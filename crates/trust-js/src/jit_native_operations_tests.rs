@@ -1,6 +1,7 @@
 //! ECMA-262 e28783d5, Declarative Environment Records, GetValue/PutValue,
 //! OrdinaryGet and EvaluateCall. Region publication must precede observations.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
@@ -44,7 +45,7 @@ fn local_typeof_literals_avoid_strings_and_use_native_scalar_classification() {
         .interp
         .get_var("scalarTypes", &env)
         .unwrap_or_else(|_| panic!("fixture binding exists"));
-    let crate::value::Value::Obj(object) = function else {
+    let ValueView::Obj(object) = (function).view() else {
         panic!("fixture is callable")
     };
     let object = object.borrow();
@@ -246,11 +247,11 @@ fn native_void_releases_scalars_and_shared_owners_without_a_general_helper() {
     );
     evaluate(&mut engine, "for(var warm=0;warm<64;warm++)nativeVoid(7);");
     let env = engine.interp.global_env.clone();
-    let crate::value::Value::Obj(object) = engine
+    let ValueView::Obj(object) = (engine
         .interp
         .get_var("nativeVoid", &env)
-        .unwrap_or_else(|_| panic!("fixture binding exists"))
-    else {
+        .unwrap_or_else(|_| panic!("fixture binding exists")))
+    .view() else {
         panic!("fixture is callable")
     };
     let object = object.borrow();
@@ -418,11 +419,11 @@ fn in_operator_dense_element_hits_stay_native() {
         "for(var warm=0;warm<64;warm++)has(warm&1,[1,2]);",
     );
     let env = engine.interp.global_env.clone();
-    let crate::value::Value::Obj(object) = engine
+    let ValueView::Obj(object) = (engine
         .interp
         .get_var("has", &env)
-        .unwrap_or_else(|_| panic!("fixture binding exists"))
-    else {
+        .unwrap_or_else(|_| panic!("fixture binding exists")))
+    .view() else {
         panic!("fixture is callable")
     };
     let object = object.borrow();
@@ -503,8 +504,8 @@ fn html_all_collection_is_a_live_falsy_callable_platform_object() {
     // [[IsHTMLDDA]] object with the interface prototype, live read-only
     // indexed and unenumerable named properties, and a legacy caller.
     fn length(_: &crate::interpreter::Interp, state: &Value) -> u32 {
-        match state {
-            Value::Num(count) => *count as u32,
+        match &(state).view() {
+            ValueView::Num(count) => *count as u32,
             _ => 0,
         }
     }

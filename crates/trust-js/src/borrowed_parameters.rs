@@ -6,15 +6,16 @@
 //! the shared slot until teardown; mapped parameters consult this canonical slot as well.
 
 use crate::interpreter::Env;
+use crate::value::ValueView;
 use crate::value::{PackedValue, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
 struct Alias {
     environment: Env,
     name: Rc<str>,
-    slot: *const PackedValue,
+    slot: *const Cell<PackedValue>,
 }
 
 #[derive(Default, Clone)]
@@ -24,7 +25,7 @@ pub(crate) struct Scope<'a> {
     registry: Registry,
     floor: usize,
     end: usize,
-    _slots: PhantomData<&'a [PackedValue]>,
+    _slots: PhantomData<&'a [Cell<PackedValue>]>,
 }
 
 impl Registry {
@@ -42,7 +43,7 @@ impl Registry {
     pub(crate) unsafe fn enter<'a>(
         &self,
         homes: &[(Env, Rc<str>, u16)],
-        slots: &'a [PackedValue],
+        slots: &'a [Cell<PackedValue>],
     ) -> Scope<'a> {
         for (environment, name, slot) in homes {
             assert!((*slot as usize) < slots.len());
@@ -82,7 +83,7 @@ impl Registry {
             Env::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
         })?;
         // The scoped registration pins this shared Cell owner; it cannot resize or move.
-        Some(unsafe { &*alias.slot }.unpack())
+        Some(unsafe { &*alias.slot }.get().unpack())
     }
 
     pub(crate) fn write(&self, environment: &Env, name: &str, value: &Value) -> bool {
@@ -93,7 +94,7 @@ impl Registry {
             return false;
         };
         // Match ordinary VM writes: transfer a new owner through the Cell, releasing the old.
-        unsafe { &*alias.slot }.replace_value(value.clone());
+        unsafe { &*alias.slot }.set(PackedValue::pack(*value));
         true
     }
 
@@ -115,13 +116,13 @@ impl Drop for Scope<'_> {
         // Restore every parked record before removing its canonical lookup or allowing its
         // slot owner to be cleared/reused. Value destruction invokes no JavaScript here.
         for alias in &aliases[self.floor..] {
-            let value = unsafe { &*alias.slot }.unpack();
+            let value = unsafe { &*alias.slot }.get().unpack();
             let mut scope = alias.environment.borrow_mut();
             let binding = scope
                 .vars
                 .get_mut(&alias.name)
                 .expect("borrowed binding remains present");
-            binding.initialized = !matches!(value, Value::Empty);
+            binding.initialized = !matches!((value).view(), ValueView::Empty);
             binding.value = value;
         }
         aliases.truncate(self.floor);
@@ -151,6 +152,7 @@ impl crate::gc_trace::GcTrace for Registry {
 mod tests {
     use super::*;
     use crate::interpreter::{new_scope, Binding};
+    use crate::value::ValueView;
 
     /// A Rust unwind out of a borrowed scope restores every parked binding from its slot, with
     /// the binding's attributes, and leaves no stale slot pointer. The object the slot held
@@ -174,8 +176,8 @@ mod tests {
                 .vars
                 .insert("later", Binding::data(Value::Undefined, true, false));
             let slots = [
-                PackedValue::pack(Value::Obj(old)),
-                PackedValue::pack(Value::Empty),
+                Cell::new(PackedValue::pack(Value::Obj(old))),
+                Cell::new(PackedValue::pack(Value::Empty)),
             ];
             let homes = [
                 (environment.clone(), Rc::from("old"), 0),
@@ -186,11 +188,11 @@ mod tests {
                 {
                     let parked = environment.borrow();
                     let old = parked.vars.get("old").unwrap();
-                    assert!(matches!(old.value, Value::Undefined));
+                    assert!(matches!((old.value).view(), ValueView::Undefined));
                     assert!(old.initialized && !old.mutable && old.strict_immutable);
                     assert!(!parked.vars.get("later").unwrap().initialized);
                 }
-                slots[0].replace_value(Value::Num(7.0));
+                slots[0].set(PackedValue::pack(Value::Num(7.0)));
                 panic!("test restoration on Rust unwind");
             }));
             assert!(unwind.is_err());
@@ -203,11 +205,11 @@ mod tests {
         {
             let restored = environment.borrow();
             let old = restored.vars.get("old").unwrap();
-            assert!(matches!(old.value, Value::Num(7.0)));
+            assert!(matches!((old.value).view(), ValueView::Num(7.0)));
             assert!(old.initialized && !old.mutable && old.strict_immutable);
             let later = restored.vars.get("later").unwrap();
             assert!(!later.initialized && later.mutable);
-            assert!(matches!(later.value, Value::Empty));
+            assert!(matches!((later.value).view(), ValueView::Empty));
         }
         engine.interp.gc_collect();
         assert!(

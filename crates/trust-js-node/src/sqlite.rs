@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
+use trust_js_host::ValueKind;
 
 use trust_js_host::{ops, Ctx, OpDecl, Value};
 
@@ -338,7 +339,10 @@ fn arg_i32<'s>(args: &[Value<'s>], i: usize) -> i32 {
 }
 
 fn arg_bool<'s>(args: &[Value<'s>], i: usize) -> bool {
-    matches!(args.get(i), Some(Value::Bool(true)))
+    matches!(
+        (args.get(i)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    )
 }
 
 /// Read a C string pointer as an owned Rust `String` (lossy UTF-8); a null pointer reads as empty.
@@ -565,7 +569,7 @@ fn op_bind<'s>(
 
     // For an object argument, the only bindable shape is a TypedArray (→ BLOB). Extract its bytes
     // now, while we still hold `&mut ctx`; reject any other object before borrowing the api.
-    let blob: Option<Vec<u8>> = if matches!(value, Value::Obj(_)) {
+    let blob: Option<Vec<u8>> = if matches!((value).kind(), ValueKind::Obj(_)) {
         match ctx.typed_array_raw(&value) {
             Some((_, len, ptr)) => Some(if ptr.is_null() || len == 0 {
                 Vec::new()
@@ -587,10 +591,10 @@ fn op_bind<'s>(
     let rc = {
         let api = state(ctx).api.as_ref().unwrap();
         unsafe {
-            match &value {
-                Value::Undefined | Value::Null => (api.bind_null)(stmt, index),
-                Value::Bool(b) => (api.bind_int64)(stmt, index, if *b { 1 } else { 0 }),
-                Value::Num(n) => {
+            match &(value).kind() {
+                ValueKind::Undefined | ValueKind::Null => (api.bind_null)(stmt, index),
+                ValueKind::Bool(b) => (api.bind_int64)(stmt, index, if *b { 1 } else { 0 }),
+                ValueKind::Num(n) => {
                     // Bun (JSC) binds an integral number as INTEGER only within the int52 range
                     // [-2^51, 2^51); anything outside — and every fractional/NaN/±Inf value —
                     // goes through bind_double (verified against bun v1.2.21: 2^50 → integer,
@@ -607,10 +611,10 @@ fn op_bind<'s>(
                         (api.bind_double)(stmt, index, *n)
                     }
                 }
-                Value::BigInt(_) => {
+                ValueKind::BigInt(_) => {
                     (api.bind_int64)(stmt, index, value.bigint_as_i64().unwrap_or(0))
                 }
-                Value::Str(_) => {
+                ValueKind::Str(_) => {
                     let text = value.as_text().unwrap_or_default().into_owned();
                     (api.bind_text)(
                         stmt,
@@ -620,7 +624,7 @@ fn op_bind<'s>(
                         SQLITE_TRANSIENT,
                     )
                 }
-                Value::Obj(_) => {
+                ValueKind::Obj(_) => {
                     let bytes = blob.as_deref().unwrap_or(&[]);
                     (api.bind_blob)(
                         stmt,
@@ -1053,7 +1057,7 @@ fn op_file_control<'s>(
     let file_control = state(ctx).api.as_ref().unwrap().file_control;
     let value = args.get(2).unwrap_or(&Value::Undefined);
     let mut number = value.as_num_opt().unwrap_or(0.0) as i32;
-    let pointer = if matches!(value, Value::Undefined | Value::Null) {
+    let pointer = if matches!(&(value).kind(), ValueKind::Undefined | ValueKind::Null) {
         std::ptr::null_mut()
     } else if value.as_num_opt().is_some() {
         &mut number as *mut i32 as *mut c_void

@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// `ShadowRealm`: each instance owns a fully isolated sub-interpreter. `evaluate` runs source in it and
 /// only lets primitive completion values cross back (callables are wrapped; objects are a TypeError).
@@ -45,7 +46,6 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
 fn this_shadow_realm(i: &Interp, this: &Value) -> Option<Gc> {
     this.as_obj()
         .filter(|object| i.shadow_realms.contains_key(&(Gc::as_ptr(object) as usize)))
-        .cloned()
 }
 
 fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
@@ -55,8 +55,8 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
             "ShadowRealm.prototype.evaluate called on a non-ShadowRealm",
         )
     })?;
-    let src = match arg(a, 0) {
-        Value::Str(s) => s.to_string(),
+    let src = match (arg(a, 0)).view() {
+        ValueView::Str(s) => s.to_string(),
         _ => {
             return Err(i.make_error(
                 "TypeError",
@@ -89,9 +89,9 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
         sub.declare_block_lexicals(&body, &scope, false);
         let r = sub
             .in_code(Some(source), |sub| sub.run_stmt_list(&body, &scope))
-            .map(|v| match v {
-                Value::Empty => Value::Undefined,
-                other => other,
+            .map(|v| match v.view() {
+                ValueView::Empty => Value::Undefined,
+                _ => v,
             });
         sub.drain_microtasks();
         r
@@ -118,8 +118,8 @@ fn shadow_import_value(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value
         )
     })?;
     let spec = ab(i.to_string(&arg(a, 0)))?.to_string();
-    let name = match arg(a, 1) {
-        Value::Str(s) => s.to_string(),
+    let name = match (arg(a, 1)).view() {
+        ValueView::Str(s) => s.to_string(),
         _ => return Err(i.make_error("TypeError", "importValue exportName must be a string")),
     };
     let promise = i.new_promise();
@@ -153,7 +153,7 @@ fn shadow_import_value(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value
             }
         };
         match value {
-            Ok(Value::Undefined) => Err(i.make_error(
+            Ok(v) if matches!(v.view(), ValueView::Undefined) => Err(i.make_error(
                 "TypeError",
                 format!("importValue: no export named '{name}'"),
             )),

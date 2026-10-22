@@ -22,6 +22,7 @@
 
 use crate::bytecode::Tier;
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{Gc, PackedValue, Property, Value, WeakGc};
 use crate::Engine;
 use std::cell::RefCell;
@@ -52,7 +53,7 @@ pub(crate) struct Census {
 /// `track(value)`: the test follows an object through a weak handle; returns `value`.
 pub(crate) fn track(_: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    if let Value::Obj(object) = &value {
+    if let ValueView::Obj(object) = &(value).view() {
         let weak = Gc::downgrade(object);
         PENDING.with(|pending| pending.borrow_mut().push(weak.clone()));
         TRACKED.with(|tracked| tracked.borrow_mut().push(weak));
@@ -738,8 +739,8 @@ fn alias_into(source: &PackedValue, word: &mut PackedValue) {
 fn tag_of(word: &PackedValue) -> Option<String> {
     let tag =
         word.with_object(|object| object.borrow().props.get("tag").map(Property::value))??;
-    match tag {
-        Value::Str(tag) => Some(tag.as_str().to_owned()),
+    match (tag).view() {
+        ValueView::Str(tag) => Some(tag.as_str().to_owned()),
         _ => None,
     }
 }
@@ -848,8 +849,8 @@ fn committed_from_rust(i: &mut Interp) -> String {
     let result = unsafe { i.call_native_committed(collect, &*this_slot, args.as_mut_ptr(), 1) };
     unsafe { args.set_len(0) };
     std::hint::black_box(&held);
-    match result {
-        Ok(Value::Str(marks)) => marks.as_str().to_owned(),
+    match (result).map(|__value| (__value).view()) {
+        Ok(ValueView::Str(marks)) => marks.as_str().to_owned(),
         _ => panic!("collect() returns its markers"),
     }
 }
@@ -912,7 +913,7 @@ fn committed_native_call_operands_are_roots() {
         let target = crate::gc_test::in_frame(|| {
             let env = engine.interp.global_env.clone();
             let value = engine.interp.get_var(native, &env).ok().expect("a native");
-            Gc::as_ptr(value.as_obj().expect("a function object")) as usize
+            Gc::as_ptr(&value.as_obj().expect("a function object")) as usize
         });
         assert!(
             with_chunk(&mut engine, function, |chunk| chunk
@@ -1036,7 +1037,7 @@ fn entry_this_is_a_root() {
 /// the tail call.
 fn collecting_apply(i: &mut Interp, handler: Value, _: &[Value]) -> Result<Value, Value> {
     let marks = collect(i, Value::Undefined, &[])?;
-    let Value::Obj(handler) = handler else {
+    let ValueView::Obj(handler) = (handler).view() else {
         panic!("the getter's receiver is the handler")
     };
     let mut handler = handler.borrow_mut();

@@ -511,6 +511,7 @@ impl Interp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
     use crate::value::{Gc, Object};
     use crate::{Completion, Engine};
 
@@ -800,7 +801,7 @@ mod tests {
                     .weak_collection_data
                     .values()
                     .flatten()
-                    .all(|(_, value)| matches!(value, Value::Undefined)));
+                    .all(|(_, value)| matches!((value).view(), ValueView::Undefined)));
                 engine.interp.gc_collect();
                 assert!(engine
                     .interp

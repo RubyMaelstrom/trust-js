@@ -5,6 +5,8 @@
 //! kept, as roots, until it leaves them. What a scoped value cannot do is checked at compile
 //! time: see the compile_fail examples of the `embed` module's documentation.
 
+use crate::scope::ValueKind;
+use crate::value::ValueView;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -23,6 +25,56 @@ fn value_in<'s>(cx: &mut Ctx<'s>, source: &str) -> Value<'s> {
     cx.eval_value(source)
         .expect("scope fixture parses")
         .unwrap_or_else(|_| panic!("{source} threw"))
+}
+
+#[test]
+fn scoped_text_borrows_survive_copied_frontier_append_growth_and_gc() {
+    fn check<'s>(cx: &mut Ctx<'s>) {
+        use crate::lstr::LStr;
+        use crate::rooting::Rooted;
+        use crate::value::Value as Internal;
+        use std::borrow::Cow;
+
+        let prefix = "scoped borrowed engine text: ".repeat(64);
+        let initial = LStr::from(prefix.as_str()).concat_grown("");
+        let owner = Rooted::new(Internal::Str(initial));
+        let original = Value::<'s>::from_internal(*owner);
+        let borrowed = original.as_engine_text().unwrap();
+        let cow = original.as_text().unwrap();
+        assert!(matches!(cow, Cow::Borrowed(_)));
+        let original_address = borrowed.as_ptr();
+        let original_len = borrowed.len();
+        assert_eq!(cow.as_ptr(), original_address);
+
+        let mut copied = initial;
+        assert!(copied.append_in_place("frontier"));
+        assert!(LStr::ptr_eq(copied.view_owner().unwrap(), &initial));
+        assert_eq!(copied.as_str().as_ptr(), original_address);
+        let mut current = Rooted::new(Internal::Str(copied));
+        let mut expected = format!("{prefix}frontier");
+        cx.collect_garbage_for_host();
+        assert_eq!(borrowed, prefix);
+        assert_eq!(borrowed.as_ptr(), original_address);
+        assert_eq!(cow.as_ref(), prefix);
+        assert_eq!(cow.as_ptr(), original_address);
+        assert_eq!(current.as_engine_text(), Some(expected.as_str()));
+
+        let suffix = "replacement growth: ".repeat(prefix.len());
+        assert!(!copied.append_in_place(&suffix));
+        copied.append_or_replace(&LStr::from(suffix.as_str()));
+        assert_ne!(copied.as_str().as_ptr(), original_address);
+        *current = Internal::Str(copied);
+        expected.push_str(&suffix);
+        cx.collect_garbage_for_host();
+        assert_eq!(borrowed, prefix);
+        assert_eq!(borrowed.len(), original_len);
+        assert_eq!(borrowed.as_ptr(), original_address);
+        assert_eq!(cow.as_ref(), prefix);
+        assert_eq!(cow.len(), original_len);
+        assert_eq!(cow.as_ptr(), original_address);
+        assert_eq!(current.as_engine_text(), Some(expected.as_str()));
+    }
+    Engine::new().scope(check);
 }
 
 /// Every kind of engine value is the scoped value of its kind, payload for payload, and EMPTY
@@ -54,9 +106,9 @@ fn scoped_values_are_the_engine_values() {
             // that of the value's variant.
             unsafe {
                 assert_eq!(*a, *b, "the tag word");
-                match value {
-                    Internal::Undefined | Internal::Null => {}
-                    Internal::Bool(_) => assert_eq!(
+                match &(value).view() {
+                    ValueView::Undefined | ValueView::Null => {}
+                    ValueView::Bool(_) => assert_eq!(
                         *a.add(1).cast::<u8>(),
                         *b.add(1).cast::<u8>(),
                         "the payload byte"
@@ -64,17 +116,37 @@ fn scoped_values_are_the_engine_values() {
                     _ => assert_eq!(*a.add(1), *b.add(1), "the payload word"),
                 }
             }
+            match (value.view(), scoped.kind()) {
+                (ValueView::Undefined, ValueKind::Undefined)
+                | (ValueView::Null, ValueKind::Null) => {}
+                (ValueView::Bool(a), ValueKind::Bool(b)) => assert_eq!(a, b),
+                (ValueView::Num(a), ValueKind::Num(b)) => assert_eq!(a.to_bits(), b.to_bits()),
+                (ValueView::BigInt(_), ValueKind::BigInt(v)) => assert_eq!(
+                    Value::BigInt(v).into_internal().cell_word(),
+                    value.cell_word()
+                ),
+                (ValueView::Str(_), ValueKind::Str(v)) => {
+                    assert_eq!(Value::Str(v).into_internal().cell_word(), value.cell_word())
+                }
+                (ValueView::Sym(_), ValueKind::Sym(v)) => {
+                    assert_eq!(Value::Sym(v).into_internal().cell_word(), value.cell_word())
+                }
+                (ValueView::Obj(_), ValueKind::Obj(v)) => {
+                    assert_eq!(Value::Obj(v).into_internal().cell_word(), value.cell_word())
+                }
+                _ => panic!("scoped view changed the value's discriminant"),
+            }
             assert_eq!(scoped.type_of(), value.type_of());
             assert!(
                 matches!(
-                    (value, scoped.into_internal()),
-                    (Internal::Num(a), Internal::Num(b)) if a.to_bits() == b.to_bits()
-                ) || !matches!(value, Internal::Num(_))
+                    (value.view(), scoped.into_internal().view()),
+                    (ValueView::Num(a), ValueView::Num(b)) if a.to_bits() == b.to_bits()
+                ) || !matches!(&(value).view(), ValueView::Num(_))
             );
         }
         assert!(matches!(
-            Value::from_internal(Internal::Empty),
-            Value::Undefined
+            (Value::from_internal(Internal::Empty)).kind(),
+            ValueKind::Undefined
         ));
         let text = value_in(cx, "'text'");
         assert_eq!(text.as_text().as_deref(), Some("text"));
@@ -85,7 +157,7 @@ fn scoped_values_are_the_engine_values() {
             "wrapping past 2^64, as the engine does"
         );
         let symbol = value_in(cx, "Symbol('described')");
-        let Value::Sym(symbol) = symbol else {
+        let ValueKind::Sym(symbol) = (symbol).kind() else {
             panic!("a symbol")
         };
         assert_eq!(symbol.description().as_deref(), Some("described"));
@@ -104,15 +176,15 @@ fn echo<'s>(_: &mut Ctx<'s>, _: Value<'s>, args: &[Value<'s>]) -> Result<Value<'
 
 /// `kind()`: the receiver's kind, as the native function sees it.
 fn kind<'s>(cx: &mut Ctx<'s>, this: Value<'s>, _: &[Value<'s>]) -> Result<Value<'s>, Value<'s>> {
-    let kind = match this {
-        Value::Undefined => "undefined",
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Num(_) => "number",
-        Value::BigInt(_) => "bigint",
-        Value::Str(_) => "string",
-        Value::Sym(_) => "symbol",
-        Value::Obj(_) => "object",
+    let kind = match (this).kind() {
+        ValueKind::Undefined => "undefined",
+        ValueKind::Null => "null",
+        ValueKind::Bool(_) => "boolean",
+        ValueKind::Num(_) => "number",
+        ValueKind::BigInt(_) => "bigint",
+        ValueKind::Str(_) => "string",
+        ValueKind::Sym(_) => "symbol",
+        ValueKind::Obj(_) => "object",
     };
     Ok(cx.str(kind))
 }

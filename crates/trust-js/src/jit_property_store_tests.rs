@@ -275,7 +275,8 @@ fn creation_ics_use_each_active_heaps_shape_directory() {
             .get_var("create", &env)
             .ok()
             .expect("create binding");
-        let object = value.as_obj().expect("create function").borrow();
+        let function_handle = value.as_obj().expect("create function");
+        let object = function_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("create is a user function")
         };

@@ -2,6 +2,7 @@
 //! Representation checks accompany observable regressions: the change must remove
 //! decimal-key storage, not merely happen to produce the same array contents.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 #[test]
@@ -33,7 +34,9 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
     assert_eq!(grown.mirror_get(8191), Some(8191.0));
     assert!(grown.set_index_value(12, Value::lstr("mixed")).is_ok());
     assert_eq!(grown.mirror_get(12), None);
-    assert!(matches!(grown.get_index(12).unwrap().value(), Value::Str(s) if s.as_str() == "mixed"));
+    assert!(
+        matches!((grown.get_index(12).unwrap().value()).view(), ValueView::Str(s) if s.as_str() == "mixed")
+    );
 }
 
 #[test]

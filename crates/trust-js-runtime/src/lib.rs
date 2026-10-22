@@ -17,6 +17,7 @@
 
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+use trust_js_host::ValueKind;
 
 use trust_js_host::{
     install, CallbackQueue, DedicatedExecutor, Engine, EvalError, Handle, RuntimeInterrupt,
@@ -716,8 +717,10 @@ impl Runtime {
                 // The global `onunhandledrejection` handler runs first; `event.preventDefault()`
                 // suppresses the default report.
                 let fire = trust_js_host::value(cx, fire_rejection);
-                match cx.call_function_interruptible(&fire, Value::Undefined, &[promise, reason]) {
-                    Ok(Value::Bool(true)) => return false,
+                match (cx.call_function_interruptible(&fire, Value::Undefined, &[promise, reason]))
+                    .map(|__value| (__value).kind())
+                {
+                    Ok(ValueKind::Bool(true)) => return false,
                     Err(EvalError::Interrupted(_)) => return true,
                     _ => {}
                 }
@@ -764,8 +767,10 @@ fn report_uncaught<'s>(ctx: &mut Ctx<'s>, fire_error: &Handle, error: &Value<'s>
     // HTML "report an exception": the global `onerror` handler runs first; returning `true`
     // suppresses the default report.
     let fire = trust_js_host::value(ctx, fire_error);
-    match ctx.call_function_interruptible(&fire, Value::Undefined, std::slice::from_ref(error)) {
-        Ok(Value::Bool(true)) | Err(EvalError::Interrupted(_)) => return,
+    match (ctx.call_function_interruptible(&fire, Value::Undefined, std::slice::from_ref(error)))
+        .map(|__value| (__value).kind())
+    {
+        Ok(ValueKind::Bool(true)) | Err(EvalError::Interrupted(_)) => return,
         _ => {}
     }
     let text = console::describe_error(ctx, error);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn check(source: &str, expected: &str) {
@@ -125,8 +126,8 @@ fn prepared_reference_captures_strictness_and_survives_generation_exhaustion() {
         );
     }
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(7.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(7.0))
     ));
     let mut strict = engine
         .interp
@@ -160,21 +161,21 @@ fn prepared_reference_imports_are_live_and_never_mutable_address_hints() {
         .ok()
         .unwrap();
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(7.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(7.0))
     ));
     exporter.borrow_mut().vars.get_mut("source").unwrap().value = Value::Num(19.0);
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(19.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(19.0))
     ));
     assert!(engine
         .interp
         .write_prepared_reference(&mut reference, Value::Num(31.0))
         .is_err());
     assert!(matches!(
-        exporter.borrow().vars.get("source").unwrap().value,
-        Value::Num(19.0)
+        (exporter.borrow().vars.get("source").unwrap().value).view(),
+        ValueView::Num(19.0)
     ));
 }
 

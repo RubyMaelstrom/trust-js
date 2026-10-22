@@ -33,6 +33,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, Tc
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{CompletionSender, Ctx, Handle, SpawnHandle, TaskRegistry, Value};
 
@@ -137,9 +138,11 @@ pub(crate) fn op_server_listen<'s>(
     let host = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
-    let port = match args.get(1) {
-        Some(Value::Num(n)) if n.is_finite() && n.fract() == 0.0 && (0.0..=65535.0).contains(n) => {
-            *n as u16
+    let port = match (args.get(1)).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n))
+            if n.is_finite() && n.fract() == 0.0 && (0.0..=65535.0).contains(&n) =>
+        {
+            n as u16
         }
         _ => return Err(ctx.make_error("TypeError", "listen: port must be 0..=65535")),
     };
@@ -192,13 +195,15 @@ pub(crate) fn op_server_respond<'s>(
     _this: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let conn_id = match args.first() {
-        Some(Value::Num(n)) if *n >= 0.0 => *n as u32,
+    let conn_id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) if n >= 0.0 => n as u32,
         _ => return Err(ctx.make_error("TypeError", "respond: bad connection id")),
     };
-    let status = match args.get(1) {
-        Some(Value::Num(n)) if n.is_finite() && n.fract() == 0.0 && (200.0..=599.0).contains(n) => {
-            *n as u16
+    let status = match (args.get(1)).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n))
+            if n.is_finite() && n.fract() == 0.0 && (200.0..=599.0).contains(&n) =>
+        {
+            n as u16
         }
         _ => return Err(ctx.make_error("TypeError", "respond: status must be 200..=599")),
     };
@@ -206,8 +211,8 @@ pub(crate) fn op_server_respond<'s>(
         .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
         .to_string();
     let headers = read_header_pairs(ctx, args.get(3).unwrap_or(&Value::Undefined))?;
-    let body = match args.get(4) {
-        None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
+    let body = match args.get(4).filter(|value| !value.is_nullish()) {
+        None => Vec::new(),
         Some(v) => ctx.typed_array_bytes(v).unwrap_or_default(),
     };
     if body.len() as u64 > MAX_BODY {
@@ -256,8 +261,8 @@ pub(crate) fn op_server_close<'s>(
     _this: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let id = match args.first() {
-        Some(Value::Num(n)) if *n >= 0.0 => *n as u64,
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) if n >= 0.0 => n as u64,
         _ => return Ok(Value::Undefined),
     };
     let target = ctx

@@ -3,6 +3,7 @@
 //! changed key set nor a failed address hint permits resolving the name in an outer record.
 
 use super::*;
+use crate::value::ValueView;
 
 pub(crate) const REFERENCE_SCOPE: u32 = 0;
 pub(crate) const REFERENCE_OBJECT: u32 = 1;
@@ -249,7 +250,7 @@ impl Interp {
             if has_binding {
                 return Ok(PreparedReference::scope(name, scope, strict));
             }
-            if let Some(Value::Obj(object)) = with_object {
+            if let Some(ValueView::Obj(object)) = (with_object).map(|__value| (__value).view()) {
                 if self.with_has_binding(&Value::Obj(object.clone()), &name)? {
                     // HasBinding has already run HasProperty and @@unscopables in order.
                     // The latter may mutate the descriptor: refresh only after it completes.

@@ -1,5 +1,6 @@
 //! Storage proof for ECMA-262 Array.prototype.shift, snapshot e28783d5.
 use super::*;
+use crate::value::ValueView;
 
 fn array(values: Vec<Value>, packed: bool, reverse: bool, named_tail: bool) -> Props {
     let len = values.len();
@@ -48,8 +49,8 @@ fn numbers(len: usize, packed: bool, reverse: bool, named_tail: bool) -> Props {
 }
 
 fn number(value: Value) -> f64 {
-    match value {
-        Value::Num(value) => value,
+    match (value).view() {
+        ValueView::Num(value) => value,
         _ => panic!("expected a Number"),
     }
 }
@@ -112,7 +113,7 @@ fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
                     }
                     if named {
                         assert!(
-                            matches!(props.get("named").unwrap().value(), Value::Str(s) if &*s == "preserved")
+                            matches!((props.get("named").unwrap().value()).view(), ValueView::Str(s) if &*s == "preserved")
                         );
                         assert_eq!(props.get("01").unwrap().number_value(), Some(71.0));
                         assert_eq!(props.get("4294967295").unwrap().number_value(), Some(72.0));
@@ -324,14 +325,16 @@ fn tiny_prepends_stay_inline_before_promoting_once() {
         );
         for n in 0..=index {
             assert!(
-                matches!(properties.get_index(n as u32).unwrap().value(), Value::Obj(value)
+                matches!((properties.get_index(n as u32).unwrap().value()).view(), ValueView::Obj(value)
                 if Gc::ptr_eq(&value, &owners[index-n]))
             );
         }
     }
     for index in (0..12).rev() {
         let first = properties.shift_dense_array(index + 1).unwrap();
-        assert!(matches!(&first, Value::Obj(value) if Gc::ptr_eq(value, &owners[index])));
+        assert!(
+            matches!(&(first).view(), ValueView::Obj(value) if Gc::ptr_eq(value, &owners[index]))
+        );
     }
 }
 

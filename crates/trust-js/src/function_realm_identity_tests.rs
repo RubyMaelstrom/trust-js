@@ -61,7 +61,7 @@ fn function_realm_identity_survives_host_environment_and_prototype_changes() {
             .ok()
             .expect("retained owner constructor");
         assert_eq!(
-            engine.interp.callee_realm_global(owner.as_obj().unwrap()),
+            engine.interp.callee_realm_global(&owner.as_obj().unwrap()),
             None,
             "the changed environment/prototype cannot move [[Realm]]: {tier:?}"
         );

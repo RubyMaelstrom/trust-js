@@ -12,7 +12,8 @@
 use crate::bytecode::Tier;
 use crate::interpreter::{Abrupt, Interp};
 use crate::realm_inline_guard_tests::{eval_string, in_realm, render, TIERS};
-use crate::value::{Callable, Value};
+use crate::value::Callable;
+use crate::value::ValueView;
 use crate::Engine;
 use std::rc::Rc;
 
@@ -157,7 +158,8 @@ fn run_shared(it: &mut Interp) -> String {
 
 fn global_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
     let env = it.global_env.clone();
-    let Ok(Value::Obj(object)) = it.get_var(name, &env) else {
+    let Ok(ValueView::Obj(object)) = (it.get_var(name, &env)).map(|__value| (__value).view())
+    else {
         panic!("{name} is a global function");
     };
     let borrowed = object.borrow();

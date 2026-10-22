@@ -22,7 +22,8 @@ fn function(engine: &mut Engine, name: &str) -> Rc<crate::ast::Function> {
     engine.interp.activate_gc_heap();
     let env = engine.interp.global_env;
     let value = engine.interp.get_var(name, &env).ok().unwrap();
-    let object = value.as_obj().unwrap().borrow();
+    let object_handle = value.as_obj().unwrap();
+    let object = object_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("user function")
     };
@@ -188,8 +189,8 @@ fn constructor_hints_trace_layouts_conditionally_and_record_old_to_young_writes(
             let weak = crate::gc_handle::WeakRef::to(layout.as_ptr() as usize);
             engine.interp.construct_capacity_hints.insert(
                 &engine.interp.gc_heap,
-                Gc::as_ptr(constructor) as usize,
-                (Gc::downgrade(constructor), layout),
+                Gc::as_ptr(&constructor) as usize,
+                (Gc::downgrade(&constructor), layout),
             );
             weak
         })
@@ -317,7 +318,7 @@ fn retiring_an_evicted_foreign_runtime_fences_warmed_same_ast_call_ics() {
             let code_lease = runtime.code.get().and_then(Option::as_ref).unwrap().clone();
             let runtime = Rc::downgrade(runtime);
             user.cache.set(Some(sidecar));
-            (Gc::downgrade(object), runtime, code_lease)
+            (Gc::downgrade(&object), runtime, code_lease)
         });
         for engine in &mut foreign {
             install(engine, &body);
@@ -414,7 +415,8 @@ fn foreign_getter_fill_stale_reset_and_tdz_preserve_the_runtime_lease() {
     install(&mut outer, &body);
     let env = outer.interp.global_env;
     let getter = outer.interp.get_var("getter", &env).ok().unwrap();
-    let borrowed = getter.as_obj().unwrap().borrow();
+    let borrowed_handle = getter.as_obj().unwrap();
+    let borrowed = borrowed_handle.borrow();
     let Callable::User(user) = &borrowed.call else {
         panic!("getter")
     };

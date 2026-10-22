@@ -3,6 +3,9 @@
 
 #[cfg(feature = "embed")]
 use crate::embed::{Ctx, Value};
+#[cfg(feature = "embed")]
+use crate::scope::ValueKind;
+use crate::value::ValueView;
 use crate::{Completion, Engine, ExecutionOutcome, InterruptReason};
 
 /// The completion value of `src` in the scope `cx`, with no microtask checkpoint.
@@ -58,7 +61,7 @@ fn reasons(
 /// Whether `src`, run in a scope of `engine` with no microtask checkpoint, is `true`.
 #[cfg(feature = "embed")]
 fn eval_true(engine: &mut Engine, src: &str) -> bool {
-    engine.scope(|cx| matches!(value_in(cx, src), Value::Bool(true)))
+    engine.scope(|cx| matches!((value_in(cx, src)).kind(), ValueKind::Bool(true)))
 }
 
 fn run(src: &str) -> String {
@@ -163,16 +166,13 @@ fn integer_switch_dispatch_preserves_case_block_semantics_in_all_tiers() {
 fn boolean_bitwise_fast_paths_preserve_numbers_and_coercion_in_all_tiers() {
     // Validate the wide Value layout used by both native boolean templates against live fields:
     // a full tag word, then Bool's byte at the payload offset (the rest of that word is padding).
-    for value in [
-        crate::value::Value::Bool(false),
-        crate::value::Value::Bool(true),
-    ] {
-        let base = &value as *const crate::value::Value as usize;
-        let crate::value::Value::Bool(ref boolean) = value else {
-            unreachable!()
-        };
-        assert_eq!(boolean as *const bool as usize - base, 8);
-        assert_eq!(unsafe { *(base as *const u64) }, 3);
+    for boolean in [false, true] {
+        let value = crate::value::Value::Bool(boolean);
+        let base = std::ptr::from_ref(&value).cast::<u8>();
+        // Inspect this Value's initialized tag and payload byte. A decoded ValueView is a
+        // separate copy, so the address of its Bool field cannot measure this Value's layout.
+        assert_eq!(unsafe { base.cast::<u64>().read() }, 3);
+        assert_eq!(unsafe { base.add(8).read() }, u8::from(boolean));
     }
     // ECMA-262 ToNumeric, ToNumber, ApplyStringOrNumericBinaryOperator, snapshot e28783d5fc9d.
     // Comparisons feeding a bitwise mask are common in generated asm.js initialization loops.
@@ -928,7 +928,7 @@ fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
                 .interp
                 .eval_in_realm(&global, "victim")
                 .unwrap_or_else(|_| panic!("live victim"));
-            let crate::value::Value::Obj(function) = value else {
+            let ValueView::Obj(function) = (value).view() else {
                 panic!("function object")
             };
             crate::value::Gc::downgrade(&function)
@@ -3595,11 +3595,12 @@ fn host_call_entry_activates_the_receiving_engine_agent() {
     fn call_make_object(engine: &mut Engine) -> crate::value::Gc {
         engine.scope(|cx| {
             let function = value_in(cx, "makeAgentObject");
-            match cx
+            match (cx
                 .call_function(&function, Value::Undefined, &[])
-                .unwrap_or_else(|_| panic!("host call succeeds"))
+                .unwrap_or_else(|_| panic!("host call succeeds")))
+            .kind()
             {
-                Value::Obj(object) => object.gc(),
+                ValueKind::Obj(object) => object.gc(),
                 _ => panic!("host call returned an object"),
             }
         })
@@ -3644,26 +3645,28 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
         )
         .expect("ShadowRealm ownership probe parses");
 
-    let shadow = match engine
+    let shadow = match (engine
         .interp
         .global
         .borrow()
         .props
         .get("savedShadow")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("ShadowRealm object was retained"),
     };
-    let parent_object = match engine
+    let parent_object = match (engine
         .interp
         .global
         .borrow()
         .props
         .get("parentMarker")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("parent marker was retained"),
     };
     let shadow_key = crate::value::Gc::as_ptr(&shadow) as usize;
@@ -3672,14 +3675,15 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
         .shadow_realms
         .get(&shadow_key)
         .unwrap_or_else(|| panic!("ShadowRealm implementation remains available"));
-    let child_object = match child
+    let child_object = match (child
         .global
         .borrow()
         .props
         .get("childMarker")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("child marker was retained"),
     };
 
@@ -3793,8 +3797,9 @@ fn function_name_templates_serve_only_their_heap() {
                 let Ok(function) = engine.interp.member_get(&global, binding) else {
                     panic!("binding {binding}");
                 };
-                match engine.interp.member_get(&function, "name") {
-                    Ok(crate::value::Value::Str(name)) => name.cell_word(),
+                match (engine.interp.member_get(&function, "name")).map(|__value| (__value).view())
+                {
+                    Ok(ValueView::Str(name)) => name.cell_word(),
                     _ => panic!("{binding}.name is a string"),
                 }
             })
@@ -4626,7 +4631,10 @@ fn embedder_realms_isolate_intrinsics_and_native_globals() {
         assert!(installed, "child setup completes");
 
         assert!(
-            matches!(cx.member_get(&main, "realmMarker"), Ok(Value::Undefined)),
+            matches!(
+                (cx.member_get(&main, "realmMarker")).map(|__value| (__value).kind()),
+                Ok(ValueKind::Undefined)
+            ),
             "native global stays out of the main realm"
         );
         let child_result = cx
@@ -5424,9 +5432,10 @@ fn embedder_bigint_i64_bridge_runs_to_bigint() {
             .unwrap_or(Value::Undefined);
         assert!(matches!(cx.coerce_bigint_i64(&value), Ok(-2)));
         assert!(matches!(
-            cx.member_get(&global, "coerced")
-                .unwrap_or(Value::Undefined),
-            Value::Bool(true)
+            (cx.member_get(&global, "coerced")
+                .unwrap_or(Value::Undefined))
+            .kind(),
+            ValueKind::Bool(true)
         ));
         assert!(cx.coerce_bigint_i64(&Value::Num(2.0)).is_err());
     });
@@ -6499,8 +6508,8 @@ fn host_weak_map_lookup_uses_intrinsic_brand_and_storage() {
             Some(42.)
         );
         assert!(matches!(
-            cx.weak_map_get(&value, &Value::Null).ok(),
-            Some(Value::Undefined)
+            (cx.weak_map_get(&value, &Value::Null).ok()).map(|__value| (__value).kind()),
+            Some(ValueKind::Undefined)
         ));
         let set = value_in(cx, "new WeakSet([key])");
         assert!(cx.weak_map_get(&set, &key).is_err());
@@ -6882,15 +6891,16 @@ fn gc_registry_follows_an_agent_across_generator_vm_resumptions() {
         Completion::Throw { name, message } => panic!("generator setup threw {name}: {message}"),
     }
 
-    let worker_object = match engine
+    let worker_object = match (engine
         .interp
         .global
         .borrow()
         .props
         .get("workerObject")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("generator did not publish its worker-allocated object"),
     };
     let snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
@@ -6942,26 +6952,28 @@ fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
         .eval("globalThis.agentMarker = { agent: 2 }", false)
         .expect("second Agent script parses");
 
-    let first_object = match first
+    let first_object = match (first
         .interp
         .global
         .borrow()
         .props
         .get("agentMarker")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("first Agent marker missing"),
     };
-    let second_object = match second
+    let second_object = match (second
         .interp
         .global
         .borrow()
         .props
         .get("agentMarker")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("second Agent marker missing"),
     };
     let first_snapshot = crate::value::heap_gc_snapshot(&first.interp.gc_heap);
@@ -7005,15 +7017,16 @@ fn object_shapes_follow_the_agent_across_generator_vm_resumptions() {
         )
         .expect("shape handoff script parses");
 
-    let get_object = |name: &str| match engine
+    let get_object = |name: &str| match (engine
         .interp
         .global
         .borrow()
         .props
         .get(name)
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("{name} was not published as an object"),
     };
     let main_object = get_object("mainObject");
@@ -14548,7 +14561,8 @@ fn loop_free_functions_earn_native_code_through_vm_runs() {
         let Ok(value) = engine.interp.get_var(name, &env) else {
             panic!("missing fixture function {name}")
         };
-        let object = value.as_obj().expect("function object").borrow();
+        let object_handle = value.as_obj().expect("function object");
+        let object = object_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("user function")
         };
@@ -26580,7 +26594,7 @@ fn compiled_base_class_constructors_preserve_instance_initialization_order() {
             .interp
             .get_var("Base", &global)
             .unwrap_or_else(|_| panic!("base class binding remains available on {tier:?}"));
-        let crate::value::Value::Obj(ctor) = ctor else {
+        let ValueView::Obj(ctor) = (ctor).view() else {
             panic!("Base is not an object on {tier:?}");
         };
         let constructor_compiled = match &ctor.borrow().call {
@@ -26637,7 +26651,7 @@ fn compiled_derived_class_constructors_preserve_super_and_this_binding_semantics
             .interp
             .get_var("Derived", &global)
             .unwrap_or_else(|_| panic!("derived class binding remains available on {tier:?}"));
-        let crate::value::Value::Obj(ctor) = ctor else {
+        let ValueView::Obj(ctor) = (ctor).view() else {
             panic!("Derived is not an object on {tier:?}");
         };
         let constructor_compiled = match &ctor.borrow().call {
@@ -26793,7 +26807,7 @@ fn compiled_try_finally_preserves_every_completion_kind() {
                 .interp
                 .get_var(name, &global)
                 .unwrap_or_else(|_| panic!("{name} remains available on {tier:?}"));
-            let crate::value::Value::Obj(function) = function else {
+            let ValueView::Obj(function) = (function).view() else {
                 panic!("{name} is not an object on {tier:?}");
             };
             let compiled = match &function.borrow().call {
@@ -29764,7 +29778,7 @@ fn object_literal_methods_without_super_do_not_form_cycles() {
                         .interp
                         .get_var("o", &env)
                         .unwrap_or_else(|_| panic!("o"));
-                    crate::value::Gc::downgrade(value.as_obj().unwrap())
+                    crate::value::Gc::downgrade(&value.as_obj().unwrap())
                 });
                 run_in(&mut engine, "var m = o.m; o = null;");
                 engine.interp.gc_collect();
@@ -29965,7 +29979,8 @@ fn compiled_iteration_records_share_one_published_layout() {
                     .get_member_key(&fs, &k.to_string())
                     .ok()
                     .unwrap();
-                let object = f.as_obj().unwrap().borrow();
+                let object_handle = f.as_obj().unwrap();
+                let object = object_handle.borrow();
                 let crate::value::Callable::User(user) = &object.call else {
                     panic!("closure")
                 };
@@ -31789,7 +31804,7 @@ fn embedding_helpers_follow_their_documented_semantics() {
     let interrupt = engine.interrupt_handle();
     engine.scope(|cx| {
         fn same<'s>(a: &Value<'s>, b: &Value<'s>) -> bool {
-            matches!((a, b), (Value::Obj(a), Value::Obj(b)) if a == b)
+            matches!((&(a).kind(), &(b).kind()), (ValueKind::Obj(a), ValueKind::Obj(b)) if a == b)
         }
         // prototype_of: the ToObject view without traps; get_prototype_of: Object.getPrototypeOf.
         let number_proto = value_in(cx, "Number.prototype");
@@ -31816,12 +31831,12 @@ fn embedding_helpers_follow_their_documented_semantics() {
         let realm = cx.create_embed_realm();
         assert!(cx.eval_in_realm(&realm, "let shared = 41;").is_ok());
         let completion = cx.eval_in_realm(&realm, "shared + 1");
-        assert!(matches!(completion, Ok(Value::Num(n)) if n == 42.0));
+        assert!(matches!((completion).map(|__value| (__value).kind()), Ok(ValueKind::Num(n)) if n == 42.0));
         // A sloppy Script's assignment to an undeclared name creates that Realm's global
         // property.
         assert!(cx.eval_in_realm(&realm, "assigned = 7;").is_ok());
         let completion = cx.eval_in_realm(&realm, "globalThis.assigned");
-        assert!(matches!(completion, Ok(Value::Num(n)) if n == 7.0));
+        assert!(matches!((completion).map(|__value| (__value).kind()), Ok(ValueKind::Num(n)) if n == 7.0));
         let other_syntax = cx
             .member_get(&realm, "SyntaxError")
             .unwrap_or_else(|_| panic!("SyntaxError lookup threw"));

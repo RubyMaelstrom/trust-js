@@ -1,5 +1,6 @@
 //! ECMA-262 ScriptEvaluation / PrepareForOrdinaryCall / BuiltinCallOrConstruct.
 use crate::embed::Value;
+use crate::scope::ValueKind;
 use crate::Engine;
 
 #[test]
@@ -97,7 +98,7 @@ fn native_operation_observes_script_caller_across_realms_and_eval() {
             matches!(module, crate::Completion::Value(_)),
             "module {tier:?}"
         );
-        assert!(engine.scope(|cx| matches!(cx.script_caller_global(), Value::Obj(_))));
+        assert!(engine.scope(|cx| matches!((cx.script_caller_global()).kind(), ValueKind::Obj(_))));
     }
 }
 

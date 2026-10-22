@@ -21,7 +21,8 @@ fn engine() -> Engine {
 fn native(engine: &mut Engine, name: &str) {
     let env = engine.interp.global_env;
     let value = engine.interp.get_var(name, &env).ok().unwrap();
-    let borrowed = value.as_obj().unwrap().borrow();
+    let object_handle = value.as_obj().unwrap();
+    let borrowed = object_handle.borrow();
     let Callable::User(user) = &borrowed.call else {
         panic!("writer")
     };

@@ -26,6 +26,7 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::io::Read;
 use std::time::Instant;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{ops, Ctx, Extension, OpState, SpawnHandle, TaskRegistry, Value};
 
@@ -370,8 +371,14 @@ fn op_decoder_start<'s>(
     let label = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
-    let fatal = matches!(args.get(1), Some(Value::Bool(true)));
-    let ignore_bom = matches!(args.get(2), Some(Value::Bool(true)));
+    let fatal = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
+    let ignore_bom = matches!(
+        (args.get(2)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let encoding =
         encoding_rs::Encoding::for_label_no_replacement(label.as_bytes()).ok_or_else(|| {
             ctx.make_error(
@@ -419,7 +426,10 @@ fn op_decoder_push<'s>(
     if bytes.len() > trust_js_host::MAX_DECOMPRESSED_BYTES {
         return Err(ctx.make_error("RangeError", "TextDecoder input exceeds byte limit"));
     }
-    let stream = matches!(args.get(2), Some(Value::Bool(true)));
+    let stream = matches!(
+        (args.get(2)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let mut decoder = ctx
         .host_mut::<TextDecoderRegistry>()
         .expect("web installs text decoder registry")
@@ -461,8 +471,8 @@ fn op_url_parse<'s>(
     let input = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
-    let base = match args.get(1) {
-        None | Some(Value::Undefined) => None,
+    let base = match args.get(1).filter(|value| !value.is_undefined()) {
+        None => None,
         Some(v) => Some(ctx.coerce_string(v)?.to_string()),
     };
     let u = url::parse(&input, base.as_deref())
@@ -765,7 +775,10 @@ fn op_decompress_push<'s>(
     let bytes = ctx
         .typed_array_bytes(a.get(1).unwrap_or(&Value::Undefined))
         .ok_or_else(|| ctx.make_error("TypeError", "decompression expects a BufferSource"))?;
-    let finish = matches!(a.get(2), Some(Value::Bool(true)));
+    let finish = matches!(
+        (a.get(2)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let mut decoder = ctx
         .host_mut::<CodecRegistry>()
         .expect("web installs decompression registry")
@@ -810,7 +823,10 @@ fn op_compress_push<'s>(
     let bytes = ctx
         .typed_array_bytes(a.get(1).unwrap_or(&Value::Undefined))
         .ok_or_else(|| ctx.make_error("TypeError", "compression expects a BufferSource"))?;
-    let finish = matches!(a.get(2), Some(Value::Bool(true)));
+    let finish = matches!(
+        (a.get(2)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let mut encoder = ctx
         .host_mut::<CodecRegistry>()
         .expect("web installs compression registry")
@@ -845,14 +861,17 @@ fn op_http_request<'s>(
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
         .to_string();
     let headers = read_header_pairs(ctx, args.get(2).unwrap_or(&Value::Undefined))?;
-    let body = match args.get(3) {
-        None | Some(Value::Undefined) | Some(Value::Null) => None,
+    let body = match args.get(3).filter(|value| !value.is_nullish()) {
+        None => None,
         Some(v) => match ctx.typed_array_bytes(v) {
             Some(bytes) => Some(bytes),
             None => Some(ctx.coerce_string(v)?.as_bytes().to_vec()),
         },
     };
-    let credentials = matches!(args.get(4), Some(Value::Bool(true)));
+    let credentials = matches!(
+        (args.get(4)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let (resolve, reject) = match (args.get(5), args.get(6)) {
         (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => (*res, *rej),
         _ => return Err(ctx.make_error("TypeError", "__http.request expects (resolve, reject)")),
@@ -886,7 +905,7 @@ pub(crate) fn read_header_pairs<'s>(
     let len = ctx
         .get_member(v, "length")
         .map_err(|_| ctx.make_error("TypeError", "__http.request: headers must be an array"))?;
-    let Value::Num(len) = len else {
+    let ValueKind::Num(len) = (len).kind() else {
         return Ok(out);
     };
     if !len.is_finite() || len.fract() != 0.0 || !(0.0..=1024.0).contains(&len) {

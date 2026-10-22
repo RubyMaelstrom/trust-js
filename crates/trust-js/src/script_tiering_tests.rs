@@ -2,6 +2,7 @@
 //! ECMA-262 local official snapshot e28783d5fc9dc12b3de905961e2c71410b38a202.
 //! OSR changes execution machinery only: declarations, side effects, identity and
 //! completion records must not be recreated or replayed at a hot header.
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn value(engine: &mut Engine, source: &str) -> String {
@@ -283,12 +284,12 @@ fn hot_script_completion_owner_survives_gc_at_borrowed_entry_and_finalizer() {
                 .ok()
                 .expect("GC fixture completes");
             assert_osr(tier);
-            let Value::Obj(object) = &result else {
+            let ValueView::Obj(object) = &(result).view() else {
                 panic!("completion is owned object");
             };
             assert!(matches!(
-                object.borrow().props.get("k").unwrap().value(),
-                Value::Num(1999.0)
+                (object.borrow().props.get("k").unwrap().value()).view(),
+                ValueView::Num(1999.0)
             ));
             crate::value::Gc::downgrade(object)
         });

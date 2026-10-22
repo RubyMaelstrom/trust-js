@@ -15,7 +15,8 @@ fn host_arrays_preserve_descriptors_at_storage_boundaries() {
         let array = engine
             .interp
             .make_array((0..len).map(|_| Value::Obj(owner.clone())).collect());
-        let array = array.as_obj().unwrap().borrow();
+        let array_handle = array.as_obj().unwrap();
+        let array = array_handle.borrow();
         assert!(Gc::ptr_eq(
             array.proto.as_ref().unwrap(),
             &engine.interp.array_proto
@@ -27,7 +28,7 @@ fn host_arrays_preserve_descriptors_at_storage_boundaries() {
         for index in 0..len {
             let property = array.props.get_index(index as u32).unwrap();
             assert!(property.writable() && property.enumerable() && property.configurable());
-            assert!(Gc::ptr_eq(property.value().as_obj().unwrap(), &owner));
+            assert!(Gc::ptr_eq(&property.value().as_obj().unwrap(), &owner));
         }
         if (1..=32).contains(&len) {
             assert!(

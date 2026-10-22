@@ -216,8 +216,8 @@ fn op_open_sync<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
-    let mode = match args.get(1) {
-        None | Some(Value::Undefined) => "r".to_string(),
+    let mode = match args.get(1).filter(|value| !value.is_undefined()) {
+        None => "r".to_string(),
         Some(v) => ctx.coerce_string(v)?.to_string(),
     };
     let mut opts = std::fs::OpenOptions::new();

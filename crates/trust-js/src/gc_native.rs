@@ -62,7 +62,7 @@ impl NativeGcGraph {
             let to = self.index(to);
             let head = self
                 .js_edges
-                .entry(crate::value::Gc::as_ptr(owner) as usize)
+                .entry(crate::value::Gc::as_ptr(&owner) as usize)
                 .or_insert(END);
             let next = *head;
             *head = self.edges.len();

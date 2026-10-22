@@ -65,8 +65,8 @@ fn iterator_results_remove_wrapper_allocations_but_public_next_keeps_identity() 
             .call(next, iterator, &[])
             .unwrap_or_else(|_| panic!("public next"));
         assert!(!crate::value::Gc::ptr_eq(
-            first.as_obj().unwrap(),
-            second.as_obj().unwrap()
+            &first.as_obj().unwrap(),
+            &second.as_obj().unwrap()
         ));
         assert_eq!(
             crate::value::heap_allocated_objects(&engine.interp.gc_heap) - before,
@@ -256,11 +256,12 @@ fn iterator_results_private_target_is_traced_and_collectable() {
     // Strong handles live only in this helper frame (the collector scans the stack).
     let target = crate::gc_test::in_frame(|| {
         let iterator = global(&mut engine, "iterator");
-        let object = iterator.as_obj().unwrap().borrow();
+        let object_handle = iterator.as_obj().unwrap();
+        let object = object_handle.borrow();
         let crate::value::Exotic::ArrayIterator(state) = &object.exotic else {
             panic!("private iterator slots")
         };
-        crate::value::Gc::downgrade(state.target.as_obj().unwrap())
+        crate::value::Gc::downgrade(&state.target.as_obj().unwrap())
     });
     engine.interp.gc_collect();
     assert!(crate::gc_test::alive(&target));

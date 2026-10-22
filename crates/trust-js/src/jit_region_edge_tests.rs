@@ -1,6 +1,7 @@
 //! ECMA-262 e28783d5 If/Logical/Conditional/ForBody/Try evaluation.
 //! Removing pure control-flow stubs must not change owners, polls, effects or values.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, value::Value, Completion, Engine};
 
 #[test]
@@ -117,7 +118,7 @@ fn cfg_edges_actual_branching_region_keeps_backedge_poll_and_deadline() {
         .call(function, Value::Undefined, &[Value::Num(40000.0)])
         .ok()
         .unwrap();
-    assert!(matches!(value, Value::Num(n) if n == 30000.0));
+    assert!(matches!((value).view(), ValueView::Num(n) if n == 30000.0));
     assert!(
         EXECUTED_REGIONS.with(std::cell::Cell::get) > before,
         "direct host call must execute the tested function's optimized region"

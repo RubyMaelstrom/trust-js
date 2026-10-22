@@ -7094,3 +7094,185 @@ change, reviewed; 2026-10-22):
   Against matched main, framework cycles improve 10.5/14.4/8.1%,
   sustained JIT/bytecode 34.8/28.2%; this does not close S0's
   outstanding React RSS or Djot GC-share bounds.
+
+Step 12e/12f tagged-helper clarification (before implementation)
+
+The tagged.rs module contains live numeric helpers as well as an
+older representation experiment. Five bytecode numeric paths use
+TaggedNumericFrame/TaggedNumberFrame; jit_ir imports neutral IDs,
+RootMap and DeoptRecord, producing CopySlot recipes. Step 12e uses
+canonical Value constructors directly in those five Number helpers,
+preserving ToInt32, Number::exponentiate edge cases and the existing
+tagged_arithmetic flag. Invalid-word and NaN tests move to the real
+Value contract. This does not remove the live IR metadata or add
+GC-bearing constants to metadata that does not trace them. Inventory
+the unused HeapRef/root/materialization experiment before the 12f
+single-representation cleanup; retain meaningful IR validation.
+
+Step 12f scaffold cleanup clarification (before implementation)
+
+The source inventory finds no live handle-table or relocation bridge
+in tagged.rs. After 12e replaces the five numeric shadow helpers,
+only jit_ir's neutral metadata imports and one side-exit validation
+test use the module. Step 12f removes the obsolete second TaggedValue,
+32-bit HeapRef, fake root set, shadow frames and toy materializer.
+It preserves root-map validation and ordered CopySlot deopt metadata
+in a neutral module, with no embedded GC values. Port meaningful
+bitmap and side-exit checks; do not retain the unused toy heap just
+for its tests. The real gc_core::NoGcScope remains unchanged.
+
+The now-redundant tagged_arithmetic field, environment switch and
+alternate Number path also retire in 12f. Preserve coercion ordering,
+ToInt32, signed zero, NaN and exponentiation edge-case coverage on the
+canonical path. Removing the flag may reorder Rust-layout Interp
+fields. The neutral 12f/12e comparison admits only measured field
+moves with source and base-register proof; it admits no semantic
+emitted-code change, guessed offset range or blanket block exemption.
+
+Step 12e callback argument roots (review finding, before the fix)
+
+Readonly argument-window review found a pre-existing gap at the
+safe callback boundary. Interp::call_callback/invoke can supply a
+Rust-heap slice to CallbackCache::call_values. Both the compiled
+fast and cached entries poll before copying parameters into their
+callee frame, but this incoming heap window had no registered root.
+The generic call and committed native call already root their input.
+
+Two isolated pre-fix probes on zombie, from source fd209928..., each
+force exactly one major pre-entry collection. The fresh argument is
+held only by a heap Vec and a weak tracker; the compiled scalar body
+performs no collection. Both fast and cached probes reach the actual
+native callee and fail their first-mark assertion: Stack rather than
+Root. Survival by a stale native-stack word does not establish the
+required boundary root. The failing source and results are retained.
+
+Root the borrowed slice in CallbackCache::call_values after its
+non-JIT generic early return, through cached/fast/fallback dispatch,
+post-call polling and tail draining. A root guard borrows the same
+window; no copy or change to emitted instructions is needed. Its
+other caller supplies a native-stack array. Prepared fixed-array
+calls retain their established Decision 0 stack-root contract; raw
+compiled entry contracts must explicitly require caller roots as
+well as stable immutable storage. Verify both pre-entry probes and
+that roots end with the call, then run the normal cross-tier gates.
+
+Step 12c: Copy values, decoded views and explicit mutable slots
+
+Value, LStr, JsBigInt and PackedValue now implement Copy. The engine
+and scoped enums retain their 16-byte layout for this preparatory
+step; distinct ValueView/ValueKind enums share variant inventories
+and explicit discriminants. Patterns across the engine and host
+crates use decoded views. Constructors retain their names; views
+are not stored. The scoped invariant brand and thread affinity stay.
+
+PackedValue is a plain 8-byte word. Property-only PropWord retains
+Cell mutability and deferred-prototype materialization; frame slots
+use Cell<PackedValue>, while operand windows use plain words. The
+FRAME_BUF backing allocation uses UnsafeCell for actual mutation;
+no mutable slice is manufactured from shared Cell storage. Binding
+string accumulation decodes, appends and writes back while its
+original binding remains rooted. Gc/Env expose inherent borrows,
+with the card barrier before mutable borrows; their Deref-to-RefCell
+escape is gone. Explicit raw payload pointers serve the few audited
+unsafe sites. Borrowed string text is tied to the original Value,
+with copied frontier append/growth and precise GC regressions.
+
+Four new tests pin Copy/size/thread affinity, every decoded variant,
+and internal/scoped borrowed text through append, growth and minor
+and major collections. Existing branding compile-fail doctests,
+barrier, alias, lazy-prototype and rooting tests remain. The source
+and expanded-pattern census covers macros and forwarding patterns.
+Key mutants remove Env::try_borrow_mut's barrier or bypass property
+promotion; both fail at the intended verifier/execution boundary.
+
+The first full zombie gate exposed one converted layout-test bug:
+it compared an original Value address to a Bool field in a decoded
+copy. The corrected test reads only the original initialized tag
+and payload byte, preserving its layout check without reading
+padding. An address-sensitive view census found no second instance.
+The failed run and exact before/after snapshots remain preserved.
+A focused ARM rerun passed; the final gates use the corrected source.
+
+The full ARM run exposed a second test assumption: the strict Math
+intrinsic hit count can lose a hit when another test invalidates the
+process-global call-cache epoch. The original failure had no epoch
+counter, so a specific concurrent invalidation cannot be identified.
+The old test passes in its own GC-stress process. Isolate its exact
+hit proof in a child that inherits stress; retain the 32-hit bound.
+A one-call positive control must hit once, then the identical call
+must miss after forced invalidation; warm again before measurement.
+The repaired test passes normally and at stress 1; the full ARM lib
+rerun is 2371/0/7 and all five clippy configurations remain clean.
+Only this ARM test module changes after the original gate; production
+builds and x64/Wine are unaffected. Source maps verify that boundary.
+
+Original ARM gate: five clippy configurations clean, fmt clean,
+rustdoc eight unchanged warnings; lib 2370/1/7 (the Math fixture),
+doctests 11/0/1; all-target workspace and downstream suites pass.
+Host 37, timers 6, fs 0, web 62/0/1, node 45, runtime 184/0/1.
+Test262 threshold 8 is 53575/53575, report identical to S5; targeted
+stress is 2080 pass and five existing ignores, no failure or timeout.
+Difftest is 138 agree, 12 budget skips, no crash. Fixtures preserve
+outputs and 56/10/160 compiles; sustained allocation collects 194
+times at both tiers with the same checksum. All nine strict dump
+pairs against selected 12b are neutral, including branch targets,
+scalar constants and consistent pointer relocations. No new or lost
+tests beyond the four expected additions. Original 492-path source
+map is unchanged throughout. Actual release DWARF confirms unchanged
+sizes and every direct member offset for Object (160), Interp (5776),
+JitCtx (328), JitFrame (2376), PropertyLayoutData (40) and Chunk (1344).
+Final zombie gate: x64 2201/0/7; Wine 2193/3/7, with exactly the same
+three baseline snapshot codec failures. Lists gain four tests and
+lose none. x64 clippy is clean; Windows has its 23 baseline
+warnings. Fixtures retain outputs, 56/10/160 JIT compiles and
+21/6/16 collections; difftest has 138 agreements, 12 budget skips,
+no crashes. All 492 source paths match the reviewed tree afterward.
+
+Relocation review found a limitation in the generic comparator:
+address range alone cannot prove a literal is a pointer. For these
+nine actual pairs, an additional source review and independent
+consumer census account for all 33895 changed literals: cache and
+epoch addresses, code residency counters, fixed environments, key
+identities, 1050 string words and 111 object identities. Private
+stub contracts and the longer-lived secondary CallIc cursor are
+explicitly checked against their source. All 549524 equal-value MOV
+pairs also have identical encodings. No numeric constant delta or
+unexplained relocation remains; this evidence does not promote the
+range-only check as sufficient for arbitrary future comparisons.
+
+Measurement on Crystal aarch64, CPU 5, rustc 1.99.1, fat LTO/cgu1:
+15 rotating rounds across six workload/tier pairs and four binaries,
+360 valid samples. The first quiet wait was deferred without samples
+while owner work used 15-18 cores; no owner process was touched.
+The actual run passed the minute gate (15 llama ticks, 4230 total
+busy ticks); other cores averaged 0.67 at the median, 3.54 maximum
+per sample. Outputs, compile counts and collection counts agree.
+Paired-bootstrap intervals and every component remain in the raw
+review. Against selected 12b, Vue/React/Djot cycles change
+-3.95/-0.005/-1.81%, instructions -5.06/-0.56/-2.56%; sustained
+JIT/bytecode cycles -1.58/-0.80%, instructions -1.84/-2.31%.
+Fixture RSS changes +1.31/-2.66/-0.41%; sustained RSS within 0.2%.
+Total GC pause changes -0.96/+1.07/+0.76%, longest pauses within
+2%; sustained total pauses fall 1.09/0.85%. Empty startup cycles
+fall 1.11%, wall median is unchanged; its noisy exit-pause interval
+is retained without a precise improvement claim.
+
+React JIT compilation's initial +4.97% estimate had a wide interval
+[-5.40,+17.98]. A separate quiet 100-pair follow-up (200 samples,
+other cores median 0.36, maximum 1.82) gives -2.12%, interval
+[-4.78,+3.36]; parse and bytecode compilation stay within 1.3%.
+The original estimates are preserved. Other primary compile costs
+remain within 2%, and emitted code/retained objects remain stable.
+No material part-level regression is found. These small pause/RSS
+movements are accepted within policy for the representation work.
+
+Against matched main, fixture cycles fall 13.49/14.42/9.74% and
+Vue instructions 14.17%. React RSS is still +45.45%, and Djot GC
+share excluding exit is 7.70%; those S0 bounds remain open. Sustained
+GC shares are 34.02/25.25% at JIT/bytecode; final S6 acceptance must
+report the applicable bounds explicitly. This part does not close
+stage criteria merely because its comparison with 12b passes.
+Fresh fat-LTO/cgu1 export (rustc 1.99.1), source unchanged throughout:
+step12c engine 46456a6c0f15, 19,983,968 bytes. Compare selected 12b
+787cbefb0836 and current-toolchain main 4de8ccc1edd4, keeping S0's
+older-toolchain main 311ae9ae5658 separately labelled.

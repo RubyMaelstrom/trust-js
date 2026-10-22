@@ -223,6 +223,7 @@ impl CallbackCache {
 mod tests {
     use super::*;
     use crate::value::Callable;
+    use crate::value::ValueView;
     use crate::{Completion, Engine};
 
     fn eval(engine: &mut Engine, source: &str) -> String {
@@ -483,7 +484,10 @@ mod tests {
         /// two objects are tracked.
         fn call_six(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
             let callee = args.first().cloned().unwrap_or(Value::Undefined);
-            let collect = matches!(args.get(1), Some(Value::Bool(true)));
+            let collect = matches!(
+                (args.get(1)).map(|__value| (__value).view()),
+                Some(ValueView::Bool(true))
+            );
             let receiver = i.new_object();
             receiver
                 .borrow_mut()
@@ -540,7 +544,10 @@ mod tests {
                     .any(|entry| entry.get().callee != 0),
                 "the site cached its compiled callee"
             );
-            (crate::value::Gc::downgrade(callee.as_obj().unwrap()), cache)
+            (
+                crate::value::Gc::downgrade(&callee.as_obj().unwrap()),
+                cache,
+            )
         });
         assert_tracked_collectable(&mut engine);
         run(&mut engine, "retained = null; 0;");
@@ -615,9 +622,13 @@ mod tests {
         for n in 0..160 {
             let arg = engine.interp.make_array(vec![Value::Num(n as f64)]);
             let result = entry.call(&mut engine.interp, Value::Undefined, [arg]);
-            assert!(matches!(result, Ok(Value::Undefined)));
+            assert!(matches!(
+                (result).map(|__value| (__value).view()),
+                Ok(ValueView::Undefined)
+            ));
         }
-        let object = entry.callee.as_obj().unwrap().borrow();
+        let object_handle = entry.callee.as_obj().unwrap();
+        let object = object_handle.borrow();
         let Callable::User(user) = &object.call else {
             panic!("user")
         };
@@ -657,7 +668,8 @@ mod tests {
             .interp
             .get_var("laterHot", &env)
             .unwrap_or_else(|_| panic!("laterHot"));
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let Callable::User(user) = &object.call else {
             panic!("user")
         };
@@ -698,7 +710,8 @@ mod tests {
             .interp
             .get_var("arrowHot", &env)
             .unwrap_or_else(|_| panic!("arrowHot"));
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let Callable::User(user) = &object.call else {
             panic!("user")
         };

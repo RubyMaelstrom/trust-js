@@ -21,6 +21,7 @@
 //! - [ ] ESM `import` of `node:` specifiers (this is the CommonJS surface); `require('esm')`
 
 use std::path::Path;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{ops, Ctx, Extension, SpawnHandle, Value};
 
@@ -441,8 +442,14 @@ fn op_rm<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
-    let recursive = matches!(args.get(1), Some(Value::Bool(true)));
-    let force = matches!(args.get(2), Some(Value::Bool(true)));
+    let recursive = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
+    let force = matches!(
+        (args.get(2)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let path = std::path::Path::new(&p);
     let result = if path.is_dir() {
         if recursive {
@@ -468,7 +475,10 @@ fn op_mkdir<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
-    let recursive = matches!(args.get(1), Some(Value::Bool(true)));
+    let recursive = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let result = if recursive {
         std::fs::create_dir_all(&p)
     } else {

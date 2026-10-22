@@ -4,6 +4,7 @@
 //! Tests that expect an object to be reclaimed hold it only inside [`in_frame`] and ask
 //! [`alive`] instead of upgrading in their own frame.
 
+use crate::value::ValueView;
 /// Run `f` in its own frame, which is popped (and then scrubbed by the next explicit
 /// collection) before the caller continues.
 #[inline(never)]
@@ -47,17 +48,15 @@ impl WeakCell for crate::interpreter::WeakEnv {
 
 impl WeakCell for crate::interpreter::WeakValue {
     fn live_address(&self) -> Option<usize> {
-        match self.upgrade() {
-            Some(crate::value::Value::Obj(object)) => {
-                Some(crate::value::Gc::as_ptr(&object) as usize)
-            }
+        match (self.upgrade()).map(|__value| (__value).view()) {
+            Some(ValueView::Obj(object)) => Some(crate::value::Gc::as_ptr(&object) as usize),
             _ => None,
         }
     }
 
     fn heap(&self) -> Option<crate::value::GcHeap> {
-        match self.upgrade() {
-            Some(crate::value::Value::Obj(object)) => Some(crate::value::object_heap(
+        match (self.upgrade()).map(|__value| (__value).view()) {
+            Some(ValueView::Obj(object)) => Some(crate::value::object_heap(
                 crate::value::Gc::as_ptr(&object) as usize,
             )),
             _ => None,
@@ -226,7 +225,7 @@ impl HiddenAddress {
     #[inline(never)]
     pub(crate) fn of(value: &crate::value::Value) -> Self {
         let object = value.as_obj().expect("an object");
-        Self(!(crate::value::Gc::as_ptr(object) as usize))
+        Self(!(crate::value::Gc::as_ptr(&object) as usize))
     }
 
     /// The address `address()` computes, in a frame of its own.

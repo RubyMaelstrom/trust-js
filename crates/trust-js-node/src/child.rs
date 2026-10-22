@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use trust_js_host::ValueKind;
 
 use trust_js_host::{ops, CompletionSender, Ctx, OpDecl, TaskId, TaskRegistry, Value};
 
@@ -77,8 +78,8 @@ fn read_string_array<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>) -> Result<Vec<String>
     if v.as_obj().is_none() {
         return Ok(out);
     }
-    let len = match ctx.get_member(v, "length") {
-        Ok(Value::Num(n)) => n as usize,
+    let len = match (ctx.get_member(v, "length")).map(|__value| (__value).kind()) {
+        Ok(ValueKind::Num(n)) => n as usize,
         _ => return Ok(out),
     };
     for i in 0..len {
@@ -101,8 +102,10 @@ fn stdio_for(name: &str) -> Stdio {
 
 fn opt_string<'s>(ctx: &mut Ctx<'s>, v: Option<&Value<'s>>) -> Option<String> {
     match v {
-        Some(text @ Value::Str(_)) => text.as_text().map(|text| text.into_owned()),
-        Some(v) if !matches!(v, Value::Undefined | Value::Null) => {
+        Some(text) if matches!(text.kind(), ValueKind::Str(_)) => {
+            text.as_text().map(|text| text.into_owned())
+        }
+        Some(v) if !matches!(&(v).kind(), ValueKind::Undefined | ValueKind::Null) => {
             ctx.coerce_string(v).ok().map(|s| s.to_string())
         }
         _ => None,
@@ -126,7 +129,9 @@ fn build_command<'s>(
     }
     // env: an array of [k, v] pairs *replaces* the environment (Node semantics); absent = inherit.
     if env_pairs.as_obj().is_some() {
-        if let Ok(Value::Num(n)) = ctx.get_member(&env_pairs, "length") {
+        if let Ok(ValueKind::Num(n)) =
+            (ctx.get_member(&env_pairs, "length")).map(|__value| (__value).kind())
+        {
             command.env_clear();
             for i in 0..(n as usize) {
                 let pair = ctx

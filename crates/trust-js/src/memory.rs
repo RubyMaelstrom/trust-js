@@ -4,6 +4,7 @@
 //! rounding or Rust's private `RcBox`/`HashMap` layouts. Every partial category says so in the
 //! emitted record; unavailable owners are never represented by a misleading zero.
 
+use crate::value::ValueView;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
@@ -582,20 +583,20 @@ impl Visitor {
     }
 
     pub(crate) fn value(&mut self, value: &Value) {
-        match value {
-            Value::BigInt(value) => {
+        match &(value).view() {
+            ValueView::BigInt(value) => {
                 self.bigint(value);
             }
-            Value::Str(value) => {
+            ValueView::Str(value) => {
                 self.lstr(value);
             }
-            Value::Sym(value) => self.symbol(value),
-            Value::Undefined
-            | Value::Empty
-            | Value::Null
-            | Value::Bool(_)
-            | Value::Num(_)
-            | Value::Obj(_) => {}
+            ValueView::Sym(value) => self.symbol(value),
+            ValueView::Undefined
+            | ValueView::Empty
+            | ValueView::Null
+            | ValueView::Bool(_)
+            | ValueView::Num(_)
+            | ValueView::Obj(_) => {}
         }
     }
 
@@ -2541,6 +2542,7 @@ mod tests {
     use crate::host::{RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory};
     use crate::lstr::LStr;
     use crate::value::Props;
+    use crate::value::ValueView;
 
     struct ReportedHostState(Vec<u8>);
 
@@ -2643,20 +2645,20 @@ mod tests {
             )
             .expect("layout fixture parses");
         let env = engine.interp.global_env.clone();
-        let Value::Obj(a) = engine
+        let ValueView::Obj(a) = (engine
             .interp
             .get_var("a", &env)
             .ok()
-            .expect("a is initialized")
-        else {
+            .expect("a is initialized"))
+        .view() else {
             panic!("a is an object")
         };
-        let Value::Obj(b) = engine
+        let ValueView::Obj(b) = (engine
             .interp
             .get_var("b", &env)
             .ok()
-            .expect("b is initialized")
-        else {
+            .expect("b is initialized"))
+        .view() else {
             panic!("b is an object")
         };
         let a = a.borrow().props.clone();
@@ -2709,7 +2711,7 @@ mod tests {
                 props,
                 Exotic::None,
             ));
-            let weak_source = Gc::downgrade(source.as_obj().unwrap());
+            let weak_source = Gc::downgrade(&source.as_obj().unwrap());
             let keys = engine
                 .interp
                 .for_in_keys(&source)

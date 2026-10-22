@@ -3,7 +3,9 @@
 //! cannot hide a moved-out owner, a widened return, or a partially committed stack result.
 
 use super::*;
+use crate::value::ValueView;
 use crate::{jit::JitCtx, Completion, Engine};
+use std::cell::Cell;
 use std::mem::MaybeUninit;
 
 #[derive(Clone, Copy, Debug)]
@@ -122,8 +124,8 @@ fn invoke(
     let prefix_len = 1;
     unsafe { base.write(PackedValue::pack(prefix)) };
 
-    let mut slots: Vec<PackedValue> = (0..chunk.n_slots)
-        .map(|_| PackedValue::pack(Value::Undefined))
+    let mut slots: Vec<Cell<PackedValue>> = (0..chunk.n_slots)
+        .map(|_| Cell::new(PackedValue::pack(Value::Undefined)))
         .collect();
     let mut this_value = Value::Undefined;
     let mut stack_len = prefix_len;
@@ -133,7 +135,7 @@ fn invoke(
             stack_len += 1;
         }
         ReadKind::Local => {
-            slots[site.slot as usize] = PackedValue::pack(receiver);
+            slots[site.slot as usize].set(PackedValue::pack(receiver));
         }
         ReadKind::This => this_value = receiver,
     }
@@ -217,8 +219,8 @@ fn binding(engine: &mut Engine, name: &str) -> Value {
 }
 
 fn same_js_value(engine: &mut Engine, expected: &Value, actual: &Value) -> bool {
-    match (expected, actual) {
-        (Value::Num(expected), Value::Num(actual)) => {
+    match (&(expected).view(), &(actual).view()) {
+        (ValueView::Num(expected), ValueView::Num(actual)) => {
             (expected.is_nan() && actual.is_nan()) || expected.to_bits() == actual.to_bits()
         }
         _ => engine.interp.strict_equals(expected, actual),
@@ -269,7 +271,7 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
             );
             assert!(outcome.error.is_none());
             let values = outcome.take_values();
-            assert!(matches!(&values[0], Value::Str(s) if s.as_str() == "prefix"));
+            assert!(matches!(&(values[0]).view(), ValueView::Str(s) if s.as_str() == "prefix"));
             let actual = values.last().expect("named read pushes its result");
             assert!(
                 same_js_value(&mut engine, expected, actual),
@@ -277,7 +279,7 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
             );
             if kind.is_method() {
                 assert!(
-                    matches!(&values[1], Value::Obj(value) if crate::value::Gc::ptr_eq(value, &receiver))
+                    matches!(&(values[1]).view(), ValueView::Obj(value) if crate::value::Gc::ptr_eq(value, &receiver))
                 );
                 assert_eq!(values.len(), 3);
             } else {
@@ -333,8 +335,13 @@ fn named_read_proxy_reentry_runs_after_borrowed_lookup_and_keeps_method_receiver
             "proxy property read failed for {kind:?}"
         );
         let values = outcome.take_values();
-        assert!(matches!(&values[0], Value::Str(value) if value.as_str() == "proxy-prefix"));
-        assert!(matches!(values.last(), Some(Value::Num(31.0))));
+        assert!(
+            matches!(&(values[0]).view(), ValueView::Str(value) if value.as_str() == "proxy-prefix")
+        );
+        assert!(matches!(
+            (values.last()).map(|__value| (__value).view()),
+            Some(ValueView::Num(31.0))
+        ));
         if kind.is_method() {
             assert!(same_js_value(&mut engine, &proxy, &values[1]));
         }

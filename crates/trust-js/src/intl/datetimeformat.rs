@@ -6,6 +6,7 @@ use super::service::{
 };
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 /// Days since the Unix epoch for a proleptic-Gregorian date (Howard Hinnant's algorithm).
@@ -110,7 +111,7 @@ pub(crate) fn install(it: &mut Interp, ns: &Gc) {
 /// Resolve both range endpoints (numbers or Temporal objects) to epoch-ms + kind. The two endpoints
 /// must be the same kind; NaN or start > end throws.
 fn range_dates(i: &mut Interp, o: &Gc, a: &Value, b: &Value) -> Result<(f64, f64, u8), Value> {
-    if matches!(a, Value::Undefined) || matches!(b, Value::Undefined) {
+    if matches!(&(a).view(), ValueView::Undefined) || matches!(&(b).view(), ValueView::Undefined) {
         return Err(i.make_error("TypeError", "formatRange requires two dates"));
     }
     // ToDateTimeFormattable each endpoint IN ORDER: a Temporal value keeps its type, a non-Temporal
@@ -129,7 +130,7 @@ fn range_dates(i: &mut Interp, o: &Gc, a: &Value, b: &Value) -> Result<(f64, f64
     };
     // Two Temporal endpoints must share a calendar (RangeError otherwise).
     let cal_of = |i: &Interp, v: &Value| -> Option<String> {
-        let ptr = Gc::as_ptr(v.as_obj()?) as usize;
+        let ptr = Gc::as_ptr(&v.as_obj()?) as usize;
         if i.temporal.contains_key(&ptr) {
             Some(
                 i.temporal_cal
@@ -189,7 +190,7 @@ fn era_cldr_index(cal: &str, code: &str) -> &'static str {
 fn range_type_tag(i: &Interp, v: &Value) -> u8 {
     use crate::temporal::Temporal as T;
     if let Some(o) = v.as_obj() {
-        if let Some(t) = i.temporal.get(&(Gc::as_ptr(o) as usize)) {
+        if let Some(t) = i.temporal.get(&(Gc::as_ptr(&o) as usize)) {
             return match t {
                 T::Date(_) => 1,
                 T::Time(_) => 2,
@@ -415,7 +416,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     }
     let hour12 = {
         let v = ab(i.get_member_key(&options, "hour12"))?;
-        if matches!(v, Value::Undefined) {
+        if matches!((v).view(), ValueView::Undefined) {
             None
         } else {
             Some(i.to_boolean(&v))
@@ -430,7 +431,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     )?;
     let time_zone = {
         let v = ab(i.get_member_key(&options, "timeZone"))?;
-        if matches!(v, Value::Undefined) {
+        if matches!((v).view(), ValueView::Undefined) {
             // ECMA-402 #sec-createdatetimeformat: SystemTimeZoneIdentifier().
             crate::builtins::system_time_zone().to_string()
         } else {
@@ -459,7 +460,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     let second = get_option(i, &options, "second", &["2-digit", "numeric"], None)?;
     let frac_sec = {
         let v = ab(i.get_member_key(&options, "fractionalSecondDigits"))?;
-        if matches!(v, Value::Undefined) {
+        if matches!((v).view(), ValueView::Undefined) {
             None
         } else {
             // GetNumberOption(1, 3): reject NaN/out-of-range, otherwise floor into [1,3].
@@ -763,11 +764,11 @@ const WD_SHORT: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 /// (1=Date, 2=Time, 3=DateTime, 4=YearMonth, 5=MonthDay, 0=any/number/instant/zoned).
 fn dtf_ms_kind(i: &mut Interp, o: &Gc, date: &Value) -> Result<(f64, u8), Value> {
     use crate::temporal::Temporal as T;
-    if matches!(date, Value::Undefined) {
+    if matches!(&(date).view(), ValueView::Undefined) {
         return Ok((0.0, 0));
     }
     if let Some(dobj) = date.as_obj() {
-        let ptr = Gc::as_ptr(dobj) as usize;
+        let ptr = Gc::as_ptr(&dobj) as usize;
         if let Some(t) = i.temporal.get(&ptr).cloned() {
             // format()/formatRange() do not accept Temporal.ZonedDateTime directly (the caller can't
             // know which time zone to use); Temporal.ZonedDateTime.prototype.toLocaleString handles it.
@@ -784,13 +785,14 @@ fn dtf_ms_kind(i: &mut Interp, o: &Gc, date: &Value) -> Result<(f64, u8), Value>
                 .get(&ptr)
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "iso8601".to_string());
-            let dcal = match o
+            let dcal = match (o
                 .borrow()
                 .internal_slots()
                 .get("#\u{0}dtf_ca")
-                .map(|p| p.value())
+                .map(|p| p.value()))
+            .map(|__value| (__value).view())
             {
-                Some(Value::Str(s)) => s.to_string(),
+                Some(ValueView::Str(s)) => s.to_string(),
                 _ => "iso8601".to_string(),
             };
             let kind = match t {
@@ -879,13 +881,14 @@ fn do_format(i: &mut Interp, this: &Value, date: &Value) -> Result<String, Value
 
 /// The formatter's numbering system id (`latn` unless set).
 fn dtf_nu(o: &Gc) -> String {
-    match o
+    match (o
         .borrow()
         .internal_slots()
         .get("#\u{0}dtf_nu")
-        .map(|p| p.value())
+        .map(|p| p.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Str(s)) => s.to_string(),
+        Some(ValueView::Str(s)) => s.to_string(),
         _ => "latn".to_string(),
     }
 }
@@ -905,13 +908,14 @@ fn do_format_ms(o: &Gc, ms: f64, kind: u8) -> String {
 }
 
 fn dtf_slot(o: &Gc, slot: &str) -> Option<String> {
-    match o
+    match (o
         .borrow()
         .internal_slots()
         .get(slot)
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Str(value)) => Some(value.to_string()),
+        Some(ValueView::Str(value)) => Some(value.to_string()),
         _ => None,
     }
 }
@@ -1026,11 +1030,12 @@ fn requested_skeleton(o: &Gc, kind: u8) -> String {
             }
         }
         if kind_allows(kind, "fracsec") {
-            if let Some(Value::Num(digits)) = o
+            if let Some(ValueView::Num(digits)) = (o
                 .borrow()
                 .internal_slots()
                 .get("#\u{0}dtf_fracsec")
-                .map(|p| p.value())
+                .map(|p| p.value()))
+            .map(|__value| (__value).view())
             {
                 skeleton.extend(std::iter::repeat_n('S', digits as usize));
             }
@@ -2009,11 +2014,12 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     // hourCycle/hour12 are resolved internally for every formatter but only surface in
     // resolvedOptions when the resolved pattern actually shows an hour.
     if matches!(
-        o.borrow()
+        (o.borrow()
             .internal_slots()
             .get("#\u{0}dtf_hourshown")
-            .map(|p| p.value()),
-        Some(Value::Bool(true))
+            .map(|p| p.value()))
+        .map(|__value| (__value).view()),
+        Some(ValueView::Bool(true))
     ) {
         put(i, &res, "hourCycle", "#\u{0}dtf_hourcycle");
         put(i, &res, "hour12", "#\u{0}dtf_hour12");

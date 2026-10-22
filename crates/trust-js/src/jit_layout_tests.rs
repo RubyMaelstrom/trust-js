@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::interpreter::{new_scope, Binding};
+use crate::value::ValueView;
 
 /// The `T` at byte offset `off` from `base`.
 fn read<T: Copy>(base: usize, off: usize) -> T {
@@ -66,7 +67,7 @@ fn global(engine: &mut crate::Engine, source: &str, name: &str) -> Gc {
     engine.eval(source, false).expect("fixture parses");
     let env = engine.interp.global_env.clone();
     let value = engine.interp.get_var(name, &env).ok().expect("bound name");
-    let Value::Obj(object) = value else {
+    let ValueView::Obj(object) = (value).view() else {
         panic!("{name} is an object")
     };
     object

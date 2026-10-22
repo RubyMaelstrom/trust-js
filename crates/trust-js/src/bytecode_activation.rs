@@ -224,6 +224,7 @@ impl ActivationPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
     use crate::{bytecode::Tier, Completion, Engine};
 
     fn evaluate(engine: &mut Engine, source: &str) -> String {
@@ -349,11 +350,11 @@ mod tests {
                 "true"
             );
             let global = engine.interp.global_env.clone();
-            let Value::Obj(one) = engine
+            let ValueView::Obj(one) = (engine
                 .interp
                 .get_var("one", &global)
-                .unwrap_or_else(|_| panic!("missing closure"))
-            else {
+                .unwrap_or_else(|_| panic!("missing closure")))
+            .view() else {
                 panic!("expected closure")
             };
             let activation = match &one.borrow().call {
@@ -422,7 +423,8 @@ mod tests {
                     .interp
                     .get_var(name, &global)
                     .unwrap_or_else(|_| panic!("missing fixture closure {name}"));
-                let object = value.as_obj().unwrap().borrow();
+                let object_handle = value.as_obj().unwrap();
+                let object = object_handle.borrow();
                 let crate::value::Callable::User(user) = &object.call else {
                     panic!("fixture closure")
                 };

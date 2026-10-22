@@ -6,6 +6,7 @@
 //! they must be uniform across tiers, and interruption must never run author cleanup.
 
 use crate::interpreter::{Abrupt, Interp, MAX_ARGUMENTS_LEN, MAX_ARRAY_OP_LEN};
+use crate::value::ValueView;
 use crate::value::{Property, Value};
 
 impl Interp {
@@ -64,7 +65,7 @@ impl Interp {
         array: &Value,
         value: Option<Value>,
     ) -> Result<(), Abrupt> {
-        let Value::Obj(array) = array else {
+        let ValueView::Obj(array) = &(array).view() else {
             unreachable!("literal builder retains an Array")
         };
         let index = self.array_length(array);
@@ -137,7 +138,7 @@ impl Interp {
         mut append: impl FnMut(&mut Interp, Value) -> Result<(), Abrupt>,
     ) -> Result<(), Abrupt> {
         self.interrupt_poll_force()?;
-        if let Value::Str(text) = spread {
+        if let ValueView::Str(text) = &(spread).view() {
             if crate::builtins::intrinsic_string_iterator_is_unmodified(self) {
                 for point in crate::jstr::CodePointIter::new(text) {
                     if count & 255 == 0 {
@@ -163,7 +164,7 @@ impl Interp {
         // Only a proven intrinsic iterator permits using the Array's private length. An Array
         // with an own/custom iterator may have an enormous length but yield just one value.
         if crate::builtins::array_iterator_fast_path_is_safe(self, spread) {
-            let Value::Obj(array) = spread else {
+            let ValueView::Obj(array) = &(spread).view() else {
                 unreachable!()
             };
             let length = self.array_length(array);

@@ -36,6 +36,7 @@
 
 use crate::interpreter::{Abrupt, Interp};
 use crate::lstr::LStr;
+use crate::value::ValueView;
 use crate::value::{Callable, Exotic, Value};
 use std::rc::Rc;
 
@@ -671,13 +672,14 @@ impl Interp {
             .last()
             .map(|frame| (frame.fn_ptr, frame.callee()));
         let name = callee.as_ref().and_then(|(_, callee)| {
-            match callee
+            match (callee
                 .borrow()
                 .props
                 .get("name")
-                .map(|property| property.value())
+                .map(|property| property.value()))
+            .map(|__value| (__value).view())
             {
-                Some(Value::Str(name)) if !name.is_empty() => Some(name),
+                Some(ValueView::Str(name)) if !name.is_empty() => Some(name),
                 _ => None,
             }
         });
@@ -817,10 +819,10 @@ impl Interp {
         if property.accessor() {
             return None;
         }
-        match property.value() {
-            Value::Num(limit) if limit.is_nan() || limit <= 0.0 => Some(0),
+        match (property.value()).view() {
+            ValueView::Num(limit) if limit.is_nan() || limit <= 0.0 => Some(0),
             // Infinity (and anything that large) keeps every frame.
-            Value::Num(limit) => Some(if limit >= usize::MAX as f64 {
+            ValueView::Num(limit) => Some(if limit >= usize::MAX as f64 {
                 usize::MAX
             } else {
                 limit as usize
@@ -929,7 +931,10 @@ impl Interp {
         let Abrupt::Throw(thrown) = thrown else {
             return;
         };
-        if let Some((mut trace, index)) = self.pending_frame(thrown) {
+        let Some(object) = thrown.as_obj() else {
+            return;
+        };
+        if let Some((mut trace, index)) = self.pending_frame(&object) {
             if is_inline_position(position) {
                 // The operation belongs to spliced callees: their frames come first.
                 let (chain, outer) = inline_chain(position);
@@ -953,7 +958,7 @@ impl Interp {
                 trace.frames[index].position = position;
             }
             trace.lines = None;
-        }
+        };
     }
 
     /// A `catch` (or `finally`) of the current context took `caught`: whatever position the
@@ -963,19 +968,19 @@ impl Interp {
     #[inline(never)]
     pub(crate) fn settle_caught(&mut self, caught: &Value) {
         self.call_site = NO_POSITION;
-        if let Some((mut trace, index)) = self.pending_frame(caught) {
+        let Some(object) = caught.as_obj() else {
+            return;
+        };
+        if let Some((mut trace, index)) = self.pending_frame(&object) {
             trace.frames[index].depth = PLACED_DEPTH;
-        }
+        };
     }
 
     /// The thrown Error's unplaced frame for the current context, as (trace, frame index).
     fn pending_frame<'a>(
         &self,
-        thrown: &'a Value,
+        object: &'a crate::value::Gc,
     ) -> Option<(std::cell::RefMut<'a, StackTrace>, usize)> {
-        let Value::Obj(object) = thrown else {
-            return None;
-        };
         let object = object.try_borrow_mut().ok()?;
         let depth = self.context_depth();
         let trace = std::cell::RefMut::filter_map(object, |object| match &mut object.exotic {
@@ -1000,8 +1005,10 @@ fn function_frame(
     depth: u32,
 ) -> Option<Frame> {
     let object = callee.borrow();
-    let name = match object.props.get("name").map(|property| property.value()) {
-        Some(Value::Str(name)) if !name.is_empty() => Some(name),
+    let name = match (object.props.get("name").map(|property| property.value()))
+        .map(|__value| (__value).view())
+    {
+        Some(ValueView::Str(name)) if !name.is_empty() => Some(name),
         _ => None,
     };
     let kind = if construct {

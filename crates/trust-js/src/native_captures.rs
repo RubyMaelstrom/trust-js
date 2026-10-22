@@ -8,10 +8,11 @@
 
 mod tests {
     use crate::interpreter::Interp;
+    use crate::value::ValueView;
     use crate::value::{Gc, Object, Property, Value};
 
-    fn object(value: &Value) -> &Gc {
-        let Value::Obj(object) = value else {
+    fn object(value: &Value) -> Gc {
+        let ValueView::Obj(object) = value.view() else {
             panic!("fixture must be an object");
         };
         object
@@ -43,7 +44,7 @@ mod tests {
                 .borrow_mut()
                 .props
                 .insert("callback", Property::builtin(callback.clone()));
-            (Gc::downgrade(&target), Gc::downgrade(object(&callback)))
+            (Gc::downgrade(&target), Gc::downgrade(&object(&callback)))
         });
         interp.gc_collect();
         assert!(
@@ -92,7 +93,7 @@ mod tests {
                     .invoke(live.clone(), Value::Null, &[])
                     .unwrap_or_else(|_| panic!("shared native invocation failed"));
                 assert!(Gc::ptr_eq(
-                    object(&result),
+                    &object(&result),
                     &weak_target.upgrade().expect("live capture")
                 ));
                 weak_target
@@ -138,7 +139,7 @@ mod tests {
                 .invoke(Value::Obj(old_owner.clone()), Value::Undefined, &[])
                 .unwrap_or_else(|_| panic!("old owner invocation failed"));
             assert!(Gc::ptr_eq(
-                object(&result),
+                &object(&result),
                 &weak_target.upgrade().expect("old owner's capture")
             ));
             weak_target
@@ -162,7 +163,7 @@ mod tests {
             interp.member_set(target, "calls", Value::Num(1.))?;
             interp.gc_collect();
             assert_eq!(interp.member_get(target, "calls")?.as_num_opt(), Some(1.));
-            if matches!(captures[1], Value::Bool(true)) {
+            if matches!((captures[1]).view(), ValueView::Bool(true)) {
                 Err(target.clone())
             } else {
                 Ok(target.clone())
@@ -195,7 +196,7 @@ mod tests {
                     _ => panic!("native completion changed"),
                 };
                 assert!(Gc::ptr_eq(
-                    object(&result),
+                    &object(&result),
                     &weak_target.upgrade().expect("active capture")
                 ));
                 weak_target

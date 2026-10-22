@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::time::Instant;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{
     ops, CallbackQueue, CompletionSender, Ctx, Engine, Extension, OpState, TaskRegistry, Value,
@@ -169,7 +170,7 @@ pub(crate) fn install_data_props(engine: &mut Engine) {
 fn install_data_props_in(ctx: &mut Ctx<'_>) {
     let global = ctx.global_this();
     let process = match ctx.get_member(&global, "process") {
-        Ok(v @ Value::Obj(_)) => v,
+        Ok(v) if v.as_obj().is_some() => v,
         _ => unreachable!("install() defined the process namespace"),
     };
 
@@ -570,7 +571,7 @@ fn op_umask<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let prev = match args.first() {
-        Some(v) if !matches!(v, Value::Undefined) => {
+        Some(v) if !matches!((v).kind(), ValueKind::Undefined) => {
             let m = ctx.coerce_number(v)? as u32;
             unsafe { ffi::umask(m) }
         }

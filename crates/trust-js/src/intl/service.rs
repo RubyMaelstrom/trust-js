@@ -4,6 +4,7 @@
 use super::{ab, arg, canonicalize_locale_list};
 use crate::interpreter::Interp;
 use crate::intl::tags;
+use crate::value::ValueView;
 use crate::value::{Gc, Property, Value};
 
 /// ECMA-402 DefaultLocale is implementation-defined. TRust JS deliberately favors US English when a
@@ -163,7 +164,7 @@ pub fn default_numbering_system(base: &str) -> &'static str {
 /// discarded (both matchers behave identically here).
 pub fn read_locale_matcher(i: &mut Interp, options: &Value) -> Result<(), Value> {
     let v = ab(i.get_member_key(options, "localeMatcher"))?;
-    if matches!(v, Value::Undefined) {
+    if matches!((v).view(), ValueView::Undefined) {
         return Ok(());
     }
     let s = ab(i.to_string(&v))?.to_string();
@@ -182,7 +183,7 @@ pub fn get_option(
     fallback: Option<&str>,
 ) -> Result<Option<String>, Value> {
     let v = ab(i.get_member_key(options, prop))?;
-    if matches!(v, Value::Undefined) {
+    if matches!((v).view(), ValueView::Undefined) {
         return Ok(fallback.map(|s| s.to_string()));
     }
     let s = ab(i.to_string(&v))?.to_string();
@@ -198,7 +199,7 @@ pub(crate) fn install_supported_locales(it: &mut Interp, ctor: &Gc) {
         let requested = canonicalize_locale_list(i, &arg(a, 0))?;
         // Validate the options bag's localeMatcher (per spec) then filter by supported language.
         let options = arg(a, 1);
-        if !matches!(options, Value::Undefined) {
+        if !matches!((options).view(), ValueView::Undefined) {
             read_locale_matcher(i, &options)?;
         }
         // FilterLocales: the requested locales with an available match.
@@ -227,10 +228,12 @@ pub(crate) fn brand_slot(i: &mut Interp, this: &Value, marker: &str) -> Result<G
 /// OrdinaryCreateFromConstructor's proto lookup: `Get(newTarget, "prototype")` (propagating a
 /// poisoned getter's error), falling back to the intrinsic prototype when it isn't an object.
 pub(crate) fn instance_proto(i: &mut Interp, intrinsic: &str) -> Result<Option<Gc>, Value> {
-    if let Value::Obj(nt) = &i.new_target {
+    if let ValueView::Obj(nt) = &(i.new_target).view() {
         let nt = nt.clone();
-        match i.get_member_key(&Value::Obj(nt.clone()), "prototype") {
-            Ok(Value::Obj(p)) => return Ok(Some(p)),
+        match (i.get_member_key(&Value::Obj(nt.clone()), "prototype"))
+            .map(|__value| (__value).view())
+        {
+            Ok(ValueView::Obj(p)) => return Ok(Some(p)),
             // GetPrototypeFromConstructor: when newTarget.prototype is not an object, use the
             // *newTarget's realm* intrinsic (found by matching its prototype chain's Function.prototype
             // against each realm), not necessarily the current realm's.

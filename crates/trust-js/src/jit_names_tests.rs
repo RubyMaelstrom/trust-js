@@ -2,6 +2,7 @@
 //! ECMA-262 e28783d5 GetIdentifierReference/GetValue/PutValue: no lookup replay after effects.
 use super::*;
 use crate::interpreter::{new_binding_layout_id, new_scope, Binding, Env};
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 use std::cell::Cell;
 
@@ -30,8 +31,10 @@ fn scope(parent: Option<Env>, key: &str, value: f64, layout: u32) -> Env {
 }
 
 fn run(engine: &mut Engine, chunk: &Rc<Chunk>, code: &JitCode, env: &Env) -> f64 {
-    match super::super::run(&mut engine.interp, chunk, code, env, Value::Undefined, &[]) {
-        Ok(Value::Num(n)) => n,
+    match (super::super::run(&mut engine.interp, chunk, code, env, Value::Undefined, &[]))
+        .map(|__value| (__value).view())
+    {
+        Ok(crate::value::ValueView::Num(n)) => n,
         _ => panic!("expected numeric native result"),
     }
 }
@@ -244,7 +247,7 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
     engine.interp.gc_collect();
     assert!(holder.try_borrow_mut().is_ok() && object.try_borrow_mut().is_ok());
     assert!(matches!(
-        object.borrow().props.get("outer").map(|p| p.value()),
-        Some(Value::Num(n)) if n == 13.0
+        (object.borrow().props.get("outer").map(|p| p.value())).map(|__value| (__value).view()),
+        Some(ValueView::Num(n)) if n == 13.0
     ));
 }

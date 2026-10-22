@@ -643,7 +643,8 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     if crate::bytecode::inline_recompile_at() == 100 {
-        let callee = callee.as_obj().unwrap().borrow();
+        let callee_handle = callee.as_obj().unwrap();
+        let callee = callee_handle.borrow();
         let crate::value::Callable::User(user) = &callee.call else {
             panic!("child user callee")
         };

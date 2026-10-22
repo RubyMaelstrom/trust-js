@@ -6,6 +6,7 @@ use super::service::{
 };
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 use std::rc::Rc;
 
@@ -116,7 +117,7 @@ fn initialize(i: &mut Interp, locales: &Value, options: &Value) -> Result<Collat
     let collation_opt = get_option(i, &options, "collation", &[], None)?;
     let numeric = {
         let v = ab(i.get_member_key(&options, "numeric"))?;
-        if matches!(v, Value::Undefined) {
+        if matches!((v).view(), ValueView::Undefined) {
             None
         } else {
             Some(i.to_boolean(&v))
@@ -133,7 +134,7 @@ fn initialize(i: &mut Interp, locales: &Value, options: &Value) -> Result<Collat
     .unwrap();
     let ignore_punct_opt = {
         let v = ab(i.get_member_key(&options, "ignorePunctuation"))?;
-        if matches!(v, Value::Undefined) {
+        if matches!((v).view(), ValueView::Undefined) {
             None
         } else {
             Some(i.to_boolean(&v))
@@ -263,14 +264,16 @@ fn stored_collate_opts(o: &Gc) -> Rc<CollateOpts> {
     }) {
         return opts;
     }
-    let get = |k: &str| match body.internal_slots().get(k).map(|p| p.value()) {
-        Some(Value::Str(s)) => s.to_string(),
+    let get = |k: &str| match (body.internal_slots().get(k).map(|p| p.value()))
+        .map(|__value| (__value).view())
+    {
+        Some(ValueView::Str(s)) => s.to_string(),
         _ => String::new(),
     };
     let getb = |k: &str| {
         matches!(
-            body.internal_slots().get(k).map(|p| p.value()),
-            Some(Value::Bool(true))
+            (body.internal_slots().get(k).map(|p| p.value())).map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         )
     };
     let opts = Rc::new(
@@ -319,9 +322,11 @@ pub(crate) fn locale_compare(
     locales: &Value,
     options: &Value,
 ) -> Result<Value, Value> {
-    let key = match (locales, options) {
-        (Value::Undefined, Value::Undefined) => Some(""),
-        (Value::Str(locale), Value::Undefined) if !locale.is_empty() => Some(locale.as_str()),
+    let key = match ((locales).view(), (options).view()) {
+        (ValueView::Undefined, ValueView::Undefined) => Some(""),
+        (ValueView::Str(locale), ValueView::Undefined) if !locale.is_empty() => {
+            locales.as_engine_text()
+        }
         _ => None,
     };
     let Some(key) = key else {

@@ -1,6 +1,7 @@
 //! Own-data shortcuts for captured Object Environment Records. ECMA-262 snapshot
 //! e28783d5fc9d: HasBinding, GetBindingValue, SetMutableBinding, OrdinaryHasProperty/Get/Set.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn run(engine: &mut Engine, source: &str) -> String {
@@ -97,8 +98,8 @@ fn prepared_reference_own_refresh_keeps_saved_owner_and_live_descriptor_strictne
     let mut reference = PreparedReference::object(Rc::from("value"), owner.clone(), false);
     reset_paths();
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(3.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(3.0))
     ));
     let prior_shape = reference.shape;
     owner.borrow_mut().props.remove("first");
@@ -120,8 +121,8 @@ fn prepared_reference_own_refresh_keeps_saved_owner_and_live_descriptor_strictne
         .insert("value", Property::plain(Value::Num(99.0)));
     assert_ne!(owner.borrow().props.shape(), prior_shape);
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(7.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(7.0))
     ));
     engine.interp.strict = true; // must not override the captured sloppy Reference.
     owner
@@ -135,8 +136,8 @@ fn prepared_reference_own_refresh_keeps_saved_owner_and_live_descriptor_strictne
         .write_prepared_reference(&mut reference, Value::Num(11.0))
         .is_ok());
     assert!(matches!(
-        owner.borrow().props.get("value").unwrap().value(),
-        Value::Num(7.0)
+        (owner.borrow().props.get("value").unwrap().value()).view(),
+        ValueView::Num(7.0)
     ));
     reference.strict = 1;
     engine.interp.strict = false;
@@ -245,8 +246,8 @@ fn prepared_reference_own_numeric_internal_names_never_bypass_mapped_arguments()
     reference.slot = owner.borrow().props.slot_of("0").unwrap_or(usize::MAX);
     reset_paths();
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(3.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(3.0))
     ));
     assert_eq!(reference.shape, 0);
     assert!(engine
@@ -254,8 +255,8 @@ fn prepared_reference_own_numeric_internal_names_never_bypass_mapped_arguments()
         .write_prepared_reference(&mut reference, Value::Num(7.0))
         .is_ok());
     assert!(matches!(
-        engine.interp.mapped_arg_value(pointer, "0"),
-        Some(Value::Num(7.0))
+        (engine.interp.mapped_arg_value(pointer, "0")).map(|__value| (__value).view()),
+        Some(ValueView::Num(7.0))
     ));
     assert_eq!(run(&mut engine, "observe()"), "7");
     assert_eq!(paths()[2], 0);
@@ -314,8 +315,8 @@ fn prepared_reference_own_exotic_host_and_exhausted_shapes_withdraw_hints() {
     owner.borrow_mut().props.force_uncacheable_shape_for_test();
     reset_paths();
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(9.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(9.0))
     ));
     assert!(engine
         .interp

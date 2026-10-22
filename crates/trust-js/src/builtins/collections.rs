@@ -4,6 +4,7 @@ use super::*;
 use crate::ordered_collection::{
     key_hash as collection_key_hash, CollectionKind, OrderedCollection,
 };
+use crate::value::ValueView;
 
 pub(super) fn install_collections(it: &mut Interp) {
     // %MapIteratorPrototype% / %SetIteratorPrototype%: distinct iterator prototypes (proto is
@@ -36,11 +37,11 @@ pub(super) fn install_map_methods(it: &mut Interp) {
     it.def_method(&mp, "getOrInsert", 2, |i, this, a| {
         let map = coll_obj_kind(i, &this, Some("Map"))?;
         let key = canonicalize_map_key(arg(a, 0));
-        if let Some(value) = collection_get(i, map, &key) {
+        if let Some(value) = collection_get(i, &map, &key) {
             return Ok(value);
         }
         let value = arg(a, 1);
-        collection_set(i, map, key, value.clone());
+        collection_set(i, &map, key, value.clone());
         Ok(value)
     });
     it.def_method(&mp, "getOrInsertComputed", 2, |i, this, a| {
@@ -51,12 +52,12 @@ pub(super) fn install_map_methods(it: &mut Interp) {
         if !cb.is_callable() {
             return Err(i.make_error("TypeError", "callback is not callable"));
         }
-        if let Some(value) = collection_get(i, map, &key) {
+        if let Some(value) = collection_get(i, &map, &key) {
             return Ok(value);
         }
         let value = ab(i.call(cb, Value::Undefined, std::slice::from_ref(&key)))?;
         // The callback may have inserted the key; the computed value overwrites that mutation.
-        collection_set(i, map, key, value.clone());
+        collection_set(i, &map, key, value.clone());
         Ok(value)
     });
 }
@@ -66,9 +67,10 @@ fn set_values(i: &mut Interp, this: &Value) -> Result<crate::rooting::RootedVec,
     // Requires a real Set [[SetData]] slot — a Map (stored the same way) is rejected.
     // Rooted: Set methods run the other set-like's methods between elements.
     let set = coll_obj_kind(i, this, Some("Set"))?;
-    let mut values = crate::rooting::RootedVec::from_vec(Vec::with_capacity(coll_live_len(i, set)));
+    let mut values =
+        crate::rooting::RootedVec::from_vec(Vec::with_capacity(coll_live_len(i, &set)));
     values.extend(
-        i.collection(set)
+        i.collection(&set)
             .expect("brand-checked Set")
             .iter()
             .map(|(key, _)| key.clone()),
@@ -169,7 +171,7 @@ fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
 }
 /// GetSetRecord: a set-like `other` exposes a numeric `size`, and callable `has` and `keys`.
 fn set_record(i: &mut Interp, other: &Value) -> Result<(Value, Value, f64), Value> {
-    if !matches!(other, Value::Obj(_)) {
+    if !matches!(&(other).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "argument is not an object"));
     }
     // GetSetRecord: size → ToNumber (NaN throws TypeError), ToIntegerOrInfinity (negative throws
@@ -204,7 +206,7 @@ fn set_like_has(i: &mut Interp, has: &Value, other: &Value, v: &Value) -> Result
 /// Open a set-like's keys iterator record: `(iterator, nextMethod)`.
 fn set_like_open(i: &mut Interp, keys: &Value, other: &Value) -> Result<(Value, Value), Value> {
     let iter = ab(i.call(keys.clone(), other.clone(), &[]))?;
-    if !matches!(iter, Value::Obj(_)) {
+    if !matches!((iter).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "set-like keys did not return an object"));
     }
     let next = ab(i.get_member_key(&iter, "next"))?;
@@ -215,7 +217,7 @@ fn set_like_open(i: &mut Interp, keys: &Value, other: &Value) -> Result<(Value, 
 /// Step a set-like keys iterator: `Some(value)` or `None` when done. `-0` is canonicalized to `+0`.
 fn set_like_next(i: &mut Interp, iter: &Value, next: &Value) -> Result<Option<Value>, Value> {
     let r = ab(i.call(next.clone(), iter.clone(), &[]))?;
-    if !matches!(r, Value::Obj(_)) {
+    if !matches!((r).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "iterator result is not an object"));
     }
     let done = ab(i.get_member_key(&r, "done"))?;
@@ -264,11 +266,11 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         // The result is rooted across the other set's `has`/`next` calls (I1).
         let mut out = crate::rooting::RootedVec::new();
         let mut result_index = crate::fasthash::FastMap::default();
-        if (coll_live_len(i, set) as f64) <= other_size {
+        if (coll_live_len(i, &set) as f64) <= other_size {
             // Walk this Set LIVE, probing the other's `has` — the callback may delete
             // and re-append entries, and the walk observes that (appended entries are visited).
-            let cursor = collection_cursor(i, set);
-            while let Some((k, _)) = collection_next(i, set, &cursor) {
+            let cursor = collection_cursor(i, &set);
+            while let Some((k, _)) = collection_next(i, &set, &cursor) {
                 if set_like_has(i, &has, &arg(a, 0), &k)? {
                     result_index_insert(&mut out, &mut result_index, k);
                 }
@@ -277,7 +279,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             // Iterate the other's keys, probing this Set's LIVE data (no `has` calls on the other).
             let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
             while let Some(k) = set_like_next(i, &iter, &next)? {
-                if set_data_has(i, set, &k) {
+                if set_data_has(i, &set, &k) {
                     result_index_insert(&mut out, &mut result_index, k);
                 }
             }
@@ -339,7 +341,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         }
         while let Some(k) = set_like_next(i, &iter, &next)? {
             let result_offset = option_result_index_find(&result, &result_index, &k);
-            if set_data_has(i, set, &k) {
+            if set_data_has(i, &set, &k) {
                 if let Some(offset) = result_offset {
                     result[offset] = None;
                     option_result_index_remove(&mut result_index, &k, offset);
@@ -357,11 +359,11 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         let (has, _keys, other_size) = set_record(i, &arg(a, 0))?;
         // A larger set cannot be a subset; otherwise every element must be in the other. The
         // receiver's data is walked LIVE by index (the `has` callback may delete entries).
-        if (coll_live_len(i, set) as f64) > other_size {
+        if (coll_live_len(i, &set) as f64) > other_size {
             return Ok(Value::Bool(false));
         }
-        let cursor = collection_cursor(i, set);
-        while let Some((k, _)) = collection_next(i, set, &cursor) {
+        let cursor = collection_cursor(i, &set);
+        while let Some((k, _)) = collection_next(i, &set, &cursor) {
             if !set_like_has(i, &has, &arg(a, 0), &k)? {
                 return Ok(Value::Bool(false));
             }
@@ -374,12 +376,12 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         // A smaller set cannot be a superset; otherwise every other key must be in this. The
         // other's keys are iterated lazily against the LIVE receiver data (the iterator may add
         // entries), closing the iterator if a missing key exits early.
-        if (coll_live_len(i, set) as f64) < other_size {
+        if (coll_live_len(i, &set) as f64) < other_size {
             return Ok(Value::Bool(false));
         }
         let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
         while let Some(k) = set_like_next(i, &iter, &next)? {
-            if !set_data_has(i, set, &k) {
+            if !set_data_has(i, &set, &k) {
                 ab(i.iterator_close_normal(&iter))?;
                 return Ok(Value::Bool(false));
             }
@@ -389,10 +391,10 @@ pub(super) fn install_set_methods(it: &mut Interp) {
     it.def_method(&sp, "isDisjointFrom", 1, |i, this, a| {
         let set = coll_obj_kind(i, &this, Some("Set"))?;
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
-        if (coll_live_len(i, set) as f64) <= other_size {
+        if (coll_live_len(i, &set) as f64) <= other_size {
             // Walk this Set LIVE by index (the `has` callback may mutate it), probing the other.
-            let cursor = collection_cursor(i, set);
-            while let Some((k, _)) = collection_next(i, set, &cursor) {
+            let cursor = collection_cursor(i, &set);
+            while let Some((k, _)) = collection_next(i, &set, &cursor) {
                 if set_like_has(i, &has, &arg(a, 0), &k)? {
                     return Ok(Value::Bool(false));
                 }
@@ -403,7 +405,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             while let Some(k) = set_like_next(i, &iter, &next)? {
                 // SetDataHas is deliberately live: the arbitrary other's iterator can mutate the
                 // receiver between steps (ECMA-262 §24.2.4.10).
-                if set_data_has(i, set, &k) {
+                if set_data_has(i, &set, &k) {
                     ab(i.iterator_close_normal(&iter))?;
                     return Ok(Value::Bool(false));
                 }
@@ -453,21 +455,17 @@ fn collection_ctor(
     }
     let mv = Value::Obj(obj);
     if let Some(src) = args.first() {
-        if !matches!(src, Value::Undefined | Value::Null) {
+        if !matches!(&(src).view(), ValueView::Undefined | ValueView::Null) {
             let add_fn = ab(i.get_member_key(&mv, if is_set { "add" } else { "set" }))?;
             if !add_fn.is_callable() {
                 return Err(i.make_error("TypeError", "adder is not callable"));
             }
             // Step the source lazily: an error while processing an entry closes the iterator.
             let (iter, next) = ab(i.get_iterator(src))?;
-            loop {
-                let item = match step_iter_with(i, &iter, &next)? {
-                    Some(v) => v,
-                    None => break,
-                };
+            while let Some(item) = step_iter_with(i, &iter, &next)? {
                 let step = if is_set {
                     i.call(add_fn.clone(), mv.clone(), &[item])
-                } else if !matches!(item, Value::Obj(_)) {
+                } else if !matches!((item).view(), ValueView::Obj(_)) {
                     Err(crate::interpreter::Abrupt::Throw(i.make_error(
                         "TypeError",
                         "iterator value is not an entry object",
@@ -540,32 +538,32 @@ pub(super) fn collection_next(
 
 fn map_size(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     let map = coll_obj_kind(i, &this, Some("Map"))?;
-    Ok(Value::Num(coll_live_len(i, map) as f64))
+    Ok(Value::Num(coll_live_len(i, &map) as f64))
 }
 
 fn set_size(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     let set = coll_obj_kind(i, &this, Some("Set"))?;
-    Ok(Value::Num(coll_live_len(i, set) as f64))
+    Ok(Value::Num(coll_live_len(i, &set) as f64))
 }
 
 /// CoerceKey for Map/Set: `-0` is canonicalized to `+0` so a stored key (and any key handed to a
 /// callback or iterated) is `+0`, per spec.
 fn canonicalize_map_key(k: Value) -> Value {
-    match k {
-        Value::Num(n) if n == 0.0 && n.is_sign_negative() => Value::Num(0.0),
-        other => other,
+    match k.view() {
+        ValueView::Num(n) if n == 0.0 && n.is_sign_negative() => Value::Num(0.0),
+        _ => k,
     }
 }
 
 pub(crate) fn map_get(i: &mut Interp, map: &Value, key: &Value) -> Result<Value, Value> {
     let map = coll_obj_kind(i, map, Some("Map"))?;
     let key = canonicalize_map_key(key.clone());
-    Ok(collection_get(i, map, &key).unwrap_or(Value::Undefined))
+    Ok(collection_get(i, &map, &key).unwrap_or(Value::Undefined))
 }
 
 pub(crate) fn map_set(i: &mut Interp, map: &Value, key: Value, value: Value) -> Result<(), Value> {
     let map = coll_obj_kind(i, map, Some("Map"))?;
-    collection_set(i, map, canonicalize_map_key(key), value);
+    collection_set(i, &map, canonicalize_map_key(key), value);
     Ok(())
 }
 
@@ -601,13 +599,13 @@ pub(super) fn install_map_like(
     let clear_fn: NativeFn = if is_set {
         |i, this, _| {
             let set = coll_obj_kind(i, &this, Some("Set"))?;
-            collection_clear(i, set);
+            collection_clear(i, &set);
             Ok(Value::Undefined)
         }
     } else {
         |i, this, _| {
             let map = coll_obj_kind(i, &this, Some("Map"))?;
-            collection_clear(i, map);
+            collection_clear(i, &map);
             Ok(Value::Undefined)
         }
     };
@@ -906,11 +904,10 @@ fn weak_remove(
 /// semantics and error), for the per-key methods below.
 fn collection_of_kind<'a>(
     i: &'a Interp,
-    this: &'a Value,
+    object: Option<&'a Gc>,
     kind: crate::ordered_collection::CollectionKind,
 ) -> Result<crate::ordered_collection::CollectionRef<'a>, Value> {
-    let data = this
-        .as_obj()
+    let data = object
         .and_then(|object| i.collection(object))
         .filter(|data| data.kind() == kind);
     data.ok_or_else(|| i.make_error("TypeError", "method called on an incompatible receiver"))
@@ -919,7 +916,7 @@ fn collection_of_kind<'a>(
 /// The key argument after CoerceKey's `-0` → `+0`, borrowed when unchanged.
 fn coerced_key(a: &[Value]) -> std::borrow::Cow<'_, Value> {
     match a.first() {
-        Some(Value::Num(n)) if *n == 0.0 && n.is_sign_negative() => {
+        Some(key) if matches!(key.view(), ValueView::Num(n) if n == 0.0 && n.is_sign_negative()) => {
             std::borrow::Cow::Owned(Value::Num(0.0))
         }
         Some(key) => std::borrow::Cow::Borrowed(key),
@@ -928,7 +925,12 @@ fn coerced_key(a: &[Value]) -> std::borrow::Cow<'_, Value> {
 }
 
 pub(crate) fn nf_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    let data = collection_of_kind(i, &this, crate::ordered_collection::CollectionKind::Map)?;
+    let object = this.as_obj();
+    let data = collection_of_kind(
+        i,
+        object.as_ref(),
+        crate::ordered_collection::CollectionKind::Map,
+    )?;
     Ok(data
         .get(&coerced_key(a))
         .cloned()
@@ -938,7 +940,7 @@ pub(crate) fn nf_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Val
 pub(crate) fn nf_map_set(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     // `map_set` with one [[MapData]] lookup (`insert` canonicalizes -0).
     let inserted = match this.as_obj() {
-        Some(object) => match i.collection_mut(object) {
+        Some(object) => match i.collection_mut(&object) {
             Some(mut data) if data.kind() == crate::ordered_collection::CollectionKind::Map => {
                 data.insert(arg(a, 0), arg(a, 1));
                 true
@@ -954,32 +956,42 @@ pub(crate) fn nf_map_set(i: &mut Interp, this: Value, a: &[Value]) -> Result<Val
 }
 
 pub(crate) fn nf_map_has(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    let data = collection_of_kind(i, &this, crate::ordered_collection::CollectionKind::Map)?;
+    let object = this.as_obj();
+    let data = collection_of_kind(
+        i,
+        object.as_ref(),
+        crate::ordered_collection::CollectionKind::Map,
+    )?;
     Ok(Value::Bool(data.has(&coerced_key(a))))
 }
 
 pub(crate) fn nf_map_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     let map = coll_obj_kind(i, &this, Some("Map"))?;
     let key = canonicalize_map_key(arg(a, 0));
-    Ok(Value::Bool(collection_delete(i, map, &key)))
+    Ok(Value::Bool(collection_delete(i, &map, &key)))
 }
 
 pub(crate) fn nf_set_add(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     let set = coll_obj_kind(i, &this, Some("Set"))?;
     let key = canonicalize_map_key(arg(a, 0));
-    collection_set(i, set, key.clone(), key);
+    collection_set(i, &set, key.clone(), key);
     Ok(this)
 }
 
 pub(crate) fn nf_set_has(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    let data = collection_of_kind(i, &this, crate::ordered_collection::CollectionKind::Set)?;
+    let object = this.as_obj();
+    let data = collection_of_kind(
+        i,
+        object.as_ref(),
+        crate::ordered_collection::CollectionKind::Set,
+    )?;
     Ok(Value::Bool(data.has(&coerced_key(a))))
 }
 
 pub(crate) fn nf_set_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     let set = coll_obj_kind(i, &this, Some("Set"))?;
     let key = canonicalize_map_key(arg(a, 0));
-    Ok(Value::Bool(collection_delete(i, set, &key)))
+    Ok(Value::Bool(collection_delete(i, &set, &key)))
 }
 
 pub(crate) fn nf_weak_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {

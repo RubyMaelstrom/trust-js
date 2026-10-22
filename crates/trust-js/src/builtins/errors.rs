@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::stack_trace::Skip;
+use crate::value::ValueView;
 
 pub(super) fn install_errors(it: &mut Interp) {
     // Base Error first (its prototype's proto is Object.prototype).
@@ -19,18 +20,18 @@ pub(super) fn install_errors(it: &mut Interp) {
     set_builtin(&error_proto, "name", Value::lstr("Error"));
     set_builtin(&error_proto, "message", Value::lstr(""));
     it.def_method(&error_proto, "toString", 0, |i, this, _| {
-        if !matches!(this, Value::Obj(_)) {
+        if !matches!((this).view(), ValueView::Obj(_)) {
             return Err(i.make_error(
                 "TypeError",
                 "Error.prototype.toString called on a non-object",
             ));
         }
         let name = match ab(i.get_member_key(&this, "name"))? {
-            Value::Undefined => crate::lstr::LStr::from("Error"),
+            v if matches!(v.view(), ValueView::Undefined) => crate::lstr::LStr::from("Error"),
             v => ab(i.to_string(&v))?,
         };
         let msg = match ab(i.get_member_key(&this, "message"))? {
-            Value::Undefined => crate::lstr::LStr::from(""),
+            v if matches!(v.view(), ValueView::Undefined) => crate::lstr::LStr::from(""),
             v => ab(i.to_string(&v))?,
         };
         Ok(Value::Str(if msg.is_empty() {
@@ -49,8 +50,8 @@ pub(super) fn install_errors(it: &mut Interp) {
     // was not a Number at construction. The setter shadows this with an own data property, so
     // `err.stack = x` caches as usual.
     let get_stack = it.make_native("get stack", 0, |i, this, _| {
-        let lines = match &this {
-            Value::Obj(o) => match &mut o.borrow_mut().exotic {
+        let lines = match &(this).view() {
+            ValueView::Obj(o) => match &mut o.borrow_mut().exotic {
                 Exotic::Error(Some(trace)) => trace.lines(),
                 _ => return Ok(Value::Undefined),
             },
@@ -65,8 +66,8 @@ pub(super) fn install_errors(it: &mut Interp) {
     });
     // set stack: SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v).
     let set_stack = it.make_native("set stack", 1, |i, this, a| {
-        let o = match &this {
-            Value::Obj(o) => o.clone(),
+        let o = match &(this).view() {
+            ValueView::Obj(o) => o.clone(),
             _ => {
                 return Err(i.make_error(
                     "TypeError",
@@ -76,7 +77,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         };
         // The value must be a String.
         let v = arg(a, 0);
-        if !matches!(v, Value::Str(_)) {
+        if !matches!((v).view(), ValueView::Str(_)) {
             return Err(i.make_error(
                 "TypeError",
                 "Error.prototype.stack setter requires a string value",
@@ -88,7 +89,10 @@ pub(super) fn install_errors(it: &mut Interp) {
         }
         // [[GetOwnProperty]]("stack") (proxy-aware): does the receiver already have its own stack?
         let has_own = if let Some((t, h)) = proxy_pair(i, &this) {
-            !matches!(proxy_gopd_value(i, &t, &h, "stack")?, Value::Undefined)
+            !matches!(
+                (proxy_gopd_value(i, &t, &h, "stack")?).view(),
+                ValueView::Undefined
+            )
         } else {
             o.borrow().props.contains("stack")
         };
@@ -169,7 +173,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         if name == "Error" {
             it.def_method(&ctor, "isError", 1, |_i, _t, a| {
                 Ok(Value::Bool(
-                    matches!(arg(a, 0), Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Error(_))),
+                    matches!((arg(a, 0)).view(), ValueView::Obj(o) if matches!(o.borrow().exotic, Exotic::Error(_))),
                 ))
             });
             // V8's stack-trace controls, which libraries feature-test. Captures read the limit
@@ -209,19 +213,19 @@ pub(super) fn install_errors(it: &mut Interp) {
     let agg_ctor = it.make_native("AggregateError", 2, |i, _t, a| {
         let err = i.make_error_skipping("AggregateError", "", constructor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
-        if matches!(i.new_target, Value::Obj(_)) {
+        if matches!((i.new_target).view(), ValueView::Obj(_)) {
             let nt = i.new_target.clone();
-            let proto = match i.get_member_key(&nt, "prototype") {
-                Ok(Value::Obj(p)) => Some(p),
+            let proto = match (i.get_member_key(&nt, "prototype")).map(|__value| (__value).view()) {
+                Ok(ValueView::Obj(p)) => Some(p),
                 _ => ctor_realm_proto(i, &nt, "AggregateError")?
                     .or_else(|| i.error_protos.get("AggregateError").cloned()),
             };
-            if let (Value::Obj(o), Some(p)) = (&err, proto) {
+            if let (ValueView::Obj(o), Some(p)) = (&(err).view(), proto) {
                 o.borrow_mut().proto = Some(p);
             }
         }
         // The spec order is: message, then cause, then the (iterated) errors list — last.
-        if !matches!(arg(a, 1), Value::Undefined) {
+        if !matches!((arg(a, 1)).view(), ValueView::Undefined) {
             let s = ab(i.to_string(&arg(a, 1)))?;
             if let Some(o) = err.as_obj() {
                 o.borrow_mut()
@@ -262,18 +266,18 @@ pub(super) fn install_errors(it: &mut Interp) {
     let sup_ctor = it.make_native("SuppressedError", 3, |i, _t, a| {
         let err = i.make_error_skipping("SuppressedError", "", constructor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
-        if matches!(i.new_target, Value::Obj(_)) {
+        if matches!((i.new_target).view(), ValueView::Obj(_)) {
             let nt = i.new_target.clone();
-            let proto = match i.get_member_key(&nt, "prototype") {
-                Ok(Value::Obj(p)) => Some(p),
+            let proto = match (i.get_member_key(&nt, "prototype")).map(|__value| (__value).view()) {
+                Ok(ValueView::Obj(p)) => Some(p),
                 _ => ctor_realm_proto(i, &nt, "SuppressedError")?
                     .or_else(|| i.error_protos.get("SuppressedError").cloned()),
             };
-            if let (Value::Obj(o), Some(p)) = (&err, proto) {
+            if let (ValueView::Obj(o), Some(p)) = (&(err).view(), proto) {
                 o.borrow_mut().proto = Some(p);
             }
         }
-        if !matches!(arg(a, 2), Value::Undefined) {
+        if !matches!((arg(a, 2)).view(), ValueView::Undefined) {
             let s = ab(i.to_string(&arg(a, 2)))?;
             if let Some(o) = err.as_obj() {
                 o.borrow_mut()
@@ -311,8 +315,8 @@ pub(super) fn install_errors(it: &mut Interp) {
 /// including the innermost call of new.target when that is a JavaScript function, so a
 /// subclass's constructors (and its `super()` chain) do not appear in its errors' stacks.
 fn constructor_skip(i: &Interp) -> Skip {
-    match &i.new_target {
-        Value::Obj(target) if matches!(target.borrow().call, Callable::User(_)) => {
+    match &(i.new_target).view() {
+        ValueView::Obj(target) if matches!(target.borrow().call, Callable::User(_)) => {
             Skip::UntilSeen(Gc::as_ptr(target) as usize)
         }
         _ => Skip::None,
@@ -324,11 +328,11 @@ fn constructor_skip(i: &Interp) -> Skip {
 fn stack_string(i: &mut Interp, error: &Value, lines: &str) -> Result<Value, Value> {
     let perf_started = crate::jit::perf_stage_start();
     let name = match ab(i.get_member_key(error, "name"))? {
-        Value::Undefined => "Error".to_string(),
+        v if matches!(v.view(), ValueView::Undefined) => "Error".to_string(),
         v => ab(i.to_string(&v))?.to_string(),
     };
     let msg = match ab(i.get_member_key(error, "message"))? {
-        Value::Undefined => String::new(),
+        v if matches!(v.view(), ValueView::Undefined) => String::new(),
         v => ab(i.to_string(&v))?.to_string(),
     };
     let head = if msg.is_empty() {
@@ -347,11 +351,11 @@ fn stack_string(i: &mut Interp, error: &Value, lines: &str) -> Result<Value, Val
 /// `constructorOpt` when given (everything if it is not on the stack), and install it as an own
 /// accessor `stack` on `target` that formats it with `target`'s current name and message.
 fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let Value::Obj(target) = arg(args, 0) else {
+    let ValueView::Obj(target) = (arg(args, 0)).view() else {
         return Err(i.make_error("TypeError", "Error.captureStackTrace requires an object"));
     };
-    let skip = match arg(args, 1) {
-        Value::Obj(function) if arg(args, 1).is_callable() => {
+    let skip = match (arg(args, 1)).view() {
+        ValueView::Obj(function) if arg(args, 1).is_callable() => {
             Skip::UntilSeen(Gc::as_ptr(&function) as usize)
         }
         _ => Skip::None,
@@ -372,7 +376,7 @@ fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
         0,
         Rc::new(
             move |i: &mut Interp, this: Value, _: &[Value], _names: &[Value]| {
-                let installed = matches!(&this, Value::Obj(object)
+                let installed = matches!(&(this).view(), ValueView::Obj(object)
                     if std::ptr::eq(Gc::as_ptr(object), holder.as_ptr()));
                 let lines = match trace.0.borrow_mut().as_deref_mut() {
                     Some(trace) if installed => trace.lines(),
@@ -389,7 +393,7 @@ fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
         "",
         1,
         Rc::new(|i: &mut Interp, this: Value, args: &[Value]| {
-            if let Value::Obj(object) = &this {
+            if let ValueView::Obj(object) = &(this).view() {
                 let desc = data_descriptor(i, arg(args, 0));
                 ab(define_own_property(i, object, "stack", &desc))?;
             }
@@ -430,18 +434,18 @@ fn data_descriptor(i: &Interp, value: Value) -> Value {
 fn make_err(i: &mut Interp, kind: &str, args: &[Value]) -> Result<Value, Value> {
     let err = i.make_error_skipping(kind, "", constructor_skip(i));
     // OrdinaryCreateFromConstructor: a subclass / Reflect.construct new.target sets the prototype.
-    if matches!(i.new_target, Value::Obj(_)) {
+    if matches!((i.new_target).view(), ValueView::Obj(_)) {
         let nt = i.new_target.clone();
-        let proto = match i.get_member_key(&nt, "prototype") {
-            Ok(Value::Obj(p)) => Some(p),
+        let proto = match (i.get_member_key(&nt, "prototype")).map(|__value| (__value).view()) {
+            Ok(ValueView::Obj(p)) => Some(p),
             _ => ctor_realm_proto(i, &nt, kind)?.or_else(|| i.error_protos.get(kind).cloned()),
         };
-        if let (Value::Obj(o), Some(p)) = (&err, proto) {
+        if let (ValueView::Obj(o), Some(p)) = (&(err).view(), proto) {
             o.borrow_mut().proto = Some(p);
         }
     }
     if let Some(msg) = args.first() {
-        if !matches!(msg, Value::Undefined) {
+        if !matches!(&(msg).view(), ValueView::Undefined) {
             // ToString(message) may throw (e.g. a Symbol, or a throwing toString) — propagate it.
             let perf_started = crate::jit::perf_stage_start();
             let s = ab(i.to_string(msg))?;
@@ -466,7 +470,7 @@ pub(super) fn install_error_cause(
     err: &Value,
     options: Option<&Value>,
 ) -> Result<(), Value> {
-    if let Some(opts @ Value::Obj(_)) = options {
+    if let Some(opts) = options.filter(|value| value.as_obj().is_some()) {
         if ab(i.js_has_property(opts, "cause"))? {
             let cause = ab(i.get_member_key(opts, "cause"))?;
             if let Some(e) = err.as_obj() {

@@ -3,6 +3,7 @@
 //! sinks live in `OpState` so tests (and later, embedders) can capture them.
 
 use std::io::Write;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{ops, Ctx, Extension, OpState, Value};
 
@@ -46,16 +47,22 @@ impl Default for ConsoleOut {
 /// by description, everything else through ToString. Never throws — a value whose `toString`
 /// throws prints as its typeof. (A real `util.inspect` is future work.)
 fn render<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>) -> String {
-    match v {
-        Value::Str(_) => v.as_text().unwrap_or_default().into_owned(),
-        Value::Sym(s) => match s.description() {
-            Some(d) => format!("Symbol({d})"),
-            None => "Symbol()".into(),
-        },
-        other => match ctx.coerce_string(other) {
-            Ok(s) => s.to_string(),
-            Err(_) => format!("[{}]", other.type_of()),
-        },
+    {
+        let __value_match_original = v;
+        match &(__value_match_original).kind() {
+            ValueKind::Str(_) => v.as_text().unwrap_or_default().into_owned(),
+            ValueKind::Sym(s) => match s.description() {
+                Some(d) => format!("Symbol({d})"),
+                None => "Symbol()".into(),
+            },
+            _ => {
+                let other = __value_match_original;
+                match ctx.coerce_string(other) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => format!("[{}]", other.type_of()),
+                }
+            }
+        }
     }
 }
 
@@ -129,12 +136,12 @@ pub fn describe_error<'s>(ctx: &mut Ctx<'s>, error: &Value<'s>) -> String {
         let name = ctx
             .get_member(error, "name")
             .ok()
-            .filter(|v| !matches!(v, Value::Undefined))
+            .filter(|v| !matches!(&(v).kind(), ValueKind::Undefined))
             .map(|v| render(ctx, &v));
         let message = ctx
             .get_member(error, "message")
             .ok()
-            .filter(|v| !matches!(v, Value::Undefined))
+            .filter(|v| !matches!(&(v).kind(), ValueKind::Undefined))
             .map(|v| render(ctx, &v));
         if let Some(name) = name {
             return match message {

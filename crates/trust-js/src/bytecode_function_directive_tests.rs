@@ -18,7 +18,8 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
     let env = engine.interp.global_env.clone();
     let value = engine.interp.get_var(name, &env).ok().unwrap();
-    let object = value.as_obj().unwrap().borrow();
+    let object_handle = value.as_obj().unwrap();
+    let object = object_handle.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("user function")
     };
@@ -38,10 +39,7 @@ fn strings(chunk: &Chunk) -> Vec<&str> {
     chunk
         .consts
         .iter()
-        .filter_map(|value| match value {
-            Value::Str(string) => Some(string.as_str()),
-            _ => None,
-        })
+        .filter_map(Value::as_engine_text)
         .collect()
 }
 
@@ -326,7 +324,8 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
         }
         let env = engine.interp.global_env.clone();
         let value = engine.interp.get_var("subject", &env).ok().unwrap();
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("prepared user")
         };

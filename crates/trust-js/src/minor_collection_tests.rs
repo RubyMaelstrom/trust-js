@@ -13,7 +13,8 @@
 use crate::bytecode::Tier;
 use crate::gc_core::CollectionKind;
 use crate::gc_test::alive;
-use crate::value::{Gc, Value, WeakGc};
+use crate::value::ValueView;
+use crate::value::{Gc, WeakGc};
 use crate::{Completion, Engine};
 
 /// An engine at `tier` (threshold 0) whose heap has no stress interval.
@@ -40,8 +41,8 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 #[inline(never)]
 fn weak_global(engine: &mut Engine, name: &str) -> WeakGc {
     let env = engine.interp.global_env.clone();
-    match engine.interp.get_var(name, &env) {
-        Ok(Value::Obj(object)) => Gc::downgrade(&object),
+    match (engine.interp.get_var(name, &env)).map(|__value| (__value).view()) {
+        Ok(ValueView::Obj(object)) => Gc::downgrade(&object),
         _ => panic!("{name}: not an object"),
     }
 }

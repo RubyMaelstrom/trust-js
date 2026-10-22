@@ -43,6 +43,7 @@ struct View {
 /// See the module docs. `repr(transparent)`: one pointer, which the embedder's scoped strings
 /// (`scope::JsString`) are too.
 #[repr(transparent)]
+#[derive(Clone, Copy)]
 pub struct LStr {
     p: NonNull<Header>,
 }
@@ -544,21 +545,6 @@ impl LStr {
         mapped.set_fresh_len(source.len());
         mapped
     }
-}
-
-impl Clone for LStr {
-    #[inline]
-    fn clone(&self) -> LStr {
-        LStr { p: self.p }
-    }
-}
-
-/// Nothing to release: the collector frees unreachable cells. The empty impl keeps `LStr`, and
-/// so `Value`, a type with drop glue until S6's criterion closure decides how far values become
-/// `Copy`.
-impl Drop for LStr {
-    #[inline]
-    fn drop(&mut self) {}
 }
 
 impl std::ops::Deref for LStr {

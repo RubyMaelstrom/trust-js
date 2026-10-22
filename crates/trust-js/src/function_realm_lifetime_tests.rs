@@ -4,6 +4,7 @@
 use crate::interpreter::Abrupt;
 use crate::realm_inline_guard_tests::{eval_string, in_realm, set_global, TIERS};
 use crate::value::Value;
+use crate::value::ValueView;
 use crate::Engine;
 
 fn prototype_identity(value: &Value) -> usize {
@@ -30,8 +31,8 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
         let (weak_global, old_environment, hidden_key) = crate::gc_test::in_frame(|| {
             let realm = engine.interp.create_realm();
             let global = realm.as_obj().expect("Realm global");
-            let realm_key = crate::value::Gc::as_ptr(global) as usize;
-            let weak_global = crate::value::Gc::downgrade(global);
+            let realm_key = crate::value::Gc::as_ptr(&global) as usize;
+            let weak_global = crate::value::Gc::downgrade(&global);
             let (closure, constructor, old_environment, array_proto, object_proto, error_proto) =
                 in_realm(&mut engine.interp, &realm, |i| {
                     i.switch_host_job_context(41);
@@ -59,7 +60,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                         let binding = record.vars.get("this").expect("global this binding");
                         assert!(!binding.mutable && !binding.deletable);
                         assert!(crate::value::Gc::ptr_eq(
-                            binding.value.as_obj().expect("original global"),
+                            &binding.value.as_obj().expect("original global"),
                             &i.global
                         ));
                     }
@@ -69,13 +70,13 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                     assert!(constructor.as_obj().unwrap().borrow().proto.is_none());
                     // Exclude an accidentally retained intrinsic as an alternate Realm root.
                     for binding in old.borrow().vars.values() {
-                        if let Value::Obj(object) = &binding.value {
+                        if let ValueView::Obj(object) = &(binding.value).view() {
                             assert!(
                                 crate::value::Gc::ptr_eq(object, &i.global)
-                                    || crate::value::Gc::ptr_eq(object, closure.as_obj().unwrap())
+                                    || crate::value::Gc::ptr_eq(object, &closure.as_obj().unwrap())
                                     || crate::value::Gc::ptr_eq(
                                         object,
-                                        constructor.as_obj().unwrap()
+                                        &constructor.as_obj().unwrap()
                                     )
                             );
                         }
@@ -91,7 +92,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                         let binding = record.vars.get("this").expect("replacement this binding");
                         assert!(!binding.mutable && !binding.deletable);
                         assert!(crate::value::Gc::ptr_eq(
-                            binding.value.as_obj().expect("same Realm global"),
+                            &binding.value.as_obj().expect("same Realm global"),
                             &i.global
                         ));
                     }
@@ -128,7 +129,9 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                     .ok()
                     .expect("retained constructor");
                 assert_eq!(
-                    engine.interp.callee_realm_global(closure.as_obj().unwrap()),
+                    engine
+                        .interp
+                        .callee_realm_global(&closure.as_obj().unwrap()),
                     Some(realm_key),
                     "{tier:?}"
                 );

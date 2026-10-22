@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, T
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{ops, CallbackQueue, CompletionSender, Ctx, OpDecl, TaskRegistry, Value};
 
@@ -32,7 +33,10 @@ fn op_upgrade<'s>(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect();
-    let verify_peer = !matches!(args.get(3), Some(Value::Bool(false)));
+    let verify_peer = !matches!(
+        (args.get(3)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(false))
+    );
     let (resolve, reject) = callbacks(ctx, args.get(4), args.get(5))?;
     let tcp = crate::net::take_stream(ctx, socket_id)?;
     let local = tcp
@@ -160,7 +164,10 @@ fn op_connect<'s>(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect();
-    let verify_peer = !matches!(args.get(4), Some(Value::Bool(false)));
+    let verify_peer = !matches!(
+        (args.get(4)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(false))
+    );
     let (resolve, reject) = callbacks(ctx, args.get(5), args.get(6))?;
     let task = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_connect)?;
     completions(ctx).run_blocking(task, move || {

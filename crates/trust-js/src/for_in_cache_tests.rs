@@ -1,6 +1,7 @@
 //! EnumerateObjectProperties / CreateForInIterator, official ECMA-262 local snapshot
 //! e28783d5fc9dc12b3de905961e2c71410b38a202. Candidate storage is unobservable; live
 //! deletion, key order, shadowing and each activation's independent cursor are not.
+use crate::value::ValueView;
 use crate::value::{heap_allocated_objects, Object, Property, Value};
 use crate::{bytecode::Tier, Completion, Engine};
 use std::rc::Rc;
@@ -99,13 +100,13 @@ fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
         let weak_layout = crate::gc_handle::WeakRef::to(layout.as_ptr() as usize);
         let a = predicted_object(&layout, 1);
         let b = predicted_object(&layout, 2);
-        let weak_a = crate::value::Gc::downgrade(a.as_obj().unwrap());
+        let weak_a = crate::value::Gc::downgrade(&a.as_obj().unwrap());
         let first = backing(&mut engine, &a);
         let second = backing(&mut engine, &b);
         assert_eq!(key_at(&first, 0), "a");
         assert_eq!(key_at(&second, 1), "b");
         assert!(
-            !crate::value::Gc::ptr_eq(first.as_obj().unwrap(), second.as_obj().unwrap()),
+            !crate::value::Gc::ptr_eq(&first.as_obj().unwrap(), &second.as_obj().unwrap()),
             "live prefix participates in proof"
         );
         let identity = layout.as_ptr();
@@ -186,16 +187,17 @@ fn for_in_cache_accounts_unused_predictions_and_detaches_on_mutation() {
 }
 
 fn key_at(backing: &Value, index: u32) -> String {
-    match backing
+    match (backing
         .as_obj()
         .unwrap()
         .borrow()
         .props
         .get_index(index)
         .unwrap()
-        .value()
+        .value())
+    .view()
     {
-        Value::Str(key) => key.to_string(),
+        ValueView::Str(key) => key.to_string(),
         _ => panic!("candidate must be a string"),
     }
 }
@@ -224,13 +226,14 @@ fn for_in_backing_hits_share_identity_without_retaining_author_objects() {
         for _ in 0..1000 {
             let next = backing(&mut engine, &source);
             assert!(crate::value::Gc::ptr_eq(
-                keys.as_obj().unwrap(),
-                next.as_obj().unwrap()
+                &keys.as_obj().unwrap(),
+                &next.as_obj().unwrap()
             ));
         }
         assert_eq!(heap_allocated_objects(&engine.interp.gc_heap), allocated);
         {
-            let object = keys.as_obj().unwrap().borrow();
+            let object_handle = keys.as_obj().unwrap();
+            let object = object_handle.borrow();
             assert!(object.proto.is_none());
             assert!(!object.extensible);
             for index in 0..2 {

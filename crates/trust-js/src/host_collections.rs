@@ -3,6 +3,7 @@
 //! effects; indexed/named value getters remain ordinary traced callables.
 
 use crate::interpreter::{Abrupt, Interp};
+use crate::value::ValueView;
 use crate::value::{Gc, Value};
 
 impl Interp {
@@ -64,7 +65,7 @@ impl Interp {
         }
         let mut prototype = crate::builtins::js_get_prototype_of(self, &Value::Obj(object.clone()))
             .map_err(Abrupt::Throw)?;
-        while matches!(prototype, Value::Obj(_)) {
+        while matches!((prototype).view(), ValueView::Obj(_)) {
             if crate::builtins::has_own_property_trapped(self, &prototype, key)
                 .map_err(Abrupt::Throw)?
             {

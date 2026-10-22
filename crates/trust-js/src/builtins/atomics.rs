@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::interpreter::{AsyncWait, BlockedAgent, WaitOutcome, Waiter};
+use crate::value::ValueView;
 use std::time::Duration;
 
 /// `Atomics` over integer TypedArrays. A shared buffer's read-modify-write operations hold its
@@ -254,16 +255,22 @@ pub(super) fn install_atomics(it: &mut Interp) {
         require_waitable(i, &arg(a, 0))?;
         let (info, idx) = target(i, a)?;
         // count = ToIntegerOrInfinity(arg2), default +Infinity (= all); negative clamps to 0.
-        let count: i64 = match arg(a, 2) {
-            Value::Undefined => -1,
-            v => {
-                let n = ab(i.to_number(&v))?;
-                if n.is_nan() || n < 0.0 {
-                    0
-                } else if n == f64::INFINITY {
-                    -1
-                } else {
-                    n as i64
+        let count: i64 = {
+            let __value_match_original = arg(a, 2);
+            match (__value_match_original).view() {
+                ValueView::Undefined => -1,
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let n = ab(i.to_number(&v))?;
+                        if n.is_nan() || n < 0.0 {
+                            0
+                        } else if n == f64::INFINITY {
+                            -1
+                        } else {
+                            n as i64
+                        }
+                    }
                 }
             }
         };
@@ -332,9 +339,9 @@ pub(super) fn install_atomics(it: &mut Interp) {
     });
     it.def_method(&atomics, "pause", 0, |i, _t, a| {
         // The optional iterationNumber, if present, must be an integral Number.
-        match arg(a, 0) {
-            Value::Undefined => {}
-            Value::Num(n) if n.fract() == 0.0 && n.is_finite() => {}
+        match (arg(a, 0)).view() {
+            ValueView::Undefined => {}
+            ValueView::Num(n) if n.fract() == 0.0 && n.is_finite() => {}
             _ => {
                 return Err(i.make_error(
                     "TypeError",

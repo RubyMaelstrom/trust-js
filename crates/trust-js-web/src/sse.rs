@@ -13,6 +13,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{CompletionSender, Ctx, TaskRegistry, Value};
 
@@ -406,8 +407,8 @@ pub(crate) fn op_sse_close<'s>(
     _this: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) => n as u64,
         _ => return Err(ctx.make_error("TypeError", "close: bad connection id")),
     };
     if let Some(e) = sse_registry(ctx).conns.get_mut(&id) {

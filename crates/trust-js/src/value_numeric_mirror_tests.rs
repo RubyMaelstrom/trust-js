@@ -1,4 +1,5 @@
 use super::*;
+use crate::value::ValueView;
 
 fn packed(length: usize) -> Props {
     let initial = length.min(32);
@@ -154,7 +155,9 @@ fn packed_mirror_clone_is_independent_and_preparation_work_is_bounded() {
         .set_value(Value::lstr("changed"));
     drop(original);
     assert_eq!(copy.mirror_get(1), Some(1.0));
-    assert!(matches!(copy.get("named").unwrap().value(), Value::Str(value) if &*value == "kept"));
+    assert!(
+        matches!((copy.get("named").unwrap().value()).view(), ValueView::Str(value) if &*value == "kept")
+    );
 
     let mut maximum = packed(4096);
     assert!(maximum.prepare_packed_numeric_mirror());

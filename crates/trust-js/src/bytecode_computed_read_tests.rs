@@ -3,7 +3,9 @@
 //! The helper must commit a compact owner, not leave a wide completion in native scratch.
 
 use super::*;
+use crate::value::ValueView;
 use crate::{jit::JitCtx, Completion, Engine};
+use std::cell::Cell;
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
     match engine
@@ -45,12 +47,12 @@ fn invoke(
     let chunk = Chunk::rewrite_owned_for_test(chunk, |chunk| chunk.ops[0] = op);
     let local = matches!(op, Op::GetElemLocal(_));
     let mut slots = [
-        PackedValue::pack(if local {
+        Cell::new(PackedValue::pack(if local {
             object.clone()
         } else {
             Value::Undefined
-        }),
-        PackedValue::pack(Value::Undefined),
+        })),
+        Cell::new(PackedValue::pack(Value::Undefined)),
     ];
     let mut storage: [std::mem::MaybeUninit<PackedValue>; 4] =
         std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
@@ -157,7 +159,7 @@ fn computed_read_helper_errors_consume_operands_not_prefix_or_local() {
             let prefix = crate::value::Object::new(None);
             let (result, error) = invoke(&mut engine, op, object, key, Value::Obj(prefix.clone()));
             assert!(
-                matches!(&result[0],Value::Obj(actual) if crate::value::Gc::ptr_eq(actual,&prefix))
+                matches!(&(result[0]).view(),ValueView::Obj(actual) if crate::value::Gc::ptr_eq(actual,&prefix))
             );
             assert_eq!(evaluate(&mut engine, "calls"), expected_calls.to_string());
             let Some(Abrupt::Throw(error)) = error else {
@@ -168,7 +170,7 @@ fn computed_read_helper_errors_consume_operands_not_prefix_or_local() {
                 assert!(engine.interp.strict_equals(&error, &sentinel));
             } else {
                 let name = engine.interp.get_member_key(&error, "name").ok().unwrap();
-                assert!(matches!(name,Value::Str(s) if s.as_str()==expected_error));
+                assert!(matches!((name).view(),ValueView::Str(s) if s.as_str()==expected_error));
             }
         }
     }

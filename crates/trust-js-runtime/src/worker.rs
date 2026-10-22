@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{
     ops, CompletionSender, Ctx, Extension, Handle, RuntimeInterrupt, TaskId, TaskRegistry, Value,
@@ -131,7 +132,10 @@ pub(crate) fn op_worker_spawn<'s>(
     let entry = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
-    let is_module = matches!(args.get(1), Some(Value::Bool(true)));
+    let is_module = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let dispatch = match args.get(2) {
         Some(v) if v.is_callable() => trust_js_host::handle(ctx, v)?,
         _ => return Err(ctx.make_error("TypeError", "spawn: dispatch must be a function")),
@@ -139,7 +143,11 @@ pub(crate) fn op_worker_spawn<'s>(
     let opts = args.get(3).cloned().unwrap_or(Value::Undefined);
     let has_opts = opts.as_obj().is_some();
     let opt_bool = |ctx: &mut Ctx<'s>, name: &str| -> bool {
-        has_opts && matches!(ctx.get_member(&opts, name), Ok(Value::Bool(true)))
+        has_opts
+            && matches!(
+                (ctx.get_member(&opts, name)).map(|__value| (__value).kind()),
+                Ok(ValueKind::Bool(true))
+            )
     };
     let is_node = opt_bool(ctx, "node");
     let is_eval = opt_bool(ctx, "eval");
@@ -204,8 +212,8 @@ pub(crate) fn op_worker_post<'s>(
     _t: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) => n as u64,
         _ => return Err(ctx.make_error("TypeError", "post: bad worker id")),
     };
     let bytes = ctx
@@ -227,8 +235,8 @@ pub(crate) fn op_worker_terminate<'s>(
     _t: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) => n as u64,
         _ => return Err(ctx.make_error("TypeError", "terminate: bad worker id")),
     };
     if let Some(w) = registry(ctx).workers.get_mut(&id) {
@@ -247,11 +255,14 @@ pub(crate) fn op_worker_set_ref<'s>(
     _t: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) => n as u64,
         _ => return Err(ctx.make_error("TypeError", "setRef: bad worker id")),
     };
-    let keep = matches!(args.get(1), Some(Value::Bool(true)));
+    let keep = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let task = match registry(ctx).workers.get_mut(&id) {
         Some(w) => {
             w.keep_alive = keep;
@@ -572,7 +583,10 @@ fn op_wself_set_ref<'s>(
     _t: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let keep = matches!(args.first(), Some(Value::Bool(true)));
+    let keep = matches!(
+        (args.first()).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let task = match ctx.host_mut::<WorkerSelf>() {
         Some(w) => {
             w.keep_alive = keep;

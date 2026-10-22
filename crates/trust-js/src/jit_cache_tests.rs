@@ -16,7 +16,8 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 fn chunk(i: &mut Interp, name: &str) -> Rc<Chunk> {
     let env = i.global_env.clone();
     let value = i.get_var(name, &env).ok().expect("fixture function");
-    let object = value.as_obj().expect("function object").borrow();
+    let object_handle = value.as_obj().expect("function object");
+    let object = object_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("user function")
     };
@@ -518,7 +519,8 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         e.interp.get_var(name, &env).ok().expect("fixture binding")
     }
     fn function_pin(value: &Value) -> std::rc::Weak<crate::ast::Function> {
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let Callable::User(user) = &object.call else {
             panic!("ordinary function")
         };
@@ -568,7 +570,7 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         let (object_pin, function_pin, key) = in_frame(|| {
             let target = value(&mut e, "target");
             (
-                Gc::downgrade(target.as_obj().unwrap()),
+                Gc::downgrade(&target.as_obj().unwrap()),
                 function_pin(&target),
                 HiddenAddress::of(&target),
             )
@@ -607,7 +609,7 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         assert_eq!(eval(&mut e, "target=new Function('x','return x+70');target(1);invokeTarget(target,2);invokeTarget(target,3);"), "73");
         assert!(in_frame(|| {
             let target = value(&mut e, "target");
-            Gc::as_ptr(target.as_obj().unwrap()) as usize != key.get()
+            Gc::as_ptr(&target.as_obj().unwrap()) as usize != key.get()
         }));
     }
     // The first closure may die while a sibling with the SAME immutable AST
@@ -623,11 +625,11 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
             let ast = function_pin(&first);
             assert_eq!(ast.as_ptr(), function_pin(&sibling).as_ptr());
             (
-                Gc::downgrade(first.as_obj().unwrap()),
+                Gc::downgrade(&first.as_obj().unwrap()),
                 HiddenAddress::of(&first),
                 ast,
                 HiddenAddress::of(&sibling),
-                Gc::downgrade(factory.as_obj().unwrap()),
+                Gc::downgrade(&factory.as_obj().unwrap()),
             )
         });
         // Retire the factory's separate runtime before warming the sharing proof. After the
@@ -684,7 +686,7 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         let (pin, key) = in_frame(|| {
             let target = value(&mut e, "target");
             (
-                Gc::downgrade(target.as_obj().unwrap()),
+                Gc::downgrade(&target.as_obj().unwrap()),
                 HiddenAddress::of(&target),
             )
         });
@@ -717,8 +719,9 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
             // cached route to the live target's native code on its first call.
             let callback = crate::callback::CallbackCache::new();
             matches!(
-                callback.call(&mut e.interp, &target, Value::Undefined, [Value::Num(8.0)]),
-                Ok(Value::Num(9.0))
+                (callback.call(&mut e.interp, &target, Value::Undefined, [Value::Num(8.0)]))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(9.0))
             )
         }));
         assert!(overflow_hit(&e, key));
@@ -744,8 +747,9 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
             let target = value(&mut e, "target");
             let callback = crate::callback::CallbackCache::new();
             matches!(
-                callback.call(&mut e.interp, &target, Value::Undefined, [Value::Num(9.0)]),
-                Ok(Value::Num(10.0))
+                (callback.call(&mut e.interp, &target, Value::Undefined, [Value::Num(9.0)]))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(10.0))
             )
         }));
         e.set_tier(Tier::Interp);

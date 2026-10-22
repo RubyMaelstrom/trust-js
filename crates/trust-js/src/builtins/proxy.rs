@@ -1,16 +1,19 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Value> {
-    if !matches!(target, Value::Obj(_)) || !matches!(handler, Value::Obj(_)) {
+    if !matches!((target).view(), ValueView::Obj(_))
+        || !matches!((handler).view(), ValueView::Obj(_))
+    {
         return Err(i.make_error(
             "TypeError",
             "Cannot create proxy with a non-object as target or handler",
         ));
     }
-    let proto = match &target {
-        Value::Obj(o) => o.borrow().proto.clone(),
+    let proto = match &(target).view() {
+        ValueView::Obj(o) => o.borrow().proto.clone(),
         _ => None,
     };
     let obj = Object::new(proto);
@@ -28,7 +31,7 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
 }
 
 fn revoke_proxy(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
-    if let Value::Obj(o) = arg(a, 0) {
+    if let ValueView::Obj(o) = (arg(a, 0)).view() {
         let ptr = Gc::as_ptr(&o) as usize;
         // Keep the entry but null the handler, so the object stays a (revoked) Proxy and every
         // operation throws a TypeError rather than silently acting like a plain object.
@@ -53,7 +56,7 @@ pub(super) fn install_proxy(it: &mut Interp) {
         let proxy = make_proxy(i, arg(a, 0), arg(a, 1))?;
         let revoke = make_bound(i, revoke_proxy, vec![proxy.clone()]);
         // The revocation function has own `length` (0) then `name` ("") like a built-in function.
-        if let Value::Obj(ro) = &revoke {
+        if let ValueView::Obj(ro) = &(revoke).view() {
             ro.borrow_mut().props.insert(
                 "length",
                 Property::data(Value::Num(0.0), false, false, true),

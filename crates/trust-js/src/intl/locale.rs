@@ -3,6 +3,7 @@
 use super::{ab, coerce_options, def_getter, make_service};
 use crate::interpreter::Interp;
 use crate::intl::tags;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 // ---- subtag validators (the option grammar) --------------------------------------------------
@@ -85,8 +86,8 @@ pub(crate) fn install(it: &mut Interp, ns: &Gc) {
         }
         let present = o.borrow().internal_slots().contains("#\u{0}locale_kn");
         let is_false = matches!(
-            o.borrow().internal_slots().get("#\u{0}locale_kn").map(|p| p.value()),
-            Some(Value::Str(s)) if &*s == "false"
+            (o.borrow().internal_slots().get("#\u{0}locale_kn").map(|p| p.value())).map(|__value| (__value).view()),
+            Some(ValueView::Str(s)) if &*s == "false"
         );
         Ok(Value::Bool(present && !is_false))
     });
@@ -202,17 +203,15 @@ fn locale_keyword(i: &mut Interp, this: &Value, name: &str) -> Result<Option<Str
     {
         return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
     }
-    Ok(
-        match object
-            .borrow()
-            .internal_slots()
-            .get(name)
-            .map(|p| p.value())
-        {
-            Some(Value::Str(value)) if !value.is_empty() => Some(value.to_string()),
-            _ => None,
-        },
-    )
+    let value = object
+        .borrow()
+        .internal_slots()
+        .get(name)
+        .map(|p| p.value());
+    Ok(match value.map(|value| value.view()) {
+        Some(ValueView::Str(value)) if !value.is_empty() => Some(value.to_string()),
+        _ => None,
+    })
 }
 
 fn string_array<T: Into<crate::lstr::LStr>>(i: &mut Interp, values: Vec<T>) -> Value {
@@ -384,8 +383,9 @@ fn slot(i: &mut Interp, this: &Value, name: &str) -> Result<String, Value> {
     let o = this
         .as_obj()
         .ok_or_else(|| i.make_error("TypeError", "not a Locale"))?;
-    match o.borrow().internal_slots().get(name).map(|p| p.value()) {
-        Some(Value::Str(s)) => Ok(s.to_string()),
+    let value = o.borrow().internal_slots().get(name).map(|p| p.value());
+    match value.map(|value| value.view()) {
+        Some(ValueView::Str(s)) => Ok(s.to_string()),
         _ => Err(i.make_error("TypeError", "receiver is not an Intl.Locale")),
     }
 }
@@ -398,8 +398,9 @@ fn opt_slot(i: &mut Interp, this: &Value, name: &str) -> Result<Value, Value> {
     if !o.borrow().internal_slots().contains("#\u{0}locale_tag") {
         return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
     }
-    match o.borrow().internal_slots().get(name).map(|p| p.value()) {
-        Some(Value::Str(s)) => Ok(Value::Str(s)),
+    let value = o.borrow().internal_slots().get(name).map(|p| p.value());
+    match value.map(|value| value.view()) {
+        Some(ValueView::Str(s)) => Ok(Value::Str(s)),
         _ => Ok(Value::Undefined),
     }
 }
@@ -419,7 +420,7 @@ fn titlecase(s: &str) -> String {
 /// GetOption(options, prop, "string"): reads + ToStrings the option, or `None` if undefined.
 fn get_str(i: &mut Interp, options: &Value, prop: &str) -> Result<Option<String>, Value> {
     let v = ab(i.get_member_key(options, prop))?;
-    if matches!(v, Value::Undefined) {
+    if matches!((v).view(), ValueView::Undefined) {
         return Ok(None);
     }
     Ok(Some(ab(i.to_string(&v))?.to_string()))
@@ -430,20 +431,21 @@ fn locale_construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Val
         return Err(i.make_error("TypeError", "Intl.Locale requires 'new'"));
     }
     let tag_arg = super::arg(a, 0);
-    let mut base = match &tag_arg {
-        Value::Str(s) => s.to_string(),
-        Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}locale_tag") => {
-            match o
+    let mut base = match &(tag_arg).view() {
+        ValueView::Str(s) => s.to_string(),
+        ValueView::Obj(o) if o.borrow().internal_slots().contains("#\u{0}locale_tag") => {
+            match (o
                 .borrow()
                 .internal_slots()
                 .get("#\u{0}locale_tag")
-                .map(|p| p.value())
+                .map(|p| p.value()))
+            .map(|__value| (__value).view())
             {
-                Some(Value::Str(s)) => s.to_string(),
+                Some(ValueView::Str(s)) => s.to_string(),
                 _ => String::new(),
             }
         }
-        Value::Obj(_) => ab(i.to_string(&tag_arg))?.to_string(),
+        ValueView::Obj(_) => ab(i.to_string(&tag_arg))?.to_string(),
         _ => return Err(i.make_error("TypeError", "locale tag must be a string or Locale")),
     };
     // Intl.Locale requires a full unicode_language_id (a language subtag); a private-use-only tag
@@ -509,7 +511,7 @@ fn locale_construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Val
     )?;
     let kn = {
         let v = ab(i.get_member_key(&options, "numeric"))?;
-        if matches!(v, Value::Undefined) {
+        if matches!((v).view(), ValueView::Undefined) {
             None
         } else {
             Some(i.to_boolean(&v))
@@ -568,7 +570,7 @@ fn keyword_opt(
     valid: fn(&str) -> bool,
 ) -> Result<Option<String>, Value> {
     let v = ab(i.get_member_key(options, prop))?;
-    if matches!(v, Value::Undefined) {
+    if matches!((v).view(), ValueView::Undefined) {
         return Ok(None);
     }
     let s = ab(i.to_string(&v))?.to_string();
@@ -603,7 +605,7 @@ fn fw_to_num(fw: &str) -> Option<f64> {
 /// firstDayOfWeek accepts a weekday name (mon…sun) or a number 0-7; canonicalizes to the fw type.
 fn firstday_opt(i: &mut Interp, options: &Value) -> Result<Option<String>, Value> {
     let v = ab(i.get_member_key(options, "firstDayOfWeek"))?;
-    if matches!(v, Value::Undefined) {
+    if matches!((v).view(), ValueView::Undefined) {
         return Ok(None);
     }
     let s = ab(i.to_string(&v))?.to_string().to_lowercase();

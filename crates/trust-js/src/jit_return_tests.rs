@@ -8,7 +8,9 @@
 ))]
 
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
+use std::cell::Cell;
 
 fn compile_return(engine: &mut Engine, source: &str) -> (Rc<Chunk>, JitCode) {
     let statements = crate::parser::parse_script(source, false).ok().unwrap();
@@ -34,11 +36,11 @@ fn enter(
     let i: &mut Interp = &mut engine.interp;
     let env = i.global_env.clone();
     let (_, count) = chunk.jit_frame();
-    let mut slots: Vec<PackedValue> = (0..count)
-        .map(|_| PackedValue::pack(Value::Undefined))
+    let mut slots: Vec<Cell<PackedValue>> = (0..count)
+        .map(|_| Cell::new(PackedValue::pack(Value::Undefined)))
         .collect();
     if count != 0 {
-        slots[0] = PackedValue::pack(value);
+        slots[0].set(PackedValue::pack(value));
     }
     let mut stack: Vec<std::mem::MaybeUninit<PackedValue>> =
         Vec::with_capacity(code.max_stack.max(1));
@@ -126,8 +128,8 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     for value in values {
         let (result, helpers) = enter(&mut engine, &chunk, &code, value.clone(), Value::Undefined);
         assert_eq!(helpers, 0, "empty native return called the checked helper");
-        match (&value, &result) {
-            (Value::Num(expected), Value::Num(actual)) => {
+        match (&(value).view(), &(result).view()) {
+            (ValueView::Num(expected), ValueView::Num(actual)) => {
                 assert!(
                     expected.is_nan() && actual.is_nan() || expected.to_bits() == actual.to_bits()
                 );
@@ -184,7 +186,7 @@ fn packed_native_return_replaces_all_displaced_kinds_without_helper() {
             if source.contains("return value") {
                 assert_eq!(result.as_num_opt(), Some(42.0));
             } else {
-                assert!(matches!(result, Value::Undefined));
+                assert!(matches!((result).view(), ValueView::Undefined));
             }
         }
     }
@@ -217,10 +219,10 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
                 assert_eq!(helpers, 0, "{source} occupied={occupied}");
                 if source.contains("return value") {
                     assert!(
-                        matches!(&result, Value::Obj(o) if crate::value::Gc::as_ptr(o) == weak.as_ptr())
+                        matches!(&(result).view(), ValueView::Obj(o) if crate::value::Gc::as_ptr(o) == weak.as_ptr())
                     );
                 } else {
-                    assert!(matches!(result, Value::Undefined));
+                    assert!(matches!((result).view(), ValueView::Undefined));
                 }
                 weak
             });
@@ -256,10 +258,10 @@ fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
         );
         assert_eq!(helpers, 0);
         let returned = result.as_obj().unwrap();
-        assert_eq!(crate::value::Gc::as_ptr(returned), weak.as_ptr());
+        assert_eq!(crate::value::Gc::as_ptr(&returned), weak.as_ptr());
         let self_value = returned.borrow().props.get("self").unwrap().value();
         assert!(
-            matches!(&self_value, Value::Obj(value) if crate::value::Gc::ptr_eq(value, returned))
+            matches!(&(self_value).view(), ValueView::Obj(value) if crate::value::Gc::ptr_eq(value, &returned))
         );
         weak
     });
@@ -292,7 +294,8 @@ fn packed_native_return_direct_call_moves_and_clears_the_entire_word() {
     let env = engine.interp.global_env.clone();
     for name in ["returned", "invoked"] {
         let function = engine.interp.get_var(name, &env).ok().unwrap();
-        let object = function.as_obj().unwrap().borrow();
+        let function_handle = function.as_obj().unwrap();
+        let object = function_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("user function")
         };
@@ -419,7 +422,8 @@ fn direct_calls_enter_callees_that_materialize_native_activations() {
     let env = engine.interp.global_env.clone();
     for name in ["shaped", "upper"] {
         let function = engine.interp.get_var(name, &env).ok().unwrap();
-        let object = function.as_obj().unwrap().borrow();
+        let function_handle = function.as_obj().unwrap();
+        let object = function_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("user function")
         };
@@ -513,7 +517,10 @@ fn direct_finish_vacates_a_last_reference_receiver() {
             .frame_pool
             .iter()
             .filter(|record| unsafe {
-                !matches!(record.as_ref().ctx.this_value(), Value::Undefined)
+                !matches!(
+                    (record.as_ref().ctx.this_value()).view(),
+                    ValueView::Undefined
+                )
             })
             .count(),
         0,

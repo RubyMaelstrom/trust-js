@@ -4,6 +4,7 @@
 //! algorithm, never reject a valid program or reuse an unrelated descriptor location.
 use super::*;
 use crate::bytecode::{IcState, Tier, IC_EMPTY, PROP_IC_WAYS};
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 use std::cell::Cell;
 
@@ -54,20 +55,24 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
     let i = &mut engine.interp;
     for _ in 0..4 {
         assert!(matches!(
-            i.get_prop_keyed(&Value::Obj(first.clone()), "alpha", &cache[0]),
-            Ok(Value::Num(7.0))
+            (i.get_prop_keyed(&Value::Obj(first.clone()), "alpha", &cache[0]))
+                .map(|__value| (__value).view()),
+            Ok(ValueView::Num(7.0))
         ));
         assert!(matches!(
-            i.get_prop_keyed(&Value::Obj(second.clone()), "alpha", &cache[0]),
-            Ok(Value::Undefined)
+            (i.get_prop_keyed(&Value::Obj(second.clone()), "alpha", &cache[0]))
+                .map(|__value| (__value).view()),
+            Ok(ValueView::Undefined)
         ));
         assert!(matches!(
-            i.get_computed_property(&Value::Obj(first.clone()), &computed),
-            Ok(Value::Num(7.0))
+            (i.get_computed_property(&Value::Obj(first.clone()), &computed))
+                .map(|__value| (__value).view()),
+            Ok(ValueView::Num(7.0))
         ));
         assert!(matches!(
-            i.get_computed_property(&Value::Obj(second.clone()), &computed),
-            Ok(Value::Undefined)
+            (i.get_computed_property(&Value::Obj(second.clone()), &computed))
+                .map(|__value| (__value).view()),
+            Ok(ValueView::Undefined)
         ));
     }
     assert!(cache.iter().all(|way| way.get().depth == IC_EMPTY));
@@ -80,16 +85,16 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
     assert!(i.try_ic_set(&second, &key, &Value::Num(13.0), &cache[0]));
     assert!(cache.iter().all(|way| way.get().depth == IC_EMPTY));
     assert!(matches!(
-        first.borrow().props.get("alpha").unwrap().value(),
-        Value::Num(11.0)
+        (first.borrow().props.get("alpha").unwrap().value()).view(),
+        ValueView::Num(11.0)
     ));
     assert!(matches!(
-        second.borrow().props.get("alpha").unwrap().value(),
-        Value::Num(13.0)
+        (second.borrow().props.get("alpha").unwrap().value()).view(),
+        ValueView::Num(13.0)
     ));
     assert!(matches!(
-        second.borrow().props.get("beta").unwrap().value(),
-        Value::Num(9.0)
+        (second.borrow().props.get("beta").unwrap().value()).view(),
+        ValueView::Num(9.0)
     ));
 }
 
@@ -207,10 +212,11 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
         let cache = Cell::new(IcState::EMPTY);
         let old = object(&mut engine, "old");
         assert!(matches!(
-            engine
+            (engine
                 .interp
-                .instanceof_ic(&Value::Obj(old), &Value::Obj(ctor.clone()), &cache),
-            Ok(Value::Bool(true))
+                .instanceof_ic(&Value::Obj(old), &Value::Obj(ctor.clone()), &cache))
+            .map(|__value| (__value).view()),
+            Ok(ValueView::Bool(true))
         ));
         assert_eq!(cache.get().depth, IC_EMPTY);
         assert_eq!(
@@ -249,10 +255,11 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
         );
         let fresh = object(&mut engine, "fresh");
         assert!(matches!(
-            engine
+            (engine
                 .interp
-                .instanceof_ic(&Value::Obj(fresh), &Value::Obj(ctor.clone()), &cache),
-            Ok(Value::Bool(true))
+                .instanceof_ic(&Value::Obj(fresh), &Value::Obj(ctor.clone()), &cache))
+            .map(|__value| (__value).view()),
+            Ok(ValueView::Bool(true))
         ));
         assert_eq!(run(&mut engine, "C.prototype={tag:7};var fresh=make(6);fresh.x+'|'+fresh.tag+'|'+(fresh instanceof C)+'|'+(old instanceof C)"), "6|7|true|false", "{tier:?}");
     }

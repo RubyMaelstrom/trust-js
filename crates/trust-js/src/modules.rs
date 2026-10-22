@@ -15,6 +15,7 @@
 use crate::ast::*;
 use crate::builtins::make_bound_len;
 use crate::interpreter::{new_scope, Abrupt, Binding, Env, Interp};
+use crate::value::ValueView;
 use crate::value::{Object, Property, Value};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -307,7 +308,7 @@ impl Interp {
     /// must not report the internal promise as an unhandled rejection.
     fn new_evaluation_promise(&mut self) -> Value {
         let promise = self.new_promise();
-        if let Value::Obj(object) = &promise {
+        if let ValueView::Obj(object) = &(promise).view() {
             if let Some(state) = self
                 .promises
                 .get_mut(&self.gc_heap, &(crate::value::Gc::as_ptr(object) as usize))
@@ -362,7 +363,7 @@ impl Interp {
         self.inner_module_evaluation_async(&key, &mut stack, &mut 0);
         self.drain_microtasks_interruptible()
             .map_err(Abrupt::Interrupt)?;
-        if let Value::Obj(o) = &top {
+        if let ValueView::Obj(o) = &(top).view() {
             if let Some(ps) = self.promises.get(&(crate::value::Gc::as_ptr(o) as usize)) {
                 if ps.status == 2 {
                     let reason = ps.value.clone();
@@ -669,7 +670,7 @@ impl Interp {
         self.declare_default_placeholder(&body, &env);
         self.validate_indirect_exports(key)?;
         self.link_imports(key, &body, &env)?;
-        if let Value::Obj(ns_obj) = ns {
+        if let ValueView::Obj(ns_obj) = (ns).view() {
             self.build_namespace(key, &ns_obj)?;
         }
         let completed = stack.pop();
@@ -1087,7 +1088,7 @@ impl Interp {
             return v.clone();
         }
         let base = self.module_recs[dep].ns.clone();
-        let Value::Obj(base_o) = &base else {
+        let ValueView::Obj(base_o) = &(base).view() else {
             return base;
         };
         let dns = Object::new(None);
@@ -1097,7 +1098,7 @@ impl Interp {
             for (k, p) in src.props.iter() {
                 let mut p = p.clone();
                 if Interp::is_sym_key(k) {
-                    if let Value::Str(tag) = p.value() {
+                    if let ValueView::Str(tag) = (p.value()).view() {
                         if &*tag == "Module" {
                             p.set_value(Value::lstr("Deferred Module".to_string()));
                         }
@@ -1144,13 +1145,15 @@ impl Interp {
             self.evaluate_module(key)?;
             // A stub minted mid-link for a cyclic dependency copied an empty export table —
             // hydrate it from the real namespace now that the module is linked and evaluated.
-            if let Some(Value::Obj(stub)) = self.deferred_ns_objs.get(key).cloned() {
+            if let Some(ValueView::Obj(stub)) =
+                (self.deferred_ns_objs.get(key).cloned()).map(|__value| (__value).view())
+            {
                 let hydrated = self
                     .module_ns
                     .contains_key(&(crate::value::Gc::as_ptr(&stub) as usize));
                 if !hydrated {
                     let base = self.module_recs[key].ns.clone();
-                    if let Value::Obj(base_o) = &base {
+                    if let ValueView::Obj(base_o) = &(base).view() {
                         {
                             let src = base_o.borrow();
                             let mut dst = stub.borrow_mut();
@@ -1158,7 +1161,7 @@ impl Interp {
                                 if dst.props.get(k).is_none() {
                                     let mut p = p.clone();
                                     if Interp::is_sym_key(k) {
-                                        if let Value::Str(tag) = p.value() {
+                                        if let ValueView::Str(tag) = (p.value()).view() {
                                             if &*tag == "Module" {
                                                 p.set_value(Value::lstr(
                                                     "Deferred Module".to_string(),
@@ -1604,12 +1607,12 @@ impl Interp {
                 self.reject_promise(&top, error);
                 return;
             };
-            if let Value::Obj(o) = &top {
+            if let ValueView::Obj(o) = &(top).view() {
                 self.generators
                     .insert(&self.gc_heap, crate::value::Gc::as_ptr(o) as usize, coro);
             }
-            let top_key = match &top {
-                Value::Obj(o) => crate::value::Gc::as_ptr(o) as usize,
+            let top_key = match &(top).view() {
+                ValueView::Obj(o) => crate::value::Gc::as_ptr(o) as usize,
                 _ => return,
             };
             self.drive_async(
@@ -1799,8 +1802,8 @@ impl Interp {
             },
         };
         let referrer = match meta {
-            Some(m) => match self.get_member_key(&m, "url") {
-                Ok(Value::Str(s)) => s.to_string(),
+            Some(m) => match (self.get_member_key(&m, "url")).map(|__value| (__value).view()) {
+                Ok(ValueView::Str(s)) => s.to_string(),
                 _ => self.import_base.clone(),
             },
             None => self.import_base.clone(),
@@ -2024,9 +2027,10 @@ impl Interp {
 fn same_binding(a: &Resolution, b: &Resolution) -> bool {
     match (a, b) {
         (Resolution::Local(e1, l1), Resolution::Local(e2, l2)) => Env::ptr_eq(e1, e2) && l1 == l2,
-        (Resolution::Ns(Value::Obj(o1)), Resolution::Ns(Value::Obj(o2))) => {
-            crate::value::Gc::ptr_eq(o1, o2)
-        }
+        (Resolution::Ns(v1), Resolution::Ns(v2)) => match (v1.view(), v2.view()) {
+            (ValueView::Obj(o1), ValueView::Obj(o2)) => crate::value::Gc::ptr_eq(&o1, &o2),
+            _ => false,
+        },
         (Resolution::DeferNs(d1), Resolution::DeferNs(d2)) => d1 == d2,
         _ => false,
     }

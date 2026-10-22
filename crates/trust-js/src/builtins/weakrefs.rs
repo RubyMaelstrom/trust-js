@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// WeakRef / FinalizationRegistry (ECMA-262 §9.9–9.13 and §26.1–26.2). Targets and unregister
 /// tokens are real weak handles; held values and cleanup callbacks remain strong edges of a live
@@ -79,7 +80,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             return Err(i.make_error("TypeError", "target and held value must not be the same"));
         }
         let token = arg(a, 2);
-        if !matches!(token, Value::Undefined) && !can_be_held_weakly(i, &token) {
+        if !matches!((token).view(), ValueView::Undefined) && !can_be_held_weakly(i, &token) {
             return Err(i.make_error("TypeError", "unregister token cannot be held weakly"));
         }
         i.gc_weak_metadata_safepoint(false);
@@ -95,7 +96,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         state.cells.push(crate::interpreter::FinalizationCell {
             target: Some(weak_target),
             held_value: arg(a, 1),
-            unregister_token: (!matches!(token, Value::Undefined))
+            unregister_token: (!matches!((token).view(), ValueView::Undefined))
                 .then(|| crate::interpreter::WeakTarget::of(&token))
                 .flatten(),
         });

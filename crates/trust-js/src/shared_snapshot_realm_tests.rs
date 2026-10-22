@@ -11,6 +11,7 @@
 use crate::bytecode::Tier;
 use crate::interpreter::{Abrupt, Interp};
 use crate::realm_inline_guard_tests::{eval_string, in_realm, render, set_global, TIERS};
+use crate::value::ValueView;
 use crate::value::{Callable, Value};
 use crate::Engine;
 use std::rc::Rc;
@@ -111,7 +112,9 @@ fn shared_method(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
     let Ok(shared) = it.get_member_key(&global, "shared") else {
         panic!("shared is defined");
     };
-    let Ok(Value::Obj(function)) = it.get_member_key(&shared, name) else {
+    let Ok(ValueView::Obj(function)) =
+        (it.get_member_key(&shared, name)).map(|__value| (__value).view())
+    else {
         panic!("shared.{name} is a function");
     };
     let borrowed = function.borrow();
@@ -127,7 +130,9 @@ fn probe_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
     let Ok(probe) = it.get_member_key(&global, "probe") else {
         panic!("probe is defined");
     };
-    let Ok(Value::Obj(function)) = it.get_member_key(&probe, name) else {
+    let Ok(ValueView::Obj(function)) =
+        (it.get_member_key(&probe, name)).map(|__value| (__value).view())
+    else {
         panic!("probe.{name} is a function");
     };
     let borrowed = function.borrow();
@@ -142,7 +147,7 @@ fn global_user_callable(it: &mut Interp, name: &str) -> crate::value::UserFn {
     let value = it
         .get_var(name, &env)
         .unwrap_or_else(|_| panic!("missing global {name}"));
-    let Value::Obj(object) = value else {
+    let ValueView::Obj(object) = (value).view() else {
         panic!("{name} is not an object")
     };
     let borrowed = object.borrow();

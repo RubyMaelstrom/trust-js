@@ -1,6 +1,7 @@
 //! Predicate/ownership lowering, ECMA-262 e28783d5: Number::equal, IsStrictlyEqual,
 //! ToBoolean, OrdinaryGet, and left-to-right equality Evaluation/GetValue.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, value::Value, Completion, Engine};
 
 #[test]
@@ -269,7 +270,7 @@ fn region_predicates_native_peeks_do_not_call_condition_helper() {
             )
             .ok()
             .unwrap();
-        assert!(matches!(result,Value::Num(n) if n==want));
+        assert!(matches!((result).view(),ValueView::Num(n) if n==want));
     }
     assert!(
         EXECUTED_REGIONS.with(std::cell::Cell::get) > regions,

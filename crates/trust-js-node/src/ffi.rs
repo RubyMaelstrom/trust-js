@@ -32,6 +32,7 @@ use std::cell::Cell;
 use std::os::raw::c_void;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use trust_js_host::ValueKind;
 
 use trust_js_host::{Ctx, Handle, Value};
 
@@ -172,18 +173,18 @@ fn plain_error<'s>(ctx: &mut Ctx<'s>, msg: impl Into<String>) -> Value<'s> {
 /// Bun's acceptance rules: numbers are addresses, typed arrays contribute their backing pointer,
 /// null/undefined are 0, and strings/bigints are refused with Bun's exact messages.
 fn value_to_pointer<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>) -> Result<u64, Value<'s>> {
-    match v {
-        Value::Num(n) => Ok(*n as i64 as u64),
-        Value::Null | Value::Undefined => Ok(0),
-        Value::Str(_) => Err(type_error(
+    match &(v).kind() {
+        ValueKind::Num(n) => Ok(*n as i64 as u64),
+        ValueKind::Null | ValueKind::Undefined => Ok(0),
+        ValueKind::Str(_) => Err(type_error(
             ctx,
             "To convert a string to a pointer, encode it as a buffer",
         )),
-        Value::BigInt(b) => Err(type_error(
+        ValueKind::BigInt(b) => Err(type_error(
             ctx,
             format!("Unable to convert {} to a pointer", b.to_i128_wrapping()),
         )),
-        Value::Obj(_) => {
+        ValueKind::Obj(_) => {
             if let Some((_, _, p)) = ctx.typed_array_raw(v) {
                 Ok(p as u64)
             } else {
@@ -220,8 +221,8 @@ fn marshal_arg<'s>(
     }
     // Integer register class.
     let bits = match code {
-        T_I64 | T_U64 | T_I64_FAST | T_U64_FAST => match v {
-            Value::BigInt(b) => b.to_i128_wrapping() as u64,
+        T_I64 | T_U64 | T_I64_FAST | T_U64_FAST => match &(v).kind() {
+            ValueKind::BigInt(b) => b.to_i128_wrapping() as u64,
             _ => {
                 let n = ctx.coerce_number(v)?;
                 if n.fract() != 0.0 || !n.is_finite() {
@@ -308,8 +309,8 @@ unsafe fn invoke_native(
 // ---- ops --------------------------------------------------------------------------------------
 
 fn arr_len<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>) -> usize {
-    match ctx.member_get(v, "length") {
-        Ok(Value::Num(n)) => n as usize,
+    match (ctx.member_get(v, "length")).map(|__value| (__value).kind()) {
+        Ok(ValueKind::Num(n)) => n as usize,
         _ => 0,
     }
 }
@@ -750,9 +751,9 @@ fn cb_return_to_raw<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>, ret_code: u8) -> u64 {
     if is_pointer(ret_code) {
         return value_to_pointer(ctx, v).unwrap_or(0);
     }
-    match v {
-        Value::BigInt(b) => b.to_i128_wrapping() as u64,
-        Value::Bool(b) => *b as u64,
+    match &(v).kind() {
+        ValueKind::BigInt(b) => b.to_i128_wrapping() as u64,
+        ValueKind::Bool(b) => *b as u64,
         _ => ctx.coerce_number(v).map(|n| n as i64 as u64).unwrap_or(0),
     }
 }

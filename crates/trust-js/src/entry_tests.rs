@@ -2,6 +2,7 @@
 //! ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202, spec.html:14247–14435.
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
@@ -38,7 +39,7 @@ fn check(source: &str, expected: &str, functions: &[(&str, Entry)], native: bool
                 .interp
                 .get_var(name, &env)
                 .unwrap_or_else(|_| panic!("missing {name}"));
-            let crate::value::Value::Obj(object) = value else {
+            let ValueView::Obj(object) = (value).view() else {
                 panic!("{name} is not an object")
             };
             let object = object.borrow();
@@ -396,7 +397,7 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
                 .interp
                 .get_var("named", &env)
                 .unwrap_or_else(|_| panic!("missing named function"));
-            let crate::value::Value::Obj(object) = value else {
+            let ValueView::Obj(object) = (value).view() else {
                 panic!("missing function")
             };
             let weak = crate::value::Gc::downgrade(&object);
@@ -412,7 +413,7 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
                     .expect("self binding exists at closure creation");
                 assert!(!binding.mutable && binding.initialized && !binding.strict_immutable);
                 assert!(
-                    matches!(&binding.value, crate::value::Value::Obj(bound) if crate::value::Gc::ptr_eq(bound, &object))
+                    matches!(&(binding.value).view(), ValueView::Obj(bound) if crate::value::Gc::ptr_eq(bound, &object))
                 );
                 if !matches!(tier, Tier::Interp) {
                     assert!(
@@ -457,7 +458,7 @@ fn named_expression_unused_self_environment_is_elided_without_changing_identity(
                 .get_var("named", &env)
                 .unwrap_or_else(|_| panic!("named"));
             let object = value.as_obj().unwrap();
-            let weak = crate::value::Gc::downgrade(object);
+            let weak = crate::value::Gc::downgrade(&object);
             {
                 let borrowed = object.borrow();
                 let crate::value::Callable::User(user) = &borrowed.call else {

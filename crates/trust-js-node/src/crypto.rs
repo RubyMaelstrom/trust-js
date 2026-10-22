@@ -13,6 +13,7 @@
 //! below are pure one-shot transforms over whole messages.
 
 use std::sync::OnceLock;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{ops, Ctx, OpDecl, Value};
 
@@ -704,7 +705,10 @@ fn op_aes_ecb<'s>(
     _this: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let encrypt = matches!(args.first(), Some(Value::Bool(true)));
+    let encrypt = matches!(
+        (args.first()).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let key = bytes_arg(ctx, args, 1)
         .ok_or_else(|| ctx.make_error("TypeError", "key must be a buffer"))?;
     let data = bytes_arg(ctx, args, 2)
@@ -722,7 +726,10 @@ fn op_aes_cbc<'s>(
     _this: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let encrypt = matches!(args.first(), Some(Value::Bool(true)));
+    let encrypt = matches!(
+        (args.first()).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let key = bytes_arg(ctx, args, 1)
         .ok_or_else(|| ctx.make_error("TypeError", "key must be a buffer"))?;
     let iv = bytes_arg(ctx, args, 2)

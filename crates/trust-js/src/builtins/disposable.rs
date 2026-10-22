@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// `DisposableStack` / `AsyncDisposableStack` (explicit resource management). Disposers are
 /// stored as `[fn, thisArg(, adoptedValue)]` entries in an internal array and run LIFO on
@@ -20,8 +21,8 @@ fn ds_brand(i: &mut Interp, this: &Value, async_kind: bool) -> Result<Gc, Value>
         .internal_slots()
         .get("#\u{0}ds_kind")
         .map(|p| p.value());
-    match kind {
-        Some(Value::Str(k)) if &*k == want => Ok(o),
+    match (kind).map(|__value| (__value).view()) {
+        Some(ValueView::Str(k)) if &*k == want => Ok(o),
         _ => Err(i.make_error("TypeError", format!("receiver is not a {name}"))),
     }
 }
@@ -141,20 +142,20 @@ fn adisp_reaction(
     Value::Obj(bound)
 }
 fn adisp_react_fulfil(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let idx = match arg(a, 1) {
-        Value::Num(n) => n as i64,
+    let idx = match (arg(a, 1)).view() {
+        ValueView::Num(n) => n as i64,
         _ => return Ok(Value::Undefined),
     };
-    let err = matches!(arg(a, 3), Value::Bool(true)).then(|| arg(a, 4));
+    let err = matches!((arg(a, 3)).view(), ValueView::Bool(true)).then(|| arg(a, 4));
     adisp_run(i, arg(a, 0), idx, arg(a, 2), err);
     Ok(Value::Undefined)
 }
 fn adisp_react_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let idx = match arg(a, 1) {
-        Value::Num(n) => n as i64,
+    let idx = match (arg(a, 1)).view() {
+        ValueView::Num(n) => n as i64,
         _ => return Ok(Value::Undefined),
     };
-    let prev = matches!(arg(a, 3), Value::Bool(true)).then(|| arg(a, 4));
+    let prev = matches!((arg(a, 3)).view(), ValueView::Bool(true)).then(|| arg(a, 4));
     let err = Some(ds_combine_error(i, prev, arg(a, 5)));
     adisp_run(i, arg(a, 0), idx, arg(a, 2), err);
     Ok(Value::Undefined)
@@ -177,7 +178,7 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
             return Err(i.make_error("ReferenceError", "DisposableStack already disposed"));
         }
         let v = arg(a, 0);
-        if !matches!(v, Value::Undefined | Value::Null) {
+        if !matches!((v).view(), ValueView::Undefined | ValueView::Null) {
             let key = well_known_key(i, "dispose").unwrap_or_default();
             let disp = ab(i.get_member_key(&v, &key))?;
             if !disp.is_callable() {
@@ -221,7 +222,7 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
             return Ok(Value::Undefined);
         }
         set_internal(
-            this.as_obj().unwrap(),
+            &this.as_obj().unwrap(),
             "#\u{0}ds_disposed",
             Value::Bool(true),
         );
@@ -252,9 +253,9 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
         set_internal(&fresh, "#\u{0}ds_kind", Value::lstr("sync"));
         set_internal(&fresh, "#\u{0}ds_disposed", Value::Bool(false));
         let empty = i.make_array(Vec::new());
-        set_internal(this.as_obj().unwrap(), "#\u{0}ds", empty);
+        set_internal(&this.as_obj().unwrap(), "#\u{0}ds", empty);
         set_internal(
-            this.as_obj().unwrap(),
+            &this.as_obj().unwrap(),
             "#\u{0}ds_disposed",
             Value::Bool(true),
         );
@@ -313,7 +314,7 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
             return Err(i.make_error("ReferenceError", "AsyncDisposableStack already disposed"));
         }
         let v = arg(a, 0);
-        if matches!(v, Value::Undefined | Value::Null) {
+        if matches!((v).view(), ValueView::Undefined | ValueView::Null) {
             // AddDisposableResource records an await-only sentinel for a nullish async resource.
             let entry = i.make_array(vec![Value::Undefined]);
             ds_push(i, &this, entry)?;
@@ -383,7 +384,7 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
             return Ok(result);
         }
         set_internal(
-            this.as_obj().unwrap(),
+            &this.as_obj().unwrap(),
             "#\u{0}ds_disposed",
             Value::Bool(true),
         );
@@ -404,9 +405,9 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         set_internal(&fresh, "#\u{0}ds_kind", Value::lstr("async"));
         set_internal(&fresh, "#\u{0}ds_disposed", Value::Bool(false));
         let empty = i.make_array(Vec::new());
-        set_internal(this.as_obj().unwrap(), "#\u{0}ds", empty);
+        set_internal(&this.as_obj().unwrap(), "#\u{0}ds", empty);
         set_internal(
-            this.as_obj().unwrap(),
+            &this.as_obj().unwrap(),
             "#\u{0}ds_disposed",
             Value::Bool(true),
         );

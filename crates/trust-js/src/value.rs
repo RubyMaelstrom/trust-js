@@ -125,19 +125,45 @@ impl NativeCaptures {
     }
 }
 
-/// The engine value. `repr(u64)` with fixed discriminants gives it a *defined* layout — a full
-/// tag word at offset 0 and every payload (including Bool's byte) at offset 8 — which the JIT's
-/// inline fast paths read directly (see `jit::layout` for the assertions). A word-sized tag keeps
-/// every move of a Value two aligned word copies: with a byte tag, compilers split moves at the
-/// Bool byte and read the result back across two earlier stores, defeating store forwarding.
-/// Tags 0..=4 are the scalar variants; the others hold a cell's address, which copies freely (a
-/// handle holds no count). The low byte of the tag word is the discriminant, so byte-wide tag
-/// reads stay valid.
-#[derive(Clone, Default)]
-#[repr(u64)]
-pub(crate) enum Value {
-    #[default]
-    Undefined = 0,
+// One declaration pins both sides of Value::view: adding or changing a variant cannot
+// silently create a same-size enum with an invalid view discriminant or payload type.
+macro_rules! define_wide_values {
+    ($(#[$value_doc:meta])* $default:ident = $zero:literal;
+        $($(#[$variant_doc:meta])* $variant:ident $(($payload:ty))? = $tag:literal,)*) => {
+        $(#[$value_doc])*
+        #[derive(Clone, Copy, Default)]
+        #[repr(u64)]
+        // Storage payloads are read through the identity view, rather than enum patterns.
+        #[allow(dead_code)]
+        pub(crate) enum Value {
+            #[default]
+            $default = $zero,
+            $($(#[$variant_doc])* $variant $(($payload))? = $tag,)*
+        }
+
+        /// An ephemeral match view of an engine value. The shared declaration fixes the
+        /// same representation while Value remains wide; distinct types reject view escapes.
+        #[derive(Clone, Copy)]
+        #[repr(u64)]
+        // Constructed by Value::view's representation identity, rather than variant expressions.
+        #[allow(dead_code)]
+        pub(crate) enum ValueView {
+            $default = $zero,
+            $($(#[$variant_doc])* $variant $(($payload))? = $tag,)*
+        }
+    };
+}
+
+define_wide_values! {
+    /// The engine value. `repr(u64)` with fixed discriminants gives it a *defined* layout — a full
+    /// tag word at offset 0 and every payload (including Bool's byte) at offset 8 — which the JIT's
+    /// inline fast paths read directly (see `jit::layout` for the assertions). A word-sized tag keeps
+    /// every move of a Value two aligned word copies: with a byte tag, compilers split moves at the
+    /// Bool byte and read the result back across two earlier stores, defeating store forwarding.
+    /// Tags 0..=4 are the scalar variants; the others hold a cell's address, which copies freely (a
+    /// handle holds no count). The low byte of the tag word is the discriminant, so byte-wide tag
+    /// reads stay valid.
+    Undefined = 0;
     /// The spec's EMPTY completion marker: produced only by *statement* evaluation (declarations
     /// and other value-less statements) so completion values thread per UpdateEmpty. Never a JS
     /// value — every engine boundary converts it to `Undefined` before a value escapes.
@@ -159,15 +185,27 @@ pub(crate) enum Value {
     Obj(Gc) = 8,
 }
 
+const _: () = {
+    assert!(std::mem::size_of::<Value>() == std::mem::size_of::<ValueView>());
+    assert!(std::mem::align_of::<Value>() == std::mem::align_of::<ValueView>());
+};
+
 impl Value {
+    #[inline(always)]
+    pub(crate) fn view(&self) -> ValueView {
+        // SAFETY: define_wide_values emits two distinct repr(u64) enums from the same
+        // discriminants and payload types. The adjacent assertions pin their size and alignment.
+        unsafe { std::mem::transmute::<Value, ValueView>(*self) }
+    }
+
     /// The cell this value holds, as a GC edge: an object or a payload cell.
     #[inline]
     pub(crate) fn cell_word(&self) -> Option<u64> {
-        match self {
-            Value::Obj(object) => Some(Gc::as_ptr(object) as u64),
-            Value::BigInt(bigint) => Some(bigint.cell_word()),
-            Value::Sym(symbol) => Some(symbol_identity(symbol) as u64),
-            Value::Str(string) => Some(string.cell_word()),
+        match &(self).view() {
+            ValueView::Obj(object) => Some(Gc::as_ptr(object) as u64),
+            ValueView::BigInt(bigint) => Some(bigint.cell_word()),
+            ValueView::Sym(symbol) => Some(symbol_identity(symbol) as u64),
+            ValueView::Str(string) => Some(string.cell_word()),
             _ => None,
         }
     }
@@ -182,16 +220,16 @@ pub(crate) fn trace_nullish_property(site: &str, key: &Value) {
     if std::env::var_os("TRUST_JS_NULLISH_TRACE").is_none() {
         return;
     }
-    let key = match key {
-        Value::Str(s) => format!("string:{:?}", s.as_str()),
-        Value::Num(n) => format!("number:{n:?}"),
-        Value::Bool(v) => format!("boolean:{v}"),
-        Value::Null => "null".to_owned(),
-        Value::Undefined => "undefined".to_owned(),
-        Value::Empty => "empty".to_owned(),
-        Value::BigInt(_) => "bigint".to_owned(),
-        Value::Sym(_) => "symbol".to_owned(),
-        Value::Obj(_) => "object".to_owned(),
+    let key = match &(key).view() {
+        ValueView::Str(s) => format!("string:{:?}", s.as_str()),
+        ValueView::Num(n) => format!("number:{n:?}"),
+        ValueView::Bool(v) => format!("boolean:{v}"),
+        ValueView::Null => "null".to_owned(),
+        ValueView::Undefined => "undefined".to_owned(),
+        ValueView::Empty => "empty".to_owned(),
+        ValueView::BigInt(_) => "bigint".to_owned(),
+        ValueView::Sym(_) => "symbol".to_owned(),
+        ValueView::Obj(_) => "object".to_owned(),
     };
     eprintln!("TRust JS: nullish computed-property read site={site} key={key}");
 }
@@ -200,7 +238,12 @@ pub(crate) fn trace_nullish_property(site: &str, key: &Value) {
 // `Value` enum while the migration is staged; packing at the heap boundary cuts each ordinary
 // property by eight bytes without coupling the experiment to every interpreter pattern match.
 #[repr(transparent)]
-pub(crate) struct PackedValue(Cell<u64>);
+#[derive(Clone, Copy)]
+pub(crate) struct PackedValue(u64, std::marker::PhantomData<*const ()>);
+
+/// Property-only word storage. A deferred prototype can be held and promoted only here.
+#[repr(transparent)]
+struct PropWord(Cell<u64>, std::marker::PhantomData<*const ()>);
 
 const PACK_PAYLOAD: u64 = 0x0000_ffff_ffff_ffff;
 pub(crate) const PACK_UNDEFINED: u64 = 0x7ff9_0000_0000_0000;
@@ -235,38 +278,40 @@ impl PackedValue {
     #[cfg(test)]
     #[inline]
     pub(crate) fn bits(&self) -> u64 {
-        self.0.get()
+        self.0
     }
 
     pub(crate) fn scalar_bits(value: &Value) -> Option<u64> {
-        match value {
-            Value::Undefined => Some(PACK_UNDEFINED),
-            Value::Empty => Some(PACK_EMPTY),
-            Value::Null => Some(PACK_NULL),
-            Value::Bool(value) => Some(PACK_BOOL | u64::from(*value)),
-            Value::Num(value) => Some(if value.is_nan() {
+        match &(value).view() {
+            ValueView::Undefined => Some(PACK_UNDEFINED),
+            ValueView::Empty => Some(PACK_EMPTY),
+            ValueView::Null => Some(PACK_NULL),
+            ValueView::Bool(value) => Some(PACK_BOOL | u64::from(*value)),
+            ValueView::Num(value) => Some(if value.is_nan() {
                 PACK_CANON_NAN
             } else {
                 value.to_bits()
             }),
-            Value::BigInt(_) | Value::Str(_) | Value::Sym(_) | Value::Obj(_) => None,
+            ValueView::BigInt(_) | ValueView::Str(_) | ValueView::Sym(_) | ValueView::Obj(_) => {
+                None
+            }
         }
     }
 
     #[inline]
     fn tag(&self) -> u64 {
-        self.0.get() & !PACK_PAYLOAD
+        self.0 & !PACK_PAYLOAD
     }
 
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.get() == PACK_EMPTY
+        self.0 == PACK_EMPTY
     }
 
     #[cfg(test)]
     #[inline]
     pub(crate) fn is_undefined(&self) -> bool {
-        self.0.get() == PACK_UNDEFINED
+        self.0 == PACK_UNDEFINED
     }
 
     /// Inspect a primitive without cloning an owner or materializing a deferred object.
@@ -306,7 +351,7 @@ impl PackedValue {
         match self.tag() {
             PACK_UNDEFINED | PACK_EMPTY | PACK_NULL | PACK_BOOL | PACK_BIGINT | PACK_STR
             | PACK_SYM | PACK_OBJ | PACK_LAZY_PROTO => None,
-            _ => Some(f64::from_bits(self.0.get())),
+            _ => Some(f64::from_bits(self.0)),
         }
     }
 
@@ -330,9 +375,23 @@ impl PackedValue {
         word
     }
 
-    unsafe fn read_word<T>(&self) -> T {
+    #[inline]
+    fn from_bits(bits: u64) -> Self {
+        debug_assert_ne!(
+            bits & !PACK_PAYLOAD,
+            PACK_LAZY_PROTO,
+            "a deferred prototype's word copied without materializing"
+        );
+        Self(bits, std::marker::PhantomData)
+    }
+
+    unsafe fn read_word<T: Copy>(&self) -> T {
+        unsafe { Self::decode_payload(self.0) }
+    }
+
+    unsafe fn decode_payload<T: Copy>(bits: u64) -> T {
         assert!(std::mem::size_of::<T>() <= std::mem::size_of::<usize>());
-        let word = (self.0.get() & PACK_PAYLOAD) as usize;
+        let word = (bits & PACK_PAYLOAD) as usize;
         let mut value = std::mem::MaybeUninit::<T>::uninit();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -344,46 +403,31 @@ impl PackedValue {
         }
     }
 
-    unsafe fn clone_word<T: Clone>(&self) -> T {
+    unsafe fn clone_word<T: Copy>(&self) -> T {
         let value = std::mem::ManuallyDrop::new(unsafe { self.read_word::<T>() });
         T::clone(&value)
     }
 
     #[inline]
     pub(crate) fn pack(value: Value) -> PackedValue {
-        let bits = match value {
-            Value::Undefined => PACK_UNDEFINED,
-            Value::Empty => PACK_EMPTY,
-            Value::Null => PACK_NULL,
-            Value::Bool(v) => PACK_BOOL | v as u64,
-            Value::Num(v) => {
+        let bits = match (value).view() {
+            ValueView::Undefined => PACK_UNDEFINED,
+            ValueView::Empty => PACK_EMPTY,
+            ValueView::Null => PACK_NULL,
+            ValueView::Bool(v) => PACK_BOOL | v as u64,
+            ValueView::Num(v) => {
                 if v.is_nan() {
                     PACK_CANON_NAN
                 } else {
                     v.to_bits()
                 }
             }
-            Value::BigInt(v) => PACK_BIGINT | unsafe { Self::into_word(v) },
-            Value::Str(v) => PACK_STR | unsafe { Self::into_word(v) },
-            Value::Sym(v) => PACK_SYM | unsafe { Self::into_word(v) },
-            Value::Obj(v) => PACK_OBJ | unsafe { Self::into_word(v) },
+            ValueView::BigInt(v) => PACK_BIGINT | unsafe { Self::into_word(v) },
+            ValueView::Str(v) => PACK_STR | unsafe { Self::into_word(v) },
+            ValueView::Sym(v) => PACK_SYM | unsafe { Self::into_word(v) },
+            ValueView::Obj(v) => PACK_OBJ | unsafe { Self::into_word(v) },
         };
-        PackedValue(Cell::new(bits))
-    }
-
-    /// Move an owner into this shared frame cell, releasing its previous owner. A live
-    /// activation may expose this cell through a scoped arguments alias; neither path takes
-    /// an exclusive reference to the cell or changes its address. Install the new word before
-    /// dropping the old owner so a destructor cannot observe a moved-out slot.
-    #[inline]
-    pub(crate) fn replace_stored(&self, value: PackedValue) {
-        let value = std::mem::ManuallyDrop::new(value);
-        drop(PackedValue(Cell::new(self.0.replace(value.0.get()))));
-    }
-
-    #[inline]
-    pub(crate) fn replace_value(&self, value: Value) {
-        self.replace_stored(Self::pack(value));
+        Self::from_bits(bits)
     }
 
     #[inline]
@@ -392,97 +436,113 @@ impl PackedValue {
             PACK_UNDEFINED => Value::Undefined,
             PACK_EMPTY => Value::Empty,
             PACK_NULL => Value::Null,
-            PACK_BOOL => Value::Bool(self.0.get() & 1 != 0),
+            PACK_BOOL => Value::Bool(self.0 & 1 != 0),
             PACK_BIGINT => Value::BigInt(unsafe { self.clone_word() }),
             PACK_STR => Value::Str(unsafe { self.clone_word() }),
             PACK_SYM => Value::Sym(unsafe { self.clone_word() }),
             PACK_OBJ => Value::Obj(unsafe { self.clone_word() }),
-            PACK_LAZY_PROTO => {
-                let lazy = std::mem::ManuallyDrop::new(unsafe { self.read_word::<LazyProto>() });
-                let prototype = lazy.materialize();
-                // Promotion is representation-only, invokes no JS and preserves the descriptor
-                // and identity. Subsequent native reads see an ordinary PACK_OBJ, not a thunk.
-                // Dropping the replaced lazy word releases nothing: the cell dies once no word
-                // names it. The word lives in the function's properties, which this read
-                // writes without a mutable borrow: the write barrier records it in the
-                // function's card, with no safepoint before the store.
-                let bits = PACK_OBJ | unsafe { Self::into_word(prototype.clone()) };
-                lazy.mark_owner_card();
-                drop(PackedValue(Cell::new(self.0.replace(bits))));
-                Value::Obj(prototype)
-            }
-            _ => Value::Num(f64::from_bits(self.0.get())),
+            PACK_LAZY_PROTO => unreachable!("a deferred prototype reached execution storage"),
+            _ => Value::Num(f64::from_bits(self.0)),
         }
     }
 
-    /// Lend the object edge this word holds (an object, or a deferred prototype's single stored
-    /// edge: the logical edge from its function) without copying a handle out of the word.
-    /// Never materializes a prototype. A deferred prototype is a cell of its own,
-    /// which marking reaches through `PackedValue::trace_gc_edges`, not through this edge.
+    /// Lend the ordinary object edge this execution word holds. Property-only deferred
+    /// prototype words never enter execution storage.
     #[inline]
     fn with_object_edge(&self, f: impl FnOnce(&Gc)) {
-        match self.tag() {
-            PACK_OBJ => {
-                let object = std::mem::ManuallyDrop::new(unsafe { self.read_word::<Gc>() });
-                f(&object)
-            }
-            PACK_LAZY_PROTO => {
-                let lazy = std::mem::ManuallyDrop::new(unsafe { self.read_word::<LazyProto>() });
-                lazy.with_gc_edge(f)
-            }
-            _ => {}
+        if self.tag() == PACK_OBJ {
+            let object = std::mem::ManuallyDrop::new(unsafe { self.read_word::<Gc>() });
+            f(&object)
         }
     }
 
-    /// Copy a property's word out of its property: a deferred prototype materializes, and this
-    /// word is promoted in place to the prototype's object word (as `unpack` does); any other
-    /// word is cloned. Every copy of a word that can be a property's (a descriptor snapshot, a
-    /// read into execution storage) goes through here: a deferred prototype is a property-only
-    /// word that lives only in its function's `prototype` slot, and a plain copy could carry it
-    /// into execution or under another key.
-    #[inline]
-    pub(crate) fn clone_materialized(&self) -> PackedValue {
-        if self.tag() == PACK_LAZY_PROTO {
-            return PackedValue::pack(self.unpack());
-        }
-        self.clone()
-    }
-
-    /// Consume the packed word: its payload bits become the returned `Value`'s handle (a
-    /// deferred prototype materializes).
+    /// Decode a plain execution word. Copying or consuming a word changes no ownership.
     #[inline]
     pub(crate) fn into_value(self) -> Value {
-        let this = std::mem::ManuallyDrop::new(self);
-        match this.tag() {
-            PACK_UNDEFINED => Value::Undefined,
-            PACK_EMPTY => Value::Empty,
-            PACK_NULL => Value::Null,
-            PACK_BOOL => Value::Bool(this.0.get() & 1 != 0),
-            PACK_BIGINT => Value::BigInt(unsafe { this.read_word() }),
-            PACK_STR => Value::Str(unsafe { this.read_word() }),
-            PACK_SYM => Value::Sym(unsafe { this.read_word() }),
-            PACK_OBJ => Value::Obj(unsafe { this.read_word() }),
-            PACK_LAZY_PROTO => {
-                let lazy = unsafe { this.read_word::<LazyProto>() };
-                Value::Obj(lazy.materialize())
-            }
-            _ => Value::Num(f64::from_bits(this.0.get())),
-        }
+        self.unpack()
     }
 }
 
-/// A word owns nothing (its payload is a cell address or a scalar), so a clone copies
-/// its bits. A deferred prototype is a property-only word that must not be copied as is:
-/// property reads copy words with [`PackedValue::clone_materialized`]. Debug builds assert it.
-impl Clone for PackedValue {
+impl PropWord {
     #[inline]
-    fn clone(&self) -> Self {
-        debug_assert_ne!(
-            self.tag(),
-            PACK_LAZY_PROTO,
-            "a deferred prototype's word copied without materializing"
-        );
-        PackedValue(Cell::new(self.0.get()))
+    fn pack(value: Value) -> Self {
+        Self::from_packed(PackedValue::pack(value))
+    }
+
+    #[inline]
+    fn from_packed(value: PackedValue) -> Self {
+        debug_assert_ne!(value.tag(), PACK_LAZY_PROTO);
+        Self(Cell::new(value.0), std::marker::PhantomData)
+    }
+
+    #[inline]
+    fn tag(&self) -> u64 {
+        self.0.get() & !PACK_PAYLOAD
+    }
+
+    #[cfg(test)]
+    fn bits(&self) -> u64 {
+        self.0.get()
+    }
+
+    #[inline]
+    fn unpack(&self) -> Value {
+        if self.tag() == PACK_LAZY_PROTO {
+            // SAFETY: only defer_function_prototype publishes this property-only tag.
+            let lazy = unsafe { PackedValue::decode_payload::<LazyProto>(self.0.get()) };
+            let prototype = lazy.materialize();
+            // Representation-only promotion invokes no JS. Record the owning function before
+            // publishing its new object edge, with no safepoint between barrier and store.
+            lazy.mark_owner_card();
+            self.0
+                .set(PACK_OBJ | unsafe { PackedValue::into_word(prototype) });
+            Value::Obj(prototype)
+        } else {
+            PackedValue::from_bits(self.0.get()).unpack()
+        }
+    }
+
+    #[inline]
+    fn clone_materialized(&self) -> PackedValue {
+        if self.tag() == PACK_LAZY_PROTO {
+            PackedValue::pack(self.unpack())
+        } else {
+            PackedValue::from_bits(self.0.get())
+        }
+    }
+
+    #[inline]
+    fn into_value(self) -> Value {
+        self.unpack()
+    }
+
+    #[inline]
+    fn with_object<R>(&self, f: impl FnOnce(&Gc) -> R) -> Option<R> {
+        if self.tag() != PACK_OBJ {
+            return None;
+        }
+        PackedValue::from_bits(self.0.get()).with_object(f)
+    }
+
+    #[inline]
+    fn number(&self) -> Option<f64> {
+        if self.tag() == PACK_LAZY_PROTO {
+            return None;
+        }
+        PackedValue::from_bits(self.0.get()).number()
+    }
+
+    #[inline]
+    fn swap(&self, other: &Self) {
+        self.0.swap(&other.0);
+    }
+
+    fn trace_gc_edges(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        if self.tag() == PACK_LAZY_PROTO {
+            sink.word(self.0.get() & PACK_PAYLOAD);
+        } else {
+            PackedValue::from_bits(self.0.get()).trace_gc_edges(sink);
+        }
     }
 }
 
@@ -493,6 +553,169 @@ const _: () = assert!(!std::mem::needs_drop::<PackedValue>());
 #[cfg(test)]
 mod packed_value_tests {
     use super::*;
+    #[cfg(feature = "embed")]
+    use crate::scope::ValueKind;
+    use crate::value::ValueView;
+
+    #[test]
+    fn copy_values_views_and_slot_cells_have_pinned_layouts_and_thread_affinity() {
+        fn copy<T: Copy>() {}
+        copy::<Value>();
+        copy::<ValueView>();
+        copy::<PackedValue>();
+        copy::<crate::lstr::LStr>();
+        copy::<crate::bigint::JsBigInt>();
+        assert_eq!(std::mem::size_of::<Value>(), 16);
+        assert_eq!(std::mem::size_of::<ValueView>(), 16);
+        assert_eq!(std::mem::size_of::<PackedValue>(), 8);
+        assert_eq!(std::mem::size_of::<Cell<PackedValue>>(), 8);
+        assert_eq!(
+            std::mem::align_of::<Cell<PackedValue>>(),
+            std::mem::align_of::<PackedValue>()
+        );
+        assert_eq!(std::mem::size_of::<PropWord>(), 8);
+        assert_eq!(std::mem::size_of::<Property>(), 16);
+        // If any type becomes Send/Sync, the placeholder below becomes ambiguous and this
+        // fixture stops compiling. Plain packed bits must retain the Agent's thread affinity.
+        macro_rules! thread_bound {
+            ($ty:ty) => {{
+                trait AmbiguousIfSend<A> {
+                    fn check() {}
+                }
+                struct IsSend;
+                impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+                impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
+                let _ = <$ty as AmbiguousIfSend<_>>::check;
+                trait AmbiguousIfSync<A> {
+                    fn check() {}
+                }
+                struct IsSync;
+                impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+                impl<T: ?Sized + Sync> AmbiguousIfSync<IsSync> for T {}
+                let _ = <$ty as AmbiguousIfSync<_>>::check;
+            }};
+        }
+        thread_bound!(Value);
+        thread_bound!(ValueView);
+        thread_bound!(PackedValue);
+        thread_bound!(PropWord);
+        thread_bound!(Property);
+        thread_bound!(crate::lstr::LStr);
+        thread_bound!(crate::bigint::JsBigInt);
+        thread_bound!(Gc);
+        thread_bound!(Env);
+        #[cfg(feature = "embed")]
+        {
+            copy::<crate::scope::Value<'static>>();
+            copy::<ValueKind<'static>>();
+            thread_bound!(crate::scope::Value<'static>);
+            thread_bound!(crate::scope::ValueKind<'static>);
+        }
+    }
+
+    #[test]
+    fn views_preserve_every_discriminant_and_payload() {
+        assert!(matches!(Value::Undefined.view(), ValueView::Undefined));
+        assert!(matches!(Value::Empty.view(), ValueView::Empty));
+        assert!(matches!(Value::Null.view(), ValueView::Null));
+        for boolean in [false, true] {
+            assert!(
+                matches!(Value::Bool(boolean).view(), ValueView::Bool(actual) if actual == boolean)
+            );
+        }
+        for number in [
+            0.0,
+            -0.0,
+            f64::INFINITY,
+            f64::from_bits(0xfff8_0123_4567_89ab),
+        ] {
+            assert!(
+                matches!(Value::Num(number).view(), ValueView::Num(actual) if actual.to_bits() == number.to_bits())
+            );
+        }
+        let mut interp = crate::interpreter::Interp::new();
+        let integer = crate::bigint::JsBigInt::parse_dec("123456789012345678901234567890").unwrap();
+        assert!(
+            matches!(Value::BigInt(integer).view(), ValueView::BigInt(actual) if actual.cell_word() == integer.cell_word())
+        );
+        let string = crate::lstr::LStr::from("view payload");
+        assert!(
+            matches!(Value::Str(string).view(), ValueView::Str(actual) if crate::lstr::LStr::ptr_eq(&actual, &string))
+        );
+        let symbol = interp.new_symbol(Some("view symbol".into()));
+        assert!(
+            matches!(symbol.view(), ValueView::Sym(actual) if symbol.cell_word() == Some(symbol_identity(&actual) as u64))
+        );
+        let object = Object::new(None);
+        assert!(
+            matches!(Value::Obj(object).view(), ValueView::Obj(actual) if Gc::ptr_eq(&actual, &object))
+        );
+    }
+
+    #[test]
+    fn borrowed_engine_text_survives_copied_frontier_append_growth_and_precise_gc() {
+        use crate::gc_core::CollectionKind;
+        use crate::rooting::Rooted;
+        use crate::value::property_layout_cell_tests::{collect, isolated, Words};
+
+        let (heap, _release, _active) = isolated();
+        let prefix = "borrowed engine text: ".repeat(64);
+        let initial = crate::lstr::LStr::from(prefix.as_str()).concat_grown("");
+        let original = Rooted::new(Value::Str(initial));
+        let original_word = initial.cell_word() as usize;
+        let original_weak = crate::gc_handle::WeakRef::to(original_word);
+        let borrowed = original.as_engine_text().unwrap();
+        let original_address = borrowed.as_ptr();
+        let original_len = borrowed.len();
+
+        let mut copied = initial;
+        assert!(copied.append_in_place("frontier"));
+        assert!(crate::lstr::LStr::ptr_eq(
+            copied.view_owner().unwrap(),
+            &initial
+        ));
+        assert_eq!(copied.as_str().as_ptr(), original_address);
+        let mut current = Rooted::new(Value::Str(copied));
+        let mut expected = format!("{prefix}frontier");
+        // No conservative stack scan or additional explicit roots: only these Rooted
+        // receivers retain the dynamic strings, including the original borrowed bytes.
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            collect(&heap, &Words(Vec::new()), kind);
+            assert!(heap
+                .core
+                .borrow()
+                .owns_cell(original_word, heap.string_desc));
+            assert_eq!(borrowed, prefix);
+            assert_eq!(borrowed.len(), original_len);
+            assert_eq!(borrowed.as_ptr(), original_address);
+            assert_eq!(current.as_engine_text(), Some(expected.as_str()));
+        }
+
+        let suffix = "replacement growth: ".repeat(prefix.len());
+        assert!(!copied.append_in_place(&suffix));
+        copied.append_or_replace(&crate::lstr::LStr::from(suffix.as_str()));
+        assert_ne!(copied.as_str().as_ptr(), original_address);
+        *current = Value::Str(copied);
+        expected.push_str(&suffix);
+        let replacement_word = copied.cell_word() as usize;
+        let replacement_weak = crate::gc_handle::WeakRef::to(replacement_word);
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            collect(&heap, &Words(Vec::new()), kind);
+            let core = heap.core.borrow();
+            assert!(core.owns_cell(original_word, heap.string_desc));
+            assert!(core.owns_cell(replacement_word, heap.string_desc));
+            assert_eq!(borrowed, prefix);
+            assert_eq!(borrowed.len(), original_len);
+            assert_eq!(borrowed.as_ptr(), original_address);
+            assert_eq!(current.as_engine_text(), Some(expected.as_str()));
+        }
+
+        drop(current);
+        drop(original);
+        collect(&heap, &Words(Vec::new()), CollectionKind::Major);
+        assert!(original_weak.live_ptr().is_none());
+        assert!(replacement_weak.live_ptr().is_none());
+    }
 
     /// The JIT backends read wide Values as (tag word, payload word) and a Bool as bit 0 of the
     /// payload word. Pin that representation.
@@ -500,16 +723,22 @@ mod packed_value_tests {
     fn wide_value_layout_is_tag_word_then_payload_word() {
         assert_eq!(std::mem::size_of::<Value>(), 16);
         assert_eq!(std::mem::size_of::<Option<Value>>(), 16);
-        let words = |value: &Value| unsafe {
-            let base = value as *const Value as *const u8;
-            (base.cast::<u64>().read(), base.add(8).read())
-        };
-        assert_eq!(words(&Value::Undefined).0, 0);
-        assert_eq!(words(&Value::Null).0, 2);
-        assert_eq!(words(&Value::Bool(false)), (3, 0));
-        assert_eq!(words(&Value::Bool(true)), (3, 1));
+        // Unit variants have no initialized payload; a Bool initializes only its payload
+        // byte. Read those initialized fields, never the union's padding as a second u64.
+        let tag = |value: &Value| unsafe { std::ptr::from_ref(value).cast::<u64>().read() };
+        assert_eq!(tag(&Value::Undefined), 0);
+        assert_eq!(tag(&Value::Empty), 1);
+        assert_eq!(tag(&Value::Null), 2);
+        for boolean in [false, true] {
+            let value = Value::Bool(boolean);
+            assert_eq!(tag(&value), 3);
+            assert_eq!(
+                unsafe { std::ptr::from_ref(&value).cast::<u8>().add(8).read() },
+                u8::from(boolean)
+            );
+        }
         let number = Value::Num(1.5);
-        assert_eq!(words(&number).0, 4);
+        assert_eq!(tag(&number), 4);
         assert_eq!(
             unsafe {
                 (&number as *const Value as *const u8)
@@ -524,7 +753,7 @@ mod packed_value_tests {
         let object = Object::new(None);
         let layout = jit_layout(&object);
         let value = Value::Obj(object.clone());
-        assert_eq!(words(&value).0, 8);
+        assert_eq!(tag(&value), 8);
         assert_eq!(
             unsafe {
                 (&value as *const Value as *const u8)
@@ -532,7 +761,7 @@ mod packed_value_tests {
                     .cast::<usize>()
                     .read()
             } + layout.obj_from_cell,
-            RefCell::as_ptr(&object) as usize
+            object.object_ptr() as usize
         );
     }
 
@@ -568,8 +797,8 @@ mod packed_value_tests {
             Value::Str("number".into()),
             Value::Obj(object.clone()),
         ] {
-            let empty = matches!(value, Value::Empty);
-            let is_object = matches!(value, Value::Obj(_));
+            let empty = matches!((value).view(), ValueView::Empty);
+            let is_object = matches!((value).view(), ValueView::Obj(_));
             let packed = PackedValue::pack(value);
             let bits = packed.bits();
             for _ in 0..20 {
@@ -579,7 +808,7 @@ mod packed_value_tests {
             assert_eq!(packed.bits(), bits);
             if is_object {
                 assert!(
-                    matches!(packed.unpack(), Value::Obj(actual) if Gc::ptr_eq(&actual, &object))
+                    matches!((packed.unpack()).view(), ValueView::Obj(actual) if Gc::ptr_eq(&actual, &object))
                 );
             }
         }
@@ -591,7 +820,8 @@ mod packed_value_tests {
         engine.eval("function unobserved(){}", false).unwrap();
         let env = engine.interp.global_env.clone();
         let function = engine.interp.get_var("unobserved", &env).ok().unwrap();
-        let object = function.as_obj().unwrap().borrow();
+        let object_handle = function.as_obj().unwrap();
+        let object = object_handle.borrow();
         let prototype = object.props.get("prototype").unwrap();
         assert_eq!(prototype.packed.tag(), PACK_LAZY_PROTO);
         let bits = prototype.packed.bits();
@@ -600,7 +830,7 @@ mod packed_value_tests {
             assert!(prototype.number_value().is_none());
         }
         assert_eq!(prototype.packed.bits(), bits);
-        assert!(matches!(prototype.value(), Value::Obj(_)));
+        assert!(matches!((prototype.value()).view(), ValueView::Obj(_)));
         assert_eq!(prototype.packed.tag(), PACK_OBJ);
         let mut property = Property::plain(Value::Num(3.0));
         assert_eq!(property.number_value(), Some(3.0));
@@ -615,27 +845,27 @@ mod packed_value_tests {
     fn packed_value_is_one_word_and_round_trips_scalars() {
         assert_eq!(std::mem::size_of::<PackedValue>(), 8);
         assert!(matches!(
-            PackedValue::pack(Value::Undefined).into_value(),
-            Value::Undefined
+            (PackedValue::pack(Value::Undefined).into_value()).view(),
+            ValueView::Undefined
         ));
         assert!(matches!(
-            PackedValue::pack(Value::Empty).into_value(),
-            Value::Empty
+            (PackedValue::pack(Value::Empty).into_value()).view(),
+            ValueView::Empty
         ));
         assert!(matches!(
-            PackedValue::pack(Value::Null).into_value(),
-            Value::Null
+            (PackedValue::pack(Value::Null).into_value()).view(),
+            ValueView::Null
         ));
         assert!(matches!(
-            PackedValue::pack(Value::Bool(false)).into_value(),
-            Value::Bool(false)
+            (PackedValue::pack(Value::Bool(false)).into_value()).view(),
+            ValueView::Bool(false)
         ));
         assert!(matches!(
-            PackedValue::pack(Value::Bool(true)).into_value(),
-            Value::Bool(true)
+            (PackedValue::pack(Value::Bool(true)).into_value()).view(),
+            ValueView::Bool(true)
         ));
         for n in [0.0f64, -0.0, 42.5, f64::INFINITY, f64::NAN] {
-            let Value::Num(out) = PackedValue::pack(Value::Num(n)).into_value() else {
+            let ValueView::Num(out) = (PackedValue::pack(Value::Num(n)).into_value()).view() else {
                 panic!("number changed kind")
             };
             assert!(n.is_nan() && out.is_nan() || n.to_bits() == out.to_bits());
@@ -652,7 +882,7 @@ mod packed_value_tests {
         assert_eq!(packed.bits(), PACK_OBJ | Gc::as_ptr(&obj) as u64);
         assert!(!std::mem::needs_drop::<PackedValue>());
         let out = packed.into_value();
-        assert!(matches!(&out, Value::Obj(actual) if Gc::ptr_eq(actual, &obj)));
+        assert!(matches!(&(out).view(), ValueView::Obj(actual) if Gc::ptr_eq(actual, &obj)));
         drop(out);
     }
 
@@ -681,7 +911,7 @@ mod packed_value_tests {
         let object = Object::new(None);
         let string = crate::lstr::LStr::from("packed clone owner");
         let mut interp = crate::interpreter::Interp::new();
-        let Value::Sym(symbol) = interp.new_symbol(None) else {
+        let ValueView::Sym(symbol) = (interp.new_symbol(None)).view() else {
             unreachable!()
         };
         let original = [
@@ -702,24 +932,26 @@ mod packed_value_tests {
         }
         drop(copies);
         assert!(matches!(
-            original[0].unpack(),
-            Value::Obj(actual) if Gc::ptr_eq(&actual, &object)
+            (original[0].unpack()).view(),
+            ValueView::Obj(actual) if Gc::ptr_eq(&actual, &object)
         ));
         assert!(matches!(
-            original[1].unpack(),
-            Value::Str(actual) if crate::lstr::LStr::ptr_eq(&actual, &string)
+            (original[1].unpack()).view(),
+            ValueView::Str(actual) if crate::lstr::LStr::ptr_eq(&actual, &string)
                 && &*actual == "packed clone owner"
         ));
         assert!(matches!(
-            original[2].unpack(),
-            Value::Sym(actual) if symbol_ptr_eq(&actual, &symbol)
+            (original[2].unpack()).view(),
+            ValueView::Sym(actual) if symbol_ptr_eq(&actual, &symbol)
         ));
         let integer = crate::bigint::JsBigInt::parse_dec("123456789012345678901234567890").unwrap();
         let packed = PackedValue::pack(Value::BigInt(integer.clone()));
         let copied = packed.clone();
         assert_eq!(packed.bits(), copied.bits());
         drop(packed);
-        assert!(matches!(copied.into_value(), Value::BigInt(value) if value == integer));
+        assert!(
+            matches!((copied.into_value()).view(), ValueView::BigInt(value) if value == integer)
+        );
     }
 
     #[test]
@@ -735,7 +967,9 @@ mod packed_value_tests {
                 assert_eq!(PackedValue::scalar_bits(&value), Some(PACK_CANON_NAN));
                 let packed = PackedValue::pack(value);
                 assert_eq!(packed.bits(), PACK_CANON_NAN);
-                assert!(matches!(packed.into_value(), Value::Num(value) if value.is_nan()));
+                assert!(
+                    matches!((packed.into_value()).view(), ValueView::Num(value) if value.is_nan())
+                );
             }
         }
         for number in [
@@ -753,39 +987,38 @@ mod packed_value_tests {
         assert_eq!(PackedValue::scalar_bits(&Value::lstr("not copyable")), None);
     }
 
-    /// Raw frame-word reads, writes, an in-place `replace_value` and `drop_in_place` move an
-    /// object's word and leave the other words intact; handles hold no count, so the
-    /// test checks the words and identities alone.
+    /// Shared slot cells support copied reads/replacement and native raw inner-word stores
+    /// without fabricating an exclusive slice. The word layout and neighboring slots stay exact.
     #[test]
     fn packed_raw_frame_moves_and_replacements_preserve_ownership() {
         let obj = Object::new(None);
-        let mut frame: [std::mem::MaybeUninit<PackedValue>; 5] =
-            std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
-        let base = frame.as_mut_ptr().cast::<PackedValue>();
-        unsafe {
-            base.add(0).write(PackedValue::pack(Value::Num(1.5)));
-            base.add(1)
-                .write(PackedValue::pack(Value::Obj(obj.clone())));
-            base.add(2).write(PackedValue::pack(Value::Bool(true)));
-            base.add(3).write(PackedValue::pack(Value::Null));
-            base.add(4).write(PackedValue::pack(Value::Num(-0.0)));
-        }
-        unsafe {
-            let moved = base.add(1).read();
-            base.add(1).write(PackedValue::pack(Value::Undefined));
-            assert_eq!((*base).bits(), 1.5f64.to_bits());
-            assert!(matches!(moved.unpack(), Value::Obj(o) if Gc::ptr_eq(&o, &obj)));
-            (*base.add(3)).replace_value(moved.into_value());
-            assert!(matches!((*base.add(3)).unpack(), Value::Obj(o) if Gc::ptr_eq(&o, &obj)));
-            assert!(matches!((*base.add(1)).unpack(), Value::Undefined));
-            assert!(matches!((*base.add(2)).unpack(), Value::Bool(true)));
-            assert!(
-                matches!((*base.add(4)).unpack(), Value::Num(n) if n.to_bits() == (-0.0f64).to_bits())
-            );
-            for k in 0..5 {
-                std::ptr::drop_in_place(base.add(k));
-            }
-        }
+        let frame: [Cell<PackedValue>; 5] =
+            std::array::from_fn(|_| Cell::new(PackedValue::pack(Value::Undefined)));
+        frame[0].set(PackedValue::pack(Value::Num(1.5)));
+        frame[1].set(PackedValue::pack(Value::Obj(obj)));
+        frame[2].set(PackedValue::pack(Value::Bool(true)));
+        frame[3].set(PackedValue::pack(Value::Null));
+        frame[4].set(PackedValue::pack(Value::Num(-0.0)));
+        let moved = frame[1].replace(PackedValue::pack(Value::Undefined));
+        assert_eq!(frame[0].get().bits(), 1.5f64.to_bits());
+        assert!(matches!(moved.unpack().view(), ValueView::Obj(o) if Gc::ptr_eq(&o, &obj)));
+        // SAFETY: this raw loan addresses the inner word of a live Cell. No exclusive Rust
+        // slice/reference exists, and this test performs no collection or reentrant call.
+        unsafe { frame[3].as_ptr().write(moved) };
+        assert!(
+            matches!(frame[3].get().unpack().view(), ValueView::Obj(o) if Gc::ptr_eq(&o, &obj))
+        );
+        assert!(matches!(
+            frame[1].get().unpack().view(),
+            ValueView::Undefined
+        ));
+        assert!(matches!(
+            frame[2].get().unpack().view(),
+            ValueView::Bool(true)
+        ));
+        assert!(
+            matches!(frame[4].get().unpack().view(), ValueView::Num(n) if n.to_bits() == (-0.0f64).to_bits())
+        );
     }
 
     #[test]
@@ -1818,23 +2051,21 @@ impl Value {
     pub fn from_engine_text(s: impl Into<String>) -> Value {
         Value::Str(s.into().into())
     }
-    /// A string value's engine text, unchanged: every code unit survives a round trip through
-    /// [`Value::from_engine_text`] (tests; embedders read `embed::JsString`).
-    #[cfg(test)]
-    pub fn as_engine_text(&self) -> Option<&str> {
-        match self {
-            Value::Str(s) => Some(s),
-            _ => None,
-        }
+    /// Borrow a string's immutable cell text for this original receiver's lifetime.
+    pub(crate) fn as_engine_text(&self) -> Option<&str> {
+        let ValueView::Str(string) = self.view() else {
+            return None;
+        };
+        let text = string.as_str() as *const str;
+        // SAFETY: the view copied the original receiver's cell handle. The bytes belong to
+        // that cell, not the temporary handle, and already exposed bytes never change. The
+        // original receiver remains the root/lifetime owner of the returned cell borrow.
+        Some(unsafe { &*text })
     }
-    /// A string value as Rust text: the conversion to a Web IDL `USVString`, in which every lone
-    /// surrogate becomes U+FFFD (tests; embedders read `embed::JsString`).
-    #[cfg(test)]
-    pub fn as_text(&self) -> Option<std::borrow::Cow<'_, str>> {
-        match self {
-            Value::Str(s) => Some(crate::jstr::to_text(s)),
-            _ => None,
-        }
+
+    /// Borrow a string as USVString text, replacing lone surrogates with U+FFFD.
+    pub(crate) fn as_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.as_engine_text().map(crate::jstr::to_text)
     }
     /// A BigInt from an `i64` (for the embedder's 64-bit integer bridge, e.g. wasm i64).
     pub fn bigint_from_i64(v: i64) -> Value {
@@ -1848,35 +2079,35 @@ impl Value {
     pub fn bigint_from_i128(v: i128) -> Value {
         Value::BigInt(crate::bigint::JsBigInt::from_i128(v))
     }
-    pub(crate) fn as_obj(&self) -> Option<&Gc> {
-        match self {
-            Value::Obj(o) => Some(o),
+    pub(crate) fn as_obj(&self) -> Option<Gc> {
+        match self.view() {
+            ValueView::Obj(object) => Some(object),
             _ => None,
         }
     }
     /// The number, if this is a `Number` (an embedder convenience for reading op arguments).
     pub fn as_num_opt(&self) -> Option<f64> {
-        match self {
-            Value::Num(n) => Some(*n),
+        match &(self).view() {
+            ValueView::Num(n) => Some(*n),
             _ => None,
         }
     }
     pub fn is_callable(&self) -> bool {
-        matches!(self, Value::Obj(o) if !matches!(o.borrow().call, Callable::None))
+        matches!(&(self).view(), ValueView::Obj(o) if !matches!(o.borrow().call, Callable::None))
     }
     /// The `typeof` result determined by the value alone. The Annex B.3.6 [[IsHTMLDDA]] object
     /// (`document.all`) is branded in its Agent, so this reports "function" for it; use
     /// `Ctx::type_of` for the operator's exact result.
     pub fn type_of(&self) -> &'static str {
-        match self {
-            Value::Undefined | Value::Empty => "undefined",
-            Value::Null => "object",
-            Value::Bool(_) => "boolean",
-            Value::Num(_) => "number",
-            Value::BigInt(_) => "bigint",
-            Value::Str(_) => "string",
-            Value::Sym(_) => "symbol",
-            Value::Obj(o) => {
+        match &(self).view() {
+            ValueView::Undefined | ValueView::Empty => "undefined",
+            ValueView::Null => "object",
+            ValueView::Bool(_) => "boolean",
+            ValueView::Num(_) => "number",
+            ValueView::BigInt(_) => "bigint",
+            ValueView::Str(_) => "string",
+            ValueView::Sym(_) => "symbol",
+            ValueView::Obj(o) => {
                 if matches!(o.borrow().call, Callable::None) {
                     "object"
                 } else {
@@ -2962,9 +3193,7 @@ impl PackedValue {
     /// traces its function and its parent or prototype itself) or an object.
     pub(crate) fn trace_gc_edges(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         match self.tag() {
-            PACK_BIGINT | PACK_SYM | PACK_STR | PACK_LAZY_PROTO => {
-                sink.word(self.0.get() & PACK_PAYLOAD)
-            }
+            PACK_BIGINT | PACK_SYM | PACK_STR => sink.word(self.0 & PACK_PAYLOAD),
             _ => self.with_object_edge(|object| sink.object(object)),
         }
     }
@@ -3277,8 +3506,8 @@ pub(crate) fn observe_weak_target(
     queue: &Rc<crate::weak_metadata::DeathQueue>,
 ) {
     use crate::weak_metadata::DeathObservers;
-    match target.upgrade() {
-        Some(Value::Obj(object)) => {
+    match target.upgrade().map(|value| value.view()) {
+        Some(ValueView::Obj(object)) => {
             let cell = Gc::as_ptr(&object) as usize;
             object_heap(cell)
                 .weak_observers
@@ -3287,7 +3516,7 @@ pub(crate) fn observe_weak_target(
                 .or_insert_with(|| DeathObservers::new(target.clone()))
                 .subscribe(queue);
         }
-        Some(Value::Sym(symbol)) => {
+        Some(ValueView::Sym(symbol)) => {
             symbol
                 .weak_observers
                 .borrow_mut()
@@ -3305,8 +3534,8 @@ pub(crate) fn unobserve_weak_target(
     target: &crate::interpreter::WeakTarget,
     queue: &Rc<crate::weak_metadata::DeathQueue>,
 ) {
-    match target.upgrade() {
-        Some(Value::Obj(object)) => {
+    match (target.upgrade()).map(|__value| (__value).view()) {
+        Some(ValueView::Obj(object)) => {
             let cell = Gc::as_ptr(&object) as usize;
             let heap = object_heap(cell);
             let mut watched = heap.weak_observers.borrow_mut();
@@ -3318,7 +3547,7 @@ pub(crate) fn unobserve_weak_target(
                 crate::weak_metadata::shrink_map(&mut watched);
             }
         }
-        Some(Value::Sym(symbol)) => {
+        Some(ValueView::Sym(symbol)) => {
             let mut watched = symbol.weak_observers.borrow_mut();
             if watched
                 .as_mut()
@@ -4166,7 +4395,7 @@ pub enum TaIndex {
 /// bits point to an accessor pair only for accessor properties. Thus ordinary properties are 16
 /// bytes and allocate no metadata, while still keeping the flags directly readable by the JIT.
 pub struct Property {
-    packed: PackedValue,
+    packed: PropWord,
     meta: usize,
 }
 
@@ -4208,7 +4437,7 @@ impl Clone for Property {
         Property {
             // A snapshot can be stored under another key or on another object (a descriptor
             // define, a property copy), where a deferred prototype must not travel unmaterialized.
-            packed: self.packed.clone_materialized(),
+            packed: PropWord::from_packed(self.packed.clone_materialized()),
             meta,
         }
     }
@@ -4258,7 +4487,7 @@ impl Property {
             | ((enumerable as usize) * PROP_ENUMERABLE)
             | ((configurable as usize) * PROP_CONFIGURABLE);
         Property {
-            packed: PackedValue::pack(value),
+            packed: PropWord::pack(value),
             meta,
         }
     }
@@ -4275,7 +4504,7 @@ impl Property {
         let ptr = Box::into_raw(Box::new(Accessors { get, set })) as usize;
         debug_assert_eq!(ptr & PROP_FLAG_MASK, 0);
         Property {
-            packed: PackedValue::pack(Value::Undefined),
+            packed: PropWord::pack(Value::Undefined),
             meta: ptr | flags,
         }
     }
@@ -4375,7 +4604,9 @@ impl Property {
     }
     pub(crate) fn visit_retained_value(&self, visitor: &mut crate::memory::Visitor) {
         if self.packed.tag() == PACK_LAZY_PROTO {
-            let lazy = std::mem::ManuallyDrop::new(unsafe { self.packed.read_word::<LazyProto>() });
+            let lazy = std::mem::ManuallyDrop::new(unsafe {
+                PackedValue::decode_payload::<LazyProto>(self.packed.0.get())
+            });
             lazy.visit_retained_memory(visitor);
         } else {
             visitor.value(&self.value());
@@ -4386,9 +4617,10 @@ impl Property {
     pub(crate) fn defer_function_prototype(&mut self, owner: &Gc, parent: Gc, template: &Props) {
         let lazy = LazyFunctionPrototype::new(owner, parent, template);
         let lazy: LazyProto = crate::gc_box::new(lazy);
-        self.packed = PackedValue(Cell::new(
-            PACK_LAZY_PROTO | unsafe { PackedValue::into_word(lazy) },
-        ));
+        self.packed = PropWord(
+            Cell::new(PACK_LAZY_PROTO | unsafe { PackedValue::into_word(lazy) }),
+            std::marker::PhantomData,
+        );
     }
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
@@ -4402,11 +4634,11 @@ impl Property {
     }
     #[inline]
     pub(crate) fn set_value(&mut self, value: Value) {
-        self.packed = PackedValue::pack(value);
+        self.packed = PropWord::pack(value);
     }
     #[inline]
     pub(crate) fn replace_value(&mut self, value: Value) -> Value {
-        let old = std::mem::replace(&mut self.packed, PackedValue::pack(value));
+        let old = std::mem::replace(&mut self.packed, PropWord::pack(value));
         old.into_value()
     }
     #[inline]
@@ -4460,7 +4692,7 @@ impl Property {
     /// Move an execution owner directly into an ordinary property, with no decode/repack.
     pub(crate) fn plain_packed(packed: PackedValue) -> Property {
         Property {
-            packed,
+            packed: PropWord::from_packed(packed),
             meta: PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE,
         }
     }
@@ -6444,8 +6676,8 @@ impl Props {
             return;
         }
         let p = &self.entries.fields[slot];
-        match p.value() {
-            Value::Num(f) if !p.accessor() && p.writable() && f.to_bits() != MIRROR_HOLE => {
+        match (p.value()).view() {
+            ValueView::Num(f) if !p.accessor() && p.writable() && f.to_bits() != MIRROR_HOLE => {
                 if !f64_exact_i32(f) {
                     self.mirror_flags &= !MIRROR_ALL_I32;
                 }
@@ -6470,7 +6702,7 @@ impl Props {
         // not pay a buffer allocation just to invalidate it.
         {
             let p = &self.entries.fields[slot];
-            let ok = matches!(p.value(), Value::Num(f) if f.to_bits() != MIRROR_HOLE)
+            let ok = matches!((p.value()).view(), ValueView::Num(f) if f.to_bits() != MIRROR_HOLE)
                 && !p.accessor()
                 && p.writable();
             if !ok {
@@ -6520,8 +6752,8 @@ impl Props {
             if p.is_empty() || p.accessor() || !p.writable() {
                 return Err(v);
             }
-            let number = match &v {
-                Value::Num(number) => Some(*number),
+            let number = match &(v).view() {
+                ValueView::Num(number) => Some(*number),
                 _ => None,
             };
             p.set_value(v);
@@ -6553,8 +6785,8 @@ impl Props {
             return Err(v);
         }
         if self.mirror_flags & MIRROR_OK != 0 {
-            match &v {
-                Value::Num(f) if f.to_bits() != MIRROR_HOLE => {
+            match &(v).view() {
+                ValueView::Num(f) if f.to_bits() != MIRROR_HOLE => {
                     if !f64_exact_i32(*f) {
                         self.mirror_flags &= !MIRROR_ALL_I32;
                     }
@@ -6871,7 +7103,7 @@ impl Props {
                 // representation; larger arrays advance their logical data pointer.
                 let properties = buffers.inline_packed.as_slice();
                 for pair in properties.windows(2) {
-                    pair[0].packed.0.swap(&pair[1].packed.0);
+                    pair[0].packed.swap(&pair[1].packed);
                 }
                 buffers.inline_packed.pop().unwrap()
             };
@@ -6923,7 +7155,7 @@ impl Props {
         let first = if packed {
             self.note_structural();
             for pair in self.elems.packed_ref().unwrap().windows(2) {
-                pair[0].packed.0.swap(&pair[1].packed.0);
+                pair[0].packed.swap(&pair[1].packed);
             }
             let buffers = self.elems.0.as_deref_mut().unwrap();
             let property = if let Some(properties) = buffers.packed.as_deref_mut() {
@@ -6942,8 +7174,7 @@ impl Props {
                 let next = self.elems[n] as usize;
                 self.entries.fields[previous]
                     .packed
-                    .0
-                    .swap(&self.entries.fields[next].packed.0);
+                    .swap(&self.entries.fields[next].packed);
             }
             let last = len - 1;
             let slot = self.elems[last] as usize;
@@ -7012,21 +7243,21 @@ impl Props {
         let mirror = self.mirror_flags & MIRROR_OK != 0
             && self.elems.mirror_len() == len
             && (len == 0 || self.mirror_flags & MIRROR_PACKED != 0)
-            && items
-                .iter()
-                .all(|value| matches!(value, Value::Num(n) if n.to_bits() != MIRROR_HOLE));
+            && items.iter().all(
+                |value| matches!(&(value).view(), ValueView::Num(n) if n.to_bits() != MIRROR_HOLE),
+            );
         if mirror {
             let buffers = self.elems.buffers_mut();
             buffers
                 .mirror
-                .prepend(items.iter().map(|value| match value {
-                    Value::Num(n) => *n,
+                .prepend(items.iter().map(|value| match &(value).view() {
+                    ValueView::Num(n) => *n,
                     _ => unreachable!(),
                 }));
             self.mirror_flags |= MIRROR_PACKED;
             if items
                 .iter()
-                .any(|value| matches!(value, Value::Num(n) if !f64_exact_i32(*n)))
+                .any(|value| matches!(&(value).view(), ValueView::Num(n) if !f64_exact_i32(*n)))
             {
                 self.mirror_flags &= !MIRROR_ALL_I32;
             }
@@ -7046,10 +7277,11 @@ impl Props {
                 .unwrap()
                 .prepend(items.iter().map(|item| Property::plain(item.clone())));
         }
-        buffers
-            .inline_packed
-            .packed_plain
-            .set(items.iter().all(|value| !matches!(value, Value::Empty)));
+        buffers.inline_packed.packed_plain.set(
+            items
+                .iter()
+                .all(|value| !matches!(&(value).view(), ValueView::Empty)),
+        );
         self.set_array_length_value(next as f64);
         true
     }

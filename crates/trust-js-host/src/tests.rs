@@ -1,4 +1,5 @@
 use super::*;
+use trust_js::embed::ValueKind;
 
 /// The Phase-1 acceptance test: an external crate registers a native global and JS calls it.
 fn host_add<'s>(
@@ -92,7 +93,7 @@ fn call_function_reenters_the_engine() {
             .call_function(&cb, Value::Undefined, &[Value::Num(21.0)])
             .map_err(|_| "js threw")
             .expect("call ok");
-        assert!(matches!(out, Value::Num(n) if n == 42.0));
+        assert!(matches!((out).kind(), ValueKind::Num(n) if n == 42.0));
     });
 }
 

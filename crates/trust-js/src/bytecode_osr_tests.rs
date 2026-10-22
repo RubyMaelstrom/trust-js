@@ -1,4 +1,5 @@
 use super::*;
+use crate::value::ValueView;
 
 fn operand_owner_loop(i: &mut Interp) -> (Rc<Chunk>, Value) {
     let body =
@@ -68,7 +69,7 @@ fn osr_preserves_nonempty_operand_prefix_and_rejects_wrong_initial_depth() {
     let result = run_tiered_script(&mut engine.interp, &chunk, &env, Value::Undefined)
         .ok()
         .expect("borrowed operand loop completes");
-    let (Value::Obj(actual), Value::Obj(expected)) = (result, owner) else {
+    let (ValueView::Obj(actual), ValueView::Obj(expected)) = (result.view(), owner.view()) else {
         panic!("owned objects");
     };
     assert!(crate::value::Gc::ptr_eq(&actual, &expected));
@@ -116,8 +117,8 @@ fn osr_entry_operand_prefix_is_a_root() {
                 Op::CallWithThis(0, 1)
             ]
         );
-        assert!(matches!(raw.consts[1], Value::Num(n) if n == 0.0));
-        assert!(matches!(raw.consts[2], Value::Num(n) if n == 2000.0));
+        assert!(matches!((raw.consts[1]).view(), ValueView::Num(n) if n == 0.0));
+        assert!(matches!((raw.consts[2]).view(), ValueView::Num(n) if n == 2000.0));
         raw.ops = vec![
             // track({tag: 'O'}): the prefix.
             Op::LoadNameForCall(0, 0),
@@ -152,7 +153,7 @@ fn osr_entry_operand_prefix_is_a_root() {
             .expect("the prefix loop completes");
         let marks = engine.interp.get_var("osrMarks", &env).ok().expect("marks");
         assert!(
-            matches!(&marks, Value::Str(marks) if marks.as_str() == "R"),
+            matches!(&(marks).view(), ValueView::Str(marks) if marks.as_str() == "R"),
             "the prefix was marked by a root"
         );
         let tag = result
@@ -164,7 +165,9 @@ fn osr_entry_operand_prefix_is_a_root() {
             .map(crate::value::Property::value);
         tag
     });
-    assert!(matches!(tag, Some(Value::Str(tag)) if tag.as_str() == "O"));
+    assert!(
+        matches!((tag).map(|__value| (__value).view()), Some(ValueView::Str(tag)) if tag.as_str() == "O")
+    );
     assert!(crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()) > 0);
     let census = last_census();
     assert!(
@@ -197,7 +200,7 @@ fn osr_compile_unavailable_keeps_exact_baseline_state_without_replay() {
     let result = run_tiered_script(&mut engine.interp, &chunk, &env, Value::Undefined)
         .ok()
         .expect("unavailable native code stays bytecode");
-    let (Value::Obj(actual), Value::Obj(expected)) = (result, owner) else {
+    let (ValueView::Obj(actual), ValueView::Obj(expected)) = (result.view(), owner.view()) else {
         panic!("owned objects");
     };
     assert!(crate::value::Gc::ptr_eq(&actual, &expected));

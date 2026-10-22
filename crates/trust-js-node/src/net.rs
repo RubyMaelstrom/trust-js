@@ -36,6 +36,7 @@ use std::net::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use trust_js_host::ValueKind;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -713,7 +714,10 @@ fn op_set_no_delay<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
-    let on = !matches!(args.get(1), Some(Value::Bool(false)));
+    let on = !matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(false))
+    );
     let ok = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.get(&sid))
@@ -730,7 +734,10 @@ fn op_set_keep_alive<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
-    let on = matches!(args.get(1), Some(Value::Bool(true)));
+    let on = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let delay_ms = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.0);
     let stream = ctx
         .host_mut::<NetRegistry>()
@@ -772,7 +779,10 @@ fn op_socket_ref<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
-    let unref = matches!(args.get(1), Some(Value::Bool(true)));
+    let unref = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let pending = ctx.host_mut::<NetRegistry>().and_then(|r| {
         r.sockets.get_mut(&sid).map(|e| {
             e.unref = unref;
@@ -994,7 +1004,10 @@ fn op_server_ref<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
-    let unref = matches!(args.get(1), Some(Value::Bool(true)));
+    let unref = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let pending = ctx.host_mut::<NetRegistry>().and_then(|r| {
         r.servers.get_mut(&sid).map(|e| {
             e.unref = unref;
@@ -1296,7 +1309,10 @@ fn op_udp_set_broadcast<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
-    let on = matches!(args.get(1), Some(Value::Bool(true)));
+    let on = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     with_udp(ctx, sid, "setBroadcast", |s, _| s.set_broadcast(on))
 }
 
@@ -1348,7 +1364,10 @@ fn op_udp_set_multicast_loop<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
-    let on = matches!(args.get(1), Some(Value::Bool(true)));
+    let on = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     with_udp(ctx, sid, "setMulticastLoopback", |s, kind6| {
         if kind6 {
             s.set_multicast_loop_v6(on)
@@ -1504,8 +1523,8 @@ fn udp_source_membership<'s>(
     let group_text = ctx
         .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
         .to_string();
-    let interface_text = match args.get(3) {
-        Some(Value::Undefined) | Some(Value::Null) | None => String::new(),
+    let interface_text = match args.get(3).filter(|value| !value.is_nullish()) {
+        None => String::new(),
         Some(value) => ctx.coerce_string(value)?.to_string(),
     };
     let source = parse_v4(&source_text).map_err(|_| {
@@ -1639,8 +1658,8 @@ fn udp_membership<'s>(
     let mcast = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
         .to_string();
-    let iface = match args.get(2) {
-        Some(Value::Undefined) | Some(Value::Null) | None => String::new(),
+    let iface = match args.get(2).filter(|value| !value.is_nullish()) {
+        None => String::new(),
         Some(v) => ctx.coerce_string(v)?.to_string(),
     };
     let kind6 = ctx
@@ -1692,7 +1711,10 @@ fn op_udp_ref<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
-    let unref = matches!(args.get(1), Some(Value::Bool(true)));
+    let unref = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let pending = ctx.host_mut::<DgramRegistry>().and_then(|r| {
         r.sockets.get_mut(&sid).map(|e| {
             e.unref = unref;
@@ -1715,7 +1737,10 @@ fn op_udp_get_buffer_size<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
-    let receive = matches!(args.get(1), Some(Value::Bool(true)));
+    let receive = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let socket = ctx
         .host_mut::<DgramRegistry>()
         .and_then(|registry| registry.sockets.get(&sid))
@@ -1732,7 +1757,10 @@ fn op_udp_set_buffer_size<'s>(
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
-    let receive = matches!(args.get(1), Some(Value::Bool(true)));
+    let receive = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let size = arg_u64(args, 2).min(i32::MAX as u64) as i32;
     let socket = ctx
         .host_mut::<DgramRegistry>()

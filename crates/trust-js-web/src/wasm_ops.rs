@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{
     ArrayBufferBytes, Ctx, Handle, RetainedExternalAllocation, RetainedExternalMemory, Value,
@@ -167,7 +168,7 @@ fn optional_u32_arg<'s>(
     index: usize,
     what: &str,
 ) -> Result<Option<u32>, Value<'s>> {
-    if matches!(args.get(index), None | Some(Value::Undefined)) {
+    if args.get(index).is_none_or(Value::is_undefined) {
         Ok(None)
     } else {
         u32_arg(ctx, args, index, what).map(Some)
@@ -554,7 +555,10 @@ pub(crate) fn op_alloc_global<'s>(
     let ty = valtype_of(&type_name)
         .ok_or_else(|| ctx.make_error("TypeError", "unsupported WebAssembly global type"))?;
     let val = js_to_val(ctx, a.first().unwrap_or(&Value::Undefined), ty)?;
-    let mutable = matches!(a.get(1), Some(Value::Bool(true)));
+    let mutable = matches!(
+        (a.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
     Ok(Value::Num(ws.store.alloc_global(val, mutable, ty) as f64))
 }

@@ -4,6 +4,7 @@ use super::*;
 use crate::bytecode::{
     IcState, Tier, IC_ABSENT, IC_ACCESSOR, IC_ARR_KEYCHK, IC_EMPTY, PROP_IC_WAYS,
 };
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -191,8 +192,8 @@ fn record_getter_specialization_returns_fresh_live_records() {
                 .get_prop_ic(&source, "state", &cache[0])
                 .unwrap_or_else(|_| panic!("maintenance getter"));
             assert!(matches!(
-                engine.interp.get_member_key(&value, "index"),
-                Ok(Value::Num(7.))
+                (engine.interp.get_member_key(&value, "index")).map(|__value| (__value).view()),
+                Ok(ValueView::Num(7.))
             ));
             assert_eq!(
                 property_read::TEST_RECORD_GETTERS.with(Cell::get),
@@ -275,7 +276,7 @@ fn getter_cache_owned_snapshot_stays_two_words() {
         .finish_cached_get(read, &Value::Undefined, None)
         .ok()
         .unwrap();
-    assert!(matches!(&value, Value::Obj(actual) if Gc::ptr_eq(actual, &object)));
+    assert!(matches!(&(value).view(), ValueView::Obj(actual) if Gc::ptr_eq(actual, &object)));
 }
 
 #[test]
@@ -291,7 +292,8 @@ fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_dr
                 .ok()
                 .unwrap();
             let read = {
-                let object = function.as_obj().unwrap().borrow();
+                let object_handle = function.as_obj().unwrap();
+                let object = object_handle.borrow();
                 engine
                     .interp
                     .snapshot_cached_get(
@@ -303,7 +305,7 @@ fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_dr
                     )
                     .unwrap()
             };
-            (read, Gc::downgrade(function.as_obj().unwrap()))
+            (read, Gc::downgrade(&function.as_obj().unwrap()))
         });
         engine.interp.gc_collect();
         let prototype = read.data().unwrap();
@@ -313,7 +315,7 @@ fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_dr
             .ok()
             .unwrap();
         assert!(Gc::ptr_eq(
-            constructor.as_obj().unwrap(),
+            &constructor.as_obj().unwrap(),
             &weak.upgrade().unwrap()
         ));
         weak
@@ -335,12 +337,13 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
                 0,
                 Rc::new(|_, this, args| {
                     assert!(args.is_empty());
-                    let object = this.as_obj().unwrap().borrow();
+                    let object_handle = this.as_obj().unwrap();
+                    let object = object_handle.borrow();
                     Ok(object.props.get("id").unwrap().value())
                 }),
                 crate::value::NativeCaptures::None,
             );
-            let weak = Gc::downgrade(getter.as_obj().unwrap());
+            let weak = Gc::downgrade(&getter.as_obj().unwrap());
             holder.borrow_mut().props.insert(
                 "cached",
                 Property::accessor_prop(Some(getter), None, true, true),
@@ -362,7 +365,7 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
                 .get_prop_ic(&base, "cached", &cache[0])
                 .ok()
                 .unwrap();
-            assert!(matches!(value, Value::Num(19.0)));
+            assert!(matches!((value).view(), ValueView::Num(19.0)));
             assert_eq!(
                 cache[0].get().depth,
                 if depth <= 5 {
@@ -387,8 +390,8 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
             "layout caches must not pin getter values"
         );
         assert!(matches!(
-            engine.interp.get_prop_ic(&base, "cached", &cache[0]),
-            Ok(Value::Num(23.0))
+            (engine.interp.get_prop_ic(&base, "cached", &cache[0])).map(|__value| (__value).view()),
+            Ok(ValueView::Num(23.0))
         ));
     }
 }
@@ -423,7 +426,7 @@ fn getter_cache_same_shape_replacement_and_kind_changes_are_live() {
         }
         for _ in 0..3 {
             assert!(
-                matches!(engine.interp.get_prop_ic(&base, "cached", &cache[0]), Ok(Value::Num(n)) if n==expected)
+                matches!((engine.interp.get_prop_ic(&base, "cached", &cache[0])).map(|__value| (__value).view()), Ok(ValueView::Num(n)) if n==expected)
             );
             assert_eq!(cache[0].get().depth, IC_ACCESSOR);
         }
@@ -439,8 +442,8 @@ fn getter_cache_same_shape_replacement_and_kind_changes_are_live() {
         .insert("cached", Property::accessor_prop(None, None, false, true));
     assert_eq!(object.borrow().props.shape(), shape);
     assert!(matches!(
-        engine.interp.get_prop_ic(&base, "cached", &cache[0]),
-        Ok(Value::Undefined)
+        (engine.interp.get_prop_ic(&base, "cached", &cache[0])).map(|__value| (__value).view()),
+        Ok(ValueView::Undefined)
     ));
     assert_eq!(calls.get(), 6);
     object
@@ -448,8 +451,8 @@ fn getter_cache_same_shape_replacement_and_kind_changes_are_live() {
         .props
         .insert("cached", Property::plain(Value::Num(31.0)));
     assert!(matches!(
-        engine.interp.get_prop_ic(&base, "cached", &cache[0]),
-        Ok(Value::Num(31.0))
+        (engine.interp.get_prop_ic(&base, "cached", &cache[0])).map(|__value| (__value).view()),
+        Ok(ValueView::Num(31.0))
     ));
     assert_eq!(cache[0].get().depth, 0);
 }
@@ -481,11 +484,11 @@ fn getter_cache_array_holder_uses_live_key_checks_and_computed_keys() {
             .ok()
             .unwrap();
         assert!(
-            matches!(engine.interp.get_prop_ic(&array, "cached", &cache[0]), Ok(Value::Num(v)) if v==n as f64+1.0)
+            matches!((engine.interp.get_prop_ic(&array, "cached", &cache[0])).map(|__value| (__value).view()), Ok(ValueView::Num(v)) if v==n as f64+1.0)
         );
         assert_eq!(cache[0].get().depth, IC_ACCESSOR | IC_ARR_KEYCHK);
         assert!(
-            matches!(engine.interp.get_computed_property(&array, &key), Ok(Value::Num(v)) if v==n as f64+1.0)
+            matches!((engine.interp.get_computed_property(&array, &key)).map(|__value| (__value).view()), Ok(ValueView::Num(v)) if v==n as f64+1.0)
         );
         let shape = array.as_obj().unwrap().borrow().props.shape();
         assert_eq!(
@@ -534,8 +537,9 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
                 for k in 0..5000 {
                     let transient = crate::lstr::LStr::from(format!("absent{k}"));
                     assert!(matches!(
-                        interp.get_computed_property(&other, &transient),
-                        Ok(Value::Undefined)
+                        (interp.get_computed_property(&other, &transient))
+                            .map(|__value| (__value).view()),
+                        Ok(ValueView::Undefined)
                     ));
                 }
                 assert_eq!(
@@ -552,7 +556,7 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
             }),
             crate::value::NativeCaptures::None,
         );
-        let weak = Gc::downgrade(getter.as_obj().unwrap());
+        let weak = Gc::downgrade(&getter.as_obj().unwrap());
         object.borrow_mut().props.insert(
             "cached",
             Property::accessor_prop(Some(getter), None, true, true),
@@ -565,7 +569,7 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
         .get_computed_property(&base, &key)
         .ok()
         .unwrap();
-    assert!(Gc::ptr_eq(result.as_obj().unwrap(), &object));
+    assert!(Gc::ptr_eq(&result.as_obj().unwrap(), &object));
     assert_eq!(called.get(), 1);
     engine.interp.gc_collect();
     assert!(
@@ -573,8 +577,8 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
         "the replaced getter is released"
     );
     assert!(matches!(
-        engine.interp.get_computed_property(&base, &key),
-        Ok(Value::Num(47.0))
+        (engine.interp.get_computed_property(&base, &key)).map(|__value| (__value).view()),
+        Ok(ValueView::Num(47.0))
     ));
     assert_eq!(called.get(), 1);
 }
@@ -717,8 +721,9 @@ fn getter_cache_legacy_poison_stays_generic_and_getter_exceptions_propagate() {
         let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         for _ in 0..3 {
             assert!(matches!(
-                engine.interp.get_prop_ic(&sloppy, key, &cache[0]),
-                Ok(Value::Null)
+                (engine.interp.get_prop_ic(&sloppy, key, &cache[0]))
+                    .map(|__value| (__value).view()),
+                Ok(ValueView::Null)
             ));
             assert!(cache.iter().all(|c| c.get().depth == IC_EMPTY));
             assert!(engine.interp.get_prop_ic(&strict, key, &cache[0]).is_err());
@@ -854,7 +859,7 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
         let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         for _ in 0..2 {
             assert!(
-                matches!(engine.interp.get_prop_ic(&base, "__pilot", &cache[0]), Ok(Value::Num(n)) if n == expected),
+                matches!((engine.interp.get_prop_ic(&base, "__pilot", &cache[0])).map(|__value| (__value).view()), Ok(ValueView::Num(n)) if n == expected),
                 "{label}"
             );
             assert_eq!(
@@ -866,10 +871,11 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
         let absent = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         for _ in 0..2 {
             assert!(matches!(
-                engine
+                (engine
                     .interp
-                    .get_prop_ic(&base, "__pilot_absent", &absent[0]),
-                Ok(Value::Undefined)
+                    .get_prop_ic(&base, "__pilot_absent", &absent[0]))
+                .map(|__value| (__value).view()),
+                Ok(ValueView::Undefined)
             ));
             assert_eq!(absent[0].get().depth, IC_ABSENT, "{label}");
         }
@@ -877,33 +883,36 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
     // A cached absence must observe a late addition on the wrapper prototype.
     let late = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
     assert!(matches!(
-        engine
+        (engine
             .interp
-            .get_prop_ic(&Value::Num(1.0), "__pilot_late", &late[0]),
-        Ok(Value::Undefined)
+            .get_prop_ic(&Value::Num(1.0), "__pilot_late", &late[0]))
+        .map(|__value| (__value).view()),
+        Ok(ValueView::Undefined)
     ));
     evaluate(&mut engine, "Number.prototype.__pilot_late = 44;");
     assert!(matches!(
-        engine
+        (engine
             .interp
-            .get_prop_ic(&Value::Num(1.0), "__pilot_late", &late[0]),
-        Ok(Value::Num(44.0))
+            .get_prop_ic(&Value::Num(1.0), "__pilot_late", &late[0]))
+        .map(|__value| (__value).view()),
+        Ok(ValueView::Num(44.0))
     ));
     // Accessors cache as accessor states and the live getter runs on every read.
     let accessor = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
     for _ in 0..2 {
         assert!(matches!(
-            engine
+            (engine
                 .interp
-                .get_prop_ic(&Value::Bool(false), "__pilot_g", &accessor[0]),
-            Ok(Value::Num(43.0))
+                .get_prop_ic(&Value::Bool(false), "__pilot_g", &accessor[0]))
+            .map(|__value| (__value).view()),
+            Ok(ValueView::Num(43.0))
         ));
         assert_eq!(accessor[0].get().depth, IC_ACCESSOR);
     }
     let global = Value::Obj(engine.interp.global.clone());
     assert!(matches!(
-        engine.interp.get_member_key(&global, "pilotGetterCalls"),
-        Ok(Value::Num(2.0))
+        (engine.interp.get_member_key(&global, "pilotGetterCalls")).map(|__value| (__value).view()),
+        Ok(ValueView::Num(2.0))
     ));
     // Wrapper objects resolve through their wrapper prototype at depth 1.
     let wrapper = engine
@@ -914,10 +923,11 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
     let wrap_cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
     for _ in 0..2 {
         assert!(matches!(
-            engine
+            (engine
                 .interp
-                .get_prop_ic(&wrapper, "__pilot", &wrap_cache[0]),
-            Ok(Value::Num(41.0))
+                .get_prop_ic(&wrapper, "__pilot", &wrap_cache[0]))
+            .map(|__value| (__value).view()),
+            Ok(ValueView::Num(41.0))
         ));
         assert_eq!(wrap_cache[0].get().depth, 1);
     }

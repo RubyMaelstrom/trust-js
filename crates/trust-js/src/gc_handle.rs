@@ -1,12 +1,10 @@
 //! The engine's strong object handle.
 //!
 //! [`Gc`] is the `Copy` address of a GC cell holding the `RefCell<Object>` (P1 S2; see
-//! `gc_core`). It dereferences to the `RefCell<Object>`, so `.borrow()` works on a handle;
-//! `.borrow_mut()` and `.try_borrow_mut()` are the handle's own, which record the write in the
-//! object's card first (the write barrier, S6 step 10b). Identity goes through associated
-//! functions — [`Gc::as_ptr`], [`Gc::ptr_eq`],
-//! [`Gc::downgrade`] — so `gc.as_ptr()` names `RefCell::as_ptr` through the deref. Copying a
-//! handle is free and dropping one releases nothing; the collector reclaims unreachable cells.
+//! `gc_core`). Its inherent borrow API keeps the RefCell private; both mutable borrows record
+//! the object's card first. Identity uses the associated `Gc::as_ptr` (the cell address), while
+//! `object_ptr` explicitly names its payload. Copying a handle is free and dropping one releases
+//! nothing; the collector reclaims unreachable cells.
 
 pub(crate) use cell::{clear_dead_weak_cells, WeakRef};
 pub(crate) use cell::{Gc, WeakGc};
@@ -59,9 +57,33 @@ mod cell {
             WeakGc::of(this)
         }
 
+        /// Borrow the live cell's payload. The RefCell itself never leaves this handle API.
+        #[inline]
+        pub fn borrow(&self) -> std::cell::Ref<'_, Object> {
+            // SAFETY: a reachable handle names a live cell (Decision 0 / I1).
+            unsafe { self.0.as_ref() }.borrow()
+        }
+
+        #[inline]
+        pub fn try_borrow(&self) -> Result<std::cell::Ref<'_, Object>, std::cell::BorrowError> {
+            // SAFETY: as in `borrow`.
+            unsafe { self.0.as_ref() }.try_borrow()
+        }
+
+        /// The payload's address, distinct from `Gc::as_ptr`'s RefCell address. Reading or
+        /// writing through it requires the usual raw-pointer safety proof; writes must also
+        /// record the owning cell's card before publishing any new edge.
+        // Kept as part of the explicit handle API after removing RefCell dereferencing.
+        #[allow(dead_code)]
+        #[inline]
+        pub(crate) fn object_ptr(&self) -> *mut Object {
+            // SAFETY: a reachable handle names a live cell (Decision 0 / I1).
+            unsafe { self.0.as_ref() }.as_ptr()
+        }
+
         /// Mutably borrow the object, as `RefCell::borrow_mut`, first recording the write in the
         /// object's card (the write barrier, `gc_core::card_mark`). Every mutable borrow through
-        /// a handle resolves here, before the `Deref` to the `RefCell`. A card set at the borrow
+        /// a handle resolves here; the `RefCell` is never exposed. A card set at the borrow
         /// covers every write made under it: no collection runs while a borrow is outstanding
         /// (I9), and the card stays set until the next collection starts.
         #[inline]
@@ -69,7 +91,7 @@ mod cell {
             // SAFETY: a reachable handle names a live object cell (Decision 0 / I1): small (an
             // object's cell fits the 192-byte class) and of the carded object kind.
             unsafe { crate::gc_core::card_mark(self.0.as_ptr().cast()) };
-            (**self).borrow_mut()
+            unsafe { self.0.as_ref() }.borrow_mut()
         }
 
         /// `RefCell::try_borrow_mut` with the write barrier, as [`Gc::borrow_mut`].
@@ -79,16 +101,7 @@ mod cell {
         ) -> Result<std::cell::RefMut<'_, Object>, std::cell::BorrowMutError> {
             // SAFETY: as in `borrow_mut`.
             unsafe { crate::gc_core::card_mark(self.0.as_ptr().cast()) };
-            (**self).try_borrow_mut()
-        }
-    }
-
-    impl std::ops::Deref for Gc {
-        type Target = RefCell<Object>;
-        #[inline]
-        fn deref(&self) -> &RefCell<Object> {
-            // SAFETY: a reachable handle names a live cell (Decision 0 / I1).
-            unsafe { self.0.as_ref() }
+            unsafe { self.0.as_ref() }.try_borrow_mut()
         }
     }
 

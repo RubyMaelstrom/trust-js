@@ -1194,7 +1194,8 @@ mod tests {
         engine.eval("function unobserved(){}", false).unwrap();
         let env = engine.interp.global_env.clone();
         let function = engine.interp.get_var("unobserved", &env).ok().unwrap();
-        let object = function.as_obj().unwrap().borrow();
+        let function_handle = function.as_obj().unwrap();
+        let object = function_handle.borrow();
         let prototype = object.props.get("prototype").unwrap();
         assert_eq!(prototype.packed.tag(), PACK_LAZY_PROTO);
         let packed_before = prototype.packed.bits();

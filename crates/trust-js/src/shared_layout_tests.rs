@@ -3,6 +3,7 @@
 //! OrdinarySetWithOwnDescriptor 13449; OrdinaryDelete 13501; OrdinaryOwnPropertyKeys 13531.
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::value::{Callable, Gc, Property, Props, Value};
 use crate::{Completion, Engine};
 use std::rc::Rc;
@@ -16,11 +17,11 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
     let env = engine.interp.global_env.clone();
-    let Value::Obj(object) = engine
+    let ValueView::Obj(object) = (engine
         .interp
         .get_var(name, &env)
-        .unwrap_or_else(|_| panic!("missing {name}"))
-    else {
+        .unwrap_or_else(|_| panic!("missing {name}")))
+    .view() else {
         panic!("{name} is not an object")
     };
     object
@@ -87,7 +88,10 @@ fn templates_share_keys_but_not_values_or_descriptors() {
     );
     a.get_mut("x").unwrap().set_writable(false);
     assert!(b.get("x").unwrap().writable());
-    assert!(matches!(b.get("x").unwrap().value(), Value::Num(3.0)));
+    assert!(matches!(
+        (b.get("x").unwrap().value()).view(),
+        ValueView::Num(3.0)
+    ));
     a.remove("x");
     a.insert("z", Property::plain(Value::Num(5.0)));
     assert_eq!(

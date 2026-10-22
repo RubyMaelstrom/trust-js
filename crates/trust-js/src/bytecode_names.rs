@@ -521,6 +521,7 @@ mod tests {
     use crate::bytecode::Op;
     use crate::interpreter::{new_binding_layout_id, new_scope};
     use crate::value::Callable;
+    use crate::value::ValueView;
     use crate::Engine;
 
     fn reader() -> (Engine, Rc<Chunk>, u32, u32) {
@@ -536,7 +537,8 @@ mod tests {
             .get("readDeep")
             .unwrap()
             .value();
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let Callable::User(user) = &object.call else {
             panic!("function")
         };
@@ -575,8 +577,9 @@ mod tests {
             let middle = scope(Some(holder.clone()), "middle", 0.0, layouts[1]);
             let first = scope(Some(middle), "local", 0.0, layouts[2]);
             assert!(matches!(
-                chunk.load_name_ic(&mut engine.interp, &first, name, cache),
-                Ok(Value::Num(11.0))
+                (chunk.load_name_ic(&mut engine.interp, &first, name, cache))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(11.0))
             ));
             assert_eq!(chunk.name_caches[cache as usize].get().env, DEEP_NAME_IC);
             // Every scope is fresh, including the holder. Matching layout never reuses old values.
@@ -584,19 +587,19 @@ mod tests {
             let middle2 = scope(Some(holder2.clone()), "middle", 0.0, layouts[1]);
             let second = scope(Some(middle2.clone()), "local", 0.0, layouts[2]);
             assert!(matches!(
-                chunk.name_ic_hit(&engine.interp, &second, cache),
-                Some(Value::Num(29.0))
+                (chunk.name_ic_hit(&engine.interp, &second, cache)).map(|__value| (__value).view()),
+                Some(ValueView::Num(29.0))
             ));
             assert!(chunk
                 .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(37.0))
                 .is_ok());
             assert!(matches!(
-                holder2.borrow().vars.get("outer").unwrap().value,
-                Value::Num(37.0)
+                (holder2.borrow().vars.get("outer").unwrap().value).view(),
+                ValueView::Num(37.0)
             ));
             assert!(matches!(
-                holder.borrow().vars.get("outer").unwrap().value,
-                Value::Num(11.0)
+                (holder.borrow().vars.get("outer").unwrap().value).view(),
+                ValueView::Num(11.0)
             ));
             holder2
                 .borrow_mut()
@@ -627,8 +630,9 @@ mod tests {
                 .insert("outer", Binding::data(Value::Num(43.0), true, true));
             assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
             assert!(matches!(
-                chunk.load_name_ic(&mut engine.interp, &second, name, cache),
-                Ok(Value::Num(43.0))
+                (chunk.load_name_ic(&mut engine.interp, &second, name, cache))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(43.0))
             ));
             Env::downgrade(&first)
         });
@@ -681,8 +685,9 @@ mod tests {
             .vars
             .set_generation_for_test(u32::MAX - 1);
         assert!(matches!(
-            chunk.load_name_ic(&mut engine.interp, &holder, name, cache),
-            Ok(Value::Num(5.0))
+            (chunk.load_name_ic(&mut engine.interp, &holder, name, cache))
+                .map(|__value| (__value).view()),
+            Ok(crate::value::ValueView::Num(5.0))
         ));
         assert_eq!(chunk.name_caches[cache as usize].get().gen, u32::MAX - 1);
         holder.borrow_mut().vars.remove("outer");
@@ -696,15 +701,16 @@ mod tests {
             .name_ic_fill(&engine.interp, &holder, name, cache)
             .is_none());
         assert!(matches!(
-            chunk.load_name_ic(&mut engine.interp, &holder, name, cache),
-            Ok(Value::Num(17.0))
+            (chunk.load_name_ic(&mut engine.interp, &holder, name, cache))
+                .map(|__value| (__value).view()),
+            Ok(crate::value::ValueView::Num(17.0))
         ));
         assert!(chunk
             .store_name_ic(&mut engine.interp, &holder, name, cache, Value::Num(19.0))
             .is_ok());
         assert!(matches!(
-            holder.borrow().vars.get("outer").unwrap().value,
-            Value::Num(19.0)
+            (holder.borrow().vars.get("outer").unwrap().value).view(),
+            ValueView::Num(19.0)
         ));
         let middle = scope(Some(holder), "middle", 0.0, 0);
         let child = scope(Some(middle), "local", 0.0, 0);
@@ -715,8 +721,8 @@ mod tests {
         let local = scope(None, "outer", 23.0, 0);
         local.borrow_mut().vars.set_generation_for_test(u32::MAX);
         assert!(matches!(
-            chunk.load_cap_ic(&mut engine.interp, &local, name),
-            Ok(Value::Num(23.0))
+            (chunk.load_cap_ic(&mut engine.interp, &local, name)).map(|__value| (__value).view()),
+            Ok(crate::value::ValueView::Num(23.0))
         ));
         assert_eq!(chunk.cap_caches[name as usize].get().env, 0);
     }
@@ -749,8 +755,9 @@ mod tests {
                 .ok()
                 .unwrap();
             assert!(matches!(
-                engine.interp.read_prepared_reference(&mut reference),
-                Ok(Value::Num(31.0))
+                (engine.interp.read_prepared_reference(&mut reference))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(31.0))
             ));
             fresh.borrow_mut().vars.get_mut("outer").unwrap().mutable = false;
             fresh
@@ -780,13 +787,14 @@ mod tests {
         let middle = new_scope(Some(engine.interp.global_env.clone()));
         let child = new_scope(Some(middle));
         assert!(matches!(
-            chunk.load_name_ic(&mut engine.interp, &child, name, cache),
-            Ok(Value::Num(7.0))
+            (chunk.load_name_ic(&mut engine.interp, &child, name, cache))
+                .map(|__value| (__value).view()),
+            Ok(crate::value::ValueView::Num(7.0))
         ));
         engine.eval("outer = 13;", false).unwrap();
         assert!(matches!(
-            chunk.name_ic_hit(&engine.interp, &child, cache),
-            Some(Value::Num(13.0))
+            (chunk.name_ic_hit(&engine.interp, &child, cache)).map(|__value| (__value).view()),
+            Some(ValueView::Num(13.0))
         ));
         // Accessor conversion may preserve key layout, but must execute its getter.
         engine
@@ -797,8 +805,9 @@ mod tests {
             .unwrap();
         assert!(chunk.name_ic_hit(&engine.interp, &child, cache).is_none());
         assert!(matches!(
-            chunk.load_name_ic(&mut engine.interp, &child, name, cache),
-            Ok(Value::Num(19.0))
+            (chunk.load_name_ic(&mut engine.interp, &child, name, cache))
+                .map(|__value| (__value).view()),
+            Ok(crate::value::ValueView::Num(19.0))
         ));
     }
 

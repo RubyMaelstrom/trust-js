@@ -4,6 +4,7 @@
 use crate::ast::*;
 use crate::interpreter::*;
 use crate::stack_trace::NO_POSITION;
+use crate::value::ValueView;
 use crate::value::*;
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -268,7 +269,7 @@ impl Interp {
                                         }
                                     }
                                 };
-                                if matches!(v, Value::Undefined) {
+                                if matches!((v).view(), ValueView::Undefined) {
                                     if let Some(d) = default {
                                         v = me.eval(d, env)?;
                                         if let (Pattern::Ident(n), true) =
@@ -316,7 +317,7 @@ impl Interp {
                 }
             }
             Pattern::Object(objpat) => {
-                if matches!(value, Value::Undefined | Value::Null) {
+                if matches!((value).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(self.throw("TypeError", "cannot destructure null or undefined"));
                 }
                 let mut used: Vec<String> = Vec::new();
@@ -327,7 +328,7 @@ impl Interp {
                     // ResolveBinding *before* GetV (observable through a `with` env's has trap).
                     let reference = self.prepare_binding_reference(&prop.value, env, mode)?;
                     let mut v = self.get_member_key(&value, &key)?;
-                    if matches!(v, Value::Undefined) {
+                    if matches!((v).view(), ValueView::Undefined) {
                         if let Some(d) = &prop.default {
                             v = self.eval(d, env)?;
                             if let (Pattern::Ident(n), true) = (&prop.value, is_anonymous_fn(d)) {
@@ -392,7 +393,7 @@ impl Interp {
         for stmt in body {
             match self.exec_stmt(stmt, env) {
                 Ok(v) => {
-                    if !matches!(v, Value::Empty) {
+                    if !matches!((v).view(), ValueView::Empty) {
                         last = v;
                     }
                 }
@@ -423,7 +424,7 @@ impl Interp {
             for s in stmts {
                 match self.exec_stmt(s, parent) {
                     Ok(sv) => {
-                        if !matches!(sv, Value::Empty) {
+                        if !matches!((sv).view(), ValueView::Empty) {
                             v = sv;
                         }
                     }
@@ -446,7 +447,7 @@ impl Interp {
         for s in stmts {
             match self.exec_stmt(s, &scope) {
                 Ok(sv) => {
-                    if !matches!(sv, Value::Empty) {
+                    if !matches!((sv).view(), ValueView::Empty) {
                         v = sv;
                     }
                     result = Ok(v.clone());
@@ -485,7 +486,7 @@ impl Interp {
         value: &Value,
         is_async: bool,
     ) -> Result<Option<Disposable>, Abrupt> {
-        if matches!(value, Value::Undefined | Value::Null) {
+        if matches!(&(value).view(), ValueView::Undefined | ValueView::Null) {
             // An evaluated `await using x = null` still records a pending Await for the
             // block's end (an empty async disposal awaits once).
             if is_async {
@@ -518,7 +519,7 @@ impl Interp {
                 from_async = m.is_callable();
             }
         }
-        if matches!(m, Value::Undefined | Value::Null) {
+        if matches!((m).view(), ValueView::Undefined | ValueView::Null) {
             if let Some(k) = crate::builtins::well_known_key(self, "dispose") {
                 m = self.get_member_key(value, &k)?;
             }
@@ -769,7 +770,7 @@ impl Interp {
         let take_right = match op {
             "&&" => self.to_boolean(&left),
             "||" => !self.to_boolean(&left),
-            "??" => matches!(left, Value::Undefined | Value::Null),
+            "??" => matches!((left).view(), ValueView::Undefined | ValueView::Null),
             _ => unreachable!(),
         };
         if take_right {
@@ -1020,7 +1021,7 @@ impl Interp {
             Stmt::Labeled { label, body } => self.exec_labeled(label, body, env),
             Stmt::With { obj, body } => {
                 let value = self.eval(obj, env)?;
-                if matches!(value, Value::Undefined | Value::Null) {
+                if matches!((value).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(
                         self.throw("TypeError", "Cannot convert undefined or null to object")
                     );
@@ -1212,7 +1213,7 @@ impl Interp {
         // V starts at undefined per ForBodyEvaluation, so a value-less loop completes undefined.
         let mut v = Value::Undefined;
         let keep = |bv: Value, v: &mut Value| {
-            if !matches!(bv, Value::Empty) {
+            if !matches!((bv).view(), ValueView::Empty) {
                 *v = bv;
             }
         };
@@ -1503,12 +1504,14 @@ impl Interp {
                 None => Value::Undefined,
             };
             // GetMethod: a non-callable, non-nullish @@asyncIterator is a TypeError.
-            if !matches!(method, Value::Undefined | Value::Null) && !method.is_callable() {
+            if !matches!((method).view(), ValueView::Undefined | ValueView::Null)
+                && !method.is_callable()
+            {
                 return Err(self.throw("TypeError", "@@asyncIterator is not callable"));
             }
             let (iter, from_sync) = if method.is_callable() {
                 let it = self.call(method, rhs.clone(), &[])?;
-                if !matches!(it, Value::Obj(_)) {
+                if !matches!((it).view(), ValueView::Obj(_)) {
                     return Err(self.throw("TypeError", "@@asyncIterator did not return an object"));
                 }
                 (it, false)
@@ -1525,7 +1528,7 @@ impl Interp {
                 let res = me.call(next.clone(), iter.clone(), &[])?;
                 // Await the step result by parking the coroutine (real microtask ticks).
                 let res = if from_sync { res } else { me.coro_await(res)? };
-                if !matches!(res, Value::Obj(_)) {
+                if !matches!((res).view(), ValueView::Obj(_)) {
                     return Err(me.throw("TypeError", "iterator result is not an object"));
                 }
                 let done = me.get_member_key(&res, "done")?;
@@ -1654,18 +1657,18 @@ impl Interp {
                     return Ok(LoopStep::Done(Value::Empty));
                 };
                 idx += 1;
-                if let Value::Str(k) = &v {
+                if let ValueView::Str(k) = &(v).view() {
                     // (A string-primitive RHS's index keys are always present.)
-                    if matches!(rhs, Value::Obj(_)) && !me.js_has_property(&rhs, k)? {
+                    if matches!((rhs).view(), ValueView::Obj(_)) && !me.js_has_property(&rhs, k)? {
                         continue;
                     }
                 }
                 // Keep ordinary candidate strings and decode only escaped leading-NUL keys.
-                break match v {
-                    Value::Str(key) if key.as_str().starts_with("\0\0") => {
+                break match v.view() {
+                    ValueView::Str(key) if key.as_str().starts_with("\0\0") => {
                         crate::value::string_key_value(key)
                     }
-                    other => other,
+                    _ => v,
                 };
             };
             let iter_env = new_scope(Some(env.clone()));
@@ -1730,7 +1733,7 @@ impl Interp {
                     // absent method is a protocol violation — close the inner iterator (close
                     // errors propagate) and then throw TypeError.
                     let throw = self.get_member_key(&iterator, "throw")?;
-                    if matches!(throw, Value::Undefined | Value::Null) {
+                    if matches!((throw).view(), ValueView::Undefined | ValueView::Null) {
                         self.iterator_close_normal(&iterator)?;
                         return Err(
                             self.throw("TypeError", "the delegated iterator has no 'throw' method")
@@ -1743,7 +1746,7 @@ impl Interp {
                 }
                 Resume::Return(v) => {
                     let ret = self.get_member_key(&iterator, "return")?;
-                    if matches!(ret, Value::Undefined | Value::Null) {
+                    if matches!((ret).view(), ValueView::Undefined | ValueView::Null) {
                         return Err(Abrupt::Return(v));
                     }
                     if !ret.is_callable() {
@@ -1755,7 +1758,7 @@ impl Interp {
                     return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled));
                 }
             };
-            if !matches!(result, Value::Obj(_)) {
+            if !matches!((result).view(), ValueView::Obj(_)) {
                 return Err(self.throw("TypeError", "iterator result is not an object"));
             }
             let done = self.get_member_key(&result, "done")?;
@@ -1778,7 +1781,7 @@ impl Interp {
     /// argument, and (per the async-from-sync wrapper) validate/unwrap its result.
     fn async_for_await_close(&mut self, iter: &Value, from_sync: bool) -> Result<(), Abrupt> {
         let ret = self.get_member_key(iter, "return")?;
-        if matches!(ret, Value::Undefined | Value::Null) {
+        if matches!((ret).view(), ValueView::Undefined | ValueView::Null) {
             return Ok(());
         }
         if !ret.is_callable() {
@@ -1786,7 +1789,7 @@ impl Interp {
         }
         let r = self.call(ret, iter.clone(), &[])?;
         let r = if from_sync { r } else { self.await_value(r)? };
-        if !matches!(r, Value::Obj(_)) {
+        if !matches!((r).view(), ValueView::Obj(_)) {
             return Err(self.throw("TypeError", "iterator result is not an object"));
         }
         if from_sync {
@@ -1843,12 +1846,14 @@ impl Interp {
             None => Value::Undefined,
         };
         // GetMethod: a non-callable, non-nullish @@asyncIterator is a TypeError (no sync fallback).
-        if !matches!(amethod, Value::Undefined | Value::Null) && !amethod.is_callable() {
+        if !matches!((amethod).view(), ValueView::Undefined | ValueView::Null)
+            && !amethod.is_callable()
+        {
             return Err(self.throw("TypeError", "@@asyncIterator is not callable"));
         }
         let (iterator, next, from_sync) = if amethod.is_callable() {
             let it = self.call(amethod, value.clone(), &[])?;
-            if !matches!(it, Value::Obj(_)) {
+            if !matches!((it).view(), ValueView::Obj(_)) {
                 return Err(self.throw("TypeError", "@@asyncIterator did not return an object"));
             }
             let n = self.get_member_key(&it, "next")?;
@@ -1862,7 +1867,7 @@ impl Interp {
         macro_rules! settle {
             ($result:expr) => {{
                 let r = self.coro_await($result)?;
-                if !matches!(r, Value::Obj(_)) {
+                if !matches!(r.view(), ValueView::Obj(_)) {
                     return Err(self.throw("TypeError", "iterator result is not an object"));
                 }
                 let done = self.get_member_key(&r, "done")?;
@@ -1957,7 +1962,7 @@ impl Interp {
             }
             let iter = self.call(itfn, v.clone(), &[])?;
             // GetIteratorFromMethod: the iterator must be an object.
-            if !matches!(iter, Value::Obj(_)) {
+            if !matches!((iter).view(), ValueView::Obj(_)) {
                 return Err(self.throw("TypeError", "@@iterator returned a non-object"));
             }
             // GetIterator only *reads* `next`; it is validated as callable when actually called
@@ -1989,7 +1994,7 @@ impl Interp {
     /// IteratorComplete followed by IteratorValue only for a non-exhausted result.
     /// Custom iterator getters remain observable in precisely this order.
     pub(crate) fn iterator_result_value(&mut self, result: Value) -> Result<Option<Value>, Abrupt> {
-        if !matches!(result, Value::Obj(_)) {
+        if !matches!((result).view(), ValueView::Obj(_)) {
             return Err(self.throw("TypeError", "iterator result is not an object"));
         }
         let done = self.get_member_key(&result, "done")?;
@@ -2022,12 +2027,12 @@ impl Interp {
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<(), Abrupt> = (|| {
             let ret = self.get_member_key(iter, "return")?;
-            if !matches!(ret, Value::Undefined | Value::Null) {
+            if !matches!((ret).view(), ValueView::Undefined | ValueView::Null) {
                 if !ret.is_callable() {
                     return Err(self.throw("TypeError", "iterator 'return' is not callable"));
                 }
                 let r = self.call(ret, iter.clone(), &[])?;
-                if !matches!(r, Value::Obj(_)) {
+                if !matches!((r).view(), ValueView::Obj(_)) {
                     return Err(self.throw("TypeError", "iterator 'return' must return an object"));
                 }
             }
@@ -2043,8 +2048,8 @@ impl Interp {
     /// The values `v` yields. Rooted while author code runs (I1), and returned rooted: callers
     /// usually run more author code before consuming them.
     pub(crate) fn iterate(&mut self, v: &Value) -> Result<crate::rooting::RootedVec, Abrupt> {
-        match v {
-            Value::Str(s) if crate::builtins::intrinsic_string_iterator_is_unmodified(self) => {
+        match &(v).view() {
+            ValueView::Str(s) if crate::builtins::intrinsic_string_iterator_is_unmodified(self) => {
                 let perf_started = crate::jit::perf_stage_start();
                 // String.prototype[@@iterator] returns one String value per code point
                 // (ECMA-262 §22.1.3.36).  ASCII code points are also one UTF-16 code unit, so
@@ -2072,7 +2077,7 @@ impl Interp {
                 crate::jit::perf_iterate_fast_end(perf_started);
                 return result;
             }
-            Value::Obj(o) if crate::builtins::array_iterator_fast_path_is_safe(self, v) => {
+            ValueView::Obj(o) if crate::builtins::array_iterator_fast_path_is_safe(self, v) => {
                 let perf_started = crate::jit::perf_stage_start();
                 let result: Result<crate::rooting::RootedVec, Abrupt> = (|| {
                     // %ArrayIteratorPrototype%.next performs LengthOfArrayLike followed by
@@ -2119,7 +2124,7 @@ impl Interp {
             let iter = self.call(itfn, v.clone(), &[])?;
             // GetIteratorFromMethod rejects a primitive result before creating an Iterator Record;
             // there is therefore nothing to close in this case.
-            if !matches!(iter, Value::Obj(_)) {
+            if !matches!((iter).view(), ValueView::Obj(_)) {
                 return Err(self.throw("TypeError", "@@iterator returned a non-object"));
             }
             let next = self.get_member_key(&iter, "next")?;
@@ -2182,7 +2187,7 @@ impl Interp {
         let keys = self.enum_keys(v)?;
         // A module namespace's [[GetOwnProperty]] runs during enumeration, so an uninitialized
         // export makes the loop throw before any iteration.
-        if let Value::Obj(object) = v {
+        if let ValueView::Obj(object) = &(v).view() {
             let ptr = crate::value::Gc::as_ptr(object) as usize;
             if self.is_namespace(ptr) {
                 for key in &keys {
@@ -2209,7 +2214,7 @@ impl Interp {
         value: &Value,
         mut pins: Option<&mut EnumerationLayouts>,
     ) -> Option<EnumerationShape> {
-        let mut current = Gc::as_ptr(value.as_obj()?);
+        let mut current = Gc::as_ptr(&value.as_obj()?);
         let mut shape = EnumerationShape {
             levels: [(0, 0, 0); 6],
             depth: 0,
@@ -2245,14 +2250,14 @@ impl Interp {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         // A string primitive enumerates its index keys (ToObject makes them own properties).
-        if let Value::Str(sv) = v {
+        if let ValueView::Str(sv) = &(v).view() {
             for k in 0..crate::jstr::unit_len(sv) {
                 out.push(k.to_string());
             }
             return Ok(out);
         }
-        let mut cur = match v {
-            Value::Obj(o) => Some(o.clone()),
+        let mut cur = match &(v).view() {
+            ValueView::Obj(o) => Some(o.clone()),
             _ => None,
         };
         while let Some(o) = cur {
@@ -2263,7 +2268,7 @@ impl Interp {
                 let keys =
                     crate::builtins::proxy_enum_string_keys(self, &ov).map_err(Abrupt::Throw)?;
                 for k in keys {
-                    if let Value::Str(ks) = k {
+                    if let ValueView::Str(ks) = (k).view() {
                         let key = crate::value::encode_owned_string_key(ks.to_string());
                         if seen.insert(key.clone()) {
                             out.push(key);
@@ -2272,8 +2277,8 @@ impl Interp {
                 }
                 let parent =
                     crate::builtins::js_get_prototype_of(self, &ov).map_err(Abrupt::Throw)?;
-                cur = match parent {
-                    Value::Obj(p) => Some(p),
+                cur = match (parent).view() {
+                    ValueView::Obj(p) => Some(p),
                     _ => None,
                 };
                 continue;
@@ -2296,10 +2301,11 @@ impl Interp {
                         }
                     }
                 }
-                cur = match crate::builtins::js_get_prototype_of(self, &Value::Obj(o.clone()))
-                    .map_err(Abrupt::Throw)?
+                cur = match (crate::builtins::js_get_prototype_of(self, &Value::Obj(o.clone()))
+                    .map_err(Abrupt::Throw)?)
+                .view()
                 {
-                    Value::Obj(parent) => Some(parent),
+                    ValueView::Obj(parent) => Some(parent),
                     _ => None,
                 };
                 continue;
@@ -2377,7 +2383,7 @@ impl Interp {
                     for s in body {
                         match self.exec_stmt(s, &body_env) {
                             Ok(sv) => {
-                                if !matches!(sv, Value::Empty) {
+                                if !matches!((sv).view(), ValueView::Empty) {
                                     v = sv;
                                 }
                                 last = Ok(v.clone());
@@ -2458,12 +2464,12 @@ impl Interp {
             for s in &case.body {
                 match self.exec_stmt(s, &scope) {
                     Ok(sv) => {
-                        if !matches!(sv, Value::Empty) {
+                        if !matches!((sv).view(), ValueView::Empty) {
                             v = sv;
                         }
                     }
                     Err(Abrupt::Break(None, bv)) => {
-                        if !matches!(bv, Value::Empty) {
+                        if !matches!((bv).view(), ValueView::Empty) {
                             v = bv;
                         }
                         return Ok(crate::interpreter::update_empty(v));
@@ -2502,7 +2508,7 @@ impl Interp {
         }
         if let Some(k) = crate::builtins::well_known_key(self, "unscopables") {
             let uns = self.get_member_key(obj, &k)?;
-            if matches!(uns, Value::Obj(_)) {
+            if matches!((uns).view(), ValueView::Obj(_)) {
                 let blocked = self.get_member_key(&uns, name)?;
                 if self.to_boolean(&blocked) {
                     return Ok(false);
@@ -2570,7 +2576,7 @@ impl Interp {
             }
             // `with (obj)`: resolve against the object's properties if it has the name (the proxy
             // `has` trap and @@unscopables participate here). Rare — fall to the owned path.
-            if let Some(obj @ Value::Obj(_)) = &b.with_obj {
+            if let Some(obj) = b.with_obj.as_ref().filter(|value| value.as_obj().is_some()) {
                 let obj = obj.clone();
                 drop(b);
                 if self.with_has_binding(&obj, name)? {
@@ -2671,7 +2677,7 @@ impl Interp {
         while let Some(s) = cur {
             let b = s.borrow();
             if let Some(binding) = b.vars.get(name) {
-                if let Value::Str(k) = &binding.value {
+                if let ValueView::Str(k) = &(binding.value).view() {
                     return k.clone();
                 }
             }
@@ -2685,7 +2691,7 @@ impl Interp {
         while let Some(s) = cur {
             let b = s.borrow();
             if let Some(binding) = b.vars.get(name) {
-                if let Value::Str(k) = &binding.value {
+                if let ValueView::Str(k) = &(binding.value).view() {
                     return k.to_string();
                 }
             }
@@ -2698,17 +2704,17 @@ impl Interp {
     /// attribute. Non-object options/attributes and non-string attribute values are TypeErrors
     /// (which the caller turns into a rejected promise).
     fn import_attributes(&mut self, o: &Value) -> Result<Option<String>, Abrupt> {
-        if matches!(o, Value::Undefined) {
+        if matches!(&(o).view(), ValueView::Undefined) {
             return Ok(None);
         }
-        if !matches!(o, Value::Obj(_)) {
+        if !matches!(&(o).view(), ValueView::Obj(_)) {
             return Err(self.throw("TypeError", "import options must be an object"));
         }
         let with = self.get_member_key(o, "with")?;
-        if matches!(with, Value::Undefined) {
+        if matches!((with).view(), ValueView::Undefined) {
             return Ok(None);
         }
-        if !matches!(with, Value::Obj(_)) {
+        if !matches!((with).view(), ValueView::Obj(_)) {
             return Err(self.throw("TypeError", "import attributes must be an object"));
         }
         // EnumerableOwnProperties(with, key+value): own string keys in order (through a proxy's
@@ -2724,7 +2730,7 @@ impl Interp {
                 }
                 let desc =
                     crate::builtins::proxy_gopd_value(self, &t, &h, &pk).map_err(Abrupt::Throw)?;
-                if matches!(desc, Value::Undefined) {
+                if matches!((desc).view(), ValueView::Undefined) {
                     continue;
                 }
                 let e = self.get_member_key(&desc, "enumerable")?;
@@ -2732,7 +2738,7 @@ impl Interp {
                     continue;
                 }
                 let v = self.get_member_key(&with, &pk)?;
-                let Value::Str(sv) = v else {
+                let ValueView::Str(sv) = (v).view() else {
                     return Err(self.throw("TypeError", "import attribute values must be strings"));
                 };
                 if pk == "type" {
@@ -2761,7 +2767,7 @@ impl Interp {
                 continue;
             }
             let v = self.get_member_key(&with, &k)?;
-            let Value::Str(sv) = v else {
+            let ValueView::Str(sv) = (v).view() else {
                 return Err(self.throw("TypeError", "import attribute values must be strings"));
             };
             if &*k == "type" {
@@ -2834,8 +2840,8 @@ impl Interp {
     /// PrivateGet: read a private field/method after a brand check. An object that was not
     /// constructed with this private name in scope (`#x` absent) is a TypeError, not `undefined`.
     pub(crate) fn get_private_member(&mut self, base: &Value, name: &str) -> Completion {
-        let prop = match base {
-            Value::Obj(o) => o.borrow().internal_slots().get(name).cloned(),
+        let prop = match &(base).view() {
+            ValueView::Obj(o) => o.borrow().internal_slots().get(name).cloned(),
             _ => None,
         };
         match prop {
@@ -2870,8 +2876,8 @@ impl Interp {
         value: Value,
     ) -> Result<(), Abrupt> {
         let shown = private_display(name).to_string();
-        let (o, prop) = match base {
-            Value::Obj(o) => (o.clone(), o.borrow().internal_slots().get(name).cloned()),
+        let (o, prop) = match &(base).view() {
+            ValueView::Obj(o) => (o.clone(), o.borrow().internal_slots().get(name).cloned()),
             _ => {
                 return Err(self.throw(
                     "TypeError",
@@ -2913,7 +2919,9 @@ impl Interp {
     /// object is in scope (object-literal & class methods bound via `%homeobject%`), else the
     /// statically-resolved `%superproto%` carried by older class-method environments.
     fn super_base(&mut self, env: &Env) -> Result<Value, Abrupt> {
-        if let Some(Value::Obj(home)) = self.peek_binding("%homeobject%", env) {
+        if let Some(ValueView::Obj(home)) =
+            (self.peek_binding("%homeobject%", env)).map(|__value| (__value).view())
+        {
             return Ok(match home.borrow().proto.clone() {
                 Some(p) => Value::Obj(p),
                 None => Value::Null,
@@ -2958,7 +2966,7 @@ impl Interp {
                 }
                 (b.with_obj.clone(), b.parent.clone())
             };
-            if let Some(obj @ Value::Obj(_)) = &with_obj {
+            if let Some(obj) = with_obj.as_ref().filter(|value| value.as_obj().is_some()) {
                 if self.with_has_binding(obj, name)? {
                     // SetMutableBinding re-checks HasProperty; strict code throws if the
                     // property vanished while @@unscopables ran.
@@ -3014,10 +3022,10 @@ impl Interp {
     /// an ordinary object's own element storage is answered without building its string key;
     /// any other case runs the general algorithm.
     pub(crate) fn in_operator(&mut self, key: &Value, object: &Value) -> Result<bool, Abrupt> {
-        let Value::Obj(target) = object else {
+        let ValueView::Obj(target) = &(object).view() else {
             return Err(self.throw("TypeError", "'in' requires an object on the right"));
         };
-        if let Value::Num(n) = *key {
+        if let ValueView::Num(n) = (*key).view() {
             if n >= 0.0
                 && n < u32::MAX as f64
                 && n.fract() == 0.0
@@ -3033,7 +3041,7 @@ impl Interp {
                 }
             }
         }
-        if let Value::Str(name) = key {
+        if let ValueView::Str(name) = &(key).view() {
             if let Some(present) =
                 Self::ordinary_chain_has_property(target, &crate::value::encode_string_key(name))
             {
@@ -3140,15 +3148,15 @@ impl Interp {
     /// trap, or forwarding to the target's own `[[HasProperty]]`), TypedArray index slots, then the
     /// ordinary own-property + prototype walk.
     pub(crate) fn js_has_property(&mut self, obj: &Value, key: &str) -> Result<bool, Abrupt> {
-        let o = match obj {
-            Value::Obj(o) => o.clone(),
+        let o = match &(obj).view() {
+            ValueView::Obj(o) => o.clone(),
             _ => return Ok(false),
         };
         // A deferred namespace evaluates on [[HasProperty]] with a string key.
         self.defer_trigger(&o, Some(key))?;
         let ptr = Gc::as_ptr(&o) as usize;
         if let Some((target, handler)) = self.proxy_at(ptr) {
-            if matches!(handler, Value::Null) {
+            if matches!((handler).view(), ValueView::Null) {
                 return Err(self.throw("TypeError", "cannot perform 'has' on a revoked proxy"));
             }
             let Some(trap) =
@@ -3170,7 +3178,7 @@ impl Interp {
             if !present {
                 // ECMA-262 §10.5.7 step 9: target.[[GetOwnProperty]](P), then IsExtensible(target)
                 // only for a configurable target property; both may run a Proxy target's traps.
-                if let Value::Obj(t) = &target {
+                if let ValueView::Obj(t) = &(target).view() {
                     let target_desc = crate::builtins::object_get_own_property(self, t, key)
                         .map_err(Abrupt::Throw)?;
                     if let Some(target_desc) = target_desc {
@@ -3481,7 +3489,7 @@ impl Interp {
         if self.short_circuit {
             return Ok(Value::Undefined); // an earlier `?.` link short-circuited
         }
-        if optional && matches!(base, Value::Undefined | Value::Null) {
+        if optional && matches!((base).view(), ValueView::Undefined | ValueView::Null) {
             self.short_circuit = true;
             return Ok(Value::Undefined);
         }
@@ -3537,7 +3545,7 @@ impl Interp {
             link,
             Expr::Member { optional: true, .. } | Expr::Index { optional: true, .. }
         );
-        if optional && matches!(base, Value::Undefined | Value::Null) {
+        if optional && matches!((base).view(), ValueView::Undefined | ValueView::Null) {
             self.short_circuit = true;
             return Ok(Value::Undefined);
         }
@@ -3550,13 +3558,13 @@ impl Interp {
             Expr::Index { index, .. } => {
                 let idx = self.eval(index, env)?;
                 // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
-                if matches!(base, Value::Undefined | Value::Null) {
+                if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                     trace_nullish_property("eval-index", &idx);
                     return Err(
                         self.throw("TypeError", "cannot read property of null or undefined")
                     );
                 }
-                if let (Value::Obj(o), Value::Num(n)) = (&base, &idx) {
+                if let (ValueView::Obj(o), ValueView::Num(n)) = (&(base).view(), &(idx).view()) {
                     if let Some(v) = self.fast_get_elem(o, *n) {
                         return Ok(v);
                     }
@@ -3646,7 +3654,7 @@ impl Interp {
         // a getter on the super prototype sees the current `this`.
         let this = self.get_var("this", env)?;
         let home = self.super_base(env)?;
-        if matches!(home, Value::Undefined | Value::Null) {
+        if matches!((home).view(), ValueView::Undefined | ValueView::Null) {
             return Err(self.throw(
                 "TypeError",
                 format!("cannot read property '{prop}' of a null super base"),
@@ -3675,7 +3683,7 @@ impl Interp {
         if self.short_circuit {
             return Ok(Value::Undefined);
         }
-        if optional && matches!(base, Value::Undefined | Value::Null) {
+        if optional && matches!((base).view(), ValueView::Undefined | ValueView::Null) {
             self.short_circuit = true;
             return Ok(Value::Undefined);
         }
@@ -3683,12 +3691,12 @@ impl Interp {
             .eval(index, env)
             .map_err(|error| self.placed_error(error, position))?;
         // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
-        if matches!(base, Value::Undefined | Value::Null) {
+        if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
             trace_nullish_property("eval-index", &idx);
             let error = self.throw("TypeError", "cannot read property of null or undefined");
             return Err(self.placed_error(error, position));
         }
-        if let (Value::Obj(o), Value::Num(n)) = (&base, &idx) {
+        if let (ValueView::Obj(o), ValueView::Num(n)) = (&(base).view(), &(idx).view()) {
             if let Some(v) = self.fast_get_elem(o, *n) {
                 return Ok(v);
             }
@@ -3707,7 +3715,7 @@ impl Interp {
         let idx = self.eval(index, env)?;
         let home = self.super_base(env)?;
         let key = self.to_property_key(&idx)?;
-        if matches!(home, Value::Undefined | Value::Null) {
+        if matches!((home).view(), ValueView::Undefined | ValueView::Null) {
             return Err(self.throw(
                 "TypeError",
                 format!(
@@ -3856,9 +3864,9 @@ impl Interp {
         site: Option<&crate::bytecode::PrivateSite>,
     ) -> Result<Value, Abrupt> {
         let key = self.private_key_vm(name, env, site);
-        match value {
+        match (value).view() {
             // Private fields, methods and accessors are own internal state, never inherited.
-            Value::Obj(object) => {
+            ValueView::Obj(object) => {
                 let object = object.borrow();
                 Ok(Value::Bool(match site {
                     Some(site) => site.find(object.internal_slots(), &key).is_some(),
@@ -3879,7 +3887,7 @@ impl Interp {
         let key = self.private_key_vm(name, env, site);
         // PrivateGet on a private field or method is the element's value; an accessor (and a
         // missing element's TypeError) takes the general path, after this borrow ends.
-        if let (Some(site), Value::Obj(object)) = (site, value) {
+        if let (Some(site), ValueView::Obj(object)) = (site, &(value).view()) {
             let object = object.borrow();
             if let Some(property) = site
                 .find(object.internal_slots(), &key)
@@ -3904,7 +3912,7 @@ impl Interp {
         let key = self.private_key_vm(name, env, site);
         // PrivateSet on a private field writes it in place; a method (not writable), an accessor
         // and a missing element take the general path with its TypeErrors and setter call.
-        if let (Some(site), Value::Obj(object)) = (site, base) {
+        if let (Some(site), ValueView::Obj(object)) = (site, &(base).view()) {
             let mut object = object.borrow_mut();
             if let Some(slot) = site.find(object.internal_slots(), &key) {
                 if let Some((_, property)) = object.internal_slots_mut().entry_at_mut(slot) {
@@ -3928,7 +3936,7 @@ impl Interp {
         receiver: Value,
         key: Value,
     ) -> Result<Value, Abrupt> {
-        if matches!(base, Value::Null | Value::Undefined) {
+        if matches!(&(base).view(), ValueView::Null | ValueView::Undefined) {
             return Err(self.throw("TypeError", "cannot read property of null super base"));
         }
         let key = self.to_property_key(&key)?;
@@ -3942,7 +3950,7 @@ impl Interp {
         key: Value,
         value: Value,
     ) -> Result<(), Abrupt> {
-        if matches!(base, Value::Null | Value::Undefined) {
+        if matches!(&(base).view(), ValueView::Null | ValueView::Undefined) {
             return Err(self.throw("TypeError", "cannot set property on null super base"));
         }
         let key = self.to_property_key(&key)?;
@@ -3965,7 +3973,7 @@ impl Interp {
                 ArrayElem::Hole => self.append_array_literal(&arr, None)?,
                 ArrayElem::Spread(e) => {
                     let v = self.eval(e, env)?;
-                    let prefix = self.array_length(arr.as_obj().expect("array literal"));
+                    let prefix = self.array_length(&arr.as_obj().expect("array literal"));
                     self.expand_spread(&v, prefix, |i, value| {
                         i.append_array_literal(&arr, Some(value))
                     })?;
@@ -3979,8 +3987,8 @@ impl Interp {
     /// (or "" without a description); a string key is used as-is.
     pub(crate) fn fn_name_for_key(&self, key: &str) -> String {
         if Interp::is_sym_key(key) {
-            match self.sym_from_key(key) {
-                Some(Value::Sym(d)) => match &d.description {
+            match (self.sym_from_key(key)).map(|__value| (__value).view()) {
+                Some(ValueView::Sym(d)) => match &d.description {
                     Some(desc) => format!("[{desc}]"),
                     None => String::new(),
                 },
@@ -3997,12 +4005,12 @@ impl Interp {
         if !v.is_callable() {
             return;
         }
-        if let Value::Obj(o) = v {
+        if let ValueView::Obj(o) = &(v).view() {
             let empty = o
                 .borrow()
                 .props
                 .get("name")
-                .map(|p| matches!(p.value(), Value::Str(s) if s.is_empty()))
+                .map(|p| matches!((p.value()).view(), ValueView::Str(s) if s.is_empty()))
                 .unwrap_or(true);
             if empty {
                 o.borrow_mut().props.insert(
@@ -4081,9 +4089,9 @@ impl Interp {
                 // value type is ignored (no property is created).
                 PropDef::Proto(e) => {
                     let v = self.eval(e, env)?;
-                    match v {
-                        Value::Obj(p) => obj.borrow_mut().proto = Some(p),
-                        Value::Null => obj.borrow_mut().proto = None,
+                    match (v).view() {
+                        ValueView::Obj(p) => obj.borrow_mut().proto = Some(p),
+                        ValueView::Null => obj.borrow_mut().proto = None,
                         _ => {}
                     }
                 }
@@ -4149,7 +4157,7 @@ impl Interp {
 
     /// Freeze an object in place (non-extensible, all own props non-writable/non-configurable).
     pub(crate) fn freeze_object(&self, v: &Value) {
-        if let Value::Obj(o) = v {
+        if let ValueView::Obj(o) = &(v).view() {
             let mut b = o.borrow_mut();
             b.extensible = false;
             b.props.freeze_descriptors();
@@ -4213,7 +4221,7 @@ impl Interp {
                 let strings = self.make_array(cooked);
                 let raw_arr = self.make_array(raw);
                 self.freeze_object(&raw_arr);
-                if let Value::Obj(so) = &strings {
+                if let ValueView::Obj(so) = &(strings).view() {
                     // `raw` is a non-enumerable data property (then frozen with the rest).
                     so.borrow_mut().props.insert(
                         "raw",
@@ -4221,7 +4229,7 @@ impl Interp {
                     );
                 }
                 self.freeze_object(&strings);
-                if let Value::Obj(o) = &strings {
+                if let ValueView::Obj(o) = &(strings).view() {
                     self.gc_pin(o);
                 }
                 self.template_cache.insert(site, strings.clone());
@@ -4283,7 +4291,7 @@ impl Interp {
                 let take_right = match *op {
                     "&&" => self.to_boolean(&lv),
                     "||" => !self.to_boolean(&lv),
-                    "??" => matches!(lv, Value::Undefined | Value::Null),
+                    "??" => matches!((lv).view(), ValueView::Undefined | ValueView::Null),
                     _ => false,
                 };
                 if take_right {
@@ -4373,7 +4381,7 @@ impl Interp {
             if binding.vars.contains_key("this") {
                 return matches!(
                     binding.vars.get("%supercallok%"),
-                    Some(marker) if marker.initialized && matches!(&marker.value, Value::Bool(true))
+                    Some(marker) if marker.initialized && matches!(&(marker.value).view(), ValueView::Bool(true))
                 );
             }
             cursor = binding.parent.clone();
@@ -4461,8 +4469,8 @@ impl Interp {
         // an ordinary call, not a condition for recognizing this Realm's %eval%.
         let (func, receiver) = self.get_var_with("eval", env)?;
         let direct = matches!(
-            (&func, &self.eval_fn),
-            (Value::Obj(function), Some(intrinsic)) if Gc::ptr_eq(function, intrinsic)
+            (&(func).view(), &self.eval_fn),
+            (ValueView::Obj(function), Some(intrinsic)) if Gc::ptr_eq(function, intrinsic)
         );
         let argv = self.eval_args(args, env)?;
         if direct {
@@ -4512,7 +4520,7 @@ impl Interp {
             return Ok(Value::Undefined);
         }
         // `f?.()` short-circuits the whole chain when the callee is nullish.
-        if optional && matches!(func, Value::Undefined | Value::Null) {
+        if optional && matches!((func).view(), ValueView::Undefined | ValueView::Null) {
             self.short_circuit = true;
             return Ok(Value::Undefined);
         }
@@ -4587,7 +4595,7 @@ impl Interp {
                 if self.short_circuit {
                     return Ok((Value::Undefined, Value::Undefined));
                 }
-                if *optional && matches!(base, Value::Undefined | Value::Null) {
+                if *optional && matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                     self.short_circuit = true;
                     return Ok((Value::Undefined, Value::Undefined));
                 }
@@ -4620,7 +4628,7 @@ impl Interp {
                 if self.short_circuit {
                     return Ok((Value::Undefined, Value::Undefined));
                 }
-                if *optional && matches!(base, Value::Undefined | Value::Null) {
+                if *optional && matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                     self.short_circuit = true;
                     return Ok((Value::Undefined, Value::Undefined));
                 }
@@ -4647,11 +4655,11 @@ impl Interp {
     /// throw its reason). A non-promise is returned as-is. A still-pending promise yields undefined
     /// (TRust JS cannot truly suspend).
     pub(crate) fn await_value(&mut self, v: Value) -> Result<Value, Abrupt> {
-        let ptr = match &v {
-            Value::Obj(o) if self.promises.contains_key(&(Gc::as_ptr(o) as usize)) => {
+        let ptr = match &(v).view() {
+            ValueView::Obj(o) if self.promises.contains_key(&(Gc::as_ptr(o) as usize)) => {
                 Gc::as_ptr(o) as usize
             }
-            Value::Obj(_) => {
+            ValueView::Obj(_) => {
                 // Await of a plain object goes through the promise resolution procedure: a
                 // thenable is adopted (its `then` called once), anything else settles as-is.
                 let then = self.get_member_key(&v, "then")?;
@@ -4742,14 +4750,14 @@ impl Interp {
     /// Whether `callback` is a resolving function made by [`Self::make_host_resolver_pair`]:
     /// a bound resolver whose [[AlreadyResolved]] record has the private marker prototype.
     pub(crate) fn is_host_resolver(&self, callback: &Value) -> bool {
-        let Value::Obj(function) = callback else {
+        let ValueView::Obj(function) = &(callback).view() else {
             return false;
         };
         let function = function.borrow();
         let Callable::Bound(bound) = &function.call else {
             return false;
         };
-        matches!(bound.args.first(), Some(Value::Obj(flag))
+        matches!((bound.args.first()).map(|__value| (__value).view()), Some(ValueView::Obj(flag))
         if flag.borrow().proto.as_ref().is_some_and(|proto| {
             Gc::ptr_eq(proto, &self.host_resolution_marker)
         }))
@@ -4765,21 +4773,21 @@ impl Interp {
     pub(crate) fn resolve_promise_from(&mut self, promise: &Value, value: Value, host_steps: bool) {
         // Follow a subclass graft's forwarding link (see run_constructor_on's native arm).
         let mut promise = promise.clone();
-        if let Value::Obj(o) = &promise {
+        if let ValueView::Obj(o) = &(promise).view() {
             if let Some(f) = self.promise_forward.get(&(Gc::as_ptr(o) as usize)) {
                 promise = f.clone();
             }
         }
         let promise = &promise;
-        let ptr = match promise {
-            Value::Obj(o) => Gc::as_ptr(o) as usize,
+        let ptr = match &(promise).view() {
+            ValueView::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return,
         };
         if self.promises.get(&ptr).map(|s| s.status).unwrap_or(1) != 0 {
             return;
         }
         // Resolving a promise with ITSELF is a TypeError rejection (chaining cycle).
-        if let (Value::Obj(p), Value::Obj(v)) = (promise, &value) {
+        if let (ValueView::Obj(p), ValueView::Obj(v)) = (&(promise).view(), &(value).view()) {
             if Gc::ptr_eq(p, v) {
                 let e = crate::interpreter::abrupt_value(
                     self.throw("TypeError", "Chaining cycle detected for promise"),
@@ -4790,7 +4798,7 @@ impl Interp {
         }
         // Adopt a thenable's eventual state; a throwing `then` getter rejects. The `then` CALL
         // itself happens in a microtask (PromiseResolveThenableJob).
-        if matches!(value, Value::Obj(_)) {
+        if matches!((value).view(), ValueView::Obj(_)) {
             match self.get_member_key(&value, "then") {
                 Ok(then) if then.is_callable() => {
                     // HostEnqueuePromiseJob(job, GetFunctionRealm(then)); embedder platform
@@ -4837,7 +4845,7 @@ impl Interp {
 
     pub(crate) fn reject_promise(&mut self, promise: &Value, reason: Value) {
         let mut promise = promise.clone();
-        if let Value::Obj(o) = &promise {
+        if let ValueView::Obj(o) = &(promise).view() {
             if let Some(f) = self.promise_forward.get(&(Gc::as_ptr(o) as usize)) {
                 promise = f.clone();
             }
@@ -4846,8 +4854,8 @@ impl Interp {
     }
 
     fn settle(&mut self, promise: &Value, value: Value, fulfilled: bool) {
-        let ptr = match promise {
-            Value::Obj(o) => Gc::as_ptr(o) as usize,
+        let ptr = match &(promise).view() {
+            ValueView::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return,
         };
         let (reactions, handled) = match self.promises.get_mut(&self.gc_heap, &ptr) {
@@ -4901,7 +4909,7 @@ impl Interp {
         on_r: Value,
         result: Value,
     ) {
-        if !matches!(promise, Value::Obj(_)) {
+        if !matches!(&(promise).view(), ValueView::Obj(_)) {
             return;
         }
         // HostMakeJobCallback runs at registration, not settlement or job execution.
@@ -4914,7 +4922,7 @@ impl Interp {
     /// two unobservable built-in resumption steps and no result capability. `async_promise` is the
     /// suspended async function's result promise (its coroutine key).
     pub(crate) fn perform_await_then(&mut self, promise: &Value, async_promise: &Value) {
-        if !matches!(promise, Value::Obj(_)) {
+        if !matches!(&(promise).view(), ValueView::Obj(_)) {
             return;
         }
         let on_f = self.make_await_job_callback(async_promise.clone(), true);
@@ -4931,8 +4939,8 @@ impl Interp {
         on_r: crate::interpreter::JobCallback,
         result: Value,
     ) {
-        let ptr = match promise {
-            Value::Obj(o) => Gc::as_ptr(o) as usize,
+        let ptr = match &(promise).view() {
+            ValueView::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return,
         };
         let (status, handled, outstanding) =
@@ -5034,13 +5042,15 @@ impl Interp {
             return (None, same_realm_context);
         }
         let current_realm = Gc::as_ptr(&self.global) as usize;
-        let realm = match handler {
-            Value::Obj(handler) => match self.get_function_realm_global(handler) {
-                Ok(Some(realm)) => realm,
-                // NewPromiseReactionJob uses the current Realm when GetFunctionRealm completes
-                // abruptly (for example, a revoked callable Proxy).
-                Ok(None) | Err(_) => current_realm,
-            },
+        let realm = match &(handler).view() {
+            ValueView::Obj(handler) => {
+                match self.get_function_realm_global(handler) {
+                    Ok(Some(realm)) => realm,
+                    // NewPromiseReactionJob uses the current Realm when GetFunctionRealm completes
+                    // abruptly (for example, a revoked callable Proxy).
+                    Ok(None) | Err(_) => current_realm,
+                }
+            }
             _ => current_realm,
         };
         let host_context = if realm == current_realm {
@@ -5236,7 +5246,7 @@ impl Interp {
         &mut self,
         registry: Value,
     ) -> Result<(), crate::InterruptReason> {
-        let Some(ptr) = registry.as_obj().map(|object| Gc::as_ptr(object) as usize) else {
+        let Some(ptr) = registry.as_obj().map(|object| Gc::as_ptr(&object) as usize) else {
             return Ok(());
         };
         if let Some(state) = self.finalization_registries.get_mut(&self.gc_heap, &ptr) {
@@ -5322,7 +5332,7 @@ impl Interp {
             InternalJob::AwaitFulfilled { .. } => crate::coroutine::Resume::Next(value),
             InternalJob::AwaitRejected { .. } => crate::coroutine::Resume::Throw(value),
         };
-        let Value::Obj(async_promise) = &handler.callback else {
+        let ValueView::Obj(async_promise) = &(handler.callback).view() else {
             return;
         };
         let key = Gc::as_ptr(async_promise) as usize;
@@ -5416,10 +5426,11 @@ impl Interp {
     /// overrides the instance prototype (falling back to newTarget's realm's %RegExp.prototype%).
     pub(crate) fn regexp_alloc_proto(&mut self) -> Result<Option<crate::value::Gc>, Abrupt> {
         Ok(if self.constructing {
-            match &self.new_target.clone() {
-                nt @ Value::Obj(_) => match self.get_member_key(nt, "prototype")? {
-                    Value::Obj(p) => Some(p),
-                    _ => crate::builtins::regexp_realm_proto(self, nt)
+            let nt = self.new_target;
+            match nt.view() {
+                ValueView::Obj(_) => match (self.get_member_key(&nt, "prototype")?).view() {
+                    ValueView::Obj(p) => Some(p),
+                    _ => crate::builtins::regexp_realm_proto(self, &nt)
                         .map_err(Abrupt::Throw)?
                         .or_else(|| self.extra_protos.get("RegExp").cloned()),
                 },
@@ -5488,10 +5499,12 @@ impl Interp {
 
     /// Direct eval: a non-string argument is returned unchanged; a string is parsed and executed.
     pub(crate) fn direct_eval(&mut self, arg: Option<&Value>, env: &Env) -> Result<Value, Abrupt> {
-        let code = match arg {
-            Some(Value::Str(s)) => s.clone(),
-            Some(other) => return Ok(other.clone()),
-            None => return Ok(Value::Undefined),
+        let Some(value) = arg else {
+            return Ok(Value::Undefined);
+        };
+        let code = match value.view() {
+            ValueView::Str(s) => s,
+            _ => return Ok(*value),
         };
         self.perform_eval(&code, env, true)
     }
@@ -5852,7 +5865,7 @@ impl Interp {
         for stmt in body {
             match self.exec_stmt(stmt, lex_env) {
                 Ok(v) => {
-                    if !matches!(v, Value::Empty) {
+                    if !matches!((v).view(), ValueView::Empty) {
                         last = v;
                     }
                 }
@@ -6065,30 +6078,31 @@ impl Interp {
     ) -> Result<(), Abrupt> {
         // (IsConstructor runs BEFORE any `prototype` read; a callable non-constructor like
         // %IsHTMLDDA% is a TypeError without observable gets.)
-        let (proto_parent, ctor_parent): (Option<Gc>, Option<Value>) = match &parent {
-            None => (Some(self.object_proto.clone()), None),
-            Some(Value::Null) => (None, None),
-            Some(v @ Value::Obj(pc)) if self.value_is_constructor(v) => {
-                let pp = self.get_member_key(v, "prototype")?;
-                let pp = match pp {
-                    Value::Obj(o) => Some(o),
-                    Value::Null => None,
-                    _ => {
-                        return Err(self.throw(
-                            "TypeError",
-                            "Class extends value does not have a valid prototype property",
-                        ));
-                    }
-                };
-                (pp, Some(Value::Obj(pc.clone())))
-            }
-            _ => {
-                return Err(self.throw(
-                    "TypeError",
-                    "Class extends value is not a constructor or null",
-                ));
-            }
-        };
+        let (proto_parent, ctor_parent): (Option<Gc>, Option<Value>) =
+            match parent.map(|value| value.view()) {
+                None => (Some(self.object_proto.clone()), None),
+                Some(ValueView::Null) => (None, None),
+                Some(ValueView::Obj(pc)) if self.value_is_constructor(parent.as_ref().unwrap()) => {
+                    let pp = self.get_member_key(parent.as_ref().unwrap(), "prototype")?;
+                    let pp = match (pp).view() {
+                        ValueView::Obj(o) => Some(o),
+                        ValueView::Null => None,
+                        _ => {
+                            return Err(self.throw(
+                                "TypeError",
+                                "Class extends value does not have a valid prototype property",
+                            ));
+                        }
+                    };
+                    (pp, Some(Value::Obj(pc.clone())))
+                }
+                _ => {
+                    return Err(self.throw(
+                        "TypeError",
+                        "Class extends value is not a constructor or null",
+                    ));
+                }
+            };
         prepared.proto_parent = proto_parent;
         prepared.ctor_parent = ctor_parent;
         prepared.derived = parent.is_some();
@@ -6185,8 +6199,8 @@ impl Interp {
                 "prototype",
                 Property::data(Value::Obj(proto.clone()), false, false, false),
             );
-            b.proto = match &ctor_parent {
-                Some(Value::Obj(p)) => Some(p.clone()),
+            b.proto = match ctor_parent.map(|__value| (__value).view()) {
+                Some(ValueView::Obj(p)) => Some(p.clone()),
                 _ => Some(self.function_proto.clone()),
             };
             if let Some(n) = &class.name {
@@ -6339,7 +6353,7 @@ impl Interp {
                 }
                 MemberKind::Method => {
                     let mut f = self.make_function(m.func.clone().unwrap(), menv.clone());
-                    if let Value::Obj(fo) = &f {
+                    if let ValueView::Obj(fo) = &(f).view() {
                         let name = self.fn_name_for_key(if key.is_private() {
                             private_display(&key)
                         } else {
@@ -6392,7 +6406,7 @@ impl Interp {
                 MemberKind::Get | MemberKind::Set => {
                     let mut f = self.make_function(m.func.clone().unwrap(), menv.clone());
                     let is_get = m.kind == MemberKind::Get;
-                    if let Value::Obj(fo) = &f {
+                    if let ValueView::Obj(fo) = &(f).view() {
                         let prefix = if is_get { "get " } else { "set " };
                         let name = self.fn_name_for_key(if key.is_private() {
                             private_display(&key)
@@ -6806,7 +6820,7 @@ impl Interp {
             )?;
             inits.append(&mut std::mem::take(&mut self.decorator_initializers));
             match r {
-                Value::Undefined => {}
+                v if matches!(v.view(), ValueView::Undefined) => {}
                 v if v.is_callable() => value = v,
                 _ => {
                     return Err(
@@ -6841,7 +6855,7 @@ impl Interp {
             )?;
             inits.append(&mut std::mem::take(&mut self.decorator_initializers));
             match r {
-                Value::Undefined => {}
+                v if matches!(v.view(), ValueView::Undefined) => {}
                 v if v.is_callable() => transforms.push(v),
                 _ => {
                     return Err(self.throw(
@@ -6886,9 +6900,9 @@ impl Interp {
                 &[Value::Obj(pair), ctx],
             )?;
             inits.append(&mut std::mem::take(&mut self.decorator_initializers));
-            match r {
-                Value::Undefined => {}
-                Value::Obj(_) => {
+            match (r).view() {
+                ValueView::Undefined => {}
+                ValueView::Obj(_) => {
                     let ng = self.get_member_key(&r, "get")?;
                     if ng.is_callable() {
                         get = ng;
@@ -6922,8 +6936,8 @@ impl Interp {
         this: &Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        let obj = match ctor {
-            Value::Obj(o) => o.clone(),
+        let obj = match &(ctor).view() {
+            ValueView::Obj(o) => o.clone(),
             _ => return Err(self.throw("TypeError", "super target is not a constructor")),
         };
         let ptr = Gc::as_ptr(&obj) as usize;
@@ -6970,7 +6984,8 @@ impl Interp {
                 let made = self.dispatch_native(&call, this.clone(), args);
                 self.constructing = saved;
                 let made = made?;
-                if let (Value::Obj(src), Value::Obj(dst)) = (&made, this) {
+                if let (ValueView::Obj(src), ValueView::Obj(dst)) = (&(made).view(), &(this).view())
+                {
                     if !Gc::ptr_eq(src, dst) {
                         for k in src.borrow().props.keys() {
                             let p = src.borrow().props.get(&k).cloned().unwrap();
@@ -7089,7 +7104,7 @@ impl Interp {
         // OwnPropertyKeys/GetOwnProperty/Get work. Keep its shared layout and copy the owning
         // packed values directly instead of rebuilding keys, lookups and shape transitions.
         if excluded.is_empty() {
-            if let Value::Obj(source) = value {
+            if let ValueView::Obj(source) = &(value).view() {
                 if !Gc::ptr_eq(source, rest) {
                     let source = source.borrow();
                     if source.ic_plain.get() && matches!(source.exotic, Exotic::None) {
@@ -7114,7 +7129,7 @@ impl Interp {
                 }
                 let desc =
                     crate::builtins::proxy_gopd_value(self, &t, &h, &pk).map_err(Abrupt::Throw)?;
-                if matches!(desc, Value::Undefined) {
+                if matches!((desc).view(), ValueView::Undefined) {
                     continue;
                 }
                 let e = self.get_member_key(&desc, "enumerable")?;
@@ -7127,8 +7142,8 @@ impl Interp {
             }
             return Ok(());
         }
-        match value {
-            Value::Obj(src) => {
+        match &(value).view() {
+            ValueView::Obj(src) => {
                 // CopyDataProperties snapshots [[OwnPropertyKeys]] before any descriptor getter
                 // runs. Indexed platform getters may mutate expandos, but cannot add newly-created
                 // keys to this operation's snapshot.
@@ -7176,7 +7191,7 @@ impl Interp {
                 }
             }
             // ToObject(string): copy the enumerable index properties.
-            Value::Str(s) => {
+            ValueView::Str(s) => {
                 for (idx, ch) in s.chars().enumerate() {
                     let k = idx.to_string();
                     if is_excluded(&k) {
@@ -7196,8 +7211,8 @@ impl Interp {
         ctor: &Value,
         this: &Value,
     ) -> Result<(), Abrupt> {
-        let obj = match ctor {
-            Value::Obj(o) => o.clone(),
+        let obj = match &(ctor).view() {
+            ValueView::Obj(o) => o.clone(),
             _ => return Ok(()),
         };
         let ptr = Gc::as_ptr(&obj) as usize;
@@ -7221,7 +7236,7 @@ impl Interp {
         // PrivateMethodOrAccessorAdd: stamp the class's private methods/accessors on the instance
         // before any field initializer runs; a second initialization (return-override tricks
         // constructing over the same object twice) is a TypeError.
-        if let Value::Obj(o) = this {
+        if let ValueView::Obj(o) = &(this).view() {
             // InitializeInstanceElements checks extensibility once for the complete
             // private-method/accessor group (Stage 3 nonextensible-applies-to-private).
             if !priv_members.is_empty()
@@ -7289,7 +7304,7 @@ impl Interp {
                     // PrivateFieldAdd: stamped directly on the object (bypassing proxy traps);
                     // the supported proposal first performs IsExtensible, whose Proxy trap
                     // is observable, then checks for a duplicate Private Name.
-                    let Value::Obj(o) = this else {
+                    let ValueView::Obj(o) = &(this).view() else {
                         return Err(me.throw("TypeError", "cannot add a private field"));
                     };
                     if !crate::builtins::js_is_extensible(me, this).map_err(Abrupt::Throw)? {
@@ -7335,12 +7350,12 @@ impl Interp {
             }
             return Ok(Value::lstr(v.type_of()));
         }
-        let v = if matches!(op, "-" | "~") && matches!(v, Value::Obj(_)) {
+        let v = if matches!(op, "-" | "~") && matches!((v).view(), ValueView::Obj(_)) {
             self.to_primitive(&v, Hint::Number)?
         } else {
             v
         };
-        if let Value::BigInt(n) = v {
+        if let ValueView::BigInt(n) = (v).view() {
             return match op {
                 "-" => Ok(Value::BigInt(n.neg())),
                 "~" => Ok(Value::BigInt(n.not())),
@@ -7460,12 +7475,12 @@ impl Interp {
         }
         let v = self.eval(arg, env)?;
         // `-`/`~` apply ToNumeric: a BigInt (or BigInt wrapper object) stays a BigInt.
-        let v = if matches!(op, "-" | "~") && matches!(v, Value::Obj(_)) {
+        let v = if matches!(op, "-" | "~") && matches!((v).view(), ValueView::Obj(_)) {
             self.to_primitive(&v, Hint::Number)?
         } else {
             v
         };
-        if let Value::BigInt(n) = v {
+        if let ValueView::BigInt(n) = (v).view() {
             return match op {
                 "!" => Ok(Value::Bool(n.is_zero())),
                 "-" => Ok(Value::BigInt(n.neg())),
@@ -7521,7 +7536,7 @@ impl Interp {
                 if self.short_circuit {
                     return Ok(Value::Bool(true));
                 }
-                if matches!(base, Value::Undefined | Value::Null) {
+                if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                     self.short_circuit = true;
                     return Ok(Value::Bool(true));
                 }
@@ -7537,7 +7552,7 @@ impl Interp {
                 if self.short_circuit {
                     return Ok(Value::Bool(true));
                 }
-                if matches!(base, Value::Undefined | Value::Null) {
+                if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                     self.short_circuit = true;
                     return Ok(Value::Bool(true));
                 }
@@ -7556,7 +7571,7 @@ impl Interp {
                 if self.short_circuit {
                     return Ok(Value::Bool(true));
                 }
-                if matches!(base, Value::Undefined | Value::Null) {
+                if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(self.throw(
                         "TypeError",
                         format!("cannot delete property '{prop}' of null or undefined"),
@@ -7579,7 +7594,7 @@ impl Interp {
                 }
                 let idx = self.eval(index, env)?;
                 let key = self.to_property_key(&idx)?;
-                if matches!(base, Value::Undefined | Value::Null) {
+                if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(self.throw(
                         "TypeError",
                         format!(
@@ -7617,7 +7632,7 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         {
             {
-                if let Value::Obj(o) = &base {
+                if let ValueView::Obj(o) = &(base).view() {
                     self.defer_trigger(o, Some(prop))?;
                     let ptr = Gc::as_ptr(o) as usize;
                     if let Some((target, handler)) = self.proxy_at(ptr) {
@@ -7696,7 +7711,7 @@ impl Interp {
                 }
                 // A string primitive's `length` and in-range indices are non-configurable own
                 // properties of the string exotic wrapper: [[Delete]] is false (TypeError strict).
-                if let Value::Str(sv) = &base {
+                if let ValueView::Str(sv) = &(base).view() {
                     if self.string_own_key(sv, prop) {
                         if strict {
                             return Err(self.throw(
@@ -7740,7 +7755,10 @@ impl Interp {
                         }
                         return Ok(Value::Bool(false));
                     }
-                    if let Some(wobj @ Value::Obj(o)) = &with_obj {
+                    if let Some((wobj, o)) = with_obj
+                        .as_ref()
+                        .and_then(|wobj| wobj.as_obj().map(|o| (wobj, o)))
+                    {
                         // @@unscopables-blocked names skip this scope entirely; a present
                         // binding deletes via the object's [[Delete]] (own property only —
                         // an inherited one is untouched and reports true per OrdinaryDelete).
@@ -7786,7 +7804,7 @@ impl Interp {
         handler: Value,
         key: &str,
     ) -> Result<bool, Abrupt> {
-        if matches!(handler, Value::Null) {
+        if matches!((handler).view(), ValueView::Null) {
             return Err(self.throw("TypeError", "cannot delete on a revoked proxy"));
         }
         let trap = self.proxy_get_trap(
@@ -7798,7 +7816,7 @@ impl Interp {
             // ECMA-262 §10.5.10 step 7: target.[[Delete]](P), with the target's own internal
             // method (a Proxy, TypedArray, mapped arguments or host object has its own).
             let deleted = self.delete_prop_with(target, key, false)?;
-            return Ok(matches!(deleted, Value::Bool(true)));
+            return Ok(matches!((deleted).view(), ValueView::Bool(true)));
         };
         let kv = self
             .sym_from_key(key)
@@ -7815,7 +7833,7 @@ impl Interp {
         // ECMA-262 §10.5.10 steps 10-15: a non-configurable property, or any property of a
         // non-extensible target, can't be reported as deleted. Both queries use the target's
         // own internal methods.
-        if let Value::Obj(t) = &target {
+        if let ValueView::Obj(t) = &(target).view() {
             let target_desc =
                 crate::builtins::object_get_own_property(self, t, key).map_err(Abrupt::Throw)?;
             if let Some(target_desc) = target_desc {
@@ -7882,7 +7900,7 @@ impl Interp {
                     .get(name.as_str())
                     .map(|bd| bd.value.clone())
                     .unwrap_or(Value::Undefined);
-                if let Value::Num(n) = old {
+                if let ValueView::Num(n) = (old).view() {
                     let new = if op == "++" { n + 1.0 } else { n - 1.0 };
                     if let Some(bd) = scope.borrow_mut().vars.get_mut(name) {
                         bd.value = Value::Num(new);
@@ -7896,8 +7914,8 @@ impl Interp {
         let mut lref = self.resolve_reference(arg, env)?;
         let old = self.get_reference(&mut lref)?;
         let old_numeric = self.to_numeric(old)?;
-        match old_numeric {
-            Value::BigInt(old) => {
+        match (old_numeric).view() {
+            ValueView::BigInt(old) => {
                 let one = crate::bigint::JsBigInt::from_u64(1);
                 let new = if op == "++" {
                     old.add(&one)
@@ -7907,7 +7925,7 @@ impl Interp {
                 self.put_reference(&mut lref, Value::BigInt(new.clone()))?;
                 Ok(Value::BigInt(if prefix { new } else { old }))
             }
-            Value::Num(old) => {
+            ValueView::Num(old) => {
                 let new = if op == "++" { old + 1.0 } else { old - 1.0 };
                 self.put_reference(&mut lref, Value::Num(new))?;
                 Ok(Value::Num(if prefix { new } else { old }))
@@ -8005,7 +8023,7 @@ impl Interp {
             let do_assign = match op {
                 "&&=" => self.to_boolean(&cur),
                 "||=" => !self.to_boolean(&cur),
-                "??=" => matches!(cur, Value::Undefined | Value::Null),
+                "??=" => matches!((cur).view(), ValueView::Undefined | ValueView::Null),
                 _ => unreachable!(),
             };
             if !do_assign {
@@ -8141,7 +8159,7 @@ impl Interp {
                                 };
                                 if matches!(core, Expr::Array(_) | Expr::Object(_)) {
                                     let mut v = next_value!();
-                                    if matches!(v, Value::Undefined) {
+                                    if matches!((v).view(), ValueView::Undefined) {
                                         if let Some(d) = default {
                                             v = me.eval(d, env)?;
                                         }
@@ -8150,7 +8168,7 @@ impl Interp {
                                 } else {
                                     let mut lref = me.resolve_reference(core, env)?;
                                     let mut v = next_value!();
-                                    if matches!(v, Value::Undefined) {
+                                    if matches!((v).view(), ValueView::Undefined) {
                                         if let Some(d) = default {
                                             v = me.eval(d, env)?;
                                             if let (Expr::Ident(n, _), true) =
@@ -8194,7 +8212,7 @@ impl Interp {
                 }
             }
             Expr::Object(props) => {
-                if matches!(value, Value::Undefined | Value::Null) {
+                if matches!((value).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(self.throw("TypeError", "cannot destructure null or undefined"));
                 }
                 let mut taken: Vec<String> = Vec::new();
@@ -8225,7 +8243,7 @@ impl Interp {
                             };
                             if matches!(core, Expr::Array(_) | Expr::Object(_)) {
                                 let mut v = self.get_member_key(&value, &k)?;
-                                if matches!(v, Value::Undefined) {
+                                if matches!((v).view(), ValueView::Undefined) {
                                     if let Some(d) = default {
                                         v = self.eval(d, env)?;
                                     }
@@ -8234,7 +8252,7 @@ impl Interp {
                             } else {
                                 let mut lref = self.resolve_reference(core, env)?;
                                 let mut v = self.get_member_key(&value, &k)?;
-                                if matches!(v, Value::Undefined) {
+                                if matches!((v).view(), ValueView::Undefined) {
                                     if let Some(d) = default {
                                         v = self.eval(d, env)?;
                                         if let (Expr::Ident(n, _), true) =
@@ -8284,7 +8302,7 @@ impl Interp {
         // Hot path: number ⊕ number has no observable coercion steps (no ToPrimitive hooks, no
         // BigInt mixing) — compute directly. Rust f64 comparisons share JS NaN semantics (all
         // false), and +0 == -0 holds, so the comparison arms are exact.
-        if let (Value::Num(a), Value::Num(b)) = (&l, &r) {
+        if let (ValueView::Num(a), ValueView::Num(b)) = (&(l).view(), &(r).view()) {
             let (a, b) = (*a, *b);
             match op {
                 "+" => return Ok(Value::Num(a + b)),
@@ -8330,8 +8348,13 @@ impl Interp {
         }
         // Primitive strings cannot invoke conversion hooks. Append to the left operand's buffer
         // at its frontier where it can, just like native string addition.
-        if op == "+" && matches!((&l, &r), (Value::Str(_), Value::Str(_))) {
-            let (Value::Str(left), Value::Str(right)) = (l, r) else {
+        if op == "+"
+            && matches!(
+                (&(l).view(), &(r).view()),
+                (ValueView::Str(_), ValueView::Str(_))
+            )
+        {
+            let (ValueView::Str(left), ValueView::Str(right)) = ((l).view(), (r).view()) else {
                 unreachable!()
             };
             if left.len().saturating_add(right.len()) > MAX_STR_LEN {
@@ -8351,19 +8374,23 @@ impl Interp {
             // touching the right one.
             if op != "+" {
                 let lp = self.to_primitive(&l, Hint::Number)?;
-                let ln = if matches!(lp, Value::BigInt(_)) {
+                let ln = if matches!((lp).view(), ValueView::BigInt(_)) {
                     lp
                 } else {
                     Value::Num(self.to_number(&lp)?)
                 };
                 let rp = self.to_primitive(&r, Hint::Number)?;
-                let rn = if matches!(rp, Value::BigInt(_)) {
+                let rn = if matches!((rp).view(), ValueView::BigInt(_)) {
                     rp
                 } else {
                     Value::Num(self.to_number(&rp)?)
                 };
-                if matches!(ln, Value::BigInt(_)) || matches!(rn, Value::BigInt(_)) {
-                    if let (Value::BigInt(x), Value::BigInt(y)) = (&ln, &rn) {
+                if matches!((ln).view(), ValueView::BigInt(_))
+                    || matches!((rn).view(), ValueView::BigInt(_))
+                {
+                    if let (ValueView::BigInt(x), ValueView::BigInt(y)) =
+                        (&(ln).view(), &(rn).view())
+                    {
                         return self.bigint_binop(op, x, y);
                     }
                     return Err(self.throw(
@@ -8371,8 +8398,8 @@ impl Interp {
                         "Cannot mix BigInt and other types, use explicit conversions",
                     ));
                 }
-                let (a, b) = match (&ln, &rn) {
-                    (Value::Num(a), Value::Num(b)) => (*a, *b),
+                let (a, b) = match (&(ln).view(), &(rn).view()) {
+                    (ValueView::Num(a), ValueView::Num(b)) => (*a, *b),
                     _ => unreachable!(),
                 };
                 return match op {
@@ -8413,7 +8440,10 @@ impl Interp {
             let hint = Hint::Default;
             let lp = self.to_primitive(&l, hint)?;
             let rp = self.to_primitive(&r, hint)?;
-            if op == "+" && (matches!(lp, Value::Str(_)) || matches!(rp, Value::Str(_))) {
+            if op == "+"
+                && (matches!((lp).view(), ValueView::Str(_))
+                    || matches!((rp).view(), ValueView::Str(_)))
+            {
                 let ls = self.to_string(&lp)?;
                 let rs = self.to_string(&rp)?;
                 if ls.len() + rs.len() > MAX_STR_LEN {
@@ -8421,8 +8451,10 @@ impl Interp {
                 }
                 return Ok(Value::Str(ls.concat_owned(&rs)));
             }
-            if matches!(lp, Value::BigInt(_)) || matches!(rp, Value::BigInt(_)) {
-                if let (Value::BigInt(x), Value::BigInt(y)) = (&lp, &rp) {
+            if matches!((lp).view(), ValueView::BigInt(_))
+                || matches!((rp).view(), ValueView::BigInt(_))
+            {
+                if let (ValueView::BigInt(x), ValueView::BigInt(y)) = (&(lp).view(), &(rp).view()) {
                     return self.bigint_binop(op, x, y);
                 }
                 return Err(self.throw(
@@ -8571,16 +8603,18 @@ impl Interp {
     /// undefined / null / Symbol throw TypeError.
     pub(crate) fn to_bigint(&mut self, v: &Value) -> Result<crate::bigint::JsBigInt, Abrupt> {
         let p = self.to_primitive(v, Hint::Number)?;
-        match p {
-            Value::BigInt(n) => Ok(n),
-            Value::Bool(b) => Ok(crate::bigint::JsBigInt::from_u64(b as u64)),
-            Value::Str(s) => {
+        match (p).view() {
+            ValueView::BigInt(n) => Ok(n),
+            ValueView::Bool(b) => Ok(crate::bigint::JsBigInt::from_u64(b as u64)),
+            ValueView::Str(s) => {
                 let mut poll = crate::bigint::Poll::new(&self.runtime_interrupt);
                 string_to_bigint_bounded(&s, &mut poll)
                     .map_err(|stop| self.bigint_stop(stop))?
                     .ok_or_else(|| self.throw("SyntaxError", "Cannot convert string to a BigInt"))
             }
-            Value::Num(_) => Err(self.throw("TypeError", "Cannot convert a Number to a BigInt")),
+            ValueView::Num(_) => {
+                Err(self.throw("TypeError", "Cannot convert a Number to a BigInt"))
+            }
             _ => Err(self.throw("TypeError", "Cannot convert value to a BigInt")),
         }
     }
@@ -8588,7 +8622,7 @@ impl Interp {
     fn compare(&mut self, op: &str, l: Value, r: Value) -> Result<Value, Abrupt> {
         let lp = self.to_primitive(&l, Hint::Number)?;
         let rp = self.to_primitive(&r, Hint::Number)?;
-        if let (Value::Str(a), Value::Str(b)) = (&lp, &rp) {
+        if let (ValueView::Str(a), ValueView::Str(b)) = (&(lp).view(), &(rp).view()) {
             // String relational comparison is per UTF-16 code unit (which differs from `str`
             // byte order once supplementary-plane characters are involved).
             let ord = crate::jstr::cmp_units(a, b);
@@ -8602,18 +8636,18 @@ impl Interp {
             return Ok(Value::Bool(res));
         }
         // BigInt operands compare exactly (never through f64, which would lose precision).
-        let ord: Option<std::cmp::Ordering> = match (&lp, &rp) {
-            (Value::BigInt(a), Value::BigInt(b)) => Some(a.cmp(b)),
-            (Value::BigInt(a), Value::Str(t)) => {
+        let ord: Option<std::cmp::Ordering> = match (&(lp).view(), &(rp).view()) {
+            (ValueView::BigInt(a), ValueView::BigInt(b)) => Some(a.cmp(b)),
+            (ValueView::BigInt(a), ValueView::Str(t)) => {
                 // StringToBigInt: an unparsable string makes the comparison undefined (false).
                 string_to_bigint(t).map(|b| a.cmp(&b))
             }
-            (Value::Str(t), Value::BigInt(b)) => string_to_bigint(t).map(|a| a.cmp(b)),
-            (Value::BigInt(a), _) => {
+            (ValueView::Str(t), ValueView::BigInt(b)) => string_to_bigint(t).map(|a| a.cmp(b)),
+            (ValueView::BigInt(a), _) => {
                 let n = self.to_number(&rp)?;
                 a.cmp_f64(n)
             }
-            (_, Value::BigInt(b)) => {
+            (_, ValueView::BigInt(b)) => {
                 let n = self.to_number(&lp)?;
                 b.cmp_f64(n).map(std::cmp::Ordering::reverse)
             }
@@ -8641,7 +8675,7 @@ impl Interp {
     }
 
     fn instanceof(&mut self, l: &Value, r: &Value) -> Result<Value, Abrupt> {
-        if !matches!(r, Value::Obj(_)) {
+        if !matches!(&(r).view(), ValueView::Obj(_)) {
             return Err(self.throw(
                 "TypeError",
                 "right-hand side of instanceof is not an object",
@@ -8653,8 +8687,8 @@ impl Interp {
             // canonical Function.prototype. Prove that shape without performing a generic
             // prototype-chain property read: an own override or altered function prototype
             // falls through, as do proxies and other side-table exotics.
-            let inherits_default = match r {
-                Value::Obj(o) if self.ordinary_get_ptr(Gc::as_ptr(o) as usize) => {
+            let inherits_default = match &(r).view() {
+                ValueView::Obj(o) if self.ordinary_get_ptr(Gc::as_ptr(o) as usize) => {
                     let b = o.borrow();
                     b.proto
                         .as_ref()
@@ -8672,8 +8706,8 @@ impl Interp {
                 // Function.prototype. Calling that native would only turn around and invoke this
                 // same abstract operation, while paying call-frame and GC polling overhead.
                 let is_default = matches!(
-                    &handler,
-                    Value::Obj(o)
+                    &(handler).view(),
+                    ValueView::Obj(o)
                         if matches!(
                             o.borrow().call,
                             Callable::Native(f)
@@ -8688,7 +8722,7 @@ impl Interp {
                 return Ok(Value::Bool(self.to_boolean(&res)));
             }
             // GetMethod: a present but non-callable @@hasInstance is a TypeError.
-            if !matches!(handler, Value::Undefined | Value::Null) {
+            if !matches!((handler).view(), ValueView::Undefined | ValueView::Null) {
                 return Err(self.throw("TypeError", "@@hasInstance is not callable"));
             }
         }
@@ -8713,7 +8747,9 @@ impl Interp {
         // proves no own @@hasInstance appeared, while the inherited intrinsic is read live.
         let cached = cache.get();
         if self.inline_ic_safe.get() && cached.depth == 0 {
-            if let (Some(key), Value::Obj(lhs), Value::Obj(rhs)) = (key.as_deref(), l, r) {
+            if let (Some(key), ValueView::Obj(lhs), ValueView::Obj(rhs)) =
+                (key.as_deref(), &(l).view(), &(r).view())
+            {
                 let canonical = self
                     .function_proto
                     .borrow()
@@ -8723,8 +8759,8 @@ impl Interp {
                     .map(Property::value)
                     .is_some_and(|value| {
                         matches!(
-                            value,
-                            Value::Obj(ref function)
+                            (value).view(),
+                            ValueView::Obj(ref function)
                                 if matches!(
                                     function.borrow().call,
                                     Callable::Native(native)
@@ -8754,7 +8790,7 @@ impl Interp {
                 } else {
                     None
                 };
-                if let Some(Value::Obj(target)) = target {
+                if let Some(ValueView::Obj(target)) = (target).map(|__value| (__value).view()) {
                     let mut cur = Some(lhs.clone());
                     while let Some(object) = cur {
                         let next = object.borrow().proto.clone();
@@ -8769,8 +8805,8 @@ impl Interp {
                 }
             }
         }
-        let fill = match (key.as_deref(), r) {
-            (Some(key), Value::Obj(o)) if self.ordinary_get_ptr(Gc::as_ptr(o) as usize) => {
+        let fill = match (key.as_deref(), &(r).view()) {
+            (Some(key), ValueView::Obj(o)) if self.ordinary_get_ptr(Gc::as_ptr(o) as usize) => {
                 let b = o.borrow();
                 if b.is_constructor
                     && matches!(b.exotic, Exotic::None)
@@ -8783,7 +8819,7 @@ impl Interp {
                 {
                     b.props.prototype_slot().and_then(|slot| {
                         let prop = b.props.get("prototype")?;
-                        (!prop.accessor() && matches!(prop.value(), Value::Obj(_)))
+                        (!prop.accessor() && matches!((prop.value()).view(), ValueView::Obj(_)))
                             .then_some((b.props.shape(), slot))
                     })
                 } else {
@@ -8812,20 +8848,20 @@ impl Interp {
     /// OrdinaryHasInstance(C, O): unwrap bound functions to their target, then test whether `C`'s
     /// `prototype` appears on `O`'s prototype chain.
     pub(crate) fn ordinary_has_instance(&mut self, c: &Value, o: &Value) -> Result<bool, Abrupt> {
-        let co = match c {
-            Value::Obj(x) if !matches!(x.borrow().call, Callable::None) => x.clone(),
+        let co = match &(c).view() {
+            ValueView::Obj(x) if !matches!(x.borrow().call, Callable::None) => x.clone(),
             _ => return Ok(false),
         };
         if let Callable::Bound(bound) = &co.borrow().call {
             let target = Value::Obj(bound.target.clone());
             return self.ordinary_has_instance(&target, o);
         }
-        let o_obj = match o {
-            Value::Obj(x) => x.clone(),
+        let o_obj = match &(o).view() {
+            ValueView::Obj(x) => x.clone(),
             _ => return Ok(false),
         };
-        let proto = match self.get_member_key(c, "prototype")? {
-            Value::Obj(p) => p,
+        let proto = match (self.get_member_key(c, "prototype")?).view() {
+            ValueView::Obj(p) => p,
             _ => return Err(self.throw("TypeError", "prototype property is not an object")),
         };
         // With no proxies in the realm, [[GetPrototypeOf]] is a direct field read for every hop.
@@ -8851,8 +8887,8 @@ impl Interp {
         let mut cur = Value::Obj(o_obj);
         loop {
             let next = crate::builtins::js_get_prototype_of(self, &cur).map_err(Abrupt::Throw)?;
-            match next {
-                Value::Obj(x) => {
+            match (next).view() {
+                ValueView::Obj(x) => {
                     if Gc::ptr_eq(&x, &proto) {
                         return Ok(true);
                     }
@@ -8866,38 +8902,38 @@ impl Interp {
     // ----- abstract operations ----------------------------------------------------------------
 
     pub fn to_boolean(&self, v: &Value) -> bool {
-        match v {
-            Value::Undefined | Value::Empty | Value::Null => false,
-            Value::Bool(b) => *b,
-            Value::Num(n) => *n != 0.0 && !n.is_nan(),
-            Value::BigInt(n) => !n.is_zero(),
-            Value::Str(s) => !s.is_empty(),
+        match &(v).view() {
+            ValueView::Undefined | ValueView::Empty | ValueView::Null => false,
+            ValueView::Bool(b) => *b,
+            ValueView::Num(n) => *n != 0.0 && !n.is_nan(),
+            ValueView::BigInt(n) => !n.is_zero(),
+            ValueView::Str(s) => !s.is_empty(),
             // The [[IsHTMLDDA]] object is the one falsy Object.
-            Value::Obj(_) => !self.is_htmldda(v),
-            Value::Sym(_) => true,
+            ValueView::Obj(_) => !self.is_htmldda(v),
+            ValueView::Sym(_) => true,
         }
     }
 
     pub(crate) fn to_number(&mut self, v: &Value) -> Result<f64, Abrupt> {
-        Ok(match v {
-            Value::Undefined | Value::Empty => f64::NAN,
-            Value::Null => 0.0,
-            Value::Bool(b) => {
+        Ok(match &(v).view() {
+            ValueView::Undefined | ValueView::Empty => f64::NAN,
+            ValueView::Null => 0.0,
+            ValueView::Bool(b) => {
                 if *b {
                     1.0
                 } else {
                     0.0
                 }
             }
-            Value::Num(n) => *n,
-            Value::BigInt(_) => {
+            ValueView::Num(n) => *n,
+            ValueView::BigInt(_) => {
                 return Err(self.throw("TypeError", "Cannot convert a BigInt value to a number"));
             }
-            Value::Str(s) => parse_number(s),
-            Value::Sym(_) => {
+            ValueView::Str(s) => parse_number(s),
+            ValueView::Sym(_) => {
                 return Err(self.throw("TypeError", "Cannot convert a Symbol value to a number"));
             }
-            Value::Obj(_) => {
+            ValueView::Obj(_) => {
                 let p = self.to_primitive(v, Hint::Number)?;
                 self.to_number(&p)?
             }
@@ -8909,11 +8945,11 @@ impl Interp {
     /// update expressions: an object can observably coerce to BigInt even though the original
     /// reference value was not itself a BigInt.
     pub(crate) fn to_numeric(&mut self, value: Value) -> Result<Value, Abrupt> {
-        match value {
-            numeric @ (Value::Num(_) | Value::BigInt(_)) => Ok(numeric),
-            other => {
-                let primitive = self.to_primitive(&other, Hint::Number)?;
-                if matches!(primitive, Value::BigInt(_)) {
+        match value.view() {
+            ValueView::Num(_) | ValueView::BigInt(_) => Ok(value),
+            _ => {
+                let primitive = self.to_primitive(&value, Hint::Number)?;
+                if matches!((primitive).view(), ValueView::BigInt(_)) {
                     Ok(primitive)
                 } else {
                     Ok(Value::Num(self.to_number(&primitive)?))
@@ -8932,27 +8968,33 @@ impl Interp {
     }
 
     pub(crate) fn to_string(&mut self, v: &Value) -> Result<crate::lstr::LStr, Abrupt> {
-        match v {
-            Value::Undefined | Value::Empty => Ok(crate::lstr::LStr::from("undefined")),
-            Value::Null => Ok(crate::lstr::LStr::from("null")),
-            Value::Bool(b) => Ok(crate::lstr::LStr::from(if *b { "true" } else { "false" })),
-            Value::Num(n) => Ok(crate::lstr::LStr::from(self.num_to_str(*n).as_str())),
-            Value::BigInt(n) => Ok(crate::lstr::LStr::from(
+        match &(v).view() {
+            ValueView::Undefined | ValueView::Empty => Ok(crate::lstr::LStr::from("undefined")),
+            ValueView::Null => Ok(crate::lstr::LStr::from("null")),
+            ValueView::Bool(b) => Ok(crate::lstr::LStr::from(if *b { "true" } else { "false" })),
+            ValueView::Num(n) => Ok(crate::lstr::LStr::from(self.num_to_str(*n).as_str())),
+            ValueView::BigInt(n) => Ok(crate::lstr::LStr::from(
                 self.bigint_to_string(n, 10)?.as_str(),
             )),
-            Value::Str(s) => Ok(s.clone()),
-            Value::Sym(_) => {
+            ValueView::Str(s) => Ok(s.clone()),
+            ValueView::Sym(_) => {
                 Err(self.throw("TypeError", "Cannot convert a Symbol value to a string"))
             }
-            Value::Obj(_) => {
+            ValueView::Obj(_) => {
                 let perf_started = crate::jit::perf_stage_start();
                 let result = (|| {
                     let p = self.to_primitive(v, Hint::String)?;
-                    match p {
-                        Value::Obj(_) => {
-                            Err(self.throw("TypeError", "cannot convert object to string"))
+                    {
+                        let __value_match_original = p;
+                        match (__value_match_original).view() {
+                            ValueView::Obj(_) => {
+                                Err(self.throw("TypeError", "cannot convert object to string"))
+                            }
+                            _ => {
+                                let other = __value_match_original;
+                                self.to_string(&other)
+                            }
                         }
-                        other => self.to_string(&other),
                     }
                 })();
                 crate::jit::perf_to_string_object_end(perf_started, result.is_ok());
@@ -8966,14 +9008,14 @@ impl Interp {
         v: &Value,
     ) -> Result<crate::value::PropertyKey, Abrupt> {
         // A symbol key maps to its internal NUL-prefixed key; everything else is its string form.
-        if let Value::Sym(s) = v {
+        if let ValueView::Sym(s) = &(v).view() {
             return Ok(crate::value::PropertyKey::symbol(s.clone()));
         }
         // ToPropertyKey: ToPrimitive(hint String) first — a Symbol result stays a symbol key (rather
         // than being stringified, which would throw), so `obj[wrapperWhoseToStringReturnsASymbol]`
         // is a symbol-keyed access.
         let prim = self.to_primitive(v, Hint::String)?;
-        if let Value::Sym(s) = &prim {
+        if let ValueView::Sym(s) = &(prim).view() {
             return Ok(crate::value::PropertyKey::symbol(s.clone()));
         }
         Ok(crate::value::PropertyKey::string(
@@ -8982,8 +9024,8 @@ impl Interp {
     }
 
     pub(crate) fn to_primitive(&mut self, v: &Value, hint: Hint) -> Result<Value, Abrupt> {
-        let obj = match v {
-            Value::Obj(o) => o.clone(),
+        let obj = match &(v).view() {
+            ValueView::Obj(o) => o.clone(),
             _ => return Ok(v.clone()),
         };
         let perf_started = crate::jit::perf_stage_start();
@@ -8992,7 +9034,8 @@ impl Interp {
             if let Some(key) = crate::builtins::well_known_key(self, "toPrimitive") {
                 let f = self.get_member_key(&Value::Obj(obj.clone()), &key)?;
                 // GetMethod: a present-but-non-callable @@toPrimitive (not undefined/null) is a TypeError.
-                if !matches!(f, Value::Undefined | Value::Null) && !f.is_callable() {
+                if !matches!((f).view(), ValueView::Undefined | ValueView::Null) && !f.is_callable()
+                {
                     return Err(self.throw("TypeError", "@@toPrimitive is not callable"));
                 }
                 if f.is_callable() {
@@ -9002,7 +9045,7 @@ impl Interp {
                         Hint::Default => "default",
                     };
                     let r = self.call(f, v.clone(), &[Value::lstr(hint_str)])?;
-                    if matches!(r, Value::Obj(_)) {
+                    if matches!((r).view(), ValueView::Obj(_)) {
                         return Err(
                             self.throw("TypeError", "Cannot convert object to a primitive value")
                         );
@@ -9018,7 +9061,7 @@ impl Interp {
                 let f = self.get_member_key(&Value::Obj(obj.clone()), method)?;
                 if f.is_callable() {
                     let r = self.call(f, v.clone(), &[])?;
-                    if !matches!(r, Value::Obj(_)) {
+                    if !matches!((r).view(), ValueView::Obj(_)) {
                         return Ok(r);
                     }
                 }
@@ -9089,22 +9132,24 @@ impl Interp {
     }
 
     pub(crate) fn strict_equals(&self, a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Undefined, Value::Undefined) => true,
-            (Value::Null, Value::Null) => true,
-            (Value::Bool(x), Value::Bool(y)) => x == y,
-            (Value::Num(x), Value::Num(y)) => x == y,
-            (Value::BigInt(x), Value::BigInt(y)) => x == y,
-            (Value::Str(x), Value::Str(y)) => x == y,
-            (Value::Sym(x), Value::Sym(y)) => x.id == y.id,
-            (Value::Obj(x), Value::Obj(y)) => Gc::ptr_eq(x, y),
+        match (&(a).view(), &(b).view()) {
+            (ValueView::Undefined, ValueView::Undefined) => true,
+            (ValueView::Null, ValueView::Null) => true,
+            (ValueView::Bool(x), ValueView::Bool(y)) => x == y,
+            (ValueView::Num(x), ValueView::Num(y)) => x == y,
+            (ValueView::BigInt(x), ValueView::BigInt(y)) => x == y,
+            (ValueView::Str(x), ValueView::Str(y)) => x == y,
+            (ValueView::Sym(x), ValueView::Sym(y)) => x.id == y.id,
+            (ValueView::Obj(x), ValueView::Obj(y)) => Gc::ptr_eq(x, y),
             _ => false,
         }
     }
 
     /// IsConstructor: whether `v` has a [[Construct]] internal method.
     pub(crate) fn value_is_constructor(&self, v: &Value) -> bool {
-        let Value::Obj(o) = v else { return false };
+        let ValueView::Obj(o) = &(v).view() else {
+            return false;
+        };
         if let Some((target, _)) = self.proxies.get(&(Gc::as_ptr(o) as usize)) {
             // A proxy is a constructor exactly when its target is.
             return self.value_is_constructor(&target.clone());
@@ -9134,53 +9179,57 @@ impl Interp {
 
     pub(crate) fn loose_equals(&mut self, a: &Value, b: &Value) -> Result<bool, Abrupt> {
         // [[IsHTMLDDA]] compares loosely equal to undefined/null (and to itself, as an object).
-        if matches!(a, Value::Undefined | Value::Null) && self.is_htmldda(b)
-            || matches!(b, Value::Undefined | Value::Null) && self.is_htmldda(a)
+        if matches!(&(a).view(), ValueView::Undefined | ValueView::Null) && self.is_htmldda(b)
+            || matches!(&(b).view(), ValueView::Undefined | ValueView::Null) && self.is_htmldda(a)
         {
             return Ok(true);
         }
-        Ok(match (a, b) {
-            (Value::Undefined | Value::Null, Value::Undefined | Value::Null) => true,
-            (Value::BigInt(x), Value::BigInt(y)) => x == y,
-            (Value::BigInt(x), Value::Num(y)) | (Value::Num(y), Value::BigInt(x)) => x.eq_f64(*y),
-            (Value::BigInt(x), Value::Str(s)) | (Value::Str(s), Value::BigInt(x)) => {
+        Ok(match (&(a).view(), &(b).view()) {
+            (ValueView::Undefined | ValueView::Null, ValueView::Undefined | ValueView::Null) => {
+                true
+            }
+            (ValueView::BigInt(x), ValueView::BigInt(y)) => x == y,
+            (ValueView::BigInt(x), ValueView::Num(y))
+            | (ValueView::Num(y), ValueView::BigInt(x)) => x.eq_f64(*y),
+            (ValueView::BigInt(x), ValueView::Str(s))
+            | (ValueView::Str(s), ValueView::BigInt(x)) => {
                 // StringToBigInt: an unparsable string compares unequal.
                 string_to_bigint(s).map(|n| n == *x).unwrap_or(false)
             }
-            (Value::BigInt(_), Value::Obj(_)) => {
+            (ValueView::BigInt(_), ValueView::Obj(_)) => {
                 let bp = self.to_primitive(b, Hint::Default)?;
                 self.loose_equals(a, &bp)?
             }
-            (Value::Obj(_), Value::BigInt(_)) => {
+            (ValueView::Obj(_), ValueView::BigInt(_)) => {
                 let ap = self.to_primitive(a, Hint::Default)?;
                 self.loose_equals(&ap, b)?
             }
-            (Value::Num(_), Value::Num(_))
-            | (Value::Str(_), Value::Str(_))
-            | (Value::Bool(_), Value::Bool(_))
-            | (Value::Sym(_), Value::Sym(_))
-            | (Value::Obj(_), Value::Obj(_)) => self.strict_equals(a, b),
-            (Value::Num(_), Value::Str(_)) => {
+            (ValueView::Num(_), ValueView::Num(_))
+            | (ValueView::Str(_), ValueView::Str(_))
+            | (ValueView::Bool(_), ValueView::Bool(_))
+            | (ValueView::Sym(_), ValueView::Sym(_))
+            | (ValueView::Obj(_), ValueView::Obj(_)) => self.strict_equals(a, b),
+            (ValueView::Num(_), ValueView::Str(_)) => {
                 let bn = self.to_number(b)?;
                 self.strict_equals(a, &Value::Num(bn))
             }
-            (Value::Str(_), Value::Num(_)) => {
+            (ValueView::Str(_), ValueView::Num(_)) => {
                 let an = self.to_number(a)?;
                 self.strict_equals(&Value::Num(an), b)
             }
-            (Value::Bool(_), _) => {
+            (ValueView::Bool(_), _) => {
                 let an = self.to_number(a)?;
                 self.loose_equals(&Value::Num(an), b)?
             }
-            (_, Value::Bool(_)) => {
+            (_, ValueView::Bool(_)) => {
                 let bn = self.to_number(b)?;
                 self.loose_equals(a, &Value::Num(bn))?
             }
-            (Value::Obj(_), Value::Num(_) | Value::Str(_) | Value::Sym(_)) => {
+            (ValueView::Obj(_), ValueView::Num(_) | ValueView::Str(_) | ValueView::Sym(_)) => {
                 let ap = self.to_primitive(a, Hint::Default)?;
                 self.loose_equals(&ap, b)?
             }
-            (Value::Num(_) | Value::Str(_) | Value::Sym(_), Value::Obj(_)) => {
+            (ValueView::Num(_) | ValueView::Str(_) | ValueView::Sym(_), ValueView::Obj(_)) => {
                 let bp = self.to_primitive(b, Hint::Default)?;
                 self.loose_equals(a, &bp)?
             }
@@ -9702,7 +9751,7 @@ fn dec_add_initializer(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
 
 /// The resolver pair's shared [[AlreadyResolved]] cell (`args[0]`): true (and mark) on first use.
 fn promise_mark_already(flag: &Value) -> bool {
-    if let Value::Obj(o) = flag {
+    if let ValueView::Obj(o) = &(flag).view() {
         let used = o.borrow().internal_slots().contains("#\u{0}called");
         if used {
             return false;
@@ -10064,7 +10113,9 @@ impl Interp {
         base: &Value,
         key: &mut RefKey,
     ) -> Result<crate::value::PropertyKey, Abrupt> {
-        if matches!(key, RefKey::Raw(_)) && matches!(base, Value::Null | Value::Undefined) {
+        if matches!(key, RefKey::Raw(_))
+            && matches!(&(base).view(), ValueView::Null | ValueView::Undefined)
+        {
             return Err(self.throw("TypeError", "cannot access property of null or undefined"));
         }
         self.coerce_ref_key(key)
@@ -10075,10 +10126,11 @@ impl Interp {
         match r {
             Reference::Var(reference) => self.read_prepared_reference(reference),
             Reference::Prop(base, key) => {
-                if let (Value::Obj(o), RefKey::Raw(Value::Num(n))) = (&*base, &*key) {
-                    let (o, n) = (o.clone(), *n);
-                    if let Some(v) = self.fast_get_elem(&o, n) {
-                        return Ok(v);
+                if let RefKey::Raw(raw) = &*key {
+                    if let (ValueView::Obj(o), ValueView::Num(n)) = (base.view(), raw.view()) {
+                        if let Some(v) = self.fast_get_elem(&o, n) {
+                            return Ok(v);
+                        }
                     }
                 }
                 let k = self.ref_prop_key(&base.clone(), key)?;
@@ -10094,7 +10146,7 @@ impl Interp {
             } => {
                 // PutValue/GetValue step: ToObject(V.[[Base]]) — a null/undefined super base
                 // (a null home-object prototype) throws a TypeError.
-                if matches!(proto, Value::Null | Value::Undefined) {
+                if matches!((proto).view(), ValueView::Null | ValueView::Undefined) {
                     return Err(self.throw("TypeError", "cannot read property of null super base"));
                 }
                 let k = self.coerce_ref_key(key)?;
@@ -10111,11 +10163,12 @@ impl Interp {
             Reference::Var(reference) => self.write_prepared_reference(reference, value),
             Reference::Prop(base, key) => {
                 let mut value = value;
-                if let (Value::Obj(o), RefKey::Raw(Value::Num(n))) = (&*base, &*key) {
-                    let (o, n) = (o.clone(), *n);
-                    match self.fast_set_elem(&o, n, value) {
-                        Ok(()) => return Ok(()),
-                        Err(v) => value = v,
+                if let RefKey::Raw(raw) = &*key {
+                    if let (ValueView::Obj(o), ValueView::Num(n)) = (base.view(), raw.view()) {
+                        match self.fast_set_elem(&o, n, value) {
+                            Ok(()) => return Ok(()),
+                            Err(v) => value = v,
+                        }
                     }
                 }
                 let k = self.ref_prop_key(&base.clone(), key)?;
@@ -10129,7 +10182,7 @@ impl Interp {
                 receiver,
                 key,
             } => {
-                if matches!(proto, Value::Null | Value::Undefined) {
+                if matches!((proto).view(), ValueView::Null | ValueView::Undefined) {
                     return Err(self.throw("TypeError", "cannot set property on null super base"));
                 }
                 let k = self.coerce_ref_key(key)?;

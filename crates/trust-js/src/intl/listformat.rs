@@ -9,6 +9,7 @@ use super::{
     make_service,
 };
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Value};
 
 pub(crate) fn install(it: &mut Interp, ns: &crate::value::Gc) {
@@ -63,7 +64,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
 
 /// StringListFromIterable: iterate the argument, requiring every element to be a String.
 fn string_list(i: &mut Interp, list: &Value) -> Result<Vec<String>, Value> {
-    if matches!(list, Value::Undefined) {
+    if matches!(&(list).view(), ValueView::Undefined) {
         return Ok(Vec::new());
     }
     // Iterate LAZILY so a non-string element throws immediately (stopping the iteration), rather than
@@ -73,9 +74,9 @@ fn string_list(i: &mut Interp, list: &Value) -> Result<Vec<String>, Value> {
     // The formatted list contains every element, so their total bounds its length.
     let mut total = 0usize;
     loop {
-        match ab(i.iterator_step(&iter, &next))? {
+        match ab(i.iterator_step(&iter, &next))?.map(|value| value.view()) {
             None => break,
-            Some(Value::Str(s)) => {
+            Some(ValueView::Str(s)) => {
                 total = total.saturating_add(s.len());
                 if let Err(err) = crate::builtins::check_string_length(i, total) {
                     i.iterator_close(&iter);
@@ -185,8 +186,10 @@ fn assemble_segments(parts: &[String], patterns: [&'static str; 4], lang: &str) 
 
 fn format(i: &mut Interp, this: &Value, list: &Value, to_parts: bool) -> Result<Value, Value> {
     let o = brand_slot(i, this, "#\u{0}lf")?;
-    let get = |k: &str| match o.borrow().internal_slots().get(k).map(|p| p.value()) {
-        Some(Value::Str(s)) => s.to_string(),
+    let get = |k: &str| match (o.borrow().internal_slots().get(k).map(|p| p.value()))
+        .map(|__value| (__value).view())
+    {
+        Some(ValueView::Str(s)) => s.to_string(),
         _ => String::new(),
     };
     let (locale, kind, style) = (

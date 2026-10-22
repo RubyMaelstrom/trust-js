@@ -15,7 +15,10 @@ use crate::bytecode::Tier;
 use crate::gc_core::CollectionKind;
 use crate::gc_test::{alive, HiddenAddress};
 use crate::interpreter::gc_collect::ClientReport;
-use crate::interpreter::{new_scope, Env, Interp, WeakEnv, WeakKey};
+#[cfg(debug_assertions)]
+use crate::interpreter::WeakKey;
+use crate::interpreter::{new_scope, Env, Interp, WeakEnv};
+use crate::value::ValueView;
 use crate::value::{Gc, Property, Value, WeakGc};
 use crate::{Completion, Engine};
 
@@ -39,8 +42,8 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 /// The global object named `name`.
 fn global_object(engine: &mut Engine, name: &str) -> Gc {
     let env = engine.interp.global_env.clone();
-    match engine.interp.get_var(name, &env) {
-        Ok(Value::Obj(object)) => object,
+    match (engine.interp.get_var(name, &env)).map(|__value| (__value).view()) {
+        Ok(ValueView::Obj(object)) => object,
         _ => panic!("{name}: not an object"),
     }
 }

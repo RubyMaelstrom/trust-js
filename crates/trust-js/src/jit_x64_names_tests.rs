@@ -3,6 +3,7 @@
 use super::*;
 use crate::interpreter::{new_binding_layout_id, new_scope, Binding, Env};
 use crate::value::Value;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 use std::rc::Rc;
 
@@ -37,8 +38,8 @@ fn run(engine: &mut Engine, chunk: &Rc<Chunk>, code: &JitCode, env: &Env) -> Val
 }
 
 fn number(value: Value) -> f64 {
-    match value {
-        Value::Num(number) => number,
+    match (value).view() {
+        ValueView::Num(number) => number,
         _ => panic!("expected Number"),
     }
 }
@@ -437,7 +438,7 @@ fn native_name_overwrites_do_not_read_displaced_bigints_or_deferred_words() {
             // Install a property-only word directly to prove that a numeric PutValue never
             // observes/materializes the value it displaces. Ordinary reads still guard it.
             let mut property = global.borrow().props.get("outer").unwrap().clone();
-            property.defer_function_prototype(owner, engine.interp.object_proto, &template);
+            property.defer_function_prototype(&owner, engine.interp.object_proto, &template);
             // Reinsert the same descriptor class: a mutable descriptor escape would demote
             // the shape and test a semantic IC miss rather than the displaced-word guard.
             global.borrow_mut().props.insert("outer", property);
@@ -501,6 +502,6 @@ fn native_name_bigint_stores_decode_the_word_and_record_an_old_holders_card() {
     engine.interp.gc_collect();
     assert!(crate::gc_test::alive(&weak));
     assert!(
-        matches!(&holder.borrow().vars.get("outer").unwrap().value, Value::BigInt(value) if value.to_string_radix(10) == "123456789")
+        matches!(&(holder.borrow().vars.get("outer").unwrap().value).view(), ValueView::BigInt(value) if value.to_string_radix(10) == "123456789")
     );
 }

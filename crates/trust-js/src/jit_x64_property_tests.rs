@@ -2,6 +2,7 @@
 //! accessors and exotic receivers retain their observable [[Get]] algorithm.
 use super::*;
 use crate::value::Value;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Engine};
 use std::rc::Rc;
 
@@ -63,8 +64,8 @@ fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
             .set_member_key(&receiver, "value", Value::Num(1.0))
             .unwrap_or_else(|_| panic!("fixture operation throws"));
         assert!(matches!(
-            run(&mut engine, &chunk, &code, &receiver, this),
-            Value::Num(1.0)
+            (run(&mut engine, &chunk, &code, &receiver, this)).view(),
+            crate::value::ValueView::Num(1.0)
         ));
         let values = eval(&mut engine,
             "[undefined,null,false,true,0,-0,NaN,Infinity,'owned string',Symbol('owned'),{identity:42},12345678901234567890n]");
@@ -115,7 +116,7 @@ fn own_data_reads_find_fields_in_place_and_spilled() {
             let before = reads(usize::from(this));
             let result = run(&mut engine, &chunk, &code, &receiver, this);
             assert!(
-                matches!(result, Value::Num(n) if n == count as f64),
+                matches!((result).view(), ValueView::Num(n) if n == count as f64),
                 "{count} fields (this: {this})"
             );
             assert_eq!(
@@ -201,7 +202,10 @@ fn descriptor_exotic_shape_and_value_changes_preserve_get_effects_across_tiers()
         engine.set_tier_threshold(0);
         let before = reads(0) + reads(1);
         assert!(
-            matches!(eval(&mut engine, source), Value::Bool(true)),
+            matches!(
+                (eval(&mut engine, source)).view(),
+                crate::value::ValueView::Bool(true)
+            ),
             "{tier:?}"
         );
         if tier == Tier::Jit {

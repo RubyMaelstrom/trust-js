@@ -2,6 +2,7 @@
 //! be restored before any engine work resumes, including builtin continuations and unwinding.
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::value::{Gc, NativeCaptures, Property, Value};
 use crate::{Completion, Engine};
 use std::cell::{Cell, RefCell};
@@ -65,11 +66,11 @@ fn native_reentry_restores_the_allocation_heap_on_success_and_throw_all_tiers() 
                 "42"
             );
             let env = outer.interp.global_env.clone();
-            let Value::Obj(kept) = outer
+            let ValueView::Obj(kept) = (outer
                 .interp
                 .get_var("kept", &env)
-                .unwrap_or_else(|_| panic!("kept read"))
-            else {
+                .unwrap_or_else(|_| panic!("kept read")))
+            .view() else {
                 panic!("object")
             };
             assert!(owns(&outer, &kept), "{tier:?}, native error={fail}");
@@ -279,11 +280,11 @@ fn bare_native_reentry_restores_the_heap_on_committed_calls_and_interruption() {
             "42"
         );
         let env = outer.interp.global_env.clone();
-        let Value::Obj(kept) = outer
+        let ValueView::Obj(kept) = (outer
             .interp
             .get_var("kept", &env)
-            .unwrap_or_else(|_| panic!("kept read"))
-        else {
+            .unwrap_or_else(|_| panic!("kept read")))
+        .view() else {
             panic!("object")
         };
         assert!(owns(&outer, &kept));

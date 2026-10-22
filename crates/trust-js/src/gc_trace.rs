@@ -83,6 +83,12 @@ impl GcTrace for Env {
     }
 }
 
+impl<T: Copy + GcTrace> GcTrace for std::cell::Cell<T> {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        self.get().trace_gc(sink);
+    }
+}
+
 impl GcTrace for PackedValue {
     #[inline]
     fn trace_gc(&self, sink: &mut dyn GcSink) {
@@ -226,7 +232,7 @@ impl GcTrace for crate::interpreter::Binding {
 pub(crate) struct VmFrameRoots {
     pub(crate) env: *const Env,
     pub(crate) cap_env: *const Env,
-    pub(crate) slots: *const [PackedValue],
+    pub(crate) slots: *const [std::cell::Cell<PackedValue>],
     pub(crate) stack: *const crate::execution_storage::ValueStack<PackedValue>,
     pub(crate) references: *const [crate::eval::PreparedReferenceSlot],
     pub(crate) this_val: *const Value,

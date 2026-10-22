@@ -6,6 +6,7 @@
 //! holder's card instead.
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::value::{Gc, Property, Value};
 use crate::{Completion, Engine};
 
@@ -33,8 +34,8 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 /// The global object named `name`.
 fn global_object(engine: &mut Engine, name: &str) -> Gc {
     let env = engine.interp.global_env.clone();
-    match engine.interp.get_var(name, &env) {
-        Ok(Value::Obj(object)) => object,
+    match (engine.interp.get_var(name, &env)).map(|__value| (__value).view()) {
+        Ok(ValueView::Obj(object)) => object,
         _ => panic!("{name}: not an object"),
     }
 }
@@ -74,7 +75,7 @@ fn handle_borrows_record_the_write_in_their_cells_cards() {
         for (object, target) in objects.iter().zip(&young) {
             let value = object.borrow().props.get("a").map(Property::value);
             assert!(
-                matches!(value, Some(Value::Obj(found)) if Gc::ptr_eq(&found, target)),
+                matches!((value).map(|__value| (__value).view()), Some(ValueView::Obj(found)) if Gc::ptr_eq(&found, target)),
                 "round {round}"
             );
         }
@@ -102,7 +103,7 @@ fn captured_binding_store_records_its_environment() {
     assert_eq!(eval(&mut engine, source), "7");
 }
 
-/// `PackedValue::unpack` promotes a function's deferred prototype word to the materialized
+/// `PropWord::unpack` promotes a function's deferred prototype word to the materialized
 /// prototype's under a shared borrow of the function, and the deferred prototype's cell records
 /// the prototype: the first read of an old function's `prototype`, at every tier.
 #[test]
@@ -133,7 +134,10 @@ fn deferred_prototype_materialization_records_its_cell() {
     let is_object = crate::gc_test::in_frame(|| {
         let function = global_object(&mut engine, "F");
         let moved = function.borrow_mut().props.take_value("prototype");
-        matches!(moved, Some(Value::Obj(_)))
+        matches!(
+            (moved).map(|__value| (__value).view()),
+            Some(ValueView::Obj(_))
+        )
     });
     assert!(is_object);
     assert_eq!(crate::value::prototypes_materialized() - materialized, 1);

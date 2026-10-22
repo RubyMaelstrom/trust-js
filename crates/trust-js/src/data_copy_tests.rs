@@ -3,6 +3,7 @@
 //! checks, ordered effects, independent owners, and ArraySpeciesCreate's observable targets.
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::value::{Property, Props, Value};
 use crate::{Completion, Engine};
 
@@ -150,11 +151,13 @@ fn named_copy_shares_only_keys_and_normalizes_flags() {
     assert!(property.writable() && property.enumerable() && property.configurable());
     target.insert("a", Property::plain(Value::lstr("changed")));
     target.insert("tail", Property::plain(Value::Num(7.0)));
-    assert!(matches!(source.get("a").unwrap().value(),Value::Str(s) if &*s == "owned"));
+    assert!(
+        matches!((source.get("a").unwrap().value()).view(),ValueView::Str(s) if &*s == "owned")
+    );
     assert!(!source.contains("tail"));
     assert!(matches!(
-        target.length_property().unwrap().value(),
-        Value::Num(3.0)
+        (target.length_property().unwrap().value()).view(),
+        ValueView::Num(3.0)
     ));
 }
 
@@ -168,7 +171,7 @@ fn named_copy_rebuilds_wide_lookup_and_keeps_indexed_sources_checked() {
     assert!(target.try_copy_named_data_from(&source));
     for n in 0..80 {
         assert!(
-            matches!(target.get(&format!("field{n}")).unwrap().value(),Value::Num(value) if value==n as f64)
+            matches!((target.get(&format!("field{n}")).unwrap().value()).view(),ValueView::Num(value) if value==n as f64)
         );
     }
     assert_eq!(source.shape(), target.shape());

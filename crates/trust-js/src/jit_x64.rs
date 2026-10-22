@@ -1389,7 +1389,8 @@ mod encoding_tests {
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
-    use crate::{bytecode::Tier, value::Callable, value::Value, Completion, Engine};
+    use crate::value::ValueView;
+    use crate::{bytecode::Tier, value::Callable, Completion, Engine};
 
     fn engine() -> Engine {
         let mut engine = Engine::new();
@@ -1407,11 +1408,11 @@ mod tests {
 
     fn assert_native_code(engine: &mut Engine, name: &str, expected: bool) {
         let env = engine.interp.global_env.clone();
-        let Value::Obj(object) = engine
+        let ValueView::Obj(object) = (engine
             .interp
             .get_var(name, &env)
-            .unwrap_or_else(|_| panic!("missing {name}"))
-        else {
+            .unwrap_or_else(|_| panic!("missing {name}")))
+        .view() else {
             panic!("{name} is not an object");
         };
         let object = object.borrow();

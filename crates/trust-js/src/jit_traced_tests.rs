@@ -40,7 +40,8 @@ pub(super) fn with_chunk<R>(
 ) -> R {
     let env = engine.interp.global_env.clone();
     let value = engine.interp.get_var(name, &env).ok().expect("bound name");
-    let object = value.as_obj().expect("a function object").borrow();
+    let object_handle = value.as_obj().expect("a function object");
+    let object = object_handle.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
@@ -103,7 +104,7 @@ fn admission_collects() {
         eval(&mut jit, "var victim = {v: 1}; 0;");
         let env = jit.interp.global_env.clone();
         let victim = jit.interp.get_var("victim", &env).ok().expect("victim");
-        crate::value::Gc::downgrade(victim.as_obj().expect("an object"))
+        crate::value::Gc::downgrade(&victim.as_obj().expect("an object"))
     });
     let stats = |engine: &Engine| engine.interp.gc_heap.core.borrow().stats();
     let before = stats(&jit);

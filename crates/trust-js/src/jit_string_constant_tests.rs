@@ -19,6 +19,7 @@
 use crate::bytecode::{Chunk, Op, Tier};
 use crate::lstr::LStr;
 use crate::value::Value;
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 /// A fresh engine at `tier` that compiles every function at its first call.
@@ -45,7 +46,8 @@ fn global(engine: &mut Engine, name: &str) -> Value {
 /// stage, the body recompiled with hot callees inlined.
 fn with_chunk<R>(engine: &mut Engine, name: &str, spliced: bool, f: impl FnOnce(&Chunk) -> R) -> R {
     let value = global(engine, name);
-    let object = value.as_obj().expect("a function object").borrow();
+    let object_handle = value.as_obj().expect("a function object");
+    let object = object_handle.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
@@ -64,7 +66,8 @@ fn with_chunk<R>(engine: &mut Engine, name: &str, spliced: bool, f: impl FnOnce(
 /// Whether the global function `name` has its second-stage chunk.
 fn second_stage(engine: &mut Engine, name: &str) -> bool {
     let value = global(engine, name);
-    let object = value.as_obj().expect("a function object").borrow();
+    let object_handle = value.as_obj().expect("a function object");
+    let object = object_handle.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
@@ -110,8 +113,8 @@ fn constants(chunk: &Chunk) -> Vec<LStr> {
         .filter_map(|op| match *op {
             Op::Const(k) if chunk.jit_const_is_str(k) => {
                 // SAFETY: the slot lives as long as the chunk, which the caller lends.
-                match unsafe { &*chunk.jit_const_ptr(k) } {
-                    Value::Str(string) => Some(string.clone()),
+                match &(unsafe { &*chunk.jit_const_ptr(k) }).view() {
+                    ValueView::Str(string) => Some(string.clone()),
                     _ => unreachable!("a string constant"),
                 }
             }
@@ -164,7 +167,7 @@ fn returned(
     eval(engine, &format!("var returned = {call};"));
     let value = global(engine, "returned");
     eval(engine, "returned = undefined;");
-    let Value::Str(string) = &value else {
+    let ValueView::Str(string) = &(value).view() else {
         panic!("{call} returned no string")
     };
     assert_eq!(string.as_str(), text, "{tier:?} {call}");
@@ -339,7 +342,7 @@ fn grown_apart(engine: &mut Engine, tier: Tier, name: &str, n: usize) {
     eval(engine, &format!("var returned = {name}({n});"));
     let value = global(engine, "returned");
     eval(engine, "returned = undefined;");
-    let Value::Str(grown) = &value else {
+    let ValueView::Str(grown) = &(value).view() else {
         panic!("{name}({n}) returned no string")
     };
     assert_eq!(grown.as_str(), "abc".to_owned() + &"d".repeat(n));
@@ -422,7 +425,7 @@ fn inlined_string_constants_belong_to_the_caller() {
                 };
                 std::rc::Rc::downgrade(&user.func)
             };
-            (crate::value::Gc::downgrade(object), function)
+            (crate::value::Gc::downgrade(&object), function)
         });
         eval(
             &mut engine,

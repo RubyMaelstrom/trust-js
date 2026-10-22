@@ -39,6 +39,7 @@
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::rc::Rc;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{
     CountedHandle, Ctx, Handle, HostGc, HostGcVisitor, HostTrace, NativeCallableRetained,
@@ -274,9 +275,15 @@ impl NapiConstructorClosure {
         args: &[Value<'s>],
         prototype: &Value<'s>,
     ) -> Result<Value<'s>, Value<'s>> {
-        let instance = match this {
-            Value::Undefined => interp.new_object_with_proto(prototype),
-            other => other,
+        let instance = {
+            let __value_match_original = this;
+            match (__value_match_original).kind() {
+                ValueKind::Undefined => interp.new_object_with_proto(prototype),
+                _ => {
+                    let other = __value_match_original;
+                    other
+                }
+            }
         };
         invoke_napi_callback(interp, self.callback, self.data, instance, args)?;
         Ok(instance)
@@ -717,7 +724,7 @@ pub unsafe extern "C" fn napi_typeof(
 ) -> napi_status {
     let env = &*env;
     let v = env.value(value);
-    let t = if matches!(v, Value::Null) {
+    let t = if matches!((v).kind(), ValueKind::Null) {
         NAPI_NULL
     } else {
         match v.type_of() {
@@ -790,8 +797,8 @@ pub unsafe extern "C" fn napi_get_value_bool(
     result: *mut bool,
 ) -> napi_status {
     let env = &*env;
-    match env.value(value) {
-        Value::Bool(b) => {
+    match (env.value(value)).kind() {
+        ValueKind::Bool(b) => {
             *result = b;
             NAPI_OK
         }
@@ -915,7 +922,7 @@ pub unsafe extern "C" fn napi_has_named_property(
     let name = read_utf8(utf8name, NAPI_AUTO_LENGTH);
     match env.interp().member_get(&obj, &name) {
         Ok(v) => {
-            *result = !matches!(v, Value::Undefined);
+            *result = !matches!((v).kind(), ValueKind::Undefined);
             NAPI_OK
         }
         Err(e) => {
@@ -1240,7 +1247,7 @@ pub unsafe extern "C" fn napi_get_prototype(
     let env = &mut *env;
     let value = env.value(object);
     // Node's CHECK_TO_OBJECT: ToObject, so null and undefined are not objects.
-    if matches!(value, Value::Undefined | Value::Null) {
+    if matches!((value).kind(), ValueKind::Undefined | ValueKind::Null) {
         return NAPI_OBJECT_EXPECTED;
     }
     // [[GetPrototypeOf]] (ECMA-262 #sec-object.getprototypeof), which runs a Proxy's
@@ -1915,6 +1922,7 @@ pub fn keep_napi_exports() {
 mod tests {
     use super::*;
     use std::ffi::CString;
+    use trust_js_host::ValueKind;
 
     use trust_js_host::RetainedManagedAllocation;
 
@@ -2359,10 +2367,10 @@ mod tests {
                 unsafe { napi_get_prototype(&mut env, handle, &mut result) },
                 NAPI_OK
             );
-            let Value::Obj(prototype) = (unsafe { env.value(result) }) else {
+            let ValueKind::Obj(prototype) = (unsafe { env.value(result) }).kind() else {
                 panic!("an object prototype")
             };
-            let Value::Obj(expected) = &reported else {
+            let ValueKind::Obj(expected) = &(reported).kind() else {
                 panic!("an object")
             };
             assert!(prototype == *expected);
@@ -2397,7 +2405,7 @@ mod tests {
         let Ok(callback_result) = callback.call(interp, Value::Undefined, &[]) else {
             panic!("empty N-API callback should not throw")
         };
-        assert!(matches!(callback_result, Value::Undefined));
+        assert!(matches!((callback_result).kind(), ValueKind::Undefined));
         let mut visit = RetainedVisit::default();
         callback.scan_retained_memory(&mut visit);
         assert!(visit.allocations.is_empty());

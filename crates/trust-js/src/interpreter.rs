@@ -7,6 +7,7 @@
 use crate::ast::*;
 use crate::builtins::TaAccessor;
 use crate::execution_storage::StoredValue;
+use crate::value::ValueView;
 use crate::value::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -242,22 +243,22 @@ impl BoundCallTrace {
 // Native descriptors only: diagnostics must not call an author's getter, Proxy
 // trap or conversion method, or keep a returned object alive after its call.
 fn bound_trace_preview(value: &Value, depth: usize) -> String {
-    match value {
-        Value::Str(text) => format!(
+    match &(value).view() {
+        ValueView::Str(text) => format!(
             "string(bytes={},prefix={:?})",
             text.len(),
             text.chars().take(48).collect::<String>()
         ),
-        Value::Num(number) => format!("{number}"),
-        Value::Bool(boolean) => format!("{boolean}"),
-        Value::Obj(object) => {
+        ValueView::Num(number) => format!("{number}"),
+        ValueView::Bool(boolean) => format!("{boolean}"),
+        ValueView::Obj(object) => {
             let id = Gc::as_ptr(object) as usize;
             let Ok(object) = object.try_borrow() else {
                 return format!("object@{id:x}(borrowed)");
             };
             let name = match object.props.get("name") {
-                Some(property) if !property.accessor() => match property.value() {
-                    Value::Str(name) => name.chars().take(48).collect::<String>(),
+                Some(property) if !property.accessor() => match (property.value()).view() {
+                    ValueView::Str(name) => name.chars().take(48).collect::<String>(),
                     _ => String::new(),
                 },
                 _ => String::new(),
@@ -340,7 +341,7 @@ fn trace_bound_call_exit(id: u64, result: &Result<Value, Abrupt>) {
 }
 
 fn bound_trace_arrays(value: &Value) -> Vec<(usize, String, Vec<String>)> {
-    let Value::Obj(owner) = value else {
+    let ValueView::Obj(owner) = &(value).view() else {
         return Vec::new();
     };
     let Ok(owner) = owner.try_borrow() else {
@@ -351,7 +352,7 @@ fn bound_trace_arrays(value: &Value) -> Vec<(usize, String, Vec<String>)> {
         if property.accessor() {
             continue;
         }
-        let Value::Obj(array) = property.value() else {
+        let ValueView::Obj(array) = (property.value()).view() else {
             continue;
         };
         let id = Gc::as_ptr(&array) as usize;
@@ -364,7 +365,7 @@ fn bound_trace_arrays(value: &Value) -> Vec<(usize, String, Vec<String>)> {
         let Some(length) = array.props.get("length").filter(|p| !p.accessor()) else {
             continue;
         };
-        let Value::Num(length) = length.value() else {
+        let ValueView::Num(length) = (length.value()).view() else {
             continue;
         };
         if !(16.0..=512.0).contains(&length) {
@@ -779,9 +780,9 @@ pub(crate) enum WeakKey {
 
 impl WeakKey {
     pub(crate) fn of(value: &Value) -> Option<Self> {
-        match value {
-            Value::Obj(object) => Some(Self::Object(Gc::as_ptr(object) as usize)),
-            Value::Sym(symbol) => Some(Self::Symbol(symbol.id)),
+        match &(value).view() {
+            ValueView::Obj(object) => Some(Self::Object(Gc::as_ptr(object) as usize)),
+            ValueView::Sym(symbol) => Some(Self::Symbol(symbol.id)),
             _ => None,
         }
     }
@@ -798,9 +799,9 @@ pub(crate) enum WeakTarget {
 
 impl WeakTarget {
     pub(crate) fn of(value: &Value) -> Option<Self> {
-        match value {
-            Value::Obj(object) => Some(Self::Object(Gc::downgrade(object))),
-            Value::Sym(symbol) => Some(Self::Symbol(
+        match &(value).view() {
+            ValueView::Obj(object) => Some(Self::Object(Gc::downgrade(object))),
+            ValueView::Sym(symbol) => Some(Self::Symbol(
                 crate::value::symbol_downgrade(symbol),
                 symbol.id,
             )),
@@ -1307,7 +1308,7 @@ fn trace_legacy_reflection(key: &str, frame: Option<&FnFrame>) {
     let state = match (key, frame) {
         ("arguments", None) => 0,
         ("arguments", Some(frame)) => match frame.extra.as_deref() {
-            Some(extra) if !matches!(extra.args_obj, Value::Null) => 1,
+            Some(extra) if !matches!((extra.args_obj).view(), ValueView::Null) => 1,
             Some(extra) if extra.lazy.is_some() => 2,
             _ => 3,
         },
@@ -2066,6 +2067,7 @@ pub(crate) struct JitBindingStorage {
 #[cfg(test)]
 mod binding_layout_tests {
     use super::*;
+    use crate::value::ValueView;
 
     #[test]
     fn cold_import_cells_trace_exporters_and_keep_cached_reads_live() {
@@ -2153,7 +2155,7 @@ mod binding_layout_tests {
             let slot = first.binding_slot(&name).unwrap();
             assert_eq!(second.binding_slot(&name), Some(slot));
             assert!(
-                matches!(second.fixed_binding_at(slot).unwrap().value, Value::Num(v) if v == (100+n) as f64)
+                matches!((second.fixed_binding_at(slot).unwrap().value).view(), ValueView::Num(v) if v == (100+n) as f64)
             );
         }
         let slot = first.binding_slot("v23").unwrap();
@@ -2165,7 +2167,7 @@ mod binding_layout_tests {
         );
         let binding = first.fixed_binding_at(slot).unwrap();
         assert!(!binding.mutable && !binding.initialized);
-        assert!(matches!(binding.value, Value::Num(999.)));
+        assert!(matches!((binding.value).view(), ValueView::Num(999.)));
         first.insert("dynamic", Binding::data(Value::Num(7.), true, true));
         assert_eq!(first.layout_id(), 0);
         first.share_layout(&cached);
@@ -2194,12 +2196,12 @@ mod binding_layout_tests {
 
     fn closure_env(engine: &mut crate::Engine, name: &str) -> Env {
         let global = engine.interp.global_env.clone();
-        let Value::Obj(object) = engine
+        let ValueView::Obj(object) = (engine
             .interp
             .get_var(name, &global)
             .ok()
-            .expect("closure exists")
-        else {
+            .expect("closure exists"))
+        .view() else {
             panic!("expected function object");
         };
         let result = match &object.borrow().call {
@@ -2600,17 +2602,19 @@ pub(crate) type Completion = Result<Value, Abrupt>;
 
 /// UpdateEmpty: replace an EMPTY statement-completion value with `undefined`.
 pub(crate) fn update_empty(v: Value) -> Value {
-    match v {
-        Value::Empty => Value::Undefined,
-        other => other,
+    match v.view() {
+        ValueView::Empty => Value::Undefined,
+        _ => v,
     }
 }
 
 /// UpdateEmpty for an abrupt completion: fill an empty break/continue value with `v`.
 pub(crate) fn update_abrupt_empty(a: Abrupt, v: Value) -> Abrupt {
     match a {
-        Abrupt::Break(l, Value::Empty) => Abrupt::Break(l, v),
-        Abrupt::Continue(l, Value::Empty) => Abrupt::Continue(l, v),
+        Abrupt::Break(l, old) if matches!(old.view(), ValueView::Empty) => Abrupt::Break(l, v),
+        Abrupt::Continue(l, old) if matches!(old.view(), ValueView::Empty) => {
+            Abrupt::Continue(l, v)
+        }
         other => other,
     }
 }
@@ -2798,21 +2802,36 @@ mod deep_property_ic_tests {
                 .get_prop_ic(&object, "optional", &cache[0])
                 .unwrap_or_else(|_| panic!("ordinary read threw"))
         };
-        assert!(matches!(read(&mut interp), Value::Undefined));
+        assert!(matches!(
+            (read(&mut interp)).view(),
+            crate::value::ValueView::Undefined
+        ));
         assert_eq!(cache[0].get().depth, IC_ABSENT);
         assert_eq!(cache[0].get().slot, 6);
-        assert!(matches!(read(&mut interp), Value::Undefined));
+        assert!(matches!(
+            (read(&mut interp)).view(),
+            crate::value::ValueView::Undefined
+        ));
         base.borrow_mut()
             .props
             .insert("optional", Property::plain(Value::Num(7.0)));
-        assert!(matches!(read(&mut interp), Value::Num(7.0)));
+        assert!(matches!(
+            (read(&mut interp)).view(),
+            crate::value::ValueView::Num(7.0)
+        ));
         assert_eq!(cache[0].get().depth, 5);
-        assert!(matches!(read(&mut interp), Value::Num(7.0)));
+        assert!(matches!(
+            (read(&mut interp)).view(),
+            crate::value::ValueView::Num(7.0)
+        ));
         levels[2]
             .borrow_mut()
             .props
             .insert("optional", Property::plain(Value::Num(11.0)));
-        assert!(matches!(read(&mut interp), Value::Num(11.0)));
+        assert!(matches!(
+            (read(&mut interp)).view(),
+            crate::value::ValueView::Num(11.0)
+        ));
         // Identical layout, different prototype identity/value: the IC must follow it live.
         let replacement = Object::new(None);
         replacement
@@ -2820,7 +2839,10 @@ mod deep_property_ic_tests {
             .props
             .insert("optional", Property::plain(Value::Num(19.0)));
         levels[3].borrow_mut().proto = Some(replacement);
-        assert!(matches!(read(&mut interp), Value::Num(19.0)));
+        assert!(matches!(
+            (read(&mut interp)).view(),
+            crate::value::ValueView::Num(19.0)
+        ));
         assert_eq!(std::mem::size_of::<IcState>(), 32);
         assert_eq!(
             std::mem::offset_of!(IcState, mid3_shape),
@@ -2888,6 +2910,7 @@ mod constructor_transfer_tests;
 #[cfg(test)]
 mod computed_key_cache_tests {
     use super::*;
+    use crate::value::ValueView;
 
     /// The stub cache keys computed resolutions by their name text, not the key's address: a key
     /// allocation reused for another name misses. Only the text and validated layout metadata
@@ -2912,7 +2935,10 @@ mod computed_key_cache_tests {
         let mut key = String::from("alpha");
         let address = key.as_ptr();
         let read = i.get_prop_keyed(&base, &key, &cells[0]);
-        assert!(matches!(read, Ok(Value::Num(7.0))));
+        assert!(matches!(
+            (read).map(|__value| (__value).view()),
+            Ok(ValueView::Num(7.0))
+        ));
         assert!(
             i.stub_cache_get(shape, &key).is_some(),
             "computed reads must populate the owned-text stub cache"
@@ -2927,12 +2953,15 @@ mod computed_key_cache_tests {
             cell.set(crate::bytecode::IcState::EMPTY);
         }
         let read = i.get_prop_keyed(&base, &key, &cells[0]);
-        assert!(matches!(read, Ok(Value::Num(9.0))));
+        assert!(matches!(
+            (read).map(|__value| (__value).view()),
+            Ok(ValueView::Num(9.0))
+        ));
         assert!(i.stub_cache_get(shape, &key).is_some());
         let computed_key = crate::lstr::LStr::from("alpha");
         assert!(matches!(
-            i.get_computed_property(&base, &computed_key),
-            Ok(Value::Num(7.0))
+            (i.get_computed_property(&base, &computed_key)).map(|__value| (__value).view()),
+            Ok(ValueView::Num(7.0))
         ));
 
         let long_key = "k".repeat(COMPUTED_STUB_KEY_MAX_BYTES + 1);
@@ -2944,7 +2973,10 @@ mod computed_key_cache_tests {
             cell.set(crate::bytecode::IcState::EMPTY);
         }
         let read = i.get_prop_keyed(&base, &long_key, &cells[0]);
-        assert!(matches!(read, Ok(Value::Num(11.0))));
+        assert!(matches!(
+            (read).map(|__value| (__value).view()),
+            Ok(ValueView::Num(11.0))
+        ));
         assert!(
             i.stub_cache_get(object.borrow().props.shape(), &long_key)
                 .is_none(),
@@ -4991,8 +5023,8 @@ impl Interp {
         realm_global: &Value,
         body: impl FnOnce(&mut Self) -> Result<Value, Abrupt>,
     ) -> Result<Value, Abrupt> {
-        let ptr = match realm_global {
-            Value::Obj(o) => Gc::as_ptr(o) as usize,
+        let ptr = match &(realm_global).view() {
+            ValueView::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return Err(self.throw("TypeError", "not a realm global")),
         };
         let mut saved = match self.realms.get(&ptr) {
@@ -5043,8 +5075,8 @@ impl Interp {
         &mut self,
         realm_global: &Value,
     ) -> Result<(usize, RealmState), Value> {
-        let key = match realm_global {
-            Value::Obj(global) => Gc::as_ptr(global) as usize,
+        let key = match &(realm_global).view() {
+            ValueView::Obj(global) => Gc::as_ptr(global) as usize,
             _ => return Err(self.make_error("TypeError", "not a realm global")),
         };
         let mut saved = match self.realms.get(&key) {
@@ -5088,7 +5120,7 @@ impl Interp {
 
     /// The promise state of `value`, when it is a promise.
     fn promise_state_mut(&mut self, value: &Value) -> Option<&mut PromiseState> {
-        let Value::Obj(object) = value else {
+        let ValueView::Obj(object) = &(value).view() else {
             return None;
         };
         self.promises
@@ -5110,7 +5142,7 @@ impl Interp {
         };
         state.handled = true;
         state.outstanding = None;
-        if let Value::Obj(object) = promise {
+        if let ValueView::Obj(object) = &(promise).view() {
             self.unhandled_rejections
                 .remove(&(Gc::as_ptr(object) as usize));
         }
@@ -5196,7 +5228,7 @@ impl Interp {
 /// The Realm key of an ECMAScript function or bound function's target (None for built-ins
 /// and other callables, whose Realm is not recorded on the object).
 fn function_realm_key(callback: &Value) -> Option<usize> {
-    let Value::Obj(function) = callback else {
+    let ValueView::Obj(function) = &(callback).view() else {
         return None;
     };
     let function = function.borrow();
@@ -6002,7 +6034,7 @@ impl Interp {
             return symbol;
         }
         let key: Rc<str> = Rc::from(key);
-        let Value::Sym(symbol) = self.new_symbol(Some(key.clone())) else {
+        let ValueView::Sym(symbol) = (self.new_symbol(Some(key.clone()))).view() else {
             unreachable!("new_symbol must return a symbol")
         };
         let mut agent = self.symbol_agent.borrow_mut();
@@ -6034,8 +6066,8 @@ impl Interp {
         let symbol = match existing {
             Some(symbol) => symbol,
             None => {
-                let Value::Sym(symbol) =
-                    self.new_symbol(Some(Rc::from(format!("Symbol.{name}").as_str())))
+                let ValueView::Sym(symbol) =
+                    (self.new_symbol(Some(Rc::from(format!("Symbol.{name}").as_str())))).view()
                 else {
                     unreachable!("new_symbol must return a symbol")
                 };
@@ -6073,8 +6105,8 @@ impl Interp {
         base: &Value,
     ) -> crate::feedback::ElementReceiverKind {
         use crate::feedback::ElementReceiverKind;
-        match base {
-            Value::Obj(object) => {
+        match &(base).view() {
+            ValueView::Obj(object) => {
                 let ptr = Gc::as_ptr(object) as usize;
                 if self.typed_arrays.contains_key(&ptr) {
                     return ElementReceiverKind::TypedArray;
@@ -6096,11 +6128,13 @@ impl Interp {
                     _ => ElementReceiverKind::Exotic,
                 }
             }
-            Value::Str(_) => ElementReceiverKind::String,
-            Value::Num(_) | Value::Bool(_) | Value::Sym(_) | Value::BigInt(_) => {
+            ValueView::Str(_) => ElementReceiverKind::String,
+            ValueView::Num(_) | ValueView::Bool(_) | ValueView::Sym(_) | ValueView::BigInt(_) => {
                 ElementReceiverKind::Primitive
             }
-            Value::Undefined | Value::Empty | Value::Null => ElementReceiverKind::Exotic,
+            ValueView::Undefined | ValueView::Empty | ValueView::Null => {
+                ElementReceiverKind::Exotic
+            }
         }
     }
 
@@ -6124,14 +6158,15 @@ impl Interp {
     /// pointer or function address; identity-sensitive caches remain private execution machinery.
     pub(crate) fn call_target_kind(&self, callee: &Value) -> crate::feedback::CallTargetKind {
         use crate::feedback::CallTargetKind;
-        let Value::Obj(object) = callee else {
+        let ValueView::Obj(object) = (callee).view() else {
             return CallTargetKind::NonCallable;
         };
-        let ptr = Gc::as_ptr(object) as usize;
+        let ptr = Gc::as_ptr(&object) as usize;
         if self.proxies.contains_key(&ptr) {
             return CallTargetKind::Proxy;
         }
-        match &object.borrow().call {
+        let body = object.borrow();
+        match &body.call {
             Callable::User(_) => CallTargetKind::UserFunction,
             Callable::Native(_) | Callable::NativeData(_) => CallTargetKind::NativeFunction,
             Callable::Bound(_) => CallTargetKind::BoundFunction,
@@ -6159,7 +6194,7 @@ impl Interp {
             | CallTargetKind::Proxy
             | CallTargetKind::WrappedFunction => CallEnvironmentKind::Dynamic,
             CallTargetKind::UserFunction => {
-                let Value::Obj(object) = callee else {
+                let ValueView::Obj(object) = (callee).view() else {
                     return CallEnvironmentKind::Unknown;
                 };
                 let Callable::User(user) = &object.borrow().call else {
@@ -6248,7 +6283,7 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Value> {
-        let key = if let Value::Obj(ref object) = callee {
+        let key = if let ValueView::Obj(ref object) = (callee).view() {
             self.get_function_realm_global(object)
                 .map_err(abrupt_value)?
         } else {
@@ -6287,7 +6322,7 @@ impl Interp {
         global: &Value,
         operation: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let Value::Obj(global) = global else {
+        let ValueView::Obj(global) = &(global).view() else {
             return operation(self);
         };
         let key = Gc::as_ptr(global) as usize;
@@ -6313,8 +6348,8 @@ impl Interp {
         }
         let (script_caller, active_script) =
             if self.capture_job_script_caller && callback.is_callable() {
-                let script_caller = match self.script_caller_global() {
-                    Value::Obj(global) => Some(global),
+                let script_caller = match (self.script_caller_global()).view() {
+                    ValueView::Obj(global) => Some(global),
                     _ => None,
                 };
                 (script_caller, self.job_active_script(&callback))
@@ -6333,7 +6368,7 @@ impl Interp {
     /// ScriptOrModule, unless the callback is an ECMAScript function with a ScriptOrModule of
     /// its own, whose function context would always be found first.
     fn job_active_script(&self, callback: &Value) -> Option<Rc<crate::stack_trace::ScriptSource>> {
-        if let Value::Obj(function) = callback {
+        if let ValueView::Obj(function) = &(callback).view() {
             if let Callable::User(user) = &function.borrow().call {
                 if !user.func.self_hosted
                     && user
@@ -6358,8 +6393,8 @@ impl Interp {
         fulfilled: bool,
     ) -> JobCallback {
         let (script_caller, active_script) = if self.capture_job_script_caller {
-            let script_caller = match self.script_caller_global() {
-                Value::Obj(global) => Some(global),
+            let script_caller = match (self.script_caller_global()).view() {
+                ValueView::Obj(global) => Some(global),
                 _ => None,
             };
             (script_caller, self.active_script_or_module())
@@ -6387,7 +6422,7 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         let previous_entry = self.host_entry_realm;
         if self.capture_job_script_caller {
-            let key = if let Value::Obj(ref object) = callback.callback {
+            let key = if let ValueView::Obj(ref object) = (callback.callback).view() {
                 self.get_function_realm_global(object)?
             } else {
                 None
@@ -6485,13 +6520,13 @@ impl Interp {
     /// Used by host addons to key per-object native state (`napi_wrap`) and to implement `===`
     /// on objects without exposing the object handle.
     pub fn object_addr(&self, v: &Value) -> Option<usize> {
-        v.as_obj().map(|o| Gc::as_ptr(o) as usize)
+        v.as_obj().map(|o| Gc::as_ptr(&o) as usize)
     }
 
     /// Downgrade an object Value (tests watching it die).
     #[cfg(test)]
     pub(crate) fn downgrade_object_value(&self, v: &Value) -> Option<WeakValue> {
-        v.as_obj().map(|object| WeakValue(Gc::downgrade(object)))
+        v.as_obj().map(|object| WeakValue(Gc::downgrade(&object)))
     }
 
     /// Whether `v` has Proxy exotic behavior. Hosts need this for Node's
@@ -6582,13 +6617,13 @@ impl Interp {
     /// `null` for `null`/`undefined` or an object without a prototype. Use
     /// [`Self::get_prototype_of`] for the full `Object.getPrototypeOf` semantics.
     pub fn prototype_of(&self, v: &Value) -> Value {
-        match v {
-            Value::Obj(o) => o.borrow().proto.clone().map_or(Value::Null, Value::Obj),
-            Value::Str(_) => Value::Obj(self.string_proto.clone()),
-            Value::Num(_) => Value::Obj(self.number_proto.clone()),
-            Value::Bool(_) => Value::Obj(self.boolean_proto.clone()),
-            Value::Sym(_) => Value::Obj(self.symbol_proto.clone()),
-            Value::BigInt(_) => self
+        match &(v).view() {
+            ValueView::Obj(o) => o.borrow().proto.clone().map_or(Value::Null, Value::Obj),
+            ValueView::Str(_) => Value::Obj(self.string_proto.clone()),
+            ValueView::Num(_) => Value::Obj(self.number_proto.clone()),
+            ValueView::Bool(_) => Value::Obj(self.boolean_proto.clone()),
+            ValueView::Sym(_) => Value::Obj(self.symbol_proto.clone()),
+            ValueView::BigInt(_) => self
                 .extra_protos
                 .get("BigInt")
                 .cloned()
@@ -6601,19 +6636,25 @@ impl Interp {
     /// for `null`/`undefined`), then `[[GetPrototypeOf]]`, which runs a Proxy's trap and its
     /// invariant checks. `Err` carries the thrown value.
     pub fn get_prototype_of(&mut self, v: &Value) -> Result<Value, Value> {
-        match v {
-            Value::Obj(_) => crate::builtins::js_get_prototype_of(self, v),
-            Value::Undefined | Value::Empty | Value::Null => {
-                Err(self.make_error("TypeError", "Cannot convert undefined or null to object"))
+        {
+            let __value_match_original = v;
+            match &(__value_match_original).view() {
+                ValueView::Obj(_) => crate::builtins::js_get_prototype_of(self, v),
+                ValueView::Undefined | ValueView::Empty | ValueView::Null => {
+                    Err(self.make_error("TypeError", "Cannot convert undefined or null to object"))
+                }
+                _ => {
+                    let primitive = __value_match_original;
+                    Ok(self.prototype_of(primitive))
+                }
             }
-            primitive => Ok(self.prototype_of(primitive)),
         }
     }
 
     /// Whether `v` is an Error object (has the error exotic on itself or anywhere up its
     /// prototype chain — so subclass instances count too).
     pub fn is_error_value(&self, v: &Value) -> bool {
-        let mut cur = v.as_obj().cloned();
+        let mut cur = v.as_obj();
         while let Some(o) = cur {
             if matches!(o.borrow().exotic, Exotic::Error(_)) {
                 return true;
@@ -6630,13 +6671,14 @@ impl Interp {
     /// value. Only an own string data message and the engine-captured stack are
     /// inspected. Non-Errors (including proxies around Errors) return None.
     pub fn error_diagnostic(&self, value: &Value) -> Option<String> {
-        let object = value.as_obj()?.try_borrow().ok()?;
+        let handle = value.as_obj()?;
+        let object = handle.try_borrow().ok()?;
         let Exotic::Error(trace) = &object.exotic else {
             return None;
         };
         let message = match object.props.get("message") {
-            Some(property) if !property.accessor() => match property.value() {
-                Value::Str(message) => message.chars().take(512).collect::<String>(),
+            Some(property) if !property.accessor() => match (property.value()).view() {
+                ValueView::Str(message) => message.chars().take(512).collect::<String>(),
                 _ => "<non-string message>".to_owned(),
             },
             Some(_) => "<accessor message>".to_owned(),
@@ -6678,7 +6720,7 @@ impl Interp {
             return Err(self.make_error("TypeError", "value is not callable"));
         };
         let key = self
-            .get_function_realm_global(object)
+            .get_function_realm_global(&object)
             .map_err(|error| match error {
                 Abrupt::Throw(value) => value,
                 _ => self.make_error("Error", "unexpected GetFunctionRealm completion"),
@@ -6692,7 +6734,7 @@ impl Interp {
     /// A fresh object with an explicit `[[Prototype]]` (`null` → no prototype). For host addons
     /// creating instances with a class's prototype.
     pub fn new_object_with_proto(&self, proto: &Value) -> Value {
-        Value::Obj(Object::new(proto.as_obj().cloned()))
+        Value::Obj(Object::new(proto.as_obj()))
     }
 
     /// Install a contiguous set of lazy, read-only indexed properties on a host-created object.
@@ -6707,7 +6749,7 @@ impl Interp {
         length: u32,
         getter: Value,
     ) -> Result<(), Value> {
-        let Some(object) = target.as_obj().cloned() else {
+        let Some(object) = target.as_obj() else {
             return Err(self.make_error("TypeError", "indexed-property target must be an object"));
         };
         if !getter.is_callable() {
@@ -6780,7 +6822,7 @@ impl Interp {
         self.host_indexed
             .get_mut(
                 &self.gc_heap,
-                &(Gc::as_ptr(target.as_obj().unwrap()) as usize),
+                &(Gc::as_ptr(&target.as_obj().unwrap()) as usize),
             )
             .unwrap()
             .live = Some(Rc::new(HostIndexedLive {
@@ -6836,7 +6878,7 @@ impl Interp {
         let obj = v.as_obj()?;
         let info = self
             .typed_arrays
-            .get(&(Gc::as_ptr(obj) as usize))
+            .get(&(Gc::as_ptr(&obj) as usize))
             .copied()?;
         let len = self.ta_len(&info)?;
         let (code, elem) = match info.kind {
@@ -6880,7 +6922,9 @@ impl Interp {
         }
         let obj = Object::new(Some(self.array_proto.clone()));
         let len = items.len();
-        let numeric = items.iter().all(|v| matches!(v, Value::Num(_)));
+        let numeric = items
+            .iter()
+            .all(|v| matches!(&(v).view(), ValueView::Num(_)));
         {
             let mut b = obj.borrow_mut();
             b.props.mark_array();
@@ -6938,7 +6982,7 @@ impl Interp {
     /// ECMA-262 OrdinaryGet returns these own data values before consulting prototypes.
     pub fn copy_numeric_array(&self, value: &Value, limit: usize) -> Option<Vec<f64>> {
         let object = value.as_obj()?;
-        if !self.ordinary_get_ptr(Gc::as_ptr(object) as usize) {
+        if !self.ordinary_get_ptr(Gc::as_ptr(&object) as usize) {
             return None;
         }
         let object = object.borrow();
@@ -6998,8 +7042,12 @@ impl Interp {
             return Value::Obj(obj);
         }
         let obj = Object::new(Some(self.array_proto.clone()));
-        let numeric =
-            (0..len).all(|k| matches!(unsafe { (*items.add(k)).unpack() }, Value::Num(_)));
+        let numeric = (0..len).all(|k| {
+            matches!(
+                (unsafe { (*items.add(k)).unpack() }).view(),
+                ValueView::Num(_)
+            )
+        });
         {
             let mut b = obj.borrow_mut();
             b.props.mark_array();
@@ -7028,8 +7076,8 @@ impl Interp {
         } else {
             "%GeneratorPrototype%"
         };
-        let proto = match gen_proto {
-            Some(Value::Obj(o)) => Some(o),
+        let proto = match (gen_proto).map(|__value| (__value).view()) {
+            Some(ValueView::Obj(o)) => Some(o),
             _ => self.extra_protos.get(intrinsic).cloned(),
         }
         .or_else(|| Some(self.object_proto.clone()));
@@ -7271,7 +7319,7 @@ impl Interp {
         named: (fn(&Interp, &Value) -> Vec<String>, Value),
         call: Value,
     ) -> Result<Value, Value> {
-        let Some(prototype) = prototype.as_obj().cloned() else {
+        let Some(prototype) = prototype.as_obj() else {
             return Err(
                 self.make_error("TypeError", "HTMLAllCollection prototype must be an object")
             );
@@ -7464,7 +7512,7 @@ impl Interp {
         let obj = v.as_obj()?;
         let info = self
             .typed_arrays
-            .get(&(Gc::as_ptr(obj) as usize))
+            .get(&(Gc::as_ptr(&obj) as usize))
             .copied()?;
         let len = self.ta_len(&info)?;
         self.ta_read_bytes(&info, 0, len)
@@ -7478,7 +7526,7 @@ impl Interp {
         let obj = v.as_obj()?;
         let info = self
             .typed_arrays
-            .get(&(Gc::as_ptr(obj) as usize))
+            .get(&(Gc::as_ptr(&obj) as usize))
             .copied()?;
         let len = self.ta_len(&info)?;
         let es = info.kind.elsize();
@@ -7503,13 +7551,15 @@ impl Interp {
         if info.kind.name() != name || (!allow_shared && self.is_shared_buffer(info.buffer)) {
             return None;
         }
-        let buffer = self.ta_buffer.get(&ptr)?.as_obj()?.borrow();
+        let handle = self.ta_buffer.get(&ptr)?.as_obj()?;
+        let buffer = handle.borrow();
         if !matches!(
-            buffer
+            (buffer
                 .internal_slots()
                 .get("#\u{0}abResizable")
-                .map(|p| p.value()),
-            Some(Value::Bool(false))
+                .map(|p| p.value()))
+            .map(|__value| (__value).view()),
+            Some(ValueView::Bool(false))
         ) {
             return None;
         }
@@ -7526,7 +7576,7 @@ impl Interp {
     /// the distinction between ordinary and shared backing stores.
     pub fn buffer_source_bytes(&self, v: &Value, allow_shared: bool) -> Option<Vec<u8>> {
         let obj = v.as_obj()?;
-        let ptr = Gc::as_ptr(obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
 
         if let Some(info) = self.typed_arrays.get(&ptr).copied() {
             if !allow_shared && self.is_shared_buffer(info.buffer) {
@@ -7603,7 +7653,7 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let ptr = Gc::as_ptr(obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         let Some(storage) = self.local_buffer(ptr) else {
             return false;
         };
@@ -7627,7 +7677,7 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let ptr = Gc::as_ptr(obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         let Some(storage) = self.local_buffer(ptr) else {
             return false;
         };
@@ -7654,7 +7704,7 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let ptr = Gc::as_ptr(obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         let Some(storage) = self.local_buffer(ptr) else {
             return false;
         };
@@ -7675,7 +7725,7 @@ impl Interp {
     /// to modify the mirror. Taking the ranges does not change the mutation generation. `None`
     /// for another value, a detached buffer or a SharedArrayBuffer, which has no dirty ranges.
     pub fn take_array_buffer_dirty_ranges(&mut self, v: &Value) -> Option<Vec<Range<usize>>> {
-        let ptr = v.as_obj().map(|obj| Gc::as_ptr(obj) as usize)?;
+        let ptr = v.as_obj().map(|obj| Gc::as_ptr(&obj) as usize)?;
         self.flush_native_buffer_writes(ptr);
         self.local_buffer(ptr).is_some().then(|| {
             self.array_buffer_dirty_ranges
@@ -7690,7 +7740,7 @@ impl Interp {
     /// value, a detached buffer or a SharedArrayBuffer: other agents write a Shared Data Block
     /// without any generation this agent could observe.
     pub fn array_buffer_version(&self, v: &Value) -> Option<u64> {
-        let ptr = v.as_obj().map(|obj| Gc::as_ptr(obj) as usize)?;
+        let ptr = v.as_obj().map(|obj| Gc::as_ptr(&obj) as usize)?;
         self.local_buffer(ptr).is_some().then(|| {
             self.array_buffer_versions
                 .get(&ptr)
@@ -7739,7 +7789,7 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let ptr = Gc::as_ptr(obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         // A Shared Data Block cannot be detached.
         if self.is_shared_buffer(ptr) {
             return false;
@@ -7759,7 +7809,7 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(obj) as usize)).copied() else {
+        let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(&obj) as usize)).copied() else {
             return false;
         };
         let Some(length) = self.ta_len(&info) else {
@@ -8003,7 +8053,10 @@ impl Interp {
     /// Engine [[Get]] for an already encoded String-or-Symbol property key.
     pub(crate) fn get_member_key(&mut self, base: &Value, key: &str) -> Result<Value, Abrupt> {
         let result = self.get_member_recv(base, key, base.clone());
-        if matches!(result, Ok(Value::Undefined)) {
+        if matches!(
+            (result).as_ref().map(|__value| (__value).view()),
+            Ok(ValueView::Undefined)
+        ) {
             self.trace_undefined_property(base, key);
         }
         result
@@ -8025,8 +8078,10 @@ impl Interp {
             .and_then(|frame| {
                 let callee = frame.callee();
                 let object = callee.borrow();
-                match object.props.get("name").map(|property| property.value()) {
-                    Some(Value::Str(name)) => Some(name.chars().take(80).collect::<String>()),
+                match (object.props.get("name").map(|property| property.value()))
+                    .map(|__value| (__value).view())
+                {
+                    Some(ValueView::Str(name)) => Some(name.chars().take(80).collect::<String>()),
                     _ => None,
                 }
             })
@@ -8034,7 +8089,7 @@ impl Interp {
         let key = key.chars().take(120).collect::<String>();
         let mut entry = format!("function={function:?} base={} key={key:?}", type_name(base));
         if canonical_index(&key).is_none() {
-            if let Value::Obj(object) = base {
+            if let ValueView::Obj(object) = &(base).view() {
                 let id = Gc::as_ptr(object) as usize;
                 let object = object.borrow();
                 let kind = if let Some(data) = self.buffer_data(id) {
@@ -8063,15 +8118,18 @@ impl Interp {
                     .collect::<Vec<_>>();
                 let constructor = object.proto.as_ref().and_then(|prototype| {
                     let prototype = prototype.borrow();
-                    match prototype
+                    match (prototype
                         .props
                         .get("constructor")
-                        .map(|property| property.value())
+                        .map(|property| property.value()))
+                    .map(|__value| (__value).view())
                     {
-                        Some(Value::Obj(function)) => {
+                        Some(ValueView::Obj(function)) => {
                             let function = function.borrow();
-                            match function.props.get("name").map(|property| property.value()) {
-                                Some(Value::Str(name)) => {
+                            match (function.props.get("name").map(|property| property.value()))
+                                .map(|__value| (__value).view())
+                            {
+                                Some(ValueView::Str(name)) => {
                                     Some(name.chars().take(80).collect::<String>())
                                 }
                                 _ => None,
@@ -8250,15 +8308,15 @@ impl Interp {
                 // a value already of the view's content type (a Number, or a BigInt for BigInt
                 // content) can bypass that observable step; coercions, mismatched content and
                 // immutable-buffer errors retain the general path.
-                match &v {
-                    Value::Num(value)
+                match &(v).view() {
+                    ValueView::Num(value)
                         if !info.kind.is_bigint()
                             && !self.immutable_buffers.contains(&info.buffer) =>
                     {
                         self.ta_write(&info, n as usize, *value);
                         return Ok(());
                     }
-                    Value::BigInt(value)
+                    ValueView::BigInt(value)
                         if info.kind.is_bigint()
                             && !self.immutable_buffers.contains(&info.buffer) =>
                     {
@@ -8294,10 +8352,12 @@ impl Interp {
             return Err(v);
         }
         let Some((old_len, length_writable)) =
-            b.props.length_property().and_then(|p| match p.value() {
-                Value::Num(len) => Some((len, p.writable())),
-                _ => None,
-            })
+            b.props
+                .length_property()
+                .and_then(|p| match (p.value()).view() {
+                    ValueView::Num(len) => Some((len, p.writable())),
+                    _ => None,
+                })
         else {
             return Err(v);
         };
@@ -8441,15 +8501,15 @@ impl Interp {
             && key.as_str() != "description"
             && !key.as_bytes().first().is_some_and(u8::is_ascii_digit);
         if cacheable {
-            let object = match base {
-                Value::Obj(object) => Some(object),
-                Value::Str(_) => Some(&self.string_proto),
-                Value::Num(_) => Some(&self.number_proto),
-                Value::Bool(_) => Some(&self.boolean_proto),
+            let object = match (base).view() {
+                ValueView::Obj(object) => Some(object),
+                ValueView::Str(_) => Some(self.string_proto),
+                ValueView::Num(_) => Some(self.number_proto),
+                ValueView::Bool(_) => Some(self.boolean_proto),
                 _ => None,
             };
             if let Some(object) = object {
-                let head = Gc::as_ptr(object);
+                let head = Gc::as_ptr(&object);
                 let shape = object.borrow().props.shape();
                 if let Some(state) = self.computed_reads.lookup(key.as_ptr() as usize, shape) {
                     if let Some(value) = self.ic_shape_probe(head, key, state) {
@@ -8464,7 +8524,7 @@ impl Interp {
                 // scratch ways are empty; probing them and copying the key into a second
                 // pointer-indexed stub table adds work on high-cardinality/transient inputs.
                 // Derive once and retain the key only in the bounded computed cache.
-                if let Some(value) = self.ic_get_rederive(object, key, &scratch[0], false) {
+                if let Some(value) = self.ic_get_rederive(&object, key, &scratch[0], false) {
                     self.computed_reads.insert(key, scratch[0].get());
                     return self.finish_cached_get(value, base, None);
                 }
@@ -8481,8 +8541,8 @@ impl Interp {
         stable_name: bool,
         trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
     ) -> Result<Value, Abrupt> {
-        match base {
-            Value::Obj(o) => {
+        match &(base).view() {
+            ValueView::Obj(o) => {
                 if let Some(v) = self.try_ic_get(o, name, cache, stable_name) {
                     return self.finish_cached_get(v, base, trace);
                 }
@@ -8490,14 +8550,14 @@ impl Interp {
             // Primitive receivers: named non-index reads (`"x".replace`, `(1).toFixed`) resolve
             // on the wrapper prototype chain — cache that walk too. `length` and numeric keys
             // have primitive-specific handling in get_member; symbols get description handling.
-            Value::Str(_) | Value::Num(_) | Value::Bool(_)
+            ValueView::Str(_) | ValueView::Num(_) | ValueView::Bool(_)
                 if name != "length"
                     && name != "description"
                     && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) =>
             {
-                let proto = match base {
-                    Value::Str(_) => self.string_proto.clone(),
-                    Value::Num(_) => self.number_proto.clone(),
+                let proto = match &(base).view() {
+                    ValueView::Str(_) => self.string_proto.clone(),
+                    ValueView::Num(_) => self.number_proto.clone(),
                     _ => self.boolean_proto.clone(),
                 };
                 if let Some(v) = self.try_ic_get(&proto, name, cache, stable_name) {
@@ -8510,16 +8570,17 @@ impl Interp {
     }
 
     fn property_receiver_shape(&self, base: &Value) -> Option<u32> {
-        let object = match base {
-            Value::Obj(object) => Some(object),
-            Value::Str(_) => Some(&self.string_proto),
-            Value::Num(_) => Some(&self.number_proto),
-            Value::Bool(_) => Some(&self.boolean_proto),
-            Value::Sym(_) => Some(&self.symbol_proto),
-            Value::BigInt(_) => self.extra_protos.get("BigInt"),
+        let object = match (base).view() {
+            ValueView::Obj(object) => Some(object),
+            ValueView::Str(_) => Some(self.string_proto),
+            ValueView::Num(_) => Some(self.number_proto),
+            ValueView::Bool(_) => Some(self.boolean_proto),
+            ValueView::Sym(_) => Some(self.symbol_proto),
+            ValueView::BigInt(_) => self.extra_protos.get("BigInt").copied(),
             _ => None,
         }?;
-        Some(object.borrow().props.shape())
+        let shape = object.borrow().props.shape();
+        Some(shape)
     }
 
     /// Whether object pointer `ptr` (holding `b`) reads like an ordinary object for IC purposes.
@@ -8951,9 +9012,9 @@ impl Interp {
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> &'static str {
-        let Value::Obj(o) = base else {
-            return match base {
-                Value::Str(_) | Value::Num(_) | Value::Bool(_) => "receiver: primitive",
+        let ValueView::Obj(o) = &(base).view() else {
+            return match &(base).view() {
+                ValueView::Str(_) | ValueView::Num(_) | ValueView::Bool(_) => "receiver: primitive",
                 _ => "receiver: non-object",
             };
         };
@@ -9025,7 +9086,7 @@ impl Interp {
         v: Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<(), Abrupt> {
-        if let Value::Obj(o) = base {
+        if let ValueView::Obj(o) = &(base).view() {
             if self.try_ic_set(o, name, &v, cache) {
                 return Ok(());
             }
@@ -9045,7 +9106,7 @@ impl Interp {
         trace: &mut crate::feedback::CurrentPropertyTrace,
     ) -> Result<(), Abrupt> {
         trace.receiver_shape = self.property_receiver_shape(base);
-        if let Value::Obj(o) = base {
+        if let ValueView::Obj(o) = &(base).view() {
             if self.try_ic_set(o, name, &v, cache) {
                 return Ok(());
             }
@@ -9072,7 +9133,7 @@ impl Interp {
         lval: Value,
         x: &crate::lstr::LStr,
     ) -> Result<(), Value> {
-        let Value::Str(lv) = &lval else {
+        let ValueView::Str(lv) = &(lval).view() else {
             return Err(lval);
         };
         if lv.len() + x.len() > MAX_STR_LEN {
@@ -9088,15 +9149,15 @@ impl Interp {
         if p.accessor() || !p.writable() {
             return Err(lval);
         }
-        let same = matches!(p.value(), Value::Str(cur) if crate::lstr::LStr::ptr_eq(&cur, lv));
+        let same = matches!((p.value()).view(), ValueView::Str(cur) if crate::lstr::LStr::ptr_eq(&cur, lv));
         if !same {
             return Err(lval);
         }
         // Take the slot's handle and append to it. The object stays borrowed throughout, so
         // the checked descriptor cannot change between the read above and the value-only
         // take/store below.
-        let cur = match b.props.take_value(name) {
-            Some(Value::Str(s)) => s,
+        let cur = match (b.props.take_value(name)).map(|__value| (__value).view()) {
+            Some(ValueView::Str(s)) => s,
             _ => unreachable!("checked above"),
         };
         drop(lval);
@@ -9463,7 +9524,7 @@ impl Interp {
         mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
     ) -> Result<Value, Abrupt> {
         // An `import defer` namespace evaluates its module on string-keyed access.
-        if let Value::Obj(o) = base {
+        if let ValueView::Obj(o) = &(base).view() {
             if self.deferred_ns.contains_key(&(Gc::as_ptr(o) as usize)) {
                 let shape = o.borrow().props.shape();
                 if let Some(trace) = trace.as_deref_mut() {
@@ -9477,8 +9538,8 @@ impl Interp {
             }
             self.defer_trigger(o, Some(key))?;
         }
-        match base {
-            Value::Undefined | Value::Empty | Value::Null => {
+        match &(base).view() {
+            ValueView::Undefined | ValueView::Empty | ValueView::Null => {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(crate::feedback::PropertyOutcome::Rejected, None, 0, None);
                 }
@@ -9491,7 +9552,7 @@ impl Interp {
                     ),
                 ))
             }
-            Value::Str(s) => {
+            ValueView::Str(s) => {
                 // `length` and indices are in UTF-16 code units (cached — a scanner loop reads
                 // them per character of a megabytes-long source).
                 if key == "length" {
@@ -9514,15 +9575,15 @@ impl Interp {
                 let proto = self.string_proto.clone();
                 self.get_from_chain(&proto, key, &receiver, trace)
             }
-            Value::Num(_) => {
+            ValueView::Num(_) => {
                 let proto = self.number_proto.clone();
                 self.get_from_chain(&proto, key, &receiver, trace)
             }
-            Value::Bool(_) => {
+            ValueView::Bool(_) => {
                 let proto = self.boolean_proto.clone();
                 self.get_from_chain(&proto, key, &receiver, trace)
             }
-            Value::Sym(s) => {
+            ValueView::Sym(s) => {
                 if key == "description" {
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.record(crate::feedback::PropertyOutcome::Exotic, None, 0, None);
@@ -9536,7 +9597,7 @@ impl Interp {
                 let proto = self.symbol_proto.clone();
                 self.get_from_chain(&proto, key, &receiver, trace)
             }
-            Value::BigInt(_) => match self.extra_protos.get("BigInt").cloned() {
+            ValueView::BigInt(_) => match self.extra_protos.get("BigInt").cloned() {
                 Some(proto) => self.get_from_chain(&proto, key, &receiver, trace),
                 None => {
                     if let Some(trace) = trace.as_deref_mut() {
@@ -9545,7 +9606,7 @@ impl Interp {
                     Ok(Value::Undefined)
                 }
             },
-            Value::Obj(o) => {
+            ValueView::Obj(o) => {
                 let o = o.clone();
                 let ptr = Gc::as_ptr(&o) as usize;
                 // A mapped `arguments` index aliases its parameter binding.
@@ -9662,8 +9723,8 @@ impl Interp {
                     // of those intrinsic getters, compute its result instead; anything else on
                     // the way (an own property, a subclass or replaced accessor, a Proxy, a null
                     // prototype) takes the ordinary lookup below.
-                    let accessor = match &receiver {
-                        Value::Obj(r) if Gc::ptr_eq(r, &o) => self.ta_accessor_reached(&o, key),
+                    let accessor = match &(receiver).view() {
+                        ValueView::Obj(r) if Gc::ptr_eq(r, &o) => self.ta_accessor_reached(&o, key),
                         _ => None,
                     };
                     if let Some(accessor) = accessor {
@@ -9795,7 +9856,7 @@ impl Interp {
                         None,
                     );
                 }
-                if matches!(handler, Value::Null) {
+                if matches!((handler).view(), ValueView::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
                 }
                 let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")? else {
@@ -9901,13 +9962,13 @@ impl Interp {
                     && self.is_throw_type_error(&getter)
                     && !Gc::ptr_eq(
                         &obj,
-                        match receiver {
-                            Value::Obj(r) => r,
+                        match &(receiver).view() {
+                            ValueView::Obj(r) => r,
                             _ => &obj,
                         },
                     )
                 {
-                    if let Value::Obj(r) = receiver {
+                    if let ValueView::Obj(r) = &(receiver).view() {
                         let plain = match &r.borrow().call {
                             Callable::User(user) => {
                                 !user.func.is_strict
@@ -9940,7 +10001,9 @@ impl Interp {
                                     // The activation skipped building its arguments object
                                     // (the body never names it) — conjure it now.
                                     let lazy = match self.fn_frames[k].extra.as_deref() {
-                                        Some(x) if matches!(x.args_obj, Value::Null) => {
+                                        Some(x)
+                                            if matches!((x.args_obj).view(), ValueView::Null) =>
+                                        {
                                             x.lazy.clone()
                                         }
                                         _ => None,
@@ -9996,8 +10059,8 @@ impl Interp {
 
     /// Whether `v` is the [[IsHTMLDDA]] object.
     pub(crate) fn is_htmldda(&self, v: &Value) -> bool {
-        match v {
-            Value::Obj(o) => self
+        match &(v).view() {
+            ValueView::Obj(o) => self
                 .htmldda
                 .get(&(Gc::as_ptr(o) as usize))
                 .is_some_and(|dda| dda.ptr_eq(&Gc::downgrade(o))),
@@ -10013,15 +10076,19 @@ impl Interp {
             return test == TypeofTest::Undefined;
         }
         match test {
-            TypeofTest::Undefined => matches!(value, Value::Undefined | Value::Empty),
-            TypeofTest::Boolean => matches!(value, Value::Bool(_)),
-            TypeofTest::Number => matches!(value, Value::Num(_)),
-            TypeofTest::BigInt => matches!(value, Value::BigInt(_)),
-            TypeofTest::String => matches!(value, Value::Str(_)),
-            TypeofTest::Symbol => matches!(value, Value::Sym(_)),
-            TypeofTest::Object => match value {
-                Value::Null => true,
-                Value::Obj(object) => matches!(object.borrow().call, Callable::None),
+            TypeofTest::Undefined => {
+                matches!(&(value).view(), ValueView::Undefined | ValueView::Empty)
+            }
+            TypeofTest::Boolean => matches!(&(value).view(), ValueView::Bool(_)),
+            TypeofTest::Number => matches!(&(value).view(), ValueView::Num(_)),
+            TypeofTest::BigInt => matches!(&(value).view(), ValueView::BigInt(_)),
+            TypeofTest::String => matches!(&(value).view(), ValueView::Str(_)),
+            TypeofTest::Symbol => matches!(&(value).view(), ValueView::Sym(_)),
+            TypeofTest::Object => match &(value).view() {
+                ValueView::Null => true,
+                ValueView::Obj(object) => {
+                    matches!(object.borrow().call, Callable::None)
+                }
                 _ => false,
             },
             TypeofTest::Function => value.is_callable(),
@@ -10031,8 +10098,11 @@ impl Interp {
 
     /// Whether `getter` is the %ThrowTypeError% intrinsic.
     fn is_throw_type_error(&self, getter: &Option<Value>) -> bool {
-        match (getter, self.extra_protos.get("%ThrowTypeError%")) {
-            (Some(Value::Obj(g)), Some(tte)) => Gc::ptr_eq(g, tte),
+        match (
+            (getter).map(|__value| (__value).view()),
+            self.extra_protos.get("%ThrowTypeError%"),
+        ) {
+            (Some(ValueView::Obj(g)), Some(tte)) => Gc::ptr_eq(&g, tte),
             _ => false,
         }
     }
@@ -10198,7 +10268,7 @@ impl Interp {
         // Arguments [[Set]] updates its ParameterMap only when the arguments object
         // itself is Receiver. A proxy forwarding to it must preserve a distinct Receiver.
         if !self.mapped_arguments.is_empty() {
-            if let (Value::Obj(o), Value::Obj(r)) = (base, &receiver) {
+            if let (ValueView::Obj(o), ValueView::Obj(r)) = (&(base).view(), &(receiver).view()) {
                 let ptr = Gc::as_ptr(o) as usize;
                 if Gc::ptr_eq(o, r) && self.mapped_arg_write(ptr, key, &value) {
                     // Update the own property's value in place — its attributes (e.g. a
@@ -10220,9 +10290,9 @@ impl Interp {
                 }
             }
         }
-        let obj = match base {
-            Value::Obj(o) => o.clone(),
-            Value::Undefined | Value::Null => {
+        let obj = match &(base).view() {
+            ValueView::Obj(o) => o.clone(),
+            ValueView::Undefined | ValueView::Null => {
                 if let Some(trace) = trace {
                     trace.record(crate::feedback::PropertyOutcome::Rejected, None, 0, None);
                 }
@@ -10239,12 +10309,12 @@ impl Interp {
             // prototype chain still handles the write, with the primitive as receiver; otherwise
             // the write fails — a silent no-op in sloppy mode, a TypeError in strict mode.
             _ => {
-                let proto = match base {
-                    Value::Str(_) => Some(self.string_proto.clone()),
-                    Value::Num(_) => Some(self.number_proto.clone()),
-                    Value::Bool(_) => Some(self.boolean_proto.clone()),
-                    Value::Sym(_) => Some(self.symbol_proto.clone()),
-                    Value::BigInt(_) => self.extra_protos.get("BigInt").cloned(),
+                let proto = match &(base).view() {
+                    ValueView::Str(_) => Some(self.string_proto.clone()),
+                    ValueView::Num(_) => Some(self.number_proto.clone()),
+                    ValueView::Bool(_) => Some(self.boolean_proto.clone()),
+                    ValueView::Sym(_) => Some(self.symbol_proto.clone()),
+                    ValueView::BigInt(_) => self.extra_protos.get("BigInt").cloned(),
                     _ => None,
                 };
                 let mut cur = proto;
@@ -10439,7 +10509,7 @@ impl Interp {
                         None,
                     );
                 }
-                if matches!(handler, Value::Null) {
+                if matches!((handler).view(), ValueView::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'set' on a revoked proxy"));
                 }
                 let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_SET, "set")? else {
@@ -10468,7 +10538,7 @@ impl Interp {
             if !Gc::ptr_eq(&o, &obj) {
                 if let Some(info) = self.typed_arrays.get(&optr).copied() {
                     match self.ta_index_kind(&info, key) {
-                        TaIndex::Element(_) | TaIndex::Exotic if matches!(&receiver, Value::Obj(r) if Gc::ptr_eq(r, &o)) =>
+                        TaIndex::Element(_) | TaIndex::Exotic if matches!(&(receiver).view(), ValueView::Obj(r) if Gc::ptr_eq(r, &o)) =>
                         {
                             if let Some(trace) = trace.as_deref_mut() {
                                 trace.record(
@@ -10615,8 +10685,8 @@ impl Interp {
         // OrdinarySet: the write lands on the *receiver* (they differ for `super.x = v` and
         // Reflect.set with an explicit receiver). A namespace receiver rejects the define,
         // probing the binding first so a TDZ export surfaces ReferenceError.
-        let obj = match &receiver {
-            Value::Obj(r) if !Gc::ptr_eq(r, &obj) => {
+        let obj = match &(receiver).view() {
+            ValueView::Obj(r) if !Gc::ptr_eq(r, &obj) => {
                 // A deferred-namespace receiver evaluates before its own properties are consulted.
                 self.defer_trigger(r, Some(key))?;
                 let rptr = Gc::as_ptr(r) as usize;
@@ -11031,8 +11101,10 @@ impl Interp {
         if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(obj) as usize)) {
             return self.ta_len(info).unwrap_or(0);
         }
-        match obj.borrow().props.length_property().map(|p| p.value()) {
-            Some(Value::Num(n)) => n as usize,
+        match (obj.borrow().props.length_property().map(|p| p.value()))
+            .map(|__value| (__value).view())
+        {
+            Some(ValueView::Num(n)) => n as usize,
             _ => 0,
         }
     }
@@ -11473,8 +11545,10 @@ impl Interp {
         self.template_cache.retain(|(realm_key, _), value| {
             self.realms.contains_key(realm_key)
                 && !garbage_objects.contains(*realm_key)
-                && match value {
-                    Value::Obj(object) => !garbage_objects.contains(Gc::as_ptr(object) as usize),
+                && match (value).view() {
+                    ValueView::Obj(object) => {
+                        !garbage_objects.contains(Gc::as_ptr(&object) as usize)
+                    }
                     _ => true,
                 }
         });
@@ -11865,10 +11939,21 @@ impl Interp {
         name: &'static str,
     ) -> Result<Option<Value>, Abrupt> {
         let caches = self.proxy_trap_caches();
-        match self.get_prop_ic(handler, name, &caches.lookups[kind][0])? {
-            Value::Undefined | Value::Null => Ok(None),
-            trap if trap.is_callable() => Ok(Some(trap)),
-            _ => Err(self.throw("TypeError", format!("proxy '{name}' trap is not callable"))),
+        {
+            let __value_match_original =
+                self.get_prop_ic(handler, name, &caches.lookups[kind][0])?;
+            match (__value_match_original).view() {
+                ValueView::Undefined | ValueView::Null => Ok(None),
+                _ if {
+                    let trap = __value_match_original;
+                    trap.is_callable()
+                } =>
+                {
+                    let trap = __value_match_original;
+                    Ok(Some(trap))
+                }
+                _ => Err(self.throw("TypeError", format!("proxy '{name}' trap is not callable"))),
+            }
         }
     }
 
@@ -11888,7 +11973,7 @@ impl Interp {
     /// for `key` vacuous: it has no own `key`, or only a configurable one (ECMA-262 §10.5.8 step
     /// 9 and §10.5.9 step 10 constrain non-configurable properties only). No descriptor copy.
     fn proxy_invariant_vacuous(target: &Value, key: &str) -> bool {
-        let Value::Obj(target) = target else {
+        let ValueView::Obj(target) = &(target).view() else {
             return false;
         };
         let body = target.borrow();
@@ -11904,7 +11989,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         if self.tier != crate::bytecode::Tier::Jit
-            || !matches!(&callee, Value::Obj(o) if matches!(&o.borrow().call, Callable::User(_)))
+            || !matches!(&(callee).view(), ValueView::Obj(o) if matches!(&o.borrow().call, Callable::User(_)))
         {
             return self.call(callee, this, args);
         }
@@ -11938,8 +12023,8 @@ impl Interp {
         };
         let step = crate::builtins::intrinsic_iterator_step(native)?;
         // `ic_plain` excludes a Proxy without a table lookup.
-        if !self.ordinary_get_ptr(Gc::as_ptr(object) as usize)
-            || (self.multi_realm() && self.callee_realm_global(object).is_some())
+        if !self.ordinary_get_ptr(Gc::as_ptr(&object) as usize)
+            || (self.multi_realm() && self.callee_realm_global(&object).is_some())
         {
             return None;
         }
@@ -12043,11 +12128,11 @@ impl Interp {
         // so this iterative traversal cannot form a target cycle.
         loop {
             if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&cur) as usize)) {
-                if matches!(handler, Value::Null) {
+                if matches!((handler).view(), ValueView::Null) {
                     return Err(self.throw("TypeError", "proxy has been revoked"));
                 }
-                match target.clone() {
-                    Value::Obj(t) => {
+                match (target.clone()).view() {
+                    ValueView::Obj(t) => {
                         cur = t;
                         continue;
                     }
@@ -12091,7 +12176,7 @@ impl Interp {
         // A cross-realm callee runs with its own realm's intrinsics active (so a thrown TypeError,
         // a fresh object's prototype, or a global lookup lands in the right realm).
         if self.multi_realm() {
-            if let Value::Obj(o) = &callee {
+            if let ValueView::Obj(o) = &(callee).view() {
                 // A proxy's trap machinery runs in the caller's realm (the trap-arguments array is
                 // a caller-realm Array); invoking the trap function swaps on its own.
                 if !self.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
@@ -12165,8 +12250,8 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        let obj = match &callee {
-            Value::Obj(o) => o.clone(),
+        let obj = match &(callee).view() {
+            ValueView::Obj(o) => o.clone(),
             _ => {
                 // Optional call-boundary context complements the error stack
                 // when an obfuscated interpreter attempts to call a primitive.
@@ -12180,8 +12265,8 @@ impl Interp {
                             .is_ok_and(|filter| filter == "1" || filter.contains("not a function"))
                 }) && TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32
                 {
-                    let preview = match &callee {
-                        Value::Str(text) => text.chars().take(160).collect::<String>(),
+                    let preview = match &(callee).view() {
+                        ValueView::Str(text) => text.chars().take(160).collect::<String>(),
                         _ => type_name(&callee).to_string(),
                     };
                     eprintln!(
@@ -12209,7 +12294,7 @@ impl Interp {
                     return Err(self.throw("TypeError", "value is not a function"));
                 }
                 let trap = self.get_member_key(&handler, "apply")?;
-                if matches!(trap, Value::Undefined | Value::Null) {
+                if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
                     return self.call(target, this, args);
                 }
                 if !trap.is_callable() {
@@ -12229,13 +12314,12 @@ impl Interp {
                 .internal_slots()
                 .get("#\u{0}eval_realm")
                 .map(|p| p.value());
-            if let Some(realm_g @ Value::Obj(_)) = realm_g {
+            if let Some(realm_g) = realm_g.filter(|value| value.as_obj().is_some()) {
                 return match args.first() {
-                    Some(Value::Str(s)) => {
-                        let s = s.clone();
-                        self.indirect_eval_in_realm(&realm_g, &s)
-                    }
-                    Some(other) => Ok(other.clone()),
+                    Some(value) => match value.view() {
+                        ValueView::Str(s) => self.indirect_eval_in_realm(&realm_g, &s),
+                        _ => Ok(*value),
+                    },
                     None => Ok(Value::Undefined),
                 };
             }
@@ -12311,8 +12395,8 @@ impl Interp {
                         "DBG cross enter realm={:p} parent={parent:p} self={:p} tkind={}",
                         Gc::as_ptr(&realm),
                         self as *const Interp,
-                        match &target {
-                            Value::Obj(o) => match &o.borrow().call {
+                        match &(target).view() {
+                            ValueView::Obj(o) => match &o.borrow().call {
                                 Callable::User(_) => "user",
                                 Callable::WrappedShadow(_) => "wshadow",
                                 Callable::WrappedCross(_) => "wcross",
@@ -12327,7 +12411,7 @@ impl Interp {
                 // and is suspended in that call, not mutably borrowed, while code here runs.
                 let host: &mut Interp = unsafe { &mut *parent };
                 for a in args {
-                    if matches!(a, Value::Obj(_)) && !a.is_callable() {
+                    if matches!(&(a).view(), ValueView::Obj(_)) && !a.is_callable() {
                         return Err(self.throw(
                             "TypeError",
                             "wrapped function arguments must be primitives or callables",
@@ -12360,7 +12444,7 @@ impl Interp {
                     }
                 };
                 match host_result {
-                    Ok(v) if !matches!(v, Value::Obj(_)) => Ok(v),
+                    Ok(v) if !matches!((v).view(), ValueView::Obj(_)) => Ok(v),
                     Ok(v) if v.is_callable() => Ok(self.make_wrapped_cross(v)),
                     Ok(_) => {
                         Err(self.throw("TypeError", "a wrapped function returned a non-primitive"))
@@ -12370,15 +12454,19 @@ impl Interp {
                             eprintln!(
                                 "DBG cross err: {:?}",
                                 match &e {
-                                    Abrupt::Throw(Value::Str(s)) => format!("str {s}"),
-                                    Abrupt::Throw(Value::Obj(o)) => format!(
+                                    Abrupt::Throw(value) if value.as_engine_text().is_some() =>
+                                        format!("str {}", value.as_engine_text().unwrap()),
+                                    Abrupt::Throw(value) if value.as_obj().is_some() => format!(
                                         "obj {:?}",
-                                        o.borrow()
+                                        value
+                                            .as_obj()
+                                            .unwrap()
+                                            .borrow()
                                             .props
                                             .get("message")
                                             .map(|p| p.value())
-                                            .and_then(|v| match v {
-                                                Value::Str(s) => Some(s.to_string()),
+                                            .and_then(|v| match (v).view() {
+                                                ValueView::Str(s) => Some(s.to_string()),
                                                 _ => None,
                                             })
                                     ),
@@ -12427,8 +12515,8 @@ impl Interp {
 
     /// Read an auto-accessor's backing field off `this`, throwing if `this` lacks the slot.
     fn accessor_load(&mut self, this: &Value, key: &str) -> Result<Value, Abrupt> {
-        match this {
-            Value::Obj(o) if o.borrow().internal_slots().contains(key) => Ok(o
+        match &(this).view() {
+            ValueView::Obj(o) if o.borrow().internal_slots().contains(key) => Ok(o
                 .borrow()
                 .internal_slots()
                 .get(key)
@@ -12443,8 +12531,8 @@ impl Interp {
 
     /// Write an auto-accessor's backing field on `this`, throwing if `this` lacks the slot.
     fn accessor_store(&mut self, this: &Value, key: &str, value: Value) -> Result<Value, Abrupt> {
-        match this {
-            Value::Obj(o) if o.borrow().internal_slots().contains(key) => {
+        match &(this).view() {
+            ValueView::Obj(o) if o.borrow().internal_slots().contains(key) => {
                 if let Some(p) = o.borrow_mut().internal_slots_mut().get_mut(key) {
                     p.set_value(value);
                 }
@@ -12470,7 +12558,7 @@ impl Interp {
 
     /// Marshal one value crossing OUT of a shadow realm into this (host) realm.
     fn marshal_from_shadow(&mut self, realm: &Gc, v: Value) -> Result<Value, Abrupt> {
-        if !matches!(v, Value::Obj(_)) {
+        if !matches!((v).view(), ValueView::Obj(_)) {
             return Ok(v);
         }
         if v.is_callable() {
@@ -12519,14 +12607,14 @@ impl Interp {
                 self.get_member_key(&target, "name"),
             ),
         };
-        let length = match length_r {
-            Ok(Value::Num(n)) if n.is_finite() => n.trunc().max(0.0),
-            Ok(Value::Num(n)) if n == f64::INFINITY => f64::INFINITY,
+        let length = match (length_r).map(|__value| (__value).view()) {
+            Ok(ValueView::Num(n)) if n.is_finite() => n.trunc().max(0.0),
+            Ok(ValueView::Num(n)) if n == f64::INFINITY => f64::INFINITY,
             Ok(_) => 0.0,
             Err(_) => return Err(bad(self)),
         };
-        let name = match name_r {
-            Ok(Value::Str(s)) => s.to_string(),
+        let name = match (name_r).map(|__value| (__value).view()) {
+            Ok(ValueView::Str(s)) => s.to_string(),
             Ok(_) => String::new(),
             Err(_) => return Err(bad(self)),
         };
@@ -12553,7 +12641,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         for a in args {
-            if matches!(a, Value::Obj(_)) && !a.is_callable() {
+            if matches!(&(a).view(), ValueView::Obj(_)) && !a.is_callable() {
                 return Err(self.throw(
                     "TypeError",
                     "ShadowRealm wrapped function: arguments must be primitives or callables",
@@ -12594,21 +12682,30 @@ impl Interp {
                     eprintln!(
                         "DBG cws err: {:?}",
                         match &e {
-                            Abrupt::Throw(Value::Str(s)) => format!("str {s}"),
-                            Abrupt::Throw(Value::Obj(o)) => format!(
+                            Abrupt::Throw(value) if value.as_engine_text().is_some() =>
+                                format!("str {}", value.as_engine_text().unwrap()),
+                            Abrupt::Throw(value) if value.as_obj().is_some() => format!(
                                 "obj {:?} {:?}",
-                                o.borrow().props.get("name").map(|p| p.value()).and_then(
-                                    |v| match v {
-                                        Value::Str(s) => Some(s.to_string()),
+                                value
+                                    .as_obj()
+                                    .unwrap()
+                                    .borrow()
+                                    .props
+                                    .get("name")
+                                    .map(|p| p.value())
+                                    .and_then(|v| match (v).view() {
+                                        ValueView::Str(s) => Some(s.to_string()),
                                         _ => None,
-                                    }
-                                ),
-                                o.borrow()
+                                    }),
+                                value
+                                    .as_obj()
+                                    .unwrap()
+                                    .borrow()
                                     .props
                                     .get("message")
                                     .map(|p| p.value())
-                                    .and_then(|v| match v {
-                                        Value::Str(s) => Some(s.to_string()),
+                                    .and_then(|v| match (v).view() {
+                                        ValueView::Str(s) => Some(s.to_string()),
                                         _ => None,
                                     })
                             ),
@@ -12840,10 +12937,10 @@ impl Interp {
         if func.is_strict || is_construct {
             return this;
         }
-        match this {
-            Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
-            other @ Value::Obj(_) => other,
-            prim => crate::builtins::box_primitive_pub(self, prim),
+        match this.view() {
+            ValueView::Undefined | ValueView::Null => Value::Obj(self.global.clone()),
+            ValueView::Obj(_) => this,
+            _ => crate::builtins::box_primitive_pub(self, this),
         }
     }
 
@@ -13053,10 +13150,10 @@ impl Interp {
         self.in_async_gen_body = saved_agb;
 
         let value = result?;
-        if matches!(value, Value::Obj(_)) {
+        if matches!((value).view(), ValueView::Obj(_)) {
             return Ok(value);
         }
-        if !matches!(value, Value::Undefined | Value::Empty) {
+        if !matches!((value).view(), ValueView::Undefined | ValueView::Empty) {
             return Err(self.throw_in_caller_realm(
                 "TypeError",
                 "a derived constructor may only return an object or undefined",
@@ -13220,7 +13317,7 @@ impl Interp {
     ) -> CachedCall {
         #[cfg(feature = "architecture-diagnostics")]
         crate::bytecode::call_cache_diagnostics::probe(site, callee);
-        let Value::Obj(o) = callee else {
+        let ValueView::Obj(o) = &(callee).view() else {
             return CachedCall::Miss;
         };
         let key = Gc::as_ptr(o) as usize;
@@ -13798,7 +13895,7 @@ impl Interp {
         let initializer = self
             .try_ic_get(this, initializer_name, initializer_cache, true)?
             .data()?;
-        let Value::Obj(initializer_obj) = &initializer else {
+        let ValueView::Obj(initializer_obj) = &(initializer).view() else {
             return None;
         };
         // Reuse the body's own `GetMethod("apply")` feedback too. Its shape guards prove there
@@ -13807,7 +13904,7 @@ impl Interp {
         let apply = self
             .try_ic_get(initializer_obj, "apply", apply_cache, true)?
             .data()?;
-        let Value::Obj(apply_obj) = &apply else {
+        let ValueView::Obj(apply_obj) = &(apply).view() else {
             return None;
         };
         let initializer_ptr = Gc::as_ptr(initializer_obj) as usize;
@@ -14060,7 +14157,9 @@ impl Interp {
         caller_ctx: Option<*mut crate::jit::JitCtx>,
         site: Option<(&crate::bytecode::Chunk, u32)>,
     ) -> Option<Result<Value, Abrupt>> {
-        let Value::Obj(o) = callee else { return None };
+        let ValueView::Obj(o) = &(callee).view() else {
+            return None;
+        };
         let key = Gc::as_ptr(o) as usize;
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         if epoch == u32::MAX {
@@ -14180,8 +14279,8 @@ impl Interp {
                 b.props.get("prototype")
             };
             match property {
-                Some(p) if !p.accessor() => match p.value() {
-                    Value::Obj(pp) => pp,
+                Some(p) if !p.accessor() => match (p.value()).view() {
+                    ValueView::Obj(pp) => pp,
                     _ => return None,
                 },
                 _ => return None,
@@ -14417,8 +14516,8 @@ impl Interp {
             self.observe_construct_capacity(o, &this);
         }
         // A constructor explicitly returning an object overrides the instance.
-        Some(r.map(|ret| match ret {
-            v @ Value::Obj(_) => v,
+        Some(r.map(|ret| match ret.view() {
+            ValueView::Obj(_) => ret,
             _ => this_val,
         }))
     }
@@ -14459,7 +14558,7 @@ impl Interp {
             }
             let slot = b.props.slot_of("prototype")?;
             let property = b.props.property_at(slot)?;
-            if property.accessor() || !matches!(property.value(), Value::Obj(_)) {
+            if property.accessor() || !matches!((property.value()).view(), ValueView::Obj(_)) {
                 return None;
             }
             (b.props.shape(), slot as u32)
@@ -14560,7 +14659,9 @@ impl Interp {
         // [[Call]] must dispatch its traps, but a separate ordinary function still has the
         // same [[Call]] after any number of unrelated proxies have been created/revoked.
         // The immutable Callable and identity pin preserve this proof on cached hits.
-        let Value::Obj(o) = callee else { return None };
+        let ValueView::Obj(o) = &(callee).view() else {
+            return None;
+        };
         let object = o.borrow();
         let (func, env, realm) = match &object.call {
             Callable::User(user) if object.ic_plain.get() => {
@@ -14972,11 +15073,11 @@ impl Interp {
                 let this_val = if func.is_strict || is_construct {
                     this
                 } else {
-                    match this {
-                        Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
-                        other @ Value::Obj(_) => other,
+                    match this.view() {
+                        ValueView::Undefined | ValueView::Null => Value::Obj(self.global.clone()),
+                        ValueView::Obj(_) => this,
                         // Sloppy mode: a primitive `this` is boxed to its wrapper (ToObject).
-                        prim => crate::builtins::box_primitive_pub(self, prim),
+                        _ => crate::builtins::box_primitive_pub(self, this),
                     }
                 };
                 scope.borrow_mut().vars.insert(
@@ -15197,8 +15298,8 @@ impl Interp {
                 .map(|c| c.derived)
                 .unwrap_or(false);
             if let Ok(v) = &result {
-                if !matches!(v, Value::Obj(_)) {
-                    if derived && !matches!(v, Value::Undefined | Value::Empty) {
+                if !matches!((v).view(), ValueView::Obj(_)) {
+                    if derived && !matches!((v).view(), ValueView::Undefined | ValueView::Empty) {
                         result = Err(self.throw_in_caller_realm(
                             "TypeError",
                             "a derived constructor may only return an object or undefined",
@@ -15289,7 +15390,7 @@ impl Interp {
             crate::coroutine::unavailable(error)
         };
         let object = self.make_generator(func.is_async, gen_proto);
-        if let Value::Obj(value) = &object {
+        if let ValueView::Obj(value) = &(object).view() {
             self.gc_pin(value);
             self.generators
                 .insert(&self.gc_heap, Gc::as_ptr(value) as usize, continuation);
@@ -15370,13 +15471,13 @@ impl Interp {
             crate::coroutine::unavailable(error)
         };
         let promise = self.new_promise();
-        if let Value::Obj(o) = &promise {
+        if let ValueView::Obj(o) = &(promise).view() {
             self.gc_pin(o);
             self.generators
                 .insert(&self.gc_heap, Gc::as_ptr(o) as usize, coro);
         }
-        let key = match &promise {
-            Value::Obj(o) => Gc::as_ptr(o) as usize,
+        let key = match &(promise).view() {
+            ValueView::Obj(o) => Gc::as_ptr(o) as usize,
             _ => unreachable!(),
         };
         self.drive_async(
@@ -15610,7 +15711,7 @@ impl Interp {
     /// PromiseResolve with the observable `Get(x, "constructor")` on a native promise — a
     /// poisoned getter surfaces as the returned error.
     pub(crate) fn promise_resolve_checked(&mut self, v: Value) -> Result<Value, Value> {
-        if let Value::Obj(o) = &v {
+        if let ValueView::Obj(o) = &(v).view() {
             if self.promises.contains_key(&(Gc::as_ptr(o) as usize)) {
                 return match self.get_member_key(&v, "constructor") {
                     Ok(_) => Ok(v),
@@ -15646,7 +15747,7 @@ impl Interp {
                 self.make_array(rest)
             } else {
                 let mut v = args.get(i).cloned().unwrap_or(Value::Undefined);
-                if matches!(v, Value::Undefined) {
+                if matches!((v).view(), ValueView::Undefined) {
                     if let Some(d) = &p.default {
                         v = self.eval(d, scope)?;
                         if let (crate::ast::Pattern::Ident(n), true) =
@@ -15692,7 +15793,7 @@ impl Interp {
                 if let Some(b) = bs.vars.get_mut(&name) {
                     // Only a plain `var` slot (still `undefined`) inherits the parameter value; a
                     // function declaration keeps its function object.
-                    if matches!(b.value, Value::Undefined) {
+                    if matches!((b.value).view(), ValueView::Undefined) {
                         b.value = v;
                     }
                 }
@@ -15758,7 +15859,7 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         // IsConstructor is checked in the *caller's* realm, before any realm swap — the
         // TypeError for `new nonCtor` belongs to the code doing the `new`.
-        if !matches!(&callee, Value::Obj(_)) || !self.value_is_constructor(&callee) {
+        if !matches!(&(callee).view(), ValueView::Obj(_)) || !self.value_is_constructor(&callee) {
             return Err(self.throw(
                 "TypeError",
                 format!("{} is not a constructor", type_name(&callee)),
@@ -15767,7 +15868,7 @@ impl Interp {
         // A cross-realm constructor runs with its own realm's intrinsics active. The caller's
         // realm is remembered for the [[Construct]] errors thrown after the callee context pops.
         if self.multi_realm() {
-            if let Value::Obj(o) = &callee {
+            if let ValueView::Obj(o) = &(callee).view() {
                 if !self.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
                     if let Some(gptr) = self.callee_realm_global(o) {
                         let mut saved = self.realms[&gptr].snapshot_clone();
@@ -15795,8 +15896,8 @@ impl Interp {
         args: &[Value],
         new_target: Value,
     ) -> Result<Value, Abrupt> {
-        let obj = match &callee {
-            Value::Obj(o) => o.clone(),
+        let obj = match &(callee).view() {
+            ValueView::Obj(o) => o.clone(),
             _ => return Err(self.throw("TypeError", "value is not a constructor")),
         };
         // Proxy with a `construct` trap (or forward to the target).
@@ -15804,7 +15905,7 @@ impl Interp {
             if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&obj) as usize)).cloned()
             {
                 let trap = self.get_member_key(&handler, "construct")?;
-                if matches!(trap, Value::Undefined | Value::Null) {
+                if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
                     // Forward to the target's [[Construct]] with the original new.target.
                     return self.construct_inner(target, args, new_target);
                 }
@@ -15814,7 +15915,7 @@ impl Interp {
                 let arr = self.make_array(args.to_vec());
                 let result = self.call(trap, handler, &[target, arr, new_target.clone()])?;
                 // [[Construct]] invariant: the trap must return an Object.
-                if !matches!(result, Value::Obj(_)) {
+                if !matches!((result).view(), ValueView::Obj(_)) {
                     return Err(
                         self.throw("TypeError", "proxy construct trap returned a non-object")
                     );
@@ -15874,11 +15975,11 @@ impl Interp {
                 // OrdinaryCreateFromConstructor: the new instance's prototype comes from
                 // new.target; a non-object `prototype` falls back to new.target's realm's
                 // %Object.prototype% (GetFunctionRealm).
-                let proto = match self.get_member_key(&new_target, "prototype")? {
-                    Value::Obj(p) => Some(p),
+                let proto = match (self.get_member_key(&new_target, "prototype")?).view() {
+                    ValueView::Obj(p) => Some(p),
                     _ => {
-                        let realm = match &new_target {
-                            Value::Obj(nt) => self.get_function_realm_global(nt)?,
+                        let realm = match &(new_target).view() {
+                            ValueView::Obj(nt) => self.get_function_realm_global(nt)?,
                             _ => None,
                         };
                         realm
@@ -15915,8 +16016,8 @@ impl Interp {
                 // allocation size; all writes still perform their normal live semantic guards.
                 self.observe_construct_capacity(&obj, &this);
                 // A constructor explicitly returning an object overrides the instance.
-                Ok(match ret {
-                    Value::Obj(_) => ret,
+                Ok(match (ret).view() {
+                    ValueView::Obj(_) => ret,
                     _ => this_val,
                 })
             }
@@ -15995,8 +16096,8 @@ impl Interp {
         if Self::proxy_invariant_vacuous(target, key) {
             return Ok(());
         }
-        let prop = match target {
-            Value::Obj(t) => {
+        let prop = match &(target).view() {
+            ValueView::Obj(t) => {
                 crate::builtins::object_get_own_property(self, t, key).map_err(Abrupt::Throw)?
             }
             _ => None,
@@ -16004,8 +16105,9 @@ impl Interp {
         if let Some(p) = prop {
             if !p.configurable() {
                 let bad = if p.accessor() {
-                    matches!(p.getter(), None | Some(Value::Undefined))
-                        && !matches!(result, Value::Undefined)
+                    p.getter()
+                        .is_none_or(|value| matches!(value.view(), ValueView::Undefined))
+                        && !matches!(&(result).view(), ValueView::Undefined)
                 } else {
                     !p.writable() && !crate::builtins::same_value_pub(result, &p.value())
                 };
@@ -16033,8 +16135,8 @@ impl Interp {
         if Self::proxy_invariant_vacuous(target, key) {
             return Ok(());
         }
-        let prop = match target {
-            Value::Obj(t) => {
+        let prop = match &(target).view() {
+            ValueView::Obj(t) => {
                 crate::builtins::object_get_own_property(self, t, key).map_err(Abrupt::Throw)?
             }
             _ => None,
@@ -16042,7 +16144,8 @@ impl Interp {
         if let Some(p) = prop {
             if !p.configurable() {
                 let bad = if p.accessor() {
-                    matches!(p.setter(), None | Some(Value::Undefined))
+                    p.setter()
+                        .is_none_or(|value| matches!(value.view(), ValueView::Undefined))
                 } else {
                     !p.writable() && !crate::builtins::same_value_pub(value, &p.value())
                 };
@@ -16309,7 +16412,7 @@ impl Interp {
         for stmt in body {
             match self.exec_stmt(stmt, &env) {
                 Ok(v) => {
-                    if !matches!(v, Value::Empty) {
+                    if !matches!((v).view(), ValueView::Empty) {
                         last = v;
                     }
                 }
@@ -16754,15 +16857,15 @@ fn collect_annexb_funcs(
 }
 
 pub(crate) fn type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Undefined | Value::Empty => "undefined",
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Num(_) => "number",
-        Value::BigInt(_) => "bigint",
-        Value::Str(_) => "string",
-        Value::Sym(_) => "symbol",
-        Value::Obj(_) => "object",
+    match &(v).view() {
+        ValueView::Undefined | ValueView::Empty => "undefined",
+        ValueView::Null => "null",
+        ValueView::Bool(_) => "boolean",
+        ValueView::Num(_) => "number",
+        ValueView::BigInt(_) => "bigint",
+        ValueView::Str(_) => "string",
+        ValueView::Sym(_) => "symbol",
+        ValueView::Obj(_) => "object",
     }
 }
 

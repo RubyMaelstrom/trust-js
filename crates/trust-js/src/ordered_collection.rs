@@ -8,6 +8,7 @@
 //! Weak cursor registrations never retain an iterator or a JavaScript object.
 
 use crate::fasthash::{FastMap, FxHasher};
+use crate::value::ValueView;
 use crate::value::{Gc, Value};
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
@@ -164,9 +165,12 @@ impl OrderedCollection {
         // append. Hold the one index lookup across that decision: hashing a long String or
         // BigInt again, or probing the table again, has no semantic purpose. The ordered
         // entries and live cursors remain authoritative (ECMA-262 §24.1.3.9 / §24.2.4.1).
-        let key = match key {
-            Value::Num(n) => Value::Num(if n == 0.0 { 0.0 } else { n }),
-            key => key,
+        let key = {
+            let __value_match_original = key;
+            match (__value_match_original).view() {
+                ValueView::Num(n) => Value::Num(if n == 0.0 { 0.0 } else { n }),
+                _ => __value_match_original,
+            }
         };
         let hash = key_hash(&key);
         match self.index.entry(hash) {
@@ -329,8 +333,8 @@ impl OrderedCollection {
 }
 
 fn same_key(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Num(a), Value::Num(b)) => a == b || (a.is_nan() && b.is_nan()),
+    match (&(left).view(), &(right).view()) {
+        (ValueView::Num(a), ValueView::Num(b)) => a == b || (a.is_nan() && b.is_nan()),
         _ => crate::builtins::same_value_pub(left, right),
     }
 }
@@ -341,15 +345,15 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
     #[cfg(test)]
     KEY_HASH_CALLS.with(|count| count.set(count.get() + 1));
     let mut state = FxHasher::default();
-    match value {
-        Value::Undefined => state.write_u8(0),
-        Value::Empty => state.write_u8(1),
-        Value::Null => state.write_u8(2),
-        Value::Bool(value) => {
+    match &(value).view() {
+        ValueView::Undefined => state.write_u8(0),
+        ValueView::Empty => state.write_u8(1),
+        ValueView::Null => state.write_u8(2),
+        ValueView::Bool(value) => {
             state.write_u8(3);
             value.hash(&mut state);
         }
-        Value::Num(value) => {
+        ValueView::Num(value) => {
             state.write_u8(4);
             state.write_u64(if *value == 0.0 {
                 0.0f64.to_bits()
@@ -359,11 +363,11 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
                 value.to_bits()
             });
         }
-        Value::BigInt(value) => {
+        ValueView::BigInt(value) => {
             state.write_u8(5);
             value.hash(&mut state);
         }
-        Value::Str(value) => {
+        ValueView::Str(value) => {
             state.write_u8(6);
             value.hash(&mut state);
             // Fx's byte loop still leaves clustered low bits for fixed-width suffixes.
@@ -374,11 +378,11 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
             let hash = (hash ^ (hash >> 32)).wrapping_mul(0xd6e8_feb8_6659_fd93);
             return hash ^ (hash >> 32);
         }
-        Value::Sym(value) => {
+        ValueView::Sym(value) => {
             state.write_u8(7);
             state.write_u64(value.id);
         }
-        Value::Obj(value) => {
+        ValueView::Obj(value) => {
             state.write_u8(8);
             state.write_usize(Gc::as_ptr(value) as usize);
         }
@@ -483,10 +487,11 @@ impl crate::gc_trace::GcTrace for OrderedCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
 
     fn number(value: &Value) -> u32 {
-        match value {
-            Value::Num(value) => *value as u32,
+        match &(value).view() {
+            ValueView::Num(value) => *value as u32,
             _ => panic!("expected numeric model value"),
         }
     }
@@ -629,7 +634,7 @@ mod tests {
             .iter()
             .find(|(key, _)| same_key(key, &Value::Num(0.0)))
             .unwrap();
-        assert!(matches!(zero.0, Value::Num(n) if !n.is_sign_negative()));
+        assert!(matches!((zero.0).view(), ValueView::Num(n) if !n.is_sign_negative()));
     }
 
     #[test]
@@ -645,7 +650,10 @@ mod tests {
         once(&mut || data.insert(Value::Undefined, Value::Num(1.0)));
         once(&mut || data.insert(collision.clone(), Value::Num(2.0)));
         let cursor = data.cursor();
-        assert!(matches!(data.next(&cursor).unwrap().0, Value::Undefined));
+        assert!(matches!(
+            (data.next(&cursor).unwrap().0).view(),
+            ValueView::Undefined
+        ));
         // Updating a collision hit must neither append nor advance/rewind live cursors.
         once(&mut || data.insert(collision.clone(), Value::Num(3.0)));
         once(&mut || data.insert(Value::Undefined, Value::Num(4.0)));
@@ -655,7 +663,10 @@ mod tests {
         once(&mut || assert!(data.delete(&Value::Undefined)));
         once(&mut || assert!(!data.delete(&Value::Undefined)));
         once(&mut || data.insert(Value::Undefined, Value::Num(5.0)));
-        assert!(matches!(data.next(&cursor).unwrap().0, Value::Undefined));
+        assert!(matches!(
+            (data.next(&cursor).unwrap().0).view(),
+            ValueView::Undefined
+        ));
         assert!(data.next(&cursor).is_none());
         // Collapse Many to One through the other key, then remove the final bucket.
         once(&mut || assert!(data.delete(&collision)));

@@ -2,6 +2,7 @@
 //! ApplyStringOrNumericBinaryOperator 21341, String.prototype.concat 36291.
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 fn check(source: &str, expected: &str) {
@@ -200,11 +201,11 @@ fn string_concat_helpers_reach_compiled_tiers() {
         "#, false), Ok(Completion::Value(v)) if v == "true"));
         for name in ["add", "append", "appendLocal", "appendCaptured"] {
             let env = engine.interp.global_env.clone();
-            let crate::value::Value::Obj(object) = engine
+            let ValueView::Obj(object) = (engine
                 .interp
                 .get_var(name, &env)
-                .unwrap_or_else(|_| panic!("missing {name}"))
-            else {
+                .unwrap_or_else(|_| panic!("missing {name}")))
+            .view() else {
                 panic!("{name} is not an object");
             };
             let object = object.borrow();

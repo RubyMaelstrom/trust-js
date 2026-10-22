@@ -377,6 +377,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
     use crate::{
         ast::LoopSite,
         bytecode::{loop_fragment, Tier},
@@ -1005,8 +1006,10 @@ mod tests {
             b.eval("var obj={pad:0,x:7}", false).unwrap();
             for (first, expected) in [(true, 600.0), (false, 2100.0), (true, 600.0)] {
                 let engine = if first { &mut a } else { &mut b };
-                assert!(matches!(engine.interp.run_program(&body),
-                    Ok(crate::value::Value::Num(value)) if value == expected));
+                assert!(
+                    matches!((engine.interp.run_program(&body)).map(|__value| (__value).view()),
+                    Ok(ValueView::Num(value)) if value == expected)
+                );
             }
             let cached = |engine: &Engine| {
                 engine

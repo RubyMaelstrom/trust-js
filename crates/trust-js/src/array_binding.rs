@@ -34,7 +34,7 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         // No intervening initialization can execute JS. Keep the checked read available
         // rather than introduce raw layouts.
-        self.fast_get_elem(source.as_obj().expect("binding Array"), index as f64)
+        self.fast_get_elem(&source.as_obj().expect("binding Array"), index as f64)
             .map(Ok)
             .unwrap_or_else(|| self.get_member_key(source, &index.to_string()))
     }
@@ -62,8 +62,8 @@ impl Interp {
         let remaining = count.saturating_sub(index);
         for _ in 0..remaining {
             if !done {
-                if index < self.array_length(array) {
-                    let value = match self.fast_get_elem(array, index as f64) {
+                if index < self.array_length(&array) {
+                    let value = match self.fast_get_elem(&array, index as f64) {
                         Some(value) => value,
                         None => match self.get_member_key(source, &index.to_string()) {
                             Ok(value) => value,
@@ -97,7 +97,8 @@ impl Interp {
         if !crate::builtins::array_iteration_is_intrinsic(self, source) {
             return None;
         }
-        let body = source.as_obj()?.borrow();
+        let object = source.as_obj()?;
+        let body = object.borrow();
         let length = crate::builtins::ordinary_array_length(&body.props)?;
         let mut index = 0;
         while index < count.min(length) {

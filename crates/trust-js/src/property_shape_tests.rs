@@ -5,6 +5,7 @@
 //! from creating a strong object edge between these separate Agents (I6).
 
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 /// The engine value of `source` (unbranded: the crate's own form).
@@ -37,12 +38,12 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
         let global = owner.interp.global_this();
         owner
             .interp
-            .set_member_key(&global, "a", local.clone())
+            .set_member_key(&global, "a", local)
             .ok()
             .unwrap();
         owner
             .interp
-            .set_member_key(&global, "b", original.clone())
+            .set_member_key(&global, "b", original)
             .ok()
             .unwrap();
 
@@ -192,15 +193,18 @@ fn property_shapes_exhausted_array_length_hint_does_not_hide_named_properties() 
         .array_length_shape
         .set(SHAPE_UNCACHEABLE);
     assert!(matches!(
-        props.get("named").unwrap().value(),
-        Value::Num(37.0)
+        (props.get("named").unwrap().value()).view(),
+        ValueView::Num(37.0)
     ));
     assert!(props.get("missing").is_none());
     assert!(matches!(
-        props.get("length").unwrap().value(),
-        Value::Num(12.0)
+        (props.get("length").unwrap().value()).view(),
+        ValueView::Num(12.0)
     ));
-    assert!(matches!(props.get("11").unwrap().value(), Value::Num(11.0)));
+    assert!(matches!(
+        (props.get("11").unwrap().value()).view(),
+        ValueView::Num(11.0)
+    ));
 }
 
 #[test]
@@ -264,7 +268,9 @@ fn value_only_writes_keep_shape_but_mutable_escape_demotes() {
     assert_eq!(props.shape(), shared, "value-only write by key");
     assert!(props.set_value_at(0, Value::Num(3.0)));
     assert_eq!(props.shape(), shared, "value-only write by slot");
-    assert!(matches!(props.take_value("pc_k"), Some(Value::Num(n)) if n == 3.0));
+    assert!(
+        matches!((props.take_value("pc_k")).map(|__value| (__value).view()), Some(ValueView::Num(n)) if n == 3.0)
+    );
     assert_eq!(props.shape(), shared, "value-only take");
     assert!(props.set_value("pc_k", Value::Num(4.0)));
     // Acquiring &mut Property demotes even before any descriptor is touched: the

@@ -17,6 +17,7 @@
 //! holds the prompt hostage until cleared (Ctrl-C kills the process; there is no per-line
 //! signal handling in pure std).
 
+use trust_js_host::ValueKind;
 use trust_js_host::{Ctx, Handle, ParseError, Value};
 use trust_js_runtime::{describe_error, render_value, Runtime};
 
@@ -150,10 +151,13 @@ impl Repl {
             let global = ctx.global_this();
             let settled = ctx.get_member(&global, "__repl_settled").ok()?;
             let _ = ctx.set_member(&global, "__repl_settled", Value::Undefined);
-            if matches!(settled, Value::Undefined) {
+            if matches!((settled).kind(), ValueKind::Undefined) {
                 return Some(None);
             }
-            let ok = matches!(ctx.get_member(&settled, "ok"), Ok(Value::Bool(true)));
+            let ok = matches!(
+                (ctx.get_member(&settled, "ok")).map(|__value| (__value).kind()),
+                Ok(ValueKind::Bool(true))
+            );
             let value = ctx.get_member(&settled, "value").ok()?;
             Some(Some((
                 ok,
@@ -178,10 +182,18 @@ impl Repl {
             let v = held.get(ctx).expect("the engine's own handle");
             let global = ctx.global_this();
             let _ = ctx.set_member(&global, "_", v);
-            match &v {
-                // Quote strings so `"42"` and `42` are distinguishable, as every REPL does.
-                Value::Str(_) => format!("'{}'", v.as_text().unwrap_or_default()),
-                other => render_value(ctx, other),
+            {
+                let __value_match_original = &v;
+                match &(__value_match_original).kind() {
+                    // Quote strings so `"42"` and `42` are distinguishable, as every REPL does.
+                    ValueKind::Str(_) => {
+                        format!("'{}'", v.as_text().unwrap_or_default())
+                    }
+                    _ => {
+                        let other = __value_match_original;
+                        render_value(ctx, other)
+                    }
+                }
             }
         });
         Step::Done(text)

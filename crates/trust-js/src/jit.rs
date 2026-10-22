@@ -24,6 +24,7 @@
     allow(dead_code)
 )]
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
@@ -1365,6 +1366,7 @@ impl Drop for ExecutableCodeReservation<'_> {
 #[cfg(test)]
 mod executable_code_budget_tests {
     use super::*;
+    use crate::value::ValueView;
     use std::sync::atomic::Ordering::Relaxed;
 
     #[test]
@@ -1465,10 +1467,10 @@ mod executable_code_budget_tests {
         let held =
             ExecutableCodeReservation::try_new(budget, budget.remaining.load(Relaxed)).unwrap();
         assert!(
-            matches!(engine.interp.call(function.clone(), Value::Undefined, &[Value::Num(41.0)]),
-            Ok(Value::Num(value)) if value == 42.0)
+            matches!((engine.interp.call(function.clone(), Value::Undefined, &[Value::Num(41.0)])).map(|__value| (__value).view()),
+            Ok(ValueView::Num(value)) if value == 42.0)
         );
-        let Value::Obj(object) = &function else {
+        let ValueView::Obj(object) = &(function).view() else {
             panic!("function object")
         };
         let chunk = match &object.borrow().call {
@@ -1490,8 +1492,8 @@ mod executable_code_budget_tests {
         let denials = budget.denials.load(Relaxed);
         for _ in 0..32 {
             assert!(
-                matches!(engine.interp.call(function.clone(), Value::Undefined, &[Value::Num(41.0)]),
-                Ok(Value::Num(value)) if value == 42.0)
+                matches!((engine.interp.call(function.clone(), Value::Undefined, &[Value::Num(41.0)])).map(|__value| (__value).view()),
+                Ok(ValueView::Num(value)) if value == 42.0)
             );
         }
         assert_eq!(
@@ -1518,8 +1520,8 @@ mod executable_code_budget_tests {
         );
         drop(held);
         assert!(
-            matches!(engine.interp.call(function, Value::Undefined, &[Value::Num(41.0)]),
-            Ok(Value::Num(value)) if value == 42.0)
+            matches!((engine.interp.call(function, Value::Undefined, &[Value::Num(41.0)])).map(|__value| (__value).view()),
+            Ok(ValueView::Num(value)) if value == 42.0)
         );
         assert!(
             chunk.jit.get().is_some_and(|code| code.is_some()),
@@ -1737,7 +1739,7 @@ pub struct JitCtx {
     /// [16] Final stack top, written by the epilogues (for leftover-value cleanup on throw).
     pub final_sp: *mut PackedValue,
     /// [24] Local slots base (the inline LoadLocal/StoreLocal templates index off this).
-    pub slots: *mut PackedValue,
+    pub slots: *mut Cell<PackedValue>,
     /// [32] Points at `Interp::inline_ic_safe` (a `Cell<bool>` byte): raw prototype-walk
     /// templates read it live and fall to the helper after a Proxy is created.
     pub inline_ic_safe: *const u8,
@@ -1864,7 +1866,7 @@ impl JitCtx {
     /// A runtime miss for one operation must not copy every local in a large function.
     pub(crate) unsafe fn clone_slot(&self, slot: usize) -> Value {
         debug_assert!(slot < self.n_slots);
-        unsafe { (*self.slots.add(slot)).unpack() }
+        unsafe { (*self.slots.add(slot)).get().unpack() }
     }
 }
 
@@ -7970,6 +7972,7 @@ extern "C" fn record_direct_packed_return() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 mod direct_call_tests {
+    use crate::value::ValueView;
     #[test]
     fn computed_method_native_probe_reads_live_values_and_preserves_owners() {
         use crate::value::{Object, PackedValue, Property, Value};
@@ -8032,8 +8035,9 @@ mod direct_call_tests {
             }
             let receiver = Value::Obj(object.clone());
             assert!(matches!(
-                engine.interp.get_computed_property(&receiver, &key),
-                Ok(Value::Num(17.0))
+                (engine.interp.get_computed_property(&receiver, &key))
+                    .map(|__value| (__value).view()),
+                Ok(ValueView::Num(17.0))
             ));
             for value in [Value::Num(29.0), Value::Str(key.clone()), receiver.clone()] {
                 holder.borrow_mut().props.set_value(&key, value.clone());
@@ -8047,10 +8051,16 @@ mod direct_call_tests {
                     end
                 );
                 assert_eq!(ctx[0], 0, "expected a native cache hit, depth {depth}");
-                match (&operands[1].unpack(), &value) {
-                    (Value::Num(a), Value::Num(b)) => assert_eq!(a, b),
-                    (Value::Str(a), Value::Str(b)) => assert!(crate::lstr::LStr::ptr_eq(a, b)),
-                    (Value::Obj(a), Value::Obj(b)) => assert!(crate::value::Gc::ptr_eq(a, b)),
+                match (&(operands[1].unpack()).view(), &(value).view()) {
+                    (ValueView::Num(a), ValueView::Num(b)) => {
+                        assert_eq!(a, b)
+                    }
+                    (ValueView::Str(a), ValueView::Str(b)) => {
+                        assert!(crate::lstr::LStr::ptr_eq(a, b))
+                    }
+                    (ValueView::Obj(a), ValueView::Obj(b)) => {
+                        assert!(crate::value::Gc::ptr_eq(a, b))
+                    }
                     _ => panic!("wrong computed value"),
                 }
                 drop(operands);
@@ -8124,7 +8134,9 @@ mod direct_call_tests {
                 "native/Rust probe disagreement after growth"
             );
             if cached {
-                assert!(matches!(operands[1].unpack(), Value::Num(value) if value == n as f64));
+                assert!(
+                    matches!((operands[1].unpack()).view(), ValueView::Num(value) if value == n as f64)
+                );
             }
             ctx[0] = 0;
         }
@@ -8142,7 +8154,9 @@ mod direct_call_tests {
                 );
             }
             assert_eq!(ctx[0], 0, "a refilled key must hit the grown table");
-            assert!(matches!(operands[1].unpack(), Value::Num(value) if value == n as f64));
+            assert!(
+                matches!((operands[1].unpack()).view(), ValueView::Num(value) if value == n as f64)
+            );
         }
     }
 
@@ -17790,7 +17804,7 @@ pub(crate) unsafe fn run_continuation(
     chunk: &Chunk,
     code: &JitCode,
     state: &mut crate::bytecode::NativeContinuation,
-    slots: &[PackedValue],
+    slots: &[Cell<PackedValue>],
     pc: &mut usize,
     this_val: &Value,
     handlers: &mut Vec<crate::bytecode::Handler>,
@@ -17816,7 +17830,7 @@ pub(crate) unsafe fn run_borrowed_frame(
     chunk: &Chunk,
     code: &JitCode,
     state: &mut crate::bytecode::NativeContinuation,
-    slots: &[PackedValue],
+    slots: &[Cell<PackedValue>],
     pc: &mut usize,
     this_val: &Value,
     handlers: &mut Vec<crate::bytecode::Handler>,
@@ -17978,8 +17992,13 @@ pub fn run(
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     let (n_params, n_slots) = chunk.jit_frame();
     let seed = n_params.min(args.len());
-    slots.extend(args[..seed].iter().cloned().map(PackedValue::pack));
-    slots.resize_with(n_slots, || PackedValue::pack(Value::Undefined));
+    slots.extend(
+        args[..seed]
+            .iter()
+            .copied()
+            .map(|value| Cell::new(PackedValue::pack(value))),
+    );
+    slots.resize_with(n_slots, || Cell::new(PackedValue::pack(Value::Undefined)));
     if let Some(rest) = chunk.rest_slot {
         let rest_values = args.get(n_params..).unwrap_or(&[]).to_vec();
         slots.write_value(rest as usize, i.make_array(rest_values));
@@ -18057,10 +18076,7 @@ pub fn run(
     if ok == 1 {
         Ok(ctx.take_ret().into_value())
     } else {
-        Err(ctx
-            .error
-            .take()
-            .unwrap_or_else(|| Abrupt::Throw(Value::Undefined)))
+        Err(ctx.error.take().unwrap_or(Abrupt::Throw(Value::Undefined)))
     }
 }
 
@@ -18100,7 +18116,7 @@ pub(crate) const FRAME_POOL_LIMIT: usize = 256;
 #[repr(C)]
 pub(crate) struct JitFrame {
     pub(crate) ctx: JitCtx,
-    words: [std::mem::MaybeUninit<PackedValue>; FRAME_BUF],
+    words: [std::mem::MaybeUninit<Cell<PackedValue>>; FRAME_BUF],
 }
 
 /// Byte offset of a record's slot storage from the record (and its context) base.
@@ -18123,14 +18139,18 @@ impl JitFrame {
         let mut record = Box::<JitFrame>::new_uninit();
         let base = record.as_mut_ptr();
         let record = unsafe {
-            let words = std::ptr::addr_of_mut!((*base).words).cast::<PackedValue>();
+            let slots = std::ptr::addr_of_mut!((*base).words).cast::<Cell<PackedValue>>();
+            // All mixed-buffer words have real UnsafeCell backing. Slot loans are shared
+            // Cell slices; the disjoint operand tail is lent as raw inner-word storage only
+            // during native execution. No mutable slice is made from either shared loan.
+            let words = slots.cast::<PackedValue>();
             // The collector scans an active record's words whole (see `JitFrame`).
-            words.write_bytes(0, FRAME_BUF);
+            slots.write_bytes(0, FRAME_BUF);
             std::ptr::addr_of_mut!((*base).ctx).write(JitCtx {
                 helpers: i.jit_helpers.as_ptr(),
                 stack_base: words,
                 final_sp: words,
-                slots: words,
+                slots,
                 inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
                 env_raw: std::ptr::null(),
                 this_word: PackedValue::pack(Value::Undefined),
@@ -18364,19 +18384,23 @@ unsafe fn run_moved_inner(
     let frame = i.frame_pool.pop().unwrap_or_else(|| JitFrame::alloc(i));
     let ctx = unsafe { &mut (*frame.as_ptr()).ctx };
     let slots_ptr = ctx.slots;
-    let stack_base = unsafe { slots_ptr.add(n_slots) };
+    let stack_base = unsafe { slots_ptr.add(n_slots).cast::<PackedValue>() };
     unsafe {
-        std::ptr::copy_nonoverlapping(args, slots_ptr, seed);
+        std::ptr::copy_nonoverlapping(args, slots_ptr.cast::<PackedValue>(), seed);
         // A packed Undefined is a complete tagged word, never a zeroed wide discriminant.
         for k in seed..n_slots {
-            slots_ptr.add(k).write(PackedValue::pack(Value::Undefined));
+            slots_ptr
+                .add(k)
+                .write(Cell::new(PackedValue::pack(Value::Undefined)));
         }
         // Surplus arguments were still moved to us: they become the rest parameter's Array
         // (CreateArrayFromList), or are dropped.
         if let Some(rest) = chunk.rest_slot {
             let array = i.make_array_from_raw(args.add(seed), argc - seed);
             std::ptr::drop_in_place(slots_ptr.add(rest as usize));
-            slots_ptr.add(rest as usize).write(PackedValue::pack(array));
+            slots_ptr
+                .add(rest as usize)
+                .write(Cell::new(PackedValue::pack(array)));
         } else {
             for k in seed..argc {
                 std::ptr::drop_in_place(args.add(k));
@@ -18386,7 +18410,9 @@ unsafe fn run_moved_inner(
             if slot < seed {
                 std::ptr::drop_in_place(slots_ptr.add(slot));
             }
-            slots_ptr.add(slot).write(PackedValue::pack(value));
+            slots_ptr
+                .add(slot)
+                .write(Cell::new(PackedValue::pack(value)));
         }
     }
     let env = unsafe { &*env };
@@ -18418,10 +18444,7 @@ unsafe fn run_moved_inner(
     let result = if ok == 1 {
         Ok(ctx.take_ret())
     } else {
-        Err(ctx
-            .error
-            .take()
-            .unwrap_or_else(|| Abrupt::Throw(Value::Undefined)))
+        Err(ctx.error.take().unwrap_or(Abrupt::Throw(Value::Undefined)))
     };
     unsafe { JitFrame::release(i, frame) };
     result
@@ -18459,14 +18482,18 @@ unsafe fn run_moved_oversized(
     stack.reserve(code.max_stack);
     let (slots_ptr, stack_base) = (slots.as_mut_ptr(), stack.as_mut_ptr());
     unsafe {
-        std::ptr::copy_nonoverlapping(args, slots_ptr, seed);
+        std::ptr::copy_nonoverlapping(args, slots_ptr.cast::<PackedValue>(), seed);
         for k in seed..n_slots {
-            slots_ptr.add(k).write(PackedValue::pack(Value::Undefined));
+            slots_ptr
+                .add(k)
+                .write(Cell::new(PackedValue::pack(Value::Undefined)));
         }
         if let Some(rest) = chunk.rest_slot {
             let array = i.make_array_from_raw(args.add(seed), argc - seed);
             std::ptr::drop_in_place(slots_ptr.add(rest as usize));
-            slots_ptr.add(rest as usize).write(PackedValue::pack(array));
+            slots_ptr
+                .add(rest as usize)
+                .write(Cell::new(PackedValue::pack(array)));
         } else {
             for k in seed..argc {
                 std::ptr::drop_in_place(args.add(k));
@@ -18476,7 +18503,9 @@ unsafe fn run_moved_oversized(
             if slot < seed {
                 std::ptr::drop_in_place(slots_ptr.add(slot));
             }
-            slots_ptr.add(slot).write(PackedValue::pack(value));
+            slots_ptr
+                .add(slot)
+                .write(Cell::new(PackedValue::pack(value)));
         }
     }
     let env = unsafe { &*env };
@@ -18544,10 +18573,7 @@ unsafe fn run_moved_oversized(
     if ok == 1 {
         Ok(ctx.take_ret())
     } else {
-        Err(ctx
-            .error
-            .take()
-            .unwrap_or_else(|| Abrupt::Throw(Value::Undefined)))
+        Err(ctx.error.take().unwrap_or(Abrupt::Throw(Value::Undefined)))
     }
 }
 

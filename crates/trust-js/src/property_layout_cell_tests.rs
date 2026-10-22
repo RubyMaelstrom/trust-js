@@ -298,9 +298,9 @@ fn native_creation_records_an_old_receivers_only_edge_to_a_young_layout() {
     eval(&mut engine, "var target={},prefix={alpha:0};function write(){target.alpha=7;target.beta=8;}for(var k=0;k<100;k++){target={};write();}0");
     let env = engine.interp.global_env;
     let target_value = engine.interp.get_var("target", &env).ok().unwrap();
-    let target = *target_value.as_obj().unwrap();
+    let target = target_value.as_obj().unwrap();
     let prefix_value = engine.interp.get_var("prefix", &env).ok().unwrap();
-    let prefix = *prefix_value.as_obj().unwrap();
+    let prefix = prefix_value.as_obj().unwrap();
     let shapes = [prefix.borrow().props.shape(), target.borrow().props.shape()];
     let heap = engine.interp.gc_heap.clone();
     for _ in 0..256 {

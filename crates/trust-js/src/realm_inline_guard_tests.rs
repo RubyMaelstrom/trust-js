@@ -11,13 +11,14 @@
 use crate::bytecode::Tier;
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
+use crate::value::ValueView;
 use crate::Engine;
 
 pub(crate) const TIERS: [Tier; 3] = [Tier::Interp, Tier::Bytecode, Tier::Jit];
 
 /// Run `f` with `realm` installed as the active Realm, as an embedder's host operation does.
 pub(crate) fn in_realm<R>(it: &mut Interp, realm: &Value, f: impl FnOnce(&mut Interp) -> R) -> R {
-    let Value::Obj(global) = realm else {
+    let ValueView::Obj(global) = &(realm).view() else {
         panic!("a Realm is named by its global object");
     };
     let key = crate::value::Gc::as_ptr(global) as usize;

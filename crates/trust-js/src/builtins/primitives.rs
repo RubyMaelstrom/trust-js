@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 pub(super) fn install_number(it: &mut Interp) {
     let np = it.number_proto.clone();
@@ -17,14 +18,20 @@ pub(super) fn install_number(it: &mut Interp) {
     });
     it.def_method(&np, "toString", 1, |i, this, args| {
         let n = this_number(i, &this)?;
-        let radix = match arg(args, 0) {
-            Value::Undefined => 10.0,
-            v => {
-                let r = ab(i.to_number(&v))?;
-                if r.is_nan() {
-                    0.0
-                } else {
-                    r.trunc()
+        let radix = {
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined => 10.0,
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let r = ab(i.to_number(&v))?;
+                        if r.is_nan() {
+                            0.0
+                        } else {
+                            r.trunc()
+                        }
+                    }
                 }
             }
         };
@@ -61,12 +68,12 @@ pub(super) fn install_number(it: &mut Interp) {
         Ok(Value::lstr(to_exponential(
             x,
             f,
-            matches!(fd, Value::Undefined),
+            matches!((fd).view(), ValueView::Undefined),
         )))
     });
     it.def_method(&np, "toPrecision", 1, |i, this, args| {
         let n = this_number(i, &this)?;
-        if matches!(arg(args, 0), Value::Undefined) {
+        if matches!((arg(args, 0)).view(), ValueView::Undefined) {
             return Ok(Value::lstr(i.num_to_str(n)));
         }
         // ToIntegerOrInfinity(precision): NaN is 0, anything else truncates toward zero, so
@@ -116,8 +123,10 @@ pub(super) fn install_number(it: &mut Interp) {
         let n = match args.first() {
             None => 0.0,
             // Number(bigint) explicitly converts (only *implicit* ToNumber of a BigInt throws).
-            Some(Value::BigInt(n)) => n.to_f64(),
-            Some(v) => ab(i.to_number(v))?,
+            Some(v) => match v.view() {
+                ValueView::BigInt(n) => n.to_f64(),
+                _ => ab(i.to_number(v))?,
+            },
         };
         maybe_box(i, Value::Num(n))
     });
@@ -146,17 +155,17 @@ pub(super) fn install_number(it: &mut Interp) {
     it.def_method(&ctor, "isNaN", 1, nf_number_is_nan);
     it.def_method(&ctor, "isFinite", 1, |_i, _this, args| {
         Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Num(n) if n.is_finite()),
+            matches!((arg(args, 0)).view(), ValueView::Num(n) if n.is_finite()),
         ))
     });
     it.def_method(&ctor, "isSafeInteger", 1, |_i, _this, args| {
         Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Num(n) if n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0),
+            matches!((arg(args, 0)).view(), ValueView::Num(n) if n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0),
         ))
     });
     it.def_method(&ctor, "isInteger", 1, |_i, _this, args| {
         Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Num(n) if n.is_finite() && n.fract() == 0.0),
+            matches!((arg(args, 0)).view(), ValueView::Num(n) if n.is_finite() && n.fract() == 0.0),
         ))
     });
     set_builtin(&it.global, "Number", Value::Obj(ctor));
@@ -459,9 +468,9 @@ pub(super) fn install_boolean(it: &mut Interp) {
 
 /// thisBooleanValue: a Boolean primitive or Boolean wrapper, else TypeError.
 fn this_boolean(i: &mut Interp, this: &Value) -> Result<bool, Value> {
-    match this {
-        Value::Bool(b) => Ok(*b),
-        Value::Obj(o) => match o.borrow().exotic {
+    match &(this).view() {
+        ValueView::Bool(b) => Ok(*b),
+        ValueView::Obj(o) => match o.borrow().exotic {
             Exotic::BoolWrap(b) => Ok(b),
             _ => Err(i.make_error(
                 "TypeError",
@@ -477,9 +486,9 @@ fn this_boolean(i: &mut Interp, this: &Value) -> Result<bool, Value> {
 
 /// thisSymbolValue: a Symbol primitive or Symbol wrapper object, else TypeError.
 fn this_symbol(i: &mut Interp, this: &Value) -> Result<crate::value::SymbolRef, Value> {
-    match this {
-        Value::Sym(s) => Ok(s.clone()),
-        Value::Obj(o) => match &o.borrow().exotic {
+    match &(this).view() {
+        ValueView::Sym(s) => Ok(s.clone()),
+        ValueView::Obj(o) => match &o.borrow().exotic {
             Exotic::SymWrap(s) => Ok(s.clone()),
             _ => Err(i.make_error("TypeError", "Symbol method called on incompatible receiver")),
         },
@@ -528,9 +537,15 @@ pub(super) fn install_symbol(it: &mut Interp) {
         if i.constructing {
             return Err(i.make_error("TypeError", "Symbol is not a constructor"));
         }
-        let desc = match arg(args, 0) {
-            Value::Undefined => None,
-            v => Some(ab(i.to_string(&v))?),
+        let desc = {
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined => None,
+                _ => {
+                    let v = __value_match_original;
+                    Some(ab(i.to_string(&v))?)
+                }
+            }
         };
         Ok(i.new_symbol(desc.map(Into::into)))
     });
@@ -566,7 +581,7 @@ pub(super) fn install_symbol(it: &mut Interp) {
     ] {
         let sym = it.well_known_symbol(name);
         if name == "iterator" {
-            if let Value::Sym(d) = &sym {
+            if let ValueView::Sym(d) = &(sym).view() {
                 it.iterator_sym = Some(d.clone());
             }
         }
@@ -580,7 +595,7 @@ pub(super) fn install_symbol(it: &mut Interp) {
         Ok(Value::Sym(i.symbol_for(key)))
     });
     it.def_method(&ctor, "keyFor", 1, |i, _this, args| {
-        let Value::Sym(s) = arg(args, 0) else {
+        let ValueView::Sym(s) = (arg(args, 0)).view() else {
             return Err(i.make_error("TypeError", "Symbol.keyFor: argument is not a Symbol"));
         };
         Ok(i.symbol_key_for(&s)
@@ -615,9 +630,9 @@ fn to_bigint(i: &mut Interp, v: &Value) -> Result<crate::bigint::JsBigInt, Value
 
 /// thisBigIntValue: a BigInt primitive or BigInt wrapper object, else TypeError.
 fn this_bigint(i: &mut Interp, this: &Value) -> Result<crate::bigint::JsBigInt, Value> {
-    match this {
-        Value::BigInt(n) => Ok(n.clone()),
-        Value::Obj(o) => match &o.borrow().exotic {
+    match &(this).view() {
+        ValueView::BigInt(n) => Ok(n.clone()),
+        ValueView::Obj(o) => match &o.borrow().exotic {
             Exotic::BigIntWrap(n) => Ok((**n).clone()),
             _ => Err(i.make_error("TypeError", "BigInt method called on incompatible receiver")),
         },
@@ -630,16 +645,23 @@ pub(super) fn install_bigint(it: &mut Interp) {
     Rc::make_mut(&mut it.extra_protos).insert("BigInt", proto.clone());
     it.def_method(&proto, "toString", 0, |i, this, a| {
         let n = this_bigint(i, &this)?;
-        let radix = match arg(a, 0) {
-            Value::Undefined => 10,
-            v => {
-                let r = ab(i.to_number(&v))?.trunc();
-                if !(2.0..=36.0).contains(&r) {
-                    return Err(
-                        i.make_error("RangeError", "toString radix must be between 2 and 36")
-                    );
+        let radix = {
+            let __value_match_original = arg(a, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined => 10,
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let r = ab(i.to_number(&v))?.trunc();
+                        if !(2.0..=36.0).contains(&r) {
+                            return Err(i.make_error(
+                                "RangeError",
+                                "toString radix must be between 2 and 36",
+                            ));
+                        }
+                        r as u32
+                    }
                 }
-                r as u32
             }
         };
         Ok(Value::lstr(ab(i.bigint_to_string(&n, radix))?))
@@ -664,19 +686,21 @@ pub(super) fn install_bigint(it: &mut Interp) {
         }
         // ToPrimitive(value, number) first; a Number primitive then goes through
         // NumberToBigInt (RangeError for NaN/Infinity/non-integral), unlike plain ToBigInt.
-        let prim = match arg(a, 0) {
-            v @ Value::Obj(_) => ab(i.to_primitive(&v, crate::eval::Hint::Number))?,
-            v => v,
+        let input = arg(a, 0);
+        let prim = if matches!(input.view(), ValueView::Obj(_)) {
+            ab(i.to_primitive(&input, crate::eval::Hint::Number))?
+        } else {
+            input
         };
-        match prim {
-            Value::BigInt(n) => Ok(Value::BigInt(n)),
-            Value::Num(n) => crate::bigint::JsBigInt::from_f64(n)
+        match (prim).view() {
+            ValueView::BigInt(n) => Ok(Value::BigInt(n)),
+            ValueView::Num(n) => crate::bigint::JsBigInt::from_f64(n)
                 .map(Value::BigInt)
                 .ok_or_else(|| {
                     i.make_error("RangeError", "The number cannot be converted to a BigInt")
                 }),
-            Value::Bool(b) => Ok(Value::BigInt(crate::bigint::JsBigInt::from_u64(b as u64))),
-            Value::Str(s) => ab(i.to_bigint(&Value::Str(s))).map(Value::BigInt),
+            ValueView::Bool(b) => Ok(Value::BigInt(crate::bigint::JsBigInt::from_u64(b as u64))),
+            ValueView::Str(s) => ab(i.to_bigint(&Value::Str(s))).map(Value::BigInt),
             _ => Err(i.make_error("TypeError", "Cannot convert value to a BigInt")),
         }
     });
@@ -747,6 +771,6 @@ pub(crate) fn nf_number_is_nan(
     args: &[Value],
 ) -> Result<Value, Value> {
     Ok(Value::Bool(
-        matches!(arg(args, 0), Value::Num(n) if n.is_nan()),
+        matches!((arg(args, 0)).view(), ValueView::Num(n) if n.is_nan()),
     ))
 }

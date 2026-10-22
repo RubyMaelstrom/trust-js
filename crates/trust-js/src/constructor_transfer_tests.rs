@@ -151,7 +151,7 @@ fn constructor_transfer_sole_object_owner_survives_gc_then_releases() {
                 let retained = engine.interp.get_var("retained", &env).ok().unwrap();
                 let object = retained.as_obj().unwrap();
                 let payload = object.borrow().props.get("value").unwrap().value();
-                Gc::downgrade(payload.as_obj().unwrap())
+                Gc::downgrade(&payload.as_obj().unwrap())
             });
             engine.interp.gc_collect();
             assert_eq!(

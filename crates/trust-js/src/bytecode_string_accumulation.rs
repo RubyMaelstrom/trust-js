@@ -6,6 +6,9 @@
 //! the original operations and owners untouched. No post-RHS name re-resolution
 //! is used to guess the original Reference.
 
+use crate::value::ValueView;
+use std::cell::Cell;
+
 use super::{observe_arithmetic_operands, observe_arithmetic_result, Chunk, Op};
 use crate::execution_storage::{SlotAccess, StoredValue, ValueStack};
 use crate::interpreter::{Env, Interp, MAX_STR_LEN};
@@ -83,7 +86,7 @@ fn try_store(
     plan: Plan,
     right: Value,
 ) -> Option<Stored> {
-    let Value::Str(ref suffix) = right else {
+    let ValueView::Str(ref suffix) = (right).view() else {
         return None;
     };
     let name = &chunk.names[plan.name as usize];
@@ -105,7 +108,7 @@ fn try_store(
                 {
                     return None;
                 }
-                let Value::Str(prefix) = &binding.value else {
+                let ValueView::Str(prefix) = &(binding.value).view() else {
                     return None;
                 };
                 if prefix.len().saturating_add(suffix.len()) > MAX_STR_LEN {
@@ -117,13 +120,14 @@ fn try_store(
                     &binding.value,
                     &right,
                 );
-                // The binding remains populated, including throughout allocation. There is no
-                // copied left operand to retain the prefix: no observer or interior resume can
-                // enter this region. Real aliases (including the RHS/view owners) remain live.
-                let Value::Str(prefix) = &mut binding.value else {
+                // Keep the original binding populated and rooted throughout decode/append.
+                // Commit the copied prefix before any observer or interior resume can enter;
+                // real aliases, including the RHS and substring views, keep their old text.
+                let ValueView::Str(mut prefix) = binding.value.view() else {
                     unreachable!()
                 };
                 prefix.append_or_replace(suffix);
+                binding.value = Value::Str(prefix);
                 observe_arithmetic_result(&chunk.feedback, plan.pc + 2, profiling, &binding.value);
                 let stored = Stored {
                     result: plan.keep.then(|| binding.value.clone()),
@@ -146,7 +150,7 @@ pub(super) fn try_vm<S: StoredValue>(
     chunk: &Chunk,
     interp: &mut Interp,
     env: &Env,
-    slots: &[S],
+    slots: &[Cell<S>],
     stack: &mut ValueStack<S>,
     pc: usize,
     stop_at: Option<usize>,

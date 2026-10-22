@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 pub(super) fn install_json(it: &mut Interp) {
     let j = it.new_object();
@@ -14,9 +15,9 @@ pub(super) fn install_json(it: &mut Interp) {
                 keys: None,
             }
         } else if json_is_array(i, &replacer)? {
-            let len = match &replacer {
-                Value::Obj(o) if proxy_pair(i, &replacer).is_none() => i.array_length(o),
-                Value::Obj(o) => ab(i.to_length(o))?,
+            let len = match &(replacer).view() {
+                ValueView::Obj(o) if proxy_pair(i, &replacer).is_none() => i.array_length(o),
+                ValueView::Obj(o) => ab(i.to_length(o))?,
                 _ => 0,
             };
             let mut list: Vec<Rc<str>> = Vec::new();
@@ -27,10 +28,10 @@ pub(super) fn install_json(it: &mut Interp) {
             for k in 0..len {
                 let item = ab(i.get_member_key(&replacer, &k.to_string()))?;
                 // String/Number primitives and their wrappers contribute a key via ToString.
-                let key = match &item {
-                    Value::Str(s) => Some(s.to_string()),
-                    Value::Num(n) => Some(i.num_to_str(*n)),
-                    Value::Obj(o)
+                let key = match &(item).view() {
+                    ValueView::Str(s) => Some(s.to_string()),
+                    ValueView::Num(n) => Some(i.num_to_str(*n)),
+                    ValueView::Obj(o)
                         if matches!(o.borrow().exotic, Exotic::StrWrap(_) | Exotic::NumWrap(_)) =>
                     {
                         Some(ab(i.to_string(&item))?.to_string())
@@ -56,7 +57,7 @@ pub(super) fn install_json(it: &mut Interp) {
         // The `space` argument: a Number/String wrapper is unwrapped first; then a Number becomes
         // that many spaces (clamped 0..10), a String its first 10 code units, else no indentation.
         let mut space = arg(args, 2);
-        if let Value::Obj(o) = &space {
+        if let ValueView::Obj(o) = &(space).view() {
             // Classify first: the conversions may run JavaScript, which needs `o` unborrowed.
             let (number, string) = {
                 let exotic = &o.borrow().exotic;
@@ -71,16 +72,16 @@ pub(super) fn install_json(it: &mut Interp) {
                 space = Value::Str(ab(i.to_string(&space))?);
             }
         }
-        let gap = match space {
-            Value::Num(n) => {
+        let gap = match (space).view() {
+            ValueView::Num(n) => {
                 let n = if n.is_nan() { 0.0 } else { n.trunc() };
                 " ".repeat(n.clamp(0.0, 10.0) as usize)
             }
-            Value::Str(s) if s.ascii_hint() => s[..s.len().min(10)].to_owned(),
+            ValueView::Str(s) if s.ascii_hint() => s[..s.len().min(10)].to_owned(),
             // JSON.stringify takes the first ten UTF-16 code units, including a lone
             // surrogate when that boundary splits an astral character. Decode only
             // this bounded prefix instead of materializing the full indentation string.
-            Value::Str(s) => {
+            ValueView::Str(s) => {
                 crate::jstr::from_units(&crate::jstr::unit_iter(&s).take(10).collect::<Vec<_>>())
             }
             _ => String::new(),
@@ -180,7 +181,7 @@ pub(super) fn install_json(it: &mut Interp) {
     });
     it.def_method(&j, "isRawJSON", 1, |_i, _t, args| {
         Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Obj(o) if o.borrow().internal_slots().contains("\u{0}raw_json")),
+            matches!((arg(args, 0)).view(), ValueView::Obj(o) if o.borrow().internal_slots().contains("\u{0}raw_json")),
         ))
     });
     set_to_string_tag(it, &j, "JSON");
@@ -268,7 +269,7 @@ fn json_delete_prop(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Val
         ab(i.proxy_delete(target, handler, key))?;
         return Ok(());
     }
-    if let Value::Obj(o) = holder {
+    if let ValueView::Obj(o) = &(holder).view() {
         let configurable = o
             .borrow()
             .props
@@ -302,7 +303,7 @@ fn json_create_data_prop(i: &mut Interp, holder: &Value, key: &str, v: Value) ->
         ))?;
         return Ok(());
     }
-    if let Value::Obj(o) = holder {
+    if let ValueView::Obj(o) = &(holder).view() {
         ab(define_own_property(i, o, key, &Value::Obj(desc)))?;
     }
     Ok(())
@@ -318,10 +319,10 @@ fn internalize_json_property(
     record: Option<&JsonRecord>,
 ) -> Result<Value, Value> {
     let val = ab(i.get_member_key(holder, name))?;
-    if matches!(val, Value::Obj(_)) {
+    if matches!((val).view(), ValueView::Obj(_)) {
         if json_is_array(i, &val)? {
             let len = match val.as_obj() {
-                Some(o) => ab(i.to_length(o))?,
+                Some(o) => ab(i.to_length(&o))?,
                 None => 0,
             };
             for idx in 0..len {
@@ -333,7 +334,7 @@ fn internalize_json_property(
                 let new_el = nested(i, |i| {
                     internalize_json_property(i, &val, &k, reviver, child)
                 })?;
-                if matches!(new_el, Value::Undefined) {
+                if matches!((new_el).view(), ValueView::Undefined) {
                     json_delete_prop(i, &val, &k)?;
                 } else {
                     json_create_data_prop(i, &val, &k, new_el)?;
@@ -343,19 +344,26 @@ fn internalize_json_property(
             let keys: Vec<String> = if proxy_pair(i, &val).is_some() {
                 proxy_enum_string_keys(i, &val)?
                     .iter()
-                    .filter_map(|k| match k {
-                        Value::Str(s) => Some(crate::value::encode_owned_string_key(s.to_string())),
+                    .filter_map(|k| match &(k).view() {
+                        ValueView::Str(s) => {
+                            Some(crate::value::encode_owned_string_key(s.to_string()))
+                        }
                         _ => None,
                     })
                     .collect()
-            } else if let Some(info) = val.as_obj().and_then(|o| ta_info(i, o)) {
+            } else if let Some(info) = val.as_obj().and_then(|o| ta_info(i, &o)) {
                 // A TypedArray holder (a reviver may graft one in) walks its integer indices.
                 (0..i.ta_len(&info).unwrap_or(0))
                     .map(|k| k.to_string())
                     .collect()
             } else {
                 val.as_obj()
-                    .map(|o| ordered_enum_keys(o).iter().map(|k| k.to_string()).collect())
+                    .map(|o| {
+                        ordered_enum_keys(&o)
+                            .iter()
+                            .map(|k| k.to_string())
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
             for k in keys {
@@ -369,7 +377,7 @@ fn internalize_json_property(
                 let new_el = nested(i, |i| {
                     internalize_json_property(i, &val, &k, reviver, child)
                 })?;
-                if matches!(new_el, Value::Undefined) {
+                if matches!((new_el).view(), ValueView::Undefined) {
                     json_delete_prop(i, &val, &k)?;
                 } else {
                     json_create_data_prop(i, &val, &k, new_el)?;
@@ -381,7 +389,7 @@ fn internalize_json_property(
     // not forward-modified by the reviver) exposes its exact source text.
     let context = i.new_object();
     if let Some(JsonRecord::Prim(src, parsed)) = record {
-        if !matches!(val, Value::Obj(_)) && same_value(&val, parsed) {
+        if !matches!((val).view(), ValueView::Obj(_)) && same_value(&val, parsed) {
             set_data(&context, "source", Value::lstr(src.clone()));
         }
     }
@@ -489,7 +497,7 @@ fn json_get_index(
 /// on an ordinary prototype chain; walk such a chain directly, and leave accessors and exotic
 /// objects to the full [[Get]] (whose result is the same, including getter calls).
 fn json_to_json_method(i: &mut Interp, value: &Value) -> Result<Value, Value> {
-    if let Value::Obj(start) = value {
+    if let ValueView::Obj(start) = &(value).view() {
         let mut current = start.clone();
         loop {
             let next = {
@@ -522,7 +530,7 @@ fn json_serialize_property(
     key: JsonKey,
     mut value: Value,
 ) -> Result<bool, Value> {
-    if matches!(value, Value::Obj(_) | Value::BigInt(_)) {
+    if matches!((value).view(), ValueView::Obj(_) | ValueView::BigInt(_)) {
         let to_json = json_to_json_method(i, &value)?;
         if to_json.is_callable() {
             value = ab(i.call(to_json, value.clone(), &[key.value()]))?;
@@ -531,7 +539,7 @@ fn json_serialize_property(
     if let Some(func) = &s.opts.func {
         value = ab(i.call(func.clone(), holder.clone(), &[key.value(), value]))?;
     }
-    if let Value::Obj(o) = &value {
+    if let ValueView::Obj(o) = &(value).view() {
         // A JSON.rawJSON object (always created with a null prototype) serializes as its stored
         // raw text, verbatim.
         let raw = {
@@ -544,7 +552,7 @@ fn json_serialize_property(
                 Some(_) => None,
             }
         };
-        if let Some(Value::Str(raw)) = raw {
+        if let Some(ValueView::Str(raw)) = (raw).map(|__value| (__value).view()) {
             s.out.push_str(&raw);
             return Ok(true);
         }
@@ -566,27 +574,27 @@ fn json_serialize_property(
             None => {}
         }
     }
-    match &value {
-        Value::Undefined | Value::Empty | Value::Sym(_) => return Ok(false),
-        Value::Null => s.out.push_str("null"),
-        Value::Bool(b) => s.out.push_str(if *b { "true" } else { "false" }),
-        Value::Num(n) if !n.is_finite() => s.out.push_str("null"),
-        Value::Num(n) if n.fract() == 0.0 && n.abs() < 1e15 => {
+    match &(value).view() {
+        ValueView::Undefined | ValueView::Empty | ValueView::Sym(_) => return Ok(false),
+        ValueView::Null => s.out.push_str("null"),
+        ValueView::Bool(b) => s.out.push_str(if *b { "true" } else { "false" }),
+        ValueView::Num(n) if !n.is_finite() => s.out.push_str("null"),
+        ValueView::Num(n) if n.fract() == 0.0 && n.abs() < 1e15 => {
             // Integral and below 10^21, so Number::toString prints its digits (-0 prints "0").
             use std::fmt::Write;
             let _ = write!(s.out, "{}", *n as i64);
         }
-        Value::Num(n) => s.out.push_str(&i.num_to_str(*n)),
+        ValueView::Num(n) => s.out.push_str(&i.num_to_str(*n)),
         // JSON.stringify of a BigInt throws (matches the spec).
-        Value::BigInt(_) => {
+        ValueView::BigInt(_) => {
             return Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"));
         }
-        Value::Str(text) => {
+        ValueView::Str(text) => {
             // Escaping only lengthens the text.
             check_string_length(i, s.out.len().saturating_add(text.len()))?;
             json_quote_into(&mut s.out, text);
         }
-        Value::Obj(o) => {
+        ValueView::Obj(o) => {
             if !matches!(o.borrow().call, Callable::None) {
                 return Ok(false); // functions are omitted
             }
@@ -659,8 +667,10 @@ fn json_serialize_object(
         Some(list) => list.clone(),
         None if proxy_pair(i, value).is_some() => proxy_enum_string_keys(i, value)?
             .iter()
-            .filter_map(|key| match key {
-                Value::Str(key) => Some(Rc::from(crate::value::encode_string_key(key).as_ref())),
+            .filter_map(|key| match &(key).view() {
+                ValueView::Str(key) => {
+                    Some(Rc::from(crate::value::encode_string_key(key).as_ref()))
+                }
                 _ => None,
             })
             .collect(),

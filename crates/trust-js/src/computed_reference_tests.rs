@@ -32,7 +32,8 @@ fn check_all_tiers(source: &str, native_functions: &[&str]) {
                     .interp
                     .get_var(name, &env)
                     .unwrap_or_else(|_| panic!("{name}"));
-                let object = function.as_obj().expect("fixture function").borrow();
+                let object_handle = function.as_obj().expect("fixture function");
+                let object = object_handle.borrow();
                 let Callable::User(user) = &object.call else {
                     panic!("fixture user function")
                 };

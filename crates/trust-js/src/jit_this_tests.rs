@@ -20,7 +20,7 @@
 //! the packed word at [48] as a slot form reads its slot.
 
 use crate::bytecode::Tier;
-use crate::value::Value;
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 /// A fresh engine at `tier` that compiles every function at its first call.
@@ -46,7 +46,8 @@ fn with_chunk<R>(
 ) -> R {
     let env = engine.interp.global_env.clone();
     let value = engine.interp.get_var(name, &env).ok().expect("bound name");
-    let object = value.as_obj().expect("a function object").borrow();
+    let object_handle = value.as_obj().expect("a function object");
+    let object = object_handle.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
@@ -659,7 +660,7 @@ fn direct_calls_move_every_kind_of_receiver_and_reset_this() {
                 // SAFETY: a pooled record is allocated and runs nothing.
                 let this = unsafe { record.as_ref().ctx.this_value() };
                 assert!(
-                    matches!(this, Value::Undefined),
+                    matches!((this).view(), ValueView::Undefined),
                     "a pooled record holds Undefined"
                 );
             }

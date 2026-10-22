@@ -5,6 +5,7 @@ use super::*;
 use crate::ast::{Function, Stmt};
 use crate::bytecode::{self, Tier};
 use crate::interpreter::{new_scope, Binding};
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -253,7 +254,8 @@ fn prepare_callback(engine: &mut Engine) -> Rc<Chunk> {
     let env = engine.interp.global_env.clone();
     let value = engine.interp.get_var("push", &env).ok().unwrap();
     let function = {
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("callback")
         };
@@ -455,7 +457,8 @@ fn shared_snapshot_native_code_uses_each_realms_live_declarative_holder() {
     fn append_function(i: &mut Interp) -> Rc<Function> {
         let env = i.global_env.clone();
         let value = i.get_var("appendPart", &env).ok().unwrap();
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("shared function")
         };
@@ -562,9 +565,7 @@ fn prefix(engine: &mut Engine, state: &mut bytecode::VmCoro, stop: usize) {
             Some(stop),
             None
         ),
-        Ok(bytecode::VmRunExit::Step(bytecode::VmStep::Done(
-            Value::Undefined
-        )))
+        Ok(bytecode::VmRunExit::Step(bytecode::VmStep::Done(value))) if matches!(value.view(), ValueView::Undefined)
     ));
     assert_eq!(state.pc, stop);
 }
@@ -679,7 +680,9 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
             )
         }
         .unwrap_or_else(|_| panic!("native continuation must complete without error"));
-        assert!(matches!(step, bytecode::VmStep::Yield(Value::Undefined)));
+        assert!(
+            matches!(step, bytecode::VmStep::Yield(value) if matches!(value.view(), ValueView::Undefined))
+        );
         assert_eq!(TEST_NATIVE_HITS.with(Cell::get), hits + 1);
         assert_eq!(result(&holder).as_engine_text().unwrap(), "CB");
     }
@@ -721,7 +724,7 @@ fn borrowed_native_every_original_interior_resumes_without_replaying_the_prefix(
         }
         .unwrap_or_else(|_| panic!("native continuation must complete without error"));
         assert!(
-            matches!(step,bytecode::VmStep::Yield(Value::Str(ref value)) if value.as_str()=="AB")
+            matches!(step,bytecode::VmStep::Yield(value) if value.as_engine_text()==Some("AB"))
         );
         assert_eq!(result(&holder).as_engine_text().unwrap(), "AB");
         assert_eq!(
@@ -789,7 +792,7 @@ fn borrowed_native_preentry_interrupt_leaves_binding_then_commits_before_yield()
         )
     }
     .unwrap_or_else(|_| panic!("native continuation must complete without error"));
-    assert!(matches!(step,bytecode::VmStep::Yield(Value::Str(ref value)) if value.as_str()=="AB"));
+    assert!(matches!(step,bytecode::VmStep::Yield(value) if value.as_engine_text()==Some("AB")));
     assert_eq!(TEST_NATIVE_HITS.with(Cell::get), hits + 1);
     assert_eq!(result(&holder).as_engine_text().unwrap(), "AB");
 }

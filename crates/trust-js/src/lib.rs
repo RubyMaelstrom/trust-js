@@ -32,6 +32,7 @@
     clippy::drop_non_drop
 )]
 
+use crate::value::ValueView;
 /// A process-lifetime diagnostic switch: whether environment variable `$name` is set. The first
 /// read is cached, because a libc environment lookup scans every variable under a lock and the
 /// compilers consult these switches per chunk and per candidate region.
@@ -968,24 +969,29 @@ impl Engine {
     fn describe_throw(&mut self, thrown: Value) -> Completion {
         // Pull the constructor name + message off an Error object; fall back to the rendered value.
         let name = match self.interp.get_member_key(&thrown, "name") {
-            Ok(Value::Undefined) | Err(_) => {
+            Ok(value) if !matches!(value.view(), ValueView::Undefined) => self.render(&value),
+            _ => {
                 // No own/inherited `name` (e.g. Test262Error): use the constructor's name.
                 match self.interp.get_member_key(&thrown, "constructor") {
-                    Ok(ctor @ Value::Obj(_)) => match self.interp.get_member_key(&ctor, "name") {
-                        Ok(Value::Undefined) | Err(_) => String::new(),
-                        Ok(v) => self.render(&v),
-                    },
+                    Ok(ctor) if matches!(ctor.view(), ValueView::Obj(_)) => {
+                        match self.interp.get_member_key(&ctor, "name") {
+                            Ok(value) if !matches!(value.view(), ValueView::Undefined) => {
+                                self.render(&value)
+                            }
+                            _ => String::new(),
+                        }
+                    }
                     _ => String::new(),
                 }
             }
-            Ok(v) => self.render(&v),
         };
-        let message = match &thrown {
-            Value::Obj(_) => match self.interp.get_member_key(&thrown, "message") {
-                Ok(Value::Undefined) | Err(_) => String::new(),
-                Ok(v) => self.render(&v),
-            },
-            other => self.render(other),
+        let message = if matches!(thrown.view(), ValueView::Obj(_)) {
+            match self.interp.get_member_key(&thrown, "message") {
+                Ok(value) if !matches!(value.view(), ValueView::Undefined) => self.render(&value),
+                _ => String::new(),
+            }
+        } else {
+            self.render(&thrown)
         };
         Completion::Throw { name, message }
     }
@@ -1108,7 +1114,24 @@ pub mod embed {
     //! };
     //! ```
     //!
-    //! nor be kept in a collection outside its scope, across the collections between scopes (a
+    //! A match view carries the same scope brand and cannot escape either:
+    //!
+    //! ```compile_fail
+    //! let mut engine = trust_js::Engine::new();
+    //! let kept = engine.scope(|cx| cx.global_this().kind());
+    //! ```
+    //!
+    //! Inspect a value with [`Value::kind`] and [`ValueKind`]; value storage and API arguments
+    //! still take [`Value`]. The two types remain distinct:
+    //!
+    //! ```compile_fail,E0308
+    //! use trust_js::embed::Value;
+    //! fn takes_value<'s>(_: Value<'s>) {}
+    //! let mut engine = trust_js::Engine::new();
+    //! engine.scope(|cx| takes_value(cx.global_this().kind()));
+    //! ```
+    //!
+    //! A value cannot be kept in a collection outside its scope, across collections between scopes (a
     //! [`ValueList`] keeps values inside one):
     //!
     //! ```compile_fail,E0521
@@ -1176,7 +1199,8 @@ pub mod embed {
     pub use crate::interpreter::ArrayBufferBytes;
     pub use crate::scope::{
         BigInt, Ctx, EvalError, HostJobContextEnter, HostJobContextLeave, IndexedLength,
-        IndexedNames, JsString, NativeCaptureFn, NativeFn, Object, Symbol, Value, ValueList,
+        IndexedNames, JsString, NativeCaptureFn, NativeFn, Object, Symbol, Value, ValueKind,
+        ValueList,
     };
     pub use crate::value::{
         NativeCallableRetained, NativeCaptures, NativeRetainedMemoryVisitor,
@@ -1290,7 +1314,7 @@ impl interpreter::Interp {
         source: Option<std::rc::Rc<stack_trace::ScriptSource>>,
     ) -> Result<Value, EvalFailure> {
         match self.run_classic_program(body, source) {
-            Ok(Value::Empty) => Ok(Value::Undefined),
+            Ok(value) if matches!(value.view(), ValueView::Empty) => Ok(Value::Undefined),
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => {
                 crate::jit::perf_error_escaped();
@@ -1316,7 +1340,7 @@ impl interpreter::Interp {
         );
         self.strict = directive_strict;
         let result = match self.run_program_from(&body, Some(source)) {
-            Ok(Value::Empty) => Ok(Value::Undefined),
+            Ok(value) if matches!(value.view(), ValueView::Empty) => Ok(Value::Undefined),
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => {
                 crate::jit::perf_error_escaped();

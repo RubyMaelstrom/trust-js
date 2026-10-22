@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 pub(super) fn install_globals(it: &mut Interp) {
     // The test262 async harness ($DONE) reports completion via `print`; route it to the console.
@@ -12,23 +13,41 @@ pub(super) fn install_globals(it: &mut Interp) {
     global_fn(it, "parseInt", 2, |i, _t, a| {
         // ToString is the identity for Strings (ECMA-262 §7.1.2); bypass the second
         // clone for the common string-input case. Other inputs keep the full path.
-        let s = match arg(a, 0) {
-            Value::Str(s) => s,
-            v => ab(i.to_string(&v))?,
+        let s = {
+            let __value_match_original = arg(a, 0);
+            match (__value_match_original).view() {
+                ValueView::Str(s) => s,
+                _ => {
+                    let v = __value_match_original;
+                    ab(i.to_string(&v))?
+                }
+            }
         };
         // The radix is ToUint32'd (wrapping), so e.g. 2^32+2 means radix 2 and Infinity means 0.
         // ToNumber is the identity for Numbers (§7.1.4), so apply ToUint32 directly.
-        let radix = match arg(a, 1) {
-            Value::Undefined => 0,
-            Value::Num(r) => to_uint32(r),
-            v => ab(i.to_uint32(&v))?,
+        let radix = {
+            let __value_match_original = arg(a, 1);
+            match (__value_match_original).view() {
+                ValueView::Undefined => 0,
+                ValueView::Num(r) => to_uint32(r),
+                _ => {
+                    let v = __value_match_original;
+                    ab(i.to_uint32(&v))?
+                }
+            }
         };
         Ok(Value::Num(parse_int(&s, radix)))
     });
     global_fn(it, "parseFloat", 1, |i, _t, a| {
-        let s = match arg(a, 0) {
-            Value::Str(s) => s,
-            v => ab(i.to_string(&v))?,
+        let s = {
+            let __value_match_original = arg(a, 0);
+            match (__value_match_original).view() {
+                ValueView::Str(s) => s,
+                _ => {
+                    let v = __value_match_original;
+                    ab(i.to_string(&v))?
+                }
+            }
         };
         Ok(Value::Num(parse_float(&s)))
     });
@@ -41,7 +60,7 @@ pub(super) fn install_globals(it: &mut Interp) {
             .props
             .get("parseFloat")
             .map(|p| p.value());
-        if let (Value::Obj(n), Some(pi), Some(pf)) = (num, pi, pf) {
+        if let (ValueView::Obj(n), Some(pi), Some(pf)) = (num.view(), pi, pf) {
             n.borrow_mut()
                 .props
                 .insert("parseInt", Property::builtin(pi));
@@ -52,9 +71,15 @@ pub(super) fn install_globals(it: &mut Interp) {
     }
     global_fn(it, "isNaN", 1, nf_is_nan);
     global_fn(it, "isFinite", 1, |i, _t, a| {
-        let n = match arg(a, 0) {
-            Value::Num(n) => n,
-            v => ab(i.to_number(&v))?,
+        let n = {
+            let __value_match_original = arg(a, 0);
+            match (__value_match_original).view() {
+                ValueView::Num(n) => n,
+                _ => {
+                    let v = __value_match_original;
+                    ab(i.to_number(&v))?
+                }
+            }
         };
         Ok(Value::Bool(n.is_finite()))
     });
@@ -138,9 +163,15 @@ pub(super) fn install_globals(it: &mut Interp) {
     // Indirect eval: runs in the global scope. (A *direct* `eval(...)` call is intercepted in
     // `eval_call` and run in the caller's scope; both share this same function object.)
     let eval_fn = it.make_native("eval", 1, |i, _this, args| {
-        let code = match arg(args, 0) {
-            Value::Str(s) => s,
-            other => return Ok(other),
+        let code = {
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Str(s) => s,
+                _ => {
+                    let other = __value_match_original;
+                    return Ok(other);
+                }
+            }
         };
         let env = i.global_env.clone();
         ab(i.perform_eval(&code, &env, false))
@@ -281,9 +312,15 @@ fn parse_float(s: &str) -> f64 {
 /// Global `isNaN` (named so the JIT call cache can prove and tag its exact identity).
 pub(crate) fn nf_is_nan(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
     // ToNumber identity for Numbers (§7.1.4); other inputs keep the full coercive path.
-    let n = match arg(args, 0) {
-        Value::Num(n) => n,
-        v => ab(i.to_number(&v))?,
+    let n = {
+        let __value_match_original = arg(args, 0);
+        match (__value_match_original).view() {
+            ValueView::Num(n) => n,
+            _ => {
+                let v = __value_match_original;
+                ab(i.to_number(&v))?
+            }
+        }
     };
     Ok(Value::Bool(n.is_nan()))
 }

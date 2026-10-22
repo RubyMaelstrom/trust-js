@@ -21,7 +21,8 @@ fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
         .interp
         .get_var(name, &env)
         .unwrap_or_else(|_| panic!("missing fixture function {name}"));
-    let object = value.as_obj().expect("fixture function object").borrow();
+    let object_handle = value.as_obj().expect("fixture function object");
+    let object = object_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("fixture user function")
     };

@@ -23,6 +23,8 @@
 //! `TRUST_JS_TIER` / `TRUST_JS_TIER_THRESHOLD` env vars, the CLI's
 //! `--tier`, or `Engine::set_tier`.
 
+use crate::value::ValueView;
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -298,6 +300,7 @@ pub(crate) mod lexical_cache;
 mod binding_layout_cache_tests {
     use super::*;
     use crate::interpreter::{new_binding_layout_id, new_scope, Binding};
+    use crate::value::ValueView;
 
     #[test]
     fn binding_layout_cache_promotes_own_slots_without_retaining_an_activation() {
@@ -335,8 +338,8 @@ mod binding_layout_cache_tests {
             let second = make(29.);
             for (env, expected) in [(&first, 17.), (&second, 29.)] {
                 assert!(
-                    matches!(chunk.load_name_ic(&mut engine.interp, env, name, cache),
-                    Ok(Value::Num(value)) if value==expected)
+                    matches!((chunk.load_name_ic(&mut engine.interp, env, name, cache)).map(|__value| (__value).view()),
+                    Ok(crate::value::ValueView::Num(value)) if value==expected)
                 );
             }
             assert_eq!(chunk.name_caches[cache as usize].get().env, FIXED_NAME_IC);
@@ -350,15 +353,15 @@ mod binding_layout_cache_tests {
             "slot proof must not retain an activation"
         );
         assert!(matches!(
-            chunk.name_ic_hit(&engine.interp, &second, cache),
-            Some(Value::Num(29.))
+            (chunk.name_ic_hit(&engine.interp, &second, cache)).map(|__value| (__value).view()),
+            Some(ValueView::Num(29.))
         ));
         chunk
             .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(31.))
             .unwrap_or_else(|_| panic!("live write"));
         assert!(matches!(
-            second.borrow().vars.get("outer").unwrap().value,
-            Value::Num(31.)
+            (second.borrow().vars.get("outer").unwrap().value).view(),
+            ValueView::Num(31.)
         ));
         second
             .borrow_mut()
@@ -432,20 +435,21 @@ mod binding_layout_cache_tests {
             };
             let first = make_child(&parent, "padding", layout);
             assert!(matches!(
-                chunk.load_name_ic(&mut engine.interp, &first, name, cache),
-                Ok(Value::Num(17.0))
+                (chunk.load_name_ic(&mut engine.interp, &first, name, cache))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(17.0))
             ));
             assert_eq!(chunk.name_caches[cache as usize].get().env & 7, 6);
             let second = make_child(&parent, "padding", layout);
             assert!(!Env::ptr_eq(&first, &second));
             assert!(matches!(
-                chunk.name_ic_hit(&engine.interp, &second, cache),
-                Some(Value::Num(17.0))
+                (chunk.name_ic_hit(&engine.interp, &second, cache)).map(|__value| (__value).view()),
+                Some(ValueView::Num(17.0))
             ));
             parent.borrow_mut().vars.get_mut("outer").unwrap().value = Value::Num(23.0);
             assert!(matches!(
-                chunk.name_ic_hit(&engine.interp, &second, cache),
-                Some(Value::Num(23.0))
+                (chunk.name_ic_hit(&engine.interp, &second, cache)).map(|__value| (__value).view()),
+                Some(ValueView::Num(23.0))
             ));
             parent
                 .borrow_mut()
@@ -469,8 +473,9 @@ mod binding_layout_cache_tests {
             );
             assert!(chunk.name_ic_hit(&engine.interp, &shadow, cache).is_none());
             assert!(matches!(
-                chunk.load_name_ic(&mut engine.interp, &shadow, name, cache),
-                Ok(Value::Num(99.0))
+                (chunk.load_name_ic(&mut engine.interp, &shadow, name, cache))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(99.0))
             ));
             // Refill the layout entry and exercise its write path.
             chunk
@@ -480,8 +485,8 @@ mod binding_layout_cache_tests {
                 .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(31.0))
                 .unwrap_or_else(|_| panic!("layout cache write threw"));
             assert!(matches!(
-                parent.borrow().vars.get("outer").unwrap().value,
-                Value::Num(31.0)
+                (parent.borrow().vars.get("outer").unwrap().value).view(),
+                ValueView::Num(31.0)
             ));
             // The parent identity is still mandatory even for equal child layouts.
             let different_parent = new_scope(None);
@@ -494,8 +499,8 @@ mod binding_layout_cache_tests {
             // Reparenting is detected too; a layout identity describes keys, not links.
             other.borrow_mut().parent = Some(parent.clone());
             assert!(matches!(
-                chunk.name_ic_hit(&engine.interp, &other, cache),
-                Some(Value::Num(31.0))
+                (chunk.name_ic_hit(&engine.interp, &other, cache)).map(|__value| (__value).view()),
+                Some(ValueView::Num(31.0))
             ));
             other
                 .borrow_mut()
@@ -503,8 +508,9 @@ mod binding_layout_cache_tests {
                 .insert("outer", Binding::data(Value::Num(53.0), true, true));
             assert!(chunk.name_ic_hit(&engine.interp, &other, cache).is_none());
             assert!(matches!(
-                chunk.load_name_ic(&mut engine.interp, &other, name, cache),
-                Ok(Value::Num(53.0))
+                (chunk.load_name_ic(&mut engine.interp, &other, name, cache))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(53.0))
             ));
 
             chunk
@@ -3183,7 +3189,7 @@ impl Chunk {
 
     #[inline]
     fn record_name_number(&self, cache: usize, value: &Value) {
-        if let Value::Num(n) = value {
+        if let ValueView::Num(n) = &(value).view() {
             if !n.is_nan() {
                 self.name_num_bits[cache].set(n.to_bits());
                 self.name_num_valid[cache].set(true);
@@ -5209,12 +5215,12 @@ fn refresh_current_layout_feedback(
 fn arithmetic_value_class(value: &Value) -> Option<crate::feedback::ValueClass> {
     use crate::feedback::ValueClass;
 
-    Some(match value {
-        Value::Undefined => ValueClass::Undefined,
-        Value::Empty => return None,
-        Value::Null => ValueClass::Null,
-        Value::Bool(_) => ValueClass::Boolean,
-        Value::Num(number)
+    Some(match &(value).view() {
+        ValueView::Undefined => ValueClass::Undefined,
+        ValueView::Empty => return None,
+        ValueView::Null => ValueClass::Null,
+        ValueView::Bool(_) => ValueClass::Boolean,
+        ValueView::Num(number)
             if number.is_finite()
                 && !(number.to_bits() == (-0.0_f64).to_bits())
                 && number.fract() == 0.0
@@ -5223,11 +5229,11 @@ fn arithmetic_value_class(value: &Value) -> Option<crate::feedback::ValueClass> 
         {
             ValueClass::NumberInt32
         }
-        Value::Num(_) => ValueClass::NumberDouble,
-        Value::BigInt(_) => ValueClass::BigInt,
-        Value::Str(_) => ValueClass::String,
-        Value::Sym(_) => ValueClass::Symbol,
-        Value::Obj(_) => ValueClass::Object,
+        ValueView::Num(_) => ValueClass::NumberDouble,
+        ValueView::BigInt(_) => ValueClass::BigInt,
+        ValueView::Str(_) => ValueClass::String,
+        ValueView::Sym(_) => ValueClass::Symbol,
+        ValueView::Obj(_) => ValueClass::Object,
     })
 }
 
@@ -5323,6 +5329,7 @@ mod feedback_layout_tests {
         ElementReceiverKind, FeedbackVector, ObservationKind, ObservationRole, ObservationState,
         OperationKind, PropertyOutcome, ValueClass,
     };
+    use crate::value::ValueView;
 
     #[test]
     fn canonical_layout_ignores_raw_cache_and_name_indexes() {
@@ -5459,7 +5466,7 @@ mod feedback_layout_tests {
         let add = |left: f64, right: f64| left + right;
         let result = try_tagged_numeric_binary(&Value::Num(1.5), &Value::Num(2.0), &add)
             .expect("Number operands use the tagged frame");
-        assert!(matches!(result, Value::Num(value) if value == 3.5));
+        assert!(matches!((result).view(), ValueView::Num(value) if value == 3.5));
 
         let interp = Interp::new();
         assert!(try_tagged_numeric_binary(&Value::lstr("x"), &Value::Num(2.0), &add).is_none());
@@ -5483,12 +5490,12 @@ mod feedback_layout_tests {
         let negative_zero = try_tagged_numeric_binary(&Value::Num(-0.0), &Value::Num(-0.0), &add)
             .expect("numeric fast path");
         assert!(
-            matches!(negative_zero, Value::Num(value) if value.to_bits() == (-0.0f64).to_bits())
+            matches!((negative_zero).view(), ValueView::Num(value) if value.to_bits() == (-0.0f64).to_bits())
         );
 
         let nan = try_tagged_numeric_binary(&Value::Num(f64::NAN), &Value::Num(1.0), &add)
             .expect("numeric fast path");
-        assert!(matches!(nan, Value::Num(value) if value.is_nan()));
+        assert!(matches!((nan).view(), ValueView::Num(value) if value.is_nan()));
 
         let infinity = try_tagged_numeric_binary(
             &Value::Num(f64::INFINITY),
@@ -5496,7 +5503,7 @@ mod feedback_layout_tests {
             &add,
         )
         .expect("numeric fast path");
-        assert!(matches!(infinity, Value::Num(value) if value.is_nan()));
+        assert!(matches!((infinity).view(), ValueView::Num(value) if value.is_nan()));
     }
 
     #[test]
@@ -5504,10 +5511,11 @@ mod feedback_layout_tests {
         let lt = |left: f64, right: f64| left < right;
         let result = try_tagged_numeric_cmp(&Value::Num(1.5), &Value::Num(2.0), &lt)
             .expect("Number operands use the tagged frame");
-        assert!(matches!(result, Value::Bool(true)));
+        assert!(matches!((result).view(), ValueView::Bool(true)));
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(2.0), &Value::Num(1.5), &lt),
-            Some(Value::Bool(false))
+            (try_tagged_numeric_cmp(&Value::Num(2.0), &Value::Num(1.5), &lt))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(false))
         ));
 
         let interp = Interp::new();
@@ -5535,57 +5543,68 @@ mod feedback_layout_tests {
         let ne = |left: f64, right: f64| left != right;
         let gt = |left: f64, right: f64| left > right;
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &lt),
-            Some(Value::Bool(false))
+            (try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &lt))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(false))
         ));
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &le),
-            Some(Value::Bool(false))
+            (try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &le))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(false))
         ));
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &eq),
-            Some(Value::Bool(false))
+            (try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &eq))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(false))
         ));
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &ne),
-            Some(Value::Bool(true))
+            (try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &ne))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         ));
 
         // `-0` and `+0` compare equal, exactly as the f64 predicates do.
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &eq),
-            Some(Value::Bool(true))
+            (try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &eq))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         ));
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &lt),
-            Some(Value::Bool(false))
+            (try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &lt))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(false))
         ));
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &ne),
-            Some(Value::Bool(false))
+            (try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &ne))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(false))
         ));
 
         // Infinities and subnormals round-trip their exact bits through the frame.
         assert!(matches!(
-            try_tagged_numeric_cmp(
+            (try_tagged_numeric_cmp(
                 &Value::Num(f64::NEG_INFINITY),
                 &Value::Num(f64::INFINITY),
                 &lt,
-            ),
-            Some(Value::Bool(true))
+            ))
+            .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         ));
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(f64::INFINITY), &Value::Num(f64::INFINITY), &le),
-            Some(Value::Bool(true))
+            (try_tagged_numeric_cmp(&Value::Num(f64::INFINITY), &Value::Num(f64::INFINITY), &le))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         ));
         let subnormal = f64::from_bits(1);
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(subnormal), &Value::Num(0.0), &gt),
-            Some(Value::Bool(true))
+            (try_tagged_numeric_cmp(&Value::Num(subnormal), &Value::Num(0.0), &gt))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         ));
         assert!(matches!(
-            try_tagged_numeric_cmp(&Value::Num(0.0), &Value::Num(subnormal), &gt),
-            Some(Value::Bool(false))
+            (try_tagged_numeric_cmp(&Value::Num(0.0), &Value::Num(subnormal), &gt))
+                .map(|__value| (__value).view()),
+            Some(ValueView::Bool(false))
         ));
     }
 
@@ -5594,24 +5613,24 @@ mod feedback_layout_tests {
         let band = |left: i32, right: i32| left & right;
         let result = try_tagged_numeric_i32(&Value::Num(12.0), &Value::Num(10.0), &band)
             .expect("Number operands use the tagged frame");
-        assert!(matches!(result, Value::Num(value) if value == 8.0));
+        assert!(matches!((result).view(), ValueView::Num(value) if value == 8.0));
 
         // ToInt32 wrapping is applied inside the frame to the exact extracted bits.
         assert!(matches!(
-            try_tagged_numeric_i32(&Value::Num(4294967296.0), &Value::Num(1.0), &band),
-            Some(Value::Num(value)) if value == 0.0
+            (try_tagged_numeric_i32(&Value::Num(4294967296.0), &Value::Num(1.0), &band)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == 0.0
         ));
         assert!(matches!(
-            try_tagged_numeric_i32(&Value::Num(-0.5), &Value::Num(1.0), &band),
-            Some(Value::Num(value)) if value == 0.0
+            (try_tagged_numeric_i32(&Value::Num(-0.5), &Value::Num(1.0), &band)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == 0.0
         ));
         assert!(matches!(
-            try_tagged_numeric_i32(&Value::Num(f64::NAN), &Value::Num(1.0), &band),
-            Some(Value::Num(value)) if value == 0.0
+            (try_tagged_numeric_i32(&Value::Num(f64::NAN), &Value::Num(1.0), &band)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == 0.0
         ));
         assert!(matches!(
-            try_tagged_numeric_i32(&Value::Num(-1.0), &Value::Num(2.0), &band),
-            Some(Value::Num(value)) if value == 2.0
+            (try_tagged_numeric_i32(&Value::Num(-1.0), &Value::Num(2.0), &band)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == 2.0
         ));
 
         let interp = Interp::new();
@@ -5633,38 +5652,42 @@ mod feedback_layout_tests {
         // Negation flips signed zero exactly like the canonical fast path.
         let neg = try_tagged_numeric_unary(&Value::Num(0.0), |n| -n)
             .expect("Number operand uses the tagged frame");
-        assert!(matches!(neg, Value::Num(value) if value.to_bits() == (-0.0f64).to_bits()));
+        assert!(
+            matches!((neg).view(), ValueView::Num(value) if value.to_bits() == (-0.0f64).to_bits())
+        );
         let neg_neg = try_tagged_numeric_unary(&Value::Num(-0.0), |n| -n)
             .expect("Number operand uses the tagged frame");
-        assert!(matches!(neg_neg, Value::Num(value) if value.to_bits() == 0.0f64.to_bits()));
+        assert!(
+            matches!((neg_neg).view(), ValueView::Num(value) if value.to_bits() == 0.0f64.to_bits())
+        );
 
         // NaN, infinities, and subnormals round-trip through the frame.
         assert!(matches!(
-            try_tagged_numeric_unary(&Value::Num(f64::NAN), |n| n),
-            Some(Value::Num(value)) if value.is_nan()
+            (try_tagged_numeric_unary(&Value::Num(f64::NAN), |n| n)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            try_tagged_numeric_unary(&Value::Num(f64::INFINITY), |n| -n),
-            Some(Value::Num(value)) if value == f64::NEG_INFINITY
+            (try_tagged_numeric_unary(&Value::Num(f64::INFINITY), |n| -n)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == f64::NEG_INFINITY
         ));
         let subnormal = f64::from_bits(1);
         assert!(matches!(
-            try_tagged_numeric_unary(&Value::Num(subnormal), |n| -n),
-            Some(Value::Num(value)) if value.to_bits() == (-subnormal).to_bits()
+            (try_tagged_numeric_unary(&Value::Num(subnormal), |n| -n)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value.to_bits() == (-subnormal).to_bits()
         ));
 
         // Bitwise NOT converts through ToInt32 before inverting.
         assert!(matches!(
-            try_tagged_numeric_unary(&Value::Num(0.0), |n| !crate::eval::to_int32(n) as f64),
-            Some(Value::Num(value)) if value == -1.0
+            (try_tagged_numeric_unary(&Value::Num(0.0), |n| !crate::eval::to_int32(n) as f64)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == -1.0
         ));
         assert!(matches!(
-            try_tagged_numeric_unary(&Value::Num(-1.0), |n| !crate::eval::to_int32(n) as f64),
-            Some(Value::Num(value)) if value == 0.0
+            (try_tagged_numeric_unary(&Value::Num(-1.0), |n| !crate::eval::to_int32(n) as f64)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == 0.0
         ));
         assert!(matches!(
-            try_tagged_numeric_unary(&Value::Num(f64::NAN), |n| !crate::eval::to_int32(n) as f64),
-            Some(Value::Num(value)) if value == -1.0
+            (try_tagged_numeric_unary(&Value::Num(f64::NAN), |n| !crate::eval::to_int32(n) as f64)).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == -1.0
         ));
 
         let interp = Interp::new();
@@ -5678,43 +5701,43 @@ mod feedback_layout_tests {
         // Step 8 fires before the ±1 special cases: a negative base with a non-integral exponent
         // (and -+∞ are never integral Numbers) is NaN, so `-1 ** ±∞` is NaN, matching Node/V8.
         assert!(matches!(
-            try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::INFINITY)),
-            Some(Value::Num(value)) if value.is_nan()
+            (try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::INFINITY))).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NEG_INFINITY)),
-            Some(Value::Num(value)) if value.is_nan()
+            (try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NEG_INFINITY))).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            try_tagged_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::INFINITY)),
-            Some(Value::Num(value)) if value.is_nan()
+            (try_tagged_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::INFINITY))).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            try_tagged_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::NEG_INFINITY)),
-            Some(Value::Num(value)) if value.is_nan()
+            (try_tagged_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::NEG_INFINITY))).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value.is_nan()
         ));
 
         // Ordinary cases agree with powf: NaN exponent is NaN even for base 1, `0 ** -1` is
         // +Infinity, negative base with fractional exponent is NaN, `NaN ** 0` is 1.
         assert!(matches!(
-            try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NAN)),
-            Some(Value::Num(value)) if value.is_nan()
+            (try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NAN))).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            try_tagged_numeric_pow(&Value::Num(0.0), &Value::Num(-1.0)),
-            Some(Value::Num(value)) if value == f64::INFINITY
+            (try_tagged_numeric_pow(&Value::Num(0.0), &Value::Num(-1.0))).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == f64::INFINITY
         ));
         assert!(matches!(
-            try_tagged_numeric_pow(&Value::Num(-2.0), &Value::Num(0.5)),
-            Some(Value::Num(value)) if value.is_nan()
+            (try_tagged_numeric_pow(&Value::Num(-2.0), &Value::Num(0.5))).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            try_tagged_numeric_pow(&Value::Num(f64::NAN), &Value::Num(0.0)),
-            Some(Value::Num(value)) if value == 1.0
+            (try_tagged_numeric_pow(&Value::Num(f64::NAN), &Value::Num(0.0))).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == 1.0
         ));
         assert!(matches!(
-            try_tagged_numeric_pow(&Value::Num(2.0), &Value::Num(-1.0)),
-            Some(Value::Num(value)) if value == 0.5
+            (try_tagged_numeric_pow(&Value::Num(2.0), &Value::Num(-1.0))).map(|__value| (__value).view()),
+            Some(ValueView::Num(value)) if value == 0.5
         ));
 
         let interp = Interp::new();
@@ -5738,7 +5761,9 @@ mod feedback_layout_tests {
         stack.extend([Value::lstr("left"), Value::Num(1.0)]);
 
         assert!(bin_num(&mut interp, &mut stack, &feedback, 0, "+", |a, b| a + b).is_ok());
-        assert!(matches!(stack.last(), Some(Value::Str(value)) if &*value == "left1"));
+        assert!(
+            matches!((stack.last()).map(|__value| (__value).view()), Some(ValueView::Str(value)) if &*value == "left1")
+        );
         let site = feedback.sites().next().unwrap().0;
         assert_eq!(
             feedback
@@ -5771,7 +5796,7 @@ mod feedback_layout_tests {
 
         assert!(bin_num(&mut interp, &mut stack, &feedback, 0, "+", |a, b| a + b).is_ok());
         assert_eq!(stack.len(), 1);
-        assert!(matches!(stack.read_value(0), Value::Num(3.0)));
+        assert!(matches!((stack.read_value(0)).view(), ValueView::Num(3.0)));
         assert_eq!(feedback.retained_bytes(), retained_before);
     }
 
@@ -5858,8 +5883,11 @@ mod feedback_layout_tests {
             Err(_) => panic!("string update must succeed"),
         };
 
-        assert!(matches!(expression, Value::Num(4.0)));
-        assert!(matches!(stored, Some(Value::Num(5.0))));
+        assert!(matches!((expression).view(), ValueView::Num(4.0)));
+        assert!(matches!(
+            (stored).map(|__value| (__value).view()),
+            Some(ValueView::Num(5.0))
+        ));
         let site = feedback.sites().next().unwrap().0;
         assert_eq!(
             feedback
@@ -6086,7 +6114,7 @@ mod feedback_layout_tests {
             Err(_) => panic!("getter must complete"),
         };
 
-        assert!(matches!(result, Value::Num(17.0)));
+        assert!(matches!((result).view(), ValueView::Num(17.0)));
         assert_eq!(trace.outcome, Some(PropertyOutcome::Accessor));
         assert_eq!(trace.depth, 0);
         assert_eq!(trace.field_slot, None);
@@ -6146,7 +6174,7 @@ mod feedback_layout_tests {
             Err(_) => panic!("string length must complete"),
         };
 
-        assert!(matches!(result, Value::Num(3.0)));
+        assert!(matches!((result).view(), ValueView::Num(3.0)));
         assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
         assert_eq!(trace.depth, 0);
     }
@@ -6169,7 +6197,7 @@ mod feedback_layout_tests {
             Ok(value) => value,
             Err(_) => panic!("forwarded proxy get must complete"),
         };
-        assert!(matches!(result, Value::Num(3.0)));
+        assert!(matches!((result).view(), ValueView::Num(3.0)));
         assert_eq!(get_trace.outcome, Some(PropertyOutcome::Exotic));
 
         let mut set_trace = crate::feedback::CurrentPropertyTrace::default();
@@ -6178,8 +6206,8 @@ mod feedback_layout_tests {
             .is_ok());
         assert_eq!(set_trace.outcome, Some(PropertyOutcome::Exotic));
         assert!(matches!(
-            interp.get_member_key(&proxy, "value"),
-            Ok(Value::Num(4.0))
+            (interp.get_member_key(&proxy, "value")).map(|__value| (__value).view()),
+            Ok(ValueView::Num(4.0))
         ));
     }
 
@@ -6235,8 +6263,8 @@ mod feedback_layout_tests {
 
         assert_eq!(trace.outcome, Some(PropertyOutcome::Rejected));
         assert!(matches!(
-            interp.get_member_key(&object, "value"),
-            Ok(Value::Num(1.0))
+            (interp.get_member_key(&object, "value")).map(|__value| (__value).view()),
+            Ok(ValueView::Num(1.0))
         ));
     }
 
@@ -6256,7 +6284,7 @@ mod feedback_layout_tests {
         let value = interp
             .get_member_profiled(&array, "1", &mut trace)
             .unwrap_or_else(|_| panic!("array hole read must complete"));
-        assert!(matches!(value, Value::Undefined));
+        assert!(matches!((value).view(), ValueView::Undefined));
         assert_eq!(trace.outcome, Some(PropertyOutcome::Absent));
         assert_eq!(
             match trace.outcome {
@@ -6281,7 +6309,7 @@ mod feedback_layout_tests {
         let value = interp
             .get_member_profiled(&typed, "-0", &mut typed_trace)
             .unwrap_or_else(|_| panic!("canonical numeric typed-array read must complete"));
-        assert!(matches!(value, Value::Undefined));
+        assert!(matches!((value).view(), ValueView::Undefined));
         assert_eq!(typed_trace.outcome, Some(PropertyOutcome::Exotic));
     }
 
@@ -6318,20 +6346,20 @@ mod feedback_layout_tests {
             );
         }
         assert!(matches!(
-            interp.eval_in_realm(&global, "coercions"),
-            Ok(Value::Num(0.))
+            (interp.eval_in_realm(&global, "coercions")).map(|__value| (__value).view()),
+            Ok(ValueView::Num(0.))
         ));
         let object = Value::Obj(interp.new_object());
         assert!(
             set_element_profiled(&mut interp, &chunk, pc, &object, &key, Value::Num(7.)).is_ok()
         );
         assert!(matches!(
-            interp.eval_in_realm(&global, "coercions"),
-            Ok(Value::Num(1.))
+            (interp.eval_in_realm(&global, "coercions")).map(|__value| (__value).view()),
+            Ok(ValueView::Num(1.))
         ));
         assert!(matches!(
-            interp.get_member_key(&object, "x"),
-            Ok(Value::Num(7.))
+            (interp.get_member_key(&object, "x")).map(|__value| (__value).view()),
+            Ok(ValueView::Num(7.))
         ));
     }
 
@@ -8538,13 +8566,13 @@ pub(crate) fn lazy_arguments_element(
     key: &Value,
     materialized: impl FnOnce(&Value),
 ) -> Result<Value, Abrupt> {
-    let still_lazy = matches!(list, Value::Obj(object)
+    let still_lazy = matches!(&(list).view(), ValueView::Obj(object)
         if matches!(object.borrow().exotic, crate::value::Exotic::Array));
     if !still_lazy {
         // Already materialized by an earlier fallback: an ordinary arguments object.
         return get_computed_element(i, chunk, pc, list, key);
     }
-    if let (Value::Obj(list), Value::Num(index)) = (list, key) {
+    if let (ValueView::Obj(list), ValueView::Num(index)) = (&(list).view(), &(key).view()) {
         if let Some(value) = i.fast_get_elem(list, *index) {
             return Ok(value);
         }
@@ -15098,7 +15126,9 @@ pub(crate) fn try_function_osr(
         Value::Undefined
     };
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
-    slots.resize_with(chunk.n_slots, || PackedValue::pack(Value::Undefined));
+    slots.resize_with(chunk.n_slots, || {
+        Cell::new(PackedValue::pack(Value::Undefined))
+    });
     for (slot, value) in initial {
         slots.write_value(slot as usize, value);
     }
@@ -15220,8 +15250,15 @@ fn run_inner(
     let cap_env = env.clone();
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     let seed = chunk.n_params.min(args.len());
-    slots.extend(args[..seed].iter().cloned().map(PackedValue::pack));
-    slots.resize_with(chunk.n_slots, || PackedValue::pack(Value::Undefined));
+    slots.extend(
+        args[..seed]
+            .iter()
+            .copied()
+            .map(|value| Cell::new(PackedValue::pack(value))),
+    );
+    slots.resize_with(chunk.n_slots, || {
+        Cell::new(PackedValue::pack(Value::Undefined))
+    });
     if let Some(rest) = chunk.rest_slot {
         let rest_values = args.get(chunk.n_params..).unwrap_or(&[]).to_vec();
         slots.write_value(rest as usize, i.make_array(rest_values));
@@ -15286,7 +15323,7 @@ fn drive_vm(
     env: &mut Env,
     cap_env: &Env,
     references: &mut [crate::eval::PreparedReferenceSlot],
-    slots: &[PackedValue],
+    slots: &[Cell<PackedValue>],
     stack: &mut ValueStack<PackedValue>,
     pc: &mut usize,
     this_val: &Value,
@@ -15567,7 +15604,7 @@ fn script_osr_code(
 
 fn for_in_step<S: StoredValue>(
     i: &mut Interp,
-    slots: &[S],
+    slots: &[Cell<S>],
     keys_slot: u16,
     index_slot: u16,
     source_slot: u16,
@@ -15588,12 +15625,12 @@ fn for_in_next(
     source: &Value,
 ) -> Result<Option<Value>, Abrupt> {
     loop {
-        let index = match *cursor {
-            Value::Num(index) => index as u32,
+        let index = match (*cursor).view() {
+            ValueView::Num(index) => index as u32,
             _ => unreachable!("for-in cursor is an internal integer"),
         };
-        let key = match keys {
-            Value::Obj(keys) => keys
+        let key = match &(keys).view() {
+            ValueView::Obj(keys) => keys
                 .borrow()
                 .props
                 .get_index(index)
@@ -15604,8 +15641,8 @@ fn for_in_next(
             return Ok(None);
         };
         *cursor = Value::Num(index as f64 + 1.0);
-        if matches!(source, Value::Obj(_)) {
-            let Value::Str(name) = &key else {
+        if matches!(&(source).view(), ValueView::Obj(_)) {
+            let ValueView::Str(name) = &(key).view() else {
                 unreachable!("for-in candidates are strings")
             };
             if !i.js_has_property(source, name)? {
@@ -15614,11 +15651,11 @@ fn for_in_next(
         }
         // Reuse ordinary candidates: fresh strings would discard their computed-read cache
         // identity on every iteration. Only escaped leading-NUL keys need decoding.
-        return Ok(Some(match key {
-            Value::Str(name) if name.as_str().starts_with("\0\0") => {
+        return Ok(Some(match key.view() {
+            ValueView::Str(name) if name.as_str().starts_with("\0\0") => {
                 crate::value::string_key_value(name)
             }
-            other => other,
+            _ => key,
         }));
     }
 }
@@ -15632,14 +15669,14 @@ fn assign_target_with_slots<S: StoredValue>(
     plan: &AssignmentTargetPlan,
     value: Value,
     env: &Env,
-    slots: &[S],
+    slots: &[Cell<S>],
 ) -> Result<(), Abrupt> {
     let projected = crate::interpreter::new_scope(Some(env.clone()));
     {
         let mut scope = projected.borrow_mut();
         for local in &plan.locals {
             let value = slots.read_value(local.slot as usize);
-            let initialized = !matches!(value, Value::Empty);
+            let initialized = !matches!((value).view(), ValueView::Empty);
             scope.vars.insert(
                 local.name.clone(),
                 crate::interpreter::Binding::data(value, local.mutable, initialized),
@@ -15678,14 +15715,14 @@ fn eval_expr_with_slots<S: StoredValue>(
     i: &mut Interp,
     plan: &EvalExprPlan,
     env: &Env,
-    slots: &[S],
+    slots: &[Cell<S>],
 ) -> Result<Value, Abrupt> {
     let projected = crate::interpreter::new_scope(Some(env.clone()));
     {
         let mut scope = projected.borrow_mut();
         for local in &plan.locals {
             let value = slots.read_value(local.slot as usize);
-            let initialized = !matches!(value, Value::Empty);
+            let initialized = !matches!((value).view(), ValueView::Empty);
             scope.vars.insert(
                 local.name.clone(),
                 crate::interpreter::Binding::data(value, local.mutable, initialized),
@@ -15857,7 +15894,7 @@ fn array_literal_append(i: &mut Interp, array: &Value, value: Option<Value>) -> 
 /// Consume the private dense array built by ArgumentListEvaluation lowering. No user code can
 /// observe this object between creation and consumption, so every index is a plain own value.
 fn argument_array_values(i: &Interp, array: Value) -> Vec<Value> {
-    let Value::Obj(array) = array else {
+    let ValueView::Obj(array) = (array).view() else {
         unreachable!("argument-list builder retains an Array")
     };
     let length = i.array_length(&array);
@@ -15883,7 +15920,7 @@ fn run_vm<S: StoredValue>(
     env: &mut Env,
     cap_env: &Env,
     references: &mut [crate::eval::PreparedReferenceSlot],
-    slots: &[S],
+    slots: &[Cell<S>],
     stack: &mut ValueStack<S>,
     pc: &mut usize,
     this_val: &Value,
@@ -15956,7 +15993,7 @@ fn run_vm_inner<S: StoredValue>(
     env: &mut Env,
     cap_env: &Env,
     references: &mut [crate::eval::PreparedReferenceSlot],
-    slots: &[S],
+    slots: &[Cell<S>],
     stack: &mut ValueStack<S>,
     pc: &mut usize,
     this_val: &Value,
@@ -16008,7 +16045,7 @@ fn run_vm_inner<S: StoredValue>(
                 stack.pop_stored().expect("vm stack underflow");
             }
             Op::LoadLocal(s) => {
-                let v = &slots[s as usize];
+                let v = slots[s as usize].get();
                 if v.is_empty() {
                     return Err(i.throw(
                         "ReferenceError",
@@ -16021,14 +16058,14 @@ fn run_vm_inner<S: StoredValue>(
                 stack.push_stored(v.clone());
             }
             Op::StoreLocal(s) => {
-                slots[s as usize].replace_stored(stack.pop_stored().expect("vm stack underflow"))
+                slots[s as usize].set(stack.pop_stored().expect("vm stack underflow"))
             }
             Op::UpdateLocal(s, kind) => {
                 let idx = s as usize;
                 let current = slots.read_value(idx);
-                match &current {
+                match &(current).view() {
                     // Reading a slot still in its TDZ is the same ReferenceError as LoadLocal.
-                    Value::Empty => {
+                    ValueView::Empty => {
                         return Err(i.throw(
                             "ReferenceError",
                             format!(
@@ -16038,7 +16075,7 @@ fn run_vm_inner<S: StoredValue>(
                         ));
                     }
                     // Fast path: a numeric slot updates in place.
-                    Value::Num(n) => {
+                    ValueView::Num(n) => {
                         let profiling =
                             observe_arithmetic_operand(&chunk.feedback, op_pc, &current);
                         let old = *n;
@@ -16061,7 +16098,7 @@ fn run_vm_inner<S: StoredValue>(
                     }
                     // BigInt updates stay BigInt (ToNumeric, not ToNumber) — never coerced to a
                     // Number and never thrown on like unary `+` would.
-                    Value::BigInt(n) => {
+                    ValueView::BigInt(n) => {
                         let profiling =
                             observe_arithmetic_operand(&chunk.feedback, op_pc, &current);
                         let old = n.clone();
@@ -16204,7 +16241,7 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::StoreConstLocal(s, n) => {
                 pop!();
-                if matches!(slots.read_value(s as usize), Value::Empty) {
+                if matches!((slots.read_value(s as usize)).view(), ValueView::Empty) {
                     return Err(i.throw(
                         "ReferenceError",
                         format!(
@@ -16241,8 +16278,8 @@ fn run_vm_inner<S: StoredValue>(
             Op::LoadLexicalThis => stack.push(i.resolve_this_binding(env)?),
             Op::RequireObject => {
                 if matches!(
-                    stack.last().expect("vm stack underflow"),
-                    Value::Undefined | Value::Null
+                    (stack.last().expect("vm stack underflow")).view(),
+                    ValueView::Undefined | ValueView::Null
                 ) {
                     return Err(i.throw("TypeError", "cannot access property of null or undefined"));
                 }
@@ -16272,7 +16309,7 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::GetPropLocal(s, n, c) => {
                 let obj = slots.read_value(s as usize);
-                if matches!(obj, Value::Empty) {
+                if matches!((obj).view(), ValueView::Empty) {
                     return Err(i.throw(
                         "ReferenceError",
                         format!(
@@ -16333,7 +16370,7 @@ fn run_vm_inner<S: StoredValue>(
             Op::SetPropLocalDrop(s, n, c) => {
                 let v = pop!();
                 let obj = slots.read_value(s as usize);
-                if matches!(obj, Value::Empty) {
+                if matches!((obj).view(), ValueView::Empty) {
                     return Err(i.throw(
                         "ReferenceError",
                         format!(
@@ -16354,8 +16391,8 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::DestructureGuard => {
                 if matches!(
-                    stack.last().expect("vm stack underflow"),
-                    Value::Undefined | Value::Null
+                    (stack.last().expect("vm stack underflow")).view(),
+                    ValueView::Undefined | ValueView::Null
                 ) {
                     return Err(i.throw("TypeError", "cannot destructure null or undefined"));
                 }
@@ -16502,7 +16539,7 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::PushWith => {
                 let value = pop!();
-                if matches!(value, Value::Undefined | Value::Null) {
+                if matches!((value).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(i.throw("TypeError", "Cannot convert undefined or null to object"));
                 }
                 let object = crate::builtins::box_primitive_pub(i, value);
@@ -16605,12 +16642,12 @@ fn run_vm_inner<S: StoredValue>(
                 };
             }
             Op::DisposeJump => {
-                let handler_depth = match pop!() {
-                    Value::Num(value) => value as usize,
+                let handler_depth = match (pop!()).view() {
+                    ValueView::Num(value) => value as usize,
                     _ => unreachable!("disposal jump depth is an internal integer"),
                 };
-                let target = match pop!() {
-                    Value::Num(value) => value as usize,
+                let target = match (pop!()).view() {
+                    ValueView::Num(value) => value as usize,
                     _ => unreachable!("disposal jump target is an internal integer"),
                 };
                 let frame = disposal_frames
@@ -16640,11 +16677,11 @@ fn run_vm_inner<S: StoredValue>(
                 let source = pop!();
                 let mut excluded = Vec::with_capacity(excluded_values.len());
                 for key in excluded_values {
-                    match key {
-                        Value::Str(key) => {
+                    match key.view() {
+                        ValueView::Str(key) => {
                             excluded.push(crate::value::encode_owned_string_key(key.to_string()))
                         }
-                        other => excluded.push(i.to_property_key(&other)?.into_string()),
+                        _ => excluded.push(i.to_property_key(&key)?.into_string()),
                     }
                 }
                 let rest = i.copy_data_properties(&source, &excluded)?;
@@ -16653,7 +16690,7 @@ fn run_vm_inner<S: StoredValue>(
             Op::DeleteProp(n, strict) => {
                 let base = pop!();
                 let prop = &chunk.names[n as usize];
-                if matches!(base, Value::Undefined | Value::Null) {
+                if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(i.throw(
                         "TypeError",
                         format!(
@@ -16669,7 +16706,7 @@ fn run_vm_inner<S: StoredValue>(
                 let idx = pop!();
                 let base = pop!();
                 let key = i.to_property_key(&idx)?;
-                if matches!(base, Value::Undefined | Value::Null) {
+                if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(i.throw(
                         "TypeError",
                         format!(
@@ -16758,8 +16795,8 @@ fn run_vm_inner<S: StoredValue>(
                 // Environment Record can supply a receiver without making the
                 // Reference a property Reference (ECMA-262 §13.3.6).
                 let direct = matches!(
-                    (&callee, &i.eval_fn),
-                    (Value::Obj(function), Some(intrinsic))
+                    (&(callee).view(), &i.eval_fn),
+                    (ValueView::Obj(function), Some(intrinsic))
                         if crate::value::Gc::ptr_eq(function, intrinsic)
                 );
                 let value = if !direct && matches!(op, Op::TailEvalCallArgsArray) {
@@ -16805,14 +16842,15 @@ fn run_vm_inner<S: StoredValue>(
                 let lval = pop!();
                 let obj = pop!();
                 let name = &chunk.names[n as usize];
-                let lval = if let (Value::Str(x), Value::Obj(o)) = (&v, &obj) {
-                    match i.append_prop_fast(o, name, lval, x) {
-                        Ok(()) => continue,
-                        Err(l) => l,
-                    }
-                } else {
-                    lval
-                };
+                let lval =
+                    if let (ValueView::Str(x), ValueView::Obj(o)) = (&(v).view(), &(obj).view()) {
+                        match i.append_prop_fast(o, name, lval, x) {
+                            Ok(()) => continue,
+                            Err(l) => l,
+                        }
+                    } else {
+                        lval
+                    };
                 let r = i.binary("+", lval, v)?;
                 set_named_property(i, chunk, op_pc, &obj, name, r, &chunk.caches[c as usize])?;
             }
@@ -16879,8 +16917,11 @@ fn run_vm_inner<S: StoredValue>(
                 // Detailed collection uses the exact-PC shared tail below; ordinary execution
                 // retains this allocation-free numeric path.
                 if !chunk.feedback.detailed_enabled() {
-                    if let (Value::Obj(o), Value::Num(nk)) = (&obj, &key) {
-                        if let Some(Value::Num(old)) = i.fast_get_elem(o, *nk) {
+                    if let (ValueView::Obj(o), ValueView::Num(nk)) = (&(obj).view(), &(key).view())
+                    {
+                        if let Some(ValueView::Num(old)) =
+                            (i.fast_get_elem(o, *nk)).map(|__value| (__value).view())
+                        {
                             let new = match kind {
                                 UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => {
                                     old + 1.0
@@ -16915,7 +16956,7 @@ fn run_vm_inner<S: StoredValue>(
                 }
                 // General path: nullish check, one ToPropertyKey, [[Get]], ToNumeric, [[Set]] —
                 // the oracle's Reference order exactly.
-                if matches!(obj, Value::Undefined | Value::Null) {
+                if matches!((obj).view(), ValueView::Undefined | ValueView::Null) {
                     crate::value::trace_nullish_property("bytecode-update-elem", &key);
                     return Err(i.throw("TypeError", "cannot read property of null or undefined"));
                 }
@@ -16926,11 +16967,14 @@ fn run_vm_inner<S: StoredValue>(
                 })?;
             }
             Op::ToPropKeyLocal(s) => {
-                if matches!(slots.read_value(s as usize), Value::Undefined | Value::Null) {
+                if matches!(
+                    (slots.read_value(s as usize)).view(),
+                    ValueView::Undefined | ValueView::Null
+                ) {
                     return Err(i.throw("TypeError", "cannot access property of null or undefined"));
                 }
-                match stack.last().expect("vm stack underflow") {
-                    Value::Num(_) | Value::Str(_) | Value::Sym(_) => {}
+                match (stack.last().expect("vm stack underflow")).view() {
+                    ValueView::Num(_) | ValueView::Str(_) | ValueView::Sym(_) => {}
                     _ => {
                         let key = pop!();
                         let k = i.to_property_key(&key)?;
@@ -16940,15 +16984,15 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::ToPropKey => {
                 if matches!(
-                    stack.get(stack.len().saturating_sub(2)),
-                    Some(Value::Undefined | Value::Null)
+                    (stack.get(stack.len().saturating_sub(2))).map(|__value| (__value).view()),
+                    Some(ValueView::Undefined | ValueView::Null)
                 ) {
                     return Err(i.throw("TypeError", "cannot access property of null or undefined"));
                 }
-                match stack.last().expect("vm stack underflow") {
+                match (stack.last().expect("vm stack underflow")).view() {
                     // Side-effect-free and deterministic to coerce later; numbers stay numeric
                     // so GetElem/SetElem keep their dense fast path.
-                    Value::Num(_) | Value::Str(_) | Value::Sym(_) => {}
+                    ValueView::Num(_) | ValueView::Str(_) | ValueView::Sym(_) => {}
                     _ => {
                         let key = pop!();
                         let k = i.to_property_key(&key)?;
@@ -17034,8 +17078,8 @@ fn run_vm_inner<S: StoredValue>(
                         .flatten()
                     {
                         Some(value) => value,
-                        None => match (&a, &b) {
-                            (Value::Num(x), Value::Num(y)) => {
+                        None => match (&(a).view(), &(b).view()) {
+                            (ValueView::Num(x), ValueView::Num(y)) => {
                                 if y.is_nan() || (x.abs() == 1.0 && y.is_infinite()) {
                                     Value::Num(f64::NAN)
                                 } else {
@@ -17060,9 +17104,9 @@ fn run_vm_inner<S: StoredValue>(
                     .flatten()
                 {
                     Some(value) => value,
-                    None => match a {
-                        Value::Num(n) => Value::Num(-n),
-                        other => i.eval_unary_vm("-", other)?,
+                    None => match a.view() {
+                        ValueView::Num(n) => Value::Num(-n),
+                        _ => i.eval_unary_vm("-", a)?,
                     },
                 };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
@@ -17077,9 +17121,9 @@ fn run_vm_inner<S: StoredValue>(
                     .flatten()
                 {
                     Some(value) => value,
-                    None => match a {
-                        Value::Num(n) => Value::Num(n),
-                        other => i.eval_unary_vm("+", other)?,
+                    None => match a.view() {
+                        ValueView::Num(n) => Value::Num(n),
+                        _ => i.eval_unary_vm("+", a)?,
                     },
                 };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
@@ -17098,9 +17142,9 @@ fn run_vm_inner<S: StoredValue>(
                     .flatten()
                 {
                     Some(value) => value,
-                    None => match a {
-                        Value::Num(n) => Value::Num(!crate::eval::to_int32(n) as f64),
-                        other => i.eval_unary_vm("~", other)?,
+                    None => match a.view() {
+                        ValueView::Num(n) => Value::Num(!crate::eval::to_int32(n) as f64),
+                        _ => i.eval_unary_vm("~", a)?,
                     },
                 };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
@@ -17137,11 +17181,14 @@ fn run_vm_inner<S: StoredValue>(
                 let it = &chunk.inline_targets[t as usize];
                 let d = it.argc as usize + 1;
                 let callee_ok = matches!(
-                    &stack.read_value(stack.len() - d),
-                    Value::Obj(o) if crate::value::Gc::as_ptr(o) as usize == it.expected
+                    &(stack.read_value(stack.len() - d)).view(),
+                    ValueView::Obj(o) if crate::value::Gc::as_ptr(o) as usize == it.expected
                 );
                 let this_ok = !it.check_this
-                    || matches!(stack.read_value(stack.len() - d - 1), Value::Obj(_));
+                    || matches!(
+                        (stack.read_value(stack.len() - d - 1)).view(),
+                        ValueView::Obj(_)
+                    );
                 let env_ok = it.expected_env == 0 || Env::as_ptr(env) as usize == it.expected_env;
                 let realm_ok = Env::as_ptr(&i.global_env) as usize == it.expected_genv;
                 if !(callee_ok && this_ok && env_ok && realm_ok) {
@@ -17198,8 +17245,8 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::JumpIfNotNullishPeek(t) => {
                 let taken = !matches!(
-                    stack.last().expect("vm stack underflow"),
-                    Value::Undefined | Value::Null
+                    (stack.last().expect("vm stack underflow")).view(),
+                    ValueView::Undefined | ValueView::Null
                 );
                 if taken && t as usize <= *pc {
                     i.interrupt_poll()?;
@@ -17378,7 +17425,7 @@ fn run_vm_inner<S: StoredValue>(
             Op::ArraySpread => {
                 let spread = pop!();
                 let array = stack.last().expect("array builder missing").clone();
-                let prefix = i.array_length(array.as_obj().expect("array builder"));
+                let prefix = i.array_length(&array.as_obj().expect("array builder"));
                 i.expand_spread(&spread, prefix, |i, value| {
                     array_literal_append(i, &array, Some(value))
                 })?;
@@ -17417,14 +17464,16 @@ fn run_vm_inner<S: StoredValue>(
                 // owner until CreateDataProperty has retained the identity
                 // (ECMA-262 e28783d5, sec-topropertykey).
                 let key = i.to_property_key(&key)?;
-                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                let ValueView::Obj(object) = (stack.last().expect("object builder missing")).view()
+                else {
                     unreachable!("object literal builder retains an Object")
                 };
                 literal_define_data(i, &object, key.as_str(), value, name_anonymous);
             }
             Op::ObjectDataName(name, name_anonymous) => {
                 let value = pop!();
-                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                let ValueView::Obj(object) = (stack.last().expect("object builder missing")).view()
+                else {
                     unreachable!("object literal builder retains an Object")
                 };
                 literal_define_data(
@@ -17437,7 +17486,8 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::ObjectSpread => {
                 let source = pop!();
-                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                let ValueView::Obj(object) = (stack.last().expect("object builder missing")).view()
+                else {
                     unreachable!("object literal builder retains an Object")
                 };
                 i.copy_data_properties_into(&object, &source, &[])?;
@@ -17482,26 +17532,29 @@ fn run_vm_inner<S: StoredValue>(
             },
             Op::ObjectProto => {
                 let prototype = pop!();
-                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                let ValueView::Obj(object) = (stack.last().expect("object builder missing")).view()
+                else {
                     unreachable!("object literal builder retains an Object")
                 };
-                match prototype {
-                    Value::Obj(prototype) => object.borrow_mut().proto = Some(prototype),
-                    Value::Null => object.borrow_mut().proto = None,
+                match (prototype).view() {
+                    ValueView::Obj(prototype) => object.borrow_mut().proto = Some(prototype),
+                    ValueView::Null => object.borrow_mut().proto = None,
                     _ => {}
                 }
             }
             Op::ObjectMethod(function, kind) => {
                 let key = pop!();
                 let key = i.to_property_key(&key)?;
-                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                let ValueView::Obj(object) = (stack.last().expect("object builder missing")).view()
+                else {
                     unreachable!("object literal builder retains an Object")
                 };
                 let func = &chunk.funcs[function as usize];
                 literal_define_method(i, &object, env, func, key.as_str(), kind);
             }
             Op::ObjectMethodName(function, kind, name) => {
-                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                let ValueView::Obj(object) = (stack.last().expect("object builder missing")).view()
+                else {
                     unreachable!("object literal builder retains an Object")
                 };
                 let func = &chunk.funcs[function as usize];
@@ -17628,7 +17681,7 @@ fn run_vm_inner<S: StoredValue>(
                 let base = pop!();
                 let key = pop!();
                 let receiver = pop!();
-                if matches!(base, Value::Null | Value::Undefined) {
+                if matches!((base).view(), ValueView::Null | ValueView::Undefined) {
                     return Err(i.throw("TypeError", "cannot read property of null super base"));
                 }
                 let key = i.to_property_key(&key)?;
@@ -17650,7 +17703,7 @@ fn run_vm_inner<S: StoredValue>(
                 let base = pop!();
                 let key = pop!();
                 let receiver = pop!();
-                if matches!(base, Value::Null | Value::Undefined) {
+                if matches!((base).view(), ValueView::Null | ValueView::Undefined) {
                     return Err(i.throw("TypeError", "cannot read property of null super base"));
                 }
                 let key = i.to_property_key(&key)?;
@@ -17733,7 +17786,10 @@ fn run_vm_inner<S: StoredValue>(
                 return Err(Abrupt::Throw(exc));
             }
             Op::DestructureStepL(iter_s, next_s, done_s) => {
-                if matches!(slots.read_value(done_s as usize), Value::Bool(true)) {
+                if matches!(
+                    (slots.read_value(done_s as usize)).view(),
+                    ValueView::Bool(true)
+                ) {
                     stack.push(Value::Undefined);
                     continue;
                 }
@@ -17753,14 +17809,20 @@ fn run_vm_inner<S: StoredValue>(
             Op::DestructureRestL(iter_s, next_s, done_s) => {
                 let iterator = slots.read_value(iter_s as usize);
                 let next = slots.read_value(next_s as usize);
-                let mut done = matches!(slots.read_value(done_s as usize), Value::Bool(true));
+                let mut done = matches!(
+                    (slots.read_value(done_s as usize)).view(),
+                    ValueView::Bool(true)
+                );
                 let result = i.drain_iterator_rest(&iterator, &next, &mut done);
                 slots.write_value(done_s as usize, Value::Bool(done));
                 let values = result?;
                 stack.push(i.make_array(values));
             }
             Op::IterCloseIfNotDoneL(iter_s, done_s) => {
-                if !matches!(slots.read_value(done_s as usize), Value::Bool(true)) {
+                if !matches!(
+                    (slots.read_value(done_s as usize)).view(),
+                    ValueView::Bool(true)
+                ) {
                     slots.write_value(done_s as usize, Value::Bool(true));
                     let iterator = slots.read_value(iter_s as usize);
                     i.iterator_close_normal(&iterator)?;
@@ -17768,7 +17830,10 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::IterAbortIfNotDoneL(iter_s, done_s) => {
                 let error = pop!();
-                if !matches!(slots.read_value(done_s as usize), Value::Bool(true)) {
+                if !matches!(
+                    (slots.read_value(done_s as usize)).view(),
+                    ValueView::Bool(true)
+                ) {
                     slots.write_value(done_s as usize, Value::Bool(true));
                     let iterator = slots.read_value(iter_s as usize);
                     i.iterator_close(&iterator);
@@ -17778,7 +17843,10 @@ fn run_vm_inner<S: StoredValue>(
             Op::AsyncIterStepL(iter_s, next_s, from_sync_s, done_s) => {
                 let iterator = slots.read_value(iter_s as usize);
                 let next = slots.read_value(next_s as usize);
-                let from_sync = matches!(slots.read_value(from_sync_s as usize), Value::Bool(true));
+                let from_sync = matches!(
+                    (slots.read_value(from_sync_s as usize)).view(),
+                    ValueView::Bool(true)
+                );
                 let result = match i.call(next, iterator.clone(), &[]) {
                     Ok(result) => result,
                     Err(error) if from_sync => {
@@ -17789,7 +17857,7 @@ fn run_vm_inner<S: StoredValue>(
                 if !from_sync {
                     return Ok(VmStep::Await(result));
                 }
-                if !matches!(result, Value::Obj(_)) {
+                if !matches!((result).view(), ValueView::Obj(_)) {
                     let error = i.make_error("TypeError", "iterator result is not an object");
                     return Ok(VmStep::Await(rejected_intrinsic_promise(i, error)));
                 }
@@ -17835,12 +17903,18 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::AsyncIterResumeL(from_sync_s, done_s) => {
                 let settled = pop!();
-                let from_sync = matches!(slots.read_value(from_sync_s as usize), Value::Bool(true));
+                let from_sync = matches!(
+                    (slots.read_value(from_sync_s as usize)).view(),
+                    ValueView::Bool(true)
+                );
                 let (done, value) = if from_sync {
-                    let done = matches!(slots.read_value(done_s as usize), Value::Bool(true));
+                    let done = matches!(
+                        (slots.read_value(done_s as usize)).view(),
+                        ValueView::Bool(true)
+                    );
                     (done, if done { Value::Undefined } else { settled })
                 } else {
-                    if !matches!(settled, Value::Obj(_)) {
+                    if !matches!((settled).view(), ValueView::Obj(_)) {
                         return Err(i.throw("TypeError", "iterator result is not an object"));
                     }
                     let done = i.get_member_key(&settled, "done")?;
@@ -17858,7 +17932,10 @@ fn run_vm_inner<S: StoredValue>(
             Op::AsyncIterCloseL(iter_s, from_sync_s, swallow_error) => {
                 return Ok(VmStep::AsyncClose {
                     iterator: slots.read_value(iter_s as usize),
-                    from_sync: matches!(slots.read_value(from_sync_s as usize), Value::Bool(true)),
+                    from_sync: matches!(
+                        (slots.read_value(from_sync_s as usize)).view(),
+                        ValueView::Bool(true)
+                    ),
                     swallow_error,
                 });
             }
@@ -17876,12 +17953,12 @@ fn run_vm_inner<S: StoredValue>(
             Op::ReturnBare => return Ok(VmStep::BareReturn),
             Op::ResumeReturn => return Ok(VmStep::ResumeReturn(pop!())),
             Op::ResumeJump => {
-                let handler_depth = match pop!() {
-                    Value::Num(value) => value as usize,
+                let handler_depth = match (pop!()).view() {
+                    ValueView::Num(value) => value as usize,
                     _ => unreachable!("finally jump depth is an internal integer"),
                 };
-                let target = match pop!() {
-                    Value::Num(value) => value as usize,
+                let target = match (pop!()).view() {
+                    ValueView::Num(value) => value as usize,
                     _ => unreachable!("finally jump target is an internal integer"),
                 };
                 return Ok(VmStep::AbruptJump {
@@ -18193,7 +18270,7 @@ impl VmAsyncClose {
             Ok(ret) => ret,
             Err(error) => return (None, Self::failure(swallow_error, error)),
         };
-        if matches!(ret, Value::Undefined | Value::Null) {
+        if matches!((ret).view(), ValueView::Undefined | ValueView::Null) {
             return (None, AsyncCloseAction::Continue);
         }
         if !ret.is_callable() {
@@ -18258,7 +18335,7 @@ impl VmAsyncClose {
                 return Self::reject_from_sync(i, iterator, swallow_error, error);
             }
         };
-        if matches!(ret, Value::Undefined | Value::Null) {
+        if matches!((ret).view(), ValueView::Undefined | ValueView::Null) {
             let promise = i.new_promise();
             let result = i.iter_result_obj(Value::Undefined, true);
             i.resolve_promise(&promise, result);
@@ -18280,7 +18357,7 @@ impl VmAsyncClose {
                 return Self::reject_from_sync(i, iterator, swallow_error, error);
             }
         };
-        if !matches!(result, Value::Obj(_)) {
+        if !matches!((result).view(), ValueView::Obj(_)) {
             let error =
                 Abrupt::Throw(i.make_error("TypeError", "iterator result is not an object"));
             return Self::reject_from_sync(i, iterator, swallow_error, error);
@@ -18313,7 +18390,7 @@ impl VmAsyncClose {
         match signal {
             Resume::Next(result) => match self.stage {
                 AsyncCloseStage::AwaitResult => {
-                    if matches!(result, Value::Obj(_)) {
+                    if matches!((result).view(), ValueView::Obj(_)) {
                         AsyncCloseAction::Continue
                     } else {
                         Self::failure(
@@ -18341,12 +18418,14 @@ impl VmDelegate {
                 Some(key) => i.get_member_key(&value, &key)?,
                 None => Value::Undefined,
             };
-            if !matches!(method, Value::Undefined | Value::Null) && !method.is_callable() {
+            if !matches!((method).view(), ValueView::Undefined | ValueView::Null)
+                && !method.is_callable()
+            {
                 return Err(i.throw("TypeError", "@@asyncIterator is not callable"));
             }
             if method.is_callable() {
                 let iterator = i.call(method, value, &[])?;
-                if !matches!(iterator, Value::Obj(_)) {
+                if !matches!((iterator).view(), ValueView::Obj(_)) {
                     return Err(i.throw("TypeError", "@@asyncIterator did not return an object"));
                 }
                 let next = i.get_member_key(&iterator, "next")?;
@@ -18394,7 +18473,7 @@ impl VmDelegate {
                             Ok(method) => method,
                             Err(error) => return Self::abrupt(error),
                         };
-                        if matches!(method, Value::Undefined | Value::Null) {
+                        if matches!((method).view(), ValueView::Undefined | ValueView::Null) {
                             if !self.async_mode {
                                 if let Err(error) = i.iterator_close_normal(&self.iterator) {
                                     return Self::abrupt(error);
@@ -18410,7 +18489,7 @@ impl VmDelegate {
                                 Ok(ret) => ret,
                                 Err(error) => return Self::abrupt(error),
                             };
-                            if matches!(ret, Value::Undefined | Value::Null) {
+                            if matches!((ret).view(), ValueView::Undefined | ValueView::Null) {
                                 return Self::type_error(
                                     i,
                                     "the delegated iterator has no 'throw' method",
@@ -18436,7 +18515,7 @@ impl VmDelegate {
                             Ok(method) => method,
                             Err(error) => return Self::abrupt(error),
                         };
-                        if matches!(method, Value::Undefined | Value::Null) {
+                        if matches!((method).view(), ValueView::Undefined | ValueView::Null) {
                             if self.async_mode {
                                 self.stage = DelegateStage::AwaitMissingReturn;
                                 return DelegateAction::Suspend(Suspend::Await(value));
@@ -18480,7 +18559,7 @@ impl VmDelegate {
             },
             DelegateStage::AwaitCloseResult => match signal {
                 Resume::Next(result) => {
-                    if !matches!(result, Value::Obj(_)) {
+                    if !matches!((result).view(), ValueView::Obj(_)) {
                         return Self::type_error(i, "iterator 'return' must return an object");
                     }
                     if self.from_sync {
@@ -18522,7 +18601,7 @@ impl VmDelegate {
         completion: DelegateCompletion,
     ) -> DelegateAction {
         use crate::coroutine::Suspend;
-        if !matches!(result, Value::Obj(_)) {
+        if !matches!((result).view(), ValueView::Obj(_)) {
             return Self::type_error(i, "iterator result is not an object");
         }
         let done = match i.get_member_key(&result, "done") {
@@ -18594,7 +18673,7 @@ pub struct VmCoro {
     env: Env,
     references: Vec<crate::eval::PreparedReferenceSlot>,
     this_val: Value,
-    slots: Vec<PackedValue>,
+    slots: Vec<Cell<PackedValue>>,
     stack: ValueStack<PackedValue>,
     pc: usize,
     /// The `try` handler stack, saved across suspensions so a rejected `await` inside a `try` still
@@ -18679,7 +18758,10 @@ impl VmCoro {
         for reference in self.references.iter().flatten() {
             bytes = bytes.saturating_add(reference.scan_retained_memory(visitor));
         }
-        for value in self.slots.iter().chain(self.stack.raw_slice()) {
+        for value in &self.slots {
+            visitor.value(&value.get().unpack());
+        }
+        for value in self.stack.raw_slice() {
             visitor.value(&value.unpack());
         }
         for frame in &self.disposal_frames {
@@ -18737,8 +18819,8 @@ impl VmCoro {
         let references = (0..chunk.n_refs)
             .map(|_| crate::eval::PreparedReferenceSlot::default())
             .collect();
-        let slots: Vec<PackedValue> = (0..chunk.n_slots)
-            .map(|_| PackedValue::pack(Value::Undefined))
+        let slots: Vec<Cell<PackedValue>> = (0..chunk.n_slots)
+            .map(|_| Cell::new(PackedValue::pack(Value::Undefined)))
             .collect();
         for (k, a) in params.iter().take(chunk.n_params).enumerate() {
             slots.write_value(k, a.clone());
@@ -19177,12 +19259,12 @@ fn step_value(
         UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard
     );
     let old_numeric = i.to_numeric(old)?;
-    let new_value = match &old_numeric {
-        Value::BigInt(old) => {
+    let new_value = match &(old_numeric).view() {
+        ValueView::BigInt(old) => {
             let one = crate::bigint::JsBigInt::from_u64(1);
             Value::BigInt(if inc { old.add(&one) } else { old.sub(&one) })
         }
-        Value::Num(old) => Value::Num(if inc { old + 1.0 } else { old - 1.0 }),
+        ValueView::Num(old) => Value::Num(if inc { old + 1.0 } else { old - 1.0 }),
         _ => unreachable!("ToNumeric returns only Number or BigInt"),
     };
     set(i, new_value.clone())?;
@@ -19221,7 +19303,7 @@ fn get_named_property(
 ) -> Result<Value, Abrupt> {
     if !chunk.feedback.detailed_enabled() {
         // A String primitive's `length` is its own fixed data property (ECMA-262 §10.4.3.5).
-        if let (Value::Str(s), "length") = (base, name) {
+        if let (ValueView::Str(s), "length") = (&(base).view(), name) {
             return Ok(Value::Num(i.str_len(s) as f64));
         }
         return i.get_prop_ic(base, name, cache);
@@ -19323,7 +19405,7 @@ fn get_element_profiled(
     base: &Value,
     raw_key: &Value,
 ) -> Result<Value, Abrupt> {
-    if matches!(base, Value::Undefined | Value::Null) {
+    if matches!(&(base).view(), ValueView::Undefined | ValueView::Null) {
         crate::value::trace_nullish_property("bytecode-profiled-get-elem", raw_key);
         return Err(i.throw("TypeError", "cannot read property of null or undefined"));
     }
@@ -19347,7 +19429,7 @@ fn set_element_profiled(
 ) -> Result<(), Abrupt> {
     // PutValue performs ToObject before ToPropertyKey (ECMA-262 e28783d5,
     // sec-putvalue). Profiling must preserve the same observable ordering.
-    if matches!(base, Value::Undefined | Value::Null) {
+    if matches!(&(base).view(), ValueView::Undefined | ValueView::Null) {
         return Err(i.throw("TypeError", "cannot set property of null or undefined"));
     }
     let key = i.to_property_key(raw_key)?;
@@ -19438,8 +19520,8 @@ fn bin_num<S: StoredValue>(
         .flatten()
     {
         Some(value) => value,
-        None => match (&a, &b) {
-            (Value::Num(x), Value::Num(y)) => Value::Num(f(*x, *y)),
+        None => match (&(a).view(), &(b).view()) {
+            (ValueView::Num(x), ValueView::Num(y)) => Value::Num(f(*x, *y)),
             _ => i.binary(op, a, b)?,
         },
     };
@@ -19457,7 +19539,7 @@ fn try_tagged_numeric_binary<F>(left: &Value, right: &Value, f: &F) -> Option<Va
 where
     F: Fn(f64, f64) -> f64,
 {
-    let (Value::Num(left), Value::Num(right)) = (left, right) else {
+    let (ValueView::Num(left), ValueView::Num(right)) = (&(left).view(), &(right).view()) else {
         return None;
     };
     let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
@@ -19481,7 +19563,7 @@ fn try_tagged_numeric_cmp<F>(left: &Value, right: &Value, f: &F) -> Option<Value
 where
     F: Fn(f64, f64) -> bool,
 {
-    let (Value::Num(left), Value::Num(right)) = (left, right) else {
+    let (ValueView::Num(left), ValueView::Num(right)) = (&(left).view(), &(right).view()) else {
         return None;
     };
     let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
@@ -19502,7 +19584,7 @@ fn try_tagged_numeric_i32<F>(left: &Value, right: &Value, f: &F) -> Option<Value
 where
     F: Fn(i32, i32) -> i32,
 {
-    let (Value::Num(left), Value::Num(right)) = (left, right) else {
+    let (ValueView::Num(left), ValueView::Num(right)) = (&(left).view(), &(right).view()) else {
         return None;
     };
     let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
@@ -19523,7 +19605,7 @@ fn try_tagged_numeric_unary<F>(value: &Value, f: F) -> Option<Value>
 where
     F: FnOnce(f64) -> f64,
 {
-    let Value::Num(n) = value else {
+    let ValueView::Num(n) = &(value).view() else {
         return None;
     };
     let frame = crate::tagged::TaggedNumberFrame::new(*n);
@@ -19541,7 +19623,7 @@ where
 /// `None` keeps the complete helper with BigInt mixing and ToNumeric ordering (ECMA-262 §13.9).
 #[inline(always)]
 fn try_tagged_numeric_pow(left: &Value, right: &Value) -> Option<Value> {
-    let (Value::Num(left), Value::Num(right)) = (left, right) else {
+    let (ValueView::Num(left), ValueView::Num(right)) = (&(left).view(), &(right).view()) else {
         return None;
     };
     let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
@@ -19572,7 +19654,7 @@ fn bin_i32<S: StoredValue>(
     {
         Some(value) => value,
         None => {
-            if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
+            if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
                 Value::Num(f(crate::eval::to_int32(*x), crate::eval::to_int32(*y)) as f64)
             } else {
                 i.binary(op, a, b)?
@@ -19601,7 +19683,7 @@ fn bin_cmp<S: StoredValue>(
         stack.push(v);
         return Ok(());
     }
-    if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
+    if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
         stack.push(Value::Bool(f(*x, *y)));
         return Ok(());
     }
@@ -20535,8 +20617,8 @@ impl Chunk {
     /// Whether const `k` is a trivially-copyable value the JIT may materialize inline.
     pub(crate) fn jit_const_copyable(&self, k: u32) -> bool {
         matches!(
-            self.consts[k as usize],
-            Value::Undefined | Value::Null | Value::Bool(_) | Value::Num(_)
+            (self.consts[k as usize]).view(),
+            ValueView::Undefined | ValueView::Null | ValueView::Bool(_) | ValueView::Num(_)
         )
     }
     /// One-word execution encoding for an immediate constant; heap constants need ownership
@@ -20550,8 +20632,8 @@ impl Chunk {
     /// the cell while the chunk lives, the chunk owns that code, and cells never move. So only
     /// code this chunk owns may embed it, never a process-wide shared stub.
     pub(crate) fn jit_const_str_word(&self, k: u32) -> Option<u64> {
-        match &self.consts[k as usize] {
-            Value::Str(string) => Some(crate::value::PACK_STR | string.cell_word()),
+        match &(self.consts[k as usize]).view() {
+            ValueView::Str(string) => Some(crate::value::PACK_STR | string.cell_word()),
             _ => None,
         }
     }
@@ -20565,12 +20647,12 @@ impl Chunk {
     /// Whether const `k` is a string: the string-const templates push it as an immediate
     /// (`jit_const_str_word`).
     pub(crate) fn jit_const_is_str(&self, k: u32) -> bool {
-        matches!(self.consts[k as usize], Value::Str(_))
+        matches!((self.consts[k as usize]).view(), ValueView::Str(_))
     }
     /// The f64 bits of a Num const (for the JIT's register-chain emitter).
     pub(crate) fn jit_const_num(&self, k: u32) -> Option<u64> {
-        match &self.consts[k as usize] {
-            Value::Num(n) => Some(n.to_bits()),
+        match &(self.consts[k as usize]).view() {
+            ValueView::Num(n) => Some(n.to_bits()),
             _ => None,
         }
     }
@@ -20578,11 +20660,11 @@ impl Chunk {
     /// repr(u8) puts each payload at its own alignment: Bool's byte sits in word0 at offset 1,
     /// Num's f64 fills word1 (offset 8).
     pub(crate) fn jit_const_bits(&self, k: u32) -> (u64, u64) {
-        match &self.consts[k as usize] {
-            Value::Undefined => (0, 0),
-            Value::Null => (2, 0),
-            Value::Bool(b) => (3 | ((*b as u64) << 8), 0),
-            Value::Num(n) => (4, n.to_bits()),
+        match &(self.consts[k as usize]).view() {
+            ValueView::Undefined => (0, 0),
+            ValueView::Null => (2, 0),
+            ValueView::Bool(b) => (3 | ((*b as u64) << 8), 0),
+            ValueView::Num(n) => (4, n.to_bits()),
             _ => unreachable!("non-copyable const in jit_const_bits"),
         }
     }
@@ -21672,16 +21754,19 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
     sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let base = unsafe { sp.sub(2) };
-    if !matches!(unsafe { &(*base).unpack() }, Value::Str(_))
-        || !matches!(unsafe { &(*base.add(1)).unpack() }, Value::Str(_))
+    if !matches!(&(unsafe { &(*base).unpack() }).view(), ValueView::Str(_))
+        || !matches!(
+            &(unsafe { &(*base.add(1)).unpack() }).view(),
+            ValueView::Str(_)
+        )
     {
         return unsafe { jit_exec(ctx, pc, sp) };
     }
 
-    let Value::Str(left) = (unsafe { base.read().into_value() }) else {
+    let ValueView::Str(left) = (unsafe { base.read().into_value() }).view() else {
         unreachable!()
     };
-    let Value::Str(right) = (unsafe { base.add(1).read().into_value() }) else {
+    let ValueView::Str(right) = (unsafe { base.add(1).read().into_value() }).view() else {
         unreachable!()
     };
     if left.len().saturating_add(right.len()) > crate::interpreter::MAX_STR_LEN {
@@ -21753,11 +21838,11 @@ unsafe fn jit_intrinsic_inner(
         // Move the three owners out; each is released exactly once below.
         let receiver = base.read().into_value();
         let callee = base.add(1).read();
-        let Value::Num(n) = base.add(2).read().into_value() else {
+        let ValueView::Num(n) = (base.add(2).read().into_value()).view() else {
             unreachable!("Number argument guard")
         };
         let value = if intrinsic == INTRINSIC_CHAR_CODE_AT {
-            let Value::Str(s) = &receiver else {
+            let ValueView::Str(s) = &(receiver).view() else {
                 unreachable!("charCodeAt receiver guard")
             };
             let idx = if n.is_nan() { 0.0 } else { n.trunc() };
@@ -21781,7 +21866,7 @@ unsafe fn jit_intrinsic_inner(
     if intrinsic == INTRINSIC_ARRAY_PUSH {
         // [receiver, callee, value]. A guarded dense append runs no author code, so it needs
         // none of the native-call boundary below (depth, safepoint, new.target bookkeeping).
-        if let Value::Obj(receiver) = (*base).unpack() {
+        if let ValueView::Obj(receiver) = ((*base).unpack()).view() {
             let value = base.add(2).read();
             match crate::builtins::array_push_dense_packed(i, &receiver, value) {
                 Ok(length) => {
@@ -21816,10 +21901,10 @@ unsafe fn jit_intrinsic_inner(
                 let saved_nt = std::mem::replace(&mut i.new_target, Value::Undefined);
                 let r = match intrinsic {
                     INTRINSIC_CHAR_AT => {
-                        let Value::Str(s) = &(*base).unpack() else {
+                        let ValueView::Str(s) = &((*base).unpack()).view() else {
                             unreachable!("charAt intrinsic receiver guard")
                         };
-                        let Value::Num(n) = &(*base.add(2)).unpack() else {
+                        let ValueView::Num(n) = &((*base.add(2)).unpack()).view() else {
                             unreachable!("charAt intrinsic index guard")
                         };
                         let idx = if n.is_nan() { 0.0 } else { n.trunc() };
@@ -21835,10 +21920,10 @@ unsafe fn jit_intrinsic_inner(
                     INTRINSIC_CODE_POINT_AT => {
                         #[cfg(test)]
                         TEST_JIT_CODE_POINT_INTRINSICS.with(|count| count.set(count.get() + 1));
-                        let Value::Str(s) = &(*base).unpack() else {
+                        let ValueView::Str(s) = &((*base).unpack()).view() else {
                             unreachable!("codePointAt intrinsic receiver guard")
                         };
-                        let Value::Num(n) = &(*base.add(2)).unpack() else {
+                        let ValueView::Num(n) = &((*base.add(2)).unpack()).view() else {
                             unreachable!("codePointAt intrinsic index guard")
                         };
                         let idx = if n.is_nan() { 0.0 } else { n.trunc() };
@@ -21850,13 +21935,13 @@ unsafe fn jit_intrinsic_inner(
                         })
                     }
                     INTRINSIC_STRING_SLICE => {
-                        let Value::Str(s) = &(*base).unpack() else {
+                        let ValueView::Str(s) = &((*base).unpack()).view() else {
                             unreachable!("slice intrinsic receiver guard")
                         };
-                        let Value::Num(start) = &(*base.add(2)).unpack() else {
+                        let ValueView::Num(start) = &((*base.add(2)).unpack()).view() else {
                             unreachable!("slice intrinsic start guard")
                         };
-                        let Value::Num(end) = &(*base.add(3)).unpack() else {
+                        let ValueView::Num(end) = &((*base.add(3)).unpack()).view() else {
                             unreachable!("slice intrinsic end guard")
                         };
                         debug_assert!(s.ascii_hint());
@@ -21888,15 +21973,16 @@ unsafe fn jit_intrinsic_inner(
                         })
                     }
                     INTRINSIC_OBJECT_HAS_OWN => {
-                        let object @ Value::Obj(_) = &(*base.add(2)).unpack() else {
+                        let object = (*base.add(2)).unpack();
+                        let ValueView::Obj(_) = object.view() else {
                             unreachable!("hasOwn intrinsic object guard")
                         };
-                        let Value::Str(key) = &(*base.add(3)).unpack() else {
+                        let ValueView::Str(key) = &((*base.add(3)).unpack()).view() else {
                             unreachable!("hasOwn intrinsic key guard")
                         };
                         crate::builtins::has_own_property_trapped(
                             i,
-                            object,
+                            &object,
                             &crate::value::encode_string_key(key),
                         )
                         .map(Value::Bool)
@@ -21938,8 +22024,11 @@ unsafe fn jit_intrinsic_inner(
                         // into an already-JIT-compiled target frame. No observable operation occurs
                         // before every list guard has passed; unusual array-likes and non-JIT targets
                         // execute the named builtin unchanged.
-                        let dense = match (&(*base).unpack(), &(*base.add(3)).unpack()) {
-                            (Value::Obj(_), Value::Obj(list))
+                        let dense = match (
+                            &((*base).unpack()).view(),
+                            &((*base.add(3)).unpack()).view(),
+                        ) {
+                            (ValueView::Obj(_), ValueView::Obj(list))
                                 if i.ordinary_get_ptr(crate::value::Gc::as_ptr(list) as usize)
                                     && !i.mapped_arguments.contains_key(
                                         &(crate::value::Gc::as_ptr(list) as usize),
@@ -21947,8 +22036,8 @@ unsafe fn jit_intrinsic_inner(
                             {
                                 let b = list.borrow();
                                 let len = match b.props.get("length") {
-                                    Some(p) if !p.accessor() => match p.value() {
-                                        Value::Num(n)
+                                    Some(p) if !p.accessor() => match (p.value()).view() {
+                                        ValueView::Num(n)
                                             if n >= 0.0
                                                 && n.is_finite()
                                                 && n.fract() == 0.0
@@ -22007,7 +22096,7 @@ unsafe fn jit_intrinsic_inner(
                         }
                     }
                     INTRINSIC_ARRAY_PUSH => {
-                        let Value::Obj(o) = &(*base).unpack() else {
+                        let ValueView::Obj(o) = &((*base).unpack()).view() else {
                             unreachable!("push intrinsic receiver guard")
                         };
                         let arg = base.add(2).read().into_value();
@@ -22030,7 +22119,7 @@ unsafe fn jit_intrinsic_inner(
                         }
                     }
                     INTRINSIC_ARRAY_POP => {
-                        let Value::Obj(o) = &(*base).unpack() else {
+                        let ValueView::Obj(o) = &((*base).unpack()).view() else {
                             unreachable!("pop intrinsic receiver guard")
                         };
                         match crate::builtins::jit_array_pop(i, o) {
@@ -22040,9 +22129,10 @@ unsafe fn jit_intrinsic_inner(
                         }
                     }
                     INTRINSIC_REGEXP_EXEC_DISCARD => {
-                        let (Value::Obj(_), Value::Str(input)) =
-                            (&(*base).unpack(), &(*base.add(2)).unpack())
-                        else {
+                        let (ValueView::Obj(_), ValueView::Str(input)) = (
+                            &((*base).unpack()).view(),
+                            &((*base.add(2)).unpack()).view(),
+                        ) else {
                             unreachable!("regexp exec intrinsic guards")
                         };
                         match crate::builtins::regexp_exec_discard_fast(i, &(*base).unpack(), input)
@@ -22215,7 +22305,7 @@ unsafe fn jit_reflect_apply_operand_only(
     let i = &mut *ctx.interp;
     let args_ptr = sp.sub(3);
     let target = (*args_ptr).unpack();
-    let Value::Obj(target_object) = &target else {
+    let ValueView::Obj(target_object) = &(target).view() else {
         return None;
     };
     let nf = {
@@ -22235,7 +22325,11 @@ unsafe fn jit_reflect_apply_operand_only(
         return None;
     }
     let values = dense_own_list(i, &list)?;
-    if numeric && !values.iter().all(|value| matches!(value, Value::Num(_))) {
+    if numeric
+        && !values
+            .iter()
+            .all(|value| matches!((value).view(), ValueView::Num(_)))
+    {
         return None;
     }
     drop((target, list));
@@ -22268,7 +22362,7 @@ unsafe fn jit_reflect_apply_operand_only(
 /// The elements of an ordinary array-like whose `length` and indices `0..length` are all own
 /// data properties: CreateListFromArrayLike's Gets then run no author code.
 fn dense_own_list(i: &Interp, list: &Value) -> Option<Vec<Value>> {
-    let Value::Obj(list) = list else {
+    let ValueView::Obj(list) = &(list).view() else {
         return None;
     };
     if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(list) as usize)
@@ -22279,8 +22373,8 @@ fn dense_own_list(i: &Interp, list: &Value) -> Option<Vec<Value>> {
     }
     let b = list.borrow();
     let len = match b.props.get("length") {
-        Some(p) if !p.accessor() => match p.value() {
-            Value::Num(n) if n >= 0.0 && n.fract() == 0.0 && n <= 64.0 => n as usize,
+        Some(p) if !p.accessor() => match (p.value()).view() {
+            ValueView::Num(n) if n >= 0.0 && n.fract() == 0.0 && n <= 64.0 => n as usize,
             _ => return None,
         },
         _ => return None,
@@ -22598,7 +22692,7 @@ unsafe fn jit_object_literal_inner(
     // alive and owned across any fallible step).
     macro_rules! builder {
         () => {{
-            let Value::Obj(object) = (*sp.sub(1)).unpack() else {
+            let crate::value::ValueView::Obj(object) = (*sp.sub(1)).unpack().view() else {
                 unreachable!("object literal builder retains an Object")
             };
             object
@@ -22634,9 +22728,9 @@ unsafe fn jit_object_literal_inner(
             // A fresh, unexposed ordinary object, not an author-visible __proto__ assignment.
             // Primitive values other than null are ignored.
             let object = builder!();
-            match prototype {
-                Value::Obj(prototype) => object.borrow_mut().proto = Some(prototype),
-                Value::Null => object.borrow_mut().proto = None,
+            match (prototype).view() {
+                ValueView::Obj(prototype) => object.borrow_mut().proto = Some(prototype),
+                ValueView::Null => object.borrow_mut().proto = None,
                 _ => {}
             }
         }
@@ -22778,7 +22872,7 @@ pub(crate) unsafe extern "C" fn jit_make_array(
 /// the closed Array prefix applies.
 fn open_array_binding<S: StoredValue>(
     i: &mut Interp,
-    slots: &[S],
+    slots: &[Cell<S>],
     source: Value,
     iterator: u16,
     next: u16,
@@ -23282,7 +23376,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
             sp = sp.sub(1);
             let v = sp.read().into_value();
             let obj = ctx.clone_slot(s as usize);
-            if matches!(obj, Value::Empty) {
+            if matches!((obj).view(), ValueView::Empty) {
                 return Err(i.throw(
                     "ReferenceError",
                     format!(
@@ -23326,22 +23420,22 @@ fn get_computed_element(
     if chunk.feedback.detailed_enabled() {
         return get_element_profiled(i, chunk, pc, obj, key);
     }
-    if matches!(obj, Value::Undefined | Value::Null) {
+    if matches!(&(obj).view(), ValueView::Undefined | ValueView::Null) {
         crate::value::trace_nullish_property("get-method-elem", key);
         return Err(i.throw("TypeError", "cannot read property of null or undefined"));
     }
-    if let Value::Str(key) = key {
+    if let ValueView::Str(key) = &(key).view() {
         return i.get_computed_property(obj, key);
     }
-    match (obj, key) {
-        (Value::Obj(object), Value::Num(index)) => {
+    match (&(obj).view(), &(key).view()) {
+        (ValueView::Obj(object), ValueView::Num(index)) => {
             if let Some(value) = i.fast_get_elem(object, *index) {
                 return Ok(value);
             }
         }
         // A String's own integer-indexed properties are its code units (ECMA-262
         // StringGetOwnProperty), read without the decimal key text.
-        (Value::Str(string), Value::Num(index))
+        (ValueView::Str(string), ValueView::Num(index))
             if *index >= 0.0 && index.fract() == 0.0 && *index < u32::MAX as f64 =>
         {
             if let Some(unit) = i.unit_at(string, *index as usize) {
@@ -23353,7 +23447,7 @@ fn get_computed_element(
     // ToPropertyKey of an integral Number is its decimal text, and of a Symbol its encoded
     // key; skip the temporary strings. The Symbol stays owned by `key` during the read.
     if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
-        if let (Value::Obj(object), Value::Num(index)) = (obj, key) {
+        if let (ValueView::Obj(object), ValueView::Num(index)) = (&(obj).view(), &(key).view()) {
             // A hole, an absent index or a sparse element of an ordinary chain.
             if let Some(value) = Interp::ordinary_chain_get_data(object, text.as_str()) {
                 return Ok(value);
@@ -23364,7 +23458,7 @@ fn get_computed_element(
         }
         return i.get_member_key(obj, text.as_str());
     }
-    if let Value::Sym(symbol) = key {
+    if let ValueView::Sym(symbol) = &(key).view() {
         return i.get_member_key(obj, crate::value::KeyText::symbol(symbol.id).as_str());
     }
     let key = i.to_property_key(key)?;
@@ -23388,10 +23482,12 @@ fn set_computed_element(
     if chunk.feedback.detailed_enabled() {
         return set_element_profiled(i, chunk, pc, object, key, value);
     }
-    if matches!(object, Value::Undefined | Value::Null) {
+    if matches!(&(object).view(), ValueView::Undefined | ValueView::Null) {
         return Err(i.throw("TypeError", "cannot set property of null or undefined"));
     }
-    let value = if let (Value::Obj(object), Value::Num(index)) = (object, key) {
+    let value = if let (ValueView::Obj(object), ValueView::Num(index)) =
+        (&(object).view(), &(key).view())
+    {
         match i.fast_set_elem(object, *index, value) {
             Ok(()) => return Ok(()),
             Err(value) => match Interp::ordinary_set_existing_index(object, *index, value) {
@@ -23404,7 +23500,7 @@ fn set_computed_element(
     };
     // ToPropertyKey of a String is itself, and of an integral Number its decimal text: pass
     // them without building an owned key string.
-    if let Value::Str(key) = key {
+    if let ValueView::Str(key) = &(key).view() {
         return i.set_member_key(object, &crate::value::encode_string_key(key), value);
     }
     if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
@@ -23459,7 +23555,7 @@ pub(crate) unsafe extern "C" fn jit_get_element(
             let key = unsafe { base.read().into_value() };
             // Clone before a coercion/getter can reenter and overwrite the canonical slot.
             let object = unsafe { ctx.clone_slot(slot as usize) };
-            if matches!(object, Value::Empty) {
+            if matches!((object).view(), ValueView::Empty) {
                 let error = unsafe { &mut *ctx.interp }.throw(
                     "ReferenceError",
                     format!(
@@ -23638,8 +23734,8 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
             }
             Op::GetPropLocal(s, n, c) => {
                 debug_assert!((s as usize) < ctx.n_slots);
-                let obj = ctx.slots.add(s as usize);
-                if (*obj).is_empty() {
+                let obj = (*ctx.slots.add(s as usize)).get();
+                if obj.is_empty() {
                     return Err(i.throw(
                         "ReferenceError",
                         format!(
@@ -23652,7 +23748,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     jit_propstat(
                         ctx,
                         i,
-                        &(*obj).unpack(),
+                        &obj.unpack(),
                         &chunk.names[n as usize],
                         &chunk.caches[c as usize],
                         pc,
@@ -23664,7 +23760,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         i,
                         chunk,
                         &chunk.names[n as usize],
-                        &*obj,
+                        &obj,
                     )
                 } {
                     Some(r) => PackedValue::pack(r?),
@@ -23672,7 +23768,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         i,
                         chunk,
                         pc as usize,
-                        obj,
+                        &obj,
                         &chunk.names[n as usize],
                         &chunk.caches[c as usize],
                     )?,
@@ -23807,7 +23903,7 @@ unsafe fn jit_call_inner(
         // probe + `call_native_committed` — no receiver borrow, no `Callable` dispatch.
         {
             let callee = &(*sp.sub(argc + 1)).unpack();
-            if let Value::Obj(o) = callee {
+            if let ValueView::Obj(o) = &(callee).view() {
                 let nf = {
                     let object = o.borrow();
                     match &object.call {
@@ -24160,8 +24256,8 @@ unsafe fn jit_callstat(
     {
         NATIVES.with(|counts| {
             let mut counts = counts.borrow_mut();
-            let name = match &(*sp.sub(argc + 1)).unpack() {
-                Value::Obj(o) => {
+            let name = match &((*sp.sub(argc + 1)).unpack()).view() {
+                ValueView::Obj(o) => {
                     let borrowed = o.borrow();
                     match &borrowed.call {
                         crate::value::Callable::NativeData(native) => native.identity.to_string(),
@@ -24171,8 +24267,8 @@ unsafe fn jit_callstat(
                         _ => borrowed
                             .props
                             .get("name")
-                            .and_then(|p| match p.value() {
-                                Value::Str(s) => Some(s.to_string()),
+                            .and_then(|p| match (p.value()).view() {
+                                ValueView::Str(s) => Some(s.to_string()),
                                 _ => None,
                             })
                             .unwrap_or_else(|| "<native>".to_string()),
@@ -24213,7 +24309,7 @@ unsafe fn jit_callstat(
             if !with_this {
                 break 'r "gate: sloppy this-user, no receiver";
             }
-            if !matches!((*sp.sub(argc + 2)).unpack(), Value::Obj(_)) {
+            if !matches!(((*sp.sub(argc + 2)).unpack()).view(), ValueView::Obj(_)) {
                 break 'r "gate: sloppy this-user, non-object receiver";
             }
         }
@@ -24295,8 +24391,8 @@ fn jit_method_operand_stat(obj: &Value, key: &Value) {
         static COUNTS: std::cell::RefCell<Dump> =
             std::cell::RefCell::new(Dump(Default::default()));
     }
-    let receiver = match obj {
-        Value::Obj(object) => {
+    let receiver = match &(obj).view() {
+        ValueView::Obj(object) => {
             let object = object.borrow();
             if !object.ic_plain.get() {
                 "exotic object"
@@ -24308,18 +24404,18 @@ fn jit_method_operand_stat(obj: &Value, key: &Value) {
                 "object"
             }
         }
-        Value::Str(_) => "primitive string",
-        Value::Num(_) => "primitive number",
-        Value::Bool(_) => "primitive boolean",
+        ValueView::Str(_) => "primitive string",
+        ValueView::Num(_) => "primitive number",
+        ValueView::Bool(_) => "primitive boolean",
         _ => "other receiver",
     };
-    let key = match key {
-        Value::Str(s) if s.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
+    let key = match &(key).view() {
+        ValueView::Str(s) if s.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
             "digit-leading string"
         }
-        Value::Str(_) => "named string",
-        Value::Num(_) => "number",
-        Value::Sym(_) => "symbol",
+        ValueView::Str(_) => "named string",
+        ValueView::Num(_) => "number",
+        ValueView::Sym(_) => "symbol",
         _ => "coercing key",
     };
     let _ = COUNTS.try_with(|counts| {
@@ -24461,16 +24557,17 @@ fn name_call_error(
     } else {
         !callee.is_callable()
     };
-    let (Abrupt::Throw(Value::Obj(object)), true, Some(name)) =
-        (&error, rejected, chunk.call_name(pc))
-    else {
+    let (Abrupt::Throw(value), true, Some(name)) = (&error, rejected, chunk.call_name(pc)) else {
+        return error;
+    };
+    let ValueView::Obj(object) = value.view() else {
         return error;
     };
     let mut object = object.borrow_mut();
     let unnamed = matches!(object.exotic, crate::value::Exotic::Error(_))
         && matches!(
-            object.props.get("message").map(crate::value::Property::value),
-            Some(Value::Str(message))
+            (object.props.get("message").map(crate::value::Property::value)).map(|__value| (__value).view()),
+            Some(ValueView::Str(message))
                 if crate::callee_name::is_unnamed_message(&message, construct)
         );
     if unnamed {
@@ -24582,7 +24679,7 @@ unsafe fn jit_exec_inner(
             *sp = sp.add(2);
         }
         Op::LoadLocal(s) => {
-            let v = &slots[s as usize];
+            let v = slots[s as usize].get();
             if v.is_empty() {
                 return Err(i.throw(
                     "ReferenceError",
@@ -24597,11 +24694,11 @@ unsafe fn jit_exec_inner(
         }
         Op::StoreLocal(s) => {
             *sp = sp.sub(1);
-            slots[s as usize].replace_stored(sp.read());
+            slots[s as usize].set(sp.read());
         }
         Op::UpdateLocal(s, kind) => {
             let idx = s as usize;
-            if matches!(slots.read_value(idx), Value::Empty) {
+            if matches!((slots.read_value(idx)).view(), ValueView::Empty) {
                 return Err(i.throw(
                     "ReferenceError",
                     format!(
@@ -24753,7 +24850,7 @@ unsafe fn jit_exec_inner(
         }
         Op::GetPropLocal(s, n, c) => {
             let obj = slots.read_value(s as usize);
-            if matches!(obj, Value::Empty) {
+            if matches!((obj).view(), ValueView::Empty) {
                 return Err(i.throw(
                     "ReferenceError",
                     format!(
@@ -24823,7 +24920,7 @@ unsafe fn jit_exec_inner(
         Op::SetPropLocalDrop(s, n, c) => {
             let v = pop!();
             let obj = slots.read_value(s as usize);
-            if matches!(obj, Value::Empty) {
+            if matches!((obj).view(), ValueView::Empty) {
                 return Err(i.throw(
                     "ReferenceError",
                     format!(
@@ -24845,7 +24942,10 @@ unsafe fn jit_exec_inner(
         Op::DestructureGuard => {
             #[cfg(test)]
             TEST_JIT_DESTRUCTURE_GUARD_HELPERS.with(|count| count.set(count.get() + 1));
-            if matches!(&(*sp.sub(1)).unpack(), Value::Undefined | Value::Null) {
+            if matches!(
+                &((*sp.sub(1)).unpack()).view(),
+                ValueView::Undefined | ValueView::Null
+            ) {
                 return Err(i.throw("TypeError", "cannot destructure null or undefined"));
             }
         }
@@ -24899,7 +24999,7 @@ unsafe fn jit_exec_inner(
         Op::DeleteProp(n, strict) => {
             let base = pop!();
             let prop = &chunk.names[n as usize];
-            if matches!(base, Value::Undefined | Value::Null) {
+            if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                 return Err(i.throw(
                     "TypeError",
                     format!(
@@ -24915,7 +25015,7 @@ unsafe fn jit_exec_inner(
             let idx = pop!();
             let base = pop!();
             let key = i.to_property_key(&idx)?;
-            if matches!(base, Value::Undefined | Value::Null) {
+            if matches!((base).view(), ValueView::Undefined | ValueView::Null) {
                 return Err(i.throw(
                     "TypeError",
                     format!(
@@ -25002,7 +25102,8 @@ unsafe fn jit_exec_inner(
             let lval = pop!();
             let obj = pop!();
             let name = &chunk.names[n as usize];
-            let lval = if let (Value::Str(x), Value::Obj(o)) = (&v, &obj) {
+            let lval = if let (ValueView::Str(x), ValueView::Obj(o)) = (&(v).view(), &(obj).view())
+            {
                 match i.append_prop_fast(o, name, lval, x) {
                     Ok(()) => return Ok(()),
                     Err(l) => l,
@@ -25083,8 +25184,10 @@ unsafe fn jit_exec_inner(
             let key = pop!();
             let obj = pop!();
             if !chunk.feedback.detailed_enabled() {
-                if let (Value::Obj(o), Value::Num(nk)) = (&obj, &key) {
-                    if let Some(Value::Num(old)) = i.fast_get_elem(o, *nk) {
+                if let (ValueView::Obj(o), ValueView::Num(nk)) = (&(obj).view(), &(key).view()) {
+                    if let Some(ValueView::Num(old)) =
+                        (i.fast_get_elem(o, *nk)).map(|__value| (__value).view())
+                    {
                         let new = match kind {
                             UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => old + 1.0,
                             UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => old - 1.0,
@@ -25109,7 +25212,7 @@ unsafe fn jit_exec_inner(
                 }
                 return Ok(());
             }
-            if matches!(obj, Value::Undefined | Value::Null) {
+            if matches!((obj).view(), ValueView::Undefined | ValueView::Null) {
                 crate::value::trace_nullish_property("jit-update-elem", &key);
                 return Err(i.throw("TypeError", "cannot read property of null or undefined"));
             }
@@ -25122,11 +25225,14 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::ToPropKey => {
-            if matches!(&(*sp.sub(2)).unpack(), Value::Undefined | Value::Null) {
+            if matches!(
+                &((*sp.sub(2)).unpack()).view(),
+                ValueView::Undefined | ValueView::Null
+            ) {
                 return Err(i.throw("TypeError", "cannot access property of null or undefined"));
             }
-            match &(*sp.sub(1)).unpack() {
-                Value::Num(_) | Value::Str(_) | Value::Sym(_) => {}
+            match &((*sp.sub(1)).unpack()).view() {
+                ValueView::Num(_) | ValueView::Str(_) | ValueView::Sym(_) => {}
                 _ => {
                     let key = pop!();
                     let k = i.to_property_key(&key)?;
@@ -25135,11 +25241,14 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::ToPropKeyLocal(s) => {
-            if matches!(slots.read_value(s as usize), Value::Undefined | Value::Null) {
+            if matches!(
+                (slots.read_value(s as usize)).view(),
+                ValueView::Undefined | ValueView::Null
+            ) {
                 return Err(i.throw("TypeError", "cannot access property of null or undefined"));
             }
-            match &(*sp.sub(1)).unpack() {
-                Value::Num(_) | Value::Str(_) | Value::Sym(_) => {}
+            match &((*sp.sub(1)).unpack()).view() {
+                ValueView::Num(_) | ValueView::Str(_) | ValueView::Sym(_) => {}
                 _ => {
                     let key = pop!();
                     let k = i.to_property_key(&key)?;
@@ -25234,9 +25343,9 @@ unsafe fn jit_exec_inner(
         Op::Neg => {
             let a = pop!();
             let profiling = observe_arithmetic_operand(&chunk.feedback, pc as usize, &a);
-            let v = match a {
-                Value::Num(n) => Value::Num(-n),
-                other => i.eval_unary_vm("-", other)?,
+            let v = match a.view() {
+                ValueView::Num(n) => Value::Num(-n),
+                _ => i.eval_unary_vm("-", a)?,
             };
             observe_arithmetic_result(&chunk.feedback, pc as usize, profiling, &v);
             push!(v);
@@ -25244,9 +25353,9 @@ unsafe fn jit_exec_inner(
         Op::Plus => {
             let a = pop!();
             let profiling = observe_arithmetic_operand(&chunk.feedback, pc as usize, &a);
-            let v = match a {
-                Value::Num(n) => Value::Num(n),
-                other => i.eval_unary_vm("+", other)?,
+            let v = match a.view() {
+                ValueView::Num(n) => Value::Num(n),
+                _ => i.eval_unary_vm("+", a)?,
             };
             observe_arithmetic_result(&chunk.feedback, pc as usize, profiling, &v);
             push!(v);
@@ -25259,9 +25368,9 @@ unsafe fn jit_exec_inner(
         Op::BitNot => {
             let a = pop!();
             let profiling = observe_arithmetic_operand(&chunk.feedback, pc as usize, &a);
-            let v = match a {
-                Value::Num(n) => Value::Num(!crate::eval::to_int32(n) as f64),
-                other => i.eval_unary_vm("~", other)?,
+            let v = match a.view() {
+                ValueView::Num(n) => Value::Num(!crate::eval::to_int32(n) as f64),
+                _ => i.eval_unary_vm("~", a)?,
             };
             observe_arithmetic_result(&chunk.feedback, pc as usize, profiling, &v);
             push!(v);
@@ -25679,7 +25788,7 @@ unsafe fn jit_bin_num(
     *sp = sp.sub(1);
     let a = sp.read().into_value();
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
-    let v = if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
+    let v = if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
         Value::Num(f(*x, *y))
     } else {
         i.binary(op, a, b)?
@@ -25703,9 +25812,9 @@ unsafe fn jit_bin_i32(
     *sp = sp.sub(1);
     let a = sp.read().into_value();
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
-    let primitive_i32 = |v: &Value| match v {
-        Value::Num(n) => Some(crate::eval::to_int32(*n)),
-        Value::Bool(b) => Some(i32::from(*b)),
+    let primitive_i32 = |v: &Value| match (v).view() {
+        ValueView::Num(n) => Some(crate::eval::to_int32(n)),
+        ValueView::Bool(b) => Some(i32::from(b)),
         _ => None,
     };
     let v = if let (Some(x), Some(y)) = (primitive_i32(&a), primitive_i32(&b)) {
@@ -25729,7 +25838,7 @@ unsafe fn jit_bin_cmp(
     let b = sp.read().into_value();
     *sp = sp.sub(1);
     let a = sp.read().into_value();
-    let v = if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
+    let v = if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
         Value::Bool(f(*x, *y))
     } else {
         i.binary(op, a, b)?
@@ -25765,7 +25874,10 @@ pub(crate) unsafe extern "C" fn jit_cond(
             i.to_boolean(&v) as u64
         }
         crate::jit::COND_PEEK_TRUTHY => i.to_boolean(&(*sp.sub(1)).unpack()) as u64,
-        _ => !matches!(&(*sp.sub(1)).unpack(), Value::Undefined | Value::Null) as u64,
+        _ => !matches!(
+            &((*sp.sub(1)).unpack()).view(),
+            ValueView::Undefined | ValueView::Null
+        ) as u64,
     };
     if profiled {
         let taken = (flag != 0) == take_when_true;
@@ -25950,11 +26062,11 @@ unsafe fn jit_complete_target(
         Op::AbruptJump(target, depth) => Some((*target as usize, *depth as usize)),
         Op::ResumeJump => {
             sp = sp.sub(1);
-            let Value::Num(depth) = sp.read().into_value() else {
+            let ValueView::Num(depth) = (sp.read().into_value()).view() else {
                 unreachable!()
             };
             sp = sp.sub(1);
-            let Value::Num(target) = sp.read().into_value() else {
+            let ValueView::Num(target) = (sp.read().into_value()).view() else {
                 unreachable!()
             };
             Some((target as usize, depth as usize))
@@ -26084,6 +26196,7 @@ impl Chunk {
 mod return_slot_tests {
     use super::*;
     use crate::jit::JitCtx;
+    use crate::value::ValueView;
     use std::mem::ManuallyDrop;
 
     // jit_return touches only ret and the supplied operand slot. Every field
@@ -26149,7 +26262,7 @@ mod return_slot_tests {
                 });
                 assert_eq!(unsafe { jit_return(&mut ctx, 1, base.add(1)) }, base);
                 assert_eq!(ctx.ret.bits(), expected);
-                if matches!(value, Value::Empty) {
+                if matches!((value).view(), ValueView::Empty) {
                     assert!(ctx.ret.is_empty());
                     assert!(!ctx.ret.is_undefined());
                 }
@@ -26396,6 +26509,7 @@ mod layout_cell_roots_tests {
     use super::*;
     use crate::gc_core::CollectionKind;
     use crate::value::property_layout_cell_tests::{collect, isolated, Words};
+    use crate::value::ValueView;
     use crate::value::{new_property_layout, Props};
 
     #[test]
@@ -26418,8 +26532,8 @@ mod layout_cell_roots_tests {
         let constant = chunk
             .consts
             .iter()
-            .find_map(|value| match value {
-                Value::Str(text) if &**text == "kept constant" => Some(text.cell_word()),
+            .find_map(|value| match (value).view() {
+                ValueView::Str(text) if &*text == "kept constant" => Some(text.cell_word()),
                 _ => None,
             })
             .unwrap();
@@ -26455,10 +26569,9 @@ mod layout_cell_roots_tests {
                 .core
                 .borrow()
                 .owns_cell(learned_word as usize, heap.property_layout_desc));
-            assert!(chunk
-                .consts
-                .iter()
-                .any(|value| matches!(value, Value::Str(text) if &**text == "kept constant")));
+            assert!(chunk.consts.iter().any(
+                |value| matches!((value).view(), ValueView::Str(text) if &*text == "kept constant")
+            ));
         }
         drop(chunk);
         collect(&heap, &Words(Vec::new()), CollectionKind::Major);
@@ -26520,6 +26633,7 @@ mod private_site_root_tests {
     use crate::gc_core::CollectionKind;
     use crate::gc_trace::{GcSink, GcTrace};
     use crate::value::property_layout_cell_tests::{collect, isolated, Words};
+    use crate::value::ValueView;
 
     #[test]
     fn late_private_keys_are_chunk_roots_and_never_retired_heap_thread_roots() {
@@ -26540,10 +26654,11 @@ mod private_site_root_tests {
         assert_eq!(chunk.private_sites.len(), 1);
         collect(&heap, &Words(Vec::new()), CollectionKind::Major);
         let env = crate::interpreter::new_scope(None);
-        let key = chunk.private_sites[0].key(&env, || match Value::lstr("late private key") {
-            Value::Str(key) => key,
-            _ => unreachable!(),
-        });
+        let key =
+            chunk.private_sites[0].key(&env, || match (Value::lstr("late private key")).view() {
+                ValueView::Str(key) => key,
+                _ => unreachable!(),
+            });
         let word = key.cell_word();
         let weak = crate::gc_handle::WeakRef::to(word as usize);
         drop(key);

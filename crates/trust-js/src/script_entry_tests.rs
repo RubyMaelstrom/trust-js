@@ -1,6 +1,7 @@
 //! ECMA-262 ScriptEvaluation, GlobalDeclarationInstantiation, StatementList/UpdateEmpty and
 //! TryStatement Evaluation. Local official snapshot e28783d5fc9dc12b3de905961e2c71410b38a202.
 
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn value(engine: &mut Engine, source: &str) -> String {
@@ -285,12 +286,12 @@ fn compiled_script_completion_owners_survive_finalizer_gc_and_are_released() {
                 .run_program(&body)
                 .ok()
                 .expect("GC script completes");
-            let Value::Obj(object) = &result else {
+            let ValueView::Obj(object) = &(result).view() else {
                 panic!("completion lost on {tier:?}");
             };
             assert!(matches!(
-                object.borrow().props.get("n").unwrap().value(),
-                Value::Num(42.0)
+                (object.borrow().props.get("n").unwrap().value()).view(),
+                ValueView::Num(42.0)
             ));
             crate::value::Gc::downgrade(object)
         });

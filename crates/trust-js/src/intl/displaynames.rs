@@ -8,6 +8,7 @@ use super::{
 };
 use crate::interpreter::Interp;
 use crate::intl::tags;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 pub(crate) fn install(it: &mut Interp, ns: &Gc) {
@@ -27,7 +28,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let requested = canonicalize_locale_list(i, &arg(a, 0))?;
     // options is required and must be an object.
     let opt_arg = arg(a, 1);
-    if matches!(opt_arg, Value::Undefined) {
+    if matches!((opt_arg).view(), ValueView::Undefined) {
         return Err(i.make_error("TypeError", "options is required for Intl.DisplayNames"));
     }
     let options = coerce_options(i, &opt_arg)?;
@@ -79,13 +80,14 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
 }
 
 fn string_slot(object: &Gc, key: &str, fallback: &str) -> String {
-    match object
+    match (object
         .borrow()
         .internal_slots()
         .get(key)
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Str(value)) => value.to_string(),
+        Some(ValueView::Str(value)) => value.to_string(),
         _ => fallback.to_string(),
     }
 }
@@ -320,7 +322,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     set_data(&res, "type", get("#\u{0}dn_type"));
     set_data(&res, "fallback", get("#\u{0}dn_fallback"));
     let language_display = get("#\u{0}dn_langdisplay");
-    if !matches!(language_display, Value::Undefined) {
+    if !matches!((language_display).view(), ValueView::Undefined) {
         set_data(&res, "languageDisplay", language_display);
     }
     Ok(Value::Obj(res))

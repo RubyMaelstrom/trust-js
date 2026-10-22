@@ -19,7 +19,8 @@ fn compiled_numeric_array_initialization_retains_coherent_mirrors() {
             let global = crate::value::Value::Obj(engine.interp.global.clone());
             let value = engine.interp.get_member_key(&global, "numeric")
                 .unwrap_or_else(|_| panic!("numeric fixture binding"));
-            let object = value.as_obj().expect("numeric array").borrow();
+            let object_handle = value.as_obj().expect("numeric array");
+            let object = object_handle.borrow();
             for index in 0..128 {
                 assert_eq!(object.props.mirror_get(index), Some(index as f64 + 0.25),
                     "{tier:?}: index {index}, {source}");

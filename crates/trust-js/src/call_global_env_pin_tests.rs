@@ -54,8 +54,8 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
         .member_get(&main, "nativeRealmProbe")
         .ok()
         .expect("installed native probe");
-    let native_id = crate::value::Gc::as_ptr(native.as_obj().unwrap()) as usize;
-    let native_pin = crate::value::Gc::downgrade(native.as_obj().unwrap());
+    let native_id = crate::value::Gc::as_ptr(&native.as_obj().unwrap()) as usize;
+    let native_pin = crate::value::Gc::downgrade(&native.as_obj().unwrap());
     let bytes =
         crate::compile_snapshot("globalThis.subject = function(native) { return native(); };")
             .expect("shared caller snapshot");
@@ -87,7 +87,7 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             _ => panic!("shared caller function"),
         };
         (
-            crate::value::Gc::downgrade(subject.as_obj().unwrap()),
+            crate::value::Gc::downgrade(&subject.as_obj().unwrap()),
             function,
         )
     });
@@ -177,7 +177,8 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             .member_get(&i.global_this(), "subject")
             .ok()
             .expect("child caller callable");
-        let body = child_subject.as_obj().unwrap().borrow();
+        let body_handle = child_subject.as_obj().unwrap();
+        let body = body_handle.borrow();
         let Callable::User(user) = &body.call else {
             panic!("child caller");
         };

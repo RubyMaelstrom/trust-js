@@ -16,6 +16,7 @@
 //! written against the internal ones: the engine stores and calls it unchanged
 //! ([`native_fn`]), so generated code and native calls cost what they did.
 
+use crate::value::ValueView;
 use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -32,23 +33,46 @@ use crate::{InterruptReason, ParseError};
 /// `Send` nor `Sync`, so no scoped value leaves its thread.
 type Brand<'s> = PhantomData<*mut &'s ()>;
 
-/// A JavaScript value of the scope `'s`.
-///
-/// The primitive variants are plain data; strings, symbols, BigInts and objects are opaque
-/// handles to cells of the scope's heap ([`JsString`], [`Symbol`], [`BigInt`], [`Object`]),
-/// read and used through the scope's [`Ctx`]. A value is `Copy` and lives as long as its scope:
-/// while a scope runs, the values in its Rust stack frames are roots of every collection. A
-/// value kept in Rust heap memory (a `Vec`) is not, so a list of values held across a call that
-/// can run JavaScript, and so collect, is a [`ValueList`]; a value kept beyond the scope is a
-/// [`Handle`](crate::embed::Handle).
-///
-/// `repr(u64)` with the engine's discriminants: the layout of the engine's own value, which the
-/// engine passes to native functions as it is.
-#[derive(Clone, Copy, Default)]
-#[repr(u64)]
-pub enum Value<'s> {
-    #[default]
-    Undefined = 0,
+// The independent scoped inventory pins Value::kind, including each payload's invariant
+// lifetime brand. It emits distinct enums; no view can be passed as a stored scoped Value.
+macro_rules! define_scoped_values {
+    (for $scope:lifetime; $(#[$value_doc:meta])* $default:ident = $zero:literal;
+        $($(#[$variant_doc:meta])* $variant:ident $(($payload:ty))? = $tag:literal,)*) => {
+        $(#[$value_doc])*
+        #[derive(Clone, Copy, Default)]
+        #[repr(u64)]
+        pub enum Value<$scope> {
+            #[default]
+            $default = $zero,
+            $($(#[$variant_doc])* $variant $(($payload))? = $tag,)*
+        }
+
+        /// An ephemeral match view with the same invariant, thread-bound scope brand as Value.
+        /// Use it to inspect a value; persistent value storage and APIs still take Value.
+        #[derive(Clone, Copy)]
+        #[repr(u64)]
+        pub enum ValueKind<$scope> {
+            $default = $zero,
+            $($(#[$variant_doc])* $variant $(($payload))? = $tag,)*
+        }
+    };
+}
+
+define_scoped_values! {
+    for 's;
+    /// A JavaScript value of the scope `'s`.
+    ///
+    /// The primitive variants are plain data; strings, symbols, BigInts and objects are opaque
+    /// handles to cells of the scope's heap ([`JsString`], [`Symbol`], [`BigInt`], [`Object`]),
+    /// read and used through the scope's [`Ctx`]. A value is `Copy` and lives as long as its scope:
+    /// while a scope runs, the values in its Rust stack frames are roots of every collection. A
+    /// value kept in Rust heap memory (a `Vec`) is not, so a list of values held across a call that
+    /// can run JavaScript, and so collect, is a [`ValueList`]; a value kept beyond the scope is a
+    /// [`Handle`](crate::embed::Handle).
+    ///
+    /// `repr(u64)` with the engine's discriminants: the layout of the engine's own value, which the
+    /// engine passes to native functions as it is.
+    Undefined = 0;
     Null = 2,
     Bool(bool) = 3,
     Num(f64) = 4,
@@ -107,6 +131,8 @@ const _: () = {
     use std::mem::{align_of, size_of};
     assert!(size_of::<Value<'static>>() == size_of::<Internal>());
     assert!(align_of::<Value<'static>>() == align_of::<Internal>());
+    assert!(size_of::<ValueKind<'static>>() == size_of::<Value<'static>>());
+    assert!(align_of::<ValueKind<'static>>() == align_of::<Value<'static>>());
     assert!(size_of::<Object<'static>>() == size_of::<crate::value::Gc>());
     assert!(size_of::<JsString<'static>>() == size_of::<crate::lstr::LStr>());
     assert!(size_of::<Symbol<'static>>() == size_of::<crate::value::SymbolRef>());
@@ -118,15 +144,29 @@ const _: () = {
 };
 
 impl<'s> Value<'s> {
+    /// Inspect this value through its scoped match view.
+    #[inline(always)]
+    pub fn kind(&self) -> ValueKind<'s> {
+        // SAFETY: define_scoped_values emits these distinct repr(u64) enums from the same
+        // explicit discriminants and branded payload types. Size/alignment are pinned above.
+        unsafe { std::mem::transmute::<Value<'s>, ValueKind<'s>>(*self) }
+    }
+
     /// The scoped form of an engine value. EMPTY, a statement-completion marker that never
     /// crosses an engine boundary, reads as undefined.
     #[inline]
     pub(crate) fn from_internal(value: Internal) -> Value<'s> {
-        match value {
-            Internal::Empty => Value::Undefined,
-            // SAFETY: every other internal value is a valid scoped value of the same layout
-            // (`repr(u64)`, the same discriminants, each payload of the same layout).
-            value => unsafe { std::mem::transmute::<Internal, Value<'s>>(value) },
+        {
+            let __value_match_original = value;
+            match (__value_match_original).view() {
+                ValueView::Empty => Value::Undefined,
+                // SAFETY: every other internal value is a valid scoped value of the same layout
+                // (`repr(u64)`, the same discriminants, each payload of the same layout).
+                _ => {
+                    let value = __value_match_original;
+                    unsafe { std::mem::transmute::<Internal, Value<'s>>(value) }
+                }
+            }
         }
     }
 
@@ -140,7 +180,7 @@ impl<'s> Value<'s> {
     /// The engine value this is, borrowed.
     #[inline]
     pub(crate) fn as_internal(&self) -> &Internal {
-        // SAFETY: as for `into_internal`; the internal value's drop glue never runs on a borrow.
+        // SAFETY: as for `into_internal`; the borrow retains the original receiver's lifetime.
         unsafe { &*std::ptr::from_ref(self).cast::<Internal>() }
     }
 
@@ -148,7 +188,9 @@ impl<'s> Value<'s> {
     #[inline]
     pub(crate) fn slice_from_internal<'a>(values: &'a [Internal]) -> &'a [Value<'s>] {
         debug_assert!(
-            !values.iter().any(|value| matches!(value, Internal::Empty)),
+            !values
+                .iter()
+                .any(|value| matches!((value).view(), ValueView::Empty)),
             "an EMPTY completion value crossed into the embed API"
         );
         // SAFETY: as for `from_internal`, without EMPTY.
@@ -164,26 +206,26 @@ impl<'s> Value<'s> {
 
     /// Whether this is undefined.
     pub fn is_undefined(&self) -> bool {
-        matches!(self, Value::Undefined)
+        matches!(&(self).kind(), ValueKind::Undefined)
     }
 
     /// Whether this is undefined or null.
     pub fn is_nullish(&self) -> bool {
-        matches!(self, Value::Undefined | Value::Null)
+        matches!(&(self).kind(), ValueKind::Undefined | ValueKind::Null)
     }
 
     /// The object, if this is one.
     pub fn as_obj(&self) -> Option<Object<'s>> {
-        match self {
-            Value::Obj(object) => Some(*object),
+        match &(self).kind() {
+            ValueKind::Obj(object) => Some(*object),
             _ => None,
         }
     }
 
     /// The number, if this is a Number (an embedder convenience for reading op arguments).
     pub fn as_num_opt(&self) -> Option<f64> {
-        match self {
-            Value::Num(n) => Some(*n),
+        match &(self).kind() {
+            ValueKind::Num(n) => Some(*n),
             _ => None,
         }
     }
@@ -192,26 +234,20 @@ impl<'s> Value<'s> {
     /// surrogate becomes U+FFFD. `None` for any other value; see [`Ctx::coerce_string`] for
     /// ToString.
     pub fn as_text(&self) -> Option<Cow<'_, str>> {
-        match self {
-            Value::Str(string) => Some(string.as_text()),
-            _ => None,
-        }
+        self.as_internal().as_text()
     }
 
     /// A string value's engine text, unchanged (see [`JsString::as_engine_text`]). `None` for
     /// any other value; see [`Ctx::coerce_engine_text`] for ToString.
     pub fn as_engine_text(&self) -> Option<&str> {
-        match self {
-            Value::Str(string) => Some(string.as_engine_text()),
-            _ => None,
-        }
+        self.as_internal().as_engine_text()
     }
 
     /// Read a BigInt as an `i64` (wrapping past ±2^63), for the embedder's 64-bit bridge. `None`
     /// when the value isn't a BigInt.
     pub fn bigint_as_i64(&self) -> Option<i64> {
-        match self {
-            Value::BigInt(bigint) => Some(bigint.to_i64_wrapping()),
+        match &(self).kind() {
+            ValueKind::BigInt(bigint) => Some(bigint.to_i64_wrapping()),
             _ => None,
         }
     }
@@ -231,15 +267,15 @@ impl<'s> Value<'s> {
 
 impl std::fmt::Debug for Value<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Value::Undefined => f.write_str("Undefined"),
-            Value::Null => f.write_str("Null"),
-            Value::Bool(value) => f.debug_tuple("Bool").field(value).finish(),
-            Value::Num(value) => f.debug_tuple("Num").field(value).finish(),
-            Value::BigInt(value) => f.debug_tuple("BigInt").field(value).finish(),
-            Value::Str(value) => f.debug_tuple("Str").field(value).finish(),
-            Value::Sym(value) => f.debug_tuple("Sym").field(value).finish(),
-            Value::Obj(value) => f.debug_tuple("Obj").field(value).finish(),
+        match &(self).kind() {
+            ValueKind::Undefined => f.write_str("Undefined"),
+            ValueKind::Null => f.write_str("Null"),
+            ValueKind::Bool(value) => f.debug_tuple("Bool").field(value).finish(),
+            ValueKind::Num(value) => f.debug_tuple("Num").field(value).finish(),
+            ValueKind::BigInt(value) => f.debug_tuple("BigInt").field(value).finish(),
+            ValueKind::Str(value) => f.debug_tuple("Str").field(value).finish(),
+            ValueKind::Sym(value) => f.debug_tuple("Sym").field(value).finish(),
+            ValueKind::Obj(value) => f.debug_tuple("Obj").field(value).finish(),
         }
     }
 }

@@ -9,6 +9,7 @@ use super::{
     ab, arg, canonicalize_locale_list, get_options_object as coerce_options, make_service,
 };
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 pub(crate) fn install(it: &mut Interp, ns: &Gc) {
@@ -60,7 +61,7 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
     let raw_digits = super::numberformat::read_raw_digits(i, &options)?;
     let rounding_increment = {
         let value = ab(i.get_member_key(&options, "roundingIncrement"))?;
-        if matches!(value, Value::Undefined) {
+        if matches!((value).view(), ValueView::Undefined) {
             1
         } else {
             let number = ab(i.to_number(&value))?;
@@ -191,25 +192,27 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
 }
 
 fn string_slot(object: &Gc, key: &str) -> String {
-    match object
+    match (object
         .borrow()
         .internal_slots()
         .get(key)
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Str(value)) => value.to_string(),
+        Some(ValueView::Str(value)) => value.to_string(),
         _ => String::new(),
     }
 }
 
 fn number_slot(object: &Gc, key: &str) -> Option<u32> {
-    match object
+    match (object
         .borrow()
         .internal_slots()
         .get(key)
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Num(value)) => Some(value as u32),
+        Some(ValueView::Num(value)) => Some(value as u32),
         _ => None,
     }
 }
@@ -291,7 +294,9 @@ fn select(i: &mut Interp, this: &Value, value: &Value) -> Result<Value, Value> {
 
 fn select_range(i: &mut Interp, this: &Value, start: &Value, end: &Value) -> Result<Value, Value> {
     let object = brand_slot(i, this, "#\u{0}pr")?;
-    if matches!(start, Value::Undefined) || matches!(end, Value::Undefined) {
+    if matches!(&(start).view(), ValueView::Undefined)
+        || matches!(&(end).view(), ValueView::Undefined)
+    {
         return Err(i.make_error("TypeError", "selectRange requires two values"));
     }
     let (start_category, start_decimal) = resolve_plural(i, &object, start)?;
@@ -327,13 +332,13 @@ fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
     set_data(&result, "locale", get("#\u{0}pr_locale"));
     set_data(&result, "type", get("#\u{0}pr_type"));
     set_data(&result, "notation", get("#\u{0}pr_notation"));
-    if matches!(get("#\u{0}pr_notation"), Value::Str(value) if &*value == "compact") {
+    if matches!((get("#\u{0}pr_notation")).view(), ValueView::Str(value) if &*value == "compact") {
         set_data(&result, "compactDisplay", get("#\u{0}pr_compactdisplay"));
     }
     set_data(&result, "minimumIntegerDigits", get("#\u{0}pr_minint"));
     set_data(&result, "minimumFractionDigits", get("#\u{0}pr_minfrac"));
     set_data(&result, "maximumFractionDigits", get("#\u{0}pr_maxfrac"));
-    if !matches!(get("#\u{0}pr_minsig"), Value::Undefined) {
+    if !matches!((get("#\u{0}pr_minsig")).view(), ValueView::Undefined) {
         set_data(&result, "minimumSignificantDigits", get("#\u{0}pr_minsig"));
         set_data(&result, "maximumSignificantDigits", get("#\u{0}pr_maxsig"));
     }

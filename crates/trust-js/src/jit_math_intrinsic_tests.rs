@@ -12,10 +12,11 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
     }
 }
 
-fn assert_native_intrinsic(engine: &mut Engine, name: &str, intrinsic: u8) {
+fn assert_native_intrinsic(engine: &mut Engine, name: &str, intrinsic: u8) -> u32 {
     let env = engine.interp.global_env.clone();
     let function = engine.interp.get_var(name, &env).ok().unwrap();
-    let object = function.as_obj().unwrap().borrow();
+    let function_handle = function.as_obj().unwrap();
+    let object = function_handle.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} must be an author function")
     };
@@ -29,21 +30,22 @@ fn assert_native_intrinsic(engine: &mut Engine, name: &str, intrinsic: u8) {
         chunk.jit_runs.get() > 0,
         "{name} must enter the native body"
     );
-    assert!(
-        chunk.jit_ops().iter().any(|op| {
+    chunk
+        .jit_ops()
+        .iter()
+        .find_map(|op| {
             let crate::bytecode::Op::CallWithThis(_, site) = op else {
-                return false;
+                return None;
             };
             let entries =
                 chunk.jit_call_cache_ptr(*site) as *const std::cell::Cell<crate::bytecode::CallIc>;
-            (0..crate::bytecode::CALL_IC_WAYS).any(|way| {
+            (0..crate::bytecode::CALL_IC_WAYS).find_map(|way| {
                 // The chunk retains this site's complete fixed-size cache array.
                 let entry = unsafe { (*entries.add(way)).get() };
-                entry.callee != 0 && entry.intrinsic == intrinsic
+                (entry.callee != 0 && entry.intrinsic == intrinsic).then_some(entry.epoch)
             })
-        }),
-        "{name} must warm the exact builtin intrinsic"
-    );
+        })
+        .unwrap_or_else(|| panic!("{name} must warm the exact builtin intrinsic"))
 }
 
 /// Math methods ignore their receiver (ECMA-262 e28783d5, #sec-math.abs,
@@ -129,8 +131,8 @@ fn math_intrinsics_destroy_the_final_aliased_operand_owner() {
                 let value = engine.interp.get_var("builtin", &env).ok().unwrap();
                 let sentinel = engine.interp.get_var("sentinel", &env).ok().unwrap();
                 (
-                    crate::value::Gc::downgrade(value.as_obj().unwrap()),
-                    crate::value::Gc::downgrade(sentinel.as_obj().unwrap()),
+                    crate::value::Gc::downgrade(&value.as_obj().unwrap()),
+                    crate::value::Gc::downgrade(&sentinel.as_obj().unwrap()),
                 )
             });
             evaluate(&mut engine, "builtin=undefined; sentinel=undefined");
@@ -178,6 +180,27 @@ fn math_intrinsic_instruction_encodings() {
 
 #[test]
 fn exact_math_and_isnan_intrinsics_accept_primitive_receivers_natively() {
+    const CHILD: &str = "TRUST_JS_TEST_PRIMITIVE_MATH_INTRINSICS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Every call checks the process-global IC epoch. Other tests retiring code can
+        // invalidate this warmed site mid-loop without changing its JavaScript results.
+        // Isolate the exact native-hit proof; keep inherited GC-stress settings intact.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "jit::math_intrinsic_tests::exact_math_and_isnan_intrinsics_accept_primitive_receivers_natively",
+                "--exact", "--nocapture", "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     use crate::bytecode::{INTRINSIC_IS_NAN, INTRINSIC_MATH_ABS, INTRINSIC_MATH_SQRT};
     for (builtin, argument, result, intrinsic) in [
         ("Math.abs", "-9", 9, INTRINSIC_MATH_ABS),
@@ -201,16 +224,54 @@ fn exact_math_and_isnan_intrinsics_accept_primitive_receivers_natively() {
                 );
                 if tier == Tier::Jit {
                     assert_native_intrinsic(&mut engine, name, intrinsic);
+                    // Establish that this exact one-iteration input can hit before testing
+                    // the stale entry; otherwise an unrelated fallback could mask the guard.
+                    super::TEST_FAST_MATH_INTRINSICS.with(|count| count.set(0));
+                    assert_eq!(
+                        evaluate(&mut engine, &format!("{name}(1)")),
+                        result.to_string()
+                    );
+                    assert_eq!(
+                        super::TEST_FAST_MATH_INTRINSICS.with(|count| count.get()),
+                        1,
+                        "{builtin} with {name} must be eligible before epoch invalidation"
+                    );
+                    // A stale epoch must take the checked path even for an exact Math
+                    // builtin. Prove the miss keeps the result and does not count as a hit.
+                    crate::bytecode::invalidate_call_caches();
+                    super::TEST_FAST_MATH_INTRINSICS.with(|count| count.set(0));
+                    assert_eq!(
+                        evaluate(&mut engine, &format!("{name}(1)")),
+                        result.to_string()
+                    );
+                    assert_eq!(
+                        super::TEST_FAST_MATH_INTRINSICS.with(|count| count.get()),
+                        0,
+                        "{builtin} with {name} must reject the stale intrinsic entry"
+                    );
+                    assert_eq!(
+                        evaluate(&mut engine, &format!("{name}(16)")),
+                        (result * 16).to_string()
+                    );
                 }
+                let cached_epoch = (tier == Tier::Jit)
+                    .then(|| assert_native_intrinsic(&mut engine, name, intrinsic));
+                let epoch_before =
+                    crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
                 super::TEST_FAST_MATH_INTRINSICS.with(|count| count.set(0));
                 assert_eq!(
                     evaluate(&mut engine, &format!("{name}(32)")),
                     (result * 32).to_string()
                 );
                 if tier == Tier::Jit {
+                    let hits = super::TEST_FAST_MATH_INTRINSICS.with(|count| count.get());
+                    let epoch_after =
+                        crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
                     assert!(
-                        super::TEST_FAST_MATH_INTRINSICS.with(|count| count.get()) >= 32,
-                        "{builtin} with {name} must commit through the native intrinsic"
+                        hits >= 32,
+                        "{builtin} with {name} must commit through the native intrinsic: \
+                         {hits} hits, cached epoch {cached_epoch:?}, process epoch \
+                         {epoch_before}->{epoch_after} (including post-call task collection)"
                     );
                 }
             }

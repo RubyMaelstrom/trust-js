@@ -1,10 +1,11 @@
 //! Callee-local fast paths in Agents containing proxies. ECMA-262 snapshot e28783d5:
 //! Proxy [[Call]] / [[Construct]] (spec.html:16541,16568), Object.hasOwn (31428).
 
+use crate::value::ValueView;
 use std::rc::Rc;
 
 use crate::bytecode::{Chunk, Tier};
-use crate::value::{Callable, Gc, Value};
+use crate::value::{Callable, Gc};
 use crate::{Completion, Engine};
 
 fn eval(engine: &mut Engine, source: &str) -> String {
@@ -16,11 +17,11 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
     let env = engine.interp.global_env.clone();
-    let Value::Obj(object) = engine
+    let ValueView::Obj(object) = (engine
         .interp
         .get_var(name, &env)
-        .unwrap_or_else(|_| panic!("missing {name}"))
-    else {
+        .unwrap_or_else(|_| panic!("missing {name}")))
+    .view() else {
         panic!("{name} is not an object")
     };
     object

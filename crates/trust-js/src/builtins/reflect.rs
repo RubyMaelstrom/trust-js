@@ -1,12 +1,13 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 pub(super) fn install_reflect(it: &mut Interp) {
     let r = it.new_object();
     it.def_method(&r, "get", 2, |i, _t, a| {
         let target = arg(a, 0);
-        if !matches!(target, Value::Obj(_)) {
+        if !matches!((target).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Reflect.get called on non-object"));
         }
         let key = ab(i.to_property_key(&arg(a, 1)))?;
@@ -20,7 +21,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
     });
     it.def_method(&r, "set", 3, |i, _t, a| {
         let target = arg(a, 0);
-        if !matches!(target, Value::Obj(_)) {
+        if !matches!((target).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Reflect.set called on non-object"));
         }
         let key = ab(i.to_property_key(&arg(a, 1)))?;
@@ -28,7 +29,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         // A proxy's [[Set]] returns the ToBoolean of its trap result; surface that as Reflect.set's
         // own boolean rather than always reporting success.
         if let Some((ptarget, handler)) = proxy_pair(i, &target) {
-            if matches!(handler, Value::Null) {
+            if matches!((handler).view(), ValueView::Null) {
                 return Err(i.make_error("TypeError", "proxy is revoked"));
             }
             let trap = ab(i.get_member_key(&handler, "set"))?;
@@ -80,7 +81,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
     });
     it.def_method(&r, "has", 2, |i, _t, a| {
         let target = arg(a, 0);
-        if !matches!(target, Value::Obj(_)) {
+        if !matches!((target).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Reflect.has called on non-object"));
         }
         let key = ab(i.to_property_key(&arg(a, 1)))?;
@@ -90,7 +91,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
     it.def_method(&r, "getOwnPropertyDescriptor", 2, |i, _t, a| {
         // ECMA-262 §28.1.7: TypeError for a non-object target, then ToPropertyKey exactly once,
         // then target.[[GetOwnProperty]](key) and FromPropertyDescriptor.
-        let Value::Obj(o) = arg(a, 0) else {
+        let ValueView::Obj(o) = (arg(a, 0)).view() else {
             return Err(i.make_error(
                 "TypeError",
                 "Reflect.getOwnPropertyDescriptor on non-object",
@@ -104,7 +105,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
     });
     it.def_method(&r, "deleteProperty", 2, |i, _t, a| {
         let key = ab(i.to_property_key(&arg(a, 1)))?;
-        if let Value::Obj(o) = arg(a, 0) {
+        if let ValueView::Obj(o) = (arg(a, 0)).view() {
             ab(i.defer_trigger(&o, Some(&key)))?;
             if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
                 return Ok(Value::Bool(ab(i.proxy_delete(target, handler, &key))?));
@@ -146,40 +147,42 @@ pub(super) fn install_reflect(it: &mut Interp) {
         Err(i.make_error("TypeError", "Reflect.deleteProperty called on non-object"))
     });
     it.def_method(&r, "ownKeys", 1, |i, _t, a| {
-        let o = match arg(a, 0) {
-            Value::Obj(o) => o,
+        let o = match (arg(a, 0)).view() {
+            ValueView::Obj(o) => o,
             _ => return Err(i.make_error("TypeError", "Reflect.ownKeys called on non-object")),
         };
         let keys = object_own_property_keys(i, &o)?;
         Ok(i.make_array(keys.into_vec()))
     });
-    it.def_method(&r, "getPrototypeOf", 1, |i, _t, a| match arg(a, 0) {
-        Value::Obj(o) => {
-            if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
-                return js_get_prototype_of(i, &Value::Obj(o.clone()));
+    it.def_method(&r, "getPrototypeOf", 1, |i, _t, a| {
+        match (arg(a, 0)).view() {
+            ValueView::Obj(o) => {
+                if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
+                    return js_get_prototype_of(i, &Value::Obj(o.clone()));
+                }
+                Ok(o.borrow()
+                    .proto
+                    .clone()
+                    .map(Value::Obj)
+                    .unwrap_or(Value::Null))
             }
-            Ok(o.borrow()
-                .proto
-                .clone()
-                .map(Value::Obj)
-                .unwrap_or(Value::Null))
+            _ => Err(i.make_error("TypeError", "Reflect.getPrototypeOf called on non-object")),
         }
-        _ => Err(i.make_error("TypeError", "Reflect.getPrototypeOf called on non-object")),
     });
     it.def_method(&r, "setPrototypeOf", 2, |i, _t, a| {
         let obj = arg(a, 0);
-        if !matches!(obj, Value::Obj(_)) {
+        if !matches!((obj).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Reflect.setPrototypeOf called on non-object"));
         }
         let proto = arg(a, 1);
-        if !matches!(proto, Value::Obj(_) | Value::Null) {
+        if !matches!((proto).view(), ValueView::Obj(_) | ValueView::Null) {
             return Err(i.make_error("TypeError", "prototype must be an object or null"));
         }
         Ok(Value::Bool(js_set_prototype_of(i, &obj, &proto)?))
     });
     it.def_method(&r, "defineProperty", 3, |i, _t, a| {
-        let o = match arg(a, 0) {
-            Value::Obj(o) => o,
+        let o = match (arg(a, 0)).view() {
+            ValueView::Obj(o) => o,
             _ => return Err(i.make_error("TypeError", "Reflect.defineProperty on non-object")),
         };
         let key = ab(i.to_property_key(&arg(a, 1)))?;
@@ -218,14 +221,14 @@ pub(super) fn install_reflect(it: &mut Interp) {
     });
     it.def_method(&r, "isExtensible", 1, |i, _t, a| {
         let obj = arg(a, 0);
-        if !matches!(obj, Value::Obj(_)) {
+        if !matches!((obj).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Reflect.isExtensible called on non-object"));
         }
         Ok(Value::Bool(js_is_extensible(i, &obj)?))
     });
     it.def_method(&r, "preventExtensions", 1, |i, _t, a| {
         let obj = arg(a, 0);
-        if !matches!(obj, Value::Obj(_)) {
+        if !matches!((obj).view(), ValueView::Obj(_)) {
             return Err(i.make_error(
                 "TypeError",
                 "Reflect.preventExtensions called on non-object",

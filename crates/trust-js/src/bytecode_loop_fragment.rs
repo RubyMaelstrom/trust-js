@@ -225,7 +225,9 @@ pub(crate) fn enter(
     let cap_env = env.clone();
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     debug_assert!(slots.is_empty() && stack.is_empty());
-    slots.resize_with(chunk.n_slots, || PackedValue::pack(Value::Undefined));
+    slots.resize_with(chunk.n_slots, || {
+        std::cell::Cell::new(PackedValue::pack(Value::Undefined))
+    });
     slots.write_value(completion_slot as usize, completion.clone());
     // Proven private homes can live in frame slots while this loop runs. Keep their original
     // records pinned and publish the final values before any parked AST catch/finally resumes.
@@ -753,6 +755,7 @@ impl Compiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
 
     #[test]
     fn fragment_implicit_async_generator_await_is_an_own_suspension() {
@@ -836,7 +839,7 @@ mod tests {
                 &Value::Num(23.0),
                 Seed::None
             ),
-            Ok(Some(Err(Abrupt::Throw(Value::Num(17.0)))))
+            Ok(Some(Err(Abrupt::Throw(value)))) if matches!(value.view(), ValueView::Num(17.0))
         ));
         assert_eq!(TEST_FRAGMENT_ENTRIES.with(|counter| counter.get()), 1);
     }

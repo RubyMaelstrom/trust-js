@@ -3,6 +3,7 @@
 use super::*;
 use crate::bytecode::Tier;
 use crate::feedback::{CurrentPropertyTrace, PropertyOutcome};
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 fn run(engine: &mut Engine, source: &str) -> String {
@@ -183,7 +184,7 @@ fn ordinary_data_read_getter_reentry_mutation_gc_and_throw_all_tiers() {
                 &Value::Obj(receiver.clone()),
                 traced,
             );
-            assert!(matches!(missing, Value::Undefined));
+            assert!(matches!((missing).view(), ValueView::Undefined));
             if traced {
                 assert_eq!(trace.outcome, Some(PropertyOutcome::Accessor));
             }
@@ -275,7 +276,7 @@ fn ordinary_data_read_lazy_prototype_identity_and_returned_ownership() {
                 .unwrap()
                 .value();
             assert!(Gc::ptr_eq(
-                constructor.as_obj().unwrap(),
+                &constructor.as_obj().unwrap(),
                 &weak_function.upgrade().unwrap()
             ));
             weak_function
@@ -307,7 +308,10 @@ fn ordinary_data_read_proxy_dispatch_receivers_and_invariants_all_tiers() {
             for name in ["proxy", "forwarding"] {
                 let start = object(&mut engine, name);
                 let (result, trace) = read(&mut engine.interp, &start, "x", &receiver, traced);
-                assert!(matches!(result, Value::Num(73.0)), "{tier:?}, {name}");
+                assert!(
+                    matches!((result).view(), ValueView::Num(73.0)),
+                    "{tier:?}, {name}"
+                );
                 if traced {
                     assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
                 }
@@ -329,7 +333,7 @@ fn ordinary_data_read_proxy_dispatch_receivers_and_invariants_all_tiers() {
                     .get_member_key(&error, "name")
                     .ok()
                     .expect("error name");
-                assert!(matches!(name, Value::Str(s) if s.as_str()=="TypeError"));
+                assert!(matches!((name).view(), ValueView::Str(s) if s.as_str()=="TypeError"));
                 if traced {
                     assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
                 }
@@ -351,10 +355,12 @@ fn ordinary_data_read_host_indexed_dispatch_precedes_ordinary_lookup() {
             .make_native("indexedRead", 1, |interp, this, args| {
                 assert!(this.as_obj().is_some());
                 interp.gc_collect();
-                Ok(Value::Num(match args.first() {
-                    Some(Value::Num(n)) => n + 21.0,
-                    _ => panic!("index"),
-                }))
+                Ok(Value::Num(
+                    match (args.first()).map(|__value| (__value).view()) {
+                        Some(ValueView::Num(n)) => n + 21.0,
+                        _ => panic!("index"),
+                    },
+                ))
             }),
     );
     engine
@@ -368,12 +374,12 @@ fn ordinary_data_read_host_indexed_dispatch_precedes_ordinary_lookup() {
         .insert("named", Property::plain(Value::Num(39.0)));
     for traced in [false, true] {
         let (result, trace) = read(&mut engine.interp, &start, "1", &target, traced);
-        assert!(matches!(result, Value::Num(22.0)));
+        assert!(matches!((result).view(), ValueView::Num(22.0)));
         if traced {
             assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
         }
         let (result, trace) = read(&mut engine.interp, &start, "named", &target, traced);
-        assert!(matches!(result, Value::Num(39.0)));
+        assert!(matches!((result).view(), ValueView::Num(39.0)));
         if traced {
             assert_eq!(trace.outcome, Some(PropertyOutcome::Data));
         }

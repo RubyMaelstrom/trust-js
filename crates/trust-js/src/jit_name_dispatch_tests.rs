@@ -540,9 +540,15 @@ fn name_dispatch_native_deep_hits_ignore_shallow_generation_and_follow_live_pare
             &[],
         )
     };
-    assert!(matches!(run(&mut engine), Ok(Value::Num(17.0))));
+    assert!(matches!(
+        (run(&mut engine)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(17.0))
+    ));
     let before = names::TEST_NATIVE_DEEP_NAMES.with(Cell::get);
-    assert!(matches!(run(&mut engine), Ok(Value::Num(17.0))));
+    assert!(matches!(
+        (run(&mut engine)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(17.0))
+    ));
     assert_eq!(names::TEST_NATIVE_DEEP_NAMES.with(Cell::get), before + 1);
     let replacement = binding_scope(None);
     replacement
@@ -553,7 +559,10 @@ fn name_dispatch_native_deep_hits_ignore_shallow_generation_and_follow_live_pare
         .value = Value::Num(29.0);
     middle.borrow_mut().parent = Some(replacement);
     assert!(
-        matches!(run(&mut engine), Ok(Value::Num(29.0))),
+        matches!(
+            (run(&mut engine)).map(|__value| (__value).view()),
+            Ok(crate::value::ValueView::Num(29.0))
+        ),
         "cache miss must follow current links"
     );
 }

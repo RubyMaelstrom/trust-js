@@ -355,7 +355,8 @@ out.join('|');
 fn settle(engine: &mut Engine, name: &str) {
     let env = engine.interp.global_env.clone();
     let function = engine.interp.get_var(name, &env).ok().expect("function");
-    let object = function.as_obj().expect("object").borrow();
+    let function_handle = function.as_obj().expect("object");
+    let object = function_handle.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };

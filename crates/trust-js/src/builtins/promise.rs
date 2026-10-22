@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 pub(super) fn install_promise(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
@@ -48,7 +49,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         ab(i.call(then, this.clone(), &[Value::Undefined, arg(a, 0)]))
     });
     it.def_method(&proto, "finally", 1, |i, this, a| {
-        if !matches!(this, Value::Obj(_)) {
+        if !matches!((this).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.prototype.finally on non-object"));
         }
         let default_ctor = intrinsic_promise(i);
@@ -78,9 +79,10 @@ pub(super) fn install_promise(it: &mut Interp) {
         }
         let promise = i.new_promise();
         // OrdinaryCreateFromConstructor: newTarget's prototype (its getter may throw).
-        if let (Value::Obj(p), nt @ Value::Obj(_)) = (&promise, &i.new_target.clone()) {
-            match ab(i.get_member_key(nt, "prototype"))? {
-                Value::Obj(proto) => p.borrow_mut().proto = Some(proto),
+        let nt = i.new_target;
+        if let (ValueView::Obj(p), ValueView::Obj(_)) = (promise.view(), nt.view()) {
+            match (ab(i.get_member_key(&nt, "prototype"))?).view() {
+                ValueView::Obj(proto) => p.borrow_mut().proto = Some(proto),
                 _ => {
                     if let Some(proto) = ctor_realm_proto(i, &nt.clone(), "Promise")? {
                         p.borrow_mut().proto = Some(proto);
@@ -104,7 +106,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         .props
         .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
     it.def_method(&ctor, "withResolvers", 0, |i, t, _a| {
-        if !matches!(t, Value::Obj(_)) {
+        if !matches!((t).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.withResolvers called on a non-object"));
         }
         let promise = new_promise_capability(i, &t)?;
@@ -117,13 +119,13 @@ pub(super) fn install_promise(it: &mut Interp) {
     });
     it.def_method(&ctor, "resolve", 1, |i, t, a| {
         // `this` must be a constructor object; PromiseResolve(this, v).
-        if !matches!(t, Value::Obj(_)) {
+        if !matches!((t).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.resolve called on a non-object"));
         }
         promise_resolve(i, &t, arg(a, 0))
     });
     it.def_method(&ctor, "reject", 1, |i, t, a| {
-        if !matches!(t, Value::Obj(_)) {
+        if !matches!((t).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.reject called on a non-object"));
         }
         // NewPromiseCapability(C): rejection goes through the capability's own reject.
@@ -520,7 +522,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         promise_keyed_combinator(i, t, arg(a, 0), true)
     });
     it.def_method(&ctor, "try", 1, |i, t, a| {
-        if !matches!(t, Value::Obj(_)) {
+        if !matches!((t).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.try called on a non-object"));
         }
         let func = arg(a, 0);
@@ -540,8 +542,10 @@ pub(super) fn install_promise(it: &mut Interp) {
     install_species(it, &ctor);
     // The identity of the intrinsic @@species getter, for `promise_species_is_intrinsic`.
     let species_getter = well_known_key(it, "species").and_then(|key| {
-        match ctor.borrow().props.get(&key).and_then(|p| p.getter()) {
-            Some(Value::Obj(getter)) => Some(getter.clone()),
+        match (ctor.borrow().props.get(&key).and_then(|p| p.getter()))
+            .map(|__value| (__value).view())
+        {
+            Some(ValueView::Obj(getter)) => Some(getter.clone()),
             _ => None,
         }
     });
@@ -570,8 +574,8 @@ fn intrinsic_promise(i: &Interp) -> Value {
 /// %Promise%'s "prototype" is non-writable and non-configurable, so its promise inherits from
 /// %Promise.prototype% exactly like one from `Interp::new_promise`.
 fn promise_species_is_intrinsic(i: &Interp, promise: &Value) -> bool {
-    let (Value::Obj(promise), Some(prototype), Some(ctor), Some(species_getter)) = (
-        promise,
+    let (ValueView::Obj(promise), Some(prototype), Some(ctor), Some(species_getter)) = (
+        &(promise).view(),
         i.extra_protos.get("Promise"),
         i.extra_protos.get("%PromiseCtor%"),
         i.extra_protos.get("%PromiseSpeciesGetter%"),
@@ -594,21 +598,21 @@ fn promise_species_is_intrinsic(i: &Interp, promise: &Value) -> bool {
         .props
         .get("constructor")
         .is_some_and(|p| {
-            !p.accessor() && matches!(p.value(), Value::Obj(c) if Gc::ptr_eq(&c, ctor))
+            !p.accessor() && matches!((p.value()).view(), ValueView::Obj(c) if Gc::ptr_eq(&c, ctor))
         });
     let Some(species) = well_known_key(i, "species") else {
         return false;
     };
     inherits_ctor && ctor.borrow().props.get(&species).is_some_and(|p| {
         p.accessor()
-            && matches!(p.getter(), Some(Value::Obj(getter)) if Gc::ptr_eq(getter, species_getter))
+            && matches!((p.getter()).map(|__value| (__value).view()), Some(ValueView::Obj(getter)) if Gc::ptr_eq(&getter, species_getter))
     })
 }
 
 /// ECMA-262 PromiseResolve: return a matching native promise unchanged, otherwise settle a new
 /// capability supplied by `ctor` through that capability's resolve function.
 fn promise_resolve(i: &mut Interp, ctor: &Value, resolution: Value) -> Result<Value, Value> {
-    if let Value::Obj(o) = &resolution {
+    if let ValueView::Obj(o) = &(resolution).view() {
         if i.promises.contains_key(&(Gc::as_ptr(o) as usize)) {
             let resolution_ctor = ab(i.get_member_key(&resolution, "constructor"))?;
             if same_value(&resolution_ctor, ctor) {

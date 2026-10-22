@@ -10,7 +10,8 @@ use std::rc::Rc;
 fn subject(i: &mut crate::interpreter::Interp) -> crate::value::UserFn {
     let env = i.global_env.clone();
     let value = i.get_var("subject", &env).ok().unwrap();
-    let object = value.as_obj().unwrap().borrow();
+    let object_handle = value.as_obj().unwrap();
+    let object = object_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("snapshot subject")
     };

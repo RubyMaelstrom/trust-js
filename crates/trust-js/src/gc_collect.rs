@@ -37,6 +37,8 @@ use crate::gc_native::NativeGcGraph;
 use crate::gc_trace::{GcSink, GcTrace};
 use crate::host::{HostGcVisitor, NativeGcId};
 use crate::value::GcState;
+#[cfg(feature = "embed")]
+use crate::value::ValueView;
 
 /// The byte budget's floor. A major collection is due once the heap holds more than the budget
 /// after a minor collection: its old cells, live or not, since minor collections free only young
@@ -476,8 +478,8 @@ impl HostGcVisitor for HostGraph {
 
     #[cfg(feature = "embed")]
     fn edge(&mut self, owner: &crate::handles::WeakHandle, value: &crate::handles::WeakHandle) {
-        if let (Some(Value::Obj(owner)), Some(value)) = (
-            owner.reported(self.heap_id),
+        if let (Some(ValueView::Obj(owner)), Some(value)) = (
+            (owner.reported(self.heap_id)).map(|__value| (__value).view()),
             value.reported(self.heap_id).as_ref().and_then(value_word),
         ) {
             self.edges.push((Gc::as_ptr(&owner) as usize, value));

@@ -1,6 +1,7 @@
 use super::*;
 use crate::interpreter::Interp;
 use crate::value::Value;
+use crate::value::ValueView;
 
 // ECMA-262 Object Type / ToPropertyKey (local snapshot e28783d5fc9d): all Strings,
 // including leading NULs, are keys distinct from every Symbol. These regressions
@@ -151,7 +152,7 @@ fn encoded_string_keys_never_claim_symbol_ownership() {
         let key = crate::value::PropertyKey::string(text.to_string());
         assert!(!Interp::is_sym_key(&key));
         assert_eq!(crate::value::decode_string_key(&key), text);
-        assert!(matches!(key.into_value(), Value::Str(value) if &*value == text));
+        assert!(matches!((key.into_value()).view(), ValueView::Str(value) if &*value == text));
     }
 }
 
@@ -167,8 +168,8 @@ fn host_property_boundaries_encode_author_nul_names() {
         .member_set(&global, "\0host", Value::Num(9.0))
         .is_ok());
     assert!(matches!(
-        engine.interp.member_get(&global, "\0host"),
-        Ok(Value::Num(9.0))
+        (engine.interp.member_get(&global, "\0host")).map(|__value| (__value).view()),
+        Ok(ValueView::Num(9.0))
     ));
     let getter = engine.interp.make_native("host_getter", 0, host_getter);
     engine
@@ -249,7 +250,7 @@ fn public_host_string_apis_cannot_forge_symbol_property_keys() {
             .member_get(&global, "hostSymbol")
             .ok()
             .expect("host symbol");
-        let Value::Sym(symbol) = symbol else {
+        let ValueView::Sym(symbol) = (symbol).view() else {
             panic!("expected a Symbol");
         };
         let object = engine
@@ -264,12 +265,12 @@ fn public_host_string_apis_cannot_forge_symbol_property_keys() {
             .expect("host proxy");
         let forged = format!("\0{}", symbol.id);
         assert!(matches!(
-            engine.interp.get_member(&object, &forged),
-            Ok(Value::Undefined)
+            (engine.interp.get_member(&object, &forged)).map(|__value| (__value).view()),
+            Ok(ValueView::Undefined)
         ));
         assert!(matches!(
-            engine.interp.get_member(&proxy, &forged),
-            Ok(Value::Undefined)
+            (engine.interp.get_member(&proxy, &forged)).map(|__value| (__value).view()),
+            Ok(ValueView::Undefined)
         ));
         assert!(engine
             .interp
@@ -280,8 +281,8 @@ fn public_host_string_apis_cannot_forge_symbol_property_keys() {
             .set_member(&proxy, &forged, Value::Num(100.0))
             .is_ok());
         assert!(matches!(
-            engine.interp.member_get(&object, &forged),
-            Ok(Value::Num(100.0))
+            (engine.interp.member_get(&object, &forged)).map(|__value| (__value).view()),
+            Ok(ValueView::Num(100.0))
         ));
         assert!(engine
             .interp
@@ -306,8 +307,8 @@ fn public_host_string_apis_cannot_forge_symbol_property_keys() {
             .set_member(&object, "\0\0host", Value::Num(8.0))
             .is_ok());
         assert!(matches!(
-            engine.interp.get_member(&object, "\0\0host"),
-            Ok(Value::Num(8.0))
+            (engine.interp.get_member(&object, "\0\0host")).map(|__value| (__value).view()),
+            Ok(ValueView::Num(8.0))
         ));
     }
 }

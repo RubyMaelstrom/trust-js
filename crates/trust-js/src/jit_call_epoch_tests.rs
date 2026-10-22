@@ -2,6 +2,7 @@
 //! changing a predicate must preserve the live callee/Realm and safe fallback.
 use super::*;
 use crate::bytecode::{CallIc, CallOverflow, Tier, CALL_IC_EPOCH, CALL_IC_WAYS};
+use crate::value::ValueView;
 use crate::value::{Callable, Object};
 use std::cell::Cell;
 use std::mem::{offset_of, size_of};
@@ -97,7 +98,8 @@ fn caller_chunk(engine: &mut crate::Engine) -> Rc<Chunk> {
         .get_var("epochCaller", &env)
         .ok()
         .expect("caller");
-    let object = value.as_obj().expect("function").borrow();
+    let function_handle = value.as_obj().expect("function");
+    let object = function_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("user function")
     };
@@ -284,7 +286,7 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     // Owners carry no count: the probe leaves the callee's operand word and cell
     // intact, which a collection (and, in debug builds, its heap verifier) confirms.
     assert!(
-        matches!(&operand[0].unpack(), Value::Obj(o) if crate::value::Gc::ptr_eq(o, &object)),
+        matches!(&(operand[0].unpack()).view(), ValueView::Obj(o) if crate::value::Gc::ptr_eq(o, &object)),
         "the probe must not consume the callee operand"
     );
     engine.interp.gc_collect();

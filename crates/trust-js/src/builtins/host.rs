@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// The test262 `$262` host object (test262 INTERPRETING.md): `global`, `gc`, `createRealm`,
 /// `evalScript`, `detachArrayBuffer`, `IsHTMLDDA`, `agent` and `AbstractModuleSource`.
@@ -34,12 +35,18 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         set_internal(&host, "#\u{0}realm_global", rg);
     }
     it.def_method(&host, "evalScript", 1, |i, this, args| {
-        let code = match arg(args, 0) {
-            Value::Str(s) => s,
-            other => return Ok(other),
+        let code = {
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Str(s) => s,
+                _ => {
+                    let other = __value_match_original;
+                    return Ok(other);
+                }
+            }
         };
         let rg = ab(i.get_internal_slot(&this, "#\u{0}realm_global"))?;
-        if let Value::Obj(_) = &rg {
+        if let ValueView::Obj(_) = &(rg).view() {
             return match i.eval_script_in_realm(&rg, &code) {
                 Ok(value) => Ok(value),
                 Err(Abrupt::Throw(value)) => Err(value),
@@ -68,7 +75,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         }
     });
     it.def_method(&host, "detachArrayBuffer", 1, |i, _t, args| {
-        if let Value::Obj(o) = arg(args, 0) {
+        if let ValueView::Obj(o) = (arg(args, 0)).view() {
             let p = Gc::as_ptr(&o) as usize;
             // DetachArrayBuffer asserts IsSharedArrayBuffer is false: a Shared Data Block cannot be
             // detached, so refuse instead of leaving the buffer half detached.
@@ -183,7 +190,7 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
         // Accept a SharedArrayBuffer directly, or a TypedArray view over one.
         let p = match sab.as_obj() {
             Some(o) => {
-                let p = Gc::as_ptr(o) as usize;
+                let p = Gc::as_ptr(&o) as usize;
                 if i.is_shared_buffer(p) {
                     p
                 } else if let Some(info) = i.typed_arrays.get(&p) {

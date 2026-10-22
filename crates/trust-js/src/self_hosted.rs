@@ -31,6 +31,7 @@
 
 use crate::ast::{Expr, Stmt};
 use crate::interpreter::{abrupt_value, Abrupt, Binding, Env, Interp};
+use crate::value::ValueView;
 use crate::value::{Exotic, Gc, PackedValue, Property, Value};
 use std::rc::Rc;
 
@@ -111,8 +112,8 @@ pub(crate) fn install_array_methods(it: &mut Interp, array_proto: &Gc) {
         .get_or_init(|| Rc::new(SelfHostedSource::load()))
         .clone();
     let env = intrinsic_environment(it);
-    let methods = match it.eval(&source.array_methods, &env) {
-        Ok(Value::Obj(methods)) => methods,
+    let methods = match (it.eval(&source.array_methods, &env)).map(|__value| (__value).view()) {
+        Ok(ValueView::Obj(methods)) => methods,
         Ok(_) => unreachable!("the self-hosted source evaluates to an object literal"),
         Err(_) => panic!("evaluating the self-hosted Array methods cannot throw"),
     };
@@ -124,7 +125,7 @@ pub(crate) fn install_array_methods(it: &mut Interp, array_proto: &Gc) {
             .get(name)
             .map(|property| property.value())
             .unwrap_or_else(|| panic!("the self-hosted source defines Array.prototype.{name}"));
-        if let Value::Obj(function) = &method {
+        if let ValueView::Obj(function) = &(method).view() {
             // The function's own `length` keeps its attributes and position; only the value
             // differs from the formal parameter count.
             function.borrow_mut().props.insert(
@@ -178,9 +179,9 @@ fn intrinsic_environment(it: &Interp) -> Env {
 
 /// ToObject(`value`) (ECMA-262 §7.1.18) for the receiver of the built-in `method`.
 pub(crate) fn to_object(i: &mut Interp, value: Value, method: &str) -> Result<Value, Abrupt> {
-    match value {
-        object @ Value::Obj(_) => Ok(object),
-        primitive => crate::builtins::to_object_for_method(i, primitive, method)
+    match value.view() {
+        ValueView::Obj(_) => Ok(value),
+        _ => crate::builtins::to_object_for_method(i, value, method)
             .map(Value::Obj)
             .map_err(Abrupt::Throw),
     }
@@ -190,13 +191,15 @@ pub(crate) fn to_object(i: &mut Interp, value: Value, method: &str) -> Result<Va
 /// ordinary Array's own `length` is always a data property holding an integral Number no
 /// greater than 2^32 − 1, so its value is the answer without the generic Get.
 pub(crate) fn length_of_array_like(i: &mut Interp, object: &Value) -> Result<f64, Abrupt> {
-    let Value::Obj(target) = object else {
+    let ValueView::Obj(target) = &(object).view() else {
         unreachable!("LengthOfArrayLike is applied to ToObject's result");
     };
     {
         let body = target.borrow();
         if body.ic_plain.get() && matches!(body.exotic, Exotic::Array) {
-            if let Some(Value::Num(length)) = body.props.length_property().map(|p| p.value()) {
+            if let Some(ValueView::Num(length)) =
+                (body.props.length_property().map(|p| p.value())).map(|__value| (__value).view())
+            {
                 return Ok(length);
             }
         }
@@ -218,7 +221,7 @@ pub(crate) fn array_species_create(
     original: &Value,
     length: &Value,
 ) -> Result<Value, Abrupt> {
-    let Value::Num(length) = *length else {
+    let ValueView::Num(length) = (*length).view() else {
         unreachable!("ArraySpeciesCreate receives a non-negative integer length");
     };
     crate::builtins::array_species_create_length(i, original, length).map_err(Abrupt::Throw)
@@ -244,8 +247,8 @@ fn argument(args: &[Value], index: usize) -> Value {
 }
 
 fn message(args: &[Value], index: usize) -> String {
-    match argument(args, index) {
-        Value::Str(text) => text.to_string(),
+    match (argument(args, index)).view() {
+        ValueView::Str(text) => text.to_string(),
         _ => unreachable!("self-hosted intrinsic messages are string literals"),
     }
 }

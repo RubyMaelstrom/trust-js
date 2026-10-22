@@ -61,7 +61,8 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
         eval(&mut engine, SOURCE);
         let env = engine.interp.global_env.clone();
         let value = engine.interp.get_var("subject", &env).ok().unwrap();
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let Callable::User(user) = &object.call else {
             panic!("prepared subject")
         };
@@ -189,7 +190,8 @@ fn prepared_native_hot_calls_publish_and_execute_baseline_inline_bodies() {
     );
     let env = engine.interp.global_env.clone();
     let value = engine.interp.get_var("subject", &env).ok().unwrap();
-    let object = value.as_obj().unwrap().borrow();
+    let object_handle = value.as_obj().unwrap();
+    let object = object_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("prepared subject")
     };

@@ -65,8 +65,8 @@ pub use trust_js::embed::{
     HostGcVisitor, HostRetainedMemoryVisitor, HostTrace, JsString, NativeCallableRetained,
     NativeCaptureFn, NativeCaptures, NativeFn, NativeGcId, NativeRetainedMemoryVisitor, Object,
     OpState, ResourceId, ResourceTable, RetainedBytes, RetainedExternalAllocation,
-    RetainedExternalMemory, RetainedManagedAllocation, RetainedMemory, Symbol, Value, ValueList,
-    WeakHandle,
+    RetainedExternalMemory, RetainedManagedAllocation, RetainedMemory, Symbol, Value, ValueKind,
+    ValueList, WeakHandle,
 };
 pub use trust_js::Tier;
 pub use trust_js::{

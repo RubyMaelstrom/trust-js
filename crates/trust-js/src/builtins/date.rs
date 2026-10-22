@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 fn now_ms(i: &Interp) -> f64 {
     i.wall_now_ms().trunc()
@@ -501,14 +502,16 @@ fn parts_to_ms(y: i64, mo0: i64, d: i64, h: i64, mi: i64, s: i64, ml: i64) -> f6
 
 fn date_ms(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     // thisTimeValue: the receiver must be a Date (carry the internal time slot), else TypeError.
-    match this {
-        Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}date_ms") => {}
+    match &(this).view() {
+        ValueView::Obj(o) if o.borrow().internal_slots().contains("#\u{0}date_ms") => {}
         _ => return Err(i.make_error("TypeError", "this is not a Date object")),
     }
-    Ok(match ab(i.get_internal_slot(this, "#\u{0}date_ms"))? {
-        Value::Num(n) => n,
-        _ => f64::NAN,
-    })
+    Ok(
+        match (ab(i.get_internal_slot(this, "#\u{0}date_ms"))?).view() {
+            ValueView::Num(n) => n,
+            _ => f64::NAN,
+        },
+    )
 }
 
 fn date_get(i: &mut Interp, this: &Value, sel: u8, local: bool) -> Result<Value, Value> {
@@ -596,7 +599,7 @@ fn date_set_multi(
         let date = make_date(day, time);
         time_clip(if local { utc_time(date) } else { date })
     };
-    if let Value::Obj(o) = this {
+    if let ValueView::Obj(o) = &(this).view() {
         set_internal(o, "#\u{0}date_ms", Value::Num(ms));
     }
     Ok(Value::Num(ms))
@@ -907,34 +910,41 @@ pub(super) fn date_to_string(t: f64) -> String {
 fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> {
     // Called as a function (no `new`), Date ignores its arguments and returns the
     // current time as a string.
-    if !matches!(i.new_target, Value::Obj(_)) {
+    if !matches!((i.new_target).view(), ValueView::Obj(_)) {
         return Ok(Value::lstr(date_to_string(now_ms(i))));
     }
     let ms = match args.len() {
         0 => now_ms(i),
-        1 => match &args[0] {
-            // A Date argument clones its time value directly (no valueOf call).
-            Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}date_ms") => {
-                match o
-                    .borrow()
-                    .internal_slots()
-                    .get("#\u{0}date_ms")
-                    .map(|p| p.value())
-                {
-                    Some(Value::Num(n)) => n,
-                    _ => f64::NAN,
+        1 => {
+            let __value_match_original = &args[0];
+            match &(__value_match_original).view() {
+                // A Date argument clones its time value directly (no valueOf call).
+                ValueView::Obj(o) if o.borrow().internal_slots().contains("#\u{0}date_ms") => {
+                    match (o
+                        .borrow()
+                        .internal_slots()
+                        .get("#\u{0}date_ms")
+                        .map(|p| p.value()))
+                    .map(|__value| (__value).view())
+                    {
+                        Some(ValueView::Num(n)) => n,
+                        _ => f64::NAN,
+                    }
+                }
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let prim = ab(i.to_primitive(v, crate::eval::Hint::Default))?;
+                        match prim.view() {
+                            // #sec-date-constructor step 4.b.ii: parse exactly as
+                            // Date.parse does, then TimeClip.
+                            ValueView::Str(s) => time_clip(parse_date_string(&s)),
+                            _ => time_clip(ab(i.to_number(&prim))?),
+                        }
+                    }
                 }
             }
-            v => {
-                let prim = ab(i.to_primitive(v, crate::eval::Hint::Default))?;
-                match prim {
-                    // #sec-date-constructor step 4.b.ii: parse exactly as
-                    // Date.parse does, then TimeClip.
-                    Value::Str(s) => time_clip(parse_date_string(&s)),
-                    p => time_clip(ab(i.to_number(&p))?),
-                }
-            }
-        },
+        }
         _ => {
             // All components coerce as f64 (NaN propagates through MakeDay/MakeTime).
             let mut y = ab(i.to_number(&args[0]))?;
@@ -997,7 +1007,7 @@ pub(super) fn install_date(it: &mut Interp) {
     it.def_method(&proto, "setTime", 1, |i, this, a| {
         date_ms(i, &this)?; // thisTimeValue brand check
         let v = time_clip(ab(i.to_number(&arg(a, 0)))?);
-        if let Value::Obj(o) = &this {
+        if let ValueView::Obj(o) = &(this).view() {
             set_internal(o, "#\u{0}date_ms", Value::Num(v));
         }
         Ok(Value::Num(v))
@@ -1124,7 +1134,7 @@ pub(super) fn install_date(it: &mut Interp) {
         let o = to_object_arg(i, this.clone(), "Date.prototype.toJSON")?;
         let ov = Value::Obj(o);
         let tv = ab(i.to_primitive(&ov, crate::eval::Hint::Number))?;
-        if let Value::Num(n) = &tv {
+        if let ValueView::Num(n) = &(tv).view() {
             if !n.is_finite() {
                 return Ok(Value::Null);
             }
@@ -1251,7 +1261,7 @@ pub(super) fn install_date(it: &mut Interp) {
     });
     // Date.prototype[@@toPrimitive]: "number" hint uses valueOf, "string"/"default" use toString.
     let prim = it.make_native("[Symbol.toPrimitive]", 1, |i, this, a| {
-        if !matches!(this, Value::Obj(_)) {
+        if !matches!((this).view(), ValueView::Obj(_)) {
             return Err(i.make_error(
                 "TypeError",
                 "Date.prototype[Symbol.toPrimitive] on non-object",
@@ -1259,8 +1269,8 @@ pub(super) fn install_date(it: &mut Interp) {
         }
         // The hint must be a primitive String; OrdinaryToPrimitive then tries the two methods in
         // order, returning the first non-object result.
-        let hint = match arg(a, 0) {
-            Value::Str(s) => s.to_string(),
+        let hint = match (arg(a, 0)).view() {
+            ValueView::Str(s) => s.to_string(),
             _ => return Err(i.make_error("TypeError", "invalid Symbol.toPrimitive hint")),
         };
         let methods: &[&str] = match hint.as_str() {
@@ -1272,7 +1282,7 @@ pub(super) fn install_date(it: &mut Interp) {
             let f = ab(i.get_member_key(&this, m))?;
             if f.is_callable() {
                 let r = ab(i.call(f, this.clone(), &[]))?;
-                if !matches!(r, Value::Obj(_)) {
+                if !matches!((r).view(), ValueView::Obj(_)) {
                     return Ok(r);
                 }
             }

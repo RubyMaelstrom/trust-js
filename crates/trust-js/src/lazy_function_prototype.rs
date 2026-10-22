@@ -16,7 +16,7 @@ enum State {
 pub(super) struct LazyFunctionPrototype {
     /// The function whose `prototype` this is, for the materialized prototype's `constructor`.
     /// A lazy word lives only in that function's properties (copying one out of its property
-    /// materializes it: `PackedValue::clone_materialized`), so the function is alive whenever
+    /// materializes it: `PropWord::clone_materialized`), so the function is alive whenever
     /// the prototype materializes. A traced edge of this cell ([`trace_cell`]): the function
     /// and its cell form a cycle that dies in one collection, and a stale stack word that
     /// conservatively keeps the cell keeps the function too. A weak handle would allocate a
@@ -87,19 +87,12 @@ impl LazyFunctionPrototype {
     }
 
     /// Record a write of the function's `prototype` word in the function's card (the write
-    /// barrier): `PackedValue::unpack` promotes the word to the materialized prototype's, under
+    /// barrier): a property read promotes the word to the materialized prototype's, under
     /// a shared borrow of the function.
     pub(super) fn mark_owner_card(&self) {
         // SAFETY: the function is alive while its deferred prototype is read (see `owner`), and
         // an object's cell is a small cell of the carded object kind.
         unsafe { crate::gc_core::card_mark(Gc::as_ptr(&self.owner).cast()) };
-    }
-
-    pub(super) fn with_gc_edge(&self, f: impl FnOnce(&Gc)) {
-        match &*self.state.borrow() {
-            State::Parent(parent) => f(parent),
-            State::Materialized(prototype) => f(prototype),
-        }
     }
 
     pub(super) fn visit_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
@@ -153,6 +146,7 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::bytecode::Tier;
+    use crate::value::ValueView;
     use crate::value::{Value, PACK_LAZY_PROTO, PACK_OBJ};
     use crate::{Completion, Engine};
 
@@ -168,11 +162,11 @@ mod tests {
 
     fn object(engine: &mut Engine, name: &str) -> Gc {
         let env = engine.interp.global_env.clone();
-        let Value::Obj(object) = engine
+        let ValueView::Obj(object) = (engine
             .interp
             .get_var(name, &env)
-            .unwrap_or_else(|_| panic!("{name}"))
-        else {
+            .unwrap_or_else(|_| panic!("{name}")))
+        .view() else {
             panic!("object")
         };
         object
@@ -452,7 +446,7 @@ mod tests {
                 let materialized = edges(cell);
                 let owner = Gc::as_ptr(&function) as usize;
                 let parent = Gc::as_ptr(&engine.interp.object_proto) as usize;
-                let prototype = Gc::as_ptr(prototype.as_obj().expect("an object")) as usize;
+                let prototype = Gc::as_ptr(&prototype.as_obj().expect("an object")) as usize;
                 (
                     deferred,
                     materialized,
@@ -572,7 +566,7 @@ mod tests {
     }
 
     /// Every read that copies or moves a deferred prototype's word out of its property
-    /// materializes it: `PackedValue::clone_materialized`, a descriptor snapshot
+    /// materializes it: `PropWord::clone_materialized`, a descriptor snapshot
     /// (`Property::clone`), a value snapshot (`Property::clone_value_packed`), `Property::value`
     /// and a move (`Property::take_value`), each on a function of its own, at every tier. The
     /// first read materializes the prototype exactly once and yields its object, as an object
@@ -594,7 +588,7 @@ mod tests {
         }
         const MOVE: &str = "Property::take_value";
         let reads: [(&str, Read); 5] = [
-            ("PackedValue::clone_materialized", |function| {
+            ("PropWord::clone_materialized", |function| {
                 let word = property(function, |stored| stored.packed.clone_materialized());
                 (Some(word.tag()), word.into_value())
             }),
@@ -634,7 +628,7 @@ mod tests {
                 if let Some(word) = word {
                     assert_eq!(word, PACK_OBJ, "{label}: an object word");
                 }
-                let Value::Obj(prototype) = first else {
+                let ValueView::Obj(prototype) = (first).view() else {
                     panic!("{label}: not an object")
                 };
                 let constructor = prototype
@@ -643,7 +637,7 @@ mod tests {
                     .get("constructor")
                     .map(Property::value);
                 assert!(
-                    matches!(constructor, Some(Value::Obj(c)) if Gc::ptr_eq(&c, &function)),
+                    matches!((constructor).map(|__value| (__value).view()), Some(ValueView::Obj(c)) if Gc::ptr_eq(&c, &function)),
                     "{label}: constructor"
                 );
                 assert!(
@@ -656,15 +650,15 @@ mod tests {
                 );
                 if *read_name == MOVE {
                     assert!(matches!(
-                        property(&function, Property::value),
-                        Value::Undefined
+                        (property(&function, Property::value)).view(),
+                        ValueView::Undefined
                     ));
                     assert_eq!(eval(&mut engine, &format!("{name}.prototype")), "undefined");
                 } else {
                     assert_eq!(tag(), PACK_OBJ, "{label}: the property's word");
                     let (_, second) = read(&function);
                     assert!(
-                        matches!(second, Value::Obj(o) if Gc::ptr_eq(&o, &prototype)),
+                        matches!((second).view(), ValueView::Obj(o) if Gc::ptr_eq(&o, &prototype)),
                         "{label}: a second read"
                     );
                     eval(&mut engine, &format!("var seen = {name}.prototype; 0"));
@@ -682,9 +676,8 @@ mod tests {
         }
     }
 
-    /// P1 S5 (debug builds): copying a deferred prototype's word with `Clone`, a bit copy,
-    /// instead of `PackedValue::clone_materialized` trips a debug assertion
-    /// before the property-only word can leave its property.
+    /// A deferred prototype stays in PropWord. Constructing a plain execution word from its
+    /// bits instead of reading through the materializing property boundary must fail.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "a deferred prototype's word copied without materializing")]
@@ -695,7 +688,7 @@ mod tests {
         let body = function.borrow();
         let property = body.props.get("prototype").expect("a prototype");
         assert_eq!(property.packed.tag(), PACK_LAZY_PROTO);
-        let _copy = property.packed.clone();
+        let _copy = crate::value::PackedValue::from_bits(property.packed.bits());
     }
 
     #[test]

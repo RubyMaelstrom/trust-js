@@ -3,6 +3,7 @@
 //! spec.html:19922 (EvaluateCall), :26255 (tail positions), :26617 (PrepareForTailCall).
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
@@ -18,7 +19,7 @@ fn assert_compiled(engine: &mut Engine, name: &str, native: bool) {
         .interp
         .get_var(name, &env)
         .unwrap_or_else(|_| panic!("missing {name}"));
-    let crate::value::Value::Obj(object) = value else {
+    let ValueView::Obj(object) = (value).view() else {
         panic!("{name} is not an object")
     };
     let object = object.borrow();

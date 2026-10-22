@@ -5,10 +5,10 @@
 //! lists cross the public wide-Value API; whole activations are never widened.
 
 use crate::value::{PackedValue, Value};
+use std::cell::Cell;
 
-pub(crate) trait StoredValue: Sized + Clone {
+pub(crate) trait StoredValue: Sized + Copy {
     fn from_value(value: Value) -> Self;
-    fn replace_stored(&self, value: Self);
     fn into_value(self) -> Value;
     fn clone_value(&self) -> Value;
     fn is_empty(&self) -> bool;
@@ -19,10 +19,6 @@ impl StoredValue for PackedValue {
     #[inline]
     fn from_value(value: Value) -> Self {
         Self::pack(value)
-    }
-    #[inline]
-    fn replace_stored(&self, value: Self) {
-        PackedValue::replace_stored(self, value);
     }
     #[inline]
     fn into_value(self) -> Value {
@@ -83,14 +79,14 @@ pub(crate) trait SlotAccess {
     fn write_value(&self, index: usize, value: Value);
 }
 
-impl<S: StoredValue> SlotAccess for [S] {
+impl<S: StoredValue> SlotAccess for [Cell<S>] {
     #[inline]
     fn read_value(&self, index: usize) -> Value {
-        self[index].clone_value()
+        self[index].get().clone_value()
     }
     #[inline]
     fn write_value(&self, index: usize, value: Value) {
-        self[index].replace_stored(S::from_value(value));
+        self[index].set(S::from_value(value));
     }
 }
 
@@ -223,7 +219,7 @@ impl<S: StoredValue> ValueStack<S> {
     }
 }
 
-pub(crate) type CompactFrame = (Vec<PackedValue>, ValueStack<PackedValue>);
+pub(crate) type CompactFrame = (Vec<Cell<PackedValue>>, ValueStack<PackedValue>);
 
 /// Borrow an actual call's owners while seeding an activation. Only captured parameters need
 /// decoding; an arguments object can still request the complete, owning public Value list.
@@ -302,6 +298,7 @@ impl std::ops::Deref for DecodedArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
     use crate::{bytecode::Tier, Completion, Engine};
     use std::rc::Rc;
 
@@ -327,13 +324,13 @@ mod tests {
         assert_eq!(stack.last_stored().unwrap().bits(), word);
         stack.with_tail(0, |args| {
             assert!(
-                matches!(&args[0], Value::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))
+                matches!(&(args[0]).view(), ValueView::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))
             );
         });
         assert_eq!(stack.last_stored().unwrap().bits(), word);
         stack.push(Value::Num(-0.0));
         assert!(
-            matches!(stack.pop(), Some(Value::Num(value)) if value.to_bits() == (-0.0f64).to_bits())
+            matches!((stack.pop()).map(|__value| (__value).view()), Some(ValueView::Num(value)) if value.to_bits() == (-0.0f64).to_bits())
         );
         for number in [
             f64::INFINITY,
@@ -342,22 +339,24 @@ mod tests {
             f64::from_bits(0xfffb_0000_0000_1234),
         ] {
             stack.push(Value::Num(number));
-            assert!(matches!(stack.pop(), Some(Value::Num(value)) if
-                (number.is_nan() && value.is_nan()) || value.to_bits() == number.to_bits()));
+            assert!(
+                matches!((stack.pop()).map(|__value| (__value).view()), Some(ValueView::Num(value)) if
+                (number.is_nan() && value.is_nan()) || value.to_bits() == number.to_bits())
+            );
         }
         let moved = stack.split_off(0);
         assert!(stack.is_empty());
         assert!(matches!(
-            moved.as_slice(),
-            [Value::Obj(actual)] if crate::value::Gc::ptr_eq(actual, &object)
+            moved.first().map(Value::view),
+            Some(ValueView::Obj(actual)) if moved.len() == 1 && crate::value::Gc::ptr_eq(&actual, &object)
         ));
         drop(moved);
 
-        let slots = [PackedValue::pack(Value::Obj(object.clone()))];
+        let slots = [Cell::new(PackedValue::pack(Value::Obj(object.clone())))];
         slots.write_value(0, Value::Empty);
-        assert!(matches!(slots.read_value(0), Value::Empty));
+        assert!(matches!((slots.read_value(0)).view(), ValueView::Empty));
         slots.write_value(0, Value::Undefined);
-        assert!(matches!(slots.read_value(0), Value::Undefined));
+        assert!(matches!((slots.read_value(0)).view(), ValueView::Undefined));
     }
 
     /// Decoding an argument list makes one Value per argument, on the Rust stack up to four,
@@ -377,7 +376,7 @@ mod tests {
             assert!(matches!(&decoded, DecodedArgs::Inline { .. }) == (count <= 4));
             assert!(decoded
                 .iter()
-                .all(|value| matches!(value, Value::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))));
+                .all(|value| matches!((value).view(), ValueView::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object))));
             drop(decoded);
             assert!(packed.iter().all(|packed| packed.bits() == word));
             drop(packed);
@@ -429,19 +428,19 @@ mod tests {
         let object = crate::value::Object::new(None);
         let weak = crate::value::Gc::downgrade(&object);
         let slots = [
-            PackedValue::pack(Value::Obj(object)),
-            PackedValue::pack(Value::Empty),
+            Cell::new(PackedValue::pack(Value::Obj(object))),
+            Cell::new(PackedValue::pack(Value::Empty)),
         ];
-        let word = slots[0].bits();
+        let word = slots[0].get().bits();
         let mut stack = ValueStack::<PackedValue>::default();
-        assert!(slots[1].is_empty());
-        stack.push_stored(slots[0].clone());
+        assert!(slots[1].get().is_empty());
+        stack.push_stored(slots[0].get());
         stack.push_stored(stack.last_stored().unwrap().clone());
         assert!(stack.raw_slice().iter().all(|copy| copy.bits() == word));
-        slots[1].replace_stored(stack.pop_stored().unwrap());
-        assert_eq!(slots[1].bits(), word);
+        slots[1].set(stack.pop_stored().unwrap());
+        assert_eq!(slots[1].get().bits(), word);
         drop(stack.pop_stored());
-        slots[0].replace_stored(PackedValue::pack(Value::Undefined));
+        slots[0].set(PackedValue::pack(Value::Undefined));
         drop(slots);
         assert!(crate::gc_test::alive(&weak), "a word released its object");
     }
@@ -457,18 +456,18 @@ mod tests {
         let second = crate::value::Object::new(None);
         let second_weak = crate::value::Gc::downgrade(&second);
         let second_word = crate::value::PACK_OBJ | crate::value::Gc::as_ptr(&second) as u64;
-        let slots = [PackedValue::pack(Value::Obj(first))];
+        let slots = [Cell::new(PackedValue::pack(Value::Obj(first)))];
         let shared = &slots[..];
         let alias = &shared[0];
         shared.write_value(0, Value::Obj(second));
-        assert_eq!(alias.bits(), second_word);
-        let seen = alias.unpack();
+        assert_eq!(alias.get().bits(), second_word);
+        let seen = alias.get().unpack();
         assert!(crate::value::Gc::ptr_eq(
-            seen.as_obj().unwrap(),
+            &seen.as_obj().unwrap(),
             &second_weak.upgrade().unwrap()
         ));
-        alias.replace_value(Value::Empty);
-        assert!(shared[0].is_empty());
+        alias.set(PackedValue::pack(Value::Empty));
+        assert!(shared[0].get().is_empty());
         drop(seen);
         assert!(
             crate::gc_test::alive(&first_weak) && crate::gc_test::alive(&second_weak),
@@ -489,17 +488,17 @@ mod tests {
                 .collect();
             let array = unsafe { interp.make_array_from_raw(operands.as_mut_ptr(), count) };
             unsafe { operands.set_len(0) };
-            let Value::Obj(array) = array else {
+            let ValueView::Obj(array) = (array).view() else {
                 panic!("array factory returned a primitive")
             };
             assert!(
-                matches!(array.borrow().props.get("length").unwrap().value(),
-                Value::Num(length) if length == count as f64)
+                matches!((array.borrow().props.get("length").unwrap().value()).view(),
+                ValueView::Num(length) if length == count as f64)
             );
             for index in 0..count {
                 assert!(
-                    matches!(array.borrow().props.get_index(index as u32).unwrap().value(),
-                    Value::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object))
+                    matches!((array.borrow().props.get_index(index as u32).unwrap().value()).view(),
+                    ValueView::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object))
                 );
             }
             drop(array);
@@ -514,16 +513,16 @@ mod tests {
             let result = unsafe {
                 interp.make_plain_object_templated_from(&template, &keys, operands.as_mut_ptr(), 2)
             };
-            let Value::Obj(result) = result else {
+            let ValueView::Obj(result) = (result).view() else {
                 panic!("object factory returned a primitive")
             };
             assert!(
-                matches!(result.borrow().props.get("negativeZero").unwrap().value(),
-                Value::Num(number) if number.to_bits() == (-0.0f64).to_bits())
+                matches!((result.borrow().props.get("negativeZero").unwrap().value()).view(),
+                ValueView::Num(number) if number.to_bits() == (-0.0f64).to_bits())
             );
             assert!(
-                matches!(result.borrow().props.get("held").unwrap().value(),
-                Value::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object)),
+                matches!((result.borrow().props.get("held").unwrap().value()).view(),
+                ValueView::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object)),
                 "the field holds the moved operand's object"
             );
             drop(result);
