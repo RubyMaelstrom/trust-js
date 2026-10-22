@@ -4319,7 +4319,7 @@ const EXECUTION_STACK_SEGMENT: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EXECUTION_STACK_SEGMENTS: usize = 64;
 /// A call path checks for exhaustion ([`execution_stack_exhausted`]) and then reaches its growth
 /// checkpoint ([`with_execution_stack`]) at the same depth but a little deeper on the stack: in
-/// the frame that holds the call's continuation, inside the closures that move its arguments. At
+/// the frame that holds the call's continuation, inside the closures that borrow its arguments. At
 /// the segment cap the check keeps this margin above the red zone, which bounds those frames,
 /// so a path that passes the check still finds the red zone free at its checkpoint and needs no
 /// segment there.
@@ -5191,12 +5191,6 @@ impl Interp {
         let result = operation(self);
         self.leave_embed_realm(key, saved);
         Ok(result)
-    }
-
-    /// Define a native function on the active Realm's global object.
-    pub fn define_embed_global(&mut self, name: &str, len: usize, function: NativeFn) {
-        let global = self.global.clone();
-        self.def_method(&global, name, len, function);
     }
 
     /// The opaque HTML environment-settings token currently associated with
@@ -6248,7 +6242,7 @@ impl Interp {
         let body = object.borrow();
         match &body.call {
             Callable::User(_) => CallTargetKind::UserFunction,
-            Callable::Native(_) | Callable::NativeData(_) => CallTargetKind::NativeFunction,
+            native if native.is_native() => CallTargetKind::NativeFunction,
             Callable::Bound(_) => CallTargetKind::BoundFunction,
             Callable::WrappedShadow(_) | Callable::WrappedCross(_) => {
                 CallTargetKind::WrappedFunction
@@ -7024,8 +7018,8 @@ impl Interp {
         Value::Obj(obj)
     }
 
-    /// CreateArrayFromList for an entry pair: move the packed value straight into
-    /// canonical array storage without an intermediate Vec or wide conversion.
+    /// CreateArrayFromList for an entry pair: copy the canonical word straight into
+    /// array storage without an intermediate Vec.
     pub(crate) fn make_entry_pair(&self, key: crate::lstr::LStr, value: PackedValue) -> Value {
         Value::Obj(Object::new_with_parts(
             Some(self.array_proto.clone()),
@@ -7107,12 +7101,16 @@ impl Interp {
         crate::builtins::map_set(self, map, key, value)
     }
 
-    /// Build an array by moving `len` initialized values directly from a JIT operand stack.
+    /// Build an array by copying `len` canonical words from an immutable evaluated window.
     ///
     /// # Safety
-    /// `items` must point to `len` live, non-overlapping `PackedValue`s. This method consumes every
-    /// value exactly once; the caller must reset its stack pointer to `items` before returning.
-    pub(crate) unsafe fn make_array_from_raw(&self, items: *mut PackedValue, len: usize) -> Value {
+    /// `items` points to `len` initialized execution words in stable immutable storage retained
+    /// through this call. The caller retires its window only after the copy completes.
+    pub(crate) unsafe fn make_array_from_raw(
+        &self,
+        items: *const PackedValue,
+        len: usize,
+    ) -> Value {
         if len <= 32 || crate::value::dense_elements_enabled() {
             let obj = Object::new_with_parts(
                 Some(self.array_proto.clone()),
@@ -7179,6 +7177,8 @@ impl Interp {
         let result = self.with_host_callback(|interp| {
             match call {
                 Callable::Native(f) => f(interp, this, args),
+                #[cfg(feature = "embed")]
+                Callable::ScopedNative(f) => crate::scope::invoke_native(*f, interp, this, args),
                 Callable::NativeData(data) => match &data.body {
                     crate::value::NativeCallableBody::Opaque(f) => {
                         let f = f.clone();
@@ -7189,6 +7189,13 @@ impl Interp {
                         // may become unreachable while it runs.
                         let _captures = crate::rooting::root_slice(captures);
                         function(interp, this, args, captures)
+                    }
+                    #[cfg(feature = "embed")]
+                    crate::value::NativeCallableBody::ScopedCaptured { function, captures } => {
+                        let _captures = crate::rooting::root_slice(captures);
+                        crate::scope::invoke_captured_native(
+                            *function, interp, this, args, captures,
+                        )
                     }
                     crate::value::NativeCallableBody::CapturedClosure { function, captures } => {
                         // As above; the closure lives while this call holds it.
@@ -7242,7 +7249,7 @@ impl Interp {
         function: crate::value::NativeCaptureFn,
         captures: Vec<Value>,
     ) -> Value {
-        Value::Obj(self.make_native_callable(
+        Value::Obj(self.make_native_data_callable(
             name,
             len,
             crate::value::NativeCallableBody::Captured {
@@ -7263,7 +7270,7 @@ impl Interp {
         f: std::rc::Rc<crate::value::NativeClosure>,
         captures: crate::value::NativeCaptures,
     ) -> Gc {
-        self.make_native_callable(
+        self.make_native_data_callable(
             name,
             len,
             crate::value::NativeCallableBody::Opaque(f),
@@ -7282,7 +7289,7 @@ impl Interp {
         captures: Vec<Value>,
         retained: crate::value::NativeCaptures,
     ) -> Gc {
-        self.make_native_callable(
+        self.make_native_data_callable(
             name,
             len,
             crate::value::NativeCallableBody::CapturedClosure {
@@ -7293,21 +7300,30 @@ impl Interp {
         )
     }
 
-    fn make_native_callable(
+    fn make_native_data_callable(
         &self,
         name: &str,
         len: usize,
         body: crate::value::NativeCallableBody,
         retained: Option<std::rc::Rc<dyn crate::value::NativeCallableRetained>>,
     ) -> Gc {
-        let obj = Object::new(Some(self.function_proto.clone()));
-        {
-            let mut b = obj.borrow_mut();
-            b.call = Callable::NativeData(Rc::new(crate::value::NativeCallable {
+        self.make_callable_object(
+            name,
+            len,
+            Callable::NativeData(Rc::new(crate::value::NativeCallable {
                 body,
                 retained,
                 identity: Rc::from(name),
-            }));
+            })),
+        )
+    }
+
+    /// Install the common ordinary-function properties without adapting the callback type.
+    fn make_callable_object(&self, name: &str, len: usize, call: Callable) -> Gc {
+        let obj = Object::new(Some(self.function_proto.clone()));
+        {
+            let mut b = obj.borrow_mut();
+            b.call = call;
             b.props.insert(
                 "length",
                 Property::data(Value::Num(len as f64), false, false, true),
@@ -7322,22 +7338,38 @@ impl Interp {
     }
 
     pub(crate) fn make_native(&self, name: &str, len: usize, f: NativeFn) -> Gc {
-        let obj = Object::new(Some(self.function_proto.clone()));
         crate::jit::perf_native_register(f as usize, name);
-        {
-            let mut b = obj.borrow_mut();
-            b.call = Callable::Native(f);
-            b.props.insert(
-                "length",
-                Property::data(Value::Num(len as f64), false, false, true),
-            );
-            b.props.insert(
-                "name",
-                Property::data(Value::lstr(name.to_string()), false, false, true),
-            );
-        }
-        self.register_native_realm(&obj);
-        obj
+        self.make_callable_object(name, len, Callable::Native(f))
+    }
+
+    #[cfg(feature = "embed")]
+    pub(crate) fn make_scoped_native(
+        &self,
+        name: &str,
+        len: usize,
+        f: crate::scope::NativeFn,
+    ) -> Gc {
+        crate::jit::perf_native_register(f as usize, name);
+        self.make_callable_object(name, len, Callable::ScopedNative(f))
+    }
+
+    #[cfg(feature = "embed")]
+    pub(crate) fn new_scoped_native_with_captures(
+        &self,
+        name: &str,
+        len: usize,
+        function: crate::scope::NativeCaptureFn,
+        captures: Vec<Value>,
+    ) -> Value {
+        Value::Obj(self.make_native_data_callable(
+            name,
+            len,
+            crate::value::NativeCallableBody::ScopedCaptured {
+                function,
+                captures: captures.into_boxed_slice(),
+            },
+            None,
+        ))
     }
 
     pub(crate) fn register_native_realm(&self, function: &Gc) {
@@ -7459,6 +7491,31 @@ impl Interp {
             crate::value::encode_string_key(name).as_ref(),
             Property::builtin(Value::Obj(func)),
         );
+    }
+
+    #[cfg(feature = "embed")]
+    pub(crate) fn def_scoped_method(
+        &self,
+        target: &Gc,
+        name: &str,
+        len: usize,
+        f: crate::scope::NativeFn,
+    ) {
+        let function = self.make_scoped_native(name, len, f);
+        target.borrow_mut().props.insert(
+            crate::value::encode_string_key(name).as_ref(),
+            Property::builtin(Value::Obj(function)),
+        );
+    }
+
+    #[cfg(feature = "embed")]
+    pub(crate) fn define_scoped_global(
+        &self,
+        name: &str,
+        len: usize,
+        function: crate::scope::NativeFn,
+    ) {
+        self.def_scoped_method(&self.global, name, len, function);
     }
 
     /// Embedder host state (typed per-subsystem slots + the resource table). This is how a
@@ -12412,6 +12469,8 @@ impl Interp {
             Callable::Native(_) | Callable::NativeData(_) => {
                 self.dispatch_native(&call, this, args)
             }
+            #[cfg(feature = "embed")]
+            Callable::ScopedNative(_) => self.dispatch_native(&call, this, args),
             Callable::User(user) => {
                 // A class constructor cannot be [[Call]]ed. (Empty-map guard: this runs on every
                 // single call, and most programs define no classes.)
@@ -12470,7 +12529,7 @@ impl Interp {
                                 Callable::User(_) => "user",
                                 Callable::WrappedShadow(_) => "wshadow",
                                 Callable::WrappedCross(_) => "wcross",
-                                Callable::Native(_) | Callable::NativeData(_) => "native",
+                                native if native.is_native() => "native",
                                 _ => "other",
                             },
                             _ => "nonobj",
@@ -13288,12 +13347,11 @@ impl Interp {
     /// exactly the observable effects of the layered path — recursion depth, gc_check, the
     /// `FnFrame` for `f.caller` reflection, constructing/new.target save-clear-restore, and the
     /// proper-tail-call trampoline — but skips the dispatch layers' proxy/realm/eval-marker
-    /// re-checks (guarded up front) and *moves* the `argc` argument `Value`s at `args` into the
-    /// callee's slots instead of clone-here-drop-there.
+    /// re-checks (guarded up front). It copies canonical words from the caller's immutable
+    /// evaluated argument window into the callee's separate slots.
     ///
-    /// `None` = not applicable, with NO side effects and the arguments untouched (the caller
-    /// runs the generic path). `Some(r)` = handled; the arguments AND `*this_slot` have been
-    /// consumed (the `this` binding moves into the callee instead of a clone-here-drop-there).
+    /// `None` leaves the argument window untouched; `Some` completes the call while retaining
+    /// that window and receiver through every nested call, post-call poll and tail drain.
     ///
     /// The identity-cached JIT→JIT call (see [`crate::bytecode::CallIc`]): on a per-site hit,
     /// the entire dispatch guard set collapses into two pointer compares (callee identity +
@@ -13303,14 +13361,18 @@ impl Interp {
     /// the caller falls into [`Interp::call_jit_fast`], which revalidates and refills.
     ///
     /// # Safety
-    /// Same contract as `call_jit_fast`: on `Some`, `args..args+argc` and `*this_slot` have been
-    /// consumed.
+    /// `args` is aligned and non-null even for zero arity. `args..args+argc` and `*this_slot`
+    /// are initialized immutable execution words, stable
+    /// through the complete call including post-call polls and pending tails. The caller
+    /// roots the words before entry, using its live native/JIT frame or an explicit root for
+    /// Rust-heap storage, because the first poll precedes copying into the callee's frame.
+    /// It retires the argument window only after `Some` returns; `None` leaves it untouched.
     pub(crate) unsafe fn call_jit_cached(
         &mut self,
         site: &crate::bytecode::CallSite,
         callee: &Value,
         this_slot: *const crate::value::PackedValue,
-        args: *mut crate::value::PackedValue,
+        args: *const crate::value::PackedValue,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
         let ic = match self.resolve_cached_call_entry(site, callee) {
@@ -13321,8 +13383,19 @@ impl Interp {
                 // SAFETY: `entry` is live and nothing re-entrant has run since the probe.
                 let native = unsafe { (*entry).native };
                 if native != 0 {
-                    let nf: crate::value::NativeFn = unsafe { std::mem::transmute(native) };
-                    return Some(unsafe { self.call_native_committed(nf, this_slot, args, argc) });
+                    let signature = unsafe { (*entry).direct };
+                    let result = unsafe {
+                        self.call_native_address_committed(native, signature, this_slot, args, argc)
+                    };
+                    #[cfg(all(test, feature = "embed"))]
+                    if signature & crate::bytecode::CALL_IC_SCOPED_NATIVE != 0 {
+                        // A completed scoped cached-native boundary, through the same production
+                        // helper in tests and release. The fixture checks each exact Ok/Err
+                        // payload so an early interruption/RangeError cannot satisfy its count.
+                        crate::bytecode::TEST_SCOPED_NATIVE_CACHED_COMMITS
+                            .with(|count| count.set(count.get() + 1));
+                    }
+                    return Some(result);
                 }
                 // The callee may refill this way; run from a copy.
                 unsafe { entry.read() }
@@ -13513,22 +13586,21 @@ impl Interp {
     /// corresponding [`Interp::call_jit_cached`] hit.
     ///
     /// # Safety
-    /// Same moved-operand contract as `call_jit_cached`'s `Some` arm; `prepared` must be current
+    /// Same immutable-window loan as `call_jit_cached`; `prepared` must be current
     /// (see [`Interp::prepared_call_current`]) for a callee the caller keeps alive.
     pub(crate) unsafe fn call_prepared(
         &mut self,
         prepared: &PreparedCall,
         this_slot: *const crate::value::PackedValue,
-        args: *mut crate::value::PackedValue,
+        args: *const crate::value::PackedValue,
         argc: usize,
     ) -> Result<PackedValue, Abrupt> {
         let ic = &prepared.ic;
         match &prepared.code {
-            None => {
-                let nf: crate::value::NativeFn = unsafe { std::mem::transmute(ic.native) };
-                unsafe { self.call_native_committed(nf, this_slot, args, argc) }
-                    .map(PackedValue::pack)
+            None => unsafe {
+                self.call_native_address_committed(ic.native, ic.direct, this_slot, args, argc)
             }
+            .map(PackedValue::pack),
             Some(code) => {
                 self.note_compiled_call(ic);
                 unsafe { self.call_jit_committed_packed(ic, code, this_slot, args, argc) }
@@ -13549,25 +13621,16 @@ impl Interp {
         code: &crate::jit::JitCode,
         env_ptr: *const RefCell<Scope>,
         this_slot: *const crate::value::PackedValue,
-        args: *mut crate::value::PackedValue,
+        args: *const crate::value::PackedValue,
         argc: usize,
     ) -> Result<PackedValue, Abrupt> {
-        let drop_args = || unsafe {
-            for k in 0..argc {
-                std::ptr::drop_in_place(args.add(k));
-            }
-        };
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
-            drop_args();
-            unsafe { std::ptr::drop_in_place(this_slot.cast_mut()) };
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
         if let Err(e) = self.gc_check_amortized() {
             self.depth -= 1;
-            drop_args();
-            unsafe { std::ptr::drop_in_place(this_slot.cast_mut()) };
             return Err(e);
         }
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
@@ -13617,112 +13680,154 @@ impl Interp {
         r
     }
 
-    /// A native-entry IC hit: invoke the builtin straight from the cache — no receiver borrow,
-    /// no `Callable` dispatch, no re-probe. Replicates the observable effects of the
-    /// plain-native fast call (depth guard, amortized gc tick, constructing/new.target
-    /// save-clear-restore, defensive tail drain). The arguments and `*this_slot` are consumed
-    /// unconditionally. Argument owners move into wide temporaries that remain rooted through
-    /// the post-call interrupt poll and pending-tail drain; the receiver keeps its existing
-    /// packed owner until that same boundary completes.
+    /// Invoke a cached bare native using the original callback signature. Inspect the signature
+    /// before reconstructing a typed pointer; an address alone cannot distinguish Rust Results.
     ///
     /// # Safety
-    /// Same contract as `call_jit_committed`.
-    pub(crate) unsafe fn call_native_committed(
+    /// `native` must be the original function address selected by `signature`, from a validated
+    /// live cache entry. The receiver and argument window obey `call_native_committed`'s loan.
+    #[inline]
+    pub(crate) unsafe fn call_native_address_committed(
         &mut self,
-        nf: crate::value::NativeFn,
-        this_slot: *const crate::value::PackedValue,
-        args: *mut crate::value::PackedValue,
+        native: usize,
+        signature: u8,
+        this_slot: *const PackedValue,
+        args: *const PackedValue,
         argc: usize,
     ) -> Result<Value, Abrupt> {
-        let drop_operands = || unsafe {
-            for k in 0..argc {
-                std::ptr::drop_in_place(args.add(k));
-            }
-            std::ptr::drop_in_place(this_slot.cast_mut());
-        };
-        self.depth += 1;
-        if execution_stack_exhausted(self.depth) {
-            self.depth -= 1;
-            drop_operands();
-            return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
+        #[cfg(feature = "embed")]
+        if signature & crate::bytecode::CALL_IC_SCOPED_NATIVE != 0 {
+            // SAFETY: the signature bit records this exact declared type at publication.
+            let function: crate::scope::NativeFn =
+                unsafe { std::mem::transmute(native as *const ()) };
+            return unsafe {
+                self.call_native_committed_with(
+                    native,
+                    this_slot,
+                    args,
+                    argc,
+                    |interp, this, arguments| {
+                        crate::scope::invoke_native(function, interp, this, arguments)
+                    },
+                )
+            };
         }
-        if let Err(e) = self.gc_check_amortized() {
-            self.depth -= 1;
-            drop_operands();
-            return Err(e);
+        debug_assert_eq!(signature & crate::bytecode::CALL_IC_SCOPED_NATIVE, 0);
+        let function: crate::value::NativeFn = unsafe { std::mem::transmute(native as *const ()) };
+        unsafe { self.call_native_committed(function, this_slot, args, argc) }
+    }
+
+    /// A native-entry IC hit, borrowing the caller's canonical evaluated argument window.
+    /// Roots and loans last through post-call interruption and the pending-tail drain. The
+    /// caller retires its operands only after this returns; the callee never clears or pools them.
+    ///
+    /// # Safety
+    /// `args` is aligned and non-null even for zero arity. `args..args+argc` and `this_slot`
+    /// are initialized execution words in stable immutable
+    /// storage, retained by the caller through this entire operation and all nested reentry.
+    #[inline]
+    pub(crate) unsafe fn call_native_committed(
+        &mut self,
+        function: crate::value::NativeFn,
+        this_slot: *const PackedValue,
+        args: *const PackedValue,
+        argc: usize,
+    ) -> Result<Value, Abrupt> {
+        unsafe {
+            self.call_native_committed_with(function as usize, this_slot, args, argc, function)
         }
-        let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        let saved_nt = std::mem::replace(&mut self.new_target, PackedValue::pack(Value::Undefined));
-        let native_result = match self.interrupt_poll_force() {
-            Ok(()) => unsafe {
-                crate::execution_storage::with_moved_values(args, argc, |arguments| {
-                    // I1: past four arguments they live in a Rust-heap buffer.
-                    let _arguments = crate::rooting::root_slice(arguments);
-                    let native_result = with_execution_stack(self.depth, || {
-                        let perf_started = crate::jit::perf_stage_start();
-                        let result = self.with_host_callback(|interp| {
-                            nf(interp, (&*this_slot).unpack(), arguments)
+    }
+
+    /// Share native bookkeeping while Rust monomorphizes each actual callback signature.
+    ///
+    /// # Safety
+    /// The receiver/arguments obey `call_native_committed`'s stable immutable-window contract.
+    /// `invoke` calls its function at the actual declared signature, mapping its Result explicitly.
+    pub(crate) unsafe fn call_native_committed_with(
+        &mut self,
+        address: usize,
+        this_slot: *const PackedValue,
+        args: *const PackedValue,
+        argc: usize,
+        invoke: impl FnOnce(&mut Self, Value, &[Value]) -> Result<Value, Value>,
+    ) -> Result<Value, Abrupt> {
+        // SAFETY: the caller owns a stable immutable window until this helper returns. Reentry
+        // may churn other frames and pools, but cannot retire or reuse this caller's allocation.
+        unsafe {
+            crate::execution_storage::with_borrowed_values(args, argc, |arguments| {
+                let _arguments = crate::rooting::root_slice(arguments);
+                self.depth += 1;
+                if execution_stack_exhausted(self.depth) {
+                    self.depth -= 1;
+                    return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
+                }
+                if let Err(error) = self.gc_check_amortized() {
+                    self.depth -= 1;
+                    return Err(error);
+                }
+                let saved_ctor = std::mem::replace(&mut self.constructing, false);
+                let saved_nt =
+                    std::mem::replace(&mut self.new_target, PackedValue::pack(Value::Undefined));
+                let mut result = match self.interrupt_poll_force() {
+                    Ok(()) => {
+                        let native_result = with_execution_stack(self.depth, || {
+                            let perf_started = crate::jit::perf_stage_start();
+                            let result = self.with_host_callback(|interp| {
+                                invoke(interp, (*this_slot).unpack(), arguments)
+                            });
+                            crate::jit::perf_native_end(
+                                perf_started,
+                                result.is_ok(),
+                                crate::jit::NativeLabelSrc::Addr(address),
+                            );
+                            result
                         });
-                        crate::jit::perf_native_end(
-                            perf_started,
-                            result.is_ok(),
-                            crate::jit::NativeLabelSrc::Addr(nf as usize),
-                        );
-                        result
-                    });
-                    let mut r = match self.interrupt_poll_force() {
-                        Ok(()) => native_result.map_err(Abrupt::Throw),
-                        Err(interrupt) => Err(interrupt),
-                    };
-                    self.constructing = saved_ctor;
-                    self.new_target = saved_nt;
-                    while r.is_ok() {
-                        match self.run_pending_tail(true) {
-                            Some(next) => r = next,
-                            None => break,
+                        match self.interrupt_poll_force() {
+                            Ok(()) => native_result.map_err(Abrupt::Throw),
+                            Err(interrupt) => Err(interrupt),
                         }
                     }
-                    self.depth -= 1;
-                    r
-                })
-            },
-            Err(interrupt) => {
+                    Err(interrupt) => Err(interrupt),
+                };
                 self.constructing = saved_ctor;
                 self.new_target = saved_nt;
+                while result.is_ok() {
+                    match self.run_pending_tail(true) {
+                        Some(next) => result = next,
+                        None => break,
+                    }
+                }
                 self.depth -= 1;
-                drop_operands();
-                return Err(interrupt);
-            }
-        };
-        // `with_moved_values` consumed the arguments; the receiver stays in its original slot so
-        // its strong owner and the existing `unpack()` clone keep their established lifetimes.
-        unsafe { std::ptr::drop_in_place(this_slot.cast_mut()) };
-        native_result
+                result
+            })
+        }
     }
 
     /// [`Interp::call_jit_cached`]'s committed tail, split out so the asm call thunk can enter
     /// it with an already-validated `CallIc` (the probe having run in machine code). From here
-    /// the arguments and `*this_slot` are consumed unconditionally.
+    /// the arguments and `*this_slot` remain borrowed until the whole call returns.
     ///
     /// # Safety
     /// `ic` must be a hit validated THIS turn (callee identity + epoch + realm), with the callee
     /// object alive in the caller's hands; `args..args+argc` and `*this_slot` are live
-    /// operand-stack values the caller forgets. `code` is the owned lease of
+    /// immutable argument words in storage the caller retains and roots through this whole
+    /// call. A live native/JIT frame supplies that root; Rust-heap windows require an explicit
+    /// root before the initial poll, which precedes frame seeding. `code` is the owned lease of
     /// `ic.code`, acquired immediately after validation and retained by the caller.
     pub(crate) unsafe fn call_jit_committed(
         &mut self,
         ic: &crate::bytecode::CallIc,
         code: &crate::jit::JitCode,
         this_slot: *const crate::value::PackedValue,
-        args: *mut crate::value::PackedValue,
+        args: *const crate::value::PackedValue,
         argc: usize,
     ) -> Result<Value, Abrupt> {
         unsafe { self.call_jit_committed_packed(ic, code, this_slot, args, argc) }
             .map(PackedValue::into_value)
     }
 
-    /// [`Interp::call_jit_committed`] with the completion value left packed: a native caller
-    /// that stores or forwards the result (Array callbacks) never widens it.
+    /// [`Interp::call_jit_committed`] returning the canonical word directly to native callers
+    /// that store or forward it (Array callbacks).
     ///
     /// # Safety
     /// Same contract as `call_jit_committed`.
@@ -13731,7 +13836,7 @@ impl Interp {
         ic: &crate::bytecode::CallIc,
         code: &crate::jit::JitCode,
         this_slot: *const crate::value::PackedValue,
-        args: *mut crate::value::PackedValue,
+        args: *const crate::value::PackedValue,
         argc: usize,
     ) -> Result<PackedValue, Abrupt> {
         if ic.direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 {
@@ -13743,22 +13848,10 @@ impl Interp {
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
-            unsafe {
-                for k in 0..argc {
-                    std::ptr::drop_in_place(args.add(k));
-                }
-                std::ptr::drop_in_place(this_slot.cast_mut());
-            }
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
         if let Err(e) = self.gc_check_amortized() {
             self.depth -= 1;
-            unsafe {
-                for k in 0..argc {
-                    std::ptr::drop_in_place(args.add(k));
-                }
-                std::ptr::drop_in_place(this_slot.cast_mut());
-            }
             return Err(e);
         }
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
@@ -13876,23 +13969,6 @@ impl Interp {
         }
     }
 
-    /// # Safety
-    /// `args..args+argc` and `*this_slot` must be initialized `Value`s the caller relinquishes
-    /// on `Some`.
-    /// The identity-cached JIT construct (`Op::New` with a plain, same-realm compiled function
-    /// constructor): replicates `construct` → `construct_dispatch`'s
-    /// observable effects for that case — IsConstructor, prototype read (LIVE, each time:
-    /// `F.prototype = other` is a plain value write no epoch sees), OrdinaryCreateFromConstructor,
-    /// depth guard, gc tick, `FnFrame`, new.target = the callee for the body's duration,
-    /// return-override — while skipping the dispatch layering, and MOVES the argument values
-    /// off the caller's operand stack like the cached call does.
-    ///
-    /// `None` = not applicable, no side effects, arguments untouched (caller runs the generic
-    /// path). `Some(r)` = handled; the `argc` arguments at `args` were consumed.
-    ///
-    /// # Safety
-    /// Same contract as `call_jit_cached`: `args..args+argc` must be live operand-stack values
-    /// the caller forgets on `Some`.
     fn learned_construct_layout(&self, constructor: &Gc) -> Option<crate::value::PropertyLayout> {
         let key = Gc::as_ptr(constructor) as usize;
         self.construct_capacity_hints
@@ -13936,7 +14012,7 @@ impl Interp {
         chunk: &crate::bytecode::Chunk,
         this: &Gc,
         this_val: &Value,
-        args: *mut crate::value::PackedValue,
+        args: *const crate::value::PackedValue,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
         let (initializer_name, initializer_cache, apply_cache) =
@@ -14082,11 +14158,6 @@ impl Interp {
             plan.cache_shapes(epoch, proto_ptr, start_shape, &shapes[..plan.len()]);
             Some((epoch, proto_ptr, shapes))
         });
-        let drop_args = || unsafe {
-            for k in 0..argc {
-                std::ptr::drop_in_place(args.add(k));
-            }
-        };
 
         if let (Some(initializer_chunk), Some((_epoch, _proto_ptr, shapes))) =
             (initializer_plan.as_ref(), plan_shapes)
@@ -14096,7 +14167,6 @@ impl Interp {
             // reflection frames nor separate GC polls.
             #[cfg(target_arch = "wasm32")]
             if self.depth > WASM_EXECUTION_DEPTH_GUARD.saturating_sub(2) {
-                drop_args();
                 return Some(Err(
                     self.throw("RangeError", "Maximum call stack size exceeded")
                 ));
@@ -14124,10 +14194,9 @@ impl Interp {
                     {
                         PackedValue::pack(default.clone())
                     } else {
-                        // The plan proves each parameter is consumed at most once. Move the
-                        // canonical owner directly; OrdinarySet's guards above already prove
-                        // a fresh writable data field, so no public Value boundary remains.
-                        unsafe { arg.replace(PackedValue::pack(Value::Undefined)) }
+                        // The caller retains the immutable evaluated argument window through
+                        // this operation. Copy its canonical word into the proven data field.
+                        unsafe { arg.read() }
                     }
                 } else {
                     PackedValue::pack(default.cloned().unwrap_or(Value::Undefined))
@@ -14156,7 +14225,6 @@ impl Interp {
                 );
             }
             drop(object);
-            drop_args();
             return Some(Ok(Value::Undefined));
         }
 
@@ -14165,14 +14233,12 @@ impl Interp {
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
-            drop_args();
             return Some(Err(
                 self.throw("RangeError", "Maximum call stack size exceeded")
             ));
         }
         if let Err(e) = self.gc_check_amortized() {
             self.depth -= 1;
-            drop_args();
             return Some(Err(e));
         }
 
@@ -14191,21 +14257,34 @@ impl Interp {
             None => {
                 unsafe { std::mem::ManuallyDrop::drop(&mut forwarded_this) };
                 let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
-                let r = PackedValue::with_values(args_ref, |arguments| {
+                PackedValue::with_values(args_ref, |arguments| {
                     self.call(initializer, this_val.clone(), arguments)
-                });
-                drop_args();
-                r
+                })
             }
         };
         self.depth -= 1;
         Some(result.map(|_| Value::Undefined))
     }
 
+    /// The identity-cached JIT construct (`Op::New` with a plain, same-realm compiled function
+    /// constructor): replicates `construct` → `construct_dispatch`'s
+    /// observable effects for that case — IsConstructor, prototype read (LIVE, each time:
+    /// `F.prototype = other` is a plain value write no epoch sees), OrdinaryCreateFromConstructor,
+    /// depth guard, gc tick, `FnFrame`, new.target = the callee for the body's duration,
+    /// return-override — while skipping the dispatch layering and borrowing the caller's
+    /// stable evaluated argument window, just as cached calls do.
+    ///
+    /// `None` = not applicable, no side effects, arguments untouched (caller runs the generic
+    /// path). `Some(r)` completes the operation; the caller may then retire its argument window.
+    ///
+    /// # Safety
+    /// `args` is aligned/non-null even at zero arity and names initialized immutable
+    /// execution words. The caller retains and roots the complete window through all
+    /// allocations, polls, nested execution and tail drains, as for `call_jit_cached`.
     pub(crate) unsafe fn construct_jit_fast(
         &mut self,
         callee: &Value,
-        args: *mut crate::value::PackedValue,
+        args: *const crate::value::PackedValue,
         argc: usize,
         caller_ctx: Option<*mut crate::jit::JitCtx>,
         site: Option<(&crate::bytecode::Chunk, u32)>,
@@ -14242,7 +14321,7 @@ impl Interp {
             // ordinary native construction throughout the Agent.
             if b.ic_plain.get() && (b.is_constructor || b.props.contains("prototype")) {
                 match &b.call {
-                    Callable::Native(_) | Callable::NativeData(_) => Some(b.call.clone()),
+                    native if native.is_native() => Some(native.clone()),
                     _ => None,
                 }
             } else {
@@ -14255,11 +14334,6 @@ impl Interp {
             self.depth += 1;
             if execution_stack_exhausted(self.depth) {
                 self.depth -= 1;
-                unsafe {
-                    for k in 0..argc {
-                        std::ptr::drop_in_place(args.add(k));
-                    }
-                }
                 return Some(Err(
                     self.throw("RangeError", "Maximum call stack size exceeded")
                 ));
@@ -14274,11 +14348,6 @@ impl Interp {
             });
             self.constructing = saved_ctor;
             self.new_target = saved_nt;
-            unsafe {
-                for k in 0..argc {
-                    std::ptr::drop_in_place(args.add(k));
-                }
-            }
             self.depth -= 1;
             return Some(r);
         }
@@ -14370,22 +14439,12 @@ impl Interp {
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
-            unsafe {
-                for k in 0..argc {
-                    std::ptr::drop_in_place(args.add(k));
-                }
-            }
             return Some(Err(
                 self.throw("RangeError", "Maximum call stack size exceeded")
             ));
         }
         if let Err(e) = self.gc_check_amortized() {
             self.depth -= 1;
-            unsafe {
-                for k in 0..argc {
-                    std::ptr::drop_in_place(args.add(k));
-                }
-            }
             return Some(Err(e));
         }
         // Once every field site's creation IC proves the complete fresh-object shape chain, the
@@ -14449,9 +14508,9 @@ impl Interp {
                     let (slot, name, _) = simple.field(field);
                     let value = if slot < argc {
                         let arg = unsafe { args.add(slot) };
-                        // Unique parameter uses let [[Construct]] transfer the owned packed
-                        // word straight to the proven ordinary data field, without widening.
-                        unsafe { arg.replace(PackedValue::pack(Value::Undefined)) }
+                        // Copy from the immutable evaluated argument window; the caller
+                        // retires its storage after construction completes.
+                        unsafe { arg.read() }
                     } else {
                         PackedValue::pack(Value::Undefined)
                     };
@@ -14473,11 +14532,6 @@ impl Interp {
                 chunk
                     .note_initializer_layout(object.props.shared_layout().expect("created fields"));
                 drop(object);
-                unsafe {
-                    for k in 0..argc {
-                        std::ptr::drop_in_place(args.add(k));
-                    }
-                }
                 self.depth -= 1;
                 return Some(Ok(this_val));
             }
@@ -14695,11 +14749,18 @@ impl Interp {
         ))
     }
 
+    /// A guarded cold compiled call; `None` leaves the caller's window untouched.
+    ///
+    /// # Safety
+    /// The initialized immutable receiver/argument window is aligned/non-null (also at zero
+    /// arity), retained and rooted for this complete operation and its polls/tail drain.
+    /// Native/JIT stack windows are roots under Decision 0; Rust-heap windows need an explicit
+    /// root before entry because the first collection precedes copying into the callee frame.
     pub(crate) unsafe fn call_jit_fast(
         &mut self,
         callee: &Value,
         this_slot: *const crate::value::PackedValue,
-        args: *mut crate::value::PackedValue,
+        args: *const crate::value::PackedValue,
         argc: usize,
         // The caller's per-site cache + pin map: filled once the full guard set passes, so
         // subsequent calls take [`Interp::call_jit_cached`]'s pointer-compare path.
@@ -14828,29 +14889,16 @@ impl Interp {
                 }
             }
         }
-        // --- committed: from here the arguments and `*this_slot` are ours ---
+        // Committed: retain the caller's immutable argument/receiver window through the call.
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
-            // Ownership contract: consume the arguments and `this` even on the early throw.
-            unsafe {
-                for k in 0..argc {
-                    std::ptr::drop_in_place(args.add(k));
-                }
-                std::ptr::drop_in_place(this_slot.cast_mut());
-            }
             return Some(Err(
                 self.throw("RangeError", "Maximum call stack size exceeded")
             ));
         }
         if let Err(e) = self.gc_check_amortized() {
             self.depth -= 1;
-            unsafe {
-                for k in 0..argc {
-                    std::ptr::drop_in_place(args.add(k));
-                }
-                std::ptr::drop_in_place(this_slot.cast_mut());
-            }
             return Some(Err(e));
         }
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
@@ -15922,6 +15970,34 @@ impl Interp {
         self.construct_dispatch(callee, args, new_target)
     }
 
+    fn construct_native_dispatch(
+        &mut self,
+        obj: &Gc,
+        call: &Callable,
+        args: &[Value],
+        new_target: Value,
+    ) -> Result<Value, Abrupt> {
+        // A native non-constructor (a method, global function, Math fn) has no own
+        // `prototype` property; only real built-in constructors do. Reject `new` on the rest.
+        let constructable = obj.borrow().is_constructor || obj.borrow().props.contains("prototype");
+
+        if !constructable {
+            return Err(self.throw("TypeError", "function is not a constructor"));
+        }
+        // Built-in constructors build and return their own object. The `constructing` flag
+        // lets wrapper constructors (Number/String/...) distinguish `new X()` from `X()`.
+        // `new_target` is exposed so a native constructor can derive the instance prototype
+        // from it (OrdinaryCreateFromConstructor / subclassing / Reflect.construct).
+        let saved = self.constructing;
+        let saved_nt = self.new_target.clone();
+        self.constructing = true;
+        self.new_target = PackedValue::pack(new_target);
+        let r = self.dispatch_native(call, Value::Undefined, args);
+        self.constructing = saved;
+        self.new_target = saved_nt;
+        r
+    }
+
     fn construct_dispatch(
         &mut self,
         callee: Value,
@@ -15958,26 +16034,11 @@ impl Interp {
         let call = obj.borrow().call.clone();
         match call {
             Callable::Native(_) | Callable::NativeData(_) => {
-                // A native non-constructor (a method, global function, Math fn) has no own
-                // `prototype` property; only real built-in constructors do. Reject `new` on the rest.
-                let constructable =
-                    obj.borrow().is_constructor || obj.borrow().props.contains("prototype");
-
-                if !constructable {
-                    return Err(self.throw("TypeError", "function is not a constructor"));
-                }
-                // Built-in constructors build and return their own object. The `constructing` flag
-                // lets wrapper constructors (Number/String/...) distinguish `new X()` from `X()`.
-                // `new_target` is exposed so a native constructor can derive the instance prototype
-                // from it (OrdinaryCreateFromConstructor / subclassing / Reflect.construct).
-                let saved = self.constructing;
-                let saved_nt = self.new_target.clone();
-                self.constructing = true;
-                self.new_target = PackedValue::pack(new_target);
-                let r = self.dispatch_native(&call, Value::Undefined, args);
-                self.constructing = saved;
-                self.new_target = saved_nt;
-                r
+                self.construct_native_dispatch(&obj, &call, args, new_target)
+            }
+            #[cfg(feature = "embed")]
+            Callable::ScopedNative(_) => {
+                self.construct_native_dispatch(&obj, &call, args, new_target)
             }
             Callable::User(user) => {
                 // Arrows, concise methods, getters/setters, generators and async functions have no

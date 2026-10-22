@@ -598,23 +598,25 @@ mod tests {
         for symbol in [false, true] {
             let mut engine = Engine::new();
             // The target's strong handles live only in this helper frame (the collector scans the
-            // stack).
+            // stack). Keep the weak token itself off the scanned stack too: inactive enum
+            // payload words can contain an old cell address.
             let target = crate::gc_test::in_frame(|| {
                 let value = if symbol {
                     engine.interp.new_symbol(None)
                 } else {
                     Value::Obj(Object::new(None))
                 };
-                WeakTarget::of(&value).unwrap()
+                Box::new(WeakTarget::of(&value).unwrap())
             });
+            let target = target.as_ref();
             engine.interp.gc_collect();
-            assert!(!crate::gc_test::alive(&target));
+            assert!(!crate::gc_test::alive(target));
             let mut first = WeakMetadata::default();
             let mut second = WeakMetadata::default();
             first.subscribe(target.clone(), Subscriber::WeakRef(1));
             first.subscribe(target.clone(), Subscriber::WeakRef(2));
             second.subscribe(target.clone(), Subscriber::WeakRef(3));
-            crate::value::observe_weak_target(&target, &second.deaths);
+            crate::value::observe_weak_target(target, &second.deaths);
             assert_eq!(first.deaths.pending_len(), 1);
             assert_eq!(second.deaths.pending_len(), 1);
             first.unsubscribe(target.key(), Subscriber::WeakRef(1));
@@ -667,7 +669,8 @@ mod tests {
         let mut engine = Engine::new();
         let calls = Rc::new(Cell::new(0));
         // The target's strong handles live only in this helper frame (the collector scans the
-        // stack).
+        // stack). Keep the weak token itself off the scanned stack too: inactive enum
+        // payload words can contain an old cell address.
         let (target, owner) = crate::gc_test::in_frame(|| {
             let value = Value::Obj(Object::new(None));
             let target = WeakTarget::of(&value).unwrap();
@@ -681,15 +684,16 @@ mod tests {
                 calls: calls.clone(),
                 held: Some(held),
             });
-            (target, owner)
+            (Box::new(target), owner)
         });
+        let target = target.as_ref();
         engine.interp.host_state.register_gc::<JobRoots>();
         let queue = engine.interp.weak_metadata.deaths.clone();
         engine.interp.gc_weak_metadata_safepoint(true);
         assert_eq!(calls.get(), 0);
         engine.interp.gc_collect();
         assert!(
-            crate::gc_test::alive(&target),
+            crate::gc_test::alive(target),
             "safepoints do not end synchronous work"
         );
         assert_eq!(engine.interp.kept_alive.len(), 1);
@@ -698,7 +702,7 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert!(engine.interp.kept_alive.is_empty());
         engine.interp.gc_collect();
-        assert!(!crate::gc_test::alive(&target));
+        assert!(!crate::gc_test::alive(target));
         assert!(engine.interp.weak_refs[&(Gc::as_ptr(&owner) as usize)].is_none());
         assert_eq!(queue.pending_len(), 0);
         // Even an entirely empty subsequent checkpoint must notify the host exactly once.
@@ -970,17 +974,19 @@ mod tests {
     fn weak_metadata_kept_target_and_owner_retirement_preserve_job_semantics() {
         let mut engine = Engine::new();
         // The target's strong handles live only in this helper frame (the collector scans the
-        // stack).
+        // stack). Keep the weak token itself off the scanned stack too: inactive enum
+        // payload words can contain an old cell address.
         let (weak, owner) = crate::gc_test::in_frame(|| {
             let target = Value::Obj(Object::new(None));
             let weak = WeakTarget::of(&target).unwrap();
             let owner = reference(&mut engine.interp, &weak);
             engine.interp.kept_alive.push(target);
-            (weak, owner)
+            (Box::new(weak), owner)
         });
+        let weak = weak.as_ref();
         engine.interp.gc_collect();
         assert!(
-            crate::gc_test::alive(&weak),
+            crate::gc_test::alive(weak),
             "same-job KeptAlive target was cleared"
         );
         engine.interp.clear_kept_objects();

@@ -1,8 +1,7 @@
-//! Owned execution storage. JavaScript abstract operations and host APIs still consume `Value`;
-//! persistent local/operand owners use `PackedValue` in both the VM and native backends. Local
-//! cells are shared during execution so scoped parameter aliases can replace their owning
-//! words through Cell, without an overlapping exclusive slice borrow. Only actual argument
-//! lists cross the public wide-Value API; whole activations are never widened.
+//! Canonical execution words and scoped read-only argument loans. Mutable local slots use
+//! Cell so parameter aliases can replace words without an overlapping exclusive slice loan.
+//! Only immutable evaluated argument windows may be viewed as Value slices; Cell-backed
+//! slots and live property storage must first be copied to such a window.
 
 use crate::value::{PackedValue, Value};
 use std::cell::Cell;
@@ -39,44 +38,43 @@ impl StoredValue for PackedValue {
     }
     #[inline]
     fn with_values<R>(values: &[Self], f: impl FnOnce(&[Value]) -> R) -> R {
-        // Decode only the actual argument list, never a whole activation. Common arities stay
-        // on the Rust stack; each temporary owns its handle across arbitrary JS/GC reentry.
-        match values {
-            [] => return f(&[]),
-            [a] => return f(&[a.unpack()]),
-            [a, b] => return f(&[a.unpack(), b.unpack()]),
-            [a, b, c] => return f(&[a.unpack(), b.unpack(), c.unpack()]),
-            [a, b, c, d] => return f(&[a.unpack(), b.unpack(), c.unpack(), d.unpack()]),
-            _ => {}
-        }
-        let arguments: Vec<Value> = values.iter().map(PackedValue::unpack).collect();
-        f(&arguments)
+        f(values_from_words(values))
     }
 }
 
-/// Move `argc` owned packed words starting at `args` into wide values for the duration of `f`
-/// (the caller forgets the words). Common arities stay on the Rust stack.
+/// Borrow an immutable evaluated operand window as canonical execution values. Both types
+/// are transparent wrappers over the same validated eight-byte word. This function cannot
+/// accept Cell-backed mutable slots or property words: callers must snapshot those first.
+#[inline]
+pub(crate) fn values_from_words(words: &[PackedValue]) -> &[Value] {
+    // SAFETY: the two transparent wrappers have identical layout, validity, and thread
+    // affinity. The shared input loan rules out writes and storage reuse for the output's life.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<Value>(), words.len()) }
+}
+
+/// The inverse read-only view, retaining the original evaluated argument allocation.
+#[inline]
+pub(crate) fn words_from_values(values: &[Value]) -> &[PackedValue] {
+    // SAFETY: Value is a transparent PackedValue; this loan grants no mutable access.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<PackedValue>(), values.len()) }
+}
+
+/// Loan canonical argument words for the complete operation, including any post-call polls
+/// and tail calls performed by `f`. The caller retires its window only after this returns.
 ///
 /// # Safety
-/// `args..args + argc` must be initialized, owned words that the caller never reads or drops
-/// again.
-pub(crate) unsafe fn with_moved_values<R>(
-    args: *mut PackedValue,
+/// `args` must be aligned and non-null even when `argc` is zero. `args..args + argc` must be
+/// initialized execution words in an immutable evaluated argument window whose allocation is
+/// neither modified, pooled nor reused until `f` returns. Production empty windows come from
+/// Rust slices or the initialized native stack and retain that canonical empty-slice address.
+#[inline]
+pub(crate) unsafe fn with_borrowed_values<R>(
+    args: *const PackedValue,
     argc: usize,
     f: impl FnOnce(&[Value]) -> R,
 ) -> R {
-    let take = |k: usize| unsafe { args.add(k).read() }.into_value();
-    match argc {
-        0 => f(&[]),
-        1 => f(&[take(0)]),
-        2 => f(&[take(0), take(1)]),
-        3 => f(&[take(0), take(1), take(2)]),
-        4 => f(&[take(0), take(1), take(2), take(3)]),
-        _ => {
-            let values: Vec<Value> = (0..argc).map(take).collect();
-            f(&values)
-        }
-    }
+    let words = unsafe { std::slice::from_raw_parts(args, argc) };
+    f(values_from_words(words))
 }
 
 pub(crate) trait SlotAccess {
@@ -211,7 +209,8 @@ impl<S: StoredValue> ValueStack<S> {
 }
 
 // These raw transfers only connect native code to the same representation of the VM adapter.
-// There is no cast from packed owners to Value. Capacity/initialization ownership is the caller's.
+// Read-only Value views exist only for evaluated operand windows; Cell slots remain separate.
+// Capacity and initialization of raw native storage are the caller's responsibility.
 impl<S: StoredValue> ValueStack<S> {
     pub(crate) fn as_mut_ptr(&mut self) -> *mut S {
         self.0.as_mut_ptr()
@@ -261,41 +260,6 @@ impl CallArgs<'_> {
                 .iter()
                 .map(PackedValue::unpack)
                 .collect(),
-        }
-    }
-}
-
-/// A bounded argument-boundary decode, never an activation conversion. Most JS/native calls
-/// fit four arguments and need no heap allocation; all temporary handles remain rooted until
-/// the called operation returns or throws.
-pub(crate) enum DecodedArgs {
-    Inline { values: [Value; 4], len: usize },
-    Heap(Vec<Value>),
-}
-
-impl DecodedArgs {
-    pub(crate) fn new(arguments: &[PackedValue]) -> Self {
-        if arguments.len() <= 4 {
-            let mut values = std::array::from_fn(|_| Value::Undefined);
-            for (value, argument) in values.iter_mut().zip(arguments) {
-                *value = argument.unpack();
-            }
-            Self::Inline {
-                values,
-                len: arguments.len(),
-            }
-        } else {
-            Self::Heap(arguments.iter().map(PackedValue::unpack).collect())
-        }
-    }
-}
-
-impl std::ops::Deref for DecodedArgs {
-    type Target = [Value];
-    fn deref(&self) -> &[Value] {
-        match self {
-            Self::Inline { values, len } => &values[..*len],
-            Self::Heap(values) => values,
         }
     }
 }
@@ -364,25 +328,40 @@ mod tests {
         assert!(matches!((slots.read_value(0)).view(), ValueView::Undefined));
     }
 
-    /// Decoding an argument list makes one Value per argument, on the Rust stack up to four,
-    /// each the argument's object, and leaves the words as they were. The words keep
-    /// their bits through the decode, and neither the decode nor the words have anything to
-    /// release.
+    /// Even an empty loan retains the canonical window address; no substitute slice or
+    /// decoded argument storage is introduced.
     #[test]
-    fn compact_storage_decodes_only_argument_owners_with_exact_lifetime() {
+    fn empty_argument_loans_keep_the_interior_canonical_window_address() {
+        let words = [PackedValue::pack(Value::Num(1.0)); 4];
+        let empty = &words[2..2];
+        assert_ne!(empty.as_ptr(), [].as_ptr());
+        // SAFETY: the zero-length interior slice is aligned/non-null and its array stays live.
+        unsafe {
+            with_borrowed_values(empty.as_ptr(), 0, |values| {
+                assert!(values.is_empty());
+                assert_eq!(values.as_ptr().cast::<PackedValue>(), empty.as_ptr());
+            })
+        };
+        assert_eq!(
+            values_from_words(empty).as_ptr().cast::<PackedValue>(),
+            empty.as_ptr()
+        );
+    }
+
+    #[test]
+    fn compact_storage_loans_the_original_argument_window_without_copying() {
         let object = crate::value::Object::new(None);
         let word = PackedValue::pack(Value::Obj(object.clone())).bits();
         for count in 0..=8 {
             let packed: Vec<_> = (0..count)
                 .map(|_| PackedValue::pack(Value::Obj(object.clone())))
                 .collect();
-            let decoded = DecodedArgs::new(&packed);
+            let decoded = values_from_words(&packed);
             assert_eq!(decoded.len(), count);
-            assert!(matches!(&decoded, DecodedArgs::Inline { .. }) == (count <= 4));
+            assert_eq!(decoded.as_ptr().cast::<PackedValue>(), packed.as_ptr());
             assert!(decoded
                 .iter()
                 .all(|value| matches!((value).view(), ValueView::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object))));
-            drop(decoded);
             assert!(packed.iter().all(|packed| packed.bits() == word));
             drop(packed);
         }

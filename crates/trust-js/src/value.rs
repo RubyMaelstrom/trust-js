@@ -41,7 +41,7 @@ pub(crate) use crate::gc_handle::{Gc, WeakGc};
 
 /// A native (Rust-implemented) function. It can only throw (via `Err`), never break/return/continue,
 /// so a plain `Result<Value, Value>` (Err = the thrown value) is the whole contract. An embedder's
-/// `embed::NativeFn` is the same machine function over the scoped types (`scope::native_fn`).
+/// callback retains its own scoped signature and maps the Result at a typed boundary.
 pub(crate) type NativeFn = fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 
 /// One identity-bearing allocation retained below a data-carrying native callable.
@@ -125,89 +125,139 @@ impl NativeCaptures {
     }
 }
 
-// One declaration pins both sides of Value::view: adding or changing a variant cannot
-// silently create a same-size enum with an invalid view discriminant or payload type.
-macro_rules! define_wide_values {
-    ($(#[$value_doc:meta])* $default:ident = $zero:literal;
-        $($(#[$variant_doc:meta])* $variant:ident $(($payload:ty))? = $tag:literal,)*) => {
-        $(#[$value_doc])*
-        #[derive(Clone, Copy, Default)]
-        #[repr(u64)]
-        // Storage payloads are read through the identity view, rather than enum patterns.
-        #[allow(dead_code)]
-        pub(crate) enum Value {
-            #[default]
-            $default = $zero,
-            $($(#[$variant_doc])* $variant $(($payload))? = $tag,)*
-        }
+/// The engine's thread-bound execution word. Its transparent representation is shared with
+/// PackedValue; match views are decoded only while inspecting a value. Constructors retain
+/// the former enum spellings, and every Number constructor canonicalizes NaN immediately.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct Value(PackedValue);
 
-        /// An ephemeral match view of an engine value. The shared declaration fixes the
-        /// same representation while Value remains wide; distinct types reject view escapes.
-        #[derive(Clone, Copy)]
-        #[repr(u64)]
-        // Constructed by Value::view's representation identity, rather than variant expressions.
-        #[allow(dead_code)]
-        pub(crate) enum ValueView {
-            $default = $zero,
-            $($(#[$variant_doc])* $variant $(($payload))? = $tag,)*
-        }
-    };
-}
-
-define_wide_values! {
-    /// The engine value. `repr(u64)` with fixed discriminants gives it a *defined* layout — a full
-    /// tag word at offset 0 and every payload (including Bool's byte) at offset 8 — which the JIT's
-    /// inline fast paths read directly (see `jit::layout` for the assertions). A word-sized tag keeps
-    /// every move of a Value two aligned word copies: with a byte tag, compilers split moves at the
-    /// Bool byte and read the result back across two earlier stores, defeating store forwarding.
-    /// Tags 0..=4 are the scalar variants; the others hold a cell's address, which copies freely (a
-    /// handle holds no count). The low byte of the tag word is the discriminant, so byte-wide tag
-    /// reads stay valid.
-    Undefined = 0;
-    /// The spec's EMPTY completion marker: produced only by *statement* evaluation (declarations
-    /// and other value-less statements) so completion values thread per UpdateEmpty. Never a JS
-    /// value — every engine boundary converts it to `Undefined` before a value escapes.
+/// An ephemeral decoded match view. This enum is never used as execution storage.
+#[derive(Clone, Copy)]
+#[repr(u64)]
+pub(crate) enum ValueView {
+    Undefined = 0,
     Empty = 1,
     Null = 2,
     Bool(bool) = 3,
     Num(f64) = 4,
-    /// Arbitrary-precision BigInt (sign plus little-endian base-2^64 magnitude).
     BigInt(crate::bigint::JsBigInt) = 5,
-    /// A string in the engine representation: UTF-8 in which a lone surrogate is the scalar
-    /// U+10F800 + (unit − 0xD800) and a character in U+10F800..=U+10FFFF is its surrogate pair
-    /// of such scalars. Embedders exchange text with [`Value::str`], [`Value::from_string`],
-    /// [`Value::as_text`] and `Ctx::coerce_string`, code units with [`Value::from_utf16`] and
-    /// `Ctx::coerce_utf16`, or engine text with [`Value::from_engine_text`],
-    /// [`Value::as_engine_text`] and `Ctx::coerce_engine_text`, rather than reading or building
-    /// this payload directly.
     Str(crate::lstr::LStr) = 6,
     Sym(SymbolRef) = 7,
     Obj(Gc) = 8,
 }
 
+impl Default for Value {
+    fn default() -> Self {
+        Self::Undefined
+    }
+}
+
 const _: () = {
-    assert!(std::mem::size_of::<Value>() == std::mem::size_of::<ValueView>());
-    assert!(std::mem::align_of::<Value>() == std::mem::align_of::<ValueView>());
+    assert!(std::mem::size_of::<Value>() == 8);
+    assert!(std::mem::align_of::<Value>() == std::mem::align_of::<PackedValue>());
+    assert!(!std::mem::needs_drop::<Value>());
 };
 
+#[allow(non_snake_case, non_upper_case_globals)]
 impl Value {
-    #[inline(always)]
-    pub(crate) fn view(&self) -> ValueView {
-        // SAFETY: define_wide_values emits two distinct repr(u64) enums from the same
-        // discriminants and payload types. The adjacent assertions pin their size and alignment.
-        unsafe { std::mem::transmute::<Value, ValueView>(*self) }
+    pub(crate) const Undefined: Self = Self(PackedValue(PACK_UNDEFINED, std::marker::PhantomData));
+    /// The internal completion marker. Public value boundaries normalize it to undefined.
+    pub(crate) const Empty: Self = Self(PackedValue(PACK_EMPTY, std::marker::PhantomData));
+    pub(crate) const Null: Self = Self(PackedValue(PACK_NULL, std::marker::PhantomData));
+
+    #[inline]
+    pub(crate) const fn Bool(value: bool) -> Self {
+        Self(PackedValue(
+            PACK_BOOL | value as u64,
+            std::marker::PhantomData,
+        ))
     }
 
-    /// The cell this value holds, as a GC edge: an object or a payload cell.
+    /// ECMA-262 Number Type: all IEEE NaNs denote one language NaN. This leaves backing
+    /// ArrayBuffer bytes and Wasm's internal floating payloads untouched.
+    #[inline]
+    pub(crate) const fn Num(value: f64) -> Self {
+        let bits = if value.is_nan() {
+            PACK_CANON_NAN
+        } else {
+            value.to_bits()
+        };
+        Self(PackedValue(bits, std::marker::PhantomData))
+    }
+
+    #[inline]
+    pub(crate) fn BigInt(value: crate::bigint::JsBigInt) -> Self {
+        Self(PackedValue(
+            PACK_BIGINT | unsafe { PackedValue::into_word(value) },
+            std::marker::PhantomData,
+        ))
+    }
+
+    /// UTF-8 engine text, with a lone UTF-16 surrogate represented by the scalar
+    /// U+10F800 + (unit - 0xD800). Use the text/UTF-16 conversion methods at host boundaries;
+    /// this constructor receives an already encoded immutable string-cell handle.
+    #[inline]
+    pub(crate) fn Str(value: crate::lstr::LStr) -> Self {
+        Self(PackedValue(
+            PACK_STR | unsafe { PackedValue::into_word(value) },
+            std::marker::PhantomData,
+        ))
+    }
+
+    #[inline]
+    pub(crate) fn Sym(value: SymbolRef) -> Self {
+        Self(PackedValue(
+            PACK_SYM | unsafe { PackedValue::into_word(value) },
+            std::marker::PhantomData,
+        ))
+    }
+
+    #[inline]
+    pub(crate) fn Obj(value: Gc) -> Self {
+        Self(PackedValue(
+            PACK_OBJ | unsafe { PackedValue::into_word(value) },
+            std::marker::PhantomData,
+        ))
+    }
+
+    /// Reconstruct an execution value from its bits.
+    ///
+    /// # Safety
+    /// The word must be a valid execution encoding. A reference payload must name the start
+    /// of a live cell of the encoded kind in the owning Agent. Bit validation cannot establish
+    /// cell liveness, type, ownership, or provenance, and never admits a property-only word.
+    #[inline]
+    pub(crate) unsafe fn from_bits(bits: u64) -> Self {
+        Self(PackedValue::from_bits(bits))
+    }
+
+    #[inline]
+    pub(crate) const fn bits(self) -> u64 {
+        self.0 .0
+    }
+
+    #[inline(always)]
+    pub(crate) fn view(&self) -> ValueView {
+        match self.0.tag() {
+            PACK_UNDEFINED => ValueView::Undefined,
+            PACK_EMPTY => ValueView::Empty,
+            PACK_NULL => ValueView::Null,
+            PACK_BOOL => ValueView::Bool(self.0 .0 & 1 != 0),
+            PACK_BIGINT => ValueView::BigInt(unsafe { self.0.read_word() }),
+            PACK_STR => ValueView::Str(unsafe { self.0.read_word() }),
+            PACK_SYM => ValueView::Sym(unsafe { self.0.read_word() }),
+            PACK_OBJ => ValueView::Obj(unsafe { self.0.read_word() }),
+            PACK_LAZY_PROTO => unreachable!("a deferred prototype reached execution storage"),
+            _ => ValueView::Num(f64::from_bits(self.0 .0)),
+        }
+    }
+
+    /// The untagged cell address held as a strong GC edge. Scalar words are never roots.
     #[inline]
     pub(crate) fn cell_word(&self) -> Option<u64> {
-        match &(self).view() {
-            ValueView::Obj(object) => Some(Gc::as_ptr(object) as u64),
-            ValueView::BigInt(bigint) => Some(bigint.cell_word()),
-            ValueView::Sym(symbol) => Some(symbol_identity(symbol) as u64),
-            ValueView::Str(string) => Some(string.cell_word()),
-            _ => None,
-        }
+        matches!(self.0.tag(), PACK_BIGINT | PACK_STR | PACK_SYM | PACK_OBJ)
+            .then_some(self.0 .0 & PACK_PAYLOAD)
     }
 }
 
@@ -234,9 +284,8 @@ pub(crate) fn trace_nullish_property(site: &str, key: &Value) {
     eprintln!("TRust JS: nullish computed-property read site={site} key={key}");
 }
 
-// NaN-boxed storage used for long-lived property values. Execution still uses the ergonomic
-// `Value` enum while the migration is staged; packing at the heap boundary cuts each ordinary
-// property by eight bytes without coupling the experiment to every interpreter pattern match.
+// The execution-storage word. Value is transparent over this same representation; the two
+// nominal types keep raw native/operand transfers distinct from decoded match views.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub(crate) struct PackedValue(u64, std::marker::PhantomData<*const ()>);
@@ -282,20 +331,7 @@ impl PackedValue {
     }
 
     pub(crate) fn scalar_bits(value: &Value) -> Option<u64> {
-        match &(value).view() {
-            ValueView::Undefined => Some(PACK_UNDEFINED),
-            ValueView::Empty => Some(PACK_EMPTY),
-            ValueView::Null => Some(PACK_NULL),
-            ValueView::Bool(value) => Some(PACK_BOOL | u64::from(*value)),
-            ValueView::Num(value) => Some(if value.is_nan() {
-                PACK_CANON_NAN
-            } else {
-                value.to_bits()
-            }),
-            ValueView::BigInt(_) | ValueView::Str(_) | ValueView::Sym(_) | ValueView::Obj(_) => {
-                None
-            }
-        }
+        value.cell_word().is_none().then_some(value.bits())
     }
 
     #[inline]
@@ -382,7 +418,24 @@ impl PackedValue {
             PACK_LAZY_PROTO,
             "a deferred prototype's word copied without materializing"
         );
+        debug_assert!(
+            Self::valid_bits(bits),
+            "invalid execution word {bits:#018x}"
+        );
         Self(bits, std::marker::PhantomData)
+    }
+
+    /// Encoding validation only: reference liveness, exact cell type and ownership remain
+    /// the raw constructor's caller contract. No heap borrow is taken during validation.
+    const fn valid_bits(bits: u64) -> bool {
+        let payload = bits & PACK_PAYLOAD;
+        match bits & !PACK_PAYLOAD {
+            PACK_UNDEFINED | PACK_EMPTY | PACK_NULL => payload == 0,
+            PACK_BOOL => payload <= 1,
+            PACK_BIGINT | PACK_STR | PACK_SYM | PACK_OBJ => payload != 0 && payload & 7 == 0,
+            PACK_LAZY_PROTO => false,
+            _ => !f64::from_bits(bits).is_nan() || bits == PACK_CANON_NAN,
+        }
     }
 
     unsafe fn read_word<T: Copy>(&self) -> T {
@@ -403,47 +456,16 @@ impl PackedValue {
         }
     }
 
-    unsafe fn clone_word<T: Copy>(&self) -> T {
-        let value = std::mem::ManuallyDrop::new(unsafe { self.read_word::<T>() });
-        T::clone(&value)
-    }
-
     #[inline]
-    pub(crate) fn pack(value: Value) -> PackedValue {
-        let bits = match (value).view() {
-            ValueView::Undefined => PACK_UNDEFINED,
-            ValueView::Empty => PACK_EMPTY,
-            ValueView::Null => PACK_NULL,
-            ValueView::Bool(v) => PACK_BOOL | v as u64,
-            ValueView::Num(v) => {
-                if v.is_nan() {
-                    PACK_CANON_NAN
-                } else {
-                    v.to_bits()
-                }
-            }
-            ValueView::BigInt(v) => PACK_BIGINT | unsafe { Self::into_word(v) },
-            ValueView::Str(v) => PACK_STR | unsafe { Self::into_word(v) },
-            ValueView::Sym(v) => PACK_SYM | unsafe { Self::into_word(v) },
-            ValueView::Obj(v) => PACK_OBJ | unsafe { Self::into_word(v) },
-        };
-        Self::from_bits(bits)
+    pub(crate) const fn pack(value: Value) -> PackedValue {
+        value.0
     }
 
     #[inline]
     pub(crate) fn unpack(&self) -> Value {
-        match self.tag() {
-            PACK_UNDEFINED => Value::Undefined,
-            PACK_EMPTY => Value::Empty,
-            PACK_NULL => Value::Null,
-            PACK_BOOL => Value::Bool(self.0 & 1 != 0),
-            PACK_BIGINT => Value::BigInt(unsafe { self.clone_word() }),
-            PACK_STR => Value::Str(unsafe { self.clone_word() }),
-            PACK_SYM => Value::Sym(unsafe { self.clone_word() }),
-            PACK_OBJ => Value::Obj(unsafe { self.clone_word() }),
-            PACK_LAZY_PROTO => unreachable!("a deferred prototype reached execution storage"),
-            _ => Value::Num(f64::from_bits(self.0)),
-        }
+        // SAFETY: typed execution storage contains valid, live execution words. Debug builds
+        // validate encodings before exposing a handle; release copies this transparent word.
+        unsafe { Value::from_bits(self.0) }
     }
 
     /// Lend the ordinary object edge this execution word holds. Property-only deferred
@@ -565,7 +587,7 @@ mod packed_value_tests {
         copy::<PackedValue>();
         copy::<crate::lstr::LStr>();
         copy::<crate::bigint::JsBigInt>();
-        assert_eq!(std::mem::size_of::<Value>(), 16);
+        assert_eq!(std::mem::size_of::<Value>(), 8);
         assert_eq!(std::mem::size_of::<ValueView>(), 16);
         assert_eq!(std::mem::size_of::<PackedValue>(), 8);
         assert_eq!(std::mem::size_of::<Cell<PackedValue>>(), 8);
@@ -630,7 +652,7 @@ mod packed_value_tests {
             f64::from_bits(0xfff8_0123_4567_89ab),
         ] {
             assert!(
-                matches!(Value::Num(number).view(), ValueView::Num(actual) if actual.to_bits() == number.to_bits())
+                matches!(Value::Num(number).view(), ValueView::Num(actual) if actual.to_bits() == if number.is_nan() { PACK_CANON_NAN } else { number.to_bits() })
             );
         }
         let mut interp = crate::interpreter::Interp::new();
@@ -649,6 +671,88 @@ mod packed_value_tests {
         let object = Object::new(None);
         assert!(
             matches!(Value::Obj(object).view(), ValueView::Obj(actual) if Gc::ptr_eq(&actual, &object))
+        );
+    }
+
+    #[test]
+    fn number_constructors_canonicalize_every_reserved_nan_prefix() {
+        for high in (0x7ff0u64..=0x7fff).chain(0xfff0..=0xffff) {
+            for payload in [1, 0x8000_0000_0000, PACK_PAYLOAD] {
+                let number = f64::from_bits(high << 48 | payload);
+                assert!(number.is_nan());
+                let value = Value::Num(number);
+                assert_eq!(value.bits(), PACK_CANON_NAN);
+                assert!(matches!(value.view(), ValueView::Num(n) if n.is_nan()));
+            }
+        }
+        for number in [
+            0.0,
+            -0.0,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            f64::MAX,
+            f64::MIN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(Value::Num(number).bits(), number.to_bits());
+        }
+    }
+
+    /// Migrated from the dormant 32-bit tagged-handle scaffold. Production references use
+    /// 48-bit cell addresses: validate null/alignment, never impose that old 32-bit limit.
+    #[test]
+    fn raw_execution_encoding_rejects_bad_scalars_nan_and_reference_payloads() {
+        for valid in [
+            PACK_UNDEFINED,
+            PACK_EMPTY,
+            PACK_NULL,
+            PACK_BOOL,
+            PACK_BOOL | 1,
+            PACK_CANON_NAN,
+            0.0f64.to_bits(),
+            (-0.0f64).to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+        ] {
+            assert!(PackedValue::valid_bits(valid));
+            assert_eq!(unsafe { Value::from_bits(valid) }.bits(), valid);
+        }
+        for invalid in [
+            PACK_UNDEFINED | 1,
+            PACK_EMPTY | 1,
+            PACK_NULL | 1,
+            PACK_BOOL | 2,
+            PACK_OBJ,
+            PACK_STR,
+            PACK_BIGINT,
+            PACK_SYM,
+            PACK_OBJ | 3,
+            PACK_STR | 1,
+            PACK_BIGINT | 7,
+            PACK_SYM | 5,
+            PACK_CANON_NAN | 1,
+            0xfff8_0000_0000_0000,
+            PACK_LAZY_PROTO | 8,
+            0xfffb_0000_0000_0001,
+        ] {
+            assert!(!PackedValue::valid_bits(invalid), "{invalid:#018x}");
+            #[cfg(debug_assertions)]
+            assert!(std::panic::catch_unwind(|| {
+                // The checked constructor must reject before constructing any cell handle.
+                let _ = unsafe { Value::from_bits(invalid) };
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn cell_payload_fit_remains_a_release_assertion_and_accepts_48_bits() {
+        let wide = 0x0000_1234_5678_9000usize;
+        assert_eq!(unsafe { PackedValue::into_word(wide) }, wide as u64);
+        assert!(
+            std::panic::catch_unwind(|| unsafe { PackedValue::into_word(1usize << 48) }).is_err()
         );
     }
 
@@ -717,51 +821,28 @@ mod packed_value_tests {
         assert!(replacement_weak.live_ptr().is_none());
     }
 
-    /// The JIT backends read wide Values as (tag word, payload word) and a Bool as bit 0 of the
-    /// payload word. Pin that representation.
+    /// Execution values and packed operands are the same complete canonical word. Decoded
+    /// views remain separate enums and are never used to infer execution payload offsets.
     #[test]
-    fn wide_value_layout_is_tag_word_then_payload_word() {
-        assert_eq!(std::mem::size_of::<Value>(), 16);
+    fn execution_value_layout_is_one_canonical_word() {
+        assert_eq!(std::mem::size_of::<Value>(), 8);
+        assert_eq!(std::mem::align_of::<Value>(), 8);
         assert_eq!(std::mem::size_of::<Option<Value>>(), 16);
-        // Unit variants have no initialized payload; a Bool initializes only its payload
-        // byte. Read those initialized fields, never the union's padding as a second u64.
-        let tag = |value: &Value| unsafe { std::ptr::from_ref(value).cast::<u64>().read() };
-        assert_eq!(tag(&Value::Undefined), 0);
-        assert_eq!(tag(&Value::Empty), 1);
-        assert_eq!(tag(&Value::Null), 2);
+        let word = |value: &Value| unsafe { std::ptr::from_ref(value).cast::<u64>().read() };
+        assert_eq!(word(&Value::Undefined), PACK_UNDEFINED);
+        assert_eq!(word(&Value::Empty), PACK_EMPTY);
+        assert_eq!(word(&Value::Null), PACK_NULL);
         for boolean in [false, true] {
-            let value = Value::Bool(boolean);
-            assert_eq!(tag(&value), 3);
-            assert_eq!(
-                unsafe { std::ptr::from_ref(&value).cast::<u8>().add(8).read() },
-                u8::from(boolean)
-            );
+            assert_eq!(word(&Value::Bool(boolean)), PACK_BOOL | u64::from(boolean));
         }
-        let number = Value::Num(1.5);
-        assert_eq!(tag(&number), 4);
-        assert_eq!(
-            unsafe {
-                (&number as *const Value as *const u8)
-                    .add(8)
-                    .cast::<f64>()
-                    .read()
-            },
-            1.5
-        );
-        // The Obj payload is the stored handle word (the cell address); the Object sits
-        // `obj_from_cell` bytes in.
+        assert_eq!(word(&Value::Num(1.5)), 1.5f64.to_bits());
         let object = Object::new(None);
         let layout = jit_layout(&object);
-        let value = Value::Obj(object.clone());
-        assert_eq!(tag(&value), 8);
+        let value = Value::Obj(object);
+        assert_eq!(word(&value) & !PACK_PAYLOAD, PACK_OBJ);
         assert_eq!(
-            unsafe {
-                (&value as *const Value as *const u8)
-                    .add(8)
-                    .cast::<usize>()
-                    .read()
-            } + layout.obj_from_cell,
-            object.object_ptr() as usize
+            (word(&value) & PACK_PAYLOAD) as usize + layout.obj_from_cell,
+            object.object_ptr() as usize,
         );
     }
 
@@ -1879,13 +1960,39 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     }
     let native: NativeFn = call_layout_probe;
     let native_callable = Callable::Native(native);
-    let native_words: [usize; 2] =
-        unsafe { std::mem::transmute_copy::<Callable, [usize; 2]>(&native_callable) };
+    // Callable's discriminant is one initialized byte; the rest of its first word is padding.
+    // Read only that byte and its initialized pointer payload, never the padding as a usize.
+    let callable_words = |call: &Callable| {
+        let bytes = std::ptr::from_ref(call).cast::<u8>();
+        unsafe {
+            (
+                bytes.read(),
+                bytes
+                    .add(std::mem::size_of::<usize>())
+                    .cast::<usize>()
+                    .read(),
+            )
+        }
+    };
+    let native_words = callable_words(&native_callable);
     let callable_ok = std::mem::size_of::<Callable>() == 16
-        && native_words[0] & 0xff == 1
-        && native_words[1] == native as usize
+        && native_words.0 == 1
+        && native_words.1 == native as usize
         && std::mem::align_of::<UserCallable>() == 8
         && std::mem::align_of::<Function>() <= 8;
+    #[cfg(feature = "embed")]
+    let callable_ok = {
+        fn scoped_probe<'s>(
+            _: &mut crate::scope::Ctx<'s>,
+            _: crate::scope::Value<'s>,
+            _: &[crate::scope::Value<'s>],
+        ) -> Result<crate::scope::Value<'s>, crate::scope::Value<'s>> {
+            Ok(crate::scope::Value::Undefined)
+        }
+        let function: crate::scope::NativeFn = scoped_probe;
+        let words = callable_words(&Callable::ScopedNative(function));
+        callable_ok && words.0 == 13 && words.1 == function as usize
+    };
     let parsed = crate::parser::parse_script("function probe(){}", false).ok();
     let probe_func = match parsed.as_deref() {
         Some([crate::ast::Stmt::FuncDecl(func)]) => Some(func.clone()),
@@ -1895,12 +2002,11 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         Some(func) => {
             let realm = obj_addr; // any identity the probe can recognize
             let closure = Callable::user(func.clone(), probe_env.clone(), realm);
-            let words: [usize; 2] =
-                unsafe { std::mem::transmute_copy::<Callable, [usize; 2]>(&closure) };
+            let words = callable_words(&closure);
             let Callable::User(user) = &closure else {
                 unreachable!("Callable::user makes a user callable")
             };
-            let payload = words[1];
+            let payload = words.1;
             let user_data_off = (user_fn_ptr(user) as usize).wrapping_sub(payload);
             let func_word = unsafe { std::mem::transmute_copy::<Rc<Function>, usize>(&func) };
             let func_data_off = (Rc::as_ptr(&func) as usize).wrapping_sub(func_word);
@@ -1908,7 +2014,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             let user_env = user_data_off + offset_of!(UserCallable, env);
             let user_realm = user_data_off + offset_of!(UserCallable, realm);
             let read = |off: usize| unsafe { *((payload + off) as *const usize) };
-            let ok = words[0] & 0xff == CALLABLE_USER_TAG as usize
+            let ok = words.0 == CALLABLE_USER_TAG
                 && user_data_off < 256
                 && func_data_off < 256
                 && read(user_func) == func_word
@@ -2202,6 +2308,10 @@ pub enum Callable {
     /// A decorator's private access functions use PrivateGet/PrivateSet, not [[Get]]/[[Set]].
     PrivatePropGet(Rc<Rc<str>>) = 11,
     PrivatePropSet(Rc<Rc<str>>) = 12,
+    /// A host callback called through its actual scoped Rust signature. Its result is mapped
+    /// explicitly at the public boundary, never reinterpreted as an engine-native Result.
+    #[cfg(feature = "embed")]
+    ScopedNative(crate::scope::NativeFn) = 13,
 }
 
 /// The discriminant of [`Callable::User`] (see the enum's layout note).
@@ -2229,6 +2339,11 @@ pub(crate) enum NativeCallableBody {
     Opaque(Rc<NativeClosure>),
     Captured {
         function: NativeCaptureFn,
+        captures: Box<[Value]>,
+    },
+    #[cfg(feature = "embed")]
+    ScopedCaptured {
+        function: crate::scope::NativeCaptureFn,
         captures: Box<[Value]>,
     },
     /// A closure with engine-owned captures (S6 step 11b).
@@ -2332,6 +2447,17 @@ pub struct WrappedCrossCallable {
 }
 
 impl Callable {
+    /// Native capability, independent of the Rust callback signature. Intrinsic identity
+    /// recognizers must continue to match only `Native`, whose type is the engine signature.
+    pub(crate) fn is_native(&self) -> bool {
+        match self {
+            Self::Native(_) | Self::NativeData(_) => true,
+            #[cfg(feature = "embed")]
+            Self::ScopedNative(_) => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn user(func: Rc<Function>, env: Env, realm: usize) -> Callable {
         let runtime = match func.runtime() {
             crate::function_runtime::RuntimeLease::Primary(_) => None,
@@ -2498,6 +2624,8 @@ impl Object {
             })
             || match call {
                 Callable::None | Callable::Native(_) | Callable::User(_) => false,
+                #[cfg(feature = "embed")]
+                Callable::ScopedNative(_) => false,
                 Callable::NativeData(_)
                 | Callable::Bound(_)
                 | Callable::WrappedShadow(_)
@@ -3126,6 +3254,8 @@ impl crate::gc_trace::GcTrace for Object {
             | Callable::PropSet(_)
             | Callable::PrivatePropGet(_)
             | Callable::PrivatePropSet(_) => {}
+            #[cfg(feature = "embed")]
+            Callable::ScopedNative(_) => {}
         }
     }
 }
@@ -3181,6 +3311,12 @@ impl crate::gc_trace::GcTrace for NativeCallable {
         match &self.body {
             NativeCallableBody::Captured { captures, .. }
             | NativeCallableBody::CapturedClosure { captures, .. } => {
+                for capture in captures.iter() {
+                    sink.value(capture);
+                }
+            }
+            #[cfg(feature = "embed")]
+            NativeCallableBody::ScopedCaptured { captures, .. } => {
                 for capture in captures.iter() {
                     sink.value(capture);
                 }
@@ -6201,11 +6337,11 @@ impl Props {
         }
     }
 
-    /// Construct a dense array map directly from moved JIT stack values.
+    /// Construct a dense array by copying canonical words from a JIT argument window.
     ///
     /// # Safety
-    /// `items..items+len` contains initialized `PackedValue`s relinquished by the caller.
-    pub(crate) unsafe fn packed_array_from_raw(items: *mut PackedValue, len: usize) -> Props {
+    /// `items..items+len` contains immutable initialized execution words valid through this call.
+    pub(crate) unsafe fn packed_array_from_raw(items: *const PackedValue, len: usize) -> Props {
         Self::packed_array_properties(
             (0..len).map(|index| Property::plain_packed(unsafe { items.add(index).read() })),
         )

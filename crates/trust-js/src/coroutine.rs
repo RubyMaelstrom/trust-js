@@ -200,6 +200,7 @@ impl crate::gc_trace::GcTrace for UnavailableCoro {
 mod tests {
     use super::{Resume, Suspend, UnavailableCoro};
     use crate::bytecode::Tier;
+    use crate::value::ValueView;
     use crate::{Completion, Engine, Value};
 
     fn value(engine: &mut Engine, source: &str) -> String {
@@ -222,7 +223,7 @@ mod tests {
         let mut returned = unavailable(Value::Num(1.0));
         assert!(matches!(
             returned.resume(Resume::Return(Value::Num(2.0))),
-            Suspend::Done(Value::Num(2.0))
+            Suspend::Done(value) if matches!(value.view(), ValueView::Num(2.0))
         ));
         assert!(returned.done);
         assert!(!returned.started);
@@ -230,7 +231,7 @@ mod tests {
         let mut thrown = unavailable(Value::Num(1.0));
         assert!(matches!(
             thrown.resume(Resume::Throw(Value::Num(3.0))),
-            Suspend::Throw(Value::Num(3.0))
+            Suspend::Throw(value) if matches!(value.view(), ValueView::Num(3.0))
         ));
         assert!(thrown.done);
         assert!(!thrown.started);
@@ -238,7 +239,7 @@ mod tests {
         let mut driven = unavailable(Value::Num(4.0));
         assert!(matches!(
             driven.resume(Resume::Next(Value::Undefined)),
-            Suspend::Throw(Value::Num(4.0))
+            Suspend::Throw(value) if matches!(value.view(), ValueView::Num(4.0))
         ));
         assert!(driven.done);
         assert!(driven.started);

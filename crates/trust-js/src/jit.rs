@@ -570,6 +570,12 @@ fn record_native_op_src(
                 .get(&(*f as usize))
                 .map(String::as_str)
                 .unwrap_or(NATIVE_OP_UNKNOWN),
+            #[cfg(feature = "embed")]
+            crate::value::Callable::ScopedNative(f) => tables
+                .names
+                .get(&(*f as usize))
+                .map(String::as_str)
+                .unwrap_or(NATIVE_OP_UNKNOWN),
             _ => return,
         },
         NativeLabelSrc::Addr(addr) => tables
@@ -1827,7 +1833,7 @@ impl std::ops::Deref for JitThisView {
 
 // The activation's `this`. Rust reads and writes it only here.
 impl JitCtx {
-    /// The activation's `this` as a wide Value: the word widened.
+    /// The activation's `this` as a canonical execution Value.
     #[inline]
     pub(crate) fn this_value(&self) -> Value {
         self.this_word.unpack()
@@ -2513,14 +2519,13 @@ pub const COND_PEEK_TRUTHY: u32 = 1;
 ))]
 pub const COND_PEEK_NOT_NULLISH: u32 = 2;
 
-// The inline fast paths read Value directly: repr(u8) tag byte at offset 0, payload at
-// offset 8, 16 bytes total on 64-bit. Tags 0..=4 (Undefined/Empty/Null/Bool/Num) are trivially
-// copyable. Only 64-bit desktop JIT targets depend on this; on wasm32 `Value` is smaller.
+// The public/internal execution values and native operand words share their canonical
+// eight-byte representation. Decoded match views never participate in emitted layouts.
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-const _: () = assert!(std::mem::size_of::<Value>() == 16);
+const _: () = assert!(std::mem::size_of::<Value>() == 8);
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -12369,8 +12374,7 @@ fn emit_packed_existing_guard(
     a.b_cond(C_EQ, slow);
 }
 
-/// Encode a wide Number at `off` into x16. Other kinds stay on the checked path, keeping the
-/// per-site packed-write template compact; Number payload bits are already NaN-box compatible.
+/// Load a Number word at `off` into x16. Other kinds stay on the checked numeric path.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -17937,15 +17941,15 @@ impl JitFrame {
     }
 }
 
-/// [`run`] for the JIT→JIT fast call: takes ownership of `argc` argument packed words at `args`
-/// (moved off the caller's operand stack — the caller must NOT drop them), seeding parameter
-/// slots by move instead of clone and dropping any surplus. Only for chunks with no activation
-/// environment (`Chunk::jit_no_activation`), so the arguments have exactly one consumer.
-/// `env` is borrowed raw: the caller keeps the aliased handle alive across the run.
+/// JIT-to-JIT entry borrowing canonical argument words from the caller's immutable evaluated
+/// window. Parameter slots copy the words, and a rest parameter copies its suffix into a new
+/// Array. No part of this entry clears, mutates or releases the caller's argument storage.
+/// `env` is borrowed raw; the caller keeps its handle alive across the run.
 ///
 /// # Safety
-/// `args..args+argc` must be initialized packed owners the caller relinquishes entirely; `*env` must
-/// outlive the run.
+/// `args` must be aligned and non-null even at zero arity. `args..args+argc` must be
+/// initialized execution words in stable immutable storage retained
+/// through the complete call, its polls and tail drain. `*env` must outlive the run.
 #[cfg(any(
     all(
         target_arch = "aarch64",
@@ -17962,7 +17966,7 @@ pub(crate) unsafe fn run_moved(
     code: &JitCode,
     env: *const Env,
     this_val: JitThis,
-    args: *mut PackedValue,
+    args: *const PackedValue,
     argc: usize,
     // `chunk.jit_frame()`, precomputed by the caller (the cached call reads it from its IC).
     frame: (usize, usize),
@@ -17975,7 +17979,7 @@ pub(crate) unsafe fn run_moved(
 /// [`run_moved`]; the caller's context is left untouched.
 ///
 /// # Safety
-/// Same moved-argument and environment lifetime contract as [`run_moved`].
+/// Same immutable argument-window and environment lifetime contract as [`run_moved`].
 #[cfg(any(
     all(
         target_arch = "aarch64",
@@ -17994,7 +17998,7 @@ pub(crate) unsafe fn run_moved_shared(
     code: &JitCode,
     env: *const Env,
     this_val: JitThis,
-    args: *mut PackedValue,
+    args: *const PackedValue,
     argc: usize,
     frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
@@ -18009,10 +18013,10 @@ thread_local! {
     };
 }
 
-/// Moved-frame entry for a callee that needs a real activation environment. Decode/clone only
-/// captured parameters into that environment, then move the call's owned arguments into the
-/// fixed frame buffer. A complete Value list is needed only to materialize an `arguments` exotic
-/// before the move; ordinary captured calls require no temporary argument owners or Vec.
+/// Entry for a callee that needs a real activation environment. Copy captured parameters into
+/// that environment and canonical words into the private fixed frame buffer. The caller's
+/// immutable argument window remains available through materialization and the entire call;
+/// ordinary captured calls need no temporary decoded argument array.
 #[cfg(any(
     all(
         target_arch = "aarch64",
@@ -18029,7 +18033,7 @@ pub(crate) unsafe fn run_moved_env(
     code: &JitCode,
     definition_env: *const Env,
     this_val: JitThis,
-    args: *mut PackedValue,
+    args: *const PackedValue,
     argc: usize,
     frame: (usize, usize),
 ) -> Result<PackedValue, Abrupt> {
@@ -18076,7 +18080,7 @@ unsafe fn run_moved_inner(
     code: &JitCode,
     env: *const Env,
     this_val: JitThis,
-    args: *mut PackedValue,
+    args: *const PackedValue,
     argc: usize,
     (n_params, n_slots): (usize, usize),
     arguments: Option<(usize, Value)>,
@@ -18116,18 +18120,14 @@ unsafe fn run_moved_inner(
                 .add(k)
                 .write(Cell::new(PackedValue::pack(Value::Undefined)));
         }
-        // Surplus arguments were still moved to us: they become the rest parameter's Array
-        // (CreateArrayFromList), or are dropped.
+        // A rest parameter copies the surplus argument words into its own Array. Without
+        // rest, the caller's surplus words stay untouched until it retires the input window.
         if let Some(rest) = chunk.rest_slot {
             let array = i.make_array_from_raw(args.add(seed), argc - seed);
             std::ptr::drop_in_place(slots_ptr.add(rest as usize));
             slots_ptr
                 .add(rest as usize)
                 .write(Cell::new(PackedValue::pack(array)));
-        } else {
-            for k in seed..argc {
-                std::ptr::drop_in_place(args.add(k));
-            }
         }
         if let Some((slot, value)) = arguments {
             if slot < seed {
@@ -18193,7 +18193,7 @@ unsafe fn run_moved_oversized(
     code: &JitCode,
     env: *const Env,
     this_val: JitThis,
-    args: *mut PackedValue,
+    args: *const PackedValue,
     argc: usize,
     (n_params, n_slots): (usize, usize),
     arguments: Option<(usize, Value)>,
@@ -18217,10 +18217,6 @@ unsafe fn run_moved_oversized(
             slots_ptr
                 .add(rest as usize)
                 .write(Cell::new(PackedValue::pack(array)));
-        } else {
-            for k in seed..argc {
-                std::ptr::drop_in_place(args.add(k));
-            }
         }
         if let Some((slot, value)) = arguments {
             if slot < seed {
@@ -18338,7 +18334,7 @@ pub(crate) unsafe fn run_moved(
     _code: &JitCode,
     _env: *const Env,
     _this_val: JitThis,
-    _args: *mut PackedValue,
+    _args: *const PackedValue,
     _argc: usize,
     _frame: (usize, usize),
 ) -> Result<PackedValue, Abrupt> {
@@ -18363,7 +18359,7 @@ pub(crate) unsafe fn run_moved_shared(
     _code: &JitCode,
     _env: *const Env,
     _this_val: JitThis,
-    _args: *mut PackedValue,
+    _args: *const PackedValue,
     _argc: usize,
     _frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
@@ -18387,7 +18383,7 @@ pub(crate) unsafe fn run_moved_env(
     _code: &JitCode,
     _env: *const Env,
     _this_val: JitThis,
-    _args: *mut PackedValue,
+    _args: *const PackedValue,
     _argc: usize,
     _frame: (usize, usize),
 ) -> Result<PackedValue, Abrupt> {

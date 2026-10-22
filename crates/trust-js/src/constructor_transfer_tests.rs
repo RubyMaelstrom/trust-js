@@ -204,3 +204,98 @@ fn constructor_transfer_surplus_evaluation_duplicates_and_fallback_order() {
         );
     }
 }
+
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn simple_and_forwarded_initializers_copy_an_immutable_argument_window() {
+    // Both plans cache the global prototype/call epochs. Isolate strict per-call native
+    // counters so unrelated Engine startup/retirement cannot make a correct guard miss.
+    const CHILD: &str = "TRUST_JS_TEST_CONSTRUCTOR_ARGUMENT_LOAN_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "interpreter::constructor_transfer_tests::simple_and_forwarded_initializers_copy_an_immutable_argument_window", "--test-threads=1"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut engine = setup(Tier::Jit);
+    let values = crate::rooting::RootedVec::from_vec(vec![
+        Value::Undefined,
+        Value::Null,
+        Value::Bool(false),
+        Value::Bool(true),
+        Value::Num(-0.0),
+        Value::Num(f64::NAN),
+        Value::Num(3.5),
+        Value::bigint_from_i128((1i128 << 100) + 7),
+        Value::from_string("constructor argument storage".repeat(32)),
+        Value::Sym(crate::value::new_symbol_ref(crate::value::SymbolData {
+            id: u64::MAX,
+            description: None,
+            weak_observers: Default::default(),
+        })),
+        Value::Obj(engine.interp.new_object()),
+    ]);
+    for (name, forwarded) in [("Simple", false), ("Wrapper", true)] {
+        let env = engine.interp.global_env;
+        let callee = engine
+            .interp
+            .get_var(name, &env)
+            .unwrap_or_else(|_| panic!("constructor"));
+        for value in &values {
+            // This is the original immutable canonical Value array, not a mutable transfer
+            // adapter. The two initializer branches previously replaced these words.
+            let arguments = [*value, *value];
+            let before = if forwarded {
+                FORWARDED.with(Cell::get)
+            } else {
+                SIMPLE.with(Cell::get)
+            };
+            let result = unsafe {
+                engine.interp.construct_jit_fast(
+                    &callee,
+                    arguments.as_ptr().cast::<PackedValue>(),
+                    arguments.len(),
+                    None,
+                    None,
+                )
+            }
+            .expect("warm constructor plan")
+            .unwrap_or_else(|_| panic!("constructor call"));
+            let after = if forwarded {
+                FORWARDED.with(Cell::get)
+            } else {
+                SIMPLE.with(Cell::get)
+            };
+            assert_eq!(
+                after,
+                before + 1,
+                "the exact {name} initializer plan must commit"
+            );
+            assert!(
+                arguments
+                    .iter()
+                    .all(|argument| argument.bits() == value.bits()),
+                "{name} rewrote its caller's immutable window"
+            );
+            let result = result.as_obj().expect("constructed instance");
+            let expected = if forwarded && !engine.interp.to_boolean(value) {
+                Value::Num(19.0)
+            } else {
+                *value
+            };
+            assert_eq!(
+                result.borrow().props.get("value").unwrap().value().bits(),
+                expected.bits()
+            );
+        }
+    }
+}

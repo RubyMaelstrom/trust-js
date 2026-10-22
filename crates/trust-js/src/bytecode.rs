@@ -28,7 +28,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::execution_storage::{CallArgs, DecodedArgs, SlotAccess, StoredValue, ValueStack};
+use crate::execution_storage::{values_from_words, CallArgs, SlotAccess, StoredValue, ValueStack};
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::stack_trace::NO_POSITION;
 use crate::value::{PackedValue, Value};
@@ -890,6 +890,18 @@ pub const CALL_IC_NEEDS_ENV: u8 = 16;
 /// Lexical [[ThisMode]]: the call inherits `new.target` and resolves `this` through its
 /// definition environment. Keep this bit independent of activation/direct-entry eligibility.
 pub const CALL_IC_LEXICAL_THIS: u8 = 32;
+
+/// The native address has the scoped callback signature. Bit 0 stays clear, so emitted
+/// compiled-entry gates retain their existing helper route. Such entries have no intrinsic.
+pub const CALL_IC_SCOPED_NATIVE: u8 = 64;
+
+#[cfg(all(test, feature = "embed"))]
+thread_local! {
+    /// Actual typed callback completions from the generated native call-cache hit arm.
+    /// Cold dispatch, prepared calls and unrelated native boundaries do not increment it.
+    pub(crate) static TEST_SCOPED_NATIVE_IC_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static TEST_SCOPED_NATIVE_CACHED_COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// `String.prototype.charCodeAt`: the call template inlines the all-ASCII receiver + exact-u32
 /// in-bounds index case to a byte load (see `crate::lstr::ASCII_HINT`).
@@ -19514,7 +19526,7 @@ fn bin_num<S: StoredValue>(
     Ok(())
 }
 
-/// Attempt the immediate-only tagged ABI path. Returning `None` is a deliberate deoptimization:
+/// Attempt the canonical Number-only path. Returning `None` is a deliberate deoptimization:
 /// heap values, strings, BigInts, symbols, objects, and the internal Empty marker all continue
 /// through the complete interpreter helper, preserving ToPrimitive/ToNumeric ordering and
 /// abrupt completion behavior mandated by ECMA-262 §13.15 (Additive Operators).
@@ -19526,16 +19538,10 @@ where
     let (ValueView::Num(left), ValueView::Num(right)) = (&(left).view(), &(right).view()) else {
         return None;
     };
-    let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
-    let result = frame.binary(f);
-    Some(Value::Num(
-        result
-            .as_number()
-            .expect("tagged numeric result remains a Number"),
-    ))
+    Some(Value::Num(f(*left, *right)))
 }
 
-/// Attempt the immediate-only tagged ABI path for relational and equality operators. Returning
+/// Attempt the canonical Number-only path for relational and equality operators. Returning
 /// `None` is the same deliberate deoptimization as the arithmetic slice: heap values, strings,
 /// BigInts, symbols, and objects all continue through the complete interpreter helper, preserving
 /// the abstract-relation/equality ordering and coercion mandated by ECMA-262 §13.11 (Relational
@@ -19550,19 +19556,13 @@ where
     let (ValueView::Num(left), ValueView::Num(right)) = (&(left).view(), &(right).view()) else {
         return None;
     };
-    let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
-    let result = frame.cmp(f);
-    Some(Value::Bool(
-        result
-            .as_boolean()
-            .expect("tagged comparison result remains a Boolean"),
-    ))
+    Some(Value::Bool(f(*left, *right)))
 }
 
-/// Attempt the immediate-only tagged ABI path for bitwise and shift operators. Returning `None`
+/// Attempt the canonical Number-only path for bitwise and shift operators. Returning `None`
 /// keeps the complete `Interp::binary` helper: heap values, strings, BigInts, symbols, and objects
 /// preserve ToNumeric ordering and the BigInt mixing check of ECMA-262 §13.7–13.8. Number operands
-/// run ToInt32 (§7.1.5) inside the frame on the exact extracted bits, identical to `bin_i32`.
+/// run ToInt32 (§7.1.5) on the exact extracted bits, identical to `bin_i32`.
 #[inline(always)]
 fn try_tagged_numeric_i32<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
 where
@@ -19571,16 +19571,12 @@ where
     let (ValueView::Num(left), ValueView::Num(right)) = (&(left).view(), &(right).view()) else {
         return None;
     };
-    let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
-    let result = frame.bitwise(f);
     Some(Value::Num(
-        result
-            .as_number()
-            .expect("tagged bitwise result remains a Number"),
+        f(crate::eval::to_int32(*left), crate::eval::to_int32(*right)) as f64,
     ))
 }
 
-/// Attempt the immediate-only tagged ABI path for unary numeric operators. Returning `None` keeps
+/// Attempt the canonical Number-only path for unary numeric operators. Returning `None` keeps
 /// the complete `eval_unary_vm` helper with its ToNumber/ToNumeric ordering and abrupt completions
 /// (ECMA-262 §13.5.5–6, §13.5.9). The closure is the same f64 transform the canonical fast path
 /// runs, so signed-zero negation, `+` identity, and ToInt32-based bitwise NOT match exactly.
@@ -19592,16 +19588,10 @@ where
     let ValueView::Num(n) = &(value).view() else {
         return None;
     };
-    let frame = crate::tagged::TaggedNumberFrame::new(*n);
-    let result = frame.unary(f);
-    Some(Value::Num(
-        result
-            .as_number()
-            .expect("tagged unary result remains a Number"),
-    ))
+    Some(Value::Num(f(*n)))
 }
 
-/// Attempt the immediate-only tagged ABI path for exponentiation, mirroring the canonical
+/// Attempt the canonical Number-only path for exponentiation, mirroring the canonical
 /// `Interp::binary` fast path's Number::exponentiate guard exactly (NaN exponent, and |base| = 1
 /// with an infinite exponent, are NaN even though raw `powf` would round them to 1.0). Returning
 /// `None` keeps the complete helper with BigInt mixing and ToNumeric ordering (ECMA-262 §13.9).
@@ -19610,12 +19600,12 @@ fn try_tagged_numeric_pow(left: &Value, right: &Value) -> Option<Value> {
     let (ValueView::Num(left), ValueView::Num(right)) = (&(left).view(), &(right).view()) else {
         return None;
     };
-    let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
-    let result = frame.pow();
     Some(Value::Num(
-        result
-            .as_number()
-            .expect("tagged exponentiation result remains a Number"),
+        if right.is_nan() || (left.abs() == 1.0 && right.is_infinite()) {
+            f64::NAN
+        } else {
+            left.powf(*right)
+        },
     ))
 }
 
@@ -20661,10 +20651,9 @@ impl Chunk {
         self.make_run_env(i, env, this_val, args)
     }
 
-    /// Seed captured owners directly from the still-live caller operand list. The ordinary
-    /// frame subsequently consumes those words; the environment owns only its captured copies.
-    /// `this` arrives packed and is widened only for an activation that binds it
-    /// (an inner arrow chain reads it).
+    /// Seed captured bindings from the still-live immutable caller operand list. The callee's
+    /// frame and environment receive their own copies; only the caller retires its operands.
+    /// Decode `this` only for an activation that binds it (an inner arrow chain reads it).
     pub(crate) fn jit_make_run_env_packed(
         &self,
         i: &mut Interp,
@@ -21983,7 +21972,7 @@ unsafe fn jit_intrinsic_inner(
                             None => crate::builtins::nf_function_call(
                                 i,
                                 (*base).unpack(),
-                                &DecodedArgs::new(std::slice::from_raw_parts(
+                                values_from_words(std::slice::from_raw_parts(
                                     base.add(2),
                                     call_argc,
                                 )),
@@ -22055,7 +22044,7 @@ unsafe fn jit_intrinsic_inner(
                                 None => crate::builtins::nf_function_apply(
                                     i,
                                     (*base).unpack(),
-                                    &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 2)),
+                                    values_from_words(std::slice::from_raw_parts(base.add(2), 2)),
                                 )
                                 .map_err(Abrupt::Throw),
                             }
@@ -22063,7 +22052,7 @@ unsafe fn jit_intrinsic_inner(
                             crate::builtins::nf_function_apply(
                                 i,
                                 (*base).unpack(),
-                                &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 2)),
+                                values_from_words(std::slice::from_raw_parts(base.add(2), 2)),
                             )
                             .map_err(Abrupt::Throw)
                         }
@@ -22085,7 +22074,7 @@ unsafe fn jit_intrinsic_inner(
                                 crate::builtins::nf_array_push(
                                     i,
                                     (*base).unpack(),
-                                    &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 1)),
+                                    values_from_words(std::slice::from_raw_parts(base.add(2), 1)),
                                 )
                                 .map_err(Abrupt::Throw)
                             }
@@ -22117,7 +22106,7 @@ unsafe fn jit_intrinsic_inner(
                             None => crate::builtins::regexp_exec(
                                 i,
                                 (*base).unpack(),
-                                &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 1)),
+                                values_from_words(std::slice::from_raw_parts(base.add(2), 1)),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -22136,7 +22125,7 @@ unsafe fn jit_intrinsic_inner(
                             None => crate::builtins::nf_string_replace(
                                 i,
                                 (*base).unpack(),
-                                &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 2)),
+                                values_from_words(std::slice::from_raw_parts(base.add(2), 2)),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -22152,7 +22141,7 @@ unsafe fn jit_intrinsic_inner(
                             None => crate::builtins::nf_string_split(
                                 i,
                                 (*base).unpack(),
-                                &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 1)),
+                                values_from_words(std::slice::from_raw_parts(base.add(2), 1)),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -22407,13 +22396,15 @@ unsafe fn jit_call_hit_inner(
     let entry = &chunk.call_caches[c as usize].entries[way];
     // A native entry needs two words of the way: read them in place. Copying the whole entry
     // first (a dozen words through vector stores) made every native call wait for the copy.
-    let (native, intrinsic) = {
+    let (native, intrinsic, signature) = {
         // SAFETY: the Cell holds plain-old-data and nothing writes it during this read.
         let entry = unsafe { &*entry.as_ptr() };
-        (entry.native, entry.intrinsic)
+        (entry.native, entry.intrinsic, entry.direct)
     };
     if native != 0 {
-        return jit_call_hit_native(ctx, sp, argc, with_this, native, intrinsic, entry);
+        return jit_call_hit_native(
+            ctx, sp, argc, with_this, native, intrinsic, signature, entry,
+        );
     }
     let mut ic = entry.get();
     // A code-keyed probe hit (see `jit::emit_call_code_probe`) matched another closure of this
@@ -22450,11 +22441,11 @@ unsafe fn jit_call_hit_inner(
         &raw mut *undef as *const PackedValue
     };
     let r = i.call_jit_committed(&ic, &code, this_slot, args_ptr, argc);
-    // Arguments and `this` were moved; pop them and the callee slot virtually (same ownership
-    // story as jit_call_inner's Some arm).
+    // The callee's argument/receiver loans have ended. This owning caller now retires its
+    // operand window and callee slot before publishing the result.
     sp = args_ptr.sub(1);
     if with_this {
-        sp = sp.sub(1); // `this` was consumed (moved) by the callee — skip, don't drop
+        sp = sp.sub(1); // retire the receiver after its loan ends
     }
     match r {
         Ok(v) => {
@@ -22472,9 +22463,10 @@ unsafe fn jit_call_hit_inner(
 }
 
 /// [`jit_call_hit_inner`]'s native-entry arm: the emitted probe proved the callee is the
-/// way's builtin `native` (identity, epoch and realm). Consumes the callee, receiver and
-/// arguments exactly like the user-function arm.
+/// way's bare native `native` (identity, epoch and realm). Loan the receiver/argument window
+/// through the complete boundary, then let this owning caller retire those operands.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn jit_call_hit_native(
     ctx: &mut crate::jit::JitCtx,
     mut sp: *mut PackedValue,
@@ -22482,57 +22474,83 @@ unsafe fn jit_call_hit_native(
     with_this: bool,
     native: usize,
     intrinsic: u8,
+    signature: u8,
     entry: &std::cell::Cell<CallIc>,
 ) -> crate::jit::SpFlag {
     let i = &mut *ctx.interp;
     if ctx.callstat_enabled {
         jit_callstat(i, ctx, &entry.get(), argc, with_this, sp);
     }
-    let operand_only = match intrinsic {
-        INTRINSIC_OPERAND_ONLY => true,
-        INTRINSIC_NUMERIC_ONLY | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
-            (0..argc).all(|k| (*sp.sub(argc).add(k)).number().is_some())
-        }
-        INTRINSIC_DATAVIEW_GET | INTRINSIC_DATAVIEW_SET => {
-            let checked = if intrinsic == INTRINSIC_DATAVIEW_SET {
-                2
-            } else {
-                1
-            };
-            (0..argc.min(checked)).all(|k| (*sp.sub(argc).add(k)).is_primitive())
-        }
-        _ => false,
-    };
-    if intrinsic == INTRINSIC_REFLECT_APPLY && argc == 3 {
-        if let Some(flag) = jit_reflect_apply_operand_only(ctx, sp, with_this) {
-            return flag;
-        }
-    }
-    let nf: crate::value::NativeFn = std::mem::transmute(native);
     let args_ptr = sp.sub(argc);
-    let r = if operand_only {
-        // The exact builtin is proven and runs no author code for these operands: move the
-        // receiver and arguments into it directly, without an arbitrary native's call boundary.
-        let this = if with_this {
-            sp.sub(argc + 2).read().into_value()
-        } else {
-            Value::Undefined
-        };
-        crate::execution_storage::with_moved_values(args_ptr, argc, |args| nf(i, this, args))
-            .map_err(Abrupt::Throw)
+    let undefined = PackedValue::pack(Value::Undefined);
+    let this_slot: *const PackedValue = if with_this {
+        sp.sub(argc + 2)
     } else {
-        let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
-        let this_slot: *const PackedValue = if with_this {
-            sp.sub(argc + 2)
-        } else {
-            &raw mut *undef as *const PackedValue
-        };
-        i.call_native_committed(nf, this_slot, args_ptr, argc)
+        &raw const undefined
     };
-    // Arguments and `this` were moved; pop them and the callee slot virtually.
+    // Inspect the signature before any pointer classifier or operand-only shortcut. Identical
+    // machine addresses do not make distinct Rust Result signatures interchangeable.
+    let r = if signature & CALL_IC_SCOPED_NATIVE != 0 {
+        debug_assert_eq!(intrinsic, 0);
+        #[cfg(feature = "embed")]
+        {
+            // SAFETY: this bit records the original scoped fn signature at IC publication.
+            let function: crate::scope::NativeFn = std::mem::transmute(native as *const ());
+            i.call_native_committed_with(
+                native,
+                this_slot,
+                args_ptr,
+                argc,
+                |interp, this, arguments| {
+                    let result = crate::scope::invoke_native(function, interp, this, arguments);
+                    #[cfg(test)]
+                    TEST_SCOPED_NATIVE_IC_COMMITS.with(|count| count.set(count.get() + 1));
+                    result
+                },
+            )
+        }
+        #[cfg(not(feature = "embed"))]
+        unreachable!("a scoped native entry cannot be published without embed")
+    } else {
+        let operand_only = match intrinsic {
+            INTRINSIC_OPERAND_ONLY => true,
+            INTRINSIC_NUMERIC_ONLY | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
+                (0..argc).all(|k| (*sp.sub(argc).add(k)).number().is_some())
+            }
+            INTRINSIC_DATAVIEW_GET | INTRINSIC_DATAVIEW_SET => {
+                let checked = if intrinsic == INTRINSIC_DATAVIEW_SET {
+                    2
+                } else {
+                    1
+                };
+                (0..argc.min(checked)).all(|k| (*sp.sub(argc).add(k)).is_primitive())
+            }
+            _ => false,
+        };
+        if intrinsic == INTRINSIC_REFLECT_APPLY && argc == 3 {
+            if let Some(flag) = jit_reflect_apply_operand_only(ctx, sp, with_this) {
+                return flag;
+            }
+        }
+        let nf: crate::value::NativeFn = std::mem::transmute(native as *const ());
+        if operand_only {
+            // The exact builtin is proven and runs no author code for these operands: move the
+            // receiver and arguments into it directly, without an arbitrary native's call boundary.
+            let this = if with_this {
+                sp.sub(argc + 2).read().into_value()
+            } else {
+                Value::Undefined
+            };
+            crate::execution_storage::with_borrowed_values(args_ptr, argc, |args| nf(i, this, args))
+                .map_err(Abrupt::Throw)
+        } else {
+            i.call_native_committed(nf, this_slot, args_ptr, argc)
+        }
+    };
+    // The boundary's loans are finished; this owning caller retires the operand window.
     sp = args_ptr.sub(1);
     if with_this {
-        sp = sp.sub(1); // `this` was consumed (moved) by the callee — skip, don't drop
+        sp = sp.sub(1); // retire the receiver after its loan ends
     }
     match r {
         Ok(v) => {
@@ -23151,8 +23169,8 @@ unsafe fn jit_new_site(
         let argc = argc as usize;
         let args_ptr = unsafe { sp.sub(argc) };
         let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
-        let args_values = DecodedArgs::new(unsafe { std::slice::from_raw_parts(args_ptr, argc) });
-        let args = &*args_values;
+        let args_values = values_from_words(unsafe { std::slice::from_raw_parts(args_ptr, argc) });
+        let args = args_values;
         let value = match construct_profiled(i, chunk, pc as usize, callee, args) {
             Ok(value) => value,
             Err(abrupt) => {
@@ -23258,8 +23276,8 @@ unsafe fn jit_new_inner(
         *sp = unsafe { sp.add(1) };
         return Ok(());
     }
-    let args_values = DecodedArgs::new(unsafe { std::slice::from_raw_parts(args_ptr, argc) });
-    let args = &*args_values;
+    let args_values = values_from_words(unsafe { std::slice::from_raw_parts(args_ptr, argc) });
+    let args = args_values;
     let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
     let v = i.construct(callee, args).map_err(|error| match site {
         Some((chunk, _)) => {
@@ -23838,8 +23856,8 @@ unsafe fn jit_call_inner(
     };
     let args_ptr = sp.sub(argc);
     if chunk.feedback.detailed_enabled() {
-        let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
-        let args = &*args_values;
+        let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+        let args = args_values;
         let callee = (*sp.sub(argc + 1)).unpack();
         let this = if with_this {
             (*sp.sub(argc + 2)).unpack()
@@ -23885,12 +23903,18 @@ unsafe fn jit_call_inner(
                         crate::value::Callable::Native(nf)
                             if object.ic_plain.get() && i.native_call_in_current_realm(o) =>
                         {
-                            Some(*nf)
+                            Some((*nf as usize, 0, Some(*nf)))
+                        }
+                        #[cfg(feature = "embed")]
+                        crate::value::Callable::ScopedNative(nf)
+                            if object.ic_plain.get() && i.native_call_in_current_realm(o) =>
+                        {
+                            Some((*nf as usize, CALL_IC_SCOPED_NATIVE, None))
                         }
                         _ => None,
                     }
                 };
-                if let Some(nf) = nf {
+                if let Some((native, signature, engine_native)) = nf {
                     {
                         let key = crate::value::Gc::as_ptr(o) as usize;
                         let mut p = chunk.call_pins.borrow_mut();
@@ -23916,125 +23940,129 @@ unsafe fn jit_call_inner(
                                     uses_this: true,
                                     n_params: 0,
                                     n_slots: 0,
-                                    direct: 0, // bit 0 clear: the direct sequence's first gate bails
+                                    direct: signature, // bit 0 clear: compiled-entry gate uses the helper
                                     func: std::ptr::null(),
                                     epoch: CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
                                     chunk_raw: std::ptr::null(),
                                     code_mem: std::ptr::null(),
                                     pc_offs_ptr: std::ptr::null(),
-                                    native: nf as usize,
-                                    intrinsic: match nf as *const () as usize {
-                                        p if p
-                                            == crate::builtins::nf_char_code_at as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_CHAR_CODE_AT
+                                    native,
+                                    intrinsic: engine_native.map_or(0, |nf| {
+                                        match nf as *const () as usize {
+                                            p if p
+                                                == crate::builtins::nf_char_code_at as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_CHAR_CODE_AT
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_code_point_at as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_CODE_POINT_AT
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_char_at as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_CHAR_AT
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_string_slice as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_STRING_SLICE
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_object_has_own as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_OBJECT_HAS_OWN
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_function_apply as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_FUNCTION_APPLY
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_math_sqrt as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_MATH_SQRT
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_array_push as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_ARRAY_PUSH
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_array_pop as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_ARRAY_POP
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_function_call as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_FUNCTION_CALL
+                                            }
+                                            p if p
+                                                == crate::builtins::regexp_exec as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_REGEXP_EXEC_DISCARD
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_string_replace as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_STRING_REPLACE_DISCARD
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_string_split as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_STRING_SPLIT_DISCARD
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_is_nan as *const ()
+                                                    as usize
+                                                || p == crate::builtins::nf_number_is_nan
+                                                    as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_IS_NAN
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_from_char_code as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_FROM_CHAR_CODE
+                                            }
+                                            p if p
+                                                == crate::builtins::nf_reflect_apply as *const ()
+                                                    as usize =>
+                                            {
+                                                INTRINSIC_REFLECT_APPLY
+                                            }
+                                            _ if crate::builtins::math_intrinsic(nf) != 0 => {
+                                                crate::builtins::math_intrinsic(nf)
+                                            }
+                                            _ if crate::builtins::dataview_intrinsic(nf) != 0 => {
+                                                crate::builtins::dataview_intrinsic(nf)
+                                            }
+                                            _ if crate::builtins::is_operand_only_native(nf) => {
+                                                INTRINSIC_OPERAND_ONLY
+                                            }
+                                            _ if crate::builtins::is_numeric_only_native(nf) => {
+                                                INTRINSIC_NUMERIC_ONLY
+                                            }
+                                            _ => 0,
                                         }
-                                        p if p
-                                            == crate::builtins::nf_code_point_at as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_CODE_POINT_AT
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_char_at as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_CHAR_AT
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_string_slice as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_STRING_SLICE
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_object_has_own as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_OBJECT_HAS_OWN
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_function_apply as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_FUNCTION_APPLY
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_math_sqrt as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_MATH_SQRT
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_array_push as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_ARRAY_PUSH
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_array_pop as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_ARRAY_POP
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_function_call as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_FUNCTION_CALL
-                                        }
-                                        p if p
-                                            == crate::builtins::regexp_exec as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_REGEXP_EXEC_DISCARD
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_string_replace as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_STRING_REPLACE_DISCARD
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_string_split as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_STRING_SPLIT_DISCARD
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_is_nan as *const () as usize
-                                            || p == crate::builtins::nf_number_is_nan as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_IS_NAN
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_from_char_code as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_FROM_CHAR_CODE
-                                        }
-                                        p if p
-                                            == crate::builtins::nf_reflect_apply as *const ()
-                                                as usize =>
-                                        {
-                                            INTRINSIC_REFLECT_APPLY
-                                        }
-                                        _ if crate::builtins::math_intrinsic(nf) != 0 => {
-                                            crate::builtins::math_intrinsic(nf)
-                                        }
-                                        _ if crate::builtins::dataview_intrinsic(nf) != 0 => {
-                                            crate::builtins::dataview_intrinsic(nf)
-                                        }
-                                        _ if crate::builtins::is_operand_only_native(nf) => {
-                                            INTRINSIC_OPERAND_ONLY
-                                        }
-                                        _ if crate::builtins::is_numeric_only_native(nf) => {
-                                            INTRINSIC_NUMERIC_ONLY
-                                        }
-                                        _ => 0,
-                                    },
+                                    }),
                                     realm: 0,
                                 },
                                 None,
@@ -24053,8 +24081,10 @@ unsafe fn jit_call_inner(
                     } else {
                         &raw mut *undef2 as *const PackedValue
                     };
-                    let r = i.call_native_committed(nf, this_slot2, args_ptr, argc);
-                    // Arguments and `this` were consumed; pop them and the callee slot.
+                    let r = i.call_native_address_committed(
+                        native, signature, this_slot2, args_ptr, argc,
+                    );
+                    // All argument/receiver loans ended; retire this caller's operand window.
                     *sp = args_ptr.sub(1);
                     if with_this {
                         *sp = sp.sub(1);
@@ -24085,8 +24115,8 @@ unsafe fn jit_call_inner(
         push!(v);
         return Ok(());
     }
-    let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
-    let args = &*args_values;
+    let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+    let args = args_values;
     let callee = (*sp.sub(argc + 1)).unpack();
     let this = if with_this {
         (*sp.sub(argc + 2)).unpack()
@@ -25381,8 +25411,8 @@ unsafe fn jit_exec_inner(
             let argc = argc as usize;
             let args_ptr = sp.sub(argc);
             if chunk.feedback.detailed_enabled() {
-                let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
-                let args = &*args_values;
+                let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+                let args = args_values;
                 let callee = (*sp.sub(argc + 1)).unpack();
                 let value = call_profiled(i, chunk, pc as usize, callee, Value::Undefined, args)
                     .map_err(|error| {
@@ -25423,8 +25453,8 @@ unsafe fn jit_exec_inner(
                 push!(v);
                 return Ok(());
             }
-            let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
-            let args = &*args_values;
+            let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+            let args = args_values;
             let callee = (*sp.sub(argc + 1)).unpack();
             let v = i.call(callee, Value::Undefined, args).map_err(|error| {
                 let callee = (*sp.sub(argc + 1)).unpack();
@@ -25451,8 +25481,8 @@ unsafe fn jit_exec_inner(
             let argc = argc as usize;
             let args_ptr = sp.sub(argc);
             if chunk.feedback.detailed_enabled() {
-                let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
-                let args = &*args_values;
+                let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+                let args = args_values;
                 let method = (*sp.sub(argc + 1)).unpack();
                 let this = (*sp.sub(argc + 2)).unpack();
                 let value =
@@ -25488,8 +25518,8 @@ unsafe fn jit_exec_inner(
                 push!(v);
                 return Ok(());
             }
-            let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
-            let args = &*args_values;
+            let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+            let args = args_values;
             let m = (*sp.sub(argc + 1)).unpack();
             let this = (*sp.sub(argc + 2)).unpack();
             let v = i.call(m, this, args).map_err(|error| {
@@ -25504,8 +25534,8 @@ unsafe fn jit_exec_inner(
             if chunk.feedback.detailed_enabled() {
                 let args_ptr = sp.sub(argc);
                 let callee = (*sp.sub(argc + 1)).unpack();
-                let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
-                let args = &*args_values;
+                let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+                let args = args_values;
                 let value =
                     construct_profiled(i, chunk, pc as usize, callee, args).map_err(|error| {
                         let callee = (*sp.sub(argc + 1)).unpack();

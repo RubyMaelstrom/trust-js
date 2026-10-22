@@ -938,3 +938,61 @@ mod retained_memory_tests {
         assert_eq!(allocations.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod numeric_value_tests {
+    use super::*;
+
+    #[test]
+    fn js_numeric_bridge_canonicalizes_nan_without_rewriting_guest_payloads() {
+        let mut engine = trust_js_host::Engine::new();
+        engine.scope(|cx| {
+            assert_eq!(std::mem::size_of::<Value<'_>>(), 8);
+            let word =
+                |value: &Value<'_>| unsafe { std::ptr::from_ref(value).cast::<u64>().read() };
+            for high in (0x7ff0u64..=0x7fff).chain(0xfff0..=0xffff) {
+                for payload in [1, 0x8000_1234_5678, 0xffff_ffff_ffff] {
+                    let bits = high << 48 | payload;
+                    let guest = Val::F64(f64::from_bits(bits));
+                    let js = val_to_js(cx, guest);
+                    assert_eq!(word(&js), 0x7ff8_0000_0000_0000);
+                    assert!(js.as_num_opt().unwrap().is_nan());
+                    assert_eq!(
+                        guest.f64().to_bits(),
+                        bits,
+                        "the guest Val remains unchanged"
+                    );
+                }
+            }
+            for bits in [
+                0x7f80_0001,
+                0x7fc0_0001,
+                0x7fff_ffff,
+                0xff80_0001,
+                0xffc0_0001,
+                0xffff_ffff,
+            ] {
+                let guest = Val::F32(f32::from_bits(bits));
+                let js = val_to_js(cx, guest);
+                assert_eq!(word(&js), 0x7ff8_0000_0000_0000);
+                assert_eq!(guest.f32().to_bits(), bits);
+            }
+            for number in [
+                0.0,
+                -0.0,
+                f64::from_bits(1),
+                -f64::from_bits(1),
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                1.5,
+            ] {
+                let js = val_to_js(cx, Val::F64(number));
+                assert_eq!(word(&js), number.to_bits());
+                assert_eq!(
+                    js_to_val(cx, &js, ValType::F64).unwrap().f64().to_bits(),
+                    number.to_bits()
+                );
+            }
+        });
+    }
+}

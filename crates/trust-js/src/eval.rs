@@ -6916,7 +6916,7 @@ impl Interp {
                 self.super_call_ok = saved_super;
                 r
             }
-            Callable::Native(_) | Callable::NativeData(_) => {
+            call if call.is_native() => {
                 // Native parent (e.g. Error/Map): a super() call is a construct, so set the flag for
                 // constructors that require `new`. Run it, then graft its own props onto `this`.
                 let saved = self.constructing;
@@ -9102,7 +9102,7 @@ impl Interp {
                     || user.func.is_generator
                     || user.func.is_async)
             }
-            Callable::Native(_) | Callable::NativeData(_) => {
+            call if call.is_native() => {
                 b.is_constructor
                     || b.props
                         .get("prototype")

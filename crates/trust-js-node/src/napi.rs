@@ -2442,4 +2442,49 @@ mod tests {
         executor.scan_retained_memory(&mut visit);
         assert_eq!(visit.allocations.len(), 1);
     }
+
+    #[test]
+    fn napi_double_ingress_canonicalizes_every_nan_prefix_and_preserves_scalars() {
+        let mut engine = trust_js_host::Engine::new();
+        let mut env = Env::new(ctx_ptr(&mut engine));
+        let numbers = (0x7ff0u64..=0x7fff)
+            .chain(0xfff0..=0xffff)
+            .flat_map(|high| {
+                [
+                    f64::from_bits(high << 48 | 1),
+                    f64::from_bits(high << 48 | 0x8000_1234_5678),
+                ]
+            })
+            .chain([
+                0.0,
+                -0.0,
+                f64::from_bits(1),
+                -f64::from_bits(1),
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                1.5,
+            ]);
+        for number in numbers {
+            let mut handle = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { napi_create_double(&mut env, number, &mut handle) },
+                NAPI_OK
+            );
+            let value = unsafe { env.value(handle) };
+            assert_eq!(std::mem::size_of_val(&value), 8);
+            let word = unsafe { std::ptr::from_ref(&value).cast::<u64>().read() };
+            let expected = if number.is_nan() {
+                0x7ff8_0000_0000_0000
+            } else {
+                number.to_bits()
+            };
+            assert_eq!(word, expected);
+            let mut read = 0.0;
+            assert_eq!(
+                unsafe { napi_get_value_double(&mut env, handle, &mut read) },
+                NAPI_OK
+            );
+            assert_eq!(read.to_bits(), expected);
+        }
+    }
 }

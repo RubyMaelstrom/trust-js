@@ -603,6 +603,8 @@ impl Visitor {
     fn callable(&mut self, callable: &Callable) {
         match callable {
             Callable::None | Callable::Native(_) => {}
+            #[cfg(feature = "embed")]
+            Callable::ScopedNative(_) => {}
             Callable::NativeData(value) => {
                 let identity = Rc::as_ptr(value) as usize;
                 let first = self.callable_allocations.insert(identity);
@@ -621,16 +623,26 @@ impl Visitor {
                         size_of_val(function.as_ref()),
                     )),
                     crate::value::NativeCallableBody::Captured { .. } => None,
+                    #[cfg(feature = "embed")]
+                    crate::value::NativeCallableBody::ScopedCaptured { .. } => None,
                     crate::value::NativeCallableBody::CapturedClosure { function, .. } => Some((
                         Rc::as_ptr(function) as *const () as usize,
                         size_of_val(function.as_ref()),
                     )),
                 };
                 // Engine-owned captures.
-                if let crate::value::NativeCallableBody::Captured { captures, .. }
-                | crate::value::NativeCallableBody::CapturedClosure { captures, .. } =
-                    &value.body
-                {
+                let captures = match &value.body {
+                    crate::value::NativeCallableBody::Captured { captures, .. }
+                    | crate::value::NativeCallableBody::CapturedClosure { captures, .. } => {
+                        Some(captures)
+                    }
+                    #[cfg(feature = "embed")]
+                    crate::value::NativeCallableBody::ScopedCaptured { captures, .. } => {
+                        Some(captures)
+                    }
+                    crate::value::NativeCallableBody::Opaque(_) => None,
+                };
+                if let Some(captures) = captures {
                     if first {
                         self.callable_metadata = self
                             .callable_metadata

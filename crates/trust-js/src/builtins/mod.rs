@@ -133,13 +133,18 @@ pub(crate) fn nf_function_apply(
 ) -> Result<Value, Value> {
     let this_arg = arg(args, 0);
     let list = match (arg(args, 1)).view() {
-        ValueView::Undefined | ValueView::Null => i.take_native_arg_buf(0),
+        ValueView::Undefined | ValueView::Null => {
+            crate::rooting::RootedVec::from_vec(i.take_native_arg_buf(0))
+        }
         ValueView::Obj(o) => {
             let len = ab(i.to_length(&o))?;
             check_argument_count(i, len)?;
             let direct_dense = i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
                 && !i.mapped_arguments.contains_key(&(Gc::as_ptr(&o) as usize));
-            let mut v = i.take_native_arg_buf(len);
+            // CreateListFromArrayLike performs ordered Gets. A later getter may collect or
+            // replace an earlier source property, so the already evaluated prefix is rooted
+            // independently of the source object while this snapshot is built.
+            let mut v = crate::rooting::RootedVec::from_vec(i.take_native_arg_buf(len));
             for k in 0..len {
                 // Arrays and unmapped arguments objects overwhelmingly contain plain own dense
                 // entries. Read those by slot: the generic path allocates a decimal key and walks
@@ -161,10 +166,10 @@ pub(crate) fn nf_function_apply(
         }
         _ => return Err(i.make_error("TypeError", "apply: argument list must be array-like")),
     };
-    // The recycled buffer is returned even when the call throws: `call` never retains the slice
-    // (every callee copies arguments into its own activation), so recycling is unobservable.
+    // Keep the completed argument window rooted and immutable through the whole call, including
+    // native reentry, post-call polls and pending tails. Recycle only after those loans end.
     let call_result = i.call(this, this_arg, &list);
-    i.recycle_native_arg_buf(list);
+    i.recycle_native_arg_buf(list.into_vec());
     ab(call_result)
 }
 

@@ -1649,8 +1649,7 @@ impl Engine {
     pub fn define_global(&mut self, name: &str, len: usize, f: embed::NativeFn) {
         self.interp.activate_gc_heap();
         let global = self.interp.global.clone();
-        self.interp
-            .def_method(&global, name, len, crate::scope::native_fn(f));
+        self.interp.def_scoped_method(&global, name, len, f);
     }
 
     /// Define `globalThis.<name>` as a namespace object (like `Math`) with the given
@@ -1659,11 +1658,10 @@ impl Engine {
         self.interp.activate_gc_heap();
         let ns = self.interp.new_object();
         for (op, len, f) in ops {
-            let f = crate::scope::native_fn(*f);
-            self.interp.def_method(&ns, op, *len, f);
+            self.interp.def_scoped_method(&ns, op, *len, *f);
             // Qualify the diagnostic identity (`ns.op`); the bare `op` label recorded by
             // `def_method` would otherwise collide across namespaces sharing method names.
-            crate::jit::perf_native_relabel(f as usize, format!("{name}.{op}"));
+            crate::jit::perf_native_relabel(*f as usize, format!("{name}.{op}"));
         }
         self.interp.global.borrow_mut().props.insert(
             crate::value::encode_string_key(name).as_ref(),

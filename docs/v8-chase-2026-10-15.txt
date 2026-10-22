@@ -7396,3 +7396,202 @@ Against matched main, fixture cycles -14.84/-16.06/-10.42% and Vue
 instructions -14.37%. Open S0 bounds remain: React peak RSS +40.48%,
 Djot GC share 7.67%, sustained shares 33.73/25.15% at native/bytecode.
 These are still exit-review items; this part does not close them.
+
+Step 12e: engine and scoped Values become words together
+
+The engine Value and branded embed Value are transparent eight-byte
+Copy words. Match views decode only for inspection. The scoped
+invariant lifetime and thread restriction remain. Every language
+Number constructor canonicalizes NaN, including reserved tag-shaped
+payloads; finite values, signed zeros and subnormals retain their bits.
+ArrayBuffer backing bytes and internal Wasm float payloads retain
+their separate contracts. Raw reconstruction is unsafe, checks the
+encoding in debug builds, and requires a live cell of the proper kind
+and Agent. Pointer packing retains its release 48-bit fit assertion.
+
+Native calls borrow the original immutable evaluated argument window.
+DecodedArgs and redundant argument packing are removed. Mutable Cell
+slots and property words are never reinterpreted as immutable argument
+slices. Constructor initializers read and copy input words. Callers
+retain the window until the call, post-call polls and pending tails
+finish, then retire or recycle their own storage.
+
+Bare and captured scoped callbacks keep their actual function types.
+ScopedNative tag 13 preserves bare function storage; native IC bit
+0x40 distinguishes the typed signature in Rust dispatch. The bare
+pointer's low bit remains clear, its intrinsic is zero and chunk_raw
+is null. Each dispatch funnel calls the declared Result type and
+maps success/error explicitly; no aggregate function ABI transmute
+is used. Constructor, realm, capability, super, GC trace, finalizer
+and retained-memory paths include both typed callback forms.
+
+EMPTY becomes Undefined at every public value boundary, including
+bare callbacks, returns, throws, captures and forwarded arguments.
+Ordinary slices retain their address. Only an EMPTY-containing slice
+needs a sanitized copy. This closes step 11's release-boundary item.
+
+As recorded before implementation, Function.prototype.apply roots
+its evaluated prefix while later indexed getters can collect. The
+root remains through the call and ends before buffer recycling.
+CallbackCache roots borrowed heap arguments before its compiled
+entry poll and through tail draining; controlled first-mark tests
+proved the previous incidental native-stack retention. Prepared
+fixed-array callers retain their stack-root contract, and raw JIT
+entry documentation states the caller's root obligation.
+
+The five live Number helpers formerly routed through tagged.rs now
+use canonical Value constructors, retaining ToInt32, coercion order
+and the NaN/infinite-exponent pow guards. The arithmetic switch is
+kept in this part; the unused second representation is removed in
+12f. Invalid-word tests now exercise production Value.
+
+Source review covers every typed native funnel, immutable loan,
+root/poll/tail boundary and representation ingress. Focused checks
+include all value kinds and Ok/Err native results, native cache hits,
+captured callbacks, reentrant and oversized argument windows, both
+constructor forms, release EMPTY forwarding, NaN inputs and raw-byte
+preservation. Linux focused checks pass 19 normal and 19 stress cases
+plus 10 release cases; Wine 25 normal and 25 stress; ARM 28 normal
+and 28 stress. Every counted case resolves in the actual inventory.
+Fresh mutants omitting the apply prefix root, NaN canonicalization
+or the original-window loan fail their intended assertions. Earlier
+invalid-fixture and zero-match runs remain recorded as failures.
+
+Production layouts: Interp 5776 to 5768 bytes, JitCtx 328 to 320,
+JitFrame 2376 to 2368, with its word base moving from 328 to 320.
+The other 20 measured carrier layouts retain every direct member's
+offset and size. Exact layouts, runtime probes and source provenance
+are retained for the neutral generated-code comparison.
+
+The fresh x64 suite exposed three weak-metadata test fixtures whose
+inactive WeakTarget payload word retained an old object address on
+the native stack. Retention diagnostics locate the scanned word at
+token+16. Box these weak tokens inside their existing separate frame
+and borrow them afterward. Native scanning and all assertions stay.
+Wine also exposed native-frame sensitivity in the synthetic this-word
+root test; its original retained word was not localized. Box that
+context in a separate helper frame. Both precise-only diagnostics
+and boxed native-scanning variants pass normal and stress cases.
+The final boxed context test still rejects an omitted precise root:
+the first assertion sees D instead of R in both Wine modes.
+
+Both repairs are confined to test modules. Preserve the original
+source, layout and fat-LTO binary manifests; exact before/after
+inventories and the reviewed cfg(test) boundaries establish identical
+production input. This is source equivalence, not a claim that the
+old binaries were rebuilt from the final test-file bytes.
+
+An initial zombie run reused an older test artifact because copied
+prepared files retained old mtimes. That run is invalid and archived.
+Fresh per-gate Cargo targets exposed the failures above. Integration
+now copies bytes with current mtimes, and later zombie gates use
+fresh targets. The original failed fresh suite is retained too.
+A bounded provenance replay of selected 12b/12c release artifacts
+uses isolated exact-commit exports and fresh targets. Both pass all
+three fixture outputs, compile/code-byte counts, collection counts
+and the 138-agree/12-budget-skip differential test. No historical
+stale release run was established; the replay fills certificate gaps.
+
+Final routine validation: ARM 2398/0/7, five strict clippy builds,
+doctests 11/0/1 and 1820 targeted interval-one stress passes with five
+existing ignores, no failures or retries. The final test binary is
+freshly built and its source and binary stay unchanged throughout.
+The 18 new and two replaced tests match the reviewed source delta.
+Original production-only phases remain applicable through the exact
+test-only equivalence check: workspace and downstream suites pass,
+Test262 threshold eight is 53575/53575 with the reference report,
+fixtures compile 56/10/160 functions and collect 21/6/16 times,
+sustained allocation collects 194 times at both tiers, and differential
+testing agrees on 138 cases with 12 existing budget skips.
+
+Fresh zombie targets pass x64 2227/0/7; Wine is 2219/3/7 with exactly
+its three baseline snapshot-codec failures and 23 baseline warnings.
+Both lists have the same 18 additions and two removals. Release
+fixtures and differential testing match. All 20 additional normal
+and stress cases for the repaired tests pass in the actual gate
+binaries. One artifact check initially looked for a Windows private
+symbol in the executable; its corrected check binds the actual PDB
+by its CodeView GUID and age. The initial failed check is preserved.
+
+The independent strict comparison passes all nine fixture/mode pairs:
+678 generated chunks and 1356 verified parent/child companion images.
+The frozen checker has 26 positive and 141 negative neutral-proof
+controls, in addition to the unchanged core and structural controls.
+No semantic rewrite rule or function-body exemption is used. Private
+callers and continuations require complete stack and type proofs;
+frame/pool origins require their actual bounds checks. Every allowed
+address-field change is checked at its byte-width consumer. The
+nested HandlerVec layout is measured independently in all three
+binaries; its length field is at byte 16 with width eight. Earlier
+failed comparisons and insufficient proof candidates are preserved.
+
+The final timing runner preserves raw perf records, rejects inherited
+engine options and verifies all 360 samples: 15 complete rounds over
+six workloads and four binaries. It requires unscaled CPU-5 counters,
+matching output and complete metrics before producing summaries. The
+quiet window checks every inference-server PID and start time, with
+nonnegative per-process and whole-machine CPU deltas. Original
+measurement drivers and previous samples remain unchanged.
+
+Measurement review caught a launcher RSS floor in the first complete
+run: hashing binaries into the Python process raised its inherited
+peak to about 34 MiB. Preserve that run without accepting its memory
+figures. The corrected run streams hashes and uses a small GNU time
+process immediately around each engine. A controlled 64 MiB launcher
+allocation changes only the wrapper peak, not the engine peak. Perf
+counts include this timer uniformly for all four engines; the outer
+RSS and exact inner exit/RSS records are both retained. GNU time 1.9
+is built locally from its original source with GNU C17, without a
+system install. Main lacks per-cause pause timing, so its GC share
+excluding exit is unavailable, not inferred from total pause time.
+
+The first strict raw-perf parser also rejected an unsupported SMMU
+counter record. The reviewed correction accepts only that exact
+unsupported, zero-runtime record once; counted, scaled, duplicate
+or unknown device events still fail. Preserve the original rejection.
+Fifty negative metadata controls and independent source review cover
+the final measurement validator; the RSS attribution control is
+separate from benchmark timing.
+
+Final comparison: Crystal/aarch64, Linux 7.3, CPU 5, release fat LTO,
+codegen-units 1; 15 interleaved rounds, six workloads, four engines,
+360 valid samples, no scaled counters or major faults. Other CPUs
+average 0.491 cores busy at the median, maximum 1.809. The parent,
+12e and matched main use rustc 1.99.1; retained S0 main uses 1.99.0.
+Both main binaries are e3310993. Engine 12e is 19808960 bytes, md5
+397ae93513aef39e86d6a12bd2aa03f6, with the explicit test-only source
+equivalence described above. Raw samples, summaries and paired
+bootstrap intervals are in target/s6-step10/m12e-v3.
+
+In Vue/React/Djot order, versus 12d, median cycles change
+-4.130/-1.198/-2.206%, instructions -3.917/-0.727/-1.967%, and wall
+-3.931/-0.566/-2.002%. Cycle bootstrap intervals exclude zero for
+all three. Sustained allocation changes cycles -2.017/-6.705% and
+instructions -3.077/-7.628% at JIT/bytecode. Empty startup is 18.9 ms,
+equal to the parent's median; its cycle change is +0.113%, with a
+confidence interval spanning zero. Empty engine RSS is 17504 KiB.
+
+Fixture engine RSS changes +0.842/+3.408/-0.375% versus 12d; all
+three intervals span zero. Absolute medians are 33060/24396/42480 KiB.
+Total GC pause changes +0.347/-1.980/-1.210%; median longest pauses
+are 1.800/1.202/2.410 ms. JIT compilation changes
+-1.215/+4.519/+0.307%; the React and Djot intervals span zero.
+Bytecode compilation changes -1.604/-1.249/-1.149%, and parsing
+-0.154/+1.058/-0.767%. Generated code changes -0.005/0/+0.005%;
+full generated-code equivalence is established independently above.
+Compile counts and collection counts remain 56/10/160 and 21/6/16;
+sustained allocation collects 194 times at both tiers.
+
+Versus matched main, fixture cycles change -18.401/-17.056/-12.361%
+and instructions -17.741/-22.698/-15.308%. Against retained S0 main,
+cycles change -18.161/-17.123/-12.450%. Matched-main engine RSS
+changes +1.661/+46.189/+0.236%; React still exceeds the +25% bound.
+GC shares excluding exit are 3.870/4.344/7.739%, and sustained
+allocation is 34.367/26.858% at JIT/bytecode. Djot and sustained
+allocation still exceed the 5% bound; improved execution time does
+not close these limits. React bytecode compilation is +15.062%
+versus matched main, Vue bytecode compilation +6.067%, and Vue's
+largest generated chunk +56.594%. React JIT compilation is +14.007%
+with an interval spanning zero. Keep these components and the
+56/10 versus main's 55/9 admission difference visible for the final
+review. This commit completes 12e, not the step-12 or S6 exit gate.

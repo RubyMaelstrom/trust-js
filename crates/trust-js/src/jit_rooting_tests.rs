@@ -929,13 +929,21 @@ fn committed_native_call_operands_are_roots() {
     assert_tracked_collectable(&mut engine);
 }
 
+// Build the synthetic context in a separate frame, then retain only its stable
+// Rust-heap address here. Native scanning stays enabled without stale context
+// temporaries in this_round keeping the cleared receiver alive.
+#[inline(never)]
+fn boxed_return_context() -> Box<super::JitCtx> {
+    Box::new(return_context())
+}
+
 /// One round of [`context_this_word_is_a_root`].
 #[inline(never)]
 fn this_round(i: &mut Interp) {
-    let mut ctx = return_context();
+    let mut ctx = boxed_return_context();
     let this = track_into(i, &mut ctx.this_word, "this");
     let _frame = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
-        ctx: &ctx,
+        ctx: &*ctx,
         words: [(std::ptr::null(), 0), (std::ptr::null(), 0)],
     });
     collect_here(i);
@@ -957,9 +965,9 @@ fn this_round(i: &mut Interp) {
 
 /// (16) A context's `this`, the packed word at [48], through a synthetic context registered as a
 /// Rust entry's activation (`gc_trace::enter_jit_frame`): the object it names, which nothing else
-/// roots, is marked first by the context, a root, while the context is registered (the context
-/// itself lies on the native stack, whose scan comes after the roots); once `this` is cleared to
-/// Undefined, as a pooled record's is, the object is collectable.
+/// roots, is marked first by the registered context. The context is boxed in a separate
+/// frame to keep stale context temporaries off the scanned native stack. Once `this` is
+/// cleared to Undefined, as a pooled record's is, the object is collectable.
 #[test]
 fn context_this_word_is_a_root() {
     let mut engine = jit_engine(0);

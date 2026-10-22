@@ -164,15 +164,11 @@ fn integer_switch_dispatch_preserves_case_block_semantics_in_all_tiers() {
 
 #[test]
 fn boolean_bitwise_fast_paths_preserve_numbers_and_coercion_in_all_tiers() {
-    // Validate the wide Value layout used by both native boolean templates against live fields:
-    // a full tag word, then Bool's byte at the payload offset (the rest of that word is padding).
+    // Boolean execution values carry their scalar payload in the canonical eight-byte word.
     for boolean in [false, true] {
         let value = crate::value::Value::Bool(boolean);
-        let base = std::ptr::from_ref(&value).cast::<u8>();
-        // Inspect this Value's initialized tag and payload byte. A decoded ValueView is a
-        // separate copy, so the address of its Bool field cannot measure this Value's layout.
-        assert_eq!(unsafe { base.cast::<u64>().read() }, 3);
-        assert_eq!(unsafe { base.add(8).read() }, u8::from(boolean));
+        assert_eq!(std::mem::size_of_val(&value), 8);
+        assert_eq!(value.bits(), crate::value::PACK_BOOL | u64::from(boolean));
     }
     // ECMA-262 ToNumeric, ToNumber, ApplyStringOrNumericBinaryOperator, snapshot e28783d5fc9d.
     // Comparisons feeding a bitwise mask are common in generated asm.js initialization loops.

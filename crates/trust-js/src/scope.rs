@@ -9,12 +9,10 @@
 //! [`Handle`](crate::embed::Handle) (S6 step 11a), made from a value through a context and
 //! read back into one.
 //!
-//! The types here are layout-identical to the engine's own: [`Value<'s>`] is the internal
-//! value's `repr(u64)` enum without its `EMPTY` completion marker (which never crosses an engine
-//! boundary), and each cell wrapper is `repr(transparent)` over the cell's address. A native
-//! function written against the scoped types is therefore the same machine function as one
-//! written against the internal ones: the engine stores and calls it unchanged
-//! ([`native_fn`]), so generated code and native calls cost what they did.
+//! Scoped and internal values are transparent eight-byte execution words; each handle is
+//! transparent over its cell pointer. Bare native functions retain their original declared
+//! scoped signature and are called at that type, with explicit Result mapping. Ordinary
+//! immutable argument windows are borrowed directly; EMPTY is normalized at public boundaries.
 
 use crate::value::ValueView;
 use std::borrow::Cow;
@@ -33,60 +31,34 @@ use crate::{InterruptReason, ParseError};
 /// `Send` nor `Sync`, so no scoped value leaves its thread.
 type Brand<'s> = PhantomData<*mut &'s ()>;
 
-// The independent scoped inventory pins Value::kind, including each payload's invariant
-// lifetime brand. It emits distinct enums; no view can be passed as a stored scoped Value.
-macro_rules! define_scoped_values {
-    (for $scope:lifetime; $(#[$value_doc:meta])* $default:ident = $zero:literal;
-        $($(#[$variant_doc:meta])* $variant:ident $(($payload:ty))? = $tag:literal,)*) => {
-        $(#[$value_doc])*
-        #[derive(Clone, Copy, Default)]
-        #[repr(u64)]
-        pub enum Value<$scope> {
-            #[default]
-            $default = $zero,
-            $($(#[$variant_doc])* $variant $(($payload))? = $tag,)*
-        }
-
-        /// An ephemeral match view with the same invariant, thread-bound scope brand as Value.
-        /// Use it to inspect a value; persistent value storage and APIs still take Value.
-        #[derive(Clone, Copy)]
-        #[repr(u64)]
-        pub enum ValueKind<$scope> {
-            $default = $zero,
-            $($(#[$variant_doc])* $variant $(($payload))? = $tag,)*
-        }
-    };
+/// A thread-bound JavaScript execution word branded by its scope. Its transparent word
+/// representation matches the engine's Value; decoded ValueKind views are never storage.
+/// Stack values stay rooted during the scope; heap collections held across JS calls use a
+/// ValueList, and values kept beyond the scope use a Handle.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Value<'s> {
+    word: Internal,
+    scope: Brand<'s>,
 }
 
-define_scoped_values! {
-    for 's;
-    /// A JavaScript value of the scope `'s`.
-    ///
-    /// The primitive variants are plain data; strings, symbols, BigInts and objects are opaque
-    /// handles to cells of the scope's heap ([`JsString`], [`Symbol`], [`BigInt`], [`Object`]),
-    /// read and used through the scope's [`Ctx`]. A value is `Copy` and lives as long as its scope:
-    /// while a scope runs, the values in its Rust stack frames are roots of every collection. A
-    /// value kept in Rust heap memory (a `Vec`) is not, so a list of values held across a call that
-    /// can run JavaScript, and so collect, is a [`ValueList`]; a value kept beyond the scope is a
-    /// [`Handle`](crate::embed::Handle).
-    ///
-    /// `repr(u64)` with the engine's discriminants: the layout of the engine's own value, which the
-    /// engine passes to native functions as it is.
-    Undefined = 0;
+impl Default for Value<'_> {
+    fn default() -> Self {
+        Self::Undefined
+    }
+}
+
+/// An ephemeral decoded match view with the same invariant, thread-bound scope brand.
+#[derive(Clone, Copy)]
+#[repr(u64)]
+pub enum ValueKind<'s> {
+    Undefined = 0,
     Null = 2,
     Bool(bool) = 3,
     Num(f64) = 4,
-    /// A BigInt.
     BigInt(BigInt<'s>) = 5,
-    /// A string. Embedders exchange text with [`Ctx::str`], [`Ctx::string`],
-    /// [`Value::as_text`] and [`Ctx::coerce_string`], code units with
-    /// [`Ctx::string_from_utf16`] and [`Ctx::coerce_utf16`], or the engine's own representation
-    /// with [`Ctx::string_from_engine_text`], [`Value::as_engine_text`] and
-    /// [`Ctx::coerce_engine_text`].
     Str(JsString<'s>) = 6,
-    /// A Symbol.
     Sym(Symbol<'s>) = 7,
-    /// An object (functions included).
     Obj(Object<'s>) = 8,
 }
 
@@ -131,77 +103,157 @@ const _: () = {
     use std::mem::{align_of, size_of};
     assert!(size_of::<Value<'static>>() == size_of::<Internal>());
     assert!(align_of::<Value<'static>>() == align_of::<Internal>());
-    assert!(size_of::<ValueKind<'static>>() == size_of::<Value<'static>>());
-    assert!(align_of::<ValueKind<'static>>() == align_of::<Value<'static>>());
+    assert!(size_of::<Value<'static>>() == 8);
     assert!(size_of::<Object<'static>>() == size_of::<crate::value::Gc>());
     assert!(size_of::<JsString<'static>>() == size_of::<crate::lstr::LStr>());
     assert!(size_of::<Symbol<'static>>() == size_of::<crate::value::SymbolRef>());
     assert!(size_of::<BigInt<'static>>() == size_of::<crate::bigint::JsBigInt>());
+    // Regression evidence only: typed native calls never transmute Result signatures.
     assert!(
         size_of::<Result<Value<'static>, Value<'static>>>()
             == size_of::<Result<Internal, Internal>>()
     );
+    assert!(
+        align_of::<Result<Value<'static>, Value<'static>>>()
+            == align_of::<Result<Internal, Internal>>()
+    );
 };
 
+#[allow(non_snake_case, non_upper_case_globals)]
 impl<'s> Value<'s> {
-    /// Inspect this value through its scoped match view.
-    #[inline(always)]
-    pub fn kind(&self) -> ValueKind<'s> {
-        // SAFETY: define_scoped_values emits these distinct repr(u64) enums from the same
-        // explicit discriminants and branded payload types. Size/alignment are pinned above.
-        unsafe { std::mem::transmute::<Value<'s>, ValueKind<'s>>(*self) }
-    }
+    pub const Undefined: Self = Self {
+        word: Internal::Undefined,
+        scope: PhantomData,
+    };
+    pub const Null: Self = Self {
+        word: Internal::Null,
+        scope: PhantomData,
+    };
 
-    /// The scoped form of an engine value. EMPTY, a statement-completion marker that never
-    /// crosses an engine boundary, reads as undefined.
     #[inline]
-    pub(crate) fn from_internal(value: Internal) -> Value<'s> {
-        {
-            let __value_match_original = value;
-            match (__value_match_original).view() {
-                ValueView::Empty => Value::Undefined,
-                // SAFETY: every other internal value is a valid scoped value of the same layout
-                // (`repr(u64)`, the same discriminants, each payload of the same layout).
-                _ => {
-                    let value = __value_match_original;
-                    unsafe { std::mem::transmute::<Internal, Value<'s>>(value) }
-                }
-            }
+    pub const fn Bool(value: bool) -> Self {
+        Self {
+            word: Internal::Bool(value),
+            scope: PhantomData,
         }
     }
 
-    /// The engine value this is.
+    /// Construct a Number, canonicalizing every IEEE NaN while preserving signed zeros.
+    #[inline]
+    pub const fn Num(value: f64) -> Self {
+        Self {
+            word: Internal::Num(value),
+            scope: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn BigInt(value: BigInt<'s>) -> Self {
+        Self::from_internal(Internal::BigInt(*value.bigint()))
+    }
+    #[inline]
+    pub fn Str(value: JsString<'s>) -> Self {
+        Self::from_internal(Internal::Str(*value.lstr()))
+    }
+    #[inline]
+    pub fn Sym(value: Symbol<'s>) -> Self {
+        Self::from_internal(Internal::Sym(*value.symbol()))
+    }
+    #[inline]
+    pub fn Obj(value: Object<'s>) -> Self {
+        Self::from_internal(Internal::Obj(value.gc()))
+    }
+
+    /// Inspect a value through a decoded scoped view. Even a raw internal EMPTY word reads
+    /// as undefined; no invalid Rust enum representation is ever manufactured.
+    #[inline(always)]
+    pub fn kind(&self) -> ValueKind<'s> {
+        match self.word.view() {
+            ValueView::Undefined | ValueView::Empty => ValueKind::Undefined,
+            ValueView::Null => ValueKind::Null,
+            ValueView::Bool(value) => ValueKind::Bool(value),
+            ValueView::Num(value) => ValueKind::Num(value),
+            ValueView::BigInt(value) => ValueKind::BigInt(unsafe {
+                // Each handle is transparent over the same cell pointer; the output retains
+                // this receiver's invariant brand and the original scope owns the cell.
+                std::mem::transmute::<crate::bigint::JsBigInt, BigInt<'s>>(value)
+            }),
+            ValueView::Str(value) => ValueKind::Str(JsString::from_lstr(value)),
+            ValueView::Sym(value) => ValueKind::Sym(unsafe {
+                std::mem::transmute::<crate::value::SymbolRef, Symbol<'s>>(value)
+            }),
+            ValueView::Obj(value) => ValueKind::Obj(Object::from_gc(value)),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_internal(value: Internal) -> Value<'s> {
+        let word = if value.bits() == crate::value::PACK_EMPTY {
+            Internal::Undefined
+        } else {
+            value
+        };
+        Self {
+            word,
+            scope: PhantomData,
+        }
+    }
+
     #[inline]
     pub(crate) fn into_internal(self) -> Internal {
-        // SAFETY: every scoped value is a valid internal value of the same layout.
-        unsafe { std::mem::transmute::<Value<'s>, Internal>(self) }
+        *self.as_internal()
     }
 
-    /// The engine value this is, borrowed.
+    /// Ordinary values lend their original word. The internal completion marker is exposed
+    /// as an immutable undefined constant, including through coercion/equality entry points.
     #[inline]
     pub(crate) fn as_internal(&self) -> &Internal {
-        // SAFETY: as for `into_internal`; the borrow retains the original receiver's lifetime.
-        unsafe { &*std::ptr::from_ref(self).cast::<Internal>() }
+        if self.word.bits() == crate::value::PACK_EMPTY {
+            &Internal::Undefined
+        } else {
+            &self.word
+        }
     }
 
-    /// Engine values as scoped values. The engine never passes EMPTY to an embedder.
+    /// Borrow already normalized immutable words (ValueList maintains this invariant).
     #[inline]
     pub(crate) fn slice_from_internal<'a>(values: &'a [Internal]) -> &'a [Value<'s>] {
-        debug_assert!(
-            !values
-                .iter()
-                .any(|value| matches!((value).view(), ValueView::Empty)),
-            "an EMPTY completion value crossed into the embed API"
-        );
-        // SAFETY: as for `from_internal`, without EMPTY.
+        debug_assert!(values
+            .iter()
+            .all(|value| value.bits() != crate::value::PACK_EMPTY));
+        // SAFETY: both wrappers are transparent execution words. The original immutable loan
+        // and its roots remain live for the whole returned borrow; this never casts Cell slots.
         unsafe { &*(std::ptr::from_ref(values) as *const [Value<'s>]) }
     }
 
-    /// Scoped values as engine values.
-    #[inline]
-    pub(crate) fn slice_as_internal<'a>(values: &'a [Value<'s>]) -> &'a [Internal] {
-        // SAFETY: as for `into_internal`.
-        unsafe { &*(std::ptr::from_ref(values) as *const [Internal]) }
+    /// A native-boundary loan. Ordinary calls retain the canonical window's address; an
+    /// unexpected EMPTY uses a rare normalized copy without changing the caller's storage.
+    pub(crate) fn normalized_slice_from_internal<'a>(
+        values: &'a [Internal],
+    ) -> Cow<'a, [Value<'s>]> {
+        if values
+            .iter()
+            .any(|value| value.bits() == crate::value::PACK_EMPTY)
+        {
+            Cow::Owned(values.iter().copied().map(Self::from_internal).collect())
+        } else {
+            Cow::Borrowed(Self::slice_from_internal(values))
+        }
+    }
+
+    /// Forwarded public slices normalize raw EMPTY values to real undefined elements, never
+    /// holes. Ordinary inputs remain the original immutable word window.
+    pub(crate) fn slice_as_internal<'a>(values: &'a [Value<'s>]) -> Cow<'a, [Internal]> {
+        if values
+            .iter()
+            .any(|value| value.word.bits() == crate::value::PACK_EMPTY)
+        {
+            Cow::Owned(values.iter().copied().map(Self::into_internal).collect())
+        } else {
+            // SAFETY: the same transparent word representation and immutable loan. The scope
+            // still roots every reference, and the callee establishes its normal slice roots.
+            Cow::Borrowed(unsafe { &*(std::ptr::from_ref(values) as *const [Internal]) })
+        }
     }
 
     /// Whether this is undefined.
@@ -601,21 +653,45 @@ pub type IndexedLength = for<'s> fn(&Ctx<'s>, &Value<'s>) -> u32;
 /// ([`Ctx::install_live_readonly_indexed_properties`]): a native read, as [`IndexedLength`].
 pub type IndexedNames = for<'s> fn(&Ctx<'s>, &Value<'s>) -> Vec<String>;
 
-/// The engine form of a native function.
+/// Invoke a bare scoped callback at its actual declared Result signature. The caller roots
+/// the original immutable windows through the complete native boundary (including polls/tails).
 #[inline]
-pub(crate) fn native_fn(f: NativeFn) -> crate::value::NativeFn {
-    // SAFETY: the two signatures are the same machine signature: `&mut Ctx<'s>` and `&mut Interp`
-    // are both thin references (`Ctx` is `repr(transparent)` over `Interp`), the slices both
-    // slices of 16-byte values, and the receiver and results values of one layout (`repr(u64)`
-    // enums with the same discriminants and payloads), which the engine never makes EMPTY.
-    unsafe { std::mem::transmute::<NativeFn, crate::value::NativeFn>(f) }
+pub(crate) fn invoke_native(
+    function: NativeFn,
+    interp: &mut Interp,
+    this: Internal,
+    args: &[Internal],
+) -> Result<Internal, Internal> {
+    // SAFETY: one fresh call scope; the higher-ranked fn cannot export its brand. Results are
+    // converted before leaving this call. No aggregate-return function pointer is recast.
+    let cx = unsafe { Ctx::new(interp) };
+    function(
+        cx,
+        Value::from_internal(this),
+        &Value::normalized_slice_from_internal(args),
+    )
+    .map(Value::into_internal)
+    .map_err(Value::into_internal)
 }
 
-/// The engine form of a native function with captures (as [`native_fn`]).
 #[inline]
-fn native_capture_fn(f: NativeCaptureFn) -> crate::value::NativeCaptureFn {
-    // SAFETY: as for `native_fn`.
-    unsafe { std::mem::transmute::<NativeCaptureFn, crate::value::NativeCaptureFn>(f) }
+pub(crate) fn invoke_captured_native(
+    function: NativeCaptureFn,
+    interp: &mut Interp,
+    this: Internal,
+    args: &[Internal],
+    captures: &[Internal],
+) -> Result<Internal, Internal> {
+    // SAFETY: as in invoke_native, with the immutable engine-owned captures rooted by the call.
+    let cx = unsafe { Ctx::new(interp) };
+    function(
+        cx,
+        Value::from_internal(this),
+        &Value::normalized_slice_from_internal(args),
+        &Value::normalized_slice_from_internal(captures),
+    )
+    .map(Value::into_internal)
+    .map_err(Value::into_internal)
 }
 
 /// The engine form of a native closure: a closure of the engine's signature calling it.
@@ -631,7 +707,7 @@ where
             f(
                 cx,
                 Value::from_internal(this),
-                Value::slice_from_internal(args),
+                &Value::normalized_slice_from_internal(args),
             )
             .map(Value::into_internal)
             .map_err(Value::into_internal)
@@ -657,8 +733,8 @@ where
             f(
                 cx,
                 Value::from_internal(this),
-                Value::slice_from_internal(args),
-                Value::slice_from_internal(captures),
+                &Value::normalized_slice_from_internal(args),
+                &Value::normalized_slice_from_internal(captures),
             )
             .map(Value::into_internal)
             .map_err(Value::into_internal)
@@ -951,19 +1027,17 @@ impl<'s> Ctx<'s> {
 
     /// A native function object of the current Realm.
     pub fn make_native(&self, name: &str, len: usize, f: NativeFn) -> Object<'s> {
-        Object::from_gc(self.it_ref().make_native(name, len, native_fn(f)))
+        Object::from_gc(self.it_ref().make_scoped_native(name, len, f))
     }
 
     /// Define a native method on `target` (non-enumerable, as built-ins are).
     pub fn def_method(&self, target: &Object<'s>, name: &str, len: usize, f: NativeFn) {
-        self.it_ref()
-            .def_method(&target.gc(), name, len, native_fn(f));
+        self.it_ref().def_scoped_method(&target.gc(), name, len, f);
     }
 
     /// Define a native function on the active Realm's global object.
     pub fn define_embed_global(&mut self, name: &str, len: usize, function: NativeFn) {
-        self.it()
-            .define_embed_global(name, len, native_fn(function));
+        self.it().define_scoped_global(name, len, function);
     }
 
     /// A function backed by a native closure that carries Rust state (N-API callbacks carrying
@@ -1013,10 +1087,10 @@ impl<'s> Ctx<'s> {
         function: NativeCaptureFn,
         captures: &[Value<'s>],
     ) -> Value<'s> {
-        Value::from_internal(self.it_ref().new_native_fn_with_captures(
+        Value::from_internal(self.it_ref().new_scoped_native_with_captures(
             name,
             len,
-            native_capture_fn(function),
+            function,
             Value::slice_as_internal(captures).to_vec(),
         ))
     }
@@ -1216,7 +1290,7 @@ impl<'s> Ctx<'s> {
         thrown(self.it().invoke(
             callee.into_internal(),
             this.into_internal(),
-            Value::slice_as_internal(args),
+            &Value::slice_as_internal(args),
         ))
     }
 
@@ -1231,7 +1305,7 @@ impl<'s> Ctx<'s> {
             .call(
                 callee.into_internal(),
                 this.into_internal(),
-                Value::slice_as_internal(args),
+                &Value::slice_as_internal(args),
             )
             .map(Value::from_internal)
             .map_err(lowered)
@@ -1247,7 +1321,7 @@ impl<'s> Ctx<'s> {
         eval_result(self.it().invoke_interruptible(
             callee.into_internal(),
             this.into_internal(),
-            Value::slice_as_internal(args),
+            &Value::slice_as_internal(args),
         ))
     }
 
@@ -1262,7 +1336,7 @@ impl<'s> Ctx<'s> {
         thrown(self.it().invoke_callback_entry(
             callee.into_internal(),
             this.into_internal(),
-            Value::slice_as_internal(args),
+            &Value::slice_as_internal(args),
         ))
     }
 
@@ -1274,7 +1348,7 @@ impl<'s> Ctx<'s> {
     ) -> Result<Value<'s>, Value<'s>> {
         thrown(
             self.it()
-                .construct_value(callee.into_internal(), Value::slice_as_internal(args)),
+                .construct_value(callee.into_internal(), &Value::slice_as_internal(args)),
         )
     }
 
@@ -1771,7 +1845,7 @@ impl<'s> Ctx<'s> {
         eval_result(self.it().call_callback_entry(
             func.as_internal(),
             this.into_internal(),
-            Value::slice_as_internal(args),
+            &Value::slice_as_internal(args),
             script_caller.as_internal(),
         ))
     }

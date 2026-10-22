@@ -10,7 +10,6 @@ use crate::fasthash::FastMap;
 use crate::interpreter::{Abrupt, Interp, PreparedCall};
 use crate::value::{PackedValue, Value};
 use std::cell::{Cell, RefCell};
-use std::mem::ManuallyDrop;
 
 pub(crate) struct Callback {
     // This strong root owns the closure and its environment across every GC/callback reentry.
@@ -58,11 +57,13 @@ impl Callback {
                 .as_ref()
                 .filter(|prepared| interp.prepared_call_current(prepared))
             {
-                let mut args = ManuallyDrop::new(args.map(PackedValue::pack));
-                let this = ManuallyDrop::new(PackedValue::pack(this));
-                // The prepared entry consumes every operand, exactly like a cache hit.
-                return unsafe { interp.call_prepared(prepared, &*this, args.as_mut_ptr(), N) }
-                    .map(PackedValue::into_value);
+                let this = PackedValue::pack(this);
+                // The evaluated array remains immutable and in scope through all nested calls,
+                // post-call polls, and tail drains. Its canonical words need no adapter array.
+                return unsafe {
+                    interp.call_prepared(prepared, &this, args.as_ptr().cast::<PackedValue>(), N)
+                }
+                .map(PackedValue::into_value);
             }
         }
         let result = self.cache.call(interp, &self.callee, this, args);
@@ -107,33 +108,7 @@ impl CallbackCache {
         this: Value,
         args: [Value; N],
     ) -> Result<Value, Abrupt> {
-        if interp.tier != Tier::Jit {
-            return interp.call(callee.clone(), this, &args);
-        }
-        let mut args = ManuallyDrop::new(args.map(PackedValue::pack));
-        let mut this = ManuallyDrop::new(PackedValue::pack(this));
-        // Both fast entries leave all arguments untouched on None and consume all of them on
-        // Some, including early stack/interrupt errors. ManuallyDrop transfers ownership once;
-        // the generic path below recovers normal RAII ownership on a miss.
-        unsafe {
-            let result = interp
-                .call_jit_cached(&self.site, callee, &*this, args.as_mut_ptr(), N)
-                .or_else(|| {
-                    interp.call_jit_fast(
-                        callee,
-                        &*this,
-                        args.as_mut_ptr(),
-                        N,
-                        Some((&self.site, &self.pins)),
-                    )
-                });
-            if let Some(result) = result {
-                return result;
-            }
-            let args = ManuallyDrop::take(&mut args).map(PackedValue::into_value);
-            let this = ManuallyDrop::take(&mut this).into_value();
-            interp.call(callee.clone(), this, &args)
-        }
+        self.call_values(interp, callee, this, &args)
     }
 
     pub(crate) fn call_values(
@@ -143,51 +118,31 @@ impl CallbackCache {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        // Native algorithms and host callbacks overwhelmingly use at most four arguments.
-        // Larger argument lists retain the same guarded ABI, allocating only actual arguments.
         if interp.tier != Tier::Jit {
-            return interp.call(callee.clone(), this, args);
+            return interp.call(*callee, this, args);
         }
-        match args {
-            [] => self.call(interp, callee, this, []),
-            [a] => self.call(interp, callee, this, [a.clone()]),
-            [a, b] => self.call(interp, callee, this, [a.clone(), b.clone()]),
-            [a, b, c] => self.call(interp, callee, this, [a.clone(), b.clone(), c.clone()]),
-            [a, b, c, d] => self.call(
-                interp,
-                callee,
-                this,
-                [a.clone(), b.clone(), c.clone(), d.clone()],
-            ),
-            _ => {
-                let mut args: Vec<_> = args.iter().cloned().map(PackedValue::pack).collect();
-                let mut this = ManuallyDrop::new(PackedValue::pack(this));
-                unsafe {
-                    let result = interp
-                        .call_jit_cached(&self.site, callee, &*this, args.as_mut_ptr(), args.len())
-                        .or_else(|| {
-                            interp.call_jit_fast(
-                                callee,
-                                &*this,
-                                args.as_mut_ptr(),
-                                args.len(),
-                                Some((&self.site, &self.pins)),
-                            )
-                        });
-                    if let Some(result) = result {
-                        // The committed entry consumed every element; keep only the allocation.
-                        args.set_len(0);
-                        return result;
-                    }
-                    let args: Vec<_> = args.into_iter().map(PackedValue::into_value).collect();
-                    interp.call(
-                        callee.clone(),
-                        ManuallyDrop::take(&mut this).into_value(),
-                        &args,
+        // Safe callers may lend a Rust-heap argument window. The compiled entry polls before
+        // seeding its own frame; keep these exact words rooted through both entry paths, any
+        // generic fallback, post-call polls and pending tails, without copying the window.
+        let _arguments = crate::rooting::root_slice(args);
+        let this_word = PackedValue::pack(this);
+        let words = crate::execution_storage::words_from_values(args);
+        // SAFETY: the original evaluated argument window stays borrowed until the committed
+        // call (including polls and tails) returns. Nothing mutates or pools it here.
+        let result = unsafe {
+            interp
+                .call_jit_cached(&self.site, callee, &this_word, words.as_ptr(), words.len())
+                .or_else(|| {
+                    interp.call_jit_fast(
+                        callee,
+                        &this_word,
+                        words.as_ptr(),
+                        words.len(),
+                        Some((&self.site, &self.pins)),
                     )
-                }
-            }
-        }
+                })
+        };
+        result.unwrap_or_else(|| interp.call(*callee, this, args))
     }
 
     pub(crate) fn prune_dead(&self) {
@@ -726,5 +681,174 @@ mod tests {
                 .and_then(Option::as_ref)
                 .is_some());
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod entry_root_tests {
+    use super::*;
+    use crate::gc_core::MarkSource;
+    use crate::value::{Callable, Gc};
+    use crate::{Completion, Engine};
+
+    fn check(warm_cache: bool) {
+        let child = if warm_cache {
+            "TRUST_JS_TEST_CACHED_CALLBACK_ENTRY_ROOT_CHILD"
+        } else {
+            "TRUST_JS_TEST_FAST_CALLBACK_ENTRY_ROOT_CHILD"
+        };
+        let name = if warm_cache {
+            "callback::entry_root_tests::cached_callback_roots_heap_arguments_before_the_entry_poll"
+        } else {
+            "callback::entry_root_tests::fast_callback_roots_heap_arguments_before_the_entry_poll"
+        };
+        if std::env::var_os(child).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--test-threads=1"])
+                .env(child, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        match engine
+            .eval(
+                "function entryRoot(a,b,c,d,e,f){return 17};entryRoot(0,0,0,0,0,0)",
+                false,
+            )
+            .unwrap()
+        {
+            Completion::Value(value) => assert_eq!(value, "17"),
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+        let env = engine.interp.global_env;
+        let callee = engine
+            .interp
+            .get_var("entryRoot", &env)
+            .unwrap_or_else(|_| panic!("compiled callback"));
+        let object = callee.as_obj().unwrap();
+        let body = object.borrow();
+        let Callable::User(user) = &body.call else {
+            panic!("user callback");
+        };
+        let chunk = user
+            .func
+            .runtime()
+            .execution_code()
+            .and_then(Option::as_ref)
+            .unwrap()
+            .clone();
+        assert!(chunk.jit.get().flatten().is_some());
+        drop(body);
+        engine.interp.native_callback_cache = None;
+        if warm_cache {
+            engine
+                .interp
+                .invoke(callee, Value::Undefined, &[Value::Num(0.0); 6])
+                .unwrap_or_else(|_| panic!("warm callback cache"));
+            let key = Gc::as_ptr(&object) as usize;
+            let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                engine
+                    .interp
+                    .native_callback_cache
+                    .as_ref()
+                    .unwrap()
+                    .site
+                    .entries
+                    .iter()
+                    .any(|entry| entry.get().callee == key && entry.get().epoch == epoch),
+                "actual current compiled cache hit"
+            );
+        }
+        engine
+            .interp
+            .gc_heap
+            .core
+            .borrow_mut()
+            .set_retention_tracing(true);
+        // Only the Rust-heap Vec carries the argument word after this helper returns. A weak
+        // pin protects diagnostic identity but supplies no strong edge or KeepDuringJob root.
+        let (arguments, weak) = crate::gc_test::in_frame(|| {
+            let object = engine.interp.new_object();
+            (
+                vec![
+                    Value::Obj(object),
+                    Value::Num(1.0),
+                    Value::Num(2.0),
+                    Value::Num(3.0),
+                    Value::Num(4.0),
+                    Value::Num(5.0),
+                ],
+                Gc::downgrade(&object),
+            )
+        });
+        chunk.jit_runs.set(0);
+        chunk.inline_retry_at.set(u32::MAX);
+        let before = engine.interp.gc_heap.core.borrow().collections();
+        // The first compiled-entry poll must collect before argument slots are seeded. The
+        // scalar-returning body neither reads this argument nor executes any later safepoint.
+        engine.interp.gc_tick = crate::interpreter::GC_CALL_POLL_MASK;
+        engine.interp.gc_next = 0;
+        let result = engine
+            .interp
+            .invoke(callee, Value::Undefined, &arguments)
+            .unwrap_or_else(|_| panic!("native callback"));
+        assert_eq!(result.as_num_opt(), Some(17.0));
+        assert_eq!(
+            engine.interp.gc_heap.core.borrow().collections(),
+            before + 1,
+            "one pre-entry collection, none in the body"
+        );
+        assert!(
+            chunk.jit_runs.get() >= 1,
+            "the exact compiled callee must enter native code"
+        );
+        let root = weak
+            .upgrade()
+            .expect("pre-entry collection lost the heap argument");
+        let path = engine
+            .interp
+            .gc_heap
+            .core
+            .borrow()
+            .retention_path(Gc::as_ptr(&root) as usize);
+        assert!(
+            matches!(path.first(), Some((_, _, MarkSource::Root))),
+            "pre-entry heap arguments must be explicit roots, got {path:?}"
+        );
+        assert_eq!(
+            arguments[0].cell_word().unwrap() as usize,
+            Gc::as_ptr(&root) as usize
+        );
+        drop(arguments);
+        engine
+            .interp
+            .gc_collect_precise_for_test(crate::gc_core::CollectionKind::Major);
+        assert!(
+            weak.upgrade().is_none(),
+            "callback arguments remained rooted after the loan ended"
+        );
+    }
+
+    #[test]
+    fn fast_callback_roots_heap_arguments_before_the_entry_poll() {
+        check(false);
+    }
+    #[test]
+    fn cached_callback_roots_heap_arguments_before_the_entry_poll() {
+        check(true);
     }
 }

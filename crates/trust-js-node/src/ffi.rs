@@ -839,4 +839,79 @@ mod tests {
             0b010
         );
     }
+
+    #[test]
+    fn float_returns_and_memory_reads_canonicalize_js_nan_only() {
+        extern "C" fn f64_payload(bits: u64) -> f64 {
+            f64::from_bits(bits)
+        }
+        extern "C" fn f32_payload(bits: u64) -> f32 {
+            f32::from_bits(bits as u32)
+        }
+        let mut engine = trust_js_host::Engine::new();
+        engine.scope(|cx| {
+            assert_eq!(std::mem::size_of::<Value<'_>>(), 8);
+            let word =
+                |value: &Value<'_>| unsafe { std::ptr::from_ref(value).cast::<u64>().read() };
+            for high in (0x7ff0u64..=0x7fff).chain(0xfff0..=0xffff) {
+                let bits = high << 48 | 0x8000_1234_5678;
+                let address = std::hint::black_box(f64_payload as *const ()).cast::<c_void>();
+                let raw = unsafe { invoke_native(address, &[bits], &[], T_F64) };
+                assert_eq!(
+                    raw.f64.to_bits(),
+                    bits,
+                    "the foreign return retains its payload"
+                );
+                let js = marshal_return(cx, raw, T_F64);
+                assert_eq!(word(&js), 0x7ff8_0000_0000_0000);
+                let pointer = std::ptr::from_ref(&bits) as usize;
+                let js = op_read(
+                    cx,
+                    Value::Undefined,
+                    &[Value::Num(pointer as f64), Value::Num(0.0), Value::Num(9.0)],
+                )
+                .unwrap();
+                assert_eq!(word(&js), 0x7ff8_0000_0000_0000);
+                assert_eq!(
+                    bits,
+                    high << 48 | 0x8000_1234_5678,
+                    "the foreign memory is not rewritten"
+                );
+            }
+            for bits in [
+                0x7f80_0001u32,
+                0x7fc0_0001,
+                0x7fff_ffff,
+                0xff80_0001,
+                0xffc0_0001,
+                0xffff_ffff,
+            ] {
+                let address = std::hint::black_box(f32_payload as *const ()).cast::<c_void>();
+                let raw = unsafe { invoke_native(address, &[u64::from(bits)], &[], T_F32) };
+                assert_eq!(raw.f32.to_bits(), bits);
+                assert_eq!(word(&marshal_return(cx, raw, T_F32)), 0x7ff8_0000_0000_0000);
+                let pointer = std::ptr::from_ref(&bits) as usize;
+                let js = op_read(
+                    cx,
+                    Value::Undefined,
+                    &[Value::Num(pointer as f64), Value::Num(0.0), Value::Num(8.0)],
+                )
+                .unwrap();
+                assert_eq!(word(&js), 0x7ff8_0000_0000_0000);
+            }
+            for number in [
+                0.0f64,
+                -0.0,
+                f64::from_bits(1),
+                -f64::from_bits(1),
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                1.5,
+            ] {
+                let address = std::hint::black_box(f64_payload as *const ()).cast::<c_void>();
+                let raw = unsafe { invoke_native(address, &[number.to_bits()], &[], T_F64) };
+                assert_eq!(word(&marshal_return(cx, raw, T_F64)), number.to_bits());
+            }
+        });
+    }
 }
