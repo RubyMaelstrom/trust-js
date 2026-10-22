@@ -1810,17 +1810,17 @@ pub struct JitCtx {
 /// it: the packed word.
 pub(crate) type JitThis = PackedValue;
 
-/// An activation's `this` lent to Rust code that takes a `&Value` (see [`JitCtx::this_view`]):
-/// the view holds the widened word.
+/// An activation's `this` copied for a borrowed VM bridge (see [`JitCtx::this_view`]).
+/// Holding its word separately lets the bridge also borrow the context's mutable fields.
 pub(crate) struct JitThisView {
-    this: Value,
+    this: PackedValue,
 }
 
 impl std::ops::Deref for JitThisView {
-    type Target = Value;
+    type Target = PackedValue;
 
     #[inline]
-    fn deref(&self) -> &Value {
+    fn deref(&self) -> &PackedValue {
         &self.this
     }
 }
@@ -1833,13 +1833,17 @@ impl JitCtx {
         self.this_word.unpack()
     }
 
-    /// Lend the activation's `this` as a wide Value without borrowing the context, so the caller
-    /// can lend the context's other fields beside it: the view holds the widened word.
+    /// Copy the activation's existing word without borrowing the context.
     #[inline]
     pub(crate) fn this_view(&self) -> JitThisView {
         JitThisView {
-            this: self.this_word.unpack(),
+            this: self.this_word,
         }
+    }
+
+    #[inline]
+    pub(crate) fn this_word(&self) -> PackedValue {
+        self.this_word
     }
 
     /// Install the activation's `this`; the previous word owns nothing, so nothing is released.
@@ -2232,7 +2236,7 @@ mod shared_stub_tests {
                 .collect()
         })
         .unwrap();
-        let name_stub = SharedStub::NameValuePtr { packed_ok: true }.key();
+        let name_stub = SharedStub::NameValuePtr { property_ok: true }.key();
         assert!(keys.contains(&name_stub));
         assert!(keys
             .iter()
@@ -2242,11 +2246,11 @@ mod shared_stub_tests {
     #[test]
     fn shared_stubs_are_requested_once_and_forgotten_with_a_rewound_emission() {
         let mut a = asm::Asm::new();
-        let name = SharedStub::NameValuePtr { packed_ok: true }.key();
+        let name = SharedStub::NameValuePtr { property_ok: true }.key();
         let first = a.shared_stub(name);
         assert_eq!(a.shared_stub(name), first, "one entry label per stub");
         let checkpoint = a.checkpoint();
-        let transient = a.shared_stub(SharedStub::NameValuePtr { packed_ok: false }.key());
+        let transient = a.shared_stub(SharedStub::NameValuePtr { property_ok: false }.key());
         assert_ne!(transient, first);
         a.rewind(checkpoint);
         let requested = a.take_shared_stubs();
@@ -2261,8 +2265,8 @@ mod shared_stub_tests {
     #[test]
     fn shared_stub_keys_round_trip() {
         let mut keys = vec![
-            SharedStub::NameValuePtr { packed_ok: false }.key(),
-            SharedStub::NameValuePtr { packed_ok: true }.key(),
+            SharedStub::NameValuePtr { property_ok: false }.key(),
+            SharedStub::NameValuePtr { property_ok: true }.key(),
             SharedStub::NameValuePtrIn.key(),
         ];
         #[cfg(all(
@@ -6088,14 +6092,7 @@ fn emit_prop_load_inline(
     // of discarding the validation and re-deriving the resolution in Rust.
     guard_prop_data(a, 9, 15, ea, accessor_hit);
     a.bind(val_body);
-    if layout.entry_accessor == layout.entry_value + 8 {
-        // Heap and execution words share the encoding.
-        a.ldur(12, 15, ev);
-    } else {
-        a.ldur(9, 15, ev);
-        a.ldur(13, 15, ev + 8);
-        emit_exec_encode_wide(a, 9, 13, 12, 16, 17, 0, slow);
-    }
+    a.ldur(12, 15, ev); // Heap and execution storage share the complete word.
     if name == "prototype" {
         // Only this key can hold a function's deferred prototype.
         property_word_guard(a, 12, 13, slow);
@@ -6276,13 +6273,7 @@ fn emit_method_elem_dense(
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 9, 15, ea, slow);
-    if layout.entry_accessor == layout.entry_value + 8 {
-        a.ldur(12, 15, ev);
-    } else {
-        a.ldur(9, 15, ev);
-        a.ldur(13, 15, ev + 8);
-        emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 0, slow);
-    }
+    a.ldur(12, 15, ev);
     // Commit: the element simply replaces the Number key.
     a.bind(commit);
     emit_exec_word_store(a, 12, 20, -8);
@@ -7572,7 +7563,6 @@ fn direct_call_supported(
         && fits8(il.fn_frames + il.fnf_cap_word)
         && fits8(il.frame_pool + il.fp_ptr_word)
         && fits8(il.frame_pool + il.fp_len_word)
-        && fits8(il.new_target + 8)
         // The handlers Vec's length-word offset within JitCtx (per-instantiation, probed).
         && jit_handlers_len_offset().is_some_and(fits8)
         && fits8(offset_of!(JitCtx, ret))
@@ -7889,8 +7879,8 @@ fn emit_direct_call(
         }
         a.str_imm(4, 9, 48);
     }
-    // Save area: [record, constructing (byte), new_target (16B)]. constructing and new_target
-    // live on the interpreter and are cleared for the callee.
+    // Save area: [record, constructing (byte), new_target word, padding]. Keep SP 16-aligned.
+    // The interpreter's construct state is cleared for an ordinary callee.
     a.sub_imm(31, 31, 32);
     a.stur(9, 31, 0);
     let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
@@ -7898,16 +7888,15 @@ fn emit_direct_call(
     a.stur(4, 31, 8);
     a.strb_imm(31, construct_base, construct_offset);
     a.ldr_imm(4, 14, il.new_target as u32);
-    a.ldr_imm(5, 14, (il.new_target + 8) as u32);
     a.stur(4, 31, 16);
-    a.stur(5, 31, 24);
-    let (target_base, target_offset) = byte_field_address(a, 14, il.new_target, 16);
+    a.stur(31, 31, 24); // initialized padding cannot retain a stale conservative root
     let lexical_target = a.new_label();
     a.ldurb(4, 12, IC_DIRECT);
     let lexical_bit = asm::logical_imm_w(crate::bytecode::CALL_IC_LEXICAL_THIS as u32).unwrap();
     a.logic_imm_w(0, 4, 4, lexical_bit);
     a.cbnz(4, false, lexical_target);
-    a.strb_imm(31, target_base, target_offset); // ordinary calls clear new.target
+    a.mov_imm64(4, crate::value::PACK_UNDEFINED);
+    a.str_imm(4, 14, il.new_target as u32); // ordinary calls clear the complete word
     a.bind(lexical_target); // arrows retain their lexical function environment's new.target
 
     // ---- run the callee on its own record ----
@@ -7918,6 +7907,31 @@ fn emit_direct_call(
     let field1 = asm::logical_imm_w(1).unwrap();
     a.logic_imm_w(2, 1, 0, field1); // eor w1, w0, #1
     a.ldur(10, 31, 0);
+    #[cfg(test)]
+    {
+        // Count the exact callee while its record/FnFrame still retains its runtime and
+        // Chunk. No borrowed Chunk pointer outlives finish, and w1 (threw) remains intact.
+        let normal = a.new_label();
+        let record = a.new_label();
+        a.ldr_imm(4, 10, cx_chunk);
+        a.cbz(1, false, normal);
+        a.add_imm(
+            4,
+            4,
+            offset_of!(crate::bytecode::Chunk, test_direct_throws) as u32,
+        );
+        a.b(record);
+        a.bind(normal);
+        a.add_imm(
+            4,
+            4,
+            offset_of!(crate::bytecode::Chunk, test_direct_returns) as u32,
+        );
+        a.bind(record);
+        a.ldr_imm(5, 4, 0);
+        a.add_imm(5, 5, 1);
+        a.str_imm(5, 4, 0);
+    }
     // Teardown (completion transfer, record return, frame pop, tail drain, depth--): one
     // shared per-chunk stub (see `emit_direct_finish_stub`) whose fast path never leaves
     // machine code. w8 = threw.
@@ -7929,15 +7943,24 @@ fn emit_direct_call(
     let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
     a.strb_imm(4, construct_base, construct_offset);
     a.ldur(4, 31, 16);
-    a.ldur(5, 31, 24);
     a.str_imm(4, 14, il.new_target as u32);
-    a.str_imm(5, 14, (il.new_target + 8) as u32);
     a.add_imm(31, 31, 32);
 
     // ---- pop the arguments and the callee (and skip the consumed this slot); dispatch on
     // threw ----
     let popped = ((argc + 1 + with_this as usize) * 8) as u32;
     a.sub_imm(20, 20, popped);
+    #[cfg(test)]
+    {
+        let normal = a.new_label();
+        a.cbz(8, true, normal);
+        let address = TEST_DIRECT_PACKED_THROWS.with(|count| count.as_ptr() as usize);
+        a.mov_imm64(4, address as u64);
+        a.ldr_imm(5, 4, 0);
+        a.add_imm(5, 5, 1);
+        a.str_imm(5, 4, 0);
+        a.bind(normal);
+    }
     a.cbnz(8, true, l_unwind); // threw → caller unwind (fields restored)
                                // Move the complete word; no decode/encode.
     a.ldr_imm(4, 19, cx_ret);
@@ -7957,6 +7980,8 @@ fn emit_direct_call(
 #[cfg(all(test, target_arch = "aarch64"))]
 thread_local! {
     static TEST_DIRECT_PACKED_RETURNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Direct callee errors dispatched only after restoring constructing and new_target.
+    static TEST_DIRECT_PACKED_THROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Numeric-chain property operations compiled with `this` as their receiver.
     static TEST_THIS_CHAIN_OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -8684,46 +8709,28 @@ fn emit_update_prop_inline(
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 9, 15, ea, slow);
     guard_prop_writable(a, 9, 15, ew, slow);
-    if layout.entry_accessor == layout.entry_value + 8 {
-        a.ldur(16, 15, ev);
-        a.lsr_imm(9, 16, 48);
-        let number = a.new_label();
-        a.movz(14, (crate::value::PACK_OBJ >> 48) as u32, 0);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_HS, slow);
-        a.movz(14, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_LO, number);
-        a.movz(14, (crate::value::PACK_SYM >> 48) as u32, 0);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_LS, slow);
-        a.bind(number);
-    } else {
-        a.ldurb(9, 15, ev);
-        a.cmp_imm_w(9, 4);
-        a.b_cond(C_NE, slow);
-    }
+    a.ldur(16, 15, ev);
+    a.lsr_imm(9, 16, 48);
+    let number = a.new_label();
+    a.movz(14, (crate::value::PACK_OBJ >> 48) as u32, 0);
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_HS, slow);
+    a.movz(14, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_LO, number);
+    a.movz(14, (crate::value::PACK_SYM >> 48) as u32, 0);
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_LS, slow);
+    a.bind(number);
     // --- commit: d0 = old, d2 = old ± 1, written in place ---
-    a.ldur_d(
-        0,
-        15,
-        if layout.entry_accessor == layout.entry_value + 8 {
-            ev
-        } else {
-            ev + 8
-        },
-    );
+    a.ldur_d(0, 15, ev);
     a.fmov_one(1);
     let dec = matches!(
         kind,
         UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
     );
     a.f_arith(if dec { 1 } else { 0 }, 2, 0, 1);
-    if layout.entry_accessor == layout.entry_value + 8 {
-        emit_exec_number_store(a, 2, 15, ev, 16);
-    } else {
-        a.stur_d(2, 15, ev + 8);
-    }
+    emit_exec_number_store(a, 2, 15, ev, 16);
     // result per kind: Pre* push the new value, Post* the old, *Discard nothing.
     match kind {
         UpdKind::PreInc | UpdKind::PreDec => {
@@ -9978,8 +9985,8 @@ fn load_name_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.scope_gen / 4 < 4096
         && layout.scope_layout.is_multiple_of(4)
         && layout.scope_layout / 4 < 4096
-        && layout.binding_value + 16 < 256
-        && layout.binding_value < 4096
+        && layout.binding_value.is_multiple_of(8)
+        && layout.binding_value < 256
         && layout.binding_init < 4096
         && layout.binding_import < 4096
         && layout.scope_with_valid
@@ -10019,10 +10026,10 @@ fn emit_update_name_inline(
 ) {
     let slow = a.new_label();
     let done = a.new_label();
-    let bits = a.new_label();
     let scope = a.new_label();
+    let checked = a.new_label();
 
-    // x14 -> wide Binding.value (x7=0) or packed global Property value (x7=1).
+    // x14 -> execution word. x7 still distinguishes Binding (0) from Property (1).
     emit_name_ic_value_ptr(a, layout, cache_ptr, slow, true);
     a.cbz(7, false, scope);
 
@@ -10034,24 +10041,10 @@ fn emit_update_name_inline(
         (layout.entry_writable - layout.entry_value) as u32,
         slow,
     );
-    a.ldur(16, 14, 0);
-    a.lsr_imm(9, 16, 48);
-    let packed_number = a.new_label();
-    a.movz(13, (crate::value::PACK_OBJ >> 48) as u32, 0);
-    a.cmp_reg_w(9, 13);
-    a.b_cond(C_HS, slow);
-    a.movz(13, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-    a.cmp_reg_w(9, 13);
-    a.b_cond(C_LO, packed_number);
-    a.movz(13, (crate::value::PACK_SYM >> 48) as u32, 0);
-    a.cmp_reg_w(9, 13);
-    a.b_cond(C_HI, packed_number);
-    a.b(slow);
-    a.bind(packed_number);
-    a.b(bits);
+    a.b(checked);
 
-    // Scope mode: mutability is live (const/named-expression bindings must take the slow path);
-    // wide execution Values carry their Number tag beside the payload.
+    // Scope mode retains the live mutability check (const/named-expression bindings take
+    // the checked path); changing representation does not change the owner or its flags.
     a.bind(scope);
     a.ldrb_imm(
         9,
@@ -10059,13 +10052,10 @@ fn emit_update_name_inline(
         (layout.binding_mutable - layout.binding_value) as u32,
     );
     a.cbz(9, false, slow);
-    a.ldurb(9, 14, 0);
-    a.cmp_imm_w(9, 4);
-    a.b_cond(C_NE, slow);
-    a.add_imm(14, 14, 8);
 
-    // x14 now points at the f64 bits in either storage mode.
-    a.bind(bits);
+    // Every non-number execution tag is a NaN. Keep numeric NaN canonicalization on the
+    // checked path too; finite Numbers, signed zero and infinities share this word update.
+    a.bind(checked);
     a.ldur_d(0, 14, 0);
     a.fcmp(0, 0);
     a.b_cond(C_VS, slow); // keep NaN boxing/canonicalization on the checked path
@@ -10087,6 +10077,8 @@ fn emit_update_name_inline(
         }
         UpdKind::IncDiscard | UpdKind::DecDiscard => {}
     }
+    #[cfg(test)]
+    names::record_name_commit(a, 2);
     a.b(done);
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
@@ -10188,7 +10180,7 @@ fn emit_store_name_value(
     let scope = a.new_label();
     a.cbz(7, false, scope);
 
-    // Packed global property: the moved stack word overwrites the old one.
+    // Property mode retains its live writable/data-descriptor guard.
     guard_prop_writable(
         a,
         9,
@@ -10219,10 +10211,11 @@ fn emit_store_name_value(
     }
     emit_card_mark(a, 15, 15, 16);
     a.sub_imm(20, 20, 8);
+    #[cfg(test)]
+    names::record_name_commit(a, 1);
     a.b(done);
 
-    // Wide scope binding: validate mutability. The incoming Value moves from the operand stack
-    // into the binding, and the old value is released by overwriting it.
+    // Scope binding: validate mutability, then copy the complete incoming execution word.
     a.bind(scope);
     a.ldrb_imm(
         9,
@@ -10231,8 +10224,12 @@ fn emit_store_name_value(
     );
     a.cbz(9, false, slow);
     emit_exec_word_load(a, 8, 20, -8);
-    // A Number stored over a Number (the common update of a closure variable such as a stack
-    // pointer) overwrites the payload: the discriminant stays and neither word owns anything.
+    // The old wide decoder rejected property-only/reserved words before publishing either
+    // half. Retain that boundary before the one-word Binding commit; EMPTY remains distinct
+    // from the separately checked initialization flag, as in the old decoder.
+    property_word_guard(a, 8, 9, slow);
+    a.stur(8, 14, 0);
+    // Number stores need no young-edge barrier, regardless of the displaced word's kind.
     {
         let generic = a.new_label();
         let number = a.new_label();
@@ -10243,19 +10240,12 @@ fn emit_store_name_value(
         a.cmp_reg_x(8, 9);
         a.b_cond(C_NE, generic);
         a.bind(number);
-        a.ldurb(9, 14, 0);
-        a.cmp_imm_w(9, 4);
-        a.b_cond(C_NE, generic);
-        a.stur(8, 14, 8);
         a.sub_imm(20, 20, 8);
+        #[cfg(test)]
+        names::record_name_commit(a, 1);
         a.b(done);
         a.bind(generic);
     }
-    // The decode below precedes both stores.
-    emit_exec_word_load(a, 8, 20, -8);
-    emit_exec_decode_wide(a, 8, 9, 10, 11, 13, slow);
-    a.stur(9, 14, 0);
-    a.stur(10, 14, 8);
     // The write barrier (site D): the binding's environment, reloaded.
     match owner {
         NameStoreOwner::Cache(cache_ptr) => emit_name_owner_env(a, layout, cache_ptr),
@@ -10276,6 +10266,8 @@ fn emit_store_name_value(
     }
     emit_card_mark(a, 17, 17, 16);
     a.sub_imm(20, 20, 8);
+    #[cfg(test)]
+    names::record_name_commit(a, 1);
     a.b(done);
 }
 
@@ -10329,7 +10321,7 @@ fn emit_load_name_inline_marked(
     }
     // Validate the cache and leave a pointer to the resolved Value in x14 (either mode).
     emit_name_ic_value_ptr(a, layout, cache_ptr, slow, true);
-    emit_load_name_value(a, layout, slow, for_call, false);
+    emit_load_name_value(a, slow, for_call, false);
     a.b(done);
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
@@ -10364,14 +10356,15 @@ fn emit_load_name_in_inline(
     } else {
         emit_name_ic_value_ptr_in(a, layout, slow, true, NameEnv::InX9);
     }
-    emit_load_name_value(a, layout, slow, for_call, false);
+    emit_load_name_value(a, slow, for_call, false);
     a.b(done);
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
     a.bind(done);
 }
 
-/// Clone from a checked x14 value address into the canonical operand stack (x7=storage kind).
+/// Copy the word at a checked x14 value address into the canonical operand stack. x7 is the
+/// semantic owner kind, Binding=0/Property=1; both owners now store the same execution word.
 /// `prototype_key`: a `LoadRef` whose Reference names `prototype`. Its packed holder can be a
 /// `with` object that is a function whose prototype is still deferred; the packed holder of a
 /// free-name read is the global object, never a function.
@@ -10379,52 +10372,13 @@ fn emit_load_name_in_inline(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_load_name_value(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    slow: usize,
-    for_call: bool,
-    prototype_key: bool,
-) {
-    // Lexical Binding.value stays wide; object properties already share execution encoding.
-    let loaded = a.new_label();
-    if layout.entry_accessor == layout.entry_value + 8 {
-        let wide = a.new_label();
-        a.cbz(7, false, wide);
-        a.ldur(12, 14, 0);
-        if prototype_key {
-            property_word_guard(a, 12, 13, slow);
-        }
-        a.b(loaded);
-        a.bind(wide);
-        // The wide lexical binding of a closure variable usually holds a Number (a counter, a
-        // stack pointer) or an Object (an array view): decode those two without the general
-        // encoder. A Number word is its payload (a NaN is the canonical one); an Object
-        // word is the Object tag over the stored pointer.
-        let generic = a.new_label();
-        let wide_number = a.new_label();
-        a.ldurb(10, 14, 0);
-        a.cmp_imm_w(10, 4);
-        a.b_cond(C_EQ, wide_number);
-        a.cmp_imm_w(10, 8);
-        a.b_cond(C_NE, generic);
-        a.ldur(11, 14, 8);
-        a.mov_imm64(12, crate::value::PACK_OBJ);
-        a.logic_x(1, 12, 12, 11);
-        a.b(loaded);
-        a.bind(wide_number);
-        a.ldur(12, 14, 8);
-        a.fmov_d_x(0, 12);
-        a.fcmp(0, 0);
-        a.b_cond(7, loaded);
-        a.mov_imm64(12, crate::value::PACK_CANON_NAN);
-        a.b(loaded);
-        a.bind(generic);
+fn emit_load_name_value(a: &mut asm::Asm, slow: usize, for_call: bool, prototype_key: bool) {
+    a.ldur(12, 14, 0);
+    if prototype_key {
+        // Only a property can contain the deferred tag. Its checked read materializes it;
+        // the same guard is harmless for a binding, whose execution word cannot be deferred.
+        property_word_guard(a, 12, 13, slow);
     }
-    a.ldur(10, 14, 0);
-    a.ldur(11, 14, 8);
-    emit_exec_encode_wide(a, 10, 11, 12, 13, 16, 0, slow);
-    a.bind(loaded);
     if for_call {
         a.mov_imm64(9, crate::value::PACK_UNDEFINED);
         emit_exec_word_store(a, 9, 20, 0);
@@ -10432,6 +10386,8 @@ fn emit_load_name_value(
     }
     emit_exec_word_store(a, 12, 20, 0);
     a.add_imm(20, 20, 8);
+    #[cfg(test)]
+    names::record_name_commit(a, 0);
 }
 
 /// Shared LoadName cache validation: on success x14 points at the resolved `Value` (the binding's
@@ -10451,7 +10407,7 @@ fn emit_load_name_value(
 #[derive(Clone, Copy)]
 enum SharedStub {
     /// [`emit_name_ic_value_ptr_body`]: x12 = `NameIc` cell → w9 = hit, x14 = value, x7 = kind.
-    NameValuePtr { packed_ok: bool },
+    NameValuePtr { property_ok: bool },
     /// [`emit_name_ic_value_ptr_in`] from the fixed scope in x9 (`Op::LoadNameIn`), with the
     /// outputs of [`SharedStub::NameValuePtr`].
     NameValuePtrIn,
@@ -10597,7 +10553,9 @@ impl SharedStub {
 
     fn key(self) -> u32 {
         match self {
-            SharedStub::NameValuePtr { packed_ok } => Self::NAME_VALUE_PTR | u32::from(packed_ok),
+            SharedStub::NameValuePtr { property_ok } => {
+                Self::NAME_VALUE_PTR | u32::from(property_ok)
+            }
             SharedStub::NameValuePtrIn => Self::NAME_VALUE_PTR_IN,
             SharedStub::NameLoad { for_call } => Self::NAME_LOAD | u32::from(for_call),
             SharedStub::Helper { idx } => Self::HELPER | u32::from(idx),
@@ -10646,7 +10604,7 @@ impl SharedStub {
     fn from_key(key: u32) -> SharedStub {
         match key & !0xff {
             Self::NAME_VALUE_PTR => SharedStub::NameValuePtr {
-                packed_ok: key & 1 != 0,
+                property_ok: key & 1 != 0,
             },
             Self::NAME_VALUE_PTR_IN => SharedStub::NameValuePtrIn,
             Self::NAME_LOAD => SharedStub::NameLoad {
@@ -10707,9 +10665,9 @@ impl SharedStub {
     fn emit(self, a: &mut asm::Asm, context: &StubContext<'_>) {
         let layout = context.layout;
         match self {
-            SharedStub::NameValuePtr { packed_ok } => {
+            SharedStub::NameValuePtr { property_ok } => {
                 let miss = a.new_label();
-                emit_name_ic_value_ptr_body(a, layout, miss, packed_ok);
+                emit_name_ic_value_ptr_body(a, layout, miss, property_ok);
                 a.movz(9, 1, 0);
                 a.ret();
                 a.bind(miss);
@@ -10740,7 +10698,7 @@ impl SharedStub {
             SharedStub::NameLoad { for_call } => {
                 let miss = a.new_label();
                 emit_name_ic_value_ptr_body(a, layout, miss, true);
-                emit_load_name_value(a, layout, miss, for_call, false);
+                emit_load_name_value(a, miss, for_call, false);
                 a.movz(9, 1, 0);
                 a.ret();
                 a.bind(miss);
@@ -11176,21 +11134,21 @@ fn emit_name_ic_value_ptr(
     layout: &crate::value::JitLayout,
     cache_ptr: usize,
     slow: usize,
-    packed_ok: bool,
+    property_ok: bool,
 ) {
     a.mov_imm64(12, cache_ptr as u64);
     if use_shared_stub(a) {
-        let stub = a.shared_stub(SharedStub::NameValuePtr { packed_ok }.key());
+        let stub = a.shared_stub(SharedStub::NameValuePtr { property_ok }.key());
         a.bl_label(stub);
         a.cbz(9, false, slow);
     } else {
-        emit_name_ic_value_ptr_body(a, layout, slow, packed_ok);
+        emit_name_ic_value_ptr_body(a, layout, slow, property_ok);
     }
 }
 
 /// The name-cache validation shared by every free-name site (see
 /// [`emit_name_ic_value_ptr`]): x12 = the site's `NameIc` cell. On success x14 points at the
-/// resolved Value (x7 = 0 for a wide scope binding, 1 for a packed global property); a failed
+/// resolved word (x7 = 0 for a Binding, 1 for a global Property); a failed
 /// proof branches to `slow`. Clobbers x7 and x9..x17 only — callers keep chain values in x2..x8
 /// and FP registers — and calls nothing.
 #[cfg(all(
@@ -11201,9 +11159,9 @@ fn emit_name_ic_value_ptr_body(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     slow: usize,
-    packed_ok: bool,
+    property_ok: bool,
 ) {
-    emit_name_ic_value_ptr_in(a, layout, slow, packed_ok, NameEnv::Running);
+    emit_name_ic_value_ptr_in(a, layout, slow, property_ok, NameEnv::Running);
 }
 
 /// Where a free-name cache probe starts its Environment Record walk.
@@ -11231,7 +11189,7 @@ fn emit_name_ic_value_ptr_in(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     slow: usize,
-    packed_ok: bool,
+    property_ok: bool,
     env: NameEnv,
 ) {
     use crate::bytecode::{
@@ -11250,8 +11208,9 @@ fn emit_name_ic_value_ptr_in(
     if env == NameEnv::Running {
         a.ldr_imm(9, 19, 40); // ctx.env_raw
     }
-    a.ldrb_imm(17, 9, layout.scope_with as u32);
-    a.cmp_imm_w(17, layout.scope_with_none as u32);
+    a.ldr_imm(17, 9, layout.scope_with as u32);
+    a.mov_imm64(16, layout.scope_with_none);
+    a.cmp_reg_x(17, 16);
     a.b_cond(C_NE, slow);
     a.ldr_imm(10, 12, NAME_IC_OFF_ENV);
     let deep = a.new_label();
@@ -11283,9 +11242,9 @@ fn emit_name_ic_value_ptr_in(
     a.b_cond(C_NE, deep);
     a.cmp_reg_w(11, 13);
     a.b_cond(C_NE, slow);
-    if layout.entry_accessor == layout.entry_value + 8 && !packed_ok {
-        // Global bindings live in packed properties; scope bindings below remain wide. Keep the
-        // global arm checked until it shares the packed decoder with GetProp.
+    if !property_ok {
+        // This caller admits only a Binding owner. Width equality does not grant the
+        // descriptor/property semantics that this mode explicitly excludes.
         a.b(slow);
     }
     a.ldr_imm(14, 19, 56); // the realm's global Object
@@ -11316,7 +11275,7 @@ fn emit_name_ic_value_ptr_in(
     a.cmp_imm_x(10, crate::bytecode::lexical_cache::DEEP_NAME_IC as u32);
     a.b_cond(C_NE, slow);
     a.ldr_imm(12, 12, NAME_IC_OFF_BINDING);
-    names::emit_deep_name_value_ptr(a, layout, slow, packed_ok);
+    names::emit_deep_name_value_ptr(a, layout, slow, property_ok);
     a.b(have);
     // Same published ordered layout, different activation allocation. Derive
     // this invocation's Binding address; no previous invocation is retained.
@@ -11388,8 +11347,9 @@ fn emit_name_ic_value_ptr_in(
     a.cmp_reg_x(14, 16);
     a.b_cond(C_NE, slow);
     a.ldr_w_imm(15, 14, sg);
-    a.ldrb_imm(17, 14, layout.scope_with as u32);
-    a.cmp_imm_w(17, layout.scope_with_none as u32);
+    a.ldr_imm(17, 14, layout.scope_with as u32);
+    a.mov_imm64(16, layout.scope_with_none);
+    a.cmp_reg_x(17, 16);
     a.b_cond(C_NE, slow);
     a.cmp_reg_w(15, 13);
     a.b_cond(C_NE, slow);
@@ -11407,7 +11367,7 @@ fn emit_name_ic_value_ptr_in(
     a.ldrb_imm(9, 14, layout.binding_import as u32);
     a.cbnz(9, false, slow);
     a.add_imm(14, 14, bv); // x14 → the binding's Value
-    a.movz(7, 0, 0); // wide scope binding
+    a.movz(7, 0, 0); // Binding owner: initialization/import/mutability semantics
     a.bind(have);
 }
 
@@ -11420,8 +11380,7 @@ fn emit_name_ic_value_ptr_in(
 fn elem_inlinable(layout: &crate::value::JitLayout) -> bool {
     let elems = layout.obj_props + layout.props_elems;
     get_prop_inlinable(layout)
-        && (layout.entry_accessor == layout.entry_value + 8
-            || layout.entry_accessor >= layout.entry_value + 16)
+        && layout.entry_accessor == layout.entry_value + 8
         && [
             elems,
             layout.dense_elems + layout.vec_ptr_off,
@@ -11623,15 +11582,8 @@ fn emit_get_elem_inline_marked(
     a.madd(15, 13, 16, 15);
     // 8. not an accessor
     guard_prop_data(a, 9, 15, ea, slow);
-    // Copy the same compact word the heap holds; wide legacy layouts encode once.
-    if layout.entry_accessor == layout.entry_value + 8 {
-        a.ldur(12, 15, ev);
-    } else {
-        a.ldur(9, 15, ev);
-        a.ldur(13, 15, ev + 8);
-        emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 0, slow);
-    }
-    // --- commit: everything validated; from here only writes ---
+    a.ldur(12, 15, ev); // Copy the complete heap word.
+                        // --- commit: everything validated; from here only writes ---
     a.bind(mirror_hit);
     // pop obj+key, push value → value lands at the obj slot, sp drops one
     emit_exec_word_store(a, 12, 20, -16);
@@ -11646,24 +11598,19 @@ fn emit_get_elem_inline_marked(
 
 /// Inline dense-element write (`a[i] = v`, and the value-keeping `SetElem` when `keep`): the
 /// machine-code mirror of `Interp::fast_set_elem` — overwrite an existing own writable data
-/// element. `v` *moves* into the slot (under `keep` it also stays on the stack as the expression
-/// result). An incoming non-Number (see `emit_packed_stack_encode`), an accessor or
-/// non-writable slot, or any dense miss falls to the
-/// checked helper.
+/// element. The complete word is copied into the slot; under `keep` it also stays on the stack
+/// as the expression result. Accessors, non-writable slots, unsupported incoming words and dense
+/// misses retain the checked path. A non-Number invalidates the numeric mirror.
 /// Where a mirror store's key index comes from.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 enum MirrorKey {
-    /// Exact u32 already in an x register.
-    U32InReg(u32),
-    /// The key Value's f64 payload at `[x20 + off]` (already validated as an exact u32).
+    /// The numeric execution word at `[x20 + off]`, already validated as an exact u32.
     StackF64(i32),
     /// A validated u32 key in a d register.
     F64InDreg(u32),
-    /// Compile-time constant index.
-    Const(u32),
 }
 
 /// What a mirror store writes.
@@ -11672,8 +11619,7 @@ enum MirrorKey {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 enum MirrorVal {
-    /// A Value at `[x20 + off]` (tag at `off`, payload at `off+8`); tag unknown — a non-Num
-    /// invalidates the mirror.
+    /// An execution word at `[x20 + off]`; a non-Number invalidates the mirror.
     Stack(i32),
     /// A proven-Num f64 in a d register; `bool` = proven exact-i32 (keeps `MIRROR_ALL_I32`).
     Num(u32, bool),
@@ -11741,17 +11687,11 @@ fn emit_mirror_store(
     }
     // Key index → x9.
     match key {
-        MirrorKey::U32InReg(r) => {
-            if r != 9 {
-                a.mov(9, r);
-            }
-        }
         MirrorKey::StackF64(off) => {
             a.ldur_d(0, 20, off);
             a.fcvtzu_w_d(9, 0);
         }
         MirrorKey::F64InDreg(d) => a.fcvtzu_w_d(9, d),
-        MirrorKey::Const(n) => a.mov_imm64(9, n as u64),
     }
     // Insurance bounds check, then the store.
     a.ldr_imm(12, base, mirror);
@@ -11819,7 +11759,7 @@ fn emit_set_elem_inline_marked(
     let slow = a.new_label();
     let done = a.new_label();
     let typed = a.new_label();
-    // 1. stack: [obj @ -48, key @ -32, v @ -16]
+    // 1. stack: [obj @ -24, key @ -16, v @ -8]
     emit_exec_word_load(a, 9, 20, -24);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
     // 2. key must be exactly a u32; the unordered compare of a non-Number (NaN pattern) misses
@@ -11861,8 +11801,8 @@ fn emit_set_elem_inline_marked(
     // Move v into the entry.
     emit_packed_stack_encode(a, -8, slow);
     a.stur(16, 15, ev);
-    // Keep the element mirror coherent (x9/x12/x13/d0/d1 are dead here; v words in 14/17,
-    // bases in 10/11/15 stay live).
+    // Keep the element mirror coherent (x9/x12/x13/d0/d1 are dead here; the RHS remains in
+    // its canonical stack word and bases in 10/11/15 stay live).
     emit_mirror_store(
         a,
         layout,
@@ -12626,13 +12566,7 @@ fn emit_elem_local_keyed(
     guard_prop_data(a, 9, 15, ea, slow);
     if get {
         // Copy directly into a compact word; preserve d0 (the deferred numeric key).
-        if layout.entry_accessor == layout.entry_value + 8 {
-            a.ldur(12, 15, ev);
-        } else {
-            a.ldur(9, 15, ev);
-            a.ldur(13, 15, ev + 8);
-            emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 1, slow);
-        }
+        a.ldur(12, 15, ev);
         a.bind(mirror_hit);
         match key {
             KeySrc::Stack => {
@@ -12802,13 +12736,7 @@ fn emit_local_own_dense_data_guard(
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 14, 15, ea, slow);
-    if layout.entry_accessor == layout.entry_value + 8 {
-        a.ldur(12, 15, ev);
-    } else {
-        a.ldur(9, 15, ev);
-        a.ldur(13, 15, ev + 8);
-        emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 1, slow);
-    }
+    a.ldur(12, 15, ev);
     a.bind(entry_ready);
     // PackedValue's Empty word is the deleted-slot marker, not a language value.
     a.mov_imm64(14, crate::value::PACK_EMPTY);
@@ -12828,7 +12756,6 @@ fn emit_local_assumed_dense_data_value(
     layout: &crate::value::JitLayout,
     receiver_off: u32,
     key: KeySrc,
-    slow: usize,
 ) {
     let obj_off = layout.obj_from_cell as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
@@ -12869,13 +12796,7 @@ fn emit_local_assumed_dense_data_value(
     fields_data(a, layout, 15, 11);
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
-    if layout.entry_accessor == layout.entry_value + 8 {
-        a.ldur(12, 15, ev);
-    } else {
-        a.ldur(9, 15, ev);
-        a.ldur(13, 15, ev + 8);
-        emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 1, slow);
-    }
+    a.ldur(12, 15, ev);
     a.bind(entry_ready);
 }
 
@@ -13643,11 +13564,7 @@ fn emit_chain_marked(
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
     let ev = layout.entry_value as i32;
-    let num_ev = if layout.entry_accessor == layout.entry_value + 8 {
-        ev
-    } else {
-        ev + 8
-    };
+    let num_ev = ev;
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
@@ -13782,30 +13699,9 @@ fn emit_chain_marked(
                 a.madd(15, 13, 16, 15);
                 guard_prop_data(a, 9, 15, ea, guard!());
                 let rd = free.pop().expect("chain reg underflow");
-                if layout.entry_accessor == layout.entry_value + 8 {
-                    // Packed Property value: all bit patterns outside the reserved tagged
-                    // prefixes are Numbers (including the canonical NaN prefix). Object has a
-                    // negative prefix and therefore needs its own rejection before the range.
-                    a.ldur(13, 15, ev);
-                    a.lsr_imm(9, 13, 48);
-                    a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
-                    a.cmp_reg_x(9, 16);
-                    a.b_cond(C_HS, guard!());
-                    let is_num = a.new_label();
-                    a.movz(16, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-                    a.cmp_reg_x(9, 16);
-                    a.b_cond(C_LO, is_num);
-                    a.movz(16, (crate::value::PACK_SYM >> 48) as u32, 0);
-                    a.cmp_reg_x(9, 16);
-                    a.b_cond(C_LS, guard!());
-                    a.bind(is_num);
-                    a.fmov_d_x(rd, 13);
-                } else {
-                    a.ldrb_imm(9, 15, ev as u32);
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_NE, guard!());
-                    a.ldur_d(rd, 15, ev + 8);
-                }
+                // A numeric read still rejects every execution tag before entering FP state.
+                a.ldur(13, 15, ev);
+                emit_exec_number_guard(a, 13, rd, 16, guard!());
                 vregs.push((rd, false));
             }
             ChainOp::StoreProp(off, st) => {
@@ -13841,13 +13737,7 @@ fn emit_chain_marked(
                 a.madd(15, 13, 16, 15);
                 guard_prop_data(a, 9, 15, ea, guard!());
                 guard_prop_writable(a, 9, 15, ew, guard!());
-                if layout.entry_accessor == layout.entry_value + 8 {
-                    emit_exec_number_store(a, dv, 15, ev, 13);
-                } else {
-                    a.movz(9, 4, 0);
-                    a.stur(9, 15, ev);
-                    a.stur_d(dv, 15, ev + 8);
-                }
+                emit_exec_number_store(a, dv, 15, ev, 13);
                 #[cfg(test)]
                 {
                     // The chain's receiver cache can keep x8 live across this test-only
@@ -14026,17 +13916,7 @@ fn emit_chain_marked(
                         fields_data(a, layout, 15, 11);
                         a.movz(14, es as u32, 0);
                         a.madd(15, 13, 14, 15);
-                        if layout.entry_accessor == layout.entry_value + 8 {
-                            a.fmov_x_d(14, dv);
-                            a.fcmp(dv, dv);
-                            let encoded = a.new_label();
-                            a.b_cond(C_VS ^ 1, encoded);
-                            a.mov_imm64(14, f64::NAN.to_bits());
-                            a.bind(encoded);
-                            a.stur(14, 15, num_ev);
-                        } else {
-                            a.stur_d(dv, 15, num_ev);
-                        }
+                        emit_exec_number_store(a, dv, 15, num_ev, 14);
                         a.str_d_lsl3(dv, mpreg, 9);
                         // Flag-first ALL_I32 upkeep (dv int-ness is unknown in this tier).
                         let i32_done = a.new_label();
@@ -14151,17 +14031,7 @@ fn emit_chain_marked(
                     fields_data(a, layout, 15, 11);
                     a.movz(14, es as u32, 0);
                     a.madd(15, 13, 14, 15);
-                    if layout.entry_accessor == layout.entry_value + 8 {
-                        a.fmov_x_d(14, dv);
-                        a.fcmp(dv, dv);
-                        let encoded = a.new_label();
-                        a.b_cond(C_VS ^ 1, encoded);
-                        a.mov_imm64(14, f64::NAN.to_bits());
-                        a.bind(encoded);
-                        a.stur(14, 15, num_ev);
-                    } else {
-                        a.stur_d(dv, 15, num_ev);
-                    }
+                    emit_exec_number_store(a, dv, 15, num_ev, 14);
                     a.ldr_imm(12, 11, mirror);
                     a.ldr_imm(12, 12, mvp);
                     a.str_d_lsl3(dv, 12, 9);
@@ -14198,47 +14068,20 @@ fn emit_chain_marked(
                 a.movz(9, es as u32, 0); // entry stride (< 65536; the key index in x9 is dead)
                 a.madd(15, 13, 9, 15);
                 guard_prop_data(a, 9, 15, ea, guard!());
-                if layout.entry_accessor == layout.entry_value + 8 {
-                    // A length update or descriptor operation can invalidate the optional
-                    // mirror without changing ordinary numeric elements. Read authoritative
-                    // packed properties directly instead of replaying the entire chain.
-                    if is_set {
-                        guard_prop_writable(a, 14, 15, ew, guard!());
-                    }
-                    if is_set {
-                        emit_packed_existing_guard(a, layout, 15, guard!());
-                    } else {
-                        emit_packed_number_read_guard(a, layout, 15, guard!());
-                    }
-                    if is_set {
-                        a.fmov_x_d(16, dv);
-                        a.fcmp(dv, dv);
-                        let encoded = a.new_label();
-                        a.b_cond(C_VS ^ 1, encoded);
-                        a.mov_imm64(16, f64::NAN.to_bits());
-                        a.bind(encoded);
-                        a.stur(16, 15, ev);
-                        a.strb_imm(31, 11, mf);
-                    } else {
-                        a.fmov_d_x(dk, 12);
-                    }
-                    a.b(mirror_done);
-                }
+                // A length update or descriptor operation can invalidate the optional
+                // mirror without changing ordinary numeric elements. Read authoritative
+                // packed properties directly instead of replaying the entire chain.
                 if is_set {
-                    guard_prop_writable(a, 9, 15, ew, guard!());
-                    // commit: entry = Num(dv)
-                    a.movz(9, 4, 0);
-                    a.stur(9, 15, ev);
-                    a.stur_d(dv, 15, ev + 8);
-                    // Element mirror: dv is a proven Num; int-ness is unknown in this tier.
-                    emit_mirror_store(
-                        a,
-                        layout,
-                        11,
-                        MirrorKey::F64InDreg(dk),
-                        MirrorVal::Num(dv, false),
-                    );
-                    a.bind(mirror_done);
+                    guard_prop_writable(a, 14, 15, ew, guard!());
+                    emit_packed_existing_guard(a, layout, 15, guard!());
+                    emit_exec_number_store(a, dv, 15, ev, 16);
+                    a.strb_imm(31, 11, mf);
+                } else {
+                    emit_packed_number_read_guard(a, layout, 15, guard!());
+                    a.fmov_d_x(dk, 12);
+                }
+                a.bind(mirror_done);
+                if is_set {
                     free.push(dk);
                     if keep {
                         vregs.push((dv, viv)); // v stays the virtual result (a Num)
@@ -14246,12 +14089,6 @@ fn emit_chain_marked(
                         free.push(dv);
                     }
                 } else {
-                    // element must be a Num to stay in a register
-                    a.ldrb_imm(9, 15, ev as u32);
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_NE, guard!());
-                    a.ldur_d(dk, 15, ev + 8); // reuse the key's register for the element
-                    a.bind(mirror_done);
                     vregs.push((dk, false));
                 }
                 a.b(packed_done);
@@ -14355,36 +14192,15 @@ fn emit_chain_marked(
             }
             ChainOp::KeyNop => {}
             ChainOp::LoadName(cache_ptr) => {
-                // The validator clobbers x9-x17 only — receiver caches (x2-x8) survive it.
-                // Shared cache validation (scope or global mode) leaves x14 → the Value.
+                // The validator clobbers x7 and x9-x17. Receiver-cache allocation excludes
+                // x7, so cached receiver registers survive the semantic owner result.
+                // Shared cache validation leaves x14 pointing to the live execution word.
                 emit_name_ic_value_ptr(a, layout, cache_ptr, guard!(), true);
                 let rd = free.pop().expect("chain reg underflow");
-                let loaded = a.new_label();
-                if layout.entry_accessor == layout.entry_value + 8 {
-                    let wide = a.new_label();
-                    a.cbz(7, false, wide);
-                    a.ldur(9, 14, 0);
-                    a.lsr_imm(10, 9, 48);
-                    let number = a.new_label();
-                    a.movz(11, (crate::value::PACK_OBJ >> 48) as u32, 0);
-                    a.cmp_reg_x(10, 11);
-                    a.b_cond(C_HS, guard!());
-                    a.movz(11, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-                    a.cmp_reg_x(10, 11);
-                    a.b_cond(C_LO, number);
-                    a.movz(11, (crate::value::PACK_SYM >> 48) as u32, 0);
-                    a.cmp_reg_x(10, 11);
-                    a.b_cond(C_LS, guard!());
-                    a.bind(number);
-                    a.fmov_d_x(rd, 9);
-                    a.b(loaded);
-                    a.bind(wide);
-                }
-                a.ldurb(9, 14, 0);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, guard!()); // only a Num can live in a register
-                a.ldur_d(rd, 14, 8);
-                a.bind(loaded);
+                a.ldur(9, 14, 0);
+                emit_exec_number_guard(a, 9, rd, 10, guard!());
+                #[cfg(test)]
+                names::record_name_commit(a, 3);
                 vregs.push((rd, false));
             }
             ChainOp::CmpBranch(neg, target) => {
@@ -15991,17 +15807,9 @@ fn emit_loop_chain(
     let ex = layout.obj_exotic as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
     let mvp = (layout.dense_mirror + layout.vec_ptr_off) as u32;
     let mvl = (layout.dense_mirror + layout.vec_len_off) as u32;
-    let ev = layout.entry_value as i32;
-    let num_ev = if layout.entry_accessor == layout.entry_value + 8 {
-        ev
-    } else {
-        ev + 8
-    };
-    let ea = layout.entry_accessor as u32;
-    let ew = layout.entry_writable as u32;
+    let num_ev = layout.entry_value as i32;
     let es = layout.entry_size as u64;
     let plain = layout.obj_ic_plain as u32;
     let mf = (layout.obj_props + layout.props_mirror_flags) as u32;
@@ -16061,36 +15869,12 @@ fn emit_loop_chain(
         a.b_cond(C_EQ, pre_fail);
     }
     // Validate names before populating integer local homes: the shared IC probe uses x7 as its
-    // packed/wide result marker in addition to x9-x17. Large regions can legitimately assign
+    // Binding/Property owner result in addition to x9-x17. Large regions can legitimately assign
     // a resident local to x7, so reversing this order would silently overwrite that local.
     for np in &plan.names {
         emit_name_ic_value_ptr(a, layout, np.ptr, pre_fail, true);
-        let loaded = a.new_label();
-        if layout.entry_accessor == layout.entry_value + 8 {
-            let wide = a.new_label();
-            a.cbz(7, false, wide);
-            a.ldur(9, 14, 0);
-            a.lsr_imm(10, 9, 48);
-            let number = a.new_label();
-            a.movz(11, (crate::value::PACK_OBJ >> 48) as u32, 0);
-            a.cmp_reg_x(10, 11);
-            a.b_cond(C_HS, pre_fail);
-            a.movz(11, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-            a.cmp_reg_x(10, 11);
-            a.b_cond(C_LO, number);
-            a.movz(11, (crate::value::PACK_SYM >> 48) as u32, 0);
-            a.cmp_reg_x(10, 11);
-            a.b_cond(C_LS, pre_fail);
-            a.bind(number);
-            a.fmov_d_x(np.dreg, 9);
-            a.b(loaded);
-            a.bind(wide);
-        }
-        a.ldurb(9, 14, 0);
-        a.cmp_imm_w(9, 4);
-        a.b_cond(C_NE, pre_fail); // only a Num can live in a register
-        a.ldur_d(np.dreg, 14, 8);
-        a.bind(loaded);
+        a.ldur(9, 14, 0);
+        emit_exec_number_guard(a, 9, np.dreg, 10, pre_fail);
         if np.int_checked {
             a.fcvtzs_w_d(9, np.dreg);
             a.scvtf_d_w(1, 9);
@@ -16099,6 +15883,8 @@ fn emit_loop_chain(
             a.cmp_reg_x(10, 11);
             a.b_cond(C_NE, pre_fail);
         }
+        #[cfg(test)]
+        names::record_name_commit(a, 4);
     }
     for s in &plan.slots {
         if !s.preload {
@@ -16398,26 +16184,6 @@ fn emit_loop_chain(
                         }
                     };
                 }
-                // Element lookup: key index in x9, receiver base in `r` → entry pointer in x15.
-                macro_rules! elem_entry {
-                    ($r:expr) => {{
-                        a.ldr_imm(12, $r, el);
-                        a.cbz(12, true, guard!());
-                        a.ldr_imm(14, 12, evl);
-                        a.cmp_reg_x(9, 14);
-                        a.b_cond(C_HS, guard!());
-                        a.ldr_imm(12, 12, evp);
-                        a.add_shifted(12, 12, 9, 2);
-                        a.ldr_w_imm(13, 12, 0);
-                        a.cmn_imm_w(13, 1);
-                        a.b_cond(C_EQ, guard!());
-                        fields_data(a, layout, 15, $r);
-                        a.movz(9, es as u32, 0);
-                        a.madd(15, 13, 9, 15);
-                        guard_prop_data(a, 9, 15, ea, guard!());
-                    }};
-                }
-
                 match *cop {
                     ChainOp::ConstNum(bits) => vstack.push(LV::K(bits)),
                     ChainOp::Load(off) => {
@@ -16607,38 +16373,16 @@ fn emit_loop_chain(
                                     vstack.push(LV::D(dt, false));
                                 }
                             } else {
-                                let r = rp.reg;
-                                if layout.entry_accessor == layout.entry_value + 8 {
-                                    a.b(guard!());
-                                }
-                                elem_entry!(r);
-                                a.ldrb_imm(9, 15, ev as u32);
-                                a.cmp_imm_w(9, 4);
-                                a.b_cond(C_NE, guard!());
+                                // Packed non-mirror reads already replay through the checked
+                                // path. Keep that admission, without its dead wide-value code.
+                                a.b(guard!());
+                                // Model the unreachable successful suffix for the planner's
+                                // virtual stack/snapshots; no value or pin is read at runtime.
                                 if matches!(plan.kinds[idx], PushKind::I { .. }) {
-                                    // w-form: the exactness compare-back also proves i32 (the
-                                    // planner's range analysis relies on that bound).
-                                    a.ldur_d(0, 15, ev + 8);
                                     let xt = free_i.pop().expect("loop i pool");
-                                    a.fcvtzs_w_d(xt, 0);
-                                    a.scvtf_d_w(1, xt);
-                                    // Bit-compare, not fcmp: IEEE equality would accept -0.0
-                                    // and erase its sign through the int-typed value.
-                                    a.fmov_x_d(9, 1);
-                                    a.fmov_x_d(10, 0);
-                                    a.cmp_reg_x(9, 10);
-                                    a.b_cond(C_NE, guard!());
-                                    a.sxtw(xt, xt);
-                                    if let Some(p) = pin {
-                                        a.mov(p, xt);
-                                    }
                                     vstack.push(LV::I(xt, true));
                                 } else {
                                     let dt = free_d.pop().expect("loop d pool");
-                                    a.ldur_d(dt, 15, ev + 8);
-                                    if let Some(p) = pin {
-                                        a.fmov_d_d(p, dt);
-                                    }
                                     vstack.push(LV::D(dt, false));
                                 }
                             }
@@ -16716,11 +16460,7 @@ fn emit_loop_chain(
                             };
                             a.movz(12, es as u32, 0);
                             a.madd(15, 13, 12, enr);
-                            if layout.entry_accessor == layout.entry_value + 8 {
-                                emit_exec_number_store(a, 2, 15, num_ev, 14);
-                            } else {
-                                a.stur_d(2, 15, num_ev);
-                            }
+                            emit_exec_number_store(a, 2, 15, num_ev, 14);
                             a.bind(canonical_stored);
                             match rp.mpreg {
                                 Some(x) => a.str_d_lsl3(2, x, 9),
@@ -16754,24 +16494,8 @@ fn emit_loop_chain(
                                 a.bind(i32_done);
                             }
                         } else {
-                            if layout.entry_accessor == layout.entry_value + 8 {
-                                a.b(guard!());
-                            }
-                            elem_entry!(r);
-                            guard_prop_writable(a, 9, 15, ew, guard!());
-                            a.movz(9, 4, 0);
-                            a.stur(9, 15, ev);
-                            a.stur_d(2, 15, ev + 8);
-                            // Element mirror: the value was staged in d2; key registers are
-                            // still intact (operand frees are deferred to op end).
-                            let mkey = match key {
-                                LV::I(x, _) => MirrorKey::U32InReg(x),
-                                LV::D(d, _) => MirrorKey::F64InDreg(d),
-                                // A K key reaching the commit passed the exact-u32 runtime
-                                // check, so the compile-time conversion is exact.
-                                LV::K(bits) => MirrorKey::Const(f64::from_bits(bits) as u32),
-                            };
-                            emit_mirror_store(a, layout, r, mkey, MirrorVal::Num(2, i32_proven));
+                            // This packed non-mirror case already bailed before mutation.
+                            a.b(guard!());
                         }
                         if keep {
                             vstack.push(val);
@@ -17806,7 +17530,7 @@ pub(crate) unsafe fn run_continuation(
     state: &mut crate::bytecode::NativeContinuation,
     slots: &[Cell<PackedValue>],
     pc: &mut usize,
-    this_val: &Value,
+    this_val: &PackedValue,
     handlers: &mut Vec<crate::bytecode::Handler>,
 ) -> Result<crate::bytecode::VmStep, Abrupt> {
     assert!(
@@ -17832,7 +17556,7 @@ pub(crate) unsafe fn run_borrowed_frame(
     state: &mut crate::bytecode::NativeContinuation,
     slots: &[Cell<PackedValue>],
     pc: &mut usize,
-    this_val: &Value,
+    this_val: &PackedValue,
     handlers: &mut Vec<crate::bytecode::Handler>,
     first_transfer: bool,
 ) -> Result<crate::bytecode::VmStep, Abrupt> {
@@ -17862,8 +17586,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         slots: slots.as_ptr().cast_mut(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
         env_raw: Env::as_ptr(env) as *const u8,
-        // The VM frame's `this` stays wide; the native run reads it packed.
-        this_word: PackedValue::pack(this_val.clone()),
+        this_word: *this_val,
         global_body: jit_global_body(i, code),
         genv: Env::as_ptr(&i.global_env) as usize,
         interp: i,

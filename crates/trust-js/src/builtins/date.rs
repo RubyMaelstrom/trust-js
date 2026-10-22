@@ -910,7 +910,7 @@ pub(super) fn date_to_string(t: f64) -> String {
 fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> {
     // Called as a function (no `new`), Date ignores its arguments and returns the
     // current time as a string.
-    if !matches!((i.new_target).view(), ValueView::Obj(_)) {
+    if !matches!((i.constructor_new_target()).view(), ValueView::Obj(_)) {
         return Ok(Value::lstr(date_to_string(now_ms(i))));
     }
     let ms = match args.len() {

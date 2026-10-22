@@ -232,7 +232,7 @@ fn hot_script_borrowed_this_is_the_global_environment_this_value() {
             .vars
             .get_mut("this")
             .unwrap()
-            .value = Value::Obj(wrapper);
+            .set_value(Value::Obj(wrapper));
         reset_counts();
         assert_eq!(
             value(

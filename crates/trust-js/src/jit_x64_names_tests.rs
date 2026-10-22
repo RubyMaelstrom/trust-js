@@ -213,6 +213,75 @@ fn native_name_loads_and_stores_all_execution_word_kinds() {
 }
 
 #[test]
+fn native_name_store_rejects_internal_words_before_target_stack_or_card_commit() {
+    use crate::gc_core::{CARD_SHIFT, CARD_TABLE_OFFSET, PAGE_SIZE};
+    let _engine = Engine::new();
+    let owner = new_scope(None);
+    let owner_word = Env::as_ptr(&owner) as usize;
+    let card = ((owner_word & !(PAGE_SIZE - 1))
+        + CARD_TABLE_OFFSET
+        + ((owner_word & (PAGE_SIZE - 1)) >> CARD_SHIFT)) as *mut u8;
+    let mut a = Asm::new();
+    let slow = a.label();
+    let done = a.label();
+    a.bytes(&[0x41, 0x55]); // push r13: the engine operand top is callee-saved.
+    #[cfg(target_os = "windows")]
+    {
+        a.nr_mov(SP, R8); // top, before DX is used by the guard
+        a.nr_mov(R9, DX); // actual owner
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        a.nr_mov(SP, DX); // top
+        a.nr_mov(R9, 6); // rsi = actual owner
+        a.nr_mov(CX, 7); // rdi = target word address
+    }
+    store_value(&mut a, slow);
+    a.jmp(done);
+    a.bind(slow);
+    a.bind(done);
+    a.nr_mov(AX, SP);
+    a.bytes(&[0x41, 0x5d, 0xc3]); // pop r13; ret
+    let code = crate::jit::ExecutableBuffer::from_bytes(&a.finish()).expect("store guard probe");
+    let probe: unsafe extern "C" fn(*mut u64, usize, *mut u64) -> usize =
+        unsafe { std::mem::transmute(code.as_ptr()) };
+    for (incoming, accepted) in [
+        (7.0f64.to_bits(), true),
+        (crate::value::PACK_EMPTY, false),
+        (crate::value::PACK_LAZY_PROTO | 0x5a5a, false),
+        (0xffff_0000_0000_0000, false),
+    ] {
+        // Raw byte/word buffers deliberately avoid constructing an invalid PackedValue.
+        let mut target = [11.0f64.to_bits(), 0x55aa_55aa_55aa_55aa];
+        let mut operands = [0x1122_3344_5566_7788, incoming, 0x8877_6655_4433_2211];
+        let original_target = target;
+        let original_operands = operands;
+        let top = unsafe { operands.as_mut_ptr().add(2) };
+        // SAFETY: the owner is a live, small carded Env; no safepoint or edge mutation occurs.
+        unsafe { card.write(0) };
+        let returned_top = unsafe { probe(target.as_mut_ptr(), owner_word, top) };
+        assert_eq!(operands, original_operands);
+        assert_eq!(target[1], original_target[1]);
+        if accepted {
+            assert_eq!(target[0], incoming);
+            assert_eq!(returned_top, unsafe { top.sub(1) } as usize);
+            assert_eq!(
+                unsafe { card.read() },
+                1,
+                "valid store reaches the actual owner card"
+            );
+        } else {
+            assert_eq!(
+                target, original_target,
+                "guard before target commit: {incoming:#x}"
+            );
+            assert_eq!(returned_top, top as usize, "guard before operand pop");
+            assert_eq!(unsafe { card.read() }, 0, "guard before card commit");
+        }
+    }
+}
+
+#[test]
 fn native_name_import_mutability_and_parent_changes_stay_live() {
     let mut engine = Engine::new();
     let (chunk, code) = compile(&mut engine, "function f(){return outer;}");
@@ -229,7 +298,12 @@ fn native_name_import_mutability_and_parent_changes_stay_live() {
         .unwrap()
         .set_import_reference(Some((exporter.clone(), "source".into())));
     assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 23.0);
-    exporter.borrow_mut().vars.get_mut("source").unwrap().value = Value::Num(24.0);
+    exporter
+        .borrow_mut()
+        .vars
+        .get_mut("source")
+        .unwrap()
+        .set_value(Value::Num(24.0));
     assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 24.0);
     let replacement = scope(None, "outer", 31.0, new_binding_layout_id());
     middle.borrow_mut().parent = Some(replacement);
@@ -502,6 +576,6 @@ fn native_name_bigint_stores_decode_the_word_and_record_an_old_holders_card() {
     engine.interp.gc_collect();
     assert!(crate::gc_test::alive(&weak));
     assert!(
-        matches!(&(holder.borrow().vars.get("outer").unwrap().value).view(), ValueView::BigInt(value) if value.to_string_radix(10) == "123456789")
+        matches!(&(holder.borrow().vars.get("outer").unwrap().value()).view(), ValueView::BigInt(value) if value.to_string_radix(10) == "123456789")
     );
 }

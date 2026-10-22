@@ -241,7 +241,7 @@ pub(crate) fn enter(
                 slots.write_value(
                     *slot as usize,
                     if binding.initialized {
-                        binding.value.clone()
+                        binding.value()
                     } else {
                         Value::Empty
                     },
@@ -304,7 +304,7 @@ pub(crate) fn enter(
         &slots,
         &mut stack,
         &mut pc,
-        &Value::Undefined,
+        &PackedValue::pack(Value::Undefined),
         &mut handlers,
         &mut disposal_frames,
         &mut class_states,

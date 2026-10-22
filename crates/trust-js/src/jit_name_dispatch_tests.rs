@@ -10,7 +10,7 @@ use std::mem::{offset_of, size_of};
 #[derive(Debug, PartialEq, Eq)]
 struct ProbeResult {
     address: usize,
-    packed: usize,
+    owner_kind: usize,
 }
 
 // Only generated code reads these aligned bytes. They are NOT a Rust JitCtx value: no invalid
@@ -45,13 +45,13 @@ impl ProbeContext {
 fn probe_words(
     layout: &crate::value::JitLayout,
     cache: &Cell<NameIc>,
-    packed_ok: bool,
+    property_ok: bool,
 ) -> Vec<u32> {
     let mut a = asm::Asm::new();
     let slow = a.new_label();
     a.stp_pre(19, 30, -16);
     a.mov(19, 0);
-    emit_name_ic_value_ptr(&mut a, layout, cache.as_ptr() as usize, slow, packed_ok);
+    emit_name_ic_value_ptr(&mut a, layout, cache.as_ptr() as usize, slow, property_ok);
     a.mov(0, 14);
     a.mov(1, 7);
     a.ldp_post(19, 30, 16);
@@ -75,13 +75,17 @@ fn probe_words(
 
 /// The validator body emitted inline at a site-shaped continuation (the shared stub wraps
 /// exactly this body), for emission-order assertions.
-fn body_words(layout: &crate::value::JitLayout, cache: &Cell<NameIc>, packed_ok: bool) -> Vec<u32> {
+fn body_words(
+    layout: &crate::value::JitLayout,
+    cache: &Cell<NameIc>,
+    property_ok: bool,
+) -> Vec<u32> {
     let mut a = asm::Asm::new();
     let slow = a.new_label();
     a.stp_pre(19, 30, -16);
     a.mov(19, 0);
     a.mov_imm64(12, cache.as_ptr() as u64);
-    emit_name_ic_value_ptr_body(&mut a, layout, slow, packed_ok);
+    emit_name_ic_value_ptr_body(&mut a, layout, slow, property_ok);
     a.mov(0, 14);
     a.mov(1, 7);
     a.ldp_post(19, 30, 16);
@@ -97,9 +101,9 @@ fn body_words(layout: &crate::value::JitLayout, cache: &Cell<NameIc>, packed_ok:
 fn native_probe(
     layout: &crate::value::JitLayout,
     cache: &Cell<NameIc>,
-    packed_ok: bool,
+    property_ok: bool,
 ) -> ExecutableBuffer {
-    let bytes: Vec<_> = probe_words(layout, cache, packed_ok)
+    let bytes: Vec<_> = probe_words(layout, cache, property_ok)
         .into_iter()
         .flat_map(u32::to_le_bytes)
         .collect();
@@ -133,8 +137,8 @@ fn binding_ic(env: &Env) -> (NameIc, ProbeResult) {
             act_gen: 0,
         },
         ProbeResult {
-            address: &binding.value as *const Value as usize,
-            packed: 0,
+            address: binding as *const Binding as usize + Binding::value_offset(),
+            owner_kind: 0,
         },
     )
 }
@@ -178,7 +182,7 @@ fn name_dispatch_cmn32_max_predicate_preserves_source_and_ignores_upper_bits() {
 }
 
 #[test]
-fn name_dispatch_fixed_layout_uses_current_wide_activation_and_live_flags() {
+fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
     use crate::interpreter::VarMap;
     let engine = crate::Engine::new();
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
@@ -215,12 +219,13 @@ fn name_dispatch_fixed_layout_uses_current_wide_activation_and_live_flags() {
         });
         let code = native_probe(&layout, &cache, true);
         for env in [&first, &second] {
-            let expected = &env.borrow().vars.get("v23").unwrap().value as *const Value as usize;
+            let expected = env.borrow().vars.get("v23").unwrap() as *const Binding as usize
+                + Binding::value_offset();
             assert_eq!(
                 probe(&code, &ProbeContext::new(&engine, env)),
                 ProbeResult {
                     address: expected,
-                    packed: 0
+                    owner_kind: 0
                 }
             );
         }
@@ -256,9 +261,11 @@ fn name_dispatch_fixed_layout_uses_current_wide_activation_and_live_flags() {
             gen: identity,
             ..cache.get()
         });
-        second.borrow_mut().with_obj = Some(Value::Obj(engine.interp.global.clone()));
+        second
+            .borrow_mut()
+            .set_with_object(Some(Value::Obj(engine.interp.global.clone())));
         assert_eq!(probe(&code, &context).address, 0);
-        second.borrow_mut().with_obj = None;
+        second.borrow_mut().set_with_object(None);
         second.borrow_mut().vars.remove("v0");
         assert_eq!(probe(&code, &context).address, 0);
     }
@@ -322,9 +329,10 @@ fn name_dispatch_native_binding_preserves_identity_with_tdz_import_and_exhaustio
     cache.set(binding_ic(&other).0);
     assert_eq!(probe(&code, &context).address, 0);
     cache.set(ic);
-    env.borrow_mut().with_obj = Some(Value::Obj(engine.interp.global.clone()));
+    env.borrow_mut()
+        .set_with_object(Some(Value::Obj(engine.interp.global.clone())));
     assert_eq!(probe(&code, &context).address, 0);
-    env.borrow_mut().with_obj = None;
+    env.borrow_mut().set_with_object(None);
     env.borrow_mut().vars.get_mut("outer").unwrap().initialized = false;
     assert_eq!(probe(&code, &context).address, 0);
     env.borrow_mut().vars.get_mut("outer").unwrap().initialized = true;
@@ -393,11 +401,11 @@ fn name_dispatch_native_global_checks_identity_before_generation_without_losing_
         probe(&code, &context),
         ProbeResult {
             address: expected,
-            packed: 1
+            owner_kind: 1
         }
     );
-    let no_packed = native_probe(&layout, &cache, false);
-    assert_eq!(probe(&no_packed, &context).address, 0);
+    let no_properties = native_probe(&layout, &cache, false);
+    assert_eq!(probe(&no_properties, &context).address, 0);
     cache.set(NameIc {
         gen: ic.gen.wrapping_add(1),
         ..ic
@@ -477,9 +485,11 @@ fn name_dispatch_native_depth_one_keeps_layout_and_parent_generation_distinct() 
         let cache = Cell::new(ic);
         let code = native_probe(&layout, &cache, true);
         assert_eq!(probe(&code, &context), expected);
-        parent.borrow_mut().with_obj = Some(Value::Obj(engine.interp.global.clone()));
+        parent
+            .borrow_mut()
+            .set_with_object(Some(Value::Obj(engine.interp.global.clone())));
         assert_eq!(probe(&code, &context).address, 0);
-        parent.borrow_mut().with_obj = None;
+        parent.borrow_mut().set_with_object(None);
         child.borrow_mut().vars.set_generation_for_test(u32::MAX);
         if fixed_layout {
             child.borrow_mut().vars.publish_layout(layout_id);
@@ -556,7 +566,7 @@ fn name_dispatch_native_deep_hits_ignore_shallow_generation_and_follow_live_pare
         .vars
         .get_mut("outer")
         .unwrap()
-        .value = Value::Num(29.0);
+        .set_value(Value::Num(29.0));
     middle.borrow_mut().parent = Some(replacement);
     assert!(
         matches!(

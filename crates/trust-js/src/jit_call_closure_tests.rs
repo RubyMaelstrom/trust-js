@@ -28,6 +28,156 @@ fn all_tiers(source: &str, expected: &str) {
 }
 
 #[test]
+fn packed_new_target_survives_direct_normal_throw_nested_and_lexical_calls() {
+    const CHILD: &str = "TRUST_JS_TEST_PACKED_NEW_TARGET_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The direct-call IC epoch is process-global; parallel Engine startup must not make
+        // an actual native-return/throw assertion depend on unrelated tests' cache fences.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "jit::call_closure_tests::packed_new_target_survives_direct_normal_throw_nested_and_lexical_calls",
+                "--exact", "--nocapture", "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.interp.def_method(
+            &engine.interp.global,
+            "collectPackedTarget",
+            0,
+            |interp, _, _| {
+                interp.gc_collect();
+                Ok(crate::value::Value::Undefined)
+            },
+        );
+        evaluate(
+            &mut engine,
+            r#"
+            function plain(mode) {
+                var sum=0;
+                for(var k=0;k<3;k++)sum+=k;
+                collectPackedTarget();
+                if(mode<0)throw 17;
+                return new.target;
+            }
+            function Nested(){this.correct=new.target===Nested;}
+            function Outer(mode){
+                var initial=new.target;
+                var ordinary=plain(0),afterNormal=new.target===initial,threw=false;
+                try{plain(mode);}catch(error){threw=error===17;}
+                var afterThrow=new.target===initial,nested=new Nested();
+                var afterNested=new.target===initial,ordinaryAfterNested=plain(0);
+                collectPackedTarget();
+                this.answer=[initial===Outer,ordinary===undefined,afterNormal,
+                    threw===(mode<0),afterThrow,nested.correct,afterNested,
+                    ordinaryAfterNested===undefined,new.target===initial].join(',');
+            }
+            function lexicalPlain(mode){collectPackedTarget();if(mode<0)throw 19;}
+            function Lexical(mode){
+                var expected=new.target,read=()=>new.target;
+                try{lexicalPlain(mode);}catch(error){if(error!==19)throw error;}
+                collectPackedTarget();this.read=read;this.correct=read()===expected;
+            }
+            function drive(mode){var made=new Outer(mode),lexical=new Lexical(mode);
+                return made.answer+'|'+(lexical.correct&&lexical.read()===Lexical);}
+            for(var warm=0;warm<100;warm++){drive(0);drive(-1);}
+            0;
+        "#,
+        );
+        #[cfg(target_arch = "aarch64")]
+        let plain_function = if tier == Tier::Jit {
+            let env = engine.interp.global_env;
+            let outer = engine.interp.get_var("Outer", &env).ok().unwrap();
+            let outer_handle = outer.as_obj().unwrap();
+            let outer_object = outer_handle.borrow();
+            let crate::value::Callable::User(outer_user) = &outer_object.call else {
+                panic!("Outer user function")
+            };
+            let outer_runtime = outer_user.func.runtime();
+            let outer_chunk = outer_runtime
+                .execution_code_for(crate::interpreter::Env::as_ptr(&env) as usize)
+                .and_then(Option::as_ref)
+                .expect("compiled Outer");
+            assert!(outer_chunk.lean_new_target,
+                "ordinary constructor observations must read the packed interpreter register, not an Env copy");
+            drop(outer_object);
+            let value = engine.interp.get_var("plain", &env).ok().unwrap();
+            let handle = value.as_obj().unwrap();
+            let object = handle.borrow();
+            let crate::value::Callable::User(user) = &object.call else {
+                panic!("plain user function")
+            };
+            Some(user.func.clone())
+        } else {
+            None
+        };
+        #[cfg(target_arch = "aarch64")]
+        let direct_counts = || {
+            let mut returns = 0;
+            let mut throws = 0;
+            if let Some(function) = &plain_function {
+                let runtime = function.runtime();
+                for chunk in [runtime.code.get(), runtime.code2.get()]
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    returns += chunk.test_direct_returns.get();
+                    throws += chunk.test_direct_throws.get();
+                }
+            }
+            (returns, throws)
+        };
+        for mode in [0, -1] {
+            #[cfg(target_arch = "aarch64")]
+            let before = (
+                super::TEST_DIRECT_PACKED_RETURNS.with(std::cell::Cell::get),
+                super::TEST_DIRECT_PACKED_THROWS.with(std::cell::Cell::get),
+                direct_counts(),
+            );
+            assert_eq!(
+                evaluate(&mut engine, &format!("var measured;for(var measure=0;measure<32;measure++){{measured=drive({mode});if(measured!=='true,true,true,true,true,true,true,true,true|true')throw Error(measured);}}measured")),
+                "true,true,true,true,true,true,true,true,true|true",
+                "{tier:?}, mode={mode}"
+            );
+            assert_eq!(
+                engine.interp.new_target.bits(),
+                crate::value::PACK_UNDEFINED
+            );
+            #[cfg(target_arch = "aarch64")]
+            if tier == Tier::Jit {
+                assert!(
+                    super::TEST_DIRECT_PACKED_RETURNS.with(std::cell::Cell::get) > before.0,
+                    "direct native return must pass state restoration"
+                );
+                assert!(direct_counts().0 > before.2.0,
+                    "the exact ordinary plain callee must complete directly; lexical read() cannot mask fallback");
+                if mode < 0 {
+                    assert!(
+                        super::TEST_DIRECT_PACKED_THROWS.with(std::cell::Cell::get) > before.1,
+                        "the direct native error path must restore state before caller unwind"
+                    );
+                    assert!(direct_counts().1 > before.2.1,
+                        "the exact ordinary plain callee must throw directly after collecting inside its saved-state area");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn direct_call_frames_start_undefined_and_release_owners() {
     all_tiers(
         r####"// Direct-call frames: every local starts undefined, every owner is released at exit.

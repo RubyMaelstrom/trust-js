@@ -360,7 +360,7 @@ mod binding_layout_cache_tests {
             .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(31.))
             .unwrap_or_else(|_| panic!("live write"));
         assert!(matches!(
-            (second.borrow().vars.get("outer").unwrap().value).view(),
+            (second.borrow().vars.get("outer").unwrap().value()).view(),
             ValueView::Num(31.)
         ));
         second
@@ -446,7 +446,12 @@ mod binding_layout_cache_tests {
                 (chunk.name_ic_hit(&engine.interp, &second, cache)).map(|__value| (__value).view()),
                 Some(ValueView::Num(17.0))
             ));
-            parent.borrow_mut().vars.get_mut("outer").unwrap().value = Value::Num(23.0);
+            parent
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .set_value(Value::Num(23.0));
             assert!(matches!(
                 (chunk.name_ic_hit(&engine.interp, &second, cache)).map(|__value| (__value).view()),
                 Some(ValueView::Num(23.0))
@@ -485,7 +490,7 @@ mod binding_layout_cache_tests {
                 .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(31.0))
                 .unwrap_or_else(|_| panic!("layout cache write threw"));
             assert!(matches!(
-                (parent.borrow().vars.get("outer").unwrap().value).view(),
+                (parent.borrow().vars.get("outer").unwrap().value()).view(),
                 ValueView::Num(31.0)
             ));
             // The parent identity is still mandatory even for equal child layouts.
@@ -2461,6 +2466,14 @@ pub struct Chunk {
     inline_planning_genv: usize,
     /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these).
     pub(crate) jit_runs: std::cell::Cell<u32>,
+    /// Test-only per-code evidence, recorded after the receiver word is pushed by native
+    /// execution (including its checked op helper). No GC edge or production field.
+    #[cfg(test)]
+    pub(crate) test_this_commits: std::cell::Cell<usize>,
+    #[cfg(all(test, target_arch = "aarch64"))]
+    pub(crate) test_direct_returns: std::cell::Cell<usize>,
+    #[cfg(all(test, target_arch = "aarch64"))]
+    pub(crate) test_direct_throws: std::cell::Cell<usize>,
     /// Bytecode VM runs that a loop-free body made while it waited for native admission
     /// (see `Interp::jit_admit_runs`).
     pub(crate) vm_runs: std::cell::Cell<u32>,
@@ -2570,6 +2583,12 @@ impl crate::gc_trace::GcTrace for Chunk {
             inline_targets: _,
             inline_planning_genv: _,
             jit_runs: _,
+            #[cfg(test)]
+                test_this_commits: _,
+            #[cfg(all(test, target_arch = "aarch64"))]
+                test_direct_returns: _,
+            #[cfg(all(test, target_arch = "aarch64"))]
+                test_direct_throws: _,
             vm_runs: _,
             inline_attempted: _,
             inline_retry_at: _,
@@ -3319,44 +3338,24 @@ impl Chunk {
                     CapInit::Param(k, name) => {
                         b.vars.insert(
                             name.clone(),
-                            crate::interpreter::Binding {
-                                value: args.read(*k as usize),
-                                mutable: true,
-                                strict_immutable: false,
-                                initialized: true,
-                                import_ref: None,
-                                imported: false,
-                                deletable: false,
-                            },
+                            crate::interpreter::Binding::data(args.read(*k as usize), true, true),
                         );
                     }
                     CapInit::Rest(first, name) => {
                         b.vars.insert(
                             name.clone(),
-                            crate::interpreter::Binding {
-                                value: i.make_array(args.rest_values(*first as usize)),
-                                mutable: true,
-                                strict_immutable: false,
-                                initialized: true,
-                                import_ref: None,
-                                imported: false,
-                                deletable: false,
-                            },
+                            crate::interpreter::Binding::data(
+                                i.make_array(args.rest_values(*first as usize)),
+                                true,
+                                true,
+                            ),
                         );
                     }
                     CapInit::Var(name) => {
                         if !b.vars.contains_key(name) {
                             b.vars.insert(
                                 name.clone(),
-                                crate::interpreter::Binding {
-                                    value: Value::Undefined,
-                                    mutable: true,
-                                    strict_immutable: false,
-                                    initialized: true,
-                                    import_ref: None,
-                                    imported: false,
-                                    deletable: false,
-                                },
+                                crate::interpreter::Binding::data(Value::Undefined, true, true),
                             );
                         }
                     }
@@ -3368,15 +3367,7 @@ impl Chunk {
                         b.lexical_names.push(name.clone());
                         b.vars.insert(
                             name.clone(),
-                            crate::interpreter::Binding {
-                                value: Value::Undefined,
-                                mutable: !is_const,
-                                strict_immutable: *is_const,
-                                initialized: false,
-                                import_ref: None,
-                                imported: false,
-                                deletable: false,
-                            },
+                            crate::interpreter::Binding::data(Value::Undefined, !is_const, false),
                         );
                     }
                 }
@@ -3384,15 +3375,7 @@ impl Chunk {
             if self.env_this && !self.lexical_this {
                 b.vars.insert(
                     "this",
-                    crate::interpreter::Binding {
-                        value: this_val.clone(),
-                        mutable: false,
-                        strict_immutable: true,
-                        initialized: true,
-                        import_ref: None,
-                        imported: false,
-                        deletable: false,
-                    },
+                    crate::interpreter::Binding::data(*this_val, false, true),
                 );
             }
         }
@@ -3400,15 +3383,7 @@ impl Chunk {
             let v = i.make_function(self.funcs[fidx as usize].clone(), act.clone());
             act.borrow_mut().vars.insert(
                 name.to_string(),
-                crate::interpreter::Binding {
-                    value: v,
-                    mutable: true,
-                    strict_immutable: false,
-                    initialized: true,
-                    import_ref: None,
-                    imported: false,
-                    deletable: false,
-                },
+                crate::interpreter::Binding::data(v, true, true),
             );
         }
         if self.env_arguments {
@@ -7498,6 +7473,12 @@ fn finish_chunk(
         inline_targets: c.inline_targets,
         inline_planning_genv,
         jit_runs: std::cell::Cell::new(0),
+        #[cfg(test)]
+        test_this_commits: std::cell::Cell::new(0),
+        #[cfg(all(test, target_arch = "aarch64"))]
+        test_direct_returns: std::cell::Cell::new(0),
+        #[cfg(all(test, target_arch = "aarch64"))]
+        test_direct_throws: std::cell::Cell::new(0),
         vm_runs: std::cell::Cell::new(0),
         inline_attempted: std::cell::Cell::new(inline_recompile_at() == 0),
         inline_retry_at: std::cell::Cell::new(inline_recompile_at()),
@@ -15106,7 +15087,7 @@ pub(crate) fn try_function_osr(
             if let Some(binding) = scope.vars.get(name) {
                 if shadow_depth == 0 {
                     value = Some(if binding.initialized {
-                        binding.value.clone()
+                        binding.value()
                     } else {
                         Value::Empty
                     });
@@ -15120,11 +15101,11 @@ pub(crate) fn try_function_osr(
         let Some(value) = value else { return Ok(None) };
         initial.push((*slot, value));
     }
-    let this_val = if chunk.needs_frame_this() {
+    let this_val = PackedValue::pack(if chunk.needs_frame_this() {
         i.get_var("this", live_env)?
     } else {
         Value::Undefined
-    };
+    });
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     slots.resize_with(chunk.n_slots, || {
         Cell::new(PackedValue::pack(Value::Undefined))
@@ -15247,6 +15228,7 @@ fn run_inner(
     // Captured locals (and a lexically-read `this`) live in a per-call activation env; slots
     // hold everything else. No captures → the definition env is used directly.
     let mut env = chunk.make_run_env(i, env, &this_val, args);
+    let this_val = PackedValue::pack(this_val);
     let cap_env = env.clone();
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     let seed = chunk.n_params.min(args.len());
@@ -15326,7 +15308,7 @@ fn drive_vm(
     slots: &[Cell<PackedValue>],
     stack: &mut ValueStack<PackedValue>,
     pc: &mut usize,
-    this_val: &Value,
+    this_val: &PackedValue,
     handlers: &mut Vec<Handler>,
     disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
     class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
@@ -15699,7 +15681,7 @@ fn assign_target_with_slots<S: StoredValue>(
         slots.write_value(
             local.slot as usize,
             if binding.initialized {
-                binding.value.clone()
+                binding.value()
             } else {
                 Value::Empty
             },
@@ -15745,7 +15727,7 @@ fn eval_expr_with_slots<S: StoredValue>(
         slots.write_value(
             local.slot as usize,
             if binding.initialized {
-                binding.value.clone()
+                binding.value()
             } else {
                 Value::Empty
             },
@@ -15923,7 +15905,7 @@ fn run_vm<S: StoredValue>(
     slots: &[Cell<S>],
     stack: &mut ValueStack<S>,
     pc: &mut usize,
-    this_val: &Value,
+    this_val: &PackedValue,
     handlers: &mut Vec<Handler>,
     disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
     class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
@@ -15996,7 +15978,7 @@ fn run_vm_inner<S: StoredValue>(
     slots: &[Cell<S>],
     stack: &mut ValueStack<S>,
     pc: &mut usize,
-    this_val: &Value,
+    this_val: &PackedValue,
     handlers: &mut Vec<Handler>,
     disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
     class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
@@ -16159,7 +16141,7 @@ fn run_vm_inner<S: StoredValue>(
                         drop(b);
                         return Err(i.throw("ReferenceError", msg));
                     }
-                    bd.value.clone()
+                    bd.value()
                 };
                 step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
                     i.write_prepared_reference(&mut reference, v)
@@ -16274,7 +16256,7 @@ fn run_vm_inner<S: StoredValue>(
                 })?;
                 unreachable!("immutable update always completes abruptly");
             }
-            Op::LoadThis => stack.push(this_val.clone()),
+            Op::LoadThis => stack.push_stored(S::from_word(*this_val)),
             Op::LoadLexicalThis => stack.push(i.resolve_this_binding(env)?),
             Op::RequireObject => {
                 if matches!(
@@ -16301,7 +16283,7 @@ fn run_vm_inner<S: StoredValue>(
                     i,
                     chunk,
                     op_pc,
-                    this_val,
+                    &this_val.unpack(),
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
                 )?;
@@ -16361,7 +16343,7 @@ fn run_vm_inner<S: StoredValue>(
                     i,
                     chunk,
                     op_pc,
-                    this_val,
+                    &this_val.unpack(),
                     &chunk.names[n as usize],
                     v,
                     &chunk.caches[c as usize],
@@ -17568,11 +17550,13 @@ fn run_vm_inner<S: StoredValue>(
                 );
             }
             Op::ImportMeta => stack.push(i.import_meta_vm(env)),
-            Op::NewTarget => stack.push(if chunk.lean_new_target {
-                i.new_target.clone()
-            } else {
-                i.new_target_vm(env)
-            }),
+            Op::NewTarget => {
+                if chunk.lean_new_target {
+                    stack.push_stored(S::from_word(i.new_target));
+                } else {
+                    stack.push(i.new_target_vm(env));
+                }
+            }
             Op::DynamicImport(phase, has_options) => {
                 let options = has_options.then(|| pop!());
                 let specifier = pop!();
@@ -17664,7 +17648,7 @@ fn run_vm_inner<S: StoredValue>(
             // ECMA-262 §13.3.7.1 creates a Super Reference with the current function's actual
             // this binding as [[ThisValue]]. Compiled calls keep that binding in the VM frame
             // rather than materializing an activation environment, so use it directly here.
-            Op::SuperThis => stack.push(this_val.clone()),
+            Op::SuperThis => stack.push_stored(S::from_word(*this_val)),
             Op::SuperBase => stack.push(i.super_base_vm(env)?),
             Op::SuperGet | Op::SuperGetMethod => {
                 let keep_receiver = matches!(op, Op::SuperGetMethod);
@@ -18672,7 +18656,7 @@ pub struct VmCoro {
     cap_env: Env,
     env: Env,
     references: Vec<crate::eval::PreparedReferenceSlot>,
-    this_val: Value,
+    this_val: PackedValue,
     slots: Vec<Cell<PackedValue>>,
     stack: ValueStack<PackedValue>,
     pc: usize,
@@ -18723,7 +18707,7 @@ impl VmCoro {
 
         visitor.chunk(&self.chunk);
         visitor.value(&Value::Obj(self.realm.clone()));
-        visitor.value(&self.this_val);
+        visitor.value(&self.this_val.unpack());
         let mut bytes = self
             .references
             .capacity()
@@ -18839,7 +18823,7 @@ impl VmCoro {
             cap_env: env.clone(),
             env,
             references,
-            this_val,
+            this_val: PackedValue::pack(this_val),
             slots,
             stack: ValueStack::with_capacity(16),
             pc: 0,
@@ -19834,12 +19818,11 @@ impl Chunk {
         let ic = self.name_caches[c as usize].get();
         if ic.env == FIXED_NAME_IC {
             let scope = env.borrow();
-            if scope.with_obj.is_some() || ic.gen == 0 || scope.vars.layout_id() != ic.gen {
+            if scope.has_with_object() || ic.gen == 0 || scope.vars.layout_id() != ic.gen {
                 return None;
             }
             let binding = scope.vars.fixed_binding_at(ic.binding as usize)?;
-            return (binding.initialized && binding.import_ref.is_none())
-                .then(|| binding.value.clone());
+            return (binding.initialized && binding.import_ref.is_none()).then(|| binding.value());
         }
         if ic.env == lexical_cache::DEEP_NAME_IC {
             return self.deep_name_ic_hit(i, env, c);
@@ -19855,7 +19838,7 @@ impl Chunk {
             // flag are read live — in-place writes flow through.
             let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::Binding) };
             return if bd.initialized && bd.import_ref.is_none() {
-                Some(bd.value.clone())
+                Some(bd.value())
             } else {
                 None
             };
@@ -19896,7 +19879,7 @@ impl Chunk {
             }
             let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::Binding) };
             return if bd.initialized && bd.import_ref.is_none() {
-                Some(bd.value.clone())
+                Some(bd.value())
             } else {
                 None
             };
@@ -19911,14 +19894,14 @@ impl Chunk {
     fn name_ic_fill(&self, i: &Interp, env: &Env, n: u32, c: u32) -> Option<Value> {
         {
             let b = env.borrow();
-            if b.with_obj.is_some() || b.vars.generation() == u32::MAX {
+            if b.has_with_object() || b.vars.generation() == u32::MAX {
                 return None;
             }
             if let Some(bd) = b.vars.get(&self.names[n as usize]) {
                 if !bd.initialized || bd.import_ref.is_some() {
                     return None;
                 }
-                let v = bd.value.clone();
+                let v = bd.value();
                 self.record_name_number(c as usize, &v);
                 let previous = self.name_caches[c as usize].get();
                 let layout_id = b.vars.layout_id();
@@ -19963,13 +19946,13 @@ impl Chunk {
             if layout_id != 0 || self.makes_env() {
                 if let Some(p) = &b.parent {
                     let pb = p.borrow();
-                    if pb.with_obj.is_none()
+                    if !pb.has_with_object()
                         && pb.vars.layout_id() == 0
                         && pb.vars.generation() != u32::MAX
                     {
                         if let Some(bd) = pb.vars.get(&self.names[n as usize]) {
                             if bd.initialized && bd.import_ref.is_none() {
-                                let v = bd.value.clone();
+                                let v = bd.value();
                                 self.record_name_number(c as usize, &v);
                                 self.name_caches[c as usize].set(NameIc {
                                     env: Env::as_ptr(p) as usize
@@ -20054,7 +20037,7 @@ impl Chunk {
             let b = env.borrow();
             if ic.env == FIXED_NAME_IC
                 && ic.gen != 0
-                && b.with_obj.is_none()
+                && !b.has_with_object()
                 && b.vars.layout_id() == ic.gen
             {
                 if let Some(binding) = b.vars.fixed_binding_at(ic.binding as usize) {
@@ -20116,7 +20099,7 @@ impl Chunk {
                 ),
             ));
         }
-        Ok(binding.value.clone())
+        Ok(binding.value())
     }
 
     pub(crate) fn store_cap_ic(
@@ -20142,7 +20125,7 @@ impl Chunk {
         // its card, with no safepoint before the store.
         // SAFETY: `env` names a live environment cell, a small cell of a carded kind.
         unsafe { crate::gc_core::card_mark(Env::as_ptr(env).cast()) };
-        binding.value = value;
+        binding.set_value(value);
         if initialize {
             binding.initialized = true;
         }
@@ -20188,10 +20171,10 @@ impl Chunk {
         if ic.env == FIXED_NAME_IC {
             {
                 let mut scope = env.borrow_mut();
-                if scope.with_obj.is_none() && ic.gen != 0 && scope.vars.layout_id() == ic.gen {
+                if !scope.has_with_object() && ic.gen != 0 && scope.vars.layout_id() == ic.gen {
                     if let Some(binding) = scope.vars.fixed_binding_at_mut(ic.binding as usize) {
                         if binding.initialized && binding.mutable && binding.import_ref.is_none() {
-                            binding.value = value;
+                            binding.set_value(value);
                             return Ok(());
                         }
                     }
@@ -20216,7 +20199,7 @@ impl Chunk {
             if b.vars.matches_generation(ic.gen) {
                 let bd = unsafe { &mut *(ic.binding as usize as *mut crate::interpreter::Binding) };
                 if bd.initialized && bd.mutable && bd.import_ref.is_none() {
-                    bd.value = value;
+                    bd.set_value(value);
                     return Ok(());
                 }
             }
@@ -20251,7 +20234,7 @@ impl Chunk {
                             &mut *(ic.binding as usize as *mut crate::interpreter::Binding)
                         };
                         if bd.initialized && bd.mutable && bd.import_ref.is_none() {
-                            bd.value = value;
+                            bd.set_value(value);
                             return Ok(());
                         }
                     }
@@ -21307,15 +21290,7 @@ fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
         .map(|binding| {
             (
                 binding.name.clone(),
-                crate::interpreter::Binding {
-                    value: Value::Undefined,
-                    mutable: !binding.is_const,
-                    strict_immutable: binding.is_const,
-                    initialized: false,
-                    import_ref: None,
-                    imported: false,
-                    deletable: false,
-                },
+                crate::interpreter::Binding::data(Value::Undefined, !binding.is_const, false),
             )
         })
         .collect();
@@ -21370,15 +21345,12 @@ fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
                 .expect("per-iteration binding missing");
                 (
                     binding.name.clone(),
-                    crate::interpreter::Binding {
-                        value: previous.value.clone(),
-                        mutable: previous.mutable,
-                        strict_immutable: previous.strict_immutable,
-                        initialized: previous.initialized,
-                        import_ref: None,
-                        imported: false,
-                        deletable: false,
-                    },
+                    crate::interpreter::Binding::data_word(
+                        previous.word(),
+                        previous.mutable,
+                        previous.initialized,
+                    )
+                    .with_strict_immutable(previous.strict_immutable),
                 )
             })
             .collect()
@@ -21395,7 +21367,7 @@ fn initialize_lexical_binding(chunk: &Chunk, env: &Env, name: u32, value: Value)
         .vars
         .get_mut(name)
         .expect("lexical initialization requires an own binding");
-    binding.value = value;
+    binding.set_value(value);
     binding.initialized = true;
 }
 
@@ -21898,7 +21870,8 @@ unsafe fn jit_intrinsic_inner(
                 // run outside a pending construction. Dense push/pop themselves cannot observe
                 // these fields, but a prototype setter or unusual array-like on the miss path can.
                 let saved_ctor = std::mem::replace(&mut i.constructing, false);
-                let saved_nt = std::mem::replace(&mut i.new_target, Value::Undefined);
+                let saved_nt =
+                    std::mem::replace(&mut i.new_target, PackedValue::pack(Value::Undefined));
                 let r = match intrinsic {
                     INTRINSIC_CHAR_AT => {
                         let ValueView::Str(s) = &((*base).unpack()).view() else {
@@ -23700,7 +23673,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                 Ok(())
             }
             Op::GetPropThis(n, c) => {
-                let this = ctx.this_view();
+                let this = ctx.this_value();
                 jit_propstat(
                     ctx,
                     i,
@@ -24739,7 +24712,7 @@ unsafe fn jit_exec_inner(
                     drop(b);
                     return Err(i.throw("ReferenceError", msg));
                 }
-                bd.value.clone()
+                bd.value()
             };
             if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
                 i.write_prepared_reference(&mut reference, v)
@@ -24807,7 +24780,14 @@ unsafe fn jit_exec_inner(
             let v = pop!();
             chunk.store_name_ic(i, env, n, c, v)?;
         }
-        Op::LoadThis => push!(ctx.this_value()),
+        Op::LoadThis => {
+            (*sp).write(ctx.this_word());
+            *sp = (*sp).add(1);
+            #[cfg(test)]
+            chunk
+                .test_this_commits
+                .set(chunk.test_this_commits.get() + 1);
+        }
         Op::GetProp(n, c) => {
             let obj = pop!();
             jit_propstat(
@@ -25612,11 +25592,12 @@ unsafe fn jit_exec_inner(
             // GetNewTarget follows the nearest this-binding Environment Record;
             // an arrow must observe its defining environment, not the caller. A lean ordinary
             // body has no such record: its [[NewTarget]] is the interpreter's current value.
-            push!(if chunk.lean_new_target {
-                i.new_target.clone()
+            if chunk.lean_new_target {
+                (*sp).write(i.new_target);
+                *sp = (*sp).add(1);
             } else {
-                i.new_target_vm(env)
-            });
+                push!(i.new_target_vm(env));
+            }
         }
         Op::ToStr => {
             #[cfg(test)]
@@ -26190,7 +26171,15 @@ impl Chunk {
     pub(crate) fn test_ops(&self) -> &[Op] {
         &self.ops
     }
+
+    pub(crate) fn test_name_cache(&self, index: u32) -> NameIc {
+        self.name_caches[index as usize].get()
+    }
 }
+
+#[cfg(test)]
+#[path = "bytecode_packed_storage_tests.rs"]
+mod packed_storage_tests;
 
 #[cfg(test)]
 mod return_slot_tests {

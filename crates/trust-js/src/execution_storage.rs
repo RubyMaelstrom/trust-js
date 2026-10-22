@@ -9,6 +9,7 @@ use std::cell::Cell;
 
 pub(crate) trait StoredValue: Sized + Copy {
     fn from_value(value: Value) -> Self;
+    fn from_word(value: PackedValue) -> Self;
     fn into_value(self) -> Value;
     fn clone_value(&self) -> Value;
     fn is_empty(&self) -> bool;
@@ -19,6 +20,10 @@ impl StoredValue for PackedValue {
     #[inline]
     fn from_value(value: Value) -> Self {
         Self::pack(value)
+    }
+    #[inline]
+    fn from_word(value: PackedValue) -> Self {
+        value
     }
     #[inline]
     fn into_value(self) -> Value {

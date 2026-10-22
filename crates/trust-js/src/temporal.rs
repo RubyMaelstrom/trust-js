@@ -2770,7 +2770,7 @@ fn add_ctor(
 /// GetPrototypeFromConstructor: a construct via a subclass new-target adopts that target's
 /// `prototype` object (an observable Get that may throw); a non-object value keeps the default.
 fn sub_proto(i: &mut Interp, v: &Value) -> Result<(), Value> {
-    let nt = i.new_target.clone();
+    let nt = i.constructor_new_target();
     if !matches!((nt).view(), ValueView::Obj(_)) {
         return Ok(());
     }

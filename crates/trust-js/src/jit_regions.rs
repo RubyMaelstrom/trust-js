@@ -33,6 +33,15 @@ thread_local! {
     // Native data hit, native absence hit, checked property fallback, region property
     // continuation, numeric result, post-result miss, scalar prefix/local reuse.
     static PROPERTY_PATHS: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
+    // Fused free-name typed-array accesses that passed all guards and committed (read/write).
+    static NAME_ELEMENT_COMMITS: [std::cell::Cell<usize>; 2] = const {
+        [const { std::cell::Cell::new(0) }; 2]
+    };
+}
+
+#[cfg(test)]
+pub(super) fn name_element_commits() -> [usize; 2] {
+    NAME_ELEMENT_COMMITS.with(|counts| [counts[0].get(), counts[1].get()])
 }
 
 /// Property paths recorded so far on this thread (see `PROPERTY_PATHS`; tests only).
@@ -339,7 +348,6 @@ struct TdzArrayPair {
 struct TdzArrayEmission {
     pattern: TdzArrayPair,
     pre_fail: usize,
-    post_fail: usize,
     continuation: usize,
 }
 
@@ -1986,7 +1994,7 @@ fn name_element_stub(a: &asm::Asm) -> bool {
 /// calls nothing, so its link register stays the caller's.
 ///
 /// * `hit`: the element is read (x12 = packed Number, d1 = value) or written.
-/// * `value_miss`: the name validated (x14 = its value, x7 = storage kind) but the receiver or
+/// * `value_miss`: the name validated (x14 = its word, x7 = owner kind) but the receiver or
 ///   index is not for the native path.
 /// * `name_miss`: the name cache did not validate or a typed-array guard failed.
 pub(super) fn emit_name_element_body(
@@ -1998,30 +2006,22 @@ pub(super) fn emit_name_element_body(
     name_miss: usize,
     value_miss: usize,
 ) {
-    // The binding: x14 = its value, x7 = 0 for a wide scope binding, 1 for a packed global
-    // property (the shared probe of LoadName).
+    #[cfg(test)]
+    let committed = a.new_label();
+    #[cfg(not(test))]
+    let committed = hit;
+    // x14 points at the execution word; x7 remains Binding=0/Property=1.
     if leaf || !shared_stubs_enabled() {
         emit_name_ic_value_ptr_body(a, layout, name_miss, true);
     } else {
-        let stub = a.shared_stub(SharedStub::NameValuePtr { packed_ok: true }.key());
+        let stub = a.shared_stub(SharedStub::NameValuePtr { property_ok: true }.key());
         a.bl_label(stub);
         a.cbz(9, false, name_miss);
     }
-    // x10 = the Object's allocation. A wide scope binding holds its Value (tag byte, then the
-    // payload word); a packed global property holds the encoded word.
-    let have = a.new_label();
-    let wide = a.new_label();
-    a.cbz(7, false, wide);
+    // x10 = the Object's allocation from either owner's identical execution word.
     a.ldur(12, 14, 0);
     emit_exec_tag_guard(a, 12, crate::value::PACK_OBJ, 13, value_miss);
     emit_exec_payload(a, 12, 10);
-    a.b(have);
-    a.bind(wide);
-    a.ldurb(13, 14, 0);
-    a.cmp_imm_w(13, 8); // Value::Obj
-    a.b_cond(C_NE, value_miss);
-    a.ldur(10, 14, 8);
-    a.bind(have);
     // An ordinary Object that is not exotic (a typed array is neither Array nor plain).
     a.add_imm(11, 10, layout.obj_from_cell as u32);
     a.ldrb_imm(12, 11, layout.obj_exotic as u32);
@@ -2044,11 +2044,23 @@ pub(super) fn emit_name_element_body(
     }
     // The value (d1) is in place: the access reads it as a register operand.
     match layout.native_typed_array {
-        Some(native) if leaf => typed_array::emit_access(a, &native, write, hit, name_miss),
+        Some(native) if leaf => typed_array::emit_access(a, &native, write, committed, name_miss),
         _ => {
             let value = write.then_some(typed_array::WriteValue::Register(1));
-            typed_array::emit(a, layout, value, hit, name_miss);
+            typed_array::emit(a, layout, value, committed, name_miss);
         }
+    }
+    #[cfg(test)]
+    {
+        // x12/d1 hold a successful read; x15/x16 are scratch after either access commits.
+        a.bind(committed);
+        let address =
+            NAME_ELEMENT_COMMITS.with(|counts| counts[usize::from(write)].as_ptr() as usize);
+        a.mov_imm64(15, address as u64);
+        a.ldr_imm(16, 15, 0);
+        a.add_imm(16, 16, 1);
+        a.str_imm(16, 15, 0);
+        a.b(hit);
     }
 }
 
@@ -2204,7 +2216,7 @@ fn emit_name_element_fallback(
     a.b(common);
     a.bind(f.value_miss);
     prefix(a);
-    emit_load_name_value(a, layout, full, false, false);
+    emit_load_name_value(a, full, false, false);
     a.bind(common);
     a.add_imm(20, 20, 8 * (1 + u32::from(f.set)));
     if f.set {
@@ -2380,10 +2392,8 @@ pub(super) fn emit(
                 };
                 let block_start = cfg.blocks()[block_id.0 as usize].start;
                 let pre_fail = a.new_label();
-                let post_fail = a.new_label();
                 let continuation = a.new_label();
                 bails.push((pre_fail, pc, Vec::new(), 0, true));
-                bails.push((post_fail, pc + 6, Vec::new(), 0, true));
                 tdz_array_exit_blocks.insert(block_start);
                 tdz_array_skips.extend(pc + 1..pattern.continuation);
                 tdz_array_continuations
@@ -2395,7 +2405,6 @@ pub(super) fn emit(
                     TdzArrayEmission {
                         pattern,
                         pre_fail,
-                        post_fail,
                         continuation,
                     },
                 );
@@ -2501,13 +2510,7 @@ pub(super) fn emit(
                     }
                 }
 
-                emit_local_assumed_dense_data_value(
-                    a,
-                    layout,
-                    receiver_off,
-                    key_src,
-                    candidate.post_fail,
-                );
+                emit_local_assumed_dense_data_value(a, layout, receiver_off, key_src);
                 // The first Tdz made this destination Empty, so the result can be stored
                 // directly into its canonical slot.
                 emit_exec_word_store(a, 12, 22, pattern.value as i32 * 8);
@@ -3743,6 +3746,13 @@ fn emit_effect(
             a.ldr_imm(12, 19, 48); // ctx.this_word
             emit_exec_word_store(a, 12, 20, 0);
             a.add_imm(20, 20, 8);
+            #[cfg(test)]
+            {
+                a.mov_imm64(9, chunk.test_this_commits.as_ptr() as u64);
+                a.ldr_imm(10, 9, 0);
+                a.add_imm(10, 10, 1);
+                a.str_imm(10, 9, 0);
+            }
         }
         Op::Undef if fast & 128 != 0 => {
             a.mov_imm64(9, crate::value::PACK_UNDEFINED);

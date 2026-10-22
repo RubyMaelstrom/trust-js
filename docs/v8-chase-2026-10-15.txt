@@ -7276,3 +7276,123 @@ Fresh fat-LTO/cgu1 export (rustc 1.99.1), source unchanged throughout:
 step12c engine 46456a6c0f15, 19,983,968 bytes. Compare selected 12b
 787cbefb0836 and current-toolchain main 4de8ccc1edd4, keeping S0's
 older-toolchain main 311ae9ae5658 separately labelled.
+
+Step 12d: packed bindings, scope receivers and call state
+
+Binding.value is a private execution word with explicit accessors.
+Scope.with_obj uses full-word EMPTY for absence; Null is present.
+Initialization stays a separate flag, so initialized undefined and
+TDZ remain distinct. Interp.new_target, VM/suspended this and the
+JIT receiver snapshot use words; tracing and size accounting follow.
+ARM direct calls save 32 aligned bytes, retain new.target at +16,
+initialize +24, clear an ordinary call with full Undefined, and
+restore both normal and throw paths. Lexical calls keep the target.
+
+ARM and x64 name templates load/store words, preserving live flags,
+layout/generation checks, with rejection and actual-owner cards.
+Input guards run before a target write, card or operand retirement.
+The x64 FIXED_NAME_IC branch is completed as recorded beforehand:
+a nonzero matching layout plus bounded Small/Indexed slot lookup.
+Other non-mirror loop admission remains unchanged. Obsolete wide
+codecs and physically dead numeric suffixes are removed only as
+reviewed; no collector, guard or fallback is exempted by this step.
+
+Native proofs cover each cache mode, all execution kinds, six update
+forms, numeric edges, inline/spilled bindings, TDZ/import/mutability,
+with absence/presence and old-owner cards. Direct-call new.target
+controls execute the exact native callee with collecting normal and
+throw paths. Suspended this is the sole precise root across yield,
+await and resume; controls establish exact native continuation entry
+and post-resume release. An isolated layout-mismatch mutant fails
+its intended value assertion. Earlier repairs and interrupted runs
+remain preserved; no zero-match focused run is counted as a pass.
+
+The first full remote gate caught a stale prepared-reference size
+assertion: 32, while the packed Binding is 24 bytes. Correct only
+the expected size and its message, retaining import-flag and storage
+checks. Before the correction, x64 is 2210/1/7; Wine 2202/4/7,
+including its three baseline codec failures. Initial clippy and
+fixtures/difftest pass. The original logs and all 494 source paths
+are archived; ARM's future gate was held before starting. Rebase
+only that test block in later isolated exports after frozen readers
+finish. The original 12c base and measured export retain their exact
+source. Corrected routine gates pass: ARM 2382/0/7, x64 2211/0/7,
+Wine 2203/3/7 with exactly its three baseline codec failures. Five
+strict Clippy configurations pass; rustdoc retains eight warnings,
+none new, and doctests pass 11/0/1. Workspace and downstream suites
+pass; test-list changes are the expected additions, one removed wide
+codec test and one wide-to-word test rename.
+
+Fixture stdout is unchanged, with compiles 56/10/160 and collections
+21/6/16. Sustained allocation collects 194 times at both tiers and
+keeps its checksum. Difftest: 138 agree, 12 budget skips, no crash.
+Full Test262 at threshold 8 passes 53575/53575 with the three existing
+upstream skips, exactly the reference.
+Targeted interval-1 stress passes 1818 tests with five existing ignores,
+no failure, timeout or retry. The exact 1823-name inventory is complete;
+all 494 source paths remain unchanged through the ARM gate. The final
+zombie archive verifies all 497 source/configuration paths.
+
+Actual release layouts: Binding 32 to 24, Scope 120 to 104, VarMap
+80 to 72, VarStorage 72 to 64, IndexedBindings 64 to 56 bytes.
+Interp remains 5776 bytes, with member moves; JitCtx 328, JitFrame
+2376, Object 160 and the other measured neutral carriers stay fixed.
+Original production probes in isolated diagnostic exports report
+actual Option<Value> absence byte 255 and new full-word PACK_EMPTY,
+binding tuple stride 48 to 40, flag offsets 24/25/26 to 16/17/18.
+All 38 parent/child production-versus-diagnostic DWARF layouts agree.
+All nine actual dump pairs pass strict comparison: 678 cross-version
+chunks and 1356 companion images. Extra production layouts confirm
+neutral name descriptors, guard arrays and secondary-call overflow
+entries/sets. Every companion first matches its original image before
+its completion/resume offsets are imported. Ordinary bytecode offsets
+do not grant blanket register provenance. Every scalar instruction,
+branch predicate/destination and native-word delta is accounted for.
+
+Source-specific rewrites cover 2861 complete name probes and 2664
+direct-call save/restore sites, including lexical targets, full-word
+Undefined/EMPTY tests and normal/error restoration. Actual-owner
+cards remain exact. Named field moves require measured layouts and
+proven base registers. Address relocations require a bijection and
+all-consumer checks through aliases, joins and private calls; unknown
+writes or control flow cannot establish proof. Inspected stubs retain
+every pointer alias and route their actual explicit return status.
+
+The independently copied final checker passes 242 positive controls,
+rejects 378 negative controls and passes 37 structural-index controls.
+No chunk, block or admission exception is granted. Earlier checker
+failures remain preserved; previously accepted event/image reports
+are unchanged by the final status-routing repair. Final proof tools,
+commands, input hashes and reports are under s6-step12dr/comparator-
+root-v4; the source-reviewed engine itself needed no further change.
+
+Fresh fat-LTO/cgu1 engine 6fbd7e2b614a (19961576 bytes), rustc 1.99.1,
+from a frozen 496-path export. Only the cfg(test) size fixture differs
+from the final source; all production paths are byte-identical.
+Quiet performance: 15 rotating rounds, 360 valid samples, CPU 5,
+Crystal ARM/rustc 1.99.1. The quiet minute used 11 llama-server ticks
+and 2337 ticks across all CPUs; other cores median 0.391, maximum
+2.493 during runs. Outputs, compile/failure counts and collections
+match 12c throughout. Retain both matched-toolchain and original S0
+main references independently.
+
+Against 12c, Vue/React/Djot cycles change -1.37/-2.15/-0.74%, and
+instructions -0.28/-0.76/-0.42%. Sustained native/bytecode cycles
++0.25/-0.21%; bytecode instructions +1.51%, a minor component cost
+retained for the representation migration. This part still decodes
+packed bindings into the wide Value that 12e removes. Native sustained
+instructions fall 0.42%. Fixture JIT bytes fall 4.78/0.59/3.10%;
+sustained native bytes fall 10.89%. Live-object counts are unchanged.
+
+Fixture peak RSS changes -0.14/+1.56/-1.74%; sustained stays within
+0.26%. GC total pauses fall 0.21/1.59/0.51%, sustained 0.30/0.42%,
+and longest pauses stay within 1.7%. Fixture compilation and parse
+components show no material regression against 12c. Empty-process
+cycles -0.58%, wall +1.13%; its exit GC estimate -8.37% has a wide CI
+[-16.12,+13.84], so no precise pause improvement is claimed. Full
+component distributions and paired intervals remain in the report.
+
+Against matched main, fixture cycles -14.84/-16.06/-10.42% and Vue
+instructions -14.37%. Open S0 bounds remain: React peak RSS +40.48%,
+Djot GC share 7.67%, sustained shares 33.73/25.15% at native/bytecode.
+These are still exit-review items; this part does not close them.

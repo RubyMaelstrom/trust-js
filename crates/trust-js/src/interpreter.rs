@@ -1746,7 +1746,7 @@ impl VarMap {
             }
             VarStorage::Large(_) => unreachable!("fresh compiled activation has fixed storage"),
         };
-        entries[slot].1.value = value;
+        entries[slot].1.set_value(value);
     }
 
     /// Requested bytes owned directly by this binding map, plus whether the result is exact.
@@ -2104,7 +2104,7 @@ mod binding_layout_tests {
                 let exporter = weak
                     .upgrade()
                     .expect("rooted imports retain their exporter");
-                let value = exporter.borrow().vars.get("source").unwrap().value.clone();
+                let value = exporter.borrow().vars.get("source").unwrap().value();
                 value
                     .as_obj()
                     .unwrap()
@@ -2155,7 +2155,7 @@ mod binding_layout_tests {
             let slot = first.binding_slot(&name).unwrap();
             assert_eq!(second.binding_slot(&name), Some(slot));
             assert!(
-                matches!((second.fixed_binding_at(slot).unwrap().value).view(), ValueView::Num(v) if v == (100+n) as f64)
+                matches!((second.fixed_binding_at(slot).unwrap().value()).view(), ValueView::Num(v) if v == (100+n) as f64)
             );
         }
         let slot = first.binding_slot("v23").unwrap();
@@ -2167,7 +2167,7 @@ mod binding_layout_tests {
         );
         let binding = first.fixed_binding_at(slot).unwrap();
         assert!(!binding.mutable && !binding.initialized);
-        assert!(matches!((binding.value).view(), ValueView::Num(999.)));
+        assert!(matches!((binding.value()).view(), ValueView::Num(999.)));
         first.insert("dynamic", Binding::data(Value::Num(7.), true, true));
         assert_eq!(first.layout_id(), 0);
         first.share_layout(&cached);
@@ -2310,7 +2310,7 @@ mod binding_layout_tests {
         assert_ne!(id, 0);
         vars.insert("value", Binding::data(Value::Num(1.0), true, true));
         vars.publish_layout(id);
-        vars.get_mut("value").unwrap().value = Value::Num(2.0);
+        vars.get_mut("value").unwrap().set_value(Value::Num(2.0));
         assert_eq!(vars.layout_id(), id);
         vars.get_mut("value").unwrap().initialized = false;
         assert_eq!(vars.layout_id(), id, "TDZ is checked live");
@@ -2363,7 +2363,7 @@ pub struct Scope {
     pub vars: VarMap,
     pub parent: Option<Env>,
     /// For a `with (obj)` block: identifier resolution checks `obj`'s properties before the parent.
-    pub with_obj: Option<Value>,
+    with_obj: PackedValue,
     /// `true` when this scope or ANY ancestor is a `with` scope (propagated at construction).
     /// Compiled tiers refuse to run a body whose closure chain is under a `with`: the VM's
     /// free-name ops re-resolve at execution time, but a with-object binding can appear or
@@ -2383,6 +2383,50 @@ pub struct Scope {
     /// body scope holds both hoisted vars and body-level lexicals; a sloppy direct eval's
     /// var/lexical conflict check needs to tell them apart.
     pub lexical_names: ScopeNames,
+}
+
+impl Scope {
+    /// A with record is present exactly when its word is not EMPTY. Presence is independent
+    /// of the held value's truthiness or kind (including synthetic Null records in tests).
+    #[inline]
+    pub(crate) fn has_with_object(&self) -> bool {
+        !self.with_obj.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn with_object(&self) -> Option<Value> {
+        self.has_with_object().then(|| self.with_obj.unpack())
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn set_with_object(&mut self, object: Option<Value>) {
+        debug_assert!(!object.is_some_and(|value| matches!(value.view(), ValueView::Empty)));
+        self.with_obj = PackedValue::pack(object.unwrap_or(Value::Empty));
+    }
+
+    pub(crate) const fn with_object_offset() -> usize {
+        std::mem::offset_of!(Self, with_obj)
+    }
+}
+
+impl crate::gc_trace::GcTrace for Scope {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            vars,
+            parent,
+            with_obj,
+            under_with: _,
+            var_boundary: _,
+            catch_param: _,
+            lexical_names: _,
+        } = self;
+        for binding in vars.values() {
+            crate::gc_trace::GcTrace::trace_gc(binding, sink);
+        }
+        crate::gc_trace::GcTrace::trace_gc(parent, sink);
+        crate::gc_trace::GcTrace::trace_gc(with_obj, sink);
+    }
 }
 
 /// P1 S4: an environment cell, with its first binding in place, fills the heap's 128-byte size
@@ -2429,7 +2473,8 @@ impl ScopeNames {
 
 #[derive(Clone)]
 pub struct Binding {
-    pub value: Value,
+    /// Execution word only; initialization remains an independent flag.
+    value: PackedValue,
     pub mutable: bool,
     /// `false` while a `let`/`const` is in its temporal dead zone.
     pub initialized: bool,
@@ -2483,12 +2528,40 @@ impl BindingGetterCache {
 pub(crate) const MAX_BINDING_GETTER_SCOPES: usize = 16;
 
 impl Binding {
+    #[inline]
+    pub(crate) fn value(&self) -> Value {
+        self.value.unpack()
+    }
+
+    #[inline]
+    pub(crate) fn word(&self) -> PackedValue {
+        self.value
+    }
+
+    #[inline]
+    pub(crate) fn set_value(&mut self, value: Value) {
+        self.value = PackedValue::pack(value);
+    }
+
+    #[inline]
+    pub(crate) fn set_word(&mut self, word: PackedValue) {
+        self.value = word;
+    }
+
+    pub(crate) const fn value_offset() -> usize {
+        std::mem::offset_of!(Self, value)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, String)>) {
         self.imported = reference.is_some();
         self.import_ref = reference.map(|(env, name)| Box::new((env, Rc::from(name))));
     }
     pub(crate) fn data(value: Value, mutable: bool, initialized: bool) -> Binding {
+        Self::data_word(PackedValue::pack(value), mutable, initialized)
+    }
+
+    pub(crate) fn data_word(value: PackedValue, mutable: bool, initialized: bool) -> Binding {
         Binding {
             value,
             mutable,
@@ -2498,6 +2571,36 @@ impl Binding {
             deletable: false,
             // An immutable binding created through this helper (const/TDZ) is strict by default.
             strict_immutable: !mutable,
+        }
+    }
+
+    pub(crate) fn with_strict_immutable(mut self, strict: bool) -> Self {
+        self.strict_immutable = strict;
+        self
+    }
+
+    pub(crate) fn live_import(environment: Env, name: Rc<str>) -> Self {
+        let mut binding = Self::data(Value::Undefined, false, true);
+        binding.import_ref = Some(Box::new((environment, name)));
+        binding.imported = true;
+        binding
+    }
+}
+
+impl crate::gc_trace::GcTrace for Binding {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            value,
+            mutable: _,
+            initialized: _,
+            import_ref,
+            imported: _,
+            deletable: _,
+            strict_immutable: _,
+        } = self;
+        crate::gc_trace::GcTrace::trace_gc(value, sink);
+        if let Some(import) = import_ref {
+            sink.env(&import.0);
         }
     }
 }
@@ -2515,7 +2618,7 @@ fn new_env(
     Env::new(Scope {
         vars,
         parent,
-        with_obj,
+        with_obj: PackedValue::pack(with_obj.unwrap_or(Value::Empty)),
         under_with,
         var_boundary,
         catch_param,
@@ -3481,7 +3584,7 @@ pub struct Interp {
     /// The object is pinned in `gc_pins`; `getter` is an internal GC edge owned by that object.
     pub(crate) host_indexed: gc_collect::SideSlotTable<HostIndexedProperties>,
     /// The active `new.target` for the function currently executing (Undefined outside a `new`).
-    pub(crate) new_target: Value,
+    pub(crate) new_target: PackedValue,
     /// The `new.target` to install for the next constructor invocation (set by `construct`).
     pub(crate) pending_new_target: Value,
     /// The `$262.IsHTMLDDA` objects (emulate `document.all`), indexed weakly by identity: typeof
@@ -4799,15 +4902,7 @@ impl Interp {
             let global_env = new_var_scope(None);
             global_env.borrow_mut().vars.insert(
                 "this".to_string(),
-                Binding {
-                    value: Value::Obj(self.global.clone()),
-                    mutable: false,
-                    strict_immutable: true,
-                    initialized: true,
-                    import_ref: None,
-                    imported: false,
-                    deletable: false,
-                },
+                Binding::data(Value::Obj(self.global.clone()), false, true),
             );
             let state = HostSettingsState {
                 global_env,
@@ -4939,18 +5034,10 @@ impl Interp {
         crate::builtins::install(self);
         // Top-level `this` is the new global.
         let g = Value::Obj(self.global.clone());
-        self.global_env.borrow_mut().vars.insert(
-            "this".to_string(),
-            Binding {
-                value: g,
-                mutable: false,
-                strict_immutable: true,
-                initialized: true,
-                import_ref: None,
-                imported: false,
-                deletable: false,
-            },
-        );
+        self.global_env
+            .borrow_mut()
+            .vars
+            .insert("this".to_string(), Binding::data(g, false, true));
         // Tag this realm's `eval` so an *indirect* call to it (`otherRealm.eval(code)`) runs the code
         // in this realm's global scope, not the caller's (see `call_inner`).
         if let Some(ef) = &self.eval_fn {
@@ -5483,7 +5570,7 @@ impl Interp {
             regexp_programs: crate::cache::RegexpProgramCache::new(16 << 20, 512),
             proxies: Default::default(),
             host_indexed: Default::default(),
-            new_target: Value::Undefined,
+            new_target: PackedValue::pack(Value::Undefined),
             pending_new_target: Value::Undefined,
             htmldda: Default::default(),
             ctor_caller_realm: None,
@@ -5551,18 +5638,11 @@ impl Interp {
         crate::builtins::install(&mut interp);
         // `this` at the top level is the global object (sloppy mode).
         let g = Value::Obj(interp.global.clone());
-        interp.global_env.borrow_mut().vars.insert(
-            "this".to_string(),
-            Binding {
-                value: g,
-                mutable: false,
-                strict_immutable: true,
-                initialized: true,
-                import_ref: None,
-                imported: false,
-                deletable: false,
-            },
-        );
+        interp
+            .global_env
+            .borrow_mut()
+            .vars
+            .insert("this".to_string(), Binding::data(g, false, true));
         // Register the main realm so a call back into main-realm code from inside another realm
         // swaps the main intrinsics back in (see `callee_realm_global`).
         let main = interp.snapshot_realm();
@@ -6709,7 +6789,7 @@ impl Interp {
     /// call. ECMA-262 BuiltinCallOrConstruct passes this independently of `this`.
     /// Returning an owned handle preserves it across reentrant conversions/GC.
     pub fn constructor_new_target(&self) -> Value {
-        self.new_target.clone()
+        self.new_target.unpack()
     }
 
     /// GetFunctionRealm for host bindings which implement constructor prototype
@@ -7994,16 +8074,8 @@ impl Interp {
         if let Some(self_env) = self_env {
             self_env.borrow_mut().vars.insert(
                 func.name.as_ref().expect("named expression").clone(),
-                Binding {
-                    value: Value::Obj(obj.clone()),
-                    mutable: false,
-                    initialized: true,
-                    import_ref: None,
-                    imported: false,
-                    deletable: false,
-                    // CreateImmutableBinding(name, false): sloppy writes are silent no-ops.
-                    strict_immutable: false,
-                },
+                // CreateImmutableBinding(name, false): sloppy writes are silent no-ops.
+                Binding::data(Value::Obj(obj.clone()), false, true).with_strict_immutable(false),
             );
         }
         Value::Obj(obj)
@@ -10129,10 +10201,7 @@ impl Interp {
         {
             return Some(value);
         }
-        env.borrow()
-            .vars
-            .get(name.as_str())
-            .map(|b| b.value.clone())
+        env.borrow().vars.get(name.as_str()).map(|b| b.value())
     }
 
     /// Write through a mapped `arguments[key]` alias into its parameter binding.
@@ -10151,7 +10220,7 @@ impl Interp {
             return true;
         }
         if let Some(b) = env.borrow_mut().vars.get_mut(&name) {
-            b.value = v.clone();
+            b.set_value(*v);
             return true;
         }
         false
@@ -12051,7 +12120,8 @@ impl Interp {
             return Some(Err(error));
         }
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        let saved_target = std::mem::replace(&mut self.new_target, Value::Undefined);
+        let saved_target =
+            std::mem::replace(&mut self.new_target, PackedValue::pack(Value::Undefined));
         let result = with_execution_stack(self.depth, || {
             self.interrupt_poll_force()?;
             let started = crate::jit::perf_stage_start();
@@ -12335,7 +12405,7 @@ impl Interp {
         self.constructing = false;
         // An arrow inherits the enclosing new.target lexically — don't clear it for one.
         if !matches!(&call, Callable::User(user) if user.func.is_arrow) {
-            self.new_target = Value::Undefined;
+            self.new_target = PackedValue::pack(Value::Undefined);
         }
         let r = match call {
             Callable::None => Err(self.throw("TypeError", "value is not a function")),
@@ -13103,28 +13173,11 @@ impl Interp {
             let mut scope = env.borrow_mut();
             scope.vars.insert(
                 new_target_name,
-                Binding {
-                    value: self.new_target.clone(),
-                    mutable: false,
-                    strict_immutable: false,
-                    initialized: true,
-                    import_ref: None,
-                    imported: false,
-                    deletable: false,
-                },
+                Binding::data_word(self.new_target, false, true).with_strict_immutable(false),
             );
-            scope.vars.insert(
-                this_name,
-                Binding {
-                    value: Value::Undefined,
-                    mutable: false,
-                    strict_immutable: true,
-                    initialized: false,
-                    import_ref: None,
-                    imported: false,
-                    deletable: false,
-                },
-            );
+            scope
+                .vars
+                .insert(this_name, Binding::data(Value::Undefined, false, false));
             scope.vars.insert(
                 super_call_name,
                 Binding::data(Value::Bool(true), false, true),
@@ -13163,7 +13216,7 @@ impl Interp {
             .borrow()
             .vars
             .get("this")
-            .map(|binding| (binding.value.clone(), binding.initialized));
+            .map(|binding| (binding.value(), binding.initialized));
         match binding {
             Some((this, true)) => Ok(this),
             _ => Err(self.throw_in_caller_realm(
@@ -13523,7 +13576,7 @@ impl Interp {
         let saved_nt = if ic.direct & crate::bytecode::CALL_IC_LEXICAL_THIS != 0 {
             self.new_target.clone()
         } else {
-            std::mem::replace(&mut self.new_target, Value::Undefined)
+            std::mem::replace(&mut self.new_target, PackedValue::pack(Value::Undefined))
         };
         self.fn_frames.push(FnFrame {
             fn_ptr: ic.callee,
@@ -13599,7 +13652,7 @@ impl Interp {
             return Err(e);
         }
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
+        let saved_nt = std::mem::replace(&mut self.new_target, PackedValue::pack(Value::Undefined));
         let native_result = match self.interrupt_poll_force() {
             Ok(()) => unsafe {
                 crate::execution_storage::with_moved_values(args, argc, |arguments| {
@@ -13712,7 +13765,7 @@ impl Interp {
         let saved_nt = if ic.direct & crate::bytecode::CALL_IC_LEXICAL_THIS != 0 {
             self.new_target.clone()
         } else {
-            std::mem::replace(&mut self.new_target, Value::Undefined)
+            std::mem::replace(&mut self.new_target, PackedValue::pack(Value::Undefined))
         };
         self.fn_frames.push(FnFrame {
             fn_ptr: ic.callee,
@@ -14212,7 +14265,7 @@ impl Interp {
                 ));
             }
             let saved_ctor = std::mem::replace(&mut self.constructing, true);
-            let saved_nt = std::mem::replace(&mut self.new_target, callee.clone());
+            let saved_nt = std::mem::replace(&mut self.new_target, PackedValue::pack(*callee));
             let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
             let r = with_execution_stack(self.depth, || {
                 PackedValue::with_values(args_ref, |arguments| {
@@ -14433,7 +14486,7 @@ impl Interp {
         // The body runs with new.target = the callee (what the layered path's pending-new-target
         // handoff produces for `new F()`); compiled chunks can't read it directly, but natives
         // the body invokes could observe it ambiently.
-        let saved_nt = std::mem::replace(&mut self.new_target, callee.clone());
+        let saved_nt = std::mem::replace(&mut self.new_target, PackedValue::pack(*callee));
         self.fn_frames.push(FnFrame {
             fn_ptr: key,
             call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
@@ -14804,7 +14857,7 @@ impl Interp {
         let saved_nt = if func.is_arrow {
             self.new_target.clone()
         } else {
-            std::mem::replace(&mut self.new_target, Value::Undefined)
+            std::mem::replace(&mut self.new_target, PackedValue::pack(Value::Undefined))
         };
         self.fn_frames.push(FnFrame {
             fn_ptr: Gc::as_ptr(o) as usize,
@@ -14954,7 +15007,10 @@ impl Interp {
                 let saved_new_target = if is_construct {
                     Some(std::mem::replace(
                         &mut self.new_target,
-                        std::mem::replace(&mut self.pending_new_target, Value::Undefined),
+                        PackedValue::pack(std::mem::replace(
+                            &mut self.pending_new_target,
+                            Value::Undefined,
+                        )),
                     ))
                 } else {
                     None
@@ -15025,11 +15081,11 @@ impl Interp {
         let saved_field_init = self.in_field_init_code;
         let saved_agb = self.in_async_gen_body;
         if !func.is_arrow {
-            self.new_target = if is_construct {
+            self.new_target = PackedValue::pack(if is_construct {
                 std::mem::replace(&mut self.pending_new_target, Value::Undefined)
             } else {
                 Value::Undefined
-            };
+            });
             // An ordinary function body is not class-field-initializer code, nor an async
             // generator's own body (an arrow inherits both).
             self.in_field_init_code = false;
@@ -15045,15 +15101,7 @@ impl Interp {
             if scan & crate::ast::SCAN_NEW_TARGET != 0 {
                 scope.borrow_mut().vars.insert(
                     "%newtarget%".to_string(),
-                    Binding {
-                        value: self.new_target.clone(),
-                        mutable: false,
-                        strict_immutable: false,
-                        initialized: true,
-                        import_ref: None,
-                        imported: false,
-                        deletable: false,
-                    },
+                    Binding::data_word(self.new_target, false, true).with_strict_immutable(false),
                 );
             }
             // Class machinery and every [[Construct]] need the `this` binding regardless of the
@@ -15082,15 +15130,7 @@ impl Interp {
                 };
                 scope.borrow_mut().vars.insert(
                     "this".to_string(),
-                    Binding {
-                        value: this_val,
-                        mutable: false,
-                        strict_immutable: true,
-                        initialized: !derived_tdz,
-                        import_ref: None,
-                        imported: false,
-                        deletable: false,
-                    },
+                    Binding::data(this_val, false, !derived_tdz),
                 );
             }
             // A SuperCall is syntactically valid in a derived constructor and arrows nested
@@ -15114,15 +15154,7 @@ impl Interp {
                 }
                 scope.borrow_mut().vars.insert(
                     "arguments".to_string(),
-                    Binding {
-                        value: Value::Obj(ao),
-                        mutable: true,
-                        strict_immutable: false,
-                        initialized: true,
-                        import_ref: None,
-                        imported: false,
-                        deletable: false,
-                    },
+                    Binding::data(Value::Obj(ao), true, true),
                 );
             } else if !func.is_strict && !func.is_generator && !func.is_async && !func.is_method {
                 if let Some(frame) = self.fn_frames.last_mut() {
@@ -15311,7 +15343,7 @@ impl Interp {
                                 .borrow()
                                 .vars
                                 .get("this")
-                                .map(|b| (b.value.clone(), b.initialized));
+                                .map(|b| (b.value(), b.initialized));
                             if let Some((t, init)) = found {
                                 result = if derived && !init {
                                     Err(self.throw_in_caller_realm(
@@ -15787,14 +15819,14 @@ impl Interp {
                 .vars
                 .get(name.as_str())
                 .filter(|b| b.initialized)
-                .map(|b| b.value.clone());
+                .map(|b| b.value());
             if let Some(v) = seeded {
                 let mut bs = body_scope.borrow_mut();
                 if let Some(b) = bs.vars.get_mut(&name) {
                     // Only a plain `var` slot (still `undefined`) inherits the parameter value; a
                     // function declaration keeps its function object.
-                    if matches!((b.value).view(), ValueView::Undefined) {
-                        b.value = v;
+                    if matches!((b.value()).view(), ValueView::Undefined) {
+                        b.set_value(v);
                     }
                 }
             }
@@ -15941,7 +15973,7 @@ impl Interp {
                 let saved = self.constructing;
                 let saved_nt = self.new_target.clone();
                 self.constructing = true;
-                self.new_target = new_target;
+                self.new_target = PackedValue::pack(new_target);
                 let r = self.dispatch_native(&call, Value::Undefined, args);
                 self.constructing = saved;
                 self.new_target = saved_nt;
@@ -16342,7 +16374,7 @@ impl Interp {
                     self.global
                         .borrow_mut()
                         .props
-                        .insert(name, Property::data(binding.value, true, true, false));
+                        .insert(name, Property::data(binding.value(), true, true, false));
                 }
                 // CreateGlobalFunctionBinding: a configurable property is fully redefined; a
                 // non-configurable one (already validated writable) just takes the new value.
@@ -16350,13 +16382,13 @@ impl Interp {
                     self.global
                         .borrow_mut()
                         .props
-                        .insert(name, Property::data(binding.value, true, true, false));
+                        .insert(name, Property::data(binding.value(), true, true, false));
                 }
                 Some((true, _)) if is_func => {
                     self.global
                         .borrow_mut()
                         .props
-                        .set_value(name, binding.value.clone());
+                        .set_value(name, binding.value());
                 }
                 _ => {}
             }
@@ -16480,18 +16512,10 @@ impl Interp {
                     if name == "*default*" {
                         self.set_fn_name(&f, "default");
                     }
-                    scope.borrow_mut().vars.insert(
-                        name.clone(),
-                        Binding {
-                            value: f,
-                            mutable: true,
-                            strict_immutable: false,
-                            initialized: true,
-                            import_ref: None,
-                            imported: false,
-                            deletable: false,
-                        },
-                    );
+                    scope
+                        .borrow_mut()
+                        .vars
+                        .insert(name.clone(), Binding::data(f, true, true));
                 }
                 HoistOp::AnnexB(name, func) => {
                     if !(function_code && name == "arguments")
@@ -16517,15 +16541,7 @@ fn cold_environment_layouts_enabled() -> bool {
 }
 
 fn undef_var_binding() -> Binding {
-    Binding {
-        value: Value::Undefined,
-        mutable: true,
-        strict_immutable: false,
-        initialized: true,
-        import_ref: None,
-        imported: false,
-        deletable: false,
-    }
+    Binding::data(Value::Undefined, true, true)
 }
 
 /// Build the hoisting plan for a statement list: `var` names in traversal order, then function

@@ -40,15 +40,7 @@ fn first_plan(chunk: &Chunk) -> Plan {
 }
 
 fn binding(value: Value) -> Binding {
-    Binding {
-        value,
-        mutable: true,
-        initialized: true,
-        import_ref: None,
-        imported: false,
-        deletable: false,
-        strict_immutable: false,
-    }
+    Binding::data(value, true, true)
 }
 
 fn scope(engine: &Engine, value: Value) -> Env {
@@ -60,7 +52,7 @@ fn scope(engine: &Engine, value: Value) -> Env {
 }
 
 fn result(env: &Env) -> Value {
-    env.borrow().vars.get("result").unwrap().value.clone()
+    env.borrow().vars.get("result").unwrap().value()
 }
 
 #[test]
@@ -90,7 +82,11 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
         old.as_engine_text().unwrap(),
         format!("{}!", "x".repeat(900))
     );
-    env.borrow_mut().vars.get_mut("result").unwrap().value = Value::from_utf16(&[0xd834]);
+    env.borrow_mut()
+        .vars
+        .get_mut("result")
+        .unwrap()
+        .set_value(Value::from_utf16(&[0xd834]));
     let joined = try_store(
         &chunk,
         &mut engine.interp,
@@ -122,14 +118,14 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
                 .get_mut("result")
                 .unwrap()
                 .set_import_reference(Some((engine.interp.global_env.clone(), "exported".into()))),
-            4 => env.borrow_mut().with_obj = Some(Value::Null),
+            4 => env.borrow_mut().set_with_object(Some(Value::Null)),
             5 => {
                 env.borrow_mut().vars.remove("result");
             }
             6 => env.borrow_mut().parent = None,
             _ => unreachable!(),
         }
-        let old = env.borrow().vars.get("result").map(|b| b.value.clone());
+        let old = env.borrow().vars.get("result").map(|b| b.value());
         assert!(
             try_store(
                 &chunk,
@@ -655,7 +651,12 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
     {
         let chunk = state.chunk.clone();
         state.pc = plan.pc;
-        holder.borrow_mut().vars.get_mut("result").unwrap().value = Value::lstr("C");
+        holder
+            .borrow_mut()
+            .vars
+            .get_mut("result")
+            .unwrap()
+            .set_value(Value::lstr("C"));
         let code = crate::jit::continuation_code(&mut engine.interp, &chunk).unwrap();
         let hits = TEST_NATIVE_HITS.with(Cell::get);
         let mut native = bytecode::NativeContinuation {

@@ -270,10 +270,23 @@ fn scope_offsets_read_generation_parent_and_bindings() {
             assert_eq!(read::<u8>(binding, layout.binding_init), 1);
             assert_eq!(read::<u8>(binding, layout.binding_mutable), 1);
             assert_eq!(read::<u8>(binding, layout.binding_import), 0);
+            assert_eq!(layout.binding_value, Binding::value_offset());
+            assert!((binding + layout.binding_value).is_multiple_of(8));
+            assert!(layout.binding_value + 8 <= std::mem::size_of::<Binding>());
             assert_eq!(
-                binding + layout.binding_value,
-                &live.value as *const Value as usize
+                read::<u64>(binding, layout.binding_value),
+                live.word().bits()
             );
+            for flag in [
+                layout.binding_init,
+                layout.binding_mutable,
+                layout.binding_import,
+            ] {
+                assert!(
+                    !(layout.binding_value..layout.binding_value + 8).contains(&flag),
+                    "the execution word must not overlap a binding flag"
+                );
+            }
         }
     };
     let parent = new_scope(None);
@@ -299,7 +312,13 @@ fn scope_offsets_read_generation_parent_and_bindings() {
                 read::<u32>(base, layout.scope_layout),
                 scope.vars.layout_id()
             );
-            assert_eq!(read::<u8>(base, layout.scope_with), layout.scope_with_none);
+            assert!((base + layout.scope_with).is_multiple_of(8));
+            assert!(
+                layout.scope_with + 8
+                    <= std::mem::size_of::<std::cell::RefCell<crate::interpreter::Scope>>()
+            );
+            assert_eq!(read::<u64>(base, layout.scope_with), layout.scope_with_none);
+            assert_eq!(layout.scope_with_none, crate::value::PACK_EMPTY);
             assert_eq!(read::<u8>(base, layout.scope_under_with), 0);
         }
         let parent_word = read::<usize>(base, layout.scope_parent);
@@ -330,6 +349,28 @@ fn scope_offsets_read_generation_parent_and_bindings() {
     assert_eq!(
         read::<u32>(Env::as_ptr(&env) as usize, layout.scope_layout),
         env.borrow().vars.layout_id()
+    );
+    // Presence is a complete-word test, including non-object and falsey synthetic records.
+    let base = Env::as_ptr(&env) as usize;
+    for value in [
+        Value::Null,
+        Value::Undefined,
+        Value::Bool(false),
+        Value::Num(-0.0),
+    ] {
+        env.borrow_mut().set_with_object(Some(value));
+        assert!(env.borrow().has_with_object());
+        assert_eq!(
+            read::<u64>(base, layout.scope_with),
+            crate::value::PackedValue::pack(value).bits()
+        );
+        assert_ne!(read::<u64>(base, layout.scope_with), layout.scope_with_none);
+    }
+    env.borrow_mut().set_with_object(None);
+    assert!(!env.borrow().has_with_object());
+    assert_eq!(
+        read::<u64>(base, layout.scope_with),
+        crate::value::PACK_EMPTY
     );
 }
 

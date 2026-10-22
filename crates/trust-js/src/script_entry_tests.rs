@@ -254,7 +254,7 @@ fn compiled_script_uses_global_environment_this_value_not_property_object() {
             .vars
             .get_mut("this")
             .unwrap()
-            .value = Value::Obj(wrapper);
+            .set_value(Value::Obj(wrapper));
         assert_eq!(value(&mut engine,
             "var actual=3;let get=()=>this;[this.marker,get()===this,this!==globalThis,globalThis.actual].join('|');"),
             "41|true|true|3");

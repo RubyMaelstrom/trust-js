@@ -1442,11 +1442,11 @@ pub struct JitLayout {
     pub scope_binding_stride: usize,
     pub scope_binding_offset: usize,
     pub scope_small_valid: bool,
-    /// Option<Value> None tag for an absent object-environment record, checked live.
+    /// Packed object-environment word; a complete EMPTY word means absent, checked live.
     pub scope_with: usize,
-    pub scope_with_none: u8,
+    pub scope_with_none: u64,
     pub scope_with_valid: bool,
-    /// `value` within a `Binding` (the LoadName template's 16-byte copy source).
+    /// The execution word within a `Binding` (the LoadName template's eight-byte source).
     pub binding_value: usize,
     /// `mutable` within a `Binding` (free-name update/store guard).
     pub binding_mutable: usize,
@@ -1853,14 +1853,18 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         });
     let scope_small_tag = vars_offset + small.tag;
     let scope_small_vec = vars_offset + small.entries;
-    let scope_with = scope_refcell + offset_of!(crate::interpreter::Scope, with_obj);
-    let without_object: Option<Value> = None;
-    let with_object = Some(Value::Num(1.0));
-    let scope_with_none = unsafe { *(&without_object as *const Option<Value> as *const u8) };
-    let scope_with_valid = std::mem::size_of::<Option<Value>>() == std::mem::size_of::<Value>()
-        && scope_with_none > 8
-        && unsafe { *(&with_object as *const Option<Value> as *const u8) } == 4;
-    let binding_value = offset_of!(crate::interpreter::Binding, value);
+    let scope_with = scope_refcell + crate::interpreter::Scope::with_object_offset();
+    let probe_with = crate::interpreter::new_with_scope(probe_env.clone(), Value::Null);
+    let scope_with_none = PACK_EMPTY;
+    let scope_with_valid = std::mem::size_of::<PackedValue>() == 8
+        && std::mem::align_of::<PackedValue>() == 8
+        && scope_with.is_multiple_of(8)
+        && scope_with + 8 <= std::mem::size_of::<RefCell<crate::interpreter::Scope>>()
+        && unsafe { *((Env::as_ptr(&probe_child) as usize + scope_with) as *const u64) }
+            == PACK_EMPTY
+        && unsafe { *((Env::as_ptr(&probe_with) as usize + scope_with) as *const u64) }
+            == PACK_NULL;
+    let binding_value = crate::interpreter::Binding::value_offset();
     let binding_mutable = offset_of!(crate::interpreter::Binding, mutable);
     let binding_init = offset_of!(crate::interpreter::Binding, initialized);
     let binding_import = offset_of!(crate::interpreter::Binding, imported);

@@ -162,15 +162,11 @@ fn intrinsic_environment(it: &Interp) -> Env {
         for (name, length, function) in intrinsics {
             record.vars.insert(
                 name,
-                Binding {
-                    value: Value::Obj(it.make_native(name, length, function)),
-                    mutable: false,
-                    strict_immutable: true,
-                    initialized: true,
-                    import_ref: None,
-                    imported: false,
-                    deletable: false,
-                },
+                Binding::data(
+                    Value::Obj(it.make_native(name, length, function)),
+                    false,
+                    true,
+                ),
             );
         }
     }

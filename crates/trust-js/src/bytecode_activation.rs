@@ -445,7 +445,11 @@ mod tests {
                 ));
                 assert!(l.vars.binding_slot("v95").is_some());
             }
-            left.borrow_mut().vars.get_mut("v95").unwrap().value = Value::Num(1.);
+            left.borrow_mut()
+                .vars
+                .get_mut("v95")
+                .unwrap()
+                .set_value(Value::Num(1.));
             assert_eq!(evaluate(&mut engine, "left59()+'|'+right59()"), "4561|4752");
             left.borrow_mut()
                 .vars

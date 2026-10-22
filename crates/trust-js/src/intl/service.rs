@@ -228,7 +228,7 @@ pub(crate) fn brand_slot(i: &mut Interp, this: &Value, marker: &str) -> Result<G
 /// OrdinaryCreateFromConstructor's proto lookup: `Get(newTarget, "prototype")` (propagating a
 /// poisoned getter's error), falling back to the intrinsic prototype when it isn't an object.
 pub(crate) fn instance_proto(i: &mut Interp, intrinsic: &str) -> Result<Option<Gc>, Value> {
-    if let ValueView::Obj(nt) = &(i.new_target).view() {
+    if let ValueView::Obj(nt) = &(i.constructor_new_target()).view() {
         let nt = nt.clone();
         match (i.get_member_key(&Value::Obj(nt.clone()), "prototype"))
             .map(|__value| (__value).view())

@@ -213,8 +213,8 @@ pub(super) fn install_errors(it: &mut Interp) {
     let agg_ctor = it.make_native("AggregateError", 2, |i, _t, a| {
         let err = i.make_error_skipping("AggregateError", "", constructor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
-        if matches!((i.new_target).view(), ValueView::Obj(_)) {
-            let nt = i.new_target.clone();
+        if matches!((i.constructor_new_target()).view(), ValueView::Obj(_)) {
+            let nt = i.constructor_new_target();
             let proto = match (i.get_member_key(&nt, "prototype")).map(|__value| (__value).view()) {
                 Ok(ValueView::Obj(p)) => Some(p),
                 _ => ctor_realm_proto(i, &nt, "AggregateError")?
@@ -266,8 +266,8 @@ pub(super) fn install_errors(it: &mut Interp) {
     let sup_ctor = it.make_native("SuppressedError", 3, |i, _t, a| {
         let err = i.make_error_skipping("SuppressedError", "", constructor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
-        if matches!((i.new_target).view(), ValueView::Obj(_)) {
-            let nt = i.new_target.clone();
+        if matches!((i.constructor_new_target()).view(), ValueView::Obj(_)) {
+            let nt = i.constructor_new_target();
             let proto = match (i.get_member_key(&nt, "prototype")).map(|__value| (__value).view()) {
                 Ok(ValueView::Obj(p)) => Some(p),
                 _ => ctor_realm_proto(i, &nt, "SuppressedError")?
@@ -315,7 +315,7 @@ pub(super) fn install_errors(it: &mut Interp) {
 /// including the innermost call of new.target when that is a JavaScript function, so a
 /// subclass's constructors (and its `super()` chain) do not appear in its errors' stacks.
 fn constructor_skip(i: &Interp) -> Skip {
-    match &(i.new_target).view() {
+    match &(i.constructor_new_target()).view() {
         ValueView::Obj(target) if matches!(target.borrow().call, Callable::User(_)) => {
             Skip::UntilSeen(Gc::as_ptr(target) as usize)
         }
@@ -434,8 +434,8 @@ fn data_descriptor(i: &Interp, value: Value) -> Value {
 fn make_err(i: &mut Interp, kind: &str, args: &[Value]) -> Result<Value, Value> {
     let err = i.make_error_skipping(kind, "", constructor_skip(i));
     // OrdinaryCreateFromConstructor: a subclass / Reflect.construct new.target sets the prototype.
-    if matches!((i.new_target).view(), ValueView::Obj(_)) {
-        let nt = i.new_target.clone();
+    if matches!((i.constructor_new_target()).view(), ValueView::Obj(_)) {
+        let nt = i.constructor_new_target();
         let proto = match (i.get_member_key(&nt, "prototype")).map(|__value| (__value).view()) {
             Ok(ValueView::Obj(p)) => Some(p),
             _ => ctor_realm_proto(i, &nt, kind)?.or_else(|| i.error_protos.get(kind).cloned()),

@@ -771,15 +771,7 @@ impl Interp {
             if needs_tdz {
                 env.borrow_mut().vars.insert(
                     "*default*".to_string(),
-                    Binding {
-                        value: Value::Undefined,
-                        mutable: false,
-                        strict_immutable: true,
-                        initialized: false,
-                        import_ref: None,
-                        imported: false,
-                        deletable: false,
-                    },
+                    Binding::data(Value::Undefined, false, false),
                 );
             }
         }
@@ -831,15 +823,7 @@ impl Interp {
             Resolution::Local(src_env, src_local) => {
                 env.borrow_mut().vars.insert(
                     local.to_string(),
-                    Binding {
-                        value: Value::Undefined,
-                        mutable: false,
-                        strict_immutable: true,
-                        initialized: true,
-                        import_ref: Some(Box::new((src_env, Rc::from(src_local)))),
-                        imported: true,
-                        deletable: false,
-                    },
+                    Binding::live_import(src_env, Rc::from(src_local)),
                 );
                 Ok(())
             }

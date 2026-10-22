@@ -1791,7 +1791,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         Some(v) if !matches!((v).view(), ValueView::Obj(_)) => Some(to_index(i, v)?),
         _ => None,
     };
-    let nt = i.new_target;
+    let nt = i.constructor_new_target();
     let proto = match nt.view() {
         ValueView::Obj(_) => match (ab(i.get_member_key(&nt, "prototype"))?).view() {
             ValueView::Obj(p) => Some(p),

@@ -64,11 +64,56 @@ fn typed_array_elements_match_the_specification_in_every_tier() {
 #[test]
 fn element_access_through_free_names_matches_in_every_tier() {
     let before = super::regions::executed_regions();
+    let committed = super::regions::name_element_commits();
     assert_clean(&in_every_tier(FUSED), 80);
     assert!(
         super::regions::executed_regions() > before,
         "the loops must execute as register regions"
     );
+    assert!(
+        super::regions::name_element_commits()[0] > committed[0],
+        "a fused name-element read must commit after packed receiver decoding"
+    );
+}
+
+#[test]
+fn packed_name_element_reads_and_writes_commit_for_captured_and_global_receivers() {
+    for captured in [false, true] {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        let body = r#"
+            var named=new Float64Array(8);
+            function read(n){n=n|0;var sum=0;for(var k=0;(k|0)<(n|0);k=(k+1)|0)sum+=named[k&7];return sum;}
+            function write(n){n=n|0;for(var k=0;(k|0)<(n|0);k=(k+1)|0)named[k&7]=k+0.25;return named[7];}
+        "#;
+        let source = if captured {
+            format!("var pair=(function(){{{body}return [read,write];}})();var read=pair[0],write=pair[1];")
+        } else {
+            body.to_owned()
+        };
+        let value = |engine: &mut Engine, source: &str| match engine.eval(source, false).unwrap() {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        };
+        value(&mut engine, &source);
+        value(
+            &mut engine,
+            "for(var warm=0;warm<8;warm++){write(64);read(32);}0",
+        );
+        let before = super::regions::name_element_commits();
+        assert_eq!(value(&mut engine, "read(32)"), "1912");
+        assert!(
+            super::regions::name_element_commits()[0] > before[0],
+            "committed fused packed read, captured={captured}"
+        );
+        let before = super::regions::name_element_commits();
+        assert_eq!(value(&mut engine, "write(32)"), "31.25");
+        assert!(
+            super::regions::name_element_commits()[1] > before[1],
+            "committed fused packed write, captured={captured}"
+        );
+    }
 }
 
 /// Numeric frame slots outside the eight register homes: reads and stores in register regions
@@ -175,10 +220,15 @@ var RESULT = bad.length + ':' + checked + ':' + bad.slice(0, 12).join(';');
 #[test]
 fn computed_stores_and_unfusable_names_match_in_every_tier() {
     let before = super::regions::executed_regions();
+    let committed = super::regions::name_element_commits();
     assert_clean(&in_every_tier(FUSED_STORES), 10_000);
     assert!(
         super::regions::executed_regions() > before,
         "the loops must execute as register regions"
+    );
+    assert!(
+        super::regions::name_element_commits()[1] > committed[1],
+        "a fused name-element store must commit after packed receiver decoding"
     );
 }
 

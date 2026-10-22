@@ -126,7 +126,7 @@ fn classify_name(env: &Env, name: &str) -> (NamePath, usize) {
             };
             return (kind, depth);
         }
-        if scope.with_obj.is_some() {
+        if scope.has_with_object() {
             return (NamePath::With, depth);
         }
         let Some(parent) = scope.parent.clone() else {
@@ -236,7 +236,8 @@ mod tests {
             .insert("value", Binding::data(Value::Num(7.0), true, true));
         let object = Object::new(None);
         let with = new_scope(Some(outer));
-        with.borrow_mut().with_obj = Some(Value::Obj(object.clone()));
+        with.borrow_mut()
+            .set_with_object(Some(Value::Obj(object.clone())));
         let inner = new_scope(Some(with.clone()));
         // Holding an exclusive object borrow proves classification never inspects
         // its properties, invokes traps/getters, or asks for @@unscopables.

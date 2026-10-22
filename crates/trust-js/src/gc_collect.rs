@@ -966,10 +966,11 @@ impl Interp {
     }
 
     /// Exercise the real root/side-slot/sweep client without conservative native roots. This
-    /// makes native old-to-young edge tests independent of stale words in Rust frames.
+    /// makes packed-storage and native old-to-young edge tests independent of stale words in
+    /// Rust frames.
     #[cfg(all(
         test,
-        target_arch = "aarch64",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     pub(crate) fn gc_collect_precise_for_test(&mut self, kind: CollectionKind) {

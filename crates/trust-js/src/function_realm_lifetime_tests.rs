@@ -60,7 +60,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                         let binding = record.vars.get("this").expect("global this binding");
                         assert!(!binding.mutable && !binding.deletable);
                         assert!(crate::value::Gc::ptr_eq(
-                            &binding.value.as_obj().expect("original global"),
+                            &binding.value().as_obj().expect("original global"),
                             &i.global
                         ));
                     }
@@ -70,7 +70,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                     assert!(constructor.as_obj().unwrap().borrow().proto.is_none());
                     // Exclude an accidentally retained intrinsic as an alternate Realm root.
                     for binding in old.borrow().vars.values() {
-                        if let ValueView::Obj(object) = &(binding.value).view() {
+                        if let ValueView::Obj(object) = &(binding.value()).view() {
                             assert!(
                                 crate::value::Gc::ptr_eq(object, &i.global)
                                     || crate::value::Gc::ptr_eq(object, &closure.as_obj().unwrap())
@@ -92,7 +92,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                         let binding = record.vars.get("this").expect("replacement this binding");
                         assert!(!binding.mutable && !binding.deletable);
                         assert!(crate::value::Gc::ptr_eq(
-                            &binding.value.as_obj().expect("same Realm global"),
+                            &binding.value().as_obj().expect("same Realm global"),
                             &i.global
                         ));
                     }

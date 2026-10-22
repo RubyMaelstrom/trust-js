@@ -186,43 +186,6 @@ impl GcSink for VisitSink<'_> {
     }
 }
 
-impl GcTrace for crate::interpreter::Scope {
-    fn trace_gc(&self, sink: &mut dyn GcSink) {
-        let crate::interpreter::Scope {
-            vars,
-            parent,
-            with_obj,
-            under_with: _,
-            var_boundary: _,
-            catch_param: _,
-            lexical_names: _,
-        } = self;
-        for binding in vars.values() {
-            binding.trace_gc(sink);
-        }
-        parent.trace_gc(sink);
-        with_obj.trace_gc(sink);
-    }
-}
-
-impl GcTrace for crate::interpreter::Binding {
-    fn trace_gc(&self, sink: &mut dyn GcSink) {
-        let crate::interpreter::Binding {
-            value,
-            mutable: _,
-            initialized: _,
-            import_ref,
-            imported: _,
-            deletable: _,
-            strict_immutable: _,
-        } = self;
-        value.trace_gc(sink);
-        if let Some(import) = import_ref {
-            sink.env(&import.0);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // State Rust frames keep on the Rust heap while they run (I1): the stack scan sees the frames'
 // pointers to it, never its contents, so the owners register it for the duration.
@@ -235,7 +198,7 @@ pub(crate) struct VmFrameRoots {
     pub(crate) slots: *const [std::cell::Cell<PackedValue>],
     pub(crate) stack: *const crate::execution_storage::ValueStack<PackedValue>,
     pub(crate) references: *const [crate::eval::PreparedReferenceSlot],
-    pub(crate) this_val: *const Value,
+    pub(crate) this_val: *const PackedValue,
     pub(crate) disposal_frames: *const Vec<Vec<crate::interpreter::Disposable>>,
     pub(crate) class_states: *const [Option<crate::eval::PreparedClassEvaluation>],
 }

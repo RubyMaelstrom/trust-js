@@ -59,7 +59,7 @@ pub(crate) const NAME_GUARD_LAYOUT: usize = std::mem::offset_of!(Guard, layout);
 
 impl Guard {
     fn matches(&self, env: &Env, scope: &Scope) -> bool {
-        scope.with_obj.is_none()
+        !scope.has_with_object()
             && ((self.pin.as_ptr() == Env::as_ptr(env)
                 && scope.vars.matches_generation(self.generation))
                 || (self.layout != 0 && self.layout == scope.vars.layout_id()))
@@ -180,7 +180,7 @@ impl ResolutionIc {
         let mut guards = Vec::new();
         for _ in 0..MAX_SCOPES {
             let scope = env.borrow();
-            if scope.with_obj.is_some()
+            if scope.has_with_object()
                 || (scope.vars.generation() == u32::MAX && scope.vars.layout_id() == 0)
             {
                 return None;
@@ -315,7 +315,7 @@ impl DeepNameIc {
                 let binding = self
                     .binding(env, &scope.vars, &chunk.names[self.name as usize])
                     .or_else(|| scope.vars.get(&chunk.names[self.name as usize]))?;
-                (binding.initialized && binding.import_ref.is_none()).then(|| binding.value.clone())
+                (binding.initialized && binding.import_ref.is_none()).then(|| binding.value())
             }
             Target::Global { shape, slot } => {
                 if !Env::ptr_eq(env, &i.global_env)
@@ -368,7 +368,7 @@ impl DeepNameIc {
                 };
                 if let Some(binding) = binding {
                     if binding.initialized && binding.mutable && binding.import_ref.is_none() {
-                        binding.value = value.take().unwrap();
+                        binding.set_value(value.take().unwrap());
                         return true;
                     }
                 }
@@ -425,7 +425,7 @@ impl Chunk {
         let mut guards = Vec::new();
         for _ in 0..MAX_SCOPES {
             let scope = current.borrow();
-            if scope.with_obj.is_some()
+            if scope.has_with_object()
                 || (scope.vars.generation() == u32::MAX && scope.vars.layout_id() == 0)
             {
                 return None;
@@ -445,7 +445,7 @@ impl Chunk {
                         pointer: binding,
                         slot: scope.vars.binding_slot(&self.names[n as usize]),
                     },
-                    binding.value.clone(),
+                    binding.value(),
                 ))
             } else if Env::ptr_eq(&current, &i.global_env) {
                 if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize) {
@@ -594,11 +594,11 @@ mod tests {
                 .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(37.0))
                 .is_ok());
             assert!(matches!(
-                (holder2.borrow().vars.get("outer").unwrap().value).view(),
+                (holder2.borrow().vars.get("outer").unwrap().value()).view(),
                 ValueView::Num(37.0)
             ));
             assert!(matches!(
-                (holder.borrow().vars.get("outer").unwrap().value).view(),
+                (holder.borrow().vars.get("outer").unwrap().value()).view(),
                 ValueView::Num(11.0)
             ));
             holder2
@@ -661,12 +661,14 @@ mod tests {
         child.borrow_mut().parent = Some(shadow);
         assert!(chunk.name_ic_hit(&engine.interp, &child, cache).is_none());
         child.borrow_mut().parent = Some(middle.clone());
-        middle.borrow_mut().with_obj = Some(Value::Obj(engine.interp.global.clone()));
+        middle
+            .borrow_mut()
+            .set_with_object(Some(Value::Obj(engine.interp.global.clone())));
         assert!(chunk.name_ic_hit(&engine.interp, &child, cache).is_none());
         assert!(chunk
             .deep_name_ic_fill(&engine.interp, &child, name, cache)
             .is_none());
-        middle.borrow_mut().with_obj = None;
+        middle.borrow_mut().set_with_object(None);
         let mut deep = holder;
         for _ in 0..MAX_SCOPES {
             deep = new_scope(Some(deep));
@@ -709,7 +711,7 @@ mod tests {
             .store_name_ic(&mut engine.interp, &holder, name, cache, Value::Num(19.0))
             .is_ok());
         assert!(matches!(
-            (holder.borrow().vars.get("outer").unwrap().value).view(),
+            (holder.borrow().vars.get("outer").unwrap().value()).view(),
             ValueView::Num(19.0)
         ));
         let middle = scope(Some(holder), "middle", 0.0, 0);

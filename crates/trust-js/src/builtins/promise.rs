@@ -79,7 +79,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         }
         let promise = i.new_promise();
         // OrdinaryCreateFromConstructor: newTarget's prototype (its getter may throw).
-        let nt = i.new_target;
+        let nt = i.constructor_new_target();
         if let (ValueView::Obj(p), ValueView::Obj(_)) = (promise.view(), nt.view()) {
             match (ab(i.get_member_key(&nt, "prototype"))?).view() {
                 ValueView::Obj(proto) => p.borrow_mut().proto = Some(proto),

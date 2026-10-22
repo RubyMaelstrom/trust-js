@@ -303,7 +303,7 @@ impl Interp {
             // The previous optimization deliberately excludes global and with environments.
             // Rechecking the live parent and with state also covers scope-chain edits.
             if scope.parent.is_none()
-                || scope.with_obj.is_some()
+                || scope.has_with_object()
                 || scope.under_with
                 || !scope.vars.matches_generation(guard.generation)
             {
@@ -315,7 +315,7 @@ impl Interp {
                 // mutation has moved or removed it. In-place binding changes are inspected live.
                 let binding = unsafe { &*cache.binding };
                 return if binding.initialized && !binding.imported && binding.import_ref.is_none() {
-                    BindingGetterProbe::Value(binding.value.clone())
+                    BindingGetterProbe::Value(binding.value())
                 } else {
                     BindingGetterProbe::UninitializedOrImport
                 };
@@ -352,7 +352,7 @@ impl Interp {
             // A global Environment Record's object part and with environments may run code.
             // Saturated generations cannot validate a stable Binding address.
             if scope.parent.is_none()
-                || scope.with_obj.is_some()
+                || scope.has_with_object()
                 || scope.under_with
                 || scope.vars.generation() == u32::MAX
             {
@@ -379,7 +379,7 @@ impl Interp {
         for index in 0..scope_count {
             let scope = env.borrow();
             if scope.parent.is_none()
-                || scope.with_obj.is_some()
+                || scope.has_with_object()
                 || scope.under_with
                 || scope.vars.generation() == u32::MAX
             {
@@ -395,7 +395,7 @@ impl Interp {
                     return None;
                 }
                 binding_ptr = binding as *const crate::interpreter::Binding;
-                value = Some(binding.value.clone());
+                value = Some(binding.value());
                 break;
             }
             let parent = scope.parent.as_ref()?.clone();

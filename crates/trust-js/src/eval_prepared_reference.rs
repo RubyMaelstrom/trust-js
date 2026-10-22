@@ -243,7 +243,7 @@ impl Interp {
                 let record = scope.borrow();
                 (
                     record.vars.contains_key(&name),
-                    record.with_obj.clone(),
+                    record.with_object(),
                     record.parent.clone(),
                 )
             };
@@ -310,7 +310,7 @@ impl Interp {
                     reference.binding = binding as *const Binding as *mut Binding;
                     (
                         binding.initialized,
-                        binding.value.clone(),
+                        binding.value(),
                         binding
                             .import_ref
                             .as_deref()
@@ -406,7 +406,7 @@ impl Interp {
                             Ok(())
                         };
                     }
-                    binding.value = value;
+                    binding.set_value(value);
                     reference.binding = binding;
                     reference.generation = record.vars.generation();
                     return Ok(());

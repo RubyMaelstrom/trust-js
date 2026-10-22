@@ -8,13 +8,17 @@ use crate::bytecode::lexical_cache::{
 };
 use crate::bytecode::UpdKind;
 use crate::eval::{PreparedReference, PreparedReferenceSlot};
-use crate::value::{JitLayout, PACK_NULL, PACK_STR, PACK_SYM};
+use crate::value::JitLayout;
 use std::mem::{offset_of, size_of};
 
 #[cfg(test)]
 thread_local! {
     pub(super) static TEST_NATIVE_DEEP_NAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static TEST_NATIVE_NAME_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Successful load, store and numeric update, after the value/stack mutation.
+    pub(super) static TEST_NATIVE_NAME_COMMITS: [std::cell::Cell<usize>; 3] = const {
+        [const { std::cell::Cell::new(0) }; 3]
+    };
     pub(super) static TEST_NATIVE_REFERENCES: [std::cell::Cell<usize>; 3] = const {
         [std::cell::Cell::new(0), std::cell::Cell::new(0), std::cell::Cell::new(0)]
     };
@@ -23,6 +27,10 @@ thread_local! {
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "jit_x64_names_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "jit_packed_name_tests.rs"]
+mod packed_tests;
 
 /// Thread-affine test instrumentation only; production code contains no counter operations.
 /// AX/DX are volatile after an operation commits; no owner or stack pointer is changed.
@@ -69,8 +77,9 @@ fn valid(l: &JitLayout) -> bool {
 }
 
 fn scope_plain(a: &mut Asm, l: &JitLayout, slow: usize) {
-    a.nr_load8(AX, R9, l.scope_with);
-    a.nr_op_imm(7, AX, l.scope_with_none as i32);
+    a.nr_load(AX, R9, l.scope_with);
+    a.nr_imm(DX, l.scope_with_none);
+    a.nr_cmp(AX, DX);
     a.jcc(NE, slow);
 }
 
@@ -101,6 +110,28 @@ fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
     a.nr_mul_imm(DX, l.entry_size);
     a.nr_reg(0x01, CX, DX);
     a.nr_imm(R11, 1);
+}
+
+/// R8 supplies a validated layout's slot index; R9 is its actual current scope. Address
+/// the live Small/Indexed storage instead of retaining an identity-specific Binding pointer.
+fn layout_binding_target(a: &mut Asm, l: &JitLayout, slot_offset: usize, slow: usize) {
+    if storage::scope_entries_fit(l) {
+        a.nr_load8(AX, R9, l.scope_small_tag);
+        a.nr_imm(DX, 2);
+        a.nr_reg(0x09, AX, DX); // tag | 2 == 2 accepts Small(0) and Indexed(2)
+        a.nr_cmp(AX, DX);
+        a.jcc(NE, slow);
+        a.nr_load(DX, R8, slot_offset);
+        storage::scope_entries_len(a, l, CX, R9);
+        a.nr_cmp(DX, CX);
+        a.jcc(AE, slow);
+        storage::scope_entries_data(a, l, CX, R9);
+        a.nr_mul_imm(DX, l.scope_binding_stride);
+        a.nr_reg(0x01, CX, DX);
+        a.nr_lea(CX, CX, l.scope_binding_offset as i32);
+    } else {
+        a.jmp(slow);
+    }
 }
 
 /// R8=live descriptor, R9=the current scope (`Env::as_ptr`: the environment cell's
@@ -159,23 +190,7 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.nr_load(CX, R8, offset_of!(NativeNameDescriptor, binding));
     a.jmp(binding);
     a.bind(fresh);
-    if storage::scope_entries_fit(l) {
-        a.nr_load8(AX, R9, l.scope_small_tag);
-        a.nr_imm(DX, 2);
-        a.nr_reg(0x09, AX, DX); // tag | 2 == 2 accepts Small(0) and Indexed(2)
-        a.nr_cmp(AX, DX);
-        a.jcc(NE, slow);
-        a.nr_load(DX, R8, offset_of!(NativeNameDescriptor, slot));
-        storage::scope_entries_len(a, l, CX, R9);
-        a.nr_cmp(DX, CX);
-        a.jcc(AE, slow);
-        storage::scope_entries_data(a, l, CX, R9);
-        a.nr_mul_imm(DX, l.scope_binding_stride);
-        a.nr_reg(0x01, CX, DX);
-        a.nr_lea(CX, CX, l.scope_binding_offset as i32);
-    } else {
-        a.jmp(slow);
-    }
+    layout_binding_target(a, l, offset_of!(NativeNameDescriptor, slot), slow);
     a.bind(binding);
     a.nr_zero_guard(CX, slow);
     a.nr_imm(R11, 0);
@@ -198,12 +213,13 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     );
 }
 
-/// Same result as deep_target, accepting the existing own/depth-one/global compact IC ABI.
+/// Same result as deep_target, accepting the own/fixed/depth-one/global compact IC ABI.
 fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     use crate::bytecode::{
-        NAME_IC_OFF_ACT_GEN, NAME_IC_OFF_BINDING, NAME_IC_OFF_ENV, NAME_IC_OFF_GEN,
+        FIXED_NAME_IC, NAME_IC_OFF_ACT_GEN, NAME_IC_OFF_BINDING, NAME_IC_OFF_ENV, NAME_IC_OFF_GEN,
     };
     let deep = a.label();
+    let fixed = a.label();
     let direct = a.label();
     let depth_one = a.label();
     let generation = a.label();
@@ -216,6 +232,8 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     a.nr_load(R10, R8, NAME_IC_OFF_ENV as usize);
     a.nr_op_imm(7, R10, DEEP_NAME_IC as i32);
     a.jcc(EQ, deep);
+    a.nr_op_imm(7, R10, FIXED_NAME_IC as i32);
+    a.jcc(EQ, fixed);
     a.nr_load32(R11, R8, NAME_IC_OFF_GEN as usize);
     a.nr_max_guard(R11, AX, slow);
     a.nr_cmp(R10, R9);
@@ -274,6 +292,16 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     a.nr_zero_guard(CX, slow);
     a.nr_imm(R11, 0);
     a.jmp(done);
+    a.bind(fixed);
+    a.nr_load32(AX, R8, NAME_IC_OFF_GEN as usize);
+    a.nr_zero_guard(AX, slow);
+    a.nr_load32(DX, R9, l.scope_layout);
+    // Fixed layout identity, not a generation or an identity-specific binding pointer.
+    a.nr_cmp(AX, DX);
+    a.jcc(NE, slow);
+    layout_binding_target(a, l, NAME_IC_OFF_BINDING as usize, slow);
+    a.nr_imm(R11, 0);
+    a.jmp(done);
     a.bind(deep);
     a.nr_load(R8, R8, NAME_IC_OFF_BINDING as usize);
     deep_target(a, l, slow);
@@ -282,10 +310,10 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
 
 /// Convert Binding/Property address to its value address, after live semantic flags.
 fn value_address(a: &mut Asm, l: &JitLayout, store: bool, slow: usize) {
-    let packed = a.label();
+    let property = a.label();
     let done = a.label();
     a.nr_test(R11);
-    a.jcc(NE, packed);
+    a.jcc(NE, property);
     a.nr_load8(AX, CX, l.binding_init);
     a.nr_zero_guard(AX, slow);
     a.nr_load8(AX, CX, l.binding_import);
@@ -297,7 +325,7 @@ fn value_address(a: &mut Asm, l: &JitLayout, store: bool, slow: usize) {
     }
     a.nr_lea(CX, CX, l.binding_value as i32);
     a.jmp(done);
-    a.bind(packed);
+    a.bind(property);
     a.nr_load(AX, CX, l.entry_accessor);
     a.nr_op_imm(4, AX, crate::value::PROP_ACCESSOR as i32);
     a.nr_test(AX);
@@ -311,71 +339,10 @@ fn value_address(a: &mut Asm, l: &JitLayout, store: bool, slow: usize) {
     a.bind(done);
 }
 
-/// Read wide Binding.value to compact RAX, or copy a packed property. No ownership change.
-/// CX/R8..R11 preserved. Empty/property-only/reserved words take the authoritative helper.
-fn read_word(a: &mut Asm, slow: usize) {
-    let packed = a.label();
-    let done = a.label();
-    let number = a.label();
-    let boolean = a.label();
-    let pointer = a.label();
-    let null = a.label();
-    let undefined = a.label();
-    a.nr_test(R11);
-    a.jcc(NE, packed);
-    a.nr_load8(AX, CX, 0);
-    for (tag, label) in [(0, undefined), (2, null), (3, boolean), (4, number)] {
-        a.nr_op_imm(7, AX, tag);
-        a.jcc(EQ, label);
-    }
-    a.nr_op_imm(7, AX, 5);
-    a.jcc(BELOW, slow);
-    // BigInt/String/Symbol/Object use an explicit tag map; no invalid wide tag is admitted.
-    a.jmp(pointer);
-    a.bind(undefined);
-    a.nr_imm(AX, PACK_UNDEFINED);
-    a.jmp(done);
-    a.bind(null);
-    a.nr_imm(AX, PACK_NULL);
-    a.jmp(done);
-    a.bind(boolean);
-    // Value::Bool's byte sits at the payload offset; the rest of that word is padding.
-    a.nr_load8(DX, CX, 8);
-    a.nr_op_imm(4, DX, 1);
-    a.nr_imm(AX, PACK_BOOL);
-    a.nr_reg(0x09, AX, DX);
-    a.jmp(done);
-    a.bind(number);
-    a.nr_load(AX, CX, 8);
-    a.bytes(&[0x66, 0x48, 0x0f, 0x6e, 0xc0, 0x66, 0x0f, 0x2e, 0xc0]); // movq xmm0,rax; ucomisd xmm0,xmm0
-    a.jcc(0x8b, done);
-    a.nr_imm(AX, 0x7ff8_0000_0000_0000);
-    a.jmp(done);
-    a.bind(pointer);
-    let bigint = a.label();
-    let string = a.label();
-    let symbol = a.label();
-    let object = a.label();
-    for (tag, label) in [(5, bigint), (6, string), (7, symbol), (8, object)] {
-        a.nr_op_imm(7, AX, tag);
-        a.jcc(EQ, label);
-    }
-    a.jmp(slow);
-    for (label, tag) in [
-        (bigint, crate::value::PACK_BIGINT),
-        (string, PACK_STR),
-        (symbol, PACK_SYM),
-        (object, PACK_OBJ),
-    ] {
-        a.bind(label);
-        a.nr_load(AX, CX, 8);
-        a.nr_imm(DX, tag);
-        a.nr_reg(0x09, AX, DX);
-        a.jmp(done);
-    }
-    a.bind(packed);
+/// Binding and Property values share one execution word. CX/R8..R11 remain unchanged;
+/// the following execution guard preserves the EMPTY and property-only boundaries.
+fn read_word(a: &mut Asm) {
     a.nr_load(AX, CX, 0);
-    a.bind(done);
 }
 
 /// Values crossing into execution storage cannot carry TDZ/EMPTY or a deferred prototype.
@@ -390,7 +357,7 @@ fn execution_word_guard(a: &mut Asm, slow: usize) {
 }
 
 fn load_value(a: &mut Asm, for_call: bool, slow: usize) {
-    read_word(a, slow);
+    read_word(a);
     execution_word_guard(a, slow);
     if for_call {
         a.nr_imm(DX, PACK_UNDEFINED);
@@ -401,76 +368,10 @@ fn load_value(a: &mut Asm, for_call: bool, slow: usize) {
     a.add_sp(8);
 }
 
-/// Decode compact RHS without cloning. R8=wide tag word, R9=payload; R10 stays raw.
-fn decode_rhs(a: &mut Asm, slow: usize) {
-    let number = a.label();
-    let tagged = a.label();
-    let done = a.label();
-    a.nr_mov(DX, R10);
-    a.nr_shift(true, DX, 48);
-    a.nr_op_imm(7, DX, 0x7ff9);
-    a.jcc(BELOW, number);
-    a.nr_op_imm(7, DX, 0x7fff);
-    a.jcc(BE, tagged);
-    a.nr_op_imm(7, DX, 0xfff9);
-    a.jcc(BELOW, number);
-    a.bind(tagged);
-    let undefined = a.label();
-    let null = a.label();
-    let boolean = a.label();
-    let bigint = a.label();
-    let string = a.label();
-    let symbol = a.label();
-    let object = a.label();
-    for (tag, label) in [
-        (0x7ff9, undefined),
-        (0x7ffb, null),
-        (0x7ffc, boolean),
-        (0x7ffd, bigint),
-        (0x7ffe, string),
-        (0x7fff, symbol),
-        (0xfff9, object),
-    ] {
-        a.nr_op_imm(7, DX, tag);
-        a.jcc(EQ, label);
-    }
-    a.jmp(slow);
-    for (label, tag) in [(undefined, 0), (null, 2)] {
-        a.bind(label);
-        a.nr_imm(R8, tag);
-        a.nr_imm(R9, 0);
-        a.jmp(done);
-    }
-    a.bind(boolean);
-    a.nr_imm(R8, 3);
-    a.nr_mov(R9, R10);
-    a.nr_op_imm(4, R9, 1);
-    a.jmp(done);
-    for (label, tag) in [(bigint, 5), (string, 6), (symbol, 7), (object, 8)] {
-        a.bind(label);
-        a.nr_imm(R8, tag);
-        a.nr_mov(R9, R10);
-        a.nr_shift(false, R9, 16);
-        a.nr_shift(true, R9, 16);
-        a.jmp(done);
-    }
-    a.bind(number);
-    a.nr_imm(R8, 4);
-    a.nr_mov(R9, R10);
-    a.bind(done);
-}
-
-/// The native stack pointer, whose frame keeps a spare word at [rsp+8]: the prologue reserves 16
-/// bytes, of which only the first saves the caller's strictness.
-const NATIVE_SP: u8 = 4;
-
-/// The write barrier's first half (S6 step 10b; `gc_core::card_mark`): from the store's owner in
-/// R9 (an environment's cell start, or an Object, its cell's start + 8, which lies in the cell's
-/// card), the address of its card, page base + 65,024 + ((owner >> 7) & 511), kept in the
-/// frame's spare word at [rsp+8], where `decode_rhs`, which overwrites R9, cannot reach it. A
-/// card address left there resolves to no cell for the conservative stack scan. Clobbers AX
-/// and R9.
-fn card_address(a: &mut Asm) {
+/// Record the actual owner's card (S6 step10b, `gc_core::card_mark`). R9 still holds that
+/// Env/Object after the word store: no RHS width conversion or spill can overwrite it.
+/// An Object's body is inside the same card as its cell start. Clobbers AX and R9.
+fn card_mark(a: &mut Asm) {
     use crate::gc_core::{CARD_SHIFT, CARD_TABLE_OFFSET, PAGE_SIZE};
     // The 16-bit move takes the owner's offset in its page.
     const _: () = assert!(PAGE_SIZE == 1 << 16 && CARD_TABLE_OFFSET < i32::MAX as usize);
@@ -479,60 +380,22 @@ fn card_address(a: &mut Asm) {
     a.nr_op_imm(4, R9, -(PAGE_SIZE as i32)); // and r9, -65536: the page base
     a.bytes(&[0x4a, 0x8d, 0x84, 0x08]); // lea rax, [rax + r9 + 65024]: the card's byte
     a.bytes(&(CARD_TABLE_OFFSET as i32).to_le_bytes());
-    a.nr_store(NATIVE_SP, 8, AX);
-}
-
-/// The write barrier's second half, after the store and before any safepoint: set the card
-/// whose address [`card_address`] kept. Clobbers AX.
-fn card_store(a: &mut Asm) {
-    a.nr_load(AX, NATIVE_SP, 8);
     a.bytes(&[0xc6, 0x00, 0x01]); // mov byte [rax], 1
 }
 
 /// All semantic guards precede the store commit. The write barrier records the store in its
-/// owner's card: R9 holds the owner only until `decode_rhs`, so the card's address is taken
-/// first and the card set after the store.
+/// actual owner's card before any safepoint; R11 keeps its Binding/Property meaning.
 fn store_value(a: &mut Asm, slow: usize) {
-    a.nr_mem(true, &[0x8b], R10, SP, -8);
-    card_address(a);
-    decode_rhs(a, slow);
-    // R8/R9/R10 hold the transferred new word.
-    let packed = a.label();
-    let done = a.label();
-    a.nr_test(R11);
-    a.jcc(NE, packed);
-    a.nr_store(CX, 0, R8);
-    a.nr_store(CX, 8, R9);
-    a.jmp(done);
-    a.bind(packed);
-    a.nr_store(CX, 0, R10);
-    a.bind(done);
-    card_store(a);
+    a.nr_mem(true, &[0x8b], AX, SP, -8);
+    execution_word_guard(a, slow);
+    a.nr_store(CX, 0, AX);
+    card_mark(a);
     a.add_sp(-8);
 }
 
 /// Numeric ++/--, after live mutability/writability guards. Non-Numbers and NaNs
 /// stay on the checked ToNumeric boundary. The only mutation follows every guard.
 fn update_value(a: &mut Asm, kind: UpdKind, slow: usize) {
-    let packed = a.label();
-    let number = a.label();
-    a.nr_test(R11);
-    a.jcc(NE, packed);
-    a.nr_load8(AX, CX, 0);
-    a.nr_op_imm(7, AX, 4);
-    a.jcc(NE, slow);
-    a.nr_lea(CX, CX, 8);
-    a.jmp(number);
-    a.bind(packed);
-    a.nr_load(AX, CX, 0);
-    a.nr_shift(true, AX, 48);
-    a.nr_op_imm(7, AX, 0x7ff9);
-    a.jcc(BELOW, number);
-    a.nr_op_imm(7, AX, 0x7fff);
-    a.jcc(BE, slow);
-    a.nr_op_imm(7, AX, 0xfff9);
-    a.jcc(AE, slow);
-    a.bind(number);
     a.nr_load(R8, CX, 0);
     a.bytes(&[0x66, 0x49, 0x0f, 0x6e, 0xc0]); // movq xmm0,r8 (old Number)
     a.bytes(&[0x66, 0x0f, 0x2e, 0xc0]); // ucomisd xmm0,xmm0
@@ -745,6 +608,19 @@ pub(super) fn emit_op(
                 TEST_NATIVE_NAME_OPS.with(|count| count.as_ptr() as usize)
             };
             record(a, address);
+            if !matches!(op, Op::ResolveNameRef(..)) {
+                let index = if matches!(op, Op::UpdateNameCached(..)) {
+                    2
+                } else if store {
+                    1
+                } else {
+                    0
+                };
+                record(
+                    a,
+                    TEST_NATIVE_NAME_COMMITS.with(|counts| counts[index].as_ptr() as usize),
+                );
+            }
         }
         a.jmp(done);
     }

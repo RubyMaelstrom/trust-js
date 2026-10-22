@@ -308,7 +308,7 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
             // GetPrototypeFromConstructor(new.target, ...): a cross-realm `new other.Function()`
             // gets the other realm's prototype as its [[Prototype]] — including the *fallback*
             // when newTarget.prototype isn't an object (resolved in newTarget's realm).
-            let nt = i.new_target.clone();
+            let nt = i.constructor_new_target();
             if matches!((nt).view(), ValueView::Obj(_)) {
                 let kind_key = match prefix {
                     "function*" => "%GeneratorFunction.prototype%",

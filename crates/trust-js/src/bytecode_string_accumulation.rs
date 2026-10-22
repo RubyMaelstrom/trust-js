@@ -97,7 +97,7 @@ fn try_store(
         }
         let parent = {
             let mut record = current.borrow_mut();
-            if record.with_obj.is_some() || record.parent.is_none() {
+            if record.has_with_object() || record.parent.is_none() {
                 return None;
             }
             if let Some(binding) = record.vars.get_mut(name) {
@@ -108,29 +108,25 @@ fn try_store(
                 {
                     return None;
                 }
-                let ValueView::Str(prefix) = &(binding.value).view() else {
+                let original = binding.value();
+                let ValueView::Str(prefix) = original.view() else {
                     return None;
                 };
                 if prefix.len().saturating_add(suffix.len()) > MAX_STR_LEN {
                     return None;
                 }
-                let profiling = observe_arithmetic_operands(
-                    &chunk.feedback,
-                    plan.pc + 2,
-                    &binding.value,
-                    &right,
-                );
+                let profiling =
+                    observe_arithmetic_operands(&chunk.feedback, plan.pc + 2, &original, &right);
                 // Keep the original binding populated and rooted throughout decode/append.
                 // Commit the copied prefix before any observer or interior resume can enter;
                 // real aliases, including the RHS and substring views, keep their old text.
-                let ValueView::Str(mut prefix) = binding.value.view() else {
-                    unreachable!()
-                };
+                let mut prefix = prefix;
                 prefix.append_or_replace(suffix);
-                binding.value = Value::Str(prefix);
-                observe_arithmetic_result(&chunk.feedback, plan.pc + 2, profiling, &binding.value);
+                let result = Value::Str(prefix);
+                binding.set_value(result);
+                observe_arithmetic_result(&chunk.feedback, plan.pc + 2, profiling, &result);
                 let stored = Stored {
-                    result: plan.keep.then(|| binding.value.clone()),
+                    result: plan.keep.then_some(result),
                 };
                 drop(record);
                 // Pure scalar/weak cache population, as after the ordinary checked store.

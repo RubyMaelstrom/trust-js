@@ -2043,7 +2043,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
 }
 
 pub(crate) fn new_from_ctor(i: &mut Interp, default_proto: &str) -> Result<Gc, Value> {
-    let nt = i.new_target;
+    let nt = i.constructor_new_target();
     let proto = match nt.view() {
         ValueView::Obj(_) => {
             match (ab(i.get_member_key(&nt.clone(), "prototype"))?).view() {
@@ -2051,7 +2051,7 @@ pub(crate) fn new_from_ctor(i: &mut Interp, default_proto: &str) -> Result<Gc, V
                 // The constructor's `prototype` isn't an object — use its realm's intrinsic
                 // (GetFunctionRealm, which throws for a proxy revoked mid-construct — the
                 // `prototype` getter may have revoked it).
-                _ => ctor_realm_proto(i, &i.new_target.clone(), default_proto)?
+                _ => ctor_realm_proto(i, &i.constructor_new_target(), default_proto)?
                     .or_else(|| i.extra_protos.get(default_proto).cloned()),
             }
         }
@@ -4501,7 +4501,7 @@ fn install_object(it: &mut Interp) {
         // `new Object()` with a newTarget other than %Object% itself (a subclass or a
         // Reflect.construct target): OrdinaryCreateFromConstructor(newTarget, %Object.prototype%).
         if i.constructing {
-            if let ValueView::Obj(nt) = (i.new_target.clone()).view() {
+            if let ValueView::Obj(nt) = (i.constructor_new_target()).view() {
                 let is_self = matches!(
                     i.extra_protos.get("%ObjectCtor%"),
                     Some(c) if Gc::ptr_eq(c, &nt)
@@ -7173,7 +7173,7 @@ pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Res
     // GetPrototypeFromConstructor: a subclass / cross-realm new.target redirects the
     // instance prototype (falling back to new.target's realm's %Array.prototype%).
     if i.constructing {
-        let nt = i.new_target.clone();
+        let nt = i.constructor_new_target();
         if let ValueView::Obj(_) = &(nt).view() {
             let proto = match (ab(i.get_member_key(&nt, "prototype"))?).view() {
                 ValueView::Obj(p) => Some(p),
@@ -7902,7 +7902,7 @@ fn install_iterator(it: &mut Interp) {
 
     let ctor = it.make_native("Iterator", 0, |i, t, _a| {
         // Abstract: NewTarget must be present and must not be %Iterator% itself.
-        let nt = i.new_target.clone();
+        let nt = i.constructor_new_target();
         let is_self = match (&(nt).view(), i.extra_protos.get("%IteratorCtorMarker%")) {
             (ValueView::Obj(a), Some(b)) => Gc::ptr_eq(a, b),
             _ => false,
@@ -12339,7 +12339,7 @@ fn maybe_box(i: &mut Interp, v: Value) -> Result<Value, Value> {
         return Ok(v);
     }
     let boxed = box_primitive(i, v);
-    let nt = i.new_target.clone();
+    let nt = i.constructor_new_target();
     if let (ValueView::Obj(o), ValueView::Obj(_)) = (&(boxed).view(), &(nt).view()) {
         let key = match o.borrow().exotic {
             Exotic::NumWrap(_) => "Number",

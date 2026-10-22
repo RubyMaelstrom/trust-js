@@ -6,7 +6,6 @@
 //! the shared slot until teardown; mapped parameters consult this canonical slot as well.
 
 use crate::interpreter::Env;
-use crate::value::ValueView;
 use crate::value::{PackedValue, Value};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
@@ -63,16 +62,16 @@ impl Registry {
             _slots: PhantomData,
         };
         drop(aliases);
-        // Registration is complete and the restoration guard exists before releasing any
-        // parked owner. The binding's initialization/mutability state remains unchanged;
-        // only the canonical slot owns its current Value while this AST record is parked.
+        // Registration and the restoration guard precede clearing parked words. The binding's
+        // initialization/mutability flags stay independent; the canonical slot retains its
+        // current word while this AST record is parked.
         for (environment, name, _) in homes {
             environment
                 .borrow_mut()
                 .vars
                 .get_mut(name)
                 .expect("borrowed binding remains present")
-                .value = Value::Undefined;
+                .set_value(Value::Undefined);
         }
         scope
     }
@@ -116,14 +115,14 @@ impl Drop for Scope<'_> {
         // Restore every parked record before removing its canonical lookup or allowing its
         // slot owner to be cleared/reused. Value destruction invokes no JavaScript here.
         for alias in &aliases[self.floor..] {
-            let value = unsafe { &*alias.slot }.get().unpack();
+            let word = unsafe { &*alias.slot }.get();
             let mut scope = alias.environment.borrow_mut();
             let binding = scope
                 .vars
                 .get_mut(&alias.name)
                 .expect("borrowed binding remains present");
-            binding.initialized = !matches!((value).view(), ValueView::Empty);
-            binding.value = value;
+            binding.initialized = !word.is_empty();
+            binding.set_word(word);
         }
         aliases.truncate(self.floor);
     }
@@ -188,7 +187,7 @@ mod tests {
                 {
                     let parked = environment.borrow();
                     let old = parked.vars.get("old").unwrap();
-                    assert!(matches!((old.value).view(), ValueView::Undefined));
+                    assert!(matches!((old.value()).view(), ValueView::Undefined));
                     assert!(old.initialized && !old.mutable && old.strict_immutable);
                     assert!(!parked.vars.get("later").unwrap().initialized);
                 }
@@ -205,11 +204,11 @@ mod tests {
         {
             let restored = environment.borrow();
             let old = restored.vars.get("old").unwrap();
-            assert!(matches!((old.value).view(), ValueView::Num(7.0)));
+            assert!(matches!((old.value()).view(), ValueView::Num(7.0)));
             assert!(old.initialized && !old.mutable && old.strict_immutable);
             let later = restored.vars.get("later").unwrap();
             assert!(!later.initialized && later.mutable);
-            assert!(matches!((later.value).view(), ValueView::Empty));
+            assert!(matches!((later.value()).view(), ValueView::Empty));
         }
         engine.interp.gc_collect();
         assert!(

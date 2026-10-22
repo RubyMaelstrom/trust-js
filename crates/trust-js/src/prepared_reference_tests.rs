@@ -164,7 +164,12 @@ fn prepared_reference_imports_are_live_and_never_mutable_address_hints() {
         (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
         Ok(crate::value::ValueView::Num(7.0))
     ));
-    exporter.borrow_mut().vars.get_mut("source").unwrap().value = Value::Num(19.0);
+    exporter
+        .borrow_mut()
+        .vars
+        .get_mut("source")
+        .unwrap()
+        .set_value(Value::Num(19.0));
     assert!(matches!(
         (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
         Ok(crate::value::ValueView::Num(19.0))
@@ -174,7 +179,7 @@ fn prepared_reference_imports_are_live_and_never_mutable_address_hints() {
         .write_prepared_reference(&mut reference, Value::Num(31.0))
         .is_err());
     assert!(matches!(
-        (exporter.borrow().vars.get("source").unwrap().value).view(),
+        (exporter.borrow().vars.get("source").unwrap().value()).view(),
         ValueView::Num(19.0)
     ));
 }
@@ -258,8 +263,8 @@ fn prepared_reference_native_kind_flags_use_compact_binding_size_and_live_import
     #[cfg(target_pointer_width = "64")]
     assert_eq!(
         std::mem::size_of::<Binding>(),
-        32,
-        "kind bit uses flag padding in the compact binding"
+        24,
+        "import kind flag fits the 24-byte packed binding"
     );
     let target = new_scope(None);
     let mut binding = Binding::data(Value::Undefined, false, true);

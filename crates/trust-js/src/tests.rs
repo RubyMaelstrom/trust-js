@@ -29522,6 +29522,30 @@ fn interp_layout_probes() {
     };
     assert!(words(l.fnf_ptr_word, l.fnf_len_word, l.fnf_cap_word));
     assert!(words(l.fp_ptr_word, l.fp_len_word, l.fp_cap_word));
+    // The direct-call thunk saves and clears one complete execution word, never a wide
+    // discriminant/payload pair. Check its measured address, extent and actual contents.
+    let base = std::ptr::from_ref(&*e.interp) as usize;
+    assert!((base + l.new_target).is_multiple_of(8));
+    assert!(l.new_target + 8 <= std::mem::size_of::<crate::interpreter::Interp>());
+    assert_eq!(
+        base + l.new_target,
+        std::ptr::from_ref(&e.interp.new_target) as usize
+    );
+    let saved = e.interp.new_target;
+    for value in [
+        crate::value::Value::Undefined,
+        crate::value::Value::Null,
+        crate::value::Value::Obj(e.interp.global.clone()),
+    ] {
+        e.interp.new_target = crate::value::PackedValue::pack(value);
+        // Derive the read address after the mutation, rather than retaining provenance from a
+        // shared Interp borrow across a later exclusive field write.
+        let current = std::ptr::from_ref(&*e.interp) as usize;
+        // SAFETY: the measured offset addresses this live, aligned PackedValue field.
+        let word = unsafe { ((current + l.new_target) as *const u64).read() };
+        assert_eq!(word, crate::value::PackedValue::pack(value).bits());
+    }
+    e.interp.new_target = saved;
 }
 
 /// ECMA-262 §10.5.5-§10.5.11: every Proxy invariant check reads target.[[GetOwnProperty]](P),

@@ -704,54 +704,28 @@ impl Interp {
                         for name in names {
                             let mut b = scope.borrow_mut();
                             b.lexical_names.push(name.clone());
-                            b.vars.insert(
-                                name,
-                                Binding {
-                                    value: Value::Undefined,
-                                    mutable: !immutable,
-                                    strict_immutable: immutable,
-                                    initialized: false,
-                                    import_ref: None,
-                                    imported: false,
-                                    deletable: false,
-                                },
-                            );
+                            b.vars
+                                .insert(name, Binding::data(Value::Undefined, !immutable, false));
                         }
                     }
                 }
                 Stmt::FuncDecl(func) if with_functions => {
                     if let Some(name) = &func.name {
                         let f = self.make_function(func.clone(), scope.clone());
-                        scope.borrow_mut().vars.insert(
-                            name.clone(),
-                            Binding {
-                                value: f,
-                                mutable: true,
-                                strict_immutable: false,
-                                initialized: true,
-                                import_ref: None,
-                                imported: false,
-                                deletable: false,
-                            },
-                        );
+                        scope
+                            .borrow_mut()
+                            .vars
+                            .insert(name.clone(), Binding::data(f, true, true));
                     }
                 }
                 Stmt::ClassDecl(class) => {
                     if let Some(name) = &class.name {
                         // Classes are lexically scoped with a TDZ until the declaration executes.
                         scope.borrow_mut().lexical_names.push(name.clone());
-                        scope.borrow_mut().vars.insert(
-                            name.clone(),
-                            Binding {
-                                value: Value::Undefined,
-                                mutable: true,
-                                strict_immutable: false,
-                                initialized: false,
-                                import_ref: None,
-                                imported: false,
-                                deletable: false,
-                            },
-                        );
+                        scope
+                            .borrow_mut()
+                            .vars
+                            .insert(name.clone(), Binding::data(Value::Undefined, true, false));
                     }
                 }
                 _ => {}
@@ -1305,18 +1279,10 @@ impl Interp {
                             let mut names = Vec::new();
                             pattern_idents(pat, &mut names);
                             for name in names {
-                                loop_env.borrow_mut().vars.insert(
-                                    name,
-                                    Binding {
-                                        value: Value::Undefined,
-                                        mutable: true,
-                                        strict_immutable: false,
-                                        initialized: false,
-                                        import_ref: None,
-                                        imported: false,
-                                        deletable: false,
-                                    },
-                                );
+                                loop_env
+                                    .borrow_mut()
+                                    .vars
+                                    .insert(name, Binding::data(Value::Undefined, true, false));
                             }
                         }
                     }
@@ -1463,18 +1429,9 @@ impl Interp {
             let mut names = Vec::new();
             pattern_idents(left, &mut names);
             for n in names {
-                tdz.borrow_mut().vars.insert(
-                    n,
-                    Binding {
-                        value: Value::Undefined,
-                        mutable: true,
-                        strict_immutable: false,
-                        initialized: false,
-                        import_ref: None,
-                        imported: false,
-                        deletable: false,
-                    },
-                );
+                tdz.borrow_mut()
+                    .vars
+                    .insert(n, Binding::data(Value::Undefined, true, false));
             }
             self.eval(right, &tdz)?
         } else {
@@ -2486,18 +2443,9 @@ impl Interp {
     // ----- variable binding -------------------------------------------------------------------
 
     fn init_lexical(&mut self, name: &str, value: Value, is_const: bool, env: &Env) {
-        env.borrow_mut().vars.insert(
-            name.to_string(),
-            Binding {
-                value,
-                mutable: !is_const,
-                strict_immutable: is_const,
-                initialized: true,
-                import_ref: None,
-                imported: false,
-                deletable: false,
-            },
-        );
+        env.borrow_mut()
+            .vars
+            .insert(name.to_string(), Binding::data(value, !is_const, true));
     }
 
     /// Object-environment HasBinding for a `with (obj)` scope: HasProperty, then an object-valued
@@ -2572,11 +2520,11 @@ impl Interp {
                     drop(b);
                     return Ok((self.get_var(&local, &src_env)?, None));
                 }
-                return Ok((binding.value.clone(), None));
+                return Ok((binding.value(), None));
             }
             // `with (obj)`: resolve against the object's properties if it has the name (the proxy
             // `has` trap and @@unscopables participate here). Rare — fall to the owned path.
-            if let Some(obj) = b.with_obj.as_ref().filter(|value| value.as_obj().is_some()) {
+            if let Some(obj) = b.with_object().filter(|value| value.as_obj().is_some()) {
                 let obj = obj.clone();
                 drop(b);
                 if self.with_has_binding(&obj, name)? {
@@ -2661,7 +2609,7 @@ impl Interp {
         while let Some(s) = cur {
             let b = s.borrow();
             if let Some(binding) = b.vars.get(name) {
-                return Some(binding.value.clone());
+                return Some(binding.value());
             }
             cur = b.parent.clone();
         }
@@ -2677,7 +2625,7 @@ impl Interp {
         while let Some(s) = cur {
             let b = s.borrow();
             if let Some(binding) = b.vars.get(name) {
-                if let ValueView::Str(k) = &(binding.value).view() {
+                if let ValueView::Str(k) = &(binding.value()).view() {
                     return k.clone();
                 }
             }
@@ -2691,7 +2639,7 @@ impl Interp {
         while let Some(s) = cur {
             let b = s.borrow();
             if let Some(binding) = b.vars.get(name) {
-                if let ValueView::Str(k) = &(binding.value).view() {
+                if let ValueView::Str(k) = &(binding.value()).view() {
                     return k.to_string();
                 }
             }
@@ -2790,7 +2738,7 @@ impl Interp {
             if b.var_boundary {
                 None
             } else {
-                b.vars.get(name).map(|x| x.value.clone())
+                b.vars.get(name).map(|x| x.value())
             }
         };
         let val = own.unwrap_or_else(|| {
@@ -2806,7 +2754,7 @@ impl Interp {
         while let Some(s) = cur {
             if s.borrow().var_boundary {
                 if let Some(b) = s.borrow_mut().vars.get_mut(name) {
-                    b.value = val;
+                    b.set_value(val);
                     return;
                 }
                 // The binding can be missing here only if a deletable (eval-created) one was
@@ -2960,11 +2908,11 @@ impl Interp {
                         }
                         return Ok(());
                     }
-                    binding.value = value;
+                    binding.set_value(value);
                     binding.initialized = true;
                     return Ok(());
                 }
-                (b.with_obj.clone(), b.parent.clone())
+                (b.with_object(), b.parent.clone())
             };
             if let Some(obj) = with_obj.as_ref().filter(|value| value.as_obj().is_some()) {
                 if self.with_has_binding(obj, name)? {
@@ -3246,7 +3194,7 @@ impl Interp {
                 let record = scope.borrow();
                 if let Some(binding) = record.vars.get("this") {
                     if binding.initialized && binding.import_ref.is_none() {
-                        return Ok(binding.value.clone());
+                        return Ok(binding.value());
                     }
                     drop(record);
                     // Use the selected record, not the original chain, for its TDZ/import
@@ -3775,7 +3723,7 @@ impl Interp {
 
     pub(crate) fn new_target_vm(&self, env: &Env) -> Value {
         self.peek_binding("%newtarget%", env)
-            .unwrap_or_else(|| self.new_target.clone())
+            .unwrap_or_else(|| self.constructor_new_target())
     }
 
     /// EvaluateImportCall after the specifier and optional options expressions have already run.
@@ -4381,7 +4329,7 @@ impl Interp {
             if binding.vars.contains_key("this") {
                 return matches!(
                     binding.vars.get("%supercallok%"),
-                    Some(marker) if marker.initialized && matches!(&(marker.value).view(), ValueView::Bool(true))
+                    Some(marker) if marker.initialized && matches!(&(marker.value()).view(), ValueView::Bool(true))
                 );
             }
             cursor = binding.parent.clone();
@@ -4448,7 +4396,7 @@ impl Interp {
             return Err(self.throw("ReferenceError", "super() may only be called once"));
         }
         if let Some(binding) = this_env.borrow_mut().vars.get_mut("this") {
-            binding.value = result.clone();
+            binding.set_value(result);
             binding.initialized = true;
         }
 
@@ -5426,7 +5374,7 @@ impl Interp {
     /// overrides the instance prototype (falling back to newTarget's realm's %RegExp.prototype%).
     pub(crate) fn regexp_alloc_proto(&mut self) -> Result<Option<crate::value::Gc>, Abrupt> {
         Ok(if self.constructing {
-            let nt = self.new_target;
+            let nt = self.constructor_new_target();
             match nt.view() {
                 ValueView::Obj(_) => match (self.get_member_key(&nt, "prototype")?).view() {
                     ValueView::Obj(p) => Some(p),
@@ -5713,7 +5661,7 @@ impl Interp {
                     let b = s.borrow();
                     // A `with` object environment holds no lexical declarations, and a `catch`
                     // parameter environment is exempt from the var/lexical conflict check.
-                    (b.with_obj.is_some() || b.catch_param, b.parent.clone())
+                    (b.has_with_object() || b.catch_param, b.parent.clone())
                 };
                 if !skip {
                     for &(name, _) in &var_bindings {
@@ -5765,7 +5713,7 @@ impl Interp {
                 .borrow()
                 .vars
                 .get(name)
-                .map(|b| b.value.clone())
+                .map(|b| b.value())
                 .unwrap_or(Value::Undefined);
             if is_global {
                 if is_func {
@@ -5960,18 +5908,10 @@ impl Interp {
         // scope there — uninitialized (TDZ) until the constructor exists, and immutable.
         let outer_class_env = new_scope(Some(env.clone()));
         if let Some(n) = &class.name {
-            outer_class_env.borrow_mut().vars.insert(
-                n.clone(),
-                Binding {
-                    value: Value::Undefined,
-                    mutable: false,
-                    strict_immutable: true,
-                    initialized: false,
-                    import_ref: None,
-                    imported: false,
-                    deletable: false,
-                },
-            );
+            outer_class_env
+                .borrow_mut()
+                .vars
+                .insert(n.clone(), Binding::data(Value::Undefined, false, false));
         }
         // The spec's PrivateEnvironment is also allocated before heritage but becomes active only
         // for class elements. TRust JS represents it as a child lexical record carrying unforgeable
@@ -6228,7 +6168,7 @@ impl Interp {
         // ClassElementEvaluation), so `[Name]` as a computed key is a ReferenceError.
         if let Some(n) = &class.name {
             if let Some(b) = outer_class_env.borrow_mut().vars.get_mut(n) {
-                b.value = ctor_val.clone();
+                b.set_value(ctor_val);
             }
         }
 
@@ -6944,7 +6884,7 @@ impl Interp {
         // A proxy parent constructs through its [[Construct]] trap machinery; the returned object
         // is what super() binds as `this` (the object-override path in the super-call code).
         if self.proxies.contains_key(&ptr) {
-            let nt = self.new_target.clone();
+            let nt = self.constructor_new_target();
             return self.construct_nt(ctor.clone(), args, nt);
         }
         let is_class = self.class_info.contains_key(&ptr);
@@ -7744,7 +7684,7 @@ impl Interp {
                         (
                             binding.is_some(),
                             binding.map(|x| x.deletable).unwrap_or(false),
-                            b.with_obj.clone(),
+                            b.with_object(),
                             b.parent.clone(),
                         )
                     };
@@ -7862,7 +7802,7 @@ impl Interp {
         while let Some(s) = cur {
             let (found, parent) = {
                 let b = s.borrow();
-                if b.with_obj.is_some() {
+                if b.has_with_object() {
                     return None;
                 }
                 match b.vars.get(name) {
@@ -7898,12 +7838,12 @@ impl Interp {
                     .borrow()
                     .vars
                     .get(name.as_str())
-                    .map(|bd| bd.value.clone())
+                    .map(|bd| bd.value())
                     .unwrap_or(Value::Undefined);
                 if let ValueView::Num(n) = (old).view() {
                     let new = if op == "++" { n + 1.0 } else { n - 1.0 };
                     if let Some(bd) = scope.borrow_mut().vars.get_mut(name) {
-                        bd.value = Value::Num(new);
+                        bd.set_value(Value::Num(new));
                         return Ok(Value::Num(if prefix { new } else { n }));
                     }
                 }
@@ -7965,7 +7905,7 @@ impl Interp {
                         .borrow()
                         .vars
                         .get(name.as_str())
-                        .map(|bd| bd.value.clone())
+                        .map(|bd| bd.value())
                         .unwrap_or(Value::Undefined);
                     let rhs = self.eval(value, env)?;
                     let result = self.binary(&op[..op.len() - 1], old, rhs)?;
@@ -7973,7 +7913,7 @@ impl Interp {
                         let mut record = scope.borrow_mut();
                         match record.vars.get_mut(name) {
                             Some(bd) if bd.mutable && bd.initialized && bd.import_ref.is_none() => {
-                                bd.value = result.clone();
+                                bd.set_value(result);
                                 true
                             }
                             _ => false,
@@ -9290,18 +9230,9 @@ fn env_free_initializer(e: &Expr) -> bool {
 
 /// [`bind`] with an already shared name, which the binding map adopts without copying.
 fn bind_shared_name(env: &Env, name: Rc<str>, value: Value) {
-    env.borrow_mut().vars.insert(
-        name,
-        Binding {
-            value,
-            mutable: true,
-            strict_immutable: false,
-            initialized: true,
-            import_ref: None,
-            imported: false,
-            deletable: false,
-        },
-    );
+    env.borrow_mut()
+        .vars
+        .insert(name, Binding::data(value, true, true));
 }
 
 /// The hidden binding names of a class field initializer's environment (`0` = `this`,
@@ -9320,18 +9251,9 @@ fn field_init_name(which: usize) -> Rc<str> {
 
 /// Insert an initialized, mutable binding into `env` (used for the hidden `%super*%`/`this` slots).
 pub(crate) fn bind(env: &Env, name: &str, value: Value) {
-    env.borrow_mut().vars.insert(
-        name.to_string(),
-        Binding {
-            value,
-            mutable: true,
-            strict_immutable: false,
-            initialized: true,
-            import_ref: None,
-            imported: false,
-            deletable: false,
-        },
-    );
+    env.borrow_mut()
+        .vars
+        .insert(name.to_string(), Binding::data(value, true, true));
 }
 
 fn opt_obj(o: &Option<Gc>) -> Value {

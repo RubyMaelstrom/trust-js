@@ -1169,7 +1169,7 @@ impl Visitor {
         bytes = bytes.saturating_add(scope.lexical_names.retained_requested_storage_bytes());
         for (name, binding) in scope.vars.iter() {
             self.rc_str(name);
-            self.value(&binding.value);
+            self.value(&binding.value());
             if let Some((_, import_name)) = binding.import_ref.as_deref() {
                 bytes =
                     bytes.saturating_add(size_of::<(crate::interpreter::Env, std::rc::Rc<str>)>());
@@ -1896,7 +1896,7 @@ fn scan_realm(
                     .saturating_mul(size_of::<Value>()),
             ),
     );
-    visitor.value(&interp.new_target);
+    visitor.value(&interp.constructor_new_target());
     visitor.value(&interp.pending_new_target);
     for frame in &interp.fn_frames {
         if let Some(extra) = &frame.extra {
@@ -3689,7 +3689,8 @@ mod tests {
             .interp
             .decorator_initializers
             .push(Value::lstr("decorator initializer"));
-        engine.interp.new_target = Value::lstr("active new target");
+        engine.interp.new_target =
+            crate::value::PackedValue::pack(Value::lstr("active new target"));
         engine.interp.pending_new_target = Value::lstr("pending new target");
 
         let shared_values: Rc<[Value]> = vec![Value::lstr("lazy frame argument")].into();

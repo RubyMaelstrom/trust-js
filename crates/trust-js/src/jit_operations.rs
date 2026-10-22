@@ -153,6 +153,13 @@ pub(super) fn emit(
             a.ldr_imm(12, 19, 48); // ctx.this_word
             emit_exec_word_store(a, 12, 20, 0);
             a.add_imm(20, 20, 8);
+            #[cfg(test)]
+            {
+                a.mov_imm64(9, chunk.test_this_commits.as_ptr() as u64);
+                a.ldr_imm(10, 9, 0);
+                a.add_imm(10, 10, 1);
+                a.str_imm(10, 9, 0);
+            }
         }
         Op::LoadName(_, cache) if fast & 8192 != 0 && load_name_inlinable(layout) => {
             emit_load_name_inline(

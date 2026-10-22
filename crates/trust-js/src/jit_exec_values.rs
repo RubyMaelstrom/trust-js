@@ -1,14 +1,10 @@
 //! ARM64 compact execution-word primitives. Canonical local/operand words and a context's return
-//! slot (`ret`) are one PackedValue, as is its `this`; lexical Binding cells are wide Values, a
-//! separate ABI.
+//! slot (`ret`), `this`, lexical Binding cells and object data values share PackedValue words.
 //! ECMA-262 §6.1.6.1 (snapshot e28783d5): preserve signed zero/infinities; NaN payload
 //! canonicalization is allowed and prevents numeric bits from aliasing internal tags.
 
 use super::*;
-use crate::value::{
-    PACK_BIGINT, PACK_BOOL, PACK_CANON_NAN, PACK_EMPTY, PACK_LAZY_PROTO, PACK_NULL, PACK_OBJ,
-    PACK_STR, PACK_SYM, PACK_UNDEFINED,
-};
+use crate::value::{PACK_CANON_NAN, PACK_LAZY_PROTO, PACK_OBJ, PACK_SYM, PACK_UNDEFINED};
 
 /// Decode the semantic discriminant (wide Value ABI 0..=8) without acquiring an
 /// owner. Preserve raw, clobber kind/scratch/NZCV, reject property-only tags.
@@ -40,46 +36,6 @@ pub(super) fn emit_exec_kind(a: &mut asm::Asm, raw: u32, kind: u32, scratch: u32
     a.b(done);
     a.bind(object);
     a.movz(kind, 8, 0);
-    a.bind(done);
-}
-
-/// Produce a borrowed wide pair for a compact word: the discriminant in tag_word and every
-/// payload, including Bool's 0/1, in payload; refs are untagged. No retain/drop.
-/// Raw is preserved; both outputs, kind/scratch and NZCV are clobbered.
-pub(super) fn emit_exec_decode_wide(
-    a: &mut asm::Asm,
-    raw: u32,
-    tag_word: u32,
-    payload: u32,
-    kind: u32,
-    scratch: u32,
-    slow: usize,
-) {
-    let regs = [raw, tag_word, payload, kind, scratch];
-    for i in 0..regs.len() {
-        for j in i + 1..regs.len() {
-            assert_ne!(regs[i], regs[j]);
-        }
-    }
-    emit_exec_kind(a, raw, kind, scratch, slow);
-    a.mov(tag_word, kind);
-    a.movz(payload, 0, 0);
-    let number = a.new_label();
-    let reference = a.new_label();
-    let done = a.new_label();
-    a.cmp_imm_w(kind, 4);
-    a.b_cond(C_EQ, number);
-    a.b_cond(C_HI, reference);
-    a.cmp_imm_w(kind, 3);
-    a.b_cond(C_NE, done);
-    a.movz(scratch, 1, 0);
-    a.logic_x(0, payload, raw, scratch);
-    a.b(done);
-    a.bind(number);
-    a.mov(payload, raw);
-    a.b(done);
-    a.bind(reference);
-    emit_exec_payload(a, raw, payload);
     a.bind(done);
 }
 
@@ -184,71 +140,10 @@ pub(super) fn emit_exec_number_store(
     a.bind(done);
 }
 
-/// Encode a borrowed/moved wide Value pair; ownership does not change here. The low
-/// byte of tag_word is its discriminant and every payload uses the second word; only bit 0
-/// of a Bool's payload word is meaningful (the rest of that word is padding). BigInt is a thin stored handle, exactly as PackedValue::pack.
-/// Inputs are preserved; packed/tag_scratch/const_scratch/fp_scratch and NZCV clobbered.
-pub(super) fn emit_exec_encode_wide(
-    a: &mut asm::Asm,
-    tag_word: u32,
-    payload: u32,
-    packed: u32,
-    tag_scratch: u32,
-    const_scratch: u32,
-    fp_scratch: u32,
-    slow: usize,
-) {
-    let regs = [tag_word, payload, packed, tag_scratch, const_scratch];
-    for i in 0..regs.len() {
-        for j in i + 1..regs.len() {
-            assert_ne!(regs[i], regs[j]);
-        }
-    }
-    a.logic_imm_w(0, tag_scratch, tag_word, asm::logical_imm_w(0xff).unwrap());
-    let number = a.new_label();
-    let boolean = a.new_label();
-    let done = a.new_label();
-    a.cmp_imm_w(tag_scratch, 4);
-    a.b_cond(C_EQ, number);
-    a.cmp_imm_w(tag_scratch, 3);
-    a.b_cond(C_EQ, boolean);
-    for (tag, bits, reference) in [
-        (8, PACK_OBJ, true),
-        (0, PACK_UNDEFINED, false),
-        (6, PACK_STR, true),
-        (7, PACK_SYM, true),
-        (5, PACK_BIGINT, true),
-        (1, PACK_EMPTY, false),
-        (2, PACK_NULL, false),
-    ] {
-        let next = a.new_label();
-        a.cmp_imm_w(tag_scratch, tag);
-        a.b_cond(C_NE, next);
-        a.mov_imm64(packed, bits);
-        if reference {
-            a.logic_x(1, packed, packed, payload);
-        }
-        a.b(done);
-        a.bind(next);
-    }
-    a.b(slow);
-    a.bind(boolean);
-    a.logic_imm_w(0, packed, payload, asm::logical_imm_w(1).unwrap());
-    a.mov_imm64(const_scratch, PACK_BOOL);
-    a.logic_x(1, packed, packed, const_scratch);
-    a.b(done);
-    a.bind(number);
-    a.fmov_d_x(fp_scratch, payload);
-    a.fcmp(fp_scratch, fp_scratch);
-    a.mov(packed, payload);
-    a.b_cond(7, done);
-    a.mov_imm64(packed, PACK_CANON_NAN);
-    a.bind(done);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::{PACK_BIGINT, PACK_BOOL, PACK_EMPTY, PACK_NULL, PACK_STR};
 
     fn executable(a: asm::Asm) -> ExecutableBuffer {
         let bytes: Vec<u8> = a.finish().into_iter().flat_map(u32::to_le_bytes).collect();
@@ -517,54 +412,5 @@ mod tests {
             unsafe { run(raw, &mut output) };
             assert_eq!(output, PACK_CANON_NAN);
         }
-    }
-
-    #[test]
-    fn native_execution_boundary_codec_round_trips_every_kind_without_ownership_changes() {
-        let mut a = asm::Asm::new();
-        let fail = a.new_label();
-        // Packed raw x0, destination x1. Both transforms borrow the owners.
-        emit_exec_decode_wide(&mut a, 0, 2, 3, 4, 5, fail);
-        emit_exec_encode_wide(&mut a, 2, 3, 6, 7, 8, 0, fail);
-        a.str_imm(6, 1, 0);
-        a.movz(0, 1, 0);
-        a.ret();
-        a.bind(fail);
-        a.movz(0, 0, 0);
-        a.ret();
-        let code = executable(a);
-        let run: unsafe extern "C" fn(u64, *mut u64) -> u64 =
-            unsafe { std::mem::transmute(code.as_ptr()) };
-        // Payloads need not point at allocations: encoding/decoding must not dereference
-        // them (no word owns its cell; the collector traces the words). Include nonzero low
-        // payload bytes.
-        let mut words = vec![
-            0.0f64.to_bits(),
-            (-0.0f64).to_bits(),
-            1.5f64.to_bits(),
-            f64::MAX.to_bits(),
-            f64::INFINITY.to_bits(),
-            f64::NEG_INFINITY.to_bits(),
-            PACK_CANON_NAN,
-            PACK_UNDEFINED,
-            PACK_EMPTY,
-            PACK_NULL,
-            PACK_BOOL,
-            PACK_BOOL | 1,
-        ];
-        for tag in [PACK_BIGINT, PACK_STR, PACK_SYM, PACK_OBJ] {
-            words.push(tag | 0x1234_5678_90ab);
-        }
-        for raw in words {
-            let mut output = u64::MAX;
-            assert_eq!(unsafe { run(raw, &mut output) }, 1, "raw {raw:x}");
-            assert_eq!(output, raw, "raw {raw:x}");
-        }
-        let mut output = 123;
-        assert_eq!(
-            unsafe { run(crate::value::PACK_LAZY_PROTO, &mut output) },
-            0
-        );
-        assert_eq!(output, 123);
     }
 }
