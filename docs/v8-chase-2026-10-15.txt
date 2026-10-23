@@ -8287,3 +8287,50 @@ finalizer teardown/exception limitations remain separate from step 12.
 Memory and GC tuning, explicit bounded performance exceptions, and final
 S6 acceptance/merge still require their own disposition. Main and the
 accepted release artifacts are unchanged.
+
+
+S6 post-review collector optimization pass: plan, 2026-10-23
+
+The owner requests an optimization pass focused on the remaining memory,
+GC and component costs, including finding missing mechanisms rather than
+cutting corners. The starting production code is 662530ad, with the I4
+contract accepted in 40b87a68 and measurements recorded in dfd6fdbb. The
+retained fat-LTO baseline is 2f1bc081a8dde568; no engine code has
+changed since its full Crystal/zombie gates and optimized repro runs.
+
+Retain the existing non-moving, generational, single-word engine and the
+approved I4 guards. The React RSS (+55% against a +25% bound), Djot GC
+share (7.786% excluding diagnostic exit against 5%), allocation-stress
+costs, and independent compilation/code-size costs remain targets. No
+bound or correctness requirement is waived. Node finalizer teardown
+remains the separately recorded host work; this pass concerns collector
+and shared engine costs.
+
+First establish current production profiles and diagnostic accounting:
+GC phases/trace work, actual backing-page commitment versus charged cell
+bytes, dead-old retention, external payloads and startup overhead. Bind
+all exports and binaries to source hashes. Isolated diagnostic builds
+are observation tools, with unchanged-output/collection checks; their
+timings are not acceptance results.
+
+Initial source leads to investigate are eager free-list writes across
+new 64 KiB pages, huge-page commitment for sparse size classes, and full
+external element-buffer rescans when an old array's cell card is dirty.
+Audit lazy virgin-slot allocation, page reuse/retirement, precise dirty
+element ranges, and card summaries before choosing implementation.
+Account for weak pins, ephemerons, structural mutation, COW, all Rust,
+VM, JIT and embedding writes, and the cost of added metadata. Preserve a
+correct full-trace fallback for operations without precise information.
+Collector scheduling or adaptive policy changes require measured need;
+the earlier rejected floor/nursery sweeps are evidence, not a reason to
+repeat parameter tuning or recognize benchmark workloads.
+
+Each implementation part receives focused semantic/GC tests and mutation
+checks of load-bearing barriers, followed by routine gates on Crystal
+and zombie. Close the pass with full stress and conformance at the
+agreed thresholds, and fresh release comparisons against its parent and
+main. Review elapsed/CPU time, RSS, pauses, startup, compilation and
+code size separately. Keep every failed/rejected attempt. Only one
+implementation agent or engine job per machine is active at a time;
+read-only surveys may proceed in parallel. Measurements use the agreed
+quiet condition, and commits wait for all owned jobs to finish.
