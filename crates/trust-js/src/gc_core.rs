@@ -765,8 +765,9 @@ struct PageMeta {
     /// The page ends in a card table ([`LayoutDesc::carded`]).
     carded: bool,
     /// The page received a cell since the last collection (it was made, or a cell was taken
-    /// from its free list), and is listed in `Heap::young_pages`: only such a page can hold a
-    /// young cell, so only such pages are swept by a minor collection. Cleared by every sweep.
+    /// from its reclaimed list or virgin tail), and is listed in `Heap::young_pages`: only
+    /// such a page can hold a young cell, so only such pages are swept by a minor collection.
+    /// Cleared by every sweep.
     young: bool,
     /// Set by the marking that found a cell reachable, and kept by the sweep: between
     /// collections a marked cell is old (a collection kept it), an allocated unmarked one young
@@ -787,8 +788,12 @@ struct PageMeta {
     /// being finished ([`Heap::finish_collection`]): the sweep keeps those it finds unmarked as
     /// zombies, and clears every bit.
     pins: Vec<u64>,
-    /// Index of first free cell, or -1. Free cells thread their next
-    /// index+1 through their first word (0 = end).
+    /// The first never-handed-out cell. Only the prefix below this cursor can have allocation
+    /// bits or reclaimed cells; the virgin tail's payload is not read or linked. Monotonic
+    /// until this page is emptied and its storage reused with fresh metadata.
+    next_unused: usize,
+    /// Index of first reclaimed cell, or -1. These cells are below `next_unused` and thread
+    /// their next index+1 through their first word (0 = end). Sweeps preserve existing holes.
     free_head: i32,
     live: usize,
 }
@@ -862,16 +867,30 @@ impl PageMeta {
         }
     }
 
-    fn take_free(&mut self) -> Option<*mut u8> {
-        if self.free_head < 0 {
+    fn has_room(&self) -> bool {
+        self.free_head >= 0 || self.next_unused < self.cells
+    }
+
+    fn take_cell(&mut self) -> Option<*mut u8> {
+        let index = if self.free_head >= 0 {
+            let index = self.free_head as usize;
+            debug_assert!(index < self.next_unused, "GC free list outside used prefix");
+            // SAFETY: reclaimed cells hold their free-list link in word 0. The virgin tail
+            // is never on this list, so allocation does not read its uninitialized payload.
+            let next = unsafe { std::ptr::read(self.cell_ptr(index) as *const u64) };
+            debug_assert!(next <= self.next_unused as u64, "GC free list corrupted");
+            self.free_head = if next == 0 { -1 } else { (next - 1) as i32 };
+            index
+        } else if self.next_unused < self.cells {
+            let index = self.next_unused;
+            self.next_unused += 1;
+            index
+        } else {
             return None;
-        }
-        let index = self.free_head as usize;
+        };
+        debug_assert!(!bit(&self.allocated, index) && !bit(&self.zombies, index));
+        debug_assert!(!bit(&self.marks, index));
         let ptr = self.cell_ptr(index) as *mut u8;
-        // SAFETY: free cells hold their free-list link in word 0.
-        let next = unsafe { std::ptr::read(ptr as *const u64) };
-        debug_assert!(next as usize <= self.cells, "GC free list corrupted");
-        self.free_head = if next == 0 { -1 } else { (next - 1) as i32 };
         set_bit(&mut self.allocated, index, true);
         self.live += 1;
         // SAFETY: the cell lies inside this page and is now owned by the caller.
@@ -884,7 +903,7 @@ impl PageMeta {
 #[derive(Default)]
 struct ClassPages {
     current: Option<u32>,
-    /// Pages with free cells after the last sweep, other than `current`.
+    /// Pages with reclaimed cells or virgin capacity after the last sweep, other than `current`.
     avail: Vec<u32>,
 }
 
@@ -1596,7 +1615,7 @@ impl Heap {
                 break;
             };
             if let Some(page) = self.pages[index as usize].as_mut() {
-                if let Some(ptr) = page.take_free() {
+                if let Some(ptr) = page.take_cell() {
                     // The page holds a young cell now: the next minor collection sweeps it.
                     if !page.young {
                         page.young = true;
@@ -1612,27 +1631,24 @@ impl Heap {
         self.classes[desc.0 as usize][class].current = Some(index);
         self.pages[index as usize]
             .as_mut()
-            .and_then(PageMeta::take_free)
+            .and_then(PageMeta::take_cell)
             .expect("fresh page has free cells")
     }
 
     fn new_page(&mut self, desc: DescId, class: usize) -> u32 {
         let cell_size = SIZE_CLASSES[class];
         let base = match self.spare_pages.pop() {
-            Some(base) => {
-                let base = base as *mut u8;
-                // SAFETY: a spare page is a page of the source no cell occupies; zeroed like a
-                // fresh one.
-                unsafe { std::ptr::write_bytes(base, 0, PAGE_SIZE) };
-                base
-            }
+            // A spare has no remaining cell or handle. Its payload may be dirty: take_cell
+            // zeros each whole cell before handing it out, without touching the virgin tail.
+            Some(base) => base as *mut u8,
             None => self.page_source.take(),
         };
         debug_assert!(
             (base as usize).is_multiple_of(PAGE_SIZE),
             "GC page off its alignment"
         );
-        // A carded kind's page ends in its card table, zeroed (clean) like the rest of the page.
+        // A carded kind's page ends in its card table. Reused storage can have held an
+        // uncarded kind whose payload reached that table, so it is explicitly cleared below.
         let carded = self.descs[desc.0 as usize].carded;
         let cells = if carded {
             CARD_TABLE_OFFSET / cell_size
@@ -1640,14 +1656,8 @@ impl Heap {
             PAGE_SIZE / cell_size
         };
         debug_assert!(!carded || cells * cell_size <= CARD_TABLE_OFFSET);
-        // Thread the free list: cell i -> i+1 (stored as i+2), last -> 0.
-        for i in 0..cells {
-            let next = if i + 1 < cells { (i + 2) as u64 } else { 0 };
-            // SAFETY: the cell lies inside the fresh page.
-            unsafe { std::ptr::write(base.add(i * cell_size) as *mut u64, next) };
-        }
         let words = cells.div_ceil(64);
-        let meta = PageMeta {
+        let mut meta = PageMeta {
             base: base as usize,
             cell_size,
             cells,
@@ -1660,9 +1670,11 @@ impl Heap {
             waiters: vec![0; words],
             zombies: vec![0; words],
             pins: vec![0; words],
-            free_head: 0,
+            next_unused: 0,
+            free_head: -1,
             live: 0,
         };
+        meta.clear_cards();
         let index = match self.free_page_slots.pop() {
             Some(index) => {
                 self.pages[index as usize] = Some(meta);
@@ -2649,7 +2661,7 @@ impl Heap {
                         continue;
                     };
                     let class = &mut self.classes[page.desc.0 as usize][page.class];
-                    if page.free_head >= 0 && class.current != Some(index) {
+                    if page.has_room() && class.current != Some(index) {
                         debug_assert!(!class.avail.contains(&index), "a young page on its list");
                         class.avail.push(index);
                     }
@@ -2664,7 +2676,7 @@ impl Heap {
                         continue;
                     };
                     let class = &mut self.classes[page.desc.0 as usize][page.class];
-                    if page.free_head >= 0 && class.current != Some(index as u32) {
+                    if page.has_room() && class.current != Some(index as u32) {
                         class.avail.push(index as u32);
                     }
                 }
@@ -2730,17 +2742,19 @@ impl Heap {
             return 0;
         };
         let finalize = self.descs[page.desc.0 as usize].finalize;
-        let mut head: i32 = -1;
-        let mut live = 0usize;
         let mut freed = 0usize;
         let mut swept = 0u64;
-        for i in 0..page.cells {
-            if bit(&page.marks, i) {
-                live += 1;
-                continue;
-            }
-            let cell = page.cell_ptr(i) as *mut u64;
-            if bit(&page.allocated, i) {
+        debug_assert!(page.next_unused <= page.cells);
+        for word in 0..page.next_unused.div_ceil(64) {
+            // Include unmarked zombies: an unpinned zombie frees storage without another
+            // finalization/death. Existing holes and the untouched virgin tail are excluded.
+            let used = (page.next_unused - word * 64).min(64);
+            let mut candidates = page.allocated[word] & !page.marks[word];
+            candidates &= u64::MAX >> (64 - used);
+            while candidates != 0 {
+                let i = word * 64 + candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                let cell = page.cell_ptr(i) as *mut u64;
                 if !bit(&page.zombies, i) {
                     swept += 1;
                     if let Some(finalize) = finalize {
@@ -2755,20 +2769,25 @@ impl Heap {
                 if bit(&page.pins, i) {
                     // Finalized, but its address stays reserved for weak handles.
                     set_bit(&mut page.zombies, i, true);
-                    live += 1;
                     continue;
                 }
                 set_bit(&mut page.zombies, i, false);
                 set_bit(&mut page.allocated, i, false);
+                page.live -= 1;
                 freed += page.cell_size;
+                let link = if page.free_head < 0 {
+                    0
+                } else {
+                    page.free_head as u64 + 1
+                };
+                // SAFETY: only this newly reclaimed cell is linked. Previously free cells
+                // retain their chain; virgin cells are never touched by the sweep.
+                unsafe { std::ptr::write(cell, link) };
+                page.free_head = i as i32;
             }
-            let link = if head < 0 { 0 } else { head as u64 + 1 };
-            // SAFETY: as above; word 0 of a free cell is its free-list link.
-            unsafe { std::ptr::write(cell, link) };
-            head = i as i32;
         }
-        page.free_head = head;
-        page.live = live;
+        // These cover the full bitmap, including live cells and zero-death sweeps: a pin
+        // observed for a live cell must not keep that cell pinned when it later dies.
         page.waiters.fill(0);
         page.pins.fill(0);
         self.stats.cells_swept += swept;
@@ -2780,7 +2799,7 @@ impl Heap {
                 count.set(count.get() - swept as i64);
             }
         }
-        if live == 0 {
+        if page.live == 0 {
             self.release_page(index);
         }
         freed
@@ -3787,6 +3806,76 @@ mod tests {
         unsafe { std::ptr::write((p as *mut u64).add(index), value) };
     }
 
+    fn assert_zeroed_cell(cell: *const u8, bytes: usize) {
+        // SAFETY: tests call this only for a complete cell just handed out by Heap::alloc.
+        assert!(unsafe { std::slice::from_raw_parts(cell, bytes) }
+            .iter()
+            .all(|&byte| byte == 0));
+    }
+
+    fn page_slot(heap: &Heap, cell: usize) -> usize {
+        heap.page_table
+            .get(cell >> PAGE_SHIFT)
+            .expect("a live small cell's page") as usize
+    }
+
+    /// Every recycled hole occurs exactly once; live/zombie/virgin storage never occurs.
+    /// Reading only listed links also makes this verifier usable while the virgin tail holds
+    /// deliberate nonzero sentinels. Return list order so zero-death sweeps can prove stability.
+    fn checked_free_chain(page: &PageMeta) -> Vec<usize> {
+        assert!(page.next_unused <= page.cells);
+        let mut seen = vec![false; page.cells];
+        let mut chain = Vec::new();
+        let mut head = page.free_head;
+        while head >= 0 {
+            let index = head as usize;
+            assert!(
+                index < page.next_unused,
+                "a virgin/out-of-page free-list entry"
+            );
+            assert!(!seen[index], "a duplicate or cyclic free-list entry");
+            assert!(!bit(&page.allocated, index), "an allocated free-list entry");
+            assert!(!bit(&page.zombies, index), "a zombie free-list entry");
+            assert!(!bit(&page.marks, index), "a marked free-list entry");
+            seen[index] = true;
+            chain.push(index);
+            let next = word(page.cell_ptr(index) as *const u8, 0);
+            assert!(next <= page.next_unused as u64);
+            head = if next == 0 { -1 } else { (next - 1) as i32 };
+        }
+        let mut allocated = 0;
+        for (index, &listed) in seen.iter().enumerate() {
+            let used = index < page.next_unused;
+            let occupied = bit(&page.allocated, index);
+            assert_eq!(
+                listed,
+                used && !occupied,
+                "hole {index} missing or duplicated"
+            );
+            assert!(!bit(&page.zombies, index) || occupied);
+            if !used {
+                assert!(!occupied && !bit(&page.marks, index));
+                assert!(!bit(&page.zombies, index));
+            }
+            allocated += usize::from(occupied);
+        }
+        assert_eq!(
+            page.live, allocated,
+            "page.live includes all allocated zombies"
+        );
+        assert_eq!(
+            page.has_room(),
+            !chain.is_empty() || page.next_unused < page.cells
+        );
+        chain
+    }
+
+    fn check_free_chains(heap: &Heap) {
+        for page in heap.pages.iter().flatten() {
+            checked_free_chain(page);
+        }
+    }
+
     /// A stack top above the calling test's frame.
     fn stack_top(marker: &u64) -> *const u8 {
         (marker as *const u64).wrapping_add(256) as *const u8
@@ -3873,8 +3962,8 @@ mod tests {
         assert_eq!(pages(&fx), (0, 128));
     }
 
-    /// S6 step 10a: pages come from the heap's page source 64 KiB-aligned and zeroed: new, reused
-    /// from the spare pool, and given back to the source when the pool is trimmed and taken again.
+    /// Pages are 64 KiB-aligned and every whole cell is zero before handout: new, reused from
+    /// the spare pool, and given back to the source when the pool is trimmed and taken again.
     /// On Linux the pages given back are taken again before a new chunk is mapped (after the
     /// current chunk's last pages), so they come from the same chunks. The heap's release returns
     /// every page: live, spare and given back.
@@ -3883,21 +3972,21 @@ mod tests {
         let mut fx = Fixture::new();
         fx.heap.set_collect_on_alloc(false);
         let per_page = PAGE_SIZE / 16;
-        // Fill `pages` new pages with nodes whose value words are all ones, checking each page as
-        // it gives its first cell: the cell starts the page, and no value word is set.
+        // Fill pages with nodes whose value words are all ones. Check both words of every
+        // handout, including recycled storage: untouched spare payload need not be zero yet.
         let fill = |fx: &mut Fixture, pages: usize| -> Vec<usize> {
             (0..pages)
                 .map(|_| {
                     let first = fx.heap.alloc(fx.node, 16);
                     let base = first as usize;
                     assert_eq!(base % PAGE_SIZE, 0, "a new page's first cell starts it");
-                    assert!(
-                        (0..per_page).all(|i| word((base + 16 * i) as *const u8, 1) == 0),
-                        "the page at {base:#x} is not zeroed"
-                    );
+                    assert_zeroed_cell(first, 16);
                     set_word(first, 1, u64::MAX);
-                    for _ in 1..per_page {
-                        fx.alloc_node(0, u64::MAX);
+                    for index in 1..per_page {
+                        let cell = fx.heap.alloc(fx.node, 16);
+                        assert_eq!(cell as usize, base + 16 * index);
+                        assert_zeroed_cell(cell, 16);
+                        set_word(cell, 1, u64::MAX);
                     }
                     base
                 })
@@ -3973,6 +4062,442 @@ mod tests {
         fx.heap.release_all();
         assert_eq!(fx.heap.page_source.mapped_bytes(), 0);
         source(&fx, 0, 0);
+    }
+
+    #[test]
+    fn virgin_slots_are_not_read_or_linked_by_allocation_or_sweep() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let anchor = fx.alloc_node(0, 7);
+        fx.roots[0] = tagged(anchor);
+        let child = fx.heap.alloc(fx.leaf, 16) as usize;
+        let slot = page_slot(&fx.heap, anchor as usize);
+        let page = fx.heap.pages[slot].as_ref().unwrap();
+        assert_eq!((page.next_unused, page.free_head), (1, -1));
+        let sentinels: Vec<(usize, [u64; 2])> = [1, 63, 64, 65, page.cells - 1]
+            .into_iter()
+            .map(|index| {
+                let ptr = page.cell_ptr(index) as *mut u8;
+                let words = if index == 65 {
+                    [tagged(child as *const u8), 0xa5a5_a5a5_a5a5_a5a5]
+                } else {
+                    [0xa5a5_a5a5_a5a5_a5a5; 2]
+                };
+                // Deliberately dirty reserved, unallocated storage: GC must neither read it
+                // as payload nor rewrite it as a free-list link.
+                set_word(ptr, 0, words[0]);
+                set_word(ptr, 1, words[1]);
+                (ptr as usize, words)
+            })
+            .collect();
+        let virgin = sentinels[3].0;
+        fx.roots[1] = tagged((virgin + 8) as *const u8);
+        assert_eq!(
+            fx.heap.resolve(virgin as u64 + 8),
+            Some(virgin as *const u8)
+        );
+        assert_eq!(fx.heap.cell_age(virgin as u64), None);
+        assert!(!fx.heap.owns_cell(virgin, fx.node));
+        assert!(fx.start_marking_kind(&no_edges, CollectionKind::Minor));
+        fx.heap.finish_collection(&[virgin, sentinels[0].0]);
+        assert!(
+            !fx.heap.is_allocated_word(child as u64),
+            "virgin payload is not traced"
+        );
+        for kind in [CollectionKind::Major, CollectionKind::Minor] {
+            assert!(fx.start_marking_kind(&no_edges, kind));
+            fx.heap.finish_collection(&[virgin]);
+            let page = fx.heap.pages[slot].as_ref().unwrap();
+            assert_eq!((page.next_unused, page.free_head, page.live), (1, -1, 1));
+            assert!(checked_free_chain(page).is_empty());
+            for &(ptr, expected) in &sentinels {
+                assert_eq!(
+                    [word(ptr as *const u8, 0), word(ptr as *const u8, 1)],
+                    expected
+                );
+            }
+        }
+        let next = fx.heap.alloc(fx.node, 16);
+        assert_eq!(next as usize, sentinels[0].0);
+        assert_zeroed_cell(next, 16);
+        fx.roots[2] = tagged(next);
+        fx.collect_minor();
+        for &(ptr, expected) in &sentinels[1..] {
+            assert_eq!(
+                [word(ptr as *const u8, 0), word(ptr as *const u8, 1)],
+                expected
+            );
+        }
+        check_free_chains(&fx.heap);
+    }
+
+    #[test]
+    fn bitmap_sweep_preserves_holes_across_word_and_capacity_boundaries() {
+        // 768-byte cells have 85 slots: a partial last bitmap word. The other used-prefix
+        // lengths put both death and survival immediately around the 63/64/65 boundary.
+        for used in [63usize, 64, 65, 85] {
+            FIN_COUNT.with(|count| count.set(0));
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let size = 768;
+            let cells: Vec<usize> = (0..used)
+                .map(|_| {
+                    let cell = fx.heap.alloc(fx.leaf, size);
+                    assert_zeroed_cell(cell, size);
+                    // Leaf finalization never reads payload, so every byte may be dirty.
+                    unsafe { std::ptr::write_bytes(cell, 0xa5, size) };
+                    cell as usize
+                })
+                .collect();
+            let slot = page_slot(&fx.heap, cells[0]);
+            let capacity = fx.heap.pages[slot].as_ref().unwrap().cells;
+            assert_eq!(capacity, 85);
+            let kept = [0, used / 2, used - 1];
+            for (root, index) in kept.into_iter().enumerate() {
+                fx.roots[root] = tagged(cells[index] as *const u8);
+            }
+            fx.collect_minor();
+            let first_deaths = used - kept.len();
+            assert_eq!(FIN_COUNT.with(Cell::get), first_deaths);
+            let page = fx.heap.pages[slot].as_ref().unwrap();
+            assert_eq!((page.next_unused, page.live), (used, kept.len()));
+            let holes = checked_free_chain(page);
+            assert_eq!(holes.len(), first_deaths);
+            fx.collect();
+            fx.collect_minor();
+            assert_eq!(
+                checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
+                holes
+            );
+            assert_eq!(FIN_COUNT.with(Cell::get), first_deaths);
+
+            let mut handed_out: std::collections::HashSet<usize> =
+                kept.into_iter().map(|index| cells[index]).collect();
+            for _ in 0..holes.len() {
+                let cell = fx.heap.alloc(fx.leaf, size);
+                assert_zeroed_cell(cell, size);
+                assert!(
+                    cells.contains(&(cell as usize)),
+                    "reclaimed holes precede virgin slots"
+                );
+                assert!(
+                    handed_out.insert(cell as usize),
+                    "a cell was handed out twice"
+                );
+            }
+            assert_eq!(fx.heap.pages[slot].as_ref().unwrap().next_unused, used);
+            for index in used..capacity {
+                let cell = fx.heap.alloc(fx.leaf, size);
+                assert_eq!(cell as usize, cells[0] + index * size);
+                assert_zeroed_cell(cell, size);
+                assert!(handed_out.insert(cell as usize));
+            }
+            assert_eq!(handed_out.len(), capacity);
+            let page = fx.heap.pages[slot].as_ref().unwrap();
+            assert_eq!(page.next_unused, capacity);
+            assert!(!page.has_room());
+            assert!(checked_free_chain(page).is_empty());
+            let extra = fx.heap.alloc(fx.leaf, size);
+            assert_zeroed_cell(extra, size);
+            assert_ne!(extra as usize >> PAGE_SHIFT, cells[0] >> PAGE_SHIFT);
+            assert!(handed_out.insert(extra as usize));
+            fx.collect_minor();
+            assert_eq!(fx.live(), kept.len());
+            assert_eq!(
+                FIN_COUNT.with(Cell::get),
+                first_deaths + capacity - kept.len() + 1
+            );
+            let holes = checked_free_chain(fx.heap.pages[slot].as_ref().unwrap());
+            assert_eq!(holes.len(), capacity - kept.len());
+            fx.collect();
+            assert_eq!(
+                checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
+                holes
+            );
+            check_free_chains(&fx.heap);
+        }
+    }
+
+    #[test]
+    fn virgin_capacity_is_available_after_minor_and_major_sweeps() {
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let anchor = fx.alloc_node(0, 1);
+            fx.roots[0] = tagged(anchor);
+            let slot = page_slot(&fx.heap, anchor as usize);
+            let class = size_class(16).unwrap();
+            // Park a valid partially used page off current so both availability rebuilds must
+            // recognize virgin capacity even though no reclaimed hole exists.
+            fx.heap.classes[fx.node.0 as usize][class].current = None;
+            assert!(fx.start_marking_kind(&no_edges, kind));
+            fx.heap.finish_collection(&[]);
+            assert_eq!(
+                fx.heap.classes[fx.node.0 as usize][class].avail,
+                [slot as u32]
+            );
+            let page = fx.heap.pages[slot].as_ref().unwrap();
+            assert_eq!((page.next_unused, page.free_head), (1, -1));
+            let next = fx.heap.alloc(fx.node, 16);
+            assert_eq!(next as usize, anchor as usize + 16);
+            assert_zeroed_cell(next, 16);
+            assert_eq!(fx.heap.stats().pages_live, 1);
+            assert_eq!(fx.heap.young_page_count(), 1);
+            check_free_chains(&fx.heap);
+        }
+    }
+
+    #[test]
+    fn black_allocations_use_holes_then_virgin_slots_and_survive() {
+        FIN_COUNT.with(|count| count.set(0));
+        let count = Box::new(Cell::new(-1));
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        // SAFETY: count outlives the heap and is written only by it.
+        unsafe { fx.heap.attach_live_count(fx.leaf, NonNull::from(&*count)) };
+        let anchor = fx.heap.alloc(fx.leaf, 16);
+        let dead = fx.heap.alloc(fx.leaf, 16);
+        fx.roots[0] = tagged(anchor);
+        fx.collect();
+        let slot = page_slot(&fx.heap, anchor as usize);
+        assert_eq!(
+            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
+            [1]
+        );
+        assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (1, 1));
+        assert!(fx.start_marking_kind(&no_edges, CollectionKind::Minor));
+        let hole = fx.heap.alloc(fx.leaf, 16);
+        let virgin = fx.heap.alloc(fx.leaf, 16);
+        assert_eq!(hole, dead);
+        assert_eq!(virgin as usize, anchor as usize + 32);
+        for cell in [hole, virgin] {
+            assert_zeroed_cell(cell, 16);
+            assert!(
+                is_marked_at(&fx.heap, cell as usize),
+                "allocation between phases is black"
+            );
+        }
+        assert_eq!(count.get(), 3);
+        fx.heap.finish_collection(&[]);
+        assert_eq!(
+            (fx.live(), count.get(), FIN_COUNT.with(Cell::get)),
+            (3, 3, 1)
+        );
+        check_free_chains(&fx.heap);
+        fx.collect_minor();
+        assert_eq!(count.get(), 3, "black survivors are now old");
+        fx.collect();
+        assert_eq!(
+            (fx.live(), count.get(), FIN_COUNT.with(Cell::get)),
+            (1, 1, 3)
+        );
+        assert_eq!(
+            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
+            [2, 1]
+        );
+    }
+
+    #[test]
+    fn black_allocation_on_a_new_page_survives_both_collection_kinds() {
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            FIN_COUNT.with(|count| count.set(0));
+            let count = Box::new(Cell::new(-1));
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            // SAFETY: count outlives the heap and is written only by it.
+            unsafe { fx.heap.attach_live_count(fx.leaf, NonNull::from(&*count)) };
+            let size = 4096;
+            let capacity = PAGE_SIZE / size;
+            let cells: Vec<usize> = (0..capacity)
+                .map(|_| fx.heap.alloc(fx.leaf, size) as usize)
+                .collect();
+            fx.roots[0] = tagged(cells[0] as *const u8);
+            assert_eq!(fx.heap.stats().pages_live, 1);
+            assert!(fx.start_marking_kind(&no_edges, kind));
+            // The first page is still full until sweep. Allocating between phases must
+            // create, register and blacken a new page's first cell without a traced root.
+            let black = fx.heap.alloc(fx.leaf, size);
+            assert_ne!(black as usize >> PAGE_SHIFT, cells[0] >> PAGE_SHIFT);
+            assert_zeroed_cell(black, size);
+            assert!(is_marked_at(&fx.heap, black as usize));
+            assert_eq!(fx.heap.young_page_count(), 2);
+            fx.heap.finish_collection(&[]);
+            assert_eq!(fx.heap.stats().last_pages_swept, 2);
+            assert_eq!(fx.heap.young_page_count(), 0);
+            assert_eq!((fx.live(), count.get()), (2, 2));
+            assert_eq!(FIN_COUNT.with(Cell::get), capacity - 1);
+            assert!(fx.heap.owns_cell(black as usize, fx.leaf));
+            check_free_chains(&fx.heap);
+            fx.collect_minor();
+            assert_eq!(count.get(), 2, "the new page's survivor is now old");
+            fx.collect();
+            assert_eq!(count.get(), 1);
+            assert!(!fx.heap.is_allocated_word(black as u64));
+            fx.roots.fill(0);
+            fx.collect();
+            assert_eq!((fx.live(), count.get()), (0, 0));
+            assert_eq!(FIN_COUNT.with(Cell::get), capacity + 1);
+            assert_eq!(fx.heap.stats().cells_swept, (capacity + 1) as u64);
+            assert_eq!(fx.heap.stats().pages_live, 0);
+        }
+    }
+
+    #[test]
+    fn reused_pages_zero_each_handout_and_clear_new_card_tables() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let leaf = fx.leaf;
+        let old = fill_page(&mut fx, leaf, 64);
+        let base = old[0];
+        fx.collect();
+        assert_eq!(fx.heap.spare_pages, [base]);
+        // SAFETY: this spare mapping has no remaining live cell or weak pin. Poison the full
+        // old payload, including the future card table, to distinguish lazy per-cell clearing.
+        unsafe { std::ptr::write_bytes(base as *mut u8, 0xa5, PAGE_SIZE) };
+        let first = fx.heap.alloc(fx.carded, 192);
+        assert_eq!(first as usize, base);
+        assert_zeroed_cell(first, 192);
+        fx.roots[0] = tagged(first);
+        let slot = page_slot(&fx.heap, base);
+        let page = fx.heap.pages[slot].as_ref().unwrap();
+        assert_eq!((page.next_unused, page.free_head), (1, -1));
+        assert!((0..page.cells).all(|index| !page.card_set(index)));
+        assert_eq!(word((base + 384) as *const u8, 1), 0xa5a5_a5a5_a5a5_a5a5);
+        let second = fx.heap.alloc(fx.carded, 192);
+        assert_zeroed_cell(second, 192);
+        fx.collect_minor();
+        assert_eq!(
+            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
+            [1]
+        );
+        assert_eq!(word((base + 384) as *const u8, 1), 0xa5a5_a5a5_a5a5_a5a5);
+        assert_eq!(fx.heap.alloc(fx.carded, 192), second);
+        assert_zeroed_cell(second, 192);
+        let third = fx.heap.alloc(fx.carded, 192);
+        assert_eq!(third as usize, base + 384);
+        assert_zeroed_cell(third, 192);
+        check_free_chains(&fx.heap);
+    }
+
+    #[test]
+    fn zero_death_sweeps_clear_live_pins_and_all_waiters() {
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            FIN_COUNT.with(|count| count.set(0));
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let anchor = fx.heap.alloc(fx.leaf, 16);
+            fx.roots[0] = tagged(anchor);
+            let slot = page_slot(&fx.heap, anchor as usize);
+            assert!(fx.start_marking_kind(&no_edges, kind));
+            let page = fx.heap.pages[slot].as_mut().unwrap();
+            page.waiters.fill(u64::MAX);
+            page.pins.fill(u64::MAX);
+            fx.heap.finish_collection(&[anchor as usize]);
+            let page = fx.heap.pages[slot].as_ref().unwrap();
+            assert!(page.pins.iter().all(|&word| word == 0));
+            assert!(page.waiters.iter().all(|&word| word == 0));
+            assert_eq!(FIN_COUNT.with(Cell::get), 0);
+            assert!(checked_free_chain(page).is_empty());
+            fx.roots[0] = 0;
+            fx.collect();
+            assert!(
+                !fx.heap.is_allocated_word(anchor as u64),
+                "no stale live-cell pin"
+            );
+            assert_eq!(FIN_COUNT.with(Cell::get), 1);
+            assert_eq!(fx.heap.stats().pages_live, 0);
+        }
+    }
+
+    #[test]
+    fn zombies_are_not_recycled_until_unpinned_or_counted_twice() {
+        FIN_COUNT.with(|count| count.set(0));
+        let count = Box::new(Cell::new(-1));
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        // SAFETY: count outlives the heap and is written only by it.
+        unsafe { fx.heap.attach_live_count(fx.leaf, NonNull::from(&*count)) };
+        let anchor = fx.heap.alloc(fx.leaf, 16);
+        let hole = fx.heap.alloc(fx.leaf, 16);
+        let zombie = fx.heap.alloc(fx.leaf, 16);
+        fx.roots[0] = tagged(anchor);
+        assert!(fx.start_marking(&no_edges));
+        fx.heap.finish_collection(&[zombie as usize]);
+        let slot = page_slot(&fx.heap, anchor as usize);
+        assert_eq!(
+            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
+            [1]
+        );
+        assert_eq!(fx.heap.pages[slot].as_ref().unwrap().live, 2);
+        assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (1, 2));
+        let reused = fx.heap.alloc(fx.leaf, 16);
+        let virgin = fx.heap.alloc(fx.leaf, 16);
+        assert_eq!(reused, hole);
+        assert_ne!(reused, zombie);
+        assert_eq!(virgin as usize, anchor as usize + 48);
+        assert_zeroed_cell(reused, 16);
+        assert_zeroed_cell(virgin, 16);
+        fx.roots[1] = tagged(reused);
+        fx.roots[2] = tagged(virgin);
+        for _ in 0..2 {
+            assert!(fx.start_marking(&no_edges));
+            fx.heap.finish_collection(&[zombie as usize]);
+            assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (3, 2));
+            let page = fx.heap.pages[slot].as_ref().unwrap();
+            assert_eq!(page.live, 4);
+            assert!(checked_free_chain(page).is_empty());
+        }
+        fx.collect();
+        assert!(!fx.heap.is_allocated_word(zombie as u64));
+        assert_eq!(
+            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
+            [2]
+        );
+        assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (3, 2));
+        assert_eq!(fx.heap.pages[slot].as_ref().unwrap().live, 3);
+        fx.roots.fill(0);
+        fx.collect();
+        assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (0, 5));
+        assert_eq!(fx.heap.stats().pages_live, 0);
+    }
+
+    #[test]
+    fn old_to_young_cards_cover_recycled_and_virgin_allocations() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let holder = fx.heap.alloc(fx.carded, 16);
+        let dead = fx.heap.alloc(fx.carded, 16);
+        fx.roots[0] = tagged(holder);
+        fx.collect();
+        let recycled = fx.heap.alloc(fx.carded, 16);
+        assert_eq!(recycled, dead);
+        let first_leaf = fx.heap.alloc(fx.leaf, 16);
+        set_word(recycled, 0, tagged(first_leaf));
+        set_word(holder, 0, tagged(recycled));
+        // SAFETY: holder is an old, live cell of a carded descriptor.
+        unsafe { card_mark(holder) };
+        assert_eq!(fx.heap.cell_age(recycled as u64), Some(CellAge::Young));
+        fx.collect_minor();
+        assert!(fx.heap.stats().last_card_cells > 0);
+        assert!(fx.heap.owns_cell(recycled as usize, fx.carded));
+        assert!(fx.heap.owns_cell(first_leaf as usize, fx.leaf));
+        let virgin = fx.heap.alloc(fx.carded, 16);
+        assert_eq!(virgin as usize, holder as usize + 32);
+        let second_leaf = fx.heap.alloc(fx.leaf, 16);
+        set_word(virgin, 0, tagged(second_leaf));
+        set_word(recycled, 0, tagged(virgin));
+        // SAFETY: recycled survived the previous collection and is now old.
+        unsafe { card_mark(recycled) };
+        assert_eq!(fx.heap.cell_age(virgin as u64), Some(CellAge::Young));
+        fx.collect_minor();
+        assert!(fx.heap.stats().last_card_cells > 0);
+        assert!(fx.heap.owns_cell(virgin as usize, fx.carded));
+        assert!(fx.heap.owns_cell(second_leaf as usize, fx.leaf));
+        check_free_chains(&fx.heap);
+        fx.collect();
+        assert!(!fx.heap.is_allocated_word(first_leaf as u64));
+        assert!(fx.heap.owns_cell(second_leaf as usize, fx.leaf));
+        check_free_chains(&fx.heap);
     }
 
     #[test]
@@ -5670,9 +6195,9 @@ mod tests {
         assert_eq!(fx.live(), 32);
     }
 
-    /// S6 step 10b: spare pages are zeroed on reuse, so a page that held a carded kind, its cards
-    /// set, and is reused for an uncarded kind carries no table: its cells reach the page's end,
-    /// zeroed, and resolve to themselves. Reused again for a carded kind, its table is clean.
+    /// A page that held a carded kind, its cards set, and is reused for an uncarded kind carries
+    /// no table: every handed-out cell is zeroed, reaches the page's end and resolves to itself.
+    /// Reused again for a carded kind, its table is clean before its first handout.
     #[test]
     fn a_spare_page_reused_for_another_kind_carries_no_table() {
         let mut fx = Fixture::new();

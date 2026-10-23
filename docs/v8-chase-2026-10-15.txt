@@ -8334,3 +8334,151 @@ code size separately. Keep every failed/rejected attempt. Only one
 implementation agent or engine job per machine is active at a time;
 read-only surveys may proceed in parallel. Measurements use the agreed
 quiet condition, and commits wait for all owned jobs to finish.
+
+
+GC optimization part A candidate: lazy page slots, 2026-10-23
+
+The source audit finds three unnecessary payload writes: eagerly
+threading every new page slot, clearing whole spare pages, and rebuilding
+links through every free slot on each sweep. Separate virgin capacity
+from reclaimed holes. Allocate holes first, otherwise advance a virgin
+cursor; zero every cell before handout. Sweep allocated unmarked bitmap
+candidates, preserve existing hole chains, and link only newly freed
+cells. Keep pinned zombies allocated, finalize each death once, and
+clear pin/waiter metadata even on a sweep with no deaths. Both minor and
+major availability lists recognize virgin capacity. Carded reuse clears
+its table; page-source contracts, budgets and managed layouts stay fixed.
+
+The baseline census runs in an isolated diagnostic export. Production
+flat profiles have not started because the agreed quiet windows failed;
+those original windows and the paused controller are preserved. Preparing
+this independently attributable candidate may proceed while measurement
+waits, but adoption still requires the census, release comparisons and
+both machines' routine gates. No timing threshold or acceptance bound is
+relaxed. Huge-page backing policy and remembered-element ranges are
+separate candidates so their costs can be distinguished.
+
+Internal tests cover every allocation path, free-chain uniqueness,
+virgin tails, bitmap boundaries, repeated collections, black allocation,
+weak pins, first-death accounting and cross-kind page/card reuse. Replace
+the old test's eager whole-spare-zero expectation with complete zeroing
+before each handout; retain the actual caller and page-source contracts.
+Root reviews the implementation and discriminating mutations before the
+agreed Crystal/zombie gates. Candidate preparation is not a performance
+claim or permission to commit while a job is active.
+
+
+GC optimization part A completed, 2026-10-24
+
+Pages now separate virgin slots from reclaimed holes. Allocation
+consumes existing holes first, otherwise advances a cursor, and zeros
+each complete cell before handout. Spare reuse initializes metadata and
+card tables without clearing untouched payload. Sweep visits allocated
+unmarked bits, including zombies, preserves old hole links, and links
+only newly reclaimed cells. Pinned deaths retain their addresses;
+finalization and live-object accounting happen once. Both availability
+lists recognize virgin capacity. Managed layouts, page geometry,
+mapping/huge-page policy, budgets and production emitter instructions
+are unchanged.
+
+Nine new collector tests cover untouched virgin storage, exact
+free-chain membership, bitmap boundaries, minor/major availability,
+black allocation through holes, virgin slots and new pages, zeroing/card
+reuse, weak pins, first-death counts, and old-to-young cards. The old
+eager spare-page-zero assertion now checks the actual guarantee: every
+whole cell is zero when handed out. Root and an independent reviewer
+checked the implementation. All seven isolated mutations fail at their
+intended assertions: omitted zeroing, lost hole links, each availability
+branch, zombie retirement, pin reset and reused-card clearing. No crash
+is counted as mutation evidence.
+
+Crystal routine gate: 2415 passed, zero failed, seven known ignores;
+five strict Clippy configurations clean; rustdoc has the same eight
+warnings; doctests 11/0/1. Workspace/all-target and every routine
+downstream suite pass. Fixture outputs, native compilation counts and
+collection counts match the parent; sustained JIT and bytecode checksums
+match with 194 collections each. All nine normalized dump files match
+the rooting repair exactly (678 chunks). Difftest agrees on 138 seeds
+with the same 12 budget skips. Test262 threshold 8 passes 53575, fails
+zero, skips three. Targeted stress at interval 1 passes 224 and ignores
+five, with no timeout/retry; five slow tests wait for the closing
+milestone under the agreed tiered gate.
+
+Zombie routine gate: x64 2244/0/7, Wine 2236/3/7, with exactly the three
+established snapshot failures and 23 unchanged Windows Clippy
+diagnostics. Both inventories add exactly the nine tests. Release
+fixtures and difftest match. All 18 additional exact x64/Wine stress-1
+cases pass. An initial extra-test runner stopped at its priority
+assertion before building or testing; its transcript is retained. The
+recovery applies nice 19 inside the runner and verifies the unchanged
+source and binaries. ARM and remote raw-artifact verifiers pass. All
+owned jobs were reaped before this commit.
+
+Fresh fat-LTO comparison on Crystal, CPU 5, rustc 1.99.1/LLVM 23.1.1,
+opt 3, one codegen unit, panic abort: candidate b583abc66ed1d3ec versus
+parent 2f1bc081a8dde568 and matched-main be807bb62a3f72c8. The frozen
+candidate source is 7870fa4f3c4b41f7 (797 paths); only this record and
+the plan change after the gate. The primary experiment has 15
+interleaved rounds, six workload/tier pairs and three engines: 270
+validated executions. Its quiet minute records 13 inference-server ticks
+and 2297 total busy ticks at HZ 100; other-core busy median is 0.398,
+maximum 2.641.
+
+Against the parent, median wall time changes are Vue -0.61%, React
+-0.68%, Djot -1.49%, sustained JIT -1.29% and bytecode -1.33%. GC pause
+totals improve by 11.99%, 3.90%, 12.50%, 1.60% and 1.97%, respectively.
+Sustained longest-pause medians improve by about 7%. Compilation and
+generated-code components show no meaningful new regression. React peak
+RSS changes -1.06% (paired 95% interval -5.51..3.46), still +48.9%
+against matched main. Djot workload GC share, excluding diagnostic exit,
+falls from 7.757% to 6.842%; it remains above 5%. This part improves
+collection work, not the unresolved memory/backing bounds.
+
+The primary empty-script RSS estimate (+4.17%, interval -4.26..8.79) and
+Vue fault estimate (+6.77%, interval -4.54..14.40) prompted a declared
+precision follow-up: 100 fixed rounds of empty and Vue, parent/candidate
+only, 400 validated executions. Its quiet minute records 13 server ticks
+and 2457 total busy ticks. Empty wall time changes -0.52% (interval
+-1.55..0.53); RSS +2.40% (-0.35..3.95), a bounded small difference in
+this step towards lower collection costs. Vue wall time changes -0.63%
+(-0.77..-0.49), RSS -0.38% (-0.92..0.94), and faults -1.12%
+(-7.36..6.63). The primary fault increase does not reproduce; no exact
+fault neutrality is claimed. Vue GC pause improvement repeats at 12.14%.
+Both experiments and their original results remain preserved.
+
+Performance metrics add an explicit exit collection. Workload GC shares
+subtract that cause; the empty script has only this diagnostic
+collection. These instrumented instruction totals are not the
+default-options S0 instruction-cap check. No whole-managed-memory or
+per-source-field attribution is inferred from RSS. Full closing stress,
+threshold 0/x64 conformance and final default-options/component checks
+remain required after the optimization pass.
+
+Baseline diagnostics also completed: 96 default-option flat-profile
+executions with no lost samples, and 48 production/census executions
+with identical outputs. Nineteen of 24 census pairs match the complete
+GC sequence; all React and sustained pairs match, while Djot and one Vue
+exit sample have small retention differences. React first-pre-GC cells
+use 2.097 MB against 4.194 MB resident chunks, including 1.573 MB of
+untaken backing. The small-block allocator cache stays below 0.66 MB in
+these observations. Separate smaps attribution finds additional
+system-heap retention; removing eager writes alone cannot eliminate
+backing and external-payload costs.
+
+The next remembered-element candidate is prepared in a separate source
+export while the tested live part A stays fixed. Its concrete plan was
+written in that export before implementation; integration will merge the
+plan into the current record without overwriting these results. An
+additional bounded diagnostic found that 12 allocations of 16 MiB
+trigger two major collections in the root realm and none in a
+ShadowRealm, in all three tiers. Those collector routing/pressure paths
+are unchanged by part A. A complete correction needs shared pressure and
+a sound active-interpreter ownership/entry contract; merely forwarding
+through a raw parent pointer is not an accepted implementation.
+
+Artifacts are under target/s6-gc-opt-2026-10-23: part-a contains the
+frozen sources, mutation cases, both gate verifications, both release
+experiments and original/recovery evidence. The retained candidate is
+target/s6-lto/s6-gc-opt-part-a. React RSS, Djot GC share and remaining
+independent component bounds stay open. I4 approval is unchanged; this
+is not S6 exit acceptance or merge authorization.
