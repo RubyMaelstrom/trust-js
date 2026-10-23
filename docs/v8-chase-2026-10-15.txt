@@ -8250,3 +8250,40 @@ remain historical evidence. Both measurement jobs have completed and
 been reaped; no correctness gate is rerun for this documentation update
 because engine, configuration, fixture and test inputs match the already
 validated repair.
+
+
+I4 guarded-cache contract accepted, 2026-10-23
+
+The owner accepts the current I4 exceptions. This adopts the bounded
+contract proposed at the S6 exit review: cached raw interior or code
+locations are non-owning and require a complete live-owner/identity,
+address-reuse and structural/code-validity proof before dereference. The
+reviewed NameIc/CallIc paths validate live identity and the required
+non-recycled generation/layout/code epoch. Owner and execution lifetime
+must survive reentry. Invalidation precedes retirement; a potentially
+invalidated location is revalidated or re-derived before reuse. A raw
+cache never serves as the sole root.
+
+These caches avoid repeated name resolution and call-entry setup on hot
+paths. That is the engineering rationale for keeping them in the
+non-moving design. No separate removal benchmark establishes that every
+cache is individually faster. The approval accepts the guarded design
+and closes the I4 wording decision; it does not turn the bounded source
+audit into a whole-engine proof or relax I1/I7/I8 obligations. The five
+reentry-rooting regressions remain correctness defects repaired in
+662530ad, not approved cache exceptions.
+
+The checklist now states the approved contract rather than the original
+absolute ban. Earlier owner-review artifacts and their pending status
+remain historical evidence. No engine, cache, test, fixture or build
+configuration changes accompany this documentation decision, so the
+completed correctness gates and measured artifacts remain applicable.
+
+No other acceptance decision is inferred. React RSS still exceeds its
++25% bound against main; Djot's non-exit GC share remains above 5%, and
+the sustained-allocation and other component limits remain open as
+recorded in the completed measurements. The previously carried N-API
+finalizer teardown/exception limitations remain separate from step 12.
+Memory and GC tuning, explicit bounded performance exceptions, and final
+S6 acceptance/merge still require their own disposition. Main and the
+accepted release artifacts are unchanged.
