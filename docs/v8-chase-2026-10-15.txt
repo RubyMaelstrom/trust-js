@@ -8017,3 +8017,119 @@ The invariant inventory and its test-only source links are
 in target/s6-step12fr/final-invariant-inventory.txt and
 final-audit-corrected.json. The tracked narrative retains the same
 limitations.
+
+
+S6 exit review repairs, 2026-10-23 (this commit)
+
+The owner's review identified five GC lifetime regressions against
+main, all predating step 12. The release repro matrix retained 24/24
+passing main runs and 19/24 failing branch runs across interpreter,
+bytecode and JIT. The disposal failures include release crashes.
+The repaired release build passes all 24 runs, including the NaN
+control. The original scripts and every failing observation remain
+under target/s6-review-fixes; neither main nor the earlier evidence
+was changed.
+
+DisposeFrame roots the current and remaining resources together with
+normal/abrupt completion. A resource stays in that record through its
+call, await and error folding. The VM publishes VmDispose in its
+already traced coroutine before the first advance. Suspensions keep
+that state; completion/termination clear it. No persistent Rooted
+registration is added to a coroutine.
+
+Iterator.zip/zipKeyed use a RootedVec for partial results. JSON.parse
+roots the actual source record and traces its primitive values with
+an iterative walk, preserving iterative drop. Class evaluation uses
+one traced pending-elements record for fields, transforms, private
+members and static elements; FieldInit tracing also serves installed
+ClassInfo. Object.groupBy roots actual converted PropertyKeys and
+groups, plus a bounded pair for the current element/key conversion.
+Publication into the final owning object has no intervening callback.
+
+Nineteen tests cover all tiers, normal/abrupt completion, actual async
+suspension, all zip modes, source strings/duplicate JSON keys, computed
+Symbol keys, decorators/private members and IteratorClose. They check
+explicit roots before real minor/major collection, avoiding success
+from dead native/JIT slots, and check retirement after unwinding.
+Separate source-record tests prove precise retention, death after drop
+and iterative traversal/drop at 50,000 levels on a 1 MiB stack.
+
+Ten fresh omitted-root variants compile and produce twelve intended
+assertion failures. Build errors, empty filters, crashes and timeouts
+do not count as mutation evidence. The final test checkpoint helper
+uses the same activate/drain/task-boundary sequence in every feature
+configuration. The first gate and preflight configuration failures
+are preserved; production code did not change during that repair.
+
+Tested source snapshot: 797 files, SHA-256
+fd9ee16059bebbdc3c2030c774b79300b42a7a12313cdc35f8244f8f7321b216.
+The final zombie focused run passes all 76 individual cases: all
+nineteen tests, normal and stress interval 1, on native x64 and Wine.
+Independent checks compare raw per-case output, exits, exact
+names/counts, source maps and binary hashes after archiving.
+
+Both full gates match their recorded baselines. Crystal's native
+library is 2406 pass / 0 fail / 7 ignore; x64 is 2235 / 0 / 7.
+Windows under Wine is 2227 / 3 / 7, with exactly the same three
+snapshot-codec failures. Each inventory adds nineteen names and
+removes none. All nineteen also pass normal/stress1 individually
+under Wine. No native stress case fails, times out or needs a retry:
+Crystal covers all 2413 tests and zombie all 2242, including every
+established slow-list case at intervals 100 and 1000.
+
+Five strict Crystal clippy configurations pass; zombie's native
+clippy is clean and its 23 Windows diagnostics match the reference.
+Rustdoc's eight warnings are unchanged, doctests are 11 / 0 / 1,
+and the workspace and downstream results match their baselines.
+The native Wasm wrapper check executes both existing empty harnesses;
+this does not claim a wasm32 build or Wasm specification-suite run.
+
+Release fixture outputs, compilation and collection counts match,
+as do sustained-allocation checksums and 194 collections in both
+tiers. Difftest is 138 agreements and twelve existing budget skips.
+All nine routine .sum2 files (678 chunks) are byte-identical to the
+previous S6 exit; this repair changes no JIT emitter or baked layout.
+Full Test262 at threshold8 is 53575 pass / 0 fail / 3 skip on both
+native machines. Crystal threshold0 is 53573 / 2 / 3 with exactly
+the two existing staging reference failures. All reports match the
+references byte for byte; rounded 100.0% is not a zero-failure claim.
+
+The final-source fat-LTO release also passes all 24 original repro
+runs with exact stdout and empty stderr. Its SHA-256 is
+2f1bc081a8dde56800c9721f1f3bfabe4c9587737ac6eaba6f3b62d787dd070b,
+and it is 19,802,008 bytes. The fresh export, successful build,
+unchanged source maps and all four prepared comparison binaries
+are linked by hashes. Only the two tracked review records change
+after validation; engine, configuration, fixture and test inputs
+are unchanged.
+
+Performance comparison pending by the owner's decision
+
+The owner requests: "Commit fixes; record performance pending."
+The prepared fifteen-round, six-workload, four-binary comparison did
+not collect a sample. None of nine sixty-second quiet windows met
+the recorded condition; the inference server remained above the
+one-percent-of-one-core threshold, or a process-enumeration race
+invalidated the window. The owned measurement runner was stopped
+and reaped before this commit; the owner's processes were untouched.
+The timing criterion is unchanged. The previous S6 exit's results
+describe its earlier source; no fresh timing, counter, pause or RSS
+conclusion is claimed for this repair. The new binary, matched and
+historical main binaries, parent binary and quiet-window evidence
+are retained for the deferred comparison.
+
+The three requested documentation corrections describe the completed
+S6 exit validation, production managed-memory unavailability, and the
+current GC-buffer string append implementation. I4 remains unchanged
+pending the owner's decision. These repairs do not accept the stage,
+waive its open performance bounds, merge main, or publish the branch.
+
+Local evidence is retained under target/s6-review-fixes: original
+baseline and no-LTO release repros, ten mutation builds and their
+twelve assertion failures, and final/frozen-source. The final/
+subdirectory holds gate-verified.json, dump-summaries-verified.json,
+zombie-coordinator-verified.json, zombie-milestone/verified-all.json,
+zombie-focused-verified.json, fat-lto-repros/verified.json, and
+performance-pending.json. The fat-LTO export and build certificate
+are under target/s6-lto/s6-rooting-review-final. These local artifacts
+are not required for a fresh checkout to build or run the new tests.

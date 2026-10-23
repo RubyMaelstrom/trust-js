@@ -19067,13 +19067,17 @@ impl VmCoro {
                     continue;
                 }
                 Ok(VmStep::Dispose { frame, completion }) => {
-                    let mut disposal = VmDispose::new(frame, completion);
-                    match disposal.advance(i) {
+                    // The first advance can call several synchronous disposers before any
+                    // suspension. Publish all resources and the completion in the traced
+                    // continuation first, just as for later resume calls above.
+                    self.disposal = Some(VmDispose::new(frame, completion));
+                    let action = self.disposal.as_mut().expect("just published").advance(i);
+                    match action {
                         DisposeAction::Suspend(value) => {
-                            self.disposal = Some(disposal);
                             return Suspend::Await(value);
                         }
                         DisposeAction::Complete(completion) => {
+                            self.disposal = None;
                             let pending = pending_dispose_completion(completion);
                             if pending.is_none() {
                                 resume_directly = true;
@@ -19081,6 +19085,7 @@ impl VmCoro {
                             disposal_pending = pending;
                         }
                         DisposeAction::Terminate => {
+                            self.disposal = None;
                             self.done = true;
                             return Suspend::Done(Value::Undefined);
                         }

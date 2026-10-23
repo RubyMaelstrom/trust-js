@@ -179,6 +179,12 @@ mod private_name_cache_tests;
 mod realm_inline_guard_tests;
 #[cfg(test)]
 mod record_enumeration_tests;
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod reentry_rooting_tests;
 mod regex;
 mod regex_emoji;
 mod regex_fold;

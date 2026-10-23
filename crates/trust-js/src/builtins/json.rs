@@ -133,6 +133,10 @@ pub(super) fn install_json(it: &mut Interp) {
         // recording primitive source spans for its `context` argument.
         if reviver.is_callable() {
             let (v, record) = json_parse_recorded(i, input, &mut pos)?;
+            // A reviver can replace a later property before it is visited. Its originally
+            // parsed value still participates in SameValue/source matching, even when only
+            // this Rust-owned record retains it across the reviver's safepoints (I1).
+            let record = crate::rooting::Rooted::new(record);
             json_skip_ws(input, &mut pos);
             if pos != input.len() {
                 return Err(i.make_error("SyntaxError", "Unexpected non-whitespace after JSON"));
@@ -969,6 +973,22 @@ enum JsonRecord {
     Obj(Vec<(String, JsonRecord)>),
 }
 
+impl crate::gc_trace::GcTrace for JsonRecord {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        // Like Drop below, tracing must not use one native frame per nesting level.
+        let mut pending = vec![self];
+        while let Some(record) = pending.pop() {
+            match record {
+                JsonRecord::Prim(_source, parsed) => sink.value(parsed),
+                JsonRecord::Arr(children) => pending.extend(children),
+                JsonRecord::Obj(entries) => {
+                    pending.extend(entries.iter().map(|(_key, child)| child));
+                }
+            }
+        }
+    }
+}
+
 impl JsonRecord {
     fn take_children(&mut self, out: &mut Vec<JsonRecord>) {
         match self {
@@ -1208,5 +1228,389 @@ fn json_parse_string(
             }
             c => s.push(c),
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod tests {
+    use super::*;
+    use crate::bytecode::Tier;
+    use crate::gc_core::{CellAge, CollectionKind, MarkSource};
+    use crate::gc_handle::WeakRef;
+    use crate::rooting::Rooted;
+    use crate::{Completion, Engine};
+    use std::cell::RefCell;
+
+    // ECMA-262 e28783d5, spec.html:47996-48045, InternalizeJSONProperty;
+    // spec.html:6065-6067, SameValueNonNumber. Equal String code units keep the
+    // original source token even when the replacement has a different GC cell.
+
+    struct Leaf {
+        key: String,
+        token: String,
+        replacement: String,
+    }
+
+    fn leaves(keys: [&str; 3]) -> Vec<Leaf> {
+        let suffix = "-json-source-record-root-".repeat(4);
+        [
+            (format!(r#""\u0061{suffix}""#), format!("a{suffix}")),
+            (format!(r#""é{suffix}""#), format!("é{suffix}")),
+            (
+                format!(r#""\ud800{suffix}""#),
+                format!("{}{suffix}", crate::jstr::smuggle(0xd800)),
+            ),
+        ]
+        .into_iter()
+        .zip(keys)
+        .map(|((token, replacement), key)| Leaf {
+            key: key.to_owned(),
+            token,
+            replacement,
+        })
+        .collect()
+    }
+
+    fn literal(text: &str) -> String {
+        let mut result = String::new();
+        json_quote_into(&mut result, text);
+        result
+    }
+
+    fn eval(engine: &mut Engine, source: &str) -> String {
+        match engine
+            .eval(source, false)
+            .expect("JSON rooting fixture parses")
+        {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
+
+    fn assert_live_strings(interp: &Interp, watched: &[WeakRef], explicit_root: bool) {
+        let heap = &interp.gc_heap;
+        let core = heap.core.borrow();
+        for weak in watched {
+            // Check the clearing weak flag and descriptor before any possible payload read.
+            let address = weak
+                .live_ptr()
+                .expect("the original parsed string stays live");
+            assert!(core.owns_cell(address, heap.string_desc));
+            if explicit_root {
+                let path = core.retention_path(address);
+                assert!(
+                    matches!(path.first(), Some((_, _, MarkSource::Root))),
+                    "the source record must explicitly root its parsed string: {path:?}"
+                );
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Watched {
+        strings: Vec<WeakRef>,
+        calls: usize,
+    }
+
+    fn check_replaced_siblings(text: &str, first_key: &str, leaves: Vec<Leaf>, abrupt: bool) {
+        let expected = leaves
+            .iter()
+            .map(|leaf| format!("{}:{}", literal(&leaf.key), literal(&leaf.token)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let order = leaves
+            .iter()
+            .map(|leaf| leaf.key.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            r#"(function() {{
+                var expected = {{{expected}}}, seen = [];
+                var caught = false;
+                try {{
+                    JSON.parse({text}, function(key, value, context) {{
+                        if (key === {first_key}) {{
+                            __replaceJSONStrings.call(this);
+                            if ({abrupt}) throw 73;
+                        }}
+                        if (Object.hasOwn(expected, key)) {{
+                            if (!Object.hasOwn(context, 'source') || context.source !== expected[key])
+                                throw new Error('source for ' + key);
+                            seen.push(key);
+                        }}
+                        return value;
+                    }});
+                }} catch (error) {{
+                    if (!{abrupt} || error !== 73) throw error;
+                    caught = true;
+                }}
+                if ({abrupt} ? !caught : seen.join(',') !== {order}) throw new Error('visits');
+                return 'ok';
+            }})()"#,
+            text = literal(text),
+            first_key = literal(first_key),
+            order = literal(&order),
+        );
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            engine.interp.activate_gc_heap();
+            engine
+                .interp
+                .gc_heap
+                .core
+                .borrow_mut()
+                .set_retention_tracing(true);
+            let watched = Rc::new(RefCell::new(Watched::default()));
+            let callback_state = watched.clone();
+            let replacements = leaves
+                .iter()
+                .map(|leaf| (leaf.key.clone(), leaf.replacement.clone()))
+                .collect::<Vec<_>>();
+            let native = engine.interp.new_native_fn(
+                "__replaceJSONStrings",
+                0,
+                Rc::new(move |interp, holder, _| {
+                    let object = holder.as_obj().expect("parsed array or object holder");
+                    let mut originals = Vec::new();
+                    for (key, text) in &replacements {
+                        let old = ab(interp.get_member_key(&holder, key))?;
+                        let ValueView::Str(string) = old.view() else {
+                            panic!("a later parsed property is a string");
+                        };
+                        let weak = WeakRef::to(string.cell_word() as usize);
+                        let replacement = Value::lstr(text.as_str());
+                        assert!(same_value(&old, &replacement));
+                        assert_ne!(old.cell_word(), replacement.cell_word());
+                        set_data(&object, key, replacement);
+                        originals.push(weak);
+                    }
+                    assert_eq!(originals.len(), 3);
+                    for kind in [CollectionKind::Minor, CollectionKind::Major] {
+                        let before = interp.gc_heap.core.borrow().stats().collections;
+                        // AST evaluation needs its legitimate native temporaries. Roots are
+                        // visited before that scan, so require Root rather than accepting a
+                        // stale parser-frame copy as evidence of source-record ownership.
+                        interp.gc_heap_collect_explicit(kind);
+                        assert_eq!(interp.gc_heap.core.borrow().stats().collections, before + 1);
+                        assert_live_strings(interp, &originals, kind == CollectionKind::Major);
+                    }
+                    let mut state = callback_state.borrow_mut();
+                    state.strings = originals;
+                    state.calls += 1;
+                    Ok(Value::Undefined)
+                }),
+                // Only Rust strings, counters and weak observers are captured.
+                crate::value::NativeCaptures::None,
+            );
+            set_data(&engine.interp.global, "__replaceJSONStrings", native);
+            assert_eq!(eval(&mut engine, &source), "ok", "{tier:?}");
+            assert_eq!(watched.borrow().calls, 1, "{tier:?}");
+            // Outside JS, exclude all stale native words and prove both normal and abrupt
+            // completion unregister the record instead of keeping the originals forever.
+            engine
+                .interp
+                .gc_collect_precise_for_test(CollectionKind::Major);
+            assert!(watched
+                .borrow()
+                .strings
+                .iter()
+                .all(|weak| weak.live_ptr().is_none()));
+        }
+    }
+
+    #[test]
+    fn json_reviver_equal_sibling_strings_are_explicit_roots_in_all_tiers() {
+        let object = leaves(["a", "b", "c"]);
+        let text = format!(
+            r#"{{"kick":0,"a":{},"b":{},"c":{}}}"#,
+            object[0].token, object[1].token, object[2].token
+        );
+        check_replaced_siblings(&text, "kick", object, false);
+        let array = leaves(["1", "2", "3"]);
+        let text = format!(
+            r#"[0,{},{},{}]"#,
+            array[0].token, array[1].token, array[2].token
+        );
+        check_replaced_siblings(&text, "0", array, false);
+    }
+
+    #[test]
+    fn json_reviver_duplicate_keys_keep_the_last_source_after_gc() {
+        let entries = leaves(["dup", "b", "c"]);
+        let text = format!(
+            r#"{{"kick":0,"dup":"discarded first token","b":{},"dup":{},"c":{}}}"#,
+            entries[1].token, entries[0].token, entries[2].token
+        );
+        check_replaced_siblings(&text, "kick", entries, false);
+    }
+
+    #[test]
+    fn json_reviver_throw_retires_source_record_roots() {
+        let entries = leaves(["a", "b", "c"]);
+        let text = format!(
+            r#"{{"kick":0,"a":{},"b":{},"c":{}}}"#,
+            entries[0].token, entries[1].token, entries[2].token
+        );
+        check_replaced_siblings(&text, "kick", entries, true);
+    }
+
+    #[test]
+    fn json_reviver_samevalue_and_scalar_source_controls() {
+        let source = r#"(function() {
+            function check(ok) { if (!ok) throw new Error('source control'); }
+            var visits = 0;
+            JSON.parse('[0,"same","change","delete",-0,0,1.50]', function(k,v,c) {
+                if (k === '0') {
+                    this[1] = 'sam' + 'e'; this[2] = 'different'; delete this[3];
+                    this[4] = 0; this[5] = -0; this[6] = 1.5;
+                    __forceJSONCollection();
+                }
+                if (k === '1') check(c.source === '"same"');
+                if (k === '2' || k === '3' || k === '4' || k === '5')
+                    check(!Object.hasOwn(c, 'source'));
+                if (k === '6') check(c.source === '1.50');
+                if (k !== '') visits++;
+                return v;
+            });
+            check(visits === 7);
+            for (var text of ['  "scalar"  ', ' 1.50 ', ' true ', ' null ', ' -0 ']) {
+                var count = 0;
+                JSON.parse(text, function(k,v,c) {
+                    check(k === '' && c.source === text.trim());
+                    if (text.trim() === '-0') check(Object.is(v, -0));
+                    __forceJSONCollection();
+                    count++;
+                    return v;
+                });
+                check(count === 1);
+            }
+            return 'ok';
+        })()"#;
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let native = engine.interp.new_native_fn(
+                "__forceJSONCollection",
+                0,
+                Rc::new(|interp, _, _| {
+                    interp.gc_heap_collect_explicit(CollectionKind::Major);
+                    Ok(Value::Undefined)
+                }),
+                crate::value::NativeCaptures::None,
+            );
+            set_data(&engine.interp.global, "__forceJSONCollection", native);
+            assert_eq!(eval(&mut engine, source), "ok", "{tier:?}");
+        }
+    }
+
+    fn watch_record_strings(record: &JsonRecord) -> Vec<WeakRef> {
+        // Independent of GcTrace: an omitted trace arm must not omit its own witnesses.
+        let mut watched = Vec::new();
+        let mut pending = vec![record];
+        while let Some(record) = pending.pop() {
+            match record {
+                JsonRecord::Prim(_source, parsed) => {
+                    if let ValueView::Str(string) = parsed.view() {
+                        watched.push(WeakRef::to(string.cell_word() as usize));
+                    }
+                }
+                JsonRecord::Arr(children) => pending.extend(children),
+                JsonRecord::Obj(entries) => {
+                    pending.extend(entries.iter().map(|(_key, child)| child));
+                }
+            }
+        }
+        watched
+    }
+
+    fn check_precise_record(engine: &mut Engine, record: JsonRecord, leaves: usize) {
+        let watched = watch_record_strings(&record);
+        assert_eq!(watched.len(), leaves);
+        for weak in &watched {
+            assert_eq!(
+                engine
+                    .interp
+                    .gc_heap
+                    .core
+                    .borrow()
+                    .cell_age(weak.ptr() as u64),
+                Some(CellAge::Young)
+            );
+        }
+        let record = Rooted::new(record);
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            engine.interp.gc_collect_precise_for_test(kind);
+            assert_live_strings(&engine.interp, &watched, true);
+        }
+        drop(record);
+        engine
+            .interp
+            .gc_collect_precise_for_test(CollectionKind::Major);
+        assert!(watched.iter().all(|weak| weak.live_ptr().is_none()));
+    }
+
+    #[test]
+    fn json_record_scalar_array_and_object_are_precise_roots_until_drop() {
+        let token = literal(&"fresh noninterned parsed string ".repeat(8));
+        for text in [
+            token.clone(),
+            format!("[{token}]"),
+            format!(r#"{{"nested":[{token}]}}"#),
+        ] {
+            let mut engine = Engine::new();
+            engine.interp.activate_gc_heap();
+            engine
+                .interp
+                .gc_heap
+                .core
+                .borrow_mut()
+                .set_retention_tracing(true);
+            let mut position = 0;
+            let (_, record) = json_parse_recorded(
+                &mut engine.interp,
+                JsonInput::Bytes(text.as_bytes()),
+                &mut position,
+            )
+            .unwrap_or_else(|_| panic!("recorded fixture parses"));
+            assert_eq!(position, text.len());
+            check_precise_record(&mut engine, record, 1);
+        }
+    }
+
+    #[test]
+    fn json_record_deep_trace_and_drop_are_iterative() {
+        std::thread::Builder::new()
+            .name("deep-json-record".to_owned())
+            .stack_size(1 << 20)
+            .spawn(|| {
+                let mut engine = Engine::new();
+                engine.interp.activate_gc_heap();
+                engine
+                    .interp
+                    .gc_heap
+                    .core
+                    .borrow_mut()
+                    .set_retention_tracing(true);
+                let parsed = Value::lstr("deep source record string ".repeat(8));
+                let mut record = JsonRecord::Prim("a Rust source token".to_owned(), parsed);
+                for depth in 0..50_000 {
+                    record = if depth & 1 == 0 {
+                        JsonRecord::Arr(vec![record])
+                    } else {
+                        JsonRecord::Obj(vec![(String::new(), record)])
+                    };
+                }
+                check_precise_record(&mut engine, record, 1);
+            })
+            .expect("spawn deep JSON record test")
+            .join()
+            .expect("deep JSON record trace/drop panicked");
     }
 }

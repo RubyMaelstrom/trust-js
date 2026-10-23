@@ -128,6 +128,26 @@ struct PreparedDecoratorValue {
     this_value: Value,
 }
 
+/// Rust-side state kept across DisposeResources callbacks and await-only markers.
+struct DisposeFrame {
+    resources: Vec<Disposable>,
+    completion: Completion,
+}
+
+/// Class records own their keys and callable transforms until publication. A companion list
+/// of values is insufficient: ToPropertyKey can create a Symbol not held by its input object.
+#[derive(Default)]
+struct PendingClassElements {
+    instance_fields: Vec<FieldInit>,
+    private_members: Vec<(String, Property)>,
+    static_elements: Vec<StaticClassElement>,
+}
+
+enum StaticClassElement {
+    Field(FieldInit),
+    Block(Rc<Function>),
+}
+
 impl PreparedClassEvaluation {
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         let mut bytes = self
@@ -534,7 +554,7 @@ impl Interp {
     /// the completion (if it was previously normal) or is folded into a `SuppressedError` chain.
     pub(crate) fn dispose_frame(
         &mut self,
-        mut frame: Vec<Disposable>,
+        frame: Vec<Disposable>,
         result: Completion,
     ) -> Completion {
         // Script termination is host control flow, not ECMAScript abrupt completion cleanup.
@@ -548,8 +568,13 @@ impl Interp {
         // synchronous resource (or at the end when there is no such resource).
         let mut needs_await = false;
         let mut has_awaited = false;
-        let mut completion = result;
-        while let Some(r) = frame.pop() {
+        let mut pending = crate::rooting::Rooted::new(DisposeFrame {
+            resources: frame,
+            completion: result,
+        });
+        // Keep the current record in the traced list until its call/await finishes. In
+        // particular, an await-only marker can suspend before this resource is called.
+        while let Some(r) = pending.resources.last() {
             if !r.kind_is_async && needs_await && !has_awaited {
                 self.coro_await(Value::Undefined)?;
                 needs_await = false;
@@ -558,6 +583,7 @@ impl Interp {
             if !r.method.is_callable() {
                 debug_assert!(r.kind_is_async);
                 needs_await = true;
+                pending.resources.pop();
                 continue;
             }
 
@@ -590,7 +616,8 @@ impl Interp {
             match disposed {
                 Ok(_) => {}
                 Err(Abrupt::Throw(new_err)) => {
-                    completion = match completion {
+                    let previous = std::mem::replace(&mut pending.completion, Ok(Value::Undefined));
+                    pending.completion = match previous {
                         Err(Abrupt::Throw(prev)) => {
                             Err(Abrupt::Throw(self.make_suppressed(new_err, prev)))
                         }
@@ -606,11 +633,12 @@ impl Interp {
                 }
                 Err(other) => return Err(other),
             }
+            pending.resources.pop();
         }
         if needs_await && !has_awaited {
             self.coro_await(Value::Undefined)?;
         }
-        completion
+        std::mem::replace(&mut pending.completion, Ok(Value::Undefined))
     }
 
     /// Run one `for-of` iteration: bind the element and execute the body. For a `using`/`await using`
@@ -6153,24 +6181,14 @@ impl Interp {
             }
         }
 
-        // Methods, accessors and fields. Values entering these Rust-side lists stay rooted
-        // until the class is complete: later members run decorators and static elements run
-        // author code (I1).
-        let mut roots = crate::rooting::ValueRoots::new();
-        let mut inst_fields: Vec<FieldInit> = Vec::new();
+        // Methods, accessors and fields retain their actual records, including computed
+        // Symbol keys, while later decorators and static elements run author code (I1).
+        let mut pending = crate::rooting::Rooted::new(PendingClassElements::default());
         // Instance private methods/accessors: stamped onto each instance when `this` is created
         // (PrivateMethodOrAccessorAdd), not placed on the prototype — so brand checks, double
         // initialization, and return-override semantics fall out of own-property checks.
-        let mut priv_members: Vec<(String, Property)> = Vec::new();
         // Static elements (field initializers and static blocks) defer until every member's
         // computed key has been evaluated, then run in declaration order.
-        type StaticEl = (
-            Option<Rc<Function>>,
-            crate::value::PropertyKey,
-            Option<Expr>,
-            Vec<Value>,
-        );
-        let mut static_els: Vec<StaticEl> = Vec::new();
         let mut instance_inits = crate::rooting::RootedVec::new();
         let mut static_inits = crate::rooting::RootedVec::new();
         for (member_index, m) in class.members.iter().enumerate() {
@@ -6240,13 +6258,8 @@ impl Interp {
                         setter = s;
                         transforms = t;
                     }
-                    for transform in &transforms {
-                        roots.keep(transform);
-                    }
                     if is_private && !m.is_static {
-                        roots.keep(&getter);
-                        roots.keep(&setter);
-                        priv_members.push((
+                        pending.private_members.push((
                             key.to_string(),
                             Property::accessor_prop(Some(getter), Some(setter), false, false),
                         ));
@@ -6254,14 +6267,15 @@ impl Interp {
                         self.define_class_accessor(&target, &key, Some(getter), Some(setter));
                     }
                     if m.is_static {
-                        static_els.push((
-                            None,
-                            crate::value::PropertyKey::private(backing.to_string()),
-                            m.value.clone(),
-                            transforms,
-                        ));
+                        pending
+                            .static_elements
+                            .push(StaticClassElement::Field(FieldInit {
+                                key: crate::value::PropertyKey::private(backing.to_string()),
+                                init: m.value.clone(),
+                                transforms,
+                            }));
                     } else {
-                        inst_fields.push(FieldInit {
+                        pending.instance_fields.push(FieldInit {
                             key: crate::value::PropertyKey::private(backing.to_string()),
                             init: m.value.clone(),
                             transforms,
@@ -6309,8 +6323,7 @@ impl Interp {
                         Property::builtin(f)
                     };
                     if is_private && !m.is_static {
-                        roots.keep(&prop.value());
-                        priv_members.push((key.into_string(), prop));
+                        pending.private_members.push((key.into_string(), prop));
                     } else if is_private {
                         target
                             .borrow_mut()
@@ -6368,10 +6381,8 @@ impl Interp {
                         (None, Some(f))
                     };
                     if is_private && !m.is_static {
-                        for accessor in get.iter().chain(set.iter()) {
-                            roots.keep(accessor);
-                        }
-                        if let Some((_, p)) = priv_members
+                        if let Some((_, p)) = pending
+                            .private_members
                             .iter_mut()
                             .find(|(k, _)| k.as_str() == key.as_str())
                         {
@@ -6382,7 +6393,7 @@ impl Interp {
                                 p.set_setter(set);
                             }
                         } else {
-                            priv_members.push((
+                            pending.private_members.push((
                                 key.into_string(),
                                 Property::accessor_prop(get, set, false, false),
                             ));
@@ -6407,13 +6418,16 @@ impl Interp {
                         };
                         self.decorate_field(decorators, &key, m.is_static, is_private, sink)?
                     };
-                    for transform in &transforms {
-                        roots.keep(transform);
-                    }
                     if m.is_static {
-                        static_els.push((None, key, m.value.clone(), transforms));
+                        pending
+                            .static_elements
+                            .push(StaticClassElement::Field(FieldInit {
+                                key,
+                                init: m.value.clone(),
+                                transforms,
+                            }));
                     } else {
-                        inst_fields.push(FieldInit {
+                        pending.instance_fields.push(FieldInit {
                             key,
                             init: m.value.clone(),
                             transforms,
@@ -6422,12 +6436,9 @@ impl Interp {
                 }
                 MemberKind::StaticBlock => {
                     if let Some(func) = &m.func {
-                        static_els.push((
-                            Some(func.clone()),
-                            crate::value::PropertyKey::string(String::new()),
-                            None,
-                            Vec::new(),
-                        ));
+                        pending
+                            .static_elements
+                            .push(StaticClassElement::Block(func.clone()));
                     }
                 }
                 MemberKind::Constructor => {}
@@ -6452,21 +6463,20 @@ impl Interp {
             &self.gc_heap,
             Gc::as_ptr(&ctor_obj) as usize,
             ClassInfo {
-                fields: inst_fields.into(),
+                fields: std::mem::take(&mut pending.instance_fields).into(),
                 field_env: inst_env,
                 derived,
                 instance_initializers: instance_inits.into_vec(),
-                private_members: priv_members,
+                private_members: std::mem::take(&mut pending.private_members),
             },
         );
 
-        for (block, key, init, transforms) in static_els {
+        // Borrow each record without detaching the backing list: both the current key and
+        // the remaining static records stay traced through initializer/decorator callbacks.
+        for element in pending.static_elements.iter() {
             let scope = new_scope(Some(static_env));
             bind(&scope, "this", ctor_val);
-            if block.is_none() {
-                bind(&scope, "%fieldinit%", Value::Bool(true));
-            }
-            if let Some(func) = block {
+            if let StaticClassElement::Block(func) = element {
                 // A static block instantiates its declarations like a function body,
                 // including a `using` disposal frame.
                 self.hoist(&func.body, &scope, &[]);
@@ -6489,6 +6499,15 @@ impl Interp {
                 result?;
                 continue;
             }
+            let StaticClassElement::Field(FieldInit {
+                key,
+                init,
+                transforms,
+            }) = element
+            else {
+                unreachable!("static blocks continue above");
+            };
+            bind(&scope, "%fieldinit%", Value::Bool(true));
             // A static field initializer is field-initializer code: no super() and no
             // `arguments` (even through a direct eval); an anonymous function value takes
             // the field's name.
@@ -6496,14 +6515,14 @@ impl Interp {
             let saved_field = self.in_field_init_code;
             self.super_call_ok = false;
             self.in_field_init_code = true;
-            let v = match &init {
+            let v = match init {
                 Some(e) => {
                     let v = self.eval(e, &scope);
                     if let (Ok(v), true) = (&v, is_anonymous_fn(e)) {
                         let name = self.fn_name_for_key(if key.is_private() {
-                            private_display(&key)
+                            private_display(key)
                         } else {
-                            &key
+                            key
                         });
                         self.set_fn_name(v, &name);
                     }
@@ -6514,7 +6533,7 @@ impl Interp {
             self.super_call_ok = saved_super;
             self.in_field_init_code = saved_field;
             let mut v = v?;
-            for tr in &transforms {
+            for tr in transforms {
                 v = self.call(*tr, ctor_val, &[v])?;
             }
             // The supported nonextensible-applies-to-private proposal checks IsExtensible
@@ -10128,6 +10147,43 @@ enum TailEval {
     /// A call in tail position: callee, `this`, arguments and the call's source position.
     Tail(Value, Value, crate::rooting::RootedVec, u32),
     Val(Value),
+}
+
+impl crate::gc_trace::GcTrace for DisposeFrame {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            resources,
+            completion,
+        } = self;
+        resources.trace_gc(sink);
+        match completion {
+            Ok(value) => value.trace_gc(sink),
+            Err(abrupt) => abrupt.trace_gc(sink),
+        }
+    }
+}
+
+impl crate::gc_trace::GcTrace for PendingClassElements {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            instance_fields,
+            private_members,
+            static_elements,
+        } = self;
+        instance_fields.trace_gc(sink);
+        private_members.trace_gc(sink);
+        static_elements.trace_gc(sink);
+    }
+}
+
+impl crate::gc_trace::GcTrace for StaticClassElement {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        match self {
+            Self::Field(field) => field.trace_gc(sink),
+            // Parsed syntax is Rust-owned; runtime function caches have their own registry.
+            Self::Block(_) => {}
+        }
+    }
 }
 
 impl crate::gc_trace::GcTrace for PreparedDecoratorValue {

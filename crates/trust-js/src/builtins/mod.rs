@@ -4524,18 +4524,19 @@ fn install_object(it: &mut Interp) {
 
     it.def_method(&ctor, "hasOwn", 2, nf_object_has_own);
     it.def_method(&ctor, "groupBy", 2, |i, _this, args| {
-        let mut groups: Vec<(crate::value::PropertyKey, Vec<Value>)> = Vec::new();
+        let mut groups =
+            crate::rooting::Rooted::new(Vec::<(crate::value::PropertyKey, Vec<Value>)>::new());
         let mut group_index: crate::fasthash::FastMap<String, usize> = Default::default();
-        // The groups are Rust-heap state across callback calls (I1).
-        let mut roots = crate::rooting::ValueRoots::new();
+        // Coercion can run author code before the key/element join a group. Once transferred,
+        // the groups trace the converted PropertyKey itself, including a newly created Symbol.
+        let mut pending = crate::rooting::Rooted::new((Value::Undefined, Value::Undefined));
         group_by(
             i,
             &arg(args, 0),
             &arg(args, 1),
             "Object.groupBy",
             |i, key_v, el| {
-                roots.keep(&key_v);
-                roots.keep(&el);
+                *pending = (key_v, el);
                 let key = ab(i.to_property_key(&key_v))?;
                 if let Some(&offset) = group_index.get(key.as_str()) {
                     groups[offset].1.push(el);
@@ -4545,14 +4546,17 @@ fn install_object(it: &mut Interp) {
                     // object's property storage takes ownership. Callback/coercion may collect.
                     groups.push((key, vec![el]));
                 }
+                *pending = (Value::Undefined, Value::Undefined);
                 Ok(())
             },
         )?;
         drop(group_index);
         let result = i.new_object();
         result.borrow_mut().proto = None; // groupBy returns a null-prototype object
-        for (k, v) in groups {
-            let arr = i.make_array(v);
+        for (k, v) in groups.iter_mut() {
+            // make_array and direct property publication cannot run author code. Transfer
+            // each element buffer atomically, keeping its Symbol key rooted until insertion.
+            let arr = i.make_array(std::mem::take(v));
             result
                 .borrow_mut()
                 .props
@@ -9682,7 +9686,7 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
     let mark = |i: &mut Interp, state: &Value, j: usize| -> Result<(), Value> {
         ab(i.set_member_key(state, &j.to_string(), Value::Bool(true)))
     };
-    let mut values = vec![Value::Undefined; n];
+    let mut values = crate::rooting::RootedVec::from_vec(vec![Value::Undefined; n]);
     for j in 0..n {
         let closed = ab(i.get_member_key(&state, &j.to_string()))?;
         if i.to_boolean(&closed) {
@@ -9784,7 +9788,7 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
         }
         Value::Obj(o)
     } else {
-        i.make_array(values)
+        i.make_array(values.into_vec())
     };
     Ok(iter_result(i, result, false))
 }

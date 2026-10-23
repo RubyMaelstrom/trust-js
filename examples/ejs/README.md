@@ -41,10 +41,12 @@ What the 55.8 minutes was made of, in the order it fell:
 2. **Double-copy concatenation** — each `a + b` copied the accumulation twice.
    2.7 min → 82 s.
 3. **The append loop itself** — `s += x` on immutable exactly-sized strings is inherently
-   O(n²). The engine string is now a thin refcounted buffer *with spare capacity* (`LStr`,
-   the design original QuickJS uses), and the fused `obj.k += v` op appends **in place** when the
-   accumulator is uniquely referenced — astring's `write()` becomes amortized O(1).
-   82 s → 16 s.
+   O(n²). `LStr` now uses a GC-cell buffer with spare capacity and immutable views. An
+   accumulator ending at the buffer's written frontier can append **in place** beyond that
+   frontier and take a longer view; aliases retain their original visible length. Other
+   appends use a new buffer with geometric capacity. The fused `obj.k += v` path makes
+   astring's `write()` amortized O(1), without requiring unique ownership.
+   Recorded improvement from the original buffer-append fix: 82 s → 16 s.
 4. **Compiled-tier coverage and inline caches** — object-destructuring declarations (at
    block *and* function-body level), simple parameter defaults, optional chains (`a?.b`,
    `r?.m(x)`), `for…of` (with exact IteratorClose semantics on break/return/throw), and

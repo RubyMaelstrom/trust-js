@@ -336,6 +336,12 @@ pub(crate) fn trace_thread_roots(sink: &mut dyn GcSink) {
         }
     });
     crate::rooting::trace_rooted(sink);
+    trace_running_coroutines(sink);
+}
+
+/// The continuation's own edges, separately from conservative native/JIT word ranges.
+/// Keeping this walk distinct lets root-lifetime tests reject accidental stack retention.
+pub(crate) fn trace_running_coroutines(sink: &mut dyn GcSink) {
     RUNNING_COROUTINES.with(|running| {
         for &coroutine in running.borrow().iter() {
             // SAFETY: registered only while `Coroutine::resume` borrows it.
@@ -519,20 +525,25 @@ impl GcTrace for crate::interpreter::ClassInfo {
             instance_initializers,
             private_members,
         } = self;
-        for field in fields.iter() {
-            let crate::interpreter::FieldInit {
-                key, // a computed key may be a Symbol, which is a cell
-                init: _,
-                transforms,
-            } = field;
-            key.trace_gc(sink);
-            transforms.trace_gc(sink);
-        }
+        fields.trace_gc(sink);
         field_env.trace_gc(sink);
         instance_initializers.trace_gc(sink);
         for (_, property) in private_members {
             property.trace_gc(sink);
         }
+    }
+}
+
+/// Used both by pending class records and by the constructor's published ClassInfo.
+impl GcTrace for crate::interpreter::FieldInit {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::FieldInit {
+            key,     // a computed key may be a Symbol, which is a cell
+            init: _, // parsed syntax, not runtime values
+            transforms,
+        } = self;
+        key.trace_gc(sink);
+        transforms.trace_gc(sink);
     }
 }
 

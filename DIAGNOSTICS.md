@@ -84,14 +84,15 @@ comment/example in the same change.
   register for the next operator, comparison or branch (`Operand::Int` in `jit_regions.rs`).
 - `TRUST_JS_PERF_METRICS=1` prints one JSON JIT/collector performance summary at normal
   exit (compile attempts/seconds/bytes, inline attempts, lex/parse/bytecode-compile time,
-  native-call time, GC pauses and post-GC managed memory). The shell collects once more at
+  native-call time, GC pauses and managed-memory availability metadata). The shell collects once more at
   exit, before printing it, so the GC counts and pauses include that collection (cause
   `explicit`, a major collection). Collections are counted by cause (`gc_causes`) and by kind
   (`gc_kinds`: `minor`, `major`), and their pauses are also reported by cause
-  (`gc_pause_seconds_by_cause`) and by kind (`gc_pause_seconds_by_kind`). The managed-memory
-  record counts the heap's live rooted handles (`handles`: `strong` and `weak`), the values
-  host code keeps; a leaked handle keeps its value alive. Diagnostic only; excluded from
-  acceptance timing.
+  (`gc_pause_seconds_by_cause`) and by kind (`gc_pause_seconds_by_kind`). Production GC does
+  not record a managed-memory snapshot: `managed_memory` reports `safepoint: null`,
+  `complete: false`, and unavailable requested/external byte totals, not measured zeros.
+  Live rooted-handle counts (`handles`: `strong` and `weak`) remain available independently;
+  a leaked strong handle keeps its value alive. Diagnostic only; excluded from acceptance timing.
 - Helper-traffic tallies print their top entries to stderr at exit and are diagnostic only:
   `TRUST_JS_JIT_OPSTAT=1` counts ops that reach a JIT helper (`=2` adds the function and
   pc), `TRUST_JS_JIT_CALLSTAT=1` counts why calls reaching the call helper missed the
