@@ -8,14 +8,14 @@ use crate::Engine;
 use std::rc::Rc;
 
 fn subject(i: &mut crate::interpreter::Interp) -> crate::value::UserFn {
-    let env = i.global_env.clone();
+    let env = i.global_env;
     let value = i.get_var("subject", &env).ok().unwrap();
     let object_handle = value.as_obj().unwrap();
     let object = object_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("snapshot subject")
     };
-    user.clone()
+    *user
 }
 
 fn run(i: &mut crate::interpreter::Interp, snapshot: &'static [u8]) {
@@ -75,11 +75,11 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
             .get()
             .flatten()
             .expect("warm inline native code");
-        let main = Value::Obj(i.global.clone());
+        let main = Value::Obj(i.global);
         let child = i.create_realm();
         in_realm(i, &child, |i| {
             run(i, snapshot);
-            set_global(i, "mainRealm", main.clone());
+            set_global(i, "mainRealm", main);
             let child_user = subject(i);
             assert!(
                 Rc::ptr_eq(function, &child_user.func),

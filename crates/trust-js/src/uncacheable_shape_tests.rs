@@ -16,13 +16,13 @@ fn run(engine: &mut Engine, source: &str) -> String {
 }
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine
         .interp
         .get_var(name, &env)
         .ok()
         .expect("fixture object");
-    value.as_obj().expect("object").clone()
+    value.as_obj().expect("object")
 }
 
 fn unknown(object: &Gc) {
@@ -55,22 +55,22 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
     let i = &mut engine.interp;
     for _ in 0..4 {
         assert!(matches!(
-            (i.get_prop_keyed(&Value::Obj(first.clone()), "alpha", &cache[0]))
+            (i.get_prop_keyed(&Value::Obj(first), "alpha", &cache[0]))
                 .map(|__value| (__value).view()),
             Ok(ValueView::Num(7.0))
         ));
         assert!(matches!(
-            (i.get_prop_keyed(&Value::Obj(second.clone()), "alpha", &cache[0]))
+            (i.get_prop_keyed(&Value::Obj(second), "alpha", &cache[0]))
                 .map(|__value| (__value).view()),
             Ok(ValueView::Undefined)
         ));
         assert!(matches!(
-            (i.get_computed_property(&Value::Obj(first.clone()), &computed))
+            (i.get_computed_property(&Value::Obj(first), &computed))
                 .map(|__value| (__value).view()),
             Ok(ValueView::Num(7.0))
         ));
         assert!(matches!(
-            (i.get_computed_property(&Value::Obj(second.clone()), &computed))
+            (i.get_computed_property(&Value::Obj(second), &computed))
                 .map(|__value| (__value).view()),
             Ok(ValueView::Undefined)
         ));
@@ -151,7 +151,7 @@ fn uncacheable_shapes_preserve_direct_and_deep_global_names_all_tiers() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         run(&mut engine, "function deep(){let captured=0;return function(){return sentinelValue+captured;};}var load=deep();");
-        let global = engine.interp.global.clone();
+        let global = engine.interp.global;
         global
             .borrow_mut()
             .props
@@ -214,7 +214,7 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
         assert!(matches!(
             (engine
                 .interp
-                .instanceof_ic(&Value::Obj(old), &Value::Obj(ctor.clone()), &cache))
+                .instanceof_ic(&Value::Obj(old), &Value::Obj(ctor), &cache))
             .map(|__value| (__value).view()),
             Ok(ValueView::Bool(true))
         ));
@@ -257,7 +257,7 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
         assert!(matches!(
             (engine
                 .interp
-                .instanceof_ic(&Value::Obj(fresh), &Value::Obj(ctor.clone()), &cache))
+                .instanceof_ic(&Value::Obj(fresh), &Value::Obj(ctor), &cache))
             .map(|__value| (__value).view()),
             Ok(ValueView::Bool(true))
         ));
@@ -272,7 +272,7 @@ fn uncacheable_shapes_keep_regexp_dependencies_live_without_publishing_slots() {
         &engine.interp
     ));
     let before = engine.interp.regexp_dependency_cache.get().shape;
-    let proto = engine.interp.extra_protos.get("RegExp").unwrap().clone();
+    let proto = *engine.interp.extra_protos.get("RegExp").unwrap();
     unknown(&proto);
     assert!(crate::builtins::regexp_dependencies_canonical(
         &engine.interp

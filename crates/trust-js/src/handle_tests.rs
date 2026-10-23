@@ -309,7 +309,7 @@ fn handles_and_values_of_another_engine_are_refused() {
     });
     second.scope(|cx| {
         assert_eq!(err(handle.get(cx)), HandleError::Foreign);
-        let foreign = Value::from_internal(object.clone());
+        let foreign = Value::from_internal(object);
         assert_eq!(err(Handle::new(cx, &foreign)), HandleError::Foreign);
         assert_eq!(err(WeakHandle::new(cx, &foreign)), HandleError::Foreign);
         assert_eq!(
@@ -320,7 +320,7 @@ fn handles_and_values_of_another_engine_are_refused() {
         let weak = handle.downgrade().expect("a weak handle");
         assert_eq!(err(weak.upgrade(cx)), HandleError::Foreign);
         // A string is a cell of its own Engine's heap too.
-        let foreign = Value::from_internal(string.clone());
+        let foreign = Value::from_internal(string);
         assert_eq!(err(Handle::new(cx, &foreign)), HandleError::Foreign);
         // Primitives belong to no heap.
         let number = Handle::new(cx, &Value::Num(1.5)).expect("a primitive");

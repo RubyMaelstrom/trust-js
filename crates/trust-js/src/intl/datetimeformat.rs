@@ -220,8 +220,8 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
         let f = i.make_native("", 1, |i, that, a| {
             Ok(Value::lstr(do_format(i, &that, &arg(a, 0))?))
         });
-        let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o.clone()));
-        set_internal_slot(&o, "#\u{0}dtf_bound", bound.clone());
+        let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o));
+        set_internal_slot(&o, "#\u{0}dtf_bound", bound);
         Ok(bound)
     });
     proto.borrow_mut().props.insert(

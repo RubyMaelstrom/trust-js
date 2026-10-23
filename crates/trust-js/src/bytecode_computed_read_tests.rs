@@ -18,7 +18,7 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 fn binding(engine: &mut Engine, name: &str) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .get_var(name, &env)
@@ -47,26 +47,22 @@ fn invoke(
     let chunk = Chunk::rewrite_owned_for_test(chunk, |chunk| chunk.ops[0] = op);
     let local = matches!(op, Op::GetElemLocal(_));
     let mut slots = [
-        Cell::new(PackedValue::pack(if local {
-            object.clone()
-        } else {
-            Value::Undefined
-        })),
-        Cell::new(PackedValue::pack(Value::Undefined)),
+        Cell::new(if local { object } else { Value::Undefined }),
+        Cell::new(Value::Undefined),
     ];
-    let mut storage: [std::mem::MaybeUninit<PackedValue>; 4] =
+    let mut storage: [std::mem::MaybeUninit<Value>; 4] =
         std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
-    let base = storage.as_mut_ptr().cast::<PackedValue>();
+    let base = storage.as_mut_ptr().cast::<Value>();
     let count = if local { 2 } else { 3 };
     unsafe {
-        base.write(PackedValue::pack(prefix));
+        base.write(prefix);
         if !local {
-            base.add(1).write(PackedValue::pack(object));
+            base.add(1).write(object);
         }
-        base.add(count - 1).write(PackedValue::pack(key));
+        base.add(count - 1).write(key);
     }
     let i = &mut *engine.interp;
-    let env = i.global_env.clone();
+    let env = i.global_env;
     let mut ctx = JitCtx {
         helpers: i.jit_helpers.as_ptr(),
         stack_base: base,
@@ -74,7 +70,7 @@ fn invoke(
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
         env_raw: Env::as_ptr(&env).cast(),
-        this_word: PackedValue::pack(Value::Undefined),
+        this_word: (Value::Undefined),
         global_body: std::ptr::null(),
         genv: Env::as_ptr(&env) as usize,
         interp: i,
@@ -85,7 +81,7 @@ fn invoke(
         code_base: std::ptr::null(),
         pc_offsets: std::ptr::null(),
         error: None,
-        ret: PackedValue::pack(Value::Undefined),
+        ret: (Value::Undefined),
         env_parent_raw: std::ptr::null(),
         opstat_enabled: false,
         callstat_enabled: false,
@@ -116,7 +112,7 @@ fn invoke(
         "wrong canonical stack extent for {op:?}"
     );
     let values = (0..live)
-        .map(|index| unsafe { base.add(index).read().into_value() })
+        .map(|index| unsafe { base.add(index).read() })
         .collect();
     (values, ctx.error.take())
 }
@@ -157,7 +153,7 @@ fn computed_read_helper_errors_consume_operands_not_prefix_or_local() {
         ] {
             evaluate(&mut engine, "calls=0;");
             let prefix = crate::value::Object::new(None);
-            let (result, error) = invoke(&mut engine, op, object, key, Value::Obj(prefix.clone()));
+            let (result, error) = invoke(&mut engine, op, object, key, Value::Obj(prefix));
             assert!(
                 matches!(&(result[0]).view(),ValueView::Obj(actual) if crate::value::Gc::ptr_eq(actual,&prefix))
             );

@@ -6,7 +6,7 @@
 //! the shared slot until teardown; mapped parameters consult this canonical slot as well.
 
 use crate::interpreter::Env;
-use crate::value::{PackedValue, Value};
+use crate::value::Value;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -14,7 +14,7 @@ use std::rc::Rc;
 struct Alias {
     environment: Env,
     name: Rc<str>,
-    slot: *const Cell<PackedValue>,
+    slot: *const Cell<Value>,
 }
 
 #[derive(Default, Clone)]
@@ -24,7 +24,7 @@ pub(crate) struct Scope<'a> {
     registry: Registry,
     floor: usize,
     end: usize,
-    _slots: PhantomData<&'a [Cell<PackedValue>]>,
+    _slots: PhantomData<&'a [Cell<Value>]>,
 }
 
 impl Registry {
@@ -42,7 +42,7 @@ impl Registry {
     pub(crate) unsafe fn enter<'a>(
         &self,
         homes: &[(Env, Rc<str>, u16)],
-        slots: &'a [Cell<PackedValue>],
+        slots: &'a [Cell<Value>],
     ) -> Scope<'a> {
         for (environment, name, slot) in homes {
             assert!((*slot as usize) < slots.len());
@@ -51,7 +51,7 @@ impl Registry {
         let mut aliases = self.0.borrow_mut();
         let floor = aliases.len();
         aliases.extend(homes.iter().map(|(environment, name, slot)| Alias {
-            environment: environment.clone(),
+            environment: *environment,
             name: name.clone(),
             slot: &slots[*slot as usize],
         }));
@@ -82,7 +82,7 @@ impl Registry {
             Env::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
         })?;
         // The scoped registration pins this shared Cell owner; it cannot resize or move.
-        Some(unsafe { &*alias.slot }.get().unpack())
+        Some(unsafe { &*alias.slot }.get())
     }
 
     pub(crate) fn write(&self, environment: &Env, name: &str, value: &Value) -> bool {
@@ -92,8 +92,8 @@ impl Registry {
         }) else {
             return false;
         };
-        // Match ordinary VM writes: transfer a new owner through the Cell, releasing the old.
-        unsafe { &*alias.slot }.set(PackedValue::pack(*value));
+        // Match ordinary VM writes: replace the Cell's value so every parameter alias sees it.
+        unsafe { &*alias.slot }.set(*value);
         true
     }
 
@@ -122,7 +122,7 @@ impl Drop for Scope<'_> {
                 .get_mut(&alias.name)
                 .expect("borrowed binding remains present");
             binding.initialized = !word.is_empty();
-            binding.set_word(word);
+            binding.set_value(word);
         }
         aliases.truncate(self.floor);
     }
@@ -169,18 +169,15 @@ mod tests {
             environment
                 .borrow_mut()
                 .vars
-                .insert("old", Binding::data(Value::Obj(old.clone()), false, true));
+                .insert("old", Binding::data(Value::Obj(old), false, true));
             environment
                 .borrow_mut()
                 .vars
                 .insert("later", Binding::data(Value::Undefined, true, false));
-            let slots = [
-                Cell::new(PackedValue::pack(Value::Obj(old))),
-                Cell::new(PackedValue::pack(Value::Empty)),
-            ];
+            let slots = [Cell::new(Value::Obj(old)), Cell::new(Value::Empty)];
             let homes = [
-                (environment.clone(), Rc::from("old"), 0),
-                (environment.clone(), Rc::from("later"), 1),
+                (environment, Rc::from("old"), 0),
+                (environment, Rc::from("later"), 1),
             ];
             let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _scope = unsafe { registry.enter(&homes, &slots) };
@@ -191,7 +188,7 @@ mod tests {
                     assert!(old.initialized && !old.mutable && old.strict_immutable);
                     assert!(!parked.vars.get("later").unwrap().initialized);
                 }
-                slots[0].set(PackedValue::pack(Value::Num(7.0)));
+                slots[0].set(Value::Num(7.0));
                 panic!("test restoration on Rust unwind");
             }));
             assert!(unwind.is_err());

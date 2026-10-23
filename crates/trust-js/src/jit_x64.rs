@@ -17,7 +17,7 @@ mod names;
 #[path = "jit_x64_storage.rs"]
 mod storage;
 
-// JavaScript slots are owned PackedValues; C ABI stack alignment is independent.
+// JavaScript slots are owned Values; C ABI stack alignment is independent.
 const SLOT_BYTES: i32 = 8;
 
 // Register numbers and condition codes of the register-generic forms (`Asm::nr_*`).
@@ -1003,7 +1003,7 @@ pub(super) fn compile_entry(
         }
         match op {
             Op::Const(k) if chunk.jit_const_copyable(*k) => {
-                a.mov_word_imm(chunk.jit_const_packed_bits(*k)?);
+                a.mov_word_imm(chunk.jit_const_scalar_bits(*k)?);
                 a.store_word_r13(0);
                 a.add_sp(8);
             }
@@ -1407,7 +1407,7 @@ mod tests {
     }
 
     fn assert_native_code(engine: &mut Engine, name: &str, expected: bool) {
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let ValueView::Obj(object) = (engine
             .interp
             .get_var(name, &env)

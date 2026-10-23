@@ -49,7 +49,7 @@ impl Interp {
         {
             return Ok(false);
         }
-        let mut prototype = object.borrow().proto.clone();
+        let mut prototype = object.borrow().proto;
         while let Some(current) = prototype {
             let current = current.borrow();
             if !current.ic_plain.get() {
@@ -58,12 +58,12 @@ impl Interp {
             if current.props.contains(key) {
                 return Ok(false);
             }
-            prototype = current.proto.clone();
+            prototype = current.proto;
         }
         if !self.host_named_supported(object, key) {
             return Ok(false);
         }
-        let mut prototype = crate::builtins::js_get_prototype_of(self, &Value::Obj(object.clone()))
+        let mut prototype = crate::builtins::js_get_prototype_of(self, &Value::Obj(*object))
             .map_err(Abrupt::Throw)?;
         while matches!((prototype).view(), ValueView::Obj(_)) {
             if crate::builtins::has_own_property_trapped(self, &prototype, key)
@@ -89,11 +89,11 @@ impl Interp {
             .host_indexed
             .get(&(Gc::as_ptr(object) as usize))
             .and_then(|properties| properties.live.as_ref())
-            .and_then(|live| live.named_getter.clone())
+            .and_then(|live| live.named_getter)
             .expect("named membership requires a getter");
         self.call_callback(
             getter,
-            Value::Obj(object.clone()),
+            Value::Obj(*object),
             &[crate::value::string_key_value(key)],
         )
         .map(Some)

@@ -177,7 +177,6 @@ Options:
 Environment:
   TRUST_JS_TIER=TIER         Default execution tier (--tier overrides it)
   TRUST_JS_TIER_THRESHOLD=N  Default tier-up threshold (--tier-threshold overrides it)
-  TRUST_JS_TAGGED_ARITHMETIC=1  Enable the opt-in tagged Number frame migration slice
                             (arithmetic and comparison operators in the bytecode VM)
 
 Diagnostics (env, unstable):

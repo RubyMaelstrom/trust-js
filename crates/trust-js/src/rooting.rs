@@ -107,7 +107,7 @@ impl Iterator for RootedIntoIter {
     type Item = Value;
     #[inline]
     fn next(&mut self) -> Option<Value> {
-        let value = self.values.get(self.next)?.clone();
+        let value = *self.values.get(self.next)?;
         self.next += 1;
         Some(value)
     }
@@ -193,7 +193,7 @@ impl ValueRoots {
 
     #[inline]
     pub(crate) fn keep(&mut self, value: &Value) {
-        self.values.push(value.clone());
+        self.values.push(*value);
     }
 }
 

@@ -40,7 +40,7 @@ fn local_typeof_literals_avoid_strings_and_use_native_scalar_classification() {
     "#,
     );
     evaluate(&mut engine, "for(var warm=0;warm<64;warm++)scalarTypes(7);");
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let function = engine
         .interp
         .get_var("scalarTypes", &env)
@@ -246,7 +246,7 @@ fn native_void_releases_scalars_and_shared_owners_without_a_general_helper() {
         "function nativeVoid(v){return void v;}nativeVoid(7);",
     );
     evaluate(&mut engine, "for(var warm=0;warm<64;warm++)nativeVoid(7);");
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let ValueView::Obj(object) = (engine
         .interp
         .get_var("nativeVoid", &env)
@@ -297,7 +297,7 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
             0,
             Rc::new(move |i, _, _| {
                 let probe = Probe(count.clone());
-                let object = crate::value::Object::new(Some(i.object_proto.clone()));
+                let object = crate::value::Object::new(Some(i.object_proto));
                 object.borrow_mut().call =
                     crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
                         body: crate::value::NativeCallableBody::Opaque(Rc::new(move |_, _, _| {
@@ -418,7 +418,7 @@ fn in_operator_dense_element_hits_stay_native() {
         &mut engine,
         "for(var warm=0;warm<64;warm++)has(warm&1,[1,2]);",
     );
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let ValueView::Obj(object) = (engine
         .interp
         .get_var("has", &env)

@@ -12,14 +12,13 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn array(engine: &mut Engine, name: &str) -> crate::value::Gc {
-    let global = crate::value::Value::Obj(engine.interp.global.clone());
+    let global = crate::value::Value::Obj(engine.interp.global);
     engine
         .interp
         .get_member_key(&global, name)
         .unwrap_or_else(|_| panic!("{name}"))
         .as_obj()
         .unwrap()
-        .clone()
 }
 
 fn reset_entries() {

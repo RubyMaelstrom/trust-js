@@ -15,7 +15,7 @@ fn run(engine: &mut Engine, source: &str) -> String {
 }
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .get_var(name, &env)
@@ -23,7 +23,6 @@ fn object(engine: &mut Engine, name: &str) -> Gc {
         .unwrap()
         .as_obj()
         .unwrap()
-        .clone()
 }
 
 fn reset_paths() {
@@ -95,7 +94,7 @@ fn prepared_reference_own_refresh_keeps_saved_owner_and_live_descriptor_strictne
         .borrow_mut()
         .props
         .insert("value", Property::plain(Value::Num(3.0)));
-    let mut reference = PreparedReference::object(Rc::from("value"), owner.clone(), false);
+    let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
     reset_paths();
     assert!(matches!(
         (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
@@ -240,7 +239,7 @@ fn prepared_reference_own_numeric_internal_names_never_bypass_mapped_arguments()
     let owner = object(&mut engine, "owner");
     let pointer = Gc::as_ptr(&owner) as usize;
     assert!(engine.interp.mapped_arguments.contains_key(&pointer));
-    let mut reference = PreparedReference::object(Rc::from("0"), owner.clone(), false);
+    let mut reference = PreparedReference::object(Rc::from("0"), owner, false);
     // Simulate a previously published ordinary shape hint: owner kind must still be checked.
     reference.shape = owner.borrow().props.shape();
     reference.slot = owner.borrow().props.slot_of("0").unwrap_or(usize::MAX);
@@ -289,7 +288,7 @@ fn prepared_reference_own_exotic_host_and_exhausted_shapes_withdraw_hints() {
         .borrow_mut()
         .props
         .insert("value", Property::plain(Value::Num(9.0)));
-    let mut reference = PreparedReference::object(Rc::from("value"), owner.clone(), false);
+    let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
     assert!(engine
         .interp
         .refresh_reference_own_data_hint(&mut reference));
@@ -352,7 +351,7 @@ fn prepared_reference_own_values_and_last_owner_survive_gc_without_reboxing_chan
         owner
             .borrow_mut()
             .props
-            .insert("value", Property::plain(value.clone()));
+            .insert("value", Property::plain(value));
         let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
         reset_paths();
         let actual = engine
@@ -363,7 +362,7 @@ fn prepared_reference_own_values_and_last_owner_survive_gc_without_reboxing_chan
         assert!(crate::builtins::same_value_pub(&actual, &value));
         assert!(engine
             .interp
-            .write_prepared_reference(&mut reference, value.clone())
+            .write_prepared_reference(&mut reference, value)
             .is_ok());
         engine.interp.gc_collect();
         assert!(crate::builtins::same_value_pub(

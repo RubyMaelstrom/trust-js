@@ -7,17 +7,13 @@ fn operand_owner_loop(i: &mut Interp) -> (Rc<Chunk>, Value) {
             .ok()
             .expect("metadata fixture parses");
     let mut chunk = compile_script(&body, false).expect("metadata fixture compiles");
-    let owner = Value::Obj(crate::value::Object::new(Some(i.object_proto.clone())));
+    let owner = Value::Obj(crate::value::Object::new(Some(i.object_proto)));
     chunk = Chunk::rewrite_owned_for_test(chunk, |raw| {
         // Keep one owned operand below the loop condition. Every map must retain it;
         // the conditional edge has already popped its boolean before OSR admission.
         let base = raw.consts.len() as u32;
-        raw.consts.extend([
-            owner.clone(),
-            Value::Num(0.0),
-            Value::Num(2000.0),
-            Value::Num(1.0),
-        ]);
+        raw.consts
+            .extend([owner, Value::Num(0.0), Value::Num(2000.0), Value::Num(1.0)]);
         assert!(raw.ops.len() >= 13); // existing feedback/caches cover these PCs
         raw.ops = vec![
             Op::Const(base),
@@ -64,7 +60,7 @@ fn osr_preserves_nonempty_operand_prefix_and_rejects_wrong_initial_depth() {
         chunk.jit.get().is_none(),
         "ordinary CallIc cache remains separate"
     );
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     crate::jit::TEST_OSR_ENTRIES.with(|count| count.set(0));
     let result = run_tiered_script(&mut engine.interp, &chunk, &env, Value::Undefined)
         .ok()
@@ -144,7 +140,7 @@ fn osr_entry_operand_prefix_is_a_root() {
         raw.jit_needs_activation_state = raw.ops.iter().any(jit_bridge_op);
         raw.has_tail_calls = false;
     });
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     crate::jit::TEST_OSR_ENTRIES.with(|count| count.set(0));
     // The result's handle lives only in this helper frame (the collector scans the stack).
     let tag = crate::gc_test::in_frame(|| {
@@ -195,7 +191,7 @@ fn osr_compile_unavailable_keeps_exact_baseline_state_without_replay() {
     assert!(state.code(&mut engine.interp, &chunk).is_none());
     assert!(state.unavailable());
     chunk = Chunk::rewrite_owned_for_test(chunk, |chunk| chunk.resumable = false);
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     crate::jit::TEST_OSR_ENTRIES.with(|count| count.set(0));
     let result = run_tiered_script(&mut engine.interp, &chunk, &env, Value::Undefined)
         .ok()

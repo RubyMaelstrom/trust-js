@@ -41,7 +41,7 @@ fn arg(args: &[Value], i: usize) -> Value {
 
 /// Install `Intl` and its services on the global object.
 pub fn install(it: &mut Interp) {
-    let intl = Object::new(Some(it.object_proto.clone()));
+    let intl = Object::new(Some(it.object_proto));
 
     // Intl[@@toStringTag] = "Intl" { writable:false, enumerable:false, configurable:true }.
     if let Some(key) = crate::builtins::to_string_tag_key(it) {
@@ -132,7 +132,7 @@ pub(crate) fn canonicalize_locale_list(
         _ => {
             // CanonicalizeLocaleList does ToObject(locales) first, so a primitive (number, boolean,
             // symbol) is boxed and its inherited `length`/indexed properties are read.
-            let obj = crate::builtins::box_primitive_pub(i, locales.clone());
+            let obj = crate::builtins::box_primitive_pub(i, *locales);
             let lenv = ab(i.get_member_key(&obj, "length"))?;
             let len = to_length(i, &lenv)?;
             for k in 0..len {
@@ -276,28 +276,26 @@ pub(crate) fn make_service(
     len: usize,
     ctor_fn: crate::value::NativeFn,
 ) -> (Gc, Gc) {
-    let proto = Object::new(Some(it.object_proto.clone()));
+    let proto = Object::new(Some(it.object_proto));
     let ctor = it.make_native(name, len, ctor_fn);
     ctor.borrow_mut().is_constructor = true;
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     if let Some(key) = crate::builtins::to_string_tag_key(it) {
         proto.borrow_mut().props.insert(
             key,
             Property::data(Value::lstr(format!("Intl.{name}")), false, false, true),
         );
     }
-    Rc::make_mut(&mut it.extra_protos).insert(
-        crate::builtins::static_name(&format!("Intl.{name}")),
-        proto.clone(),
-    );
-    set_builtin(ns, name, Value::Obj(ctor.clone()));
+    Rc::make_mut(&mut it.extra_protos)
+        .insert(crate::builtins::static_name(&format!("Intl.{name}")), proto);
+    set_builtin(ns, name, Value::Obj(ctor));
     (ctor, proto)
 }
 
@@ -311,7 +309,7 @@ pub(crate) fn brand_slot_legacy(
 ) -> Result<Gc, Value> {
     if let Some(o) = this.as_obj() {
         if o.borrow().internal_slots().contains(marker) {
-            return Ok(o.clone());
+            return Ok(o);
         }
         let symv = i
             .extra_protos
@@ -323,7 +321,7 @@ pub(crate) fn brand_slot_legacy(
                 let v = ab(i.get_member_key(this, &key))?;
                 if let Some(inner) = v.as_obj() {
                     if inner.borrow().internal_slots().contains(marker) {
-                        return Ok(inner.clone());
+                        return Ok(inner);
                     }
                 }
             }
@@ -335,17 +333,17 @@ pub(crate) fn brand_slot_legacy(
 /// Whether `o` inherits from the service prototype registered under `proto_key`.
 fn inherits_service_proto(i: &Interp, o: &Gc, proto_key: &str) -> bool {
     let proto = match i.extra_protos.get(proto_key) {
-        Some(p) => p.clone(),
+        Some(p) => *p,
         None => return false,
     };
-    let mut cur = o.borrow().proto.clone();
+    let mut cur = o.borrow().proto;
     for _ in 0..64 {
         match cur {
             Some(p) => {
                 if Gc::ptr_eq(&p, &proto) {
                     return true;
                 }
-                cur = p.borrow().proto.clone();
+                cur = p.borrow().proto;
             }
             None => break,
         }
@@ -377,9 +375,9 @@ pub(crate) fn legacy_chain(
         Some(ValueView::Sym(sd)) => {
             this_o.borrow_mut().props.insert(
                 crate::interpreter::Interp::sym_key(&sd),
-                Property::data(Value::Obj(instance.clone()), false, false, false),
+                Property::data(Value::Obj(*instance), false, false, false),
             );
-            Some(this.clone())
+            Some(*this)
         }
         _ => None,
     }
@@ -409,10 +407,10 @@ pub(crate) fn coerce_options(i: &mut Interp, options: &Value) -> Result<Value, V
         // CoerceOptionsToObject(undefined) = OrdinaryObjectCreate(null): a null-prototype object, so
         // option reads never observe Object.prototype pollution.
         ValueView::Undefined => Ok(Value::Obj(Object::new(None))),
-        ValueView::Obj(_) => Ok(options.clone()),
+        ValueView::Obj(_) => Ok(*options),
         ValueView::Null => Err(i.make_error("TypeError", "options cannot be null")),
         // CoerceOptionsToObject: a primitive is ToObject-boxed (so inherited properties are read).
-        _ => Ok(crate::builtins::box_primitive_pub(i, options.clone())),
+        _ => Ok(crate::builtins::box_primitive_pub(i, *options)),
     }
 }
 
@@ -421,7 +419,7 @@ pub(crate) fn coerce_options(i: &mut Interp, options: &Value) -> Result<Value, V
 pub(crate) fn get_options_object(i: &mut Interp, options: &Value) -> Result<Value, Value> {
     match &(options).view() {
         ValueView::Undefined => Ok(Value::Obj(Object::new(None))),
-        ValueView::Obj(_) => Ok(options.clone()),
+        ValueView::Obj(_) => Ok(*options),
         _ => Err(i.make_error("TypeError", "options must be an object or undefined")),
     }
 }
@@ -447,7 +445,7 @@ pub(crate) fn def_getter(it: &mut Interp, proto: &Gc, name: &str, f: crate::valu
 #[allow(dead_code)]
 pub(crate) fn tag_of_str(v: &Value) -> Option<Rc<str>> {
     match &(v).view() {
-        ValueView::Str(s) => Some(s.clone().into()),
+        ValueView::Str(s) => Some((*s).into()),
         _ => None,
     }
 }

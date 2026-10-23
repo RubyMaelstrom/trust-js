@@ -41,7 +41,7 @@ pub(super) fn install_map_methods(it: &mut Interp) {
             return Ok(value);
         }
         let value = arg(a, 1);
-        collection_set(i, &map, key, value.clone());
+        collection_set(i, &map, key, value);
         Ok(value)
     });
     it.def_method(&mp, "getOrInsertComputed", 2, |i, this, a| {
@@ -57,7 +57,7 @@ pub(super) fn install_map_methods(it: &mut Interp) {
         }
         let value = ab(i.call(cb, Value::Undefined, std::slice::from_ref(&key)))?;
         // The callback may have inserted the key; the computed value overwrites that mutation.
-        collection_set(i, &map, key, value.clone());
+        collection_set(i, &map, key, value);
         Ok(value)
     });
 }
@@ -73,7 +73,7 @@ fn set_values(i: &mut Interp, this: &Value) -> Result<crate::rooting::RootedVec,
         i.collection(&set)
             .expect("brand-checked Set")
             .iter()
-            .map(|(key, _)| key.clone()),
+            .map(|(key, _)| *key),
     );
     Ok(values)
 }
@@ -165,7 +165,7 @@ fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
     );
     for value in values {
         let value = canonicalize_map_key(value);
-        collection_set(i, &obj, value.clone(), value);
+        collection_set(i, &obj, value, value);
     }
     Value::Obj(obj)
 }
@@ -200,12 +200,12 @@ fn set_record(i: &mut Interp, other: &Value) -> Result<(Value, Value, f64), Valu
     Ok((has, keys, int_size))
 }
 fn set_like_has(i: &mut Interp, has: &Value, other: &Value, v: &Value) -> Result<bool, Value> {
-    let r = ab(i.call(has.clone(), other.clone(), std::slice::from_ref(v)))?;
+    let r = ab(i.call(*has, *other, std::slice::from_ref(v)))?;
     Ok(i.to_boolean(&r))
 }
 /// Open a set-like's keys iterator record: `(iterator, nextMethod)`.
 fn set_like_open(i: &mut Interp, keys: &Value, other: &Value) -> Result<(Value, Value), Value> {
-    let iter = ab(i.call(keys.clone(), other.clone(), &[]))?;
+    let iter = ab(i.call(*keys, *other, &[]))?;
     if !matches!((iter).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "set-like keys did not return an object"));
     }
@@ -216,7 +216,7 @@ fn set_like_open(i: &mut Interp, keys: &Value, other: &Value) -> Result<(Value, 
 
 /// Step a set-like keys iterator: `Some(value)` or `None` when done. `-0` is canonicalized to `+0`.
 fn set_like_next(i: &mut Interp, iter: &Value, next: &Value) -> Result<Option<Value>, Value> {
-    let r = ab(i.call(next.clone(), iter.clone(), &[]))?;
+    let r = ab(i.call(*next, *iter, &[]))?;
     if !matches!((r).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "iterator result is not an object"));
     }
@@ -305,16 +305,13 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             // scan per key. The result snapshot precedes GetIteratorFromMethod, per the standard.
             let mut result = OrderedCollection::with_capacity(CollectionKind::Set, vals.len());
             for value in vals.iter() {
-                result.insert(value.clone(), value.clone());
+                result.insert(*value, *value);
             }
             let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
             while let Some(key) = set_like_next(i, &iter, &next)? {
                 result.delete(&key);
             }
-            Ok(new_set(
-                i,
-                result.iter().map(|(key, _)| key.clone()).collect(),
-            ))
+            Ok(new_set(i, result.iter().map(|(key, _)| *key).collect()))
         }
     });
     it.def_method(&sp, "symmetricDifference", 1, |i, this, a| {
@@ -464,7 +461,7 @@ fn collection_ctor(
             let (iter, next) = ab(i.get_iterator(src))?;
             while let Some(item) = step_iter_with(i, &iter, &next)? {
                 let step = if is_set {
-                    i.call(add_fn.clone(), mv.clone(), &[item])
+                    i.call(add_fn, mv, &[item])
                 } else if !matches!((item).view(), ValueView::Obj(_)) {
                     Err(crate::interpreter::Abrupt::Throw(i.make_error(
                         "TypeError",
@@ -473,7 +470,7 @@ fn collection_ctor(
                 } else {
                     i.get_member_key(&item, "0")
                         .and_then(|k| i.get_member_key(&item, "1").map(|v| (k, v)))
-                        .and_then(|(k, v)| i.call(add_fn.clone(), mv.clone(), &[k, v]))
+                        .and_then(|(k, v)| i.call(add_fn, mv, &[k, v]))
                 };
                 if let Err(e) = step {
                     i.iterator_close(&iter);
@@ -557,7 +554,7 @@ fn canonicalize_map_key(k: Value) -> Value {
 
 pub(crate) fn map_get(i: &mut Interp, map: &Value, key: &Value) -> Result<Value, Value> {
     let map = coll_obj_kind(i, map, Some("Map"))?;
-    let key = canonicalize_map_key(key.clone());
+    let key = canonicalize_map_key(*key);
     Ok(collection_get(i, &map, &key).unwrap_or(Value::Undefined))
 }
 
@@ -574,8 +571,8 @@ pub(super) fn install_map_like(
     is_set: bool,
     ctor_fn: NativeFn,
 ) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert(name, proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert(name, proto);
 
     let adder: NativeFn = if is_set { nf_set_add } else { nf_map_set };
     it.def_method(
@@ -651,7 +648,7 @@ pub(super) fn install_map_like(
         Property::accessor_prop(Some(Value::Obj(size_getter)), None, false, true),
     );
     // @@iterator: Set -> values, Map -> entries.
-    if let Some(sym) = it.iterator_sym.clone() {
+    if let Some(sym) = it.iterator_sym {
         let default = if is_set { "values" } else { "entries" };
         let f = proto
             .borrow()
@@ -668,12 +665,12 @@ pub(super) fn install_map_like(
     let ctor = it.make_native(name, 0, ctor_fn);
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     if !is_set {
         // Map.groupBy(items, cb) -> a Map of key -> [items...].
         it.def_method(&ctor, "groupBy", 2, |i, _t, a| {
@@ -762,7 +759,7 @@ pub(crate) fn weak_map_get(i: &mut Interp, map: &Value, key: &Value) -> Result<V
     let ptr = weak_brand_ptr(i, map, CollectionKind::Map)?;
     Ok(weak_entry_index(i, ptr, key)
         .and_then(|index| i.weak_collection_data.get(&ptr)?.get(index))
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| *value)
         .unwrap_or(Value::Undefined))
 }
 
@@ -801,8 +798,8 @@ fn weak_delete(i: &mut Interp, ptr: usize, key: &Value) -> bool {
 }
 
 pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ctor_fn: NativeFn) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert(name, proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert(name, proto);
     let adder: NativeFn = if is_set {
         nf_weak_set_add
     } else {
@@ -824,10 +821,10 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
                 return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
             }
             if let Some(index) = weak_entry_index(i, ptr, &key) {
-                return Ok(i.weak_collection_data[&ptr][index].1.clone());
+                return Ok(i.weak_collection_data[&ptr][index].1);
             }
             let value = arg(a, 1);
-            weak_insert(i, ptr, key, value.clone());
+            weak_insert(i, ptr, key, value);
             Ok(value)
         });
         it.def_method(&proto, "getOrInsertComputed", 2, |i, this, a| {
@@ -841,11 +838,11 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
                 return Err(i.make_error("TypeError", "callback is not callable"));
             }
             if let Some(index) = weak_entry_index(i, ptr, &key) {
-                return Ok(i.weak_collection_data[&ptr][index].1.clone());
+                return Ok(i.weak_collection_data[&ptr][index].1);
             }
             let value = ab(i.call(cb, Value::Undefined, std::slice::from_ref(&key)))?;
             // The callback may have inserted the key; the computed value overwrites that mutation.
-            weak_insert(i, ptr, key, value.clone());
+            weak_insert(i, ptr, key, value);
             Ok(value)
         });
     }
@@ -864,12 +861,12 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
     let ctor = it.make_native(name, 0, ctor_fn);
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     set_to_string_tag(it, &proto, name);
     set_builtin(&it.global, name, Value::Obj(ctor));
 }
@@ -974,7 +971,7 @@ pub(crate) fn nf_map_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<
 pub(crate) fn nf_set_add(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     let set = coll_obj_kind(i, &this, Some("Set"))?;
     let key = canonicalize_map_key(arg(a, 0));
-    collection_set(i, &set, key.clone(), key);
+    collection_set(i, &set, key, key);
     Ok(this)
 }
 
@@ -1011,7 +1008,7 @@ pub(crate) fn nf_weak_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Resul
         .and_then(|identity| index.entries.get(&identity).copied());
     Ok(entry
         .and_then(|entry| i.weak_collection_data.get(&ptr)?.get(entry))
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| *value)
         .unwrap_or(Value::Undefined))
 }
 

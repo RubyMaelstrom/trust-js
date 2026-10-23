@@ -45,7 +45,7 @@ fn host_units(it: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value>
 }
 
 fn install(it: &mut Interp) {
-    let global = it.global.clone();
+    let global = it.global;
     it.def_method(&global, "hostText", 1, host_text);
     it.def_method(&global, "hostRead", 1, host_read);
     it.def_method(&global, "hostUnits", 1, host_units);

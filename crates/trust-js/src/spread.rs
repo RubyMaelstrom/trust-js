@@ -454,7 +454,7 @@ mod tests {
                 "var reads=0,src={{[Symbol.iterator](){{return {{next(){{reads++;{body}}}}};}}}};"
             ),
             );
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let source = engine.interp.get_var("src", &env).ok().unwrap();
             let (iterator, next) = engine.interp.get_iterator(&source).ok().unwrap();
             let mut actual_done = false;
@@ -481,7 +481,7 @@ mod tests {
             "#
                 ),
             );
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let src = engine.interp.get_var("src", &env).ok().unwrap();
             let mut output = Vec::new();
             let completion = engine.interp.expand_spread_bounded(&src, 2, 4, |_, value| {

@@ -10,7 +10,7 @@ fn value(engine: &mut Engine, source: &str) -> String {
 }
 
 fn function(engine: &mut Engine, name: &str) -> std::rc::Rc<crate::ast::Function> {
-    let environment = engine.interp.global_env.clone();
+    let environment = engine.interp.global_env;
     let value = engine.interp.get_var(name, &environment).ok().unwrap();
     let object = value.as_obj().unwrap();
     let crate::value::Callable::User(user) = &object.borrow().call else {
@@ -514,7 +514,7 @@ fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
                     }
                 }
             }
-            let global = i.global_env.clone();
+            let global = i.global_env;
             if let Ok(hot) = i.get_var("hot", &global) {
                 if let Some(hot) = hot.as_obj() {
                     let hot = hot.borrow();
@@ -616,10 +616,10 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
     let i = &mut *engine.interp;
     set_global(i, "marker", Value::str("main"));
     let child = i.create_realm();
-    set_global(i, "childRealm", child.clone());
+    set_global(i, "childRealm", child);
     let callee = in_realm(i, &child, |i| {
         eval_string(i, "globalThis.marker='child';globalThis.inner=function(){'use strict';return [marker];};globalThis.hot=function(){'use strict';const out=inner();return out;};");
-        let global = i.global_env.clone();
+        let global = i.global_env;
         i.get_var("hot", &global)
             .unwrap_or_else(|_| panic!("child hot function"))
     });
@@ -627,7 +627,7 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
         // The parent Realm initiates this generic call. Realm activation must precede
         // both the promotion proof and the selected native body's literal allocation.
         let out = i
-            .call(callee.clone(), Value::Undefined, &[])
+            .call(callee, Value::Undefined, &[])
             .unwrap_or_else(|_| panic!("child call completes"));
         set_global(i, "last", out);
         assert_eq!(

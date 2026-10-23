@@ -89,7 +89,7 @@ fn prepared_reference_does_not_read_or_reject_binding_during_capture() {
 #[test]
 fn prepared_reference_captures_strictness_and_survives_generation_exhaustion() {
     let mut engine = Engine::new();
-    let scope = new_scope(Some(engine.interp.global_env.clone()));
+    let scope = new_scope(Some(engine.interp.global_env));
     scope
         .borrow_mut()
         .vars
@@ -153,7 +153,7 @@ fn prepared_reference_imports_are_live_and_never_mutable_address_hints() {
         .insert("source", Binding::data(Value::Num(7.0), true, true));
     let importer = new_scope(None);
     let mut binding = Binding::data(Value::Undefined, false, true);
-    binding.set_import_reference(Some((exporter.clone(), "source".into())));
+    binding.set_import_reference(Some((exporter, "source".into())));
     importer.borrow_mut().vars.insert("alias", binding);
     let mut reference = engine
         .interp
@@ -223,11 +223,7 @@ fn prepared_reference_slot_reports_its_reference_and_releases_a_replaced_one() {
             .borrow_mut()
             .vars
             .insert("x", Binding::data(Value::Num(1.0), true, true));
-        slot.set(PreparedReference::scope(
-            Rc::from("x"),
-            scope.clone(),
-            false,
-        ));
+        slot.set(PreparedReference::scope(Rc::from("x"), scope, false));
         Env::downgrade(&scope)
     });
     let next_weak = crate::gc_test::in_frame(|| {
@@ -235,7 +231,7 @@ fn prepared_reference_slot_reports_its_reference_and_releases_a_replaced_one() {
         next.borrow_mut()
             .vars
             .insert("x", Binding::data(Value::Num(2.0), true, true));
-        slot.set(PreparedReference::scope(Rc::from("x"), next.clone(), true));
+        slot.set(PreparedReference::scope(Rc::from("x"), next, true));
         Env::downgrade(&next)
     });
     engine.interp.gc_collect();

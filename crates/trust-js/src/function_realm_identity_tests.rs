@@ -30,7 +30,7 @@ fn function_realm_identity_survives_host_environment_and_prototype_changes() {
         );
         let foreign = engine.interp.create_realm();
         set_global(&mut engine.interp, "foreign", foreign);
-        let previous_environment = engine.interp.global_env.clone();
+        let previous_environment = engine.interp.global_env;
         engine.interp.switch_host_job_context(42);
         assert!(!crate::interpreter::Env::ptr_eq(
             &previous_environment,
@@ -54,7 +54,7 @@ fn function_realm_identity_survives_host_environment_and_prototype_changes() {
                 $262.gc();
             "#,
         );
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let owner = engine
             .interp
             .get_var("OwnerCtor", &env)

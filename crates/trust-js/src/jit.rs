@@ -36,7 +36,7 @@ use crate::bytecode::Chunk;
 use crate::bytecode::UpdKind;
 use crate::execution_storage::SlotAccess;
 use crate::interpreter::{Abrupt, Env, Interp};
-use crate::value::{PackedValue, Value};
+use crate::value::Value;
 
 #[cfg(all(
     target_arch = "aarch64",
@@ -1464,7 +1464,7 @@ mod executable_code_budget_tests {
         engine
             .eval("function hot(value) { return value + 1; }", false)
             .unwrap();
-        let global = Value::Obj(engine.interp.global.clone());
+        let global = Value::Obj(engine.interp.global);
         let function = engine
             .interp
             .get_member_key(&global, "hot")
@@ -1473,7 +1473,7 @@ mod executable_code_budget_tests {
         let held =
             ExecutableCodeReservation::try_new(budget, budget.remaining.load(Relaxed)).unwrap();
         assert!(
-            matches!((engine.interp.call(function.clone(), Value::Undefined, &[Value::Num(41.0)])).map(|__value| (__value).view()),
+            matches!((engine.interp.call(function, Value::Undefined, &[Value::Num(41.0)])).map(|__value| (__value).view()),
             Ok(ValueView::Num(value)) if value == 42.0)
         );
         let ValueView::Obj(object) = &(function).view() else {
@@ -1498,7 +1498,7 @@ mod executable_code_budget_tests {
         let denials = budget.denials.load(Relaxed);
         for _ in 0..32 {
             assert!(
-                matches!((engine.interp.call(function.clone(), Value::Undefined, &[Value::Num(41.0)])).map(|__value| (__value).view()),
+                matches!((engine.interp.call(function, Value::Undefined, &[Value::Num(41.0)])).map(|__value| (__value).view()),
                 Ok(ValueView::Num(value)) if value == 42.0)
             );
         }
@@ -1741,11 +1741,11 @@ pub struct JitCtx {
     pub helpers: *const usize,
     /// [8] Operand-stack base; the JIT keeps the live top in a register and stores it back here
     /// on every exit path.
-    pub stack_base: *mut PackedValue,
+    pub stack_base: *mut Value,
     /// [16] Final stack top, written by the epilogues (for leftover-value cleanup on throw).
-    pub final_sp: *mut PackedValue,
+    pub final_sp: *mut Value,
     /// [24] Local slots base (the inline LoadLocal/StoreLocal templates index off this).
-    pub slots: *mut Cell<PackedValue>,
+    pub slots: *mut Cell<Value>,
     /// [32] Points at `Interp::inline_ic_safe` (a `Cell<bool>` byte): raw prototype-walk
     /// templates read it live and fall to the helper after a Proxy is created.
     pub inline_ic_safe: *const u8,
@@ -1755,7 +1755,7 @@ pub struct JitCtx {
     /// [48] The activation's `this` itself, as a packed word that owns nothing. Generated code
     /// chooses its LoadThis, receiver, direct-call and finish-stub forms for it; Rust reads and
     /// writes it through the `this` accessors below.
-    pub(crate) this_word: PackedValue,
+    pub(crate) this_word: Value,
     /// [56] The current realm's global `Object` (inside its cell's RefCell): the LoadName
     /// templates' global-mode path validates the cached shape/slot against it.
     pub global_body: *const u8,
@@ -1778,7 +1778,7 @@ pub struct JitCtx {
     pub error: Option<Abrupt>,
     /// Owned native return slot. Vacant is the complete PACK_UNDEFINED word, never a
     /// zero tag byte; direct calls move it back to the packed operand stack unchanged.
-    pub ret: PackedValue,
+    pub ret: Value,
     /// Parent of `env_raw` as an `Env::as_ptr`, or null. Depth-1 free-name caches use this to
     /// validate a fresh activation without baking that per-call allocation's identity.
     pub env_parent_raw: *const u8,
@@ -1812,49 +1812,17 @@ pub struct JitCtx {
     pub accessor_slot: u32,
 }
 
-/// `this` as the moved JIT entries (`run_moved` and its forms) take it and a [`JitCtx`] holds
-/// it: the packed word.
-pub(crate) type JitThis = PackedValue;
-
-/// An activation's `this` copied for a borrowed VM bridge (see [`JitCtx::this_view`]).
-/// Holding its word separately lets the bridge also borrow the context's mutable fields.
-pub(crate) struct JitThisView {
-    this: PackedValue,
-}
-
-impl std::ops::Deref for JitThisView {
-    type Target = PackedValue;
-
-    #[inline]
-    fn deref(&self) -> &PackedValue {
-        &self.this
-    }
-}
-
 // The activation's `this`. Rust reads and writes it only here.
 impl JitCtx {
     /// The activation's `this` as a canonical execution Value.
     #[inline]
     pub(crate) fn this_value(&self) -> Value {
-        self.this_word.unpack()
-    }
-
-    /// Copy the activation's existing word without borrowing the context.
-    #[inline]
-    pub(crate) fn this_view(&self) -> JitThisView {
-        JitThisView {
-            this: self.this_word,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn this_word(&self) -> PackedValue {
         self.this_word
     }
 
-    /// Install the activation's `this`; the previous word owns nothing, so nothing is released.
+    /// Install the activation's receiver snapshot.
     #[inline]
-    pub(crate) fn set_this(&mut self, this: JitThis) {
+    pub(crate) fn set_this(&mut self, this: Value) {
         self.this_word = this;
     }
 
@@ -1862,21 +1830,21 @@ impl JitCtx {
     /// complete Undefined word.
     #[inline]
     pub(crate) fn clear_this(&mut self) {
-        self.this_word = PackedValue::pack(Value::Undefined);
+        self.this_word = Value::Undefined;
     }
 }
 
 impl JitCtx {
     #[inline]
-    pub(crate) fn take_ret(&mut self) -> PackedValue {
-        std::mem::replace(&mut self.ret, PackedValue::pack(Value::Undefined))
+    pub(crate) fn take_ret(&mut self) -> Value {
+        std::mem::replace(&mut self.ret, Value::Undefined)
     }
 
     /// Clone one local without changing the representation of the rest of the frame.
     /// A runtime miss for one operation must not copy every local in a large function.
     pub(crate) unsafe fn clone_slot(&self, slot: usize) -> Value {
         debug_assert!(slot < self.n_slots);
-        unsafe { (*self.slots.add(slot)).get().unpack() }
+        unsafe { (*self.slots.add(slot)).get() }
     }
 }
 
@@ -2551,7 +2519,7 @@ mod layout_asserts {
     // [48]: the 8-byte packed `this` word.
     const _: () = assert!(
         std::mem::offset_of!(JitCtx, this_word) == 48
-            && std::mem::size_of::<crate::value::PackedValue>() == 8
+            && std::mem::size_of::<crate::value::Value>() == 8
     );
     const _: () = assert!(std::mem::offset_of!(JitCtx, global_body) == 56);
     const _: () = assert!(std::mem::offset_of!(JitCtx, genv) == 64);
@@ -2591,7 +2559,7 @@ mod layout_asserts {
 /// Two-register return for helpers that produce (new sp, flag) — x0/x1 under the C ABI.
 #[repr(C)]
 pub struct SpFlag {
-    pub sp: *mut PackedValue,
+    pub sp: *mut Value,
     pub flag: u64,
 }
 
@@ -8005,11 +7973,11 @@ mod direct_call_tests {
     use crate::value::ValueView;
     #[test]
     fn computed_method_native_probe_reads_live_values_and_preserves_owners() {
-        use crate::value::{Object, PackedValue, Property, Value};
+        use crate::value::{Object, Property, Value};
         unsafe extern "C" fn miss(
             ctx: *mut super::JitCtx,
             _pc: u32,
-            sp: *mut PackedValue,
+            sp: *mut Value,
         ) -> super::SpFlag {
             unsafe {
                 *ctx.cast::<usize>() += 1;
@@ -8041,11 +8009,8 @@ mod direct_call_tests {
             .flat_map(u32::to_le_bytes)
             .collect();
         let code = super::ExecutableBuffer::from_bytes(&bytes).unwrap();
-        let entry: unsafe extern "C" fn(
-            *mut usize,
-            *mut PackedValue,
-            *const usize,
-        ) -> *mut PackedValue = unsafe { std::mem::transmute(code.as_ptr()) };
+        let entry: unsafe extern "C" fn(*mut usize, *mut Value, *const usize) -> *mut Value =
+            unsafe { std::mem::transmute(code.as_ptr()) };
         let mut helpers = [0usize; super::N_HELPERS];
         helpers[super::H_GET_METHOD_ELEM] = miss as *const () as usize;
         // Only the activation-relative Interp pointer is read on this no-call hit path.
@@ -8059,29 +8024,26 @@ mod direct_call_tests {
                 .borrow_mut()
                 .props
                 .insert(key.as_str(), Property::plain(Value::Num(17.0)));
-            let mut object = holder.clone();
+            let mut object = holder;
             for _ in 0..depth {
                 object = Object::new(Some(object));
             }
-            let receiver = Value::Obj(object.clone());
+            let receiver = Value::Obj(object);
             assert!(matches!(
                 (engine.interp.get_computed_property(&receiver, &key))
                     .map(|__value| (__value).view()),
                 Ok(ValueView::Num(17.0))
             ));
-            for value in [Value::Num(29.0), Value::Str(key.clone()), receiver.clone()] {
-                holder.borrow_mut().props.set_value(&key, value.clone());
-                let mut operands = [
-                    PackedValue::pack(receiver.clone()),
-                    PackedValue::pack(Value::Str(key.clone())),
-                ];
+            for value in [Value::Num(29.0), Value::Str(key), receiver] {
+                holder.borrow_mut().props.set_value(&key, value);
+                let mut operands = [receiver, (Value::Str(key))];
                 let end = unsafe { operands.as_mut_ptr().add(2) };
                 assert_eq!(
                     unsafe { entry(ctx.as_mut_ptr(), end, helpers.as_ptr()) },
                     end
                 );
                 assert_eq!(ctx[0], 0, "expected a native cache hit, depth {depth}");
-                match (&(operands[1].unpack()).view(), &(value).view()) {
+                match (&(operands[1].clone()).view(), &(value).view()) {
                     (ValueView::Num(a), ValueView::Num(b)) => {
                         assert_eq!(a, b)
                     }
@@ -8109,10 +8071,7 @@ mod direct_call_tests {
                 .set_value(Value::Num(31.0));
             // Same string contents at a different allocation must miss the identity probe.
             let fresh = crate::lstr::LStr::from(key.as_str());
-            let mut operands = [
-                PackedValue::pack(receiver),
-                PackedValue::pack(Value::Str(fresh)),
-            ];
+            let mut operands = [(receiver), (Value::Str(fresh))];
             unsafe {
                 entry(
                     ctx.as_mut_ptr(),
@@ -8136,7 +8095,7 @@ mod direct_call_tests {
                 .props
                 .insert(key.as_str(), Property::plain(Value::Num(n as f64)));
         }
-        let receiver = Value::Obj(holder.clone());
+        let receiver = Value::Obj(holder);
         let initial_mask = engine.interp.computed_reads.mask;
         for key in &keys {
             assert!(engine.interp.get_computed_property(&receiver, key).is_ok());
@@ -8149,10 +8108,7 @@ mod direct_call_tests {
                 .computed_reads
                 .lookup(key.as_ptr() as usize, shape)
                 .is_some();
-            let mut operands = [
-                PackedValue::pack(receiver.clone()),
-                PackedValue::pack(Value::Str(key.clone())),
-            ];
+            let mut operands = [receiver, (Value::Str(*key))];
             let end = unsafe { operands.as_mut_ptr().add(2) };
             assert_eq!(
                 unsafe { entry(ctx.as_mut_ptr(), end, helpers.as_ptr()) },
@@ -8165,17 +8121,14 @@ mod direct_call_tests {
             );
             if cached {
                 assert!(
-                    matches!((operands[1].unpack()).view(), ValueView::Num(value) if value == n as f64)
+                    matches!((operands[1].clone()).view(), ValueView::Num(value) if value == n as f64)
                 );
             }
             ctx[0] = 0;
         }
         for (n, key) in keys.iter().enumerate().take(256) {
             assert!(engine.interp.get_computed_property(&receiver, key).is_ok());
-            let mut operands = [
-                PackedValue::pack(receiver.clone()),
-                PackedValue::pack(Value::Str(key.clone())),
-            ];
+            let mut operands = [receiver, (Value::Str(*key))];
             unsafe {
                 entry(
                     ctx.as_mut_ptr(),
@@ -8185,7 +8138,7 @@ mod direct_call_tests {
             }
             assert_eq!(ctx[0], 0, "a refilled key must hit the grown table");
             assert!(
-                matches!((operands[1].unpack()).view(), ValueView::Num(value) if value == n as f64)
+                matches!((operands[1].clone()).view(), ValueView::Num(value) if value == n as f64)
             );
         }
     }
@@ -11505,7 +11458,7 @@ fn emit_get_elem_inline_marked(
     emit_exec_word_load(a, 9, 20, -16);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
     // 2. key must be exactly a u32 (round-trip compare; NaN/negative/fractional/huge all miss).
-    // Every non-Number word is a NaN pattern (ECMA-262 PackedValue tags), and an unordered
+    // Every non-Number word is a NaN pattern (ECMA-262 Value tags), and an unordered
     // FCMP is "not equal", so this test alone also proves the key is a Number.
     a.ldur_d(0, 20, -8);
     a.fcvtzu_w_d(9, 0);
@@ -11804,7 +11757,7 @@ fn emit_set_elem_inline_marked(
     guard_prop_writable(a, 9, 15, ew, slow);
     // --- commit ---
     // Move v into the entry.
-    emit_packed_stack_encode(a, -8, slow);
+    emit_stack_number_load(a, -8, slow);
     a.stur(16, 15, ev);
     // Keep the element mirror coherent (x9/x12/x13/d0/d1 are dead here; the RHS remains in
     // its canonical stack word and bases in 10/11/15 stay live).
@@ -11878,7 +11831,7 @@ fn emit_packed_element_store(
     guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
     guard_prop_writable(a, 14, 15, layout.property_meta as u32, slow);
     emit_packed_existing_guard(a, layout, 15, slow);
-    emit_packed_stack_encode(a, -8, slow);
+    emit_stack_number_load(a, -8, slow);
     a.stur(16, 15, layout.property_value as i32);
     // The canonical packed property stays authoritative. Hot numeric arrays can also own an
     // f64 mirror; this numeric write preserves it exactly, including -0/NaN.
@@ -12379,7 +12332,7 @@ fn emit_packed_existing_guard(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_packed_stack_encode(a: &mut asm::Asm, off: i32, slow: usize) {
+fn emit_stack_number_load(a: &mut asm::Asm, off: i32, slow: usize) {
     emit_exec_word_load(a, 16, 20, off);
     emit_exec_number_guard(a, 16, 1, 13, slow);
 }
@@ -12589,7 +12542,7 @@ fn emit_elem_local_keyed(
     } else {
         guard_prop_writable(a, 9, 15, ew, slow);
         // --- commit: move v into the entry ---
-        emit_packed_stack_encode(a, -8, slow);
+        emit_stack_number_load(a, -8, slow);
         a.stur(16, 15, ev);
         // Element mirror (x9/x12/x13/d1 dead here; the key f64 survives in d0).
         emit_mirror_store(a, layout, 11, MirrorKey::F64InDreg(0), MirrorVal::Stack(-8));
@@ -12742,7 +12695,7 @@ fn emit_local_own_dense_data_guard(
     guard_prop_data(a, 14, 15, ea, slow);
     a.ldur(12, 15, ev);
     a.bind(entry_ready);
-    // PackedValue's Empty word is the deleted-slot marker, not a language value.
+    // Value's Empty word is the deleted-slot marker, not a language value.
     a.mov_imm64(14, crate::value::PACK_EMPTY);
     a.cmp_reg_x(12, 14);
     a.b_cond(C_EQ, slow);
@@ -12845,7 +12798,7 @@ enum ChainOp {
     /// and the value tag are still checked on every execution.
     LoadProp(u32, crate::bytecode::IcState),
     /// Own writable numeric property store. Receiver encoding matches `LoadProp`; the virtual
-    /// top is consumed and written without materializing a wide stack Value.
+    /// top is consumed and stored in the property value.
     StoreProp(u32, crate::bytecode::IcState),
     /// Terminal fused compare+branch: negated ARM condition + target pc.
     CmpBranch(u32, usize),
@@ -12899,7 +12852,7 @@ fn plan_linked_scan(
         || *back as usize != head
         || (*exit as usize) < end
         || !chunk.jit_const_copyable(*null)
-        || chunk.jit_const_bits(*null) != (2, 0)
+        || chunk.jit_const_scalar_bits(*null) != Some(crate::value::PACK_NULL)
     {
         return None;
     }
@@ -13637,10 +13590,9 @@ fn emit_chain_marked(
                 vregs.push((rd, false));
             }
             ChainOp::LoadProp(off, st) => {
-                // Receiver-direct compact property probe. Unlike the ordinary property
-                // template, a successful read never materializes a wide Value or pushes the
-                // property's word: the numeric payload enters the chain's FP register stack
-                // directly.
+                // Receiver-direct compact property probe. A successful read puts the numeric
+                // payload directly on the chain's FP register stack, without pushing the
+                // property's word onto the operand stack.
                 #[cfg(all(test, target_arch = "aarch64"))]
                 if off == u32::MAX {
                     TEST_THIS_CHAIN_OPS.with(|ops| ops.set(ops.get() + 1));
@@ -17532,9 +17484,9 @@ pub(crate) unsafe fn run_continuation(
     chunk: &Chunk,
     code: &JitCode,
     state: &mut crate::bytecode::NativeContinuation,
-    slots: &[Cell<PackedValue>],
+    slots: &[Cell<Value>],
     pc: &mut usize,
-    this_val: &PackedValue,
+    this_val: &Value,
     handlers: &mut Vec<crate::bytecode::Handler>,
 ) -> Result<crate::bytecode::VmStep, Abrupt> {
     assert!(
@@ -17558,9 +17510,9 @@ pub(crate) unsafe fn run_borrowed_frame(
     chunk: &Chunk,
     code: &JitCode,
     state: &mut crate::bytecode::NativeContinuation,
-    slots: &[Cell<PackedValue>],
+    slots: &[Cell<Value>],
     pc: &mut usize,
-    this_val: &PackedValue,
+    this_val: &Value,
     handlers: &mut Vec<crate::bytecode::Handler>,
     first_transfer: bool,
 ) -> Result<crate::bytecode::VmStep, Abrupt> {
@@ -17601,7 +17553,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         code_base: code.mem,
         pc_offsets: code.pc_offsets.as_ptr(),
         error: None,
-        ret: PackedValue::pack(Value::Undefined),
+        ret: (Value::Undefined),
         env_parent_raw: jit_env_parent_raw(env),
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
@@ -17719,13 +17671,8 @@ pub fn run(
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     let (n_params, n_slots) = chunk.jit_frame();
     let seed = n_params.min(args.len());
-    slots.extend(
-        args[..seed]
-            .iter()
-            .copied()
-            .map(|value| Cell::new(PackedValue::pack(value))),
-    );
-    slots.resize_with(n_slots, || Cell::new(PackedValue::pack(Value::Undefined)));
+    slots.extend(args[..seed].iter().copied().map(Cell::new));
+    slots.resize_with(n_slots, || Cell::new(Value::Undefined));
     if let Some(rest) = chunk.rest_slot {
         let rest_values = args.get(n_params..).unwrap_or(&[]).to_vec();
         slots.write_value(rest as usize, i.make_array(rest_values));
@@ -17744,7 +17691,7 @@ pub fn run(
         stack_base,
         final_sp: stack_base,
         env_raw,
-        this_word: PackedValue::pack(this_val),
+        this_word: (this_val),
         global_body: jit_global_body(i, code),
         genv: Env::as_ptr(&i.global_env) as usize,
         env_parent_raw,
@@ -17771,7 +17718,7 @@ pub fn run(
         code_base: code.mem,
         pc_offsets: code.pc_offsets.as_ptr(),
         error: None,
-        ret: PackedValue::pack(Value::Undefined),
+        ret: (Value::Undefined),
     };
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     // The pooled buffers are this context's roots for the native run (the stack scan
@@ -17801,7 +17748,7 @@ pub fn run(
         i.vm_pool.push((slots, stack));
     }
     if ok == 1 {
-        Ok(ctx.take_ret().into_value())
+        Ok(ctx.take_ret())
     } else {
         Err(ctx.error.take().unwrap_or(Abrupt::Throw(Value::Undefined)))
     }
@@ -17843,7 +17790,7 @@ pub(crate) const FRAME_POOL_LIMIT: usize = 256;
 #[repr(C)]
 pub(crate) struct JitFrame {
     pub(crate) ctx: JitCtx,
-    words: [std::mem::MaybeUninit<Cell<PackedValue>>; FRAME_BUF],
+    words: [std::mem::MaybeUninit<Cell<Value>>; FRAME_BUF],
 }
 
 /// Byte offset of a record's slot storage from the record (and its context) base.
@@ -17866,11 +17813,11 @@ impl JitFrame {
         let mut record = Box::<JitFrame>::new_uninit();
         let base = record.as_mut_ptr();
         let record = unsafe {
-            let slots = std::ptr::addr_of_mut!((*base).words).cast::<Cell<PackedValue>>();
+            let slots = std::ptr::addr_of_mut!((*base).words).cast::<Cell<Value>>();
             // All mixed-buffer words have real UnsafeCell backing. Slot loans are shared
             // Cell slices; the disjoint operand tail is lent as raw inner-word storage only
             // during native execution. No mutable slice is made from either shared loan.
-            let words = slots.cast::<PackedValue>();
+            let words = slots.cast::<Value>();
             // The collector scans an active record's words whole (see `JitFrame`).
             slots.write_bytes(0, FRAME_BUF);
             std::ptr::addr_of_mut!((*base).ctx).write(JitCtx {
@@ -17880,7 +17827,7 @@ impl JitFrame {
                 slots,
                 inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
                 env_raw: std::ptr::null(),
-                this_word: PackedValue::pack(Value::Undefined),
+                this_word: (Value::Undefined),
                 global_body: std::ptr::null(),
                 genv: 0,
                 interp: i as *mut Interp,
@@ -17891,7 +17838,7 @@ impl JitFrame {
                 code_base: std::ptr::null(),
                 pc_offsets: std::ptr::null(),
                 error: None,
-                ret: PackedValue::pack(Value::Undefined),
+                ret: (Value::Undefined),
                 env_parent_raw: std::ptr::null(),
                 opstat_enabled: crate::bytecode::jit_opstat_enabled(),
                 callstat_enabled: crate::bytecode::jit_callstat_enabled(),
@@ -17923,7 +17870,7 @@ impl JitFrame {
         // A throw can escape through open try regions; a pooled record owns no handlers.
         ctx.handlers.clear();
         ctx.handler_floor = 0;
-        // Owned values are released here, not by the next user of the record.
+        // Clear completed context fields before returning this record to the pool.
         ctx.clear_this();
         drop(ctx.take_ret());
         ctx.error = None;
@@ -17965,12 +17912,12 @@ pub(crate) unsafe fn run_moved(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     env: *const Env,
-    this_val: JitThis,
-    args: *const PackedValue,
+    this_val: Value,
+    args: *const Value,
     argc: usize,
     // `chunk.jit_frame()`, precomputed by the caller (the cached call reads it from its IC).
     frame: (usize, usize),
-) -> Result<PackedValue, Abrupt> {
+) -> Result<Value, Abrupt> {
     unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame, None) }
 }
 
@@ -17997,13 +17944,12 @@ pub(crate) unsafe fn run_moved_shared(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     env: *const Env,
-    this_val: JitThis,
-    args: *const PackedValue,
+    this_val: Value,
+    args: *const Value,
     argc: usize,
     frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
     unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame, None) }
-        .map(PackedValue::into_value)
 }
 
 #[cfg(test)]
@@ -18032,21 +17978,19 @@ pub(crate) unsafe fn run_moved_env(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     definition_env: *const Env,
-    this_val: JitThis,
-    args: *const PackedValue,
+    this_val: Value,
+    args: *const Value,
     argc: usize,
     frame: (usize, usize),
-) -> Result<PackedValue, Abrupt> {
+) -> Result<Value, Abrupt> {
     #[cfg(test)]
     TEST_PACKED_ENV_ENTRIES.with(|entries| entries.set(entries.get() + 1));
     let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
-    let activation =
-        chunk.jit_make_run_env_packed(i, unsafe { &*definition_env }, &this_val, args_ref);
+    let activation = chunk.jit_make_run_env(i, unsafe { &*definition_env }, &this_val, args_ref);
     let arguments = chunk.jit_arguments_slot().map(|slot| {
         (
             slot as usize,
-            crate::execution_storage::CallArgs::Packed(args_ref)
-                .with_values(|values| chunk.arguments_slot_value(i, values, &activation)),
+            chunk.arguments_slot_value(i, args_ref, &activation),
         )
     });
     unsafe {
@@ -18079,12 +18023,12 @@ unsafe fn run_moved_inner(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     env: *const Env,
-    this_val: JitThis,
-    args: *const PackedValue,
+    this_val: Value,
+    args: *const Value,
     argc: usize,
     (n_params, n_slots): (usize, usize),
     arguments: Option<(usize, Value)>,
-) -> Result<PackedValue, Abrupt> {
+) -> Result<Value, Abrupt> {
     assert_eq!(
         code.entry_kind,
         NativeEntryKind::FreshFrame,
@@ -18111,31 +18055,25 @@ unsafe fn run_moved_inner(
     let frame = i.frame_pool.pop().unwrap_or_else(|| JitFrame::alloc(i));
     let ctx = unsafe { &mut (*frame.as_ptr()).ctx };
     let slots_ptr = ctx.slots;
-    let stack_base = unsafe { slots_ptr.add(n_slots).cast::<PackedValue>() };
+    let stack_base = unsafe { slots_ptr.add(n_slots).cast::<Value>() };
     unsafe {
-        std::ptr::copy_nonoverlapping(args, slots_ptr.cast::<PackedValue>(), seed);
+        std::ptr::copy_nonoverlapping(args, slots_ptr.cast::<Value>(), seed);
         // A packed Undefined is a complete tagged word, never a zeroed wide discriminant.
         for k in seed..n_slots {
-            slots_ptr
-                .add(k)
-                .write(Cell::new(PackedValue::pack(Value::Undefined)));
+            slots_ptr.add(k).write(Cell::new(Value::Undefined));
         }
         // A rest parameter copies the surplus argument words into its own Array. Without
         // rest, the caller's surplus words stay untouched until it retires the input window.
         if let Some(rest) = chunk.rest_slot {
             let array = i.make_array_from_raw(args.add(seed), argc - seed);
             std::ptr::drop_in_place(slots_ptr.add(rest as usize));
-            slots_ptr
-                .add(rest as usize)
-                .write(Cell::new(PackedValue::pack(array)));
+            slots_ptr.add(rest as usize).write(Cell::new(array));
         }
         if let Some((slot, value)) = arguments {
             if slot < seed {
                 std::ptr::drop_in_place(slots_ptr.add(slot));
             }
-            slots_ptr
-                .add(slot)
-                .write(Cell::new(PackedValue::pack(value)));
+            slots_ptr.add(slot).write(Cell::new(value));
         }
     }
     let env = unsafe { &*env };
@@ -18192,12 +18130,12 @@ unsafe fn run_moved_oversized(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     env: *const Env,
-    this_val: JitThis,
-    args: *const PackedValue,
+    this_val: Value,
+    args: *const Value,
     argc: usize,
     (n_params, n_slots): (usize, usize),
     arguments: Option<(usize, Value)>,
-) -> Result<PackedValue, Abrupt> {
+) -> Result<Value, Abrupt> {
     let seed = n_params.min(argc);
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     slots.reserve(n_slots);
@@ -18205,26 +18143,20 @@ unsafe fn run_moved_oversized(
     stack.reserve(code.max_stack);
     let (slots_ptr, stack_base) = (slots.as_mut_ptr(), stack.as_mut_ptr());
     unsafe {
-        std::ptr::copy_nonoverlapping(args, slots_ptr.cast::<PackedValue>(), seed);
+        std::ptr::copy_nonoverlapping(args, slots_ptr.cast::<Value>(), seed);
         for k in seed..n_slots {
-            slots_ptr
-                .add(k)
-                .write(Cell::new(PackedValue::pack(Value::Undefined)));
+            slots_ptr.add(k).write(Cell::new(Value::Undefined));
         }
         if let Some(rest) = chunk.rest_slot {
             let array = i.make_array_from_raw(args.add(seed), argc - seed);
             std::ptr::drop_in_place(slots_ptr.add(rest as usize));
-            slots_ptr
-                .add(rest as usize)
-                .write(Cell::new(PackedValue::pack(array)));
+            slots_ptr.add(rest as usize).write(Cell::new(array));
         }
         if let Some((slot, value)) = arguments {
             if slot < seed {
                 std::ptr::drop_in_place(slots_ptr.add(slot));
             }
-            slots_ptr
-                .add(slot)
-                .write(Cell::new(PackedValue::pack(value)));
+            slots_ptr.add(slot).write(Cell::new(value));
         }
     }
     let env = unsafe { &*env };
@@ -18260,7 +18192,7 @@ unsafe fn run_moved_oversized(
         code_base: code.mem,
         pc_offsets: code.pc_offsets.as_ptr(),
         error: None,
-        ret: PackedValue::pack(Value::Undefined),
+        ret: (Value::Undefined),
     };
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     // As in `run`. The slot Vec's length stays 0, so its `n_slots` words, all written
@@ -18283,7 +18215,7 @@ unsafe fn run_moved_oversized(
         for k in 0..n_slots {
             std::ptr::drop_in_place(slots_ptr.add(k));
         }
-        // The values were dropped above; the Vec must not double-drop them.
+        // Keep the pooled slot Vec logically empty after this activation.
         slots.set_len(0);
     }
     if i.vm_pool.len() < 64 {
@@ -18333,11 +18265,11 @@ pub(crate) unsafe fn run_moved(
     _chunk: &Rc<Chunk>,
     _code: &JitCode,
     _env: *const Env,
-    _this_val: JitThis,
-    _args: *const PackedValue,
+    _this_val: Value,
+    _args: *const Value,
     _argc: usize,
     _frame: (usize, usize),
-) -> Result<PackedValue, Abrupt> {
+) -> Result<Value, Abrupt> {
     unreachable!("jit code cannot exist on this platform")
 }
 
@@ -18358,8 +18290,8 @@ pub(crate) unsafe fn run_moved_shared(
     _chunk: &Rc<Chunk>,
     _code: &JitCode,
     _env: *const Env,
-    _this_val: JitThis,
-    _args: *const PackedValue,
+    _this_val: Value,
+    _args: *const Value,
     _argc: usize,
     _frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
@@ -18382,11 +18314,11 @@ pub(crate) unsafe fn run_moved_env(
     _chunk: &Rc<Chunk>,
     _code: &JitCode,
     _env: *const Env,
-    _this_val: JitThis,
-    _args: *const PackedValue,
+    _this_val: Value,
+    _args: *const Value,
     _argc: usize,
     _frame: (usize, usize),
-) -> Result<PackedValue, Abrupt> {
+) -> Result<Value, Abrupt> {
     unreachable!("jit code cannot exist on this platform")
 }
 

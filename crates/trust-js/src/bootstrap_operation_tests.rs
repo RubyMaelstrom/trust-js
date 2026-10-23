@@ -188,9 +188,9 @@ fn property_descriptor_objects_follow_the_running_realm() {
         engine.set_tier(tier);
         let it = &mut *engine.interp;
         let child = it.create_realm();
-        set_global(it, "child", child.clone());
-        let main = Value::Obj(it.global.clone());
-        in_realm(it, &child, |it| set_global(it, "main", main.clone()));
+        set_global(it, "child", child);
+        let main = Value::Obj(it.global);
+        in_realm(it, &child, |it| set_global(it, "main", main));
         let result = eval_string(
             it,
             r#"(function () {

@@ -383,7 +383,7 @@ mod api {
 
         /// Entry `index`'s value (`None` once a weak entry's target has died).
         fn value(&self, index: u32) -> Option<crate::value::Value> {
-            self.slots.borrow().entries[index as usize].value.clone()
+            self.slots.borrow().entries[index as usize].value
         }
 
         /// Give entry `index` a new value (`value` is the heap's); recorded.

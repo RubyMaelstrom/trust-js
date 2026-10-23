@@ -408,7 +408,7 @@ impl Interp {
                 if let Some(object) = self.gc_pins.get(&owner) {
                     registry.cleanup_scheduled = true;
                     self.pending_finalization_cleanup
-                        .push_back(Value::Obj(object.clone()));
+                        .push_back(Value::Obj(*object));
                 }
             }
         }
@@ -675,7 +675,7 @@ mod tests {
             let value = Value::Obj(Object::new(None));
             let target = WeakTarget::of(&value).unwrap();
             let owner = reference(&mut engine.interp, &target);
-            engine.interp.kept_alive.push(value.clone());
+            engine.interp.kept_alive.push(value);
             let held = engine.scope(|cx| {
                 crate::handles::WeakHandle::new(cx, &crate::scope::Value::from_internal(value))
                     .expect("a weak handle")

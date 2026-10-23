@@ -153,8 +153,7 @@ fn format(
     set_data(&nf_options, "signDisplay", Value::lstr("never"));
     let number_format = new_service(i, "NumberFormat", &locale, nf_options)?;
     let format = ab(i.get_member_key(&number_format, "format"))?;
-    let formatted = match (ab(i.call(format, number_format.clone(), &[Value::Num(number)]))?).view()
-    {
+    let formatted = match (ab(i.call(format, number_format, &[Value::Num(number)]))?).view() {
         ValueView::Str(value) => value.to_string(),
         _ => magnitude.to_string(),
     };

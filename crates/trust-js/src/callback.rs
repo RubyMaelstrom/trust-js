@@ -8,7 +8,7 @@
 use crate::bytecode::{CallSite, Tier};
 use crate::fasthash::FastMap;
 use crate::interpreter::{Abrupt, Interp, PreparedCall};
-use crate::value::{PackedValue, Value};
+use crate::value::Value;
 use std::cell::{Cell, RefCell};
 
 pub(crate) struct Callback {
@@ -57,13 +57,9 @@ impl Callback {
                 .as_ref()
                 .filter(|prepared| interp.prepared_call_current(prepared))
             {
-                let this = PackedValue::pack(this);
                 // The evaluated array remains immutable and in scope through all nested calls,
                 // post-call polls, and tail drains. Its canonical words need no adapter array.
-                return unsafe {
-                    interp.call_prepared(prepared, &this, args.as_ptr().cast::<PackedValue>(), N)
-                }
-                .map(PackedValue::into_value);
+                return unsafe { interp.call_prepared(prepared, &this, args.as_ptr(), N) };
             }
         }
         let result = self.cache.call(interp, &self.callee, this, args);
@@ -88,7 +84,7 @@ impl Callback {
         if let Some(result) = interp.try_intrinsic_iterator_step(iterator, &self.callee) {
             return result;
         }
-        let result = self.call(interp, iterator.clone(), [])?;
+        let result = self.call(interp, *iterator, [])?;
         interp.iterator_result_value(result)
     }
 }
@@ -125,8 +121,8 @@ impl CallbackCache {
         // seeding its own frame; keep these exact words rooted through both entry paths, any
         // generic fallback, post-call polls and pending tails, without copying the window.
         let _arguments = crate::rooting::root_slice(args);
-        let this_word = PackedValue::pack(this);
-        let words = crate::execution_storage::words_from_values(args);
+        let this_word = this;
+        let words = args;
         // SAFETY: the original evaluated argument window stays borrowed until the committed
         // call (including polls and tails) returns. Nothing mutates or pools it here.
         let result = unsafe {
@@ -480,7 +476,7 @@ mod tests {
         assert!(last_census().records >= 1, "the callee's record");
         // The handles, and the cache entries' raw callee addresses, stay in helper frames.
         let (pin, cache) = crate::gc_test::in_frame(|| {
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let callee = engine
                 .interp
                 .get_var("retained", &env)
@@ -568,7 +564,7 @@ mod tests {
             &mut engine,
             "var callback = x => x.value; callback({value:1});",
         );
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let callee = engine
             .interp
             .get_var("callback", &env)
@@ -618,7 +614,7 @@ mod tests {
             ),
             "2400"
         );
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let value = engine
             .interp
             .get_var("laterHot", &env)
@@ -660,7 +656,7 @@ mod tests {
             ),
             "1000"
         );
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let value = engine
             .interp
             .get_var("arrowHot", &env)

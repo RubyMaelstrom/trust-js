@@ -40,7 +40,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 /// explicit collection zeroes it).
 #[inline(never)]
 fn weak_global(engine: &mut Engine, name: &str) -> WeakGc {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     match (engine.interp.get_var(name, &env)).map(|__value| (__value).view()) {
         Ok(ValueView::Obj(object)) => Gc::downgrade(&object),
         _ => panic!("{name}: not an object"),

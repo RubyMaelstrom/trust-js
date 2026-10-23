@@ -220,7 +220,7 @@ fn hot_script_borrowed_this_is_the_global_environment_this_value() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(32);
-        let wrapper = Object::new(Some(engine.interp.object_proto.clone()));
+        let wrapper = Object::new(Some(engine.interp.object_proto));
         wrapper
             .borrow_mut()
             .props

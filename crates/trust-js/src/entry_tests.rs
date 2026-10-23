@@ -34,7 +34,7 @@ fn check(source: &str, expected: &str, functions: &[(&str, Entry)], native: bool
             continue;
         }
         for &(name, entry) in functions {
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let value = engine
                 .interp
                 .get_var(name, &env)
@@ -392,7 +392,7 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
         );
         // Strong handles live only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let value = engine
                 .interp
                 .get_var("named", &env)
@@ -452,7 +452,7 @@ fn named_expression_unused_self_environment_is_elided_without_changing_identity(
         let enabled = std::env::var("TRUST_JS_ELIDE_SELF_ENV").as_deref() != Ok("0");
         // Strong handles live only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let value = engine
                 .interp
                 .get_var("named", &env)

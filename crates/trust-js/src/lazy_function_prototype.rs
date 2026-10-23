@@ -16,7 +16,7 @@ enum State {
 pub(super) struct LazyFunctionPrototype {
     /// The function whose `prototype` this is, for the materialized prototype's `constructor`.
     /// A lazy word lives only in that function's properties (copying one out of its property
-    /// materializes it: `PropWord::clone_materialized`), so the function is alive whenever
+    /// materializes it: `PropWord::materialize`), so the function is alive whenever
     /// the prototype materializes. A traced edge of this cell ([`trace_cell`]): the function
     /// and its cell form a cycle that dies in one collection, and a stale stack word that
     /// conservatively keeps the cell keeps the function too. A weak handle would allocate a
@@ -57,7 +57,7 @@ impl LazyFunctionPrototype {
         // collection can trace this state while it is borrowed (I9; see `trace_cell`).
         let mut state = self.state.borrow_mut();
         if let State::Materialized(prototype) = &*state {
-            return prototype.clone();
+            return *prototype;
         }
         #[cfg(test)]
         MATERIALIZED.with(|count| count.set(count.get() + 1));
@@ -75,14 +75,14 @@ impl LazyFunctionPrototype {
                 .push(Property::builtin(super::Value::Obj(owner)));
         }
         props.shape = self.shape;
-        let prototype = Object::new_with_parts(Some(parent.clone()), props, Exotic::None);
+        let prototype = Object::new_with_parts(Some(*parent), props, Exotic::None);
         // The write barrier: this cell now names the fresh prototype. No safepoint lies between
         // the card and the store.
         // SAFETY: `self` is the payload of a live deferred-prototype cell (`gc_box::new` moves
         // it in at the cell's start; it is only ever read through its handle), a small cell
         // of a carded kind.
         unsafe { crate::gc_core::card_mark(std::ptr::from_ref(self).cast()) };
-        *state = State::Materialized(prototype.clone());
+        *state = State::Materialized(prototype);
         prototype
     }
 
@@ -161,7 +161,7 @@ mod tests {
     }
 
     fn object(engine: &mut Engine, name: &str) -> Gc {
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let ValueView::Obj(object) = (engine
             .interp
             .get_var(name, &env)
@@ -566,9 +566,9 @@ mod tests {
     }
 
     /// Every read that copies or moves a deferred prototype's word out of its property
-    /// materializes it: `PropWord::clone_materialized`, a descriptor snapshot
-    /// (`Property::clone`), a value snapshot (`Property::clone_value_packed`), `Property::value`
-    /// and a move (`Property::take_value`), each on a function of its own, at every tier. The
+    /// materializes it: `PropWord::materialize`, a descriptor snapshot
+    /// (`Property::clone`), `Property::value` and a move (`Property::take_value`),
+    /// each on a function of its own, at every tier. The
     /// first read materializes the prototype exactly once and yields its object, as an object
     /// word from the word reads, and the property's word is then that object's. A second read,
     /// and a script's read of the property, materialize nothing and yield the same object. Its
@@ -587,18 +587,14 @@ mod tests {
             )
         }
         const MOVE: &str = "Property::take_value";
-        let reads: [(&str, Read); 5] = [
-            ("PropWord::clone_materialized", |function| {
-                let word = property(function, |stored| stored.packed.clone_materialized());
-                (Some(word.tag()), word.into_value())
+        let reads: [(&str, Read); 4] = [
+            ("PropWord::materialize", |function| {
+                let value = property(function, |stored| stored.packed.materialize());
+                (Some(value.tag()), value)
             }),
             ("Property::clone", |function| {
                 let snapshot = property(function, Property::clone);
                 (Some(snapshot.packed.tag()), snapshot.value())
-            }),
-            ("Property::clone_value_packed", |function| {
-                let word = property(function, Property::clone_value_packed);
-                (Some(word.tag()), word.into_value())
             }),
             ("Property::value", |function| {
                 (None, property(function, Property::value))
@@ -688,7 +684,7 @@ mod tests {
         let body = function.borrow();
         let property = body.props.get("prototype").expect("a prototype");
         assert_eq!(property.packed.tag(), PACK_LAZY_PROTO);
-        let _copy = crate::value::PackedValue::from_bits(property.packed.bits());
+        let _copy = unsafe { crate::value::Value::from_bits(property.packed.bits()) };
     }
 
     #[test]

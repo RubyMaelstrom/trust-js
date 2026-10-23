@@ -27,30 +27,21 @@ fn object_alloc_bench() {
     const N: u32 = 5_000_000;
 
     time_per_op("Object::new(proto) + drop", N, |_| {
-        std::hint::black_box(Object::new(Some(proto.clone())));
+        std::hint::black_box(Object::new(Some(proto)));
     });
 
     let mut template = Props::new();
     template.insert(Rc::from("x"), Property::plain(Value::Undefined));
     template.insert(Rc::from("y"), Property::plain(Value::Undefined));
     time_per_op("templated {x,y} + drop", N, |i| {
-        let props = template.instantiate_plain_packed(
-            [
-                crate::value::PackedValue::pack(Value::Num(f64::from(i))),
-                crate::value::PackedValue::pack(Value::Num(1.0)),
-            ]
-            .into_iter(),
-        );
-        std::hint::black_box(Object::new_with_parts(
-            Some(proto.clone()),
-            props,
-            Exotic::None,
-        ));
+        let props =
+            template.instantiate_plain([(Value::Num(f64::from(i))), (Value::Num(1.0))].into_iter());
+        std::hint::black_box(Object::new_with_parts(Some(proto), props, Exotic::None));
     });
 
     let mut kept = Vec::with_capacity(N as usize);
     time_per_op("Object::new(proto) retained", N, |_| {
-        kept.push(Object::new(Some(proto.clone())));
+        kept.push(Object::new(Some(proto)));
     });
     let started = std::time::Instant::now();
     drop(kept);

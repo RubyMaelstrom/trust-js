@@ -723,7 +723,7 @@ impl Interp {
         };
         self.code_frames.push(CodeFrame {
             kind: frame.kind,
-            name: frame.name.clone(),
+            name: frame.name,
             source: Some(frame.source.clone()),
             start: frame.start,
             depth: self.fn_frames.len() as u32,
@@ -881,7 +881,7 @@ impl Interp {
                 let entry = &self.code_frames[code];
                 let frame = entry.source.as_ref().map(|source| Frame {
                     kind: entry.kind,
-                    name: entry.name.clone(),
+                    name: entry.name,
                     source: Some(source.clone()),
                     position,
                     start: entry.start,

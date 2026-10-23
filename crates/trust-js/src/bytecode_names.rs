@@ -118,14 +118,14 @@ impl ResolutionIc {
         start: &Env,
         name: &Rc<str>,
     ) -> Option<crate::eval::PreparedReference> {
-        let mut env = start.clone();
+        let mut env = *start;
         for (depth, guard) in self.guards.iter().enumerate() {
             let scope = env.borrow();
             if !guard.matches(&env, &scope) {
                 return None;
             }
             if depth + 1 < self.guards.len() {
-                let parent = scope.parent.clone()?;
+                let parent = scope.parent?;
                 drop(scope);
                 env = parent;
                 continue;
@@ -142,7 +142,7 @@ impl ResolutionIc {
                     };
                     return Some(crate::eval::PreparedReference::scope_with_hint(
                         name.clone(),
-                        env.clone(),
+                        env,
                         i.strict,
                         scope.vars.generation(),
                         binding as *const Binding as *mut Binding,
@@ -161,11 +161,8 @@ impl ResolutionIc {
                     {
                         return None;
                     }
-                    let mut reference = crate::eval::PreparedReference::object(
-                        name.clone(),
-                        i.global.clone(),
-                        i.strict,
-                    );
+                    let mut reference =
+                        crate::eval::PreparedReference::object(name.clone(), i.global, i.strict);
                     reference.shape = shape;
                     reference.slot = slot;
                     return Some(reference);
@@ -176,7 +173,7 @@ impl ResolutionIc {
     }
 
     fn build(i: &Interp, start: &Env, name: &str) -> Option<Self> {
-        let mut env = start.clone();
+        let mut env = *start;
         let mut guards = Vec::new();
         for _ in 0..MAX_SCOPES {
             let scope = env.borrow();
@@ -221,7 +218,7 @@ impl ResolutionIc {
                     target,
                 });
             }
-            let parent = scope.parent.clone()?;
+            let parent = scope.parent?;
             drop(scope);
             env = parent;
         }
@@ -421,7 +418,7 @@ impl Chunk {
     }
 
     pub(super) fn deep_name_ic_fill(&self, i: &Interp, env: &Env, n: u32, c: u32) -> Option<Value> {
-        let mut current = env.clone();
+        let mut current = *env;
         let mut guards = Vec::new();
         for _ in 0..MAX_SCOPES {
             let scope = current.borrow();
@@ -494,7 +491,7 @@ impl Chunk {
                 self.record_name_number(c as usize, &value);
                 return Some(value);
             }
-            let parent = scope.parent.clone()?;
+            let parent = scope.parent?;
             drop(scope);
             current = parent;
         }
@@ -574,7 +571,7 @@ mod tests {
                 new_binding_layout_id(),
             ];
             let holder = scope(None, "outer", 11.0, layouts[0]);
-            let middle = scope(Some(holder.clone()), "middle", 0.0, layouts[1]);
+            let middle = scope(Some(holder), "middle", 0.0, layouts[1]);
             let first = scope(Some(middle), "local", 0.0, layouts[2]);
             assert!(matches!(
                 (chunk.load_name_ic(&mut engine.interp, &first, name, cache))
@@ -584,8 +581,8 @@ mod tests {
             assert_eq!(chunk.name_caches[cache as usize].get().env, DEEP_NAME_IC);
             // Every scope is fresh, including the holder. Matching layout never reuses old values.
             let holder2 = scope(None, "outer", 29.0, layouts[0]);
-            let middle2 = scope(Some(holder2.clone()), "middle", 0.0, layouts[1]);
-            let second = scope(Some(middle2.clone()), "local", 0.0, layouts[2]);
+            let middle2 = scope(Some(holder2), "middle", 0.0, layouts[1]);
+            let second = scope(Some(middle2), "local", 0.0, layouts[2]);
             assert!(matches!(
                 (chunk.name_ic_hit(&engine.interp, &second, cache)).map(|__value| (__value).view()),
                 Some(ValueView::Num(29.0))
@@ -648,22 +645,22 @@ mod tests {
     fn deep_names_guard_unpublished_scope_identity_with_and_depth_bound() {
         let (mut engine, chunk, name, cache) = reader();
         let holder = scope(None, "outer", 5.0, 0);
-        let middle = scope(Some(holder.clone()), "middle", 0.0, 0);
-        let child = scope(Some(middle.clone()), "local", 0.0, 0);
+        let middle = scope(Some(holder), "middle", 0.0, 0);
+        let child = scope(Some(middle), "local", 0.0, 0);
         assert!(chunk
             .load_name_ic(&mut engine.interp, &child, name, cache)
             .is_ok());
-        let shadow = scope(Some(holder.clone()), "outer", 99.0, 0);
+        let shadow = scope(Some(holder), "outer", 99.0, 0);
         assert_eq!(
             shadow.borrow().vars.generation(),
             middle.borrow().vars.generation()
         );
         child.borrow_mut().parent = Some(shadow);
         assert!(chunk.name_ic_hit(&engine.interp, &child, cache).is_none());
-        child.borrow_mut().parent = Some(middle.clone());
+        child.borrow_mut().parent = Some(middle);
         middle
             .borrow_mut()
-            .set_with_object(Some(Value::Obj(engine.interp.global.clone())));
+            .set_with_object(Some(Value::Obj(engine.interp.global)));
         assert!(chunk.name_ic_hit(&engine.interp, &child, cache).is_none());
         assert!(chunk
             .deep_name_ic_fill(&engine.interp, &child, name, cache)
@@ -786,7 +783,7 @@ mod tests {
     fn deep_names_global_cells_remain_live_and_accessors_miss() {
         let (mut engine, chunk, name, cache) = reader();
         engine.eval("globalThis.outer = 7;", false).unwrap();
-        let middle = new_scope(Some(engine.interp.global_env.clone()));
+        let middle = new_scope(Some(engine.interp.global_env));
         let child = new_scope(Some(middle));
         assert!(matches!(
             (chunk.load_name_ic(&mut engine.interp, &child, name, cache))

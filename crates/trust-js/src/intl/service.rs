@@ -218,7 +218,7 @@ pub(crate) fn install_supported_locales(it: &mut Interp, ctor: &Gc) {
 /// Brand-check helper: fetch the internal slot object of a service instance, or throw TypeError.
 pub(crate) fn brand_slot(i: &mut Interp, this: &Value, marker: &str) -> Result<Gc, Value> {
     match this.as_obj() {
-        Some(o) if o.borrow().internal_slots().contains(marker) => Ok(o.clone()),
+        Some(o) if o.borrow().internal_slots().contains(marker) => Ok(o),
         _ => Err(i.make_error("TypeError", "method called on an incompatible receiver")),
     }
 }
@@ -229,10 +229,8 @@ pub(crate) fn brand_slot(i: &mut Interp, this: &Value, marker: &str) -> Result<G
 /// poisoned getter's error), falling back to the intrinsic prototype when it isn't an object.
 pub(crate) fn instance_proto(i: &mut Interp, intrinsic: &str) -> Result<Option<Gc>, Value> {
     if let ValueView::Obj(nt) = &(i.constructor_new_target()).view() {
-        let nt = nt.clone();
-        match (i.get_member_key(&Value::Obj(nt.clone()), "prototype"))
-            .map(|__value| (__value).view())
-        {
+        let nt = *nt;
+        match (i.get_member_key(&Value::Obj(nt), "prototype")).map(|__value| (__value).view()) {
             Ok(ValueView::Obj(p)) => return Ok(Some(p)),
             // GetPrototypeFromConstructor: when newTarget.prototype is not an object, use the
             // *newTarget's realm* intrinsic (found by matching its prototype chain's Function.prototype
@@ -256,7 +254,7 @@ fn realm_protos_of<'a>(
     i: &'a Interp,
     func: &Gc,
 ) -> Option<&'a crate::fasthash::FastMap<&'static str, Gc>> {
-    let mut cur = func.borrow().proto.clone();
+    let mut cur = func.borrow().proto;
     while let Some(p) = cur {
         if crate::value::Gc::ptr_eq(&p, &i.function_proto) {
             return Some(&i.extra_protos);
@@ -266,7 +264,7 @@ fn realm_protos_of<'a>(
                 return Some(&rs.extra_protos);
             }
         }
-        cur = p.borrow().proto.clone();
+        cur = p.borrow().proto;
     }
     None
 }

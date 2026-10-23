@@ -34,17 +34,14 @@ fn enter(
     previous: Value,
 ) -> (Value, usize) {
     let i: &mut Interp = &mut engine.interp;
-    let env = i.global_env.clone();
+    let env = i.global_env;
     let (_, count) = chunk.jit_frame();
-    let mut slots: Vec<Cell<PackedValue>> = (0..count)
-        .map(|_| Cell::new(PackedValue::pack(Value::Undefined)))
-        .collect();
+    let mut slots: Vec<Cell<Value>> = (0..count).map(|_| Cell::new(Value::Undefined)).collect();
     if count != 0 {
-        slots[0].set(PackedValue::pack(value));
+        slots[0].set(value);
     }
-    let mut stack: Vec<std::mem::MaybeUninit<PackedValue>> =
-        Vec::with_capacity(code.max_stack.max(1));
-    let base = stack.as_mut_ptr().cast::<PackedValue>();
+    let mut stack: Vec<std::mem::MaybeUninit<Value>> = Vec::with_capacity(code.max_stack.max(1));
+    let base = stack.as_mut_ptr().cast::<Value>();
     let mut ctx = JitCtx {
         helpers: i.jit_helpers.as_ptr(),
         stack_base: base,
@@ -52,7 +49,7 @@ fn enter(
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         env_raw: Env::as_ptr(&env) as *const u8,
-        this_word: PackedValue::pack(Value::Undefined),
+        this_word: (Value::Undefined),
         global_body: super::jit_global_body(i, code),
         genv: Env::as_ptr(&env) as usize,
         interp: i as *mut Interp,
@@ -63,7 +60,7 @@ fn enter(
         code_base: code.mem,
         pc_offsets: code.pc_offsets.as_ptr(),
         error: None,
-        ret: PackedValue::pack(previous),
+        ret: (previous),
         env_parent_raw: super::jit_env_parent_raw(&env),
         opstat_enabled: false,
         callstat_enabled: false,
@@ -97,7 +94,7 @@ fn enter(
     // The result remains an owning GC root after the callee's local owners are
     // destroyed, before widening at the host boundary. This also covers cycles.
     i.gc_collect();
-    (ctx.take_ret().into_value(), calls)
+    (ctx.take_ret(), calls)
 }
 
 #[test]
@@ -106,7 +103,7 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     engine
         .eval("var returnSymbol=Symbol('return');", false)
         .unwrap();
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let symbol = engine.interp.get_var("returnSymbol", &env).ok().unwrap();
     let values = [
         Value::Undefined,
@@ -126,7 +123,7 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     ];
     let (chunk, code) = compile_return(&mut engine, "function pass(value){return value;}");
     for value in values {
-        let (result, helpers) = enter(&mut engine, &chunk, &code, value.clone(), Value::Undefined);
+        let (result, helpers) = enter(&mut engine, &chunk, &code, value, Value::Undefined);
         assert_eq!(helpers, 0, "empty native return called the checked helper");
         match (&(value).view(), &(result).view()) {
             (ValueView::Num(expected), ValueView::Num(actual)) => {
@@ -172,13 +169,7 @@ fn packed_native_return_replaces_all_displaced_kinds_without_helper() {
     ] {
         let (chunk, code) = compile_return(&mut engine, source);
         for previous in &displaced {
-            let (result, helpers) = enter(
-                &mut engine,
-                &chunk,
-                &code,
-                Value::Num(42.0),
-                previous.clone(),
-            );
+            let (result, helpers) = enter(&mut engine, &chunk, &code, Value::Num(42.0), *previous);
             assert_eq!(
                 helpers, 0,
                 "{source}: every occupied word must commit natively"
@@ -210,7 +201,7 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
                 let object = crate::value::Object::new(None);
                 let weak = crate::value::Gc::downgrade(&object);
                 let previous = if occupied {
-                    Value::Obj(object.clone())
+                    Value::Obj(object)
                 } else {
                     Value::Undefined
                 };
@@ -243,12 +234,12 @@ fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
     let (chunk, code) = compile_return(&mut engine, "function pass(value){return value;}");
     // The object's handles live only in this helper frame (the collector scans the stack).
     let weak = crate::gc_test::in_frame(|| {
-        let object = crate::value::Object::new(Some(engine.interp.object_proto.clone()));
+        let object = crate::value::Object::new(Some(engine.interp.object_proto));
         let weak = crate::value::Gc::downgrade(&object);
-        object.borrow_mut().props.insert(
-            "self",
-            crate::value::Property::plain(Value::Obj(object.clone())),
-        );
+        object
+            .borrow_mut()
+            .props
+            .insert("self", crate::value::Property::plain(Value::Obj(object)));
         let (result, helpers) = enter(
             &mut engine,
             &chunk,
@@ -291,7 +282,7 @@ fn packed_native_return_direct_call_moves_and_clears_the_entire_word() {
     // Isolate the ordinary direct-call ABI from AST splicing. Both chunks keep
     // their real native entry and live inline caches; only the test's retry
     // scheduler is settled so this exact boundary cannot disappear by inlining.
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     for name in ["returned", "invoked"] {
         let function = engine.interp.get_var(name, &env).ok().unwrap();
         let function_handle = function.as_obj().unwrap();
@@ -419,7 +410,7 @@ fn direct_calls_enter_callees_that_materialize_native_activations() {
             false,
         )
         .unwrap();
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     for name in ["shaped", "upper"] {
         let function = engine.interp.get_var(name, &env).ok().unwrap();
         let function_handle = function.as_obj().unwrap();

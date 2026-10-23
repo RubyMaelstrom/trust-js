@@ -79,7 +79,7 @@ impl Interp {
             push(Value::Undefined);
         }
         if !done {
-            let iterator = crate::builtins::array_values_iterator(self, source.clone(), index);
+            let iterator = crate::builtins::array_values_iterator(self, *source, index);
             return Some(self.iterator_close_normal(&iterator));
         }
         Some(Ok(()))

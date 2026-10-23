@@ -145,7 +145,7 @@ fn constructor_transfer_sole_object_owner_survives_gc_then_releases() {
                 &mut engine,
                 &format!("var retained={maker}({{marker:71}}, Symbol('retained'));"),
             );
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             // Strong handles live only in this helper frame (the collector scans the stack).
             let weak = crate::gc_test::in_frame(|| {
                 let retained = engine.interp.get_var("retained", &env).ok().unwrap();
@@ -262,7 +262,7 @@ fn simple_and_forwarded_initializers_copy_an_immutable_argument_window() {
             let result = unsafe {
                 engine.interp.construct_jit_fast(
                     &callee,
-                    arguments.as_ptr().cast::<PackedValue>(),
+                    arguments.as_ptr().cast::<Value>(),
                     arguments.len(),
                     None,
                     None,

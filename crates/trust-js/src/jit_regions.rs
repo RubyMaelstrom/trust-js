@@ -3760,7 +3760,7 @@ fn emit_effect(
             a.add_imm(20, 20, 8);
         }
         Op::Const(k) if fast & 128 != 0 && chunk.jit_const_copyable(k) => {
-            a.mov_imm64(9, chunk.jit_const_packed_bits(k).unwrap());
+            a.mov_imm64(9, chunk.jit_const_scalar_bits(k).unwrap());
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
         }

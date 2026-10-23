@@ -42,8 +42,8 @@ fn install_compare_getter(it: &mut Interp, proto: &Gc) {
         let f = i.make_native("", 2, |i, that, a| {
             compare(i, &that, &arg(a, 0), &arg(a, 1))
         });
-        let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), this.clone());
-        set_internal_slot(&o, "#\u{0}co_bound", bound.clone());
+        let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), this);
+        set_internal_slot(&o, "#\u{0}co_bound", bound);
         Ok(bound)
     });
     proto.borrow_mut().props.insert(

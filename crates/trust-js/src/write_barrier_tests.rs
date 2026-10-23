@@ -33,7 +33,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 
 /// The global object named `name`.
 fn global_object(engine: &mut Engine, name: &str) -> Gc {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     match (engine.interp.get_var(name, &env)).map(|__value| (__value).view()) {
         Ok(ValueView::Obj(object)) => object,
         _ => panic!("{name}: not an object"),
@@ -103,7 +103,7 @@ fn captured_binding_store_records_its_environment() {
     assert_eq!(eval(&mut engine, source), "7");
 }
 
-/// `PropWord::unpack` promotes a function's deferred prototype word to the materialized
+/// `PropWord::materialize` promotes a function's deferred prototype word to the materialized
 /// prototype's under a shared borrow of the function, and the deferred prototype's cell records
 /// the prototype: the first read of an old function's `prototype`, at every tier.
 #[test]

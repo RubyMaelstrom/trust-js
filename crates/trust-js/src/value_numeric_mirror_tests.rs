@@ -3,9 +3,7 @@ use crate::value::ValueView;
 
 fn packed(length: usize) -> Props {
     let initial = length.min(32);
-    let mut words: Vec<_> = (0..initial)
-        .map(|index| PackedValue::pack(Value::Num(index as f64)))
-        .collect();
+    let mut words: Vec<_> = (0..initial).map(|index| Value::Num(index as f64)).collect();
     let mut properties = unsafe { Props::packed_array_from_raw(words.as_mut_ptr(), initial) };
     unsafe {
         words.set_len(0);

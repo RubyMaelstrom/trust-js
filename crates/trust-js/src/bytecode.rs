@@ -28,10 +28,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::execution_storage::{values_from_words, CallArgs, SlotAccess, StoredValue, ValueStack};
+use crate::execution_storage::{SlotAccess, ValueStack};
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::stack_trace::NO_POSITION;
-use crate::value::{PackedValue, Value};
+use crate::value::Value;
 
 #[path = "bytecode_activation.rs"]
 mod activation;
@@ -425,7 +425,7 @@ mod binding_layout_cache_tests {
                 .insert("outer", Binding::data(Value::Num(17.0), true, true));
             let layout = new_binding_layout_id();
             let make_child = |parent: &Env, key: &str, layout| {
-                let child = new_scope(Some(parent.clone()));
+                let child = new_scope(Some(*parent));
                 child
                     .borrow_mut()
                     .vars
@@ -502,7 +502,7 @@ mod binding_layout_cache_tests {
             let other = make_child(&different_parent, "padding", layout);
             assert!(chunk.name_ic_hit(&engine.interp, &other, cache).is_none());
             // Reparenting is detected too; a layout identity describes keys, not links.
-            other.borrow_mut().parent = Some(parent.clone());
+            other.borrow_mut().parent = Some(parent);
             assert!(matches!(
                 (chunk.name_ic_hit(&engine.interp, &other, cache)).map(|__value| (__value).view()),
                 Some(ValueView::Num(31.0))
@@ -628,7 +628,7 @@ impl ComputedReadCache {
         self.insert_way(ComputedReadWay {
             key: identity,
             state,
-            pin: Some(key.clone()),
+            pin: Some(*key),
         });
     }
 
@@ -1084,7 +1084,7 @@ impl PrivateSite {
         let raw = Env::as_ptr(env) as usize;
         if self.env.get() == raw {
             if let Some(key) = self.key.borrow().as_ref() {
-                return key.clone();
+                return *key;
             }
         }
         let key = resolve();
@@ -1097,7 +1097,7 @@ impl PrivateSite {
             self.slot.set(u32::MAX);
             *self.entry_key.borrow_mut() = None;
         }
-        *self.key.borrow_mut() = Some(key.clone());
+        *self.key.borrow_mut() = Some(key);
         *self.pin.borrow_mut() = Env::downgrade(env);
         self.env.set(raw);
         key
@@ -2742,17 +2742,17 @@ impl Chunk {
         Some(values)
     }
 
-    /// The preceding proof initialized exactly the plan's Number prefix. The
-    /// raw constructor consumes those owners once; unused MaybeUninit slots own nothing.
+    /// The proof initialized exactly the plan's Number prefix. The raw constructor copies
+    /// that prefix; unused MaybeUninit slots are never read.
     pub(crate) fn make_record_getter_result(&self, i: &mut Interp, values: [f64; 8]) -> Value {
         let plan = self
             .record_getter
             .get()
             .and_then(Option::as_deref)
             .expect("record getter proof");
-        let mut packed = [const { std::mem::MaybeUninit::<PackedValue>::uninit() }; 8];
+        let mut packed = [const { std::mem::MaybeUninit::<Value>::uninit() }; 8];
         for slot in 0..plan.count {
-            packed[slot].write(PackedValue::pack(Value::Num(values[slot])));
+            packed[slot].write(Value::Num(values[slot]));
         }
         unsafe {
             i.make_plain_object_templated_from(
@@ -3308,21 +3308,11 @@ impl Chunk {
     /// `MakeClosure` environments route through the result. Returns `env` untouched when nothing
     /// needs seeding.
     fn make_run_env(&self, i: &mut Interp, env: &Env, this_val: &Value, args: &[Value]) -> Env {
-        self.make_run_env_from(i, env, this_val, CallArgs::Values(args))
-    }
-
-    fn make_run_env_from(
-        &self,
-        i: &mut Interp,
-        env: &Env,
-        this_val: &Value,
-        args: CallArgs<'_>,
-    ) -> Env {
         if self.prepared_entry {
-            return env.clone();
+            return *env;
         }
         if !self.makes_env() {
-            return env.clone();
+            return *env;
         }
         if !self.reuse_activation && activation_plans_enabled() {
             return self
@@ -3331,10 +3321,10 @@ impl Chunk {
                 .instantiate(self, i, env, this_val, args);
         }
         let act = if self.reuse_activation {
-            env.clone()
+            *env
         } else {
             crate::interpreter::new_var_scope_with_capacity(
-                Some(env.clone()),
+                Some(*env),
                 self.cap_inits.len()
                     + usize::from(self.env_this && !self.lexical_this)
                     + usize::from(self.env_arguments),
@@ -3350,14 +3340,18 @@ impl Chunk {
                     CapInit::Param(k, name) => {
                         b.vars.insert(
                             name.clone(),
-                            crate::interpreter::Binding::data(args.read(*k as usize), true, true),
+                            crate::interpreter::Binding::data(
+                                args.get(*k as usize).copied().unwrap_or(Value::Undefined),
+                                true,
+                                true,
+                            ),
                         );
                     }
                     CapInit::Rest(first, name) => {
                         b.vars.insert(
                             name.clone(),
                             crate::interpreter::Binding::data(
-                                i.make_array(args.rest_values(*first as usize)),
+                                i.make_array(args.get(*first as usize..).unwrap_or(&[]).to_vec()),
                                 true,
                                 true,
                             ),
@@ -3392,15 +3386,14 @@ impl Chunk {
             }
         }
         for (fidx, name) in fns {
-            let v = i.make_function(self.funcs[fidx as usize].clone(), act.clone());
+            let v = i.make_function(self.funcs[fidx as usize].clone(), act);
             act.borrow_mut().vars.insert(
                 name.to_string(),
                 crate::interpreter::Binding::data(v, true, true),
             );
         }
         if self.env_arguments {
-            let arguments =
-                args.with_values(|args| Value::Obj(i.make_compiled_arguments_object(args, &act)));
+            let arguments = Value::Obj(i.make_compiled_arguments_object(args, &act));
             act.borrow_mut().vars.insert(
                 "arguments".to_string(),
                 crate::interpreter::Binding::data(arguments, true, true),
@@ -5449,42 +5442,39 @@ mod feedback_layout_tests {
     }
 
     #[test]
-    fn tagged_numeric_binary_accepts_only_immediate_numbers() {
+    fn numeric_binary_accepts_only_immediate_numbers() {
         let add = |left: f64, right: f64| left + right;
-        let result = try_tagged_numeric_binary(&Value::Num(1.5), &Value::Num(2.0), &add)
+        let result = try_numeric_binary(&Value::Num(1.5), &Value::Num(2.0), &add)
             .expect("Number operands use the tagged frame");
         assert!(matches!((result).view(), ValueView::Num(value) if value == 3.5));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_binary(&Value::lstr("x"), &Value::Num(2.0), &add).is_none());
-        assert!(try_tagged_numeric_binary(
+        assert!(try_numeric_binary(&Value::lstr("x"), &Value::Num(2.0), &add).is_none());
+        assert!(try_numeric_binary(
             &Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
             &Value::Num(2.0),
             &add,
         )
         .is_none());
-        assert!(try_tagged_numeric_binary(
-            &Value::Obj(interp.new_object()),
-            &Value::Num(2.0),
-            &add
-        )
-        .is_none());
+        assert!(
+            try_numeric_binary(&Value::Obj(interp.new_object()), &Value::Num(2.0), &add).is_none()
+        );
     }
 
     #[test]
-    fn tagged_numeric_binary_keeps_ieee_edge_results() {
+    fn numeric_binary_keeps_ieee_edge_results() {
         let add = |left: f64, right: f64| left + right;
-        let negative_zero = try_tagged_numeric_binary(&Value::Num(-0.0), &Value::Num(-0.0), &add)
+        let negative_zero = try_numeric_binary(&Value::Num(-0.0), &Value::Num(-0.0), &add)
             .expect("numeric fast path");
         assert!(
             matches!((negative_zero).view(), ValueView::Num(value) if value.to_bits() == (-0.0f64).to_bits())
         );
 
-        let nan = try_tagged_numeric_binary(&Value::Num(f64::NAN), &Value::Num(1.0), &add)
+        let nan = try_numeric_binary(&Value::Num(f64::NAN), &Value::Num(1.0), &add)
             .expect("numeric fast path");
         assert!(matches!((nan).view(), ValueView::Num(value) if value.is_nan()));
 
-        let infinity = try_tagged_numeric_binary(
+        let infinity = try_numeric_binary(
             &Value::Num(f64::INFINITY),
             &Value::Num(f64::NEG_INFINITY),
             &add,
@@ -5494,33 +5484,30 @@ mod feedback_layout_tests {
     }
 
     #[test]
-    fn tagged_numeric_cmp_accepts_only_immediate_numbers() {
+    fn numeric_cmp_accepts_only_immediate_numbers() {
         let lt = |left: f64, right: f64| left < right;
-        let result = try_tagged_numeric_cmp(&Value::Num(1.5), &Value::Num(2.0), &lt)
+        let result = try_numeric_cmp(&Value::Num(1.5), &Value::Num(2.0), &lt)
             .expect("Number operands use the tagged frame");
         assert!(matches!((result).view(), ValueView::Bool(true)));
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(2.0), &Value::Num(1.5), &lt))
+            (try_numeric_cmp(&Value::Num(2.0), &Value::Num(1.5), &lt))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(false))
         ));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_cmp(&Value::lstr("x"), &Value::Num(2.0), &lt).is_none());
-        assert!(try_tagged_numeric_cmp(
+        assert!(try_numeric_cmp(&Value::lstr("x"), &Value::Num(2.0), &lt).is_none());
+        assert!(try_numeric_cmp(
             &Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
             &Value::Num(2.0),
             &lt,
         )
         .is_none());
-        assert!(
-            try_tagged_numeric_cmp(&Value::Obj(interp.new_object()), &Value::Num(2.0), &lt)
-                .is_none()
-        );
+        assert!(try_numeric_cmp(&Value::Obj(interp.new_object()), &Value::Num(2.0), &lt).is_none());
     }
 
     #[test]
-    fn tagged_numeric_cmp_keeps_ieee_edge_results() {
+    fn numeric_cmp_keeps_ieee_edge_results() {
         // Every NaN case reduces to false for the relational/equality operators on Number
         // operands (ECMA-262 §13.11-12 of the abstract-relation/equality algorithms), which is
         // exactly what the f64 predicates produce.
@@ -5530,46 +5517,46 @@ mod feedback_layout_tests {
         let ne = |left: f64, right: f64| left != right;
         let gt = |left: f64, right: f64| left > right;
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &lt))
+            (try_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &lt))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(false))
         ));
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &le))
+            (try_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &le))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(false))
         ));
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &eq))
+            (try_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &eq))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(false))
         ));
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &ne))
+            (try_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &ne))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(true))
         ));
 
         // `-0` and `+0` compare equal, exactly as the f64 predicates do.
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &eq))
+            (try_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &eq))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(true))
         ));
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &lt))
+            (try_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &lt))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(false))
         ));
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &ne))
+            (try_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &ne))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(false))
         ));
 
         // Infinities and subnormals round-trip their exact bits through the frame.
         assert!(matches!(
-            (try_tagged_numeric_cmp(
+            (try_numeric_cmp(
                 &Value::Num(f64::NEG_INFINITY),
                 &Value::Num(f64::INFINITY),
                 &lt,
@@ -5578,71 +5565,70 @@ mod feedback_layout_tests {
             Some(ValueView::Bool(true))
         ));
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(f64::INFINITY), &Value::Num(f64::INFINITY), &le))
+            (try_numeric_cmp(&Value::Num(f64::INFINITY), &Value::Num(f64::INFINITY), &le))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(true))
         ));
         let subnormal = f64::from_bits(1);
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(subnormal), &Value::Num(0.0), &gt))
+            (try_numeric_cmp(&Value::Num(subnormal), &Value::Num(0.0), &gt))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(true))
         ));
         assert!(matches!(
-            (try_tagged_numeric_cmp(&Value::Num(0.0), &Value::Num(subnormal), &gt))
+            (try_numeric_cmp(&Value::Num(0.0), &Value::Num(subnormal), &gt))
                 .map(|__value| (__value).view()),
             Some(ValueView::Bool(false))
         ));
     }
 
     #[test]
-    fn tagged_numeric_i32_accepts_only_immediate_numbers_and_wraps() {
+    fn numeric_i32_accepts_only_immediate_numbers_and_wraps() {
         let band = |left: i32, right: i32| left & right;
-        let result = try_tagged_numeric_i32(&Value::Num(12.0), &Value::Num(10.0), &band)
+        let result = try_numeric_i32(&Value::Num(12.0), &Value::Num(10.0), &band)
             .expect("Number operands use the tagged frame");
         assert!(matches!((result).view(), ValueView::Num(value) if value == 8.0));
 
         // ToInt32 wrapping is applied inside the frame to the exact extracted bits.
         assert!(matches!(
-            (try_tagged_numeric_i32(&Value::Num(4294967296.0), &Value::Num(1.0), &band)).map(|__value| (__value).view()),
+            (try_numeric_i32(&Value::Num(4294967296.0), &Value::Num(1.0), &band)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == 0.0
         ));
         assert!(matches!(
-            (try_tagged_numeric_i32(&Value::Num(-0.5), &Value::Num(1.0), &band)).map(|__value| (__value).view()),
+            (try_numeric_i32(&Value::Num(-0.5), &Value::Num(1.0), &band)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == 0.0
         ));
         assert!(matches!(
-            (try_tagged_numeric_i32(&Value::Num(f64::NAN), &Value::Num(1.0), &band)).map(|__value| (__value).view()),
+            (try_numeric_i32(&Value::Num(f64::NAN), &Value::Num(1.0), &band)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == 0.0
         ));
         assert!(matches!(
-            (try_tagged_numeric_i32(&Value::Num(-1.0), &Value::Num(2.0), &band)).map(|__value| (__value).view()),
+            (try_numeric_i32(&Value::Num(-1.0), &Value::Num(2.0), &band)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == 2.0
         ));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_i32(&Value::lstr("x"), &Value::Num(2.0), &band).is_none());
-        assert!(try_tagged_numeric_i32(
+        assert!(try_numeric_i32(&Value::lstr("x"), &Value::Num(2.0), &band).is_none());
+        assert!(try_numeric_i32(
             &Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
             &Value::Num(2.0),
             &band,
         )
         .is_none());
         assert!(
-            try_tagged_numeric_i32(&Value::Obj(interp.new_object()), &Value::Num(2.0), &band)
-                .is_none()
+            try_numeric_i32(&Value::Obj(interp.new_object()), &Value::Num(2.0), &band).is_none()
         );
     }
 
     #[test]
-    fn tagged_numeric_unary_accepts_only_immediate_numbers() {
+    fn numeric_unary_accepts_only_immediate_numbers() {
         // Negation flips signed zero exactly like the canonical fast path.
-        let neg = try_tagged_numeric_unary(&Value::Num(0.0), |n| -n)
+        let neg = try_numeric_unary(&Value::Num(0.0), |n| -n)
             .expect("Number operand uses the tagged frame");
         assert!(
             matches!((neg).view(), ValueView::Num(value) if value.to_bits() == (-0.0f64).to_bits())
         );
-        let neg_neg = try_tagged_numeric_unary(&Value::Num(-0.0), |n| -n)
+        let neg_neg = try_numeric_unary(&Value::Num(-0.0), |n| -n)
             .expect("Number operand uses the tagged frame");
         assert!(
             matches!((neg_neg).view(), ValueView::Num(value) if value.to_bits() == 0.0f64.to_bits())
@@ -5650,93 +5636,91 @@ mod feedback_layout_tests {
 
         // NaN, infinities, and subnormals round-trip through the frame.
         assert!(matches!(
-            (try_tagged_numeric_unary(&Value::Num(f64::NAN), |n| n)).map(|__value| (__value).view()),
+            (try_numeric_unary(&Value::Num(f64::NAN), |n| n)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            (try_tagged_numeric_unary(&Value::Num(f64::INFINITY), |n| -n)).map(|__value| (__value).view()),
+            (try_numeric_unary(&Value::Num(f64::INFINITY), |n| -n)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == f64::NEG_INFINITY
         ));
         let subnormal = f64::from_bits(1);
         assert!(matches!(
-            (try_tagged_numeric_unary(&Value::Num(subnormal), |n| -n)).map(|__value| (__value).view()),
+            (try_numeric_unary(&Value::Num(subnormal), |n| -n)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value.to_bits() == (-subnormal).to_bits()
         ));
 
         // Bitwise NOT converts through ToInt32 before inverting.
         assert!(matches!(
-            (try_tagged_numeric_unary(&Value::Num(0.0), |n| !crate::eval::to_int32(n) as f64)).map(|__value| (__value).view()),
+            (try_numeric_unary(&Value::Num(0.0), |n| !crate::eval::to_int32(n) as f64)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == -1.0
         ));
         assert!(matches!(
-            (try_tagged_numeric_unary(&Value::Num(-1.0), |n| !crate::eval::to_int32(n) as f64)).map(|__value| (__value).view()),
+            (try_numeric_unary(&Value::Num(-1.0), |n| !crate::eval::to_int32(n) as f64)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == 0.0
         ));
         assert!(matches!(
-            (try_tagged_numeric_unary(&Value::Num(f64::NAN), |n| !crate::eval::to_int32(n) as f64)).map(|__value| (__value).view()),
+            (try_numeric_unary(&Value::Num(f64::NAN), |n| !crate::eval::to_int32(n) as f64)).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == -1.0
         ));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_unary(&Value::lstr("x"), |n| -n).is_none());
-        assert!(try_tagged_numeric_unary(&Value::Obj(interp.new_object()), |n| -n).is_none());
+        assert!(try_numeric_unary(&Value::lstr("x"), |n| -n).is_none());
+        assert!(try_numeric_unary(&Value::Obj(interp.new_object()), |n| -n).is_none());
     }
 
     #[test]
-    fn tagged_numeric_pow_keeps_exponentiate_edges() {
+    fn numeric_pow_keeps_exponentiate_edges() {
         // The Number::exponentiate cases where raw powf disagrees with ECMA-262 §6.1.6.1.20.
         // Step 8 fires before the ±1 special cases: a negative base with a non-integral exponent
         // (and -+∞ are never integral Numbers) is NaN, so `-1 ** ±∞` is NaN, matching Node/V8.
         assert!(matches!(
-            (try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::INFINITY))).map(|__value| (__value).view()),
+            (try_numeric_pow(&Value::Num(1.0), &Value::Num(f64::INFINITY))).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            (try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NEG_INFINITY))).map(|__value| (__value).view()),
+            (try_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NEG_INFINITY))).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            (try_tagged_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::INFINITY))).map(|__value| (__value).view()),
+            (try_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::INFINITY))).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            (try_tagged_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::NEG_INFINITY))).map(|__value| (__value).view()),
+            (try_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::NEG_INFINITY))).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value.is_nan()
         ));
 
         // Ordinary cases agree with powf: NaN exponent is NaN even for base 1, `0 ** -1` is
         // +Infinity, negative base with fractional exponent is NaN, `NaN ** 0` is 1.
         assert!(matches!(
-            (try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NAN))).map(|__value| (__value).view()),
+            (try_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NAN))).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            (try_tagged_numeric_pow(&Value::Num(0.0), &Value::Num(-1.0))).map(|__value| (__value).view()),
+            (try_numeric_pow(&Value::Num(0.0), &Value::Num(-1.0))).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == f64::INFINITY
         ));
         assert!(matches!(
-            (try_tagged_numeric_pow(&Value::Num(-2.0), &Value::Num(0.5))).map(|__value| (__value).view()),
+            (try_numeric_pow(&Value::Num(-2.0), &Value::Num(0.5))).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value.is_nan()
         ));
         assert!(matches!(
-            (try_tagged_numeric_pow(&Value::Num(f64::NAN), &Value::Num(0.0))).map(|__value| (__value).view()),
+            (try_numeric_pow(&Value::Num(f64::NAN), &Value::Num(0.0))).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == 1.0
         ));
         assert!(matches!(
-            (try_tagged_numeric_pow(&Value::Num(2.0), &Value::Num(-1.0))).map(|__value| (__value).view()),
+            (try_numeric_pow(&Value::Num(2.0), &Value::Num(-1.0))).map(|__value| (__value).view()),
             Some(ValueView::Num(value)) if value == 0.5
         ));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_pow(&Value::lstr("x"), &Value::Num(2.0)).is_none());
-        assert!(try_tagged_numeric_pow(
+        assert!(try_numeric_pow(&Value::lstr("x"), &Value::Num(2.0)).is_none());
+        assert!(try_numeric_pow(
             &Value::BigInt(crate::bigint::JsBigInt::from_u64(2)),
             &Value::Num(2.0),
         )
         .is_none());
-        assert!(
-            try_tagged_numeric_pow(&Value::Obj(interp.new_object()), &Value::Num(2.0)).is_none()
-        );
+        assert!(try_numeric_pow(&Value::Obj(interp.new_object()), &Value::Num(2.0)).is_none());
     }
 
     #[test]
@@ -5744,7 +5728,7 @@ mod feedback_layout_tests {
         let (layout, bindings) = feedback_layout_for_ops(&[Op::Add], &[]);
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
         let mut interp = Interp::new();
-        let mut stack = ValueStack::<PackedValue>::default();
+        let mut stack = ValueStack::default();
         stack.extend([Value::lstr("left"), Value::Num(1.0)]);
 
         assert!(bin_num(&mut interp, &mut stack, &feedback, 0, "+", |a, b| a + b).is_ok());
@@ -5778,7 +5762,7 @@ mod feedback_layout_tests {
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, false);
         let retained_before = feedback.retained_bytes();
         let mut interp = Interp::new();
-        let mut stack = ValueStack::<PackedValue>::default();
+        let mut stack = ValueStack::default();
         stack.extend([Value::Num(1.0), Value::Num(2.0)]);
 
         assert!(bin_num(&mut interp, &mut stack, &feedback, 0, "+", |a, b| a + b).is_ok());
@@ -5792,7 +5776,7 @@ mod feedback_layout_tests {
         let (layout, bindings) = feedback_layout_for_ops(&[Op::Add], &[]);
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
         let mut interp = Interp::new();
-        let mut stack = ValueStack::<PackedValue>::default();
+        let mut stack = ValueStack::default();
         stack.extend([
             Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
             Value::Num(1.0),
@@ -8573,7 +8557,7 @@ pub(crate) fn lazy_arguments_element(
     // The [[Get]] may reach an inherited accessor that receives (and could keep or mutate) the
     // arguments object, so it replaces the list for every later read in this activation.
     let values = crate::builtins::dense_array_snapshot(i, list).unwrap_or_default();
-    let scope = i.global_env.clone();
+    let scope = i.global_env;
     let arguments = Value::Obj(i.make_compiled_arguments_object(&values, &scope));
     materialized(&arguments);
     get_computed_element(i, chunk, pc, &arguments, key)
@@ -14991,7 +14975,7 @@ pub(crate) fn try_function_osr(
     let construct = frame.construct;
     let callee = frame.callee();
     let (function, closure) = match &callee.borrow().call {
-        crate::value::Callable::User(user) => (user.func.clone(), user.env.clone()),
+        crate::value::Callable::User(user) => (user.func.clone(), user.env),
         _ => return Ok(None),
     };
     let address = site as *const _ as usize;
@@ -15045,7 +15029,7 @@ pub(crate) fn try_function_osr(
                 (*slot as usize) < chunk.n_params
                     && formals.iter().any(|formal| formal == name.as_ref())
             })
-            .map(|(name, slot, _)| (activation.clone(), name.clone(), *slot))
+            .map(|(name, slot, _)| (activation, name.clone(), *slot))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -15091,7 +15075,7 @@ pub(crate) fn try_function_osr(
     let mut initial = Vec::with_capacity(entry.bindings.len());
     let mut private_homes = Vec::with_capacity(entry.bindings.len());
     for (name, slot, shadow_depth) in &entry.bindings {
-        let mut cursor = Some(live_env.clone());
+        let mut cursor = Some(*live_env);
         let mut value = None;
         let mut shadow_depth = *shadow_depth;
         while let Some(environment) = cursor {
@@ -15103,37 +15087,35 @@ pub(crate) fn try_function_osr(
                     } else {
                         Value::Empty
                     });
-                    private_homes.push((environment.clone(), name.clone(), *slot));
+                    private_homes.push((environment, name.clone(), *slot));
                     break;
                 }
                 shadow_depth -= 1;
             }
-            cursor = scope.parent.clone();
+            cursor = scope.parent;
         }
         let Some(value) = value else { return Ok(None) };
         initial.push((*slot, value));
     }
-    let this_val = PackedValue::pack(if chunk.needs_frame_this() {
+    let this_val = if chunk.needs_frame_this() {
         i.get_var("this", live_env)?
     } else {
         Value::Undefined
-    });
+    };
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
-    slots.resize_with(chunk.n_slots, || {
-        Cell::new(PackedValue::pack(Value::Undefined))
-    });
+    slots.resize_with(chunk.n_slots, || Cell::new(Value::Undefined));
     for (slot, value) in initial {
         slots.write_value(slot as usize, value);
     }
     let cap_env = if chunk.makes_env() || chunk.prepared_entry {
-        activation.clone()
+        activation
     } else {
-        closure.clone()
+        closure
     };
     let mut env = if !entry.environment_handlers.is_empty() {
-        live_env.clone()
+        *live_env
     } else {
-        cap_env.clone()
+        cap_env
     };
     let mut pc = entry.pc;
     let mut handlers = entry
@@ -15240,19 +15222,11 @@ fn run_inner(
     // Captured locals (and a lexically-read `this`) live in a per-call activation env; slots
     // hold everything else. No captures → the definition env is used directly.
     let mut env = chunk.make_run_env(i, env, &this_val, args);
-    let this_val = PackedValue::pack(this_val);
-    let cap_env = env.clone();
+    let cap_env = env;
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     let seed = chunk.n_params.min(args.len());
-    slots.extend(
-        args[..seed]
-            .iter()
-            .copied()
-            .map(|value| Cell::new(PackedValue::pack(value))),
-    );
-    slots.resize_with(chunk.n_slots, || {
-        Cell::new(PackedValue::pack(Value::Undefined))
-    });
+    slots.extend(args[..seed].iter().copied().map(Cell::new));
+    slots.resize_with(chunk.n_slots, || Cell::new(Value::Undefined));
     if let Some(rest) = chunk.rest_slot {
         let rest_values = args.get(chunk.n_params..).unwrap_or(&[]).to_vec();
         slots.write_value(rest as usize, i.make_array(rest_values));
@@ -15317,10 +15291,10 @@ fn drive_vm(
     env: &mut Env,
     cap_env: &Env,
     references: &mut [crate::eval::PreparedReferenceSlot],
-    slots: &[Cell<PackedValue>],
-    stack: &mut ValueStack<PackedValue>,
+    slots: &[Cell<Value>],
+    stack: &mut ValueStack,
     pc: &mut usize,
-    this_val: &PackedValue,
+    this_val: &Value,
     handlers: &mut Vec<Handler>,
     disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
     class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
@@ -15596,9 +15570,9 @@ fn script_osr_code(
     Ok(code.filter(|code| code.osr_entry_depth(pc) == Some(depth)))
 }
 
-fn for_in_step<S: StoredValue>(
+fn for_in_step(
     i: &mut Interp,
-    slots: &[Cell<S>],
+    slots: &[Cell<Value>],
     keys_slot: u16,
     index_slot: u16,
     source_slot: u16,
@@ -15658,14 +15632,14 @@ fn for_in_next(
 /// Environment Records, so project the lexically visible slot bindings into one child record,
 /// execute the normative algorithm, and copy bindings back even after an abrupt completion (an
 /// earlier element/property assignment remains observable when a later one throws).
-fn assign_target_with_slots<S: StoredValue>(
+fn assign_target_with_slots(
     i: &mut Interp,
     plan: &AssignmentTargetPlan,
     value: Value,
     env: &Env,
-    slots: &[Cell<S>],
+    slots: &[Cell<Value>],
 ) -> Result<(), Abrupt> {
-    let projected = crate::interpreter::new_scope(Some(env.clone()));
+    let projected = crate::interpreter::new_scope(Some(*env));
     {
         let mut scope = projected.borrow_mut();
         for local in &plan.locals {
@@ -15705,13 +15679,13 @@ fn assign_target_with_slots<S: StoredValue>(
 /// Execute one uncommon, non-suspending expression through the normative evaluator while the
 /// surrounding function remains a heap VM continuation. Slot bindings are projected exactly like
 /// AssignmentPattern's shared bridge and copied back after both normal and abrupt completion.
-fn eval_expr_with_slots<S: StoredValue>(
+fn eval_expr_with_slots(
     i: &mut Interp,
     plan: &EvalExprPlan,
     env: &Env,
-    slots: &[Cell<S>],
+    slots: &[Cell<Value>],
 ) -> Result<Value, Abrupt> {
-    let projected = crate::interpreter::new_scope(Some(env.clone()));
+    let projected = crate::interpreter::new_scope(Some(*env));
     {
         let mut scope = projected.borrow_mut();
         for local in &plan.locals {
@@ -15908,16 +15882,16 @@ fn argument_array_values(i: &Interp, array: Value) -> Vec<Value> {
 /// only), or throws (`Err(Abrupt::Throw)`, caught by [`drive_vm`]). Operates on borrowed state so an
 /// async [`VmCoro`] can save it at a suspension and restore it on resume.
 #[allow(clippy::too_many_arguments)]
-fn run_vm<S: StoredValue>(
+fn run_vm(
     i: &mut Interp,
     chunk: &Chunk,
     env: &mut Env,
     cap_env: &Env,
     references: &mut [crate::eval::PreparedReferenceSlot],
-    slots: &[Cell<S>],
-    stack: &mut ValueStack<S>,
+    slots: &[Cell<Value>],
+    stack: &mut ValueStack,
     pc: &mut usize,
-    this_val: &PackedValue,
+    this_val: &Value,
     handlers: &mut Vec<Handler>,
     disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
     class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
@@ -15981,16 +15955,16 @@ impl VmRunExit {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_vm_inner<S: StoredValue>(
+fn run_vm_inner(
     interpreter: &mut Interp,
     chunk: &Chunk,
     env: &mut Env,
     cap_env: &Env,
     references: &mut [crate::eval::PreparedReferenceSlot],
-    slots: &[Cell<S>],
-    stack: &mut ValueStack<S>,
+    slots: &[Cell<Value>],
+    stack: &mut ValueStack,
     pc: &mut usize,
-    this_val: &PackedValue,
+    this_val: &Value,
     handlers: &mut Vec<Handler>,
     disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
     class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
@@ -16029,14 +16003,14 @@ fn run_vm_inner<S: StoredValue>(
         let _inline_position = unsafe { ImplicitCallPosition::enter(interpreter, chunk, op_pc) };
         let i = unsafe { &mut *interpreter };
         match op {
-            Op::Const(k) => stack.push(chunk.consts[k as usize].clone()),
+            Op::Const(k) => stack.push(chunk.consts[k as usize]),
             Op::Undef => stack.push(Value::Undefined),
             Op::Dup => {
-                let t = stack.last_stored().expect("vm stack underflow").clone();
-                stack.push_stored(t);
+                let t = stack.last().expect("vm stack underflow");
+                stack.push(t);
             }
             Op::Pop => {
-                stack.pop_stored().expect("vm stack underflow");
+                stack.pop().expect("vm stack underflow");
             }
             Op::LoadLocal(s) => {
                 let v = slots[s as usize].get();
@@ -16049,11 +16023,9 @@ fn run_vm_inner<S: StoredValue>(
                         ),
                     ));
                 }
-                stack.push_stored(v.clone());
+                stack.push(v);
             }
-            Op::StoreLocal(s) => {
-                slots[s as usize].set(stack.pop_stored().expect("vm stack underflow"))
-            }
+            Op::StoreLocal(s) => slots[s as usize].set(stack.pop().expect("vm stack underflow")),
             Op::UpdateLocal(s, kind) => {
                 let idx = s as usize;
                 let current = slots.read_value(idx);
@@ -16095,7 +16067,7 @@ fn run_vm_inner<S: StoredValue>(
                     ValueView::BigInt(n) => {
                         let profiling =
                             observe_arithmetic_operand(&chunk.feedback, op_pc, &current);
-                        let old = n.clone();
+                        let old = *n;
                         let one = crate::bigint::JsBigInt::from_u64(1);
                         let new = match kind {
                             UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => {
@@ -16105,7 +16077,7 @@ fn run_vm_inner<S: StoredValue>(
                                 old.sub(&one)
                             }
                         };
-                        let value = Value::BigInt(new.clone());
+                        let value = Value::BigInt(new);
                         observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &value);
                         slots.write_value(idx, value);
                         match kind {
@@ -16144,7 +16116,7 @@ fn run_vm_inner<S: StoredValue>(
             Op::UpdateCap(n, kind) => {
                 let name = &chunk.names[n as usize];
                 let mut reference =
-                    crate::eval::PreparedReference::scope(name.clone(), cap_env.clone(), i.strict);
+                    crate::eval::PreparedReference::scope(name.clone(), *cap_env, i.strict);
                 let old = {
                     let b = cap_env.borrow();
                     let bd = b.vars.get(name).expect("captured binding missing");
@@ -16176,8 +16148,7 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::MakeClosure(fidx, name_n) => {
                 let name = (name_n != u32::MAX).then(|| &chunk.names[name_n as usize]);
-                let v =
-                    i.make_function_named(chunk.funcs[fidx as usize].clone(), env.clone(), name);
+                let v = i.make_function_named(chunk.funcs[fidx as usize].clone(), *env, name);
                 observe_allocation(
                     &chunk.feedback,
                     op_pc,
@@ -16268,7 +16239,7 @@ fn run_vm_inner<S: StoredValue>(
                 })?;
                 unreachable!("immutable update always completes abruptly");
             }
-            Op::LoadThis => stack.push_stored(S::from_word(*this_val)),
+            Op::LoadThis => stack.push(*this_val),
             Op::LoadLexicalThis => stack.push(i.resolve_this_binding(env)?),
             Op::RequireObject => {
                 if matches!(
@@ -16295,7 +16266,7 @@ fn run_vm_inner<S: StoredValue>(
                     i,
                     chunk,
                     op_pc,
-                    &this_val.unpack(),
+                    &this_val.clone(),
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
                 )?;
@@ -16331,7 +16302,7 @@ fn run_vm_inner<S: StoredValue>(
                     op_pc,
                     &obj,
                     &chunk.names[n as usize],
-                    v.clone(),
+                    v,
                     &chunk.caches[c as usize],
                 )?;
                 stack.push(v);
@@ -16355,7 +16326,7 @@ fn run_vm_inner<S: StoredValue>(
                     i,
                     chunk,
                     op_pc,
-                    &this_val.unpack(),
+                    &this_val.clone(),
                     &chunk.names[n as usize],
                     v,
                     &chunk.caches[c as usize],
@@ -16418,7 +16389,7 @@ fn run_vm_inner<S: StoredValue>(
                 }
             }
             Op::TryArrayBinding(iterator, next, count) => {
-                let source = stack.last().expect("binding source").clone();
+                let source = stack.last().expect("binding source");
                 let matched = open_array_binding(i, slots, source, iterator, next, count)?;
                 stack.push(Value::Bool(matched));
             }
@@ -16458,7 +16429,7 @@ fn run_vm_inner<S: StoredValue>(
                         .expect("compiled class decorator record is complete");
                     i.prepare_class_decorator(&mut state, None, callback, this_value);
                 }
-                *env = state.outer_class_env.clone();
+                *env = state.outer_class_env;
                 assert!(
                     class_states[plan as usize].replace(state).is_none(),
                     "class plan re-entered before its previous evaluation completed"
@@ -16471,7 +16442,7 @@ fn run_vm_inner<S: StoredValue>(
                     .as_mut()
                     .expect("ClassStart precedes heritage evaluation");
                 i.prepare_class_heritage(state, parent)?;
-                *env = state.class_env.clone();
+                *env = state.class_env;
             }
             Op::ClassKey(plan, member) => {
                 let value = pop!();
@@ -16501,7 +16472,6 @@ fn run_vm_inner<S: StoredValue>(
                     .outer_class_env
                     .borrow()
                     .parent
-                    .clone()
                     .expect("class environment retains its outer environment");
                 let class_plan = &chunk.class_plans[plan as usize];
                 let saved_name =
@@ -16522,7 +16492,6 @@ fn run_vm_inner<S: StoredValue>(
                         .outer_class_env
                         .borrow()
                         .parent
-                        .clone()
                         .expect("class environment retains its outer environment");
                 }
                 i.strict = if class_states.iter().any(Option::is_some) {
@@ -16537,7 +16506,7 @@ fn run_vm_inner<S: StoredValue>(
                     return Err(i.throw("TypeError", "Cannot convert undefined or null to object"));
                 }
                 let object = crate::builtins::box_primitive_pub(i, value);
-                *env = crate::interpreter::new_with_scope(env.clone(), object);
+                *env = crate::interpreter::new_with_scope(*env, object);
             }
             Op::PushLex(scope) => push_lexical_scope(chunk, env, scope, false),
             Op::PushCatchLex(scope) => push_lexical_scope(chunk, env, scope, true),
@@ -16858,7 +16827,7 @@ fn run_vm_inner<S: StoredValue>(
                 let v = pop!();
                 let key = pop!();
                 let obj = pop!();
-                set_computed_element(i, chunk, op_pc, &obj, &key, v.clone())?;
+                set_computed_element(i, chunk, op_pc, &obj, &key, v)?;
                 stack.push(v);
             }
             Op::SetElemDrop => {
@@ -16878,7 +16847,7 @@ fn run_vm_inner<S: StoredValue>(
                 let list = slots.read_value(s as usize);
                 let mut replacement = None;
                 let value = lazy_arguments_element(i, chunk, op_pc, &list, &key, |object| {
-                    replacement = Some(object.clone())
+                    replacement = Some(*object)
                 });
                 if let Some(object) = replacement {
                     slots.write_value(s as usize, object);
@@ -16890,7 +16859,7 @@ fn run_vm_inner<S: StoredValue>(
                 let v = pop!();
                 let key = pop!();
                 if keep {
-                    stack.push(v.clone());
+                    stack.push(v);
                 }
                 let obj = slots.read_value(s as usize);
                 set_computed_element(i, chunk, op_pc, &obj, &key, v)?;
@@ -16996,10 +16965,10 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::Dup2 => {
                 let len = stack.len();
-                let a = stack.raw_slice()[len - 2].clone();
-                let b = stack.raw_slice()[len - 1].clone();
-                stack.push_stored(a);
-                stack.push_stored(b);
+                let a = stack.raw_slice()[len - 2];
+                let b = stack.raw_slice()[len - 1];
+                stack.push(a);
+                stack.push(b);
             }
             Op::GetMethod(n, c) => {
                 let obj = pop!();
@@ -17063,25 +17032,11 @@ fn run_vm_inner<S: StoredValue>(
                 let profiling = observe_arithmetic_operands(&chunk.feedback, op_pc, &a, &b);
                 // Exponentiation keeps a dedicated dispatch so Number⊕Number never enters the
                 // generic `binary` helper: same observable steps (no coercion for two Numbers),
-                // same Number::exponentiate guard, one less indirect match per hot op. The
-                // tagged slice rides the same path behind the opt-in switch.
+                // same Number::exponentiate guard, one less indirect match per hot op.
                 let v = if &*chunk.names[n as usize] == "**" {
-                    match i
-                        .tagged_arithmetic
-                        .then(|| try_tagged_numeric_pow(&a, &b))
-                        .flatten()
-                    {
+                    match try_numeric_pow(&a, &b) {
                         Some(value) => value,
-                        None => match (&(a).view(), &(b).view()) {
-                            (ValueView::Num(x), ValueView::Num(y)) => {
-                                if y.is_nan() || (x.abs() == 1.0 && y.is_infinite()) {
-                                    Value::Num(f64::NAN)
-                                } else {
-                                    Value::Num(x.powf(*y))
-                                }
-                            }
-                            _ => i.binary(&chunk.names[n as usize], a, b)?,
-                        },
+                        None => i.binary(&chunk.names[n as usize], a, b)?,
                     }
                 } else {
                     i.binary(&chunk.names[n as usize], a, b)?
@@ -17092,16 +17047,9 @@ fn run_vm_inner<S: StoredValue>(
             Op::Neg => {
                 let a = pop!();
                 let profiling = observe_arithmetic_operand(&chunk.feedback, op_pc, &a);
-                let v = match i
-                    .tagged_arithmetic
-                    .then(|| try_tagged_numeric_unary(&a, |n| -n))
-                    .flatten()
-                {
+                let v = match try_numeric_unary(&a, |n| -n) {
                     Some(value) => value,
-                    None => match a.view() {
-                        ValueView::Num(n) => Value::Num(-n),
-                        _ => i.eval_unary_vm("-", a)?,
-                    },
+                    None => i.eval_unary_vm("-", a)?,
                 };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
@@ -17109,16 +17057,9 @@ fn run_vm_inner<S: StoredValue>(
             Op::Plus => {
                 let a = pop!();
                 let profiling = observe_arithmetic_operand(&chunk.feedback, op_pc, &a);
-                let v = match i
-                    .tagged_arithmetic
-                    .then(|| try_tagged_numeric_unary(&a, |n| n))
-                    .flatten()
-                {
+                let v = match try_numeric_unary(&a, |n| n) {
                     Some(value) => value,
-                    None => match a.view() {
-                        ValueView::Num(n) => Value::Num(n),
-                        _ => i.eval_unary_vm("+", a)?,
-                    },
+                    None => i.eval_unary_vm("+", a)?,
                 };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
@@ -17130,16 +17071,9 @@ fn run_vm_inner<S: StoredValue>(
             Op::BitNot => {
                 let a = pop!();
                 let profiling = observe_arithmetic_operand(&chunk.feedback, op_pc, &a);
-                let v = match i
-                    .tagged_arithmetic
-                    .then(|| try_tagged_numeric_unary(&a, |n| !crate::eval::to_int32(n) as f64))
-                    .flatten()
-                {
+                let v = match try_numeric_unary(&a, |n| !crate::eval::to_int32(n) as f64) {
                     Some(value) => value,
-                    None => match a.view() {
-                        ValueView::Num(n) => Value::Num(!crate::eval::to_int32(n) as f64),
-                        _ => i.eval_unary_vm("~", a)?,
-                    },
+                    None => i.eval_unary_vm("~", a)?,
                 };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
@@ -17409,16 +17343,16 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::ArrayPush => {
                 let value = pop!();
-                let array = stack.last().expect("array builder missing").clone();
+                let array = stack.last().expect("array builder missing");
                 array_literal_append(i, &array, Some(value))?;
             }
             Op::ArrayHole => {
-                let array = stack.last().expect("array builder missing").clone();
+                let array = stack.last().expect("array builder missing");
                 array_literal_append(i, &array, None)?;
             }
             Op::ArraySpread => {
                 let spread = pop!();
-                let array = stack.last().expect("array builder missing").clone();
+                let array = stack.last().expect("array builder missing");
                 let prefix = i.array_length(&array.as_obj().expect("array builder"));
                 i.expand_spread(&spread, prefix, |i, value| {
                     array_literal_append(i, &array, Some(value))
@@ -17511,12 +17445,7 @@ fn run_vm_inner<S: StoredValue>(
                     let value = pop!();
                     let key = pop!();
                     let object = pop!();
-                    crate::self_hosted::create_data_property_or_throw(
-                        i,
-                        &object,
-                        &key,
-                        PackedValue::pack(value),
-                    )?;
+                    crate::self_hosted::create_data_property_or_throw(i, &object, &key, value)?;
                     stack.push(Value::Bool(true));
                 }
                 AbstractOp::ThrowTypeError(message) => {
@@ -17564,7 +17493,7 @@ fn run_vm_inner<S: StoredValue>(
             Op::ImportMeta => stack.push(i.import_meta_vm(env)),
             Op::NewTarget => {
                 if chunk.lean_new_target {
-                    stack.push_stored(S::from_word(i.new_target));
+                    stack.push(i.new_target);
                 } else {
                     stack.push(i.new_target_vm(env));
                 }
@@ -17599,7 +17528,7 @@ fn run_vm_inner<S: StoredValue>(
                 let base = pop!();
                 let site = &chunk.private_sites[site as usize];
                 let name = &chunk.names[name as usize];
-                i.private_set_vm(name, &base, value.clone(), env, Some(site))?;
+                i.private_set_vm(name, &base, value, env, Some(site))?;
                 stack.push(value);
             }
             Op::UpdatePrivate(name, kind) => {
@@ -17660,14 +17589,14 @@ fn run_vm_inner<S: StoredValue>(
             // ECMA-262 §13.3.7.1 creates a Super Reference with the current function's actual
             // this binding as [[ThisValue]]. Compiled calls keep that binding in the VM frame
             // rather than materializing an activation environment, so use it directly here.
-            Op::SuperThis => stack.push_stored(S::from_word(*this_val)),
+            Op::SuperThis => stack.push(*this_val),
             Op::SuperBase => stack.push(i.super_base_vm(env)?),
             Op::SuperGet | Op::SuperGetMethod => {
                 let keep_receiver = matches!(op, Op::SuperGetMethod);
                 let base = pop!();
                 let key = pop!();
                 let receiver = pop!();
-                let value = i.super_get_vm(&base, receiver.clone(), key)?;
+                let value = i.super_get_vm(&base, receiver, key)?;
                 if keep_receiver {
                     stack.push(receiver);
                 }
@@ -17681,7 +17610,7 @@ fn run_vm_inner<S: StoredValue>(
                     return Err(i.throw("TypeError", "cannot read property of null super base"));
                 }
                 let key = i.to_property_key(&key)?;
-                let value = i.get_member_recv(&base, &key, receiver.clone())?;
+                let value = i.get_member_recv(&base, &key, receiver)?;
                 stack.push(receiver);
                 stack.push(key.into_value());
                 stack.push(base);
@@ -17692,7 +17621,7 @@ fn run_vm_inner<S: StoredValue>(
                 let base = pop!();
                 let key = pop!();
                 let receiver = pop!();
-                i.super_set_vm(&base, receiver, key, value.clone())?;
+                i.super_set_vm(&base, receiver, key, value)?;
                 stack.push(value);
             }
             Op::SuperUpdate(kind) => {
@@ -17703,11 +17632,10 @@ fn run_vm_inner<S: StoredValue>(
                     return Err(i.throw("TypeError", "cannot read property of null super base"));
                 }
                 let key = i.to_property_key(&key)?;
-                let old = i.get_member_recv(&base, &key, receiver.clone())?;
+                let old = i.get_member_recv(&base, &key, receiver)?;
                 if let Some(value) =
                     step_value(i, &chunk.feedback, op_pc, kind, old, |i, value| {
-                        i.set_member_recv(&base, &key, value, receiver.clone())
-                            .map(|_| ())
+                        i.set_member_recv(&base, &key, value, receiver).map(|_| ())
                     })?
                 {
                     stack.push(value);
@@ -17843,7 +17771,7 @@ fn run_vm_inner<S: StoredValue>(
                     (slots.read_value(from_sync_s as usize)).view(),
                     ValueView::Bool(true)
                 );
-                let result = match i.call(next, iterator.clone(), &[]) {
+                let result = match i.call(next, iterator, &[]) {
                     Ok(result) => result,
                     Err(error) if from_sync => {
                         return Ok(VmStep::Await(async_from_sync_abrupt_promise(i, error)?));
@@ -18273,7 +18201,7 @@ impl VmAsyncClose {
             let error = i.throw("TypeError", "iterator 'return' is not callable");
             return (None, Self::failure(swallow_error, error));
         }
-        let result = match i.call(ret, iterator.clone(), &[]) {
+        let result = match i.call(ret, iterator, &[]) {
             Ok(result) => result,
             Err(error) => return (None, Self::failure(swallow_error, error)),
         };
@@ -18347,7 +18275,7 @@ impl VmAsyncClose {
                 Abrupt::Throw(i.make_error("TypeError", "iterator 'return' is not callable"));
             return Self::reject_from_sync(i, iterator, swallow_error, error);
         }
-        let result = match i.call(ret, iterator.clone(), &[]) {
+        let result = match i.call(ret, iterator, &[]) {
             Ok(result) => result,
             Err(error) => {
                 return Self::reject_from_sync(i, iterator, swallow_error, error);
@@ -18463,7 +18391,7 @@ impl VmDelegate {
         match stage {
             DelegateStage::Ready => {
                 let (method, argument, completion) = match signal {
-                    Resume::Next(value) => (self.next.clone(), value, DelegateCompletion::Normal),
+                    Resume::Next(value) => (self.next, value, DelegateCompletion::Normal),
                     Resume::Throw(error) => {
                         let method = match i.get_member_key(&self.iterator, "throw") {
                             Ok(method) => method,
@@ -18494,7 +18422,7 @@ impl VmDelegate {
                             if !ret.is_callable() {
                                 return Self::type_error(i, "iterator 'return' is not callable");
                             }
-                            let result = match i.call(ret, self.iterator.clone(), &[]) {
+                            let result = match i.call(ret, self.iterator, &[]) {
                                 Ok(result) => result,
                                 Err(error) => return Self::abrupt(error),
                             };
@@ -18525,7 +18453,7 @@ impl VmDelegate {
                     }
                     Resume::Terminate => return DelegateAction::Terminate,
                 };
-                let result = match i.call(method, self.iterator.clone(), &[argument]) {
+                let result = match i.call(method, self.iterator, &[argument]) {
                     Ok(result) => result,
                     Err(error) => return Self::abrupt(error),
                 };
@@ -18668,9 +18596,9 @@ pub struct VmCoro {
     cap_env: Env,
     env: Env,
     references: Vec<crate::eval::PreparedReferenceSlot>,
-    this_val: PackedValue,
-    slots: Vec<Cell<PackedValue>>,
-    stack: ValueStack<PackedValue>,
+    this_val: Value,
+    slots: Vec<Cell<Value>>,
+    stack: ValueStack,
     pc: usize,
     /// The `try` handler stack, saved across suspensions so a rejected `await` inside a `try` still
     /// lands in its `catch`.
@@ -18718,8 +18646,8 @@ impl VmCoro {
         }
 
         visitor.chunk(&self.chunk);
-        visitor.value(&Value::Obj(self.realm.clone()));
-        visitor.value(&self.this_val.unpack());
+        visitor.value(&Value::Obj(self.realm));
+        visitor.value(&self.this_val.clone());
         let mut bytes = self
             .references
             .capacity()
@@ -18727,12 +18655,12 @@ impl VmCoro {
             .saturating_add(
                 self.slots
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<PackedValue>()),
+                    .saturating_mul(std::mem::size_of::<Value>()),
             )
             .saturating_add(
                 self.stack
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<PackedValue>()),
+                    .saturating_mul(std::mem::size_of::<Value>()),
             )
             .saturating_add(
                 self.handlers
@@ -18755,10 +18683,10 @@ impl VmCoro {
             bytes = bytes.saturating_add(reference.scan_retained_memory(visitor));
         }
         for value in &self.slots {
-            visitor.value(&value.get().unpack());
+            visitor.value(&value.get().clone());
         }
         for value in self.stack.raw_slice() {
-            visitor.value(&value.unpack());
+            visitor.value(&value.clone());
         }
         for frame in &self.disposal_frames {
             bytes = bytes.saturating_add(
@@ -18815,11 +18743,11 @@ impl VmCoro {
         let references = (0..chunk.n_refs)
             .map(|_| crate::eval::PreparedReferenceSlot::default())
             .collect();
-        let slots: Vec<Cell<PackedValue>> = (0..chunk.n_slots)
-            .map(|_| Cell::new(PackedValue::pack(Value::Undefined)))
+        let slots: Vec<Cell<Value>> = (0..chunk.n_slots)
+            .map(|_| Cell::new(Value::Undefined))
             .collect();
         for (k, a) in params.iter().take(chunk.n_params).enumerate() {
-            slots.write_value(k, a.clone());
+            slots.write_value(k, *a);
         }
         if let Some(slot) = chunk.arguments_slot {
             slots.write_value(
@@ -18830,12 +18758,12 @@ impl VmCoro {
         let class_states = (0..chunk.class_plans.len()).map(|_| None).collect();
         VmCoro {
             chunk,
-            realm: i.global.clone(),
+            realm: i.global,
             host_job_context: i.host_job_context,
-            cap_env: env.clone(),
+            cap_env: env,
             env,
             references,
-            this_val: PackedValue::pack(this_val),
+            this_val: (this_val),
             slots,
             stack: ValueStack::with_capacity(16),
             pc: 0,
@@ -18899,7 +18827,7 @@ impl VmCoro {
         );
         // This local owner remains an external GC root while the driver has
         // temporarily removed the continuation from its owner's internal slot.
-        let realm = self.realm.clone();
+        let realm = self.realm;
         let frame = self.frame.take();
         let suspend = i.with_suspended_context(&realm, self.host_job_context, |i| {
             i.in_resumed(frame.as_deref(), |i| self.resume_active(i, signal))
@@ -19263,7 +19191,7 @@ fn step_value(
         ValueView::Num(old) => Value::Num(if inc { old + 1.0 } else { old - 1.0 }),
         _ => unreachable!("ToNumeric returns only Number or BigInt"),
     };
-    set(i, new_value.clone())?;
+    set(i, new_value)?;
     observe_arithmetic_result(feedback, pc, profiling, &new_value);
     Ok(match kind {
         UpdKind::PreInc | UpdKind::PreDec => Some(new_value),
@@ -19273,9 +19201,9 @@ fn step_value(
 }
 
 /// [`step_value`] pushing its result onto the VM's operand stack.
-fn step_and_store<S: StoredValue>(
+fn step_and_store(
     i: &mut Interp,
-    stack: &mut ValueStack<S>,
+    stack: &mut ValueStack,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     kind: UpdKind,
@@ -19313,19 +19241,19 @@ fn get_named_property(
 }
 
 #[inline]
-unsafe fn get_named_property_packed(
+unsafe fn get_named_property_from_slot(
     i: &mut Interp,
     chunk: &Chunk,
     pc: usize,
-    base: *const PackedValue,
+    base: *const Value,
     name: &str,
     cache: &std::cell::Cell<IcState>,
-) -> Result<PackedValue, Abrupt> {
+) -> Result<Value, Abrupt> {
     if !chunk.feedback.detailed_enabled() {
-        return unsafe { i.get_prop_ic_packed(base, name, cache) };
+        return unsafe { i.get_prop_ic_from_slot(base, name, cache) };
     }
-    let receiver = unsafe { &*base }.unpack();
-    get_named_property(i, chunk, pc, &receiver, name, cache).map(PackedValue::pack)
+    let receiver = *unsafe { &*base };
+    get_named_property(i, chunk, pc, &receiver, name, cache)
 }
 
 #[inline]
@@ -19499,9 +19427,9 @@ fn construct_profiled(
 }
 
 #[inline]
-fn bin_num<S: StoredValue>(
+fn bin_num(
     i: &mut Interp,
-    stack: &mut ValueStack<S>,
+    stack: &mut ValueStack,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     op: &'static str,
@@ -19510,16 +19438,9 @@ fn bin_num<S: StoredValue>(
     let b = stack.pop().expect("vm stack underflow");
     let a = stack.pop().expect("vm stack underflow");
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
-    let v = match i
-        .tagged_arithmetic
-        .then(|| try_tagged_numeric_binary(&a, &b, &f))
-        .flatten()
-    {
+    let v = match try_numeric_binary(&a, &b, &f) {
         Some(value) => value,
-        None => match (&(a).view(), &(b).view()) {
-            (ValueView::Num(x), ValueView::Num(y)) => Value::Num(f(*x, *y)),
-            _ => i.binary(op, a, b)?,
-        },
+        None => i.binary(op, a, b)?,
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
     stack.push(v);
@@ -19531,7 +19452,7 @@ fn bin_num<S: StoredValue>(
 /// through the complete interpreter helper, preserving ToPrimitive/ToNumeric ordering and
 /// abrupt completion behavior mandated by ECMA-262 §13.15 (Additive Operators).
 #[inline(always)]
-fn try_tagged_numeric_binary<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
+fn try_numeric_binary<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
 where
     F: Fn(f64, f64) -> f64,
 {
@@ -19549,7 +19470,7 @@ where
 /// where the f64 predicate is exactly the specified comparison (including `-0 == +0` and every
 /// NaN case reducing to `false`).
 #[inline(always)]
-fn try_tagged_numeric_cmp<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
+fn try_numeric_cmp<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
 where
     F: Fn(f64, f64) -> bool,
 {
@@ -19564,7 +19485,7 @@ where
 /// preserve ToNumeric ordering and the BigInt mixing check of ECMA-262 §13.7–13.8. Number operands
 /// run ToInt32 (§7.1.5) on the exact extracted bits, identical to `bin_i32`.
 #[inline(always)]
-fn try_tagged_numeric_i32<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
+fn try_numeric_i32<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
 where
     F: Fn(i32, i32) -> i32,
 {
@@ -19581,7 +19502,7 @@ where
 /// (ECMA-262 §13.5.5–6, §13.5.9). The closure is the same f64 transform the canonical fast path
 /// runs, so signed-zero negation, `+` identity, and ToInt32-based bitwise NOT match exactly.
 #[inline(always)]
-fn try_tagged_numeric_unary<F>(value: &Value, f: F) -> Option<Value>
+fn try_numeric_unary<F>(value: &Value, f: F) -> Option<Value>
 where
     F: FnOnce(f64) -> f64,
 {
@@ -19596,7 +19517,7 @@ where
 /// with an infinite exponent, are NaN even though raw `powf` would round them to 1.0). Returning
 /// `None` keeps the complete helper with BigInt mixing and ToNumeric ordering (ECMA-262 §13.9).
 #[inline(always)]
-fn try_tagged_numeric_pow(left: &Value, right: &Value) -> Option<Value> {
+fn try_numeric_pow(left: &Value, right: &Value) -> Option<Value> {
     let (ValueView::Num(left), ValueView::Num(right)) = (&(left).view(), &(right).view()) else {
         return None;
     };
@@ -19610,9 +19531,9 @@ fn try_tagged_numeric_pow(left: &Value, right: &Value) -> Option<Value> {
 }
 
 #[inline]
-fn bin_i32<S: StoredValue>(
+fn bin_i32(
     i: &mut Interp,
-    stack: &mut ValueStack<S>,
+    stack: &mut ValueStack,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     op: &'static str,
@@ -19621,19 +19542,9 @@ fn bin_i32<S: StoredValue>(
     let b = stack.pop().expect("vm stack underflow");
     let a = stack.pop().expect("vm stack underflow");
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
-    let v = match i
-        .tagged_arithmetic
-        .then(|| try_tagged_numeric_i32(&a, &b, &f))
-        .flatten()
-    {
+    let v = match try_numeric_i32(&a, &b, &f) {
         Some(value) => value,
-        None => {
-            if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
-                Value::Num(f(crate::eval::to_int32(*x), crate::eval::to_int32(*y)) as f64)
-            } else {
-                i.binary(op, a, b)?
-            }
-        }
+        None => i.binary(op, a, b)?,
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
     stack.push(v);
@@ -19641,27 +19552,18 @@ fn bin_i32<S: StoredValue>(
 }
 
 #[inline]
-fn bin_cmp<S: StoredValue>(
+fn bin_cmp(
     i: &mut Interp,
-    stack: &mut ValueStack<S>,
+    stack: &mut ValueStack,
     op: &'static str,
     f: impl Fn(f64, f64) -> bool,
 ) -> Result<(), Abrupt> {
     let b = stack.pop().expect("vm stack underflow");
     let a = stack.pop().expect("vm stack underflow");
-    if let Some(v) = i
-        .tagged_arithmetic
-        .then(|| try_tagged_numeric_cmp(&a, &b, &f))
-        .flatten()
-    {
-        stack.push(v);
-        return Ok(());
-    }
-    if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
-        stack.push(Value::Bool(f(*x, *y)));
-        return Ok(());
-    }
-    let v = i.binary(op, a, b)?;
+    let v = match try_numeric_cmp(&a, &b, &f) {
+        Some(value) => value,
+        None => i.binary(op, a, b)?,
+    };
     stack.push(v);
     Ok(())
 }
@@ -19712,7 +19614,7 @@ impl Chunk {
         let object = self.inline_targets[t as usize].pin.upgrade()?;
         let object = object.borrow();
         match &object.call {
-            crate::value::Callable::User(user) => Some(user.env.clone()),
+            crate::value::Callable::User(user) => Some(user.env),
             _ => None,
         }
     }
@@ -20212,9 +20114,7 @@ impl Chunk {
         } else if ic.env & 2 != 0 {
             let parent = {
                 let b = env.borrow();
-                ic.matches_activation(&b.vars)
-                    .then(|| b.parent.clone())
-                    .flatten()
+                ic.matches_activation(&b.vars).then(|| b.parent).flatten()
             };
             if let Some(parent) = parent {
                 if Env::as_ptr(&parent) as usize == ic.env & !7 {
@@ -20488,7 +20388,7 @@ impl Chunk {
     }
 
     /// Whether calls run without an activation environment (nothing captured, no lexical
-    /// `this`) — the precondition for the JIT→JIT fast call's moved-argument entry.
+    /// `this`), allowing the no-activation JIT entry.
     pub(crate) fn jit_no_activation(&self) -> bool {
         !self.resumable && !self.needs_env()
     }
@@ -20587,17 +20487,17 @@ impl Chunk {
     pub(crate) fn jit_needs_activation_state(&self) -> bool {
         self.jit_needs_activation_state
     }
-    /// Whether const `k` is a trivially-copyable value the JIT may materialize inline.
+    /// Whether const `k` belongs to the JIT's inline scalar-constant template.
     pub(crate) fn jit_const_copyable(&self, k: u32) -> bool {
         matches!(
             (self.consts[k as usize]).view(),
             ValueView::Undefined | ValueView::Null | ValueView::Bool(_) | ValueView::Num(_)
         )
     }
-    /// One-word execution encoding for an immediate constant; heap constants need ownership
-    /// cloning and are deliberately excluded. All Number NaNs use the canonical packed bits.
-    pub(crate) fn jit_const_packed_bits(&self, k: u32) -> Option<u64> {
-        PackedValue::scalar_bits(&self.consts[k as usize])
+    /// Canonical bits for the scalar-constant template. Reference-bearing constants use their
+    /// own loading and lifetime checks. All Number NaNs use the canonical packed bits.
+    pub(crate) fn jit_const_scalar_bits(&self, k: u32) -> Option<u64> {
+        Value::scalar_bits(&self.consts[k as usize])
     }
     /// The execution word of string const `k`, `PACK_STR | cell`, which generated
     /// code pushes as an immediate; `None` for any other const. The word owns nothing. It names
@@ -20629,18 +20529,6 @@ impl Chunk {
             _ => None,
         }
     }
-    /// The first 16 bytes of a copyable const as two words, for inline materialization.
-    /// repr(u8) puts each payload at its own alignment: Bool's byte sits in word0 at offset 1,
-    /// Num's f64 fills word1 (offset 8).
-    pub(crate) fn jit_const_bits(&self, k: u32) -> (u64, u64) {
-        match &(self.consts[k as usize]).view() {
-            ValueView::Undefined => (0, 0),
-            ValueView::Null => (2, 0),
-            ValueView::Bool(b) => (3 | ((*b as u64) << 8), 0),
-            ValueView::Num(n) => (4, n.to_bits()),
-            _ => unreachable!("non-copyable const in jit_const_bits"),
-        }
-    }
     pub(crate) fn jit_make_run_env(
         &self,
         i: &mut Interp,
@@ -20651,23 +20539,6 @@ impl Chunk {
         self.make_run_env(i, env, this_val, args)
     }
 
-    /// Seed captured bindings from the still-live immutable caller operand list. The callee's
-    /// frame and environment receive their own copies; only the caller retires its operands.
-    /// Decode `this` only for an activation that binds it (an inner arrow chain reads it).
-    pub(crate) fn jit_make_run_env_packed(
-        &self,
-        i: &mut Interp,
-        env: &Env,
-        this_val: &crate::jit::JitThis,
-        args: &[PackedValue],
-    ) -> Env {
-        let this_val = &if self.env_this && !self.lexical_this {
-            this_val.unpack()
-        } else {
-            Value::Undefined
-        };
-        self.make_run_env_from(i, env, this_val, CallArgs::Packed(args))
-    }
     /// (pops, pushes) of the op at `pc`, for the static stack-depth analysis. `None` = an op the
     /// JIT can't account for (which refuses compilation).
     pub(crate) fn jit_stack_effect(&self, pc: usize) -> Option<(usize, usize)> {
@@ -20968,7 +20839,7 @@ pub(crate) struct NativeActivation {
     chunk: *const Chunk,
     env: Env,
     cap_env: Env,
-    stack: ValueStack<PackedValue>,
+    stack: ValueStack,
     references: Vec<crate::eval::PreparedReferenceSlot>,
     disposal_frames: Vec<Vec<crate::interpreter::Disposable>>,
     class_states: Vec<Option<crate::eval::PreparedClassEvaluation>>,
@@ -20983,7 +20854,7 @@ pub(crate) struct NativeContinuation {
     pub(crate) env: *mut Env,
     pub(crate) cap_env: *const Env,
     pub(crate) references: *mut [crate::eval::PreparedReferenceSlot],
-    pub(crate) stack: *mut ValueStack<PackedValue>,
+    pub(crate) stack: *mut ValueStack,
     pub(crate) disposal_frames: *mut Vec<Vec<crate::interpreter::Disposable>>,
     pub(crate) class_states: *mut [Option<crate::eval::PreparedClassEvaluation>],
 }
@@ -21096,7 +20967,7 @@ fn jit_bridge_op(op: &Op) -> bool {
 unsafe fn jit_continuation_operation(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
     exits: bool,
 ) -> crate::jit::SpFlag {
     let state = &mut *ctx.resume_activation;
@@ -21110,7 +20981,7 @@ unsafe fn jit_continuation_operation(
     let result = if next == chunk.ops.len() {
         Ok(VmStep::Done(Value::Undefined))
     } else {
-        let this = ctx.this_view();
+        let this = ctx.this_value();
         run_vm(
             &mut *ctx.interp,
             chunk,
@@ -21169,7 +21040,7 @@ unsafe fn jit_continuation_operation(
 pub(crate) unsafe extern "C" fn jit_slice_op(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     jit_continuation_operation(&mut *ctx, pc, sp, true)
 }
@@ -21179,10 +21050,10 @@ unsafe fn new_native_activation(ctx: &crate::jit::JitCtx) -> Box<NativeActivatio
     let borrowed = std::mem::ManuallyDrop::new(crate::interpreter::Env::from_raw(
         ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
     ));
-    let env = crate::interpreter::Env::clone(&borrowed);
+    let env = *borrowed;
     Box::new(NativeActivation {
         chunk: ctx.chunk,
-        cap_env: env.clone(),
+        cap_env: env,
         env,
         stack: ValueStack::default(),
         references: (0..chunk.n_refs)
@@ -21218,7 +21089,7 @@ thread_local! {
 pub(crate) unsafe extern "C" fn jit_reference_op(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     #[cfg(test)]
     TEST_REFERENCE_HELPERS.with(|count| count.set(count.get() + 1));
@@ -21245,13 +21116,13 @@ pub(crate) unsafe extern "C" fn jit_reference_op(
                 .as_mut()
                 .expect("prepared Reference resolved before GetValue");
             i.read_prepared_reference(reference).map(|value| {
-                sp.write(PackedValue::pack(value));
+                sp.write(value);
                 sp = sp.add(1);
             })
         }
         Op::StoreRef(reference) => {
             sp = sp.sub(1);
-            let value = sp.read().into_value();
+            let value = sp.read();
             let reference = (*ctx.references_raw.add(reference as usize))
                 .as_mut()
                 .expect("prepared Reference resolved before PutValue");
@@ -21284,9 +21155,9 @@ fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
         })
         .collect();
     let next = if catch {
-        crate::interpreter::new_catch_scope(env.clone())
+        crate::interpreter::new_catch_scope(*env)
     } else {
-        crate::interpreter::new_scope(Some(env.clone()))
+        crate::interpreter::new_scope(Some(*env))
     };
     // A block record is never a VariableEnvironment, so it records no `lexical_names` (only
     // EvalDeclarationInstantiation's variable-environment check reads them; it tests block
@@ -21313,7 +21184,6 @@ fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
     let parent = env
         .borrow()
         .parent
-        .clone()
         .expect("per-iteration lexical environment has a parent");
     let next = crate::interpreter::new_scope(Some(parent));
     let bindings = {
@@ -21334,8 +21204,8 @@ fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
                 .expect("per-iteration binding missing");
                 (
                     binding.name.clone(),
-                    crate::interpreter::Binding::data_word(
-                        previous.word(),
+                    crate::interpreter::Binding::data(
+                        previous.value(),
                         previous.mutable,
                         previous.initialized,
                     )
@@ -21365,7 +21235,6 @@ fn pop_lexical_scope(env: &mut Env) {
     let parent = env
         .borrow()
         .parent
-        .clone()
         .expect("compiled environment scope has a parent");
     *env = parent;
 }
@@ -21383,7 +21252,7 @@ fn jit_scope_operation(op: &Op) -> bool {
 unsafe fn jit_scope_op(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     if !ctx.resume_activation.is_null() && (*ctx.resume_activation).chunk == ctx.chunk {
@@ -21402,7 +21271,7 @@ unsafe fn jit_scope_op(
         Op::CloneLex(scope) => clone_lexical_scope(chunk, &mut activation.env, scope),
         Op::InitLex(name) => {
             sp = sp.sub(1);
-            let value = sp.read().into_value();
+            let value = sp.read();
             initialize_lexical_binding(chunk, &activation.env, name, value);
         }
         Op::PopEnv => pop_lexical_scope(&mut activation.env),
@@ -21421,7 +21290,7 @@ unsafe fn jit_scope_op(
 unsafe fn jit_vm_operation(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let chunk = &*ctx.chunk;
@@ -21430,7 +21299,7 @@ unsafe fn jit_vm_operation(
     }
     jit_opstat(ctx, pc);
     ensure_native_activation(ctx);
-    let this = ctx.this_view();
+    let this = ctx.this_value();
     let activation = ctx
         .activation
         .as_mut()
@@ -21487,7 +21356,7 @@ unsafe fn jit_vm_operation(
 unsafe fn jit_private_op_inner(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
-    sp: &mut *mut PackedValue,
+    sp: &mut *mut Value,
 ) -> Result<(), Abrupt> {
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
@@ -21518,13 +21387,13 @@ unsafe fn jit_private_op_inner(
     macro_rules! pop {
         () => {{
             *sp = sp.sub(1);
-            sp.read().into_value()
+            sp.read()
         }};
     }
     macro_rules! push {
         ($v:expr) => {{
             let v = $v;
-            sp.write(PackedValue::pack(v));
+            sp.write(v);
             *sp = sp.add(1);
         }};
     }
@@ -21548,7 +21417,7 @@ unsafe fn jit_private_op_inner(
         _ => {
             let value = pop!();
             let base = pop!();
-            i.private_set_vm(name, &base, value.clone(), private_env, site)?;
+            i.private_set_vm(name, &base, value, private_env, site)?;
             push!(value);
         }
     }
@@ -21558,7 +21427,7 @@ unsafe fn jit_private_op_inner(
 pub(crate) unsafe extern "C" fn jit_exec(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let chunk = &*(*ctx).chunk;
     #[cfg(test)]
@@ -21645,26 +21514,25 @@ pub(crate) unsafe extern "C" fn jit_exec(
 }
 
 /// Strict equality fallback for cases intentionally left out of the generated fast path:
-/// equal-length string content, BigInts, and operands whose last owner must run a destructor.
-/// This operation cannot throw, so it can bypass the generic bytecode decoder and stack/slot
-/// adaptation while retaining ordinary `Value` ownership semantics.
+/// equal-length string content and BigInts. This operation cannot throw, so it can bypass
+/// the generic bytecode decoder and stack/slot adaptation while preserving those comparisons.
 pub(crate) unsafe extern "C" fn jit_strict_eq(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     let chunk = unsafe { &*ctx.chunk };
     let op = &chunk.ops[pc as usize];
     debug_assert!(matches!(op, Op::StrictEq | Op::StrictNotEq));
     let base = unsafe { sp.sub(2) };
-    let left = unsafe { base.read().into_value() };
-    let right = unsafe { base.add(1).read().into_value() };
+    let left = unsafe { base.read() };
+    let right = unsafe { base.add(1).read() };
     let mut equal = unsafe { (&*ctx.interp).strict_equals(&left, &right) };
     if matches!(op, Op::StrictNotEq) {
         equal = !equal;
     }
-    unsafe { base.write(PackedValue::pack(Value::Bool(equal))) };
+    unsafe { base.write(Value::Bool(equal)) };
     crate::jit::SpFlag {
         sp: unsafe { base.add(1) },
         flag: 0,
@@ -21675,7 +21543,7 @@ pub(crate) unsafe extern "C" fn jit_strict_eq(
 pub(crate) unsafe extern "C" fn jit_make_regexp(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     let chunk = unsafe { &*ctx.chunk };
@@ -21692,7 +21560,7 @@ pub(crate) unsafe extern "C" fn jit_make_regexp(
                     .len()
                     .saturating_add(chunk.names[flags as usize].len()),
             );
-            unsafe { sp.write(PackedValue::pack(value)) };
+            unsafe { sp.write(value) };
             crate::jit::SpFlag {
                 sp: unsafe { sp.add(1) },
                 flag: 0,
@@ -21712,22 +21580,22 @@ pub(crate) unsafe extern "C" fn jit_make_regexp(
 pub(crate) unsafe extern "C" fn jit_add_strings(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let base = unsafe { sp.sub(2) };
-    if !matches!(&(unsafe { &(*base).unpack() }).view(), ValueView::Str(_))
+    if !matches!(&(unsafe { &(*base).clone() }).view(), ValueView::Str(_))
         || !matches!(
-            &(unsafe { &(*base.add(1)).unpack() }).view(),
+            &(unsafe { &(*base.add(1)).clone() }).view(),
             ValueView::Str(_)
         )
     {
         return unsafe { jit_exec(ctx, pc, sp) };
     }
 
-    let ValueView::Str(left) = (unsafe { base.read().into_value() }).view() else {
+    let ValueView::Str(left) = (unsafe { base.read() }).view() else {
         unreachable!()
     };
-    let ValueView::Str(right) = (unsafe { base.add(1).read().into_value() }).view() else {
+    let ValueView::Str(right) = (unsafe { base.add(1).read() }).view() else {
         unreachable!()
     };
     if left.len().saturating_add(right.len()) > crate::interpreter::MAX_STR_LEN {
@@ -21738,7 +21606,7 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
         return crate::jit::SpFlag { sp: base, flag: 1 };
     }
 
-    unsafe { base.write(PackedValue::pack(Value::Str(left.concat_owned(&right)))) };
+    unsafe { base.write(Value::Str(left.concat_owned(&right))) };
     crate::jit::SpFlag {
         sp: unsafe { base.add(1) },
         flag: 0,
@@ -21754,13 +21622,13 @@ thread_local! {
 
 /// Hot native intrinsics after the machine-code call IC has already proved builtin identity.
 /// Emitted guards keep string/property intrinsics on non-coercing cases. Function#apply performs
-/// its own dense-list guards; Array push/pop transfer ownership directly between the operand
-/// stack and dense storage. Every guard miss invokes the exact builtin implementation.
+/// its own dense-list guards; Array push/pop copy canonical words between the operand stack
+/// and dense storage. Every guard miss invokes the exact builtin implementation.
 /// [`jit_intrinsic_inner`] as the explicit call it is: the callee records the call's position.
 pub(crate) unsafe extern "C" fn jit_intrinsic(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let site = (packed & 0xFFFF) as usize;
     let i = unsafe { &mut *(*ctx).interp };
@@ -21773,7 +21641,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
 unsafe fn jit_intrinsic_inner(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let i = &mut *ctx.interp;
@@ -21797,9 +21665,9 @@ unsafe fn jit_intrinsic_inner(
         // argument and only read or intern a string, so they need none of the native-call
         // boundary below. The template proved the operand types.
         // Move the three owners out; each is released exactly once below.
-        let receiver = base.read().into_value();
+        let receiver = base.read();
         let callee = base.add(1).read();
-        let ValueView::Num(n) = (base.add(2).read().into_value()).view() else {
+        let ValueView::Num(n) = (base.add(2).read()).view() else {
             unreachable!("Number argument guard")
         };
         let value = if intrinsic == INTRINSIC_CHAR_CODE_AT {
@@ -21818,7 +21686,7 @@ unsafe fn jit_intrinsic_inner(
         };
         drop(callee);
         drop(receiver);
-        base.write(PackedValue::pack(value));
+        base.write(value);
         return crate::jit::SpFlag {
             sp: base.add(1),
             flag: 0,
@@ -21827,14 +21695,14 @@ unsafe fn jit_intrinsic_inner(
     if intrinsic == INTRINSIC_ARRAY_PUSH {
         // [receiver, callee, value]. A guarded dense append runs no author code, so it needs
         // none of the native-call boundary below (depth, safepoint, new.target bookkeeping).
-        if let ValueView::Obj(receiver) = ((*base).unpack()).view() {
+        if let ValueView::Obj(receiver) = ((*base).clone()).view() {
             let value = base.add(2).read();
-            match crate::builtins::array_push_dense_packed(i, &receiver, value) {
+            match crate::builtins::array_push_dense(i, &receiver, value) {
                 Ok(length) => {
                     drop(receiver);
                     std::ptr::drop_in_place(base);
                     std::ptr::drop_in_place(base.add(1));
-                    base.write(PackedValue::pack(Value::Num(length as f64)));
+                    base.write(Value::Num(length as f64));
                     return crate::jit::SpFlag {
                         sp: base.add(1),
                         flag: 0,
@@ -21859,14 +21727,13 @@ unsafe fn jit_intrinsic_inner(
                 // run outside a pending construction. Dense push/pop themselves cannot observe
                 // these fields, but a prototype setter or unusual array-like on the miss path can.
                 let saved_ctor = std::mem::replace(&mut i.constructing, false);
-                let saved_nt =
-                    std::mem::replace(&mut i.new_target, PackedValue::pack(Value::Undefined));
+                let saved_nt = std::mem::replace(&mut i.new_target, Value::Undefined);
                 let r = match intrinsic {
                     INTRINSIC_CHAR_AT => {
-                        let ValueView::Str(s) = &((*base).unpack()).view() else {
+                        let ValueView::Str(s) = &((*base).clone()).view() else {
                             unreachable!("charAt intrinsic receiver guard")
                         };
-                        let ValueView::Num(n) = &((*base.add(2)).unpack()).view() else {
+                        let ValueView::Num(n) = &((*base.add(2)).clone()).view() else {
                             unreachable!("charAt intrinsic index guard")
                         };
                         let idx = if n.is_nan() { 0.0 } else { n.trunc() };
@@ -21882,10 +21749,10 @@ unsafe fn jit_intrinsic_inner(
                     INTRINSIC_CODE_POINT_AT => {
                         #[cfg(test)]
                         TEST_JIT_CODE_POINT_INTRINSICS.with(|count| count.set(count.get() + 1));
-                        let ValueView::Str(s) = &((*base).unpack()).view() else {
+                        let ValueView::Str(s) = &((*base).clone()).view() else {
                             unreachable!("codePointAt intrinsic receiver guard")
                         };
-                        let ValueView::Num(n) = &((*base.add(2)).unpack()).view() else {
+                        let ValueView::Num(n) = &((*base.add(2)).clone()).view() else {
                             unreachable!("codePointAt intrinsic index guard")
                         };
                         let idx = if n.is_nan() { 0.0 } else { n.trunc() };
@@ -21897,13 +21764,13 @@ unsafe fn jit_intrinsic_inner(
                         })
                     }
                     INTRINSIC_STRING_SLICE => {
-                        let ValueView::Str(s) = &((*base).unpack()).view() else {
+                        let ValueView::Str(s) = &((*base).clone()).view() else {
                             unreachable!("slice intrinsic receiver guard")
                         };
-                        let ValueView::Num(start) = &((*base.add(2)).unpack()).view() else {
+                        let ValueView::Num(start) = &((*base.add(2)).clone()).view() else {
                             unreachable!("slice intrinsic start guard")
                         };
-                        let ValueView::Num(end) = &((*base.add(3)).unpack()).view() else {
+                        let ValueView::Num(end) = &((*base.add(3)).clone()).view() else {
                             unreachable!("slice intrinsic end guard")
                         };
                         debug_assert!(s.ascii_hint());
@@ -21935,11 +21802,11 @@ unsafe fn jit_intrinsic_inner(
                         })
                     }
                     INTRINSIC_OBJECT_HAS_OWN => {
-                        let object = (*base.add(2)).unpack();
+                        let object = *base.add(2);
                         let ValueView::Obj(_) = object.view() else {
                             unreachable!("hasOwn intrinsic object guard")
                         };
-                        let ValueView::Str(key) = &((*base.add(3)).unpack()).view() else {
+                        let ValueView::Str(key) = &((*base.add(3)).clone()).view() else {
                             unreachable!("hasOwn intrinsic key guard")
                         };
                         crate::builtins::has_own_property_trapped(
@@ -21958,7 +21825,7 @@ unsafe fn jit_intrinsic_inner(
                         debug_assert!(call_argc >= 1);
                         let forwarded = call_argc - 1;
                         match i.call_jit_fast(
-                            &(*base).unpack(),
+                            &(*base).clone(),
                             base.add(2),
                             base.add(3),
                             forwarded,
@@ -21971,11 +21838,8 @@ unsafe fn jit_intrinsic_inner(
                             }
                             None => crate::builtins::nf_function_call(
                                 i,
-                                (*base).unpack(),
-                                values_from_words(std::slice::from_raw_parts(
-                                    base.add(2),
-                                    call_argc,
-                                )),
+                                *base,
+                                std::slice::from_raw_parts(base.add(2), call_argc),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -21986,50 +21850,49 @@ unsafe fn jit_intrinsic_inner(
                         // into an already-JIT-compiled target frame. No observable operation occurs
                         // before every list guard has passed; unusual array-likes and non-JIT targets
                         // execute the named builtin unchanged.
-                        let dense = match (
-                            &((*base).unpack()).view(),
-                            &((*base.add(3)).unpack()).view(),
-                        ) {
-                            (ValueView::Obj(_), ValueView::Obj(list))
-                                if i.ordinary_get_ptr(crate::value::Gc::as_ptr(list) as usize)
-                                    && !i.mapped_arguments.contains_key(
+                        let dense =
+                            match (&((*base).clone()).view(), &((*base.add(3)).clone()).view()) {
+                                (ValueView::Obj(_), ValueView::Obj(list))
+                                    if i.ordinary_get_ptr(
+                                        crate::value::Gc::as_ptr(list) as usize
+                                    ) && !i.mapped_arguments.contains_key(
                                         &(crate::value::Gc::as_ptr(list) as usize),
                                     ) =>
-                            {
-                                let b = list.borrow();
-                                let len = match b.props.get("length") {
-                                    Some(p) if !p.accessor() => match (p.value()).view() {
-                                        ValueView::Num(n)
-                                            if n >= 0.0
-                                                && n.is_finite()
-                                                && n.fract() == 0.0
-                                                && n <= crate::interpreter::MAX_ARGUMENTS_LEN
-                                                    as f64 =>
-                                        {
-                                            Some(n as usize)
-                                        }
+                                {
+                                    let b = list.borrow();
+                                    let len = match b.props.get("length") {
+                                        Some(p) if !p.accessor() => match (p.value()).view() {
+                                            ValueView::Num(n)
+                                                if n >= 0.0
+                                                    && n.is_finite()
+                                                    && n.fract() == 0.0
+                                                    && n <= crate::interpreter::MAX_ARGUMENTS_LEN
+                                                        as f64 =>
+                                            {
+                                                Some(n as usize)
+                                            }
+                                            _ => None,
+                                        },
                                         _ => None,
-                                    },
-                                    _ => None,
-                                };
-                                len.and_then(|len| {
-                                    let mut values = Vec::with_capacity(len);
-                                    for k in 0..len {
-                                        let value = b
-                                            .props
-                                            .get_index(k as u32)
-                                            .filter(|p| !p.accessor())
-                                            .map(|p| p.value())?;
-                                        values.push(PackedValue::pack(value));
-                                    }
-                                    Some(values)
-                                })
-                            }
-                            _ => None,
-                        };
+                                    };
+                                    len.and_then(|len| {
+                                        let mut values = Vec::with_capacity(len);
+                                        for k in 0..len {
+                                            let value = b
+                                                .props
+                                                .get_index(k as u32)
+                                                .filter(|p| !p.accessor())
+                                                .map(|p| p.value())?;
+                                            values.push(value);
+                                        }
+                                        Some(values)
+                                    })
+                                }
+                                _ => None,
+                            };
                         if let Some(mut values) = dense {
                             match i.call_jit_fast(
-                                &(*base).unpack(),
+                                &(*base).clone(),
                                 base.add(2),
                                 values.as_mut_ptr(),
                                 values.len(),
@@ -22043,25 +21906,25 @@ unsafe fn jit_intrinsic_inner(
                                 }
                                 None => crate::builtins::nf_function_apply(
                                     i,
-                                    (*base).unpack(),
-                                    values_from_words(std::slice::from_raw_parts(base.add(2), 2)),
+                                    *base,
+                                    std::slice::from_raw_parts(base.add(2), 2),
                                 )
                                 .map_err(Abrupt::Throw),
                             }
                         } else {
                             crate::builtins::nf_function_apply(
                                 i,
-                                (*base).unpack(),
-                                values_from_words(std::slice::from_raw_parts(base.add(2), 2)),
+                                *base,
+                                std::slice::from_raw_parts(base.add(2), 2),
                             )
                             .map_err(Abrupt::Throw)
                         }
                     }
                     INTRINSIC_ARRAY_PUSH => {
-                        let ValueView::Obj(o) = &((*base).unpack()).view() else {
+                        let ValueView::Obj(o) = &((*base).clone()).view() else {
                             unreachable!("push intrinsic receiver guard")
                         };
-                        let arg = base.add(2).read().into_value();
+                        let arg = base.add(2).read();
                         push_arg_moved = true;
                         match crate::builtins::jit_array_push_one(i, o, arg) {
                             Ok(v) => Ok(v),
@@ -22069,35 +21932,35 @@ unsafe fn jit_intrinsic_inner(
                                 // The transfer helper promises a guard miss has no side effects and
                                 // returns the original owner, so the generic builtin sees the exact
                                 // operand stack it would have seen without specialization.
-                                base.add(2).write(PackedValue::pack(arg));
+                                base.add(2).write(arg);
                                 push_arg_moved = false;
                                 crate::builtins::nf_array_push(
                                     i,
-                                    (*base).unpack(),
-                                    values_from_words(std::slice::from_raw_parts(base.add(2), 1)),
+                                    *base,
+                                    std::slice::from_raw_parts(base.add(2), 1),
                                 )
                                 .map_err(Abrupt::Throw)
                             }
                         }
                     }
                     INTRINSIC_ARRAY_POP => {
-                        let ValueView::Obj(o) = &((*base).unpack()).view() else {
+                        let ValueView::Obj(o) = &((*base).clone()).view() else {
                             unreachable!("pop intrinsic receiver guard")
                         };
                         match crate::builtins::jit_array_pop(i, o) {
                             Some(v) => Ok(v),
-                            None => crate::builtins::nf_array_pop(i, (*base).unpack(), &[])
-                                .map_err(Abrupt::Throw),
+                            None => {
+                                crate::builtins::nf_array_pop(i, *base, &[]).map_err(Abrupt::Throw)
+                            }
                         }
                     }
                     INTRINSIC_REGEXP_EXEC_DISCARD => {
-                        let (ValueView::Obj(_), ValueView::Str(input)) = (
-                            &((*base).unpack()).view(),
-                            &((*base.add(2)).unpack()).view(),
-                        ) else {
+                        let (ValueView::Obj(_), ValueView::Str(input)) =
+                            (&((*base).clone()).view(), &((*base.add(2)).clone()).view())
+                        else {
                             unreachable!("regexp exec intrinsic guards")
                         };
-                        match crate::builtins::regexp_exec_discard_fast(i, &(*base).unpack(), input)
+                        match crate::builtins::regexp_exec_discard_fast(i, &(*base).clone(), input)
                         {
                             Some(r) => {
                                 i.interrupt_poll_force()?;
@@ -22105,8 +21968,8 @@ unsafe fn jit_intrinsic_inner(
                             }
                             None => crate::builtins::regexp_exec(
                                 i,
-                                (*base).unpack(),
-                                values_from_words(std::slice::from_raw_parts(base.add(2), 1)),
+                                *base,
+                                std::slice::from_raw_parts(base.add(2), 1),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -22114,9 +21977,9 @@ unsafe fn jit_intrinsic_inner(
                     INTRINSIC_STRING_REPLACE_DISCARD => {
                         match crate::builtins::string_replace_discard_fast(
                             i,
-                            &(*base).unpack(),
-                            &(*base.add(2)).unpack(),
-                            &(*base.add(3)).unpack(),
+                            &(*base).clone(),
+                            &(*base.add(2)).clone(),
+                            &(*base.add(3)).clone(),
                         ) {
                             Some(r) => {
                                 i.interrupt_poll_force()?;
@@ -22124,8 +21987,8 @@ unsafe fn jit_intrinsic_inner(
                             }
                             None => crate::builtins::nf_string_replace(
                                 i,
-                                (*base).unpack(),
-                                values_from_words(std::slice::from_raw_parts(base.add(2), 2)),
+                                *base,
+                                std::slice::from_raw_parts(base.add(2), 2),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -22133,15 +21996,15 @@ unsafe fn jit_intrinsic_inner(
                     INTRINSIC_STRING_SPLIT_DISCARD => {
                         match crate::builtins::string_split_discard_fast(
                             i,
-                            &(*base).unpack(),
-                            &(*base.add(2)).unpack(),
+                            &(*base).clone(),
+                            &(*base.add(2)).clone(),
                             &Value::Undefined,
                         ) {
                             Some(r) => r.map_err(Abrupt::Throw),
                             None => crate::builtins::nf_string_split(
                                 i,
-                                (*base).unpack(),
-                                values_from_words(std::slice::from_raw_parts(base.add(2), 1)),
+                                *base,
+                                std::slice::from_raw_parts(base.add(2), 1),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -22167,7 +22030,7 @@ unsafe fn jit_intrinsic_inner(
     }
     match r {
         Ok(v) => {
-            base.write(PackedValue::pack(v));
+            base.write(v);
             crate::jit::SpFlag {
                 sp: base.add(1),
                 flag: 0,
@@ -22234,7 +22097,7 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
     if !threw {
         while let Some(r) = i.run_pending_tail(true) {
             match r {
-                Ok(v) => caller.ret = PackedValue::pack(v),
+                Ok(v) => caller.ret = v,
                 Err(e) => {
                     caller.error = Some(e);
                     threw = true;
@@ -22261,12 +22124,12 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
 /// As for [`jit_call_hit`]: `sp` is the live operand top of a `CallWithThis(3)`/`Call(3)` site.
 unsafe fn jit_reflect_apply_operand_only(
     ctx: &mut crate::jit::JitCtx,
-    sp: *mut PackedValue,
+    sp: *mut Value,
     with_this: bool,
 ) -> Option<crate::jit::SpFlag> {
     let i = &mut *ctx.interp;
     let args_ptr = sp.sub(3);
-    let target = (*args_ptr).unpack();
+    let target = *args_ptr;
     let ValueView::Obj(target_object) = &(target).view() else {
         return None;
     };
@@ -22281,7 +22144,7 @@ unsafe fn jit_reflect_apply_operand_only(
             _ => return None,
         }
     };
-    let list = (*args_ptr.add(2)).unpack();
+    let list = *args_ptr.add(2);
     let numeric = crate::builtins::is_numeric_only_native(nf);
     if !crate::builtins::is_operand_only_native(nf) && !numeric {
         return None;
@@ -22295,7 +22158,7 @@ unsafe fn jit_reflect_apply_operand_only(
         return None;
     }
     drop((target, list));
-    let this_arg = args_ptr.add(1).read().into_value();
+    let this_arg = args_ptr.add(1).read();
     let r = nf(i, this_arg, &values);
     // Release the target, the list, the Reflect.apply function and its receiver.
     drop(args_ptr.read());
@@ -22308,7 +22171,7 @@ unsafe fn jit_reflect_apply_operand_only(
     }
     Some(match r {
         Ok(v) => {
-            base.write(PackedValue::pack(v));
+            base.write(v);
             crate::jit::SpFlag {
                 sp: base.add(1),
                 flag: 0,
@@ -22357,7 +22220,7 @@ fn dense_own_list(i: &Interp, list: &Value) -> Option<Vec<Value>> {
 pub(crate) unsafe extern "C" fn jit_call_hit(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let site = (pc & 0xFFFF) as usize;
     let i = unsafe { &mut *(*ctx).interp };
@@ -22368,7 +22231,7 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
 unsafe fn jit_call_hit_inner(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let way = (pc >> 16) as usize & (CALL_IC_WAYS - 1);
@@ -22434,11 +22297,11 @@ unsafe fn jit_call_hit_inner(
         i.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);
     }
     let args_ptr = sp.sub(argc);
-    let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
-    let this_slot: *const PackedValue = if with_this {
+    let mut undef = std::mem::ManuallyDrop::new(Value::Undefined);
+    let this_slot: *const Value = if with_this {
         sp.sub(argc + 2)
     } else {
-        &raw mut *undef as *const PackedValue
+        &raw mut *undef as *const Value
     };
     let r = i.call_jit_committed(&ic, &code, this_slot, args_ptr, argc);
     // The callee's argument/receiver loans have ended. This owning caller now retires its
@@ -22449,7 +22312,7 @@ unsafe fn jit_call_hit_inner(
     }
     match r {
         Ok(v) => {
-            sp.write(PackedValue::pack(v));
+            sp.write(v);
             crate::jit::SpFlag {
                 sp: sp.add(1),
                 flag: 0,
@@ -22469,7 +22332,7 @@ unsafe fn jit_call_hit_inner(
 #[allow(clippy::too_many_arguments)]
 unsafe fn jit_call_hit_native(
     ctx: &mut crate::jit::JitCtx,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
     argc: usize,
     with_this: bool,
     native: usize,
@@ -22482,8 +22345,8 @@ unsafe fn jit_call_hit_native(
         jit_callstat(i, ctx, &entry.get(), argc, with_this, sp);
     }
     let args_ptr = sp.sub(argc);
-    let undefined = PackedValue::pack(Value::Undefined);
-    let this_slot: *const PackedValue = if with_this {
+    let undefined = Value::Undefined;
+    let this_slot: *const Value = if with_this {
         sp.sub(argc + 2)
     } else {
         &raw const undefined
@@ -22537,7 +22400,7 @@ unsafe fn jit_call_hit_native(
             // The exact builtin is proven and runs no author code for these operands: move the
             // receiver and arguments into it directly, without an arbitrary native's call boundary.
             let this = if with_this {
-                sp.sub(argc + 2).read().into_value()
+                sp.sub(argc + 2).read()
             } else {
                 Value::Undefined
             };
@@ -22554,7 +22417,7 @@ unsafe fn jit_call_hit_native(
     }
     match r {
         Ok(v) => {
-            sp.write(PackedValue::pack(v));
+            sp.write(v);
             crate::jit::SpFlag {
                 sp: sp.add(1),
                 flag: 0,
@@ -22603,11 +22466,11 @@ fn literal_define_method<K: AsRef<str> + crate::value::IntoPropKey>(
     kind: u8,
 ) {
     let method_env = if func.observes_home_object() {
-        let home_env = crate::interpreter::new_scope(Some(env.clone()));
-        crate::eval::bind(&home_env, "%homeobject%", Value::Obj(object.clone()));
+        let home_env = crate::interpreter::new_scope(Some(*env));
+        crate::eval::bind(&home_env, "%homeobject%", Value::Obj(*object));
         home_env
     } else {
-        env.clone()
+        *env
     };
     let value = i.make_function(func.clone(), method_env);
     let name = i.fn_name_for_key(key.as_ref());
@@ -22652,7 +22515,7 @@ fn jit_object_literal_operation(op: &Op) -> bool {
 pub(crate) unsafe extern "C" fn jit_object_literal(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -22669,21 +22532,21 @@ pub(crate) unsafe extern "C" fn jit_object_literal(
 unsafe fn jit_object_literal_inner(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
-    sp: &mut *mut PackedValue,
+    sp: &mut *mut Value,
 ) -> Result<(), Abrupt> {
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
     macro_rules! pop {
         () => {{
             *sp = sp.sub(1);
-            sp.read().into_value()
+            sp.read()
         }};
     }
     // The builder object under construction, borrowed from the operand stack (which keeps it
     // alive and owned across any fallible step).
     macro_rules! builder {
         () => {{
-            let crate::value::ValueView::Obj(object) = (*sp.sub(1)).unpack().view() else {
+            let crate::value::ValueView::Obj(object) = (*sp.sub(1)).clone().view() else {
                 unreachable!("object literal builder retains an Object")
             };
             object
@@ -22698,7 +22561,7 @@ unsafe fn jit_object_literal_inner(
                 crate::feedback::AllocationObjectKind::Object,
                 0,
             );
-            sp.write(PackedValue::pack(value));
+            sp.write(value);
             *sp = sp.add(1);
         }
         Op::ObjectData(name_anonymous) => {
@@ -22760,7 +22623,7 @@ unsafe fn jit_object_literal_inner(
 pub(crate) unsafe extern "C" fn jit_make_closure(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -22774,15 +22637,14 @@ pub(crate) unsafe extern "C" fn jit_make_closure(
         ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
     ));
     let name = (name != u32::MAX).then(|| &chunk.names[name as usize]);
-    let closure =
-        i.make_function_named(chunk.funcs[function as usize].clone(), (*env).clone(), name);
+    let closure = i.make_function_named(chunk.funcs[function as usize].clone(), *env, name);
     observe_allocation(
         &chunk.feedback,
         pc as usize,
         crate::feedback::AllocationObjectKind::Function,
         0,
     );
-    sp.write(PackedValue::pack(closure));
+    sp.write(closure);
     crate::jit::SpFlag {
         sp: sp.add(1),
         flag: 0,
@@ -22795,7 +22657,7 @@ pub(crate) unsafe extern "C" fn jit_make_closure(
 pub(crate) unsafe extern "C" fn jit_make_object(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -22812,7 +22674,7 @@ pub(crate) unsafe extern "C" fn jit_make_object(
     } else {
         let mut values = Vec::with_capacity(count);
         for k in 0..count {
-            values.push(base.add(k).read().into_value());
+            values.push(base.add(k).read());
         }
         i.make_plain_object_vm(keys, values)
     };
@@ -22823,7 +22685,7 @@ pub(crate) unsafe extern "C" fn jit_make_object(
         count,
     );
     sp = base;
-    sp.write(PackedValue::pack(v));
+    sp.write(v);
     crate::jit::SpFlag {
         sp: sp.add(1),
         flag: 0,
@@ -22835,7 +22697,7 @@ pub(crate) unsafe extern "C" fn jit_make_object(
 pub(crate) unsafe extern "C" fn jit_make_array(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     jit_opstat(ctx, pc);
@@ -22852,7 +22714,7 @@ pub(crate) unsafe extern "C" fn jit_make_array(
         count as usize,
     );
     sp = base;
-    unsafe { sp.write(PackedValue::pack(value)) };
+    unsafe { sp.write(value) };
     crate::jit::SpFlag {
         sp: unsafe { sp.add(1) },
         flag: 0,
@@ -22861,9 +22723,9 @@ pub(crate) unsafe extern "C" fn jit_make_array(
 
 /// `Op::TryArrayBinding`: retain the source and its `next` method in the two hidden slots when
 /// the closed Array prefix applies.
-fn open_array_binding<S: StoredValue>(
+fn open_array_binding(
     i: &mut Interp,
-    slots: &[Cell<S>],
+    slots: &[Cell<Value>],
     source: Value,
     iterator: u16,
     next: u16,
@@ -22884,21 +22746,21 @@ fn open_array_binding<S: StoredValue>(
 pub(crate) unsafe extern "C" fn jit_iteration(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     jit_opstat(ctx, pc);
     let chunk = unsafe { &*ctx.chunk };
     let _inline_position = unsafe { ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize) };
     let i = unsafe { &mut *ctx.interp };
-    let push = |sp: &mut *mut PackedValue, value: Value| unsafe {
-        sp.write(PackedValue::pack(value));
+    let push = |sp: &mut *mut Value, value: Value| unsafe {
+        sp.write(value);
         *sp = sp.add(1);
     };
     let result = match chunk.ops[pc as usize] {
         Op::DestructureArr(count) => {
             sp = unsafe { sp.sub(1) };
-            let source = unsafe { sp.read() }.into_value();
+            let source = unsafe { sp.read() };
             match i.destructure_array_prefix(&source, count as usize, |value| push(&mut sp, value))
             {
                 Some(result) => result,
@@ -22911,7 +22773,7 @@ pub(crate) unsafe extern "C" fn jit_iteration(
         }
         Op::TryArrayBinding(iterator, next, count) => {
             let slots = unsafe { std::slice::from_raw_parts(ctx.slots, ctx.n_slots) };
-            let source = unsafe { &*sp.sub(1) }.clone_value();
+            let source = unsafe { *sp.sub(1) };
             open_array_binding(i, slots, source, iterator, next, count).map(|matched| {
                 #[cfg(test)]
                 if matched {
@@ -22998,7 +22860,7 @@ thread_local! {
 pub(crate) unsafe extern "C" fn jit_set_elem(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     #[cfg(test)]
     TEST_JIT_SET_ELEM_HELPERS.with(|count| count.set(count.get() + 1));
@@ -23011,15 +22873,15 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
         Op::SetElem | Op::SetElemDrop => {
             let keep = matches!(chunk.ops[pc as usize], Op::SetElem);
             sp = unsafe { sp.sub(1) };
-            let value = unsafe { sp.read().into_value() };
+            let value = unsafe { sp.read() };
             sp = unsafe { sp.sub(1) };
-            let key = unsafe { sp.read().into_value() };
+            let key = unsafe { sp.read() };
             sp = unsafe { sp.sub(1) };
-            let object = unsafe { sp.read().into_value() };
-            let retained = keep.then(|| value.clone());
+            let object = unsafe { sp.read() };
+            let retained = keep.then_some(value);
             set_computed_element(i, chunk, pc as usize, &object, &key, value)?;
             if let Some(value) = retained {
-                unsafe { sp.write(PackedValue::pack(value)) };
+                unsafe { sp.write(value) };
                 sp = unsafe { sp.add(1) };
             }
             Ok(())
@@ -23027,11 +22889,11 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
         Op::SetElemLocal(slot) | Op::SetElemLocalDrop(slot) => {
             let keep = matches!(chunk.ops[pc as usize], Op::SetElemLocal(_));
             sp = unsafe { sp.sub(1) };
-            let value = unsafe { sp.read().into_value() };
+            let value = unsafe { sp.read() };
             sp = unsafe { sp.sub(1) };
-            let key = unsafe { sp.read().into_value() };
+            let key = unsafe { sp.read() };
             if keep {
-                unsafe { sp.write(PackedValue::pack(value.clone())) };
+                unsafe { sp.write(value) };
                 sp = unsafe { sp.add(1) };
             }
             let local = unsafe { ctx.clone_slot(slot as usize) };
@@ -23054,7 +22916,7 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
 pub(crate) unsafe extern "C" fn jit_abstract_operation(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -23072,26 +22934,25 @@ pub(crate) unsafe extern "C" fn jit_abstract_operation(
     }
 }
 
-/// [`Op::Abstract`] on the native operand stack. Every operand is moved into Rust ownership
-/// (and `sp` lowered past it) before the fallible step, so an abrupt completion drops each
-/// exactly once and leaves `sp` at the unwind boundary. CreateDataPropertyOrThrow keeps the
-/// value packed on the array-element path.
+/// [`Op::Abstract`] on the native operand stack. Consumed operands are copied into Rust locals
+/// and `sp` is lowered past them before fallible work, leaving it at the unwind boundary on
+/// abrupt completion. CreateDataPropertyOrThrow keeps the array-element value as a word.
 unsafe fn jit_abstract_operation_inner(
     ctx: &mut crate::jit::JitCtx,
     operation: AbstractOp,
-    sp: &mut *mut PackedValue,
+    sp: &mut *mut Value,
 ) -> Result<(), Abrupt> {
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
     macro_rules! pop {
         () => {{
             *sp = sp.sub(1);
-            sp.read().into_value()
+            sp.read()
         }};
     }
     macro_rules! push {
         ($v:expr) => {{
-            sp.write(PackedValue::pack($v));
+            sp.write($v);
             *sp = sp.add(1);
         }};
     }
@@ -23142,7 +23003,7 @@ unsafe fn jit_abstract_operation_inner(
 pub(crate) unsafe extern "C" fn jit_new(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let site = (packed & 0xFFFF) as usize;
     let i = unsafe { &mut *(*ctx).interp };
@@ -23153,7 +23014,7 @@ pub(crate) unsafe extern "C" fn jit_new(
 unsafe fn jit_new_site(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let pc = packed & 0xFFFF;
@@ -23168,13 +23029,13 @@ unsafe fn jit_new_site(
     if chunk.feedback.detailed_enabled() {
         let argc = argc as usize;
         let args_ptr = unsafe { sp.sub(argc) };
-        let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
-        let args_values = values_from_words(unsafe { std::slice::from_raw_parts(args_ptr, argc) });
+        let callee = unsafe { *sp.sub(argc + 1) };
+        let args_values = unsafe { std::slice::from_raw_parts(args_ptr, argc) };
         let args = args_values;
         let value = match construct_profiled(i, chunk, pc as usize, callee, args) {
             Ok(value) => value,
             Err(abrupt) => {
-                let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
+                let callee = unsafe { *sp.sub(argc + 1) };
                 ctx.error = Some(name_call_error(
                     i,
                     chunk,
@@ -23187,7 +23048,7 @@ unsafe fn jit_new_site(
             }
         };
         sp = unsafe { jit_consume(sp, argc + 1) };
-        unsafe { sp.write(PackedValue::pack(value)) };
+        unsafe { sp.write(value) };
         return crate::jit::SpFlag {
             sp: unsafe { sp.add(1) },
             flag: 0,
@@ -23220,7 +23081,7 @@ unsafe fn jit_new_site(
 pub(crate) unsafe extern "C" fn jit_instanceof(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     jit_opstat(ctx, pc);
@@ -23229,15 +23090,15 @@ pub(crate) unsafe extern "C" fn jit_instanceof(
     let Op::InstanceOf(cache) = chunk.ops[pc as usize] else {
         unreachable!("jit_instanceof emitted only for InstanceOf");
     };
-    let rhs = unsafe { sp.sub(1).read().into_value() };
-    let lhs = unsafe { sp.sub(2).read().into_value() };
+    let rhs = unsafe { sp.sub(1).read() };
+    let lhs = unsafe { sp.sub(2).read() };
     let out = unsafe { &mut *ctx.interp }.instanceof_ic(&lhs, &rhs, &chunk.caches[cache as usize]);
     let base = unsafe { sp.sub(2) };
     drop(lhs);
     drop(rhs);
     match out {
         Ok(value) => {
-            unsafe { base.write(PackedValue::pack(value)) };
+            unsafe { base.write(value) };
             crate::jit::SpFlag {
                 sp: unsafe { base.add(1) },
                 flag: 0,
@@ -23256,14 +23117,14 @@ unsafe fn jit_new_inner(
     site: Option<(&Chunk, u32)>,
     pc: usize,
     argc: usize,
-    sp: &mut *mut PackedValue,
+    sp: &mut *mut Value,
 ) -> Result<(), Abrupt> {
     let args_ptr = unsafe { sp.sub(argc) };
-    // Identity-cached construct: on Some the arguments were MOVED into the callee's frame — pop
-    // them and the callee slot virtually.
+    // After a cached construct completes, the owning caller retires its argument window
+    // and callee position.
     if let Some(r) = unsafe {
         i.construct_jit_fast(
-            &(*sp.sub(argc + 1)).unpack(),
+            &(*sp.sub(argc + 1)).clone(),
             args_ptr,
             argc,
             caller_ctx,
@@ -23272,22 +23133,22 @@ unsafe fn jit_new_inner(
     } {
         *sp = unsafe { args_ptr.sub(1) };
         let v = r?;
-        unsafe { sp.write(PackedValue::pack(v)) };
+        unsafe { sp.write(v) };
         *sp = unsafe { sp.add(1) };
         return Ok(());
     }
-    let args_values = values_from_words(unsafe { std::slice::from_raw_parts(args_ptr, argc) });
+    let args_values = unsafe { std::slice::from_raw_parts(args_ptr, argc) };
     let args = args_values;
-    let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
+    let callee = unsafe { *sp.sub(argc + 1) };
     let v = i.construct(callee, args).map_err(|error| match site {
         Some((chunk, _)) => {
-            let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
+            let callee = unsafe { *sp.sub(argc + 1) };
             name_call_error(i, chunk, pc, &callee, true, error)
         }
         None => error,
     })?;
     *sp = unsafe { jit_consume(*sp, argc + 1) };
-    unsafe { sp.write(PackedValue::pack(v)) };
+    unsafe { sp.write(v) };
     *sp = unsafe { sp.add(1) };
     Ok(())
 }
@@ -23306,7 +23167,7 @@ thread_local! {
 pub(crate) unsafe extern "C" fn jit_set_prop(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     #[cfg(test)]
     TEST_JIT_SET_PROP_HELPERS.with(|count| count.set(count.get() + 1));
@@ -23318,27 +23179,27 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
     let r: Result<(), Abrupt> = (|| match chunk.ops[pc as usize] {
         Op::SetProp(n, c) => {
             sp = sp.sub(1);
-            let v = sp.read().into_value();
+            let v = sp.read();
             sp = sp.sub(1);
-            let obj = sp.read().into_value();
+            let obj = sp.read();
             set_named_property(
                 i,
                 chunk,
                 pc as usize,
                 &obj,
                 &chunk.names[n as usize],
-                v.clone(),
+                v,
                 &chunk.caches[c as usize],
             )?;
-            sp.write(PackedValue::pack(v));
+            sp.write(v);
             sp = sp.add(1);
             Ok(())
         }
         Op::SetPropDrop(n, c) => {
             sp = sp.sub(1);
-            let v = sp.read().into_value();
+            let v = sp.read();
             sp = sp.sub(1);
-            let obj = sp.read().into_value();
+            let obj = sp.read();
             set_named_property(
                 i,
                 chunk,
@@ -23351,7 +23212,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
         }
         Op::SetPropThisDrop(n, c) => {
             sp = sp.sub(1);
-            let v = sp.read().into_value();
+            let v = sp.read();
             let this = ctx.this_value();
             set_named_property(
                 i,
@@ -23365,7 +23226,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
         }
         Op::SetPropLocalDrop(s, n, c) => {
             sp = sp.sub(1);
-            let v = sp.read().into_value();
+            let v = sp.read();
             let obj = ctx.clone_slot(s as usize);
             if matches!((obj).view(), ValueView::Empty) {
                 return Err(i.throw(
@@ -23502,7 +23363,7 @@ fn set_computed_element(
 }
 
 /// Compact computed-read boundary for the three receiver/operand shapes. Move consumed
-/// operands out before author code and publish only an owned PackedValue on success (plus
+/// operands out before author code and publish only an owned Value on success (plus
 /// the original receiver for a method Reference). This deliberately does not route a wide
 /// Result<Value, Abrupt> through the generic opcode dispatcher's shared result temporary.
 ///
@@ -23512,7 +23373,7 @@ fn set_computed_element(
 pub(crate) unsafe extern "C" fn jit_get_element(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     unsafe { jit_opstat(ctx, pc) };
@@ -23532,8 +23393,8 @@ pub(crate) unsafe extern "C" fn jit_get_element(
     let (base, obj, key, method) = match chunk.ops[pc as usize] {
         Op::GetElem | Op::GetMethodElem => {
             let base = unsafe { sp.sub(2) };
-            let object = unsafe { base.read().into_value() };
-            let key = unsafe { base.add(1).read().into_value() };
+            let object = unsafe { base.read() };
+            let key = unsafe { base.add(1).read() };
             (
                 base,
                 object,
@@ -23543,7 +23404,7 @@ pub(crate) unsafe extern "C" fn jit_get_element(
         }
         Op::GetElemLocal(slot) => {
             let base = unsafe { sp.sub(1) };
-            let key = unsafe { base.read().into_value() };
+            let key = unsafe { base.read() };
             // Clone before a coercion/getter can reenter and overwrite the canonical slot.
             let object = unsafe { ctx.clone_slot(slot as usize) };
             if matches!((object).view(), ValueView::Empty) {
@@ -23570,10 +23431,10 @@ pub(crate) unsafe extern "C" fn jit_get_element(
             let mut output = base;
             unsafe {
                 if method {
-                    output.write(PackedValue::pack(obj));
+                    output.write(obj);
                     output = output.add(1);
                 }
-                output.write(PackedValue::pack(value));
+                output.write(value);
             }
             crate::jit::SpFlag {
                 sp: unsafe { output.add(1) },
@@ -23611,36 +23472,19 @@ unsafe fn jit_accessor_fast(
     i: &mut Interp,
     chunk: &Chunk,
     name: &str,
-    receiver: &Value,
+    receiver: Value,
 ) -> Option<Result<Value, Abrupt>> {
     let (holder, slot) = validated;
     if holder == 0 || chunk.feedback.detailed_enabled() {
         return None;
     }
-    unsafe { i.accessor_validated_get(holder, slot, name, receiver) }
-}
-
-/// Packed-receiver form of [`jit_accessor_fast`]: unpacks (clones) the receiver only
-/// when a validated accessor was actually published, so ordinary helper reads pay no
-/// extra ownership traffic for the fast path's existence.
-unsafe fn jit_accessor_fast_packed(
-    validated: (usize, u32),
-    i: &mut Interp,
-    chunk: &Chunk,
-    name: &str,
-    packed: &PackedValue,
-) -> Option<Result<Value, Abrupt>> {
-    if validated.0 == 0 || chunk.feedback.detailed_enabled() {
-        return None;
-    }
-    let receiver = packed.unpack();
-    unsafe { i.accessor_validated_get(validated.0, validated.1, name, &receiver) }
+    unsafe { i.accessor_validated_get(holder, slot, name, &receiver) }
 }
 
 pub(crate) unsafe extern "C" fn jit_get_prop(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -23661,23 +23505,17 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     jit_propstat(
                         ctx,
                         i,
-                        &obj.unpack(),
+                        &obj.clone(),
                         &chunk.names[n as usize],
                         &chunk.caches[c as usize],
                         pc,
                     );
                 }
                 let v = match unsafe {
-                    jit_accessor_fast_packed(
-                        accessor_validated,
-                        i,
-                        chunk,
-                        &chunk.names[n as usize],
-                        &obj,
-                    )
+                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], obj)
                 } {
-                    Some(r) => PackedValue::pack(r?),
-                    None => get_named_property_packed(
+                    Some(r) => r?,
+                    None => get_named_property_from_slot(
                         i,
                         chunk,
                         pc as usize,
@@ -23701,13 +23539,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     pc,
                 );
                 let v = match unsafe {
-                    jit_accessor_fast(
-                        accessor_validated,
-                        i,
-                        chunk,
-                        &chunk.names[n as usize],
-                        &this,
-                    )
+                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], this)
                 } {
                     Some(r) => r?,
                     None => get_named_property(
@@ -23719,7 +23551,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         &chunk.caches[c as usize],
                     )?,
                 };
-                sp.write(PackedValue::pack(v));
+                sp.write(v);
                 sp = sp.add(1);
                 Ok(())
             }
@@ -23739,23 +23571,17 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     jit_propstat(
                         ctx,
                         i,
-                        &obj.unpack(),
+                        &obj.clone(),
                         &chunk.names[n as usize],
                         &chunk.caches[c as usize],
                         pc,
                     );
                 }
                 let v = match unsafe {
-                    jit_accessor_fast_packed(
-                        accessor_validated,
-                        i,
-                        chunk,
-                        &chunk.names[n as usize],
-                        &obj,
-                    )
+                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], obj)
                 } {
-                    Some(r) => PackedValue::pack(r?),
-                    None => get_named_property_packed(
+                    Some(r) => r?,
+                    None => get_named_property_from_slot(
                         i,
                         chunk,
                         pc as usize,
@@ -23774,23 +23600,17 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     jit_propstat(
                         ctx,
                         i,
-                        &(*obj).unpack(),
+                        &(*obj).clone(),
                         &chunk.names[n as usize],
                         &chunk.caches[c as usize],
                         pc,
                     );
                 }
                 let m = match unsafe {
-                    jit_accessor_fast_packed(
-                        accessor_validated,
-                        i,
-                        chunk,
-                        &chunk.names[n as usize],
-                        &*obj,
-                    )
+                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], *obj)
                 } {
-                    Some(r) => PackedValue::pack(r?),
-                    None => get_named_property_packed(
+                    Some(r) => r?,
+                    None => get_named_property_from_slot(
                         i,
                         chunk,
                         pc as usize,
@@ -23821,7 +23641,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
 pub(crate) unsafe extern "C" fn jit_call(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -23839,13 +23659,13 @@ pub(crate) unsafe extern "C" fn jit_call(
 unsafe fn jit_call_inner(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
-    sp: &mut *mut PackedValue,
+    sp: &mut *mut Value,
 ) -> Result<(), Abrupt> {
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
     macro_rules! push {
         ($v:expr) => {{
-            sp.write(PackedValue::pack($v));
+            sp.write($v);
             *sp = sp.add(1);
         }};
     }
@@ -23856,33 +23676,33 @@ unsafe fn jit_call_inner(
     };
     let args_ptr = sp.sub(argc);
     if chunk.feedback.detailed_enabled() {
-        let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+        let args_values = std::slice::from_raw_parts(args_ptr, argc);
         let args = args_values;
-        let callee = (*sp.sub(argc + 1)).unpack();
+        let callee = *sp.sub(argc + 1);
         let this = if with_this {
-            (*sp.sub(argc + 2)).unpack()
+            *sp.sub(argc + 2)
         } else {
             Value::Undefined
         };
         let value = call_profiled(i, chunk, pc as usize, callee, this, args).map_err(|error| {
-            let callee = (*sp.sub(argc + 1)).unpack();
+            let callee = *sp.sub(argc + 1);
             name_call_error(i, chunk, pc as usize, &callee, false, error)
         })?;
         *sp = jit_consume(*sp, argc + usize::from(with_this) + 1);
         push!(value);
         return Ok(());
     }
-    // See the Op::Call arm of `jit_exec_inner` for the ownership story: on Some the arguments
-    // and the `this` slot were MOVED into the callee.
-    let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
-    let this_slot: *const PackedValue = if with_this {
+    // Fast calls borrow the evaluated receiver/argument window through their polls and tail
+    // drain. On Some, the call has finished and this caller retires those operand positions.
+    let mut undef = std::mem::ManuallyDrop::new(Value::Undefined);
+    let this_slot: *const Value = if with_this {
         sp.sub(argc + 2)
     } else {
-        &raw mut *undef as *const PackedValue
+        &raw mut *undef as *const Value
     };
     let mut r = i.call_jit_cached(
         &chunk.call_caches[c as usize],
-        &(*sp.sub(argc + 1)).unpack(),
+        &(*sp.sub(argc + 1)).clone(),
         this_slot,
         args_ptr,
         argc,
@@ -23893,7 +23713,7 @@ unsafe fn jit_call_inner(
         // entry (identity-pinned like a user callee), so subsequent calls take the machine-code
         // probe + `call_native_committed` — no receiver borrow, no `Callable` dispatch.
         {
-            let callee = &(*sp.sub(argc + 1)).unpack();
+            let callee = &(*sp.sub(argc + 1)).clone();
             if let ValueView::Obj(o) = &(callee).view() {
                 let nf = {
                     let object = o.borrow();
@@ -24074,12 +23894,11 @@ unsafe fn jit_call_inner(
                             }
                         }
                     }
-                    let mut undef2 =
-                        std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
-                    let this_slot2: *const PackedValue = if with_this {
+                    let mut undef2 = std::mem::ManuallyDrop::new(Value::Undefined);
+                    let this_slot2: *const Value = if with_this {
                         sp.sub(argc + 2)
                     } else {
-                        &raw mut *undef2 as *const PackedValue
+                        &raw mut *undef2 as *const Value
                     };
                     let r = i.call_native_address_committed(
                         native, signature, this_slot2, args_ptr, argc,
@@ -24098,7 +23917,7 @@ unsafe fn jit_call_inner(
     }
     if r.is_none() {
         r = i.call_jit_fast(
-            &(*sp.sub(argc + 1)).unpack(),
+            &(*sp.sub(argc + 1)).clone(),
             this_slot,
             args_ptr,
             argc,
@@ -24109,22 +23928,22 @@ unsafe fn jit_call_inner(
         // Pop the arguments and the callee/method slot.
         *sp = args_ptr.sub(1);
         if with_this {
-            *sp = sp.sub(1); // `this` was consumed by the callee
+            *sp = sp.sub(1); // retire the receiver after its loan ends
         }
         let v = r?;
         push!(v);
         return Ok(());
     }
-    let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+    let args_values = std::slice::from_raw_parts(args_ptr, argc);
     let args = args_values;
-    let callee = (*sp.sub(argc + 1)).unpack();
+    let callee = *sp.sub(argc + 1);
     let this = if with_this {
-        (*sp.sub(argc + 2)).unpack()
+        *sp.sub(argc + 2)
     } else {
         Value::Undefined
     };
     let v = i.call(callee, this, args).map_err(|error| {
-        let callee = (*sp.sub(argc + 1)).unpack();
+        let callee = *sp.sub(argc + 1);
         name_call_error(i, chunk, pc as usize, &callee, false, error)
     })?;
     *sp = jit_consume(*sp, argc + 1 + with_this as usize);
@@ -24218,7 +24037,7 @@ unsafe fn jit_callstat(
     ic: &CallIc,
     argc: usize,
     with_this: bool,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) {
     if !ctx.callstat_enabled || !jit_profile_window_open() {
         return;
@@ -24259,7 +24078,7 @@ unsafe fn jit_callstat(
     {
         NATIVES.with(|counts| {
             let mut counts = counts.borrow_mut();
-            let name = match &((*sp.sub(argc + 1)).unpack()).view() {
+            let name = match &((*sp.sub(argc + 1)).clone()).view() {
                 ValueView::Obj(o) => {
                     let borrowed = o.borrow();
                     match &borrowed.call {
@@ -24312,7 +24131,7 @@ unsafe fn jit_callstat(
             if !with_this {
                 break 'r "gate: sloppy this-user, no receiver";
             }
-            if !matches!(((*sp.sub(argc + 2)).unpack()).view(), ValueView::Obj(_)) {
+            if !matches!(((*sp.sub(argc + 2)).clone()).view(), ValueView::Obj(_)) {
                 break 'r "gate: sloppy this-user, non-object receiver";
             }
         }
@@ -24632,7 +24451,7 @@ unsafe fn jit_cap_env<'a>(ctx: &'a crate::jit::JitCtx, env: &'a Env) -> &'a Env 
 unsafe fn jit_exec_inner(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
-    sp: &mut *mut PackedValue,
+    sp: &mut *mut Value,
 ) -> Result<(), Abrupt> {
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
@@ -24653,20 +24472,20 @@ unsafe fn jit_exec_inner(
     macro_rules! pop {
         () => {{
             *sp = sp.sub(1);
-            sp.read().into_value()
+            sp.read()
         }};
     }
     macro_rules! push {
         ($v:expr) => {{
-            sp.write(PackedValue::pack($v));
+            sp.write($v);
             *sp = sp.add(1);
         }};
     }
     match chunk.ops[pc as usize] {
-        Op::Const(k) => push!(chunk.consts[k as usize].clone()),
+        Op::Const(k) => push!(chunk.consts[k as usize]),
         Op::Undef => push!(Value::Undefined),
         Op::Dup => {
-            let value = (*sp.sub(1)).clone();
+            let value = *sp.sub(1);
             sp.write(value);
             *sp = sp.add(1);
         }
@@ -24675,8 +24494,8 @@ unsafe fn jit_exec_inner(
             std::ptr::drop_in_place(*sp);
         }
         Op::Dup2 => {
-            let a = (*sp.sub(2)).clone();
-            let b = (*sp.sub(1)).clone();
+            let a = *sp.sub(2);
+            let b = *sp.sub(1);
             sp.write(a);
             sp.add(1).write(b);
             *sp = sp.add(2);
@@ -24692,7 +24511,7 @@ unsafe fn jit_exec_inner(
                     ),
                 ));
             }
-            sp.write(v.clone());
+            sp.write(v);
             *sp = sp.add(1);
         }
         Op::StoreLocal(s) => {
@@ -24733,7 +24552,7 @@ unsafe fn jit_exec_inner(
         Op::UpdateCap(n, kind) => {
             let name = &chunk.names[n as usize];
             let mut reference =
-                crate::eval::PreparedReference::scope(name.clone(), cap_env.clone(), i.strict);
+                crate::eval::PreparedReference::scope(name.clone(), *cap_env, i.strict);
             let old = {
                 let b = cap_env.borrow();
                 let bd = b.vars.get(name).expect("captured binding missing");
@@ -24771,7 +24590,7 @@ unsafe fn jit_exec_inner(
         }
         Op::MakeClosure(fidx, name_n) => {
             let name = (name_n != u32::MAX).then(|| &chunk.names[name_n as usize]);
-            let v = i.make_function_named(chunk.funcs[fidx as usize].clone(), env.clone(), name);
+            let v = i.make_function_named(chunk.funcs[fidx as usize].clone(), *env, name);
             observe_allocation(
                 &chunk.feedback,
                 pc as usize,
@@ -24811,7 +24630,7 @@ unsafe fn jit_exec_inner(
             chunk.store_name_ic(i, env, n, c, v)?;
         }
         Op::LoadThis => {
-            (*sp).write(ctx.this_word());
+            (*sp).write(ctx.this_value());
             *sp = (*sp).add(1);
             #[cfg(test)]
             chunk
@@ -24896,7 +24715,7 @@ unsafe fn jit_exec_inner(
                 pc as usize,
                 &obj,
                 &chunk.names[n as usize],
-                v.clone(),
+                v,
                 &chunk.caches[c as usize],
             )?;
             push!(v);
@@ -24953,7 +24772,7 @@ unsafe fn jit_exec_inner(
             #[cfg(test)]
             TEST_JIT_DESTRUCTURE_GUARD_HELPERS.with(|count| count.set(count.get() + 1));
             if matches!(
-                &((*sp.sub(1)).unpack()).view(),
+                &((*sp.sub(1)).clone()).view(),
                 ValueView::Undefined | ValueView::Null
             ) {
                 return Err(i.throw("TypeError", "cannot destructure null or undefined"));
@@ -24983,7 +24802,7 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::TryArrayBinding(iterator, next, count) => {
-            let source = (*sp.sub(1)).unpack();
+            let source = *sp.sub(1);
             let matched = open_array_binding(i, slots, source, iterator, next, count)?;
             #[cfg(test)]
             if matched {
@@ -25049,14 +24868,14 @@ unsafe fn jit_exec_inner(
                 CallArgsMode::Fixed(argc) => {
                     *sp = sp.sub(argc as usize);
                     (0..argc as usize)
-                        .map(|index| sp.add(index).read().into_value())
+                        .map(|index| sp.add(index).read())
                         .collect()
                 }
                 CallArgsMode::FinalSpread(argc) => {
                     let spread = pop!();
                     *sp = sp.sub(argc as usize - 1);
                     let mut args: Vec<Value> = (0..argc as usize - 1)
-                        .map(|index| sp.add(index).read().into_value())
+                        .map(|index| sp.add(index).read())
                         .collect();
                     i.append_spread_arguments(&spread, &mut args)?;
                     args
@@ -25142,7 +24961,7 @@ unsafe fn jit_exec_inner(
             let v = pop!();
             let key = pop!();
             let obj = pop!();
-            set_computed_element(i, chunk, pc as usize, &obj, &key, v.clone())?;
+            set_computed_element(i, chunk, pc as usize, &obj, &key, v)?;
             push!(v);
         }
         Op::SetElemDrop => {
@@ -25162,7 +24981,7 @@ unsafe fn jit_exec_inner(
             let list = slots.read_value(s as usize);
             let mut replacement = None;
             let value = lazy_arguments_element(i, chunk, pc as usize, &list, &key, |object| {
-                replacement = Some(object.clone())
+                replacement = Some(*object)
             });
             if let Some(object) = replacement {
                 slots.write_value(s as usize, object);
@@ -25174,7 +24993,7 @@ unsafe fn jit_exec_inner(
             let v = pop!();
             let key = pop!();
             if keep {
-                push!(v.clone());
+                push!(v);
             }
             let obj = slots.read_value(s as usize);
             set_computed_element(i, chunk, pc as usize, &obj, &key, v)?;
@@ -25236,12 +25055,12 @@ unsafe fn jit_exec_inner(
         }
         Op::ToPropKey => {
             if matches!(
-                &((*sp.sub(2)).unpack()).view(),
+                &((*sp.sub(2)).clone()).view(),
                 ValueView::Undefined | ValueView::Null
             ) {
                 return Err(i.throw("TypeError", "cannot access property of null or undefined"));
             }
-            match &((*sp.sub(1)).unpack()).view() {
+            match &((*sp.sub(1)).clone()).view() {
                 ValueView::Num(_) | ValueView::Str(_) | ValueView::Sym(_) => {}
                 _ => {
                     let key = pop!();
@@ -25257,7 +25076,7 @@ unsafe fn jit_exec_inner(
             ) {
                 return Err(i.throw("TypeError", "cannot access property of null or undefined"));
             }
-            match &((*sp.sub(1)).unpack()).view() {
+            match &((*sp.sub(1)).clone()).view() {
                 ValueView::Num(_) | ValueView::Str(_) | ValueView::Sym(_) => {}
                 _ => {
                     let key = pop!();
@@ -25411,36 +25230,35 @@ unsafe fn jit_exec_inner(
             let argc = argc as usize;
             let args_ptr = sp.sub(argc);
             if chunk.feedback.detailed_enabled() {
-                let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+                let args_values = std::slice::from_raw_parts(args_ptr, argc);
                 let args = args_values;
-                let callee = (*sp.sub(argc + 1)).unpack();
+                let callee = *sp.sub(argc + 1);
                 let value = call_profiled(i, chunk, pc as usize, callee, Value::Undefined, args)
                     .map_err(|error| {
-                        let callee = (*sp.sub(argc + 1)).unpack();
+                        let callee = *sp.sub(argc + 1);
                         name_call_error(i, chunk, pc as usize, &callee, false, error)
                     })?;
                 *sp = jit_consume(*sp, argc + 1);
                 push!(value);
                 return Ok(());
             }
-            // JIT→JIT fast call: on Some the arguments and the `this` slot were MOVED into the
-            // callee — rewind the stack past them without dropping, then drop only the callee
-            // slot. The `this` here is a local Undefined in a ManuallyDrop: the callee owns it on
-            // Some (no double drop), and leaking it on None is a no-op (no payload).
+            // Fast calls borrow the evaluated receiver/argument window through their polls
+            // and tail drain. On Some, the call has finished and this caller retires those
+            // operand positions. The receiver-less case supplies a local Undefined word.
             // The per-site callee cache short-circuits the dispatch guards on an identity hit;
             // a miss falls into `call_jit_fast`, which refills it.
-            let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
+            let mut undef = std::mem::ManuallyDrop::new(Value::Undefined);
             let mut r = i.call_jit_cached(
                 &chunk.call_caches[c as usize],
-                &(*sp.sub(argc + 1)).unpack(),
-                &raw mut *undef as *const PackedValue,
+                &(*sp.sub(argc + 1)).clone(),
+                &raw mut *undef as *const Value,
                 args_ptr,
                 argc,
             );
             if r.is_none() {
                 r = i.call_jit_fast(
-                    &(*sp.sub(argc + 1)).unpack(),
-                    &raw mut *undef as *const PackedValue,
+                    &(*sp.sub(argc + 1)).clone(),
+                    &raw mut *undef as *const Value,
                     args_ptr,
                     argc,
                     Some((&chunk.call_caches[c as usize], &chunk.call_pins)),
@@ -25453,11 +25271,11 @@ unsafe fn jit_exec_inner(
                 push!(v);
                 return Ok(());
             }
-            let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+            let args_values = std::slice::from_raw_parts(args_ptr, argc);
             let args = args_values;
-            let callee = (*sp.sub(argc + 1)).unpack();
+            let callee = *sp.sub(argc + 1);
             let v = i.call(callee, Value::Undefined, args).map_err(|error| {
-                let callee = (*sp.sub(argc + 1)).unpack();
+                let callee = *sp.sub(argc + 1);
                 name_call_error(i, chunk, pc as usize, &callee, false, error)
             })?;
             *sp = jit_consume(*sp, argc + 1);
@@ -25481,13 +25299,13 @@ unsafe fn jit_exec_inner(
             let argc = argc as usize;
             let args_ptr = sp.sub(argc);
             if chunk.feedback.detailed_enabled() {
-                let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+                let args_values = std::slice::from_raw_parts(args_ptr, argc);
                 let args = args_values;
-                let method = (*sp.sub(argc + 1)).unpack();
-                let this = (*sp.sub(argc + 2)).unpack();
+                let method = *sp.sub(argc + 1);
+                let this = *sp.sub(argc + 2);
                 let value =
                     call_profiled(i, chunk, pc as usize, method, this, args).map_err(|error| {
-                        let method = (*sp.sub(argc + 1)).unpack();
+                        let method = *sp.sub(argc + 1);
                         name_call_error(i, chunk, pc as usize, &method, false, error)
                     })?;
                 *sp = jit_consume(*sp, argc + 2);
@@ -25496,14 +25314,14 @@ unsafe fn jit_exec_inner(
             }
             let mut r = i.call_jit_cached(
                 &chunk.call_caches[c as usize],
-                &(*sp.sub(argc + 1)).unpack(),
+                &(*sp.sub(argc + 1)).clone(),
                 sp.sub(argc + 2),
                 args_ptr,
                 argc,
             );
             if r.is_none() {
                 r = i.call_jit_fast(
-                    &(*sp.sub(argc + 1)).unpack(),
+                    &(*sp.sub(argc + 1)).clone(),
                     sp.sub(argc + 2),
                     args_ptr,
                     argc,
@@ -25513,17 +25331,17 @@ unsafe fn jit_exec_inner(
             if let Some(r) = r {
                 *sp = args_ptr.sub(1);
                 std::ptr::drop_in_place(*sp); // the method
-                *sp = sp.sub(1); // `this` was consumed by the callee
+                *sp = sp.sub(1); // retire the receiver after its loan ends
                 let v = r?;
                 push!(v);
                 return Ok(());
             }
-            let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+            let args_values = std::slice::from_raw_parts(args_ptr, argc);
             let args = args_values;
-            let m = (*sp.sub(argc + 1)).unpack();
-            let this = (*sp.sub(argc + 2)).unpack();
+            let m = *sp.sub(argc + 1);
+            let this = *sp.sub(argc + 2);
             let v = i.call(m, this, args).map_err(|error| {
-                let method = (*sp.sub(argc + 1)).unpack();
+                let method = *sp.sub(argc + 1);
                 name_call_error(i, chunk, pc as usize, &method, false, error)
             })?;
             *sp = jit_consume(*sp, argc + 2);
@@ -25533,12 +25351,12 @@ unsafe fn jit_exec_inner(
             let argc = argc as usize;
             if chunk.feedback.detailed_enabled() {
                 let args_ptr = sp.sub(argc);
-                let callee = (*sp.sub(argc + 1)).unpack();
-                let args_values = values_from_words(std::slice::from_raw_parts(args_ptr, argc));
+                let callee = *sp.sub(argc + 1);
+                let args_values = std::slice::from_raw_parts(args_ptr, argc);
                 let args = args_values;
                 let value =
                     construct_profiled(i, chunk, pc as usize, callee, args).map_err(|error| {
-                        let callee = (*sp.sub(argc + 1)).unpack();
+                        let callee = *sp.sub(argc + 1);
                         name_call_error(i, chunk, pc as usize, &callee, true, error)
                     })?;
                 *sp = jit_consume(*sp, argc + 1);
@@ -25576,7 +25394,7 @@ unsafe fn jit_exec_inner(
             let mut items = Vec::with_capacity(n);
             let base = sp.sub(n);
             for k in 0..n {
-                items.push(base.add(k).read().into_value());
+                items.push(base.add(k).read());
             }
             *sp = base;
             let value = i.make_array(items);
@@ -25593,7 +25411,7 @@ unsafe fn jit_exec_inner(
             let mut values = Vec::with_capacity(count);
             let base = sp.sub(count);
             for k in 0..count {
-                values.push(base.add(k).read().into_value());
+                values.push(base.add(k).read());
             }
             *sp = base;
             let keys = &chunk.names[start as usize..start as usize + count];
@@ -25777,8 +25595,8 @@ unsafe fn jit_exec_inner(
     Ok(())
 }
 
-/// Drop `n` consumed operands below `sp` (post-call cleanup) and return the new top.
-unsafe fn jit_consume(sp: *mut PackedValue, n: usize) -> *mut PackedValue {
+/// Retire `n` consumed operand positions below `sp` and return the new top.
+unsafe fn jit_consume(sp: *mut Value, n: usize) -> *mut Value {
     let base = sp.sub(n);
     for k in 0..n {
         std::ptr::drop_in_place(base.add(k));
@@ -25788,16 +25606,16 @@ unsafe fn jit_consume(sp: *mut PackedValue, n: usize) -> *mut PackedValue {
 
 unsafe fn jit_bin_num(
     i: &mut Interp,
-    sp: &mut *mut PackedValue,
+    sp: &mut *mut Value,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     op: &'static str,
     f: impl Fn(f64, f64) -> f64,
 ) -> Result<(), Abrupt> {
     *sp = sp.sub(1);
-    let b = sp.read().into_value();
+    let b = sp.read();
     *sp = sp.sub(1);
-    let a = sp.read().into_value();
+    let a = sp.read();
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
     let v = if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
         Value::Num(f(*x, *y))
@@ -25805,23 +25623,23 @@ unsafe fn jit_bin_num(
         i.binary(op, a, b)?
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
-    sp.write(PackedValue::pack(v));
+    sp.write(v);
     *sp = sp.add(1);
     Ok(())
 }
 
 unsafe fn jit_bin_i32(
     i: &mut Interp,
-    sp: &mut *mut PackedValue,
+    sp: &mut *mut Value,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     op: &'static str,
     f: impl Fn(i32, i32) -> i32,
 ) -> Result<(), Abrupt> {
     *sp = sp.sub(1);
-    let b = sp.read().into_value();
+    let b = sp.read();
     *sp = sp.sub(1);
-    let a = sp.read().into_value();
+    let a = sp.read();
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
     let primitive_i32 = |v: &Value| match (v).view() {
         ValueView::Num(n) => Some(crate::eval::to_int32(n)),
@@ -25834,27 +25652,27 @@ unsafe fn jit_bin_i32(
         i.binary(op, a, b)?
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
-    sp.write(PackedValue::pack(v));
+    sp.write(v);
     *sp = sp.add(1);
     Ok(())
 }
 
 unsafe fn jit_bin_cmp(
     i: &mut Interp,
-    sp: &mut *mut PackedValue,
+    sp: &mut *mut Value,
     op: &'static str,
     f: impl Fn(f64, f64) -> bool,
 ) -> Result<(), Abrupt> {
     *sp = sp.sub(1);
-    let b = sp.read().into_value();
+    let b = sp.read();
     *sp = sp.sub(1);
-    let a = sp.read().into_value();
+    let a = sp.read();
     let v = if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
         Value::Bool(f(*x, *y))
     } else {
         i.binary(op, a, b)?
     };
-    sp.write(PackedValue::pack(v));
+    sp.write(v);
     *sp = sp.add(1);
     Ok(())
 }
@@ -25869,7 +25687,7 @@ thread_local! {
 pub(crate) unsafe extern "C" fn jit_cond(
     ctx: *mut crate::jit::JitCtx,
     packed_mode: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     #[cfg(test)]
     TEST_JIT_COND_HELPERS.with(|count| count.set(count.get() + 1));
@@ -25881,12 +25699,12 @@ pub(crate) unsafe extern "C" fn jit_cond(
     let flag = match mode {
         crate::jit::COND_POP_TRUTHY => {
             sp = sp.sub(1);
-            let v = sp.read().into_value();
+            let v = sp.read();
             i.to_boolean(&v) as u64
         }
-        crate::jit::COND_PEEK_TRUTHY => i.to_boolean(&(*sp.sub(1)).unpack()) as u64,
+        crate::jit::COND_PEEK_TRUTHY => i.to_boolean(&(*sp.sub(1)).clone()) as u64,
         _ => !matches!(
-            &((*sp.sub(1)).unpack()).view(),
+            &((*sp.sub(1)).clone()).view(),
             ValueView::Undefined | ValueView::Null
         ) as u64,
     };
@@ -25908,8 +25726,8 @@ thread_local! {
 pub(crate) unsafe extern "C" fn jit_return(
     ctx: *mut crate::jit::JitCtx,
     mode: u32,
-    mut sp: *mut PackedValue,
-) -> *mut PackedValue {
+    mut sp: *mut Value,
+) -> *mut Value {
     #[cfg(test)]
     TEST_JIT_RETURN_HELPERS.with(|count| count.set(count.get() + 1));
     let ctx = &mut *ctx;
@@ -25919,7 +25737,7 @@ pub(crate) unsafe extern "C" fn jit_return(
         sp = sp.sub(1);
         sp.read()
     } else {
-        PackedValue::pack(Value::Undefined)
+        Value::Undefined
     };
     sp
 }
@@ -25927,8 +25745,8 @@ pub(crate) unsafe extern "C" fn jit_return(
 pub(crate) unsafe extern "C" fn jit_push_handler(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
-) -> *mut PackedValue {
+    sp: *mut Value,
+) -> *mut Value {
     let ctx = &mut *ctx;
     let depth = sp.offset_from(ctx.stack_base) as usize;
     let target = match (&*ctx.chunk).jit_ops()[pc as usize] {
@@ -25960,8 +25778,8 @@ pub(crate) unsafe extern "C" fn jit_push_handler(
 pub(crate) unsafe extern "C" fn jit_pop_handler(
     ctx: *mut crate::jit::JitCtx,
     _imm: u32,
-    sp: *mut PackedValue,
-) -> *mut PackedValue {
+    sp: *mut Value,
+) -> *mut Value {
     (*ctx).handlers.pop();
     sp
 }
@@ -25971,13 +25789,13 @@ pub(crate) unsafe extern "C" fn jit_pop_handler(
 pub(crate) unsafe extern "C" fn jit_unwind(
     ctx: *mut crate::jit::JitCtx,
     _imm: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let result = jit_unwind_target(ctx, sp);
     crate::jit::SpFlag {
         sp: result.target.map_or(std::ptr::null_mut(), |pc| {
-            ctx.code_base.add(*ctx.pc_offsets.add(pc) as usize) as *mut PackedValue
+            ctx.code_base.add(*ctx.pc_offsets.add(pc) as usize) as *mut Value
         }),
         flag: result.sp as u64,
     }
@@ -25986,7 +25804,7 @@ pub(crate) unsafe extern "C" fn jit_unwind(
 /// Machine-independent completion destination. Retained VM state uses bytecode PCs; the
 /// native caller maps the destination to its corresponding machine-code address.
 struct NativeCompletionTarget {
-    sp: *mut PackedValue,
+    sp: *mut Value,
     target: Option<usize>,
 }
 
@@ -25994,7 +25812,7 @@ struct NativeCompletionTarget {
 /// already-performed abrupt completion. Neither entry may replay the operation that threw.
 unsafe fn jit_unwind_target(
     ctx: &mut crate::jit::JitCtx,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> NativeCompletionTarget {
     // Only thrown completions are catchable; anything else propagates out.
     if !matches!(ctx.error, Some(Abrupt::Throw(_))) {
@@ -26034,7 +25852,7 @@ unsafe fn jit_unwind_target(
                 unreachable!()
             };
             (*ctx.interp).settle_caught(&exc);
-            target.write(PackedValue::pack(exc));
+            target.write(exc);
             NativeCompletionTarget {
                 sp: target.add(1),
                 target: Some(catch_pc),
@@ -26050,7 +25868,7 @@ unsafe fn jit_unwind_target(
 pub(crate) unsafe extern "C" fn jit_complete(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let result = jit_complete_target(ctx, pc, sp);
@@ -26065,7 +25883,7 @@ pub(crate) unsafe extern "C" fn jit_complete(
 unsafe fn jit_complete_target(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut PackedValue,
+    mut sp: *mut Value,
 ) -> NativeCompletionTarget {
     let op = &(&*ctx.chunk).jit_ops()[pc as usize];
     let mut value = None;
@@ -26073,11 +25891,11 @@ unsafe fn jit_complete_target(
         Op::AbruptJump(target, depth) => Some((*target as usize, *depth as usize)),
         Op::ResumeJump => {
             sp = sp.sub(1);
-            let ValueView::Num(depth) = (sp.read().into_value()).view() else {
+            let ValueView::Num(depth) = (sp.read()).view() else {
                 unreachable!()
             };
             sp = sp.sub(1);
-            let ValueView::Num(target) = (sp.read().into_value()).view() else {
+            let ValueView::Num(target) = (sp.read()).view() else {
                 unreachable!()
             };
             Some((target as usize, depth as usize))
@@ -26128,9 +25946,9 @@ unsafe fn jit_complete_target(
             std::ptr::drop_in_place(sp);
         }
         if let Some((target, depth)) = jump {
-            sp.write(PackedValue::pack(Value::Num(target as f64)));
+            sp.write(Value::Num(target as f64));
             sp = sp.add(1);
-            sp.write(PackedValue::pack(Value::Num(depth as f64)));
+            sp.write(Value::Num(depth as f64));
             sp = sp.add(1);
         } else if let Some(value) = value.take() {
             sp.write(value);
@@ -26147,7 +25965,7 @@ unsafe fn jit_complete_target(
             target: Some(target),
         }
     } else {
-        ctx.ret = value.unwrap_or_else(|| PackedValue::pack(Value::Undefined));
+        ctx.ret = value.unwrap_or(Value::Undefined);
         NativeCompletionTarget { sp, target: None }
     }
 }
@@ -26160,7 +25978,7 @@ unsafe fn jit_complete_target(
 pub(crate) unsafe extern "C" fn jit_interrupt(
     ctx: *mut crate::jit::JitCtx,
     _imm: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
@@ -26189,8 +26007,8 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
 pub(crate) unsafe extern "C" fn jit_loop_backedge(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
-) -> *mut PackedValue {
+    sp: *mut Value,
+) -> *mut Value {
     let ctx = unsafe { &*ctx };
     unsafe { (&*ctx.chunk).feedback.observe_loop_backedge(pc as usize) };
     sp
@@ -26228,7 +26046,7 @@ mod return_slot_tests {
             slots: std::ptr::null_mut(),
             inline_ic_safe: std::ptr::null(),
             env_raw: std::ptr::null(),
-            this_word: PackedValue::pack(Value::Undefined),
+            this_word: (Value::Undefined),
             global_body: std::ptr::null(),
             genv: 0,
             interp: std::ptr::null_mut(),
@@ -26246,7 +26064,7 @@ mod return_slot_tests {
             code_base: std::ptr::null(),
             pc_offsets: std::ptr::null(),
             error: None,
-            ret: PackedValue::pack(ret),
+            ret: (ret),
             env_parent_raw: std::ptr::null(),
             opstat_enabled: false,
             callstat_enabled: false,
@@ -26270,7 +26088,7 @@ mod return_slot_tests {
         }
         for value in values {
             for occupied in [false, true] {
-                let packed = PackedValue::pack(value.clone());
+                let packed = value;
                 let expected = packed.bits();
                 let mut operand = ManuallyDrop::new([packed]);
                 let base = operand.as_mut_ptr();
@@ -26299,7 +26117,7 @@ mod return_slot_tests {
     #[test]
     fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
         use std::mem::{offset_of, size_of};
-        assert_eq!(size_of::<PackedValue>(), 8);
+        assert_eq!(size_of::<Value>(), 8);
         assert_eq!(std::mem::size_of_val(&context(Value::Undefined).ret), 8);
         assert_eq!(
             std::mem::size_of_val(&context(Value::Undefined).this_word),

@@ -238,7 +238,7 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
             .vars
             .get_mut("v23")
             .unwrap()
-            .set_import_reference(Some((first.clone(), "v23".into())));
+            .set_import_reference(Some((first, "v23".into())));
         assert_eq!(probe(&code, &context).address, 0);
         second
             .borrow_mut()
@@ -263,7 +263,7 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
         });
         second
             .borrow_mut()
-            .set_with_object(Some(Value::Obj(engine.interp.global.clone())));
+            .set_with_object(Some(Value::Obj(engine.interp.global)));
         assert_eq!(probe(&code, &context).address, 0);
         second.borrow_mut().set_with_object(None);
         second.borrow_mut().vars.remove("v0");
@@ -330,7 +330,7 @@ fn name_dispatch_native_binding_preserves_identity_with_tdz_import_and_exhaustio
     assert_eq!(probe(&code, &context).address, 0);
     cache.set(ic);
     env.borrow_mut()
-        .set_with_object(Some(Value::Obj(engine.interp.global.clone())));
+        .set_with_object(Some(Value::Obj(engine.interp.global)));
     assert_eq!(probe(&code, &context).address, 0);
     env.borrow_mut().set_with_object(None);
     env.borrow_mut().vars.get_mut("outer").unwrap().initialized = false;
@@ -377,7 +377,7 @@ fn name_dispatch_native_global_checks_identity_before_generation_without_losing_
         false,
     ), Ok(crate::Completion::Value(_))));
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let context = ProbeContext::new(&engine, &env);
     let (slot, shape, expected) = {
         let global = engine.interp.global.borrow();
@@ -462,7 +462,7 @@ fn name_dispatch_native_depth_one_keeps_layout_and_parent_generation_distinct() 
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
     for fixed_layout in [false, true] {
         let parent = binding_scope(None);
-        let child = new_scope(Some(parent.clone()));
+        let child = new_scope(Some(parent));
         child
             .borrow_mut()
             .vars
@@ -487,7 +487,7 @@ fn name_dispatch_native_depth_one_keeps_layout_and_parent_generation_distinct() 
         assert_eq!(probe(&code, &context), expected);
         parent
             .borrow_mut()
-            .set_with_object(Some(Value::Obj(engine.interp.global.clone())));
+            .set_with_object(Some(Value::Obj(engine.interp.global)));
         assert_eq!(probe(&code, &context).address, 0);
         parent.borrow_mut().set_with_object(None);
         child.borrow_mut().vars.set_generation_for_test(u32::MAX);
@@ -530,7 +530,7 @@ fn name_dispatch_native_deep_hits_ignore_shallow_generation_and_follow_live_pare
     let code = super::compile(&chunk, &layout, &ilayout).unwrap();
     let holder = binding_scope(None);
     let middle = new_scope(Some(holder));
-    let child = new_scope(Some(middle.clone()));
+    let child = new_scope(Some(middle));
     child
         .borrow_mut()
         .vars

@@ -1299,7 +1299,6 @@ impl Interp {
             tier: _,
             tier_threshold: _,
             jit_admit_runs: _,
-            tagged_arithmetic: _,
             vm_pool,
             native_arg_pool,
             stub_cache: _,       // shapes and slots

@@ -125,12 +125,12 @@ impl NativeCaptures {
     }
 }
 
-/// The engine's thread-bound execution word. Its transparent representation is shared with
-/// PackedValue; match views are decoded only while inspecting a value. Constructors retain
-/// the former enum spellings, and every Number constructor canonicalizes NaN immediately.
+/// The engine's thread-bound execution word. Match views are decoded only while inspecting
+/// a value; execution storage, bindings and immutable argument windows all use this type.
+/// Every Number constructor canonicalizes NaN immediately.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub(crate) struct Value(PackedValue);
+pub(crate) struct Value(u64, std::marker::PhantomData<*const ()>);
 
 /// An ephemeral decoded match view. This enum is never used as execution storage.
 #[derive(Clone, Copy)]
@@ -155,23 +155,20 @@ impl Default for Value {
 
 const _: () = {
     assert!(std::mem::size_of::<Value>() == 8);
-    assert!(std::mem::align_of::<Value>() == std::mem::align_of::<PackedValue>());
+    assert!(std::mem::align_of::<Value>() == std::mem::align_of::<u64>());
     assert!(!std::mem::needs_drop::<Value>());
 };
 
 #[allow(non_snake_case, non_upper_case_globals)]
 impl Value {
-    pub(crate) const Undefined: Self = Self(PackedValue(PACK_UNDEFINED, std::marker::PhantomData));
+    pub(crate) const Undefined: Self = Self(PACK_UNDEFINED, std::marker::PhantomData);
     /// The internal completion marker. Public value boundaries normalize it to undefined.
-    pub(crate) const Empty: Self = Self(PackedValue(PACK_EMPTY, std::marker::PhantomData));
-    pub(crate) const Null: Self = Self(PackedValue(PACK_NULL, std::marker::PhantomData));
+    pub(crate) const Empty: Self = Self(PACK_EMPTY, std::marker::PhantomData);
+    pub(crate) const Null: Self = Self(PACK_NULL, std::marker::PhantomData);
 
     #[inline]
     pub(crate) const fn Bool(value: bool) -> Self {
-        Self(PackedValue(
-            PACK_BOOL | value as u64,
-            std::marker::PhantomData,
-        ))
+        Self(PACK_BOOL | value as u64, std::marker::PhantomData)
     }
 
     /// ECMA-262 Number Type: all IEEE NaNs denote one language NaN. This leaves backing
@@ -183,15 +180,15 @@ impl Value {
         } else {
             value.to_bits()
         };
-        Self(PackedValue(bits, std::marker::PhantomData))
+        Self(bits, std::marker::PhantomData)
     }
 
     #[inline]
     pub(crate) fn BigInt(value: crate::bigint::JsBigInt) -> Self {
-        Self(PackedValue(
-            PACK_BIGINT | unsafe { PackedValue::into_word(value) },
+        Self(
+            PACK_BIGINT | unsafe { Self::into_word(value) },
             std::marker::PhantomData,
-        ))
+        )
     }
 
     /// UTF-8 engine text, with a lone UTF-16 surrogate represented by the scalar
@@ -199,26 +196,26 @@ impl Value {
     /// this constructor receives an already encoded immutable string-cell handle.
     #[inline]
     pub(crate) fn Str(value: crate::lstr::LStr) -> Self {
-        Self(PackedValue(
-            PACK_STR | unsafe { PackedValue::into_word(value) },
+        Self(
+            PACK_STR | unsafe { Self::into_word(value) },
             std::marker::PhantomData,
-        ))
+        )
     }
 
     #[inline]
     pub(crate) fn Sym(value: SymbolRef) -> Self {
-        Self(PackedValue(
-            PACK_SYM | unsafe { PackedValue::into_word(value) },
+        Self(
+            PACK_SYM | unsafe { Self::into_word(value) },
             std::marker::PhantomData,
-        ))
+        )
     }
 
     #[inline]
     pub(crate) fn Obj(value: Gc) -> Self {
-        Self(PackedValue(
-            PACK_OBJ | unsafe { PackedValue::into_word(value) },
+        Self(
+            PACK_OBJ | unsafe { Self::into_word(value) },
             std::marker::PhantomData,
-        ))
+        )
     }
 
     /// Reconstruct an execution value from its bits.
@@ -229,35 +226,44 @@ impl Value {
     /// cell liveness, type, ownership, or provenance, and never admits a property-only word.
     #[inline]
     pub(crate) unsafe fn from_bits(bits: u64) -> Self {
-        Self(PackedValue::from_bits(bits))
+        debug_assert_ne!(
+            bits & !PACK_PAYLOAD,
+            PACK_LAZY_PROTO,
+            "a deferred prototype's word copied without materializing"
+        );
+        debug_assert!(
+            Self::valid_bits(bits),
+            "invalid execution word {bits:#018x}"
+        );
+        Self(bits, std::marker::PhantomData)
     }
 
     #[inline]
     pub(crate) const fn bits(self) -> u64 {
-        self.0 .0
+        self.0
     }
 
     #[inline(always)]
     pub(crate) fn view(&self) -> ValueView {
-        match self.0.tag() {
+        match self.tag() {
             PACK_UNDEFINED => ValueView::Undefined,
             PACK_EMPTY => ValueView::Empty,
             PACK_NULL => ValueView::Null,
-            PACK_BOOL => ValueView::Bool(self.0 .0 & 1 != 0),
-            PACK_BIGINT => ValueView::BigInt(unsafe { self.0.read_word() }),
-            PACK_STR => ValueView::Str(unsafe { self.0.read_word() }),
-            PACK_SYM => ValueView::Sym(unsafe { self.0.read_word() }),
-            PACK_OBJ => ValueView::Obj(unsafe { self.0.read_word() }),
+            PACK_BOOL => ValueView::Bool(self.0 & 1 != 0),
+            PACK_BIGINT => ValueView::BigInt(unsafe { self.read_word() }),
+            PACK_STR => ValueView::Str(unsafe { self.read_word() }),
+            PACK_SYM => ValueView::Sym(unsafe { self.read_word() }),
+            PACK_OBJ => ValueView::Obj(unsafe { self.read_word() }),
             PACK_LAZY_PROTO => unreachable!("a deferred prototype reached execution storage"),
-            _ => ValueView::Num(f64::from_bits(self.0 .0)),
+            _ => ValueView::Num(f64::from_bits(self.0)),
         }
     }
 
     /// The untagged cell address held as a strong GC edge. Scalar words are never roots.
     #[inline]
     pub(crate) fn cell_word(&self) -> Option<u64> {
-        matches!(self.0.tag(), PACK_BIGINT | PACK_STR | PACK_SYM | PACK_OBJ)
-            .then_some(self.0 .0 & PACK_PAYLOAD)
+        matches!(self.tag(), PACK_BIGINT | PACK_STR | PACK_SYM | PACK_OBJ)
+            .then_some(self.0 & PACK_PAYLOAD)
     }
 }
 
@@ -283,12 +289,6 @@ pub(crate) fn trace_nullish_property(site: &str, key: &Value) {
     };
     eprintln!("TRust JS: nullish computed-property read site={site} key={key}");
 }
-
-// The execution-storage word. Value is transparent over this same representation; the two
-// nominal types keep raw native/operand transfers distinct from decoded match views.
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub(crate) struct PackedValue(u64, std::marker::PhantomData<*const ()>);
 
 /// Property-only word storage. A deferred prototype can be held and promoted only here.
 #[repr(transparent)]
@@ -322,14 +322,7 @@ pub(crate) const DEFERRED_PROTOTYPE_BYTES: usize = std::mem::size_of::<LazyFunct
 /// releases nothing; the cell dies at the first collection that finds no word naming it.
 type LazyProto = crate::gc_box::GcBox<LazyFunctionPrototype>;
 
-impl PackedValue {
-    /// The encoded bits. A word owns nothing: generated code copies it as it is.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn bits(&self) -> u64 {
-        self.0
-    }
-
+impl Value {
     pub(crate) fn scalar_bits(value: &Value) -> Option<u64> {
         value.cell_word().is_none().then_some(value.bits())
     }
@@ -350,38 +343,35 @@ impl PackedValue {
         self.0 == PACK_UNDEFINED
     }
 
-    /// Inspect a primitive without cloning an owner or materializing a deferred object.
+    /// Inspect whether this execution value is a primitive.
     #[inline]
     pub(crate) fn is_primitive(&self) -> bool {
         !matches!(self.tag(), PACK_OBJ | PACK_LAZY_PROTO)
     }
 
-    /// Lend an already materialized object without creating another owner. The
-    /// callback must finish its borrowed inspection before an observer can change
-    /// the source slot; property lookup uses this only to take an owned snapshot.
-    /// Deferred prototypes deliberately retain their ordinary materializing path.
+    /// Inspect an object without exposing its payload to a reentrant observer. Property
+    /// lookup uses the callback to take a separate value snapshot before running JS.
     #[inline]
     pub(crate) fn with_object<R>(&self, f: impl FnOnce(&Gc) -> R) -> Option<R> {
         if self.tag() != PACK_OBJ {
             return None;
         }
-        let object = std::mem::ManuallyDrop::new(unsafe { self.read_word::<Gc>() });
+        let object = unsafe { self.read_word::<Gc>() };
         Some(f(&object))
     }
 
-    /// Borrow string text for an observer-free primitive operation, retaining the
-    /// compact slot's owner. As with `with_object`, do not lend frame slots to JS.
+    /// Borrow string text for an observer-free primitive operation. As with `with_object`,
+    /// mutable frame slots must not stay borrowed across JS execution.
     #[inline]
     pub(crate) fn with_string<R>(&self, f: impl FnOnce(&crate::lstr::LStr) -> R) -> Option<R> {
         if self.tag() != PACK_STR {
             return None;
         }
-        let string = std::mem::ManuallyDrop::new(unsafe { self.read_word::<crate::lstr::LStr>() });
+        let string = unsafe { self.read_word::<crate::lstr::LStr>() };
         Some(f(&string))
     }
 
-    /// Inspect a Number without manufacturing an owning Value. In particular, rejecting a
-    /// reference or deferred prototype must not clone it or materialize it as a side effect.
+    /// Inspect a Number without decoding a match view or inspecting a reference payload.
     #[inline]
     pub(crate) fn number(&self) -> Option<f64> {
         match self.tag() {
@@ -391,13 +381,12 @@ impl PackedValue {
         }
     }
 
-    unsafe fn into_word<T>(value: T) -> u64 {
+    unsafe fn into_word<T: Copy>(value: T) -> u64 {
         assert!(std::mem::size_of::<T>() <= std::mem::size_of::<usize>());
-        let value = std::mem::ManuallyDrop::new(value);
         let mut word = 0usize;
         unsafe {
             std::ptr::copy_nonoverlapping(
-                &*value as *const T as *const u8,
+                &value as *const T as *const u8,
                 &mut word as *mut usize as *mut u8,
                 std::mem::size_of::<T>(),
             );
@@ -409,20 +398,6 @@ impl PackedValue {
             "pointer does not fit NaN-box payload"
         );
         word
-    }
-
-    #[inline]
-    fn from_bits(bits: u64) -> Self {
-        debug_assert_ne!(
-            bits & !PACK_PAYLOAD,
-            PACK_LAZY_PROTO,
-            "a deferred prototype's word copied without materializing"
-        );
-        debug_assert!(
-            Self::valid_bits(bits),
-            "invalid execution word {bits:#018x}"
-        );
-        Self(bits, std::marker::PhantomData)
     }
 
     /// Encoding validation only: reference liveness, exact cell type and ownership remain
@@ -455,44 +430,11 @@ impl PackedValue {
             value.assume_init()
         }
     }
-
-    #[inline]
-    pub(crate) const fn pack(value: Value) -> PackedValue {
-        value.0
-    }
-
-    #[inline]
-    pub(crate) fn unpack(&self) -> Value {
-        // SAFETY: typed execution storage contains valid, live execution words. Debug builds
-        // validate encodings before exposing a handle; release copies this transparent word.
-        unsafe { Value::from_bits(self.0) }
-    }
-
-    /// Lend the ordinary object edge this execution word holds. Property-only deferred
-    /// prototype words never enter execution storage.
-    #[inline]
-    fn with_object_edge(&self, f: impl FnOnce(&Gc)) {
-        if self.tag() == PACK_OBJ {
-            let object = std::mem::ManuallyDrop::new(unsafe { self.read_word::<Gc>() });
-            f(&object)
-        }
-    }
-
-    /// Decode a plain execution word. Copying or consuming a word changes no ownership.
-    #[inline]
-    pub(crate) fn into_value(self) -> Value {
-        self.unpack()
-    }
 }
 
 impl PropWord {
     #[inline]
-    fn pack(value: Value) -> Self {
-        Self::from_packed(PackedValue::pack(value))
-    }
-
-    #[inline]
-    fn from_packed(value: PackedValue) -> Self {
+    fn from_value(value: Value) -> Self {
         debug_assert_ne!(value.tag(), PACK_LAZY_PROTO);
         Self(Cell::new(value.0), std::marker::PhantomData)
     }
@@ -508,34 +450,22 @@ impl PropWord {
     }
 
     #[inline]
-    fn unpack(&self) -> Value {
+    fn materialize(&self) -> Value {
         if self.tag() == PACK_LAZY_PROTO {
             // SAFETY: only defer_function_prototype publishes this property-only tag.
-            let lazy = unsafe { PackedValue::decode_payload::<LazyProto>(self.0.get()) };
+            let lazy = unsafe { Value::decode_payload::<LazyProto>(self.0.get()) };
             let prototype = lazy.materialize();
             // Representation-only promotion invokes no JS. Record the owning function before
             // publishing its new object edge, with no safepoint between barrier and store.
             lazy.mark_owner_card();
             self.0
-                .set(PACK_OBJ | unsafe { PackedValue::into_word(prototype) });
+                .set(PACK_OBJ | unsafe { Value::into_word(prototype) });
             Value::Obj(prototype)
         } else {
-            PackedValue::from_bits(self.0.get()).unpack()
+            // SAFETY: ordinary property words hold valid execution values; the property-only
+            // deferred tag was handled above, before constructing an execution value.
+            unsafe { Value::from_bits(self.0.get()) }
         }
-    }
-
-    #[inline]
-    fn clone_materialized(&self) -> PackedValue {
-        if self.tag() == PACK_LAZY_PROTO {
-            PackedValue::pack(self.unpack())
-        } else {
-            PackedValue::from_bits(self.0.get())
-        }
-    }
-
-    #[inline]
-    fn into_value(self) -> Value {
-        self.unpack()
     }
 
     #[inline]
@@ -543,7 +473,9 @@ impl PropWord {
         if self.tag() != PACK_OBJ {
             return None;
         }
-        PackedValue::from_bits(self.0.get()).with_object(f)
+        // SAFETY: the property holds an ordinary Object word, whose live cell stays in the
+        // observer-free inspection's owning property snapshot.
+        unsafe { Value::from_bits(self.0.get()) }.with_object(f)
     }
 
     #[inline]
@@ -551,7 +483,8 @@ impl PropWord {
         if self.tag() == PACK_LAZY_PROTO {
             return None;
         }
-        PackedValue::from_bits(self.0.get()).number()
+        // SAFETY: a non-deferred property contains an execution word.
+        unsafe { Value::from_bits(self.0.get()) }.number()
     }
 
     #[inline]
@@ -563,14 +496,15 @@ impl PropWord {
         if self.tag() == PACK_LAZY_PROTO {
             sink.word(self.0.get() & PACK_PAYLOAD);
         } else {
-            PackedValue::from_bits(self.0.get()).trace_gc_edges(sink);
+            // SAFETY: the property-only tag was handled separately above.
+            sink.value(&unsafe { Value::from_bits(self.0.get()) });
         }
     }
 }
 
 // A word owns nothing, so it has no drop glue; dropping or overwriting one, and every
 // teardown loop over execution words, compiles to nothing.
-const _: () = assert!(!std::mem::needs_drop::<PackedValue>());
+const _: () = assert!(!std::mem::needs_drop::<Value>());
 
 #[cfg(test)]
 mod packed_value_tests {
@@ -584,16 +518,14 @@ mod packed_value_tests {
         fn copy<T: Copy>() {}
         copy::<Value>();
         copy::<ValueView>();
-        copy::<PackedValue>();
         copy::<crate::lstr::LStr>();
         copy::<crate::bigint::JsBigInt>();
         assert_eq!(std::mem::size_of::<Value>(), 8);
         assert_eq!(std::mem::size_of::<ValueView>(), 16);
-        assert_eq!(std::mem::size_of::<PackedValue>(), 8);
-        assert_eq!(std::mem::size_of::<Cell<PackedValue>>(), 8);
+        assert_eq!(std::mem::size_of::<Cell<Value>>(), 8);
         assert_eq!(
-            std::mem::align_of::<Cell<PackedValue>>(),
-            std::mem::align_of::<PackedValue>()
+            std::mem::align_of::<Cell<Value>>(),
+            std::mem::align_of::<Value>()
         );
         assert_eq!(std::mem::size_of::<PropWord>(), 8);
         assert_eq!(std::mem::size_of::<Property>(), 16);
@@ -619,7 +551,6 @@ mod packed_value_tests {
         }
         thread_bound!(Value);
         thread_bound!(ValueView);
-        thread_bound!(PackedValue);
         thread_bound!(PropWord);
         thread_bound!(Property);
         thread_bound!(crate::lstr::LStr);
@@ -715,7 +646,7 @@ mod packed_value_tests {
             f64::INFINITY.to_bits(),
             f64::NEG_INFINITY.to_bits(),
         ] {
-            assert!(PackedValue::valid_bits(valid));
+            assert!(Value::valid_bits(valid));
             assert_eq!(unsafe { Value::from_bits(valid) }.bits(), valid);
         }
         for invalid in [
@@ -736,7 +667,7 @@ mod packed_value_tests {
             PACK_LAZY_PROTO | 8,
             0xfffb_0000_0000_0001,
         ] {
-            assert!(!PackedValue::valid_bits(invalid), "{invalid:#018x}");
+            assert!(!Value::valid_bits(invalid), "{invalid:#018x}");
             #[cfg(debug_assertions)]
             assert!(std::panic::catch_unwind(|| {
                 // The checked constructor must reject before constructing any cell handle.
@@ -750,10 +681,8 @@ mod packed_value_tests {
     #[cfg(target_pointer_width = "64")]
     fn cell_payload_fit_remains_a_release_assertion_and_accepts_48_bits() {
         let wide = 0x0000_1234_5678_9000usize;
-        assert_eq!(unsafe { PackedValue::into_word(wide) }, wide as u64);
-        assert!(
-            std::panic::catch_unwind(|| unsafe { PackedValue::into_word(1usize << 48) }).is_err()
-        );
+        assert_eq!(unsafe { Value::into_word(wide) }, wide as u64);
+        assert!(std::panic::catch_unwind(|| unsafe { Value::into_word(1usize << 48) }).is_err());
     }
 
     #[test]
@@ -850,7 +779,7 @@ mod packed_value_tests {
     /// its bits, a Number's (or NaN's) value comes back exactly, and an object's word still
     /// names its object. A word owns nothing, so its bits are all there is to keep.
     #[test]
-    fn packed_numeric_inspection_is_non_owning_and_preserves_number_bits() {
+    fn numeric_inspection_preserves_number_bits_without_materializing_properties() {
         for number in [
             0.0,
             -0.0,
@@ -861,7 +790,7 @@ mod packed_value_tests {
             f64::from_bits(PACK_OBJ | 123),
             f64::from_bits(PACK_SYM | 456),
         ] {
-            let packed = PackedValue::pack(Value::Num(number));
+            let packed = Value::Num(number);
             let bits = packed.bits();
             let actual = packed.number().expect("Number tag");
             assert!(number.is_nan() && actual.is_nan() || number.to_bits() == actual.to_bits());
@@ -876,11 +805,11 @@ mod packed_value_tests {
             Value::Bool(false),
             Value::Bool(true),
             Value::Str("number".into()),
-            Value::Obj(object.clone()),
+            Value::Obj(object),
         ] {
             let empty = matches!((value).view(), ValueView::Empty);
             let is_object = matches!((value).view(), ValueView::Obj(_));
-            let packed = PackedValue::pack(value);
+            let packed = value;
             let bits = packed.bits();
             for _ in 0..20 {
                 assert!(packed.number().is_none());
@@ -889,7 +818,7 @@ mod packed_value_tests {
             assert_eq!(packed.bits(), bits);
             if is_object {
                 assert!(
-                    matches!((packed.unpack()).view(), ValueView::Obj(actual) if Gc::ptr_eq(&actual, &object))
+                    matches!(packed.clone().view(), ValueView::Obj(actual) if Gc::ptr_eq(&actual, &object))
                 );
             }
         }
@@ -899,7 +828,7 @@ mod packed_value_tests {
     fn property_scalar_inspection_never_materializes_a_deferred_prototype() {
         let mut engine = crate::Engine::new();
         engine.eval("function unobserved(){}", false).unwrap();
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let function = engine.interp.get_var("unobserved", &env).ok().unwrap();
         let object_handle = function.as_obj().unwrap();
         let object = object_handle.borrow();
@@ -923,55 +852,47 @@ mod packed_value_tests {
     }
 
     #[test]
-    fn packed_value_is_one_word_and_round_trips_scalars() {
-        assert_eq!(std::mem::size_of::<PackedValue>(), 8);
+    fn execution_value_round_trips_scalar_encodings() {
+        let scalar = |value: Value| {
+            // SAFETY: scalar constructors provide valid encodings without reference payloads.
+            unsafe { Value::from_bits(value.bits()) }
+        };
         assert!(matches!(
-            (PackedValue::pack(Value::Undefined).into_value()).view(),
+            scalar(Value::Undefined).view(),
             ValueView::Undefined
         ));
-        assert!(matches!(
-            (PackedValue::pack(Value::Empty).into_value()).view(),
-            ValueView::Empty
-        ));
-        assert!(matches!(
-            (PackedValue::pack(Value::Null).into_value()).view(),
-            ValueView::Null
-        ));
-        assert!(matches!(
-            (PackedValue::pack(Value::Bool(false)).into_value()).view(),
-            ValueView::Bool(false)
-        ));
-        assert!(matches!(
-            (PackedValue::pack(Value::Bool(true)).into_value()).view(),
-            ValueView::Bool(true)
-        ));
-        for n in [0.0f64, -0.0, 42.5, f64::INFINITY, f64::NAN] {
-            let ValueView::Num(out) = (PackedValue::pack(Value::Num(n)).into_value()).view() else {
-                panic!("number changed kind")
+        assert!(matches!(scalar(Value::Empty).view(), ValueView::Empty));
+        assert!(matches!(scalar(Value::Null).view(), ValueView::Null));
+        for boolean in [false, true] {
+            assert!(matches!(scalar(Value::Bool(boolean)).view(),
+                ValueView::Bool(actual) if actual == boolean));
+        }
+        for number in [0.0f64, -0.0, 42.5, f64::INFINITY, f64::NAN] {
+            let ValueView::Num(actual) = scalar(Value::Num(number)).view() else {
+                panic!("Number changed kind")
             };
-            assert!(n.is_nan() && out.is_nan() || n.to_bits() == out.to_bits());
+            assert!(number.is_nan() && actual.is_nan() || number.to_bits() == actual.to_bits());
         }
     }
 
-    /// Packing moves a handle into a word and `into_value` moves it back out, the same handle.
-    /// The word is the object tag over the cell's address, and the type has no drop
-    /// glue, so a move needs no drop of its source.
+    /// The object encoding contains its exact cell address; a raw execution value reconstructed
+    /// from those bits observes the same object and has no destructor.
     #[test]
-    fn packed_value_moves_reference_ownership_without_a_bump() {
+    fn execution_value_reference_bits_preserve_the_cell_identity() {
         let obj = Object::new(None);
-        let packed = PackedValue::pack(Value::Obj(obj.clone()));
+        let packed = Value::Obj(obj);
         assert_eq!(packed.bits(), PACK_OBJ | Gc::as_ptr(&obj) as u64);
-        assert!(!std::mem::needs_drop::<PackedValue>());
-        let out = packed.into_value();
+        assert!(!std::mem::needs_drop::<Value>());
+        // SAFETY: these exact bits came from the live, same-Agent object above.
+        let out = unsafe { Value::from_bits(packed.bits()) };
         assert!(matches!(&(out).view(), ValueView::Obj(actual) if Gc::ptr_eq(actual, &obj)));
         drop(out);
     }
 
-    /// A clone of a word has its exact bits, for every kind, and dropping clones leaves the
-    /// originals' values intact. A clone is a bit copy of a word over a cell's
-    /// address, which owns nothing, so there is nothing to retain or release.
+    /// Copies preserve every scalar bit pattern and cell identity, with no destructor or
+    /// count-based lifetime. The collecting heap determines cell liveness.
     #[test]
-    fn packed_value_direct_clones_preserve_bits_and_exact_owner_counts() {
+    fn copied_execution_values_preserve_all_kinds_and_cell_identities() {
         for value in [
             Value::Undefined,
             Value::Empty,
@@ -984,22 +905,18 @@ mod packed_value_tests {
             Value::Num(f64::NEG_INFINITY),
             Value::Num(f64::from_bits(0xfffa_0000_0000_1234)),
         ] {
-            let packed = PackedValue::pack(value);
-            let cloned = packed.clone();
+            let packed = value;
+            let cloned = packed;
             assert_eq!(packed.bits(), cloned.bits());
             assert_eq!(cloned.is_empty(), cloned.bits() == PACK_EMPTY);
         }
-        let object = Object::new(None);
-        let string = crate::lstr::LStr::from("packed clone owner");
         let mut interp = crate::interpreter::Interp::new();
+        let object = Object::new(None);
+        let string = crate::lstr::LStr::from("copied value identity");
         let ValueView::Sym(symbol) = (interp.new_symbol(None)).view() else {
             unreachable!()
         };
-        let original = [
-            PackedValue::pack(Value::Obj(object.clone())),
-            PackedValue::pack(Value::Str(string.clone())),
-            PackedValue::pack(Value::Sym(symbol.clone())),
-        ];
+        let original = [Value::Obj(object), Value::Str(string), Value::Sym(symbol)];
         assert_eq!(
             [original[0].bits(), original[2].bits()],
             [
@@ -1007,32 +924,30 @@ mod packed_value_tests {
                 PACK_SYM | symbol_identity(&symbol) as u64
             ]
         );
-        let copies = original.clone();
+        let copies = original;
         for (a, b) in original.iter().zip(&copies) {
             assert_eq!(a.bits(), b.bits());
         }
         drop(copies);
         assert!(matches!(
-            (original[0].unpack()).view(),
+            original[0].clone().view(),
             ValueView::Obj(actual) if Gc::ptr_eq(&actual, &object)
         ));
         assert!(matches!(
-            (original[1].unpack()).view(),
+            original[1].clone().view(),
             ValueView::Str(actual) if crate::lstr::LStr::ptr_eq(&actual, &string)
-                && &*actual == "packed clone owner"
+                && &*actual == "copied value identity"
         ));
         assert!(matches!(
-            (original[2].unpack()).view(),
+            original[2].clone().view(),
             ValueView::Sym(actual) if symbol_ptr_eq(&actual, &symbol)
         ));
         let integer = crate::bigint::JsBigInt::parse_dec("123456789012345678901234567890").unwrap();
-        let packed = PackedValue::pack(Value::BigInt(integer.clone()));
-        let copied = packed.clone();
+        let packed = Value::BigInt(integer);
+        let copied = packed;
         assert_eq!(packed.bits(), copied.bits());
         drop(packed);
-        assert!(
-            matches!((copied.into_value()).view(), ValueView::BigInt(value) if value == integer)
-        );
+        assert!(matches!(copied.view(), ValueView::BigInt(value) if value == integer));
     }
 
     #[test]
@@ -1045,12 +960,10 @@ mod packed_value_tests {
                 let number = f64::from_bits(bits);
                 assert!(number.is_nan());
                 let value = Value::Num(number);
-                assert_eq!(PackedValue::scalar_bits(&value), Some(PACK_CANON_NAN));
-                let packed = PackedValue::pack(value);
+                assert_eq!(Value::scalar_bits(&value), Some(PACK_CANON_NAN));
+                let packed = value;
                 assert_eq!(packed.bits(), PACK_CANON_NAN);
-                assert!(
-                    matches!((packed.into_value()).view(), ValueView::Num(value) if value.is_nan())
-                );
+                assert!(matches!(packed.view(), ValueView::Num(value) if value.is_nan()));
             }
         }
         for number in [
@@ -1061,44 +974,41 @@ mod packed_value_tests {
             f64::MIN_POSITIVE,
         ] {
             assert_eq!(
-                PackedValue::scalar_bits(&Value::Num(number)),
+                Value::scalar_bits(&Value::Num(number)),
                 Some(number.to_bits())
             );
         }
-        assert_eq!(PackedValue::scalar_bits(&Value::lstr("not copyable")), None);
+        assert_eq!(Value::scalar_bits(&Value::lstr("not copyable")), None);
     }
 
     /// Shared slot cells support copied reads/replacement and native raw inner-word stores
     /// without fabricating an exclusive slice. The word layout and neighboring slots stay exact.
     #[test]
-    fn packed_raw_frame_moves_and_replacements_preserve_ownership() {
+    fn cell_frame_copies_and_replacements_preserve_bits_and_neighbors() {
         let obj = Object::new(None);
-        let frame: [Cell<PackedValue>; 5] =
-            std::array::from_fn(|_| Cell::new(PackedValue::pack(Value::Undefined)));
-        frame[0].set(PackedValue::pack(Value::Num(1.5)));
-        frame[1].set(PackedValue::pack(Value::Obj(obj)));
-        frame[2].set(PackedValue::pack(Value::Bool(true)));
-        frame[3].set(PackedValue::pack(Value::Null));
-        frame[4].set(PackedValue::pack(Value::Num(-0.0)));
-        let moved = frame[1].replace(PackedValue::pack(Value::Undefined));
+        let frame: [Cell<Value>; 5] = std::array::from_fn(|_| Cell::new(Value::Undefined));
+        frame[0].set(Value::Num(1.5));
+        frame[1].set(Value::Obj(obj));
+        frame[2].set(Value::Bool(true));
+        frame[3].set(Value::Null);
+        frame[4].set(Value::Num(-0.0));
+        let moved = frame[1].replace(Value::Undefined);
         assert_eq!(frame[0].get().bits(), 1.5f64.to_bits());
-        assert!(matches!(moved.unpack().view(), ValueView::Obj(o) if Gc::ptr_eq(&o, &obj)));
+        assert!(matches!(moved.clone().view(), ValueView::Obj(o) if Gc::ptr_eq(&o, &obj)));
         // SAFETY: this raw loan addresses the inner word of a live Cell. No exclusive Rust
         // slice/reference exists, and this test performs no collection or reentrant call.
         unsafe { frame[3].as_ptr().write(moved) };
-        assert!(
-            matches!(frame[3].get().unpack().view(), ValueView::Obj(o) if Gc::ptr_eq(&o, &obj))
-        );
+        assert!(matches!(frame[3].get().clone().view(), ValueView::Obj(o) if Gc::ptr_eq(&o, &obj)));
         assert!(matches!(
-            frame[1].get().unpack().view(),
+            frame[1].get().clone().view(),
             ValueView::Undefined
         ));
         assert!(matches!(
-            frame[2].get().unpack().view(),
+            frame[2].get().clone().view(),
             ValueView::Bool(true)
         ));
         assert!(
-            matches!(frame[4].get().unpack().view(), ValueView::Num(n) if n.to_bits() == (-0.0f64).to_bits())
+            matches!(frame[4].get().clone().view(), ValueView::Num(n) if n.to_bits() == (-0.0f64).to_bits())
         );
     }
 
@@ -1744,7 +1654,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let obj_from_cell = obj_addr.wrapping_sub(stored);
     // An Option<Gc> (a proto field) holds exactly the stored word, and None is null (the
     // handle's non-null niche).
-    let some_proto: Option<Gc> = Some(sample.clone());
+    let some_proto: Option<Gc> = Some(*sample);
     let none_proto: Option<Gc> = None;
     let niche_ok = std::mem::size_of::<Option<Gc>>() == std::mem::size_of::<usize>()
         && unsafe { *(&some_proto as *const Option<Gc> as *const usize) } == stored
@@ -1898,11 +1808,11 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let scope_refcell = scope_addr - Env::as_ptr(&probe_env) as usize;
     let scope_stored = unsafe { *(&probe_env as *const Env as *const usize) };
     let scope_identity_ok = scope_stored == Env::as_ptr(&probe_env) as usize;
-    let parent_some = Some(probe_env.clone());
+    let parent_some = Some(probe_env);
     let parent_none: Option<Env> = None;
     let scope_parent = scope_refcell + offset_of!(crate::interpreter::Scope, parent);
     // A live child's parent field holds the parent's stored word, at the measured offset.
-    let probe_child = crate::interpreter::new_scope(Some(probe_env.clone()));
+    let probe_child = crate::interpreter::new_scope(Some(probe_env));
     let child_parent =
         unsafe { *((Env::as_ptr(&probe_child) as usize + scope_parent) as *const usize) };
     let scope_parent_valid = std::mem::size_of::<Option<Env>>() == std::mem::size_of::<usize>()
@@ -1935,10 +1845,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let scope_small_tag = vars_offset + small.tag;
     let scope_small_vec = vars_offset + small.entries;
     let scope_with = scope_refcell + crate::interpreter::Scope::with_object_offset();
-    let probe_with = crate::interpreter::new_with_scope(probe_env.clone(), Value::Null);
+    let probe_with = crate::interpreter::new_with_scope(probe_env, Value::Null);
     let scope_with_none = PACK_EMPTY;
-    let scope_with_valid = std::mem::size_of::<PackedValue>() == 8
-        && std::mem::align_of::<PackedValue>() == 8
+    let scope_with_valid = std::mem::size_of::<Value>() == 8
+        && std::mem::align_of::<Value>() == 8
         && scope_with.is_multiple_of(8)
         && scope_with + 8 <= std::mem::size_of::<RefCell<crate::interpreter::Scope>>()
         && unsafe { *((Env::as_ptr(&probe_child) as usize + scope_with) as *const u64) }
@@ -2001,7 +1911,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let (user_func, user_env, user_realm, func_data_off, closure_ok) = match probe_func {
         Some(func) => {
             let realm = obj_addr; // any identity the probe can recognize
-            let closure = Callable::user(func.clone(), probe_env.clone(), realm);
+            let closure = Callable::user(func.clone(), probe_env, realm);
             let words = callable_words(&closure);
             let Callable::User(user) = &closure else {
                 unreachable!("Callable::user makes a user callable")
@@ -2425,7 +2335,7 @@ impl Clone for UserCallable {
     fn clone(&self) -> Self {
         Self {
             func: self.func.clone(),
-            env: self.env.clone(),
+            env: self.env,
             realm: self.realm,
             // A cloned callable starts without a resolution proof. Its new owner can refill a
             // cache against the same live environment when it is first used.
@@ -3053,14 +2963,14 @@ pub(crate) fn interned_string(
 ) -> crate::lstr::LStr {
     with_active_gc_heap(|heap| {
         if let Some(Some(string)) = heap.interned_strings.borrow().get(slot) {
-            return string.clone();
+            return *string;
         }
         let string = make();
         let mut interned = heap.interned_strings.borrow_mut();
         if interned.len() <= slot {
             interned.resize(slot + 1, None);
         }
-        interned[slot] = Some(string.clone());
+        interned[slot] = Some(string);
         string
     })
 }
@@ -3328,16 +3238,7 @@ impl crate::gc_trace::GcTrace for NativeCallable {
     }
 }
 
-impl PackedValue {
-    /// Report this word's strong edge: a payload cell (a deferred prototype's included, which
-    /// traces its function and its parent or prototype itself) or an object.
-    pub(crate) fn trace_gc_edges(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        match self.tag() {
-            PACK_BIGINT | PACK_SYM | PACK_STR => sink.word(self.0 & PACK_PAYLOAD),
-            _ => self.with_object_edge(|object| sink.object(object)),
-        }
-    }
-
+impl Value {
     /// Whether this word is undefined or null. Reads no payload.
     pub(crate) fn is_nullish(&self) -> bool {
         matches!(self.tag(), PACK_UNDEFINED | PACK_NULL)
@@ -4577,7 +4478,7 @@ impl Clone for Property {
         Property {
             // A snapshot can be stored under another key or on another object (a descriptor
             // define, a property copy), where a deferred prototype must not travel unmaterialized.
-            packed: PropWord::from_packed(self.packed.clone_materialized()),
+            packed: PropWord::from_value(self.packed.materialize()),
             meta,
         }
     }
@@ -4627,7 +4528,7 @@ impl Property {
             | ((enumerable as usize) * PROP_ENUMERABLE)
             | ((configurable as usize) * PROP_CONFIGURABLE);
         Property {
-            packed: PropWord::pack(value),
+            packed: PropWord::from_value(value),
             meta,
         }
     }
@@ -4644,7 +4545,7 @@ impl Property {
         let ptr = Box::into_raw(Box::new(Accessors { get, set })) as usize;
         debug_assert_eq!(ptr & PROP_FLAG_MASK, 0);
         Property {
-            packed: PropWord::pack(Value::Undefined),
+            packed: PropWord::from_value(Value::Undefined),
             meta: ptr | flags,
         }
     }
@@ -4713,14 +4614,7 @@ impl Property {
     }
     #[inline]
     pub(crate) fn value(&self) -> Value {
-        self.packed.unpack()
-    }
-    /// An owning OrdinaryGet value snapshot with no wide-value round trip. It materializes a
-    /// deferred MakeConstructor prototype just like value(), so execution storage never
-    /// receives a property-only thunk.
-    #[inline]
-    pub(crate) fn clone_value_packed(&self) -> PackedValue {
-        self.packed.clone_materialized()
+        self.packed.materialize()
     }
     /// Whether this data property holds exactly the object at `expected`, compared without
     /// creating an owner. A deferred prototype has no address yet and never matches.
@@ -4745,7 +4639,7 @@ impl Property {
     pub(crate) fn visit_retained_value(&self, visitor: &mut crate::memory::Visitor) {
         if self.packed.tag() == PACK_LAZY_PROTO {
             let lazy = std::mem::ManuallyDrop::new(unsafe {
-                PackedValue::decode_payload::<LazyProto>(self.packed.0.get())
+                Value::decode_payload::<LazyProto>(self.packed.0.get())
             });
             lazy.visit_retained_memory(visitor);
         } else {
@@ -4758,7 +4652,7 @@ impl Property {
         let lazy = LazyFunctionPrototype::new(owner, parent, template);
         let lazy: LazyProto = crate::gc_box::new(lazy);
         self.packed = PropWord(
-            Cell::new(PACK_LAZY_PROTO | unsafe { PackedValue::into_word(lazy) }),
+            Cell::new(PACK_LAZY_PROTO | unsafe { Value::into_word(lazy) }),
             std::marker::PhantomData,
         );
     }
@@ -4774,12 +4668,12 @@ impl Property {
     }
     #[inline]
     pub(crate) fn set_value(&mut self, value: Value) {
-        self.packed = PropWord::pack(value);
+        self.packed = PropWord::from_value(value);
     }
     #[inline]
     pub(crate) fn replace_value(&mut self, value: Value) -> Value {
-        let old = std::mem::replace(&mut self.packed, PropWord::pack(value));
-        old.into_value()
+        let old = std::mem::replace(&mut self.packed, PropWord::from_value(value));
+        old.materialize()
     }
     #[inline]
     pub(crate) fn take_value(&mut self) -> Value {
@@ -4828,13 +4722,6 @@ impl Property {
     /// A default plain data property: writable, enumerable, configurable.
     pub(crate) fn plain(value: Value) -> Property {
         Property::data(value, true, true, true)
-    }
-    /// Move an execution owner directly into an ordinary property, with no decode/repack.
-    pub(crate) fn plain_packed(packed: PackedValue) -> Property {
-        Property {
-            packed: PropWord::from_packed(packed),
-            meta: PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE,
-        }
     }
     /// A non-enumerable method/builtin property: writable + configurable, not enumerable.
     pub(crate) fn builtin(value: Value) -> Property {
@@ -4902,7 +4789,7 @@ impl InlinePacked {
         for item in items.iter().rev() {
             // Create the new owner before moving existing slots. Each committed
             // step leaves a completely initialized prefix for cleanup.
-            let property = Property::plain(item.clone());
+            let property = Property::plain(*item);
             let ptr = self.slots.as_mut_ptr().cast::<Property>();
             unsafe {
                 std::ptr::copy(ptr, ptr.add(1), self.len as usize);
@@ -6237,7 +6124,7 @@ impl Props {
                     .entries
                     .fields
                     .iter()
-                    .map(|property| Property::plain_packed(property.clone_value_packed())),
+                    .map(|property| Property::plain(property.value())),
             );
             self.shape = source.shape;
             self.len_slot.set(source.len_slot.get());
@@ -6245,10 +6132,7 @@ impl Props {
             self.ensure_fallback_index();
         } else {
             for (key, property) in source.entries.iter() {
-                self.insert(
-                    key.clone(),
-                    Property::plain_packed(property.clone_value_packed()),
-                );
+                self.insert(key.clone(), Property::plain(property.value()));
             }
         }
         true
@@ -6341,23 +6225,17 @@ impl Props {
     ///
     /// # Safety
     /// `items..items+len` contains immutable initialized execution words valid through this call.
-    pub(crate) unsafe fn packed_array_from_raw(items: *const PackedValue, len: usize) -> Props {
+    pub(crate) unsafe fn packed_array_from_raw(items: *const Value, len: usize) -> Props {
         Self::packed_array_properties(
-            (0..len).map(|index| Property::plain_packed(unsafe { items.add(index).read() })),
+            (0..len).map(|index| Property::plain(unsafe { items.add(index).read() })),
         )
     }
 
     /// CreateArrayFromList / ArrayCreate (ECMA-262 e28783d5). Host/runtime lists
     /// use the same canonical contiguous storage as literal operands. Values
     /// move into plain own properties; no getters, conversions or species run.
-    pub(crate) fn packed_array_from_values(items: Vec<Value>) -> Props {
-        Self::packed_array_properties(items.into_iter().map(Property::plain))
-    }
-
-    pub(crate) fn packed_array_from_packed(
-        items: impl ExactSizeIterator<Item = PackedValue>,
-    ) -> Props {
-        Self::packed_array_properties(items.map(Property::plain_packed))
+    pub(crate) fn packed_array(items: impl ExactSizeIterator<Item = Value>) -> Props {
+        Self::packed_array_properties(items.map(Property::plain))
     }
 
     fn packed_array_properties(items: impl ExactSizeIterator<Item = Property>) -> Props {
@@ -6423,20 +6301,13 @@ impl Props {
 
     /// Instantiate a compiler-proved plain-data object template with its final values.
     ///
-    /// Cloning the whole template would clone every placeholder [`PackedValue`] and then drop it
+    /// Cloning the whole template would clone every placeholder [`Value`] and then drop it
     /// again as the caller overwrote each slot. Object-heavy parsers do this millions of times.
     /// The key/shape and lookup sidecars are the reusable part; plain property descriptors are
     /// cheaper and safer to construct directly around the moved values.
     pub(crate) fn instantiate_plain<I>(&self, values: I) -> Props
     where
         I: ExactSizeIterator<Item = Value>,
-    {
-        self.instantiate_plain_packed(values.map(PackedValue::pack))
-    }
-
-    pub(crate) fn instantiate_plain_packed<I>(&self, values: I) -> Props
-    where
-        I: ExactSizeIterator<Item = PackedValue>,
     {
         assert_eq!(values.len(), self.entries.len(), "object-template arity");
         // The copied shape records the template's classes; the instantiated fields are
@@ -6449,7 +6320,7 @@ impl Props {
             "plain object template with a non-writable or accessor field"
         );
         let entries = NamedEntries {
-            fields: values.map(Property::plain_packed).collect(),
+            fields: values.map(Property::plain).collect(),
             layout: self.entries.layout.clone(),
         };
         Props {
@@ -7415,7 +7286,7 @@ impl Props {
                 .packed
                 .as_deref_mut()
                 .unwrap()
-                .prepend(items.iter().map(|item| Property::plain(item.clone())));
+                .prepend(items.iter().map(|item| Property::plain(*item)));
         }
         buffers.inline_packed.packed_plain.set(
             items

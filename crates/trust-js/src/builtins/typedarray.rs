@@ -6,8 +6,8 @@ use crate::value::ValueView;
 pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     // A SharedArrayBuffer's bytes live in a process-wide Shared Data Block (`BufferData::Shared`),
     // which every agent the buffer is shared with sees.
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("SharedArrayBuffer", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("SharedArrayBuffer", proto);
     // byteLength/maxByteLength/growable accessor getters on the prototype.
     // SharedArrayBuffer.prototype accessors require a shared buffer: reject a plain ArrayBuffer
     // `this` with a TypeError (the kind of its Data Block is the discriminator).
@@ -225,12 +225,12 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     install_species(it, &ctor); // SharedArrayBuffer[@@species] returns `this`
     set_builtin(&it.global, "SharedArrayBuffer", Value::Obj(ctor));
 }
@@ -414,8 +414,8 @@ pub(crate) fn array_buffer_with_storage(
 }
 
 pub(super) fn install_array_buffer(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("ArrayBuffer", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("ArrayBuffer", proto);
     set_to_string_tag(it, &proto, "ArrayBuffer");
     // byteLength/maxByteLength/resizable/detached are accessor getters on the prototype.
     // ArrayBuffer.prototype accessors/methods require a non-shared buffer: reject a SharedArrayBuffer
@@ -748,12 +748,12 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     it.def_method(&ctor, "isView", 1, |i, _t, a| {
         // A view is a TypedArray or a DataView (identified by its `__dv_buffer` internal slot).
         let is_view = match (arg(a, 0)).view() {
@@ -830,7 +830,7 @@ fn ta_delegate(i: &mut Interp, this: &Value, method: &str, args: &[Value]) -> Re
         }
         for k in 0..len {
             let val = if k == actual {
-                coerced.clone()
+                coerced
             } else {
                 i.ta_read(&info, k)
             };
@@ -846,7 +846,7 @@ fn ta_delegate(i: &mut Interp, this: &Value, method: &str, args: &[Value]) -> Re
         return r;
     }
     let f = it_array_method(i, method);
-    let result = ab(i.call(f, this.clone(), args))?;
+    let result = ab(i.call(f, *this, args))?;
     // Methods that produce a new collection return a TypedArray built via TypedArraySpeciesCreate
     // (the receiver's `constructor[@@species]`, falling back to the kind's intrinsic constructor).
     if matches!(
@@ -969,7 +969,7 @@ fn ta_sort_compare(
     is_bigint: bool,
 ) -> Result<i32, Value> {
     if let Some(cmp) = cmp {
-        let r = ab(cmp.call(i, Value::Undefined, [a.clone(), b.clone()]))?;
+        let r = ab(cmp.call(i, Value::Undefined, [*a, *b]))?;
         let n = ab(i.to_number(&r))?;
         return Ok(if n.is_nan() {
             0
@@ -1022,21 +1022,21 @@ fn ta_merge_sort(
     let (mut li, mut ri, mut k) = (0usize, 0usize, 0usize);
     while li < left.len() && ri < right.len() {
         if ta_sort_compare(i, &left[li], &right[ri], cmp, is_bigint)? <= 0 {
-            vals[k] = left[li].clone();
+            vals[k] = left[li];
             li += 1;
         } else {
-            vals[k] = right[ri].clone();
+            vals[k] = right[ri];
             ri += 1;
         }
         k += 1;
     }
     while li < left.len() {
-        vals[k] = left[li].clone();
+        vals[k] = left[li];
         li += 1;
         k += 1;
     }
     while ri < right.len() {
-        vals[k] = right[ri].clone();
+        vals[k] = right[ri];
         ri += 1;
         k += 1;
     }
@@ -1083,7 +1083,7 @@ fn ta_native(
         if cb.is_callable() {
             // Keep one guarded entry across the algorithm, without changing any live element
             // read or species/Call order (ECMA-262 %TypedArray%.prototype callback methods).
-            Ok(crate::callback::Callback::new(cb.clone()))
+            Ok(crate::callback::Callback::new(cb))
         } else {
             Err(i.make_error("TypeError", "callback is not a function"))
         }
@@ -1103,7 +1103,7 @@ fn ta_native(
             let cb = require_cb(i)?;
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                ab(cb.call(i, this_arg.clone(), [v, Value::Num(k as f64), this.clone()]))?;
+                ab(cb.call(i, this_arg, [v, Value::Num(k as f64), *this]))?;
             }
             Ok(Value::Undefined)
         })()),
@@ -1111,7 +1111,7 @@ fn ta_native(
             let cb = require_cb(i)?;
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let r = ab(cb.call(i, this_arg.clone(), [v, Value::Num(k as f64), this.clone()]))?;
+                let r = ab(cb.call(i, this_arg, [v, Value::Num(k as f64), *this]))?;
                 if !i.to_boolean(&r) {
                     return Ok(Value::Bool(false));
                 }
@@ -1122,7 +1122,7 @@ fn ta_native(
             let cb = require_cb(i)?;
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let r = ab(cb.call(i, this_arg.clone(), [v, Value::Num(k as f64), this.clone()]))?;
+                let r = ab(cb.call(i, this_arg, [v, Value::Num(k as f64), *this]))?;
                 if i.to_boolean(&r) {
                     return Ok(Value::Bool(true));
                 }
@@ -1144,11 +1144,7 @@ fn ta_native(
                 };
                 remaining -= 1;
                 let v = i.ta_read(&info, k);
-                let r = ab(cb.call(
-                    i,
-                    this_arg.clone(),
-                    [v.clone(), Value::Num(k as f64), this.clone()],
-                ))?;
+                let r = ab(cb.call(i, this_arg, [v, Value::Num(k as f64), *this]))?;
                 if i.to_boolean(&r) {
                     return Ok(if want_value { v } else { Value::Num(k as f64) });
                 }
@@ -1169,8 +1165,7 @@ fn ta_native(
                 })?;
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let mapped =
-                    ab(cb.call(i, this_arg.clone(), [v, Value::Num(k as f64), this.clone()]))?;
+                let mapped = ab(cb.call(i, this_arg, [v, Value::Num(k as f64), *this]))?;
                 ab(i.ta_store(&new_info, k, &mapped))?;
             }
             Ok(new_ta)
@@ -1181,11 +1176,7 @@ fn ta_native(
             let mut kept = crate::rooting::RootedVec::new();
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let r = ab(cb.call(
-                    i,
-                    this_arg.clone(),
-                    [v.clone(), Value::Num(k as f64), this.clone()],
-                ))?;
+                let r = ab(cb.call(i, this_arg, [v, Value::Num(k as f64), *this]))?;
                 if i.to_boolean(&r) {
                     kept.push(v);
                 }
@@ -1227,11 +1218,7 @@ fn ta_native(
                 };
                 remaining -= 1;
                 let v = i.ta_read(&info, k);
-                acc = ab(cb.call(
-                    i,
-                    Value::Undefined,
-                    [acc, v, Value::Num(k as f64), this.clone()],
-                ))?;
+                acc = ab(cb.call(i, Value::Undefined, [acc, v, Value::Num(k as f64), *this]))?;
             }
             Ok(acc)
         })()),
@@ -1390,13 +1377,13 @@ fn ta_native(
                         }
                     }
                     i.ta_write_bytes(&info, start, &bytes);
-                    return Ok(this.clone());
+                    return Ok(*this);
                 }
             }
             for k in start..end {
                 ab(i.ta_store(&info, k, &value))?;
             }
-            Ok(this.clone())
+            Ok(*this)
         })()),
         "copyWithin" => Some((|| {
             if i.immutable_buffers.contains(&info.buffer) {
@@ -1427,7 +1414,7 @@ fn ta_native(
                 // boxed Value and numeric conversion per element (ECMA-262 §23.2.3.6).
                 if let Some(bytes) = i.ta_read_bytes(&info, from, count as usize) {
                     i.ta_write_bytes(&info, to, &bytes);
-                    return Ok(this.clone());
+                    return Ok(*this);
                 }
                 let snap: Vec<Value> = (0..count as usize)
                     .map(|j| i.ta_read(&info, from + j))
@@ -1436,7 +1423,7 @@ fn ta_native(
                     ab(i.ta_store(&info, to + j, v))?;
                 }
             }
-            Ok(this.clone())
+            Ok(*this)
         })()),
         "sort" | "toSorted" => Some((|| {
             let cmp = arg(args, 0);
@@ -1484,7 +1471,7 @@ fn ta_native(
                         }
                         if in_place {
                             i.ta_write_bytes(&info, 0, &sorted);
-                            return Ok(this.clone());
+                            return Ok(*this);
                         }
                         let (new_ta, new_info) = ta_create_same(i, info.kind, len)?;
                         i.ta_write_bytes(&new_info, 0, &sorted);
@@ -1519,7 +1506,7 @@ fn ta_native(
                     for (k, n) in nums.iter().enumerate() {
                         ab(i.ta_store(&info, k, &Value::Num(*n)))?;
                     }
-                    return Ok(this.clone());
+                    return Ok(*this);
                 }
                 let (new_ta, new_info) = ta_create_same(i, info.kind, len)?;
                 for (k, n) in nums.iter().enumerate() {
@@ -1538,7 +1525,7 @@ fn ta_native(
                 for (k, v) in vals.iter().enumerate() {
                     ab(i.ta_store(&info, k, v))?;
                 }
-                Ok(this.clone())
+                Ok(*this)
             } else {
                 let (new_ta, new_info) = ta_create_same(i, info.kind, len)?;
                 for (k, v) in vals.iter().enumerate() {
@@ -1584,7 +1571,7 @@ fn ta_native(
                         reversed.extend_from_slice(&source[k * es..(k + 1) * es]);
                     }
                     i.ta_write_bytes(&info, 0, &reversed);
-                    return Ok(this.clone());
+                    return Ok(*this);
                 }
             }
             for k in 0..len / 2 {
@@ -1593,7 +1580,7 @@ fn ta_native(
                 ab(i.ta_store(&info, k, &b))?;
                 ab(i.ta_store(&info, len - 1 - k, &a))?;
             }
-            Ok(this.clone())
+            Ok(*this)
         })()),
         "slice" => Some((|| {
             let start = rel_index(ab(i.to_number(&arg(args, 0)))?, len);
@@ -1687,7 +1674,7 @@ fn ta_species_create(
     args: &[Value],
     write: bool,
 ) -> Result<Value, Value> {
-    let default_ctor = ab(i.get_member_key(&Value::Obj(i.global.clone()), kind.name()))?;
+    let default_ctor = ab(i.get_member_key(&Value::Obj(i.global), kind.name()))?;
     let ctor = ab(i.get_member_key(this, "constructor"))?;
     let chosen = if matches!((ctor).view(), ValueView::Undefined) {
         default_ctor
@@ -2280,7 +2267,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
 
     // Shared %TypedArray% prototype. Each method brand-checks the receiver is a TypedArray, then
     // delegates to the generic Array method (which works through get_member/array_length/set_member).
-    let ta_proto = Object::new(Some(it.object_proto.clone()));
+    let ta_proto = Object::new(Some(it.object_proto));
     for (name, f) in TA_METHODS {
         // Each method's `length` matches its required-parameter count.
         let len = match *name {
@@ -2295,7 +2282,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
         ta_proto.borrow_mut().props.insert("toString", p);
     }
     // %TypedArray%.prototype[@@iterator] is the same function object as its own `values`.
-    if let Some(sym) = it.iterator_sym.clone() {
+    if let Some(sym) = it.iterator_sym {
         let k = Interp::sym_key(&sym);
         let values_prop = ta_proto.borrow().props.get("values").cloned();
         if let Some(p) = values_prop {
@@ -2372,12 +2359,12 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
     ta_ctor.borrow_mut().is_constructor = true;
     ta_ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(ta_proto.clone()), false, false, false),
+        Property::data(Value::Obj(ta_proto), false, false, false),
     );
-    ta_proto.borrow_mut().props.insert(
-        "constructor",
-        Property::builtin(Value::Obj(ta_ctor.clone())),
-    );
+    ta_proto
+        .borrow_mut()
+        .props
+        .insert("constructor", Property::builtin(Value::Obj(ta_ctor)));
     it.def_method(&ta_ctor, "of", 0, ta_of);
     it.def_method(&ta_ctor, "from", 1, ta_from);
     install_species(it, &ta_ctor);
@@ -2397,23 +2384,23 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
         (TaKind::U64, ta_ctor_u64),
     ];
     for (kind, ctor_fn) in kinds {
-        let proto = Object::new(Some(ta_proto.clone()));
-        Rc::make_mut(&mut it.extra_protos).insert(kind.name(), proto.clone());
+        let proto = Object::new(Some(ta_proto));
+        Rc::make_mut(&mut it.extra_protos).insert(kind.name(), proto);
         // BYTES_PER_ELEMENT is a non-writable, non-enumerable, non-configurable constant.
         proto.borrow_mut().props.insert(
             "BYTES_PER_ELEMENT",
             Property::data(Value::Num(kind.elsize() as f64), false, false, false),
         );
         let ctor = it.make_native(kind.name(), 3, ctor_fn);
-        ctor.borrow_mut().proto = Some(ta_ctor.clone()); // [[Prototype]] is %TypedArray%
+        ctor.borrow_mut().proto = Some(ta_ctor); // [[Prototype]] is %TypedArray%
         ctor.borrow_mut().props.insert(
             "prototype",
-            Property::data(Value::Obj(proto.clone()), false, false, false),
+            Property::data(Value::Obj(proto), false, false, false),
         );
         proto
             .borrow_mut()
             .props
-            .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+            .insert("constructor", Property::builtin(Value::Obj(ctor)));
         ctor.borrow_mut().props.insert(
             "BYTES_PER_ELEMENT",
             Property::data(Value::Num(kind.elsize() as f64), false, false, false),
@@ -2843,7 +2830,7 @@ fn ta_of(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let ta = ab(i.construct(this, &len_args))?;
     let ta = ta_validate_created(i, ta, &len_args, true)?;
     for (k, v) in args.iter().enumerate() {
-        ab(i.set_member_key(&ta, &k.to_string(), v.clone()))?;
+        ab(i.set_member_key(&ta, &k.to_string(), *v))?;
     }
     Ok(ta)
 }
@@ -2885,7 +2872,7 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
         // `items` stays rooted while mapping and stores run author code (I1).
         for (k, v) in items.iter().cloned().enumerate() {
             let val = if let Some(mapfn) = &mapfn {
-                ab(mapfn.call(i, this_arg.clone(), [v, Value::Num(k as f64)]))?
+                ab(mapfn.call(i, this_arg, [v, Value::Num(k as f64)]))?
             } else {
                 v
             };
@@ -2903,7 +2890,7 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
     for k in 0..len {
         let v = ab(i.get_member_key(&src, &k.to_string()))?;
         let val = if let Some(mapfn) = &mapfn {
-            ab(mapfn.call(i, this_arg.clone(), [v, Value::Num(k as f64)]))?
+            ab(mapfn.call(i, this_arg, [v, Value::Num(k as f64)]))?
         } else {
             v
         };

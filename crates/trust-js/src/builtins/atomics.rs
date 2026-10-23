@@ -8,7 +8,7 @@ use std::time::Duration;
 /// `Atomics` over integer TypedArrays. A shared buffer's read-modify-write operations hold its
 /// Shared Data Block's lock; `wait`/`waitAsync`/`notify` use the process-wide WaiterLists.
 pub(super) fn install_atomics(it: &mut Interp) {
-    let atomics = Object::new(Some(it.object_proto.clone()));
+    let atomics = Object::new(Some(it.object_proto));
 
     fn target(i: &mut Interp, args: &[Value]) -> Result<(TaInfo, usize), Value> {
         target_rw(i, args, false)
@@ -325,7 +325,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         let promise = i.new_promise();
         let block = i.shared_block(info.buffer).unwrap().clone();
         i.pending_async_waits.push(AsyncWait {
-            promise: promise.clone(),
+            promise,
             token,
             id,
             block,

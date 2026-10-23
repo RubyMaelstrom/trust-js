@@ -44,7 +44,7 @@ fn check(source: &str, expected: &str) {
 }
 
 fn global_user_callable(engine: &mut Engine, name: &str) -> crate::value::UserFn {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine
         .interp
         .get_var(name, &env)
@@ -56,7 +56,7 @@ fn global_user_callable(engine: &mut Engine, name: &str) -> crate::value::UserFn
     let crate::value::Callable::User(user) = &borrowed.call else {
         panic!("{name} is not an ordinary function")
     };
-    user.clone()
+    *user
 }
 
 fn has_binding_getter_cache(user: &crate::value::UserCallable) -> bool {
@@ -178,7 +178,7 @@ fn record_getter_specialization_returns_fresh_live_records() {
         engine.interp.gc_collect();
         assert_eq!(evaluate(&mut engine, "read(source).index"), "7");
         if tier == Tier::Jit {
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let source = engine
                 .interp
                 .get_var("source", &env)
@@ -265,7 +265,7 @@ fn getter_cache_owned_snapshot_stays_two_words() {
     assert_eq!(std::mem::size_of::<Option<CachedGet>>(), 16);
     let mut engine = Engine::new();
     let object = Object::new(None);
-    let property = Property::plain(Value::Obj(object.clone()));
+    let property = Property::plain(Value::Obj(object));
     let read = engine
         .interp
         .snapshot_cached_get(&property, "value", 0, 0, false)
@@ -350,7 +350,7 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
             );
             weak
         });
-        let mut receiver = holder.clone();
+        let mut receiver = holder;
         for _ in 0..depth {
             receiver = Object::new(Some(receiver));
         }
@@ -358,7 +358,7 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
             .borrow_mut()
             .props
             .insert("id", Property::plain(Value::Num(19.0)));
-        let base = Value::Obj(receiver.clone());
+        let base = Value::Obj(receiver);
         for _ in 0..3 {
             let value = engine
                 .interp
@@ -400,7 +400,7 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
 fn getter_cache_same_shape_replacement_and_kind_changes_are_live() {
     let mut engine = Engine::new();
     let object = Object::new(None);
-    let base = Value::Obj(object.clone());
+    let base = Value::Obj(object);
     let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
     let calls = Rc::new(Cell::new(0));
     let mut shape = None;
@@ -469,7 +469,7 @@ fn getter_cache_array_holder_uses_live_key_checks_and_computed_keys() {
             arrays.push(a);}
     "#,
     );
-    let global = Value::Obj(engine.interp.global.clone());
+    let global = Value::Obj(engine.interp.global);
     let arrays = engine
         .interp
         .get_member_key(&global, "arrays")
@@ -563,7 +563,7 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
         );
         weak
     });
-    let base = Value::Obj(object.clone());
+    let base = Value::Obj(object);
     let result = engine
         .interp
         .get_computed_property(&base, &key)
@@ -706,7 +706,7 @@ fn getter_cache_legacy_poison_stays_generic_and_getter_exceptions_propagate() {
         &mut engine,
         "function sloppy(){}; var strict=function(){'use strict';};",
     );
-    let global = Value::Obj(engine.interp.global.clone());
+    let global = Value::Obj(engine.interp.global);
     let sloppy = engine
         .interp
         .get_member_key(&global, "sloppy")
@@ -909,7 +909,7 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
         ));
         assert_eq!(accessor[0].get().depth, IC_ACCESSOR);
     }
-    let global = Value::Obj(engine.interp.global.clone());
+    let global = Value::Obj(engine.interp.global);
     assert!(matches!(
         (engine.interp.get_member_key(&global, "pilotGetterCalls")).map(|__value| (__value).view()),
         Ok(ValueView::Num(2.0))
@@ -963,7 +963,7 @@ fn propstat_classify_buckets_match_template_guards_without_running_getters() {
         ),
         "ok"
     );
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let var = |engine: &mut Engine, name: &str| {
         engine
             .interp

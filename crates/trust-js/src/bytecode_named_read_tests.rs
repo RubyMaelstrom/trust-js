@@ -75,7 +75,7 @@ fn use_kind(chunk: Rc<Chunk>, site: ReadSite, kind: ReadKind) -> Rc<Chunk> {
 }
 
 struct Invocation {
-    stack: Box<[MaybeUninit<PackedValue>; 4]>,
+    stack: Box<[MaybeUninit<Value>; 4]>,
     initialized: [bool; 4],
     live: usize,
     error: Option<Abrupt>,
@@ -87,7 +87,7 @@ impl Invocation {
         self.initialized[index] = false;
         // SAFETY: every live stack position is initialized by the helper, and this bit is
         // cleared before the owner is moved out so Drop cannot release it a second time.
-        unsafe { self.stack[index].assume_init_read().into_value() }
+        unsafe { self.stack[index].assume_init_read() }
     }
 
     fn take_values(&mut self) -> Vec<Value> {
@@ -118,29 +118,29 @@ fn invoke(
     receiver: Value,
     prefix: Value,
 ) -> Invocation {
-    let mut stack: Box<[MaybeUninit<PackedValue>; 4]> =
+    let mut stack: Box<[MaybeUninit<Value>; 4]> =
         Box::new(std::array::from_fn(|_| MaybeUninit::uninit()));
-    let base = stack.as_mut_ptr().cast::<PackedValue>();
+    let base = stack.as_mut_ptr().cast::<Value>();
     let prefix_len = 1;
-    unsafe { base.write(PackedValue::pack(prefix)) };
+    unsafe { base.write(prefix) };
 
-    let mut slots: Vec<Cell<PackedValue>> = (0..chunk.n_slots)
-        .map(|_| Cell::new(PackedValue::pack(Value::Undefined)))
+    let mut slots: Vec<Cell<Value>> = (0..chunk.n_slots)
+        .map(|_| Cell::new(Value::Undefined))
         .collect();
     let mut this_value = Value::Undefined;
     let mut stack_len = prefix_len;
     match kind {
         ReadKind::Stack | ReadKind::Method => {
-            unsafe { base.add(stack_len).write(PackedValue::pack(receiver)) };
+            unsafe { base.add(stack_len).write(receiver) };
             stack_len += 1;
         }
         ReadKind::Local => {
-            slots[site.slot as usize].set(PackedValue::pack(receiver));
+            slots[site.slot as usize].set(receiver);
         }
         ReadKind::This => this_value = receiver,
     }
 
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let interp = &mut *engine.interp;
     let mut ctx = JitCtx {
         helpers: interp.jit_helpers.as_ptr(),
@@ -149,7 +149,7 @@ fn invoke(
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &interp.inline_ic_safe as *const _ as *const u8,
         env_raw: Env::as_ptr(&env).cast(),
-        this_word: PackedValue::pack(this_value),
+        this_word: (this_value),
         global_body: std::ptr::null(),
         genv: Env::as_ptr(&env) as usize,
         interp,
@@ -160,7 +160,7 @@ fn invoke(
         code_base: std::ptr::null(),
         pc_offsets: std::ptr::null(),
         error: None,
-        ret: PackedValue::pack(Value::Undefined),
+        ret: (Value::Undefined),
         env_parent_raw: std::ptr::null(),
         opstat_enabled: false,
         callstat_enabled: false,
@@ -210,7 +210,7 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 fn binding(engine: &mut Engine, name: &str) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .get_var(name, &env)
@@ -259,8 +259,8 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
             receiver
                 .borrow_mut()
                 .props
-                .insert("value", crate::value::Property::plain(expected.clone()));
-            let receiver_value = Value::Obj(receiver.clone());
+                .insert("value", crate::value::Property::plain(*expected));
+            let receiver_value = Value::Obj(receiver);
             let mut outcome = invoke(
                 &mut engine,
                 &chunk,
@@ -322,14 +322,7 @@ fn named_read_proxy_reentry_runs_after_borrowed_lookup_and_keeps_method_receiver
         ReadKind::Method,
     ] {
         chunk = use_kind(chunk, site, kind);
-        let mut outcome = invoke(
-            &mut engine,
-            &chunk,
-            site,
-            kind,
-            proxy.clone(),
-            prefix.clone(),
-        );
+        let mut outcome = invoke(&mut engine, &chunk, site, kind, proxy, prefix);
         assert!(
             outcome.error.is_none(),
             "proxy property read failed for {kind:?}"

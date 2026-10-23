@@ -112,7 +112,7 @@ pub(crate) fn uncached_name(env: &Env, name: &str) {
 }
 
 fn classify_name(env: &Env, name: &str) -> (NamePath, usize) {
-    let mut current = env.clone();
+    let mut current = *env;
     let mut depth = 0;
     loop {
         let scope = current.borrow();
@@ -129,7 +129,7 @@ fn classify_name(env: &Env, name: &str) -> (NamePath, usize) {
         if scope.has_with_object() {
             return (NamePath::With, depth);
         }
-        let Some(parent) = scope.parent.clone() else {
+        let Some(parent) = scope.parent else {
             // No global property/Proxy/getter inspection: the real lookup decides
             // whether this is a global binding, an inherited binding, or absence.
             return (NamePath::BeyondScopes, depth);
@@ -204,8 +204,8 @@ mod tests {
             .borrow_mut()
             .vars
             .insert("value", Binding::data(Value::Num(7.0), true, true));
-        let middle = new_scope(Some(outer.clone()));
-        let inner = new_scope(Some(middle.clone()));
+        let middle = new_scope(Some(outer));
+        let inner = new_scope(Some(middle));
         assert_eq!(classify_name(&inner, "value"), (NamePath::Declarative, 2));
         assert_eq!(classify_name(&inner, "absent"), (NamePath::BeyondScopes, 2));
         middle
@@ -236,9 +236,8 @@ mod tests {
             .insert("value", Binding::data(Value::Num(7.0), true, true));
         let object = Object::new(None);
         let with = new_scope(Some(outer));
-        with.borrow_mut()
-            .set_with_object(Some(Value::Obj(object.clone())));
-        let inner = new_scope(Some(with.clone()));
+        with.borrow_mut().set_with_object(Some(Value::Obj(object)));
+        let inner = new_scope(Some(with));
         // Holding an exclusive object borrow proves classification never inspects
         // its properties, invokes traps/getters, or asks for @@unscopables.
         let _exclusive = object.borrow_mut();

@@ -270,7 +270,7 @@ impl LStr {
     pub(crate) fn slice_bytes(&self, start: usize, end: usize) -> LStr {
         let bytes = &self.as_str()[start..end];
         if start == 0 && end == self.len() {
-            return self.clone();
+            return *self;
         }
         let (owner, offset) = self
             .view()
@@ -281,7 +281,7 @@ impl LStr {
         {
             return LStr::from(bytes);
         }
-        LStr::new_view(owner.clone(), offset, bytes.len())
+        LStr::new_view(*owner, offset, bytes.len())
     }
 
     /// A view of `len` bytes of flat `owner` from `offset`.
@@ -378,8 +378,8 @@ impl LStr {
     fn append_with_hint(&mut self, x: &str, ascii: bool) -> bool {
         // Frontier append: only the string ending where its buffer's writes end may extend it.
         let (buffer, offset) = match self.view() {
-            Some(view) => (view.owner.clone(), view.offset),
-            None => (self.clone(), 0),
+            Some(view) => (view.owner, view.offset),
+            None => (*self, 0),
         };
         let len = self.len();
         let h = buffer.hdr();
@@ -438,7 +438,7 @@ impl LStr {
             return;
         }
         if self.is_empty() {
-            *self = right.clone();
+            *self = *right;
             return;
         }
         if !self.ascii_hint()
@@ -653,12 +653,12 @@ mod tests {
         assert_eq!(s.as_str(), "abc");
         // A frontier append returns a view, which carries no hint.
         assert!(s.ascii_hint() || s.view_owner().is_some());
-        let alias = s.clone();
+        let alias = s;
         s = s.concat_owned(&LStr::from("d"));
         assert!(!LStr::ptr_eq(&s, &alias));
         assert_eq!(alias.as_str(), "abc");
         assert_eq!(s.as_str(), "abcd");
-        let right = s.clone();
+        let right = s;
         s = s.concat_owned(&right);
         assert_eq!(right.as_str(), "abcd");
         assert_eq!(s.as_str(), "abcdabcd");
@@ -677,7 +677,7 @@ mod tests {
         for i in 0..10_000 {
             s = s.concat_owned(&chunk);
             if i == 999 {
-                alias_at_1k = Some(s.clone());
+                alias_at_1k = Some(s);
             }
         }
         assert_eq!(s.len(), 80_000);
@@ -695,7 +695,7 @@ mod tests {
         assert_eq!(alias.len(), 8_000, "alias must not observe later appends");
         // Doubling self-append through an alias stays correct.
         let a = LStr::from("xy");
-        let b = a.clone();
+        let b = a;
         let a = a.concat_owned(&b);
         assert_eq!(a.as_str(), "xyxy");
         assert_eq!(b.as_str(), "xy");
@@ -739,12 +739,12 @@ mod tests {
         value.append_or_replace(&LStr::from("b"));
         assert_eq!(value.buffer_ptr(), pointer);
         assert_eq!(value.as_str(), "ab");
-        let snapshot = value.clone();
+        let snapshot = value;
         value.append_or_replace(&LStr::from("c"));
         assert_eq!(snapshot.as_str(), "ab");
         assert_eq!(value.as_str(), "abc");
         assert!(!LStr::ptr_eq(&value, &snapshot));
-        let rhs = value.clone();
+        let rhs = value;
         value.append_or_replace(&rhs);
         assert_eq!(rhs.as_str(), "abc");
         assert_eq!(value.as_str(), "abcabc");
@@ -765,7 +765,7 @@ mod tests {
         assert_eq!(nested.as_str(), &source[100..800]);
         assert!(!source.append_in_place("changed"));
         assert!(!prefix.append_in_place("changed"));
-        let alias = prefix.clone();
+        let alias = prefix;
         let appended = prefix.concat_owned(&LStr::from("!"));
         assert_eq!(appended.as_str(), format!("{}!", "x".repeat(900)));
         assert_eq!(alias.len(), 900);

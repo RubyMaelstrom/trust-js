@@ -5,7 +5,7 @@
 use crate::bytecode::Chunk;
 use crate::interpreter::{new_binding_layout_id, new_scope, Binding, Env};
 use crate::jit::JitCode;
-use crate::value::{PackedValue, Value};
+use crate::value::Value;
 use crate::Engine;
 use std::rc::Rc;
 
@@ -277,25 +277,17 @@ fn every_execution_kind_commits_native_name_loads_and_stores_for_each_owner() {
                     after[1] > before[1],
                     "native store: padding={padding}, mode={mode:?}, {expression}"
                 );
-                assert_eq!(
-                    PackedValue::pack(result).bits(),
-                    PackedValue::pack(input).bits(),
-                    "{expression}"
-                );
+                assert_eq!((result).bits(), (input).bits(), "{expression}");
                 case.assert_mode(&chunk);
                 let stored = if let Some(target) = case.target {
                     let scope = target.borrow();
                     let binding = scope.vars.get("outer").unwrap();
                     assert!(binding.initialized && binding.mutable && !binding.imported);
-                    binding.word()
+                    binding.value()
                 } else {
-                    PackedValue::pack(engine.interp.get_var("outer", &globals).ok().unwrap())
+                    engine.interp.get_var("outer", &globals).ok().unwrap()
                 };
-                assert_eq!(
-                    stored.bits(),
-                    PackedValue::pack(input).bits(),
-                    "stored {expression}"
-                );
+                assert_eq!(stored.bits(), (input).bits(), "stored {expression}");
             }
         }
     }
@@ -656,13 +648,10 @@ fn native_binding_updates_commit_all_six_forms_and_numeric_edges() {
             } else {
                 next
             };
+            assert_eq!((result).bits(), (Value::Num(expected)).bits());
             assert_eq!(
-                PackedValue::pack(result).bits(),
-                PackedValue::pack(Value::Num(expected)).bits()
-            );
-            assert_eq!(
-                target.borrow().vars.get("outer").unwrap().word().bits(),
-                PackedValue::pack(Value::Num(next)).bits()
+                target.borrow().vars.get("outer").unwrap().value().bits(),
+                (Value::Num(next)).bits()
             );
         }
     }

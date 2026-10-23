@@ -433,7 +433,7 @@ impl Interp {
             }
             return Ok(v);
         }
-        let scope = new_scope(Some(parent.clone()));
+        let scope = new_scope(Some(*parent));
         self.declare_block_lexicals(stmts, &scope, true);
         // A block is a disposal boundary only when it actually declares a `using` resource.
         let has_using = stmts.iter().any(stmt_declares_using);
@@ -450,10 +450,10 @@ impl Interp {
                     if !matches!((sv).view(), ValueView::Empty) {
                         v = sv;
                     }
-                    result = Ok(v.clone());
+                    result = Ok(v);
                 }
                 Err(e) => {
-                    result = Err(crate::interpreter::update_abrupt_empty(e, v.clone()));
+                    result = Err(crate::interpreter::update_abrupt_empty(e, v));
                     break;
                 }
             }
@@ -501,7 +501,7 @@ impl Interp {
         }
         let (method, method_is_async) = self.dispose_method(value, is_async)?;
         Ok(Some(Disposable {
-            value: value.clone(),
+            value: *value,
             method,
             kind_is_async: is_async,
             method_is_async,
@@ -561,7 +561,7 @@ impl Interp {
                 continue;
             }
 
-            let called = self.call(r.method.clone(), r.value.clone(), &[]);
+            let called = self.call(r.method, r.value, &[]);
             let disposed = if r.kind_is_async && r.method_is_async {
                 // A directly selected @@asyncDispose method is awaited only when Call completed
                 // normally. A synchronous throw becomes the disposal result immediately.
@@ -634,7 +634,7 @@ impl Interp {
                 self.using_stack.push(Vec::new());
                 let step = (|me: &mut Self| -> Completion {
                     me.add_disposable(&v, is_async)?;
-                    me.bind_pattern(left, v.clone(), iter_env, mode)?;
+                    me.bind_pattern(left, v, iter_env, mode)?;
                     me.exec_stmt(body, iter_env)
                 })(self);
                 let frame = self.using_stack.pop().unwrap_or_default();
@@ -711,7 +711,7 @@ impl Interp {
                 }
                 Stmt::FuncDecl(func) if with_functions => {
                     if let Some(name) = &func.name {
-                        let f = self.make_function(func.clone(), scope.clone());
+                        let f = self.make_function(func.clone(), *scope);
                         scope
                             .borrow_mut()
                             .vars
@@ -1005,7 +1005,7 @@ impl Interp {
                 // it supplies both HasBinding and WithBaseObject (the receiver of an identifier
                 // call such as `charAt(0)`).
                 let o = crate::builtins::box_primitive_pub(self, value);
-                let with_env = crate::interpreter::new_with_scope(env.clone(), o);
+                let with_env = crate::interpreter::new_with_scope(*env, o);
                 match self.exec_stmt(body, &with_env) {
                     Ok(v) => Ok(crate::interpreter::update_empty(v)),
                     Err(e) => Err(crate::interpreter::update_abrupt_empty(e, Value::Undefined)),
@@ -1039,7 +1039,7 @@ impl Interp {
                 // `export default function(){}` / `class{}` with no name: the value is bound to the
                 // synthetic `*default*` local (which the "default" export resolves to).
                 Stmt::FuncDecl(f) if f.name.is_none() => {
-                    let v = self.make_function(f.clone(), env.clone());
+                    let v = self.make_function(f.clone(), *env);
                     self.set_fn_name(&v, "default");
                     self.init_lexical("*default*", v, false, env);
                     Ok(Value::Empty)
@@ -1232,7 +1232,7 @@ impl Interp {
         env: &Env,
         labels: &[&str],
     ) -> Completion {
-        let loop_env = new_scope(Some(env.clone()));
+        let loop_env = new_scope(Some(*env));
         // A `for (using x = r; …)` head is a disposal boundary: its resources are disposed once,
         // when the whole loop completes (normally or abruptly).
         let dispose_async = match init.as_deref() {
@@ -1352,7 +1352,7 @@ impl Interp {
             _ => Vec::new(),
         };
         let copy_env = |from: &Env| -> Env {
-            let parent = from.borrow().parent.clone();
+            let parent = from.borrow().parent;
             let e = new_scope(parent);
             for n in &per_iter {
                 let b = from.borrow().vars.get(n.as_str()).cloned();
@@ -1363,7 +1363,7 @@ impl Interp {
             e
         };
         let mut cur_env = if per_iter.is_empty() {
-            loop_env.clone()
+            *loop_env
         } else {
             copy_env(loop_env)
         };
@@ -1425,7 +1425,7 @@ impl Interp {
             decl,
             Some(DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing)
         ) {
-            let tdz = new_scope(Some(env.clone()));
+            let tdz = new_scope(Some(*env));
             let mut names = Vec::new();
             pattern_idents(left, &mut names);
             for n in names {
@@ -1467,7 +1467,7 @@ impl Interp {
                 return Err(self.throw("TypeError", "@@asyncIterator is not callable"));
             }
             let (iter, from_sync) = if method.is_callable() {
-                let it = self.call(method, rhs.clone(), &[])?;
+                let it = self.call(method, rhs, &[])?;
                 if !matches!((it).view(), ValueView::Obj(_)) {
                     return Err(self.throw("TypeError", "@@asyncIterator did not return an object"));
                 }
@@ -1476,13 +1476,13 @@ impl Interp {
                 (self.get_iterator(&rhs)?.0, true)
             };
             let next = self.get_member_key(&iter, "next")?;
-            let iter_close = iter.clone();
+            let iter_close = iter;
             // A failure in the iteration step itself marks the iterator done — only abrupt
             // completions from the loop body (or an early break/return) close it afterwards.
             let (mut exhausted, mut step_failed) = (false, false);
             let result = self.run_loop(labels, env, |me, env, _completion| {
                 step_failed = true;
-                let res = me.call(next.clone(), iter.clone(), &[])?;
+                let res = me.call(next, iter, &[])?;
                 // Await the step result by parking the coroutine (real microtask ticks).
                 let res = if from_sync { res } else { me.coro_await(res)? };
                 if !matches!((res).view(), ValueView::Obj(_)) {
@@ -1527,7 +1527,7 @@ impl Interp {
                     return Ok(LoopStep::Done(Value::Empty));
                 }
                 step_failed = false;
-                let iter_env = new_scope(Some(env.clone()));
+                let iter_env = new_scope(Some(*env));
                 let bv = me.for_of_iteration(left, v, mode, body, &iter_env, dispose)?;
                 Ok(LoopStep::Continue(bv))
             });
@@ -1545,7 +1545,7 @@ impl Interp {
             use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
             // Step the iterator lazily; close it if the loop exits early (break/return/throw).
             let (iter, next) = self.get_iterator(&rhs)?;
-            let iter_close = iter.clone();
+            let iter_close = iter;
             let mut exhausted = false;
             // A failure in the iteration step itself (next throwing, a non-object result, or a
             // `value` getter throwing) marks the iterator done: it is NOT closed.
@@ -1576,7 +1576,7 @@ impl Interp {
                     }
                 };
                 step_failed = false;
-                let iter_env = new_scope(Some(env.clone()));
+                let iter_env = new_scope(Some(*env));
                 let bv = me.for_of_iteration(left, v, mode, body, &iter_env, dispose)?;
                 Ok(LoopStep::Continue(bv))
             });
@@ -1628,7 +1628,7 @@ impl Interp {
                     _ => v,
                 };
             };
-            let iter_env = new_scope(Some(env.clone()));
+            let iter_env = new_scope(Some(*env));
             me.bind_pattern(left, v, &iter_env, mode)?;
             let bv = me.exec_stmt(body, &iter_env)?;
             Ok(LoopStep::Continue(bv))
@@ -1684,7 +1684,7 @@ impl Interp {
         let mut received = Resume::Next(Value::Undefined);
         loop {
             let (result, returning) = match received {
-                Resume::Next(v) => (self.call(next.clone(), iterator.clone(), &[v])?, false),
+                Resume::Next(v) => (self.call(next, iterator, &[v])?, false),
                 Resume::Throw(e) => {
                     // GetMethod(iterator, "throw"): a non-callable non-nullish value throws; an
                     // absent method is a protocol violation — close the inner iterator (close
@@ -1699,7 +1699,7 @@ impl Interp {
                     if !throw.is_callable() {
                         return Err(self.throw("TypeError", "iterator 'throw' is not callable"));
                     }
-                    (self.call(throw, iterator.clone(), &[e])?, false)
+                    (self.call(throw, iterator, &[e])?, false)
                 }
                 Resume::Return(v) => {
                     let ret = self.get_member_key(&iterator, "return")?;
@@ -1709,7 +1709,7 @@ impl Interp {
                     if !ret.is_callable() {
                         return Err(self.throw("TypeError", "iterator 'return' is not callable"));
                     }
-                    (self.call(ret, iterator.clone(), &[v])?, true)
+                    (self.call(ret, iterator, &[v])?, true)
                 }
                 Resume::Terminate => {
                     return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled));
@@ -1744,7 +1744,7 @@ impl Interp {
         if !ret.is_callable() {
             return Err(self.throw("TypeError", "iterator 'return' is not callable"));
         }
-        let r = self.call(ret, iter.clone(), &[])?;
+        let r = self.call(ret, *iter, &[])?;
         let r = if from_sync { r } else { self.await_value(r)? };
         if !matches!((r).view(), ValueView::Obj(_)) {
             return Err(self.throw("TypeError", "iterator result is not an object"));
@@ -1809,7 +1809,7 @@ impl Interp {
             return Err(self.throw("TypeError", "@@asyncIterator is not callable"));
         }
         let (iterator, next, from_sync) = if amethod.is_callable() {
-            let it = self.call(amethod, value.clone(), &[])?;
+            let it = self.call(amethod, *value, &[])?;
             if !matches!((it).view(), ValueView::Obj(_)) {
                 return Err(self.throw("TypeError", "@@asyncIterator did not return an object"));
             }
@@ -1850,7 +1850,7 @@ impl Interp {
         loop {
             match received {
                 Resume::Next(v) => {
-                    let result = self.call(next.clone(), iterator.clone(), &[v])?;
+                    let result = self.call(next, iterator, &[v])?;
                     let (done, inner) = settle!(result);
                     if done {
                         return Ok(inner);
@@ -1863,7 +1863,7 @@ impl Interp {
                         // No `throw` method: close the iterator (awaiting the close) then TypeError.
                         let ret = self.get_member_key(&iterator, "return")?;
                         if ret.is_callable() {
-                            if let Ok(r) = self.call(ret, iterator.clone(), &[]) {
+                            if let Ok(r) = self.call(ret, iterator, &[]) {
                                 let _ = self.coro_await(r);
                             }
                         }
@@ -1871,7 +1871,7 @@ impl Interp {
                             self.throw("TypeError", "the delegated iterator has no 'throw' method")
                         );
                     }
-                    let result = self.call(throw, iterator.clone(), &[e])?;
+                    let result = self.call(throw, iterator, &[e])?;
                     let (done, inner) = settle!(result);
                     if done {
                         return Ok(inner);
@@ -1883,7 +1883,7 @@ impl Interp {
                     if !ret.is_callable() {
                         return Err(Abrupt::Return(self.coro_await(v)?));
                     }
-                    let result = self.call(ret, iterator.clone(), &[v])?;
+                    let result = self.call(ret, iterator, &[v])?;
                     let (done, inner) = settle!(result);
                     if done {
                         return Err(Abrupt::Return(inner));
@@ -1902,10 +1902,7 @@ impl Interp {
         // Under the intrinsic Array protocol, reading @@iterator, calling
         // %Array.prototype.values% and reading `next` execute no ECMAScript code.
         if let Some(next) = crate::builtins::intrinsic_array_iteration_next(self, v) {
-            return Ok((
-                crate::builtins::array_values_iterator(self, v.clone(), 0),
-                next,
-            ));
+            return Ok((crate::builtins::array_values_iterator(self, *v, 0), next));
         }
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<(Value, Value), Abrupt> = (|| {
@@ -1917,7 +1914,7 @@ impl Interp {
             if !itfn.is_callable() {
                 return Err(self.throw("TypeError", "value is not iterable"));
             }
-            let iter = self.call(itfn, v.clone(), &[])?;
+            let iter = self.call(itfn, *v, &[])?;
             // GetIteratorFromMethod: the iterator must be an object.
             if !matches!((iter).view(), ValueView::Obj(_)) {
                 return Err(self.throw("TypeError", "@@iterator returned a non-object"));
@@ -1941,7 +1938,7 @@ impl Interp {
             if let Some(result) = self.try_intrinsic_iterator_step(iter, next) {
                 return result;
             }
-            let res = self.call(next.clone(), iter.clone(), &[])?;
+            let res = self.call(*next, *iter, &[])?;
             self.iterator_result_value(res)
         })();
         crate::jit::perf_iterator_step_end(perf_started, result.is_ok());
@@ -1969,7 +1966,7 @@ impl Interp {
         let perf_started = crate::jit::perf_stage_start();
         if let Ok(ret) = self.get_member_key(iter, "return") {
             if ret.is_callable() {
-                let _ = self.call(ret, iter.clone(), &[]);
+                let _ = self.call(ret, *iter, &[]);
             }
         }
         crate::jit::perf_iterator_close_end(perf_started);
@@ -1988,7 +1985,7 @@ impl Interp {
                 if !ret.is_callable() {
                     return Err(self.throw("TypeError", "iterator 'return' is not callable"));
                 }
-                let r = self.call(ret, iter.clone(), &[])?;
+                let r = self.call(ret, *iter, &[])?;
                 if !matches!((r).view(), ValueView::Obj(_)) {
                     return Err(self.throw("TypeError", "iterator 'return' must return an object"));
                 }
@@ -2078,7 +2075,7 @@ impl Interp {
     ) -> Result<crate::rooting::RootedVec, Abrupt> {
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<crate::rooting::RootedVec, Abrupt> = (|| {
-            let iter = self.call(itfn, v.clone(), &[])?;
+            let iter = self.call(itfn, *v, &[])?;
             // GetIteratorFromMethod rejects a primitive result before creating an Iterator Record;
             // there is therefore nothing to close in this case.
             if !matches!((iter).view(), ValueView::Obj(_)) {
@@ -2214,11 +2211,11 @@ impl Interp {
             return Ok(out);
         }
         let mut cur = match &(v).view() {
-            ValueView::Obj(o) => Some(o.clone()),
+            ValueView::Obj(o) => Some(*o),
             _ => None,
         };
         while let Some(o) = cur {
-            let ov = Value::Obj(o.clone());
+            let ov = Value::Obj(o);
             // A proxy level enumerates via its [[OwnPropertyKeys]] filtered by [[GetOwnProperty]]'s
             // enumerable flag, then walks its [[GetPrototypeOf]].
             if self.proxies.contains_key(&(Gc::as_ptr(&o) as usize)) {
@@ -2258,7 +2255,7 @@ impl Interp {
                         }
                     }
                 }
-                cur = match (crate::builtins::js_get_prototype_of(self, &Value::Obj(o.clone()))
+                cur = match (crate::builtins::js_get_prototype_of(self, &Value::Obj(o))
                     .map_err(Abrupt::Throw)?)
                 .view()
                 {
@@ -2298,7 +2295,7 @@ impl Interp {
                     }
                 }
             }
-            cur = o.borrow().proto.clone();
+            cur = o.borrow().proto;
         }
         Ok(out)
     }
@@ -2326,11 +2323,11 @@ impl Interp {
                     // var-hoisting walk skips it); the body's lexicals + statements run in a child
                     // block environment.
                     let body_env = if let Some(pat) = param {
-                        let catch_env = new_catch_scope(env.clone());
+                        let catch_env = new_catch_scope(*env);
                         self.bind_pattern(pat, ex, &catch_env, BindMode::Lexical(false))?;
                         new_scope(Some(catch_env))
                     } else {
-                        new_scope(Some(env.clone()))
+                        new_scope(Some(*env))
                     };
                     let mut v = Value::Empty;
                     let mut last = Ok(Value::Empty);
@@ -2343,10 +2340,10 @@ impl Interp {
                                 if !matches!((sv).view(), ValueView::Empty) {
                                     v = sv;
                                 }
-                                last = Ok(v.clone());
+                                last = Ok(v);
                             }
                             Err(e) => {
-                                last = Err(crate::interpreter::update_abrupt_empty(e, v.clone()));
+                                last = Err(crate::interpreter::update_abrupt_empty(e, v));
                                 break;
                             }
                         }
@@ -2396,7 +2393,7 @@ impl Interp {
 
     fn exec_switch(&mut self, disc: &Expr, cases: &[SwitchCase], env: &Env) -> Completion {
         let d = self.eval(disc, env)?;
-        let scope = new_scope(Some(env.clone()));
+        let scope = new_scope(Some(*env));
         for case in cases {
             for s in &case.body {
                 self.declare_block_lexicals(std::slice::from_ref(s), &scope, true);
@@ -2516,7 +2513,7 @@ impl Interp {
                 }
                 // A live module import reads through to the exporter's binding.
                 if let Some((src_env, local)) = binding.import_ref.as_deref() {
-                    let (src_env, local) = (src_env.clone(), local.clone());
+                    let (src_env, local) = (*src_env, local.clone());
                     drop(b);
                     return Ok((self.get_var(&local, &src_env)?, None));
                 }
@@ -2525,7 +2522,6 @@ impl Interp {
             // `with (obj)`: resolve against the object's properties if it has the name (the proxy
             // `has` trap and @@unscopables participate here). Rare — fall to the owned path.
             if let Some(obj) = b.with_object().filter(|value| value.as_obj().is_some()) {
-                let obj = obj.clone();
                 drop(b);
                 if self.with_has_binding(&obj, name)? {
                     // GetBindingValue re-checks HasProperty (the property may have vanished while
@@ -2569,7 +2565,7 @@ impl Interp {
         }
         // Fall back to a property of the global object (where builtins live). The lookup is the
         // full trap-aware [[HasProperty]]: the global's prototype may be (or contain) a proxy.
-        let g = Value::Obj(self.global.clone());
+        let g = Value::Obj(self.global);
         if self.js_has_property(&g, name)? {
             return Ok((self.get_member_key(&g, name)?, None));
         }
@@ -2587,14 +2583,14 @@ impl Interp {
     /// at the top level is *not* function code for `new.target` purposes. Governs `new.target`
     /// validity in a direct eval.
     fn in_function_code(&self, env: &Env) -> bool {
-        let mut cur = Some(env.clone());
+        let mut cur = Some(*env);
         while let Some(s) = cur {
             if Env::ptr_eq(&s, &self.global_env) {
                 return false;
             }
             let (has_this, parent) = {
                 let b = s.borrow();
-                (b.vars.contains_key("this"), b.parent.clone())
+                (b.vars.contains_key("this"), b.parent)
             };
             if has_this {
                 return true;
@@ -2605,13 +2601,13 @@ impl Interp {
     }
 
     fn peek_binding(&self, name: &str, env: &Env) -> Option<Value> {
-        let mut cur = Some(env.clone());
+        let mut cur = Some(*env);
         while let Some(s) = cur {
             let b = s.borrow();
             if let Some(binding) = b.vars.get(name) {
                 return Some(binding.value());
             }
-            cur = b.parent.clone();
+            cur = b.parent;
         }
         None
     }
@@ -2621,21 +2617,21 @@ impl Interp {
     /// spec's PrivateEnvironment). An unresolved name keeps its literal spelling.
     /// [`Self::resolve_private`] without copying the bound key string.
     fn resolve_private_key(&self, name: &str, env: &Env) -> crate::lstr::LStr {
-        let mut cur = Some(env.clone());
+        let mut cur = Some(*env);
         while let Some(s) = cur {
             let b = s.borrow();
             if let Some(binding) = b.vars.get(name) {
                 if let ValueView::Str(k) = &(binding.value()).view() {
-                    return k.clone();
+                    return *k;
                 }
             }
-            cur = b.parent.clone();
+            cur = b.parent;
         }
         crate::lstr::LStr::from(name)
     }
 
     fn resolve_private(&self, name: &str, env: &Env) -> String {
-        let mut cur = Some(env.clone());
+        let mut cur = Some(*env);
         while let Some(s) = cur {
             let b = s.borrow();
             if let Some(binding) = b.vars.get(name) {
@@ -2643,7 +2639,7 @@ impl Interp {
                     return k.to_string();
                 }
             }
-            cur = b.parent.clone();
+            cur = b.parent;
         }
         name.to_string()
     }
@@ -2695,7 +2691,7 @@ impl Interp {
             }
             return Ok(ty);
         }
-        let object = with.as_obj().unwrap().clone();
+        let object = with.as_obj().unwrap();
         let keys =
             crate::builtins::ordinary_own_keys_ordered(self, &object).map_err(Abrupt::Throw)?;
         for k in keys {
@@ -2745,12 +2741,12 @@ impl Interp {
             // B.3.4: the bare if-position declaration acts as `{ function f(){} }` — the function
             // closes over an implicit block scope binding its own name, so `f = ...` inside the
             // body rebinds the block binding, not the promoted var.
-            let block = crate::interpreter::new_scope(Some(env.clone()));
-            let f = self.make_function(func.clone(), block.clone());
-            bind(&block, name, f.clone());
+            let block = crate::interpreter::new_scope(Some(*env));
+            let f = self.make_function(func.clone(), block);
+            bind(&block, name, f);
             f
         });
-        let mut cur = Some(env.clone());
+        let mut cur = Some(*env);
         while let Some(s) = cur {
             if s.borrow().var_boundary {
                 if let Some(b) = s.borrow_mut().vars.get_mut(name) {
@@ -2769,7 +2765,7 @@ impl Interp {
                 }
                 break;
             }
-            let parent = s.borrow().parent.clone();
+            let parent = s.borrow().parent;
             cur = parent;
         }
         // Global code: the var binding lives as a global-object property (re-created when a
@@ -2794,7 +2790,7 @@ impl Interp {
         };
         match prop {
             Some(p) if p.accessor() => match p.getter() {
-                Some(g) => self.call(g.clone(), base.clone(), &[]),
+                Some(g) => self.call(*g, *base, &[]),
                 None => {
                     let shown = private_display(name);
                     Err(self.throw(
@@ -2825,7 +2821,7 @@ impl Interp {
     ) -> Result<(), Abrupt> {
         let shown = private_display(name).to_string();
         let (o, prop) = match &(base).view() {
-            ValueView::Obj(o) => (o.clone(), o.borrow().internal_slots().get(name).cloned()),
+            ValueView::Obj(o) => (*o, o.borrow().internal_slots().get(name).cloned()),
             _ => {
                 return Err(self.throw(
                     "TypeError",
@@ -2841,7 +2837,7 @@ impl Interp {
                         format!("private accessor {shown} has no setter"),
                     ));
                 };
-                self.call(setter, base.clone(), &[value])?;
+                self.call(setter, *base, &[value])?;
                 Ok(())
             }
             Some(p) => {
@@ -2870,7 +2866,7 @@ impl Interp {
         if let Some(ValueView::Obj(home)) =
             (self.peek_binding("%homeobject%", env)).map(|__value| (__value).view())
         {
-            return Ok(match home.borrow().proto.clone() {
+            return Ok(match home.borrow().proto {
                 Some(p) => Value::Obj(p),
                 None => Value::Null,
             });
@@ -2884,7 +2880,7 @@ impl Interp {
     }
 
     pub(crate) fn assign_var(&mut self, name: &str, value: Value, env: &Env) -> Result<(), Abrupt> {
-        let mut cur = Some(env.clone());
+        let mut cur = Some(*env);
         while let Some(s) = cur {
             let (with_obj, parent) = {
                 let mut b = s.borrow_mut();
@@ -2912,7 +2908,7 @@ impl Interp {
                     binding.initialized = true;
                     return Ok(());
                 }
-                (b.with_object(), b.parent.clone())
+                (b.with_object(), b.parent)
             };
             if let Some(obj) = with_obj.as_ref().filter(|value| value.as_obj().is_some()) {
                 if self.with_has_binding(obj, name)? {
@@ -2928,14 +2924,14 @@ impl Interp {
         }
         // A declared global `var`/`function` lives as a property of the global object (the check
         // is the trap-aware [[HasProperty]] — the global's proto chain may contain a proxy).
-        if self.js_has_property(&Value::Obj(self.global.clone()), name)? {
-            return self.set_member_key(&Value::Obj(self.global.clone()), name, value);
+        if self.js_has_property(&Value::Obj(self.global), name)? {
+            return self.set_member_key(&Value::Obj(self.global), name, value);
         }
         // Truly undeclared: strict → ReferenceError; sloppy → create a global property.
         if self.strict {
             return Err(self.throw("ReferenceError", format!("{name} is not defined")));
         }
-        let g = Value::Obj(self.global.clone());
+        let g = Value::Obj(self.global);
         self.set_member_key(&g, name, value)
     }
 
@@ -3007,7 +3003,7 @@ impl Interp {
     /// the chain is in an interpreter side table (`ic_plain` clear: proxies, typed arrays,
     /// namespaces, Web IDL indexed objects) or is any other exotic object.
     pub(crate) fn ordinary_chain_has_property(start: &Gc, key: &str) -> Option<bool> {
-        let mut current = start.clone();
+        let mut current = *start;
         loop {
             let next = {
                 let object = current.borrow();
@@ -3022,7 +3018,7 @@ impl Interp {
                 if object.props.contains(key) {
                     return Some(true);
                 }
-                object.proto.clone()
+                object.proto
             };
             match next {
                 Some(prototype) => current = prototype,
@@ -3037,7 +3033,7 @@ impl Interp {
     /// accessor or when an object on the chain has other internal methods (see
     /// [`Interp::ordinary_chain_has_property`]); the caller then takes the general [[Get]].
     pub(crate) fn ordinary_chain_get_data(start: &Gc, key: &str) -> Option<Value> {
-        let mut current = start.clone();
+        let mut current = *start;
         loop {
             let next = {
                 let object = current.borrow();
@@ -3052,7 +3048,7 @@ impl Interp {
                 if let Some(property) = object.props.get(key) {
                     return (!property.accessor()).then(|| property.value());
                 }
-                object.proto.clone()
+                object.proto
             };
             match next {
                 Some(prototype) => current = prototype,
@@ -3097,7 +3093,7 @@ impl Interp {
     /// ordinary own-property + prototype walk.
     pub(crate) fn js_has_property(&mut self, obj: &Value, key: &str) -> Result<bool, Abrupt> {
         let o = match &(obj).view() {
-            ValueView::Obj(o) => o.clone(),
+            ValueView::Obj(o) => *o,
             _ => return Ok(false),
         };
         // A deferred namespace evaluates on [[HasProperty]] with a string key.
@@ -3120,7 +3116,7 @@ impl Interp {
                 crate::interpreter::PROXY_TRAP_HAS,
                 &trap,
                 handler,
-                [target.clone(), key_val],
+                [target, key_val],
             )?;
             let present = self.to_boolean(&res);
             if !present {
@@ -3175,7 +3171,7 @@ impl Interp {
         if o.borrow().props.contains(key) {
             return Ok(true);
         }
-        let proto = o.borrow().proto.clone();
+        let proto = o.borrow().proto;
         match proto {
             Some(p) => self.js_has_property(&Value::Obj(p), key),
             None => Ok(false),
@@ -3188,7 +3184,7 @@ impl Interp {
     /// Records (including `with`) never supply the keyword's this binding; ordinary name
     /// resolution must not consult their author-controlled property named "this".
     pub(crate) fn resolve_this_binding(&mut self, env: &Env) -> Result<Value, Abrupt> {
-        let mut current = Some(env.clone());
+        let mut current = Some(*env);
         while let Some(scope) = current {
             let parent = {
                 let record = scope.borrow();
@@ -3201,7 +3197,7 @@ impl Interp {
                     // error path. A nearer with object cannot hide an uninitialized binding.
                     return self.get_var("this", &scope);
                 }
-                record.parent.clone()
+                record.parent
             };
             current = parent;
         }
@@ -3235,7 +3231,7 @@ impl Interp {
             Expr::Regex { body, flags } => self.make_regexp(body, flags),
             Expr::Array(elems) => self.eval_array(elems, env),
             Expr::Object(props) => self.eval_object(props, env),
-            Expr::Func(func) => Ok(self.make_function(func.clone(), env.clone())),
+            Expr::Func(func) => Ok(self.make_function(func.clone(), *env)),
             Expr::Class(class) => self.eval_class(class, env),
             Expr::Yield { delegate, arg } => {
                 let value = match arg {
@@ -3717,7 +3713,7 @@ impl Interp {
     /// referrer after suspension.
     pub(crate) fn import_meta_vm(&self, env: &Env) -> Value {
         self.peek_binding("%importmeta%", env)
-            .or_else(|| self.import_meta.clone())
+            .or(self.import_meta)
             .unwrap_or(Value::Undefined)
     }
 
@@ -3978,15 +3974,13 @@ impl Interp {
         let mut home_env: Option<Env> = None;
         let mut method_env = |func: &Rc<Function>| -> Env {
             if !func.observes_home_object() {
-                return env.clone();
+                return *env;
             }
-            home_env
-                .get_or_insert_with(|| {
-                    let home = new_scope(Some(env.clone()));
-                    bind(&home, "%homeobject%", Value::Obj(obj.clone()));
-                    home
-                })
-                .clone()
+            *home_env.get_or_insert_with(|| {
+                let home = new_scope(Some(*env));
+                bind(&home, "%homeobject%", Value::Obj(obj));
+                home
+            })
         };
         for prop in props {
             match prop {
@@ -4056,7 +4050,7 @@ impl Interp {
         set: Option<Value>,
     ) {
         let mut b = obj.borrow_mut();
-        if b.props.merge_accessor(key, get.clone(), set.clone()) {
+        if b.props.merge_accessor(key, get, set) {
             return;
         }
         b.props
@@ -4155,7 +4149,7 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         let site = (Gc::as_ptr(&self.global) as usize, site_id);
         let strings = match self.template_cache.get(&site) {
-            Some(v) => v.clone(),
+            Some(v) => *v,
             None => {
                 let cooked: Vec<Value> = quasis
                     .iter()
@@ -4180,7 +4174,7 @@ impl Interp {
                 if let ValueView::Obj(o) = &(strings).view() {
                     self.gc_pin(o);
                 }
-                self.template_cache.insert(site, strings.clone());
+                self.template_cache.insert(site, strings);
                 strings
             }
         };
@@ -4323,7 +4317,7 @@ impl Interp {
         // with a `this` binding is the only one whose derived-constructor marker can authorize
         // SuperCall. A blind lexical lookup would incorrectly reach an outer constructor from a
         // nested ordinary function's direct eval.
-        let mut cursor = Some(env.clone());
+        let mut cursor = Some(*env);
         while let Some(scope) = cursor {
             let binding = scope.borrow();
             if binding.vars.contains_key("this") {
@@ -4332,7 +4326,7 @@ impl Interp {
                     Some(marker) if marker.initialized && matches!(&(marker.value()).view(), ValueView::Bool(true))
                 );
             }
-            cursor = binding.parent.clone();
+            cursor = binding.parent;
         }
         false
     }
@@ -4375,14 +4369,14 @@ impl Interp {
 
         // GetThisEnvironment and BindThisValue occur after Construct. A second super() therefore
         // still constructs its parent before the already-initialized binding raises ReferenceError.
-        let mut cursor = Some(env.clone());
+        let mut cursor = Some(*env);
         let mut this_env = None;
         while let Some(scope) = cursor {
             if scope.borrow().vars.contains_key("this") {
                 this_env = Some(scope);
                 break;
             }
-            cursor = scope.borrow().parent.clone();
+            cursor = scope.borrow().parent;
         }
         let Some(this_env) = this_env else {
             return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
@@ -4534,7 +4528,7 @@ impl Interp {
                     let proto = self.super_base(env)?;
                     let value = self.get_reference(&mut Reference::Super {
                         proto,
-                        receiver: receiver.clone(),
+                        receiver,
                         key: RefKey::Static(prop.clone()),
                     })?;
                     return Ok((value, receiver));
@@ -4567,7 +4561,7 @@ impl Interp {
                     let proto = self.super_base(env)?;
                     let value = self.get_reference(&mut Reference::Super {
                         proto,
-                        receiver: receiver.clone(),
+                        receiver,
                         key: RefKey::Raw(index),
                     })?;
                     return Ok((value, receiver));
@@ -4614,7 +4608,7 @@ impl Interp {
                 if then.is_callable() {
                     let p = self.new_promise();
                     let (res, rej) = self.make_resolver_pair(&p);
-                    if let Err(Abrupt::Throw(e)) = self.call(then, v.clone(), &[res, rej]) {
+                    if let Err(Abrupt::Throw(e)) = self.call(then, v, &[res, rej]) {
                         self.reject_promise(&p, e);
                     }
                     return self.await_value(p);
@@ -4628,8 +4622,8 @@ impl Interp {
         self.get_member_key(&v, "constructor")?;
         self.drain_microtasks();
         match self.promises.get(&ptr) {
-            Some(s) if s.status == 1 => Ok(s.value.clone()),
-            Some(s) if s.status == 2 => Err(Abrupt::Throw(s.value.clone())),
+            Some(s) if s.status == 1 => Ok(s.value),
+            Some(s) if s.status == 2 => Err(Abrupt::Throw(s.value)),
             _ => Ok(Value::Undefined),
         }
     }
@@ -4661,9 +4655,8 @@ impl Interp {
                 promise_reject_native
             },
         );
-        let bound = Object::new(Some(self.function_proto.clone()));
-        bound.borrow_mut().call =
-            Callable::bound(target, promise.clone(), vec![Value::Obj(flag.clone())]);
+        let bound = Object::new(Some(self.function_proto));
+        bound.borrow_mut().call = Callable::bound(target, *promise, vec![Value::Obj(*flag)]);
         // A promise resolving function has `length` 1 and an empty `name`.
         bound.borrow_mut().props.insert(
             "length",
@@ -4688,7 +4681,7 @@ impl Interp {
     /// The resolver pair of an embedder's platform resolution: its [[AlreadyResolved]] record
     /// carries the private marker that [`Self::is_host_resolver`] recognizes.
     fn make_host_resolver_pair(&mut self, promise: &Value) -> (Value, Value) {
-        let flag = Object::new(Some(self.host_resolution_marker.clone()));
+        let flag = Object::new(Some(self.host_resolution_marker));
         (
             self.make_resolver_with(promise, true, &flag),
             self.make_resolver_with(promise, false, &flag),
@@ -4720,10 +4713,10 @@ impl Interp {
     /// then belongs to no Realm or settings object.
     pub(crate) fn resolve_promise_from(&mut self, promise: &Value, value: Value, host_steps: bool) {
         // Follow a subclass graft's forwarding link (see run_constructor_on's native arm).
-        let mut promise = promise.clone();
+        let mut promise = *promise;
         if let ValueView::Obj(o) = &(promise).view() {
             if let Some(f) = self.promise_forward.get(&(Gc::as_ptr(o) as usize)) {
-                promise = f.clone();
+                promise = *f;
             }
         }
         let promise = &promise;
@@ -4765,8 +4758,7 @@ impl Interp {
                     // The job's own callback is a built-in that calls `then`, so HostCallJob-
                     // Callback's script execution context for `then` sits below both.
                     let active_script = then.active_script.take();
-                    let runner =
-                        crate::builtins::make_thenable_job(self, then, value.clone(), res, rej);
+                    let runner = crate::builtins::make_thenable_job(self, then, value, res, rej);
                     self.microtasks.push_back(crate::interpreter::Job {
                         handler: crate::interpreter::JobCallback {
                             active_script,
@@ -4792,10 +4784,10 @@ impl Interp {
     }
 
     pub(crate) fn reject_promise(&mut self, promise: &Value, reason: Value) {
-        let mut promise = promise.clone();
+        let mut promise = *promise;
         if let ValueView::Obj(o) = &(promise).view() {
             if let Some(f) = self.promise_forward.get(&(Gc::as_ptr(o) as usize)) {
-                promise = f.clone();
+                promise = *f;
             }
         }
         self.settle(&promise, reason, false);
@@ -4809,7 +4801,7 @@ impl Interp {
         let (reactions, handled) = match self.promises.get_mut(&self.gc_heap, &ptr) {
             Some(s) if s.status == 0 => {
                 s.status = if fulfilled { 1 } else { 2 };
-                s.value = value.clone();
+                s.value = value;
                 (std::mem::take(&mut s.reactions), s.handled)
             }
             _ => return,
@@ -4822,10 +4814,8 @@ impl Interp {
         if !fulfilled && !handled {
             let order = self.next_unhandled_rejection;
             self.next_unhandled_rejection += 1;
-            self.unhandled_rejections.insert(
-                ptr,
-                (order, promise.clone(), value.clone(), self.host_job_context),
-            );
+            self.unhandled_rejections
+                .insert(ptr, (order, *promise, value, self.host_job_context));
         }
         for (on_f, on_r, result, host_context) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
@@ -4833,7 +4823,7 @@ impl Interp {
             self.microtasks.push_back(Job {
                 handler,
                 result,
-                value: value.clone(),
+                value,
                 fulfilled,
                 realm,
                 host_context,
@@ -4844,7 +4834,7 @@ impl Interp {
     /// The `then` operation: register reactions, returning a new dependent promise.
     pub(crate) fn promise_then(&mut self, promise: &Value, on_f: Value, on_r: Value) -> Value {
         let result = self.new_promise();
-        self.promise_then_into(promise, on_f, on_r, result.clone());
+        self.promise_then_into(promise, on_f, on_r, result);
         result
     }
 
@@ -4873,8 +4863,8 @@ impl Interp {
         if !matches!(&(promise).view(), ValueView::Obj(_)) {
             return;
         }
-        let on_f = self.make_await_job_callback(async_promise.clone(), true);
-        let on_r = self.make_await_job_callback(async_promise.clone(), false);
+        let on_f = self.make_await_job_callback(*async_promise, true);
+        let on_r = self.make_await_job_callback(*async_promise, false);
         self.perform_promise_then(promise, on_f, on_r, Value::Undefined);
     }
 
@@ -4913,23 +4903,22 @@ impl Interp {
         // `rejectionhandled`.
         if status == 2 && !handled && self.unhandled_rejections.remove(&ptr).is_none() {
             if let Some(context) = outstanding {
-                let reason = self.promises[&ptr].value.clone();
-                self.handled_rejections
-                    .push((promise.clone(), reason, context));
+                let reason = self.promises[&ptr].value;
+                self.handled_rejections.push((*promise, reason, context));
             }
         }
         match status {
             0 => {
                 if let Some(s) = self.promises.get_mut(&self.gc_heap, &ptr) {
-                    s.reactions.push((on_f, on_r, result.clone(), host_context));
+                    s.reactions.push((on_f, on_r, result, host_context));
                 }
             }
             1 => {
-                let v = self.promises[&ptr].value.clone();
+                let v = self.promises[&ptr].value;
                 let (realm, host_context) = self.reaction_job_target(&on_f, host_context);
                 self.microtasks.push_back(Job {
                     handler: on_f,
-                    result: result.clone(),
+                    result,
                     value: v,
                     fulfilled: true,
                     realm,
@@ -4937,11 +4926,11 @@ impl Interp {
                 });
             }
             _ => {
-                let v = self.promises[&ptr].value.clone();
+                let v = self.promises[&ptr].value;
                 let (realm, host_context) = self.reaction_job_target(&on_r, host_context);
                 self.microtasks.push_back(Job {
                     handler: on_r,
-                    result: result.clone(),
+                    result,
                     value: v,
                     fulfilled: false,
                     realm,
@@ -5103,7 +5092,7 @@ impl Interp {
             let mut due = crate::rooting::RootedVec::new();
             self.pending_timers.retain(|(f, deadline)| {
                 if *deadline <= now {
-                    due.push(f.clone());
+                    due.push(*f);
                     false
                 } else {
                     true
@@ -5288,10 +5277,10 @@ impl Interp {
         if self.capture_job_script_caller {
             self.host_entry_realm = handler.internal.realm();
         }
-        let async_promise = handler.callback.clone();
+        let async_promise = handler.callback;
         self.with_job_script_context(handler.active_script.as_ref(), |ctx| {
             if let Some(global) = &handler.script_caller {
-                ctx.with_callback_script_caller(&Value::Obj(global.clone()), |ctx| {
+                ctx.with_callback_script_caller(&Value::Obj(*global), |ctx| {
                     ctx.drive_async(key, async_promise, signal)
                 });
             } else {
@@ -5488,7 +5477,7 @@ impl Interp {
         // the `#name` bindings on the caller's scope chain to seed the parser's validation.
         let mut private_names: Vec<String> = Vec::new();
         if direct {
-            let mut cur = Some(caller_env.clone());
+            let mut cur = Some(*caller_env);
             while let Some(s) = cur {
                 let b = s.borrow();
                 for k in b.vars.keys() {
@@ -5496,7 +5485,7 @@ impl Interp {
                         private_names.push(k.to_string());
                     }
                 }
-                cur = b.parent.clone();
+                cur = b.parent;
             }
         }
         // A direct eval may contain a SuperProperty only when its caller is method code (a home
@@ -5528,7 +5517,7 @@ impl Interp {
         // code — an ordinary nested function inside a method shields it, an arrow is transparent.
         if direct && stmts_have_super_prop(&body) {
             let mut ok = false;
-            let mut cur = Some(caller_env.clone());
+            let mut cur = Some(*caller_env);
             while let Some(sc) = cur {
                 let b = sc.borrow();
                 if b.vars.contains_key("%superpropok%") || b.vars.contains_key("%homeobject%") {
@@ -5540,7 +5529,7 @@ impl Interp {
                 if b.vars.contains_key("arguments") {
                     break;
                 }
-                cur = b.parent.clone();
+                cur = b.parent;
             }
             if !ok {
                 return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
@@ -5552,7 +5541,7 @@ impl Interp {
         // shields it — so walk the caller's scope chain.
         let in_field_init = direct && {
             let mut found = false;
-            let mut cur = Some(caller_env.clone());
+            let mut cur = Some(*caller_env);
             while let Some(sc) = cur {
                 let b = sc.borrow();
                 if b.vars.contains_key("arguments") {
@@ -5562,7 +5551,7 @@ impl Interp {
                     found = true;
                     break;
                 }
-                cur = b.parent.clone();
+                cur = b.parent;
             }
             found
         };
@@ -5583,26 +5572,20 @@ impl Interp {
             if strict {
                 // Strict indirect eval: its own environments — top-level declarations don't leak to
                 // the global object.
-                let e = new_var_scope(Some(self.global_env.clone()));
-                (e.clone(), e)
+                let e = new_var_scope(Some(self.global_env));
+                (e, e)
             } else {
                 // Sloppy indirect eval runs in the global scope.
-                (
-                    self.global_env.clone(),
-                    new_scope(Some(self.global_env.clone())),
-                )
+                (self.global_env, new_scope(Some(self.global_env)))
             }
         } else if strict {
             // Strict direct eval: its own variable + lexical environment — nothing leaks out.
-            let e = new_var_scope(Some(caller_env.clone()));
-            (e.clone(), e)
+            let e = new_var_scope(Some(*caller_env));
+            (e, e)
         } else {
             // Sloppy direct eval: `var`/function declarations hoist into the caller's nearest
             // variable environment; lexical declarations stay in a fresh, private lexical scope.
-            (
-                nearest_var_env(caller_env),
-                new_scope(Some(caller_env.clone())),
-            )
+            (nearest_var_env(caller_env), new_scope(Some(*caller_env)))
         };
 
         self.in_code(Some(source), |this| {
@@ -5629,7 +5612,7 @@ impl Interp {
         // throwaway scope, which mirrors the interpreter's own var-scoping and function-precedence
         // rules exactly. Its parent is the eval's lexical environment so any function closes over it.
         // The hoist runs in the eval's strict mode so Annex B block functions apply only when sloppy.
-        let probe = new_scope(Some(lex_env.clone()));
+        let probe = new_scope(Some(*lex_env));
         let saved_strict = self.strict;
         self.strict = strict;
         let hoist_ops = collect_hoist_ops(body, strict, &[]);
@@ -5652,7 +5635,7 @@ impl Interp {
             }
             // ...nor over a like-named lexical binding in any scope between the eval and its variable
             // environment (block `let`/`const`, a parameter scope's `arguments`/parameters, etc.).
-            let mut cur = Some(lex_env.clone());
+            let mut cur = Some(*lex_env);
             while let Some(s) = cur {
                 if Env::ptr_eq(&s, var_env) {
                     break;
@@ -5661,7 +5644,7 @@ impl Interp {
                     let b = s.borrow();
                     // A `with` object environment holds no lexical declarations, and a `catch`
                     // parameter environment is exempt from the var/lexical conflict check.
-                    (b.has_with_object() || b.catch_param, b.parent.clone())
+                    (b.has_with_object() || b.catch_param, b.parent)
                 };
                 if !skip {
                     for &(name, _) in &var_bindings {
@@ -5864,8 +5847,8 @@ impl Interp {
             self.prepare_class_decorator(
                 &mut prepared,
                 None,
-                decorator.callback.clone(),
-                decorator.this_value.clone(),
+                decorator.callback,
+                decorator.this_value,
             );
         }
         drop(class_decorators);
@@ -5906,7 +5889,7 @@ impl Interp {
     ) -> PreparedClassEvaluation {
         // The class scope opens before the heritage evaluates: a named class's own name is in
         // scope there — uninitialized (TDZ) until the constructor exists, and immutable.
-        let outer_class_env = new_scope(Some(env.clone()));
+        let outer_class_env = new_scope(Some(*env));
         if let Some(n) = &class.name {
             outer_class_env
                 .borrow_mut()
@@ -5916,7 +5899,7 @@ impl Interp {
         // The spec's PrivateEnvironment is also allocated before heritage but becomes active only
         // for class elements. TRust JS represents it as a child lexical record carrying unforgeable
         // runtime private-name keys.
-        let class_env = new_scope(Some(outer_class_env.clone()));
+        let class_env = new_scope(Some(outer_class_env));
         for member in &class.members {
             let source = match &member.key {
                 PropKey::Ident(name) if name.starts_with('#') => name.clone(),
@@ -5931,7 +5914,7 @@ impl Interp {
         PreparedClassEvaluation {
             outer_class_env,
             class_env,
-            proto_parent: Some(self.object_proto.clone()),
+            proto_parent: Some(self.object_proto),
             ctor_parent: None,
             derived: false,
             keys: (0..class.members.len()).map(|_| None).collect(),
@@ -6020,7 +6003,7 @@ impl Interp {
         // %IsHTMLDDA% is a TypeError without observable gets.)
         let (proto_parent, ctor_parent): (Option<Gc>, Option<Value>) =
             match parent.map(|value| value.view()) {
-                None => (Some(self.object_proto.clone()), None),
+                None => (Some(self.object_proto), None),
                 Some(ValueView::Null) => (None, None),
                 Some(ValueView::Obj(pc)) if self.value_is_constructor(parent.as_ref().unwrap()) => {
                     let pp = self.get_member_key(parent.as_ref().unwrap(), "prototype")?;
@@ -6034,7 +6017,7 @@ impl Interp {
                             ));
                         }
                     };
-                    (pp, Some(Value::Obj(pc.clone())))
+                    (pp, Some(Value::Obj(pc)))
                 }
                 _ => {
                     return Err(self.throw(
@@ -6075,13 +6058,13 @@ impl Interp {
         class: &Rc<Class>,
         mut prepared: crate::rooting::Rooted<PreparedClassEvaluation>,
     ) -> Result<Value, Abrupt> {
-        let outer_class_env = prepared.outer_class_env.clone();
-        let class_env = prepared.class_env.clone();
-        let proto_parent = prepared.proto_parent.clone();
-        let ctor_parent = prepared.ctor_parent.clone();
+        let outer_class_env = prepared.outer_class_env;
+        let class_env = prepared.class_env;
+        let proto_parent = prepared.proto_parent;
+        let ctor_parent = prepared.ctor_parent;
         let derived = prepared.derived;
 
-        let proto = Object::new(proto_parent.clone());
+        let proto = Object::new(proto_parent);
 
         // The constructor: explicit member, or a synthesized default. Either way its rendered
         // source (Function.prototype.toString) is the whole class's source text.
@@ -6101,47 +6084,45 @@ impl Interp {
 
         // Environments that carry the `super` and already-minted private-name bindings into
         // methods/fields.
-        let inst_env = new_scope(Some(class_env.clone()));
+        let inst_env = new_scope(Some(class_env));
         // Instance members' [[HomeObject]] is the prototype: `super.x` resolves against its
         // *live* [[GetPrototypeOf]].
-        bind(&inst_env, "%homeobject%", Value::Obj(proto.clone()));
+        bind(&inst_env, "%homeobject%", Value::Obj(proto));
         bind(&inst_env, "%superproto%", opt_obj(&proto_parent));
         // `extends null` binds Null (a super() call is a TypeError, not a SyntaxError).
         bind(
             &inst_env,
             "%superclass%",
-            ctor_parent.clone().unwrap_or(if derived {
+            ctor_parent.unwrap_or(if derived {
                 Value::Null
             } else {
                 Value::Undefined
             }),
         );
-        let static_env = new_scope(Some(class_env.clone()));
+        let static_env = new_scope(Some(class_env));
         // Static elements' [[HomeObject]] is the constructor: their super base is the parent
         // constructor, or %Function.prototype% for a base class.
         bind(
             &static_env,
             "%superproto%",
-            ctor_parent
-                .clone()
-                .unwrap_or_else(|| Value::Obj(self.function_proto.clone())),
+            ctor_parent.unwrap_or_else(|| Value::Obj(self.function_proto)),
         );
 
         // Build the constructor object on `proto`.
-        let ctor_val = self.make_function(ctor_func, inst_env.clone());
-        let ctor_obj = ctor_val.as_obj().unwrap().clone();
+        let ctor_val = self.make_function(ctor_func, inst_env);
+        let ctor_obj = ctor_val.as_obj().unwrap();
         // Static members' [[HomeObject]] is the constructor itself (bound after it exists; the
         // scope cell is shared with the already-captured static member environments).
-        bind(&static_env, "%homeobject%", ctor_val.clone());
+        bind(&static_env, "%homeobject%", ctor_val);
         {
             let mut b = ctor_obj.borrow_mut();
             b.props.insert(
                 "prototype",
-                Property::data(Value::Obj(proto.clone()), false, false, false),
+                Property::data(Value::Obj(proto), false, false, false),
             );
             b.proto = match ctor_parent.map(|__value| (__value).view()) {
-                Some(ValueView::Obj(p)) => Some(p.clone()),
-                _ => Some(self.function_proto.clone()),
+                Some(ValueView::Obj(p)) => Some(p),
+                _ => Some(self.function_proto),
             };
             if let Some(n) = &class.name {
                 b.props.insert(
@@ -6153,8 +6134,8 @@ impl Interp {
         proto
             .borrow_mut()
             .props
-            .insert("constructor", Property::builtin(ctor_val.clone()));
-        bind(&inst_env, "%thisctor%", ctor_val.clone());
+            .insert("constructor", Property::builtin(ctor_val));
+        bind(&inst_env, "%thisctor%", ctor_val);
         // NamedEvaluation: an anonymous class takes its target name *before* any static
         // initializer runs.
         if class.name.is_none() {
@@ -6219,11 +6200,7 @@ impl Interp {
                 key
             };
             let menv = if m.is_static { &static_env } else { &inst_env };
-            let target = if m.is_static {
-                ctor_obj.clone()
-            } else {
-                proto.clone()
-            };
+            let target = if m.is_static { ctor_obj } else { proto };
             match m.kind {
                 MemberKind::Accessor => {
                     // An auto-accessor: a private backing field plus a brand-checked getter/setter.
@@ -6292,7 +6269,7 @@ impl Interp {
                     }
                 }
                 MemberKind::Method => {
-                    let mut f = self.make_function(m.func.clone().unwrap(), menv.clone());
+                    let mut f = self.make_function(m.func.clone().unwrap(), *menv);
                     if let ValueView::Obj(fo) = &(f).view() {
                         let name = self.fn_name_for_key(if key.is_private() {
                             private_display(&key)
@@ -6344,7 +6321,7 @@ impl Interp {
                     }
                 }
                 MemberKind::Get | MemberKind::Set => {
-                    let mut f = self.make_function(m.func.clone().unwrap(), menv.clone());
+                    let mut f = self.make_function(m.func.clone().unwrap(), *menv);
                     let is_get = m.kind == MemberKind::Get;
                     if let ValueView::Obj(fo) = &(f).view() {
                         let prefix = if is_get { "get " } else { "set " };
@@ -6484,8 +6461,8 @@ impl Interp {
         );
 
         for (block, key, init, transforms) in static_els {
-            let scope = new_scope(Some(static_env.clone()));
-            bind(&scope, "this", ctor_val.clone());
+            let scope = new_scope(Some(static_env));
+            bind(&scope, "this", ctor_val);
             if block.is_none() {
                 bind(&scope, "%fieldinit%", Value::Bool(true));
             }
@@ -6538,7 +6515,7 @@ impl Interp {
             self.in_field_init_code = saved_field;
             let mut v = v?;
             for tr in &transforms {
-                v = self.call(tr.clone(), ctor_val.clone(), &[v])?;
+                v = self.call(*tr, ctor_val, &[v])?;
             }
             // The supported nonextensible-applies-to-private proposal checks IsExtensible
             // before adding a new Private Name. Existing private state remains writable
@@ -6591,7 +6568,7 @@ impl Interp {
         }
         // Static element initializers and class initializers run with `this` = the class.
         for init in &static_inits {
-            self.call(init.clone(), class_value.clone(), &[])?;
+            self.call(*init, class_value, &[])?;
         }
         Ok(class_value)
     }
@@ -6599,7 +6576,7 @@ impl Interp {
     /// Build an auto-accessor's getter (`is_get`) or setter as a function object backed by the
     /// private `backing` field, with a spec-shaped `name` (`get x`/`set x`) and `length`.
     fn make_accessor_fn(&self, name: &str, backing: &Rc<str>, is_get: bool) -> Value {
-        let o = Object::new(Some(self.function_proto.clone()));
+        let o = Object::new(Some(self.function_proto));
         {
             let mut b = o.borrow_mut();
             b.call = if is_get {
@@ -6645,10 +6622,7 @@ impl Interp {
                     return;
                 }
             }
-        } else if b
-            .props
-            .merge_accessor(key.as_str(), get.clone(), set.clone())
-        {
+        } else if b.props.merge_accessor(key.as_str(), get, set) {
             return;
         }
         let property = Property::accessor_prop(get, set, false, true);
@@ -6662,7 +6636,7 @@ impl Interp {
     /// A function object wrapping an internal [`Callable`] (used for accessor get/set and decorator
     /// `access` helpers), with a spec-shaped `name`/`length`.
     fn make_callable(&self, call: Callable, name: &str, len: f64) -> Value {
-        let o = Object::new(Some(self.function_proto.clone()));
+        let o = Object::new(Some(self.function_proto));
         {
             let mut b = o.borrow_mut();
             b.call = call;
@@ -6688,7 +6662,7 @@ impl Interp {
         is_private: bool,
     ) -> Value {
         let ctx = self.new_object();
-        let cv = Value::Obj(ctx.clone());
+        let cv = Value::Obj(ctx);
         let key_rc: Rc<str> = Rc::from(key);
         let name = if !is_private && Self::is_sym_key(key) {
             self.sym_from_key(key).unwrap_or(Value::Undefined)
@@ -6753,11 +6727,7 @@ impl Interp {
                 return Err(self.throw("TypeError", "decorator is not callable"));
             }
             let ctx = self.make_decorator_context(kind, key, is_static, is_private);
-            let r = self.call(
-                decorator.callback.clone(),
-                decorator.this_value.clone(),
-                &[value.clone(), ctx],
-            )?;
+            let r = self.call(decorator.callback, decorator.this_value, &[value, ctx])?;
             inits.append(&mut std::mem::take(&mut self.decorator_initializers));
             match r {
                 v if matches!(v.view(), ValueView::Undefined) => {}
@@ -6789,8 +6759,8 @@ impl Interp {
             }
             let ctx = self.make_decorator_context("field", key, is_static, is_private);
             let r = self.call(
-                decorator.callback.clone(),
-                decorator.this_value.clone(),
+                decorator.callback,
+                decorator.this_value,
                 &[Value::Undefined, ctx],
             )?;
             inits.append(&mut std::mem::take(&mut self.decorator_initializers));
@@ -6828,15 +6798,11 @@ impl Interp {
             }
             let ctx = self.make_decorator_context("accessor", key, is_static, is_private);
             let pair = self.new_object();
-            pair.borrow_mut()
-                .props
-                .insert("get", Property::plain(get.clone()));
-            pair.borrow_mut()
-                .props
-                .insert("set", Property::plain(set.clone()));
+            pair.borrow_mut().props.insert("get", Property::plain(get));
+            pair.borrow_mut().props.insert("set", Property::plain(set));
             let r = self.call(
-                decorator.callback.clone(),
-                decorator.this_value.clone(),
+                decorator.callback,
+                decorator.this_value,
                 &[Value::Obj(pair), ctx],
             )?;
             inits.append(&mut std::mem::take(&mut self.decorator_initializers));
@@ -6877,7 +6843,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         let obj = match &(ctor).view() {
-            ValueView::Obj(o) => o.clone(),
+            ValueView::Obj(o) => *o,
             _ => return Err(self.throw("TypeError", "super target is not a constructor")),
         };
         let ptr = Gc::as_ptr(&obj) as usize;
@@ -6885,7 +6851,7 @@ impl Interp {
         // is what super() binds as `this` (the object-override path in the super-call code).
         if self.proxies.contains_key(&ptr) {
             let nt = self.constructor_new_target();
-            return self.construct_nt(ctor.clone(), args, nt);
+            return self.construct_nt(*ctor, args, nt);
         }
         let is_class = self.class_info.contains_key(&ptr);
         let derived = self
@@ -6911,8 +6877,7 @@ impl Interp {
                 // A `super(...)` call is legal only directly within a *derived* constructor body.
                 let saved_super = self.super_call_ok;
                 self.super_call_ok = is_class && derived;
-                let r =
-                    self.call_user(&user.func, user.env.clone(), this.clone(), args, true, &obj);
+                let r = self.call_user(&user.func, user.env, *this, args, true, &obj);
                 self.super_call_ok = saved_super;
                 r
             }
@@ -6921,7 +6886,7 @@ impl Interp {
                 // constructors that require `new`. Run it, then graft its own props onto `this`.
                 let saved = self.constructing;
                 self.constructing = true;
-                let made = self.dispatch_native(&call, this.clone(), args);
+                let made = self.dispatch_native(&call, *this, args);
                 self.constructing = saved;
                 let made = made?;
                 if let (ValueView::Obj(src), ValueView::Obj(dst)) = (&(made).view(), &(this).view())
@@ -7007,7 +6972,7 @@ impl Interp {
                         if let Some(v) = self.promises.remove(&sp) {
                             self.promises.insert(&self.gc_heap, dp, v);
                             // The native ctor's resolvers are bound to `src`; forward them.
-                            self.promise_forward.insert(&self.gc_heap, sp, this.clone());
+                            self.promise_forward.insert(&self.gc_heap, sp, *this);
                         }
                         if let Some(v) = self.temporal.remove(&sp) {
                             self.temporal.insert(dp, v);
@@ -7152,7 +7117,7 @@ impl Interp {
         this: &Value,
     ) -> Result<(), Abrupt> {
         let obj = match &(ctor).view() {
-            ValueView::Obj(o) => o.clone(),
+            ValueView::Obj(o) => *o,
             _ => return Ok(()),
         };
         let ptr = Gc::as_ptr(&obj) as usize;
@@ -7167,7 +7132,7 @@ impl Interp {
             }
             Some(i) => (
                 i.fields.clone(),
-                i.field_env.clone(),
+                i.field_env,
                 i.instance_initializers.clone(),
                 i.private_members.clone(),
             ),
@@ -7218,8 +7183,8 @@ impl Interp {
                         // Each initializer evaluates in its own environment (it is a method
                         // body in ClassFieldDefinitionEvaluation); one without an initializer
                         // evaluates nothing, so it needs none.
-                        let scope = new_scope(Some(field_env.clone()));
-                        bind_shared_name(&scope, field_init_name(0), this.clone());
+                        let scope = new_scope(Some(field_env));
+                        bind_shared_name(&scope, field_init_name(0), *this);
                         // Field-initializer code: a direct eval from here (or from an arrow
                         // created here) may not reference `arguments`.
                         bind_shared_name(&scope, field_init_name(1), Value::Bool(true));
@@ -7238,7 +7203,7 @@ impl Interp {
                 };
                 // Decorator-supplied field initializers transform the value in turn.
                 for t in &field.transforms {
-                    v = me.call(t.clone(), this.clone(), &[v])?;
+                    v = me.call(*t, *this, &[v])?;
                 }
                 if key.is_private() {
                     // PrivateFieldAdd: stamped directly on the object (bypassing proxy traps);
@@ -7271,7 +7236,7 @@ impl Interp {
             }
             // Decorator addInitializer callbacks run after the fields, with `this` = the instance.
             for init in &initializers {
-                me.call(init.clone(), this.clone(), &[])?;
+                me.call(*init, *this, &[])?;
             }
             Ok(())
         })(self);
@@ -7331,7 +7296,7 @@ impl Interp {
         keys: &[std::rc::Rc<str>],
         values: Vec<Value>,
     ) -> Value {
-        let obj = crate::value::Object::new(Some(self.object_proto.clone()));
+        let obj = crate::value::Object::new(Some(self.object_proto));
         {
             let mut b = obj.borrow_mut();
             for (k, v) in keys.iter().zip(values) {
@@ -7345,12 +7310,12 @@ impl Interp {
     /// stack (moved; the caller forgets them) — no intermediate `Vec` per instantiation.
     ///
     /// # Safety
-    /// `base..base+count` must be initialized `PackedValue`s the caller relinquishes.
+    /// `base..base+count` must be initialized `Value`s the caller relinquishes.
     pub(crate) unsafe fn make_plain_object_templated_from(
         &mut self,
         tmpl: &std::cell::OnceCell<Box<crate::value::Props>>,
         keys: &[std::rc::Rc<str>],
-        base: *const PackedValue,
+        base: *const Value,
         count: usize,
     ) -> Value {
         let map = tmpl.get_or_init(|| {
@@ -7361,10 +7326,9 @@ impl Interp {
             p.mark_layout_shared();
             Box::new(p)
         });
-        let props =
-            map.instantiate_plain_packed((0..count).map(|slot| unsafe { base.add(slot).read() }));
+        let props = map.instantiate_plain((0..count).map(|slot| unsafe { base.add(slot).read() }));
         let obj = crate::value::Object::new_with_parts(
-            Some(self.object_proto.clone()),
+            Some(self.object_proto),
             props,
             crate::value::Exotic::None,
         );
@@ -7391,7 +7355,7 @@ impl Interp {
             Box::new(p)
         });
         let obj = crate::value::Object::new_with_parts(
-            Some(self.object_proto.clone()),
+            Some(self.object_proto),
             map.instantiate_plain(values.into_iter()),
             crate::value::Exotic::None,
         );
@@ -7676,7 +7640,7 @@ impl Interp {
     pub(crate) fn delete_ident(&mut self, name: &str, env: &Env) -> Result<Value, Abrupt> {
         {
             {
-                let mut cur = Some(env.clone());
+                let mut cur = Some(*env);
                 while let Some(s) = cur {
                     let (has, deletable, with_obj, parent) = {
                         let b = s.borrow();
@@ -7685,7 +7649,7 @@ impl Interp {
                             binding.is_some(),
                             binding.map(|x| x.deletable).unwrap_or(false),
                             b.with_object(),
-                            b.parent.clone(),
+                            b.parent,
                         )
                     };
                     if has {
@@ -7702,7 +7666,7 @@ impl Interp {
                         // @@unscopables-blocked names skip this scope entirely; a present
                         // binding deletes via the object's [[Delete]] (own property only —
                         // an inherited one is untouched and reports true per OrdinaryDelete).
-                        let (wobj, o) = (wobj.clone(), o.clone());
+                        let (wobj, o) = (*wobj, o);
                         if self.with_has_binding(&wobj, name)? {
                             if self.host_named_visible(&o, name)? {
                                 return Ok(Value::Bool(false));
@@ -7723,7 +7687,7 @@ impl Interp {
                     cur = parent;
                 }
                 // Fall back to a global-object property.
-                let g = self.global.clone();
+                let g = self.global;
                 let existing = g.borrow().props.get(name).map(|p| p.configurable());
                 match existing {
                     Some(true) => {
@@ -7765,7 +7729,7 @@ impl Interp {
             crate::interpreter::PROXY_TRAP_DELETE,
             &trap,
             handler,
-            [target.clone(), kv],
+            [target, kv],
         )?;
         if !self.to_boolean(&res) {
             return Ok(false);
@@ -7798,7 +7762,7 @@ impl Interp {
     /// walking plain scopes only. `None` (any `with` frame, TDZ, const, import, or not found)
     /// sends the caller down the full Reference path.
     fn plain_binding_scope(&self, name: &str, env: &Env) -> Option<Env> {
-        let mut cur = Some(env.clone());
+        let mut cur = Some(*env);
         while let Some(s) = cur {
             let (found, parent) = {
                 let b = s.borrow();
@@ -7812,7 +7776,7 @@ impl Interp {
                         }
                         (true, None)
                     }
-                    None => (false, b.parent.clone()),
+                    None => (false, b.parent),
                 }
             };
             if found {
@@ -7862,7 +7826,7 @@ impl Interp {
                 } else {
                     old.sub(&one)
                 };
-                self.put_reference(&mut lref, Value::BigInt(new.clone()))?;
+                self.put_reference(&mut lref, Value::BigInt(new))?;
                 Ok(Value::BigInt(if prefix { new } else { old }))
             }
             ValueView::Num(old) => {
@@ -7922,7 +7886,7 @@ impl Interp {
                     if !stored {
                         let mut reference =
                             PreparedReference::scope(Rc::from(name.as_str()), scope, strict);
-                        self.write_prepared_reference(&mut reference, result.clone())?;
+                        self.write_prepared_reference(&mut reference, result)?;
                     }
                     return Ok(result);
                 }
@@ -7932,7 +7896,7 @@ impl Interp {
             // A destructuring target evaluates the RHS first, then iterates the pattern.
             if matches!(target, Expr::Array(_) | Expr::Object(_)) {
                 let v = self.eval(value, env)?;
-                self.assign_to_target(target, v.clone(), env)?;
+                self.assign_to_target(target, v, env)?;
                 return Ok(v);
             }
             // A simple target evaluates its Reference (base + computed key expression) BEFORE the
@@ -7951,7 +7915,7 @@ impl Interp {
                     self.set_fn_name(&v, n);
                 }
             }
-            self.put_reference(&mut lref, v.clone())?;
+            self.put_reference(&mut lref, v)?;
             return Ok(v);
         }
         // The LHS reference is resolved once and reused for GetValue + PutValue, so a `with`-object
@@ -7976,7 +7940,7 @@ impl Interp {
                     self.set_fn_name(&v, n);
                 }
             }
-            self.put_reference(&mut lref, v.clone())?;
+            self.put_reference(&mut lref, v)?;
             return Ok(v);
         }
         // Compound arithmetic/bitwise: a op= b  ≡  a = a <op> b.
@@ -7984,7 +7948,7 @@ impl Interp {
         let rhs = self.eval(value, env)?;
         let bin_op = &op[..op.len() - 1];
         let result = self.binary(bin_op, cur, rhs)?;
-        self.put_reference(&mut lref, result.clone())?;
+        self.put_reference(&mut lref, result)?;
         Ok(result)
     }
 
@@ -8032,7 +7996,7 @@ impl Interp {
             // Destructuring assignment: an array/object literal reinterpreted as a target.
             Expr::Array(elems) => {
                 let (iter, next) = self.get_iterator(&value)?;
-                let iter_close = iter.clone();
+                let iter_close = iter;
                 let mut done = false;
                 let result = (|me: &mut Self| -> Result<(), Abrupt> {
                     // A throw from `next` (IteratorStep) marks the record done, so IteratorClose
@@ -8658,7 +8622,7 @@ impl Interp {
                 if is_default {
                     return Ok(Value::Bool(self.ordinary_has_instance(r, l)?));
                 }
-                let res = self.call(handler, r.clone(), std::slice::from_ref(l))?;
+                let res = self.call(handler, *r, std::slice::from_ref(l))?;
                 return Ok(Value::Bool(self.to_boolean(&res)));
             }
             // GetMethod: a present but non-callable @@hasInstance is a TypeError.
@@ -8731,9 +8695,9 @@ impl Interp {
                     None
                 };
                 if let Some(ValueView::Obj(target)) = (target).map(|__value| (__value).view()) {
-                    let mut cur = Some(lhs.clone());
+                    let mut cur = Some(*lhs);
                     while let Some(object) = cur {
-                        let next = object.borrow().proto.clone();
+                        let next = object.borrow().proto;
                         match next {
                             Some(proto) if Gc::ptr_eq(&proto, &target) => {
                                 return Ok(Value::Bool(true));
@@ -8789,15 +8753,15 @@ impl Interp {
     /// `prototype` appears on `O`'s prototype chain.
     pub(crate) fn ordinary_has_instance(&mut self, c: &Value, o: &Value) -> Result<bool, Abrupt> {
         let co = match &(c).view() {
-            ValueView::Obj(x) if !matches!(x.borrow().call, Callable::None) => x.clone(),
+            ValueView::Obj(x) if !matches!(x.borrow().call, Callable::None) => *x,
             _ => return Ok(false),
         };
         if let Callable::Bound(bound) = &co.borrow().call {
-            let target = Value::Obj(bound.target.clone());
+            let target = Value::Obj(bound.target);
             return self.ordinary_has_instance(&target, o);
         }
         let o_obj = match &(o).view() {
-            ValueView::Obj(x) => x.clone(),
+            ValueView::Obj(x) => *x,
             _ => return Ok(false),
         };
         let proto = match (self.get_member_key(c, "prototype")?).view() {
@@ -8811,7 +8775,7 @@ impl Interp {
         if self.proxies.is_empty() {
             let mut cur = o_obj;
             loop {
-                let next = cur.borrow().proto.clone();
+                let next = cur.borrow().proto;
                 match next {
                     Some(x) => {
                         if Gc::ptr_eq(&x, &proto) {
@@ -8916,7 +8880,7 @@ impl Interp {
             ValueView::BigInt(n) => Ok(crate::lstr::LStr::from(
                 self.bigint_to_string(n, 10)?.as_str(),
             )),
-            ValueView::Str(s) => Ok(s.clone()),
+            ValueView::Str(s) => Ok(*s),
             ValueView::Sym(_) => {
                 Err(self.throw("TypeError", "Cannot convert a Symbol value to a string"))
             }
@@ -8949,14 +8913,14 @@ impl Interp {
     ) -> Result<crate::value::PropertyKey, Abrupt> {
         // A symbol key maps to its internal NUL-prefixed key; everything else is its string form.
         if let ValueView::Sym(s) = &(v).view() {
-            return Ok(crate::value::PropertyKey::symbol(s.clone()));
+            return Ok(crate::value::PropertyKey::symbol(*s));
         }
         // ToPropertyKey: ToPrimitive(hint String) first — a Symbol result stays a symbol key (rather
         // than being stringified, which would throw), so `obj[wrapperWhoseToStringReturnsASymbol]`
         // is a symbol-keyed access.
         let prim = self.to_primitive(v, Hint::String)?;
         if let ValueView::Sym(s) = &(prim).view() {
-            return Ok(crate::value::PropertyKey::symbol(s.clone()));
+            return Ok(crate::value::PropertyKey::symbol(*s));
         }
         Ok(crate::value::PropertyKey::string(
             self.to_string(&prim)?.to_string(),
@@ -8965,14 +8929,14 @@ impl Interp {
 
     pub(crate) fn to_primitive(&mut self, v: &Value, hint: Hint) -> Result<Value, Abrupt> {
         let obj = match &(v).view() {
-            ValueView::Obj(o) => o.clone(),
-            _ => return Ok(v.clone()),
+            ValueView::Obj(o) => *o,
+            _ => return Ok(*v),
         };
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<Value, Abrupt> = (|| {
             // A `@@toPrimitive` method takes precedence over valueOf/toString.
             if let Some(key) = crate::builtins::well_known_key(self, "toPrimitive") {
-                let f = self.get_member_key(&Value::Obj(obj.clone()), &key)?;
+                let f = self.get_member_key(&Value::Obj(obj), &key)?;
                 // GetMethod: a present-but-non-callable @@toPrimitive (not undefined/null) is a TypeError.
                 if !matches!((f).view(), ValueView::Undefined | ValueView::Null) && !f.is_callable()
                 {
@@ -8984,7 +8948,7 @@ impl Interp {
                         Hint::Number => "number",
                         Hint::Default => "default",
                     };
-                    let r = self.call(f, v.clone(), &[Value::lstr(hint_str)])?;
+                    let r = self.call(f, *v, &[Value::lstr(hint_str)])?;
                     if matches!((r).view(), ValueView::Obj(_)) {
                         return Err(
                             self.throw("TypeError", "Cannot convert object to a primitive value")
@@ -8998,9 +8962,9 @@ impl Interp {
                 _ => ["valueOf", "toString"],
             };
             for method in order {
-                let f = self.get_member_key(&Value::Obj(obj.clone()), method)?;
+                let f = self.get_member_key(&Value::Obj(obj), method)?;
                 if f.is_callable() {
-                    let r = self.call(f, v.clone(), &[])?;
+                    let r = self.call(f, *v, &[])?;
                     if !matches!((r).view(), ValueView::Obj(_)) {
                         return Ok(r);
                     }
@@ -9258,7 +9222,7 @@ pub(crate) fn bind(env: &Env, name: &str, value: Value) {
 
 fn opt_obj(o: &Option<Gc>) -> Value {
     match o {
-        Some(g) => Value::Obj(g.clone()),
+        Some(g) => Value::Obj(*g),
         None => Value::Undefined,
     }
 }
@@ -10020,7 +9984,7 @@ impl Interp {
             RefKey::Private(s) => Ok(crate::value::PropertyKey::private(s.clone())),
             RefKey::Coerced(key) => Ok(key.clone()),
             RefKey::Raw(v) => {
-                let v = v.clone();
+                let v = *v;
                 let k = self.to_property_key(&v)?;
                 *key = RefKey::Coerced(k.clone());
                 Ok(k)
@@ -10072,8 +10036,8 @@ impl Interp {
                     return Err(self.throw("TypeError", "cannot read property of null super base"));
                 }
                 let k = self.coerce_ref_key(key)?;
-                let proto = proto.clone();
-                let receiver = receiver.clone();
+                let proto = *proto;
+                let receiver = *receiver;
                 self.get_member_recv(&proto, &k, receiver)
             }
         }
@@ -10110,8 +10074,8 @@ impl Interp {
                 let k = self.coerce_ref_key(key)?;
                 // OrdinarySet from the super base: accessors on the base's chain win, and the
                 // final write lands on the receiver.
-                let proto = proto.clone();
-                let receiver = receiver.clone();
+                let proto = *proto;
+                let receiver = *receiver;
                 let strict = self.strict;
                 let success = self.set_member_recv(&proto, &k, value, receiver)?;
                 self.finish_assignment_set(&k, strict, success)

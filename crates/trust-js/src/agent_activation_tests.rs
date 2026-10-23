@@ -65,7 +65,7 @@ fn native_reentry_restores_the_allocation_heap_on_success_and_throw_all_tiers() 
                 ),
                 "42"
             );
-            let env = outer.interp.global_env.clone();
+            let env = outer.interp.global_env;
             let ValueView::Obj(kept) = (outer
                 .interp
                 .get_var("kept", &env)
@@ -182,7 +182,7 @@ fn settings_hooks_restore_the_heap_before_suspended_work_and_after_leave() {
     outer.interp.host_job_context_enter = Some(enter);
     outer.interp.host_job_context_leave = Some(hop);
     outer.interp.activate_gc_heap();
-    let global = outer.interp.global.clone();
+    let global = outer.interp.global;
     let made = outer
         .interp
         .with_suspended_context(&global, 23, |interp| interp.new_object());
@@ -269,7 +269,7 @@ fn bare_native_reentry_restores_the_heap_on_committed_calls_and_interruption() {
         let inner = Rc::new(RefCell::new(Engine::new()));
         outer.interp.op_state().put(inner.clone());
         outer.interp.activate_gc_heap();
-        let global = outer.interp.global.clone();
+        let global = outer.interp.global;
         outer.interp.def_method(&global, "bareHop", 0, hop);
         assert_eq!(
             eval(
@@ -279,7 +279,7 @@ fn bare_native_reentry_restores_the_heap_on_committed_calls_and_interruption() {
             ),
             "42"
         );
-        let env = outer.interp.global_env.clone();
+        let env = outer.interp.global_env;
         let ValueView::Obj(kept) = (outer
             .interp
             .get_var("kept", &env)

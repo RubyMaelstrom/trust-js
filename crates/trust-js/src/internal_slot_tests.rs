@@ -230,7 +230,7 @@ fn internal_slot_tests_gc_traces_live_slots_and_breaks_internal_slot_cycles() {
             var cycle = new Intl.Collator('en-US'), compare = cycle.compare;
         "#,
         );
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         // Strong handles live only in helper frames (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let cycle = engine.interp.get_var("cycle", &env).ok().unwrap();

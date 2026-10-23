@@ -41,7 +41,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 
 /// The global object named `name`.
 fn global_object(engine: &mut Engine, name: &str) -> Gc {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     match (engine.interp.get_var(name, &env)).map(|__value| (__value).view()) {
         Ok(ValueView::Obj(object)) => object,
         _ => panic!("{name}: not an object"),
@@ -398,7 +398,7 @@ fn every_side_slot_table_records_its_writes_for_minor_collections() {
     for write in &table_writes() {
         // The clean owner's entry holds an old object and an old environment.
         let old = global_object(&mut engine, "old");
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         (write.write)(&mut engine.interp, clean.get(), old, env);
         engine.interp.gc_collect();
         let (young, young_env) = write_young(&mut engine.interp, write, owner);

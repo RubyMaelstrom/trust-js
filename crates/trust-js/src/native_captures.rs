@@ -24,7 +24,7 @@ mod tests {
         _: &[Value],
         captures: &[Value],
     ) -> Result<Value, Value> {
-        Ok(captures[0].clone())
+        Ok(captures[0])
     }
 
     #[test]
@@ -38,12 +38,12 @@ mod tests {
                 "capture",
                 0,
                 returning_capture,
-                vec![Value::Obj(target.clone()), Value::Obj(target.clone())],
+                vec![Value::Obj(target), Value::Obj(target)],
             );
             target
                 .borrow_mut()
                 .props
-                .insert("callback", Property::builtin(callback.clone()));
+                .insert("callback", Property::builtin(callback));
             (Gc::downgrade(&target), Gc::downgrade(&object(&callback)))
         });
         interp.gc_collect();
@@ -69,28 +69,28 @@ mod tests {
                         "shared",
                         0,
                         returning_capture,
-                        vec![Value::Obj(target.clone())],
+                        vec![Value::Obj(target)],
                     );
                     let second = Object::new(None);
                     second.borrow_mut().call = object(&first).borrow().call.clone();
                     target
                         .borrow_mut()
                         .props
-                        .insert("first", Property::builtin(first.clone()));
+                        .insert("first", Property::builtin(first));
                     target
                         .borrow_mut()
                         .props
-                        .insert("second", Property::builtin(Value::Obj(second.clone())));
+                        .insert("second", Property::builtin(Value::Obj(second)));
                     let live = if live_second {
-                        Value::Obj(second.clone())
+                        Value::Obj(second)
                     } else {
-                        first.clone()
+                        first
                     };
                     (live, Gc::downgrade(&target))
                 });
                 interp.gc_collect();
                 let result = interp
-                    .invoke(live.clone(), Value::Null, &[])
+                    .invoke(live, Value::Null, &[])
                     .unwrap_or_else(|_| panic!("shared native invocation failed"));
                 assert!(Gc::ptr_eq(
                     &object(&result),
@@ -119,7 +119,7 @@ mod tests {
                     "young",
                     0,
                     returning_capture,
-                    vec![Value::Obj(target.clone())],
+                    vec![Value::Obj(target)],
                 );
                 // Internal construction can share a newly allocated payload with an
                 // existing function object.
@@ -127,7 +127,7 @@ mod tests {
                 target
                     .borrow_mut()
                     .props
-                    .insert("callback", Property::builtin(young_owner.clone()));
+                    .insert("callback", Property::builtin(young_owner));
                 Gc::downgrade(&target)
             });
             interp.gc_collect();
@@ -136,7 +136,7 @@ mod tests {
                 "old native owner lost young captures"
             );
             let result = interp
-                .invoke(Value::Obj(old_owner.clone()), Value::Undefined, &[])
+                .invoke(Value::Obj(old_owner), Value::Undefined, &[])
                 .unwrap_or_else(|_| panic!("old owner invocation failed"));
             assert!(Gc::ptr_eq(
                 &object(&result),
@@ -164,9 +164,9 @@ mod tests {
             interp.gc_collect();
             assert_eq!(interp.member_get(target, "calls")?.as_num_opt(), Some(1.));
             if matches!((captures[1]).view(), ValueView::Bool(true)) {
-                Err(target.clone())
+                Err(*target)
             } else {
-                Ok(target.clone())
+                Ok(*target)
             }
         }
         for throws in [false, true] {
@@ -178,12 +178,12 @@ mod tests {
                     target
                         .borrow_mut()
                         .props
-                        .insert("self", Property::builtin(Value::Obj(target.clone())));
+                        .insert("self", Property::builtin(Value::Obj(target)));
                     let callback = interp.new_native_fn_with_captures(
                         "reentrant",
                         0,
                         reentrant,
-                        vec![Value::Obj(target.clone()), Value::Bool(throws)],
+                        vec![Value::Obj(target), Value::Bool(throws)],
                     );
                     let lease = object(&callback).borrow().call.clone();
                     (lease, Gc::downgrade(&target))

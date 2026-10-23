@@ -14,7 +14,7 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 fn assert_compiled(engine: &mut Engine, name: &str, native: bool) {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine
         .interp
         .get_var(name, &env)
@@ -66,7 +66,7 @@ fn engine(tier: Tier) -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(tier);
     engine.set_tier_threshold(0);
-    let global = engine.interp.global.clone();
+    let global = engine.interp.global;
     engine
         .interp
         .def_method(&global, "checkTailDepth", 0, bounded_depth);

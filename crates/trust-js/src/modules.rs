@@ -145,7 +145,7 @@ impl ModuleCoro {
         match &result {
             crate::coroutine::Suspend::Done(_) => i.finish_dynamic_module(&self.key, None),
             crate::coroutine::Suspend::Throw(error) => {
-                i.finish_dynamic_module(&self.key, Some(error.clone()))
+                i.finish_dynamic_module(&self.key, Some(*error))
             }
             crate::coroutine::Suspend::Await(_) | crate::coroutine::Suspend::Yield(_) => {}
         }
@@ -333,7 +333,7 @@ impl Interp {
         } else {
             &key
         };
-        self.module_recs.get(evaluation_key)?.top_promise.clone()
+        self.module_recs.get(evaluation_key)?.top_promise
     }
 
     /// Load, link, and evaluate the module identified by canonical `key` (with initial `src`),
@@ -358,7 +358,7 @@ impl Interp {
                 self.module_recs.get_mut(m).unwrap().top_promise = Some(p);
             }
         }
-        let top = self.module_recs[&key].top_promise.clone().unwrap();
+        let top = self.module_recs[&key].top_promise.unwrap();
         let mut stack = Vec::new();
         self.inner_module_evaluation_async(&key, &mut stack, &mut 0);
         self.drain_microtasks_interruptible()
@@ -366,12 +366,12 @@ impl Interp {
         if let ValueView::Obj(o) = &(top).view() {
             if let Some(ps) = self.promises.get(&(crate::value::Gc::as_ptr(o) as usize)) {
                 if ps.status == 2 {
-                    let reason = ps.value.clone();
+                    let reason = ps.value;
                     return Err(Abrupt::Throw(reason));
                 }
             }
         }
-        Ok(self.module_recs[&key].ns.clone())
+        Ok(self.module_recs[&key].ns)
     }
 
     /// Every module in `key`'s dependency graph (including itself), depth-first.
@@ -554,19 +554,19 @@ impl Interp {
 
         // Create the scope + namespace object, then build the export tables. This record must exist
         // before we recurse into dependencies so an import cycle resolves back to it.
-        let env = new_scope(Some(self.global_env.clone()));
+        let env = new_scope(Some(self.global_env));
         // Top-level `this` in a module is `undefined` (not the global object).
         env.borrow_mut().vars.insert(
             "this".to_string(),
             Binding::data(Value::Undefined, false, true),
         );
         let ns_obj = Object::new(None);
-        let ns = Value::Obj(ns_obj.clone());
-        self.modules.insert(key.to_string(), ns.clone());
+        let ns = Value::Obj(ns_obj);
+        self.modules.insert(key.to_string(), ns);
         let meta = self.build_import_meta(key);
         // `import.meta` resolves lexically: a function exported from this module keeps seeing
         // this module's object no matter who calls it.
-        crate::eval::bind(&env, "%importmeta%", meta.clone());
+        crate::eval::bind(&env, "%importmeta%", meta);
 
         let mut tables = build_export_tables(&body, &resolved);
         if let Some(value) = default_export {
@@ -587,7 +587,7 @@ impl Interp {
             ModuleRec {
                 body: body.clone(),
                 source,
-                env: env.clone(),
+                env,
                 ns,
                 meta,
                 dep_keys,
@@ -658,7 +658,7 @@ impl Interp {
 
         let (body, env, ns) = {
             let rec = &self.module_recs[key];
-            (rec.body.clone(), rec.env.clone(), rec.ns.clone())
+            (rec.body.clone(), rec.env, rec.ns)
         };
         let dep_keys = self.module_recs[key].dep_keys.clone();
         for dep in &dep_keys {
@@ -785,7 +785,7 @@ impl Interp {
             for spec in &decl.specs {
                 match spec {
                     ImportSpec::Namespace(local) => {
-                        let ns = self.module_recs[&dep].ns.clone();
+                        let ns = self.module_recs[&dep].ns;
                         self.bind_local(env, local, ns);
                     }
                     ImportSpec::DeferNamespace(local) => {
@@ -852,12 +852,12 @@ impl Interp {
     /// initial prototype is `%AbstractModuleSource%.prototype`.
     pub(crate) fn module_source_of(&mut self, dep: &str) -> Value {
         if let Some(v) = self.module_source_objs.get(dep) {
-            return v.clone();
+            return *v;
         }
         let proto = self.extra_protos.get("%HostModuleSourceProto%").cloned();
         let obj = Object::new(proto);
         let v = Value::Obj(obj);
-        self.module_source_objs.insert(dep.to_string(), v.clone());
+        self.module_source_objs.insert(dep.to_string(), v);
         v
     }
 
@@ -893,7 +893,7 @@ impl Interp {
         // A source-phase re-export resolves to the requested module's ModuleSource object.
         if name == "~source~" {
             return match self.module_source_objs.get(key) {
-                Some(v) => Resolution::Ns(v.clone()),
+                Some(v) => Resolution::Ns(*v),
                 None => Resolution::NotFound,
             };
         }
@@ -907,7 +907,7 @@ impl Interp {
             if let Some(origin) = rec.imports.get(local) {
                 return match origin {
                     ImportOrigin::Namespace(dep) => match self.module_recs.get(dep) {
-                        Some(d) => Resolution::Ns(d.ns.clone()),
+                        Some(d) => Resolution::Ns(d.ns),
                         None => Resolution::NotFound,
                     },
                     ImportOrigin::DeferNamespace(dep) => {
@@ -923,7 +923,7 @@ impl Interp {
                     }
                 };
             }
-            return Resolution::Local(rec.env.clone(), local.clone());
+            return Resolution::Local(rec.env, local.clone());
         }
         if let Some((dep, imported)) = rec.indirect.get(name) {
             let (dep, imported) = (dep.clone(), imported.clone());
@@ -931,7 +931,7 @@ impl Interp {
         }
         if let Some(dep) = rec.star_as.get(name) {
             if let Some(drec) = self.module_recs.get(dep) {
-                return Resolution::Ns(drec.ns.clone());
+                return Resolution::Ns(drec.ns);
             }
             return Resolution::NotFound;
         }
@@ -1017,7 +1017,7 @@ impl Interp {
                 Resolution::Ns(v) => {
                     live.insert(
                         crate::value::encode_owned_string_key(name.clone()),
-                        NsBinding::Static(v.clone()),
+                        NsBinding::Static(v),
                     );
                     ns.borrow_mut().props.insert(
                         crate::value::encode_string_key(name).as_ref(),
@@ -1028,7 +1028,7 @@ impl Interp {
                     let v = self.make_deferred_ns(&dep);
                     live.insert(
                         crate::value::encode_owned_string_key(name.clone()),
-                        NsBinding::Static(v.clone()),
+                        NsBinding::Static(v),
                     );
                     ns.borrow_mut().props.insert(
                         crate::value::encode_string_key(name).as_ref(),
@@ -1069,9 +1069,9 @@ impl Interp {
         // One deferred namespace per module: every `import defer` of the same module (and every
         // re-export of such a binding) observes the same object.
         if let Some(v) = self.deferred_ns_objs.get(dep) {
-            return v.clone();
+            return *v;
         }
-        let base = self.module_recs[dep].ns.clone();
+        let base = self.module_recs[dep].ns;
         let ValueView::Obj(base_o) = &(base).view() else {
             return base;
         };
@@ -1107,7 +1107,7 @@ impl Interp {
         self.deferred_ns
             .insert(crate::value::Gc::as_ptr(&dns) as usize, dep.to_string());
         self.deferred_ns_objs
-            .insert(dep.to_string(), Value::Obj(dns.clone()));
+            .insert(dep.to_string(), Value::Obj(dns));
         Value::Obj(dns)
     }
 
@@ -1136,7 +1136,7 @@ impl Interp {
                     .module_ns
                     .contains_key(&(crate::value::Gc::as_ptr(&stub) as usize));
                 if !hydrated {
-                    let base = self.module_recs[key].ns.clone();
+                    let base = self.module_recs[key].ns;
                     if let ValueView::Obj(base_o) = &(base).view() {
                         {
                             let src = base_o.borrow();
@@ -1207,7 +1207,7 @@ impl Interp {
         {
             let rec = &self.module_recs[key];
             if let Some(err) = &rec.eval_error {
-                return Err(Abrupt::Throw(err.clone()));
+                return Err(Abrupt::Throw(*err));
             }
             if rec.evaluated || rec.evaluating {
                 return Ok(());
@@ -1250,12 +1250,7 @@ impl Interp {
 
         let (body, env, meta, source) = {
             let rec = &self.module_recs[key];
-            (
-                rec.body.clone(),
-                rec.env.clone(),
-                rec.meta.clone(),
-                rec.source.clone(),
-            )
+            (rec.body.clone(), rec.env, rec.meta, rec.source.clone())
         };
         let saved_meta = self.import_meta.take();
         let saved_strict = self.strict;
@@ -1276,7 +1271,7 @@ impl Interp {
             }
             Err(a) => {
                 let v = crate::interpreter::abrupt_value(a);
-                rec.eval_error = Some(v.clone());
+                rec.eval_error = Some(v);
                 rec.evaluated = true;
                 Err(Abrupt::Throw(v))
             }
@@ -1428,7 +1423,7 @@ impl Interp {
                 .unwrap_or_else(|| dep.to_string());
             let (dep_err, dep_done, dep_async) = {
                 let d = &self.module_recs[&root];
-                (d.eval_error.clone(), d.evaluated, d.async_order.is_some())
+                (d.eval_error, d.evaluated, d.async_order.is_some())
             };
             if let Some(err) = dep_err {
                 self.finish_scc(key, stack);
@@ -1490,7 +1485,7 @@ impl Interp {
                 .unwrap_or_else(|| m.clone());
             let (dep_err, dep_done, dep_async) = {
                 let d = &self.module_recs[&root];
-                (d.eval_error.clone(), d.evaluated, d.async_order.is_some())
+                (d.eval_error, d.evaluated, d.async_order.is_some())
             };
             if dep_err.is_some() || dep_done || !dep_async {
                 continue;
@@ -1537,15 +1532,10 @@ impl Interp {
     /// Execute `key`'s own body (all dependencies done): a TLA body parks in a coroutine whose
     /// completion runs the ancestor cascade; a synchronous body runs now.
     fn module_execute_async(&mut self, key: &str) {
-        let top = self.module_recs[key].top_promise.clone();
+        let top = self.module_recs[key].top_promise;
         let (body, env, meta, source) = {
             let rec = &self.module_recs[key];
-            (
-                rec.body.clone(),
-                rec.env.clone(),
-                rec.meta.clone(),
-                rec.source.clone(),
-            )
+            (rec.body.clone(), rec.env, rec.meta, rec.source.clone())
         };
         if body_has_tla(&body) {
             self.module_recs.get_mut(key).unwrap().evaluating = true;
@@ -1569,14 +1559,8 @@ impl Interp {
                 .map(|(name, binding)| (name.to_string(), !binding.mutable))
                 .collect();
             let coro = if let Some(chunk) = crate::bytecode::compile_module(&body, &bindings) {
-                let mut vm = crate::bytecode::VmCoro::new(
-                    self,
-                    chunk,
-                    env.clone(),
-                    Value::Undefined,
-                    &[],
-                    &[],
-                );
+                let mut vm =
+                    crate::bytecode::VmCoro::new(self, chunk, env, Value::Undefined, &[], &[]);
                 vm.frame = Some(Interp::resumed_module_frame(source.clone()));
                 crate::coroutine::Coroutine::Module(Box::new(ModuleCoro::new(vm, module_key)))
             } else {
@@ -1587,7 +1571,7 @@ impl Interp {
                     eprintln!("[tier] unavailable VM module coroutine: {key}");
                 }
                 let error = self.make_error("Error", crate::coroutine::VM_UNAVAILABLE_MSG);
-                self.finish_dynamic_module(key, Some(error.clone()));
+                self.finish_dynamic_module(key, Some(error));
                 self.reject_promise(&top, error);
                 return;
             };
@@ -1620,7 +1604,7 @@ impl Interp {
         match result {
             Ok(_) => {
                 self.module_recs.get_mut(key).unwrap().evaluated = true;
-                if let Some(t) = self.module_recs[key].top_promise.clone() {
+                if let Some(t) = self.module_recs[key].top_promise {
                     self.resolve_promise(&t, Value::Undefined);
                 }
             }
@@ -1636,7 +1620,7 @@ impl Interp {
     pub(crate) fn async_module_fulfilled(&mut self, key: &str) {
         // Spec step 7: the fulfilled module's own capability resolves before any ancestor
         // executes — leaf-to-root fulfilment order is observable through dynamic import.
-        if let Some(t) = self.module_recs[key].top_promise.clone() {
+        if let Some(t) = self.module_recs[key].top_promise {
             self.resolve_promise(&t, Value::Undefined);
         }
         let mut exec: Vec<(u64, String)> = Vec::new();
@@ -1681,15 +1665,15 @@ impl Interp {
             if rec.evaluated || rec.eval_error.is_some() {
                 return;
             }
-            rec.eval_error = Some(err.clone());
+            rec.eval_error = Some(err);
             rec.evaluated = true;
             rec.evaluating = false;
         }
-        if let Some(t) = self.module_recs[key].top_promise.clone() {
-            self.reject_promise(&t, err.clone());
+        if let Some(t) = self.module_recs[key].top_promise {
+            self.reject_promise(&t, err);
         }
         for parent in self.module_recs[key].async_parents.clone() {
-            self.async_module_rejected(&parent, err.clone());
+            self.async_module_rejected(&parent, err);
         }
     }
 
@@ -1782,7 +1766,7 @@ impl Interp {
                 Some(active) => {
                     return self.dynamic_import_from(promise, specifier, attr_type, defer, &active)
                 }
-                None => self.import_meta.clone(),
+                None => self.import_meta,
             },
         };
         let referrer = match meta {
@@ -1816,7 +1800,7 @@ impl Interp {
                 self.pending_dynamic_imports.insert(
                     request_id,
                     PendingDynamicImport {
-                        promise: promise.clone(),
+                        promise,
                         specifier: specifier.to_string(),
                         attr_type: attr_type.map(str::to_string),
                         defer,
@@ -1838,7 +1822,7 @@ impl Interp {
             self.link_module(&canon)?;
             Ok(canon)
         })();
-        self.finish_dynamic_import(promise.clone(), attr_type, defer, result);
+        self.finish_dynamic_import(promise, attr_type, defer, result);
         promise
     }
 
@@ -1906,10 +1890,9 @@ impl Interp {
                 // Evaluation may suspend at a top-level await: chain the import promise onto the
                 // module's evaluation promise, resolving with the namespace.
                 let top = self.evaluate_module_dynamic(&canon);
-                let ns = self.module_recs[&canon].ns.clone();
-                let on_f =
-                    make_bound_len(self, dynamic_import_fulfil, vec![promise.clone(), ns], 1.0);
-                let on_r = make_bound_len(self, dynamic_import_reject, vec![promise.clone()], 1.0);
+                let ns = self.module_recs[&canon].ns;
+                let on_f = make_bound_len(self, dynamic_import_fulfil, vec![promise, ns], 1.0);
+                let on_r = make_bound_len(self, dynamic_import_reject, vec![promise], 1.0);
                 self.promise_then(&top, on_f, on_r);
             }
             Err(e) => {
@@ -1940,8 +1923,8 @@ impl Interp {
         let (top, err, settled) = {
             let rec = &self.module_recs[key];
             (
-                rec.top_promise.clone(),
-                rec.eval_error.clone(),
+                rec.top_promise,
+                rec.eval_error,
                 rec.evaluated || rec.evaluating,
             )
         };
@@ -1971,17 +1954,14 @@ impl Interp {
             }
         }
         self.inner_module_evaluation_async(key, &mut Vec::new(), &mut 0);
-        self.module_recs[key]
-            .top_promise
-            .clone()
-            .unwrap_or_else(|| {
-                let p = self.new_evaluation_promise();
-                match self.module_recs[key].eval_error.clone() {
-                    Some(e) => self.reject_promise(&p, e),
-                    None => self.resolve_promise(&p, Value::Undefined),
-                }
-                p
-            })
+        self.module_recs[key].top_promise.unwrap_or_else(|| {
+            let p = self.new_evaluation_promise();
+            match self.module_recs[key].eval_error {
+                Some(e) => self.reject_promise(&p, e),
+                None => self.resolve_promise(&p, Value::Undefined),
+            }
+            p
+        })
     }
 
     /// Record a dynamically-evaluated module's completion (run from inside its coroutine).

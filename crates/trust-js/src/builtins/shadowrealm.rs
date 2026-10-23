@@ -6,8 +6,8 @@ use crate::value::ValueView;
 /// `ShadowRealm`: each instance owns a fully isolated sub-interpreter. `evaluate` runs source in it and
 /// only lets primitive completion values cross back (callables are wrapped; objects are a TypeError).
 pub(super) fn install_shadow_realm(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("ShadowRealm", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("ShadowRealm", proto);
     set_to_string_tag(it, &proto, "ShadowRealm");
     it.def_method(&proto, "evaluate", 1, shadow_evaluate);
     it.def_method(&proto, "importValue", 2, shadow_import_value);
@@ -30,12 +30,12 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     it.global
         .borrow_mut()
         .props
@@ -83,8 +83,8 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
             body.first(),
             Some(crate::ast::Stmt::Expr(crate::ast::Expr::Str(d))) if &**d == "use strict"
         );
-        let genv = sub.global_env.clone();
-        let scope = crate::interpreter::new_scope(Some(genv.clone()));
+        let genv = sub.global_env;
+        let scope = crate::interpreter::new_scope(Some(genv));
         sub.hoist(&body, &genv, &[]);
         sub.declare_block_lexicals(&body, &scope, false);
         let r = sub

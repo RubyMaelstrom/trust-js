@@ -25,12 +25,7 @@
 // Handles are `Copy` (P1 S2) and packed words have no drop glue (S5): code written for
 // reference-counted handles still clones, drops or forgets them where such a handle was
 // retained or released.
-#![allow(
-    dropping_copy_types,
-    forgetting_copy_types,
-    clippy::clone_on_copy,
-    clippy::drop_non_drop
-)]
+#![allow(dropping_copy_types, forgetting_copy_types, clippy::drop_non_drop)]
 
 use crate::value::ValueView;
 /// A process-lifetime diagnostic switch: whether environment variable `$name` is set. The first
@@ -122,6 +117,7 @@ fn scrubbed<R>(f: impl FnOnce() -> R) -> R {
     gc_core::scrub_stack(gc_core::ENTRY_SCRUB_BYTES);
     result
 }
+mod deopt;
 mod gc_handle;
 mod gc_native;
 #[cfg(test)]
@@ -218,7 +214,6 @@ mod string_replace_split_tests;
 mod string_slice_tests;
 #[cfg(test)]
 mod table_record_tests;
-mod tagged;
 mod temporal;
 mod tiering;
 mod token;
@@ -1405,7 +1400,7 @@ impl interpreter::Interp {
         }
         let result = self
             .with_callback_script_caller(script_caller, |interp| {
-                interp.call_callback(func.clone(), this, args)
+                interp.call_callback(*func, this, args)
             })
             .map_err(|abrupt| match abrupt {
                 interpreter::Abrupt::Throw(value) => EvalFailure::Throw(value),
@@ -1648,7 +1643,7 @@ impl Engine {
     /// Define `globalThis.<name>` as a native function (non-enumerable, like built-ins).
     pub fn define_global(&mut self, name: &str, len: usize, f: embed::NativeFn) {
         self.interp.activate_gc_heap();
-        let global = self.interp.global.clone();
+        let global = self.interp.global;
         self.interp.def_scoped_method(&global, name, len, f);
     }
 

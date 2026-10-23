@@ -59,7 +59,7 @@ fn object_literal_builders_have_real_native_entries() {
         "numericLiteral",
         "protoLiteral",
     ] {
-        let global = Value::Obj(engine.interp.global.clone());
+        let global = Value::Obj(engine.interp.global);
         let function = engine
             .interp
             .get_member_key(&global, name)

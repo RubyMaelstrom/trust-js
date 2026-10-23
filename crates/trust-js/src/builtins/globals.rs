@@ -173,10 +173,10 @@ pub(super) fn install_globals(it: &mut Interp) {
                 }
             }
         };
-        let env = i.global_env.clone();
+        let env = i.global_env;
         ab(i.perform_eval(&code, &env, false))
     });
-    set_builtin(&it.global, "eval", Value::Obj(eval_fn.clone()));
+    set_builtin(&it.global, "eval", Value::Obj(eval_fn));
     it.eval_fn = Some(eval_fn);
 }
 

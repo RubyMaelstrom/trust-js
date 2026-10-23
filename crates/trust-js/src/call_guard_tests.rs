@@ -16,7 +16,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let ValueView::Obj(object) = (engine
         .interp
         .get_var(name, &env)
@@ -149,7 +149,7 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
     );
     let leaf = object(&mut engine, "realmLeaf");
     let driver = chunk(&mut engine, "realmDrive");
-    let old_environment = engine.interp.global_env.clone();
+    let old_environment = engine.interp.global_env;
     let previous = driver
         .cached_call_for(Gc::as_ptr(&leaf) as usize)
         .expect("initial same-Realm cache fill");
@@ -316,16 +316,12 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
         assert_eq!(eval(&mut engine, &source), "56", "{tier:?}");
         let deep = object(&mut engine, "deep");
         let mut current = match &deep.borrow().call {
-            Callable::User(user) => user.env.clone(),
+            Callable::User(user) => user.env,
             _ => panic!("deep user closure"),
         };
         let mut depth = 0;
         while !crate::interpreter::Env::ptr_eq(&current, &engine.interp.global_env) {
-            let next = current
-                .borrow()
-                .parent
-                .clone()
-                .expect("global root retained");
+            let next = current.borrow().parent.expect("global root retained");
             current = next;
             depth += 1;
         }

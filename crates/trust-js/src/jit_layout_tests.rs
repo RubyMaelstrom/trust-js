@@ -65,7 +65,7 @@ fn entries_of(layout: &JitLayout) -> JitVecLayout {
 
 fn global(engine: &mut crate::Engine, source: &str, name: &str) -> Gc {
     engine.eval(source, false).expect("fixture parses");
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine.interp.get_var(name, &env).ok().expect("bound name");
     let ValueView::Obj(object) = (value).view() else {
         panic!("{name} is an object")
@@ -116,7 +116,7 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
     let mut engine = crate::Engine::new();
     let layout = probe(&engine);
     let proto = Object::new(None);
-    let object = Object::new(Some(proto.clone()));
+    let object = Object::new(Some(proto));
     object
         .borrow_mut()
         .props
@@ -275,7 +275,7 @@ fn scope_offsets_read_generation_parent_and_bindings() {
             assert!(layout.binding_value + 8 <= std::mem::size_of::<Binding>());
             assert_eq!(
                 read::<u64>(binding, layout.binding_value),
-                live.word().bits()
+                live.value().bits()
             );
             for flag in [
                 layout.binding_init,
@@ -297,7 +297,7 @@ fn scope_offsets_read_generation_parent_and_bindings() {
     );
     // One binding stays in the environment cell; more spill; past eight the map is Large.
     for count in [1usize, 2, 5, 9] {
-        let env = new_scope(Some(parent.clone()));
+        let env = new_scope(Some(parent));
         for slot in 0..count {
             env.borrow_mut().vars.insert(
                 format!("b{slot}"),
@@ -360,10 +360,7 @@ fn scope_offsets_read_generation_parent_and_bindings() {
     ] {
         env.borrow_mut().set_with_object(Some(value));
         assert!(env.borrow().has_with_object());
-        assert_eq!(
-            read::<u64>(base, layout.scope_with),
-            crate::value::PackedValue::pack(value).bits()
-        );
+        assert_eq!(read::<u64>(base, layout.scope_with), (value).bits());
         assert_ne!(read::<u64>(base, layout.scope_with), layout.scope_with_none);
     }
     env.borrow_mut().set_with_object(None);

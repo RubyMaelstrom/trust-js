@@ -242,7 +242,7 @@ fn compiled_script_uses_global_environment_this_value_not_property_object() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
-        let wrapper = Object::new(Some(engine.interp.object_proto.clone()));
+        let wrapper = Object::new(Some(engine.interp.object_proto));
         wrapper
             .borrow_mut()
             .props

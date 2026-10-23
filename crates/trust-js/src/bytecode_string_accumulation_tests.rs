@@ -44,7 +44,7 @@ fn binding(value: Value) -> Binding {
 }
 
 fn scope(engine: &Engine, value: Value) -> Env {
-    let env = new_scope(Some(engine.interp.global_env.clone()));
+    let env = new_scope(Some(engine.interp.global_env));
     env.borrow_mut()
         .vars
         .insert("result".to_owned(), binding(value));
@@ -62,7 +62,7 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
     let plan = first_plan(&chunk);
     let root = crate::lstr::LStr::from("x".repeat(1024));
     let view = root.slice_bytes(0, 900);
-    let alias = view.clone();
+    let alias = view;
     let env = scope(&engine, Value::Str(view));
     let stored = try_store(&chunk, &mut engine.interp, &env, plan, Value::lstr("!"))
         .expect("ordinary view-backed holder");
@@ -73,7 +73,7 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
     assert_eq!(alias.as_str(), "x".repeat(900));
     assert_eq!(root.as_str(), "x".repeat(1024));
     let old = result(&env);
-    let twice = try_store(&chunk, &mut engine.interp, &env, plan, old.clone()).unwrap();
+    let twice = try_store(&chunk, &mut engine.interp, &env, plan, old).unwrap();
     assert_eq!(
         twice.result.unwrap().as_engine_text().unwrap(),
         format!("{0}!{0}!", "x".repeat(900))
@@ -117,7 +117,7 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
                 .vars
                 .get_mut("result")
                 .unwrap()
-                .set_import_reference(Some((engine.interp.global_env.clone(), "exported".into()))),
+                .set_import_reference(Some((engine.interp.global_env, "exported".into()))),
             4 => env.borrow_mut().set_with_object(Some(Value::Null)),
             5 => {
                 env.borrow_mut().vars.remove("result");
@@ -152,7 +152,7 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
         assert!(try_store(&chunk, &mut engine.interp, &env, plan, right).is_none());
         assert_eq!(result(&env).as_engine_text().unwrap(), "prefix");
     }
-    let mut deep = env.clone();
+    let mut deep = env;
     for _ in 0..MAX_SCOPES {
         deep = new_scope(Some(deep));
     }
@@ -247,7 +247,7 @@ const REACT_CALLBACK: &str = r#"
 
 fn prepare_callback(engine: &mut Engine) -> Rc<Chunk> {
     eval(engine, REACT_CALLBACK);
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine.interp.get_var("push", &env).ok().unwrap();
     let function = {
         let object_handle = value.as_obj().unwrap();
@@ -451,7 +451,7 @@ fn shared_snapshot_native_code_uses_each_realms_live_declarative_holder() {
         .unwrap()
     });
     fn append_function(i: &mut Interp) -> Rc<Function> {
-        let env = i.global_env.clone();
+        let env = i.global_env;
         let value = i.get_var("appendPart", &env).ok().unwrap();
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();
@@ -510,7 +510,7 @@ fn length_denial_preserves_binding_and_throws_at_original_add() {
     let mut state = bytecode::VmCoro::new(
         &mut engine.interp,
         chunk.clone(),
-        holder.clone(),
+        holder,
         Value::Undefined,
         &[Value::lstr("xx")],
         &[],
@@ -576,7 +576,7 @@ fn continuation(engine: &mut Engine) -> (bytecode::VmCoro, Env, Plan) {
     let state = bytecode::VmCoro::new_generator(
         &mut engine.interp,
         chunk,
-        holder.clone(),
+        holder,
         Value::Undefined,
         &[Value::lstr("B")],
         &[],
@@ -636,7 +636,7 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
     let mut state = bytecode::VmCoro::new_generator(
         &mut engine.interp,
         chunk,
-        holder.clone(),
+        holder,
         Value::Undefined,
         &[Value::lstr("B")],
         &[],

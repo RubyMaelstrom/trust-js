@@ -919,7 +919,7 @@ fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
         );
         // The function's handle lives only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
-            let global = crate::value::Value::Obj(engine.interp.global.clone());
+            let global = crate::value::Value::Obj(engine.interp.global);
             let value = engine
                 .interp
                 .eval_in_realm(&global, "victim")
@@ -1676,7 +1676,7 @@ fn arm_deadline(
 }
 
 fn define_arm_deadline(engine: &mut Engine) {
-    let global = engine.interp.global.clone();
+    let global = engine.interp.global;
     engine
         .interp
         .def_method(&global, "armDeadline", 0, arm_deadline);
@@ -3503,7 +3503,7 @@ fn symbol_registry_is_agent_owned_and_shared_by_realms() {
     first
         .eval("Symbol.for('agent-key')", false)
         .expect("first registry insertion parses");
-    let first_symbol = first.interp.symbol_agent.borrow().global_by_key["agent-key"].clone();
+    let first_symbol = first.interp.symbol_agent.borrow().global_by_key["agent-key"];
 
     // Constructing another Engine on the same driver thread must neither clear nor share the
     // first Agent's registry.
@@ -3511,7 +3511,7 @@ fn symbol_registry_is_agent_owned_and_shared_by_realms() {
     second
         .eval("Symbol.for('agent-key')", false)
         .expect("second registry insertion parses");
-    let second_symbol = second.interp.symbol_agent.borrow().global_by_key["agent-key"].clone();
+    let second_symbol = second.interp.symbol_agent.borrow().global_by_key["agent-key"];
     assert!(!crate::value::symbol_ptr_eq(&first_symbol, &second_symbol));
     first
         .eval("Symbol.for('agent-key')", false)
@@ -3789,7 +3789,7 @@ fn function_name_templates_serve_only_their_heap() {
         ["f", "g", "h"]
             .iter()
             .map(|binding| {
-                let global = crate::value::Value::Obj(engine.interp.global.clone());
+                let global = crate::value::Value::Obj(engine.interp.global);
                 let Ok(function) = engine.interp.member_get(&global, binding) else {
                     panic!("binding {binding}");
                 };
@@ -3892,7 +3892,7 @@ fn creation_cache_after_address_reuse(tier: crate::bytecode::Tier) {
          0",
     );
     let cached = crate::gc_test::in_frame(|| {
-        let global = crate::value::Value::Obj(engine.interp.global.clone());
+        let global = crate::value::Value::Obj(engine.interp.global);
         let nt = engine.interp.member_get(&global, "NT").ok().expect("NT");
         let proto = engine
             .interp
@@ -3908,7 +3908,7 @@ fn creation_cache_after_address_reuse(tier: crate::bytecode::Tier) {
     engine.interp.gc_collect();
     let reused = crate::gc_test::in_frame(|| object_at(&mut engine, cached))
         .expect("a new object takes the dead prototype's address");
-    let global = crate::value::Value::Obj(engine.interp.global.clone());
+    let global = crate::value::Value::Obj(engine.interp.global);
     assert!(engine
         .interp
         .member_set(&global, "P2", crate::value::Value::Obj(reused))
@@ -3934,7 +3934,7 @@ fn object_at(
 ) -> Option<crate::value::Gc> {
     let mut held = Vec::new();
     for _ in 0..200_000 {
-        let object = crate::value::Object::new(Some(engine.interp.object_proto.clone()));
+        let object = crate::value::Object::new(Some(engine.interp.object_proto));
         if crate::value::Gc::as_ptr(&object) as usize == address.get() {
             return Some(object);
         }
@@ -7241,10 +7241,9 @@ fn engine_teardown_dismantles_deep_chains_without_recursive_drops() {
         .spawn(|| {
             let mut engine = Engine::new();
             for _ in 0..16_384 {
-                engine.interp.global =
-                    crate::value::Object::new(Some(engine.interp.global.clone()));
+                engine.interp.global = crate::value::Object::new(Some(engine.interp.global));
                 engine.interp.global_env =
-                    crate::interpreter::new_scope(Some(engine.interp.global_env.clone()));
+                    crate::interpreter::new_scope(Some(engine.interp.global_env));
             }
             let heap = std::rc::Rc::downgrade(&engine.interp.gc_heap);
             drop(engine);
@@ -10574,7 +10573,7 @@ fn async_tail_return_survives_leaked_tco() {
     // body forces it off before each statement. Here `__leakTco()` reproduces that leaked state
     // after an `await`, and the following tail-call `return` must still yield its real value.
     let mut e = Engine::new();
-    let global = e.interp.global.clone();
+    let global = e.interp.global;
     e.interp.def_method(&global, "__leakTco", 0, leak_tco);
     e.eval(
         "function id(x){ return x; }\n\
@@ -14553,7 +14552,7 @@ fn loop_free_functions_earn_native_code_through_vm_runs() {
     engine.set_tier_threshold(1);
     engine.interp.jit_admit_runs = 3;
     let chunk_of = |engine: &mut Engine, name: &str| {
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let Ok(value) = engine.interp.get_var(name, &env) else {
             panic!("missing fixture function {name}")
         };
@@ -26585,7 +26584,7 @@ fn compiled_base_class_constructors_preserve_instance_initialization_order() {
             "field,body,field,body|7:1:true:9"
         );
 
-        let global = engine.interp.global_env.clone();
+        let global = engine.interp.global_env;
         let ctor = engine
             .interp
             .get_var("Base", &global)
@@ -26642,7 +26641,7 @@ fn compiled_derived_class_constructors_preserve_super_and_this_binding_semantics
             "before,parent,field,after|3:7:true"
         );
 
-        let global = engine.interp.global_env.clone();
+        let global = engine.interp.global_env;
         let ctor = engine
             .interp
             .get_var("Derived", &global)
@@ -26788,7 +26787,7 @@ fn compiled_try_finally_preserves_every_completion_kind() {
             expected.replace("        ", "")
         );
 
-        let global = engine.interp.global_env.clone();
+        let global = engine.interp.global_env;
         for name in [
             "normal",
             "returning",
@@ -29531,15 +29530,15 @@ fn interp_layout_probes() {
     for value in [
         crate::value::Value::Undefined,
         crate::value::Value::Null,
-        crate::value::Value::Obj(e.interp.global.clone()),
+        crate::value::Value::Obj(e.interp.global),
     ] {
-        e.interp.new_target = crate::value::PackedValue::pack(value);
+        e.interp.new_target = value;
         // Derive the read address after the mutation, rather than retaining provenance from a
         // shared Interp borrow across a later exclusive field write.
         let current = std::ptr::from_ref(&*e.interp) as usize;
-        // SAFETY: the measured offset addresses this live, aligned PackedValue field.
+        // SAFETY: the measured offset addresses this live, aligned Value field.
         let word = unsafe { ((current + l.new_target) as *const u64).read() };
-        assert_eq!(word, crate::value::PackedValue::pack(value).bits());
+        assert_eq!(word, (value).bits());
     }
     e.interp.new_target = saved;
 }
@@ -29791,7 +29790,7 @@ fn object_literal_methods_without_super_do_not_form_cycles() {
                         "{source} for (var i = 0; i < 20; i++) make(); var o = make(); o.m();"
                     ),
                 );
-                let env = engine.interp.global_env.clone();
+                let env = engine.interp.global_env;
                 // The object lives only in this helper frame (the collector scans the stack).
                 let weak = crate::gc_test::in_frame(|| {
                     let value = engine
@@ -29990,7 +29989,7 @@ fn compiled_iteration_records_share_one_published_layout() {
             "function make(){ var fs = []; for (let i = 0; i < 3; i++) { let d = i * 2; \
              fs.push(() => i + d); } return fs; } var fs = make();",
         );
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let fs = engine.interp.get_var("fs", &env).ok().unwrap();
         let layouts: Vec<u32> = (0..3)
             .map(|k| {

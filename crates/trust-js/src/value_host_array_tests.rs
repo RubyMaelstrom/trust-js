@@ -14,7 +14,7 @@ fn host_arrays_preserve_descriptors_at_storage_boundaries() {
         let owner = engine.interp.new_object();
         let array = engine
             .interp
-            .make_array((0..len).map(|_| Value::Obj(owner.clone())).collect());
+            .make_array((0..len).map(|_| Value::Obj(owner)).collect());
         let array_handle = array.as_obj().unwrap();
         let array = array_handle.borrow();
         assert!(Gc::ptr_eq(
@@ -47,7 +47,7 @@ fn host_arrays_keep_holes_getters_length_and_numeric_values_across_tiers() {
         engine.set_tier_threshold(0);
         let held = Value::Obj(engine.interp.new_object());
         let array = engine.interp.make_array(vec![
-            held.clone(),
+            held,
             Value::Num(-0.0),
             Value::Num(f64::NAN),
             Value::lstr("text"),

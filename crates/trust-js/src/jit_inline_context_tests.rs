@@ -16,7 +16,7 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine
         .interp
         .get_var(name, &env)

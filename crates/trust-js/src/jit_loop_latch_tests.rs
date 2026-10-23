@@ -402,7 +402,7 @@ fn loop_latch_repeated_polls_gc_and_deadline_preserve_local_frame_owner() {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);
-    let global = engine.interp.global.clone();
+    let global = engine.interp.global;
     engine
         .interp
         .def_method(&global, "armLatchGc", 1, arm_latch_gc);

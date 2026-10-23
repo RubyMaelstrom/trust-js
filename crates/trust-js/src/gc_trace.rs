@@ -8,7 +8,7 @@
 //! an omitted field; the exhaustive patterns are what close that gap.
 
 use crate::interpreter::Env;
-use crate::value::{Gc, PackedValue, Value};
+use crate::value::{Gc, Value};
 
 /// Receives the strong edges found while tracing roots or cell payloads.
 pub(crate) trait GcSink {
@@ -86,13 +86,6 @@ impl GcTrace for Env {
 impl<T: Copy + GcTrace> GcTrace for std::cell::Cell<T> {
     fn trace_gc(&self, sink: &mut dyn GcSink) {
         self.get().trace_gc(sink);
-    }
-}
-
-impl GcTrace for PackedValue {
-    #[inline]
-    fn trace_gc(&self, sink: &mut dyn GcSink) {
-        self.trace_gc_edges(sink);
     }
 }
 
@@ -195,10 +188,10 @@ impl GcSink for VisitSink<'_> {
 pub(crate) struct VmFrameRoots {
     pub(crate) env: *const Env,
     pub(crate) cap_env: *const Env,
-    pub(crate) slots: *const [std::cell::Cell<PackedValue>],
-    pub(crate) stack: *const crate::execution_storage::ValueStack<PackedValue>,
+    pub(crate) slots: *const [std::cell::Cell<Value>],
+    pub(crate) stack: *const crate::execution_storage::ValueStack,
     pub(crate) references: *const [crate::eval::PreparedReferenceSlot],
-    pub(crate) this_val: *const PackedValue,
+    pub(crate) this_val: *const Value,
     pub(crate) disposal_frames: *const Vec<Vec<crate::interpreter::Disposable>>,
     pub(crate) class_states: *const [Option<crate::eval::PreparedClassEvaluation>],
 }
@@ -351,7 +344,7 @@ pub(crate) fn trace_thread_roots(sink: &mut dyn GcSink) {
     });
 }
 
-impl GcTrace for crate::execution_storage::ValueStack<PackedValue> {
+impl GcTrace for crate::execution_storage::ValueStack {
     fn trace_gc(&self, sink: &mut dyn GcSink) {
         self.raw_slice().trace_gc(sink);
     }

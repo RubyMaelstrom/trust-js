@@ -255,7 +255,7 @@ impl OrderedCollection {
             offset += 1;
             cursor.0.position.set(offset);
             if let Some(entry) = entry {
-                return Some(entry.clone());
+                return Some(*entry);
             }
         }
         None
@@ -591,7 +591,7 @@ mod tests {
         }
         let object = Value::Obj(crate::value::Object::new(None));
         let different = Value::Obj(crate::value::Object::new(None));
-        data.insert(object.clone(), Value::Num(100.0));
+        data.insert(object, Value::Num(100.0));
         assert_eq!(number(data.get(&object).unwrap()), 100);
         assert!(!data.has(&different));
         // Tagging must preserve semantic distinctions even when payloads look
@@ -615,7 +615,7 @@ mod tests {
         let collision = Value::Num(f64::from_bits(0xbe60_db93_9105_4a88));
         assert_eq!(key_hash(&Value::Undefined), key_hash(&collision));
         data.insert(Value::Undefined, Value::Num(1.0));
-        data.insert(collision.clone(), Value::Num(2.0));
+        data.insert(collision, Value::Num(2.0));
         assert_eq!(data.len(), 2);
         assert_eq!(number(data.get(&collision).unwrap()), 2);
         assert!(data.delete(&Value::Undefined));
@@ -648,14 +648,14 @@ mod tests {
             assert_eq!(KEY_HASH_CALLS.with(Cell::get) - before, 1);
         };
         once(&mut || data.insert(Value::Undefined, Value::Num(1.0)));
-        once(&mut || data.insert(collision.clone(), Value::Num(2.0)));
+        once(&mut || data.insert(collision, Value::Num(2.0)));
         let cursor = data.cursor();
         assert!(matches!(
             (data.next(&cursor).unwrap().0).view(),
             ValueView::Undefined
         ));
         // Updating a collision hit must neither append nor advance/rewind live cursors.
-        once(&mut || data.insert(collision.clone(), Value::Num(3.0)));
+        once(&mut || data.insert(collision, Value::Num(3.0)));
         once(&mut || data.insert(Value::Undefined, Value::Num(4.0)));
         assert_eq!(data.len(), 2);
         assert_eq!(number(&data.next(&cursor).unwrap().1), 3);
@@ -687,7 +687,7 @@ mod tests {
         let another_key = Value::lstr(text);
         data.insert(first_key, Value::Num(7.0));
         let before = KEY_HASH_CALLS.with(Cell::get);
-        data.insert(another_key.clone(), Value::Num(8.0));
+        data.insert(another_key, Value::Num(8.0));
         assert_eq!(KEY_HASH_CALLS.with(Cell::get) - before, 1);
         assert_eq!(data.len(), 1);
         assert_eq!(number(data.get(&another_key).unwrap()), 8);

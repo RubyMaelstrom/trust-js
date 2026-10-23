@@ -1,13 +1,13 @@
 //! ARM64 compact execution-word primitives. Canonical local/operand words and a context's return
-//! slot (`ret`), `this`, lexical Binding cells and object data values share PackedValue words.
+//! slot (`ret`), `this`, lexical Binding cells and object data values share Value words.
 //! ECMA-262 §6.1.6.1 (snapshot e28783d5): preserve signed zero/infinities; NaN payload
 //! canonicalization is allowed and prevents numeric bits from aliasing internal tags.
 
 use super::*;
 use crate::value::{PACK_CANON_NAN, PACK_LAZY_PROTO, PACK_OBJ, PACK_SYM, PACK_UNDEFINED};
 
-/// Decode the semantic discriminant (wide Value ABI 0..=8) without acquiring an
-/// owner. Preserve raw, clobber kind/scratch/NZCV, reject property-only tags.
+/// Decode the ValueView semantic discriminant (0..=8). Preserve raw, clobber
+/// kind/scratch/NZCV, reject property-only tags.
 pub(super) fn emit_exec_kind(a: &mut asm::Asm, raw: u32, kind: u32, scratch: u32, slow: usize) {
     assert!(raw != kind && raw != scratch && kind != scratch);
     let object = a.new_label();
@@ -370,7 +370,7 @@ mod tests {
             f64::NEG_INFINITY,
             f64::NAN,
         ] {
-            let raw = PackedValue::pack(Value::Num(number)).bits();
+            let raw = (Value::Num(number)).bits();
             let mut output = u64::MAX;
             assert_eq!(unsafe { run(raw, &mut output) }, 1);
             assert_eq!(output, raw);

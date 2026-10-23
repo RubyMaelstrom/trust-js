@@ -7,7 +7,7 @@
 
 use super::{Abrupt, Interp};
 use crate::feedback::{CurrentPropertyTrace, PropertyOutcome};
-use crate::value::{PackedValue, Property, Value};
+use crate::value::{Property, Value};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -30,7 +30,7 @@ enum BindingGetterProbe {
 /// In particular, a successful data read must not acquire an out-of-line getter
 /// dispatch call or a larger indirect-return buffer merely because getters cache.
 pub(super) struct CachedGet {
-    value: PackedValue,
+    value: Value,
     holder_shape: u32,
     depth: u8,
     array_key_check: bool,
@@ -40,11 +40,11 @@ pub(super) struct CachedGet {
 impl CachedGet {
     #[inline(always)]
     pub(super) fn undefined() -> Self {
-        Self::from_data(PackedValue::pack(Value::Undefined))
+        Self::from_data(Value::Undefined)
     }
 
     #[inline(always)]
-    fn from_data(value: PackedValue) -> Self {
+    fn from_data(value: Value) -> Self {
         Self {
             value,
             holder_shape: 0,
@@ -59,7 +59,7 @@ impl CachedGet {
     #[inline(always)]
     pub(super) fn data(self) -> Option<Value> {
         if self.kind == ReadKind::Data {
-            Some(self.value.into_value())
+            Some(self.value)
         } else {
             None
         }
@@ -68,7 +68,7 @@ impl CachedGet {
     /// Preserve the compact owner on a data hit. An accessor still needs its
     /// original receiver rooted across Call, so return the complete read on a miss.
     #[inline(always)]
-    pub(super) fn packed_data(self) -> Result<PackedValue, Self> {
+    pub(super) fn into_data(self) -> Result<Value, Self> {
         if self.kind == ReadKind::Data {
             Ok(self.value)
         } else {
@@ -88,7 +88,7 @@ impl Interp {
         array_key_check: bool,
     ) -> Option<CachedGet> {
         if !property.accessor() {
-            return Some(CachedGet::from_data(property.clone_value_packed()));
+            return Some(CachedGet::from_data(property.value()));
         }
         self.snapshot_cached_accessor(property, name, holder_shape, depth, array_key_check)
     }
@@ -115,7 +115,7 @@ impl Interp {
             ReadKind::MissingGetter
         };
         Some(CachedGet {
-            value: PackedValue::pack(getter.unwrap_or(Value::Undefined)),
+            value: (getter.unwrap_or(Value::Undefined)),
             holder_shape,
             depth,
             array_key_check,
@@ -131,7 +131,7 @@ impl Interp {
         trace: Option<&mut CurrentPropertyTrace>,
     ) -> Result<Value, Abrupt> {
         if read.kind == ReadKind::Data {
-            Ok(read.value.into_value())
+            Ok(read.value)
         } else {
             self.finish_cached_accessor(read, receiver, trace)
         }
@@ -156,14 +156,14 @@ impl Interp {
         if read.kind == ReadKind::MissingGetter {
             Ok(Value::Undefined)
         } else {
-            let getter = read.value.into_value();
+            let getter = read.value;
             if let Some(value) = self.try_binding_getter(&getter) {
                 return Ok(value);
             }
             if let Some(result) = self.try_record_getter(&getter, receiver) {
                 return result;
             }
-            self.call_callback(getter, receiver.clone(), &[])
+            self.call_callback(getter, *receiver, &[])
         }
     }
 
@@ -210,7 +210,7 @@ impl Interp {
         if let Some(result) = self.try_record_getter(&getter, receiver) {
             return Some(result);
         }
-        Some(self.call_callback(getter, receiver.clone(), &[]))
+        Some(self.call_callback(getter, *receiver, &[]))
     }
 
     /// A getter whose entire body is `return <identifier>` — the export accessors module
@@ -373,7 +373,7 @@ impl Interp {
         // Rewalk the proven path to take weak guards and the live Binding/value snapshot;
         // there is still no callout or possible mutation between the two traversals.
         let mut scopes = Vec::with_capacity(scope_count);
-        let mut env = start.clone();
+        let mut env = *start;
         let mut binding_ptr = std::ptr::null();
         let mut value = None;
         for index in 0..scope_count {
@@ -398,7 +398,7 @@ impl Interp {
                 value = Some(binding.value());
                 break;
             }
-            let parent = scope.parent.as_ref()?.clone();
+            let parent = *scope.parent.as_ref()?;
             drop(scope);
             env = parent;
         }

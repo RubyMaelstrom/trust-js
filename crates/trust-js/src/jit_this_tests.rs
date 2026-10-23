@@ -44,7 +44,7 @@ fn with_chunk<R>(
     name: &str,
     f: impl FnOnce(&crate::bytecode::Chunk) -> R,
 ) -> R {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine.interp.get_var(name, &env).ok().expect("bound name");
     let object_handle = value.as_obj().expect("a function object");
     let object = object_handle.borrow();

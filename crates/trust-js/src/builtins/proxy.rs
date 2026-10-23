@@ -13,7 +13,7 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
         ));
     }
     let proto = match &(target).view() {
-        ValueView::Obj(o) => o.borrow().proto.clone(),
+        ValueView::Obj(o) => o.borrow().proto,
         _ => None,
     };
     let obj = Object::new(proto);
@@ -54,7 +54,7 @@ pub(super) fn install_proxy(it: &mut Interp) {
     ctor.borrow_mut().is_constructor = true; // Proxy is a constructor but has no `.prototype`
     it.def_method(&ctor, "revocable", 2, |i, _t, a| {
         let proxy = make_proxy(i, arg(a, 0), arg(a, 1))?;
-        let revoke = make_bound(i, revoke_proxy, vec![proxy.clone()]);
+        let revoke = make_bound(i, revoke_proxy, vec![proxy]);
         // The revocation function has own `length` (0) then `name` ("") like a built-in function.
         if let ValueView::Obj(ro) = &(revoke).view() {
             ro.borrow_mut().props.insert(

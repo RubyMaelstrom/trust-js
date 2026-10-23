@@ -27,7 +27,7 @@ fn check_all_tiers(source: &str, native_functions: &[&str]) {
             ))
         {
             for name in native_functions {
-                let env = engine.interp.global_env.clone();
+                let env = engine.interp.global_env;
                 let function = engine
                     .interp
                     .get_var(name, &env)

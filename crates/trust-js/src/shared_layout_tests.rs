@@ -16,7 +16,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let ValueView::Obj(object) = (engine
         .interp
         .get_var(name, &env)

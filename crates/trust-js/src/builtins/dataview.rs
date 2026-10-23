@@ -258,8 +258,8 @@ fn dv_set_big(i: &mut Interp, this: &Value, args: &[Value]) -> Result<Value, Val
 }
 
 pub(super) fn install_dataview(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("DataView", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("DataView", proto);
     // buffer / byteLength / byteOffset are brand-checked accessor getters; byteLength/byteOffset
     // additionally throw if the backing buffer has been detached.
     for (name, getter) in [
@@ -353,7 +353,7 @@ pub(super) fn install_dataview(it: &mut Interp) {
                     .internal_slots()
                     .contains("#\u{0}abMaxByteLength") =>
             {
-                (Value::Obj(o.clone()), Gc::as_ptr(&o) as usize)
+                (Value::Obj(o), Gc::as_ptr(&o) as usize)
             }
             _ => return Err(i.make_error("TypeError", "DataView requires an ArrayBuffer")),
         };
@@ -428,12 +428,12 @@ pub(super) fn install_dataview(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     set_builtin(&it.global, "DataView", Value::Obj(ctor));
 }
 

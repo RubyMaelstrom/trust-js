@@ -12,11 +12,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         }
         let key = ab(i.to_property_key(&arg(a, 1)))?;
         // Reflect.get(target, key, receiver) — the receiver is the third argument.
-        let receiver = if a.len() > 2 {
-            arg(a, 2)
-        } else {
-            target.clone()
-        };
+        let receiver = if a.len() > 2 { arg(a, 2) } else { target };
         reflect_ordinary_get(i, &target, &key, &receiver)
     });
     it.def_method(&r, "set", 3, |i, _t, a| {
@@ -34,19 +30,15 @@ pub(super) fn install_reflect(it: &mut Interp) {
             }
             let trap = ab(i.get_member_key(&handler, "set"))?;
             if trap.is_callable() {
-                let receiver = if a.len() > 3 {
-                    arg(a, 3)
-                } else {
-                    target.clone()
-                };
+                let receiver = if a.len() > 3 { arg(a, 3) } else { target };
                 let res = ab(i.call(
                     trap,
                     handler,
                     &[
-                        ptarget.clone(),
+                        ptarget,
                         i.sym_from_key(&key)
                             .unwrap_or_else(|| crate::value::string_key_value(key.as_str())),
-                        value.clone(),
+                        value,
                         receiver,
                     ],
                 ))?;
@@ -59,22 +51,14 @@ pub(super) fn install_reflect(it: &mut Interp) {
             // Missing/undefined trap: forward to the target's [[Set]] with the original receiver,
             // returning its actual success boolean. [[Set]] reports failure as `false` (never a strict
             // PutValue throw), so evaluate it in a non-strict context.
-            let receiver = if a.len() > 3 {
-                arg(a, 3)
-            } else {
-                target.clone()
-            };
+            let receiver = if a.len() > 3 { arg(a, 3) } else { target };
             let saved = i.strict;
             i.strict = false;
             let r = i.set_member_recv(&ptarget, &key, value, receiver);
             i.strict = saved;
             return Ok(Value::Bool(ab(r)?));
         }
-        let receiver = if a.len() > 3 {
-            arg(a, 3)
-        } else {
-            target.clone()
-        };
+        let receiver = if a.len() > 3 { arg(a, 3) } else { target };
         Ok(Value::Bool(reflect_ordinary_set(
             i, &target, &key, value, &receiver,
         )?))
@@ -107,7 +91,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         let key = ab(i.to_property_key(&arg(a, 1)))?;
         if let ValueView::Obj(o) = (arg(a, 0)).view() {
             ab(i.defer_trigger(&o, Some(&key)))?;
-            if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+            if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
                 return Ok(Value::Bool(ab(i.proxy_delete(target, handler, &key))?));
             }
             if matches!(o.borrow().exotic, Exotic::Arguments) {
@@ -157,14 +141,10 @@ pub(super) fn install_reflect(it: &mut Interp) {
     it.def_method(&r, "getPrototypeOf", 1, |i, _t, a| {
         match (arg(a, 0)).view() {
             ValueView::Obj(o) => {
-                if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
-                    return js_get_prototype_of(i, &Value::Obj(o.clone()));
+                if proxy_pair(i, &Value::Obj(o)).is_some() {
+                    return js_get_prototype_of(i, &Value::Obj(o));
                 }
-                Ok(o.borrow()
-                    .proto
-                    .clone()
-                    .map(Value::Obj)
-                    .unwrap_or(Value::Null))
+                Ok(o.borrow().proto.map(Value::Obj).unwrap_or(Value::Null))
             }
             _ => Err(i.make_error("TypeError", "Reflect.getPrototypeOf called on non-object")),
         }
@@ -186,7 +166,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             _ => return Err(i.make_error("TypeError", "Reflect.defineProperty on non-object")),
         };
         let key = ab(i.to_property_key(&arg(a, 1)))?;
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
             return Ok(Value::Bool(ab(proxy_define_property(
                 i,
                 &target,
@@ -212,11 +192,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             ));
         }
         let args = create_list_from_array_like(i, &arg(a, 1))?;
-        let new_target = if a.len() >= 3 {
-            arg(a, 2)
-        } else {
-            target.clone()
-        };
+        let new_target = if a.len() >= 3 { arg(a, 2) } else { target };
         ab(i.construct_nt(target, &args, new_target))
     });
     it.def_method(&r, "isExtensible", 1, |i, _t, a| {

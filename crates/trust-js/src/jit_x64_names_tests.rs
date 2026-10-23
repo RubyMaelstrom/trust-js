@@ -67,7 +67,7 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
     ];
     let holder = scope(None, "outer", 11.0, layouts[0]);
     let child = scope(
-        Some(scope(Some(holder.clone()), "middle", 0.0, layouts[1])),
+        Some(scope(Some(holder), "middle", 0.0, layouts[1])),
         "local",
         0.0,
         layouts[2],
@@ -77,7 +77,7 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
     assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 11.0);
     let other = scope(None, "outer", 29.0, layouts[0]);
     let fresh = scope(
-        Some(scope(Some(other.clone()), "middle", 0.0, layouts[1])),
+        Some(scope(Some(other), "middle", 0.0, layouts[1])),
         "local",
         0.0,
         layouts[2],
@@ -181,7 +181,7 @@ fn native_deep_globals_load_store_and_all_numeric_update_kinds() {
     engine.eval("var outer=0;", false).unwrap();
     let (chunk, code) = compile(&mut engine,
         "function f(){outer=10;let a=outer++;let b=++outer;let c=outer--;let d=--outer;outer++;outer--;return a+b+c+d+outer;}");
-    let child = new_scope(Some(new_scope(Some(engine.interp.global_env.clone()))));
+    let child = new_scope(Some(new_scope(Some(engine.interp.global_env))));
     assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 54.0);
     let before = TEST_NATIVE_NAME_OPS.with(std::cell::Cell::get);
     assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 54.0);
@@ -251,7 +251,7 @@ fn native_name_store_rejects_internal_words_before_target_stack_or_card_commit()
         (crate::value::PACK_LAZY_PROTO | 0x5a5a, false),
         (0xffff_0000_0000_0000, false),
     ] {
-        // Raw byte/word buffers deliberately avoid constructing an invalid PackedValue.
+        // Raw byte/word buffers deliberately avoid constructing an invalid Value.
         let mut target = [11.0f64.to_bits(), 0x55aa_55aa_55aa_55aa];
         let mut operands = [0x1122_3344_5566_7788, incoming, 0x8877_6655_4433_2211];
         let original_target = target;
@@ -286,8 +286,8 @@ fn native_name_import_mutability_and_parent_changes_stay_live() {
     let mut engine = Engine::new();
     let (chunk, code) = compile(&mut engine, "function f(){return outer;}");
     let holder = scope(None, "outer", 1.0, new_binding_layout_id());
-    let middle = new_scope(Some(holder.clone()));
-    let child = new_scope(Some(middle.clone()));
+    let middle = new_scope(Some(holder));
+    let child = new_scope(Some(middle));
     assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 1.0);
     assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 1.0);
     let exporter = scope(None, "source", 23.0, new_binding_layout_id());
@@ -296,7 +296,7 @@ fn native_name_import_mutability_and_parent_changes_stay_live() {
         .vars
         .get_mut("outer")
         .unwrap()
-        .set_import_reference(Some((exporter.clone(), "source".into())));
+        .set_import_reference(Some((exporter, "source".into())));
     assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 23.0);
     exporter
         .borrow_mut()

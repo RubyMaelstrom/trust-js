@@ -288,7 +288,7 @@ fn direct_regexp_exec(i: &Interp, this: &Value) -> Option<(Gc, std::rc::Rc<crate
         return None;
     }
     drop(b);
-    Some((obj.clone(), re))
+    Some((*obj, re))
 }
 
 /// The second (flags) argument to RegExp / RegExp.prototype.compile: undefined → "", else ToString.
@@ -306,8 +306,8 @@ fn regexp_flags_arg(i: &mut Interp, a: &[Value]) -> Result<String, Value> {
 }
 
 pub(super) fn install_regexp(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("RegExp", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("RegExp", proto);
     // source/flags/global/... accessor getters (computed from the matcher).
     let add_getter = |it: &mut Interp, proto: &Gc, name: &str, f: NativeFn| {
         let g = it.make_native(&format!("get {name}"), 0, f);
@@ -487,16 +487,16 @@ pub(super) fn install_regexp(it: &mut Interp) {
         };
         ab(i.make_regexp_with_proto(&source, &flags, alloc_proto))
     });
-    Rc::make_mut(&mut it.extra_protos).insert("%RegExpCtor%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%RegExpCtor%", ctor);
     install_regexp_legacy_statics(it, &ctor);
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     install_species(it, &ctor);
     // The split paths prove the splitter's species lookup inert by this getter's identity: its
     // trivial native body may share an address with other functions, so it cannot be recognized
@@ -505,7 +505,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
         match (ctor.borrow().props.get(&key).and_then(Property::getter))
             .map(|__value| (__value).view())
         {
-            Some(ValueView::Obj(getter)) => Some(getter.clone()),
+            Some(ValueView::Obj(getter)) => Some(getter),
             _ => None,
         }
     });
@@ -706,13 +706,13 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     // Rooted across later exec calls (I1).
     let mut results = crate::rooting::RootedVec::new();
     loop {
-        let result = regexp_exec_abstract(i, &this, s.clone())?;
+        let result = regexp_exec_abstract(i, &this, s)?;
         if matches!((result).view(), ValueView::Null) {
             break;
         }
         let m0 = ab(i.get_member_key(&result, "0"))?;
         let match_str = ab(i.to_string(&m0))?;
-        results.push(Value::Str(match_str.clone()));
+        results.push(Value::Str(match_str));
         if match_str.is_empty() {
             let li = ab(i.get_member_key(&this, "lastIndex"))?;
             let li = to_length_val(i, &li)?;
@@ -955,11 +955,11 @@ fn re_sym_replace_impl(
     // The results stay rooted through later exec calls and the replacement pass (I1).
     let mut results = crate::rooting::RootedVec::new();
     loop {
-        let result = regexp_exec_abstract(i, &this, s.clone())?;
+        let result = regexp_exec_abstract(i, &this, s)?;
         if matches!((result).view(), ValueView::Null) {
             break;
         }
-        results.push(result.clone());
+        results.push(result);
         if !global {
             break;
         }
@@ -1020,14 +1020,14 @@ fn re_sym_replace_impl(
             }
         }
         let replacement = if functional {
-            let mut cbargs = vec![Value::Str(matched.clone())];
+            let mut cbargs = vec![Value::Str(matched)];
             cbargs.extend(captures.iter().cloned());
             cbargs.push(Value::Num(position as f64));
-            cbargs.push(Value::Str(s.clone()));
+            cbargs.push(Value::Str(s));
             if !matches!((named).view(), ValueView::Undefined) {
-                cbargs.push(named.clone());
+                cbargs.push(named);
             }
-            let r = ab(i.call(repl.clone(), Value::Undefined, &cbargs))?;
+            let r = ab(i.call(repl, Value::Undefined, &cbargs))?;
             ab(i.to_string(&r))?.to_string()
         } else {
             get_substitution(i, &matched, &sunits, position, &captures, &named, &repl_str)?
@@ -1118,7 +1118,7 @@ fn re_sym_replace_direct(
         }
     }
     if matches.is_empty() {
-        return Ok(Value::Str(s.clone()));
+        return Ok(Value::Str(*s));
     }
     let substitutes = replacer.is_none() && template.contains('$');
     let sunits = if substitutes {
@@ -1144,12 +1144,12 @@ fn re_sym_replace_direct(
             args.push(Value::Str(text.slice_lstr(start, end)));
             args.extend(captures());
             args.push(Value::Num(position as f64));
-            args.push(Value::Str(s.clone()));
+            args.push(Value::Str(*s));
             let groups = regexp_groups(i, re, caps, &text);
             if !matches!((groups).view(), ValueView::Undefined) {
                 args.push(groups);
             }
-            let result = ab(i.call(function.clone(), Value::Undefined, &args))?;
+            let result = ab(i.call(*function, Value::Undefined, &args))?;
             ab(i.to_string(&result))?
         } else if substitutes {
             let captures = captures();
@@ -1157,7 +1157,7 @@ fn re_sym_replace_direct(
             let matched = text.slice(start, end);
             get_substitution(i, &matched, &sunits, position, &captures, &named, template)?.into()
         } else {
-            template.clone()
+            *template
         };
         if start >= next {
             text.push_slice(&mut out, next, start);
@@ -1284,7 +1284,7 @@ fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
     let c = species_constructor(i, &this, &default_ctor)?;
     let flags_v = ab(i.get_member_key(&this, "flags"))?;
     let flags = ab(i.to_string(&flags_v))?;
-    let matcher = ab(i.construct(c, &[this.clone(), Value::Str(flags.clone())]))?;
+    let matcher = ab(i.construct(c, &[this, Value::Str(flags)]))?;
     let li_v = ab(i.get_member_key(&this, "lastIndex"))?;
     let last = to_length_val(i, &li_v)?;
     ab(i.set_member_key(&matcher, "lastIndex", Value::Num(last as f64)))?;
@@ -1307,9 +1307,9 @@ fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
 fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Regex>> {
     let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr)?.clone();
-    let proto = i.extra_protos.get("RegExp")?.clone();
-    let ctor = i.extra_protos.get("%RegExpCtor%")?.clone();
-    let species_getter = i.extra_protos.get("%RegExpSpeciesGetter%")?.clone();
+    let proto = *i.extra_protos.get("RegExp")?;
+    let ctor = *i.extra_protos.get("%RegExpCtor%")?;
+    let species_getter = *i.extra_protos.get("%RegExpSpeciesGetter%")?;
     let species_key = well_known_key(i, "species")?;
     let match_key = well_known_key(i, "match")?;
     {
@@ -1437,7 +1437,7 @@ fn split_direct(
         if let Some(caps) = regexp_match_result(i, matched)? {
             update_regexp_legacy_statics(i, &search, &caps, &text, s);
         } else {
-            parts.push(Value::Str(s.clone()));
+            parts.push(Value::Str(*s));
         }
         return Ok(i.make_array(parts));
     }
@@ -1603,7 +1603,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     } else {
         format!("{flags}y")
     };
-    let splitter = ab(i.construct(c, &[this.clone(), Value::lstr(new_flags)]))?;
+    let splitter = ab(i.construct(c, &[this, Value::lstr(new_flags)]))?;
     // ToUint32 wraps modulo 2^32 over the whole Number range: -1 is 2^32 - 1, 2^32 is 0.
     let limit = {
         let __value_match_original = arg(a, 1);
@@ -1621,7 +1621,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         return Ok(i.make_array(out.into_vec()));
     }
     if size == 0 {
-        let z = regexp_exec_abstract(i, &splitter, s.clone())?;
+        let z = regexp_exec_abstract(i, &splitter, s)?;
         if !matches!((z).view(), ValueView::Null) {
             return Ok(i.make_array(out.into_vec()));
         }
@@ -1632,7 +1632,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     let mut q = 0usize;
     while q < size {
         ab(i.set_member_key(&splitter, "lastIndex", Value::Num(q as f64)))?;
-        let z = regexp_exec_abstract(i, &splitter, s.clone())?;
+        let z = regexp_exec_abstract(i, &splitter, s)?;
         if matches!((z).view(), ValueView::Null) {
             q = advance_string_index(q, &s, unicode);
             continue;

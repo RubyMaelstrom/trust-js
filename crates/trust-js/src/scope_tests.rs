@@ -95,7 +95,7 @@ fn scoped_values_are_the_engine_values() {
             value_in(cx, "({})").into_internal(),
         ];
         for value in &internal {
-            let scoped = Value::from_internal(value.clone());
+            let scoped = Value::from_internal(*value);
             assert_eq!(std::mem::size_of_val(value), 8);
             assert_eq!(std::mem::size_of_val(&scoped), 8);
             let (a, b) = (
@@ -464,7 +464,7 @@ fn bare_scoped_native_keeps_its_signature_in_native_and_prepared_caches() {
         return;
     }
     use crate::bytecode::{CallIc, CallSite, CALL_IC_SCOPED_NATIVE};
-    use crate::value::{Callable, PackedValue, Value as Internal};
+    use crate::value::{Callable, Value as Internal};
     let mut engine = Engine::new();
     engine.set_tier(crate::bytecode::Tier::Jit);
     engine.set_tier_threshold(0);
@@ -556,7 +556,7 @@ fn bare_scoped_native_keeps_its_signature_in_native_and_prepared_caches() {
         .interp
         .prepare_call(&site, &callable)
         .expect("typed preparation");
-    let this = PackedValue::pack(Internal::Undefined);
+    let this = Internal::Undefined;
     for argument in [
         Internal::Undefined,
         Internal::Null,
@@ -565,7 +565,7 @@ fn bare_scoped_native_keeps_its_signature_in_native_and_prepared_caches() {
         Internal::Num(f64::NAN),
     ] {
         // Both the normal cache hit and a prepared call must preserve the actual signature.
-        let arguments = [PackedValue::pack(argument)];
+        let arguments = [(argument)];
         let normal = unsafe {
             engine
                 .interp
@@ -580,7 +580,7 @@ fn bare_scoped_native_keeps_its_signature_in_native_and_prepared_caches() {
                 .call_prepared(&prepared, &this, arguments.as_ptr(), 1)
         }
         .unwrap_or_else(|_| panic!("prepared return"));
-        assert_eq!(prepared_result.into_value().bits(), argument.bits());
+        assert_eq!(prepared_result.bits(), argument.bits());
     }
     assert_ne!(entry.callee, CallIc::EMPTY.callee);
 }
@@ -623,14 +623,12 @@ fn empty_bare<'s>(
 
 #[test]
 fn bare_scoped_empty_is_undefined_in_inputs_outputs_forwarding_and_handles() {
-    use crate::value::{
-        Callable, NativeCallable, NativeCallableBody, PackedValue, Value as Internal,
-    };
+    use crate::value::{Callable, NativeCallable, NativeCallableBody, Value as Internal};
     let mut engine = Engine::new();
     let function = std::hint::black_box(empty_bare as crate::embed::NativeFn);
-    let this = PackedValue::pack(Internal::Empty);
+    let this = Internal::Empty;
     for count in [1, 2] {
-        let arguments = vec![PackedValue::pack(Internal::Empty); count];
+        let arguments = vec![Internal::Empty; count];
         let result = unsafe {
             engine.interp.call_native_address_committed(
                 function as usize,
@@ -714,7 +712,7 @@ fn bare_scoped_empty_is_undefined_in_inputs_outputs_forwarding_and_handles() {
 #[test]
 fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
     use crate::gc_core::CollectionKind;
-    use crate::value::{PackedValue, Value as Internal};
+    use crate::value::Value as Internal;
     #[derive(Clone)]
     struct Expected {
         address: usize,
@@ -862,7 +860,7 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
         .def_method(&global, "loanTailCollect", 0, tail_collect);
     let queue = std::hint::black_box(queue_tail as crate::embed::NativeFn);
     let function = std::hint::black_box(check as crate::embed::NativeFn);
-    let this = PackedValue::pack(Internal::Undefined);
+    let this = Internal::Undefined;
     for count in [0, 1, 4, 5, 64] {
         let seeds = crate::rooting::RootedVec::from_vec(vec![
             Internal::Obj(engine.interp.new_object()),
@@ -892,7 +890,7 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
             weak: weak.clone(),
             calls: 0,
         });
-        let words = crate::execution_storage::words_from_values(&arguments);
+        let words = &arguments;
         let result = unsafe {
             engine.interp.call_native_address_committed(
                 function as usize,
@@ -924,7 +922,7 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
                 queue as usize,
                 crate::bytecode::CALL_IC_SCOPED_NATIVE,
                 &this,
-                arguments.as_ptr().cast::<PackedValue>(),
+                arguments.as_ptr(),
                 arguments.len(),
             )
         }

@@ -54,7 +54,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                     'ready'
                     "#,
                     );
-                    let old = i.global_env.clone();
+                    let old = i.global_env;
                     {
                         let record = old.borrow();
                         let binding = record.vars.get("this").expect("global this binding");
@@ -117,7 +117,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                 assert!(engine.interp.realms.contains_key(&realm_key), "{tier:?}");
                 assert!(weak_global.strong_count() != 0, "{tier:?}");
                 assert!(old_environment.strong_count() != 0, "{tier:?}");
-                let active = engine.interp.global_env.clone();
+                let active = engine.interp.global_env;
                 let closure = engine
                     .interp
                     .get_var("heldOldClosure", &active)
@@ -137,13 +137,13 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                 );
                 let array = engine
                     .interp
-                    .call(closure.clone(), Value::Undefined, &[Value::Num(0.0)])
+                    .call(closure, Value::Undefined, &[Value::Num(0.0)])
                     .ok()
                     .expect("old closure returns array");
                 assert_eq!(prototype_identity(&array), array_proto.as_ptr() as usize);
                 let instance = engine
                     .interp
-                    .construct(constructor.clone(), &[Value::Num(0.0)])
+                    .construct(constructor, &[Value::Num(0.0)])
                     .ok()
                     .expect("old constructor builds instance");
                 assert_eq!(

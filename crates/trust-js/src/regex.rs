@@ -2059,7 +2059,7 @@ impl ReText {
                 parent.subject_shape
             },
             unicode: parent.unicode,
-            ascii_src: ascii.then(|| source.clone()),
+            ascii_src: ascii.then_some(*source),
             parent: (!ascii).then_some(parent),
             elem_base: first,
             unit_base: start,
@@ -2087,7 +2087,7 @@ impl ReText {
                 n_elems: s.len(),
                 subject_shape: SUBJECT_ASCII,
                 unicode,
-                ascii_src: Some(s.clone()),
+                ascii_src: Some(*s),
                 parent: None,
                 elem_base: 0,
                 unit_base: 0,
@@ -2095,7 +2095,7 @@ impl ReText {
         }
         // Keep the engine string itself: `LStr::clone` copies a handle, and its immutable
         // bytes can be matched and sliced directly.
-        Self::build(unicode, s, Some(s.clone()))
+        Self::build(unicode, s, Some(*s))
     }
 
     fn build(unicode: bool, s: &str, src: Option<crate::lstr::LStr>) -> ReText {

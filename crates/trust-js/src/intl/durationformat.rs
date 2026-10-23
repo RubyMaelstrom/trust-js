@@ -507,7 +507,7 @@ fn partition(
                 Some(sd) if !(value == 0.0 && value.is_sign_negative()) => Value::lstr(sd.clone()),
                 _ => Value::Num(value),
             };
-            let parts_arr = ab(i.call(ftp, nf.clone(), &[nf_arg]))?;
+            let parts_arr = ab(i.call(ftp, nf, &[nf_arg]))?;
             // Read the {type,value} objects into (type,value,unit=singular) parts.
             let len = ab(i.get_member_key(&parts_arr, "length"))?;
             let len = if let ValueView::Num(n) = (len).view() {

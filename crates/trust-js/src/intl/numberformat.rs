@@ -170,8 +170,8 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
         }
         let f = i.make_native("", 1, |i, that, a| format_number(i, &that, &arg(a, 0)));
         // Bind `this` = the (possibly unwrapped) NumberFormat instance.
-        let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o.clone()));
-        set_internal_slot(&o, "#\u{0}nf_boundformat", bound.clone());
+        let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o));
+        set_internal_slot(&o, "#\u{0}nf_boundformat", bound);
         Ok(bound)
     });
     proto.borrow_mut().props.insert(
@@ -184,7 +184,7 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
 /// spec's `format`/`compare` bound functions: name `""`, length 1, and not a constructor.
 pub(crate) fn bind_this(i: &mut Interp, target: Value, this_arg: Value) -> Value {
     if let Ok(bindfn) = i.get_member_key(&target, "bind") {
-        if let Ok(bound) = i.call(bindfn, target.clone(), &[this_arg]) {
+        if let Ok(bound) = i.call(bindfn, target, &[this_arg]) {
             if let ValueView::Obj(o) = &(bound).view() {
                 o.borrow_mut().is_constructor = false;
                 o.borrow_mut().props.insert(

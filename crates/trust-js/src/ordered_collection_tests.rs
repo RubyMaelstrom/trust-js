@@ -233,7 +233,7 @@ fn ordered_collection_iterator_gc_edges_and_exhaustion_release() {
         .unwrap();
     // Strong handles live only in this helper frame (the collector scans the stack).
     let weak = crate::gc_test::in_frame(|| {
-        let global = Value::Obj(engine.interp.global.clone());
+        let global = Value::Obj(engine.interp.global);
         let value = engine
             .interp
             .member_get(&global, "collection")
@@ -266,7 +266,7 @@ fn ordered_collection_iterator_cycle_is_collectable() {
     engine.eval("var collection = new Map(); var iterator = collection.values(); collection.set(iterator, iterator);", false).unwrap();
     // Strong handles live only in this helper frame (the collector scans the stack).
     let weak = crate::gc_test::in_frame(|| {
-        let global = Value::Obj(engine.interp.global.clone());
+        let global = Value::Obj(engine.interp.global);
         let value = engine
             .interp
             .member_get(&global, "collection")

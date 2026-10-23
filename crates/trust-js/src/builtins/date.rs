@@ -995,8 +995,8 @@ fn iso_string(t: f64) -> Option<String> {
 }
 
 pub(super) fn install_date(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Date", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Date", proto);
 
     it.def_method(&proto, "getTime", 0, |i, this, _| {
         Ok(Value::Num(date_ms(i, &this)?))
@@ -1063,7 +1063,7 @@ pub(super) fn install_date(it: &mut Interp) {
     // Annex B legacy getYear/setYear (years offset from 1900).
     it.def_method(&proto, "getYear", 0, |i, this, _| {
         let f = ab(i.get_member_key(&this, "getFullYear"))?;
-        let yv = ab(i.call(f, this.clone(), &[]))?;
+        let yv = ab(i.call(f, this, &[]))?;
         let y = ab(i.to_number(&yv))?;
         Ok(Value::Num(if y.is_nan() { f64::NAN } else { y - 1900.0 }))
     });
@@ -1131,7 +1131,7 @@ pub(super) fn install_date(it: &mut Interp) {
     });
     it.def_method(&proto, "toJSON", 1, |i, this, _| {
         // Generic: ToObject, ToPrimitive(number); a non-finite time is null; else Invoke toISOString.
-        let o = to_object_arg(i, this.clone(), "Date.prototype.toJSON")?;
+        let o = to_object_arg(i, this, "Date.prototype.toJSON")?;
         let ov = Value::Obj(o);
         let tv = ab(i.to_primitive(&ov, crate::eval::Hint::Number))?;
         if let ValueView::Num(n) = &(tv).view() {
@@ -1224,12 +1224,12 @@ pub(super) fn install_date(it: &mut Interp) {
     let ctor = it.make_native("Date", 7, date_ctor);
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     it.def_method(&ctor, "now", 0, |i, _t, _a| Ok(Value::Num(now_ms(i))));
     it.def_method(&ctor, "parse", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
@@ -1281,7 +1281,7 @@ pub(super) fn install_date(it: &mut Interp) {
         for m in methods {
             let f = ab(i.get_member_key(&this, m))?;
             if f.is_callable() {
-                let r = ab(i.call(f, this.clone(), &[]))?;
+                let r = ab(i.call(f, this, &[]))?;
                 if !matches!((r).view(), ValueView::Obj(_)) {
                     return Ok(r);
                 }

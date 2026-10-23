@@ -32,7 +32,7 @@
 use crate::ast::{Expr, Stmt};
 use crate::interpreter::{abrupt_value, Abrupt, Binding, Env, Interp};
 use crate::value::ValueView;
-use crate::value::{Exotic, Gc, PackedValue, Property, Value};
+use crate::value::{Exotic, Gc, Property, Value};
 use std::rc::Rc;
 
 /// The `Array.prototype` iteration methods (forEach, map, filter, some, every, find, findIndex,
@@ -228,7 +228,7 @@ pub(crate) fn create_data_property_or_throw(
     i: &mut Interp,
     object: &Value,
     key: &Value,
-    value: PackedValue,
+    value: Value,
 ) -> Result<(), Abrupt> {
     crate::builtins::create_data_property_or_throw_key(i, object, key, value).map_err(Abrupt::Throw)
 }
@@ -295,13 +295,8 @@ fn intrinsic_create_data_property_or_throw(
     _this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
-    create_data_property_or_throw(
-        i,
-        &argument(args, 0),
-        &argument(args, 1),
-        PackedValue::pack(argument(args, 2)),
-    )
-    .map_err(abrupt_value)?;
+    create_data_property_or_throw(i, &argument(args, 0), &argument(args, 1), argument(args, 2))
+        .map_err(abrupt_value)?;
     Ok(Value::Bool(true))
 }
 

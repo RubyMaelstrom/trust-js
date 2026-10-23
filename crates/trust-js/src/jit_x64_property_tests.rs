@@ -21,7 +21,7 @@ fn compile(engine: &mut Engine, source: &str) -> (Rc<Chunk>, JitCode) {
 }
 
 fn eval(engine: &mut Engine, source: &str) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .perform_eval(source, &env, false)
@@ -39,11 +39,11 @@ fn run(
     receiver: &Value,
     this: bool,
 ) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let (receiver_this, args) = if this {
-        (receiver.clone(), Vec::new())
+        (*receiver, Vec::new())
     } else {
-        (Value::Undefined, vec![receiver.clone()])
+        (Value::Undefined, vec![*receiver])
     };
     crate::jit::run(&mut engine.interp, chunk, code, &env, receiver_this, &args)
         .unwrap_or_else(|_| panic!("native read throws"))
@@ -77,7 +77,7 @@ fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
                 .unwrap_or_else(|_| panic!("fixture operation throws"));
             engine
                 .interp
-                .set_member_key(&receiver, "value", expected.clone())
+                .set_member_key(&receiver, "value", expected)
                 .unwrap_or_else(|_| panic!("fixture operation throws"));
             let result = run(&mut engine, &chunk, &code, &receiver, this);
             assert!(crate::builtins::same_value_pub(&result, &expected));
@@ -236,7 +236,7 @@ fn one_native_chunk_reads_live_receivers_in_each_realm() {
             ),
             "child"
         );
-        let env = it.global_env.clone();
+        let env = it.global_env;
         it.get_var("receiver", &env)
             .unwrap_or_else(|_| panic!("fixture operation throws"))
     });
@@ -248,7 +248,7 @@ fn one_native_chunk_reads_live_receivers_in_each_realm() {
             .unwrap_or_else(|_| panic!("fixture operation throws"));
         let before = reads(0);
         let result = in_realm(&mut engine.interp, &child, |it| {
-            let env = it.global_env.clone();
+            let env = it.global_env;
             crate::jit::run(
                 it,
                 &chunk,

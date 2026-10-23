@@ -4,8 +4,8 @@ use super::*;
 use crate::value::ValueView;
 
 pub(super) fn install_promise(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Promise", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Promise", proto);
     if let Some(key) = to_string_tag_key(it) {
         proto.borrow_mut().props.insert(
             key,
@@ -24,7 +24,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         // reaction, which settles the result promise itself: a plain promise is the capability.
         if promise_species_is_intrinsic(i, &this) {
             let result = i.new_promise();
-            i.promise_then_into(&this, arg(a, 0), arg(a, 1), result.clone());
+            i.promise_then_into(&this, arg(a, 0), arg(a, 1), result);
             return Ok(result);
         }
         // The result promise is built by SpeciesConstructor(this, %Promise%) via NewPromiseCapability.
@@ -32,12 +32,12 @@ pub(super) fn install_promise(it: &mut Interp) {
         let c = species_constructor(i, &this, &default_ctor)?;
         let (result, res_f, rej_f) = new_promise_capability_full(i, &c)?;
         if map_ptr(&result).map(|p| i.promises.contains_key(&p)) == Some(true) {
-            i.promise_then_into(&this, arg(a, 0), arg(a, 1), result.clone());
+            i.promise_then_into(&this, arg(a, 0), arg(a, 1), result);
         } else {
             // The constructor produced a promise we don't manage: settle it through the
             // capability's own resolve/reject functions via a native shadow promise.
             let shadow = i.new_promise();
-            i.promise_then_into(&this, arg(a, 0), arg(a, 1), shadow.clone());
+            i.promise_then_into(&this, arg(a, 0), arg(a, 1), shadow);
             let dummy = i.new_promise();
             i.promise_then_into(&shadow, res_f, rej_f, dummy);
         }
@@ -46,7 +46,7 @@ pub(super) fn install_promise(it: &mut Interp) {
     it.def_method(&proto, "catch", 1, |i, this, a| {
         // Catch is `this.then(undefined, onRejected)` through the actual then method.
         let then = ab(i.get_member_key(&this, "then"))?;
-        ab(i.call(then, this.clone(), &[Value::Undefined, arg(a, 0)]))
+        ab(i.call(then, this, &[Value::Undefined, arg(a, 0)]))
     });
     it.def_method(&proto, "finally", 1, |i, this, a| {
         if !matches!((this).view(), ValueView::Obj(_)) {
@@ -61,12 +61,12 @@ pub(super) fn install_promise(it: &mut Interp) {
         let on_finally = arg(a, 0);
         // A non-callable onFinally is passed to `then` on both paths unchanged.
         if !on_finally.is_callable() {
-            return ab(i.call(then, this.clone(), &[on_finally.clone(), on_finally]));
+            return ab(i.call(then, this, &[on_finally, on_finally]));
         }
         // Otherwise wrap it so the original value/reason passes through after onFinally runs.
-        let then_finally = make_bound(i, pf_then_finally, vec![on_finally.clone(), c.clone()]);
+        let then_finally = make_bound(i, pf_then_finally, vec![on_finally, c]);
         let catch_finally = make_bound(i, pf_catch_finally, vec![on_finally, c]);
-        ab(i.call(then, this.clone(), &[then_finally, catch_finally]))
+        ab(i.call(then, this, &[then_finally, catch_finally]))
     });
 
     let ctor = it.make_native("Promise", 1, |i, _t, a| {
@@ -91,7 +91,7 @@ pub(super) fn install_promise(it: &mut Interp) {
             }
         }
         let (res, rej) = i.make_resolver_pair(&promise);
-        if let Err(Abrupt::Throw(e)) = i.call(executor, Value::Undefined, &[res, rej.clone()]) {
+        if let Err(Abrupt::Throw(e)) = i.call(executor, Value::Undefined, &[res, rej]) {
             // The catch goes through the reject RESOLVER: a no-op once resolve/reject ran.
             let _ = i.call(rej, Value::Undefined, &[e]);
         }
@@ -99,12 +99,12 @@ pub(super) fn install_promise(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     it.def_method(&ctor, "withResolvers", 0, |i, t, _a| {
         if !matches!((t).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.withResolvers called on a non-object"));
@@ -159,7 +159,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         };
         let results = i.make_array(vec![]);
         let state = i.new_object();
-        set_internal(&state, "#\u{0}results", results.clone());
+        set_internal(&state, "#\u{0}results", results);
         // remainingElementsCount starts at 1; each element increments, the loop end decrements once.
         set_internal(&state, "#\u{0}remaining", Value::Num(1.0));
         let mut idx = 0usize;
@@ -170,22 +170,22 @@ pub(super) fn install_promise(it: &mut Interp) {
                 Err(e) => {
                     // A throw from the iterator marks it done — no IteratorClose.
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
                     return Ok(result);
                 }
             };
-            let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+            let rem_v = ab(i.get_internal_slot(&Value::Obj(state), "#\u{0}remaining"))?;
             let rem = ab(i.to_number(&rem_v))?;
             set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
-            let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
+            let p = match i.call(promise_resolve, t, &[item]) {
                 Ok(p) => p,
                 Err(e) => {
                     i.iterator_close(&iter);
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
@@ -198,10 +198,10 @@ pub(super) fn install_promise(it: &mut Interp) {
                 i,
                 promise_all_element,
                 vec![
-                    Value::Obj(state.clone()),
+                    Value::Obj(state),
                     Value::Num(idx as f64),
                     Value::Obj(already),
-                    resolve_fn.clone(),
+                    resolve_fn,
                 ],
             );
             // Subscribe via the resolved value's `.then`; a throwing getter/call closes the iterator.
@@ -210,17 +210,17 @@ pub(super) fn install_promise(it: &mut Interp) {
                 Err(e) => {
                     i.iterator_close(&iter);
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
                     return Ok(result);
                 }
             };
-            if let Err(e) = i.call(then, p, &[on_f, reject_fn.clone()]) {
+            if let Err(e) = i.call(then, p, &[on_f, reject_fn]) {
                 i.iterator_close(&iter);
                 let _ = i.call(
-                    reject_fn.clone(),
+                    reject_fn,
                     Value::Undefined,
                     &[crate::interpreter::abrupt_value(e)],
                 );
@@ -230,7 +230,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         }
         // The values array's length is the element count (CreateDataProperty set each index).
         ab(i.set_member_key(&results, "length", Value::Num(idx as f64)))?;
-        let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+        let rem_v = ab(i.get_internal_slot(&Value::Obj(state), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
         set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
@@ -265,19 +265,19 @@ pub(super) fn install_promise(it: &mut Interp) {
                 Ok(None) => break,
                 Err(e) => {
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
                     return Ok(result);
                 }
             };
-            let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
+            let p = match i.call(promise_resolve, t, &[item]) {
                 Ok(p) => p,
                 Err(e) => {
                     i.iterator_close(&iter);
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
@@ -289,17 +289,17 @@ pub(super) fn install_promise(it: &mut Interp) {
                 Err(e) => {
                     i.iterator_close(&iter);
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
                     return Ok(result);
                 }
             };
-            if let Err(e) = i.call(then, p, &[resolve_fn.clone(), reject_fn.clone()]) {
+            if let Err(e) = i.call(then, p, &[resolve_fn, reject_fn]) {
                 i.iterator_close(&iter);
                 let _ = i.call(
-                    reject_fn.clone(),
+                    reject_fn,
                     Value::Undefined,
                     &[crate::interpreter::abrupt_value(e)],
                 );
@@ -330,7 +330,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         };
         let results = i.make_array(vec![]);
         let state = i.new_object();
-        set_internal(&state, "#\u{0}results", results.clone());
+        set_internal(&state, "#\u{0}results", results);
         set_internal(&state, "#\u{0}remaining", Value::Num(1.0));
         let mut idx = 0usize;
         loop {
@@ -339,22 +339,22 @@ pub(super) fn install_promise(it: &mut Interp) {
                 Ok(None) => break,
                 Err(e) => {
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
                     return Ok(result);
                 }
             };
-            let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+            let rem_v = ab(i.get_internal_slot(&Value::Obj(state), "#\u{0}remaining"))?;
             let rem = ab(i.to_number(&rem_v))?;
             set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
-            let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
+            let p = match i.call(promise_resolve, t, &[item]) {
                 Ok(p) => p,
                 Err(e) => {
                     i.iterator_close(&iter);
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
@@ -368,20 +368,20 @@ pub(super) fn install_promise(it: &mut Interp) {
                 i,
                 promise_settled_fulfill,
                 vec![
-                    Value::Obj(state.clone()),
+                    Value::Obj(state),
                     Value::Num(idx as f64),
-                    Value::Obj(already.clone()),
-                    resolve_fn.clone(),
+                    Value::Obj(already),
+                    resolve_fn,
                 ],
             );
             let on_r = make_bound(
                 i,
                 promise_settled_reject,
                 vec![
-                    Value::Obj(state.clone()),
+                    Value::Obj(state),
                     Value::Num(idx as f64),
                     Value::Obj(already),
-                    resolve_fn.clone(),
+                    resolve_fn,
                 ],
             );
             let then = match i.get_member_key(&p, "then") {
@@ -389,7 +389,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                 Err(e) => {
                     i.iterator_close(&iter);
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
@@ -399,7 +399,7 @@ pub(super) fn install_promise(it: &mut Interp) {
             if let Err(e) = i.call(then, p, &[on_f, on_r]) {
                 i.iterator_close(&iter);
                 let _ = i.call(
-                    reject_fn.clone(),
+                    reject_fn,
                     Value::Undefined,
                     &[crate::interpreter::abrupt_value(e)],
                 );
@@ -408,7 +408,7 @@ pub(super) fn install_promise(it: &mut Interp) {
             idx += 1;
         }
         ab(i.set_member_key(&results, "length", Value::Num(idx as f64)))?;
-        let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+        let rem_v = ab(i.get_internal_slot(&Value::Obj(state), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
         set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
@@ -438,7 +438,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         };
         let errors = i.make_array(vec![]);
         let state = i.new_object();
-        set_internal(&state, "#\u{0}errors", errors.clone());
+        set_internal(&state, "#\u{0}errors", errors);
         set_internal(&state, "#\u{0}remaining", Value::Num(1.0));
         let mut idx = 0usize;
         loop {
@@ -447,22 +447,22 @@ pub(super) fn install_promise(it: &mut Interp) {
                 Ok(None) => break,
                 Err(e) => {
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
                     return Ok(result);
                 }
             };
-            let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+            let rem_v = ab(i.get_internal_slot(&Value::Obj(state), "#\u{0}remaining"))?;
             let rem = ab(i.to_number(&rem_v))?;
             set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
-            let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
+            let p = match i.call(promise_resolve, t, &[item]) {
                 Ok(p) => p,
                 Err(e) => {
                     i.iterator_close(&iter);
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
@@ -475,10 +475,10 @@ pub(super) fn install_promise(it: &mut Interp) {
                 i,
                 promise_any_reject,
                 vec![
-                    Value::Obj(state.clone()),
+                    Value::Obj(state),
                     Value::Num(idx as f64),
                     Value::Obj(already),
-                    reject_fn.clone(),
+                    reject_fn,
                 ],
             );
             let then = match i.get_member_key(&p, "then") {
@@ -486,7 +486,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                 Err(e) => {
                     i.iterator_close(&iter);
                     let _ = i.call(
-                        reject_fn.clone(),
+                        reject_fn,
                         Value::Undefined,
                         &[crate::interpreter::abrupt_value(e)],
                     );
@@ -494,10 +494,10 @@ pub(super) fn install_promise(it: &mut Interp) {
                 }
             };
             // First fulfillment resolves the result (its [[AlreadyResolved]] lives in resolve_fn).
-            if let Err(e) = i.call(then, p, &[resolve_fn.clone(), on_r]) {
+            if let Err(e) = i.call(then, p, &[resolve_fn, on_r]) {
                 i.iterator_close(&iter);
                 let _ = i.call(
-                    reject_fn.clone(),
+                    reject_fn,
                     Value::Undefined,
                     &[crate::interpreter::abrupt_value(e)],
                 );
@@ -506,7 +506,7 @@ pub(super) fn install_promise(it: &mut Interp) {
             idx += 1;
         }
         ab(i.set_member_key(&errors, "length", Value::Num(idx as f64)))?;
-        let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+        let rem_v = ab(i.get_internal_slot(&Value::Obj(state), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
         set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
@@ -545,14 +545,14 @@ pub(super) fn install_promise(it: &mut Interp) {
         match (ctor.borrow().props.get(&key).and_then(|p| p.getter()))
             .map(|__value| (__value).view())
         {
-            Some(ValueView::Obj(getter)) => Some(getter.clone()),
+            Some(ValueView::Obj(getter)) => Some(getter),
             _ => None,
         }
     });
     if let Some(getter) = species_getter {
         Rc::make_mut(&mut it.extra_protos).insert("%PromiseSpeciesGetter%", getter);
     }
-    Rc::make_mut(&mut it.extra_protos).insert("%PromiseCtor%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%PromiseCtor%", ctor);
     set_builtin(&it.global, "Promise", Value::Obj(ctor));
 }
 

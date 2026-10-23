@@ -16,7 +16,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         "URIError",
     ];
     // Create Error.prototype.
-    let error_proto = Object::new(Some(it.object_proto.clone()));
+    let error_proto = Object::new(Some(it.object_proto));
     set_builtin(&error_proto, "name", Value::lstr("Error"));
     set_builtin(&error_proto, "message", Value::lstr(""));
     it.def_method(&error_proto, "toString", 0, |i, this, _| {
@@ -67,7 +67,7 @@ pub(super) fn install_errors(it: &mut Interp) {
     // set stack: SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v).
     let set_stack = it.make_native("set stack", 1, |i, this, a| {
         let o = match &(this).view() {
-            ValueView::Obj(o) => o.clone(),
+            ValueView::Obj(o) => *o,
             _ => {
                 return Err(i.make_error(
                     "TypeError",
@@ -102,11 +102,7 @@ pub(super) fn install_errors(it: &mut Interp) {
                 // Surface the proxy [[Set]] result: a falsy trap return throws under Throw=true.
                 let trap = ab(i.get_member_key(&h, "set"))?;
                 if trap.is_callable() {
-                    let res = ab(i.call(
-                        trap,
-                        h.clone(),
-                        &[t.clone(), Value::lstr("stack"), v.clone(), this.clone()],
-                    ))?;
+                    let res = ab(i.call(trap, h, &[t, Value::lstr("stack"), v, this]))?;
                     if !i.to_boolean(&res) {
                         return Err(
                             i.make_error("TypeError", "proxy set of 'stack' returned false")
@@ -145,17 +141,17 @@ pub(super) fn install_errors(it: &mut Interp) {
             true,
         ),
     );
-    Rc::make_mut(&mut it.error_protos).insert("Error", error_proto.clone());
+    Rc::make_mut(&mut it.error_protos).insert("Error", error_proto);
 
     let mut error_ctor: Option<Gc> = None;
     for name in names {
         let proto = if name == "Error" {
-            error_proto.clone()
+            error_proto
         } else {
-            let p = Object::new(Some(error_proto.clone()));
+            let p = Object::new(Some(error_proto));
             set_builtin(&p, "name", Value::lstr(name));
             set_builtin(&p, "message", Value::lstr(""));
-            Rc::make_mut(&mut it.error_protos).insert(name, p.clone());
+            Rc::make_mut(&mut it.error_protos).insert(name, p);
             p
         };
         // A distinct native constructor per error kind (fn pointers can't capture the name).
@@ -188,28 +184,28 @@ pub(super) fn install_errors(it: &mut Interp) {
                     true,
                 ),
             );
-            Rc::make_mut(&mut it.extra_protos).insert("%ErrorCtor%", ctor.clone());
-            error_ctor = Some(ctor.clone());
+            Rc::make_mut(&mut it.extra_protos).insert("%ErrorCtor%", ctor);
+            error_ctor = Some(ctor);
         } else if let Some(ec) = &error_ctor {
             // A native error subtype's [[Prototype]] is the Error constructor (it subclasses Error).
-            ctor.borrow_mut().proto = Some(ec.clone());
+            ctor.borrow_mut().proto = Some(*ec);
         }
         ctor.borrow_mut().props.insert(
             "prototype",
-            Property::data(Value::Obj(proto.clone()), false, false, false),
+            Property::data(Value::Obj(proto), false, false, false),
         );
         proto
             .borrow_mut()
             .props
-            .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+            .insert("constructor", Property::builtin(Value::Obj(ctor)));
         set_builtin(&it.global, name, Value::Obj(ctor));
     }
 
     // AggregateError(errors, message): an Error subclass carrying an `errors` array.
-    let agg_proto = Object::new(Some(error_proto.clone()));
+    let agg_proto = Object::new(Some(error_proto));
     set_builtin(&agg_proto, "name", Value::lstr("AggregateError"));
     set_builtin(&agg_proto, "message", Value::lstr(""));
-    Rc::make_mut(&mut it.error_protos).insert("AggregateError", agg_proto.clone());
+    Rc::make_mut(&mut it.error_protos).insert("AggregateError", agg_proto);
     let agg_ctor = it.make_native("AggregateError", 2, |i, _t, a| {
         let err = i.make_error_skipping("AggregateError", "", constructor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
@@ -245,24 +241,24 @@ pub(super) fn install_errors(it: &mut Interp) {
         Ok(err)
     });
     if let Some(ec) = &error_ctor {
-        agg_ctor.borrow_mut().proto = Some(ec.clone());
+        agg_ctor.borrow_mut().proto = Some(*ec);
     }
     agg_ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(agg_proto.clone()), false, false, false),
+        Property::data(Value::Obj(agg_proto), false, false, false),
     );
-    agg_proto.borrow_mut().props.insert(
-        "constructor",
-        Property::builtin(Value::Obj(agg_ctor.clone())),
-    );
+    agg_proto
+        .borrow_mut()
+        .props
+        .insert("constructor", Property::builtin(Value::Obj(agg_ctor)));
     set_builtin(&it.global, "AggregateError", Value::Obj(agg_ctor));
 
     // SuppressedError(error, suppressed, message): an Error subclass carrying `error` and
     // `suppressed` (the error thrown during disposal and the one it superseded).
-    let sup_proto = Object::new(Some(error_proto.clone()));
+    let sup_proto = Object::new(Some(error_proto));
     set_builtin(&sup_proto, "name", Value::lstr("SuppressedError"));
     set_builtin(&sup_proto, "message", Value::lstr(""));
-    Rc::make_mut(&mut it.error_protos).insert("SuppressedError", sup_proto.clone());
+    Rc::make_mut(&mut it.error_protos).insert("SuppressedError", sup_proto);
     let sup_ctor = it.make_native("SuppressedError", 3, |i, _t, a| {
         let err = i.make_error_skipping("SuppressedError", "", constructor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
@@ -299,14 +295,14 @@ pub(super) fn install_errors(it: &mut Interp) {
     });
     sup_ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(sup_proto.clone()), false, false, false),
+        Property::data(Value::Obj(sup_proto), false, false, false),
     );
-    sup_proto.borrow_mut().props.insert(
-        "constructor",
-        Property::builtin(Value::Obj(sup_ctor.clone())),
-    );
+    sup_proto
+        .borrow_mut()
+        .props
+        .insert("constructor", Property::builtin(Value::Obj(sup_ctor)));
     if let Some(ec) = &error_ctor {
-        sup_ctor.borrow_mut().proto = Some(ec.clone());
+        sup_ctor.borrow_mut().proto = Some(*ec);
     }
     set_builtin(&it.global, "SuppressedError", Value::Obj(sup_ctor));
 }
@@ -366,7 +362,7 @@ fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
     // The frames' names are engine strings: the getter's captures keep them (S6 step 11b).
     let mut names = Vec::new();
     if let Some(trace) = captured.0.borrow().as_deref() {
-        trace.for_each_name(|name| names.push(Value::Str(name.clone())));
+        trace.for_each_name(|name| names.push(Value::Str(*name)));
     }
     let trace = captured.clone();
     // The getter answers only for the object it was installed on, which it must not keep alive.
@@ -406,7 +402,7 @@ fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
     set_data(&desc, "set", Value::Obj(setter));
     set_data(&desc, "enumerable", Value::Bool(false));
     set_data(&desc, "configurable", Value::Bool(true));
-    let target_value = Value::Obj(target.clone());
+    let target_value = Value::Obj(target);
     let defined = if let Some((t, h)) = proxy_pair(i, &target_value) {
         ab(proxy_define_property(i, &t, &h, "stack", &Value::Obj(desc)))?
     } else {

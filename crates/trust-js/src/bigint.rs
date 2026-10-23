@@ -439,7 +439,7 @@ impl JsBigInt {
         Some(unstoppable(self.pow_with(e, &mut Poll::never())))
     }
     fn pow_with(&self, mut e: u128, poll: &mut Poll) -> Result<Self, Stop> {
-        let mut base = self.clone();
+        let mut base = *self;
         let mut acc = Self::from_u64(1);
         while e > 0 {
             if e & 1 == 1 {
@@ -502,7 +502,7 @@ impl JsBigInt {
             return Ok(if self.0.neg && !odd {
                 Self::from_u64(1)
             } else {
-                self.clone()
+                *self
             });
         }
         // |base| >= 2, so base^e has at least (bits - 1) * e + 1 bits.

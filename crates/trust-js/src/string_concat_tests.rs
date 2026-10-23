@@ -200,7 +200,7 @@ fn string_concat_helpers_reach_compiled_tiers() {
             ok
         "#, false), Ok(Completion::Value(v)) if v == "true"));
         for name in ["add", "append", "appendLocal", "appendCaptured"] {
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let ValueView::Obj(object) = (engine
                 .interp
                 .get_var(name, &env)

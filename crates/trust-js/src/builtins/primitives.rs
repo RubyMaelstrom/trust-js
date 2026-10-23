@@ -4,7 +4,7 @@ use super::*;
 use crate::value::ValueView;
 
 pub(super) fn install_number(it: &mut Interp) {
-    let np = it.number_proto.clone();
+    let np = it.number_proto;
     it.def_method(&np, "toLocaleString", 0, |i, this, args| {
         let n = this_number(i, &this)?;
         intl_delegate(
@@ -132,11 +132,11 @@ pub(super) fn install_number(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(np.clone()), false, false, false),
+        Property::data(Value::Obj(np), false, false, false),
     );
     np.borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     // The numeric constants are { writable:false, enumerable:false, configurable:false }.
     for (name, val) in [
         ("MAX_SAFE_INTEGER", 9007199254740991.0),
@@ -321,7 +321,7 @@ fn shortest_radix_digits(x: f64, radix: u32) -> (Vec<u8>, i64) {
             (
                 Big::from_u64(f).shl(e as u64 + 1),
                 Big::from_u64(2),
-                unit.clone(),
+                unit,
                 unit,
             )
         }
@@ -441,7 +441,7 @@ fn shortest_radix_digits(x: f64, radix: u32) -> (Vec<u8>, i64) {
 }
 
 pub(super) fn install_boolean(it: &mut Interp) {
-    let bp = it.boolean_proto.clone();
+    let bp = it.boolean_proto;
     it.def_method(&bp, "toString", 0, |i, this, _| {
         Ok(Value::lstr(if this_boolean(i, &this)? {
             "true"
@@ -458,11 +458,11 @@ pub(super) fn install_boolean(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(bp.clone()), false, false, false),
+        Property::data(Value::Obj(bp), false, false, false),
     );
     bp.borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     set_builtin(&it.global, "Boolean", Value::Obj(ctor));
 }
 
@@ -487,9 +487,9 @@ fn this_boolean(i: &mut Interp, this: &Value) -> Result<bool, Value> {
 /// thisSymbolValue: a Symbol primitive or Symbol wrapper object, else TypeError.
 fn this_symbol(i: &mut Interp, this: &Value) -> Result<crate::value::SymbolRef, Value> {
     match &(this).view() {
-        ValueView::Sym(s) => Ok(s.clone()),
+        ValueView::Sym(s) => Ok(*s),
         ValueView::Obj(o) => match &o.borrow().exotic {
-            Exotic::SymWrap(s) => Ok(s.clone()),
+            Exotic::SymWrap(s) => Ok(*s),
             _ => Err(i.make_error("TypeError", "Symbol method called on incompatible receiver")),
         },
         _ => Err(i.make_error("TypeError", "Symbol method called on incompatible receiver")),
@@ -497,7 +497,7 @@ fn this_symbol(i: &mut Interp, this: &Value) -> Result<crate::value::SymbolRef, 
 }
 
 pub(super) fn install_symbol(it: &mut Interp) {
-    let sp = it.symbol_proto.clone();
+    let sp = it.symbol_proto;
     it.def_method(&sp, "toString", 0, |i, this, _| {
         match this_symbol(i, &this) {
             Ok(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
@@ -551,15 +551,15 @@ pub(super) fn install_symbol(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(sp.clone()), false, false, false),
+        Property::data(Value::Obj(sp), false, false, false),
     );
     sp.borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
 
     // The intrinsic %Symbol% is cached so well-known-symbol lookups survive `globalThis.Symbol`
     // being replaced by user code.
-    Rc::make_mut(&mut it.extra_protos).insert("%SymbolCtor%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%SymbolCtor%", ctor);
     // Well-known symbols (each a unique, frozen instance on the constructor).
     for name in [
         "iterator",
@@ -582,7 +582,7 @@ pub(super) fn install_symbol(it: &mut Interp) {
         let sym = it.well_known_symbol(name);
         if name == "iterator" {
             if let ValueView::Sym(d) = &(sym).view() {
-                it.iterator_sym = Some(d.clone());
+                it.iterator_sym = Some(*d);
             }
         }
         ctor.borrow_mut()
@@ -631,9 +631,9 @@ fn to_bigint(i: &mut Interp, v: &Value) -> Result<crate::bigint::JsBigInt, Value
 /// thisBigIntValue: a BigInt primitive or BigInt wrapper object, else TypeError.
 fn this_bigint(i: &mut Interp, this: &Value) -> Result<crate::bigint::JsBigInt, Value> {
     match &(this).view() {
-        ValueView::BigInt(n) => Ok(n.clone()),
+        ValueView::BigInt(n) => Ok(*n),
         ValueView::Obj(o) => match &o.borrow().exotic {
-            Exotic::BigIntWrap(n) => Ok((**n).clone()),
+            Exotic::BigIntWrap(n) => Ok(**n),
             _ => Err(i.make_error("TypeError", "BigInt method called on incompatible receiver")),
         },
         _ => Err(i.make_error("TypeError", "BigInt method called on incompatible receiver")),
@@ -641,8 +641,8 @@ fn this_bigint(i: &mut Interp, this: &Value) -> Result<crate::bigint::JsBigInt, 
 }
 
 pub(super) fn install_bigint(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("BigInt", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("BigInt", proto);
     it.def_method(&proto, "toString", 0, |i, this, a| {
         let n = this_bigint(i, &this)?;
         let radix = {
@@ -706,12 +706,12 @@ pub(super) fn install_bigint(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     it.def_method(&ctor, "asIntN", 2, |i, _t, a| {
         use crate::bigint::JsBigInt;
         let bits = to_index(i, &arg(a, 0))? as u64;

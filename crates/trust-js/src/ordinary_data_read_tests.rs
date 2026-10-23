@@ -14,7 +14,7 @@ fn run(engine: &mut Engine, source: &str) -> String {
 }
 
 fn value(engine: &mut Engine, name: &str) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .get_var(name, &env)
@@ -23,10 +23,7 @@ fn value(engine: &mut Engine, name: &str) -> Value {
 }
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
-    value(engine, name)
-        .as_obj()
-        .expect("fixture object")
-        .clone()
+    value(engine, name).as_obj().expect("fixture object")
 }
 
 fn read(
@@ -76,7 +73,7 @@ fn ordinary_data_read_all_value_kinds_owned_and_traced() {
             holder
                 .borrow_mut()
                 .props
-                .insert(key, Property::plain(expected.clone()));
+                .insert(key, Property::plain(expected));
             let shape = holder.borrow().props.shape();
             let slot = holder
                 .borrow()
@@ -87,16 +84,16 @@ fn ordinary_data_read_all_value_kinds_owned_and_traced() {
                 .map(|n| n as u32);
             for inherited in [false, true] {
                 let receiver = if inherited {
-                    Object::new(Some(holder.clone()))
+                    Object::new(Some(holder))
                 } else {
-                    holder.clone()
+                    holder
                 };
                 for traced in [false, true] {
                     let (actual, trace) = read(
                         &mut engine.interp,
                         &receiver,
                         key,
-                        &Value::Obj(receiver.clone()),
+                        &Value::Obj(receiver),
                         traced,
                     );
                     assert!(
@@ -147,7 +144,7 @@ fn ordinary_data_read_getter_reentry_mutation_gc_and_throw_all_tiers() {
                 &mut engine.interp,
                 &receiver,
                 "data",
-                &Value::Obj(receiver.clone()),
+                &Value::Obj(receiver),
                 traced,
             );
             assert!(crate::builtins::same_value_pub(&result, &token));
@@ -167,7 +164,7 @@ fn ordinary_data_read_getter_reentry_mutation_gc_and_throw_all_tiers() {
             let result = engine.interp.get_from_chain(
                 &receiver,
                 "bad",
-                &Value::Obj(receiver.clone()),
+                &Value::Obj(receiver),
                 traced.then_some(&mut thrown_trace),
             );
             assert!(
@@ -181,7 +178,7 @@ fn ordinary_data_read_getter_reentry_mutation_gc_and_throw_all_tiers() {
                 &mut engine.interp,
                 &receiver,
                 "missingGetter",
-                &Value::Obj(receiver.clone()),
+                &Value::Obj(receiver),
                 traced,
             );
             assert!(matches!((missing).view(), ValueView::Undefined));
@@ -204,13 +201,7 @@ fn ordinary_data_read_dense_holes_and_present_undefined_are_distinct() {
             ("2", Value::Num(45.0), PropertyOutcome::Accessor, 0),
             ("absent", Value::Undefined, PropertyOutcome::Absent, 0),
         ] {
-            let (result, trace) = read(
-                &mut engine.interp,
-                &root,
-                key,
-                &Value::Obj(root.clone()),
-                traced,
-            );
+            let (result, trace) = read(&mut engine.interp, &root, key, &Value::Obj(root), traced);
             assert!(crate::builtins::same_value_pub(&result, &expected), "{key}");
             if traced {
                 assert_eq!(trace.outcome, Some(outcome));
@@ -240,7 +231,7 @@ fn ordinary_data_read_lazy_prototype_identity_and_returned_ownership() {
                     &mut engine.interp,
                     &function,
                     "prototype",
-                    &Value::Obj(function.clone()),
+                    &Value::Obj(function),
                     traced,
                 );
                 assert_eq!(
@@ -251,7 +242,7 @@ fn ordinary_data_read_lazy_prototype_identity_and_returned_ownership() {
                     &mut engine.interp,
                     &function,
                     "prototype",
-                    &Value::Obj(function.clone()),
+                    &Value::Obj(function),
                     traced,
                 );
                 assert!(crate::builtins::same_value_pub(&first, &second));
@@ -348,7 +339,7 @@ fn ordinary_data_read_host_indexed_dispatch_precedes_ordinary_lookup() {
     let mut engine = Engine::new();
     engine.interp.activate_gc_heap();
     let start = Object::new(None);
-    let target = Value::Obj(start.clone());
+    let target = Value::Obj(start);
     let getter = Value::Obj(
         engine
             .interp

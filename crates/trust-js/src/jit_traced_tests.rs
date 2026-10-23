@@ -38,7 +38,7 @@ pub(super) fn with_chunk<R>(
     name: &str,
     f: impl FnOnce(&crate::bytecode::Chunk) -> R,
 ) -> R {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine.interp.get_var(name, &env).ok().expect("bound name");
     let object_handle = value.as_obj().expect("a function object");
     let object = object_handle.borrow();
@@ -102,7 +102,7 @@ fn admission_collects() {
     // The victim's handle lives only in this helper frame (the collector scans the stack).
     let weak = crate::gc_test::in_frame(|| {
         eval(&mut jit, "var victim = {v: 1}; 0;");
-        let env = jit.interp.global_env.clone();
+        let env = jit.interp.global_env;
         let victim = jit.interp.get_var("victim", &env).ok().expect("victim");
         crate::value::Gc::downgrade(&victim.as_obj().expect("an object"))
     });
@@ -613,9 +613,9 @@ fn string_constant_sites_push_an_immediate() {
                     "a site loads constant {k} from its slot"
                 );
                 // SAFETY: the slot lives as long as the chunk.
-                let value = unsafe { &*chunk.jit_const_ptr(k) }.clone();
+                let value = *unsafe { &*chunk.jit_const_ptr(k) };
                 let mut site = asm::Asm::new();
-                site.mov_imm64(9, crate::value::PackedValue::pack(value).bits());
+                site.mov_imm64(9, (value).bits());
                 site.str_imm(9, 20, 0);
                 site.add_imm(20, 20, 8);
                 count(&site.finish())

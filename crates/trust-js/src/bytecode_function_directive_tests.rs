@@ -16,7 +16,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine.interp.get_var(name, &env).ok().unwrap();
     let object_handle = value.as_obj().unwrap();
     let object = object_handle.borrow();
@@ -322,7 +322,7 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
         for _ in 0..8 {
             eval(&mut engine, "subject(5)");
         }
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let value = engine.interp.get_var("subject", &env).ok().unwrap();
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();

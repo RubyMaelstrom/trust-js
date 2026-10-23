@@ -157,7 +157,7 @@ fn run_shared(it: &mut Interp) -> String {
 }
 
 fn global_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
-    let env = it.global_env.clone();
+    let env = it.global_env;
     let Ok(ValueView::Obj(object)) = (it.get_var(name, &env)).map(|__value| (__value).view())
     else {
         panic!("{name} is a global function");

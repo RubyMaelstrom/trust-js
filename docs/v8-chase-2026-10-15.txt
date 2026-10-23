@@ -7595,3 +7595,226 @@ largest generated chunk +56.594%. React JIT compilation is +14.007%
 with an interval spanning zero. Keep these components and the
 56/10 versus main's 55/9 admission difference visible for the final
 review. This commit completes 12e, not the step-12 or S6 exit gate.
+
+Step 12f: one execution representation
+
+Value is directly the transparent u64 execution word and thread
+marker. PackedValue, StoredValue, CallArgs, JitThisView and identity
+conversion wrappers are removed. ValueStack stores Value directly.
+Cell<Value> remains the mutable slot representation, and PropWord
+alone may hold a deferred prototype. Its materialization records
+the original owner's card before publishing the new object edge;
+the lazy cell retains its separate barrier.
+
+Remove tagged.rs's unused second TaggedValue, 32-bit HeapRef, mock
+roots, shadow frames and toy materialization machinery. Neutral
+compiler IDs, validated root maps and ordered CopySlot recipes
+remain in deopt.rs. They contain no GC values or runtime addresses.
+The real heap's test-only no-GC/borrow controls stay. Production keeps
+safepoint-only collection and trace-time borrow checks. The arithmetic
+flag, environment switch and duplicate Number paths are removed, keeping
+coercion, IEEE edge cases and the exponentiation guards.
+
+The clone_on_copy blanket allowance is removed. Compiler-typed
+repairs remove redundant copies while retaining actual Rc, handle
+and copy-on-write layout ownership. Native callbacks still use
+their declared signatures; immutable argument loans, post-call
+polls, tail drains and caller retirement remain intact. Final source
+review found no new aliasing, rooting or premature retirement defect.
+Stale counted-ownership comments now describe copied words and loans.
+
+Focused root-owned checks pass 79 normal and 79 interval-1 stress
+cases on each of ARM, x64 and Wine. Five strict configurations pass
+on ARM and x64; Windows retains exactly its 23 baseline warnings.
+Two fresh isolated mutants compile successfully and fail the intended
+test: removing NaN canonicalization changes the asserted word bits;
+removing the original owner's card triggers the old-to-young edge
+verifier. Neither a build failure nor an empty filter is counted.
+
+The compound rooting test now validates every exact test selector
+and every applicable module prefix against the child binary's list,
+then compares observed children with the entire expected inventory.
+The first run caught a historical abbreviated deferred-prototype
+filter; x64 caught an ARM-only module prefix requiring its existing
+architecture cfg. Preserve those failures. Corrected fresh binaries
+verify all 68 ARM and 54 x64 child tests under stress. Subsequent
+comment corrections and the shared test-fixture repair described in
+12e have exact retained diffs. The milestone tests use final source.
+
+Final production DWARF and the original runtime probes agree for all
+23 measured carriers in the diagnostic and ordinary builds. Interp
+stays 5768 bytes; removing tagged_arithmetic moves thirteen following
+byte fields by one byte, including constructing from 5759 to 5758.
+JitCtx remains 320 bytes and JitFrame 2368. The other measured
+carriers retain their sizes and all direct-member offsets.
+
+The final source audit inventories roots, all eight cell descriptors,
+ephemerons, weak clearing, native captures, heap identities, caches,
+barriers, initialized native buffers and safepoint boundaries. It is
+evidence for the inspected contracts, not a construction proof for
+unexecuted paths. The known N-API finalizer teardown gap stays open.
+
+I4's original wording forbids all cached interior pointers, whereas
+the existing engine keeps non-owning raw Binding and code locations.
+Live owner identity, weak address pins and non-recycled structural
+generations or code epochs guard every inspected use. Runtime and
+code retirement invalidate before freeing; execution leases protect
+reentry. Fixed-layout bindings rederive slots. The final owner review
+must address this wording explicitly; raw caches are not sole roots,
+but the absolute statement that they are absent is not true.
+
+The first full milestone run found a stale test expectation: removing
+tagged_arithmetic correctly left 166 classified Interp fields, while
+the inventory test still expected 167. The complete x64 suite was
+2215/1/7 with only that failure. Cancel the ongoing ARM/Wine runs and
+retain their partial logs; no partial run is counted as a pass. The
+correction changes one byte inside the cfg(test) assertion. Source,
+inventory and retained DWARF independently count 166. The exhaustive
+struct pattern, duplicate checks and all classification checks stay.
+Preserve the original layout/LTO manifests and add an exact source
+equivalence link for this third test-only change. Full milestone
+validation restarts on the corrected source with fresh zombie targets.
+
+The strict comparison passes all nine fixture/mode pairs: 678 chunks
+and 1356 verified companion images, with zero semantic rewrite rules
+or body exemptions. All 26 positive and 141 negative neutral-proof
+controls pass. The inventory-count correction required updating the
+checker's exact interpreter source hash; the first stale-pin rejection
+is retained. The new frozen bundle changes only that reviewed hash
+and its certificate metadata. Every proof algorithm and control is
+unchanged from the accepted 12e checker.
+
+The corrected full milestone passes on both machines. On Crystal,
+rustfmt checks 146 Rust files; all five strict clippy configurations
+pass. Rustdoc retains eight warnings. The library is 2387/0/7 and
+the doctests 11/0/1. The inventory has 32 removed and 21 added names,
+accounting for renames and the retired toy-model tests. The workspace
+build has no diagnostics. Downstreams pass: host 37, timers 6, fs 0,
+web 63/0/1, node 47 and runtime 184/0/1. The native wasm crate command
+executes zero tests in two binaries; this is not wasm execution
+coverage. The owner retired the wasm32 criterion on 2026-10-18.
+
+Release fixtures preserve outputs, native compiles 56/10/160 and
+collections 21/6/16. Sustained allocation collects 194 times at both
+JIT and bytecode tiers. Difftest seed 7, count 150, reports 138 agree
+and 12 budget skips across seeds 7..157, with empty stderr and corpus.
+Full ARM Test262 is 53575/0/3 at threshold 8 and 53573/2/3 at 0;
+both reports match their S5 references byte for byte. The latter's
+two staging/sm legacy-function-arguments failures remain baseline.
+Full stress covers every library test: 2357 pass and seven expected
+benchmark ignores at interval 1, 25 pass at 100, five pass at 1000.
+No failure, timeout or retry occurs in the corrected run.
+
+Zombie uses fresh, separately named Cargo targets for the corrected
+source, label step12f-inventoryfix-review. x64 is 2216/0/7; Wine is
+2208/3/7 with exactly the three baseline snapshot-codec failures.
+x64 strict clippy passes; Windows retains the same 23 warnings.
+Both inventories have the same 32 removals and 21 additions. Its
+full JIT Test262 report matches both references. Release fixture
+outputs/counts and difftest match ARM. Full x64 stress covers 2223
+names: 2190 pass and seven ignores at interval 1, 22 pass at 100,
+four pass at 1000; no timeout, failure or retry. Source maps and
+all expected names, outcomes, helper hashes and phase exits verify.
+
+The first archive verifier tried to hash the deliberately deleted
+tagged.rs. Preserve this metadata rejection. Its corrected version
+requires deletion on both machines and exact equality of the 497
+live source/config paths; it preserves every other evidence check.
+Two positive and five negative metadata controls and independent
+source review pass. The archive then verifies without rerunning or
+relabeling engine results. Both full gates finish before measurement.
+
+Final measurement: Crystal aarch64, Linux 7.3, CPU 5, boost disabled,
+rustc 1.99.1 / LLVM 23.1.1, release fat LTO and one codegen unit.
+Fifteen interleaved rounds cover empty startup, Vue, React, Djot,
+and sustained allocation at JIT and bytecode, with 12e, 12f,
+matched-toolchain main e3310993, and retained rustc-1.99.0 main.
+Default flags and heap floor are unchanged. The new timer protocol
+measures engine RSS via inner GNU time; perf counters and wall time
+include that small timer equally for all four binaries. Absolute
+startup/counter results are not spliced into older protocols.
+
+The quiet minute has 96.04 busy CPU-seconds over 60.016 seconds;
+the owner's server uses 0.17 CPU-seconds. Other-core load during
+samples has median 0.512 cores and maximum 2.147. All 360 samples
+pass the strict validator: exact matrix, outputs, counters, phases,
+compiles and collection counts. Ten major faults occur only in the
+first parent empty-startup sample; retain it and all other samples.
+No sample is dropped. All metric intervals below are paired 95%
+bootstrap intervals; complete component ranges remain in the data.
+
+12f's retained LTO binary is 19,798,936 bytes, md5
+ab7656a8a4957cdc45f8ae69c197910d. Its original build manifest remains
+unchanged. Exact cfg(test)-only certificates connect that source to
+the final source, including the inventory-count correction; copies
+of both certificates and source maps accompany this measurement.
+This proves production equivalence, not a rebuild from final test
+bytes. Final prepared-source SHA256:
+c4ffb536a401aed7782abdcefa2847dad4a8fe9758f479996ee6569978b14546
+
+Against 12e, Vue/React/Djot cycles change -1.192/+0.248/-0.230%;
+only Vue's interval excludes zero (-1.953..-0.792%). Wall time
+changes -1.163/+0.229/-0.260%. Instructions rise a small but
+consistent +0.131/+0.085/+0.058%. Engine RSS changes
++0.183/+1.848/-1.435%; all RSS intervals include zero. Absolute
+engine RSS medians are 32776/24916/42048 KiB. Total GC pause changes
+-0.234/-0.939/-0.197%. Median longest pauses are
+1.813/1.206/2.482 ms. Native compile time changes
+-0.562/+1.173/+0.178%, bytecode compile time
++0.015/+2.301/+0.365%, and parse time +0.537/-0.112/+1.278%;
+all these component intervals include zero. Generated code changes
+-0.007/0/+0.003%, with unchanged compile counts and accepted complete
+code comparisons. This cleanup is not claimed to reduce instructions.
+
+Sustained JIT/bytecode cycles change +0.319/+0.164% and wall time
++0.382/+0.421%; all four intervals include zero. Instructions rise
++0.139/+1.228%, total GC pause +0.897/+1.251%, and median longest
+pauses +3.456/+4.768%; these increases are reproducible in this run.
+Median longest pauses are 15.822/15.753 ms; observed maxima are
+21.824/25.236 ms. The longest-pause intervals extend to +5.314 and
++6.775%; the data does not prove a less-than-5% latency increase.
+Counts remain 194. These component costs are retained explicitly
+for review of the single-word architecture; they are not hidden
+by the overall program's gain.
+Empty startup has median 19.0 ms and 17576 KiB engine RSS. Its
+cycles change -0.506% and wall +3.261%, both intervals include zero.
+
+Against matched main, Vue/React/Djot cycles improve
+19.353/16.972/12.540%, instructions 17.616/22.639/15.258%, and wall
+18.816/12.996/11.979%. Against retained old main, cycles improve
+19.660/17.074/12.518%. The whole-process Vue instruction reduction
+exceeds S0's 10% relative threshold. The additional S6 Vue/Node
+counter run and the original-classifier ownership profile follow.
+
+Matched-main fixture RSS changes +1.235/+48.593/-0.980%. React
+still exceeds the +25% bound. GC shares excluding exit are
+3.918/4.330/7.799%; including exit, 4.216/4.978/8.718%. Sustained
+JIT/bytecode shares excluding exit are 34.449/27.063%; including
+exit, 36.209/28.429%. Djot and sustained allocation remain above
+5% under either accounting. Main has no per-cause pause timing;
+its share excluding exit is unavailable, not inferred from total.
+The final review must retain these unmet criteria explicitly.
+
+Other main comparisons remain visible: React bytecode compilation
++16.469%, Vue bytecode compilation +7.260%, and Vue's largest
+native chunk +56.594%; branch/main compile counts remain 56/10
+versus 55/9 for Vue/React. React native compilation +5.580% has an
+interval spanning zero. Empty engine RSS rises 22.669%. React
+median longest pause rises from 0.215 to 1.206 ms and total GC
+pause from 0.344 to 4.380 ms. The new collector accounts work
+differently from main's reference-counted heap; whole-process
+gains do not make these pause measurements disappear or satisfy
+acceptance by themselves. Sustained cycles improve 36.921/33.682%,
+instructions 34.058/29.802%, RSS 44.962/44.611%, and total GC pause
+34.192/33.168%. These gains do not waive RSS, GC-share or component
+acceptance questions. The S6 exit review must judge them together.
+
+Evidence is in target/s6-step12fr, including gate-verified.json,
+zombie-milestone/verified-all.json, final-gates-accepted.json,
+comparator-root-v3 and the preserved initial failure directories.
+Measurements, raw perf/RSS records, complete component intervals,
+source certificates and tool provenance are under
+ target/s6-step10/m12f-v3.
+Step 12 and its full milestone are complete. The separate S6 exit
+validation, occupancy census and concrete owner review follow;
+S6's overall acceptance is still open.

@@ -13,7 +13,7 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 fn assert_native_intrinsic(engine: &mut Engine, name: &str, intrinsic: u8) -> u32 {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let function = engine.interp.get_var(name, &env).ok().unwrap();
     let function_handle = function.as_obj().unwrap();
     let object = function_handle.borrow();
@@ -127,7 +127,7 @@ fn math_intrinsics_destroy_the_final_aliased_operand_owner() {
             ));
             // The strong handles live only in this helper frame (the collector scans the stack).
             let (weak, sentinel_weak) = crate::gc_test::in_frame(|| {
-                let env = engine.interp.global_env.clone();
+                let env = engine.interp.global_env;
                 let value = engine.interp.get_var("builtin", &env).ok().unwrap();
                 let sentinel = engine.interp.get_var("sentinel", &env).ok().unwrap();
                 (

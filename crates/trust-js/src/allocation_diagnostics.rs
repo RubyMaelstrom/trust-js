@@ -1192,7 +1192,7 @@ mod tests {
     fn inventory_of_lazy_function_prototype_does_not_materialize_it() {
         let mut engine = crate::Engine::new();
         engine.eval("function unobserved(){}", false).unwrap();
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let function = engine.interp.get_var("unobserved", &env).ok().unwrap();
         let function_handle = function.as_obj().unwrap();
         let object = function_handle.borrow();

@@ -10,7 +10,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn global(engine: &mut Engine, name: &str) -> Value {
-    let global = Value::Obj(engine.interp.global.clone());
+    let global = Value::Obj(engine.interp.global);
     engine
         .interp
         .get_member_key(&global, name)
@@ -58,7 +58,7 @@ fn iterator_results_remove_wrapper_allocations_but_public_next_keeps_identity() 
         // Exhausted calls must still return fresh, ordinary observable objects.
         let first = engine
             .interp
-            .call(next.clone(), iterator.clone(), &[])
+            .call(next, iterator, &[])
             .unwrap_or_else(|_| panic!("public next"));
         let second = engine
             .interp

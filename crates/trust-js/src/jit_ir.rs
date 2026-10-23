@@ -11,9 +11,7 @@
 #![allow(dead_code)]
 
 use crate::bytecode::{Chunk, Op, UpdKind};
-use crate::tagged::{
-    BytecodePc, DeoptId, DeoptRecord, MaterializationRecipe, RootMap, SafepointId,
-};
+use crate::deopt::{BytecodePc, DeoptId, DeoptRecord, MaterializationRecipe, RootMap, SafepointId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlockId(pub(crate) u32);
@@ -2359,24 +2357,53 @@ mod tests {
         ];
         let (_cfg, ir) = region(&ops, 0, 2);
         let record = ir.deopt_record_for_exit(0, 11, 13).unwrap();
-        assert_eq!(record.bytecode_pc.get(), 6);
+        assert_eq!(record.bytecode_pc, BytecodePc::new(6));
         assert_eq!(record.root_map.safepoint, SafepointId::new(13));
         assert_eq!(record.root_map.slot_count, 2);
         assert_eq!(record.root_map.operand_depth, 0);
         assert_eq!(record.recipes.len(), 2);
         record.validate().unwrap();
 
-        let frame = crate::tagged::TaggedFrame::new(vec![
-            crate::tagged::TaggedValue::number(1.0),
-            crate::tagged::TaggedValue::number(2.0),
-        ]);
-        let values = record.materialize(&frame).unwrap();
+        let frame = [crate::value::Value::Num(1.0), crate::value::Value::Num(2.0)];
+        let values: Vec<_> = record
+            .recipes
+            .iter()
+            .map(|MaterializationRecipe::CopySlot(slot)| frame[usize::from(*slot)].bits())
+            .collect();
+        assert_eq!(values, vec![frame[0].bits(), frame[1].bits()]);
+    }
+
+    #[test]
+    fn ssa_side_exit_keeps_the_exact_pc_and_nonempty_operand_stack() {
+        let ops = [
+            Op::LoadLocal(0),
+            Op::LoadLocal(1),
+            Op::JumpIfFalse(6),
+            Op::Pop,
+            Op::Jump(0),
+            Op::ReturnUndef,
+            Op::Return,
+        ];
+        let (_cfg, ir) = region(&ops, 0, 2);
+        let record = ir.deopt_record_for_exit(0, 21, 34).unwrap();
+        assert_eq!(record.id, DeoptId::new(21));
+        assert_eq!(record.bytecode_pc, BytecodePc::new(6));
+        assert_eq!(record.root_map.bytecode_pc, BytecodePc::new(6));
+        assert_eq!(record.root_map.safepoint, SafepointId::new(34));
+        assert_eq!(record.root_map.slot_count, 3);
+        assert_eq!(record.root_map.operand_depth, 1);
+        assert_eq!(record.root_map.tagged_registers, 0);
+        assert_eq!(record.root_map.tagged_slots, vec![0b111]);
+        assert_eq!(record.root_map.handle_slots, vec![0]);
+        assert_eq!(record.root_map.environment_slots, vec![0]);
         assert_eq!(
-            values,
+            record.recipes,
             vec![
-                crate::tagged::MaterializedValue::Word(crate::tagged::TaggedValue::number(1.0)),
-                crate::tagged::MaterializedValue::Word(crate::tagged::TaggedValue::number(2.0)),
+                MaterializationRecipe::CopySlot(0),
+                MaterializationRecipe::CopySlot(1),
+                MaterializationRecipe::CopySlot(2),
             ]
         );
+        record.validate().unwrap();
     }
 }

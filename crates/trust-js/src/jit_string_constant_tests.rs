@@ -38,7 +38,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn global(engine: &mut Engine, name: &str) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine.interp.get_var(name, &env).ok().expect("bound name")
 }
 
@@ -114,7 +114,7 @@ fn constants(chunk: &Chunk) -> Vec<LStr> {
             Op::Const(k) if chunk.jit_const_is_str(k) => {
                 // SAFETY: the slot lives as long as the chunk, which the caller lends.
                 match &(unsafe { &*chunk.jit_const_ptr(k) }).view() {
-                    ValueView::Str(string) => Some(string.clone()),
+                    ValueView::Str(string) => Some(*string),
                     _ => unreachable!("a string constant"),
                 }
             }
@@ -190,7 +190,7 @@ fn returned(
                 .expect("the constant's index");
             assert_eq!(
                 chunk.jit_const_str_word(k),
-                Some(crate::value::PackedValue::pack(value.clone()).bits()),
+                Some(value.bits()),
                 "the immediate is the word the VM pushes"
             );
         });

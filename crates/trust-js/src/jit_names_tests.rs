@@ -50,7 +50,7 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
     ];
     let holder = scope(None, "outer", 11.0, layouts[0]);
     let child = scope(
-        Some(scope(Some(holder.clone()), "middle", 0.0, layouts[1])),
+        Some(scope(Some(holder), "middle", 0.0, layouts[1])),
         "local",
         0.0,
         layouts[2],
@@ -60,7 +60,7 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
     assert_eq!(run(&mut engine, &chunk, &code, &child), 11.0);
     let other = scope(None, "outer", 29.0, layouts[0]);
     let fresh = scope(
-        Some(scope(Some(other.clone()), "middle", 0.0, layouts[1])),
+        Some(scope(Some(other), "middle", 0.0, layouts[1])),
         "local",
         0.0,
         layouts[2],
@@ -105,7 +105,7 @@ fn native_deep_global_names_load_store_update_without_helper_walks() {
     let mut engine = Engine::new();
     engine.eval("var outer=0;", false).unwrap();
     let (chunk, code) = compile(&mut engine, "function f(){outer=29;return ++outer;}");
-    let child = new_scope(Some(new_scope(Some(engine.interp.global_env.clone()))));
+    let child = new_scope(Some(new_scope(Some(engine.interp.global_env))));
     assert_eq!(run(&mut engine, &chunk, &code, &child), 30.0);
     let before = TEST_NATIVE_DEEP_NAMES.with(std::cell::Cell::get);
     assert_eq!(run(&mut engine, &chunk, &code, &child), 30.0);
@@ -350,7 +350,7 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
     let holder = scope(None, "outer", 7.0, 0);
     for generation in [0, 1, u32::MAX - 1, u32::MAX] {
         holder.borrow_mut().vars.set_generation_for_test(generation);
-        let reference = PreparedReference::scope(Rc::from("outer"), holder.clone(), true);
+        let reference = PreparedReference::scope(Rc::from("outer"), holder, true);
         assert_eq!(
             unsafe { probe(&reference) },
             if generation == u32::MAX {
@@ -366,7 +366,7 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
         "outer",
         crate::value::Property::data(Value::Num(13.0), true, true, true),
     );
-    let mut reference = PreparedReference::object(Rc::from("outer"), object.clone(), false);
+    let mut reference = PreparedReference::object(Rc::from("outer"), object, false);
     reference.slot = object.borrow().props.slot_of("outer").unwrap();
     reference.shape = object.borrow().props.shape();
     assert_ne!(unsafe { probe(&reference) }, 0);

@@ -92,7 +92,7 @@ fn caller_chunk(engine: &mut crate::Engine) -> Rc<Chunk> {
         ),
         Ok(crate::Completion::Value(_))
     ));
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine
         .interp
         .get_var("epochCaller", &env)
@@ -200,9 +200,9 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     let mut helpers = [0usize; N_HELPERS];
     helpers[H_CALL] = slow.as_ptr() as usize;
     helpers[H_CALL_HIT] = hit.as_ptr() as usize;
-    let mut operand = [PackedValue::pack(Value::Obj(object.clone()))];
+    let mut operand = [(Value::Obj(object))];
     let top = unsafe { operand.as_mut_ptr().add(1) };
-    let run: unsafe extern "C" fn(*mut usize, *mut PackedValue, *const usize) -> *mut PackedValue =
+    let run: unsafe extern "C" fn(*mut usize, *mut Value, *const usize) -> *mut Value =
         unsafe { std::mem::transmute(code.as_ptr()) };
     let invoke = |context: &mut ProbeContext| {
         context.0[0] = 0;
@@ -286,7 +286,7 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     // Owners carry no count: the probe leaves the callee's operand word and cell
     // intact, which a collection (and, in debug builds, its heap verifier) confirms.
     assert!(
-        matches!(&(operand[0].unpack()).view(), ValueView::Obj(o) if crate::value::Gc::ptr_eq(o, &object)),
+        matches!(&(operand[0].clone()).view(), ValueView::Obj(o) if crate::value::Gc::ptr_eq(o, &object)),
         "the probe must not consume the callee operand"
     );
     engine.interp.gc_collect();

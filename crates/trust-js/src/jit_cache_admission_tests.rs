@@ -482,7 +482,7 @@ fn admission_denial_precedes_actual_ordinary_continuation_and_osr_compilation() 
         }
     }
     fn call(e: &mut Engine, name: &str) -> Value {
-        let env = e.interp.global_env.clone();
+        let env = e.interp.global_env;
         let f = e.interp.get_var(name, &env).ok().expect("fixture function");
         e.interp
             .call(f, Value::Undefined, &[])

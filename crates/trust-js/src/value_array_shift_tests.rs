@@ -5,7 +5,7 @@ use crate::value::ValueView;
 fn array(values: Vec<Value>, packed: bool, reverse: bool, named_tail: bool) -> Props {
     let len = values.len();
     let mut properties = if packed {
-        let mut words: Vec<_> = values.into_iter().map(PackedValue::pack).collect();
+        let mut words: Vec<_> = values.into_iter().collect();
         let props = unsafe { Props::packed_array_from_raw(words.as_mut_ptr(), len) };
         unsafe { words.set_len(0) };
         props
@@ -316,9 +316,9 @@ fn packed_creation_and_prepend_do_not_certify_holes_or_nonplain_descriptors() {
 #[test]
 fn tiny_prepends_stay_inline_before_promoting_once() {
     let owners: Vec<_> = (0..12).map(|_| Object::new(None)).collect();
-    let mut properties = Props::packed_array_from_values(Vec::new());
+    let mut properties = Props::packed_array(std::iter::empty());
     for (index, owner) in owners.iter().enumerate() {
-        assert!(properties.unshift_dense_array(index, &[Value::Obj(owner.clone())]));
+        assert!(properties.unshift_dense_array(index, &[Value::Obj(*owner)]));
         assert_eq!(
             properties.elems.packed.is_none(),
             index < INLINE_PACKED_CAPACITY
@@ -333,7 +333,7 @@ fn tiny_prepends_stay_inline_before_promoting_once() {
     for index in (0..12).rev() {
         let first = properties.shift_dense_array(index + 1).unwrap();
         assert!(
-            matches!(&(first).view(), ValueView::Obj(value) if Gc::ptr_eq(value, &owners[index]))
+            matches!(first.view(), ValueView::Obj(value) if Gc::ptr_eq(&value, &owners[index]))
         );
     }
 }

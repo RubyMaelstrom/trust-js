@@ -10,9 +10,9 @@ use crate::value::ValueView;
 use std::cell::Cell;
 
 use super::{observe_arithmetic_operands, observe_arithmetic_result, Chunk, Op};
-use crate::execution_storage::{SlotAccess, StoredValue, ValueStack};
+use crate::execution_storage::{SlotAccess, ValueStack};
 use crate::interpreter::{Env, Interp, MAX_STR_LEN};
-use crate::value::{PackedValue, Value};
+use crate::value::Value;
 
 const MAX_SCOPES: usize = 16;
 
@@ -90,7 +90,7 @@ fn try_store(
         return None;
     };
     let name = &chunk.names[plan.name as usize];
-    let mut current = env.clone();
+    let mut current = *env;
     for _ in 0..MAX_SCOPES {
         if Env::ptr_eq(&current, &interp.global_env) {
             return None;
@@ -135,19 +135,19 @@ fn try_store(
                 let _ = chunk.name_ic_fill(interp, env, plan.name, plan.write_cache);
                 return Some(stored);
             }
-            record.parent.clone()
+            record.parent
         };
         current = parent?;
     }
     None
 }
 
-pub(super) fn try_vm<S: StoredValue>(
+pub(super) fn try_vm(
     chunk: &Chunk,
     interp: &mut Interp,
     env: &Env,
-    slots: &[Cell<S>],
-    stack: &mut ValueStack<S>,
+    slots: &[Cell<Value>],
+    stack: &mut ValueStack,
     pc: usize,
     stop_at: Option<usize>,
 ) -> Option<usize> {
@@ -176,7 +176,7 @@ pub(super) fn try_vm<S: StoredValue>(
 pub(crate) unsafe extern "C" fn jit_try(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     // OPSTAT counts operations that actually reach their original checked helpers. Keep
@@ -204,7 +204,7 @@ pub(crate) unsafe extern "C" fn jit_try(
     };
     let end_sp = if let Some(result) = stored.result {
         unsafe {
-            sp.write(PackedValue::pack(result));
+            sp.write(result);
             sp.add(1)
         }
     } else {

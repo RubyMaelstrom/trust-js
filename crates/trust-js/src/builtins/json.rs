@@ -90,7 +90,7 @@ pub(super) fn install_json(it: &mut Interp) {
         // function can observe it (as its receiver).
         let holder = if opts.func.is_some() {
             let wrapper = i.new_object();
-            set_data(&wrapper, "", value.clone());
+            set_data(&wrapper, "", value);
             Value::Obj(wrapper)
         } else {
             Value::Undefined
@@ -176,7 +176,7 @@ pub(super) fn install_json(it: &mut Interp) {
         o.borrow_mut().proto = None;
         set_data(&o, "rawJSON", Value::lstr(text.clone()));
         set_internal(&o, "\u{0}raw_json", Value::lstr(text));
-        i.freeze_object(&Value::Obj(o.clone()));
+        i.freeze_object(&Value::Obj(o));
         Ok(Value::Obj(o))
     });
     it.def_method(&j, "isRawJSON", 1, |_i, _t, args| {
@@ -394,8 +394,8 @@ fn internalize_json_property(
         }
     }
     ab(i.call(
-        reviver.clone(),
-        holder.clone(),
+        *reviver,
+        *holder,
         &[
             crate::value::string_key_value(name),
             val,
@@ -498,7 +498,7 @@ fn json_get_index(
 /// objects to the full [[Get]] (whose result is the same, including getter calls).
 fn json_to_json_method(i: &mut Interp, value: &Value) -> Result<Value, Value> {
     if let ValueView::Obj(start) = &(value).view() {
-        let mut current = start.clone();
+        let mut current = *start;
         loop {
             let next = {
                 let object = current.borrow();
@@ -508,7 +508,7 @@ fn json_to_json_method(i: &mut Interp, value: &Value) -> Result<Value, Value> {
                 match object.props.get("toJSON") {
                     Some(property) if !property.accessor() => return Ok(property.value()),
                     Some(_) => break,
-                    None => object.proto.clone(),
+                    None => object.proto,
                 }
             };
             match next {
@@ -533,11 +533,11 @@ fn json_serialize_property(
     if matches!((value).view(), ValueView::Obj(_) | ValueView::BigInt(_)) {
         let to_json = json_to_json_method(i, &value)?;
         if to_json.is_callable() {
-            value = ab(i.call(to_json, value.clone(), &[key.value()]))?;
+            value = ab(i.call(to_json, value, &[key.value()]))?;
         }
     }
     if let Some(func) = &s.opts.func {
-        value = ab(i.call(func.clone(), holder.clone(), &[key.value(), value]))?;
+        value = ab(i.call(*func, *holder, &[key.value(), value]))?;
     }
     if let ValueView::Obj(o) = &(value).view() {
         // A JSON.rawJSON object (always created with a null prototype) serializes as its stored
@@ -598,7 +598,7 @@ fn json_serialize_property(
             if !matches!(o.borrow().call, Callable::None) {
                 return Ok(false); // functions are omitted
             }
-            let o = o.clone();
+            let o = *o;
             if json_is_array(i, &value)? {
                 nested(i, |i| json_serialize_array(i, s, &value, &o))?;
             } else {
@@ -1076,7 +1076,7 @@ fn json_parse_recorded(
             let start = *pos;
             let v = json_parse_value(i, input, pos)?;
             let src = input.to_string(start, *pos);
-            Ok((v.clone(), JsonRecord::Prim(src, v)))
+            Ok((v, JsonRecord::Prim(src, v)))
         }
     }
 }

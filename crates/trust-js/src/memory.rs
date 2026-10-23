@@ -1121,9 +1121,9 @@ impl Visitor {
             internal_bytes += self.native_buffer(&view.buffer);
         }
         match &object.exotic {
-            Exotic::StrWrap(value) => self.value(&Value::Str((**value).clone())),
+            Exotic::StrWrap(value) => self.value(&Value::Str(**value)),
             Exotic::SymWrap(value) => self.symbol(value),
-            Exotic::BigIntWrap(value) => self.value(&Value::BigInt((**value).clone())),
+            Exotic::BigIntWrap(value) => self.value(&Value::BigInt(**value)),
             Exotic::Error(trace) => {
                 internal_bytes += trace
                     .as_deref()
@@ -1136,7 +1136,7 @@ impl Visitor {
             Exotic::StringIterator(state) => {
                 internal_bytes += std::mem::size_of_val(&**state);
                 if let Some(string) = &state.string {
-                    self.value(&Value::Str(string.clone()));
+                    self.value(&Value::Str(*string));
                 }
             }
             Exotic::Collection(entries) => {
@@ -1408,7 +1408,7 @@ fn scan_realm(
         interp
             .vm_pool
             .capacity()
-            .saturating_mul(size_of::<crate::execution_storage::CompactFrame>())
+            .saturating_mul(size_of::<crate::execution_storage::ExecutionFrame>())
             .saturating_add(
                 interp
                     .stub_cache
@@ -1453,7 +1453,7 @@ fn scan_realm(
             slots
                 .capacity()
                 .saturating_add(stack.capacity())
-                .saturating_mul(size_of::<crate::value::PackedValue>()),
+                .saturating_mul(size_of::<crate::value::Value>()),
         );
         debug_assert!(slots.is_empty() && stack.is_empty());
     }
@@ -1721,10 +1721,10 @@ fn scan_realm(
             visitor.value(&on_fulfilled.callback);
             visitor.value(&on_rejected.callback);
             if let Some(global) = &on_fulfilled.script_caller {
-                visitor.value(&Value::Obj(global.clone()));
+                visitor.value(&Value::Obj(*global));
             }
             if let Some(global) = &on_rejected.script_caller {
-                visitor.value(&Value::Obj(global.clone()));
+                visitor.value(&Value::Obj(*global));
             }
             visitor.value(result);
         }
@@ -1746,7 +1746,7 @@ fn scan_realm(
     for job in &interp.microtasks {
         visitor.value(&job.handler.callback);
         if let Some(global) = &job.handler.script_caller {
-            visitor.value(&Value::Obj(global.clone()));
+            visitor.value(&Value::Obj(*global));
         }
         visitor.value(&job.result);
         visitor.value(&job.value);
@@ -1853,7 +1853,7 @@ fn scan_realm(
     for registry in interp.finalization_registries.values() {
         visitor.value(&registry.cleanup_callback.callback);
         if let Some(global) = &registry.cleanup_callback.script_caller {
-            visitor.value(&Value::Obj(global.clone()));
+            visitor.value(&Value::Obj(*global));
         }
         totals
             .interpreter_side_tables
@@ -2227,7 +2227,7 @@ fn scan_realm(
         )>()));
     for state in interp.collection_iterators.values() {
         if let Some(target) = &state.target {
-            visitor.value(&Value::Obj(target.clone()));
+            visitor.value(&Value::Obj(*target));
         }
     }
     totals
@@ -2656,7 +2656,7 @@ mod tests {
                 false,
             )
             .expect("layout fixture parses");
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let ValueView::Obj(a) = (engine
             .interp
             .get_var("a", &env)
@@ -2879,11 +2879,8 @@ mod tests {
         let string = LStr::from("host-retained string");
         let requested_bytes = size_of::<RefCell<Vec<u8>>>() + allocation.borrow().capacity();
         let held = engine.scope(|cx| {
-            crate::handles::Handle::new(
-                cx,
-                &crate::scope::Value::from_internal(Value::Str(string.clone())),
-            )
-            .expect("a handle")
+            crate::handles::Handle::new(cx, &crate::scope::Value::from_internal(Value::Str(string)))
+                .expect("a handle")
         });
         let make_reporter = || ReportedManagedHostState {
             allocation: allocation.clone(),
@@ -2958,7 +2955,7 @@ mod tests {
         let string = LStr::from("shared allocation");
         let expected = string.retained_requested_bytes();
         let mut visitor = Visitor::default();
-        visitor.value(&Value::Str(string.clone()));
+        visitor.value(&Value::Str(string));
         visitor.value(&Value::Str(string));
         assert_eq!(visitor.strings_symbols_bigints, expected);
     }
@@ -3074,9 +3071,8 @@ mod tests {
         let string = LStr::from("explicit native capture");
         let callable = Callable::NativeData(Rc::new(crate::value::NativeCallable {
             body: crate::value::NativeCallableBody::Captured {
-                function: |_, _, _, captures| Ok(captures[0].clone()),
-                captures: vec![Value::Str(string.clone()), Value::Str(string.clone())]
-                    .into_boxed_slice(),
+                function: |_, _, _, captures| Ok(captures[0]),
+                captures: vec![Value::Str(string), Value::Str(string)].into_boxed_slice(),
             },
             retained: None,
             identity: Rc::from("captured"),
@@ -3134,7 +3130,7 @@ mod tests {
             "first",
             0,
             first_callable,
-            vec![Value::Str(string.clone())],
+            vec![Value::Str(string)],
             crate::value::NativeCaptures::Reported(first_reporter),
         );
         let (second_callable, second_reporter) = make_closure();
@@ -3142,7 +3138,7 @@ mod tests {
             "second",
             0,
             second_callable,
-            vec![Value::Str(string.clone())],
+            vec![Value::Str(string)],
             crate::value::NativeCaptures::Reported(second_reporter),
         );
         let snapshot = measure(&interp, &[first, second], &[]);
@@ -3157,7 +3153,7 @@ mod tests {
             crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
                 body: crate::value::NativeCallableBody::CapturedClosure {
                     function: first_func,
-                    captures: vec![Value::Str(string.clone())].into_boxed_slice(),
+                    captures: vec![Value::Str(string)].into_boxed_slice(),
                 },
                 retained: Some(first_retained),
                 identity: Rc::from("first"),
@@ -3167,7 +3163,7 @@ mod tests {
             crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
                 body: crate::value::NativeCallableBody::CapturedClosure {
                     function: second_func,
-                    captures: vec![Value::Str(string.clone())].into_boxed_slice(),
+                    captures: vec![Value::Str(string)].into_boxed_slice(),
                 },
                 retained: Some(second_retained),
                 identity: Rc::from("second"),
@@ -3646,7 +3642,7 @@ mod tests {
         );
         let registry = match engine
             .interp
-            .get_member_key(&Value::Obj(engine.interp.global.clone()), "memoryFinalizer")
+            .get_member_key(&Value::Obj(engine.interp.global), "memoryFinalizer")
         {
             Ok(registry) => registry,
             Err(_) => panic!("registry global is readable"),
@@ -3701,8 +3697,7 @@ mod tests {
             .interp
             .decorator_initializers
             .push(Value::lstr("decorator initializer"));
-        engine.interp.new_target =
-            crate::value::PackedValue::pack(Value::lstr("active new target"));
+        engine.interp.new_target = Value::lstr("active new target");
         engine.interp.pending_new_target = Value::lstr("pending new target");
 
         let shared_values: Rc<[Value]> = vec![Value::lstr("lazy frame argument")].into();
@@ -3723,14 +3718,14 @@ mod tests {
         let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let before = measure(&engine.interp, &before_objects, &before_scopes);
-        let object = engine.interp.global.clone();
+        let object = engine.interp.global;
         let identity = Gc::as_ptr(&object) as usize;
 
-        engine.interp.gc_pins.insert(identity, object.clone());
+        engine.interp.gc_pins.insert(identity, object);
         engine.interp.proxies.insert(
             &engine.interp.gc_heap,
             identity,
-            (Value::Obj(object.clone()), Value::Obj(object.clone())),
+            (Value::Obj(object), Value::Obj(object)),
         );
         engine.interp.host_indexed.insert(
             &engine.interp.gc_heap,
@@ -3758,7 +3753,7 @@ mod tests {
         engine.interp.mapped_arguments.insert(
             &engine.interp.gc_heap,
             identity,
-            (engine.interp.global_env.clone(), mapped_names),
+            (engine.interp.global_env, mapped_names),
         );
         engine.interp.module_source_objs.insert(
             "source/module.js".to_string(),

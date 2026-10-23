@@ -213,7 +213,7 @@ fn for_in_backing_hits_share_identity_without_retaining_author_objects() {
             .borrow_mut()
             .props
             .insert("inherited", Property::plain(Value::Num(1.0)));
-        let object = Object::new(Some(prototype.clone()));
+        let object = Object::new(Some(prototype));
         object
             .borrow_mut()
             .props

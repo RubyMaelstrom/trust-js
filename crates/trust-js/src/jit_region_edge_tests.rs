@@ -105,7 +105,7 @@ fn engine(tier: Tier) -> Engine {
 fn cfg_edges_actual_branching_region_keeps_backedge_poll_and_deadline() {
     let mut engine = engine(Tier::Bytecode);
     evaluate(&mut engine, "function cfgEdges(n){var sum=0;for(var i=0;i<n;i++){if((i&3)===0)sum+=i;else if((i&3)===1)sum-=i;else sum+=2;}return sum;}cfgEdges(64);");
-    let global = Value::Obj(engine.interp.global.clone());
+    let global = Value::Obj(engine.interp.global);
     let function = engine
         .interp
         .get_member_key(&global, "cfgEdges")

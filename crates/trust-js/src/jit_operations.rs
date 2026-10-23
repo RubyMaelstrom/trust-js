@@ -638,7 +638,7 @@ pub(super) fn emit(
             a.add_imm(20, 20, 8);
         }
         Op::Const(k) if fast & 128 != 0 && chunk.jit_const_copyable(*k) => {
-            let Some(bits) = chunk.jit_const_packed_bits(*k) else {
+            let Some(bits) = chunk.jit_const_scalar_bits(*k) else {
                 return false;
             };
             a.mov_imm64(9, bits);

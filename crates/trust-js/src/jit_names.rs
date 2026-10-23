@@ -39,7 +39,7 @@ mod tests;
 #[path = "jit_packed_name_tests.rs"]
 mod packed_tests;
 
-/// x12: descriptor; x9: the current scope's `Env::as_ptr`. On success x14 is Value/PackedValue
+/// x12: descriptor; x9: the current scope's `Env::as_ptr`. On success x14 is Value
 /// address, x7 identifies Property(1) or Binding(0). Both store words; the flag preserves
 /// descriptor/initialization/mutability rules and the actual owner. Clobbers x7,x9..x17 and NZCV
 /// only.

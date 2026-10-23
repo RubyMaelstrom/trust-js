@@ -171,8 +171,8 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     let child = engine.interp.create_realm();
     in_realm(&mut engine.interp, &child, |i| {
         assert!(i.run_classic_program(&program, None).is_ok());
-        set_global(i, "mainRealm", main.clone());
-        set_global(i, "mainNative", native.clone());
+        set_global(i, "mainRealm", main);
+        set_global(i, "mainNative", native);
         let child_subject = i
             .member_get(&i.global_this(), "subject")
             .ok()

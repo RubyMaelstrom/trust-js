@@ -305,7 +305,7 @@ fn value_only_writes_keep_shape_but_mutable_escape_demotes() {
 fn replace_properties_preserves_live_prototype_flag() {
     let mut engine = Engine::new();
     let obj = value(&mut engine, "({keep: 1})");
-    let o = obj.as_obj().unwrap().clone();
+    let o = obj.as_obj().unwrap();
     o.borrow().props.mark_proto();
     o.borrow_mut().replace_properties(Props::with_capacity(0));
     let epoch = proto_epoch();

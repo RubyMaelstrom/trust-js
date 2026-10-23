@@ -108,7 +108,7 @@ fn run_shared(it: &mut Interp) {
 }
 
 fn shared_method(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
-    let global = Value::Obj(it.global.clone());
+    let global = Value::Obj(it.global);
     let Ok(shared) = it.get_member_key(&global, "shared") else {
         panic!("shared is defined");
     };
@@ -126,7 +126,7 @@ fn shared_method(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
 
 /// The AST Function behind a probe method, to prove both Realms run the same code.
 fn probe_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
-    let global = Value::Obj(it.global.clone());
+    let global = Value::Obj(it.global);
     let Ok(probe) = it.get_member_key(&global, "probe") else {
         panic!("probe is defined");
     };
@@ -143,7 +143,7 @@ fn probe_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
 }
 
 fn global_user_callable(it: &mut Interp, name: &str) -> crate::value::UserFn {
-    let env = it.global_env.clone();
+    let env = it.global_env;
     let value = it
         .get_var(name, &env)
         .unwrap_or_else(|_| panic!("missing global {name}"));
@@ -154,7 +154,7 @@ fn global_user_callable(it: &mut Interp, name: &str) -> crate::value::UserFn {
     let Callable::User(user) = &borrowed.call else {
         panic!("{name} is not an ordinary function")
     };
-    user.clone()
+    *user
 }
 
 fn has_binding_getter_cache(user: &crate::value::UserCallable) -> bool {
@@ -171,7 +171,7 @@ fn realms_sharing_a_snapshot_keep_distinct_intrinsics_globals_and_objects() {
         engine.set_tier(tier);
         let it = &mut *engine.interp;
         let child = it.create_realm();
-        let main = Value::Obj(it.global.clone());
+        let main = Value::Obj(it.global);
 
         set_global(it, "realmTag", Value::lstr("main"));
         run_shared(it);
@@ -210,8 +210,8 @@ fn realms_sharing_a_snapshot_keep_distinct_intrinsics_globals_and_objects() {
         }
 
         // ... but every object they create belongs to the Realm that created it.
-        set_global(it, "childRealm", child.clone());
-        in_realm(it, &child, |it| set_global(it, "mainRealm", main.clone()));
+        set_global(it, "childRealm", child);
+        in_realm(it, &child, |it| set_global(it, "mainRealm", main));
         let cross = eval_string(
             it,
             r#"[
@@ -340,7 +340,7 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         let it = &mut *engine.interp;
-        let main = Value::Obj(it.global.clone());
+        let main = Value::Obj(it.global);
         let run = |it: &mut Interp| {
             let body = it.shared_snapshot_program(snapshot).expect("decodes");
             assert!(it.run_classic_program(&body, None).is_ok());
@@ -364,7 +364,7 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
         }
         let child = it.create_realm();
         in_realm(it, &child, run);
-        in_realm(it, &child, |it| set_global(it, "mainRealm", main.clone()));
+        in_realm(it, &child, |it| set_global(it, "mainRealm", main));
         let result = in_realm(it, &child, |it| {
             eval_string(
                 it,

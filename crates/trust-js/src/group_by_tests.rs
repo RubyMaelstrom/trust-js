@@ -283,7 +283,7 @@ fn group_by_cached_callees_keep_then_release_their_final_owners() {
                 let mut weak_callees = Vec::new();
                 let mut weak_fields = Vec::new();
                 for name in ["callback", "next"] {
-                    let env = engine.interp.global_env.clone();
+                    let env = engine.interp.global_env;
                     let callee = engine
                         .interp
                         .get_var(name, &env)

@@ -14,7 +14,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn chunk(i: &mut Interp, name: &str) -> Rc<Chunk> {
-    let env = i.global_env.clone();
+    let env = i.global_env;
     let value = i.get_var(name, &env).ok().expect("fixture function");
     let object_handle = value.as_obj().expect("function object");
     let object = object_handle.borrow();
@@ -131,7 +131,7 @@ fn direct_return_and_throw_survive_reentrant_reclamation() {
     };
     assert!(matches!(mode.as_str(), "stable" | "stale"));
     let mut e = engine();
-    let global = e.interp.global.clone();
+    let global = e.interp.global;
     e.interp
         .def_method(&global, "reclaimNow", 0, reclaim_from_native);
     eval(
@@ -447,7 +447,7 @@ fn recompiled_functions_keep_their_original_realm() {
         .global
         .borrow_mut()
         .props
-        .insert("other", crate::value::Property::plain(child.clone()));
+        .insert("other", crate::value::Property::plain(child));
     e.interp
         .eval_in_realm(
             &child,
@@ -515,7 +515,7 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
     use crate::value::{Gc, Value};
     use std::sync::atomic::Ordering::Relaxed;
     fn value(e: &mut Engine, name: &str) -> Value {
-        let env = e.interp.global_env.clone();
+        let env = e.interp.global_env;
         e.interp.get_var(name, &env).ok().expect("fixture binding")
     }
     fn function_pin(value: &Value) -> std::rc::Weak<crate::ast::Function> {

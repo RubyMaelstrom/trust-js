@@ -23,7 +23,7 @@
 use crate::bytecode::Tier;
 use crate::interpreter::Interp;
 use crate::value::ValueView;
-use crate::value::{Gc, PackedValue, Property, Value, WeakGc};
+use crate::value::{Gc, Property, Value, WeakGc};
 use crate::Engine;
 use std::cell::RefCell;
 
@@ -685,7 +685,7 @@ fn return_context() -> super::JitCtx {
         slots: std::ptr::null_mut(),
         inline_ic_safe: std::ptr::null(),
         env_raw: std::ptr::null(),
-        this_word: PackedValue::pack(Value::Undefined),
+        this_word: (Value::Undefined),
         global_body: std::ptr::null(),
         genv: 0,
         interp: std::ptr::null_mut(),
@@ -696,7 +696,7 @@ fn return_context() -> super::JitCtx {
         code_base: std::ptr::null(),
         pc_offsets: std::ptr::null(),
         error: None,
-        ret: PackedValue::pack(Value::Undefined),
+        ret: (Value::Undefined),
         env_parent_raw: std::ptr::null(),
         opstat_enabled: false,
         callstat_enabled: false,
@@ -717,26 +717,26 @@ fn return_context() -> super::JitCtx {
 /// Store a fresh tracked object `{tag}` in `word` from a frame of its own, so that no handle to
 /// it is left in the caller's frame; returns its weak handle.
 #[inline(never)]
-fn track_into(i: &mut Interp, word: &mut PackedValue, tag: &str) -> WeakGc {
+fn track_into(i: &mut Interp, word: &mut Value, tag: &str) -> WeakGc {
     let object = i.new_object();
     object
         .borrow_mut()
         .props
         .insert("tag", Property::plain(Value::str(tag)));
-    *word = PackedValue::pack(Value::Obj(object));
+    *word = Value::Obj(object);
     let _ = track(i, Value::Undefined, &[Value::Obj(object)]);
     Gc::downgrade(&object)
 }
 
 /// Store a second word for the object `source` holds in `word`, from a frame of its own.
 #[inline(never)]
-fn alias_into(source: &PackedValue, word: &mut PackedValue) {
-    *word = source.clone();
+fn alias_into(source: &Value, word: &mut Value) {
+    *word = *source;
 }
 
 /// The `tag` of the object `word` holds, read in a frame of its own.
 #[inline(never)]
-fn tag_of(word: &PackedValue) -> Option<String> {
+fn tag_of(word: &Value) -> Option<String> {
     let tag =
         word.with_object(|object| object.borrow().props.get("tag").map(Property::value))??;
     match (tag).view() {
@@ -762,9 +762,7 @@ fn return_round(i: &mut Interp, occupied: bool, alias: bool) {
     let mut ctx = return_context();
     // The operand word lives on the Rust heap, unregistered: once `jit_return` has moved it into
     // `ret`, only `ret` can keep the result alive.
-    let mut operand = Box::new(std::mem::ManuallyDrop::new(PackedValue::pack(
-        Value::Undefined,
-    )));
+    let mut operand = Box::new(std::mem::ManuallyDrop::new(Value::Undefined));
     let old = occupied.then(|| track_into(i, &mut ctx.ret, "old"));
     let returned = match &old {
         Some(old) if alias => {
@@ -777,7 +775,7 @@ fn return_round(i: &mut Interp, occupied: bool, alias: bool) {
         ctx: &ctx,
         words: [(std::ptr::null(), 0), (std::ptr::null(), 0)],
     });
-    let base: *mut PackedValue = &mut **operand;
+    let base: *mut Value = &mut **operand;
     // SAFETY: `base` holds one written word; the operand pointer is one past it.
     assert_eq!(unsafe { jit_return(&mut ctx, 1, base.add(1)) }, base);
     collect_here(i);
@@ -800,7 +798,7 @@ fn return_round(i: &mut Interp, occupied: bool, alias: bool) {
         );
     }
     // A bare return empties `ret` without reading its operand pointer.
-    let unused = std::ptr::NonNull::<PackedValue>::dangling().as_ptr();
+    let unused = std::ptr::NonNull::<Value>::dangling().as_ptr();
     // SAFETY: a bare return reads no operand.
     assert_eq!(unsafe { jit_return(&mut ctx, 0, unused) }, unused);
     assert!(ctx.ret.is_undefined());
@@ -837,13 +835,13 @@ fn context_return_slot_is_a_root() {
 /// root. Returns the markers of the receiver and the argument.
 #[inline(never)]
 fn committed_from_rust(i: &mut Interp) -> String {
-    let mut this_slot = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
+    let mut this_slot = std::mem::ManuallyDrop::new(Value::Undefined);
     track_into(i, &mut this_slot, "receiver");
-    let mut args = vec![PackedValue::pack(Value::Undefined)];
+    let mut args = vec![(Value::Undefined)];
     track_into(i, &mut args[0], "argument");
     // A stack copy of the argument word until the boundary has moved it: a collection at the
     // boundary's entry (GC stress) must not find the argument unrooted. It marks as `S`.
-    let held = std::mem::ManuallyDrop::new(args[0].clone());
+    let held = std::mem::ManuallyDrop::new(args[0]);
     // SAFETY: the receiver word and one argument word are written; the boundary consumes the
     // argument, and `args` is emptied before it drops.
     let result = unsafe { i.call_native_committed(collect, &*this_slot, args.as_mut_ptr(), 1) };
@@ -911,7 +909,7 @@ fn committed_native_call_operands_are_roots() {
         ("viaTail", "tailCall"),
     ] {
         let target = crate::gc_test::in_frame(|| {
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let value = engine.interp.get_var(native, &env).ok().expect("a native");
             Gc::as_ptr(&value.as_obj().expect("a function object")) as usize
         });
@@ -1140,35 +1138,89 @@ fn rooting_holds_under_gc_stress() {
     if std::env::var_os(CHILD).is_some() || crate::gc_test::stress_active() {
         return;
     }
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let executable = std::env::current_exe().unwrap();
+    let prefixes = [
+        "jit::rooting_tests::",
+        "jit::traced_tests::",
+        #[cfg(target_arch = "aarch64")]
+        "jit::word_routing_tests::",
+        "jit::this_tests::",
+        "jit::string_constant_tests::",
+        "value::lazy_function_prototype::tests::deferred_prototype",
+    ];
+    let exact = [
+        "callback::tests::long_callback_calls_root_operands_and_cache_weakly",
+        "bytecode::osr_tests::osr_entry_operand_prefix_is_a_root",
+        "value::lazy_function_prototype::tests::dead_constructors_leave_no_reserved_cells",
+        "value::lazy_function_prototype::tests::rust_overwrites_of_deferred_prototypes_free_their_cells",
+        "bytecode::return_slot_tests::packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries",
+        "memory::tests::deferred_prototype_payload_is_counted_once_in_property_storage",
+        "value::packed_value_tests::numeric_inspection_preserves_number_bits_without_materializing_properties",
+        "value::packed_value_tests::execution_value_reference_bits_preserve_the_cell_identity",
+        "value::packed_value_tests::copied_execution_values_preserve_all_kinds_and_cell_identities",
+        "execution_storage::tests::execution_storage_preserves_scalar_bits_and_object_identity",
+        "execution_storage::tests::execution_storage_loans_the_original_argument_window_without_copying",
+        "execution_storage::tests::slot_stack_copies_and_replacements_preserve_the_cell_identity",
+        "execution_storage::tests::shared_slot_aliases_observe_canonical_value_replacement",
+    ];
+    let listing = std::process::Command::new(&executable)
+        .args(["--list", "--color", "never"])
+        .output()
+        .expect("list registered rooting tests");
+    assert!(
+        listing.status.success(),
+        "could not list the child test binary"
+    );
+    let inventory = String::from_utf8(listing.stdout).expect("UTF-8 test inventory");
+    let registered: Vec<_> = inventory
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .collect();
+    for name in exact {
+        assert_eq!(
+            registered.iter().filter(|&&actual| actual == name).count(),
+            1,
+            "rooting child requests an absent or ambiguous exact test: {name}"
+        );
+    }
+    for prefix in prefixes {
+        assert!(
+            registered.iter().any(|name| name.starts_with(prefix)
+                && !name.ends_with("::rooting_holds_under_gc_stress")),
+            "rooting child requests an empty prefix: {prefix}"
+        );
+    }
+    let expected: std::collections::BTreeSet<_> = registered
+        .into_iter()
+        .filter(|name| {
+            (exact.contains(name) || prefixes.iter().any(|prefix| name.starts_with(prefix)))
+                && !name.contains("rooting_holds_under_gc_stress")
+        })
+        .collect();
+    assert!(!expected.is_empty());
+    let filters: Vec<_> = prefixes.into_iter().chain(exact).collect();
+    let output = std::process::Command::new(&executable)
+        .args(filters)
         .args([
-            "jit::rooting_tests::",
-            "callback::tests::long_callback_calls_root_operands_and_cache_weakly",
-            "bytecode::osr_tests::osr_entry_operand_prefix_is_a_root",
-            "jit::traced_tests::",
-            "jit::word_routing_tests::",
-            "jit::this_tests::",
-            "jit::string_constant_tests::",
-            "value::lazy_function_prototype::tests::dead_constructors_leave_no_reserved_cells",
-            "value::lazy_function_prototype::tests::deferred_prototype",
-            "value::lazy_function_prototype::tests::rust_overwrites_of_deferred_prototypes",
-            "bytecode::return_slot_tests::packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries",
-            "memory::tests::deferred_prototype_payload_is_counted_once_in_property_storage",
-            "value::packed_value_tests::packed_numeric_inspection_is_non_owning_and_preserves_number_bits",
-            "value::packed_value_tests::packed_value_moves_reference_ownership_without_a_bump",
-            "value::packed_value_tests::packed_value_direct_clones_preserve_bits_and_exact_owner_counts",
-            "execution_storage::tests::compact_storage_preserves_scalar_bits_and_heap_ownership",
-            "execution_storage::tests::compact_storage_decodes_only_argument_owners_with_exact_lifetime",
-            "execution_storage::tests::compact_storage_owner_moves_and_duplicates_do_not_cross_value_boundary",
-            "execution_storage::tests::compact_storage_shared_alias_observes_replacement_and_exact_owner_release",
             "--skip",
             "rooting_holds_under_gc_stress",
+            "--color",
+            "never",
         ])
         .env(CHILD, "1")
         .env("TRUST_JS_GC_STRESS", "1")
         .output()
         .expect("stressed rooting tests");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let observed: std::collections::BTreeSet<_> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("test ")?.split_once(" ... "))
+        .map(|(name, _)| name.strip_suffix(" - should panic").unwrap_or(name))
+        .collect();
+    assert_eq!(
+        observed, expected,
+        "rooting child executed a different test inventory\n{stdout}"
+    );
     assert!(
         output.status.success()
             && stdout.contains("test result: ok.")

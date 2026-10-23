@@ -322,7 +322,7 @@ fn fragment_tail_return_preserves_pending_trampoline_transfer() {
         let site = &body.site;
         engine.interp.strict = true;
         engine.interp.tco_ok = true;
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         // Past the ordinary-call depth (see `Op::TailDeep`) the tail call must be staged.
         let depth = engine.interp.depth;
         engine.interp.depth = crate::bytecode::ordinary_tail_call_depth();

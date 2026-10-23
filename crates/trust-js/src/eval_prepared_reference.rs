@@ -168,7 +168,7 @@ impl PreparedReference {
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         visitor.rc_str(&self.name);
         if let Some(object) = &self.object {
-            visitor.value(&Value::Obj(object.clone()));
+            visitor.value(&Value::Obj(*object));
         }
         // Scope storage is enumerated once by the existing scope graph census.
         0
@@ -237,21 +237,21 @@ impl Interp {
         env: &Env,
     ) -> Result<PreparedReference, Abrupt> {
         let strict = self.strict;
-        let mut current = Some(env.clone());
+        let mut current = Some(*env);
         while let Some(scope) = current {
             let (has_binding, with_object, parent) = {
                 let record = scope.borrow();
                 (
                     record.vars.contains_key(&name),
                     record.with_object(),
-                    record.parent.clone(),
+                    record.parent,
                 )
             };
             if has_binding {
                 return Ok(PreparedReference::scope(name, scope, strict));
             }
             if let Some(ValueView::Obj(object)) = (with_object).map(|__value| (__value).view()) {
-                if self.with_has_binding(&Value::Obj(object.clone()), &name)? {
+                if self.with_has_binding(&Value::Obj(object), &name)? {
                     // HasBinding has already run HasProperty and @@unscopables in order.
                     // The latter may mutate the descriptor: refresh only after it completes.
                     let mut reference = PreparedReference::object(name, object, strict);
@@ -262,14 +262,14 @@ impl Interp {
             current = parent;
         }
         // Capture the binding object, not a later ambient Realm's global object.
-        let global = self.global.clone();
+        let global = self.global;
         let mut reference = PreparedReference::object(name, global, strict);
         if self.refresh_reference_own_data_hint(&mut reference) {
             #[cfg(test)]
             record_reference_own_path(0);
             Ok(reference)
         } else if self.js_has_property(
-            &Value::Obj(reference.object.as_ref().unwrap().clone()),
+            &Value::Obj(*reference.object.as_ref().unwrap()),
             &reference.name,
         )? {
             // An exotic HasProperty may execute author code. Any later optimization must
@@ -314,7 +314,7 @@ impl Interp {
                         binding
                             .import_ref
                             .as_deref()
-                            .map(|(exporter, local)| (exporter.clone(), local.clone())),
+                            .map(|(exporter, local)| (*exporter, local.clone())),
                     )
                 };
                 if !initialized {
@@ -340,13 +340,8 @@ impl Interp {
                 #[cfg(test)]
                 record_reference_own_path(4);
                 let name = &reference.name;
-                let object = Value::Obj(
-                    reference
-                        .object
-                        .as_ref()
-                        .expect("object Reference owner")
-                        .clone(),
-                );
+                let object =
+                    Value::Obj(*reference.object.as_ref().expect("object Reference owner"));
                 // ObjectEnvironmentRecord.GetBindingValue always does HasProperty, including in
                 // sloppy code. Do not repeat HasBinding / @@unscopables after capture.
                 if !self.js_has_property(&object, name)? {
@@ -440,13 +435,8 @@ impl Interp {
                 #[cfg(test)]
                 record_reference_own_path(4);
                 let name = &reference.name;
-                let object = Value::Obj(
-                    reference
-                        .object
-                        .as_ref()
-                        .expect("object Reference owner")
-                        .clone(),
-                );
+                let object =
+                    Value::Obj(*reference.object.as_ref().expect("object Reference owner"));
                 if !self.js_has_property(&object, name)? && reference.strict != 0 {
                     return Err(self.throw("ReferenceError", format!("{name} is not defined")));
                 }
@@ -457,7 +447,7 @@ impl Interp {
                 if reference.strict != 0 {
                     return Err(self.throw("ReferenceError", format!("{name} is not defined")));
                 }
-                self.set_reference_object(&Value::Obj(self.global.clone()), name, value, false)
+                self.set_reference_object(&Value::Obj(self.global), name, value, false)
             }
             _ => unreachable!("invalid prepared Reference kind"),
         }

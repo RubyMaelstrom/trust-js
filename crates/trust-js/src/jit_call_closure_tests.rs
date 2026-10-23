@@ -503,7 +503,7 @@ out.join('|');
 
 #[cfg(target_arch = "aarch64")]
 fn settle(engine: &mut Engine, name: &str) {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let function = engine.interp.get_var(name, &env).ok().expect("function");
     let function_handle = function.as_obj().expect("object");
     let object = function_handle.borrow();
