@@ -8019,7 +8019,7 @@ final-audit-corrected.json. The tracked narrative retains the same
 limitations.
 
 
-S6 exit review repairs, 2026-10-23 (this commit)
+S6 exit review repairs, 2026-10-23 (662530ad)
 
 The owner's review identified five GC lifetime regressions against
 main, all predating step 12. The release repro matrix retained 24/24
@@ -8103,7 +8103,7 @@ are linked by hashes. Only the two tracked review records change
 after validation; engine, configuration, fixture and test inputs
 are unchanged.
 
-Performance comparison pending by the owner's decision
+Performance comparison initially deferred by the owner's decision
 
 The owner requests: "Commit fixes; record performance pending."
 The prepared fifteen-round, six-workload, four-binary comparison did
@@ -8133,3 +8133,120 @@ zombie-focused-verified.json, fat-lto-repros/verified.json, and
 performance-pending.json. The fat-LTO export and build certificate
 are under target/s6-lto/s6-rooting-review-final. These local artifacts
 are not required for a fresh checkout to build or run the new tests.
+
+
+S6 repair performance comparison completed, 2026-10-23
+
+The owner reports an available quiet machine and resumes the comparison
+deferred in 662530ad. The code, fixtures and configuration are
+unchanged. The retained fat-LTO build is production-equivalent to
+662530ad; its tested source snapshot is fd9ee16059bebbdc. The parent is
+step12f, 31d54fde (01220c04 changes documentation only). Both main
+references use e3310993, one rebuilt with rustc 1.99.1 and one retained
+from rustc 1.99.0. The candidate, parent and matched main use rustc
+1.99.1 / LLVM 23.1.1. All builds use opt-level 3, fat LTO, one codegen
+unit and panic=abort.
+
+The machine is Crystal, Linux aarch64, pinned to CPU 5 and nice 19. The
+primary experiment has fifteen interleaved rounds over empty, Vue,
+React, Djot and sustained allocation at JIT, plus sustained allocation
+at bytecode: 360 fresh-process samples across four builds. Every
+checksum, compile/GC count, raw active-PMU counter and process exit
+passes the strict validator. Source, workload and executable hashes are
+unchanged before and after execution. The quiet minute passes with 10
+inference-server ticks and 2817 total busy ticks at 100 Hz. Activity on
+other cores during runs has median 0.480 and max 1.834 cores; all
+samples are retained, with maximum per-process major faults of ten.
+
+Execution uses --tier=jit or --tier=bytecode with the default tier
+threshold and TRUST_JS_PERF_METRICS=1; no other engine environment
+options are set. These instrumented component measurements add the
+shell's explicit exit collection. Counters include the inner GNU time
+wrapper; its RSS record measures the engine process, not the wrapper.
+Production managed requested/external-byte snapshots remain unavailable.
+This experiment does not rerun the default-options S0 instruction cap or
+ownership profile, or claim whole-browser speed.
+
+Primary medians: candidate change from parent, percent. Pause is summed
+GC time; MaxGC is the median of each process's longest pause.
+
+workload/tier   wall  cycles   instr     RSS   pause   MaxGC
+empty/JIT     +0.53   +0.98   +0.031   +2.08  +18.38  +18.38
+Vue/JIT       +0.63   +0.71   +0.017   +1.00   +0.24   -0.01
+React/JIT     +0.11   -0.18   +0.001   +2.50   +0.52   -0.04
+Djot/JIT      +0.07   +0.05   -0.001   +0.88   -0.12   +0.15
+sustained/JIT +0.02   +0.09   +0.025   -0.59   +0.16   +0.33
+sustained/BC  +0.30   +0.67   -0.001   -0.11   -0.60   +0.65
+
+The initial empty-script exit-GC median rises from 0.568783 to 0.673343
+ms: +18.383%, paired 95% interval -0.560..+22.365%. Vue minor faults
+rise 13.314% (2734 to 3098), interval +0.160..18.237%; sustained-JIT
+faults rise 8.860%, interval -4.421..10.835%. These component questions
+are investigated separately; throughput gains against main do not settle
+them.
+
+A fixed follow-up is declared before execution: one hundred complete
+interleaved rounds over empty and Vue, with the same four binaries,
+flags, inputs and CPU affinity. All 800 additional samples validate. The
+second quiet minute passes with 11 server ticks and 2851 total busy
+ticks. Activity on other cores has median 0.491 and max 3.816 cores; no
+samples are excluded and no major faults occur. The original 360-sample
+result remains intact. Both reports use 5000 bootstrap resamples of
+paired rounds, seed 120012, for the quoted 95% intervals.
+
+The follow-up empty exit-GC medians are 0.578279 and 0.577663 ms,
+-0.107%, interval -10.295..12.628%. The initial +18.383% gap does not
+recur, but this interval still does not establish +/-5% neutrality.
+Using the original 0.625 ms diagnostic split, high-mode frequencies are
+parent 43/100 and candidate 46/100, versus 3/15 and 9/15 originally. The
+two timing bands correlate with minor faults in both branch and main
+binaries. The cause is not isolated; ASLR is not established as an
+explanation. The empty script's sole collection is the diagnostic exit
+step, enabled by TRUST_JS_PERF_METRICS, not normal CLI startup behavior.
+
+Empty process wall medians both equal 18.9 ms, change 0.000%, interval
+-0.792..1.333%. Cycles change -0.001%, interval -0.388..0.457%; RSS
+changes +0.734%, interval -1.529..3.751%. No large startup difference is
+reproduced in this follow-up; the diagnostic-GC limit remains.
+
+Vue's small timing cost reproduces: 602.65 to 607.55 ms, +0.813%,
+interval +0.696..0.964%; cycles +0.812%, interval +0.689..0.952%.
+Instructions change -0.015%, RSS -0.272%, total GC +0.178%, and the
+median longest GC pause +0.414%. Minor faults change +1.567%, interval
+-2.585..4.169%; the initial +13.314% jump does not recur. The small Vue
+timing cost is recorded; its cause is not isolated.
+
+Several short primary compilation/parse measurements have confidence
+intervals extending above 5%, despite point changes below 2.2%. The
+complete component tables retain these limits. Neither sample set
+establishes strict neutrality for every component or a causal
+explanation for every change.
+
+Main-reference questions remain open. In the primary matrix, matched
+main to candidate wall improves 18.188/12.897/11.545% for
+Vue/React/Djot, and sustained JIT/bytecode improves 36.698/32.900%.
+React peak RSS remains +55.026% (16196 to 25108 KiB; interval
+46.284..60.606%); the measured parent is already 24496 KiB. This repair
+does not close that bound. Vue's largest native chunk remains +56.601%
+versus main, and Vue/React bytecode compilation remains +6.389/+11.517%;
+their parent-to-candidate changes are +0.004% and +0.226/-0.621%
+respectively.
+
+Candidate total GC shares are 4.178/5.015/8.709% for Vue/React/Djot and
+36.324/28.156% for sustained JIT/bytecode. Excluding the diagnostic
+exit, they are 3.877/4.349/7.786% and 34.531/26.815%. Main's per-cause
+pause split is unavailable. The carried RSS, GC-share and component
+bounds are not waived by these results, and I4 remains unchanged pending
+the owner's decision. Measurement completion is not stage acceptance or
+promotion of a release artifact.
+
+Local evidence: target/s6-review-fixes/final/measurement-resumed and
+measurement-startup-vue-followup, including raw rows, manifests, quiet
+windows, strict validations, build bindings and paired reports.
+followup-plan.json records the declared investigation, and
+performance-complete.json checks all 1160 samples and source/binary
+fences. The original deferred attempt and performance-pending.json
+remain historical evidence. Both measurement jobs have completed and
+been reaped; no correctness gate is rerun for this documentation update
+because engine, configuration, fixture and test inputs match the already
+validated repair.
