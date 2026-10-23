@@ -7818,3 +7818,202 @@ source certificates and tool provenance are under
 Step 12 and its full milestone are complete. The separate S6 exit
 validation, occupancy census and concrete owner review follow;
 S6's overall acceptance is still open.
+
+S6 exit validation and owner review (2026-10-23)
+
+Step 12 and both full validation stages are complete. Correctness
+results match the agreed baselines. S6 is not ready to merge: the
+memory, GC-share, component and I4 questions below remain open.
+
+Code is committed through 31d54fdef2ba95cdac4eaeb2863a2436b0f3ba66
+on rearch/v8-chase. Main remains e3310993. No push or merge occurred.
+Final prepared production-equivalent source SHA256:
+c4ffb536a401aed7782abdcefa2847dad4a8fe9758f479996ee6569978b14546
+
+Implementation and correctness
+
+Steps 12a–12f replace the engine and scoped API's Value enum with one
+eight-byte, thread-bound Copy execution word. Mutable slots use
+Cell<Value>. PropWord alone can retain a deferred prototype and
+records the original owner's card when materializing its edge.
+Native calls borrow immutable argument windows; typed callbacks keep
+their actual signatures and roots. NaN ingress is canonicalized,
+while raw buffer and guest Wasm payload bits keep their semantics.
+The obsolete tagged experiment, arithmetic switch and transitional
+value wrappers are gone. Neutral compiler-frame metadata remains.
+
+The corrected full step-12 milestone passes on both machines. ARM
+library/stress has 2387 passes and seven expected benchmark ignores;
+x64 has 2216 passes and seven ignores. Wine has 2208 passes, seven
+ignores and exactly three baseline snapshot-codec failures. No
+stress failure, timeout or retry occurs. Both ARM Test262 thresholds
+and zombie's JIT report match their references; threshold zero keeps
+its two baseline legacy-function-arguments failures. The downstream
+suites pass. Native wasm-crate commands execute zero tests, which is
+not Wasm execution coverage; the owner retired wasm32 acceptance.
+
+All nine strict generated-code pairs pass: 678 chunks and 1356
+verified companion images, zero semantic rewrite rules or body
+exemptions. The final committed engine source is unchanged from this
+accepted milestone. The separate S6 exit validation also passes.
+ARM formatting checks all 274 Rust files changed since main; all
+five strict clippy configurations pass and rustdoc keeps eight
+baseline warnings. Its library is 2387/0/7, doctests 11/0/1, with
+unchanged inventories and no workspace diagnostics. Downstreams are
+host 37, timers 6, fs 0, web 63/0/1, node 47, runtime 184/0/1,
+and native wasm 0/0/0. Fixtures preserve outputs, compiles 56/10/160
+and collections 21/6/16; sustained allocation collects 194 times.
+Difftest reports 138 agreements and 12 budget skips, with empty
+stderr and corpus. ARM Test262 is 53575/0/3 at threshold 8 and
+53573/2/3 at zero, matching the reference reports exactly.
+
+The S6 exit x64 library is 2216/0/7; Wine is 2208/3/7 with exactly
+its baseline failures. x64 clippy is clean, Windows has its same
+23 warnings, both inventories are unchanged, and Test262, fixtures
+and difftest match their references. Full ARM stress passes
+2357/25/5 cases at intervals 1/100/1000, plus seven expected ignores.
+Full x64 stress passes 2190/22/4, plus seven ignores. Neither exit
+run has a failure, timeout or retry in its stress suite. Every
+source/config hash, expected test name, outcome and phase exit is
+verified. Final evidence status explicitly leaves acceptance open.
+
+Original failures remain preserved: stale remote Cargo artifacts,
+GC-fixture/native-stack sensitivity, the stale inventory-test count,
+and source-pin, archive and measurement-parser rejections. Corrected
+runs have their own labels and directories. The release binaries
+retain original build manifests; exact cfg(test)-only certificates
+connect their compiled source to the final source. They are not
+represented as rebuilds from the final test bytes.
+
+Default-options Vue results
+
+The S0 absolute instruction cap passes. Fifteen interleaved rounds
+on Crystal CPU 5 give final median 2,668,510,178 instructions versus
+matched main 3,298,528,568. Every final sample is below 2.97 billion
+(range 2,665,659,654–2,669,110,873). GNU time is inside perf, so these
+counts conservatively include its instructions. Process wall time
+also includes launching and reaping perf; RSS is engine-only. Main
+uses the same rustc 1.99.1 toolchain; the retained rustc-1.99.0 main
+stays separate.
+
+Against matched main, default Vue instructions fall 19.100%, cycles
+22.548%, wall time 21.760%, and cache misses 7.971%. Paired 95%
+intervals exclude zero for each. Branch misses rise 15.388%
+(95% interval +13.620..+16.504%); their causal source has not been
+isolated, and aggregate speed does not waive this component issue.
+Engine RSS changes -1.412%, with an interval spanning zero.
+
+Node v24.22.0 runs the same fixture in median 188.446 ms versus
+TRust's 498.537 ms, a 2.646x wall-time ratio. This is one Vue workload,
+not an overall engine comparison. Exact binaries and all raw counters
+are retained. Initial major faults remain in the samples.
+
+The unchanged S0 ownership classifier reports a raw sampled bucket
+of 1.47%, versus original S0 9.05%, fresh matched main 9.08%, and
+retained main 9.16%. The halving criterion passes. Each fresh profile
+contains eight successful default-options executions and zero lost
+samples. Selected self totals are 68.8/66.16/65.93%; they are not
+renormalized. These serial sampled-symbol point estimates have no
+confidence interval and are not exact ownership-time measurements.
+
+Instrumented component results and open bounds
+
+The 360-sample, fifteen-round component matrix enables metrics for
+all engines to obtain GC and compilation data. It is a distinct
+protocol from the default-options counters above. Its auxiliary Vue
+counter run is retained separately; the original clock-label parser
+rejection is preserved as metadata failure, not an engine failure.
+Engine RSS comes from inner GNU time, not the launcher's highwater.
+
+Against matched main, instrumented Vue/React/Djot wall times improve
+18.816/12.996/11.979%, and cycles 19.353/16.972/12.540%. Engine RSS
+changes +1.235/+48.593/-0.980%; React fails the +25% bound, with a
+paired 95% interval of +45.810..+57.717%. Its median is 24916 KiB.
+The throughput gains do not establish memory acceptance.
+
+Total GC shares, including exit, are Vue 4.216%, React 4.978%, and
+Djot 8.718%. React is borderline: its median's 95% interval is
+4.960..5.061%, and individual samples reach 5.152%. Sustained
+allocation is 36.209% at JIT and 28.429% at bytecode. Excluding exit,
+the same shares are 3.918/4.330/7.799% and 34.449/27.063%.
+Djot and sustained allocation fail the 5% bound either way. Main's
+per-cause pause timings do not exist; no-exit shares are unavailable.
+
+Observed longest pauses are 2.081/1.283/5.400 ms for the fixtures
+and 21.824/25.236 ms for sustained JIT/bytecode. Relative to 12e,
+median longest sustained pauses rise 3.456/4.768%; their intervals
+extend above 5%. Sustained-bytecode instructions rise 1.228%.
+Those costs are recorded explicitly for the final cleanup step.
+
+Other main-baseline component questions remain: React/Vue bytecode
+compile time +16.469/+7.260%, Vue's largest native chunk +56.594%,
+empty-startup RSS +22.669%, and React median longest pause rising
+from 0.215 to 1.206 ms. Branch and main compile different counts
+(56/10 versus 55/9 on Vue/React). The whole-process comparison
+includes that work; it does not isolate the cause of each component.
+
+Occupancy evidence
+
+The isolated census adds a read-only method and post-collection
+logging in two files, with no stored fields or allocator changes.
+Six production/diagnostic pairs
+have identical checksums and all 194 raw collection records,
+including minor-collection suffixes. Each has 190 minors and four
+majors. All recorded large-cell bytes and counts are zero.
+
+At the final task-boundary minor, allocated small-cell bytes / usable
+cell capacity are 46,557,024 / 49,717,680 (93.643%) at JIT and
+46,453,920 / 49,522,864 (93.803%) at bytecode. After the explicit
+exit major they are 38,637,792 / 39,980,208 (96.642%) and
+38,637,600 / 39,590,832 (97.592%). Spares add 0.75 MiB before exit
+and 2 MiB afterward. Free cell capacity after exit is 1,342,416 and
+953,232 bytes respectively; card tables and class tails are separate.
+
+These are allocated size-class bytes, including retained old cells
+and zombies. They are not precise strong reachability or requested
+payload sizes. The census excludes backing buffers, allocator and
+side-table overhead, reserved address space and other process RSS;
+it does not establish whole-RSS fragmentation or timing acceptance.
+
+I4 requires an explicit contract decision
+
+The plan says generated code and IC cells never cache raw interior
+pointers across possible collections and instead rederive them from
+tagged words. That literal statement is not true of this engine.
+Non-owning Binding and code locations remain cached. The bounded
+source review verifies live-owner identity, weak address pins,
+non-recycled structural generations/code epochs, and execution leases
+across reentry at every inspected use. Invalidation precedes freeing;
+fixed-layout reads rederive slots. No new defect was found, but that
+review cannot silently turn the literal ban into a satisfied invariant.
+
+Proposed wording for owner review: a cached raw location is non-owning
+and must have a complete stable-owner/ABA and structural/code-validity
+proof before dereference. Preserve owner and execution lifetime across
+reentry, and revalidate or rederive after invalidation. A raw cache
+must never be the sole root. This is a proposal, not an amendment.
+The alternative is further implementation work to satisfy the ban.
+
+Other carried limits and disposition
+
+Production collection remains safepoint-only. NoGcScope/BorrowScope
+are test-only controls, not production dynamic borrow counters. Native
+conservative scanning retains the recorded compiler/ABI contract and
+its limitations. N-API pending finalizers still lack a teardown flush
+and discard callback exceptions. The previously deferred card/range
+summary work is still separate; no scope or criterion is waived here.
+
+The instruction and ownership goals have concrete passing evidence.
+Memory, GC-share, component and I4 acceptance questions remain open.
+The recommended disposition is to keep the completed implementation
+on the review branch and resolve those questions before merging.
+
+Primary evidence: target/s6-step12fr/final-step-review.json;
+target/s6-step10/m12f-v3; target/s6-exit/aux-verified-v2.json and
+aux-review-v2.json; the two Vue counter directories;
+ownership-profile; occupancy; gate-verified.json;
+zombie-milestone/verified-all.json; and final-exit-verified.json.
+The invariant inventory and its test-only source links are
+in target/s6-step12fr/final-invariant-inventory.txt and
+final-audit-corrected.json. The tracked narrative retains the same
+limitations.
