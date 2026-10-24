@@ -3669,8 +3669,10 @@ impl Drop for Heap {
         if !std::thread::panicking() {
             self.debug_assert_quiescent();
         }
-        // The due word belongs to the heap's owner, which may be dropping it too.
+        // The due word belongs to the heap's owner, which may be dropping it too, and a charge
+        // that outlives the heap keeps its ledger (`value::ExternalCharge`): neither may write it.
         self.due_word = None;
+        self.control.external.due_word.set(None);
         self.release_all();
     }
 }

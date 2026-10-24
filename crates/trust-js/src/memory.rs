@@ -709,12 +709,15 @@ impl Visitor {
                 self.function(&value.func);
             }
             Callable::Bound(value) => {
-                // Box-backed variants have one allocation per containing Object, and the object
-                // snapshot is identity-unique, so they need no shared-allocation identity set.
-                self.callable_metadata = self
-                    .callable_metadata
-                    .saturating_add(size_of_val(value.as_ref()))
-                    .saturating_add(value.args.capacity().saturating_mul(size_of::<Value>()));
+                // A shared payload cell: a constructor's result can share its function's (see
+                // `gc_storage::SharedPayload`), so count each cell once.
+                let identity = value.as_ref() as *const crate::value::BoundCallable as usize;
+                if self.callable_allocations.insert(identity) {
+                    self.callable_metadata = self
+                        .callable_metadata
+                        .saturating_add(size_of_val(value.as_ref()))
+                        .saturating_add(value.args.capacity().saturating_mul(size_of::<Value>()));
+                }
                 self.value(&value.this);
                 for argument in &value.args {
                     self.value(argument);

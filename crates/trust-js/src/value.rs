@@ -4703,9 +4703,14 @@ pub(crate) fn activate_agent(heap: &GcHeap, symbols: &SymbolAgent) {
             return;
         }
         remember_gc_heap(heap);
-        ACTIVE_GC_HEAP.with(|active| *active.borrow_mut() = Some(heap.clone()));
-        ACTIVE_SYMBOL_AGENT.with(|active| *active.borrow_mut() = Some(symbols.clone()));
+        // The tag names a heap only while it lives (see `with_agent_heap`): it moves first, and
+        // the replaced heap, which the slot may hold last, drops once both name the new one.
         tag.set(next);
+        let replaced = (
+            ACTIVE_GC_HEAP.with(|active| active.borrow_mut().replace(heap.clone())),
+            ACTIVE_SYMBOL_AGENT.with(|active| active.borrow_mut().replace(symbols.clone())),
+        );
+        drop(replaced);
         #[cfg(test)]
         ACTIVE_AGENT_SLOW_SWITCHES.with(|switches| {
             switches.set(switches.get().wrapping_add(1));
@@ -4728,9 +4733,14 @@ impl Drop for AgentActivationGuard {
         let Some((heap, symbols, tag)) = self.previous.take() else {
             return;
         };
-        ACTIVE_GC_HEAP.with(|active| *active.borrow_mut() = heap);
-        ACTIVE_SYMBOL_AGENT.with(|active| *active.borrow_mut() = symbols);
+        // As in `activate_agent`: the tag first, the replaced heap dropped last.
         ACTIVE_AGENT_TAG.with(|active| active.set(tag));
+        let replaced = (
+            ACTIVE_GC_HEAP.with(|active| std::mem::replace(&mut *active.borrow_mut(), heap)),
+            ACTIVE_SYMBOL_AGENT
+                .with(|active| std::mem::replace(&mut *active.borrow_mut(), symbols)),
+        );
+        drop(replaced);
         #[cfg(test)]
         ACTIVE_AGENT_SLOW_SWITCHES.with(|switches| {
             switches.set(switches.get().wrapping_add(1));
@@ -4770,13 +4780,13 @@ pub(crate) fn deactivate_agent_if(heap: &GcHeap, symbols: &SymbolAgent) {
     let current = (Rc::as_ptr(heap) as usize, Rc::as_ptr(symbols) as usize);
     ACTIVE_AGENT_TAG.with(|tag| {
         if tag.get() == current {
-            ACTIVE_GC_HEAP.with(|active| {
-                active.borrow_mut().take();
-            });
-            ACTIVE_SYMBOL_AGENT.with(|active| {
-                active.borrow_mut().take();
-            });
+            // As in `activate_agent`: the tag first, the heap dropped last.
             tag.set((0, 0));
+            let taken = (
+                ACTIVE_GC_HEAP.with(|active| active.borrow_mut().take()),
+                ACTIVE_SYMBOL_AGENT.with(|active| active.borrow_mut().take()),
+            );
+            drop(taken);
         }
     });
 }

@@ -12617,21 +12617,27 @@ impl Interp {
                 args.first().cloned().unwrap_or(Value::Undefined),
             ),
             // Decorator `context.access` get/set: read/write a named property on the first argument.
+            // The key lives in the callee's payload cell; a getter or setter may let the callee
+            // die, so each holds its own count while it runs.
             Callable::PropGet(key) => {
+                let key = Rc::clone(&key);
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
                 self.get_member_key(&recv, &key)
             }
             Callable::PropSet(key) => {
+                let key = Rc::clone(&key);
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
                 let val = args.get(1).cloned().unwrap_or(Value::Undefined);
                 self.set_member_key(&recv, &key, val)
                     .map(|_| Value::Undefined)
             }
             Callable::PrivatePropGet(key) => {
+                let key = Rc::clone(&key);
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
                 self.get_private_member(&recv, &key)
             }
             Callable::PrivatePropSet(key) => {
+                let key = Rc::clone(&key);
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
                 let val = args.get(1).cloned().unwrap_or(Value::Undefined);
                 self.set_private_member(&recv, &key, val)
