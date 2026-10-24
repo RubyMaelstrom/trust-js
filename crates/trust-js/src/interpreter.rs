@@ -7250,7 +7250,7 @@ impl Interp {
         self.make_callable_object(
             name,
             len,
-            Callable::NativeData(Rc::new(crate::value::NativeCallable {
+            Callable::native_data(Rc::new(crate::value::NativeCallable {
                 body,
                 retained,
                 identity: Rc::from(name),

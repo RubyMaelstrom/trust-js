@@ -1078,6 +1078,19 @@ impl Interp {
                 .map(|(name, nanos)| format!(" {name}={:.0}", micros(nanos)))
                 .collect::<String>();
             let core_nanos = stats.last_phase_nanos.iter().sum::<u64>();
+            let names = heap.core.borrow().desc_names();
+            let finalized = stats
+                .last_finalized
+                .iter()
+                .enumerate()
+                .filter(|(_, &count)| count != 0)
+                .map(|(desc, count)| {
+                    format!(
+                        " fin:{}={count}",
+                        names.get(desc).copied().unwrap_or("?").replace(' ', "_")
+                    )
+                })
+                .collect::<String>();
             let steps = ENGINE_STEP_NANOS.with(|steps| steps.replace([0; ENGINE_STEPS]));
             let steps = ENGINE_STEP_NAMES
                 .iter()
@@ -1094,7 +1107,7 @@ impl Interp {
                 CollectionKind::Major => String::new(),
             };
             eprintln!(
-                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor} external={} us: mark={:.0} sweep={:.0} engine={:.0}{phases}{steps}",
+                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor} external={} us: mark={:.0} sweep={:.0} engine={:.0}{phases}{steps}{finalized}",
                 match kind {
                     CollectionKind::Minor => "minor",
                     CollectionKind::Major => "major",

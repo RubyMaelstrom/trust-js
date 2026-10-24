@@ -1571,8 +1571,12 @@ fn probe_jit_repr() -> JitRepr {
     let none_tag = tag(&Exotic::None);
     let (exotic_collection_tag, collection_ok) = {
         use crate::ordered_collection::{CollectionKind, OrderedCollection};
-        let map = Exotic::Collection(Box::new(OrderedCollection::new(CollectionKind::Map)));
-        let set = Exotic::Collection(Box::new(OrderedCollection::new(CollectionKind::Set)));
+        let map = Exotic::Collection(crate::gc_storage::PayloadBox::new(OrderedCollection::new(
+            CollectionKind::Map,
+        )));
+        let set = Exotic::Collection(crate::gc_storage::PayloadBox::new(OrderedCollection::new(
+            CollectionKind::Set,
+        )));
         let collection = tag(&map);
         let others = [
             none_tag,
@@ -2204,31 +2208,31 @@ pub enum Callable {
     None = 0,
     Native(NativeFn) = 1,
     /// A native function carrying captured state (see [`NativeClosure`]).
-    NativeData(Rc<NativeCallable>) = 2,
+    NativeData(crate::gc_storage::PayloadBox<Rc<NativeCallable>>) = 2,
     /// An interpreted function: its AST plus the lexical environment it closed over.
     User(UserFn) = CALLABLE_USER_TAG,
     /// The result of `Function.prototype.bind`.
-    Bound(Box<BoundCallable>) = 4,
+    Bound(crate::gc_storage::PayloadBox<BoundCallable>) = 4,
     /// A ShadowRealm wrapped function: `target` is a callable inside the realm of the ShadowRealm
     /// object `realm`, which the wrapper keeps alive. Calls marshal primitive args in and the
     /// primitive result out.
-    WrappedShadow(Rc<WrappedShadowCallable>) = 5,
+    WrappedShadow(crate::gc_storage::PayloadBox<Rc<WrappedShadowCallable>>) = 5,
     /// The inverse: a function living *inside* a ShadowRealm whose `target` is a callable of the
     /// host realm. It runs only in its own realm's interpreter, which knows its host (see
     /// `Interp::shadow_home`).
-    WrappedCross(Box<WrappedCrossCallable>) = 6,
+    WrappedCross(crate::gc_storage::PayloadBox<WrappedCrossCallable>) = 6,
     /// An auto-accessor's synthesized getter: reads the private backing field (brand-checked) off
     /// the receiver.
-    AccessorGet(Rc<Rc<str>>) = 7,
+    AccessorGet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 7,
     /// An auto-accessor's synthesized setter: writes the private backing field (brand-checked).
-    AccessorSet(Rc<Rc<str>>) = 8,
+    AccessorSet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 8,
     /// A decorator `context.access.get`: returns `args[0][name]`.
-    PropGet(Rc<Rc<str>>) = 9,
+    PropGet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 9,
     /// A decorator `context.access.set`: performs `args[0][name] = args[1]`.
-    PropSet(Rc<Rc<str>>) = 10,
+    PropSet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 10,
     /// A decorator's private access functions use PrivateGet/PrivateSet, not [[Get]]/[[Set]].
-    PrivatePropGet(Rc<Rc<str>>) = 11,
-    PrivatePropSet(Rc<Rc<str>>) = 12,
+    PrivatePropGet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 11,
+    PrivatePropSet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 12,
     /// A host callback called through its actual scoped Rust signature. Its result is mapped
     /// explicitly at the public boundary, never reinterpreted as an engine-native Result.
     #[cfg(feature = "embed")]
@@ -2454,10 +2458,26 @@ impl Callable {
     }
 
     pub(crate) fn wrapped_shadow(realm: Gc, target: Value) -> Callable {
-        Callable::WrappedShadow(Rc::new(WrappedShadowCallable {
-            realm,
-            target: Box::new(target),
-        }))
+        Callable::WrappedShadow(crate::gc_storage::PayloadBox::new(Rc::new(
+            WrappedShadowCallable {
+                realm,
+                target: Box::new(target),
+            },
+        )))
+    }
+
+    /// A native function with captured state, its data in a payload cell.
+    pub(crate) fn native_data(data: Rc<NativeCallable>) -> Callable {
+        Callable::NativeData(crate::gc_storage::PayloadBox::new(data))
+    }
+
+    /// An accessor or decorator access function (`variant`) for the field `key`, its key in a
+    /// payload cell.
+    pub(crate) fn accessor_key(
+        variant: fn(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) -> Callable,
+        key: Rc<str>,
+    ) -> Callable {
+        variant(crate::gc_storage::PayloadBox::new(Rc::new(key)))
     }
 
     pub(crate) fn bound(target: Gc, this: Value, args: Vec<Value>) -> Callable {
@@ -2465,7 +2485,7 @@ impl Callable {
         charge.settle(
             std::mem::size_of::<BoundCallable>() + args.capacity() * std::mem::size_of::<Value>(),
         );
-        Callable::Bound(Box::new(BoundCallable {
+        Callable::Bound(crate::gc_storage::PayloadBox::new(BoundCallable {
             target,
             this,
             args,
@@ -2474,7 +2494,9 @@ impl Callable {
     }
 
     pub(crate) fn wrapped_cross(target: Value) -> Callable {
-        Callable::WrappedCross(Box::new(WrappedCrossCallable { target }))
+        Callable::WrappedCross(crate::gc_storage::PayloadBox::new(WrappedCrossCallable {
+            target,
+        }))
     }
 }
 
@@ -2504,24 +2526,24 @@ pub enum Exotic {
     /// P1 S4: a Map's or Set's [[MapData]]/[[SetData]], in its own cell (see
     /// `Interp::collection`). Declared next to `None` so that [`Exotic::is_ordinary`] tests one
     /// tag range.
-    Collection(Box<crate::ordered_collection::OrderedCollection>),
+    Collection(crate::gc_storage::PayloadBox<crate::ordered_collection::OrderedCollection>),
     Array,
     BoolWrap(bool),
     NumWrap(f64),
-    StrWrap(Box<crate::lstr::LStr>),
+    StrWrap(crate::gc_storage::PayloadBox<crate::lstr::LStr>),
     SymWrap(SymbolRef),
-    BigIntWrap(Box<crate::bigint::JsBigInt>),
+    BigIntWrap(crate::gc_storage::PayloadBox<crate::bigint::JsBigInt>),
     /// An error object. Carries the stack frames captured at construction (see
     /// `crate::stack_trace`), None when `Error.stackTraceLimit` was not a Number then; the
     /// `Error.prototype.stack` getter formats them after the live `name: message` head.
     /// name/message live as ordinary properties, and the tag lets `Error.prototype.toString` /
     /// the test262 runner recognise an error cheaply.
-    Error(Option<Box<crate::stack_trace::StackTrace>>),
+    Error(Option<crate::gc_storage::PayloadBox<crate::stack_trace::StackTrace>>),
     /// An `arguments` exotic object (mapped index/parameter aliasing lives in
     /// `Interp::mapped_arguments`).
     Arguments,
-    ArrayIterator(Box<ArrayIteratorState>),
-    StringIterator(Box<StringIteratorState>),
+    ArrayIterator(crate::gc_storage::PayloadBox<ArrayIteratorState>),
+    StringIterator(crate::gc_storage::PayloadBox<StringIteratorState>),
 }
 
 impl Exotic {
@@ -2540,15 +2562,15 @@ impl Exotic {
     }
 
     pub(crate) fn str_wrap(value: crate::lstr::LStr) -> Exotic {
-        Exotic::StrWrap(Box::new(value))
+        Exotic::StrWrap(crate::gc_storage::PayloadBox::new(value))
     }
 
     pub(crate) fn bigint_wrap(value: crate::bigint::JsBigInt) -> Exotic {
-        Exotic::BigIntWrap(Box::new(value))
+        Exotic::BigIntWrap(crate::gc_storage::PayloadBox::new(value))
     }
 
     pub(crate) fn error(stack: Option<Box<crate::stack_trace::StackTrace>>) -> Exotic {
-        Exotic::Error(stack)
+        Exotic::Error(stack.map(|stack| crate::gc_storage::PayloadBox::new(*stack)))
     }
 }
 
@@ -2564,7 +2586,8 @@ pub(crate) struct Object {
     /// clear, so ONE proxy existing somewhere no longer disables the caches for every plain
     /// object in the program (the old global `inline_ic_safe` latch).
     pub(crate) ic_plain: Cell<bool>,
-    pub(crate) native_typed_array: Option<Box<crate::native_typed_array::NativeTypedArray>>,
+    pub(crate) native_typed_array:
+        Option<crate::gc_storage::PayloadBox<crate::native_typed_array::NativeTypedArray>>,
     /// IsConstructor, recorded when the object gets its [[Call]]: set for user functions other
     /// than arrows, methods, generators and async functions, for natives marked as constructors,
     /// and for bound functions and callable proxies whose target was one. A native with an own
@@ -2572,74 +2595,14 @@ pub(crate) struct Object {
     pub(crate) is_constructor: bool,
 }
 
-impl Object {
-    /// Whether finalization has any owned allocation to release. Exhaustive field and variant
-    /// matches make new storage participate in this decision. Property words, accessor pairs,
-    /// cell handles and storage blocks have no owning drops (`gc_storage`): an ordinary object
-    /// or Array whose sidecar holds no hash index, Symbol keys or internal slots needs none.
-    fn owns_payload(&self) -> bool {
-        let Self {
-            proto: _,
-            props,
-            extensible: _,
-            call,
-            exotic,
-            ic_plain: _,
-            native_typed_array,
-            is_constructor: _,
-        } = self;
-        let Props {
-            entries,
-            proto_flag: _,
-            shape: _,
-            elems,
-            mirror_flags: _,
-            mirror_holes: _,
-            has_far: _,
-            elem_mode: _,
-            proto_slot: _,
-            len_slot: _,
-        } = props;
-        // Named properties own nothing outside the heap: their spill is a storage block and
-        // an accessor pair a cell (`gc_storage`).
-        let NamedEntries {
-            fields: _,
-            layout: _,
-        } = entries;
-        elems.owns_payload()
-            || native_typed_array.is_some()
-            || match call {
-                Callable::None | Callable::Native(_) | Callable::User(_) => false,
-                #[cfg(feature = "embed")]
-                Callable::ScopedNative(_) => false,
-                Callable::NativeData(_)
-                | Callable::Bound(_)
-                | Callable::WrappedShadow(_)
-                | Callable::WrappedCross(_)
-                | Callable::AccessorGet(_)
-                | Callable::AccessorSet(_)
-                | Callable::PropGet(_)
-                | Callable::PropSet(_)
-                | Callable::PrivatePropGet(_)
-                | Callable::PrivatePropSet(_) => true,
-            }
-            || match exotic {
-                Exotic::None
-                | Exotic::Array
-                | Exotic::BoolWrap(_)
-                | Exotic::NumWrap(_)
-                | Exotic::SymWrap(_)
-                | Exotic::Arguments
-                | Exotic::Error(None) => false,
-                Exotic::Collection(_)
-                | Exotic::StrWrap(_)
-                | Exotic::BigIntWrap(_)
-                | Exotic::Error(Some(_))
-                | Exotic::ArrayIterator(_)
-                | Exotic::StringIterator(_) => true,
-            }
-    }
+// An object cell owns nothing to release: its Rust-heap payloads (a Map's tables, a bound
+// function's arguments, an error's stack trace, a map's hash index...) sit in payload cells of
+// their own, whose finalizers drop them (`gc_storage::PayloadBox`), and its properties and
+// elements in storage blocks. So an object dies without a finalizer, its death a bit in its
+// page; a field that needed dropping would fail here.
+const _: () = assert!(!std::mem::needs_drop::<RefCell<Object>>());
 
+impl Object {
     /// Engine state shares the existing lazy storage allocation but remains separate from
     /// ECMAScript properties. Author strings, reflection, proxies and integrity levels cannot
     /// address this map (ECMA-262 6.1.7.2). Ordinary objects retain their compact body layout.
@@ -2860,6 +2823,8 @@ pub(crate) struct GcState {
     pub(crate) object_desc: crate::gc_core::DescId,
     /// Storage blocks (`gc_storage`).
     pub(crate) storage_desc: crate::gc_core::DescId,
+    /// Payload cells, by kind (`gc_storage::PayloadBox`).
+    payload_descs: PayloadDescs,
     /// Accessor-pair cells (each an [`Accessors`]).
     pub(crate) accessor_desc: crate::gc_core::DescId,
     pub(crate) scope_desc: crate::gc_core::DescId,
@@ -2978,8 +2943,95 @@ pub(crate) fn debug_assert_due_word(heap: &GcHeap) {
     }
 }
 
+/// The descriptors of the payload cells objects keep their Rust-heap values in
+/// (`gc_storage::PayloadBox`), one per kind.
+pub(crate) struct PayloadDescs {
+    collection: crate::gc_core::DescId,
+    string_wrapper: crate::gc_core::DescId,
+    bigint_wrapper: crate::gc_core::DescId,
+    stack_trace: crate::gc_core::DescId,
+    array_iterator: crate::gc_core::DescId,
+    string_iterator: crate::gc_core::DescId,
+    native: crate::gc_core::DescId,
+    bound: crate::gc_core::DescId,
+    wrapped_shadow: crate::gc_core::DescId,
+    wrapped_cross: crate::gc_core::DescId,
+    accessor_key: crate::gc_core::DescId,
+    typed_array: crate::gc_core::DescId,
+    extras: crate::gc_core::DescId,
+}
+
+macro_rules! payload_kinds {
+    ($($ty:ty => $field:ident),* $(,)?) => {
+        $(
+            impl crate::gc_storage::PayloadKind for $ty {
+                fn desc(heap: &GcState) -> crate::gc_core::DescId {
+                    heap.payload_descs.$field
+                }
+            }
+        )*
+    };
+}
+
+payload_kinds! {
+    crate::ordered_collection::OrderedCollection => collection,
+    crate::lstr::LStr => string_wrapper,
+    crate::bigint::JsBigInt => bigint_wrapper,
+    crate::stack_trace::StackTrace => stack_trace,
+    ArrayIteratorState => array_iterator,
+    StringIteratorState => string_iterator,
+    Rc<NativeCallable> => native,
+    BoundCallable => bound,
+    Rc<WrappedShadowCallable> => wrapped_shadow,
+    WrappedCrossCallable => wrapped_cross,
+    Rc<Rc<str>> => accessor_key,
+    crate::native_typed_array::NativeTypedArray => typed_array,
+    DenseExtras => extras,
+}
+
+impl PayloadDescs {
+    fn register(core: &mut crate::gc_core::Heap) -> Self {
+        use crate::gc_storage::payload_layout;
+        let mut leaf = |desc: crate::gc_core::LayoutDesc| {
+            let id = core.register_desc(desc);
+            core.set_leaf(id);
+            id
+        };
+        Self {
+            collection: leaf(
+                payload_layout::<crate::ordered_collection::OrderedCollection>("map or set data"),
+            ),
+            string_wrapper: leaf(payload_layout::<crate::lstr::LStr>("string wrapper data")),
+            bigint_wrapper: leaf(payload_layout::<crate::bigint::JsBigInt>(
+                "bigint wrapper data",
+            )),
+            stack_trace: leaf(payload_layout::<crate::stack_trace::StackTrace>(
+                "stack trace",
+            )),
+            array_iterator: leaf(payload_layout::<ArrayIteratorState>("array iterator state")),
+            string_iterator: leaf(payload_layout::<StringIteratorState>(
+                "string iterator state",
+            )),
+            native: leaf(payload_layout::<Rc<NativeCallable>>("native function data")),
+            bound: leaf(payload_layout::<BoundCallable>("bound function data")),
+            wrapped_shadow: leaf(payload_layout::<Rc<WrappedShadowCallable>>(
+                "wrapped function data",
+            )),
+            wrapped_cross: leaf(payload_layout::<WrappedCrossCallable>(
+                "wrapped function data",
+            )),
+            accessor_key: leaf(payload_layout::<Rc<Rc<str>>>("accessor function key")),
+            typed_array: leaf(
+                payload_layout::<crate::native_typed_array::NativeTypedArray>("typed array view"),
+            ),
+            extras: leaf(payload_layout::<DenseExtras>("property map extras")),
+        }
+    }
+}
+
 /// The descriptors of a [`GcState`]'s cell kinds.
 struct CellDescs {
+    payloads: PayloadDescs,
     storage: crate::gc_core::DescId,
     accessor: crate::gc_core::DescId,
     object: crate::gc_core::DescId,
@@ -3000,6 +3052,8 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     // Storage blocks have no edges of their own: their owners trace what they hold.
     let storage = core.register_desc(crate::gc_storage::layout());
     core.set_leaf(storage);
+    // Nor have payload cells; their finalizers drop the values objects keep in them.
+    let payloads = PayloadDescs::register(&mut core);
     let accessor = core.register_desc(crate::gc_core::LayoutDesc {
         name: "accessor pair",
         trace: trace_accessor_cell,
@@ -3015,7 +3069,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
         name: "object",
         trace: trace_object_cell,
         mark_trace: Some(mark_object_cell),
-        finalize: Some(finalize_object_cell),
+        finalize: layout_census::enabled().then_some(census_dead_object as _),
         carded: true,
     });
     let scope = core.register_desc(crate::gc_core::LayoutDesc {
@@ -3054,6 +3108,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     (
         core,
         CellDescs {
+            payloads,
             storage,
             accessor,
             object,
@@ -3265,54 +3320,95 @@ pub(crate) fn check_layout_owners(
 /// `gc_core::ExternalBytes`). Containers keep what they charged in an [`ExternalCharge`].
 pub(crate) fn charge_external(bytes: usize) {
     if bytes != 0 {
-        with_active_gc_heap(|heap| heap.ledger.charge_external(bytes));
+        if let Some(ledger) = active_ledger() {
+            ledger.charge_external(bytes);
+        }
     }
 }
 
 /// Release `bytes` that [`charge_external`] charged.
 pub(crate) fn release_external(bytes: usize) {
     if bytes != 0 {
-        with_active_gc_heap(|heap| heap.ledger.release_external(bytes));
+        if let Some(ledger) = active_ledger() {
+            ledger.release_external(bytes);
+        }
     }
 }
 
-/// The bytes one Rust-heap payload container has charged to the active heap's external ledger
-/// ([`charge_external`]). [`ExternalCharge::settle`] brings the charge to the container's current
-/// size; dropping the record releases it. A clone charges what the original holds again, for a
-/// cloned container, until that one settles its own size.
+/// The active Agent heap's external ledger, if a heap is active and this thread's storage is
+/// not being torn down: charges come from containers' finalizers too, which a heap's teardown
+/// at thread exit runs after the thread's other storage may be gone. Without one, a charge is
+/// not recorded (no heap would collect for it).
+fn active_ledger() -> Option<Rc<crate::gc_core::Control>> {
+    ACTIVE_GC_HEAP
+        .try_with(|active| {
+            let active = active.try_borrow().ok()?;
+            Some(active.as_ref()?.ledger.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+/// The bytes one Rust-heap payload container has charged to a heap's external ledger
+/// ([`charge_external`]): the active heap's when it first charged, which the record keeps, so
+/// that whatever heap is active when it changes or drops (a payload cell's finalizer runs in
+/// its heap's sweep or teardown), the bytes go back to the ledger they came from.
+/// [`ExternalCharge::settle`] brings the charge to the container's current size; dropping the
+/// record releases it. A clone charges what the original holds again, for a cloned container,
+/// until that one settles its own size.
 #[derive(Default)]
-pub(crate) struct ExternalCharge(usize);
+pub(crate) struct ExternalCharge {
+    bytes: usize,
+    ledger: Option<Rc<crate::gc_core::Control>>,
+}
 
 impl ExternalCharge {
     /// Nothing charged.
     pub(crate) const fn new() -> Self {
-        Self(0)
+        Self {
+            bytes: 0,
+            ledger: None,
+        }
     }
 
     /// Charge or release the difference between `bytes` and what is charged now.
     #[inline]
     pub(crate) fn settle(&mut self, bytes: usize) {
-        if bytes != self.0 {
-            if bytes > self.0 {
-                charge_external(bytes - self.0);
-            } else {
-                release_external(self.0 - bytes);
-            }
-            self.0 = bytes;
+        if bytes == self.bytes {
+            return;
         }
+        if self.ledger.is_none() {
+            self.ledger = active_ledger();
+        }
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        if bytes > self.bytes {
+            ledger.charge_external(bytes - self.bytes);
+        } else {
+            ledger.release_external(self.bytes - bytes);
+        }
+        self.bytes = bytes;
     }
 }
 
 impl Clone for ExternalCharge {
     fn clone(&self) -> Self {
-        charge_external(self.0);
-        Self(self.0)
+        if let Some(ledger) = &self.ledger {
+            ledger.charge_external(self.bytes);
+        }
+        Self {
+            bytes: self.bytes,
+            ledger: self.ledger.clone(),
+        }
     }
 }
 
 impl Drop for ExternalCharge {
     fn drop(&mut self) {
-        release_external(self.0);
+        if let Some(ledger) = &self.ledger {
+            ledger.release_external(self.bytes);
+        }
     }
 }
 
@@ -3419,11 +3515,15 @@ impl Object {
             call,
             exotic,
             ic_plain: _,
-            native_typed_array: _, // byte storage only
+            native_typed_array,
             is_constructor: _,
         } = self;
         if let Some(proto) = proto {
             sink.object(proto);
+        }
+        // The view's payload cell; its buffer is byte storage.
+        if let Some(view) = native_typed_array {
+            crate::gc_storage::PayloadBox::trace(view, sink);
         }
         // The storage blocks the payloads live in, in every trace: they live as long as an owner
         // reports them (`gc_storage`).
@@ -3452,14 +3552,28 @@ impl Object {
         }
         props.entries.layout.trace_gc(sink);
         props.trace_symbol_keys(sink);
+        // Each payload cell (`gc_storage::PayloadBox`), with what its value holds.
+        use crate::gc_storage::PayloadBox;
         match exotic {
-            Exotic::ArrayIterator(state) => sink.value(&state.target),
-            Exotic::BigIntWrap(bigint) => sink.word(bigint.cell_word()),
+            Exotic::ArrayIterator(state) => {
+                PayloadBox::trace(state, sink);
+                sink.value(&state.target);
+            }
+            Exotic::BigIntWrap(bigint) => {
+                PayloadBox::trace(bigint, sink);
+                sink.word(bigint.cell_word());
+            }
             Exotic::SymWrap(symbol) => sink.word(symbol_identity(symbol) as u64),
-            Exotic::StrWrap(string) => sink.word(string.cell_word()),
-            Exotic::StringIterator(state) => state.string.trace_gc(sink),
-            Exotic::Error(stack) => stack.trace_gc(sink), // frame names
-            Exotic::Collection(data) => data.trace_gc(sink),
+            Exotic::StrWrap(string) => {
+                PayloadBox::trace(string, sink);
+                sink.word(string.cell_word());
+            }
+            Exotic::StringIterator(state) => {
+                PayloadBox::trace(state, sink);
+                state.string.trace_gc(sink);
+            }
+            Exotic::Error(stack) => stack.trace_gc(sink), // the cell and the frame names
+            Exotic::Collection(data) => data.trace_gc(sink), // the cell and the entries
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)
@@ -3470,6 +3584,7 @@ impl Object {
             // The closure cell, which traces its environment.
             Callable::User(user) => sink.word(crate::gc_box::GcBox::as_ptr(user) as u64),
             Callable::Bound(bound) => {
+                PayloadBox::trace(bound, sink);
                 sink.object(&bound.target);
                 sink.value(&bound.this);
                 for argument in &bound.args {
@@ -3477,19 +3592,22 @@ impl Object {
                 }
             }
             Callable::WrappedShadow(shadow) => {
+                PayloadBox::trace(shadow, sink);
                 sink.object(&shadow.realm);
                 sink.value(&shadow.target);
             }
-            Callable::WrappedCross(cross) => sink.value(&cross.target),
-            Callable::NativeData(native) => native.trace_gc(sink),
-            Callable::None
-            | Callable::Native(_)
-            | Callable::AccessorGet(_)
-            | Callable::AccessorSet(_)
-            | Callable::PropGet(_)
-            | Callable::PropSet(_)
-            | Callable::PrivatePropGet(_)
-            | Callable::PrivatePropSet(_) => {}
+            Callable::WrappedCross(cross) => {
+                PayloadBox::trace(cross, sink);
+                sink.value(&cross.target);
+            }
+            Callable::NativeData(native) => native.trace_gc(sink), // the cell and the captures
+            Callable::AccessorGet(key)
+            | Callable::AccessorSet(key)
+            | Callable::PropGet(key)
+            | Callable::PropSet(key)
+            | Callable::PrivatePropGet(key)
+            | Callable::PrivatePropSet(key) => PayloadBox::trace(key, sink),
+            Callable::None | Callable::Native(_) => {}
             #[cfg(feature = "embed")]
             Callable::ScopedNative(_) => {}
         }
@@ -3591,19 +3709,13 @@ impl Value {
     }
 }
 
-/// Release the object's owned Rust payload. Empty ordinary objects need no destructor; cell
-/// edges are uncounted. Keep the census outside that fast path so it observes every death.
-fn finalize_object_cell(cell: *mut u8) {
+/// The object finalizer of the layout census (`TRUST_JS_GC_CENSUS`): it records each death.
+/// Objects have nothing to drop, so without the census they have no finalizer.
+fn census_dead_object(cell: *mut u8) {
     // SAFETY: a dying object is initialized and no borrow may cross a safepoint (I9).
-    let object = unsafe { &mut *cell.cast::<RefCell<Object>>() }.get_mut();
-    if layout_census::enabled() {
+    let object = unsafe { &*cell.cast::<RefCell<Object>>() };
+    if let Ok(object) = unsafe { object.try_borrow_unguarded() } {
         layout_census::record(layout_census::DEAD, object);
-    }
-    if object.owns_payload() {
-        // SAFETY: object cells are initialized before any collection or teardown, and finalized
-        // exactly once. Payloadless objects may be forgotten because none of their drops free
-        // memory or deliver notifications (those are evicted before the sweep).
-        unsafe { std::ptr::drop_in_place(object) };
     }
 }
 
@@ -4191,6 +4303,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         ledger,
         object_desc: descs.object,
         storage_desc: descs.storage,
+        payload_descs: descs.payloads,
         accessor_desc: descs.accessor,
         scope_desc: descs.scope,
         bigint_desc: descs.bigint,
@@ -5518,7 +5631,7 @@ static EMPTY_INTERNAL_SLOTS: EmptyInternalSlots = EmptyInternalSlots(InternalSlo
 #[repr(C)]
 struct DenseStorage(
     Option<crate::gc_storage::StorageBox<DenseBuffers>>,
-    Option<Box<DenseExtras>>,
+    Option<crate::gc_storage::PayloadBox<DenseExtras>>,
 );
 
 impl std::ops::Deref for DenseStorage {
@@ -5562,6 +5675,9 @@ impl DenseStorage {
     /// Report the sidecar's block and the blocks it holds (see [`Props::trace_storage`]).
     fn trace_storage(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         use crate::gc_storage::{trace_block, StorageBox};
+        if let Some(extras) = &self.1 {
+            crate::gc_storage::PayloadBox::trace(extras, sink);
+        }
         let Some(buffers) = &self.0 else {
             return;
         };
@@ -5594,12 +5710,6 @@ impl DenseStorage {
         }
     }
 
-    /// Whether dropping the storage releases anything outside the heap: the extras (a hash
-    /// index, Symbol keys, internal slots). The sidecar and its buffers are blocks of plain
-    /// data, so without extras an owner that dies needs no finalizer for its map.
-    fn owns_payload(&self) -> bool {
-        self.1.is_some()
-    }
     fn retain_symbol_key(&mut self, key: &str) {
         let Some(id) = encoded_symbol_id(key) else {
             return;
@@ -6047,14 +6157,16 @@ pub(crate) fn detached_field_bytes(capacity: usize) -> usize {
 
 #[derive(Clone, Default)]
 struct NamedEntries {
-    fields: Fields,
+    /// Never dropped: its elements and its spill own nothing to release (`Property` holds no
+    /// drop glue, the spill is a storage block), so a map, and an object, carry no drop glue.
+    fields: std::mem::ManuallyDrop<Fields>,
     layout: Option<PropertyLayout>,
 }
 
 impl NamedEntries {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            fields: Fields::with_capacity(capacity),
+            fields: std::mem::ManuallyDrop::new(Fields::with_capacity(capacity)),
             layout: None,
         }
     }
@@ -6083,7 +6195,7 @@ impl NamedEntries {
             .map_or(&[], |keys| &keys[..self.len()])
     }
     fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &Property)> {
-        self.keys().iter().zip(&self.fields)
+        self.keys().iter().zip(self.fields.iter())
     }
     fn get(&self, slot: usize) -> Option<(&Rc<str>, &Property)> {
         Some((self.keys().get(slot)?, self.fields.get(slot)?))
@@ -6797,7 +6909,7 @@ impl Props {
 
     pub(crate) fn with_layout(capacity: usize, layout: Option<PropertyLayout>) -> Props {
         Self::with_entries(NamedEntries {
-            fields: Fields::with_capacity(capacity),
+            fields: std::mem::ManuallyDrop::new(Fields::with_capacity(capacity)),
             layout,
         })
     }
@@ -6896,7 +7008,7 @@ impl Props {
             .heap_capacity()
             .saturating_mul(std::mem::size_of::<Property>());
         let mut exact = true;
-        for property in &self.entries.fields {
+        for property in self.entries.fields.iter() {
             bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
         }
         if let Some(dense) = self.elems.0.as_deref() {
@@ -6997,12 +7109,12 @@ impl Props {
         let shape = array_length_shape(&length_key);
         let mut props = Props {
             entries: NamedEntries {
-                fields: Fields::from_iter([Property::data(
+                fields: std::mem::ManuallyDrop::new(Fields::from_iter([Property::data(
                     Value::Num(len as f64),
                     true,
                     false,
                     false,
-                )]),
+                )])),
                 layout: Some(array_length_layout()),
             },
             shape,
@@ -7064,7 +7176,7 @@ impl Props {
             "plain object template with a non-writable or accessor field"
         );
         let entries = NamedEntries {
-            fields: values.map(Property::plain).collect(),
+            fields: std::mem::ManuallyDrop::new(values.map(Property::plain).collect()),
             layout: self.entries.layout.clone(),
         };
         Props {
@@ -9163,7 +9275,7 @@ mod object_accounting_tests {
     }
 
     #[test]
-    fn object_payload_finalization_runs_for_rust_heap_payloads_only() {
+    fn object_payloads_drop_with_their_payload_cells() {
         struct Witness(Rc<Cell<usize>>);
         impl Drop for Witness {
             fn drop(&mut self) {
@@ -9174,8 +9286,6 @@ mod object_accounting_tests {
         let symbols = new_symbol_agent();
         let _active = enter_agent(&heap, &symbols);
         let release = HeapRelease::new(&heap);
-        let plain = Object::new(None);
-        assert!(!plain.borrow().owns_payload());
         let named = Object::new(None);
         named
             .borrow_mut()
@@ -9190,29 +9300,17 @@ mod object_accounting_tests {
             .unwrap()
             .clone();
         let identity = layout.as_ptr();
-        assert!(!named.borrow().owns_payload());
-        // A spill is a storage block (`gc_storage`): the collector frees it with the object.
-        let spilled = Object::new_with_capacity(None, INLINE_NAMED_SLOTS + 1);
-        assert!(!spilled.borrow().owns_payload());
+        // Internal slots live in the map's extras, a payload cell with a finalizer.
         let sidecar = Object::new(None);
         sidecar
             .borrow_mut()
             .internal_slots_mut()
             .insert("state", Property::plain(Value::Num(2.0)));
-        assert!(sidecar.borrow().owns_payload());
-        let accessor = Object::new(None);
-        // An accessor pair is a cell of its own, which the collector frees.
-        accessor
-            .borrow_mut()
-            .props
-            .entries
-            .fields
-            .push(Property::accessor_prop(None, None, true, true));
-        assert!(!accessor.borrow().owns_payload());
+        // A native function's Rust state lives in a payload cell, dropped when the cell dies.
         let dropped = Rc::new(Cell::new(0));
         let witness = Witness(dropped.clone());
         let native = Object::new(None);
-        native.borrow_mut().call = Callable::NativeData(Rc::new(NativeCallable {
+        native.borrow_mut().call = Callable::native_data(Rc::new(NativeCallable {
             body: NativeCallableBody::Opaque(Rc::new(move |_, _, _| {
                 let _keep = &witness;
                 Ok(Value::Undefined)
@@ -9220,7 +9318,6 @@ mod object_accounting_tests {
             retained: None,
             identity: Rc::from("finalization witness"),
         }));
-        assert!(native.borrow().owns_payload());
         collect(&heap, &[], CollectionKind::Major);
         assert_eq!(layout.as_ptr(), identity);
         assert_eq!(&*layout[0], "field");

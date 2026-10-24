@@ -558,11 +558,12 @@ fn remembered_object_trace_preserves_every_non_element_edge_family() {
             .insert("internal", Property::plain(values[2]));
         body.props
             .insert(key.as_str(), Property::plain(Value::Null));
-        body.exotic = Exotic::ArrayIterator(Box::new(ArrayIteratorState {
-            target: values[3],
-            index: 0,
-            kind: 0,
-        }));
+        body.exotic =
+            Exotic::ArrayIterator(crate::gc_storage::PayloadBox::new(ArrayIteratorState {
+                target: values[3],
+                index: 0,
+                kind: 0,
+            }));
         body.call = Callable::bound(object(values[4]), values[5], vec![values[6]]);
     }
     let words: Vec<u64> = values.into_iter().chain([symbol]).map(witness).collect();

@@ -2051,8 +2051,9 @@ pub const H_INTERRUPT: usize = 22;
 /// Exact-PC loop back-edge feedback in diagnostic mode.
 pub const H_LOOP_BACKEDGE: usize = 23;
 
-/// Pure representation preparation: no author code or engine allocation/safepoint. The
-/// activation owns `raw`; the optional f64 mirror leaves canonical Property addresses intact.
+/// Pure representation preparation: no author code or safepoint. The mirror's storage block is
+/// allocated in the heap, and allocation never collects. The activation owns `raw`; the
+/// optional f64 mirror leaves canonical Property addresses intact.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -2065,6 +2066,10 @@ unsafe extern "C" fn jit_prepare_packed_numeric_mirror(
     let Ok(mut body) = object.try_borrow_mut() else {
         return;
     };
+    // The write barrier, as `Gc::borrow_mut` records it: the mirror is a new storage block
+    // (`gc_storage`), which an old array's card must report to the next minor collection.
+    // SAFETY: `raw` is a live object's cell (see above), of the carded object kind.
+    unsafe { crate::gc_core::card_mark(raw.cast()) };
     if matches!(body.exotic, crate::value::Exotic::Array) && body.ic_plain.get() {
         body.props.prepare_packed_numeric_mirror();
     }
@@ -2362,7 +2367,7 @@ mod native_op_tests {
             retained: None,
             identity: Rc::from("test.extension.op"),
         });
-        let call = crate::value::Callable::NativeData(data);
+        let call = crate::value::Callable::native_data(data);
         let mut t = tables();
         record_native_op_src(&mut t, NativeLabelSrc::Call(&call), 5, true);
         let rendered = render_native_ops(&t);

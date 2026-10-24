@@ -143,3 +143,110 @@ impl crate::inline_vec::Spill for GcSpill {
         // The collector frees the block once no owner reports it.
     }
 }
+
+/// A kind of value an engine cell keeps beside itself in a payload cell ([`PayloadBox`]).
+pub(crate) trait PayloadKind: Sized + 'static {
+    /// The descriptor of this kind's payload cells in `heap`.
+    fn desc(heap: &crate::value::GcState) -> crate::gc_core::DescId;
+}
+
+/// The descriptor of `T`'s payload cells: no edges of their own (the owner traces what the
+/// value holds, as it reports the cell), uncarded (the value changes only through its owner,
+/// whose card the change sets), and a finalizer that drops the value when the cell dies, if
+/// `T` has anything to drop.
+pub(crate) fn payload_layout<T: PayloadKind>(name: &'static str) -> crate::gc_core::LayoutDesc {
+    crate::gc_core::LayoutDesc {
+        name,
+        trace: crate::gc_box::trace_none,
+        mark_trace: None,
+        finalize: std::mem::needs_drop::<T>().then_some(finalize_payload::<T> as _),
+        carded: false,
+    }
+}
+
+/// Drop the value of a dead payload cell of `T`: its descriptor's finalizer.
+fn finalize_payload<T: PayloadKind>(cell: *mut u8) {
+    // SAFETY: payload cells of `T` hold a value written by `PayloadBox::new` before any
+    // collection, which only this finalizer drops, once.
+    unsafe { std::ptr::drop_in_place(cell.cast::<T>()) };
+}
+
+/// One value of type `T` in a payload cell of its own: a `Box<T>` whose value the collector
+/// drops. An object keeps its Rust-heap payloads (a Map's tables, a bound function's arguments,
+/// an error's stack trace...) in these, so the object itself holds nothing to drop and dies
+/// without a finalizer (`value::Object`); the payload cell's finalizer drops the value when the
+/// cell dies, with its owner or once the owner let it go. The owner reports the cell with
+/// [`PayloadBox::trace`] and traces the value's edges itself, in every trace; it changes the
+/// value only through itself, so the owner's card records a change as for any of its fields.
+/// Dropping the box drops nothing: the value is the cell's. A clone is a new cell.
+#[repr(transparent)]
+pub(crate) struct PayloadBox<T: PayloadKind>(NonNull<T>, std::marker::PhantomData<T>);
+
+impl<T: PayloadKind> PayloadBox<T> {
+    pub(crate) fn new(value: T) -> Self {
+        const { assert!(align_of::<T>() <= BLOCK_ALIGN) };
+        let cell = crate::value::alloc_payload_cell(T::desc, size_of::<T>().max(1)).cast::<T>();
+        // SAFETY: a fresh cell sized and aligned for `T`. Allocation never collects, so the
+        // value is written before any collection can finalize the cell.
+        unsafe {
+            cell.write(value);
+            Self(NonNull::new_unchecked(cell), std::marker::PhantomData)
+        }
+    }
+
+    /// Report the cell to `sink`.
+    #[inline]
+    pub(crate) fn trace(this: &Self, sink: &mut dyn GcSink) {
+        trace_block(this.0.as_ptr().cast(), sink);
+    }
+}
+
+impl<T: PayloadKind> Deref for PayloadBox<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: the box names a live payload cell its owner reports.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl<T: PayloadKind> DerefMut for PayloadBox<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as in `deref`; the box is the cell's one owner, borrowed mutably.
+        unsafe { self.0.as_mut() }
+    }
+}
+
+impl<T: PayloadKind + Default> Default for PayloadBox<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: PayloadKind> AsRef<T> for PayloadBox<T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+/// The cell, and the value's own edges.
+impl<T: PayloadKind + crate::gc_trace::GcTrace> crate::gc_trace::GcTrace for PayloadBox<T> {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        Self::trace(self, sink);
+        (**self).trace_gc(sink);
+    }
+}
+
+impl<T: PayloadKind + Clone> Clone for PayloadBox<T> {
+    fn clone(&self) -> Self {
+        Self::new((**self).clone())
+    }
+}
+
+impl<T: PayloadKind + std::fmt::Debug> std::fmt::Debug for PayloadBox<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}

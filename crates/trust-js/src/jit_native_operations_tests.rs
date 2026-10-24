@@ -299,7 +299,7 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
                 let probe = Probe(count.clone());
                 let object = crate::value::Object::new(Some(i.object_proto));
                 object.borrow_mut().call =
-                    crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
+                    crate::value::Callable::native_data(Rc::new(crate::value::NativeCallable {
                         body: crate::value::NativeCallableBody::Opaque(Rc::new(move |_, _, _| {
                             let _ = &probe;
                             Ok(crate::value::Value::Undefined)

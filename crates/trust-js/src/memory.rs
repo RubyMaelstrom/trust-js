@@ -607,6 +607,8 @@ impl Visitor {
             #[cfg(feature = "embed")]
             Callable::ScopedNative(_) => {}
             Callable::NativeData(value) => {
+                // The shared Rc inside the object's payload cell.
+                let value: &Rc<crate::value::NativeCallable> = value;
                 let identity = Rc::as_ptr(value) as usize;
                 let first = self.callable_allocations.insert(identity);
                 if first {
@@ -719,6 +721,8 @@ impl Visitor {
                 }
             }
             Callable::WrappedShadow(value) => {
+                // The shared Rc inside the object's payload cell.
+                let value: &Rc<crate::value::WrappedShadowCallable> = value;
                 let identity = Rc::as_ptr(value) as usize;
                 if self.callable_allocations.insert(identity) {
                     self.callable_metadata = self
@@ -3162,7 +3166,7 @@ mod tests {
     #[test]
     fn explicit_native_captures_are_complete_and_shared_storage_is_counted_once() {
         let string = LStr::from("explicit native capture");
-        let callable = Callable::NativeData(Rc::new(crate::value::NativeCallable {
+        let callable = Callable::native_data(Rc::new(crate::value::NativeCallable {
             body: crate::value::NativeCallableBody::Captured {
                 function: |_, _, _, captures| Ok(captures[0]),
                 captures: vec![Value::Str(string), Value::Str(string)].into_boxed_slice(),
@@ -3243,7 +3247,7 @@ mod tests {
         let mut visitor = Visitor::default();
         let (first_func, first_retained) = make_closure();
         let first_callable =
-            crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
+            crate::value::Callable::native_data(Rc::new(crate::value::NativeCallable {
                 body: crate::value::NativeCallableBody::CapturedClosure {
                     function: first_func,
                     captures: vec![Value::Str(string)].into_boxed_slice(),
@@ -3253,7 +3257,7 @@ mod tests {
             }));
         let (second_func, second_retained) = make_closure();
         let second_callable =
-            crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
+            crate::value::Callable::native_data(Rc::new(crate::value::NativeCallable {
                 body: crate::value::NativeCallableBody::CapturedClosure {
                     function: second_func,
                     captures: vec![Value::Str(string)].into_boxed_slice(),

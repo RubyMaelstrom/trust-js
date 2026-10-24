@@ -6650,9 +6650,9 @@ impl Interp {
         {
             let mut b = o.borrow_mut();
             b.call = if is_get {
-                Callable::AccessorGet(Rc::new(backing.clone()))
+                Callable::accessor_key(Callable::AccessorGet, backing.clone())
             } else {
-                Callable::AccessorSet(Rc::new(backing.clone()))
+                Callable::accessor_key(Callable::AccessorSet, backing.clone())
             };
             let prefix = if is_get { "get " } else { "set " };
             b.props.insert(
@@ -6745,18 +6745,18 @@ impl Interp {
         let access = self.new_object();
         if matches!(kind, "method" | "getter" | "field" | "accessor") {
             let call = if is_private {
-                Callable::PrivatePropGet(Rc::new(key_rc.clone()))
+                Callable::accessor_key(Callable::PrivatePropGet, key_rc.clone())
             } else {
-                Callable::PropGet(Rc::new(key_rc.clone()))
+                Callable::accessor_key(Callable::PropGet, key_rc.clone())
             };
             let g = self.make_callable(call, "get", 1.0);
             access.borrow_mut().props.insert("get", Property::plain(g));
         }
         if matches!(kind, "setter" | "field" | "accessor") {
             let call = if is_private {
-                Callable::PrivatePropSet(Rc::new(key_rc.clone()))
+                Callable::accessor_key(Callable::PrivatePropSet, key_rc.clone())
             } else {
-                Callable::PropSet(Rc::new(key_rc.clone()))
+                Callable::accessor_key(Callable::PropSet, key_rc.clone())
             };
             let s = self.make_callable(call, "set", 2.0);
             access.borrow_mut().props.insert("set", Property::plain(s));

@@ -666,7 +666,7 @@ fn bare_scoped_empty_is_undefined_in_inputs_outputs_forwarding_and_handles() {
             .all(|value| value.into_internal().bits() == crate::value::PACK_UNDEFINED));
         Ok(raw_scoped_empty())
     }
-    let call = Callable::NativeData(Rc::new(NativeCallable {
+    let call = Callable::native_data(Rc::new(NativeCallable {
         body: NativeCallableBody::ScopedCaptured {
             function: std::hint::black_box(captures as crate::embed::NativeCaptureFn),
             captures: vec![Internal::Empty, Internal::Empty].into_boxed_slice(),

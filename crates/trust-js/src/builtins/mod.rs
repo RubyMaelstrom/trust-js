@@ -10223,11 +10223,13 @@ fn make_array_iterator(i: &mut Interp, target: Value, kind: u8) -> Value {
     let obj = Object::new_with_parts(
         proto,
         crate::value::Props::new(),
-        Exotic::ArrayIterator(Box::new(crate::value::ArrayIteratorState {
-            target,
-            index: 0,
-            kind,
-        })),
+        Exotic::ArrayIterator(crate::gc_storage::PayloadBox::new(
+            crate::value::ArrayIteratorState {
+                target,
+                index: 0,
+                kind,
+            },
+        )),
     );
     Value::Obj(obj)
 }
@@ -11216,10 +11218,12 @@ fn nf_string_iterator(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Va
     let obj = Object::new_with_parts(
         i.extra_protos.get("%StringIteratorPrototype%").cloned(),
         crate::value::Props::new(),
-        Exotic::StringIterator(Box::new(crate::value::StringIteratorState {
-            string: Some(s),
-            index: 0,
-        })),
+        Exotic::StringIterator(crate::gc_storage::PayloadBox::new(
+            crate::value::StringIteratorState {
+                string: Some(s),
+                index: 0,
+            },
+        )),
     );
     Ok(Value::Obj(obj))
 }

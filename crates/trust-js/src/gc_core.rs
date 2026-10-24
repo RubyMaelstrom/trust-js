@@ -1240,7 +1240,13 @@ pub(crate) struct GcStats {
     /// The last collection's phases, in nanoseconds, while [`Heap::set_phase_timing`] is on:
     /// see [`Phase`].
     pub(crate) last_phase_nanos: [u64; PHASES],
+    /// The cells the last collection finalized, by descriptor (the first [`COUNTED_DESCS`]),
+    /// while phases are timed.
+    pub(crate) last_finalized: [u32; COUNTED_DESCS],
 }
+
+/// How many descriptors [`GcStats::last_finalized`] counts.
+pub(crate) const COUNTED_DESCS: usize = 16;
 
 /// The phases of a collection the heap times (diagnostics; [`Heap::set_phase_timing`]).
 #[derive(Clone, Copy)]
@@ -2102,6 +2108,11 @@ impl Heap {
         })
     }
 
+    /// The names of the descriptors, by id (diagnostics).
+    pub(crate) fn desc_names(&self) -> Vec<&'static str> {
+        self.descs.iter().map(|desc| desc.name).collect()
+    }
+
     /// The name of the kind of the cell `word` resolves to (diagnostics).
     #[cfg(debug_assertions)]
     pub(crate) fn kind_name(&self, word: u64) -> Option<&'static str> {
@@ -2603,6 +2614,7 @@ impl Heap {
         self.refresh_due();
         self.stats.collections += 1;
         self.stats.last_phase_nanos = [0; PHASES];
+        self.stats.last_finalized = [0; COUNTED_DESCS];
         let mut clock = self.phase_clock();
         self.flush_cursors();
         self.begin_marking(kind, client);
@@ -3270,22 +3282,28 @@ impl Heap {
     /// Run the finalizer of every newly dead cell of the page in slot `index`: the unmarked
     /// allocated cells that are not zombies (finalized before). The sweep's first pass; nothing
     /// is freed yet (see [`Heap::sweep`]).
-    fn finalize_page(&self, index: usize) {
+    fn finalize_page(&mut self, index: usize) {
         let Some(page) = self.pages[index].as_ref() else {
             return;
         };
         let Some(finalize) = self.descs[page.desc.0 as usize].finalize else {
             return;
         };
+        let mut finalized = 0u32;
         for word in 0..page.next_unused.div_ceil(64) {
             let used = (page.next_unused - word * 64).min(64);
             let mut candidates = page.allocated[word] & !page.marks[word] & !page.zombies[word];
             candidates &= u64::MAX >> (64 - used);
+            finalized += candidates.count_ones();
             while candidates != 0 {
                 let i = word * 64 + candidates.trailing_zeros() as usize;
                 candidates &= candidates - 1;
                 finalize(page.cell_ptr(i) as *mut u8);
             }
+        }
+        let desc = page.desc.0 as usize;
+        if self.phase_timing && desc < COUNTED_DESCS {
+            self.stats.last_finalized[desc] += finalized;
         }
     }
 
@@ -3699,13 +3717,40 @@ pub(crate) fn scrub_stack(bytes: usize) {
 }
 
 /// Zero `bytes` (a multiple of 16) below the caller's stack pointer. A leaf with no frame, so
-/// nothing of its own is left in the zeroed range.
+/// nothing of its own is left in the zeroed range. Whole blocks are zeroed with `dc zva`, which
+/// writes a block (DCZID_EL0's size, usually 64 bytes) without reading it, as memset does;
+/// pairs of zero registers cover the unaligned head and the tail, and everything when the
+/// instruction is prohibited.
 #[cfg(target_arch = "aarch64")]
 #[unsafe(naked)]
 unsafe extern "C" fn zero_below_sp(bytes: usize) {
     std::arch::naked_asm!(
         "mov x9, sp",
         "sub x10, x9, x0",
+        // The block size, 4 << DCZID_EL0.BS bytes, unless DZP prohibits the instruction.
+        "mrs x11, dczid_el0",
+        "tbnz x11, #4, 2f",
+        "and x11, x11, #15",
+        "mov x12, #4",
+        "lsl x12, x12, x11",
+        "sub x13, x12, #1",
+        // The head, up to a block boundary.
+        "4:",
+        "tst x10, x13",
+        "b.eq 5f",
+        "cmp x10, x9",
+        "b.hs 3f",
+        "stp xzr, xzr, [x10], #16",
+        "b 4b",
+        // Whole blocks.
+        "5:",
+        "add x14, x10, x12",
+        "cmp x14, x9",
+        "b.hi 2f",
+        "dc zva, x10",
+        "mov x10, x14",
+        "b 5b",
+        // The tail, or everything without `dc zva`.
         "2:",
         "cmp x10, x9",
         "b.hs 3f",
@@ -3722,16 +3767,16 @@ unsafe extern "C" fn zero_below_sp(bytes: usize) {
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 unsafe extern "sysv64" fn zero_below_sp(bytes: usize) {
+    // `rep stosq` from the range's start up to the return address: (bytes - 8) / 8 words. The
+    // direction flag is clear on entry (the calling convention).
     std::arch::naked_asm!(
         "lea rcx, [rsp + 8]",
         "sub rcx, rdi",
-        "2:",
-        "cmp rcx, rsp",
-        "jae 3f",
-        "mov qword ptr [rcx], 0",
-        "add rcx, 8",
-        "jmp 2b",
-        "3:",
+        "xchg rdi, rcx",
+        "sub rcx, 8",
+        "shr rcx, 3",
+        "xor eax, eax",
+        "rep stosq",
         "ret",
     )
 }

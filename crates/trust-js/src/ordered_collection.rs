@@ -451,7 +451,8 @@ impl crate::interpreter::Interp {
 
     /// Give a new Map or Set `object` its [[MapData]]/[[SetData]].
     pub(crate) fn set_collection(&mut self, object: &Gc, data: OrderedCollection) {
-        object.borrow_mut().exotic = crate::value::Exotic::Collection(Box::new(data));
+        object.borrow_mut().exotic =
+            crate::value::Exotic::Collection(crate::gc_storage::PayloadBox::new(data));
     }
 
     /// Move `from`'s [[MapData]]/[[SetData]], if it has one, to `to` (the subclass instance a

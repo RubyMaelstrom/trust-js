@@ -83,17 +83,18 @@ impl Interp {
                 })
             })
             .clone();
-        object.borrow_mut().native_typed_array = Some(Box::new(NativeTypedArray {
-            buffer_ptr: Rc::as_ptr(&buffer),
-            offset: info.offset,
-            end,
-            // Native element counts stay within the signed 32-bit range: generated code may
-            // then reject a negative key by its unsigned magnitude alone.
-            limit: if info.track { 0 } else { info.len.min(1 << 31) },
-            kind,
-            shift: size.trailing_zeros() as u8,
-            buffer,
-        }));
+        object.borrow_mut().native_typed_array =
+            Some(crate::gc_storage::PayloadBox::new(NativeTypedArray {
+                buffer_ptr: Rc::as_ptr(&buffer),
+                offset: info.offset,
+                end,
+                // Native element counts stay within the signed 32-bit range: generated code may
+                // then reject a negative key by its unsigned magnitude alone.
+                limit: if info.track { 0 } else { info.len.min(1 << 31) },
+                kind,
+                shift: size.trailing_zeros() as u8,
+                buffer,
+            }));
     }
 
     pub(crate) fn invalidate_native_buffer(&mut self, ptr: usize) {
