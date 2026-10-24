@@ -9087,3 +9087,184 @@ Both are owner decisions. The Vue longest-pause and React compilation
 costs of part C exceed the roughly 5% minor-regression allowance and
 await owner acceptance or further work. Raw results are under each
 part's measurement directory.
+
+
+GC rework after the owner's review of the bounds, 2026-10-24
+
+The owner judged the +25% peak-RSS bound arbitrary and asked for the
+collector that best serves correctness and the faster JIT to come, with
+implementation first and testing kept for the final merge decision.
+The review's measurements (part D's fat-LTO binary) found a correctness
+gap the bounds had hidden: the triggers counted cells only, so element
+storage in the Rust heap grew without collection. One live 1,000,000-
+element Array at a time peaked at 4.59 GB (main 66 MB, Node 326 MB); a
+chain of a.map over 100,000 elements at 4.09 GB with no collection at
+all (main 28 MB); arrays grown by push at 1.42 GB (main 16 MB). Node
+used 64/64/69/110 MB on React/Vue/Djot/sustained allocation against
+part D's 20/29/39/76 MB. Seven commits followed, each with the lib suite
+on Crystal and focused tests; the closing gates come last.
+
+- External bytes (39ed8b62). The heap's control block keeps a ledger of
+  the bytes cells own in the Rust heap: Map and Set tables, bound
+  arguments, stack traces, environment binding spills, a map's hash
+  index, Symbol keys and internal slots charge it as they grow and
+  release it when dropped. A collection is due once a nursery budget of
+  them was charged since the last one; the bytes still charged count with
+  the cells against the byte budget. A collection the charges made due
+  that releases under a quarter of them doubles the external budget, up
+  to the byte budget, so a growing live Map does not collect at every
+  step. 30 replaced 6 MB Maps now collect as they grow.
+- Payload storage in the heap (54eddb1d). Spilled named properties, the
+  element sidecar, packed elements, the numeric mirror, the dense slot
+  map and the remembered-element bitmap live in storage blocks
+  (gc_storage): leaf cells of the heap's own pages with no trace or
+  finalizer, which their owners report as edges in every trace. Accessor
+  pairs are immutable cells that copies share. Properties own nothing
+  outside the heap; a map's Rust-heap parts (hash index, Symbol keys,
+  internal slots) move to a box beside the sidecar, so dropping a map
+  never reads a block, which may have gone with its heap (templates can
+  outlive their Agent). An ordinary object or Array needs no finalizer
+  work, its storage counts toward the nursery as cells do, and the three
+  runaway scripts collect as they go (regression tests). Every finalizer
+  runs before any dead cell is freed. Minor collections sweep only the
+  large cells allocated since the last one.
+- Bitmap allocation (56d9f92a). A page hands out the lowest free cell of
+  its allocation bitmap (Go's allocCache), so allocation never reads a
+  free cell, and the sweep frees by clearing bits: no dead cell's memory
+  is touched in release builds. The profiles had put the free-list pop's
+  cache miss at the top of React's native samples.
+- Minor collections' fixed work (f99a715f). New phase timers
+  (TRUST_JS_GC_LOG) showed most of a Vue or Djot minor collection
+  independent of what survived. A minor collection now traces only the
+  code roots registered since the last collection and the cells stored
+  into older ones since (late template, layout and private-key fills
+  report them; debug builds check after every minor marking that no code
+  root holds an unmarked young cell); the barrier also sets its page's
+  summary byte (the card table's last byte, whose card no cell starts
+  in) and minor collections skip clean pages' tables (one more strb on
+  ARM64, one byte store on x64; debug builds check every set card has its
+  summary); dead objects are counted by popcount and listed only when a
+  table walk needs them; the thread's weak cells keep those whose
+  targets a collection found alive apart, and minor collections read the
+  young ones. Per Djot minor collection, roots 150 -> 80 us, dead-object
+  listing 64-78 -> 2-4, weak cells 63 -> 10-12.
+- Allocation cursors (76aab7d7). Each (descriptor, size class) has a
+  cursor in one dense array with the page, its bitmap and the free cells
+  of the current word (Go's mcache, JavaScriptCore's local allocators);
+  page metadata is read when a word runs out, and its counts catch up
+  then and as collections start. This is the layout inlined allocation
+  in generated code will read. The rooting registry's unregister became
+  constant-time (1.6% of Vue had been its free-list filtering).
+- Objects without finalizers (0f571675). An object's Rust-heap
+  payloads (Map and Set tables, a bound function's arguments, an error's
+  stack trace, native function data, a typed array's view, its map's
+  hash index, Symbol keys and internal slots) live in payload cells of
+  their own (gc_storage), one descriptor per kind, whose finalizers drop
+  them. The object cell holds nothing to drop, which a compile-time
+  check keeps so, and dies as a bit in its page. A payload's external
+  charge remembers its heap, so a finalizer that runs while another
+  heap is active (teardown) releases into the right ledger. The numeric
+  mirror's helper, which gave an old array a new block without the
+  barrier, now sets the card; a GC stress run of 76aab7d7 had caught it
+  in 13 JIT numeric-array tests, which pass under stress since. The
+  stack scrub zeroes with dc zva on ARM64 and rep stosq on x64, and
+  TRUST_JS_GC_LOG counts the finalized cells by kind.
+- Calls, cards, closures and allocation (f0a618ff).
+  - Every call copies the callee's [[Call]] payload out of the object
+    before it runs, and since 0f571675 the copy was a new payload cell:
+    a native-data call (Math.random among them), a bound call or a
+    wrapped call each allocated one, with a finalizer. A loop of bound
+    and native calls collected 298 times instead of 184 and spent 112
+    instead of 47 ms in collections. Call payloads are immutable, so a
+    copy now names the same cell (SharedPayload), as a Gc copy names
+    the same object; the native-data and wrapped dispatches hold their
+    own Rc while the function runs, which an independent review of
+    0f571675 found otherwise rested on a stack slot the compiler happened
+    to keep. Structs that live in payload cells no longer charge their
+    own size to the external ledger as well, internal slots' charges
+    record their heap like the others, and nothing charges whichever
+    heap is active any more.
+  - The barrier sets the card of every cell written, young or old, so a
+    minor collection walked thousands of young cells' set cards, with
+    two divisions each, to find the few old cells among them. A page
+    that received cells since the last collection is now walked by its
+    old cells, an old page by its set cards with a reciprocal instead of
+    the divisions. Per minor collection, React 30 -> 8 us, Vue 64 -> 9,
+    Djot 80 -> 36, sustained allocation 51 -> 10.
+  - Closures die without finalizers. A heap's closure registry holds
+    each function with closures in it once; a closure keeps an
+    uncounted copy of the Rc, the same word the JIT reads, and a major
+    marking stamps the function of every closure it traces (in the
+    marker's trace only: the collector's checks trace dead closures),
+    after which the registry lets go of the functions it did not stamp.
+    A closure's rare cache is a payload cell; closure cells are carded,
+    and installing a cache sets the card.
+  - Environment binding spills live in storage blocks: no malloc and
+    free per environment with more than one binding, and no charge to
+    keep. Environment records and property layouts still finalize, to
+    release their names' counts (see below).
+  - Allocation: a small cell from its class's loaded cursor is inlined
+    into the caller, with the zeroing length a constant where the size
+    is, while no collection runs, no stress interval is set and
+    allocation does not collect; every other allocation is out of line,
+    where the 368-byte frame the whole path used to set up stays. Each
+    allocation charges its bytes at once, so the one that spends a
+    budget still makes the collection due; cells are counted as their
+    cursor is flushed. The allocation paths take the active heap from
+    the Agent tag instead of two RefCell borrows. Heap::alloc_cell had
+    been 7.8% of the sustained workload's samples.
+  - A Windows-only failure of the debug lib suite under Wine,
+    abrupt_continue_allocation_safepoints_run_after_finalizers, bisected
+    to 54eddb1d: one unnamed temporary in drive_vm's frame held an odd
+    address 0x7f bytes into the WeakRef target, computed from the
+    adjacent object, and the conservative scan kept the target (a
+    collection without the stack scan freed it). The test now checks
+    that the loop's allocation safepoints collected, which it meant to,
+    instead of the death of a particular object.
+
+Screened against part D (fat LTO, CPU 5, 5 interleaved rounds, other
+cores busy at a load of 2.5-7): wall Djot -3.0%, sustained allocation
+-8.7%, Vue +0.2%, React +1.0%; total GC pause Djot -29%, sustained -33%,
+Vue -19%, React +8% (18 minor collections instead of 5: its elements
+now fill the nursery, at about 0.22 ms each); peak RSS React -16% (17.8
+against 21.1 MB), others within 3%. GC shares Vue 3.2%, React 5.9%,
+Djot 6.3%, sustained 16.5%.
+
+Evaluated and not taken: a nursery a quarter of the heap (2-32 MiB)
+took the sustained workload's minor collections from 241 to 55 but its
+minor time only 16% and its wall 2.4%, for 20% more peak RSS (80 -> 96
+MB), since its minor collections are dominated by finalizers and card
+work, not fixed costs; the nursery stays 2 MiB and the major budget
+twice the bytes the last major collection left (Go's GOGC 100). Both
+are deterministic in bytes, which keeps collection timing reproducible
+for the code-dump comparisons. Lazy sweeping is moot now that the sweep
+reads no dead cell.
+
+f0a618ff against 0f571675, by instructions executed (user
+space, minimum of three pinned runs; the machine also ran a game and a
+C++ build, at a load of up to 25, which made wall and pause times
+meaningless): React -1.7%, Vue -2.3%, Djot -2.5%, sustained allocation
+-9.8%, a loop of bound and native calls -14.6%. Peak RSS (fresh copies
+of both binaries, seven runs) React 17.0 -> 16.8 MB, Vue 26.3 -> 26.1,
+Djot 35.9 -> 35.8; some runs of Vue and Djot, either binary, land about
+2 MB higher, where a fourth chunk advises huge pages for all four (part
+D's threshold), which environment spills in the heap's pages now reach
+a little sooner. The debug lib suite passes (2469 tests) on Crystal.
+The finalized cells per minor collection are now environments (about
+1,000 in React and Vue, 650 in Djot, 2,100 to 6,500 in the sustained
+workload, 12 ns each) and Djot's property layouts (800 to 1,000); no
+object or closure.
+
+What remains of the collector's costs and is left for the object-model
+work (P2), where the layouts change anyway: environment records and
+property layouts hold their binding and key names as counted Rc<str>,
+which their finalizers release; names interned per heap (atoms) with
+scope descriptors that environments share, as JavaScriptCore's symbol
+tables and V8's scope infos are, would let both die as bits too and
+shrink every binding by the name's 16 bytes. Elements stay 16-byte
+Properties (8-byte words halve array memory and simplify the JIT's
+element loads), the object cell stays 192 bytes, and generated code
+still calls Rust to allocate, through the cursor and byte charge that
+the inlined Rust path now uses. The barrier keeps one emitter per
+backend, which a marking barrier for incremental or concurrent marking
+would extend.
