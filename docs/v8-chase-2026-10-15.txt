@@ -9282,7 +9282,13 @@ runs a precise major collection, then a minor one, over 200 kept
 functions. Of the 2,478 tests, 1,617 ran on 05986747 before the pass
 was stopped (1,610 passed, 7 are ignored); the rest, the two failures
 and the slow tests among them, ran on 6defd5bb, and all passed. The
-debug lib suite passes on 6defd5bb (2,471 tests).
+debug lib suite passes on 6defd5bb (2,471 tests), and zombie's routine
+checks of 6defd5bb, which include 05986747, match f0a618ff's test for
+test: clippy clean on x86-64 and at the baseline's 23 diagnostics for
+Windows, x86-64 2,299 passed, Wine 2,290 passed with the three known
+snapshot codec failures (each suite has the two new tests, which pass),
+and the release fixtures (exit codes, compile and collection counts,
+masked output) and difftest (138 agree, 12 skipped) unchanged.
 
 What remains of the collector's costs and is left for the object-model
 work (P2), where the layouts change anyway: environment records and
