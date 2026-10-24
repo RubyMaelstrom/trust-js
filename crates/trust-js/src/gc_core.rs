@@ -862,11 +862,11 @@ struct PageMeta {
     /// bits; the virgin tail's payload is never read or written before it is handed out.
     /// Monotonic until this page is emptied and its storage reused with fresh metadata.
     next_unused: usize,
-    /// The allocation cursor (Go's `allocCache`): `free` holds the free cells of `allocated`'s
-    /// word `next_word - 1` not yet handed out, as set bits. Allocation takes the lowest, so it
-    /// reuses reclaimed holes in address order and reaches the virgin tail last, and it never
-    /// reads a free cell: the sweep frees by clearing bits, without writing to dead cells. Reset
-    /// by every sweep of the page.
+    /// Where the page's [`Cursor`] resumes: the next word of `allocated` to load is
+    /// `next_word`, and `free` the free cells of word `next_word - 1` while the cursor has not
+    /// taken them. Allocation takes the lowest free cell, so it reuses reclaimed holes in
+    /// address order and reaches the virgin tail last, and it never reads a free cell: the
+    /// sweep frees by clearing bits, without writing to dead cells. Reset by every sweep.
     free: u64,
     next_word: u32,
     live: usize,
@@ -958,27 +958,6 @@ impl PageMeta {
         self.next_word = 0;
     }
 
-    #[inline]
-    fn take_cell(&mut self, zero: bool) -> Option<*mut u8> {
-        if self.free == 0 {
-            self.next_free_word()?;
-        }
-        let word = self.next_word as usize - 1;
-        let index = word * 64 + self.free.trailing_zeros() as usize;
-        self.free &= self.free - 1;
-        debug_assert!(!bit(&self.allocated, index) && !bit(&self.zombies, index));
-        debug_assert!(!bit(&self.marks, index));
-        let ptr = self.cell_ptr(index) as *mut u8;
-        self.allocated[word] |= 1 << (index % 64);
-        self.live += 1;
-        self.next_unused = self.next_unused.max(index + 1);
-        if zero {
-            // SAFETY: the cell lies inside this page and is now owned by the caller.
-            unsafe { std::ptr::write_bytes(ptr, 0, self.cell_size) };
-        }
-        Some(ptr)
-    }
-
     /// Load the cursor with the next word of `allocated` that has a free cell; `None` once the
     /// page has none left.
     #[cold]
@@ -996,6 +975,46 @@ impl PageMeta {
         }
         None
     }
+}
+
+/// The allocation cursor of one (descriptor, size class): the page it hands cells out from and
+/// the free cells of that page's current bitmap word (Go's mcache with its allocCache,
+/// JavaScriptCore's local allocators). The cursors of all classes sit in one dense array, so
+/// allocation touches the cursor's line and the bitmap word, and reads the page's metadata only
+/// when the word runs out ([`Heap::refill`]). The page's `live` and `next_unused` catch up when
+/// the cursor leaves the word, as a collection starts and before a sweep ([`Heap::flush_cursors`]).
+#[derive(Clone, Copy)]
+struct Cursor {
+    /// The free cells of bitmap word `word` not yet handed out, as set bits.
+    free: u64,
+    /// The page's allocation bitmap (its `allocated` buffer, which never moves).
+    bits: *mut u64,
+    /// The page's first cell.
+    base: usize,
+    cell_size: usize,
+    word: u32,
+    /// The page's slot, or [`NO_PAGE`].
+    page: u32,
+    /// Cells handed out since the page's `live` last caught up.
+    taken: u32,
+    /// One past the highest cell index handed out, for the page's `next_unused`.
+    high: u32,
+}
+
+/// [`Cursor::page`] of a cursor with no page.
+const NO_PAGE: u32 = u32::MAX;
+
+impl Cursor {
+    const EMPTY: Cursor = Cursor {
+        free: 0,
+        bits: std::ptr::null_mut(),
+        base: 0,
+        cell_size: 0,
+        word: 0,
+        page: NO_PAGE,
+        taken: 0,
+        high: 0,
+    };
 }
 
 /// Allocation state for one (descriptor, size class).
@@ -1258,6 +1277,8 @@ pub(crate) struct Heap {
     leaf: Vec<bool>,
     /// Indexed by descriptor, then size class.
     classes: Vec<[ClassPages; SIZE_CLASSES.len()]>,
+    /// The allocation cursors, by descriptor × size classes + class ([`Cursor`]).
+    cursors: Vec<Cursor>,
     /// Slots are reused after release, so page indices stay stable.
     pages: Vec<Option<PageMeta>>,
     free_page_slots: Vec<u32>,
@@ -1363,6 +1384,7 @@ impl Heap {
             descs: Vec::new(),
             leaf: Vec::new(),
             classes: Vec::new(),
+            cursors: Vec::new(),
             pages: Vec::new(),
             free_page_slots: Vec::new(),
             spare_pages: Vec::new(),
@@ -1411,6 +1433,8 @@ impl Heap {
         self.leaf.push(false);
         self.classes
             .push(std::array::from_fn(|_| ClassPages::default()));
+        self.cursors
+            .extend(std::iter::repeat_n(Cursor::EMPTY, SIZE_CLASSES.len()));
         id
     }
 
@@ -1696,8 +1720,15 @@ impl Heap {
         let pages = self.pages.iter().flatten();
         s.pages_live = pages.clone().count();
         s.pages_spare = self.spare_pages.len();
-        s.live_cells = pages.clone().map(|p| p.live).sum::<usize>() + self.larges.len();
-        s.live_bytes = pages.map(|p| p.live * p.cell_size).sum::<usize>()
+        // From the bits, which the cursors keep exact, unlike the pages' counts.
+        let live = |p: &PageMeta| -> usize {
+            p.allocated
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum()
+        };
+        s.live_cells = pages.clone().map(live).sum::<usize>() + self.larges.len();
+        s.live_bytes = pages.map(|p| live(p) * p.cell_size).sum::<usize>()
             + self.larges.values().map(|l| l.size).sum::<usize>();
         s.trigger_bytes = self.trigger_bytes;
         s.external_bytes = self.control.external.live.get();
@@ -1827,40 +1858,130 @@ impl Heap {
         }
     }
 
+    #[inline]
     fn alloc_small(&mut self, desc: DescId, class: usize, zero: bool) -> *mut u8 {
+        let slot = desc.0 as usize * SIZE_CLASSES.len() + class;
+        if self.cursors[slot].free == 0 {
+            self.refill(slot, desc, class);
+        }
+        let cursor = &mut self.cursors[slot];
+        let bit = cursor.free.trailing_zeros();
+        cursor.free &= cursor.free - 1;
+        let index = cursor.word * 64 + bit;
+        // SAFETY: the cursor's page is live, `bits` is its allocation bitmap and `word` one of
+        // its words ([`Heap::refill`]); the cell was free.
+        unsafe {
+            let word = cursor.bits.add(cursor.word as usize);
+            debug_assert_eq!(*word & (1 << bit), 0, "a cursor's free cell is allocated");
+            *word |= 1 << bit;
+        }
+        cursor.taken += 1;
+        cursor.high = cursor.high.max(index + 1);
+        let ptr = (cursor.base + index as usize * cursor.cell_size) as *mut u8;
+        if zero {
+            // SAFETY: the cell lies inside the page and is now owned by the caller.
+            unsafe { std::ptr::write_bytes(ptr, 0, cursor.cell_size) };
+        }
+        ptr
+    }
+
+    /// Load the cursor in `slot` with free cells: the next word of its page that has some, or
+    /// the first of the next page with room, or of a new page. A page that takes cells is young
+    /// until the next sweep (the next minor collection sweeps it).
+    #[cold]
+    #[inline(never)]
+    fn refill(&mut self, slot: usize, desc: DescId, class: usize) {
+        self.flush_cursor(slot);
         loop {
-            let pages = &mut self.classes[desc.0 as usize][class];
-            if pages.current.is_none() {
-                pages.current = pages.avail.pop();
+            let page = self.cursors[slot].page;
+            if page != NO_PAGE {
+                let meta = self.pages[page as usize]
+                    .as_mut()
+                    .expect("a cursor's page is live");
+                if meta.next_free_word().is_some() {
+                    let cursor = &mut self.cursors[slot];
+                    cursor.free = std::mem::take(&mut meta.free);
+                    cursor.word = meta.next_word - 1;
+                    return;
+                }
+                // Full: on no list until a sweep frees one of its cells.
+                self.cursors[slot] = Cursor::EMPTY;
+                self.classes[desc.0 as usize][class].current = None;
             }
-            let Some(index) = pages.current else {
-                break;
-            };
-            if let Some(page) = self.pages[index as usize].as_mut() {
-                if let Some(ptr) = page.take_cell(zero) {
-                    // The page holds a young cell now: the next minor collection sweeps it.
-                    if !page.young {
-                        page.young = true;
+            let index = match self.classes[desc.0 as usize][class].avail.pop() {
+                Some(index) => {
+                    let meta = self.pages[index as usize]
+                        .as_mut()
+                        .expect("an available page is live");
+                    if !meta.young {
+                        meta.young = true;
                         self.young_pages.push(index);
                     }
-                    return ptr;
+                    meta.reset_cursor();
+                    index
                 }
-            }
-            self.classes[desc.0 as usize][class].current = None;
+                // A new page is young from the start.
+                None => self.new_page(desc, class),
+            };
+            self.classes[desc.0 as usize][class].current = Some(index);
+            let meta = self.pages[index as usize]
+                .as_mut()
+                .expect("a page just taken is live");
+            self.cursors[slot] = Cursor {
+                free: 0,
+                bits: meta.allocated.as_mut_ptr(),
+                base: meta.base,
+                cell_size: meta.cell_size,
+                word: 0,
+                page: index,
+                taken: 0,
+                high: 0,
+            };
         }
-        // A new page is young from the start (`new_page`).
-        let index = self.new_page(desc, class);
-        self.classes[desc.0 as usize][class].current = Some(index);
-        self.pages[index as usize]
-            .as_mut()
-            .and_then(|page| page.take_cell(zero))
-            .expect("fresh page has free cells")
+    }
+
+    /// Bring the cursor in `slot`'s page's `live` and `next_unused` up to date with the cells it
+    /// handed out.
+    fn flush_cursor(&mut self, slot: usize) {
+        let cursor = &mut self.cursors[slot];
+        if cursor.page != NO_PAGE && cursor.taken != 0 {
+            let meta = self.pages[cursor.page as usize]
+                .as_mut()
+                .expect("a cursor's page is live");
+            meta.live += cursor.taken as usize;
+            meta.next_unused = meta.next_unused.max(cursor.high as usize);
+            cursor.taken = 0;
+        }
+    }
+
+    /// The page in `slot`, its counts brought up to date with its cursor (tests).
+    #[cfg(test)]
+    fn page_view(&mut self, slot: usize) -> &PageMeta {
+        self.flush_cursors();
+        self.pages[slot].as_ref().expect("a live page")
+    }
+
+    /// [`Heap::flush_cursor`] every cursor: as a collection starts, and before its sweep reads
+    /// the pages' counts.
+    fn flush_cursors(&mut self) {
+        for slot in 0..self.cursors.len() {
+            self.flush_cursor(slot);
+        }
+    }
+
+    /// Forget every cursor and current page, flushed already: after a sweep, whose bits they
+    /// cached. The next allocation of each class takes a page again, from its list.
+    fn reset_cursors(&mut self) {
+        self.cursors.fill(Cursor::EMPTY);
+        for class in self.classes.iter_mut().flatten() {
+            class.current = None;
+        }
     }
 
     fn new_page(&mut self, desc: DescId, class: usize) -> u32 {
         let cell_size = SIZE_CLASSES[class];
         let base = match self.spare_pages.pop() {
-            // A spare has no remaining cell or handle. Its payload may be dirty: take_cell
+            // A spare has no remaining cell or handle. Its payload may be dirty: allocation
             // zeros each whole cell before handing it out, without touching the virgin tail.
             Some(base) => base as *mut u8,
             None => self.page_source.take(),
@@ -2483,6 +2604,7 @@ impl Heap {
         self.stats.collections += 1;
         self.stats.last_phase_nanos = [0; PHASES];
         let mut clock = self.phase_clock();
+        self.flush_cursors();
         self.begin_marking(kind, client);
         // `begin_marking` handled cells' and pages' addresses in frames below this one, which the
         // native stack scan's frames reuse: zero that region first, as the engine zeroes its own
@@ -2994,6 +3116,8 @@ impl Heap {
     /// payloads (`gc_storage`), whatever order the pages are swept in.
     fn sweep(&mut self, kind: CollectionKind) -> usize {
         let mut clock = self.phase_clock();
+        // Allocation between the phases moved the cursors on.
+        self.flush_cursors();
         let young = std::mem::take(&mut self.young_pages);
         match kind {
             CollectionKind::Minor => {
@@ -3030,6 +3154,8 @@ impl Heap {
             }
         }
         self.stats.last_pages_swept = swept_pages;
+        // The cursors cached the swept pages' bits; their pages go back to the lists below.
+        self.reset_cursors();
         // Every page is old until it receives a cell again (pages released above are gone).
         for &index in &young {
             if let Some(page) = self.pages[index as usize].as_mut() {
@@ -3370,6 +3496,7 @@ impl Heap {
         self.free_page_slots.clear();
         self.page_table.clear();
         self.young_pages.clear();
+        self.cursors.fill(Cursor::EMPTY);
         self.card_cells.clear();
         for class in self.classes.iter_mut().flatten() {
             *class = ClassPages::default();
@@ -4410,7 +4537,8 @@ mod tests {
         holes
     }
 
-    fn check_free_chains(heap: &Heap) {
+    fn check_free_chains(heap: &mut Heap) {
+        heap.flush_cursors();
         for page in heap.pages.iter().flatten() {
             checked_free_chain(page);
         }
@@ -4671,7 +4799,7 @@ mod tests {
         fx.roots[0] = tagged(anchor);
         let child = fx.heap.alloc(fx.leaf, 16) as usize;
         let slot = page_slot(&fx.heap, anchor as usize);
-        let page = fx.heap.pages[slot].as_ref().unwrap();
+        let page = fx.heap.page_view(slot);
         assert_eq!((page.next_unused, checked_free_chain(page).len()), (1, 0));
         let sentinels: Vec<(usize, [u64; 2])> = [1, 63, 64, 65, page.cells - 1]
             .into_iter()
@@ -4706,7 +4834,7 @@ mod tests {
         for kind in [CollectionKind::Major, CollectionKind::Minor] {
             assert!(fx.start_marking_kind(&no_edges, kind));
             fx.heap.finish_collection(&[virgin]);
-            let page = fx.heap.pages[slot].as_ref().unwrap();
+            let page = fx.heap.page_view(slot);
             assert_eq!((page.next_unused, page.live), (1, 1));
             assert!(checked_free_chain(page).is_empty());
             for &(ptr, expected) in &sentinels {
@@ -4727,7 +4855,7 @@ mod tests {
                 expected
             );
         }
-        check_free_chains(&fx.heap);
+        check_free_chains(&mut fx.heap);
     }
 
     #[test]
@@ -4749,7 +4877,7 @@ mod tests {
                 })
                 .collect();
             let slot = page_slot(&fx.heap, cells[0]);
-            let capacity = fx.heap.pages[slot].as_ref().unwrap().cells;
+            let capacity = fx.heap.page_view(slot).cells;
             assert_eq!(capacity, 85);
             let kept = [0, used / 2, used - 1];
             for (root, index) in kept.into_iter().enumerate() {
@@ -4758,16 +4886,13 @@ mod tests {
             fx.collect_minor();
             let first_deaths = used - kept.len();
             assert_eq!(FIN_COUNT.with(Cell::get), first_deaths);
-            let page = fx.heap.pages[slot].as_ref().unwrap();
+            let page = fx.heap.page_view(slot);
             assert_eq!((page.next_unused, page.live), (used, kept.len()));
             let holes = checked_free_chain(page);
             assert_eq!(holes.len(), first_deaths);
             fx.collect();
             fx.collect_minor();
-            assert_eq!(
-                checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
-                holes
-            );
+            assert_eq!(checked_free_chain(fx.heap.page_view(slot)), holes);
             assert_eq!(FIN_COUNT.with(Cell::get), first_deaths);
 
             let mut handed_out: std::collections::HashSet<usize> =
@@ -4784,7 +4909,7 @@ mod tests {
                     "a cell was handed out twice"
                 );
             }
-            assert_eq!(fx.heap.pages[slot].as_ref().unwrap().next_unused, used);
+            assert_eq!(fx.heap.page_view(slot).next_unused, used);
             for index in used..capacity {
                 let cell = fx.heap.alloc(fx.leaf, size);
                 assert_eq!(cell as usize, cells[0] + index * size);
@@ -4792,7 +4917,7 @@ mod tests {
                 assert!(handed_out.insert(cell as usize));
             }
             assert_eq!(handed_out.len(), capacity);
-            let page = fx.heap.pages[slot].as_ref().unwrap();
+            let page = fx.heap.page_view(slot);
             assert_eq!(page.next_unused, capacity);
             assert!(!page.has_room());
             assert!(checked_free_chain(page).is_empty());
@@ -4806,14 +4931,11 @@ mod tests {
                 FIN_COUNT.with(Cell::get),
                 first_deaths + capacity - kept.len() + 1
             );
-            let holes = checked_free_chain(fx.heap.pages[slot].as_ref().unwrap());
+            let holes = checked_free_chain(fx.heap.page_view(slot));
             assert_eq!(holes.len(), capacity - kept.len());
             fx.collect();
-            assert_eq!(
-                checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
-                holes
-            );
-            check_free_chains(&fx.heap);
+            assert_eq!(checked_free_chain(fx.heap.page_view(slot)), holes);
+            check_free_chains(&mut fx.heap);
         }
     }
 
@@ -4835,14 +4957,14 @@ mod tests {
                 fx.heap.classes[fx.node.0 as usize][class].avail,
                 [slot as u32]
             );
-            let page = fx.heap.pages[slot].as_ref().unwrap();
+            let page = fx.heap.page_view(slot);
             assert_eq!((page.next_unused, checked_free_chain(page).len()), (1, 0));
             let next = fx.heap.alloc(fx.node, 16);
             assert_eq!(next as usize, anchor as usize + 16);
             assert_zeroed_cell(next, 16);
             assert_eq!(fx.heap.stats().pages_live, 1);
             assert_eq!(fx.heap.young_page_count(), 1);
-            check_free_chains(&fx.heap);
+            check_free_chains(&mut fx.heap);
         }
     }
 
@@ -4859,10 +4981,7 @@ mod tests {
         fx.roots[0] = tagged(anchor);
         fx.collect();
         let slot = page_slot(&fx.heap, anchor as usize);
-        assert_eq!(
-            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
-            [1]
-        );
+        assert_eq!(checked_free_chain(fx.heap.page_view(slot)), [1]);
         assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (1, 1));
         assert!(fx.start_marking_kind(&no_edges, CollectionKind::Minor));
         let hole = fx.heap.alloc(fx.leaf, 16);
@@ -4882,7 +5001,7 @@ mod tests {
             (fx.live(), count.get(), FIN_COUNT.with(Cell::get)),
             (3, 3, 1)
         );
-        check_free_chains(&fx.heap);
+        check_free_chains(&mut fx.heap);
         fx.collect_minor();
         assert_eq!(count.get(), 3, "black survivors are now old");
         fx.collect();
@@ -4891,10 +5010,7 @@ mod tests {
             (1, 1, 3)
         );
         // The holes, in the address order allocation takes them.
-        assert_eq!(
-            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
-            [1, 2]
-        );
+        assert_eq!(checked_free_chain(fx.heap.page_view(slot)), [1, 2]);
     }
 
     #[test]
@@ -4927,7 +5043,7 @@ mod tests {
             assert_eq!((fx.live(), count.get()), (2, 2));
             assert_eq!(FIN_COUNT.with(Cell::get), capacity - 1);
             assert!(fx.heap.owns_cell(black as usize, fx.leaf));
-            check_free_chains(&fx.heap);
+            check_free_chains(&mut fx.heap);
             fx.collect_minor();
             assert_eq!(count.get(), 2, "the new page's survivor is now old");
             fx.collect();
@@ -4959,24 +5075,21 @@ mod tests {
         assert_zeroed_cell(first, 192);
         fx.roots[0] = tagged(first);
         let slot = page_slot(&fx.heap, base);
-        let page = fx.heap.pages[slot].as_ref().unwrap();
+        let page = fx.heap.page_view(slot);
         assert_eq!((page.next_unused, checked_free_chain(page).len()), (1, 0));
         assert!((0..page.cells).all(|index| !page.card_set(index)));
         assert_eq!(word((base + 384) as *const u8, 1), 0xa5a5_a5a5_a5a5_a5a5);
         let second = fx.heap.alloc(fx.carded, 192);
         assert_zeroed_cell(second, 192);
         fx.collect_minor();
-        assert_eq!(
-            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
-            [1]
-        );
+        assert_eq!(checked_free_chain(fx.heap.page_view(slot)), [1]);
         assert_eq!(word((base + 384) as *const u8, 1), 0xa5a5_a5a5_a5a5_a5a5);
         assert_eq!(fx.heap.alloc(fx.carded, 192), second);
         assert_zeroed_cell(second, 192);
         let third = fx.heap.alloc(fx.carded, 192);
         assert_eq!(third as usize, base + 384);
         assert_zeroed_cell(third, 192);
-        check_free_chains(&fx.heap);
+        check_free_chains(&mut fx.heap);
     }
 
     #[test]
@@ -4993,7 +5106,7 @@ mod tests {
             page.waiters.fill(u64::MAX);
             page.pins.fill(u64::MAX);
             fx.heap.finish_collection(&[anchor as usize]);
-            let page = fx.heap.pages[slot].as_ref().unwrap();
+            let page = fx.heap.page_view(slot);
             assert!(page.pins.iter().all(|&word| word == 0));
             assert!(page.waiters.iter().all(|&word| word == 0));
             assert_eq!(FIN_COUNT.with(Cell::get), 0);
@@ -5024,11 +5137,8 @@ mod tests {
         assert!(fx.start_marking(&no_edges));
         fx.heap.finish_collection(&[zombie as usize]);
         let slot = page_slot(&fx.heap, anchor as usize);
-        assert_eq!(
-            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
-            [1]
-        );
-        assert_eq!(fx.heap.pages[slot].as_ref().unwrap().live, 2);
+        assert_eq!(checked_free_chain(fx.heap.page_view(slot)), [1]);
+        assert_eq!(fx.heap.page_view(slot).live, 2);
         assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (1, 2));
         let reused = fx.heap.alloc(fx.leaf, 16);
         let virgin = fx.heap.alloc(fx.leaf, 16);
@@ -5043,18 +5153,15 @@ mod tests {
             assert!(fx.start_marking(&no_edges));
             fx.heap.finish_collection(&[zombie as usize]);
             assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (3, 2));
-            let page = fx.heap.pages[slot].as_ref().unwrap();
+            let page = fx.heap.page_view(slot);
             assert_eq!(page.live, 4);
             assert!(checked_free_chain(page).is_empty());
         }
         fx.collect();
         assert!(!fx.heap.is_allocated_word(zombie as u64));
-        assert_eq!(
-            checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
-            [2]
-        );
+        assert_eq!(checked_free_chain(fx.heap.page_view(slot)), [2]);
         assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (3, 2));
-        assert_eq!(fx.heap.pages[slot].as_ref().unwrap().live, 3);
+        assert_eq!(fx.heap.page_view(slot).live, 3);
         fx.roots.fill(0);
         fx.collect();
         assert_eq!((count.get(), FIN_COUNT.with(Cell::get)), (0, 5));
@@ -5093,11 +5200,11 @@ mod tests {
         assert!(fx.heap.stats().last_card_cells > 0);
         assert!(fx.heap.owns_cell(virgin as usize, fx.carded));
         assert!(fx.heap.owns_cell(second_leaf as usize, fx.leaf));
-        check_free_chains(&fx.heap);
+        check_free_chains(&mut fx.heap);
         fx.collect();
         assert!(!fx.heap.is_allocated_word(first_leaf as u64));
         assert!(fx.heap.owns_cell(second_leaf as usize, fx.leaf));
-        check_free_chains(&fx.heap);
+        check_free_chains(&mut fx.heap);
     }
 
     #[test]

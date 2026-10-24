@@ -339,16 +339,16 @@ mod registry {
     pub(super) fn register(entry: Entry) -> Slot {
         TABLE.with(|table| {
             let mut table = table.borrow_mut();
-            match table.free.pop() {
-                Some(index) => {
+            // The free list may name slots the table has since dropped or refilled (see
+            // `unregister`): only an empty slot below the length is reused.
+            while let Some(index) = table.free.pop() {
+                if table.entries.get(index).is_some_and(Option::is_none) {
                     table.entries[index] = Some(entry);
-                    Slot(index)
-                }
-                None => {
-                    table.entries.push(Some(entry));
-                    Slot(table.entries.len() - 1)
+                    return Slot(index);
                 }
             }
+            table.entries.push(Some(entry));
+            Slot(table.entries.len() - 1)
         })
     }
 
@@ -358,12 +358,13 @@ mod registry {
             let mut table = table.borrow_mut();
             table.entries[slot.0] = None;
             if slot.0 + 1 == table.entries.len() {
+                // The common, stack-ordered case: drop the empty tail. Free-list entries beyond
+                // it go stale and are skipped when they come up (`register`), so this stays
+                // constant-time amortized instead of filtering the list each time.
                 table.entries.pop();
                 while let Some(None) = table.entries.last() {
                     table.entries.pop();
                 }
-                let len = table.entries.len();
-                table.free.retain(|&index| index < len);
             } else {
                 table.free.push(slot.0);
             }
