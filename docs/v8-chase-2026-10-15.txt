@@ -9049,3 +9049,41 @@ Zombie: x64 2295/0/7 and Wine 2286/3/7 with exactly the three
 established snapshot failures; the new test is Linux-only and passes
 under GC stress. The fat-LTO comparison follows with part C's, once the
 machine is quiet. Artifacts are under target/s6-gc-opt-2026-10-23/part-d.
+
+
+GC optimization parts C and D: release comparisons, 2026-10-24
+
+Both comparisons use part B's protocol: fat LTO, opt 3, one codegen
+unit, panic abort, CPU 5, metrics enabled, 15 interleaved rounds of six
+workload/tier pairs over the part, its parent and matched main, 270
+validated executions each, after a quiet minute. Part C's candidate is
+7a7a96c842d024e8 from the 807-path frozen source 25090fbd4958beae;
+part D's is c357ca2df1e8168a from 9ff86b640c24c65e. Other cores were
+busy at a median of 2.07 and 1.92.
+
+Part C against part B: wall time changes Vue -0.4%, React +0.7%, Djot
++0.3%, the empty script +1.6% and sustained allocation +1.2% (JIT) and
+-1.5% (bytecode); cycles stay within 1.5% and instructions rise 0.3 to
+1.2%. Outputs are equal. Total GC pause rises 3.4% on Djot (95%
+interval +1.8..+5.2) and 3.8% on Vue (+1.0..+4.5); Vue's longest pause
+rises 6.9% (+4.4..+8.9), about 0.12 ms on its diagnostic exit
+collection. React's bytecode compilation time rises 5.7% (+2.1..+7.3).
+Peak RSS is unchanged within its intervals. Against matched main, wall
+time falls 17.4/13.1/11.1% on Vue/React/Djot and 44-49% on sustained
+allocation; React's peak RSS stays +48.0%.
+
+Part D against part C: React's peak RSS falls 3.5% (-5.7..-2.2), Vue's
+5.1% (-7.2..-3.4) and the empty script's 10.8% (-19.0..-5.1); Djot and
+sustained allocation are unchanged. Base pages cost 35-47% more minor
+faults, and wall time rises 1.2% on Vue, 2.3% on React and 1.7% on Djot
+and sustained bytecode. Instructions are unchanged. The protocol's
+smaller React gain than the no-LTO screening is real chunk memory (4.1
+to 2.7 MB, now without huge pages) inside larger run-to-run variation
+of the file-backed and huge-page-backed malloc mappings. React remains
++42.0% against main, outside its +25% bound; its remaining gap is the
+malloc heap of dead arrays' element storage, which the evaluated
+nursery charge or a smaller element representation would address.
+Both are owner decisions. The Vue longest-pause and React compilation
+costs of part C exceed the roughly 5% minor-regression allowance and
+await owner acceptance or further work. Raw results are under each
+part's measurement directory.
