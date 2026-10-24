@@ -111,7 +111,8 @@ comment/example in the same change.
   `mark` and `sweep` as the engine drives them, `engine` for what the engine does around the
   heap's phases (building the marking client, sweeping its tables and weak handles), and the
   heap's phases (`begin`: cards and marks; `roots`; `stack`; `side`: side-table edges and
-  side-slot owners; `drain`: tracing; `finalize`; `free`).
+  side-slot owners; `drain`: tracing; `finalize`; `free`), then the cells finalized, by kind
+  (`fin:<kind>=count`).
 - Collections are minor or major. A minor collection traces from the roots and from the old
   cells (cells an earlier collection kept) whose cards the write barrier set since the last
   collection, and of the engine's side tables (internal slots kept outside objects, WeakMap and
@@ -124,10 +125,10 @@ comment/example in the same change.
   replaces the 2 MiB nursery budget: a minor collection is due once N bytes of cells have
   been allocated since the last collection (0 turns minor collections off: every collection
   is then major, due once the allocated bytes pass the byte budget). Objects' property and
-  element storage are cells too. Bytes that cells own outside the heap (Map and Set tables,
-  hash indexes, binding storage, bound arguments, stack traces) count as well: a collection
-  is due once a nursery budget of them was acquired since the last one, and those still held
-  count with the cells against the byte budget.
+  element storage and environments' binding storage are cells too. Bytes that cells own
+  outside the heap (Map and Set tables, hash indexes, internal slots, bound arguments, stack
+  traces) count as well: a collection is due once a nursery budget of them was acquired since
+  the last one, and those still held count with the cells against the byte budget.
   `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget (twice
   the bytes a major collection leaves, at least the floor): a major collection is due once
   the heap holds more than the budget after a minor collection, its old cells counted whether

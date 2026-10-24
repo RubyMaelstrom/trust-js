@@ -1571,8 +1571,10 @@ impl BindingLayout {
 
 /// A binding map's ordered entries. P1 S4: the first entry lives in the environment cell, so a
 /// record with one binding (most block and many function records) allocates nothing beside it;
-/// more move the entries to one heap buffer.
-pub(crate) type BindingEntries = crate::inline_vec::InlineVec<(Rc<str>, Binding), 1>;
+/// more move the entries to one storage block (`gc_storage`), which the record reports
+/// ([`VarMap::trace_storage`]).
+pub(crate) type BindingEntries =
+    crate::inline_vec::InlineVec<(Rc<str>, Binding), 1, crate::gc_storage::GcSpill>;
 
 /// The bytes of `entries`' storage beside the environment cell.
 fn binding_entries_heap_bytes(entries: &BindingEntries) -> usize {
@@ -1651,6 +1653,18 @@ impl<'a> Iterator for VarValues<'a> {
 }
 
 impl VarMap {
+    /// Report the storage block of the ordered entries, once they have spilled into one.
+    pub(crate) fn trace_storage(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        match &self.map {
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                if let Some(block) = entries.spill_ptr() {
+                    crate::gc_storage::trace_block(block, sink);
+                }
+            }
+            VarStorage::Large(_) => {}
+        }
+    }
+
     /// Publish actual instantiated names, never assumptions about syntax. A
     /// different eval-created key set retains the dynamic map. Moving entries
     /// invalidates raw-pointer caches before any address can change.
@@ -2423,6 +2437,7 @@ impl crate::gc_trace::GcTrace for Scope {
             catch_param: _,
             lexical_names: _,
         } = self;
+        vars.trace_storage(sink);
         for binding in vars.values() {
             crate::gc_trace::GcTrace::trace_gc(binding, sink);
         }
@@ -7119,7 +7134,9 @@ impl Interp {
                 Callable::Native(f) => f(interp, this, args),
                 #[cfg(feature = "embed")]
                 Callable::ScopedNative(f) => crate::scope::invoke_native(*f, interp, this, args),
-                Callable::NativeData(data) => match &data.body {
+                // The call's own handle: the function object, and with it the payload cell that
+                // `call` names, may become unreachable while the function runs.
+                Callable::NativeData(data) => match &Rc::clone(data).body {
                     crate::value::NativeCallableBody::Opaque(f) => {
                         let f = f.clone();
                         f(interp, this, args)
@@ -12486,6 +12503,8 @@ impl Interp {
                 result
             }
             Callable::WrappedShadow(shadow) => {
+                // The call's own handle, as for native data (`dispatch_native`).
+                let shadow = Rc::clone(&shadow);
                 self.call_wrapped_shadow(&shadow.realm, *shadow.target, args)
             }
             Callable::WrappedCross(cross) => {

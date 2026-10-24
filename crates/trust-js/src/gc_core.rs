@@ -907,44 +907,70 @@ impl PageMeta {
     /// in a set card of this page, and clear the cards. A card covers `1 << CARD_SHIFT` bytes,
     /// so one card can cover the starts of several small cells; each marked one is listed. An
     /// unmarked cell is young (or free, or a zombie) and is traced, if at all, as it is reached.
+    ///
+    /// The barrier sets the card of every cell written, young or old, so a page that received
+    /// cells since the last collection has most of its cards set for young cells, which this
+    /// collection does not need: such a page is walked by its old cells, listing those whose
+    /// card is set. An old page has few set cards and only old cells: it is walked by its cards.
     fn take_card_cells(&mut self, cells: &mut Vec<TraceWork>) {
         // SAFETY: a carded page ends in its card table, the summary its last byte; the page is
         // live while its metadata is.
         if !self.carded || unsafe { ((self.base + CARD_SUMMARY) as *const u8).read() } == 0 {
             return;
         }
-        const WORDS: usize = CARD_TABLE_BYTES / 8;
-        let table = (self.base + CARD_TABLE_OFFSET) as *mut u64;
-        for word_index in 0..WORDS {
-            // SAFETY: a carded page ends in its card table, 8-aligned (the page is 64 KiB-aligned
-            // and CARD_TABLE_OFFSET a multiple of 8), which no cell overlaps; the page is live
-            // while its metadata is, and nothing else touches it during a collection.
-            let word = unsafe { table.add(word_index).read() };
-            if word == 0 {
-                continue;
-            }
-            // SAFETY: as above.
-            unsafe { table.add(word_index).write(0) };
-            for (byte, &value) in word.to_ne_bytes().iter().enumerate() {
-                if value == 0 {
-                    continue;
+        let old_word = |word: usize| self.marks[word] & !self.zombies[word];
+        let work = |index: usize| TraceWork {
+            cell: self.cell_ptr(index),
+            desc: self.desc,
+            purpose: TracePurpose::Remembered,
+        };
+        if self.young {
+            for word in 0..self.next_unused.div_ceil(64) {
+                let mut old = old_word(word);
+                while old != 0 {
+                    let index = word * 64 + old.trailing_zeros() as usize;
+                    old &= old - 1;
+                    if self.card_set(index) {
+                        cells.push(work(index));
+                    }
                 }
-                let card = word_index * 8 + byte;
-                let first = (card << CARD_SHIFT).div_ceil(self.cell_size);
-                let end = ((card + 1) << CARD_SHIFT)
-                    .div_ceil(self.cell_size)
-                    .min(self.cells);
-                for index in first..end {
-                    if bit(&self.marks, index) && !bit(&self.zombies, index) {
-                        cells.push(TraceWork {
-                            cell: self.cell_ptr(index),
-                            desc: self.desc,
-                            purpose: TracePurpose::Remembered,
-                        });
+            }
+        } else {
+            const WORDS: usize = CARD_TABLE_BYTES / 8;
+            const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+            const HIGH: u64 = 0x8080_8080_8080_8080;
+            let table = (self.base + CARD_TABLE_OFFSET) as *const u64;
+            // The first cell that starts at or after byte `offset` of the page:
+            // `ceil(offset / cell_size)`, by a multiplication. Exact: the reciprocal exceeds
+            // 2^32 / cell_size by less than one and `offset + cell_size - 1` is below 2^17, so
+            // the product exceeds the quotient by less than 2^-15, while a non-integral quotient
+            // is at least 1 / cell_size >= 2^-12 short of the next integer.
+            let size = self.cell_size as u64;
+            let reciprocal = (1u64 << 32).div_ceil(size);
+            let first_at =
+                |offset: usize| (((offset as u64 + size - 1) * reciprocal) >> 32) as usize;
+            for word in 0..WORDS {
+                // SAFETY: a carded page ends in its card table, 8-aligned (the page is 64 KiB-
+                // aligned and CARD_TABLE_OFFSET a multiple of 8), which no cell overlaps; the
+                // page is live while its metadata is, and nothing else touches it during a
+                // collection. Little-endian: bit `8 * k` begins card `8 * word + k`'s byte.
+                let bytes = u64::from_le(unsafe { table.add(word).read() });
+                // The high bit of each byte that is not zero.
+                let mut set = (((bytes & LOW7) + LOW7) | bytes) & HIGH;
+                while set != 0 {
+                    let card = word * 8 + set.trailing_zeros() as usize / 8;
+                    set &= set - 1;
+                    let first = first_at(card << CARD_SHIFT);
+                    let end = first_at((card + 1) << CARD_SHIFT).min(self.cells);
+                    for index in first..end {
+                        if old_word(index / 64) & (1 << (index % 64)) != 0 {
+                            cells.push(work(index));
+                        }
                     }
                 }
             }
         }
+        self.clear_cards();
     }
 
     fn has_room(&self) -> bool {
@@ -1005,6 +1031,30 @@ struct Cursor {
 const NO_PAGE: u32 = u32::MAX;
 
 impl Cursor {
+    /// Hand out the lowest free cell of the loaded word, which has one (`free` is not zero).
+    /// Cells leave a page's cursor in increasing order, so the last is the highest.
+    #[inline(always)]
+    fn take(&mut self) -> *mut u8 {
+        debug_assert_ne!(self.free, 0, "a cursor takes from a loaded word");
+        let bit = self.free.trailing_zeros();
+        self.free &= self.free - 1;
+        let index = self.word * 64 + bit;
+        // SAFETY: the cursor's page is live, `bits` is its allocation bitmap and `word` one of
+        // its words ([`Heap::refill`]); the cell was free.
+        unsafe {
+            let word = self.bits.add(self.word as usize);
+            debug_assert_eq!(*word & (1 << bit), 0, "a cursor's free cell is allocated");
+            *word |= 1 << bit;
+        }
+        self.taken += 1;
+        debug_assert!(
+            index >= self.high,
+            "a cursor hands out cells in increasing order"
+        );
+        self.high = index + 1;
+        (self.base + index as usize * self.cell_size) as *mut u8
+    }
+
     const EMPTY: Cursor = Cursor {
         free: 0,
         bits: std::ptr::null_mut(),
@@ -1246,7 +1296,7 @@ pub(crate) struct GcStats {
 }
 
 /// How many descriptors [`GcStats::last_finalized`] counts.
-pub(crate) const COUNTED_DESCS: usize = 16;
+pub(crate) const COUNTED_DESCS: usize = 32;
 
 /// The phases of a collection the heap times (diagnostics; [`Heap::set_phase_timing`]).
 #[derive(Clone, Copy)]
@@ -1351,6 +1401,12 @@ pub(crate) struct Heap {
     /// [`Heap::collection_due`] at its own safepoints, where it can supply
     /// roots the heap cannot see (the interpreter's state).
     collect_on_alloc: bool,
+    /// Allocation may take its fast path ([`Heap::alloc_cell`]), which charges each cell's
+    /// bytes at once but counts the cells (statistics, a stress interval's count, the page's)
+    /// only as their cursor is flushed (at a refill, and as a collection starts and as it
+    /// sweeps): not when allocation may collect, under a stress interval or during a
+    /// collection, which count each cell as it is taken ([`Heap::update_fast_alloc`]).
+    fast_alloc: bool,
     /// The embedder's copy of [`Heap::collection_due`], as a word that code polls without
     /// calling into the heap (see [`Heap::attach_due_word`]).
     due_word: Option<NonNull<Cell<u64>>>,
@@ -1419,6 +1475,7 @@ impl Heap {
             external_at_mark: 0,
             external_due_at_mark: false,
             collect_on_alloc: true,
+            fast_alloc: false,
             due_word: None,
             live_count: None,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
@@ -1520,7 +1577,10 @@ impl Heap {
     }
 
     pub(crate) fn set_stress_every(&mut self, allocs: usize) {
+        // Cells taken so far count before the interval changes.
+        self.flush_cursors();
         self.stress_every = allocs;
+        self.update_fast_alloc();
         self.refresh_due();
     }
 
@@ -1553,7 +1613,10 @@ impl Heap {
 
     /// See the `collect_on_alloc` field.
     pub(crate) fn set_collect_on_alloc(&mut self, collect: bool) {
+        // Cells taken so far count before allocation may collect on its counts.
+        self.flush_cursors();
         self.collect_on_alloc = collect;
+        self.update_fast_alloc();
     }
 
     /// Whether a collection is due: with a nursery, its budget is spent or a major collection is
@@ -1723,6 +1786,8 @@ impl Heap {
 
     pub(crate) fn stats(&self) -> GcStats {
         let mut s = self.stats;
+        // The cells the cursors have taken since they were last flushed.
+        s.allocations += self.cursors.iter().map(|c| u64::from(c.taken)).sum::<u64>();
         let pages = self.pages.iter().flatten();
         s.pages_live = pages.clone().count();
         s.pages_spare = self.spare_pages.len();
@@ -1796,6 +1861,7 @@ impl Heap {
     /// cell is allocated marked (black): marking is over, so the cell survives
     /// this sweep untraced. Code running in that window must not store a
     /// reference to an unmarked cell into a new or surviving one.
+    #[inline]
     pub(crate) fn alloc(&mut self, desc: DescId, size: usize) -> *mut u8 {
         self.alloc_cell(desc, size, true)
             .expect("GC large allocation failed")
@@ -1804,26 +1870,78 @@ impl Heap {
     /// [`Heap::alloc`] without zeroing the cell, or `None` when the memory of a large cell
     /// cannot be had: for a leaf kind ([`Heap::set_leaf`]) whose owner writes every byte it later
     /// reads, and which neither the collector nor anyone else reads before then.
+    #[inline]
     pub(crate) fn try_alloc_uninit(&mut self, desc: DescId, size: usize) -> Option<*mut u8> {
         debug_assert!(self.leaf[desc.0 as usize], "uninitialized cells are leaves");
         self.alloc_cell(desc, size, false)
     }
 
-    #[inline]
+    /// The allocation path: a small cell from its class's cursor, which holds the free cells of
+    /// one word of a page's bitmap, unless the heap counts each allocation as it happens
+    /// ([`Heap::fast_alloc`]); everything else ([`Heap::alloc_cell_slow`]) out of line. Inlined
+    /// into each caller, where the size is usually a constant, and with it the class and the
+    /// length the cell is zeroed for.
+    #[inline(always)]
     fn alloc_cell(&mut self, desc: DescId, size: usize, zero: bool) -> Option<*mut u8> {
+        if let Some(class) = size_class(size) {
+            if self.fast_alloc {
+                let slot = desc.0 as usize * SIZE_CLASSES.len() + class;
+                if let Some(cursor) = self.cursors.get_mut(slot) {
+                    if cursor.free != 0 {
+                        let ptr = cursor.take();
+                        if zero {
+                            // SAFETY: the cell lies inside its page, `SIZE_CLASSES[class]` bytes
+                            // (the cursor's cell size), and now belongs to the caller.
+                            unsafe { std::ptr::write_bytes(ptr, 0, SIZE_CLASSES[class]) };
+                        }
+                        self.count_live(desc);
+                        self.charge_bytes(SIZE_CLASSES[class]);
+                        return Some(ptr);
+                    }
+                }
+            }
+        }
+        self.alloc_cell_slow(desc, size, zero)
+    }
+
+    /// Every allocation the fast path does not take: a cursor to load, a large cell, an
+    /// allocation that may collect first, under a stress interval or during a collection. The
+    /// fast path counts its cells as their cursor is flushed; this one, when the heap counts
+    /// each allocation, flushes the cursor at once. Both charge the bytes at once.
+    #[inline(never)]
+    fn alloc_cell_slow(&mut self, desc: DescId, size: usize, zero: bool) -> Option<*mut u8> {
         debug_assert!(
             (desc.0 as usize) < self.descs.len(),
             "unregistered GC descriptor"
         );
         let class = size_class(size);
-        let cost = class.map_or(size, |class| SIZE_CLASSES[class]);
         let collecting = self.control.collecting.get();
         if !collecting {
-            self.maybe_collect_for_alloc(cost);
+            self.maybe_collect_for_alloc(class.map_or(size, |class| SIZE_CLASSES[class]));
         }
         let ptr = match class {
-            Some(class) => self.alloc_small(desc, class, zero),
-            None => self.alloc_large(desc, size, zero)?,
+            Some(class) => {
+                let slot = desc.0 as usize * SIZE_CLASSES.len() + class;
+                if self.cursors[slot].free == 0 {
+                    self.refill(slot, desc, class);
+                }
+                let ptr = self.cursors[slot].take();
+                if zero {
+                    // SAFETY: as in `alloc_cell`.
+                    unsafe { std::ptr::write_bytes(ptr, 0, SIZE_CLASSES[class]) };
+                }
+                self.charge_bytes(SIZE_CLASSES[class]);
+                if !self.fast_alloc {
+                    self.flush_cursor(slot);
+                }
+                ptr
+            }
+            None => {
+                let ptr = self.alloc_large(desc, size, zero)?;
+                self.charge_bytes(size);
+                self.count_cells(1);
+                ptr
+            }
         };
         if collecting {
             let cell = self
@@ -1831,6 +1949,13 @@ impl Heap {
                 .expect("a fresh cell resolves to itself");
             self.mark(&cell);
         }
+        self.count_live(desc);
+        Some(ptr)
+    }
+
+    /// Count a new cell of `desc` in the embedder's live count, if it keeps one for `desc`.
+    #[inline(always)]
+    fn count_live(&self, desc: DescId) {
         if let Some((counted, count)) = self.live_count {
             if desc == counted {
                 // SAFETY: `attach_live_count` keeps the count valid until this heap is dropped.
@@ -1838,15 +1963,42 @@ impl Heap {
                 count.set(count.get() + 1);
             }
         }
-        self.stats.allocations += 1;
-        self.allocated_bytes = self.allocated_bytes.saturating_add(cost);
-        self.allocs_since_gc += 1;
+    }
+
+    /// Charge a new cell's `bytes` to the budgets: exactly, so the allocation that spends a
+    /// budget is the one that makes the collection due.
+    #[inline(always)]
+    fn charge_bytes(&mut self, bytes: usize) {
+        self.allocated_bytes = self.allocated_bytes.saturating_add(bytes);
         // The due word's one compare: an allocation past the budget (any allocation under a
         // stress interval) recomputes it, out of line.
         if self.allocated_bytes > self.due_check_bytes {
+            self.refresh_due_cold();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refresh_due_cold(&mut self) {
+        self.refresh_due();
+    }
+
+    /// Count `cells` new cells in the statistics and toward a stress interval, as their cursor
+    /// is flushed (see [`Heap::fast_alloc`]).
+    fn count_cells(&mut self, cells: usize) {
+        self.stats.allocations += cells as u64;
+        self.allocs_since_gc += cells;
+        if self.stress_every > 0 {
+            // The interval counts cells, which `charge_bytes` did not see yet.
             self.refresh_due();
         }
-        Some(ptr)
+    }
+
+    /// Whether allocation may take the fast path ([`Heap::fast_alloc`]): the heap does not
+    /// collect on allocation, has no stress interval and is not collecting.
+    fn update_fast_alloc(&mut self) {
+        self.fast_alloc =
+            !self.collect_on_alloc && self.stress_every == 0 && !self.control.collecting.get();
     }
 
     fn maybe_collect_for_alloc(&mut self, upcoming: usize) {
@@ -1862,33 +2014,6 @@ impl Heap {
         if due {
             self.collect_kind(self.due_kind());
         }
-    }
-
-    #[inline]
-    fn alloc_small(&mut self, desc: DescId, class: usize, zero: bool) -> *mut u8 {
-        let slot = desc.0 as usize * SIZE_CLASSES.len() + class;
-        if self.cursors[slot].free == 0 {
-            self.refill(slot, desc, class);
-        }
-        let cursor = &mut self.cursors[slot];
-        let bit = cursor.free.trailing_zeros();
-        cursor.free &= cursor.free - 1;
-        let index = cursor.word * 64 + bit;
-        // SAFETY: the cursor's page is live, `bits` is its allocation bitmap and `word` one of
-        // its words ([`Heap::refill`]); the cell was free.
-        unsafe {
-            let word = cursor.bits.add(cursor.word as usize);
-            debug_assert_eq!(*word & (1 << bit), 0, "a cursor's free cell is allocated");
-            *word |= 1 << bit;
-        }
-        cursor.taken += 1;
-        cursor.high = cursor.high.max(index + 1);
-        let ptr = (cursor.base + index as usize * cursor.cell_size) as *mut u8;
-        if zero {
-            // SAFETY: the cell lies inside the page and is now owned by the caller.
-            unsafe { std::ptr::write_bytes(ptr, 0, cursor.cell_size) };
-        }
-        ptr
     }
 
     /// Load the cursor in `slot` with free cells: the next word of its page that has some, or
@@ -1951,12 +2076,13 @@ impl Heap {
     fn flush_cursor(&mut self, slot: usize) {
         let cursor = &mut self.cursors[slot];
         if cursor.page != NO_PAGE && cursor.taken != 0 {
+            let taken = std::mem::take(&mut cursor.taken) as usize;
             let meta = self.pages[cursor.page as usize]
                 .as_mut()
                 .expect("a cursor's page is live");
-            meta.live += cursor.taken as usize;
+            meta.live += taken;
             meta.next_unused = meta.next_unused.max(cursor.high as usize);
-            cursor.taken = 0;
+            self.count_cells(taken);
         }
     }
 
@@ -2597,6 +2723,7 @@ impl Heap {
             !self.control.collecting.replace(true),
             "re-entrant GC collection"
         );
+        self.update_fast_alloc();
         self.control.pending_collect.set(false);
         self.collecting_kind = kind;
         if kind == CollectionKind::Major {
@@ -2867,6 +2994,7 @@ impl Heap {
         self.trim_spare_pages();
         self.allocs_since_gc = 0;
         self.control.collecting.set(false);
+        self.update_fast_alloc();
         // New budgets and interval; a request deferred meanwhile keeps the word set.
         self.refresh_due();
     }

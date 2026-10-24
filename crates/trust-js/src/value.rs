@@ -2208,31 +2208,31 @@ pub enum Callable {
     None = 0,
     Native(NativeFn) = 1,
     /// A native function carrying captured state (see [`NativeClosure`]).
-    NativeData(crate::gc_storage::PayloadBox<Rc<NativeCallable>>) = 2,
+    NativeData(crate::gc_storage::SharedPayload<Rc<NativeCallable>>) = 2,
     /// An interpreted function: its AST plus the lexical environment it closed over.
     User(UserFn) = CALLABLE_USER_TAG,
     /// The result of `Function.prototype.bind`.
-    Bound(crate::gc_storage::PayloadBox<BoundCallable>) = 4,
+    Bound(crate::gc_storage::SharedPayload<BoundCallable>) = 4,
     /// A ShadowRealm wrapped function: `target` is a callable inside the realm of the ShadowRealm
     /// object `realm`, which the wrapper keeps alive. Calls marshal primitive args in and the
     /// primitive result out.
-    WrappedShadow(crate::gc_storage::PayloadBox<Rc<WrappedShadowCallable>>) = 5,
+    WrappedShadow(crate::gc_storage::SharedPayload<Rc<WrappedShadowCallable>>) = 5,
     /// The inverse: a function living *inside* a ShadowRealm whose `target` is a callable of the
     /// host realm. It runs only in its own realm's interpreter, which knows its host (see
     /// `Interp::shadow_home`).
-    WrappedCross(crate::gc_storage::PayloadBox<WrappedCrossCallable>) = 6,
+    WrappedCross(crate::gc_storage::SharedPayload<WrappedCrossCallable>) = 6,
     /// An auto-accessor's synthesized getter: reads the private backing field (brand-checked) off
     /// the receiver.
-    AccessorGet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 7,
+    AccessorGet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 7,
     /// An auto-accessor's synthesized setter: writes the private backing field (brand-checked).
-    AccessorSet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 8,
+    AccessorSet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 8,
     /// A decorator `context.access.get`: returns `args[0][name]`.
-    PropGet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 9,
+    PropGet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 9,
     /// A decorator `context.access.set`: performs `args[0][name] = args[1]`.
-    PropSet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 10,
+    PropSet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 10,
     /// A decorator's private access functions use PrivateGet/PrivateSet, not [[Get]]/[[Set]].
-    PrivatePropGet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 11,
-    PrivatePropSet(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) = 12,
+    PrivatePropGet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 11,
+    PrivatePropSet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 12,
     /// A host callback called through its actual scoped Rust signature. Its result is mapped
     /// explicitly at the public boundary, never reinterpreted as an engine-native Result.
     #[cfg(feature = "embed")]
@@ -2249,8 +2249,8 @@ pub struct BoundCallable {
     pub(crate) target: Gc,
     pub(crate) this: Value,
     pub(crate) args: Vec<Value>,
-    /// The box and its arguments, charged to the heap's external ledger ([`charge_external`])
-    /// and released when the box drops.
+    /// The arguments' buffer, charged to the heap's external ledger ([`ExternalCharge`]) and
+    /// released when the payload cell drops it (the struct itself is in the cell).
     #[allow(dead_code)]
     charge: ExternalCharge,
 }
@@ -2286,7 +2286,7 @@ pub(crate) enum NativeCallableBody {
 /// from the `UserCallable` data, which the [`UserFn`] word leads to (see `JitLayout::user_func`).
 #[repr(C)]
 pub struct UserCallable {
-    pub(crate) func: Rc<Function>,
+    pub(crate) func: ClosureFunction,
     pub(crate) env: Env,
     /// Heap identity of the Realm whose global environment created this
     /// function. Cross-Realm calls must temporarily activate that Realm so
@@ -2294,8 +2294,39 @@ pub struct UserCallable {
     pub(crate) realm: usize,
     /// A lazily allocated proof for a getter body that returns one captured binding. Kept after
     /// the JIT-visible prefix so ordinary call probes retain their established field offsets;
-    /// most functions pay only this nullable pointer and allocate no cache.
-    pub(crate) cache: Cell<Option<Box<UserCallableCache>>>,
+    /// most functions pay only this nullable pointer and allocate no cache. A payload cell the
+    /// closure reports, so the closure itself has nothing to drop; installing one in a closure
+    /// that may be old sets the closure's card (`UserCallable::put_binding_getter_cache`).
+    pub(crate) cache: Cell<Option<crate::gc_storage::PayloadBox<UserCallableCache>>>,
+}
+
+/// P1 S6: closures die without finalizers: the closure cell holds no counted reference.
+const _: () = assert!(!std::mem::needs_drop::<UserCallable>());
+
+/// A closure's function: an uncounted copy of the `Rc` that its heap's closure registry holds
+/// once for all the function's closures there (`GcState::closure_functions`), so a dead closure
+/// has nothing to release. The registry keeps the function until a major collection finds no
+/// closure of it alive in the heap (`sweep_closure_functions`). The same word as the `Rc`,
+/// which the JIT reads (`JitLayout::user_func`).
+#[repr(transparent)]
+pub(crate) struct ClosureFunction(std::mem::ManuallyDrop<Rc<Function>>);
+
+impl ClosureFunction {
+    /// A closure's copy of `func`, which the active heap's registry must hold
+    /// ([`hold_closure_function`]) for as long as the closure can be reached.
+    fn new(func: &Rc<Function>) -> Self {
+        // SAFETY: a bitwise copy of a live `Rc`, never dropped (`ManuallyDrop`) and never moved
+        // out: the registry's count stands for it.
+        Self(std::mem::ManuallyDrop::new(unsafe { std::ptr::read(func) }))
+    }
+}
+
+impl std::ops::Deref for ClosureFunction {
+    type Target = Rc<Function>;
+    #[inline]
+    fn deref(&self) -> &Rc<Function> {
+        &self.0
+    }
 }
 
 /// The existing nullable closure sidecar also pins foreign runtime entries. Primary closures
@@ -2327,12 +2358,17 @@ impl UserCallable {
         if let Some(sidecar) = &mut sidecar {
             sidecar.binding_getter = proof;
         } else if proof.is_some() {
-            sidecar = Some(Box::new(UserCallableCache {
+            let made = crate::gc_storage::PayloadBox::new(UserCallableCache {
                 runtime: None,
                 binding_getter: proof,
                 origin: None,
                 own_origin: false,
-            }));
+            });
+            // A new edge from a closure that may be old (see `UserCallable::cache`).
+            // SAFETY: closure cells are carded, and the payload is the cell's start
+            // (`gc_box::new`).
+            unsafe { crate::gc_core::card_mark((self as *const Self).cast()) };
+            sidecar = Some(made);
         }
         if sidecar.as_ref().is_some_and(|sidecar| {
             sidecar.runtime.is_none() && sidecar.binding_getter.is_none() && !sidecar.own_origin
@@ -2362,7 +2398,7 @@ impl UserCallable {
         own.unwrap_or_else(|| self.func.shared_origin().cloned())
     }
 
-    fn cloned_runtime_pin(&self) -> Option<Box<UserCallableCache>> {
+    fn cloned_runtime_pin(&self) -> Option<crate::gc_storage::PayloadBox<UserCallableCache>> {
         let sidecar = self.cache.take();
         let metadata = sidecar.as_ref().map(|sidecar| {
             (
@@ -2374,7 +2410,7 @@ impl UserCallable {
         self.cache.set(sidecar);
         metadata.and_then(|(runtime, origin, own_origin)| {
             (runtime.is_some() || own_origin).then(|| {
-                Box::new(UserCallableCache {
+                crate::gc_storage::PayloadBox::new(UserCallableCache {
                     runtime,
                     binding_getter: None,
                     origin,
@@ -2387,8 +2423,9 @@ impl UserCallable {
 
 impl Clone for UserCallable {
     fn clone(&self) -> Self {
+        hold_closure_function(&self.func);
         Self {
-            func: self.func.clone(),
+            func: ClosureFunction::new(&self.func),
             env: self.env,
             realm: self.realm,
             // A cloned callable starts without a resolution proof. Its new owner can refill a
@@ -2429,7 +2466,10 @@ impl Callable {
         origin: Option<crate::agent_control::RuntimeOrigin>,
         _owner: crate::agent_access::RealmId,
     ) -> Callable {
-        let (runtime, own_origin) = match func.runtime() {
+        let lease = func.runtime();
+        // The active heap's: `runtime` finds the entry of the active heap.
+        let heap_id = lease.heap.id;
+        let (runtime, own_origin) = match lease {
             // Most closures of one function in one heap come from the same record: they share
             // the primary entry's copy, and only a differing (or absent) record is boxed.
             crate::function_runtime::RuntimeLease::Primary(primary) => {
@@ -2441,15 +2481,18 @@ impl Callable {
             crate::function_runtime::RuntimeLease::Foreign(runtime) => (Some(runtime), true),
         };
         let metadata = (runtime.is_some() || own_origin).then(|| {
-            Box::new(UserCallableCache {
+            crate::gc_storage::PayloadBox::new(UserCallableCache {
                 runtime,
                 binding_getter: None,
                 origin: if own_origin { origin } else { None },
                 own_origin,
             })
         });
+        if func.runtime_cache().closure_heap.get() != heap_id {
+            hold_closure_function_in(&func, heap_id);
+        }
         let user = UserCallable {
-            func,
+            func: ClosureFunction::new(&func),
             env,
             realm,
             cache: Cell::new(metadata),
@@ -2458,7 +2501,7 @@ impl Callable {
     }
 
     pub(crate) fn wrapped_shadow(realm: Gc, target: Value) -> Callable {
-        Callable::WrappedShadow(crate::gc_storage::PayloadBox::new(Rc::new(
+        Callable::WrappedShadow(crate::gc_storage::SharedPayload::new(Rc::new(
             WrappedShadowCallable {
                 realm,
                 target: Box::new(target),
@@ -2468,24 +2511,22 @@ impl Callable {
 
     /// A native function with captured state, its data in a payload cell.
     pub(crate) fn native_data(data: Rc<NativeCallable>) -> Callable {
-        Callable::NativeData(crate::gc_storage::PayloadBox::new(data))
+        Callable::NativeData(crate::gc_storage::SharedPayload::new(data))
     }
 
     /// An accessor or decorator access function (`variant`) for the field `key`, its key in a
     /// payload cell.
     pub(crate) fn accessor_key(
-        variant: fn(crate::gc_storage::PayloadBox<Rc<Rc<str>>>) -> Callable,
+        variant: fn(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) -> Callable,
         key: Rc<str>,
     ) -> Callable {
-        variant(crate::gc_storage::PayloadBox::new(Rc::new(key)))
+        variant(crate::gc_storage::SharedPayload::new(Rc::new(key)))
     }
 
     pub(crate) fn bound(target: Gc, this: Value, args: Vec<Value>) -> Callable {
         let mut charge = ExternalCharge::default();
-        charge.settle(
-            std::mem::size_of::<BoundCallable>() + args.capacity() * std::mem::size_of::<Value>(),
-        );
-        Callable::Bound(crate::gc_storage::PayloadBox::new(BoundCallable {
+        charge.settle(args.capacity() * std::mem::size_of::<Value>());
+        Callable::Bound(crate::gc_storage::SharedPayload::new(BoundCallable {
             target,
             this,
             args,
@@ -2494,9 +2535,9 @@ impl Callable {
     }
 
     pub(crate) fn wrapped_cross(target: Value) -> Callable {
-        Callable::WrappedCross(crate::gc_storage::PayloadBox::new(WrappedCrossCallable {
-            target,
-        }))
+        Callable::WrappedCross(crate::gc_storage::SharedPayload::new(
+            WrappedCrossCallable { target },
+        ))
     }
 }
 
@@ -2636,7 +2677,7 @@ impl Object {
         let slots = self.take_internal_slots();
         if let Some(extras) = properties.elems.1.as_deref_mut() {
             extras.internal_slots = slots;
-        } else if slots.0.is_some() {
+        } else if slots.entries.is_some() {
             properties.elems.extras_mut().internal_slots = slots;
         }
         properties.elems.force_packed_full();
@@ -2709,28 +2750,28 @@ impl Object {
 /// keep their state without adding property keys, descriptors or shape transitions; ordinary
 /// objects allocate neither a separate map nor an extra pointer in their object body.
 ///
-/// Its storage is charged to the heap's external ledger ([`charge_external`]) as it grows, and
+/// Its storage is charged to the heap's external ledger ([`ExternalCharge`]) as it grows, and
 /// released when it drops.
 #[derive(Default)]
-pub(crate) struct InternalSlots(Option<Box<Vec<(Rc<str>, Property)>>>);
+pub(crate) struct InternalSlots {
+    entries: Option<Box<Vec<(Rc<str>, Property)>>>,
+    charge: ExternalCharge,
+}
 
 impl Clone for InternalSlots {
     fn clone(&self) -> Self {
-        let copy = Self(self.0.clone());
-        charge_external(copy.retained_storage_bytes());
+        let mut copy = Self {
+            entries: self.entries.clone(),
+            charge: ExternalCharge::new(),
+        };
+        copy.charge.settle(copy.retained_storage_bytes());
         copy
-    }
-}
-
-impl Drop for InternalSlots {
-    fn drop(&mut self) {
-        release_external(self.retained_storage_bytes());
     }
 }
 
 impl InternalSlots {
     pub(crate) fn get(&self, key: &str) -> Option<&Property> {
-        self.0
+        self.entries
             .as_ref()?
             .iter()
             .find(|(name, _)| &**name == key)
@@ -2742,7 +2783,7 @@ impl InternalSlots {
     }
 
     pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Property> {
-        self.0
+        self.entries
             .as_mut()?
             .iter_mut()
             .find(|(name, _)| &**name == key)
@@ -2750,15 +2791,18 @@ impl InternalSlots {
     }
 
     pub(crate) fn entry_at(&self, slot: usize) -> Option<&(Rc<str>, Property)> {
-        self.0.as_ref()?.get(slot)
+        self.entries.as_ref()?.get(slot)
     }
 
     pub(crate) fn entry_at_mut(&mut self, slot: usize) -> Option<&mut (Rc<str>, Property)> {
-        self.0.as_mut()?.get_mut(slot)
+        self.entries.as_mut()?.get_mut(slot)
     }
 
     pub(crate) fn slot_of(&self, key: &str) -> Option<usize> {
-        self.0.as_ref()?.iter().position(|(name, _)| &**name == key)
+        self.entries
+            .as_ref()?
+            .iter()
+            .position(|(name, _)| &**name == key)
     }
 
     pub(crate) fn property_at(&self, slot: usize) -> Option<&Property> {
@@ -2768,20 +2812,20 @@ impl InternalSlots {
     pub(crate) fn insert(&mut self, key: impl IntoPropKey, value: Property) {
         let key = key.into_prop_key();
         let before = self.retained_storage_bytes();
-        let entries = self.0.get_or_insert_with(|| Box::new(Vec::new()));
+        let entries = self.entries.get_or_insert_with(|| Box::new(Vec::new()));
         if let Some((_, previous)) = entries.iter_mut().find(|(name, _)| **name == *key) {
             *previous = value;
         } else {
             entries.push((key, value));
         }
         let after = self.retained_storage_bytes();
-        if after > before {
-            charge_external(after - before);
+        if after != before {
+            self.charge.settle(after);
         }
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &Property)> {
-        self.0
+        self.entries
             .iter()
             .flat_map(|entries| entries.iter())
             .map(|(key, value)| (key, value))
@@ -2792,7 +2836,7 @@ impl InternalSlots {
     }
 
     pub(crate) fn retained_storage_bytes(&self) -> usize {
-        self.0.as_ref().map_or(0, |entries| {
+        self.entries.as_ref().map_or(0, |entries| {
             std::mem::size_of_val(&**entries)
                 + entries.capacity() * std::mem::size_of::<(Rc<str>, Property)>()
         })
@@ -2809,6 +2853,9 @@ pub(crate) struct GcState {
     function_runtimes: RefCell<
         crate::fasthash::FastMap<u64, std::rc::Weak<crate::function_runtime::FunctionRuntime>>,
     >,
+    /// The functions of this heap's closures, each held once for all of them, by address (see
+    /// [`ClosureFunction`]).
+    closure_functions: RefCell<crate::fasthash::FastMap<usize, Rc<Function>>>,
     array_length_shape: Cell<u32>,
     array_length_layout: RefCell<Option<PropertyLayout>>,
     live: LiveCount,
@@ -2818,7 +2865,7 @@ pub(crate) struct GcState {
     pub(crate) core: RefCell<crate::gc_core::Heap>,
     /// The core's control block, through which the containers of its cells' Rust-heap payloads
     /// charge and release their bytes without borrowing the core, which a sweep's finalizers
-    /// run under (see [`charge_external`]).
+    /// run under (see [`ExternalCharge`]).
     ledger: Rc<crate::gc_core::Control>,
     pub(crate) object_desc: crate::gc_core::DescId,
     /// Storage blocks (`gc_storage`).
@@ -2959,6 +3006,7 @@ pub(crate) struct PayloadDescs {
     accessor_key: crate::gc_core::DescId,
     typed_array: crate::gc_core::DescId,
     extras: crate::gc_core::DescId,
+    closure_cache: crate::gc_core::DescId,
 }
 
 macro_rules! payload_kinds {
@@ -2987,6 +3035,7 @@ payload_kinds! {
     Rc<Rc<str>> => accessor_key,
     crate::native_typed_array::NativeTypedArray => typed_array,
     DenseExtras => extras,
+    UserCallableCache => closure_cache,
 }
 
 impl PayloadDescs {
@@ -3025,6 +3074,7 @@ impl PayloadDescs {
                 payload_layout::<crate::native_typed_array::NativeTypedArray>("typed array view"),
             ),
             extras: leaf(payload_layout::<DenseExtras>("property map extras")),
+            closure_cache: leaf(payload_layout::<UserCallableCache>("closure cache")),
         }
     }
 }
@@ -3085,10 +3135,11 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let user_fn = core.register_desc(crate::gc_core::LayoutDesc {
         name: "closure",
         trace: trace_user_fn_cell,
-        mark_trace: None,
-        finalize: Some(crate::gc_box::finalize::<UserCallable>),
-        // A closure's environment is set when the closure is made.
-        carded: false,
+        mark_trace: Some(mark_user_fn_cell),
+        // A closure owns nothing to drop (`UserCallable`).
+        finalize: None,
+        // A closure's environment is set when the closure is made; a later cache sets the card.
+        carded: true,
     });
     let lazy_proto = core.register_desc(crate::gc_core::LayoutDesc {
         name: "lazy prototype",
@@ -3135,12 +3186,32 @@ impl crate::gc_box::Payload for LazyFunctionPrototype {
     }
 }
 
+/// The marker's trace of a closure ([`LayoutDesc::mark_trace`]): its edges, and the record
+/// that the major collection marking found a closure of its function alive, for the closure
+/// registry ([`mark_closure_function`]). Every other trace (the collector's checks among them)
+/// uses [`trace_user_fn_cell`], which records nothing.
+///
+/// [`LayoutDesc::mark_trace`]: crate::gc_core::LayoutDesc::mark_trace
+fn mark_user_fn_cell(
+    cell: *const u8,
+    _purpose: crate::gc_core::TracePurpose,
+    visit: &mut dyn FnMut(*const u8),
+) {
+    // SAFETY: as in `trace_user_fn_cell`.
+    let user = unsafe { &*cell.cast::<UserCallable>() };
+    mark_closure_function(&user.func);
+    trace_user_fn_cell(cell, visit);
+}
+
 /// A closure's environment and immutable runtime source-record edges.
 fn trace_user_fn_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     // SAFETY: closure cells are initialized by `gc_box::new` before any collection.
     let user = unsafe { &*cell.cast::<UserCallable>() };
     visit(Env::as_ptr(&user.env).cast());
     let metadata = user.cache.take();
+    if let Some(metadata) = &metadata {
+        crate::gc_storage::PayloadBox::trace(metadata, &mut crate::gc_trace::VisitSink(visit));
+    }
     let origin = match metadata.as_ref().filter(|metadata| metadata.own_origin) {
         Some(metadata) => metadata.origin.as_ref(),
         None if !user.func.self_hosted => user.func.shared_origin(),
@@ -3153,8 +3224,9 @@ fn trace_user_fn_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
 }
 
 /// A fresh string cell of `size` bytes in the active Agent's heap (see `LStr`).
+#[inline]
 pub(crate) fn alloc_string_cell(size: usize) -> *mut u8 {
-    with_active_gc_heap(|heap| heap.core.borrow_mut().alloc(heap.string_desc, size))
+    with_agent_heap(|heap| heap.core.borrow_mut().alloc(heap.string_desc, size))
 }
 
 /// The active heap's interned string at `slot`, made by `make` on first use. Engine
@@ -3314,27 +3386,6 @@ pub(crate) fn check_layout_owners(
     trace_roots(&mut owners);
 }
 
-/// Charge `bytes` of Rust-heap payload to the active Agent heap's external ledger: bytes that a
-/// container belonging to one of its cells (or about to) acquired outside the heap, which only a
-/// collection of the owner frees and which therefore count toward the collection triggers (see
-/// `gc_core::ExternalBytes`). Containers keep what they charged in an [`ExternalCharge`].
-pub(crate) fn charge_external(bytes: usize) {
-    if bytes != 0 {
-        if let Some(ledger) = active_ledger() {
-            ledger.charge_external(bytes);
-        }
-    }
-}
-
-/// Release `bytes` that [`charge_external`] charged.
-pub(crate) fn release_external(bytes: usize) {
-    if bytes != 0 {
-        if let Some(ledger) = active_ledger() {
-            ledger.release_external(bytes);
-        }
-    }
-}
-
 /// The active Agent heap's external ledger, if a heap is active and this thread's storage is
 /// not being torn down: charges come from containers' finalizers too, which a heap's teardown
 /// at thread exit runs after the thread's other storage may be gone. Without one, a charge is
@@ -3349,10 +3400,13 @@ fn active_ledger() -> Option<Rc<crate::gc_core::Control>> {
         .flatten()
 }
 
-/// The bytes one Rust-heap payload container has charged to a heap's external ledger
-/// ([`charge_external`]): the active heap's when it first charged, which the record keeps, so
-/// that whatever heap is active when it changes or drops (a payload cell's finalizer runs in
-/// its heap's sweep or teardown), the bytes go back to the ledger they came from.
+/// The bytes one Rust-heap payload container has charged to a heap's external ledger: bytes
+/// that a container belonging to one of its cells (or about to) acquired outside the heap, which
+/// only a collection of the owner frees and which therefore count toward the collection
+/// triggers (see `gc_core::ExternalBytes`). The record keeps the ledger of the heap active when
+/// it first charged, so that whatever heap is active when it changes or drops (a payload cell's
+/// finalizer runs in its heap's sweep or teardown), the bytes go back to the ledger they came
+/// from.
 /// [`ExternalCharge::settle`] brings the charge to the container's current size; dropping the
 /// record releases it. A clone charges what the original holds again, for a cloned container,
 /// until that one settles its own size.
@@ -3416,7 +3470,7 @@ impl Drop for ExternalCharge {
 /// when the memory of a large one cannot be had.
 #[inline]
 pub(crate) fn alloc_storage_block(bytes: usize) -> Option<*mut u8> {
-    with_active_gc_heap(|heap| {
+    with_agent_heap(|heap| {
         heap.core
             .borrow_mut()
             .try_alloc_uninit(heap.storage_desc, bytes)
@@ -3424,11 +3478,12 @@ pub(crate) fn alloc_storage_block(bytes: usize) -> Option<*mut u8> {
 }
 
 /// A fresh payload cell of `size` bytes in the active Agent's heap (see `GcBox::new`).
+#[inline]
 pub(crate) fn alloc_payload_cell(
     desc: fn(&GcState) -> crate::gc_core::DescId,
     size: usize,
 ) -> *mut u8 {
-    with_active_gc_heap(|heap| heap.core.borrow_mut().alloc(desc(heap), size))
+    with_agent_heap(|heap| heap.core.borrow_mut().alloc(desc(heap), size))
 }
 
 /// Strong edges an object holds itself. Edges kept for it in the interpreter's owner-keyed
@@ -3482,8 +3537,9 @@ fn finalize_scope_cell(cell: *mut u8) {
 }
 
 /// A fresh cell for one environment record in the active heap (see `Env::new`).
+#[inline]
 pub(crate) fn alloc_scope_cell() -> *mut RefCell<crate::interpreter::Scope> {
-    with_active_gc_heap(|heap| {
+    with_agent_heap(|heap| {
         heap.core
             .borrow_mut()
             .alloc(
@@ -3552,8 +3608,9 @@ impl Object {
         }
         props.entries.layout.trace_gc(sink);
         props.trace_symbol_keys(sink);
-        // Each payload cell (`gc_storage::PayloadBox`), with what its value holds.
-        use crate::gc_storage::PayloadBox;
+        // Each payload cell (`gc_storage::PayloadBox`, `gc_storage::SharedPayload`), with what
+        // its value holds.
+        use crate::gc_storage::{PayloadBox, SharedPayload};
         match exotic {
             Exotic::ArrayIterator(state) => {
                 PayloadBox::trace(state, sink);
@@ -3584,7 +3641,7 @@ impl Object {
             // The closure cell, which traces its environment.
             Callable::User(user) => sink.word(crate::gc_box::GcBox::as_ptr(user) as u64),
             Callable::Bound(bound) => {
-                PayloadBox::trace(bound, sink);
+                SharedPayload::trace(bound, sink);
                 sink.object(&bound.target);
                 sink.value(&bound.this);
                 for argument in &bound.args {
@@ -3592,12 +3649,12 @@ impl Object {
                 }
             }
             Callable::WrappedShadow(shadow) => {
-                PayloadBox::trace(shadow, sink);
+                SharedPayload::trace(shadow, sink);
                 sink.object(&shadow.realm);
                 sink.value(&shadow.target);
             }
             Callable::WrappedCross(cross) => {
-                PayloadBox::trace(cross, sink);
+                SharedPayload::trace(cross, sink);
                 sink.value(&cross.target);
             }
             Callable::NativeData(native) => native.trace_gc(sink), // the cell and the captures
@@ -3606,7 +3663,7 @@ impl Object {
             | Callable::PropGet(key)
             | Callable::PropSet(key)
             | Callable::PrivatePropGet(key)
-            | Callable::PrivatePropSet(key) => PayloadBox::trace(key, sink),
+            | Callable::PrivatePropSet(key) => SharedPayload::trace(key, sink),
             Callable::None | Callable::Native(_) => {}
             #[cfg(feature = "embed")]
             Callable::ScopedNative(_) => {}
@@ -4295,6 +4352,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         weak_observers: RefCell::new(Default::default()),
         shapes: RefCell::new(ShapeTable::new()),
         function_runtimes: RefCell::default(),
+        closure_functions: RefCell::default(),
         array_length_shape: Cell::new(SHAPE_EMPTY),
         array_length_layout: RefCell::default(),
         live: LiveCount::new(0),
@@ -4380,8 +4438,9 @@ pub(crate) fn heap_id(heap: &GcHeap) -> u64 {
 }
 
 /// The active Agent heap's identity (never reused).
+#[inline]
 pub(crate) fn active_heap_id() -> u64 {
-    with_active_gc_heap(|heap| heap.heap_id)
+    with_agent_heap(|heap| heap.heap_id)
 }
 
 /// Heap identity and an inert lifetime token. Parsed code may outlive its first Engine;
@@ -4422,6 +4481,85 @@ pub(crate) fn foreign_function_runtime(cache: u64) -> Rc<crate::function_runtime
         entries.insert(cache, Rc::downgrade(&entry));
         entry
     })
+}
+
+/// Make the active heap's closure registry hold `func` for a closure being made of it (see
+/// [`ClosureFunction`]).
+pub(crate) fn hold_closure_function(func: &Rc<Function>) {
+    let heap_id = active_heap_id();
+    if func.runtime_cache().closure_heap.get() != heap_id {
+        hold_closure_function_in(func, heap_id);
+    }
+}
+
+/// [`hold_closure_function`] for the active heap, `heap_id`, which does not hold it yet as far
+/// as the function's cache knows: the registry may still hold it if another heap made a
+/// closure of the function since.
+#[cold]
+fn hold_closure_function_in(func: &Rc<Function>, heap_id: u64) {
+    with_active_gc_heap(|heap| {
+        debug_assert_eq!(heap.heap_id, heap_id);
+        heap.closure_functions
+            .borrow_mut()
+            .entry(Rc::as_ptr(func) as usize)
+            .or_insert_with(|| func.clone());
+    });
+    func.runtime_cache().closure_heap.set(heap_id);
+}
+
+thread_local! {
+    /// While a major collection marks on this thread, its stamp ([`closure_mark_stamp`]);
+    /// otherwise 0.
+    static CLOSURE_MARK_STAMP: Cell<u64> = const { Cell::new(0) };
+    static LAST_CLOSURE_MARK_STAMP: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Start a major collection's marking of closures: the marker's trace of a closure records the
+/// returned stamp in its function's cache, unique among this thread's collections (a function
+/// is used only on its thread). [`sweep_closure_functions`] ends it.
+pub(crate) fn closure_mark_stamp() -> u64 {
+    let stamp = LAST_CLOSURE_MARK_STAMP.with(|last| {
+        last.set(last.get() + 1);
+        last.get()
+    });
+    CLOSURE_MARK_STAMP.with(|current| current.set(stamp));
+    stamp
+}
+
+/// End the marking that [`closure_mark_stamp`] started. Once it has completed (`marked`), let
+/// go of each function of the registry that it found no live closure of: no closure of the
+/// function is left in the heap but dead ones, which hold nothing (see [`ClosureFunction`]).
+/// Runs as the marking ends, before any closure can be made again.
+pub(crate) fn sweep_closure_functions(heap: &GcState, stamp: u64, marked: bool) {
+    CLOSURE_MARK_STAMP.with(|current| current.set(0));
+    if !marked {
+        return;
+    }
+    let mut released = Vec::new();
+    heap.closure_functions.borrow_mut().retain(|_, func| {
+        let cache = func.runtime_cache();
+        if cache.closure_mark.get() == stamp {
+            return true;
+        }
+        if cache.closure_heap.get() == heap.heap_id {
+            cache.closure_heap.set(0);
+        }
+        released.push(func.clone());
+        false
+    });
+    // A function's drop can reach code caches; release them outside the registry's borrow.
+    drop(released);
+}
+
+/// Record, for the registry sweep, that a major collection traced a closure of `func`.
+#[inline]
+fn mark_closure_function(func: &Function) {
+    let stamp = CLOSURE_MARK_STAMP.with(Cell::get);
+    if stamp != 0 {
+        if let Some(cache) = func.runtime.get() {
+            cache.closure_mark.set(stamp);
+        }
+    }
 }
 
 /// Major-only maintenance runs after payload finalizers released closure/runtime leases.
@@ -4587,6 +4725,21 @@ pub(crate) fn active_gc_heap() -> GcHeap {
         let mut active = active.borrow_mut();
         active.get_or_insert_with(unowned_gc_heap).clone()
     })
+}
+
+/// [`with_active_gc_heap`] for the hot paths (allocation, the heap's identity): the heap the
+/// active Agent's tag names, without the active-heap cell's borrows; outside an Agent, the
+/// same as `with_active_gc_heap`. `f` must not change the active Agent.
+#[inline(always)]
+fn with_agent_heap<R>(f: impl FnOnce(&GcState) -> R) -> R {
+    let state = ACTIVE_AGENT_TAG.with(|tag| tag.get().0) as *const GcState;
+    if !state.is_null() {
+        // SAFETY: while the tag names a heap, the active-heap cell holds an `Rc` of it:
+        // `activate_agent` sets both, and the activation guard and `deactivate_agent_if` change
+        // both together; `f` changes neither.
+        return f(unsafe { &*state });
+    }
+    with_active_gc_heap(f)
 }
 
 fn with_active_gc_heap<R>(f: impl FnOnce(&GcState) -> R) -> R {
@@ -5623,7 +5776,10 @@ struct EmptyInternalSlots(InternalSlots);
 // Never mutated: writers make the map's own extras first (`DenseStorage::extras_mut`).
 unsafe impl Sync for EmptyInternalSlots {}
 
-static EMPTY_INTERNAL_SLOTS: EmptyInternalSlots = EmptyInternalSlots(InternalSlots(None));
+static EMPTY_INTERNAL_SLOTS: EmptyInternalSlots = EmptyInternalSlots(InternalSlots {
+    entries: None,
+    charge: ExternalCharge::new(),
+});
 
 /// A property map's element sidecar (its first word, the nullable pointer the JIT follows) and
 /// its Rust-heap extras.

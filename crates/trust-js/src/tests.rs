@@ -6393,8 +6393,7 @@ fn abrupt_continue_allocation_safepoints_run_after_finalizers() {
             eval_quiet(
                 &mut engine,
                 &format!(
-                    "var dead={{}};dead.self=dead;var previous=new WeakRef(dead);dead=null;\n\
-                 {declaration} allocate(){{\n\
+                    "{declaration} allocate(){{\n\
                    let survivor={{answer:42}};let index=0;let finalized=0;\n\
                    outer:while(index<2000){{\n\
                      try{{let cycle={{}};cycle.self=cycle;index++;continue outer;}}\n\
@@ -6413,12 +6412,18 @@ fn abrupt_continue_allocation_safepoints_run_after_finalizers() {
             } else {
                 "allocate()"
             };
+            // The task boundary's collection is deferred, so only the loop's allocation
+            // safepoints can collect during the call. (Whether a particular dead object goes
+            // depends on stale words in native frames, which the stack scan may take for
+            // references.)
+            let before = engine.interp.gc_heap.core.borrow().collections();
             assert!(
-                eval_true(
-                    &mut engine,
-                    &format!("{call}===2042 && previous.deref()===undefined")
-                ),
+                eval_true(&mut engine, &format!("{call}===2042")),
                 "{tier:?}, generator={generator}"
+            );
+            assert!(
+                engine.interp.gc_heap.core.borrow().collections() > before,
+                "{tier:?}, generator={generator}: no allocation safepoint collected"
             );
         }
     }

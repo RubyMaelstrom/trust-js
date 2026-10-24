@@ -88,6 +88,13 @@ pub(crate) struct FunctionRuntimeCache {
     primary: FunctionRuntime,
     // Foreign reuse is uncommon. Keep its Vec metadata out of each single-heap cache too.
     foreign: RefCell<Option<Box<ForeignRuntimes>>>,
+    /// The heap whose closure registry was last made to hold the function for its closures
+    /// (`value::hold_closure_function`): a closure made under that heap registers nothing.
+    /// Reset when that registry lets the function go.
+    pub(crate) closure_heap: Cell<u64>,
+    /// The stamp of the last major collection that traced one of the function's closures
+    /// (`value::closure_mark_stamp`), unique across this thread's heaps.
+    pub(crate) closure_mark: Cell<u64>,
 }
 
 pub(crate) enum RuntimeLease<'a> {
@@ -112,6 +119,8 @@ impl FunctionRuntimeCache {
             identity: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             primary: FunctionRuntime::new(),
             foreign: RefCell::default(),
+            closure_heap: Cell::new(0),
+            closure_mark: Cell::new(0),
         }
     }
 

@@ -1502,9 +1502,14 @@ impl Function {
     }
 
     pub(crate) fn runtime(&self) -> crate::function_runtime::RuntimeLease<'_> {
+        self.runtime_cache().current()
+    }
+
+    /// The function's heap-bound runtime caches, made on first use.
+    #[inline]
+    pub(crate) fn runtime_cache(&self) -> &crate::function_runtime::FunctionRuntimeCache {
         self.runtime
             .get_or_init(|| Box::new(crate::function_runtime::FunctionRuntimeCache::new()))
-            .current()
     }
 
     /// What this function's own activation must provide: whether the body (or a nested arrow, or a

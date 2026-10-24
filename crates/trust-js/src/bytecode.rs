@@ -7972,7 +7972,7 @@ fn plan_inlines_at(
             } else {
                 Default::default()
             };
-            let f = f.clone();
+            let f = Rc::clone(f);
             drop(b);
             ways.push(InlineWay {
                 check_this: uses_this && !f.is_strict,

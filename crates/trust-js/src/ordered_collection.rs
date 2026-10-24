@@ -107,7 +107,7 @@ pub(crate) struct OrderedCollection {
     live_len: usize,
     // Lazy: collections used only for lookup need no registry allocation.
     cursors: Option<Rc<CursorRegistry>>,
-    /// The table bytes charged to the heap's external ledger (see `value::charge_external`):
+    /// The table bytes charged to the heap's external ledger (see `value::ExternalCharge`):
     /// only the collection of the Map or Set that owns them frees them.
     charge: crate::value::ExternalCharge,
 }
@@ -135,8 +135,8 @@ impl OrderedCollection {
     /// nothing.
     #[inline]
     fn settle_charge(&mut self) {
-        let bytes = size_of::<Self>()
-            + self.entries.capacity() * size_of::<Option<(Value, Value)>>()
+        // The struct itself is in its payload cell, which the heap counts as a cell.
+        let bytes = self.entries.capacity() * size_of::<Option<(Value, Value)>>()
             + self.index.capacity() * (size_of::<(u64, Bucket)>() + 1);
         self.charge.settle(bytes);
     }

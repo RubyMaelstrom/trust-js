@@ -24,30 +24,27 @@ pub(crate) trait Spill {
     unsafe fn free(ptr: *mut u8, layout: Layout);
 }
 
-/// The Rust heap, charged to the active Agent heap's external ledger
-/// (`value::charge_external`): the spill of an engine cell's storage, which only a collection
-/// of the cell frees.
-pub(crate) struct ChargedHeap;
+/// The Rust heap, for a vector outside the Agent heap's cells. The engine's cells spill into
+/// storage blocks instead (`gc_storage::GcSpill`), which their collection frees and counts.
+pub(crate) struct RustHeap;
 
-impl Spill for ChargedHeap {
+impl Spill for RustHeap {
     fn alloc(layout: Layout) -> *mut u8 {
         // SAFETY: the caller's layout has a non-zero size.
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
             handle_alloc_error(layout);
         }
-        crate::value::charge_external(layout.size());
         ptr
     }
 
     unsafe fn free(ptr: *mut u8, layout: Layout) {
         // SAFETY: the caller's contract: `alloc(layout)` returned `ptr`.
         unsafe { dealloc(ptr, layout) };
-        crate::value::release_external(layout.size());
     }
 }
 
-pub(crate) struct InlineVec<T, const N: usize, S: Spill = ChargedHeap> {
+pub(crate) struct InlineVec<T, const N: usize, S: Spill = RustHeap> {
     len: u32,
     /// Heap capacity once spilled; 0 while the elements are in place.
     cap: u32,
@@ -116,8 +113,12 @@ impl<T, const N: usize, S: Spill> InlineVec<T, N, S> {
     /// collector frees (`gc_storage::GcSpill`), the edge the owner reports.
     #[inline]
     pub(crate) fn spill_ptr(&self) -> Option<*const u8> {
-        // SAFETY: `cap` says which field of `data` is in use.
-        (self.cap != 0).then(|| unsafe { self.data.heap } as *const u8)
+        if self.cap == 0 {
+            return None;
+        }
+        // SAFETY: `cap` says which field of `data` is in use. Read only when spilled: the
+        // inline field's bytes may be uninitialized.
+        Some(unsafe { self.data.heap } as *const u8)
     }
 
     #[inline]
@@ -386,7 +387,7 @@ impl<T, const N: usize, S: Spill> FromIterator<T> for InlineVec<T, N, S> {
 }
 
 /// The elements of an [`InlineVec`], by value.
-pub(crate) struct IntoIter<T, const N: usize, S: Spill = ChargedHeap> {
+pub(crate) struct IntoIter<T, const N: usize, S: Spill = RustHeap> {
     vec: InlineVec<T, N, S>,
     next: usize,
 }

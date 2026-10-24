@@ -250,3 +250,73 @@ impl<T: PayloadKind + std::fmt::Debug> std::fmt::Debug for PayloadBox<T> {
         (**self).fmt(f)
     }
 }
+
+/// An immutable value of type `T` in a payload cell that copies share: a function object's
+/// [[Call]] payload (a native function's data, a bound function's target and arguments...),
+/// which every call copies out of the object before it runs. A copy names the same cell, as a
+/// [`crate::value::Gc`] copy names the same object, and follows the same rule: the cell lives
+/// while a traced owner reports it ([`SharedPayload::trace`], with the value's edges) or a
+/// native frame holds a copy; one kept anywhere else across a safepoint must be traced there.
+/// The cell's finalizer drops the value, once, when the last of them lets it go. A frame that
+/// keeps a pointer into the value itself across a call (such as an `Rc` field's target) holds
+/// that value's own handle, not only the copy.
+#[repr(transparent)]
+pub(crate) struct SharedPayload<T: PayloadKind>(NonNull<T>, std::marker::PhantomData<T>);
+
+impl<T: PayloadKind> SharedPayload<T> {
+    pub(crate) fn new(value: T) -> Self {
+        const { assert!(align_of::<T>() <= BLOCK_ALIGN) };
+        let cell = crate::value::alloc_payload_cell(T::desc, size_of::<T>().max(1)).cast::<T>();
+        // SAFETY: as in `PayloadBox::new`.
+        unsafe {
+            cell.write(value);
+            Self(NonNull::new_unchecked(cell), std::marker::PhantomData)
+        }
+    }
+
+    /// Report the cell to `sink`.
+    #[inline]
+    pub(crate) fn trace(this: &Self, sink: &mut dyn GcSink) {
+        trace_block(this.0.as_ptr().cast(), sink);
+    }
+}
+
+impl<T: PayloadKind> Clone for SharedPayload<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: PayloadKind> Copy for SharedPayload<T> {}
+
+impl<T: PayloadKind> Deref for SharedPayload<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: the copy names a live payload cell (see the type's comment), whose value no
+        // one changes.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl<T: PayloadKind> AsRef<T> for SharedPayload<T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+/// The cell, and the value's own edges.
+impl<T: PayloadKind + crate::gc_trace::GcTrace> crate::gc_trace::GcTrace for SharedPayload<T> {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        Self::trace(self, sink);
+        (**self).trace_gc(sink);
+    }
+}
+
+impl<T: PayloadKind + std::fmt::Debug> std::fmt::Debug for SharedPayload<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}

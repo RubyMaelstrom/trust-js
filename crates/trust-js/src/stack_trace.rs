@@ -546,7 +546,7 @@ pub(crate) struct StackTrace {
     /// The formatted frame lines, built on first use.
     lines: Option<Rc<str>>,
     /// [`StackTrace::retained_bytes`] as charged to the heap's external ledger: only the
-    /// collection of the error that owns the trace frees it (see `value::charge_external`).
+    /// collection of the error that owns the trace frees it (see `value::ExternalCharge`).
     charge: crate::value::ExternalCharge,
 }
 
@@ -576,7 +576,8 @@ impl StackTrace {
     }
 
     fn settle_charge(&mut self) {
-        let bytes = self.retained_bytes();
+        // The struct itself is in its payload cell, which the heap counts as a cell.
+        let bytes = self.retained_bytes() - std::mem::size_of::<Self>();
         self.charge.settle(bytes);
     }
 
