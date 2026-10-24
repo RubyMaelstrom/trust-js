@@ -420,6 +420,7 @@ pub(crate) struct Visitor {
     fragment_source_only: bool,
     loop_site_tokens: HashSet<usize>,
     gc_heaps: HashSet<usize>,
+    agent_routes: HashSet<usize>,
     heap_ids: HashSet<u64>,
     lstrs: HashSet<usize>,
     rc_strs: HashSet<usize>,
@@ -684,6 +685,14 @@ impl Visitor {
                         if let Some(runtime) = &sidecar.runtime {
                             self.function_runtime(runtime, true);
                         }
+                        if let Some(origin) = &sidecar.origin {
+                            if let Some(source) = &origin.source {
+                                self.script_source(source);
+                            }
+                            if let Some(referrer) = &origin.referrer {
+                                self.rc_str(referrer);
+                            }
+                        }
                         if let Some(cache) = &sidecar.binding_getter {
                             self.callable_metadata = self.callable_metadata.saturating_add(
                                 cache
@@ -815,6 +824,14 @@ impl Visitor {
 
     pub(crate) fn regexp_backref_groups_allocation(&mut self, identity: usize) -> bool {
         self.regexp_backref_groups.insert(identity)
+    }
+
+    fn agent_route(&mut self, route: &Rc<crate::agent_control::Route>) -> usize {
+        if !self.agent_routes.insert(Rc::as_ptr(route) as usize) {
+            return 0;
+        }
+        size_of::<crate::agent_control::Route>()
+            .saturating_add(route.owners.len().saturating_mul(size_of::<Gc>()))
     }
 
     fn array_buffer(&mut self, buffer: &crate::interpreter::ArrayBufferBytes) {
@@ -1612,12 +1629,6 @@ fn scan_realm(
                     .len()
                     .saturating_mul(size_of::<(String, crate::modules::ModuleRec)>()),
             )
-            .saturating_add(
-                interp
-                    .pending_dynamic_imports
-                    .len()
-                    .saturating_mul(size_of::<(u64, crate::modules::PendingDynamicImport)>()),
-            )
             .saturating_add(interp.module_ns.len().saturating_mul(size_of::<(
                 usize,
                 crate::fasthash::FastMap<String, crate::modules::NsBinding>,
@@ -1633,11 +1644,34 @@ fn scan_realm(
                 .saturating_add(record.scan_retained_memory(visitor)),
         );
     }
-    for pending in interp.pending_dynamic_imports.values() {
+    totals.interpreter_side_tables.add(
+        interp
+            .routed_imports
+            .len()
+            .saturating_mul(size_of::<(usize, crate::agent_control::RoutedImport)>()),
+    );
+    for bridge in interp.routed_imports.values() {
+        totals.interpreter_side_tables.add(
+            match &bridge.mode {
+                crate::agent_control::ImportMode::Namespace => 0usize,
+                crate::agent_control::ImportMode::Shadow { shadow, name } => {
+                    visitor.value(&Value::Obj(*shadow));
+                    name.capacity()
+                }
+            }
+            .saturating_add(visitor.agent_route(&bridge.requester))
+            .saturating_add(visitor.agent_route(&bridge.source)),
+        );
+        visitor.value(&bridge.request);
+    }
+    if !interp.routed_imports.is_empty() {
         totals
             .interpreter_side_tables
-            .add(pending.scan_retained_memory(visitor));
+            .make_lower_bound("opaque intrinsic bridge HashMap bucket storage");
     }
+    totals
+        .interpreter_side_tables
+        .add(visitor.agent_route(&interp.realm_route()));
     for bindings in interp.module_ns.values() {
         totals.interpreter_side_tables.add(
             bindings
@@ -1651,10 +1685,7 @@ fn scan_realm(
             );
         }
     }
-    if !interp.modules.is_empty()
-        || !interp.module_recs.is_empty()
-        || !interp.pending_dynamic_imports.is_empty()
-        || !interp.module_ns.is_empty()
+    if !interp.modules.is_empty() || !interp.module_recs.is_empty() || !interp.module_ns.is_empty()
     {
         totals
             .interpreter_side_tables
@@ -1678,12 +1709,6 @@ fn scan_realm(
                     .capacity()
                     .saturating_mul(size_of::<(Value, Value)>()),
             )
-            .saturating_add(
-                interp
-                    .microtasks
-                    .capacity()
-                    .saturating_mul(size_of::<crate::interpreter::Job>()),
-            )
             .saturating_add(interp.host_settings_states.len().saturating_mul(size_of::<(
                 (usize, u64),
                 crate::interpreter::HostSettingsState,
@@ -1693,12 +1718,6 @@ fn scan_realm(
                     .retired_host_job_contexts
                     .len()
                     .saturating_mul(size_of::<u64>()),
-            )
-            .saturating_add(
-                interp
-                    .kept_alive
-                    .capacity()
-                    .saturating_mul(size_of::<Value>()),
             )
             .saturating_add(
                 interp
@@ -1743,14 +1762,6 @@ fn scan_realm(
         visitor.value(promise);
         visitor.value(reason);
     }
-    for job in &interp.microtasks {
-        visitor.value(&job.handler.callback);
-        if let Some(global) = &job.handler.script_caller {
-            visitor.value(&Value::Obj(*global));
-        }
-        visitor.value(&job.result);
-        visitor.value(&job.value);
-    }
     for state in interp.host_settings_states.values() {
         // Environments are already canonical to the collector's scope snapshot. The parallel
         // global-name set is not part of an Env and therefore needs its own identity registry.
@@ -1768,9 +1779,6 @@ fn scan_realm(
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
-    }
-    for value in &interp.kept_alive {
-        visitor.value(value);
     }
     for value in interp.promise_forward.values() {
         visitor.value(value);
@@ -1839,12 +1847,6 @@ fn scan_realm(
                     .finalization_registries
                     .len()
                     .saturating_mul(size_of::<(usize, crate::interpreter::FinalizationState)>()),
-            )
-            .saturating_add(
-                interp
-                    .pending_finalization_cleanup
-                    .capacity()
-                    .saturating_mul(size_of::<Value>()),
             ),
     );
     totals
@@ -1864,9 +1866,6 @@ fn scan_realm(
             // includes their inline Weak handles; only [[HeldValue]] is strongly retained.
             visitor.value(&cell.held_value);
         }
-    }
-    for registry in &interp.pending_finalization_cleanup {
-        visitor.value(registry);
     }
     if !interp.weak_refs.is_empty() || !interp.finalization_registries.is_empty() {
         totals
@@ -1889,10 +1888,7 @@ fn scan_realm(
                 interp
                     .job_script_contexts
                     .capacity()
-                    .saturating_mul(size_of::<(
-                        u32,
-                        std::rc::Rc<crate::stack_trace::ScriptSource>,
-                    )>()),
+                    .saturating_mul(size_of::<(u32, crate::agent_control::RuntimeOrigin)>()),
             )
             .saturating_add(interp.pending_fn_name.as_ref().map_or(0, String::capacity))
             .saturating_add(
@@ -1908,6 +1904,14 @@ fn scan_realm(
                     .saturating_mul(size_of::<Value>()),
             ),
     );
+    if let Some(source) = interp
+        .caller_origin
+        .as_ref()
+        .and_then(|caller| caller.origin.as_ref())
+        .and_then(|origin| origin.source.as_ref())
+    {
+        visitor.script_source(source);
+    }
     visitor.value(&interp.constructor_new_target());
     visitor.value(&interp.pending_new_target);
     for frame in &interp.fn_frames {
@@ -2178,31 +2182,6 @@ fn scan_realm(
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
 
-    totals.interpreter_side_tables.add(
-        interp
-            .pending_async_waits
-            .capacity()
-            .saturating_mul(size_of::<crate::interpreter::AsyncWait>())
-            .saturating_add(
-                interp
-                    .async_wait_inbox
-                    .as_ref()
-                    .map_or(0, |_| size_of::<crate::interpreter::AsyncWaitInbox>()),
-            )
-            .saturating_add(
-                interp
-                    .pending_timers
-                    .capacity()
-                    .saturating_mul(size_of::<(Value, std::time::Instant)>()),
-            ),
-    );
-    for wait in &interp.pending_async_waits {
-        visitor.value(&wait.promise);
-        visitor.shared_array_buffer(wait.block.id());
-    }
-    for (callback, _) in &interp.pending_timers {
-        visitor.value(callback);
-    }
     if let Some(agent) = &interp.agent {
         totals.interpreter_side_tables.add(
             size_of::<crate::interpreter::AgentChannels>().saturating_add(
@@ -2213,7 +2192,7 @@ fn scan_realm(
             ),
         );
     }
-    if interp.async_wait_inbox.is_some() || interp.agent.is_some() {
+    if interp.agent.is_some() {
         totals.interpreter_side_tables.make_lower_bound(
             "standard-library channel backing and queued message storage are opaque",
         );
@@ -2366,18 +2345,115 @@ fn scan_realm(
         interp
             .shadow_realms
             .len()
-            .saturating_mul(size_of::<(usize, Box<Interp>)>()),
+            .saturating_mul(size_of::<(usize, crate::agent_access::Owned<Interp>)>()),
     );
     if !interp.shadow_realms.is_empty() {
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
-    for sub in interp.shadow_realms.values() {
-        let objects = crate::value::heap_gc_snapshot(&sub.gc_heap);
-        let scopes = crate::value::gc_scope_snapshot(&sub.gc_heap);
-        scan_realm(sub, &objects, &scopes, visitor, totals);
+}
+
+/// Agent queues/kept objects are scanned once, not once per active/owned interpreter. Routes
+/// are shared immutable allocations; the topology cache is not a collector root.
+fn scan_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut DirectTotals) {
+    use crate::agent_control::{Cleanup, Routed, Timer};
+    let agent = &interp.gc_heap.agent;
+    totals.interpreter_side_tables.add(
+        size_of::<crate::agent_control::AgentControl>()
+            .saturating_add(agent.access.retained_metadata_bytes())
+            .saturating_add(visitor.agent_route(&agent.root_route)),
+    );
+    let kept = agent.kept_alive.borrow();
+    totals
+        .interpreter_side_tables
+        .add(kept.capacity().saturating_mul(size_of::<Value>()));
+    for value in kept.iter() {
+        visitor.value(value);
     }
+    drop(kept);
+    let work = agent.work.borrow();
+    totals.interpreter_side_tables.add(
+        work.promises
+            .capacity()
+            .saturating_mul(size_of::<Routed<crate::interpreter::Job>>())
+            .saturating_add(
+                work.cleanup
+                    .capacity()
+                    .saturating_mul(size_of::<Routed<Cleanup>>()),
+            )
+            .saturating_add(
+                work.waits
+                    .capacity()
+                    .saturating_mul(size_of::<Routed<crate::interpreter::AsyncWait>>()),
+            )
+            .saturating_add(
+                work.timers
+                    .capacity()
+                    .saturating_mul(size_of::<Routed<Timer>>()),
+            )
+            .saturating_add(
+                work.imports
+                    .len()
+                    .saturating_mul(
+                        size_of::<(u64, Routed<crate::modules::PendingDynamicImport>)>(),
+                    ),
+            )
+            .saturating_add(
+                work.inbox
+                    .as_ref()
+                    .map_or(0, |_| size_of::<crate::interpreter::AsyncWaitInbox>()),
+            ),
+    );
+    for job in &work.promises {
+        totals
+            .interpreter_side_tables
+            .add(visitor.agent_route(&job.route));
+        visitor.value(&job.payload.handler.callback);
+        if let Some(global) = job.payload.handler.script_caller {
+            visitor.value(&Value::Obj(global));
+        }
+        if let Some(origin) = &job.payload.handler.active_script {
+            if let Some(source) = &origin.source {
+                visitor.script_source(source);
+            }
+            if let Some(referrer) = &origin.referrer {
+                visitor.rc_str(referrer);
+            }
+        }
+        visitor.value(&job.payload.result);
+        visitor.value(&job.payload.value);
+    }
+    for cleanup in &work.cleanup {
+        totals
+            .interpreter_side_tables
+            .add(visitor.agent_route(&cleanup.route));
+        visitor.value(&cleanup.payload.registry);
+    }
+    for wait in &work.waits {
+        totals
+            .interpreter_side_tables
+            .add(visitor.agent_route(&wait.route));
+        visitor.value(&wait.payload.promise);
+        visitor.shared_array_buffer(wait.payload.block.id());
+    }
+    for timer in &work.timers {
+        totals
+            .interpreter_side_tables
+            .add(visitor.agent_route(&timer.route));
+        visitor.value(&timer.payload.callback);
+    }
+    for pending in work.imports.values() {
+        totals.interpreter_side_tables.add(
+            visitor
+                .agent_route(&pending.route)
+                .saturating_add(pending.payload.scan_retained_memory(visitor))
+                .saturating_add(visitor.agent_route(&pending.payload.authority_route)),
+        );
+    }
+    totals
+        .interpreter_side_tables
+        .make_lower_bound("opaque Agent directory/HashMap/channel backing storage");
 }
 
 fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut DirectTotals) {
@@ -2429,14 +2505,31 @@ fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut Direct
 fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     let mut visitor = Visitor::default();
     let mut totals = DirectTotals::default();
-    fn note_heaps(interp: &Interp, ids: &mut HashSet<u64>) {
-        ids.insert(crate::value::heap_id(&interp.gc_heap));
-        for child in interp.shadow_realms.values() {
-            note_heaps(child, ids);
+    let members = interp
+        .gc_heap
+        .agent
+        .access
+        .shared_snapshot(interp.realm_id, interp);
+    let mut sampled_heaps = HashSet::new();
+    for (_, pointer) in members {
+        // SAFETY: shared snapshot resolves current/suspended lineages; no GC or JS runs in
+        // this synchronous diagnostic. All references end with this measurement.
+        let member = unsafe { &*pointer };
+        let heap_id = crate::value::heap_id(&member.gc_heap);
+        visitor.heap_ids.insert(heap_id);
+        if sampled_heaps.insert(heap_id) {
+            scan_agent(member, &mut visitor, &mut totals);
+            if Rc::ptr_eq(&member.gc_heap, &interp.gc_heap) {
+                scan_realm(member, objects, scopes, &mut visitor, &mut totals);
+            } else {
+                let objects = crate::value::heap_gc_snapshot(&member.gc_heap);
+                let scopes = crate::value::gc_scope_snapshot(&member.gc_heap);
+                scan_realm(member, &objects, &scopes, &mut visitor, &mut totals);
+            }
+        } else {
+            scan_realm(member, &[], &[], &mut visitor, &mut totals);
         }
     }
-    note_heaps(interp, &mut visitor.heap_ids);
-    scan_realm(interp, objects, scopes, &mut visitor, &mut totals);
     scan_symbol_agent(interp, &mut visitor, &mut totals);
     visitor
         .shared_array_buffer_allocations
@@ -3221,43 +3314,45 @@ mod tests {
     }
 
     #[test]
-    fn agent_snapshot_aggregates_shadow_heaps_with_global_deduplication() {
+    fn agent_snapshot_counts_one_shadow_heap_and_deduplicates_backings() {
         use crate::interpreter::BufferData;
         let mut root = Interp::new();
-        let mut shadow = Interp::new_with_symbol_agent(root.symbol_agent.clone());
+        let object = Object::new(None);
+        root.global.borrow_mut().props.insert(
+            "diagnosticRealm",
+            crate::value::Property::plain(Value::Obj(object)),
+        );
+        let shadow = Interp::new_shadow(&root, &object);
+        let id = shadow.id();
+        root.shadow_realms
+            .insert(Gc::as_ptr(&object) as usize, shadow);
         let shared_buffer = Rc::new(RefCell::new(Vec::with_capacity(333)));
         root.array_buffers
             .insert(1, BufferData::Local(shared_buffer.clone()));
-        shadow
-            .array_buffers
-            .insert(2, BufferData::Local(shared_buffer));
         let shared_data_block = crate::interpreter::alloc_shared_mem(337).unwrap();
         let shared_id = shared_data_block.id();
         root.array_buffers
             .insert(3, BufferData::Shared(shared_data_block.clone()));
-        shadow
-            .array_buffers
-            .insert(4, BufferData::Shared(shared_data_block));
-
-        let root_objects = crate::value::heap_gc_snapshot(&root.gc_heap);
-        let root_scopes = crate::value::gc_scope_snapshot(&root.gc_heap);
-        let shadow_objects = crate::value::heap_gc_snapshot(&shadow.gc_heap);
-        let shadow_scopes = crate::value::gc_scope_snapshot(&shadow.gc_heap);
-        let root_only = measure(&root, &root_objects, &root_scopes);
-        let shadow_only = measure(&shadow, &shadow_objects, &shadow_scopes);
-        let expected_objects = root_objects.len().saturating_add(shadow_objects.len());
-        let expected_scopes = root_scopes.len().saturating_add(shadow_scopes.len());
-
-        root.shadow_realms.insert(7, Box::new(shadow));
-        let aggregate = measure(&root, &root_objects, &root_scopes);
-
+        let heap = root.gc_heap.clone();
+        root.with_route(id, |shadow| {
+            assert!(Rc::ptr_eq(&heap, &shadow.gc_heap));
+            shadow
+                .array_buffers
+                .insert(2, BufferData::Local(shared_buffer));
+            shadow
+                .array_buffers
+                .insert(4, BufferData::Shared(shared_data_block));
+        });
+        let objects = crate::value::heap_gc_snapshot(&root.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&root.gc_heap);
+        let aggregate = measure(&root, &objects, &scopes);
         assert_eq!(
             aggregate.object_bodies.bytes,
-            expected_objects.saturating_mul(size_of::<RefCell<Object>>())
+            objects.len().saturating_mul(size_of::<RefCell<Object>>())
         );
         assert_eq!(
             aggregate.scope_bodies.bytes,
-            expected_scopes.saturating_mul(size_of::<RefCell<Scope>>())
+            scopes.len().saturating_mul(size_of::<RefCell<Scope>>())
         );
         assert_eq!(aggregate.array_buffer_backing.bytes, 333);
         assert_eq!(aggregate.shared_array_buffer_backing.allocations.len(), 1);
@@ -3271,14 +3366,6 @@ mod tests {
             "\"allocation_id\":\"shared-data-block:{shared_id}\""
         )));
         assert!(json.contains("\"externally_shared\":true"));
-        assert!(
-            aggregate.strings_symbols_bigints.bytes
-                < root_only
-                    .strings_symbols_bigints
-                    .bytes
-                    .saturating_add(shadow_only.strings_symbols_bigints.bytes),
-            "Agent-shared symbol/string payload must be credited once"
-        );
         assert!(aggregate.interpreter_side_tables.bytes >= 2 * size_of::<Interp>());
     }
 
@@ -3493,7 +3580,7 @@ mod tests {
         let pending_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let pending = measure(&engine.interp, &pending_objects, &pending_scopes);
         assert_eq!(engine.interp.promises.len(), 2);
-        assert_eq!(engine.interp.microtasks.len(), 0);
+        assert_eq!(engine.interp.gc_heap.agent.work.borrow().promises.len(), 0);
         assert!(engine
             .interp
             .promises
@@ -3507,7 +3594,7 @@ mod tests {
         let queued_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let queued_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let queued = measure(&engine.interp, &queued_objects, &queued_scopes);
-        assert_eq!(engine.interp.microtasks.len(), 1);
+        assert_eq!(engine.interp.gc_heap.agent.work.borrow().promises.len(), 1);
         assert!(queued.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
         assert!(queued.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
     }
@@ -3647,10 +3734,7 @@ mod tests {
             Ok(registry) => registry,
             Err(_) => panic!("registry global is readable"),
         };
-        engine
-            .interp
-            .pending_finalization_cleanup
-            .push_back(registry);
+        engine.interp.enqueue_test_cleanup(registry);
 
         let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
@@ -3847,11 +3931,17 @@ mod tests {
         let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let before = measure(&engine.interp, &before_objects, &before_scopes);
 
-        engine.interp.pending_async_waits.reserve(3);
         engine
             .interp
-            .pending_async_waits
-            .push(crate::interpreter::AsyncWait {
+            .gc_heap
+            .agent
+            .work
+            .borrow_mut()
+            .waits
+            .reserve(3);
+        engine
+            .interp
+            .enqueue_async_wait(crate::interpreter::AsyncWait {
                 promise: Value::lstr("wait promise payload"),
                 token: 0,
                 id: 0,
@@ -3859,12 +3949,19 @@ mod tests {
                 index: 0,
                 deadline: None,
             });
-        engine.interp.async_wait_inbox = Some(Default::default());
-        engine.interp.pending_timers.reserve(4);
-        engine.interp.pending_timers.push((
+        let _inbox = engine.interp.agent_async_inbox();
+        engine
+            .interp
+            .gc_heap
+            .agent
+            .work
+            .borrow_mut()
+            .timers
+            .reserve(4);
+        engine.interp.enqueue_agent_timer(
             Value::lstr("timer callback payload"),
             std::time::Instant::now(),
-        ));
+        );
 
         let (broadcast_tx, broadcast_rx) = std::sync::mpsc::channel();
         let (report_tx, report_rx) = std::sync::mpsc::channel();

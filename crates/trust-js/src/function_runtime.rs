@@ -17,6 +17,11 @@ pub(crate) struct FunctionRuntime {
     pub(crate) code: OnceCell<Option<Rc<Chunk>>>,
     pub(crate) code2: OnceCell<Option<Rc<Chunk>>>,
     pub(crate) fn_maps: OnceCell<Rc<FunctionMaps>>,
+    /// The runtime ScriptOrModule this heap's first closure of the function had. Closures with
+    /// the same record share it instead of each boxing a copy (`UserCallableCache::own_origin`).
+    /// Those closures trace it; it is compared by identity with a live active record before a
+    /// new closure shares it, so its GC edges are never followed after its sharers die.
+    pub(crate) origin: OnceCell<crate::agent_control::RuntimeOrigin>,
 }
 
 impl FunctionRuntime {
@@ -27,6 +32,7 @@ impl FunctionRuntime {
             code: OnceCell::new(),
             code2: OnceCell::new(),
             fn_maps: OnceCell::new(),
+            origin: OnceCell::new(),
         }
     }
 
@@ -129,6 +135,11 @@ impl FunctionRuntimeCache {
         let entry = crate::value::foreign_function_runtime(self.identity);
         foreign.push(entry.clone());
         RuntimeLease::Foreign(entry)
+    }
+
+    /// The record shared by closures created under the primary entry (see `FunctionRuntime`).
+    pub(crate) fn primary_origin(&self) -> Option<&crate::agent_control::RuntimeOrigin> {
+        self.primary.origin.get()
     }
 
     /// Only Rust metadata is safe to inspect on a dead entry. The caller chooses which live

@@ -26,7 +26,7 @@ fn old_with_record_keeps_its_sole_young_object_through_the_packed_word() {
     use crate::gc_core::{CellAge, CollectionKind};
     let mut engine = crate::Engine::new();
     engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
-    engine.interp.gc_task_deferred = true;
+    engine.interp.gc_heap.agent.task_deferred.set(true);
     let scope = crate::rooting::Rooted::new(crate::interpreter::new_scope(None));
     engine
         .interp
@@ -76,7 +76,7 @@ fn suspended_this_word_is_the_sole_receiver_root_across_yield_await_and_completi
             // This fixture proves an actual young receiver survives its first precise minor.
             // Automatic stress/task polls must not promote it before that controlled collection.
             engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
-            engine.interp.gc_task_deferred = true;
+            engine.interp.gc_heap.agent.task_deferred.set(true);
             evaluate(
                 &mut engine,
                 if asynchronous {

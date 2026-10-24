@@ -288,7 +288,7 @@ fn native_creation_records_an_old_receivers_only_edge_to_a_young_layout() {
     // This fixture controls promotion explicitly; automatic polls must not age the layout
     // while the directory still holds it, including in an external GC_STRESS=1 run.
     engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
-    engine.interp.gc_task_deferred = true;
+    engine.interp.gc_heap.agent.task_deferred.set(true);
     let eval = |engine: &mut Engine, source: &str| {
         assert!(matches!(
             engine.eval(source, false).unwrap(),

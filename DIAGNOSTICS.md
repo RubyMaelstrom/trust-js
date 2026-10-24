@@ -185,3 +185,35 @@ selected workloads. Octane scores are higher-is-better; ARES-6 reports a geomean
 milliseconds, lower-is-better. A selected ARES-6 run is a partial result, not the
 official full-suite score. Missing completion markers or failed workloads invalidate
 a run.
+
+
+### Optional Miri checks for root and interpreter access storage
+
+The standalone harnesses import the actual engine modules without building the engine.
+They are optional diagnostics and are not workspace build dependencies. The recorded
+probe toolchain is `nightly-2026-10-23` (`rustc 1.101.0-nightly`, commit `7189d39d9`,
+Miri `0.1.0`, LLVM `23.1.4`). Install that nightly's `miri` and `rust-src` components
+separately if using these commands; normal builds do not require them.
+
+```sh
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/agent-access-miri/Cargo.toml
+MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-tree-borrows" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/agent-access-miri/Cargo.toml
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/rooting-miri/Cargo.toml
+MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-tree-borrows" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/rooting-miri/Cargo.toml
+```
+
+The access harness exercises current-borrow publication, nested/reentrant access,
+root movement, marking/sweep phase separation, quarantine and unwind. The rooting
+harness uses inert Value/trace interfaces around the directly imported module;
+it exercises raw ownership, registration, short mutation loans, argument/iterator
+reentry, reallocation, transfer, registry-slot reuse and teardown. Passing these
+checks covers those module call shapes, not the JIT, native stack scanner or the
+whole JavaScript engine.
+
+This explicit negative control must run one selected test and fail with Miri's
+undefined-behavior diagnostic under either model; a compile failure or zero selected
+tests is not a successful negative control:
+
+```sh
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/agent-access-miri/Cargo.toml --features stale-suspension --lib tests::stale_suspension_is_a_miri_negative_control -- --exact
+```

@@ -63,7 +63,7 @@ fn scoped_text_borrows_survive_copied_frontier_append_growth_and_gc() {
         assert!(!copied.append_in_place(&suffix));
         copied.append_or_replace(&LStr::from(suffix.as_str()));
         assert_ne!(copied.as_str().as_ptr(), original_address);
-        *current = Internal::Str(copied);
+        current.replace(Internal::Str(copied));
         expected.push_str(&suffix);
         cx.collect_garbage_for_host();
         assert_eq!(borrowed, prefix);

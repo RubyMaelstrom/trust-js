@@ -103,9 +103,11 @@ fn shared_buffer_wait_owns_bytes_until_resolution_or_agent_teardown() {
             &mut engine,
             "Atomics.waitAsync(new Int32Array(new SharedArrayBuffer(4)), 0, 0);",
         );
-        let wait = &engine.interp.pending_async_waits[0];
-        let id = wait.id;
-        let weak = Arc::downgrade(&wait.block);
+        let (id, weak) = {
+            let work = engine.interp.gc_heap.agent.work.borrow();
+            let wait = &work.waits[0].payload;
+            (wait.id, Arc::downgrade(&wait.block))
+        };
         engine.interp.gc_collect();
         assert!(engine.interp.array_buffers.is_empty());
         assert!(

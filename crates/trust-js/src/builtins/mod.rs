@@ -4524,43 +4524,53 @@ fn install_object(it: &mut Interp) {
 
     it.def_method(&ctor, "hasOwn", 2, nf_object_has_own);
     it.def_method(&ctor, "groupBy", 2, |i, _this, args| {
-        let mut groups =
-            crate::rooting::Rooted::new(Vec::<(crate::value::PropertyKey, Vec<Value>)>::new());
+        let groups = crate::rooting::Rooted::new(RefCell::new(Vec::<(
+            crate::value::PropertyKey,
+            Vec<Value>,
+        )>::new()));
         let mut group_index: crate::fasthash::FastMap<String, usize> = Default::default();
         // Coercion can run author code before the key/element join a group. Once transferred,
         // the groups trace the converted PropertyKey itself, including a newly created Symbol.
-        let mut pending = crate::rooting::Rooted::new((Value::Undefined, Value::Undefined));
+        let pending =
+            crate::rooting::Rooted::new(std::cell::Cell::new((Value::Undefined, Value::Undefined)));
         group_by(
             i,
             &arg(args, 0),
             &arg(args, 1),
             "Object.groupBy",
             |i, key_v, el| {
-                *pending = (key_v, el);
+                pending.set((key_v, el));
                 let key = ab(i.to_property_key(&key_v))?;
                 if let Some(&offset) = group_index.get(key.as_str()) {
-                    groups[offset].1.push(el);
+                    groups.borrow_mut()[offset].1.push(el);
                 } else {
-                    group_index.insert(key.as_str().to_owned(), groups.len());
+                    group_index.insert(key.as_str().to_owned(), groups.borrow().len());
                     // Keep the PropertyKey owner, including a Symbol identity, until the result
                     // object's property storage takes ownership. Callback/coercion may collect.
-                    groups.push((key, vec![el]));
+                    groups.borrow_mut().push((key, vec![el]));
                 }
-                *pending = (Value::Undefined, Value::Undefined);
+                pending.set((Value::Undefined, Value::Undefined));
                 Ok(())
             },
         )?;
         drop(group_index);
         let result = i.new_object();
         result.borrow_mut().proto = None; // groupBy returns a null-prototype object
-        for (k, v) in groups.iter_mut() {
-            // make_array and direct property publication cannot run author code. Transfer
-            // each element buffer atomically, keeping its Symbol key rooted until insertion.
-            let arr = i.make_array(std::mem::take(v));
+        let count = groups.borrow().len();
+        for index in 0..count {
+            let (key, values) = {
+                let mut entries = groups.borrow_mut();
+                (
+                    entries[index].0.clone(),
+                    std::mem::take(&mut entries[index].1),
+                )
+            };
+            // Construction/publication are callback-free; the key remains precisely rooted.
+            let arr = i.make_array(values);
             result
                 .borrow_mut()
                 .props
-                .insert(k.as_str(), Property::plain(arr));
+                .insert(key.as_str(), Property::plain(arr));
         }
         Ok(Value::Obj(result))
     });
@@ -7480,7 +7490,11 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
     Ok(removed)
 }
 
-fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Value> {
+fn merge_sort(
+    i: &mut Interp,
+    items: &mut crate::rooting::RootedVec,
+    cmp: &Value,
+) -> Result<(), Value> {
     let n = items.len();
     if n <= 1 {
         return Ok(());
@@ -7547,8 +7561,10 @@ fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Va
         }
         width = width.saturating_mul(2);
     }
-    for (slot, value) in items.iter_mut().zip(source) {
-        *slot = value;
+    // Original roots remained unchanged during every comparator call. Commit is pure and
+    // uses short payload updates; scratch-space remains the same two O(n) working buffers.
+    for (index, value) in source.into_iter().enumerate() {
+        items.set(index, value);
     }
     Ok(())
 }
@@ -7573,7 +7589,10 @@ fn default_sort_keys(i: &mut Interp, items: &[Value]) -> Result<Option<Vec<Optio
     Ok(Some(keys))
 }
 
-fn merge_sort_with_keys(items: &mut [Value], keys: Vec<Option<LStr>>) -> Result<(), Value> {
+fn merge_sort_with_keys(
+    items: &mut crate::rooting::RootedVec,
+    keys: Vec<Option<LStr>>,
+) -> Result<(), Value> {
     let n = items.len();
     debug_assert_eq!(n, keys.len());
     let mut source: Vec<(Value, Option<LStr>)> = items.iter().cloned().zip(keys).collect();
@@ -7619,8 +7638,8 @@ fn merge_sort_with_keys(items: &mut [Value], keys: Vec<Option<LStr>>) -> Result<
         }
         width = width.saturating_mul(2);
     }
-    for (slot, (value, _)) in items.iter_mut().zip(source) {
-        *slot = value;
+    for (index, (value, _)) in source.into_iter().enumerate() {
+        items.set(index, value);
     }
     Ok(())
 }
@@ -9357,14 +9376,13 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     // Open the inputs in order, GetIteratorFlattenable each as it is read. The lists are
     // rooted across the author code each step runs (I1).
     // Rooted: a Symbol key's cell, like the iterators, outlives author code.
-    let mut keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
-        crate::rooting::Rooted::new(Vec::new());
+    let keys = crate::rooting::Rooted::new(RefCell::new(Vec::<crate::value::PropertyKey>::new()));
     let mut iters = crate::rooting::RootedVec::new();
     let mut nexts = crate::rooting::RootedVec::new();
     let open_one = |i: &mut Interp,
                     v: &Value,
-                    iters: &mut Vec<Value>,
-                    nexts: &mut Vec<Value>|
+                    iters: &mut crate::rooting::RootedVec,
+                    nexts: &mut crate::rooting::RootedVec|
      -> Result<(), Value> {
         let iter = get_iterator_flattenable(i, v, false)?;
         let next = ab(i.get_member_key(&iter, "next"))?;
@@ -9443,7 +9461,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
                 close_setup(i, &iters, None);
                 return Err(e);
             }
-            keys.push(k);
+            keys.borrow_mut().push(k);
         }
     } else {
         // zip: step the iterable-of-iterables, opening each input as it is produced. An error
@@ -9473,9 +9491,9 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     let mut padding = crate::rooting::RootedVec::from_vec(vec![Value::Undefined; n_iters]);
     if mode == "longest" && !matches!((padding_value).view(), ValueView::Undefined) {
         if keyed {
-            for (j, k) in keys.iter().enumerate() {
+            for (j, k) in keys.borrow().iter().enumerate() {
                 match ab(i.get_member_key(&padding_value, k)) {
-                    Ok(v) => padding[j] = v,
+                    Ok(v) => padding.set(j, v),
                     Err(e) => {
                         close_setup(i, &iters, None);
                         return Err(e);
@@ -9491,12 +9509,12 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
                 }
             };
             let mut using = true;
-            for slot in padding.iter_mut().take(n_iters) {
+            for index in 0..n_iters {
                 if !using {
                     break;
                 }
                 match step_iter_with(i, &pit, &pnext) {
-                    Ok(Some(v)) => *slot = v,
+                    Ok(Some(v)) => padding.set(index, v),
                     Ok(None) => using = false,
                     Err(e) => {
                         close_setup(i, &iters, None);
@@ -9532,7 +9550,13 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     set_internal_slot(&obj, "#\u{0}zip_pad", i.make_array(padding.into_vec()));
     set_internal_slot(&obj, "#\u{0}zip_finished", Value::Bool(false));
     if keyed {
-        let karr = i.make_array(keys.iter().cloned().map(|key| key.into_value()).collect());
+        let karr = i.make_array(
+            keys.borrow()
+                .iter()
+                .cloned()
+                .map(|key| key.into_value())
+                .collect(),
+        );
         set_internal_slot(&obj, "#\u{0}zip_keys", karr);
     }
     i.def_method(&obj, "next", 0, zip_next);
@@ -9691,13 +9715,13 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
         let closed = ab(i.get_member_key(&state, &j.to_string()))?;
         if i.to_boolean(&closed) {
             // An exhausted input in `longest` mode contributes its padding value.
-            values[j] = ab(i.get_member_key(&pad, &j.to_string()))?;
+            values.set(j, ab(i.get_member_key(&pad, &j.to_string()))?);
             continue;
         }
         let it = ab(i.get_member_key(&iters, &j.to_string()))?;
         let nx = ab(i.get_member_key(&nexts, &j.to_string()))?;
         match step_iter_with(i, &it, &nx) {
-            Ok(Some(v)) => values[j] = v,
+            Ok(Some(v)) => values.set(j, v),
             Ok(None) => {
                 mark(i, &state, j)?;
                 match mode.as_str() {
@@ -9754,7 +9778,7 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                     }
                     _ => {
                         // longest: exhausted inputs are padded; finish when all are done.
-                        values[j] = ab(i.get_member_key(&pad, &j.to_string()))?;
+                        values.set(j, ab(i.get_member_key(&pad, &j.to_string()))?);
                         let mut any_open = false;
                         for k in 0..n {
                             let c = ab(i.get_member_key(&state, &k.to_string()))?;
@@ -11694,17 +11718,18 @@ fn install_string(it: &mut Interp) {
         // to the old stepwise path; otherwise each intermediate byte length is just the sum and
         // all pieces can be copied once into one LStr allocation.
         // Rooted: ToString of a later argument may run user code.
-        let mut parts = crate::rooting::Rooted::new(Vec::with_capacity(args.len() + 1));
-        parts.push(s);
-        let mut total = parts[0].len();
+        let parts = crate::rooting::Rooted::new(RefCell::new(Vec::with_capacity(args.len() + 1)));
+        parts.borrow_mut().push(s);
+        let mut total = parts.borrow()[0].len();
         for (index, argument) in args.iter().enumerate() {
             let next = ab(i.to_string(argument))?;
             if parts
+                .borrow()
                 .last()
                 .is_some_and(|previous| crate::jstr::needs_join_fixup(previous, &next))
             {
-                let mut out = parts[0].to_string();
-                for part in parts.iter().skip(1) {
+                let mut out = parts.borrow()[0].to_string();
+                for part in parts.borrow().iter().skip(1) {
                     out.push_str(part);
                 }
                 out = crate::jstr::concat(&out, &next);
@@ -11723,12 +11748,13 @@ fn install_string(it: &mut Interp) {
                 .checked_add(next.len())
                 .filter(|&len| len <= MAX_STR_LEN)
                 .ok_or_else(|| i.make_error("RangeError", "Invalid string length"))?;
-            parts.push(next);
+            parts.borrow_mut().push(next);
         }
-        Ok(Value::Str(crate::lstr::LStr::concat_many(
-            parts.as_slice(),
+        let result = Value::Str(crate::lstr::LStr::concat_many(
+            parts.borrow().as_slice(),
             total,
-        )))
+        ));
+        Ok(result)
     });
     it.def_method(&sp, "repeat", 1, |i, this, args| {
         let s = this_string(i, &this)?;

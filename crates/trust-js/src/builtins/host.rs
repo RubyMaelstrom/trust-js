@@ -235,7 +235,7 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
         }
         let ms = ab(i.to_number(&arg(a, 1)))?.max(0.0);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
-        i.pending_timers.push((f, deadline));
+        i.enqueue_agent_timer(f, deadline);
         Ok(Value::Undefined)
     });
     it.def_method(&agent, "monotonicNow", 0, |_i, _t, _a| {

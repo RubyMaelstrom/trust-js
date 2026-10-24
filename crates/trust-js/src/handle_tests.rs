@@ -48,9 +48,9 @@ fn handle_of(engine: &mut Engine, source: &str) -> Handle {
 /// An engine whose heap runs no stress or task-boundary collections: for tests that watch what
 /// one collection does.
 fn quiet_engine() -> Engine {
-    let mut engine = Engine::new();
+    let engine = Engine::new();
     engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
-    engine.interp.gc_task_deferred = true;
+    engine.interp.gc_heap.agent.task_deferred.set(true);
     engine
 }
 

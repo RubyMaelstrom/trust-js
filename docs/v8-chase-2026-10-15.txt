@@ -8643,3 +8643,366 @@ executions and the paired component review. The retained release is
 target/s6-lto/s6-gc-opt-part-b. Only the record and plan change after
 the gate. I4 approval remains unchanged; S6 exit acceptance and merge
 authorization remain open.
+
+
+GC optimization part C plan: Agent collection, 2026-10-24
+
+A bounded diagnostic confirms that twelve 16 MiB backing allocations
+collect twice in the root interpreter and zero times in a ShadowRealm,
+in every execution tier. Child collection currently returns immediately.
+Buffer debt also resets before an attempted major, and resize/grow
+bypasses traffic accounting. Shared-heap limits and pressure must be
+Agent-wide. This is correctness work before further memory policy
+experiments.
+
+The implementation will use stable interpreter identities and scoped
+access leases. Child storage owns raw allocations privately, without
+Deref exposing an owning Box while a child is active. Routes and
+collectors use the newest pointer derived from the current mutable
+borrow, restore lineage in LIFO order, and never retain a root
+interpreter pointer beyond a public entry: Engine may move. Route
+entries are non-owning; only active entries and queued work retain the
+owner path. Each collection visits each interpreter once. Shared marking
+references end before exclusive sweep visits; removed subtrees are
+quarantined until no visitor can still reach them. Construction is
+unpublished and collection-suppressed until initialization and
+registration finish. This replaces unsafe raw-parent forwarding rather
+than assuming stable addresses establish valid aliases.
+
+Every saved RealmState across reentry is explicitly rooted before
+swapping. Restore state and callback/settings bookkeeping on normal,
+exceptional and Rust-unwind exits; Drop does not invoke JavaScript or
+collect. Remove whole-call suppression only after these roots and the
+access discipline are in place. Audit all realm swaps, manual RealmEntry
+tokens, callback setup, error creation, construction and job
+preparation. Tokens use stable identities, not interpreter addresses.
+
+Three Agent guards have distinct jobs: access leases, synchronous
+author-execution depth, and checkpoint recursion. An access-only
+Engine::scope is not itself a job. Guard all public APIs that can invoke
+author code, including conversions and property access, before entering
+host settings and through leaving them. Preserve script, checkpoint,
+then result-rendering order. Root normal and abrupt results across
+drains; author code invoked during rendering belongs to a separate
+synchronous span and leaves work for the next checkpoint. Independent
+Agents can checkpoint during each other's callbacks.
+
+Promise work uses one Agent FIFO with explicit immutable interpreter
+routes, separate from a Job's handler/settings Realm. Queued and current
+work traces its route owners and actual Realm identities. Pop into
+rooted storage before invoking any user or host callback. Finalization
+cleanup is a separate queue: an entire held-value loop is one cleanup
+job, and newly queued Promise work runs before the next cleanup job.
+Pending async waits, deadlines, host module completions and pending-work
+APIs follow the same routing discipline. Topology caches alone must not
+retain otherwise unreachable realms.
+
+The selected ClearKeptObjects policy is the end of the outer host
+checkpoint, consistent with the HTML checkpoint and permitted by
+ECMAScript. Move KeptAlive to the shared heap's unconditional roots.
+Nested same-Agent entry and ShadowRealm return do not drain or clear it.
+Clear once at the real checkpoint, including an empty checkpoint and the
+supported interrupt/cancellation path; never between callbacks in one
+cleanup job. Invoke HostState.end_job for the relevant surviving host
+states at that boundary under its no-JavaScript/no-recollection
+contract. Rust unwind restores guards without silently manufacturing a
+checkpoint. run_one_job remains a bounded checkpoint and cleans up on
+early interrupt too.
+
+Removing nested child drains also requires splitting module loading from
+checkpointing. Preserve pending top-level await and implement
+importValue as routed asynchronous continuation state owned by reachable
+promises, not an unconditional Agent root. Route settlement and error
+copying to the requester, preserving its Realm/settings. Check
+HasOwnProperty before Get so an undefined export is distinct from a
+missing export. Agent-unique host request identifiers route completions
+and handle cancellation/stale responses. Audit the legacy await path; no
+pending await may turn into undefined or run a nested same-Agent drain.
+
+Collection suppression, collecting state, pending major requests,
+live-object limits and error allowance are canonical Agent state.
+Existing safepoints and stack-scannability rules remain. Return a typed
+collection outcome; deferral, a minor, or a no-op cannot consume major
+pressure. The due word must preserve pending external requests. Snapshot
+a monotonic growth ticket when a major starts and consume only that
+ticket on successful completion, retaining growth published during the
+collection. Recompute retained backing after every successful major
+using unique storage identities across the whole Agent. Preserve the 64
+MiB pressure floor.
+
+Replace exposed raw local RefCell and shared Mutex backing storage with
+tracked wrappers and migrate every workspace consumer, including
+WebAssembly growth. Positive successful logical growth publishes
+pressure; failed allocations and untouched reservations do not. Prepare
+projected growth at an existing safepoint before borrowing or locking
+storage. Guards publish cached lengths and tickets on Drop without
+JavaScript or collection. Local/shared aliases deduplicate, transfer
+preserves identity, copied storage receives a new identity, and explicit
+Agent leases/weak atomic subscriptions avoid keeping dead heaps alive.
+Collectors read cached shared lengths without waiting on another
+thread's lock. Foreign growth merges its atomic ticket at Rust polls
+before an early no-due return; audit native periodic polls on each
+backend. Validate typed-view pointer/epoch behavior after migration.
+
+Implement this as one complete correctness part with internal review
+checkpoints. Root owns all executions; the sole implementation agent
+writes only the isolated part-c export. Require source review of the
+actual access module, including a std-only Miri harness using that
+module if the toolchain is available. Miri covers current-borrow
+provenance, root movement, nested entry/reentry, phase ordering,
+quarantine and unwind; it does not prove JIT or whole-engine
+correctness.
+
+Tests must show a completed collection inside child and grandchild loops
+in all tiers, ordinary cell and buffer pressure, consistent limits,
+parent suppression/debt retention, active owner survival and inactive
+realm retirement. Cover rooted saved realm state, reentrant routes, root
+movement, independent Agent progress, unwind and interrupt restoration.
+Prove Agent FIFO and same-job WeakRef lifetime with precise collections
+and no stale stack roots; include a kept Symbol whose former child realm
+retires, child wrapper name getters, and two cleanup callbacks sharing
+protection. Test routed pending jobs, top-level await imports,
+undefined/missing exports and collectible unresolved continuations.
+Exercise local/shared aliases, transfer, resize, grow, WebAssembly,
+foreign growth, busy shared locks and failed/deferred collection
+accounting. Mutation-check the key routing, rooting, suppression,
+boundary and pressure sites. Both routine platform gates and the final
+full milestone gates remain mandatory.
+
+Local standards: ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202,
+Jobs, HostEnqueuePromiseJob, ClearKeptObjects, AddToKeptObjects and
+CleanupFinalizationRegistry; ShadowRealm
+9ff2a01f1ec68a427f6f37ce710aa7cba8150678, wrapped calls, evaluation and
+importValue; HTML e5071a20, perform a microtask checkpoint. These
+snapshots were read before implementation. No GC movement, concurrent
+marking, pressure-floor change, I4 relaxation, performance waiver or
+merge authorization is introduced.
+
+C prerequisite amendment (2026-10-24, recorded before root utility edits):
+
+The unchanged production rooting module fails actual-module std-only Miri
+probes: Stacked Borrows rejects immutable and mutable Rooted/RootedVec
+registration, and Tree Borrows also rejects mutable and RefCell cases.
+Moving the owning Box after creating the registry's raw shared pointer is
+not a sound provenance contract. Part C therefore first gives rooted
+storage private raw ownership, registers directly through that raw
+lineage, and unregisters before destruction. Audit mutable root loans
+across argument evaluation, callbacks and iterators; an owning mutable
+reference cannot silently coexist with registry tracing. Import the actual
+rooting module into a std-only Miri harness, covering these real call
+shapes, alongside the interpreter access module tests. Preserve precise
+edge inventories and the chosen checkpoint policy. No whole-engine or
+whole-rooting claim follows merely from a passing surrogate or a build.
+
+C checkpoint/cleanup refinement (2026-10-24, before wiring the partial pump):
+
+run_one_job is a partial host checkpoint pump. A successful single-job
+return does not ClearKeptObjects: repeated calls belong to the same
+protection interval until an empty/no-ready-work result or an explicit
+full checkpoint closes it. Future external I/O is not ready checkpoint
+work. Nested same-Agent pumps defer. An interrupted pump preserves its
+false/interrupt API behavior and explicitly cancels queued Promise work
+and closes the supported boundary; Rust unwind restores flags only.
+No raw interpreter pointer is retained between these host calls.
+
+Finalization cleanup remains a separate low-priority host task lane,
+not Promise microtasks. Keep its registry constructor Realm/global and
+task/reporting context distinct from callback entry Realm/settings and
+JobCallback incumbent/script capture. Trace both retained Realm globals
+from live registry state and queued work, independent of NewTarget and
+mutable prototypes. Prepare callback settings around the whole cleanup
+loop; preserve the no-constructor-throw revoked-callable fallback as an
+explicit engine policy, not a claimed normative HTML proxy rule.
+
+C import authority refinement (2026-10-24, before implementation): loader authorization
+and cancellation are separate from the child execution Realm/settings. importValue
+captures the actual current runtime ScriptOrModule authority, else the requester's
+explicit host context. Runtime module/code metadata carries that authority through
+static dependencies, dynamic imports, await resumption and later exported calls;
+neutral shared AST/ScriptSource caches never acquire an ambient mutable authority.
+Accepted host work retains both dispatch and initiating-authority routes, uses
+Agent-unique IDs, and is cancelled by the initiating owner/context. Retired authority
+never falls back to zero or a new caller. Public URL/referrer strings stay unqualified;
+internal module-map keys distinguish the originating authority. Historical code
+identity is non-rooting; intrinsic unresolved bridges remain promise-owned.
+
+At each real cross-interpreter transfer, capture the effective caller runtime
+ScriptOrModule before suspension and establish the target's existing context floor.
+New target user/code contexts override that inherited caller; a null-source builtin
+uses the inherited caller before the target's suspended older frames. Restore this
+metadata on return/unwind, without adding bookkeeping to every ordinary function
+call. Eval/Function derivations and source-less shared snapshot code preserve actual
+runtime provenance. Ordinary child evaluate establishes its existing child policy;
+import delegation cannot become a mutable default leaking into unrelated code.
+The selected scope and tests are specified in adjacent import-authority-choice.txt;
+include contexts17/23, TLA/nested/later imports, cancellation, child-to-parent
+builtin/eval/Function propagation and independent-Agent isolation.
+
+C actual source-record ownership refinement (2026-10-24, before implementation):
+A runtime function or eval/Function-derived context retains the SAME actual
+ScriptOrModule identity independently of its execution Realm and non-owning
+LoadAuthority. Use an immutable runtime ReferrerRecord carrying stable identity,
+actual source-owner route, source Realm/execution context, public base, authority
+and canonical owner-local module key. Loaded-request bookkeeping contains only
+plain normalized keys; do not install mutable GC edges in old uncarded closures.
+Reachable runtime functions, frames and callbacks trace their source owner/Realm;
+neutral AST/ScriptSource/Chunk caches and historical authorization remain unrooted.
+
+Module lookup/loading/evaluation uses that actual source record and owning module
+map. A general conditional result-capability bridge settles ordinary imports in
+the invoking Realm with the ORIGINAL namespace, exports and rejection values.
+Only accepted external obligations are unconditional work roots. Consequently
+ordinary cross-interpreter namespace/native metadata accesses and actual callable
+Realm dispatch must resolve the authoritative owner at existing operation funnels.
+Keep a borrowed builtin's algorithm/error/default-constructor Realm in its caller;
+do not route an entire builtin merely because receiver metadata is foreign.
+Preserve proxy/bound operation order, one object identity and shared mutations.
+
+Require same-dependency module counter/namespace identity and live-export tests
+for a parent Function inheriting a child module source; retain the source owner
+when only the derived function survives, retire it when all such work/values die.
+Cover original rejection identity, exported callable Realm/prototypes, prototype-
+null Proxy/ArrayBuffer and representative metadata, cross-owner writes, and
+conditional owner-path retirement. Local ECMA e28783d5 OrdinaryFunctionCreate
+14068-69 and HostLoad/FinishLoading 29571-29614, HTML e5071a20 122468-122480.
+Exact scope is recorded in adjacent source-owner-choice.txt. This completes the
+selected C correctness boundary; no unrelated builtin algorithms are authorized.
+
+Conditional native-owner home paths are fed through existing changed-owner
+records on minor collections, including pins installed during unpublished child
+construction and newly attached metadata on old owners. Major collections may
+census all owner pins; verification checks completeness. The owner registry must
+never include unrelated weak cache keys.
+
+
+GC optimization part C: Agent collection, 2026-10-24
+
+Part C is integrated after 5066e21c. A ShadowRealm's interpreter now
+collects the shared Agent heap from its own safepoints instead of
+returning at once. Interpreters own their raw allocations through the
+agent_access directory; collections and routes use the newest lease
+derived from the current borrow, and saved Realm, settings, caller and
+constructor state stays rooted across reentry. Promise jobs, cleanup
+tasks, waits, timers and host imports form one Agent FIFO with explicit
+routes; KeptAlive is cleared once at the end of the outer host
+checkpoint, and nested same-Agent checkpoints defer. Collection
+suppression, pending requests, limits and the task trigger are Agent
+state; a deferred, minor or no-op collection cannot consume a pending
+major. Rooted and RootedVec own their storage through a raw allocation,
+which the actual-module Miri harnesses accept under Stacked and Tree
+Borrows with deliberate failing controls. Module loading, import
+authority and actual source records follow the recorded refinements:
+a parent Function derived under a child module imports that module's
+own record and namespace, and keeps the child alive only while needed.
+
+Root took over the isolated export from the previous implementation
+agent. Its 23 focused tests had three failures, all in the tests
+themselves: two allocated on one engine after creating a second one
+without reactivating the first heap, one expected a ShadowRealm wrapped
+call to return a Promise, and one expected host enter/leave hooks where
+the existing hook contract (tests.rs) forbids them when entering the
+job's Realm already selects its context. The source-record cache, which
+correctly reuses a loaded module for a repeated request, needed fresh
+specifiers in one test; a nested wrapper needed one more unwrap in
+another. ShadowRealm.evaluate no longer drains the child's jobs: one
+Agent has one job queue, so a test now reads the queued result after
+the checkpoint.
+
+Buffer pressure deviates from the plan's tracked storage wrappers. The
+pressure count and trigger are Agent state; after a completed major
+the trigger is recomputed from the buffers every member interpreter
+retains, each Shared Data Block counted once. ArrayBuffer resize (now
+reserved fallibly), SharedArrayBuffer grow, and WebAssembly memory
+allocation, instantiation, Memory.grow and the memory.grow instruction
+account their new data at explicit call sites; hosts report through
+Ctx::note_external_buffer_growth. Transfer already accounted. The
+wrappers' atomic cross-thread tickets were not needed for this
+coverage, and cached shared lengths remain read under their locks as
+before part C. Five mutants of these sites fail at their assertions.
+
+The release comparison against part B found part C's own costs: on the
+no-LTO engine Vue executed 13.9% more instructions and a bound-call
+microbenchmark 18.8% more. Metadata lookups had lost their empty-table
+fast paths to consult the Agent owner index on every miss, the owner
+index was written for every native function and pin and swept on every
+collection, call and construct always resolved a callable's home, and
+every closure boxed its runtime source record. A lone interpreter now
+keeps no owner index (the first child publishes its parent's owners,
+the last one's retirement clears it); its lookups, calls and constructs
+take the earlier local paths; and closures of one parsed function share
+the record of the first one in their heap, boxing only a different or
+absent record. The remaining instruction deltas against part B are
+Vue +0.91%, React -0.23%, Djot -1.14%, sustained allocation +1.28%,
+empty startup -0.99%, closures +1.88% and bound calls +1.46%
+(no LTO, CPU 5, minimum of three).
+
+An independent mutation pass over the routing, tracing, restoration,
+suppression, checkpoint and execution-guard sites killed 15 of 21
+mutants; root then added tests for a child await resumed by a parent
+settlement, suppressed requests keeping a pending major, the nested
+checkpoint's KeptAlive epoch and the restored settings context, plus
+the owner-index lifecycle and per-script closure records. Eight of
+nine second-round mutants are killed at those assertions. The enqueue route of a foreign-Realm
+job survives: call-time routing resumes the job in its owner and its
+Realm reference retains the owner, so no observable difference was
+found. A record's owner and Realm edges each retain the same path, and
+child bootstrap has no safepoint for the suppression guard to defer.
+
+The first routine gates found three regressions that the handed-over
+export already had; part B passes each. Five Test262 tests failed at
+threshold 8. A module awaiting only inside class heritage, a computed
+name or an `await using` loop head was not recognized as having
+top-level await, so it ran synchronously through the evaluator; part B
+settled that await by draining the job queue in place, which part C
+forbids. The module test now follows ParseModule's [[HasTLA]], body
+Contains `await` (including patterns, class heritage and computed names,
+excluding function bodies), with a regression test. Calls stopped
+entering a wrapped function's [[Realm]]: the part C call funnel asked
+only for User and native callables' Realms. Wrapped callables again
+take the Realm whose %Function.prototype% WrappedFunctionCreate gave
+them. The runtime's bun:jsc drainMicrotasks, which the embedding API
+documents as running queued Promise jobs synchronously, had become a
+deferred nested checkpoint. It now runs the queued Promise jobs inside
+the outer job without ending it: KeptAlive, host end_job, cleanup tasks
+and the task-boundary collection stay with the outer checkpoint, and a
+drain requested by one of its jobs defers. The first attempts' outputs
+are kept with an -r1 suffix.
+
+Crystal routine gate (second attempt): rustfmt is clean on 283 files,
+the five strict Clippy configurations pass and rustdoc keeps its eight
+warnings. The library suite is 2466/0/7 and doctests 11/0/1; the
+inventory adds 35 tests and renames one Agent memory test. The workspace
+builds, and the downstream suites are host 37, timers 6, fs 0,
+web 64/0/1, node 47 and runtime 184/0/1. Fixture outputs, compilation
+counts (56/10/160) and collection counts (21/6/16) match part B, as do
+the sustained checksums and their 194 collections. All nine code-dump
+pairs keep their token counts and signatures; every chunk differs from
+part B only in materialized helper addresses and Interp field offsets,
+because the Interp layout changed. Difftest agrees on 138 seeds with the
+same 12 budget skips. Test262 at threshold 8 is 53575/53575, identical
+to the reference report. Targeted stress at interval 1 passes 1617 and
+ignores five; the child/grandchild loop test joins a part C copy of the
+slow list (target/s2-exp/runs/slow100-s6-gc-opt-c.txt): it takes 46 s at
+interval 100 and exceeds 900 s at interval 1.
+
+Zombie routine gate (second attempt): x64 Clippy is clean and Windows
+keeps its 23 diagnostics. x64 is 2294/0/7 and Wine 2286/3/7 with exactly
+the three established snapshot failures; both inventories add the same
+35 tests and rename the same one. Release fixtures and difftest match.
+All 35 new tests pass under GC stress on both platforms, the slow-listed
+one at interval 100.
+
+The actual-module Miri harnesses pass on the final agent_access.rs
+(e5e86310) and rooting.rs (bcd6e2c1): six access and eight rooting cases
+in Stacked and Tree Borrows with strict provenance, and the stale-
+suspension negative control is rejected under both.
+
+The frozen source has 807 paths, SHA256 25090fbd4958beae, equal to both
+second gates. The paired fat-LTO release comparison against part B and
+main waits for a quiet machine and is recorded separately; the
+instruction deltas above are the no-LTO screening results.
+
+Artifacts are under target/s6-gc-opt-2026-10-23/part-c, including the
+previous agent's iterations and both gates, and target/claude-partc for
+the takeover: the integration patch, focused runs, performance builds
+and mutation results.

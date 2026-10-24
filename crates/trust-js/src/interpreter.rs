@@ -836,6 +836,10 @@ pub(crate) struct FinalizationState {
     pub(crate) cleanup_callback: JobCallback,
     pub(crate) cells: crate::finalization_cells::FinalizationCells,
     pub(crate) cleanup_scheduled: bool,
+    pub(crate) registry_realm: Gc,
+    pub(crate) registry_context: u64,
+    pub(crate) callback_realm: Option<usize>,
+    pub(crate) callback_context: u64,
 }
 
 fn shared_mem_registry() -> &'static Mutex<HashMap<u64, std::sync::Weak<SharedDataBlock>>> {
@@ -959,7 +963,6 @@ impl AsyncWaitInbox {
     pub(crate) fn take(&self) -> Vec<u64> {
         std::mem::take(&mut self.notified.lock().unwrap())
     }
-    #[cfg(feature = "embed")]
     pub(crate) fn has_notifications(&self) -> bool {
         !self.notified.lock().unwrap().is_empty()
     }
@@ -3217,6 +3220,7 @@ pub struct Interp {
     /// Collector ownership follows the ECMAScript Agent, not the native thread currently running
     /// one of its suspended execution contexts. All realms in this interpreter share this heap.
     pub(crate) gc_heap: crate::value::GcHeap,
+    pub(crate) realm_id: crate::agent_access::RealmId,
     /// ECMA-262 Agent Record symbol state, shared by all realms including ShadowRealms.
     pub(crate) symbol_agent: crate::value::SymbolAgent,
     pub(crate) global: Gc,
@@ -3320,7 +3324,7 @@ pub struct Interp {
     pub(crate) code_frames: Vec<crate::stack_trace::CodeFrame>,
     /// Script execution contexts pushed for job callbacks (HTML HostCallJobCallback), each with
     /// the context depth it was pushed at; they appear in no stack trace.
-    pub(crate) job_script_contexts: Vec<(u32, Rc<crate::stack_trace::ScriptSource>)>,
+    pub(crate) job_script_contexts: Vec<(u32, crate::agent_control::RuntimeOrigin)>,
     /// The prototype of the [[AlreadyResolved]] record shared by the resolving functions of an
     /// embedder's platform resolution ([`Interp::promise_resolved_with`]). Never exposed to
     /// script; it identifies those functions as platform steps (see [`InternalJob::HostReaction`]).
@@ -3469,9 +3473,9 @@ pub struct Interp {
     #[allow(clippy::type_complexity)]
     pub(crate) dynamic_module_loader:
         Option<Rc<dyn Fn(u64, u64, &str, &str, Option<&str>) -> bool>>,
-    pub(crate) pending_dynamic_imports:
-        std::collections::HashMap<u64, crate::modules::PendingDynamicImport>,
-    pub(crate) next_dynamic_import_id: u64,
+    /// Conditional intrinsic importValue bridges, owned by the requester promise. They are
+    /// not Agent work roots until the child import actually queues a runnable reaction.
+    pub(crate) routed_imports: gc_collect::SideSlotTable<crate::agent_control::RoutedImport>,
     /// Live module-namespace state keyed by the namespace object's pointer: for each exported name,
     /// how to read its current value (a live binding in some module scope, or a static value for a
     /// star-as namespace re-export). Namespace property reads consult this so they stay live.
@@ -3515,13 +3519,6 @@ pub struct Interp {
     /// Whether this agent may block in `Atomics.wait` (false for the main agent, true for the
     /// worker agents spawned by `$262.agent.start`).
     pub(crate) can_block: bool,
-    /// This agent's `Atomics.waitAsync` waiters still in a WaiterList, oldest first. Job
-    /// checkpoints resolve their promises once notified or timed out (`settle_async_waits`).
-    pub(crate) pending_async_waits: Vec<AsyncWait>,
-    /// Where other agents deliver notifications of those waiters (made on first use).
-    pub(crate) async_wait_inbox: Option<Arc<AsyncWaitInbox>>,
-    /// Host timers from `$262.agent.setTimeout`: (callback, deadline).
-    pub(crate) pending_timers: Vec<(Value, std::time::Instant)>,
     /// Agent-harness wiring (present only in spawned agents / a main with agents).
     pub(crate) agent: Option<Box<AgentChannels>>,
     /// TypedArray view state, keyed by the typed-array object's pointer.
@@ -3543,7 +3540,7 @@ pub struct Interp {
     pub(crate) ta_buffer: gc_collect::SideSlotTable<Value>,
     /// Each `ShadowRealm` instance owns an isolated realm (a full sub-interpreter), keyed by the
     /// ShadowRealm object's pointer. Only primitive completion values cross the boundary.
-    pub(crate) shadow_realms: crate::fasthash::FastMap<usize, Box<Interp>>,
+    pub(crate) shadow_realms: crate::fasthash::FastMap<usize, crate::agent_access::Owned<Interp>>,
     /// A ShadowRealm's interpreter: its place in its parent's tree (None for an Agent's root).
     pub(crate) shadow_home: Option<ShadowHome>,
     /// DataView state `(buffer ptr, byteOffset, byteLength)`, keyed by the DataView's pointer.
@@ -3600,8 +3597,6 @@ pub struct Interp {
     pub(crate) temporal: crate::fasthash::FastMap<usize, crate::temporal::Temporal>,
     /// The calendar id of a Temporal date-bearing object (default "iso8601"), keyed by object ptr.
     pub(crate) temporal_cal: crate::fasthash::FastMap<usize, std::rc::Rc<str>>,
-    /// The microtask queue (drained after the main script by [`crate::Engine::eval`]).
-    pub(crate) microtasks: std::collections::VecDeque<Job>,
     /// Opaque embedder settings token associated with the currently-running script/callback.
     /// Promise reactions retain this alongside their ECMA-262 handler Realm so a browser host
     /// that temporarily multiplexes several Window settings objects through one engine Realm can
@@ -3618,6 +3613,8 @@ pub struct Interp {
     /// Opt-in browser incumbent-source propagation for JobCallback records. Non-browser hosts
     /// retain ECMA-262's default HostMakeJobCallback/HostCallJobCallback behavior.
     pub(crate) capture_job_script_caller: bool,
+    /// Actual caller source above the suspended local context floor at a cross-Interp entry.
+    pub(crate) caller_origin: Option<crate::agent_control::CallerOrigin>,
     /// Per-(ECMAScript realm, host settings object) global lexical state.
     /// HTML normally has a 1:1 realm/settings mapping; browser embedders that
     /// multiplex logical Window realms select the corresponding state through
@@ -3629,9 +3626,6 @@ pub struct Interp {
     pub(crate) retired_host_job_contexts: std::collections::HashSet<u64>,
     pub(crate) host_job_context_enter: Option<fn(&mut Interp, u64)>,
     pub(crate) host_job_context_leave: Option<fn(&mut Interp)>,
-    /// The Agent Record's [[KeptAlive]] list (ECMA-262 §9.10–9.11). WeakRef construction and
-    /// successful dereference append here; the host clears it between synchronous jobs.
-    pub(crate) kept_alive: Vec<Value>,
     /// Embedder host state (typed slots + resource table); see [`crate::host`]. Reached from
     /// native fns via [`Interp::op_state`] — the only way, since `NativeFn` cannot capture.
     pub(crate) host_state: crate::host::OpState,
@@ -3640,35 +3634,15 @@ pub struct Interp {
     pub(crate) generators: gc_collect::SideSlotTable<crate::coroutine::Coroutine>,
     /// The live-object ceiling: a safepoint (`gc_check`, the JIT's entry and loop polls) that
     /// finds the live count above it collects, and throws the limit's RangeError if more than
-    /// `live_object_limit` objects stay alive; the record-getter fast path then leaves the call
-    /// to the ordinary path. It is `live_object_limit`, or, after that RangeError, the live
+    /// the Agent limit’s objects stay alive; the record-getter fast path then leaves the call
+    /// to the ordinary path. It mirrors the Agent limit, or, after that RangeError, the live
     /// count at the throw plus [`LIMIT_ERROR_HANDLER_ROOM`]. It is not a growth trigger:
     /// allocation makes a collection due through the heap's byte budget (see
     /// `gc_collect::GC_MIN_HEAP_BYTES`).
     pub(crate) gc_next: i64,
-    /// Live-object ceiling for this engine; see [`MIN_LIVE_OBJECT_LIMIT`]. Defaults to
-    /// [`default_live_object_limit`] and is configurable by the embedder. Safepoints see it
-    /// through `gc_next`.
-    pub(crate) live_object_limit: i64,
-    /// Nonzero while an embedder performs an atomic bootstrap operation whose
-    /// temporary VM values are still being published into a rooted object
-    /// graph. Collection is deferred until the operation returns so active
-    /// evaluation state remains a complete root set.
-    pub(crate) gc_suppressed: u32,
-    /// ArrayBuffer data allocated since the last collection, and the amount that triggers the
-    /// next one (see [`Interp::note_buffer_allocation`]).
-    pub(crate) buffer_gc: BufferPressure,
     /// Call counter for [`Interp::gc_check_amortized`]: layered calls poll every 256 calls. Direct
     /// JIT calls leave it alone; the callee's entry poll is their safepoint.
     pub(crate) gc_tick: u32,
-    /// Allocation counter at the preceding host task boundary.
-    pub(crate) gc_task_allocated: u64,
-    /// Objects remaining after the most recent collection, for task-boundary pressure.
-    pub(crate) gc_task_live: i64,
-    /// Host scheduling hint for optional task-boundary collection only.
-    /// Allocation safepoints and their existing limits remain enabled.
-    pub(crate) gc_task_deferred: bool,
-    pub(crate) gc_task_pending: bool,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
     /// build a wrapper object instead of returning a primitive).
     pub(crate) constructing: bool,
@@ -3741,8 +3715,6 @@ pub struct Interp {
     pub(crate) weak_metadata: crate::weak_metadata::WeakMetadata,
     /// FinalizationRegistry internal slots, keyed by the registry instance.
     pub(crate) finalization_registries: gc_collect::SideSlotTable<FinalizationState>,
-    /// HostEnqueueFinalizationRegistryCleanupJob captures registries strongly until a later job.
-    pub(crate) pending_finalization_cleanup: std::collections::VecDeque<Value>,
     /// Async generators mid-step (running or parked at an `await`): further next/return/throw
     /// requests queue here (the spec's AsyncGeneratorRequest queue) until the step completes.
     pub(crate) async_gen_busy: std::collections::HashSet<usize>,
@@ -3777,6 +3749,7 @@ macro_rules! interp_memory_inventory {
 #[cfg(test)]
 interp_memory_inventory! {
     gc_heap => "measured",
+    realm_id => "non_owning",
     symbol_agent => "measured",
     global => "measured",
     global_env => "measured",
@@ -3852,8 +3825,7 @@ interp_memory_inventory! {
     module_recs => "measured",
     module_loader => "external",
     dynamic_module_loader => "external",
-    pending_dynamic_imports => "measured",
-    next_dynamic_import_id => "non_owning",
+    routed_imports => "measured",
     module_ns => "measured",
     collection_iterators => "measured",
     weak_collection_data => "measured",
@@ -3866,9 +3838,6 @@ interp_memory_inventory! {
     immutable_buffers => "measured",
     host_keyed_buffers => "measured",
     can_block => "non_owning",
-    pending_async_waits => "measured",
-    async_wait_inbox => "measured",
-    pending_timers => "measured",
     agent => "measured",
     typed_arrays => "measured",
     async_gens => "measured",
@@ -3893,27 +3862,19 @@ interp_memory_inventory! {
     handled_rejections => "measured",
     temporal => "measured",
     temporal_cal => "measured",
-    microtasks => "measured",
     host_job_context => "non_owning",
     script_entry => "non_owning",
     host_entry_realm => "non_owning",
     capture_job_script_caller => "non_owning",
+    caller_origin => "measured",
     host_settings_states => "measured",
     retired_host_job_contexts => "measured",
     host_job_context_enter => "non_owning",
     host_job_context_leave => "non_owning",
-    kept_alive => "measured",
     host_state => "external",
     generators => "measured",
     gc_next => "non_owning",
-    live_object_limit => "non_owning",
-    gc_suppressed => "non_owning",
-    buffer_gc => "non_owning",
     gc_tick => "non_owning",
-    gc_task_allocated => "non_owning",
-    gc_task_live => "non_owning",
-    gc_task_deferred => "non_owning",
-    gc_task_pending => "non_owning",
     constructing => "non_owning",
     super_call_ok => "non_owning",
     fn_frames => "measured",
@@ -3938,7 +3899,6 @@ interp_memory_inventory! {
     weak_refs => "measured",
     weak_metadata => "measured",
     finalization_registries => "measured",
-    pending_finalization_cleanup => "measured",
     async_gen_busy => "measured",
     async_gen_queue => "measured",
     heap_release => "non_owning",
@@ -3963,7 +3923,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 166);
+    assert_eq!(names.len(), 154);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3973,53 +3933,24 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
     let _tripwire: fn(&Interp) = interp_memory_inventory_exhaustive_pattern;
 }
 
-/// What a ShadowRealm's interpreter knows of the realm that owns it.
+/// Stable topology and a cached retained path. The path is traced only by active/queued work.
 pub(crate) struct ShadowHome {
-    /// The ShadowRealm object, in the parent realm. Weak: the object keeps the realm, not the
-    /// reverse; it is alive whenever code in this realm runs.
     pub(crate) owner: crate::value::WeakGc,
-    /// The parent interpreter, recorded at each entry (see [`Interp::enter_shadow`]).
-    pub(crate) parent: *mut Interp,
-    /// Entries in progress: code in this realm is running. Collections treat the
-    /// realm's roots and its ShadowRealm object as roots meanwhile.
-    pub(crate) entries: u32,
+    pub(crate) parent: crate::agent_access::RealmId,
+    pub(crate) route: Rc<crate::agent_control::Route>,
 }
 
-/// An entry into a ShadowRealm's interpreter, which is used in place: its `Box` is pinned, and
-/// re-entrant calls (host code called from the realm calling back into it) are sequenced by
-/// the JS call stack. Holds the realm's agent active until it drops.
-pub(crate) struct ShadowEntry {
-    sub: *mut Interp,
-    /// Keeps the owner alive meanwhile (entries are locals, which the stack scan finds).
-    _owner: Gc,
-    _agent: crate::value::AgentActivationGuard,
-}
-
-impl ShadowEntry {
-    pub(crate) fn interp(&mut self) -> &mut Interp {
-        // SAFETY: an entered realm stays in its parent's table: its ShadowRealm object, held
-        // here, does not die meanwhile.
-        unsafe { &mut *self.sub }
-    }
-}
-
-impl Drop for ShadowEntry {
-    fn drop(&mut self) {
-        if let Some(home) = self.interp().shadow_home.as_mut() {
-            home.entries -= 1;
-        }
-    }
-}
-
-/// End a collected ShadowRealm's interpreter and its nested realms' (I5), in the collector's
-/// eviction step while the cells they name are intact. Their suspended coroutines are as
-/// unreachable as they are, so they end as memory instead of being resumed to terminate, as
-/// when an Agent ends with live state (`Interp::drop`).
-fn drop_collected_realm(mut realm: Box<Interp>) {
-    for (_, nested) in std::mem::take(&mut realm.shadow_realms) {
+/// A detached subtree is destroyed only after collection visitors have ended. Coroutines
+/// terminate as memory; collection never resumes author code during retirement.
+fn drop_collected_realm(mut realm: crate::agent_access::Owned<Interp>) {
+    // SAFETY: retirement removed this inactive subtree from all collection snapshots. The
+    // owning capability is now exclusive, and no child lease exists (Owned::drop checks).
+    let mut pointer = realm.retirement_pointer();
+    let interp = unsafe { pointer.as_mut() };
+    for (_, nested) in std::mem::take(&mut interp.shadow_realms) {
         drop_collected_realm(nested);
     }
-    drop(std::mem::take(&mut realm.generators));
+    drop(std::mem::take(&mut interp.generators));
 }
 
 impl Drop for Interp {
@@ -4031,6 +3962,15 @@ impl Drop for Interp {
         // interpreter is not an Agent: its calls stay in its Agent's profile.
         if self.shadow_home.is_none() {
             function_profile_dump();
+        } else {
+            let children = &self.gc_heap.agent.children;
+            children.set(children.get() - 1);
+            if children.get() == 0 {
+                // The root is alone again; its own tables are authoritative.
+                if let Ok(mut index) = self.gc_heap.agent.metadata_owners.try_borrow_mut() {
+                    index.clear();
+                }
+            }
         }
         // A suspended coroutine owns non-Send `Rc` values on its worker stack and retains a raw
         // pointer back to this interpreter. Wake and unwind every such body while `self` is still
@@ -4038,11 +3978,6 @@ impl Drop for Interp {
         let mut coroutines = std::mem::take(&mut self.generators);
         for coroutine in coroutines.values_mut(&self.gc_heap) {
             coroutine.terminate(self);
-        }
-        // A terminated agent cannot resolve its pending waitAsync promises. Remove its waiter
-        // records before releasing their Shared Data Block owners and notification inboxes.
-        for wait in std::mem::take(&mut self.pending_async_waits) {
-            futex_remove_async(wait.id, wait.index, wait.token);
         }
         // The whole Agent is ending, not merely reaching a GC safepoint: the heap's owner
         // (`heap_release`) finalizes and frees every cell once all other fields have dropped,
@@ -4079,7 +4014,7 @@ pub(crate) struct JobCallback {
     /// HTML HostMakeJobCallback's [[ActiveScriptContext]]: the active ScriptOrModule at
     /// registration, which HostCallJobCallback pushes while calling the callback (browser hosts
     /// only; see [`Interp::make_job_callback`]).
-    pub(crate) active_script: Option<Rc<crate::stack_trace::ScriptSource>>,
+    pub(crate) active_script: Option<crate::agent_control::RuntimeOrigin>,
     /// A reaction step the specification models as an unobservable built-in function. When set,
     /// `callback` is not called; see [`InternalJob`].
     pub(crate) internal: InternalJob,
@@ -4104,6 +4039,18 @@ pub(crate) enum InternalJob {
     /// to no Realm or settings object, so HTML HostEnqueuePromiseJob gives it null job settings
     /// and it runs even after the settings object it was registered in is gone.
     HostReaction,
+    /// The callback word keys the requester promise's conditional ShadowRealm import slots.
+    /// It is never called. The dispatch route and language Realm are independent identities.
+    RoutedImportFulfilled {
+        requester: crate::agent_access::RealmId,
+        realm: usize,
+        context: u64,
+    },
+    RoutedImportRejected {
+        requester: crate::agent_access::RealmId,
+        realm: usize,
+        context: u64,
+    },
 }
 
 impl InternalJob {
@@ -4111,9 +4058,26 @@ impl InternalJob {
     pub(crate) fn realm(self) -> Option<usize> {
         match self {
             InternalJob::None | InternalJob::HostReaction => None,
-            InternalJob::AwaitFulfilled { realm } | InternalJob::AwaitRejected { realm } => {
-                Some(realm)
-            }
+            InternalJob::AwaitFulfilled { realm }
+            | InternalJob::AwaitRejected { realm }
+            | InternalJob::RoutedImportFulfilled { realm, .. }
+            | InternalJob::RoutedImportRejected { realm, .. } => Some(realm),
+        }
+    }
+
+    pub(crate) fn routed_import(self) -> Option<(crate::agent_access::RealmId, usize, u64, bool)> {
+        match self {
+            Self::RoutedImportFulfilled {
+                requester,
+                realm,
+                context,
+            } => Some((requester, realm, context, true)),
+            Self::RoutedImportRejected {
+                requester,
+                realm,
+                context,
+            } => Some((requester, realm, context, false)),
+            _ => None,
         }
     }
 
@@ -4181,6 +4145,7 @@ macro_rules! gc_side_slot_tables {
             host_indexed,
             promises,
             promise_forward,
+            routed_imports,
             async_gen_queue,
             finalization_registries,
             mapped_arguments,
@@ -4538,7 +4503,7 @@ pub(crate) fn with_data_stack<R>(f: impl FnOnce() -> R) -> Option<R> {
 }
 
 /// Smallest automatically derived live-object ceiling (the former fixed limit). When a safe point
-/// sees more *live* objects than the engine's ceiling (see [`Interp::live_object_limit`]), a
+/// sees more *live* objects than the engine's ceiling (see [`crate::Engine::live_object_limit`]), a
 /// collection runs; if it can't get back under, a RangeError is thrown rather than exhausting
 /// RAM. This bounds genuine retention; transient garbage is reclaimed and doesn't count.
 pub const MIN_LIVE_OBJECT_LIMIT: i64 = 3_000_000;
@@ -4582,10 +4547,12 @@ pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
 /// memory limit, the trigger grows with the buffer data that survives a collection.
 const BUFFER_GC_TRIGGER: usize = 64 * 1024 * 1024;
 
+/// One Agent's ArrayBuffer pressure. Every interpreter sharing the heap adds to the same
+/// count: a ShadowRealm's buffers die in the same collections as its parent's.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BufferPressure {
-    since_gc: usize,
-    trigger: usize,
+    pub(crate) since_gc: usize,
+    pub(crate) trigger: usize,
 }
 
 impl Default for BufferPressure {
@@ -4619,7 +4586,7 @@ fn buffer_gc_trigger_grows_with_retained_shared_data_blocks() {
             crate::Completion::Value(ref value) if value == "4"
         ));
         assert_eq!(
-            engine.interp.buffer_gc.trigger,
+            engine.interp.gc_heap.agent.buffers.get().trigger,
             120 << 20,
             "{constructor} survivors must raise the trigger"
         );
@@ -4926,7 +4893,23 @@ impl Interp {
         }
         self.host_settings_states
             .retain(|(_, candidate), _| *candidate != context);
-        self.microtasks.retain(|job| job.host_context != context);
+        {
+            let id = self.realm_id;
+            let mut work = self.gc_heap.agent.work.borrow_mut();
+            work.promises
+                .retain(|job| job.route.target != id || job.payload.host_context != context);
+            work.cleanup
+                .retain(|job| job.route.target != id || job.payload.registry_context != context);
+        }
+        let cancelled: Vec<_> = self
+            .routed_imports
+            .iter()
+            .filter(|(_, pending)| pending.context == context)
+            .map(|(&owner, _)| owner)
+            .collect();
+        for owner in cancelled {
+            self.routed_imports.remove(&owner);
+        }
         for promise in self.promises.values_mut(&self.gc_heap) {
             promise
                 .reactions
@@ -4938,12 +4921,11 @@ impl Interp {
                         })
                 });
         }
-        self.pending_dynamic_imports
-            .retain(|_, pending| pending.host_context != context);
-        self.modules
-            .retain(|key, _| crate::modules::module_map_context(key) != context);
-        self.module_recs
-            .retain(|key, _| crate::modules::module_map_context(key) != context);
+        self.cancel_load_authority(crate::agent_control::LoadAuthority {
+            agent: crate::value::heap_id(&self.gc_heap),
+            owner: self.realm_id,
+            context,
+        });
         // HTML #discard-a-document releases settings/module roots independently
         // of allocation pressure. Revisit that graph at the next safe boundary,
         // rather than charging its eventual destruction to unrelated new work.
@@ -4954,7 +4936,7 @@ impl Interp {
         // 10c): the boundary's collection is major. A collection in progress (a host
         // sweep retiring a context) leaves the request to the boundary's minor one
         // and the graph to the next major.
-        self.gc_task_pending = true;
+        self.gc_heap.agent.task_pending.set(true);
         if let Ok(mut core) = self.gc_heap.core.try_borrow_mut() {
             core.request_major();
         }
@@ -4980,7 +4962,7 @@ impl Interp {
             self.gc_pin(&main.global);
             self.realms.insert(Gc::as_ptr(&main.global) as usize, main);
         }
-        let saved = self.snapshot_realm();
+        let saved = crate::rooting::Rooted::new(self.snapshot_realm());
 
         // Fresh intrinsics, mirroring `Interp::new`. The new realm's Symbol constructor gets the
         // Agent's well-known Symbols (`Interp::well_known_symbol`), so `@@iterator` etc. match
@@ -5092,15 +5074,11 @@ impl Interp {
             ValueView::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return Err(self.throw("TypeError", "not a realm global")),
         };
-        let mut saved = match self.realms.get(&ptr) {
-            Some(r) => r.snapshot_clone(),
+        let target = match self.realms.get(&ptr) {
+            Some(realm) => realm.snapshot_clone(),
             None => return Err(self.throw("TypeError", "unknown realm")),
         };
-        self.swap_realm(&mut saved);
-        let result = body(self);
-        self.swap_realm(&mut saved);
-        self.realms.insert(ptr, saved);
-        result
+        self.with_realm_snapshot(ptr, target, body)
     }
 }
 
@@ -5165,10 +5143,16 @@ impl Interp {
         realm_global: &Value,
         operation: impl FnOnce(&mut Self) -> R,
     ) -> Result<R, Value> {
-        let (key, saved) = self.enter_embed_realm(realm_global)?;
-        let result = operation(self);
-        self.leave_embed_realm(key, saved);
-        Ok(result)
+        let key = realm_global
+            .as_obj()
+            .map(|global| Gc::as_ptr(&global) as usize)
+            .ok_or_else(|| self.make_error("TypeError", "not a realm global"))?;
+        let target = self
+            .realms
+            .get(&key)
+            .map(RealmState::snapshot_clone)
+            .ok_or_else(|| self.make_error("TypeError", "unknown realm"))?;
+        Ok(self.with_realm_snapshot(key, target, operation))
     }
 
     /// The opaque HTML environment-settings token currently associated with
@@ -5357,41 +5341,68 @@ impl Interp {
     /// same Agent (Symbols), isolated globals and intrinsics. It allocates in its parent's heap
     /// — one heap per Agent, so no edge between the two realms' objects ever crosses heaps (I6)
     /// — and the root of the ShadowRealm tree collects for all of it.
-    pub(crate) fn new_shadow(parent: &Interp, owner: &Gc) -> Interp {
+    pub(crate) fn new_shadow(parent: &Interp, owner: &Gc) -> crate::agent_access::Owned<Interp> {
+        let _unpublished = crate::agent_control::Suppression::new(&parent.gc_heap);
+        let access = parent.gc_heap.agent.access.clone();
+        let id = access.fresh_id();
         let mut realm =
             Self::new_in_heap(parent.symbol_agent.clone(), parent.gc_heap.clone(), false);
+        realm.realm_id = id;
+        let mut owners = parent.realm_route().owners.to_vec();
+        owners.push(*owner);
         realm.shadow_home = Some(ShadowHome {
             owner: Gc::downgrade(owner),
-            parent: std::ptr::null_mut(),
-            entries: 0,
+            parent: parent.realm_id,
+            route: Rc::new(crate::agent_control::Route {
+                agent: crate::value::heap_id(&parent.gc_heap),
+                target: id,
+                owners: owners.into_boxed_slice(),
+            }),
         });
-        realm
+        // Counted while `shadow_home` is set; `Drop` uncounts it.
+        let children = &parent.gc_heap.agent.children;
+        children.set(children.get() + 1);
+        if children.get() == 1 {
+            // A lone interpreter kept no owner index. Its metadata is foreign from now on.
+            for identity in parent
+                .gc_pins
+                .keys()
+                .copied()
+                .chain(parent.native_function_realms.borrow().keys().copied())
+            {
+                parent.remember_metadata_owner(identity);
+            }
+        }
+        // No callback/collection occurs between assigning identity and adoption. Include
+        // native callables as well as gc_pin owners created during unpublished bootstrap.
+        for identity in realm
+            .gc_pins
+            .keys()
+            .copied()
+            .chain(realm.native_function_realms.borrow().keys().copied())
+        {
+            realm.remember_metadata_owner(identity);
+        }
+        // Registration completes before suppression ends; the caller's table publication has
+        // no intervening safepoint. Allocation itself never collects.
+        let owner = access.adopt(id, parent.realm_id, realm);
+        debug_assert_eq!(access.parent(id), Some(parent.realm_id));
+        owner
     }
 
-    /// Enter the realm of the ShadowRealm object `realm` (None if this interpreter does not own
-    /// it). While the entry lives, code may run in the realm.
-    pub(crate) fn enter_shadow(&mut self, realm: &Gc) -> Option<ShadowEntry> {
-        let parent = self as *mut Interp;
-        let sub = self.shadow_realms.get_mut(&(Gc::as_ptr(realm) as usize))?;
-        let home = sub
-            .shadow_home
-            .as_mut()
-            .expect("a ShadowRealm's interpreter knows its owner");
-        home.parent = parent;
-        home.entries += 1;
-        let agent = sub.enter_agent();
-        Some(ShadowEntry {
-            sub: &mut **sub,
-            _owner: *realm,
-            _agent: agent,
-        })
+    /// Suspend this current borrow and run in a raw-owned child. The closure cannot export
+    /// an Interp reference; all owner/table borrows end before entering author code.
+    pub(crate) fn with_shadow<R>(
+        &mut self,
+        realm: &Gc,
+        operation: impl FnOnce(&mut Interp) -> R,
+    ) -> Option<R> {
+        let id = self.shadow_realms.get(&(Gc::as_ptr(realm) as usize))?.id();
+        Some(self.with_route(id, operation))
     }
 
-    /// Whether code in this (ShadowRealm) interpreter is running.
     pub(crate) fn shadow_entered(&self) -> bool {
-        self.shadow_home
-            .as_ref()
-            .is_some_and(|home| home.entries > 0)
+        self.gc_heap.agent.access.active(self.realm_id)
     }
 
     fn new_in_heap(
@@ -5399,6 +5410,7 @@ impl Interp {
         gc_heap: crate::value::GcHeap,
         owns_heap: bool,
     ) -> Interp {
+        let _unpublished = crate::agent_control::Suppression::new(&gc_heap);
         // Decision 0: every engine frame on this thread lies below the scanned stack top.
         crate::gc_core::register_thread_native_stack();
         #[cfg(all(test, target_os = "linux"))]
@@ -5418,9 +5430,14 @@ impl Interp {
         let symbol_proto = Object::new(Some(object_proto));
         let global = Object::new(Some(object_proto));
         let global_env = new_var_scope(None);
-        let live_object_limit = default_live_object_limit();
+        let live_object_limit = gc_heap.agent.next.get();
         let mut interp = Interp {
             gc_heap: gc_heap.clone(),
+            realm_id: if owns_heap {
+                crate::agent_access::RealmId::ROOT
+            } else {
+                crate::agent_access::RealmId::UNPUBLISHED
+            },
             symbol_agent,
             global,
             global_env,
@@ -5466,8 +5483,7 @@ impl Interp {
             module_recs: Default::default(),
             module_loader: None,
             dynamic_module_loader: None,
-            pending_dynamic_imports: Default::default(),
-            next_dynamic_import_id: 1,
+            routed_imports: Default::default(),
             module_ns: Default::default(),
             tier: match std::env::var("TRUST_JS_TIER").as_deref() {
                 Ok("interp") => crate::bytecode::Tier::Interp,
@@ -5520,9 +5536,6 @@ impl Interp {
             immutable_buffers: std::collections::HashSet::new(),
             host_keyed_buffers: std::collections::HashSet::new(),
             can_block: true,
-            pending_async_waits: Vec::new(),
-            async_wait_inbox: None,
-            pending_timers: Vec::new(),
             agent: None,
             typed_arrays: Default::default(),
             async_gens: std::collections::HashSet::new(),
@@ -5547,27 +5560,19 @@ impl Interp {
             handled_rejections: Vec::new(),
             temporal: Default::default(),
             temporal_cal: Default::default(),
-            microtasks: std::collections::VecDeque::new(),
             host_job_context: 0,
             script_entry: None,
             host_entry_realm: None,
             capture_job_script_caller: false,
+            caller_origin: None,
             host_settings_states: Default::default(),
             retired_host_job_contexts: Default::default(),
             host_job_context_enter: None,
             host_job_context_leave: None,
-            kept_alive: Vec::new(),
             host_state: Default::default(),
             generators: Default::default(),
             gc_next: live_object_limit,
-            live_object_limit,
-            gc_suppressed: 0,
-            buffer_gc: BufferPressure::default(),
             gc_tick: 0,
-            gc_task_allocated: crate::value::heap_allocated_objects(&gc_heap),
-            gc_task_live: crate::value::heap_live_objects(&gc_heap),
-            gc_task_deferred: false,
-            gc_task_pending: false,
             constructing: false,
             super_call_ok: false,
             fn_frames: Vec::new(),
@@ -5592,7 +5597,6 @@ impl Interp {
             weak_refs: Default::default(),
             weak_metadata: Default::default(),
             finalization_registries: Default::default(),
-            pending_finalization_cleanup: Default::default(),
             async_gen_busy: std::collections::HashSet::new(),
             async_gen_queue: Default::default(),
             heap_release: if owns_heap {
@@ -5641,21 +5645,21 @@ impl Interp {
     /// active: restoration first compares its identities.
     #[inline]
     pub(crate) fn with_host_callback<R>(&mut self, callback: impl FnOnce(&mut Self) -> R) -> R {
-        struct RestoreAgent(*mut Interp);
-        impl Drop for RestoreAgent {
-            fn drop(&mut self) {
-                // SAFETY: the scoped invocation keeps its exclusive Interp borrow alive and
-                // stationary. The callback's reborrow derives from this same raw pointer and
-                // has ended before Drop reads through it, including on unwind. No pointer to
-                // a sibling field is kept across the mutable callback reborrow.
-                unsafe { (&*self.0).activate_gc_heap() };
+        crate::agent_access::suspend_local(self, |pointer| {
+            struct RestoreAgent(std::ptr::NonNull<Interp>);
+            impl Drop for RestoreAgent {
+                fn drop(&mut self) {
+                    // SAFETY: callback descends from this same supplied raw capability, and its
+                    // mutable reference ended before Drop, including on unwind. No sibling
+                    // field pointer or older caller reference is resumed in this scope.
+                    unsafe {
+                        (&*self.0.as_ptr()).activate_gc_heap();
+                    }
+                }
             }
-        }
-        let interp = self as *mut Self;
-        let _restore = RestoreAgent(interp);
-        // SAFETY: the pointer comes from this call's exclusive borrow, which is not used again
-        // until this reborrow ends. Scoped host contexts cannot replace or move the Interp.
-        callback(unsafe { &mut *interp })
+            let _restore = RestoreAgent(pointer);
+            callback(unsafe { &mut *pointer.as_ptr() })
+        })
     }
 
     /// The read-only form of `with_host_callback`, requiring no raw pointers: the shared
@@ -6331,25 +6335,17 @@ impl Interp {
             None
         }
         .unwrap_or(Gc::as_ptr(&self.global) as usize);
-        let saved = self.host_entry_realm.replace(key);
-        let result = self.invoke(callee, this, args);
-        self.host_entry_realm = saved;
-        result
+        self.with_entry_context(self.script_entry, Some(key), |interp| {
+            interp.invoke(callee, this, args)
+        })
     }
 
     pub(crate) fn with_script_entry<R>(&mut self, operation: impl FnOnce(&mut Self) -> R) -> R {
-        let saved_host_entry = self.host_entry_realm;
-        // Eval does not itself prepare a new host script entry. At the outer
-        // engine boundary there is no entry yet, so the current Realm supplies it.
-        self.host_entry_realm
-            .get_or_insert(Gc::as_ptr(&self.global) as usize);
-        let saved = self
-            .script_entry
-            .replace((Gc::as_ptr(&self.global) as usize, self.fn_frames.len()));
-        let result = operation(self);
-        self.script_entry = saved;
-        self.host_entry_realm = saved_host_entry;
-        result
+        let host = self
+            .host_entry_realm
+            .or(Some(Gc::as_ptr(&self.global) as usize));
+        let script = Some((Gc::as_ptr(&self.global) as usize, self.fn_frames.len()));
+        self.with_entry_context(script, host, operation)
     }
 
     /// Invoke a host callback with a previously captured incumbent global as its fallback
@@ -6370,10 +6366,11 @@ impl Interp {
         if !self.realms.contains_key(&key) {
             return operation(self);
         }
-        let saved = self.script_entry.replace((key, self.fn_frames.len()));
-        let result = operation(self);
-        self.script_entry = saved;
-        result
+        self.with_entry_context(
+            Some((key, self.fn_frames.len())),
+            self.host_entry_realm,
+            operation,
+        )
     }
 
     /// HostMakeJobCallback. A browser host (see [`Self::capture_job_script_caller`]) saves the
@@ -6408,7 +6405,7 @@ impl Interp {
     /// The script execution context HostMakeJobCallback saves for `callback`: the active
     /// ScriptOrModule, unless the callback is an ECMAScript function with a ScriptOrModule of
     /// its own, whose function context would always be found first.
-    fn job_active_script(&self, callback: &Value) -> Option<Rc<crate::stack_trace::ScriptSource>> {
+    fn job_active_script(&self, callback: &Value) -> Option<crate::agent_control::RuntimeOrigin> {
         if let ValueView::Obj(function) = &(callback).view() {
             if let Callable::User(user) = &function.borrow().call {
                 if !user.func.self_hosted
@@ -6422,7 +6419,7 @@ impl Interp {
                 }
             }
         }
-        self.active_script_or_module()
+        self.active_runtime_origin()
     }
 
     /// HostMakeJobCallback for one of Await's built-in reaction steps (see [`InternalJob`]).
@@ -6438,7 +6435,7 @@ impl Interp {
                 ValueView::Obj(global) => Some(global),
                 _ => None,
             };
-            (script_caller, self.active_script_or_module())
+            (script_caller, self.active_runtime_origin())
         } else {
             (None, None)
         };
@@ -6461,73 +6458,53 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        let previous_entry = self.host_entry_realm;
-        if self.capture_job_script_caller {
-            let key = if let ValueView::Obj(ref object) = (callback.callback).view() {
+        let entry = if self.capture_job_script_caller {
+            let key = if let ValueView::Obj(ref object) = callback.callback.view() {
                 self.get_function_realm_global(object)?
             } else {
                 None
             }
             .unwrap_or(Gc::as_ptr(&self.global) as usize);
-            self.host_entry_realm = Some(key);
-        }
-        let result = self.with_job_script_context(callback.active_script.as_ref(), |ctx| {
-            if let Some(global) = &callback.script_caller {
-                ctx.with_callback_script_caller(&Value::Obj(*global), |ctx| {
+            Some(key)
+        } else {
+            self.host_entry_realm
+        };
+        self.with_entry_context(self.script_entry, entry, |interp| {
+            interp.with_job_script_context(callback.active_script.as_ref(), |ctx| {
+                if let Some(global) = &callback.script_caller {
+                    ctx.with_callback_script_caller(&Value::Obj(*global), |ctx| {
+                        ctx.call_callback(callback.callback, this, args)
+                    })
+                } else {
                     ctx.call_callback(callback.callback, this, args)
-                })
-            } else {
-                ctx.call_callback(callback.callback, this, args)
-            }
-        });
-        self.host_entry_realm = previous_entry;
-        result
+                }
+            })
+        })
     }
 
     /// ECMA-262 RunSuspendedContext: the source continuation becomes the topmost
     /// script context until it parks/completes, even when a foreign native
     /// Promise reaction or borrowed generator method resumes it. Ordinary calls
     /// made by the body still take precedence above this entry's frame floor.
-    pub(crate) fn with_suspended_context<R>(
+    pub(crate) fn with_suspended_context<R: crate::gc_trace::GcTrace + 'static>(
         &mut self,
         global: &Gc,
         context: u64,
         operation: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let key = Gc::as_ptr(global) as usize;
-        let saved = if !Gc::ptr_eq(global, &self.global) {
+        if !Gc::ptr_eq(global, &self.global) {
             let target = self
                 .realms
                 .get(&key)
                 .expect("a live source continuation retains its owning Realm")
                 .snapshot_clone();
-            let saved = self.snapshot_realm();
-            self.restore_realm(&target);
-            Some(saved)
+            self.with_realm_snapshot(key, target, |interp| {
+                interp.with_settings_context(context, |interp| interp.with_script_entry(operation))
+            })
         } else {
-            None
-        };
-        let previous_context = self.host_job_context;
-        let switch_context = context != previous_context;
-        if switch_context {
-            if let Some(enter) = self.host_job_context_enter {
-                self.with_host_callback(|interp| enter(interp, context));
-            }
-            self.switch_host_job_context(context);
+            self.with_settings_context(context, |interp| interp.with_script_entry(operation))
         }
-        let result = self.with_script_entry(operation);
-        if switch_context {
-            if let Some(leave) = self.host_job_context_leave {
-                self.with_host_callback(leave);
-            }
-            self.switch_host_job_context(previous_context);
-        }
-        if let Some(saved) = saved {
-            let updated = self.snapshot_realm();
-            self.realms.insert(key, updated);
-            self.restore_realm(&saved);
-        }
-        result
     }
 
     /// [[Get]] for embedders: like [`Self::get_member`] but surfaces a thrown value rather than
@@ -6586,13 +6563,22 @@ impl Interp {
         crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
         self.activate_gc_heap();
         let before = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_collect_with_cause(
+        let outcome = self.gc_collect_with_cause(
             crate::value::GcCause::Explicit,
             Some(crate::gc_core::CollectionKind::Major),
         );
         let live = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_next = self.live_object_limit;
-        self.gc_task_allocated = crate::value::heap_allocated_objects(&self.gc_heap);
+        if outcome
+            == crate::agent_control::CollectionOutcome::Collected(
+                crate::gc_core::CollectionKind::Major,
+            )
+        {
+            self.set_agent_next(self.gc_heap.agent.limit.get());
+            self.gc_heap
+                .agent
+                .task_allocated
+                .set(crate::value::heap_allocated_objects(&self.gc_heap));
+        }
         before.saturating_sub(live)
     }
 
@@ -6649,7 +6635,7 @@ impl Interp {
 
     /// Execute all currently queued promise reaction jobs synchronously.
     pub fn drain_microtasks_for_host(&mut self) {
-        self.drain_microtasks();
+        self.drain_promise_jobs_for_host();
     }
 
     /// The `[[Prototype]]` slot of `ToObject(v)` without running author code: an object's stored
@@ -7327,6 +7313,7 @@ impl Interp {
     }
 
     pub(crate) fn register_native_realm(&self, function: &Gc) {
+        self.remember_metadata_owner(Gc::as_ptr(function) as usize);
         self.native_function_realms.borrow_mut().register(
             &self.gc_heap,
             function,
@@ -7342,12 +7329,10 @@ impl Interp {
         if self.eval_realm_fns.contains(&key) {
             return false;
         }
-        !self.multi_realm()
-            || self
-                .native_function_realms
-                .borrow()
-                .get(&key)
-                .is_some_and(|(_, realm)| *realm == Gc::as_ptr(&self.global) as usize)
+        self.native_function_realms
+            .borrow()
+            .get(&key)
+            .is_some_and(|(_, realm)| *realm == Gc::as_ptr(&self.global) as usize)
     }
 
     /// Create a minimal callable `[[IsHTMLDDA]]` exotic (ECMA-262 Annex B.3.6): falsy, `typeof`
@@ -8056,6 +8041,12 @@ impl Interp {
                 func.clone(),
                 self_env.as_ref().cloned().unwrap_or(env),
                 Gc::as_ptr(&self.global) as usize,
+                if func.self_hosted {
+                    None
+                } else {
+                    self.active_runtime_origin()
+                },
+                self.realm_id,
             );
             b.props = fn_map;
         }
@@ -9441,8 +9432,7 @@ impl Interp {
 
     #[inline]
     fn side_table_ordinary_get_ptr(&self, ptr: usize) -> bool {
-        (self.typed_arrays.is_empty() || !self.typed_arrays.contains_key(&ptr))
-            && self.side_table_non_typed_ordinary_get_ptr(ptr)
+        self.typed_array_at(ptr).is_none() && self.side_table_non_typed_ordinary_get_ptr(ptr)
     }
 
     /// An object whose [[Get]]/[[Set]] behavior lives in an interpreter side table (Proxy,
@@ -9471,10 +9461,24 @@ impl Interp {
 
     #[inline]
     fn side_table_non_typed_ordinary_get_ptr(&self, ptr: usize) -> bool {
+        if !self.single_interpreter() {
+            return self.agent_side_table_non_typed_ordinary_get_ptr(ptr);
+        }
         (self.proxies.is_empty() || !self.proxies.contains_key(&ptr))
             && (self.module_ns.is_empty() || !self.module_ns.contains_key(&ptr))
             && (self.deferred_ns.is_empty() || !self.deferred_ns.contains_key(&ptr))
             && (self.host_indexed.is_empty() || !self.host_indexed.contains_key(&ptr))
+    }
+
+    /// The same probe when another interpreter may own the side-table entry.
+    #[inline(never)]
+    fn agent_side_table_non_typed_ordinary_get_ptr(&self, ptr: usize) -> bool {
+        self.proxy_at(ptr).is_none()
+            && !self.is_namespace(ptr)
+            && !self.is_deferred_namespace(ptr)
+            && self
+                .metadata_owner(ptr, |interp, key| interp.host_indexed.contains_key(&key))
+                .is_none()
     }
 
     /// Number of contiguous Web IDL supported property indices on `object`, if installed.
@@ -9542,25 +9546,33 @@ impl Interp {
     /// (every prototype-chain hop asks).
     #[inline(always)]
     pub(crate) fn proxy_at(&self, ptr: usize) -> Option<(Value, Value)> {
-        if self.proxies.is_empty() {
-            return None;
+        if !self.proxies.is_empty() {
+            if let Some(proxy) = self.proxies.get(&ptr) {
+                return Some(*proxy);
+            }
         }
-        self.proxies.get(&ptr).cloned()
+        let owner =
+            self.foreign_metadata_owner(ptr, |interp, key| interp.proxies.contains_key(&key))?;
+        self.with_realm_view(owner, |interp| interp.proxies.get(&ptr).cloned())
     }
 
     /// The TypedArray state of `ptr`, skipping the table probe when no TypedArray exists: the
     /// [[Get]]/[[Set]] slow paths ask for every object.
     #[inline(always)]
     pub(crate) fn typed_array_at(&self, ptr: usize) -> Option<TaInfo> {
-        if self.typed_arrays.is_empty() {
-            return None;
+        if !self.typed_arrays.is_empty() {
+            if let Some(info) = self.typed_arrays.get(&ptr) {
+                return Some(*info);
+            }
         }
-        self.typed_arrays.get(&ptr).copied()
+        let owner =
+            self.foreign_metadata_owner(ptr, |interp, key| interp.typed_arrays.contains_key(&key))?;
+        self.with_realm_view(owner, |interp| interp.typed_arrays.get(&ptr).copied())
     }
 
     #[inline(always)]
     pub(crate) fn defer_trigger(&mut self, o: &Gc, key: Option<&str>) -> Result<(), Abrupt> {
-        if self.deferred_ns.is_empty() {
+        if self.deferred_ns.is_empty() && self.single_interpreter() {
             return Ok(());
         }
         self.defer_trigger_slow(o, key)
@@ -9570,11 +9582,14 @@ impl Interp {
         if matches!(key, Some(k) if Interp::is_sym_key(k) || k == "then") {
             return Ok(());
         }
-        let module_key = match self.deferred_ns.get(&(Gc::as_ptr(o) as usize)) {
-            Some(k) => k.clone(),
-            None => return Ok(()),
+        let ptr = Gc::as_ptr(o) as usize;
+        let Some(owner) =
+            self.metadata_owner(ptr, |interp, ptr| interp.deferred_ns.contains_key(&ptr))
+        else {
+            return Ok(());
         };
-        self.evaluate_deferred(&module_key)
+        let module_key = self.with_realm_view(owner, |interp| interp.deferred_ns[&ptr].clone());
+        self.with_route(owner, |owner| owner.evaluate_deferred(&module_key))
     }
 
     pub(crate) fn get_member_recv(
@@ -9595,7 +9610,7 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         // An `import defer` namespace evaluates its module on string-keyed access.
         if let ValueView::Obj(o) = &(base).view() {
-            if self.deferred_ns.contains_key(&(Gc::as_ptr(o) as usize)) {
+            if self.is_deferred_namespace(Gc::as_ptr(o) as usize) {
                 let shape = o.borrow().props.shape();
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(
@@ -9723,30 +9738,21 @@ impl Interp {
                         }
                     }
                 }
-                // Module namespace: exports read live from the exporting module's scope (or a stored
-                // static value for a star-as namespace re-export).
-                if !self.module_ns.is_empty() {
-                    if let Some(map) = self.module_ns.get(&ptr) {
-                        if let Some(binding) = map.get(key) {
-                            if let Some(trace) = trace.as_deref_mut() {
-                                trace.record(
-                                    crate::feedback::PropertyOutcome::Exotic,
-                                    Some(o.borrow().props.shape()),
-                                    0,
-                                    None,
-                                );
-                            }
-                            match binding.clone() {
-                                crate::modules::NsBinding::Live(mod_env, local) => {
-                                    return self.get_var(&local, &mod_env);
-                                }
-                                crate::modules::NsBinding::Static(v) => return Ok(v),
-                            }
-                        }
+                // Copy only the actual live binding descriptor from its metadata owner.
+                // Binding reads and their errors still belong to this executing algorithm.
+                if let Some(property) = self.namespace_own_property(ptr, key) {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(o.borrow().props.shape()),
+                            0,
+                            None,
+                        );
                     }
+                    return property.map(|property| property.value());
                 }
                 // Proxy: invoke the `get` trap, or forward to the target.
-                if !self.proxies.is_empty() {
+                {
                     if let Some((target, handler)) = self.proxy_at(ptr) {
                         if let Some(trace) = trace.as_deref_mut() {
                             trace.record(
@@ -10107,14 +10113,14 @@ impl Interp {
 
     /// Throw with the constructing caller's realm's error intrinsics (see `ctor_caller_realm`).
     fn throw_in_caller_realm(&mut self, kind: &str, msg: &str) -> Abrupt {
-        match self.ctor_caller_realm.take() {
+        match self
+            .ctor_caller_realm
+            .as_ref()
+            .map(RealmState::snapshot_clone)
+        {
             Some(caller) => {
-                let cur = self.snapshot_realm();
-                self.restore_realm(&caller);
-                let e = self.throw(kind, msg);
-                self.restore_realm(&cur);
-                self.ctor_caller_realm = Some(caller);
-                e
+                let key = Gc::as_ptr(&caller.global) as usize;
+                self.with_realm_snapshot(key, caller, |interp| interp.throw(kind, msg))
             }
             None => self.throw(kind, msg),
         }
@@ -10232,11 +10238,9 @@ impl Interp {
     /// its temporal dead zone throws ReferenceError (per the namespace [[GetOwnProperty]] step).
     fn ns_probe_tdz(&mut self, ptr: usize, key: &str) -> Result<(), Abrupt> {
         let live = self
-            .module_ns
-            .get(&ptr)
-            .and_then(|map| map.get(key))
-            .and_then(|b| match b {
-                crate::modules::NsBinding::Live(env, local) => Some((*env, local.clone())),
+            .namespace_binding(ptr, key)
+            .and_then(|binding| match binding {
+                crate::modules::NsBinding::Live(env, local) => Some((env, local)),
                 _ => None,
             });
         if let Some((env, local)) = live {
@@ -10490,7 +10494,7 @@ impl Interp {
             return Ok(false);
         }
         // Proxy: invoke the `set` trap, or forward to the target.
-        if !self.proxies.is_empty() {
+        {
             if let Some((target, handler)) = self.proxy_at(ptr) {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(
@@ -11415,21 +11419,25 @@ impl Interp {
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
         // The due word JIT polls read is the core's `collection_due` (debug builds).
         crate::value::debug_assert_due_word(&self.gc_heap);
-        if self.gc_suppressed != 0 {
+        if self.gc_heap.agent.suppressed.get() != 0 {
             return Ok(());
         }
         self.gc_weak_metadata_safepoint(false);
         // Only a collection the ceiling makes due enforces the limit: GC stress and the cell
         // heap's budgets also collect here, and must not throw again inside the handler that
         // the room set below lets allocate.
-        let over_ceiling = crate::value::heap_live_objects(&self.gc_heap) > self.gc_next;
+        let over_ceiling =
+            crate::value::heap_live_objects(&self.gc_heap) > self.gc_heap.agent.next.get();
         if !over_ceiling && !self.gc_heap_due() {
             return Ok(());
         }
         // A minor collection would leave the old dead counted: the limit is enforced after a
         // major one.
         let kind = over_ceiling.then_some(crate::gc_core::CollectionKind::Major);
-        self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold, kind);
+        let outcome = self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold, kind);
+        if outcome == crate::agent_control::CollectionOutcome::Deferred {
+            return Ok(());
+        }
         let live = crate::value::heap_live_objects(&self.gc_heap);
         if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
             eprintln!(
@@ -11441,93 +11449,77 @@ impl Interp {
                 self.generators.len()
             );
         }
-        if over_ceiling && live > self.live_object_limit {
+        if over_ceiling && live > self.gc_heap.agent.limit.get() {
             // Leave the handler that catches this error room to allocate (its error object,
             // messages, cleanup) before the next safepoint collects again. Without the room,
             // the very first allocation in the `catch` block would rerun the full collection
             // and throw again, so the error could never be handled in practice.
-            self.gc_next = live.saturating_add(LIMIT_ERROR_HANDLER_ROOM);
+            self.set_agent_next(live.saturating_add(LIMIT_ERROR_HANDLER_ROOM));
             return Err(self.throw("RangeError", "allocation limit exceeded"));
         }
-        // Under the limit again, the ceiling is the limit. The collector sets it so too, unless
-        // it deferred or this is a ShadowRealm's interpreter, which leaves collecting to the
-        // root. A collection the ceiling did not make due keeps the ceiling the collector left.
+        // A completed collection below the limit restores the shared ceiling. Collections
+        // not caused by the ceiling preserve the Agent's existing handler allowance.
         if over_ceiling {
-            self.gc_next = self.live_object_limit;
+            self.set_agent_next(self.gc_heap.agent.limit.get());
         }
         Ok(())
     }
 
-    /// ClearKeptObjects and host-owned temporary native roots share a job boundary. Neither may
-    /// run during an active synchronous evaluation (ECMA-262 #sec-weakref-invariants).
-    pub(crate) fn clear_kept_objects(&mut self) {
-        self.kept_alive.clear();
-        self.host_state.end_job();
-    }
-
-    /// Collect after a high-pressure host task, when temporary roots from that task have gone away.
-    /// Allocation safepoints alone cannot see this transition: a graph may be reachable during
-    /// every in-task collection and become garbage only as the callback returns.
+    /// Optional collection after a completed outer checkpoint. ClearKeptObjects/host leases
+    /// are released by the checkpoint independently of this optional scheduling policy.
     pub(crate) fn gc_task_boundary(&mut self) -> i64 {
-        if self.gc_suppressed != 0 {
+        let heap = self.gc_heap.clone();
+        if heap.agent.suppressed.get() != 0 || heap.agent.execution_depth.get() != 0 {
             return 0;
         }
-        // ClearKeptObjects (ECMA-262 §9.10): the synchronous job that established WeakRef
-        // read consistency has ended before a host task-boundary collection may run.
-        self.clear_kept_objects();
         self.gc_weak_metadata_safepoint(true);
-        let allocated = crate::value::heap_allocated_objects(&self.gc_heap);
-        let churn = allocated.wrapping_sub(self.gc_task_allocated);
-        self.gc_task_allocated = allocated;
-        let before = crate::value::heap_live_objects(&self.gc_heap);
+        let allocated = crate::value::heap_allocated_objects(&heap);
+        let churn = allocated.wrapping_sub(heap.agent.task_allocated.replace(allocated));
+        let before = crate::value::heap_live_objects(&heap);
+        let previous = heap.agent.task_live.get();
         let floor = GC_TASK_ALLOCATION_TRIGGER as i64;
-        // Marking an entire retained scene after every 10k transient allocations
-        // makes animation pauses proportional to the scene. Collect once growth
-        // reaches 1/8 of the last live set, or one task allocates half that set
-        // (covering graphs released after an in-task collection). The 10k floor
-        // preserves prompt collection on small heaps; growth also catches garbage
-        // accumulated across many smaller tasks.
-        // ECMA-262 #sec-liveness permits this scheduling choice. ClearKeptObjects
-        // above still runs at every job boundary, independently of collection.
-        let growth = before.saturating_sub(self.gc_task_live);
-        self.gc_task_pending |= growth >= (self.gc_task_live / 8).max(floor)
-            || churn >= (self.gc_task_live / 2).max(floor) as u64;
-        // ECMA-262 #sec-liveness leaves collection scheduling to the host.
-        // Preserve the pressure request across deferred checkpoints, including
-        // a high-churn task whose temporary graph has just become unreachable.
-        // ClearKeptObjects above is NEVER deferred with the optional scan.
-        if !self.gc_task_pending || self.gc_task_deferred {
+        let growth = before.saturating_sub(previous);
+        heap.agent.task_pending.set(
+            heap.agent.task_pending.get()
+                || growth >= (previous / 8).max(floor)
+                || churn >= (previous / 2).max(floor) as u64,
+        );
+        if !heap.agent.task_pending.get() || heap.agent.task_deferred.get() {
             return 0;
         }
-        // Minor, unless a major collection is due: what a task leaves is mostly young garbage.
         self.gc_collect_with_cause(crate::value::GcCause::TaskBoundary, None);
-        let live = crate::value::heap_live_objects(&self.gc_heap);
+        let live = crate::value::heap_live_objects(&heap);
         if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
-            eprintln!(
-                "[gc-task] live={live} reclaimed={} realms={} templates={} pins={} host_settings={} coroutines={}",
-                before.saturating_sub(live),
-                self.realms.len(),
-                self.template_cache.len(),
-                self.gc_pins.len(),
-                self.host_settings_states.len(),
-                self.generators.len()
-            );
+            eprintln!("[gc-task] live={live} reclaimed={} realms={} templates={} pins={} host_settings={} coroutines={}",
+                before.saturating_sub(live), self.realms.len(), self.template_cache.len(),
+                self.gc_pins.len(), self.host_settings_states.len(), self.generators.len());
         }
-        self.gc_next = self.live_object_limit;
         before.saturating_sub(live)
     }
 
     pub fn suspend_gc(&mut self) {
-        self.gc_suppressed = self.gc_suppressed.saturating_add(1);
+        self.gc_heap
+            .agent
+            .suppressed
+            .set(self.gc_heap.agent.suppressed.get().saturating_add(1));
     }
 
     pub fn resume_gc(&mut self) {
-        self.gc_suppressed = self.gc_suppressed.saturating_sub(1);
+        self.gc_heap
+            .agent
+            .suppressed
+            .set(self.gc_heap.agent.suppressed.get().saturating_sub(1));
     }
 
     /// Pin `o` for the lifetime of its side-table entries (see `gc_pins`).
     pub(crate) fn gc_pin(&mut self, o: &Gc) {
-        self.gc_pins.insert(Gc::as_ptr(o) as usize, *o);
+        let owner = Gc::as_ptr(o) as usize;
+        // All callers install native metadata, a Realm group, or a template/namespace owner;
+        // cache keys and weak targets use separate registries. Attaching new ownership to an
+        // OLD object is still a changed conditional edge, including before child publication.
+        self.gc_heap.records.borrow_mut().remember_owner(owner);
+        self.remember_metadata_owner(owner);
+        self.gc_pins.insert(owner, *o);
     }
 
     /// A regex-ready view of `s`, cached by string identity: repeated exec/replace/split over the
@@ -11594,6 +11586,7 @@ impl Interp {
         garbage_objects: &crate::gc_sweep::DeadObjects<'_>,
         native: &crate::gc_native::NativeGcGraph,
         kind: crate::gc_core::CollectionKind,
+        retired: &mut Vec<crate::agent_access::Owned<Interp>>,
     ) {
         self.host_state
             .sweep_gc_with_native(&|id| native.is_live(id));
@@ -11627,7 +11620,7 @@ impl Interp {
         // Small dead sets keep directed removal; dense churn scans each table only once.
         // Dead cells stay intact until the heap frees them after this sweep, and weak targets
         // were cleared above.
-        self.gc_evict_dead_owners(garbage_objects);
+        self.gc_evict_dead_owners(garbage_objects, retired);
     }
 
     /// I8: every interpreter field, classified by what it keeps about objects that may die, so
@@ -11635,7 +11628,11 @@ impl Interp {
     /// address evicts a dead object's entries here: a later object at the same address must
     /// not inherit them. Every other field keeps its keys alive, pins them weakly, is swept by
     /// an earlier step, or is not keyed by object addresses.
-    fn gc_evict_dead_owners(&mut self, dead: &crate::gc_sweep::DeadObjects<'_>) {
+    fn gc_evict_dead_owners(
+        &mut self,
+        dead: &crate::gc_sweep::DeadObjects<'_>,
+        retired: &mut Vec<crate::agent_access::Owned<Interp>>,
+    ) {
         let _evicting = crate::gc_sweep::Evicting::enter();
         let Interp {
             // Keyed by an object's address: evicted below.
@@ -11706,6 +11703,7 @@ impl Interp {
             // Not keyed by object addresses: intrinsics and roots, execution state, counters, and
             // tables keyed by shapes, names, ids, source text or AST nodes.
             gc_heap: _,
+            realm_id: _,
             global: _,
             global_env: _,
             object_proto: _,
@@ -11762,13 +11760,9 @@ impl Interp {
             module_recs: _,
             module_loader: _,
             dynamic_module_loader: _,
-            pending_dynamic_imports: _,
-            next_dynamic_import_id: _,
+            routed_imports,
             extra_protos: _,
             can_block: _,
-            pending_async_waits: _,
-            async_wait_inbox: _,
-            pending_timers: _,
             agent: _,
             global_var_names: _,
             regexp_programs: _,
@@ -11777,24 +11771,16 @@ impl Interp {
             ctor_caller_realm: _,
             next_unhandled_rejection: _,
             handled_rejections: _,
-            microtasks: _,
             host_job_context: _,
             script_entry: _,
             host_entry_realm: _,
             capture_job_script_caller: _,
+            caller_origin: _,
             retired_host_job_contexts: _,
             host_job_context_enter: _,
             host_job_context_leave: _,
-            kept_alive: _,
             gc_next: _,
-            live_object_limit: _,
-            gc_suppressed: _,
-            buffer_gc: _,
             gc_tick: _,
-            gc_task_allocated: _,
-            gc_task_live: _,
-            gc_task_deferred: _,
-            gc_task_pending: _,
             constructing: _,
             super_call_ok: _,
             fn_frames: _,
@@ -11812,7 +11798,6 @@ impl Interp {
             deferred_ns_objs: _,
             borrowed_parameters: _,
             module_source_objs: _,
-            pending_finalization_cleanup: _,
             heap_release: _,
         } = self;
         class_info.evict_dead(dead);
@@ -11840,7 +11825,7 @@ impl Interp {
                 .collect();
             for owner in collected {
                 if let Some(realm) = shadow_realms.remove(&owner) {
-                    drop_collected_realm(realm);
+                    retired.push(realm);
                 }
             }
         }
@@ -11850,6 +11835,7 @@ impl Interp {
         crate::gc_sweep::set(async_gens, dead);
         crate::gc_sweep::set(async_gen_busy, dead);
         async_gen_queue.evict_dead(dead);
+        routed_imports.evict_dead(dead);
         mapped_arguments.evict_dead(dead);
         construct_capacity_hints.evict_dead(dead);
         crate::gc_sweep::map(deferred_ns, dead);
@@ -11921,42 +11907,77 @@ impl Interp {
     /// as much again. Called before the data block is allocated, where a collection is a
     /// safepoint like any allocation of the buffer object itself.
     pub(crate) fn note_buffer_allocation(&mut self, len: usize) {
-        self.buffer_gc.since_gc = self.buffer_gc.since_gc.saturating_add(len);
-        if self.buffer_gc.since_gc <= self.buffer_gc.trigger || self.gc_suppressed != 0 {
+        let agent = &self.gc_heap.agent;
+        let mut pressure = agent.buffers.get();
+        pressure.since_gc = pressure.since_gc.saturating_add(len);
+        agent.buffers.set(pressure);
+        if pressure.since_gc <= pressure.trigger || agent.suppressed.get() != 0 {
             return;
         }
-        self.gc_collect_with_cause(
+        let outcome = self.gc_collect_with_cause(
             crate::value::GcCause::AllocationThreshold,
             Some(crate::gc_core::CollectionKind::Major),
         );
+        // A deferred collection keeps the debt for the next safepoint; only a completed major
+        // collection (which reset the count) measures what survived it.
+        if outcome
+            != crate::agent_control::CollectionOutcome::Collected(
+                crate::gc_core::CollectionKind::Major,
+            )
+        {
+            return;
+        }
+        let retained = self.agent_retained_buffer_bytes();
+        let agent = &self.gc_heap.agent;
+        let mut pressure = agent.buffers.get();
+        pressure.trigger = retained.max(BUFFER_GC_TRIGGER);
+        agent.buffers.set(pressure);
+    }
+
+    /// Buffer data every interpreter of this Agent still holds. A surviving SharedArrayBuffer
+    /// retains its Shared Data Block; each block counts once, however many buffers (in however
+    /// many Realms) alias it.
+    fn agent_retained_buffer_bytes(&mut self) -> usize {
         let mut local = 0usize;
         let mut blocks = crate::fasthash::FastSet::default();
-        for data in self.array_buffers.values() {
-            match data {
-                BufferData::Local(bytes) => {
-                    local += bytes.try_borrow().map_or(0, |bytes| bytes.len());
-                }
-                // A surviving SharedArrayBuffer retains its Shared Data Block. Count each block
-                // once, however many buffers alias it.
-                BufferData::Shared(block) => {
-                    blocks.insert(block.id());
+        let access = self.gc_heap.agent.access.clone();
+        self.with_raw_access(|_| {
+            for (_, pointer) in access.snapshot() {
+                // SAFETY: a shared visit after the requester published its current lineage;
+                // nothing here runs JavaScript, collects or keeps a table reference.
+                let interp = unsafe { &*pointer.as_ptr() };
+                for data in interp.array_buffers.values() {
+                    match data {
+                        BufferData::Local(bytes) => {
+                            local += bytes.try_borrow().map_or(0, |bytes| bytes.len());
+                        }
+                        BufferData::Shared(block) => {
+                            blocks.insert(block.id());
+                        }
+                    }
                 }
             }
-        }
+        });
         let shared: usize = blocks
             .into_iter()
             .filter_map(shared_mem_get)
             .map(|block| block.lock().unwrap().len())
             .sum();
-        self.buffer_gc.trigger = local.saturating_add(shared).max(BUFFER_GC_TRIGGER);
+        local.saturating_add(shared)
+    }
+
+    /// Account for host-allocated data an ArrayBuffer can expose (a WebAssembly memory's
+    /// initial or grown pages), exactly like an engine allocation of that many buffer bytes.
+    pub(crate) fn note_external_buffer_growth(&mut self, len: usize) {
+        if len != 0 {
+            self.note_buffer_allocation(len);
+        }
     }
 
     /// A data block could not be allocated: collect everything unreachable (discarded buffers
     /// included) before the caller retries once.
     pub(crate) fn collect_for_failed_allocation(&mut self) {
-        if self.gc_suppressed == 0 {
-            self.gc_collect();
-        }
+        self.gc_collect();
     }
 
     /// Collect for `cause`: a collection of `kind`, or with `None` of the kind the heap asks for
@@ -11965,11 +11986,7 @@ impl Interp {
         &mut self,
         cause: crate::value::GcCause,
         kind: Option<crate::gc_core::CollectionKind>,
-    ) {
-        // ArrayBuffer data counts from the last major collection (see `gc_heap_after_sweep`).
-        if kind == Some(crate::gc_core::CollectionKind::Major) {
-            self.buffer_gc.since_gc = 0;
-        }
+    ) -> crate::agent_control::CollectionOutcome {
         match (cause, kind) {
             (crate::value::GcCause::Explicit, Some(kind)) => self.gc_heap_collect_explicit(kind),
             _ => self.gc_heap_collect(cause, kind),
@@ -12082,7 +12099,7 @@ impl Interp {
         let step = crate::builtins::intrinsic_iterator_step(native)?;
         // `ic_plain` excludes a Proxy without a table lookup.
         if !self.ordinary_get_ptr(Gc::as_ptr(&object) as usize)
-            || (self.multi_realm() && self.callee_realm_global(&object).is_some())
+            || self.callee_realm_global(&object).is_some()
         {
             return None;
         }
@@ -12185,11 +12202,11 @@ impl Interp {
         // and proxy target links always lead toward an already-created object,
         // so this iterative traversal cannot form a target cycle.
         loop {
-            if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&cur) as usize)) {
+            if let Some((target, handler)) = self.proxy_at(Gc::as_ptr(&cur) as usize) {
                 if matches!((handler).view(), ValueView::Null) {
                     return Err(self.throw("TypeError", "proxy has been revoked"));
                 }
-                match (target.clone()).view() {
+                match target.view() {
                     ValueView::Obj(t) => {
                         cur = t;
                         continue;
@@ -12231,20 +12248,22 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        // A cross-realm callee runs with its own realm's intrinsics active (so a thrown TypeError,
-        // a fresh object's prototype, or a global lookup lands in the right realm).
-        if self.multi_realm() {
-            if let ValueView::Obj(o) = &(callee).view() {
-                // A proxy's trap machinery runs in the caller's realm (the trap-arguments array is
-                // a caller-realm Array); invoking the trap function swaps on its own.
-                if !self.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
-                    if let Some(gptr) = self.callee_realm_global(o) {
-                        let mut saved = self.realms[&gptr].snapshot_clone();
-                        self.swap_realm(&mut saved);
-                        let r = self.call_dispatch(callee, this, args);
-                        self.swap_realm(&mut saved);
-                        self.realms.insert(gptr, saved);
-                        return r;
+        // With one Realm and one interpreter, every callee already runs in the active Realm.
+        let foreign_possible = self.multi_realm() || !self.single_interpreter();
+        if let Some(object) = callee.as_obj().filter(|_| foreign_possible) {
+            // Proxy and Bound abstract-operation ordering stays in the caller. Their eventual
+            // trap/target call goes through this same actual callable-Realm funnel.
+            if self.proxy_at(Gc::as_ptr(&object) as usize).is_none() {
+                if let Some((owner, realm)) = self.callable_home(&object) {
+                    if owner != self.realm_id {
+                        return self
+                            .with_route(owner, |target| target.call_inner(callee, this, args));
+                    }
+                    if realm != Gc::as_ptr(&self.global) as usize {
+                        let state = self.realms[&realm].snapshot_clone();
+                        return self.with_realm_snapshot(realm, state, |target| {
+                            target.call_dispatch(callee, this, args)
+                        });
                     }
                 }
             }
@@ -12252,44 +12271,74 @@ impl Interp {
         self.call_dispatch(callee, this, args)
     }
 
+    /// Only actual User/native and wrapped callables own a direct [[Realm]]. Bound/Proxy target
+    /// unwrapping belongs to their abstract operations, not an eager owner switch.
+    pub(crate) fn callable_home(
+        &self,
+        object: &Gc,
+    ) -> Option<(crate::agent_access::RealmId, usize)> {
+        let realm = {
+            let body = object.borrow();
+            match &body.call {
+                Callable::User(user) => user.realm,
+                // ShadowRealm WrappedFunctionCreate gives a wrapper its caller Realm's
+                // %Function.prototype%; that Realm is the wrapper's [[Realm]] (one of ours).
+                Callable::WrappedShadow(_) | Callable::WrappedCross(_) => {
+                    let realm = self
+                        .wrapper_prototype_realm(body.proto)
+                        .unwrap_or(Gc::as_ptr(&self.global) as usize);
+                    return Some((self.realm_id, realm));
+                }
+                call if call.is_native() => {
+                    let key = Gc::as_ptr(object) as usize;
+                    let owner = self.metadata_owner(key, |interp, key| {
+                        interp.native_function_realms.borrow().contains_key(&key)
+                    })?;
+                    self.with_realm_view(owner, |interp| {
+                        interp
+                            .native_function_realms
+                            .borrow()
+                            .get(&key)
+                            .map(|(_, realm)| *realm)
+                    })?
+                }
+                _ => return None,
+            }
+        };
+        // The active Realm is this interpreter's own: no table probe on the common path.
+        if realm == Gc::as_ptr(&self.global) as usize {
+            return Some((self.realm_id, realm));
+        }
+        let owner = self.metadata_owner(realm, |interp, key| interp.realms.contains_key(&key))?;
+        Some((owner, realm))
+    }
+
     /// The realm (keyed by its global's pointer) a function belongs to, when it is NOT the active
     /// realm. A user function's immutable [[Realm]] is recorded at creation; its lexical
     /// environment and mutable [[Prototype]] do not determine that identity. Other callables
     /// retain their existing native registration/prototype lookup.
     pub(crate) fn callee_realm_global(&self, obj: &Gc) -> Option<usize> {
-        if let Callable::User(user) = &obj.borrow().call {
-            // ECMA-262 e28783d5 GetFunctionRealm / PrepareForOrdinaryCall use [[Realm]].
-            // User callables are freshly allocated by make_fn, never native registrations.
-            // Host settings may replace the active global environment, and author code may
-            // replace [[Prototype]]; neither changes this immutable creation identity.
-            // An author closure's Env chain retains its defining global scope's immutable
-            // internal `this` binding. That edge keeps the Realm global live through GC even
-            // after host settings replace the RealmState's current global environment.
-            let realm = user.realm;
-            return (realm != Gc::as_ptr(&self.global) as usize
-                && self.realms.contains_key(&realm))
-            .then_some(realm);
+        // One Realm and one interpreter: every callable belongs to the active Realm.
+        if !self.multi_realm() && self.single_interpreter() {
+            return None;
         }
-        if let Some((_, realm)) = self
-            .native_function_realms
-            .borrow()
-            .get(&(Gc::as_ptr(obj) as usize))
-        {
-            return (*realm != Gc::as_ptr(&self.global) as usize
-                && self.realms.contains_key(realm))
-            .then_some(*realm);
+        if let Some((_, realm)) = self.callable_home(obj) {
+            return (realm != Gc::as_ptr(&self.global) as usize).then_some(realm);
         }
-        let mut cur = obj.borrow().proto;
+        self.wrapper_prototype_realm(obj.borrow().proto)
+            .filter(|&realm| realm != Gc::as_ptr(&self.global) as usize)
+    }
+
+    /// The Realm whose %Function.prototype% a callable's prototype chain reaches first.
+    fn wrapper_prototype_realm(&self, proto: Option<Gc>) -> Option<usize> {
+        let mut cur = proto;
         let mut hops = 0;
         while let Some(p) = cur {
             if Gc::ptr_eq(&p, &self.function_proto) {
-                return None;
+                return Some(Gc::as_ptr(&self.global) as usize);
             }
             for (g, rs) in &self.realms {
                 if Gc::ptr_eq(&p, &rs.function_proto) {
-                    if Gc::ptr_eq(&rs.function_proto, &self.function_proto) {
-                        return None;
-                    }
                     return Some(*g);
                 }
             }
@@ -12343,9 +12392,8 @@ impl Interp {
         // recursion in the interpreter and bytecode tiers stays abortable (HTML §8.1.4.5).
         self.interrupt_poll()?;
         // Proxy with an `apply` trap (or forward to the target).
-        if !self.proxies.is_empty() {
-            if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&obj) as usize)).cloned()
-            {
+        {
+            if let Some((target, handler)) = self.proxy_at(Gc::as_ptr(&obj) as usize) {
                 // ProxyCreate step 5 gives a proxy [[Call]] only when its target is callable,
                 // and Call step 2 throws before any trap is read (ECMA-262, local e28783d).
                 if matches!(obj.borrow().call, Callable::None) {
@@ -12439,11 +12487,14 @@ impl Interp {
                 let target = cross.target;
                 // A cross wrapper runs only in its own realm, entered from its parent.
                 let (realm, parent) = {
+                    assert!(
+                        self.shadow_entered(),
+                        "a cross-realm wrapper runs in its entered ShadowRealm"
+                    );
                     let home = self
                         .shadow_home
                         .as_ref()
-                        .filter(|home| home.entries > 0)
-                        .expect("a cross-realm wrapper runs in its entered ShadowRealm");
+                        .expect("a ShadowRealm knows its parent");
                     let realm = home
                         .owner
                         .upgrade()
@@ -12452,7 +12503,7 @@ impl Interp {
                 };
                 if std::env::var("TRUST_JS_DBG").is_ok() {
                     eprintln!(
-                        "DBG cross enter realm={:p} parent={parent:p} self={:p} tkind={}",
+                        "DBG cross enter realm={:p} parent={parent:?} self={:p} tkind={}",
                         Gc::as_ptr(&realm),
                         self as *const Interp,
                         match &(target).view() {
@@ -12467,9 +12518,6 @@ impl Interp {
                         }
                     );
                 }
-                // SAFETY: the parent entered this realm (`enter_shadow` recorded its address)
-                // and is suspended in that call, not mutably borrowed, while code here runs.
-                let host: &mut Interp = unsafe { &mut *parent };
                 for a in args {
                     if matches!(&(a).view(), ValueView::Obj(_)) && !a.is_callable() {
                         return Err(self.throw(
@@ -12478,19 +12526,20 @@ impl Interp {
                         ));
                     }
                 }
-                let host_result = (|| -> Result<Result<Value, Abrupt>, ()> {
-                    let _agent = host.enter_agent();
-                    // Wrapping copies name/length, which can run getters (I1).
-                    let mut out_args = crate::rooting::RootedVec::new();
-                    for a in args {
-                        if a.is_callable() {
-                            out_args.push(host.make_wrapped_shadow(&realm, *a).map_err(|_| ())?);
-                        } else {
-                            out_args.push(*a);
+                let host_result =
+                    self.with_route(parent, |host| -> Result<Result<Value, Abrupt>, ()> {
+                        // Wrapping copies name/length, which can run getters (I1).
+                        let mut out_args = crate::rooting::RootedVec::new();
+                        for a in args {
+                            if a.is_callable() {
+                                out_args
+                                    .push(host.make_wrapped_shadow(&realm, *a).map_err(|_| ())?);
+                            } else {
+                                out_args.push(*a);
+                            }
                         }
-                    }
-                    Ok(host.call(target, Value::Undefined, &out_args))
-                })();
+                        Ok(host.call(target, Value::Undefined, &out_args))
+                    });
                 let host_result = match host_result {
                     Ok(result) => result,
                     Err(()) => {
@@ -12602,12 +12651,6 @@ impl Interp {
         }
     }
 
-    /// The namespace object of a loaded module (for ShadowRealm.importValue).
-    pub(crate) fn module_namespace(&self, key: &str) -> Option<Value> {
-        let key = crate::modules::module_map_key(self.host_job_context, key);
-        self.module_recs.get(&key).map(|m| m.ns)
-    }
-
     /// Marshal an evaluate/importValue result out of the realm of the ShadowRealm object `realm`.
     pub(crate) fn make_shadow_result(&mut self, realm: &Gc, v: Value) -> Result<Value, Abrupt> {
         self.marshal_from_shadow(realm, v)
@@ -12646,11 +12689,8 @@ impl Interp {
                 "wrapped function name/length are not accessible",
             )
         };
-        let (length_r, name_r) = match self.enter_shadow(realm) {
-            Some(mut entry) => {
-                let sub = entry.interp();
-                // HasOwnProperty first (its [[GetOwnProperty]] trap is observable and may
-                // throw), and both Gets allocate in the target realm when user code runs.
+        let (length_r, name_r) = self
+            .with_shadow(realm, |sub| {
                 let l = match crate::builtins::has_own_property_trapped(sub, &target, "length") {
                     Ok(true) => sub.get_member_key(&target, "length"),
                     Ok(false) => Ok(Value::Num(0.0)),
@@ -12658,12 +12698,13 @@ impl Interp {
                 };
                 let n = sub.get_member_key(&target, "name");
                 (l, n)
-            }
-            None => (
-                self.get_member_key(&target, "length"),
-                self.get_member_key(&target, "name"),
-            ),
-        };
+            })
+            .unwrap_or_else(|| {
+                (
+                    self.get_member_key(&target, "length"),
+                    self.get_member_key(&target, "name"),
+                )
+            });
         let length = match (length_r).map(|__value| (__value).view()) {
             Ok(ValueView::Num(n)) if n.is_finite() => n.trunc().max(0.0),
             Ok(ValueView::Num(n)) if n == f64::INFINITY => f64::INFINITY,
@@ -12707,23 +12748,18 @@ impl Interp {
         }
         // Primitive arguments cross directly; callables wrap as sub-realm functions that
         // re-enter this realm; other objects throw.
-        let result = {
-            let Some(mut entry) = self.enter_shadow(realm) else {
-                return Err(self.throw("TypeError", "the ShadowRealm is no longer available"));
-            };
-            let sub = entry.interp();
-            // Rooted while later wrappers are made (I1).
+        let Some(result) = self.with_shadow(realm, |sub| {
             let mut inner_args = crate::rooting::RootedVec::new();
             for a in args {
-                if a.is_callable() {
-                    inner_args.push(sub.make_wrapped_cross(*a));
+                inner_args.push(if a.is_callable() {
+                    sub.make_wrapped_cross(*a)
                 } else {
-                    inner_args.push(*a);
-                }
+                    *a
+                });
             }
-            let r = sub.call(target, Value::Undefined, &inner_args);
-            sub.drain_microtasks();
-            r
+            sub.call(target, Value::Undefined, &inner_args)
+        }) else {
+            return Err(self.throw("TypeError", "the ShadowRealm is no longer available"));
         };
         match result {
             Ok(v) => self
@@ -13227,18 +13263,10 @@ impl Interp {
         };
         let current_key = Gc::as_ptr(&self.global) as usize;
         if self.realms.len() > 1 && target_key != 0 && target_key != current_key {
-            if let Some(mut saved) = self.realms.get(&target_key).map(RealmState::snapshot_clone) {
-                let target_context = saved.host_job_context;
-                let caller_context = self.host_job_context;
-                self.swap_realm(&mut saved);
-                self.switch_host_job_context(target_context);
-                self.suspend_gc();
-                let result = self.call_user_active(func, closure, this, args, is_construct, fn_obj);
-                self.resume_gc();
-                self.swap_realm(&mut saved);
-                self.realms.insert(target_key, saved);
-                self.switch_host_job_context(caller_context);
-                return result;
+            if let Some(target) = self.realms.get(&target_key).map(RealmState::snapshot_clone) {
+                return self.with_realm_snapshot(target_key, target, |interp| {
+                    interp.call_user_active(func, closure, this, args, is_construct, fn_obj)
+                });
             }
         }
         self.call_user_active(func, closure, this, args, is_construct, fn_obj)
@@ -13944,6 +13972,12 @@ impl Interp {
         // without entering a second JIT frame. This is deliberately derived from bytecode and
         // cache state only: function/source identity and observed argument/result values never
         // participate.
+        if !self.native_call_in_current_realm(apply_obj)
+            || !matches!(&initializer_obj.borrow().call,
+                Callable::User(user) if user.realm == Gc::as_ptr(&self.global) as usize)
+        {
+            return None;
+        }
         let initializer_plan =
             if let Some(runtime) = chunk.jit_forwarder_runtime(initializer_obj, apply_ptr) {
                 Some(runtime)
@@ -13967,24 +14001,7 @@ impl Interp {
                 {
                     None
                 } else {
-                    let same_realm = if self.multi_realm() {
-                        type ScopeCell = RefCell<Scope>;
-                        let mut cur: *const ScopeCell = Env::as_ptr(&user.env);
-                        let mut active = false;
-                        for _ in 0..8 {
-                            if cur == Env::as_ptr(&self.global_env) {
-                                active = true;
-                                break;
-                            }
-                            match unsafe { (*cur).borrow().parent.as_ref().map(Env::as_ptr) } {
-                                Some(parent) => cur = parent,
-                                None => break,
-                            }
-                        }
-                        active
-                    } else {
-                        true
-                    };
+                    let same_realm = user.realm == Gc::as_ptr(&self.global) as usize;
                     if same_realm {
                         let runtime = user
                             .func
@@ -14211,7 +14228,7 @@ impl Interp {
         // contract, so hot `new Array()` / `new Date()` sites avoid the full IsConstructor → realm →
         // construct-dispatch stack on every iteration.  Cross-realm calls retain the layered
         // path because the callee's intrinsics must be installed before its native body runs.
-        let native = if cached_site.is_none() && !self.multi_realm() {
+        let native = if cached_site.is_none() && self.native_call_in_current_realm(o) {
             let b = o.borrow();
             // Proxy callability uses a native sentinel, not its target's body. Only the
             // actual callee's internal methods matter; unrelated proxies must not disable
@@ -14687,7 +14704,7 @@ impl Interp {
         // self-hosted environments have no global parent, and host settings may
         // replace a Realm's global environment while ordinary closures survive.
         // Cache fills still pin and guard the currently active global environment.
-        if self.multi_realm() && realm != Gc::as_ptr(&self.global) as usize {
+        if realm != Gc::as_ptr(&self.global) as usize {
             return None;
         }
         if !self.class_info.is_empty() && self.class_info.contains_key(&(Gc::as_ptr(o) as usize)) {
@@ -15827,27 +15844,40 @@ impl Interp {
                 format!("{} is not a constructor", type_name(&callee)),
             ));
         }
-        // A cross-realm constructor runs with its own realm's intrinsics active. The caller's
-        // realm is remembered for the [[Construct]] errors thrown after the callee context pops.
-        if self.multi_realm() {
-            if let ValueView::Obj(o) = &(callee).view() {
-                if !self.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
-                    if let Some(gptr) = self.callee_realm_global(o) {
-                        let mut saved = self.realms[&gptr].snapshot_clone();
-                        self.swap_realm(&mut saved);
-                        let saved_ccr = self.ctor_caller_realm.replace(saved.snapshot_clone());
-                        let r = self.construct_dispatch(callee, args, new_target);
-                        self.ctor_caller_realm = saved_ccr;
-                        self.swap_realm(&mut saved);
-                        self.realms.insert(gptr, saved);
-                        return r;
+        // With one Realm and one interpreter, every constructor already runs in the active Realm.
+        let foreign_possible = self.multi_realm() || !self.single_interpreter();
+        if let Some(object) = callee.as_obj().filter(|_| foreign_possible) {
+            if self.proxy_at(Gc::as_ptr(&object) as usize).is_none() {
+                if let Some((owner, realm)) = self.callable_home(&object) {
+                    if owner != self.realm_id {
+                        let caller = crate::rooting::Rooted::new(self.snapshot_realm());
+                        return self.with_route(owner, |target| {
+                            target.with_constructor_caller(
+                                Some(caller.snapshot_clone()),
+                                |target| {
+                                    if realm == Gc::as_ptr(&target.global) as usize {
+                                        target.construct_dispatch(callee, args, new_target)
+                                    } else {
+                                        let state = target.realms[&realm].snapshot_clone();
+                                        target.with_realm_snapshot(realm, state, |target| {
+                                            target.construct_dispatch(callee, args, new_target)
+                                        })
+                                    }
+                                },
+                            )
+                        });
+                    }
+                    if realm != Gc::as_ptr(&self.global) as usize {
+                        let caller = self.snapshot_realm();
+                        let state = self.realms[&realm].snapshot_clone();
+                        return self.with_realm_snapshot(realm, state, |target| {
+                            target.with_constructor_caller(Some(caller), |target| {
+                                target.construct_dispatch(callee, args, new_target)
+                            })
+                        });
                     }
                 }
             }
-            let saved_ccr = self.ctor_caller_realm.take();
-            let r = self.construct_dispatch(callee, args, new_target);
-            self.ctor_caller_realm = saved_ccr;
-            return r;
         }
         self.construct_dispatch(callee, args, new_target)
     }
@@ -15891,9 +15921,8 @@ impl Interp {
             _ => return Err(self.throw("TypeError", "value is not a constructor")),
         };
         // Proxy with a `construct` trap (or forward to the target).
-        if !self.proxies.is_empty() {
-            if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&obj) as usize)).cloned()
-            {
+        {
+            if let Some((target, handler)) = self.proxy_at(Gc::as_ptr(&obj) as usize) {
                 let trap = self.get_member_key(&handler, "construct")?;
                 if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
                     // Forward to the target's [[Construct]] with the original new.target.

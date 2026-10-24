@@ -109,7 +109,7 @@ fn admission_collects() {
     let stats = |engine: &Engine| engine.interp.gc_heap.core.borrow().stats();
     let before = stats(&jit);
     // Every safepoint now finds a collection due by the live-object threshold.
-    jit.interp.gc_next = 0;
+    jit.interp.set_agent_next(0);
     assert_eq!(
         eval(
             &mut jit,

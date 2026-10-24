@@ -974,6 +974,13 @@ impl<'s> Ctx<'s> {
         thrown(self.it().make_host_keyed_array_buffer(bytes))
     }
 
+    /// Account for `bytes` of new host-allocated data that an `ArrayBuffer` can expose, such as
+    /// a WebAssembly memory's initial or grown pages. Like an engine buffer allocation, this
+    /// counts toward the Agent's buffer pressure and may collect.
+    pub fn note_external_buffer_growth(&mut self, bytes: usize) {
+        self.it().note_external_buffer_growth(bytes);
+    }
+
     /// A fixed-length host-keyed `ArrayBuffer` over an existing Data Block, which writes through
     /// either side update (the WebAssembly JS API §4.1).
     pub fn make_host_keyed_array_buffer_from_storage(
@@ -1003,7 +1010,10 @@ impl<'s> Ctx<'s> {
     /// Web IDL "a promise resolved with" `value`: a new promise of the current Realm, resolved
     /// with `value` (adopting a thenable's state as platform work).
     pub fn promise_resolved_with(&mut self, value: Value<'s>) -> Value<'s> {
-        Value::from_internal(self.it().promise_resolved_with(value.into_internal()))
+        Value::from_internal(
+            self.it()
+                .with_author_entry(|interp| interp.promise_resolved_with(value.into_internal())),
+        )
     }
 
     /// Web IDL "react to a promise" with embedder steps: PerformPromiseThen(`promise`,
@@ -1016,11 +1026,13 @@ impl<'s> Ctx<'s> {
         on_fulfilled: Value<'s>,
         on_rejected: Value<'s>,
     ) -> Result<Value<'s>, Value<'s>> {
-        thrown(self.it().react_to_promise(
-            promise.as_internal(),
-            on_fulfilled.into_internal(),
-            on_rejected.into_internal(),
-        ))
+        thrown(self.it().with_author_entry(|interp| {
+            interp.react_to_promise(
+                promise.as_internal(),
+                on_fulfilled.into_internal(),
+                on_rejected.into_internal(),
+            )
+        }))
     }
 
     // ----- native functions -------------------------------------------------------------------
@@ -1245,7 +1257,10 @@ impl<'s> Ctx<'s> {
 
     /// `[[Get]]` of a String key; `Err` is the thrown value.
     pub fn member_get(&mut self, base: &Value<'s>, key: &str) -> Result<Value<'s>, Value<'s>> {
-        thrown(self.it().member_get(base.as_internal(), key))
+        thrown(
+            self.it()
+                .with_author_entry(|interp| interp.member_get(base.as_internal(), key)),
+        )
     }
 
     /// `[[Set]]` of a String key; `Err` is the thrown value.
@@ -1256,14 +1271,16 @@ impl<'s> Ctx<'s> {
         value: Value<'s>,
     ) -> Result<(), Value<'s>> {
         self.it()
-            .member_set(base.as_internal(), key, value.into_internal())
+            .with_author_entry(|interp| {
+                interp.member_set(base.as_internal(), key, value.into_internal())
+            })
             .map_err(Value::from_internal)
     }
 
     /// [`Ctx::member_get`].
     pub fn get_member(&mut self, base: &Value<'s>, key: &str) -> Result<Value<'s>, Value<'s>> {
         self.it()
-            .get_member(base.as_internal(), key)
+            .with_author_entry(|interp| interp.get_member(base.as_internal(), key))
             .map(Value::from_internal)
             .map_err(lowered)
     }
@@ -1276,7 +1293,9 @@ impl<'s> Ctx<'s> {
         value: Value<'s>,
     ) -> Result<(), Value<'s>> {
         self.it()
-            .set_member(base.as_internal(), key, value.into_internal())
+            .with_author_entry(|interp| {
+                interp.set_member(base.as_internal(), key, value.into_internal())
+            })
             .map_err(lowered)
     }
 
@@ -1287,11 +1306,13 @@ impl<'s> Ctx<'s> {
         this: Value<'s>,
         args: &[Value<'s>],
     ) -> Result<Value<'s>, Value<'s>> {
-        thrown(self.it().invoke(
-            callee.into_internal(),
-            this.into_internal(),
-            &Value::slice_as_internal(args),
-        ))
+        thrown(self.it().with_author_entry(|interp| {
+            interp.invoke(
+                callee.into_internal(),
+                this.into_internal(),
+                &Value::slice_as_internal(args),
+            )
+        }))
     }
 
     /// [`Ctx::invoke`].
@@ -1302,11 +1323,13 @@ impl<'s> Ctx<'s> {
         args: &[Value<'s>],
     ) -> Result<Value<'s>, Value<'s>> {
         self.it()
-            .call(
-                callee.into_internal(),
-                this.into_internal(),
-                &Value::slice_as_internal(args),
-            )
+            .with_author_entry(|interp| {
+                interp.call(
+                    callee.into_internal(),
+                    this.into_internal(),
+                    &Value::slice_as_internal(args),
+                )
+            })
             .map(Value::from_internal)
             .map_err(lowered)
     }
@@ -1318,11 +1341,13 @@ impl<'s> Ctx<'s> {
         this: Value<'s>,
         args: &[Value<'s>],
     ) -> Result<Value<'s>, EvalError<'s>> {
-        eval_result(self.it().invoke_interruptible(
-            callee.into_internal(),
-            this.into_internal(),
-            &Value::slice_as_internal(args),
-        ))
+        eval_result(self.it().with_author_entry(|interp| {
+            interp.invoke_interruptible(
+                callee.into_internal(),
+                this.into_internal(),
+                &Value::slice_as_internal(args),
+            )
+        }))
     }
 
     /// Enter an author callback through a host boundary: GetFunctionRealm of `callee` (bound
@@ -1333,11 +1358,13 @@ impl<'s> Ctx<'s> {
         this: Value<'s>,
         args: &[Value<'s>],
     ) -> Result<Value<'s>, Value<'s>> {
-        thrown(self.it().invoke_callback_entry(
-            callee.into_internal(),
-            this.into_internal(),
-            &Value::slice_as_internal(args),
-        ))
+        thrown(self.it().with_author_entry(|interp| {
+            interp.invoke_callback_entry(
+                callee.into_internal(),
+                this.into_internal(),
+                &Value::slice_as_internal(args),
+            )
+        }))
     }
 
     /// `new callee(...args)`; `Err` is the thrown value.
@@ -1346,10 +1373,9 @@ impl<'s> Ctx<'s> {
         callee: Value<'s>,
         args: &[Value<'s>],
     ) -> Result<Value<'s>, Value<'s>> {
-        thrown(
-            self.it()
-                .construct_value(callee.into_internal(), &Value::slice_as_internal(args)),
-        )
+        thrown(self.it().with_author_entry(|interp| {
+            interp.construct_value(callee.into_internal(), &Value::slice_as_internal(args))
+        }))
     }
 
     /// [`Ctx::construct_value`].
@@ -1389,13 +1415,15 @@ impl<'s> Ctx<'s> {
 
     /// ToNumber; `Err` is the thrown value (conversions can run user `valueOf`/`toString`).
     pub fn to_number(&mut self, v: &Value<'s>) -> Result<f64, Value<'s>> {
-        self.it().to_number(v.as_internal()).map_err(lowered)
+        self.it()
+            .with_author_entry(|interp| interp.to_number(v.as_internal()))
+            .map_err(lowered)
     }
 
     /// ToString, as a string of this scope.
     pub fn to_string(&mut self, v: &Value<'s>) -> Result<JsString<'s>, Value<'s>> {
         self.it()
-            .to_string(v.as_internal())
+            .with_author_entry(|interp| interp.to_string(v.as_internal()))
             .map(JsString::from_lstr)
             .map_err(lowered)
     }
@@ -1403,7 +1431,7 @@ impl<'s> Ctx<'s> {
     /// [`Ctx::to_number`].
     pub fn coerce_number(&mut self, v: &Value<'s>) -> Result<f64, Value<'s>> {
         self.it()
-            .coerce_number(v.as_internal())
+            .with_author_entry(|interp| interp.coerce_number(v.as_internal()))
             .map_err(Value::from_internal)
     }
 
@@ -1411,7 +1439,7 @@ impl<'s> Ctx<'s> {
     /// `i64`: Numbers are rejected).
     pub fn coerce_bigint_i64(&mut self, v: &Value<'s>) -> Result<i64, Value<'s>> {
         self.it()
-            .coerce_bigint_i64(v.as_internal())
+            .with_author_entry(|interp| interp.coerce_bigint_i64(v.as_internal()))
             .map_err(Value::from_internal)
     }
 
@@ -1419,21 +1447,21 @@ impl<'s> Ctx<'s> {
     /// becomes U+FFFD. Use [`Ctx::coerce_utf16`] where lone surrogates must survive.
     pub fn coerce_string(&mut self, v: &Value<'s>) -> Result<Rc<str>, Value<'s>> {
         self.it()
-            .coerce_string(v.as_internal())
+            .with_author_entry(|interp| interp.coerce_string(v.as_internal()))
             .map_err(Value::from_internal)
     }
 
     /// Web IDL `USVString`: [`Ctx::coerce_string`] as an owned `String`.
     pub fn coerce_usv_string(&mut self, v: &Value<'s>) -> Result<String, Value<'s>> {
         self.it()
-            .coerce_usv_string(v.as_internal())
+            .with_author_entry(|interp| interp.coerce_usv_string(v.as_internal()))
             .map_err(Value::from_internal)
     }
 
     /// ToString as UTF-16 code units, lone surrogates included (a Web IDL `DOMString`).
     pub fn coerce_utf16(&mut self, v: &Value<'s>) -> Result<Vec<u16>, Value<'s>> {
         self.it()
-            .coerce_utf16(v.as_internal())
+            .with_author_entry(|interp| interp.coerce_utf16(v.as_internal()))
             .map_err(Value::from_internal)
     }
 
@@ -1441,7 +1469,7 @@ impl<'s> Ctx<'s> {
     /// rebuilds exactly the same JS string.
     pub fn coerce_engine_text(&mut self, v: &Value<'s>) -> Result<Rc<str>, Value<'s>> {
         self.it()
-            .coerce_engine_text(v.as_internal())
+            .with_author_entry(|interp| interp.coerce_engine_text(v.as_internal()))
             .map_err(Value::from_internal)
     }
 
@@ -1488,7 +1516,10 @@ impl<'s> Ctx<'s> {
 
     /// `Object.getPrototypeOf(v)`, a Proxy's trap included; `Err` is the thrown value.
     pub fn get_prototype_of(&mut self, v: &Value<'s>) -> Result<Value<'s>, Value<'s>> {
-        thrown(self.it().get_prototype_of(v.as_internal()))
+        thrown(
+            self.it()
+                .with_author_entry(|interp| interp.get_prototype_of(v.as_internal())),
+        )
     }
 
     /// Whether the current native call is a construct (`new`).
@@ -1676,7 +1707,7 @@ impl<'s> Ctx<'s> {
         src: &str,
     ) -> Result<Value<'s>, Value<'s>> {
         self.it()
-            .eval_in_realm(realm_global.as_internal(), src)
+            .with_author_entry(|interp| interp.eval_in_realm(realm_global.as_internal(), src))
             .map(Value::from_internal)
             .map_err(lowered)
     }

@@ -196,7 +196,8 @@ pub trait Host {
 
     /// WebAssembly JS API §5.3 requires the corresponding fixed ArrayBuffer to be refreshed
     /// immediately after a successful `memory.grow`, including before a later host callback.
-    fn memory_grew(&mut self, _memory_addr: usize) -> Result<(), String> {
+    /// `grown_bytes` is the memory's new data, for the embedder's allocation accounting.
+    fn memory_grew(&mut self, _memory_addr: usize, _grown_bytes: usize) -> Result<(), String> {
         Ok(())
     }
 }
@@ -463,6 +464,11 @@ struct Ctrl {
 }
 
 impl Store {
+    /// Bytes held by this store's live memories.
+    pub fn memory_bytes(&self) -> usize {
+        self.memory_bytes
+    }
+
     /// Trace store entities reachable from live JavaScript wrappers, then tombstone everything
     /// else. Addresses are never renumbered, so a collection cannot invalidate another live
     /// wrapper or a table slot. The byte/element budgets are released with the entities.
@@ -851,7 +857,8 @@ impl Store {
                     let delta = stack.pop().unwrap().i32();
                     let previous = self.mem_grow(ma, delta);
                     if previous >= 0 {
-                        host.memory_grew(ma)?;
+                        // A successful grow had a non-negative delta of at most 65536 pages.
+                        host.memory_grew(ma, (delta as u32 as usize).saturating_mul(PAGE_SIZE))?;
                     }
                     stack.push(Val::I32(previous));
                 }

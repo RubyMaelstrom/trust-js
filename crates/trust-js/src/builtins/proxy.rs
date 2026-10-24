@@ -35,10 +35,19 @@ fn revoke_proxy(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Valu
         let ptr = Gc::as_ptr(&o) as usize;
         // Keep the entry but null the handler, so the object stays a (revoked) Proxy and every
         // operation throws a TypeError rather than silently acting like a plain object.
-        if let Some((target, _)) = i.proxies.get(&ptr).cloned() {
+        if let Some(owner) = i.metadata_owner(ptr, |owner, ptr| owner.proxies.contains_key(&ptr)) {
             i.inline_ic_safe.set(false);
             o.borrow().ic_plain.set(false);
-            i.proxies.insert(&i.gc_heap, ptr, (target, Value::Null));
+            let heap = i.gc_heap.clone();
+            i.with_metadata_table(
+                owner,
+                |owner| &mut owner.proxies,
+                |proxies| {
+                    if let Some((target, _)) = proxies.get(&ptr).copied() {
+                        proxies.insert(&heap, ptr, (target, Value::Null));
+                    }
+                },
+            );
         }
     }
     Ok(Value::Undefined)

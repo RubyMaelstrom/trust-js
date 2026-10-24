@@ -92,21 +92,17 @@ impl Interp {
     pub(crate) fn append_spread_arguments(
         &mut self,
         spread: &Value,
-        arguments: &mut Vec<Value>,
+        arguments: &mut crate::rooting::RootedVec,
     ) -> Result<(), Abrupt> {
-        let mut rooted = crate::rooting::RootedVec::from_vec(std::mem::take(arguments));
-        let result =
-            self.expand_spread_bounded(spread, rooted.len(), MAX_ARGUMENTS_LEN, |_, value| {
-                rooted.push(value);
-                Ok(())
-            });
-        *arguments = rooted.into_vec();
-        result
+        self.expand_spread_bounded(spread, arguments.len(), MAX_ARGUMENTS_LEN, |_, value| {
+            arguments.push(value);
+            Ok(())
+        })
     }
 
     pub(crate) fn append_argument(
         &mut self,
-        arguments: &mut Vec<Value>,
+        arguments: &mut crate::rooting::RootedVec,
         value: Value,
     ) -> Result<(), Abrupt> {
         if arguments.len() >= MAX_ARGUMENTS_LEN {

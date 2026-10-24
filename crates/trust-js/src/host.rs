@@ -65,7 +65,9 @@ pub trait HostTrace {
 /// Register with [`OpState::register_gc`], which also registers the type's [`HostTrace`].
 /// These callbacks must not execute JavaScript, allocate JS objects, or re-enter collection.
 pub trait HostGc: HostTrace {
-    /// Release temporary native roots at the same synchronous-job boundary as ClearKeptObjects.
+    /// Release temporary native roots at the end of the outer host checkpoint, alongside
+    /// ClearKeptObjects. A successful partial one-job pump retains these leases until its
+    /// empty result or a later full checkpoint; nested same-Agent requests do not end it.
     /// This may update native bookkeeping only: no JavaScript, JS allocation or collection.
     /// Persistent async work must own explicit roots rather than relying on a job lease.
     fn end_job(&mut self) {}

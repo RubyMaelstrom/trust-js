@@ -168,7 +168,7 @@ fn format(
 
     // Rooted across the formatToParts call and part reads (I1).
     let mut output = crate::rooting::RootedVec::new();
-    let push_literal = |i: &mut Interp, output: &mut Vec<Value>, text: &str| {
+    let push_literal = |i: &mut Interp, output: &mut crate::rooting::RootedVec, text: &str| {
         if text.is_empty() {
             return;
         }

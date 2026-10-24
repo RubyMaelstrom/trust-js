@@ -8,12 +8,37 @@
 //! entering a structure that cannot be traced are kept in [`ValueRoots`].
 
 use crate::value::Value;
+use std::mem::ManuallyDrop;
+use std::ptr::NonNull;
+
+/// Raw ownership, without Box's pointee retagging when the root wrapper moves. Registry
+/// pointers are derived directly from this capability, before any temporary shared reference.
+struct Storage<T>(NonNull<T>);
+impl<T> Storage<T> {
+    fn new(value: T) -> Self {
+        Self(NonNull::new(Box::into_raw(Box::new(value))).expect("Box is non-null"))
+    }
+    fn as_ptr(&self) -> *mut T {
+        self.0.as_ptr()
+    }
+    fn into_inner(self) -> T {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: the sole owner, after its registry entry was removed.
+        unsafe { *Box::from_raw(this.0.as_ptr()) }
+    }
+}
+impl<T> Drop for Storage<T> {
+    fn drop(&mut self) {
+        // SAFETY: sole raw ownership; the containing root unregisters before this field drops.
+        unsafe {
+            drop(Box::from_raw(self.0.as_ptr()));
+        }
+    }
+}
 
 /// A `Vec<Value>` whose elements are GC roots while it lives.
 pub(crate) struct RootedVec {
-    /// Boxed so the registered address stays put when the `RootedVec` moves.
-    #[allow(clippy::box_collection)]
-    values: Box<Vec<Value>>,
+    values: Storage<Vec<Value>>,
     slot: registry::Slot,
 }
 
@@ -25,17 +50,74 @@ impl RootedVec {
 
     #[inline]
     pub(crate) fn from_vec(values: Vec<Value>) -> Self {
-        let values = Box::new(values);
-        let slot = registry::register(registry::Entry::Vec(std::ptr::from_ref(&*values)));
+        let values = Storage::new(values);
+        let slot = registry::register(registry::Entry::Vec(values.as_ptr().cast_const()));
         RootedVec { values, slot }
     }
 
     /// The values, no longer rooted: the caller roots them again before the next safepoint
     /// (a call roots its argument list for its duration).
     #[inline]
-    pub(crate) fn into_vec(mut self) -> Vec<Value> {
-        let values: &mut Vec<Value> = &mut self.values;
-        std::mem::take(values)
+    pub(crate) fn into_vec(self) -> Vec<Value> {
+        let this = ManuallyDrop::new(self);
+        registry::unregister(this.slot);
+        // SAFETY: this no longer runs Drop; transfer its sole storage owner after unregistering.
+        unsafe { std::ptr::read(&this.values) }.into_inner()
+    }
+
+    // These are inherent methods: evaluating push(callback()) borrows only the raw-owner
+    // wrapper, not the Vec payload. Every payload loan ends before iterator/predicate code.
+    pub(crate) fn push(&mut self, value: Value) {
+        unsafe {
+            (&mut *self.values.as_ptr()).push(value);
+        }
+    }
+    pub(crate) fn pop(&mut self) -> Option<Value> {
+        unsafe { (&mut *self.values.as_ptr()).pop() }
+    }
+    pub(crate) fn set(&mut self, index: usize, value: Value) {
+        unsafe {
+            (&mut *self.values.as_ptr())[index] = value;
+        }
+    }
+    pub(crate) fn insert(&mut self, index: usize, value: Value) {
+        unsafe {
+            (&mut *self.values.as_ptr()).insert(index, value);
+        }
+    }
+    pub(crate) fn remove(&mut self, index: usize) -> Value {
+        unsafe { (&mut *self.values.as_ptr()).remove(index) }
+    }
+    pub(crate) fn truncate(&mut self, len: usize) {
+        unsafe {
+            (&mut *self.values.as_ptr()).truncate(len);
+        }
+    }
+    pub(crate) fn clear(&mut self) {
+        self.truncate(0);
+    }
+    #[cfg(test)]
+    #[allow(dead_code)] // Standalone actual-module Miri consumer exercises reallocation.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        unsafe {
+            (&mut *self.values.as_ptr()).reserve(additional);
+        }
+    }
+    pub(crate) fn extend(&mut self, values: impl IntoIterator<Item = Value>) {
+        for value in values {
+            self.push(value);
+        }
+    }
+    pub(crate) fn append(&mut self, values: &mut Vec<Value>) {
+        self.extend(std::mem::take(values));
+    }
+    /// The caller uses raw words only, ends each writable loan before a safepoint, and retains
+    /// this owner without reallocating its buffer. No mutable Rust slice/reference to the
+    /// payload may span registry tracing.
+    #[cfg(test)]
+    #[allow(dead_code)] // Standalone Miri consumer models the canonical raw native-word loan.
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut Value {
+        unsafe { (&mut *self.values.as_ptr()).as_mut_ptr() }
     }
 }
 
@@ -50,14 +132,8 @@ impl std::ops::Deref for RootedVec {
     type Target = Vec<Value>;
     #[inline]
     fn deref(&self) -> &Vec<Value> {
-        &self.values
-    }
-}
-
-impl std::ops::DerefMut for RootedVec {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Vec<Value> {
-        &mut self.values
+        // SAFETY: the stable allocation is owned and no mutable payload reference escapes.
+        unsafe { &*self.values.as_ptr() }
     }
 }
 
@@ -139,20 +215,35 @@ impl Drop for RootedVec {
 pub(crate) use crate::gc_trace::GcTrace as Traceable;
 
 /// A value whose GC edges are roots while it lives: engine state built up in a Rust structure
-/// across safepoints, such as a class evaluation's decorators.
+/// across safepoints, such as a class evaluation's decorators. Mutable generic state uses
+/// checked interior loans (e.g. RefCell) that end before callbacks/tracing; no &mut T escapes.
+/// T's destructor must not execute JavaScript or collect: it runs after unregistering. Current
+/// payloads, including JsonRecord's iterative teardown, satisfy this internal contract.
 pub(crate) struct Rooted<T: Traceable + 'static> {
-    /// Boxed so the registered address stays put.
-    value: Box<T>,
+    value: Storage<T>,
     slot: registry::Slot,
 }
 
 impl<T: Traceable + 'static> Rooted<T> {
     #[inline]
     pub(crate) fn new(value: T) -> Self {
-        let value = Box::new(value);
-        let traced: &dyn crate::gc_trace::GcTrace = &*value;
-        let slot = registry::register(registry::Entry::Traced(std::ptr::from_ref(traced)));
+        let value = Storage::new(value);
+        let traced = value.as_ptr() as *const dyn crate::gc_trace::GcTrace;
+        let slot = registry::register(registry::Entry::Traced(traced));
         Rooted { value, slot }
+    }
+
+    /// Transfer unrooted state. Its GC edges need a new owner/root before the next safepoint.
+    pub(crate) fn into_inner(self) -> T {
+        let this = ManuallyDrop::new(self);
+        registry::unregister(this.slot);
+        unsafe { std::ptr::read(&this.value) }.into_inner()
+    }
+
+    /// Return the previous, now-unrooted state; root/publish it before another safepoint.
+    pub(crate) fn replace(&mut self, value: T) -> T {
+        // Argument evaluation has ended. No mutable payload reference escapes this operation.
+        unsafe { std::ptr::replace(self.value.as_ptr(), value) }
     }
 }
 
@@ -160,14 +251,7 @@ impl<T: Traceable + 'static> std::ops::Deref for Rooted<T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
-        &self.value
-    }
-}
-
-impl<T: Traceable + 'static> std::ops::DerefMut for Rooted<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.value
+        unsafe { &*self.value.as_ptr() }
     }
 }
 
@@ -289,7 +373,7 @@ mod registry {
     pub(super) fn trace(sink: &mut dyn crate::gc_trace::GcSink) {
         TABLE.with(|table| {
             for entry in table.borrow().entries.iter().flatten() {
-                // SAFETY: an entry is registered only while its owner (the box of a `RootedVec`
+                // SAFETY: an entry is registered only while its owner (the raw-owned storage of a `RootedVec`
                 // or `Rooted`, or a `SliceRoot`'s borrow) keeps it alive and unmoved.
                 unsafe {
                     match *entry {

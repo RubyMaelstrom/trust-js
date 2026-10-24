@@ -19,7 +19,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             .and_then(crate::interpreter::WeakTarget::upgrade);
         if let Some(target) = target {
             // WeakRefDeref -> AddToKeptObjects. The host clears this at the next job boundary.
-            i.kept_alive.push(target);
+            i.add_kept_object(target);
             Ok(target)
         } else {
             Ok(Value::Undefined)
@@ -37,7 +37,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         let obj = new_from_ctor(i, "WeakRef")?;
         let ptr = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.kept_alive.push(target);
+        i.add_kept_object(target);
         let target = crate::interpreter::WeakTarget::of(&target)
             .expect("CanBeHeldWeakly accepted the WeakRef target");
         i.weak_metadata.subscribe(
@@ -142,6 +142,8 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         let ptr = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         let cleanup_callback = i.make_job_callback(arg(a, 0));
+        let (callback_realm, callback_context) =
+            i.promise_job_target(&arg(a, 0), i.host_job_context);
         i.finalization_registries.insert(
             &i.gc_heap,
             ptr,
@@ -149,6 +151,10 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
                 cleanup_callback,
                 cells: Default::default(),
                 cleanup_scheduled: false,
+                registry_realm: i.global,
+                registry_context: i.host_job_context,
+                callback_realm,
+                callback_context,
             },
         );
         Ok(Value::Obj(obj))

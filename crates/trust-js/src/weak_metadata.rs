@@ -271,7 +271,7 @@ impl Interp {
     /// are scheduled. ClearKeptObjects still belongs exclusively to the host job boundary.
     #[inline]
     pub(crate) fn gc_weak_metadata_safepoint(&mut self, force: bool) {
-        if self.gc_suppressed != 0 {
+        if self.gc_heap.agent.suppressed.get() != 0 {
             return;
         }
         let pending = self.weak_metadata.deaths.pending_len();
@@ -284,7 +284,10 @@ impl Interp {
         // A prior drain can have readied cells without queued deaths remaining. Forced job
         // checkpoints must still request owner validation/scheduling in that case. Neither
         // ClearKeptObjects nor host end_job is gated here (ECMA-262 #sec-weakref-invariants).
-        self.gc_task_pending |= !self.weak_metadata.ready_registries.is_empty();
+        self.gc_heap.agent.task_pending.set(
+            self.gc_heap.agent.task_pending.get()
+                || !self.weak_metadata.ready_registries.is_empty(),
+        );
     }
 
     /// Delete one weak entry and its identity index together. Weak collection order is not
@@ -397,6 +400,7 @@ impl Interp {
     /// `Interp::gc_heap_after_sweep` for why no ready registry is dead there).
     pub(crate) fn gc_schedule_finalization_cleanup(&mut self, dead: Option<&DeadObjects<'_>>) {
         let ready: Vec<_> = self.weak_metadata.ready_registries.drain().collect();
+        let route = self.realm_route();
         for owner in ready {
             if dead.is_some_and(|dead| dead.contains(owner)) {
                 continue;
@@ -404,11 +408,29 @@ impl Interp {
             let Some(registry) = self.finalization_registries.get_mut(&self.gc_heap, &owner) else {
                 continue;
             };
+            // A destroyed registry task context cannot regain queued work at a later GC.
+            // Inactive contexts, and a distinct callback/incumbent context, are not discarded.
+            if self
+                .retired_host_job_contexts
+                .contains(&registry.registry_context)
+            {
+                continue;
+            }
             if !registry.cleanup_scheduled && registry.cells.has_ready() {
                 if let Some(object) = self.gc_pins.get(&owner) {
                     registry.cleanup_scheduled = true;
-                    self.pending_finalization_cleanup
-                        .push_back(Value::Obj(*object));
+                    self.gc_heap.agent.work.borrow_mut().cleanup.push_back(
+                        crate::agent_control::Routed {
+                            route: route.clone(),
+                            payload: crate::agent_control::Cleanup {
+                                registry: Value::Obj(*object),
+                                registry_realm: registry.registry_realm,
+                                registry_context: registry.registry_context,
+                                callback_realm: registry.callback_realm,
+                                callback_context: registry.callback_context,
+                            },
+                        },
+                    );
                 }
             }
         }
@@ -675,7 +697,7 @@ mod tests {
             let value = Value::Obj(Object::new(None));
             let target = WeakTarget::of(&value).unwrap();
             let owner = reference(&mut engine.interp, &target);
-            engine.interp.kept_alive.push(value);
+            engine.interp.add_kept_object(value);
             let held = engine.scope(|cx| {
                 crate::handles::WeakHandle::new(cx, &crate::scope::Value::from_internal(value))
                     .expect("a weak handle")
@@ -696,18 +718,18 @@ mod tests {
             crate::gc_test::alive(target),
             "safepoints do not end synchronous work"
         );
-        assert_eq!(engine.interp.kept_alive.len(), 1);
-        engine.interp.gc_task_deferred = true;
-        engine.interp.gc_task_boundary();
+        assert_eq!(engine.interp.gc_heap.agent.kept_alive.borrow().len(), 1);
+        engine.interp.gc_heap.agent.task_deferred.set(true);
+        engine.interp.drain_microtasks();
         assert_eq!(calls.get(), 1);
-        assert!(engine.interp.kept_alive.is_empty());
+        assert!(engine.interp.gc_heap.agent.kept_alive.borrow().is_empty());
         engine.interp.gc_collect();
         assert!(!crate::gc_test::alive(target));
         assert!(engine.interp.weak_refs[&(Gc::as_ptr(&owner) as usize)].is_none());
         assert_eq!(queue.pending_len(), 0);
         // Even an entirely empty subsequent checkpoint must notify the host exactly once.
         let _borrowed = queue.entries.borrow_mut();
-        engine.interp.gc_task_boundary();
+        engine.interp.drain_microtasks();
         assert_eq!(calls.get(), 2);
         assert_eq!(queue.pending_len(), 0);
     }
@@ -746,7 +768,7 @@ mod tests {
         "#,
                 "true",
             );
-            assert!(engine.interp.kept_alive.is_empty());
+            assert!(engine.interp.gc_heap.agent.kept_alive.borrow().is_empty());
             engine.interp.gc_collect();
             assert_eq!(engine.interp.weak_metadata.cleared_subscribers, 5);
             assert_eq!(engine.interp.weak_metadata.targets.len(), stable_count);
@@ -932,7 +954,7 @@ mod tests {
             engine.interp.gc_collect();
             if !stress {
                 assert_eq!(
-                    !engine.interp.pending_finalization_cleanup.is_empty(),
+                    !engine.interp.gc_heap.agent.work.borrow().cleanup.is_empty(),
                     keep_owner
                 );
             }
@@ -980,7 +1002,7 @@ mod tests {
             let target = Value::Obj(Object::new(None));
             let weak = WeakTarget::of(&target).unwrap();
             let owner = reference(&mut engine.interp, &weak);
-            engine.interp.kept_alive.push(target);
+            engine.interp.add_kept_object(target);
             (Box::new(weak), owner)
         });
         let weak = weak.as_ref();
@@ -989,7 +1011,7 @@ mod tests {
             crate::gc_test::alive(weak),
             "same-job KeptAlive target was cleared"
         );
-        engine.interp.clear_kept_objects();
+        engine.interp.drain_microtasks();
         engine.interp.gc_collect();
         assert!(engine.interp.weak_refs[&(Gc::as_ptr(&owner) as usize)].is_none());
         let other = Value::Obj(Object::new(None));

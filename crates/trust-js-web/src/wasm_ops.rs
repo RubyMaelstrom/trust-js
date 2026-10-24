@@ -268,7 +268,9 @@ impl Host for CtxHost<'_, '_> {
         }
     }
 
-    fn memory_grew(&mut self, memory_addr: usize) -> Result<(), String> {
+    fn memory_grew(&mut self, memory_addr: usize, grown_bytes: usize) -> Result<(), String> {
+        // The store holds no JavaScript values, so the accounting may collect here.
+        self.ctx.note_external_buffer_growth(grown_bytes);
         match refresh_memory_buffer(self.ctx, memory_addr) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -521,11 +523,13 @@ pub(crate) fn op_alloc_memory<'s>(
 ) -> Result<Value<'s>, Value<'s>> {
     let min = u32_arg(ctx, a, 0, "memory initial")? as usize;
     let max = optional_u32_arg(ctx, a, 1, "memory maximum")?;
-    let result = ctx
-        .host_mut::<WasmStore>()
-        .expect("wasm store")
-        .store
-        .alloc_memory(min, max);
+    let (result, grown) = {
+        let store = &mut ctx.host_mut::<WasmStore>().expect("wasm store").store;
+        let before = store.memory_bytes();
+        let result = store.alloc_memory(min, max);
+        (result, store.memory_bytes().saturating_sub(before))
+    };
+    ctx.note_external_buffer_growth(grown);
     result
         .map(|address| Value::Num(address as f64))
         .map_err(|error| ctx.make_error("RangeError", error))
@@ -647,8 +651,13 @@ pub(crate) fn op_instantiate<'s>(
                 Parsed::Global(addr) => imports.global_addrs.push(addr),
             }
         }
-        ws.store.instantiate(Rc::clone(&module), imports)
+        let before = ws.store.memory_bytes();
+        let result = ws.store.instantiate(Rc::clone(&module), imports);
+        (result, ws.store.memory_bytes().saturating_sub(before))
     };
+    let (inst_result, grown) = inst_result;
+    // A module's own memories are new buffer data (its start function's grows report below).
+    ctx.note_external_buffer_growth(grown);
     let inst_idx = match inst_result {
         Ok(instance) => instance,
         Err(error) => {
@@ -779,13 +788,16 @@ pub(crate) fn op_mem_grow<'s>(
 ) -> Result<Value<'s>, Value<'s>> {
     let addr = num(a, 0) as usize;
     let delta = num(a, 1) as i32;
-    let previous = {
+    let (previous, grown) = {
         let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
         if addr >= ws.store.memories.len() {
             return Err(ctx.make_error("Error", "wasm: bad memory address"));
         }
-        ws.store.mem_grow(addr, delta)
+        let before = ws.store.memory_bytes();
+        let previous = ws.store.mem_grow(addr, delta);
+        (previous, ws.store.memory_bytes().saturating_sub(before))
     };
+    ctx.note_external_buffer_growth(grown);
     if previous >= 0 {
         refresh_memory_buffer(ctx, addr)?;
     }

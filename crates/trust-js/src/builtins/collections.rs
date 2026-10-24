@@ -95,7 +95,7 @@ fn result_index_find(
 }
 
 fn result_index_insert(
-    values: &mut Vec<Value>,
+    values: &mut crate::rooting::RootedVec,
     index: &mut crate::fasthash::FastMap<u64, Vec<usize>>,
     value: Value,
 ) -> bool {

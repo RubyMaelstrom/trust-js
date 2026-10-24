@@ -9,8 +9,8 @@
 //! conservatively (Decision 0).
 //!
 //! A ShadowRealm's interpreter shares its parent's heap: one heap per Agent, so no edge ever
-//! crosses heaps (I6). Only the root interpreter collects, over its whole ShadowRealm tree; a
-//! collection requested inside a ShadowRealm runs at the root's next safepoint. A realm's
+//! crosses heaps (I6). Each interpreter can collect at its current safepoint, over its whole Agent, using scoped
+//! current-borrow capabilities. The root's address is never saved between host entries. A realm's
 //! roots belong to its ShadowRealm object, traced once that object is marked, so a realm kept
 //! only by cycles through itself is collected; while code in a realm runs, its roots and its
 //! ShadowRealm object are roots.
@@ -166,6 +166,12 @@ pub(crate) struct ClientRecords {
 }
 
 impl ClientRecords {
+    /// A newly installed native owner may already be old. Recording is unconditional, even
+    /// during unpublished child bootstrap: publication of shadow_home happens before marking.
+    pub(crate) fn remember_owner(&mut self, owner: usize) {
+        self.side_slot_owners.insert(owner);
+    }
+
     /// The collection in progress has marked: start recording for the next one, keeping the
     /// functions registered since the last collection for this one's [[Realm]] sweep.
     fn consume(&mut self) {
@@ -499,7 +505,7 @@ struct Marking<'a> {
     /// A minor collection's client reports what the tables recorded instead of the tables (see
     /// [`ClientRecords`]).
     kind: CollectionKind,
-    /// The root interpreter, then its ShadowRealm descendants breadth-first.
+    /// Root first, then descendants in stable creation/topological order.
     interps: Vec<&'a Interp>,
     /// Parallel to `interps`.
     hosts: Vec<RefCell<HostGraph>>,
@@ -518,26 +524,39 @@ struct Marking<'a> {
     /// GetTemplateObject's per-Realm [[TemplateMap]] values, by (interpreter, Realm key).
     templates: FastMap<(usize, usize), Vec<u64>>,
     activated_realms: RefCell<FastSet<(usize, usize)>>,
+    activated_homes: RefCell<FastSet<usize>>,
 }
 
 impl<'a> Marking<'a> {
     /// Out of line: its frames must be dead (and scrubbed) before the native stack is scanned.
     #[inline(never)]
     fn new(root: &'a Interp, kind: CollectionKind) -> Self {
-        let mut interps = vec![root];
+        let pointers = root
+            .gc_heap
+            .agent
+            .access
+            .shared_snapshot(root.realm_id, root);
+        let mut interps = Vec::with_capacity(pointers.len());
         let mut shadow_owners = FastMap::default();
         let mut entered = Vec::new();
-        let mut next = 0;
-        while let Some(&interp) = interps.get(next) {
-            for (&owner, child) in &interp.shadow_realms {
-                let index = interps.len();
+        for (id, pointer) in pointers {
+            // SAFETY: the collection's current lease refreshes the requester; all other active
+            // participants published their current borrow at suspension. Inactive allocations
+            // have raw owners. No shared phase reference survives into sweep/retirement.
+            let interp = unsafe { &*pointer };
+            let index = interps.len();
+            if let Some(home) = &interp.shadow_home {
+                let owner = home
+                    .owner
+                    .upgrade()
+                    .expect("a registered realm has a live owner cell");
+                let owner = Gc::as_ptr(&owner) as usize;
                 shadow_owners.insert(owner, index);
-                if child.shadow_entered() {
+                if root.gc_heap.agent.access.active(id) {
                     entered.push((owner, index));
                 }
-                interps.push(&**child);
             }
-            next += 1;
+            interps.push(interp);
         }
         let mut hosts = Vec::with_capacity(interps.len());
         let mut realm_members: FastMap<usize, Vec<(usize, usize)>> = FastMap::default();
@@ -573,6 +592,7 @@ impl<'a> Marking<'a> {
             realm_members,
             templates,
             activated_realms: RefCell::default(),
+            activated_homes: RefCell::default(),
         }
     }
 
@@ -643,6 +663,16 @@ impl EdgeReporter<'_, '_> {
 }
 
 impl Marking<'_> {
+    fn trace_home(&self, index: usize, words: &mut dyn GcSink) {
+        let Some(home) = &self.interps[index].shadow_home else {
+            return;
+        };
+        let first = { self.activated_homes.borrow_mut().insert(index) };
+        if first {
+            home.route.trace_gc(words);
+        }
+    }
+
     /// The roots of interpreter `index` and of its host.
     fn trace_interp_roots(&self, index: usize, words: &mut dyn GcSink) {
         self.interps[index].trace_gc_roots(words);
@@ -717,6 +747,11 @@ impl crate::gc_core::MarkClient for Marking<'_> {
             CollectionKind::Major => {
                 for interp in &self.interps {
                     interp.for_each_side_slot_owner(&mut |owner| noted.note(owner));
+                    // Owner pins are callback identities, not roots. Full collections census
+                    // them; minors already receive every newly attached owner in ClientRecords.
+                    for &owner in interp.gc_pins.keys() {
+                        noted.note(owner);
+                    }
                 }
             }
             // The owners whose entries were written since the last collection, the young ones
@@ -748,18 +783,27 @@ impl crate::gc_core::MarkClient for Marking<'_> {
     fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64)) {
         let mut words = WordSink(sink);
         if let Some(&index) = self.shadow_owners.get(&owner) {
+            // Raw ownership is hierarchical: a live descendant implementation cannot outlive
+            // the allocation containing its owning slot. This is a CONDITIONAL edge from a
+            // reachable owner, never an unconditional root from the topology directory.
+            self.trace_home(index, &mut words);
             // An entered realm's roots were traced as roots.
             if !self.interps[index].shadow_entered() {
                 self.trace_interp_roots(index, &mut words);
             }
         }
-        for interp in &self.interps {
+        for (index, interp) in self.interps.iter().enumerate() {
+            if interp.gc_pins.contains_key(&owner) {
+                self.trace_home(index, &mut words);
+            }
             interp.trace_owner_slots(owner, &mut words);
         }
         for &(index, key) in self.realm_members.get(&owner).into_iter().flatten() {
             if !self.activated_realms.borrow_mut().insert((index, key)) {
                 continue;
             }
+            // A child global/intrinsic may be retained directly (AddToKeptObjects).
+            self.trace_home(index, &mut words);
             if let Some(realm) = self.interps[index].realms.get(&key) {
                 realm.trace_gc(&mut words);
             }
@@ -868,7 +912,8 @@ impl Interp {
     /// ceiling (`gc_next`), the heap's nursery or byte budget or stress interval, or a deferred
     /// request.
     pub(crate) fn gc_heap_due(&self) -> bool {
-        crate::value::heap_live_objects(&self.gc_heap) > self.gc_next
+        crate::value::heap_live_objects(&self.gc_heap) > self.gc_heap.agent.next.get()
+            || self.gc_heap.agent.pending.get().is_some()
             || self.gc_heap.core.borrow().collection_due()
     }
 
@@ -877,13 +922,16 @@ impl Interp {
     /// collection's own frames are about to reuse. Zero that region first, from the caller's
     /// frame (inlined, see `Interp::gc_collect`).
     #[inline(always)]
-    pub(crate) fn gc_heap_collect_explicit(&mut self, kind: CollectionKind) {
+    pub(crate) fn gc_heap_collect_explicit(
+        &mut self,
+        kind: CollectionKind,
+    ) -> crate::agent_control::CollectionOutcome {
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(EXPLICIT_SCRUB_BYTES);
-        self.gc_heap_collect(crate::value::GcCause::Explicit, Some(kind));
+        self.gc_heap_collect(crate::value::GcCause::Explicit, Some(kind))
     }
 
-    /// Collect the Agent heap (a no-op in a ShadowRealm's interpreter): a collection of `kind`,
+    /// Collect the whole Agent heap from this interpreter's current safepoint: a collection of `kind`,
     /// or with `None` of the kind the heap asks for (`gc_core::Heap::due_kind`: minor unless a
     /// major collection is due). Defers, leaving the request pending for the next safepoint,
     /// inside a no-GC region, while a cell borrow is outstanding or on a native stack segment
@@ -892,16 +940,43 @@ impl Interp {
         &mut self,
         cause: crate::value::GcCause,
         kind: Option<CollectionKind>,
-    ) {
-        if !self.gc_heap_root() {
-            return;
+    ) -> crate::agent_control::CollectionOutcome {
+        if self.gc_heap.agent.suppressed.get() != 0 || self.gc_heap.agent.collecting.get() {
+            // An unpublished child must never publish its temporary identity as Agent root.
+            self.gc_heap.agent.request(&self.gc_heap, kind);
+            return crate::agent_control::CollectionOutcome::Deferred;
         }
+        assert_ne!(
+            self.realm_id,
+            crate::agent_access::RealmId::UNPUBLISHED,
+            "unpublished interpreter cannot collect"
+        );
+        self.with_access(|current| current.gc_heap_collect_active(cause, kind))
+    }
+
+    fn gc_heap_collect_active(
+        &mut self,
+        cause: crate::value::GcCause,
+        kind: Option<CollectionKind>,
+    ) -> crate::agent_control::CollectionOutcome {
+        use crate::agent_control::CollectionOutcome;
         let heap = self.gc_heap.clone();
+        let pending = heap.agent.pending.take();
+        let requested =
+            if kind == Some(CollectionKind::Major) || pending == Some(CollectionKind::Major) {
+                Some(CollectionKind::Major)
+            } else {
+                kind.or(pending)
+            };
         let kind = match heap.core.try_borrow_mut() {
-            Ok(core) => kind.unwrap_or_else(|| core.due_kind()),
-            // Requested from inside this collection (a host sweep or Drop): it is running.
-            Err(_) => return,
+            Ok(core) => requested.unwrap_or_else(|| core.due_kind()),
+            Err(_) => {
+                heap.agent.request(&heap, requested);
+                return CollectionOutcome::Deferred;
+            }
         };
+        heap.agent.collecting.set(true);
+        let _collecting = crate::agent_control::Collecting(heap.clone());
         let performance_started = crate::value::gc_performance_metrics_start();
         let objects_before = crate::value::heap_live_objects(&heap);
         // Frames that are live while the native stack is scanned — this one and those of
@@ -911,22 +986,29 @@ impl Interp {
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
         let Some(native) = self.gc_heap_mark(&heap, kind) else {
-            return;
+            heap.agent.request(&heap, Some(kind));
+            return CollectionOutcome::Deferred;
         };
         let reclaimed = self.gc_heap_sweep(&heap, native, kind);
         if crate::value::layout_census::enabled() {
             crate::value::layout_census::sample_live(&heap);
         }
         crate::value::gc_finish_generation(&heap);
+        if let Some(pending) = heap.agent.pending.get() {
+            // A request made while the core was borrowed could publish only Agent metadata.
+            // Reattach it to the native due word AFTER finish_collection's budget reset.
+            heap.core.borrow_mut().request_collection(pending);
+        }
         let live = crate::value::heap_live_objects(&heap);
         // The ceiling is the live-object limit. Over the limit, keep the room gc_check left the
         // handler of the limit's RangeError: a stress or byte-budget collection must not take
         // it away.
-        self.gc_next = if live > self.live_object_limit {
-            self.gc_next.max(self.live_object_limit)
+        let limit = heap.agent.limit.get();
+        self.set_agent_next(if live > limit {
+            heap.agent.next.get().max(limit)
         } else {
-            self.live_object_limit
-        };
+            limit
+        });
         if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
             let stats = heap.core.borrow().stats();
             let minor = match kind {
@@ -963,6 +1045,7 @@ impl Interp {
                 kind,
             );
         }
+        CollectionOutcome::Collected(kind)
     }
 
     /// Exercise the real root/side-slot/sweep client without conservative native roots. This
@@ -974,7 +1057,6 @@ impl Interp {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     pub(crate) fn gc_collect_precise_for_test(&mut self, kind: CollectionKind) {
-        assert!(self.gc_heap_root());
         let heap = self.gc_heap.clone();
         let marking = Marking::new(self, kind);
         heap.handles.set_collecting(true);
@@ -1037,6 +1119,10 @@ impl Interp {
                 .clear_dead_weak(kind, |word| core.is_dead_target(word as usize));
         }
         crate::value::sweep_object_metadata(heap, &dead);
+        heap.agent
+            .metadata_owners
+            .borrow_mut()
+            .retain(|&identity, _| !dead.contains(identity));
         self.gc_heap_sweep_tree(&dead, &native, kind);
         heap.records.borrow_mut().native_functions_swept.clear();
         drop(native);
@@ -1055,7 +1141,7 @@ impl Interp {
         // The heap's bits no longer say what died: from here on only the list's length counts.
         let reclaimed = dead.len();
         drop(dead);
-        self.gc_heap_after_sweep(kind);
+        self.gc_heap_after_sweep_agent(kind);
         reclaimed
     }
 
@@ -1067,14 +1153,22 @@ impl Interp {
         native: &FastMap<usize, NativeGcGraph>,
         kind: CollectionKind,
     ) {
-        let empty = NativeGcGraph::default();
-        let graph = native
-            .get(&(std::ptr::from_ref(self) as usize))
-            .unwrap_or(&empty);
-        self.gc_sweep_dead_objects(dead, graph, kind);
-        for child in self.shadow_realms.values_mut() {
-            child.gc_heap_sweep_tree(dead, native, kind);
-        }
+        let access = self.gc_heap.agent.access.clone();
+        self.with_raw_access(|_| {
+            let pointers = access.snapshot();
+            let mut retired = Vec::new();
+            for (_, pointer) in pointers {
+                // SAFETY: marking references ended before this fresh mutable snapshot. Every
+                // removed subtree remains in retired until ALL visitors have finished.
+                let interp = unsafe { &mut *pointer.as_ptr() };
+                let empty = NativeGcGraph::default();
+                let graph = native.get(&(pointer.as_ptr() as usize)).unwrap_or(&empty);
+                interp.gc_sweep_dead_objects(dead, graph, kind, &mut retired);
+            }
+            for realm in retired {
+                drop_collected_realm(realm);
+            }
+        });
     }
 
     /// Evict the dead built-ins' [[Realm]] entries. A major collection walks the table. A minor
@@ -1113,7 +1207,7 @@ impl Interp {
 
     /// Post-sweep bookkeeping for every interpreter in the tree: drop expired inline-cache
     /// pins, deliver destruction notifications and schedule FinalizationRegistry cleanup.
-    fn gc_heap_after_sweep(&mut self, kind: CollectionKind) {
+    fn gc_heap_after_sweep(&mut self) {
         self.gc_prune_dead_pins();
         self.gc_drain_weak_deaths();
         // The finalizers' death notices, just drained, can ready more registries, and every
@@ -1123,16 +1217,31 @@ impl Interp {
         // (`clear_weak_identity`), and no script has run to register one. So no dead check is
         // needed, and none could be made: the sweep has cleared the bits that said what died.
         self.gc_schedule_finalization_cleanup(None);
-        self.gc_task_live = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_task_pending = false;
+    }
+
+    fn gc_heap_after_sweep_agent(&mut self, kind: CollectionKind) {
+        self.gc_heap
+            .agent
+            .task_live
+            .set(crate::value::heap_live_objects(&self.gc_heap));
+        self.gc_heap.agent.task_pending.set(false);
         // ArrayBuffer data counts from the last major collection: a minor one leaves the old
         // buffers that died, and their data, for a major collection to free.
         if kind == CollectionKind::Major {
-            self.buffer_gc.since_gc = 0;
+            let mut pressure = self.gc_heap.agent.buffers.get();
+            pressure.since_gc = 0;
+            self.gc_heap.agent.buffers.set(pressure);
         }
-        for child in self.shadow_realms.values_mut() {
-            child.gc_heap_after_sweep(kind);
-        }
+        let access = self.gc_heap.agent.access.clone();
+        self.with_raw_access(|_| {
+            for (_, pointer) in access.snapshot() {
+                // SAFETY: exclusive post-sweep visits after the shared phase, resolving only
+                // still-owned slots and the newly published requester capability.
+                unsafe {
+                    (&mut *pointer.as_ptr()).gc_heap_after_sweep();
+                }
+            }
+        });
     }
 
     /// Owners of this interpreter's owner-keyed side-table slots (see `trace_owner_slots`).
@@ -1202,6 +1311,11 @@ impl Interp {
             };
         }
         gc_side_slot_tables!(tables);
+        if let Some(home) = &self.shadow_home {
+            for &owner in self.gc_pins.keys() {
+                check("native owner route", owner, &*home.route);
+            }
+        }
         for (&owner, coroutine) in self.generators.iter() {
             check("generators", owner, coroutine);
         }
@@ -1278,6 +1392,7 @@ impl Interp {
     fn trace_gc_roots(&self, sink: &mut dyn GcSink) {
         let Interp {
             gc_heap: _,
+            realm_id: _,
             symbol_agent,
             global,
             global_env,
@@ -1315,7 +1430,7 @@ impl Interp {
             global_env_pins: _, // weak pins
             call_site: _,
             code_frames,
-            job_script_contexts: _,
+            job_script_contexts,
             host_resolution_marker,
             jit_helpers: _,
             jit_layout: _,
@@ -1353,8 +1468,7 @@ impl Interp {
             module_recs,
             module_loader: _,
             dynamic_module_loader: _,
-            pending_dynamic_imports,
-            next_dynamic_import_id: _,
+            routed_imports: _,       // conditional owner-keyed importValue bridge
             module_ns: _,            // side slots
             collection_iterators: _, // side slots
             weak_collection_data: _, // ephemerons
@@ -1367,9 +1481,6 @@ impl Interp {
             immutable_buffers: _,
             host_keyed_buffers: _,
             can_block: _,
-            pending_async_waits,
-            async_wait_inbox: _,
-            pending_timers,
             agent: _,
             typed_arrays: _,
             async_gens: _,
@@ -1394,27 +1505,19 @@ impl Interp {
             handled_rejections,
             temporal: _,
             temporal_cal: _,
-            microtasks,
             host_job_context: _,
             script_entry: _,
             host_entry_realm: _,
             capture_job_script_caller: _,
+            caller_origin, // actual conditional source-owner/Realm edges
             host_settings_states,
             retired_host_job_contexts: _,
             host_job_context_enter: _,
             host_job_context_leave: _,
-            kept_alive,
             host_state: _, // reported through its HostGc visitors
             generators: _, // side slots
             gc_next: _,
-            live_object_limit: _,
-            gc_suppressed: _,
-            buffer_gc: _,
             gc_tick: _,
-            gc_task_allocated: _,
-            gc_task_live: _,
-            gc_task_deferred: _,
-            gc_task_pending: _,
             constructing: _,
             super_call_ok: _,
             fn_frames,
@@ -1439,7 +1542,6 @@ impl Interp {
             weak_refs: _,               // weak
             weak_metadata: _,           // weak
             finalization_registries: _, // side slots
-            pending_finalization_cleanup,
             async_gen_busy: _,
             async_gen_queue: _, // side slots
             heap_release: _,
@@ -1506,6 +1608,12 @@ impl Interp {
             last.text.trace_gc(sink);
         }
         code_frames.trace_gc(sink);
+        for (_, origin) in job_script_contexts {
+            origin.trace_gc(sink);
+        }
+        if let Some(caller) = caller_origin {
+            caller.origin.trace_gc(sink);
+        }
         // The Agent's registered (Symbol.for) and well-known Symbols live as long as it does.
         {
             let agent = symbol_agent.borrow();
@@ -1520,11 +1628,6 @@ impl Interp {
         import_meta.trace_gc(sink);
         modules.trace_gc(sink);
         module_recs.trace_gc(sink);
-        pending_dynamic_imports.trace_gc(sink);
-        pending_async_waits.trace_gc(sink);
-        for (callback, _) in pending_timers {
-            callback.trace_gc(sink);
-        }
         new_target.trace_gc(sink);
         pending_new_target.trace_gc(sink);
         ctor_caller_realm.trace_gc(sink);
@@ -1536,9 +1639,7 @@ impl Interp {
             promise.trace_gc(sink);
             reason.trace_gc(sink);
         }
-        microtasks.trace_gc(sink);
         host_settings_states.trace_gc(sink);
-        kept_alive.trace_gc(sink);
         fn_frames.trace_gc(sink);
         if let Some(tail) = pending_tail {
             let (callee, this, arguments) = &**tail;
@@ -1551,7 +1652,6 @@ impl Interp {
         deferred_ns_objs.trace_gc(sink);
         borrowed_parameters.trace_gc(sink);
         module_source_objs.trace_gc(sink);
-        pending_finalization_cleanup.trace_gc(sink);
     }
 }
 

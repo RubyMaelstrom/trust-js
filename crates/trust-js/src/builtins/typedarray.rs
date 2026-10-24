@@ -77,6 +77,12 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         let Some(block) = crate::interpreter::shared_mem_get(id) else {
             return Err(i.make_error("TypeError", "grow requires a SharedArrayBuffer"));
         };
+        // Growth is new buffer data. Account for it before taking the lock: the accounting may
+        // collect, and a collection measures retained Shared Data Blocks under their locks.
+        let current = block.lock().unwrap().len();
+        if new_len > current && new_len <= max {
+            i.note_buffer_allocation(new_len - current);
+        }
         let mut bytes = block.lock().unwrap();
         let cur = bytes.len();
         if new_len == cur {
@@ -632,6 +638,19 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if new_len > max {
             return Err(i.make_error("RangeError", "ArrayBuffer resize out of range"));
         }
+        let buf = buf.clone();
+        let current = buf.borrow().len();
+        if let Some(extra) = new_len.checked_sub(current).filter(|&extra| extra > 0) {
+            // Growth is new buffer data, accounted for (and reserved) like a new buffer's.
+            i.note_buffer_allocation(extra);
+            if buf.borrow_mut().try_reserve_exact(extra).is_err() {
+                // Unreachable buffers still hold their data until a collection finds them.
+                i.collect_for_failed_allocation();
+                if buf.borrow_mut().try_reserve_exact(extra).is_err() {
+                    return Err(i.make_error("RangeError", "Array buffer allocation failed"));
+                }
+            }
+        }
         buf.borrow_mut().resize(new_len, 0);
         i.mark_array_buffer_dirty(ptr);
         // byteLength derives from the backing store length, which the resize above updated.
@@ -1005,7 +1024,7 @@ fn ta_sort_compare(
 /// A stable merge sort that propagates a throwing comparefn.
 fn ta_merge_sort(
     i: &mut Interp,
-    vals: &mut [Value],
+    vals: &mut crate::rooting::RootedVec,
     cmp: Option<&crate::callback::Callback>,
     is_bigint: bool,
 ) -> Result<(), Value> {
@@ -1022,21 +1041,21 @@ fn ta_merge_sort(
     let (mut li, mut ri, mut k) = (0usize, 0usize, 0usize);
     while li < left.len() && ri < right.len() {
         if ta_sort_compare(i, &left[li], &right[ri], cmp, is_bigint)? <= 0 {
-            vals[k] = left[li];
+            vals.set(k, left[li]);
             li += 1;
         } else {
-            vals[k] = right[ri];
+            vals.set(k, right[ri]);
             ri += 1;
         }
         k += 1;
     }
     while li < left.len() {
-        vals[k] = left[li];
+        vals.set(k, left[li]);
         li += 1;
         k += 1;
     }
     while ri < right.len() {
-        vals[k] = right[ri];
+        vals.set(k, right[ri]);
         ri += 1;
         k += 1;
     }

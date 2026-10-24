@@ -28,7 +28,7 @@ fn engine(tier: Tier) -> Engine {
     engine.set_tier(tier);
     engine.set_tier_threshold(0);
     engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
-    engine.interp.gc_task_deferred = true;
+    engine.interp.gc_heap.agent.task_deferred.set(true);
     engine
 }
 
@@ -339,6 +339,10 @@ fn table_writes() -> [TableWrite; 12] {
                         cleanup_callback: JobCallback::plain(Value::Obj(young)),
                         cells: Default::default(),
                         cleanup_scheduled: false,
+                        registry_realm: i.global,
+                        registry_context: i.host_job_context,
+                        callback_realm: None,
+                        callback_context: i.host_job_context,
                     },
                 );
             },

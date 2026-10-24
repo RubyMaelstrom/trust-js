@@ -728,7 +728,7 @@ mod packed_value_tests {
         assert!(!copied.append_in_place(&suffix));
         copied.append_or_replace(&crate::lstr::LStr::from(suffix.as_str()));
         assert_ne!(copied.as_str().as_ptr(), original_address);
-        *current = Value::Str(copied);
+        current.replace(Value::Str(copied));
         expected.push_str(&suffix);
         let replacement_word = copied.cell_word() as usize;
         let replacement_weak = crate::gc_handle::WeakRef::to(replacement_word);
@@ -1913,7 +1913,13 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let (user_func, user_env, user_realm, func_data_off, closure_ok) = match probe_func {
         Some(func) => {
             let realm = obj_addr; // any identity the probe can recognize
-            let closure = Callable::user(func.clone(), probe_env, realm);
+            let closure = Callable::user(
+                func.clone(),
+                probe_env,
+                realm,
+                None,
+                crate::agent_access::RealmId::ROOT,
+            );
             let words = callable_words(&closure);
             let Callable::User(user) = &closure else {
                 unreachable!("Callable::user makes a user callable")
@@ -2286,6 +2292,10 @@ pub struct UserCallable {
 pub(crate) struct UserCallableCache {
     pub(crate) runtime: Option<Rc<crate::function_runtime::FunctionRuntime>>,
     pub(crate) binding_getter: Option<crate::interpreter::BindingGetterCache>,
+    /// This closure's own runtime ScriptOrModule (`None` included) when `own_origin`. Otherwise
+    /// the closure shares its function's primary record (`Function::shared_origin`).
+    pub(crate) origin: Option<crate::agent_control::RuntimeOrigin>,
+    pub(crate) own_origin: bool,
 }
 
 impl UserCallable {
@@ -2309,25 +2319,56 @@ impl UserCallable {
             sidecar = Some(Box::new(UserCallableCache {
                 runtime: None,
                 binding_getter: proof,
+                origin: None,
+                own_origin: false,
             }));
         }
-        if sidecar
-            .as_ref()
-            .is_some_and(|sidecar| sidecar.runtime.is_none() && sidecar.binding_getter.is_none())
-        {
+        if sidecar.as_ref().is_some_and(|sidecar| {
+            sidecar.runtime.is_none() && sidecar.binding_getter.is_none() && !sidecar.own_origin
+        }) {
             sidecar = None;
         }
         self.cache.set(sidecar);
     }
 
+    /// Immutable source-record ownership is installed before the closure is published. Even
+    /// context-zero functions must retain that actual record when later invoked in another
+    /// interpreter; the current interpreter/parse cache cannot reconstruct its identity.
+    pub(crate) fn runtime_origin(
+        &self,
+        _owner: crate::agent_access::RealmId,
+        _agent: u64,
+    ) -> Option<crate::agent_control::RuntimeOrigin> {
+        if self.func.self_hosted {
+            return None;
+        }
+        let sidecar = self.cache.take();
+        let own = sidecar
+            .as_ref()
+            .filter(|sidecar| sidecar.own_origin)
+            .map(|sidecar| sidecar.origin.clone());
+        self.cache.set(sidecar);
+        own.unwrap_or_else(|| self.func.shared_origin().cloned())
+    }
+
     fn cloned_runtime_pin(&self) -> Option<Box<UserCallableCache>> {
         let sidecar = self.cache.take();
-        let pin = sidecar.as_ref().and_then(|sidecar| sidecar.runtime.clone());
+        let metadata = sidecar.as_ref().map(|sidecar| {
+            (
+                sidecar.runtime.clone(),
+                sidecar.origin.clone(),
+                sidecar.own_origin,
+            )
+        });
         self.cache.set(sidecar);
-        pin.map(|runtime| {
-            Box::new(UserCallableCache {
-                runtime: Some(runtime),
-                binding_getter: None,
+        metadata.and_then(|(runtime, origin, own_origin)| {
+            (runtime.is_some() || own_origin).then(|| {
+                Box::new(UserCallableCache {
+                    runtime,
+                    binding_getter: None,
+                    origin,
+                    own_origin,
+                })
             })
         })
     }
@@ -2370,21 +2411,37 @@ impl Callable {
         }
     }
 
-    pub(crate) fn user(func: Rc<Function>, env: Env, realm: usize) -> Callable {
-        let runtime = match func.runtime() {
-            crate::function_runtime::RuntimeLease::Primary(_) => None,
-            crate::function_runtime::RuntimeLease::Foreign(runtime) => {
-                Some(Box::new(UserCallableCache {
-                    runtime: Some(runtime),
-                    binding_getter: None,
-                }))
+    pub(crate) fn user(
+        func: Rc<Function>,
+        env: Env,
+        realm: usize,
+        origin: Option<crate::agent_control::RuntimeOrigin>,
+        _owner: crate::agent_access::RealmId,
+    ) -> Callable {
+        let (runtime, own_origin) = match func.runtime() {
+            // Most closures of one function in one heap come from the same record: they share
+            // the primary entry's copy, and only a differing (or absent) record is boxed.
+            crate::function_runtime::RuntimeLease::Primary(primary) => {
+                let shared = origin.as_ref().is_some_and(|origin| {
+                    Rc::ptr_eq(primary.origin.get_or_init(|| origin.clone()), origin)
+                });
+                (None, !shared && !func.self_hosted)
             }
+            crate::function_runtime::RuntimeLease::Foreign(runtime) => (Some(runtime), true),
         };
+        let metadata = (runtime.is_some() || own_origin).then(|| {
+            Box::new(UserCallableCache {
+                runtime,
+                binding_getter: None,
+                origin: if own_origin { origin } else { None },
+                own_origin,
+            })
+        });
         let user = UserCallable {
             func,
             env,
             realm,
-            cache: Cell::new(runtime),
+            cache: Cell::new(metadata),
         };
         Callable::User(crate::gc_box::new(user))
     }
@@ -2741,6 +2798,7 @@ impl InternalSlots {
 }
 
 pub(crate) struct GcState {
+    pub(crate) agent: crate::agent_control::AgentControl,
     heap_id: u64,
     #[cfg(feature = "architecture-diagnostics")]
     diagnostics: RefCell<allocation_diagnostics::State>,
@@ -2799,7 +2857,7 @@ pub(crate) type GcHeap = Rc<GcState>;
 #[cfg(feature = "embed")]
 pub(crate) struct EnteredRealm {
     /// The interpreter that entered it, by address.
-    pub(crate) interp: usize,
+    pub(crate) interp: crate::agent_access::RealmId,
     /// The entered Realm's key (its global object's address).
     pub(crate) key: usize,
     /// The state of the Realm it replaced, restored when the entry is left.
@@ -2953,11 +3011,21 @@ impl crate::gc_box::Payload for LazyFunctionPrototype {
     }
 }
 
-/// A closure cell's one edge: its environment.
+/// A closure's environment and immutable runtime source-record edges.
 fn trace_user_fn_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     // SAFETY: closure cells are initialized by `gc_box::new` before any collection.
     let user = unsafe { &*cell.cast::<UserCallable>() };
     visit(Env::as_ptr(&user.env).cast());
+    let metadata = user.cache.take();
+    let origin = match metadata.as_ref().filter(|metadata| metadata.own_origin) {
+        Some(metadata) => metadata.origin.as_ref(),
+        None if !user.func.self_hosted => user.func.shared_origin(),
+        None => None,
+    };
+    if let Some(origin) = origin {
+        crate::gc_trace::GcTrace::trace_gc(origin, &mut crate::gc_trace::VisitSink(visit));
+    }
+    user.cache.set(metadata);
 }
 
 /// A fresh string cell of `size` bytes in the active Agent's heap (see `LStr`).
@@ -2988,6 +3056,7 @@ pub(crate) fn interned_string(
 /// Report this heap's permanent caches and actual live code/template owners. Root containers
 /// are scanned in full in minor collections, including fields published since the last one.
 pub(crate) fn trace_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
+    heap.agent.trace_gc(sink);
     for string in heap.interned_strings.borrow().iter().flatten() {
         sink.word(string.cell_word());
     }
@@ -3890,6 +3959,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
     let (core, descs) = new_cell_heap();
     let heap_id = NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let heap = Rc::new(GcState {
+        agent: crate::agent_control::AgentControl::new(heap_id),
         heap_id,
         #[cfg(feature = "architecture-diagnostics")]
         diagnostics: RefCell::new(allocation_diagnostics::State::default()),

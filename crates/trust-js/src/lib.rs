@@ -63,6 +63,10 @@ pub use interpreter::SharedMem;
 mod bytecode;
 /// The execution tiers ([`Engine::set_tier`]).
 pub use bytecode::Tier;
+mod agent_access;
+mod agent_control;
+#[cfg(test)]
+mod agent_control_tests;
 mod cache;
 mod callback;
 mod callee_name;
@@ -610,6 +614,14 @@ impl Engine {
         self.interp.collect_garbage_for_host();
     }
 
+    /// Collections so far, and the minor collections among them. Hidden like the method above:
+    /// a diagnostic for host crates' allocation-accounting tests, not supported embedder API.
+    #[doc(hidden)]
+    pub fn unstable_gc_collection_counts(&self) -> (u64, u64) {
+        let stats = self.interp.gc_heap.core.borrow().stats();
+        (stats.collections, stats.minor_collections)
+    }
+
     /// Replace the realm's control handle before evaluating author code.
     ///
     /// Runtime assemblers use this after their finite, trusted bootstrap has installed built-ins:
@@ -696,35 +708,49 @@ impl Engine {
             body.first(),
             Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
         );
-        self.interp.strict = strict || directive_strict;
-        let result = self.interp.run_program_from(&body, Some(source));
-        match result {
-            Ok(v) => {
-                // Run queued promise reactions (the microtask checkpoint after the script).
-                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
-                    self.interp.gc_task_boundary();
-                    return Ok(ExecutionOutcome::Interrupted { reason });
-                }
-                self.interp.gc_task_boundary();
-                Ok(ExecutionOutcome::Value(self.render(&v)))
-            }
-            Err(interpreter::Abrupt::Throw(thrown)) => {
-                crate::jit::perf_error_escaped();
-                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
-                    self.interp.gc_task_boundary();
-                    return Ok(ExecutionOutcome::Interrupted { reason });
-                }
-                self.interp.gc_task_boundary();
-                let Completion::Throw { name, message } = self.describe_throw(thrown) else {
-                    unreachable!()
-                };
-                Ok(ExecutionOutcome::Throw { name, message })
-            }
-            Err(interpreter::Abrupt::Interrupt(reason)) => {
-                self.interp.gc_task_boundary();
-                Ok(ExecutionOutcome::Interrupted { reason })
-            }
-            Err(_) => Ok(ExecutionOutcome::Value(String::new())),
+        let result = self.interp.with_author_entry(|interp| {
+            interp.strict = strict || directive_strict;
+            interp.run_program_from(&body, Some(source))
+        });
+        Ok(self.finish_host_execution(result, None, true))
+    }
+
+    /// A completion remains a root while queued work and optional GC run. Formatting has its
+    /// own synchronous execution span AFTER this checkpoint; work it enqueues waits for the
+    /// next explicit/automatic checkpoint (never a guard Drop).
+    fn finish_host_execution(
+        &mut self,
+        result: Result<Value, interpreter::Abrupt>,
+        evaluation: Option<Value>,
+        render: bool,
+    ) -> ExecutionOutcome {
+        let completion = crate::rooting::Rooted::new((result, evaluation));
+        if let Err(interpreter::Abrupt::Interrupt(reason)) = &completion.0 {
+            self.interp.cancel_agent_checkpoint();
+            return ExecutionOutcome::Interrupted { reason: *reason };
+        }
+        if matches!(&completion.0, Err(interpreter::Abrupt::Throw(_))) {
+            crate::jit::perf_error_escaped();
+        }
+        if let Err(reason) = self.interp.drain_microtasks_interruptible() {
+            return ExecutionOutcome::Interrupted { reason };
+        }
+        let thrown = if let Err(interpreter::Abrupt::Throw(value)) = &completion.0 {
+            Some(*value)
+        } else {
+            completion
+                .1
+                .and_then(|promise| self.interp.promise_rejection(&promise))
+        };
+        if let Some(thrown) = thrown {
+            let Completion::Throw { name, message } = self.describe_throw(thrown) else {
+                unreachable!()
+            };
+            return ExecutionOutcome::Throw { name, message };
+        }
+        match &completion.0 {
+            Ok(value) if render => ExecutionOutcome::Value(self.render(value)),
+            _ => ExecutionOutcome::Value(String::new()),
         }
     }
 
@@ -754,35 +780,11 @@ impl Engine {
             body.first(),
             Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
         );
-        self.interp.strict = strict || directive_strict;
-        let result = self.interp.run_program(&body);
-        match result {
-            Ok(v) => {
-                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
-                    self.interp.gc_task_boundary();
-                    return Ok(ExecutionOutcome::Interrupted { reason });
-                }
-                self.interp.gc_task_boundary();
-                Ok(ExecutionOutcome::Value(self.render(&v)))
-            }
-            Err(interpreter::Abrupt::Throw(thrown)) => {
-                crate::jit::perf_error_escaped();
-                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
-                    self.interp.gc_task_boundary();
-                    return Ok(ExecutionOutcome::Interrupted { reason });
-                }
-                self.interp.gc_task_boundary();
-                let Completion::Throw { name, message } = self.describe_throw(thrown) else {
-                    unreachable!()
-                };
-                Ok(ExecutionOutcome::Throw { name, message })
-            }
-            Err(interpreter::Abrupt::Interrupt(reason)) => {
-                self.interp.gc_task_boundary();
-                Ok(ExecutionOutcome::Interrupted { reason })
-            }
-            Err(_) => Ok(ExecutionOutcome::Value(String::new())),
-        }
+        let result = self.interp.with_author_entry(|interp| {
+            interp.strict = strict || directive_strict;
+            interp.run_program(&body)
+        });
+        Ok(self.finish_host_execution(result, None, true))
     }
 
     /// Install a host module loader used by dynamic `import()` (and `eval_module`). `loader(specifier,
@@ -842,7 +844,8 @@ impl Engine {
         result: Option<(String, String)>,
     ) -> bool {
         self.interp.activate_gc_heap();
-        self.interp.finish_dynamic_module_load(request_id, result)
+        self.interp
+            .with_author_entry(|interp| interp.finish_dynamic_module_load(request_id, result))
     }
 
     /// The base URL of the classic scripts evaluated from now on (HTML: a classic script's base
@@ -887,36 +890,20 @@ impl Engine {
     ) -> Result<ExecutionOutcome, ParseError> {
         self.interp.activate_gc_heap();
         self.interp.module_loader = Some(std::rc::Rc::new(loader));
-        let result = self.interp.load_module(key, src);
-        Ok(match result {
-            Ok(_) => match self.interp.drain_microtasks_interruptible() {
-                Ok(()) => {
-                    self.interp.gc_task_boundary();
-                    ExecutionOutcome::Value(String::new())
-                }
-                Err(reason) => {
-                    self.interp.gc_task_boundary();
-                    ExecutionOutcome::Interrupted { reason }
-                }
-            },
-            Err(interpreter::Abrupt::Throw(value)) => {
-                crate::jit::perf_error_escaped();
-                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
-                    self.interp.gc_task_boundary();
-                    return Ok(ExecutionOutcome::Interrupted { reason });
-                }
-                self.interp.gc_task_boundary();
-                let Completion::Throw { name, message } = self.describe_throw(value) else {
-                    unreachable!()
-                };
-                ExecutionOutcome::Throw { name, message }
-            }
-            Err(interpreter::Abrupt::Interrupt(reason)) => {
-                self.interp.gc_task_boundary();
-                ExecutionOutcome::Interrupted { reason }
-            }
-            Err(_) => ExecutionOutcome::Value(String::new()),
-        })
+        let authority = self.interp.default_load_authority();
+        let (result, evaluation) = self.interp.with_author_entry(|interp| {
+            let origin = interp.new_referrer_record(
+                None,
+                Some(std::rc::Rc::from(interp.import_base.as_str())),
+                authority,
+                crate::agent_control::ReferrerKind::Realm,
+            );
+            interp.with_runtime_origin(Some(origin), |interp| {
+                let result = interp.load_module(key, src);
+                (result, interp.module_evaluation_promise(key))
+            })
+        });
+        Ok(self.finish_host_execution(result, evaluation, false))
     }
 
     /// Select the execution tier (see [`Tier`]). `Interp` never touches any codegen
@@ -939,13 +926,12 @@ impl Engine {
     pub fn set_live_object_limit(&mut self, limit: u64) {
         let floor = interpreter::MIN_CONFIGURED_LIVE_OBJECT_LIMIT as u64;
         let limit = limit.clamp(floor, i64::MAX as u64) as i64;
-        self.interp.live_object_limit = limit;
-        self.interp.gc_next = limit;
+        self.interp.set_agent_limit(limit);
     }
 
     /// The engine's current live-object ceiling (see [`Engine::set_live_object_limit`]).
     pub fn live_object_limit(&self) -> u64 {
-        self.interp.live_object_limit as u64
+        self.interp.gc_heap.agent.limit.get() as u64
     }
 
     /// Drain anything written to `console.*` since the last call, as Rust text (lone
@@ -961,40 +947,42 @@ impl Engine {
     }
 
     fn render(&mut self, v: &Value) -> String {
+        let value = crate::rooting::Rooted::new(*v);
         self.interp
-            .to_string(v)
-            .map(|s| jstr::to_text(&s).into_owned())
-            .unwrap_or_default()
+            .with_author_entry(|interp| render_value(interp, &value))
     }
 
     fn describe_throw(&mut self, thrown: Value) -> Completion {
-        // Pull the constructor name + message off an Error object; fall back to the rendered value.
-        let name = match self.interp.get_member_key(&thrown, "name") {
-            Ok(value) if !matches!(value.view(), ValueView::Undefined) => self.render(&value),
-            _ => {
-                // No own/inherited `name` (e.g. Test262Error): use the constructor's name.
-                match self.interp.get_member_key(&thrown, "constructor") {
+        let thrown = crate::rooting::Rooted::new(thrown);
+        self.interp.with_author_entry(|interp| {
+            let name = match interp.get_member_key(&thrown, "name") {
+                Ok(value) if !matches!(value.view(), ValueView::Undefined) => {
+                    render_value(interp, &value)
+                }
+                _ => match interp.get_member_key(&thrown, "constructor") {
                     Ok(ctor) if matches!(ctor.view(), ValueView::Obj(_)) => {
-                        match self.interp.get_member_key(&ctor, "name") {
+                        match interp.get_member_key(&ctor, "name") {
                             Ok(value) if !matches!(value.view(), ValueView::Undefined) => {
-                                self.render(&value)
+                                render_value(interp, &value)
                             }
                             _ => String::new(),
                         }
                     }
                     _ => String::new(),
+                },
+            };
+            let message = if matches!(thrown.view(), ValueView::Obj(_)) {
+                match interp.get_member_key(&thrown, "message") {
+                    Ok(value) if !matches!(value.view(), ValueView::Undefined) => {
+                        render_value(interp, &value)
+                    }
+                    _ => String::new(),
                 }
-            }
-        };
-        let message = if matches!(thrown.view(), ValueView::Obj(_)) {
-            match self.interp.get_member_key(&thrown, "message") {
-                Ok(value) if !matches!(value.view(), ValueView::Undefined) => self.render(&value),
-                _ => String::new(),
-            }
-        } else {
-            self.render(&thrown)
-        };
-        Completion::Throw { name, message }
+            } else {
+                render_value(interp, &thrown)
+            };
+            Completion::Throw { name, message }
+        })
     }
 
     fn legacy_completion(outcome: ExecutionOutcome) -> Completion {
@@ -1223,6 +1211,13 @@ pub mod embed {
     }
 }
 
+fn render_value(interp: &mut interpreter::Interp, value: &Value) -> String {
+    interp
+        .to_string(value)
+        .map(|s| jstr::to_text(&s).into_owned())
+        .unwrap_or_default()
+}
+
 /// The engine form of an interrupt-aware entry point's failure (`embed::EvalError`).
 #[cfg(feature = "embed")]
 pub(crate) enum EvalFailure {
@@ -1314,7 +1309,7 @@ impl interpreter::Interp {
         body: &[ast::Stmt],
         source: Option<std::rc::Rc<stack_trace::ScriptSource>>,
     ) -> Result<Value, EvalFailure> {
-        match self.run_classic_program(body, source) {
+        match self.with_author_entry(|interp| interp.run_classic_program(body, source)) {
             Ok(value) if matches!(value.view(), ValueView::Empty) => Ok(Value::Undefined),
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => {
@@ -1339,24 +1334,20 @@ impl interpreter::Interp {
             body.first(),
             Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
         );
-        self.strict = directive_strict;
-        let result = match self.run_program_from(&body, Some(source)) {
+        let result = match self.with_author_entry(|interp| {
+            interp.strict = directive_strict;
+            interp.run_program_from(&body, Some(source))
+        }) {
             Ok(value) if matches!(value.view(), ValueView::Empty) => Ok(Value::Undefined),
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => {
                 crate::jit::perf_error_escaped();
                 Err(EvalFailure::Throw(value))
             }
-            Err(interpreter::Abrupt::Interrupt(reason)) => {
-                self.gc_task_boundary();
-                Err(EvalFailure::Interrupted(reason))
-            }
+            Err(interpreter::Abrupt::Interrupt(reason)) => Err(EvalFailure::Interrupted(reason)),
             Err(_) => Ok(Value::Undefined),
         };
-        // This embedding entry runs one synchronous ECMAScript job. Promise jobs, if any, are
-        // deliberately owned by the caller and begin with a fresh [[KeptAlive]] list.
-        self.clear_kept_objects();
-        Ok(result)
+        Ok(self.finish_value_entry(result))
     }
 
     /// `Ctx::eval_snapshot_value_interruptible`: [`Self::eval_value_entry`] for a snapshot.
@@ -1365,11 +1356,7 @@ impl interpreter::Interp {
         bytes: &[u8],
     ) -> Result<Result<Value, EvalFailure>, ParseError> {
         let result = self.eval_classic_snapshot(bytes)?;
-        if matches!(&result, Err(EvalFailure::Interrupted(_))) {
-            self.gc_task_boundary();
-        }
-        self.clear_kept_objects();
-        Ok(result)
+        Ok(self.finish_value_entry(result))
     }
 
     /// `Ctx::eval_shared_snapshot_value_interruptible`: [`Self::eval_snapshot_value_entry`]
@@ -1379,11 +1366,7 @@ impl interpreter::Interp {
         bytes: &'static [u8],
     ) -> Result<Result<Value, EvalFailure>, ParseError> {
         let result = self.eval_shared_classic_snapshot(bytes)?;
-        if matches!(&result, Err(EvalFailure::Interrupted(_))) {
-            self.gc_task_boundary();
-        }
-        self.clear_kept_objects();
-        Ok(result)
+        Ok(self.finish_value_entry(result))
     }
 
     /// `Ctx::call_callback_interruptible`: call `func` as the event loop fires a callback, with
@@ -1395,27 +1378,29 @@ impl interpreter::Interp {
         args: &[Value],
         script_caller: &Value,
     ) -> Result<Value, EvalFailure> {
-        if let Err(abrupt) = self.interrupt_poll_force() {
-            let error = match abrupt {
-                interpreter::Abrupt::Interrupt(reason) => EvalFailure::Interrupted(reason),
-                interpreter::Abrupt::Throw(value) => EvalFailure::Throw(value),
-                _ => EvalFailure::Throw(Value::Undefined),
-            };
-            self.gc_task_boundary();
-            return Err(error);
-        }
         let result = self
-            .with_callback_script_caller(script_caller, |interp| {
-                interp.call_callback(*func, this, args)
+            .with_author_entry(|interp| {
+                interp.interrupt_poll_force()?;
+                interp.with_callback_script_caller(script_caller, |interp| {
+                    interp.call_callback(*func, this, args)
+                })
             })
             .map_err(|abrupt| match abrupt {
                 interpreter::Abrupt::Throw(value) => EvalFailure::Throw(value),
                 interpreter::Abrupt::Interrupt(reason) => EvalFailure::Interrupted(reason),
                 _ => EvalFailure::Throw(Value::Undefined),
             });
-        self.clear_kept_objects();
-        if matches!(result, Err(EvalFailure::Interrupted(_))) {
-            self.gc_task_boundary();
+        self.finish_value_entry(result)
+    }
+
+    fn finish_value_entry(
+        &mut self,
+        result: Result<Value, EvalFailure>,
+    ) -> Result<Value, EvalFailure> {
+        // The embedder owns its checkpoint. Successful entries retain shared kept objects;
+        // only explicit host interruption ends/cancels the outer work here.
+        if matches!(&result, Err(EvalFailure::Interrupted(_))) {
+            self.cancel_agent_checkpoint();
         }
         result
     }
@@ -1436,32 +1421,18 @@ impl interpreter::Interp {
             .collect()
     }
 
-    /// `Engine::run_microtasks`: a microtask checkpoint, then the task boundary.
+    /// Full outer host checkpoint: Promise FIFO plus the separate ready cleanup task lane.
+    /// Child and nested same-Agent requests defer; independent Agents have their own state.
     pub(crate) fn run_microtasks_entry(&mut self) {
         self.activate_gc_heap();
         self.drain_microtasks();
-        self.gc_task_boundary();
     }
 
-    /// `Engine::run_microtasks_interruptible`: a checkpoint keeping a host interruption as
-    /// control flow (pending jobs are discarded when a running job is killed).
     pub(crate) fn run_microtasks_interruptible_entry(
         &mut self,
     ) -> Result<(), crate::InterruptReason> {
         self.activate_gc_heap();
-        if let Err(reason) = self.drain_microtasks_interruptible() {
-            self.gc_task_boundary();
-            return Err(reason);
-        }
-        self.gc_task_boundary();
-        Ok(())
-    }
-
-    /// Whether promise-reaction jobs are queued.
-    pub(crate) fn has_pending_jobs(&self) -> bool {
-        !self.microtasks.is_empty()
-            || !self.pending_finalization_cleanup.is_empty()
-            || self.async_waits_ready()
+        self.drain_microtasks_interruptible()
     }
 
     /// `Ctx::enter_realm`: make `realm_global`'s Realm the active one, keeping the caller's on
@@ -1473,7 +1444,7 @@ impl interpreter::Interp {
         let (key, saved) = self.enter_embed_realm(realm_global)?;
         let mut entered = self.gc_heap.entered_realms.borrow_mut();
         entered.push(crate::value::EnteredRealm {
-            interp: std::ptr::from_ref(self) as usize,
+            interp: self.realm_id,
             key,
             saved,
         });
@@ -1493,7 +1464,7 @@ impl interpreter::Interp {
                     && entry.depth == entered.len()
                     && entered
                         .last()
-                        .is_some_and(|last| last.interp == std::ptr::from_ref(self) as usize),
+                        .is_some_and(|last| last.interp == self.realm_id),
                 "a RealmEntry is left by its own Engine, innermost first"
             );
             entered.pop().expect("the innermost entry")
@@ -1695,12 +1666,12 @@ impl Engine {
     /// memory limits, microtasks, or ClearKeptObjects. The host must end the
     /// interval and service pending collection when its input queue quiets down.
     pub fn defer_task_garbage_collection(&mut self, deferred: bool) {
-        self.interp.gc_task_deferred = deferred;
+        self.interp.gc_heap.agent.task_deferred.set(deferred);
     }
 
     /// Whether a checkpoint requested an optional collection that is pending.
     pub fn has_pending_task_garbage_collection(&self) -> bool {
-        self.interp.gc_task_pending
+        self.interp.gc_heap.agent.task_pending.get()
     }
 
     /// Service a deferred request between host tasks, after their microtask
@@ -1710,7 +1681,9 @@ impl Engine {
     /// the boundary's frames are built (see `Interp::gc_collect`).
     #[inline(always)]
     pub fn collect_pending_task_garbage(&mut self) -> i64 {
-        if !self.interp.gc_task_pending || self.interp.gc_task_deferred {
+        if !self.interp.gc_heap.agent.task_pending.get()
+            || self.interp.gc_heap.agent.task_deferred.get()
+        {
             return 0;
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -1783,26 +1756,16 @@ impl Engine {
         self.run_one_job_interruptible().unwrap_or(false)
     }
 
-    /// Run one queued job, preserving a host interruption from the job's JavaScript callback.
+    /// Partially pump one ready Agent job, preserving interruption. A successful return retains
+    /// KeptAlive and host roots across subsequent pumps. An empty return or a full
+    /// `run_microtasks` closes the checkpoint. Hosts that stop after `has_pending_jobs()==false`
+    /// must explicitly perform the full checkpoint; that read-only predicate never clears roots.
+    /// Nested same-Agent calls defer and return false.
     pub fn run_one_job_interruptible(&mut self) -> Result<bool, crate::InterruptReason> {
         self.interp.activate_gc_heap();
-        // Resolving the Atomics.waitAsync promises that can settle is a job, which may queue
-        // reaction jobs.
-        let settled = self.interp.settle_async_waits();
-        match self.interp.microtasks.pop_front() {
-            Some(job) => {
-                self.interp.run_job_interruptible(job)?;
-                self.interp.clear_kept_objects();
-                Ok(true)
-            }
-            None => match self.interp.pending_finalization_cleanup.pop_front() {
-                Some(registry) => {
-                    self.interp.run_finalization_cleanup_job(registry)?;
-                    Ok(true)
-                }
-                None => Ok(settled),
-            },
-        }
+        self.interp
+            .agent_checkpoint(Some(1))
+            .map(|completed| completed != 0)
     }
 }
 

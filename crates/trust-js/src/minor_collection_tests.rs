@@ -177,7 +177,7 @@ fn the_task_boundary_collects_minorly_unless_a_major_collection_is_due() {
     let (minor, major) = since(&engine, before);
     assert!(minor >= 1 && major == 0, "{minor} minor, {major} major");
     let before = collections(&engine);
-    engine.interp.gc_task_pending = true;
+    engine.interp.gc_heap.agent.task_pending.set(true);
     engine.interp.gc_task_boundary();
     assert_eq!(since(&engine, before), (1, 0));
     // A byte budget the heap is past: the next minor collection makes a major one due.
@@ -193,7 +193,7 @@ fn the_task_boundary_collects_minorly_unless_a_major_collection_is_due() {
         CollectionKind::Major
     );
     let before = collections(&engine);
-    engine.interp.gc_task_pending = true;
+    engine.interp.gc_heap.agent.task_pending.set(true);
     engine.interp.gc_task_boundary();
     assert_eq!(since(&engine, before), (0, 1));
 }
@@ -240,7 +240,7 @@ fn the_live_object_limit_collects_majorly_before_its_range_error() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = engine(tier);
         engine.set_live_object_limit(150_000);
-        engine.interp.gc_task_deferred = true;
+        engine.interp.gc_heap.agent.task_deferred.set(true);
         {
             let mut core = engine.interp.gc_heap.core.borrow_mut();
             core.set_nursery_bytes(Some(1 << 40));
@@ -286,7 +286,7 @@ fn the_live_object_limit_collects_majorly_before_its_range_error() {
 fn allocation_safepoints_collect_minorly_until_a_major_collection_is_due() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = engine(tier);
-        engine.interp.gc_task_deferred = true;
+        engine.interp.gc_heap.agent.task_deferred.set(true);
         {
             let mut core = engine.interp.gc_heap.core.borrow_mut();
             core.set_nursery_bytes(Some(256 << 10));
@@ -325,7 +325,7 @@ fn allocation_safepoints_collect_minorly_until_a_major_collection_is_due() {
 #[test]
 fn gc_stress_collects_minorly_with_every_mth_collection_major() {
     let mut engine = engine(Tier::Bytecode);
-    engine.interp.gc_task_deferred = true;
+    engine.interp.gc_heap.agent.task_deferred.set(true);
     {
         let mut core = engine.interp.gc_heap.core.borrow_mut();
         core.set_stress_every(1);

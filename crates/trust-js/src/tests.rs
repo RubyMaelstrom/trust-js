@@ -1815,7 +1815,14 @@ fn interruption_stops_an_endless_microtask_chain() {
     ));
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     interrupt.set_deadline(None);
-    assert!(engine.interp.microtasks.is_empty());
+    assert!(engine
+        .interp
+        .gc_heap
+        .agent
+        .work
+        .borrow()
+        .promises
+        .is_empty());
     // A collection at every safepoint (GC stress) may leave the 50 ms deadline a single turn.
     let several = if crate::gc_test::stress_active() {
         "true"
@@ -2441,7 +2448,7 @@ fn object_count_alone_does_not_collect() {
         engine.set_tier_threshold(0);
         // The end-of-eval task boundary would collect after this much growth: defer it, as the
         // embed API's `defer_task_garbage_collection` does.
-        engine.interp.gc_task_deferred = true;
+        engine.interp.gc_heap.agent.task_deferred.set(true);
         let heap = engine.interp.gc_heap.clone();
         // This heap's nursery budget, which TRUST_JS_GC_NURSERY_BYTES sets for every heap in the
         // process (`gc_collect::configure_heap`).
@@ -3666,26 +3673,25 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
         _ => panic!("parent marker was retained"),
     };
     let shadow_key = crate::value::Gc::as_ptr(&shadow) as usize;
-    let child = engine
+    let child_id = engine
         .interp
         .shadow_realms
         .get(&shadow_key)
-        .unwrap_or_else(|| panic!("ShadowRealm implementation remains available"));
-    let child_object = match (child
-        .global
-        .borrow()
-        .props
-        .get("childMarker")
-        .map(|property| property.value()))
-    .map(|__value| (__value).view())
-    {
-        Some(ValueView::Obj(object)) => object,
-        _ => panic!("child marker was retained"),
-    };
-
-    // A ShadowRealm allocates in its parent's (its Agent's) heap, so both markers
-    // live in the one heap; the caller's heap is still the active one afterwards.
-    assert!(std::rc::Rc::ptr_eq(&engine.interp.gc_heap, &child.gc_heap));
+        .unwrap_or_else(|| panic!("ShadowRealm implementation remains available"))
+        .id();
+    let child_object = engine.interp.with_realm_view(child_id, |child| {
+        assert!(std::rc::Rc::ptr_eq(&engine.interp.gc_heap, &child.gc_heap));
+        match child
+            .global
+            .borrow()
+            .props
+            .get("childMarker")
+            .map(|property| property.value().view())
+        {
+            Some(ValueView::Obj(object)) => object,
+            _ => panic!("child marker was retained"),
+        }
+    });
     let snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
     for marker in [&parent_object, &child_object] {
         assert!(snapshot
@@ -3769,8 +3775,11 @@ fn shadow_realm_stays_traced_while_its_function_is_wrapped() {
              realm.evaluate('0');
              read() + ':' + read.name",
         ),
-        "210:read"
+        // One Agent job queue: returning from the ShadowRealm runs no nested checkpoint.
+        "0:read"
     );
+    // The queued tokens survived both collections and ran at the script's checkpoint.
+    assert_eq!(eval_to_string(&mut engine, "read()"), "210");
 }
 
 /// P1 S4: parsed code can serve several engines on one thread, one after another. A
@@ -3986,7 +3995,11 @@ fn collected_shadow_realm_ends_without_resuming_its_coroutines() {
         .interp
         .shadow_realms
         .values()
-        .map(|realm| realm.generators.len())
+        .map(|realm| {
+            engine
+                .interp
+                .with_realm_view(realm.id(), |child| child.generators.len())
+        })
         .sum();
     assert!(parked > 0, "the realm holds a parked module body");
     eval_to_string(&mut engine, "held = undefined; 0");
@@ -6266,7 +6279,7 @@ fn deferred_task_gc_preserves_jobs_kept_objects_and_pending_pressure() {
         engine.run_microtasks_interruptible().unwrap();
         assert!(engine.has_pending_task_garbage_collection(), "{tier:?}");
         assert!(
-            engine.interp.kept_alive.is_empty(),
+            engine.interp.gc_heap.agent.kept_alive.borrow().is_empty(),
             "ClearKeptObjects was deferred"
         );
         assert_eq!(engine.collect_pending_task_garbage(), 0);
@@ -6300,7 +6313,9 @@ fn deferred_task_gc_keeps_allocation_safepoints_enabled() {
             "var o={};o.self=o;var weak=new WeakRef(o);o=null;",
         );
         engine.run_microtasks_interruptible().unwrap();
-        engine.interp.gc_next = engine.interp.live_object_count() + 128;
+        engine
+            .interp
+            .set_agent_next(engine.interp.live_object_count() + 128);
         eval_quiet(
             &mut engine,
             "for(var i=0;i<2000;i++){var cycle={};cycle.self=cycle;}cycle=null;",
@@ -6338,7 +6353,9 @@ fn compiled_allocation_loop_safepoints_preserve_live_and_kept_roots() {
                  }",
         );
         engine.run_microtasks_interruptible().unwrap();
-        engine.interp.gc_next = engine.interp.live_object_count() + 128;
+        engine
+            .interp
+            .set_agent_next(engine.interp.live_object_count() + 128);
         assert!(
             eval_true(
                 &mut engine,
@@ -6388,7 +6405,9 @@ fn abrupt_continue_allocation_safepoints_run_after_finalizers() {
                 ),
             );
             engine.run_microtasks_interruptible().unwrap();
-            engine.interp.gc_next = engine.interp.live_object_count() + 128;
+            engine
+                .interp
+                .set_agent_next(engine.interp.live_object_count() + 128);
             let call = if generator {
                 "allocate().next().value"
             } else {
@@ -6413,7 +6432,7 @@ fn compiled_allocation_guard_accepts_maximum_signed_threshold() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         engine.defer_task_garbage_collection(true);
-        engine.interp.gc_next = i64::MAX;
+        engine.interp.set_agent_next(i64::MAX);
         let result = engine.scope(|cx| {
             value_in(cx, "function allocate(){let index=0;while(index<1000){let cycle={};cycle.self=cycle;index++;}return index;}allocate()").as_num_opt()
         });
@@ -6707,6 +6726,8 @@ fn promise_jobs_restore_their_embedder_settings_context() {
     );
 
     engine.run_microtasks();
+    // The job's settings were prepared around it and restored afterwards.
+    assert_eq!(engine.host_job_context(), 0);
     assert_eq!(run_in(&mut engine, "observedHostContext"), "41");
     let trace = engine
         .host_mut::<ContextTrace>()
@@ -7127,7 +7148,11 @@ fn engine_teardown_reclaims_the_entire_object_and_environment_graph() {
                 .interp
                 .shadow_realms
                 .values()
-                .map(|child| Rc::downgrade(&child.gc_heap))
+                .map(|child| {
+                    engine
+                        .interp
+                        .with_realm_view(child.id(), |child| Rc::downgrade(&child.gc_heap))
+                })
                 .collect();
             assert!(!child_heaps.is_empty());
             drop(engine);
@@ -20199,9 +20224,13 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
     assert!(retired_namespace.in_map(&engine.interp.gc_pins));
     assert!(engine
         .interp
-        .microtasks
+        .gc_heap
+        .agent
+        .work
+        .borrow()
+        .promises
         .iter()
-        .any(|job| job.host_context == 61));
+        .any(|job| job.payload.host_context == 61));
 
     assert!(engine.release_host_job_context(61));
     assert!(!engine.release_host_job_context(61));
@@ -20222,9 +20251,13 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
         .any(|key| crate::modules::module_map_context(key) == 61));
     assert!(!engine
         .interp
-        .microtasks
+        .gc_heap
+        .agent
+        .work
+        .borrow()
+        .promises
         .iter()
-        .any(|job| job.host_context == 61));
+        .any(|job| job.payload.host_context == 61));
 
     engine.run_microtasks();
     assert_eq!(run_in(&mut engine, "retiredJobRan"), "false");
@@ -27629,7 +27662,7 @@ fn atomics_wait_async_settles_through_the_job_queue() {
             "tier {tier:?}"
         );
         assert!(
-            engine.interp.pending_async_waits.is_empty(),
+            engine.interp.gc_heap.agent.work.borrow().waits.is_empty(),
             "tier {tier:?}"
         );
     }
@@ -31889,3 +31922,39 @@ fn embedding_helpers_follow_their_documented_semantics() {
 
 #[path = "property_key_security_tests.rs"]
 mod property_key_security;
+
+/// [[HasTLA]] counts every `await` the module body Contains: class heritage, computed names and
+/// `await using` included. A module missed by the scan ran synchronously, where an `await`
+/// cannot suspend (it once drained the job queue in place instead).
+#[test]
+fn module_await_in_class_heritage_computed_names_and_await_using_suspends() {
+    for (source, expected) in [
+        (
+            "function fn() { return function () {}; }\
+             export class C extends fn(await new Promise(r => r(1))) {}\
+             globalThis.r = typeof C;",
+            "function",
+        ),
+        (
+            "class K { [await Promise.resolve('k')]() { return 1; } } globalThis.r = new K().k();",
+            "1",
+        ),
+        (
+            "const { [await Promise.resolve('a')]: a = await Promise.resolve(2) } = {};\
+             globalThis.r = a;",
+            "2",
+        ),
+        (
+            "const objs = [1, 2].map(n => ({ n, async [Symbol.asyncDispose]() {} }));\
+             const f = []; let i = 0;\
+             for (await using x of objs) { f[i++] = () => x.n; }\
+             globalThis.r = f.map(g => g()).join();",
+            "1,2",
+        ),
+    ] {
+        assert_eq!(
+            run_module(&[("m.js", source)], "String(globalThis.r)"),
+            expected
+        );
+    }
+}

@@ -40,8 +40,42 @@ pub(crate) fn module_map_context(key: &str) -> u64 {
     };
     encoded
         .split_once(MODULE_CONTEXT_SEPARATOR)
-        .and_then(|(context, _)| context.parse().ok())
+        .and_then(|(context, _)| context.split('@').next()?.parse().ok())
         .unwrap_or(0)
+}
+
+/// Qualify delegated graphs by originating interpreter as well as its host context. Own
+/// context-zero/ordinary graphs retain the historical spelling; no internal prefix is public.
+pub(crate) fn authority_module_key(
+    target: crate::agent_access::RealmId,
+    authority: crate::agent_control::LoadAuthority,
+    url: &str,
+) -> String {
+    let url = module_map_url(url);
+    if authority.owner == target {
+        return module_map_key(authority.context, url);
+    }
+    format!(
+        "{MODULE_CONTEXT_SEPARATOR}{}@{}{MODULE_CONTEXT_SEPARATOR}{url}",
+        authority.context,
+        authority.owner.number()
+    )
+}
+pub(crate) fn module_key_has_authority(
+    key: &str,
+    target: crate::agent_access::RealmId,
+    authority: crate::agent_control::LoadAuthority,
+) -> bool {
+    if module_map_context(key) != authority.context {
+        return false;
+    }
+    let owner = key
+        .strip_prefix(MODULE_CONTEXT_SEPARATOR)
+        .and_then(|encoded| encoded.split_once(MODULE_CONTEXT_SEPARATOR))
+        .and_then(|(header, _)| header.split_once('@'))
+        .and_then(|(_, owner)| owner.parse::<u64>().ok())
+        .unwrap_or(target.number());
+    owner == authority.owner.number()
 }
 
 /// The URL a module's `import.meta.url` reports and its `import()` calls resolve against: its
@@ -79,6 +113,7 @@ pub(crate) struct ModuleRec {
     body: Rc<Vec<Stmt>>,
     /// The module's source record, for its top-level frame in stack traces.
     source: Rc<crate::stack_trace::ScriptSource>,
+    origin: crate::agent_control::RuntimeOrigin,
     env: Env,
     pub ns: Value,
     meta: Value,
@@ -189,7 +224,9 @@ pub(crate) struct PendingDynamicImport {
     specifier: String,
     attr_type: Option<String>,
     defer: bool,
-    pub(crate) host_context: u64,
+    pub(crate) authority: crate::agent_control::LoadAuthority,
+    pub(crate) authority_route: Rc<crate::agent_control::Route>,
+    pub(crate) origin: crate::agent_control::RuntimeOrigin,
 }
 
 impl ModuleRec {
@@ -322,9 +359,8 @@ impl Interp {
     /// The evaluation promise for `key`, redirected to its cycle root once evaluation has begun.
     /// Browser embedders use this to delay a module script's completion steps through top-level
     /// await instead of treating the initial suspension as successful evaluation.
-    #[cfg(feature = "embed")]
     pub(crate) fn module_evaluation_promise(&self, key: &str) -> Option<Value> {
-        let key = module_map_key(self.host_job_context, key);
+        let key = authority_module_key(self.realm_id, self.load_authority(), key);
         let record = self.module_recs.get(&key)?;
         let evaluation_key = if (record.started || record.evaluated || record.evaluating)
             && record.cycle_root.is_some()
@@ -339,7 +375,10 @@ impl Interp {
     /// Load, link, and evaluate the module identified by canonical `key` (with initial `src`),
     /// returning its namespace object.
     pub(crate) fn load_module(&mut self, key: &str, src: &str) -> Result<Value, Abrupt> {
-        let key = module_map_key(self.host_job_context, key);
+        if !self.authority_is_live(self.load_authority()) {
+            return Err(self.throw("TypeError", "module load authority has retired"));
+        }
+        let key = authority_module_key(self.realm_id, self.load_authority(), key);
         // Phase 1: parse the whole graph (so every module's export tables exist before any linking).
         self.load_requested_modules(&key, Some(ModuleSource::Source(src.to_string())))?;
         // Phase 2: link (hoist bindings, wire live imports, build namespaces) depth-first.
@@ -361,8 +400,6 @@ impl Interp {
         let top = self.module_recs[&key].top_promise.unwrap();
         let mut stack = Vec::new();
         self.inner_module_evaluation_async(&key, &mut stack, &mut 0);
-        self.drain_microtasks_interruptible()
-            .map_err(Abrupt::Interrupt)?;
         if let ValueView::Obj(o) = &(top).view() {
             if let Some(ps) = self.promises.get(&(crate::value::Gc::as_ptr(o) as usize)) {
                 if ps.status == 2 {
@@ -488,7 +525,7 @@ impl Interp {
         };
         // Module source text comes from the host (its loaders and entry points): Rust text, in
         // which a character of the engine's lone-surrogate range is a real character.
-        let origin = crate::stack_trace::SourceOrigin::new(key);
+        let origin = crate::stack_trace::SourceOrigin::new(module_map_url(key));
         let (body, source) =
             crate::parser::parse_module_from(&crate::jstr::from_text(&src), Some(&origin))
                 .map_err(|e| self.throw("SyntaxError", e.message))?;
@@ -582,11 +619,19 @@ impl Interp {
             .filter(|(spec, _)| defer_specs.get(*spec).copied().unwrap_or(false))
             .map(|(_, canon)| canon.clone())
             .collect();
+        let authority = self.load_authority();
+        let origin = self.new_referrer_record(
+            Some(source.clone()),
+            source.referrer().cloned(),
+            authority,
+            crate::agent_control::ReferrerKind::Module(key.to_string()),
+        );
         self.module_recs.insert(
             key.to_string(),
             ModuleRec {
                 body: body.clone(),
                 source,
+                origin,
                 env,
                 ns,
                 meta,
@@ -645,6 +690,19 @@ impl Interp {
     /// succeeded, which lets the outer operation restore precisely the in-progress records after
     /// an abrupt completion.
     fn inner_module_linking(&mut self, key: &str, stack: &mut Vec<String>) -> Result<(), Abrupt> {
+        let Some(origin) = self.module_runtime_origin(key) else {
+            return Err(self.throw("TypeError", "incomplete module graph"));
+        };
+        self.with_runtime_origin(Some(origin), |this| {
+            this.inner_module_linking_body(key, stack)
+        })
+    }
+
+    fn inner_module_linking_body(
+        &mut self,
+        key: &str,
+        stack: &mut Vec<String>,
+    ) -> Result<(), Abrupt> {
         let Some(rec) = self.module_recs.get(key) else {
             // A host loading failure must have rejected LoadRequestedModules before Link. Keep the
             // engine boundary total even if a corrupt/incomplete host graph reaches this point.
@@ -713,11 +771,17 @@ impl Interp {
             Some(l) => l.clone(),
             None => return Err(self.throw("TypeError", "no module loader configured")),
         };
-        let context = module_map_context(referrer);
+        let authority = self.load_authority();
+        if !self.authority_is_live(authority) {
+            return Err(self.throw("TypeError", "module load authority has retired"));
+        }
         let public_referrer = module_map_url(referrer);
         let loaded = self.with_host_callback(|_| loader(specifier, public_referrer, attr_type));
         match loaded {
-            Some((canonical, source)) => Ok((module_map_key(context, &canonical), source)),
+            Some((canonical, source)) => Ok((
+                authority_module_key(self.realm_id, authority, &canonical),
+                source,
+            )),
             None => Err(self.throw(
                 "TypeError",
                 format!("module not found: {specifier} (imported from {public_referrer})"),
@@ -1204,6 +1268,13 @@ impl Interp {
     }
 
     fn evaluate_module(&mut self, key: &str) -> Result<(), Abrupt> {
+        let Some(origin) = self.module_runtime_origin(key) else {
+            return Err(self.throw("TypeError", "incomplete module graph"));
+        };
+        self.with_runtime_origin(Some(origin), |this| this.evaluate_module_body(key))
+    }
+
+    fn evaluate_module_body(&mut self, key: &str) -> Result<(), Abrupt> {
         {
             let rec = &self.module_recs[key];
             if let Some(err) = &rec.eval_error {
@@ -1532,6 +1603,12 @@ impl Interp {
     /// Execute `key`'s own body (all dependencies done): a TLA body parks in a coroutine whose
     /// completion runs the ancestor cascade; a synchronous body runs now.
     fn module_execute_async(&mut self, key: &str) {
+        let origin = self
+            .module_runtime_origin(key)
+            .expect("linked module runtime identity");
+        self.with_runtime_origin(Some(origin), |this| this.module_execute_async_body(key));
+    }
+    fn module_execute_async_body(&mut self, key: &str) {
         let top = self.module_recs[key].top_promise;
         let (body, env, meta, source) = {
             let rec = &self.module_recs[key];
@@ -1561,7 +1638,10 @@ impl Interp {
             let coro = if let Some(chunk) = crate::bytecode::compile_module(&body, &bindings) {
                 let mut vm =
                     crate::bytecode::VmCoro::new(self, chunk, env, Value::Undefined, &[], &[]);
-                vm.frame = Some(Interp::resumed_module_frame(source.clone()));
+                vm.frame = Some(Interp::resumed_module_frame(
+                    source.clone(),
+                    self.module_recs[key].origin.clone(),
+                ));
                 crate::coroutine::Coroutine::Module(Box::new(ModuleCoro::new(vm, module_key)))
             } else {
                 // Compiler coverage is a prerequisite for AsyncBlock execution. Contain a future
@@ -1720,20 +1800,76 @@ impl Interp {
 
     /// Whether `ptr` (an object pointer) is a module namespace exotic object. Asked on [[Get]]
     /// slow paths for every object, so an empty table answers without a probe.
+    /// Whether no module namespace can exist: none here, and no other interpreter. Every
+    /// property path asks, so the answer avoids any table probe or index lookup.
+    #[inline(always)]
+    fn no_namespaces(&self) -> bool {
+        self.module_ns.is_empty() && self.single_interpreter()
+    }
+
+    #[inline(always)]
     pub(crate) fn is_namespace(&self, ptr: usize) -> bool {
-        !self.module_ns.is_empty() && self.module_ns.contains_key(&ptr)
+        !self.no_namespaces() && self.namespace_owner(ptr).is_some()
+    }
+
+    fn namespace_owner(&self, ptr: usize) -> Option<crate::agent_access::RealmId> {
+        self.metadata_owner(ptr, |interp, ptr| {
+            !interp.module_ns.is_empty() && interp.module_ns.contains_key(&ptr)
+        })
+    }
+
+    #[inline(always)]
+    pub(crate) fn namespace_binding(&self, ptr: usize, key: &str) -> Option<NsBinding> {
+        if self.no_namespaces() {
+            return None;
+        }
+        self.namespace_binding_slow(ptr, key)
+    }
+
+    fn namespace_binding_slow(&self, ptr: usize, key: &str) -> Option<NsBinding> {
+        if let Some(bindings) = self.module_ns.get(&ptr) {
+            return bindings.get(key).cloned();
+        }
+        let owner =
+            self.foreign_metadata_owner(ptr, |interp, ptr| interp.module_ns.contains_key(&ptr))?;
+        self.with_realm_view(owner, |interp| {
+            interp.module_ns.get(&ptr)?.get(key).cloned()
+        })
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_deferred_namespace(&self, ptr: usize) -> bool {
+        if self.deferred_ns.is_empty() && self.single_interpreter() {
+            return false;
+        }
+        self.metadata_owner(ptr, |interp, ptr| {
+            !interp.deferred_ns.is_empty() && interp.deferred_ns.contains_key(&ptr)
+        })
+        .is_some()
     }
 
     /// A module namespace's `[[GetOwnProperty]]` for a string key: `Some(property)` with the export's
     /// *current* value (writable, enumerable, non-configurable) if `key` is an exported name, or
     /// `Some(Err(ReferenceError))` if the underlying binding is still uninitialized. `None` means the
     /// key is not an export (the caller falls back to ordinary lookup — e.g. `@@toStringTag`).
+    #[inline(always)]
     pub(crate) fn namespace_own_property(
         &mut self,
         ptr: usize,
         key: &str,
     ) -> Option<Result<Property, Abrupt>> {
-        let binding = self.module_ns.get(&ptr)?.get(key)?.clone();
+        if self.no_namespaces() {
+            return None;
+        }
+        self.namespace_own_property_slow(ptr, key)
+    }
+
+    fn namespace_own_property_slow(
+        &mut self,
+        ptr: usize,
+        key: &str,
+    ) -> Option<Result<Property, Abrupt>> {
+        let binding = self.namespace_binding(ptr, key)?;
         let value = match binding {
             NsBinding::Live(env, local) => match self.get_var(&local, &env) {
                 Ok(v) => v,
@@ -1742,6 +1878,30 @@ impl Interp {
             NsBinding::Static(v) => v,
         };
         Some(Ok(Property::data(value, true, true, false)))
+    }
+
+    fn module_runtime_origin(&self, key: &str) -> Option<crate::agent_control::RuntimeOrigin> {
+        self.module_recs
+            .get(key)
+            .map(|record| record.origin.clone())
+    }
+
+    pub(crate) fn delegated_import(
+        &mut self,
+        specifier: &str,
+        referrer: &str,
+        authority: crate::agent_control::LoadAuthority,
+    ) -> Value {
+        let origin = self.new_referrer_record(
+            None,
+            Some(Rc::from(referrer)),
+            authority,
+            crate::agent_control::ReferrerKind::Realm,
+        );
+        self.with_runtime_origin(Some(origin), |this| {
+            let promise = this.new_promise();
+            this.dynamic_import_from(promise, specifier, None, false, referrer)
+        })
     }
 
     /// `import(specifier)`: ask an asynchronous embedder first, then retain the legacy synchronous
@@ -1754,29 +1914,171 @@ impl Interp {
         defer: bool,
         referrer: Option<Value>,
     ) -> Value {
-        let promise = self.new_promise();
-        // EvaluateImportCall: the referrer is GetActiveScriptOrModule(), else the current Realm
-        // (whose host-defined base is the host's import base). Module code finds its module
-        // lexically: the `import.meta` captured at the call site survives `await`. Other code
-        // finds the active Script or Module by its execution contexts, including the script
-        // execution context a browser host pushes for a job callback (HTML HostCallJobCallback).
-        let meta = match referrer {
-            Some(meta) => Some(meta),
-            None => match self.active_script_referrer() {
-                Some(active) => {
-                    return self.dynamic_import_from(promise, specifier, attr_type, defer, &active)
-                }
-                None => self.import_meta,
+        let promise = crate::rooting::Rooted::new(self.new_promise());
+        let origin = crate::rooting::Rooted::new(
+            self.active_runtime_origin()
+                .unwrap_or_else(|| self.default_runtime_origin(None)),
+        );
+        let referrer = match origin.referrer.as_ref() {
+            Some(referrer) => referrer.to_string(),
+            None => match referrer.or(self.import_meta) {
+                Some(meta) => match self.get_member_key(&meta, "url").map(|value| value.view()) {
+                    Ok(ValueView::Str(value)) => value.to_string(),
+                    _ => self.import_base.clone(),
+                },
+                None => self.import_base.clone(),
             },
         };
-        let referrer = match meta {
-            Some(m) => match (self.get_member_key(&m, "url")).map(|__value| (__value).view()) {
-                Ok(ValueView::Str(s)) => s.to_string(),
-                _ => self.import_base.clone(),
-            },
-            None => self.import_base.clone(),
+        let Some(source) = origin.owner.as_ref() else {
+            let error = self.make_error("TypeError", "module source record is unavailable");
+            self.reject_promise(&promise, error);
+            return *promise;
         };
-        self.dynamic_import_from(promise, specifier, attr_type, defer, &referrer)
+        let same_realm = source.target == self.realm_id
+            && origin
+                .realm
+                .is_some_and(|realm| crate::value::Gc::ptr_eq(&realm, &self.global));
+        if same_realm {
+            self.in_source_record((*origin).clone(), |this| {
+                this.dynamic_import_from(*promise, specifier, attr_type, defer, &referrer)
+            })
+        } else {
+            self.import_from_source_owner(
+                *promise,
+                (*origin).clone(),
+                specifier,
+                attr_type,
+                defer,
+                &referrer,
+            )
+        }
+    }
+
+    /// A source is loaded in its actual interpreter/Realm, independent of the invocation
+    /// Realm which owns the result capability. No copied namespace or ShadowRealm wrapper.
+    fn import_from_source_owner(
+        &mut self,
+        promise: Value,
+        origin: crate::agent_control::RuntimeOrigin,
+        specifier: &str,
+        attr_type: Option<&str>,
+        defer: bool,
+        referrer: &str,
+    ) -> Value {
+        let promise = crate::rooting::Rooted::new(promise);
+        let origin = crate::rooting::Rooted::new(origin);
+        let requester = self.realm_route();
+        let realm = self.global;
+        let context = self.host_job_context;
+        let source = origin
+            .owner
+            .as_ref()
+            .expect("validated source owner")
+            .clone();
+        let request = self.with_route(source.target, |owner| {
+            owner.in_source_record((*origin).clone(), |owner| {
+                let inner = owner.new_promise();
+                owner.dynamic_import_from(inner, specifier, attr_type, defer, referrer)
+            })
+        });
+        let request = crate::rooting::Rooted::new(request);
+        let identity = promise
+            .as_obj()
+            .map(|owner| crate::value::Gc::as_ptr(&owner) as usize)
+            .expect("import capability");
+        self.routed_imports.insert(
+            &self.gc_heap,
+            identity,
+            crate::agent_control::RoutedImport {
+                requester: requester.clone(),
+                requester_realm: realm,
+                context,
+                authority: origin.authority,
+                source: source.clone(),
+                request: *request,
+                mode: crate::agent_control::ImportMode::Namespace,
+                origin: Some((*origin).clone()),
+            },
+        );
+        let fulfilled = crate::interpreter::JobCallback {
+            internal: crate::interpreter::InternalJob::RoutedImportFulfilled {
+                requester: requester.target,
+                realm: crate::value::Gc::as_ptr(&realm) as usize,
+                context,
+            },
+            ..self.make_job_callback(*promise)
+        };
+        let rejected = crate::interpreter::JobCallback {
+            internal: crate::interpreter::InternalJob::RoutedImportRejected {
+                requester: requester.target,
+                realm: crate::value::Gc::as_ptr(&realm) as usize,
+                context,
+            },
+            ..self.make_job_callback(*promise)
+        };
+        let handlers = crate::rooting::Rooted::new((fulfilled, rejected));
+        self.with_route(source.target, |owner| {
+            owner.perform_promise_then(
+                &request,
+                handlers.0.clone(),
+                handlers.1.clone(),
+                Value::Undefined,
+            );
+        });
+        *promise
+    }
+
+    pub(crate) fn in_source_record<R: crate::gc_trace::GcTrace + 'static>(
+        &mut self,
+        origin: crate::agent_control::RuntimeOrigin,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let origin = crate::rooting::Rooted::new(origin);
+        assert_eq!(
+            origin.owner.as_ref().expect("source owner").target,
+            self.realm_id
+        );
+        let global = origin.realm.expect("source Realm");
+        let key = crate::value::Gc::as_ptr(&global) as usize;
+        let run = |this: &mut Self| {
+            this.with_settings_context(origin.host_context, |this| {
+                this.with_runtime_origin(Some((*origin).clone()), operation)
+            })
+        };
+        if crate::value::Gc::ptr_eq(&self.global, &global) {
+            run(self)
+        } else {
+            let state = self
+                .realms
+                .get(&key)
+                .expect("retained source Realm")
+                .snapshot_clone();
+            self.with_realm_snapshot(key, state, run)
+        }
+    }
+
+    fn cached_source_request(
+        &self,
+        origin: &crate::agent_control::RuntimeOrigin,
+        request: &crate::agent_control::LoadedRequest,
+    ) -> Option<String> {
+        if let Some(key) = origin.loaded.borrow().get(request) {
+            return Some(key.clone());
+        }
+        if let crate::agent_control::ReferrerKind::Module(key) = &origin.kind {
+            // Static import and ordinary import() from this very same Module Record must
+            // resolve the same request, regardless of the caller's Realm or loader changes.
+            return self
+                .module_recs
+                .get(key)?
+                .resolved
+                .get(&dep_map_key(
+                    &request.specifier,
+                    request.attr_type.as_deref(),
+                ))
+                .cloned();
+        }
+        None
     }
 
     /// HostLoadImportedModule for `import()` from `referrer` (a module URL or a script's base),
@@ -1789,29 +2091,79 @@ impl Interp {
         defer: bool,
         referrer: &str,
     ) -> Value {
-        let host_context = self.host_job_context;
+        let origin = self
+            .active_runtime_origin()
+            .unwrap_or_else(|| self.default_runtime_origin(None));
+        let request = crate::agent_control::LoadedRequest {
+            specifier: specifier.to_string(),
+            attr_type: attr_type.map(str::to_string),
+            defer,
+        };
+        let authority = origin.authority;
+        let Some(authority_route) = self.authority_route(authority) else {
+            let reason = self.make_error("TypeError", "module load authority has retired");
+            self.reject_promise(&promise, reason);
+            return promise;
+        };
+        let authority_route = crate::rooting::Rooted::new(authority_route);
+        if let Some(key) = self.cached_source_request(&origin, &request) {
+            self.finish_dynamic_import(promise, attr_type, defer, Ok(key));
+            return promise;
+        }
         if let Some(loader) = self.dynamic_module_loader.clone() {
-            let request_id = self.next_dynamic_import_id;
-            self.next_dynamic_import_id = self.next_dynamic_import_id.wrapping_add(1).max(1);
-            let accepted = self.with_host_callback(|_| {
-                loader(request_id, host_context, specifier, referrer, attr_type)
-            });
-            if accepted {
-                self.pending_dynamic_imports.insert(
-                    request_id,
-                    PendingDynamicImport {
-                        promise,
-                        specifier: specifier.to_string(),
-                        attr_type: attr_type.map(str::to_string),
-                        defer,
-                        host_context,
+            let route = self.realm_route();
+            let request_id = {
+                let mut work = self.gc_heap.agent.work.borrow_mut();
+                let id = work.next_import;
+                work.next_import = id
+                    .checked_add(1)
+                    .expect("Agent import request identities exhausted");
+                // Publish before the host callback: a host may reenter/collect or complete a
+                // request synchronously. Accepted external work explicitly owns this path.
+                work.imports.insert(
+                    id,
+                    crate::agent_control::Routed {
+                        route,
+                        payload: PendingDynamicImport {
+                            promise,
+                            specifier: specifier.to_string(),
+                            attr_type: attr_type.map(str::to_string),
+                            defer,
+                            authority,
+                            authority_route: (*authority_route).clone(),
+                            origin: origin.clone(),
+                        },
                     },
                 );
+                id
+            };
+            let accepted = self.with_host_callback(|_| {
+                loader(
+                    request_id,
+                    authority.context,
+                    specifier,
+                    referrer,
+                    attr_type,
+                )
+            });
+            if accepted {
+                return promise;
+            }
+            if self
+                .gc_heap
+                .agent
+                .work
+                .borrow_mut()
+                .imports
+                .remove(&request_id)
+                .is_none()
+            {
+                // A synchronous completion already consumed the request. Never fetch twice.
                 return promise;
             }
         }
         let result = (|| {
-            let scoped_referrer = module_map_key(host_context, referrer);
+            let scoped_referrer = authority_module_key(self.realm_id, authority, referrer);
             let (canon, src) = self.fetch_module(specifier, &scoped_referrer, attr_type)?;
             let canon = match attr_type {
                 Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
@@ -1822,6 +2174,9 @@ impl Interp {
             self.link_module(&canon)?;
             Ok(canon)
         })();
+        if let Ok(key) = &result {
+            origin.loaded.borrow_mut().insert(request, key.clone());
+        }
         self.finish_dynamic_import(promise, attr_type, defer, result);
         promise
     }
@@ -1834,33 +2189,76 @@ impl Interp {
         request_id: u64,
         result: Option<(String, String)>,
     ) -> bool {
-        let Some(pending) = self.pending_dynamic_imports.remove(&request_id) else {
+        let pending = self
+            .gc_heap
+            .agent
+            .work
+            .borrow_mut()
+            .imports
+            .remove(&request_id);
+        let Some(pending) = pending else {
             return false;
         };
-        let result = match result {
-            Some((canon, source)) => {
-                let canon = module_map_key(pending.host_context, &canon);
-                let canon = match pending.attr_type.as_deref() {
-                    Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
-                    _ => canon,
-                };
-                let source = typed_module_source(source, pending.attr_type.as_deref());
-                self.load_requested_modules(&canon, Some(source))
-                    .and_then(|()| self.link_module(&canon))
-                    .map(|()| canon)
-            }
-            None => Err(self.throw(
-                "TypeError",
-                format!("module not found: {}", pending.specifier),
-            )),
+        let pending = crate::rooting::Rooted::new(pending);
+        if !self.authority_is_live(pending.payload.authority) {
+            return false;
+        }
+        self.with_route(pending.route.target, |target| {
+            target.with_author_entry(|target| {
+                target.in_source_record(pending.payload.origin.clone(), |target| {
+                    target.finish_routed_dynamic_import(&pending.payload, result)
+                });
+            })
+        });
+        true
+    }
+
+    fn finish_routed_dynamic_import(
+        &mut self,
+        pending: &PendingDynamicImport,
+        result: Option<(String, String)>,
+    ) {
+        let request = crate::agent_control::LoadedRequest {
+            specifier: pending.specifier.clone(),
+            attr_type: pending.attr_type.clone(),
+            defer: pending.defer,
         };
+        // Multiple accepted loads may finish in either order. The first successful normal
+        // load fixes this exact referrer/request's ModuleRecord, not just its public URL.
+        let result = if let Some(key) = self.cached_source_request(&pending.origin, &request) {
+            Ok(key)
+        } else {
+            match result {
+                Some((canon, source)) => {
+                    let canon = authority_module_key(self.realm_id, pending.authority, &canon);
+                    let canon = match pending.attr_type.as_deref() {
+                        Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
+                        _ => canon,
+                    };
+                    let source = typed_module_source(source, pending.attr_type.as_deref());
+                    self.load_requested_modules(&canon, Some(source))
+                        .and_then(|()| self.link_module(&canon))
+                        .map(|()| canon)
+                }
+                None => Err(self.throw(
+                    "TypeError",
+                    format!("module not found: {}", pending.specifier),
+                )),
+            }
+        };
+        if let Ok(key) = &result {
+            pending
+                .origin
+                .loaded
+                .borrow_mut()
+                .insert(request, key.clone());
+        }
         self.finish_dynamic_import(
             pending.promise,
             pending.attr_type.as_deref(),
             pending.defer,
             result,
         );
-        true
     }
 
     fn finish_dynamic_import(
@@ -2099,134 +2497,107 @@ impl Interp {
     }
 }
 
-/// Whether a module body contains top-level `await` (a for-await head, an `await using`, or an
-/// Await expression outside any function/class body) — the async-module test for `import defer`.
+/// ECMA-262 ParseModule's [[HasTLA]]: whether the body Contains `await` (an Await expression, a
+/// for-await head or an `await using` declaration), including class heritage, computed names and
+/// binding-pattern defaults but no function or arrow body. Such a module runs as a VM coroutine;
+/// a module without one runs to completion synchronously (also the `import defer` test).
 pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
+    use crate::ast::{ArrayPatElem, DeclKind, ForInit, Pattern, PropKey};
+    use crate::eval::expr_has_own_suspension as expr;
+    fn pattern(p: &Pattern) -> bool {
+        match p {
+            Pattern::Ident(_) => false,
+            Pattern::Array(elements) => elements.iter().any(|element| match element {
+                ArrayPatElem::Hole => false,
+                ArrayPatElem::Elem {
+                    pattern: p,
+                    default,
+                } => pattern(p) || default.as_ref().is_some_and(expr),
+                ArrayPatElem::Rest(p) => pattern(p),
+            }),
+            Pattern::Object(object) => object.props.iter().any(|prop| {
+                matches!(&prop.key, PropKey::Computed(key) if expr(key))
+                    || pattern(&prop.value)
+                    || prop.default.as_ref().is_some_and(expr)
+            }),
+            Pattern::Member(target) => expr(target),
+        }
+    }
+    fn declarations(kind: &DeclKind, decls: &[(Pattern, Option<Expr>)]) -> bool {
+        matches!(kind, DeclKind::AwaitUsing)
+            || decls
+                .iter()
+                .any(|(p, init)| pattern(p) || init.as_ref().is_some_and(expr))
+    }
     fn stmt(s: &Stmt) -> bool {
         if crate::interpreter::ast_stack_low() {
             return crate::interpreter::with_ast_stack(|| stmt(s));
         }
         match s {
             Stmt::Expr(e) | Stmt::Throw(e) => expr(e),
-            Stmt::Return(v) => v.as_ref().map(expr).unwrap_or(false),
-            Stmt::VarDecl { kind, decls } => {
-                matches!(kind, crate::ast::DeclKind::AwaitUsing)
-                    || decls
-                        .iter()
-                        .any(|(_, init)| init.as_ref().map(expr).unwrap_or(false))
-            }
+            Stmt::Return(v) => v.as_ref().is_some_and(expr),
+            Stmt::VarDecl { kind, decls } => declarations(kind, decls),
+            Stmt::ClassDecl(class) => expr(&Expr::Class(class.clone())),
             Stmt::If { test, cons, alt } => {
-                expr(test) || stmt(cons) || alt.as_ref().map(|a| stmt(a)).unwrap_or(false)
+                expr(test) || stmt(cons) || alt.as_ref().is_some_and(|a| stmt(a))
             }
             Stmt::Block(b) => b.iter().any(stmt),
-            Stmt::While { test, body, .. } | Stmt::DoWhile { body, test, .. } => {
-                expr(test) || stmt(body)
-            }
+            Stmt::While { test, body } | Stmt::DoWhile { body, test } => expr(test) || stmt(body),
             Stmt::For {
                 init,
                 test,
                 update,
                 body,
-                ..
             } => {
-                init.as_ref()
-                    .map(|i| match i.as_ref() {
-                        crate::ast::ForInit::VarDecl { decls, .. } => decls
-                            .iter()
-                            .any(|(_, e)| e.as_ref().map(expr).unwrap_or(false)),
-                        crate::ast::ForInit::Expr(e) => expr(e),
-                    })
-                    .unwrap_or(false)
-                    || test.as_ref().map(expr).unwrap_or(false)
-                    || update.as_ref().map(expr).unwrap_or(false)
+                init.as_ref().is_some_and(|i| match i.as_ref() {
+                    ForInit::VarDecl { kind, decls } => declarations(kind, decls),
+                    ForInit::Expr(e) => expr(e),
+                }) || test.as_ref().is_some_and(expr)
+                    || update.as_ref().is_some_and(expr)
                     || stmt(body)
             }
             Stmt::ForInOf {
+                decl,
+                left,
                 right,
-                body,
                 is_await,
+                body,
                 ..
-            } => *is_await || expr(right) || stmt(body),
+            } => {
+                *is_await
+                    || matches!(decl, Some(DeclKind::AwaitUsing))
+                    || pattern(left)
+                    || expr(right)
+                    || stmt(body)
+            }
             Stmt::Try {
                 block,
                 handler,
                 finalizer,
-                ..
             } => {
                 block.iter().any(stmt)
-                    || handler
-                        .as_ref()
-                        .map(|(_, h)| h.iter().any(stmt))
-                        .unwrap_or(false)
-                    || finalizer
-                        .as_ref()
-                        .map(|f| f.iter().any(stmt))
-                        .unwrap_or(false)
+                    || handler.as_ref().is_some_and(|(parameter, h)| {
+                        parameter.as_ref().is_some_and(pattern) || h.iter().any(stmt)
+                    })
+                    || finalizer.as_ref().is_some_and(|f| f.iter().any(stmt))
             }
             Stmt::Switch { disc, cases } => {
                 expr(disc)
-                    || cases.iter().any(|c| {
-                        c.test.as_ref().map(expr).unwrap_or(false) || c.body.iter().any(stmt)
-                    })
+                    || cases
+                        .iter()
+                        .any(|c| c.test.as_ref().is_some_and(expr) || c.body.iter().any(stmt))
             }
             Stmt::Labeled { body, .. } => stmt(body),
             Stmt::With { obj, body } => expr(obj) || stmt(body),
             Stmt::ExportDefault(inner) | Stmt::ExportDecl(inner) => stmt(inner),
-            _ => false,
-        }
-    }
-    fn expr(e: &Expr) -> bool {
-        if crate::interpreter::ast_stack_low() {
-            return crate::interpreter::with_ast_stack(|| expr(e));
-        }
-        match e {
-            Expr::Await(_) => true,
-            Expr::ToStr(x) | Expr::OptionalChain(x) => expr(x),
-            Expr::Unary { arg, .. } | Expr::Update { arg, .. } => expr(arg),
-            Expr::Binary { left, right, .. }
-            | Expr::Logical { left, right, .. }
-            | Expr::Assign {
-                target: left,
-                value: right,
-                ..
-            } => expr(left) || expr(right),
-            Expr::Cond { test, cons, alt } => expr(test) || expr(cons) || expr(alt),
-            Expr::Call { callee, args, .. } => {
-                expr(callee)
-                    || args.iter().any(|a| match a {
-                        crate::ast::ArrayElem::Item(e) | crate::ast::ArrayElem::Spread(e) => {
-                            expr(e)
-                        }
-                        _ => false,
-                    })
-            }
-            Expr::New { callee, args, .. } => {
-                expr(callee)
-                    || args.iter().any(|a| match a {
-                        crate::ast::ArrayElem::Item(e) | crate::ast::ArrayElem::Spread(e) => {
-                            expr(e)
-                        }
-                        _ => false,
-                    })
-            }
-            Expr::Member { obj, .. } => expr(obj),
-            Expr::Index { obj, index, .. } => expr(obj) || expr(index),
-            Expr::Seq(v) => v.iter().any(expr),
-            Expr::Array(elems) => elems.iter().any(|a| match a {
-                crate::ast::ArrayElem::Item(e) | crate::ast::ArrayElem::Spread(e) => expr(e),
-                _ => false,
-            }),
-            Expr::Object(props) => props.iter().any(|p| match p {
-                crate::ast::PropDef::KeyValue { value, .. } => expr(value),
-                crate::ast::PropDef::Spread(e) => expr(e),
-                _ => false,
-            }),
-            Expr::Yield { arg, .. } => arg.as_ref().map(|a| expr(a)).unwrap_or(false),
-            Expr::TaggedTemplate { tag, .. } => expr(tag),
-            Expr::ImportCall { spec, options, .. } => {
-                expr(spec) || options.as_ref().map(|o| expr(o)).unwrap_or(false)
-            }
-            _ => false,
+            Stmt::FuncDecl(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::Empty
+            | Stmt::Debugger
+            | Stmt::Import(_)
+            | Stmt::ExportNamed { .. }
+            | Stmt::ExportAll { .. } => false,
         }
     }
     body.iter().any(stmt)
@@ -2361,6 +2732,7 @@ impl crate::gc_trace::GcTrace for ModuleRec {
         let Self {
             body: _,
             source: _,
+            origin,
             env,
             ns,
             meta,
@@ -2386,6 +2758,7 @@ impl crate::gc_trace::GcTrace for ModuleRec {
             on_stack: _,
             cycle_root: _,
         } = self;
+        origin.trace_gc(sink);
         env.trace_gc(sink);
         ns.trace_gc(sink);
         meta.trace_gc(sink);
@@ -2401,8 +2774,12 @@ impl crate::gc_trace::GcTrace for PendingDynamicImport {
             specifier: _,
             attr_type: _,
             defer: _,
-            host_context: _,
+            authority: _,
+            authority_route,
+            origin,
         } = self;
         crate::gc_trace::GcTrace::trace_gc(promise, sink);
+        crate::gc_trace::GcTrace::trace_gc(authority_route, sink);
+        crate::gc_trace::GcTrace::trace_gc(origin, sink);
     }
 }

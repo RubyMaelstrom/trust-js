@@ -498,7 +498,7 @@ fn native_binding_stores_mark_the_actual_old_owners_card_for_every_reference_kin
         for mode in MODES.into_iter().filter(|mode| *mode != Mode::Global) {
             let mut engine = Engine::new();
             engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
-            engine.interp.gc_task_deferred = true;
+            engine.interp.gc_heap.agent.task_deferred.set(true);
             let (chunk, code) = native_for_mode(
                 &mut engine,
                 "function write(input){outer=input;return 0;}",

@@ -2167,6 +2167,12 @@ impl Heap {
 
     /// Defer a requested collection of `kind`: it is pending until the next safepoint, and a
     /// major request makes a major collection due.
+    /// Publish an Agent-level request without collecting at a non-safepoint. In particular a
+    /// suppressed major must remain due after the suppression/byte loan ends.
+    pub(crate) fn request_collection(&mut self, kind: CollectionKind) {
+        self.defer(false, kind);
+    }
+
     fn defer(&mut self, native_stack: bool, kind: CollectionKind) -> bool {
         // With a request pending the due word is set already.
         self.major_due |= kind == CollectionKind::Major;

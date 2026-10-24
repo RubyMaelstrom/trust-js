@@ -278,7 +278,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         match i.shared_block_id(info.buffer) {
             Some(id) => {
                 let byte_index = info.offset + idx * info.kind.elsize();
-                let own = i.async_wait_inbox.clone();
+                let own = i.gc_heap.agent.work.borrow().inbox.clone();
                 let (woken, own_tokens) =
                     crate::interpreter::futex_notify(id, byte_index, count, own.as_ref());
                 // NotifyWaiter resolves this agent's own waitAsync promises at once.
@@ -309,10 +309,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         // A value that already differs, or a zero timeout, resolves synchronously (not async).
         let byte_index = info.offset + idx * info.kind.elsize();
         let token = crate::interpreter::next_async_wait_token();
-        let inbox = i
-            .async_wait_inbox
-            .get_or_insert_with(Default::default)
-            .clone();
+        let inbox = i.agent_async_inbox();
         let waiter = (timeout != Some(Duration::ZERO)).then_some(Waiter::Async(inbox, token));
         if let Err(value) = enqueue_waiter(&info, byte_index, id, expected, waiter) {
             set_data(&result, "async", Value::Bool(false));
@@ -324,7 +321,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         // agent's inbox), or this agent's job checkpoints time it out (settle_async_waits).
         let promise = i.new_promise();
         let block = i.shared_block(info.buffer).unwrap().clone();
-        i.pending_async_waits.push(AsyncWait {
+        i.enqueue_async_wait(AsyncWait {
             promise,
             token,
             id,

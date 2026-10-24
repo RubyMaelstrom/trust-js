@@ -797,7 +797,7 @@ mod entry_root_tests {
         // The first compiled-entry poll must collect before argument slots are seeded. The
         // scalar-returning body neither reads this argument nor executes any later safepoint.
         engine.interp.gc_tick = crate::interpreter::GC_CALL_POLL_MASK;
-        engine.interp.gc_next = 0;
+        engine.interp.set_agent_next(0);
         let result = engine
             .interp
             .invoke(callee, Value::Undefined, &arguments)

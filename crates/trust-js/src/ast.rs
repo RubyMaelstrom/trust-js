@@ -1496,6 +1496,11 @@ impl Expr {
 
 impl Function {
     #[inline]
+    /// The runtime ScriptOrModule shared by this function's primary-heap closures, if any.
+    pub(crate) fn shared_origin(&self) -> Option<&crate::agent_control::RuntimeOrigin> {
+        self.runtime.get()?.primary_origin()
+    }
+
     pub(crate) fn runtime(&self) -> crate::function_runtime::RuntimeLease<'_> {
         self.runtime
             .get_or_init(|| Box::new(crate::function_runtime::FunctionRuntimeCache::new()))

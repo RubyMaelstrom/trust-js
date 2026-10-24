@@ -309,7 +309,7 @@ pub(crate) struct ScriptSource {
     /// is first formatted (minified bundles are a few very long lines).
     unit_samples: std::cell::OnceCell<Box<[(u32, u32)]>>,
     /// The ScriptOrModule of code from this source, as the host-defined base its `import()`
-    /// calls resolve against (see [`Interp::active_script_or_module`]): set when a Script or
+    /// calls resolve against (see [`Interp::active_runtime_origin`]): set when a Script or
     /// Module starts to evaluate, and for eval code and dynamic functions to the active
     /// ScriptOrModule where they are created (ECMA-262 PerformEval, OrdinaryFunctionCreate).
     /// Unset is null, as for host snapshot code.
@@ -599,6 +599,7 @@ pub(crate) struct CodeFrame {
     kind: FrameKind,
     name: Option<LStr>,
     source: Option<Rc<ScriptSource>>,
+    origin: Option<crate::agent_control::RuntimeOrigin>,
     /// See [`Frame::start`].
     start: u32,
     /// `fn_frames.len()` on entry: the context runs above those function frames.
@@ -613,7 +614,8 @@ pub(crate) struct CodeFrame {
 pub(crate) struct ResumedFrame {
     kind: FrameKind,
     name: Option<LStr>,
-    source: Rc<ScriptSource>,
+    source: Option<Rc<ScriptSource>>,
+    origin: Option<crate::agent_control::RuntimeOrigin>,
     start: u32,
     /// `Gc::as_ptr` identity of the function object whose call created the body, if any: its
     /// first step runs inside that call's frame (see [`Interp::in_resumed`]).
@@ -653,10 +655,18 @@ impl Interp {
             Some(SourceKind::Eval) => FrameKind::Eval,
             _ => FrameKind::TopLevel,
         };
+        let origin = match source.as_deref().map(ScriptSource::kind) {
+            Some(SourceKind::Eval | SourceKind::Function) => self.active_runtime_origin(),
+            Some(SourceKind::Module) => self
+                .active_runtime_origin()
+                .or_else(|| Some(self.default_runtime_origin(source.clone()))),
+            _ => Some(self.default_runtime_origin(source.clone())),
+        };
         self.code_frames.push(CodeFrame {
             kind,
             name: None,
             source,
+            origin,
             start: 0,
             depth: self.fn_frames.len() as u32,
             call_site: std::mem::replace(&mut self.call_site, NO_POSITION),
@@ -666,7 +676,11 @@ impl Interp {
     /// The frame of a generator or async function body that the innermost call (of `func`)
     /// creates now, for when it resumes later. None for functions without a source.
     pub(crate) fn resumed_frame(&self, func: &crate::ast::Function) -> Option<Box<ResumedFrame>> {
-        let source = func.script.clone().filter(|_| !func.self_hosted)?;
+        if func.self_hosted {
+            return None;
+        }
+        let source = func.script.clone();
+        let origin = self.active_runtime_origin();
         let callee = self
             .fn_frames
             .last()
@@ -687,17 +701,22 @@ impl Interp {
             kind: FrameKind::Function,
             name,
             source,
+            origin,
             start: func.start,
             function: callee.map_or(0, |(identity, _)| identity),
         }))
     }
 
     /// The frame of a module body that runs as a coroutine (top-level await).
-    pub(crate) fn resumed_module_frame(source: Rc<ScriptSource>) -> Box<ResumedFrame> {
+    pub(crate) fn resumed_module_frame(
+        source: Rc<ScriptSource>,
+        origin: crate::agent_control::RuntimeOrigin,
+    ) -> Box<ResumedFrame> {
         Box::new(ResumedFrame {
             kind: FrameKind::TopLevel,
             name: None,
-            source,
+            source: Some(source.clone()),
+            origin: Some(origin),
             start: 0,
             function: 0,
         })
@@ -721,10 +740,16 @@ impl Interp {
         let Some(frame) = frame.filter(|_| !framed) else {
             return run(self);
         };
+        if frame.source.is_none() {
+            // Source-less snapshots still carry an actual runtime origin; avoid inventing a
+            // display stack frame merely to preserve its authorization after await/yield.
+            return self.with_runtime_origin(frame.origin.clone(), run);
+        }
         self.code_frames.push(CodeFrame {
             kind: frame.kind,
             name: frame.name,
-            source: Some(frame.source.clone()),
+            source: frame.source.clone(),
+            origin: frame.origin.clone(),
             start: frame.start,
             depth: self.fn_frames.len() as u32,
             call_site: std::mem::replace(&mut self.call_site, NO_POSITION),
@@ -744,13 +769,28 @@ impl Interp {
     /// ScriptOrModule is not null. Function contexts take their function's (built-in, self-
     /// hosted and host snapshot functions have none); below them lie the script execution
     /// contexts a host pushed for job callbacks (HTML HostCallJobCallback).
-    pub(crate) fn active_script_or_module(&self) -> Option<Rc<ScriptSource>> {
+    /// Runtime identity above a real transfer floor, then the actual suspended caller across
+    /// the Agent. This never searches the target's older contexts before that caller.
+    pub(crate) fn active_runtime_origin(&self) -> Option<crate::agent_control::RuntimeOrigin> {
         let mut function = self.fn_frames.len();
         let mut code = self.code_frames.len();
         let mut pushed = self.job_script_contexts.len();
+        let mut position = self.call_site;
         loop {
             let depth = function + code;
-            // A pushed context entered at depth d runs above the d contexts below it.
+            if let Some(caller) = &self.caller_origin {
+                if depth <= caller.floor as usize {
+                    // A newly prepared HostCallJobCallback context can sit at the SAME
+                    // function/code depth. It still precedes the inherited caller; older
+                    // target job contexts below the separate floor cannot win.
+                    if pushed > caller.job_floor
+                        && self.job_script_contexts[pushed - 1].0 as usize >= depth
+                    {
+                        return Some(self.job_script_contexts[pushed - 1].1.clone());
+                    }
+                    return caller.origin.clone();
+                }
+            }
             if pushed > 0 && self.job_script_contexts[pushed - 1].0 as usize >= depth {
                 pushed -= 1;
                 return Some(self.job_script_contexts[pushed].1.clone());
@@ -758,33 +798,76 @@ impl Interp {
             if depth == 0 {
                 return None;
             }
-            let source = if code > 0 && self.code_frames[code - 1].depth as usize >= function {
+            // An observable splice runs above its containing physical frame. Existing
+            // position markers preserve the identity-proven callee for explicit AND implicit
+            // callbacks; the splice's hidden slot roots that callee throughout execution.
+            // Read one site at a time instead of allocating inline_chain's diagnostic Vec.
+            while is_inline_position(position) {
+                let Some(site) = inline_site(position) else {
+                    return Some(self.closed_runtime_origin());
+                };
+                let Some(callee) = site.callee.upgrade() else {
+                    return Some(self.closed_runtime_origin());
+                };
+                if let Callable::User(user) = &callee.borrow().call {
+                    if let Some(origin) =
+                        user.runtime_origin(self.realm_id, crate::value::heap_id(&self.gc_heap))
+                    {
+                        return Some(origin);
+                    }
+                }
+                position = site.outer;
+            }
+            let origin = if code > 0 && self.code_frames[code - 1].depth as usize >= function {
                 code -= 1;
-                self.code_frames[code].source.clone()
+                position = self.code_frames[code].call_site;
+                self.code_frames[code].origin.clone()
             } else {
                 function -= 1;
+                position = self.fn_frames[function].call_site;
                 match &self.fn_frames[function].callee().borrow().call {
-                    Callable::User(user) if !user.func.self_hosted => user.func.script.clone(),
+                    Callable::User(user) => {
+                        user.runtime_origin(self.realm_id, crate::value::heap_id(&self.gc_heap))
+                    }
                     _ => None,
                 }
             };
-            if let Some(source) = source.filter(|source| source.referrer().is_some()) {
-                return Some(source);
+            if origin.is_some() {
+                return origin;
             }
         }
     }
 
-    /// The referrer of the active ScriptOrModule (see [`Self::active_script_or_module`]).
+    fn closed_runtime_origin(&self) -> crate::agent_control::RuntimeOrigin {
+        // Missing active inline metadata violates the compiled-frame contract. It must never
+        // turn an originating authorization into the ambient caller/default context.
+        Rc::new(crate::agent_control::ReferrerRecord {
+            source: None,
+            referrer: None,
+            authority: crate::agent_control::LoadAuthority {
+                agent: crate::value::heap_id(&self.gc_heap),
+                owner: crate::agent_access::RealmId::UNPUBLISHED,
+                context: 0,
+            },
+            owner: None,
+            realm: None,
+            host_context: self.host_job_context,
+            kind: crate::agent_control::ReferrerKind::Closed,
+            loaded: Default::default(),
+        })
+    }
+
+    /// The referrer of the active ScriptOrModule (see [`Self::active_runtime_origin`]).
     pub(crate) fn active_script_referrer(&self) -> Option<Rc<str>> {
-        self.active_script_or_module()
-            .and_then(|source| source.referrer().cloned())
+        self.active_runtime_origin()
+            .and_then(|origin| origin.referrer.clone())
     }
 
     /// HTML HostCallJobCallback steps 4-6: run `operation` with the script execution context
     /// HostMakeJobCallback saved (`script`) pushed below it, when there is one.
     pub(crate) fn with_job_script_context<R>(
         &mut self,
-        script: Option<&Rc<ScriptSource>>,
+        script: Option<&crate::agent_control::RuntimeOrigin>,
         operation: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let Some(script) = script else {
@@ -1078,11 +1161,13 @@ impl crate::gc_trace::GcTrace for CodeFrame {
             kind: _,
             name,
             source: _,
+            origin, // actual immutable source-owner and Realm edges
             start: _,
             depth: _,
             call_site: _,
         } = self;
         crate::gc_trace::GcTrace::trace_gc(name, sink);
+        crate::gc_trace::GcTrace::trace_gc(origin, sink);
     }
 }
 
@@ -1092,10 +1177,12 @@ impl crate::gc_trace::GcTrace for ResumedFrame {
             kind: _,
             name,
             source: _,
+            origin, // actual immutable source-owner and Realm edges
             start: _,
             function: _, // an identity, kept alive by its call while it runs
         } = self;
         crate::gc_trace::GcTrace::trace_gc(name, sink);
+        crate::gc_trace::GcTrace::trace_gc(origin, sink);
     }
 }
 

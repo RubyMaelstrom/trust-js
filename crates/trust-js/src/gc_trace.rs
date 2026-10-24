@@ -44,6 +44,38 @@ pub(crate) trait GcTrace {
     fn trace_gc(&self, sink: &mut dyn GcSink);
 }
 
+impl GcTrace for () {
+    fn trace_gc(&self, _: &mut dyn GcSink) {}
+}
+impl GcTrace for crate::InterruptReason {
+    fn trace_gc(&self, _: &mut dyn GcSink) {}
+}
+impl<T: GcTrace, E: GcTrace> GcTrace for Result<T, E> {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        match self {
+            Ok(value) => value.trace_gc(sink),
+            Err(error) => error.trace_gc(sink),
+        }
+    }
+}
+impl<A: GcTrace, B: GcTrace, C: GcTrace> GcTrace for (A, B, C) {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        self.0.trace_gc(sink);
+        self.1.trace_gc(sink);
+        self.2.trace_gc(sink);
+    }
+}
+impl GcTrace for crate::coroutine::Suspend {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        match self {
+            crate::coroutine::Suspend::Yield(value)
+            | crate::coroutine::Suspend::Await(value)
+            | crate::coroutine::Suspend::Done(value)
+            | crate::coroutine::Suspend::Throw(value) => value.trace_gc(sink),
+        }
+    }
+}
+
 impl GcTrace for Value {
     #[inline]
     fn trace_gc(&self, sink: &mut dyn GcSink) {
@@ -421,11 +453,17 @@ impl GcTrace for crate::interpreter::JobCallback {
         let crate::interpreter::JobCallback {
             callback,
             script_caller,
-            active_script: _,
-            internal: _, // realm identities and flags only
+            active_script,
+            internal,
         } = self;
         callback.trace_gc(sink);
         script_caller.trace_gc(sink);
+        active_script.trace_gc(sink);
+        // An unobservable built-in step still has a semantic [[Realm]], including while its
+        // reaction is pending rather than queued. It is independent of the dispatch route.
+        if let Some(realm) = internal.realm() {
+            sink.word(realm as u64);
+        }
     }
 }
 
@@ -436,12 +474,15 @@ impl GcTrace for crate::interpreter::Job {
             result,
             value,
             fulfilled: _,
-            realm: _,
+            realm,
             host_context: _,
         } = self;
         handler.trace_gc(sink);
         result.trace_gc(sink);
         value.trace_gc(sink);
+        if let Some(global) = realm {
+            sink.word(*global as u64);
+        }
     }
 }
 
@@ -575,8 +616,16 @@ impl GcTrace for crate::interpreter::FinalizationState {
             cleanup_callback,
             cells,
             cleanup_scheduled: _,
+            registry_realm,
+            registry_context: _,
+            callback_realm,
+            callback_context: _,
         } = self;
         cleanup_callback.trace_gc(sink);
+        registry_realm.trace_gc(sink);
+        if let Some(global) = callback_realm {
+            sink.word(*global as u64);
+        }
         for cell in cells.iter() {
             cell.held_value.trace_gc(sink);
         }

@@ -118,6 +118,19 @@ pub(crate) struct PreparedClassEvaluation {
     decorator_values: Option<PreparedDecoratorValues>,
 }
 
+impl PreparedClassEvaluation {
+    /// Publish only after the observable prototype Get has completed with no state loan.
+    pub(crate) fn publish_heritage(&mut self, values: (Option<Gc>, Option<Value>, bool)) {
+        self.proto_parent = values.0;
+        self.ctor_parent = values.1;
+        self.derived = values.2;
+    }
+    /// Publish only after ToPropertyKey has completed; no author code runs here.
+    pub(crate) fn publish_key(&mut self, member: usize, key: crate::value::PropertyKey) {
+        self.keys[member] = Some(key);
+    }
+}
+
 struct PreparedDecoratorValues {
     class: Vec<PreparedDecoratorValue>,
     members: Vec<Vec<PreparedDecoratorValue>>,
@@ -568,13 +581,22 @@ impl Interp {
         // synchronous resource (or at the end when there is no such resource).
         let mut needs_await = false;
         let mut has_awaited = false;
-        let mut pending = crate::rooting::Rooted::new(DisposeFrame {
+        let pending = crate::rooting::Rooted::new(std::cell::RefCell::new(DisposeFrame {
             resources: frame,
             completion: result,
-        });
+        }));
         // Keep the current record in the traced list until its call/await finishes. In
         // particular, an await-only marker can suspend before this resource is called.
-        while let Some(r) = pending.resources.last() {
+        loop {
+            let resource = pending.borrow().resources.last().map(|r| Disposable {
+                value: r.value,
+                method: r.method,
+                kind_is_async: r.kind_is_async,
+                method_is_async: r.method_is_async,
+            });
+            let Some(r) = resource else {
+                break;
+            };
             if !r.kind_is_async && needs_await && !has_awaited {
                 self.coro_await(Value::Undefined)?;
                 needs_await = false;
@@ -583,7 +605,7 @@ impl Interp {
             if !r.method.is_callable() {
                 debug_assert!(r.kind_is_async);
                 needs_await = true;
-                pending.resources.pop();
+                pending.borrow_mut().resources.pop();
                 continue;
             }
 
@@ -616,29 +638,33 @@ impl Interp {
             match disposed {
                 Ok(_) => {}
                 Err(Abrupt::Throw(new_err)) => {
-                    let previous = std::mem::replace(&mut pending.completion, Ok(Value::Undefined));
-                    pending.completion = match previous {
-                        Err(Abrupt::Throw(prev)) => {
-                            Err(Abrupt::Throw(self.make_suppressed(new_err, prev)))
+                    let (previous_throw, interrupted) = {
+                        let state = pending.borrow();
+                        match &state.completion {
+                            Err(Abrupt::Throw(previous)) => (Some(*previous), None),
+                            Err(Abrupt::Interrupt(reason)) => (None, Some(*reason)),
+                            _ => (None, None),
                         }
-                        // DisposeResources replaces every non-throw completion (normal, return,
-                        // break, or continue) with the disposal throw. Only two throw completions
-                        // form a SuppressedError chain.
-                        Ok(_)
-                        | Err(Abrupt::Return(_))
-                        | Err(Abrupt::Break(..))
-                        | Err(Abrupt::Continue(..)) => Err(Abrupt::Throw(new_err)),
-                        Err(Abrupt::Interrupt(reason)) => Err(Abrupt::Interrupt(reason)),
                     };
+                    // The old completion stays rooted until after SuppressedError construction.
+                    let completion = if let Some(reason) = interrupted {
+                        Err(Abrupt::Interrupt(reason))
+                    } else {
+                        Err(Abrupt::Throw(match previous_throw {
+                            Some(previous) => self.make_suppressed(new_err, previous),
+                            None => new_err,
+                        }))
+                    };
+                    pending.borrow_mut().completion = completion;
                 }
                 Err(other) => return Err(other),
             }
-            pending.resources.pop();
+            pending.borrow_mut().resources.pop();
         }
         if needs_await && !has_awaited {
             self.coro_await(Value::Undefined)?;
         }
-        std::mem::replace(&mut pending.completion, Ok(Value::Undefined))
+        pending.into_inner().into_inner().completion
     }
 
     /// Run one `for-of` iteration: bind the element and execute the body. For a `using`/`await using`
@@ -4621,9 +4647,10 @@ impl Interp {
         Ok(reference)
     }
 
-    /// `await v`: if `v` is a promise, drain microtasks to settle it, then return its value (or
-    /// throw its reason). A non-promise is returned as-is. A still-pending promise yields undefined
-    /// (TRust JS cannot truly suspend).
+    /// Legacy AST compatibility only. Real async/generator/module bodies use heap VM
+    /// continuations even under Tier::Interp. A promise cannot be synchronously awaited inside
+    /// an active Agent job: report the existing unavailable-VM failure rather than draining
+    /// nested jobs or turning a pending completion into undefined.
     pub(crate) fn await_value(&mut self, v: Value) -> Result<Value, Abrupt> {
         let ptr = match &(v).view() {
             ValueView::Obj(o) if self.promises.contains_key(&(Gc::as_ptr(o) as usize)) => {
@@ -4648,15 +4675,17 @@ impl Interp {
         // Await → PromiseResolve(%Promise%, v): the `constructor` read on a native promise is
         // observable, and its abrupt completion is the await's.
         self.get_member_key(&v, "constructor")?;
-        self.drain_microtasks();
-        match self.promises.get(&ptr) {
-            Some(s) if s.status == 1 => Ok(s.value),
-            Some(s) if s.status == 2 => Err(Abrupt::Throw(s.value)),
-            _ => Ok(Value::Undefined),
-        }
+        let _ = ptr;
+        Err(self.throw("Error", crate::coroutine::VM_UNAVAILABLE_MSG))
     }
 
     // ----- promises ---------------------------------------------------------------------------
+
+    pub(crate) fn promise_rejection(&self, promise: &Value) -> Option<Value> {
+        let object = promise.as_obj()?;
+        let state = self.promises.get(&(Gc::as_ptr(&object) as usize))?;
+        (state.status == 2).then_some(state.value)
+    }
 
     pub(crate) fn new_promise(&mut self) -> Value {
         let obj = Object::new(self.extra_protos.get("Promise").cloned());
@@ -4787,7 +4816,7 @@ impl Interp {
                     // Callback's script execution context for `then` sits below both.
                     let active_script = then.active_script.take();
                     let runner = crate::builtins::make_thenable_job(self, then, value, res, rej);
-                    self.microtasks.push_back(crate::interpreter::Job {
+                    self.enqueue_promise_job(crate::interpreter::Job {
                         handler: crate::interpreter::JobCallback {
                             active_script,
                             ..crate::interpreter::JobCallback::plain(runner)
@@ -4848,7 +4877,7 @@ impl Interp {
         for (on_f, on_r, result, host_context) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
             let (realm, host_context) = self.reaction_job_target(&handler, host_context);
-            self.microtasks.push_back(Job {
+            self.enqueue_promise_job(Job {
                 handler,
                 result,
                 value,
@@ -4944,7 +4973,7 @@ impl Interp {
             1 => {
                 let v = self.promises[&ptr].value;
                 let (realm, host_context) = self.reaction_job_target(&on_f, host_context);
-                self.microtasks.push_back(Job {
+                self.enqueue_promise_job(Job {
                     handler: on_f,
                     result,
                     value: v,
@@ -4956,7 +4985,7 @@ impl Interp {
             _ => {
                 let v = self.promises[&ptr].value;
                 let (realm, host_context) = self.reaction_job_target(&on_r, host_context);
-                self.microtasks.push_back(Job {
+                self.enqueue_promise_job(Job {
                     handler: on_r,
                     result,
                     value: v,
@@ -4975,6 +5004,9 @@ impl Interp {
         handler: &crate::interpreter::JobCallback,
         same_realm_context: u64,
     ) -> (Option<usize>, u64) {
+        if let Some((_, realm, context, _)) = handler.internal.routed_import() {
+            return (Some(realm), context);
+        }
         if handler.internal == crate::interpreter::InternalJob::HostReaction {
             // HTML HostEnqueuePromiseJob with a null Realm: null job settings.
             return (None, 0);
@@ -4985,9 +5017,7 @@ impl Interp {
         let host_context = if realm == Gc::as_ptr(&self.global) as usize {
             same_realm_context
         } else {
-            self.realms
-                .get(&realm)
-                .map_or(same_realm_context, |state| state.host_job_context)
+            self.realm_host_context(realm, same_realm_context)
         };
         (Some(realm), host_context)
     }
@@ -4998,7 +5028,7 @@ impl Interp {
     /// callable that will run. HTML then obtains the job settings from that Realm. A real
     /// cross-Realm callable therefore uses the target Realm's settings; the captured context is
     /// retained only when an embedder multiplexes multiple settings objects through one Realm.
-    fn promise_job_target(
+    pub(crate) fn promise_job_target(
         &mut self,
         handler: &Value,
         same_realm_context: u64,
@@ -5021,9 +5051,7 @@ impl Interp {
         let host_context = if realm == current_realm {
             same_realm_context
         } else {
-            self.realms
-                .get(&realm)
-                .map_or(same_realm_context, |state| state.host_job_context)
+            self.realm_host_context(realm, same_realm_context)
         };
         (Some(realm), host_context)
     }
@@ -5035,24 +5063,33 @@ impl Interp {
     /// that notify's, and resolves "ok" when its notification arrives. Returns whether any
     /// promise resolved; their reactions are queued jobs.
     pub(crate) fn settle_async_waits(&mut self) -> bool {
-        if self.pending_async_waits.is_empty() {
-            return false;
-        }
+        let heap = self.gc_heap.clone();
+        let inbox = heap.agent.work.borrow().inbox.clone();
+        let notified = inbox.map(|inbox| inbox.take()).unwrap_or_default();
         let mut settled = false;
-        let notified = self
-            .async_wait_inbox
-            .as_ref()
-            .map(|inbox| inbox.take())
-            .unwrap_or_default();
         for token in notified {
             settled |= self.resolve_async_wait(token, "ok");
         }
         let now = std::time::Instant::now();
-        let mut expired: Vec<_> = self
-            .pending_async_waits
+        let mut expired: Vec<_> = heap
+            .agent
+            .work
+            .borrow()
+            .waits
             .iter()
-            .filter(|wait| wait.deadline.is_some_and(|deadline| deadline <= now))
-            .map(|wait| (wait.deadline, wait.token, wait.id, wait.index))
+            .filter(|wait| {
+                wait.payload
+                    .deadline
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .map(|wait| {
+                (
+                    wait.payload.deadline,
+                    wait.payload.token,
+                    wait.payload.id,
+                    wait.payload.index,
+                )
+            })
             .collect();
         expired.sort_unstable();
         for (_, token, id, index) in expired {
@@ -5063,75 +5100,107 @@ impl Interp {
         settled
     }
 
-    /// Resolve the promise of this agent's pending `Atomics.waitAsync` `token` with `result`;
-    /// `false` when no such wait is pending.
+    /// Token identities are Agent-wide. Remove the accepted host wait before dispatch, but
+    /// keep its promise and complete ancestor route rooted until settlement has published jobs.
     pub(crate) fn resolve_async_wait(&mut self, token: u64, result: &str) -> bool {
-        let Some(at) = self
-            .pending_async_waits
-            .iter()
-            .position(|wait| wait.token == token)
-        else {
-            return false;
+        let wait = {
+            let mut work = self.gc_heap.agent.work.borrow_mut();
+            let Some(at) = work
+                .waits
+                .iter()
+                .position(|wait| wait.payload.token == token)
+            else {
+                return false;
+            };
+            work.waits.remove(at)
         };
-        let wait = self.pending_async_waits.remove(at);
-        self.resolve_promise(&wait.promise, Value::lstr(result));
+        let wait = crate::rooting::Rooted::new(wait);
+        self.with_route(wait.route.target, |target| {
+            target.resolve_promise(&wait.payload.promise, Value::lstr(result));
+        });
         true
     }
 
-    /// The earliest timeout of a pending `Atomics.waitAsync`: when a host should next run a job
-    /// checkpoint for it (HostEnqueueTimeoutJob).
+    /// Earliest timeout anywhere in this Agent; future waits do not themselves count as ready
+    /// checkpoint work or keep an ordinary host event loop alive.
     pub(crate) fn next_async_wait_deadline(&self) -> Option<std::time::Instant> {
-        self.pending_async_waits
+        self.gc_heap
+            .agent
+            .work
+            .borrow()
+            .waits
             .iter()
-            .filter_map(|wait| wait.deadline)
+            .filter_map(|wait| wait.payload.deadline)
             .min()
     }
 
-    /// Whether a pending `Atomics.waitAsync` can settle at the next job checkpoint.
-    #[cfg(feature = "embed")]
     pub(crate) fn async_waits_ready(&self) -> bool {
-        !self.pending_async_waits.is_empty()
-            && (self
-                .async_wait_inbox
+        let work = self.gc_heap.agent.work.borrow();
+        !work.waits.is_empty()
+            && (work
+                .inbox
                 .as_ref()
                 .is_some_and(|inbox| inbox.has_notifications())
-                || self
-                    .next_async_wait_deadline()
-                    .is_some_and(|deadline| deadline <= std::time::Instant::now()))
+                || work.waits.iter().any(|wait| {
+                    wait.payload
+                        .deadline
+                        .is_some_and(|deadline| deadline <= std::time::Instant::now())
+                }))
     }
 
-    /// The event loop of a test262 host, which has no work but this agent's: run jobs until no
-    /// `Atomics.waitAsync` promise or `$262.agent` timer is pending, blocking in between until
-    /// the next timeout or timer, or a notification from another agent. A wait that nothing can
-    /// settle would hang the host, so it gives up after four seconds without progress.
+    /// Test262's host explicitly waits for future Agent work. Ordinary checkpoints only run
+    /// work that is ready now. A timer is one routed host task followed by a full checkpoint.
     pub(crate) fn run_agent_event_loop(&mut self) -> Result<(), crate::InterruptReason> {
+        if self.realm_id != crate::agent_access::RealmId::ROOT
+            || self.gc_heap.agent.execution_depth.get() != 0
+            || self.gc_heap.agent.checkpoint.get()
+        {
+            self.gc_heap.agent.checkpoint_requested.set(true);
+            return Ok(());
+        }
         const IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
         self.drain_microtasks_interruptible()?;
         let mut idle_since = std::time::Instant::now();
-        while !self.pending_async_waits.is_empty() || !self.pending_timers.is_empty() {
-            self.interrupt_poll_force().map_err(|abrupt| match abrupt {
-                Abrupt::Interrupt(reason) => reason,
-                _ => unreachable!("a host-control poll only produces Interrupt"),
-            })?;
+        loop {
+            let pending = {
+                let work = self.gc_heap.agent.work.borrow();
+                !work.waits.is_empty() || !work.timers.is_empty()
+            };
+            if !pending {
+                break;
+            }
+            if let Err(Abrupt::Interrupt(reason)) = self.interrupt_poll_force() {
+                self.cancel_agent_checkpoint();
+                return Err(reason);
+            }
             let mut resolved_any = self.settle_async_waits();
-            // Fire due host timers ($262.agent.setTimeout), earliest first.
-            let now = std::time::Instant::now();
-            // Removed from `pending_timers`: rooted until each has run (I1).
-            let mut due = crate::rooting::RootedVec::new();
-            self.pending_timers.retain(|(f, deadline)| {
-                if *deadline <= now {
-                    due.push(*f);
-                    false
-                } else {
-                    true
-                }
-            });
-            for f in due.iter().cloned() {
-                if let Err(Abrupt::Interrupt(reason)) = self.call(f, Value::Undefined, &[]) {
-                    self.clear_kept_objects();
+            loop {
+                let timer = {
+                    let mut work = self.gc_heap.agent.work.borrow_mut();
+                    let now = std::time::Instant::now();
+                    let at = work
+                        .timers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, timer)| timer.payload.deadline <= now)
+                        .min_by_key(|(_, timer)| (timer.payload.deadline, timer.payload.order))
+                        .map(|(index, _)| index);
+                    at.map(|at| work.timers.remove(at))
+                };
+                let Some(timer) = timer else {
+                    break;
+                };
+                let timer = crate::rooting::Rooted::new(timer);
+                let result = self.with_route(timer.route.target, |target| {
+                    target.with_author_entry(|target| {
+                        target.call(timer.payload.callback, Value::Undefined, &[])
+                    })
+                });
+                if let Err(Abrupt::Interrupt(reason)) = result {
+                    self.cancel_agent_checkpoint();
                     return Err(reason);
                 }
-                self.clear_kept_objects();
+                self.drain_microtasks_interruptible()?;
                 resolved_any = true;
             }
             if resolved_any {
@@ -5144,20 +5213,20 @@ impl Interp {
                 break;
             }
             let next_timer = self
-                .pending_timers
+                .gc_heap
+                .agent
+                .work
+                .borrow()
+                .timers
                 .iter()
-                .map(|(_, deadline)| *deadline)
+                .map(|timer| timer.payload.deadline)
                 .min();
             let wake = [self.next_async_wait_deadline(), next_timer]
                 .into_iter()
                 .flatten()
                 .fold(give_up, std::cmp::min);
-            let inbox = self
-                .async_wait_inbox
-                .get_or_insert_with(Default::default)
-                .clone();
-            // A host interruption wakes it too; the poll above then reports it.
-            inbox.wait_until(wake, &self.runtime_interrupt);
+            self.agent_async_inbox()
+                .wait_until(wake, &self.runtime_interrupt);
         }
         Ok(())
     }
@@ -5172,41 +5241,12 @@ impl Interp {
     /// the host's concern and are stopped through [`crate::RuntimeInterrupt`], polled before
     /// every job below.
     pub(crate) fn drain_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
-        // The script/callback that preceded this checkpoint is a completed synchronous job.
-        self.clear_kept_objects();
-        loop {
-            // Resolving a notified or timed-out Atomics.waitAsync is a job of this queue too.
-            if !self.pending_async_waits.is_empty() {
-                self.settle_async_waits();
-            }
-            let Some(job) = self.microtasks.pop_front() else {
-                let Some(registry) = self.pending_finalization_cleanup.pop_front() else {
-                    break;
-                };
-                self.run_finalization_cleanup_job(registry)?;
-                continue;
-            };
-            if let Err(abrupt) = self.interrupt_poll_force() {
-                self.microtasks.clear();
-                self.clear_kept_objects();
-                let Abrupt::Interrupt(reason) = abrupt else {
-                    unreachable!("a host-control poll only produces Interrupt")
-                };
-                return Err(reason);
-            }
-            if let Err(reason) = self.run_job_interruptible(job) {
-                self.microtasks.clear();
-                self.clear_kept_objects();
-                return Err(reason);
-            }
-            self.clear_kept_objects();
-        }
-        Ok(())
+        self.agent_checkpoint(None).map(|_| ())
     }
 
     /// HostEnqueueFinalizationRegistryCleanupJob / CleanupFinalizationRegistry (ECMA-262
-    /// §9.9.4.1 and §9.12). A callback is a separate job; its target cell is removed before
-    /// invocation and any promise reactions it queues run on the following checkpoint iteration.
+    /// §9.9.4.1 and §9.12). The entire held-value loop is one host cleanup task. Each target
+    /// cell is removed before invocation; queued Promise jobs run after this whole task returns.
     pub(crate) fn run_finalization_cleanup_job(
         &mut self,
         registry: Value,
@@ -5241,7 +5281,12 @@ impl Interp {
             } else {
                 self.weak_metadata.ready_registries.remove(&ptr);
             }
-            match self.call_job_callback(&callback, Value::Undefined, &[held_value]) {
+            let current = crate::rooting::Rooted::new((callback, held_value));
+            match self.call_job_callback(
+                &current.0,
+                Value::Undefined,
+                std::slice::from_ref(&current.1),
+            ) {
                 Ok(_) => {}
                 // CleanupFinalizationRegistry uses `?`: the first callback throw ends this job.
                 // The bare engine has no host error reporter; browser/Node embedders can add one
@@ -5251,11 +5296,9 @@ impl Interp {
                 | Err(Abrupt::Break(_, _))
                 | Err(Abrupt::Continue(_, _)) => return Ok(()),
                 Err(Abrupt::Interrupt(reason)) => {
-                    self.clear_kept_objects();
                     return Err(reason);
                 }
             }
-            self.clear_kept_objects();
         }
     }
 
@@ -5263,26 +5306,20 @@ impl Interp {
     /// settlement through when there is no handler).
     pub(crate) fn run_job_interruptible(
         &mut self,
-        job: crate::interpreter::Job,
+        job: &crate::interpreter::Job,
     ) -> Result<(), crate::InterruptReason> {
-        // ECMA-262 §9.5 schedules a Promise job in the Realm supplied by
-        // HostEnqueuePromiseJob. HTML §8.1.6.6.4 prepares that Realm's settings before invoking
-        // the job. Enter the Realm around the complete abstract closure, rather than waiting for
-        // `Call(handler)` to switch after the host preparation callback has already run.
+        // The current job remains a precise root throughout Realm/settings preparation and
+        // host hooks. Its immutable payload is only shared while author callbacks execute.
         let current_realm = Gc::as_ptr(&self.global) as usize;
         if let Some(target_realm) = job.realm.filter(|realm| *realm != current_realm) {
             if let Some(target) = self
                 .realms
                 .get(&target_realm)
-                .map(crate::interpreter::RealmState::snapshot_clone)
+                .map(RealmState::snapshot_clone)
             {
-                let saved = self.snapshot_realm();
-                self.restore_realm(&target);
-                let result = self.run_job_in_active_realm(job);
-                let updated = self.snapshot_realm();
-                self.realms.insert(target_realm, updated);
-                self.restore_realm(&saved);
-                return result;
+                return self.with_realm_snapshot(target_realm, target, |interp| {
+                    interp.run_job_in_active_realm(job)
+                });
             }
         }
         self.run_job_in_active_realm(job)
@@ -5293,7 +5330,10 @@ impl Interp {
     fn run_internal_job(&mut self, handler: &crate::interpreter::JobCallback, value: Value) {
         use crate::interpreter::InternalJob;
         let signal = match handler.internal {
-            InternalJob::None | InternalJob::HostReaction => return,
+            InternalJob::None
+            | InternalJob::HostReaction
+            | InternalJob::RoutedImportFulfilled { .. }
+            | InternalJob::RoutedImportRejected { .. } => return,
             InternalJob::AwaitFulfilled { .. } => crate::coroutine::Resume::Next(value),
             InternalJob::AwaitRejected { .. } => crate::coroutine::Resume::Throw(value),
         };
@@ -5301,34 +5341,41 @@ impl Interp {
             return;
         };
         let key = Gc::as_ptr(async_promise) as usize;
-        let previous_entry = self.host_entry_realm;
-        if self.capture_job_script_caller {
-            self.host_entry_realm = handler.internal.realm();
-        }
+        let entry = if self.capture_job_script_caller {
+            handler.internal.realm()
+        } else {
+            self.host_entry_realm
+        };
         let async_promise = handler.callback;
-        self.with_job_script_context(handler.active_script.as_ref(), |ctx| {
-            if let Some(global) = &handler.script_caller {
-                ctx.with_callback_script_caller(&Value::Obj(*global), |ctx| {
-                    ctx.drive_async(key, async_promise, signal)
-                });
-            } else {
-                ctx.drive_async(key, async_promise, signal);
-            }
+        self.with_entry_context(self.script_entry, entry, |interp| {
+            interp.with_job_script_context(handler.active_script.as_ref(), |ctx| {
+                if let Some(global) = &handler.script_caller {
+                    ctx.with_callback_script_caller(&Value::Obj(*global), |ctx| {
+                        ctx.drive_async(key, async_promise, signal)
+                    });
+                } else {
+                    ctx.drive_async(key, async_promise, signal);
+                }
+            });
         });
-        self.host_entry_realm = previous_entry;
     }
 
     fn run_job_in_active_realm(
         &mut self,
-        job: crate::interpreter::Job,
+        job: &crate::interpreter::Job,
     ) -> Result<(), crate::InterruptReason> {
-        let previous_host_context = self.host_job_context;
-        let switch_host_context = job.realm.is_some() && job.host_context != previous_host_context;
-        if switch_host_context {
-            if let Some(enter) = self.host_job_context_enter {
-                self.with_host_callback(|interp| enter(interp, job.host_context));
-            }
-            self.switch_host_job_context(job.host_context);
+        if job.realm.is_some() && job.host_context != self.host_job_context {
+            return self.with_settings_context(job.host_context, |interp| interp.run_job_body(job));
+        }
+        self.run_job_body(job)
+    }
+
+    fn run_job_body(
+        &mut self,
+        job: &crate::interpreter::Job,
+    ) -> Result<(), crate::InterruptReason> {
+        if let Some((_, _, _, fulfilled)) = job.handler.internal.routed_import() {
+            return self.finish_routed_import(job.handler.callback, job.value, fulfilled);
         }
         if job.handler.internal.resumes_await() {
             // Await's reaction built-ins return undefined and have no result capability; the
@@ -5348,12 +5395,6 @@ impl Interp {
                 ),
                 Err(Abrupt::Throw(e)) => self.reject_promise(&job.result, e),
                 Err(Abrupt::Interrupt(reason)) => {
-                    if switch_host_context {
-                        if let Some(leave) = self.host_job_context_leave {
-                            self.with_host_callback(leave);
-                        }
-                        self.switch_host_job_context(previous_host_context);
-                    }
                     return Err(reason);
                 }
                 Err(_) => {}
@@ -5362,12 +5403,6 @@ impl Interp {
             self.resolve_promise(&job.result, job.value);
         } else {
             self.reject_promise(&job.result, job.value);
-        }
-        if switch_host_context {
-            if let Some(leave) = self.host_job_context_leave {
-                self.with_host_callback(leave);
-            }
-            self.switch_host_job_context(previous_host_context);
         }
         Ok(())
     }
@@ -5848,10 +5883,12 @@ impl Interp {
         // The decorators proposal evaluates class decorator expressions before
         // ClassDefinitionEvaluation (and therefore before the class name's TDZ and heritage).
         // Evaluated decorators stay rooted while later expressions run author code (I1).
-        let mut class_decorators =
-            crate::rooting::Rooted::new(Vec::with_capacity(class.decorators.len()));
+        let class_decorators = crate::rooting::Rooted::new(std::cell::RefCell::new(
+            Vec::with_capacity(class.decorators.len()),
+        ));
         for decorator in &class.decorators {
-            class_decorators.push(self.eval_decorator_expression(decorator, env)?);
+            let value = self.eval_decorator_expression(decorator, env)?;
+            class_decorators.borrow_mut().push(value);
         }
         // ClassDefinitionEvaluation is strict code throughout — the heritage expression and
         // computed member keys included, whatever the surrounding mode.
@@ -5866,33 +5903,35 @@ impl Interp {
         &mut self,
         class: &Rc<Class>,
         env: &Env,
-        class_decorators: crate::rooting::Rooted<Vec<PreparedDecoratorValue>>,
+        class_decorators: crate::rooting::Rooted<std::cell::RefCell<Vec<PreparedDecoratorValue>>>,
     ) -> Result<Value, Abrupt> {
         // Rooted through heritage, decorator and computed-key evaluation and the decorator
         // application that finishes the class (I1).
-        let mut prepared = crate::rooting::Rooted::new(self.begin_class_evaluation(class, env));
-        for decorator in class_decorators.iter() {
+        let prepared = crate::rooting::Rooted::new(std::cell::RefCell::new(
+            self.begin_class_evaluation(class, env),
+        ));
+        for decorator in class_decorators.borrow().iter() {
             self.prepare_class_decorator(
-                &mut prepared,
+                &mut prepared.borrow_mut(),
                 None,
                 decorator.callback,
                 decorator.this_value,
             );
         }
         drop(class_decorators);
+        let outer = prepared.borrow().outer_class_env;
         let parent = match &class.superclass {
-            Some(expression) => Some(self.eval(expression, &prepared.outer_class_env)?),
+            Some(expression) => Some(self.eval(expression, &outer)?),
             None => None,
         };
-        self.prepare_class_heritage(&mut prepared, parent)?;
-        // TC39 decorators proposal, "Evaluating decorators": visit each element top-to-bottom,
-        // evaluating its decorators left-to-right before its computed ClassElementName. Retain
-        // those values for the later application phase rather than re-evaluating their syntax.
+        let heritage = self.class_heritage(parent)?;
+        prepared.borrow_mut().publish_heritage(heritage);
         for (index, member) in class.members.iter().enumerate() {
+            let env = prepared.borrow().class_env;
             for decorator in &member.decorators {
-                let value = self.eval_decorator_expression(decorator, &prepared.class_env)?;
+                let value = self.eval_decorator_expression(decorator, &env)?;
                 self.prepare_class_decorator(
-                    &mut prepared,
+                    &mut prepared.borrow_mut(),
                     Some(index),
                     value.callback,
                     value.this_value,
@@ -5902,10 +5941,12 @@ impl Interp {
                 continue;
             }
             if let PropKey::Computed(expression) = &member.key {
-                let value = self.eval(expression, &prepared.class_env)?;
-                self.prepare_class_key(&mut prepared, class, index, value)?;
+                let value = self.eval(expression, &env)?;
+                let key = self.class_computed_key(class, index, value)?;
+                prepared.borrow_mut().publish_key(index, key);
             }
         }
+        let prepared = crate::rooting::Rooted::new(prepared.into_inner().into_inner());
         self.finish_class_evaluation(class, prepared)
     }
 
@@ -6022,11 +6063,10 @@ impl Interp {
 
     /// Complete the heritage portion through Get(superclass, "prototype") before any computed
     /// member name is evaluated.
-    pub(crate) fn prepare_class_heritage(
+    pub(crate) fn class_heritage(
         &mut self,
-        prepared: &mut PreparedClassEvaluation,
         parent: Option<Value>,
-    ) -> Result<(), Abrupt> {
+    ) -> Result<(Option<Gc>, Option<Value>, bool), Abrupt> {
         // (IsConstructor runs BEFORE any `prototype` read; a callable non-constructor like
         // %IsHTMLDDA% is a TypeError without observable gets.)
         let (proto_parent, ctor_parent): (Option<Gc>, Option<Value>) =
@@ -6054,20 +6094,16 @@ impl Interp {
                     ));
                 }
             };
-        prepared.proto_parent = proto_parent;
-        prepared.ctor_parent = ctor_parent;
-        prepared.derived = parent.is_some();
-        Ok(())
+        Ok((proto_parent, ctor_parent, parent.is_some()))
     }
 
     /// Record one already-evaluated computed ClassElementName after its single ToPropertyKey.
-    pub(crate) fn prepare_class_key(
+    pub(crate) fn class_computed_key(
         &mut self,
-        prepared: &mut PreparedClassEvaluation,
         class: &Class,
         member: usize,
         value: Value,
-    ) -> Result<(), Abrupt> {
+    ) -> Result<crate::value::PropertyKey, Abrupt> {
         let key = self.to_property_key(&value)?;
         if class.members[member].is_static && key == "prototype" {
             return Err(self.throw(
@@ -6075,8 +6111,7 @@ impl Interp {
                 "classes may not have a static property named 'prototype'",
             ));
         }
-        prepared.keys[member] = Some(key);
-        Ok(())
+        Ok(key)
     }
 
     /// Finish the atomic portion of ClassDefinitionEvaluation from retained environments,
@@ -6084,7 +6119,7 @@ impl Interp {
     pub(crate) fn finish_class_evaluation(
         &mut self,
         class: &Rc<Class>,
-        mut prepared: crate::rooting::Rooted<PreparedClassEvaluation>,
+        prepared: crate::rooting::Rooted<PreparedClassEvaluation>,
     ) -> Result<Value, Abrupt> {
         let outer_class_env = prepared.outer_class_env;
         let class_env = prepared.class_env;
@@ -6183,7 +6218,8 @@ impl Interp {
 
         // Methods, accessors and fields retain their actual records, including computed
         // Symbol keys, while later decorators and static elements run author code (I1).
-        let mut pending = crate::rooting::Rooted::new(PendingClassElements::default());
+        let pending =
+            crate::rooting::Rooted::new(std::cell::RefCell::new(PendingClassElements::default()));
         // Instance private methods/accessors: stamped onto each instance when `this` is created
         // (PrivateMethodOrAccessorAdd), not placed on the prototype — so brand checks, double
         // initialization, and return-override semantics fall out of own-property checks.
@@ -6197,7 +6233,7 @@ impl Interp {
             }
             // Computed keys evaluate with the class's PrivateEnvironment active: an arrow made
             // inside one may capture `A.#x` (class_env holds the runtime private-name bindings).
-            let key = match prepared.keys[member_index].take() {
+            let key = match prepared.keys[member_index].clone() {
                 Some(key) => key,
                 None => self.eval_prop_key(&m.key, &class_env)?,
             };
@@ -6259,7 +6295,7 @@ impl Interp {
                         transforms = t;
                     }
                     if is_private && !m.is_static {
-                        pending.private_members.push((
+                        pending.borrow_mut().private_members.push((
                             key.to_string(),
                             Property::accessor_prop(Some(getter), Some(setter), false, false),
                         ));
@@ -6268,6 +6304,7 @@ impl Interp {
                     }
                     if m.is_static {
                         pending
+                            .borrow_mut()
                             .static_elements
                             .push(StaticClassElement::Field(FieldInit {
                                 key: crate::value::PropertyKey::private(backing.to_string()),
@@ -6275,7 +6312,7 @@ impl Interp {
                                 transforms,
                             }));
                     } else {
-                        pending.instance_fields.push(FieldInit {
+                        pending.borrow_mut().instance_fields.push(FieldInit {
                             key: crate::value::PropertyKey::private(backing.to_string()),
                             init: m.value.clone(),
                             transforms,
@@ -6323,7 +6360,10 @@ impl Interp {
                         Property::builtin(f)
                     };
                     if is_private && !m.is_static {
-                        pending.private_members.push((key.into_string(), prop));
+                        pending
+                            .borrow_mut()
+                            .private_members
+                            .push((key.into_string(), prop));
                     } else if is_private {
                         target
                             .borrow_mut()
@@ -6381,7 +6421,8 @@ impl Interp {
                         (None, Some(f))
                     };
                     if is_private && !m.is_static {
-                        if let Some((_, p)) = pending
+                        let mut records = pending.borrow_mut();
+                        if let Some((_, p)) = records
                             .private_members
                             .iter_mut()
                             .find(|(k, _)| k.as_str() == key.as_str())
@@ -6393,7 +6434,7 @@ impl Interp {
                                 p.set_setter(set);
                             }
                         } else {
-                            pending.private_members.push((
+                            records.private_members.push((
                                 key.into_string(),
                                 Property::accessor_prop(get, set, false, false),
                             ));
@@ -6420,6 +6461,7 @@ impl Interp {
                     };
                     if m.is_static {
                         pending
+                            .borrow_mut()
                             .static_elements
                             .push(StaticClassElement::Field(FieldInit {
                                 key,
@@ -6427,7 +6469,7 @@ impl Interp {
                                 transforms,
                             }));
                     } else {
-                        pending.instance_fields.push(FieldInit {
+                        pending.borrow_mut().instance_fields.push(FieldInit {
                             key,
                             init: m.value.clone(),
                             transforms,
@@ -6437,6 +6479,7 @@ impl Interp {
                 MemberKind::StaticBlock => {
                     if let Some(func) = &m.func {
                         pending
+                            .borrow_mut()
                             .static_elements
                             .push(StaticClassElement::Block(func.clone()));
                     }
@@ -6459,21 +6502,29 @@ impl Interp {
         // Keep this metadata even if a static element throws: the constructor may escape.
         // https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation
         self.gc_pin(&ctor_obj);
+        let (fields, private_members) = {
+            let mut records = pending.borrow_mut();
+            (
+                std::mem::take(&mut records.instance_fields).into(),
+                std::mem::take(&mut records.private_members),
+            )
+        };
         self.class_info.insert(
             &self.gc_heap,
             Gc::as_ptr(&ctor_obj) as usize,
             ClassInfo {
-                fields: std::mem::take(&mut pending.instance_fields).into(),
+                fields,
                 field_env: inst_env,
                 derived,
                 instance_initializers: instance_inits.into_vec(),
-                private_members: std::mem::take(&mut pending.private_members),
+                private_members,
             },
         );
 
         // Borrow each record without detaching the backing list: both the current key and
         // the remaining static records stay traced through initializer/decorator callbacks.
-        for element in pending.static_elements.iter() {
+        let static_elements = pending.borrow();
+        for element in static_elements.static_elements.iter() {
             let scope = new_scope(Some(static_env));
             bind(&scope, "this", ctor_val);
             if let StaticClassElement::Block(func) = element {
@@ -6739,7 +6790,7 @@ impl Interp {
         key: &str,
         is_static: bool,
         is_private: bool,
-        inits: &mut Vec<Value>,
+        inits: &mut crate::rooting::RootedVec,
     ) -> Result<Value, Abrupt> {
         for decorator in decorators.iter().rev() {
             if !decorator.callback.is_callable() {
@@ -6768,7 +6819,7 @@ impl Interp {
         key: &str,
         is_static: bool,
         is_private: bool,
-        inits: &mut Vec<Value>,
+        inits: &mut crate::rooting::RootedVec,
     ) -> Result<Vec<Value>, Abrupt> {
         // Rooted across the later decorators' calls (I1).
         let mut transforms = crate::rooting::RootedVec::new();
@@ -6806,7 +6857,7 @@ impl Interp {
         is_static: bool,
         mut get: Value,
         mut set: Value,
-        inits: &mut Vec<Value>,
+        inits: &mut crate::rooting::RootedVec,
     ) -> Result<(Value, Value, Vec<Value>), Abrupt> {
         let is_private = key.is_private();
         // Rooted across the later decorators' calls (I1).

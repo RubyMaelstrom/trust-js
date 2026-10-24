@@ -1092,6 +1092,54 @@ mod api_tests {
     }
 
     #[test]
+    fn wasm_memory_growth_counts_toward_buffer_pressure() {
+        // The same module with a 4096-page maximum: 4 x 512 pages are 128 MiB of growth, past
+        // the engine's 64 MiB buffer trigger, with no other allocation large enough to collect.
+        let memory_section: &[u8] = &[0x05, 0x04, 0x01, 0x01, 0x01, 0x03];
+        let start = SHARED_MEMORY_MODULE
+            .windows(memory_section.len())
+            .position(|window| window == memory_section)
+            .expect("the test module's memory section");
+        let mut module = SHARED_MEMORY_MODULE[..start].to_vec();
+        module.extend_from_slice(&[0x05, 0x05, 0x01, 0x01, 0x01, 0x80, 0x20]);
+        module.extend_from_slice(&SHARED_MEMORY_MODULE[start + memory_section.len()..]);
+        let bytes = module
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        for (label, growth) in [
+            (
+                "Memory.prototype.grow",
+                "const memory = new WebAssembly.Memory({ initial: 0, maximum: 4096 });\
+                 for (let k = 0; k < 4; k++) memory.grow(512);\
+                 memory.buffer.byteLength"
+                    .to_string(),
+            ),
+            (
+                "memory.grow",
+                format!(
+                    "const module = new WebAssembly.Module(new Uint8Array([{bytes}]));\
+                     const instance = new WebAssembly.Instance(module, {{ env: {{ afterGrow() {{}} }} }});\
+                     for (let k = 0; k < 4; k++) instance.exports.growThenCall(512);\
+                     instance.exports.memory.buffer.byteLength - 65536"
+                ),
+            ),
+        ] {
+            let mut engine = Engine::new();
+            install(&mut engine, &[extension()]);
+            engine.collect_garbage_at_idle();
+            let (collections, minors) = engine.unstable_gc_collection_counts();
+            assert_eq!(eval(&mut engine, &growth), (2048 * 65536).to_string(), "{label}");
+            let (after, after_minors) = engine.unstable_gc_collection_counts();
+            assert!(
+                after - after_minors > collections - minors,
+                "{label}: grown pages count toward the engine's buffer pressure"
+            );
+        }
+    }
+
+    #[test]
     fn wasm_store_entities_follow_live_js_handle_graph() {
         let mut engine = Engine::new();
         install(&mut engine, &[extension()]);

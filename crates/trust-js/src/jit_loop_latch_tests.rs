@@ -379,7 +379,7 @@ thread_local! {
 fn arm_latch_gc(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
     let object = args[0].as_obj().expect("local root");
     LOCAL_ROOT.with(|root| *root.borrow_mut() = Some(crate::value::Gc::downgrade(&object)));
-    i.gc_next = 0;
+    i.set_agent_next(0);
     Ok(Value::Undefined)
 }
 

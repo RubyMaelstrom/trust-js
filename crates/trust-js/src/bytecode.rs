@@ -16438,24 +16438,26 @@ fn run_vm_inner(
             }
             Op::ClassHeritage(plan, present) => {
                 let parent = present.then(|| pop!());
+                let heritage = i.class_heritage(parent)?;
                 let state = class_states[plan as usize]
                     .as_mut()
                     .expect("ClassStart precedes heritage evaluation");
-                i.prepare_class_heritage(state, parent)?;
+                state.publish_heritage(heritage);
                 *env = state.class_env;
             }
             Op::ClassKey(plan, member) => {
                 let value = pop!();
-                let state = class_states[plan as usize]
-                    .as_mut()
-                    .expect("ClassStart precedes computed-name evaluation");
-                i.prepare_class_key(
-                    state,
+                let key = i.class_computed_key(
                     &chunk.class_plans[plan as usize].class,
                     member as usize,
                     value,
                 )?;
+                class_states[plan as usize]
+                    .as_mut()
+                    .expect("ClassStart precedes computed-name evaluation")
+                    .publish_key(member as usize, key);
             }
+
             Op::ClassDecorator(plan, member) => {
                 let callback = pop!();
                 let this_value = pop!();
@@ -16693,9 +16695,11 @@ fn run_vm_inner(
                     CallArgsMode::Fixed(argc) => stack.split_off(stack.len() - argc as usize),
                     CallArgsMode::FinalSpread(argc) => {
                         let spread = pop!();
-                        let mut args = stack.split_off(stack.len() - (argc as usize - 1));
+                        let mut args = crate::rooting::RootedVec::from_vec(
+                            stack.split_off(stack.len() - (argc as usize - 1)),
+                        );
                         i.append_spread_arguments(&spread, &mut args)?;
-                        args
+                        args.into_vec()
                     }
                     CallArgsMode::Array => argument_array_values(i, pop!()),
                 };
@@ -16707,7 +16711,7 @@ fn run_vm_inner(
             Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
                 let spread = pop!();
                 let at = stack.len() - (argc as usize - 1);
-                let mut args: Vec<Value> = stack.split_off(at);
+                let mut args = crate::rooting::RootedVec::from_vec(stack.split_off(at));
                 i.append_spread_arguments(&spread, &mut args)?;
                 let callee = pop!();
                 let this = if matches!(op, Op::CallSpreadThis(_)) {
@@ -24879,11 +24883,11 @@ unsafe fn jit_exec_inner(
                 CallArgsMode::FinalSpread(argc) => {
                     let spread = pop!();
                     *sp = sp.sub(argc as usize - 1);
-                    let mut args: Vec<Value> = (0..argc as usize - 1)
+                    let mut args: crate::rooting::RootedVec = (0..argc as usize - 1)
                         .map(|index| sp.add(index).read())
                         .collect();
                     i.append_spread_arguments(&spread, &mut args)?;
-                    args
+                    args.into_vec()
                 }
                 CallArgsMode::Array => argument_array_values(i, pop!()),
             };
@@ -24902,7 +24906,7 @@ unsafe fn jit_exec_inner(
             } else {
                 Value::Undefined
             };
-            let mut args = plain;
+            let mut args = crate::rooting::RootedVec::from_vec(plain);
             i.append_spread_arguments(&spread, &mut args)?;
             if !callee.is_callable() {
                 return Err(not_callable_error(i, chunk, pc as usize, &callee, false));
