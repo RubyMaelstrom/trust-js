@@ -1152,7 +1152,7 @@ impl Interp {
         let heap = self.gc_heap.clone();
         let marking = Marking::new(self, kind);
         heap.handles.set_collecting(true);
-        assert!(heap.core.borrow_mut().start_marking(false, &marking, kind));
+        assert!(crate::value::mark_agent_heap(&heap, false, &marking, kind));
         heap.records.borrow_mut().consume();
         heap.handles.consume();
         let native = marking.into_native_graphs();
@@ -1178,10 +1178,7 @@ impl Interp {
         });
         // No handle may be made or made strong until the sweep has freed the dead.
         heap.handles.set_collecting(true);
-        // Marking finds which functions still have closures (see `ClosureFunction`).
-        let stamp = crate::value::closure_mark_stamp();
-        let started = heap.core.borrow_mut().start_marking(true, &marking, kind);
-        crate::value::sweep_closure_functions(heap, stamp, started, kind);
+        let started = crate::value::mark_agent_heap(heap, true, &marking, kind);
         if !started {
             heap.handles.set_collecting(false);
         }

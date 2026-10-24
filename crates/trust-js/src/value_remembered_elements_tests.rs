@@ -365,7 +365,8 @@ fn actual_marker_keeps_sole_young_trees_in_distant_blocks_and_appended_tail() {
     {
         let heap = engine.interp.gc_heap.clone();
         let _guard = heap.core.borrow().nogc();
-        assert!(!heap.core.borrow_mut().start_marking(
+        assert!(!crate::value::mark_agent_heap(
+            &heap,
             false,
             &ArrayRoot(witness(value)),
             CollectionKind::Minor
@@ -736,7 +737,8 @@ fn between_phase_mutation_belongs_to_the_following_collection() {
     let heap = engine.interp.gc_heap.clone();
     // Every other engine cell is already old from the precise major. This minor has no new
     // side-table state and reports this array explicitly, without any conservative roots.
-    assert!(heap.core.borrow_mut().start_marking(
+    assert!(crate::value::mark_agent_heap(
+        &heap,
         false,
         &ArrayRoot(witness(value)),
         CollectionKind::Minor

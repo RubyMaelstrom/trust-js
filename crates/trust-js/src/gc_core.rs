@@ -2723,6 +2723,7 @@ impl Heap {
             !self.control.collecting.replace(true),
             "re-entrant GC collection"
         );
+        self.control.markings.set(self.control.markings.get() + 1);
         self.update_fast_alloc();
         self.control.pending_collect.set(false);
         self.collecting_kind = kind;
@@ -3680,6 +3681,8 @@ pub(crate) struct Control {
     pending_collect: Cell<bool>,
     borrows: Cell<u32>,
     collecting: Cell<bool>,
+    /// How many markings of this heap have begun.
+    markings: Cell<u64>,
     /// The bytes this heap's cells own outside it (see [`ExternalBytes`]).
     external: ExternalBytes,
 }
@@ -3711,6 +3714,12 @@ impl Control {
     /// sweep).
     pub(crate) fn collecting(&self) -> bool {
         self.collecting.get()
+    }
+
+    /// How many markings of this heap have begun: a cell made since the count was read is
+    /// young at the next one.
+    pub(crate) fn markings(&self) -> u64 {
+        self.markings.get()
     }
 
     /// Record `bytes` of Rust-heap payload acquired by a cell of this heap, or by a container a

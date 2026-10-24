@@ -182,3 +182,38 @@ fn closure_functions_go_with_their_closures() {
         count(&engine).saturating_sub(after_minor)
     );
 }
+
+/// A test's own collection (`gc_collect_precise_for_test`) judges the closure registry as
+/// every marking does: the closures it marks are old, and the minor collection after it must
+/// not take their functions for young ones. GC stress caught two agent tests calling a freed
+/// function after a precise major collection had bypassed the registry.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn closure_functions_outlive_the_minor_collection_after_a_precise_one() {
+    let mut engine = engine();
+    let count = |engine: &Engine| crate::value::closure_function_count(&engine.interp.gc_heap);
+    eval(
+        &mut engine,
+        "var kept = []; for (var i = 0; i < 200; i++) kept.push(new Function('return ' + i)); 0",
+    );
+    let held = count(&engine);
+    engine
+        .interp
+        .gc_collect_precise_for_test(crate::gc_core::CollectionKind::Major);
+    engine.interp.gc_collect_minor();
+    assert!(
+        count(&engine) >= held,
+        "a minor collection let go of {} functions of old closures",
+        held - count(&engine)
+    );
+    assert_eq!(
+        eval(
+            &mut engine,
+            "var sum = 0; for (var f of kept) sum += f(); sum"
+        ),
+        "19900"
+    );
+}

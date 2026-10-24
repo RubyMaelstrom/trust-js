@@ -2857,11 +2857,14 @@ pub(crate) struct GcState {
     >,
     /// The functions of this heap's closures, each held once for all of them, by address (see
     /// [`ClosureFunction`]).
-    closure_functions: RefCell<crate::fasthash::FastMap<usize, ClosureHold>>,
+    closure_functions: RefCell<crate::fasthash::FastMap<usize, Rc<Function>>>,
     /// The registry's functions taken since the last collection, none of whose closures has
     /// survived one: a minor collection, which traces every live young closure, lets go of
     /// those it found no closure of.
     young_closure_functions: RefCell<Vec<usize>>,
+    /// The heap's markings (`gc_core::Control::markings`) when a collection last judged the
+    /// registry: the young functions' closures are young only at the marking after it.
+    closure_functions_judged: Cell<u64>,
     array_length_shape: Cell<u32>,
     array_length_layout: RefCell<Option<PropertyLayout>>,
     live: LiveCount,
@@ -4360,6 +4363,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         function_runtimes: RefCell::default(),
         closure_functions: RefCell::default(),
         young_closure_functions: RefCell::default(),
+        closure_functions_judged: Cell::new(0),
         array_length_shape: Cell::new(SHAPE_EMPTY),
         array_length_layout: RefCell::default(),
         live: LiveCount::new(0),
@@ -4510,27 +4514,15 @@ fn hold_closure_function_in(func: &Rc<Function>, heap_id: u64) {
         if let std::collections::hash_map::Entry::Vacant(entry) =
             heap.closure_functions.borrow_mut().entry(key)
         {
+            entry.insert(func.clone());
             // A closure made while a collection finishes is allocated marked, old once it ends:
             // only a major collection judges its function.
-            let old = heap.ledger.collecting();
-            entry.insert(ClosureHold {
-                func: func.clone(),
-                old,
-            });
-            if !old {
+            if !heap.ledger.collecting() {
                 heap.young_closure_functions.borrow_mut().push(key);
             }
         }
     });
     func.runtime_cache().closure_heap.set(heap_id);
-}
-
-/// One function of a heap's closure registry (see [`ClosureFunction`]).
-struct ClosureHold {
-    func: Rc<Function>,
-    /// A closure of the function survived a collection: only a major collection, which traces
-    /// the old closures, can find them all dead.
-    old: bool,
 }
 
 thread_local! {
@@ -4540,10 +4532,29 @@ thread_local! {
     static LAST_CLOSURE_MARK_STAMP: Cell<u64> = const { Cell::new(0) };
 }
 
+/// Mark `heap` for a collection of `kind` ([`crate::gc_core::Heap::start_marking`]) and let
+/// its closure registry go of the functions the marking found no live closure of (see
+/// [`ClosureFunction`]). Every marking of an Agent heap goes through here: one that did not
+/// would make closures old that the registry takes for young.
+pub(crate) fn mark_agent_heap(
+    heap: &GcState,
+    native_roots: bool,
+    client: &dyn crate::gc_core::MarkClient,
+    kind: crate::gc_core::CollectionKind,
+) -> bool {
+    let stamp = closure_mark_stamp();
+    let marked = heap
+        .core
+        .borrow_mut()
+        .start_marking(native_roots, client, kind);
+    sweep_closure_functions(heap, stamp, marked, kind);
+    marked
+}
+
 /// Start a collection's marking of closures: the marker's trace of a closure records the
 /// returned stamp in its function's cache, unique among this thread's collections (a function
 /// is used only on its thread). [`sweep_closure_functions`] ends it.
-pub(crate) fn closure_mark_stamp() -> u64 {
+fn closure_mark_stamp() -> u64 {
     let stamp = LAST_CLOSURE_MARK_STAMP.with(|last| {
         last.set(last.get() + 1);
         last.get()
@@ -4558,7 +4569,7 @@ pub(crate) fn closure_mark_stamp() -> u64 {
 /// (see `GcState::young_closure_functions`). No closure of such a function is left in the heap
 /// but dead ones, which hold nothing (see [`ClosureFunction`]). Runs as the marking ends,
 /// before any closure can be made again.
-pub(crate) fn sweep_closure_functions(
+fn sweep_closure_functions(
     heap: &GcState,
     stamp: u64,
     marked: bool,
@@ -4568,13 +4579,22 @@ pub(crate) fn sweep_closure_functions(
     if !marked {
         return;
     }
+    // The young functions' closures were made since the registry was last judged: all young
+    // at this marking if it is the next one. A marking that bypassed `mark_agent_heap` made
+    // them old, and only a major collection can judge them now.
+    let markings = heap.ledger.markings();
+    let young_judged = heap.closure_functions_judged.replace(markings) + 1 == markings;
+    debug_assert!(
+        young_judged,
+        "an Agent heap marked without `mark_agent_heap`"
+    );
     let mut released: Vec<Rc<Function>> = Vec::new();
-    let mut release = |func: &Rc<Function>| {
+    let mut release = |func: Rc<Function>| {
         let cache = func.runtime_cache();
         if cache.closure_heap.get() == heap.heap_id {
             cache.closure_heap.set(0);
         }
-        released.push(func.clone());
+        released.push(func);
     };
     let traced = |func: &Rc<Function>| func.runtime_cache().closure_mark.get() == stamp;
     {
@@ -4583,26 +4603,18 @@ pub(crate) fn sweep_closure_functions(
         match kind {
             crate::gc_core::CollectionKind::Minor => {
                 for key in young.drain(..) {
-                    let Some(hold) = registry.get_mut(&key) else {
-                        continue;
-                    };
-                    debug_assert!(!hold.old, "a young function's closures are young");
-                    if traced(&hold.func) {
-                        hold.old = true;
-                    } else {
-                        release(&hold.func);
-                        registry.remove(&key);
+                    if young_judged && registry.get(&key).is_some_and(|func| !traced(func)) {
+                        release(registry.remove(&key).expect("the young function is held"));
                     }
                 }
             }
             crate::gc_core::CollectionKind::Major => {
                 young.clear();
-                registry.retain(|_, hold| {
-                    if traced(&hold.func) {
-                        hold.old = true;
+                registry.retain(|_, func| {
+                    if traced(func) {
                         return true;
                     }
-                    release(&hold.func);
+                    release(func.clone());
                     false
                 });
             }
@@ -9384,7 +9396,7 @@ mod object_accounting_tests {
     /// on conservative retention in the test's frame. Preserve the production phase ordering.
     fn collect(heap: &GcHeap, roots: &[Gc], kind: CollectionKind) {
         let client = Roots(roots.iter().map(|o| Gc::as_ptr(o) as u64).collect(), heap);
-        assert!(heap.core.borrow_mut().start_marking(false, &client, kind));
+        assert!(mark_agent_heap(heap, false, &client, kind));
         let dead = crate::gc_sweep::DeadObjects::new(heap);
         sweep_object_metadata(heap, &dead);
         let pins = {

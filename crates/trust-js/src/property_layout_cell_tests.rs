@@ -29,7 +29,7 @@ pub(crate) fn collect(heap: &GcHeap, roots: &dyn GcTrace, kind: CollectionKind) 
         fn ephemerons(&self, _: &mut EdgeSink<'_>) {}
     }
     let client = Roots { heap, roots };
-    assert!(heap.core.borrow_mut().start_marking(false, &client, kind));
+    assert!(crate::value::mark_agent_heap(heap, false, &client, kind));
     let dead = crate::gc_sweep::DeadObjects::new(heap);
     sweep_object_metadata(heap, &dead);
     let pins = {
