@@ -431,9 +431,9 @@ mod os_pages {
 /// release returns every page.
 ///
 /// On Linux the source maps chunks of 2 MiB at 2 MiB boundaries, advised for transparent huge
-/// pages, and carves its pages from them. A page given back is discarded (its memory freed, the
-/// range left mapped to read as zero) and taken again once the current chunk is carved, before a
-/// new chunk is mapped. Chunks are unmapped only with the heap.
+/// pages once the heap has a few of them, and carves its pages from them. A page given back is
+/// discarded (its memory freed, the range left mapped to read as zero) and taken again once the
+/// current chunk is carved, before a new chunk is mapped. Chunks are unmapped only with the heap.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "aarch64", target_arch = "x86_64")
@@ -444,6 +444,10 @@ mod page_source {
     /// The size and alignment of a chunk: one transparent huge page, where base pages are 4 KiB.
     pub(super) const CHUNK_SIZE: usize = 2 << 20;
     const PAGES_PER_CHUNK: usize = CHUNK_SIZE / PAGE_SIZE;
+    /// The chunks a heap maps before it asks for huge pages. A huge page makes its whole chunk
+    /// resident, so a small heap's partly carved chunks keep base pages, which only the pages
+    /// taken make resident; a heap that reaches this many chunks advises them all.
+    pub(super) const HUGE_PAGE_MIN_CHUNKS: usize = 4;
 
     pub(super) struct PageSource {
         /// The chunks mapped, by address.
@@ -484,9 +488,24 @@ mod page_source {
         fn map_chunk(&mut self) {
             let base = os_pages::map_aligned(CHUNK_SIZE, CHUNK_SIZE);
             assert!(!base.is_null(), "GC page allocation failed");
-            os_pages::advise_huge_pages(base, CHUNK_SIZE);
             self.chunks.push(base as usize);
+            match self.chunks.len() {
+                n if n < HUGE_PAGE_MIN_CHUNKS => {}
+                // The earlier chunks too: the heap is now large enough to use them whole.
+                HUGE_PAGE_MIN_CHUNKS => {
+                    for &chunk in &self.chunks {
+                        os_pages::advise_huge_pages(chunk as *mut u8, CHUNK_SIZE);
+                    }
+                }
+                _ => os_pages::advise_huge_pages(base, CHUNK_SIZE),
+            }
             (self.next, self.end) = (base as usize, base as usize + CHUNK_SIZE);
+        }
+
+        /// Whether the chunks mapped so far are advised for huge pages.
+        #[cfg(test)]
+        pub(super) fn huge_pages_advised(&self) -> bool {
+            self.chunks.len() >= HUGE_PAGE_MIN_CHUNKS
         }
 
         /// Return the memory of the page at `base` to the OS. The page stays in its chunk, to be
@@ -4068,6 +4087,65 @@ mod tests {
     /// the spare pool, and given back to the source when the pool is trimmed and taken again.
     /// On Linux the pages given back are taken again before a new chunk is mapped (after the
     /// current chunk's last pages), so they come from the same chunks. The heap's release returns
+    /// A small heap's chunks keep base pages, which only the pages taken make resident; the
+    /// chunk that makes the heap large enough advises every chunk mapped for huge pages, as the
+    /// kernel's own mapping flags show.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn small_heaps_keep_base_pages_until_enough_chunks_are_mapped() {
+        use super::page_source::{PageSource, CHUNK_SIZE, HUGE_PAGE_MIN_CHUNKS};
+        // The VmFlags of the mapping holding `address`, from /proc/self/smaps.
+        fn advised(address: usize) -> bool {
+            let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
+            let mut inside = false;
+            for line in smaps.lines() {
+                if let Some((range, _)) = line.split_once(' ') {
+                    if let Some((start, end)) = range.split_once('-') {
+                        if let (Ok(start), Ok(end)) = (
+                            usize::from_str_radix(start, 16),
+                            usize::from_str_radix(end, 16),
+                        ) {
+                            inside = (start..end).contains(&address);
+                            continue;
+                        }
+                    }
+                }
+                if inside {
+                    if let Some(flags) = line.strip_prefix("VmFlags:") {
+                        return flags.split_whitespace().any(|flag| flag == "hg");
+                    }
+                }
+            }
+            panic!("no mapping holds {address:#x}");
+        }
+        let mut source = PageSource::new();
+        let mut chunks = Vec::new();
+        let mut taken = Vec::new();
+        for chunk in 1..=HUGE_PAGE_MIN_CHUNKS {
+            let first = source.take() as usize;
+            assert_eq!(first % CHUNK_SIZE, 0, "a new chunk's first page");
+            taken.push(first);
+            for _ in 1..CHUNK_SIZE / PAGE_SIZE {
+                taken.push(source.take() as usize);
+            }
+            chunks.push(first);
+            assert_eq!(source.chunks(), chunk);
+            assert_eq!(source.huge_pages_advised(), chunk == HUGE_PAGE_MIN_CHUNKS);
+            for &base in &chunks {
+                assert_eq!(
+                    advised(base),
+                    chunk == HUGE_PAGE_MIN_CHUNKS,
+                    "chunk {chunk}"
+                );
+            }
+        }
+        // SAFETY: every page this source gave is listed and no longer used.
+        unsafe { source.release(taken) };
+    }
+
     /// every page: live, spare and given back.
     #[test]
     fn pages_are_aligned_and_zeroed_when_new_reused_or_taken_again() {

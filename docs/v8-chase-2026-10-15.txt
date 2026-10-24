@@ -9006,3 +9006,46 @@ Artifacts are under target/s6-gc-opt-2026-10-23/part-c, including the
 previous agent's iterations and both gates, and target/claude-partc for
 the takeover: the integration patch, focused runs, performance builds
 and mutation results.
+
+
+GC optimization part D: huge pages for large heaps only, 2026-10-24
+
+React's peak RSS remained +48.9% against matched main, against a +25%
+bound. With transparent huge pages disabled per process, its gap is
++6 MB: GC chunks 2.7 MB, the malloc heap +3 MB (1.7 to 4.6 MB) and the
+stack +0.2 MB; with them, both GC chunks were resident whole. Crystal's
+glibc defaults glibc.malloc.hugetlb to 1, so its malloc heap also grows
+in 2 MiB huge pages. The heap's extra bytes are mostly dead arrays'
+dense element storage, about 2.5 KB each and about 1,000 per React
+nursery cycle, which only a sweep frees.
+
+Part D maps chunks without huge-page advice until the heap has four
+(8 MiB); the fourth chunk advises all of them. A small heap's partly
+carved chunks keep base pages, which only the pages taken make
+resident. A test reads the kernel's mapping flags to check the advice.
+No-LTO screening on CPU 5, with the system's default huge-page settings
+and the median peak RSS of three to five runs, against part C: React
+22.0 to 19.4 MB (+21% over main's 16.0 MB), Vue 29.9 to 28.2 MB, the
+empty script 15.0 to 12.1 MB, sustained allocation 77.6 to 76.9 MB;
+Djot, which reaches four chunks, is unchanged. Instruction counts and
+collections are unchanged.
+
+Counting dense element storage toward the nursery budget was evaluated
+and not adopted. At full weight React reaches 17.5 MB (+9%) and arrays
+of the twelve-4-MiB probe would be collected, but React's collections
+rise from 6 to 16 and its GC pause excluding exit by about a third,
+above the 5% GC-share bound. Partial weights are collector policy
+tuning that the plan reserves for the owner. The experiment is kept in
+target/claude-partc/partd-d1-d2-scratch.diff.
+
+Crystal routine gate: rustfmt, the five strict Clippy configurations
+and rustdoc's eight warnings are unchanged; the library suite is
+2467/0/7 with one new test, doctests 11/0/1, and every downstream suite
+matches part C. Fixture outputs, compilation and collection counts,
+sustained checksums and all nine code-dump pairs are identical to part
+C; difftest agrees on 138 seeds and Test262 at threshold 8 is
+53575/53575, identical to the reference. Targeted stress passes 226.
+Zombie: x64 2295/0/7 and Wine 2286/3/7 with exactly the three
+established snapshot failures; the new test is Linux-only and passes
+under GC stress. The fat-LTO comparison follows with part C's, once the
+machine is quiet. Artifacts are under target/s6-gc-opt-2026-10-23/part-d.
