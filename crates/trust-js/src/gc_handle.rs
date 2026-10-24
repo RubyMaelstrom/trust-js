@@ -6,7 +6,7 @@
 //! `object_ptr` explicitly names its payload. Copying a handle is free and dropping one releases
 //! nothing; the collector reclaims unreachable cells.
 
-pub(crate) use cell::{clear_dead_weak_cells, WeakRef};
+pub(crate) use cell::{clear_dead_weak_cells, clear_dead_weak_cells_in, TargetState, WeakRef};
 pub(crate) use cell::{Gc, WeakGc};
 
 mod cell {
@@ -135,11 +135,11 @@ mod cell {
             });
             WEAK_CELLS.with(|cells| {
                 let mut cells = cells.borrow_mut();
-                if cells.cells.len() >= cells.prune_at {
-                    cells.cells.retain(|cell| cell.strong_count() > 0);
-                    cells.prune_at = (cells.cells.len() * 2).max(1024);
+                if cells.young.len() >= cells.prune_at {
+                    cells.young.retain(|cell| cell.strong_count() > 0);
+                    cells.prune_at = (cells.young.len() * 2).max(1024);
                 }
-                cells.cells.push(Rc::downgrade(&cell));
+                cells.young.push(Rc::downgrade(&cell));
             });
             WeakRef(Some(cell))
         }
@@ -164,15 +164,22 @@ mod cell {
         }
     }
 
+    /// Every weak cell created on this thread, which the heaps clear as their targets die. A
+    /// cell is old once a collection of its target's heap found the target alive (marked):
+    /// only a major collection of that heap can find it dead, since marks persist through
+    /// minor collections, so a minor collection reads the young cells alone (S6). A dead
+    /// target's cell stays young: every collection that could sweep the zombie its address is
+    /// kept in must see the cell, to pin it again.
     struct WeakCells {
-        cells: Vec<std::rc::Weak<WeakCell>>,
+        young: Vec<std::rc::Weak<WeakCell>>,
+        old: Vec<std::rc::Weak<WeakCell>>,
         prune_at: usize,
     }
 
     thread_local! {
         /// Every weak cell created on this thread; a heap clears the cells of its dead targets.
         static WEAK_CELLS: RefCell<WeakCells> = const {
-            RefCell::new(WeakCells { cells: Vec::new(), prune_at: 1024 })
+            RefCell::new(WeakCells { young: Vec::new(), old: Vec::new(), prune_at: 1024 })
         };
     }
 
@@ -226,16 +233,92 @@ mod cell {
     pub(crate) fn clear_dead_weak_cells(mut is_dead: impl FnMut(usize) -> bool) -> Vec<usize> {
         let mut pinned = Vec::new();
         WEAK_CELLS.with(|cells| {
-            cells.borrow_mut().cells.retain(|cell| {
-                let Some(cell) = cell.upgrade() else {
-                    return false;
-                };
-                if is_dead(cell.ptr) {
+            let mut cells = cells.borrow_mut();
+            let WeakCells { young, old, .. } = &mut *cells;
+            let mut clear = |cell: &std::rc::Weak<WeakCell>| -> Option<bool> {
+                let cell = cell.upgrade()?;
+                let dead = is_dead(cell.ptr);
+                if dead {
                     cell.alive.set(false);
                     pinned.push(cell.ptr);
                 }
-                true
+                Some(dead)
+            };
+            young.retain(|cell| clear(cell).is_some());
+            let mut died = Vec::new();
+            old.retain(|cell| match clear(cell) {
+                None => false,
+                Some(true) => {
+                    died.push(cell.clone());
+                    false
+                }
+                Some(false) => true,
             });
+            young.append(&mut died);
+        });
+        pinned
+    }
+
+    /// What a heap's collection says of a weak cell's target (see
+    /// [`clear_dead_weak_cells_in`]).
+    pub(crate) enum TargetState {
+        /// The collection marked it: it is old now.
+        Live,
+        /// The collection left it unmarked: it is dead, or a zombie.
+        Dead,
+        /// Not a cell of the collecting heap.
+        Elsewhere,
+    }
+
+    /// The weak-cell sweep of one heap's collection: clear the cells whose target `state` finds
+    /// dead and return those addresses, once per cell, as [`clear_dead_weak_cells`] does. A
+    /// minor collection reads the young cells alone (see `WeakCells`); a major one reads them
+    /// all. Cells found live become old; cells found dead are, or become, young.
+    pub(crate) fn clear_dead_weak_cells_in(
+        minor: bool,
+        mut state: impl FnMut(usize) -> TargetState,
+    ) -> Vec<usize> {
+        let mut pinned = Vec::new();
+        WEAK_CELLS.with(|cells| {
+            let mut cells = cells.borrow_mut();
+            let WeakCells { young, old, .. } = &mut *cells;
+            let mut promoted = Vec::new();
+            young.retain(|weak| {
+                let Some(cell) = weak.upgrade() else {
+                    return false;
+                };
+                match state(cell.ptr) {
+                    TargetState::Dead => {
+                        cell.alive.set(false);
+                        pinned.push(cell.ptr);
+                        true
+                    }
+                    TargetState::Live => {
+                        promoted.push(weak.clone());
+                        false
+                    }
+                    TargetState::Elsewhere => true,
+                }
+            });
+            if !minor {
+                let mut died = Vec::new();
+                old.retain(|weak| {
+                    let Some(cell) = weak.upgrade() else {
+                        return false;
+                    };
+                    match state(cell.ptr) {
+                        TargetState::Dead => {
+                            cell.alive.set(false);
+                            pinned.push(cell.ptr);
+                            died.push(weak.clone());
+                            false
+                        }
+                        TargetState::Live | TargetState::Elsewhere => true,
+                    }
+                });
+                young.append(&mut died);
+            }
+            old.append(&mut promoted);
         });
         pinned
     }

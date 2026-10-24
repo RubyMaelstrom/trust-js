@@ -2881,6 +2881,13 @@ pub(crate) struct GcState {
     /// Actual AST template and compiled chunk owners, weakly registered in their heap. Their
     /// constants and layouts are roots for the Rust owner's lifetime, including late fields.
     pub(crate) code_roots: RefCell<Vec<std::rc::Weak<dyn crate::gc_trace::GcTrace>>>,
+    /// The code roots registered since the last collection. A minor collection traces these
+    /// and `young_code_words` instead of every code root: an older root holds old cells, apart
+    /// from those stored into it since, which its late fills report ([`remember_code_edges`]).
+    young_code_roots: RefCell<Vec<std::rc::Weak<dyn crate::gc_trace::GcTrace>>>,
+    /// The edges stored into older code roots since the last collection (see
+    /// `young_code_roots`), as cell words.
+    young_code_words: RefCell<Vec<u64>>,
     /// S6 step 11b: the Realms an embedder entered and has not left (`Ctx::enter_realm`), each
     /// with the state of the Realm it replaced, which is a root of every collection until the
     /// entry is left. Innermost last.
@@ -3118,6 +3125,12 @@ pub(crate) fn interned_string(
 /// Report this heap's permanent caches and actual live code/template owners. Root containers
 /// are scanned in full in minor collections, including fields published since the last one.
 pub(crate) fn trace_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
+    trace_fixed_heap_roots(heap, sink);
+    trace_code_roots(heap, sink);
+}
+
+/// The heap's roots other than its code roots.
+fn trace_fixed_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
     heap.agent.trace_gc(sink);
     for string in heap.interned_strings.borrow().iter().flatten() {
         sink.word(string.cell_word());
@@ -3125,6 +3138,10 @@ pub(crate) fn trace_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::G
     use crate::gc_trace::GcTrace;
     heap.array_length_layout.borrow().trace_gc(sink);
     heap.shapes.borrow().layouts.trace_gc(sink);
+}
+
+/// Every live code root, dropping the registrations of dead ones.
+fn trace_code_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
     heap.code_roots
         .borrow_mut()
         .retain(|owner| match owner.upgrade() {
@@ -3134,6 +3151,57 @@ pub(crate) fn trace_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::G
             }
             None => false,
         });
+}
+
+/// The heap's roots as a collection of `kind` traces them: a major collection every code root,
+/// a minor one only those registered since the last collection and the edges stored into
+/// older ones since (see `GcState::young_code_roots`). Either way the young lists start over.
+pub(crate) fn trace_heap_roots_for(
+    heap: &GcState,
+    sink: &mut dyn crate::gc_trace::GcSink,
+    kind: crate::gc_core::CollectionKind,
+) {
+    trace_fixed_heap_roots(heap, sink);
+    let young_roots = std::mem::take(&mut *heap.young_code_roots.borrow_mut());
+    let young_words = std::mem::take(&mut *heap.young_code_words.borrow_mut());
+    match kind {
+        crate::gc_core::CollectionKind::Major => trace_code_roots(heap, sink),
+        crate::gc_core::CollectionKind::Minor => {
+            for owner in young_roots.iter().filter_map(std::rc::Weak::upgrade) {
+                owner.trace_gc(sink);
+            }
+            for word in young_words {
+                sink.word(word);
+            }
+        }
+    }
+}
+
+/// Debug builds, after a minor collection's marking: every code root's edges are marked, so the
+/// minor collection, which traced only the young code roots and the reported stores, missed no
+/// store of a young cell into an older root (see [`remember_code_edges`]).
+#[cfg(debug_assertions)]
+pub(crate) fn check_code_roots_marked(heap: &GcState, core: &crate::gc_core::Heap) {
+    use crate::gc_trace::GcTrace;
+    struct Check<'a>(&'a crate::gc_core::Heap);
+    impl crate::gc_trace::GcSink for Check<'_> {
+        fn word(&mut self, word: u64) {
+            assert!(
+                self.0.cell_age(word) != Some(crate::gc_core::CellAge::Young),
+                "a code root holds the young {} cell {word:#x} unmarked by a minor collection: \
+                 a late store into the root was not reported (value::remember_code_edges)",
+                self.0.kind_name(word).unwrap_or("?")
+            );
+        }
+    }
+    for owner in heap
+        .code_roots
+        .borrow()
+        .iter()
+        .filter_map(std::rc::Weak::upgrade)
+    {
+        owner.trace_gc(&mut Check(core));
+    }
 }
 
 /// Verify the COW invariant by actual owning-slot identity, independently of repeated collector
@@ -4133,6 +4201,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         property_layout_desc: descs.property_layout,
         interned_strings: RefCell::default(),
         code_roots: RefCell::default(),
+        young_code_roots: RefCell::default(),
+        young_code_words: RefCell::default(),
         #[cfg(feature = "embed")]
         entered_realms: RefCell::default(),
         records: RefCell::default(),
@@ -4272,7 +4342,27 @@ pub(crate) fn function_runtime_index_stats(heap: &GcState) -> (usize, usize, usi
 /// keeps only a Weak: discarded code stops rooting cells and no code/heap cycle is made.
 pub(crate) fn register_code_roots<T: crate::gc_trace::GcTrace + 'static>(owner: &Rc<T>) {
     let traced: Rc<dyn crate::gc_trace::GcTrace> = owner.clone();
-    with_active_gc_heap(|heap| heap.code_roots.borrow_mut().push(Rc::downgrade(&traced)));
+    with_active_gc_heap(|heap| {
+        heap.code_roots.borrow_mut().push(Rc::downgrade(&traced));
+        heap.young_code_roots
+            .borrow_mut()
+            .push(Rc::downgrade(&traced));
+    });
+}
+
+/// Record the edges of `value`, which was just stored into a registered code root (a late
+/// template or layout fill): the next minor collection traces them, since it traces only the
+/// code roots registered since the last collection (see `GcState::young_code_roots`). Every
+/// store of a new cell into an older code root must be reported here; debug builds check it
+/// after every minor collection's marking ([`check_code_roots_marked`]).
+pub(crate) fn remember_code_edges(value: &dyn crate::gc_trace::GcTrace) {
+    struct Words<'a>(&'a mut Vec<u64>);
+    impl crate::gc_trace::GcSink for Words<'_> {
+        fn word(&mut self, word: u64) {
+            self.0.push(word);
+        }
+    }
+    with_active_gc_heap(|heap| value.trace_gc(&mut Words(&mut heap.young_code_words.borrow_mut())));
 }
 
 #[inline]

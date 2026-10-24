@@ -1097,6 +1097,9 @@ impl PrivateSite {
             self.slot.set(u32::MAX);
             *self.entry_key.borrow_mut() = None;
         }
+        // A late store into the owning chunk, a registered code root (see
+        // `value::remember_code_edges`).
+        crate::value::remember_code_edges(&key);
         *self.key.borrow_mut() = Some(key);
         *self.pin.borrow_mut() = Env::downgrade(env);
         self.env.set(raw);
@@ -3262,6 +3265,8 @@ impl Chunk {
     }
     pub(crate) fn note_initializer_layout(&self, layout: &crate::value::PropertyLayout) {
         if self.initializer_layout.get().is_none() {
+            // A late fill of this registered code root (see `value::remember_code_edges`).
+            crate::value::remember_code_edges(layout);
             let _ = self.initializer_layout.set(layout.clone());
         }
     }

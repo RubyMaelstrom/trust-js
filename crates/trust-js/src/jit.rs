@@ -9343,6 +9343,7 @@ fn emit_prop_create_probe(
 /// orr  s1, owner, #0xffff     ; base + 65,535, whose low byte (0xff) is the byte stored
 /// sub  s2, s2, #511           ; card - 511: base + 65,535 + (card - 511) = base + 65,024 + card
 /// strb w(s1), [s1, s2]        ; strb's immediate cannot reach 65,024: a register offset
+/// strb w(s1), [s1]            ; base + 65,535 is the page's card summary (`CARD_SUMMARY`)
 /// ```
 ///
 /// `s1` may be `owner`; `s2` differs from both. One emitter for every site.
@@ -9361,10 +9362,12 @@ fn emit_card_mark(a: &mut asm::Asm, owner: u32, s1: u32, s2: u32) {
             && CARD_TABLE_BYTES.is_power_of_two()
             && PAGE_SIZE >= 256
     );
+    const _: () = assert!(crate::gc_core::CARD_SUMMARY == PAGE_SIZE - 1);
     a.ubfx(s2, owner, CARD_SHIFT, CARD_TABLE_BYTES.trailing_zeros());
     a.orr_low_ones_x(s1, owner, PAGE_SHIFT);
     a.sub_imm(s2, s2, (CARD_TABLE_BYTES - 1) as u32);
     a.strb_reg(s1, s1, s2);
+    a.strb_imm(s1, s1, 0);
 }
 
 /// Debug check for [`emit_card_mark`]'s use of an Object address: it lies in its cell's card.

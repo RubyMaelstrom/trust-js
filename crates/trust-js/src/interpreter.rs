@@ -8018,6 +8018,11 @@ impl Interp {
                         assert!(props.set_value_at(1, name_value), "function name slot");
                         if named.is_none() {
                             *named = Some((name.clone(), props.clone()));
+                            // A late fill of the registered maps (see
+                            // `value::remember_code_edges`): the stored copy's own blocks.
+                            if let Some((_, stored)) = &*named {
+                                crate::value::remember_code_edges(stored);
+                            }
                             props.mark_layout_shared();
                         }
                         props

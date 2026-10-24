@@ -381,6 +381,9 @@ fn card_mark(a: &mut Asm) {
     a.bytes(&[0x4a, 0x8d, 0x84, 0x08]); // lea rax, [rax + r9 + 65024]: the card's byte
     a.bytes(&(CARD_TABLE_OFFSET as i32).to_le_bytes());
     a.bytes(&[0xc6, 0x00, 0x01]); // mov byte [rax], 1
+                                  // mov byte [r9 + 65535], 1: the page's card summary (`gc_core::CARD_SUMMARY`).
+    const _: () = assert!(crate::gc_core::CARD_SUMMARY == 0xffff);
+    a.bytes(&[0x41, 0xc6, 0x81, 0xff, 0xff, 0x00, 0x00, 0x01]);
 }
 
 /// All semantic guards precede the store commit. The write barrier records the store in its

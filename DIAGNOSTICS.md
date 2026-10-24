@@ -107,7 +107,11 @@ comment/example in the same change.
 - `TRUST_JS_FEEDBACK_PROFILE=1` enables the detailed per-site feedback vector; it changes
   the execution paths that collect it, so its observations are not observations of ordinary
   optimized execution and it is never an acceptance setting.
-- `TRUST_JS_GC_LOG=1` logs collections.
+- `TRUST_JS_GC_LOG=1` logs collections, each line with its phases' times in microseconds:
+  `mark` and `sweep` as the engine drives them, `engine` for what the engine does around the
+  heap's phases (building the marking client, sweeping its tables and weak handles), and the
+  heap's phases (`begin`: cards and marks; `roots`; `stack`; `side`: side-table edges and
+  side-slot owners; `drain`: tracing; `finalize`; `free`).
 - Collections are minor or major. A minor collection traces from the roots and from the old
   cells (cells an earlier collection kept) whose cards the write barrier set since the last
   collection, and of the engine's side tables (internal slots kept outside objects, WeakMap and
@@ -119,7 +123,11 @@ comment/example in the same change.
   live-object limit collect majorly. For collector tuning, `TRUST_JS_GC_NURSERY_BYTES=N`
   replaces the 2 MiB nursery budget: a minor collection is due once N bytes of cells have
   been allocated since the last collection (0 turns minor collections off: every collection
-  is then major, due once the allocated bytes pass the byte budget).
+  is then major, due once the allocated bytes pass the byte budget). Objects' property and
+  element storage are cells too. Bytes that cells own outside the heap (Map and Set tables,
+  hash indexes, binding storage, bound arguments, stack traces) count as well: a collection
+  is due once a nursery budget of them was acquired since the last one, and those still held
+  count with the cells against the byte budget.
   `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget (twice
   the bytes a major collection leaves, at least the floor): a major collection is due once
   the heap holds more than the budget after a minor collection, its old cells counted whether

@@ -115,9 +115,64 @@ fn gc_nursery_bytes() -> Option<usize> {
     })
 }
 
+/// `TRUST_JS_GC_LOG=1` (diagnostic): log every collection, with its phases' times.
+fn gc_log() -> bool {
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LOG.get_or_init(|| std::env::var_os("TRUST_JS_GC_LOG").is_some())
+}
+
+/// The engine's own steps around the heap's phases, timed for `TRUST_JS_GC_LOG` (see
+/// [`EngineStep`]).
+const ENGINE_STEPS: usize = 6;
+
+/// Steps of a collection the engine times for `TRUST_JS_GC_LOG`.
+#[derive(Clone, Copy)]
+enum EngineStep {
+    /// Zeroing the native stack below the collection's frames.
+    Scrub,
+    /// Building the marking client (Realm members, hosts, templates).
+    Client,
+    /// Listing the dead objects for the tables' sweeps.
+    Dead,
+    /// Clearing weak handles and weak cells to the dead.
+    Weak,
+    /// Evicting the dead from the engine's tables.
+    Tables,
+    /// The Agent's bookkeeping after the sweep.
+    After,
+}
+
+const ENGINE_STEP_NAMES: [&str; ENGINE_STEPS] =
+    ["scrub", "client", "dead", "weak", "tables", "after"];
+
+thread_local! {
+    /// [`EngineStep`] times of the collection in progress, in nanoseconds.
+    static ENGINE_STEP_NANOS: std::cell::Cell<[u64; ENGINE_STEPS]> =
+        const { std::cell::Cell::new([0; ENGINE_STEPS]) };
+}
+
+/// Time `f` as `step` while `TRUST_JS_GC_LOG` is set.
+#[inline]
+fn timed<R>(step: EngineStep, f: impl FnOnce() -> R) -> R {
+    if !gc_log() {
+        return f();
+    }
+    let started = std::time::Instant::now();
+    let result = f();
+    let nanos = started.elapsed().as_nanos() as u64;
+    ENGINE_STEP_NANOS.with(|steps| {
+        let mut all = steps.get();
+        all[step as usize] += nanos;
+        steps.set(all);
+    });
+    result
+}
+
 /// Collection settings for a new Agent heap.
 pub(crate) fn configure_heap(core: &mut crate::gc_core::Heap) {
     core.set_heap_growth(gc_min_heap_bytes(), 100);
+    // `TRUST_JS_GC_LOG=1`: each collection's log line includes its phases' times.
+    core.set_phase_timing(gc_log());
     core.set_nursery_bytes(gc_nursery_bytes());
     core.set_stress_every(gc_stress());
     core.set_stress_major_every(gc_stress_major());
@@ -700,7 +755,7 @@ impl crate::gc_core::MarkClient for Marking<'_> {
         }
         // The tree shares one heap; its interned strings live as long as it does.
         if let Some(root) = self.interps.first() {
-            crate::value::trace_heap_roots(&root.gc_heap, &mut words);
+            crate::value::trace_heap_roots_for(&root.gc_heap, &mut words, self.kind);
             // The Realms an embedder replaced by entering others, until it leaves them (S6 step
             // 11b, `GcState::entered_realms`).
             #[cfg(feature = "embed")]
@@ -978,18 +1033,23 @@ impl Interp {
         heap.agent.collecting.set(true);
         let _collecting = crate::agent_control::Collecting(heap.clone());
         let performance_started = crate::value::gc_performance_metrics_start();
+        let log_started = gc_log().then(std::time::Instant::now);
         let objects_before = crate::value::heap_live_objects(&heap);
         // Frames that are live while the native stack is scanned — this one and those of
         // `gc_heap_mark` — must hold no stale cell addresses: a dead cell's address may be
         // reused by the time of the next collection. Sweeping, which handles every dead
         // address, runs in a sibling call, and the region both calls use is zeroed first.
         #[cfg(not(target_arch = "wasm32"))]
-        crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
+        timed(EngineStep::Scrub, || {
+            crate::gc_core::scrub_stack(GC_SCRUB_BYTES)
+        });
         let Some(native) = self.gc_heap_mark(&heap, kind) else {
             heap.agent.request(&heap, Some(kind));
             return CollectionOutcome::Deferred;
         };
+        let log_marked = gc_log().then(std::time::Instant::now);
         let reclaimed = self.gc_heap_sweep(&heap, native, kind);
+        let log_swept = gc_log().then(std::time::Instant::now);
         if crate::value::layout_census::enabled() {
             crate::value::layout_census::sample_live(&heap);
         }
@@ -1009,8 +1069,23 @@ impl Interp {
         } else {
             limit
         });
-        if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
+        if let (Some(started), Some(marked), Some(swept)) = (log_started, log_marked, log_swept) {
             let stats = heap.core.borrow().stats();
+            let micros = |nanos: u64| nanos as f64 / 1000.0;
+            let phases = crate::gc_core::Phase::NAMES
+                .iter()
+                .zip(stats.last_phase_nanos)
+                .map(|(name, nanos)| format!(" {name}={:.0}", micros(nanos)))
+                .collect::<String>();
+            let core_nanos = stats.last_phase_nanos.iter().sum::<u64>();
+            let steps = ENGINE_STEP_NANOS.with(|steps| steps.replace([0; ENGINE_STEPS]));
+            let steps = ENGINE_STEP_NAMES
+                .iter()
+                .zip(steps)
+                .map(|(name, nanos)| format!(" {name}={:.0}", micros(nanos)))
+                .collect::<String>();
+            let mark_nanos = (marked - started).as_nanos() as u64;
+            let sweep_nanos = (swept - marked).as_nanos() as u64;
             let minor = match kind {
                 CollectionKind::Minor => format!(
                     " young_pages={} card_cells={} promoted={}",
@@ -1019,7 +1094,7 @@ impl Interp {
                 CollectionKind::Major => String::new(),
             };
             eprintln!(
-                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor}",
+                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor} external={} us: mark={:.0} sweep={:.0} engine={:.0}{phases}{steps}",
                 match kind {
                     CollectionKind::Minor => "minor",
                     CollectionKind::Major => "major",
@@ -1029,7 +1104,11 @@ impl Interp {
                 stats.pages_live,
                 stats.pages_spare,
                 stats.collections,
-                stats.deferred_collections
+                stats.deferred_collections,
+                stats.external_bytes,
+                micros(mark_nanos),
+                micros(sweep_nanos),
+                micros((mark_nanos + sweep_nanos).saturating_sub(core_nanos)),
             );
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -1077,16 +1156,22 @@ impl Interp {
         heap: &crate::value::GcHeap,
         kind: CollectionKind,
     ) -> Option<FastMap<usize, NativeGcGraph>> {
-        let marking = Marking::new(self, kind);
+        let marking = timed(EngineStep::Client, || Marking::new(self, kind));
         // Building the client just enumerated every Realm member and host value, dead or
         // alive, in frames below this one; the marker's frames reuse that region.
         #[cfg(not(target_arch = "wasm32"))]
-        crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
+        timed(EngineStep::Scrub, || {
+            crate::gc_core::scrub_stack(GC_SCRUB_BYTES)
+        });
         // No handle may be made or made strong until the sweep has freed the dead.
         heap.handles.set_collecting(true);
         let started = heap.core.borrow_mut().start_marking(true, &marking, kind);
         if !started {
             heap.handles.set_collecting(false);
+        }
+        #[cfg(debug_assertions)]
+        if started && kind == CollectionKind::Minor {
+            crate::value::check_code_roots_marked(heap, &heap.core.borrow());
         }
         started.then(|| {
             // This marking consumed what the tables and the handles recorded since the last
@@ -1110,29 +1195,33 @@ impl Interp {
     ) -> usize {
         // Between the phases every cell is intact and new cells are allocated marked: the
         // engine evicts the dead from its tables while their identities are still stable.
-        let dead = crate::gc_sweep::DeadObjects::new(heap);
+        let dead = timed(EngineStep::Dead, || crate::gc_sweep::DeadObjects::new(heap));
         // Weak handles to dead cells are cleared first (S6 step 11a): the host sweeps see them
         // cleared, and no cell they name is freed while they name it.
-        {
+        timed(EngineStep::Weak, || {
             let core = heap.core.borrow();
             heap.handles
                 .clear_dead_weak(kind, |word| core.is_dead_target(word as usize));
-        }
-        crate::value::sweep_object_metadata(heap, &dead);
-        heap.agent
-            .metadata_owners
-            .borrow_mut()
-            .retain(|&identity, _| !dead.contains(identity));
-        self.gc_heap_sweep_tree(&dead, &native, kind);
+        });
+        timed(EngineStep::Tables, || {
+            crate::value::sweep_object_metadata(heap, &dead);
+            heap.agent
+                .metadata_owners
+                .borrow_mut()
+                .retain(|&identity, _| !dead.contains(identity));
+            self.gc_heap_sweep_tree(&dead, &native, kind);
+        });
         heap.records.borrow_mut().native_functions_swept.clear();
         drop(native);
         // Weak handles to dead cells are cleared; a cell a weak handle still names stays
         // reserved (finalized, never reused) until its last weak handle is dropped, which keeps
         // raw-address inline-cache comparisons ABA-safe.
-        let pinned = {
+        let pinned = timed(EngineStep::Weak, || {
             let core = heap.core.borrow();
-            crate::gc_handle::clear_dead_weak_cells(|addr| core.is_dead_target(addr))
-        };
+            crate::gc_handle::clear_dead_weak_cells_in(kind == CollectionKind::Minor, |addr| {
+                core.weak_target_state(addr)
+            })
+        });
         heap.core.borrow_mut().finish_collection(&pinned);
         if kind == CollectionKind::Major {
             crate::value::prune_function_runtimes_after_major(heap);
@@ -1141,7 +1230,7 @@ impl Interp {
         // The heap's bits no longer say what died: from here on only the list's length counts.
         let reclaimed = dead.len();
         drop(dead);
-        self.gc_heap_after_sweep_agent(kind);
+        timed(EngineStep::After, || self.gc_heap_after_sweep_agent(kind));
         reclaimed
     }
 

@@ -7394,6 +7394,8 @@ impl Interp {
                 p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
             }
             p.mark_layout_shared();
+            // A late fill of the chunk's template, a registered code root.
+            crate::value::remember_code_edges(&p);
             Box::new(p)
         });
         let props = map.instantiate_plain((0..count).map(|slot| unsafe { base.add(slot).read() }));
@@ -7422,6 +7424,8 @@ impl Interp {
                 p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
             }
             p.mark_layout_shared();
+            // A late fill of the chunk's template, a registered code root.
+            crate::value::remember_code_edges(&p);
             Box::new(p)
         });
         let obj = crate::value::Object::new_with_parts(

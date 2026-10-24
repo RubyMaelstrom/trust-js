@@ -19,7 +19,10 @@ use std::hash::BuildHasher;
 /// builds assert that every query comes between the phases of the view's collection, and that
 /// every answer is the list's.
 pub(crate) struct DeadObjects<'h> {
-    list: Vec<usize>,
+    /// The dead cells' addresses, listed on the first walk ([`DeadObjects::iter`]): a table
+    /// smaller than the dead count is swept by membership alone and needs no list.
+    list: std::cell::OnceCell<Vec<usize>>,
+    count: usize,
     membership: Membership<'h>,
 }
 
@@ -49,11 +52,14 @@ impl<'h> DeadObjects<'h> {
     /// The objects of `heap` found dead by the collection between whose phases the heap is.
     pub(crate) fn new(heap: &'h crate::value::GcState) -> Self {
         let core = heap.core.borrow();
-        let list = core.dead_cells(heap.object_desc);
+        let count = core.dead_count(heap.object_desc);
         #[cfg(debug_assertions)]
         let collection = core
             .collection_in_progress()
             .expect("dead objects are listed between a collection's phases");
+        #[cfg(debug_assertions)]
+        let listed: crate::fasthash::FastSet<usize> =
+            core.dead_cells(heap.object_desc).into_iter().collect();
         drop(core);
         Self {
             membership: Membership::Bits {
@@ -62,9 +68,10 @@ impl<'h> DeadObjects<'h> {
                 #[cfg(debug_assertions)]
                 collection,
                 #[cfg(debug_assertions)]
-                listed: list.iter().copied().collect(),
+                listed,
             },
-            list,
+            list: std::cell::OnceCell::new(),
+            count,
         }
     }
 
@@ -73,7 +80,8 @@ impl<'h> DeadObjects<'h> {
     pub(crate) fn from_list(list: Vec<usize>) -> Self {
         Self {
             membership: Membership::List(list.iter().copied().collect()),
-            list,
+            count: list.len(),
+            list: list.into(),
         }
     }
 
@@ -113,16 +121,40 @@ impl<'h> DeadObjects<'h> {
 
     /// How many objects died.
     pub(crate) fn len(&self) -> usize {
-        self.list.len()
+        self.count
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.list.is_empty()
+        self.count == 0
     }
 
-    /// The dead objects' addresses, in the list's order.
+    /// The dead objects' addresses, in the list's order. The first walk lists them from the
+    /// heap's bits, so it must come between the phases of the view's collection.
     pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.list.iter().copied()
+        self.list
+            .get_or_init(|| match &self.membership {
+                Membership::Bits {
+                    core,
+                    desc,
+                    #[cfg(debug_assertions)]
+                    collection,
+                    #[cfg(debug_assertions)]
+                        listed: _,
+                } => {
+                    let core = core.borrow();
+                    #[cfg(debug_assertions)]
+                    assert_eq!(
+                        core.collection_in_progress(),
+                        Some(*collection),
+                        "dead objects listed outside their collection's phases"
+                    );
+                    core.dead_cells(*desc)
+                }
+                #[cfg(test)]
+                Membership::List(_) => unreachable!("a test view's list is given"),
+            })
+            .iter()
+            .copied()
     }
 }
 

@@ -78,13 +78,19 @@ pub(crate) const CARD_TABLE_BYTES: usize = PAGE_SIZE >> CARD_SHIFT;
 /// Where a carded page's card table starts in the page (65,024): no cell reaches it.
 pub(crate) const CARD_TABLE_OFFSET: usize = PAGE_SIZE - CARD_TABLE_BYTES;
 const _: () = assert!(CARD_TABLE_BYTES == 512 && CARD_TABLE_OFFSET == 65_024);
+/// The page's card summary: the last byte of a carded page, which is the card of the table's
+/// own last 128 bytes, so no cell's start maps to it. The barrier sets it with every card, and
+/// a minor collection skips the table of a page whose summary is clear, reading one byte
+/// instead of the table (see `PageMeta::take_card_cells`).
+pub(crate) const CARD_SUMMARY: usize = PAGE_SIZE - 1;
+const _: () = assert!((CARD_SUMMARY - CARD_TABLE_OFFSET) == CARD_TABLE_BYTES - 1);
 
 /// The write barrier: record that the cell starting at `cell` was written, by setting its card
 /// (a nonzero byte at its page's base + `CARD_TABLE_OFFSET` + its start's offset in the page >>
-/// `CARD_SHIFT`), from the address alone: no lookup, no load, no branch. A card stays set until
-/// the next collection starts. Generated code stores the same byte (ARM64's `emit_card_mark`,
-/// x64's `card_address` and `card_store`); an Object's address (its cell's start + 8) lies in
-/// its cell's card.
+/// `CARD_SHIFT`) and its page's summary ([`CARD_SUMMARY`]), from the address alone: no lookup,
+/// no load, no branch. A card stays set until the next collection starts. Generated code
+/// stores the same bytes (ARM64's `emit_card_mark`, x64's `card_mark`); an Object's address
+/// (its cell's start + 8) lies in its cell's card.
 ///
 /// # Safety
 /// `cell` is the start of a live small cell of a carded kind ([`LayoutDesc::carded`]), whose
@@ -93,10 +99,13 @@ const _: () = assert!(CARD_TABLE_BYTES == 512 && CARD_TABLE_OFFSET == 65_024);
 pub(crate) unsafe fn card_mark(cell: *const u8) {
     let addr = cell as usize;
     let card = (addr >> CARD_SHIFT) & (CARD_TABLE_BYTES - 1);
-    let table = (addr & !(PAGE_SIZE - 1)) + CARD_TABLE_OFFSET;
+    let base = addr & !(PAGE_SIZE - 1);
     // SAFETY: the caller's contract: the cell's page is live and carded, and no cell overlaps
-    // its card table.
-    unsafe { ((table + card) as *mut u8).write(1) };
+    // its card table, of which the summary is the last byte.
+    unsafe {
+        ((base + CARD_TABLE_OFFSET + card) as *mut u8).write(1);
+        ((base + CARD_SUMMARY) as *mut u8).write(1);
+    }
 }
 
 /// The size class of each 16-byte multiple up to the largest small cell: `CLASS_OF[(size +
@@ -899,7 +908,9 @@ impl PageMeta {
     /// so one card can cover the starts of several small cells; each marked one is listed. An
     /// unmarked cell is young (or free, or a zombie) and is traced, if at all, as it is reached.
     fn take_card_cells(&mut self, cells: &mut Vec<TraceWork>) {
-        if !self.carded {
+        // SAFETY: a carded page ends in its card table, the summary its last byte; the page is
+        // live while its metadata is.
+        if !self.carded || unsafe { ((self.base + CARD_SUMMARY) as *const u8).read() } == 0 {
             return;
         }
         const WORDS: usize = CARD_TABLE_BYTES / 8;
@@ -1207,6 +1218,37 @@ pub(crate) struct GcStats {
     pub(crate) trigger_bytes: usize,
     /// The bytes the cells own outside the heap, charged and not released ([`ExternalBytes`]).
     pub(crate) external_bytes: usize,
+    /// The last collection's phases, in nanoseconds, while [`Heap::set_phase_timing`] is on:
+    /// see [`Phase`].
+    pub(crate) last_phase_nanos: [u64; PHASES],
+}
+
+/// The phases of a collection the heap times (diagnostics; [`Heap::set_phase_timing`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Phase {
+    /// Checking (debug builds), clearing or gathering the cards and marks.
+    Begin,
+    /// The client's roots.
+    Roots,
+    /// The native stack and registers.
+    Stack,
+    /// Side-table edges and side-slot owners.
+    Side,
+    /// Tracing everything reached.
+    Drain,
+    /// The sweep's finalizers.
+    Finalize,
+    /// The sweep's freeing of cells and pages.
+    Free,
+}
+
+/// The number of [`Phase`]s.
+pub(crate) const PHASES: usize = 7;
+
+impl Phase {
+    pub(crate) const NAMES: [&str; PHASES] = [
+        "begin", "roots", "stack", "side", "drain", "finalize", "free",
+    ];
 }
 
 pub(crate) struct Heap {
@@ -1294,6 +1336,8 @@ pub(crate) struct Heap {
     /// sweeping and the settings recompute it).
     due_check_bytes: usize,
     stats: GcStats,
+    /// Time the phases of each collection into `stats.last_phase_nanos` (diagnostics).
+    phase_timing: bool,
     #[cfg(test)]
     retention_tracing: bool,
     /// The last traced collection's mark sources, by cell start.
@@ -1351,6 +1395,7 @@ impl Heap {
             live_count: None,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
             stats: GcStats::default(),
+            phase_timing: false,
             #[cfg(test)]
             retention_tracing: false,
             #[cfg(test)]
@@ -1367,6 +1412,29 @@ impl Heap {
         self.classes
             .push(std::array::from_fn(|_| ClassPages::default()));
         id
+    }
+
+    /// Time each collection's phases into [`GcStats::last_phase_nanos`] (diagnostics: a clock
+    /// read between phases).
+    pub(crate) fn set_phase_timing(&mut self, on: bool) {
+        self.phase_timing = on;
+    }
+
+    /// The clock for [`Heap::phase_done`], when phases are timed.
+    #[inline]
+    fn phase_clock(&self) -> Option<std::time::Instant> {
+        self.phase_timing.then(std::time::Instant::now)
+    }
+
+    /// Record `phase` as having run since `started` (from [`Heap::phase_clock`]), and restart
+    /// the clock for the next phase.
+    #[inline]
+    fn phase_done(&mut self, phase: Phase, started: &mut Option<std::time::Instant>) {
+        if let Some(start) = started {
+            let now = std::time::Instant::now();
+            self.stats.last_phase_nanos[phase as usize] += (now - *start).as_nanos() as u64;
+            *start = now;
+        }
     }
 
     /// Declare that `desc`'s cells hold no edges (its trace reports none): marking one sets its
@@ -1913,6 +1981,13 @@ impl Heap {
         })
     }
 
+    /// The name of the kind of the cell `word` resolves to (diagnostics).
+    #[cfg(debug_assertions)]
+    pub(crate) fn kind_name(&self, word: u64) -> Option<&'static str> {
+        self.locate(word)
+            .map(|cell| self.descs[cell.desc.0 as usize].name)
+    }
+
     /// Resolve `ptr` to the start of its cell, accepting interior addresses.
     pub(crate) fn resolve(&self, word: u64) -> Option<*const u8> {
         self.locate(word).map(|cell| cell.start as *const u8)
@@ -2196,22 +2271,64 @@ impl Heap {
     pub(crate) fn dead_cells(&self, desc: DescId) -> Vec<usize> {
         self.debug_assert_marking_current("dead_cells");
         let mut dead = Vec::new();
+        self.for_each_dead(desc, |page, mut bits, word| {
+            while bits != 0 {
+                dead.push(page.cell_ptr(word * 64 + bits.trailing_zeros() as usize));
+                bits &= bits - 1;
+            }
+        });
+        self.for_each_dead_large(desc, |start| dead.push(start));
+        dead
+    }
+
+    /// How many cells [`Heap::dead_cells`] would list, from the bits alone.
+    pub(crate) fn dead_count(&self, desc: DescId) -> usize {
+        self.debug_assert_marking_current("dead_count");
+        let mut count = 0;
+        self.for_each_dead(desc, |_, bits, _| count += bits.count_ones() as usize);
+        self.for_each_dead_large(desc, |_| count += 1);
+        count
+    }
+
+    /// Call `f` with each word of dead-cell bits (allocated, unmarked, not zombies) of `desc`'s
+    /// pages the collection in progress sweeps, and the word's index in its page.
+    fn for_each_dead(&self, desc: DescId, mut f: impl FnMut(&PageMeta, u64, usize)) {
         self.for_each_swept_page(|page| {
             if page.desc != desc {
                 return;
             }
-            for i in 0..page.cells {
-                if bit(&page.allocated, i) && !bit(&page.marks, i) && !bit(&page.zombies, i) {
-                    dead.push(page.cell_ptr(i));
+            // Only the prefix below `next_unused` holds allocated cells.
+            for word in 0..page.next_unused.div_ceil(64) {
+                let bits = page.allocated[word] & !page.marks[word] & !page.zombies[word];
+                if bits != 0 {
+                    f(page, bits, word);
                 }
             }
         });
-        for (&start, large) in &self.larges {
+    }
+
+    /// Call `f` with each dead large cell of `desc` among those the collection in progress
+    /// sweeps: a minor collection's young ones, or all.
+    fn for_each_dead_large(&self, desc: DescId, mut f: impl FnMut(usize)) {
+        let mut visit = |start: usize, large: &LargeObj| {
             if large.desc == desc && !large.marked && !large.zombie {
-                dead.push(start);
+                f(start);
+            }
+        };
+        match self.collecting_kind {
+            CollectionKind::Minor => {
+                for start in &self.young_larges {
+                    if let Some(large) = self.larges.get(start) {
+                        visit(*start, large);
+                    }
+                }
+            }
+            CollectionKind::Major => {
+                for (&start, large) in &self.larges {
+                    visit(start, large);
+                }
             }
         }
-        dead
     }
 
     /// Whether `addr` is the start of a small cell of `desc` that the current marking left
@@ -2286,6 +2403,19 @@ impl Heap {
         live
     }
 
+    /// What the current marking says of the cell `addr` lies in, for a weak reference to it:
+    /// marked (live), unmarked (dead: clear the reference), or no cell of this heap. Between
+    /// the phases of a collection.
+    pub(crate) fn weak_target_state(&self, addr: usize) -> crate::gc_handle::TargetState {
+        use crate::gc_handle::TargetState;
+        self.debug_assert_marking_current("weak_target_state");
+        match self.locate(addr as u64) {
+            None => TargetState::Elsewhere,
+            Some(cell) if self.is_marked(&cell) => TargetState::Live,
+            Some(_) => TargetState::Dead,
+        }
+    }
+
     /// Whether `addr` (interior addresses included) lies in a cell of this heap that the
     /// current marking left unmarked: a weak reference to it must be cleared. Between the phases
     /// of a collection.
@@ -2351,6 +2481,8 @@ impl Heap {
         self.external_due_at_mark = self.control.external.due.get();
         self.refresh_due();
         self.stats.collections += 1;
+        self.stats.last_phase_nanos = [0; PHASES];
+        let mut clock = self.phase_clock();
         self.begin_marking(kind, client);
         // `begin_marking` handled cells' and pages' addresses in frames below this one, which the
         // native stack scan's frames reuse: zero that region first, as the engine zeroes its own
@@ -2367,10 +2499,13 @@ impl Heap {
         // A minor collection traces the old cells whose cards were set, although they are
         // marked: they may hold the only edges to young cells.
         m.worklist.append(&mut self.card_cells);
+        self.phase_done(Phase::Begin, &mut clock);
         client.roots(&mut |word| self.mark_word::<true>(word, &mut m));
+        self.phase_done(Phase::Roots, &mut clock);
         if native_roots {
             self.mark_native_stack(&mut m);
         }
+        self.phase_done(Phase::Stack, &mut clock);
         #[cfg(test)]
         {
             m.source = MarkSource::Root;
@@ -2390,7 +2525,9 @@ impl Heap {
                 client,
             );
         });
+        self.phase_done(Phase::Side, &mut clock);
         self.drain(&mut m, client);
+        self.phase_done(Phase::Drain, &mut clock);
         if cfg!(debug_assertions) {
             self.verify(&m);
         }
@@ -2518,6 +2655,16 @@ impl Heap {
                 if bit(&page.marks, i) && !page.card_set(i) {
                     check(page.cell_ptr(i), page.desc);
                 }
+            }
+            // A minor collection reads a page's cards only when its summary is set.
+            if page.carded && (0..page.cells).any(|i| page.card_set(i)) {
+                // SAFETY: a carded page ends in its card table, the summary its last byte.
+                let summary = unsafe { ((page.base + CARD_SUMMARY) as *const u8).read() };
+                assert!(
+                    summary != 0,
+                    "write barrier: the page at {:#x} has a set card but a clear summary",
+                    page.base
+                );
             }
         }
         for (&start, large) in &self.larges {
@@ -2846,6 +2993,7 @@ impl Heap {
     /// may read leaf cells that die with its cell, such as the storage blocks of an object's
     /// payloads (`gc_storage`), whatever order the pages are swept in.
     fn sweep(&mut self, kind: CollectionKind) -> usize {
+        let mut clock = self.phase_clock();
         let young = std::mem::take(&mut self.young_pages);
         match kind {
             CollectionKind::Minor => {
@@ -2860,6 +3008,7 @@ impl Heap {
             }
         }
         self.finalize_larges(kind);
+        self.phase_done(Phase::Finalize, &mut clock);
         let mut freed = 0usize;
         let mut swept_pages = 0usize;
         let mut sweep = |heap: &mut Self, index: usize| {
@@ -2988,6 +3137,7 @@ impl Heap {
         if cfg!(debug_assertions) {
             self.check_page_table();
         }
+        self.phase_done(Phase::Free, &mut clock);
         freed
     }
 
@@ -6592,18 +6742,29 @@ mod tests {
                 unsafe { card_mark(cell as *const u8) };
                 let after = page_bytes(base);
                 assert_ne!(after[card], 0, "{size}-byte cell {index}'s card");
+                assert_ne!(
+                    after[CARD_SUMMARY], 0,
+                    "{size}-byte cell {index}'s page summary"
+                );
                 assert!(
-                    (0..PAGE_SIZE).all(|i| i == card || before[i] == after[i]),
+                    (0..PAGE_SIZE).all(|i| i == card || i == CARD_SUMMARY || before[i] == after[i]),
                     "{size}-byte cell {index} changed another byte"
                 );
                 let page = fx.heap.pages.iter().flatten().find(|p| p.base == base);
                 assert!(page.unwrap().card_set(index));
             }
-            // Exactly the cards cells start in are set.
+            // Exactly the cards cells start in are set, and the page's summary, the card of the
+            // table's own last bytes, which no cell starts in.
             let bytes = page_bytes(base);
             for card in 0..CARD_TABLE_BYTES {
                 let starts = all.iter().any(|&cell| (cell - base) >> CARD_SHIFT == card);
-                assert_eq!(bytes[CARD_TABLE_OFFSET + card] != 0, starts, "card {card}");
+                let summary = CARD_TABLE_OFFSET + card == CARD_SUMMARY;
+                assert!(!(starts && summary), "a cell starts in the summary's card");
+                assert_eq!(
+                    bytes[CARD_TABLE_OFFSET + card] != 0,
+                    starts || summary,
+                    "card {card}"
+                );
             }
             let distinct: std::collections::HashSet<usize> = all
                 .iter()
