@@ -1178,12 +1178,10 @@ impl Interp {
         });
         // No handle may be made or made strong until the sweep has freed the dead.
         heap.handles.set_collecting(true);
-        // A major marking finds which functions still have closures (see `ClosureFunction`).
-        let stamp = (kind == CollectionKind::Major).then(crate::value::closure_mark_stamp);
+        // Marking finds which functions still have closures (see `ClosureFunction`).
+        let stamp = crate::value::closure_mark_stamp();
         let started = heap.core.borrow_mut().start_marking(true, &marking, kind);
-        if let Some(stamp) = stamp {
-            crate::value::sweep_closure_functions(heap, stamp, started);
-        }
+        crate::value::sweep_closure_functions(heap, stamp, started, kind);
         if !started {
             heap.handles.set_collecting(false);
         }

@@ -131,3 +131,54 @@ fn replaced_arrays_are_collected_as_their_elements_grow() {
         );
     }
 }
+
+/// The registry that holds closures' functions (`value::ClosureFunction`) lets a function go at
+/// the collection that finds its closures dead, as the closures' finalizers used to: the next
+/// minor collection when they all died young, a major one once one had survived. A function
+/// made by `new Function` owns its parse tree and code, which the collector does not count, so
+/// holding dead ones until a major collection would let a script that compiles a function per
+/// call grow without bound. Counts over many functions keep the test independent of stale
+/// words in native frames, which may keep any one closure.
+#[test]
+fn closure_functions_go_with_their_closures() {
+    let mut engine = engine();
+    let count = |engine: &Engine| crate::value::closure_function_count(&engine.interp.gc_heap);
+    engine.interp.gc_collect();
+    let base = count(&engine);
+    // 2,000 functions, each closure dead at once.
+    eval(
+        &mut engine,
+        "var n = 0; for (var i = 0; i < 2000; i++) n += new Function('x', 'return x + ' + i)(1); n",
+    );
+    engine.interp.gc_collect_minor();
+    let after_minor = count(&engine);
+    assert!(
+        after_minor < base + 100,
+        "a minor collection kept {} of 2,000 functions whose closures died young",
+        after_minor - base
+    );
+    // 200 functions whose closures survive a collection, then die: minor collections cannot
+    // tell, a major one can.
+    eval(
+        &mut engine,
+        "var kept = []; for (var i = 0; i < 200; i++) kept.push(new Function('return ' + i)); 0",
+    );
+    engine.interp.gc_collect_minor();
+    let with_old = count(&engine);
+    assert!(
+        with_old >= after_minor + 200,
+        "{with_old} < {after_minor} + 200"
+    );
+    eval(&mut engine, "kept = null; 0");
+    engine.interp.gc_collect_minor();
+    assert!(
+        count(&engine) >= after_minor + 200,
+        "a minor collection judged old closures"
+    );
+    engine.interp.gc_collect();
+    assert!(
+        count(&engine) < after_minor + 20,
+        "a major collection kept {} functions of dead old closures",
+        count(&engine).saturating_sub(after_minor)
+    );
+}

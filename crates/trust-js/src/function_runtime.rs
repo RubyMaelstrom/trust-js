@@ -92,7 +92,7 @@ pub(crate) struct FunctionRuntimeCache {
     /// (`value::hold_closure_function`): a closure made under that heap registers nothing.
     /// Reset when that registry lets the function go.
     pub(crate) closure_heap: Cell<u64>,
-    /// The stamp of the last major collection that traced one of the function's closures
+    /// The stamp of the last collection that traced one of the function's closures
     /// (`value::closure_mark_stamp`), unique across this thread's heaps.
     pub(crate) closure_mark: Cell<u64>,
 }

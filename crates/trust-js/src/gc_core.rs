@@ -3707,6 +3707,12 @@ struct ExternalBytes {
 }
 
 impl Control {
+    /// Whether a collection of this heap is in progress (from its marking to the end of its
+    /// sweep).
+    pub(crate) fn collecting(&self) -> bool {
+        self.collecting.get()
+    }
+
     /// Record `bytes` of Rust-heap payload acquired by a cell of this heap, or by a container a
     /// cell will own. A collection becomes due once the bytes charged since the last one pass the
     /// external budget; the due word says so at once, so the next safepoint collects.

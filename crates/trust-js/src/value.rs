@@ -2305,9 +2305,11 @@ const _: () = assert!(!std::mem::needs_drop::<UserCallable>());
 
 /// A closure's function: an uncounted copy of the `Rc` that its heap's closure registry holds
 /// once for all the function's closures there (`GcState::closure_functions`), so a dead closure
-/// has nothing to release. The registry keeps the function until a major collection finds no
-/// closure of it alive in the heap (`sweep_closure_functions`). The same word as the `Rc`,
-/// which the JIT reads (`JitLayout::user_func`).
+/// has nothing to release. The registry keeps the function until a collection finds no closure
+/// of it alive in the heap (`sweep_closure_functions`): the next minor collection for a
+/// function whose closures all died young, a major one once one had survived, which is when the
+/// closures' finalizers used to release it. The same word as the `Rc`, which the JIT reads
+/// (`JitLayout::user_func`).
 #[repr(transparent)]
 pub(crate) struct ClosureFunction(std::mem::ManuallyDrop<Rc<Function>>);
 
@@ -2855,7 +2857,11 @@ pub(crate) struct GcState {
     >,
     /// The functions of this heap's closures, each held once for all of them, by address (see
     /// [`ClosureFunction`]).
-    closure_functions: RefCell<crate::fasthash::FastMap<usize, Rc<Function>>>,
+    closure_functions: RefCell<crate::fasthash::FastMap<usize, ClosureHold>>,
+    /// The registry's functions taken since the last collection, none of whose closures has
+    /// survived one: a minor collection, which traces every live young closure, lets go of
+    /// those it found no closure of.
+    young_closure_functions: RefCell<Vec<usize>>,
     array_length_shape: Cell<u32>,
     array_length_layout: RefCell<Option<PropertyLayout>>,
     live: LiveCount,
@@ -4324,7 +4330,7 @@ thread_local! {
     /// The ECMAScript Agent surrounding the code currently running on this native thread. This is
     /// the allocation heap: `Interp` restores it whenever execution moves between the driver and a coroutine
     /// worker. See ECMA-262, Agents and GeneratorResume/RunSuspendedContext.
-    static ACTIVE_GC_HEAP: RefCell<Option<GcHeap>> = const { RefCell::new(None) };
+    static ACTIVE_GC_HEAP: ActiveHeapCell = const { ActiveHeapCell(RefCell::new(None)) };
     /// Symbol identity/registry state for the surrounding Agent. It is separate from `GcHeap`
     /// because TRust JS currently isolates a ShadowRealm's object heap while the specification still
     /// requires the ShadowRealm to share its Agent's Symbols.
@@ -4353,6 +4359,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         shapes: RefCell::new(ShapeTable::new()),
         function_runtimes: RefCell::default(),
         closure_functions: RefCell::default(),
+        young_closure_functions: RefCell::default(),
         array_length_shape: Cell::new(SHAPE_EMPTY),
         array_length_layout: RefCell::default(),
         live: LiveCount::new(0),
@@ -4499,22 +4506,41 @@ pub(crate) fn hold_closure_function(func: &Rc<Function>) {
 fn hold_closure_function_in(func: &Rc<Function>, heap_id: u64) {
     with_active_gc_heap(|heap| {
         debug_assert_eq!(heap.heap_id, heap_id);
-        heap.closure_functions
-            .borrow_mut()
-            .entry(Rc::as_ptr(func) as usize)
-            .or_insert_with(|| func.clone());
+        let key = Rc::as_ptr(func) as usize;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            heap.closure_functions.borrow_mut().entry(key)
+        {
+            // A closure made while a collection finishes is allocated marked, old once it ends:
+            // only a major collection judges its function.
+            let old = heap.ledger.collecting();
+            entry.insert(ClosureHold {
+                func: func.clone(),
+                old,
+            });
+            if !old {
+                heap.young_closure_functions.borrow_mut().push(key);
+            }
+        }
     });
     func.runtime_cache().closure_heap.set(heap_id);
 }
 
+/// One function of a heap's closure registry (see [`ClosureFunction`]).
+struct ClosureHold {
+    func: Rc<Function>,
+    /// A closure of the function survived a collection: only a major collection, which traces
+    /// the old closures, can find them all dead.
+    old: bool,
+}
+
 thread_local! {
-    /// While a major collection marks on this thread, its stamp ([`closure_mark_stamp`]);
-    /// otherwise 0.
+    /// While a collection marks on this thread, its stamp ([`closure_mark_stamp`]); otherwise
+    /// 0.
     static CLOSURE_MARK_STAMP: Cell<u64> = const { Cell::new(0) };
     static LAST_CLOSURE_MARK_STAMP: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Start a major collection's marking of closures: the marker's trace of a closure records the
+/// Start a collection's marking of closures: the marker's trace of a closure records the
 /// returned stamp in its function's cache, unique among this thread's collections (a function
 /// is used only on its thread). [`sweep_closure_functions`] ends it.
 pub(crate) fn closure_mark_stamp() -> u64 {
@@ -4527,31 +4553,72 @@ pub(crate) fn closure_mark_stamp() -> u64 {
 }
 
 /// End the marking that [`closure_mark_stamp`] started. Once it has completed (`marked`), let
-/// go of each function of the registry that it found no live closure of: no closure of the
-/// function is left in the heap but dead ones, which hold nothing (see [`ClosureFunction`]).
-/// Runs as the marking ends, before any closure can be made again.
-pub(crate) fn sweep_closure_functions(heap: &GcState, stamp: u64, marked: bool) {
+/// go of each function of the registry that it found no live closure of, of those it can
+/// judge: every function after a major collection, the young ones after a minor collection
+/// (see `GcState::young_closure_functions`). No closure of such a function is left in the heap
+/// but dead ones, which hold nothing (see [`ClosureFunction`]). Runs as the marking ends,
+/// before any closure can be made again.
+pub(crate) fn sweep_closure_functions(
+    heap: &GcState,
+    stamp: u64,
+    marked: bool,
+    kind: crate::gc_core::CollectionKind,
+) {
     CLOSURE_MARK_STAMP.with(|current| current.set(0));
     if !marked {
         return;
     }
-    let mut released = Vec::new();
-    heap.closure_functions.borrow_mut().retain(|_, func| {
+    let mut released: Vec<Rc<Function>> = Vec::new();
+    let mut release = |func: &Rc<Function>| {
         let cache = func.runtime_cache();
-        if cache.closure_mark.get() == stamp {
-            return true;
-        }
         if cache.closure_heap.get() == heap.heap_id {
             cache.closure_heap.set(0);
         }
         released.push(func.clone());
-        false
-    });
+    };
+    let traced = |func: &Rc<Function>| func.runtime_cache().closure_mark.get() == stamp;
+    {
+        let mut registry = heap.closure_functions.borrow_mut();
+        let mut young = heap.young_closure_functions.borrow_mut();
+        match kind {
+            crate::gc_core::CollectionKind::Minor => {
+                for key in young.drain(..) {
+                    let Some(hold) = registry.get_mut(&key) else {
+                        continue;
+                    };
+                    debug_assert!(!hold.old, "a young function's closures are young");
+                    if traced(&hold.func) {
+                        hold.old = true;
+                    } else {
+                        release(&hold.func);
+                        registry.remove(&key);
+                    }
+                }
+            }
+            crate::gc_core::CollectionKind::Major => {
+                young.clear();
+                registry.retain(|_, hold| {
+                    if traced(&hold.func) {
+                        hold.old = true;
+                        return true;
+                    }
+                    release(&hold.func);
+                    false
+                });
+            }
+        }
+    }
     // A function's drop can reach code caches; release them outside the registry's borrow.
     drop(released);
 }
 
-/// Record, for the registry sweep, that a major collection traced a closure of `func`.
+/// How many functions `heap`'s closure registry holds (see [`ClosureFunction`]).
+#[cfg(test)]
+pub(crate) fn closure_function_count(heap: &GcState) -> usize {
+    heap.closure_functions.borrow().len()
+}
+
+/// Record, for the registry sweep, that the collection marking traced a closure of `func`.
 #[inline]
 fn mark_closure_function(func: &Function) {
     let stamp = CLOSURE_MARK_STAMP.with(Cell::get);
@@ -4725,6 +4792,25 @@ pub(crate) fn active_gc_heap() -> GcHeap {
         let mut active = active.borrow_mut();
         active.get_or_insert_with(unowned_gc_heap).clone()
     })
+}
+
+/// The active Agent's heap slot (`ACTIVE_GC_HEAP`). Its teardown with the thread's storage
+/// also clears the Agent tag, which names the heap the slot holds and which
+/// [`with_agent_heap`] reads in place of borrowing the slot: a destructor that runs later and
+/// allocates then finds no Agent, rather than the heap the slot just released.
+struct ActiveHeapCell(RefCell<Option<GcHeap>>);
+
+impl std::ops::Deref for ActiveHeapCell {
+    type Target = RefCell<Option<GcHeap>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ActiveHeapCell {
+    fn drop(&mut self) {
+        let _ = ACTIVE_AGENT_TAG.try_with(|tag| tag.set((0, 0)));
+    }
 }
 
 /// [`with_active_gc_heap`] for the hot paths (allocation, the heap's identity): the heap the
