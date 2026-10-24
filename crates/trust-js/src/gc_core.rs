@@ -693,9 +693,34 @@ pub(crate) type FinalizeFn = fn(*mut u8);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct DescId(pub(crate) u32);
 
+/// Actual marker work; ordinary trace callbacks/verifiers never consume remembered state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TracePurpose {
+    Full,
+    Remembered,
+}
+
+pub(crate) type MarkTraceFn = fn(*const u8, TracePurpose, &mut dyn FnMut(*const u8));
+
+#[derive(Clone, Copy)]
+struct TraceWork {
+    cell: usize,
+    desc: DescId,
+    purpose: TracePurpose,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<TraceWork>() == 16);
+    assert!(std::mem::size_of::<TraceWork>() == std::mem::size_of::<(usize, DescId)>());
+};
+
 pub(crate) struct LayoutDesc {
     pub(crate) name: &'static str,
     pub(crate) trace: TraceFn,
+    /// Used only by actual marker drain, after first-mark bookkeeping. The ordinary trace
+    /// remains complete and nonconsuming for verification and root/diagnostic visitors.
+    pub(crate) mark_trace: Option<MarkTraceFn>,
     pub(crate) finalize: Option<FinalizeFn>,
     /// The kind's cells gain references after their initialization (the engine's objects,
     /// environments and deferred prototypes), through writes the barrier records
@@ -833,7 +858,7 @@ impl PageMeta {
     /// in a set card of this page, and clear the cards. A card covers `1 << CARD_SHIFT` bytes,
     /// so one card can cover the starts of several small cells; each marked one is listed. An
     /// unmarked cell is young (or free, or a zombie) and is traced, if at all, as it is reached.
-    fn take_card_cells(&mut self, cells: &mut Vec<(usize, DescId)>) {
+    fn take_card_cells(&mut self, cells: &mut Vec<TraceWork>) {
         if !self.carded {
             return;
         }
@@ -860,7 +885,11 @@ impl PageMeta {
                     .min(self.cells);
                 for index in first..end {
                     if bit(&self.marks, index) && !bit(&self.zombies, index) {
-                        cells.push((self.cell_ptr(index), self.desc));
+                        cells.push(TraceWork {
+                            cell: self.cell_ptr(index),
+                            desc: self.desc,
+                            purpose: TracePurpose::Remembered,
+                        });
                     }
                 }
             }
@@ -1039,7 +1068,7 @@ struct Marker {
     source: MarkSource,
     #[cfg(test)]
     parents: Option<FastMap<usize, MarkSource>>,
-    worklist: Vec<(usize, DescId)>,
+    worklist: Vec<TraceWork>,
     edges: Vec<CondEdge>,
     /// Waiting edges keyed by cell start >> 4 (cells are 16-aligned).
     waiting: FastMap<usize, Vec<u32>>,
@@ -1172,7 +1201,7 @@ pub(crate) struct Heap {
     young_pages: Vec<u32>,
     /// A minor collection's old cells whose cards were set, gathered as it starts
     /// (`Heap::begin_marking`) and traced as its marking starts.
-    card_cells: Vec<(usize, DescId)>,
+    card_cells: Vec<TraceWork>,
     /// The bytes of the cells marked by the collection in progress.
     marked_bytes: usize,
     /// When false, allocation never collects: the embedder polls
@@ -1844,7 +1873,11 @@ impl Heap {
                     parents.insert(cell.start, m.source);
                 }
                 self.stats.cells_marked += 1;
-                m.worklist.push((cell.start, cell.desc));
+                m.worklist.push(TraceWork {
+                    cell: cell.start,
+                    desc: cell.desc,
+                    purpose: TracePurpose::Full,
+                });
                 if has_waiters {
                     if let Some(edges) = m.waiting.remove(&(cell.start >> 4)) {
                         m.ready.extend(edges);
@@ -2467,15 +2500,24 @@ impl Heap {
 
     fn drain(&mut self, m: &mut Marker, client: &dyn MarkClient) {
         loop {
-            while let Some((cell, desc)) = m.worklist.pop() {
+            while let Some(TraceWork {
+                cell,
+                desc,
+                purpose,
+            }) = m.worklist.pop()
+            {
                 #[cfg(test)]
                 {
                     m.source = MarkSource::Cell(cell);
                 }
-                let trace = self.descs[desc.0 as usize].trace;
+                let descriptor = &self.descs[desc.0 as usize];
                 let mut edges = std::mem::take(&mut m.trace_scratch);
                 edges.clear();
-                trace(cell as *const u8, &mut |edge| edges.push(edge));
+                if let Some(trace) = descriptor.mark_trace {
+                    trace(cell as *const u8, purpose, &mut |edge| edges.push(edge));
+                } else {
+                    (descriptor.trace)(cell as *const u8, &mut |edge| edges.push(edge));
+                }
                 // The size check is once per descriptor batch, never a per-word policy test.
                 // This is an amortization heuristic, not a claim that large batches are unique.
                 if edges.len() <= MARK_CACHE_BATCH_LIMIT {
@@ -3679,18 +3721,21 @@ mod tests {
             let node = heap.register_desc(LayoutDesc {
                 name: "node",
                 trace: trace_node,
+                mark_trace: None,
                 finalize: None,
                 carded: false,
             });
             let leaf = heap.register_desc(LayoutDesc {
                 name: "leaf",
                 trace: trace_none,
+                mark_trace: None,
                 finalize: Some(fin_count),
                 carded: false,
             });
             let carded = heap.register_desc(LayoutDesc {
                 name: "carded node",
                 trace: trace_node,
+                mark_trace: None,
                 finalize: None,
                 carded: true,
             });
@@ -3797,6 +3842,57 @@ mod tests {
 
     /// The side tables of a client that has none.
     fn no_edges(_: &mut EdgeSink<'_>) {}
+
+    thread_local! {
+        static WORK_PURPOSES: RefCell<Vec<(usize, TracePurpose)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn remember_work(cell: *const u8, purpose: TracePurpose, visit: &mut dyn FnMut(*const u8)) {
+        WORK_PURPOSES.with(|work| work.borrow_mut().push((cell as usize, purpose)));
+        trace_node(cell, visit);
+    }
+
+    #[test]
+    fn remembered_work_items_keep_full_children_and_ephemeron_ready_work_distinct() {
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            std::mem::size_of::<TraceWork>(),
+            std::mem::size_of::<(usize, DescId)>()
+        );
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        fx.heap.descs[fx.node.0 as usize].mark_trace = Some(remember_work);
+        fx.heap.descs[fx.carded.0 as usize].mark_trace = Some(remember_work);
+        let old = fx.heap.alloc(fx.carded, 16);
+        fx.roots[0] = tagged(old);
+        fx.collect();
+        WORK_PURPOSES.with(|work| work.borrow_mut().clear());
+        let direct = fx.alloc_node(0, 1);
+        let child = fx.alloc_node(0, 2);
+        let held = fx.alloc_node(0, 3);
+        fx.roots[1] = tagged(direct);
+        fx.roots[2] = tagged(old); // A repeated positive old root must not suppress card work.
+        set_word(old, 0, tagged(child));
+        // SAFETY: old is a live carded cell of this heap.
+        unsafe { card_mark(old) };
+        let before = fx.heap.stats().cells_marked;
+        assert!(fx.start_marking_kind(
+            &|sink| sink.ephemeron(old, tagged(child), tagged(held)),
+            CollectionKind::Minor
+        ));
+        fx.heap.finish_collection(&[]);
+        assert_eq!(fx.heap.stats().cells_marked - before, 3);
+        assert_eq!(fx.heap.stats().last_card_cells, 1);
+        WORK_PURPOSES.with(|work| {
+            let work = work.borrow();
+            assert_eq!(work.len(), 4);
+            assert!(work.contains(&(old as usize, TracePurpose::Remembered)));
+            for cell in [direct, child, held] {
+                assert!(work.contains(&(cell as usize, TracePurpose::Full)));
+            }
+        });
+        assert!(fx.heap.owns_cell(held as usize, fx.node));
+    }
 
     fn word(p: *const u8, index: usize) -> u64 {
         unsafe { std::ptr::read((p as *const u64).add(index)) }
@@ -6807,6 +6903,7 @@ mod tests {
             let desc = fx.heap.register_desc(LayoutDesc {
                 name: "edge batch",
                 trace: trace_batch,
+                mark_trace: None,
                 finalize: None,
                 carded: false,
             });
@@ -7050,6 +7147,7 @@ mod tests {
             let desc = fx.heap.register_desc(LayoutDesc {
                 name: "carded edge batch",
                 trace: trace_batch,
+                mark_trace: None,
                 finalize: None,
                 carded: true,
             });
@@ -7159,6 +7257,7 @@ mod tests {
             let object = fx.heap.register_desc(LayoutDesc {
                 name: "prototype/layout fan-in",
                 trace: trace_object,
+                mark_trace: None,
                 finalize: None,
                 carded: false,
             });
@@ -7553,12 +7652,14 @@ mod tests {
         let node = heap.register_desc(LayoutDesc {
             name: "node",
             trace: trace_node,
+            mark_trace: None,
             finalize: None,
             carded: false,
         });
         let blob = heap.register_desc(LayoutDesc {
             name: "blob",
             trace: trace_none,
+            mark_trace: None,
             finalize: None,
             carded: false,
         });

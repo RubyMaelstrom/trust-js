@@ -94,6 +94,7 @@ pub(crate) fn cell_layout() -> crate::gc_core::LayoutDesc {
     crate::gc_core::LayoutDesc {
         name: "string",
         trace,
+        mark_trace: None,
         finalize: None,
         // A view's owner is set when the view is made.
         carded: false,

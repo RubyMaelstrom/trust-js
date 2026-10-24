@@ -38,6 +38,15 @@ use crate::execution_storage::SlotAccess;
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_PACKED_APPEND_ENABLED: Cell<bool> = const { Cell::new(false) };
+    pub(crate) static TEST_PACKED_APPEND_RECEIVER: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static TEST_PACKED_APPEND_LENGTH: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static TEST_PACKED_APPEND_COMMITS: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static TEST_PACKED_APPEND_HEAP_COMMITS: Cell<usize> = const { Cell::new(0) };
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "macos", target_os = "windows")
@@ -12236,6 +12245,32 @@ fn emit_define_elem_inline(
     a.ucvtf_d_w(1, 16);
     a.stur_d(1, 14, layout.entry_value as i32);
     a.bind(length_kept);
+    #[cfg(test)]
+    if TEST_PACKED_APPEND_ENABLED.with(Cell::get) {
+        // Opt in at Rust emission time: ordinary debug tests retain their exact instruction
+        // layout and do not embed unused witness TLS addresses.
+        // Post-commit witness for one armed receiver/length. x9/x17 are dead, and these
+        // direct Cell updates invoke no helper, allocation, GC or author callback.
+        let skip = a.new_label();
+        a.mov_imm64(9, TEST_PACKED_APPEND_RECEIVER.with(Cell::as_ptr) as u64);
+        a.ldr_imm(17, 9, 0);
+        a.cmp_reg_x(10, 17);
+        a.b_cond(C_NE, skip);
+        a.mov_imm64(9, TEST_PACKED_APPEND_LENGTH.with(Cell::as_ptr) as u64);
+        a.ldr_imm(17, 9, 0);
+        a.cmp_reg_x(16, 17);
+        a.b_cond(C_NE, skip);
+        a.mov_imm64(9, TEST_PACKED_APPEND_COMMITS.with(Cell::as_ptr) as u64);
+        a.ldr_imm(17, 9, 0);
+        a.add_imm(17, 17, 1);
+        a.str_imm(17, 9, 0);
+        a.cbz(15, true, skip);
+        a.mov_imm64(9, TEST_PACKED_APPEND_HEAP_COMMITS.with(Cell::as_ptr) as u64);
+        a.ldr_imm(17, 9, 0);
+        a.add_imm(17, 17, 1);
+        a.str_imm(17, 9, 0);
+        a.bind(skip);
+    }
     // [A, k, V] → [true].
     a.mov_imm64(1, crate::value::PACK_BOOL | 1);
     emit_exec_word_store(a, 1, 20, -24);

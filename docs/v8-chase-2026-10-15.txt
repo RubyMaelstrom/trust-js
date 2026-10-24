@@ -8482,3 +8482,164 @@ experiments and original/recovery evidence. The retained candidate is
 target/s6-lto/s6-gc-opt-part-a. React RSS, Djot GC share and remaining
 independent component bounds stay open. I4 approval is unchanged; this
 is not S6 exit acceptance or merge authorization.
+
+
+GC optimization part B candidate: remembered elements, 2026-10-23
+
+The current production profiles confirm that tracing retained array
+elements is a substantial sustained-allocation cost. Prepare precise
+dirty logical blocks plus an implicit appended tail, held only in the
+optional heap packed buffer. Preserve Object/Props/DenseBuffers and
+inline carriers. A single dirty suffix is insufficient for early-index
+replacements. Fallible bitmap growth falls back to full tracing.
+
+Actual marker callbacks alone consume this metadata. Ordinary tracing
+and verification remain complete and side-effect-free. Every named,
+internal, prototype, layout, Symbol, exotic and callable edge stays full.
+Clones/transplants and generic mutable escapes start full; truncation
+clamps or resets proof before native append can reuse removed positions.
+Audit every Rust and native write. Native DEFINE_ELEM's appended tail may
+be recognized without new emitted stores only with verified header layout
+and actual post-commit tests, including shrink then same-length regrowth.
+
+Part A remains frozen for its ARM routine gate. This separately copied
+candidate is prepared in isolation; live integration, acceptance and
+commits wait for part A's checks. Root owns execution and review. The
+part receives precise sole-holder, boundary, structural, failure-fallback
+and native-path tests, discriminating mutations, both routine platform
+gates and an independent release comparison. Full closing stress and
+conformance remain required. No bounds or liveness contracts change.
+
+
+GC optimization part B: remembered packed elements, 2026-10-24
+
+Part B is integrated after eeddd29c. Heap-packed arrays now remember
+dirty logical blocks of 64 properties and an implicit appended tail. A
+small wrapper holds this optional metadata; Object, Props, DenseBuffers
+and the native deque header keep their sizes and offsets. Indexed writes
+record blocks, while clones, replacements, reorders and generic mutable
+escapes start full. Pop clamps the traced prefix so native same-length
+regrowth cannot hide young values. Bitmap allocation failure falls back
+to full tracing without changing the setter's allocation-failure
+behavior.
+
+Only the actual marker consumes the metadata, after reporting every edge
+of the object. Ordinary tracing and heap verification remain complete
+and nonconsuming. Remembered work is distinct from a first full mark
+without enlarging the work item. Every prototype, named, layout, Symbol,
+internal, exotic and callable edge remains fully reported by the same
+exhaustive inventory. Native append keeps its existing owner-card store
+and recognizes the appended tail without additional production
+instructions. Retained-storage diagnostics include the wrapper and
+bitmap.
+
+Seventeen tests cover precise sole-owner retention and retirement,
+distant blocks and tails, ordinary verifier nonconsumption, metadata
+failure, structural escapes, all non-element edge families and native
+append. The ARM test counts an actual heap append, with zero
+fallback-helper calls, then proves young-to-old survival across a
+precise minor after append, pop/regrow and truncate/regrow. Its
+read-only length-slot preparation leaves remembered metadata unchanged.
+A negative extensibility case proves the checked fallback. Two Symbol
+tests own an independent weak pin and distinguish dead reserved storage
+from live retention and final reclamation. Original compilation,
+lifetime-fixture and native-fallback failures remain preserved; none was
+dismissed as a passing run.
+
+Root and the independent reviewer checked the implementation and tests.
+Seven fresh isolated mutations fail at their intended assertions in
+eight exact runs, including native same-length regrowth and the native
+owner card. The other sites are index bits, ordinary-trace consumption,
+generic mutable escapes, remembered work purpose and bitmap failure
+fallback. No crash or compilation failure counts as mutation evidence.
+
+Crystal routine gate: 2432 passed, zero failed, seven existing ignores.
+Five strict Clippy configurations pass; rustdoc retains the same eight
+warnings; doctests are 11/0/1. Workspace and all six downstream suites
+pass. Fixture outputs, compilation counts and collection counts match
+part A; sustained checksums match in both tiers. All nine normalized
+code summaries are bytewise identical to part A, covering 678 chunks.
+Difftest agrees on 138 seeds with the same 12 budget skips. Test262
+threshold 8 is unchanged at 53575/0/3. Targeted stress at interval 1
+passes 664 and ignores five, with zero failures, timeouts or retries;
+ten targeted slow-list cases remain for the closing milestone.
+
+Zombie routine gate: x64 2260/0/7, Wine 2252/3/7, retaining exactly the
+three established snapshot failures and 23 unchanged Windows
+diagnostics. Both inventories add exactly 16 tests; the seventeenth is
+ARM-only. All 32 additional exact native/Wine stress-1 cases pass, as do
+the routine release fixtures and difftest. The local verifier and remote
+archive verifier bind the sources, helpers, test binaries and raw
+results. Every owned execution was reaped before the commit.
+
+Fresh fat-LTO comparison on Crystal, CPU 5, rustc 1.99.1/LLVM 23.1.1,
+opt 3, one codegen unit, panic abort: candidate d4f41bcc5f324f9d versus
+part A b583abc66ed1d3ec and matched-main be807bb62a3f72c8. The candidate
+has 19805552 bytes and frozen source c10ebcca3f50f31c4, 798 paths. The
+primary experiment contains 15 interleaved rounds over six workload/tier
+pairs and three engines, 270 validated executions. Its quiet minute
+records 13 server ticks and 2400 total busy ticks at HZ 100; other-core
+busy median is 0.403, maximum 1.929.
+
+Against part A, sustained wall time improves 18.61% in JIT and 13.94% in
+bytecode, with total GC pause reductions of 49.68% and 49.83%. Sustained
+longest pauses rise 3.08% and 2.35%, respectively. Vue wall time rises
+0.98%, Djot 0.61%, and React is neutral. Nonempty memory, compilation
+and generated-code components show no meaningful new regression. React
+peak RSS remains +48.87% against matched main and Djot workload GC share
+is 6.861%; neither open bound is closed by this tracing change.
+
+The startup diagnostic-GC interval and sustained longest-pause interval
+required a declared fixed follow-up: 100 interleaved rounds of empty,
+Vue and sustained JIT, parent/candidate only, 600 validated executions.
+An initial quiet window was invalidated by a process-discovery race; no
+measurement ran until the next valid minute, with 13 server ticks and
+2462 total busy ticks. Other-core busy median is 0.416, maximum 2.683.
+
+The follow-up confirms sustained JIT wall -18.65% (paired 95% interval
+-18.77..-18.51) and total GC pause -49.84%. Its longest pause rises
+3.97% (3.27..4.46), from 14.57 to 15.14 ms. Vue wall rises 1.14%
+(0.96..1.30), cycles 1.15% (0.94..1.37), and RSS changes -0.21%
+(-0.95..0.44). Empty wall is unchanged (-1.04..1.05); RSS changes +3.20%
+(-0.19..4.75), versus the primary -2.31% (-8.22..1.69). Both datasets
+are retained; exact neutrality is not claimed. The empty diagnostic
+exit-GC median changes from primary +7.45% to follow-up -7.20%, with
+wide intervals; this component remains imprecise rather than showing a
+reproducible production startup slowdown.
+
+These parent costs are individually within the repository's
+minor-regression policy as a step towards the large sustained-allocation
+improvement. This is not an aggregate excuse for the carried main
+bounds. Metrics add an exit collection; workload shares exclude that
+cause. The empty script's sole collection is diagnostic, and
+instrumented instruction totals are not the S0 default-options cap
+check. Full closing stress, threshold 0/x64 conformance and final
+independent component/default-option checks remain required.
+
+The parallel correctness audit has also produced concrete follow-up
+work. A bounded ordinary-array probe on zombie's part B release
+allocates twelve arrays of 524288 numeric elements and discards each
+predecessor. All twelve runs across the three tiers and root/ShadowRealm
+execution return the expected checksum with zero collections and peaks
+of 164944..167028 KiB. Known Property and mirror capacities lie outside
+the cell byte budget. This is a scheduling diagnostic, not performance
+acceptance or complete RSS attribution.
+
+The shared-Agent/ShadowRealm correction is being implemented in an
+isolated source export. Its early audit also found that existing Rooted
+and RootedVec storage registers pointers derived from shared references
+and then moves owning Boxes. Actual-module Miri probes reject that
+ownership pattern; callback-spanning mutable payload loans exist at
+several consumers too. The isolated repair uses raw ownership and short
+mutation operations, with source review, both Miri borrow models,
+deliberate failing controls, and early consumer tests. Those checks do
+not accept unfinished Agent job/pressure behavior. This known
+prerequisite and general external-payload/backing accounting remain open
+work in the authorized optimization pass.
+
+Artifacts are under target/s6-gc-opt-2026-10-23/part-b, including both
+gate verifications, frozen source, mutation results, 870 release
+executions and the paired component review. The retained release is
+target/s6-lto/s6-gc-opt-part-b. Only the record and plan change after
+the gate. I4 approval remains unchanged; S6 exit acceptance and merge
+authorization remain open.

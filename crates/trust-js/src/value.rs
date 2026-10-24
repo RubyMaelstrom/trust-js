@@ -1139,6 +1139,7 @@ fn symbol_cell_layout() -> crate::gc_core::LayoutDesc {
     crate::gc_core::LayoutDesc {
         name: "symbol",
         trace: crate::gc_box::trace_none,
+        mark_trace: None,
         finalize: Some(crate::gc_box::finalize::<SymbolData>),
         carded: false,
     }
@@ -1750,15 +1751,16 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && pv.capacity() == 3
         && mv.len() == 1
         && mv.capacity() == 3;
-    let packed_some: Option<PackedProperties> = Some(Box::new(pv));
+    let packed_some: Option<PackedProperties> = Some(Box::new(pv.into()));
     let packed_word = unsafe { *(&packed_some as *const Option<PackedProperties> as *const usize) };
     let packed_expected = packed_some
         .as_deref()
-        .map_or(0, |v| v as *const DenseDeque<Property> as usize);
+        .map_or(0, |v| &v.values as *const DenseDeque<Property> as usize);
     let packed_none: Option<PackedProperties> = None;
     let packed_none_word =
         unsafe { *(&packed_none as *const Option<PackedProperties> as *const usize) };
-    let packed_elems_valid = deque_header_ok
+    let packed_elems_valid = offset_of!(PackedBuffer, values) == 0
+        && deque_header_ok
         && packed_word == packed_expected
         && packed_word != 0
         && packed_none_word == 0;
@@ -2600,6 +2602,7 @@ impl Object {
         } else if slots.0.is_some() {
             properties.elems.buffers_mut().internal_slots = slots;
         }
+        properties.elems.force_packed_full();
         self.props = properties;
     }
 
@@ -2623,6 +2626,8 @@ impl Object {
     /// replacement on every object.
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
+        // Moving a property payload to a new receiver cannot inherit the old owner's proof.
+        props.elems.force_packed_full();
         #[cfg(feature = "architecture-diagnostics")]
         let caller = std::panic::Location::caller();
         with_active_gc_heap(|heap| {
@@ -2884,12 +2889,14 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let object = core.register_desc(crate::gc_core::LayoutDesc {
         name: "object",
         trace: trace_object_cell,
+        mark_trace: Some(mark_object_cell),
         finalize: Some(finalize_object_cell),
         carded: true,
     });
     let scope = core.register_desc(crate::gc_core::LayoutDesc {
         name: "environment",
         trace: trace_scope_cell,
+        mark_trace: None,
         finalize: Some(finalize_scope_cell),
         carded: true,
     });
@@ -2899,6 +2906,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let user_fn = core.register_desc(crate::gc_core::LayoutDesc {
         name: "closure",
         trace: trace_user_fn_cell,
+        mark_trace: None,
         finalize: Some(crate::gc_box::finalize::<UserCallable>),
         // A closure's environment is set when the closure is made.
         carded: false,
@@ -2906,6 +2914,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let lazy_proto = core.register_desc(crate::gc_core::LayoutDesc {
         name: "lazy prototype",
         trace: lazy_function_prototype::trace_cell,
+        mark_trace: None,
         finalize: None,
         // Materialization writes the cell's state (`LazyFunctionPrototype::materialize`).
         carded: true,
@@ -2913,6 +2922,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let property_layout = core.register_desc(crate::gc_core::LayoutDesc {
         name: "property layout",
         trace: crate::gc_box::trace_none,
+        mark_trace: None,
         finalize: Some(crate::gc_box::finalize::<PropertyLayoutData>),
         carded: false,
     });
@@ -3069,6 +3079,21 @@ fn trace_object_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     object.trace_gc(&mut crate::gc_trace::VisitSink(visit));
 }
 
+/// Only Heap::drain invokes this hook. Ordinary descriptor tracing/verifiers do not consume.
+fn mark_object_cell(
+    cell: *const u8,
+    purpose: crate::gc_core::TracePurpose,
+    visit: &mut dyn FnMut(*const u8),
+) {
+    // SAFETY: the actual marker runs at the same unborrowed safepoint as trace_object_cell.
+    let object = unsafe { (*(cell as *const RefCell<Object>)).try_borrow_unguarded() }
+        .expect("object mutably borrowed during GC (I9)");
+    object.trace_gc_fields(&mut crate::gc_trace::VisitSink(visit), Some(purpose));
+    // Commit only after ALL element and non-element edges were successfully reported. A panic
+    // leaves the original obligations intact; between-phase writes are recorded afterwards.
+    object.props.elems.finish_packed_mark_trace();
+}
+
 /// Strong edges of an environment record.
 fn trace_scope_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     use crate::gc_trace::GcTrace;
@@ -3108,6 +3133,18 @@ pub(crate) fn alloc_scope_cell() -> *mut RefCell<crate::interpreter::Scope> {
 
 impl crate::gc_trace::GcTrace for Object {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.trace_gc_fields(sink, None);
+    }
+}
+
+impl Object {
+    /// A single exhaustive edge inventory for ordinary tracing and both actual marker modes.
+    fn trace_gc_fields(
+        &self,
+        sink: &mut dyn crate::gc_trace::GcSink,
+        purpose: Option<crate::gc_core::TracePurpose>,
+    ) {
+        use crate::gc_trace::GcTrace;
         let Object {
             proto,
             props,
@@ -3121,7 +3158,26 @@ impl crate::gc_trace::GcTrace for Object {
         if let Some(proto) = proto {
             sink.object(proto);
         }
-        for property in props.values().chain(self.internal_slots().values()) {
+        if let Some(purpose) = purpose {
+            if let Some(packed) = props.elems.packed.as_deref() {
+                packed.trace_elements(purpose, sink);
+            } else if let Some(properties) = props.elems.packed_ref() {
+                for property in properties {
+                    trace_packed_property(property, sink, Some(purpose));
+                }
+            }
+        } else {
+            for property in props.packed_values() {
+                property.trace_gc(sink);
+            }
+        }
+        // Named/classic properties and every non-element edge are ALWAYS complete.
+        for property in props
+            .entries
+            .fields
+            .iter()
+            .chain(self.internal_slots().values())
+        {
             property.trace_gc(sink);
         }
         props.entries.layout.trace_gc(sink);
@@ -4859,7 +4915,215 @@ impl Clone for DenseBuffers {
 // extra indirection keeps this optional field pointer-sized instead of adding two words to each
 // allocation; the compact representation is more valuable here than Clippy's generic Vec advice.
 #[allow(clippy::box_collection)]
-type PackedProperties = Box<DenseDeque<Property>>;
+type PackedProperties = Box<PackedBuffer>;
+
+const PACKED_DIRTY_BLOCK: usize = 64;
+const PACKED_TRACE_FULL: usize = usize::MAX;
+
+#[cfg(test)]
+thread_local! {
+    static PACKED_BITMAP_FAIL_GROWTH: Cell<bool> = const { Cell::new(false) };
+    static PACKED_MARK_VISITS: Cell<[usize; 2]> = const { Cell::new([0; 2]) };
+}
+
+/// Only heap-packed arrays pay for remembered metadata. The native append code still sees
+/// the admitted DenseDeque header at offset zero; all outer carriers remain pointer-sized.
+#[repr(C)]
+struct PackedBuffer {
+    values: DenseDeque<Property>,
+    /// Full until an actual marker reports all obligations successfully. Vec's nonzero-sized
+    /// allocation bound makes usize::MAX impossible as a real live length.
+    traced_len: Cell<usize>,
+    dirty: RefCell<Vec<u64>>,
+}
+
+impl From<DenseDeque<Property>> for PackedBuffer {
+    fn from(values: DenseDeque<Property>) -> Self {
+        Self {
+            values,
+            traced_len: Cell::new(PACKED_TRACE_FULL),
+            dirty: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl From<Vec<Property>> for PackedBuffer {
+    fn from(values: Vec<Property>) -> Self {
+        Self::from(DenseDeque::from(values))
+    }
+}
+
+impl FromIterator<Property> for PackedBuffer {
+    fn from_iter<T: IntoIterator<Item = Property>>(iter: T) -> Self {
+        Self::from(iter.into_iter().collect::<DenseDeque<Property>>())
+    }
+}
+
+impl Clone for PackedBuffer {
+    fn clone(&self) -> Self {
+        Self::from(self.values.clone())
+    }
+}
+
+impl std::ops::Deref for PackedBuffer {
+    type Target = DenseDeque<Property>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl<'a> IntoIterator for &'a PackedBuffer {
+    type Item = &'a Property;
+    type IntoIter = std::slice::Iter<'a, Property>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter()
+    }
+}
+
+impl PackedBuffer {
+    fn force_full(&self) {
+        self.traced_len.set(PACKED_TRACE_FULL);
+    }
+
+    fn full_mut(&mut self) -> &mut DenseDeque<Property> {
+        self.force_full();
+        &mut self.values
+    }
+
+    fn note_index(&mut self, index: usize) {
+        let traced = self.traced_len.get();
+        if traced == PACKED_TRACE_FULL || index >= traced {
+            return;
+        }
+        let block = index / PACKED_DIRTY_BLOCK;
+        let word = block / 64;
+        let dirty = self.dirty.get_mut();
+        if word >= dirty.len() {
+            #[cfg(test)]
+            let fail = PACKED_BITMAP_FAIL_GROWTH.with(Cell::get);
+            #[cfg(not(test))]
+            let fail = false;
+            if fail || dirty.try_reserve(word + 1 - dirty.len()).is_err() {
+                // Remembering is optional: never introduce OOM to an existing-value store.
+                self.traced_len.set(PACKED_TRACE_FULL);
+                return;
+            }
+            dirty.resize(word + 1, 0);
+        }
+        dirty[word] |= 1 << (block % 64);
+    }
+
+    fn index_mut(&mut self, index: usize) -> Option<&mut Property> {
+        if index >= self.values.len() {
+            return None;
+        }
+        self.note_index(index);
+        self.values.get_mut(index)
+    }
+
+    fn push(&mut self, property: Property) {
+        self.values.push(property);
+    }
+
+    fn pop(&mut self) -> Option<Property> {
+        let result = self.values.pop();
+        if self.traced_len.get() != PACKED_TRACE_FULL {
+            self.traced_len
+                .set(self.traced_len.get().min(self.values.len()));
+        }
+        result
+    }
+
+    fn pop_front(&mut self) -> Option<Property> {
+        self.full_mut().pop_front()
+    }
+
+    fn prepend(&mut self, items: impl ExactSizeIterator<Item = Property> + DoubleEndedIterator) {
+        self.full_mut().prepend(items);
+    }
+
+    fn trace_elements(
+        &self,
+        purpose: crate::gc_core::TracePurpose,
+        sink: &mut dyn crate::gc_trace::GcSink,
+    ) {
+        let Self {
+            values,
+            traced_len,
+            dirty,
+        } = self;
+        let len = values.len();
+        let traced = traced_len.get();
+        let mut report = |start: usize, end: usize| {
+            for property in &values[start..end] {
+                trace_packed_property(property, sink, Some(purpose));
+            }
+        };
+        if purpose == crate::gc_core::TracePurpose::Full || traced == PACKED_TRACE_FULL {
+            report(0, len);
+            return;
+        }
+        let prefix = traced.min(len);
+        let dirty = dirty.borrow();
+        let mut run: Option<(usize, usize)> = None;
+        for (word_index, &word) in dirty.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let block = word_index * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let start = block * PACKED_DIRTY_BLOCK;
+                if start >= prefix {
+                    break;
+                }
+                let end = (start + PACKED_DIRTY_BLOCK).min(prefix);
+                match run {
+                    Some((first, previous_end)) if previous_end == start => {
+                        run = Some((first, end))
+                    }
+                    Some((first, previous_end)) => {
+                        report(first, previous_end);
+                        run = Some((start, end));
+                    }
+                    None => run = Some((start, end)),
+                }
+            }
+        }
+        match run {
+            Some((start, end)) if end == prefix => report(start, len),
+            Some((start, end)) => {
+                report(start, end);
+                report(prefix, len);
+            }
+            None => report(prefix, len),
+        }
+    }
+
+    /// Called only after the actual Object marker successfully reported ALL its edges.
+    fn finish_mark_trace(&self) {
+        self.dirty.borrow_mut().clear();
+        self.traced_len.set(self.values.len());
+    }
+}
+
+fn trace_packed_property(
+    property: &Property,
+    sink: &mut dyn crate::gc_trace::GcSink,
+    purpose: Option<crate::gc_core::TracePurpose>,
+) {
+    #[cfg(test)]
+    if let Some(purpose) = purpose {
+        PACKED_MARK_VISITS.with(|counts| {
+            let mut value = counts.get();
+            value[usize::from(purpose == crate::gc_core::TracePurpose::Remembered)] += 1;
+            counts.set(value);
+        });
+    }
+    #[cfg(not(test))]
+    let _ = purpose;
+    if !property.is_empty() {
+        crate::gc_trace::GcTrace::trace_gc(property, sink);
+    }
+}
 
 struct EmptyDenseBuffers(DenseBuffers);
 // This value's empty buffers and cached-proof cell are never mutated. Every writer first
@@ -4925,17 +5189,17 @@ impl DenseStorage {
         if dense.packed.is_none() && dense.inline_packed.len != 0 {
             dense.packed = Some(Box::new(dense.inline_packed.into_vec().into()));
         }
-        dense.packed.as_deref_mut()
+        dense.packed.as_deref_mut().map(PackedBuffer::full_mut)
     }
     fn packed_slice_mut(&mut self) -> Option<&mut [Property]> {
         self.0.as_deref()?.inline_packed.packed_plain.set(false);
         self.packed_values_mut()
     }
-    // Value-only writes leave descriptor attributes and occupancy unchanged.
+    // A generic mutable slice can change any slot, so it abandons remembered precision.
     fn packed_values_mut(&mut self) -> Option<&mut [Property]> {
         let dense = self.0.as_deref_mut()?;
         match dense.packed.as_deref_mut() {
-            Some(packed) => Some(packed.as_mut_slice()),
+            Some(packed) => Some(packed.full_mut().as_mut_slice()),
             None if dense.inline_packed.len != 0 => Some(unsafe {
                 // The same initialized prefix as InlinePacked::as_slice. A mutable
                 // element access does not require promoting the backing storage.
@@ -4945,6 +5209,31 @@ impl DenseStorage {
                 )
             }),
             None => None,
+        }
+    }
+    fn packed_index_mut(&mut self, index: usize) -> Option<&mut Property> {
+        self.0.as_deref()?.inline_packed.packed_plain.set(false);
+        self.packed_index_value_mut(index)
+    }
+    // Descriptor/occupancy-preserving counterpart of the former packed_values_mut caller.
+    fn packed_index_value_mut(&mut self, index: usize) -> Option<&mut Property> {
+        let dense = self.0.as_deref_mut()?;
+        if let Some(packed) = dense.packed.as_deref_mut() {
+            packed.index_mut(index)
+        } else if index < dense.inline_packed.len as usize {
+            Some(unsafe { dense.inline_packed.slots[index].assume_init_mut() })
+        } else {
+            None
+        }
+    }
+    fn force_packed_full(&self) {
+        if let Some(packed) = self.packed.as_deref() {
+            packed.force_full();
+        }
+    }
+    fn finish_packed_mark_trace(&self) {
+        if let Some(packed) = self.packed.as_deref() {
+            packed.finish_mark_trace();
         }
     }
     fn push_packed(&mut self, property: Property) {
@@ -4966,7 +5255,7 @@ impl DenseStorage {
     fn packed_ref(&self) -> Option<&[Property]> {
         let dense = self.0.as_deref()?;
         match dense.packed.as_deref() {
-            Some(packed) => Some(packed.as_slice()),
+            Some(packed) => Some(packed.values.as_slice()),
             None if dense.inline_packed.len != 0 => Some(dense.inline_packed.as_slice()),
             None => None,
         }
@@ -4997,6 +5286,7 @@ impl DenseStorage {
     fn set_packed(&mut self, packed: Option<PackedProperties>) {
         if packed.is_some() {
             let dense = self.buffers_mut();
+            packed.as_deref().unwrap().force_full();
             dense.inline_packed = InlinePacked::default();
             dense.inline_packed.packed_plain.set(
                 packed
@@ -6175,7 +6465,9 @@ impl Props {
                     .saturating_mul(std::mem::size_of::<f64>()),
             );
             if let Some(packed) = dense.packed.as_deref() {
-                bytes = bytes.saturating_add(std::mem::size_of::<DenseDeque<Property>>());
+                bytes = bytes.saturating_add(std::mem::size_of::<PackedBuffer>());
+                bytes = bytes
+                    .saturating_add(packed.dirty.borrow().capacity() * std::mem::size_of::<u64>());
                 bytes = bytes.saturating_add(
                     packed
                         .capacity()
@@ -6362,7 +6654,7 @@ impl Props {
         if (1..=32).contains(&len) || (len != 0 && dense_elements_enabled()) {
             self.entries.reserve_exact(1); // own `length`
             self.elems
-                .set_packed(Some(Box::new(DenseDeque::with_capacity(len))));
+                .set_packed(Some(Box::new(DenseDeque::with_capacity(len).into())));
             self.mirror_flags = if numeric && dense_elements_enabled() {
                 MIRROR_OK | MIRROR_PACKED | MIRROR_ALL_I32 | MIRROR_NO_HOLES
             } else {
@@ -6450,7 +6742,7 @@ impl Props {
         let packed = buffers
             .packed
             .as_deref()
-            .map(DenseDeque::as_slice)
+            .map(|packed| packed.values.as_slice())
             .unwrap_or_else(|| buffers.inline_packed.as_slice());
         mirror.extend(
             packed
@@ -6756,13 +7048,13 @@ impl Props {
             if self.mirror_flags & MIRROR_PACKED_FAILED != 0 {
                 self.mirror_invalidate();
             }
-            let packed = self.elems.packed_values_mut().unwrap();
-            let Some(p) = packed.get_mut(n as usize) else {
+            let Some(p) = self.elems.packed_ref().unwrap().get(n as usize) else {
                 return Err(v);
             };
             if p.is_empty() || p.accessor() || !p.writable() {
                 return Err(v);
             }
+            let p = self.elems.packed_index_value_mut(n as usize).unwrap();
             let number = match &(v).view() {
                 ValueView::Num(number) => Some(*number),
                 _ => None,
@@ -7165,6 +7457,7 @@ impl Props {
         };
         let first = if packed {
             self.note_structural();
+            self.elems.force_packed_full();
             for pair in self.elems.packed_ref().unwrap().windows(2) {
                 pair[0].packed.swap(&pair[1].packed);
             }
@@ -7517,14 +7810,10 @@ impl Props {
                 .is_some_and(|p| !p.is_empty())
             {
                 self.mirror_invalidate();
-                return self
-                    .elems
-                    .packed_slice_mut()
-                    .and_then(|p| p.get_mut(n as usize))
-                    .is_some_and(|p| {
-                        p.set_value(v);
-                        true
-                    });
+                return self.elems.packed_index_mut(n as usize).is_some_and(|p| {
+                    p.set_value(v);
+                    true
+                });
             }
         }
         if key.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
@@ -7785,7 +8074,7 @@ impl Props {
             if n < packed.len() {
                 self.note_structural();
                 self.mirror_invalidate();
-                self.elems.packed_slice_mut().unwrap()[n] = prop;
+                *self.elems.packed_index_mut(n).unwrap() = prop;
                 return;
             }
             if !self.has_far.get() && n <= packed.len() + 256 {
@@ -8136,6 +8425,14 @@ mod host_array_tests;
 #[cfg(test)]
 #[path = "value_dense_elements_tests.rs"]
 mod dense_elements_tests;
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[path = "value_remembered_elements_tests.rs"]
+mod remembered_elements_tests;
 
 /// A canonical array-index property key (`"0"`, `"42"` — decimal, no leading zeros, fits u32).
 #[inline(always)]
