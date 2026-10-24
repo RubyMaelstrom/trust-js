@@ -112,6 +112,14 @@ impl<T, const N: usize, S: Spill> InlineVec<T, N, S> {
         self.cap as usize
     }
 
+    /// The spill buffer's address while the elements live in one: with [`Spill`] storage the
+    /// collector frees (`gc_storage::GcSpill`), the edge the owner reports.
+    #[inline]
+    pub(crate) fn spill_ptr(&self) -> Option<*const u8> {
+        // SAFETY: `cap` says which field of `data` is in use.
+        (self.cap != 0).then(|| unsafe { self.data.heap } as *const u8)
+    }
+
     #[inline]
     fn as_ptr(&self) -> *const T {
         // SAFETY: `cap` says which field of `data` is in use.

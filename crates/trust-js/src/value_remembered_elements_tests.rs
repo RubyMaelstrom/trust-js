@@ -42,38 +42,17 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 #[test]
-fn heap_wrapper_keeps_dense_carrier_sizes_and_native_header() {
-    #[allow(dead_code)]
-    struct PreviousDenseBuffers {
-        index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>,
-        packed: Option<Box<DenseDeque<Property>>>,
-        inline_packed: InlinePacked,
-        elems: Vec<u32>,
-        mirror: DenseDeque<f64>,
-        symbols: Option<Box<crate::fasthash::FastMap<u64, SymbolRef>>>,
-        internal_slots: InternalSlots,
-    }
-    assert_eq!(
-        std::mem::size_of::<DenseBuffers>(),
-        std::mem::size_of::<PreviousDenseBuffers>()
-    );
-    assert_eq!(
-        std::mem::align_of::<DenseBuffers>(),
-        std::mem::align_of::<PreviousDenseBuffers>()
-    );
+fn storage_carriers_are_plain_data_with_the_native_header_first() {
+    // The sidecar and the packed buffer live in storage blocks (`gc_storage`): plain data, so
+    // that dropping a map never reads a block, which may have gone with its heap.
+    assert!(!std::mem::needs_drop::<DenseBuffers>());
+    assert!(!std::mem::needs_drop::<PackedBuffer>());
+    // The map's storage word the JIT follows comes first; the Rust-heap extras follow it.
     assert_eq!(
         std::mem::size_of::<DenseStorage>(),
-        std::mem::size_of::<usize>()
+        2 * std::mem::size_of::<usize>()
     );
     assert_eq!(std::mem::offset_of!(PackedBuffer, values), 0);
-    assert_eq!(
-        std::mem::offset_of!(DenseBuffers, packed),
-        std::mem::offset_of!(PreviousDenseBuffers, packed)
-    );
-    assert_eq!(
-        std::mem::offset_of!(DenseBuffers, inline_packed),
-        std::mem::offset_of!(PreviousDenseBuffers, inline_packed)
-    );
     let sample = Object::new(None);
     let layout = jit_layout(&sample);
     assert!(layout.packed_elems_valid);
@@ -165,7 +144,7 @@ fn mutable_escapes_reorders_clone_and_whole_replacement_start_full() {
         130
     );
     clean(properties.elems.packed.as_deref().unwrap());
-    let new_buffer = Box::new(packed(32));
+    let new_buffer = crate::gc_storage::StorageBox::new(packed(32));
     clean(&new_buffer);
     properties.elems.set_packed(Some(new_buffer));
     assert_eq!(
@@ -382,7 +361,7 @@ fn actual_marker_keeps_sole_young_trees_in_distant_blocks_and_appended_tail() {
         .unwrap()
         .dirty
         .borrow()
-        .clone();
+        .to_vec();
     {
         let heap = engine.interp.gc_heap.clone();
         let _guard = heap.core.borrow().nogc();
@@ -395,7 +374,7 @@ fn actual_marker_keeps_sole_young_trees_in_distant_blocks_and_appended_tail() {
     array.borrow().trace_gc(&mut Ignore);
     array.borrow().props.trace_gc(&mut Ignore);
     assert_eq!(
-        *array
+        array
             .borrow()
             .props
             .elems
@@ -403,7 +382,8 @@ fn actual_marker_keeps_sole_young_trees_in_distant_blocks_and_appended_tail() {
             .as_deref()
             .unwrap()
             .dirty
-            .borrow(),
+            .borrow()
+            .to_vec(),
         dirty
     );
     let before = visits();
@@ -637,7 +617,7 @@ fn unwinding_after_elements_before_callable_edges_does_not_consume_dirtiness() {
         .unwrap()
         .dirty
         .borrow()
-        .clone();
+        .to_vec();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         mark_object_cell(
             Gc::as_ptr(&array) as *const u8,
@@ -651,7 +631,7 @@ fn unwinding_after_elements_before_callable_edges_does_not_consume_dirtiness() {
     }));
     assert!(result.is_err());
     assert_eq!(
-        *array
+        array
             .borrow()
             .props
             .elems
@@ -659,7 +639,8 @@ fn unwinding_after_elements_before_callable_edges_does_not_consume_dirtiness() {
             .as_deref()
             .unwrap()
             .dirty
-            .borrow(),
+            .borrow()
+            .to_vec(),
         dirty
     );
     engine
@@ -951,7 +932,7 @@ fn native_append_guards(array: &Gc) -> NativeAppendGuards {
             .elems
             .packed
             .as_deref()
-            .map(|packed| (packed.traced_len.get(), packed.dirty.borrow().clone())),
+            .map(|packed| (packed.traced_len.get(), packed.dirty.borrow().to_vec())),
     };
     snapshot
 }

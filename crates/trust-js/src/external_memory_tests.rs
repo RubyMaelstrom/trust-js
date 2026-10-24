@@ -8,7 +8,7 @@ use crate::{Completion, Engine};
 
 /// An engine whose heap runs no stress collections, so the triggers alone decide.
 fn engine() -> Engine {
-    let mut engine = Engine::new();
+    let engine = Engine::new();
     engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
     engine
 }
@@ -83,4 +83,51 @@ fn collected_owners_release_their_charges() {
         after <= before + 4096,
         "collected owners release their charges: {before} -> {charged} -> {after}"
     );
+}
+
+/// The engine's own payloads live in the heap (`gc_storage`): element storage counts toward the
+/// nursery as cells do, so replacing one large Array, however few cells it takes, collects.
+/// Each pattern allocated gigabytes before any collection when element storage lived in the
+/// Rust heap uncounted: `new Array(n).fill(v)`, a chain of `map`, and arrays grown by `push`.
+#[test]
+fn replaced_arrays_are_collected_as_their_elements_grow() {
+    for (source, expected) in [
+        (
+            "var keep, n = 0;
+             for (var i = 0; i < 40; i++) { keep = new Array(100000).fill(i); n += keep.length; }
+             n",
+            "4000000",
+        ),
+        (
+            "var a = Array.from({length: 100000}, (_, i) => i);
+             for (var i = 0; i < 40; i++) a = a.map(x => x + 1);
+             a[0]",
+            "40",
+        ),
+        (
+            "var s = 0;
+             for (var i = 0; i < 400; i++) {
+               var a = [];
+               for (var j = 0; j < 10000; j++) a.push(j * 0.5);
+               s += a.length;
+             }
+             s",
+            "4000000",
+        ),
+    ] {
+        let mut engine = engine();
+        let (collections, _) = state(&engine);
+        assert_eq!(eval(&mut engine, source), expected, "{source}");
+        let (after, _) = state(&engine);
+        assert!(
+            after - collections >= 10,
+            "only {} collections while replacing about 64 MB of elements:\n{source}",
+            after - collections
+        );
+        let held = engine.interp.gc_heap.core.borrow().stats().live_bytes;
+        assert!(
+            held < 48 << 20,
+            "{held} bytes of cells held after replacing arrays:\n{source}"
+        );
+    }
 }

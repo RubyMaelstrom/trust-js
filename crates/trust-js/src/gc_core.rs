@@ -99,8 +99,25 @@ pub(crate) unsafe fn card_mark(cell: *const u8) {
     unsafe { ((table + card) as *mut u8).write(1) };
 }
 
+/// The size class of each 16-byte multiple up to the largest small cell: `CLASS_OF[(size +
+/// 15) / 16]` is the first class whose cells hold `size` bytes.
+const CLASS_OF: [u8; LARGEST_SMALL_CELL / 16 + 1] = {
+    let mut table = [0u8; LARGEST_SMALL_CELL / 16 + 1];
+    let mut class = 0;
+    let mut units = 0;
+    while units < table.len() {
+        while SIZE_CLASSES[class] < units * 16 {
+            class += 1;
+        }
+        table[units] = class as u8;
+        units += 1;
+    }
+    table
+};
+
+#[inline]
 fn size_class(size: usize) -> Option<usize> {
-    SIZE_CLASSES.iter().position(|&c| size <= c)
+    CLASS_OF.get(size.div_ceil(16)).map(|&class| class as usize)
 }
 
 fn bit(bits: &[u64], index: usize) -> bool {
@@ -919,7 +936,7 @@ impl PageMeta {
         self.free_head >= 0 || self.next_unused < self.cells
     }
 
-    fn take_cell(&mut self) -> Option<*mut u8> {
+    fn take_cell(&mut self, zero: bool) -> Option<*mut u8> {
         let index = if self.free_head >= 0 {
             let index = self.free_head as usize;
             debug_assert!(index < self.next_unused, "GC free list outside used prefix");
@@ -941,8 +958,10 @@ impl PageMeta {
         let ptr = self.cell_ptr(index) as *mut u8;
         set_bit(&mut self.allocated, index, true);
         self.live += 1;
-        // SAFETY: the cell lies inside this page and is now owned by the caller.
-        unsafe { std::ptr::write_bytes(ptr, 0, self.cell_size) };
+        if zero {
+            // SAFETY: the cell lies inside this page and is now owned by the caller.
+            unsafe { std::ptr::write_bytes(ptr, 0, self.cell_size) };
+        }
         Some(ptr)
     }
 }
@@ -958,6 +977,9 @@ struct ClassPages {
 struct LargeObj {
     size: usize,
     desc: DescId,
+    /// Allocated since the last collection, and listed in `Heap::young_larges`. Cleared by the
+    /// sweep that meets it.
+    young: bool,
     /// See `PageMeta::marks`. A large cell has no card: the write barrier never records one.
     marked: bool,
     waiters: bool,
@@ -1168,6 +1190,9 @@ pub(crate) struct GcStats {
 
 pub(crate) struct Heap {
     descs: Vec<LayoutDesc>,
+    /// By descriptor: its cells hold no edges ([`Heap::set_leaf`]), so marking one queues no
+    /// trace.
+    leaf: Vec<bool>,
     /// Indexed by descriptor, then size class.
     classes: Vec<[ClassPages; SIZE_CLASSES.len()]>,
     /// Slots are reused after release, so page indices stay stable.
@@ -1183,6 +1208,9 @@ pub(crate) struct Heap {
     /// word the collector resolves finds its page.
     page_table: PageTable,
     larges: BTreeMap<usize, LargeObj>,
+    /// The large cells allocated since the last collection ([`LargeObj::young`]), by start: a
+    /// minor collection sweeps these and leaves the old ones, as it leaves the old pages.
+    young_larges: Vec<usize>,
     /// Address span of all large objects: cheap rejection of stack words.
     large_span: (usize, usize),
     /// Shared with NoGcScope/BorrowScope guards so a guard can be alive
@@ -1268,6 +1296,7 @@ impl Heap {
         crate::gc_test::scrub_stack_at_thread_exit();
         Self {
             descs: Vec::new(),
+            leaf: Vec::new(),
             classes: Vec::new(),
             pages: Vec::new(),
             free_page_slots: Vec::new(),
@@ -1275,6 +1304,7 @@ impl Heap {
             page_source: page_source::PageSource::new(),
             page_table: PageTable::new(),
             larges: BTreeMap::new(),
+            young_larges: Vec::new(),
             large_span: (usize::MAX, 0),
             control: Rc::default(),
             allocated_bytes: 0,
@@ -1312,9 +1342,16 @@ impl Heap {
     pub(crate) fn register_desc(&mut self, desc: LayoutDesc) -> DescId {
         let id = DescId(self.descs.len() as u32);
         self.descs.push(desc);
+        self.leaf.push(false);
         self.classes
             .push(std::array::from_fn(|_| ClassPages::default()));
         id
+    }
+
+    /// Declare that `desc`'s cells hold no edges (its trace reports none): marking one sets its
+    /// mark and queues no trace.
+    pub(crate) fn set_leaf(&mut self, desc: DescId) {
+        self.leaf[desc.0 as usize] = true;
     }
 
     /// Record why each cell is marked, for [`Heap::retention_path`] (diagnostics: costs a map
@@ -1634,6 +1671,20 @@ impl Heap {
     /// this sweep untraced. Code running in that window must not store a
     /// reference to an unmarked cell into a new or surviving one.
     pub(crate) fn alloc(&mut self, desc: DescId, size: usize) -> *mut u8 {
+        self.alloc_cell(desc, size, true)
+            .expect("GC large allocation failed")
+    }
+
+    /// [`Heap::alloc`] without zeroing the cell, or `None` when the memory of a large cell
+    /// cannot be had: for a leaf kind ([`Heap::set_leaf`]) whose owner writes every byte it later
+    /// reads, and which neither the collector nor anyone else reads before then.
+    pub(crate) fn try_alloc_uninit(&mut self, desc: DescId, size: usize) -> Option<*mut u8> {
+        debug_assert!(self.leaf[desc.0 as usize], "uninitialized cells are leaves");
+        self.alloc_cell(desc, size, false)
+    }
+
+    #[inline]
+    fn alloc_cell(&mut self, desc: DescId, size: usize, zero: bool) -> Option<*mut u8> {
         debug_assert!(
             (desc.0 as usize) < self.descs.len(),
             "unregistered GC descriptor"
@@ -1645,8 +1696,8 @@ impl Heap {
             self.maybe_collect_for_alloc(cost);
         }
         let ptr = match class {
-            Some(class) => self.alloc_small(desc, class),
-            None => self.alloc_large(desc, size),
+            Some(class) => self.alloc_small(desc, class, zero),
+            None => self.alloc_large(desc, size, zero)?,
         };
         if collecting {
             let cell = self
@@ -1669,21 +1720,25 @@ impl Heap {
         if self.allocated_bytes > self.due_check_bytes {
             self.refresh_due();
         }
-        ptr
+        Some(ptr)
     }
 
     fn maybe_collect_for_alloc(&mut self, upcoming: usize) {
+        if !self.collect_on_alloc {
+            // The embedder collects at its own safepoints (the engine's heaps).
+            return;
+        }
         // Stress collects *before* an allocation: collecting after handing
         // out the cell would free it before the caller can root it.
         let due = self.control.pending_collect.get()
             || self.bytes_due(upcoming)
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every);
-        if due && self.collect_on_alloc {
+        if due {
             self.collect_kind(self.due_kind());
         }
     }
 
-    fn alloc_small(&mut self, desc: DescId, class: usize) -> *mut u8 {
+    fn alloc_small(&mut self, desc: DescId, class: usize, zero: bool) -> *mut u8 {
         loop {
             let pages = &mut self.classes[desc.0 as usize][class];
             if pages.current.is_none() {
@@ -1693,7 +1748,7 @@ impl Heap {
                 break;
             };
             if let Some(page) = self.pages[index as usize].as_mut() {
-                if let Some(ptr) = page.take_cell() {
+                if let Some(ptr) = page.take_cell(zero) {
                     // The page holds a young cell now: the next minor collection sweeps it.
                     if !page.young {
                         page.young = true;
@@ -1709,7 +1764,7 @@ impl Heap {
         self.classes[desc.0 as usize][class].current = Some(index);
         self.pages[index as usize]
             .as_mut()
-            .and_then(PageMeta::take_cell)
+            .and_then(|page| page.take_cell(zero))
             .expect("fresh page has free cells")
     }
 
@@ -1769,27 +1824,39 @@ impl Heap {
         index
     }
 
-    fn alloc_large(&mut self, desc: DescId, size: usize) -> *mut u8 {
+    /// A large cell of `size` bytes, or `None` when its memory cannot be had.
+    fn alloc_large(&mut self, desc: DescId, size: usize, zero: bool) -> Option<*mut u8> {
+        let layout = Layout::from_size_align(size, 16).ok()?;
         // SAFETY: size > 4 KiB; null is checked below.
-        let ptr = unsafe { alloc_zeroed(large_layout(size)) };
-        assert!(!ptr.is_null(), "GC large allocation failed");
+        let ptr = unsafe {
+            if zero {
+                alloc_zeroed(layout)
+            } else {
+                std::alloc::alloc(layout)
+            }
+        };
+        if ptr.is_null() {
+            return None;
+        }
         let start = ptr as usize;
         self.larges.insert(
             start,
             LargeObj {
                 size,
                 desc,
+                young: true,
                 marked: false,
                 waiters: false,
                 zombie: false,
                 pinned: false,
             },
         );
+        self.young_larges.push(start);
         self.large_span = (
             self.large_span.0.min(start),
             self.large_span.1.max(start + size),
         );
-        ptr
+        Some(ptr)
     }
 
     /// Resolve a candidate word (raw pointer or tagged word, interior
@@ -1922,11 +1989,13 @@ impl Heap {
                     parents.insert(cell.start, m.source);
                 }
                 self.stats.cells_marked += 1;
-                m.worklist.push(TraceWork {
-                    cell: cell.start,
-                    desc: cell.desc,
-                    purpose: TracePurpose::Full,
-                });
+                if !self.leaf[cell.desc.0 as usize] {
+                    m.worklist.push(TraceWork {
+                        cell: cell.start,
+                        desc: cell.desc,
+                        purpose: TracePurpose::Full,
+                    });
+                }
                 if has_waiters {
                     if let Some(edges) = m.waiting.remove(&(cell.start >> 4)) {
                         m.ready.extend(edges);
@@ -2045,7 +2114,8 @@ impl Heap {
     /// Pin the allocated cell that starts at `addr`, if one does, for this collection's sweep
     /// (see [`Heap::finish_collection`]). A minor collection's sweep leaves the pages that
     /// received no cell since the last collection alone, and their cells with them (a dead one
-    /// there is a zombie already), so it records no pin there: none would be cleared.
+    /// there is a zombie already), and the old large cells likewise, so it records no pin
+    /// there: none would be cleared.
     fn record_pin(&mut self, addr: usize) {
         let Some(cell) = self.locate(addr as u64).filter(|cell| cell.start == addr) else {
             return;
@@ -2061,10 +2131,13 @@ impl Heap {
                 }
             }
             Loc::Large => {
-                self.larges
+                let large = self
+                    .larges
                     .get_mut(&addr)
-                    .expect("a located large cell is allocated")
-                    .pinned = true;
+                    .expect("a located large cell is allocated");
+                if large.young || !minor {
+                    large.pinned = true;
+                }
             }
         }
     }
@@ -2746,8 +2819,25 @@ impl Heap {
     /// cells pinned for weak handles (see `PageMeta::pins`) stay allocated as zombies. The marks
     /// stay set: until the next collection starts they tell old cells from young ones (see
     /// `PageMeta::marks`). Returns the bytes freed.
+    ///
+    /// Every finalizer runs before any dead cell is poisoned, linked or released: a finalizer
+    /// may read leaf cells that die with its cell, such as the storage blocks of an object's
+    /// payloads (`gc_storage`), whatever order the pages are swept in.
     fn sweep(&mut self, kind: CollectionKind) -> usize {
         let young = std::mem::take(&mut self.young_pages);
+        match kind {
+            CollectionKind::Minor => {
+                for &index in &young {
+                    self.finalize_page(index as usize);
+                }
+            }
+            CollectionKind::Major => {
+                for index in 0..self.pages.len() {
+                    self.finalize_page(index);
+                }
+            }
+        }
+        self.finalize_larges(kind);
         let mut freed = 0usize;
         let mut swept_pages = 0usize;
         let mut sweep = |heap: &mut Self, index: usize| {
@@ -2810,10 +2900,11 @@ impl Heap {
         self.young_pages = young;
         self.young_pages.clear();
         let mut swept = 0u64;
-        let descs = &self.descs;
         let live_count = self.live_count;
         let mut counted_dead = 0i64;
-        self.larges.retain(|&start, large| {
+        // Sweep one large cell; false once its memory is freed.
+        let mut sweep_large = |start: usize, large: &mut LargeObj| -> bool {
+            large.young = false;
             let pinned = std::mem::take(&mut large.pinned);
             if large.marked {
                 large.waiters = false;
@@ -2821,12 +2912,10 @@ impl Heap {
             }
             large.waiters = false;
             if !large.zombie {
+                // Finalized already (`Heap::finalize_larges`).
                 swept += 1;
                 if live_count.is_some_and(|(desc, _)| desc == large.desc) {
                     counted_dead += 1;
-                }
-                if let Some(finalize) = descs[large.desc.0 as usize].finalize {
-                    finalize(start as *mut u8);
                 }
                 #[cfg(debug_assertions)]
                 // SAFETY: the dead object spans `size` bytes from `start`.
@@ -2842,7 +2931,28 @@ impl Heap {
             // SAFETY: allocated in alloc_large with this layout.
             unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
             false
-        });
+        };
+        let young_larges = std::mem::take(&mut self.young_larges);
+        match kind {
+            // The old large cells stay marked, live or not, until a major collection, as the
+            // old pages' cells do; a dead one there is a zombie already.
+            CollectionKind::Minor => {
+                for &start in &young_larges {
+                    let Some(large) = self.larges.get_mut(&start) else {
+                        continue;
+                    };
+                    if !sweep_large(start, large) {
+                        self.larges.remove(&start);
+                    }
+                }
+            }
+            CollectionKind::Major => self
+                .larges
+                .retain(|&start, large| sweep_large(start, large)),
+        }
+        // The list's buffer is kept for the next cycle's large cells.
+        self.young_larges = young_larges;
+        self.young_larges.clear();
         if let Some((_, count)) = live_count {
             // SAFETY: `attach_live_count`'s contract.
             let count = unsafe { count.as_ref() };
@@ -2859,13 +2969,60 @@ impl Heap {
         freed
     }
 
+    /// Run the finalizer of every newly dead cell of the page in slot `index`: the unmarked
+    /// allocated cells that are not zombies (finalized before). The sweep's first pass; nothing
+    /// is freed yet (see [`Heap::sweep`]).
+    fn finalize_page(&self, index: usize) {
+        let Some(page) = self.pages[index].as_ref() else {
+            return;
+        };
+        let Some(finalize) = self.descs[page.desc.0 as usize].finalize else {
+            return;
+        };
+        for word in 0..page.next_unused.div_ceil(64) {
+            let used = (page.next_unused - word * 64).min(64);
+            let mut candidates = page.allocated[word] & !page.marks[word] & !page.zombies[word];
+            candidates &= u64::MAX >> (64 - used);
+            while candidates != 0 {
+                let i = word * 64 + candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                finalize(page.cell_ptr(i) as *mut u8);
+            }
+        }
+    }
+
+    /// The first pass's large cells: finalize the newly dead ones among those the collection of
+    /// `kind` sweeps (a minor collection's young ones, or all).
+    fn finalize_larges(&self, kind: CollectionKind) {
+        let finalize = |start: usize, large: &LargeObj| {
+            if !large.marked && !large.zombie {
+                if let Some(finalize) = self.descs[large.desc.0 as usize].finalize {
+                    finalize(start as *mut u8);
+                }
+            }
+        };
+        match kind {
+            CollectionKind::Minor => {
+                for start in &self.young_larges {
+                    if let Some(large) = self.larges.get(start) {
+                        finalize(*start, large);
+                    }
+                }
+            }
+            CollectionKind::Major => {
+                for (&start, large) in &self.larges {
+                    finalize(start, large);
+                }
+            }
+        }
+    }
+
     /// Sweep the page in slot `index` (see [`Heap::sweep`]), releasing it if no cell is left.
     /// Returns the bytes freed.
     fn sweep_page(&mut self, index: usize) -> usize {
         let Some(page) = self.pages[index].as_mut() else {
             return 0;
         };
-        let finalize = self.descs[page.desc.0 as usize].finalize;
         let mut freed = 0usize;
         let mut swept = 0u64;
         debug_assert!(page.next_unused <= page.cells);
@@ -2880,10 +3037,8 @@ impl Heap {
                 candidates &= candidates - 1;
                 let cell = page.cell_ptr(i) as *mut u64;
                 if !bit(&page.zombies, i) {
+                    // Finalized already (`Heap::finalize_page`).
                     swept += 1;
-                    if let Some(finalize) = finalize {
-                        finalize(cell as *mut u8);
-                    }
                     #[cfg(debug_assertions)]
                     for w in 1..page.cell_size / 8 {
                         // SAFETY: the dead cell lies inside this page.
@@ -3022,15 +3177,20 @@ impl Heap {
                 }
             }
         }
-        for (start, large) in std::mem::take(&mut self.larges) {
+        let larges = std::mem::take(&mut self.larges);
+        // Every cell is finalized before any is freed (see `Heap::sweep`).
+        for (&start, large) in &larges {
             if let Some(finalize) = self.descs[large.desc.0 as usize].finalize {
                 if !large.zombie {
                     finalize(start as *mut u8);
                 }
             }
+        }
+        for (start, large) in larges {
             // SAFETY: allocated in alloc_large with this layout.
             unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
         }
+        self.young_larges.clear();
         let spare = std::mem::take(&mut self.spare_pages);
         // SAFETY: the live pages and the spare ones are all the pages the source gave and has not
         // taken back; their cells are finalized, and nothing uses them any more.
@@ -5417,10 +5577,11 @@ mod tests {
         // the minor collection; the following major collection drops their count to zero.
         fx.collect_minor();
         assert_eq!(count.get(), 3);
-        // A zombie on a page with no new allocations waits for a major sweep; large cells
-        // are swept every time. Neither kind is included in the published live count.
+        // A zombie on a page with no new allocations waits for a major sweep, and so does an
+        // old large zombie: a minor collection sweeps only the large cells allocated since the
+        // last one. Neither kind is included in the published live count.
         assert!(fx.heap.is_allocated_word(young_small as u64));
-        assert!(!fx.heap.is_allocated_word(young_large as u64));
+        assert!(fx.heap.is_allocated_word(young_large as u64));
         assert!(fx.heap.is_allocated_word(black as u64));
         fx.collect();
         assert_eq!(count.get(), 0);

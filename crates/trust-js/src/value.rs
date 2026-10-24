@@ -1727,10 +1727,13 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     // DenseStorage is deliberately a transparent nullable pointer to boxed buffer headers. The
     // JIT first follows this pointer and then uses the probed Vec offsets above. Verify the niche
     // than relying on it silently if a future compiler changes the representation.
-    let thin_some = DenseStorage(Some(Box::new(DenseBuffers::default())));
+    let thin_some = DenseStorage(
+        Some(crate::gc_storage::StorageBox::new(DenseBuffers::default())),
+        None,
+    );
     let thin_word = unsafe { *(&thin_some as *const DenseStorage as *const usize) };
     let thin_expected = thin_some.0.as_deref().unwrap() as *const DenseBuffers as usize;
-    let thin_none = DenseStorage(None);
+    let thin_none = DenseStorage(None, None);
     let thin_none_word = unsafe { *(&thin_none as *const DenseStorage as *const usize) };
     let thin_vec_ok = thin_word == thin_expected && thin_none_word == 0;
 
@@ -1751,7 +1754,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && pv.capacity() == 3
         && mv.len() == 1
         && mv.capacity() == 3;
-    let packed_some: Option<PackedProperties> = Some(Box::new(pv.into()));
+    let packed_some: Option<PackedProperties> = Some(PackedProperties::new(pv.into()));
     let packed_word = unsafe { *(&packed_some as *const Option<PackedProperties> as *const usize) };
     let packed_expected = packed_some
         .as_deref()
@@ -2571,8 +2574,9 @@ pub(crate) struct Object {
 
 impl Object {
     /// Whether finalization has any owned allocation to release. Exhaustive field and variant
-    /// matches make new storage participate in this decision. Property words and cell handles
-    /// have no owning drops, but inline properties can own accessor boxes.
+    /// matches make new storage participate in this decision. Property words, accessor pairs,
+    /// cell handles and storage blocks have no owning drops (`gc_storage`): an ordinary object
+    /// or Array whose sidecar holds no hash index, Symbol keys or internal slots needs none.
     fn owns_payload(&self) -> bool {
         let Self {
             proto: _,
@@ -2596,14 +2600,14 @@ impl Object {
             proto_slot: _,
             len_slot: _,
         } = props;
-        let NamedEntries { fields, layout: _ } = entries;
-        fields.spilled()
-            || elems.0.is_some()
+        // Named properties own nothing outside the heap: their spill is a storage block and
+        // an accessor pair a cell (`gc_storage`).
+        let NamedEntries {
+            fields: _,
+            layout: _,
+        } = entries;
+        elems.owns_payload()
             || native_typed_array.is_some()
-            || fields.iter().any(|property| {
-                let Property { packed: _, meta } = property;
-                meta & !PROP_FLAG_MASK != 0
-            })
             || match call {
                 Callable::None | Callable::Native(_) | Callable::User(_) => false,
                 #[cfg(feature = "embed")]
@@ -2640,20 +2644,20 @@ impl Object {
     /// ECMAScript properties. Author strings, reflection, proxies and integrity levels cannot
     /// address this map (ECMA-262 6.1.7.2). Ordinary objects retain their compact body layout.
     pub(crate) fn internal_slots(&self) -> &InternalSlots {
-        &self.props.elems.internal_slots
+        self.props.elems.internal_slots()
     }
 
     pub(crate) fn internal_slots_mut(&mut self) -> &mut InternalSlots {
-        &mut self.props.elems.buffers_mut().internal_slots
+        &mut self.props.elems.extras_mut().internal_slots
     }
 
     fn take_internal_slots(&mut self) -> InternalSlots {
         self.props
             .elems
-            .0
+            .1
             .as_deref_mut()
-            .map_or_else(InternalSlots::default, |buffers| {
-                std::mem::take(&mut buffers.internal_slots)
+            .map_or_else(InternalSlots::default, |extras| {
+                std::mem::take(&mut extras.internal_slots)
             })
     }
 
@@ -2667,10 +2671,10 @@ impl Object {
             .proto_flag
             .set(self.props.proto_flag.get() || properties.proto_flag.get());
         let slots = self.take_internal_slots();
-        if let Some(buffers) = properties.elems.0.as_deref_mut() {
-            buffers.internal_slots = slots;
+        if let Some(extras) = properties.elems.1.as_deref_mut() {
+            extras.internal_slots = slots;
         } else if slots.0.is_some() {
-            properties.elems.buffers_mut().internal_slots = slots;
+            properties.elems.extras_mut().internal_slots = slots;
         }
         properties.elems.force_packed_full();
         self.props = properties;
@@ -2741,8 +2745,25 @@ impl Object {
 /// A lazy internal-slot map inside the existing property-storage sidecar. Built-in instances
 /// keep their state without adding property keys, descriptors or shape transitions; ordinary
 /// objects allocate neither a separate map nor an extra pointer in their object body.
-#[derive(Clone, Default)]
+///
+/// Its storage is charged to the heap's external ledger ([`charge_external`]) as it grows, and
+/// released when it drops.
+#[derive(Default)]
 pub(crate) struct InternalSlots(Option<Box<Vec<(Rc<str>, Property)>>>);
+
+impl Clone for InternalSlots {
+    fn clone(&self) -> Self {
+        let copy = Self(self.0.clone());
+        charge_external(copy.retained_storage_bytes());
+        copy
+    }
+}
+
+impl Drop for InternalSlots {
+    fn drop(&mut self) {
+        release_external(self.retained_storage_bytes());
+    }
+}
 
 impl InternalSlots {
     pub(crate) fn get(&self, key: &str) -> Option<&Property> {
@@ -2783,11 +2804,16 @@ impl InternalSlots {
 
     pub(crate) fn insert(&mut self, key: impl IntoPropKey, value: Property) {
         let key = key.into_prop_key();
+        let before = self.retained_storage_bytes();
         let entries = self.0.get_or_insert_with(|| Box::new(Vec::new()));
         if let Some((_, previous)) = entries.iter_mut().find(|(name, _)| **name == *key) {
             *previous = value;
         } else {
             entries.push((key, value));
+        }
+        let after = self.retained_storage_bytes();
+        if after > before {
+            charge_external(after - before);
         }
     }
 
@@ -2832,6 +2858,10 @@ pub(crate) struct GcState {
     /// run under (see [`charge_external`]).
     ledger: Rc<crate::gc_core::Control>,
     pub(crate) object_desc: crate::gc_core::DescId,
+    /// Storage blocks (`gc_storage`).
+    pub(crate) storage_desc: crate::gc_core::DescId,
+    /// Accessor-pair cells (each an [`Accessors`]).
+    pub(crate) accessor_desc: crate::gc_core::DescId,
     pub(crate) scope_desc: crate::gc_core::DescId,
     /// BigInt payload cells.
     pub(crate) bigint_desc: crate::gc_core::DescId,
@@ -2943,6 +2973,8 @@ pub(crate) fn debug_assert_due_word(heap: &GcHeap) {
 
 /// The descriptors of a [`GcState`]'s cell kinds.
 struct CellDescs {
+    storage: crate::gc_core::DescId,
+    accessor: crate::gc_core::DescId,
     object: crate::gc_core::DescId,
     scope: crate::gc_core::DescId,
     bigint: crate::gc_core::DescId,
@@ -2958,6 +2990,17 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let mut core = crate::gc_core::Heap::new();
     core.set_collect_on_alloc(false);
     crate::interpreter::gc_collect::configure_heap(&mut core);
+    // Storage blocks have no edges of their own: their owners trace what they hold.
+    let storage = core.register_desc(crate::gc_storage::layout());
+    core.set_leaf(storage);
+    let accessor = core.register_desc(crate::gc_core::LayoutDesc {
+        name: "accessor pair",
+        trace: trace_accessor_cell,
+        mark_trace: None,
+        finalize: None,
+        // A pair is immutable: a property that changes one gets a new pair.
+        carded: false,
+    });
     // S6 step 10b: objects, environments and deferred prototypes gain references after their
     // initialization, through writes the barrier records in their pages' card tables
     // (`gc_core::card_mark`); the other kinds' edges are set when their cells are made.
@@ -3004,6 +3047,8 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     (
         core,
         CellDescs {
+            storage,
+            accessor,
             object,
             scope,
             bigint,
@@ -3171,6 +3216,11 @@ pub(crate) fn release_external(bytes: usize) {
 pub(crate) struct ExternalCharge(usize);
 
 impl ExternalCharge {
+    /// Nothing charged.
+    pub(crate) const fn new() -> Self {
+        Self(0)
+    }
+
     /// Charge or release the difference between `bytes` and what is charged now.
     #[inline]
     pub(crate) fn settle(&mut self, bytes: usize) {
@@ -3196,6 +3246,17 @@ impl Drop for ExternalCharge {
     fn drop(&mut self) {
         release_external(self.0);
     }
+}
+
+/// A storage block of `bytes` bytes in the active Agent's heap (see `gc_storage`), or `None`
+/// when the memory of a large one cannot be had.
+#[inline]
+pub(crate) fn alloc_storage_block(bytes: usize) -> Option<*mut u8> {
+    with_active_gc_heap(|heap| {
+        heap.core
+            .borrow_mut()
+            .try_alloc_uninit(heap.storage_desc, bytes)
+    })
 }
 
 /// A fresh payload cell of `size` bytes in the active Agent's heap (see `GcBox::new`).
@@ -3296,6 +3357,9 @@ impl Object {
         if let Some(proto) = proto {
             sink.object(proto);
         }
+        // The storage blocks the payloads live in, in every trace: they live as long as an owner
+        // reports them (`gc_storage`).
+        props.trace_storage(sink);
         if let Some(purpose) = purpose {
             if let Some(packed) = props.elems.packed.as_deref() {
                 packed.trace_elements(purpose, sink);
@@ -3366,6 +3430,7 @@ impl Object {
 
 impl crate::gc_trace::GcTrace for Props {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.trace_storage(sink);
         crate::gc_trace::GcTrace::trace_gc(&self.entries.layout, sink);
         for property in self.values() {
             crate::gc_trace::GcTrace::trace_gc(property, sink);
@@ -3375,9 +3440,19 @@ impl crate::gc_trace::GcTrace for Props {
 }
 
 impl Props {
+    /// Report the storage blocks this map's payloads live in (`gc_storage`): the named
+    /// properties' spill, the element sidecar and the blocks it holds. Every trace of the map's
+    /// owner reports them, since nothing else keeps them alive.
+    pub(crate) fn trace_storage(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        if let Some(spill) = self.entries.fields.spill_ptr() {
+            crate::gc_storage::trace_block(spill, sink);
+        }
+        self.elems.trace_storage(sink);
+    }
+
     /// The Symbols of Symbol-valued keys, which the encoded keys only name by id.
     pub(crate) fn trace_symbol_keys(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        if let Some(symbols) = &self.elems.symbols {
+        if let Some(symbols) = self.elems.symbols() {
             for symbol in symbols.values() {
                 sink.word(symbol_identity(symbol) as u64);
             }
@@ -3401,6 +3476,10 @@ impl crate::gc_trace::GcTrace for PropertyKey {
 impl crate::gc_trace::GcTrace for Property {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         self.packed.trace_gc_edges(sink);
+        // The pair's cell, and its functions, which its trace reports again.
+        if let Some(cell) = self.accessor_cell_word() {
+            sink.word(cell);
+        }
         if let Some(getter) = self.getter() {
             sink.value(getter);
         }
@@ -4043,6 +4122,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         core: RefCell::new(core),
         ledger,
         object_desc: descs.object,
+        storage_desc: descs.storage,
+        accessor_desc: descs.accessor,
         scope_desc: descs.scope,
         bigint_desc: descs.bigint,
         symbol_desc: descs.symbol,
@@ -4628,21 +4709,60 @@ pub enum TaIndex {
     Ordinary,
 }
 
-/// A property descriptor. A data property uses `value`/`writable`; an accessor uses the boxed
+/// A property descriptor. A data property uses `value`/`writable`; an accessor uses the
 /// getter/setter pair. The low bits of `meta` hold the four descriptor flags; its aligned upper
 /// bits point to an accessor pair only for accessor properties. Thus ordinary properties are 16
 /// bytes and allocate no metadata, while still keeping the flags directly readable by the JIT.
+///
+/// P1 S6: a property owns nothing outside the heap. Its accessor pair is an immutable cell
+/// ([`Accessors`]) that copies of the property share and a change replaces, so property storage
+/// needs no destructor and can live in storage blocks (`gc_storage`).
 pub struct Property {
     packed: PropWord,
     meta: usize,
 }
 
-/// The boxed getter/setter pair of an accessor property.
+/// The getter/setter pair of an accessor property: an immutable payload cell (16-byte aligned,
+/// as every cell is, which leaves `meta`'s flag bits free). Its edges are its two functions.
 #[repr(align(16))]
 #[derive(Clone, Default)]
 pub(crate) struct Accessors {
     pub get: Option<Value>,
     pub set: Option<Value>,
+}
+
+impl crate::gc_box::Payload for Accessors {
+    fn desc(heap: &GcState) -> crate::gc_core::DescId {
+        heap.accessor_desc
+    }
+}
+
+impl crate::gc_trace::GcTrace for Accessors {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Accessors { get, set } = self;
+        if let Some(get) = get {
+            sink.value(get);
+        }
+        if let Some(set) = set {
+            sink.value(set);
+        }
+    }
+}
+
+/// The edges of an accessor-pair cell: its getter and setter.
+fn trace_accessor_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
+    use crate::gc_trace::GcTrace;
+    // SAFETY: accessor cells are initialized by `gc_box::new` before any collection and never
+    // change afterwards.
+    unsafe { &*(cell as *const Accessors) }.trace_gc(&mut crate::gc_trace::VisitSink(visit));
+}
+
+/// A new accessor-pair cell in the active heap, as `meta`'s pointer bits.
+fn accessor_cell(get: Option<Value>, set: Option<Value>) -> usize {
+    let pair = crate::gc_box::new(Accessors { get, set });
+    let ptr = crate::gc_box::GcBox::as_ptr(&pair) as usize;
+    debug_assert_eq!(ptr & PROP_FLAG_MASK, 0);
+    ptr
 }
 
 /// Descriptor class as encoded in shape transitions (Pilot C): the only descriptor facts
@@ -4664,28 +4784,12 @@ const PROP_FLAG_MASK: usize = 15;
 
 impl Clone for Property {
     fn clone(&self) -> Self {
-        let flags = self.meta & PROP_FLAG_MASK;
-        let ptr = self.meta & !PROP_FLAG_MASK;
-        let meta = if ptr == 0 {
-            flags
-        } else {
-            let acc = unsafe { &*(ptr as *const Accessors) };
-            Box::into_raw(Box::new(acc.clone())) as usize | flags
-        };
         Property {
             // A snapshot can be stored under another key or on another object (a descriptor
             // define, a property copy), where a deferred prototype must not travel unmaterialized.
             packed: PropWord::from_value(self.packed.materialize()),
-            meta,
-        }
-    }
-}
-
-impl Drop for Property {
-    fn drop(&mut self) {
-        let ptr = self.meta & !PROP_FLAG_MASK;
-        if ptr != 0 {
-            unsafe { drop(Box::from_raw(ptr as *mut Accessors)) };
+            // The accessor pair is immutable: the copy shares its cell.
+            meta: self.meta,
         }
     }
 }
@@ -4739,22 +4843,22 @@ impl Property {
         let flags = PROP_ACCESSOR
             | ((enumerable as usize) * PROP_ENUMERABLE)
             | ((configurable as usize) * PROP_CONFIGURABLE);
-        let ptr = Box::into_raw(Box::new(Accessors { get, set })) as usize;
-        debug_assert_eq!(ptr & PROP_FLAG_MASK, 0);
         Property {
             packed: PropWord::from_value(Value::Undefined),
-            meta: ptr | flags,
+            meta: accessor_cell(get, set) | flags,
         }
     }
     #[inline]
     fn accessors(&self) -> Option<&Accessors> {
         let ptr = self.meta & !PROP_FLAG_MASK;
+        // SAFETY: a property that names a pair keeps its cell alive (its holder traces it).
         (ptr != 0).then(|| unsafe { &*(ptr as *const Accessors) })
     }
+    /// The accessor pair's cell, as its holder reports it.
     #[inline]
-    fn accessors_mut(&mut self) -> Option<&mut Accessors> {
+    fn accessor_cell_word(&self) -> Option<u64> {
         let ptr = self.meta & !PROP_FLAG_MASK;
-        (ptr != 0).then(|| unsafe { &mut *(ptr as *mut Accessors) })
+        (ptr != 0).then_some(ptr as u64)
     }
     #[inline]
     pub(crate) fn accessor(&self) -> bool {
@@ -4884,37 +4988,27 @@ impl Property {
     pub(crate) fn setter(&self) -> Option<&Value> {
         self.accessors().and_then(|a| a.set.as_ref())
     }
+    /// Replace the getter. The pair is immutable, so this makes a new one (with the setter), or
+    /// none when there is no pair and no getter.
     pub(crate) fn set_getter(&mut self, g: Option<Value>) {
-        if let Some(a) = self.accessors_mut() {
-            a.get = g;
-        } else if let Some(g) = g {
+        if g.is_some() || self.accessors().is_some() {
+            let set = self.accessors().and_then(|a| a.set);
             let flags = self.meta & PROP_FLAG_MASK;
-            let ptr = Box::into_raw(Box::new(Accessors {
-                get: Some(g),
-                set: None,
-            })) as usize;
-            self.meta = ptr | flags;
+            self.meta = accessor_cell(g, set) | flags;
         }
     }
+    /// Replace the setter, as [`Property::set_getter`] does the getter.
     pub(crate) fn set_setter(&mut self, s: Option<Value>) {
-        if let Some(a) = self.accessors_mut() {
-            a.set = s;
-        } else if let Some(s) = s {
+        if s.is_some() || self.accessors().is_some() {
+            let get = self.accessors().and_then(|a| a.get);
             let flags = self.meta & PROP_FLAG_MASK;
-            let ptr = Box::into_raw(Box::new(Accessors {
-                get: None,
-                set: Some(s),
-            })) as usize;
-            self.meta = ptr | flags;
+            self.meta = accessor_cell(get, s) | flags;
         }
     }
-    /// Drop the accessor pair (used when a define converts an accessor back to a data property).
+    /// Forget the accessor pair (used when a define converts an accessor back to a data
+    /// property); the collector frees its cell.
     pub(crate) fn clear_accessors(&mut self) {
-        let ptr = self.meta & !PROP_FLAG_MASK;
-        if ptr != 0 {
-            unsafe { drop(Box::from_raw(ptr as *mut Accessors)) };
-            self.meta &= PROP_FLAG_MASK;
-        }
+        self.meta &= PROP_FLAG_MASK;
     }
     /// A default plain data property: writable, enumerable, configurable.
     pub(crate) fn plain(value: Value) -> Property {
@@ -5015,40 +5109,84 @@ impl Clone for InlinePacked {
     }
 }
 
-impl Drop for InlinePacked {
-    fn drop(&mut self) {
-        for index in 0..self.len as usize {
-            unsafe { self.slots[index].assume_init_drop() };
-        }
-    }
-}
+// No Drop: properties own nothing outside the heap, so the slots need no destructor and the
+// sidecar block that holds them is plain data (see `DenseBuffers`).
+const _: () = assert!(!std::mem::needs_drop::<Property>());
 
-#[derive(Default)]
+/// The element sidecar of a property map, in a storage block (`gc_storage`), which is what the
+/// JIT reads. Plain data only: dropping the map never reads the block, which may have gone
+/// with its heap (a template can outlive its Agent).
+#[derive(Clone, Default)]
 struct DenseBuffers {
-    index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>,
     packed: Option<PackedProperties>,
     inline_packed: InlinePacked,
-    elems: Vec<u32>,
+    elems: DenseDeque<u32>,
     mirror: DenseDeque<f64>,
+}
+
+/// What a property map keeps in the Rust heap beside its sidecar, each part only once needed:
+/// a hash index, the Symbols of its Symbol keys and internal slots. The index's and the Symbol
+/// map's storage is charged to the heap's external ledger ([`DenseExtras::settle_charge`]),
+/// the internal slots' by themselves. An object whose map has extras needs its finalizer.
+#[derive(Default)]
+struct DenseExtras {
+    charge: ExternalCharge,
+    index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>,
     /// Strong ownership for Symbol-valued property keys. String keys stay inline in `entries`;
     /// this cold sidecar exists only for objects that actually acquire a Symbol key.
     symbols: Option<Box<crate::fasthash::FastMap<u64, SymbolRef>>>,
     internal_slots: InternalSlots,
 }
 
-impl Clone for DenseBuffers {
+impl Clone for DenseExtras {
     fn clone(&self) -> Self {
-        Self {
+        let mut copy = Self {
+            charge: ExternalCharge::new(),
             index: self.index.clone(),
-            packed: self.packed.clone(),
-            inline_packed: self.inline_packed.clone(),
-            elems: self.elems.clone(),
-            mirror: self.mirror.clone(),
             symbols: self.symbols.clone(),
             // Ordinary property templates and array copies never duplicate private brands or
             // built-in internal state. Receiver transplantation copies slots explicitly.
             internal_slots: InternalSlots::default(),
+        };
+        copy.settle_charge();
+        copy
+    }
+}
+
+impl DenseExtras {
+    /// Bring the external charge to the hash index's and Symbol-key map's current capacity
+    /// (buckets with a control byte each, and the boxes), after either changed.
+    fn settle_charge(&mut self) {
+        fn map_bytes<K, V>(map: &Option<Box<crate::fasthash::FastMap<K, V>>>) -> usize {
+            map.as_ref().map_or(0, |map| {
+                std::mem::size_of_val(&**map) + map.capacity() * (std::mem::size_of::<(K, V)>() + 1)
+            })
         }
+        let bytes = map_bytes(&self.index) + map_bytes(&self.symbols);
+        self.charge.settle(bytes);
+    }
+}
+
+/// The map's hash index, borrowed for a change: the charge follows its capacity when the
+/// borrow ends ([`DenseExtras::settle_charge`]).
+struct IndexMut<'a>(&'a mut DenseExtras);
+
+impl std::ops::Deref for IndexMut<'_> {
+    type Target = crate::fasthash::FastMap<Rc<str>, usize>;
+    fn deref(&self) -> &Self::Target {
+        self.0.index.as_deref().expect("an index to change")
+    }
+}
+
+impl std::ops::DerefMut for IndexMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.index.as_deref_mut().expect("an index to change")
+    }
+}
+
+impl Drop for IndexMut<'_> {
+    fn drop(&mut self) {
+        self.0.settle_charge();
     }
 }
 
@@ -5056,7 +5194,7 @@ impl Clone for DenseBuffers {
 // extra indirection keeps this optional field pointer-sized instead of adding two words to each
 // allocation; the compact representation is more valuable here than Clippy's generic Vec advice.
 #[allow(clippy::box_collection)]
-type PackedProperties = Box<PackedBuffer>;
+type PackedProperties = crate::gc_storage::StorageBox<PackedBuffer>;
 
 const PACKED_DIRTY_BLOCK: usize = 64;
 const PACKED_TRACE_FULL: usize = usize::MAX;
@@ -5075,7 +5213,7 @@ struct PackedBuffer {
     /// Full until an actual marker reports all obligations successfully. Vec's nonzero-sized
     /// allocation bound makes usize::MAX impossible as a real live length.
     traced_len: Cell<usize>,
-    dirty: RefCell<Vec<u64>>,
+    dirty: RefCell<DenseDeque<u64>>,
 }
 
 impl From<DenseDeque<Property>> for PackedBuffer {
@@ -5083,7 +5221,7 @@ impl From<DenseDeque<Property>> for PackedBuffer {
         Self {
             values,
             traced_len: Cell::new(PACKED_TRACE_FULL),
-            dirty: RefCell::new(Vec::new()),
+            dirty: RefCell::new(DenseDeque::new()),
         }
     }
 }
@@ -5144,12 +5282,12 @@ impl PackedBuffer {
             let fail = PACKED_BITMAP_FAIL_GROWTH.with(Cell::get);
             #[cfg(not(test))]
             let fail = false;
-            if fail || dirty.try_reserve(word + 1 - dirty.len()).is_err() {
+            if fail || dirty.try_reserve_exact(word + 1 - dirty.len()).is_err() {
                 // Remembering is optional: never introduce OOM to an existing-value store.
                 self.traced_len.set(PACKED_TRACE_FULL);
                 return;
             }
-            dirty.resize(word + 1, 0);
+            dirty.resize_with(word + 1, || 0);
         }
         dirty[word] |= 1 << (block % 64);
     }
@@ -5272,18 +5410,26 @@ struct EmptyDenseBuffers(DenseBuffers);
 unsafe impl Sync for EmptyDenseBuffers {}
 
 static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers {
-    index: None,
     packed: None,
     inline_packed: InlinePacked::new(),
-    elems: Vec::new(),
+    elems: DenseDeque::new(),
     mirror: DenseDeque::new(),
-    symbols: None,
-    internal_slots: InternalSlots(None),
 });
 
+struct EmptyInternalSlots(InternalSlots);
+// Never mutated: writers make the map's own extras first (`DenseStorage::extras_mut`).
+unsafe impl Sync for EmptyInternalSlots {}
+
+static EMPTY_INTERNAL_SLOTS: EmptyInternalSlots = EmptyInternalSlots(InternalSlots(None));
+
+/// A property map's element sidecar (its first word, the nullable pointer the JIT follows) and
+/// its Rust-heap extras.
 #[derive(Clone, Default)]
-#[repr(transparent)]
-struct DenseStorage(Option<Box<DenseBuffers>>);
+#[repr(C)]
+struct DenseStorage(
+    Option<crate::gc_storage::StorageBox<DenseBuffers>>,
+    Option<Box<DenseExtras>>,
+);
 
 impl std::ops::Deref for DenseStorage {
     type Target = DenseBuffers;
@@ -5297,6 +5443,73 @@ impl DenseStorage {
     fn buffers_mut(&mut self) -> &mut DenseBuffers {
         self.0.get_or_insert_with(Default::default)
     }
+
+    #[inline]
+    fn extras_mut(&mut self) -> &mut DenseExtras {
+        self.1.get_or_insert_with(Default::default)
+    }
+
+    /// The map's own hash index, when it keeps one (`Props::build_index`).
+    #[inline]
+    fn index(&self) -> Option<&crate::fasthash::FastMap<Rc<str>, usize>> {
+        self.1.as_deref()?.index.as_deref()
+    }
+
+    /// The Symbols of the map's Symbol-valued keys, if it has any.
+    #[inline]
+    fn symbols(&self) -> Option<&crate::fasthash::FastMap<u64, SymbolRef>> {
+        self.1.as_deref()?.symbols.as_deref()
+    }
+
+    /// The map's internal slots (empty while it has none).
+    #[inline]
+    fn internal_slots(&self) -> &InternalSlots {
+        self.1
+            .as_deref()
+            .map_or(&EMPTY_INTERNAL_SLOTS.0, |extras| &extras.internal_slots)
+    }
+
+    /// Report the sidecar's block and the blocks it holds (see [`Props::trace_storage`]).
+    fn trace_storage(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        use crate::gc_storage::{trace_block, StorageBox};
+        let Some(buffers) = &self.0 else {
+            return;
+        };
+        StorageBox::trace(buffers, sink);
+        let DenseBuffers {
+            packed,
+            inline_packed: _, // in the sidecar's block
+            elems,
+            mirror,
+        } = &**buffers;
+        if let Some(packed) = packed {
+            StorageBox::trace(packed, sink);
+            let PackedBuffer {
+                values,
+                traced_len: _,
+                dirty,
+            } = &**packed;
+            if let Some(block) = values.block_ptr() {
+                trace_block(block, sink);
+            }
+            if let Some(block) = dirty.borrow().block_ptr() {
+                trace_block(block, sink);
+            }
+        }
+        for block in [elems.block_ptr(), mirror.block_ptr()]
+            .into_iter()
+            .flatten()
+        {
+            trace_block(block, sink);
+        }
+    }
+
+    /// Whether dropping the storage releases anything outside the heap: the extras (a hash
+    /// index, Symbol keys, internal slots). The sidecar and its buffers are blocks of plain
+    /// data, so without extras an owner that dies needs no finalizer for its map.
+    fn owns_payload(&self) -> bool {
+        self.1.is_some()
+    }
     fn retain_symbol_key(&mut self, key: &str) {
         let Some(id) = encoded_symbol_id(key) else {
             return;
@@ -5304,31 +5517,32 @@ impl DenseStorage {
         let Some(symbol) = active_symbol(id) else {
             return;
         };
-        self.buffers_mut()
+        let extras = self.extras_mut();
+        extras
             .symbols
             .get_or_insert_with(Default::default)
             .insert(id, symbol);
+        extras.settle_charge();
     }
     fn release_symbol_key(&mut self, key: &str) {
         let Some(id) = encoded_symbol_id(key) else {
             return;
         };
-        if let Some(symbols) = self
-            .0
-            .as_deref_mut()
-            .and_then(|buffers| buffers.symbols.as_deref_mut())
-        {
-            symbols.remove(&id);
+        if let Some(extras) = self.1.as_deref_mut() {
+            if let Some(symbols) = extras.symbols.as_deref_mut() {
+                symbols.remove(&id);
+            }
         }
     }
-    fn index_mut(&mut self) -> Option<&mut crate::fasthash::FastMap<Rc<str>, usize>> {
-        self.0.as_deref_mut()?.index.as_deref_mut()
+    fn index_mut(&mut self) -> Option<IndexMut<'_>> {
+        let extras = self.1.as_deref_mut()?;
+        extras.index.is_some().then(|| IndexMut(extras))
     }
     fn packed_mut(&mut self) -> Option<&mut DenseDeque<Property>> {
         let dense = self.0.as_deref_mut()?;
         dense.inline_packed.packed_plain.set(false);
         if dense.packed.is_none() && dense.inline_packed.len != 0 {
-            dense.packed = Some(Box::new(dense.inline_packed.into_vec().into()));
+            dense.packed = Some(PackedProperties::new(dense.inline_packed.into_vec().into()));
         }
         dense.packed.as_deref_mut().map(PackedBuffer::full_mut)
     }
@@ -5390,7 +5604,7 @@ impl DenseStorage {
         } else {
             let mut packed = dense.inline_packed.into_vec();
             packed.push(property);
-            dense.packed = Some(Box::new(packed.into()));
+            dense.packed = Some(PackedProperties::new(packed.into()));
         }
     }
     fn packed_ref(&self) -> Option<&[Property]> {
@@ -5419,9 +5633,12 @@ impl DenseStorage {
     }
     fn set_index(&mut self, index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>) {
         if index.is_some() {
-            self.buffers_mut().index = index;
-        } else if let Some(d) = self.0.as_deref_mut() {
-            d.index = None;
+            let extras = self.extras_mut();
+            extras.index = index;
+            extras.settle_charge();
+        } else if let Some(extras) = self.1.as_deref_mut() {
+            extras.index = None;
+            extras.settle_charge();
         }
     }
     fn set_packed(&mut self, packed: Option<PackedProperties>) {
@@ -5725,7 +5942,8 @@ pub(crate) const INLINE_NAMED_SLOTS: usize = 4;
 
 /// Named-property values in key-layout order: in the cell up to [`INLINE_NAMED_SLOTS`], beyond
 /// that in one heap buffer (see `crate::inline_vec`), a layout the JIT reads.
-type Fields = crate::inline_vec::InlineVec<Property, INLINE_NAMED_SLOTS>;
+type Fields =
+    crate::inline_vec::InlineVec<Property, INLINE_NAMED_SLOTS, crate::gc_storage::GcSpill>;
 
 /// Bytes a map with room for `capacity` named values owns outside its object: none while they
 /// fit the inline slots.
@@ -6622,13 +6840,13 @@ impl Props {
                     bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
                 }
             }
-            if dense.index.is_some() {
+            if self.elems.index().is_some() {
                 bytes = bytes.saturating_add(std::mem::size_of::<
                     crate::fasthash::FastMap<Rc<str>, usize>,
                 >());
                 exact = false;
             }
-            if dense.symbols.is_some() {
+            if self.elems.symbols().is_some() {
                 bytes = bytes.saturating_add(std::mem::size_of::<
                     crate::fasthash::FastMap<u64, SymbolRef>,
                 >());
@@ -6679,7 +6897,10 @@ impl Props {
         let (inline_packed, packed) = if inline {
             (InlinePacked::from_properties(items), None)
         } else {
-            (InlinePacked::default(), Some(Box::new(items.collect())))
+            (
+                InlinePacked::default(),
+                Some(PackedProperties::new(items.collect())),
+            )
         };
         inline_packed.packed_plain.set(all_plain);
         let length_key = fn_key(0);
@@ -6701,15 +6922,15 @@ impl Props {
             elems: if len == 0 {
                 DenseStorage::default()
             } else {
-                DenseStorage(Some(Box::new(DenseBuffers {
-                    index: None,
-                    packed,
-                    inline_packed,
-                    elems: Vec::new(),
-                    mirror: DenseDeque::new(),
-                    symbols: None,
-                    internal_slots: InternalSlots::default(),
-                })))
+                DenseStorage(
+                    Some(crate::gc_storage::StorageBox::new(DenseBuffers {
+                        packed,
+                        inline_packed,
+                        elems: DenseDeque::new(),
+                        mirror: DenseDeque::new(),
+                    })),
+                    None,
+                )
             },
             mirror_flags: if len == 0 {
                 MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES
@@ -6794,8 +7015,9 @@ impl Props {
     pub(crate) fn reserve_dense_exact(&mut self, len: usize, numeric: bool) {
         if (1..=32).contains(&len) || (len != 0 && dense_elements_enabled()) {
             self.entries.reserve_exact(1); // own `length`
-            self.elems
-                .set_packed(Some(Box::new(DenseDeque::with_capacity(len).into())));
+            self.elems.set_packed(Some(PackedProperties::new(
+                DenseDeque::with_capacity(len).into(),
+            )));
             self.mirror_flags = if numeric && dense_elements_enabled() {
                 MIRROR_OK | MIRROR_PACKED | MIRROR_ALL_I32 | MIRROR_NO_HOLES
             } else {
@@ -6832,7 +7054,8 @@ impl Props {
         debug_assert_eq!(self.elems.len(), 0);
         let mut packed = Vec::with_capacity(len);
         packed.resize_with(len, || Property::plain(Value::Empty));
-        self.elems.set_packed(Some(Box::new(packed.into())));
+        self.elems
+            .set_packed(Some(PackedProperties::new(packed.into())));
         // The raw-f64 mirror describes classic `elems` slots, not keyless packed properties.
         self.mirror_flags = 0;
     }
@@ -7333,7 +7556,7 @@ impl Props {
         self.note_structural();
         let slot = self.entries.len();
         let key = index_key(n as usize);
-        if let Some(index) = self.elems.index_mut() {
+        if let Some(mut index) = self.elems.index_mut() {
             index.insert(key.clone(), slot);
         }
         self.reserve_entry();
@@ -7399,7 +7622,7 @@ impl Props {
         self.note_structural();
         let slot = self.entries.len();
         let key = index_key(n);
-        if let Some(index) = self.elems.index_mut() {
+        if let Some(mut index) = self.elems.index_mut() {
             index.insert(key.clone(), slot);
         }
         self.reserve_entry();
@@ -7472,7 +7695,7 @@ impl Props {
         self.note_structural();
         let (_, p) = self.entries.pop().unwrap();
         self.elems.pop();
-        if let Some(index) = self.elems.index_mut() {
+        if let Some(mut index) = self.elems.index_mut() {
             index.remove(&index_key(n as usize));
         }
         if self.mirror_flags & MIRROR_OK != 0 {
@@ -7714,7 +7937,9 @@ impl Props {
             buffers.inline_packed.prepend(items);
         } else {
             if buffers.packed.is_none() {
-                buffers.packed = Some(Box::new(buffers.inline_packed.into_vec().into()));
+                buffers.packed = Some(PackedProperties::new(
+                    buffers.inline_packed.into_vec().into(),
+                ));
             }
             buffers
                 .packed
@@ -7817,13 +8042,9 @@ impl Props {
                 return slot;
             }
         }
-        let found = if self.elems.index.is_none() {
-            self.entries.iter().position(|(k, _)| &**k == key)
-        } else {
-            self.elems
-                .index
-                .as_ref()
-                .and_then(|index| index.get(key).copied())
+        let found = match self.elems.index() {
+            None => self.entries.iter().position(|(k, _)| &**k == key),
+            Some(index) => index.get(key).copied(),
         };
         if let Some(s) = found {
             if key == "length" {
@@ -7857,7 +8078,7 @@ impl Props {
             .is_some_and(|layout| layout.has_index())
         {
             self.elems.set_index(None);
-        } else if self.entries.len() > INDEX_THRESHOLD && self.elems.index.is_none() {
+        } else if self.entries.len() > INDEX_THRESHOLD && self.elems.index().is_none() {
             self.build_index();
         }
     }
@@ -8124,7 +8345,7 @@ impl Props {
         }
         let slot = self.entries.len();
         let key = index_key(slot);
-        if let Some(index) = self.elems.index_mut() {
+        if let Some(mut index) = self.elems.index_mut() {
             index.insert(key.clone(), slot);
         }
         self.reserve_entry();
@@ -8141,8 +8362,10 @@ impl Props {
         self.elems.retain_symbol_key(&key);
         self.note_structural();
         let slot = self.entries.len();
-        if let Some(index) = self.elems.index_mut() {
-            index.insert(key.clone(), slot);
+        if self.elems.index().is_some() {
+            if let Some(mut index) = self.elems.index_mut() {
+                index.insert(key.clone(), slot);
+            }
         } else if self.should_build_index(&key) {
             self.build_index();
             self.elems.index_mut().unwrap().insert(key.clone(), slot);
@@ -8187,7 +8410,7 @@ impl Props {
         debug_assert!(self.entries.predicts(key));
         self.elems.retain_symbol_key(key);
         let slot = self.entries.len();
-        if let Some(index) = self.elems.index_mut() {
+        if let Some(mut index) = self.elems.index_mut() {
             index.insert(key.clone(), slot);
         }
         self.entries.fields.push(prop);
@@ -8262,8 +8485,10 @@ impl Props {
         } else {
             self.note_structural();
             let slot = self.entries.len();
-            if let Some(index) = self.elems.index_mut() {
-                index.insert(key.clone(), slot);
+            if self.elems.index().is_some() {
+                if let Some(mut index) = self.elems.index_mut() {
+                    index.insert(key.clone(), slot);
+                }
             } else if self.should_build_index(&key) {
                 self.build_index();
                 self.elems.index_mut().unwrap().insert(key.clone(), slot);
@@ -8372,7 +8597,7 @@ impl Props {
         }
         self.len_slot.set(SlotMemo::NONE);
         self.proto_slot.set(SlotMemo::NONE);
-        if let Some(index) = self.elems.index_mut() {
+        if let Some(mut index) = self.elems.index_mut() {
             index.remove(key);
             // Every later entry moved down one slot. The index covers every entry, so
             // adjust positions in place instead of rehashing and reinserting each later key:
@@ -8848,7 +9073,7 @@ mod object_accounting_tests {
     }
 
     #[test]
-    fn object_payload_finalization_keeps_layouts_spills_sidecars_accessors_and_natives() {
+    fn object_payload_finalization_runs_for_rust_heap_payloads_only() {
         struct Witness(Rc<Cell<usize>>);
         impl Drop for Witness {
             fn drop(&mut self) {
@@ -8876,8 +9101,9 @@ mod object_accounting_tests {
             .clone();
         let identity = layout.as_ptr();
         assert!(!named.borrow().owns_payload());
+        // A spill is a storage block (`gc_storage`): the collector frees it with the object.
         let spilled = Object::new_with_capacity(None, INLINE_NAMED_SLOTS + 1);
-        assert!(spilled.borrow().owns_payload());
+        assert!(!spilled.borrow().owns_payload());
         let sidecar = Object::new(None);
         sidecar
             .borrow_mut()
@@ -8885,14 +9111,14 @@ mod object_accounting_tests {
             .insert("state", Property::plain(Value::Num(2.0)));
         assert!(sidecar.borrow().owns_payload());
         let accessor = Object::new(None);
-        // Even a partial map with no key layout must release an inline accessor box.
+        // An accessor pair is a cell of its own, which the collector frees.
         accessor
             .borrow_mut()
             .props
             .entries
             .fields
             .push(Property::accessor_prop(None, None, true, true));
-        assert!(accessor.borrow().owns_payload());
+        assert!(!accessor.borrow().owns_payload());
         let dropped = Rc::new(Cell::new(0));
         let witness = Witness(dropped.clone());
         let native = Object::new(None);

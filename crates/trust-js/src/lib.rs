@@ -128,6 +128,7 @@ mod gc_handle;
 mod gc_native;
 #[cfg(test)]
 mod gc_scan_spike;
+mod gc_storage;
 mod gc_sweep;
 mod gc_trace;
 #[cfg(test)]
