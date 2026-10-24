@@ -9265,6 +9265,25 @@ The finalized cells per minor collection are now environments (about
 workload, 12 ns each) and Djot's property layouts (800 to 1,000); no
 object or closure.
 
+GC stress (a collection at every allocation; 76aab7d7's split runs 26
+slow tests at every 100th and 5 at every 1,000th) found one bug in
+05986747: two agent tests called a function the closure registry had
+let go (one panicked in the freed function's body, the other crashed).
+Their precise test collection marked the heap without judging the
+registry, which made the young functions' closures old, and the next
+minor collection, which does not trace old closures, let their
+functions go; the engine's own collections always judged it. 6defd5bb
+routes every marking of an Agent heap through value::mark_agent_heap,
+which judges the registry. The heap also counts its markings, and a
+minor collection judges the young functions only as the first marking
+since the registry was last judged: a marking that bypassed it would
+delay their release, not free them (debug builds assert). A new test
+runs a precise major collection, then a minor one, over 200 kept
+functions. Of the 2,478 tests, 1,617 ran on 05986747 before the pass
+was stopped (1,610 passed, 7 are ignored); the rest, the two failures
+and the slow tests among them, ran on 6defd5bb, and all passed. The
+debug lib suite passes on 6defd5bb (2,471 tests).
+
 What remains of the collector's costs and is left for the object-model
 work (P2), where the layouts change anyway: environment records and
 property layouts hold their binding and key names as counted Rc<str>,
