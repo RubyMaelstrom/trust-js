@@ -2242,6 +2242,10 @@ pub struct BoundCallable {
     pub(crate) target: Gc,
     pub(crate) this: Value,
     pub(crate) args: Vec<Value>,
+    /// The box and its arguments, charged to the heap's external ledger ([`charge_external`])
+    /// and released when the box drops.
+    #[allow(dead_code)]
+    charge: ExternalCharge,
 }
 
 pub struct NativeCallable {
@@ -2454,7 +2458,16 @@ impl Callable {
     }
 
     pub(crate) fn bound(target: Gc, this: Value, args: Vec<Value>) -> Callable {
-        Callable::Bound(Box::new(BoundCallable { target, this, args }))
+        let mut charge = ExternalCharge::default();
+        charge.settle(
+            std::mem::size_of::<BoundCallable>() + args.capacity() * std::mem::size_of::<Value>(),
+        );
+        Callable::Bound(Box::new(BoundCallable {
+            target,
+            this,
+            args,
+            charge,
+        }))
     }
 
     pub(crate) fn wrapped_cross(target: Value) -> Callable {
@@ -2814,6 +2827,10 @@ pub(crate) struct GcState {
     /// P1 S2: the cells holding this Agent's objects. Allocation never collects (see
     /// `new_object_heap`); collections run at interpreter safepoints, which supply the roots.
     pub(crate) core: RefCell<crate::gc_core::Heap>,
+    /// The core's control block, through which the containers of its cells' Rust-heap payloads
+    /// charge and release their bytes without borrowing the core, which a sweep's finalizers
+    /// run under (see [`charge_external`]).
+    ledger: Rc<crate::gc_core::Control>,
     pub(crate) object_desc: crate::gc_core::DescId,
     pub(crate) scope_desc: crate::gc_core::DescId,
     /// BigInt payload cells.
@@ -3127,6 +3144,58 @@ pub(crate) fn check_layout_owners(
     }
     trace_heap_roots(heap, &mut owners);
     trace_roots(&mut owners);
+}
+
+/// Charge `bytes` of Rust-heap payload to the active Agent heap's external ledger: bytes that a
+/// container belonging to one of its cells (or about to) acquired outside the heap, which only a
+/// collection of the owner frees and which therefore count toward the collection triggers (see
+/// `gc_core::ExternalBytes`). Containers keep what they charged in an [`ExternalCharge`].
+pub(crate) fn charge_external(bytes: usize) {
+    if bytes != 0 {
+        with_active_gc_heap(|heap| heap.ledger.charge_external(bytes));
+    }
+}
+
+/// Release `bytes` that [`charge_external`] charged.
+pub(crate) fn release_external(bytes: usize) {
+    if bytes != 0 {
+        with_active_gc_heap(|heap| heap.ledger.release_external(bytes));
+    }
+}
+
+/// The bytes one Rust-heap payload container has charged to the active heap's external ledger
+/// ([`charge_external`]). [`ExternalCharge::settle`] brings the charge to the container's current
+/// size; dropping the record releases it. A clone charges what the original holds again, for a
+/// cloned container, until that one settles its own size.
+#[derive(Default)]
+pub(crate) struct ExternalCharge(usize);
+
+impl ExternalCharge {
+    /// Charge or release the difference between `bytes` and what is charged now.
+    #[inline]
+    pub(crate) fn settle(&mut self, bytes: usize) {
+        if bytes != self.0 {
+            if bytes > self.0 {
+                charge_external(bytes - self.0);
+            } else {
+                release_external(self.0 - bytes);
+            }
+            self.0 = bytes;
+        }
+    }
+}
+
+impl Clone for ExternalCharge {
+    fn clone(&self) -> Self {
+        charge_external(self.0);
+        Self(self.0)
+    }
+}
+
+impl Drop for ExternalCharge {
+    fn drop(&mut self) {
+        release_external(self.0);
+    }
 }
 
 /// A fresh payload cell of `size` bytes in the active Agent's heap (see `GcBox::new`).
@@ -3957,6 +4026,7 @@ thread_local! {
 pub(crate) fn new_gc_heap() -> GcHeap {
     static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let (core, descs) = new_cell_heap();
+    let ledger = core.control();
     let heap_id = NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let heap = Rc::new(GcState {
         agent: crate::agent_control::AgentControl::new(heap_id),
@@ -3971,6 +4041,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         live: LiveCount::new(0),
         allocated: Cell::new(0),
         core: RefCell::new(core),
+        ledger,
         object_desc: descs.object,
         scope_desc: descs.scope,
         bigint_desc: descs.bigint,

@@ -84,6 +84,8 @@ mod dense_slot_tests;
 mod env_handle;
 mod eval;
 mod execution_storage;
+#[cfg(test)]
+mod external_memory_tests;
 /// The engine's size-class caching allocator, for its many small Rust-heap blocks (spilled
 /// property and binding storage, keys, argument lists, boxed internal state). NOT registered
 /// here: a library must not preempt an embedder's `#[global_allocator]` (the test262 runner caps

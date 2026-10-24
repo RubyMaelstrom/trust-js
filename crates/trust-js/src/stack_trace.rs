@@ -545,6 +545,9 @@ pub(crate) struct StackTrace {
     frames: Vec<Frame>,
     /// The formatted frame lines, built on first use.
     lines: Option<Rc<str>>,
+    /// [`StackTrace::retained_bytes`] as charged to the heap's external ledger: only the
+    /// collection of the error that owns the trace frees it (see `value::charge_external`).
+    charge: crate::value::ExternalCharge,
 }
 
 impl StackTrace {
@@ -568,7 +571,13 @@ impl StackTrace {
         }
         let lines: Rc<str> = out.into();
         self.lines = Some(lines.clone());
+        self.settle_charge();
         lines
+    }
+
+    fn settle_charge(&mut self) {
+        let bytes = self.retained_bytes();
+        self.charge.settle(bytes);
     }
 
     /// The formatted lines when they are already known, for side-effect-free diagnostics.
@@ -994,10 +1003,13 @@ impl Interp {
         if skipping {
             frames.clear();
         }
-        Some(Box::new(StackTrace {
+        let mut trace = Box::new(StackTrace {
             frames,
             lines: None,
-        }))
+            charge: Default::default(),
+        });
+        trace.settle_charge();
+        Some(trace)
     }
 
     /// The operation at byte `position` of the current context failed with `thrown`: give the
@@ -1041,6 +1053,7 @@ impl Interp {
                 trace.frames[index].position = position;
             }
             trace.lines = None;
+            trace.settle_charge();
         };
     }
 
@@ -1150,7 +1163,11 @@ impl crate::gc_trace::GcTrace for Frame {
 
 impl crate::gc_trace::GcTrace for StackTrace {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        let StackTrace { frames, lines: _ } = self;
+        let StackTrace {
+            frames,
+            lines: _,
+            charge: _,
+        } = self;
         crate::gc_trace::GcTrace::trace_gc(frames, sink);
     }
 }

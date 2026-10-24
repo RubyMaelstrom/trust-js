@@ -1162,6 +1162,8 @@ pub(crate) struct GcStats {
     /// The byte budget: without a nursery, the allocated bytes past which a collection is due;
     /// with one, the heap's bytes after a minor collection past which a major one is.
     pub(crate) trigger_bytes: usize,
+    /// The bytes the cells own outside the heap, charged and not released ([`ExternalBytes`]).
+    pub(crate) external_bytes: usize,
 }
 
 pub(crate) struct Heap {
@@ -1223,6 +1225,10 @@ pub(crate) struct Heap {
     card_cells: Vec<TraceWork>,
     /// The bytes of the cells marked by the collection in progress.
     marked_bytes: usize,
+    /// The external bytes charged as the collection in progress started marking, and whether
+    /// they had made it due (see `ExternalBytes` and `Heap::sweep_phase`).
+    external_at_mark: usize,
+    external_due_at_mark: bool,
     /// When false, allocation never collects: the embedder polls
     /// [`Heap::collection_due`] at its own safepoints, where it can supply
     /// roots the heap cannot see (the interpreter's state).
@@ -1287,6 +1293,8 @@ impl Heap {
             young_pages: Vec::new(),
             card_cells: Vec::new(),
             marked_bytes: 0,
+            external_at_mark: 0,
+            external_due_at_mark: false,
             collect_on_alloc: true,
             due_word: None,
             live_count: None,
@@ -1369,7 +1377,15 @@ impl Heap {
     /// The nursery budget (see the `nursery_bytes` field); `None` makes every collection major.
     pub(crate) fn set_nursery_bytes(&mut self, bytes: Option<usize>) {
         self.nursery_bytes = bytes;
+        self.reset_external_budget();
         self.refresh_due();
+    }
+
+    /// The external budget a new setting starts from: the nursery's, or without a nursery the
+    /// byte budget (see `ExternalBytes`; each sweep recomputes it).
+    fn reset_external_budget(&mut self) {
+        let base = self.nursery_bytes.unwrap_or(self.trigger_bytes).max(1);
+        self.control.external.budget.set(base);
     }
 
     /// Make the next collection major, whatever asks for it, without making one due: for an
@@ -1386,11 +1402,20 @@ impl Heap {
 
     /// Whether a collection is due: with a nursery, its budget is spent or a major collection is
     /// due; without one, the byte budget is spent; or the stress interval elapsed, or an earlier
-    /// request was deferred. Which kind runs is the collector's choice ([`Heap::due_kind`]).
+    /// request was deferred, or the external bytes charged since the last collection passed
+    /// their budget ([`ExternalBytes`]). Which kind runs is the collector's choice
+    /// ([`Heap::due_kind`]).
     pub(crate) fn collection_due(&self) -> bool {
         self.control.pending_collect.get()
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every)
             || self.bytes_due(0)
+            || self.control.external.due.get()
+    }
+
+    /// The heap's control block, shared with the containers that charge external bytes to it
+    /// (see [`Control::charge_external`]).
+    pub(crate) fn control(&self) -> Rc<Control> {
+        self.control.clone()
     }
 
     /// Whether the allocated bytes make a collection due, once `upcoming` more are allocated.
@@ -1418,18 +1443,20 @@ impl Heap {
 
     /// Keep `word` equal to [`Heap::collection_due`] (1 or 0) from now on, for code that polls
     /// for a collection without calling into the heap (the native JIT's polls; see
-    /// `value::LiveCount`). The heap is the word's only writer. An allocation that spends a
-    /// budget or reaches the stress interval sets it ([`Heap::alloc`]), and so does a deferred
-    /// request; marking (which takes the pending request and a due major collection), the end
-    /// of every sweep (new budgets and interval, a major collection a minor one made due, and
-    /// any request that arrived meanwhile) and the settings recompute it. Nothing else changes
-    /// what `collection_due` reads.
+    /// `value::LiveCount`). The heap is the word's only writer, with its control block's external
+    /// ledger. An allocation that spends a budget or reaches the stress interval sets it
+    /// ([`Heap::alloc`]), and so do a deferred request and an external charge that spends the
+    /// external budget ([`Control::charge_external`]); marking (which takes the pending request
+    /// and a due major collection), the end of every sweep (new budgets and interval, a major
+    /// collection a minor one made due, and any request that arrived meanwhile) and the settings
+    /// recompute it. Nothing else changes what `collection_due` reads.
     ///
     /// # Safety
     /// `word` must stay valid at its address, and written by no one else, for as long as the
     /// heap lives.
     pub(crate) unsafe fn attach_due_word(&mut self, word: NonNull<Cell<u64>>) {
         self.due_word = Some(word);
+        self.control.external.due_word.set(Some(word));
         self.refresh_due();
     }
 
@@ -1524,15 +1551,17 @@ impl Heap {
         }
     }
 
-    /// The byte budget: max(`min_bytes`, the bytes a major collection's sweep leaves × (1 +
-    /// `growth_percent`/100)), so that marking work per allocated byte stays bounded as the
-    /// live heap grows. Without a nursery a collection is due once the allocated bytes pass it;
-    /// with one, a major collection is due once the heap's bytes after a minor collection do.
-    /// Until the next major collection, the budget is `min_bytes`.
+    /// The byte budget: max(`min_bytes`, the bytes a major collection's sweep leaves, with the
+    /// external bytes still charged ([`ExternalBytes`]), × (1 + `growth_percent`/100)), so that
+    /// marking work per allocated byte stays bounded as the live heap grows. Without a nursery a
+    /// collection is due once the allocated bytes pass it; with one, a major collection is due
+    /// once the heap's bytes and the external bytes after a minor collection do. Until the next
+    /// major collection, the budget is `min_bytes`.
     pub(crate) fn set_heap_growth(&mut self, min_bytes: usize, growth_percent: usize) {
         self.min_trigger_bytes = min_bytes;
         self.growth_percent = growth_percent;
         self.trigger_bytes = min_bytes;
+        self.reset_external_budget();
         self.refresh_due();
     }
 
@@ -1545,6 +1574,7 @@ impl Heap {
         s.live_bytes = pages.map(|p| p.live * p.cell_size).sum::<usize>()
             + self.larges.values().map(|l| l.size).sum::<usize>();
         s.trigger_bytes = self.trigger_bytes;
+        s.external_bytes = self.control.external.live.get();
         s
     }
 
@@ -2222,6 +2252,8 @@ impl Heap {
             self.stress_collections += 1;
         }
         self.marked_bytes = 0;
+        self.external_at_mark = self.control.external.live.get();
+        self.external_due_at_mark = self.control.external.due.get();
         self.refresh_due();
         self.stats.collections += 1;
         self.begin_marking(kind, client);
@@ -2422,15 +2454,40 @@ impl Heap {
         self.allocated_bytes = held;
         self.swept_bytes = held;
         self.stats.last_marked_bytes = self.marked_bytes;
+        // The cells' payloads outside the heap count with the cells (see `ExternalBytes`).
+        let external = &self.control.external;
+        let external_live = external.live.get();
+        let size = held.saturating_add(external_live);
         match kind {
             CollectionKind::Major => {
-                let budget = held.saturating_add(held.saturating_mul(self.growth_percent) / 100);
+                let budget = size.saturating_add(size.saturating_mul(self.growth_percent) / 100);
                 self.trigger_bytes = self.min_trigger_bytes.max(budget);
             }
-            // The old cells, live or not, have passed the byte budget: a major collection is
-            // due, at the next safepoint.
-            CollectionKind::Minor => self.major_due |= held > self.trigger_bytes,
+            // The old cells, live or not, and the payloads still charged have passed the byte
+            // budget: a major collection is due, at the next safepoint.
+            CollectionKind::Minor => self.major_due |= size > self.trigger_bytes,
         }
+        // The next external budget. A collection the external charges made due, whose sweep
+        // released less than a quarter of what was charged since the last one, found those bytes
+        // live (a growing collection, say): collecting again at the same rate would find them
+        // live again, so the budget doubles, up to the byte budget, past which the bytes count
+        // toward a major collection instead. Otherwise it is the nursery's (or, without a
+        // nursery, the byte budget).
+        let charged = external.since.replace(0);
+        let released = self.external_at_mark.saturating_sub(external_live);
+        external.due.set(false);
+        let base = self.nursery_bytes.unwrap_or(self.trigger_bytes).max(1);
+        let budget = if self.external_due_at_mark && released.saturating_mul(4) < charged {
+            external
+                .budget
+                .get()
+                .saturating_mul(2)
+                .min(self.trigger_bytes)
+                .max(base)
+        } else {
+            base
+        };
+        external.budget.set(budget);
         self.trim_spare_pages();
         self.allocs_since_gc = 0;
         self.control.collecting.set(false);
@@ -3021,6 +3078,56 @@ pub(crate) struct Control {
     pending_collect: Cell<bool>,
     borrows: Cell<u32>,
     collecting: Cell<bool>,
+    /// The bytes this heap's cells own outside it (see [`ExternalBytes`]).
+    external: ExternalBytes,
+}
+
+/// The ledger of the bytes the heap's cells own outside the heap: Rust-heap payloads (ordered
+/// collection tables, hash indexes, binding storage, bound arguments, stack traces), which their
+/// containers report as they acquire and release them ([`Control::charge_external`],
+/// [`Control::release_external`]). Only a collection frees the payload of a dead cell, so these
+/// bytes count toward the collection triggers as cells do (SpiderMonkey's malloc-heap accounting,
+/// JavaScriptCore's extra memory): a collection is due once more than `budget` bytes were charged
+/// since the last one, and the bytes still charged count with the cells against the byte budget
+/// ([`Heap::set_heap_growth`]). Buffer data has its own pressure (`interpreter::BufferPressure`).
+#[derive(Default)]
+struct ExternalBytes {
+    /// Charged and not released.
+    live: Cell<usize>,
+    /// Charged since the last collection's sweep.
+    since: Cell<usize>,
+    /// `since` past which a collection is due; 0 while the heap has set none.
+    budget: Cell<usize>,
+    /// `since` passed `budget`: a collection is due. Cleared by every sweep.
+    due: Cell<bool>,
+    /// The heap's due word (see [`Heap::attach_due_word`]), set to 1 with `due`.
+    due_word: Cell<Option<NonNull<Cell<u64>>>>,
+}
+
+impl Control {
+    /// Record `bytes` of Rust-heap payload acquired by a cell of this heap, or by a container a
+    /// cell will own. A collection becomes due once the bytes charged since the last one pass the
+    /// external budget; the due word says so at once, so the next safepoint collects.
+    pub(crate) fn charge_external(&self, bytes: usize) {
+        let external = &self.external;
+        external.live.set(external.live.get().saturating_add(bytes));
+        let since = external.since.get().saturating_add(bytes);
+        external.since.set(since);
+        let budget = external.budget.get();
+        if budget != 0 && since > budget && !external.due.replace(true) {
+            if let Some(word) = external.due_word.get() {
+                // SAFETY: `Heap::attach_due_word`'s contract: the word stays valid while the heap,
+                // whose control block this is, lives, and only the heap and this ledger write it.
+                unsafe { word.as_ref() }.set(1);
+            }
+        }
+    }
+
+    /// Record that `bytes` charged by [`Control::charge_external`] were released.
+    pub(crate) fn release_external(&self, bytes: usize) {
+        let external = &self.external;
+        external.live.set(external.live.get().saturating_sub(bytes));
+    }
 }
 
 /// RAII no-GC region (I9). Collection requests inside are deferred.

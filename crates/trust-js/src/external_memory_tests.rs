@@ -1,0 +1,86 @@
+//! Memory the collector frees but does not allocate in its pages counts toward its triggers.
+//! A dead Map's tables, a bound function's arguments or an error's stack trace live in the Rust
+//! heap until a collection finds their owner dead, so a script that keeps replacing one large
+//! owner must collect as it goes, not only once its cells fill the nursery: each loop below
+//! allocates a few cells per iteration and megabytes of payload.
+
+use crate::{Completion, Engine};
+
+/// An engine whose heap runs no stress collections, so the triggers alone decide.
+fn engine() -> Engine {
+    let mut engine = Engine::new();
+    engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
+    engine
+}
+
+fn eval(engine: &mut Engine, source: &str) -> String {
+    match engine.eval(source, false).expect("fixture parses") {
+        Completion::Value(value) => value,
+        Completion::Throw { name, message } => panic!("{name}: {message}\n{source}"),
+    }
+}
+
+/// (collections so far, external bytes charged now).
+fn state(engine: &Engine) -> (u64, usize) {
+    let core = engine.interp.gc_heap.core.borrow();
+    (core.collections(), core.stats().external_bytes)
+}
+
+/// One Map of 100,000 numeric entries live at a time: about 6 MB of tables each, and almost no
+/// cells. The tables are charged as they grow, so collections run during the loop and reclaim
+/// the replaced Maps; the bytes still charged afterwards are a few Maps' worth, not 30.
+#[test]
+fn replaced_maps_are_collected_as_their_tables_grow() {
+    let mut engine = engine();
+    let (collections, _) = state(&engine);
+    let result = eval(
+        &mut engine,
+        "var m, n = 0;
+         for (var i = 0; i < 30; i++) {
+           m = new Map();
+           for (var j = 0; j < 100000; j++) m.set(j, j);
+           n += m.size;
+         }
+         n",
+    );
+    assert_eq!(result, "3000000");
+    let (after, external) = state(&engine);
+    assert!(
+        after - collections >= 10,
+        "only {} collections for 30 replaced 6 MB Maps",
+        after - collections
+    );
+    assert!(
+        external < 40 << 20,
+        "{external} external bytes still charged after 30 replaced Maps"
+    );
+}
+
+/// The ledger releases what its containers charged: a Map, a bound function with many
+/// arguments and an error's stack trace charge their payloads, and once their owners are
+/// collected the charge returns to where it was.
+#[test]
+fn collected_owners_release_their_charges() {
+    let mut engine = engine();
+    engine.interp.gc_collect();
+    let (_, before) = state(&engine);
+    eval(
+        &mut engine,
+        "var owners = [new Map([[1, 2], [3, 4]]), Math.max.bind(null, ...new Array(5000).fill(1)),
+                       new Error('charged')];
+         for (var j = 0; j < 10000; j++) owners[0].set(j, j);
+         owners[2].stack; 0",
+    );
+    let (_, charged) = state(&engine);
+    assert!(
+        charged > before + 10000 * 24,
+        "the Map's entries, the bound arguments and the trace charge their bytes: {before} -> {charged}"
+    );
+    eval(&mut engine, "owners = null; 0");
+    engine.interp.gc_collect();
+    let (_, after) = state(&engine);
+    assert!(
+        after <= before + 4096,
+        "collected owners release their charges: {before} -> {charged} -> {after}"
+    );
+}

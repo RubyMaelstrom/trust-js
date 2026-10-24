@@ -107,6 +107,9 @@ pub(crate) struct OrderedCollection {
     live_len: usize,
     // Lazy: collections used only for lookup need no registry allocation.
     cursors: Option<Rc<CursorRegistry>>,
+    /// The table bytes charged to the heap's external ledger (see `value::charge_external`):
+    /// only the collection of the Map or Set that owns them frees them.
+    charge: crate::value::ExternalCharge,
 }
 
 impl OrderedCollection {
@@ -115,13 +118,27 @@ impl OrderedCollection {
     }
 
     pub(crate) fn with_capacity(kind: CollectionKind, capacity: usize) -> Self {
-        Self {
+        let mut collection = Self {
             kind,
             entries: Vec::with_capacity(capacity),
             index: FastMap::with_capacity_and_hasher(capacity, Default::default()),
             live_len: 0,
             cursors: None,
-        }
+            charge: Default::default(),
+        };
+        collection.settle_charge();
+        collection
+    }
+
+    /// Bring the external charge to the tables' current capacity: the entries, and the index's
+    /// buckets with a control byte each. Capacities change geometrically, so most calls charge
+    /// nothing.
+    #[inline]
+    fn settle_charge(&mut self) {
+        let bytes = size_of::<Self>()
+            + self.entries.capacity() * size_of::<Option<(Value, Value)>>()
+            + self.index.capacity() * (size_of::<(u64, Bucket)>() + 1);
+        self.charge.settle(bytes);
     }
 
     pub(crate) fn kind(&self) -> CollectionKind {
@@ -190,6 +207,7 @@ impl OrderedCollection {
             }
         }
         self.live_len += 1;
+        self.settle_charge();
     }
 
     pub(crate) fn delete(&mut self, key: &Value) -> bool {
@@ -219,6 +237,7 @@ impl OrderedCollection {
             self.clear();
         } else if self.entries.len() - self.live_len > self.live_len.max(32) {
             self.compact();
+            self.settle_charge();
         }
         true
     }
@@ -275,6 +294,7 @@ impl OrderedCollection {
         if self.index.capacity() > 64 {
             self.index = FastMap::default();
         }
+        self.settle_charge();
     }
 
     fn compact(&mut self) {
@@ -476,6 +496,7 @@ impl crate::gc_trace::GcTrace for OrderedCollection {
             index: _,
             live_len: _,
             cursors: _, // positions only
+            charge: _,
         } = self;
         for (key, value) in entries.iter().flatten() {
             sink.value(key);

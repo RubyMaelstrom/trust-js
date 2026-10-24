@@ -7,14 +7,52 @@
 //! the place of the in-place elements (P1 S4), so the header is two 32-bit words.
 
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
+use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
 
-pub(crate) struct InlineVec<T, const N: usize> {
+/// Where an [`InlineVec`] keeps its elements once they no longer fit in place.
+pub(crate) trait Spill {
+    /// A buffer for `layout` (of non-zero size); never null.
+    fn alloc(layout: Layout) -> *mut u8;
+
+    /// Give back a buffer [`Spill::alloc`] returned for `layout`.
+    ///
+    /// # Safety
+    /// `ptr` came from `alloc(layout)` and is not used again; its elements were moved out or
+    /// dropped.
+    unsafe fn free(ptr: *mut u8, layout: Layout);
+}
+
+/// The Rust heap, charged to the active Agent heap's external ledger
+/// (`value::charge_external`): the spill of an engine cell's storage, which only a collection
+/// of the cell frees.
+pub(crate) struct ChargedHeap;
+
+impl Spill for ChargedHeap {
+    fn alloc(layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's layout has a non-zero size.
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        crate::value::charge_external(layout.size());
+        ptr
+    }
+
+    unsafe fn free(ptr: *mut u8, layout: Layout) {
+        // SAFETY: the caller's contract: `alloc(layout)` returned `ptr`.
+        unsafe { dealloc(ptr, layout) };
+        crate::value::release_external(layout.size());
+    }
+}
+
+pub(crate) struct InlineVec<T, const N: usize, S: Spill = ChargedHeap> {
     len: u32,
     /// Heap capacity once spilled; 0 while the elements are in place.
     cap: u32,
     data: Data<T, N>,
+    spill: PhantomData<S>,
 }
 
 /// The in-place elements while `cap` is 0, else the heap buffer.
@@ -23,7 +61,7 @@ union Data<T, const N: usize> {
     heap: *mut T,
 }
 
-impl<T, const N: usize> InlineVec<T, N> {
+impl<T, const N: usize, S: Spill> InlineVec<T, N, S> {
     pub(crate) const fn new() -> Self {
         Self {
             len: 0,
@@ -31,6 +69,7 @@ impl<T, const N: usize> InlineVec<T, N> {
             data: Data {
                 inline: ManuallyDrop::new([const { MaybeUninit::uninit() }; N]),
             },
+            spill: PhantomData,
         }
     }
 
@@ -103,11 +142,7 @@ impl<T, const N: usize> InlineVec<T, N> {
         let capacity = u32::try_from(capacity).expect("InlineVec capacity overflow");
         let layout = Layout::array::<T>(capacity as usize).expect("InlineVec capacity overflow");
         assert!(layout.size() != 0, "InlineVec of zero-sized elements");
-        // SAFETY: `layout` has a non-zero size.
-        let heap = unsafe { alloc(layout) }.cast::<T>();
-        if heap.is_null() {
-            handle_alloc_error(layout);
-        }
+        let heap = S::alloc(layout).cast::<T>();
         // SAFETY: the old storage holds `len` initialized elements; the new buffer has room for
         // them and does not overlap the old one. They move bitwise; the old copies are forgotten
         // (in-place storage is then overwritten by the buffer's pointer).
@@ -127,7 +162,7 @@ impl<T, const N: usize> InlineVec<T, N> {
         if self.cap != 0 {
             let layout = Layout::array::<T>(self.cap as usize).expect("valid InlineVec layout");
             // SAFETY: the buffer was allocated by `grow_to` with this layout.
-            unsafe { dealloc(self.data.heap.cast(), layout) };
+            unsafe { S::free(self.data.heap.cast(), layout) };
             self.cap = 0;
         }
     }
@@ -281,7 +316,7 @@ impl<T, const N: usize> InlineVec<T, N> {
     }
 }
 
-impl<T, const N: usize> Drop for InlineVec<T, N> {
+impl<T, const N: usize, S: Spill> Drop for InlineVec<T, N, S> {
     fn drop(&mut self) {
         self.clear();
         // SAFETY: every element was dropped above.
@@ -289,7 +324,7 @@ impl<T, const N: usize> Drop for InlineVec<T, N> {
     }
 }
 
-impl<T, const N: usize> std::ops::Deref for InlineVec<T, N> {
+impl<T, const N: usize, S: Spill> std::ops::Deref for InlineVec<T, N, S> {
     type Target = [T];
 
     #[inline]
@@ -299,7 +334,7 @@ impl<T, const N: usize> std::ops::Deref for InlineVec<T, N> {
     }
 }
 
-impl<T, const N: usize> std::ops::DerefMut for InlineVec<T, N> {
+impl<T, const N: usize, S: Spill> std::ops::DerefMut for InlineVec<T, N, S> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         let len = self.len();
@@ -308,13 +343,13 @@ impl<T, const N: usize> std::ops::DerefMut for InlineVec<T, N> {
     }
 }
 
-impl<T, const N: usize> Default for InlineVec<T, N> {
+impl<T, const N: usize, S: Spill> Default for InlineVec<T, N, S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Clone, const N: usize> Clone for InlineVec<T, N> {
+impl<T: Clone, const N: usize, S: Spill> Clone for InlineVec<T, N, S> {
     fn clone(&self) -> Self {
         let mut copy = Self::with_capacity(self.len());
         for element in self.iter() {
@@ -324,7 +359,7 @@ impl<T: Clone, const N: usize> Clone for InlineVec<T, N> {
     }
 }
 
-impl<T, const N: usize> Extend<T> for InlineVec<T, N> {
+impl<T, const N: usize, S: Spill> Extend<T> for InlineVec<T, N, S> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         let iter = iter.into_iter();
         self.reserve(iter.size_hint().0);
@@ -334,7 +369,7 @@ impl<T, const N: usize> Extend<T> for InlineVec<T, N> {
     }
 }
 
-impl<T, const N: usize> FromIterator<T> for InlineVec<T, N> {
+impl<T, const N: usize, S: Spill> FromIterator<T> for InlineVec<T, N, S> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut vec = Self::new();
         vec.extend(iter);
@@ -343,12 +378,12 @@ impl<T, const N: usize> FromIterator<T> for InlineVec<T, N> {
 }
 
 /// The elements of an [`InlineVec`], by value.
-pub(crate) struct IntoIter<T, const N: usize> {
-    vec: InlineVec<T, N>,
+pub(crate) struct IntoIter<T, const N: usize, S: Spill = ChargedHeap> {
+    vec: InlineVec<T, N, S>,
     next: usize,
 }
 
-impl<T, const N: usize> Iterator for IntoIter<T, N> {
+impl<T, const N: usize, S: Spill> Iterator for IntoIter<T, N, S> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
@@ -367,7 +402,7 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
     }
 }
 
-impl<T, const N: usize> Drop for IntoIter<T, N> {
+impl<T, const N: usize, S: Spill> Drop for IntoIter<T, N, S> {
     fn drop(&mut self) {
         let (next, len) = (self.next, self.vec.len());
         // The vector's own drop then only frees the buffer; elements before `next` were moved
@@ -383,16 +418,16 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
     }
 }
 
-impl<T, const N: usize> IntoIterator for InlineVec<T, N> {
+impl<T, const N: usize, S: Spill> IntoIterator for InlineVec<T, N, S> {
     type Item = T;
-    type IntoIter = IntoIter<T, N>;
+    type IntoIter = IntoIter<T, N, S>;
 
-    fn into_iter(self) -> IntoIter<T, N> {
+    fn into_iter(self) -> IntoIter<T, N, S> {
         IntoIter { vec: self, next: 0 }
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a InlineVec<T, N> {
+impl<'a, T, const N: usize, S: Spill> IntoIterator for &'a InlineVec<T, N, S> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
 
@@ -401,7 +436,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a InlineVec<T, N> {
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a mut InlineVec<T, N> {
+impl<'a, T, const N: usize, S: Spill> IntoIterator for &'a mut InlineVec<T, N, S> {
     type Item = &'a mut T;
     type IntoIter = std::slice::IterMut<'a, T>;
 
