@@ -192,8 +192,8 @@ struct TableWrite {
     remove: fn(&mut Interp, usize),
 }
 
-/// A write to each of the 12 side-slot tables (`gc_side_slot_tables!` and the generators).
-fn table_writes() -> [TableWrite; 12] {
+/// A write to each of the 11 side-slot tables (`gc_side_slot_tables!` and the generators).
+fn table_writes() -> [TableWrite; 11] {
     use crate::interpreter::{ClassInfo, FinalizationState, HostIndexedProperties, JobCallback};
     [
         TableWrite {
@@ -229,25 +229,6 @@ fn table_writes() -> [TableWrite; 12] {
             },
             remove: |i, owner| {
                 i.module_ns.remove(&owner);
-            },
-        },
-        TableWrite {
-            table: "collection_iterators",
-            holds: (true, false),
-            write: |i, owner, young, _| {
-                i.collection_iterators.insert(
-                    &i.gc_heap,
-                    owner,
-                    crate::ordered_collection::CollectionIterator {
-                        target: Some(young),
-                        cursor: None,
-                        kind: 0,
-                        brand: crate::ordered_collection::CollectionKind::Map,
-                    },
-                );
-            },
-            remove: |i, owner| {
-                i.collection_iterators.remove(&owner);
             },
         },
         TableWrite {
@@ -389,7 +370,7 @@ fn write_young(interp: &mut Interp, write: &TableWrite, owner: HiddenAddress) ->
     watched
 }
 
-/// Each of the 12 side-slot tables, written from Rust: an old owner's entry gets a young object
+/// Each of the 11 side-slot tables, written from Rust: an old owner's entry gets a young object
 /// (and a young environment), which then survives a minor collection through that entry alone;
 /// the minor collection reports the written owner, and not an old owner beside it whose old
 /// entry in the same table was not written.
@@ -444,8 +425,11 @@ fn an_unrecorded_side_slot_write_fails_the_check() {
     eval(&mut engine, "var p = new Promise(function () {}); 0");
     let promise = global_address(&mut engine, "p");
     engine.interp.gc_collect();
-    let write = &table_writes()[6];
-    assert_eq!(write.table, "promises");
+    let writes = table_writes();
+    let write = writes
+        .iter()
+        .find(|write| write.table == "promises")
+        .expect("the promises table");
     write_young(&mut engine.interp, write, promise);
     engine
         .interp

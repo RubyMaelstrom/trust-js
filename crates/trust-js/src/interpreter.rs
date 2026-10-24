@@ -3496,10 +3496,6 @@ pub struct Interp {
     /// star-as namespace re-export). Namespace property reads consult this so they stay live.
     pub(crate) module_ns:
         gc_collect::SideSlotTable<crate::fasthash::FastMap<String, crate::modules::NsBinding>>,
-    /// Unforgeable Map/Set iterator slots. Live targets are strong edges from the iterator owner;
-    /// exhausted iterators keep their brand but release the target and cursor.
-    pub(crate) collection_iterators:
-        gc_collect::SideSlotTable<crate::ordered_collection::CollectionIterator>,
     /// WeakMap/WeakSet cells. Keys are real weak handles; only WeakMap values are strong, and then
     /// only ephemerally while both the collection and key are live.
     pub(crate) weak_collection_data: gc_collect::WeakCollectionData,
@@ -3842,7 +3838,6 @@ interp_memory_inventory! {
     dynamic_module_loader => "external",
     routed_imports => "measured",
     module_ns => "measured",
-    collection_iterators => "measured",
     weak_collection_data => "measured",
     weak_collection_index => "measured",
     extra_protos => "measured",
@@ -3938,7 +3933,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 154);
+    assert_eq!(names.len(), 153);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4154,7 +4149,6 @@ macro_rules! gc_side_slot_tables {
         $callback!(
             class_info,
             module_ns,
-            collection_iterators,
             ta_buffer,
             proxies,
             host_indexed,
@@ -5540,7 +5534,6 @@ impl Interp {
             re_text_ascii_hot: None,
             regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
             regexp_last: None,
-            collection_iterators: Default::default(),
             weak_collection_data: Default::default(),
             weak_collection_index: Default::default(),
             extra_protos: Default::default(),
@@ -8615,7 +8608,8 @@ impl Interp {
                 // pointer-indexed stub table adds work on high-cardinality/transient inputs.
                 // Derive once and retain the key only in the bounded computed cache.
                 if let Some(value) = self.ic_get_rederive(&object, key, &scratch[0], false) {
-                    self.computed_reads.insert(key, scratch[0].get());
+                    self.computed_reads
+                        .insert(key, scratch[0].get(), self.gc_heap.markings());
                     return self.finish_cached_get(value, base, None);
                 }
             }
@@ -11662,7 +11656,6 @@ impl Interp {
             eval_realm_fns,
             module_ns,
             realms,
-            collection_iterators,
             typed_arrays,
             data_views,
             regexps,
@@ -11826,7 +11819,6 @@ impl Interp {
         crate::gc_sweep::set(eval_realm_fns, dead);
         module_ns.evict_dead(dead);
         crate::gc_sweep::map(realms, dead);
-        collection_iterators.evict_dead(dead);
         crate::gc_sweep::map(typed_arrays, dead);
         crate::gc_sweep::map(data_views, dead);
         crate::gc_sweep::map(regexps, dead);
@@ -13946,9 +13938,14 @@ impl Interp {
             .props
             .shared_layout()
             .expect("non-empty instance layout");
-        if let Some((_, cached)) = self.construct_capacity_hints.get_mut(&self.gc_heap, &key) {
+        if let Some((_, cached)) = self.construct_capacity_hints.get(&key) {
+            // Written (and recorded for the next minor collection) only when the hint grows.
             if cached.len() < observed {
-                *cached = layout.clone();
+                if let Some((_, cached)) =
+                    self.construct_capacity_hints.get_mut(&self.gc_heap, &key)
+                {
+                    *cached = layout.clone();
+                }
             }
         } else if self.construct_capacity_hints.len() < 65536 {
             self.construct_capacity_hints.insert(

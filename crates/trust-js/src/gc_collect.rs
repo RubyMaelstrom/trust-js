@@ -730,7 +730,11 @@ impl Marking<'_> {
 
     /// The roots of interpreter `index` and of its host.
     fn trace_interp_roots(&self, index: usize, words: &mut dyn GcSink) {
-        self.interps[index].trace_gc_roots(words);
+        let interp = self.interps[index];
+        interp.trace_gc_roots(words);
+        interp
+            .computed_reads
+            .trace_pins(words, self.kind, interp.gc_heap.markings());
         let mut host = self.hosts[index].borrow_mut();
         for &root in &host.roots {
             words.word(root);
@@ -847,11 +851,17 @@ impl crate::gc_core::MarkClient for Marking<'_> {
                 self.trace_interp_roots(index, &mut words);
             }
         }
+        // A minor collection traces the side slots written since the last collection only: an
+        // owner's others hold cells that collection marked (see `ClientRecords`).
+        let slots =
+            self.kind == CollectionKind::Major || self.records().side_slot_owners.contains(&owner);
         for (index, interp) in self.interps.iter().enumerate() {
             if interp.gc_pins.contains_key(&owner) {
                 self.trace_home(index, &mut words);
             }
-            interp.trace_owner_slots(owner, &mut words);
+            if slots {
+                interp.trace_owner_slots(owner, &mut words);
+            }
         }
         for &(index, key) in self.realm_members.get(&owner).into_iter().flatten() {
             if !self.activated_realms.borrow_mut().insert((index, key)) {
@@ -1184,7 +1194,11 @@ impl Interp {
         }
         #[cfg(debug_assertions)]
         if started && kind == CollectionKind::Minor {
-            crate::value::check_code_roots_marked(heap, &heap.core.borrow());
+            let core = heap.core.borrow();
+            crate::value::check_code_roots_marked(heap, &core);
+            for interp in &marking.interps {
+                interp.computed_reads.check_pins_marked(&core);
+            }
         }
         started.then(|| {
             // This marking consumed what the tables and the handles recorded since the last
@@ -1523,7 +1537,7 @@ impl Interp {
             arguments_shapes: _,
             descriptor_maps,
             iter_result_map,
-            computed_reads,
+            computed_reads: _, // keys pinned by collection kind (`Marking::trace_interp_roots`)
             fragment_cache: _, // weak Realm keys and compiled plans
             enumeration_keys,
             property_key_strings,
@@ -1572,7 +1586,6 @@ impl Interp {
             dynamic_module_loader: _,
             routed_imports: _,       // conditional owner-keyed importValue bridge
             module_ns: _,            // side slots
-            collection_iterators: _, // side slots
             weak_collection_data: _, // ephemerons
             weak_collection_index: _,
             extra_protos,
@@ -1690,7 +1703,6 @@ impl Interp {
         }
         // String caches keyed by a string's address pin it: a pin keeps the address from being
         // reused while an entry is keyed by it.
-        computed_reads.trace_pins(sink);
         for (_, string) in property_key_strings.values() {
             string.trace_gc(sink);
         }

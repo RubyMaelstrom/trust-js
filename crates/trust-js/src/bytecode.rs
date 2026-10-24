@@ -561,6 +561,12 @@ struct ComputedReadStorage {
     sets: Box<[ComputedReadSet]>,
     occupied: usize,
     evictions: usize,
+    /// The keys cached since the heap's marking number `young_since` began (see
+    /// [`ComputedReadCache::trace_pins`]), or `young_overflow` once more were than the cache
+    /// holds.
+    young: Vec<crate::lstr::LStr>,
+    young_since: u64,
+    young_overflow: bool,
 }
 
 #[repr(C)]
@@ -604,7 +610,9 @@ impl ComputedReadCache {
             .map(|way| way.state)
     }
 
-    pub(crate) fn insert(&mut self, key: &crate::lstr::LStr, state: IcState) {
+    /// Cache `state` for `key` while the heap has begun `markings` markings
+    /// (`GcState::markings`).
+    pub(crate) fn insert(&mut self, key: &crate::lstr::LStr, state: IcState, markings: u64) {
         // Cap the retained allocation, not merely the visible length of a spare-capacity
         // string. Cold engines allocate no table. Each of at most 4096 keys owns at most 512 B.
         if key.retained_requested_bytes() > Self::MAX_KEY_ALLOCATION
@@ -630,6 +638,22 @@ impl ComputedReadCache {
             state,
             pin: Some(*key),
         });
+        let storage = self.storage.as_mut().unwrap();
+        if storage.young_since != markings {
+            // A marking has traced the keys listed before it.
+            storage.young.clear();
+            storage.young_since = markings;
+            storage.young_overflow = false;
+        }
+        if storage.young_overflow {
+            return;
+        }
+        if storage.young.len() == storage.sets.len() * Self::WAYS {
+            storage.young = Vec::new();
+            storage.young_overflow = true;
+        } else {
+            storage.young.push(*key);
+        }
     }
 
     fn insert_way(&mut self, way: ComputedReadWay) {
@@ -667,10 +691,22 @@ impl ComputedReadCache {
             .collect();
         self.raw_sets = sets.as_ptr();
         self.mask = (count - 1) as u32;
-        let old = self.storage.replace(Box::new(ComputedReadStorage {
+        let mut old = self.storage.take();
+        let (young, young_since, young_overflow) =
+            old.as_mut().map_or((Vec::new(), 0, false), |old| {
+                (
+                    std::mem::take(&mut old.young),
+                    old.young_since,
+                    old.young_overflow,
+                )
+            });
+        self.storage = Some(Box::new(ComputedReadStorage {
             sets,
             occupied: 0,
             evictions: 0,
+            young,
+            young_since,
+            young_overflow,
         }));
         if let Some(old) = old {
             for set in old.sets.into_vec() {
@@ -699,14 +735,55 @@ impl ComputedReadCache {
 
     /// The pinned key strings, roots while cached: a pin keeps its address from
     /// being reused by another string while an entry is keyed by it.
-    pub(crate) fn trace_pins(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+    /// Report the cached keys, which the cache pins: a key's address must not be reused while
+    /// an entry is keyed by it. A minor collection, the heap's marking number `marking`, reports
+    /// only the keys cached since the marking before it, which traced the others (old cells
+    /// stay marked until a major collection).
+    pub(crate) fn trace_pins(
+        &self,
+        sink: &mut dyn crate::gc_trace::GcSink,
+        kind: crate::gc_core::CollectionKind,
+        marking: u64,
+    ) {
+        let Some(storage) = &self.storage else {
+            return;
+        };
+        if kind == crate::gc_core::CollectionKind::Minor {
+            if storage.young_since + 1 != marking {
+                // No key was cached since the last marking.
+                return;
+            }
+            if !storage.young_overflow {
+                for key in &storage.young {
+                    sink.word(key.cell_word());
+                }
+                return;
+            }
+        }
+        for set in storage.sets.iter() {
+            for way in &set.ways {
+                if let Some(key) = &way.pin {
+                    sink.word(key.cell_word());
+                }
+            }
+        }
+    }
+
+    /// Debug builds, after a minor collection's marking: every cached key is marked, so the
+    /// minor collection, which traced only the keys cached since the last one, missed none.
+    #[cfg(debug_assertions)]
+    pub(crate) fn check_pins_marked(&self, core: &crate::gc_core::Heap) {
         let Some(storage) = &self.storage else {
             return;
         };
         for set in storage.sets.iter() {
             for way in &set.ways {
                 if let Some(key) = &way.pin {
-                    sink.word(key.cell_word());
+                    assert!(
+                        core.cell_age(key.cell_word()) != Some(crate::gc_core::CellAge::Young),
+                        "a computed-read key {:#x} is young after a minor collection's marking",
+                        key.cell_word()
+                    );
                 }
             }
         }
@@ -732,19 +809,19 @@ mod computed_read_cache_tests {
             ..IcState::EMPTY
         };
         let long = crate::lstr::LStr::from("k".repeat(1024));
-        cache.insert(&long, state);
+        cache.insert(&long, state, 0);
         assert!(cache.raw_sets.is_null());
         let spare = crate::lstr::LStr::from("s".repeat(255)).concat_grown("k");
         assert_eq!(spare.len(), 256);
         assert!(spare.retained_requested_bytes() > ComputedReadCache::MAX_KEY_ALLOCATION);
-        cache.insert(&spare, state);
+        cache.insert(&spare, state, 0);
         assert!(
             cache.raw_sets.is_null(),
             "spare capacity counts against the retention cap"
         );
         let mut key = crate::lstr::LStr::from("method");
-        cache.insert(&key, state);
-        cache.insert(&key, IcState { slot: 9, ..state });
+        cache.insert(&key, state, 0);
+        cache.insert(&key, IcState { slot: 9, ..state }, 0);
         assert!(
             !key.append_in_place("changed"),
             "cache identity must remain immutable"
@@ -754,7 +831,7 @@ mod computed_read_cache_tests {
         let mut keys = Vec::new();
         for n in 0..8192 {
             let key = crate::lstr::LStr::from(format!("method{n}"));
-            cache.insert(&key, state);
+            cache.insert(&key, state, 0);
             assert_eq!(cache.lookup(key.as_ptr() as usize, 42).unwrap().slot, 7);
             keys.push(key);
         }
@@ -784,7 +861,7 @@ mod computed_read_cache_tests {
                 ),
                 0
             );
-            cache.insert(&key, state);
+            cache.insert(&key, state, 0);
             assert_eq!(
                 cache
                     .lookup(key.as_ptr() as usize, state.recv_shape)

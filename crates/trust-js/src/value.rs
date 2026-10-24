@@ -2587,6 +2587,11 @@ pub enum Exotic {
     Arguments,
     ArrayIterator(crate::gc_storage::PayloadBox<ArrayIteratorState>),
     StringIterator(crate::gc_storage::PayloadBox<StringIteratorState>),
+    /// ECMA-262 CreateMapIterator's and CreateSetIterator's private state: the collection and a
+    /// live cursor over it, which its collection's deletions and clears keep in place.
+    CollectionIterator(
+        crate::gc_storage::PayloadBox<crate::ordered_collection::CollectionIterator>,
+    ),
 }
 
 impl Exotic {
@@ -3008,6 +3013,7 @@ pub(crate) struct PayloadDescs {
     stack_trace: crate::gc_core::DescId,
     array_iterator: crate::gc_core::DescId,
     string_iterator: crate::gc_core::DescId,
+    collection_iterator: crate::gc_core::DescId,
     native: crate::gc_core::DescId,
     bound: crate::gc_core::DescId,
     wrapped_shadow: crate::gc_core::DescId,
@@ -3037,6 +3043,7 @@ payload_kinds! {
     crate::stack_trace::StackTrace => stack_trace,
     ArrayIteratorState => array_iterator,
     StringIteratorState => string_iterator,
+    crate::ordered_collection::CollectionIterator => collection_iterator,
     Rc<NativeCallable> => native,
     BoundCallable => bound,
     Rc<WrappedShadowCallable> => wrapped_shadow,
@@ -3070,6 +3077,9 @@ impl PayloadDescs {
             string_iterator: leaf(payload_layout::<StringIteratorState>(
                 "string iterator state",
             )),
+            collection_iterator: leaf(payload_layout::<
+                crate::ordered_collection::CollectionIterator,
+            >("map or set iterator state")),
             native: leaf(payload_layout::<Rc<NativeCallable>>("native function data")),
             bound: leaf(payload_layout::<BoundCallable>("bound function data")),
             wrapped_shadow: leaf(payload_layout::<Rc<WrappedShadowCallable>>(
@@ -3637,6 +3647,12 @@ impl Object {
             Exotic::StringIterator(state) => {
                 PayloadBox::trace(state, sink);
                 state.string.trace_gc(sink);
+            }
+            Exotic::CollectionIterator(state) => {
+                PayloadBox::trace(state, sink);
+                if let Some(target) = &state.target {
+                    sink.object(target);
+                }
             }
             Exotic::Error(stack) => stack.trace_gc(sink), // the cell and the frame names
             Exotic::Collection(data) => data.trace_gc(sink), // the cell and the entries
@@ -4446,6 +4462,14 @@ pub(crate) fn object_heap(cell: usize) -> GcHeap {
 
 pub(crate) fn heap_id(heap: &GcHeap) -> u64 {
     heap.heap_id
+}
+
+impl GcState {
+    /// How many markings of the heap have begun (`gc_core::Control::markings`).
+    #[inline]
+    pub(crate) fn markings(&self) -> u64 {
+        self.ledger.markings()
+    }
 }
 
 /// The active Agent heap's identity (never reused).

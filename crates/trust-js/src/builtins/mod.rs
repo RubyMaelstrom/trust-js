@@ -3436,17 +3436,17 @@ fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Valu
         .get(key)
         .cloned()
         .or_else(|| i.extra_protos.get("%IteratorPrototype%").cloned());
-    let obj = Object::new(proto);
-    i.gc_pin(&obj);
-    i.collection_iterators.insert(
-        &i.gc_heap,
-        Gc::as_ptr(&obj) as usize,
-        crate::ordered_collection::CollectionIterator {
-            target: Some(target),
-            cursor: Some(cursor),
-            kind,
-            brand,
-        },
+    let obj = Object::new_with_parts(
+        proto,
+        crate::value::Props::new(),
+        Exotic::CollectionIterator(crate::gc_storage::PayloadBox::new(
+            crate::ordered_collection::CollectionIterator {
+                target: Some(target),
+                cursor: Some(cursor),
+                kind,
+                brand,
+            },
+        )),
     );
     Ok(Value::Obj(obj))
 }
@@ -3457,16 +3457,24 @@ fn map_set_iter_step(
     this: Value,
     brand: crate::ordered_collection::CollectionKind,
 ) -> Result<Option<Value>, Value> {
-    let ptr = map_ptr(&this).ok_or_else(|| i.make_error("TypeError", "not a Map/Set Iterator"))?;
-    let state = i
-        .collection_iterators
-        .get(&ptr)
-        .filter(|state| state.brand == brand)
-        .ok_or_else(|| i.make_error("TypeError", "incompatible collection iterator"))?;
-    let kind = state.kind;
-    let entry = match (&state.target, &state.cursor) {
-        (Some(target), Some(cursor)) => collections::collection_next(i, target, cursor),
-        _ => None,
+    let Some(object) = this.as_obj() else {
+        return Err(i.make_error("TypeError", "not a Map/Set Iterator"));
+    };
+    let (kind, entry) = {
+        let iterator = object.borrow();
+        let Exotic::CollectionIterator(state) = &iterator.exotic else {
+            drop(iterator);
+            return Err(i.make_error("TypeError", "incompatible collection iterator"));
+        };
+        if state.brand != brand {
+            drop(iterator);
+            return Err(i.make_error("TypeError", "incompatible collection iterator"));
+        }
+        let entry = match (&state.target, &state.cursor) {
+            (Some(target), Some(cursor)) => collections::collection_next(i, target, cursor),
+            _ => None,
+        };
+        (state.kind, entry)
     };
     if let Some((key, value)) = entry {
         let value = match kind {
@@ -3476,9 +3484,11 @@ fn map_set_iter_step(
         };
         Ok(Some(value))
     } else {
-        let state = i.collection_iterators.get_mut(&i.gc_heap, &ptr).unwrap();
-        state.target = None;
-        state.cursor = None;
+        // Done: let go of the collection and the cursor its deletions would keep updating.
+        if let Exotic::CollectionIterator(state) = &mut object.borrow_mut().exotic {
+            state.target = None;
+            state.cursor = None;
+        }
         Ok(None)
     }
 }
@@ -3535,9 +3545,13 @@ pub(crate) fn inert_iterator_step(
     };
     // A Map/Set iterator step reads only its private cursor; a brand mismatch must still
     // create its TypeError inside the native call.
-    i.collection_iterators
-        .get(&(Gc::as_ptr(&object) as usize))
-        .filter(|state| state.brand == brand)?;
+    let branded = matches!(
+        &object.borrow().exotic,
+        Exotic::CollectionIterator(state) if state.brand == brand
+    );
+    if !branded {
+        return None;
+    }
     map_set_iter_step(i, *iterator, brand).ok()
 }
 

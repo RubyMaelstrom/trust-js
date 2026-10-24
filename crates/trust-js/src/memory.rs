@@ -1163,6 +1163,12 @@ impl Visitor {
                     self.value(&Value::Str(*string));
                 }
             }
+            Exotic::CollectionIterator(state) => {
+                internal_bytes += std::mem::size_of_val(&**state);
+                if let Some(target) = &state.target {
+                    self.value(&Value::Obj(*target));
+                }
+            }
             Exotic::Collection(entries) => {
                 internal_bytes += std::mem::size_of_val(&**entries)
                     .saturating_add(entries.storage_bytes_lower_bound());
@@ -2207,17 +2213,6 @@ fn scan_realm(
 
     totals
         .interpreter_side_tables
-        .add(interp.collection_iterators.len().saturating_mul(size_of::<(
-            usize,
-            crate::ordered_collection::CollectionIterator,
-        )>()));
-    for state in interp.collection_iterators.values() {
-        if let Some(target) = &state.target {
-            visitor.value(&Value::Obj(*target));
-        }
-    }
-    totals
-        .interpreter_side_tables
         .add(interp.weak_collection_data.len().saturating_mul(size_of::<(
             usize,
             Vec<(crate::interpreter::WeakTarget, Value)>,
@@ -2248,10 +2243,7 @@ fn scan_realm(
                 .saturating_mul(size_of::<(crate::interpreter::WeakKey, usize)>()),
         );
     }
-    if !interp.collection_iterators.is_empty()
-        || !interp.weak_collection_data.is_empty()
-        || !interp.weak_collection_index.is_empty()
-    {
+    if !interp.weak_collection_data.is_empty() || !interp.weak_collection_index.is_empty() {
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap bucket storage");
@@ -3414,7 +3406,6 @@ mod tests {
         let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let after = measure(&engine.interp, &objects, &scopes);
 
-        assert!(!engine.interp.collection_iterators.is_empty());
         assert!(!engine.interp.weak_collection_data.is_empty());
         assert!(!engine.interp.weak_collection_index.is_empty());
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);

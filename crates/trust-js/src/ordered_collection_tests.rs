@@ -254,10 +254,18 @@ fn ordered_collection_iterator_gc_edges_and_exhaustion_release() {
         !crate::gc_test::alive(&weak),
         "completed iterator releases collection"
     );
-    assert_eq!(engine.interp.collection_iterators.len(), 1);
-    engine.eval("iterator = null", false).unwrap();
-    engine.interp.gc_collect();
-    assert!(engine.interp.collection_iterators.is_empty());
+    // An exhausted iterator keeps its brand: a Set iterator's next still rejects it.
+    assert!(matches!(
+        engine
+            .eval(
+                "var setNext = new Set().values().next, done = iterator.next().done, threw = false;
+                 try { setNext.call(iterator); } catch (e) { threw = e instanceof TypeError; }
+                 done && threw",
+                false,
+            )
+            .unwrap(),
+        crate::Completion::Value(ref value) if value == "true"
+    ));
 }
 
 #[test]
@@ -276,7 +284,6 @@ fn ordered_collection_iterator_cycle_is_collectable() {
     engine.eval("collection = iterator = null", false).unwrap();
     engine.interp.gc_collect();
     assert!(!crate::gc_test::alive(&weak));
-    assert!(engine.interp.collection_iterators.is_empty());
 }
 
 /// A super() call's native result hands its [[MapData]]/[[SetData]] to `this`. A result holding

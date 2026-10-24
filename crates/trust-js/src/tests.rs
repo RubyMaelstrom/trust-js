@@ -18904,7 +18904,6 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     let mut engine = Engine::new();
     let before = [
         engine.interp.gc_pins.len(),
-        engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
         engine.interp.data_views.len(),
@@ -18936,7 +18935,6 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     engine.interp.gc_collect();
     let after = [
         engine.interp.gc_pins.len(),
-        engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
         engine.interp.data_views.len(),
