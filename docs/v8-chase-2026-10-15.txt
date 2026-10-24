@@ -9198,7 +9198,13 @@ on Crystal and focused tests; the closing gates come last.
     marker's trace only: the collector's checks trace dead closures),
     after which the registry lets go of the functions it did not stamp.
     A closure's rare cache is a payload cell; closure cells are carded,
-    and installing a cache sets the card.
+    and installing a cache sets the card. As committed, the registry let
+    functions go at major collections only, which held those of closures
+    that died young, with their parse trees and code (which the triggers
+    do not count), until one; 05986747 lets minor collections release
+    them, at the collection that finds their closures dead, as the
+    closures' finalizers used to. It also clears the Agent tag below when
+    the thread's storage tears down the active-heap slot.
   - Environment binding spills live in storage blocks: no malloc and
     free per environment with more than one binding, and no charge to
     keep. Environment records and property layouts still finalize, to
@@ -9249,7 +9255,11 @@ of both binaries, seven runs) React 17.0 -> 16.8 MB, Vue 26.3 -> 26.1,
 Djot 35.9 -> 35.8; some runs of Vue and Djot, either binary, land about
 2 MB higher, where a fourth chunk advises huge pages for all four (part
 D's threshold), which environment spills in the heap's pages now reach
-a little sooner. The debug lib suite passes (2469 tests) on Crystal.
+a little sooner. The debug lib suite passes on Crystal (2469 tests;
+2470 with 05986747's), and zombie's routine checks of f0a618ff match
+0f571675's (x86-64 and Windows clippy clean against the baseline, the
+x86-64 suite unchanged, the Windows suite under Wine down to the three
+known snapshot codec failures, release fixtures and difftest identical).
 The finalized cells per minor collection are now environments (about
 1,000 in React and Vue, 650 in Djot, 2,100 to 6,500 in the sustained
 workload, 12 ns each) and Djot's property layouts (800 to 1,000); no
