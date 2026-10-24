@@ -850,12 +850,16 @@ struct PageMeta {
     /// zombies, and clears every bit.
     pins: Vec<u64>,
     /// The first never-handed-out cell. Only the prefix below this cursor can have allocation
-    /// bits or reclaimed cells; the virgin tail's payload is not read or linked. Monotonic
-    /// until this page is emptied and its storage reused with fresh metadata.
+    /// bits; the virgin tail's payload is never read or written before it is handed out.
+    /// Monotonic until this page is emptied and its storage reused with fresh metadata.
     next_unused: usize,
-    /// Index of first reclaimed cell, or -1. These cells are below `next_unused` and thread
-    /// their next index+1 through their first word (0 = end). Sweeps preserve existing holes.
-    free_head: i32,
+    /// The allocation cursor (Go's `allocCache`): `free` holds the free cells of `allocated`'s
+    /// word `next_word - 1` not yet handed out, as set bits. Allocation takes the lowest, so it
+    /// reuses reclaimed holes in address order and reaches the virgin tail last, and it never
+    /// reads a free cell: the sweep frees by clearing bits, without writing to dead cells. Reset
+    /// by every sweep of the page.
+    free: u64,
+    next_word: u32,
     live: usize,
 }
 
@@ -933,36 +937,53 @@ impl PageMeta {
     }
 
     fn has_room(&self) -> bool {
-        self.free_head >= 0 || self.next_unused < self.cells
+        // `live` counts every allocated cell, zombies included.
+        self.live < self.cells
     }
 
+    /// Restart the allocation cursor after `allocated` changed other than through it.
+    fn reset_cursor(&mut self) {
+        self.free = 0;
+        self.next_word = 0;
+    }
+
+    #[inline]
     fn take_cell(&mut self, zero: bool) -> Option<*mut u8> {
-        let index = if self.free_head >= 0 {
-            let index = self.free_head as usize;
-            debug_assert!(index < self.next_unused, "GC free list outside used prefix");
-            // SAFETY: reclaimed cells hold their free-list link in word 0. The virgin tail
-            // is never on this list, so allocation does not read its uninitialized payload.
-            let next = unsafe { std::ptr::read(self.cell_ptr(index) as *const u64) };
-            debug_assert!(next <= self.next_unused as u64, "GC free list corrupted");
-            self.free_head = if next == 0 { -1 } else { (next - 1) as i32 };
-            index
-        } else if self.next_unused < self.cells {
-            let index = self.next_unused;
-            self.next_unused += 1;
-            index
-        } else {
-            return None;
-        };
+        if self.free == 0 {
+            self.next_free_word()?;
+        }
+        let word = self.next_word as usize - 1;
+        let index = word * 64 + self.free.trailing_zeros() as usize;
+        self.free &= self.free - 1;
         debug_assert!(!bit(&self.allocated, index) && !bit(&self.zombies, index));
         debug_assert!(!bit(&self.marks, index));
         let ptr = self.cell_ptr(index) as *mut u8;
-        set_bit(&mut self.allocated, index, true);
+        self.allocated[word] |= 1 << (index % 64);
         self.live += 1;
+        self.next_unused = self.next_unused.max(index + 1);
         if zero {
             // SAFETY: the cell lies inside this page and is now owned by the caller.
             unsafe { std::ptr::write_bytes(ptr, 0, self.cell_size) };
         }
         Some(ptr)
+    }
+
+    /// Load the cursor with the next word of `allocated` that has a free cell; `None` once the
+    /// page has none left.
+    #[cold]
+    fn next_free_word(&mut self) -> Option<()> {
+        let words = self.cells.div_ceil(64);
+        while (self.next_word as usize) < words {
+            let word = self.next_word as usize;
+            self.next_word += 1;
+            let cells = (self.cells - word * 64).min(64);
+            let valid = u64::MAX >> (64 - cells);
+            self.free = !self.allocated[word] & valid;
+            if self.free != 0 {
+                return Some(());
+            }
+        }
+        None
     }
 }
 
@@ -1804,7 +1825,8 @@ impl Heap {
             zombies: vec![0; words],
             pins: vec![0; words],
             next_unused: 0,
-            free_head: -1,
+            free: 0,
+            next_word: 0,
             live: 0,
         };
         meta.clear_cards();
@@ -3030,41 +3052,38 @@ impl Heap {
             // Include unmarked zombies: an unpinned zombie frees storage without another
             // finalization/death. Existing holes and the untouched virgin tail are excluded.
             let used = (page.next_unused - word * 64).min(64);
-            let mut candidates = page.allocated[word] & !page.marks[word];
-            candidates &= u64::MAX >> (64 - used);
-            while candidates != 0 {
-                let i = word * 64 + candidates.trailing_zeros() as usize;
-                candidates &= candidates - 1;
-                let cell = page.cell_ptr(i) as *mut u64;
-                if !bit(&page.zombies, i) {
-                    // Finalized already (`Heap::finalize_page`).
-                    swept += 1;
-                    #[cfg(debug_assertions)]
-                    for w in 1..page.cell_size / 8 {
+            let dead = page.allocated[word] & !page.marks[word] & (u64::MAX >> (64 - used));
+            if dead == 0 {
+                continue;
+            }
+            // Finalized already (`Heap::finalize_page`); unmarked zombies died before.
+            let newly_dead = dead & !page.zombies[word];
+            swept += u64::from(newly_dead.count_ones());
+            #[cfg(debug_assertions)]
+            {
+                let mut poison = newly_dead;
+                while poison != 0 {
+                    let i = word * 64 + poison.trailing_zeros() as usize;
+                    poison &= poison - 1;
+                    let cell = page.cell_ptr(i) as *mut u64;
+                    for w in 0..page.cell_size / 8 {
                         // SAFETY: the dead cell lies inside this page.
                         unsafe { std::ptr::write(cell.add(w), POISON) };
                     }
                 }
-                if bit(&page.pins, i) {
-                    // Finalized, but its address stays reserved for weak handles.
-                    set_bit(&mut page.zombies, i, true);
-                    continue;
-                }
-                set_bit(&mut page.zombies, i, false);
-                set_bit(&mut page.allocated, i, false);
-                page.live -= 1;
-                freed += page.cell_size;
-                let link = if page.free_head < 0 {
-                    0
-                } else {
-                    page.free_head as u64 + 1
-                };
-                // SAFETY: only this newly reclaimed cell is linked. Previously free cells
-                // retain their chain; virgin cells are never touched by the sweep.
-                unsafe { std::ptr::write(cell, link) };
-                page.free_head = i as i32;
             }
+            // A dead cell a weak handle pins stays allocated as a zombie: finalized, its address
+            // reserved. The others are free: a clear bit, which allocation finds without reading
+            // the cell (see `PageMeta::free`).
+            let pinned = dead & page.pins[word];
+            let reclaimed = dead & !pinned;
+            page.zombies[word] = (page.zombies[word] & !dead) | pinned;
+            page.allocated[word] &= !reclaimed;
+            let count = reclaimed.count_ones() as usize;
+            page.live -= count;
+            freed += count * page.cell_size;
         }
+        page.reset_cursor();
         // These cover the full bitmap, including live cells and zero-death sweeps: a pin
         // observed for a live cell must not keep that cell pinned when it later dies.
         page.waiters.fill(0);
@@ -4207,45 +4226,28 @@ mod tests {
             .expect("a live small cell's page") as usize
     }
 
-    /// Every recycled hole occurs exactly once; live/zombie/virgin storage never occurs.
-    /// Reading only listed links also makes this verifier usable while the virgin tail holds
-    /// deliberate nonzero sentinels. Return list order so zero-death sweeps can prove stability.
+    /// The page's reclaimed holes, in address order (the order allocation takes them): the
+    /// cells below `next_unused` whose allocation bit is clear. Checks that no free or virgin
+    /// cell is marked or a zombie, that `live` counts every allocated cell (zombies included)
+    /// and that `has_room` agrees. The holes are never read: the sweep writes no link into
+    /// them, so the virgin tail and the holes may hold any bytes.
     fn checked_free_chain(page: &PageMeta) -> Vec<usize> {
         assert!(page.next_unused <= page.cells);
-        let mut seen = vec![false; page.cells];
-        let mut chain = Vec::new();
-        let mut head = page.free_head;
-        while head >= 0 {
-            let index = head as usize;
-            assert!(
-                index < page.next_unused,
-                "a virgin/out-of-page free-list entry"
-            );
-            assert!(!seen[index], "a duplicate or cyclic free-list entry");
-            assert!(!bit(&page.allocated, index), "an allocated free-list entry");
-            assert!(!bit(&page.zombies, index), "a zombie free-list entry");
-            assert!(!bit(&page.marks, index), "a marked free-list entry");
-            seen[index] = true;
-            chain.push(index);
-            let next = word(page.cell_ptr(index) as *const u8, 0);
-            assert!(next <= page.next_unused as u64);
-            head = if next == 0 { -1 } else { (next - 1) as i32 };
-        }
+        let mut holes = Vec::new();
         let mut allocated = 0;
-        for (index, &listed) in seen.iter().enumerate() {
+        for index in 0..page.cells {
             let used = index < page.next_unused;
             let occupied = bit(&page.allocated, index);
-            assert_eq!(
-                listed,
-                used && !occupied,
-                "hole {index} missing or duplicated"
-            );
-            assert!(!bit(&page.zombies, index) || occupied);
-            if !used {
-                assert!(!occupied && !bit(&page.marks, index));
-                assert!(!bit(&page.zombies, index));
+            if occupied {
+                assert!(used, "an allocated cell in the virgin tail");
+                allocated += 1;
+            } else {
+                assert!(!bit(&page.marks, index), "a marked free cell");
+                assert!(!bit(&page.zombies, index), "a free zombie");
+                if used {
+                    holes.push(index);
+                }
             }
-            allocated += usize::from(occupied);
         }
         assert_eq!(
             page.live, allocated,
@@ -4253,9 +4255,9 @@ mod tests {
         );
         assert_eq!(
             page.has_room(),
-            !chain.is_empty() || page.next_unused < page.cells
+            !holes.is_empty() || page.next_unused < page.cells
         );
-        chain
+        holes
     }
 
     fn check_free_chains(heap: &Heap) {
@@ -4520,7 +4522,7 @@ mod tests {
         let child = fx.heap.alloc(fx.leaf, 16) as usize;
         let slot = page_slot(&fx.heap, anchor as usize);
         let page = fx.heap.pages[slot].as_ref().unwrap();
-        assert_eq!((page.next_unused, page.free_head), (1, -1));
+        assert_eq!((page.next_unused, checked_free_chain(page).len()), (1, 0));
         let sentinels: Vec<(usize, [u64; 2])> = [1, 63, 64, 65, page.cells - 1]
             .into_iter()
             .map(|index| {
@@ -4555,7 +4557,7 @@ mod tests {
             assert!(fx.start_marking_kind(&no_edges, kind));
             fx.heap.finish_collection(&[virgin]);
             let page = fx.heap.pages[slot].as_ref().unwrap();
-            assert_eq!((page.next_unused, page.free_head, page.live), (1, -1, 1));
+            assert_eq!((page.next_unused, page.live), (1, 1));
             assert!(checked_free_chain(page).is_empty());
             for &(ptr, expected) in &sentinels {
                 assert_eq!(
@@ -4684,7 +4686,7 @@ mod tests {
                 [slot as u32]
             );
             let page = fx.heap.pages[slot].as_ref().unwrap();
-            assert_eq!((page.next_unused, page.free_head), (1, -1));
+            assert_eq!((page.next_unused, checked_free_chain(page).len()), (1, 0));
             let next = fx.heap.alloc(fx.node, 16);
             assert_eq!(next as usize, anchor as usize + 16);
             assert_zeroed_cell(next, 16);
@@ -4738,9 +4740,10 @@ mod tests {
             (fx.live(), count.get(), FIN_COUNT.with(Cell::get)),
             (1, 1, 3)
         );
+        // The holes, in the address order allocation takes them.
         assert_eq!(
             checked_free_chain(fx.heap.pages[slot].as_ref().unwrap()),
-            [2, 1]
+            [1, 2]
         );
     }
 
@@ -4807,7 +4810,7 @@ mod tests {
         fx.roots[0] = tagged(first);
         let slot = page_slot(&fx.heap, base);
         let page = fx.heap.pages[slot].as_ref().unwrap();
-        assert_eq!((page.next_unused, page.free_head), (1, -1));
+        assert_eq!((page.next_unused, checked_free_chain(page).len()), (1, 0));
         assert!((0..page.cells).all(|index| !page.card_set(index)));
         assert_eq!(word((base + 384) as *const u8, 1), 0xa5a5_a5a5_a5a5_a5a5);
         let second = fx.heap.alloc(fx.carded, 192);
