@@ -852,6 +852,59 @@ impl EdgeSink<'_> {
     }
 }
 
+/// A page's bitmap, held as one raw allocation: marking ([`MarkPage::marks`]) and allocation
+/// ([`Cursor::bits`]) reach it through copies of its own pointer, which every other access
+/// derives its short-lived reference from. (A `Box` would invalidate the copies at each access
+/// through it under Rust's aliasing models.)
+struct PageBits {
+    ptr: NonNull<u64>,
+    len: usize,
+}
+
+impl PageBits {
+    fn zeroed(len: usize) -> Self {
+        let bits = Box::into_raw(vec![0u64; len].into_boxed_slice());
+        Self {
+            ptr: NonNull::new(bits.cast::<u64>()).expect("a boxed slice's pointer"),
+            len,
+        }
+    }
+
+    /// The bitmap's own pointer, for a copy that reads it while it lives.
+    fn as_ptr(&self) -> *const u64 {
+        self.ptr.as_ptr()
+    }
+
+    /// The bitmap's own pointer, for a copy that writes it while it lives.
+    fn as_mut_ptr(&mut self) -> *mut u64 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl std::ops::Deref for PageBits {
+    type Target = [u64];
+
+    fn deref(&self) -> &[u64] {
+        // SAFETY: `len` initialized words, allocated while `self` lives.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for PageBits {
+    fn deref_mut(&mut self) -> &mut [u64] {
+        // SAFETY: as in `deref`; no copy of the pointer is used while the reference lives.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for PageBits {
+    fn drop(&mut self) {
+        let bits = std::ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len);
+        // SAFETY: the allocation `zeroed` made, of `len` words, freed once.
+        drop(unsafe { Box::from_raw(bits) });
+    }
+}
+
 /// A page's metadata. Marking tests a cell's mark through the page's [`MarkPage`]; a first
 /// mark ([`Heap::mark_unmarked`]) reads the fields before `cells`, in the struct's first cache
 /// line.
@@ -862,11 +915,11 @@ struct PageMeta {
     /// collections a marked cell is old (a collection kept it), an allocated unmarked one young
     /// (allocated since). A major collection clears them before it marks; a minor one keeps
     /// them.
-    marks: Box<[u64]>,
+    marks: PageBits,
     /// Allocated (handed-out) cells. Conservative marking must ignore
     /// free cells: a stale stack word resolving into a free cell would
     /// otherwise "mark" free-list linkage and trace it as payload.
-    allocated: Box<[u64]>,
+    allocated: PageBits,
     cell_size: usize,
     desc: DescId,
     /// `ceil(2^32 / cell_size)`, by which [`PageMeta::cell_index`] divides.
@@ -922,7 +975,7 @@ const _: () = assert!(std::mem::offset_of!(PageMeta, cells) <= 64);
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
 struct MarkPage {
-    /// The page's `PageMeta::marks`, whose boxed bits stay where they are while it lives.
+    /// The page's `PageMeta::marks`, whose bits stay where they are while it lives.
     marks: *const u64,
     /// As `PageMeta::reciprocal` and `PageMeta::cells`.
     reciprocal: u32,
@@ -2267,8 +2320,8 @@ impl Heap {
             has_zombies: false,
             has_waiters: false,
             young: true,
-            marks: vec![0; words].into_boxed_slice(),
-            allocated: vec![0; words].into_boxed_slice(),
+            marks: PageBits::zeroed(words),
+            allocated: PageBits::zeroed(words),
             waiters: vec![0; words],
             zombies: vec![0; words],
             pins: vec![0; words],
@@ -3089,7 +3142,7 @@ impl Heap {
             let young = page
                 .allocated
                 .iter()
-                .zip(&page.marks)
+                .zip(page.marks.iter())
                 .zip(&page.zombies)
                 .any(|((&allocated, &marks), &zombies)| allocated & !marks & !zombies != 0);
             assert!(

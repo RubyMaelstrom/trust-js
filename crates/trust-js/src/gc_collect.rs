@@ -580,6 +580,10 @@ struct Marking<'a> {
     templates: FastMap<(usize, usize), Vec<u64>>,
     activated_realms: RefCell<FastSet<(usize, usize)>>,
     activated_homes: RefCell<FastSet<usize>>,
+    /// Debug builds: the interpreters whose roots this marking traced, the ones the checks
+    /// after a minor marking examine (`Interp::gc_heap_mark`).
+    #[cfg(debug_assertions)]
+    traced: RefCell<FastSet<usize>>,
 }
 
 impl<'a> Marking<'a> {
@@ -660,6 +664,8 @@ impl<'a> Marking<'a> {
             templates,
             activated_realms: RefCell::default(),
             activated_homes: RefCell::default(),
+            #[cfg(debug_assertions)]
+            traced: RefCell::default(),
         }
     }
 
@@ -742,6 +748,8 @@ impl Marking<'_> {
 
     /// The roots of interpreter `index` and of its host.
     fn trace_interp_roots(&self, index: usize, words: &mut dyn GcSink) {
+        #[cfg(debug_assertions)]
+        self.traced.borrow_mut().insert(index);
         let interp = self.interps[index];
         interp.trace_gc_roots(words);
         interp
@@ -1212,9 +1220,14 @@ impl Interp {
             let core = heap.core.borrow();
             crate::value::check_code_roots_marked(heap, &core);
             crate::value::check_shape_layouts_marked(heap, &core);
-            for interp in &marking.interps {
-                interp.computed_reads.check_pins_marked(&core);
-                interp.check_cache_roots_marked(&core);
+            // An interpreter whose roots the marking did not trace is a ShadowRealm's that
+            // died young: the sweep drops it, caches and all, before it frees a cell.
+            let traced = marking.traced.borrow();
+            for (index, interp) in marking.interps.iter().enumerate() {
+                if traced.contains(&index) {
+                    interp.computed_reads.check_pins_marked(&core);
+                    interp.check_cache_roots_marked(&core);
+                }
             }
         }
         started.then(|| {

@@ -386,3 +386,69 @@ fn a_minor_collection_keeps_an_old_realms_young_template_objects() {
         );
     }
 }
+
+/// Run `source` in a new ShadowRealm, in a frame of its own, and drop the ShadowRealm, or keep
+/// it in `globalThis.kept` when `keep`. No collection runs meanwhile.
+#[inline(never)]
+fn evaluate_in_new_shadow_realm(engine: &mut Engine, source: &str, keep: bool) -> String {
+    let before = collections(engine);
+    let keep = if keep { "globalThis.kept = sr; " } else { "" };
+    let result = eval(
+        engine,
+        &format!(
+            "(() => {{ const sr = new ShadowRealm(); {keep}return sr.evaluate({source:?}); }})()"
+        ),
+    );
+    assert_eq!(since(engine, before), (0, 0), "a collection ran meanwhile");
+    result
+}
+
+/// A ShadowRealm made since the last collection and unreachable at a minor one: the marking
+/// traces nothing of its interpreter, whose caches pin young cells (a string's code units, a
+/// for-in key list), and the sweep drops it. Debug builds' checks after the marking examine only
+/// the interpreters it traced (they had failed here). Kept, the ShadowRealm's interpreter is
+/// traced, caches included, and its cached state still serves.
+#[test]
+fn a_minor_collection_drops_a_young_unreachable_shadow_realm_with_its_caches() {
+    // (source, its value, a later use of what it cached, that use's value)
+    let cases = [
+        (
+            "var s = '\u{e9}'.repeat(100); s.charCodeAt(5)",
+            "233",
+            "s.charCodeAt(7)",
+            "233",
+        ),
+        (
+            "var o = {a: 1, b: 2}, n = 0; for (var k in o) n++; for (var k in o) n++; n",
+            "4",
+            "for (var k in o) n++; n",
+            "6",
+        ),
+    ];
+    for tier in [Tier::Interp, Tier::Bytecode] {
+        for (source, value, again, again_value) in cases {
+            for keep in [false, true] {
+                let mut engine = engine(tier);
+                engine
+                    .interp
+                    .gc_heap
+                    .core
+                    .borrow_mut()
+                    .set_nursery_bytes(Some(256 << 20));
+                engine.interp.gc_collect();
+                let result = evaluate_in_new_shadow_realm(&mut engine, source, keep);
+                assert_eq!(result, value, "{tier:?}");
+                engine.interp.gc_collect_minor();
+                if keep {
+                    assert_eq!(
+                        eval(&mut engine, &format!("kept.evaluate({again:?})")),
+                        again_value,
+                        "{tier:?}"
+                    );
+                } else {
+                    assert_eq!(eval(&mut engine, "1 + 1"), "2", "{tier:?}");
+                }
+            }
+        }
+    }
+}
