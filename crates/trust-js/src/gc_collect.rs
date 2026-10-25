@@ -56,13 +56,27 @@ const GC_NURSERY_BYTES: usize = 2 << 20;
 /// Under GC stress, every this many collections the stress makes one major.
 const GC_STRESS_MAJOR_EVERY: usize = 8;
 
-/// Native stack zeroed below a collection's entry before marking (see `gc_core::scrub_stack`).
+/// Native stack zeroed below a collection's entry before marking, and again below
+/// `Interp::gc_heap_mark` once its client is built (see `gc_core::scrub_stack`): the frames
+/// live from there down to the stack scan's own, which take under 3 KiB in optimized builds
+/// (2.4 KiB on ARM64 with fat LTO, 2.5 KiB on x86-64). Debug frames are several times larger.
+/// Zeroing touches the stack's pages, so an optimized build zeroes no more than its frames need.
 #[cfg(not(target_arch = "wasm32"))]
-const GC_SCRUB_BYTES: usize = 256 * 1024;
+const GC_SCRUB_BYTES: usize = if cfg!(debug_assertions) {
+    256 << 10
+} else {
+    16 << 10
+};
 
-/// Native stack zeroed before an explicit collection (see `Interp::gc_heap_collect_explicit`).
+/// Native stack zeroed before an explicit collection (see `Interp::gc_heap_collect_explicit`):
+/// the collection's frames down to the stack scan's, which take under 4 KiB in optimized
+/// builds (3.7 KiB on x86-64).
 #[cfg(not(target_arch = "wasm32"))]
-const EXPLICIT_SCRUB_BYTES: usize = 1 << 20;
+const EXPLICIT_SCRUB_BYTES: usize = if cfg!(debug_assertions) {
+    1 << 20
+} else {
+    32 << 10
+};
 
 /// `TRUST_JS_GC_STRESS=N`: collect at the first safepoint after every N cell allocations
 /// (N = 1: at every safepoint that follows an allocation), and poll at every call.
