@@ -4142,14 +4142,24 @@ pub struct Job {
     pub host_context: u64,
 }
 
+/// The host settings a promise reaction was registered with. The token is meaningful only in
+/// its registration Realm, and a pending reaction can settle from another Realm, so both are
+/// kept until NewPromiseReactionJob chooses the handler Realm at enqueue time.
+#[derive(Clone, Copy)]
+pub(crate) struct PromiseReactionSettings {
+    /// The registration Realm's global (the key of `Job::realm`).
+    pub realm: usize,
+    pub context: u64,
+}
+
 #[derive(Default)]
 pub struct PromiseState {
     /// 0 = pending, 1 = fulfilled, 2 = rejected.
     pub status: u8,
 
     pub value: Value,
-    /// Pending reactions: `(onFulfilled, onRejected, resultPromise, hostContext)`.
-    pub(crate) reactions: Vec<(JobCallback, JobCallback, Value, u64)>,
+    /// Pending reactions: `(onFulfilled, onRejected, resultPromise, registrationSettings)`.
+    pub(crate) reactions: Vec<(JobCallback, JobCallback, Value, PromiseReactionSettings)>,
     /// [[PromiseIsHandled]]: a reaction was ever registered (PerformPromiseThen), or the host
     /// marked the promise handled (Web IDL "mark as handled").
     pub(crate) handled: bool,
@@ -4942,7 +4952,7 @@ impl Interp {
             promise
                 .reactions
                 .retain(|(fulfilled, rejected, _, candidate)| {
-                    *candidate != context
+                    candidate.context != context
                         || [fulfilled, rejected].iter().any(|handler| {
                             function_realm_key(&handler.callback)
                                 .is_some_and(|realm| !owners.contains(&realm))

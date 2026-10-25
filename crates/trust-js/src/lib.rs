@@ -139,6 +139,8 @@ mod handles;
 mod host;
 mod host_collections;
 mod host_memory;
+#[cfg(all(test, feature = "embed"))]
+mod host_object_semantics_tests;
 #[cfg(test)]
 mod host_string_tests;
 mod inline_vec;
@@ -182,6 +184,8 @@ mod ordered_collection_tests;
 mod parser;
 #[cfg(test)]
 mod private_name_cache_tests;
+#[cfg(all(test, feature = "embed"))]
+mod promise_job_settings_tests;
 #[cfg(test)]
 mod realm_inline_guard_tests;
 #[cfg(test)]
@@ -511,6 +515,95 @@ fn parse_host_script_from(
         line: error.line,
         at_eof: error.at_eof,
     })
+}
+
+/// Parse-only Source Text Module information for host graph algorithms: ECMA-262 ParseModule's
+/// [[RequestedModules]] and [[HasTLA]]. A Service Worker's "is async module" check, for one,
+/// inspects the whole graph before any author code runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleInspection {
+    /// Whether the module Contains `await` outside any function (an Await expression, a
+    /// for-await head or an `await using` declaration); a nested async function's does not
+    /// make its module asynchronous.
+    pub has_top_level_await: bool,
+    /// Static imports and re-exports in source order (with duplicates): each specifier and its
+    /// `type` import attribute.
+    pub requests: Vec<(String, Option<String>)>,
+}
+
+/// Parse the Rust text `src` as a module and report its [`ModuleInspection`], evaluating
+/// nothing.
+pub fn inspect_module(src: &str) -> Result<ModuleInspection, ParseError> {
+    let body = parser::parse_module(&jstr::from_text(src)).map_err(|error| ParseError {
+        message: error.message,
+        line: error.line,
+        at_eof: error.at_eof,
+    })?;
+    Ok(ModuleInspection {
+        has_top_level_await: modules::body_has_tla(&body),
+        requests: modules::module_dependency_specifiers(&body)
+            .into_iter()
+            .map(|(specifier, kind)| (jstr::to_text(&specifier).into_owned(), kind))
+            .collect(),
+    })
+}
+
+#[cfg(test)]
+mod module_inspection_tests {
+    #[test]
+    fn module_inspection_reads_static_semantics_without_evaluation() {
+        for source in [
+            "await 1;",
+            "if (false) { await 1; }",
+            "for await (const x of []) {}",
+            "(await 1);",
+            "class C extends (await base) {}",
+            "class C { [await key]() {} }",
+            "const C = class { static [await key] = 1; };",
+            "const o = {[await key]: 1};",
+            "const o = {async [await key]() { await 2; }};",
+            "const o = {get [await key]() { return 1; }};",
+            "const o = {__proto__: await value};",
+            "tag`value ${await result}`;",
+            "const [a = await value] = [];",
+            "const {[await key]: a = await value} = {};",
+            "for (const [a = await value] of []) {}",
+            "await using resource = null;",
+            "for (await using resource of []) {}",
+        ] {
+            assert!(
+                super::inspect_module(source).unwrap().has_top_level_await,
+                "{source}"
+            );
+        }
+        for source in [
+            "throw new Error('never execute');",
+            "async function f() { await 1; }",
+            "const f = async () => await 1;",
+            "class C { async f() { await 1; } }",
+            "const o = {async f() { await 1; }};",
+            "class C { field = async () => await 1; static { const f = async () => await 1; } }",
+        ] {
+            assert!(
+                !super::inspect_module(source).unwrap().has_top_level_await,
+                "{source}"
+            );
+        }
+        let result = super::inspect_module(
+            "import './a.js'; import x from './b.json' with {type:'json'}; \
+             export * from './c.js'; import('./dynamic.js');",
+        )
+        .unwrap();
+        assert_eq!(
+            result.requests,
+            vec![
+                ("./a.js".into(), None),
+                ("./b.json".into(), Some("json".into())),
+                ("./c.js".into(), None)
+            ]
+        );
+        assert!(super::inspect_module("export const x = ;").is_err());
+    }
 }
 
 /// Parse `src` as a script and encode its AST to a snapshot blob — a build-time helper (used
@@ -1231,6 +1324,38 @@ pub(crate) enum EvalFailure {
 /// The engine side of the embedder's evaluation and callback entry points (`embed::Ctx`).
 #[cfg(feature = "embed")]
 impl interpreter::Interp {
+    /// `Ctx::set_host_object_invariants`: install host-selected essential internal methods on
+    /// `object` as internal slots, which author strings and copied properties cannot address.
+    pub(crate) fn set_host_object_invariants(
+        &mut self,
+        object: &Value,
+        immutable_prototype: bool,
+        always_extensible: bool,
+    ) -> bool {
+        let Some(cell) = object.as_obj() else {
+            return false;
+        };
+        if self.is_proxy_value(object) {
+            return false;
+        }
+        let mut cell = cell.borrow_mut();
+        if always_extensible && !cell.extensible {
+            return false;
+        }
+        for (enabled, key) in [
+            (immutable_prototype, value::HOST_IMMUTABLE_PROTOTYPE),
+            (always_extensible, value::HOST_ALWAYS_EXTENSIBLE),
+        ] {
+            if enabled {
+                cell.internal_slots_mut().insert(
+                    key,
+                    value::Property::data(Value::Bool(true), false, false, false),
+                );
+            }
+        }
+        true
+    }
+
     /// Set the opaque host settings token captured by subsequently-created promise reactions.
     ///
     /// ECMA-262 associates a PromiseReactionJob with its handler Realm, while HTML uses that

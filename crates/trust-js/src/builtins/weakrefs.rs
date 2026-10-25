@@ -142,8 +142,8 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         let ptr = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         let cleanup_callback = i.make_job_callback(arg(a, 0));
-        let (callback_realm, callback_context) =
-            i.promise_job_target(&arg(a, 0), i.host_job_context);
+        let settings = i.reaction_settings(i.host_job_context);
+        let (callback_realm, callback_context) = i.promise_job_target(&arg(a, 0), settings);
         i.finalization_registries.insert(
             &i.gc_heap,
             ptr,

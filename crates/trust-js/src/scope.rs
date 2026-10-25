@@ -1497,6 +1497,28 @@ impl<'s> Ctx<'s> {
         self.interp.is_proxy_value(v.as_internal())
     }
 
+    /// Select host-defined essential internal methods for an object after its prototype has been
+    /// initialized. The rules only accumulate: `false` leaves an installed rule in place.
+    ///
+    /// `immutable_prototype` makes the object an immutable-prototype exotic object (ECMA-262
+    /// #sec-set-immutable-prototype); `always_extensible` makes its [[PreventExtensions]] return
+    /// false, as HTML #windowproxy-preventextensions requires. Property descriptors and Proxy
+    /// invariant checks are unaffected, and the rules live in internal slots, so author strings
+    /// and copied properties cannot address them. Returns false, changing nothing, for a
+    /// non-object, a Proxy, or a non-extensible object asked to stay extensible.
+    pub fn set_host_object_invariants(
+        &mut self,
+        object: &Value<'s>,
+        immutable_prototype: bool,
+        always_extensible: bool,
+    ) -> bool {
+        self.it().set_host_object_invariants(
+            object.as_internal(),
+            immutable_prototype,
+            always_extensible,
+        )
+    }
+
     /// Whether `v` is an Error object (on itself or anywhere up its prototype chain).
     pub fn is_error_value(&self, v: &Value<'s>) -> bool {
         self.interp.is_error_value(v.as_internal())

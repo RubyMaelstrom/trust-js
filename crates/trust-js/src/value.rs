@@ -2770,6 +2770,12 @@ pub(crate) struct InternalSlots {
     charge: ExternalCharge,
 }
 
+// Host-selected essential internal methods, never ECMAScript properties
+// (`Ctx::set_host_object_invariants`). HTML's WindowProxy uses both rules; ECMA-262
+// #sec-immutable-prototype-exotic-objects permits host-defined combinations.
+pub(crate) const HOST_IMMUTABLE_PROTOTYPE: &str = "#\0hostImmutablePrototype";
+pub(crate) const HOST_ALWAYS_EXTENSIBLE: &str = "#\0hostAlwaysExtensible";
+
 impl Clone for InternalSlots {
     fn clone(&self) -> Self {
         let mut copy = Self {

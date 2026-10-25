@@ -582,8 +582,13 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
     if i.strict_equals(proto, &cur) {
         return Ok(true);
     }
-    // %Object.prototype% is an immutable-prototype exotic object: any actual change fails.
-    if Gc::ptr_eq(&o, &i.object_proto) {
+    // %Object.prototype% is an immutable-prototype exotic object, as is an object the host
+    // made one (#sec-set-immutable-prototype): any actual change fails.
+    if Gc::ptr_eq(&o, &i.object_proto)
+        || o.borrow()
+            .internal_slots()
+            .contains(crate::value::HOST_IMMUTABLE_PROTOTYPE)
+    {
         return Ok(false);
     }
     if !o.borrow().extensible {
@@ -671,6 +676,14 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         return Ok(ok);
     }
     if let ValueView::Obj(o) = &(obj).view() {
+        // HTML #windowproxy-preventextensions returns false; the host installs this rule
+        // before exposing the Window to author scripts.
+        if o.borrow()
+            .internal_slots()
+            .contains(crate::value::HOST_ALWAYS_EXTENSIBLE)
+        {
+            return Ok(false);
+        }
         // Web IDL §3.9.5: legacy platform objects must remain extensible.
         if i.host_indexed_len(o).is_some() {
             return Ok(false);

@@ -2409,7 +2409,7 @@ pub(crate) fn dep_map_key(spec: &str, attr: Option<&str>) -> String {
 }
 
 /// Every module specifier this body imports/re-exports from (with duplicates).
-fn module_dependency_specifiers(body: &[Stmt]) -> Vec<(String, Option<String>)> {
+pub(crate) fn module_dependency_specifiers(body: &[Stmt]) -> Vec<(String, Option<String>)> {
     let mut out = Vec::new();
     for stmt in body {
         match stmt {

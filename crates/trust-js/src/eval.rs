@@ -4804,7 +4804,8 @@ impl Interp {
                     let (realm, host_context) = if host_steps {
                         (None, 0)
                     } else {
-                        self.promise_job_target(&then, self.host_job_context)
+                        let settings = self.reaction_settings(self.host_job_context);
+                        self.promise_job_target(&then, settings)
                     };
                     let (res, rej) = if host_steps {
                         self.make_host_resolver_pair(promise)
@@ -4874,9 +4875,9 @@ impl Interp {
             self.unhandled_rejections
                 .insert(ptr, (order, *promise, value, self.host_job_context));
         }
-        for (on_f, on_r, result, host_context) in reactions {
+        for (on_f, on_r, result, settings) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
-            let (realm, host_context) = self.reaction_job_target(&handler, host_context);
+            let (realm, host_context) = self.reaction_job_target(&handler, settings);
             self.enqueue_promise_job(Job {
                 handler,
                 result,
@@ -4949,11 +4950,13 @@ impl Interp {
                     flags
                 });
         // Embedder reaction steps belong to no settings object (see `InternalJob::HostReaction`).
-        let host_context = if on_f.internal == crate::interpreter::InternalJob::HostReaction {
-            0
-        } else {
-            self.host_job_context
-        };
+        let settings = self.reaction_settings(
+            if on_f.internal == crate::interpreter::InternalJob::HostReaction {
+                0
+            } else {
+                self.host_job_context
+            },
+        );
         // Step 11: a rejected, unhandled promise gets HostPromiseRejectionTracker(promise,
         // "handle"). HTML: one still on the about-to-be-notified list just leaves it; one in the
         // outstanding rejected promises weak set leaves that and is reported for
@@ -4967,12 +4970,12 @@ impl Interp {
         match status {
             0 => {
                 if let Some(s) = self.promises.get_mut(&self.gc_heap, &ptr) {
-                    s.reactions.push((on_f, on_r, result, host_context));
+                    s.reactions.push((on_f, on_r, result, settings));
                 }
             }
             1 => {
                 let v = self.promises[&ptr].value;
-                let (realm, host_context) = self.reaction_job_target(&on_f, host_context);
+                let (realm, host_context) = self.reaction_job_target(&on_f, settings);
                 self.enqueue_promise_job(Job {
                     handler: on_f,
                     result,
@@ -4984,7 +4987,7 @@ impl Interp {
             }
             _ => {
                 let v = self.promises[&ptr].value;
-                let (realm, host_context) = self.reaction_job_target(&on_r, host_context);
+                let (realm, host_context) = self.reaction_job_target(&on_r, settings);
                 self.enqueue_promise_job(Job {
                     handler: on_r,
                     result,
@@ -5002,7 +5005,7 @@ impl Interp {
     fn reaction_job_target(
         &mut self,
         handler: &crate::interpreter::JobCallback,
-        same_realm_context: u64,
+        settings: crate::interpreter::PromiseReactionSettings,
     ) -> (Option<usize>, u64) {
         if let Some((_, realm, context, _)) = handler.internal.routed_import() {
             return (Some(realm), context);
@@ -5012,14 +5015,38 @@ impl Interp {
             return (None, 0);
         }
         let Some(realm) = handler.internal.realm() else {
-            return self.promise_job_target(&handler.callback, same_realm_context);
+            return self.promise_job_target(&handler.callback, settings);
         };
-        let host_context = if realm == Gc::as_ptr(&self.global) as usize {
-            same_realm_context
-        } else {
-            self.realm_host_context(realm, same_realm_context)
-        };
+        let host_context = self.promise_job_settings(realm, settings);
         (Some(realm), host_context)
+    }
+
+    /// The settings of a reaction registered now with the host settings token `context`.
+    pub(crate) fn reaction_settings(
+        &self,
+        context: u64,
+    ) -> crate::interpreter::PromiseReactionSettings {
+        crate::interpreter::PromiseReactionSettings {
+            realm: Gc::as_ptr(&self.global) as usize,
+            context,
+        }
+    }
+
+    /// HTML #hostenqueuepromisejob's job settings: those of the handler Realm `realm`. The token
+    /// captured at registration tells apart settings objects that share its registration Realm,
+    /// and is never reinterpreted in another Realm, the one settling the promise included.
+    fn promise_job_settings(
+        &self,
+        realm: usize,
+        registration: crate::interpreter::PromiseReactionSettings,
+    ) -> u64 {
+        if realm == registration.realm {
+            registration.context
+        } else if realm == Gc::as_ptr(&self.global) as usize {
+            self.host_job_context
+        } else {
+            self.realm_host_context(realm, registration.context)
+        }
     }
 
     /// Return the Realm/settings pair passed conceptually to HostEnqueuePromiseJob.
@@ -5031,10 +5058,10 @@ impl Interp {
     pub(crate) fn promise_job_target(
         &mut self,
         handler: &Value,
-        same_realm_context: u64,
+        settings: crate::interpreter::PromiseReactionSettings,
     ) -> (Option<usize>, u64) {
         if !handler.is_callable() {
-            return (None, same_realm_context);
+            return (None, settings.context);
         }
         let current_realm = Gc::as_ptr(&self.global) as usize;
         let realm = match &(handler).view() {
@@ -5048,11 +5075,7 @@ impl Interp {
             }
             _ => current_realm,
         };
-        let host_context = if realm == current_realm {
-            same_realm_context
-        } else {
-            self.realm_host_context(realm, same_realm_context)
-        };
+        let host_context = self.promise_job_settings(realm, settings);
         (Some(realm), host_context)
     }
 

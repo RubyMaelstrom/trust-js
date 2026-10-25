@@ -1747,7 +1747,7 @@ fn scan_realm(
                 crate::interpreter::JobCallback,
                 crate::interpreter::JobCallback,
                 Value,
-                u64,
+                crate::interpreter::PromiseReactionSettings,
             )>()));
         for (on_fulfilled, on_rejected, result, _) in &state.reactions {
             visitor.value(&on_fulfilled.callback);
