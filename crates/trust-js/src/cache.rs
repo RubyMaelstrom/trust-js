@@ -24,6 +24,11 @@ pub(crate) struct ByteLru<K, V> {
     max_bytes: usize,
     max_entries: usize,
     generation: u64,
+    /// The keys inserted since a collection's marking last traced the values
+    /// ([`ByteLru::trace_roots`]): a minor collection traces these values alone. `overflow` once
+    /// more were inserted than the cache holds, which makes the next one trace every value.
+    inserted: std::cell::Cell<Vec<K>>,
+    overflow: std::cell::Cell<bool>,
 }
 
 struct RegexpEntry {
@@ -252,6 +257,8 @@ where
             max_bytes,
             max_entries,
             generation: 0,
+            inserted: std::cell::Cell::new(Vec::new()),
+            overflow: std::cell::Cell::new(false),
         }
     }
 
@@ -295,9 +302,45 @@ where
             self.bytes = self.bytes.saturating_sub(previous.bytes);
         }
         self.bytes = self.bytes.saturating_add(bytes);
+        if !*self.overflow.get_mut() {
+            let inserted = self.inserted.get_mut();
+            if inserted.len() < self.max_entries {
+                inserted.push(key.clone());
+            } else {
+                *inserted = Vec::new();
+                *self.overflow.get_mut() = true;
+            }
+        }
         self.order.push_back((key, generation));
         self.evict_to_budget();
         self.compact_order_if_needed();
+    }
+
+    /// Visit the values a collection of `kind` traces, for a cache whose values are roots: every
+    /// value for a major collection; for a minor one, those inserted since a collection's marking
+    /// last called this (every value once more were inserted than the cache holds), the cells of
+    /// the others being old. Either way the record of insertions starts anew, so only a marking
+    /// calls this.
+    pub(crate) fn trace_roots(
+        &self,
+        kind: crate::gc_core::CollectionKind,
+        mut visit: impl FnMut(&V),
+    ) {
+        let mut inserted = self.inserted.take();
+        if kind == crate::gc_core::CollectionKind::Minor && !self.overflow.replace(false) {
+            for key in &inserted {
+                if let Some(entry) = self.entries.get(key) {
+                    visit(&entry.value);
+                }
+            }
+        } else {
+            self.overflow.set(false);
+            for entry in self.entries.values() {
+                visit(&entry.value);
+            }
+        }
+        inserted.clear();
+        self.inserted.set(inserted);
     }
 
     fn next_generation(&mut self) -> u64 {
@@ -397,7 +440,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::ByteLru;
+    use crate::gc_core::CollectionKind;
     use std::rc::Rc;
+
+    fn traced(cache: &ByteLru<u32, u32>, kind: CollectionKind) -> Vec<u32> {
+        let mut values = Vec::new();
+        cache.trace_roots(kind, |&value| values.push(value));
+        values.sort_unstable();
+        values
+    }
+
+    #[test]
+    fn minor_collections_trace_the_entries_inserted_since_the_last_marking() {
+        let mut cache = ByteLru::new(1 << 10, 4);
+        cache.insert(1, 10, 1);
+        cache.insert(2, 20, 1);
+        assert_eq!(traced(&cache, CollectionKind::Minor), [10, 20]);
+        assert_eq!(
+            traced(&cache, CollectionKind::Minor),
+            [0u32; 0],
+            "nothing new"
+        );
+        // A replaced value counts as inserted; an evicted entry is not reported.
+        cache.insert(2, 21, 1);
+        cache.insert(3, 30, 1);
+        cache.insert(4, 40, 1);
+        cache.insert(5, 50, 1);
+        assert_eq!(cache.stats().0, 4);
+        assert_eq!(traced(&cache, CollectionKind::Minor), [21, 30, 40, 50]);
+        // A major collection traces every value and starts the record anew.
+        cache.insert(6, 60, 1);
+        assert_eq!(traced(&cache, CollectionKind::Major), [30, 40, 50, 60]);
+        assert_eq!(traced(&cache, CollectionKind::Minor), [0u32; 0]);
+        // More insertions than the cache holds: the next minor collection traces every value.
+        for key in 10..20 {
+            cache.insert(key, key * 10, 1);
+        }
+        assert_eq!(traced(&cache, CollectionKind::Minor), [160, 170, 180, 190]);
+        cache.insert(20, 200, 1);
+        assert_eq!(traced(&cache, CollectionKind::Minor), [200]);
+    }
 
     #[test]
     fn mapped_hits_do_not_clone_pins_and_stale_generations_do_not_evict_reused_keys() {

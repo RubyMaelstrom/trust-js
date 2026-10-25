@@ -3292,13 +3292,19 @@ pub(crate) fn trace_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::G
 
 /// The heap's roots other than its code roots.
 fn trace_fixed_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
+    trace_fixed_heap_roots_but_shapes(heap, sink);
+    use crate::gc_trace::GcTrace;
+    heap.shapes.borrow().layouts.trace_gc(sink);
+}
+
+/// The heap's roots other than its code roots and its shape directory's layouts.
+fn trace_fixed_heap_roots_but_shapes(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
     heap.agent.trace_gc(sink);
     for string in heap.interned_strings.borrow().iter().flatten() {
         sink.word(string.cell_word());
     }
     use crate::gc_trace::GcTrace;
     heap.array_length_layout.borrow().trace_gc(sink);
-    heap.shapes.borrow().layouts.trace_gc(sink);
 }
 
 /// Every live code root, dropping the registrations of dead ones.
@@ -3322,7 +3328,9 @@ pub(crate) fn trace_heap_roots_for(
     sink: &mut dyn crate::gc_trace::GcSink,
     kind: crate::gc_core::CollectionKind,
 ) {
-    trace_fixed_heap_roots(heap, sink);
+    trace_fixed_heap_roots_but_shapes(heap, sink);
+    // A minor collection traces the layouts the directory took since the last collection.
+    heap.shapes.borrow().layouts.trace_roots(kind, sink);
     let young_roots = std::mem::take(&mut *heap.young_code_roots.borrow_mut());
     let young_words = std::mem::take(&mut *heap.young_code_words.borrow_mut());
     match kind {
@@ -3363,6 +3371,24 @@ pub(crate) fn check_code_roots_marked(heap: &GcState, core: &crate::gc_core::Hea
     {
         owner.trace_gc(&mut Check(core));
     }
+}
+
+/// Debug builds, after a minor collection's marking: every layout the shape directory holds is
+/// marked, so the minor collection, which traced only the entries written since the last one
+/// (`ShapeLayouts::trace_roots`), missed none.
+#[cfg(debug_assertions)]
+pub(crate) fn check_shape_layouts_marked(heap: &GcState, core: &crate::gc_core::Heap) {
+    struct Check<'a>(&'a crate::gc_core::Heap);
+    impl crate::gc_trace::GcSink for Check<'_> {
+        fn word(&mut self, word: u64) {
+            assert!(
+                self.0.cell_age(word) != Some(crate::gc_core::CellAge::Young),
+                "the shape directory holds the young layout {word:#x} after a minor \
+                 collection's marking"
+            );
+        }
+    }
+    crate::gc_trace::GcTrace::trace_gc(&heap.shapes.borrow().layouts, &mut Check(core));
 }
 
 /// Verify the COW invariant by actual owning-slot identity, independently of repeated collector

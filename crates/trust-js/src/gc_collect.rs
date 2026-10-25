@@ -616,6 +616,7 @@ impl<'a> Marking<'a> {
         let mut hosts = Vec::with_capacity(interps.len());
         let mut realm_members: FastMap<usize, Vec<(usize, usize)>> = FastMap::default();
         let mut templates: FastMap<(usize, usize), Vec<u64>> = FastMap::default();
+        let core = root.gc_heap.core.borrow();
         for (index, interp) in interps.iter().enumerate() {
             let mut host = HostGraph {
                 heap_id: crate::value::heap_id(&root.gc_heap),
@@ -624,6 +625,17 @@ impl<'a> Marking<'a> {
             interp.host_state.trace_gc(&mut host);
             hosts.push(RefCell::new(host));
             for (&key, realm) in &interp.realms {
+                // A minor collection keeps every cell an earlier collection marked: a group
+                // whose global object one marked is active from the start, and the global
+                // object, marked already, stands for its members (it activates the group at
+                // once). The members of the others are its members.
+                let global = Gc::as_ptr(&realm.global) as usize;
+                if kind == CollectionKind::Minor
+                    && core.cell_age(global as u64) == Some(crate::gc_core::CellAge::Old)
+                {
+                    realm_members.entry(global).or_default().push((index, key));
+                    continue;
+                }
                 // A RealmState reports exactly its members.
                 realm.trace_gc(&mut WordSink(&mut |member| {
                     realm_members
@@ -735,6 +747,7 @@ impl Marking<'_> {
         interp
             .computed_reads
             .trace_pins(words, self.kind, interp.gc_heap.markings());
+        interp.trace_cache_roots(self.kind, words);
         let mut host = self.hosts[index].borrow_mut();
         for &root in &host.roots {
             words.word(root);
@@ -1198,8 +1211,10 @@ impl Interp {
         if started && kind == CollectionKind::Minor {
             let core = heap.core.borrow();
             crate::value::check_code_roots_marked(heap, &core);
+            crate::value::check_shape_layouts_marked(heap, &core);
             for interp in &marking.interps {
                 interp.computed_reads.check_pins_marked(&core);
+                interp.check_cache_roots_marked(&core);
             }
         }
         started.then(|| {
@@ -1521,6 +1536,53 @@ impl Interp {
     /// Every strong root this interpreter holds itself. Owner-keyed side tables, Realm groups,
     /// weak tables and caches are not roots; each `_` below says why. ShadowRealm
     /// interpreters are traced as members of the collection's tree, not through this field.
+    /// The string caches keyed by a string's address, which pin it (a pin keeps the address
+    /// from being reused while an entry is keyed by it), as a marking of `kind` traces them: a
+    /// minor collection traces the entries made since the last one (`ByteLru::trace_roots`).
+    fn trace_cache_roots(&self, kind: CollectionKind, sink: &mut dyn GcSink) {
+        self.enumeration_keys
+            .trace_roots(kind, |keys| keys.trace_gc(sink));
+        self.property_key_strings
+            .trace_roots(kind, |(_, string)| string.trace_gc(sink));
+        self.str_units
+            .trace_roots(kind, |(string, _, _)| string.trace_gc(sink));
+        self.re_texts.trace_roots(kind, |(string, text)| {
+            string.trace_gc(sink);
+            text.trace_gc(sink);
+        });
+    }
+
+    /// Debug builds, after a minor collection's marking: every cell the string caches pin is
+    /// marked, so the minor collection, which traced only the entries made since the last one,
+    /// missed none.
+    #[cfg(debug_assertions)]
+    pub(crate) fn check_cache_roots_marked(&self, core: &crate::gc_core::Heap) {
+        struct Marked<'a>(&'a crate::gc_core::Heap);
+        impl GcSink for Marked<'_> {
+            fn word(&mut self, word: u64) {
+                assert!(
+                    self.0.cell_age(word) != Some(crate::gc_core::CellAge::Young),
+                    "a string cache pins the young cell {word:#x} after a minor collection's \
+                     marking"
+                );
+            }
+        }
+        let sink = &mut Marked(core);
+        for keys in self.enumeration_keys.values() {
+            keys.trace_gc(sink);
+        }
+        for (_, string) in self.property_key_strings.values() {
+            string.trace_gc(sink);
+        }
+        for (string, _, _) in self.str_units.values() {
+            string.trace_gc(sink);
+        }
+        for (string, text) in self.re_texts.values() {
+            string.trace_gc(sink);
+            text.trace_gc(sink);
+        }
+    }
+
     fn trace_gc_roots(&self, sink: &mut dyn GcSink) {
         let Interp {
             gc_heap: _,
@@ -1555,10 +1617,10 @@ impl Interp {
             iter_result_map,
             computed_reads: _, // keys pinned by collection kind (`Marking::trace_interp_roots`)
             fragment_cache: _, // weak Realm keys and compiled plans
-            enumeration_keys,
-            property_key_strings,
-            frame_pool, // the active JIT records (Rust entries' contexts: thread roots)
-            creation_pins: _, // weak pins
+            enumeration_keys: _, // by collection kind (`Marking::trace_interp_roots`)
+            property_key_strings: _, // by collection kind
+            frame_pool,        // the active JIT records (Rust entries' contexts: thread roots)
+            creation_pins: _,  // weak pins
             global_env_pins: _, // weak pins
             call_site: _,
             code_frames,
@@ -1568,8 +1630,8 @@ impl Interp {
             jit_layout: _,
             interp_layout: _,
             inline_ic_safe: _,
-            str_units,
-            re_texts,
+            str_units: _, // by collection kind
+            re_texts: _,  // by collection kind
             re_text_ascii_hot,
             regexp_dependency_cache: _,
             regexp_last,
@@ -1708,26 +1770,11 @@ impl Interp {
                 props.trace_gc(sink);
             }
         }
-        for keys in enumeration_keys.values() {
-            keys.trace_gc(sink);
-        }
         for (_, symbol, _) in wk_syms {
             symbol.trace_gc(sink);
         }
         if let Some(symbol) = iterator_sym {
             sink.word(crate::value::symbol_identity(symbol) as u64);
-        }
-        // String caches keyed by a string's address pin it: a pin keeps the address from being
-        // reused while an entry is keyed by it.
-        for (_, string) in property_key_strings.values() {
-            string.trace_gc(sink);
-        }
-        for (string, _, _) in str_units.values() {
-            string.trace_gc(sink);
-        }
-        for (string, text) in re_texts.values() {
-            string.trace_gc(sink);
-            text.trace_gc(sink);
         }
         if let Some((string, _, text)) = re_text_ascii_hot {
             string.trace_gc(sink);

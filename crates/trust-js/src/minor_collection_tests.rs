@@ -350,3 +350,39 @@ fn gc_stress_collects_minorly_with_every_mth_collection_major() {
         "2016"
     );
 }
+
+/// A minor collection takes an old Realm's global object for the Realm's whole group (its
+/// members and its [[TemplateMap]]), so a template object made since the last collection, held
+/// only by the map (and weakly), survives it: the site still yields that very object. Were the
+/// group not activated, the object would die, its WeakRef would clear, and the site would
+/// make another.
+#[test]
+fn a_minor_collection_keeps_an_old_realms_young_template_objects() {
+    for tier in [Tier::Interp, Tier::Bytecode] {
+        let mut engine = engine(tier);
+        eval(
+            &mut engine,
+            "function tag(s) { return s; }\n\
+             function site() { return tag`x${0}y`; }\n\
+             var weak; true",
+        );
+        engine.interp.gc_collect();
+        // Made now, young, and held by the Realm's template map alone.
+        eval(&mut engine, "weak = new WeakRef(site()); true");
+        engine.interp.gc_collect_minor();
+        // Freed cells would be taken again here.
+        eval(
+            &mut engine,
+            "for (let i = 0; i < 3000; i++) ({i, s: 'v' + i}); true",
+        );
+        engine.interp.gc_collect_minor();
+        assert_eq!(
+            eval(
+                &mut engine,
+                "var a = weak.deref(); [a === site(), a.raw.join(), a.join()].join('|')"
+            ),
+            "true|x,y|x,y",
+            "{tier:?}"
+        );
+    }
+}
