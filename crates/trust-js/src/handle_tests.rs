@@ -370,6 +370,27 @@ fn a_weak_handle_to_an_old_object_is_cleared_by_a_major_collection() {
     assert!(!alive(&observer));
 }
 
+/// The embedder's test hook runs a minor collection: it clears a weak handle to a dead young
+/// object and frees no old cell.
+#[test]
+fn the_host_test_hook_runs_a_minor_collection() {
+    let mut engine = quiet_engine();
+    let (strong, observer) = held_object(&mut engine, "old");
+    let old = strong.downgrade().expect("a weak handle");
+    engine.interp.gc_collect();
+    assert_eq!(age(&mut engine, &strong), Some(CellAge::Old));
+    drop(strong);
+    let (young, _) = weak_object(&mut engine);
+    let reclaimed = engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
+    assert!(reclaimed > 0, "the dead young object was reclaimed");
+    assert!(young.is_cleared());
+    assert!(
+        named(&mut engine, &old),
+        "a minor collection frees no old cell"
+    );
+    assert!(alive(&observer));
+}
+
 /// A counted handle holds its value while its count is above 0 and lets it die at 0: strong to
 /// weak and back to strong before a collection keeps it, and a value that died at 0 stays dead
 /// when the count rises again.

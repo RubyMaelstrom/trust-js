@@ -1994,6 +1994,15 @@ impl<'s> Ctx<'s> {
         self.interp.collect_garbage_for_host()
     }
 
+    /// Run a minor (young-generation) collection, or a major one when a major request is
+    /// pending, and return the number of reclaimed heap objects. Hosts use it to test that the
+    /// graphs they trace survive the minor path; it is not a stable API.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn unstable_collect_young_for_host_tests(&mut self) -> i64 {
+        self.interp.unstable_collect_young_for_host_tests()
+    }
+
     /// The number of heap objects the engine tracks.
     pub fn live_object_count(&self) -> i64 {
         self.interp.live_object_count()

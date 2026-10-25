@@ -6619,6 +6619,22 @@ impl Interp {
         before.saturating_sub(live)
     }
 
+    /// Run an explicit minor collection (a major one when a major request is pending) and
+    /// return the number of reclaimed heap objects: the test hook behind
+    /// `Ctx::unstable_collect_young_for_host_tests`.
+    #[inline(always)]
+    pub(crate) fn unstable_collect_young_for_host_tests(&mut self) -> i64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
+        self.activate_gc_heap();
+        let before = crate::value::heap_live_objects(&self.gc_heap);
+        self.gc_collect_with_cause(
+            crate::value::GcCause::Explicit,
+            Some(crate::gc_core::CollectionKind::Minor),
+        );
+        before.saturating_sub(crate::value::heap_live_objects(&self.gc_heap))
+    }
+
     /// Create a pending intrinsic Promise and its resolving functions for a host operation.
     ///
     /// This is the engine-facing form of ECMA-262 `CreateResolvingFunctions`: `resolve` and
