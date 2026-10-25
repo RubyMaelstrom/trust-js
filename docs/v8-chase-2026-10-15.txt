@@ -9303,3 +9303,236 @@ still calls Rust to allocate, through the cursor and byte charge that
 the inlined Rust path now uses. The barrier keeps one emitter per
 backend, which a marking barrier for incremental or concurrent marking
 would extend.
+
+
+GC rework: closing work and merge gates, 2026-10-25
+
+The owner, with the machine quiet: "proceed with any testing needed,
+then get the GC perfect and ready to merge."
+
+Release comparisons of 089c009e and e01f8942 use part B's protocol (fat
+LTO from a frozen source export, CPU 5, metrics enabled, 15 interleaved
+rounds of six workload/tier pairs over the candidate, its parent and
+matched main: 270 validated executions each, after a quiet minute). Raw
+results are under target/s6-gc-final-2026-10-25 and
+target/s6-gc-final2-2026-10-25.
+
+- 089c009e (the rework through 6defd5bb) against part D: wall time Vue
+  -3.4%, React -2.6%, Djot -5.5%, sustained allocation -20.0% (JIT) and
+  -15.0% (bytecode); total GC pause Vue -32.7%, React -14.2%, Djot
+  -38.9%, sustained -50%; React's peak RSS -9.8%, the others within
+  2.2%. Outputs equal.
+- Test262 on 089c009e: the release runner at JIT threshold 8 passes
+  53,575 of 53,575, its report identical to part D's; the debug runner
+  under GC stress (a collection at every allocation, JIT threshold 0)
+  fails only the two legacy f.arguments tests that also fail on
+  01220c04, and times out on 87 tests (01220c04: 79); the 8 new
+  timeouts pass when rerun with a 1,500 s limit.
+- An independent review of f0a618ff, 05986747 and 6defd5bb found no
+  defect a current path reaches and four latent ones, closed in
+  80e3810f: the Agent tag moved after the active-heap slot, a dropped
+  heap's ledger kept its due word, the decorator access functions read
+  their key from a payload the callee may drop, and the memory census
+  counted a shared bound payload once per object.
+- e8d3e060 and e01f8942 cut minor collections' fixed work, found by the
+  per-phase logs: the computed-read cache reported its up to 4,096
+  pinned keys at every collection, and Map and Set iterators kept their
+  state in a side table (about 540 written owners per Vue minor
+  collection), now a payload cell of the iterator; minor collections
+  look up only the side-slot owners written since the last one; and a
+  minor collection now evicts the computed-read keys that were young
+  when cached instead of pinning (and promoting) them.
+- e01f8942 against 089c009e: Vue wall -2.6%, total GC pause -49.9% (15.3
+  -> 7.6 ms), peak RSS -9.5%; the other workloads within 1%. Test262 as
+  on 089c009e, its stress run's timeouts back to 79 (one, sort_small.js,
+  not among 01220c04's, passes in 60 s rerun alone). The whole lib suite
+  passes under GC stress (2,478 tests: 26 slow ones at every 100th
+  allocation and 5 at every 1,000th), and zombie's routine checks match
+  6defd5bb's test for test.
+
+Marking throughput was the largest remaining cost: 41% of the four
+workloads' collection time, 88% of the sustained workload's major
+pauses. A major collection of a million-cell graph spent 409
+instructions and 94 cycles on each marked cell, at an IPC near 4: the
+cost was instructions, not memory.
+
+- df18f94d marks each edge as its trace reports it. The marker's traces
+  of objects, environments and closures are generic over the sink and
+  run on the marker's own, inline (two dynamic calls and a buffer per
+  edge before); testing an edge's mark reads a 16-byte record of its
+  page (MarkPage) and multiplies by the cell size's reciprocal instead
+  of dividing; a first mark is out of line and reads one cache line of
+  the reordered page metadata; BigInt, Symbol and layout cells are
+  leaves; and the drain prefetches cells through an 8-deep queue. Per
+  marked cell, 270 instructions and 57 cycles (-34%, -39%); drain time
+  per major collection -45% (mixed graph), -39% (one large array), -47%
+  (closures); tracing time in the fixtures' collections -26% to -34%
+  (the sustained workload's major collections -18%). The inlined marking
+  had kept the large cells' span in the stack scan's own frame in debug
+  builds, which kept the lowest large cell alive (a payload test caught
+  it): the scan now reads words from an out-of-line frame below them,
+  and the stack the roots' marking used is zeroed before the scan; a
+  test checks the scan's own frame.
+- 2f240f2e skips old cells in minor collections' client work: an old
+  global object stands for its Realm group (105 members were conditional
+  owners at every minor collection, about 0.3 us each), and the string
+  caches and the shape directory record what was written since the last
+  marking, which is all a minor collection traces of them. Per minor
+  collection: Vue 332 -> 283 us, React 169 -> 137, Djot 538 -> 487.
+
+The closing gates on 2f240f2e found a performance regression, and an
+independent review of df18f94d and 2f240f2e two defects, neither of
+which a release build reaches:
+
+- The GC stress run timed out on long_expression_chains_run at every
+  1,000th allocation (30 minutes; e01f8942's run passed it). On a fast
+  core alone it took 2,456 s and 9.61T instructions (e01f8942: 1,597 s
+  and 6.57T): df18f94d had inlined the lookup of a marked word and lost
+  locate's first test, so zero and small words, the commonest in frames,
+  went through the page table, which a debug build pays for at every
+  word of the test's deep native stacks. In release builds the loss
+  showed in deep recursion's roots: each active JIT record's 256-word
+  buffer is reported whole, most of it zero, through a dynamic call per
+  word. 5e8bccb6 drops words below the first page before the page table
+  (may_name_cell), as locate does, and scan_words drops them before its
+  sink. The test now takes 1,513 s and 6.02T instructions, and a script
+  allocating at the bottom of a 3,000-deep recursion marks in 380 ms
+  over 176 minor collections (e01f8942 682, 2f240f2e 791; roots 340,
+  532, 142).
+- Debug builds' checks after a minor marking examined the string caches
+  of every interpreter in the tree. A ShadowRealm made since the last
+  collection and unreachable at a minor one leaves its interpreter
+  untraced (rightly: the sweep drops it before it frees a cell), and
+  its caches can pin young cells, so the check panicked. 8035adbd checks
+  the interpreters whose roots the marking traced; a new test, which
+  fails without that, collects such a ShadowRealm with a young string's
+  code units and a for-in key list cached, and a kept one whose cached
+  state still serves.
+- MarkPage's pointer to a page's mark bits came from their Box, which
+  first marks and the clearing of marks then wrote through: undefined
+  behaviour under Stacked and Tree Borrows (the allocation cursor's
+  pointer to its page's allocation bits, under Tree Borrows), though
+  nothing could exploit it. In 8035adbd both bitmaps are raw
+  allocations whose own pointer the copies share.
+
+The review found the marker's generic traces report exactly the edges
+of the traces the verifier and barrier check run, no new leaf holding a
+cell (a Symbol's description and a layout's keys are counted strings),
+the page table and the mark pages in step through every page's making,
+reuse and release, the zombie and waiter flags never stale when read,
+the prefetch queue drained on every exit, and the Realm groups, cache
+records and layout records complete for every write path.
+
+Evaluated and not taken: prefetching each cell as it is queued (no
+change), the prefetch queue on the marker before df18f94d (18% slower:
+the per-edge work hid the misses), and caching only keys that were old
+when cached in the computed-read cache (a loop that allocates nothing
+never collects, so it would never cache).
+
+Where the branch's peak RSS goes beyond main's (React on 8035adbd,
+sampled from /proc/<pid>/smaps at its peak): the heap's chunks 4.1 MB,
+against 0.9 MB less malloc heap; the binary's text and read-only data
+0.4 MB more; and the stack, 284 KiB against main's 68. A nursery of
+512 KiB instead of 2 MiB takes 1.5 MB off React's peak. The stack was
+the collector's own:
+
+- Before marking, a collection zeroes the stack below its entry, and
+  again below gc_heap_mark once the client is built, so the frames live
+  when the stack scan starts hold no stale cell address; an explicit
+  collection first zeroes below its caller. Release builds zeroed
+  256 KiB and 1 MiB there, sizes for debug frames: the collector's
+  frames from those points down to the scan's own take 2.4 KiB (ARM64,
+  fat LTO), 2.7 KiB (ARM64 without LTO) and 2.5 KiB (x86-64), and
+  3.7 KiB below an explicit collection's caller. Zeroing makes the pages
+  resident: the metrics' exit collection left 1,032 KiB of the empty
+  script's stack resident (main 72), and each collection spent about
+  9 us zeroing (a React minor collection takes about 120 us). a8e89bdb
+  zeroes 16 and 32 KiB in optimized builds, at least six times the
+  frames, as begin_marking's zeroing already did; debug builds keep
+  256 KiB and 1 MiB, so every debug gate (the lib suite, its GC stress
+  run, Test262 under stress) runs what it ran on 8035adbd.
+- 4a6a8b4b compiles the functions only debug checks and tests call
+  under the same conditions as their callers: release builds with the
+  embed feature (the runtime's) had warned that two were never used
+  since f99a715f and 2f240f2e, and release test builds about five older
+  test helpers. Clippy with -D warnings passes for dev and release, all
+  targets, with and without embed.
+- f621124a names in DIAGNOSTICS.md the engine's step times and the
+  deferred and external counters that TRUST_JS_GC_LOG lines carry.
+
+The closing gates, and two rounds of fixes they led to:
+
+- f52e8c8a: zombie's x86-64 run of 4a6a8b4b failed
+  small_and_large_first_marks_queue_one_trace_each_and_then_hit (from
+  df18f94d), 4 lookups for 2. The positive-word cache is direct-mapped
+  and a large cell's entry follows the address its allocation got from
+  a thread's malloc arena, which the parallel harness varies: about one
+  run in 32 the large cell took the small cell's entry. The test now
+  takes a small cell with an entry of its own; another test covers
+  collisions.
+- 4c4348e9: main's lib suite passes as a release build (cargo test
+  --release, six runs of six); this branch's failed two tests every time
+  and one more in some runs, which no gate ran. A local that a test
+  expected to keep a WeakRef's target alive was dead to an optimized
+  build after its last use (a Value is a plain word); eval_module's
+  completion value, the module's namespace, stayed in the test's frame
+  (TRUST_JS_GC_WHY named it), which kept the namespace the test expected
+  collected; and two JIT measurements could start with a call site that
+  a concurrent test's recompile or code reclamation had left stale,
+  with the process-wide call-cache epoch unchanged during the run
+  measured (no collection ran during any failing one). The release
+  suite now passes five runs of five, 2,459 tests.
+- Lib suite on Crystal, debug: 2,477 passed, 7 ignored, on 8035adbd,
+  4a6a8b4b and 4c4348e9. GC stress on 8035adbd (debug builds of the
+  later commits run the same collector code): 2,446 tests at every
+  allocation (7 ignored), 26 slow ones at every 100th, 5 at every
+  1,000th, all passing, long_expression_chains_run included.
+- Test262 on 8035adbd: the release runner at JIT threshold 8 passes
+  53,575 of 53,575, its report identical to part D's (4a6a8b4b's too);
+  under GC stress at threshold 0 only the two legacy f.arguments
+  failures, and 82 timeouts (2f240f2e: 77) with the owner's game and
+  this pass's builds running; the six new ones pass when rerun alone
+  with a 1,500 s limit (329 s for the six).
+- zombie, 8035adbd, f52e8c8a and 4c4348e9: x86-64 2,304 passed; Wine
+  2,295 and the three known snapshot codec failures; clippy clean on
+  x86-64 and Windows's diagnostics the baseline's; fixtures and difftest
+  unchanged. 4c4348e9's lib suite as an x86-64 release build passes too
+  (2,286 tests).
+- Clippy with -D warnings passes for dev and release builds, all
+  targets, with and without embed.
+
+Release comparisons of 4a6a8b4b, whose non-test code 4c4348e9 keeps,
+use the same protocol: fat LTO from a frozen source export, CPU 5,
+metrics enabled, 15 interleaved rounds of six workload/tier pairs, 270
+validated executions per comparison after a quiet minute, outputs
+equal. Raw results are under target/s6-gc-final5-2026-10-25
+(measurement, measurement-vs-final4).
+
+- Against e01f8942, the last state measured (the marker, the minor
+  collections' client work, the closing fixes and the stack zeroing
+  together): total GC pause Vue -26.8% (7.6 -> 5.6 ms), React -31.7%
+  (3.6 -> 2.4 ms), Djot -27.9% (12.8 -> 9.2 ms), sustained allocation
+  -28.8% (JIT) and -28.6% (bytecode; 80 -> 57 ms); wall time -0.4%
+  (Vue) to -3.9% (sustained, JIT); peak RSS -1.9% to -3.9%.
+- Against 8035adbd, the stack zeroing alone: total GC pause -3.6%
+  (Djot) to -10.7% (React); peak RSS of the empty script -9.8%, Vue
+  -4.3%, the others within 1.7%; wall time within 1.4% (the empty
+  script -5.2%).
+- Against main (e3310993): wall time Vue -22.1%, React -15.9%, Djot
+  -17.6%, sustained allocation -60.4% (JIT) and -53.4% (bytecode), the
+  empty script +1.1% (its cycles -5.5%); peak RSS Vue -10.4%, Djot
+  -3.6%, sustained allocation -47%, the empty script -1.1% (+9.3% at
+  e01f8942), and React +26.6% (19.7 against 15.6 MB; +19.5% in the
+  second comparison, where main's React peaked at 16.3 MB); total GC
+  pause Vue -9.7%, Djot +6.5%, sustained allocation -88%, and React
+  2.4 ms against main's 0.3 ms of cycle collection.
+
+What remains of the collector's costs belongs with the object-model
+work (P2): environment records and property layouts still finalize to
+release their names' counts (a fifth of the sustained workload's minor
+collection time, Djot's layouts), which per-heap atoms and shared scope
+descriptors would remove; a minor collection still reads every carded
+page's summary byte (a chunk-level summary would need one more barrier
+store in both backends); elements stay 16-byte Properties and the object
+cell 192 bytes; generated code still calls Rust to allocate; and an
+incremental or concurrent marker would need a marking barrier.
