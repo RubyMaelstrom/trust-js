@@ -199,21 +199,35 @@ fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
                 assert_due_word(&engine.interp);
                 census
             }
-            // A concurrent test can exhaust the call-cache epoch, which sends calls through
-            // the checked helper until their sites refill: measure a round that returned
-            // through the direct sequence at every level.
+            // A concurrent test that recompiles a chunk or reclaims native code advances the
+            // call-cache epoch, which sends calls through the checked helper until their sites
+            // refill: measure a round that returned through the direct sequence at every level.
+            // Only rounds that ended at the epoch the previous round started at, which refilled
+            // every site at the epoch they used, count toward giving up.
             #[cfg(target_arch = "aarch64")]
-            for _ in 0..100 {
-                super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
-                let (result, census) = measured(&mut engine, &format!("down({N});"));
-                assert_eq!(result, (N * (N + 1) / 2).to_string());
-                assert_due_word(&engine.interp);
-                if super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) as u64 >= 2 * N {
-                    return census;
+            {
+                let epoch =
+                    || crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+                let (mut previous_start, mut settled) = (None, 0);
+                for _ in 0..2000 {
+                    let start = epoch();
+                    super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
+                    let (result, census) = measured(&mut engine, &format!("down({N});"));
+                    assert_eq!(result, (N * (N + 1) / 2).to_string());
+                    assert_due_word(&engine.interp);
+                    if super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) as u64 >= 2 * N {
+                        return census;
+                    }
+                    if previous_start == Some(epoch()) {
+                        settled += 1;
+                        if settled == 100 {
+                            break;
+                        }
+                    }
+                    previous_start = Some(start);
                 }
+                panic!("down({N}) never returned through direct calls ({settled} settled rounds)");
             }
-            #[cfg(target_arch = "aarch64")]
-            panic!("down({N}) never returned through direct calls");
         };
         let census = if end_polls {
             measure()

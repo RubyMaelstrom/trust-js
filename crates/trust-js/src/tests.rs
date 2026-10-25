@@ -20187,13 +20187,17 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
     engine.set_host_job_context(61);
     classic(&mut engine, "const retiredLexical = { retained: true };")
         .unwrap_or_else(|_| panic!("retired classic script evaluates"));
-    engine
-        .eval_module(
-            "export const retainedModuleValue = { retained: true };",
-            "https://example.test/retired.js",
-            |_, _| None,
-        )
-        .expect("retired module parses");
+    // A module's completion value is its namespace: evaluated in a helper frame, it leaves no
+    // copy in this frame, which the collections below scan.
+    crate::gc_test::in_frame(|| {
+        engine
+            .eval_module(
+                "export const retainedModuleValue = { retained: true };",
+                "https://example.test/retired.js",
+                |_, _| None,
+            )
+            .expect("retired module parses");
+    });
     classic(
         &mut engine,
         "Promise.resolve().then(() => retiredJobRan = true);",

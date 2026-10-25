@@ -1028,6 +1028,9 @@ mod tests {
             .targets
             .contains_key(&other_weak.key()));
         assert!(crate::gc_test::alive(&other_weak));
+        // `other` holds the target through the collections: a Value is a plain word, which an
+        // optimized build would otherwise let go after its last use above.
+        std::hint::black_box(&other);
     }
 
     #[test]

@@ -91,11 +91,14 @@ fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
         for(var warm=0;warm<160;warm++)point('é😀',1);
     "#,
     );
-    // CALL_IC_EPOCH is process-wide: a concurrently running test that recompiles a chunk
-    // invalidates every cached call site, and the next few calls here legitimately revalidate
-    // through the generic path. Measure a run during which the epoch stayed unchanged.
+    // CALL_IC_EPOCH is process-wide: a concurrently running test that recompiles a chunk or
+    // reclaims native code invalidates every cached call site, and the next few calls here
+    // legitimately revalidate through the generic path. Measure a run that ended at the epoch
+    // the previous run started at: that run refilled every site at the epoch this one used (a
+    // run that saw no change could still start with a site an earlier change left stale).
     let (mut hits, mut epoch_before, mut epoch_after) = (0, 0, 1);
-    for _attempt in 0..20 {
+    let mut previous_start = None;
+    for _attempt in 0..200 {
         let before = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get);
         epoch_before = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
@@ -111,9 +114,10 @@ fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
         );
         hits = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get) - before;
         epoch_after = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
-        if epoch_before == epoch_after {
+        if previous_start == Some(epoch_after) {
             break;
         }
+        previous_start = Some(epoch_before);
     }
     assert!(hits >= 120,
         "warm String/Number calls bypass generic native argument decoding: {hits} hits, epoch {epoch_before}->{epoch_after}");
