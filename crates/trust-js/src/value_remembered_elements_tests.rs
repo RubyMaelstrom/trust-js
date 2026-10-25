@@ -620,15 +620,19 @@ fn unwinding_after_elements_before_callable_edges_does_not_consume_dirtiness() {
         .dirty
         .borrow()
         .to_vec();
+    struct PanicAt(u64);
+    impl GcSink for PanicAt {
+        fn word(&mut self, word: u64) {
+            if word == self.0 {
+                panic!("after packed elements")
+            }
+        }
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        mark_object_cell(
-            Gc::as_ptr(&array) as *const u8,
+        mark_object(
+            &array.borrow(),
             TracePurpose::Remembered,
-            &mut |edge| {
-                if edge == Gc::as_ptr(&target) as *const u8 {
-                    panic!("after packed elements")
-                }
-            },
+            &mut PanicAt(Gc::as_ptr(&target) as u64),
         );
     }));
     assert!(result.is_err());

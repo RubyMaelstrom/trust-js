@@ -262,7 +262,11 @@ impl Value {
     /// The untagged cell address held as a strong GC edge. Scalar words are never roots.
     #[inline]
     pub(crate) fn cell_word(&self) -> Option<u64> {
-        matches!(self.tag(), PACK_BIGINT | PACK_STR | PACK_SYM | PACK_OBJ)
+        // The tags of BigInt, string and Symbol cells are consecutive, the object tag apart.
+        const _: () =
+            assert!(PACK_STR == PACK_BIGINT + (1 << 48) && PACK_SYM == PACK_STR + (1 << 48));
+        let tag = self.0 >> 48;
+        (tag.wrapping_sub(PACK_BIGINT >> 48) < 3 || tag == PACK_OBJ >> 48)
             .then_some(self.0 & PACK_PAYLOAD)
     }
 }
@@ -492,7 +496,8 @@ impl PropWord {
         self.0.swap(&other.0);
     }
 
-    fn trace_gc_edges(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+    #[inline]
+    fn trace_gc_edges<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         if self.tag() == PACK_LAZY_PROTO {
             sink.word(self.0.get() & PACK_PAYLOAD);
         } else {
@@ -3144,12 +3149,15 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let scope = core.register_desc(crate::gc_core::LayoutDesc {
         name: "environment",
         trace: trace_scope_cell,
-        mark_trace: None,
+        mark_trace: Some(mark_scope_cell),
         finalize: Some(finalize_scope_cell),
         carded: true,
     });
+    // BigInts, Symbols and property layouts hold no edges either: marking one queues no trace.
     let bigint = core.register_desc(crate::bigint::cell_layout());
+    core.set_leaf(bigint);
     let symbol = core.register_desc(symbol_cell_layout());
+    core.set_leaf(symbol);
     let string = core.register_desc(crate::lstr::cell_layout());
     let user_fn = core.register_desc(crate::gc_core::LayoutDesc {
         name: "closure",
@@ -3175,6 +3183,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
         finalize: Some(crate::gc_box::finalize::<PropertyLayoutData>),
         carded: false,
     });
+    core.set_leaf(property_layout);
     (
         core,
         CellDescs {
@@ -3214,22 +3223,28 @@ impl crate::gc_box::Payload for LazyFunctionPrototype {
 fn mark_user_fn_cell(
     cell: *const u8,
     _purpose: crate::gc_core::TracePurpose,
-    visit: &mut dyn FnMut(*const u8),
+    sink: &mut crate::gc_core::MarkSink<'_>,
 ) {
     // SAFETY: as in `trace_user_fn_cell`.
     let user = unsafe { &*cell.cast::<UserCallable>() };
     mark_closure_function(&user.func);
-    trace_user_fn_cell(cell, visit);
+    trace_user_fn(user, sink);
 }
 
 /// A closure's environment and immutable runtime source-record edges.
 fn trace_user_fn_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     // SAFETY: closure cells are initialized by `gc_box::new` before any collection.
     let user = unsafe { &*cell.cast::<UserCallable>() };
-    visit(Env::as_ptr(&user.env).cast());
+    trace_user_fn(user, &mut crate::gc_trace::VisitSink(visit));
+}
+
+/// [`trace_user_fn_cell`]'s edges, for any sink.
+#[inline]
+fn trace_user_fn<S: crate::gc_trace::TraceSink + ?Sized>(user: &UserCallable, sink: &mut S) {
+    sink.env(&user.env);
     let metadata = user.cache.take();
     if let Some(metadata) = &metadata {
-        crate::gc_storage::PayloadBox::trace(metadata, &mut crate::gc_trace::VisitSink(visit));
+        crate::gc_storage::PayloadBox::trace(metadata, sink);
     }
     let origin = match metadata.as_ref().filter(|metadata| metadata.own_origin) {
         Some(metadata) => metadata.origin.as_ref(),
@@ -3237,7 +3252,7 @@ fn trace_user_fn_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
         None => None,
     };
     if let Some(origin) = origin {
-        crate::gc_trace::GcTrace::trace_gc(origin, &mut crate::gc_trace::VisitSink(visit));
+        origin.trace_edges(sink);
     }
     user.cache.set(metadata);
 }
@@ -3520,12 +3535,22 @@ fn trace_object_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
 fn mark_object_cell(
     cell: *const u8,
     purpose: crate::gc_core::TracePurpose,
-    visit: &mut dyn FnMut(*const u8),
+    sink: &mut crate::gc_core::MarkSink<'_>,
 ) {
     // SAFETY: the actual marker runs at the same unborrowed safepoint as trace_object_cell.
     let object = unsafe { (*(cell as *const RefCell<Object>)).try_borrow_unguarded() }
         .expect("object mutably borrowed during GC (I9)");
-    object.trace_gc_fields(&mut crate::gc_trace::VisitSink(visit), Some(purpose));
+    mark_object(object, purpose, sink);
+}
+
+/// [`mark_object_cell`]'s work on its object, for any sink.
+#[inline]
+fn mark_object<S: crate::gc_trace::TraceSink + ?Sized>(
+    object: &Object,
+    purpose: crate::gc_core::TracePurpose,
+    sink: &mut S,
+) {
+    object.trace_gc_fields(sink, Some(purpose));
     // Commit only after ALL element and non-element edges were successfully reported. A panic
     // leaves the original obligations intact; between-phase writes are recorded afterwards.
     object.props.elems.finish_packed_mark_trace();
@@ -3539,6 +3564,22 @@ fn trace_scope_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
         unsafe { (*(cell as *const RefCell<crate::interpreter::Scope>)).try_borrow_unguarded() }
             .expect("environment mutably borrowed during GC (I9)");
     scope.trace_gc(&mut crate::gc_trace::VisitSink(visit));
+}
+
+/// The marker's trace of an environment record ([`LayoutDesc::mark_trace`]): the same edges as
+/// [`trace_scope_cell`]'s.
+///
+/// [`LayoutDesc::mark_trace`]: crate::gc_core::LayoutDesc::mark_trace
+fn mark_scope_cell(
+    cell: *const u8,
+    _purpose: crate::gc_core::TracePurpose,
+    sink: &mut crate::gc_core::MarkSink<'_>,
+) {
+    // SAFETY: as in `trace_scope_cell`.
+    let scope =
+        unsafe { (*(cell as *const RefCell<crate::interpreter::Scope>)).try_borrow_unguarded() }
+            .expect("environment mutably borrowed during GC (I9)");
+    scope.trace_fields(sink);
 }
 
 /// Release the record's Rust-heap payload when its cell dies.
@@ -3577,9 +3618,10 @@ impl crate::gc_trace::GcTrace for Object {
 
 impl Object {
     /// A single exhaustive edge inventory for ordinary tracing and both actual marker modes.
-    fn trace_gc_fields(
+    #[inline]
+    fn trace_gc_fields<S: crate::gc_trace::TraceSink + ?Sized>(
         &self,
-        sink: &mut dyn crate::gc_trace::GcSink,
+        sink: &mut S,
         purpose: Option<crate::gc_core::TracePurpose>,
     ) {
         use crate::gc_trace::GcTrace;
@@ -3613,7 +3655,7 @@ impl Object {
             }
         } else {
             for property in props.packed_values() {
-                property.trace_gc(sink);
+                property.trace_edges(sink);
             }
         }
         // Named/classic properties and every non-element edge are ALWAYS complete.
@@ -3623,9 +3665,11 @@ impl Object {
             .iter()
             .chain(self.internal_slots().values())
         {
-            property.trace_gc(sink);
+            property.trace_edges(sink);
         }
-        props.entries.layout.trace_gc(sink);
+        if let Some(layout) = &props.entries.layout {
+            sink.layout(layout);
+        }
         props.trace_symbol_keys(sink);
         // Each payload cell (`gc_storage::PayloadBox`, `gc_storage::SharedPayload`), with what
         // its value holds.
@@ -3646,7 +3690,7 @@ impl Object {
             }
             Exotic::StringIterator(state) => {
                 PayloadBox::trace(state, sink);
-                state.string.trace_gc(sink);
+                state.string.trace_gc(sink.as_dyn());
             }
             Exotic::CollectionIterator(state) => {
                 PayloadBox::trace(state, sink);
@@ -3654,8 +3698,8 @@ impl Object {
                     sink.object(target);
                 }
             }
-            Exotic::Error(stack) => stack.trace_gc(sink), // the cell and the frame names
-            Exotic::Collection(data) => data.trace_gc(sink), // the cell and the entries
+            Exotic::Error(stack) => stack.trace_gc(sink.as_dyn()), // the cell and the frame names
+            Exotic::Collection(data) => data.trace_gc(sink.as_dyn()), // the cell and the entries
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)
@@ -3682,7 +3726,7 @@ impl Object {
                 SharedPayload::trace(cross, sink);
                 sink.value(&cross.target);
             }
-            Callable::NativeData(native) => native.trace_gc(sink), // the cell and the captures
+            Callable::NativeData(native) => native.trace_gc(sink.as_dyn()), // the cell and the captures
             Callable::AccessorGet(key)
             | Callable::AccessorSet(key)
             | Callable::PropGet(key)
@@ -3711,7 +3755,8 @@ impl Props {
     /// Report the storage blocks this map's payloads live in (`gc_storage`): the named
     /// properties' spill, the element sidecar and the blocks it holds. Every trace of the map's
     /// owner reports them, since nothing else keeps them alive.
-    pub(crate) fn trace_storage(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+    #[inline]
+    pub(crate) fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         if let Some(spill) = self.entries.fields.spill_ptr() {
             crate::gc_storage::trace_block(spill, sink);
         }
@@ -3719,7 +3764,8 @@ impl Props {
     }
 
     /// The Symbols of Symbol-valued keys, which the encoded keys only name by id.
-    pub(crate) fn trace_symbol_keys(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+    #[inline]
+    pub(crate) fn trace_symbol_keys<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         if let Some(symbols) = self.elems.symbols() {
             for symbol in symbols.values() {
                 sink.word(symbol_identity(symbol) as u64);
@@ -3743,8 +3789,24 @@ impl crate::gc_trace::GcTrace for PropertyKey {
 
 impl crate::gc_trace::GcTrace for Property {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.trace_edges(sink);
+    }
+}
+
+impl Property {
+    /// [`GcTrace`](crate::gc_trace::GcTrace)'s edges, for any sink: the value, and an
+    /// accessor's pair out of line.
+    #[inline(always)]
+    fn trace_edges<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         self.packed.trace_gc_edges(sink);
-        // The pair's cell, and its functions, which its trace reports again.
+        if self.accessor_cell_word().is_some() {
+            self.trace_accessor_edges(sink);
+        }
+    }
+
+    /// An accessor property's pair: its cell, and its functions, which its trace reports again.
+    #[inline(never)]
+    fn trace_accessor_edges<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         if let Some(cell) = self.accessor_cell_word() {
             sink.word(cell);
         }
@@ -5814,10 +5876,10 @@ impl PackedBuffer {
         self.full_mut().prepend(items);
     }
 
-    fn trace_elements(
+    fn trace_elements<S: crate::gc_trace::GcSink + ?Sized>(
         &self,
         purpose: crate::gc_core::TracePurpose,
-        sink: &mut dyn crate::gc_trace::GcSink,
+        sink: &mut S,
     ) {
         let Self {
             values,
@@ -5877,9 +5939,10 @@ impl PackedBuffer {
     }
 }
 
-fn trace_packed_property(
+#[inline]
+fn trace_packed_property<S: crate::gc_trace::GcSink + ?Sized>(
     property: &Property,
-    sink: &mut dyn crate::gc_trace::GcSink,
+    sink: &mut S,
     purpose: Option<crate::gc_core::TracePurpose>,
 ) {
     #[cfg(test)]
@@ -5893,7 +5956,7 @@ fn trace_packed_property(
     #[cfg(not(test))]
     let _ = purpose;
     if !property.is_empty() {
-        crate::gc_trace::GcTrace::trace_gc(property, sink);
+        property.trace_edges(sink);
     }
 }
 
@@ -5966,7 +6029,8 @@ impl DenseStorage {
     }
 
     /// Report the sidecar's block and the blocks it holds (see [`Props::trace_storage`]).
-    fn trace_storage(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+    #[inline]
+    fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         use crate::gc_storage::{trace_block, StorageBox};
         if let Some(extras) = &self.1 {
             crate::gc_storage::PayloadBox::trace(extras, sink);

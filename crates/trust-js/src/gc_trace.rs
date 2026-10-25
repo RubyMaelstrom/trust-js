@@ -39,6 +39,62 @@ pub(crate) trait GcSink {
     }
 }
 
+/// A sink as a trait object, for the [`GcTrace`] impls a generic trace calls: a generic trace
+/// (`S: TraceSink + ?Sized`) runs on the marker's sink ([`crate::gc_core::MarkSink`]), whose
+/// edges it marks without a dynamic call, and on any `dyn GcSink`.
+pub(crate) trait AsGcSink {
+    fn as_dyn(&mut self) -> &mut dyn GcSink;
+}
+
+impl<T: GcSink> AsGcSink for T {
+    #[inline]
+    fn as_dyn(&mut self) -> &mut dyn GcSink {
+        self
+    }
+}
+
+impl AsGcSink for dyn GcSink + '_ {
+    #[inline]
+    fn as_dyn(&mut self) -> &mut dyn GcSink {
+        self
+    }
+}
+
+/// What a generic trace takes: a concrete sink or a trait object.
+pub(crate) trait TraceSink: GcSink + AsGcSink {}
+
+impl<T: GcSink + AsGcSink + ?Sized> TraceSink for T {}
+
+/// The marker's sink marks each edge as it is reported, inline in the generic traces.
+impl GcSink for crate::gc_core::MarkSink<'_> {
+    #[inline(always)]
+    fn word(&mut self, word: u64) {
+        self.mark(word);
+    }
+
+    #[inline(always)]
+    fn layout(&mut self, layout: &crate::value::PropertyLayout) {
+        self.mark(layout.cell_word());
+    }
+
+    #[inline(always)]
+    fn object(&mut self, object: &Gc) {
+        self.mark(Gc::as_ptr(object) as u64);
+    }
+
+    #[inline(always)]
+    fn env(&mut self, env: &Env) {
+        self.mark(Env::as_ptr(env) as u64);
+    }
+
+    #[inline(always)]
+    fn value(&mut self, value: &Value) {
+        if let Some(word) = value.cell_word() {
+            self.mark(word);
+        }
+    }
+}
+
 /// Report every strong GC edge this value holds.
 pub(crate) trait GcTrace {
     fn trace_gc(&self, sink: &mut dyn GcSink);

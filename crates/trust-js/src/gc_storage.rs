@@ -64,7 +64,7 @@ pub(crate) fn alloc_block(bytes: usize) -> NonNull<u8> {
 
 /// Report the block at `ptr` as an edge of its owner (see the module comment).
 #[inline]
-pub(crate) fn trace_block(ptr: *const u8, sink: &mut dyn GcSink) {
+pub(crate) fn trace_block<S: GcSink + ?Sized>(ptr: *const u8, sink: &mut S) {
     sink.word(ptr as u64);
 }
 
@@ -93,7 +93,7 @@ impl<T> StorageBox<T> {
 
     /// Report the block to `sink` (see [`trace_block`]).
     #[inline]
-    pub(crate) fn trace(this: &Self, sink: &mut dyn GcSink) {
+    pub(crate) fn trace<S: GcSink + ?Sized>(this: &Self, sink: &mut S) {
         trace_block(this.0.as_ptr().cast(), sink);
     }
 }
@@ -196,7 +196,7 @@ impl<T: PayloadKind> PayloadBox<T> {
 
     /// Report the cell to `sink`.
     #[inline]
-    pub(crate) fn trace(this: &Self, sink: &mut dyn GcSink) {
+    pub(crate) fn trace<S: GcSink + ?Sized>(this: &Self, sink: &mut S) {
         trace_block(this.0.as_ptr().cast(), sink);
     }
 }
@@ -276,7 +276,7 @@ impl<T: PayloadKind> SharedPayload<T> {
 
     /// Report the cell to `sink`.
     #[inline]
-    pub(crate) fn trace(this: &Self, sink: &mut dyn GcSink) {
+    pub(crate) fn trace<S: GcSink + ?Sized>(this: &Self, sink: &mut S) {
         trace_block(this.0.as_ptr().cast(), sink);
     }
 }

@@ -54,6 +54,14 @@ pub(crate) struct ReferrerRecord {
 
 impl GcTrace for ReferrerRecord {
     fn trace_gc(&self, sink: &mut dyn GcSink) {
+        self.trace_edges(sink);
+    }
+}
+
+impl ReferrerRecord {
+    /// [`GcTrace`]'s edges, for any sink (a closure's trace reports its origin's).
+    #[inline]
+    pub(crate) fn trace_edges<S: crate::gc_trace::TraceSink + ?Sized>(&self, sink: &mut S) {
         let Self {
             source: _,
             referrer: _,
@@ -64,8 +72,10 @@ impl GcTrace for ReferrerRecord {
             kind: _,
             loaded: _,
         } = self;
-        owner.trace_gc(sink);
-        realm.trace_gc(sink);
+        owner.trace_gc(sink.as_dyn());
+        if let Some(realm) = realm {
+            sink.object(realm);
+        }
     }
 }
 

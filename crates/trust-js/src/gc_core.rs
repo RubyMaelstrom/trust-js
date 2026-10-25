@@ -745,7 +745,23 @@ pub(crate) enum TracePurpose {
     Remembered,
 }
 
-pub(crate) type MarkTraceFn = fn(*const u8, TracePurpose, &mut dyn FnMut(*const u8));
+pub(crate) type MarkTraceFn = fn(*const u8, TracePurpose, &mut MarkSink<'_>);
+
+/// What the marker hands a [`LayoutDesc::mark_trace`]: each edge reported to it is marked at
+/// once ([`MarkSink::mark`]), through the path every word the marker resolves takes, with no
+/// buffer and no dynamic call between the trace and the mark.
+pub(crate) struct MarkSink<'a> {
+    heap: &'a mut Heap,
+    m: &'a mut Marker,
+}
+
+impl MarkSink<'_> {
+    /// Mark the cell `word` names, if it names one of this heap's (see [`Heap::mark_word`]).
+    #[inline(always)]
+    pub(crate) fn mark(&mut self, word: u64) {
+        self.heap.mark_word(word, self.m);
+    }
+}
 
 #[derive(Clone, Copy)]
 struct TraceWork {
@@ -826,28 +842,42 @@ impl EdgeSink<'_> {
     }
 }
 
+/// A page's metadata. Marking tests a cell's mark through the page's [`MarkPage`]; a first
+/// mark ([`Heap::mark_unmarked`]) reads the fields before `cells`, in the struct's first cache
+/// line.
+#[repr(C, align(64))]
 struct PageMeta {
     base: usize,
+    /// Set by the marking that found a cell reachable, and kept by the sweep: between
+    /// collections a marked cell is old (a collection kept it), an allocated unmarked one young
+    /// (allocated since). A major collection clears them before it marks; a minor one keeps
+    /// them.
+    marks: Box<[u64]>,
+    /// Allocated (handed-out) cells. Conservative marking must ignore
+    /// free cells: a stale stack word resolving into a free cell would
+    /// otherwise "mark" free-list linkage and trace it as payload.
+    allocated: Box<[u64]>,
     cell_size: usize,
-    cells: usize,
     desc: DescId,
-    class: usize,
+    /// `ceil(2^32 / cell_size)`, by which [`PageMeta::cell_index`] divides.
+    reciprocal: u32,
+    /// The page's kind holds no edges ([`Heap::set_leaf`]): marking one of its cells queues no
+    /// trace.
+    leaf: bool,
+    /// Some cell of the page is a zombie (see `zombies`): only then does marking read them.
+    has_zombies: bool,
+    /// A conditional edge waits on some cell of the page in the marking in progress (see
+    /// `waiters`): only then does a first mark read them.
+    has_waiters: bool,
     /// The page ends in a card table ([`LayoutDesc::carded`]).
     carded: bool,
+    cells: usize,
+    class: usize,
     /// The page received a cell since the last collection (it was made, or a cell was taken
     /// from its reclaimed list or virgin tail), and is listed in `Heap::young_pages`: only
     /// such a page can hold a young cell, so only such pages are swept by a minor collection.
     /// Cleared by every sweep.
     young: bool,
-    /// Set by the marking that found a cell reachable, and kept by the sweep: between
-    /// collections a marked cell is old (a collection kept it), an allocated unmarked one young
-    /// (allocated since). A major collection clears them before it marks; a minor one keeps
-    /// them.
-    marks: Vec<u64>,
-    /// Allocated (handed-out) cells. Conservative marking must ignore
-    /// free cells: a stale stack word resolving into a free cell would
-    /// otherwise "mark" free-list linkage and trace it as payload.
-    allocated: Vec<u64>,
     /// Cells a conditional edge is waiting on during this collection.
     waiters: Vec<u64>,
     /// Dead cells already finalized but still pinned by weak handles: like the allocation
@@ -872,9 +902,60 @@ struct PageMeta {
     live: usize,
 }
 
+// A first mark's fields end within the struct's first cache line.
+const _: () = assert!(std::mem::offset_of!(PageMeta, cells) <= 64);
+
+/// What marking reads of a page to test an edge's mark ([`Heap::mark_small`]), by page slot
+/// beside `Heap::pages`, 16 bytes a page: the heap's are few enough to stay in the nearest
+/// cache, where its [`PageMeta`]s are not. A page's address is its edges' with the low
+/// `PAGE_SHIFT` bits clear. A free slot's has no cells.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct MarkPage {
+    /// The page's `PageMeta::marks`, whose boxed bits stay where they are while it lives.
+    marks: *const u64,
+    /// As `PageMeta::reciprocal` and `PageMeta::cells`.
+    reciprocal: u32,
+    cells: u32,
+}
+
+impl MarkPage {
+    const FREE: Self = Self {
+        marks: std::ptr::null(),
+        reciprocal: 0,
+        cells: 0,
+    };
+
+    fn of(page: &PageMeta) -> Self {
+        Self {
+            marks: page.marks.as_ptr(),
+            reciprocal: page.reciprocal,
+            cells: u32::try_from(page.cells).expect("a page's cells"),
+        }
+    }
+
+    /// The index of the cell the address `addr`, in this page, falls in, as
+    /// [`PageMeta::cell_index`] finds it.
+    #[inline(always)]
+    fn cell_index(&self, addr: usize) -> usize {
+        (((addr & (PAGE_SIZE - 1)) as u64 * u64::from(self.reciprocal)) >> 32) as usize
+    }
+}
+
 impl PageMeta {
     fn cell_ptr(&self, index: usize) -> usize {
         self.base + index * self.cell_size
+    }
+
+    /// The index of the cell the address `addr`, in this page, falls in: `cells` or more for
+    /// the page's tail past its last cell and its card table. `offset / cell_size`, by a
+    /// multiplication. Exact: the reciprocal exceeds 2^32 / cell_size by less than one and the
+    /// offset is below 2^16, so the product exceeds the quotient by less than 2^-16, while a
+    /// non-integral quotient is at least 1 / cell_size >= 2^-12 short of the next integer.
+    #[inline(always)]
+    fn cell_index(&self, addr: usize) -> usize {
+        debug_assert!(addr.wrapping_sub(self.base) < PAGE_SIZE);
+        (((addr - self.base) as u64 * u64::from(self.reciprocal)) >> 32) as usize
     }
 
     /// Whether the card of the cell at `index` is set: always false on a page without a card
@@ -946,7 +1027,7 @@ impl PageMeta {
             // the product exceeds the quotient by less than 2^-15, while a non-integral quotient
             // is at least 1 / cell_size >= 2^-12 short of the next integer.
             let size = self.cell_size as u64;
-            let reciprocal = (1u64 << 32).div_ceil(size);
+            let reciprocal = u64::from(self.reciprocal);
             let first_at =
                 |offset: usize| (((offset as u64 + size - 1) * reciprocal) >> 32) as usize;
             for word in 0..WORDS {
@@ -1215,16 +1296,39 @@ struct Marker {
     /// Waiting edges keyed by cell start >> 4 (cells are 16-aligned).
     waiting: FastMap<usize, Vec<u32>>,
     ready: Vec<u32>,
-    trace_scratch: Vec<*const u8>,
 }
 
 /// A small direct-mapped table of exact positive words. Cell and page bits both
 /// participate so aligned shared prototype/layout addresses do not systematically collide.
 const MARK_CACHE_WORDS: usize = 32;
 const _: () = assert!(MARK_CACHE_WORDS.is_power_of_two());
-/// Amortize cache probes on short descriptor traces. Larger batches still mark every word,
-/// including repetitions, through the uncached specialization selected once in `drain`.
-const MARK_CACHE_BATCH_LIMIT: usize = 64;
+/// How many cells [`Heap::drain`] prefetches ahead of tracing them.
+const MARK_PREFETCH: usize = 8;
+
+/// Ask the CPU to bring the first two cache lines of the cell at `addr` closer ahead of its
+/// trace. A hint: it neither faults nor changes memory.
+#[inline(always)]
+fn prefetch_cell(addr: usize) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: PRFM only hints; it never faults, whatever the address.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            "prfm pldl1keep, [{0}, #64]",
+            in(reg) addr,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: PREFETCHT0 only hints; it never faults, whatever the address.
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch::<_MM_HINT_T0>(addr as *const i8);
+        _mm_prefetch::<_MM_HINT_T0>(addr.wrapping_add(64) as *const i8);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = addr;
+}
 
 #[derive(Default)]
 struct PositiveWords {
@@ -1337,6 +1441,8 @@ pub(crate) struct Heap {
     cursors: Vec<Cursor>,
     /// Slots are reused after release, so page indices stay stable.
     pages: Vec<Option<PageMeta>>,
+    /// By page slot, what marking reads first ([`MarkPage`]).
+    mark_pages: Vec<MarkPage>,
     free_page_slots: Vec<u32>,
     /// P1 S4: the memory of released pages, kept (resident) for reuse, so that pages that empty
     /// out every cycle do not go back to the page source and come again, faulting anew. Trimmed
@@ -1448,6 +1554,7 @@ impl Heap {
             classes: Vec::new(),
             cursors: Vec::new(),
             pages: Vec::new(),
+            mark_pages: Vec::new(),
             free_page_slots: Vec::new(),
             spare_pages: Vec::new(),
             page_source: page_source::PageSource::new(),
@@ -1528,6 +1635,11 @@ impl Heap {
     /// mark and queues no trace.
     pub(crate) fn set_leaf(&mut self, desc: DescId) {
         self.leaf[desc.0 as usize] = true;
+        for page in self.pages.iter_mut().flatten() {
+            if page.desc == desc {
+                page.leaf = true;
+            }
+        }
     }
 
     /// Record why each cell is marked, for [`Heap::retention_path`] (diagnostics: costs a map
@@ -2135,13 +2247,18 @@ impl Heap {
         let mut meta = PageMeta {
             base: base as usize,
             cell_size,
+            reciprocal: u32::try_from((1u64 << 32).div_ceil(cell_size as u64))
+                .expect("a cell of at least 2 bytes"),
             cells,
             desc,
             class,
             carded,
+            leaf: self.leaf[desc.0 as usize],
+            has_zombies: false,
+            has_waiters: false,
             young: true,
-            marks: vec![0; words],
-            allocated: vec![0; words],
+            marks: vec![0; words].into_boxed_slice(),
+            allocated: vec![0; words].into_boxed_slice(),
             waiters: vec![0; words],
             zombies: vec![0; words],
             pins: vec![0; words],
@@ -2151,13 +2268,16 @@ impl Heap {
             live: 0,
         };
         meta.clear_cards();
+        let mark_page = MarkPage::of(&meta);
         let index = match self.free_page_slots.pop() {
             Some(index) => {
                 self.pages[index as usize] = Some(meta);
+                self.mark_pages[index as usize] = mark_page;
                 index
             }
             None => {
                 self.pages.push(Some(meta));
+                self.mark_pages.push(mark_page);
                 (self.pages.len() - 1) as u32
             }
         };
@@ -2213,7 +2333,7 @@ impl Heap {
         }
         if let Some(index) = self.page_table.get(addr >> PAGE_SHIFT) {
             let page = self.pages[index as usize].as_ref()?;
-            let cell = (addr - page.base) / page.cell_size;
+            let cell = page.cell_index(addr);
             return (cell < page.cells).then(|| CellRef {
                 start: page.cell_ptr(cell),
                 desc: page.desc,
@@ -2352,18 +2472,27 @@ impl Heap {
                     });
                 }
                 if has_waiters {
-                    if let Some(edges) = m.waiting.remove(&(cell.start >> 4)) {
-                        m.ready.extend(edges);
-                    }
+                    Self::wake(cell.start, m);
                 }
                 true
             }
         }
     }
 
-    #[inline]
-    fn mark_word<const USE_CACHE: bool>(&mut self, word: u64, m: &mut Marker) {
-        if USE_CACHE && m.positive_words.contains(word) {
+    /// Ready the conditional edges waiting on the cell at `start`, which was just marked.
+    #[cold]
+    fn wake(start: usize, m: &mut Marker) {
+        if let Some(edges) = m.waiting.remove(&(start >> 4)) {
+            m.ready.extend(edges);
+        }
+    }
+
+    /// Mark the cell `word` resolves to, as [`Heap::locate`] resolves it (interior and tagged
+    /// words included, others ignored), and queue its trace if this marks it first. A small
+    /// cell takes [`Heap::mark_small`]; an address in the large cells' span the general path.
+    #[inline(always)]
+    fn mark_word(&mut self, word: u64, m: &mut Marker) {
+        if m.positive_words.contains(word) {
             #[cfg(test)]
             {
                 m.word_cache_hits += 1;
@@ -2374,13 +2503,87 @@ impl Heap {
         {
             m.word_lookups += 1;
         }
-        if let Some(cell) = self.locate(word) {
-            // Even the uncached specialization must complete every first-mark side effect.
-            let live = self.mark_cell(cell, m);
-            if USE_CACHE && live {
-                m.positive_words.insert(word);
+        let addr = (word & PAYLOAD_MASK) as usize;
+        let live = match self.page_table.get(addr >> PAGE_SHIFT) {
+            Some(slot) => self.mark_small(slot, addr, m),
+            None if (self.large_span.0..self.large_span.1).contains(&addr) => {
+                self.mark_large_word(word, m)
             }
+            None => false,
+        };
+        if live {
+            m.positive_words.insert(word);
         }
+    }
+
+    /// [`Heap::mark_word`] for an address in the page in slot `slot`: [`Heap::locate`] and
+    /// [`Heap::mark_cell`] in one look at the page's metadata. True when the address names a
+    /// live cell, marked now or before.
+    #[inline(always)]
+    fn mark_small(&mut self, slot: u32, addr: usize, m: &mut Marker) -> bool {
+        debug_assert!(self.pages.get(slot as usize).is_some_and(Option::is_some));
+        // SAFETY: the page table maps the live pages' numbers to their slots and nothing else
+        // (`Heap::new_page` and `Heap::release_page` keep the two in step, and debug builds
+        // check it after every sweep), and `mark_pages` has an entry for every slot.
+        let page = unsafe { *self.mark_pages.get_unchecked(slot as usize) };
+        let index = page.cell_index(addr);
+        if index >= page.cells as usize {
+            return false;
+        }
+        // Marking marks allocated cells that are no zombies, and nothing else is marked: a
+        // sweep leaves its free cells and zombies unmarked.
+        // SAFETY: the page's bits cover its `cells`; its `PageMeta` owns them, live (above).
+        if unsafe { *page.marks.add(index / 64) } & (1 << (index % 64)) != 0 {
+            debug_assert!(self.pages[slot as usize].as_ref().is_some_and(|page| {
+                page.allocated[index / 64] & !page.zombies[index / 64] & (1 << (index % 64)) != 0
+            }));
+            return true;
+        }
+        self.mark_unmarked(slot, index, m)
+    }
+
+    /// The rest of [`Heap::mark_small`], out of line, for the unmarked cell at `index` of the
+    /// page in slot `slot`: mark it if it is allocated and no zombie, and queue its trace.
+    #[inline(never)]
+    fn mark_unmarked(&mut self, slot: u32, index: usize, m: &mut Marker) -> bool {
+        debug_assert!(self.pages.get(slot as usize).is_some_and(Option::is_some));
+        // SAFETY: as in `mark_small`, which found the slot through the page table.
+        let page = unsafe {
+            self.pages
+                .get_unchecked_mut(slot as usize)
+                .as_mut()
+                .unwrap_unchecked()
+        };
+        let (word, bit) = (index / 64, 1u64 << (index % 64));
+        if page.allocated[word] & bit == 0 || (page.has_zombies && page.zombies[word] & bit != 0) {
+            return false;
+        }
+        page.marks[word] |= bit;
+        self.marked_bytes += page.cell_size;
+        self.stats.cells_marked += 1;
+        let start = page.cell_ptr(index);
+        #[cfg(test)]
+        if let Some(parents) = &mut m.parents {
+            parents.insert(start, m.source);
+        }
+        if !page.leaf {
+            m.worklist.push(TraceWork {
+                cell: start,
+                desc: page.desc,
+                purpose: TracePurpose::Full,
+            });
+        }
+        if page.has_waiters && page.waiters[word] & bit != 0 {
+            Self::wake(start, m);
+        }
+        true
+    }
+
+    /// [`Heap::mark_word`] for an address in the large cells' span.
+    #[inline(never)]
+    fn mark_large_word(&mut self, word: u64, m: &mut Marker) -> bool {
+        self.locate(word)
+            .is_some_and(|cell| self.mark_cell(cell, m))
     }
 
     /// Request a major collection, as [`Heap::collect_kind`] does.
@@ -2762,9 +2965,14 @@ impl Heap {
         // marked: they may hold the only edges to young cells.
         m.worklist.append(&mut self.card_cells);
         self.phase_done(Phase::Begin, &mut clock);
-        client.roots(&mut |word| self.mark_word::<true>(word, &mut m));
+        client.roots(&mut |word| self.mark_word(word, &mut m));
         self.phase_done(Phase::Roots, &mut clock);
         if native_roots {
+            // The roots' marking handled the heap's metadata (the large cells' span starts at a
+            // cell's address, which may be a dead one's) in frames below this one, which the
+            // stack scan's frame reuses: zero them first, as after `begin_marking`.
+            #[cfg(not(target_arch = "wasm32"))]
+            scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
             self.mark_native_stack(&mut m);
         }
         self.phase_done(Phase::Stack, &mut clock);
@@ -3046,21 +3254,30 @@ impl Heap {
         }
         let ranges = native::scan_ranges(sp).expect("collect() checked the native stack");
         for (lo, hi) in ranges {
-            let mut p = lo;
-            while p + 8 <= hi {
-                // SAFETY: registered stack regions are mapped (enter_native_stack
-                // and grow contracts); volatile keeps the compiler from reasoning
-                // about reads of other frames.
-                let word = unsafe { std::ptr::read_volatile(p as *const u64) };
-                #[cfg(test)]
-                {
-                    m.source = MarkSource::Stack(p);
-                }
-                self.mark_word::<true>(word, m);
-                p += 8;
-            }
+            self.mark_stack_range(lo, hi, m);
         }
         std::hint::black_box(&regs);
+    }
+
+    /// Mark the cells the words in `lo..hi`, native stack at and above the scan's own frame,
+    /// name. Out of line, so that what marking derives from each word and from the heap's
+    /// metadata (the large cells' span, which starts at a cell's address, among them) lives in
+    /// this frame, below the words it reads, and never among them.
+    #[inline(never)]
+    fn mark_stack_range(&mut self, lo: usize, hi: usize, m: &mut Marker) {
+        let mut p = lo;
+        while p + 8 <= hi {
+            // SAFETY: registered stack regions are mapped (enter_native_stack
+            // and grow contracts); volatile keeps the compiler from reasoning
+            // about reads of other frames.
+            let word = unsafe { std::ptr::read_volatile(p as *const u64) };
+            #[cfg(test)]
+            {
+                m.source = MarkSource::Stack(p);
+            }
+            self.mark_word(word, m);
+            p += 8;
+        }
     }
 
     fn add_source_edges(&mut self, m: &mut Marker, client: &dyn MarkClient) {
@@ -3086,37 +3303,47 @@ impl Heap {
     }
 
     fn drain(&mut self, m: &mut Marker, client: &dyn MarkClient) {
+        let mut ahead = [TraceWork {
+            cell: 0,
+            desc: DescId(0),
+            purpose: TracePurpose::Full,
+        }; MARK_PREFETCH];
+        let (mut head, mut queued) = (0usize, 0usize);
         loop {
-            while let Some(TraceWork {
-                cell,
-                desc,
-                purpose,
-            }) = m.worklist.pop()
-            {
+            loop {
+                while queued < MARK_PREFETCH {
+                    let Some(work) = m.worklist.pop() else {
+                        break;
+                    };
+                    prefetch_cell(work.cell);
+                    ahead[(head + queued) % MARK_PREFETCH] = work;
+                    queued += 1;
+                }
+                if queued == 0 {
+                    break;
+                }
+                let TraceWork {
+                    cell,
+                    desc,
+                    purpose,
+                } = ahead[head];
+                head = (head + 1) % MARK_PREFETCH;
+                queued -= 1;
                 #[cfg(test)]
                 {
                     m.source = MarkSource::Cell(cell);
                 }
                 let descriptor = &self.descs[desc.0 as usize];
-                let mut edges = std::mem::take(&mut m.trace_scratch);
-                edges.clear();
-                if let Some(trace) = descriptor.mark_trace {
-                    trace(cell as *const u8, purpose, &mut |edge| edges.push(edge));
-                } else {
-                    (descriptor.trace)(cell as *const u8, &mut |edge| edges.push(edge));
-                }
-                // The size check is once per descriptor batch, never a per-word policy test.
-                // This is an amortization heuristic, not a claim that large batches are unique.
-                if edges.len() <= MARK_CACHE_BATCH_LIMIT {
-                    for &edge in &edges {
-                        self.mark_word::<true>(edge as u64, m);
+                let (trace, mark_trace) = (descriptor.trace, descriptor.mark_trace);
+                // Each edge is marked as the trace reports it.
+                match mark_trace {
+                    Some(mark_trace) => {
+                        mark_trace(cell as *const u8, purpose, &mut MarkSink { heap: self, m })
                     }
-                } else {
-                    for &edge in &edges {
-                        self.mark_word::<false>(edge as u64, m);
-                    }
+                    None => trace(cell as *const u8, &mut |edge| {
+                        self.mark_word(edge as u64, m)
+                    }),
                 }
-                m.trace_scratch = edges;
             }
             let Some(edge) = m.ready.pop() else {
                 break;
@@ -3159,14 +3386,14 @@ impl Heap {
                         owner: conditions[0].map_or(0, |cell| cell.start),
                     };
                 }
-                self.mark_word::<true>(word, m);
+                self.mark_word(word, m);
             }
             EdgeValue::SideSlots(owner) => {
                 #[cfg(test)]
                 {
                     m.source = MarkSource::SideSlots(owner);
                 }
-                client.trace_side_slots(owner, &mut |word| self.mark_word::<true>(word, m));
+                client.trace_side_slots(owner, &mut |word| self.mark_word(word, m));
             }
         }
         #[cfg(test)]
@@ -3180,6 +3407,7 @@ impl Heap {
             Loc::Small { page, index } => {
                 if let Some(page) = self.pages[page as usize].as_mut() {
                     set_bit(&mut page.waiters, index as usize, true);
+                    page.has_waiters = true;
                 }
             }
             Loc::Large => {
@@ -3507,9 +3735,11 @@ impl Heap {
             freed += count * page.cell_size;
         }
         page.reset_cursor();
+        page.has_zombies = page.zombies.iter().any(|&word| word != 0);
         // These cover the full bitmap, including live cells and zero-death sweeps: a pin
         // observed for a live cell must not keep that cell pinned when it later dies.
         page.waiters.fill(0);
+        page.has_waiters = false;
         page.pins.fill(0);
         self.stats.cells_swept += swept;
         if let Some((desc, count)) = self.live_count {
@@ -3530,8 +3760,11 @@ impl Heap {
     /// number to its slot and holds no other entry.
     fn check_page_table(&self) {
         let mut live = 0;
+        assert_eq!(self.mark_pages.len(), self.pages.len(), "GC mark pages");
         for (slot, page) in self.pages.iter().enumerate() {
+            let mark_page = self.mark_pages[slot];
             let Some(page) = page else {
+                assert_eq!(mark_page.cells, 0, "GC mark pages: a free slot's");
                 continue;
             };
             live += 1;
@@ -3539,6 +3772,14 @@ impl Heap {
                 self.page_table.get(page.base >> PAGE_SHIFT),
                 Some(slot as u32),
                 "GC page table: the page at {:#x} does not map to its slot",
+                page.base
+            );
+            let expected = MarkPage::of(page);
+            assert!(
+                mark_page.marks == expected.marks
+                    && mark_page.reciprocal == expected.reciprocal
+                    && mark_page.cells == expected.cells,
+                "GC mark pages: the page at {:#x}'s",
                 page.base
             );
         }
@@ -3551,6 +3792,7 @@ impl Heap {
 
     fn release_page(&mut self, index: usize) {
         let page = self.pages[index].take().expect("live page slot");
+        self.mark_pages[index] = MarkPage::FREE;
         self.page_table.remove(page.base >> PAGE_SHIFT);
         let class = &mut self.classes[page.desc.0 as usize][page.class];
         if class.current == Some(index as u32) {
@@ -3610,6 +3852,7 @@ impl Heap {
     /// FinalizeFn). Every handle into this heap dangles afterwards.
     pub(crate) fn release_all(&mut self) {
         let pages = std::mem::take(&mut self.pages);
+        self.mark_pages.clear();
         for page in pages.iter().flatten() {
             if let Some(finalize) = self.descs[page.desc.0 as usize].finalize {
                 for i in 0..page.cells {
@@ -4625,9 +4868,9 @@ mod tests {
         static WORK_PURPOSES: RefCell<Vec<(usize, TracePurpose)>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn remember_work(cell: *const u8, purpose: TracePurpose, visit: &mut dyn FnMut(*const u8)) {
+    fn remember_work(cell: *const u8, purpose: TracePurpose, sink: &mut MarkSink<'_>) {
         WORK_PURPOSES.with(|work| work.borrow_mut().push((cell as usize, purpose)));
-        trace_node(cell, visit);
+        trace_node(cell, &mut |edge| sink.mark(edge as u64));
     }
 
     #[test]
@@ -6245,6 +6488,47 @@ mod tests {
         ran
     }
 
+    /// The stack scan reads no word its own frame derived from the heap: the large cells'
+    /// span starts at the lowest large cell's address, and a scan whose frame held the span
+    /// among the words it reads (marking inlined into the scan, in debug builds) kept that
+    /// cell alive, dead or not; so did a frame the roots' marking left where the scan's frame
+    /// went. A stale word elsewhere on the stack (another test's, on a reused thread stack)
+    /// may still keep it: only a source in the scan's own frame is the scan's.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_stack_scan_reads_no_word_its_own_frame_derived() {
+        // Boxed, as an engine's heap is: a heap on the stack would hold the span itself.
+        let mut fx = Box::new(Fixture::new());
+        fx.heap.set_collect_on_alloc(false);
+        fx.heap.set_retention_tracing(true);
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        // Hidden cells: only their addresses' complements are on the stack. The lowest, where
+        // the large cells' span starts, is dead; another is rooted.
+        let hidden: Vec<u64> = (0..3)
+            .map(|_| alloc_hidden(&mut fx.heap, fx.leaf, 8192))
+            .collect();
+        let lowest = *hidden.iter().max().expect("cells");
+        let rooted = *hidden.iter().find(|&&cell| cell != lowest).expect("cells");
+        fx.roots[0] = tagged(!rooted as *mut u8);
+        crate::gc_core::scrub_stack(64 * 1024);
+        assert!(fx.heap.collect());
+        // The scan's frame lies below its frame record, the first it walked.
+        let (record, _) = fx.heap.last_frames[0];
+        let path = fx.heap.retention_path((!lowest) as usize);
+        if let Some(&(_, _, MarkSource::Stack(slot))) = path.first() {
+            assert!(
+                slot >= record,
+                "the scan's own frame kept the dead large cell: word {slot:#x} below {record:#x}, \
+                 {} bytes below it; frames {:x?}",
+                record - slot,
+                &fx.heap.last_frames[..fx.heap.last_frames.len().min(6)]
+            );
+        }
+        assert!(fx.heap.owns_cell(!rooted as usize, fx.leaf));
+        black_box(&top);
+    }
+
     /// Conservative words resolve through the page table as they did through the hash map: a
     /// tagged interior address of a small cell finds the cell, while an address in a released
     /// (spare) page, one between the heap's pages and one in a 4 GiB range holding no page
@@ -7693,6 +7977,25 @@ mod tests {
         fx.collect();
     }
 
+    #[test]
+    fn cell_index_divides_exactly_for_every_class_and_offset() {
+        for cell_size in SIZE_CLASSES {
+            let page = MarkPage {
+                marks: std::ptr::null(),
+                reciprocal: u32::try_from((1u64 << 32).div_ceil(cell_size as u64)).unwrap(),
+                cells: 0,
+            };
+            let base = 7 * PAGE_SIZE;
+            for offset in 0..PAGE_SIZE {
+                assert_eq!(
+                    page.cell_index(base + offset),
+                    offset / cell_size,
+                    "offset {offset} in a page of {cell_size}-byte cells"
+                );
+            }
+        }
+    }
+
     mod positive_word_cache {
         use super::*;
 
@@ -7728,10 +8031,13 @@ mod tests {
             (cell, desc)
         }
 
+        /// A trace longer than the 64 edges the marker once cached (it marks every edge as
+        /// the trace reports it now, through the cache, whatever the trace's length).
+        const BATCH: usize = 65;
+
         #[test]
-        fn drain_selects_cached_at_64_and_uncached_at_65_edges() {
-            assert_eq!(MARK_CACHE_BATCH_LIMIT, 64, "the measured trial threshold");
-            for count in [64, 65] {
+        fn drain_probes_the_cache_for_every_edge_of_any_trace() {
+            for count in [1, 64, BATCH, 1000] {
                 let mut fx = Fixture::new();
                 fx.heap.set_collect_on_alloc(false);
                 let child = fx.heap.alloc(fx.leaf, 16);
@@ -7739,29 +8045,17 @@ mod tests {
                 let (batch, _) = alloc_batch(&mut fx, &vec![target; count]);
                 let mut marker = Marker::default();
                 let before = fx.heap.stats().cells_marked;
-                fx.heap.mark_word::<true>(tagged(batch), &mut marker);
+                fx.heap.mark_word(tagged(batch), &mut marker);
                 fx.heap.drain(&mut marker, &NoClient);
                 fx.heap.verify(&marker);
                 assert_eq!(fx.heap.stats().cells_marked - before, 3);
                 assert!(is_marked_at(&fx.heap, child as usize));
-                if count == 64 {
-                    assert_eq!(marker.positive_words.probes.get(), count + 2);
-                    assert_eq!(marker.word_cache_hits, 63, "short-batch repeated hits");
-                    assert_eq!(marker.word_lookups, 3);
-                } else {
-                    assert_eq!(
-                        marker.positive_words.probes.get(),
-                        2,
-                        "only root and child probe"
-                    );
-                    assert_eq!(marker.word_cache_hits, 0, "large batches never probe cache");
-                    assert_eq!(
-                        marker.word_lookups,
-                        count + 2,
-                        "each word resolves and marks"
-                    );
-                    assert!(!marker.positive_words.contains(target as u64));
-                }
+                // The batch, the first of the repeated edges and the child resolve; every
+                // repetition hits.
+                assert_eq!(marker.positive_words.probes.get(), count + 2);
+                assert_eq!(marker.word_cache_hits, count - 1, "repeated edges hit");
+                assert_eq!(marker.word_lookups, 3);
+                assert!(marker.positive_words.contains(target as u64));
             }
         }
 
@@ -7769,14 +8063,14 @@ mod tests {
         fn large_batch_retains_sole_targets_descendants_and_ephemeron_wakeups() {
             let mut fx = Fixture::new();
             fx.heap.set_collect_on_alloc(false);
-            let count = MARK_CACHE_BATCH_LIMIT + 1;
+            let count = BATCH;
             let children: Vec<_> = (0..count).map(|_| fx.heap.alloc(fx.leaf, 16)).collect();
             let targets: Vec<_> = children
                 .iter()
                 .map(|&child| fx.alloc_node(tagged(child), 1))
                 .collect();
             let mut edges = targets.clone();
-            edges.push(*targets.last().unwrap()); // Adjacent repeat detects accidental caching.
+            edges.push(*targets.last().unwrap()); // An adjacent repeat, which the cache answers.
             let (batch, batch_desc) = alloc_batch(&mut fx, &edges);
             let conditional_child = fx.heap.alloc(fx.leaf, 16);
             let conditional = fx.alloc_node(tagged(conditional_child), 2);
@@ -7784,14 +8078,11 @@ mod tests {
                 parents: Some(FastMap::default()),
                 ..Marker::default()
             };
-            fx.heap.mark_word::<true>(tagged(batch), &mut marker);
+            fx.heap.mark_word(tagged(batch), &mut marker);
             fx.heap.drain(&mut marker, &NoClient);
             fx.heap.verify(&marker);
-            assert_eq!(
-                marker.word_cache_hits, 0,
-                "the large adjacent repeat is uncached"
-            );
-            assert_eq!(marker.word_lookups, 1 + edges.len() + count);
+            assert_eq!(marker.word_cache_hits, 1, "the adjacent repeat hits");
+            assert_eq!(marker.word_lookups, 1 + (edges.len() - 1) + count);
             assert_eq!(marker.parents.as_ref().unwrap().len(), 1 + 2 * count);
             assert!(targets.iter().all(|target| matches!(
                 marker.parents.as_ref().unwrap().get(&(*target as usize)),
@@ -7799,7 +8090,7 @@ mod tests {
             )));
 
             // Only the batch is a precise root. Rust vectors/closure captures are excluded;
-            // the first target must wake the conditional edge when the uncached loop marks it.
+            // the first target must wake the conditional edge when the drain marks it.
             fx.roots[0] = tagged(batch);
             let ephemeron = |sink: &mut EdgeSink<'_>| {
                 sink.ephemeron(batch, tagged(targets[0]), tagged(conditional));
@@ -7852,9 +8143,7 @@ mod tests {
 
         impl BatchTrees {
             fn new(fx: &mut Fixture) -> Self {
-                let children: Vec<_> = (0..MARK_CACHE_BATCH_LIMIT + 1)
-                    .map(|_| fx.heap.alloc(fx.leaf, 16))
-                    .collect();
+                let children: Vec<_> = (0..BATCH).map(|_| fx.heap.alloc(fx.leaf, 16)).collect();
                 let targets = children
                     .iter()
                     .map(|&child| fx.alloc_node(tagged(child), 1))
@@ -7872,7 +8161,7 @@ mod tests {
             fn edges(&self) -> Vec<*mut u8> {
                 let mut edges = self.targets.clone();
                 edges.push(*self.targets.last().unwrap());
-                assert!(edges.len() > MARK_CACHE_BATCH_LIMIT);
+                assert!(edges.len() > BATCH);
                 edges
             }
 
@@ -7964,7 +8253,7 @@ mod tests {
                 finalize: None,
                 carded: true,
             });
-            let edge_count = MARK_CACHE_BATCH_LIMIT + 2;
+            let edge_count = BATCH + 1;
             let batch = fx.heap.alloc(desc, (edge_count + 1) * 8);
             set_word(batch, 0, edge_count as u64); // Other words start zeroed.
             fx.roots[0] = batch as u64; // Exactly the raw word also queued by the dirty card.
@@ -8012,50 +8301,23 @@ mod tests {
         }
 
         #[test]
-        fn uncached_words_always_locate_mark_and_leave_the_positive_table_untouched() {
+        fn small_and_large_first_marks_queue_one_trace_each_and_then_hit() {
             let mut fx = Fixture::new();
             fx.heap.set_collect_on_alloc(false);
             let child = fx.heap.alloc(fx.leaf, 16);
-            let cached = fx.alloc_node(tagged(child), 1);
+            let small = fx.alloc_node(tagged(child), 1);
             let other_child = fx.heap.alloc(fx.leaf, 16);
-            let uncached = fx.heap.alloc(fx.node, 8192);
-            set_word(uncached, 0, tagged(other_child));
+            let large = fx.heap.alloc(fx.node, 8192);
+            set_word(large, 0, tagged(other_child));
             let mut marker = Marker::default();
             let before = fx.heap.stats().cells_marked;
-            fx.heap.mark_word::<true>(cached as u64, &mut marker);
-            assert!(marker.positive_words.contains(cached as u64));
-            let table = marker.positive_words.words;
-            let probes = marker.positive_words.probes.get();
-            for (index, candidate) in [cached as u64, uncached as u64, uncached as u64, 0]
-                .into_iter()
-                .enumerate()
-            {
-                fx.heap.mark_word::<false>(candidate, &mut marker);
-                assert_eq!(marker.word_lookups, index + 2, "uncached means heap lookup");
-                assert_eq!(
-                    marker.word_cache_hits, 0,
-                    "even an existing positive is not probed"
-                );
-                assert_eq!(
-                    marker.positive_words.probes.get(),
-                    probes,
-                    "no cache lookup"
-                );
-                assert_eq!(
-                    marker.positive_words.words, table,
-                    "no insertion or replacement"
-                );
+            for candidate in [small as u64, large as u64, small as u64, large as u64] {
+                fx.heap.mark_word(candidate, &mut marker);
             }
-            assert_eq!(
-                fx.heap.stats().cells_marked - before,
-                2,
-                "new large target marked once"
-            );
-            assert_eq!(
-                marker.worklist.len(),
-                2,
-                "first-mark trace work is still queued"
-            );
+            assert_eq!(marker.word_lookups, 2, "each cell resolves once");
+            assert_eq!(marker.word_cache_hits, 2, "and then hits");
+            assert_eq!(fx.heap.stats().cells_marked - before, 2);
+            assert_eq!(marker.worklist.len(), 2, "one trace queued for each");
             fx.heap.drain(&mut marker, &NoClient);
             fx.heap.verify(&marker);
             assert_eq!(fx.heap.stats().cells_marked - before, 4);
@@ -8093,7 +8355,7 @@ mod tests {
             };
             let before = fx.heap.stats().cells_marked;
             for &cell in &objects {
-                fx.heap.mark_word::<true>(tagged(cell), &mut marker);
+                fx.heap.mark_word(tagged(cell), &mut marker);
             }
             fx.heap.drain(&mut marker, &NoClient);
             fx.heap.verify(&marker); // Independent validation never reads the cache.
@@ -8134,13 +8396,13 @@ mod tests {
                 ] {
                     let lookups = marker.word_lookups;
                     let hits = marker.word_cache_hits;
-                    fx.heap.mark_word::<true>(candidate, &mut marker);
+                    fx.heap.mark_word(candidate, &mut marker);
                     assert_eq!(
                         marker.word_lookups,
                         lookups + 1,
                         "distinct exact word {candidate:#x}"
                     );
-                    fx.heap.mark_word::<true>(candidate, &mut marker);
+                    fx.heap.mark_word(candidate, &mut marker);
                     assert_eq!(marker.word_cache_hits, hits + 1, "repeat {candidate:#x}");
                 }
                 assert_eq!(marker.worklist.len(), 1);
@@ -8248,7 +8510,7 @@ mod tests {
             assert_eq!(fx.heap.cell_age(child as u64), Some(CellAge::Young));
             {
                 let mut probe = Marker::default();
-                fx.heap.mark_word::<true>(old as u64, &mut probe);
+                fx.heap.mark_word(old as u64, &mut probe);
                 assert!(
                     probe.positive_words.contains(old as u64),
                     "old allocated marks are positives"
@@ -8347,7 +8609,7 @@ mod tests {
             let marked = fx.heap.stats().cells_marked;
             for _ in 0..3 {
                 for &candidate in &rejected {
-                    fx.heap.mark_word::<true>(candidate, &mut marker);
+                    fx.heap.mark_word(candidate, &mut marker);
                     assert!(!marker.positive_words.contains(candidate), "{candidate:#x}");
                 }
             }

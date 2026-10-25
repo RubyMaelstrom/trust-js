@@ -1654,7 +1654,8 @@ impl<'a> Iterator for VarValues<'a> {
 
 impl VarMap {
     /// Report the storage block of the ordered entries, once they have spilled into one.
-    pub(crate) fn trace_storage(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+    #[inline]
+    pub(crate) fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         match &self.map {
             VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
                 if let Some(block) = entries.spill_ptr() {
@@ -2428,6 +2429,14 @@ impl Scope {
 
 impl crate::gc_trace::GcTrace for Scope {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.trace_fields(sink);
+    }
+}
+
+impl Scope {
+    /// [`GcTrace`](crate::gc_trace::GcTrace)'s edges, for any sink (the marker's among them).
+    #[inline]
+    pub(crate) fn trace_fields<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         let Self {
             vars,
             parent,
@@ -2439,10 +2448,12 @@ impl crate::gc_trace::GcTrace for Scope {
         } = self;
         vars.trace_storage(sink);
         for binding in vars.values() {
-            crate::gc_trace::GcTrace::trace_gc(binding, sink);
+            binding.trace_edges(sink);
         }
-        crate::gc_trace::GcTrace::trace_gc(parent, sink);
-        crate::gc_trace::GcTrace::trace_gc(with_obj, sink);
+        if let Some(parent) = parent {
+            sink.env(parent);
+        }
+        sink.value(with_obj);
     }
 }
 
@@ -2592,6 +2603,14 @@ impl Binding {
 
 impl crate::gc_trace::GcTrace for Binding {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.trace_edges(sink);
+    }
+}
+
+impl Binding {
+    /// [`GcTrace`](crate::gc_trace::GcTrace)'s edges, for any sink.
+    #[inline]
+    fn trace_edges<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         let Self {
             value,
             mutable: _,
@@ -2601,7 +2620,7 @@ impl crate::gc_trace::GcTrace for Binding {
             deletable: _,
             strict_immutable: _,
         } = self;
-        crate::gc_trace::GcTrace::trace_gc(value, sink);
+        sink.value(value);
         if let Some(import) = import_ref {
             sink.env(&import.0);
         }
