@@ -1012,6 +1012,34 @@ Recorded deviation (GC optimization C plan, 2026-10-24):
   complete correctness part receives both routine gates; full closing
   stress, conformance and independent performance checks still apply.
 
+Recorded disposition (merge and TRust port, 2026-10-25):
+
+- The owner accepts React's RSS and pauses against main and merges:
+  941a8a06 merges 6f75d692 into main (e3310993). cb0ca37f adds the
+  embedder APIs TRust's companion patch carried (host object
+  invariants, module inspection, Promise reaction settings).
+- Post-merge engine fixes: dd43337c (the architecture-diagnostics
+  build), f9beb7e5 (a hidden minor-collection hook for host tests),
+  290c4b05 (host-made and copied buffer data count toward the buffer
+  trigger, as a major collection due at the next safepoint; every
+  major collection resets the trigger), c62020b0 (clippy). Gate:
+  clippy in five configurations and the workspace, lib (embed)
+  2487/0/7, doctests, the downstream crates, Test262 buffer families
+  3528/0/1 as at cb0ca37f; the buffer change's four mutants killed.
+- TRust is ported on its branch trust-js-gc-port (7d369ac..5b41235,
+  for the owner to merge). Its debug builds optimize the engine: the
+  collector's whole-heap debug checks made a page's minor collections
+  take ~250 ms. Crystal: debug and release suites 3987/0/43, clippy
+  only be37666's five warnings. zombie (x86-64 release): the four
+  environment failures be37666 has there too; GPU groups pass alone.
+  Live: the workload gate passes YouTube and Twitch; Steam renamed its
+  offers module (old and new dumps identical). Old/new trust-headless
+  on ten sites: same exits, errors and text; CSS WPT subset 186/22 as
+  before.
+- Measured on YouTube: the host graph (the client step) is 0.69 ms
+  median per minor collection, 12.6% of minor time; a minor-aware host
+  trace is a follow-up. Old/new TRust timing waits for a quiet machine.
+
 ### Working agreements (all agents)
 
 - Branch `rearch/v8-chase` only; one agent at a time. **Syncing `main`
