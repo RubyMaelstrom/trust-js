@@ -33,8 +33,10 @@ type Brand<'s> = PhantomData<*mut &'s ()>;
 
 /// A thread-bound JavaScript execution word branded by its scope. Its transparent word
 /// representation matches the engine's Value; decoded ValueKind views are never storage.
-/// Stack values stay rooted during the scope; heap collections held across JS calls use a
-/// ValueList, and values kept beyond the scope use a Handle.
+/// Stack values stay rooted during the scope; heap collections held across a call that can
+/// collect (one that runs JavaScript, an explicit collection or
+/// [`Ctx::note_external_buffer_growth`]) use a ValueList, and values kept beyond the scope use
+/// a Handle. Making a value, a buffer included, never collects.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct Value<'s> {
@@ -962,14 +964,17 @@ impl<'s> Ctx<'s> {
     }
 
     /// A fresh `ArrayBuffer` initialized with `bytes`, with the realm's intrinsic
-    /// %ArrayBuffer.prototype% (no author code runs).
+    /// %ArrayBuffer.prototype% (no author code runs). The bytes count toward the Agent's buffer
+    /// pressure; past its trigger, a major collection becomes due at the next safepoint (this
+    /// call never collects).
     pub fn make_array_buffer(&mut self, bytes: &[u8]) -> Result<Value<'s>, Value<'s>> {
         thrown(self.it().make_array_buffer(bytes))
     }
 
     /// A fresh fixed-length `ArrayBuffer` with an embedder detach key: author JavaScript cannot
     /// transfer or detach it, while [`Ctx::detach_array_buffer`] can. This models the
-    /// `"WebAssembly.Memory"` key required for `Memory.buffer`.
+    /// `"WebAssembly.Memory"` key required for `Memory.buffer`. Its bytes count toward buffer
+    /// pressure as [`Ctx::make_array_buffer`]'s do.
     pub fn make_host_keyed_array_buffer(&mut self, bytes: &[u8]) -> Result<Value<'s>, Value<'s>> {
         thrown(self.it().make_host_keyed_array_buffer(bytes))
     }

@@ -1911,6 +1911,98 @@ fn agent_buffer_growth_counts_like_allocation() {
     }
 }
 
+/// A host's buffer data counts toward the buffer trigger like the engine's own. Making a buffer
+/// is not a safepoint: past the trigger, a major collection becomes due at the next one, so the
+/// buffers a host holds outside its stack meanwhile stay valid.
+#[test]
+fn host_buffer_data_makes_a_major_collection_due_at_the_next_safepoint() {
+    // The expected collections assume no stress collections between allocations.
+    if crate::gc_test::stress_active() {
+        return;
+    }
+    let mut engine = Engine::new();
+    precise(&mut engine);
+    let before = major_collections(&engine);
+    // 96 MiB of host buffers, past the 64 MiB trigger; none is kept.
+    let observers: Vec<WeakGc> = crate::gc_test::in_frame(|| {
+        let bytes = vec![7; 16 << 20];
+        (0..6)
+            .map(|round| {
+                let buffer = if round % 2 == 0 {
+                    engine.interp.make_array_buffer(&bytes)
+                } else {
+                    engine.interp.make_uint8array(&bytes)
+                };
+                let buffer = buffer.unwrap_or_else(|_| panic!("a host buffer"));
+                Gc::downgrade(&buffer.as_obj().expect("an object"))
+            })
+            .collect()
+    });
+    assert_eq!(
+        major_collections(&engine),
+        before,
+        "making a buffer never collects"
+    );
+    assert!(observers.iter().all(crate::gc_test::alive));
+    assert_eq!(
+        engine.interp.gc_heap.agent.pending.get(),
+        Some(CollectionKind::Major)
+    );
+    without_checkpoint(&mut engine, "for (var k = 0; k < 2; k++);0");
+    assert!(
+        major_collections(&engine) > before,
+        "the next safepoint collects"
+    );
+    assert!(!observers.iter().any(crate::gc_test::alive));
+    assert_eq!(engine.interp.gc_heap.agent.buffers.get().since_gc, 0);
+}
+
+/// Every major collection measures the buffer data that survived it, whatever started it: the
+/// trigger rises with kept buffers and falls back to its floor once they die.
+#[test]
+fn buffer_trigger_follows_the_data_each_major_collection_keeps() {
+    // The expected triggers assume no stress collections between allocations.
+    if crate::gc_test::stress_active() {
+        return;
+    }
+    let mut engine = Engine::new();
+    without_checkpoint(
+        &mut engine,
+        "globalThis.kept = []; for (var k = 0; k < 4; k++) kept.push(new ArrayBuffer(40 << 20)); 0",
+    );
+    precise(&mut engine);
+    assert_eq!(engine.interp.gc_heap.agent.buffers.get().trigger, 160 << 20);
+    without_checkpoint(&mut engine, "kept = null; 0");
+    precise(&mut engine);
+    assert_eq!(engine.interp.gc_heap.agent.buffers.get().trigger, 64 << 20);
+}
+
+/// A copy a built-in makes from bytes it has read counts toward buffer pressure too: discarded
+/// same-type TypedArray copies collect.
+#[test]
+fn typed_array_copies_count_toward_buffer_pressure() {
+    // The expected collections assume no stress collections between allocations.
+    if crate::gc_test::stress_active() {
+        return;
+    }
+    let mut engine = Engine::new();
+    without_checkpoint(
+        &mut engine,
+        "globalThis.source = new Uint8Array(16 << 20); 0",
+    );
+    precise(&mut engine);
+    let before = major_collections(&engine);
+    // 96 MiB of copies, discarded as they go.
+    without_checkpoint(
+        &mut engine,
+        "for (var k = 0; k < 6; k++) new Uint8Array(source); 0",
+    );
+    assert!(
+        major_collections(&engine) > before,
+        "copies count toward buffer pressure"
+    );
+}
+
 #[test]
 fn agent_owner_index_follows_the_first_and_last_child_interpreter() {
     let mut engine = Engine::new();

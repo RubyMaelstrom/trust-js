@@ -924,6 +924,7 @@ pub(crate) fn typed_array_from_bytes(
 /// `bytes` (Import Bytes proposal), from the current Realm's intrinsics without author code.
 pub(crate) fn immutable_uint8_array(i: &mut Interp, bytes: Vec<u8>) -> Value {
     let len = bytes.len();
+    i.note_buffer_allocation_deferred(len);
     let (buf_val, buf_ptr) = make_array_buffer_from_bytes(i, bytes);
     // Immutable before the view registers, so native code never gets a writable view of it.
     i.immutable_buffers.insert(buf_ptr);
@@ -1838,6 +1839,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                 let source_bytes = i.ta_read_bytes(&source_info, 0, len).ok_or_else(|| {
                     i.make_error("TypeError", "TypedArray source is out of bounds")
                 })?;
+                i.note_buffer_allocation_deferred(source_bytes.len());
                 let (bv, bp) = make_array_buffer_from_bytes(i, source_bytes);
                 (bv, bp, 0, len, false)
             } else {
@@ -2665,6 +2667,7 @@ fn u8_bytes(i: &mut Interp, this: &Value) -> Result<Vec<u8>, Value> {
 /// The new Uint8Array of `Uint8Array.fromBase64`/`fromHex`: AllocateTypedArray("Uint8Array",
 /// %Uint8Array%, %Uint8Array.prototype%, length) and its bytes (proposal-arraybuffer-base64).
 fn make_u8array(i: &mut Interp, bytes: Vec<u8>) -> Result<Value, Value> {
+    i.note_buffer_allocation_deferred(bytes.len());
     Ok(typed_array_from_bytes(i, TaKind::U8, bytes).0)
 }
 fn b64_option_url(i: &mut Interp, opts: &Value) -> Result<bool, Value> {

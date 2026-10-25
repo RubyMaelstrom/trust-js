@@ -7749,6 +7749,7 @@ impl Interp {
     /// storage; embedders that mirror external memory can update it with
     /// [`Self::array_buffer_set_bytes`].
     pub fn make_array_buffer(&mut self, bytes: &[u8]) -> Result<Value, Value> {
+        self.note_buffer_allocation_deferred(bytes.len());
         Ok(
             crate::builtins::array_buffer_with_storage(self, Rc::new(RefCell::new(bytes.to_vec())))
                 .0,
@@ -7759,6 +7760,7 @@ impl Interp {
     /// transfer/detach it, while [`Self::detach_array_buffer`] retains the key-aware host path.
     /// This models the `"WebAssembly.Memory"` key required for `Memory.buffer`.
     pub fn make_host_keyed_array_buffer(&mut self, bytes: &[u8]) -> Result<Value, Value> {
+        self.note_buffer_allocation_deferred(bytes.len());
         self.make_host_keyed_array_buffer_from_storage(Rc::new(RefCell::new(bytes.to_vec())))
     }
 
@@ -7957,6 +7959,7 @@ impl Interp {
     /// intrinsic %Uint8Array.prototype% over a new ArrayBuffer. No author code runs, so a replaced
     /// `globalThis.Uint8Array` cannot observe or substitute the result.
     pub fn make_uint8array(&mut self, bytes: &[u8]) -> Result<Value, Value> {
+        self.note_buffer_allocation_deferred(bytes.len());
         Ok(
             crate::builtins::typed_array_from_bytes(self, crate::value::TaKind::U8, bytes.to_vec())
                 .0,
@@ -11969,33 +11972,48 @@ impl Interp {
     /// Account for `len` bytes of new ArrayBuffer data, first collecting (majorly) once enough
     /// has been allocated since the last major collection that discarded buffers may be holding
     /// as much again. Called before the data block is allocated, where a collection is a
-    /// safepoint like any allocation of the buffer object itself.
+    /// safepoint like any allocation of the buffer object itself. A deferred collection keeps
+    /// the debt for the next safepoint.
     pub(crate) fn note_buffer_allocation(&mut self, len: usize) {
+        if !self.count_buffer_bytes(len) || self.gc_heap.agent.suppressed.get() != 0 {
+            return;
+        }
+        self.gc_collect_with_cause(
+            crate::value::GcCause::AllocationThreshold,
+            Some(crate::gc_core::CollectionKind::Major),
+        );
+    }
+
+    /// [`Interp::note_buffer_allocation`] for data made where a collection must not run: a
+    /// host's bytes copied into a new buffer (an embedder may hold values outside its stack
+    /// there), or a copy a built-in makes from bytes it has already read. Past the trigger it
+    /// makes a major collection due at the next safepoint.
+    pub(crate) fn note_buffer_allocation_deferred(&mut self, len: usize) {
+        if self.count_buffer_bytes(len) {
+            self.gc_heap
+                .agent
+                .request(&self.gc_heap, Some(crate::gc_core::CollectionKind::Major));
+        }
+    }
+
+    /// Add `len` bytes to the Agent's buffer data since the last major collection: whether
+    /// they passed the trigger.
+    fn count_buffer_bytes(&self, len: usize) -> bool {
         let agent = &self.gc_heap.agent;
         let mut pressure = agent.buffers.get();
         pressure.since_gc = pressure.since_gc.saturating_add(len);
         agent.buffers.set(pressure);
-        if pressure.since_gc <= pressure.trigger || agent.suppressed.get() != 0 {
-            return;
-        }
-        let outcome = self.gc_collect_with_cause(
-            crate::value::GcCause::AllocationThreshold,
-            Some(crate::gc_core::CollectionKind::Major),
-        );
-        // A deferred collection keeps the debt for the next safepoint; only a completed major
-        // collection (which reset the count) measures what survived it.
-        if outcome
-            != crate::agent_control::CollectionOutcome::Collected(
-                crate::gc_core::CollectionKind::Major,
-            )
-        {
-            return;
-        }
+        pressure.since_gc > pressure.trigger
+    }
+
+    /// After a major collection, start counting buffer data again, against a trigger that
+    /// grows with the buffer data that survived it (whatever started the collection).
+    pub(crate) fn reset_buffer_pressure(&mut self) {
         let retained = self.agent_retained_buffer_bytes();
-        let agent = &self.gc_heap.agent;
-        let mut pressure = agent.buffers.get();
-        pressure.trigger = retained.max(BUFFER_GC_TRIGGER);
-        agent.buffers.set(pressure);
+        self.gc_heap.agent.buffers.set(BufferPressure {
+            since_gc: 0,
+            trigger: retained.max(BUFFER_GC_TRIGGER),
+        });
     }
 
     /// Buffer data every interpreter of this Agent still holds. A surviving SharedArrayBuffer

@@ -1400,11 +1400,10 @@ impl Interp {
             .set(crate::value::heap_live_objects(&self.gc_heap));
         self.gc_heap.agent.task_pending.set(false);
         // ArrayBuffer data counts from the last major collection: a minor one leaves the old
-        // buffers that died, and their data, for a major collection to free.
+        // buffers that died, and their data, for a major collection to free. The sweep has
+        // evicted the dead buffers' data from the tables.
         if kind == CollectionKind::Major {
-            let mut pressure = self.gc_heap.agent.buffers.get();
-            pressure.since_gc = 0;
-            self.gc_heap.agent.buffers.set(pressure);
+            self.reset_buffer_pressure();
         }
         let access = self.gc_heap.agent.access.clone();
         self.with_raw_access(|_| {
