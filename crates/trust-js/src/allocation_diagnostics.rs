@@ -450,6 +450,16 @@ impl PropertyInventory {
                 .observe(props.entries.len(), props.entries.capacity());
         }
 
+        // The hash index and the Symbol map live in the map's extras, which a map without
+        // element buffers can have too.
+        result.dense_string_index_capacity = props
+            .elems
+            .index()
+            .map_or(0, |index| index.capacity() as u64);
+        result.dense_symbol_sidecar_capacity = props
+            .elems
+            .symbols()
+            .map_or(0, |symbols| symbols.capacity() as u64);
         if let Some(dense) = props.elems.0.as_deref() {
             result.dense_sidecars = 1;
             // Include every retained DenseBuffers allocation. A zero-length bin means its
@@ -484,14 +494,6 @@ impl PropertyInventory {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<f64>())
                 as u64;
-            result.dense_string_index_capacity = dense
-                .index
-                .as_deref()
-                .map_or(0, |index| index.capacity() as u64);
-            result.dense_symbol_sidecar_capacity = dense
-                .symbols
-                .as_deref()
-                .map_or(0, |symbols| symbols.capacity() as u64);
 
             if let Some(packed) = dense.packed.as_deref() {
                 result.dense_heap_packed_len = packed.len() as u64;
