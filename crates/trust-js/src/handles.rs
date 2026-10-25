@@ -243,7 +243,7 @@ impl HandleTable {
     }
 
     /// Forget that entry `index` was written (tests: a write the record missed).
-    #[cfg(all(test, feature = "embed"))]
+    #[cfg(all(test, feature = "embed", debug_assertions))]
     pub(crate) fn forget_written(&self, index: u32) {
         let mut slots = self.slots.borrow_mut();
         slots.written.retain(|&written| written != index);
@@ -575,7 +575,7 @@ mod api {
         }
 
         /// The handle's entry (tests).
-        #[cfg(test)]
+        #[cfg(all(test, debug_assertions))]
         pub(crate) fn slot(&self) -> u32 {
             self.slot
         }

@@ -413,7 +413,8 @@ where
         (self.entries.len(), self.bytes)
     }
 
-    /// The cached values, in no particular order.
+    /// The cached values, in no particular order (debug builds' checks after a marking).
+    #[cfg(debug_assertions)]
     pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
         self.entries.values().map(|entry| &entry.value)
     }

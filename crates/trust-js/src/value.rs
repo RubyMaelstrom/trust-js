@@ -3283,14 +3283,17 @@ pub(crate) fn interned_string(
     })
 }
 
-/// Report this heap's permanent caches and actual live code/template owners. Root containers
-/// are scanned in full in minor collections, including fields published since the last one.
+/// Report this heap's permanent caches and actual live code/template owners, all of them, as a
+/// major collection traces them (debug checks and tests; collections call
+/// [`trace_heap_roots_for`]).
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn trace_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
     trace_fixed_heap_roots(heap, sink);
     trace_code_roots(heap, sink);
 }
 
 /// The heap's roots other than its code roots.
+#[cfg(any(test, debug_assertions))]
 fn trace_fixed_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
     trace_fixed_heap_roots_but_shapes(heap, sink);
     use crate::gc_trace::GcTrace;

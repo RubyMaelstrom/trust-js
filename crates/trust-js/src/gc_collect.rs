@@ -257,19 +257,19 @@ impl ClientRecords {
     }
 
     /// Forget that `owner`'s side-slot entries were written (tests: a write the record missed).
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn forget_side_slot_owner(&mut self, owner: usize) {
         self.side_slot_owners.remove(&owner);
     }
 
     /// Forget that `owner`'s entry under `key` was written (tests).
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn forget_weak_entry(&mut self, owner: usize, key: WeakKey) {
         self.weak_entries.remove(&(owner, key));
     }
 
     /// Forget that `function` was registered since the last collection (tests).
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn forget_native_function(&mut self, function: usize) {
         self.native_functions
             .retain(|&registered| registered != function);
@@ -493,7 +493,7 @@ impl NativeFunctionRealms {
 
     /// Point `function`'s entry at another Realm without recording it (tests: a write the
     /// record missed).
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn set_realm_unrecorded(&mut self, function: usize, realm: usize) {
         if let Some(entry) = self.0.get_mut(&function) {
             entry.1 = realm;
