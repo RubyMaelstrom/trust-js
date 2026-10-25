@@ -8371,10 +8371,18 @@ mod tests {
             let mut fx = Fixture::new();
             fx.heap.set_collect_on_alloc(false);
             let child = fx.heap.alloc(fx.leaf, 16);
-            let small = fx.alloc_node(tagged(child), 1);
             let other_child = fx.heap.alloc(fx.leaf, 16);
             let large = fx.heap.alloc(fx.node, 8192);
             set_word(large, 0, tagged(other_child));
+            // The large cell's cache entry follows its mapping's address, and a small cell
+            // sharing it would take it over (a collision, which
+            // `direct_collisions_keep_both_rooted_trees_and_their_distinct_descendants` covers):
+            // take a small cell whose entry is another, as the next one's is.
+            let small = std::iter::repeat_with(|| fx.alloc_node(tagged(child), 1))
+                .find(|&small| {
+                    PositiveWords::index(small as u64) != PositiveWords::index(large as u64)
+                })
+                .expect("a small cell outside the large cell's entry");
             let mut marker = Marker::default();
             let before = fx.heap.stats().cells_marked;
             for candidate in [small as u64, large as u64, small as u64, large as u64] {
