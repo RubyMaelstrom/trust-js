@@ -2,12 +2,12 @@
 //! Representation checks accompany observable regressions: the change must remove
 //! decimal-key storage, not merely happen to produce the same array contents.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 #[test]
 fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
-    let mut props =
-        Props::packed_array_from_values((0..8192).map(|n| Value::Num(n as f64)).collect());
+    let mut props = Props::packed_array((0..8192).map(|n| Value::Num(n as f64)));
     assert_eq!(props.entries.len(), 1);
     assert!(props.elems.elems.is_empty());
     assert_eq!(props.elems.packed_ref().unwrap().len(), 8192);
@@ -22,7 +22,7 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
     assert!(props.set_index_value(8191, Value::Num(3.5)).is_ok());
     assert_eq!(props.mirror_get(8191), Some(3.5));
 
-    let mut grown = Props::packed_array_from_values(Vec::new());
+    let mut grown = Props::packed_array(std::iter::empty());
     for n in 0..8192 {
         assert!(grown
             .try_append_element(n, Property::plain(Value::Num(n as f64)))
@@ -33,12 +33,14 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
     assert_eq!(grown.mirror_get(8191), Some(8191.0));
     assert!(grown.set_index_value(12, Value::lstr("mixed")).is_ok());
     assert_eq!(grown.mirror_get(12), None);
-    assert!(matches!(grown.get_index(12).unwrap().value(), Value::Str(s) if s.as_str() == "mixed"));
+    assert!(
+        matches!((grown.get_index(12).unwrap().value()).view(), ValueView::Str(s) if s.as_str() == "mixed")
+    );
 }
 
 #[test]
 fn dense_elements_sparse_length_does_not_reserve_storage() {
-    let mut props = Props::packed_array_from_values(Vec::new());
+    let mut props = Props::packed_array(std::iter::empty());
     props
         .get_mut("length")
         .unwrap()
@@ -156,9 +158,7 @@ fn dense_elements_numeric_loops_and_cycles_keep_owners() {
 fn dense_elements_far_deletion_and_truncation_restore_packed_coverage() {
     for length in [0, 3, 40, 4096] {
         for truncate in [false, true] {
-            let mut props = Props::packed_array_from_values(
-                (0..length).map(|n| Value::Num(n as f64)).collect(),
-            );
+            let mut props = Props::packed_array((0..length).map(|n| Value::Num(n as f64)));
             props.insert("1000000", Property::plain(Value::Num(1.0)));
             props.insert("2000000", Property::plain(Value::Num(2.0)));
             assert!(props.has_far.get());
@@ -193,7 +193,7 @@ fn dense_elements_far_deletion_and_truncation_restore_packed_coverage() {
 
 #[test]
 fn dense_elements_recovery_keeps_named_indices_outside_packed_storage_guarded() {
-    let mut props = Props::packed_array_from_values(vec![Value::Num(0.0)]);
+    let mut props = Props::packed_array([Value::Num(0.0)].into_iter());
     props.insert("1000000", Property::plain(Value::Num(1.0)));
     // While packed growth is blocked, even a nearby canonical key is a named entry.
     props.insert("1", Property::data(Value::Num(11.0), false, true, false));
@@ -221,7 +221,7 @@ fn dense_elements_recovery_keeps_named_indices_outside_packed_storage_guarded() 
 #[test]
 fn dense_elements_classic_recovery_bounds_delete_work_and_rebuilds_on_truncation() {
     for length in [12, 300] {
-        let mut props = Props::packed_array_from_values(Vec::new());
+        let mut props = Props::packed_array(std::iter::empty());
         props.insert("1000000", Property::plain(Value::Num(1.0)));
         for n in 0..length {
             props.insert(index_key(n), Property::plain(Value::Num(n as f64)));
@@ -249,7 +249,7 @@ fn dense_elements_classic_recovery_bounds_delete_work_and_rebuilds_on_truncation
 #[test]
 fn dense_elements_recovered_numeric_mirror_rechecks_descriptors_and_holes() {
     for blocked in ["hole", "accessor", "non-writable", "non-number"] {
-        let mut props = Props::packed_array_from_values(vec![Value::Num(-0.0), Value::Num(2.0)]);
+        let mut props = Props::packed_array([Value::Num(-0.0), Value::Num(2.0)].into_iter());
         props.insert("1000000", Property::plain(Value::Num(1.0)));
         match blocked {
             "hole" => assert!(props.remove("1")),

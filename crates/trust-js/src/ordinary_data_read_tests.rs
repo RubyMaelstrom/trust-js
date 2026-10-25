@@ -3,6 +3,7 @@
 use super::*;
 use crate::bytecode::Tier;
 use crate::feedback::{CurrentPropertyTrace, PropertyOutcome};
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 fn run(engine: &mut Engine, source: &str) -> String {
@@ -13,7 +14,7 @@ fn run(engine: &mut Engine, source: &str) -> String {
 }
 
 fn value(engine: &mut Engine, name: &str) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .get_var(name, &env)
@@ -22,10 +23,7 @@ fn value(engine: &mut Engine, name: &str) -> Value {
 }
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
-    value(engine, name)
-        .as_obj()
-        .expect("fixture object")
-        .clone()
+    value(engine, name).as_obj().expect("fixture object")
 }
 
 fn read(
@@ -75,7 +73,7 @@ fn ordinary_data_read_all_value_kinds_owned_and_traced() {
             holder
                 .borrow_mut()
                 .props
-                .insert(key, Property::plain(expected.clone()));
+                .insert(key, Property::plain(expected));
             let shape = holder.borrow().props.shape();
             let slot = holder
                 .borrow()
@@ -86,16 +84,16 @@ fn ordinary_data_read_all_value_kinds_owned_and_traced() {
                 .map(|n| n as u32);
             for inherited in [false, true] {
                 let receiver = if inherited {
-                    Object::new(Some(holder.clone()))
+                    Object::new(Some(holder))
                 } else {
-                    holder.clone()
+                    holder
                 };
                 for traced in [false, true] {
                     let (actual, trace) = read(
                         &mut engine.interp,
                         &receiver,
                         key,
-                        &Value::Obj(receiver.clone()),
+                        &Value::Obj(receiver),
                         traced,
                     );
                     assert!(
@@ -111,109 +109,6 @@ fn ordinary_data_read_all_value_kinds_owned_and_traced() {
                         assert_eq!(trace, CurrentPropertyTrace::default());
                     }
                 }
-            }
-        }
-    }
-}
-
-#[test]
-fn ordinary_data_read_returned_last_owner_survives_removal_and_gc() {
-    let mut engine = Engine::new();
-    engine.interp.activate_gc_heap();
-    for traced in [false, true] {
-        let holder = Object::new(None);
-        let payload = Object::new(None);
-        payload
-            .borrow_mut()
-            .props
-            .insert("alive", Property::plain(Value::Num(37.0)));
-        let weak = Rc::downgrade(&payload);
-        holder
-            .borrow_mut()
-            .props
-            .insert("data", Property::plain(Value::Obj(payload)));
-        let (result, _) = read(
-            &mut engine.interp,
-            &holder,
-            "data",
-            &Value::Obj(holder.clone()),
-            traced,
-        );
-        assert_eq!(
-            weak.strong_count(),
-            2,
-            "one property owner and one returned owner"
-        );
-        assert!(holder.borrow_mut().props.remove("data"));
-        drop(holder);
-        engine.interp.gc_collect();
-        assert_eq!(
-            weak.strong_count(),
-            1,
-            "only the returned Value roots its payload"
-        );
-        let marker = result
-            .as_obj()
-            .unwrap()
-            .borrow()
-            .props
-            .get("alive")
-            .unwrap()
-            .value();
-        assert!(matches!(marker, Value::Num(37.0)));
-        drop(result);
-        engine.interp.gc_collect();
-        assert!(weak.upgrade().is_none());
-
-        let symbol = engine.interp.new_symbol(Some(Rc::from("sole symbol")));
-        let Value::Sym(symbol_ref) = &symbol else {
-            unreachable!()
-        };
-        let weak_symbol = Rc::downgrade(symbol_ref);
-        let id = symbol_ref.id;
-        let holder = Object::new(None);
-        holder
-            .borrow_mut()
-            .props
-            .insert("data", Property::plain(symbol));
-        let (result, _) = read(
-            &mut engine.interp,
-            &holder,
-            "data",
-            &Value::Obj(holder.clone()),
-            traced,
-        );
-        assert!(holder.borrow_mut().props.remove("data"));
-        drop(holder);
-        engine.interp.gc_collect();
-        assert!(matches!(&result, Value::Sym(s) if s.id == id));
-        assert_eq!(weak_symbol.strong_count(), 1);
-        drop(result);
-        assert!(weak_symbol.upgrade().is_none());
-
-        for payload in [
-            Value::lstr("last string λ"),
-            Value::bigint_from_i64(-123456789),
-        ] {
-            let holder = Object::new(None);
-            holder
-                .borrow_mut()
-                .props
-                .insert("data", Property::plain(payload));
-            let (result, _) = read(
-                &mut engine.interp,
-                &holder,
-                "data",
-                &Value::Obj(holder.clone()),
-                traced,
-            );
-            assert!(holder.borrow_mut().props.remove("data"));
-            drop(holder);
-            engine.interp.gc_collect();
-            match result {
-                Value::Str(text) => assert_eq!(text.as_str(), "last string λ"),
-                Value::BigInt(n) => assert_eq!(n, crate::bigint::JsBigInt::from(-123456789i64)),
-                _ => panic!("lost heap-valued data"),
             }
         }
     }
@@ -249,7 +144,7 @@ fn ordinary_data_read_getter_reentry_mutation_gc_and_throw_all_tiers() {
                 &mut engine.interp,
                 &receiver,
                 "data",
-                &Value::Obj(receiver.clone()),
+                &Value::Obj(receiver),
                 traced,
             );
             assert!(crate::builtins::same_value_pub(&result, &token));
@@ -269,7 +164,7 @@ fn ordinary_data_read_getter_reentry_mutation_gc_and_throw_all_tiers() {
             let result = engine.interp.get_from_chain(
                 &receiver,
                 "bad",
-                &Value::Obj(receiver.clone()),
+                &Value::Obj(receiver),
                 traced.then_some(&mut thrown_trace),
             );
             assert!(
@@ -283,10 +178,10 @@ fn ordinary_data_read_getter_reentry_mutation_gc_and_throw_all_tiers() {
                 &mut engine.interp,
                 &receiver,
                 "missingGetter",
-                &Value::Obj(receiver.clone()),
+                &Value::Obj(receiver),
                 traced,
             );
-            assert!(matches!(missing, Value::Undefined));
+            assert!(matches!((missing).view(), ValueView::Undefined));
             if traced {
                 assert_eq!(trace.outcome, Some(PropertyOutcome::Accessor));
             }
@@ -306,13 +201,7 @@ fn ordinary_data_read_dense_holes_and_present_undefined_are_distinct() {
             ("2", Value::Num(45.0), PropertyOutcome::Accessor, 0),
             ("absent", Value::Undefined, PropertyOutcome::Absent, 0),
         ] {
-            let (result, trace) = read(
-                &mut engine.interp,
-                &root,
-                key,
-                &Value::Obj(root.clone()),
-                traced,
-            );
+            let (result, trace) = read(&mut engine.interp, &root, key, &Value::Obj(root), traced);
             assert!(crate::builtins::same_value_pub(&result, &expected), "{key}");
             if traced {
                 assert_eq!(trace.outcome, Some(outcome));
@@ -330,57 +219,61 @@ fn ordinary_data_read_lazy_prototype_identity_and_returned_ownership() {
     for traced in [false, true] {
         let mut engine = Engine::new();
         run(&mut engine, "var F=function(){};");
-        let function = object(&mut engine, "F");
-        let weak_function = Rc::downgrade(&function);
-        let holder_shape = function.borrow().props.shape();
-        let before = crate::value::heap_live_objects(&engine.interp.gc_heap);
-        let (first, trace) = read(
-            &mut engine.interp,
-            &function,
-            "prototype",
-            &Value::Obj(function.clone()),
-            traced,
-        );
-        assert_eq!(
-            crate::value::heap_live_objects(&engine.interp.gc_heap),
-            before + 1
-        );
-        let (second, _) = read(
-            &mut engine.interp,
-            &function,
-            "prototype",
-            &Value::Obj(function.clone()),
-            traced,
-        );
-        assert!(crate::builtins::same_value_pub(&first, &second));
-        assert_eq!(
-            crate::value::heap_live_objects(&engine.interp.gc_heap),
-            before + 1
-        );
-        if traced {
-            assert_eq!(trace.outcome, Some(PropertyOutcome::Data));
-            assert_eq!(trace.holder_shape, Some(holder_shape));
-        }
-        run(&mut engine, "F=null;");
-        drop(function);
-        drop(second);
+        // Strong handles live only in helper frames (the collector scans the stack): the outer one
+        // keeps the returned prototype, the inner one the function.
+        let weak_function = crate::gc_test::in_frame(|| {
+            let (weak_function, first) = crate::gc_test::in_frame(|| {
+                let function = object(&mut engine, "F");
+                let weak_function = Gc::downgrade(&function);
+                let holder_shape = function.borrow().props.shape();
+                let before = crate::value::heap_live_objects(&engine.interp.gc_heap);
+                let (first, trace) = read(
+                    &mut engine.interp,
+                    &function,
+                    "prototype",
+                    &Value::Obj(function),
+                    traced,
+                );
+                assert_eq!(
+                    crate::value::heap_live_objects(&engine.interp.gc_heap),
+                    before + 1
+                );
+                let (second, _) = read(
+                    &mut engine.interp,
+                    &function,
+                    "prototype",
+                    &Value::Obj(function),
+                    traced,
+                );
+                assert!(crate::builtins::same_value_pub(&first, &second));
+                assert_eq!(
+                    crate::value::heap_live_objects(&engine.interp.gc_heap),
+                    before + 1
+                );
+                if traced {
+                    assert_eq!(trace.outcome, Some(PropertyOutcome::Data));
+                    assert_eq!(trace.holder_shape, Some(holder_shape));
+                }
+                (weak_function, first)
+            });
+            run(&mut engine, "F=null;");
+            engine.interp.gc_collect();
+            let constructor = first
+                .as_obj()
+                .unwrap()
+                .borrow()
+                .props
+                .get("constructor")
+                .unwrap()
+                .value();
+            assert!(Gc::ptr_eq(
+                &constructor.as_obj().unwrap(),
+                &weak_function.upgrade().unwrap()
+            ));
+            weak_function
+        });
         engine.interp.gc_collect();
-        let constructor = first
-            .as_obj()
-            .unwrap()
-            .borrow()
-            .props
-            .get("constructor")
-            .unwrap()
-            .value();
-        assert!(Rc::ptr_eq(
-            constructor.as_obj().unwrap(),
-            &weak_function.upgrade().unwrap()
-        ));
-        drop(constructor);
-        drop(first);
-        engine.interp.gc_collect();
-        assert!(weak_function.upgrade().is_none());
+        assert!(!crate::gc_test::alive(&weak_function));
     }
 }
 
@@ -406,7 +299,10 @@ fn ordinary_data_read_proxy_dispatch_receivers_and_invariants_all_tiers() {
             for name in ["proxy", "forwarding"] {
                 let start = object(&mut engine, name);
                 let (result, trace) = read(&mut engine.interp, &start, "x", &receiver, traced);
-                assert!(matches!(result, Value::Num(73.0)), "{tier:?}, {name}");
+                assert!(
+                    matches!((result).view(), ValueView::Num(73.0)),
+                    "{tier:?}, {name}"
+                );
                 if traced {
                     assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
                 }
@@ -428,7 +324,7 @@ fn ordinary_data_read_proxy_dispatch_receivers_and_invariants_all_tiers() {
                     .get_member_key(&error, "name")
                     .ok()
                     .expect("error name");
-                assert!(matches!(name, Value::Str(s) if s.as_str()=="TypeError"));
+                assert!(matches!((name).view(), ValueView::Str(s) if s.as_str()=="TypeError"));
                 if traced {
                     assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
                 }
@@ -443,17 +339,19 @@ fn ordinary_data_read_host_indexed_dispatch_precedes_ordinary_lookup() {
     let mut engine = Engine::new();
     engine.interp.activate_gc_heap();
     let start = Object::new(None);
-    let target = Value::Obj(start.clone());
+    let target = Value::Obj(start);
     let getter = Value::Obj(
         engine
             .interp
             .make_native("indexedRead", 1, |interp, this, args| {
                 assert!(this.as_obj().is_some());
                 interp.gc_collect();
-                Ok(Value::Num(match args.first() {
-                    Some(Value::Num(n)) => n + 21.0,
-                    _ => panic!("index"),
-                }))
+                Ok(Value::Num(
+                    match (args.first()).map(|__value| (__value).view()) {
+                        Some(ValueView::Num(n)) => n + 21.0,
+                        _ => panic!("index"),
+                    },
+                ))
             }),
     );
     engine
@@ -467,12 +365,12 @@ fn ordinary_data_read_host_indexed_dispatch_precedes_ordinary_lookup() {
         .insert("named", Property::plain(Value::Num(39.0)));
     for traced in [false, true] {
         let (result, trace) = read(&mut engine.interp, &start, "1", &target, traced);
-        assert!(matches!(result, Value::Num(22.0)));
+        assert!(matches!((result).view(), ValueView::Num(22.0)));
         if traced {
             assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
         }
         let (result, trace) = read(&mut engine.interp, &start, "named", &target, traced);
-        assert!(matches!(result, Value::Num(39.0)));
+        assert!(matches!((result).view(), ValueView::Num(39.0)));
         if traced {
             assert_eq!(trace.outcome, Some(PropertyOutcome::Data));
         }

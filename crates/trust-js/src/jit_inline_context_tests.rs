@@ -16,12 +16,13 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine
         .interp
         .get_var(name, &env)
         .unwrap_or_else(|_| panic!("missing fixture function {name}"));
-    let object = value.as_obj().expect("fixture function object").borrow();
+    let object_handle = value.as_obj().expect("fixture function object");
+    let object = object_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("fixture user function")
     };
@@ -30,7 +31,8 @@ fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
 
 fn require_hot_native(engine: &mut Engine, name: &str, inlined: bool) {
     let function = function(engine, name);
-    let chunk = function
+    let runtime = function.runtime();
+    let chunk = runtime
         .code
         .get()
         .and_then(Option::as_ref)
@@ -53,7 +55,12 @@ fn require_hot_native(engine: &mut Engine, name: &str, inlined: bool) {
                 "{name} must cross the hot inline checkpoint"
             );
             assert_eq!(
-                function.code2.get().and_then(Option::as_ref).is_some(),
+                function
+                    .runtime()
+                    .code2
+                    .get()
+                    .and_then(Option::as_ref)
+                    .is_some(),
                 inlined,
                 "{name} must respect the splice context capability"
             );
@@ -86,7 +93,8 @@ fn hot_super_method_keeps_home_object_in_an_ordinary_caller() {
         if tier == Tier::Jit {
             require_hot_native(&mut engine, "invokeSuper", false);
             let method = function(&mut engine, "nativeSuper");
-            let chunk = method
+            let runtime = method.runtime();
+            let chunk = runtime
                 .code
                 .get()
                 .and_then(Option::as_ref)
@@ -213,7 +221,7 @@ fn hot_self_hosted_methods_keep_their_intrinsics_when_spliced() {
             require_hot_native(&mut engine, "anyLarge", true);
             // Where the JIT spliced the call (asserted above), the body kept its operations.
             let caller = function(&mut engine, "anyLarge");
-            if let Some(spliced) = caller.code2.get().and_then(Option::as_ref) {
+            if let Some(spliced) = caller.runtime().code2.get().and_then(Option::as_ref) {
                 assert!(spliced
                     .jit_ops()
                     .iter()
@@ -406,7 +414,8 @@ fn small_callees_splice_into_callers_beyond_the_shared_budget() {
         );
         if tier == Tier::Jit {
             let caller = function(&mut engine, "bigCaller");
-            let chunk = caller
+            let runtime = caller.runtime();
+            let chunk = runtime
                 .code
                 .get()
                 .and_then(Option::as_ref)

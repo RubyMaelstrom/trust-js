@@ -373,13 +373,13 @@ fn loop_latch_loop_completions_and_finally_remain_tier_equivalent() {
 }
 
 thread_local! {
-    static LOCAL_ROOT: std::cell::RefCell<Option<std::rc::Weak<std::cell::RefCell<crate::value::Object>>>> = const { std::cell::RefCell::new(None) };
+    static LOCAL_ROOT: std::cell::RefCell<Option<crate::value::WeakGc>> = const { std::cell::RefCell::new(None) };
 }
 
 fn arm_latch_gc(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
     let object = args[0].as_obj().expect("local root");
-    LOCAL_ROOT.with(|root| *root.borrow_mut() = Some(Rc::downgrade(object)));
-    i.gc_next = 0;
+    LOCAL_ROOT.with(|root| *root.borrow_mut() = Some(crate::value::Gc::downgrade(&object)));
+    i.set_agent_next(0);
     Ok(Value::Undefined)
 }
 
@@ -402,7 +402,7 @@ fn loop_latch_repeated_polls_gc_and_deadline_preserve_local_frame_owner() {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);
-    let global = engine.interp.global.clone();
+    let global = engine.interp.global;
     engine
         .interp
         .def_method(&global, "armLatchGc", 1, arm_latch_gc);

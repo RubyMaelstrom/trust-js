@@ -29,7 +29,7 @@ use std::cell::{Cell, OnceCell};
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::bigint::JsBigInt;
+use crate::bigint::BigIntLiteral;
 use crate::stack_trace::NO_POSITION;
 use crate::token::{KEYWORDS, PUNCTUATORS};
 
@@ -1114,7 +1114,7 @@ fn dec_expr_inner(r: &mut Reader) -> R<Expr> {
     Ok(match r.u8()? {
         0 => Expr::Paren(dec_boxed_expr(r)?),
         1 => Expr::Num(r.f64()?),
-        2 => Expr::BigInt(JsBigInt::parse_radix(&r.str()?, 16).ok_or("snapshot: bad bigint")?),
+        2 => Expr::BigInt(BigIntLiteral::parse_radix(&r.str()?, 16).ok_or("snapshot: bad bigint")?),
         3 => Expr::Str(r.rcstr()?),
         4 => Expr::ToStr(dec_boxed_expr(r)?),
         5 => Expr::Bool(r.bool()?),
@@ -1542,10 +1542,8 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         // Lazy runtime caches — start empty, exactly as the parser leaves them.
         scan: Cell::new(0),
         hoist: OnceCell::new(),
-        calls: Cell::new(0),
-        code: OnceCell::new(),
-        code2: OnceCell::new(),
-        fn_maps: OnceCell::new(),
+        runtime: std::cell::OnceCell::new(),
+
         env_layouts: OnceCell::new(),
     })
 }

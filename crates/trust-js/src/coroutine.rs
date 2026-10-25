@@ -50,21 +50,6 @@ pub enum Coroutine {
 }
 
 impl Coroutine {
-    /// The continuation is an internal slot of its generator/result promise, not
-    /// an independent GC root. Trace only handles physically owned by this payload.
-    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
-        match self {
-            Coroutine::Vm(c) => c.trace_gc(edges),
-            Coroutine::Module(c) => c.trace_gc(edges),
-            Coroutine::FromAsync(c) => c.trace_gc(edges),
-            Coroutine::Unavailable(c) => {
-                if let Some(reason) = &c.reason {
-                    edges.value(reason);
-                }
-            }
-        }
-    }
-
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         match self {
             Coroutine::Vm(coroutine) => std::mem::size_of::<crate::bytecode::VmCoro>()
@@ -82,6 +67,9 @@ impl Coroutine {
 
     #[inline]
     pub(crate) fn resume(&mut self, i: &mut Interp, signal: Resume) -> Suspend {
+        // P1 S2: removed from its owner's table while it runs, the continuation is reachable
+        // only from Rust frames; register it so collections in the body trace it.
+        let _running = crate::gc_trace::enter_coroutine(self);
         match self {
             Coroutine::Vm(c) => c.resume(i, signal),
             Coroutine::Module(c) => c.resume(i, signal),
@@ -197,10 +185,30 @@ pub fn coroutine_await(i: &mut Interp, _value: Value) -> Resume {
     Resume::Throw(i.make_error("Error", VM_UNAVAILABLE_MSG))
 }
 
+impl crate::gc_trace::GcTrace for UnavailableCoro {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let UnavailableCoro {
+            reason,
+            done: _,
+            started: _,
+        } = self;
+        crate::gc_trace::GcTrace::trace_gc(reason, sink);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Resume, Suspend, UnavailableCoro};
-    use crate::Value;
+    use crate::bytecode::Tier;
+    use crate::value::ValueView;
+    use crate::{Completion, Engine, Value};
+
+    fn value(engine: &mut Engine, source: &str) -> String {
+        match engine.eval(source, false).expect("GC fixture parses") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
 
     fn unavailable(reason: Value) -> UnavailableCoro {
         UnavailableCoro {
@@ -215,7 +223,7 @@ mod tests {
         let mut returned = unavailable(Value::Num(1.0));
         assert!(matches!(
             returned.resume(Resume::Return(Value::Num(2.0))),
-            Suspend::Done(Value::Num(2.0))
+            Suspend::Done(value) if matches!(value.view(), ValueView::Num(2.0))
         ));
         assert!(returned.done);
         assert!(!returned.started);
@@ -223,7 +231,7 @@ mod tests {
         let mut thrown = unavailable(Value::Num(1.0));
         assert!(matches!(
             thrown.resume(Resume::Throw(Value::Num(3.0))),
-            Suspend::Throw(Value::Num(3.0))
+            Suspend::Throw(value) if matches!(value.view(), ValueView::Num(3.0))
         ));
         assert!(thrown.done);
         assert!(!thrown.started);
@@ -231,9 +239,280 @@ mod tests {
         let mut driven = unavailable(Value::Num(4.0));
         assert!(matches!(
             driven.resume(Resume::Next(Value::Undefined)),
-            Suspend::Throw(Value::Num(4.0))
+            Suspend::Throw(value) if matches!(value.view(), ValueView::Num(4.0))
         ));
         assert!(driven.done);
         assert!(driven.started);
+    }
+
+    #[test]
+    fn gc_releases_abandoned_continuations_without_running_author_cleanup() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            value(
+                &mut engine,
+                r#"
+                var targets = [], cleaned = 0;
+                function make(mode) {
+                    const target = {mode}; target.self = target;
+                    function* sequence() {
+                        try { yield target; return 1; }
+                        finally { cleaned++; }
+                    }
+                    const generator = sequence();
+                    // Keep an actual cycle in every tier, even when compiled capture
+                    // analysis omits the otherwise unused local generator binding.
+                    target.generator = generator;
+                    if (mode !== 0) generator.next();
+                    if (mode === 2) generator.return();
+                    if (mode === 3) generator.next();
+                    targets.push(new WeakRef(target));
+                }
+                for (var mode = 0; mode < 4; mode++) make(mode);
+                'ready'
+            "#,
+            );
+            for _ in 0..3 {
+                engine.interp.gc_collect();
+                assert_eq!(
+                    value(
+                        &mut engine,
+                        "targets.map(ref => ref.deref() === undefined).join(',') + ':' + cleaned"
+                    ),
+                    "true,true,true,true:2",
+                    "{tier:?}"
+                );
+            }
+            assert!(
+                engine.interp.generators.is_empty(),
+                "dead continuation metadata must be evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_preserves_live_suspended_and_executing_continuations() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            value(
+                &mut engine,
+                r#"
+                var live, weak;
+                (() => {
+                    const target = {n: 39}; weak = new WeakRef(target);
+                    live = (function*(input) {
+                        const values = [input];
+                        yield values[0].n;
+                        // While running, this state has left the side table. Its native
+                        // stack-owned handles must NOT be discounted as internal owners.
+                        $262.gc();
+                        yield input.n + 1;
+                        return values[0];
+                    })(target);
+                })();
+                'ready'
+            "#,
+            );
+            for expected in ["39", "40", "[object Object]"] {
+                engine.interp.gc_collect();
+                assert_eq!(value(&mut engine, "weak.deref().n"), "39");
+                assert_eq!(
+                    value(&mut engine, "live.next().value"),
+                    expected,
+                    "{tier:?}"
+                );
+            }
+            value(&mut engine, "live = null; 'released'");
+            engine.interp.gc_collect();
+            assert_eq!(value(&mut engine, "weak.deref() === undefined"), "true");
+        }
+    }
+
+    #[test]
+    fn gc_coroutine_edges_preserve_external_promise_resumption_and_weak_ephemerons() {
+        let mut engine = Engine::new();
+        value(
+            &mut engine,
+            r#"
+            var resolve, done, weak, abandoned, wm = new WeakMap();
+            (() => {
+                const target = {n: 41}; weak = new WeakRef(target);
+                wm.set(target, {n: 42});
+                (async function(input) {
+                    await new Promise(r => resolve = r);
+                    $262.gc();
+                    done = wm.get(input).n;
+                })(target);
+            })();
+            (() => {
+                const target = {}; target.self = target;
+                abandoned = new WeakRef(target);
+                (async function(input) {
+                    // No resolver escapes, so this await cannot ever resume.
+                    await new Promise(() => {});
+                    globalThis.unreachable = input;
+                })(target);
+            })();
+            'ready'
+        "#,
+        );
+        engine.interp.gc_collect();
+        assert_eq!(
+            value(
+                &mut engine,
+                "[weak.deref().n, abandoned.deref() === undefined, done].join(':')"
+            ),
+            "41:true:"
+        );
+        value(&mut engine, "resolve(); resolve = null; 'queued'");
+        assert_eq!(value(&mut engine, "done"), "42");
+        engine.interp.gc_collect();
+        assert_eq!(value(&mut engine, "weak.deref() === undefined"), "true");
+    }
+
+    #[test]
+    fn gc_async_generator_reactions_own_the_generator_across_await() {
+        for return_mode in [false, true] {
+            for reject in [false, true] {
+                let mut engine = Engine::new();
+                value(
+                    &mut engine,
+                    r#"
+                    var settle, result = 'pending', weak;
+                    function fulfilled(value) { result = 'ok:' + value.value; }
+                    function rejected(error) { result = 'error:' + error; }
+                    function start(returnMode, reject) {
+                        const gate = new Promise((resolve, fail) => settle = reject ? fail : resolve);
+                        const generator = (async function*() { yield await gate; })();
+                        weak = new WeakRef(generator);
+                        // The caller retains only the external resolver, not the iterator.
+                        const request = returnMode ? generator.return(gate) : generator.next();
+                        request.then(fulfilled, rejected);
+                    }
+                "#,
+                );
+                value(
+                    &mut engine,
+                    &format!("start({return_mode}, {reject}); 'ready'"),
+                );
+                engine.interp.gc_collect();
+                assert_eq!(value(&mut engine, "weak.deref() !== undefined"), "true");
+                value(&mut engine, "settle(42); settle = null; 'queued'");
+                assert_eq!(
+                    value(&mut engine, "result"),
+                    if reject { "error:42" } else { "ok:42" },
+                    "return={return_mode}, reject={reject}"
+                );
+                engine.interp.gc_collect();
+                assert_eq!(value(&mut engine, "weak.deref() === undefined"), "true");
+            }
+        }
+    }
+
+    #[test]
+    fn gc_continuation_reference_class_delegate_and_disposal_state_survives() {
+        let mut engine = Engine::new();
+        value(
+            &mut engine,
+            r#"
+            var refWeak, classWeak, iterWeak, resourceWeak, disposed = 0;
+            function referenceTarget() {
+                const object = {x:1}; refWeak = new WeakRef(object); return object;
+            }
+            function parentClass() {
+                const parent = class {base(){return 40}};
+                classWeak = new WeakRef(parent); return parent;
+            }
+            function iterator() {
+                const iter = {n:0, next(){return {value:++this.n, done:this.n>2}},
+                              [Symbol.iterator](){return this}};
+                iterWeak = new WeakRef(iter); return iter;
+            }
+            function resource() {
+                const object = {[Symbol.dispose](){disposed++}};
+                resourceWeak = new WeakRef(object); return object;
+            }
+            var referenceGen = (function*(){referenceTarget().x += yield 'rhs';return 7})();
+            var classGen = (function*(){return class extends (yield 'parent') {
+                [yield 'name'](){return 2}
+            }})();
+            var delegateGen = (function*(){return yield* iterator()})();
+            var resourceGen = (function*(){using item = resource();yield 1;return 9})();
+            referenceGen.next(); classGen.next(); classGen.next(parentClass());
+            delegateGen.next(); resourceGen.next();
+            'ready'
+        "#,
+        );
+        engine.interp.gc_collect();
+        assert_eq!(
+            value(
+                &mut engine,
+                "[refWeak,classWeak,iterWeak,resourceWeak].every(ref => ref.deref() !== undefined)"
+            ),
+            "true"
+        );
+        assert_eq!(
+            value(
+                &mut engine,
+                r#"
+            var refTarget = refWeak.deref();
+            var a = referenceGen.next(5).value;
+            var sum = refTarget.x;
+            var C = classGen.next('extra').value;
+            var c = new C();
+            [a, sum, c.base()+c.extra(), delegateGen.next().value,
+             resourceGen.next().value, disposed].join(':')
+        "#
+            ),
+            "7:6:42:2:9:1"
+        );
+        value(
+            &mut engine,
+            "referenceGen=classGen=delegateGen=resourceGen=C=c=refTarget=null; 'released'",
+        );
+        engine.interp.gc_collect();
+        assert_eq!(
+            value(
+                &mut engine,
+                "[refWeak,classWeak,iterWeak,resourceWeak].every(ref => ref.deref() === undefined)"
+            ),
+            "true"
+        );
+        assert_eq!(value(&mut engine, "disposed"), "1");
+    }
+
+    #[test]
+    fn gc_from_async_retains_its_iterator_until_external_resumption() {
+        let mut engine = Engine::new();
+        value(
+            &mut engine,
+            r#"
+            var settle, result, weak;
+            function done(values) { result = values.join(','); }
+            (() => {
+                const iter = {
+                    index:0,
+                    next() { return this.index++ ? {done:true} : new Promise(r => settle=r); },
+                    [Symbol.asyncIterator]() { return this; }
+                };
+                weak = new WeakRef(iter);
+                Array.fromAsync(iter).then(done);
+            })();
+            'ready'
+        "#,
+        );
+        engine.interp.gc_collect();
+        assert_eq!(value(&mut engine, "weak.deref() !== undefined"), "true");
+        value(
+            &mut engine,
+            "settle({done:false,value:42}); settle = null; 'queued'",
+        );
+        assert_eq!(value(&mut engine, "result"), "42");
+        engine.interp.gc_collect();
+        assert_eq!(value(&mut engine, "weak.deref() === undefined"), "true");
     }
 }

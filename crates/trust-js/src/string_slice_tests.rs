@@ -3,6 +3,7 @@
 
 use crate::bytecode::Tier;
 use crate::value::Value;
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 fn check(source: &str, expected: &str) {
@@ -144,7 +145,7 @@ fn unicode_slice_index_stays_in_existing_cache_budget_and_pins_identity() {
     let copied = engine
         .interp
         .slice_units(&original, &units, 128, units.len());
-    assert!(matches!(Value::Str(copied), Value::Str(s) if s.as_str() == "é😀z"));
+    assert!(matches!((Value::Str(copied)).view(), ValueView::Str(s) if s.as_str() == "é😀z"));
 }
 
 #[test]

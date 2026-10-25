@@ -2,6 +2,7 @@
 //! ApplyStringOrNumericBinaryOperator 21341, String.prototype.concat 36291.
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 fn check(source: &str, expected: &str) {
@@ -46,13 +47,13 @@ fn ascii_unit_observation_does_not_pin_unique_accumulators() {
     use crate::lstr::LStr;
     let mut engine = Engine::new();
     let mut s = LStr::from("a".repeat(128)).concat_owned(&LStr::from("b"));
-    let pointer = s.as_ptr();
+    let pointer = s.buffer_ptr();
     assert_eq!(engine.interp.str_len(&s), 129);
     assert_eq!(engine.interp.unit_at(&s, 128), Some(b'b' as u16));
     assert_eq!(engine.interp.unit_at(&s, 129), None);
     s = s.concat_owned(&LStr::from("c"));
     assert_eq!(
-        s.as_ptr(),
+        s.buffer_ptr(),
         pointer,
         "unit observation must not force a prefix copy"
     );
@@ -199,20 +200,20 @@ fn string_concat_helpers_reach_compiled_tiers() {
             ok
         "#, false), Ok(Completion::Value(v)) if v == "true"));
         for name in ["add", "append", "appendLocal", "appendCaptured"] {
-            let env = engine.interp.global_env.clone();
-            let crate::value::Value::Obj(object) = engine
+            let env = engine.interp.global_env;
+            let ValueView::Obj(object) = (engine
                 .interp
                 .get_var(name, &env)
-                .unwrap_or_else(|_| panic!("missing {name}"))
-            else {
+                .unwrap_or_else(|_| panic!("missing {name}")))
+            .view() else {
                 panic!("{name} is not an object");
             };
             let object = object.borrow();
             let crate::value::Callable::User(user) = &object.call else {
                 panic!("{name} is not a user function");
             };
-            let chunk = user
-                .func
+            let runtime = user.func.runtime();
+            let chunk = runtime
                 .code
                 .get()
                 .and_then(Option::as_ref)

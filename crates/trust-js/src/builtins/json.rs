@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 pub(super) fn install_json(it: &mut Interp) {
     let j = it.new_object();
@@ -14,9 +15,9 @@ pub(super) fn install_json(it: &mut Interp) {
                 keys: None,
             }
         } else if json_is_array(i, &replacer)? {
-            let len = match &replacer {
-                Value::Obj(o) if proxy_pair(i, &replacer).is_none() => i.array_length(o),
-                Value::Obj(o) => ab(i.to_length(o))?,
+            let len = match &(replacer).view() {
+                ValueView::Obj(o) if proxy_pair(i, &replacer).is_none() => i.array_length(o),
+                ValueView::Obj(o) => ab(i.to_length(o))?,
                 _ => 0,
             };
             let mut list: Vec<Rc<str>> = Vec::new();
@@ -27,10 +28,10 @@ pub(super) fn install_json(it: &mut Interp) {
             for k in 0..len {
                 let item = ab(i.get_member_key(&replacer, &k.to_string()))?;
                 // String/Number primitives and their wrappers contribute a key via ToString.
-                let key = match &item {
-                    Value::Str(s) => Some(s.to_string()),
-                    Value::Num(n) => Some(i.num_to_str(*n)),
-                    Value::Obj(o)
+                let key = match &(item).view() {
+                    ValueView::Str(s) => Some(s.to_string()),
+                    ValueView::Num(n) => Some(i.num_to_str(*n)),
+                    ValueView::Obj(o)
                         if matches!(o.borrow().exotic, Exotic::StrWrap(_) | Exotic::NumWrap(_)) =>
                     {
                         Some(ab(i.to_string(&item))?.to_string())
@@ -56,24 +57,31 @@ pub(super) fn install_json(it: &mut Interp) {
         // The `space` argument: a Number/String wrapper is unwrapped first; then a Number becomes
         // that many spaces (clamped 0..10), a String its first 10 code units, else no indentation.
         let mut space = arg(args, 2);
-        if let Value::Obj(o) = &space {
-            let exotic = o.borrow().exotic.clone();
-            match exotic {
-                Exotic::NumWrap(_) => space = Value::Num(ab(i.to_number(&space))?),
-                Exotic::StrWrap(_) => space = Value::Str(ab(i.to_string(&space))?),
-                _ => {}
+        if let ValueView::Obj(o) = &(space).view() {
+            // Classify first: the conversions may run JavaScript, which needs `o` unborrowed.
+            let (number, string) = {
+                let exotic = &o.borrow().exotic;
+                (
+                    matches!(exotic, Exotic::NumWrap(_)),
+                    matches!(exotic, Exotic::StrWrap(_)),
+                )
+            };
+            if number {
+                space = Value::Num(ab(i.to_number(&space))?);
+            } else if string {
+                space = Value::Str(ab(i.to_string(&space))?);
             }
         }
-        let gap = match space {
-            Value::Num(n) => {
+        let gap = match (space).view() {
+            ValueView::Num(n) => {
                 let n = if n.is_nan() { 0.0 } else { n.trunc() };
                 " ".repeat(n.clamp(0.0, 10.0) as usize)
             }
-            Value::Str(s) if s.ascii_hint() => s[..s.len().min(10)].to_owned(),
+            ValueView::Str(s) if s.ascii_hint() => s[..s.len().min(10)].to_owned(),
             // JSON.stringify takes the first ten UTF-16 code units, including a lone
             // surrogate when that boundary splits an astral character. Decode only
             // this bounded prefix instead of materializing the full indentation string.
-            Value::Str(s) => {
+            ValueView::Str(s) => {
                 crate::jstr::from_units(&crate::jstr::unit_iter(&s).take(10).collect::<Vec<_>>())
             }
             _ => String::new(),
@@ -82,7 +90,7 @@ pub(super) fn install_json(it: &mut Interp) {
         // function can observe it (as its receiver).
         let holder = if opts.func.is_some() {
             let wrapper = i.new_object();
-            set_data(&wrapper, "", value.clone());
+            set_data(&wrapper, "", value);
             Value::Obj(wrapper)
         } else {
             Value::Undefined
@@ -125,6 +133,10 @@ pub(super) fn install_json(it: &mut Interp) {
         // recording primitive source spans for its `context` argument.
         if reviver.is_callable() {
             let (v, record) = json_parse_recorded(i, input, &mut pos)?;
+            // A reviver can replace a later property before it is visited. Its originally
+            // parsed value still participates in SameValue/source matching, even when only
+            // this Rust-owned record retains it across the reviver's safepoints (I1).
+            let record = crate::rooting::Rooted::new(record);
             json_skip_ws(input, &mut pos);
             if pos != input.len() {
                 return Err(i.make_error("SyntaxError", "Unexpected non-whitespace after JSON"));
@@ -168,12 +180,12 @@ pub(super) fn install_json(it: &mut Interp) {
         o.borrow_mut().proto = None;
         set_data(&o, "rawJSON", Value::lstr(text.clone()));
         set_internal(&o, "\u{0}raw_json", Value::lstr(text));
-        i.freeze_object(&Value::Obj(o.clone()));
+        i.freeze_object(&Value::Obj(o));
         Ok(Value::Obj(o))
     });
     it.def_method(&j, "isRawJSON", 1, |_i, _t, args| {
         Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Obj(o) if o.borrow().internal_slots().contains("\u{0}raw_json")),
+            matches!((arg(args, 0)).view(), ValueView::Obj(o) if o.borrow().internal_slots().contains("\u{0}raw_json")),
         ))
     });
     set_to_string_tag(it, &j, "JSON");
@@ -261,7 +273,7 @@ fn json_delete_prop(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Val
         ab(i.proxy_delete(target, handler, key))?;
         return Ok(());
     }
-    if let Value::Obj(o) = holder {
+    if let ValueView::Obj(o) = &(holder).view() {
         let configurable = o
             .borrow()
             .props
@@ -295,7 +307,7 @@ fn json_create_data_prop(i: &mut Interp, holder: &Value, key: &str, v: Value) ->
         ))?;
         return Ok(());
     }
-    if let Value::Obj(o) = holder {
+    if let ValueView::Obj(o) = &(holder).view() {
         ab(define_own_property(i, o, key, &Value::Obj(desc)))?;
     }
     Ok(())
@@ -311,10 +323,10 @@ fn internalize_json_property(
     record: Option<&JsonRecord>,
 ) -> Result<Value, Value> {
     let val = ab(i.get_member_key(holder, name))?;
-    if matches!(val, Value::Obj(_)) {
+    if matches!((val).view(), ValueView::Obj(_)) {
         if json_is_array(i, &val)? {
             let len = match val.as_obj() {
-                Some(o) => ab(i.to_length(o))?,
+                Some(o) => ab(i.to_length(&o))?,
                 None => 0,
             };
             for idx in 0..len {
@@ -326,7 +338,7 @@ fn internalize_json_property(
                 let new_el = nested(i, |i| {
                     internalize_json_property(i, &val, &k, reviver, child)
                 })?;
-                if matches!(new_el, Value::Undefined) {
+                if matches!((new_el).view(), ValueView::Undefined) {
                     json_delete_prop(i, &val, &k)?;
                 } else {
                     json_create_data_prop(i, &val, &k, new_el)?;
@@ -336,19 +348,26 @@ fn internalize_json_property(
             let keys: Vec<String> = if proxy_pair(i, &val).is_some() {
                 proxy_enum_string_keys(i, &val)?
                     .iter()
-                    .filter_map(|k| match k {
-                        Value::Str(s) => Some(crate::value::encode_owned_string_key(s.to_string())),
+                    .filter_map(|k| match &(k).view() {
+                        ValueView::Str(s) => {
+                            Some(crate::value::encode_owned_string_key(s.to_string()))
+                        }
                         _ => None,
                     })
                     .collect()
-            } else if let Some(info) = val.as_obj().and_then(|o| ta_info(i, o)) {
+            } else if let Some(info) = val.as_obj().and_then(|o| ta_info(i, &o)) {
                 // A TypedArray holder (a reviver may graft one in) walks its integer indices.
                 (0..i.ta_len(&info).unwrap_or(0))
                     .map(|k| k.to_string())
                     .collect()
             } else {
                 val.as_obj()
-                    .map(|o| ordered_enum_keys(o).iter().map(|k| k.to_string()).collect())
+                    .map(|o| {
+                        ordered_enum_keys(&o)
+                            .iter()
+                            .map(|k| k.to_string())
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
             for k in keys {
@@ -362,7 +381,7 @@ fn internalize_json_property(
                 let new_el = nested(i, |i| {
                     internalize_json_property(i, &val, &k, reviver, child)
                 })?;
-                if matches!(new_el, Value::Undefined) {
+                if matches!((new_el).view(), ValueView::Undefined) {
                     json_delete_prop(i, &val, &k)?;
                 } else {
                     json_create_data_prop(i, &val, &k, new_el)?;
@@ -374,13 +393,13 @@ fn internalize_json_property(
     // not forward-modified by the reviver) exposes its exact source text.
     let context = i.new_object();
     if let Some(JsonRecord::Prim(src, parsed)) = record {
-        if !matches!(val, Value::Obj(_)) && same_value(&val, parsed) {
+        if !matches!((val).view(), ValueView::Obj(_)) && same_value(&val, parsed) {
             set_data(&context, "source", Value::lstr(src.clone()));
         }
     }
     ab(i.call(
-        reviver.clone(),
-        holder.clone(),
+        *reviver,
+        *holder,
         &[
             crate::value::string_key_value(name),
             val,
@@ -445,7 +464,7 @@ fn json_plain_get(i: &Interp, object: &Gc) -> bool {
         && (i.mapped_arguments.is_empty()
             || !i
                 .mapped_arguments
-                .contains_key(&(Rc::as_ptr(object) as usize)))
+                .contains_key(&(Gc::as_ptr(object) as usize)))
 }
 
 /// Get(holder, key) for SerializeJSONProperty: an own data property of a plain object is read
@@ -482,8 +501,8 @@ fn json_get_index(
 /// on an ordinary prototype chain; walk such a chain directly, and leave accessors and exotic
 /// objects to the full [[Get]] (whose result is the same, including getter calls).
 fn json_to_json_method(i: &mut Interp, value: &Value) -> Result<Value, Value> {
-    if let Value::Obj(start) = value {
-        let mut current = start.clone();
+    if let ValueView::Obj(start) = &(value).view() {
+        let mut current = *start;
         loop {
             let next = {
                 let object = current.borrow();
@@ -493,7 +512,7 @@ fn json_to_json_method(i: &mut Interp, value: &Value) -> Result<Value, Value> {
                 match object.props.get("toJSON") {
                     Some(property) if !property.accessor() => return Ok(property.value()),
                     Some(_) => break,
-                    None => object.proto.clone(),
+                    None => object.proto,
                 }
             };
             match next {
@@ -515,16 +534,16 @@ fn json_serialize_property(
     key: JsonKey,
     mut value: Value,
 ) -> Result<bool, Value> {
-    if matches!(value, Value::Obj(_) | Value::BigInt(_)) {
+    if matches!((value).view(), ValueView::Obj(_) | ValueView::BigInt(_)) {
         let to_json = json_to_json_method(i, &value)?;
         if to_json.is_callable() {
-            value = ab(i.call(to_json, value.clone(), &[key.value()]))?;
+            value = ab(i.call(to_json, value, &[key.value()]))?;
         }
     }
     if let Some(func) = &s.opts.func {
-        value = ab(i.call(func.clone(), holder.clone(), &[key.value(), value]))?;
+        value = ab(i.call(*func, *holder, &[key.value(), value]))?;
     }
-    if let Value::Obj(o) = &value {
+    if let ValueView::Obj(o) = &(value).view() {
         // A JSON.rawJSON object (always created with a null prototype) serializes as its stored
         // raw text, verbatim.
         let raw = {
@@ -537,7 +556,7 @@ fn json_serialize_property(
                 Some(_) => None,
             }
         };
-        if let Some(Value::Str(raw)) = raw {
+        if let Some(ValueView::Str(raw)) = (raw).map(|__value| (__value).view()) {
             s.out.push_str(&raw);
             return Ok(true);
         }
@@ -559,31 +578,31 @@ fn json_serialize_property(
             None => {}
         }
     }
-    match &value {
-        Value::Undefined | Value::Empty | Value::Sym(_) => return Ok(false),
-        Value::Null => s.out.push_str("null"),
-        Value::Bool(b) => s.out.push_str(if *b { "true" } else { "false" }),
-        Value::Num(n) if !n.is_finite() => s.out.push_str("null"),
-        Value::Num(n) if n.fract() == 0.0 && n.abs() < 1e15 => {
+    match &(value).view() {
+        ValueView::Undefined | ValueView::Empty | ValueView::Sym(_) => return Ok(false),
+        ValueView::Null => s.out.push_str("null"),
+        ValueView::Bool(b) => s.out.push_str(if *b { "true" } else { "false" }),
+        ValueView::Num(n) if !n.is_finite() => s.out.push_str("null"),
+        ValueView::Num(n) if n.fract() == 0.0 && n.abs() < 1e15 => {
             // Integral and below 10^21, so Number::toString prints its digits (-0 prints "0").
             use std::fmt::Write;
             let _ = write!(s.out, "{}", *n as i64);
         }
-        Value::Num(n) => s.out.push_str(&i.num_to_str(*n)),
+        ValueView::Num(n) => s.out.push_str(&i.num_to_str(*n)),
         // JSON.stringify of a BigInt throws (matches the spec).
-        Value::BigInt(_) => {
+        ValueView::BigInt(_) => {
             return Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"));
         }
-        Value::Str(text) => {
+        ValueView::Str(text) => {
             // Escaping only lengthens the text.
             check_string_length(i, s.out.len().saturating_add(text.len()))?;
             json_quote_into(&mut s.out, text);
         }
-        Value::Obj(o) => {
+        ValueView::Obj(o) => {
             if !matches!(o.borrow().call, Callable::None) {
                 return Ok(false); // functions are omitted
             }
-            let o = o.clone();
+            let o = *o;
             if json_is_array(i, &value)? {
                 nested(i, |i| json_serialize_array(i, s, &value, &o))?;
             } else {
@@ -597,7 +616,7 @@ fn json_serialize_property(
 
 /// The start of SerializeJSONObject/Array: the cycle check and the deeper indentation.
 fn json_enter(i: &mut Interp, s: &mut Serializer, object: &Gc) -> Result<usize, Value> {
-    let ptr = Rc::as_ptr(object) as usize;
+    let ptr = Gc::as_ptr(object) as usize;
     let shallow = &s.stack[..s.stack.len().min(JSON_STACK_SCAN)];
     if shallow.contains(&ptr) || s.deep_stack.contains(&ptr) {
         return Err(i.make_error("TypeError", "Converting circular structure to JSON"));
@@ -621,9 +640,9 @@ fn json_leave(s: &mut Serializer, object: &Gc, stepback: usize, any: bool, close
     }
     s.out.push(close);
     let ptr = s.stack.pop();
-    debug_assert_eq!(ptr, Some(Rc::as_ptr(object) as usize));
+    debug_assert_eq!(ptr, Some(Gc::as_ptr(object) as usize));
     if s.stack.len() >= JSON_STACK_SCAN {
-        s.deep_stack.remove(&(Rc::as_ptr(object) as usize));
+        s.deep_stack.remove(&(Gc::as_ptr(object) as usize));
     }
 }
 
@@ -652,8 +671,10 @@ fn json_serialize_object(
         Some(list) => list.clone(),
         None if proxy_pair(i, value).is_some() => proxy_enum_string_keys(i, value)?
             .iter()
-            .filter_map(|key| match key {
-                Value::Str(key) => Some(Rc::from(crate::value::encode_string_key(key).as_ref())),
+            .filter_map(|key| match &(key).view() {
+                ValueView::Str(key) => {
+                    Some(Rc::from(crate::value::encode_string_key(key).as_ref()))
+                }
                 _ => None,
             })
             .collect(),
@@ -952,6 +973,22 @@ enum JsonRecord {
     Obj(Vec<(String, JsonRecord)>),
 }
 
+impl crate::gc_trace::GcTrace for JsonRecord {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        // Like Drop below, tracing must not use one native frame per nesting level.
+        let mut pending = vec![self];
+        while let Some(record) = pending.pop() {
+            match record {
+                JsonRecord::Prim(_source, parsed) => sink.value(parsed),
+                JsonRecord::Arr(children) => pending.extend(children),
+                JsonRecord::Obj(entries) => {
+                    pending.extend(entries.iter().map(|(_key, child)| child));
+                }
+            }
+        }
+    }
+}
+
 impl JsonRecord {
     fn take_children(&mut self, out: &mut Vec<JsonRecord>) {
         match self {
@@ -1059,7 +1096,7 @@ fn json_parse_recorded(
             let start = *pos;
             let v = json_parse_value(i, input, pos)?;
             let src = input.to_string(start, *pos);
-            Ok((v.clone(), JsonRecord::Prim(src, v)))
+            Ok((v, JsonRecord::Prim(src, v)))
         }
     }
 }
@@ -1191,5 +1228,389 @@ fn json_parse_string(
             }
             c => s.push(c),
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod tests {
+    use super::*;
+    use crate::bytecode::Tier;
+    use crate::gc_core::{CellAge, CollectionKind, MarkSource};
+    use crate::gc_handle::WeakRef;
+    use crate::rooting::Rooted;
+    use crate::{Completion, Engine};
+    use std::cell::RefCell;
+
+    // ECMA-262 e28783d5, spec.html:47996-48045, InternalizeJSONProperty;
+    // spec.html:6065-6067, SameValueNonNumber. Equal String code units keep the
+    // original source token even when the replacement has a different GC cell.
+
+    struct Leaf {
+        key: String,
+        token: String,
+        replacement: String,
+    }
+
+    fn leaves(keys: [&str; 3]) -> Vec<Leaf> {
+        let suffix = "-json-source-record-root-".repeat(4);
+        [
+            (format!(r#""\u0061{suffix}""#), format!("a{suffix}")),
+            (format!(r#""é{suffix}""#), format!("é{suffix}")),
+            (
+                format!(r#""\ud800{suffix}""#),
+                format!("{}{suffix}", crate::jstr::smuggle(0xd800)),
+            ),
+        ]
+        .into_iter()
+        .zip(keys)
+        .map(|((token, replacement), key)| Leaf {
+            key: key.to_owned(),
+            token,
+            replacement,
+        })
+        .collect()
+    }
+
+    fn literal(text: &str) -> String {
+        let mut result = String::new();
+        json_quote_into(&mut result, text);
+        result
+    }
+
+    fn eval(engine: &mut Engine, source: &str) -> String {
+        match engine
+            .eval(source, false)
+            .expect("JSON rooting fixture parses")
+        {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
+
+    fn assert_live_strings(interp: &Interp, watched: &[WeakRef], explicit_root: bool) {
+        let heap = &interp.gc_heap;
+        let core = heap.core.borrow();
+        for weak in watched {
+            // Check the clearing weak flag and descriptor before any possible payload read.
+            let address = weak
+                .live_ptr()
+                .expect("the original parsed string stays live");
+            assert!(core.owns_cell(address, heap.string_desc));
+            if explicit_root {
+                let path = core.retention_path(address);
+                assert!(
+                    matches!(path.first(), Some((_, _, MarkSource::Root))),
+                    "the source record must explicitly root its parsed string: {path:?}"
+                );
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Watched {
+        strings: Vec<WeakRef>,
+        calls: usize,
+    }
+
+    fn check_replaced_siblings(text: &str, first_key: &str, leaves: Vec<Leaf>, abrupt: bool) {
+        let expected = leaves
+            .iter()
+            .map(|leaf| format!("{}:{}", literal(&leaf.key), literal(&leaf.token)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let order = leaves
+            .iter()
+            .map(|leaf| leaf.key.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            r#"(function() {{
+                var expected = {{{expected}}}, seen = [];
+                var caught = false;
+                try {{
+                    JSON.parse({text}, function(key, value, context) {{
+                        if (key === {first_key}) {{
+                            __replaceJSONStrings.call(this);
+                            if ({abrupt}) throw 73;
+                        }}
+                        if (Object.hasOwn(expected, key)) {{
+                            if (!Object.hasOwn(context, 'source') || context.source !== expected[key])
+                                throw new Error('source for ' + key);
+                            seen.push(key);
+                        }}
+                        return value;
+                    }});
+                }} catch (error) {{
+                    if (!{abrupt} || error !== 73) throw error;
+                    caught = true;
+                }}
+                if ({abrupt} ? !caught : seen.join(',') !== {order}) throw new Error('visits');
+                return 'ok';
+            }})()"#,
+            text = literal(text),
+            first_key = literal(first_key),
+            order = literal(&order),
+        );
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            engine.interp.activate_gc_heap();
+            engine
+                .interp
+                .gc_heap
+                .core
+                .borrow_mut()
+                .set_retention_tracing(true);
+            let watched = Rc::new(RefCell::new(Watched::default()));
+            let callback_state = watched.clone();
+            let replacements = leaves
+                .iter()
+                .map(|leaf| (leaf.key.clone(), leaf.replacement.clone()))
+                .collect::<Vec<_>>();
+            let native = engine.interp.new_native_fn(
+                "__replaceJSONStrings",
+                0,
+                Rc::new(move |interp, holder, _| {
+                    let object = holder.as_obj().expect("parsed array or object holder");
+                    let mut originals = Vec::new();
+                    for (key, text) in &replacements {
+                        let old = ab(interp.get_member_key(&holder, key))?;
+                        let ValueView::Str(string) = old.view() else {
+                            panic!("a later parsed property is a string");
+                        };
+                        let weak = WeakRef::to(string.cell_word() as usize);
+                        let replacement = Value::lstr(text.as_str());
+                        assert!(same_value(&old, &replacement));
+                        assert_ne!(old.cell_word(), replacement.cell_word());
+                        set_data(&object, key, replacement);
+                        originals.push(weak);
+                    }
+                    assert_eq!(originals.len(), 3);
+                    for kind in [CollectionKind::Minor, CollectionKind::Major] {
+                        let before = interp.gc_heap.core.borrow().stats().collections;
+                        // AST evaluation needs its legitimate native temporaries. Roots are
+                        // visited before that scan, so require Root rather than accepting a
+                        // stale parser-frame copy as evidence of source-record ownership.
+                        interp.gc_heap_collect_explicit(kind);
+                        assert_eq!(interp.gc_heap.core.borrow().stats().collections, before + 1);
+                        assert_live_strings(interp, &originals, kind == CollectionKind::Major);
+                    }
+                    let mut state = callback_state.borrow_mut();
+                    state.strings = originals;
+                    state.calls += 1;
+                    Ok(Value::Undefined)
+                }),
+                // Only Rust strings, counters and weak observers are captured.
+                crate::value::NativeCaptures::None,
+            );
+            set_data(&engine.interp.global, "__replaceJSONStrings", native);
+            assert_eq!(eval(&mut engine, &source), "ok", "{tier:?}");
+            assert_eq!(watched.borrow().calls, 1, "{tier:?}");
+            // Outside JS, exclude all stale native words and prove both normal and abrupt
+            // completion unregister the record instead of keeping the originals forever.
+            engine
+                .interp
+                .gc_collect_precise_for_test(CollectionKind::Major);
+            assert!(watched
+                .borrow()
+                .strings
+                .iter()
+                .all(|weak| weak.live_ptr().is_none()));
+        }
+    }
+
+    #[test]
+    fn json_reviver_equal_sibling_strings_are_explicit_roots_in_all_tiers() {
+        let object = leaves(["a", "b", "c"]);
+        let text = format!(
+            r#"{{"kick":0,"a":{},"b":{},"c":{}}}"#,
+            object[0].token, object[1].token, object[2].token
+        );
+        check_replaced_siblings(&text, "kick", object, false);
+        let array = leaves(["1", "2", "3"]);
+        let text = format!(
+            r#"[0,{},{},{}]"#,
+            array[0].token, array[1].token, array[2].token
+        );
+        check_replaced_siblings(&text, "0", array, false);
+    }
+
+    #[test]
+    fn json_reviver_duplicate_keys_keep_the_last_source_after_gc() {
+        let entries = leaves(["dup", "b", "c"]);
+        let text = format!(
+            r#"{{"kick":0,"dup":"discarded first token","b":{},"dup":{},"c":{}}}"#,
+            entries[1].token, entries[0].token, entries[2].token
+        );
+        check_replaced_siblings(&text, "kick", entries, false);
+    }
+
+    #[test]
+    fn json_reviver_throw_retires_source_record_roots() {
+        let entries = leaves(["a", "b", "c"]);
+        let text = format!(
+            r#"{{"kick":0,"a":{},"b":{},"c":{}}}"#,
+            entries[0].token, entries[1].token, entries[2].token
+        );
+        check_replaced_siblings(&text, "kick", entries, true);
+    }
+
+    #[test]
+    fn json_reviver_samevalue_and_scalar_source_controls() {
+        let source = r#"(function() {
+            function check(ok) { if (!ok) throw new Error('source control'); }
+            var visits = 0;
+            JSON.parse('[0,"same","change","delete",-0,0,1.50]', function(k,v,c) {
+                if (k === '0') {
+                    this[1] = 'sam' + 'e'; this[2] = 'different'; delete this[3];
+                    this[4] = 0; this[5] = -0; this[6] = 1.5;
+                    __forceJSONCollection();
+                }
+                if (k === '1') check(c.source === '"same"');
+                if (k === '2' || k === '3' || k === '4' || k === '5')
+                    check(!Object.hasOwn(c, 'source'));
+                if (k === '6') check(c.source === '1.50');
+                if (k !== '') visits++;
+                return v;
+            });
+            check(visits === 7);
+            for (var text of ['  "scalar"  ', ' 1.50 ', ' true ', ' null ', ' -0 ']) {
+                var count = 0;
+                JSON.parse(text, function(k,v,c) {
+                    check(k === '' && c.source === text.trim());
+                    if (text.trim() === '-0') check(Object.is(v, -0));
+                    __forceJSONCollection();
+                    count++;
+                    return v;
+                });
+                check(count === 1);
+            }
+            return 'ok';
+        })()"#;
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let native = engine.interp.new_native_fn(
+                "__forceJSONCollection",
+                0,
+                Rc::new(|interp, _, _| {
+                    interp.gc_heap_collect_explicit(CollectionKind::Major);
+                    Ok(Value::Undefined)
+                }),
+                crate::value::NativeCaptures::None,
+            );
+            set_data(&engine.interp.global, "__forceJSONCollection", native);
+            assert_eq!(eval(&mut engine, source), "ok", "{tier:?}");
+        }
+    }
+
+    fn watch_record_strings(record: &JsonRecord) -> Vec<WeakRef> {
+        // Independent of GcTrace: an omitted trace arm must not omit its own witnesses.
+        let mut watched = Vec::new();
+        let mut pending = vec![record];
+        while let Some(record) = pending.pop() {
+            match record {
+                JsonRecord::Prim(_source, parsed) => {
+                    if let ValueView::Str(string) = parsed.view() {
+                        watched.push(WeakRef::to(string.cell_word() as usize));
+                    }
+                }
+                JsonRecord::Arr(children) => pending.extend(children),
+                JsonRecord::Obj(entries) => {
+                    pending.extend(entries.iter().map(|(_key, child)| child));
+                }
+            }
+        }
+        watched
+    }
+
+    fn check_precise_record(engine: &mut Engine, record: JsonRecord, leaves: usize) {
+        let watched = watch_record_strings(&record);
+        assert_eq!(watched.len(), leaves);
+        for weak in &watched {
+            assert_eq!(
+                engine
+                    .interp
+                    .gc_heap
+                    .core
+                    .borrow()
+                    .cell_age(weak.ptr() as u64),
+                Some(CellAge::Young)
+            );
+        }
+        let record = Rooted::new(record);
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            engine.interp.gc_collect_precise_for_test(kind);
+            assert_live_strings(&engine.interp, &watched, true);
+        }
+        drop(record);
+        engine
+            .interp
+            .gc_collect_precise_for_test(CollectionKind::Major);
+        assert!(watched.iter().all(|weak| weak.live_ptr().is_none()));
+    }
+
+    #[test]
+    fn json_record_scalar_array_and_object_are_precise_roots_until_drop() {
+        let token = literal(&"fresh noninterned parsed string ".repeat(8));
+        for text in [
+            token.clone(),
+            format!("[{token}]"),
+            format!(r#"{{"nested":[{token}]}}"#),
+        ] {
+            let mut engine = Engine::new();
+            engine.interp.activate_gc_heap();
+            engine
+                .interp
+                .gc_heap
+                .core
+                .borrow_mut()
+                .set_retention_tracing(true);
+            let mut position = 0;
+            let (_, record) = json_parse_recorded(
+                &mut engine.interp,
+                JsonInput::Bytes(text.as_bytes()),
+                &mut position,
+            )
+            .unwrap_or_else(|_| panic!("recorded fixture parses"));
+            assert_eq!(position, text.len());
+            check_precise_record(&mut engine, record, 1);
+        }
+    }
+
+    #[test]
+    fn json_record_deep_trace_and_drop_are_iterative() {
+        std::thread::Builder::new()
+            .name("deep-json-record".to_owned())
+            .stack_size(1 << 20)
+            .spawn(|| {
+                let mut engine = Engine::new();
+                engine.interp.activate_gc_heap();
+                engine
+                    .interp
+                    .gc_heap
+                    .core
+                    .borrow_mut()
+                    .set_retention_tracing(true);
+                let parsed = Value::lstr("deep source record string ".repeat(8));
+                let mut record = JsonRecord::Prim("a Rust source token".to_owned(), parsed);
+                for depth in 0..50_000 {
+                    record = if depth & 1 == 0 {
+                        JsonRecord::Arr(vec![record])
+                    } else {
+                        JsonRecord::Obj(vec![(String::new(), record)])
+                    };
+                }
+                check_precise_record(&mut engine, record, 1);
+            })
+            .expect("spawn deep JSON record test")
+            .join()
+            .expect("deep JSON record trace/drop panicked");
     }
 }

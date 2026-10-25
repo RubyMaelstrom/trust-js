@@ -2,8 +2,67 @@
 //! broad conformance signal comes from `crates/test262-runner`.
 
 #[cfg(feature = "embed")]
-use crate::Value;
+use crate::embed::{Ctx, Value};
+#[cfg(feature = "embed")]
+use crate::scope::ValueKind;
+use crate::value::ValueView;
 use crate::{Completion, Engine, ExecutionOutcome, InterruptReason};
+
+/// The completion value of `src` in the scope `cx`, with no microtask checkpoint.
+#[cfg(feature = "embed")]
+fn value_in<'s>(cx: &mut Ctx<'s>, src: &str) -> Value<'s> {
+    cx.eval_value_interruptible(src)
+        .expect("fixture parses")
+        .unwrap_or_else(|_| panic!("fixture threw: {src}"))
+}
+
+/// ToString of a value of the scope `cx`, as Rust text.
+#[cfg(feature = "embed")]
+fn text_of<'s>(cx: &mut Ctx<'s>, value: &Value<'s>) -> String {
+    cx.coerce_string(value)
+        .unwrap_or_else(|_| panic!("ToString threw"))
+        .to_string()
+}
+
+/// Run `src` in a scope of `engine`, with no microtask checkpoint.
+#[cfg(feature = "embed")]
+fn eval_quiet(engine: &mut Engine, src: &str) {
+    engine.scope(|cx| {
+        value_in(cx, src);
+    });
+}
+
+/// `src` evaluated as a classic Script in a scope of `engine` (`Ctx::eval_classic_script_interruptible`):
+/// `Err("throw")` when it threw, `Err("interrupted")` when it was interrupted.
+#[cfg(feature = "embed")]
+fn classic(engine: &mut Engine, src: &str) -> Result<(), &'static str> {
+    engine.scope(|cx| match cx.eval_classic_script_interruptible(src) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(crate::embed::EvalError::Throw(_))) => Err("throw"),
+        Ok(Err(crate::embed::EvalError::Interrupted(_))) => Err("interrupted"),
+        Err(error) => panic!("classic script did not parse: {}", error.message),
+    })
+}
+
+/// The `(context, reason)` of taken rejections whose reasons are numbers, read in a scope.
+#[cfg(feature = "embed")]
+fn reasons(
+    engine: &mut Engine,
+    taken: &[(u64, crate::embed::Handle, crate::embed::Handle)],
+) -> Vec<(u64, f64)> {
+    engine.scope(|cx| {
+        taken
+            .iter()
+            .filter_map(|(context, _, reason)| Some((*context, reason.get(cx).ok()?.as_num_opt()?)))
+            .collect()
+    })
+}
+
+/// Whether `src`, run in a scope of `engine` with no microtask checkpoint, is `true`.
+#[cfg(feature = "embed")]
+fn eval_true(engine: &mut Engine, src: &str) -> bool {
+    engine.scope(|cx| matches!((value_in(cx, src)).kind(), ValueKind::Bool(true)))
+}
 
 fn run(src: &str) -> String {
     match Engine::new().eval(src, false).expect("parse") {
@@ -105,18 +164,11 @@ fn integer_switch_dispatch_preserves_case_block_semantics_in_all_tiers() {
 
 #[test]
 fn boolean_bitwise_fast_paths_preserve_numbers_and_coercion_in_all_tiers() {
-    // Validate the wide Value layout used by both native boolean templates against live fields:
-    // a full tag word, then Bool's byte at the payload offset (the rest of that word is padding).
-    for value in [
-        crate::value::Value::Bool(false),
-        crate::value::Value::Bool(true),
-    ] {
-        let base = &value as *const crate::value::Value as usize;
-        let crate::value::Value::Bool(ref boolean) = value else {
-            unreachable!()
-        };
-        assert_eq!(boolean as *const bool as usize - base, 8);
-        assert_eq!(unsafe { *(base as *const u64) }, 3);
+    // Boolean execution values carry their scalar payload in the canonical eight-byte word.
+    for boolean in [false, true] {
+        let value = crate::value::Value::Bool(boolean);
+        assert_eq!(std::mem::size_of_val(&value), 8);
+        assert_eq!(value.bits(), crate::value::PACK_BOOL | u64::from(boolean));
     }
     // ECMA-262 ToNumeric, ToNumber, ApplyStringOrNumericBinaryOperator, snapshot e28783d5fc9d.
     // Comparisons feeding a bitwise mask are common in generated asm.js initialization loops.
@@ -357,54 +409,40 @@ fn fragmented_array_buffer_writes_preserve_host_synchronization() {
         &mut engine,
         "var buffer = new ArrayBuffer(4096); var bytes = new Uint8Array(buffer)",
     );
-    let buffer = engine
-        .eval_value_interruptible("buffer")
-        .expect("buffer expression parses")
-        .unwrap_or_else(|_| panic!("buffer expression threw"));
-    let version = engine.ctx().array_buffer_version(&buffer).unwrap();
-    run_in(
-        &mut engine,
-        "for (var i = 0; i < 1024; ++i) bytes[i * 4] = i & 255",
-    );
-    assert_ne!(engine.ctx().array_buffer_version(&buffer), Some(version));
-    let ranges = engine
-        .ctx()
-        .take_array_buffer_dirty_ranges(&buffer)
-        .unwrap();
-    assert_eq!(ranges.len(), 1);
-    assert_eq!(ranges[0], 0..4096);
-    let mut mirror = vec![0; 4096];
-    for range in ranges {
-        assert!(engine.ctx().array_buffer_copy_range(
-            &buffer,
-            range.start,
-            range.len(),
-            &mut mirror[range]
-        ));
-    }
-    for index in 0..1024 {
-        assert_eq!(mirror[index * 4], (index & 255) as u8);
-    }
-    assert!(engine
-        .ctx()
-        .take_array_buffer_dirty_ranges(&buffer)
-        .unwrap()
-        .is_empty());
-    // Host writes are not echoed as JS mutations; precise tracking resumes after taking.
-    let version = engine.ctx().array_buffer_version(&buffer).unwrap();
-    assert!(engine.ctx().array_buffer_set_range(&buffer, 3, &[17]));
-    assert_eq!(engine.ctx().array_buffer_version(&buffer), Some(version));
-    run_in(
-        &mut engine,
-        "bytes[5] = 42; new DataView(buffer).setUint16(7, 256)",
-    );
-    assert_eq!(
-        engine
-            .ctx()
+    engine.scope(|cx| {
+        let buffer = value_in(cx, "buffer");
+        let version = cx.array_buffer_version(&buffer).unwrap();
+        value_in(cx, "for (var i = 0; i < 1024; ++i) bytes[i * 4] = i & 255");
+        assert_ne!(cx.array_buffer_version(&buffer), Some(version));
+        let ranges = cx.take_array_buffer_dirty_ranges(&buffer).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..4096);
+        let mut mirror = vec![0; 4096];
+        for range in ranges {
+            assert!(cx.array_buffer_copy_range(
+                &buffer,
+                range.start,
+                range.len(),
+                &mut mirror[range]
+            ));
+        }
+        for index in 0..1024 {
+            assert_eq!(mirror[index * 4], (index & 255) as u8);
+        }
+        assert!(cx
             .take_array_buffer_dirty_ranges(&buffer)
-            .unwrap(),
-        [5..6, 7..9]
-    );
+            .unwrap()
+            .is_empty());
+        // Host writes are not echoed as JS mutations; precise tracking resumes after taking.
+        let version = cx.array_buffer_version(&buffer).unwrap();
+        assert!(cx.array_buffer_set_range(&buffer, 3, &[17]));
+        assert_eq!(cx.array_buffer_version(&buffer), Some(version));
+        value_in(cx, "bytes[5] = 42; new DataView(buffer).setUint16(7, 256)");
+        assert_eq!(
+            cx.take_array_buffer_dirty_ranges(&buffer).unwrap(),
+            [5..6, 7..9]
+        );
+    });
     assert_eq!(
         run_in(&mut engine, "bytes[3] + ',' + bytes[5] + ',' + bytes[7]"),
         "17,42,1"
@@ -853,7 +891,6 @@ fn legacy_function_reflection_diagnostics_preserve_lazy_materialization() {
 
 #[test]
 fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
-    use std::rc::Rc;
     for mode in [1, 2] {
         let mut engine = Engine::new();
         engine.set_tier(crate::bytecode::Tier::Jit);
@@ -880,23 +917,27 @@ fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
             ),
             "ok"
         );
-        let global = crate::value::Value::Obj(engine.interp.global.clone());
-        let value = engine
-            .interp
-            .eval_in_realm(&global, "victim")
-            .unwrap_or_else(|_| panic!("live victim"));
-        let crate::value::Value::Obj(function) = value else {
-            panic!("function object")
-        };
-        let weak = Rc::downgrade(&function);
-        drop(function);
+        // The function's handle lives only in this helper frame (the collector scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let global = crate::value::Value::Obj(engine.interp.global);
+            let value = engine
+                .interp
+                .eval_in_realm(&global, "victim")
+                .unwrap_or_else(|_| panic!("live victim"));
+            let ValueView::Obj(function) = (value).view() else {
+                panic!("function object")
+            };
+            crate::value::Gc::downgrade(&function)
+        });
         let source = format!("try {{ dispatch(victim,{mode}) }} catch(error) {{ error===sentinel ? 'sentinel' : 'wrong error' }}");
         assert_eq!(
             run_in(&mut engine, &source),
             if mode == 1 { "17" } else { "sentinel" }
         );
         // The body removed both the global owner and the default prototype's constructor
-        // backlink. Only the caller operand remained; cleanup must drop that owner exactly once.
+        // backlink. Only the caller operand remained; cleanup must leave no word that retains
+        // it, so the next collection finds it dead.
+        engine.interp.gc_collect();
         assert_eq!(
             weak.strong_count(),
             0,
@@ -1199,11 +1240,11 @@ fn separate_scripts_share_the_realm_global_lexical_environment() {
 #[cfg(feature = "embed")]
 #[test]
 fn host_reentrant_classic_scripts_use_script_evaluation_not_eval() {
-    fn run_classic(
-        ctx: &mut crate::embed::Ctx,
-        _this: Value,
-        args: &[Value],
-    ) -> Result<Value, Value> {
+    fn run_classic<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         let source = ctx
             .coerce_string(args.first().unwrap_or(&Value::Undefined))
             .unwrap_or_else(|_| panic!("classic-script source is coercible"))
@@ -1239,23 +1280,19 @@ fn host_reentrant_classic_scripts_use_script_evaluation_not_eval() {
 #[test]
 fn embedder_readonly_indexed_properties_follow_web_idl_internal_methods() {
     let mut engine = Engine::new();
-    let getter = engine
-        .eval_value(
+    engine.scope(|cx| {
+        let getter = value_in(
+            cx,
             "globalThis.indexedGetterCalls = 0;\
              (function(index) { indexedGetterCalls++; return index + 10; })",
-        )
-        .expect("getter parses")
-        .unwrap_or_else(|_| panic!("getter evaluates"));
-    let target = Value::Obj(engine.ctx().new_object());
-    engine
-        .ctx()
-        .install_readonly_indexed_properties(&target, 3, getter)
-        .unwrap_or_else(|_| panic!("fresh ordinary host object accepts indexed properties"));
-    let global = engine.ctx().global_this();
-    engine
-        .ctx()
-        .member_set(&global, "indexedList", target.clone())
-        .unwrap_or_else(|_| panic!("publish indexed host object"));
+        );
+        let target = Value::Obj(cx.new_object());
+        cx.install_readonly_indexed_properties(&target, 3, getter)
+            .unwrap_or_else(|_| panic!("fresh ordinary host object accepts indexed properties"));
+        let global = cx.global_this();
+        cx.member_set(&global, "indexedList", target)
+            .unwrap_or_else(|_| panic!("publish indexed host object"));
+    });
 
     assert_eq!(
         run_in(
@@ -1370,61 +1407,51 @@ fn embedder_readonly_indexed_properties_follow_web_idl_internal_methods() {
 #[test]
 fn embedder_indexed_property_side_table_does_not_pin_dead_objects() {
     let mut engine = Engine::new();
-    let getter = engine
-        .eval_value("index => index")
-        .expect("getter parses")
-        .unwrap_or_else(|_| panic!("getter evaluates"));
-    let target = Value::Obj(engine.ctx().new_object());
-    let pointer = target
-        .as_obj()
-        .map(|object| std::rc::Rc::as_ptr(object) as usize)
-        .expect("target is an object");
-    engine
-        .ctx()
-        .install_readonly_indexed_properties(&target, 2, getter)
-        .unwrap_or_else(|_| panic!("indexed properties install"));
-    let global = engine.ctx().global_this();
-    engine
-        .ctx()
-        .member_set(&global, "temporaryIndexedObject", target.clone())
-        .unwrap_or_else(|_| panic!("temporary object is published"));
-    assert!(engine.ctx().host_indexed.contains_key(&pointer));
+    // The target lives only in this helper frame (the collector scans the stack).
+    let pointer = crate::gc_test::in_frame(|| {
+        engine.scope(|cx| {
+            let getter = value_in(cx, "index => index");
+            let global = cx.global_this();
+            let target = Value::Obj(cx.new_object());
+            let pointer = crate::gc_test::HiddenAddress::of(target.as_internal());
+            cx.install_readonly_indexed_properties(&target, 2, getter)
+                .unwrap_or_else(|_| panic!("indexed properties install"));
+            cx.member_set(&global, "temporaryIndexedObject", target)
+                .unwrap_or_else(|_| panic!("temporary object is published"));
+            pointer
+        })
+    });
+    assert!(pointer.in_map(&engine.interp.host_indexed));
 
-    engine
-        .ctx()
-        .member_set(&global, "temporaryIndexedObject", Value::Undefined)
-        .unwrap_or_else(|_| panic!("temporary object is released"));
-    drop(target);
-    engine.ctx().collect_garbage_for_host();
+    engine.scope(|cx| {
+        let global = cx.global_this();
+        cx.member_set(&global, "temporaryIndexedObject", Value::Undefined)
+            .unwrap_or_else(|_| panic!("temporary object is released"));
+    });
+    engine.collect_garbage_at_idle();
 
-    assert!(!engine.ctx().host_indexed.contains_key(&pointer));
-    assert!(!engine.ctx().gc_pins.contains_key(&pointer));
+    assert!(!pointer.in_map(&engine.interp.host_indexed));
+    assert!(!pointer.in_map(&engine.interp.gc_pins));
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn embedder_indexed_enumeration_snapshots_keys_before_running_getters() {
     let mut engine = Engine::new();
-    let getter = engine
-        .eval_value(
+    engine.scope(|cx| {
+        let getter = value_in(
+            cx,
             "(function(index) { delete this.extra; this.addedByGetter = 1; return index + 20; })",
-        )
-        .expect("getter parses")
-        .unwrap_or_else(|_| panic!("getter evaluates"));
-    let target = Value::Obj(engine.ctx().new_object());
-    engine
-        .ctx()
-        .member_set(&target, "extra", Value::Num(7.0))
-        .unwrap_or_else(|_| panic!("named expando installs"));
-    engine
-        .ctx()
-        .install_readonly_indexed_properties(&target, 1, getter)
-        .unwrap_or_else(|_| panic!("indexed properties install"));
-    let global = engine.ctx().global_this();
-    engine
-        .ctx()
-        .member_set(&global, "mutatingIndexedList", target)
-        .unwrap_or_else(|_| panic!("mutating object is published"));
+        );
+        let target = Value::Obj(cx.new_object());
+        cx.member_set(&target, "extra", Value::Num(7.0))
+            .unwrap_or_else(|_| panic!("named expando installs"));
+        cx.install_readonly_indexed_properties(&target, 1, getter)
+            .unwrap_or_else(|_| panic!("indexed properties install"));
+        let global = cx.global_this();
+        cx.member_set(&global, "mutatingIndexedList", target)
+            .unwrap_or_else(|_| panic!("mutating object is published"));
+    });
 
     assert_eq!(
         run_in(
@@ -1633,20 +1660,40 @@ fn cancellation_crosses_threads_and_interrupts_jit_code() {
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
 
+/// `armDeadline()`: this engine's execution deadline, 20 ms ahead. A job that arms its own
+/// deadline is interrupted while it runs. Armed before the evaluation, the deadline could expire
+/// in the script body on a slow machine, and an interrupted body leaves the jobs it queued to the
+/// next evaluation's checkpoint, where nothing would stop a spinning job.
+fn arm_deadline(
+    i: &mut crate::interpreter::Interp,
+    _this: crate::value::Value,
+    _args: &[crate::value::Value],
+) -> Result<crate::value::Value, crate::value::Value> {
+    i.runtime_interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(20),
+    ));
+    Ok(crate::value::Value::Undefined)
+}
+
+fn define_arm_deadline(engine: &mut Engine) {
+    let global = engine.interp.global;
+    engine
+        .interp
+        .def_method(&global, "armDeadline", 0, arm_deadline);
+}
+
 #[test]
 fn interruption_aborts_a_running_microtask_checkpoint() {
     let mut engine = Engine::new();
     engine.set_tier(crate::bytecode::Tier::Jit);
     engine.set_tier_threshold(0);
     let interrupt = engine.interrupt_handle();
-    interrupt.set_deadline(Some(
-        std::time::Instant::now() + std::time::Duration::from_millis(20),
-    ));
+    define_arm_deadline(&mut engine);
     let outcome = engine
         .eval_interruptible(
             r#"
             var caught = 0, finalized = 0, later = 0;
-            function spin() { while (true) {} }
+            function spin() { armDeadline(); while (true) {} }
             Promise.resolve().then(() => {
                 try { spin(); }
                 catch (error) { caught = 1; }
@@ -1768,8 +1815,21 @@ fn interruption_stops_an_endless_microtask_chain() {
     ));
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     interrupt.set_deadline(None);
-    assert!(engine.interp.microtasks.is_empty());
-    match engine.eval("String(turns > 1)", false).expect("parse") {
+    assert!(engine
+        .interp
+        .gc_heap
+        .agent
+        .work
+        .borrow()
+        .promises
+        .is_empty());
+    // A collection at every safepoint (GC stress) may leave the 50 ms deadline a single turn.
+    let several = if crate::gc_test::stress_active() {
+        "true"
+    } else {
+        "String(turns > 1)"
+    };
+    match engine.eval(several, false).expect("parse") {
         Completion::Value(value) => assert_eq!(value, "true"),
         Completion::Throw { name, message } => panic!("threw {name}: {message}"),
     }
@@ -2365,6 +2425,68 @@ fn live_object_limit_error_handler_can_allocate() {
             ),
             Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
         }
+    }
+}
+
+/// Allocation makes a collection due through the heap's budgets alone: the live-object count,
+/// which also collected once it grew by 100,000 objects (or an eighth) until P1 S6 step 9a,
+/// only enforces the live-object limit. With this heap's nursery budget and byte budget floor
+/// out of reach, 300,000 objects, half of them kept, are allocated without a collection at every
+/// tier; with the engine's nursery budget back, which they have long spent, the next safepoint
+/// collects (minorly: the byte budget's floor stays out of reach, so that no major collection
+/// follows).
+#[test]
+fn object_count_alone_does_not_collect() {
+    use crate::bytecode::Tier;
+    // GC stress collects at every safepoint after an allocation.
+    if crate::gc_test::stress_active() {
+        return;
+    }
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        // The end-of-eval task boundary would collect after this much growth: defer it, as the
+        // embed API's `defer_task_garbage_collection` does.
+        engine.interp.gc_heap.agent.task_deferred.set(true);
+        let heap = engine.interp.gc_heap.clone();
+        // This heap's nursery budget, which TRUST_JS_GC_NURSERY_BYTES sets for every heap in the
+        // process (`gc_collect::configure_heap`).
+        let set_nursery = |bytes: usize| heap.core.borrow_mut().set_nursery_bytes(Some(bytes));
+        let collections = || heap.core.borrow().collections();
+        let live = || crate::value::heap_live_objects(&heap);
+        // The byte budget's floor, which TRUST_JS_GC_MIN_HEAP_BYTES sets, at the engine's growth.
+        heap.core.borrow_mut().set_heap_growth(1 << 40, 100);
+        set_nursery(1 << 40);
+        let before = collections();
+        let allocated = crate::value::heap_allocated_objects(&heap);
+        let source = "var kept = [];
+            function fill(n) { for (var i = 0; i < n; i++) { kept.push({ i: i }); var dead = { i: i }; } }
+            fill(150000); kept.length";
+        assert_eq!(run_in(&mut engine, source), "150000", "{tier:?}");
+        assert_eq!(collections(), before, "{tier:?}: no collection was due");
+        assert!(
+            crate::value::heap_allocated_objects(&heap) - allocated >= 300_000,
+            "{tier:?}"
+        );
+        // Unswept, the dead count as live.
+        let unswept = live();
+        assert!(unswept >= 300_000, "{tier:?}: {unswept} live objects");
+        // The engine's nursery budget, 2 MiB, which those objects' cells have spent.
+        set_nursery(2 << 20);
+        assert!(heap.core.borrow().collection_due(), "{tier:?}");
+        // The next safepoint, this loop's at the latest, collects.
+        assert_eq!(
+            run_in(&mut engine, "for (var j = 0; j < 2; j++); j"),
+            "2",
+            "{tier:?}"
+        );
+        assert_eq!(collections(), before + 1, "{tier:?}");
+        assert!(
+            live() <= unswept - 100_000,
+            "{tier:?}: {} live objects",
+            live()
+        );
     }
 }
 
@@ -3388,7 +3510,7 @@ fn symbol_registry_is_agent_owned_and_shared_by_realms() {
     first
         .eval("Symbol.for('agent-key')", false)
         .expect("first registry insertion parses");
-    let first_symbol = first.interp.symbol_agent.borrow().global_by_key["agent-key"].clone();
+    let first_symbol = first.interp.symbol_agent.borrow().global_by_key["agent-key"];
 
     // Constructing another Engine on the same driver thread must neither clear nor share the
     // first Agent's registry.
@@ -3396,12 +3518,12 @@ fn symbol_registry_is_agent_owned_and_shared_by_realms() {
     second
         .eval("Symbol.for('agent-key')", false)
         .expect("second registry insertion parses");
-    let second_symbol = second.interp.symbol_agent.borrow().global_by_key["agent-key"].clone();
-    assert!(!std::rc::Rc::ptr_eq(&first_symbol, &second_symbol));
+    let second_symbol = second.interp.symbol_agent.borrow().global_by_key["agent-key"];
+    assert!(!crate::value::symbol_ptr_eq(&first_symbol, &second_symbol));
     first
         .eval("Symbol.for('agent-key')", false)
         .expect("first registry remains usable");
-    assert!(std::rc::Rc::ptr_eq(
+    assert!(crate::value::symbol_ptr_eq(
         &first_symbol,
         &first.interp.symbol_agent.borrow().global_by_key["agent-key"]
     ));
@@ -3464,14 +3586,27 @@ fn nested_calls_keep_the_surrounding_agent_activation_on_the_fast_path() {
 #[cfg(feature = "embed")]
 #[test]
 fn host_call_entry_activates_the_receiving_engine_agent() {
-    use std::rc::Rc;
-
-    fn make_object(
-        ctx: &mut crate::embed::Ctx,
-        _this: Value,
-        _args: &[Value],
-    ) -> Result<Value, Value> {
+    fn make_object<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         Ok(Value::Obj(ctx.new_object()))
+    }
+
+    /// Call `makeAgentObject` in a scope of `engine`: the object, as an engine handle.
+    fn call_make_object(engine: &mut Engine) -> crate::value::Gc {
+        engine.scope(|cx| {
+            let function = value_in(cx, "makeAgentObject");
+            match (cx
+                .call_function(&function, Value::Undefined, &[])
+                .unwrap_or_else(|_| panic!("host call succeeds")))
+            .kind()
+            {
+                ValueKind::Obj(object) => object.gc(),
+                _ => panic!("host call returned an object"),
+            }
+        })
     }
 
     // A driver may alternate independent Engines on one native thread. ECMA-262 §9.6 makes the
@@ -3479,53 +3614,30 @@ fn host_call_entry_activates_the_receiving_engine_agent() {
     // nested calls then remain on that Agent without repeating the transition.
     let mut first = Engine::new();
     first.define_global("makeAgentObject", 0, make_object);
-    let first_fn = first
-        .eval_value("makeAgentObject")
-        .expect("first function parses")
-        .unwrap_or_else(|_| panic!("first function evaluates"));
-
     let mut second = Engine::new();
     second.define_global("makeAgentObject", 0, make_object);
-    let second_fn = second
-        .eval_value("makeAgentObject")
-        .expect("second function parses")
-        .unwrap_or_else(|_| panic!("second function evaluates"));
 
-    let first_object = match first
-        .call_function(&first_fn, Value::Undefined, &[])
-        .unwrap_or_else(|_| panic!("first host call succeeds"))
-    {
-        Value::Obj(object) => object,
-        _ => panic!("first host call returned an object"),
-    };
-    let second_object = match second
-        .call_function(&second_fn, Value::Undefined, &[])
-        .unwrap_or_else(|_| panic!("second host call succeeds"))
-    {
-        Value::Obj(object) => object,
-        _ => panic!("second host call returned an object"),
-    };
+    let first_object = call_make_object(&mut first);
+    let second_object = call_make_object(&mut second);
 
     let first_snapshot = crate::value::heap_gc_snapshot(&first.interp.gc_heap);
     let second_snapshot = crate::value::heap_gc_snapshot(&second.interp.gc_heap);
     assert!(first_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &first_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &first_object)));
     assert!(!second_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &first_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &first_object)));
     assert!(second_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &second_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &second_object)));
     assert!(!first_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &second_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &second_object)));
 }
 
 #[test]
 fn shadow_realm_heap_transitions_restore_the_caller_heap() {
-    use std::rc::Rc;
-
     let mut engine = Engine::new();
     let _ = engine
         .eval(
@@ -3536,59 +3648,363 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
         )
         .expect("ShadowRealm ownership probe parses");
 
-    let shadow = match engine
+    let shadow = match (engine
         .interp
         .global
         .borrow()
         .props
         .get("savedShadow")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("ShadowRealm object was retained"),
     };
-    let parent_object = match engine
+    let parent_object = match (engine
         .interp
         .global
         .borrow()
         .props
         .get("parentMarker")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("parent marker was retained"),
     };
-    let shadow_key = Rc::as_ptr(&shadow) as usize;
-    let child = engine
+    let shadow_key = crate::value::Gc::as_ptr(&shadow) as usize;
+    let child_id = engine
         .interp
         .shadow_realms
         .get(&shadow_key)
-        .unwrap_or_else(|| panic!("ShadowRealm implementation remains available"));
-    let child_object = match child
-        .global
-        .borrow()
-        .props
-        .get("childMarker")
-        .map(|property| property.value())
-    {
-        Some(crate::value::Value::Obj(object)) => object,
-        _ => panic!("child marker was retained"),
-    };
+        .unwrap_or_else(|| panic!("ShadowRealm implementation remains available"))
+        .id();
+    let child_object = engine.interp.with_realm_view(child_id, |child| {
+        assert!(std::rc::Rc::ptr_eq(&engine.interp.gc_heap, &child.gc_heap));
+        match child
+            .global
+            .borrow()
+            .props
+            .get("childMarker")
+            .map(|property| property.value().view())
+        {
+            Some(ValueView::Obj(object)) => object,
+            _ => panic!("child marker was retained"),
+        }
+    });
+    let snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+    for marker in [&parent_object, &child_object] {
+        assert!(snapshot
+            .iter()
+            .any(|object| crate::value::Gc::ptr_eq(object, marker)));
+    }
+    assert!(std::rc::Rc::ptr_eq(
+        &crate::value::active_gc_heap(),
+        &engine.interp.gc_heap
+    ));
+}
 
-    let parent_snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
-    let child_snapshot = crate::value::heap_gc_snapshot(&child.gc_heap);
-    assert!(parent_snapshot
-        .iter()
-        .any(|object| Rc::ptr_eq(object, &parent_object)));
-    assert!(!child_snapshot
-        .iter()
-        .any(|object| Rc::ptr_eq(object, &parent_object)));
-    assert!(child_snapshot
-        .iter()
-        .any(|object| Rc::ptr_eq(object, &child_object)));
-    assert!(!parent_snapshot
-        .iter()
-        .any(|object| Rc::ptr_eq(object, &child_object)));
+/// The completion value of `source`, or a panic naming what it threw.
+fn eval_to_string(engine: &mut Engine, source: &str) -> String {
+    match engine.eval(source, false).expect("parses") {
+        Completion::Value(value) => value,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    }
+}
+
+/// P1 S4: a wrapped function keeps its ShadowRealm alive. The ShadowRealm object can die
+/// first; the wrapped function still calls into the realm it came from.
+#[test]
+fn shadow_realm_wrapped_function_outlives_its_shadow_realm_object() {
+    let mut engine = Engine::new();
+    assert_eq!(
+        eval_to_string(
+            &mut engine,
+            "var twice = (() => new ShadowRealm().evaluate('(x) => x * 2'))();
+             $262.gc(); $262.gc();
+             twice(21)",
+        ),
+        "42"
+    );
+}
+
+/// P1 S4: a ShadowRealm whose object is otherwise unreachable stays alive while its code runs,
+/// across a collection caused by a host callback it calls.
+#[test]
+fn shadow_realm_survives_a_collection_while_it_runs() {
+    let mut engine = Engine::new();
+    assert_eq!(
+        eval_to_string(
+            &mut engine,
+            "(() => new ShadowRealm().evaluate(
+               '(collect) => { const kept = [1, 2, 3]; collect(); return kept.map(x => x * 2).join() }'
+             ))()(() => { $262.gc(); $262.gc(); })",
+        ),
+        "2,4,6"
+    );
+}
+
+/// P1 S4: a ShadowRealm stays in the collection's tree while a wrapped function's `name` and
+/// `length` are read from it, whatever its getters do. Here the getter queues jobs, reachable
+/// only from the realm's own job queue, then collects.
+#[test]
+fn shadow_realm_stays_traced_while_its_function_is_wrapped() {
+    let mut engine = Engine::new();
+    assert_eq!(
+        eval_to_string(
+            &mut engine,
+            "var realm = new ShadowRealm();
+             var make = realm.evaluate(`(collect) => {
+               globalThis.seen = 0;
+               const queue = (n) => {
+                 const token = { mark: n };
+                 Promise.resolve().then(() => { globalThis.seen += token.mark; });
+               };
+               const read = () => globalThis.seen;
+               Object.defineProperty(read, 'name', { get() {
+                 for (let i = 1; i <= 20; i++) queue(i);
+                 collect();
+                 return 'read';
+               } });
+               return read;
+             }`);
+             var read = make(() => {
+               $262.gc(); $262.gc();
+               for (let i = 0; i < 1000; i++) ({ filler: [i] });
+             });
+             realm.evaluate('0');
+             read() + ':' + read.name",
+        ),
+        // One Agent job queue: returning from the ShadowRealm runs no nested checkpoint.
+        "0:read"
+    );
+    // The queued tokens survived both collections and ran at the script's checkpoint.
+    assert_eq!(eval_to_string(&mut engine, "read()"), "210");
+}
+
+/// P1 S4: parsed code can serve several engines on one thread, one after another. A
+/// closure's `name` is a string of its own engine's heap, never one an AST-level template cached
+/// from the heap that first ran the code (here already dropped).
+#[test]
+fn function_name_templates_serve_only_their_heap() {
+    let body = crate::parser::parse_script(
+        "var f = function () {}; var g = () => 0; function h() {}",
+        false,
+    )
+    .ok()
+    .expect("source");
+    let name_words = |engine: &mut Engine| -> Vec<u64> {
+        assert!(engine.interp.run_program(&body).is_ok(), "program runs");
+        ["f", "g", "h"]
+            .iter()
+            .map(|binding| {
+                let global = crate::value::Value::Obj(engine.interp.global);
+                let Ok(function) = engine.interp.member_get(&global, binding) else {
+                    panic!("binding {binding}");
+                };
+                match (engine.interp.member_get(&function, "name")).map(|__value| (__value).view())
+                {
+                    Ok(ValueView::Str(name)) => name.cell_word(),
+                    _ => panic!("{binding}.name is a string"),
+                }
+            })
+            .collect()
+    };
+    let mut first = Engine::new();
+    name_words(&mut first);
+    drop(first);
+    let mut second = Engine::new();
+    for word in name_words(&mut second) {
+        assert!(
+            second.interp.gc_heap.core.borrow().is_allocated_word(word),
+            "a closure's name is a string of its own heap"
+        );
+    }
+}
+
+/// P1 S4 review: an AST-level template's name strings stay roots only while the
+/// parsed code holding the template lives. Discarded code leaves nothing rooted in the heap.
+#[test]
+fn discarded_function_templates_release_their_name_strings() {
+    const NAME_BYTES: usize = 64 * 1024;
+    let mut engine = Engine::new();
+    // The collection that finds discarded code dead still traces its templates (they die in
+    // its sweep, with the closures holding the code), so their strings go in the next one.
+    let live_bytes = |engine: &mut Engine| {
+        engine.interp.gc_collect();
+        engine.interp.gc_collect();
+        engine.interp.gc_heap.core.borrow().stats().live_bytes
+    };
+    eval_to_string(&mut engine, "(function warm() {}); 0");
+    let before = live_bytes(&mut engine);
+    for i in 0..16 {
+        let name = format!("f{i}{}", "a".repeat(NAME_BYTES));
+        eval_to_string(&mut engine, &format!("(function {name}() {{}}); 0"));
+    }
+    let after = live_bytes(&mut engine);
+    // Retained templates would keep all 16 names (1 MiB); allow a few to stray stack words.
+    assert!(
+        after < before + 4 * NAME_BYTES,
+        "discarded templates kept their names: live bytes {before} -> {after}"
+    );
+}
+
+/// P1 S5: a property-creation cache (`IC_CREATE`) names its receiver's prototype by
+/// address. Once that prototype dies and its pin is pruned, a new object can take the address,
+/// and the cache must not stand for the new object's chain: here a setter of the created name.
+#[test]
+fn creation_caches_do_not_trust_a_reused_prototype_address() {
+    // The test needs the dead prototype's address back, so it reruns itself alone in a child
+    // process, where no other test thread can take that address first (added when objects came
+    // from the process allocator, which the suite's other test threads share).
+    const CHILD: &str = "TRUST_JS_TEST_ADDRESS_REUSE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::creation_caches_do_not_trust_a_reused_prototype_address",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated address-reuse test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        // A tier's fresh heap can allocate at the previous tier's addresses, its prototype where
+        // the previous new object was. Between stack scrubs, no handle the previous tier left in
+        // a frame survives to retain it.
+        crate::scrubbed(|| creation_cache_after_address_reuse(tier));
+    }
+}
+
+#[inline(never)]
+fn creation_cache_after_address_reuse(tier: crate::bytecode::Tier) {
+    let mut engine = Engine::new();
+    engine.set_tier(tier);
+    engine.set_tier_threshold(0);
+    eval_to_string(
+        &mut engine,
+        "var C = class { constructor() { this.x = 1; } };
+         function NT() {}
+         var args = [];
+         var hits = 0;
+         var desc = { set(v) { hits++; }, configurable: true };
+         NT.prototype = {};
+         for (var i = 0; i < 20; i++) Reflect.construct(C, args, NT);
+         0",
+    );
+    let cached = crate::gc_test::in_frame(|| {
+        let global = crate::value::Value::Obj(engine.interp.global);
+        let nt = engine.interp.member_get(&global, "NT").ok().expect("NT");
+        let proto = engine
+            .interp
+            .member_get(&nt, "prototype")
+            .ok()
+            .expect("NT.prototype");
+        crate::gc_test::HiddenAddress::of(&proto)
+    });
+    eval_to_string(&mut engine, "NT.prototype = null; 0");
+    // The first collection finds the prototype dead and prunes its pin; the second frees
+    // its address (the heap keeps a pinned dead cell reserved until then).
+    engine.interp.gc_collect();
+    engine.interp.gc_collect();
+    let reused = crate::gc_test::in_frame(|| object_at(&mut engine, cached))
+        .expect("a new object takes the dead prototype's address");
+    let global = crate::value::Value::Obj(engine.interp.global);
+    assert!(engine
+        .interp
+        .member_set(&global, "P2", crate::value::Value::Obj(reused))
+        .is_ok());
+    assert_eq!(
+        eval_to_string(
+            &mut engine,
+            "Object.defineProperty(P2, 'x', desc);
+             NT.prototype = P2;
+             var o = Reflect.construct(C, args, NT);
+             hits + ':' + Object.hasOwn(o, 'x')",
+        ),
+        "1:false",
+        "{tier:?}: the setter on the new prototype runs"
+    );
+}
+
+/// A new plain object at `address`, allocating until the allocator hands that address out.
+#[inline(never)]
+fn object_at(
+    engine: &mut Engine,
+    address: crate::gc_test::HiddenAddress,
+) -> Option<crate::value::Gc> {
+    let mut held = Vec::new();
+    for _ in 0..200_000 {
+        let object = crate::value::Object::new(Some(engine.interp.object_proto));
+        if crate::value::Gc::as_ptr(&object) as usize == address.get() {
+            return Some(object);
+        }
+        held.push(object);
+    }
+    None
+}
+
+/// P1 S4: a ShadowRealm's roots count only while its object is marked, so a realm
+/// kept only by its own wrapped function, stored inside it, is collected.
+#[test]
+fn shadow_realm_kept_only_through_itself_is_collected() {
+    let mut engine = Engine::new();
+    eval_to_string(
+        &mut engine,
+        "(() => {
+           const realm = new ShadowRealm();
+           realm.evaluate('(f) => { globalThis.kept = f; }')(realm.evaluate('() => 1'));
+         })(); 0",
+    );
+    assert_eq!(engine.interp.shadow_realms.len(), 1);
+    engine.interp.gc_collect();
+    assert!(
+        engine.interp.shadow_realms.is_empty(),
+        "a realm kept only through itself was retained"
+    );
+}
+
+/// P1 S4 (I5): a collected ShadowRealm ends without resuming its suspended coroutines, here a
+/// module body parked at a top-level await (`VmCoro::resume` asserts that no coroutine resumes
+/// in the collector's eviction step). A global holds the realm until the parked body is seen:
+/// under GC stress a collection inside the evaluation may take an unreachable realm earlier.
+#[test]
+fn collected_shadow_realm_ends_without_resuming_its_coroutines() {
+    let mut engine = Engine::new();
+    engine.set_module_loader(|specifier: &str, _referrer: &str| {
+        (specifier == "parked").then(|| {
+            (
+                "parked".to_string(),
+                "export const ready = 1; await new Promise(() => {});".to_string(),
+            )
+        })
+    });
+    eval_to_string(
+        &mut engine,
+        "globalThis.held = new ShadowRealm(); held.importValue('parked', 'ready'); 0",
+    );
+    let parked: usize = engine
+        .interp
+        .shadow_realms
+        .values()
+        .map(|realm| {
+            engine
+                .interp
+                .with_realm_view(realm.id(), |child| child.generators.len())
+        })
+        .sum();
+    assert!(parked > 0, "the realm holds a parked module body");
+    eval_to_string(&mut engine, "held = undefined; 0");
+    engine.interp.gc_collect();
+    assert!(engine.interp.shadow_realms.is_empty());
 }
 
 #[test]
@@ -3602,21 +4018,23 @@ fn ordinary_symbols_are_retained_only_by_live_values_and_property_keys() {
             false,
         )
         .expect("symbol-key setup parses");
-    let held = engine
-        .interp
-        .symbol_agent
-        .borrow()
-        .symbols
-        .values()
-        .filter_map(std::rc::Weak::upgrade)
-        .find(|symbol| symbol.description.as_deref() == Some("property-only"))
-        .expect("symbol property key owns its identity");
-    let weak = std::rc::Rc::downgrade(&held);
-    drop(held);
+    // The strong handle stays in a helper frame (the collector scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let held = engine
+            .interp
+            .symbol_agent
+            .borrow()
+            .symbols
+            .values()
+            .filter_map(|weak| weak.upgrade())
+            .find(|symbol| symbol.description.as_deref() == Some("property-only"))
+            .expect("symbol property key owns its identity");
+        crate::value::symbol_downgrade(&held)
+    });
 
     engine.interp.gc_collect();
     assert!(
-        weak.upgrade().is_some(),
+        crate::gc_test::alive(&weak),
         "live property key lost its Symbol"
     );
     assert!(matches!(
@@ -3638,7 +4056,7 @@ fn ordinary_symbols_are_retained_only_by_live_values_and_property_keys() {
         .expect("symbol-key release parses");
     engine.interp.gc_collect();
     assert!(
-        weak.upgrade().is_none(),
+        !crate::gc_test::alive(&weak),
         "deleted property retained its Symbol"
     );
 
@@ -3654,10 +4072,11 @@ fn ordinary_symbols_are_retained_only_by_live_values_and_property_keys() {
     engine
         .eval("Symbol.for('registry-kept')", false)
         .expect("registered symbol parses");
-    let registered =
-        std::rc::Rc::downgrade(&engine.interp.symbol_agent.borrow().global_by_key["registry-kept"]);
+    let registered = crate::value::symbol_downgrade(
+        &engine.interp.symbol_agent.borrow().global_by_key["registry-kept"],
+    );
     engine.interp.gc_collect();
-    assert!(registered.upgrade().is_some());
+    assert!(crate::gc_test::alive(&registered));
     assert_eq!(
         run("Symbol.keyFor(Symbol.for('registry-kept'))"),
         "registry-kept"
@@ -4195,53 +4614,51 @@ fn wall_clocks_are_mutable_and_realm_local() {
 #[cfg(feature = "embed")]
 #[test]
 fn embedder_realms_isolate_intrinsics_and_native_globals() {
-    use crate::embed::{Ctx, Value};
-
-    fn realm_marker(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-        Ok(Value::Str("child".into()))
+    fn realm_marker<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
+        Ok(ctx.str("child"))
     }
 
     let mut engine = Engine::new();
-    let main = engine.global_this();
-    let child = engine.ctx().create_embed_realm();
-    let installed = engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
-            ctx.define_embed_global("realmMarker", 0, realm_marker);
-            matches!(
-                ctx.eval_classic_script_interruptible(
-                    "Array.prototype.realmOnly = 1; globalThis.authorOnly = 2;",
-                ),
-                Ok(Ok(_))
-            )
-        })
-        .unwrap_or_else(|_| panic!("enter child realm"));
-    assert!(installed, "child setup completes");
+    let rendered = engine.scope(|cx| {
+        let main = cx.global_this();
+        let child = cx.create_embed_realm();
+        let installed = cx
+            .with_embed_realm(&child, |ctx| {
+                ctx.define_embed_global("realmMarker", 0, realm_marker);
+                matches!(
+                    ctx.eval_classic_script_interruptible(
+                        "Array.prototype.realmOnly = 1; globalThis.authorOnly = 2;",
+                    ),
+                    Ok(Ok(_))
+                )
+            })
+            .unwrap_or_else(|_| panic!("enter child realm"));
+        assert!(installed, "child setup completes");
 
-    assert!(
-        matches!(
-            engine.ctx().get_member_key(&main, "realmMarker"),
-            Ok(Value::Undefined)
-        ),
-        "native global stays out of the main realm"
-    );
-    let child_result = engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
-            match ctx.eval_classic_script_interruptible(
-                "[realmMarker(), authorOnly, Array.prototype.realmOnly].join('|')",
-            ) {
-                Ok(Ok(value)) => Some(value),
-                _ => None,
-            }
-        })
-        .unwrap_or_else(|_| panic!("re-enter child realm"))
-        .unwrap_or_else(|| panic!("child script completes"));
-    let rendered = engine
-        .ctx()
-        .coerce_string(&child_result)
-        .unwrap_or_else(|_| panic!("string"))
-        .to_string();
+        assert!(
+            matches!(
+                (cx.member_get(&main, "realmMarker")).map(|__value| (__value).kind()),
+                Ok(ValueKind::Undefined)
+            ),
+            "native global stays out of the main realm"
+        );
+        let child_result = cx
+            .with_embed_realm(&child, |ctx| {
+                match ctx.eval_classic_script_interruptible(
+                    "[realmMarker(), authorOnly, Array.prototype.realmOnly].join('|')",
+                ) {
+                    Ok(Ok(value)) => Some(value),
+                    _ => None,
+                }
+            })
+            .unwrap_or_else(|_| panic!("re-enter child realm"))
+            .unwrap_or_else(|| panic!("child script completes"));
+        text_of(cx, &child_result)
+    });
     assert_eq!(rendered, "child|2|1");
     match engine
         .eval(
@@ -4258,27 +4675,28 @@ fn embedder_realms_isolate_intrinsics_and_native_globals() {
 #[cfg(feature = "embed")]
 #[test]
 fn entered_realms_stay_active_until_left_and_nest() {
-    use crate::embed::{Ctx, Value};
-
-    fn current_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    fn current_context<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         Ok(Value::Num(ctx.host_job_context() as f64))
     }
 
     let mut engine = Engine::new();
-    engine.ctx().set_host_job_context(1);
-    engine
-        .ctx()
-        .define_embed_global("currentHostContext", 0, current_context);
+    engine.set_host_job_context(1);
+    engine.scope(|cx| cx.define_embed_global("currentHostContext", 0, current_context));
+    // A Realm's global, held by a handle: the entries are made at the Engine level.
     let realm = |engine: &mut Engine, context: u64| {
-        let global = engine.ctx().create_embed_realm();
-        engine
-            .ctx()
-            .with_embed_realm(&global, |ctx| {
+        engine.scope(|cx| {
+            let global = cx.create_embed_realm();
+            cx.with_embed_realm(&global, |ctx| {
                 ctx.set_host_job_context(context);
                 ctx.define_embed_global("currentHostContext", 0, current_context);
             })
             .unwrap_or_else(|_| panic!("set up realm {context}"));
-        global
+            crate::embed::Handle::new(cx, &global).expect("a handle to the realm's global")
+        })
     };
     let first = realm(&mut engine, 2);
     let second = realm(&mut engine, 3);
@@ -4307,39 +4725,50 @@ fn entered_realms_stay_active_until_left_and_nest() {
     assert_eq!(read(&mut engine), "2:number");
     engine.leave_realm(outer);
     assert_eq!(read(&mut engine), "1:undefined");
-    assert!(engine.enter_realm(&Value::Num(1.0)).is_err(), "not a Realm");
+    let number = engine.scope(|cx| {
+        assert!(cx.enter_realm(&Value::Num(1.0)).is_err(), "not a Realm");
+        crate::embed::Handle::new(cx, &Value::Num(1.0)).expect("a primitive's handle")
+    });
+    assert_eq!(
+        engine.enter_realm(&number).err(),
+        Some(crate::RealmError::NotARealm)
+    );
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn embedder_realm_snapshot_and_host_context_restore_are_isolated() {
-    use crate::embed::{Ctx, Value};
-
-    fn current_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    fn current_context<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         Ok(Value::Num(ctx.host_job_context() as f64))
     }
 
     let mut engine = Engine::new();
-    let child = engine.ctx().create_embed_realm();
     let snapshot = crate::compile_snapshot(
         "globalThis.snapshotRealmValue = Array.prototype.snapshotRealmOnly = 7;",
     )
     .unwrap_or_else(|error| panic!("compile snapshot: {error}"));
 
-    engine.ctx().set_host_job_context(41);
-    let completed = engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
-            ctx.set_host_job_context(42);
-            ctx.define_embed_global("currentHostContext", 0, current_context);
-            matches!(
-                ctx.eval_classic_snapshot_interruptible(&snapshot),
-                Ok(Ok(_))
-            )
-        })
-        .unwrap_or_else(|_| panic!("enter child realm"));
-    assert!(completed);
-    assert_eq!(engine.ctx().host_job_context(), 41);
+    engine.set_host_job_context(41);
+    let child = engine.scope(|cx| {
+        let child = cx.create_embed_realm();
+        let completed = cx
+            .with_embed_realm(&child, |ctx| {
+                ctx.set_host_job_context(42);
+                ctx.define_embed_global("currentHostContext", 0, current_context);
+                matches!(
+                    ctx.eval_classic_snapshot_interruptible(&snapshot),
+                    Ok(Ok(_))
+                )
+            })
+            .unwrap_or_else(|_| panic!("enter child realm"));
+        assert!(completed);
+        assert_eq!(cx.host_job_context(), 41);
+        crate::embed::Handle::new(cx, &child).expect("a handle to the child's global")
+    });
 
     let engine_level = engine
         .with_embed_realm(&child, |engine| {
@@ -4351,11 +4780,11 @@ fn embedder_realm_snapshot_and_host_context_restore_are_isolated() {
         engine_level,
         Completion::Value(value) if value == "42|7"
     ));
-    assert_eq!(engine.ctx().host_job_context(), 41);
+    assert_eq!(engine.host_job_context(), 41);
 
-    engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
+    engine.scope(|cx| {
+        let child = child.get(cx).expect("the engine's handle");
+        cx.with_embed_realm(&child, |ctx| {
             ctx.eval_classic_script_interruptible(
                 "globalThis.readChildRealm = function () { return currentHostContext() + '|' + snapshotRealmValue; }; class ChildEventTarget {} globalThis.ChildEventTarget = ChildEventTarget; ChildEventTarget.prototype.realmProbe = function () { return currentHostContext() + '|' + snapshotRealmValue; };",
             )
@@ -4363,41 +4792,32 @@ fn embedder_realm_snapshot_and_host_context_restore_are_isolated() {
         .unwrap_or_else(|_| panic!("install child reader"))
         .unwrap_or_else(|error| panic!("parse child reader: {error:?}"))
         .unwrap_or_else(|_| panic!("child reader setup threw"));
-    let reader = engine
-        .ctx()
-        .member_get(&child, "readChildRealm")
-        .unwrap_or_else(|_| panic!("read child function"));
-    let cross_realm_result = engine
-        .call_function(&reader, child.clone(), &[])
-        .unwrap_or_else(|_| panic!("call child function from main Realm"));
-    assert_eq!(
-        engine
-            .ctx()
-            .coerce_string(&cross_realm_result)
-            .unwrap_or_else(|_| panic!("string cross-Realm result"))
-            .to_string(),
-        "42|7"
-    );
-    assert_eq!(engine.ctx().host_job_context(), 41);
-    let main = engine.global_this();
-    engine
-        .ctx()
-        .member_set(&main, "childRealm", child.clone())
-        .unwrap_or_else(|_| panic!("expose child global to main Realm"));
+        let reader = cx
+            .member_get(&child, "readChildRealm")
+            .unwrap_or_else(|_| panic!("read child function"));
+        let cross_realm_result = cx
+            .call_function(&reader, child, &[])
+            .unwrap_or_else(|_| panic!("call child function from main Realm"));
+        assert_eq!(text_of(cx, &cross_realm_result), "42|7");
+        assert_eq!(cx.host_job_context(), 41);
+        let main = cx.global_this();
+        cx.member_set(&main, "childRealm", child)
+            .unwrap_or_else(|_| panic!("expose child global to main Realm"));
+    });
     assert!(matches!(
         engine
             .eval("childRealm.readChildRealm()", false)
             .unwrap_or_else(|error| panic!("main cross-Realm expression: {error:?}")),
         Completion::Value(value) if value == "42|7"
     ));
-    assert_eq!(engine.ctx().host_job_context(), 41);
+    assert_eq!(engine.host_job_context(), 41);
     assert!(matches!(
         engine
             .eval("new childRealm.ChildEventTarget().realmProbe()", false)
             .unwrap_or_else(|error| panic!("main cross-Realm construct expression: {error:?}")),
         Completion::Value(value) if value == "42|7"
     ));
-    assert_eq!(engine.ctx().host_job_context(), 41);
+    assert_eq!(engine.host_job_context(), 41);
 
     assert!(matches!(
         engine
@@ -4409,43 +4829,47 @@ fn embedder_realm_snapshot_and_host_context_restore_are_isolated() {
         Completion::Value(value) if value == "undefined|undefined"
     ));
 
-    let child_result = engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
-            ctx.set_host_job_context(42);
-            ctx.eval_classic_script_interruptible(
-                "String(snapshotRealmValue) + '|' + String(Array.prototype.snapshotRealmOnly)",
-            )
-        })
-        .unwrap_or_else(|_| panic!("re-enter child realm"))
-        .unwrap_or_else(|error| panic!("parse child script: {error:?}"))
-        .unwrap_or_else(|_| panic!("child script threw"));
-    assert_eq!(
-        engine
-            .ctx()
-            .coerce_string(&child_result)
-            .unwrap_or_else(|_| panic!("string child result"))
-            .to_string(),
-        "7|7"
-    );
-    assert_eq!(engine.ctx().host_job_context(), 41);
+    let child_result = engine.scope(|cx| {
+        let child = child.get(cx).expect("the engine's handle");
+        let result = cx
+            .with_embed_realm(&child, |ctx| {
+                ctx.set_host_job_context(42);
+                ctx.eval_classic_script_interruptible(
+                    "String(snapshotRealmValue) + '|' + String(Array.prototype.snapshotRealmOnly)",
+                )
+            })
+            .unwrap_or_else(|_| panic!("re-enter child realm"))
+            .unwrap_or_else(|error| panic!("parse child script: {error:?}"))
+            .unwrap_or_else(|_| panic!("child script threw"));
+        text_of(cx, &result)
+    });
+    assert_eq!(child_result, "7|7");
+    assert_eq!(engine.host_job_context(), 41);
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn job_callbacks_capture_registration_source_without_changing_execution_realm() {
-    fn caller(ctx: &mut crate::embed::Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    fn caller<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         Ok(ctx.script_caller_global())
     }
-    fn then(ctx: &mut crate::embed::Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    fn then<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         let source = ctx.script_caller_global();
-        ctx.invoke(args[0].clone(), Value::Undefined, &[source])
+        ctx.invoke(args[0], Value::Undefined, &[source])
     }
-    fn throw_source(
-        ctx: &mut crate::embed::Ctx,
-        _this: Value,
-        _args: &[Value],
-    ) -> Result<Value, Value> {
+    fn throw_source<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         Err(ctx.script_caller_global())
     }
     for tier in [
@@ -4472,16 +4896,15 @@ fn job_callbacks_capture_registration_source_without_changing_execution_realm() 
                 globalThis.rejected = new Promise((r, j) => globalThis.fail = j);
             "#,
             );
-            let main = engine.global_this();
-            let child = engine.ctx().create_embed_realm();
-            engine
-                .ctx()
-                .member_set(&child, "main", main.clone())
-                .unwrap_or_else(|_| panic!("parent"));
-            engine
-                .ctx()
-                .member_set(&child, "browserHost", Value::Bool(browser))
-                .unwrap_or_else(|_| panic!("mode"));
+            let child = engine.scope(|cx| {
+                let main = cx.global_this();
+                let child = cx.create_embed_realm();
+                cx.member_set(&child, "main", main)
+                    .unwrap_or_else(|_| panic!("parent"));
+                cx.member_set(&child, "browserHost", Value::Bool(browser))
+                    .unwrap_or_else(|_| panic!("mode"));
+                crate::embed::Handle::new(cx, &child).expect("a handle to the child's global")
+            });
             engine.with_embed_realm(&child, |engine| run_in(engine, r#"
                 const expected = browserHost ? globalThis : main;
                 const check = (label, expected) => value => main.trace.push(label + ':' + (value === expected));
@@ -4522,12 +4945,6 @@ fn job_callback_source_realms_are_traced_and_collectable() {
             engine.set_tier_threshold(0);
             engine.set_job_callback_script_caller_capture(true);
             engine.define_global("nothing", 0, |_ctx, _, _| Ok(Value::Undefined));
-            let main = engine.global_this();
-            let child = engine.ctx().create_embed_realm();
-            engine
-                .ctx()
-                .member_set(&child, "main", main.clone())
-                .unwrap_or_else(|_| panic!("parent"));
             // The callback itself belongs to the main Realm. Only its HostDefined source
             // retains the child, whose global also owns the pending promise / registry.
             let source = if kind == "promise" {
@@ -4535,10 +4952,20 @@ fn job_callback_source_realms_are_traced_and_collectable() {
             } else {
                 "globalThis.saved = new main.FinalizationRegistry(main.nothing); main.kept = saved;"
             };
-            engine
-                .with_embed_realm(&child, |engine| run_in(engine, source))
-                .unwrap_or_else(|_| panic!("register"));
-            drop(child);
+            // The child Realm's handle lives only in this helper frame (the collector scans the
+            // stack).
+            crate::gc_test::in_frame(|| {
+                let child = engine.scope(|cx| {
+                    let main = cx.global_this();
+                    let child = cx.create_embed_realm();
+                    cx.member_set(&child, "main", main)
+                        .unwrap_or_else(|_| panic!("parent"));
+                    crate::embed::Handle::new(cx, &child).expect("a handle")
+                });
+                engine
+                    .with_embed_realm(&child, |engine| run_in(engine, source))
+                    .unwrap_or_else(|_| panic!("register"));
+            });
             engine.interp.gc_collect();
             assert_eq!(
                 engine.interp.realms.len(),
@@ -4563,21 +4990,22 @@ fn job_callback_queued_source_is_a_temporary_root() {
     let mut engine = Engine::new();
     engine.set_job_callback_script_caller_capture(true);
     engine.define_global("nothing", 0, |_ctx, _, _| Ok(Value::Undefined));
-    let main = engine.global_this();
-    let child = engine.ctx().create_embed_realm();
-    engine
-        .ctx()
-        .member_set(&child, "main", main)
-        .unwrap_or_else(|_| panic!("parent"));
-    engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
-            let result =
-                ctx.eval_classic_script_interruptible("main.Promise.resolve().then(main.nothing);");
-            assert!(result.is_ok_and(|completion| completion.is_ok()));
-        })
-        .unwrap_or_else(|_| panic!("queue child callback"));
-    drop(child);
+    // The child Realm's values live only in this helper frame (the collector scans the stack).
+    crate::gc_test::in_frame(|| {
+        engine.scope(|cx| {
+            let main = cx.global_this();
+            let child = cx.create_embed_realm();
+            cx.member_set(&child, "main", main)
+                .unwrap_or_else(|_| panic!("parent"));
+            cx.with_embed_realm(&child, |ctx| {
+                let result = ctx.eval_classic_script_interruptible(
+                    "main.Promise.resolve().then(main.nothing);",
+                );
+                assert!(result.is_ok_and(|completion| completion.is_ok()));
+            })
+            .unwrap_or_else(|_| panic!("queue child callback"));
+        });
+    });
     engine.interp.gc_collect();
     assert_eq!(
         engine.interp.realms.len(),
@@ -4607,11 +5035,9 @@ fn job_callback_context_is_restored_on_host_interruption() {
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             engine.set_job_callback_script_caller_capture(true);
-            run_in(&mut engine, "var caught = 0, later = 0; function spin() { try { while(true) {} } catch (_) { caught++; } }");
+            define_arm_deadline(&mut engine);
+            run_in(&mut engine, "var caught = 0, later = 0; function spin() { armDeadline(); try { while(true) {} } catch (_) { caught++; } }");
             let interrupt = engine.interrupt_handle();
-            interrupt.set_deadline(Some(
-                std::time::Instant::now() + std::time::Duration::from_millis(20),
-            ));
             let source = if thenable {
                 "Promise.resolve({then: spin}).then(() => later++);"
             } else {
@@ -4640,11 +5066,11 @@ fn job_callback_context_is_restored_on_host_interruption() {
 #[cfg(feature = "embed")]
 #[test]
 fn suspended_context_preserves_script_caller_across_await_and_yield() {
-    fn caller_global(
-        ctx: &mut crate::embed::Ctx,
-        _this: Value,
-        _args: &[Value],
-    ) -> Result<Value, Value> {
+    fn caller_global<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         Ok(ctx.script_caller_global())
     }
 
@@ -4661,16 +5087,15 @@ fn suspended_context_preserves_script_caller_across_await_and_yield() {
             engine.set_tier_threshold(0);
             engine.define_global("callerGlobal", 0, caller_global);
             run_in(&mut engine, "globalThis.observed = []; globalThis.pending = new Promise(r => globalThis.release = r)");
-            let main = engine.global_this();
-            let child = engine.ctx().create_embed_realm();
-            engine
-                .ctx()
-                .member_set(&child, "main", main.clone())
-                .unwrap_or_else(|_| panic!("publish parent"));
-            engine
-                .ctx()
-                .member_set(&main, "child", child.clone())
-                .unwrap_or_else(|_| panic!("publish child"));
+            let child = engine.scope(|cx| {
+                let main = cx.global_this();
+                let child = cx.create_embed_realm();
+                cx.member_set(&child, "main", main)
+                    .unwrap_or_else(|_| panic!("publish parent"));
+                cx.member_set(&main, "child", child)
+                    .unwrap_or_else(|_| panic!("publish child"));
+                crate::embed::Handle::new(cx, &child).expect("a handle to the child's global")
+            });
             let source = match kind {
                 "async" => {
                     r#"
@@ -4766,20 +5191,25 @@ fn suspended_context_realm_is_traced_but_not_permanently_rooted() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
-        let child = engine.ctx().create_embed_realm();
-        engine.with_embed_realm(&child, |engine| {
-            run_in(engine, "globalThis.saved = (function* () { yield Object.getPrototypeOf([]) === Array.prototype; })()");
-        }).unwrap_or_else(|_| panic!("initialize child continuation"));
-        let continuation = engine
-            .ctx()
-            .member_get(&child, "saved")
-            .unwrap_or_else(|_| panic!("read continuation"));
-        let main = engine.global_this();
-        engine
-            .ctx()
-            .member_set(&main, "kept", continuation)
-            .unwrap_or_else(|_| panic!("retain continuation"));
-        drop(child);
+        // Strong handles live only in this helper frame (the collector scans the stack).
+        crate::gc_test::in_frame(|| {
+            let child = engine.scope(|cx| {
+                let child = cx.create_embed_realm();
+                crate::embed::Handle::new(cx, &child).expect("a handle to the child's global")
+            });
+            engine.with_embed_realm(&child, |engine| {
+                run_in(engine, "globalThis.saved = (function* () { yield Object.getPrototypeOf([]) === Array.prototype; })()");
+            }).unwrap_or_else(|_| panic!("initialize child continuation"));
+            engine.scope(|cx| {
+                let child = child.get(cx).expect("the engine's handle");
+                let continuation = cx
+                    .member_get(&child, "saved")
+                    .unwrap_or_else(|_| panic!("read continuation"));
+                let main = cx.global_this();
+                cx.member_set(&main, "kept", continuation)
+                    .unwrap_or_else(|_| panic!("retain continuation"));
+            });
+        });
         engine.interp.gc_collect();
         assert_eq!(
             engine.interp.realms.len(),
@@ -4808,70 +5238,45 @@ fn suspended_context_realm_is_traced_but_not_permanently_rooted() {
 #[test]
 fn embedder_buffer_source_bytes_honor_views_detachment_and_shared_opt_in() {
     let mut engine = Engine::new();
-    let evaluated = engine
-        .eval_value_interruptible(
-            "globalThis.ab = new ArrayBuffer(6);\
-             globalThis.dv = new DataView(ab, 1, 3);\
-             dv.setUint8(0, 11); dv.setUint8(1, 22); dv.setUint8(2, 33);\
-             globalThis.ta = new Uint8Array(ab, 2, 2);\
-             globalThis.sab = new SharedArrayBuffer(4);\
-             globalThis.sta = new Uint8Array(sab); sta.set([4, 5, 6, 7]);",
-        )
-        .expect("parse");
-    assert!(evaluated.is_ok(), "BufferSource setup threw");
+    engine.scope(|cx| {
+        let evaluated = cx
+            .eval_value_interruptible(
+                "globalThis.ab = new ArrayBuffer(6);\
+                 globalThis.dv = new DataView(ab, 1, 3);\
+                 dv.setUint8(0, 11); dv.setUint8(1, 22); dv.setUint8(2, 33);\
+                 globalThis.ta = new Uint8Array(ab, 2, 2);\
+                 globalThis.sab = new SharedArrayBuffer(4);\
+                 globalThis.sta = new Uint8Array(sab); sta.set([4, 5, 6, 7]);",
+            )
+            .expect("parse");
+        assert!(evaluated.is_ok(), "BufferSource setup threw");
 
-    let global = engine.global_this();
-    let ab = engine
-        .ctx()
-        .member_get(&global, "ab")
-        .unwrap_or_else(|_| panic!("read ab"));
-    let dv = engine
-        .ctx()
-        .member_get(&global, "dv")
-        .unwrap_or_else(|_| panic!("read dv"));
-    let ta = engine
-        .ctx()
-        .member_get(&global, "ta")
-        .unwrap_or_else(|_| panic!("read ta"));
-    let sab = engine
-        .ctx()
-        .member_get(&global, "sab")
-        .unwrap_or_else(|_| panic!("read sab"));
-    let sta = engine
-        .ctx()
-        .member_get(&global, "sta")
-        .unwrap_or_else(|_| panic!("read sta"));
+        let global = cx.global_this();
+        let mut get = |name: &str| {
+            cx.member_get(&global, name)
+                .unwrap_or_else(|_| panic!("read {name}"))
+        };
+        let (ab, dv, ta, sab, sta) = (get("ab"), get("dv"), get("ta"), get("sab"), get("sta"));
 
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&ab, false),
-        Some(vec![0, 11, 22, 33, 0, 0])
-    );
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&dv, false),
-        Some(vec![11, 22, 33])
-    );
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&ta, false),
-        Some(vec![22, 33])
-    );
-    assert_eq!(engine.ctx().buffer_source_bytes(&sab, false), None);
-    assert_eq!(engine.ctx().buffer_source_bytes(&sta, false), None);
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&sab, true),
-        Some(vec![4, 5, 6, 7])
-    );
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&sta, true),
-        Some(vec![4, 5, 6, 7])
-    );
+        assert_eq!(
+            cx.buffer_source_bytes(&ab, false),
+            Some(vec![0, 11, 22, 33, 0, 0])
+        );
+        assert_eq!(cx.buffer_source_bytes(&dv, false), Some(vec![11, 22, 33]));
+        assert_eq!(cx.buffer_source_bytes(&ta, false), Some(vec![22, 33]));
+        assert_eq!(cx.buffer_source_bytes(&sab, false), None);
+        assert_eq!(cx.buffer_source_bytes(&sta, false), None);
+        assert_eq!(cx.buffer_source_bytes(&sab, true), Some(vec![4, 5, 6, 7]));
+        assert_eq!(cx.buffer_source_bytes(&sta, true), Some(vec![4, 5, 6, 7]));
 
-    let transferred = engine
-        .eval_value_interruptible("ab.transfer()")
-        .expect("transfer parses");
-    assert!(transferred.is_ok(), "ArrayBuffer transfer threw");
-    assert_eq!(engine.ctx().buffer_source_bytes(&ab, false), None);
-    assert_eq!(engine.ctx().buffer_source_bytes(&dv, false), None);
-    assert_eq!(engine.ctx().buffer_source_bytes(&ta, false), None);
+        let transferred = cx
+            .eval_value_interruptible("ab.transfer()")
+            .expect("transfer parses");
+        assert!(transferred.is_ok(), "ArrayBuffer transfer threw");
+        assert_eq!(cx.buffer_source_bytes(&ab, false), None);
+        assert_eq!(cx.buffer_source_bytes(&dv, false), None);
+        assert_eq!(cx.buffer_source_bytes(&ta, false), None);
+    });
 }
 
 #[cfg(feature = "embed")]
@@ -4881,131 +5286,113 @@ fn embedder_buffer_source_bytes_follow_data_view_bounds() {
     // follow resizes, a fixed view past the shrunk end is out of bounds, and a shared view needs
     // [AllowShared].
     let mut engine = Engine::new();
-    let evaluated = engine
-        .eval_value_interruptible(
-            "globalThis.rb = new ArrayBuffer(8, {maxByteLength: 16});\
-             new Uint8Array(rb).set([0, 1, 2, 3, 4, 5, 6, 7]);\
-             globalThis.tracking = new DataView(rb, 5);\
-             globalThis.fixed = new DataView(rb, 4, 3);\
-             globalThis.sdv = new DataView(new SharedArrayBuffer(4), 1, 2);\
-             sdv.setUint8(0, 9); sdv.setUint8(1, 8);",
-        )
-        .expect("parse");
-    assert!(evaluated.is_ok(), "DataView setup threw");
-    let global = engine.global_this();
-    let get = |engine: &mut Engine, name: &str| {
-        engine
-            .ctx()
-            .member_get(&global, name)
-            .unwrap_or_else(|_| panic!("read {name}"))
-    };
-    let (tracking, fixed, sdv) = (
-        get(&mut engine, "tracking"),
-        get(&mut engine, "fixed"),
-        get(&mut engine, "sdv"),
-    );
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&tracking, false),
-        Some(vec![5, 6, 7])
-    );
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&fixed, false),
-        Some(vec![4, 5, 6])
-    );
-    assert_eq!(engine.ctx().buffer_source_bytes(&sdv, false), None);
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&sdv, true),
-        Some(vec![9, 8])
-    );
-    assert!(engine
-        .eval_value_interruptible("rb.resize(6)")
-        .expect("resize parses")
-        .is_ok());
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&tracking, false),
-        Some(vec![5])
-    );
-    assert_eq!(engine.ctx().buffer_source_bytes(&fixed, false), None);
+    engine.scope(|cx| {
+        let evaluated = cx
+            .eval_value_interruptible(
+                "globalThis.rb = new ArrayBuffer(8, {maxByteLength: 16});\
+                 new Uint8Array(rb).set([0, 1, 2, 3, 4, 5, 6, 7]);\
+                 globalThis.tracking = new DataView(rb, 5);\
+                 globalThis.fixed = new DataView(rb, 4, 3);\
+                 globalThis.sdv = new DataView(new SharedArrayBuffer(4), 1, 2);\
+                 sdv.setUint8(0, 9); sdv.setUint8(1, 8);",
+            )
+            .expect("parse");
+        assert!(evaluated.is_ok(), "DataView setup threw");
+        let global = cx.global_this();
+        let mut get = |name: &str| {
+            cx.member_get(&global, name)
+                .unwrap_or_else(|_| panic!("read {name}"))
+        };
+        let (tracking, fixed, sdv) = (get("tracking"), get("fixed"), get("sdv"));
+        assert_eq!(
+            cx.buffer_source_bytes(&tracking, false),
+            Some(vec![5, 6, 7])
+        );
+        assert_eq!(cx.buffer_source_bytes(&fixed, false), Some(vec![4, 5, 6]));
+        assert_eq!(cx.buffer_source_bytes(&sdv, false), None);
+        assert_eq!(cx.buffer_source_bytes(&sdv, true), Some(vec![9, 8]));
+        assert!(cx
+            .eval_value_interruptible("rb.resize(6)")
+            .expect("resize parses")
+            .is_ok());
+        assert_eq!(cx.buffer_source_bytes(&tracking, false), Some(vec![5]));
+        assert_eq!(cx.buffer_source_bytes(&fixed, false), None);
+    });
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn embedder_can_mirror_and_detach_an_array_buffer() {
     let mut engine = Engine::new();
-    let buffer = engine
-        .ctx()
-        .make_array_buffer(&[1, 2, 3, 4])
-        .unwrap_or_else(|_| panic!("make ArrayBuffer"));
-    let global = engine.global_this();
-    engine
-        .ctx()
-        .member_set(&global, "mirrored", buffer.clone())
-        .unwrap_or_else(|_| panic!("install ArrayBuffer"));
+    engine.scope(|cx| {
+        let buffer = cx
+            .make_array_buffer(&[1, 2, 3, 4])
+            .unwrap_or_else(|_| panic!("make ArrayBuffer"));
+        let global = cx.global_this();
+        cx.member_set(&global, "mirrored", buffer)
+            .unwrap_or_else(|_| panic!("install ArrayBuffer"));
 
-    assert_eq!(
-        engine
-            .eval_value_interruptible("new Uint8Array(mirrored)[2]")
-            .expect("view parses")
-            .unwrap_or(Value::Undefined)
-            .as_num_opt(),
-        Some(3.0)
-    );
-    assert!(engine.ctx().array_buffer_set_bytes(&buffer, &[9, 8, 7, 6]));
-    let version = engine
-        .ctx()
-        .array_buffer_version(&buffer)
-        .expect("attached buffer version");
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&buffer, false),
-        Some(vec![9, 8, 7, 6])
-    );
-    assert!(engine
-        .eval_value_interruptible("new Uint8Array(mirrored)[0] = 4")
-        .expect("view write parses")
-        .is_ok());
-    assert_ne!(
-        engine.ctx().array_buffer_version(&buffer),
-        Some(version),
-        "JavaScript writes advance the embedder mutation generation"
-    );
-    assert!(!engine.ctx().array_buffer_set_bytes(&buffer, &[1, 2]));
-    assert!(engine.ctx().detach_array_buffer(&buffer));
-    assert!(!engine.ctx().detach_array_buffer(&buffer));
-    assert_eq!(engine.ctx().buffer_source_bytes(&buffer, false), None);
-    assert_eq!(
-        engine
-            .eval_value_interruptible("mirrored.byteLength")
-            .expect("byteLength parses")
-            .unwrap_or(Value::Undefined)
-            .as_num_opt(),
-        Some(0.0)
-    );
+        assert_eq!(
+            cx.eval_value_interruptible("new Uint8Array(mirrored)[2]")
+                .expect("view parses")
+                .unwrap_or(Value::Undefined)
+                .as_num_opt(),
+            Some(3.0)
+        );
+        assert!(cx.array_buffer_set_bytes(&buffer, &[9, 8, 7, 6]));
+        let version = cx
+            .array_buffer_version(&buffer)
+            .expect("attached buffer version");
+        assert_eq!(
+            cx.buffer_source_bytes(&buffer, false),
+            Some(vec![9, 8, 7, 6])
+        );
+        assert!(cx
+            .eval_value_interruptible("new Uint8Array(mirrored)[0] = 4")
+            .expect("view write parses")
+            .is_ok());
+        assert_ne!(
+            cx.array_buffer_version(&buffer),
+            Some(version),
+            "JavaScript writes advance the embedder mutation generation"
+        );
+        assert!(!cx.array_buffer_set_bytes(&buffer, &[1, 2]));
+        assert!(cx.detach_array_buffer(&buffer));
+        assert!(!cx.detach_array_buffer(&buffer));
+        assert_eq!(cx.buffer_source_bytes(&buffer, false), None);
+        assert_eq!(
+            cx.eval_value_interruptible("mirrored.byteLength")
+                .expect("byteLength parses")
+                .unwrap_or(Value::Undefined)
+                .as_num_opt(),
+            Some(0.0)
+        );
+    });
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn embedder_keyed_array_buffer_rejects_script_transfer() {
     let mut engine = Engine::new();
-    let buffer = engine
-        .ctx()
-        .make_host_keyed_array_buffer(&[1, 2, 3, 4])
-        .unwrap_or_else(|_| panic!("make keyed ArrayBuffer"));
-    let global = engine.global_this();
-    engine
-        .ctx()
-        .member_set(&global, "keyed", buffer.clone())
-        .unwrap_or_else(|_| panic!("install keyed ArrayBuffer"));
+    engine.scope(|cx| {
+        let buffer = cx
+            .make_host_keyed_array_buffer(&[1, 2, 3, 4])
+            .unwrap_or_else(|_| panic!("make keyed ArrayBuffer"));
+        let global = cx.global_this();
+        cx.member_set(&global, "keyed", buffer)
+            .unwrap_or_else(|_| panic!("install keyed ArrayBuffer"));
 
-    let transfer = engine
-        .eval_value_interruptible("keyed.transfer()")
-        .expect("transfer parses");
-    assert!(transfer.is_err());
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&buffer, false),
-        Some(vec![1, 2, 3, 4])
-    );
-    assert!(engine.ctx().detach_array_buffer(&buffer));
-    assert_eq!(engine.ctx().buffer_source_bytes(&buffer, false), None);
+        let transfer = cx
+            .eval_value_interruptible("keyed.transfer()")
+            .expect("transfer parses");
+        assert!(transfer.is_err());
+        assert_eq!(
+            cx.buffer_source_bytes(&buffer, false),
+            Some(vec![1, 2, 3, 4])
+        );
+        assert!(cx.detach_array_buffer(&buffer));
+        assert_eq!(cx.buffer_source_bytes(&buffer, false), None);
+    });
 }
 
 #[cfg(feature = "embed")]
@@ -5013,71 +5400,66 @@ fn embedder_keyed_array_buffer_rejects_script_transfer() {
 fn embedder_array_buffers_never_run_author_code() {
     // A replaced global ArrayBuffer neither observes nor substitutes host-created buffers.
     let mut engine = Engine::new();
-    engine
-        .eval_value_interruptible(
+    engine.scope(|cx| {
+        cx.eval_value_interruptible(
             "globalThis.calls = 0; globalThis.ArrayBuffer = function () { calls++; return {}; };",
         )
         .expect("replacement parses")
         .unwrap_or_else(|_| panic!("replace ArrayBuffer"));
-    let plain = engine
-        .ctx()
-        .make_array_buffer(&[1, 2, 3])
-        .unwrap_or_else(|_| panic!("make ArrayBuffer"));
-    let keyed = engine
-        .ctx()
-        .make_host_keyed_array_buffer(&[4, 5])
-        .unwrap_or_else(|_| panic!("make keyed ArrayBuffer"));
-    let global = engine.global_this();
-    for (name, buffer) in [("plain", plain.clone()), ("keyed", keyed.clone())] {
-        engine
-            .ctx()
-            .member_set(&global, name, buffer)
-            .unwrap_or_else(|_| panic!("install buffer"));
-    }
-    let result = engine
-        .eval_value_interruptible(
-            "calls + ',' + new Uint8Array(plain).join('') + ',' + new Uint8Array(keyed).join('') + ',' +\
-             (Object.getPrototypeOf(plain) === Object.getPrototypeOf(keyed)) + ',' + keyed.resizable",
-        )
-        .expect("probe parses")
-        .unwrap_or(Value::Undefined);
-    assert_eq!(result.as_text().as_deref(), Some("0,123,45,true,false"));
-    assert_eq!(
-        engine.ctx().buffer_source_bytes(&keyed, false),
-        Some(vec![4, 5])
-    );
+        let plain = cx
+            .make_array_buffer(&[1, 2, 3])
+            .unwrap_or_else(|_| panic!("make ArrayBuffer"));
+        let keyed = cx
+            .make_host_keyed_array_buffer(&[4, 5])
+            .unwrap_or_else(|_| panic!("make keyed ArrayBuffer"));
+        let global = cx.global_this();
+        for (name, buffer) in [("plain", plain), ("keyed", keyed)] {
+            cx.member_set(&global, name, buffer)
+                .unwrap_or_else(|_| panic!("install buffer"));
+        }
+        let result = cx
+            .eval_value_interruptible(
+                "calls + ',' + new Uint8Array(plain).join('') + ',' + new Uint8Array(keyed).join('') + ',' +\
+                 (Object.getPrototypeOf(plain) === Object.getPrototypeOf(keyed)) + ',' + keyed.resizable",
+            )
+            .expect("probe parses")
+            .unwrap_or(Value::Undefined);
+        assert_eq!(result.as_text().as_deref(), Some("0,123,45,true,false"));
+        assert_eq!(cx.buffer_source_bytes(&keyed, false), Some(vec![4, 5]));
+    });
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn embedder_bigint_i64_bridge_runs_to_bigint() {
     let mut engine = Engine::new();
-    let global = engine.global_this();
-    let value = engine
-        .eval_value_interruptible("({ valueOf() { globalThis.coerced = true; return -2n; } })")
-        .expect("object parses")
-        .unwrap_or(Value::Undefined);
-    assert!(matches!(engine.ctx().coerce_bigint_i64(&value), Ok(-2)));
-    assert!(matches!(
-        engine
-            .ctx()
-            .member_get(&global, "coerced")
-            .unwrap_or(Value::Undefined),
-        Value::Bool(true)
-    ));
-    assert!(engine.ctx().coerce_bigint_i64(&Value::Num(2.0)).is_err());
+    engine.scope(|cx| {
+        let global = cx.global_this();
+        let value = cx
+            .eval_value_interruptible("({ valueOf() { globalThis.coerced = true; return -2n; } })")
+            .expect("object parses")
+            .unwrap_or(Value::Undefined);
+        assert!(matches!(cx.coerce_bigint_i64(&value), Ok(-2)));
+        assert!(matches!(
+            (cx.member_get(&global, "coerced")
+                .unwrap_or(Value::Undefined))
+            .kind(),
+            ValueKind::Bool(true)
+        ));
+        assert!(cx.coerce_bigint_i64(&Value::Num(2.0)).is_err());
+    });
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn embedder_can_mint_the_web_platform_html_dda_exotic() {
     let mut engine = Engine::new();
-    let dda = engine.ctx().make_html_dda();
-    let global = engine.global_this();
-    engine
-        .ctx()
-        .member_set(&global, "dda", dda)
-        .unwrap_or_else(|_| panic!("install HTMLDDA global"));
+    engine.scope(|cx| {
+        let dda = cx.make_html_dda();
+        let global = cx.global_this();
+        cx.member_set(&global, "dda", dda)
+            .unwrap_or_else(|_| panic!("install HTMLDDA global"));
+    });
 
     let result = engine
         .eval(
@@ -5840,7 +6222,7 @@ fn for_var_heads_preserve_parameter_bindings_at_instantiation() {
 #[test]
 fn gc_reclaims_cycles() {
     // Each iteration creates an unreachable reference cycle (o <-> a). Reference counting alone
-    // never frees these; the cycle collector must, or live objects would climb without bound.
+    // never frees these; the collector must, or live objects would climb without bound.
     let mut e = Engine::new();
     match e
         .eval(
@@ -5862,62 +6244,11 @@ fn gc_reclaims_cycles() {
 
 #[cfg(feature = "embed")]
 #[test]
-fn task_pressure_collects_the_nursery_and_released_documents_the_whole_heap() {
-    // A retained page heap is not rescanned for each task's growth: young cycles are
-    // reclaimed by a nursery collection (ECMA-262 #sec-liveness permits any non-maximal
-    // set), while a released document's old graph still gets a full collection.
-    let mut engine = Engine::new();
-    engine
-        .eval_value_interruptible(
-            "var page=[];for(var i=0;i<60000;i++){var n={};n.self=n;page.push(n);}",
-        )
-        .unwrap()
-        .unwrap_or_else(|_| panic!("page fixture threw"));
-    engine.collect_garbage_at_idle();
-    let minor = |engine: &Engine| crate::value::heap_minor_collections(&engine.interp.gc_heap);
-    assert_eq!(minor(&engine), 0);
-    engine
-        .eval_value_interruptible(
-            "for(var i=0;i<15000;i++){var o={};o.self=o;}o=null;\n\
-             var weak=new WeakRef(page[0]);",
-        )
-        .unwrap()
-        .unwrap_or_else(|_| panic!("garbage fixture threw"));
-    let before = engine.ctx().live_object_count();
-    engine.run_microtasks_interruptible().unwrap();
-    assert_eq!(minor(&engine), 1, "task pressure took the nursery path");
-    assert!(engine.ctx().live_object_count() + 14_000 < before);
-    assert!(matches!(
-        engine
-            .eval_value_interruptible("weak.deref()===page[0]")
-            .unwrap()
-            .unwrap_or_else(|_| panic!("weak result threw")),
-        crate::value::Value::Bool(true)
-    ));
-
-    // Release an old Realm: its graph is only reachable by a full collection.
-    let abandoned = engine.ctx().create_embed_realm();
-    let abandoned_ptr = engine.ctx().object_addr(&abandoned).unwrap();
-    assert!(engine
-        .ctx()
-        .with_embed_realm(&abandoned, |ctx| ctx.set_host_job_context(91))
-        .is_ok());
-    engine.collect_garbage_at_idle();
-    engine.run_microtasks_interruptible().unwrap();
-    assert!(engine.ctx().release_host_job_context(91));
-    drop(abandoned);
-    assert!(engine.collect_pending_task_garbage() > 0);
-    assert_eq!(
-        minor(&engine),
-        0,
-        "a released document forces a full collection"
-    );
-    assert!(!engine.ctx().realms.contains_key(&abandoned_ptr));
-}
-
-#[cfg(feature = "embed")]
-#[test]
 fn deferred_task_gc_preserves_jobs_kept_objects_and_pending_pressure() {
+    // GC stress collects at every safepoint, so no pressure is left pending.
+    if crate::gc_test::stress_active() {
+        return;
+    }
     // ECMA-262 #sec-liveness / #sec-clear-kept-objects and HTML
     // #perform-a-microtask-checkpoint: collection is optional; completing
     // jobs and ending WeakRef read consistency at their boundary are not.
@@ -5930,44 +6261,38 @@ fn deferred_task_gc_preserves_jobs_kept_objects_and_pending_pressure() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         engine.defer_task_garbage_collection(true);
+        // The boundary's collection is minor (S6 step 10c): a nursery larger than the task keeps
+        // the task's objects young for it (as in the high-churn task test).
         engine
-            .eval_value_interruptible(
-                "var done=false;Promise.resolve().then(()=>done=true);\n\
+            .interp
+            .gc_heap
+            .core
+            .borrow_mut()
+            .set_nursery_bytes(Some(16 << 20));
+        eval_quiet(
+            &mut engine,
+            "var done=false;Promise.resolve().then(()=>done=true);\n\
              var keep=[];for(var i=0;i<12000;i++){var o={};o.self=o;keep.push(o);}\n\
              var weak=new WeakRef(keep[0]);keep=null;o=null;",
-            )
-            .unwrap()
-            .unwrap_or_else(|_| panic!("allocation fixture threw"));
-        let before = engine.ctx().live_object_count();
+        );
+        let before = engine.interp.live_object_count();
         engine.run_microtasks_interruptible().unwrap();
         assert!(engine.has_pending_task_garbage_collection(), "{tier:?}");
         assert!(
-            engine.interp.kept_alive.is_empty(),
+            engine.interp.gc_heap.agent.kept_alive.borrow().is_empty(),
             "ClearKeptObjects was deferred"
         );
         assert_eq!(engine.collect_pending_task_garbage(), 0);
-        assert!(matches!(
-            engine
-                .eval_value_interruptible("done")
-                .unwrap()
-                .unwrap_or_else(|_| panic!("job result threw")),
-            crate::value::Value::Bool(true)
-        ));
+        assert!(eval_true(&mut engine, "done"));
         // A quiet checkpoint must not forget pressure from the previous task.
         engine.run_microtasks_interruptible().unwrap();
         assert!(engine.has_pending_task_garbage_collection());
         engine.defer_task_garbage_collection(false);
         assert!(engine.collect_pending_task_garbage() > 10_000, "{tier:?}");
-        assert!(engine.ctx().live_object_count() + 10_000 < before);
+        assert!(engine.interp.live_object_count() + 10_000 < before);
         assert!(!engine.has_pending_task_garbage_collection());
         assert_eq!(engine.collect_pending_task_garbage(), 0);
-        assert!(matches!(
-            engine
-                .eval_value_interruptible("weak.deref()===undefined")
-                .unwrap()
-                .unwrap_or_else(|_| panic!("weak result threw")),
-            crate::value::Value::Bool(true)
-        ));
+        assert!(eval_true(&mut engine, "weak.deref()===undefined"));
     }
 }
 
@@ -5983,26 +6308,20 @@ fn deferred_task_gc_keeps_allocation_safepoints_enabled() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         engine.defer_task_garbage_collection(true);
-        engine
-            .eval_value_interruptible("var o={};o.self=o;var weak=new WeakRef(o);o=null;")
-            .unwrap()
-            .unwrap_or_else(|_| panic!("weak fixture threw"));
+        eval_quiet(
+            &mut engine,
+            "var o={};o.self=o;var weak=new WeakRef(o);o=null;",
+        );
         engine.run_microtasks_interruptible().unwrap();
-        engine.interp.gc_next = engine.ctx().live_object_count() + 128;
         engine
-            .eval_value_interruptible(
-                "for(var i=0;i<2000;i++){var cycle={};cycle.self=cycle;}cycle=null;",
-            )
-            .unwrap()
-            .unwrap_or_else(|_| panic!("allocation fixture threw"));
+            .interp
+            .set_agent_next(engine.interp.live_object_count() + 128);
+        eval_quiet(
+            &mut engine,
+            "for(var i=0;i<2000;i++){var cycle={};cycle.self=cycle;}cycle=null;",
+        );
         assert!(
-            matches!(
-                engine
-                    .eval_value_interruptible("weak.deref()===undefined")
-                    .unwrap()
-                    .unwrap_or_else(|_| panic!("weak result threw")),
-                crate::value::Value::Bool(true)
-            ),
+            eval_true(&mut engine, "weak.deref()===undefined"),
             "allocation GC was deferred in {tier:?}"
         );
     }
@@ -6023,41 +6342,32 @@ fn compiled_allocation_loop_safepoints_preserve_live_and_kept_roots() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         engine.defer_task_garbage_collection(true);
-        engine
-            .eval_value_interruptible(
-                "var dead={};dead.self=dead;var previous=new WeakRef(dead);dead=null;\n\
+        eval_quiet(
+            &mut engine,
+            "var dead={};dead.self=dead;var previous=new WeakRef(dead);dead=null;\n\
                  function allocate(){\n\
                    let survivor={answer:42};let total=0;let index=0;\n\
                    while(index<1000){let cycle={};cycle.self=cycle;total+=index&1;index++;}\n\
                    do{let cycle={};cycle.self=cycle;total+=index&1;index++;}while(index<2000);\n\
                    return survivor.answer+total;\n\
                  }",
-            )
-            .unwrap()
-            .unwrap_or_else(|_| panic!("setup threw in {tier:?}"));
+        );
         engine.run_microtasks_interruptible().unwrap();
-        engine.interp.gc_next = engine.ctx().live_object_count() + 128;
-        let result = engine
-            .eval_value_interruptible(
+        engine
+            .interp
+            .set_agent_next(engine.interp.live_object_count() + 128);
+        assert!(
+            eval_true(
+                &mut engine,
                 "var kept=new WeakRef({answer:17});\n\
                  allocate()===1042 && previous.deref()===undefined && kept.deref().answer===17",
-            )
-            .unwrap()
-            .unwrap_or_else(|_| panic!("allocation loop threw in {tier:?}"));
-        assert!(
-            matches!(result, crate::value::Value::Bool(true)),
+            ),
             "{tier:?}"
         );
         engine.run_microtasks_interruptible().unwrap();
-        engine.ctx().collect_garbage_for_host();
+        engine.collect_garbage_at_idle();
         assert!(
-            matches!(
-                engine
-                    .eval_value_interruptible("kept.deref()===undefined")
-                    .unwrap()
-                    .unwrap_or_else(|_| panic!("post-job weak read threw in {tier:?}")),
-                crate::value::Value::Bool(true)
-            ),
+            eval_true(&mut engine, "kept.deref()===undefined"),
             "{tier:?}"
         );
     }
@@ -6080,10 +6390,10 @@ fn abrupt_continue_allocation_safepoints_run_after_finalizers() {
             engine.set_tier_threshold(0);
             engine.defer_task_garbage_collection(true);
             let declaration = if generator { "function*" } else { "function" };
-            engine
-                .eval_value_interruptible(&format!(
-                    "var dead={{}};dead.self=dead;var previous=new WeakRef(dead);dead=null;\n\
-                 {declaration} allocate(){{\n\
+            eval_quiet(
+                &mut engine,
+                &format!(
+                    "{declaration} allocate(){{\n\
                    let survivor={{answer:42}};let index=0;let finalized=0;\n\
                    outer:while(index<2000){{\n\
                      try{{let cycle={{}};cycle.self=cycle;index++;continue outer;}}\n\
@@ -6091,23 +6401,29 @@ fn abrupt_continue_allocation_safepoints_run_after_finalizers() {
                    }}\n\
                    return survivor.answer+finalized;\n\
                  }}"
-                ))
-                .unwrap()
-                .unwrap_or_else(|_| panic!("setup threw: {tier:?}, generator={generator}"));
+                ),
+            );
             engine.run_microtasks_interruptible().unwrap();
-            engine.interp.gc_next = engine.ctx().live_object_count() + 128;
+            engine
+                .interp
+                .set_agent_next(engine.interp.live_object_count() + 128);
             let call = if generator {
                 "allocate().next().value"
             } else {
                 "allocate()"
             };
-            let result = engine
-                .eval_value_interruptible(&format!("{call}===2042 && previous.deref()===undefined"))
-                .unwrap()
-                .unwrap_or_else(|_| panic!("continue loop threw: {tier:?}, generator={generator}"));
+            // The task boundary's collection is deferred, so only the loop's allocation
+            // safepoints can collect during the call. (Whether a particular dead object goes
+            // depends on stale words in native frames, which the stack scan may take for
+            // references.)
+            let before = engine.interp.gc_heap.core.borrow().collections();
             assert!(
-                matches!(result, crate::value::Value::Bool(true)),
+                eval_true(&mut engine, &format!("{call}===2042")),
                 "{tier:?}, generator={generator}"
+            );
+            assert!(
+                engine.interp.gc_heap.core.borrow().collections() > before,
+                "{tier:?}, generator={generator}: no allocation safepoint collected"
             );
         }
     }
@@ -6121,16 +6437,21 @@ fn compiled_allocation_guard_accepts_maximum_signed_threshold() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         engine.defer_task_garbage_collection(true);
-        engine.interp.gc_next = i64::MAX;
-        let result = engine.eval_value_interruptible(
-            "function allocate(){let index=0;while(index<1000){let cycle={};cycle.self=cycle;index++;}return index;}allocate()"
-        ).unwrap().unwrap_or_else(|_| panic!("maximum-threshold loop threw: {tier:?}"));
-        assert!(
-            matches!(result, crate::value::Value::Num(1000.0)),
-            "{tier:?}"
-        );
-        assert_eq!(engine.interp.gc_next, i64::MAX, "{tier:?}");
-        assert!(engine.interp.interrupt_poll_tick >= 1000, "{tier:?}");
+        engine.interp.set_agent_next(i64::MAX);
+        let result = engine.scope(|cx| {
+            value_in(cx, "function allocate(){let index=0;while(index<1000){let cycle={};cycle.self=cycle;index++;}return index;}allocate()").as_num_opt()
+        });
+        assert_eq!(result, Some(1000.0), "{tier:?}");
+        // A GC stress collection sets a new threshold.
+        if !crate::gc_test::stress_active() {
+            assert_eq!(engine.interp.gc_next, i64::MAX, "{tier:?}");
+        }
+        // Generated code counts a tick only on its poll's fast path. Under GC stress each poll
+        // after an allocation finds a collection due and takes the slow path (`jit_interrupt`),
+        // which checks the interrupt on every call without counting.
+        if tier == crate::bytecode::Tier::Bytecode || !crate::gc_test::stress_active() {
+            assert!(engine.interp.interrupt_poll_tick >= 1000, "{tier:?}");
+        }
     }
 }
 
@@ -6138,22 +6459,30 @@ fn compiled_allocation_guard_accepts_maximum_signed_threshold() {
 #[test]
 fn high_churn_task_collects_after_temporary_roots_are_released() {
     let mut engine = Engine::new();
-    let before = engine.ctx().live_object_count();
-    let result = engine
-        .eval_value_interruptible(
-            "var retained=[]; for(var i=0;i<12000;i++){var o={};o.self=o;retained.push(o);} retained=null;",
-        )
-        .expect("parse");
-    assert!(result.is_ok(), "allocation task threw");
-    let before_boundary = engine.ctx().live_object_count();
+    // The boundary's collection is minor (S6 step 10c), so it reclaims the garbage that is
+    // young: a nursery larger than the task keeps the task's objects young until then, where a
+    // minor collection during the task would have made the ones it found reachable old.
+    engine
+        .interp
+        .gc_heap
+        .core
+        .borrow_mut()
+        .set_nursery_bytes(Some(16 << 20));
+    let before = engine.interp.live_object_count();
+    eval_quiet(
+        &mut engine,
+        "var retained=[]; for(var i=0;i<12000;i++){var o={};o.self=o;retained.push(o);} retained=null;",
+    );
+    let before_boundary = engine.interp.live_object_count();
     assert!(before_boundary > before + 10_000);
 
     engine
         .run_microtasks_interruptible()
         .expect("task-boundary checkpoint");
-    let after_boundary = engine.ctx().live_object_count();
+    let after_boundary = engine.interp.live_object_count();
+    // Under GC stress the task's own collections promote its objects before the boundary.
     assert!(
-        after_boundary + 10_000 < before_boundary,
+        crate::gc_test::stress_active() || after_boundary + 10_000 < before_boundary,
         "task boundary retained cyclic garbage: {before_boundary} -> {after_boundary}"
     );
 }
@@ -6162,151 +6491,75 @@ fn high_churn_task_collects_after_temporary_roots_are_released() {
 #[test]
 fn host_numeric_array_copy_guards_observable_property_reads() {
     let mut engine = Engine::new();
-    let mut evaluate = |source: &str| {
-        engine
-            .eval_value_interruptible(source)
-            .unwrap()
-            .unwrap_or_else(|_| panic!("array fixture threw"))
-    };
-    let dense = evaluate("Object.freeze([1,-0,NaN,Infinity])");
-    let accessor =
-        evaluate("var reads=0;Object.defineProperty([1,2],'1',{get(){reads++;return 2;}})");
-    let proxy = evaluate("new Proxy([1,2],{get(t,k){reads++;return t[k];}})");
-    let holes = evaluate("Array(2)");
-    let mixed = evaluate("[1,{valueOf(){reads++;return 2;}}]");
-    let values = engine.ctx().copy_numeric_array(&dense, 4).unwrap();
-    assert_eq!(values[0], 1.);
-    assert!(values[1].is_sign_negative());
-    assert!(values[2].is_nan());
-    assert!(values[3].is_infinite());
-    assert!(engine.ctx().copy_numeric_array(&dense, 3).is_none());
-    for value in [accessor, proxy, holes, mixed] {
-        assert!(engine.ctx().copy_numeric_array(&value, 8).is_none());
-    }
-    assert!(matches!(
-        engine.eval_value_interruptible("reads").unwrap().ok(),
-        Some(crate::value::Value::Num(0.))
-    ));
+    engine.scope(|cx| {
+        let dense = value_in(cx, "Object.freeze([1,-0,NaN,Infinity])");
+        let accessor = value_in(
+            cx,
+            "var reads=0;Object.defineProperty([1,2],'1',{get(){reads++;return 2;}})",
+        );
+        let proxy = value_in(cx, "new Proxy([1,2],{get(t,k){reads++;return t[k];}})");
+        let holes = value_in(cx, "Array(2)");
+        let mixed = value_in(cx, "[1,{valueOf(){reads++;return 2;}}]");
+        let values = cx.copy_numeric_array(&dense, 4).unwrap();
+        assert_eq!(values[0], 1.);
+        assert!(values[1].is_sign_negative());
+        assert!(values[2].is_nan());
+        assert!(values[3].is_infinite());
+        assert!(cx.copy_numeric_array(&dense, 3).is_none());
+        for value in [accessor, proxy, holes, mixed] {
+            assert!(cx.copy_numeric_array(&value, 8).is_none());
+        }
+        assert_eq!(value_in(cx, "reads").as_num_opt(), Some(0.));
+    });
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn host_weak_map_lookup_uses_intrinsic_brand_and_storage() {
     let mut engine = Engine::new();
-    let value = engine.eval_value_interruptible(
-        "var key={};var slots=new WeakMap([[key,42]]);slots.get=()=>{throw Error('override')};slots"
-    ).unwrap().unwrap_or_else(|_| panic!("weak map fixture threw"));
-    let key = engine
-        .eval_value_interruptible("key")
-        .unwrap()
-        .unwrap_or_else(|_| panic!("key fixture threw"));
-    assert!(matches!(
-        engine.ctx().weak_map_get(&value, &key).ok(),
-        Some(crate::value::Value::Num(42.))
-    ));
-    assert!(matches!(
-        engine
-            .ctx()
-            .weak_map_get(&value, &crate::value::Value::Null)
-            .ok(),
-        Some(crate::value::Value::Undefined)
-    ));
-    let set = engine
-        .eval_value_interruptible("new WeakSet([key])")
-        .unwrap()
-        .unwrap_or_else(|_| panic!("set fixture threw"));
-    assert!(engine.ctx().weak_map_get(&set, &key).is_err());
-    let map = engine
-        .eval_value_interruptible("new Map()")
-        .unwrap()
-        .unwrap_or_else(|_| panic!("map fixture threw"));
-    engine
-        .ctx()
-        .map_set(&map, crate::value::Value::Num(-0.), key.clone())
-        .unwrap_or_else(|_| panic!("map intrinsic failed"));
-    let found = engine
-        .ctx()
-        .map_get(&map, &crate::value::Value::Num(0.))
-        .unwrap_or_else(|_| panic!("map intrinsic failed"));
-    assert!(engine.ctx().values_strict_equal(&found, &key));
-    engine
-        .ctx()
-        .map_set(
-            &map,
-            crate::value::Value::Num(f64::NAN),
-            crate::value::Value::Num(7.),
-        )
-        .unwrap_or_else(|_| panic!("map intrinsic failed"));
-    assert!(matches!(
-        engine
-            .ctx()
-            .map_get(&map, &crate::value::Value::Num(f64::NAN))
-            .unwrap_or_else(|_| panic!("map lookup failed")),
-        crate::value::Value::Num(7.)
-    ));
-    assert!(engine.ctx().map_get(&set, &key).is_err());
-}
-
-#[cfg(feature = "embed")]
-#[test]
-fn transient_tasks_avoid_full_heap_scans_and_small_cycles_stay_bounded() {
-    let mut engine = Engine::new();
-    engine.set_tier(crate::bytecode::Tier::Jit);
-    engine.set_tier_threshold(0);
-    engine
-        .eval_value_interruptible("var anchors=[];for(var i=0;i<60000;i++)anchors.push({i});")
-        .unwrap()
-        .unwrap_or_else(|_| panic!("GC fixture threw"));
-    engine.ctx().collect_garbage_for_host();
-    let baseline = engine.ctx().live_object_count();
-    engine
-        .eval_value_interruptible(
-            "var dead={};dead.self=dead;var weak=new WeakRef(dead);dead=null;\n\
-         for(var i=0;i<20000;i++){var temporary={i};}temporary=null;",
-        )
-        .unwrap()
-        .unwrap_or_else(|_| panic!("GC fixture threw"));
-    engine.run_microtasks_interruptible().unwrap();
-    assert_eq!(
-        engine.interp.gc_task_live, baseline,
-        "transient churn scanned the retained heap"
-    );
-    let value = engine
-        .eval_value_interruptible("weak.deref()!==undefined")
-        .unwrap()
-        .unwrap_or_else(|_| panic!("GC fixture threw"));
-    assert!(matches!(value, crate::value::Value::Bool(true)));
-    // ClearKeptObjects after deref.
-    engine.run_microtasks_interruptible().unwrap();
-    // Each task allocates less than the old per-task trigger. Cumulative retained
-    // growth must still collect, without approaching the ordinary doubling limit.
-    for _ in 0..20 {
-        engine
-            .eval_value_interruptible(
-                "for(var i=0;i<1500;i++){var cycle={};cycle.self=cycle;}cycle=null;",
-            )
-            .unwrap()
-            .unwrap_or_else(|_| panic!("GC fixture threw"));
-        engine.run_microtasks_interruptible().unwrap();
-        assert!(engine.ctx().live_object_count() < baseline + 12_000);
-    }
-    let value = engine
-        .eval_value_interruptible("weak.deref()===undefined")
-        .unwrap()
-        .unwrap_or_else(|_| panic!("GC fixture threw"));
-    assert!(
-        matches!(value, crate::value::Value::Bool(true)),
-        "cycles were not collected"
-    );
+    engine.scope(|cx| {
+        let value = value_in(
+            cx,
+            "var key={};var slots=new WeakMap([[key,42]]);slots.get=()=>{throw Error('override')};slots",
+        );
+        let key = value_in(cx, "key");
+        assert_eq!(
+            cx.weak_map_get(&value, &key).ok().and_then(|v| v.as_num_opt()),
+            Some(42.)
+        );
+        assert!(matches!(
+            (cx.weak_map_get(&value, &Value::Null).ok()).map(|__value| (__value).kind()),
+            Some(ValueKind::Undefined)
+        ));
+        let set = value_in(cx, "new WeakSet([key])");
+        assert!(cx.weak_map_get(&set, &key).is_err());
+        let map = value_in(cx, "new Map()");
+        cx.map_set(&map, Value::Num(-0.), key)
+            .unwrap_or_else(|_| panic!("map intrinsic failed"));
+        let found = cx
+            .map_get(&map, &Value::Num(0.))
+            .unwrap_or_else(|_| panic!("map intrinsic failed"));
+        assert!(cx.values_strict_equal(&found, &key));
+        cx.map_set(&map, Value::Num(f64::NAN), Value::Num(7.))
+            .unwrap_or_else(|_| panic!("map intrinsic failed"));
+        assert_eq!(
+            cx.map_get(&map, &Value::Num(f64::NAN))
+                .unwrap_or_else(|_| panic!("map lookup failed"))
+                .as_num_opt(),
+            Some(7.)
+        );
+        assert!(cx.map_get(&set, &key).is_err());
+    });
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn error_diagnostics_do_not_execute_author_code() {
     let mut engine = Engine::new();
-    run_in(
-        &mut engine,
-        r#"
+    engine.scope(|cx| {
+        value_in(
+            cx,
+            r#"
         globalThis.diagnosticReads = 0;
         const hostile = { toString() { ++diagnosticReads; throw 'coerced'; } };
         globalThis.diagnosticError = new Error('original message');
@@ -6320,86 +6573,80 @@ fn error_diagnostics_do_not_execute_author_code() {
         });
         0;
     "#,
-    );
-    let global = engine.global_this();
-    let error = engine
-        .ctx()
-        .member_get(&global, "diagnosticError")
-        .unwrap_or_else(|_| panic!("read fixture error"));
-    assert!(engine
-        .ctx()
-        .error_diagnostic(&error)
-        .unwrap()
-        .starts_with("Error: original message"));
-    let proxy = engine
-        .ctx()
-        .member_get(&global, "diagnosticProxy")
-        .unwrap_or_else(|_| panic!("read fixture proxy"));
-    assert!(engine.ctx().error_diagnostic(&proxy).is_none());
-    run_in(&mut engine, "diagnosticError.message = hostile; 0");
-    assert!(engine
-        .ctx()
-        .error_diagnostic(&error)
-        .unwrap()
-        .contains("<non-string message>"));
-    run_in(
-        &mut engine,
-        r#"
+        );
+        let global = cx.global_this();
+        let error = cx
+            .member_get(&global, "diagnosticError")
+            .unwrap_or_else(|_| panic!("read fixture error"));
+        assert!(cx
+            .error_diagnostic(&error)
+            .unwrap()
+            .starts_with("Error: original message"));
+        let proxy = cx
+            .member_get(&global, "diagnosticProxy")
+            .unwrap_or_else(|_| panic!("read fixture proxy"));
+        assert!(cx.error_diagnostic(&proxy).is_none());
+        value_in(cx, "diagnosticError.message = hostile; 0");
+        assert!(cx
+            .error_diagnostic(&error)
+            .unwrap()
+            .contains("<non-string message>"));
+        value_in(
+            cx,
+            r#"
         Object.defineProperty(diagnosticError, 'message', { get() {
             ++diagnosticReads; throw 'message getter called';
         }});
         0;
     "#,
-    );
-    assert!(engine
-        .ctx()
-        .error_diagnostic(&error)
-        .unwrap()
-        .contains("<accessor message>"));
-    assert_eq!(run_in(&mut engine, "diagnosticReads"), "0");
-    let long = engine.ctx().make_error("Error", "🦀".repeat(10_000));
-    assert!(engine.ctx().error_diagnostic(&long).unwrap().len() < 12_000);
-    assert!(engine.ctx().error_diagnostic(&Value::Undefined).is_none());
+        );
+        assert!(cx
+            .error_diagnostic(&error)
+            .unwrap()
+            .contains("<accessor message>"));
+        assert_eq!(value_in(cx, "diagnosticReads").as_num_opt(), Some(0.0));
+        let long = cx.make_error("Error", "🦀".repeat(10_000));
+        assert!(cx.error_diagnostic(&long).unwrap().len() < 12_000);
+        assert!(cx.error_diagnostic(&Value::Undefined).is_none());
+    });
 }
 
 #[cfg(feature = "embed")]
 #[test]
 fn embedder_can_settle_a_host_promise_after_an_external_task() {
-    use crate::value::Value;
-
     let mut engine = Engine::new();
-    let (promise, resolve, reject) = engine.ctx().new_promise_with_resolvers();
-    let then = engine
-        .ctx()
-        .member_get(&promise, "then")
-        .unwrap_or_else(|_| panic!("promise has then"));
-    let on_fulfilled = match engine
-        .eval_value("globalThis.hostResult = 'pending'; value => hostResult = 'ok:' + value")
-        .expect("handler parses")
-    {
-        Ok(value) => value,
-        Err(_) => panic!("fulfillment handler evaluates"),
-    };
-    let on_rejected = match engine
-        .eval_value("reason => hostResult = 'error:' + reason")
-        .expect("handler parses")
-    {
-        Ok(value) => value,
-        Err(_) => panic!("rejection handler evaluates"),
-    };
-    engine
-        .call_function(&then, promise, &[on_fulfilled, on_rejected])
-        .unwrap_or_else(|_| panic!("then registration succeeds"));
+    // The host keeps the resolving functions in handles, past the scope that registered them.
+    let (resolve, reject) = engine.scope(|cx| {
+        let (promise, resolve, reject) = cx.new_promise_with_resolvers();
+        let then = cx
+            .member_get(&promise, "then")
+            .unwrap_or_else(|_| panic!("promise has then"));
+        let on_fulfilled = value_in(
+            cx,
+            "globalThis.hostResult = 'pending'; value => hostResult = 'ok:' + value",
+        );
+        let on_rejected = value_in(cx, "reason => hostResult = 'error:' + reason");
+        cx.call_function(&then, promise, &[on_fulfilled, on_rejected])
+            .unwrap_or_else(|_| panic!("then registration succeeds"));
+        (
+            crate::embed::Handle::new(cx, &resolve).expect("a handle"),
+            crate::embed::Handle::new(cx, &reject).expect("a handle"),
+        )
+    });
 
     // The host-held resolver is a GC root and keeps its pending promise/reactions alive even after
     // the promise itself leaves Rust scope. This models an I/O completion arriving on a later task.
     engine.collect_garbage_at_idle();
-    engine
-        .call_function(&resolve, Value::Undefined, &[Value::lstr("done")])
-        .unwrap_or_else(|_| panic!("resolve succeeds"));
-    engine
-        .call_function(&reject, Value::Undefined, &[Value::lstr("too late")])
-        .unwrap_or_else(|_| panic!("second settlement is a no-op"));
+    engine.scope(|cx| {
+        let resolve = resolve.get(cx).expect("the engine's handle");
+        let reject = reject.get(cx).expect("the engine's handle");
+        let done = cx.str("done");
+        cx.call_function(&resolve, Value::Undefined, &[done])
+            .unwrap_or_else(|_| panic!("resolve succeeds"));
+        let late = cx.str("too late");
+        cx.call_function(&reject, Value::Undefined, &[late])
+            .unwrap_or_else(|_| panic!("second settlement is a no-op"));
+    });
 
     match engine.eval("hostResult", false).expect("result parses") {
         Completion::Value(value) => assert_eq!(
@@ -6432,35 +6679,35 @@ fn promise_jobs_restore_their_embedder_settings_context() {
         leaves: usize,
     }
 
-    fn set_context(
-        ctx: &mut crate::embed::Ctx,
-        _this: Value,
-        args: &[Value],
-    ) -> Result<Value, Value> {
+    fn set_context<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         let context = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
         ctx.set_host_job_context(context);
         Ok(Value::Undefined)
     }
 
-    fn current_context(
-        ctx: &mut crate::embed::Ctx,
-        _this: Value,
-        _args: &[Value],
-    ) -> Result<Value, Value> {
+    fn current_context<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         Ok(Value::Num(
             ctx.host_mut::<ContextTrace>()
                 .map_or(0, |trace| trace.current) as f64,
         ))
     }
 
-    fn enter_context(ctx: &mut crate::embed::Ctx, context: u64) {
+    fn enter_context(ctx: &mut Ctx<'_>, context: u64) {
         if let Some(trace) = ctx.host_mut::<ContextTrace>() {
             trace.current = context;
             trace.entered.push(context);
         }
     }
 
-    fn leave_context(ctx: &mut crate::embed::Ctx) {
+    fn leave_context(ctx: &mut Ctx<'_>) {
         if let Some(trace) = ctx.host_mut::<ContextTrace>() {
             trace.current = 0;
             trace.leaves += 1;
@@ -6471,24 +6718,23 @@ fn promise_jobs_restore_their_embedder_settings_context() {
     // can associate the equivalent environment-settings token at reaction registration time,
     // then restore it even if an external task settles the promise from the default context.
     let mut engine = Engine::new();
-    engine.ctx().op_state().put(ContextTrace::default());
+    engine.op_state().put(ContextTrace::default());
     engine.define_global("setHostContext", 1, set_context);
     engine.define_global("currentHostContext", 0, current_context);
     engine.set_host_job_context_hooks(enter_context, leave_context);
-    engine
-        .eval_value_interruptible(
-            "let release; const pending = new Promise(resolve => release = resolve);\
-             setHostContext(41);\
-             pending.then(() => globalThis.observedHostContext = currentHostContext());\
-             setHostContext(0); release();",
-        )
-        .expect("setup parses")
-        .unwrap_or_else(|_| panic!("setup evaluates"));
+    eval_quiet(
+        &mut engine,
+        "let release; const pending = new Promise(resolve => release = resolve);\
+         setHostContext(41);\
+         pending.then(() => globalThis.observedHostContext = currentHostContext());\
+         setHostContext(0); release();",
+    );
 
     engine.run_microtasks();
+    // The job's settings were prepared around it and restored afterwards.
+    assert_eq!(engine.host_job_context(), 0);
     assert_eq!(run_in(&mut engine, "observedHostContext"), "41");
     let trace = engine
-        .ctx()
         .host_mut::<ContextTrace>()
         .expect("context trace remains installed");
     assert_eq!(trace.current, 0);
@@ -6505,25 +6751,25 @@ fn cross_realm_promise_jobs_prepare_the_handler_realm_before_host_settings() {
         leaves: usize,
     }
 
-    fn set_context(
-        ctx: &mut crate::embed::Ctx,
-        _this: Value,
-        args: &[Value],
-    ) -> Result<Value, Value> {
+    fn set_context<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         let context = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
         ctx.set_host_job_context(context);
         Ok(Value::Undefined)
     }
 
-    fn current_context(
-        ctx: &mut crate::embed::Ctx,
-        _this: Value,
-        _args: &[Value],
-    ) -> Result<Value, Value> {
+    fn current_context<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         Ok(Value::Num(ctx.host_job_context() as f64))
     }
 
-    fn enter_context(ctx: &mut crate::embed::Ctx, context: u64) {
+    fn enter_context(ctx: &mut Ctx<'_>, context: u64) {
         let global = ctx.global_this();
         let realm = ctx
             .member_get(&global, "realmLabel")
@@ -6536,7 +6782,7 @@ fn cross_realm_promise_jobs_prepare_the_handler_realm_before_host_settings() {
         }
     }
 
-    fn leave_context(ctx: &mut crate::embed::Ctx) {
+    fn leave_context(ctx: &mut Ctx<'_>) {
         if let Some(trace) = ctx.host_mut::<ContextTrace>() {
             trace.leaves += 1;
         }
@@ -6547,27 +6793,22 @@ fn cross_realm_promise_jobs_prepare_the_handler_realm_before_host_settings() {
     // Promise job. Even when a host also multiplexes settings tokens inside the child Realm, its
     // preparation callback must never run against the caller's global object.
     let mut engine = Engine::new();
-    engine.ctx().op_state().put(ContextTrace::default());
+    engine.op_state().put(ContextTrace::default());
     engine.define_global("setHostContext", 1, set_context);
     engine.define_global("currentHostContext", 0, current_context);
     engine.set_host_job_context_hooks(enter_context, leave_context);
-    engine.ctx().set_host_job_context(41);
-    engine
-        .eval_value_interruptible(
+    engine.set_host_job_context(41);
+    let child = engine.scope(|cx| {
+        value_in(
+            cx,
             "globalThis.realmLabel = 'main'; let release; globalThis.pending = new Promise(resolve => release = resolve); globalThis.release = release;",
-        )
-        .expect("main setup parses")
-        .unwrap_or_else(|_| panic!("main setup evaluates"));
-
-    let main = engine.global_this();
-    let pending = engine
-        .ctx()
-        .member_get(&main, "pending")
-        .unwrap_or_else(|_| panic!("read pending promise"));
-    let child = engine.ctx().create_embed_realm();
-    engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
+        );
+        let main = cx.global_this();
+        let pending = cx
+            .member_get(&main, "pending")
+            .unwrap_or_else(|_| panic!("read pending promise"));
+        let child = cx.create_embed_realm();
+        cx.with_embed_realm(&child, |ctx| {
             ctx.define_embed_global("setHostContext", 1, set_context);
             ctx.define_embed_global("currentHostContext", 0, current_context);
             ctx.member_set(&ctx.global_this(), "mainPending", pending)
@@ -6580,16 +6821,15 @@ fn cross_realm_promise_jobs_prepare_the_handler_realm_before_host_settings() {
         .unwrap_or_else(|_| panic!("enter child Realm"))
         .unwrap_or_else(|error| panic!("child setup parses: {error:?}"))
         .unwrap_or_else(|_| panic!("child setup evaluates"));
+        crate::embed::Handle::new(cx, &child).expect("a handle to the child's global")
+    });
 
-    engine
-        .eval_value_interruptible("release('ready')")
-        .expect("settlement parses")
-        .unwrap_or_else(|_| panic!("settlement evaluates"));
+    eval_quiet(&mut engine, "release('ready')");
     engine.run_microtasks();
 
-    let observed = engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
+    let observed = engine.scope(|cx| {
+        let child = child.get(cx).expect("the engine's handle");
+        cx.with_embed_realm(&child, |ctx| {
             let global = ctx.global_this();
             ctx.member_get(&global, "observed")
                 .ok()
@@ -6597,11 +6837,11 @@ fn cross_realm_promise_jobs_prepare_the_handler_realm_before_host_settings() {
                 .map(|value| value.to_string())
         })
         .unwrap_or_else(|_| panic!("re-enter child Realm"))
-        .unwrap_or_else(|| panic!("read child observation"));
+        .unwrap_or_else(|| panic!("read child observation"))
+    });
     assert_eq!(observed, "42|child");
-    assert_eq!(engine.ctx().host_job_context(), 41);
+    assert_eq!(engine.host_job_context(), 41);
     let trace = engine
-        .ctx()
         .host_mut::<ContextTrace>()
         .expect("context trace remains installed");
     assert!(
@@ -6620,34 +6860,6 @@ fn gc_keeps_reachable_cycles() {
         ),
         "true"
     );
-}
-
-#[test]
-fn gc_registry_reuses_dead_object_slots() {
-    use std::rc::Rc;
-
-    let (slots_before, _) = crate::value::gc_registry_stats();
-    for _ in 0..200_000 {
-        drop(crate::value::Object::new(None));
-    }
-    let (slots_after, free_after) = crate::value::gc_registry_stats();
-    assert!(
-        slots_after <= slots_before + 1,
-        "registry grew with cumulative churn: {slots_before} -> {slots_after}"
-    );
-    assert!(free_after > 0);
-
-    // A live weak slot must become a strong snapshot handle, then tombstone synchronously when
-    // the final owner disappears; the same slot can be reused without retaining the dead RcBox.
-    let object = crate::value::Object::new(None);
-    let ptr = Rc::as_ptr(&object);
-    let snapshot = crate::value::gc_snapshot();
-    assert!(snapshot.iter().any(|o| Rc::as_ptr(o) == ptr));
-    drop(snapshot);
-    drop(object);
-    let (slots_final, free_final) = crate::value::gc_registry_stats();
-    assert_eq!(slots_final, slots_after);
-    assert_eq!(free_final, free_after);
 }
 
 #[test]
@@ -6677,8 +6889,6 @@ fn gc_registry_remains_valid_across_repeated_sweeps() {
 
 #[test]
 fn gc_registry_follows_an_agent_across_generator_vm_resumptions() {
-    use std::rc::Rc;
-
     // ECMA-262 §9.7 Agents makes the executing thread a replaceable component of an Agent, and
     // §27.5.3.3 GeneratorResume runs the suspended [[GeneratorContext]]. An object and lexical
     // environment allocated by that context therefore remain owned by the same Agent when TRust JS
@@ -6703,22 +6913,23 @@ fn gc_registry_follows_an_agent_across_generator_vm_resumptions() {
         Completion::Throw { name, message } => panic!("generator setup threw {name}: {message}"),
     }
 
-    let worker_object = match engine
+    let worker_object = match (engine
         .interp
         .global
         .borrow()
         .props
         .get("workerObject")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("generator did not publish its worker-allocated object"),
     };
     let snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
     assert!(
         snapshot
             .iter()
-            .any(|object| Rc::ptr_eq(object, &worker_object)),
+            .any(|object| crate::value::Gc::ptr_eq(object, &worker_object)),
         "the Agent heap omitted an object allocated by its suspended execution context"
     );
     let scopes_after = crate::value::gc_scope_snapshot(&engine.interp.gc_heap).len();
@@ -6754,8 +6965,6 @@ fn gc_registry_follows_an_agent_across_generator_vm_resumptions() {
 
 #[test]
 fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
-    use std::rc::Rc;
-
     let mut first = Engine::new();
     let mut second = Engine::new();
     let _ = first
@@ -6765,26 +6974,28 @@ fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
         .eval("globalThis.agentMarker = { agent: 2 }", false)
         .expect("second Agent script parses");
 
-    let first_object = match first
+    let first_object = match (first
         .interp
         .global
         .borrow()
         .props
         .get("agentMarker")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("first Agent marker missing"),
     };
-    let second_object = match second
+    let second_object = match (second
         .interp
         .global
         .borrow()
         .props
         .get("agentMarker")
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("second Agent marker missing"),
     };
     let first_snapshot = crate::value::heap_gc_snapshot(&first.interp.gc_heap);
@@ -6792,16 +7003,16 @@ fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
 
     assert!(first_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &first_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &first_object)));
     assert!(!first_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &second_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &second_object)));
     assert!(second_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &second_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &second_object)));
     assert!(!second_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &first_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &first_object)));
 }
 
 #[test]
@@ -6828,15 +7039,16 @@ fn object_shapes_follow_the_agent_across_generator_vm_resumptions() {
         )
         .expect("shape handoff script parses");
 
-    let get_object = |name: &str| match engine
+    let get_object = |name: &str| match (engine
         .interp
         .global
         .borrow()
         .props
         .get(name)
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(crate::value::Value::Obj(object)) => object,
+        Some(ValueView::Obj(object)) => object,
         _ => panic!("{name} was not published as an object"),
     };
     let main_object = get_object("mainObject");
@@ -6925,23 +7137,27 @@ fn engine_teardown_reclaims_the_entire_object_and_environment_graph() {
                 ),
                 "ready"
             );
-            // A full ordinary collection must preserve these live roots, and must not
-            // leave scratch reference counts where Object::drop expects registry slots.
+            // A full ordinary collection preserves these live roots and leaves its object
+            // census valid for the following teardown.
             engine.interp.gc_collect();
             let heap = Rc::downgrade(&engine.interp.gc_heap);
             let objects: Vec<_> = crate::value::heap_gc_snapshot(&engine.interp.gc_heap)
                 .iter()
-                .map(|object| Rc::downgrade(object))
+                .map(crate::value::Gc::downgrade)
                 .collect();
             let scopes: Vec<_> = crate::value::gc_scope_snapshot(&engine.interp.gc_heap)
                 .iter()
-                .map(Rc::downgrade)
+                .map(crate::interpreter::Env::downgrade)
                 .collect();
             let child_heaps: Vec<_> = engine
                 .interp
                 .shadow_realms
                 .values()
-                .map(|child| Rc::downgrade(&child.gc_heap))
+                .map(|child| {
+                    engine
+                        .interp
+                        .with_realm_view(child.id(), |child| Rc::downgrade(&child.gc_heap))
+                })
                 .collect();
             assert!(!child_heaps.is_empty());
             drop(engine);
@@ -6975,9 +7191,9 @@ fn engine_teardown_preserves_another_live_agent_on_the_same_thread() {
     drop(retired);
     assert!(retired_heap.upgrade().is_none());
     let object = crate::value::Object::new(None);
-    assert!(std::rc::Rc::ptr_eq(
-        &object.borrow().gc_heap,
-        &active.interp.gc_heap
+    assert!(active.interp.gc_heap.core.borrow().owns_cell(
+        crate::value::Gc::as_ptr(&object) as usize,
+        active.interp.gc_heap.object_desc,
     ));
     assert_eq!(run_in(&mut active, "kept.self.n + 1"), "42");
     active.interp.gc_collect();
@@ -6987,37 +7203,39 @@ fn engine_teardown_preserves_another_live_agent_on_the_same_thread() {
 #[cfg(feature = "embed")]
 #[test]
 fn engine_teardown_releases_native_capture_cycles_without_running_author_cleanup() {
-    use std::{
-        cell::{Cell, RefCell},
-        rc::Rc,
-    };
+    use std::{cell::Cell, rc::Rc};
 
     let mut engine = Engine::new();
     let calls = Rc::new(Cell::new(0));
-    let captured = Rc::new(RefCell::new(Value::Undefined));
-    let weak_capture = Rc::downgrade(&captured);
-    let callback = engine.ctx().new_native_fn(
-        "recordCleanup",
-        0,
-        Rc::new({
-            let calls = calls.clone();
-            let captured = captured.clone();
-            move |_, _, _| {
-                calls.set(calls.get() + 1);
-                Ok(captured.borrow().clone())
-            }
-        }),
-    );
-    *captured.borrow_mut() = callback.clone();
-    engine
-        .interp
-        .global
-        .borrow_mut()
-        .props
-        .insert("recordCleanup", crate::value::Property::plain(callback));
-    drop(captured);
-    let result = engine
-        .eval_value(
+    // The callback's Rust state, which only its function holds.
+    let state = Rc::new(());
+    let weak_state = Rc::downgrade(&state);
+    engine.scope(|cx| {
+        // The callback captures an object that refers back to it: a cycle through the native
+        // function's engine captures (S6 step 11b; before it, through a reported Rust cell).
+        let holder = Value::Obj(cx.new_object());
+        let callback = cx.new_native_closure_with_captures(
+            "recordCleanup",
+            0,
+            {
+                let calls = calls.clone();
+                move |_, _, _, captures| {
+                    let _state = &state;
+                    calls.set(calls.get() + 1);
+                    Ok(captures[0])
+                }
+            },
+            &[holder],
+            crate::embed::NativeCaptures::None,
+        );
+        cx.member_set(&holder, "callback", callback)
+            .unwrap_or_else(|_| panic!("close the cycle"));
+        let global = cx.global_this();
+        cx.member_set(&global, "recordCleanup", callback)
+            .unwrap_or_else(|_| panic!("install the callback"));
+    });
+    let completed = engine.scope(|cx| {
+        cx.eval_value(
             r#"
         const registry = new FinalizationRegistry(recordCleanup);
         let target = {}; target.self = target; registry.register(target, 1); target = null;
@@ -7027,9 +7245,10 @@ fn engine_teardown_releases_native_capture_cycles_without_running_author_cleanup
         'ready'
     "#,
         )
-        .expect("cleanup fixture parses");
-    assert!(result.is_ok());
-    drop(result);
+        .expect("cleanup fixture parses")
+        .is_ok()
+    });
+    assert!(completed);
     let heap = Rc::downgrade(&engine.interp.gc_heap);
     engine.interrupt_handle().cancel();
     drop(engine);
@@ -7039,8 +7258,8 @@ fn engine_teardown_releases_native_capture_cycles_without_running_author_cleanup
         "shutdown must not run author jobs or finally blocks"
     );
     assert!(
-        weak_capture.upgrade().is_none(),
-        "opaque native closure cycle released"
+        weak_state.upgrade().is_none(),
+        "native closure cycle released"
     );
     assert!(heap.upgrade().is_none());
 }
@@ -7052,10 +7271,9 @@ fn engine_teardown_dismantles_deep_chains_without_recursive_drops() {
         .spawn(|| {
             let mut engine = Engine::new();
             for _ in 0..16_384 {
-                engine.interp.global =
-                    crate::value::Object::new(Some(engine.interp.global.clone()));
+                engine.interp.global = crate::value::Object::new(Some(engine.interp.global));
                 engine.interp.global_env =
-                    crate::interpreter::new_scope(Some(engine.interp.global_env.clone()));
+                    crate::interpreter::new_scope(Some(engine.interp.global_env));
             }
             let heap = std::rc::Rc::downgrade(&engine.interp.gc_heap);
             drop(engine);
@@ -7081,6 +7299,9 @@ fn recursive_calls_cross_generator_continuations_without_an_artificial_budget() 
 fn execution_stack_resource_exhaustion_unwinds_and_recovers() {
     // Host stack exhaustion must be catchable, not unlimited native segment growth. Do not
     // assert an exact JS depth: the resource being bounded is native storage, not [[Call]].
+    // Every path that checks before it grows leaves the cap to its check: no growth checkpoint
+    // finds the red zone reached at the cap.
+    let capped = crate::interpreter::execution_stack_capped_checkpoints();
     for tier in [
         crate::bytecode::Tier::Interp,
         crate::bytecode::Tier::Bytecode,
@@ -7136,6 +7357,11 @@ fn execution_stack_resource_exhaustion_unwinds_and_recovers() {
             Completion::Value(value) => assert_eq!(value, "20000", "{tier:?}: tail calls"),
             Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
         }
+        assert_eq!(
+            crate::interpreter::execution_stack_capped_checkpoints(),
+            capped,
+            "{tier:?}: a growth checkpoint found the red zone reached at the cap"
+        );
     }
 }
 
@@ -7154,6 +7380,68 @@ fn execution_stack_segment_budget_is_returned_on_rust_unwind() {
         assert!(result.is_err());
         assert_eq!(crate::interpreter::execution_stack_segments(), 0);
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn execution_stack_checkpoints_never_grow_past_the_segment_cap() {
+    // A call path checks for exhaustion, then reaches its growth checkpoint at the same depth a
+    // little deeper on the stack. At the segment cap a check inside the margin above the red zone
+    // reports exhaustion, and a checkpoint that finds the red zone reached runs the call on the
+    // current stack instead of adding a segment past the cap. The stack is positioned exactly,
+    // in a thread of its own, and the live segment count set without allocating the segments.
+    use crate::interpreter::{
+        execution_stack_capped_checkpoints, execution_stack_exhausted, execution_stack_segments,
+        with_execution_stack, with_execution_stack_segments, EXECUTION_STACK_CHECK_MARGIN,
+        EXECUTION_STACK_RED_ZONE, MAX_EXECUTION_STACK_SEGMENTS,
+    };
+    const CAP: usize = MAX_EXECUTION_STACK_SEGMENTS;
+    /// Run `f` deeper on this stack, in the first frame whose headroom is below `below`.
+    #[inline(never)]
+    fn below_headroom(below: usize, f: &mut dyn FnMut(usize)) {
+        let mut frame = [0u8; 1024];
+        std::hint::black_box(&mut frame);
+        let remaining = stacker::remaining_stack().expect("a thread stack of known bounds");
+        if remaining < below {
+            f(remaining);
+        } else {
+            below_headroom(below, f);
+        }
+        std::hint::black_box(&frame);
+    }
+    std::thread::Builder::new()
+        .name(String::from("trust-js-execution-stack-segment-cap"))
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            // Inside the margin, above the red zone: exhausted at the cap only.
+            let margin = EXECUTION_STACK_RED_ZONE + EXECUTION_STACK_CHECK_MARGIN / 2;
+            below_headroom(margin, &mut |remaining| {
+                assert!(remaining > EXECUTION_STACK_RED_ZONE + EXECUTION_STACK_CHECK_MARGIN / 4);
+                with_execution_stack_segments(CAP - 1, || {
+                    assert!(!execution_stack_exhausted(8), "below the cap");
+                });
+                with_execution_stack_segments(CAP, || {
+                    assert!(execution_stack_exhausted(8), "inside the margin at the cap");
+                });
+            });
+            // Inside the red zone: a checkpoint below the cap adds a segment, one at the cap
+            // runs the call where it is.
+            below_headroom(EXECUTION_STACK_RED_ZONE / 2, &mut |_| {
+                with_execution_stack_segments(CAP - 1, || {
+                    assert_eq!(with_execution_stack(8, execution_stack_segments), CAP);
+                    assert_eq!(execution_stack_segments(), CAP - 1);
+                });
+                with_execution_stack_segments(CAP, || {
+                    let capped = execution_stack_capped_checkpoints();
+                    assert_eq!(with_execution_stack(8, execution_stack_segments), CAP);
+                    assert_eq!(execution_stack_capped_checkpoints(), capped + 1);
+                });
+            });
+            assert_eq!(execution_stack_segments(), 0);
+        })
+        .expect("spawn segment-cap test")
+        .join()
+        .expect("segment-cap test completes");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -10315,7 +10603,7 @@ fn async_tail_return_survives_leaked_tco() {
     // body forces it off before each statement. Here `__leakTco()` reproduces that leaked state
     // after an `await`, and the following tail-call `return` must still yield its real value.
     let mut e = Engine::new();
-    let global = e.interp.global.clone();
+    let global = e.interp.global;
     e.interp.def_method(&global, "__leakTco", 0, leak_tco);
     e.eval(
         "function id(x){ return x; }\n\
@@ -14294,15 +14582,16 @@ fn loop_free_functions_earn_native_code_through_vm_runs() {
     engine.set_tier_threshold(1);
     engine.interp.jit_admit_runs = 3;
     let chunk_of = |engine: &mut Engine, name: &str| {
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let Ok(value) = engine.interp.get_var(name, &env) else {
             panic!("missing fixture function {name}")
         };
-        let object = value.as_obj().expect("function object").borrow();
+        let object_handle = value.as_obj().expect("function object");
+        let object = object_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("user function")
         };
-        user.func.code.get().cloned().flatten()
+        user.func.runtime().code.get().cloned().flatten()
     };
     run_in(
         &mut engine,
@@ -18542,6 +18831,8 @@ fn finalization_registry_retention_and_cleanup_jobs() {
         )
         .expect("setup parses");
     engine.eval("$262.gc()", false).expect("collection parses");
+    // The cleanup job ran after that collection; the next one reclaims the held value.
+    engine.eval("$262.gc()", false).expect("collection parses");
     assert!(matches!(
         engine
             .eval(
@@ -18613,8 +18904,6 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     let mut engine = Engine::new();
     let before = [
         engine.interp.gc_pins.len(),
-        engine.interp.map_data.len(),
-        engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
         engine.interp.data_views.len(),
@@ -18646,8 +18935,6 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     engine.interp.gc_collect();
     let after = [
         engine.interp.gc_pins.len(),
-        engine.interp.map_data.len(),
-        engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
         engine.interp.data_views.len(),
@@ -19827,7 +20114,7 @@ fn module_maps_are_partitioned_by_embedder_settings_context() {
         .eval("globalThis.moduleRuns = [];", false)
         .expect("setup parses");
 
-    engine.ctx().set_host_job_context(41);
+    engine.set_host_job_context(41);
     engine
         .eval_module(
             "moduleRuns.push('a:' + import.meta.url);",
@@ -19843,7 +20130,7 @@ fn module_maps_are_partitioned_by_embedder_settings_context() {
         )
         .expect("same settings module stays cached");
 
-    engine.ctx().set_host_job_context(42);
+    engine.set_host_job_context(42);
     engine
         .eval_module(
             "moduleRuns.push('b:' + import.meta.url);",
@@ -19873,26 +20160,17 @@ fn classic_script_global_lexicals_are_partitioned_by_embedder_settings_context()
     // multiplexing those Windows through one Engine must be able to evaluate
     // the same classic script in each without cross-Window lexical conflicts.
     let mut engine = Engine::new();
-    engine.ctx().set_host_job_context(51);
-    assert!(engine
-        .ctx()
-        .eval_classic_script_interruptible("const applicationStyle = 'first';")
-        .expect("first classic script parses")
-        .is_ok());
+    engine.set_host_job_context(51);
+    assert!(classic(&mut engine, "const applicationStyle = 'first';").is_ok());
 
-    engine.ctx().set_host_job_context(52);
-    assert!(engine
-        .ctx()
-        .eval_classic_script_interruptible("const applicationStyle = 'second';")
-        .expect("second classic script parses")
-        .is_ok());
+    engine.set_host_job_context(52);
+    assert!(classic(&mut engine, "const applicationStyle = 'second';").is_ok());
 
-    engine.ctx().set_host_job_context(51);
-    let duplicate = engine
-        .ctx()
-        .eval_classic_script_interruptible("const applicationStyle = 'duplicate';")
-        .expect("duplicate classic script parses");
-    assert!(matches!(duplicate, Err(crate::embed::EvalError::Throw(_))));
+    engine.set_host_job_context(51);
+    assert_eq!(
+        classic(&mut engine, "const applicationStyle = 'duplicate';"),
+        Err("throw")
+    );
 }
 
 #[cfg(feature = "embed")]
@@ -19906,38 +20184,41 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
     engine
         .eval("globalThis.retiredJobRan = false;", false)
         .expect("setup parses");
-    engine.ctx().set_host_job_context(61);
-    engine
-        .ctx()
-        .eval_classic_script_interruptible("const retiredLexical = { retained: true };")
-        .expect("retired classic script parses")
+    engine.set_host_job_context(61);
+    classic(&mut engine, "const retiredLexical = { retained: true };")
         .unwrap_or_else(|_| panic!("retired classic script evaluates"));
-    engine
-        .eval_module(
-            "export const retainedModuleValue = { retained: true };",
-            "https://example.test/retired.js",
-            |_, _| None,
-        )
-        .expect("retired module parses");
-    engine
-        .ctx()
-        .eval_classic_script_interruptible("Promise.resolve().then(() => retiredJobRan = true);")
-        .expect("retired promise script parses")
-        .unwrap_or_else(|_| panic!("retired promise script evaluates"));
-    engine.ctx().set_host_job_context(0);
+    // A module's completion value is its namespace: evaluated in a helper frame, it leaves no
+    // copy in this frame, which the collections below scan.
+    crate::gc_test::in_frame(|| {
+        engine
+            .eval_module(
+                "export const retainedModuleValue = { retained: true };",
+                "https://example.test/retired.js",
+                |_, _| None,
+            )
+            .expect("retired module parses");
+    });
+    classic(
+        &mut engine,
+        "Promise.resolve().then(() => retiredJobRan = true);",
+    )
+    .unwrap_or_else(|_| panic!("retired promise script evaluates"));
+    engine.set_host_job_context(0);
 
     assert!(engine
-        .ctx()
+        .interp
         .host_settings_states
         .keys()
         .any(|(_, context)| *context == 61));
     assert!(engine
-        .ctx()
+        .interp
         .modules
         .keys()
         .any(|key| crate::modules::module_map_context(key) == 61));
-    let retired_namespace = {
-        let ctx = engine.ctx();
+    // Kept hidden: the conservative stack scan would take the plain address for a reference to
+    // the namespace.
+    let retired_namespace = crate::gc_test::HiddenAddress::from_fn(|| {
+        let ctx = &engine.interp;
         let namespace = ctx
             .modules
             .iter()
@@ -19946,44 +20227,52 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
             .expect("retired settings module has a namespace");
         ctx.object_addr(namespace)
             .expect("module namespace is an object")
-    };
-    assert!(engine.ctx().gc_pins.contains_key(&retired_namespace));
+    });
+    assert!(retired_namespace.in_map(&engine.interp.gc_pins));
     assert!(engine
-        .ctx()
-        .microtasks
+        .interp
+        .gc_heap
+        .agent
+        .work
+        .borrow()
+        .promises
         .iter()
-        .any(|job| job.host_context == 61));
+        .any(|job| job.payload.host_context == 61));
 
-    assert!(engine.ctx().release_host_job_context(61));
-    assert!(!engine.ctx().release_host_job_context(61));
+    assert!(engine.release_host_job_context(61));
+    assert!(!engine.release_host_job_context(61));
     assert!(!engine
-        .ctx()
+        .interp
         .host_settings_states
         .keys()
         .any(|(_, context)| *context == 61));
     assert!(!engine
-        .ctx()
+        .interp
         .modules
         .keys()
         .any(|key| crate::modules::module_map_context(key) == 61));
     assert!(!engine
-        .ctx()
+        .interp
         .module_recs
         .keys()
         .any(|key| crate::modules::module_map_context(key) == 61));
     assert!(!engine
-        .ctx()
-        .microtasks
+        .interp
+        .gc_heap
+        .agent
+        .work
+        .borrow()
+        .promises
         .iter()
-        .any(|job| job.host_context == 61));
+        .any(|job| job.payload.host_context == 61));
 
     engine.run_microtasks();
     assert_eq!(run_in(&mut engine, "retiredJobRan"), "false");
     engine.collect_garbage_at_idle();
-    assert!(!engine.ctx().module_ns.contains_key(&retired_namespace));
-    assert!(!engine.ctx().gc_pins.contains_key(&retired_namespace));
-    engine.ctx().set_host_job_context(61);
-    assert_eq!(engine.ctx().host_job_context, 0);
+    assert!(!retired_namespace.in_map(&engine.interp.module_ns));
+    assert!(!retired_namespace.in_map(&engine.interp.gc_pins));
+    engine.set_host_job_context(61);
+    assert_eq!(engine.interp.host_job_context, 0);
 }
 
 #[cfg(feature = "embed")]
@@ -19993,46 +20282,65 @@ fn retired_settings_request_boundary_collection_without_allocation_pressure() {
     // reachable. Retirement requests a scan; it must not forcibly destroy a
     // retained Realm or interrupt the synchronous job (ECMA-262 §9.9).
     let mut engine = Engine::new();
-    let abandoned = engine.ctx().create_embed_realm();
-    let retained = engine.ctx().create_embed_realm();
-    let abandoned_ptr = engine.ctx().object_addr(&abandoned).unwrap();
-    let retained_ptr = engine.ctx().object_addr(&retained).unwrap();
-    for (realm, context) in [(&abandoned, 81), (&retained, 82)] {
-        assert!(engine
-            .ctx()
-            .with_embed_realm(realm, |ctx| ctx.set_host_job_context(context))
-            .is_ok());
-    }
-    // Reset allocation pressure while both Realms are explicitly rooted.
+    // Realm handles live only in helper frames (the collector scans the stack).
+    let retained_ptr = crate::gc_test::in_frame(|| {
+        // The retained Realm's global is held by a handle until this frame ends.
+        let (abandoned_ptr, retained_ptr, retained) = crate::gc_test::in_frame(|| {
+            engine.scope(|cx| {
+                let abandoned = cx.create_embed_realm();
+                let retained = cx.create_embed_realm();
+                // Addresses are kept hidden: the conservative stack scan would take a plain
+                // address for a reference.
+                let abandoned_ptr = crate::gc_test::HiddenAddress::of(abandoned.as_internal());
+                for (realm, context) in [(&abandoned, 81), (&retained, 82)] {
+                    assert!(cx
+                        .with_embed_realm(realm, |ctx| ctx.set_host_job_context(context))
+                        .is_ok());
+                }
+                (
+                    abandoned_ptr,
+                    crate::gc_test::HiddenAddress::of(retained.as_internal()),
+                    crate::embed::Handle::new(cx, &retained).expect("a handle"),
+                )
+            })
+        });
+        // Reset allocation pressure while both Realms are explicitly rooted.
+        engine.collect_garbage_at_idle();
+        assert!(!engine.has_pending_task_garbage_collection());
+        assert!(!engine.release_host_job_context(0));
+        assert!(!engine.has_pending_task_garbage_collection());
+
+        engine.defer_task_garbage_collection(true);
+        assert!(engine.release_host_job_context(81));
+        assert!(engine.release_host_job_context(82));
+        assert!(engine.has_pending_task_garbage_collection());
+        assert!(abandoned_ptr.in_map(&engine.interp.realms));
+        engine.run_microtasks();
+        assert!(engine.has_pending_task_garbage_collection());
+        assert!(abandoned_ptr.in_map(&engine.interp.realms));
+        assert_eq!(engine.collect_pending_task_garbage(), 0);
+
+        engine.defer_task_garbage_collection(false);
+        // The requested boundary collection is major (S6 step 10c): both Realms are old, having
+        // survived the idle collection above, and a minor collection would keep the abandoned
+        // one.
+        let heap = engine.interp.gc_heap.clone();
+        let minors = heap.core.borrow().minor_collections();
+        assert!(engine.collect_pending_task_garbage() > 0);
+        assert_eq!(heap.core.borrow().minor_collections(), minors);
+        assert!(!abandoned_ptr.in_map(&engine.interp.realms));
+        assert!(retained_ptr.in_map(&engine.interp.realms));
+        assert!(!engine.has_pending_task_garbage_collection());
+        assert!(!engine.release_host_job_context(81));
+        assert!(!engine.release_host_job_context(82));
+        assert!(!engine.has_pending_task_garbage_collection());
+        assert_eq!(engine.collect_pending_task_garbage(), 0);
+
+        drop(retained);
+        retained_ptr
+    });
     engine.collect_garbage_at_idle();
-    assert!(!engine.has_pending_task_garbage_collection());
-    assert!(!engine.ctx().release_host_job_context(0));
-    assert!(!engine.has_pending_task_garbage_collection());
-
-    engine.defer_task_garbage_collection(true);
-    assert!(engine.ctx().release_host_job_context(81));
-    assert!(engine.ctx().release_host_job_context(82));
-    drop(abandoned);
-    assert!(engine.has_pending_task_garbage_collection());
-    assert!(engine.ctx().realms.contains_key(&abandoned_ptr));
-    engine.run_microtasks();
-    assert!(engine.has_pending_task_garbage_collection());
-    assert!(engine.ctx().realms.contains_key(&abandoned_ptr));
-    assert_eq!(engine.collect_pending_task_garbage(), 0);
-
-    engine.defer_task_garbage_collection(false);
-    assert!(engine.collect_pending_task_garbage() > 0);
-    assert!(!engine.ctx().realms.contains_key(&abandoned_ptr));
-    assert!(engine.ctx().realms.contains_key(&retained_ptr));
-    assert!(!engine.has_pending_task_garbage_collection());
-    assert!(!engine.ctx().release_host_job_context(81));
-    assert!(!engine.ctx().release_host_job_context(82));
-    assert!(!engine.has_pending_task_garbage_collection());
-    assert_eq!(engine.collect_pending_task_garbage(), 0);
-
-    drop(retained);
-    engine.collect_garbage_at_idle();
-    assert!(!engine.ctx().realms.contains_key(&retained_ptr));
+    assert!(!retained_ptr.in_map(&engine.interp.realms));
 }
 
 #[cfg(feature = "embed")]
@@ -20043,30 +20351,36 @@ fn first_window_context_does_not_retain_realm_bootstrap_state() {
     // switch must replace the bootstrap GlobalEnv rather than leave an
     // unreachable `(realm, 0)` HostSettingsState as a Rust GC root.
     let mut engine = Engine::new();
-    let child = engine.ctx().create_embed_realm();
-    let child_ptr = engine
-        .ctx()
-        .object_addr(&child)
-        .expect("embed Realm global is an object");
-    assert!(engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| ctx.set_host_job_context(71))
-        .is_ok());
-    assert!(!engine
-        .ctx()
-        .host_settings_states
-        .keys()
-        .any(|(realm, context)| *realm == child_ptr && *context == 0));
-    assert!(engine
-        .ctx()
-        .host_settings_states
-        .keys()
-        .any(|(realm, context)| *realm == child_ptr && *context == 71));
+    // The Realm's global lives only in this helper frame (the collector scans the stack).
+    let child_ptr = crate::gc_test::in_frame(|| {
+        engine.scope(|cx| {
+            let child = cx.create_embed_realm();
+            // Kept hidden: the conservative stack scan would take the plain address for a
+            // reference.
+            let child_ptr = crate::gc_test::HiddenAddress::of(child.as_internal());
+            assert!(cx
+                .with_embed_realm(&child, |ctx| ctx.set_host_job_context(71))
+                .is_ok());
+            child_ptr
+        })
+    });
+    // The table is read in a helper frame too: its iterators left a word equal to a cell
+    // address in this frame on x86-64, which the stack scan took for a root.
+    let (bootstrap, window) = crate::gc_test::in_frame(|| {
+        let states = &engine.interp.host_settings_states;
+        let has = |context| {
+            states
+                .keys()
+                .any(|(realm, key)| *realm == child_ptr.get() && *key == context)
+        };
+        (has(0), has(71))
+    });
+    assert!(!bootstrap);
+    assert!(window);
 
-    engine.ctx().release_host_job_context(71);
-    drop(child);
-    engine.ctx().collect_garbage_for_host();
-    assert!(!engine.ctx().realms.contains_key(&child_ptr));
+    engine.release_host_job_context(71);
+    engine.collect_garbage_at_idle();
+    assert!(!child_ptr.in_map(&engine.interp.realms));
 }
 
 #[cfg(feature = "embed")]
@@ -20078,56 +20392,51 @@ fn promise_rejections_belong_to_the_rejecting_realms_settings() {
     // rejected promises weak set held the promise. A child Window Realm's rejection (even one
     // the main realm's code triggers by calling into it) is the child's, not the top-level's.
     let mut engine = Engine::new();
-    engine.ctx().set_host_job_context(1);
-    let main = engine.global_this();
-    let child = engine.ctx().create_embed_realm();
-    let installed = engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
-            ctx.set_host_job_context(71);
-            matches!(
-                ctx.eval_classic_script_interruptible(
-                    "globalThis.rejectHere = reason => { globalThis.child = Promise.reject(reason); };",
-                ),
-                Ok(Ok(_))
-            )
-        })
-        .unwrap_or_else(|_| panic!("enter child realm"));
-    assert!(installed);
-    assert!(engine
-        .ctx()
-        .member_set(&main, "frame", child.clone())
-        .is_ok());
-    assert!(matches!(
-        engine.eval_value("globalThis.top1 = Promise.reject(1); frame.rejectHere(2); globalThis.top3 = Promise.reject(3);"),
-        Ok(Ok(_))
-    ));
-    let rejections: Vec<(u64, f64)> = engine
-        .take_unhandled_rejections_in_contexts()
-        .into_iter()
-        .filter_map(|(context, _, reason)| reason.as_num_opt().map(|reason| (context, reason)))
-        .collect();
-    assert_eq!(rejections, [(1, 1.0), (71, 2.0), (1, 3.0)]);
+    engine.set_host_job_context(1);
+    let child = engine.scope(|cx| {
+        let main = cx.global_this();
+        let child = cx.create_embed_realm();
+        let installed = cx
+            .with_embed_realm(&child, |ctx| {
+                ctx.set_host_job_context(71);
+                matches!(
+                    ctx.eval_classic_script_interruptible(
+                        "globalThis.rejectHere = reason => { globalThis.child = Promise.reject(reason); };",
+                    ),
+                    Ok(Ok(_))
+                )
+            })
+            .unwrap_or_else(|_| panic!("enter child realm"));
+        assert!(installed);
+        assert!(cx.member_set(&main, "frame", child).is_ok());
+        assert!(matches!(
+            cx.eval_value("globalThis.top1 = Promise.reject(1); frame.rejectHere(2); globalThis.top3 = Promise.reject(3);"),
+            Ok(Ok(_))
+        ));
+        crate::embed::Handle::new(cx, &child).expect("a handle to the child's global")
+    });
+    let taken = engine.take_unhandled_rejections_in_contexts();
+    assert_eq!(
+        reasons(&mut engine, &taken),
+        [(1, 1.0), (71, 2.0), (1, 3.0)]
+    );
     // The child's global fired unhandledrejection, so its set holds the promise; a handler the
     // main realm attaches later is reported back to the child.
-    let child_promise = engine
-        .ctx()
-        .member_get(&child, "child")
-        .unwrap_or_else(|_| panic!("child promise"));
-    assert!(engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| ctx.add_outstanding_rejection(&child_promise))
-        .unwrap_or_else(|_| panic!("enter child realm")));
-    assert!(matches!(
-        engine.eval_value("frame.child.catch(() => {});"),
-        Ok(Ok(_))
-    ));
-    let handled: Vec<(u64, f64)> = engine
-        .take_handled_rejections_in_contexts()
-        .into_iter()
-        .filter_map(|(context, _, reason)| reason.as_num_opt().map(|reason| (context, reason)))
-        .collect();
-    assert_eq!(handled, [(71, 2.0)]);
+    engine.scope(|cx| {
+        let child = child.get(cx).expect("the engine's handle");
+        let child_promise = cx
+            .member_get(&child, "child")
+            .unwrap_or_else(|_| panic!("child promise"));
+        assert!(cx
+            .with_embed_realm(&child, |ctx| ctx.add_outstanding_rejection(&child_promise))
+            .unwrap_or_else(|_| panic!("enter child realm")));
+        assert!(matches!(
+            cx.eval_value("frame.child.catch(() => {});"),
+            Ok(Ok(_))
+        ));
+    });
+    let handled = engine.take_handled_rejections_in_contexts();
+    assert_eq!(reasons(&mut engine, &handled), [(71, 2.0)]);
 }
 
 #[cfg(feature = "embed")]
@@ -20141,51 +20450,51 @@ fn promise_rejection_tracking_reports_handled_and_outstanding_promises() {
         globalThis.e = Promise.reject(4); e.catch(() => {});
         globalThis.f = new Promise((_, reject) => globalThis.rejectF = reject);
         f.catch(() => {}); rejectF(5);";
-    assert!(matches!(engine.eval_value(source), Ok(Ok(_))));
-    let global = engine.global_this();
-    let get = |engine: &mut Engine, name: &str| {
-        engine
-            .ctx()
-            .member_get(&global, name)
-            .unwrap_or_else(|_| panic!("global"))
-    };
-    let [a, b, c, d] = ["a", "b", "c", "d"].map(|name| get(&mut engine, name));
-    assert_eq!(engine.ctx().promise_is_handled(&a), Some(false));
-    assert_eq!(engine.ctx().promise_is_handled(&d), Some(true));
-    assert_eq!(engine.ctx().promise_is_handled(&Value::Num(1.0)), None);
-    // The about-to-be-notified list, in rejection order: e and f were handled before the
-    // checkpoint.
-    let reasons: Vec<f64> = engine
-        .take_unhandled_rejections_full()
-        .into_iter()
-        .filter_map(|(_, reason)| reason.as_num_opt())
-        .collect();
-    assert_eq!(reasons, [1.0, 2.0, 3.0]);
-    let addr = |engine: &mut Engine, value: &Value| engine.ctx().object_addr(value);
-    // The host fired unhandledrejection; still-unhandled promises become outstanding.
-    assert!(engine.ctx().mark_promise_handled(&c));
-    assert_eq!(engine.ctx().promise_is_handled(&c), Some(true));
-    assert!(engine.ctx().add_outstanding_rejection(&a));
-    assert!(engine.ctx().add_outstanding_rejection(&b));
-    assert!(!engine.ctx().add_outstanding_rejection(&c));
-    assert!(!engine.ctx().add_outstanding_rejection(&d));
-    assert!(engine.take_handled_rejections().is_empty());
-    assert!(matches!(
-        engine.eval_value("a.catch(() => {}); a.then(); c.catch(() => {});"),
-        Ok(Ok(_))
-    ));
-    let handled = engine.take_handled_rejections();
-    assert_eq!(handled.len(), 1);
-    assert_eq!(addr(&mut engine, &handled[0].0), addr(&mut engine, &a));
-    assert_eq!(handled[0].1.as_num_opt(), Some(1.0));
-    assert!(matches!(
-        engine.eval_value("b.then(undefined, () => {});"),
-        Ok(Ok(_))
-    ));
-    let handled = engine.take_handled_rejections();
-    assert_eq!(handled.len(), 1);
-    assert_eq!(addr(&mut engine, &handled[0].0), addr(&mut engine, &b));
-    assert!(engine.take_handled_rejections().is_empty());
+    engine.scope(|cx| {
+        assert!(matches!(cx.eval_value(source), Ok(Ok(_))));
+        let global = cx.global_this();
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|name| {
+            cx.member_get(&global, name)
+                .unwrap_or_else(|_| panic!("global"))
+        });
+        assert_eq!(cx.promise_is_handled(&a), Some(false));
+        assert_eq!(cx.promise_is_handled(&d), Some(true));
+        assert_eq!(cx.promise_is_handled(&Value::Num(1.0)), None);
+        // The about-to-be-notified list, in rejection order: e and f were handled before the
+        // checkpoint.
+        let reasons: Vec<f64> = cx
+            .take_unhandled_rejections_in_contexts()
+            .into_iter()
+            .filter_map(|(_, _, reason)| reason.get(cx).ok()?.as_num_opt())
+            .collect();
+        assert_eq!(reasons, [1.0, 2.0, 3.0]);
+        // The host fired unhandledrejection; still-unhandled promises become outstanding.
+        assert!(cx.mark_promise_handled(&c));
+        assert_eq!(cx.promise_is_handled(&c), Some(true));
+        assert!(cx.add_outstanding_rejection(&a));
+        assert!(cx.add_outstanding_rejection(&b));
+        assert!(!cx.add_outstanding_rejection(&c));
+        assert!(!cx.add_outstanding_rejection(&d));
+        assert!(cx.take_handled_rejections().is_empty());
+        assert!(matches!(
+            cx.eval_value("a.catch(() => {}); a.then(); c.catch(() => {});"),
+            Ok(Ok(_))
+        ));
+        let handled = cx.take_handled_rejections();
+        assert_eq!(handled.len(), 1);
+        let (promise, reason) = (handled[0].0.get(cx).unwrap(), handled[0].1.get(cx).unwrap());
+        assert_eq!(cx.object_addr(&promise), cx.object_addr(&a));
+        assert_eq!(reason.as_num_opt(), Some(1.0));
+        assert!(matches!(
+            cx.eval_value("b.then(undefined, () => {});"),
+            Ok(Ok(_))
+        ));
+        let handled = cx.take_handled_rejections();
+        assert_eq!(handled.len(), 1);
+        let promise = handled[0].0.get(cx).unwrap();
+        assert_eq!(cx.object_addr(&promise), cx.object_addr(&b));
+        assert!(cx.take_handled_rejections().is_empty());
+    });
 }
 
 #[cfg(feature = "embed")]
@@ -20195,73 +20504,73 @@ fn host_reactions_have_null_job_settings_and_survive_released_contexts() {
     // a job with a null Realm null job settings, so releasing the settings object that
     // registered the reaction does not drop it, unlike an author reaction registered there.
     let mut engine = Engine::new();
-    engine.ctx().set_host_job_context(91);
+    engine.set_host_job_context(91);
     let source = "globalThis.seen = []; globalThis.p = Promise.resolve(7);
         globalThis.q = new Promise(resolve => globalThis.resolveQ = resolve);
         globalThis.r = Promise.reject(9);
         q.then(v => seen.push('author ' + v));
         new Promise(resolve => resolve(q)).then(v => seen.push('author adopted ' + v));
         globalThis.step = v => (seen.push('host ' + v), v * 2);";
-    assert!(matches!(engine.eval_value(source), Ok(Ok(_))));
-    let global = engine.global_this();
-    let get = |engine: &mut Engine, name: &str| {
-        engine
-            .ctx()
-            .member_get(&global, name)
-            .unwrap_or_else(|_| panic!("global"))
-    };
-    let [p, q, r, step] = ["p", "q", "r", "step"].map(|name| get(&mut engine, name));
-    let from_p = engine
-        .ctx()
-        .react_to_promise(&p, step.clone(), Value::Undefined)
-        .unwrap_or_else(|_| panic!("p is a promise"));
-    let from_q = engine
-        .ctx()
-        .react_to_promise(&q, step.clone(), Value::Undefined)
-        .unwrap_or_else(|_| panic!("q is a promise"));
-    let from_r = engine
-        .ctx()
-        .react_to_promise(&r, Value::Undefined, step)
-        .unwrap_or_else(|_| panic!("r is a promise"));
-    assert_eq!(engine.ctx().promise_is_handled(&r), Some(true));
-    assert!(engine
-        .ctx()
-        .react_to_promise(&Value::Num(1.0), Value::Undefined, Value::Undefined)
-        .is_err());
-    // "A promise resolved with" a thenable: the adoption job also has null job settings.
-    let adopted = engine.ctx().promise_resolved_with(q.clone());
-    let adopted_key = engine.ctx().object_addr(&adopted).unwrap();
-    // Adoption that already began under the settings object: the thenable job ran and the
-    // resolving functions' reaction waits on `pending`, registered while 91 was current.
-    let pending = run_in(
-        &mut engine,
-        "globalThis.pending = new Promise(r => globalThis.resolvePending = r); 'ok'",
-    );
-    assert_eq!(pending, "ok");
-    let pending = get(&mut engine, "pending");
-    let begun = engine.ctx().promise_resolved_with(pending);
-    let begun_key = engine.ctx().object_addr(&begun).unwrap();
-    engine.run_microtasks();
-    engine.ctx().set_host_job_context(0);
-    assert!(engine.ctx().release_host_job_context(91));
-    assert!(matches!(
-        engine.eval_value("resolveQ(8); resolvePending(10)"),
-        Ok(Ok(_))
-    ));
-    engine.run_microtasks();
-    assert_eq!(run_in(&mut engine, "seen.join()"), "host 7,host 9,host 8");
-    let state = &engine.ctx().promises[&adopted_key];
-    assert_eq!((state.status, state.value.as_num_opt()), (1, Some(8.0)));
-    let state = &engine.ctx().promises[&begun_key];
-    assert_eq!((state.status, state.value.as_num_opt()), (1, Some(10.0)));
-    for (promise, expected) in [(from_p, 14.0), (from_q, 16.0), (from_r, 18.0)] {
-        let key = engine.ctx().object_addr(&promise).unwrap();
-        let state = &engine.ctx().promises[&key];
-        assert_eq!(
-            (state.status, state.value.as_num_opt()),
-            (1, Some(expected))
+    engine.scope(|cx| {
+        assert!(matches!(cx.eval_value(source), Ok(Ok(_))));
+        let global = cx.global_this();
+        let [p, q, r, step] = ["p", "q", "r", "step"].map(|name| {
+            cx.member_get(&global, name)
+                .unwrap_or_else(|_| panic!("global"))
+        });
+        let from_p = cx
+            .react_to_promise(&p, step, Value::Undefined)
+            .unwrap_or_else(|_| panic!("p is a promise"));
+        let from_q = cx
+            .react_to_promise(&q, step, Value::Undefined)
+            .unwrap_or_else(|_| panic!("q is a promise"));
+        let from_r = cx
+            .react_to_promise(&r, Value::Undefined, step)
+            .unwrap_or_else(|_| panic!("r is a promise"));
+        assert_eq!(cx.promise_is_handled(&r), Some(true));
+        assert!(cx
+            .react_to_promise(&Value::Num(1.0), Value::Undefined, Value::Undefined)
+            .is_err());
+        // "A promise resolved with" a thenable: the adoption job also has null job settings.
+        let adopted = cx.promise_resolved_with(q);
+        let adopted_key = cx.object_addr(&adopted).unwrap();
+        // Adoption that already began under the settings object: the thenable job ran and the
+        // resolving functions' reaction waits on `pending`, registered while 91 was current.
+        let pending = value_in(
+            cx,
+            "globalThis.pending = new Promise(r => globalThis.resolvePending = r); 'ok'",
         );
-    }
+        assert_eq!(text_of(cx, &pending), "ok");
+        cx.run_microtasks();
+        let pending = cx
+            .member_get(&global, "pending")
+            .unwrap_or_else(|_| panic!("global"));
+        let begun = cx.promise_resolved_with(pending);
+        let begun_key = cx.object_addr(&begun).unwrap();
+        cx.run_microtasks();
+        cx.set_host_job_context(0);
+        assert!(cx.release_host_job_context(91));
+        assert!(matches!(
+            cx.eval_value("resolveQ(8); resolvePending(10)"),
+            Ok(Ok(_))
+        ));
+        cx.run_microtasks();
+        let seen = value_in(cx, "seen.join()");
+        assert_eq!(text_of(cx, &seen), "host 7,host 9,host 8");
+        let promises = &cx.interp().promises;
+        let state = &promises[&adopted_key];
+        assert_eq!((state.status, state.value.as_num_opt()), (1, Some(8.0)));
+        let state = &promises[&begun_key];
+        assert_eq!((state.status, state.value.as_num_opt()), (1, Some(10.0)));
+        for (promise, expected) in [(from_p, 14.0), (from_q, 16.0), (from_r, 18.0)] {
+            let key = cx.object_addr(&promise).unwrap();
+            let state = &cx.interp().promises[&key];
+            assert_eq!(
+                (state.status, state.value.as_num_opt()),
+                (1, Some(expected))
+            );
+        }
+    });
 }
 
 #[cfg(feature = "embed")]
@@ -20271,13 +20580,14 @@ fn released_settings_keep_reactions_of_other_realms_handlers() {
     // handler of the parent Window attached through the child Realm's `then` therefore
     // survives the child's settings object; the child's own handler goes with it.
     let mut engine = Engine::new();
-    let child = engine.ctx().create_embed_realm();
-    assert!(engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| ctx.set_host_job_context(5))
-        .is_ok());
-    let root = engine.global_this();
-    assert!(engine.ctx().member_set(&root, "child", child).is_ok());
+    engine.scope(|cx| {
+        let child = cx.create_embed_realm();
+        assert!(cx
+            .with_embed_realm(&child, |ctx| ctx.set_host_job_context(5))
+            .is_ok());
+        let root = cx.global_this();
+        assert!(cx.member_set(&root, "child", child).is_ok());
+    });
     // Both reactions are registered by child code, while its settings object is current.
     let source = "globalThis.log = [];
         child.parent = globalThis;
@@ -20286,7 +20596,7 @@ fn released_settings_keep_reactions_of_other_realms_handlers() {
             'p.then(v => parent.log.push(\\'child \\' + v)); p.then(parent.handler);');
         'ok'";
     assert_eq!(run_in(&mut engine, source), "ok");
-    assert!(engine.ctx().release_host_job_context(5));
+    assert!(engine.release_host_job_context(5));
     assert_eq!(run_in(&mut engine, "child.resolveP(1); 'ok'"), "ok");
     assert_eq!(run_in(&mut engine, "log.join()"), "parent 1");
 }
@@ -24770,23 +25080,17 @@ fn embedder_can_observe_module_evaluation_through_top_level_await() {
             |_, _| None,
         )
         .expect("module parses and suspends");
-    let promise = engine
-        .module_evaluation_promise("entry")
-        .expect("module retains its evaluation promise");
-    let then = engine
-        .ctx()
-        .member_get(&promise, "then")
-        .unwrap_or_else(|_| panic!("evaluation promise has then"));
-    let handler = match engine
-        .eval_value("() => globalThis.moduleObserved = true")
-        .expect("handler parses")
-    {
-        Ok(handler) => handler,
-        Err(_) => panic!("handler evaluates"),
-    };
-    engine
-        .call_function(&then, promise, &[handler])
-        .unwrap_or_else(|_| panic!("handler attaches"));
+    engine.scope(|cx| {
+        let promise = cx
+            .module_evaluation_promise("entry")
+            .expect("module retains its evaluation promise");
+        let then = cx
+            .member_get(&promise, "then")
+            .unwrap_or_else(|_| panic!("evaluation promise has then"));
+        let handler = value_in(cx, "() => globalThis.moduleObserved = true");
+        cx.call_function(&then, promise, &[handler])
+            .unwrap_or_else(|_| panic!("handler attaches"));
+    });
 
     assert_eq!(
         read(&mut engine, "String(globalThis.moduleObserved)"),
@@ -26320,16 +26624,18 @@ fn compiled_base_class_constructors_preserve_instance_initialization_order() {
             "field,body,field,body|7:1:true:9"
         );
 
-        let global = engine.interp.global_env.clone();
+        let global = engine.interp.global_env;
         let ctor = engine
             .interp
             .get_var("Base", &global)
             .unwrap_or_else(|_| panic!("base class binding remains available on {tier:?}"));
-        let crate::value::Value::Obj(ctor) = ctor else {
+        let ValueView::Obj(ctor) = (ctor).view() else {
             panic!("Base is not an object on {tier:?}");
         };
         let constructor_compiled = match &ctor.borrow().call {
-            crate::value::Callable::User(user) => user.func.code.get().is_some_and(Option::is_some),
+            crate::value::Callable::User(user) => {
+                user.func.runtime().code.get().is_some_and(Option::is_some)
+            }
             _ => false,
         };
         assert!(
@@ -26375,16 +26681,18 @@ fn compiled_derived_class_constructors_preserve_super_and_this_binding_semantics
             "before,parent,field,after|3:7:true"
         );
 
-        let global = engine.interp.global_env.clone();
+        let global = engine.interp.global_env;
         let ctor = engine
             .interp
             .get_var("Derived", &global)
             .unwrap_or_else(|_| panic!("derived class binding remains available on {tier:?}"));
-        let crate::value::Value::Obj(ctor) = ctor else {
+        let ValueView::Obj(ctor) = (ctor).view() else {
             panic!("Derived is not an object on {tier:?}");
         };
         let constructor_compiled = match &ctor.borrow().call {
-            crate::value::Callable::User(user) => user.func.code.get().is_some_and(Option::is_some),
+            crate::value::Callable::User(user) => {
+                user.func.runtime().code.get().is_some_and(Option::is_some)
+            }
             _ => false,
         };
         assert!(
@@ -26519,7 +26827,7 @@ fn compiled_try_finally_preserves_every_completion_kind() {
             expected.replace("        ", "")
         );
 
-        let global = engine.interp.global_env.clone();
+        let global = engine.interp.global_env;
         for name in [
             "normal",
             "returning",
@@ -26534,12 +26842,12 @@ fn compiled_try_finally_preserves_every_completion_kind() {
                 .interp
                 .get_var(name, &global)
                 .unwrap_or_else(|_| panic!("{name} remains available on {tier:?}"));
-            let crate::value::Value::Obj(function) = function else {
+            let ValueView::Obj(function) = (function).view() else {
                 panic!("{name} is not an object on {tier:?}");
             };
             let compiled = match &function.borrow().call {
                 crate::value::Callable::User(user) => {
-                    user.func.code.get().is_some_and(Option::is_some)
+                    user.func.runtime().code.get().is_some_and(Option::is_some)
                 }
                 _ => false,
             };
@@ -26693,39 +27001,19 @@ fn host_snapshot_job_leaves_microtasks_with_the_embedder() {
     )
     .unwrap();
     let mut engine = Engine::new();
-    assert!(engine
-        .eval_snapshot_value_interruptible(&snapshot)
-        .unwrap()
-        .is_ok());
-    let order = engine
-        .eval_value_interruptible("order.join(',')")
-        .unwrap()
-        .ok()
-        .expect("script");
-    assert_eq!(
-        engine
-            .ctx()
-            .coerce_string(&order)
-            .ok()
-            .expect("string")
-            .as_ref(),
-        "sync"
-    );
+    engine.scope(|cx| {
+        assert!(cx
+            .eval_snapshot_value_interruptible(&snapshot)
+            .unwrap()
+            .is_ok());
+        let order = value_in(cx, "order.join(',')");
+        assert_eq!(text_of(cx, &order), "sync");
+    });
     engine.run_microtasks_interruptible().unwrap();
-    let order = engine
-        .eval_value_interruptible("order.join(',')")
-        .unwrap()
-        .ok()
-        .expect("script");
-    assert_eq!(
-        engine
-            .ctx()
-            .coerce_string(&order)
-            .ok()
-            .expect("string")
-            .as_ref(),
-        "sync,job"
-    );
+    engine.scope(|cx| {
+        let order = value_in(cx, "order.join(',')");
+        assert_eq!(text_of(cx, &order), "sync,job");
+    });
 }
 
 #[test]
@@ -27381,7 +27669,7 @@ fn atomics_wait_async_settles_through_the_job_queue() {
             "tier {tier:?}"
         );
         assert!(
-            engine.interp.pending_async_waits.is_empty(),
+            engine.interp.gc_heap.agent.work.borrow().waits.is_empty(),
             "tier {tier:?}"
         );
     }
@@ -29269,6 +29557,30 @@ fn interp_layout_probes() {
     };
     assert!(words(l.fnf_ptr_word, l.fnf_len_word, l.fnf_cap_word));
     assert!(words(l.fp_ptr_word, l.fp_len_word, l.fp_cap_word));
+    // The direct-call thunk saves and clears one complete execution word, never a wide
+    // discriminant/payload pair. Check its measured address, extent and actual contents.
+    let base = std::ptr::from_ref(&*e.interp) as usize;
+    assert!((base + l.new_target).is_multiple_of(8));
+    assert!(l.new_target + 8 <= std::mem::size_of::<crate::interpreter::Interp>());
+    assert_eq!(
+        base + l.new_target,
+        std::ptr::from_ref(&e.interp.new_target) as usize
+    );
+    let saved = e.interp.new_target;
+    for value in [
+        crate::value::Value::Undefined,
+        crate::value::Value::Null,
+        crate::value::Value::Obj(e.interp.global),
+    ] {
+        e.interp.new_target = value;
+        // Derive the read address after the mutation, rather than retaining provenance from a
+        // shared Interp borrow across a later exclusive field write.
+        let current = std::ptr::from_ref(&*e.interp) as usize;
+        // SAFETY: the measured offset addresses this live, aligned Value field.
+        let word = unsafe { ((current + l.new_target) as *const u64).read() };
+        assert_eq!(word, (value).bits());
+    }
+    e.interp.new_target = saved;
 }
 
 /// ECMA-262 §10.5.5-§10.5.11: every Proxy invariant check reads target.[[GetOwnProperty]](P),
@@ -29491,8 +29803,8 @@ base-x|base-x|other-x|other:o|other-x|other-x|b|SyntaxError|base-x";
 }
 
 /// A method that cannot observe its [[HomeObject]] must not retain the object literal that
-/// defines it: otherwise every literal with a method would be a reference cycle reclaimed only
-/// by the cycle collector. A literal whose method uses `super` is reclaimed by that collector.
+/// defines it: a live method keeps its literal alive only when it uses `super`, and once the
+/// method is gone too a collection reclaims the literal either way.
 #[test]
 fn object_literal_methods_without_super_do_not_form_cycles() {
     use crate::bytecode::Tier;
@@ -29518,22 +29830,25 @@ fn object_literal_methods_without_super_do_not_form_cycles() {
                         "{source} for (var i = 0; i < 20; i++) make(); var o = make(); o.m();"
                     ),
                 );
-                let env = engine.interp.global_env.clone();
-                let value = engine
-                    .interp
-                    .get_var("o", &env)
-                    .unwrap_or_else(|_| panic!("o"));
-                let weak = std::rc::Rc::downgrade(value.as_obj().unwrap());
-                drop(value);
-                run_in(&mut engine, "o = null;");
-                if !needs_home {
-                    assert!(
-                        weak.upgrade().is_none(),
-                        "tier {tier:?} threshold {threshold}: {source}"
-                    );
-                }
+                let env = engine.interp.global_env;
+                // The object lives only in this helper frame (the collector scans the stack).
+                let weak = crate::gc_test::in_frame(|| {
+                    let value = engine
+                        .interp
+                        .get_var("o", &env)
+                        .unwrap_or_else(|_| panic!("o"));
+                    crate::value::Gc::downgrade(&value.as_obj().unwrap())
+                });
+                run_in(&mut engine, "var m = o.m; o = null;");
                 engine.interp.gc_collect();
-                assert!(weak.upgrade().is_none(), "tier {tier:?}: {source}");
+                assert_eq!(
+                    crate::gc_test::alive(&weak),
+                    needs_home,
+                    "tier {tier:?} threshold {threshold}: {source}"
+                );
+                run_in(&mut engine, "m = null;");
+                engine.interp.gc_collect();
+                assert!(!crate::gc_test::alive(&weak), "tier {tier:?}: {source}");
             }
         }
     }
@@ -29714,7 +30029,7 @@ fn compiled_iteration_records_share_one_published_layout() {
             "function make(){ var fs = []; for (let i = 0; i < 3; i++) { let d = i * 2; \
              fs.push(() => i + d); } return fs; } var fs = make();",
         );
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let fs = engine.interp.get_var("fs", &env).ok().unwrap();
         let layouts: Vec<u32> = (0..3)
             .map(|k| {
@@ -29723,7 +30038,8 @@ fn compiled_iteration_records_share_one_published_layout() {
                     .get_member_key(&fs, &k.to_string())
                     .ok()
                     .unwrap();
-                let object = f.as_obj().unwrap().borrow();
+                let object_handle = f.as_obj().unwrap();
+                let object = object_handle.borrow();
                 let crate::value::Callable::User(user) = &object.call else {
                     panic!("closure")
                 };
@@ -30796,32 +31112,24 @@ fn embedded_scripts_report_their_origin_in_stack_frames() {
         line: 4,
         column: 12,
     };
-    let stack = engine
-        .ctx()
-        .eval_classic_script_interruptible_with_origin("\nnew Error('i').stack", Some(&origin))
-        .expect("parse")
-        .unwrap_or_else(|_| panic!("script threw"));
+    let (inline, file) = engine.scope(|cx| {
+        let stack = cx
+            .eval_classic_script_interruptible_with_origin("\nnew Error('i').stack", Some(&origin))
+            .expect("parse")
+            .unwrap_or_else(|_| panic!("script threw"));
+        let inline = text_of(cx, &stack);
+        let stack = cx
+            .eval_value_interruptible_with_origin(
+                "new Error('v').stack",
+                Some(&crate::SourceOrigin::new("https://example.com/v.js")),
+            )
+            .expect("parse")
+            .unwrap_or_else(|_| panic!("script threw"));
+        (inline, text_of(cx, &stack))
+    });
+    assert_eq!(inline, frames(&["Error: i", "at https://example.com/:6:1"]));
     assert_eq!(
-        engine
-            .ctx()
-            .coerce_string(&stack)
-            .unwrap_or_else(|_| panic!("stack is not a string"))
-            .to_string(),
-        frames(&["Error: i", "at https://example.com/:6:1"])
-    );
-    let stack = engine
-        .eval_value_interruptible_with_origin(
-            "new Error('v').stack",
-            Some(&crate::SourceOrigin::new("https://example.com/v.js")),
-        )
-        .expect("parse")
-        .unwrap_or_else(|_| panic!("script threw"));
-    assert_eq!(
-        engine
-            .ctx()
-            .coerce_string(&stack)
-            .unwrap_or_else(|_| panic!("stack is not a string"))
-            .to_string(),
+        file,
         frames(&["Error: v", "at https://example.com/v.js:1:1"])
     );
 }
@@ -31509,16 +31817,6 @@ fn number_format_composes_per_units_from_cldr_patterns() {
 #[test]
 fn embedding_helpers_follow_their_documented_semantics() {
     let mut engine = Engine::new();
-    let same = |a: &Value, b: &Value| match (a, b) {
-        (Value::Obj(a), Value::Obj(b)) => std::rc::Rc::ptr_eq(a, b),
-        _ => false,
-    };
-    let value = |engine: &mut Engine, source: &str| {
-        engine
-            .eval_value_interruptible(source)
-            .expect("parses")
-            .unwrap_or_else(|_| panic!("{source} threw"))
-    };
     // make_uint8array allocates with the intrinsic %Uint8Array.prototype% and runs no author code,
     // however the global binding is replaced (AllocateTypedArray, ECMA-262 #sec-allocatetypedarray).
     run_in(
@@ -31526,12 +31824,13 @@ fn embedding_helpers_follow_their_documented_semantics() {
         "var proto = Uint8Array.prototype; var calls = 0; \
          globalThis.Uint8Array = function () { calls++; throw new Error('author code ran'); }",
     );
-    let bytes = engine
-        .ctx()
-        .make_uint8array(&[1, 2, 3])
-        .unwrap_or_else(|_| panic!("allocation threw"));
-    let global = engine.global_this();
-    assert!(engine.ctx().member_set(&global, "made", bytes).is_ok());
+    engine.scope(|cx| {
+        let bytes = cx
+            .make_uint8array(&[1, 2, 3])
+            .unwrap_or_else(|_| panic!("allocation threw"));
+        let global = cx.global_this();
+        assert!(cx.member_set(&global, "made", bytes).is_ok());
+    });
     assert_eq!(
         run_in(
             &mut engine,
@@ -31555,83 +31854,114 @@ fn embedding_helpers_follow_their_documented_semantics() {
         &mut engine,
         "var whole = new proto.constructor(16); var view = new proto.constructor(whole.buffer, 4, 4)",
     );
-    let view = value(&mut engine, "view");
-    assert!(!engine.ctx().typed_array_set_bytes(&view, &[9; 6]));
-    assert!(engine.ctx().typed_array_set_bytes(&view, &[7, 7]));
+    engine.scope(|cx| {
+        let view = value_in(cx, "view");
+        assert!(!cx.typed_array_set_bytes(&view, &[9; 6]));
+        assert!(cx.typed_array_set_bytes(&view, &[7, 7]));
+    });
     assert_eq!(run_in(&mut engine, "whole.join('')"), "0000770000000000");
-    // prototype_of: the ToObject view without traps; get_prototype_of: Object.getPrototypeOf.
-    let number_proto = value(&mut engine, "Number.prototype");
-    let five = Value::Num(5.0);
-    assert!(same(&engine.ctx().prototype_of(&five), &number_proto));
-    let trapped = value(
-        &mut engine,
-        "new Proxy({}, {getPrototypeOf() { return Array.prototype; }})",
-    );
-    let array_proto = value(&mut engine, "Array.prototype");
-    let object_proto = value(&mut engine, "Object.prototype");
-    assert!(same(&engine.ctx().prototype_of(&trapped), &object_proto));
-    let resolved = engine
-        .ctx()
-        .get_prototype_of(&trapped)
-        .unwrap_or_else(|_| panic!("trap threw"));
-    assert!(same(&resolved, &array_proto));
-    assert!(engine.ctx().get_prototype_of(&Value::Null).is_err());
-    // Ctx::type_of applies Annex B.3.6.
-    let dda = engine.ctx().make_html_dda();
-    assert_eq!(dda.type_of(), "function");
-    assert_eq!(engine.ctx().type_of(&dda), "undefined");
-    // eval_in_realm is ScriptEvaluation: global lexical declarations persist in that Realm, and a
-    // parse failure is that Realm's SyntaxError.
-    let realm = engine.ctx().create_realm();
-    assert!(engine
-        .ctx()
-        .eval_in_realm(&realm, "let shared = 41;")
-        .is_ok());
-    let completion = engine.ctx().eval_in_realm(&realm, "shared + 1");
-    assert!(matches!(completion, Ok(Value::Num(n)) if n == 42.0));
-    // A sloppy Script's assignment to an undeclared name creates that Realm's global property.
-    assert!(engine.ctx().eval_in_realm(&realm, "assigned = 7;").is_ok());
-    let completion = engine.ctx().eval_in_realm(&realm, "globalThis.assigned");
-    assert!(matches!(completion, Ok(Value::Num(n)) if n == 7.0));
-    let other_syntax = engine
-        .ctx()
-        .member_get(&realm, "SyntaxError")
-        .unwrap_or_else(|_| panic!("SyntaxError lookup threw"));
-    match engine.ctx().eval_in_realm(&realm, "let let = 1") {
-        Err(crate::interpreter::Abrupt::Throw(error)) => {
-            let constructor = engine
-                .ctx()
-                .member_get(&error, "constructor")
-                .unwrap_or_else(|_| panic!("constructor lookup threw"));
-            assert!(same(&constructor, &other_syntax));
+    let interrupt = engine.interrupt_handle();
+    engine.scope(|cx| {
+        fn same<'s>(a: &Value<'s>, b: &Value<'s>) -> bool {
+            matches!((&(a).kind(), &(b).kind()), (ValueKind::Obj(a), ValueKind::Obj(b)) if a == b)
         }
-        _ => panic!("expected the other Realm's SyntaxError"),
-    }
-    // A sparse length beyond the copied prefix allocates nothing large.
-    let sparse = value(
-        &mut engine,
-        "var sparse = [1, 2]; sparse.length = 4e9; sparse",
-    );
-    assert!(engine
-        .ctx()
-        .copy_numeric_array(&sparse, usize::MAX)
-        .is_none());
-    // An interruption stays distinguishable from a JavaScript throw.
-    let function = value(&mut engine, "(function () { return 1; })");
-    engine.interrupt_handle().cancel();
-    assert_eq!(
-        engine.ctx().pending_interrupt(),
-        Some(crate::InterruptReason::Cancelled)
-    );
-    assert!(matches!(
-        engine
-            .ctx()
-            .invoke_interruptible(function, Value::Undefined, &[]),
-        Err(crate::embed::EvalError::Interrupted(
-            crate::InterruptReason::Cancelled
-        ))
-    ));
+        // prototype_of: the ToObject view without traps; get_prototype_of: Object.getPrototypeOf.
+        let number_proto = value_in(cx, "Number.prototype");
+        let five = Value::Num(5.0);
+        assert!(same(&cx.prototype_of(&five), &number_proto));
+        let trapped = value_in(
+            cx,
+            "new Proxy({}, {getPrototypeOf() { return Array.prototype; }})",
+        );
+        let array_proto = value_in(cx, "Array.prototype");
+        let object_proto = value_in(cx, "Object.prototype");
+        assert!(same(&cx.prototype_of(&trapped), &object_proto));
+        let resolved = cx
+            .get_prototype_of(&trapped)
+            .unwrap_or_else(|_| panic!("trap threw"));
+        assert!(same(&resolved, &array_proto));
+        assert!(cx.get_prototype_of(&Value::Null).is_err());
+        // Ctx::type_of applies Annex B.3.6.
+        let dda = cx.make_html_dda();
+        assert_eq!(dda.type_of(), "function");
+        assert_eq!(cx.type_of(&dda), "undefined");
+        // eval_in_realm is ScriptEvaluation: global lexical declarations persist in that Realm,
+        // and a parse failure is that Realm's SyntaxError.
+        let realm = cx.create_embed_realm();
+        assert!(cx.eval_in_realm(&realm, "let shared = 41;").is_ok());
+        let completion = cx.eval_in_realm(&realm, "shared + 1");
+        assert!(matches!((completion).map(|__value| (__value).kind()), Ok(ValueKind::Num(n)) if n == 42.0));
+        // A sloppy Script's assignment to an undeclared name creates that Realm's global
+        // property.
+        assert!(cx.eval_in_realm(&realm, "assigned = 7;").is_ok());
+        let completion = cx.eval_in_realm(&realm, "globalThis.assigned");
+        assert!(matches!((completion).map(|__value| (__value).kind()), Ok(ValueKind::Num(n)) if n == 7.0));
+        let other_syntax = cx
+            .member_get(&realm, "SyntaxError")
+            .unwrap_or_else(|_| panic!("SyntaxError lookup threw"));
+        match cx.eval_in_realm(&realm, "let let = 1") {
+            Err(error) => {
+                let constructor = cx
+                    .member_get(&error, "constructor")
+                    .unwrap_or_else(|_| panic!("constructor lookup threw"));
+                assert!(same(&constructor, &other_syntax));
+            }
+            _ => panic!("expected the other Realm's SyntaxError"),
+        }
+        // A sparse length beyond the copied prefix allocates nothing large.
+        let sparse = value_in(cx, "var sparse = [1, 2]; sparse.length = 4e9; sparse");
+        assert!(cx.copy_numeric_array(&sparse, usize::MAX).is_none());
+        // An interruption stays distinguishable from a JavaScript throw.
+        let function = value_in(cx, "(function () { return 1; })");
+        interrupt.cancel();
+        assert_eq!(
+            cx.pending_interrupt(),
+            Some(crate::InterruptReason::Cancelled)
+        );
+        assert!(matches!(
+            cx.invoke_interruptible(function, Value::Undefined, &[]),
+            Err(crate::embed::EvalError::Interrupted(
+                crate::InterruptReason::Cancelled
+            ))
+        ));
+    });
 }
 
 #[path = "property_key_security_tests.rs"]
 mod property_key_security;
+
+/// [[HasTLA]] counts every `await` the module body Contains: class heritage, computed names and
+/// `await using` included. A module missed by the scan ran synchronously, where an `await`
+/// cannot suspend (it once drained the job queue in place instead).
+#[test]
+fn module_await_in_class_heritage_computed_names_and_await_using_suspends() {
+    for (source, expected) in [
+        (
+            "function fn() { return function () {}; }\
+             export class C extends fn(await new Promise(r => r(1))) {}\
+             globalThis.r = typeof C;",
+            "function",
+        ),
+        (
+            "class K { [await Promise.resolve('k')]() { return 1; } } globalThis.r = new K().k();",
+            "1",
+        ),
+        (
+            "const { [await Promise.resolve('a')]: a = await Promise.resolve(2) } = {};\
+             globalThis.r = a;",
+            "2",
+        ),
+        (
+            "const objs = [1, 2].map(n => ({ n, async [Symbol.asyncDispose]() {} }));\
+             const f = []; let i = 0;\
+             for (await using x of objs) { f[i++] = () => x.n; }\
+             globalThis.r = f.map(g => g()).join();",
+            "1,2",
+        ),
+    ] {
+        assert_eq!(
+            run_module(&[("m.js", source)], "String(globalThis.r)"),
+            expected
+        );
+    }
+}

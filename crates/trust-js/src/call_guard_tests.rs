@@ -1,10 +1,11 @@
 //! Callee-local fast paths in Agents containing proxies. ECMA-262 snapshot e28783d5:
 //! Proxy [[Call]] / [[Construct]] (spec.html:16541,16568), Object.hasOwn (31428).
 
+use crate::value::ValueView;
 use std::rc::Rc;
 
 use crate::bytecode::{Chunk, Tier};
-use crate::value::{Callable, Gc, Value};
+use crate::value::{Callable, Gc};
 use crate::{Completion, Engine};
 
 fn eval(engine: &mut Engine, source: &str) -> String {
@@ -15,12 +16,12 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
-    let env = engine.interp.global_env.clone();
-    let Value::Obj(object) = engine
+    let env = engine.interp.global_env;
+    let ValueView::Obj(object) = (engine
         .interp
         .get_var(name, &env)
-        .unwrap_or_else(|_| panic!("missing {name}"))
-    else {
+        .unwrap_or_else(|_| panic!("missing {name}")))
+    .view() else {
         panic!("{name} is not an object")
     };
     object
@@ -32,11 +33,9 @@ fn chunk(engine: &mut Engine, name: &str) -> Rc<Chunk> {
     let Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
-    let chunk = user
-        .func
-        .code2
-        .get()
-        .or_else(|| user.func.code.get())
+    let runtime = user.func.runtime();
+    let chunk = runtime
+        .execution_code()
         .and_then(Option::as_ref)
         .expect("compiled caller")
         .clone();
@@ -96,13 +95,13 @@ fn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() 
         if tier == Tier::Jit {
             let driver = chunk(&mut engine, "mapDrive");
             let entry = driver
-                .cached_call_for(Rc::as_ptr(&method) as usize)
+                .cached_call_for(Gc::as_ptr(&method) as usize)
                 .expect("private self-hosted method fills the native call cache");
             assert_eq!(entry.native, 0);
-            assert_eq!(entry.realm, Rc::as_ptr(&engine.interp.global) as usize);
+            assert_eq!(entry.realm, Gc::as_ptr(&engine.interp.global) as usize);
             assert_eq!(
                 entry.global_env,
-                Rc::as_ptr(&engine.interp.global_env) as usize
+                crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize
             );
             assert!(!entry.code.is_null());
             assert!(driver.jit_runs.get() > 0);
@@ -150,13 +149,19 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
     );
     let leaf = object(&mut engine, "realmLeaf");
     let driver = chunk(&mut engine, "realmDrive");
-    let old_environment = engine.interp.global_env.clone();
+    let old_environment = engine.interp.global_env;
     let previous = driver
-        .cached_call_for(Rc::as_ptr(&leaf) as usize)
+        .cached_call_for(Gc::as_ptr(&leaf) as usize)
         .expect("initial same-Realm cache fill");
-    assert_eq!(previous.global_env, Rc::as_ptr(&old_environment) as usize);
+    assert_eq!(
+        previous.global_env,
+        crate::interpreter::Env::as_ptr(&old_environment) as usize
+    );
     engine.interp.switch_host_job_context(102);
-    assert!(!Rc::ptr_eq(&old_environment, &engine.interp.global_env));
+    assert!(!crate::interpreter::Env::ptr_eq(
+        &old_environment,
+        &engine.interp.global_env
+    ));
     assert_eq!(
         eval(
             &mut engine,
@@ -168,14 +173,14 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
         "8"
     );
     let current = driver
-        .cached_call_for(Rc::as_ptr(&leaf) as usize)
+        .cached_call_for(Gc::as_ptr(&leaf) as usize)
         .expect("creation Realm remains cacheable with a replaced global environment");
     assert_ne!(current.global_env, previous.global_env);
     assert_eq!(
         current.global_env,
-        Rc::as_ptr(&engine.interp.global_env) as usize
+        crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize
     );
-    assert_eq!(current.realm, Rc::as_ptr(&engine.interp.global) as usize);
+    assert_eq!(current.realm, Gc::as_ptr(&engine.interp.global) as usize);
     assert_eq!(
         eval(
             &mut engine,
@@ -205,7 +210,7 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
         let target = object(&mut engine, name);
         assert!(
             driver
-                .cached_call_for(Rc::as_ptr(&target) as usize)
+                .cached_call_for(Gc::as_ptr(&target) as usize)
                 .is_none(),
             "{name} retains checked generic dispatch"
         );
@@ -246,20 +251,22 @@ fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {
             for (var n=0; n<12; n++) checkedDrive(victim, 0);
         "#,
         );
-        let victim = object(&mut engine, "victim");
-        let token = object(&mut engine, "token");
-        let victim_weak = Rc::downgrade(&victim);
-        let token_weak = Rc::downgrade(&token);
-        let driver = chunk(&mut engine, "checkedDrive");
-        let entry = driver
-            .cached_call_for(Rc::as_ptr(&victim) as usize)
-            .expect("capturing callee is cached");
-        assert_ne!(
-            entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV,
-            0,
-            "activation-homed callee forces the checked helper rather than direct machine call"
-        );
-        drop((victim, token));
+        // The handles, and the cached entry's raw callee and environment addresses, live only
+        // in this helper frame (the collector scans the stack).
+        let (victim_weak, token_weak) = crate::gc_test::in_frame(|| {
+            let victim = object(&mut engine, "victim");
+            let token = object(&mut engine, "token");
+            let driver = chunk(&mut engine, "checkedDrive");
+            let entry = driver
+                .cached_call_for(Gc::as_ptr(&victim) as usize)
+                .expect("capturing callee is cached");
+            assert_ne!(
+                entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV,
+                0,
+                "activation-homed callee forces the checked helper rather than direct machine call"
+            );
+            (Gc::downgrade(&victim), Gc::downgrade(&token))
+        });
         eval(&mut engine, "token = null");
         let result = eval(
             &mut engine,
@@ -309,16 +316,12 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
         assert_eq!(eval(&mut engine, &source), "56", "{tier:?}");
         let deep = object(&mut engine, "deep");
         let mut current = match &deep.borrow().call {
-            Callable::User(user) => user.env.clone(),
+            Callable::User(user) => user.env,
             _ => panic!("deep user closure"),
         };
         let mut depth = 0;
-        while !Rc::ptr_eq(&current, &engine.interp.global_env) {
-            let next = current
-                .borrow()
-                .parent
-                .clone()
-                .expect("global root retained");
+        while !crate::interpreter::Env::ptr_eq(&current, &engine.interp.global_env) {
+            let next = current.borrow().parent.expect("global root retained");
             current = next;
             depth += 1;
         }
@@ -329,12 +332,12 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
         if tier == Tier::Jit {
             let driver = chunk(&mut engine, "deepDrive");
             let entry = driver
-                .cached_call_for(Rc::as_ptr(&deep) as usize)
+                .cached_call_for(Gc::as_ptr(&deep) as usize)
                 .expect("deep same-Realm closure fills the native call cache");
             assert_eq!(
                 entry.env,
                 match &deep.borrow().call {
-                    Callable::User(user) => Rc::as_ptr(&user.env),
+                    Callable::User(user) => crate::interpreter::Env::as_ptr(&user.env),
                     _ => unreachable!(),
                 }
             );
@@ -373,14 +376,14 @@ fn proxies_do_not_disable_ordinary_call_and_construct_cache_fill() {
     for name in ["leaf", "native"] {
         let target = object(&mut engine, name);
         let entry = driver
-            .cached_call_for(Rc::as_ptr(&target) as usize)
+            .cached_call_for(Gc::as_ptr(&target) as usize)
             .unwrap_or_else(|| panic!("{name} did not fill its call cache with a live proxy"));
         assert_eq!(entry.native != 0, name == "native");
     }
     let maker = chunk(&mut engine, "maker");
     let target = object(&mut engine, "Box");
     assert!(
-        maker.cached_construct_for(Rc::as_ptr(&target) as usize),
+        maker.cached_construct_for(Gc::as_ptr(&target) as usize),
         "ordinary construction remained uncached"
     );
 }
@@ -418,7 +421,7 @@ fn fresh_closure_call_cache_uses_the_live_function_identity() {
             let driver = chunk(&mut engine, "drive");
             let original = object(&mut engine, "original");
             let entry = driver
-                .cached_call_for(Rc::as_ptr(&original) as usize)
+                .cached_call_for(Gc::as_ptr(&original) as usize)
                 .expect("original closure filled the call cache");
             assert_ne!(entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV, 0);
         }

@@ -6,6 +6,7 @@
 //! they must be uniform across tiers, and interruption must never run author cleanup.
 
 use crate::interpreter::{Abrupt, Interp, MAX_ARGUMENTS_LEN, MAX_ARRAY_OP_LEN};
+use crate::value::ValueView;
 use crate::value::{Property, Value};
 
 impl Interp {
@@ -28,9 +29,11 @@ impl Interp {
         done: &mut bool,
         limit: usize,
     ) -> Result<Vec<Value>, Abrupt> {
-        let mut values = Vec::new();
+        // Rooted while the iterator runs author code (I1); the caller consumes the result
+        // before its next safepoint.
+        let mut values = crate::rooting::RootedVec::new();
         if *done {
-            return Ok(values);
+            return Ok(values.into_vec());
         }
         self.interrupt_poll_force()?;
         if crate::builtins::inert_array_iterator_remaining(self, iterator, next)
@@ -45,7 +48,7 @@ impl Interp {
             }
             *done = true;
             let Some(value) = self.iterator_step(iterator, next)? else {
-                return Ok(values);
+                return Ok(values.into_vec());
             };
             *done = false;
             if values.len() >= limit {
@@ -62,7 +65,7 @@ impl Interp {
         array: &Value,
         value: Option<Value>,
     ) -> Result<(), Abrupt> {
-        let Value::Obj(array) = array else {
+        let ValueView::Obj(array) = &(array).view() else {
             unreachable!("literal builder retains an Array")
         };
         let index = self.array_length(array);
@@ -84,10 +87,12 @@ impl Interp {
         Ok(())
     }
 
+    /// The list (prefix and yielded values) is rooted while the iterator runs author code (I1);
+    /// the caller consumes it, normally by calling with it, before its next safepoint.
     pub(crate) fn append_spread_arguments(
         &mut self,
         spread: &Value,
-        arguments: &mut Vec<Value>,
+        arguments: &mut crate::rooting::RootedVec,
     ) -> Result<(), Abrupt> {
         self.expand_spread_bounded(spread, arguments.len(), MAX_ARGUMENTS_LEN, |_, value| {
             arguments.push(value);
@@ -97,7 +102,7 @@ impl Interp {
 
     pub(crate) fn append_argument(
         &mut self,
-        arguments: &mut Vec<Value>,
+        arguments: &mut crate::rooting::RootedVec,
         value: Value,
     ) -> Result<(), Abrupt> {
         if arguments.len() >= MAX_ARGUMENTS_LEN {
@@ -129,7 +134,7 @@ impl Interp {
         mut append: impl FnMut(&mut Interp, Value) -> Result<(), Abrupt>,
     ) -> Result<(), Abrupt> {
         self.interrupt_poll_force()?;
-        if let Value::Str(text) = spread {
+        if let ValueView::Str(text) = &(spread).view() {
             if crate::builtins::intrinsic_string_iterator_is_unmodified(self) {
                 for point in crate::jstr::CodePointIter::new(text) {
                     if count & 255 == 0 {
@@ -155,7 +160,7 @@ impl Interp {
         // Only a proven intrinsic iterator permits using the Array's private length. An Array
         // with an own/custom iterator may have an enormous length but yield just one value.
         if crate::builtins::array_iterator_fast_path_is_safe(self, spread) {
-            let Value::Obj(array) = spread else {
+            let ValueView::Obj(array) = &(spread).view() else {
                 unreachable!()
             };
             let length = self.array_length(array);
@@ -445,7 +450,7 @@ mod tests {
                 "var reads=0,src={{[Symbol.iterator](){{return {{next(){{reads++;{body}}}}};}}}};"
             ),
             );
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let source = engine.interp.get_var("src", &env).ok().unwrap();
             let (iterator, next) = engine.interp.get_iterator(&source).ok().unwrap();
             let mut actual_done = false;
@@ -472,7 +477,7 @@ mod tests {
             "#
                 ),
             );
-            let env = engine.interp.global_env.clone();
+            let env = engine.interp.global_env;
             let src = engine.interp.get_var("src", &env).ok().unwrap();
             let mut output = Vec::new();
             let completion = engine.interp.expand_spread_bounded(&src, 2, 4, |_, value| {

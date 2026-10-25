@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 thread_local! {
     /// Exact native identities; the call cache validates their Realm and live callee object.
@@ -132,16 +133,17 @@ fn dv_put(
 
 /// ToIndex's common Number/undefined inputs avoid cloning and general coercion dispatch.
 fn dv_index(i: &mut Interp, args: &[Value]) -> Result<usize, Value> {
-    match args.first() {
-        None | Some(Value::Undefined) => Ok(0),
-        Some(Value::Num(n)) => {
+    let value = arg(args, 0);
+    match value.view() {
+        ValueView::Undefined => Ok(0),
+        ValueView::Num(n) => {
             let n = if n.is_nan() { 0.0 } else { n.trunc() };
             if !(0.0..=9007199254740991.0).contains(&n) {
                 return Err(i.make_error("RangeError", "index out of range"));
             }
             Ok(n as usize)
         }
-        Some(value) => to_index(i, value),
+        _ => to_index(i, &value),
     }
 }
 fn dv_buffer_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
@@ -256,8 +258,8 @@ fn dv_set_big(i: &mut Interp, this: &Value, args: &[Value]) -> Result<Value, Val
 }
 
 pub(super) fn install_dataview(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("DataView", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("DataView", proto);
     // buffer / byteLength / byteOffset are brand-checked accessor getters; byteLength/byteOffset
     // additionally throw if the backing buffer has been detached.
     for (name, getter) in [
@@ -345,22 +347,28 @@ pub(super) fn install_dataview(it: &mut Interp) {
         // An ArrayBuffer object is identified by its [[ArrayBufferData]] slot (the internal
         // `__abMaxByteLength` marker), which survives detachment — a detached buffer is still an
         // ArrayBuffer, so ToNumber(byteOffset) must run before the detached check throws.
-        let (bv, bp) = match arg(a, 0) {
-            Value::Obj(o)
+        let (bv, bp) = match (arg(a, 0)).view() {
+            ValueView::Obj(o)
                 if o.borrow()
                     .internal_slots()
                     .contains("#\u{0}abMaxByteLength") =>
             {
-                (Value::Obj(o.clone()), Rc::as_ptr(&o) as usize)
+                (Value::Obj(o), Gc::as_ptr(&o) as usize)
             }
             _ => return Err(i.make_error("TypeError", "DataView requires an ArrayBuffer")),
         };
         // ToIndex(byteOffset) may run user code that detaches/resizes the buffer.
-        let offset = match arg(a, 1) {
-            Value::Undefined => 0,
-            v => to_index(i, &v)?,
+        let offset = {
+            let __value_match_original = arg(a, 1);
+            match (__value_match_original).view() {
+                ValueView::Undefined => 0,
+                _ => {
+                    let v = __value_match_original;
+                    to_index(i, &v)?
+                }
+            }
         };
-        let has_len = !matches!(arg(a, 2), Value::Undefined);
+        let has_len = !matches!((arg(a, 2)).view(), ValueView::Undefined);
         let len_arg = if has_len {
             Some(to_index(i, &arg(a, 2))?)
         } else {
@@ -376,12 +384,13 @@ pub(super) fn install_dataview(it: &mut Interp) {
         // IsFixedLengthArrayBuffer: a resizable ArrayBuffer or growable SharedArrayBuffer has an
         // [[ArrayBufferMaxByteLength]] slot. Read the slot, not the author-visible accessors.
         let resizable = matches!(
-            bv.as_obj().and_then(|o| o
+            (bv.as_obj().and_then(|o| o
                 .borrow()
                 .internal_slots()
                 .get("#\u{0}abResizable")
-                .map(|p| p.value())),
-            Some(Value::Bool(true))
+                .map(|p| p.value())))
+            .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         );
         if let Some(l) = len_arg {
             if l > buflen - offset {
@@ -409,7 +418,7 @@ pub(super) fn install_dataview(it: &mut Interp) {
         // A length-tracking DataView (no explicit byteLength) over a resizable buffer follows the
         // buffer's current length; its stored `len` is only the initial snapshot.
         let track = !has_len && resizable;
-        let p = Rc::as_ptr(&obj) as usize;
+        let p = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         i.data_views.insert(p, (bp, offset, len, track));
         // buffer/byteOffset/byteLength are accessor getters on the prototype, not own properties;
@@ -419,12 +428,12 @@ pub(super) fn install_dataview(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     set_builtin(&it.global, "DataView", Value::Obj(ctor));
 }
 

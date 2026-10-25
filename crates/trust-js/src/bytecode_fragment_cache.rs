@@ -7,8 +7,7 @@
 //! HashMap bucket/control storage are reported separately by memory.rs.
 use super::loop_fragment::{Context, Plan, RootKind};
 use crate::ast::LoopSiteToken;
-use crate::value::{Gc, Object};
-use std::cell::RefCell;
+use crate::value::Gc;
 use std::rc::{Rc, Weak};
 
 const ENTRIES: usize = 64;
@@ -19,7 +18,7 @@ const TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
 struct Key {
     site: Weak<LoopSiteToken>,
-    realm: Weak<RefCell<Object>>,
+    realm: crate::value::WeakGc,
     kind: RootKind,
     context: Context,
     labels: Box<[Box<str>]>,
@@ -35,7 +34,7 @@ impl Key {
         labels: &[&str],
     ) -> bool {
         self.site.as_ptr() == Rc::as_ptr(site)
-            && self.realm.as_ptr() == Rc::as_ptr(realm)
+            && self.realm.as_ptr() == Gc::as_ptr(realm)
             && self.kind == kind
             && self.context == context
             && self.labels.iter().map(|s| &**s).eq(labels.iter().copied())
@@ -186,7 +185,7 @@ impl Cache {
         storage.entries[index] = Some(Entry {
             key: Key {
                 site: Rc::downgrade(site),
-                realm: Rc::downgrade(realm),
+                realm: Gc::downgrade(realm),
                 kind,
                 context,
                 labels: labels
@@ -378,6 +377,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
     use crate::{
         ast::LoopSite,
         bytecode::{loop_fragment, Tier},
@@ -1006,8 +1006,10 @@ mod tests {
             b.eval("var obj={pad:0,x:7}", false).unwrap();
             for (first, expected) in [(true, 600.0), (false, 2100.0), (true, 600.0)] {
                 let engine = if first { &mut a } else { &mut b };
-                assert!(matches!(engine.interp.run_program(&body),
-                    Ok(crate::value::Value::Num(value)) if value == expected));
+                assert!(
+                    matches!((engine.interp.run_program(&body)).map(|__value| (__value).view()),
+                    Ok(ValueView::Num(value)) if value == expected)
+                );
             }
             let cached = |engine: &Engine| {
                 engine

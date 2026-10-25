@@ -1,7 +1,12 @@
 use super::*;
+use trust_js::embed::ValueKind;
 
 /// The Phase-1 acceptance test: an external crate registers a native global and JS calls it.
-fn host_add(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_add<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let a = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))?;
     let b = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))?;
     Ok(Value::Num(a + b))
@@ -31,7 +36,11 @@ fn native_global_callable_from_js() {
 #[test]
 fn extension_installs_state_globals_and_namespaces() {
     struct Counter(u32);
-    fn bump(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    fn bump<'s>(
+        ctx: &mut Ctx<'s>,
+        _this: Value<'s>,
+        _args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         let c = ctx.host_mut::<Counter>().expect("state_init ran");
         c.0 += 1;
         Ok(Value::Num(c.0 as f64))
@@ -55,7 +64,7 @@ fn native_fn_survives_the_bytecode_tier() {
     // The embed hooks must work on every execution tier (a native call from JIT/bytecode
     // frames goes through the same Callable::Native dispatch, but verify, don't assume).
     let mut engine = Engine::new();
-    engine.set_tier(trust_js::bytecode::Tier::Bytecode);
+    engine.set_tier(trust_js::Tier::Bytecode);
     engine.set_tier_threshold(0);
     engine.define_global("hostAdd", 2, host_add);
     assert_eq!(
@@ -77,21 +86,15 @@ fn call_function_reenters_the_engine() {
         Completion::Value(_) => {}
         Completion::Throw { name, message } => panic!("{name}: {message}"),
     }
-    let g = global_this(&mut engine);
-    let cb = engine
-        .ctx()
-        .get_member(&g, "cb")
-        .map_err(|_| ())
-        .expect("cb defined");
-    let out = engine
-        .call_function(&cb, Value::Undefined, &[Value::Num(21.0)])
-        .map_err(|_| "js threw")
-        .expect("call ok");
-    assert!(matches!(out, Value::Num(n) if n == 42.0));
-}
-
-fn global_this(engine: &mut Engine) -> Value {
-    engine.global_this()
+    engine.scope(|cx| {
+        let g = cx.global_this();
+        let cb = cx.get_member(&g, "cb").map_err(|_| ()).expect("cb defined");
+        let out = cx
+            .call_function(&cb, Value::Undefined, &[Value::Num(21.0)])
+            .map_err(|_| "js threw")
+            .expect("call ok");
+        assert!(matches!((out).kind(), ValueKind::Num(n) if n == 42.0));
+    });
 }
 
 #[test]
@@ -117,18 +120,13 @@ fn microtask_hooks_drive_promises() {
             false,
         )
         .unwrap();
-    let queue = {
-        let g = global_this(&mut engine);
-        engine
-            .ctx()
-            .get_member(&g, "queue")
-            .map_err(|_| ())
-            .unwrap()
-    };
-    engine
-        .call_function(&queue, Value::Undefined, &[])
-        .map_err(|_| "js threw")
-        .unwrap();
+    engine.scope(|cx| {
+        let g = cx.global_this();
+        let queue = cx.get_member(&g, "queue").map_err(|_| ()).unwrap();
+        cx.call_function(&queue, Value::Undefined, &[])
+            .map_err(|_| "js threw")
+            .unwrap();
+    });
     assert!(engine.has_pending_jobs());
     assert!(engine.run_one_job());
     engine.run_microtasks();
@@ -289,18 +287,21 @@ fn dedicated_executor_bounds_threads_and_contains_panics() {
 
 #[test]
 fn task_registry_cancellation_prevents_queued_work_from_starting() {
-    fn decode(
-        _ctx: &mut Ctx,
+    fn decode<'s>(
+        _ctx: &mut Ctx<'s>,
         _payload: Box<dyn std::any::Any + Send>,
-    ) -> Result<Vec<Value>, Value> {
+    ) -> Result<Vec<Value<'s>>, Value<'s>> {
         Ok(vec![])
     }
 
     let (completion_tx, completion_rx) = std::sync::mpsc::channel();
     let pool = ThreadPool::with_limits(1, 2, 128 << 10, completion_tx);
     let mut registry = TaskRegistry::with_canceller(pool.canceller());
-    let first = registry.register(Value::Undefined, None, decode);
-    let second = registry.register(Value::Undefined, None, decode);
+    let mut engine = Engine::new();
+    let mut inert =
+        || engine.scope(|cx| Handle::new(cx, &Value::Undefined).expect("a primitive handle"));
+    let first = registry.register(inert(), None, decode);
+    let second = registry.register(inert(), None, decode);
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     pool.spawn_blocking(first, move || {
@@ -316,4 +317,70 @@ fn task_registry_cancellation_prevents_queued_work_from_starting() {
     assert!(completion_rx
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
+}
+
+/// `queue(callback, arg)`: queue `callback(arg)` on the [`CallbackQueue`] and register it as an
+/// in-flight task's success and failure callbacks; returns the task's id.
+fn queue_both<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    fn decode<'s>(
+        _: &mut Ctx<'s>,
+        _: Box<dyn std::any::Any + Send>,
+    ) -> Result<Vec<Value<'s>>, Value<'s>> {
+        Ok(vec![])
+    }
+    let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    CallbackQueue::enqueue(ctx, &callback, &args[1..])?;
+    let id = TaskRegistry::register_callbacks(ctx, &callback, Some(&callback), decode)?;
+    Ok(Value::Num(id as f64))
+}
+
+/// Queued callbacks and their arguments, and in-flight tasks' callbacks, are held by handles in
+/// host state: collections keep them though no script value does, and they run afterwards.
+#[test]
+fn queued_and_task_callbacks_survive_collections_in_host_state() {
+    let mut engine = Engine::new();
+    engine.op_state().put(TaskRegistry::default());
+    engine.define_global("queue", 2, queue_both);
+    let id = eval_str(
+        &mut engine,
+        "globalThis.log = [];
+         queue(function (x) { log.push(x === undefined ? 'settled' : x.tag); },
+               {tag: ['queued', 'arg'].join(' ')})",
+    );
+    for _ in 0..2 {
+        eval_str(
+            &mut engine,
+            "var churn = []; for (let i = 0; i < 3000; i++) churn.push({i}); churn = null; 0",
+        );
+        engine.collect_garbage_at_idle();
+    }
+    let (callback, args) = engine
+        .host_mut::<CallbackQueue>()
+        .expect("queue installed")
+        .queue
+        .pop_front()
+        .expect("a queued callback");
+    engine.scope(|cx| {
+        let (callback, args) = (value(cx, &callback), values(cx, &args));
+        assert!(cx.call_function(&callback, Value::Undefined, &args).is_ok());
+    });
+    let entry = engine
+        .host_mut::<TaskRegistry>()
+        .expect("registry installed")
+        .take(id.parse().expect("a task id"))
+        .expect("the task is in flight");
+    for settle in [Some(&entry.on_ok), entry.on_err.as_ref()] {
+        engine.scope(|cx| {
+            let settle = value(cx, settle.expect("both callbacks"));
+            assert!(cx.call_function(&settle, Value::Undefined, &[]).is_ok());
+        });
+    }
+    assert_eq!(
+        eval_str(&mut engine, "log.join()"),
+        "queued arg,settled,settled"
+    );
 }

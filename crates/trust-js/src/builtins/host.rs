@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// The test262 `$262` host object (test262 INTERPRETING.md): `global`, `gc`, `createRealm`,
 /// `evalScript`, `detachArrayBuffer`, `IsHTMLDDA`, `agent` and `AbstractModuleSource`.
@@ -13,11 +14,9 @@ pub(super) fn install_host(it: &mut Interp) {
 /// (None for the main realm, in which case the live `it.global` is used and `evalScript` runs in the
 /// current realm).
 fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
-    let host = Object::new(Some(it.object_proto.clone()));
-    let global = realm_global
-        .clone()
-        .unwrap_or_else(|| Value::Obj(it.global.clone()));
-    set_builtin(&host, "global", global.clone());
+    let host = Object::new(Some(it.object_proto));
+    let global = realm_global.unwrap_or_else(|| Value::Obj(it.global));
+    set_builtin(&host, "global", global);
     it.def_method(&host, "gc", 0, |i, _t, _a| {
         i.gc_collect();
         Ok(Value::Undefined)
@@ -29,17 +28,23 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         Ok(make_262(i, Some(g)))
     });
     // evalScript runs in this $262's realm (the main realm's $262 keeps using the current global).
-    let rg = realm_global.clone();
+    let rg = realm_global;
     if let Some(rg) = rg {
         set_internal(&host, "#\u{0}realm_global", rg);
     }
     it.def_method(&host, "evalScript", 1, |i, this, args| {
-        let code = match arg(args, 0) {
-            Value::Str(s) => s,
-            other => return Ok(other),
+        let code = {
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Str(s) => s,
+                _ => {
+                    let other = __value_match_original;
+                    return Ok(other);
+                }
+            }
         };
         let rg = ab(i.get_internal_slot(&this, "#\u{0}realm_global"))?;
-        if let Value::Obj(_) = &rg {
+        if let ValueView::Obj(_) = &(rg).view() {
             return match i.eval_script_in_realm(&rg, &code) {
                 Ok(value) => Ok(value),
                 Err(Abrupt::Throw(value)) => Err(value),
@@ -68,8 +73,8 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         }
     });
     it.def_method(&host, "detachArrayBuffer", 1, |i, _t, args| {
-        if let Value::Obj(o) = arg(args, 0) {
-            let p = Rc::as_ptr(&o) as usize;
+        if let ValueView::Obj(o) = (arg(args, 0)).view() {
+            let p = Gc::as_ptr(&o) as usize;
             // DetachArrayBuffer asserts IsSharedArrayBuffer is false: a Shared Data Block cannot be
             // detached, so refuse instead of leaving the buffer half detached.
             if i.is_shared_buffer(p) {
@@ -113,7 +118,7 @@ fn make_abstract_module_source(it: &mut Interp) -> Value {
             "Abstract class AbstractModuleSource not directly constructable",
         ))
     });
-    let proto = Object::new(Some(it.object_proto.clone()));
+    let proto = Object::new(Some(it.object_proto));
     // `@@toStringTag` getter: returns the source's name for a real module-source object, else undefined.
     if let Some(key) = well_known_key(it, "toStringTag") {
         let getter = it.make_native("get [Symbol.toStringTag]", 0, |_i, _t, _a| {
@@ -126,14 +131,13 @@ fn make_abstract_module_source(it: &mut Interp) -> Value {
     }
     proto.borrow_mut().props.insert(
         "constructor",
-        Property::data(Value::Obj(ctor.clone()), true, false, true),
+        Property::data(Value::Obj(ctor), true, false, true),
     );
     // `.prototype` is non-writable, non-enumerable, non-configurable. A host-defined concrete
     // module-source prototype inherits from it; ModuleSource instances inherit from that concrete
     // prototype (Source Phase Imports §28.1).
-    Rc::make_mut(&mut it.extra_protos).insert("%AbstractModuleSourceProto%", proto.clone());
-    Rc::make_mut(&mut it.extra_protos)
-        .insert("%HostModuleSourceProto%", Object::new(Some(proto.clone())));
+    Rc::make_mut(&mut it.extra_protos).insert("%AbstractModuleSourceProto%", proto);
+    Rc::make_mut(&mut it.extra_protos).insert("%HostModuleSourceProto%", Object::new(Some(proto)));
     ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(proto), false, false, false),
@@ -144,7 +148,7 @@ fn make_abstract_module_source(it: &mut Interp) -> Value {
 /// Reconstruct a SharedArrayBuffer object in this agent from an owning broadcast block.
 fn agent_make_shared(i: &mut Interp, block: crate::interpreter::SharedMem, len: usize) -> Value {
     let obj = Object::new(i.extra_protos.get("SharedArrayBuffer").cloned());
-    let p = Rc::as_ptr(&obj) as usize;
+    let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     let id = block.id();
     i.array_buffers.insert(p, BufferData::Shared(block));
@@ -156,7 +160,7 @@ fn agent_make_shared(i: &mut Interp, block: crate::interpreter::SharedMem, len: 
 
 /// `$262.agent`: the multi-agent harness (real OS threads sharing SharedArrayBuffer memory).
 pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
-    let agent = Object::new(Some(it.object_proto.clone()));
+    let agent = Object::new(Some(it.object_proto));
     it.def_method(&agent, "start", 1, |i, _t, a| {
         let src = ab(i.to_string(&arg(a, 0)))?.to_string();
         // Lazily create the main agent's report channel.
@@ -183,7 +187,7 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
         // Accept a SharedArrayBuffer directly, or a TypedArray view over one.
         let p = match sab.as_obj() {
             Some(o) => {
-                let p = Rc::as_ptr(o) as usize;
+                let p = Gc::as_ptr(&o) as usize;
                 if i.is_shared_buffer(p) {
                     p
                 } else if let Some(info) = i.typed_arrays.get(&p) {
@@ -231,7 +235,7 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
         }
         let ms = ab(i.to_number(&arg(a, 1)))?.max(0.0);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
-        i.pending_timers.push((f, deadline));
+        i.enqueue_agent_timer(f, deadline);
         Ok(Value::Undefined)
     });
     it.def_method(&agent, "monotonicNow", 0, |_i, _t, _a| {

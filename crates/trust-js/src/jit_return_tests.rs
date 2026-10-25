@@ -8,7 +8,9 @@
 ))]
 
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
+use std::cell::Cell;
 
 fn compile_return(engine: &mut Engine, source: &str) -> (Rc<Chunk>, JitCode) {
     let statements = crate::parser::parse_script(source, false).ok().unwrap();
@@ -22,9 +24,8 @@ fn compile_return(engine: &mut Engine, source: &str) -> (Rc<Chunk>, JitCode) {
     (chunk, code)
 }
 
-/// Deliberately seed the private result slot to exercise BOTH native vacancy branches.
-/// These fixtures have no environment operations or calls; the real native prologue,
-/// local clone, return template, epilogue and checked fallback all execute unchanged.
+/// Seed the private result slot, then run the real native prologue, local load, return
+/// template and epilogue. These fixtures have no environment operations or calls.
 fn enter(
     engine: &mut Engine,
     chunk: &Chunk,
@@ -33,43 +34,40 @@ fn enter(
     previous: Value,
 ) -> (Value, usize) {
     let i: &mut Interp = &mut engine.interp;
-    let env = i.global_env.clone();
+    let env = i.global_env;
     let (_, count) = chunk.jit_frame();
-    let mut slots: Vec<PackedValue> = (0..count)
-        .map(|_| PackedValue::pack(Value::Undefined))
-        .collect();
+    let mut slots: Vec<Cell<Value>> = (0..count).map(|_| Cell::new(Value::Undefined)).collect();
     if count != 0 {
-        slots[0] = PackedValue::pack(value);
+        slots[0].set(value);
     }
-    let mut stack: Vec<std::mem::MaybeUninit<PackedValue>> =
-        Vec::with_capacity(code.max_stack.max(1));
-    let base = stack.as_mut_ptr().cast::<PackedValue>();
+    let mut stack: Vec<std::mem::MaybeUninit<Value>> = Vec::with_capacity(code.max_stack.max(1));
+    let base = stack.as_mut_ptr().cast::<Value>();
     let mut ctx = JitCtx {
         helpers: i.jit_helpers.as_ptr(),
         stack_base: base,
         final_sp: base,
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
-        env_raw: Rc::as_ptr(&env) as *const u8,
-        this_raw: std::ptr::null(),
+        env_raw: Env::as_ptr(&env) as *const u8,
+        this_word: (Value::Undefined),
         global_body: super::jit_global_body(i, code),
-        genv: Rc::as_ptr(&env) as usize,
+        genv: Env::as_ptr(&env) as usize,
         interp: i as *mut Interp,
         chunk,
-        this_val: Value::Undefined,
         n_slots: count,
         handlers: Vec::new(),
         handler_floor: 0,
         code_base: code.mem,
         pc_offsets: code.pc_offsets.as_ptr(),
         error: None,
-        ret: PackedValue::pack(previous),
+        ret: (previous),
         env_parent_raw: super::jit_env_parent_raw(&env),
         opstat_enabled: false,
         callstat_enabled: false,
         propstat_enabled: false,
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
         activation: None,
         resume_activation: std::ptr::null_mut(),
         references_raw: std::ptr::null_mut(),
@@ -78,7 +76,6 @@ fn enter(
         resume_pc: 0,
         resume_step: None,
     };
-    ctx.this_raw = &ctx.this_val;
     crate::bytecode::TEST_JIT_RETURN_HELPERS.with(|calls| calls.set(0));
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     let status = entry(&mut ctx);
@@ -97,7 +94,7 @@ fn enter(
     // The result remains an owning GC root after the callee's local owners are
     // destroyed, before widening at the host boundary. This also covers cycles.
     i.gc_collect();
-    (ctx.take_ret().into_value(), calls)
+    (ctx.take_ret(), calls)
 }
 
 #[test]
@@ -106,7 +103,7 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     engine
         .eval("var returnSymbol=Symbol('return');", false)
         .unwrap();
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let symbol = engine.interp.get_var("returnSymbol", &env).ok().unwrap();
     let values = [
         Value::Undefined,
@@ -126,10 +123,10 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     ];
     let (chunk, code) = compile_return(&mut engine, "function pass(value){return value;}");
     for value in values {
-        let (result, helpers) = enter(&mut engine, &chunk, &code, value.clone(), Value::Undefined);
+        let (result, helpers) = enter(&mut engine, &chunk, &code, value, Value::Undefined);
         assert_eq!(helpers, 0, "empty native return called the checked helper");
-        match (&value, &result) {
-            (Value::Num(expected), Value::Num(actual)) => {
+        match (&(value).view(), &(result).view()) {
+            (ValueView::Num(expected), ValueView::Num(actual)) => {
                 assert!(
                     expected.is_nan() && actual.is_nan() || expected.to_bits() == actual.to_bits()
                 );
@@ -139,6 +136,56 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     }
 }
 
+/// Every displaced execution-word kind can be overwritten directly. Mode0 must publish
+/// Undefined over an occupied word, including after falling off the function's end.
+#[test]
+fn packed_native_return_replaces_all_displaced_kinds_without_helper() {
+    let mut engine = Engine::new();
+    engine
+        .eval("var returnSymbol=Symbol('displaced');", false)
+        .unwrap();
+    let env = engine.interp.global_env;
+    let symbol = engine.interp.get_var("returnSymbol", &env).ok().unwrap();
+    let displaced = crate::rooting::RootedVec::from_vec(vec![
+        Value::Undefined,
+        Value::Null,
+        Value::Bool(false),
+        Value::Bool(true),
+        Value::Num(0.0),
+        Value::Num(-0.0),
+        Value::Num(1.25),
+        Value::Num(f64::NAN),
+        Value::Num(f64::INFINITY),
+        Value::Num(f64::NEG_INFINITY),
+        Value::Str("displaced string".into()),
+        symbol,
+        Value::Obj(crate::value::Object::new(None)),
+        Value::BigInt(crate::bigint::JsBigInt::from_i128(i128::MAX)),
+    ]);
+    for source in [
+        "function pass(value){return value;}",
+        "function pass(value){return;}",
+        "function pass(value){}",
+    ] {
+        let (chunk, code) = compile_return(&mut engine, source);
+        for previous in &displaced {
+            let (result, helpers) = enter(&mut engine, &chunk, &code, Value::Num(42.0), *previous);
+            assert_eq!(
+                helpers, 0,
+                "{source}: every occupied word must commit natively"
+            );
+            if source.contains("return value") {
+                assert_eq!(result.as_num_opt(), Some(42.0));
+            } else {
+                assert!(matches!((result).view(), ValueView::Undefined));
+            }
+        }
+    }
+}
+
+/// The returned object survives the collection `enter` runs after the callee's
+/// teardown, and once the test drops the result a collection finds it dead: neither the
+/// occupied result slot nor the native frame keeps a hidden owner.
 #[test]
 fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
     let mut engine = Engine::new();
@@ -149,60 +196,69 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
     ] {
         let (chunk, code) = compile_return(&mut engine, source);
         for occupied in [false, true] {
-            let object = crate::value::Object::new(None);
-            let weak = Rc::downgrade(&object);
-            let previous = if occupied {
-                Value::Obj(object.clone())
-            } else {
-                Value::Undefined
-            };
-            let (result, helpers) = enter(&mut engine, &chunk, &code, Value::Obj(object), previous);
-            assert_eq!(helpers, usize::from(occupied), "{source}");
-            if source.contains("return value") {
-                assert!(matches!(result, Value::Obj(_)));
-                assert_eq!(weak.strong_count(), 1);
-            } else {
-                assert!(matches!(result, Value::Undefined));
-                assert_eq!(weak.strong_count(), 0);
-            }
-            drop(result);
-            assert_eq!(weak.strong_count(), 0);
+            // The object's handles live only in this helper frame (the collector scans the stack).
+            let weak = crate::gc_test::in_frame(|| {
+                let object = crate::value::Object::new(None);
+                let weak = crate::value::Gc::downgrade(&object);
+                let previous = if occupied {
+                    Value::Obj(object)
+                } else {
+                    Value::Undefined
+                };
+                let (result, helpers) =
+                    enter(&mut engine, &chunk, &code, Value::Obj(object), previous);
+                assert_eq!(helpers, 0, "{source} occupied={occupied}");
+                if source.contains("return value") {
+                    assert!(
+                        matches!(&(result).view(), ValueView::Obj(o) if crate::value::Gc::as_ptr(o) == weak.as_ptr())
+                    );
+                } else {
+                    assert!(matches!((result).view(), ValueView::Undefined));
+                }
+                weak
+            });
+            engine.interp.gc_collect();
+            assert!(
+                !crate::gc_test::alive(&weak),
+                "{source} occupied={occupied}"
+            );
         }
     }
 }
 
+/// A cyclic object whose only owner is the return word survives the collection `enter`
+/// runs after the callee's teardown, intact; once the test drops it, a collection finds it dead.
 #[test]
 fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
     let mut engine = Engine::new();
     let (chunk, code) = compile_return(&mut engine, "function pass(value){return value;}");
-    let object = crate::value::Object::new(Some(engine.interp.object_proto.clone()));
-    let weak = Rc::downgrade(&object);
-    object.borrow_mut().props.insert(
-        "self",
-        crate::value::Property::plain(Value::Obj(object.clone())),
-    );
-    let (result, helpers) = enter(
-        &mut engine,
-        &chunk,
-        &code,
-        Value::Obj(object),
-        Value::Undefined,
-    );
-    assert_eq!(helpers, 0);
-    assert_eq!(
-        weak.strong_count(),
-        2,
-        "one return owner plus its self edge"
-    );
-    let returned = result.as_obj().unwrap();
-    let self_value = returned.borrow().props.get("self").unwrap().value();
-    assert!(matches!(&self_value, Value::Obj(value) if Rc::ptr_eq(value, returned)));
-    drop(self_value);
-    drop(result);
+    // The object's handles live only in this helper frame (the collector scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let object = crate::value::Object::new(Some(engine.interp.object_proto));
+        let weak = crate::value::Gc::downgrade(&object);
+        object
+            .borrow_mut()
+            .props
+            .insert("self", crate::value::Property::plain(Value::Obj(object)));
+        let (result, helpers) = enter(
+            &mut engine,
+            &chunk,
+            &code,
+            Value::Obj(object),
+            Value::Undefined,
+        );
+        assert_eq!(helpers, 0);
+        let returned = result.as_obj().unwrap();
+        assert_eq!(crate::value::Gc::as_ptr(&returned), weak.as_ptr());
+        let self_value = returned.borrow().props.get("self").unwrap().value();
+        assert!(
+            matches!(&(self_value).view(), ValueView::Obj(value) if crate::value::Gc::ptr_eq(value, &returned))
+        );
+        weak
+    });
     engine.interp.gc_collect();
-    assert_eq!(
-        weak.strong_count(),
-        0,
+    assert!(
+        !crate::gc_test::alive(&weak),
         "a dropped result must not leave a hidden native owner"
     );
 }
@@ -226,14 +282,16 @@ fn packed_native_return_direct_call_moves_and_clears_the_entire_word() {
     // Isolate the ordinary direct-call ABI from AST splicing. Both chunks keep
     // their real native entry and live inline caches; only the test's retry
     // scheduler is settled so this exact boundary cannot disappear by inlining.
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     for name in ["returned", "invoked"] {
         let function = engine.interp.get_var(name, &env).ok().unwrap();
-        let object = function.as_obj().unwrap().borrow();
+        let function_handle = function.as_obj().unwrap();
+        let object = function_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("user function")
         };
-        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = user.func.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert!(chunk.jit.get().flatten().is_some());
         chunk.inline_attempted.set(true);
         chunk.inline_retry_at.set(0);
@@ -352,14 +410,16 @@ fn direct_calls_enter_callees_that_materialize_native_activations() {
             false,
         )
         .unwrap();
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     for name in ["shaped", "upper"] {
         let function = engine.interp.get_var(name, &env).ok().unwrap();
-        let object = function.as_obj().unwrap().borrow();
+        let function_handle = function.as_obj().unwrap();
+        let object = function_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("user function")
         };
-        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = user.func.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert!(chunk.jit.get().flatten().is_some());
         assert_eq!(chunk.jit_needs_activation_state(), name == "shaped");
         chunk.inline_attempted.set(true);
@@ -447,7 +507,12 @@ fn direct_finish_vacates_a_last_reference_receiver() {
             .interp
             .frame_pool
             .iter()
-            .filter(|record| unsafe { !matches!(record.as_ref().ctx.this_val, Value::Undefined) })
+            .filter(|record| unsafe {
+                !matches!(
+                    (record.as_ref().ctx.this_value()).view(),
+                    ValueView::Undefined
+                )
+            })
             .count(),
         0,
         "a pooled record must not retain a `this` binding"

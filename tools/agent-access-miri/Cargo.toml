@@ -1,0 +1,11 @@
+[package]
+name = "trust-js-agent-access-miri"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone std-only consumer of the production access module, not a surrogate registry.
+[workspace]
+
+[features]
+stale-suspension = []

@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// A RegExp prototype getter: a flag boolean (`Some(char)`), or the special source/flags string.
 fn re_flag_get(i: &Interp, this: &Value, flag: Option<char>) -> Result<Value, Value> {
@@ -12,7 +13,7 @@ fn re_flag_get(i: &Interp, this: &Value, flag: Option<char>) -> Result<Value, Va
             });
         }
         // The %RegExp.prototype% object itself has default values rather than throwing.
-        if i.extra_protos.get("RegExp").map(|p| Rc::as_ptr(p) as usize) == Some(ptr) {
+        if i.extra_protos.get("RegExp").map(|p| Gc::as_ptr(p) as usize) == Some(ptr) {
             return Ok(match flag {
                 Some(_) => Value::Undefined,
                 None => Value::lstr(""),
@@ -87,7 +88,7 @@ fn re_source_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
             }
             return Ok(Value::lstr(out));
         }
-        if i.extra_protos.get("RegExp").map(|p| Rc::as_ptr(p) as usize) == Some(ptr) {
+        if i.extra_protos.get("RegExp").map(|p| Gc::as_ptr(p) as usize) == Some(ptr) {
             return Ok(Value::lstr("(?:)"));
         }
     }
@@ -98,7 +99,7 @@ fn re_source_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
 }
 
 fn re_flags_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    if !matches!(this, Value::Obj(_)) {
+    if !matches!((this).view(), ValueView::Obj(_)) {
         return Err(i.make_error(
             "TypeError",
             "RegExp.prototype.flags getter called on non-object",
@@ -159,7 +160,7 @@ pub(super) fn literal_match_dependencies_canonical(i: &Interp) -> bool {
         "sticky",
         "exec",
     ];
-    let proto_ptr = Rc::as_ptr(proto) as usize;
+    let proto_ptr = Gc::as_ptr(proto) as usize;
     let shape = p.props.shape();
     let cached = i.regexp_dependency_cache.get();
     let slots = if cached.proto == proto_ptr && cached.shape == shape {
@@ -191,8 +192,8 @@ pub(super) fn literal_match_dependencies_canonical(i: &Interp) -> bool {
     let getter_is = |index: usize, native: NativeFn| {
         property_at(index).is_some_and(|property| {
             matches!(
-                property.getter(),
-                Some(Value::Obj(function))
+                (property.getter()).map(|__value| (__value).view()),
+                Some(ValueView::Obj(function))
                     if matches!(
                         function.borrow().call,
                         Callable::Native(found)
@@ -215,8 +216,8 @@ pub(super) fn literal_match_dependencies_canonical(i: &Interp) -> bool {
             .map(Property::value)
             .is_some_and(|value| {
                 matches!(
-                    value,
-                    Value::Obj(ref function)
+                    (value).view(),
+                    ValueView::Obj(ref function)
                         if matches!(
                             function.borrow().call,
                             Callable::Native(native)
@@ -248,10 +249,10 @@ const FLAG_PROP_NAMES: [&str; 9] = [
 /// the compiled Regex for a direct read; `None` keeps the generic getter with its observable
 /// Gets (a user-overridden `flags`, a subclass prototype, or an own flag property all force it).
 fn direct_reg_exp_flags(i: &Interp, this: &Value) -> Option<std::rc::Rc<crate::regex::Regex>> {
-    let Value::Obj(obj) = this else {
+    let ValueView::Obj(obj) = &(this).view() else {
         return None;
     };
-    let ptr = Rc::as_ptr(obj) as usize;
+    let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr).cloned()?;
     let b = obj.borrow();
     if !matches!(b.exotic, Exotic::None)
@@ -259,7 +260,7 @@ fn direct_reg_exp_flags(i: &Interp, this: &Value) -> Option<std::rc::Rc<crate::r
             .proto
             .as_ref()
             .zip(i.extra_protos.get("RegExp"))
-            .is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+            .is_some_and(|(a, b)| Gc::ptr_eq(a, b))
         || FLAG_PROP_NAMES.iter().any(|name| b.props.contains(name))
     {
         return None;
@@ -274,7 +275,7 @@ fn direct_reg_exp_flags(i: &Interp, this: &Value) -> Option<std::rc::Rc<crate::r
 /// `lastIndex` is a writable non-negative integral Number, so neither reading it (ToLength) nor
 /// writing it runs user code or throws.
 fn direct_regexp_exec(i: &Interp, this: &Value) -> Option<(Gc, std::rc::Rc<crate::regex::Regex>)> {
-    let Value::Obj(obj) = this else {
+    let ValueView::Obj(obj) = &(this).view() else {
         return None;
     };
     let re = direct_reg_exp_flags(i, this)?;
@@ -282,25 +283,31 @@ fn direct_regexp_exec(i: &Interp, this: &Value) -> Option<(Gc, std::rc::Rc<crate
     let last = b.props.get("lastIndex")?;
     let plain_last = !last.accessor()
         && last.writable()
-        && matches!(last.value(), Value::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0);
+        && matches!((last.value()).view(), ValueView::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0);
     if !plain_last || b.props.contains("exec") {
         return None;
     }
     drop(b);
-    Some((obj.clone(), re))
+    Some((*obj, re))
 }
 
 /// The second (flags) argument to RegExp / RegExp.prototype.compile: undefined → "", else ToString.
 fn regexp_flags_arg(i: &mut Interp, a: &[Value]) -> Result<String, Value> {
-    match arg(a, 1) {
-        Value::Undefined => Ok(String::new()),
-        v => Ok(ab(i.to_string(&v))?.to_string()),
+    {
+        let __value_match_original = arg(a, 1);
+        match (__value_match_original).view() {
+            ValueView::Undefined => Ok(String::new()),
+            _ => {
+                let v = __value_match_original;
+                Ok(ab(i.to_string(&v))?.to_string())
+            }
+        }
     }
 }
 
 pub(super) fn install_regexp(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("RegExp", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("RegExp", proto);
     // source/flags/global/... accessor getters (computed from the matcher).
     let add_getter = |it: &mut Interp, proto: &Gc, name: &str, f: NativeFn| {
         let g = it.make_native(&format!("get {name}"), 0, f);
@@ -326,12 +333,12 @@ pub(super) fn install_regexp(it: &mut Interp) {
         let ptr = ptr.ok_or_else(|| i.make_error("TypeError", "compile called on non-RegExp"))?;
         // The legacy-regexp proposal: compile requires a DIRECT same-realm RegExp instance (a
         // subclass or cross-realm instance is a TypeError).
-        if let (Value::Obj(o), Some(rp)) = (&this, i.extra_protos.get("RegExp")) {
+        if let (ValueView::Obj(o), Some(rp)) = (&(this).view(), i.extra_protos.get("RegExp")) {
             let direct = o
                 .borrow()
                 .proto
                 .as_ref()
-                .map(|p| Rc::ptr_eq(p, rp))
+                .map(|p| Gc::ptr_eq(p, rp))
                 .unwrap_or(false);
             if !direct {
                 return Err(i.make_error(
@@ -340,26 +347,33 @@ pub(super) fn install_regexp(it: &mut Interp) {
                 ));
             }
         }
-        let (source, flags) = match arg(a, 0) {
-            Value::Obj(o) if i.regexps.contains_key(&(Rc::as_ptr(&o) as usize)) => {
-                // A RegExp pattern copies its source/flags; a second flags argument is then an error.
-                if !matches!(arg(a, 1), Value::Undefined) {
-                    return Err(
-                        i.make_error("TypeError", "cannot supply flags when compiling a RegExp")
-                    );
+        let (source, flags) = {
+            let __value_match_original = arg(a, 0);
+            match (__value_match_original).view() {
+                ValueView::Obj(o) if i.regexps.contains_key(&(Gc::as_ptr(&o) as usize)) => {
+                    // A RegExp pattern copies its source/flags; a second flags argument is then an error.
+                    if !matches!((arg(a, 1)).view(), ValueView::Undefined) {
+                        return Err(i.make_error(
+                            "TypeError",
+                            "cannot supply flags when compiling a RegExp",
+                        ));
+                    }
+                    let re = i.regexps[&(Gc::as_ptr(&o) as usize)].clone();
+                    (re.source.clone(), re.flags.clone())
                 }
-                let re = i.regexps[&(Rc::as_ptr(&o) as usize)].clone();
-                (re.source.clone(), re.flags.clone())
-            }
-            Value::Undefined => (String::new(), regexp_flags_arg(i, a)?),
-            v => {
-                let src = ab(i.to_string(&v))?.to_string();
-                (src, regexp_flags_arg(i, a)?)
+                ValueView::Undefined => (String::new(), regexp_flags_arg(i, a)?),
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let src = ab(i.to_string(&v))?.to_string();
+                        (src, regexp_flags_arg(i, a)?)
+                    }
+                }
             }
         };
         let re = crate::regex::Regex::new(&source, &flags)
             .map_err(|e| i.make_error("SyntaxError", &e))?;
-        if let Value::Obj(o) = &this {
+        if let ValueView::Obj(o) = &(this).view() {
             i.gc_pin(o);
         }
         i.regexps.insert(ptr, Rc::new(re));
@@ -370,7 +384,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
     it.def_method(&proto, "exec", 1, regexp_exec);
     it.def_method(&proto, "test", 1, |i, this, a| {
         // RegExpExec: an own/inherited callable `exec` takes precedence over the built-in matcher.
-        if !matches!(this, Value::Obj(_)) {
+        if !matches!((this).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "RegExp.prototype.test requires an object"));
         }
         let s = ab(i.to_string(&arg(a, 0)))?;
@@ -380,12 +394,12 @@ pub(super) fn install_regexp(it: &mut Interp) {
             return regexp_exec_discard_direct(i, &obj, &re, &s).map(Value::Bool);
         }
         Ok(Value::Bool(!matches!(
-            regexp_exec_abstract(i, &this, s)?,
-            Value::Null
+            (regexp_exec_abstract(i, &this, s)?).view(),
+            ValueView::Null
         )))
     });
     it.def_method(&proto, "toString", 0, |i, this, _| {
-        if !matches!(this, Value::Obj(_)) {
+        if !matches!((this).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "RegExp.prototype.toString requires an object"));
         }
         let src_v = ab(i.get_member_key(&this, "source"))?;
@@ -402,14 +416,14 @@ pub(super) fn install_regexp(it: &mut Interp) {
         let pattern = arg(a, 0);
         let flags_arg = arg(a, 1);
         // IsRegExp: an Object whose truthy @@match (when defined) or [[RegExpMatcher]] slot.
-        let has_slots = matches!(&pattern, Value::Obj(o)
-            if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)));
-        let pattern_is_regexp = if matches!(pattern, Value::Obj(_)) {
+        let has_slots = matches!(&(pattern).view(), ValueView::Obj(o)
+            if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)));
+        let pattern_is_regexp = if matches!((pattern).view(), ValueView::Obj(_)) {
             let m = match well_known_key(i, "match") {
                 Some(key) => ab(i.get_member_key(&pattern, &key))?,
                 None => Value::Undefined,
             };
-            if !matches!(m, Value::Undefined) {
+            if !matches!((m).view(), ValueView::Undefined) {
                 i.to_boolean(&m)
             } else {
                 has_slots
@@ -419,10 +433,13 @@ pub(super) fn install_regexp(it: &mut Interp) {
         };
         // Called as a function on a regexp(-like) whose .constructor is this same
         // constructor: return the argument unchanged.
-        if !i.constructing && pattern_is_regexp && matches!(flags_arg, Value::Undefined) {
+        if !i.constructing
+            && pattern_is_regexp
+            && matches!((flags_arg).view(), ValueView::Undefined)
+        {
             let c = ab(i.get_member_key(&pattern, "constructor"))?;
-            let same = match (&c, i.extra_protos.get("%RegExpCtor%")) {
-                (Value::Obj(co), Some(rc)) => Rc::ptr_eq(co, rc),
+            let same = match (&(c).view(), i.extra_protos.get("%RegExpCtor%")) {
+                (ValueView::Obj(co), Some(rc)) => Gc::ptr_eq(co, rc),
                 _ => false,
             };
             if same {
@@ -433,21 +450,27 @@ pub(super) fn install_regexp(it: &mut Interp) {
         // read first, then RegExpAlloc fetches newTarget's `prototype`, and only then does
         // RegExpInitialize run the ToString coercions.
         let (src_v, fl_v) = if has_slots {
-            let re = match &pattern {
-                Value::Obj(o) => i.regexps[&(Rc::as_ptr(o) as usize)].clone(),
+            let re = match &(pattern).view() {
+                ValueView::Obj(o) => i.regexps[&(Gc::as_ptr(o) as usize)].clone(),
                 _ => unreachable!(),
             };
-            let fl = match flags_arg {
-                Value::Undefined => Value::lstr(re.flags.clone()),
-                v => v,
+            let fl = {
+                let __value_match_original = flags_arg;
+                match (__value_match_original).view() {
+                    ValueView::Undefined => Value::lstr(re.flags.clone()),
+                    _ => __value_match_original,
+                }
             };
             (Value::lstr(re.source.clone()), fl)
         } else if pattern_is_regexp {
             // A regexp-like object: read its `source` and `flags` properties.
             let src = ab(i.get_member_key(&pattern, "source"))?;
-            let fl = match flags_arg {
-                Value::Undefined => ab(i.get_member_key(&pattern, "flags"))?,
-                v => v,
+            let fl = {
+                let __value_match_original = flags_arg;
+                match (__value_match_original).view() {
+                    ValueView::Undefined => ab(i.get_member_key(&pattern, "flags"))?,
+                    _ => __value_match_original,
+                }
             };
             (src, fl)
         } else {
@@ -455,32 +478,34 @@ pub(super) fn install_regexp(it: &mut Interp) {
         };
         let alloc_proto = ab(i.regexp_alloc_proto())?;
         let source = match src_v {
-            Value::Undefined => String::new(),
+            v if matches!(v.view(), ValueView::Undefined) => String::new(),
             v => ab(i.to_string(&v))?.to_string(),
         };
         let flags = match fl_v {
-            Value::Undefined => String::new(),
+            v if matches!(v.view(), ValueView::Undefined) => String::new(),
             v => ab(i.to_string(&v))?.to_string(),
         };
         ab(i.make_regexp_with_proto(&source, &flags, alloc_proto))
     });
-    Rc::make_mut(&mut it.extra_protos).insert("%RegExpCtor%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%RegExpCtor%", ctor);
     install_regexp_legacy_statics(it, &ctor);
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     install_species(it, &ctor);
     // The split paths prove the splitter's species lookup inert by this getter's identity: its
     // trivial native body may share an address with other functions, so it cannot be recognized
     // by function pointer.
     let species_getter = well_known_key(it, "species").and_then(|key| {
-        match ctor.borrow().props.get(&key).and_then(Property::getter) {
-            Some(Value::Obj(getter)) => Some(getter.clone()),
+        match (ctor.borrow().props.get(&key).and_then(Property::getter))
+            .map(|__value| (__value).view())
+        {
+            Some(ValueView::Obj(getter)) => Some(getter),
             _ => None,
         }
     });
@@ -507,8 +532,8 @@ pub(super) fn install_regexp(it: &mut Interp) {
         }
     }
     it.def_method(&ctor, "escape", 1, |i, _t, a| {
-        let s = match arg(a, 0) {
-            Value::Str(s) => s,
+        let s = match (arg(a, 0)).view() {
+            ValueView::Str(s) => s,
             _ => return Err(i.make_error("TypeError", "RegExp.escape requires a string")),
         };
         let mut out = String::new();
@@ -564,8 +589,8 @@ fn regexp_escape_cp(cp: u32, first: bool) -> String {
 /// brand-check that the receiver IS this realm's %RegExp% constructor.
 fn regexp_legacy_brand(i: &mut Interp, this: &Value) -> Result<Gc, Value> {
     let ctor = i.extra_protos.get("%RegExpCtor%").cloned();
-    match (this, ctor) {
-        (Value::Obj(o), Some(c)) if Rc::ptr_eq(o, &c) => Ok(c),
+    match (&(this).view(), ctor) {
+        (ValueView::Obj(o), Some(c)) if Gc::ptr_eq(o, &c) => Ok(c),
         _ => Err(i.make_error(
             "TypeError",
             "RegExp legacy static accessor called on an incompatible receiver",
@@ -652,8 +677,8 @@ pub(super) fn install_regexp_legacy_statics(it: &mut Interp, ctor: &Gc) {
 /// `this` must be an Object for the generic `RegExp.prototype[@@…]` methods (they read flags and
 /// call `exec` through ordinary property access rather than the internal slots).
 fn require_regexp_this(i: &mut Interp, this: &Value, name: &str) -> Result<(), Value> {
-    match this {
-        Value::Obj(_) => Ok(()),
+    match &(this).view() {
+        ValueView::Obj(_) => Ok(()),
         _ => Err(i.make_error("TypeError", format!("{name} called on a non-object"))),
     }
 }
@@ -678,15 +703,16 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         return regexp_exec_abstract(i, &this, s);
     }
     set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
-    let mut results: Vec<Value> = Vec::new();
+    // Rooted across later exec calls (I1).
+    let mut results = crate::rooting::RootedVec::new();
     loop {
-        let result = regexp_exec_abstract(i, &this, s.clone())?;
-        if matches!(result, Value::Null) {
+        let result = regexp_exec_abstract(i, &this, s)?;
+        if matches!((result).view(), ValueView::Null) {
             break;
         }
         let m0 = ab(i.get_member_key(&result, "0"))?;
         let match_str = ab(i.to_string(&m0))?;
-        results.push(Value::Str(match_str.clone()));
+        results.push(Value::Str(match_str));
         if match_str.is_empty() {
             let li = ab(i.get_member_key(&this, "lastIndex"))?;
             let li = to_length_val(i, &li)?;
@@ -697,7 +723,7 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     if results.is_empty() {
         Ok(Value::Null)
     } else {
-        Ok(i.make_array(results))
+        Ok(i.make_array(results.into_vec()))
     }
 }
 
@@ -730,8 +756,10 @@ pub(super) fn re_sym_match_discard_direct(
             .and_then(|last| last.caps.first().copied().flatten())
             .is_some_and(|(start, end)| start == end);
         if empty {
-            let li = match obj.borrow().props.get("lastIndex").map(Property::value) {
-                Some(Value::Num(n)) => n as usize,
+            let li = match (obj.borrow().props.get("lastIndex").map(Property::value))
+                .map(|__value| (__value).view())
+            {
+                Some(ValueView::Num(n)) => n as usize,
                 _ => unreachable!("direct match lastIndex guard"),
             };
             let next = advance_string_index(li, input, unicode);
@@ -754,8 +782,8 @@ fn re_sym_search(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Valu
     if !same_value(&cur, &prev) {
         set_throw(i, &this, "lastIndex", prev)?;
     }
-    match result {
-        Value::Null => Ok(Value::Num(-1.0)),
+    match (result).view() {
+        ValueView::Null => Ok(Value::Num(-1.0)),
         _ => ab(i.get_member_key(&result, "index")),
     }
 }
@@ -791,8 +819,10 @@ pub(super) fn re_sym_replace_discard_direct(
             .and_then(|last| last.caps.first().copied().flatten())
             .is_some_and(|(start, end)| start == end);
         if empty {
-            let li = match obj.borrow().props.get("lastIndex").map(Property::value) {
-                Some(Value::Num(n)) => n as usize,
+            let li = match (obj.borrow().props.get("lastIndex").map(Property::value))
+                .map(|__value| (__value).view())
+            {
+                Some(ValueView::Num(n)) => n as usize,
                 _ => unreachable!("direct replace lastIndex guard"),
             };
             let next = advance_string_index(li, input, unicode);
@@ -853,8 +883,8 @@ fn re_sym_replace_impl(
     // replacement coercion above have already happened. The live exec identity/prototype and
     // internal flags are checked before entering the allocation-free matcher.
     if discard_result && !functional {
-        if let Value::Obj(obj) = &this {
-            let ptr = Rc::as_ptr(obj) as usize;
+        if let ValueView::Obj(obj) = &(this).view() {
+            let ptr = Gc::as_ptr(obj) as usize;
             let re = i.regexps.get(&ptr).cloned();
             let direct_exec = re.as_ref().is_some_and(|re| {
                 let b = obj.borrow();
@@ -862,7 +892,7 @@ fn re_sym_replace_impl(
                     .proto
                     .as_ref()
                     .zip(i.extra_protos.get("RegExp"))
-                    .is_some_and(|(a, b)| Rc::ptr_eq(a, b));
+                    .is_some_and(|(a, b)| Gc::ptr_eq(a, b));
                 if !matches!(b.exotic, Exotic::None)
                     || b.props.contains("exec")
                     || !direct_proto
@@ -881,7 +911,7 @@ fn re_sym_replace_impl(
                             .map(Property::value)
                     })
                     .is_some_and(|value| {
-                        let Value::Obj(exec) = value else {
+                        let ValueView::Obj(exec) = (value).view() else {
                             return false;
                         };
                         let canonical = matches!(
@@ -905,8 +935,10 @@ fn re_sym_replace_impl(
                         .and_then(|last| last.caps.first().copied().flatten())
                         .is_some_and(|(start, end)| start == end);
                     if empty {
-                        let li = match obj.borrow().props.get("lastIndex").map(Property::value) {
-                            Some(Value::Num(n)) => n as usize,
+                        let li = match (obj.borrow().props.get("lastIndex").map(Property::value))
+                            .map(|__value| (__value).view())
+                        {
+                            Some(ValueView::Num(n)) => n as usize,
                             _ => unreachable!("discard matcher guarded lastIndex"),
                         };
                         let next = advance_string_index(li, &s, unicode);
@@ -920,13 +952,14 @@ fn re_sym_replace_impl(
         }
     }
     // Collect every match (RegExpExec advances lastIndex; empty matches step forward manually).
-    let mut results: Vec<Value> = Vec::new();
+    // The results stay rooted through later exec calls and the replacement pass (I1).
+    let mut results = crate::rooting::RootedVec::new();
     loop {
-        let result = regexp_exec_abstract(i, &this, s.clone())?;
-        if matches!(result, Value::Null) {
+        let result = regexp_exec_abstract(i, &this, s)?;
+        if matches!((result).view(), ValueView::Null) {
             break;
         }
-        results.push(result.clone());
+        results.push(result);
         if !global {
             break;
         }
@@ -963,10 +996,11 @@ fn re_sym_replace_impl(
         } else {
             (pos_raw as usize).min(size)
         };
-        let mut captures: Vec<Value> = Vec::new();
+        // Rooted: each later capture's Get and ToString may run user code.
+        let mut captures = crate::rooting::RootedVec::new();
         for n in 1..=ncaptures {
             let cap = ab(i.get_member_key(result, &n.to_string()))?;
-            captures.push(if matches!(cap, Value::Undefined) {
+            captures.push(if matches!((cap).view(), ValueView::Undefined) {
                 Value::Undefined
             } else {
                 Value::Str(ab(i.to_string(&cap))?)
@@ -974,23 +1008,26 @@ fn re_sym_replace_impl(
         }
         let mut named = ab(i.get_member_key(result, "groups"))?;
         // Non-functional replace ToObjects a present `groups` (null → TypeError).
-        if !functional && !matches!(named, Value::Undefined) && !matches!(named, Value::Obj(_)) {
-            match named {
-                Value::Null => {
+        if !functional
+            && !matches!((named).view(), ValueView::Undefined)
+            && !matches!((named).view(), ValueView::Obj(_))
+        {
+            match named.view() {
+                ValueView::Null => {
                     return Err(i.make_error("TypeError", "cannot convert null to object"));
                 }
-                other => named = box_primitive(i, other),
+                _ => named = box_primitive(i, named),
             }
         }
         let replacement = if functional {
-            let mut cbargs = vec![Value::Str(matched.clone())];
+            let mut cbargs = vec![Value::Str(matched)];
             cbargs.extend(captures.iter().cloned());
             cbargs.push(Value::Num(position as f64));
-            cbargs.push(Value::Str(s.clone()));
-            if !matches!(named, Value::Undefined) {
-                cbargs.push(named.clone());
+            cbargs.push(Value::Str(s));
+            if !matches!((named).view(), ValueView::Undefined) {
+                cbargs.push(named);
             }
-            let r = ab(i.call(repl.clone(), Value::Undefined, &cbargs))?;
+            let r = ab(i.call(repl, Value::Undefined, &cbargs))?;
             ab(i.to_string(&r))?.to_string()
         } else {
             get_substitution(i, &matched, &sunits, position, &captures, &named, &repl_str)?
@@ -1028,8 +1065,10 @@ fn re_sym_replace_direct(
     template: &crate::lstr::LStr,
 ) -> Result<Value, Value> {
     let uses_last = re.global || re.sticky;
-    let read_last = |obj: &Gc| match obj.borrow().props.get("lastIndex").map(Property::value) {
-        Some(Value::Num(n)) => n as usize,
+    let read_last = |obj: &Gc| match (obj.borrow().props.get("lastIndex").map(Property::value))
+        .map(|__value| (__value).view())
+    {
+        Some(ValueView::Num(n)) => n as usize,
         _ => unreachable!("direct replace lastIndex guard"),
     };
     let set_last = |obj: &Gc, n: usize| {
@@ -1079,7 +1118,7 @@ fn re_sym_replace_direct(
         }
     }
     if matches.is_empty() {
-        return Ok(Value::Str(s.clone()));
+        return Ok(Value::Str(*s));
     }
     let substitutes = replacer.is_none() && template.contains('$');
     let sunits = if substitutes {
@@ -1105,12 +1144,12 @@ fn re_sym_replace_direct(
             args.push(Value::Str(text.slice_lstr(start, end)));
             args.extend(captures());
             args.push(Value::Num(position as f64));
-            args.push(Value::Str(s.clone()));
+            args.push(Value::Str(*s));
             let groups = regexp_groups(i, re, caps, &text);
-            if !matches!(groups, Value::Undefined) {
+            if !matches!((groups).view(), ValueView::Undefined) {
                 args.push(groups);
             }
-            let result = ab(i.call(function.clone(), Value::Undefined, &args))?;
+            let result = ab(i.call(*function, Value::Undefined, &args))?;
             ab(i.to_string(&result))?
         } else if substitutes {
             let captures = captures();
@@ -1118,7 +1157,7 @@ fn re_sym_replace_direct(
             let matched = text.slice(start, end);
             get_substitution(i, &matched, &sunits, position, &captures, &named, template)?.into()
         } else {
-            template.clone()
+            *template
         };
         if start >= next {
             text.push_slice(&mut out, next, start);
@@ -1147,8 +1186,8 @@ fn get_substitution(
 ) -> Result<String, Value> {
     let tail = (position + crate::jstr::unit_len(matched)).min(sunits.len());
     let push_cap = |out: &mut String, cap: &Value| {
-        if let Value::Str(s) = cap {
-            out.push_str(s);
+        if let ValueView::Str(s) = (cap).view() {
+            out.push_str(&s);
         }
     };
     let t: Vec<char> = template.chars().collect();
@@ -1184,11 +1223,11 @@ fn get_substitution(
                 out.push_str(&crate::jstr::from_units(&sunits[tail..]));
                 k += 2;
             }
-            '<' if !matches!(named, Value::Undefined) => {
+            '<' if !matches!(&(named).view(), ValueView::Undefined) => {
                 if let Some(rel) = t[k + 2..].iter().position(|&c| c == '>') {
                     let name: String = t[k + 2..k + 2 + rel].iter().collect();
                     let v = ab(i.get_member_key(named, &name))?;
-                    if !matches!(v, Value::Undefined) {
+                    if !matches!((v).view(), ValueView::Undefined) {
                         out.push_str(&ab(i.to_string(&v))?);
                     }
                     k = k + 2 + rel + 1;
@@ -1245,7 +1284,7 @@ fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
     let c = species_constructor(i, &this, &default_ctor)?;
     let flags_v = ab(i.get_member_key(&this, "flags"))?;
     let flags = ab(i.to_string(&flags_v))?;
-    let matcher = ab(i.construct(c, &[this.clone(), Value::Str(flags.clone())]))?;
+    let matcher = ab(i.construct(c, &[this, Value::Str(flags)]))?;
     let li_v = ab(i.get_member_key(&this, "lastIndex"))?;
     let last = to_length_val(i, &li_v)?;
     ab(i.set_member_key(&matcher, "lastIndex", Value::Num(last as f64)))?;
@@ -1266,17 +1305,17 @@ fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
 /// %RegExp%.prototype without running user code. The splitter's own RegExpExec then finds the
 /// intrinsic `exec`. `None` when any of them could run user code.
 fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Regex>> {
-    let ptr = Rc::as_ptr(obj) as usize;
+    let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr)?.clone();
-    let proto = i.extra_protos.get("RegExp")?.clone();
-    let ctor = i.extra_protos.get("%RegExpCtor%")?.clone();
-    let species_getter = i.extra_protos.get("%RegExpSpeciesGetter%")?.clone();
+    let proto = *i.extra_protos.get("RegExp")?;
+    let ctor = *i.extra_protos.get("%RegExpCtor%")?;
+    let species_getter = *i.extra_protos.get("%RegExpSpeciesGetter%")?;
     let species_key = well_known_key(i, "species")?;
     let match_key = well_known_key(i, "match")?;
     {
         let b = obj.borrow();
         if !matches!(b.exotic, Exotic::None)
-            || b.proto.as_ref().is_none_or(|p| !Rc::ptr_eq(p, &proto))
+            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, &proto))
             || b.props.contains(&match_key)
             || [
                 "constructor",
@@ -1307,7 +1346,7 @@ fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Rege
             .filter(|property| !property.accessor())
             .map(Property::value)
             .is_some_and(
-                |value| matches!(value, Value::Obj(ref found) if Rc::ptr_eq(found, &ctor)),
+                |value| matches!((value).view(), ValueView::Obj(ref found) if Gc::ptr_eq(found, &ctor)),
             );
         let match_ok = p
             .props
@@ -1321,8 +1360,8 @@ fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Rege
         let c = ctor.borrow();
         let species_ok = c.props.get(&species_key).is_some_and(|property| {
             matches!(
-                property.getter(),
-                Some(Value::Obj(function)) if Rc::ptr_eq(function, &species_getter)
+                (property.getter()).map(|__value| (__value).view()),
+                Some(ValueView::Obj(function)) if Gc::ptr_eq(&function, &species_getter)
             ) && property.setter().is_none()
         });
         let prototype_ok = c
@@ -1331,7 +1370,7 @@ fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Rege
             .filter(|property| !property.accessor())
             .map(Property::value)
             .is_some_and(
-                |value| matches!(value, Value::Obj(ref found) if Rc::ptr_eq(found, &proto)),
+                |value| matches!((value).view(), ValueView::Obj(ref found) if Gc::ptr_eq(found, &proto)),
             );
         if !species_ok || !prototype_ok {
             return None;
@@ -1368,12 +1407,12 @@ fn re_sym_split_direct(
     s: &crate::lstr::LStr,
     limit: &Value,
 ) -> Option<Result<Value, Value>> {
-    let Value::Obj(obj) = rx else {
+    let ValueView::Obj(obj) = &(rx).view() else {
         return None;
     };
-    let lim = match limit {
-        Value::Undefined => u32::MAX,
-        Value::Num(n) => to_uint32(*n),
+    let lim = match &(limit).view() {
+        ValueView::Undefined => u32::MAX,
+        ValueView::Num(n) => to_uint32(*n),
         _ => return None,
     } as usize;
     let re = split_species_canonical(i, obj)?;
@@ -1398,7 +1437,7 @@ fn split_direct(
         if let Some(caps) = regexp_match_result(i, matched)? {
             update_regexp_legacy_statics(i, &search, &caps, &text, s);
         } else {
-            parts.push(Value::Str(s.clone()));
+            parts.push(Value::Str(*s));
         }
         return Ok(i.make_array(parts));
     }
@@ -1455,7 +1494,9 @@ pub(super) fn re_sym_split_discard_fast(
     separator: &Value,
     limit: &Value,
 ) -> Option<Result<Value, Value>> {
-    let (Value::Str(input), Value::Obj(obj), Value::Undefined) = (input, separator, limit) else {
+    let (ValueView::Str(input), ValueView::Obj(obj), ValueView::Undefined) =
+        (&(input).view(), &(separator).view(), &(limit).view())
+    else {
         return None;
     };
     let re = split_species_canonical(i, obj)?;
@@ -1474,8 +1515,8 @@ pub(super) fn re_sym_split_discard_fast(
         .map(Property::value)
         .is_some_and(|value| {
             matches!(
-                value,
-                Value::Obj(ref function)
+                (value).view(),
+                ValueView::Obj(ref function)
                     if matches!(
                         function.borrow().call,
                         Callable::Native(native)
@@ -1562,30 +1603,37 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     } else {
         format!("{flags}y")
     };
-    let splitter = ab(i.construct(c, &[this.clone(), Value::lstr(new_flags)]))?;
+    let splitter = ab(i.construct(c, &[this, Value::lstr(new_flags)]))?;
     // ToUint32 wraps modulo 2^32 over the whole Number range: -1 is 2^32 - 1, 2^32 is 0.
-    let limit = match arg(a, 1) {
-        Value::Undefined => u32::MAX as usize,
-        v => to_uint32(ab(i.to_number(&v))?) as usize,
+    let limit = {
+        let __value_match_original = arg(a, 1);
+        match (__value_match_original).view() {
+            ValueView::Undefined => u32::MAX as usize,
+            _ => {
+                let v = __value_match_original;
+                to_uint32(ab(i.to_number(&v))?) as usize
+            }
+        }
     };
-    let mut out: Vec<Value> = Vec::new();
+    // Rooted across the exec calls and captures' getters (I1).
+    let mut out = crate::rooting::RootedVec::new();
     if limit == 0 {
-        return Ok(i.make_array(out));
+        return Ok(i.make_array(out.into_vec()));
     }
     if size == 0 {
-        let z = regexp_exec_abstract(i, &splitter, s.clone())?;
-        if !matches!(z, Value::Null) {
-            return Ok(i.make_array(out));
+        let z = regexp_exec_abstract(i, &splitter, s)?;
+        if !matches!((z).view(), ValueView::Null) {
+            return Ok(i.make_array(out.into_vec()));
         }
         out.push(Value::Str(s));
-        return Ok(i.make_array(out));
+        return Ok(i.make_array(out.into_vec()));
     }
     let mut p = 0usize;
     let mut q = 0usize;
     while q < size {
         ab(i.set_member_key(&splitter, "lastIndex", Value::Num(q as f64)))?;
-        let z = regexp_exec_abstract(i, &splitter, s.clone())?;
-        if matches!(z, Value::Null) {
+        let z = regexp_exec_abstract(i, &splitter, s)?;
+        if matches!((z).view(), ValueView::Null) {
             q = advance_string_index(q, &s, unicode);
             continue;
         }
@@ -1597,7 +1645,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         }
         out.push(Value::lstr(crate::jstr::from_units(&sunits[p..q])));
         if out.len() == limit {
-            return Ok(i.make_array(out));
+            return Ok(i.make_array(out.into_vec()));
         }
         p = e;
         let len_v = ab(i.get_member_key(&z, "length"))?;
@@ -1606,11 +1654,11 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
             let cap = ab(i.get_member_key(&z, &n.to_string()))?;
             out.push(cap);
             if out.len() == limit {
-                return Ok(i.make_array(out));
+                return Ok(i.make_array(out.into_vec()));
             }
         }
         q = p;
     }
     out.push(Value::lstr(crate::jstr::from_units(&sunits[p..size])));
-    Ok(i.make_array(out))
+    Ok(i.make_array(out.into_vec()))
 }

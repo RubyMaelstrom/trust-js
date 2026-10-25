@@ -21,7 +21,7 @@ impl Write for Captured {
 fn constrained_prime_generation_matches_node_options() {
     let mut rt = Runtime::new();
     let out = Captured::default();
-    rt.engine().ctx().op_state().put(ConsoleOut {
+    rt.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

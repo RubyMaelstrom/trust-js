@@ -6,6 +6,7 @@ use crate::interpreter::{
     Abrupt, BufferData, Interp, MAX_ARGUMENTS_LEN, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN,
 };
 use crate::lstr::LStr;
+use crate::value::ValueView;
 use crate::value::*;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -78,8 +79,8 @@ fn arg(args: &[Value], i: usize) -> Value {
 /// complete coercive path with its abrupt completions and `valueOf`/`toString` ordering.
 #[inline]
 fn arg_to_number(i: &mut Interp, args: &[Value], idx: usize) -> Result<f64, Value> {
-    match args.get(idx) {
-        Some(Value::Num(n)) => Ok(*n),
+    match (args.get(idx)).map(|__value| (__value).view()) {
+        Some(ValueView::Num(n)) => Ok(n),
         _ => ab(i.to_number(&arg(args, idx))),
     }
 }
@@ -131,14 +132,19 @@ pub(crate) fn nf_function_apply(
     args: &[Value],
 ) -> Result<Value, Value> {
     let this_arg = arg(args, 0);
-    let list = match arg(args, 1) {
-        Value::Undefined | Value::Null => i.take_native_arg_buf(0),
-        Value::Obj(o) => {
+    let list = match (arg(args, 1)).view() {
+        ValueView::Undefined | ValueView::Null => {
+            crate::rooting::RootedVec::from_vec(i.take_native_arg_buf(0))
+        }
+        ValueView::Obj(o) => {
             let len = ab(i.to_length(&o))?;
             check_argument_count(i, len)?;
-            let direct_dense = i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
-                && !i.mapped_arguments.contains_key(&(Rc::as_ptr(&o) as usize));
-            let mut v = i.take_native_arg_buf(len);
+            let direct_dense = i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
+                && !i.mapped_arguments.contains_key(&(Gc::as_ptr(&o) as usize));
+            // CreateListFromArrayLike performs ordered Gets. A later getter may collect or
+            // replace an earlier source property, so the already evaluated prefix is rooted
+            // independently of the source object while this snapshot is built.
+            let mut v = crate::rooting::RootedVec::from_vec(i.take_native_arg_buf(len));
             for k in 0..len {
                 // Arrays and unmapped arguments objects overwhelmingly contain plain own dense
                 // entries. Read those by slot: the generic path allocates a decimal key and walks
@@ -153,22 +159,22 @@ pub(crate) fn nf_function_apply(
                 });
                 match own.flatten() {
                     Some(value) => v.push(value),
-                    None => v.push(ab(i.get_member_key(&Value::Obj(o.clone()), &k.to_string()))?),
+                    None => v.push(ab(i.get_member_key(&Value::Obj(o), &k.to_string()))?),
                 }
             }
             v
         }
         _ => return Err(i.make_error("TypeError", "apply: argument list must be array-like")),
     };
-    // The recycled buffer is returned even when the call throws: `call` never retains the slice
-    // (every callee copies arguments into its own activation), so recycling is unobservable.
+    // Keep the completed argument window rooted and immutable through the whole call, including
+    // native reentry, post-call polls and pending tails. Recycle only after those loans end.
     let call_result = i.call(this, this_arg, &list);
-    i.recycle_native_arg_buf(list);
+    i.recycle_native_arg_buf(list.into_vec());
     ab(call_result)
 }
 
 fn this_obj(this: &Value) -> Option<Gc> {
-    this.as_obj().cloned()
+    this.as_obj()
 }
 
 /// The newTarget realm's %RegExp.prototype% (GetFunctionRealm fallback for RegExp construction).
@@ -181,9 +187,9 @@ pub(crate) fn regexp_realm_proto(i: &mut Interp, nt: &Value) -> Result<Option<Gc
 fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<(), Value> {
     // Overwriting an existing own writable data property (the shape of every hot builtin write,
     // e.g. a RegExp's `lastIndex` after each exec) needs none of the [[Set]] machinery.
-    if let Value::Obj(o) = base {
+    if let ValueView::Obj(o) = &(base).view() {
         if matches!(o.borrow().exotic, crate::value::Exotic::None)
-            && i.ordinary_get_ptr(Rc::as_ptr(o) as usize)
+            && i.ordinary_get_ptr(Gc::as_ptr(o) as usize)
         {
             let mut b = o.borrow_mut();
             if b.props
@@ -195,7 +201,7 @@ fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<()
             }
         }
     }
-    let ok = ab(i.set_member_recv(base, key, value, base.clone()))?;
+    let ok = ab(i.set_member_recv(base, key, value, *base))?;
     if !ok {
         return Err(i.make_error(
             "TypeError",
@@ -237,9 +243,9 @@ fn date_style_default(i: &mut Interp, options: &Value, date: bool) -> Result<Val
     // ToDateTimeOptions(options, required, defaults) for toLocaleDateString(date)/toLocaleTimeString(time):
     // add the dimension's numeric defaults unless a component of that dimension (or a dateStyle/
     // timeStyle) is already present. The user's other-dimension components are kept (via the proto chain).
-    let user_obj = match options {
-        Value::Undefined => None,
-        Value::Obj(o) => Some(o.clone()),
+    let user_obj = match &(options).view() {
+        ValueView::Undefined => None,
+        ValueView::Obj(o) => Some(*o),
         _ => return Err(i.make_error("TypeError", "options must be an object")),
     };
     let dim: &[&str] = if date {
@@ -256,7 +262,10 @@ fn date_style_default(i: &mut Interp, options: &Value, date: bool) -> Result<Val
     let mut need = true;
     if user_obj.is_some() {
         for k in dim.iter().chain(["dateStyle", "timeStyle"].iter()) {
-            if !matches!(ab(i.get_member_key(options, k))?, Value::Undefined) {
+            if !matches!(
+                (ab(i.get_member_key(options, k))?).view(),
+                ValueView::Undefined
+            ) {
                 need = false;
                 break;
             }
@@ -264,7 +273,7 @@ fn date_style_default(i: &mut Interp, options: &Value, date: bool) -> Result<Val
     }
     let o = i.new_object();
     if let Some(uo) = &user_obj {
-        o.borrow_mut().proto = Some(uo.clone());
+        o.borrow_mut().proto = Some(*uo);
     }
     if need {
         let defs: &[&str] = if date {
@@ -282,9 +291,9 @@ fn date_style_default(i: &mut Interp, options: &Value, date: bool) -> Result<Val
 /// ToDateTimeOptions(options, "any", "all") for toLocaleString: add both date and time numeric
 /// defaults unless the caller already requested a date/time component or a dateStyle/timeStyle.
 fn date_all_default(i: &mut Interp, options: &Value) -> Result<Value, Value> {
-    let user_obj = match options {
-        Value::Undefined => None,
-        Value::Obj(o) => Some(o.clone()),
+    let user_obj = match &(options).view() {
+        ValueView::Undefined => None,
+        ValueView::Obj(o) => Some(*o),
         _ => return Err(i.make_error("TypeError", "options must be an object")),
     };
     let mut need = true;
@@ -302,7 +311,10 @@ fn date_all_default(i: &mut Interp, options: &Value) -> Result<Value, Value> {
             "dateStyle",
             "timeStyle",
         ] {
-            if !matches!(ab(i.get_member_key(options, k))?, Value::Undefined) {
+            if !matches!(
+                (ab(i.get_member_key(options, k))?).view(),
+                ValueView::Undefined
+            ) {
                 need = false;
                 break;
             }
@@ -310,7 +322,7 @@ fn date_all_default(i: &mut Interp, options: &Value) -> Result<Value, Value> {
     }
     let o = i.new_object();
     if let Some(uo) = &user_obj {
-        o.borrow_mut().proto = Some(uo.clone());
+        o.borrow_mut().proto = Some(*uo);
     }
     if need {
         for k in ["year", "month", "day", "hour", "minute", "second"] {
@@ -348,9 +360,15 @@ pub(crate) fn intl_delegate(
         ("NumberFormat", "format") => Ok(Value::Str(ab(i.to_string(&arg(call_args, 0)))?)),
         // Date.prototype.toLocale{,Date,Time}String → the plain toString rendering.
         ("DateTimeFormat", "format") => {
-            let t = match arg(call_args, 0) {
-                Value::Num(t) => t,
-                other => ab(i.to_number(&other))?,
+            let t = {
+                let __value_match_original = arg(call_args, 0);
+                match (__value_match_original).view() {
+                    ValueView::Num(t) => t,
+                    _ => {
+                        let other = __value_match_original;
+                        ab(i.to_number(&other))?
+                    }
+                }
             };
             Ok(Value::lstr(date::date_to_string(t)))
         }
@@ -366,7 +384,7 @@ pub(crate) fn intl_delegate(
 pub(crate) fn intl_service(i: &Interp, service: &str) -> Result<Value, Value> {
     i.extra_protos
         .get(format!("%Intl.{service}%").as_str())
-        .map(|c| Value::Obj(c.clone()))
+        .map(|c| Value::Obj(*c))
         .ok_or_else(|| i.make_error("TypeError", format!("Intl.{service} is unavailable")))
 }
 
@@ -391,17 +409,21 @@ pub(crate) fn intl_delegate(
 /// order: a Proxy runs §10.5.11; a TypedArray lists its valid integer indices first
 /// (§10.4.5.7); every other object uses OrdinaryOwnPropertyKeys order (array-index keys
 /// ascending, then strings, then symbols, each in insertion order).
-pub(crate) fn object_own_property_keys(i: &mut Interp, o: &Gc) -> Result<Vec<Value>, Value> {
+pub(crate) fn object_own_property_keys(
+    i: &mut Interp,
+    o: &Gc,
+) -> Result<crate::rooting::RootedVec, Value> {
     ab(i.defer_trigger(o, None))?;
-    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(*o)) {
         return proxy_own_keys(i, &target, &handler);
     }
-    let mut out: Vec<Value> = if let Some(info) = ta_info(i, o) {
+    // Rooted: callers walk the keys while running traps and getters.
+    let mut out: crate::rooting::RootedVec = if let Some(info) = ta_info(i, o) {
         (0..i.ta_len(&info).unwrap_or(0))
             .map(|k| Value::lstr(k.to_string()))
             .collect()
     } else {
-        Vec::new()
+        crate::rooting::RootedVec::new()
     };
     for k in ordinary_own_keys_ordered(i, o)? {
         if Interp::is_sym_key(&k) {
@@ -421,29 +443,29 @@ pub(crate) fn proxy_own_keys(
     i: &mut Interp,
     target: &Value,
     handler: &Value,
-) -> Result<Vec<Value>, Value> {
+) -> Result<crate::rooting::RootedVec, Value> {
     // ECMA-262 §10.5.11, steps 1-22 in order.
-    if matches!(handler, Value::Null) {
+    if matches!(&(handler).view(), ValueView::Null) {
         return Err(i.make_error("TypeError", "proxy is revoked"));
     }
-    let Value::Obj(target_object) = target else {
-        return Ok(Vec::new());
+    let ValueView::Obj(target_object) = &(target).view() else {
+        return Ok(crate::rooting::RootedVec::new());
     };
     let trap = ab(i.get_member_key(handler, "ownKeys"))?;
-    if matches!(trap, Value::Undefined | Value::Null) {
+    if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
         return object_own_property_keys(i, target_object);
     }
     if !trap.is_callable() {
         return Err(i.make_error("TypeError", "proxy 'ownKeys' trap is not callable"));
     }
-    let res = ab(i.call(trap, handler.clone(), std::slice::from_ref(target)))?;
-    if !matches!(res, Value::Obj(_)) {
+    let res = ab(i.call(trap, *handler, std::slice::from_ref(target)))?;
+    if !matches!((res).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "ownKeys trap must return an array-like object"));
     }
     let keys = ab(i.create_list_from_arraylike(&res))?;
     let mut key_strs: Vec<crate::value::PropertyKey> = Vec::with_capacity(keys.len());
     for k in &keys {
-        if !matches!(k, Value::Str(_) | Value::Sym(_)) {
+        if !matches!(&(k).view(), ValueView::Str(_) | ValueView::Sym(_)) {
             return Err(i.make_error(
                 "TypeError",
                 "ownKeys trap result must contain only strings and symbols",
@@ -502,11 +524,11 @@ pub(crate) fn proxy_own_keys(
 /// `[[IsExtensible]]`, proxy-aware (recurses into a proxy target, enforcing the trap invariant).
 pub(crate) fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
     if let Some((target, handler)) = proxy_pair(i, obj) {
-        if matches!(handler, Value::Null) {
+        if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
         let trap = ab(i.get_member_key(&handler, "isExtensible"))?;
-        if matches!(trap, Value::Undefined | Value::Null) {
+        if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
             return js_is_extensible(i, &target);
         }
         if !trap.is_callable() {
@@ -519,27 +541,27 @@ pub(crate) fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Valu
         }
         return Ok(result);
     }
-    Ok(matches!(obj, Value::Obj(o) if o.borrow().extensible))
+    Ok(matches!(&(obj).view(), ValueView::Obj(o) if o.borrow().extensible))
 }
 
 /// `[[SetPrototypeOf]]`, proxy-aware. Returns whether the operation succeeded (Reflect-style).
 fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<bool, Value> {
-    let o = match obj {
-        Value::Obj(o) => o.clone(),
+    let o = match &(obj).view() {
+        ValueView::Obj(o) => *o,
         _ => return Ok(true),
     };
     if let Some((target, handler)) = proxy_pair(i, obj) {
-        if matches!(handler, Value::Null) {
+        if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
         let trap = ab(i.get_member_key(&handler, "setPrototypeOf"))?;
-        if matches!(trap, Value::Undefined | Value::Null) {
+        if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
             return js_set_prototype_of(i, &target, proto);
         }
         if !trap.is_callable() {
             return Err(i.make_error("TypeError", "proxy 'setPrototypeOf' trap is not callable"));
         }
-        let res = ab(i.call(trap, handler, &[target.clone(), proto.clone()]))?;
+        let res = ab(i.call(trap, handler, &[target, *proto]))?;
         if !i.to_boolean(&res) {
             return Ok(false);
         }
@@ -556,17 +578,12 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         return Ok(true);
     }
     // Ordinary [[SetPrototypeOf]].
-    let cur = o
-        .borrow()
-        .proto
-        .clone()
-        .map(Value::Obj)
-        .unwrap_or(Value::Null);
+    let cur = o.borrow().proto.map(Value::Obj).unwrap_or(Value::Null);
     if i.strict_equals(proto, &cur) {
         return Ok(true);
     }
     // %Object.prototype% is an immutable-prototype exotic object: any actual change fails.
-    if Rc::ptr_eq(&o, &i.object_proto) {
+    if Gc::ptr_eq(&o, &i.object_proto) {
         return Ok(false);
     }
     if !o.borrow().extensible {
@@ -574,15 +591,15 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
     }
     // Cycle check: refuse if `o` already lies on the candidate prototype's chain (walking stops at
     // any proxy, whose [[GetPrototypeOf]] may be non-deterministic).
-    let mut p = proto.clone();
-    while let Value::Obj(po) = &p {
-        if Rc::ptr_eq(po, &o) {
+    let mut p = *proto;
+    while let ValueView::Obj(po) = &(p).view() {
+        if Gc::ptr_eq(po, &o) {
             return Ok(false);
         }
         if proxy_pair(i, &p).is_some() {
             break;
         }
-        let next = po.borrow().proto.clone();
+        let next = po.borrow().proto;
         p = match next {
             Some(n) => Value::Obj(n),
             None => break,
@@ -591,8 +608,8 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
     // Any successful prototype swap invalidates every property-creation inline cache: a chain
     // that was proven clean at fill time may now route through different objects.
     crate::value::bump_proto_epoch();
-    o.borrow_mut().proto = match proto {
-        Value::Obj(p) => Some(p.clone()),
+    o.borrow_mut().proto = match &(proto).view() {
+        ValueView::Obj(p) => Some(*p),
         _ => None,
     };
     Ok(true)
@@ -609,12 +626,15 @@ fn ta_byteoffset_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value,
 
 /// A proxy's own enumerable string keys (for Object.keys/values/entries): the ownKeys trap result
 /// filtered by each key's [[GetOwnProperty]] enumerable flag.
-pub(crate) fn proxy_enum_string_keys(i: &mut Interp, proxy: &Value) -> Result<Vec<Value>, Value> {
+pub(crate) fn proxy_enum_string_keys(
+    i: &mut Interp,
+    proxy: &Value,
+) -> Result<crate::rooting::RootedVec, Value> {
     let (target, handler) = proxy_pair(i, proxy).unwrap();
     let keys = proxy_own_keys(i, &target, &handler)?;
-    let mut out = Vec::new();
+    let mut out = crate::rooting::RootedVec::new();
     for k in keys {
-        if let Value::Str(ks) = &k {
+        if let ValueView::Str(ks) = &(k).view() {
             if proxy_key_enumerable(i, &target, &handler, &crate::value::encode_string_key(ks))? {
                 out.push(k);
             }
@@ -626,11 +646,11 @@ pub(crate) fn proxy_enum_string_keys(i: &mut Interp, proxy: &Value) -> Result<Ve
 /// `[[PreventExtensions]]`, proxy-aware. Returns whether it succeeded.
 fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
     if let Some((target, handler)) = proxy_pair(i, obj) {
-        if matches!(handler, Value::Null) {
+        if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
         let trap = ab(i.get_member_key(&handler, "preventExtensions"))?;
-        if matches!(trap, Value::Undefined | Value::Null) {
+        if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
             return js_prevent_extensions(i, &target);
         }
         if !trap.is_callable() {
@@ -650,7 +670,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         }
         return Ok(ok);
     }
-    if let Value::Obj(o) = obj {
+    if let ValueView::Obj(o) = &(obj).view() {
         // Web IDL §3.9.5: legacy platform objects must remain extensible.
         if i.host_indexed_len(o).is_some() {
             return Ok(false);
@@ -658,18 +678,19 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         // TypedArray [[PreventExtensions]] refuses unless IsTypedArrayFixedLength: length-tracking
         // views, and any view over a resizable (non-shared) buffer, can change length.
         if let Some(info) = ta_info(i, o) {
-            let resizable = Rc::as_ptr(o) as usize;
+            let resizable = Gc::as_ptr(o) as usize;
             let resizable = i
                 .ta_buffer
                 .get(&resizable)
                 .and_then(|b| b.as_obj())
                 .is_some_and(|b| {
                     matches!(
-                        b.borrow()
+                        (b.borrow()
                             .internal_slots()
                             .get("#\u{0}abResizable")
-                            .map(|p| p.value()),
-                        Some(Value::Bool(true))
+                            .map(|p| p.value()))
+                        .map(|__value| (__value).view()),
+                        Some(ValueView::Bool(true))
                     )
                 });
             let shared = i.is_shared_buffer(info.buffer);
@@ -688,7 +709,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
 
 fn proxy_get_prototype(i: &mut Interp, target: &Value, handler: &Value) -> Result<Value, Value> {
     let trap = ab(i.get_member_key(handler, "getPrototypeOf"))?;
-    if matches!(trap, Value::Undefined | Value::Null) {
+    if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
         // Forward to the target's [[GetPrototypeOf]] (recursing for a proxy target).
         return js_get_prototype_of(i, target);
     }
@@ -696,8 +717,8 @@ fn proxy_get_prototype(i: &mut Interp, target: &Value, handler: &Value) -> Resul
         return Err(i.make_error("TypeError", "proxy 'getPrototypeOf' trap is not callable"));
     }
     if trap.is_callable() {
-        let res = ab(i.call(trap, handler.clone(), std::slice::from_ref(target)))?;
-        if !matches!(res, Value::Obj(_) | Value::Null) {
+        let res = ab(i.call(trap, *handler, std::slice::from_ref(target)))?;
+        if !matches!((res).view(), ValueView::Obj(_) | ValueView::Null) {
             return Err(i.make_error(
                 "TypeError",
                 "getPrototypeOf trap must return an object or null",
@@ -717,12 +738,8 @@ fn proxy_get_prototype(i: &mut Interp, target: &Value, handler: &Value) -> Resul
             }
         }
         Ok(res)
-    } else if let Value::Obj(t) = target {
-        Ok(t.borrow()
-            .proto
-            .clone()
-            .map(Value::Obj)
-            .unwrap_or(Value::Null))
+    } else if let ValueView::Obj(t) = &(target).view() {
+        Ok(t.borrow().proto.map(Value::Obj).unwrap_or(Value::Null))
     } else {
         Ok(Value::Null)
     }
@@ -741,8 +758,8 @@ fn ta_buffer_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
 
 /// If `v` is a Proxy, its (target, handler) pair.
 pub(crate) fn proxy_pair(i: &Interp, v: &Value) -> Option<(Value, Value)> {
-    if let Value::Obj(o) = v {
-        i.proxies.get(&(Rc::as_ptr(o) as usize)).cloned()
+    if let ValueView::Obj(o) = (v).view() {
+        i.proxies.get(&(Gc::as_ptr(&o) as usize)).cloned()
     } else {
         None
     }
@@ -794,7 +811,7 @@ pub(crate) fn ta_accessor_getters() -> &'static [(TaAccessor, NativeFn); 4] {
 /// Which intrinsic %TypedArray.prototype% getter (of any Realm) `getter` is. Each computes its
 /// answer from a TypedArray receiver alone, so calling it on one is unobservable.
 pub(crate) fn ta_accessor_of(getter: &Value) -> Option<TaAccessor> {
-    let Value::Obj(getter) = getter else {
+    let ValueView::Obj(getter) = &(getter).view() else {
         return None;
     };
     let f = match getter.borrow().call {
@@ -810,18 +827,13 @@ pub(crate) fn ta_accessor_of(getter: &Value) -> Option<TaAccessor> {
 /// `[[GetPrototypeOf]]`, proxy-aware.
 pub(crate) fn js_get_prototype_of(i: &mut Interp, obj: &Value) -> Result<Value, Value> {
     if let Some((target, handler)) = proxy_pair(i, obj) {
-        if matches!(handler, Value::Null) {
+        if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
         return proxy_get_prototype(i, &target, &handler);
     }
-    Ok(match obj {
-        Value::Obj(o) => o
-            .borrow()
-            .proto
-            .clone()
-            .map(Value::Obj)
-            .unwrap_or(Value::Null),
+    Ok(match &(obj).view() {
+        ValueView::Obj(o) => o.borrow().proto.map(Value::Obj).unwrap_or(Value::Null),
         _ => Value::Null,
     })
 }
@@ -834,15 +846,17 @@ pub(crate) fn has_own_property_trapped(
     v: &Value,
     key: &str,
 ) -> Result<bool, Value> {
-    let Value::Obj(o) = v else { return Ok(false) };
+    let ValueView::Obj(o) = (v).view() else {
+        return Ok(false);
+    };
     {
         let object = o.borrow();
         if object.ic_plain.get() {
             return Ok(object.props.contains(key));
         }
     }
-    ab(i.defer_trigger(o, Some(key)))?;
-    if let Some(info) = ta_info(i, o) {
+    ab(i.defer_trigger(&o, Some(key)))?;
+    if let Some(info) = ta_info(i, &o) {
         match i.ta_index_kind(&info, key) {
             TaIndex::Element(_) => return Ok(true),
             TaIndex::Exotic => return Ok(false),
@@ -851,21 +865,22 @@ pub(crate) fn has_own_property_trapped(
     }
     if let Some((t, h)) = proxy_pair(i, v) {
         return Ok(!matches!(
-            proxy_gopd_value(i, &t, &h, key)?,
-            Value::Undefined
+            (proxy_gopd_value(i, &t, &h, key)?).view(),
+            ValueView::Undefined
         ));
     }
-    if ab(i.host_indexed_own_value(o, key))?.is_some() {
+    if ab(i.host_indexed_own_value(&o, key))?.is_some() {
         return Ok(true);
     }
-    let ptr = Rc::as_ptr(o) as usize;
+    let ptr = Gc::as_ptr(&o) as usize;
     if i.is_namespace(ptr) {
         if let Some(result) = i.namespace_own_property(ptr, key) {
             ab(result)?;
             return Ok(true);
         }
     }
-    Ok(o.borrow().props.contains(key))
+    let present = o.borrow().props.contains(key);
+    Ok(present)
 }
 
 /// ECMA-262 §6.2.6 / §10.1.5 [[GetOwnProperty]](P) for any object: the complete descriptor of
@@ -880,12 +895,14 @@ pub(crate) fn object_get_own_property(
 ) -> Result<Option<Property>, Value> {
     {
         let body = o.borrow();
-        if body.ic_plain.get() && matches!(body.exotic, Exotic::None | Exotic::Array) {
+        if body.ic_plain.get()
+            && (body.exotic.is_ordinary() || matches!(body.exotic, Exotic::Array))
+        {
             return Ok(body.props.get(key).cloned());
         }
     }
     ab(i.defer_trigger(o, Some(key)))?;
-    let ptr = Rc::as_ptr(o) as usize;
+    let ptr = Gc::as_ptr(o) as usize;
     // A mapped arguments index reports the live parameter value (§10.4.4.1).
     if let Some(value) = i.mapped_arg_value(ptr, key) {
         let mut property = o.borrow().props.get(key).cloned();
@@ -916,7 +933,7 @@ pub(crate) fn object_get_own_property(
             true,
         )));
     }
-    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(*o)) {
         return proxy_get_own_property(i, &target, &handler, key);
     }
     if i.is_namespace(ptr) {
@@ -933,8 +950,8 @@ fn target_own_property(
     target: &Value,
     key: &str,
 ) -> Result<Option<Property>, Value> {
-    match target {
-        Value::Obj(target) => object_get_own_property(i, target, key),
+    match &(target).view() {
+        ValueView::Obj(target) => object_get_own_property(i, target, key),
         _ => Ok(None),
     }
 }
@@ -946,11 +963,11 @@ fn proxy_get_own_property(
     handler: &Value,
     key: &str,
 ) -> Result<Option<Property>, Value> {
-    if matches!(handler, Value::Null) {
+    if matches!(&(handler).view(), ValueView::Null) {
         return Err(i.make_error("TypeError", "proxy is revoked"));
     }
     let trap = ab(i.get_member_key(handler, "getOwnPropertyDescriptor"))?;
-    if matches!(trap, Value::Undefined | Value::Null) {
+    if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
         return target_own_property(i, target, key);
     }
     if !trap.is_callable() {
@@ -962,15 +979,15 @@ fn proxy_get_own_property(
     let key_val = i
         .sym_from_key(key)
         .unwrap_or_else(|| crate::value::string_key_value(key));
-    let result = ab(i.call(trap, handler.clone(), &[target.clone(), key_val]))?;
-    if !matches!(result, Value::Obj(_) | Value::Undefined) {
+    let result = ab(i.call(trap, *handler, &[*target, key_val]))?;
+    if !matches!((result).view(), ValueView::Obj(_) | ValueView::Undefined) {
         return Err(i.make_error(
             "TypeError",
             "getOwnPropertyDescriptor trap must return an object or undefined",
         ));
     }
     let target_desc = target_own_property(i, target, key)?;
-    if matches!(result, Value::Undefined) {
+    if matches!((result).view(), ValueView::Undefined) {
         let Some(target_desc) = target_desc else {
             return Ok(None);
         };
@@ -1119,8 +1136,8 @@ fn proxy_key_enumerable(
         let kv = i
             .sym_from_key(key)
             .unwrap_or_else(|| crate::value::string_key_value(key));
-        let res = ab(i.call(trap, handler.clone(), &[target.clone(), kv]))?;
-        if matches!(res, Value::Undefined) {
+        let res = ab(i.call(trap, *handler, &[*target, kv]))?;
+        if matches!((res).view(), ValueView::Undefined) {
             return Ok(false);
         }
         let enum_v = ab(i.get_member_key(&res, "enumerable"))?;
@@ -1128,7 +1145,7 @@ fn proxy_key_enumerable(
     } else if let Some((t2, h2)) = proxy_pair(i, target) {
         // Absent gOPD trap over a proxy target: forward to the target's [[GetOwnProperty]].
         proxy_key_enumerable(i, &t2, &h2, key)
-    } else if let Value::Obj(t) = target {
+    } else if let ValueView::Obj(t) = &(target).view() {
         if ab(i.host_indexed_own_value(t, key))?.is_some() {
             return Ok(crate::value::canonical_index(key).is_some());
         }
@@ -1150,11 +1167,11 @@ fn proxy_define_property(
     desc: &Value,
 ) -> Result<bool, Abrupt> {
     let trap = i.get_member_key(handler, "defineProperty")?;
-    if matches!(trap, Value::Undefined | Value::Null) {
+    if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
         if let Some((t2, h2)) = proxy_pair(i, target) {
             return proxy_define_property(i, &t2, &h2, key, desc);
         }
-        return if let Value::Obj(t) = target {
+        return if let ValueView::Obj(t) = &(target).view() {
             define_own_property(i, t, key, desc)
         } else {
             Ok(false)
@@ -1171,16 +1188,16 @@ fn proxy_define_property(
     let pd = build_partial(i, desc)?;
     let norm = i.new_object();
     if let Some(v) = &pd.value {
-        set_data(&norm, "value", v.clone());
+        set_data(&norm, "value", *v);
     }
     if let Some(w) = pd.writable {
         set_data(&norm, "writable", Value::Bool(w));
     }
     if let Some(g) = &pd.get {
-        set_data(&norm, "get", g.clone());
+        set_data(&norm, "get", *g);
     }
     if let Some(st) = &pd.set {
-        set_data(&norm, "set", st.clone());
+        set_data(&norm, "set", *st);
     }
     if let Some(e) = pd.enumerable {
         set_data(&norm, "enumerable", Value::Bool(e));
@@ -1188,18 +1205,14 @@ fn proxy_define_property(
     if let Some(c) = pd.configurable {
         set_data(&norm, "configurable", Value::Bool(c));
     }
-    let res = i.call(
-        trap,
-        handler.clone(),
-        &[target.clone(), key_val, Value::Obj(norm)],
-    )?;
+    let res = i.call(trap, *handler, &[*target, key_val, Value::Obj(norm)])?;
     if !i.to_boolean(&res) {
         return Ok(false);
     }
     // ECMA-262 §10.5.6 steps 11-16: validate against target.[[GetOwnProperty]](P) and
     // IsExtensible(target), both of which may run a Proxy target's traps.
-    let target_desc = match target {
-        Value::Obj(t) => object_get_own_property(i, t, key).map_err(Abrupt::Throw)?,
+    let target_desc = match &(target).view() {
+        ValueView::Obj(t) => object_get_own_property(i, t, key).map_err(Abrupt::Throw)?,
         _ => None,
     };
     let extensible_target = js_is_extensible(i, target).map_err(Abrupt::Throw)?;
@@ -1266,7 +1279,7 @@ fn ta_receiver(i: &mut Interp, this: &Value) -> Result<(crate::value::TaInfo, bo
 
 /// RequireObjectCoercible for an `Array.prototype` method receiver (null/undefined → TypeError).
 fn arr_require_coercible(i: &mut Interp, this: &Value) -> Result<(), Value> {
-    if matches!(this, Value::Undefined | Value::Null) {
+    if matches!(&(this).view(), ValueView::Undefined | ValueView::Null) {
         return Err(i.make_error(
             "TypeError",
             "Array.prototype method called on null or undefined",
@@ -1277,21 +1290,27 @@ fn arr_require_coercible(i: &mut Interp, this: &Value) -> Result<(), Value> {
 
 /// TypedArray info for `o`, if it is one.
 fn ta_info(i: &Interp, o: &Gc) -> Option<crate::value::TaInfo> {
-    i.typed_arrays.get(&(Rc::as_ptr(o) as usize)).copied()
+    i.typed_arrays.get(&(Gc::as_ptr(o) as usize)).copied()
 }
 
 /// ToObject for an `Object.*` argument: an object is returned as-is, a primitive is boxed to its
 /// wrapper object, and null/undefined throw a TypeError.
 fn to_object_arg(i: &mut Interp, v: Value, method: &str) -> Result<Gc, Value> {
-    match v {
-        Value::Obj(o) => Ok(o),
-        Value::Undefined | Value::Null => {
-            Err(i.make_error("TypeError", format!("{method} called on null or undefined")))
+    {
+        let __value_match_original = v;
+        match (__value_match_original).view() {
+            ValueView::Obj(o) => Ok(o),
+            ValueView::Undefined | ValueView::Null => {
+                Err(i.make_error("TypeError", format!("{method} called on null or undefined")))
+            }
+            _ => {
+                let other = __value_match_original;
+                match (box_primitive(i, other)).view() {
+                    ValueView::Obj(o) => Ok(o),
+                    _ => Err(i.make_error("TypeError", "ToObject failed")),
+                }
+            }
         }
-        other => match box_primitive(i, other) {
-            Value::Obj(o) => Ok(o),
-            _ => Err(i.make_error("TypeError", "ToObject failed")),
-        },
     }
 }
 
@@ -1304,7 +1323,7 @@ pub(crate) fn to_object_for_method(i: &mut Interp, v: Value, method: &str) -> Re
 /// ToObject for a generic `Array.prototype` method receiver: primitives are boxed (so the method
 /// reads the inherited array-like properties), null/undefined throw.
 fn arr_to_object(i: &mut Interp, this: &Value) -> Result<Gc, Value> {
-    to_object_arg(i, this.clone(), "Array.prototype method")
+    to_object_arg(i, *this, "Array.prototype method")
 }
 
 /// Set(to, key, value) with Throw=true, for Object.assign: a non-writable data property or a
@@ -1318,12 +1337,12 @@ fn assign_set(i: &mut Interp, to: &Value, key: &str, value: Value) -> Result<(),
 /// IsArray, seeing through proxies (a Proxy whose target is an Array is itself an Array).
 fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
     if let Some((target, handler)) = proxy_pair(i, v) {
-        if matches!(handler, Value::Null) {
+        if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "Cannot perform IsArray on a revoked Proxy"));
         }
         return json_is_array(i, &target);
     }
-    Ok(matches!(v, Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Array)))
+    Ok(matches!(&(v).view(), ValueView::Obj(o) if matches!(o.borrow().exotic, Exotic::Array)))
 }
 
 /// EnumerableOwnProperties for Object.values/entries: for each own string key (in order), do
@@ -1335,7 +1354,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
     // is the required key order. A failed proof runs the ordered algorithm below.
     if let Some(object) = o
         .as_obj()
-        .filter(|object| i.ordinary_get_ptr(Rc::as_ptr(object) as usize))
+        .filter(|object| i.ordinary_get_ptr(Gc::as_ptr(object) as usize))
     {
         let object = object.borrow();
         if object.ic_plain.get()
@@ -1349,7 +1368,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             for (key, property) in object.props.iter() {
                 out.push(if entries {
                     let key = i.property_key_string(key);
-                    i.make_entry_pair(key, property.clone_value_packed())
+                    i.make_entry_pair(key, property.value())
                 } else {
                     property.value()
                 });
@@ -1357,24 +1376,25 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             return Ok(i.make_array(out));
         }
     }
-    let mut out = Vec::new();
+    // Rooted across the getters and traps each later key runs (I1).
+    let mut out = crate::rooting::RootedVec::new();
     if let Some((t, h)) = proxy_pair(i, o) {
         for k in proxy_own_keys(i, &t, &h)? {
-            if let Value::Str(ks) = &k {
+            if let ValueView::Str(ks) = &(k).view() {
                 if proxy_key_enumerable(i, &t, &h, &crate::value::encode_string_key(ks))? {
                     let v = ab(i.get_member_key(o, &crate::value::encode_string_key(ks)))?;
                     out.push(if entries {
-                        i.make_array(vec![Value::Str(ks.clone()), v])
+                        i.make_array(vec![Value::Str(*ks), v])
                     } else {
                         v
                     });
                 }
             }
         }
-    } else if let Some((object, length)) = o.as_obj().and_then(|object| {
-        i.host_indexed_len(object)
-            .map(|length| (object.clone(), length))
-    }) {
+    } else if let Some((object, length)) = o
+        .as_obj()
+        .and_then(|object| i.host_indexed_len(&object).map(|length| (object, length)))
+    {
         debug_assert_eq!(i.host_indexed_len(&object), Some(length));
         let keys = ordinary_own_keys_ordered(i, &object)?;
         for key in keys.into_iter().filter(|key| !Interp::is_sym_key(key)) {
@@ -1400,7 +1420,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
                 value
             });
         }
-    } else if let Some(info) = o.as_obj().and_then(|obj| ta_info(i, obj)) {
+    } else if let Some(info) = o.as_obj().and_then(|obj| ta_info(i, &obj)) {
         // A TypedArray's enumerable own properties are its integer indices (plus any expandos).
         // Its elements never live in the property map, and `length` etc. are inherited
         // accessors, so every string key the map holds is an ordinary own property.
@@ -1466,7 +1486,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             });
         }
     }
-    Ok(i.make_array(out))
+    Ok(i.make_array(out.into_vec()))
 }
 
 #[cfg(test)]
@@ -1499,12 +1519,12 @@ pub(crate) fn reflect_ordinary_set(
     // TypedArraySetElement (which coerces the value unconditionally, writing only when the index is
     // in range) and never falls back to creating an ordinary shadowing property.
     // A module namespace exotic object's [[Set]] always returns false.
-    if let Value::Obj(o) = target {
-        if i.is_namespace(Rc::as_ptr(o) as usize) {
+    if let ValueView::Obj(o) = &(target).view() {
+        if i.is_namespace(Gc::as_ptr(o) as usize) {
             return Ok(false);
         }
     }
-    let mut current = target.clone();
+    let mut current = *target;
     loop {
         if proxy_pair(i, &current).is_some() {
             // A proxy's [[Set]] returns its own success boolean (via the trap or a forwarded [[Set]]).
@@ -1512,7 +1532,7 @@ pub(crate) fn reflect_ordinary_set(
             // strict. PutValue's caller applies strictness after this internal operation.
             let strict = i.strict;
             i.strict = false;
-            let result = i.set_member_recv(&current, key, value, receiver.clone());
+            let result = i.set_member_recv(&current, key, value, *receiver);
             i.strict = strict;
             return ab(result);
         }
@@ -1523,7 +1543,7 @@ pub(crate) fn reflect_ordinary_set(
         // non-index is an inert success.
         if let Some(info) = map_ptr(&current).and_then(|p| i.typed_arrays.get(&p).copied()) {
             if i.canonical_numeric_index(key).is_some() {
-                let same = matches!((&current, receiver), (Value::Obj(a), Value::Obj(b)) if Rc::ptr_eq(a, b));
+                let same = matches!((&(current).view(), &(receiver).view()), (ValueView::Obj(a), ValueView::Obj(b)) if Gc::ptr_eq(a, b));
                 if same {
                     if info.kind.is_bigint() {
                         let n = ab(i.to_bigint(&value))?;
@@ -1547,8 +1567,8 @@ pub(crate) fn reflect_ordinary_set(
                 }
             }
         }
-        let obj = match &current {
-            Value::Obj(o) => o.clone(),
+        let obj = match &(current).view() {
+            ValueView::Obj(o) => *o,
             _ => return Ok(false),
         };
         if i.host_indexed_array_key(&obj, key) && ab(i.host_indexed_own_value(&obj, key))?.is_some()
@@ -1560,7 +1580,7 @@ pub(crate) fn reflect_ordinary_set(
             Some(p) if p.accessor() => {
                 return match p.setter().cloned() {
                     Some(setter) if setter.is_callable() => {
-                        ab(i.call_callback(setter, receiver.clone(), &[value]))?;
+                        ab(i.call_callback(setter, *receiver, &[value]))?;
                         Ok(true)
                     }
                     _ => Ok(false),
@@ -1573,7 +1593,7 @@ pub(crate) fn reflect_ordinary_set(
                 return reflect_define_on_receiver(i, receiver, key, value);
             }
             None => {
-                let proto = obj.borrow().proto.clone();
+                let proto = obj.borrow().proto;
                 match proto {
                     Some(pp) => current = Value::Obj(pp),
                     None => return reflect_define_on_receiver(i, receiver, key, value),
@@ -1598,14 +1618,15 @@ pub(crate) fn reflect_define_on_receiver(
         // property is redefined with just {value}, and an absent one gets CreateDataProperty.
         let existing = proxy_gopd_value(i, &target, &handler, key)?;
         let desc = i.new_object();
-        if let Value::Obj(d) = &existing {
+        if let ValueView::Obj(d) = &(existing).view() {
             let (is_accessor, writable) = {
                 let db = d.borrow();
                 (
                     db.props.contains("get") || db.props.contains("set"),
                     matches!(
-                        db.props.get("writable").map(|p| p.value()),
-                        Some(Value::Bool(true))
+                        (db.props.get("writable").map(|p| p.value()))
+                            .map(|__value| (__value).view()),
+                        Some(ValueView::Bool(true))
                     ),
                 )
             };
@@ -1627,8 +1648,8 @@ pub(crate) fn reflect_define_on_receiver(
             &Value::Obj(desc),
         ));
     }
-    let ro = match receiver {
-        Value::Obj(o) => o.clone(),
+    let ro = match &(receiver).view() {
+        ValueView::Obj(o) => *o,
         _ => return Ok(false),
     };
     // A TypedArray receiver's integer index is written through its exotic [[DefineOwnProperty]]
@@ -1696,20 +1717,20 @@ pub(crate) fn reflect_ordinary_get(
     key: &str,
     receiver: &Value,
 ) -> Result<Value, Value> {
-    let mut current = target.clone();
+    let mut current = *target;
     loop {
         if proxy_pair(i, &current).is_some() {
             // A proxy's [[Get]](P, Receiver) threads the explicit receiver.
-            return ab(i.get_member_recv(&current, key, receiver.clone()));
+            return ab(i.get_member_recv(&current, key, *receiver));
         }
-        let obj = match &current {
-            Value::Obj(o) => o.clone(),
+        let obj = match &(current).view() {
+            ValueView::Obj(o) => *o,
             _ => return Ok(Value::Undefined),
         };
         // A deferred namespace on the chain triggers its module's evaluation before the read.
         ab(i.defer_trigger(&obj, Some(key)))?;
         // A module namespace's [[Get]] reads the export's live value (throwing for a TDZ binding).
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         if i.is_namespace(ptr) {
             if let Some(res) = i.namespace_own_property(ptr, key) {
                 return Ok(ab(res)?.into_value());
@@ -1731,13 +1752,13 @@ pub(crate) fn reflect_ordinary_get(
         match own {
             Some(p) if p.accessor() => {
                 return match p.getter().cloned() {
-                    Some(g) if g.is_callable() => ab(i.call_callback(g, receiver.clone(), &[])),
+                    Some(g) if g.is_callable() => ab(i.call_callback(g, *receiver, &[])),
                     _ => Ok(Value::Undefined),
                 };
             }
             Some(p) => return Ok(p.into_value()),
             None => {
-                let proto = obj.borrow().proto.clone();
+                let proto = obj.borrow().proto;
                 match proto {
                     Some(pp) => current = Value::Obj(pp),
                     None => return Ok(Value::Undefined),
@@ -1763,7 +1784,7 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
         }
         return Ok(());
     }
-    if let Value::Obj(o) = holder {
+    if let ValueView::Obj(o) = &(holder).view() {
         if i.host_indexed_array_key(o, key) {
             let supported = crate::value::canonical_index(key)
                 .is_some_and(|index| index < i.host_indexed_len(o).unwrap_or(0));
@@ -1812,7 +1833,7 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
 }
 
 fn set_internal_obj(target: &Value, key: &str, v: Value) {
-    if let Value::Obj(o) = target {
+    if let ValueView::Obj(o) = &(target).view() {
         o.borrow_mut()
             .internal_slots_mut()
             .insert(key, Property::data(v, true, false, false));
@@ -1826,7 +1847,7 @@ fn set_internal_obj(target: &Value, key: &str, v: Value) {
 /// fully populated Array, which nothing else can reach.
 fn make_aggregate_error(i: &Interp, errors: Value) -> Value {
     let error = i.make_error("AggregateError", "");
-    if let Value::Obj(o) = &error {
+    if let ValueView::Obj(o) = &(error).view() {
         o.borrow_mut()
             .props
             .insert("errors", Property::data(errors, true, false, true));
@@ -1836,8 +1857,8 @@ fn make_aggregate_error(i: &Interp, errors: Value) -> Value {
 
 /// `Promise.resolve(x)` as a value helper (returns existing promises unchanged).
 fn promise_resolve_value(i: &mut Interp, v: Value) -> Value {
-    if let Value::Obj(o) = &v {
-        if i.promises.contains_key(&(Rc::as_ptr(o) as usize)) {
+    if let ValueView::Obj(o) = (v).view() {
+        if i.promises.contains_key(&(Gc::as_ptr(&o) as usize)) {
             return v;
         }
     }
@@ -1857,9 +1878,9 @@ fn proxy_uncallable(i: &mut Interp, _t: Value, _a: &[Value]) -> Result<Value, Va
 /// call from any native constructor: outside a `new`, `new_target` is Undefined so the default wins.
 /// CanBeHeldWeakly: an object, or a non-registered (collectable) symbol.
 fn can_be_held_weakly(i: &Interp, v: &Value) -> bool {
-    match v {
-        Value::Obj(_) => true,
-        Value::Sym(s) => !i.symbol_is_registered(s),
+    match &(v).view() {
+        ValueView::Obj(_) => true,
+        ValueView::Sym(s) => !i.symbol_is_registered(s),
         _ => false,
     }
 }
@@ -1938,7 +1959,7 @@ fn uri_decode(s: &str, preserve: &str) -> Option<String> {
 /// SetIntegrityLevel(obj, frozen?): PreventExtensions then make every own property non-configurable
 /// (and, when freezing, non-writable for data properties), all through trap-aware operations.
 fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool, Value> {
-    if !matches!(obj, Value::Obj(_)) {
+    if !matches!(&(obj).view(), ValueView::Obj(_)) {
         return Ok(true);
     }
     if !js_prevent_extensions(i, obj)? {
@@ -1946,7 +1967,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
     }
     // TypedArray elements can never be made non-configurable (or non-writable), so sealing or
     // freezing any view that currently has elements fails at the first DefinePropertyOrThrow.
-    if let Value::Obj(o) = obj {
+    if let ValueView::Obj(o) = &(obj).view() {
         if let Some(info) = ta_info(i, o) {
             if i.ta_len(&info).unwrap_or(0) > 0 {
                 return Ok(false);
@@ -1954,9 +1975,12 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         }
     }
     let proxy = proxy_pair(i, obj);
+    // A Symbol key's cell stays rooted while the traps below run.
+    let mut key_roots = crate::rooting::ValueRoots::new();
     let keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = &proxy {
         let mut ks = Vec::new();
         for k in proxy_own_keys(i, t, h)? {
+            key_roots.keep(&k);
             ks.push(ab(i.to_property_key(&k))?);
         }
         ks
@@ -1973,7 +1997,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
     for key in keys {
         let is_accessor = if let Some((t, h)) = &proxy {
             let d = proxy_gopd_value(i, t, h, &key)?;
-            matches!(&d, Value::Obj(o) if o.borrow().props.contains("get") || o.borrow().props.contains("set"))
+            matches!(&(d).view(), ValueView::Obj(o) if o.borrow().props.contains("get") || o.borrow().props.contains("set"))
         } else {
             obj.as_obj()
                 .unwrap()
@@ -1993,7 +2017,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         } else {
             ab(define_own_property(
                 i,
-                obj.as_obj().unwrap(),
+                &obj.as_obj().unwrap(),
                 &key,
                 &Value::Obj(desc),
             ))?
@@ -2006,15 +2030,18 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
 }
 
 pub(crate) fn new_from_ctor(i: &mut Interp, default_proto: &str) -> Result<Gc, Value> {
-    let proto = match &i.new_target {
-        nt @ Value::Obj(_) => match ab(i.get_member_key(&nt.clone(), "prototype"))? {
-            Value::Obj(p) => Some(p),
-            // The constructor's `prototype` isn't an object — use its realm's intrinsic
-            // (GetFunctionRealm, which throws for a proxy revoked mid-construct — the
-            // `prototype` getter may have revoked it).
-            _ => ctor_realm_proto(i, &i.new_target.clone(), default_proto)?
-                .or_else(|| i.extra_protos.get(default_proto).cloned()),
-        },
+    let nt = i.constructor_new_target();
+    let proto = match nt.view() {
+        ValueView::Obj(_) => {
+            match (ab(i.get_member_key(&nt.clone(), "prototype"))?).view() {
+                ValueView::Obj(p) => Some(p),
+                // The constructor's `prototype` isn't an object — use its realm's intrinsic
+                // (GetFunctionRealm, which throws for a proxy revoked mid-construct — the
+                // `prototype` getter may have revoked it).
+                _ => ctor_realm_proto(i, &i.constructor_new_target(), default_proto)?
+                    .or_else(|| i.extra_protos.get(default_proto).cloned()),
+            }
+        }
         _ => i.extra_protos.get(default_proto).cloned(),
     };
     Ok(Object::new(proto))
@@ -2055,25 +2082,30 @@ fn object_define_properties(
     who: &str,
 ) -> Result<(), Value> {
     let props = Value::Obj(to_object_arg(i, props_arg, who)?);
-    let keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = proxy_pair(i, &props) {
-        let mut ks = Vec::new();
-        for k in proxy_own_keys(i, &t, &h)? {
-            ks.push(ab(i.to_property_key(&k))?);
-        }
-        ks
-    } else {
-        ordinary_own_keys_ordered(i, props.as_obj().unwrap())?
-            .into_iter()
-            .map(crate::value::PropertyKey::stored)
-            .collect()
-    };
+    // Rooted: a Symbol key's cell outlives traps and getters, which may delete it.
+    let keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
+        crate::rooting::Rooted::new(if let Some((t, h)) = proxy_pair(i, &props) {
+            let mut ks = Vec::new();
+            let proxy_keys = proxy_own_keys(i, &t, &h)?;
+            for k in proxy_keys.iter() {
+                ks.push(ab(i.to_property_key(k))?);
+            }
+            ks
+        } else {
+            ordinary_own_keys_ordered(i, &props.as_obj().unwrap())?
+                .into_iter()
+                .map(crate::value::PropertyKey::stored)
+                .collect()
+        });
     // Collect descriptor objects for enumerable own keys first (so all Gets precede any Defines).
+    // They stay rooted through later getters and the defines' descriptor reads (I1).
     let mut descs: Vec<(crate::value::PropertyKey, Value)> = Vec::new();
-    for key in keys {
+    let mut roots = crate::rooting::ValueRoots::new();
+    for key in keys.iter().cloned() {
         let enumerable = if let Some((t, h)) = proxy_pair(i, &props) {
             let d = proxy_gopd_value(i, &t, &h, &key)?;
-            match &d {
-                Value::Obj(_) => {
+            match &(d).view() {
+                ValueView::Obj(_) => {
                     let e = ab(i.get_member_key(&d, "enumerable"))?;
                     i.to_boolean(&e)
                 }
@@ -2081,7 +2113,7 @@ fn object_define_properties(
             }
         } else {
             let object = props.as_obj().unwrap();
-            if ab(i.host_indexed_own_value(object, &key))?.is_some() {
+            if ab(i.host_indexed_own_value(&object, &key))?.is_some() {
                 crate::value::canonical_index(&key).is_some()
             } else {
                 object
@@ -2094,6 +2126,7 @@ fn object_define_properties(
         };
         if enumerable {
             let desc_obj = ab(i.get_member_key(&props, &key))?;
+            roots.keep(&desc_obj);
             descs.push((key, desc_obj));
         }
     }
@@ -2101,7 +2134,12 @@ fn object_define_properties(
         let ok = if let Some((t, h)) = proxy_pair(i, o) {
             ab(proxy_define_property(i, &t, &h, &key, &desc_obj))?
         } else {
-            ab(define_own_property(i, o.as_obj().unwrap(), &key, &desc_obj))?
+            ab(define_own_property(
+                i,
+                &o.as_obj().unwrap(),
+                &key,
+                &desc_obj,
+            ))?
         };
         if !ok {
             return Err(i.make_error("TypeError", "cannot define property"));
@@ -2112,9 +2150,12 @@ fn object_define_properties(
 
 /// CreateListFromArrayLike: the object must be array-like (TypeError otherwise); reads `length`
 /// (ToLength) then the indexed elements in order. Used by Reflect.apply/construct.
-fn create_list_from_array_like(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
-    let o = match v {
-        Value::Obj(o) => o.clone(),
+fn create_list_from_array_like(
+    i: &mut Interp,
+    v: &Value,
+) -> Result<crate::rooting::RootedVec, Value> {
+    let o = match &(v).view() {
+        ValueView::Obj(o) => *o,
         _ => {
             return Err(i.make_error(
                 "TypeError",
@@ -2124,7 +2165,8 @@ fn create_list_from_array_like(i: &mut Interp, v: &Value) -> Result<Vec<Value>, 
     };
     let len = ab(i.to_length(&o))?;
     check_argument_count(i, len)?;
-    let mut out = Vec::with_capacity(len.min(1024));
+    // Rooted across the getters later reads run (I1).
+    let mut out = crate::rooting::RootedVec::from_vec(Vec::with_capacity(len.min(1024)));
     for k in 0..len {
         out.push(array_get_index(i, &o, v, k)?);
     }
@@ -2152,23 +2194,23 @@ fn ctor_realm_proto(i: &mut Interp, nt: &Value, default_proto: &str) -> Result<O
     let Some(o) = nt.as_obj() else {
         return Ok(None);
     };
-    let mut ntobj: Gc = o.clone();
+    let mut ntobj: Gc = o;
     // GetFunctionRealm unwraps bound functions and (unrevoked) proxies to their targets.
     for _ in 0..64 {
-        if let Some((target, handler)) = i.proxies.get(&(Rc::as_ptr(&ntobj) as usize)) {
-            if matches!(handler, Value::Null) {
+        if let Some((target, handler)) = i.proxies.get(&(Gc::as_ptr(&ntobj) as usize)) {
+            if matches!((handler).view(), ValueView::Null) {
                 return Err(i.make_error("TypeError", "cannot get the realm of a revoked proxy"));
             }
-            match target {
-                Value::Obj(t) => {
-                    ntobj = t.clone();
+            match (target).view() {
+                ValueView::Obj(t) => {
+                    ntobj = t;
                     continue;
                 }
                 _ => return Ok(None),
             }
         }
         let bound = match &ntobj.borrow().call {
-            Callable::Bound(bound) => Some(bound.target.clone()),
+            Callable::Bound(bound) => Some(bound.target),
             _ => None,
         };
         match bound {
@@ -2184,13 +2226,13 @@ fn ctor_realm_proto(i: &mut Interp, nt: &Value, default_proto: &str) -> Result<O
     };
     // Core intrinsics live in named fields; errors in error_protos; the rest in extra_protos.
     Ok(match default_proto {
-        "Object" => Some(rs.object_proto.clone()),
-        "Array" => Some(rs.array_proto.clone()),
-        "Function" => Some(rs.function_proto.clone()),
-        "String" => Some(rs.string_proto.clone()),
-        "Number" => Some(rs.number_proto.clone()),
-        "Boolean" => Some(rs.boolean_proto.clone()),
-        "Symbol" => Some(rs.symbol_proto.clone()),
+        "Object" => Some(rs.object_proto),
+        "Array" => Some(rs.array_proto),
+        "Function" => Some(rs.function_proto),
+        "String" => Some(rs.string_proto),
+        "Number" => Some(rs.number_proto),
+        "Boolean" => Some(rs.boolean_proto),
+        "Symbol" => Some(rs.symbol_proto),
         other => rs
             .error_protos
             .get(other)
@@ -2220,8 +2262,8 @@ fn advance_string_index(index: usize, s: &str, unicode: bool) -> usize {
 fn regexp_exec_abstract(i: &mut Interp, r: &Value, s: crate::lstr::LStr) -> Result<Value, Value> {
     let exec = ab(i.get_member_key(r, "exec"))?;
     if exec.is_callable() {
-        let res = ab(i.call(exec, r.clone(), &[Value::Str(s)]))?;
-        if !matches!(res, Value::Obj(_) | Value::Null) {
+        let res = ab(i.call(exec, *r, &[Value::Str(s)]))?;
+        if !matches!((res).view(), ValueView::Obj(_) | ValueView::Null) {
             return Err(i.make_error(
                 "TypeError",
                 "RegExp exec method returned something other than an Object or null",
@@ -2232,7 +2274,7 @@ fn regexp_exec_abstract(i: &mut Interp, r: &Value, s: crate::lstr::LStr) -> Resu
     if map_ptr(r).map(|p| i.regexps.contains_key(&p)) != Some(true) {
         return Err(i.make_error("TypeError", "exec called on a non-RegExp object"));
     }
-    regexp_exec(i, r.clone(), &[Value::Str(s)])
+    regexp_exec(i, *r, &[Value::Str(s)])
 }
 
 /// Coerce `v` to a RegExp object (returning it unchanged if already one).
@@ -2352,8 +2394,8 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
     // matcher slot is only sampled afterwards. Reading an own non-accessor `lastIndex` (its
     // invariable shape — it is non-configurable) skips the [[Get]] machinery.
     let li = {
-        let own = match &this {
-            Value::Obj(o) => {
+        let own = match &(this).view() {
+            ValueView::Obj(o) => {
                 let b = o.borrow();
                 b.props
                     .get("lastIndex")
@@ -2449,14 +2491,14 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
                     }
                     Value::Obj(g)
                 };
-                if let Value::Obj(o) = &arr {
+                if let ValueView::Obj(o) = &(arr).view() {
                     set_data(o, "groups", igroups);
                 }
                 Some(arr)
             } else {
                 None
             };
-            if let Value::Obj(o) = &result {
+            if let ValueView::Obj(o) = &(result).view() {
                 set_data(o, "index", Value::Num(text.unit_index(start) as f64));
                 set_data(o, "input", Value::Str(input));
                 set_data(o, "groups", groups);
@@ -2511,10 +2553,10 @@ pub(crate) fn regexp_exec_discard_fast(
     this: &Value,
     input: &crate::lstr::LStr,
 ) -> Option<Result<bool, Value>> {
-    let Value::Obj(obj) = this else {
+    let ValueView::Obj(obj) = &(this).view() else {
         return None;
     };
-    let ptr = Rc::as_ptr(obj) as usize;
+    let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr)?.clone();
     {
         let b = obj.borrow();
@@ -2525,8 +2567,8 @@ pub(crate) fn regexp_exec_discard_fast(
         if p.accessor() || !p.writable() {
             return None;
         }
-        match p.value() {
-            Value::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => {}
+        match (p.value()).view() {
+            ValueView::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => {}
             _ => return None,
         }
     }
@@ -2545,13 +2587,14 @@ pub(crate) fn regexp_exec_discard_direct(
     let use_last = re.global || re.sticky;
     let read_units = if use_last {
         let b = obj.borrow();
-        match b
+        match (b
             .props
             .get("lastIndex")
             .expect("direct regexp lastIndex")
-            .value()
+            .value())
+        .view()
         {
-            Value::Num(n) => n as usize,
+            ValueView::Num(n) => n as usize,
             _ => unreachable!("direct regexp lastIndex guard"),
         }
     } else {
@@ -2599,18 +2642,20 @@ pub(crate) fn string_replace_discard_fast(
     search: &Value,
     replacement: &Value,
 ) -> Option<Result<Value, Value>> {
-    let (Value::Str(input), Value::Obj(obj), Value::Str(_)) = (input, search, replacement) else {
+    let (ValueView::Str(input), ValueView::Obj(obj), ValueView::Str(_)) =
+        (&(input).view(), &(search).view(), &(replacement).view())
+    else {
         return None;
     };
-    let ptr = Rc::as_ptr(obj) as usize;
+    let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr)?.clone();
-    let proto = i.extra_protos.get("RegExp")?.clone();
+    let proto = *i.extra_protos.get("RegExp")?;
     let replace_key = well_known_key(i, "replace")?;
     {
         let b = obj.borrow();
         if !matches!(b.exotic, Exotic::None)
             || b.props.contains(&replace_key)
-            || b.proto.as_ref().is_none_or(|p| !Rc::ptr_eq(p, &proto))
+            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, &proto))
             || [
                 "exec",
                 "flags",
@@ -2635,8 +2680,8 @@ pub(crate) fn string_replace_discard_fast(
         if re.sticky
             && !re.global
             && !matches!(
-                last.value(),
-                Value::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0
+                (last.value()).view(),
+                ValueView::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0
             )
         {
             return None;
@@ -2647,7 +2692,7 @@ pub(crate) fn string_replace_discard_fast(
     }
     let canonical = {
         let p = proto.borrow();
-        let Value::Obj(method) = p.props.get(&replace_key)?.value() else {
+        let ValueView::Obj(method) = (p.props.get(&replace_key)?.value()).view() else {
             return None;
         };
         let canonical = matches!(
@@ -2684,18 +2729,18 @@ pub(crate) fn string_match_discard_fast(
     input: &Value,
     search: &Value,
 ) -> Option<Result<Value, Value>> {
-    let (Value::Str(input), Value::Obj(obj)) = (input, search) else {
+    let (ValueView::Str(input), ValueView::Obj(obj)) = (&(input).view(), &(search).view()) else {
         return None;
     };
-    let ptr = Rc::as_ptr(obj) as usize;
+    let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr)?.clone();
-    let proto = i.extra_protos.get("RegExp")?.clone();
+    let proto = *i.extra_protos.get("RegExp")?;
     let match_key = well_known_key(i, "match")?;
     {
         let b = obj.borrow();
         if !matches!(b.exotic, Exotic::None)
             || b.props.contains(&match_key)
-            || b.proto.as_ref().is_none_or(|p| !Rc::ptr_eq(p, &proto))
+            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, &proto))
             || [
                 "exec",
                 "flags",
@@ -2717,8 +2762,8 @@ pub(crate) fn string_match_discard_fast(
         if last.accessor() || !last.writable() {
             return None;
         }
-        match last.value() {
-            Value::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => {}
+        match (last.value()).view() {
+            ValueView::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => {}
             _ => return None,
         }
     }
@@ -2727,7 +2772,7 @@ pub(crate) fn string_match_discard_fast(
     }
     let canonical = {
         let p = proto.borrow();
-        let Value::Obj(method) = p.props.get(&match_key)?.value() else {
+        let ValueView::Obj(method) = (p.props.get(&match_key)?.value()).view() else {
             return None;
         };
         let canonical = matches!(
@@ -2756,7 +2801,7 @@ pub(crate) fn vm_discard_call(
     method: &Value,
     args: &[Value],
 ) -> Result<Option<Value>, Value> {
-    let Value::Obj(obj) = method else {
+    let ValueView::Obj(obj) = &(method).view() else {
         return Ok(None);
     };
     let Callable::Native(nf) = &obj.borrow().call else {
@@ -2768,7 +2813,7 @@ pub(crate) fn vm_discard_call(
         let Some((first, _)) = args.split_first() else {
             return Ok(None);
         };
-        let Value::Str(input) = first else {
+        let ValueView::Str(input) = &(first).view() else {
             return Ok(None);
         };
         return match regexp_exec_discard_fast(i, this, input) {
@@ -2827,20 +2872,20 @@ fn update_regexp_legacy_statics(
     input: &crate::lstr::LStr,
 ) {
     let ctor = match i.extra_protos.get("%RegExpCtor%") {
-        Some(c) => c.clone(),
+        Some(c) => *c,
         None => return,
     };
     if let Some(prev) = &i.regexp_last {
-        if prev.ctor.as_ptr() != Rc::as_ptr(&ctor) {
+        if prev.ctor.as_ptr() != Gc::as_ptr(&ctor) {
             flush_regexp_legacy(i);
         }
     }
     if let Some(previous) = i
         .regexp_last
         .as_mut()
-        .filter(|previous| previous.ctor.as_ptr() == Rc::as_ptr(&ctor))
+        .filter(|previous| previous.ctor.as_ptr() == Gc::as_ptr(&ctor))
     {
-        previous.input = input.clone();
+        previous.input = *input;
         previous.text = text.clone();
         previous.caps.clear();
         previous.caps.extend_from_slice(caps);
@@ -2849,8 +2894,8 @@ fn update_regexp_legacy_statics(
         return;
     }
     i.regexp_last = Some(crate::interpreter::RegexpLastMatch {
-        ctor: Rc::downgrade(&ctor),
-        input: input.clone(),
+        ctor: Gc::downgrade(&ctor),
+        input: *input,
         text: text.clone(),
         caps: caps.to_vec(),
         ngroups: re.ngroups,
@@ -2867,20 +2912,20 @@ fn update_regexp_legacy_statics_lazy(
     input: &crate::lstr::LStr,
 ) {
     let ctor = match i.extra_protos.get("%RegExpCtor%") {
-        Some(c) => c.clone(),
+        Some(c) => *c,
         None => return,
     };
     if let Some(prev) = &i.regexp_last {
-        if prev.ctor.as_ptr() != Rc::as_ptr(&ctor) {
+        if prev.ctor.as_ptr() != Gc::as_ptr(&ctor) {
             flush_regexp_legacy(i);
         }
     }
     if let Some(previous) = i
         .regexp_last
         .as_mut()
-        .filter(|previous| previous.ctor.as_ptr() == Rc::as_ptr(&ctor))
+        .filter(|previous| previous.ctor.as_ptr() == Gc::as_ptr(&ctor))
     {
-        previous.input = input.clone();
+        previous.input = *input;
         previous.text = text.clone();
         previous.caps.clear();
         previous.caps.push(Some(whole));
@@ -2889,8 +2934,8 @@ fn update_regexp_legacy_statics_lazy(
         return;
     }
     i.regexp_last = Some(crate::interpreter::RegexpLastMatch {
-        ctor: Rc::downgrade(&ctor),
-        input: input.clone(),
+        ctor: Gc::downgrade(&ctor),
+        input: *input,
         text: text.clone(),
         caps: vec![Some(whole)],
         ngroups: re.ngroups,
@@ -2969,7 +3014,7 @@ fn to_index(i: &mut Interp, v: &Value) -> Result<usize, Value> {
 
 pub fn install(it: &mut Interp) {
     // Primitive globals.
-    let g = it.global.clone();
+    let g = it.global;
     // The global value properties are { writable:false, enumerable:false, configurable:false }.
     for (name, val) in [
         ("undefined", Value::Undefined),
@@ -2980,7 +3025,7 @@ pub fn install(it: &mut Interp) {
             .props
             .insert(name, Property::data(val, false, false, false));
     }
-    set_builtin(&g, "globalThis", Value::Obj(g.clone()));
+    set_builtin(&g, "globalThis", Value::Obj(g));
 
     function_proto::install_function_proto(it);
     install_object(it);
@@ -3030,7 +3075,7 @@ pub fn install(it: &mut Interp) {
 /// Whether a value is a constructor: a callable with an own `prototype` (built-in ctors / user
 /// non-arrow functions, which also set is_constructor) — matching the `new` constructability rule.
 fn is_constructor_value(v: &Value) -> bool {
-    matches!(v, Value::Obj(o) if {
+    matches!(&(v).view(), ValueView::Obj(o) if {
         let b = o.borrow();
         match &b.call {
             Callable::None => false,
@@ -3093,7 +3138,7 @@ pub(crate) fn well_known_key(it: &Interp, name: &str) -> Option<Rc<str>> {
 }
 
 fn map_ptr(this: &Value) -> Option<usize> {
-    this.as_obj().map(|o| Rc::as_ptr(o) as usize)
+    this.as_obj().map(|o| Gc::as_ptr(&o) as usize)
 }
 
 /// ArrayCreate(length) (ECMA-262 §10.4.2.2) with the current Realm's %Array.prototype%: a
@@ -3104,7 +3149,7 @@ fn array_create(i: &mut Interp, length: u64) -> Result<Value, Value> {
     }
     let array = i.make_array(Vec::new());
     if length != 0 {
-        if let Value::Obj(object) = &array {
+        if let ValueView::Obj(object) = &(array).view() {
             object
                 .borrow_mut()
                 .props
@@ -3141,7 +3186,7 @@ fn array_species_is_intrinsic(i: &Interp, original: &Gc) -> bool {
             || !body
                 .proto
                 .as_ref()
-                .is_some_and(|p| Rc::ptr_eq(p, &i.array_proto))
+                .is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
             || body.props.contains("constructor")
         {
             return false;
@@ -3156,7 +3201,7 @@ fn array_species_is_intrinsic(i: &Interp, original: &Gc) -> bool {
         .property_at(slot)
         .is_some_and(|constructor| {
             !constructor.accessor()
-                && matches!(constructor.value(), Value::Obj(c) if Rc::ptr_eq(&c, array_ctor))
+                && matches!((constructor.value()).view(), ValueView::Obj(c) if Gc::ptr_eq(&c, array_ctor))
         })
 }
 
@@ -3183,7 +3228,7 @@ fn verify_intrinsic_species(i: &Interp) -> Option<usize> {
     let species = well_known_key(i, "species")?;
     let intrinsic_getter = array_ctor.borrow().props.get(&species).is_some_and(|p| {
         p.accessor()
-            && matches!(p.getter(), Some(Value::Obj(getter)) if matches!(
+            && matches!((p.getter()).map(|__value| (__value).view()), Some(ValueView::Obj(getter)) if matches!(
                 getter.borrow().call,
                 crate::value::Callable::Native(f)
                     if f as *const () == nf_species_getter as *const ()
@@ -3204,7 +3249,7 @@ fn verify_intrinsic_species(i: &Interp) -> Option<usize> {
 
 /// ArraySpeciesCreate(originalArray, length) (ECMA-262 §10.4.2.3).
 fn array_species_create(i: &mut Interp, original: &Value, len: u64) -> Result<Value, Value> {
-    if let Value::Obj(object) = original {
+    if let ValueView::Obj(object) = &(original).view() {
         if array_species_is_intrinsic(i, object) {
             return array_create(i, len);
         }
@@ -3219,9 +3264,9 @@ fn array_species_create(i: &mut Interp, original: &Value, len: u64) -> Result<Va
     //    SameValue(C, ctorRealm.[[Intrinsics]].[[%Array%]]) holds exactly when C is the %Array%
     //    of the Realm GetFunctionRealm(C) names.
     if is_constructor_value(&c) {
-        if let Value::Obj(co) = &c {
+        if let ValueView::Obj(co) = &(c).view() {
             let is_array_ctor =
-                |ctor: &Option<Gc>| ctor.as_ref().is_some_and(|ac| Rc::ptr_eq(ac, co));
+                |ctor: &Option<Gc>| ctor.as_ref().is_some_and(|ac| Gc::ptr_eq(ac, co));
             let foreign_array = !is_array_ctor(&i.array_ctor)
                 && i.realms
                     .values()
@@ -3232,16 +3277,16 @@ fn array_species_create(i: &mut Interp, original: &Value, len: u64) -> Result<Va
         }
     }
     // 5. Get(C, @@species); null becomes undefined.
-    if matches!(&c, Value::Obj(_)) {
+    if matches!(&(c).view(), ValueView::Obj(_)) {
         if let Some(key) = well_known_key(i, "species") {
             c = ab(i.get_member_key(&c, &key))?;
         }
-        if matches!(c, Value::Null) {
+        if matches!((c).view(), ValueView::Null) {
             c = Value::Undefined;
         }
     }
     // 6. Undefined selects ArrayCreate.
-    if matches!(c, Value::Undefined) {
+    if matches!((c).view(), ValueView::Undefined) {
         return array_create(i, len);
     }
     // 7. IsConstructor.
@@ -3249,8 +3294,8 @@ fn array_species_create(i: &mut Interp, original: &Value, len: u64) -> Result<Va
         return Err(i.make_error("TypeError", "Array @@species is not a constructor"));
     }
     // 8. Construct(C, « 𝔽(length) »); the current Realm's %Array% constructs ArrayCreate(length).
-    if let (Value::Obj(s), Some(ac)) = (&c, i.array_ctor.as_ref()) {
-        if Rc::ptr_eq(s, ac) {
+    if let (ValueView::Obj(s), Some(ac)) = (&(c).view(), i.array_ctor.as_ref()) {
+        if Gc::ptr_eq(s, ac) {
             return array_create(i, len);
         }
     }
@@ -3288,11 +3333,11 @@ pub(crate) fn set_to_string_tag(i: &Interp, obj: &Gc, tag: &str) {
 /// The Object.prototype.toString builtin tag for `this` (the `[object <tag>]` body without an
 /// overriding `@@toStringTag`).
 fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
-    match this {
-        Value::Num(_) => "Number",
-        Value::Str(_) => "String",
-        Value::Bool(_) => "Boolean",
-        Value::Obj(o) => {
+    match &(this).view() {
+        ValueView::Num(_) => "Number",
+        ValueView::Str(_) => "String",
+        ValueView::Bool(_) => "Boolean",
+        ValueView::Obj(o) => {
             let b = o.borrow();
             if matches!(b.exotic, Exotic::Array) {
                 "Array"
@@ -3310,7 +3355,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
                 "String"
             } else if b.internal_slots().contains("#\u{0}date_ms") {
                 "Date"
-            } else if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)) {
+            } else if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
                 "RegExp"
             } else {
                 "Object"
@@ -3322,22 +3367,21 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
 
 /// Brand-check a Map/Set receiver: it must be an object carrying a collection data slot (every
 /// Map/Set/WeakMap/WeakSet gets one at construction), else TypeError.
-fn coll_ptr(i: &Interp, this: &Value) -> Result<usize, Value> {
-    coll_ptr_kind(i, this, None)
+fn coll_obj(i: &Interp, this: &Value) -> Result<Gc, Value> {
+    coll_obj_kind(i, this, None)
 }
 
-/// Resolve a Map/Set backing pointer with a brand check. `want = Some("Map"|"Set")` requires that
-/// exact kind; `None` accepts either strong collection but still rejects WeakMap/WeakSet and plain
-/// objects (which lack a strong `[[MapData]]`/`[[SetData]]` slot).
-fn coll_ptr_kind(i: &Interp, this: &Value, want: Option<&str>) -> Result<usize, Value> {
+/// A Map/Set receiver after a brand check. `want = Some("Map"|"Set")` requires that exact kind;
+/// `None` accepts either strong collection but still rejects WeakMap/WeakSet and plain objects
+/// (which lack a strong `[[MapData]]`/`[[SetData]]` slot).
+fn coll_obj_kind(i: &Interp, this: &Value, want: Option<&str>) -> Result<Gc, Value> {
     let err = || i.make_error("TypeError", "method called on an incompatible receiver");
     let o = this.as_obj().ok_or_else(err)?;
-    let ptr = Rc::as_ptr(o) as usize;
-    let data = i.map_data.get(&ptr).ok_or_else(err)?;
-    if want.is_some_and(|want| data.kind().name() != want) {
+    let kind = i.collection(&o).map(|data| data.kind()).ok_or_else(err)?;
+    if want.is_some_and(|want| kind.name() != want) {
         return Err(err());
     }
-    Ok(ptr)
+    Ok(o)
 }
 
 /// Build a live Map/Set iterator. `kind`: 0 = values, 1 = keys, 2 = [key,value].
@@ -3348,7 +3392,7 @@ fn collection_iter_kind(
     kind: u8,
     want: &str,
 ) -> Result<Value, Value> {
-    coll_ptr_kind(i, this, Some(want))?;
+    coll_obj_kind(i, this, Some(want))?;
     collection_iter(i, this, kind)
 }
 
@@ -3359,7 +3403,7 @@ fn collection_for_each(
     a: &[Value],
     want: Option<&str>,
 ) -> Result<Value, Value> {
-    let ptr = coll_ptr_kind(i, &this, want)?;
+    let object = coll_obj_kind(i, &this, want)?;
     let cb = arg(a, 0);
     if !cb.is_callable() {
         return Err(i.make_error("TypeError", "forEach callback is not callable"));
@@ -3368,18 +3412,20 @@ fn collection_for_each(
     let cb_this = arg(a, 1);
     // Cursors survive clear/compaction, including recursively nested forEach calls. Never hold a
     // collection borrow across JavaScript: callbacks may mutate this collection arbitrarily.
-    let cursor = i.map_data.get_mut(&ptr).unwrap().cursor();
-    while let Some((k, v)) = i.map_data[&ptr].next(&cursor) {
-        ab(cb.call(i, cb_this.clone(), [v, k, this.clone()]))?;
+    let cursor = collections::collection_cursor(i, &object);
+    while let Some((k, v)) = collections::collection_next(i, &object, &cursor) {
+        ab(cb.call(i, cb_this, [v, k, this]))?;
     }
     Ok(Value::Undefined)
 }
 
 fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Value> {
-    let ptr = coll_ptr(i, this)?;
-    let data = i.map_data.get_mut(&ptr).unwrap();
-    let brand = data.kind();
-    let cursor = data.cursor();
+    let target = coll_obj(i, this)?;
+    let brand = i
+        .collection(&target)
+        .expect("brand-checked collection")
+        .kind();
+    let cursor = collections::collection_cursor(i, &target);
     let key = if brand == crate::ordered_collection::CollectionKind::Set {
         "%SetIteratorPrototype%"
     } else {
@@ -3390,16 +3436,17 @@ fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Valu
         .get(key)
         .cloned()
         .or_else(|| i.extra_protos.get("%IteratorPrototype%").cloned());
-    let obj = Object::new(proto);
-    i.gc_pin(&obj);
-    i.collection_iterators.insert(
-        Rc::as_ptr(&obj) as usize,
-        crate::ordered_collection::CollectionIterator {
-            target: Some(this.as_obj().unwrap().clone()),
-            cursor: Some(cursor),
-            kind,
-            brand,
-        },
+    let obj = Object::new_with_parts(
+        proto,
+        crate::value::Props::new(),
+        Exotic::CollectionIterator(crate::gc_storage::PayloadBox::new(
+            crate::ordered_collection::CollectionIterator {
+                target: Some(target),
+                cursor: Some(cursor),
+                kind,
+                brand,
+            },
+        )),
     );
     Ok(Value::Obj(obj))
 }
@@ -3410,19 +3457,24 @@ fn map_set_iter_step(
     this: Value,
     brand: crate::ordered_collection::CollectionKind,
 ) -> Result<Option<Value>, Value> {
-    let ptr = map_ptr(&this).ok_or_else(|| i.make_error("TypeError", "not a Map/Set Iterator"))?;
-    let state = i
-        .collection_iterators
-        .get(&ptr)
-        .filter(|state| state.brand == brand)
-        .ok_or_else(|| i.make_error("TypeError", "incompatible collection iterator"))?;
-    let kind = state.kind;
-    let entry = match (&state.target, &state.cursor) {
-        (Some(target), Some(cursor)) => i
-            .map_data
-            .get(&(Rc::as_ptr(target) as usize))
-            .and_then(|data| data.next(cursor)),
-        _ => None,
+    let Some(object) = this.as_obj() else {
+        return Err(i.make_error("TypeError", "not a Map/Set Iterator"));
+    };
+    let (kind, entry) = {
+        let iterator = object.borrow();
+        let Exotic::CollectionIterator(state) = &iterator.exotic else {
+            drop(iterator);
+            return Err(i.make_error("TypeError", "incompatible collection iterator"));
+        };
+        if state.brand != brand {
+            drop(iterator);
+            return Err(i.make_error("TypeError", "incompatible collection iterator"));
+        }
+        let entry = match (&state.target, &state.cursor) {
+            (Some(target), Some(cursor)) => collections::collection_next(i, target, cursor),
+            _ => None,
+        };
+        (state.kind, entry)
     };
     if let Some((key, value)) = entry {
         let value = match kind {
@@ -3432,9 +3484,11 @@ fn map_set_iter_step(
         };
         Ok(Some(value))
     } else {
-        let state = i.collection_iterators.get_mut(&ptr).unwrap();
-        state.target = None;
-        state.cursor = None;
+        // Done: let go of the collection and the cursor its deletions would keep updating.
+        if let Exotic::CollectionIterator(state) = &mut object.borrow_mut().exotic {
+            state.target = None;
+            state.cursor = None;
+        }
         Ok(None)
     }
 }
@@ -3474,13 +3528,13 @@ pub(crate) fn inert_iterator_step(
 ) -> Option<Option<Value>> {
     let object = iterator.as_obj()?;
     if std::ptr::fn_addr_eq(native, array_iter_next as NativeFn) {
-        return inert_array_iter_step(i, object);
+        return inert_array_iter_step(i, &object);
     }
     if std::ptr::fn_addr_eq(native, string_iter_next as NativeFn) {
         if !matches!(object.borrow().exotic, Exotic::StringIterator(_)) {
             return None;
         }
-        return string_iter_step(i, iterator.clone()).ok();
+        return string_iter_step(i, *iterator).ok();
     }
     let brand = if std::ptr::fn_addr_eq(native, map_iter_next as NativeFn) {
         crate::ordered_collection::CollectionKind::Map
@@ -3491,16 +3545,20 @@ pub(crate) fn inert_iterator_step(
     };
     // A Map/Set iterator step reads only its private cursor; a brand mismatch must still
     // create its TypeError inside the native call.
-    i.collection_iterators
-        .get(&(Rc::as_ptr(object) as usize))
-        .filter(|state| state.brand == brand)?;
-    map_set_iter_step(i, iterator.clone(), brand).ok()
+    let branded = matches!(
+        &object.borrow().exotic,
+        Exotic::CollectionIterator(state) if state.brand == brand
+    );
+    if !branded {
+        return None;
+    }
+    map_set_iter_step(i, *iterator, brand).ok()
 }
 
 /// LengthOfArrayLike of an ordinary Array: its length slot, never an accessor.
 pub(crate) fn ordinary_array_length(props: &Props) -> Option<usize> {
-    match props.length_property().map(Property::value) {
-        Some(Value::Num(length)) => Some(length as usize),
+    match (props.length_property().map(Property::value)).map(|__value| (__value).view()) {
+        Some(ValueView::Num(length)) => Some(length as usize),
         _ => None,
     }
 }
@@ -3525,9 +3583,9 @@ fn inert_array_iter_step(i: &mut Interp, iterator: &Gc) -> Option<Option<Value>>
         let Exotic::ArrayIterator(state) = &object.exotic else {
             return None;
         };
-        let target = match &state.target {
-            Value::Obj(target) => target,
-            Value::Undefined => return Some(None),
+        let target = match (state.target).view() {
+            ValueView::Obj(target) => target,
+            ValueView::Undefined => return Some(None),
             _ => return None,
         };
         let array = target.borrow();
@@ -3599,7 +3657,7 @@ pub(crate) fn make_bound_len(
     length: f64,
 ) -> Value {
     let t = i.make_native("", 1, target);
-    let obj = Object::new(Some(i.function_proto.clone()));
+    let obj = Object::new(Some(i.function_proto));
     {
         let mut b = obj.borrow_mut();
         b.call = Callable::bound(t, Value::Undefined, bound_args);
@@ -3618,11 +3676,11 @@ pub(crate) fn make_bound_len(
 fn capability_executor(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let cap = arg(args, 0);
     let already = !matches!(
-        ab(i.get_internal_slot(&cap, "#\u{0}resolve"))?,
-        Value::Undefined
+        (ab(i.get_internal_slot(&cap, "#\u{0}resolve"))?).view(),
+        ValueView::Undefined
     ) || !matches!(
-        ab(i.get_internal_slot(&cap, "#\u{0}reject"))?,
-        Value::Undefined
+        (ab(i.get_internal_slot(&cap, "#\u{0}reject"))?).view(),
+        ValueView::Undefined
     );
     if already {
         return Err(i.make_error("TypeError", "promise capability executor already invoked"));
@@ -3645,7 +3703,7 @@ fn pf_then_finally(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Valu
     let (on_finally, c, value) = (arg(a, 0), arg(a, 1), arg(a, 2));
     let result = ab(i.call(on_finally, Value::Undefined, &[]))?;
     let resolve = ab(i.get_member_key(&c, "resolve"))?;
-    let p = ab(i.call(resolve, c.clone(), &[result]))?;
+    let p = ab(i.call(resolve, c, &[result]))?;
     let thunk = make_bound_len(i, pf_return, vec![value], 0.0);
     let then = ab(i.get_member_key(&p, "then"))?;
     ab(i.call(then, p, &[thunk]))
@@ -3654,7 +3712,7 @@ fn pf_catch_finally(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Val
     let (on_finally, c, reason) = (arg(a, 0), arg(a, 1), arg(a, 2));
     let result = ab(i.call(on_finally, Value::Undefined, &[]))?;
     let resolve = ab(i.get_member_key(&c, "resolve"))?;
-    let p = ab(i.call(resolve, c.clone(), &[result]))?;
+    let p = ab(i.call(resolve, c, &[result]))?;
     let thrower = make_bound_len(i, pf_throw, vec![reason], 0.0);
     let then = ab(i.get_member_key(&p, "then"))?;
     ab(i.call(then, p, &[thrower]))
@@ -3663,18 +3721,18 @@ fn pf_catch_finally(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Val
 /// SpeciesConstructor(O, defaultCtor): O.constructor[@@species], or the default.
 fn species_constructor(i: &mut Interp, obj: &Value, default_ctor: &Value) -> Result<Value, Value> {
     let c = ab(i.get_member_key(obj, "constructor"))?;
-    if matches!(c, Value::Undefined) {
-        return Ok(default_ctor.clone());
+    if matches!((c).view(), ValueView::Undefined) {
+        return Ok(*default_ctor);
     }
-    if !matches!(c, Value::Obj(_)) {
+    if !matches!((c).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "constructor is not an object"));
     }
     let species = match well_known_key(i, "species") {
         Some(k) => ab(i.get_member_key(&c, &k))?,
         None => Value::Undefined,
     };
-    if matches!(species, Value::Undefined | Value::Null) {
-        return Ok(default_ctor.clone());
+    if matches!((species).view(), ValueView::Undefined | ValueView::Null) {
+        return Ok(*default_ctor);
     }
     if !is_constructor_value(&species) {
         return Err(i.make_error("TypeError", "@@species is not a constructor"));
@@ -3722,8 +3780,8 @@ pub(crate) fn make_thenable_job(
 fn thenable_job_run(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let then = crate::interpreter::JobCallback {
         callback: arg(args, 0),
-        script_caller: match args.get(4) {
-            Some(Value::Obj(global)) => Some(global.clone()),
+        script_caller: match (args.get(4)).map(|__value| (__value).view()) {
+            Some(ValueView::Obj(global)) => Some(global),
             _ => None,
         },
         // The queued job carries `then`'s script execution context (see `resolve_promise`).
@@ -3733,7 +3791,7 @@ fn thenable_job_run(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, 
     let thenable = arg(args, 1);
     let res = arg(args, 2);
     let rej = arg(args, 3);
-    if let Err(e) = ab(i.call_job_callback(&then, thenable, &[res, rej.clone()])) {
+    if let Err(e) = ab(i.call_job_callback(&then, thenable, &[res, rej])) {
         let _ = i.call(rej, Value::Undefined, &[e]);
     }
     Ok(Value::Undefined)
@@ -3760,10 +3818,10 @@ fn new_promise_capability_full(
     }
     let cap = i.new_object();
     // GetCapabilitiesExecutor is an anonymous built-in function of length 2.
-    let executor = make_bound_len(i, capability_executor, vec![Value::Obj(cap.clone())], 2.0);
-    let promise = ab(i.construct(ctor.clone(), &[executor]))?;
-    let resolve = ab(i.get_internal_slot(&Value::Obj(cap.clone()), "#\u{0}resolve"))?;
-    let reject = ab(i.get_internal_slot(&Value::Obj(cap.clone()), "#\u{0}reject"))?;
+    let executor = make_bound_len(i, capability_executor, vec![Value::Obj(cap)], 2.0);
+    let promise = ab(i.construct(*ctor, &[executor]))?;
+    let resolve = ab(i.get_internal_slot(&Value::Obj(cap), "#\u{0}resolve"))?;
+    let reject = ab(i.get_internal_slot(&Value::Obj(cap), "#\u{0}reject"))?;
     if !resolve.is_callable() || !reject.is_callable() {
         return Err(i.make_error("TypeError", "promise capability functions are not callable"));
     }
@@ -3778,13 +3836,14 @@ fn promise_all_element(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
     let resolve_fn = arg(args, 3);
     let value = arg(args, 4);
     // [[AlreadyCalled]]: a second settlement of the same element is a no-op.
-    if let Value::Obj(o) = &already {
+    if let ValueView::Obj(o) = &(already).view() {
         if matches!(
-            o.borrow()
+            (o.borrow()
                 .internal_slots()
                 .get("#\u{0}called")
-                .map(|p| p.value()),
-            Some(Value::Bool(true))
+                .map(|p| p.value()))
+            .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         ) {
             return Ok(Value::Undefined);
         }
@@ -3792,7 +3851,7 @@ fn promise_all_element(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
     }
     let results = ab(i.get_internal_slot(&state, "#\u{0}results"))?;
     // CreateDataProperty: a direct own data property, so Array.prototype index setters aren't invoked.
-    if let Value::Obj(o) = &results {
+    if let ValueView::Obj(o) = &(results).view() {
         crate::value::set_data(o, &idx.to_string(), value);
     }
     let rem_v = ab(i.get_internal_slot(&state, "#\u{0}remaining"))?;
@@ -3825,7 +3884,7 @@ fn promise_keyed_combinator(
         Ok(r) => r,
         Err(e) => reject_with!(e),
     };
-    if !matches!(input, Value::Obj(_)) {
+    if !matches!((input).view(), ValueView::Obj(_)) {
         reject_with!(i.make_error("TypeError", "argument must be an object"));
     }
     // allKeys = ? input.[[OwnPropertyKeys]](); keep enumerable string keys (GetOwnProperty each).
@@ -3834,17 +3893,19 @@ fn promise_keyed_combinator(
             let mut out = Vec::new();
             if let Some((target, handler)) = proxy_pair(i, &input) {
                 for k in proxy_own_keys(i, &target, &handler)? {
-                    let Value::Str(ks) = &k else { continue };
+                    let ValueView::Str(ks) = &(k).view() else {
+                        continue;
+                    };
                     let key = crate::value::encode_string_key(ks);
                     let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-                    if matches!(desc, Value::Obj(_)) {
+                    if matches!((desc).view(), ValueView::Obj(_)) {
                         let en = ab(i.get_member_key(&desc, "enumerable"))?;
                         if i.to_boolean(&en) {
                             out.push(crate::value::encode_owned_string_key(ks.to_string()));
                         }
                     }
                 }
-            } else if let Value::Obj(o) = &input {
+            } else if let ValueView::Obj(o) = &(input).view() {
                 // Enumerable own keys — strings AND symbols, in [[OwnPropertyKeys]] order.
                 let mut strs: Vec<String> = Vec::new();
                 let mut syms: Vec<String> = Vec::new();
@@ -3885,10 +3946,10 @@ fn promise_keyed_combinator(
             Ok(v) => v,
             Err(e) => reject_with!(e),
         };
-        let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+        let rem_v = ab(i.get_internal_slot(&Value::Obj(state), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
         set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
-        let p = match i.call(promise_resolve.clone(), t.clone(), &[value]) {
+        let p = match i.call(promise_resolve, t, &[value]) {
             Ok(p) => p,
             Err(e) => reject_with!(crate::interpreter::abrupt_value(e)),
         };
@@ -3899,17 +3960,17 @@ fn promise_keyed_combinator(
                 i,
                 f,
                 vec![
-                    Value::Obj(state.clone()),
+                    Value::Obj(state),
                     Value::Num(idx as f64),
-                    Value::Obj(already.clone()),
-                    resolve_fn.clone(),
+                    Value::Obj(already),
+                    resolve_fn,
                 ],
             )
         };
         let (on_f, on_r) = if settled {
             (mk(i, promise_keyed_settle_f), mk(i, promise_keyed_settle_r))
         } else {
-            (mk(i, promise_keyed_element), reject_fn.clone())
+            (mk(i, promise_keyed_element), reject_fn)
         };
         let then = match i.get_member_key(&p, "then") {
             Ok(t) => t,
@@ -3919,11 +3980,11 @@ fn promise_keyed_combinator(
             reject_with!(crate::interpreter::abrupt_value(e));
         }
     }
-    let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+    let rem_v = ab(i.get_internal_slot(&Value::Obj(state), "#\u{0}remaining"))?;
     let rem = ab(i.to_number(&rem_v))?;
     set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
     if rem - 1.0 == 0.0 {
-        let out = promise_keyed_result(i, &Value::Obj(state.clone()))?;
+        let out = promise_keyed_result(i, &Value::Obj(state))?;
         capability_resolve_or_reject(i, resolve_fn, reject_fn, out);
     }
     Ok(result)
@@ -3933,8 +3994,8 @@ fn promise_keyed_combinator(
 fn promise_keyed_result(i: &mut Interp, state: &Value) -> Result<Value, Value> {
     let keys = ab(i.get_internal_slot(state, "#\u{0}keys"))?;
     let values = ab(i.get_internal_slot(state, "#\u{0}values"))?;
-    let len = match ab(i.get_member_key(&keys, "length"))? {
-        Value::Num(n) => n as usize,
+    let len = match (ab(i.get_member_key(&keys, "length"))?).view() {
+        ValueView::Num(n) => n as usize,
         _ => 0,
     };
     let out = i.new_object();
@@ -3955,20 +4016,21 @@ fn promise_keyed_record(i: &mut Interp, args: &[Value], payload: Value) -> Resul
     let idx = ab(i.to_number(&arg(args, 1)))? as usize;
     let already = arg(args, 2);
     let resolve_fn = arg(args, 3);
-    if let Value::Obj(o) = &already {
+    if let ValueView::Obj(o) = &(already).view() {
         if matches!(
-            o.borrow()
+            (o.borrow()
                 .internal_slots()
                 .get("#\u{0}called")
-                .map(|p| p.value()),
-            Some(Value::Bool(true))
+                .map(|p| p.value()))
+            .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         ) {
             return Ok(Value::Undefined);
         }
         set_internal(o, "#\u{0}called", Value::Bool(true));
     }
     let values = ab(i.get_internal_slot(&state, "#\u{0}values"))?;
-    if let Value::Obj(o) = &values {
+    if let ValueView::Obj(o) = &(values).view() {
         crate::value::set_data(o, &idx.to_string(), payload);
     }
     let rem_v = ab(i.get_internal_slot(&state, "#\u{0}remaining"))?;
@@ -4012,13 +4074,14 @@ fn promise_settled(i: &mut Interp, args: &[Value], fulfilled: bool) -> Result<Va
     let resolve_fn = arg(args, 3);
     let value = arg(args, 4);
     // The fulfill and reject functions for one index share this [[AlreadyCalled]] record.
-    if let Value::Obj(o) = &already {
+    if let ValueView::Obj(o) = &(already).view() {
         if matches!(
-            o.borrow()
+            (o.borrow()
                 .internal_slots()
                 .get("#\u{0}called")
-                .map(|p| p.value()),
-            Some(Value::Bool(true))
+                .map(|p| p.value()))
+            .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         ) {
             return Ok(Value::Undefined);
         }
@@ -4032,7 +4095,7 @@ fn promise_settled(i: &mut Interp, args: &[Value], fulfilled: bool) -> Result<Va
     );
     set_data(&status, if fulfilled { "value" } else { "reason" }, value);
     let results = ab(i.get_internal_slot(&state, "#\u{0}results"))?;
-    if let Value::Obj(o) = &results {
+    if let ValueView::Obj(o) = &(results).view() {
         crate::value::set_data(o, &idx.to_string(), Value::Obj(status));
     }
     let rem_v = ab(i.get_internal_slot(&state, "#\u{0}remaining"))?;
@@ -4055,13 +4118,14 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
     let already = arg(a, 2);
     let reject_fn = arg(a, 3);
     let reason = arg(a, 4);
-    if let Value::Obj(o) = &already {
+    if let ValueView::Obj(o) = &(already).view() {
         if matches!(
-            o.borrow()
+            (o.borrow()
                 .internal_slots()
                 .get("#\u{0}called")
-                .map(|p| p.value()),
-            Some(Value::Bool(true))
+                .map(|p| p.value()))
+            .map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         ) {
             return Ok(Value::Undefined);
         }
@@ -4070,7 +4134,7 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
     let errors = ab(i.get_internal_slot(&state, "#\u{0}errors"))?;
     // Step 9 replaces an element of the errors List: an own data property of the internal
     // Array, so an inherited Array.prototype index setter never runs.
-    if let Value::Obj(o) = &errors {
+    if let ValueView::Obj(o) = &(errors).view() {
         crate::value::set_data(o, &idx.to_string(), reason);
     }
     let rem_v = ab(i.get_internal_slot(&state, "#\u{0}remaining"))?;
@@ -4087,10 +4151,11 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
 /// This live walk keeps inherited setters (including __proto__) and non-writable properties
 /// on the ordered checked path. No getter, trap or conversion runs while a borrow is held.
 fn try_assign_named_data(target: &Value, source: &Value) -> bool {
-    let (Value::Obj(target), Value::Obj(source)) = (target, source) else {
+    let (ValueView::Obj(target), ValueView::Obj(source)) = (&(target).view(), &(source).view())
+    else {
         return false;
     };
-    if Rc::ptr_eq(target, source) {
+    if Gc::ptr_eq(target, source) {
         return false;
     }
     let source = source.borrow();
@@ -4114,7 +4179,7 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
     {
         return false;
     }
-    let mut prototype = target.proto.clone();
+    let mut prototype = target.proto;
     while let Some(parent) = prototype {
         let parent = parent.borrow();
         if !parent.ic_plain.get()
@@ -4123,7 +4188,7 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
         {
             return false;
         }
-        prototype = parent.proto.clone();
+        prototype = parent.proto;
     }
     target.props.try_copy_named_data_from(&source.props)
 }
@@ -4139,7 +4204,7 @@ fn group_by(
     name: &str,
     mut add: impl FnMut(&mut Interp, Value, Value) -> Result<(), Value>,
 ) -> Result<(), Value> {
-    if matches!(items, Value::Null | Value::Undefined) {
+    if matches!(&(items).view(), ValueView::Null | ValueView::Undefined) {
         return Err(i.make_error("TypeError", format!("{name} called on null or undefined")));
     }
     if !callback.is_callable() {
@@ -4148,7 +4213,7 @@ fn group_by(
     let (iterator, next) = ab(i.get_iterator(items))?;
     // These callees are fixed by GroupBy/GetIterator. Reuse the guarded callback entries
     // across steps, retaining their roots and checked fallbacks through every observer.
-    let callback = crate::callback::Callback::new(callback.clone());
+    let callback = crate::callback::Callback::new(*callback);
     let next = crate::callback::Callback::new(next);
     let mut index = 0u64;
     loop {
@@ -4163,11 +4228,7 @@ fn group_by(
         let Some(value) = ab(next.iterator_step(i, &iterator))? else {
             return Ok(());
         };
-        let key = match ab(callback.call(
-            i,
-            Value::Undefined,
-            [value.clone(), Value::Num(index as f64)],
-        )) {
+        let key = match ab(callback.call(i, Value::Undefined, [value, Value::Num(index as f64)])) {
             Ok(key) => key,
             Err(error) => {
                 i.iterator_close(&iterator);
@@ -4183,12 +4244,12 @@ fn group_by(
 }
 
 fn install_object(it: &mut Interp) {
-    let op = it.object_proto.clone();
+    let op = it.object_proto;
     it.def_method(&op, "hasOwnProperty", 1, |i, this, args| {
         // ToPropertyKey of a String or an integral Number cannot run author code or fail, so
         // those keys skip building an owned key string; ToObject still follows it.
         let key = arg(args, 0);
-        if let Value::Str(key) = &key {
+        if let ValueView::Str(key) = &(key).view() {
             let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
             return has_own_property_trapped(
                 i,
@@ -4217,7 +4278,7 @@ fn install_object(it: &mut Interp) {
         } else {
             "__defineSetter__"
         };
-        let o = to_object_arg(i, this.clone(), name)?;
+        let o = to_object_arg(i, *this, name)?;
         let f = arg(args, 1);
         if !f.is_callable() {
             return Err(i.make_error("TypeError", "accessor must be a function"));
@@ -4228,7 +4289,7 @@ fn install_object(it: &mut Interp) {
         set_data(&desc, "enumerable", Value::Bool(true));
         set_data(&desc, "configurable", Value::Bool(true));
         let key = ab(i.to_property_key(&arg(args, 0)))?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let ok = if let Some((t, h)) = proxy_pair(i, &ov) {
             ab(proxy_define_property(i, &t, &h, &key, &Value::Obj(desc)))?
         } else {
@@ -4256,14 +4317,14 @@ fn install_object(it: &mut Interp) {
         } else {
             "__lookupSetter__"
         };
-        let o = to_object_arg(i, this.clone(), name)?;
+        let o = to_object_arg(i, *this, name)?;
         let key = ab(i.to_property_key(&arg(args, 0)))?;
         let mut cur = Value::Obj(o);
         loop {
             // [[GetOwnProperty]] goes through a proxy's trap, propagating abrupt completions.
             if let Some((t, h)) = proxy_pair(i, &cur) {
                 let desc = proxy_gopd_value(i, &t, &h, &key)?;
-                if let Value::Obj(d) = &desc {
+                if let ValueView::Obj(d) = &(desc).view() {
                     let is_accessor =
                         d.borrow().props.contains("get") || d.borrow().props.contains("set");
                     if !is_accessor {
@@ -4271,7 +4332,7 @@ fn install_object(it: &mut Interp) {
                     }
                     return ab(i.get_member_key(&desc, if is_get { "get" } else { "set" }));
                 }
-            } else if let Value::Obj(co) = &cur {
+            } else if let ValueView::Obj(co) = &(cur).view() {
                 if let Some(p) = co.borrow().props.get(&key) {
                     if p.accessor() {
                         let f = if is_get {
@@ -4285,7 +4346,7 @@ fn install_object(it: &mut Interp) {
                 }
             }
             cur = js_get_prototype_of(i, &cur)?;
-            if !matches!(cur, Value::Obj(_)) {
+            if !matches!((cur).view(), ValueView::Obj(_)) {
                 return Ok(Value::Undefined);
             }
         }
@@ -4304,15 +4365,15 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&op, "isPrototypeOf", 1, |i, this, args| {
         let v = arg(args, 0);
-        if !matches!(v, Value::Obj(_)) {
+        if !matches!((v).view(), ValueView::Obj(_)) {
             return Ok(Value::Bool(false));
         }
         let me = to_object_arg(i, this, "Object.prototype.isPrototypeOf")?;
         let mut cur = js_get_prototype_of(i, &v)?;
         loop {
-            match &cur {
-                Value::Obj(o) if Rc::ptr_eq(o, &me) => return Ok(Value::Bool(true)),
-                Value::Obj(_) => {}
+            match &(cur).view() {
+                ValueView::Obj(o) if Gc::ptr_eq(o, &me) => return Ok(Value::Bool(true)),
+                ValueView::Obj(_) => {}
                 _ => return Ok(Value::Bool(false)),
             }
             cur = js_get_prototype_of(i, &cur)?;
@@ -4321,7 +4382,7 @@ fn install_object(it: &mut Interp) {
     it.def_method(&op, "propertyIsEnumerable", 1, |i, this, args| {
         let key = ab(i.to_property_key(&arg(args, 0)))?;
         let o = to_object_arg(i, this, "Object.prototype.propertyIsEnumerable")?;
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             if let Some(res) = i.namespace_own_property(ptr, &key) {
                 ab(res)?;
@@ -4329,13 +4390,19 @@ fn install_object(it: &mut Interp) {
             }
         }
         // A proxy reads [[GetOwnProperty]]'s enumerable flag through its trap.
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
             let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-            let e = match desc {
-                Value::Undefined => false,
-                d => {
-                    let ev = ab(i.get_member_key(&d, "enumerable"))?;
-                    i.to_boolean(&ev)
+            let e = {
+                let __value_match_original = desc;
+                match (__value_match_original).view() {
+                    ValueView::Undefined => false,
+                    _ => {
+                        let d = __value_match_original;
+                        {
+                            let ev = ab(i.get_member_key(&d, "enumerable"))?;
+                            i.to_boolean(&ev)
+                        }
+                    }
                 }
             };
             return Ok(Value::Bool(e));
@@ -4352,10 +4419,10 @@ fn install_object(it: &mut Interp) {
         Ok(Value::Bool(e))
     });
     it.def_method(&op, "toString", 0, |i, this, _args| {
-        if matches!(this, Value::Undefined) {
+        if matches!((this).view(), ValueView::Undefined) {
             return Ok(Value::lstr("[object Undefined]"));
         }
-        if matches!(this, Value::Null) {
+        if matches!((this).view(), ValueView::Null) {
             return Ok(Value::lstr("[object Null]"));
         }
         // IsArray pierces proxies (a revoked proxy throws).
@@ -4368,8 +4435,8 @@ fn install_object(it: &mut Interp) {
         // (ECMA-262 §20.1.3.6). Keep a String @@toStringTag borrowed through the one result
         // allocation instead of copying it into a temporary Rust `String` first.
         match to_string_tag_key(i) {
-            Some(key) => match ab(i.get_member_key(&this, &key))? {
-                Value::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
+            Some(key) => match (ab(i.get_member_key(&this, &key))?).view() {
+                ValueView::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
                     "[object ",
                     s.as_str(),
                     "]",
@@ -4402,14 +4469,14 @@ fn install_object(it: &mut Interp) {
             js_get_prototype_of(i, &Value::Obj(o))
         });
         let setter = it.make_native("set __proto__", 1, |i, this, args| {
-            if matches!(this, Value::Undefined | Value::Null) {
+            if matches!((this).view(), ValueView::Undefined | ValueView::Null) {
                 return Err(i.make_error("TypeError", "__proto__ set on null or undefined"));
             }
             let v = arg(args, 0);
             // Only an Object receiver with an Object/Null value actually changes the prototype;
             // everything else is a silent no-op.
-            if matches!(&this, Value::Obj(_))
-                && matches!(v, Value::Obj(_) | Value::Null)
+            if matches!(&(this).view(), ValueView::Obj(_))
+                && matches!((v).view(), ValueView::Obj(_) | ValueView::Null)
                 && !js_set_prototype_of(i, &this, &v)?
             {
                 return Err(i.make_error("TypeError", "cyclic __proto__ value"));
@@ -4431,81 +4498,109 @@ fn install_object(it: &mut Interp) {
         // `new Object()` with a newTarget other than %Object% itself (a subclass or a
         // Reflect.construct target): OrdinaryCreateFromConstructor(newTarget, %Object.prototype%).
         if i.constructing {
-            if let Value::Obj(nt) = i.new_target.clone() {
+            if let ValueView::Obj(nt) = (i.constructor_new_target()).view() {
                 let is_self = matches!(
                     i.extra_protos.get("%ObjectCtor%"),
-                    Some(c) if Rc::ptr_eq(c, &nt)
+                    Some(c) if Gc::ptr_eq(c, &nt)
                 );
                 if !is_self {
-                    let proto = match ab(i.get_member_key(&Value::Obj(nt.clone()), "prototype"))? {
-                        Value::Obj(p) => Some(p),
-                        _ => ctor_realm_proto(i, &Value::Obj(nt), "Object")?
-                            .or_else(|| Some(i.object_proto.clone())),
+                    let proto = match (ab(i.get_member_key(&Value::Obj(nt), "prototype"))?).view() {
+                        ValueView::Obj(p) => Some(p),
+                        _ => {
+                            ctor_realm_proto(i, &Value::Obj(nt), "Object")?.or(Some(i.object_proto))
+                        }
                     };
                     return Ok(Value::Obj(Object::new(proto)));
                 }
             }
         }
-        Ok(match arg(args, 0) {
-            Value::Undefined | Value::Null => Value::Obj(i.new_object()),
-            Value::Obj(o) => Value::Obj(o),
-            // ToObject of a primitive yields its wrapper object.
-            other => box_primitive(i, other),
+        Ok({
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined | ValueView::Null => Value::Obj(i.new_object()),
+                ValueView::Obj(o) => Value::Obj(o),
+                // ToObject of a primitive yields its wrapper object.
+                _ => {
+                    let other = __value_match_original;
+                    box_primitive(i, other)
+                }
+            }
         })
     });
-    Rc::make_mut(&mut it.extra_protos).insert("%ObjectCtor%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%ObjectCtor%", ctor);
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(op.clone()), false, false, false),
+        Property::data(Value::Obj(op), false, false, false),
     );
     op.borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
 
     it.def_method(&ctor, "hasOwn", 2, nf_object_has_own);
     it.def_method(&ctor, "groupBy", 2, |i, _this, args| {
-        let mut groups: Vec<(crate::value::PropertyKey, Vec<Value>)> = Vec::new();
+        let groups = crate::rooting::Rooted::new(RefCell::new(Vec::<(
+            crate::value::PropertyKey,
+            Vec<Value>,
+        )>::new()));
         let mut group_index: crate::fasthash::FastMap<String, usize> = Default::default();
+        // Coercion can run author code before the key/element join a group. Once transferred,
+        // the groups trace the converted PropertyKey itself, including a newly created Symbol.
+        let pending =
+            crate::rooting::Rooted::new(std::cell::Cell::new((Value::Undefined, Value::Undefined)));
         group_by(
             i,
             &arg(args, 0),
             &arg(args, 1),
             "Object.groupBy",
             |i, key_v, el| {
+                pending.set((key_v, el));
                 let key = ab(i.to_property_key(&key_v))?;
                 if let Some(&offset) = group_index.get(key.as_str()) {
-                    groups[offset].1.push(el);
+                    groups.borrow_mut()[offset].1.push(el);
                 } else {
-                    group_index.insert(key.as_str().to_owned(), groups.len());
+                    group_index.insert(key.as_str().to_owned(), groups.borrow().len());
                     // Keep the PropertyKey owner, including a Symbol identity, until the result
                     // object's property storage takes ownership. Callback/coercion may collect.
-                    groups.push((key, vec![el]));
+                    groups.borrow_mut().push((key, vec![el]));
                 }
+                pending.set((Value::Undefined, Value::Undefined));
                 Ok(())
             },
         )?;
         drop(group_index);
         let result = i.new_object();
         result.borrow_mut().proto = None; // groupBy returns a null-prototype object
-        for (k, v) in groups {
-            let arr = i.make_array(v);
+        let count = groups.borrow().len();
+        for index in 0..count {
+            let (key, values) = {
+                let mut entries = groups.borrow_mut();
+                (
+                    entries[index].0.clone(),
+                    std::mem::take(&mut entries[index].1),
+                )
+            };
+            // Construction/publication are callback-free; the key remains precisely rooted.
+            let arr = i.make_array(values);
             result
                 .borrow_mut()
                 .props
-                .insert(k.as_str(), Property::plain(arr));
+                .insert(key.as_str(), Property::plain(arr));
         }
         Ok(Value::Obj(result))
     });
     it.def_method(&ctor, "keys", 1, |i, _this, args| {
         let o = to_object_arg(i, arg(args, 0), "Object.keys")?;
         ab(i.defer_trigger(&o, None))?;
-        if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
-            let keys = proxy_enum_string_keys(i, &Value::Obj(o.clone()))?;
-            return Ok(i.make_array(keys));
+        if proxy_pair(i, &Value::Obj(o)).is_some() {
+            let keys = proxy_enum_string_keys(i, &Value::Obj(o))?;
+            return Ok(i.make_array(keys.into_vec()));
         }
         if let Some(length) = i.host_indexed_len(&o) {
             let own_keys = ordinary_own_keys_ordered(i, &o)?;
-            let mut keys = Vec::with_capacity(own_keys.len().max(length as usize));
+            // Rooted: the platform getter below runs between keys.
+            let mut keys = crate::rooting::RootedVec::from_vec(Vec::with_capacity(
+                own_keys.len().max(length as usize),
+            ));
             // EnumerableOwnProperties asks [[GetOwnProperty]] for each key. For a Web IDL
             // indexed property that operation invokes the platform getter even though
             // Object.keys ultimately keeps only the key.
@@ -4522,7 +4617,7 @@ fn install_object(it: &mut Interp) {
                     keys.push(crate::value::string_key_value(key));
                 }
             }
-            return Ok(i.make_array(keys));
+            return Ok(i.make_array(keys.into_vec()));
         }
         // A TypedArray's enumerable own keys are its integer indices plus string expandos.
         if let Some(info) = ta_info(i, &o) {
@@ -4538,7 +4633,7 @@ fn install_object(it: &mut Interp) {
         let names = ordered_enum_keys(&o);
         // A module namespace's Object.keys reads each binding's [[GetOwnProperty]], throwing for an
         // uninitialized export.
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             for k in &names {
                 if let Some(res) = i.namespace_own_property(ptr, k) {
@@ -4555,11 +4650,11 @@ fn install_object(it: &mut Interp) {
     it.def_method(&ctor, "getOwnPropertyNames", 1, |i, _this, args| {
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertyNames")?;
         ab(i.defer_trigger(&o, None))?;
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
             let keys = proxy_own_keys(i, &target, &handler)?;
             let strs: Vec<Value> = keys
                 .into_iter()
-                .filter(|k| matches!(k, Value::Str(_)))
+                .filter(|k| matches!(&(k).view(), ValueView::Str(_)))
                 .collect();
             return Ok(i.make_array(strs));
         }
@@ -4587,12 +4682,12 @@ fn install_object(it: &mut Interp) {
         // ToObject coerces primitives (and throws for null/undefined).
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertySymbols")?;
         ab(i.defer_trigger(&o, None))?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         // A proxy's symbol keys come from its [[OwnPropertyKeys]] trap.
         if let Some((target, handler)) = proxy_pair(i, &ov) {
             let syms: Vec<Value> = proxy_own_keys(i, &target, &handler)?
                 .into_iter()
-                .filter(|k| matches!(k, Value::Sym(_)))
+                .filter(|k| matches!((k).view(), ValueView::Sym(_)))
                 .collect();
             return Ok(i.make_array(syms));
         }
@@ -4604,26 +4699,22 @@ fn install_object(it: &mut Interp) {
         Ok(i.make_array(syms))
     });
     it.def_method(&ctor, "getPrototypeOf", 1, |i, _this, args| {
-        match arg(args, 0) {
-            Value::Obj(o) => {
-                if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        match (arg(args, 0)).view() {
+            ValueView::Obj(o) => {
+                if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
                     return proxy_get_prototype(i, &target, &handler);
                 }
-                Ok(o.borrow()
-                    .proto
-                    .clone()
-                    .map(Value::Obj)
-                    .unwrap_or(Value::Null))
+                Ok(o.borrow().proto.map(Value::Obj).unwrap_or(Value::Null))
             }
             // ToObject coerces a primitive (Object.getPrototypeOf('') → String.prototype).
-            Value::Undefined | Value::Empty | Value::Null => {
+            ValueView::Undefined | ValueView::Empty | ValueView::Null => {
                 Err(i.make_error("TypeError", "called on null or undefined"))
             }
-            Value::Str(_) => Ok(Value::Obj(i.string_proto.clone())),
-            Value::Num(_) => Ok(Value::Obj(i.number_proto.clone())),
-            Value::Bool(_) => Ok(Value::Obj(i.boolean_proto.clone())),
-            Value::Sym(_) => Ok(Value::Obj(i.symbol_proto.clone())),
-            Value::BigInt(_) => Ok(i
+            ValueView::Str(_) => Ok(Value::Obj(i.string_proto)),
+            ValueView::Num(_) => Ok(Value::Obj(i.number_proto)),
+            ValueView::Bool(_) => Ok(Value::Obj(i.boolean_proto)),
+            ValueView::Sym(_) => Ok(Value::Obj(i.symbol_proto)),
+            ValueView::BigInt(_) => Ok(i
                 .extra_protos
                 .get("BigInt")
                 .cloned()
@@ -4633,13 +4724,16 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&ctor, "setPrototypeOf", 2, |i, _this, args| {
         let proto = arg(args, 1);
-        if !matches!(proto, Value::Obj(_) | Value::Null) {
+        if !matches!((proto).view(), ValueView::Obj(_) | ValueView::Null) {
             return Err(i.make_error(
                 "TypeError",
                 "Object prototype may only be an Object or null",
             ));
         }
-        if matches!(arg(args, 0), Value::Undefined | Value::Null) {
+        if matches!(
+            (arg(args, 0)).view(),
+            ValueView::Undefined | ValueView::Null
+        ) {
             return Err(i.make_error(
                 "TypeError",
                 "Object.setPrototypeOf called on null or undefined",
@@ -4653,9 +4747,9 @@ fn install_object(it: &mut Interp) {
         Ok(obj)
     });
     it.def_method(&ctor, "create", 2, |i, _this, args| {
-        let proto = match arg(args, 0) {
-            Value::Obj(o) => Some(o),
-            Value::Null => None,
+        let proto = match (arg(args, 0)).view() {
+            ValueView::Obj(o) => Some(o),
+            ValueView::Null => None,
             _ => {
                 return Err(i.make_error("TypeError", "Object.create proto must be object or null"));
             }
@@ -4663,20 +4757,20 @@ fn install_object(it: &mut Interp) {
         let obj = Object::new(proto);
         // Object.create(O, Properties): when Properties is not undefined, ObjectDefineProperties.
         let props_arg = arg(args, 1);
-        if !matches!(props_arg, Value::Undefined) {
-            object_define_properties(i, &Value::Obj(obj.clone()), props_arg, "Object.create")?;
+        if !matches!((props_arg).view(), ValueView::Undefined) {
+            object_define_properties(i, &Value::Obj(obj), props_arg, "Object.create")?;
         }
         Ok(Value::Obj(obj))
     });
     it.def_method(&ctor, "defineProperty", 3, |i, _this, args| {
-        let o = match arg(args, 0) {
-            Value::Obj(o) => o,
+        let o = match (arg(args, 0)).view() {
+            ValueView::Obj(o) => o,
             _ => {
                 return Err(i.make_error("TypeError", "Object.defineProperty called on non-object"));
             }
         };
         let key = ab(i.to_property_key(&arg(args, 1)))?;
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
             if !ab(proxy_define_property(
                 i,
                 &target,
@@ -4724,14 +4818,14 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&ctor, "freeze", 1, |i, _this, args| {
         let o = arg(args, 0);
-        if matches!(o, Value::Obj(_)) && !set_integrity_level(i, &o, true)? {
+        if matches!((o).view(), ValueView::Obj(_)) && !set_integrity_level(i, &o, true)? {
             return Err(i.make_error("TypeError", "Object.freeze could not freeze the object"));
         }
         Ok(o)
     });
     it.def_method(&ctor, "preventExtensions", 1, |i, _this, args| {
         let obj = arg(args, 0);
-        if matches!(obj, Value::Obj(_)) && !js_prevent_extensions(i, &obj)? {
+        if matches!((obj).view(), ValueView::Obj(_)) && !js_prevent_extensions(i, &obj)? {
             return Err(i.make_error("TypeError", "could not prevent extensions"));
         }
         Ok(obj)
@@ -4739,7 +4833,7 @@ fn install_object(it: &mut Interp) {
     it.def_method(&ctor, "isExtensible", 1, |i, _this, args| {
         let obj = arg(args, 0);
         // Object.isExtensible returns false for a non-object (ES2015+).
-        if !matches!(obj, Value::Obj(_)) {
+        if !matches!((obj).view(), ValueView::Obj(_)) {
             return Ok(Value::Bool(false));
         }
         Ok(Value::Bool(js_is_extensible(i, &obj)?))
@@ -4749,10 +4843,10 @@ fn install_object(it: &mut Interp) {
         let to = to_object_arg(i, arg(args, 0), "Object.assign")?;
         let to_val = Value::Obj(to);
         for src in args.iter().skip(1) {
-            if matches!(src, Value::Undefined | Value::Null) {
+            if matches!(&(src).view(), ValueView::Undefined | ValueView::Null) {
                 continue;
             }
-            let from = Value::Obj(to_object_arg(i, src.clone(), "Object.assign")?);
+            let from = Value::Obj(to_object_arg(i, *src, "Object.assign")?);
             if try_assign_named_data(&to_val, &from) {
                 continue;
             }
@@ -4769,9 +4863,9 @@ fn install_object(it: &mut Interp) {
                 continue;
             }
             let o = from.as_obj().unwrap();
-            let keys = ordinary_own_keys_ordered(i, o)?;
+            let keys = ordinary_own_keys_ordered(i, &o)?;
             for k in keys {
-                let enumerable = if ab(i.host_indexed_own_value(o, &k))?.is_some() {
+                let enumerable = if ab(i.host_indexed_own_value(&o, &k))?.is_some() {
                     crate::value::canonical_index(&k).is_some()
                 } else {
                     o.borrow()
@@ -4803,7 +4897,7 @@ fn install_object(it: &mut Interp) {
     it.def_method(&ctor, "fromEntries", 1, |i, _this, args| {
         // RequireObjectCoercible(iterable).
         let iterable = arg(args, 0);
-        if matches!(iterable, Value::Undefined | Value::Null) {
+        if matches!((iterable).view(), ValueView::Undefined | ValueView::Null) {
             return Err(i.make_error(
                 "TypeError",
                 "Object.fromEntries called on null or undefined",
@@ -4812,15 +4906,11 @@ fn install_object(it: &mut Interp) {
         let obj = i.new_object();
         // Lazily step the iterator; an abrupt completion while processing an entry closes it.
         let (iter, next) = ab(i.get_iterator(&iterable))?;
-        loop {
-            let entry = match ab(i.iterator_step(&iter, &next))? {
-                Some(v) => v,
-                None => break,
-            };
+        while let Some(entry) = ab(i.iterator_step(&iter, &next))? {
             let processed = (|i: &mut Interp| -> Result<(), Value> {
                 // Each entry must be an Object; keys/values are added via CreateDataPropertyOnObject,
                 // which defines a plain data property and never invokes inherited setters.
-                if !matches!(entry, Value::Obj(_)) {
+                if !matches!((entry).view(), ValueView::Obj(_)) {
                     return Err(
                         i.make_error("TypeError", "Object.fromEntries entry is not an object")
                     );
@@ -4842,7 +4932,7 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&ctor, "defineProperties", 2, |i, _this, args| {
         let o = arg(args, 0);
-        if !matches!(o, Value::Obj(_)) {
+        if !matches!((o).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Object.defineProperties on non-object"));
         }
         object_define_properties(i, &o, arg(args, 1), "Object.defineProperties")?;
@@ -4850,7 +4940,7 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&ctor, "seal", 1, |i, _this, args| {
         let o = arg(args, 0);
-        if matches!(o, Value::Obj(_)) && !set_integrity_level(i, &o, false)? {
+        if matches!((o).view(), ValueView::Obj(_)) && !set_integrity_level(i, &o, false)? {
             return Err(i.make_error("TypeError", "Object.seal could not seal the object"));
         }
         Ok(o)
@@ -4881,7 +4971,7 @@ pub(crate) fn nf_object_has_own(
 /// TestIntegrityLevel: extensibility plus per-key configurability (and, for frozen, data-property
 /// writability), through the proxy [[IsExtensible]]/[[OwnPropertyKeys]]/[[GetOwnProperty]] traps.
 fn test_integrity_level(i: &mut Interp, v: &Value, frozen: bool) -> Result<bool, Value> {
-    if !matches!(v, Value::Obj(_)) {
+    if !matches!(&(v).view(), ValueView::Obj(_)) {
         return Ok(true);
     }
     if js_is_extensible(i, v)? {
@@ -4889,8 +4979,8 @@ fn test_integrity_level(i: &mut Interp, v: &Value, frozen: bool) -> Result<bool,
     }
     // A TypedArray's in-bounds elements are always configurable and writable, so a view with any
     // elements is never sealed or frozen.
-    if let Value::Obj(o) = v {
-        if let Some(info) = ta_info(i, o) {
+    if let ValueView::Obj(o) = (v).view() {
+        if let Some(info) = ta_info(i, &o) {
             if i.ta_len(&info).unwrap_or(0) > 0 {
                 return Ok(false);
             }
@@ -4900,8 +4990,8 @@ fn test_integrity_level(i: &mut Interp, v: &Value, frozen: bool) -> Result<bool,
         for k in proxy_own_keys(i, &t, &h)? {
             let key = ab(i.to_property_key(&k))?;
             let desc = proxy_gopd_value(i, &t, &h, &key)?;
-            let d = match &desc {
-                Value::Obj(d) => d.clone(),
+            let d = match &(desc).view() {
+                ValueView::Obj(d) => *d,
                 _ => continue,
             };
             let c = ab(i.get_member_key(&desc, "configurable"))?;
@@ -4959,7 +5049,7 @@ fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
     });
     let props = map.instantiate_plain(values.into_iter());
     Value::Obj(Object::new_with_parts(
-        Some(i.object_proto.clone()),
+        Some(i.object_proto),
         props,
         Exotic::None,
     ))
@@ -5018,7 +5108,7 @@ fn plain_descriptor_fields(o: &Gc) -> Option<[Option<Value>; 6]> {
         "set",
     ];
     let mut fields: [Option<Value>; 6] = Default::default();
-    let mut current = Some(o.clone());
+    let mut current = Some(*o);
     while let Some(object) = current {
         let body = object.try_borrow().ok()?;
         if !body.ic_plain.get() || !matches!(body.exotic, Exotic::None) {
@@ -5037,15 +5127,15 @@ fn plain_descriptor_fields(o: &Gc) -> Option<[Option<Value>; 6]> {
         if fields.iter().all(Option::is_some) {
             break;
         }
-        current = body.proto.clone();
+        current = body.proto;
     }
     Some(fields)
 }
 
 /// Read + validate a descriptor object into a PartialDesc (ToPropertyDescriptor).
 fn build_partial(i: &mut Interp, desc: &Value) -> Result<PartialDesc, Abrupt> {
-    let o = match desc {
-        Value::Obj(o) => o.clone(),
+    let o = match &(desc).view() {
+        ValueView::Obj(o) => *o,
         _ => return Err(i.throw("TypeError", "Property description must be an object")),
     };
     if let Some([enumerable, configurable, value, writable, get, set]) = plain_descriptor_fields(&o)
@@ -5058,7 +5148,7 @@ fn build_partial(i: &mut Interp, desc: &Value) -> Result<PartialDesc, Abrupt> {
     // ToPropertyDescriptor reads each field with HasProperty/Get (both trap-aware — the
     // descriptor may itself be a proxy), in the spec's field order: enumerable, configurable,
     // value, writable, get, set.
-    let base = Value::Obj(o.clone());
+    let base = Value::Obj(o);
     let bool_field = |i: &mut Interp, k: &str| -> Result<Option<bool>, Abrupt> {
         if i.js_has_property(&base, k)? {
             let v = i.get_member_key(&base, k)?;
@@ -5105,12 +5195,12 @@ fn validated_partial(
         ));
     }
     if let Some(g) = &get {
-        if !matches!(g, Value::Undefined) && !g.is_callable() {
+        if !matches!(&(g).view(), ValueView::Undefined) && !g.is_callable() {
             return Err(i.throw("TypeError", "Getter must be a function"));
         }
     }
     if let Some(s) = &set {
-        if !matches!(s, Value::Undefined) && !s.is_callable() {
+        if !matches!(&(s).view(), ValueView::Undefined) && !s.is_callable() {
             return Err(i.throw("TypeError", "Setter must be a function"));
         }
     }
@@ -5162,15 +5252,15 @@ fn to_precision(n: f64, p: usize) -> String {
 }
 
 fn opt_norm(v: Option<Value>) -> Option<Value> {
-    v.filter(|x| !matches!(x, Value::Undefined))
+    v.filter(|x| !matches!(&(x).view(), ValueView::Undefined))
 }
 
 /// OrdinaryDefineOwnProperty with the non-configurable / non-extensible invariant checks.
 /// Deferred-namespace trigger for builtin MOP entry points (`None` key = key-less operations
 /// like [[OwnPropertyKeys]], which always trigger).
 fn defer_trigger_v(i: &mut Interp, v: &Value, key: Option<&str>) -> Result<(), Value> {
-    if let Value::Obj(o) = v {
-        ab(i.defer_trigger(o, key))?;
+    if let ValueView::Obj(o) = (v).view() {
+        ab(i.defer_trigger(&o, key))?;
     }
     Ok(())
 }
@@ -5204,7 +5294,7 @@ fn define_own_property_record(
     // ArgumentsExoticObject [[DefineOwnProperty]]: sync the live parameter value into the
     // ordinary property first; after a successful ordinary define, a plain value write goes
     // through the map, and only an accessor or writable:false severs the alias.
-    let args_ptr = Rc::as_ptr(o) as usize;
+    let args_ptr = Gc::as_ptr(o) as usize;
     let mapped = i.mapped_arg_name(args_ptr, key).is_some();
     if mapped {
         if let Some(cur) = i.mapped_arg_value(args_ptr, key) {
@@ -5239,7 +5329,7 @@ fn define_own_property_ordinary(
     // Module namespace [[DefineOwnProperty]]: a String key is only redefinable to a descriptor that
     // matches the export's fixed shape (writable, enumerable, non-configurable, same value); adding
     // a new String key fails. Symbol keys fall through to the ordinary algorithm.
-    let ptr = Rc::as_ptr(o) as usize;
+    let ptr = Gc::as_ptr(o) as usize;
     if i.is_namespace(ptr) && !Interp::is_sym_key(key) {
         return match i.namespace_own_property(ptr, key) {
             Some(res) => {
@@ -5270,7 +5360,7 @@ fn define_own_property_ordinary(
                 {
                     return Ok(false);
                 }
-                if let Some(v) = d.value.clone() {
+                if let Some(v) = d.value {
                     i.ta_store(&info, idx, &v)?;
                 }
                 return Ok(true);
@@ -5445,7 +5535,7 @@ pub(crate) fn array_set_length_value(i: &mut Interp, o: &Gc, value: Value) -> Re
 /// Read the current descriptor only after both observable conversions. Only canonical array
 /// indices participate in truncation; other numeric-looking names are ordinary properties.
 fn array_set_length(i: &mut Interp, o: &Gc, d: &PartialDesc) -> Result<bool, Abrupt> {
-    let new_len = match &d.value {
+    let new_len = match d.value.map(|value| value.view()) {
         None => {
             // `length` is a non-configurable, non-enumerable data property.
             if d.is_accessor()
@@ -5472,19 +5562,20 @@ fn array_set_length(i: &mut Interp, o: &Gc, d: &PartialDesc) -> Result<bool, Abr
             }
             return Ok(true);
         }
-        Some(Value::Num(number)) => {
+        Some(ValueView::Num(number)) => {
             // ToNumber(Number) is the identity and cannot run author code. The two-conversion
             // SameValueZero test succeeds exactly for integral Numbers in [0, 2^32 - 1],
             // including -0 (normalized to +0). Saturating conversion plus an exact round trip
             // proves this range/integrality; unlike the object case below, no modulo result
             // outside that range could compare equal to the unchanged original Number.
-            let new_len = *number as u32;
-            if *number != new_len as f64 {
+            let new_len = number as u32;
+            if number != new_len as f64 {
                 return Err(i.throw("RangeError", "Invalid array length"));
             }
             new_len as usize
         }
-        Some(v) => {
+        Some(_) => {
+            let v = d.value.as_ref().unwrap();
             // ArraySetLength coerces first — ToUint32(value) then ToNumber(value), both
             // observable — and a mismatch (fraction, negative, ≥ 2^32) is a RangeError before
             // any attribute validation.
@@ -5569,8 +5660,8 @@ pub(crate) fn box_primitive_pub(i: &mut Interp, v: Value) -> Value {
     box_primitive(i, v)
 }
 fn same_value(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Num(x), Value::Num(y)) => {
+    match (&(a).view(), &(b).view()) {
+        (ValueView::Num(x), ValueView::Num(y)) => {
             if x.is_nan() && y.is_nan() {
                 return true;
             }
@@ -5579,13 +5670,13 @@ fn same_value(a: &Value, b: &Value) -> bool {
             }
             x == y
         }
-        (Value::Undefined, Value::Undefined) => true,
-        (Value::Null, Value::Null) => true,
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::BigInt(x), Value::BigInt(y)) => x == y,
-        (Value::Sym(x), Value::Sym(y)) => Rc::ptr_eq(x, y),
-        (Value::Obj(x), Value::Obj(y)) => Rc::ptr_eq(x, y),
+        (ValueView::Undefined, ValueView::Undefined) => true,
+        (ValueView::Null, ValueView::Null) => true,
+        (ValueView::Bool(x), ValueView::Bool(y)) => x == y,
+        (ValueView::Str(x), ValueView::Str(y)) => x == y,
+        (ValueView::BigInt(x), ValueView::BigInt(y)) => x == y,
+        (ValueView::Sym(x), ValueView::Sym(y)) => crate::value::symbol_ptr_eq(x, y),
+        (ValueView::Obj(x), ValueView::Obj(y)) => Gc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -5595,15 +5686,15 @@ fn same_value(a: &Value, b: &Value) -> bool {
 /// always take the observable algorithm.
 fn is_native_function(value: &Value, expected: NativeFn) -> bool {
     matches!(
-        value,
-        Value::Obj(object)
+        &(value).view(),
+        ValueView::Obj(object)
             if matches!(object.borrow().call, Callable::Native(actual)
                 if std::ptr::fn_addr_eq(actual, expected))
     )
 }
 
 fn is_intrinsic_array_constructor(i: &Interp, value: &Value) -> bool {
-    matches!((i.array_ctor.as_ref(), value), (Some(expected), Value::Obj(actual)) if Rc::ptr_eq(expected, actual))
+    matches!((i.array_ctor.as_ref(), &(value).view()), (Some(expected), ValueView::Obj(actual)) if Gc::ptr_eq(expected, actual))
 }
 
 /// Whether the intrinsic Array constructor still creates instances with this Realm's ordinary
@@ -5611,19 +5702,18 @@ fn is_intrinsic_array_constructor(i: &Interp, value: &Value) -> bool {
 /// Constructor, so changing that writable property (or replacing it with an accessor) must disable
 /// allocation shortcuts even when the constructor function itself is still the intrinsic.
 fn intrinsic_array_constructor_is_default(i: &Interp, value: &Value) -> bool {
-    let Value::Obj(actual) = value else {
+    let ValueView::Obj(actual) = (value).view() else {
         return false;
     };
-    if !matches!(i.array_ctor.as_ref(), Some(expected) if Rc::ptr_eq(expected, actual)) {
+    if !matches!(i.array_ctor.as_ref(), Some(expected) if Gc::ptr_eq(expected, &actual)) {
         return false;
     }
-    actual
-        .borrow()
-        .props
+    let body = actual.borrow();
+    body.props
         .get("prototype")
         .filter(|property| !property.accessor())
         .is_some_and(|property| {
-            matches!(property.value(), Value::Obj(proto) if Rc::ptr_eq(&proto, &i.array_proto))
+            matches!((property.value()).view(), ValueView::Obj(proto) if Gc::ptr_eq(&proto, &i.array_proto))
         })
 }
 
@@ -5648,7 +5738,7 @@ pub(crate) fn inert_array_iterator_remaining(
         return None;
     }
     let object = iterator.as_obj()?;
-    if !i.ordinary_get_ptr(Rc::as_ptr(object) as usize) {
+    if !i.ordinary_get_ptr(Gc::as_ptr(&object) as usize) {
         return None;
     }
     let object = object.borrow();
@@ -5657,8 +5747,8 @@ pub(crate) fn inert_array_iterator_remaining(
     };
     let target = state.target.as_obj()?;
     if !matches!(target.borrow().exotic, Exotic::Array)
-        || !i.ordinary_get_ptr(Rc::as_ptr(target) as usize)
-        || !i.array_append_unshadowed(target)
+        || !i.ordinary_get_ptr(Gc::as_ptr(&target) as usize)
+        || !i.array_append_unshadowed(&target)
         || target
             .borrow()
             .props
@@ -5667,7 +5757,7 @@ pub(crate) fn inert_array_iterator_remaining(
     {
         return None;
     }
-    Some(i.array_length(target).saturating_sub(state.index))
+    Some(i.array_length(&target).saturating_sub(state.index))
 }
 
 /// Whether an array can use the allocation-free iterator snapshot in `Interp::iterate`.
@@ -5677,14 +5767,14 @@ pub(crate) fn inert_array_iterator_remaining(
 /// Requiring the ordinary realm prototype and no own symbol override keeps the check entirely
 /// side-effect free; customized arrays take the protocol path.
 pub(crate) fn array_iterator_fast_path_is_safe(i: &Interp, value: &Value) -> bool {
-    let Value::Obj(object) = value else {
+    let ValueView::Obj(object) = &(value).view() else {
         return false;
     };
     if !matches!(object.borrow().exotic, Exotic::Array)
-        || !i.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+        || !i.ordinary_get_ptr(Gc::as_ptr(object) as usize)
         || !matches!(
             object.borrow().proto.as_ref(),
-            Some(proto) if Rc::ptr_eq(proto, &i.array_proto)
+            Some(proto) if Gc::ptr_eq(proto, &i.array_proto)
         )
     {
         return false;
@@ -5711,12 +5801,6 @@ pub(crate) fn array_iterator_fast_path_is_safe(i: &Interp, value: &Value) -> boo
     })
 }
 
-/// Whether `value` is %ArrayIteratorPrototype%.next of some Realm.
-#[cfg(test)]
-pub(crate) fn is_array_values_next(value: &Value) -> bool {
-    is_native_function(value, array_iter_next)
-}
-
 /// Closed, non-exhausting Array binding prefix of `count` elements. No lookup here may invoke
 /// author code: under the intrinsic protocol (see [`ArrayIterationProof`]) every index below
 /// `count` is an own data property, so each step reads it without code, and IteratorClose
@@ -5727,7 +5811,8 @@ pub(crate) fn dense_array_binding_next(i: &Interp, value: &Value, count: usize) 
         return None;
     }
     let next = intrinsic_array_iteration_next(i, value)?;
-    let body = value.as_obj()?.borrow();
+    let object = value.as_obj()?;
+    let body = object.borrow();
     (ordinary_array_length(&body.props)? >= count
         && (0..count).all(|index| own_data_element(&body.props, index).is_some()))
     .then_some(next)
@@ -5738,11 +5823,11 @@ pub(crate) fn dense_array_binding_next(i: &Interp, value: &Value, count: usize) 
 /// the intrinsic Array iterator. Holes and accessors deliberately miss so prototype lookup and
 /// side effects retain the ordinary iterator path.
 pub(crate) fn dense_array_snapshot(i: &Interp, value: &Value) -> Option<Vec<Value>> {
-    let Value::Obj(object) = value else {
+    let ValueView::Obj(object) = &(value).view() else {
         return None;
     };
     if !matches!(object.borrow().exotic, Exotic::Array)
-        || !i.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+        || !i.ordinary_get_ptr(Gc::as_ptr(object) as usize)
     {
         return None;
     }
@@ -5775,14 +5860,14 @@ pub(crate) struct ArrayIterationProof {
     iterator_key: Option<Rc<str>>,
     iterator_slot: usize,
     next_slot: usize,
-    values: std::rc::Weak<RefCell<Object>>,
-    next: std::rc::Weak<RefCell<Object>>,
-    prototype: std::rc::Weak<RefCell<Object>>,
+    values: crate::value::WeakGc,
+    next: crate::value::WeakGc,
+    prototype: crate::value::WeakGc,
 }
 
 impl ArrayIterationProof {
     /// Whether the slot at `slot` of `object` holds exactly the pinned function `expected`.
-    fn holds(object: &Gc, slot: usize, expected: &std::rc::Weak<RefCell<Object>>) -> bool {
+    fn holds(object: &Gc, slot: usize, expected: &crate::value::WeakGc) -> bool {
         object
             .borrow()
             .props
@@ -5796,7 +5881,7 @@ impl ArrayIterationProof {
 fn verify_array_iteration(i: &Interp, epoch: u32) -> Option<ArrayIterationProof> {
     // A data property holding this Realm's built-in function with behaviour `expected`.
     let intrinsic_slot = |object: &Gc, key: &str, expected: NativeFn| {
-        if !i.ordinary_get_ptr(Rc::as_ptr(object) as usize) {
+        if !i.ordinary_get_ptr(Gc::as_ptr(object) as usize) {
             return None;
         }
         let body = object.borrow();
@@ -5807,17 +5892,17 @@ fn verify_array_iteration(i: &Interp, epoch: u32) -> Option<ArrayIterationProof>
             return None;
         }
         let function = function.as_obj()?;
-        i.native_call_in_current_realm(function)
-            .then(|| (slot, Rc::downgrade(function)))
+        i.native_call_in_current_realm(&function)
+            .then(|| (slot, Gc::downgrade(&function)))
     };
     let iterator_key = well_known_key(i, "iterator")?;
     let (iterator_slot, values) = intrinsic_slot(&i.array_proto, &iterator_key, nf_array_values)?;
     let prototype = i.extra_protos.get("%ArrayIteratorPrototype%")?;
     let (next_slot, next) = intrinsic_slot(prototype, "next", array_iter_next)?;
     let mut chain = Vec::new();
-    let mut current = Some(prototype.clone());
+    let mut current = Some(*prototype);
     while let Some(object) = current {
-        if chain.len() == 64 || !i.ordinary_get_ptr(Rc::as_ptr(&object) as usize) {
+        if chain.len() == 64 || !i.ordinary_get_ptr(Gc::as_ptr(&object) as usize) {
             return None;
         }
         let parent = {
@@ -5825,7 +5910,7 @@ fn verify_array_iteration(i: &Interp, epoch: u32) -> Option<ArrayIterationProof>
             if !matches!(body.exotic, Exotic::None) || body.props.get("return").is_some() {
                 return None;
             }
-            body.proto.clone()
+            body.proto
         };
         chain.push(object);
         current = parent;
@@ -5841,7 +5926,7 @@ fn verify_array_iteration(i: &Interp, epoch: u32) -> Option<ArrayIterationProof>
         next_slot,
         values,
         next,
-        prototype: Rc::downgrade(prototype),
+        prototype: Gc::downgrade(prototype),
     })
 }
 
@@ -5878,12 +5963,7 @@ pub(crate) fn array_iteration_is_intrinsic(i: &Interp, value: &Value) -> bool {
 /// [`array_iteration_is_intrinsic`], returning the `next` method GetIterator reads. `None`
 /// means "use the observable algorithm".
 pub(crate) fn intrinsic_array_iteration_next(i: &Interp, value: &Value) -> Option<Value> {
-    with_intrinsic_array_iteration(i, value, |proof| {
-        proof
-            .next
-            .upgrade()
-            .map(|next| Value::Obj(Gc::from_rc(next)))
-    })
+    with_intrinsic_array_iteration(i, value, |proof| proof.next.upgrade().map(Value::Obj))
 }
 
 fn with_intrinsic_array_iteration<R>(
@@ -5896,14 +5976,14 @@ fn with_intrinsic_array_iteration<R>(
         {
             let body = array.borrow();
             if !matches!(body.exotic, Exotic::Array)
-                || !matches!(body.proto.as_ref(), Some(proto) if Rc::ptr_eq(proto, &i.array_proto))
-                || !i.ordinary_get_ptr(Rc::as_ptr(array) as usize)
+                || !matches!(body.proto.as_ref(), Some(proto) if Gc::ptr_eq(proto, &i.array_proto))
+                || !i.ordinary_get_ptr(Gc::as_ptr(&array) as usize)
                 || body.props.get(proof.iterator_key.as_deref()?).is_some()
             {
                 return None;
             }
         }
-        let prototype = Gc::from_rc(proof.prototype.upgrade()?);
+        let prototype = proof.prototype.upgrade()?;
         if !ArrayIterationProof::holds(&i.array_proto, proof.iterator_slot, &proof.values)
             || !ArrayIterationProof::holds(&prototype, proof.next_slot, &proof.next)
         {
@@ -5936,9 +6016,9 @@ pub(crate) fn array_iterator_close_is_inert(i: &Interp, iterator: &Value) -> boo
         let body = object.borrow();
         (matches!(body.exotic, Exotic::ArrayIterator(_))
             && matches!(body.proto.as_ref(),
-                Some(proto) if std::ptr::eq(Rc::as_ptr(proto), proof.prototype.as_ptr()))
+                Some(proto) if std::ptr::eq(Gc::as_ptr(proto), proof.prototype.as_ptr()))
             && body.props.values().next().is_none()
-            && i.ordinary_get_ptr(Rc::as_ptr(object) as usize))
+            && i.ordinary_get_ptr(Gc::as_ptr(&object) as usize))
         .then_some(())
     })
     .is_some()
@@ -5954,7 +6034,7 @@ fn nf_array_values(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value
 // ---------------------------------------------------------------------------------------------
 
 fn install_array(it: &mut Interp) {
-    let ap = it.array_proto.clone();
+    let ap = it.array_proto;
     ap.borrow().props.mark_array();
     ap.borrow_mut().exotic = Exotic::Array;
     ap.borrow_mut().props.insert(
@@ -5994,7 +6074,7 @@ fn install_array(it: &mut Interp) {
 
     it.def_method(&ap, "push", 1, nf_array_push);
     it.def_method(&ap, "pop", 0, nf_array_pop);
-    install_array_rest(it, ap.clone());
+    install_array_rest(it, ap);
     // forEach, map, filter, some, every, find, findIndex, findLast, findLastIndex, reduce and
     // reduceRight are self-hosted.
     crate::self_hosted::install_array_methods(it, &ap);
@@ -6006,15 +6086,15 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
     // whose tail is exactly the dense frontier appends in place — no key strings, no
     // existence scans, no observable coercions (a whole-number own `length` needs none).
     if matches!(o.borrow().exotic, Exotic::Array)
-        && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
+        && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
         && i.array_append_unshadowed(&o)
     {
         let mut b = o.borrow_mut();
         // Set(O, len, E, true) creates an own element: a non-extensible array rejects it
         // (§10.1.6.3 ValidateAndApplyPropertyDescriptor) and the general path throws.
         let len = match b.props.length_property() {
-            Some(p) if b.extensible && !p.accessor() && p.writable() => match p.value() {
-                Value::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => {
+            Some(p) if b.extensible && !p.accessor() && p.writable() => match (p.value()).view() {
+                ValueView::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => {
                     Some(n as u32)
                 }
                 _ => None,
@@ -6025,7 +6105,7 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
             if (len as u64 + args.len() as u64) <= u32::MAX as u64 {
                 let mut ok = true;
                 for a in args {
-                    if b.props.append_element(len, Property::plain(a.clone())) {
+                    if b.props.append_element(len, Property::plain(*a)) {
                         len += 1;
                     } else {
                         ok = false;
@@ -6033,8 +6113,8 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
                     }
                 }
                 // Sync length up to what actually landed (partial success still moved it).
-                if !matches!(b.props.length_property().map(|p| p.value()),
-                             Some(Value::Num(n)) if n == len as f64)
+                if !matches!((b.props.length_property().map(|p| p.value())).map(|__value| (__value).view()),
+                             Some(ValueView::Num(n)) if n == len as f64)
                 {
                     let s = b.props.slot_of("length").unwrap();
                     b.props.set_value_at(s, Value::Num(len as f64));
@@ -6045,7 +6125,7 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
             }
         }
     }
-    let ov = Value::Obj(o.clone());
+    let ov = Value::Obj(o);
     // `push` only writes at the tail, so a huge array-like length is fine (use ToLength, not the
     // engine's materialization cap).
     let mut len = ab(i.to_length(&o))? as u64;
@@ -6054,7 +6134,7 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
         return Err(i.make_error("TypeError", "push would exceed the maximum array length"));
     }
     for a in args {
-        set_throw(i, &ov, &len.to_string(), a.clone())?;
+        set_throw(i, &ov, &len.to_string(), *a)?;
         len += 1;
     }
     // Generic objects don't auto-track length the way arrays do, so set it explicitly.
@@ -6067,11 +6147,11 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
     // Dense fast path (mirror of push's): take the last element straight off the entries
     // tail — no key strings, no hash lookups, and crucially NO shape reset, so the array's
     // inline caches survive a pop (stack-discipline arrays live on push/pop).
-    if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize) {
+    if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize) {
         let mut b = o.borrow_mut();
         let len = match b.props.length_property() {
-            Some(p) if !p.accessor() && p.writable() => match p.value() {
-                Value::Num(n) if n.trunc() == n && (1.0..=u32::MAX as f64).contains(&n) => {
+            Some(p) if !p.accessor() && p.writable() => match (p.value()).view() {
+                ValueView::Num(n) if n.trunc() == n && (1.0..=u32::MAX as f64).contains(&n) => {
                     Some(n as u32)
                 }
                 _ => None,
@@ -6086,7 +6166,7 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
             }
         }
     }
-    let ov = Value::Obj(o.clone());
+    let ov = Value::Obj(o);
     // `pop` only touches the last index, so a huge array-like length is fine (use ToLength).
     let len = ab(i.to_length(&o))?;
     if len == 0 {
@@ -6104,9 +6184,7 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
 /// `Err(value)` means no mutation occurred and hands the argument back to the caller for the
 /// exact generic builtin path. `Ok(length)` means the argument's ownership moved into the array.
 pub(crate) fn jit_array_push_one(i: &mut Interp, o: &Gc, value: Value) -> Result<Value, Value> {
-    array_push_dense_packed(i, o, PackedValue::pack(value))
-        .map(|length| Value::Num(length as f64))
-        .map_err(PackedValue::into_value)
+    array_push_dense(i, o, value).map(|length| Value::Num(length as f64))
 }
 
 /// `Array.prototype.push(value)` (ECMA-262 §23.1.3.23) on an extensible ordinary Array whose
@@ -6114,11 +6192,7 @@ pub(crate) fn jit_array_push_one(i: &mut Interp, o: &Gc, value: Value) -> Result
 /// properties: Set(O, len, value, true) is then exactly CreateDataProperty at the dense tail,
 /// and Set(O, "length", len + 1, true) the matching length update. Returns the new length,
 /// or hands the value back (nothing changed) for the general algorithm.
-pub(crate) fn array_push_dense_packed(
-    i: &Interp,
-    o: &Gc,
-    value: PackedValue,
-) -> Result<u32, PackedValue> {
+pub(crate) fn array_push_dense(i: &Interp, o: &Gc, value: Value) -> Result<u32, Value> {
     {
         let b = o.borrow();
         if !matches!(b.exotic, Exotic::Array) || !b.ic_plain.get() || !b.extensible {
@@ -6136,28 +6210,25 @@ pub(crate) fn array_push_dense_packed(
         },
         _ => return Err(value),
     };
-    match b
-        .props
-        .try_append_element(len, Property::plain_packed(value))
-    {
+    match b.props.try_append_element(len, Property::plain(value)) {
         Ok(()) => {
             let next = len + 1;
             b.props.set_array_length_value(next as f64);
             Ok(next)
         }
-        Err(prop) => Err(PackedValue::pack(prop.into_value())),
+        Err(prop) => Err(prop.into_value()),
     }
 }
 
 /// JIT-only dense `Array#pop` form. `None` is a guard miss with no mutation.
 pub(crate) fn jit_array_pop(i: &Interp, o: &Gc) -> Option<Value> {
-    if !matches!(o.borrow().exotic, Exotic::Array) || !i.ordinary_get_ptr(Rc::as_ptr(o) as usize) {
+    if !matches!(o.borrow().exotic, Exotic::Array) || !i.ordinary_get_ptr(Gc::as_ptr(o) as usize) {
         return None;
     }
     let mut b = o.borrow_mut();
     let len = match b.props.length_property() {
-        Some(p) if !p.accessor() && p.writable() => match p.value() {
-            Value::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => n as u32,
+        Some(p) if !p.accessor() && p.writable() => match (p.value()).view() {
+            ValueView::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => n as u32,
             _ => return None,
         },
         _ => return None,
@@ -6174,7 +6245,7 @@ pub(crate) fn jit_array_pop(i: &Interp, o: &Gc) -> Option<Value> {
 fn install_array_rest(it: &mut Interp, ap: Gc) {
     it.def_method(&ap, "shift", 0, |i, this, _args| {
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.checked_array_len(&o))?;
         if len == 0 {
             set_throw(i, &ov, "length", Value::Num(0.0))?;
@@ -6183,7 +6254,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // ECMA-262 #sec-array.prototype.shift: own data reads/writes cannot
         // observe the prototype, even on non-extensible Arrays. The storage
         // proof rejects holes/accessors/failing descriptors before any mutation.
-        if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
+        if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
         {
             if let Some(first) = o.borrow_mut().props.shift_dense_array(len) {
                 return Ok(first);
@@ -6204,7 +6275,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ap, "unshift", 1, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.to_length(&o))? as u64;
         let n = args.len() as u64;
         if n > 0 {
@@ -6213,7 +6284,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             }
             if len + n <= u64::from(u32::MAX)
                 && matches!(o.borrow().exotic, Exotic::Array)
-                && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
+                && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
                 && o.borrow().extensible
                 && i.array_append_unshadowed(&o)
                 && o.borrow_mut().props.unshift_dense_array(len as usize, args)
@@ -6229,7 +6300,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 }
             }
             for (idx, a) in args.iter().enumerate() {
-                set_throw(i, &ov, &idx.to_string(), a.clone())?;
+                set_throw(i, &ov, &idx.to_string(), *a)?;
             }
         }
         set_throw(i, &ov, "length", Value::Num((len + n) as f64))?;
@@ -6241,9 +6312,15 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // bounded by the engine's materialization cap.
         let len = ab(i.to_length(&o))? as i64;
         let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
-        let end = match arg(args, 1) {
-            Value::Undefined => len,
-            v => norm_index(ab(i.to_number(&v))?, len),
+        let end = {
+            let __value_match_original = arg(args, 1);
+            match (__value_match_original).view() {
+                ValueView::Undefined => len,
+                _ => {
+                    let v = __value_match_original;
+                    norm_index(ab(i.to_number(&v))?, len)
+                }
+            }
         };
         let count = (end - start).max(0) as usize;
         // With the intrinsic species the result is a fresh Array, and own data elements are
@@ -6254,7 +6331,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             }
         }
         let result = array_species_create(i, &this, count as u64)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let mut k = start;
         let mut to = 0usize;
         while k < end {
@@ -6276,22 +6353,28 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             return Ok(Value::Num(-1.0));
         }
         let target = arg(args, 0);
-        let from = match arg(args, 1) {
-            Value::Undefined => 0usize,
-            v => {
-                let n = ab(i.to_number(&v))?;
-                if n == f64::INFINITY {
-                    return Ok(Value::Num(-1.0));
-                }
-                let n = if n.is_nan() { 0.0 } else { n.trunc() };
-                if n >= 0.0 {
-                    n as usize
-                } else {
-                    (len as f64 + n).max(0.0) as usize
+        let from = {
+            let __value_match_original = arg(args, 1);
+            match (__value_match_original).view() {
+                ValueView::Undefined => 0usize,
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let n = ab(i.to_number(&v))?;
+                        if n == f64::INFINITY {
+                            return Ok(Value::Num(-1.0));
+                        }
+                        let n = if n.is_nan() { 0.0 } else { n.trunc() };
+                        if n >= 0.0 {
+                            n as usize
+                        } else {
+                            (len as f64 + n).max(0.0) as usize
+                        }
+                    }
                 }
             }
         };
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         for k in from..len {
             let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
                 continue; // indexOf skips holes
@@ -6310,23 +6393,29 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             return Ok(Value::Bool(false));
         }
         let target = arg(args, 0);
-        let mut k = match arg(args, 1) {
-            Value::Undefined => 0i64,
-            v => {
-                let n = ab(i.to_number(&v))?;
-                if n == f64::INFINITY {
-                    return Ok(Value::Bool(false));
-                }
-                if n == f64::NEG_INFINITY || n.is_nan() {
-                    0
-                } else if n >= 0.0 {
-                    n.trunc() as i64
-                } else {
-                    (len + n.trunc() as i64).max(0)
+        let mut k = {
+            let __value_match_original = arg(args, 1);
+            match (__value_match_original).view() {
+                ValueView::Undefined => 0i64,
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let n = ab(i.to_number(&v))?;
+                        if n == f64::INFINITY {
+                            return Ok(Value::Bool(false));
+                        }
+                        if n == f64::NEG_INFINITY || n.is_nan() {
+                            0
+                        } else if n >= 0.0 {
+                            n.trunc() as i64
+                        } else {
+                            (len + n.trunc() as i64).max(0)
+                        }
+                    }
                 }
             }
         };
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         while k < len {
             let v = array_get_index(i, &o, &ov, k as usize)?;
             if same_value_zero(&v, &target) {
@@ -6338,11 +6427,17 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ap, "join", 1, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.checked_array_len(&o))?;
-        let sep = match arg(args, 0) {
-            Value::Undefined => crate::lstr::LStr::from(","),
-            v => ab(i.to_string(&v))?,
+        let sep = {
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined => crate::lstr::LStr::from(","),
+                _ => {
+                    let v = __value_match_original;
+                    ab(i.to_string(&v))?
+                }
+            }
         };
         // ECMA-262 §23.1.3.18 performs separator conversion before the left-to-right element
         // Gets/ToStrings.  Append directly to one result buffer in that same order: `to_string`
@@ -6354,7 +6449,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 push_str_checked(i, &mut out, &sep)?;
             }
             let v = array_get_index(i, &o, &ov, k)?;
-            if !matches!(v, Value::Undefined | Value::Null) {
+            if !matches!((v).view(), ValueView::Undefined | ValueView::Null) {
                 let piece = ab(i.to_string(&v))?;
                 push_str_checked(i, &mut out, &piece)?;
             }
@@ -6369,8 +6464,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // HasProperty/Get. Only an ordinary result can define properties without
         // invoking author code that changes the source between those reads.
         let unobservable_defines = result.as_obj().is_some_and(|object| {
-            matches!(object.borrow().exotic, Exotic::None | Exotic::Array)
-                && i.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+            (object.borrow().exotic.is_ordinary()
+                || matches!(object.borrow().exotic, Exotic::Array))
+                && i.ordinary_get_ptr(Gc::as_ptr(&object) as usize)
         });
         let mut n = 0u64;
         // ECMA-262 §23.1.3.2 prepends the receiver to `items`, then processes each item in order.
@@ -6378,22 +6474,22 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // argument vector or clone every argument before the observable spreadability checks.
         for v in std::iter::once(&recv).chain(args.iter()) {
             // IsConcatSpreadable: @@isConcatSpreadable if defined, else IsArray.
-            let spreadable = if let Value::Obj(_) = v {
+            let spreadable = if let ValueView::Obj(_) = &(v).view() {
                 let key = well_known_key(i, "isConcatSpreadable");
                 let flag = match &key {
                     Some(k) => ab(i.get_member_key(v, k))?,
                     None => Value::Undefined,
                 };
-                match flag {
-                    Value::Undefined => json_is_array(i, v)?,
-                    other => i.to_boolean(&other),
+                match flag.view() {
+                    ValueView::Undefined => json_is_array(i, v)?,
+                    _ => i.to_boolean(&flag),
                 }
             } else {
                 false
             };
             if spreadable {
-                let len = ab(i.to_length(&match v {
-                    Value::Obj(o) => o.clone(),
+                let len = ab(i.to_length(&match &(v).view() {
+                    ValueView::Obj(o) => *o,
                     _ => unreachable!(),
                 }))? as u64;
                 if n + len > 9007199254740991 {
@@ -6407,9 +6503,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                         unobservable_defines
                             && result
                                 .as_obj()
-                                .is_some_and(|target| !Rc::ptr_eq(source, target))
+                                .is_some_and(|target| !Gc::ptr_eq(source, &target))
                     })
-                    .and_then(|object| own_data_elements(object, 0..len as usize))
+                    .and_then(|object| own_data_elements(&object, 0..len as usize))
                 {
                     for value in values {
                         cdp_index_or_throw(i, &result, n, value)?;
@@ -6418,7 +6514,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                     continue;
                 }
                 for k in 0..len {
-                    let Value::Obj(object) = v else {
+                    let ValueView::Obj(object) = &(v).view() else {
                         unreachable!("spreadable values are objects")
                     };
                     if let Some(elem) = array_get_present_index(i, object, v, k as usize)? {
@@ -6430,7 +6526,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 if n >= 9007199254740991 {
                     return Err(i.make_error("TypeError", "concat result is too long"));
                 }
-                cdp_index_or_throw(i, &result, n, v.clone())?;
+                cdp_index_or_throw(i, &result, n, *v)?;
                 n += 1;
             }
         }
@@ -6439,7 +6535,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ap, "reverse", 0, |i, this, _args| {
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.to_length(&o))?;
         // Every Get/Set pair swaps two present writable elements.
         if edit_plain_elements(i, &o, len as u64, 0, |elements| elements.reverse()) {
@@ -6485,8 +6581,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 builtin_tag(i, &ov)
             };
             match to_string_tag_key(i) {
-                Some(key) => match ab(i.get_member_key(&ov, &key))? {
-                    Value::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
+                Some(key) => match (ab(i.get_member_key(&ov, &key))?).view() {
+                    ValueView::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
                         "[object ",
                         s.as_str(),
                         "]",
@@ -6503,7 +6599,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ap, "toLocaleString", 0, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.checked_array_len(&o))?;
         let mut out = String::new();
         for k in 0..len {
@@ -6511,7 +6607,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 out.push(',');
             }
             let el = array_get_index(i, &o, &ov, k)?;
-            if !matches!(el, Value::Undefined | Value::Null) {
+            if !matches!((el).view(), ValueView::Undefined | ValueView::Null) {
                 // ToString(? Invoke(element, "toLocaleString", « locales, options »)).
                 let tls = ab(i.get_member_key(&el, "toLocaleString"))?;
                 if !tls.is_callable() {
@@ -6534,7 +6630,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         if idx < 0 || idx >= len {
             return Ok(Value::Undefined);
         }
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         array_get_index(i, &o, &ov, idx as usize)
     });
     it.def_method(&ap, "fill", 1, |i, this, args| {
@@ -6542,10 +6638,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let len = ab(i.to_length(&o))? as i64;
         let v = arg(args, 0);
         let start = norm_index(ab(i.to_number(&arg(args, 1)))?, len);
-        let end = match arg(args, 2) {
-            Value::Undefined => len,
-            x => norm_index(ab(i.to_number(&x))?, len),
-        };
+        let end = { let __value_match_original = arg(args, 2); match (__value_match_original).view() {
+            ValueView::Undefined => len,
+            _ => { let x = __value_match_original; norm_index(ab(i.to_number(&x))?, len) },
+        } };
         // A real Array's filled span is bounded by the engine cap (it materializes one property
         // per index); a generic array-like iterates lazily — its accessors typically throw or
         // the per-op caps stop runaway growth.
@@ -6561,7 +6657,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let can_materialize = start == 0
             && end == len
             && len > 0
-            && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
+            && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
             && i.array_append_unshadowed(&o)
             && {
                 let object = o.borrow();
@@ -6573,20 +6669,20 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                             && length.writable()
                             && !length.enumerable()
                             && !length.configurable()
-                            && matches!(length.value(), Value::Num(n) if n == len as f64)
+                            && matches!((length.value()).view(), ValueView::Num(n) if n == len as f64)
                     })
             };
         if can_materialize {
-            let Value::Obj(materialized) = i.make_array(vec![v; len as usize]) else {
+            let ValueView::Obj(materialized) = (i.make_array(vec![v; len as usize])).view() else {
                 unreachable!("make_array returns an Array object")
             };
             let properties = std::mem::take(&mut materialized.borrow_mut().props);
             o.borrow_mut().replace_properties(properties);
             return Ok(Value::Obj(o));
         }
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         for k in start..end {
-            set_throw(i, &ov, &k.to_string(), v.clone())?;
+            set_throw(i, &ov, &k.to_string(), v)?;
         }
         Ok(ov)
     });
@@ -6612,7 +6708,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         } else {
             len - 1
         };
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         while k >= 0 {
             let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? else {
                 k -= 1;
@@ -6629,21 +6725,27 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let o = arr_to_object(i, &this)?;
         let source_len = ab(i.to_length(&o))?;
         // ToIntegerOrInfinity(depth); undefined defaults to 1.
-        let depth = match arg(args, 0) {
-            Value::Undefined => 1i64,
-            v => {
-                let n = ab(i.to_number(&v))?;
-                if n.is_nan() || n <= 0.0 {
-                    0
-                } else if n == f64::INFINITY {
-                    i64::MAX
-                } else {
-                    n as i64
+        let depth = {
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined => 1i64,
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let n = ab(i.to_number(&v))?;
+                        if n.is_nan() || n <= 0.0 {
+                            0
+                        } else if n == f64::INFINITY {
+                            i64::MAX
+                        } else {
+                            n as i64
+                        }
+                    }
                 }
             }
         };
         let a = array_species_create(i, &this, 0)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         flatten_into(i, &a, &ov, source_len, 0, depth, None, &Value::Undefined)?;
         Ok(a)
     });
@@ -6659,7 +6761,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         }
         let cb_this = arg(args, 1);
         let a = array_species_create(i, &this, 0)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let cb = crate::callback::Callback::new(cb);
         flatten_into(i, &a, &ov, len, 0, 1, Some(&cb), &cb_this)?;
         Ok(a)
@@ -6667,17 +6769,18 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     it.def_method(&ap, "splice", 2, array_splice);
     it.def_method(&ap, "sort", 1, |i, this, args| {
         let cmp = arg(args, 0);
-        if !matches!(cmp, Value::Undefined) && !cmp.is_callable() {
+        if !matches!((cmp).view(), ValueView::Undefined) && !cmp.is_callable() {
             return Err(i.make_error(
                 "TypeError",
                 "the comparator must be a function or undefined",
             ));
         }
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.checked_array_len(&o))?;
         // SortIndexedProperties: read only the present indices (holes are skipped, not read).
-        let mut items = Vec::new();
+        // The items stay rooted through getters, comparator calls and the write-back (I1).
+        let mut items = crate::rooting::RootedVec::new();
         for k in 0..len {
             let key = k.to_string();
             if ab(i.js_has_property(&ov, &key))? {
@@ -6687,8 +6790,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let item_count = items.len();
         merge_sort(i, &mut items, &cmp)?;
         // Set(O, k, v, true): a failed write (non-writable element) always throws.
-        for (k, v) in items.into_iter().enumerate() {
-            let ok = ab(i.set_member_recv(&ov, &k.to_string(), v, ov.clone()))?;
+        for (k, v) in items.iter().cloned().enumerate() {
+            let ok = ab(i.set_member_recv(&ov, &k.to_string(), v, ov))?;
             if !ok {
                 return Err(i.make_error(
                     "TypeError",
@@ -6706,7 +6809,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     // ----- change-array-by-copy (return a new Array, leave the receiver untouched) -----
     it.def_method(&ap, "toReversed", 0, |i, this, _| {
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.checked_array_len(&o))?;
         // Change-by-copy methods use ArrayCreate and Get. A dense ordinary Array has no
         // observable work in those indexed Gets, so snapshot its own data once and reverse the
@@ -6717,38 +6820,41 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 return Ok(i.make_array(items));
             }
         }
-        // Elements are read from the end down (from = len - k - 1) into ascending targets.
-        let mut items = Vec::with_capacity(len);
+        // Elements are read from the end down (from = len - k - 1) into ascending targets,
+        // rooted across the getters later reads run (I1).
+        let mut items = crate::rooting::RootedVec::from_vec(Vec::with_capacity(len));
         for k in 0..len {
             items.push(array_get_index(i, &o, &ov, len - k - 1)?);
         }
-        Ok(i.make_array(items))
+        Ok(i.make_array(items.into_vec()))
     });
     it.def_method(&ap, "toSorted", 1, |i, this, args| {
         // The comparator is validated before the receiver is read.
         let cmp = arg(args, 0);
-        if !matches!(cmp, Value::Undefined) && !cmp.is_callable() {
+        if !matches!((cmp).view(), ValueView::Undefined) && !cmp.is_callable() {
             return Err(i.make_error("TypeError", "comparator is not callable"));
         }
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.checked_array_len(&o))?;
         if len <= MAX_ARRAY_OP_LEN {
-            if let Some(mut items) = dense_array_snapshot(i, &ov) {
+            if let Some(items) = dense_array_snapshot(i, &ov) {
+                // Rooted through comparator calls, which may empty the source (I1).
+                let mut items = crate::rooting::RootedVec::from_vec(items);
                 merge_sort(i, &mut items, &cmp)?;
-                return Ok(i.make_array(items));
+                return Ok(i.make_array(items.into_vec()));
             }
         }
-        let mut items = Vec::with_capacity(len);
+        let mut items = crate::rooting::RootedVec::from_vec(Vec::with_capacity(len));
         for k in 0..len {
             items.push(array_get_index(i, &o, &ov, k)?);
         }
         merge_sort(i, &mut items, &cmp)?;
-        Ok(i.make_array(items))
+        Ok(i.make_array(items.into_vec()))
     });
     it.def_method(&ap, "with", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.checked_array_len(&o))? as i64;
         // ToIntegerOrInfinity truncates first (so -0.5 → 0), then negatives count from the end.
         let rel = ab(i.to_number(&arg(args, 0)))?;
@@ -6767,8 +6873,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 return Ok(i.make_array(items));
             }
         }
-        // The replaced index is never read.
-        let mut items = Vec::with_capacity(len as usize);
+        // The replaced index is never read. Rooted across the getters later reads run (I1).
+        let mut items = crate::rooting::RootedVec::from_vec(Vec::with_capacity(len as usize));
         for k in 0..len {
             if k == idx {
                 items.push(arg(args, 1));
@@ -6776,11 +6882,11 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 items.push(array_get_index(i, &o, &ov, k as usize)?);
             }
         }
-        Ok(i.make_array(items))
+        Ok(i.make_array(items.into_vec()))
     });
     it.def_method(&ap, "toSpliced", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.to_length(&o))? as u64;
         let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len as i64) as u64;
         // No start → skip 0; start but no deleteCount → delete through the end.
@@ -6813,8 +6919,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 return Ok(i.make_array(items));
             }
         }
-        // The discarded span is never read.
-        let mut items = Vec::with_capacity(new_len as usize);
+        // The discarded span is never read. Rooted across the getters later reads run (I1).
+        let mut items = crate::rooting::RootedVec::from_vec(Vec::with_capacity(new_len as usize));
         for k in 0..start {
             items.push(array_get_index(i, &o, &ov, k as usize)?);
         }
@@ -6822,17 +6928,23 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         for k in (start + del)..len {
             items.push(array_get_index(i, &o, &ov, k as usize)?);
         }
-        Ok(i.make_array(items))
+        Ok(i.make_array(items.into_vec()))
     });
     it.def_method(&ap, "copyWithin", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
+        let ov = Value::Obj(o);
         let len = ab(i.to_length(&o))? as i64;
         let target = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
         let start = norm_index(ab(i.to_number(&arg(args, 1)))?, len);
-        let end = match arg(args, 2) {
-            Value::Undefined => len,
-            v => norm_index(ab(i.to_number(&v))?, len),
+        let end = {
+            let __value_match_original = arg(args, 2);
+            match (__value_match_original).view() {
+                ValueView::Undefined => len,
+                _ => {
+                    let v = __value_match_original;
+                    norm_index(ab(i.to_number(&v))?, len)
+                }
+            }
         };
         // Copy element by element (backwards when the ranges overlap that way), with live
         // HasProperty/Get/Set and DeletePropertyOrThrow for source holes.
@@ -6860,7 +6972,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     // (ECMA-262 CreateUnmappedArgumentsObject / CreateMappedArgumentsObject), not whatever the
     // property holds later.
     let values_intrinsic = ap.borrow().props.get("values").map(|p| p.value());
-    if let Some(Value::Obj(values)) = values_intrinsic {
+    if let Some(ValueView::Obj(values)) = (values_intrinsic).map(|__value| (__value).view()) {
         Rc::make_mut(&mut it.extra_protos).insert("%Array.prototype.values%", values);
     }
     it.def_method(&ap, "keys", 0, |i, this, _| {
@@ -6872,7 +6984,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         Ok(make_array_iterator(i, this, 2))
     });
     // `arr[Symbol.iterator]` is `Array.prototype.values`.
-    if let Some(sym) = it.iterator_sym.clone() {
+    if let Some(sym) = it.iterator_sym {
         let values_fn = ap.borrow().props.get("values").map(|p| p.value()).unwrap();
         ap.borrow_mut()
             .props
@@ -6880,24 +6992,24 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     }
 
     let ctor = it.make_native("Array", 1, nf_array_ctor);
-    it.array_ctor = Some(ctor.clone());
+    it.array_ctor = Some(ctor);
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(ap.clone()), false, false, false),
+        Property::data(Value::Obj(ap), false, false, false),
     );
     ap.borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     it.def_method(&ctor, "isArray", 1, |i, _this, args| {
         // IsArray unwraps Proxies: a proxy of an array is an array (a revoked proxy throws).
         let mut v = arg(args, 0);
         loop {
-            match &v {
-                Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Array) => {
+            match &(v).view() {
+                ValueView::Obj(o) if matches!(o.borrow().exotic, Exotic::Array) => {
                     return Ok(Value::Bool(true));
                 }
-                Value::Obj(_) => match proxy_pair(i, &v) {
-                    Some((_, Value::Null)) => {
+                ValueView::Obj(_) => match proxy_pair(i, &v) {
+                    Some((_, handler)) if matches!(handler.view(), ValueView::Null) => {
                         return Err(i.make_error("TypeError", "proxy is revoked"));
                     }
                     Some((target, _)) => v = target,
@@ -6919,15 +7031,15 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             return Ok(i.make_array(args.to_vec()));
         }
         let arr = if is_constructor_value(&this) {
-            ab(i.construct(this.clone(), &[Value::Num(len as f64)]))?
+            ab(i.construct(this, &[Value::Num(len as f64)]))?
         } else {
             i.make_array(Vec::new())
         };
         for (k, v) in args.iter().enumerate() {
             // CreateDataPropertyOrThrow(A, k, v).
-            if let Value::Obj(o) = &arr {
+            if let ValueView::Obj(o) = &(arr).view() {
                 let desc = i.new_object();
-                set_data(&desc, "value", v.clone());
+                set_data(&desc, "value", *v);
                 set_data(&desc, "writable", Value::Bool(true));
                 set_data(&desc, "enumerable", Value::Bool(true));
                 set_data(&desc, "configurable", Value::Bool(true));
@@ -6943,7 +7055,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let source = arg(args, 0);
         let mapfn = arg(args, 1);
         let this_arg = arg(args, 2);
-        if !matches!(mapfn, Value::Undefined) && !mapfn.is_callable() {
+        if !matches!((mapfn).view(), ValueView::Undefined) && !mapfn.is_callable() {
             return Err(i.make_error("TypeError", "Array.from: mapFn is not callable"));
         }
         let mapfn = mapfn
@@ -6952,12 +7064,14 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // GetMethod(items, @@iterator): a throwing getter propagates; non-callable non-nullish
         // is a TypeError.
         let iter_method = match well_known_key(i, "iterator") {
-            Some(k) if !matches!(source, Value::Undefined | Value::Null) => {
+            Some(k) if !matches!((source).view(), ValueView::Undefined | ValueView::Null) => {
                 ab(i.get_member_key(&source, &k))?
             }
             _ => Value::Undefined,
         };
-        if !matches!(iter_method, Value::Undefined | Value::Null) && !iter_method.is_callable() {
+        if !matches!((iter_method).view(), ValueView::Undefined | ValueView::Null)
+            && !iter_method.is_callable()
+        {
             return Err(i.make_error("TypeError", "@@iterator is not callable"));
         }
         let use_ctor = i.value_is_constructor(&this);
@@ -6982,16 +7096,13 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             } else {
                 i.make_array(Vec::new())
             };
-            let iter = ab(i.call(iter_method, source.clone(), &[]))?;
+            let iter = ab(i.call(iter_method, source, &[]))?;
             let next = crate::callback::Callback::new(ab(i.get_member_key(&iter, "next"))?);
             let mut k = 0u64;
-            loop {
-                let Some(raw) = ab(next.iterator_step(i, &iter))? else {
-                    break;
-                };
+            while let Some(raw) = ab(next.iterator_step(i, &iter))? {
                 let step = (|i: &mut Interp| -> Result<(), Value> {
                     let v = if let Some(mapfn) = &mapfn {
-                        ab(mapfn.call(i, this_arg.clone(), [raw, Value::Num(k as f64)]))?
+                        ab(mapfn.call(i, this_arg, [raw, Value::Num(k as f64)]))?
                     } else {
                         raw
                     };
@@ -7008,8 +7119,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         }
         // Array-like path: ToObject, read length, construct with «len», then per-index Get
         // (lazily, so mutations during mapping are observed).
-        let o = to_object_arg(i, source.clone(), "Array.from")?;
-        let ov = Value::Obj(o.clone());
+        let o = to_object_arg(i, source, "Array.from")?;
+        let ov = Value::Obj(o);
         let len = ab(i.to_length(&o))?;
         let arr = if use_ctor {
             ab(i.construct(this, &[Value::Num(len as f64)]))?
@@ -7022,7 +7133,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         for k in 0..len {
             let raw = array_get_index(i, &o, &ov, k)?;
             let v = if let Some(mapfn) = &mapfn {
-                ab(mapfn.call(i, this_arg.clone(), [raw, Value::Num(k as f64)]))?
+                ab(mapfn.call(i, this_arg, [raw, Value::Num(k as f64)]))?
             } else {
                 raw
             };
@@ -7037,16 +7148,16 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
 }
 
 pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let a = if args.len() == 1 && matches!(args[0], Value::Num(_)) {
+    let a = if args.len() == 1 && matches!((args[0]).view(), ValueView::Num(_)) {
         // `new Array(len)` sets length without materializing elements; the length setter
         // validates that it is a valid uint32 (else RangeError: Invalid array length).
         let a = i.make_array(Vec::new());
-        ab(i.set_member_key(&a, "length", args[0].clone()))?;
+        ab(i.set_member_key(&a, "length", args[0]))?;
         #[cfg(all(
             target_arch = "aarch64",
             any(target_os = "macos", target_os = "linux", target_os = "windows")
         ))]
-        if let (Value::Obj(o), Value::Num(n)) = (&a, &args[0]) {
+        if let (ValueView::Obj(o), ValueView::Num(n)) = (&(a).view(), &(args[0]).view()) {
             // Tiny fixed-length work arrays are commonly filled immediately. Keyless Empty
             // slots preserve hole semantics while avoiding four separate key/entry
             // allocations for cases such as `new Array(4)`.
@@ -7059,14 +7170,14 @@ pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Res
     // GetPrototypeFromConstructor: a subclass / cross-realm new.target redirects the
     // instance prototype (falling back to new.target's realm's %Array.prototype%).
     if i.constructing {
-        let nt = i.new_target.clone();
-        if let Value::Obj(_) = &nt {
-            let proto = match ab(i.get_member_key(&nt, "prototype"))? {
-                Value::Obj(p) => Some(p),
+        let nt = i.constructor_new_target();
+        if let ValueView::Obj(_) = &(nt).view() {
+            let proto = match (ab(i.get_member_key(&nt, "prototype"))?).view() {
+                ValueView::Obj(p) => Some(p),
                 _ => ctor_realm_proto(i, &nt, "Array")?,
             };
-            if let (Value::Obj(o), Some(p)) = (&a, proto) {
-                if !Rc::ptr_eq(&p, &i.array_proto) {
+            if let (ValueView::Obj(o), Some(p)) = (&(a).view(), proto) {
+                if !Gc::ptr_eq(&p, &i.array_proto) {
                     o.borrow_mut().proto = Some(p);
                 }
             }
@@ -7097,7 +7208,7 @@ fn edit_plain_elements(
 ) -> bool {
     if len.saturating_add(growth) > u64::from(u32::MAX)
         || !matches!(object.borrow().exotic, Exotic::Array)
-        || !i.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+        || !i.ordinary_get_ptr(Gc::as_ptr(object) as usize)
         || (growth != 0 && (!object.borrow().extensible || !i.array_append_unshadowed(object)))
     {
         return false;
@@ -7173,8 +7284,8 @@ fn array_get_present_index(
         // require HasProperty first (ECMA-262 §23.1.3; TypedArray.[[HasProperty]] and
         // IsValidIntegerIndex, snapshot e28783d5fc9d). Valid numeric elements cannot contain
         // undefined; ordinary own properties containing undefined must still be visited.
-        if matches!(value, Value::Undefined)
-            && i.typed_arrays.contains_key(&(Rc::as_ptr(object) as usize))
+        if matches!((value).view(), ValueView::Undefined)
+            && i.typed_arrays.contains_key(&(Gc::as_ptr(object) as usize))
         {
             return Ok(None);
         }
@@ -7212,8 +7323,11 @@ fn flatten_into(
         && flatten_dense_target_safe(i, target, source)
     {
         if let Some(values) = dense_array_snapshot(i, source) {
+            // A nested element's `length` Get can still reach a proxy trap: keep the snapshot
+            // rooted (I1).
+            let values = crate::rooting::RootedVec::from_vec(values);
             let mut target_index = start;
-            for element in values {
+            for element in values.iter().cloned() {
                 if depth > 0 && json_is_array(i, &element)? {
                     let len_val = ab(i.get_member_key(&element, "length"))?;
                     let el_len = to_length_val(i, &len_val)?;
@@ -7238,16 +7352,12 @@ fn flatten_into(
         if !ab(i.js_has_property(source, &key))? {
             continue; // FlattenIntoArray skips holes
         }
-        let mut element = match source {
-            Value::Obj(object) => array_get_index_after_has(i, object, source, k, &key)?,
+        let mut element = match &(source).view() {
+            ValueView::Obj(object) => array_get_index_after_has(i, object, source, k, &key)?,
             _ => ab(i.get_member_key(source, &key))?,
         };
         if let Some(m) = mapper {
-            element = ab(m.call(
-                i,
-                mapper_this.clone(),
-                [element, Value::Num(k as f64), source.clone()],
-            ))?;
+            element = ab(m.call(i, *mapper_this, [element, Value::Num(k as f64), *source]))?;
         }
         if depth > 0 && json_is_array(i, &element)? {
             let len_val = ab(i.get_member_key(&element, "length"))?;
@@ -7295,17 +7405,18 @@ fn flatten_nested(
 }
 
 fn flatten_dense_target_safe(i: &Interp, target: &Value, source: &Value) -> bool {
-    let (Value::Obj(target), Value::Obj(source)) = (target, source) else {
+    let (ValueView::Obj(target), ValueView::Obj(source)) = (&(target).view(), &(source).view())
+    else {
         return false;
     };
-    !Rc::ptr_eq(target, source)
+    !Gc::ptr_eq(target, source)
         && matches!(target.borrow().exotic, Exotic::Array)
-        && i.ordinary_get_ptr(Rc::as_ptr(target) as usize)
+        && i.ordinary_get_ptr(Gc::as_ptr(target) as usize)
 }
 
 fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
-    let ov = Value::Obj(o.clone());
+    let ov = Value::Obj(o);
     // The total length may be near 2^53 for an array-like; only the elements actually moved are
     // bounded by the engine's materialization cap.
     let len = ab(i.to_length(&o))? as i64;
@@ -7333,7 +7444,7 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
         let mut removed = Vec::new();
         let growth = (items.len() as u64).saturating_sub(delete_count as u64);
         if edit_plain_elements(i, &o, len as u64, growth, |elements| {
-            let inserted = items.iter().map(|item| Property::plain(item.clone()));
+            let inserted = items.iter().map(|item| Property::plain(*item));
             removed = elements
                 .splice(range, inserted)
                 .map(Property::into_value)
@@ -7382,7 +7493,7 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
         }
     }
     for (off, v) in items.iter().enumerate() {
-        set_throw(i, &ov, &(start + off as i64).to_string(), v.clone())?;
+        set_throw(i, &ov, &(start + off as i64).to_string(), *v)?;
     }
     set_throw(
         i,
@@ -7393,7 +7504,11 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
     Ok(removed)
 }
 
-fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Value> {
+fn merge_sort(
+    i: &mut Interp,
+    items: &mut crate::rooting::RootedVec,
+    cmp: &Value,
+) -> Result<(), Value> {
     let n = items.len();
     if n <= 1 {
         return Ok(());
@@ -7410,7 +7525,7 @@ fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Va
     }
     let cmp = cmp
         .is_callable()
-        .then(|| crate::callback::Callback::new(cmp.clone()));
+        .then(|| crate::callback::Callback::new(*cmp));
 
     // SortIndexedProperties permits any stable implementation-defined comparison sequence
     // (ECMA-262 §23.1.3.30.1). Keep one source and one destination buffer for all merge passes;
@@ -7460,8 +7575,10 @@ fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Va
         }
         width = width.saturating_mul(2);
     }
-    for (slot, value) in items.iter_mut().zip(source) {
-        *slot = value;
+    // Original roots remained unchanged during every comparator call. Commit is pure and
+    // uses short payload updates; scratch-space remains the same two O(n) working buffers.
+    for (index, value) in source.into_iter().enumerate() {
+        items.set(index, value);
     }
     Ok(())
 }
@@ -7469,9 +7586,13 @@ fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Va
 fn default_sort_keys(i: &mut Interp, items: &[Value]) -> Result<Option<Vec<Option<LStr>>>, Value> {
     let mut keys = Vec::with_capacity(items.len());
     for value in items {
-        match value {
-            Value::Undefined => keys.push(None),
-            Value::Bool(_) | Value::Null | Value::Num(_) | Value::Str(_) | Value::BigInt(_) => {
+        match (value).view() {
+            ValueView::Undefined => keys.push(None),
+            ValueView::Bool(_)
+            | ValueView::Null
+            | ValueView::Num(_)
+            | ValueView::Str(_)
+            | ValueView::BigInt(_) => {
                 keys.push(Some(ab(i.to_string(value))?));
             }
             // Objects may invoke user-defined coercion; Symbols throw from ToString. Preserve
@@ -7482,7 +7603,10 @@ fn default_sort_keys(i: &mut Interp, items: &[Value]) -> Result<Option<Vec<Optio
     Ok(Some(keys))
 }
 
-fn merge_sort_with_keys(items: &mut [Value], keys: Vec<Option<LStr>>) -> Result<(), Value> {
+fn merge_sort_with_keys(
+    items: &mut crate::rooting::RootedVec,
+    keys: Vec<Option<LStr>>,
+) -> Result<(), Value> {
     let n = items.len();
     debug_assert_eq!(n, keys.len());
     let mut source: Vec<(Value, Option<LStr>)> = items.iter().cloned().zip(keys).collect();
@@ -7528,8 +7652,8 @@ fn merge_sort_with_keys(items: &mut [Value], keys: Vec<Option<LStr>>) -> Result<
         }
         width = width.saturating_mul(2);
     }
-    for (slot, (value, _)) in items.iter_mut().zip(source) {
-        *slot = value;
+    for (index, (value, _)) in source.into_iter().enumerate() {
+        items.set(index, value);
     }
     Ok(())
 }
@@ -7553,14 +7677,17 @@ fn compare_values(
     b: &Value,
 ) -> Result<Ordering, Value> {
     // `undefined` always sorts to the end.
-    match (matches!(a, Value::Undefined), matches!(b, Value::Undefined)) {
+    match (
+        matches!(&(a).view(), ValueView::Undefined),
+        matches!(&(b).view(), ValueView::Undefined),
+    ) {
         (true, true) => return Ok(Ordering::Equal),
         (true, false) => return Ok(Ordering::Greater),
         (false, true) => return Ok(Ordering::Less),
         _ => {}
     }
     if let Some(cmp) = cmp {
-        let r = ab(cmp.call(i, Value::Undefined, [a.clone(), b.clone()]))?;
+        let r = ab(cmp.call(i, Value::Undefined, [*a, *b]))?;
         let n = ab(i.to_number(&r))?;
         Ok(if n < 0.0 {
             Ordering::Less
@@ -7584,9 +7711,9 @@ fn return_this(_i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, V
 fn install_iterator(it: &mut Interp) {
     // %IteratorPrototype%: the common prototype of all built-in iterators; `[@@iterator]()` is the
     // identity function so an iterator is itself iterable.
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("%IteratorPrototype%", proto.clone());
-    if let Some(sym) = it.iterator_sym.clone() {
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("%IteratorPrototype%", proto);
+    if let Some(sym) = it.iterator_sym {
         let f = it.make_native("[Symbol.iterator]", 0, return_this);
         proto
             .borrow_mut()
@@ -7620,11 +7747,12 @@ fn install_iterator(it: &mut Interp) {
     it.def_method(&proto, "toArray", 0, |i, this, _| {
         require_iterator_object(i, &this)?;
         let next = ab(i.get_member_key(&this, "next"))?;
-        let mut out = Vec::new();
+        // Rooted across the author code each step runs (I1).
+        let mut out = crate::rooting::RootedVec::new();
         while let Some(v) = step_iter_with(i, &this, &next)? {
             out.push(v);
         }
-        Ok(i.make_array(out))
+        Ok(i.make_array(out.into_vec()))
     });
     it.def_method(&proto, "forEach", 1, |i, this, a| {
         require_iterator_object(i, &this)?;
@@ -7703,7 +7831,7 @@ fn install_iterator(it: &mut Interp) {
         let mut k = 0.0;
         let f = crate::callback::Callback::new(f);
         while let Some(v) = step_iter_with(i, &this, &next)? {
-            let r = match f.call(i, Value::Undefined, [v.clone(), Value::Num(k)]) {
+            let r = match f.call(i, Value::Undefined, [v, Value::Num(k)]) {
                 Ok(r) => r,
                 Err(e) => {
                     i.iterator_close(&this);
@@ -7733,12 +7861,12 @@ fn install_iterator(it: &mut Interp) {
 
     // %WrapForValidIteratorPrototype%: the prototype of Iterator.from's wrappers.
     {
-        let wrap_proto = Object::new(Some(proto.clone()));
+        let wrap_proto = Object::new(Some(proto));
         fn wrap_slot(this: &Value, key: &str) -> Option<Value> {
             // [[Iterated]] internal-slot access bypasses observable property algorithms.
             let o = this.as_obj()?;
             let v = o.borrow().internal_slots().get(key).map(|p| p.value());
-            v.filter(|v| !matches!(v, Value::Undefined))
+            v.filter(|v| !matches!((v).view(), ValueView::Undefined))
         }
         it.def_method(&wrap_proto, "next", 0, |i, this, _a| {
             let Some(iter) = wrap_slot(&this, "#\u{0}wrap_iter") else {
@@ -7753,7 +7881,7 @@ fn install_iterator(it: &mut Interp) {
             };
             // GetMethod(iterator, "return"); its result is returned as-is.
             let rm = ab(i.get_member_key(&iter, "return"))?;
-            if matches!(rm, Value::Undefined | Value::Null) {
+            if matches!((rm).view(), ValueView::Undefined | ValueView::Null) {
                 return Ok(iter_result(i, Value::Undefined, true));
             }
             if !rm.is_callable() {
@@ -7767,7 +7895,7 @@ fn install_iterator(it: &mut Interp) {
     // %IteratorHelperPrototype%: the shared prototype of every map/filter/take/drop/flatMap
     // helper (so cross-realm helpers interoperate — the methods live here, not per-object).
     {
-        let helper_proto = Object::new(Some(proto.clone()));
+        let helper_proto = Object::new(Some(proto));
         it.def_method(&helper_proto, "next", 0, iter_helper_next);
         it.def_method(&helper_proto, "return", 0, iter_helper_return);
         set_to_string_tag(it, &helper_proto, "Iterator Helper");
@@ -7776,32 +7904,32 @@ fn install_iterator(it: &mut Interp) {
 
     let ctor = it.make_native("Iterator", 0, |i, t, _a| {
         // Abstract: NewTarget must be present and must not be %Iterator% itself.
-        let nt = i.new_target.clone();
-        let is_self = match (&nt, i.extra_protos.get("%IteratorCtorMarker%")) {
-            (Value::Obj(a), Some(b)) => Rc::ptr_eq(a, b),
+        let nt = i.constructor_new_target();
+        let is_self = match (&(nt).view(), i.extra_protos.get("%IteratorCtorMarker%")) {
+            (ValueView::Obj(a), Some(b)) => Gc::ptr_eq(a, b),
             _ => false,
         };
-        if !i.constructing || matches!(nt, Value::Undefined) || is_self {
+        if !i.constructing || matches!((nt).view(), ValueView::Undefined) || is_self {
             return Err(i.make_error(
                 "TypeError",
                 "Abstract class Iterator not directly constructable",
             ));
         }
         // `super()` from a subclass arrives with the instance already created.
-        if matches!(t, Value::Obj(_)) {
+        if matches!((t).view(), ValueView::Obj(_)) {
             return Ok(t);
         }
         // OrdinaryCreateFromConstructor: a newTarget whose `prototype` is not an object falls
         // back to the newTarget realm's %Iterator.prototype%.
-        let proto = match ab(i.get_member_key(&nt, "prototype"))? {
-            Value::Obj(p) => Some(p),
+        let proto = match (ab(i.get_member_key(&nt, "prototype"))?).view() {
+            ValueView::Obj(p) => Some(p),
             _ => ctor_realm_proto(i, &nt, "%IteratorPrototype%")?
                 .or_else(|| i.extra_protos.get("%IteratorPrototype%").cloned()),
         };
         Ok(Value::Obj(Object::new(proto)))
     });
     ctor.borrow_mut().is_constructor = true;
-    Rc::make_mut(&mut it.extra_protos).insert("%IteratorCtorMarker%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%IteratorCtorMarker%", ctor);
     it.def_method(&ctor, "from", 1, |i, _t, a| {
         let v = arg(a, 0);
         // GetIteratorFlattenable (strings allowed): a string/iterable via @@iterator, or an iterator
@@ -7812,12 +7940,12 @@ fn install_iterator(it: &mut Interp) {
         let next = ab(i.get_member_key(&iter, "next"))?;
         let iter_proto = i.extra_protos.get("%IteratorPrototype%").cloned();
         let mut inherits = false;
-        let mut cur = iter.clone();
+        let mut cur = iter;
         loop {
             let p = js_get_prototype_of(i, &cur)?;
-            match p {
-                Value::Obj(pp) => {
-                    if iter_proto.as_ref().is_some_and(|ip| Rc::ptr_eq(&pp, ip)) {
+            match (p).view() {
+                ValueView::Obj(pp) => {
+                    if iter_proto.as_ref().is_some_and(|ip| Gc::ptr_eq(&pp, ip)) {
                         inherits = true;
                         break;
                     }
@@ -7845,25 +7973,25 @@ fn install_iterator(it: &mut Interp) {
         // Each argument must be an object; capture its @@iterator method now, in order.
         let iter_key = i
             .iterator_sym
-            .clone()
             .map(|s| Interp::sym_key(&s))
             .unwrap_or_default();
-        let mut items = Vec::new();
-        let mut methods = Vec::new();
+        // Rooted across the getters later reads run (I1).
+        let mut items = crate::rooting::RootedVec::new();
+        let mut methods = crate::rooting::RootedVec::new();
         for v in a {
-            if !matches!(v, Value::Obj(_)) {
+            if !matches!(&(v).view(), ValueView::Obj(_)) {
                 return Err(i.make_error("TypeError", "Iterator.concat argument is not an object"));
             }
             let m = ab(i.get_member_key(v, &iter_key))?;
             if !m.is_callable() {
                 return Err(i.make_error("TypeError", "Iterator.concat argument is not iterable"));
             }
-            items.push(v.clone());
+            items.push(*v);
             methods.push(m);
         }
         let obj = Object::new(i.extra_protos.get("%IteratorPrototype%").cloned());
-        let items_arr = i.make_array(items);
-        let methods_arr = i.make_array(methods);
+        let items_arr = i.make_array(items.into_vec());
+        let methods_arr = i.make_array(methods.into_vec());
         set_internal_slot(&obj, "#\u{0}cc_items", items_arr);
         set_internal_slot(&obj, "#\u{0}cc_methods", methods_arr);
         set_internal_slot(&obj, "#\u{0}cc_idx", Value::Num(0.0));
@@ -7881,9 +8009,9 @@ fn install_iterator(it: &mut Interp) {
             }
             let done = ab(i.get_internal_slot(&this, "#\u{0}cc_done"))?;
             if !i.to_boolean(&done) {
-                let o = this.as_obj().unwrap().clone();
+                let o = this.as_obj().unwrap();
                 let cur = ab(i.get_internal_slot(&this, "#\u{0}cc_cur"))?;
-                if matches!(cur, Value::Obj(_)) {
+                if matches!((cur).view(), ValueView::Obj(_)) {
                     let started = ab(i.get_internal_slot(&this, "#\u{0}cc_gstarted"))?;
                     let started = i.to_boolean(&started);
                     if started {
@@ -7904,7 +8032,7 @@ fn install_iterator(it: &mut Interp) {
             }
             Ok(iter_result(i, Value::Undefined, true))
         });
-        if let Some(sym) = i.iterator_sym.clone() {
+        if let Some(sym) = i.iterator_sym {
             let itf = i.make_native("[Symbol.iterator]", 0, return_this);
             obj.borrow_mut()
                 .props
@@ -7914,13 +8042,13 @@ fn install_iterator(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     // Iterator.prototype.constructor and [@@toStringTag] are accessor pairs: the getter yields
     // the value; the setter throws for the prototype itself as receiver but defines an own data
     // property on any other receiver (SetterThatIgnoresPrototypeProperties).
     {
-        Rc::make_mut(&mut it.extra_protos).insert("%IteratorProtoMarker%", proto.clone());
+        Rc::make_mut(&mut it.extra_protos).insert("%IteratorProtoMarker%", proto);
         let getter_ctor = it.make_native("get constructor", 0, |i, _t, _a| {
             Ok(i.global
                 .borrow()
@@ -7978,7 +8106,7 @@ fn install_iterator(it: &mut Interp) {
 
     // %AsyncIteratorPrototype%: [@@asyncIterator]() returns this, plus [@@asyncDispose] (which calls
     // the iterator's return()). The prototype of every built-in async iterator.
-    let async_iter_proto = Object::new(Some(it.object_proto.clone()));
+    let async_iter_proto = Object::new(Some(it.object_proto));
     if let Some(k) = well_known_key(it, "asyncIterator") {
         let f = it.make_native("[Symbol.asyncIterator]", 0, return_this);
         async_iter_proto
@@ -7993,7 +8121,7 @@ fn install_iterator(it: &mut Interp) {
             .props
             .insert(k, Property::builtin(Value::Obj(f)));
     }
-    Rc::make_mut(&mut it.extra_protos).insert("%AsyncIteratorPrototype%", async_iter_proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%AsyncIteratorPrototype%", async_iter_proto);
 
     // %GeneratorPrototype% (proto %IteratorPrototype%) and %AsyncGeneratorPrototype% (proto
     // %AsyncIteratorPrototype%): the [[Prototype]] of a generator function's `.prototype`, carrying
@@ -8024,7 +8152,7 @@ fn link_generator_proto(it: &mut Interp, gen_ctor_key: &str, inst_proto: &Gc) {
     };
     gen_ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(inst_proto.clone()), false, false, true),
+        Property::data(Value::Obj(*inst_proto), false, false, true),
     );
     inst_proto.borrow_mut().props.insert(
         "constructor",
@@ -8055,8 +8183,8 @@ fn async_dispose_via_return(i: &mut Interp, this: Value, _a: &[Value]) -> Result
     match i.call(ret, this, &[]) {
         Ok(v) => {
             let inner = promise_resolve_value(i, v);
-            let on_f = make_bound_len(i, dispose_settle_fulfil, vec![promise.clone()], 1.0);
-            let on_r = make_bound_len(i, dispose_settle_reject, vec![promise.clone()], 1.0);
+            let on_f = make_bound_len(i, dispose_settle_fulfil, vec![promise], 1.0);
+            let on_r = make_bound_len(i, dispose_settle_reject, vec![promise], 1.0);
             i.promise_then(&inner, on_f, on_r);
         }
         Err(e) => {
@@ -8104,15 +8232,15 @@ fn create_regexp_string_iterator(
 }
 
 fn regexp_string_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let o = match &this {
-        Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}rsi_regexp") => o.clone(),
+    let o = match &(this).view() {
+        ValueView::Obj(o) if o.borrow().internal_slots().contains("#\u{0}rsi_regexp") => *o,
         _ => return Err(i.make_error("TypeError", "next called on a non-RegExp-String-Iterator")),
     };
     let done = o
         .borrow()
         .internal_slots()
         .get("#\u{0}rsi_done")
-        .map(|p| matches!(p.value(), Value::Bool(true)))
+        .map(|p| matches!((p.value()).view(), ValueView::Bool(true)))
         .unwrap_or(true);
     if done {
         return Ok(i.iter_result_obj(Value::Undefined, true));
@@ -8123,31 +8251,34 @@ fn regexp_string_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Res
         .get("#\u{0}rsi_regexp")
         .unwrap()
         .value();
-    let s = match o
+    let s = match (o
         .borrow()
         .internal_slots()
         .get("#\u{0}rsi_string")
-        .map(|p| p.value())
+        .map(|p| p.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Str(s)) => s,
+        Some(ValueView::Str(s)) => s,
         _ => crate::lstr::LStr::from(""),
     };
     let global = matches!(
-        o.borrow()
+        (o.borrow()
             .internal_slots()
             .get("#\u{0}rsi_global")
-            .map(|p| p.value()),
-        Some(Value::Bool(true))
+            .map(|p| p.value()))
+        .map(|__value| (__value).view()),
+        Some(ValueView::Bool(true))
     );
     let unicode = matches!(
-        o.borrow()
+        (o.borrow()
             .internal_slots()
             .get("#\u{0}rsi_unicode")
-            .map(|p| p.value()),
-        Some(Value::Bool(true))
+            .map(|p| p.value()))
+        .map(|__value| (__value).view()),
+        Some(ValueView::Bool(true))
     );
-    let m = regexp_exec_abstract(i, &r, s.clone())?;
-    if matches!(m, Value::Null) {
+    let m = regexp_exec_abstract(i, &r, s)?;
+    if matches!((m).view(), ValueView::Null) {
         set_internal(&o, "#\u{0}rsi_done", Value::Bool(true));
         return Ok(i.iter_result_obj(Value::Undefined, true));
     }
@@ -8258,10 +8389,6 @@ impl FromAsyncCoro {
         }
     }
 
-    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
-        self.visit_values(|value| edges.value(value));
-    }
-
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         self.visit_values(|value| visitor.value(value));
         std::mem::size_of::<FromAsyncCoro>()
@@ -8323,13 +8450,13 @@ impl FromAsyncCoro {
             Ok(value) => value,
             Err(_) => return self.finish(Suspend::Throw(error)),
         };
-        if matches!(ret, Value::Undefined | Value::Null) {
+        if matches!((ret).view(), ValueView::Undefined | ValueView::Null) {
             return self.finish(Suspend::Throw(error));
         }
         if !ret.is_callable() {
             return self.finish(Suspend::Throw(error));
         }
-        let awaited = match i.call(ret, iterator.clone(), &[]) {
+        let awaited = match i.call(ret, iterator, &[]) {
             Ok(value) => value,
             Err(_) => return self.finish(Suspend::Throw(error)),
         };
@@ -8378,7 +8505,7 @@ impl FromAsyncCoro {
                     let awaited = if state.from_sync {
                         from_async_sync_next(i, &state.iterator, &state.next)
                     } else {
-                        match i.call(state.next.clone(), state.iterator.clone(), &[]) {
+                        match i.call(state.next, state.iterator, &[]) {
                             Ok(value) => value,
                             Err(error) => {
                                 return self.finish(Suspend::Throw(
@@ -8396,7 +8523,7 @@ impl FromAsyncCoro {
                         Resume::Throw(error) => return self.finish(Suspend::Throw(error)),
                         Resume::Terminate => unreachable!(),
                     };
-                    if !matches!(result, Value::Obj(_)) {
+                    if !matches!((result).view(), ValueView::Obj(_)) {
                         let error = i.make_error("TypeError", "iterator result is not an object");
                         return self.finish(Suspend::Throw(error));
                     }
@@ -8422,8 +8549,8 @@ impl FromAsyncCoro {
                     };
                     if state.mapper.is_callable() {
                         let mapped = match i.call(
-                            state.mapper.clone(),
-                            state.this_arg.clone(),
+                            state.mapper,
+                            state.this_arg,
                             &[value, Value::Num(state.index as f64)],
                         ) {
                             Ok(value) => value,
@@ -8478,8 +8605,8 @@ impl FromAsyncCoro {
                     };
                     if state.mapper.is_callable() {
                         let mapped = match i.call(
-                            state.mapper.clone(),
-                            state.this_arg.clone(),
+                            state.mapper,
+                            state.this_arg,
                             &[value, Value::Num(state.index as f64)],
                         ) {
                             Ok(value) => value,
@@ -8533,7 +8660,7 @@ fn from_async_get_method(i: &mut Interp, source: &Value, name: &str) -> Result<V
         Some(key) => ab(i.get_member_key(source, &key))?,
         None => Value::Undefined,
     };
-    if matches!(method, Value::Undefined | Value::Null) {
+    if matches!((method).view(), ValueView::Undefined | ValueView::Null) {
         Ok(Value::Undefined)
     } else if method.is_callable() {
         Ok(method)
@@ -8551,7 +8678,7 @@ fn from_async_start(
     mapper: Value,
     this_arg: Value,
 ) -> Result<FromAsyncStage, Value> {
-    if !matches!(mapper, Value::Undefined) && !mapper.is_callable() {
+    if !matches!((mapper).view(), ValueView::Undefined) && !mapper.is_callable() {
         return Err(i.make_error("TypeError", "Array.fromAsync: mapFn is not callable"));
     }
     let async_method = from_async_get_method(i, &source, "asyncIterator")?;
@@ -8564,7 +8691,7 @@ fn from_async_start(
         let from_sync = !async_method.is_callable();
         let method = if from_sync { sync_method } else { async_method };
         let iterator = ab(i.call(method, source, &[]))?;
-        if !matches!(iterator, Value::Obj(_)) {
+        if !matches!((iterator).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "iterator method returned a non-object"));
         }
         let next = ab(i.get_member_key(&iterator, "next"))?;
@@ -8607,7 +8734,7 @@ fn from_async_start(
 /// AsyncFromSyncIteratorContinuation's unwrap closure: package the awaited value with the saved
 /// `done` flag into a fresh IteratorResult object.
 fn from_async_sync_unwrap(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let done = matches!(arg(args, 0), Value::Bool(true));
+    let done = matches!((arg(args, 0)).view(), ValueView::Bool(true));
     Ok(i.iter_result_obj(arg(args, 1), done))
 }
 
@@ -8622,14 +8749,14 @@ fn from_async_sync_reject(i: &mut Interp, _this: Value, args: &[Value]) -> Resul
 /// its intrinsic promise for the outer Array.fromAsync Await.
 fn from_async_sync_next(i: &mut Interp, iterator: &Value, next: &Value) -> Value {
     let promise = i.new_promise();
-    let result = match i.call(next.clone(), iterator.clone(), &[]) {
+    let result = match i.call(*next, *iterator, &[]) {
         Ok(value) => value,
         Err(error) => {
             i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
             return promise;
         }
     };
-    if !matches!(result, Value::Obj(_)) {
+    if !matches!((result).view(), ValueView::Obj(_)) {
         let error = i.make_error("TypeError", "iterator result is not an object");
         i.reject_promise(&promise, error);
         return promise;
@@ -8662,9 +8789,9 @@ fn from_async_sync_next(i: &mut Interp, iterator: &Value, next: &Value) -> Value
     let on_r = if done {
         Value::Undefined
     } else {
-        make_bound_len(i, from_async_sync_reject, vec![iterator.clone()], 1.0)
+        make_bound_len(i, from_async_sync_reject, vec![*iterator], 1.0)
     };
-    i.promise_then_into(&value_wrapper, on_f, on_r, promise.clone());
+    i.promise_then_into(&value_wrapper, on_f, on_r, promise);
     promise
 }
 
@@ -8679,7 +8806,7 @@ fn from_async_sync_close(i: &mut Interp, iterator: &Value) -> Value {
             return promise;
         }
     };
-    if matches!(ret, Value::Undefined | Value::Null) {
+    if matches!((ret).view(), ValueView::Undefined | ValueView::Null) {
         let result = i.iter_result_obj(Value::Undefined, true);
         i.resolve_promise(&promise, result);
         return promise;
@@ -8689,14 +8816,14 @@ fn from_async_sync_close(i: &mut Interp, iterator: &Value) -> Value {
         i.reject_promise(&promise, error);
         return promise;
     }
-    let result = match i.call(ret, iterator.clone(), &[]) {
+    let result = match i.call(ret, *iterator, &[]) {
         Ok(value) => value,
         Err(error) => {
             i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
             return promise;
         }
     };
-    if !matches!(result, Value::Obj(_)) {
+    if !matches!((result).view(), ValueView::Obj(_)) {
         let error = i.make_error("TypeError", "iterator return result is not an object");
         i.reject_promise(&promise, error);
         return promise;
@@ -8723,7 +8850,7 @@ fn from_async_sync_close(i: &mut Interp, iterator: &Value) -> Value {
         }
     };
     let on_f = make_bound_len(i, from_async_sync_unwrap, vec![Value::Bool(done)], 1.0);
-    i.promise_then_into(&value_wrapper, on_f, Value::Undefined, promise.clone());
+    i.promise_then_into(&value_wrapper, on_f, Value::Undefined, promise);
     promise
 }
 
@@ -8736,35 +8863,16 @@ fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, V
         arg(a, 1),
         arg(a, 2),
     )));
-    if let Value::Obj(object) = &promise {
-        let key = Rc::as_ptr(object) as usize;
-        i.generators.insert(key, coroutine);
+    if let ValueView::Obj(object) = &(promise).view() {
+        let key = Gc::as_ptr(object) as usize;
+        i.generators.insert(&i.gc_heap, key, coroutine);
         i.drive_async(
             key,
-            promise.clone(),
+            promise,
             crate::coroutine::Resume::Next(Value::Undefined),
         );
     }
     Ok(promise)
-}
-
-/// Numeric CreateDataPropertyOrThrow for Array-producing algorithms. Recheck the live receiver
-/// after every callback/await: a species result may escape, become non-extensible, freeze its
-/// length, or gain a descriptor before the next write. An absent dense index needs no decimal
-/// key or temporary descriptor object; prototypes do not participate in [[DefineOwnProperty]].
-/// [`cdp_index_or_throw`] for a value already in packed form: the ordinary fresh-Array case
-/// moves the word into element storage without widening it.
-fn cdp_index_packed_or_throw(
-    i: &mut Interp,
-    target: &Value,
-    index: u64,
-    value: PackedValue,
-) -> Result<(), Value> {
-    let value = match try_define_plain_array_index(target, index, Property::plain_packed(value)) {
-        Ok(()) => return Ok(()),
-        Err(property) => property.into_value(),
-    };
-    cdp_or_throw(i, target, &index.to_string(), value)
 }
 
 /// CreateDataProperty(A, index, value) for an extensible ordinary Array whose `length` is a
@@ -8779,7 +8887,7 @@ fn try_define_plain_array_index(
     if index >= u32::MAX as u64 {
         return Err(property);
     }
-    let Value::Obj(object) = target else {
+    let ValueView::Obj(object) = &(target).view() else {
         return Err(property);
     };
     let mut object = object.borrow_mut();
@@ -8788,7 +8896,7 @@ fn try_define_plain_array_index(
     }
     let Some(length) = object.props.length_property().and_then(|length| {
         if !length.accessor() && length.writable() {
-            if let Value::Num(length) = length.value() {
+            if let ValueView::Num(length) = (length.value()).view() {
                 return Some(length as u32);
             }
         }
@@ -8805,6 +8913,10 @@ fn try_define_plain_array_index(
     Ok(())
 }
 
+/// Numeric CreateDataPropertyOrThrow for Array-producing algorithms. Recheck the live receiver
+/// after every callback/await: a species result may escape, become non-extensible, freeze its
+/// length, or gain a descriptor before the next write. An absent dense index needs no decimal
+/// key or temporary descriptor object; prototypes do not participate in [[DefineOwnProperty]].
 fn cdp_index_or_throw(
     i: &mut Interp,
     target: &Value,
@@ -8826,15 +8938,15 @@ pub(crate) fn create_data_property_or_throw_key(
     i: &mut Interp,
     target: &Value,
     key: &Value,
-    value: PackedValue,
+    value: Value,
 ) -> Result<(), Value> {
-    if let Value::Num(n) = *key {
+    if let ValueView::Num(n) = (*key).view() {
         if n >= 0.0 && n < u32::MAX as f64 && n.fract() == 0.0 {
-            return cdp_index_packed_or_throw(i, target, n as u64, value);
+            return cdp_index_or_throw(i, target, n as u64, value);
         }
     }
     let key = ab(i.to_property_key(key))?;
-    cdp_or_throw(i, target, key.as_str(), value.into_value())
+    cdp_or_throw(i, target, key.as_str(), value)
 }
 
 /// CreateDataPropertyOrThrow (trap-aware for proxy targets).
@@ -8845,12 +8957,12 @@ pub(crate) fn cdp_or_throw(
     v: Value,
 ) -> Result<(), Value> {
     defer_trigger_v(i, target, Some(key))?;
-    let Value::Obj(o) = target else {
+    let ValueView::Obj(o) = &(target).view() else {
         return Err(i.make_error("TypeError", "cannot define a property on a non-object"));
     };
     // Fast path: a fresh element on a plain, extensible Array with writable length skips the
     // descriptor-object round trip (this is the hot loop of from/map/filter/slice/concat).
-    if !i.proxies.contains_key(&(Rc::as_ptr(o) as usize)) {
+    if !i.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
         let fast = {
             let b = o.borrow();
             matches!(b.exotic, Exotic::Array)
@@ -8944,9 +9056,9 @@ fn iter_some_every(i: &mut Interp, this: Value, a: &[Value], want: bool) -> Resu
 fn iterator_includes(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_iterator_object(i, &this)?;
     let search = arg(a, 0);
-    let to_skip = match arg(a, 1) {
-        Value::Undefined => 0.0,
-        Value::Num(n) if n.is_infinite() || (!n.is_nan() && n.fract() == 0.0) => n,
+    let to_skip = match (arg(a, 1)).view() {
+        ValueView::Undefined => 0.0,
+        ValueView::Num(n) if n.is_infinite() || (!n.is_nan() && n.fract() == 0.0) => n,
         _ => {
             i.iterator_close(&this);
             return Err(i.make_error("TypeError", "skippedElements must be an integral number"));
@@ -8977,21 +9089,27 @@ fn iterator_includes(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, 
 /// on an abrupt completion, whereas iterator-protocol errors do not perform an additional close.
 fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_iterator_object(i, &this)?;
-    let separator = match arg(a, 0) {
-        Value::Undefined => ",".to_string(),
-        value => match i.to_string(&value) {
-            Ok(s) => s.to_string(),
-            Err(e) => {
-                i.iterator_close(&this);
-                return Err(crate::interpreter::abrupt_value(e));
+    let separator = {
+        let __value_match_original = arg(a, 0);
+        match (__value_match_original).view() {
+            ValueView::Undefined => ",".to_string(),
+            _ => {
+                let value = __value_match_original;
+                match i.to_string(&value) {
+                    Ok(s) => s.to_string(),
+                    Err(e) => {
+                        i.iterator_close(&this);
+                        return Err(crate::interpreter::abrupt_value(e));
+                    }
+                }
             }
-        },
+        }
     };
     let next = ab(i.get_member_key(&this, "next"))?;
     let mut result = String::new();
     let mut first = true;
     while let Some(value) = step_iter_with(i, &this, &next)? {
-        let piece = if matches!(value, Value::Undefined | Value::Null) {
+        let piece = if matches!((value).view(), ValueView::Undefined | ValueView::Null) {
             crate::lstr::LStr::from("")
         } else {
             match i.to_string(&value) {
@@ -9022,7 +9140,7 @@ fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Valu
 /// Step an iterator object (`this`) once: `Some(value)` or `None` when done.
 /// GetIteratorDirect's receiver check: an Iterator.prototype helper requires an Object `this`.
 fn require_iterator_object(i: &Interp, this: &Value) -> Result<(), Value> {
-    if matches!(this, Value::Obj(_)) {
+    if matches!(&(this).view(), ValueView::Obj(_)) {
         Ok(())
     } else {
         Err(i.make_error("TypeError", "Iterator method called on a non-object"))
@@ -9041,7 +9159,7 @@ fn step_iter_with(i: &mut Interp, src: &Value, next: &Value) -> Result<Option<Va
 /// Build a lazy iterator-helper (map/filter/take/drop/flatMap) wrapping `source`.
 fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Result<Value, Value> {
     // GetIteratorDirect requires an Object receiver (checked before the callable/limit checks).
-    if !matches!(source, Value::Obj(_)) {
+    if !matches!((source).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "Iterator helper called on a non-object"));
     }
     if matches!(kind, "map" | "filter" | "flatMap") && !f.is_callable() {
@@ -9079,7 +9197,7 @@ fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Resu
     set_internal_slot(&obj, "#\u{0}ih_next", next);
     set_internal_slot(&obj, "#\u{0}ih_src", source);
     set_internal_slot(&obj, "#\u{0}ih_kind", Value::lstr(kind));
-    set_internal_slot(&obj, "#\u{0}ih_fn", f.clone());
+    set_internal_slot(&obj, "#\u{0}ih_fn", f);
     if let Some(n) = limit {
         set_internal_slot(&obj, "#\u{0}ih_n", Value::Num(n));
         set_internal_slot(&obj, "#\u{0}ih_started", Value::Bool(false));
@@ -9101,8 +9219,8 @@ fn make_chunking_helper(
 ) -> Result<Value, Value> {
     require_iterator_object(i, &source)?;
     let is_windows = undersized.is_some();
-    let size = match size {
-        Value::Num(n) if n.is_finite() && n.fract() == 0.0 => n,
+    let size = match (size).view() {
+        ValueView::Num(n) if n.is_finite() && n.fract() == 0.0 => n,
         _ => {
             i.iterator_close(&source);
             return Err(i.make_error("TypeError", "chunk size must be an integral number"));
@@ -9112,10 +9230,10 @@ fn make_chunking_helper(
         i.iterator_close(&source);
         return Err(i.make_error("RangeError", "chunk size is outside the permitted range"));
     }
-    let mode = match undersized {
-        None | Some(Value::Undefined) => "only-full",
-        Some(Value::Str(s)) if s.to_string() == "only-full" => "only-full",
-        Some(Value::Str(s)) if s.to_string() == "allow-partial" => "allow-partial",
+    let mode = match (undersized).map(|__value| (__value).view()) {
+        None | Some(ValueView::Undefined) => "only-full",
+        Some(ValueView::Str(s)) if s.to_string() == "only-full" => "only-full",
+        Some(ValueView::Str(s)) if s.to_string() == "allow-partial" => "allow-partial",
         Some(_) => {
             i.iterator_close(&source);
             return Err(i.make_error("TypeError", "invalid undersized mode"));
@@ -9147,7 +9265,8 @@ fn make_chunking_helper(
 
 /// %IteratorHelperPrototype%.return: closes the underlying iterator once.
 fn iter_helper_return(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    if !matches!(&this, Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}ih_kind")) {
+    if !matches!(&(this).view(), ValueView::Obj(o) if o.borrow().internal_slots().contains("#\u{0}ih_kind"))
+    {
         return Err(i.make_error("TypeError", "return called on an incompatible receiver"));
     }
     let running = ab(i.get_internal_slot(&this, "#\u{0}ih_running"))?;
@@ -9156,7 +9275,7 @@ fn iter_helper_return(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value
     }
     let done = ab(i.get_internal_slot(&this, "#\u{0}ih_done"))?;
     if !i.to_boolean(&done) {
-        let o = this.as_obj().unwrap().clone();
+        let o = this.as_obj().unwrap();
         let started = ab(i.get_internal_slot(&this, "#\u{0}ih_gstarted"))?;
         let started = i.to_boolean(&started);
         if started {
@@ -9169,7 +9288,7 @@ fn iter_helper_return(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value
         let res = (|i: &mut Interp| -> Result<(), Value> {
             // A helper suspended inside a flatMap inner iterator closes it first.
             let inner = ab(i.get_internal_slot(&this, "#\u{0}ih_inner"))?;
-            if matches!(inner, Value::Obj(_)) {
+            if matches!((inner).view(), ValueView::Obj(_)) {
                 ab(i.iterator_close_normal(&inner))?;
             }
             let source_done = ab(i.get_internal_slot(&this, "#\u{0}ih_source_done"))?;
@@ -9197,16 +9316,18 @@ fn iterator_proto_weird_set(
     v: Value,
     key: &str,
 ) -> Result<Value, Value> {
-    if let (Some(h), Value::Obj(t)) = (i.extra_protos.get("%IteratorProtoMarker%"), &this) {
-        if Rc::ptr_eq(h, t) {
+    if let (Some(h), ValueView::Obj(t)) =
+        (i.extra_protos.get("%IteratorProtoMarker%"), &(this).view())
+    {
+        if Gc::ptr_eq(h, t) {
             return Err(i.make_error(
                 "TypeError",
                 "cannot assign to a property of Iterator.prototype",
             ));
         }
     }
-    match &this {
-        Value::Obj(o) => {
+    match &(this).view() {
+        ValueView::Obj(o) => {
             o.borrow_mut()
                 .props
                 .insert(key, Property::data(v, true, true, true));
@@ -9228,7 +9349,7 @@ fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
     });
     let props = map.instantiate_plain([value, Value::Bool(done)].into_iter());
     Value::Obj(Object::new_with_parts(
-        Some(i.object_proto.clone()),
+        Some(i.object_proto),
         props,
         Exotic::None,
     ))
@@ -9239,17 +9360,17 @@ fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
 /// lockstep per the mode (shortest/longest/strict) with `padding` filling exhausted inputs.
 fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value> {
     let input = arg(a, 0);
-    if !matches!(input, Value::Obj(_)) {
+    if !matches!((input).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "Iterator.zip input is not an object"));
     }
     // GetOptionsObject + mode: undefined -> "shortest"; anything else must be one of the three
     // mode strings exactly (no coercion) or it's a TypeError.
     let options = arg(a, 1);
-    let mode = match &options {
-        Value::Undefined => "shortest".to_string(),
-        Value::Obj(_) => match ab(i.get_member_key(&options, "mode"))? {
-            Value::Undefined => "shortest".to_string(),
-            Value::Str(m) if matches!(&*m.to_string(), "shortest" | "longest" | "strict") => {
+    let mode = match &(options).view() {
+        ValueView::Undefined => "shortest".to_string(),
+        ValueView::Obj(_) => match (ab(i.get_member_key(&options, "mode"))?).view() {
+            ValueView::Undefined => "shortest".to_string(),
+            ValueView::Str(m) if matches!(&*m.to_string(), "shortest" | "longest" | "strict") => {
                 m.to_string()
             }
             _ => return Err(i.make_error("TypeError", "invalid Iterator.zip mode")),
@@ -9257,23 +9378,25 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
         _ => return Err(i.make_error("TypeError", "Iterator.zip options is not an object")),
     };
     // The padding option is read (and type-checked) before the inputs are opened.
-    let padding_value = if mode == "longest" && matches!(&options, Value::Obj(_)) {
+    let padding_value = if mode == "longest" && matches!(&(options).view(), ValueView::Obj(_)) {
         let p = ab(i.get_member_key(&options, "padding"))?;
-        if !matches!(p, Value::Undefined | Value::Obj(_)) {
+        if !matches!((p).view(), ValueView::Undefined | ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Iterator.zip padding is not an object"));
         }
         p
     } else {
         Value::Undefined
     };
-    // Open the inputs in order, GetIteratorFlattenable each as it is read.
-    let mut keys: Vec<crate::value::PropertyKey> = Vec::new();
-    let mut iters: Vec<Value> = Vec::new();
-    let mut nexts: Vec<Value> = Vec::new();
+    // Open the inputs in order, GetIteratorFlattenable each as it is read. The lists are
+    // rooted across the author code each step runs (I1).
+    // Rooted: a Symbol key's cell, like the iterators, outlives author code.
+    let keys = crate::rooting::Rooted::new(RefCell::new(Vec::<crate::value::PropertyKey>::new()));
+    let mut iters = crate::rooting::RootedVec::new();
+    let mut nexts = crate::rooting::RootedVec::new();
     let open_one = |i: &mut Interp,
                     v: &Value,
-                    iters: &mut Vec<Value>,
-                    nexts: &mut Vec<Value>|
+                    iters: &mut crate::rooting::RootedVec,
+                    nexts: &mut crate::rooting::RootedVec|
      -> Result<(), Value> {
         let iter = get_iterator_flattenable(i, v, false)?;
         let next = ab(i.get_member_key(&iter, "next"))?;
@@ -9293,24 +9416,26 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     };
     if keyed {
         // zipKeyed: each own enumerable non-undefined-valued key of `iterables` is an input.
-        let all_keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = proxy_pair(i, &input) {
-            let mut ks = Vec::new();
-            for k in proxy_own_keys(i, &t, &h)? {
-                ks.push(ab(i.to_property_key(&k))?);
-            }
-            ks
-        } else {
-            let o = input.as_obj().unwrap();
-            ordinary_own_keys_ordered(i, o)?
-                .into_iter()
-                .map(crate::value::PropertyKey::stored)
-                .collect()
-        };
-        for k in all_keys {
+        let all_keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
+            crate::rooting::Rooted::new(if let Some((t, h)) = proxy_pair(i, &input) {
+                let mut ks = Vec::new();
+                let proxy_keys = proxy_own_keys(i, &t, &h)?;
+                for k in proxy_keys.iter() {
+                    ks.push(ab(i.to_property_key(k))?);
+                }
+                ks
+            } else {
+                let o = input.as_obj().unwrap();
+                ordinary_own_keys_ordered(i, &o)?
+                    .into_iter()
+                    .map(crate::value::PropertyKey::stored)
+                    .collect()
+            });
+        for k in all_keys.iter().cloned() {
             // [[GetOwnProperty]] fresh per key: skip missing or non-enumerable properties.
             let enumerable = if let Some((t, h)) = proxy_pair(i, &input) {
                 match proxy_gopd_value(i, &t, &h, &k) {
-                    Ok(Value::Undefined) => false,
+                    Ok(value) if matches!(value.view(), ValueView::Undefined) => false,
                     Ok(d) => {
                         let ev = ab(i.get_member_key(&d, "enumerable"))?;
                         i.to_boolean(&ev)
@@ -9322,7 +9447,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
                 }
             } else {
                 let object = input.as_obj().unwrap();
-                if ab(i.host_indexed_own_value(object, &k))?.is_some() {
+                if ab(i.host_indexed_own_value(&object, &k))?.is_some() {
                     crate::value::canonical_index(&k).is_some()
                 } else {
                     object
@@ -9343,14 +9468,14 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
                     return Err(e);
                 }
             };
-            if matches!(v, Value::Undefined) {
+            if matches!((v).view(), ValueView::Undefined) {
                 continue;
             }
             if let Err(e) = open_one(i, &v, &mut iters, &mut nexts) {
                 close_setup(i, &iters, None);
                 return Err(e);
             }
-            keys.push(k);
+            keys.borrow_mut().push(k);
         }
     } else {
         // zip: step the iterable-of-iterables, opening each input as it is produced. An error
@@ -9377,12 +9502,12 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     let n_iters = iters.len();
     // `longest` padding, aligned with the inputs: zip iterates the padding iterable at most
     // iterCount times (it may be infinite); zipKeyed reads padding[key] per input key.
-    let mut padding = vec![Value::Undefined; n_iters];
-    if mode == "longest" && !matches!(padding_value, Value::Undefined) {
+    let mut padding = crate::rooting::RootedVec::from_vec(vec![Value::Undefined; n_iters]);
+    if mode == "longest" && !matches!((padding_value).view(), ValueView::Undefined) {
         if keyed {
-            for (j, k) in keys.iter().enumerate() {
+            for (j, k) in keys.borrow().iter().enumerate() {
                 match ab(i.get_member_key(&padding_value, k)) {
-                    Ok(v) => padding[j] = v,
+                    Ok(v) => padding.set(j, v),
                     Err(e) => {
                         close_setup(i, &iters, None);
                         return Err(e);
@@ -9398,12 +9523,12 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
                 }
             };
             let mut using = true;
-            for slot in padding.iter_mut().take(n_iters) {
+            for index in 0..n_iters {
                 if !using {
                     break;
                 }
                 match step_iter_with(i, &pit, &pnext) {
-                    Ok(Some(v)) => *slot = v,
+                    Ok(Some(v)) => padding.set(index, v),
                     Ok(None) => using = false,
                     Err(e) => {
                         close_setup(i, &iters, None);
@@ -9428,18 +9553,24 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
             .or_else(|| i.extra_protos.get("%IteratorPrototype%"))
             .cloned(),
     );
-    set_internal_slot(&obj, "#\u{0}zip_iters", i.make_array(iters));
-    set_internal_slot(&obj, "#\u{0}zip_nexts", i.make_array(nexts));
+    set_internal_slot(&obj, "#\u{0}zip_iters", i.make_array(iters.into_vec()));
+    set_internal_slot(&obj, "#\u{0}zip_nexts", i.make_array(nexts.into_vec()));
     set_internal_slot(
         &obj,
         "#\u{0}zip_state",
         i.make_array(vec![Value::Bool(false); n_iters]),
     );
     set_internal_slot(&obj, "#\u{0}zip_mode", Value::lstr(mode.clone()));
-    set_internal_slot(&obj, "#\u{0}zip_pad", i.make_array(padding));
+    set_internal_slot(&obj, "#\u{0}zip_pad", i.make_array(padding.into_vec()));
     set_internal_slot(&obj, "#\u{0}zip_finished", Value::Bool(false));
     if keyed {
-        let karr = i.make_array(keys.into_iter().map(|key| key.into_value()).collect());
+        let karr = i.make_array(
+            keys.borrow()
+                .iter()
+                .cloned()
+                .map(|key| key.into_value())
+                .collect(),
+        );
         set_internal_slot(&obj, "#\u{0}zip_keys", karr);
     }
     i.def_method(&obj, "next", 0, zip_next);
@@ -9454,7 +9585,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
         if i.to_boolean(&running) {
             return Err(i.make_error("TypeError", "Iterator.zip iterator is already running"));
         }
-        let o = this.as_obj().unwrap().clone();
+        let o = this.as_obj().unwrap();
         let started = ab(i.get_internal_slot(&this, "#\u{0}zip_started"))?;
         let res = if i.to_boolean(&started) {
             // Suspended at a yield: the close runs in the executing state and the
@@ -9473,7 +9604,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
         res?;
         Ok(iter_result(i, Value::Undefined, true))
     });
-    if let Some(sym) = i.iterator_sym.clone() {
+    if let Some(sym) = i.iterator_sym {
         let itf = i.make_native("[Symbol.iterator]", 0, return_this);
         obj.borrow_mut()
             .props
@@ -9521,8 +9652,8 @@ pub(crate) fn ordinary_own_keys_ordered(i: &mut Interp, o: &Gc) -> Result<Vec<St
 fn zip_close_open(i: &mut Interp, this: &Value, err: Option<Value>) -> Result<(), Value> {
     let iters = ab(i.get_internal_slot(this, "#\u{0}zip_iters"))?;
     let state = ab(i.get_internal_slot(this, "#\u{0}zip_state"))?;
-    let n = match &iters {
-        Value::Obj(o) => i.array_length(o),
+    let n = match &(iters).view() {
+        ValueView::Obj(o) => i.array_length(o),
         _ => 0,
     };
     let mut pending = err;
@@ -9555,7 +9686,7 @@ fn zip_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     if i.to_boolean(&finished) {
         return Ok(iter_result(i, Value::Undefined, true));
     }
-    let Some(o) = this.as_obj().cloned() else {
+    let Some(o) = this.as_obj() else {
         return Err(i.make_error("TypeError", "next called on an incompatible receiver"));
     };
     set_internal(&o, "#\u{0}zip_started", Value::Bool(true));
@@ -9564,9 +9695,9 @@ fn zip_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     set_internal(&o, "#\u{0}zip_running", Value::Bool(false));
     let done = match &res {
         Err(_) => true,
-        Ok(r) => matches!(r, Value::Obj(ro) if matches!(
-            ro.borrow().props.get("done").map(|p| p.value()),
-            Some(Value::Bool(true))
+        Ok(r) => matches!((r).view(), ValueView::Obj(ro) if matches!(
+            (ro.borrow().props.get("done").map(|p| p.value())).map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         )),
     };
     if done {
@@ -9583,8 +9714,8 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
     let pad = ab(i.get_internal_slot(&this, "#\u{0}zip_pad"))?;
     let mode_v = ab(i.get_internal_slot(&this, "#\u{0}zip_mode"))?;
     let mode = ab(i.to_string(&mode_v))?.to_string();
-    let n = match &iters {
-        Value::Obj(o) => i.array_length(o),
+    let n = match &(iters).view() {
+        ValueView::Obj(o) => i.array_length(o),
         _ => 0,
     };
     if n == 0 {
@@ -9593,18 +9724,18 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
     let mark = |i: &mut Interp, state: &Value, j: usize| -> Result<(), Value> {
         ab(i.set_member_key(state, &j.to_string(), Value::Bool(true)))
     };
-    let mut values = vec![Value::Undefined; n];
+    let mut values = crate::rooting::RootedVec::from_vec(vec![Value::Undefined; n]);
     for j in 0..n {
         let closed = ab(i.get_member_key(&state, &j.to_string()))?;
         if i.to_boolean(&closed) {
             // An exhausted input in `longest` mode contributes its padding value.
-            values[j] = ab(i.get_member_key(&pad, &j.to_string()))?;
+            values.set(j, ab(i.get_member_key(&pad, &j.to_string()))?);
             continue;
         }
         let it = ab(i.get_member_key(&iters, &j.to_string()))?;
         let nx = ab(i.get_member_key(&nexts, &j.to_string()))?;
         match step_iter_with(i, &it, &nx) {
-            Ok(Some(v)) => values[j] = v,
+            Ok(Some(v)) => values.set(j, v),
             Ok(None) => {
                 mark(i, &state, j)?;
                 match mode.as_str() {
@@ -9632,8 +9763,8 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                                         "iterator.next is not a function",
                                     ));
                                 }
-                                let r = ab(i.call(knx.clone(), kit.clone(), &[]))?;
-                                if !matches!(r, Value::Obj(_)) {
+                                let r = ab(i.call(knx, kit, &[]))?;
+                                if !matches!((r).view(), ValueView::Obj(_)) {
                                     return Err(i.make_error(
                                         "TypeError",
                                         "iterator result is not an object",
@@ -9661,7 +9792,7 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                     }
                     _ => {
                         // longest: exhausted inputs are padded; finish when all are done.
-                        values[j] = ab(i.get_member_key(&pad, &j.to_string()))?;
+                        values.set(j, ab(i.get_member_key(&pad, &j.to_string()))?);
                         let mut any_open = false;
                         for k in 0..n {
                             let c = ab(i.get_member_key(&state, &k.to_string()))?;
@@ -9684,7 +9815,7 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
     }
     // finishResults: zip yields an Array; zipKeyed a null-prototype object keyed like the input.
     let keys = ab(i.get_internal_slot(&this, "#\u{0}zip_keys"))?;
-    let result = if matches!(keys, Value::Obj(_)) {
+    let result = if matches!((keys).view(), ValueView::Obj(_)) {
         let o = Object::new(None);
         for (j, v) in values.into_iter().enumerate() {
             let k = ab(i.get_member_key(&keys, &j.to_string()))?;
@@ -9695,7 +9826,7 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
         }
         Value::Obj(o)
     } else {
-        i.make_array(values)
+        i.make_array(values.into_vec())
     };
     Ok(iter_result(i, result, false))
 }
@@ -9711,7 +9842,7 @@ fn concat_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value
     if i.to_boolean(&done) {
         return Ok(iter_result(i, Value::Undefined, true));
     }
-    let Some(o) = this.as_obj().cloned() else {
+    let Some(o) = this.as_obj() else {
         return Err(i.make_error("TypeError", "next called on an incompatible receiver"));
     };
     set_internal(&o, "#\u{0}cc_gstarted", Value::Bool(true));
@@ -9720,9 +9851,9 @@ fn concat_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value
     set_internal(&o, "#\u{0}cc_running", Value::Bool(false));
     let finished = match &res {
         Err(_) => true,
-        Ok(r) => matches!(r, Value::Obj(ro) if matches!(
-            ro.borrow().props.get("done").map(|p| p.value()),
-            Some(Value::Bool(true))
+        Ok(r) => matches!((r).view(), ValueView::Obj(ro) if matches!(
+            (ro.borrow().props.get("done").map(|p| p.value())).map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         )),
     };
     if finished {
@@ -9734,13 +9865,13 @@ fn concat_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value
 fn concat_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
     loop {
         let cur = ab(i.get_internal_slot(&this, "#\u{0}cc_cur"))?;
-        if matches!(cur, Value::Undefined) {
+        if matches!((cur).view(), ValueView::Undefined) {
             // Open the next item's iterator (or finish).
             let idx = ab(i.get_internal_slot(&this, "#\u{0}cc_idx"))?;
             let idx = ab(i.to_number(&idx))? as usize;
             let methods = ab(i.get_internal_slot(&this, "#\u{0}cc_methods"))?;
-            let mlen = match &methods {
-                Value::Obj(o) => i.array_length(o),
+            let mlen = match &(methods).view() {
+                ValueView::Obj(o) => i.array_length(o),
                 _ => 0,
             };
             if idx >= mlen {
@@ -9750,14 +9881,14 @@ fn concat_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             let item = ab(i.get_member_key(&items, &idx.to_string()))?;
             let method = ab(i.get_member_key(&methods, &idx.to_string()))?;
             let iter = ab(i.call(method, item, &[]))?;
-            if !matches!(iter, Value::Obj(_)) {
+            if !matches!((iter).view(), ValueView::Obj(_)) {
                 return Err(i.make_error("TypeError", "@@iterator did not return an object"));
             }
             let next = ab(i.get_member_key(&iter, "next"))?;
-            set_internal(this.as_obj().unwrap(), "#\u{0}cc_cur", iter);
-            set_internal(this.as_obj().unwrap(), "#\u{0}cc_curnext", next);
+            set_internal(&this.as_obj().unwrap(), "#\u{0}cc_cur", iter);
+            set_internal(&this.as_obj().unwrap(), "#\u{0}cc_curnext", next);
             set_internal(
-                this.as_obj().unwrap(),
+                &this.as_obj().unwrap(),
                 "#\u{0}cc_idx",
                 Value::Num((idx + 1) as f64),
             );
@@ -9766,7 +9897,7 @@ fn concat_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
         let next = ab(i.get_internal_slot(&this, "#\u{0}cc_curnext"))?;
         match step_iter_with(i, &cur, &next)? {
             Some(v) => return Ok(iter_result(i, v, false)),
-            None => set_internal(this.as_obj().unwrap(), "#\u{0}cc_cur", Value::Undefined),
+            None => set_internal(&this.as_obj().unwrap(), "#\u{0}cc_cur", Value::Undefined),
         }
     }
 }
@@ -9778,23 +9909,24 @@ fn get_iterator_flattenable(
     v: &Value,
     allow_strings: bool,
 ) -> Result<Value, Value> {
-    if !(matches!(v, Value::Obj(_)) || (allow_strings && matches!(v, Value::Str(_)))) {
+    if !(matches!(&(v).view(), ValueView::Obj(_))
+        || (allow_strings && matches!(&(v).view(), ValueView::Str(_))))
+    {
         return Err(i.make_error("TypeError", "value is not iterable"));
     }
     let iter_key = i
         .iterator_sym
-        .clone()
         .map(|s| Interp::sym_key(&s))
         .unwrap_or_default();
     let itf = ab(i.get_member_key(v, &iter_key))?;
-    let iter = if matches!(itf, Value::Undefined | Value::Null) {
-        v.clone()
+    let iter = if matches!((itf).view(), ValueView::Undefined | ValueView::Null) {
+        *v
     } else if itf.is_callable() {
-        ab(i.call(itf, v.clone(), &[]))?
+        ab(i.call(itf, *v, &[]))?
     } else {
         return Err(i.make_error("TypeError", "@@iterator is not callable"));
     };
-    if !matches!(iter, Value::Obj(_)) {
+    if !matches!((iter).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "iterator is not an object"));
     }
     Ok(iter)
@@ -9803,7 +9935,7 @@ fn get_iterator_flattenable(
 fn iter_helper_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     // Brand check: only real iterator-helper objects carry the [[UnderlyingIterator]] slots (a
     // generator also inherits from %IteratorPrototype% but must be rejected here).
-    if !matches!(&this, Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}ih_kind") || o.borrow().internal_slots().contains("#\u{0}zip_iters"))
+    if !matches!(&(this).view(), ValueView::Obj(o) if o.borrow().internal_slots().contains("#\u{0}ih_kind") || o.borrow().internal_slots().contains("#\u{0}zip_iters"))
     {
         return Err(i.make_error("TypeError", "next called on an incompatible receiver"));
     }
@@ -9817,7 +9949,7 @@ fn iter_helper_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     if i.to_boolean(&done) {
         return Ok(iter_result(i, Value::Undefined, true));
     }
-    let Some(o) = this.as_obj().cloned() else {
+    let Some(o) = this.as_obj() else {
         return Err(i.make_error("TypeError", "next called on an incompatible receiver"));
     };
     set_internal(&o, "#\u{0}ih_gstarted", Value::Bool(true));
@@ -9827,9 +9959,9 @@ fn iter_helper_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     // Any completion — a done result or a throw — moves the helper to the completed state.
     let finished = match &res {
         Err(_) => true,
-        Ok(r) => matches!(r, Value::Obj(ro) if matches!(
-            ro.borrow().props.get("done").map(|p| p.value()),
-            Some(Value::Bool(true))
+        Ok(r) => matches!((r).view(), ValueView::Obj(ro) if matches!(
+            (ro.borrow().props.get("done").map(|p| p.value())).map(|__value| (__value).view()),
+            Some(ValueView::Bool(true))
         )),
     };
     if finished {
@@ -9858,7 +9990,7 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                     }
                 };
                 set_internal(
-                    this.as_obj().unwrap(),
+                    &this.as_obj().unwrap(),
                     "#\u{0}ih_count",
                     Value::Num(count + 1.0),
                 );
@@ -9871,11 +10003,7 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                 match step_iter_with(i, &src, &inext)? {
                     None => return Ok(iter_result(i, Value::Undefined, true)),
                     Some(v) => {
-                        let r = match i.call(
-                            f.clone(),
-                            Value::Undefined,
-                            &[v.clone(), Value::Num(k)],
-                        ) {
+                        let r = match i.call(f, Value::Undefined, &[v, Value::Num(k)]) {
                             Ok(r) => r,
                             Err(e) => {
                                 i.iterator_close(&src);
@@ -9884,7 +10012,7 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                         };
                         k += 1.0;
                         if i.to_boolean(&r) {
-                            set_internal(this.as_obj().unwrap(), "#\u{0}ih_count", Value::Num(k));
+                            set_internal(&this.as_obj().unwrap(), "#\u{0}ih_count", Value::Num(k));
                             return Ok(iter_result(i, v, false));
                         }
                     }
@@ -9895,12 +10023,12 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             let nv = ab(i.get_internal_slot(&this, "#\u{0}ih_n"))?;
             let n = ab(i.to_number(&nv))?;
             if count >= n {
-                set_internal(this.as_obj().unwrap(), "#\u{0}ih_done", Value::Bool(true));
+                set_internal(&this.as_obj().unwrap(), "#\u{0}ih_done", Value::Bool(true));
                 ab(i.iterator_close_normal(&src))?;
                 return Ok(iter_result(i, Value::Undefined, true));
             }
             set_internal(
-                this.as_obj().unwrap(),
+                &this.as_obj().unwrap(),
                 "#\u{0}ih_count",
                 Value::Num(count + 1.0),
             );
@@ -9921,14 +10049,14 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                         // Exhausted while skipping: the helper completes here — no further
                         // step of the underlying iterator.
                         let o = this.as_obj().unwrap();
-                        set_internal(o, "#\u{0}ih_started", Value::Bool(true));
-                        set_internal(o, "#\u{0}ih_done", Value::Bool(true));
+                        set_internal(&o, "#\u{0}ih_started", Value::Bool(true));
+                        set_internal(&o, "#\u{0}ih_done", Value::Bool(true));
                         return Ok(iter_result(i, Value::Undefined, true));
                     }
                     skipped += 1.0;
                 }
                 set_internal(
-                    this.as_obj().unwrap(),
+                    &this.as_obj().unwrap(),
                     "#\u{0}ih_started",
                     Value::Bool(true),
                 );
@@ -9945,25 +10073,29 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             }
             let size = ab(i.get_internal_slot(&this, "#\u{0}ih_size"))?;
             let size = ab(i.to_number(&size))? as usize;
-            let mut buffer = Vec::with_capacity(size.min(1024));
+            // Rooted across the author code each step runs (I1).
+            let mut buffer =
+                crate::rooting::RootedVec::from_vec(Vec::with_capacity(size.min(1024)));
             loop {
                 match step_iter_with(i, &src, &inext)? {
                     Some(value) => {
                         buffer.push(value);
                         if buffer.len() == size {
-                            return Ok(iter_result(i, i.make_array(buffer), false));
+                            let chunk = i.make_array(buffer.into_vec());
+                            return Ok(iter_result(i, chunk, false));
                         }
                     }
                     None => {
                         set_internal(
-                            this.as_obj().unwrap(),
+                            &this.as_obj().unwrap(),
                             "#\u{0}ih_source_done",
                             Value::Bool(true),
                         );
                         return if buffer.is_empty() {
                             Ok(iter_result(i, Value::Undefined, true))
                         } else {
-                            Ok(iter_result(i, i.make_array(buffer), false))
+                            let chunk = i.make_array(buffer.into_vec());
+                            Ok(iter_result(i, chunk, false))
                         };
                     }
                 }
@@ -9977,8 +10109,8 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             let size = ab(i.get_internal_slot(&this, "#\u{0}ih_size"))?;
             let size = ab(i.to_number(&size))? as usize;
             let stored = ab(i.get_internal_slot(&this, "#\u{0}ih_buf"))?;
-            let mut buffer = match stored {
-                Value::Obj(o) => {
+            let mut buffer = match (stored).view() {
+                ValueView::Obj(o) => {
                     let len = i.array_length(&o);
                     (0..len)
                         .map(|index| {
@@ -9992,17 +10124,20 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                 }
                 _ => VecDeque::new(),
             };
+            // Values stepped into the window are rooted across later steps (I1).
+            let mut roots = crate::rooting::ValueRoots::new();
             loop {
                 match step_iter_with(i, &src, &inext)? {
                     Some(value) => {
                         if buffer.len() == size {
                             buffer.pop_front();
                         }
+                        roots.keep(&value);
                         buffer.push_back(value);
                         if buffer.len() == size {
                             let window = buffer.iter().cloned().collect::<Vec<_>>();
                             set_internal(
-                                this.as_obj().unwrap(),
+                                &this.as_obj().unwrap(),
                                 "#\u{0}ih_buf",
                                 i.make_array(window.clone()),
                             );
@@ -10011,13 +10146,12 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                     }
                     None => {
                         set_internal(
-                            this.as_obj().unwrap(),
+                            &this.as_obj().unwrap(),
                             "#\u{0}ih_source_done",
                             Value::Bool(true),
                         );
                         let mode = ab(i.get_internal_slot(&this, "#\u{0}ih_undersized"))?;
-                        let allow_partial =
-                            matches!(mode, Value::Str(s) if s.to_string() == "allow-partial");
+                        let allow_partial = matches!((mode).view(), ValueView::Str(s) if s.to_string() == "allow-partial");
                         return if allow_partial && !buffer.is_empty() && buffer.len() < size {
                             Ok(iter_result(
                                 i,
@@ -10036,13 +10170,13 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             loop {
                 // Drain the active inner iterator first (lazily — it may be infinite).
                 let inner = ab(i.get_internal_slot(&this, "#\u{0}ih_inner"))?;
-                if matches!(inner, Value::Obj(_)) {
+                if matches!((inner).view(), ValueView::Obj(_)) {
                     let inext = ab(i.get_internal_slot(&this, "#\u{0}ih_inner_next"))?;
                     match step_iter_with(i, &inner, &inext) {
                         Ok(Some(v)) => return Ok(iter_result(i, v, false)),
                         Ok(None) => {
                             set_internal(
-                                this.as_obj().unwrap(),
+                                &this.as_obj().unwrap(),
                                 "#\u{0}ih_inner",
                                 Value::Undefined,
                             );
@@ -10059,8 +10193,7 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                 match step_iter_with(i, &src, &inext)? {
                     None => return Ok(iter_result(i, Value::Undefined, true)),
                     Some(v) => {
-                        let mapped = match i.call(f.clone(), Value::Undefined, &[v, Value::Num(c)])
-                        {
+                        let mapped = match i.call(f, Value::Undefined, &[v, Value::Num(c)]) {
                             Ok(m) => m,
                             Err(e) => {
                                 i.iterator_close(&src);
@@ -10068,7 +10201,7 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                             }
                         };
                         c += 1.0;
-                        set_internal(this.as_obj().unwrap(), "#\u{0}ih_count", Value::Num(c));
+                        set_internal(&this.as_obj().unwrap(), "#\u{0}ih_count", Value::Num(c));
                         // GetIteratorFlattenable (reject primitives), fetching `next` once.
                         let opened = (|i: &mut Interp| -> Result<(Value, Value), Value> {
                             let it = get_iterator_flattenable(i, &mapped, false)?;
@@ -10077,8 +10210,8 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                         })(i);
                         match opened {
                             Ok((it, n)) => {
-                                set_internal(this.as_obj().unwrap(), "#\u{0}ih_inner", it);
-                                set_internal(this.as_obj().unwrap(), "#\u{0}ih_inner_next", n);
+                                set_internal(&this.as_obj().unwrap(), "#\u{0}ih_inner", it);
+                                set_internal(&this.as_obj().unwrap(), "#\u{0}ih_inner_next", n);
                             }
                             Err(e) => {
                                 i.iterator_close(&src);
@@ -10104,11 +10237,13 @@ fn make_array_iterator(i: &mut Interp, target: Value, kind: u8) -> Value {
     let obj = Object::new_with_parts(
         proto,
         crate::value::Props::new(),
-        Exotic::ArrayIterator(Box::new(crate::value::ArrayIteratorState {
-            target,
-            index: 0,
-            kind,
-        })),
+        Exotic::ArrayIterator(crate::gc_storage::PayloadBox::new(
+            crate::value::ArrayIteratorState {
+                target,
+                index: 0,
+                kind,
+            },
+        )),
     );
     Value::Obj(obj)
 }
@@ -10179,8 +10314,8 @@ fn drive_generator(
     signal: crate::coroutine::Resume,
 ) -> Result<Value, Value> {
     use crate::coroutine::{Resume, Suspend};
-    let key = match this {
-        Value::Obj(o) => Rc::as_ptr(o) as usize,
+    let key = match &(this).view() {
+        ValueView::Obj(o) => Gc::as_ptr(o) as usize,
         _ => return Err(i.make_error("TypeError", "Generator method called on a non-generator")),
     };
     let mut coro = match i.generators.remove(&key) {
@@ -10188,7 +10323,7 @@ fn drive_generator(
         None => return Err(i.make_error("TypeError", "Generator method called on a non-generator")),
     };
     if coro.done() {
-        i.generators.insert(key, coro);
+        i.generators.insert(&i.gc_heap, key, coro);
         return match signal {
             Resume::Throw(e) => Err(e),
             Resume::Return(v) => Ok(iter_result(i, v, true)),
@@ -10197,11 +10332,11 @@ fn drive_generator(
         };
     }
     let suspend = coro.resume(i, signal);
-    i.generators.insert(key, coro);
+    i.generators.insert(&i.gc_heap, key, coro);
     // A `yield*` forwards the inner iterator's result object unwrapped.
     let raw = std::mem::take(&mut i.yield_raw_result);
     match suspend {
-        Suspend::Yield(v) if raw && matches!(v, Value::Obj(_)) => Ok(v),
+        Suspend::Yield(v) if raw && matches!((v).view(), ValueView::Obj(_)) => Ok(v),
         Suspend::Yield(v) => Ok(iter_result(i, v, false)),
         Suspend::Done(v) => Ok(iter_result(i, v, true)),
         Suspend::Throw(e) => Err(e),
@@ -10232,11 +10367,11 @@ fn async_gen_drive(
     signal: crate::coroutine::Resume,
 ) -> Result<Value, Value> {
     let r = i.new_promise();
-    match this {
+    match &(this).view() {
         // Brand check: the receiver must be an actual async generator instance; a mismatch
         // rejects the returned promise rather than throwing.
-        Value::Obj(o) if i.async_gens.contains(&(Rc::as_ptr(o) as usize)) => {
-            i.drive_async_gen(Rc::as_ptr(o) as usize, r.clone(), signal)
+        ValueView::Obj(o) if i.async_gens.contains(&(Gc::as_ptr(o) as usize)) => {
+            i.drive_async_gen(Gc::as_ptr(o) as usize, r, signal)
         }
         _ => {
             let e = i.make_error(
@@ -10276,8 +10411,8 @@ pub(crate) fn async_gen_react_fulfil(
     _t: Value,
     a: &[Value],
 ) -> Result<Value, Value> {
-    let key = match arg(a, 0) {
-        Value::Obj(object) => Rc::as_ptr(&object) as usize,
+    let key = match (arg(a, 0)).view() {
+        ValueView::Obj(object) => Gc::as_ptr(&object) as usize,
         _ => return Ok(Value::Undefined),
     };
     i.drive_async_gen_inner(key, arg(a, 1), crate::coroutine::Resume::Next(arg(a, 2)));
@@ -10288,8 +10423,8 @@ pub(crate) fn async_gen_react_reject(
     _t: Value,
     a: &[Value],
 ) -> Result<Value, Value> {
-    let key = match arg(a, 0) {
-        Value::Obj(object) => Rc::as_ptr(&object) as usize,
+    let key = match (arg(a, 0)).view() {
+        ValueView::Obj(object) => Gc::as_ptr(&object) as usize,
         _ => return Ok(Value::Undefined),
     };
     i.drive_async_gen_inner(key, arg(a, 1), crate::coroutine::Resume::Throw(arg(a, 2)));
@@ -10302,16 +10437,16 @@ pub(crate) fn async_gen_return_fulfil(
     _t: Value,
     a: &[Value],
 ) -> Result<Value, Value> {
-    let key = match arg(a, 0) {
-        Value::Obj(object) => Rc::as_ptr(&object) as usize,
+    let key = match (arg(a, 0)).view() {
+        ValueView::Obj(object) => Gc::as_ptr(&object) as usize,
         _ => return Ok(Value::Undefined),
     };
     let (r, x) = (arg(a, 1), arg(a, 2));
     if let Some(mut coro) = i.generators.remove(&key) {
         if !coro.done() {
-            let _ = coro.resume(i, crate::coroutine::Resume::Return(x.clone()));
+            let _ = coro.resume(i, crate::coroutine::Resume::Return(x));
         }
-        i.generators.insert(key, coro);
+        i.generators.insert(&i.gc_heap, key, coro);
     }
     let res = i.iter_result_obj(x, true);
     i.resolve_promise(&r, res);
@@ -10323,16 +10458,16 @@ pub(crate) fn async_gen_return_reject(
     _t: Value,
     a: &[Value],
 ) -> Result<Value, Value> {
-    let key = match arg(a, 0) {
-        Value::Obj(object) => Rc::as_ptr(&object) as usize,
+    let key = match (arg(a, 0)).view() {
+        ValueView::Obj(object) => Gc::as_ptr(&object) as usize,
         _ => return Ok(Value::Undefined),
     };
     let (r, e) = (arg(a, 1), arg(a, 2));
     if let Some(mut coro) = i.generators.remove(&key) {
         if !coro.done() {
-            let _ = coro.resume(i, crate::coroutine::Resume::Throw(e.clone()));
+            let _ = coro.resume(i, crate::coroutine::Resume::Throw(e));
         }
-        i.generators.insert(key, coro);
+        i.generators.insert(&i.gc_heap, key, coro);
     }
     i.reject_promise(&r, e);
     i.finish_async_gen_step(key);
@@ -10364,10 +10499,10 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
                 "Array Iterator next called on an incompatible receiver",
             ));
         };
-        (state.target.clone(), state.index, state.kind)
+        (state.target, state.index, state.kind)
     };
     // An exhausted iterator clears its target so it stays done even if the source later grows.
-    if matches!(target, Value::Undefined) {
+    if matches!((target).view(), ValueView::Undefined) {
         return Ok(None);
     }
     // A TypedArray target re-derives its length each step; an out-of-bounds (detached/shrunk-past)
@@ -10379,19 +10514,19 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
             None => return Err(i.make_error("TypeError", "TypedArray is out of bounds")),
         }
     } else {
-        match &target {
+        match &(target).view() {
             // LengthOfArrayLike is a [[Get]] of "length". An ordinary Array's length is an
             // array-exotic data slot, never an accessor, so reading the maintained slot is the
             // same operation without allocating the property key or coercing a Number. Proxies,
             // host objects, and ordinary array-likes retain the observable generic path.
-            Value::Obj(object)
+            ValueView::Obj(object)
                 if matches!(object.borrow().exotic, Exotic::Array)
-                    && i.ordinary_get_ptr(Rc::as_ptr(object) as usize) =>
+                    && i.ordinary_get_ptr(Gc::as_ptr(object) as usize) =>
             {
                 i.array_length(object)
             }
             // LengthOfArrayLike through [[Get]], so a proxy target's traps are honored.
-            Value::Obj(_) => {
+            ValueView::Obj(_) => {
                 let lv = ab(i.get_member_key(&target, "length"))?;
                 let n = ab(i.to_number(&lv))?;
                 if n.is_nan() || n <= 0.0 {
@@ -10400,7 +10535,7 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
                     n.min(9007199254740991.0) as usize
                 }
             }
-            Value::Str(s) => crate::jstr::unit_len(s),
+            ValueView::Str(s) => crate::jstr::unit_len(s),
             _ => 0,
         }
     };
@@ -10434,8 +10569,8 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
         // property key and dispatching through the generic indexed-property machinery.
         i.ta_read(&info, idx)
     } else {
-        ab(match &target {
-            Value::Obj(object) => i
+        ab(match &(target).view() {
+            ValueView::Obj(object) => i
                 .fast_get_elem(object, idx as f64)
                 .map(Ok)
                 .unwrap_or_else(|| i.get_member_key(&target, &idx.to_string())),
@@ -10471,13 +10606,13 @@ fn norm_index(n: f64, len: i64) -> i64 {
 }
 
 fn same_value_zero(a: &Value, b: &Value) -> bool {
-    if let (Value::Num(x), Value::Num(y)) = (a, b) {
+    if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
         if x.is_nan() && y.is_nan() {
             return true;
         }
     }
-    match (a, b) {
-        (Value::Num(x), Value::Num(y)) => x == y,
+    match (&(a).view(), &(b).view()) {
+        (ValueView::Num(x), ValueView::Num(y)) => x == y,
         _ => same_value(a, b),
     }
 }
@@ -10686,17 +10821,19 @@ pub(crate) fn nf_from_char_code(
 ) -> Result<Value, Value> {
     // One Number argument is the decoder idiom (`String.fromCharCode(c)` per character):
     // ToUint16 it and share the interned one-unit ASCII strings instead of allocating.
-    if let [Value::Num(num)] = args {
-        return Ok(Value::Str(crate::jstr::unit_lstr(uint16_of_number(*num))));
+    if let [argument] = args {
+        if let ValueView::Num(num) = argument.view() {
+            return Ok(Value::Str(crate::jstr::unit_lstr(uint16_of_number(num))));
+        }
     }
     let mut units: Vec<u16> = Vec::with_capacity(args.len());
     for a in args {
         // Each argument is ToUint16'd (so -1 -> 0xFFFF, 0x10000 -> 0), not truncated.
         // ToNumber is the identity for Numbers (ECMA-262 §7.1.4); other inputs keep
         // the full coercive path with its throws and valueOf ordering.
-        let num = match a {
-            Value::Num(num) => *num,
-            v => ab(i.to_number(v))?,
+        let num = match a.view() {
+            ValueView::Num(num) => num,
+            _ => ab(i.to_number(a))?,
         };
         units.push(uint16_of_number(num));
     }
@@ -10760,14 +10897,14 @@ pub(crate) fn nf_code_point_at(
 }
 
 fn this_string(i: &mut Interp, this: &Value) -> Result<crate::lstr::LStr, Value> {
-    match this {
-        Value::Str(s) => Ok(s.clone()),
-        Value::Obj(o) => match &o.borrow().exotic {
-            Exotic::StrWrap(s) => Ok((**s).clone()),
+    match &(this).view() {
+        ValueView::Str(s) => Ok(*s),
+        ValueView::Obj(o) => match &o.borrow().exotic {
+            Exotic::StrWrap(s) => Ok(**s),
             _ => ab(i.to_string(this)),
         },
         // String.prototype methods RequireObjectCoercible(this): null/undefined → TypeError.
-        Value::Undefined | Value::Null => Err(i.make_error(
+        ValueView::Undefined | ValueView::Null => Err(i.make_error(
             "TypeError",
             "String.prototype method called on null or undefined",
         )),
@@ -10783,14 +10920,14 @@ fn is_js_ws(c: char) -> bool {
 
 /// IsRegExp(arg): true if it has a truthy `@@match`, or (fallback) is a compiled RegExp object.
 fn arg_is_regexp(i: &mut Interp, v: &Value) -> Result<bool, Value> {
-    if let Value::Obj(o) = v {
+    if let ValueView::Obj(o) = (v).view() {
         if let Some(k) = well_known_key(i, "match") {
             let m = ab(i.get_member_key(v, &k))?;
-            if !matches!(m, Value::Undefined | Value::Null) {
+            if !matches!((m).view(), ValueView::Undefined | ValueView::Null) {
                 return Ok(i.to_boolean(&m));
             }
         }
-        return Ok(i.regexps.contains_key(&(Rc::as_ptr(o) as usize)));
+        return Ok(i.regexps.contains_key(&(Gc::as_ptr(&o) as usize)));
     }
     Ok(false)
 }
@@ -10799,9 +10936,12 @@ fn arg_is_regexp(i: &mut Interp, v: &Value) -> Result<bool, Value> {
 fn str_clamp_pos(i: &mut Interp, v: Option<&Value>, len: i64) -> Result<usize, Value> {
     // `Value::Num` is the ToNumber identity (§7.1.4.1); everything else keeps the coercive path.
     let n = match v {
-        Some(Value::Num(n)) => *n,
-        Some(v) if !matches!(v, Value::Undefined) => ab(i.to_number(v))?,
-        _ => 0.0,
+        Some(v) => match v.view() {
+            ValueView::Num(n) => n,
+            ValueView::Undefined => 0.0,
+            _ => ab(i.to_number(v))?,
+        },
+        None => 0.0,
     };
     let n = if n.is_nan() { 0 } else { n.trunc() as i64 };
     Ok(n.clamp(0, len) as usize)
@@ -10829,7 +10969,7 @@ pub(crate) fn nf_string_replace(
     this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
-    if matches!(this, Value::Undefined | Value::Null) {
+    if matches!((this).view(), ValueView::Undefined | ValueView::Null) {
         return Err(i.make_error(
             "TypeError",
             "String.prototype.replace called on null or undefined",
@@ -10837,14 +10977,14 @@ pub(crate) fn nf_string_replace(
     }
     // An object search value with a @@replace method handles the operation.
     let search = arg(args, 0);
-    if matches!(search, Value::Obj(_)) {
+    if matches!((search).view(), ValueView::Obj(_)) {
         if let Some(key) = well_known_key(i, "replace") {
             let replacer = ab(i.get_member_key(&search, &key))?;
-            if !matches!(replacer, Value::Undefined | Value::Null) {
+            if !matches!((replacer).view(), ValueView::Undefined | ValueView::Null) {
                 if !replacer.is_callable() {
                     return Err(i.make_error("TypeError", "@@replace is not callable"));
                 }
-                return ab(i.call(replacer, search.clone(), &[this.clone(), arg(args, 1)]));
+                return ab(i.call(replacer, search, &[this, arg(args, 1)]));
             }
         }
     }
@@ -10909,27 +11049,27 @@ pub(crate) fn nf_string_replace(
 
 pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     // RequireObjectCoercible(this), then dispatch to an Object regexp's @@match.
-    if matches!(this, Value::Undefined | Value::Null) {
+    if matches!((this).view(), ValueView::Undefined | ValueView::Null) {
         return Err(i.make_error(
             "TypeError",
             "String.prototype.match called on null or undefined",
         ));
     }
     let regexp = arg(a, 0);
-    if matches!(regexp, Value::Obj(_)) {
+    if matches!((regexp).view(), ValueView::Obj(_)) {
         if let Some(key) = well_known_key(i, "match") {
             let matcher = ab(i.get_member_key(&regexp, &key))?;
-            if !matches!(matcher, Value::Undefined | Value::Null) {
+            if !matches!((matcher).view(), ValueView::Undefined | ValueView::Null) {
                 if !matcher.is_callable() {
                     return Err(i.make_error("TypeError", "@@match is not callable"));
                 }
-                return ab(i.call(matcher, regexp.clone(), std::slice::from_ref(&this)));
+                return ab(i.call(matcher, regexp, std::slice::from_ref(&this)));
             }
         }
     }
     // Otherwise build a RegExp from the argument and invoke its @@match.
     let s = this_string(i, &this)?;
-    let pattern = if matches!(regexp, Value::Undefined) {
+    let pattern = if matches!((regexp).view(), ValueView::Undefined) {
         String::new()
     } else {
         ab(i.to_string(&regexp))?.to_string()
@@ -10942,45 +11082,56 @@ pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Resul
 
 pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     // RequireObjectCoercible(this), then dispatch to an Object separator's @@split.
-    if matches!(this, Value::Undefined | Value::Null) {
+    if matches!((this).view(), ValueView::Undefined | ValueView::Null) {
         return Err(i.make_error(
             "TypeError",
             "String.prototype.split called on null or undefined",
         ));
     }
     let separator = arg(args, 0);
-    if matches!(separator, Value::Obj(_)) {
+    if matches!((separator).view(), ValueView::Obj(_)) {
         if let Some(key) = well_known_key(i, "split") {
             let splitter = ab(i.get_member_key(&separator, &key))?;
-            if !matches!(splitter, Value::Undefined | Value::Null) {
+            if !matches!((splitter).view(), ValueView::Undefined | ValueView::Null) {
                 if !splitter.is_callable() {
                     return Err(i.make_error("TypeError", "@@split is not callable"));
                 }
-                return ab(i.call(splitter, separator.clone(), &[this.clone(), arg(args, 1)]));
+                return ab(i.call(splitter, separator, &[this, arg(args, 1)]));
             }
         }
     }
     let s = this_string(i, &this)?;
     // `limit` (ToUint32, modulo 2^32) caps the number of pieces; 0 → empty result — but
     // ToString of the separator is observable BEFORE the zero-limit shortcut.
-    let limit = match arg(args, 1) {
-        Value::Undefined => u32::MAX as usize,
-        v => to_uint32(ab(i.to_number(&v))?) as usize,
+    let limit = {
+        let __value_match_original = arg(args, 1);
+        match (__value_match_original).view() {
+            ValueView::Undefined => u32::MAX as usize,
+            _ => {
+                let v = __value_match_original;
+                to_uint32(ab(i.to_number(&v))?) as usize
+            }
+        }
     };
-    let is_live_regexp =
-        matches!(&arg(args, 0), Value::Obj(o) if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)));
-    let sep_str: Option<Rc<str>> = match &arg(args, 0) {
-        Value::Undefined => None,
-        _ if is_live_regexp => None,
-        v => Some(ab(i.to_string(v))?.into()),
+    let is_live_regexp = matches!(&(arg(args, 0)).view(), ValueView::Obj(o) if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)));
+    let sep_str: Option<Rc<str>> = {
+        let __value_match_original = &arg(args, 0);
+        match &(__value_match_original).view() {
+            ValueView::Undefined => None,
+            _ if is_live_regexp => None,
+            _ => {
+                let v = __value_match_original;
+                Some(ab(i.to_string(v))?.into())
+            }
+        }
     };
     if limit == 0 {
         return Ok(i.make_array(Vec::new()));
     }
     // Regex separator: split on each match (group captures are inserted between pieces).
-    if let Value::Obj(o) = &arg(args, 0) {
-        if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)) {
-            let re = i.regexps[&(Rc::as_ptr(o) as usize)].clone();
+    if let ValueView::Obj(o) = &(arg(args, 0)).view() {
+        if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
+            let re = i.regexps[&(Gc::as_ptr(o) as usize)].clone();
             let text = i.re_text(re.unicode, &s);
             let mut parts = Vec::new();
             let mut last = 0;
@@ -11081,10 +11232,12 @@ fn nf_string_iterator(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Va
     let obj = Object::new_with_parts(
         i.extra_protos.get("%StringIteratorPrototype%").cloned(),
         crate::value::Props::new(),
-        Exotic::StringIterator(Box::new(crate::value::StringIteratorState {
-            string: Some(s),
-            index: 0,
-        })),
+        Exotic::StringIterator(crate::gc_storage::PayloadBox::new(
+            crate::value::StringIteratorState {
+                string: Some(s),
+                index: 0,
+            },
+        )),
     );
     Ok(Value::Obj(obj))
 }
@@ -11118,9 +11271,9 @@ pub(crate) fn intrinsic_string_iterator_is_unmodified(i: &Interp) -> bool {
 }
 
 fn install_string(it: &mut Interp) {
-    let sp = it.string_proto.clone();
+    let sp = it.string_proto;
     // String.prototype[@@iterator]: a lazy String Iterator over the receiver, by code point.
-    if let Some(sym) = it.iterator_sym.clone() {
+    if let Some(sym) = it.iterator_sym {
         let f = it.make_native("[Symbol.iterator]", 0, nf_string_iterator);
         sp.borrow_mut()
             .props
@@ -11160,9 +11313,15 @@ fn install_string(it: &mut Interp) {
             // ECMA-262 §22.1.3.11 performs ToNumber(position) before the early
             // `maxStart < 0` return, so retain that observable coercion even when
             // the search string is longer than the receiver.
-            let number_position = match arg(args, 1) {
-                Value::Undefined => None,
-                v => Some(ab(i.to_number(&v))?),
+            let number_position = {
+                let __value_match_original = arg(args, 1);
+                match (__value_match_original).view() {
+                    ValueView::Undefined => None,
+                    _ => {
+                        let v = __value_match_original;
+                        Some(ab(i.to_number(&v))?)
+                    }
+                }
             };
             let Some(max_start) = s.len().checked_sub(needle.len()) else {
                 return Ok(Value::Num(-1.0));
@@ -11180,14 +11339,20 @@ fn install_string(it: &mut Interp) {
         // Optional `position`: search for the last occurrence starting at or before it.
         let chars = i.units_full(&s);
         let nchars = i.units_full(&needle);
-        let limit = match arg(args, 1) {
-            Value::Undefined => chars.len(),
-            v => {
-                let p = ab(i.to_number(&v))?;
-                if p.is_nan() {
-                    chars.len()
-                } else {
-                    (p.max(0.0) as usize).min(chars.len())
+        let limit = {
+            let __value_match_original = arg(args, 1);
+            match (__value_match_original).view() {
+                ValueView::Undefined => chars.len(),
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let p = ab(i.to_number(&v))?;
+                        if p.is_nan() {
+                            chars.len()
+                        } else {
+                            (p.max(0.0) as usize).min(chars.len())
+                        }
+                    }
                 }
             }
         };
@@ -11213,9 +11378,15 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "normalize", 0, |i, this, args| {
         let s = this_string(i, &this)?;
-        let form = match arg(args, 0) {
-            Value::Undefined => "NFC".to_string(),
-            v => ab(i.to_string(&v))?.to_string(),
+        let form = {
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined => "NFC".to_string(),
+                _ => {
+                    let v = __value_match_original;
+                    ab(i.to_string(&v))?.to_string()
+                }
+            }
         };
         if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
             return Err(i.make_error(
@@ -11277,7 +11448,7 @@ fn install_string(it: &mut Interp) {
             && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
         {
             let end = match args.get(1) {
-                Some(v) if !matches!(v, Value::Undefined) => {
+                Some(v) if !matches!((v).view(), ValueView::Undefined) => {
                     str_clamp_pos(i, Some(v), s.len() as i64)?
                 }
                 _ => s.len(),
@@ -11290,7 +11461,9 @@ fn install_string(it: &mut Interp) {
         let len = chars.len() as i64;
         // endsWith's optional argument is the END position (default = length).
         let end = match args.get(1) {
-            Some(v) if !matches!(v, Value::Undefined) => str_clamp_pos(i, Some(v), len)?,
+            Some(v) if !matches!((v).view(), ValueView::Undefined) => {
+                str_clamp_pos(i, Some(v), len)?
+            }
             _ => len as usize,
         };
         let nchars = i.units_full(&needle);
@@ -11306,10 +11479,13 @@ fn install_string(it: &mut Interp) {
             // ASCII byte offsets are the same code-unit indices, so keep the common path flat.
             let len = s.len() as i64;
             let mut a = (arg_to_number(i, args, 0)? as i64).clamp(0, len);
-            let mut b = match args.get(1) {
-                None | Some(Value::Undefined) => len,
-                Some(Value::Num(n)) => (*n as i64).clamp(0, len),
-                Some(v) => (ab(i.to_number(v))? as i64).clamp(0, len),
+            let mut b = {
+                let end = arg(args, 1);
+                match end.view() {
+                    ValueView::Undefined => len,
+                    ValueView::Num(n) => (n as i64).clamp(0, len),
+                    _ => (ab(i.to_number(&end))? as i64).clamp(0, len),
+                }
             };
             if a > b {
                 std::mem::swap(&mut a, &mut b);
@@ -11319,10 +11495,13 @@ fn install_string(it: &mut Interp) {
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
         let mut a = (arg_to_number(i, args, 0)? as i64).clamp(0, len);
-        let mut b = match args.get(1) {
-            None | Some(Value::Undefined) => len,
-            Some(Value::Num(n)) => (*n as i64).clamp(0, len),
-            Some(v) => (ab(i.to_number(v))? as i64).clamp(0, len),
+        let mut b = {
+            let end = arg(args, 1);
+            match end.view() {
+                ValueView::Undefined => len,
+                ValueView::Num(n) => (n as i64).clamp(0, len),
+                _ => (ab(i.to_number(&end))? as i64).clamp(0, len),
+            }
         };
         if a > b {
             std::mem::swap(&mut a, &mut b);
@@ -11346,10 +11525,13 @@ fn install_string(it: &mut Interp) {
             };
             // The whole-length default stays on `undefined`; a primitive Number needs no coercion
             // and everything else retains the full coercive path in its original position.
-            let length = match args.get(1) {
-                None | Some(Value::Undefined) => None,
-                Some(Value::Num(l)) => Some(*l),
-                Some(v) => Some(ab(i.to_number(v))?),
+            let length = {
+                let length = arg(args, 1);
+                match length.view() {
+                    ValueView::Undefined => None,
+                    ValueView::Num(length) => Some(length),
+                    _ => Some(ab(i.to_number(&length))?),
+                }
             };
             let len = match length {
                 None => size,
@@ -11378,10 +11560,13 @@ fn install_string(it: &mut Interp) {
         } else {
             (n as i64).min(size)
         };
-        let length = match args.get(1) {
-            None | Some(Value::Undefined) => None,
-            Some(Value::Num(l)) => Some(*l),
-            Some(v) => Some(ab(i.to_number(v))?),
+        let length = {
+            let length = arg(args, 1);
+            match length.view() {
+                ValueView::Undefined => None,
+                ValueView::Num(length) => Some(length),
+                _ => Some(ab(i.to_number(&length))?),
+            }
         };
         let len = match length {
             None => size,
@@ -11550,17 +11735,19 @@ fn install_string(it: &mut Interp) {
         // error timing.  If a surrogate boundary needs canonicalization, fall back immediately
         // to the old stepwise path; otherwise each intermediate byte length is just the sum and
         // all pieces can be copied once into one LStr allocation.
-        let mut parts = Vec::with_capacity(args.len() + 1);
-        parts.push(s);
-        let mut total = parts[0].len();
+        // Rooted: ToString of a later argument may run user code.
+        let parts = crate::rooting::Rooted::new(RefCell::new(Vec::with_capacity(args.len() + 1)));
+        parts.borrow_mut().push(s);
+        let mut total = parts.borrow()[0].len();
         for (index, argument) in args.iter().enumerate() {
             let next = ab(i.to_string(argument))?;
             if parts
+                .borrow()
                 .last()
                 .is_some_and(|previous| crate::jstr::needs_join_fixup(previous, &next))
             {
-                let mut out = parts[0].to_string();
-                for part in parts.iter().skip(1) {
+                let mut out = parts.borrow()[0].to_string();
+                for part in parts.borrow().iter().skip(1) {
                     out.push_str(part);
                 }
                 out = crate::jstr::concat(&out, &next);
@@ -11579,9 +11766,13 @@ fn install_string(it: &mut Interp) {
                 .checked_add(next.len())
                 .filter(|&len| len <= MAX_STR_LEN)
                 .ok_or_else(|| i.make_error("RangeError", "Invalid string length"))?;
-            parts.push(next);
+            parts.borrow_mut().push(next);
         }
-        Ok(Value::Str(crate::lstr::LStr::concat_many(&parts, total)))
+        let result = Value::Str(crate::lstr::LStr::concat_many(
+            parts.borrow().as_slice(),
+            total,
+        ));
+        Ok(result)
     });
     it.def_method(&sp, "repeat", 1, |i, this, args| {
         let s = this_string(i, &this)?;
@@ -11691,27 +11882,27 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "match", 1, nf_string_match);
     it.def_method(&sp, "search", 1, |i, this, a| {
         // RequireObjectCoercible(this), then dispatch to an Object regexp's @@search.
-        if matches!(this, Value::Undefined | Value::Null) {
+        if matches!((this).view(), ValueView::Undefined | ValueView::Null) {
             return Err(i.make_error(
                 "TypeError",
                 "String.prototype.search called on null or undefined",
             ));
         }
         let regexp = arg(a, 0);
-        if matches!(regexp, Value::Obj(_)) {
+        if matches!((regexp).view(), ValueView::Obj(_)) {
             if let Some(key) = well_known_key(i, "search") {
                 let searcher = ab(i.get_member_key(&regexp, &key))?;
-                if !matches!(searcher, Value::Undefined | Value::Null) {
+                if !matches!((searcher).view(), ValueView::Undefined | ValueView::Null) {
                     if !searcher.is_callable() {
                         return Err(i.make_error("TypeError", "@@search is not callable"));
                     }
-                    return ab(i.call(searcher, regexp.clone(), std::slice::from_ref(&this)));
+                    return ab(i.call(searcher, regexp, std::slice::from_ref(&this)));
                 }
             }
         }
         // Otherwise build a RegExp from the argument and invoke its @@search.
         let s = this_string(i, &this)?;
-        let pattern = if matches!(regexp, Value::Undefined) {
+        let pattern = if matches!((regexp).view(), ValueView::Undefined) {
             String::new()
         } else {
             ab(i.to_string(&regexp))?.to_string()
@@ -11723,18 +11914,18 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "matchAll", 1, |i, this, a| {
         // RequireObjectCoercible(this).
-        if matches!(this, Value::Undefined | Value::Null) {
+        if matches!((this).view(), ValueView::Undefined | ValueView::Null) {
             return Err(i.make_error(
                 "TypeError",
                 "String.prototype.matchAll called on null or undefined",
             ));
         }
         let regexp = arg(a, 0);
-        if !matches!(regexp, Value::Undefined | Value::Null) {
+        if !matches!((regexp).view(), ValueView::Undefined | ValueView::Null) {
             // A RegExp argument must be global; then dispatch to its @@matchAll if present.
             if arg_is_regexp(i, &regexp)? {
                 let flags = ab(i.get_member_key(&regexp, "flags"))?;
-                if matches!(flags, Value::Undefined | Value::Null) {
+                if matches!((flags).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(i.make_error("TypeError", "regexp.flags is null or undefined"));
                 }
                 let fs = ab(i.to_string(&flags))?;
@@ -11746,21 +11937,21 @@ fn install_string(it: &mut Interp) {
                 }
             }
             // Only an Object's @@matchAll is consulted; a primitive goes to the string path.
-            if matches!(regexp, Value::Obj(_)) {
+            if matches!((regexp).view(), ValueView::Obj(_)) {
                 if let Some(key) = well_known_key(i, "matchAll") {
                     let matcher = ab(i.get_member_key(&regexp, &key))?;
-                    if !matches!(matcher, Value::Undefined | Value::Null) {
+                    if !matches!((matcher).view(), ValueView::Undefined | ValueView::Null) {
                         if !matcher.is_callable() {
                             return Err(i.make_error("TypeError", "@@matchAll is not callable"));
                         }
-                        return ab(i.call(matcher, regexp.clone(), std::slice::from_ref(&this)));
+                        return ab(i.call(matcher, regexp, std::slice::from_ref(&this)));
                     }
                 }
             }
         }
         // Otherwise build a global RegExp from the argument and invoke its @@matchAll.
         let s = this_string(i, &this)?;
-        let pattern = if matches!(regexp, Value::Undefined) {
+        let pattern = if matches!((regexp).view(), ValueView::Undefined) {
             String::new()
         } else {
             ab(i.to_string(&regexp))?.to_string()
@@ -11774,7 +11965,7 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "replaceAll", 2, |i, this, args| {
         // RequireObjectCoercible(this) — but keep the raw receiver O for @@replace, which runs
         // BEFORE ToString(this).
-        if matches!(this, Value::Undefined | Value::Null) {
+        if matches!((this).view(), ValueView::Undefined | ValueView::Null) {
             return Err(i.make_error(
                 "TypeError",
                 "String.prototype.replaceAll called on null or undefined",
@@ -11783,12 +11974,12 @@ fn install_string(it: &mut Interp) {
         let search = arg(args, 0);
         // Only an *Object* searchValue is inspected for regexp-ness / @@replace; a primitive's
         // Symbol.replace is never accessed.
-        if matches!(search, Value::Obj(_)) {
+        if matches!((search).view(), ValueView::Obj(_)) {
             // A RegExp search value must be global: read `flags`, require it coercible, and check
             // for "g" — a non-global (or missing-flags) regexp is a TypeError.
             if arg_is_regexp(i, &search)? {
                 let flags = ab(i.get_member_key(&search, "flags"))?;
-                if matches!(flags, Value::Undefined | Value::Null) {
+                if matches!((flags).view(), ValueView::Undefined | ValueView::Null) {
                     return Err(i.make_error("TypeError", "regexp flags is null or undefined"));
                 }
                 let flags_str = ab(i.to_string(&flags))?;
@@ -11802,11 +11993,11 @@ fn install_string(it: &mut Interp) {
             // GetMethod(search, @@replace): if present, delegate with the raw receiver O.
             if let Some(key) = well_known_key(i, "replace") {
                 let replacer = ab(i.get_member_key(&search, &key))?;
-                if !matches!(replacer, Value::Undefined | Value::Null) {
+                if !matches!((replacer).view(), ValueView::Undefined | ValueView::Null) {
                     if !replacer.is_callable() {
                         return Err(i.make_error("TypeError", "@@replace is not callable"));
                     }
-                    return ab(i.call(replacer, search.clone(), &[this.clone(), arg(args, 1)]));
+                    return ab(i.call(replacer, search, &[this, arg(args, 1)]));
                 }
             }
         }
@@ -11945,21 +12136,23 @@ fn install_string(it: &mut Interp) {
             None => Value::lstr(""),
             // `String(sym)` stringifies a symbol to its descriptive string; `new String(sym)`
             // instead throws (via ToString below).
-            Some(Value::Sym(s)) if !i.constructing => Value::lstr(format!(
-                "Symbol({})",
-                s.description.as_deref().unwrap_or("")
-            )),
-            Some(v) => Value::Str(ab(i.to_string(v))?),
+            Some(v) => match v.view() {
+                ValueView::Sym(s) if !i.constructing => Value::lstr(format!(
+                    "Symbol({})",
+                    s.description.as_deref().unwrap_or("")
+                )),
+                _ => Value::Str(ab(i.to_string(v))?),
+            },
         };
         maybe_box(i, s)
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(sp.clone()), false, false, false),
+        Property::data(Value::Obj(sp), false, false, false),
     );
     sp.borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     it.def_method(&ctor, "fromCharCode", 1, nf_from_char_code);
     it.def_method(&ctor, "raw", 1, |i, _this, args| {
         let template = arg(args, 0);
@@ -11985,9 +12178,9 @@ fn install_string(it: &mut Interp) {
         let mut s = String::new();
         for (index, a) in args.iter().enumerate() {
             // ToNumber identity for Numbers; validation below is identical either way.
-            let n = match a {
-                Value::Num(n) => *n,
-                v => ab(i.to_number(v))?,
+            let n = match a.view() {
+                ValueView::Num(n) => n,
+                _ => ab(i.to_number(a))?,
             };
             // Each argument must be an integer code point in [0, 0x10FFFF].
             if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > 0x10FFFF as f64 {
@@ -12034,15 +12227,27 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
     // completions and valueOf/toString ordering. `undefined` end keeps its fast `len` default.
     if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
         let len = s.len() as i64;
-        let start_num = match arg(args, 0) {
-            Value::Num(n) => n,
-            v => ab(i.to_number(&v))?,
+        let start_num = {
+            let __value_match_original = arg(args, 0);
+            match (__value_match_original).view() {
+                ValueView::Num(n) => n,
+                _ => {
+                    let v = __value_match_original;
+                    ab(i.to_number(&v))?
+                }
+            }
         };
         let start = norm_index(start_num, len);
-        let end = match arg(args, 1) {
-            Value::Undefined => len,
-            Value::Num(n) => norm_index(n, len),
-            v => norm_index(ab(i.to_number(&v))?, len),
+        let end = {
+            let __value_match_original = arg(args, 1);
+            match (__value_match_original).view() {
+                ValueView::Undefined => len,
+                ValueView::Num(n) => norm_index(n, len),
+                _ => {
+                    let v = __value_match_original;
+                    norm_index(ab(i.to_number(&v))?, len)
+                }
+            }
         };
         return Ok(if start < end {
             Value::Str(s.slice_bytes(start as usize, end as usize))
@@ -12052,15 +12257,27 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
     }
     let chars = i.units_full(&s);
     let len = chars.len() as i64;
-    let start_num = match arg(args, 0) {
-        Value::Num(n) => n,
-        v => ab(i.to_number(&v))?,
+    let start_num = {
+        let __value_match_original = arg(args, 0);
+        match (__value_match_original).view() {
+            ValueView::Num(n) => n,
+            _ => {
+                let v = __value_match_original;
+                ab(i.to_number(&v))?
+            }
+        }
     };
     let start = norm_index(start_num, len);
-    let end = match arg(args, 1) {
-        Value::Undefined => len,
-        Value::Num(n) => norm_index(n, len),
-        v => norm_index(ab(i.to_number(&v))?, len),
+    let end = {
+        let __value_match_original = arg(args, 1);
+        match (__value_match_original).view() {
+            ValueView::Undefined => len,
+            ValueView::Num(n) => norm_index(n, len),
+            _ => {
+                let v = __value_match_original;
+                norm_index(ab(i.to_number(&v))?, len)
+            }
+        }
     };
     let out = if start < end {
         i.slice_units(&s, &chars, start as usize, end as usize)
@@ -12073,13 +12290,13 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
 /// Box a Number/String/Boolean primitive into a wrapper object (right prototype + exotic). Other
 /// values pass through unchanged (Symbol/BigInt wrappers are not modeled yet).
 fn box_primitive(i: &mut Interp, v: Value) -> Value {
-    let (proto, exotic) = match &v {
-        Value::Num(n) => (i.number_proto.clone(), Exotic::NumWrap(*n)),
-        Value::Bool(b) => (i.boolean_proto.clone(), Exotic::BoolWrap(*b)),
-        Value::Str(s) => (i.string_proto.clone(), Exotic::str_wrap(s.clone())),
-        Value::Sym(s) => (i.symbol_proto.clone(), Exotic::SymWrap(s.clone())),
-        Value::BigInt(n) => match i.extra_protos.get("BigInt").cloned() {
-            Some(p) => (p, Exotic::bigint_wrap(n.clone())),
+    let (proto, exotic) = match &(v).view() {
+        ValueView::Num(n) => (i.number_proto, Exotic::NumWrap(*n)),
+        ValueView::Bool(b) => (i.boolean_proto, Exotic::BoolWrap(*b)),
+        ValueView::Str(s) => (i.string_proto, Exotic::str_wrap(*s)),
+        ValueView::Sym(s) => (i.symbol_proto, Exotic::SymWrap(*s)),
+        ValueView::BigInt(n) => match i.extra_protos.get("BigInt").cloned() {
+            Some(p) => (p, Exotic::bigint_wrap(*n)),
             None => return v,
         },
         _ => return v,
@@ -12113,8 +12330,8 @@ fn maybe_box(i: &mut Interp, v: Value) -> Result<Value, Value> {
         return Ok(v);
     }
     let boxed = box_primitive(i, v);
-    let nt = i.new_target.clone();
-    if let (Value::Obj(o), Value::Obj(_)) = (&boxed, &nt) {
+    let nt = i.constructor_new_target();
+    if let (ValueView::Obj(o), ValueView::Obj(_)) = (&(boxed).view(), &(nt).view()) {
         let key = match o.borrow().exotic {
             Exotic::NumWrap(_) => "Number",
             Exotic::BoolWrap(_) => "Boolean",
@@ -12122,8 +12339,8 @@ fn maybe_box(i: &mut Interp, v: Value) -> Result<Value, Value> {
             _ => "",
         };
         if !key.is_empty() {
-            match i.get_member_key(&nt, "prototype") {
-                Ok(Value::Obj(p)) => o.borrow_mut().proto = Some(p),
+            match (i.get_member_key(&nt, "prototype")).map(|__value| (__value).view()) {
+                Ok(ValueView::Obj(p)) => o.borrow_mut().proto = Some(p),
                 Ok(_) => {
                     if let Some(p) = ctor_realm_proto(i, &nt, key)? {
                         o.borrow_mut().proto = Some(p);
@@ -12145,9 +12362,15 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
         // fillString. Keep that string allocation instead of copying it into a Rust String.
         return Ok(Value::Str(s));
     }
-    let pad = match arg(args, 1) {
-        Value::Undefined => " ".to_string(),
-        v => ab(i.to_string(&v))?.to_string(),
+    let pad = {
+        let __value_match_original = arg(args, 1);
+        match (__value_match_original).view() {
+            ValueView::Undefined => " ".to_string(),
+            _ => {
+                let v = __value_match_original;
+                ab(i.to_string(&v))?.to_string()
+            }
+        }
     };
     if pad.is_empty() {
         return Ok(Value::Str(s));
@@ -12180,10 +12403,10 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
 /// thisStringValue: a String primitive or wrapper; anything else is a TypeError (the
 /// String.prototype toString/valueOf methods are not generic).
 fn string_this_value(i: &mut Interp, this: &Value) -> Result<Value, Value> {
-    match this {
-        Value::Str(s) => Ok(Value::Str(s.clone())),
-        Value::Obj(o) => match &o.borrow().exotic {
-            Exotic::StrWrap(s) => Ok(Value::Str((**s).clone())),
+    match &(this).view() {
+        ValueView::Str(s) => Ok(Value::Str(*s)),
+        ValueView::Obj(o) => match &o.borrow().exotic {
+            Exotic::StrWrap(s) => Ok(Value::Str(**s)),
             _ => Err(i.make_error("TypeError", "not a String object")),
         },
         _ => Err(i.make_error("TypeError", "not a String object")),
@@ -12198,7 +12421,7 @@ enum Repl {
 
 fn prep_repl(i: &mut Interp, v: &Value) -> Result<Repl, Value> {
     if v.is_callable() {
-        Ok(Repl::Fn(v.clone()))
+        Ok(Repl::Fn(*v))
     } else {
         Ok(Repl::Text(ab(i.to_string(v))?.into()))
     }
@@ -12282,12 +12505,12 @@ fn string_replacement_parts(
     if let Repl::Fn(f) = repl {
         // The callback's position argument counts UTF-16 code units, not bytes.
         let r = ab(i.call(
-            f.clone(),
+            *f,
             Value::Undefined,
             &[
                 Value::lstr(matched),
                 Value::Num(unit_pos as f64),
-                Value::Str(whole.clone()),
+                Value::Str(*whole),
             ],
         ))?;
         return Ok(ab(i.to_string(&r))?.to_string());
@@ -12350,9 +12573,9 @@ fn to_uint32(n: f64) -> u32 {
 
 fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     // thisNumberValue: only a Number primitive or Number wrapper is acceptable.
-    match this {
-        Value::Num(n) => Ok(*n),
-        Value::Obj(o) => match o.borrow().exotic {
+    match &(this).view() {
+        ValueView::Num(n) => Ok(*n),
+        ValueView::Obj(o) => match o.borrow().exotic {
             Exotic::NumWrap(n) => Ok(n),
             _ => Err(i.make_error("TypeError", "Number method called on incompatible receiver")),
         },
@@ -12442,4 +12665,10 @@ fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
         format!("{}.{}", &ds[..1], &ds[1..])
     };
     format!("{sign}{m}{}", fmt_exp(exp))
+}
+
+impl crate::gc_trace::GcTrace for FromAsyncCoro {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.visit_values(|value| sink.value(value));
+    }
 }

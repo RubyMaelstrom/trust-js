@@ -8,6 +8,7 @@
 //! Weak cursor registrations never retain an iterator or a JavaScript object.
 
 use crate::fasthash::{FastMap, FxHasher};
+use crate::value::ValueView;
 use crate::value::{Gc, Value};
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
@@ -106,6 +107,9 @@ pub(crate) struct OrderedCollection {
     live_len: usize,
     // Lazy: collections used only for lookup need no registry allocation.
     cursors: Option<Rc<CursorRegistry>>,
+    /// The table bytes charged to the heap's external ledger (see `value::ExternalCharge`):
+    /// only the collection of the Map or Set that owns them frees them.
+    charge: crate::value::ExternalCharge,
 }
 
 impl OrderedCollection {
@@ -114,13 +118,27 @@ impl OrderedCollection {
     }
 
     pub(crate) fn with_capacity(kind: CollectionKind, capacity: usize) -> Self {
-        Self {
+        let mut collection = Self {
             kind,
             entries: Vec::with_capacity(capacity),
             index: FastMap::with_capacity_and_hasher(capacity, Default::default()),
             live_len: 0,
             cursors: None,
-        }
+            charge: Default::default(),
+        };
+        collection.settle_charge();
+        collection
+    }
+
+    /// Bring the external charge to the tables' current capacity: the entries, and the index's
+    /// buckets with a control byte each. Capacities change geometrically, so most calls charge
+    /// nothing.
+    #[inline]
+    fn settle_charge(&mut self) {
+        // The struct itself is in its payload cell, which the heap counts as a cell.
+        let bytes = self.entries.capacity() * size_of::<Option<(Value, Value)>>()
+            + self.index.capacity() * (size_of::<(u64, Bucket)>() + 1);
+        self.charge.settle(bytes);
     }
 
     pub(crate) fn kind(&self) -> CollectionKind {
@@ -164,9 +182,12 @@ impl OrderedCollection {
         // append. Hold the one index lookup across that decision: hashing a long String or
         // BigInt again, or probing the table again, has no semantic purpose. The ordered
         // entries and live cursors remain authoritative (ECMA-262 §24.1.3.9 / §24.2.4.1).
-        let key = match key {
-            Value::Num(n) => Value::Num(if n == 0.0 { 0.0 } else { n }),
-            key => key,
+        let key = {
+            let __value_match_original = key;
+            match (__value_match_original).view() {
+                ValueView::Num(n) => Value::Num(if n == 0.0 { 0.0 } else { n }),
+                _ => __value_match_original,
+            }
         };
         let hash = key_hash(&key);
         match self.index.entry(hash) {
@@ -186,6 +207,7 @@ impl OrderedCollection {
             }
         }
         self.live_len += 1;
+        self.settle_charge();
     }
 
     pub(crate) fn delete(&mut self, key: &Value) -> bool {
@@ -215,6 +237,7 @@ impl OrderedCollection {
             self.clear();
         } else if self.entries.len() - self.live_len > self.live_len.max(32) {
             self.compact();
+            self.settle_charge();
         }
         true
     }
@@ -251,7 +274,7 @@ impl OrderedCollection {
             offset += 1;
             cursor.0.position.set(offset);
             if let Some(entry) = entry {
-                return Some(entry.clone());
+                return Some(*entry);
             }
         }
         None
@@ -271,6 +294,7 @@ impl OrderedCollection {
         if self.index.capacity() > 64 {
             self.index = FastMap::default();
         }
+        self.settle_charge();
     }
 
     fn compact(&mut self) {
@@ -329,8 +353,8 @@ impl OrderedCollection {
 }
 
 fn same_key(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Num(a), Value::Num(b)) => a == b || (a.is_nan() && b.is_nan()),
+    match (&(left).view(), &(right).view()) {
+        (ValueView::Num(a), ValueView::Num(b)) => a == b || (a.is_nan() && b.is_nan()),
         _ => crate::builtins::same_value_pub(left, right),
     }
 }
@@ -341,15 +365,15 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
     #[cfg(test)]
     KEY_HASH_CALLS.with(|count| count.set(count.get() + 1));
     let mut state = FxHasher::default();
-    match value {
-        Value::Undefined => state.write_u8(0),
-        Value::Empty => state.write_u8(1),
-        Value::Null => state.write_u8(2),
-        Value::Bool(value) => {
+    match &(value).view() {
+        ValueView::Undefined => state.write_u8(0),
+        ValueView::Empty => state.write_u8(1),
+        ValueView::Null => state.write_u8(2),
+        ValueView::Bool(value) => {
             state.write_u8(3);
             value.hash(&mut state);
         }
-        Value::Num(value) => {
+        ValueView::Num(value) => {
             state.write_u8(4);
             state.write_u64(if *value == 0.0 {
                 0.0f64.to_bits()
@@ -359,11 +383,11 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
                 value.to_bits()
             });
         }
-        Value::BigInt(value) => {
+        ValueView::BigInt(value) => {
             state.write_u8(5);
             value.hash(&mut state);
         }
-        Value::Str(value) => {
+        ValueView::Str(value) => {
             state.write_u8(6);
             value.hash(&mut state);
             // Fx's byte loop still leaves clustered low bits for fixed-width suffixes.
@@ -374,13 +398,13 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
             let hash = (hash ^ (hash >> 32)).wrapping_mul(0xd6e8_feb8_6659_fd93);
             return hash ^ (hash >> 32);
         }
-        Value::Sym(value) => {
+        ValueView::Sym(value) => {
             state.write_u8(7);
             state.write_u64(value.id);
         }
-        Value::Obj(value) => {
+        ValueView::Obj(value) => {
             state.write_u8(8);
-            state.write_usize(Rc::as_ptr(value) as usize);
+            state.write_usize(Gc::as_ptr(value) as usize);
         }
     }
     // The table masks the LOW hash bits to choose its initial bucket. Fx's
@@ -399,6 +423,56 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
     hash ^ (hash >> 31)
 }
 
+/// A held [[MapData]]/[[SetData]] (see [`Interp::collection`]).
+pub(crate) type CollectionRef<'a> = std::cell::Ref<'a, OrderedCollection>;
+/// A held, writable [[MapData]]/[[SetData]] (see [`Interp::collection_mut`]).
+pub(crate) type CollectionMut<'a> = std::cell::RefMut<'a, OrderedCollection>;
+
+impl crate::interpreter::Interp {
+    /// The [[MapData]]/[[SetData]] of `object` if it is a Map or Set. P1 S4: it lives in the
+    /// object's cell and is borrowed with the object, so hold it for one step and never across
+    /// JavaScript.
+    pub(crate) fn collection<'a>(&'a self, object: &'a Gc) -> Option<CollectionRef<'a>> {
+        std::cell::Ref::filter_map(object.borrow(), |object| match &object.exotic {
+            crate::value::Exotic::Collection(data) => Some(&**data),
+            _ => None,
+        })
+        .ok()
+    }
+
+    /// [`Interp::collection`], writable.
+    pub(crate) fn collection_mut<'a>(&'a mut self, object: &'a Gc) -> Option<CollectionMut<'a>> {
+        std::cell::RefMut::filter_map(object.borrow_mut(), |object| match &mut object.exotic {
+            crate::value::Exotic::Collection(data) => Some(&mut **data),
+            _ => None,
+        })
+        .ok()
+    }
+
+    /// Give a new Map or Set `object` its [[MapData]]/[[SetData]].
+    pub(crate) fn set_collection(&mut self, object: &Gc, data: OrderedCollection) {
+        object.borrow_mut().exotic =
+            crate::value::Exotic::Collection(crate::gc_storage::PayloadBox::new(data));
+    }
+
+    /// Move `from`'s [[MapData]]/[[SetData]], if it has one, to `to` (the subclass instance a
+    /// `super()` call made). Whether one moved.
+    pub(crate) fn move_collection(&mut self, from: &Gc, to: &Gc) -> bool {
+        // Taken in a statement of its own: `from`'s borrow ends before the match puts back a
+        // state that is not a collection.
+        let taken = std::mem::replace(&mut from.borrow_mut().exotic, crate::value::Exotic::None);
+        let moved = match taken {
+            crate::value::Exotic::Collection(data) => data,
+            other => {
+                from.borrow_mut().exotic = other;
+                return false;
+            }
+        };
+        to.borrow_mut().exotic = crate::value::Exotic::Collection(moved);
+        true
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static KEY_HASH_CALLS: Cell<usize> = const { Cell::new(0) };
@@ -415,13 +489,31 @@ impl From<Vec<(Value, Value)>> for OrderedCollection {
     }
 }
 
+impl crate::gc_trace::GcTrace for OrderedCollection {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            kind: _,
+            entries,
+            index: _,
+            live_len: _,
+            cursors: _, // positions only
+            charge: _,
+        } = self;
+        for (key, value) in entries.iter().flatten() {
+            sink.value(key);
+            sink.value(value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
 
     fn number(value: &Value) -> u32 {
-        match value {
-            Value::Num(value) => *value as u32,
+        match &(value).view() {
+            ValueView::Num(value) => *value as u32,
             _ => panic!("expected numeric model value"),
         }
     }
@@ -521,7 +613,7 @@ mod tests {
         }
         let object = Value::Obj(crate::value::Object::new(None));
         let different = Value::Obj(crate::value::Object::new(None));
-        data.insert(object.clone(), Value::Num(100.0));
+        data.insert(object, Value::Num(100.0));
         assert_eq!(number(data.get(&object).unwrap()), 100);
         assert!(!data.has(&different));
         // Tagging must preserve semantic distinctions even when payloads look
@@ -545,7 +637,7 @@ mod tests {
         let collision = Value::Num(f64::from_bits(0xbe60_db93_9105_4a88));
         assert_eq!(key_hash(&Value::Undefined), key_hash(&collision));
         data.insert(Value::Undefined, Value::Num(1.0));
-        data.insert(collision.clone(), Value::Num(2.0));
+        data.insert(collision, Value::Num(2.0));
         assert_eq!(data.len(), 2);
         assert_eq!(number(data.get(&collision).unwrap()), 2);
         assert!(data.delete(&Value::Undefined));
@@ -564,7 +656,7 @@ mod tests {
             .iter()
             .find(|(key, _)| same_key(key, &Value::Num(0.0)))
             .unwrap();
-        assert!(matches!(zero.0, Value::Num(n) if !n.is_sign_negative()));
+        assert!(matches!((zero.0).view(), ValueView::Num(n) if !n.is_sign_negative()));
     }
 
     #[test]
@@ -578,11 +670,14 @@ mod tests {
             assert_eq!(KEY_HASH_CALLS.with(Cell::get) - before, 1);
         };
         once(&mut || data.insert(Value::Undefined, Value::Num(1.0)));
-        once(&mut || data.insert(collision.clone(), Value::Num(2.0)));
+        once(&mut || data.insert(collision, Value::Num(2.0)));
         let cursor = data.cursor();
-        assert!(matches!(data.next(&cursor).unwrap().0, Value::Undefined));
+        assert!(matches!(
+            (data.next(&cursor).unwrap().0).view(),
+            ValueView::Undefined
+        ));
         // Updating a collision hit must neither append nor advance/rewind live cursors.
-        once(&mut || data.insert(collision.clone(), Value::Num(3.0)));
+        once(&mut || data.insert(collision, Value::Num(3.0)));
         once(&mut || data.insert(Value::Undefined, Value::Num(4.0)));
         assert_eq!(data.len(), 2);
         assert_eq!(number(&data.next(&cursor).unwrap().1), 3);
@@ -590,7 +685,10 @@ mod tests {
         once(&mut || assert!(data.delete(&Value::Undefined)));
         once(&mut || assert!(!data.delete(&Value::Undefined)));
         once(&mut || data.insert(Value::Undefined, Value::Num(5.0)));
-        assert!(matches!(data.next(&cursor).unwrap().0, Value::Undefined));
+        assert!(matches!(
+            (data.next(&cursor).unwrap().0).view(),
+            ValueView::Undefined
+        ));
         assert!(data.next(&cursor).is_none());
         // Collapse Many to One through the other key, then remove the final bucket.
         once(&mut || assert!(data.delete(&collision)));
@@ -601,42 +699,52 @@ mod tests {
         assert!(data.index.is_empty());
     }
 
+    /// Equal strings allocated separately are one key: the second insert hashes once and
+    /// replaces the first entry's value instead of adding a bucket.
     #[test]
-    fn ordered_collection_single_probe_preserves_key_and_releases_replaced_values() {
-        let key = crate::value::Object::new(None);
-        let first = crate::value::Object::new(None);
-        let second = crate::value::Object::new(None);
-        let first_weak = Rc::downgrade(&first);
-        let second_weak = Rc::downgrade(&second);
+    fn ordered_collection_equal_strings_share_an_entry_and_hash_once() {
         let mut data = OrderedCollection::new(CollectionKind::Map);
-        data.insert(Value::Obj(key.clone()), Value::Obj(first));
-        assert_eq!(Rc::strong_count(&key), 2);
-        data.insert(Value::Obj(key.clone()), Value::Obj(second));
-        assert_eq!(Rc::strong_count(&key), 2, "index never owns another key");
-        assert!(
-            first_weak.upgrade().is_none(),
-            "replaced payload drops once"
-        );
-        assert!(second_weak.upgrade().is_some());
-        assert_eq!(data.len(), 1);
-        assert!(data.delete(&Value::Obj(key.clone())));
-        assert_eq!(Rc::strong_count(&key), 1);
-        assert!(
-            second_weak.upgrade().is_none(),
-            "deleted payload drops once"
-        );
-
-        // Equal separately allocated strings hit the original entry, not a second bucket.
         let text = "wide string key ".repeat(128);
         let first_key = Value::lstr(text.clone());
         let another_key = Value::lstr(text);
         data.insert(first_key, Value::Num(7.0));
         let before = KEY_HASH_CALLS.with(Cell::get);
-        data.insert(another_key.clone(), Value::Num(8.0));
+        data.insert(another_key, Value::Num(8.0));
         assert_eq!(KEY_HASH_CALLS.with(Cell::get) - before, 1);
         assert_eq!(data.len(), 1);
         assert_eq!(number(data.get(&another_key).unwrap()), 8);
         assert!(data.delete(&another_key));
+    }
+
+    /// Map.prototype.set over a present key replaces its value in place, and delete removes the
+    /// entry (leaving a hole while other entries remain): neither the replaced nor the deleted
+    /// value, nor a deleted key, stays reachable from the Map, so a collection finds each dead
+    /// while the current entries live on.
+    #[test]
+    fn ordered_collection_replaced_and_deleted_values_are_released() {
+        let mut engine = crate::Engine::new();
+        let mut run = |source: &str| match engine.eval(source, false).expect("Map fixture parses") {
+            crate::Completion::Value(value) => value,
+            crate::Completion::Throw { name, message } => panic!("{name}: {message}"),
+        };
+        run("var key={}, other={}, map=new Map([[key,{}],[other,{}]]);\
+             var replaced=new WeakRef(map.get(key)); map.set(key,{});\
+             var current=new WeakRef(map.get(key)), keyRef=new WeakRef(key); key=null; 0");
+        assert_eq!(
+            run(
+                "$262.gc(); [replaced.deref()===undefined, current.deref()!==undefined,\
+                 keyRef.deref()!==undefined, map.size].join()"
+            ),
+            "true,true,true,2"
+        );
+        run("map.delete(keyRef.deref()); 0");
+        assert_eq!(
+            run(
+                "$262.gc(); [current.deref()===undefined, keyRef.deref()===undefined, map.size,\
+                 map.get(other)!==undefined].join()"
+            ),
+            "true,true,1,true"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ impl Write for Captured {
 fn finite_field_dh_matches_node_vector_and_modp14() {
     let mut rt = Runtime::new();
     let out = Captured::default();
-    rt.engine().ctx().op_state().put(ConsoleOut {
+    rt.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

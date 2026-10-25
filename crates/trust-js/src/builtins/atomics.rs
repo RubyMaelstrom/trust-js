@@ -2,12 +2,13 @@
 
 use super::*;
 use crate::interpreter::{AsyncWait, BlockedAgent, WaitOutcome, Waiter};
+use crate::value::ValueView;
 use std::time::Duration;
 
 /// `Atomics` over integer TypedArrays. A shared buffer's read-modify-write operations hold its
 /// Shared Data Block's lock; `wait`/`waitAsync`/`notify` use the process-wide WaiterLists.
 pub(super) fn install_atomics(it: &mut Interp) {
-    let atomics = Object::new(Some(it.object_proto.clone()));
+    let atomics = Object::new(Some(it.object_proto));
 
     fn target(i: &mut Interp, args: &[Value]) -> Result<(TaInfo, usize), Value> {
         target_rw(i, args, false)
@@ -254,16 +255,22 @@ pub(super) fn install_atomics(it: &mut Interp) {
         require_waitable(i, &arg(a, 0))?;
         let (info, idx) = target(i, a)?;
         // count = ToIntegerOrInfinity(arg2), default +Infinity (= all); negative clamps to 0.
-        let count: i64 = match arg(a, 2) {
-            Value::Undefined => -1,
-            v => {
-                let n = ab(i.to_number(&v))?;
-                if n.is_nan() || n < 0.0 {
-                    0
-                } else if n == f64::INFINITY {
-                    -1
-                } else {
-                    n as i64
+        let count: i64 = {
+            let __value_match_original = arg(a, 2);
+            match (__value_match_original).view() {
+                ValueView::Undefined => -1,
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let n = ab(i.to_number(&v))?;
+                        if n.is_nan() || n < 0.0 {
+                            0
+                        } else if n == f64::INFINITY {
+                            -1
+                        } else {
+                            n as i64
+                        }
+                    }
                 }
             }
         };
@@ -271,7 +278,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         match i.shared_block_id(info.buffer) {
             Some(id) => {
                 let byte_index = info.offset + idx * info.kind.elsize();
-                let own = i.async_wait_inbox.clone();
+                let own = i.gc_heap.agent.work.borrow().inbox.clone();
                 let (woken, own_tokens) =
                     crate::interpreter::futex_notify(id, byte_index, count, own.as_ref());
                 // NotifyWaiter resolves this agent's own waitAsync promises at once.
@@ -302,10 +309,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         // A value that already differs, or a zero timeout, resolves synchronously (not async).
         let byte_index = info.offset + idx * info.kind.elsize();
         let token = crate::interpreter::next_async_wait_token();
-        let inbox = i
-            .async_wait_inbox
-            .get_or_insert_with(Default::default)
-            .clone();
+        let inbox = i.agent_async_inbox();
         let waiter = (timeout != Some(Duration::ZERO)).then_some(Waiter::Async(inbox, token));
         if let Err(value) = enqueue_waiter(&info, byte_index, id, expected, waiter) {
             set_data(&result, "async", Value::Bool(false));
@@ -317,8 +321,8 @@ pub(super) fn install_atomics(it: &mut Interp) {
         // agent's inbox), or this agent's job checkpoints time it out (settle_async_waits).
         let promise = i.new_promise();
         let block = i.shared_block(info.buffer).unwrap().clone();
-        i.pending_async_waits.push(AsyncWait {
-            promise: promise.clone(),
+        i.enqueue_async_wait(AsyncWait {
+            promise,
             token,
             id,
             block,
@@ -332,9 +336,9 @@ pub(super) fn install_atomics(it: &mut Interp) {
     });
     it.def_method(&atomics, "pause", 0, |i, _t, a| {
         // The optional iterationNumber, if present, must be an integral Number.
-        match arg(a, 0) {
-            Value::Undefined => {}
-            Value::Num(n) if n.fract() == 0.0 && n.is_finite() => {}
+        match (arg(a, 0)).view() {
+            ValueView::Undefined => {}
+            ValueView::Num(n) if n.fract() == 0.0 && n.is_finite() => {}
             _ => {
                 return Err(i.make_error(
                     "TypeError",

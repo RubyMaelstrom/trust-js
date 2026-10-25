@@ -5,8 +5,10 @@ use super::*;
 use crate::ast::{Function, Stmt};
 use crate::bytecode::{self, Tier};
 use crate::interpreter::{new_scope, Binding};
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 use std::cell::Cell;
+use std::rc::Rc;
 
 fn eval(engine: &mut Engine, source: &str) -> String {
     match engine
@@ -38,19 +40,11 @@ fn first_plan(chunk: &Chunk) -> Plan {
 }
 
 fn binding(value: Value) -> Binding {
-    Binding {
-        value,
-        mutable: true,
-        initialized: true,
-        import_ref: None,
-        imported: false,
-        deletable: false,
-        strict_immutable: false,
-    }
+    Binding::data(value, true, true)
 }
 
 fn scope(engine: &Engine, value: Value) -> Env {
-    let env = new_scope(Some(engine.interp.global_env.clone()));
+    let env = new_scope(Some(engine.interp.global_env));
     env.borrow_mut()
         .vars
         .insert("result".to_owned(), binding(value));
@@ -58,7 +52,7 @@ fn scope(engine: &Engine, value: Value) -> Env {
 }
 
 fn result(env: &Env) -> Value {
-    env.borrow().vars.get("result").unwrap().value.clone()
+    env.borrow().vars.get("result").unwrap().value()
 }
 
 #[test]
@@ -68,7 +62,7 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
     let plan = first_plan(&chunk);
     let root = crate::lstr::LStr::from("x".repeat(1024));
     let view = root.slice_bytes(0, 900);
-    let alias = view.clone();
+    let alias = view;
     let env = scope(&engine, Value::Str(view));
     let stored = try_store(&chunk, &mut engine.interp, &env, plan, Value::lstr("!"))
         .expect("ordinary view-backed holder");
@@ -79,7 +73,7 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
     assert_eq!(alias.as_str(), "x".repeat(900));
     assert_eq!(root.as_str(), "x".repeat(1024));
     let old = result(&env);
-    let twice = try_store(&chunk, &mut engine.interp, &env, plan, old.clone()).unwrap();
+    let twice = try_store(&chunk, &mut engine.interp, &env, plan, old).unwrap();
     assert_eq!(
         twice.result.unwrap().as_engine_text().unwrap(),
         format!("{0}!{0}!", "x".repeat(900))
@@ -88,7 +82,11 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
         old.as_engine_text().unwrap(),
         format!("{}!", "x".repeat(900))
     );
-    env.borrow_mut().vars.get_mut("result").unwrap().value = Value::from_utf16(&[0xd834]);
+    env.borrow_mut()
+        .vars
+        .get_mut("result")
+        .unwrap()
+        .set_value(Value::from_utf16(&[0xd834]));
     let joined = try_store(
         &chunk,
         &mut engine.interp,
@@ -119,15 +117,15 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
                 .vars
                 .get_mut("result")
                 .unwrap()
-                .set_import_reference(Some((engine.interp.global_env.clone(), "exported".into()))),
-            4 => env.borrow_mut().with_obj = Some(Value::Null),
+                .set_import_reference(Some((engine.interp.global_env, "exported".into()))),
+            4 => env.borrow_mut().set_with_object(Some(Value::Null)),
             5 => {
                 env.borrow_mut().vars.remove("result");
             }
             6 => env.borrow_mut().parent = None,
             _ => unreachable!(),
         }
-        let old = env.borrow().vars.get("result").map(|b| b.value.clone());
+        let old = env.borrow().vars.get("result").map(|b| b.value());
         assert!(
             try_store(
                 &chunk,
@@ -154,7 +152,7 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
         assert!(try_store(&chunk, &mut engine.interp, &env, plan, right).is_none());
         assert_eq!(result(&env).as_engine_text().unwrap(), "prefix");
     }
-    let mut deep = env.clone();
+    let mut deep = env;
     for _ in 0..MAX_SCOPES {
         deep = new_scope(Some(deep));
     }
@@ -249,10 +247,11 @@ const REACT_CALLBACK: &str = r#"
 
 fn prepare_callback(engine: &mut Engine) -> Rc<Chunk> {
     eval(engine, REACT_CALLBACK);
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine.interp.get_var("push", &env).ok().unwrap();
     let function = {
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("callback")
         };
@@ -269,7 +268,7 @@ fn prepare_callback(engine: &mut Engine) -> Rc<Chunk> {
     assert_eq!(chunk.ops.len(), 15);
     chunk.inline_attempted.set(true);
     chunk.inline_retry_at.set(0);
-    assert!(function.code.set(Some(chunk.clone())).is_ok());
+    assert!(function.runtime().code.set(Some(chunk.clone())).is_ok());
     chunk
 }
 
@@ -452,9 +451,10 @@ fn shared_snapshot_native_code_uses_each_realms_live_declarative_holder() {
         .unwrap()
     });
     fn append_function(i: &mut Interp) -> Rc<Function> {
-        let env = i.global_env.clone();
+        let env = i.global_env;
         let value = i.get_var("appendPart", &env).ok().unwrap();
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("shared function")
         };
@@ -510,7 +510,7 @@ fn length_denial_preserves_binding_and_throws_at_original_add() {
     let mut state = bytecode::VmCoro::new(
         &mut engine.interp,
         chunk.clone(),
-        holder.clone(),
+        holder,
         Value::Undefined,
         &[Value::lstr("xx")],
         &[],
@@ -561,9 +561,7 @@ fn prefix(engine: &mut Engine, state: &mut bytecode::VmCoro, stop: usize) {
             Some(stop),
             None
         ),
-        Ok(bytecode::VmRunExit::Step(bytecode::VmStep::Done(
-            Value::Undefined
-        )))
+        Ok(bytecode::VmRunExit::Step(bytecode::VmStep::Done(value))) if matches!(value.view(), ValueView::Undefined)
     ));
     assert_eq!(state.pc, stop);
 }
@@ -578,7 +576,7 @@ fn continuation(engine: &mut Engine) -> (bytecode::VmCoro, Env, Plan) {
     let state = bytecode::VmCoro::new_generator(
         &mut engine.interp,
         chunk,
-        holder.clone(),
+        holder,
         Value::Undefined,
         &[Value::lstr("B")],
         &[],
@@ -627,19 +625,18 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
     let mut chunk =
         bytecode::compile(&function("function* subject(part){yield result+=part;}")).unwrap();
     let original = first_plan(&chunk);
-    {
+    chunk = Chunk::rewrite_owned_for_test(chunk, |chunk| {
         // Undef supplies the following Yield's independently specified value.
-        let chunk = Rc::get_mut(&mut chunk).unwrap();
         chunk.ops[original.pc + 3] = chunk.ops[original.pc + 4];
         chunk.ops[original.pc + 4] = Op::Undef;
-    }
+    });
     let plan = first_plan(&chunk);
     assert!(!plan.keep);
     let holder = scope(&engine, Value::lstr("A"));
     let mut state = bytecode::VmCoro::new_generator(
         &mut engine.interp,
         chunk,
-        holder.clone(),
+        holder,
         Value::Undefined,
         &[Value::lstr("B")],
         &[],
@@ -654,7 +651,12 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
     {
         let chunk = state.chunk.clone();
         state.pc = plan.pc;
-        holder.borrow_mut().vars.get_mut("result").unwrap().value = Value::lstr("C");
+        holder
+            .borrow_mut()
+            .vars
+            .get_mut("result")
+            .unwrap()
+            .set_value(Value::lstr("C"));
         let code = crate::jit::continuation_code(&mut engine.interp, &chunk).unwrap();
         let hits = TEST_NATIVE_HITS.with(Cell::get);
         let mut native = bytecode::NativeContinuation {
@@ -679,7 +681,9 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
             )
         }
         .unwrap_or_else(|_| panic!("native continuation must complete without error"));
-        assert!(matches!(step, bytecode::VmStep::Yield(Value::Undefined)));
+        assert!(
+            matches!(step, bytecode::VmStep::Yield(value) if matches!(value.view(), ValueView::Undefined))
+        );
         assert_eq!(TEST_NATIVE_HITS.with(Cell::get), hits + 1);
         assert_eq!(result(&holder).as_engine_text().unwrap(), "CB");
     }
@@ -721,7 +725,7 @@ fn borrowed_native_every_original_interior_resumes_without_replaying_the_prefix(
         }
         .unwrap_or_else(|_| panic!("native continuation must complete without error"));
         assert!(
-            matches!(step,bytecode::VmStep::Yield(Value::Str(ref value)) if value.as_str()=="AB")
+            matches!(step,bytecode::VmStep::Yield(value) if value.as_engine_text()==Some("AB"))
         );
         assert_eq!(result(&holder).as_engine_text().unwrap(), "AB");
         assert_eq!(
@@ -789,7 +793,7 @@ fn borrowed_native_preentry_interrupt_leaves_binding_then_commits_before_yield()
         )
     }
     .unwrap_or_else(|_| panic!("native continuation must complete without error"));
-    assert!(matches!(step,bytecode::VmStep::Yield(Value::Str(ref value)) if value.as_str()=="AB"));
+    assert!(matches!(step,bytecode::VmStep::Yield(value) if value.as_engine_text()==Some("AB")));
     assert_eq!(TEST_NATIVE_HITS.with(Cell::get), hits + 1);
     assert_eq!(result(&holder).as_engine_text().unwrap(), "AB");
 }

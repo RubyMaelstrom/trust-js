@@ -2,6 +2,7 @@
 //! changing a predicate must preserve the live callee/Realm and safe fallback.
 use super::*;
 use crate::bytecode::{CallIc, CallOverflow, Tier, CALL_IC_EPOCH, CALL_IC_WAYS};
+use crate::value::ValueView;
 use crate::value::{Callable, Object};
 use std::cell::Cell;
 use std::mem::{offset_of, size_of};
@@ -91,17 +92,19 @@ fn caller_chunk(engine: &mut crate::Engine) -> Rc<Chunk> {
         ),
         Ok(crate::Completion::Value(_))
     ));
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine
         .interp
         .get_var("epochCaller", &env)
         .ok()
         .expect("caller");
-    let object = value.as_obj().expect("function").borrow();
+    let function_handle = value.as_obj().expect("function");
+    let object = function_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("user function")
     };
     user.func
+        .runtime()
         .code
         .get()
         .and_then(Option::as_ref)
@@ -186,8 +189,8 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     let cells =
         unsafe { &*(chunk.jit_call_cache_ptr(cache) as *const [Cell<CallIc>; CALL_IC_WAYS]) };
     let object = Object::new(None);
-    let key = Rc::as_ptr(&object) as usize;
-    let realm = Rc::as_ptr(&engine.interp.global_env) as usize;
+    let key = crate::value::Gc::as_ptr(&object) as usize;
+    let realm = Env::as_ptr(&engine.interp.global_env) as usize;
     let mut context = ProbeContext([0; size_of::<JitCtx>().div_ceil(size_of::<usize>())]);
     context.0[offset_of!(JitCtx, interp) / size_of::<usize>()] =
         &mut *engine.interp as *mut _ as usize;
@@ -197,9 +200,9 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     let mut helpers = [0usize; N_HELPERS];
     helpers[H_CALL] = slow.as_ptr() as usize;
     helpers[H_CALL_HIT] = hit.as_ptr() as usize;
-    let mut operand = [PackedValue::pack(Value::Obj(object.clone()))];
+    let mut operand = [(Value::Obj(object))];
     let top = unsafe { operand.as_mut_ptr().add(1) };
-    let run: unsafe extern "C" fn(*mut usize, *mut PackedValue, *const usize) -> *mut PackedValue =
+    let run: unsafe extern "C" fn(*mut usize, *mut Value, *const usize) -> *mut Value =
         unsafe { std::mem::transmute(code.as_ptr()) };
     let invoke = |context: &mut ProbeContext| {
         context.0[0] = 0;
@@ -220,10 +223,10 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
         cells[0].set(CallIc { epoch, ..seed });
         assert_eq!(invoke(&mut context), (2, 0), "real primary hit at {epoch}");
         cells[0].set(CallIc::EMPTY);
-        engine
-            .interp
-            .call_overflow
-            .insert(CallIc { epoch, ..seed }, Rc::downgrade(&object));
+        engine.interp.call_overflow.insert(
+            CallIc { epoch, ..seed },
+            crate::value::Gc::downgrade(&object),
+        );
         // A non-direct overflow hit intentionally re-probes in H_CALL, with way=4.
         assert_eq!(
             invoke(&mut context),
@@ -280,9 +283,12 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
             .is_none());
     }
     engine.interp.call_overflow.raw_sets = original_sets;
-    assert_eq!(
-        Rc::strong_count(&object),
-        2,
-        "the probe must not consume the callee owner"
+    // Owners carry no count: the probe leaves the callee's operand word and cell
+    // intact, which a collection (and, in debug builds, its heap verifier) confirms.
+    assert!(
+        matches!(&(operand[0].clone()).view(), ValueView::Obj(o) if crate::value::Gc::ptr_eq(o, &object)),
+        "the probe must not consume the callee operand"
     );
+    engine.interp.gc_collect();
+    assert!(object.try_borrow_mut().is_ok(), "the callee cell is intact");
 }

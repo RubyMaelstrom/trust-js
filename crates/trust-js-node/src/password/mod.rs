@@ -895,19 +895,24 @@ pub(crate) const PASSWORD_OPS: &[OpDecl] = ops![
     "argon2" (11) => op_argon2_async,
 ];
 
-fn arg_bytes(ctx: &mut Ctx, args: &[Value], i: usize, who: &str) -> Result<Vec<u8>, Value> {
+fn arg_bytes<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    i: usize,
+    who: &str,
+) -> Result<Vec<u8>, Value<'s>> {
     ctx.typed_array_bytes(args.get(i).unwrap_or(&Value::Undefined))
         .ok_or_else(|| ctx.make_error("TypeError", format!("{who} expects Buffer bytes")))
 }
 
-fn arg_str(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<String, Value> {
+fn arg_str<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>], i: usize) -> Result<String, Value<'s>> {
     Ok(ctx
         .coerce_string(args.get(i).unwrap_or(&Value::Undefined))?
         .to_string())
 }
 
 /// Saturating f64 → u32 (the glue has already validated sign/type per Bun's messages).
-fn arg_u32(args: &[Value], i: usize) -> u32 {
+fn arg_u32<'s>(args: &[Value<'s>], i: usize) -> u32 {
     let n = args.get(i).and_then(|v| v.as_num_opt()).unwrap_or(0.0);
     if n.is_nan() {
         0
@@ -917,30 +922,36 @@ fn arg_u32(args: &[Value], i: usize) -> u32 {
 }
 
 /// The trailing `(resolve, reject)` pair the glue passes; anything else is a glue bug.
-fn settle_args(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn settle_args<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     i: usize,
     who: &str,
-) -> Result<(Value, Value), Value> {
+) -> Result<(Value<'s>, Value<'s>), Value<'s>> {
     match (args.get(i), args.get(i + 1)) {
-        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
-            Ok((res.clone(), rej.clone()))
-        }
+        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => Ok((*res, *rej)),
         _ => Err(ctx.make_error("TypeError", format!("{who} expects (resolve, reject)"))),
     }
 }
 
-fn op_hash_sync(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_hash_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let pw = arg_bytes(ctx, a, 0, "__password.hashSync")?;
     let alg = arg_str(ctx, a, 1)?;
     match hash_password(&pw, &alg, arg_u32(a, 2), arg_u32(a, 3), arg_u32(a, 4)) {
-        Ok(s) => Ok(Value::from_string(s)),
+        Ok(s) => Ok(ctx.string(s)),
         Err(e) => Err(ctx.make_error("Error", e)),
     }
 }
 
-fn op_verify_sync(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_verify_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let pw = arg_bytes(ctx, a, 0, "__password.verifySync")?;
     let hash = arg_str(ctx, a, 1)?;
     match verify_password(&pw, &hash) {
@@ -949,39 +960,41 @@ fn op_verify_sync(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value>
     }
 }
 
-fn op_hash_async(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_hash_async<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let pw = arg_bytes(ctx, a, 0, "__password.hash")?;
     let alg = arg_str(ctx, a, 1)?;
     let (m, t, cost) = (arg_u32(a, 2), arg_u32(a, 3), arg_u32(a, 4));
     let (resolve, reject) = settle_args(ctx, a, 5, "__password.hash")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_hash);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_hash)?;
     crate::spawn_handle(ctx)
         .spawn_blocking(id, move || Box::new(hash_password(&pw, &alg, m, t, cost)));
     Ok(Value::Undefined)
 }
 
-fn op_verify_async(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_verify_async<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let pw = arg_bytes(ctx, a, 0, "__password.verify")?;
     let hash = arg_str(ctx, a, 1)?;
     let (resolve, reject) = settle_args(ctx, a, 2, "__password.verify")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_verify);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_verify)?;
     crate::spawn_handle(ctx).spawn_blocking(id, move || {
         Box::new(verify_password(&pw, &hash).map_err(|e| e.message().to_string()))
     });
     Ok(Value::Undefined)
 }
 
-fn argon2_args(
-    ctx: &mut Ctx,
-    a: &[Value],
+fn argon2_args<'s>(
+    ctx: &mut Ctx<'s>,
+    a: &[Value<'s>],
     who: &str,
-) -> Result<(Vec<u8>, Vec<u8>, Argon2Params), Value> {
+) -> Result<(Vec<u8>, Vec<u8>, Argon2Params), Value<'s>> {
     let variant = Argon2Variant::from_phc(&arg_str(ctx, a, 0)?)
         .ok_or_else(|| ctx.make_error("TypeError", format!("{who}: invalid Argon2 algorithm")))?;
     let message = arg_bytes(ctx, a, 1, who)?;
@@ -999,45 +1012,53 @@ fn argon2_args(
     Ok((message, nonce, params))
 }
 
-fn op_argon2_sync(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_argon2_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (message, nonce, params) = argon2_args(ctx, a, "crypto.argon2Sync")?;
     ctx.make_uint8array(&argon2_hash(&message, &nonce, &params))
 }
 
-fn op_argon2_async(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_argon2_async<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (message, nonce, params) = argon2_args(ctx, a, "crypto.argon2")?;
     let (resolve, reject) = settle_args(ctx, a, 9, "crypto.argon2")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_argon2);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_argon2)?;
     crate::spawn_handle(ctx)
         .spawn_blocking(id, move || Box::new(argon2_hash(&message, &nonce, &params)));
     Ok(Value::Undefined)
 }
 
-fn decode_argon2(
-    ctx: &mut Ctx,
+fn decode_argon2<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let bytes = *payload.downcast::<Vec<u8>>().expect("argon2 payload");
     Ok(vec![ctx.make_uint8array(&bytes)?])
 }
 
-fn decode_hash(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_hash<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<String, String>>()
         .expect("hash payload")
     {
-        Ok(s) => Ok(vec![Value::from_string(s)]),
+        Ok(s) => Ok(vec![ctx.string(s)]),
         Err(m) => Err(ctx.make_error("Error", m)),
     }
 }
 
-fn decode_verify(
-    ctx: &mut Ctx,
+fn decode_verify<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<bool, String>>()
         .expect("verify payload")

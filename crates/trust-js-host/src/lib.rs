@@ -13,6 +13,12 @@
 //! - [`CallbackQueue`]: loop-thread-local queue of JS callbacks to fire on the next turn
 //!   (JS values are `!Send`, so they never cross threads; off-thread work refers to its
 //!   callback by [`TaskId`]).
+//!
+//! JavaScript values live in scopes (S6 step 11b): a native function's values, `Value<'s>`, are
+//! its call's, and an engine-level operation's are those of an [`Engine::scope`]. Host state
+//! keeps the values it stores past their scope in [`Handle`]s (rooted handles): a value lives
+//! while a handle to it does, wherever the handle is stored, so `OpState` slots need no
+//! tracing. [`handle`] makes one from a native function's arguments.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -54,13 +60,15 @@ fn install_task_panic_hook() {
     });
 }
 
-pub use trust_js::bytecode::Tier;
 pub use trust_js::embed::{
-    ArrayBufferBytes, Ctx, EvalError, HostRetainedMemoryVisitor, NativeCallableRetained,
-    NativeClosure, NativeFn, NativeRetainedMemoryVisitor, OpState, ResourceId, ResourceTable,
-    RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory, RetainedManagedAllocation,
-    RetainedMemory, Value, WeakValue,
+    ArrayBufferBytes, BigInt, CountedHandle, Ctx, EvalError, Handle, HandleError, HostGc,
+    HostGcVisitor, HostRetainedMemoryVisitor, HostTrace, JsString, NativeCallableRetained,
+    NativeCaptureFn, NativeCaptures, NativeFn, NativeGcId, NativeRetainedMemoryVisitor, Object,
+    OpState, ResourceId, ResourceTable, RetainedBytes, RetainedExternalAllocation,
+    RetainedExternalMemory, RetainedManagedAllocation, RetainedMemory, Symbol, Value, ValueKind,
+    ValueList, WeakHandle,
 };
+pub use trust_js::Tier;
 pub use trust_js::{
     Completion, Engine, ExecutionOutcome, InterruptReason, ParseError, RuntimeInterrupt,
 };
@@ -73,6 +81,31 @@ pub mod brotli;
 
 /// Zstandard (RFC 8878) codec (std-only), for node:zlib zstd* and Bun.zstd* APIs.
 pub mod zstd;
+
+/// A [`Handle`] on `value` in `ctx`'s heap, for host state that keeps it. A native function's
+/// arguments are its heap's values, and no collection runs while it does, so this fails only
+/// on misuse (a value of another Engine), with a thrown `TypeError`.
+pub fn handle<'s>(ctx: &mut Ctx<'s>, value: &Value<'s>) -> Result<Handle, Value<'s>> {
+    Handle::new(ctx, value).map_err(|error| ctx.make_error("TypeError", error.to_string()))
+}
+
+/// [`handle`] for each of `values`.
+pub fn handles<'s>(ctx: &mut Ctx<'s>, values: &[Value<'s>]) -> Result<Vec<Handle>, Value<'s>> {
+    values.iter().map(|value| handle(ctx, value)).collect()
+}
+
+/// The value of `handle`, which host state of `ctx`'s Engine keeps: made by [`handle`] in the
+/// same heap, which lives as long as the state does, so it always reads.
+pub fn value<'s>(ctx: &Ctx<'s>, handle: &Handle) -> Value<'s> {
+    handle
+        .get(ctx)
+        .expect("host state reads its handles through its own Engine")
+}
+
+/// [`value`] for each of `handles`.
+pub fn values<'s>(ctx: &Ctx<'s>, handles: &[Handle]) -> Vec<Value<'s>> {
+    handles.iter().map(|handle| value(ctx, handle)).collect()
+}
 
 /// One native op: a named native function with its JS arity.
 #[derive(Clone, Copy)]
@@ -132,7 +165,7 @@ impl Extension {
 pub fn install(engine: &mut Engine, extensions: &[Extension]) {
     for ext in extensions {
         if let Some(init) = ext.state_init {
-            init(engine.ctx().op_state());
+            init(engine.op_state());
         }
         for op in ext.globals {
             engine.define_global(op.name, op.len, op.f);
@@ -191,15 +224,23 @@ impl TaskFailure {
 }
 
 /// JS callbacks queued (on the loop thread) to run on the next loop turn — the
-/// `enqueue_callback` primitive. Lives in [`OpState`]; the runtime drains it each turn.
+/// `enqueue_callback` primitive. Lives in [`OpState`]; the runtime drains it each turn. Each
+/// callback and argument is held by a handle until it runs.
 #[derive(Default)]
 pub struct CallbackQueue {
-    pub queue: VecDeque<(Value, Vec<Value>)>,
+    pub queue: VecDeque<(Handle, Vec<Handle>)>,
 }
 
 impl CallbackQueue {
     /// Queue `callback(args...)` for the next loop turn.
-    pub fn enqueue(state: &mut OpState, callback: Value, args: Vec<Value>) {
+    pub fn enqueue<'s>(
+        ctx: &mut Ctx<'s>,
+        callback: &Value<'s>,
+        args: &[Value<'s>],
+    ) -> Result<(), Value<'s>> {
+        let callback = handle(ctx, callback)?;
+        let args = handles(ctx, args)?;
+        let state = ctx.op_state();
         if !state.has::<CallbackQueue>() {
             state.put(CallbackQueue::default());
         }
@@ -208,6 +249,7 @@ impl CallbackQueue {
             .expect("just installed")
             .queue
             .push_back((callback, args));
+        Ok(())
     }
 }
 
@@ -574,12 +616,15 @@ impl CompletionSender {
 }
 
 /// Turns a completed task's `Send` payload back into JS callback arguments, on the loop
-/// thread. `Err` is a JS value to report as an uncaught exception (later: a rejection).
-pub type TaskDecoder = fn(&mut Ctx, Box<dyn Any + Send>) -> Result<Vec<Value>, Value>;
+/// thread, in the scope of the callback's call. `Err` is a JS value to report as an uncaught
+/// exception (later: a rejection).
+pub type TaskDecoder =
+    for<'s> fn(&mut Ctx<'s>, Box<dyn Any + Send>) -> Result<Vec<Value<'s>>, Value<'s>>;
 
 /// In-flight async tasks: `TaskId -> (JS callback, payload decoder)`. Lives in [`OpState`];
 /// the op that spawns work registers here, the loop settles from [`TaskCompletion`]s. The
-/// event loop stays alive while this is non-empty.
+/// event loop stays alive while this is non-empty. An in-flight task's settlement callbacks
+/// are held by handles until it settles.
 pub struct TaskRegistry {
     next: TaskId,
     map: std::collections::HashMap<TaskId, TaskEntry>,
@@ -596,8 +641,8 @@ impl Default for TaskRegistry {
 /// reject — when absent, a decode error is reported as an uncaught exception), and the
 /// payload decoder.
 pub struct TaskEntry {
-    pub on_ok: Value,
-    pub on_err: Option<Value>,
+    pub on_ok: Handle,
+    pub on_err: Option<Handle>,
     pub decode: TaskDecoder,
     /// An `unref`'d task still settles when it completes, but does not by itself keep the event
     /// loop alive (Node's `child.unref()` — e.g. esbuild's persistent service child).
@@ -614,7 +659,12 @@ impl TaskRegistry {
     }
 
     /// Reserve an id for work about to be spawned, remembering how to settle it.
-    pub fn register(&mut self, on_ok: Value, on_err: Option<Value>, decode: TaskDecoder) -> TaskId {
+    pub fn register(
+        &mut self,
+        on_ok: Handle,
+        on_err: Option<Handle>,
+        decode: TaskDecoder,
+    ) -> TaskId {
         let id = self.next;
         self.next += 1;
         self.map.insert(
@@ -627,6 +677,21 @@ impl TaskRegistry {
             },
         );
         id
+    }
+    /// [`TaskRegistry::register`] in `ctx`'s registry, holding the callbacks `on_ok` and
+    /// `on_err` (a native function's arguments) in handles.
+    pub fn register_callbacks<'s>(
+        ctx: &mut Ctx<'s>,
+        on_ok: &Value<'s>,
+        on_err: Option<&Value<'s>>,
+        decode: TaskDecoder,
+    ) -> Result<TaskId, Value<'s>> {
+        let on_ok = handle(ctx, on_ok)?;
+        let on_err = on_err.map(|on_err| handle(ctx, on_err)).transpose()?;
+        Ok(ctx
+            .host_mut::<TaskRegistry>()
+            .expect("the runtime installs the task registry")
+            .register(on_ok, on_err, decode))
     }
     /// Claim a completed task's settlement entry (a missing id means it was cancelled).
     pub fn take(&mut self, id: TaskId) -> Option<TaskEntry> {

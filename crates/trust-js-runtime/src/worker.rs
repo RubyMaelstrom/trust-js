@@ -30,9 +30,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{
-    ops, CompletionSender, Ctx, Extension, RuntimeInterrupt, TaskId, TaskRegistry, Value,
+    ops, CompletionSender, Ctx, Extension, Handle, RuntimeInterrupt, TaskId, TaskRegistry, Value,
 };
 
 use crate::Runtime;
@@ -65,7 +66,8 @@ pub(crate) struct WorkerRegistry {
 struct WorkerEntry {
     /// `None` once terminated (dropping the sender unblocks the worker's inbox receive).
     to_worker: Option<Sender<ToWorker>>,
-    dispatch: Value,
+    /// The main-side dispatch function, held while the worker is registered.
+    dispatch: Handle,
     stop: Arc<AtomicBool>,
     interrupt: Arc<RuntimeInterrupt>,
     /// Set only by parent-side `terminate()`. Worker-side `close()` shares `stop`, but messages
@@ -88,7 +90,7 @@ impl Drop for WorkerRegistry {
     }
 }
 
-fn registry(ctx: &mut Ctx) -> &mut WorkerRegistry {
+fn registry<'a>(ctx: &'a mut Ctx<'_>) -> &'a mut WorkerRegistry {
     ctx.host_mut::<WorkerRegistry>()
         .expect("worker registry installed")
 }
@@ -122,19 +124,30 @@ struct WorkerSpec {
 /// thread and arms the worker→main inbox. `dispatch(kind, ...)` receives `("online")`,
 /// `("message", u8array)`, `("error", string)`, or `("exit", code)`. `opts` (node mode):
 /// `{ node: true, eval: bool, init: Uint8Array }`.
-pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_worker_spawn<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let entry = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
-    let is_module = matches!(args.get(1), Some(Value::Bool(true)));
+    let is_module = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
+        Some(v) if v.is_callable() => trust_js_host::handle(ctx, v)?,
         _ => return Err(ctx.make_error("TypeError", "spawn: dispatch must be a function")),
     };
     let opts = args.get(3).cloned().unwrap_or(Value::Undefined);
     let has_opts = opts.as_obj().is_some();
-    let opt_bool = |ctx: &mut Ctx, name: &str| -> bool {
-        has_opts && matches!(ctx.get_member(&opts, name), Ok(Value::Bool(true)))
+    let opt_bool = |ctx: &mut Ctx<'s>, name: &str| -> bool {
+        has_opts
+            && matches!(
+                (ctx.get_member(&opts, name)).map(|__value| (__value).kind()),
+                Ok(ValueKind::Bool(true))
+            )
     };
     let is_node = opt_bool(ctx, "node");
     let is_eval = opt_bool(ctx, "eval");
@@ -194,9 +207,13 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
 }
 
 /// `__worker.post(id, u8array)` — enqueue an already-serialized message for the worker.
-pub(crate) fn op_worker_post(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
+pub(crate) fn op_worker_post<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) => n as u64,
         _ => return Err(ctx.make_error("TypeError", "post: bad worker id")),
     };
     let bytes = ctx
@@ -213,13 +230,13 @@ pub(crate) fn op_worker_post(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result
 /// `__worker.terminate(id)` — set the shared stop flag and drop the worker's inbox sender (so a
 /// blocked receive unblocks). The worker loop exits at its next poll and posts `Exited`, which is
 /// still delivered (the registry entry lives until then) so `'exit'` fires with the code.
-pub(crate) fn op_worker_terminate(
-    ctx: &mut Ctx,
-    _t: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
+pub(crate) fn op_worker_terminate<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) => n as u64,
         _ => return Err(ctx.make_error("TypeError", "terminate: bad worker id")),
     };
     if let Some(w) = registry(ctx).workers.get_mut(&id) {
@@ -233,12 +250,19 @@ pub(crate) fn op_worker_terminate(
 
 /// `__worker.setRef(id, keep)` — `worker.ref()/unref()`: whether this worker's inbox keeps the
 /// main loop alive. Applies to the in-flight inbox task and every re-arm after it.
-pub(crate) fn op_worker_set_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
+pub(crate) fn op_worker_set_ref<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) => n as u64,
         _ => return Err(ctx.make_error("TypeError", "setRef: bad worker id")),
     };
-    let keep = matches!(args.get(1), Some(Value::Bool(true)));
+    let keep = matches!(
+        (args.get(1)).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let task = match registry(ctx).workers.get_mut(&id) {
         Some(w) => {
             w.keep_alive = keep;
@@ -256,7 +280,7 @@ pub(crate) fn op_worker_set_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Res
     Ok(Value::Undefined)
 }
 
-fn arm_main_inbox(ctx: &mut Ctx, inbox: MainInbox) {
+fn arm_main_inbox<'s>(ctx: &mut Ctx<'s>, inbox: MainInbox) {
     let id = inbox.id;
     let (dispatch, keep_alive) = match registry(ctx).workers.get(&id) {
         Some(w) => (w.dispatch.clone(), w.keep_alive),
@@ -288,10 +312,10 @@ fn arm_main_inbox(ctx: &mut Ctx, inbox: MainInbox) {
     });
 }
 
-fn decode_main_inbox(
-    ctx: &mut Ctx,
+fn decode_main_inbox<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let MainInboxResult { id, event, inbox } = *payload
         .downcast::<MainInboxResult>()
         .expect("main inbox payload");
@@ -305,24 +329,18 @@ fn decode_main_inbox(
     if terminated_by_parent && !matches!(&event, ToMain::Exited(_)) {
         // Termination discards worker-originated tasks which were queued but not yet dispatched.
         // Keep draining the channel until Exited removes the registry entry, but expose no event.
-        return Ok(vec![Value::from_string("discard".into())]);
+        return Ok(vec![ctx.string("discard".into())]);
     }
     match event {
-        ToMain::Online => Ok(vec![Value::from_string("online".into())]),
+        ToMain::Online => Ok(vec![ctx.string("online".into())]),
         ToMain::Message(bytes) => {
             let arr = ctx.make_uint8array(&bytes)?;
-            Ok(vec![Value::from_string("message".into()), arr])
+            Ok(vec![ctx.string("message".into()), arr])
         }
-        ToMain::Error(msg) => Ok(vec![
-            Value::from_string("error".into()),
-            Value::from_string(msg),
-        ]),
+        ToMain::Error(msg) => Ok(vec![ctx.string("error".into()), ctx.string(msg)]),
         ToMain::Exited(code) => {
             registry(ctx).workers.remove(&id);
-            Ok(vec![
-                Value::from_string("exit".into()),
-                Value::Num(code as f64),
-            ])
+            Ok(vec![ctx.string("exit".into()), Value::Num(code as f64)])
         }
     }
 }
@@ -352,7 +370,7 @@ fn run_worker(
 ) {
     let mut rt = Runtime::new_with_interrupt(spec.interrupt);
     trust_js_host::install(rt.engine(), &[worker_scope_extension()]);
-    rt.engine().ctx().op_state().put(WorkerSelf {
+    rt.engine().op_state().put(WorkerSelf {
         to_main: to_main_tx.clone(),
         stop: Arc::clone(&stop),
         exit_code: None,
@@ -364,24 +382,28 @@ fn run_worker(
     // wiring (parentPort/workerData/threadId/process patches) for node workers. Evaluated only in
     // worker realms, so it lives here rather than in the shared glue.
     let boot = if spec.is_node {
-        let ctx = rt.engine().ctx();
-        let global = ctx.global_this();
-        let _ = ctx.set_member(
-            &global,
-            "__trust_jsWorkerThreadId",
-            Value::Num(spec.thread_id as f64),
-        );
-        if let Some(bytes) = &spec.init {
-            match ctx.make_uint8array(bytes) {
-                Ok(arr) => {
-                    let _ = ctx.set_member(&global, "__trust_jsWorkerInit", arr);
-                }
-                Err(_) => {
-                    let _ = to_main_tx.send(ToMain::Error("worker init payload failed".into()));
-                    let _ = to_main_tx.send(ToMain::Exited(1));
-                    return;
-                }
+        let installed = rt.engine().scope(|ctx| {
+            let global = ctx.global_this();
+            let _ = ctx.set_member(
+                &global,
+                "__trust_jsWorkerThreadId",
+                Value::Num(spec.thread_id as f64),
+            );
+            match &spec.init {
+                Some(bytes) => match ctx.make_uint8array(bytes) {
+                    Ok(arr) => {
+                        let _ = ctx.set_member(&global, "__trust_jsWorkerInit", arr);
+                        true
+                    }
+                    Err(_) => false,
+                },
+                None => true,
             }
+        });
+        if !installed {
+            let _ = to_main_tx.send(ToMain::Error("worker init payload failed".into()));
+            let _ = to_main_tx.send(ToMain::Exited(1));
+            return;
         }
         NODE_WORKER_SCOPE_JS
     } else {
@@ -428,12 +450,12 @@ fn run_worker(
 
     // Arm the main→worker inbox, then pump the loop until stopped — or, in node mode with the
     // inbox unref'd, until nothing else is pending (a natural exit).
-    arm_worker_inbox(rt.engine().ctx(), WorkerInbox { rx: to_worker_rx });
+    rt.engine()
+        .scope(|ctx| arm_worker_inbox(ctx, WorkerInbox { rx: to_worker_rx }));
     rt.run_worker_loop(&stop);
 
     let code = rt
         .engine()
-        .ctx()
         .op_state()
         .get::<WorkerSelf>()
         .and_then(|w| w.exit_code)
@@ -450,12 +472,15 @@ struct WorkerInboxResult {
     inbox: Option<WorkerInbox>,
 }
 
-fn arm_worker_inbox(ctx: &mut Ctx, inbox: WorkerInbox) {
+fn arm_worker_inbox<'s>(ctx: &mut Ctx<'s>, inbox: WorkerInbox) {
     // The JS dispatcher is a stable global installed by the scope bootstrap.
     let global = ctx.global_this();
     let dispatch = match ctx.get_member(&global, "__workerDispatchMessage") {
         Ok(v) if v.is_callable() => v,
         _ => return,
+    };
+    let Ok(dispatch) = Handle::new(ctx, &dispatch) else {
+        return;
     };
     let keep_alive = ctx
         .op_state()
@@ -489,10 +514,10 @@ fn arm_worker_inbox(ctx: &mut Ctx, inbox: WorkerInbox) {
     });
 }
 
-fn decode_worker_inbox(
-    ctx: &mut Ctx,
+fn decode_worker_inbox<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let WorkerInboxResult { bytes, inbox } = *payload
         .downcast::<WorkerInboxResult>()
         .expect("worker inbox payload");
@@ -510,7 +535,11 @@ fn decode_worker_inbox(
 }
 
 /// `__wself.post(u8array)` — send an already-serialized message to the main thread.
-fn op_wself_post(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_wself_post<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = ctx
         .typed_array_bytes(args.first().unwrap_or(&Value::Undefined))
         .ok_or_else(|| ctx.make_error("TypeError", "post: expected a Uint8Array"))?;
@@ -521,7 +550,11 @@ fn op_wself_post(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Valu
 }
 
 /// `__wself.close()` — request the worker loop to stop.
-fn op_wself_close(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_wself_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if let Some(w) = ctx.host_mut::<WorkerSelf>() {
         w.stop.store(true, Ordering::SeqCst);
     }
@@ -530,7 +563,11 @@ fn op_wself_close(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Va
 
 /// `__wself.exit(code)` — node `process.exit(code)` inside a worker: record the code and stop the
 /// loop (cooperatively — the current synchronous JS runs to its end first; see the module docs).
-fn op_wself_exit(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_wself_exit<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let code = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as i32;
     if let Some(w) = ctx.host_mut::<WorkerSelf>() {
         w.exit_code = Some(code);
@@ -541,8 +578,15 @@ fn op_wself_exit(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Valu
 
 /// `__wself.setRef(keep)` — whether the armed inbox keeps this worker alive (parentPort ref
 /// semantics: on while a 'message' listener exists, off otherwise).
-fn op_wself_set_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let keep = matches!(args.first(), Some(Value::Bool(true)));
+fn op_wself_set_ref<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let keep = matches!(
+        (args.first()).map(|__value| (__value).kind()),
+        Some(ValueKind::Bool(true))
+    );
     let task = match ctx.host_mut::<WorkerSelf>() {
         Some(w) => {
             w.keep_alive = keep;
@@ -562,7 +606,11 @@ fn op_wself_set_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, V
 
 /// `__wself.report(message)` — forward a worker-side uncaught error to the main thread (wired to
 /// the worker's global `onerror` in the bootstrap).
-fn op_wself_report(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_wself_report<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let msg = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();

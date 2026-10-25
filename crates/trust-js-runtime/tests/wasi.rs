@@ -21,7 +21,7 @@ impl Write for Captured {
 fn preview1_imports_read_and_write_guest_memory() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });
@@ -81,7 +81,7 @@ fn preview1_preopens_confine_and_access_files() {
     std::os::unix::fs::symlink(&outside, directory.join("escape-link")).unwrap();
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

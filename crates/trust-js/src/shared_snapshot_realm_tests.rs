@@ -11,6 +11,7 @@
 use crate::bytecode::Tier;
 use crate::interpreter::{Abrupt, Interp};
 use crate::realm_inline_guard_tests::{eval_string, in_realm, render, set_global, TIERS};
+use crate::value::ValueView;
 use crate::value::{Callable, Value};
 use crate::Engine;
 use std::rc::Rc;
@@ -107,11 +108,13 @@ fn run_shared(it: &mut Interp) {
 }
 
 fn shared_method(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
-    let global = Value::Obj(it.global.clone());
+    let global = Value::Obj(it.global);
     let Ok(shared) = it.get_member_key(&global, "shared") else {
         panic!("shared is defined");
     };
-    let Ok(Value::Obj(function)) = it.get_member_key(&shared, name) else {
+    let Ok(ValueView::Obj(function)) =
+        (it.get_member_key(&shared, name)).map(|__value| (__value).view())
+    else {
         panic!("shared.{name} is a function");
     };
     let borrowed = function.borrow();
@@ -123,11 +126,13 @@ fn shared_method(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
 
 /// The AST Function behind a probe method, to prove both Realms run the same code.
 fn probe_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
-    let global = Value::Obj(it.global.clone());
+    let global = Value::Obj(it.global);
     let Ok(probe) = it.get_member_key(&global, "probe") else {
         panic!("probe is defined");
     };
-    let Ok(Value::Obj(function)) = it.get_member_key(&probe, name) else {
+    let Ok(ValueView::Obj(function)) =
+        (it.get_member_key(&probe, name)).map(|__value| (__value).view())
+    else {
         panic!("probe.{name} is a function");
     };
     let borrowed = function.borrow();
@@ -137,25 +142,25 @@ fn probe_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
     user.func.clone()
 }
 
-fn global_user_callable(it: &mut Interp, name: &str) -> Rc<crate::value::UserCallable> {
-    let env = it.global_env.clone();
+fn global_user_callable(it: &mut Interp, name: &str) -> crate::value::UserFn {
+    let env = it.global_env;
     let value = it
         .get_var(name, &env)
         .unwrap_or_else(|_| panic!("missing global {name}"));
-    let Value::Obj(object) = value else {
+    let ValueView::Obj(object) = (value).view() else {
         panic!("{name} is not an object")
     };
     let borrowed = object.borrow();
     let Callable::User(user) = &borrowed.call else {
         panic!("{name} is not an ordinary function")
     };
-    user.clone()
+    *user
 }
 
 fn has_binding_getter_cache(user: &crate::value::UserCallable) -> bool {
-    let cache = user.binding_getter_cache.take();
+    let cache = user.take_binding_getter_cache();
     let cached = cache.is_some();
-    user.binding_getter_cache.set(cache);
+    user.put_binding_getter_cache(cache);
     cached
 }
 
@@ -166,7 +171,7 @@ fn realms_sharing_a_snapshot_keep_distinct_intrinsics_globals_and_objects() {
         engine.set_tier(tier);
         let it = &mut *engine.interp;
         let child = it.create_realm();
-        let main = Value::Obj(it.global.clone());
+        let main = Value::Obj(it.global);
 
         set_global(it, "realmTag", Value::lstr("main"));
         run_shared(it);
@@ -199,14 +204,14 @@ fn realms_sharing_a_snapshot_keep_distinct_intrinsics_globals_and_objects() {
         assert!(Rc::ptr_eq(&main_hot, &child_hot), "{tier:?}: shared AST");
         if tier != Tier::Interp {
             assert!(
-                main_hot.code.get().is_some_and(Option::is_some),
+                main_hot.runtime().code.get().is_some_and(Option::is_some),
                 "{tier:?}: the shared function was compiled"
             );
         }
 
         // ... but every object they create belongs to the Realm that created it.
-        set_global(it, "childRealm", child.clone());
-        in_realm(it, &child, |it| set_global(it, "mainRealm", main.clone()));
+        set_global(it, "childRealm", child);
+        in_realm(it, &child, |it| set_global(it, "mainRealm", main));
         let cross = eval_string(
             it,
             r#"[
@@ -302,7 +307,10 @@ fn shared_snapshot_binding_getters_cache_each_realms_live_closure() {
                 "{tier:?}: snapshot AST is shared"
             );
             assert!(
-                !Rc::ptr_eq(&main_getter, &child_getter),
+                !std::ptr::eq(
+                    crate::value::user_fn_ptr(&main_getter),
+                    crate::value::user_fn_ptr(&child_getter)
+                ),
                 "{tier:?}: cached environments are closure-local"
             );
         });
@@ -332,7 +340,7 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         let it = &mut *engine.interp;
-        let main = Value::Obj(it.global.clone());
+        let main = Value::Obj(it.global);
         let run = |it: &mut Interp| {
             let body = it.shared_snapshot_program(snapshot).expect("decodes");
             assert!(it.run_classic_program(&body, None).is_ok());
@@ -350,13 +358,13 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
         if tier == Tier::Jit {
             let call = shared_method(it, "call");
             assert!(
-                call.code2.get().is_some_and(Option::is_some),
+                call.runtime().code2.get().is_some_and(Option::is_some),
                 "the warmed caller has an inlined second-stage body"
             );
         }
         let child = it.create_realm();
         in_realm(it, &child, run);
-        in_realm(it, &child, |it| set_global(it, "mainRealm", main.clone()));
+        in_realm(it, &child, |it| set_global(it, "mainRealm", main));
         let result = in_realm(it, &child, |it| {
             eval_string(
                 it,
@@ -459,21 +467,23 @@ fn a_dropped_realm_that_ran_shared_unresolvable_lookups_is_collected() {
         assert_eq!(run(it), expected, "{tier:?} main");
         let mut addresses = Vec::new();
         for round in 0..3 {
-            let child = it.create_realm();
-            let Value::Obj(global) = &child else {
-                unreachable!()
-            };
-            addresses.push(Rc::as_ptr(global) as usize);
-            assert_eq!(
-                in_realm(it, &child, run),
-                expected,
-                "{tier:?} child {round}"
-            );
+            // The child Realm lives only in this helper frame and its address stays hidden
+            // (the collector scans the stack).
+            addresses.push(crate::gc_test::in_frame(|| {
+                let child = it.create_realm();
+                let address = crate::gc_test::HiddenAddress::of(&child);
+                assert_eq!(
+                    in_realm(it, &child, run),
+                    expected,
+                    "{tier:?} child {round}"
+                );
+                address
+            }));
         }
         it.gc_collect();
         for (round, address) in addresses.iter().enumerate() {
             assert!(
-                !it.realms.contains_key(address),
+                !address.in_map(&it.realms),
                 "{tier:?}: dropped child Realm {round} is still live"
             );
         }
@@ -490,30 +500,31 @@ fn a_dropped_realm_that_ran_the_last_regexp_is_collected() {
         engine.set_tier(tier);
         let it = &mut *engine.interp;
         assert_eq!(eval_string(it, "/(b)c/.exec('abcd'); RegExp.$1"), "b");
-        let child = it.create_realm();
-        let Value::Obj(global) = &child else {
-            unreachable!()
-        };
-        let address = Rc::as_ptr(global) as usize;
-        let child_statics = in_realm(it, &child, |it| {
-            eval_string(
-                it,
-                "(function () { let n = 0; for (let i = 0; i < 300; i++) n += /(x+)y/.test('axxy'); \
-                 return n + ':' + RegExp.$1 + ':' + RegExp.lastMatch; })()",
-            )
+        // The child Realm lives only in this helper frame and its address stays hidden (the
+        // collector scans the stack).
+        let address = crate::gc_test::in_frame(|| {
+            let child = it.create_realm();
+            let address = crate::gc_test::HiddenAddress::of(&child);
+            let child_statics = in_realm(it, &child, |it| {
+                eval_string(
+                    it,
+                    "(function () { let n = 0; for (let i = 0; i < 300; i++) n += /(x+)y/.test('axxy'); \
+                     return n + ':' + RegExp.$1 + ':' + RegExp.lastMatch; })()",
+                )
+            });
+            assert_eq!(child_statics, "300:xx:xxy", "{tier:?}");
+            // The child ran the most recent match, so its %RegExp% holds the pending statics.
+            in_realm(it, &child, |it| {
+                assert_eq!(
+                    eval_string(it, "/(q)/.test('q') && typeof RegExp"),
+                    "function"
+                );
+            });
+            address
         });
-        assert_eq!(child_statics, "300:xx:xxy", "{tier:?}");
-        // The child ran the most recent match, so its %RegExp% holds the pending statics.
-        in_realm(it, &child, |it| {
-            assert_eq!(
-                eval_string(it, "/(q)/.test('q') && typeof RegExp"),
-                "function"
-            );
-        });
-        drop(child);
         it.gc_collect();
         assert!(
-            !it.realms.contains_key(&address),
+            !address.in_map(&it.realms),
             "{tier:?}: the Realm of the last regexp match is still live"
         );
         assert_eq!(

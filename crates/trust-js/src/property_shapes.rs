@@ -48,12 +48,20 @@ pub(super) type LayoutPage = [LayoutEntry; SHAPE_LAYOUT_PAGE_SIZE];
 
 pub(super) struct ShapeLayouts {
     pub(super) pages: [Option<Box<LayoutPage>>; SHAPE_LAYOUT_PAGE_COUNT],
+    /// The shapes whose entries were written since a collection's marking last traced the
+    /// table ([`ShapeLayouts::trace_roots`]): a minor collection traces these entries alone.
+    /// `overflow` once more were written than the table holds, which makes the next one trace
+    /// every entry.
+    written: std::cell::Cell<Vec<u32>>,
+    overflow: std::cell::Cell<bool>,
 }
 
 impl Default for ShapeLayouts {
     fn default() -> Self {
         Self {
             pages: std::array::from_fn(|_| None),
+            written: std::cell::Cell::new(Vec::new()),
+            overflow: std::cell::Cell::new(false),
         }
     }
 }
@@ -78,18 +86,40 @@ impl ShapeLayouts {
             .flatten()
     }
 
+    /// The entry of `shape`, for its writer: the entry counts as written.
     pub(super) fn get_mut(&mut self, shape: u32) -> Option<&mut PropertyLayout> {
         if !is_cacheable_shape(shape) {
             return None;
         }
         let (page, slot) = Self::index(shape);
         let entry = &mut self.pages[page].as_mut()?[slot];
-        (entry.shape == shape)
-            .then_some(entry.keys.as_mut())
-            .flatten()
+        if entry.shape != shape || entry.keys.is_none() {
+            return None;
+        }
+        Self::note_written(&mut self.written, &mut self.overflow, shape);
+        entry.keys.as_mut()
+    }
+
+    /// Record that the entry of `shape` was written, for the next minor collection.
+    fn note_written(
+        written: &mut std::cell::Cell<Vec<u32>>,
+        overflow: &mut std::cell::Cell<bool>,
+        shape: u32,
+    ) {
+        if *overflow.get_mut() {
+            return;
+        }
+        let written = written.get_mut();
+        if written.len() < SHAPE_LAYOUT_CACHE_LIMIT {
+            written.push(shape);
+        } else {
+            *written = Vec::new();
+            *overflow.get_mut() = true;
+        }
     }
 
     pub(super) fn insert(&mut self, shape: u32, keys: PropertyLayout) {
+        keys.mark_shared();
         if !is_cacheable_shape(shape) {
             return;
         }
@@ -101,6 +131,31 @@ impl ShapeLayouts {
             shape,
             keys: Some(keys),
         };
+        Self::note_written(&mut self.written, &mut self.overflow, shape);
+    }
+
+    /// Report the layouts a collection of `kind` traces: every entry's for a major collection;
+    /// for a minor one, the entries written since a collection's marking last called this (every
+    /// entry once more were written than the table holds), the others' layouts being old.
+    /// Either way the record of writes starts anew, so only a marking calls this.
+    pub(super) fn trace_roots(
+        &self,
+        kind: crate::gc_core::CollectionKind,
+        sink: &mut dyn crate::gc_trace::GcSink,
+    ) {
+        let mut written = self.written.take();
+        if kind == crate::gc_core::CollectionKind::Minor && !self.overflow.replace(false) {
+            for &shape in &written {
+                if let Some(layout) = self.get(shape) {
+                    sink.layout(layout);
+                }
+            }
+        } else {
+            self.overflow.set(false);
+            crate::gc_trace::GcTrace::trace_gc(self, sink);
+        }
+        written.clear();
+        self.written.set(written);
     }
 
     #[cfg(test)]
@@ -120,10 +175,71 @@ impl ShapeLayouts {
     }
 }
 
+impl crate::gc_trace::GcTrace for ShapeLayouts {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            pages,
+            written: _,
+            overflow: _,
+        } = self;
+        for page in pages.iter().flatten() {
+            for entry in page.iter() {
+                let LayoutEntry { shape: _, keys } = entry;
+                crate::gc_trace::GcTrace::trace_gc(keys, sink);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::rc::Rc;
+
+    #[test]
+    fn minor_collections_trace_the_layouts_written_since_the_last_marking() {
+        use crate::gc_core::CollectionKind;
+        struct Words(Vec<u64>);
+        impl crate::gc_trace::GcSink for Words {
+            fn word(&mut self, word: u64) {
+                self.0.push(word);
+            }
+        }
+        let traced = |layouts: &ShapeLayouts, kind| {
+            let mut words = Words(Vec::new());
+            layouts.trace_roots(kind, &mut words);
+            words.0.sort_unstable();
+            words.0
+        };
+        // Layouts are cells of the active heap.
+        let _engine = crate::Engine::new();
+        let layout =
+            |name: &str| super::super::new_shared_indexed_property_layout(vec![name.into()]);
+        let mut layouts = ShapeLayouts::default();
+        let (a, b, c) = (layout("a"), layout("b"), layout("c"));
+        layouts.insert(1, a.clone());
+        layouts.insert(2, b.clone());
+        let mut both = vec![a.cell_word(), b.cell_word()];
+        both.sort_unstable();
+        assert_eq!(traced(&layouts, CollectionKind::Minor), both);
+        assert!(
+            traced(&layouts, CollectionKind::Minor).is_empty(),
+            "nothing new"
+        );
+        // A prediction's update through `get_mut` is a write.
+        *layouts.get_mut(1).expect("entry") = c.clone();
+        assert_eq!(traced(&layouts, CollectionKind::Minor), [c.cell_word()]);
+        let mut all = vec![b.cell_word(), c.cell_word()];
+        all.sort_unstable();
+        assert_eq!(traced(&layouts, CollectionKind::Major), all);
+        assert!(traced(&layouts, CollectionKind::Minor).is_empty());
+        // More writes than the table holds: the next minor collection traces every entry.
+        for _ in 0..=SHAPE_LAYOUT_CACHE_LIMIT {
+            *layouts.get_mut(2).expect("entry") = b.clone();
+        }
+        assert_eq!(traced(&layouts, CollectionKind::Minor), all);
+        assert!(traced(&layouts, CollectionKind::Minor).is_empty());
+    }
 
     #[test]
     fn shape_identity_exhaustion_disables_proofs_without_wrapping() {
@@ -162,7 +278,7 @@ mod tests {
         let mut layouts = ShapeLayouts::default();
         assert_eq!(layouts.allocated_bytes(), 0);
         let keys = crate::value::new_property_layout(vec![Rc::from("first")]);
-        let weak = Rc::downgrade(&keys);
+        let weak = crate::gc_handle::WeakRef::to(keys.as_ptr() as usize);
         layouts.insert(17, keys);
         assert_eq!(layouts.allocated_bytes(), std::mem::size_of::<LayoutPage>());
         assert_eq!(&*layouts.get(17).unwrap()[0], "first");
@@ -175,7 +291,12 @@ mod tests {
         );
         assert_eq!(layouts.len(), 1);
         assert!(layouts.get(17).is_none());
-        assert!(weak.upgrade().is_none());
+        crate::value::property_layout_cell_tests::collect(
+            &crate::value::active_gc_heap(),
+            &layouts,
+            crate::gc_core::CollectionKind::Major,
+        );
+        assert!(weak.live_ptr().is_none());
         assert_eq!(&*layouts.get(collision).unwrap()[0], "second");
         layouts.insert(
             SHAPE_UNCACHEABLE,

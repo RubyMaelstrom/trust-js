@@ -1,4 +1,5 @@
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn check(source: &str, expected: &str) {
@@ -88,7 +89,7 @@ fn prepared_reference_does_not_read_or_reject_binding_during_capture() {
 #[test]
 fn prepared_reference_captures_strictness_and_survives_generation_exhaustion() {
     let mut engine = Engine::new();
-    let scope = new_scope(Some(engine.interp.global_env.clone()));
+    let scope = new_scope(Some(engine.interp.global_env));
     scope
         .borrow_mut()
         .vars
@@ -125,8 +126,8 @@ fn prepared_reference_captures_strictness_and_survives_generation_exhaustion() {
         );
     }
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(7.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(7.0))
     ));
     let mut strict = engine
         .interp
@@ -152,7 +153,7 @@ fn prepared_reference_imports_are_live_and_never_mutable_address_hints() {
         .insert("source", Binding::data(Value::Num(7.0), true, true));
     let importer = new_scope(None);
     let mut binding = Binding::data(Value::Undefined, false, true);
-    binding.set_import_reference(Some((exporter.clone(), "source".into())));
+    binding.set_import_reference(Some((exporter, "source".into())));
     importer.borrow_mut().vars.insert("alias", binding);
     let mut reference = engine
         .interp
@@ -160,21 +161,26 @@ fn prepared_reference_imports_are_live_and_never_mutable_address_hints() {
         .ok()
         .unwrap();
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(7.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(7.0))
     ));
-    exporter.borrow_mut().vars.get_mut("source").unwrap().value = Value::Num(19.0);
+    exporter
+        .borrow_mut()
+        .vars
+        .get_mut("source")
+        .unwrap()
+        .set_value(Value::Num(19.0));
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(19.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(19.0))
     ));
     assert!(engine
         .interp
         .write_prepared_reference(&mut reference, Value::Num(31.0))
         .is_err());
     assert!(matches!(
-        exporter.borrow().vars.get("source").unwrap().value,
-        Value::Num(19.0)
+        (exporter.borrow().vars.get("source").unwrap().value()).view(),
+        ValueView::Num(19.0)
     ));
 }
 
@@ -196,42 +202,55 @@ fn prepared_reference_object_record_get_and_set_repeat_has_not_unscopables() {
     );
 }
 
+/// A slot reports its Reference's environment to the collector, and replacing the
+/// Reference drops the old one in place: once its handles are gone a collection finds the old
+/// environment dead, while the slot keeps the new one alive.
 #[test]
-fn prepared_reference_slot_replacement_and_drop_release_exact_owners() {
+fn prepared_reference_slot_reports_its_reference_and_releases_a_replaced_one() {
+    struct Words(Vec<u64>);
+    impl crate::gc_trace::GcSink for Words {
+        fn word(&mut self, word: u64) {
+            self.0.push(word);
+        }
+    }
+    let mut engine = Engine::new();
     let mut slot = PreparedReferenceSlot::default();
     assert!(slot.as_ref().is_none());
-    let scope = new_scope(None);
-    scope
-        .borrow_mut()
-        .vars
-        .insert("x", Binding::data(Value::Num(1.0), true, true));
-    let weak = Rc::downgrade(&scope);
-    slot.set(PreparedReference::scope(Rc::from("x"), scope, false));
-    assert!(weak.upgrade().is_some());
-    let next = new_scope(None);
-    next.borrow_mut()
-        .vars
-        .insert("x", Binding::data(Value::Num(2.0), true, true));
-    let next_weak = Rc::downgrade(&next);
-    slot.set(PreparedReference::scope(Rc::from("x"), next, true));
+    // Each environment's handles live only in a helper frame (the collector scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let scope = new_scope(None);
+        scope
+            .borrow_mut()
+            .vars
+            .insert("x", Binding::data(Value::Num(1.0), true, true));
+        slot.set(PreparedReference::scope(Rc::from("x"), scope, false));
+        Env::downgrade(&scope)
+    });
+    let next_weak = crate::gc_test::in_frame(|| {
+        let next = new_scope(None);
+        next.borrow_mut()
+            .vars
+            .insert("x", Binding::data(Value::Num(2.0), true, true));
+        slot.set(PreparedReference::scope(Rc::from("x"), next, true));
+        Env::downgrade(&next)
+    });
+    engine.interp.gc_collect();
     assert!(
-        weak.upgrade().is_none(),
-        "old Reference released exactly once"
+        !crate::gc_test::alive(&weak),
+        "the replaced Reference released its environment"
     );
-    let mut objects = Vec::new();
-    let mut scopes = Vec::new();
-    slot.as_ref()
-        .unwrap()
-        .trace_gc(&mut crate::gc_edges::DirectGcEdges {
-            objects: &mut objects,
-            scopes: &mut scopes,
-        });
-    assert_eq!(scopes.len(), 1);
-    scopes.clear();
-    drop(slot);
     assert!(
-        next_weak.upgrade().is_none(),
-        "slot Drop releases its live Reference"
+        crate::gc_test::alive(&next_weak),
+        "the slot keeps its live Reference"
+    );
+    let reported = crate::gc_test::in_frame(|| {
+        let mut words = Words(Vec::new());
+        crate::gc_trace::GcTrace::trace_gc(&slot, &mut words);
+        words.0 == [Env::as_ptr(&next_weak.upgrade().unwrap()) as u64]
+    });
+    assert!(
+        reported,
+        "the slot reports exactly its Reference's environment"
     );
 }
 
@@ -240,8 +259,8 @@ fn prepared_reference_native_kind_flags_use_compact_binding_size_and_live_import
     #[cfg(target_pointer_width = "64")]
     assert_eq!(
         std::mem::size_of::<Binding>(),
-        32,
-        "kind bit uses flag padding in the compact binding"
+        24,
+        "import kind flag fits the 24-byte packed binding"
     );
     let target = new_scope(None);
     let mut binding = Binding::data(Value::Undefined, false, true);
@@ -250,6 +269,7 @@ fn prepared_reference_native_kind_flags_use_compact_binding_size_and_live_import
     assert!(binding.imported);
     binding.set_import_reference(None);
     assert!(!binding.imported);
+    // The entries validate: an InlineVec keeping a map's first binding in place.
     assert!(
         VarMap::jit_small_storage_layout().is_some(),
         "current Rust small map layout validates"

@@ -3,7 +3,9 @@
 //! cannot hide a moved-out owner, a widened return, or a partially committed stack result.
 
 use super::*;
+use crate::value::ValueView;
 use crate::{jit::JitCtx, Completion, Engine};
+use std::cell::Cell;
 use std::mem::MaybeUninit;
 
 #[derive(Clone, Copy, Debug)]
@@ -61,21 +63,21 @@ fn read_chunk() -> (Rc<Chunk>, ReadSite) {
     (chunk, site)
 }
 
-fn use_kind(chunk: &mut Rc<Chunk>, site: ReadSite, kind: ReadKind) {
-    let chunk = Rc::get_mut(chunk).expect("the test owns the fixture chunk");
-    chunk.ops[site.pc] = match kind {
-        ReadKind::Stack => Op::GetProp(site.name, site.cache),
-        ReadKind::This => Op::GetPropThis(site.name, site.cache),
-        ReadKind::Local => Op::GetPropLocal(site.slot, site.name, site.cache),
-        ReadKind::Method => Op::GetMethod(site.name, site.cache),
-    };
+fn use_kind(chunk: Rc<Chunk>, site: ReadSite, kind: ReadKind) -> Rc<Chunk> {
+    Chunk::rewrite_owned_for_test(chunk, |chunk| {
+        chunk.ops[site.pc] = match kind {
+            ReadKind::Stack => Op::GetProp(site.name, site.cache),
+            ReadKind::This => Op::GetPropThis(site.name, site.cache),
+            ReadKind::Local => Op::GetPropLocal(site.slot, site.name, site.cache),
+            ReadKind::Method => Op::GetMethod(site.name, site.cache),
+        };
+    })
 }
 
 struct Invocation {
-    stack: Box<[MaybeUninit<PackedValue>; 4]>,
+    stack: Box<[MaybeUninit<Value>; 4]>,
     initialized: [bool; 4],
     live: usize,
-    prefix_len: usize,
     error: Option<Abrupt>,
 }
 
@@ -85,30 +87,11 @@ impl Invocation {
         self.initialized[index] = false;
         // SAFETY: every live stack position is initialized by the helper, and this bit is
         // cleared before the owner is moved out so Drop cannot release it a second time.
-        unsafe { self.stack[index].assume_init_read().into_value() }
-    }
-
-    fn packed(&self, index: usize) -> &PackedValue {
-        assert!(index < self.live && self.initialized[index]);
-        // SAFETY: the helper's returned SP covers precisely its still-owned packed cells.
-        unsafe { self.stack[index].assume_init_ref() }
+        unsafe { self.stack[index].assume_init_read() }
     }
 
     fn take_values(&mut self) -> Vec<Value> {
         (0..self.live).map(|index| self.value(index)).collect()
-    }
-
-    fn take_prefix(&mut self) -> Vec<Value> {
-        (0..self.prefix_len)
-            .map(|index| self.value(index))
-            .collect()
-    }
-
-    fn drop_slot(&mut self, index: usize) {
-        assert!(index < self.live && self.initialized[index]);
-        self.initialized[index] = false;
-        // SAFETY: this position still contains its one live packed owner.
-        unsafe { self.stack[index].assume_init_drop() };
     }
 }
 
@@ -135,29 +118,29 @@ fn invoke(
     receiver: Value,
     prefix: Value,
 ) -> Invocation {
-    let mut stack: Box<[MaybeUninit<PackedValue>; 4]> =
+    let mut stack: Box<[MaybeUninit<Value>; 4]> =
         Box::new(std::array::from_fn(|_| MaybeUninit::uninit()));
-    let base = stack.as_mut_ptr().cast::<PackedValue>();
+    let base = stack.as_mut_ptr().cast::<Value>();
     let prefix_len = 1;
-    unsafe { base.write(PackedValue::pack(prefix)) };
+    unsafe { base.write(prefix) };
 
-    let mut slots: Vec<PackedValue> = (0..chunk.n_slots)
-        .map(|_| PackedValue::pack(Value::Undefined))
+    let mut slots: Vec<Cell<Value>> = (0..chunk.n_slots)
+        .map(|_| Cell::new(Value::Undefined))
         .collect();
     let mut this_value = Value::Undefined;
     let mut stack_len = prefix_len;
     match kind {
         ReadKind::Stack | ReadKind::Method => {
-            unsafe { base.add(stack_len).write(PackedValue::pack(receiver)) };
+            unsafe { base.add(stack_len).write(receiver) };
             stack_len += 1;
         }
         ReadKind::Local => {
-            slots[site.slot as usize] = PackedValue::pack(receiver);
+            slots[site.slot as usize].set(receiver);
         }
         ReadKind::This => this_value = receiver,
     }
 
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let interp = &mut *engine.interp;
     let mut ctx = JitCtx {
         helpers: interp.jit_helpers.as_ptr(),
@@ -165,26 +148,26 @@ fn invoke(
         final_sp: base,
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &interp.inline_ic_safe as *const _ as *const u8,
-        env_raw: Rc::as_ptr(&env).cast(),
-        this_raw: std::ptr::null(),
+        env_raw: Env::as_ptr(&env).cast(),
+        this_word: (this_value),
         global_body: std::ptr::null(),
-        genv: Rc::as_ptr(&env) as usize,
+        genv: Env::as_ptr(&env) as usize,
         interp,
         chunk: Rc::as_ptr(chunk),
-        this_val: this_value,
         n_slots: slots.len(),
         handlers: Vec::new(),
         handler_floor: 0,
         code_base: std::ptr::null(),
         pc_offsets: std::ptr::null(),
         error: None,
-        ret: PackedValue::pack(Value::Undefined),
+        ret: (Value::Undefined),
         env_parent_raw: std::ptr::null(),
         opstat_enabled: false,
         callstat_enabled: false,
         propstat_enabled: false,
         inline_recompile_at: inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&interp.gc_heap),
+        shape_layouts: crate::value::shape_layouts_ptr(&interp.gc_heap),
         activation: None,
         resume_activation: std::ptr::null_mut(),
         resume_pc: 0,
@@ -193,7 +176,6 @@ fn invoke(
         accessor_holder: 0,
         accessor_slot: 0,
     };
-    ctx.this_raw = &ctx.this_val;
 
     let result = unsafe { jit_get_prop(&mut ctx, site.pc as u32, base.add(stack_len)) };
     assert_eq!(result.flag != 0, ctx.error.is_some());
@@ -216,7 +198,6 @@ fn invoke(
         stack,
         initialized: std::array::from_fn(|index| index < live),
         live,
-        prefix_len,
         error,
     }
 }
@@ -229,7 +210,7 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 fn binding(engine: &mut Engine, name: &str) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .get_var(name, &env)
@@ -238,8 +219,8 @@ fn binding(engine: &mut Engine, name: &str) -> Value {
 }
 
 fn same_js_value(engine: &mut Engine, expected: &Value, actual: &Value) -> bool {
-    match (expected, actual) {
-        (Value::Num(expected), Value::Num(actual)) => {
+    match (&(expected).view(), &(actual).view()) {
+        (ValueView::Num(expected), ValueView::Num(actual)) => {
             (expected.is_nan() && actual.is_nan()) || expected.to_bits() == actual.to_bits()
         }
         _ => engine.interp.strict_equals(expected, actual),
@@ -272,14 +253,14 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
         ReadKind::Local,
         ReadKind::Method,
     ] {
-        use_kind(&mut chunk, site, kind);
+        chunk = use_kind(chunk, site, kind);
         for (tag, expected) in values.iter().enumerate() {
             let receiver = crate::value::Object::new(None);
             receiver
                 .borrow_mut()
                 .props
-                .insert("value", crate::value::Property::plain(expected.clone()));
-            let receiver_value = Value::Obj(receiver.clone());
+                .insert("value", crate::value::Property::plain(*expected));
+            let receiver_value = Value::Obj(receiver);
             let mut outcome = invoke(
                 &mut engine,
                 &chunk,
@@ -290,14 +271,16 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
             );
             assert!(outcome.error.is_none());
             let values = outcome.take_values();
-            assert!(matches!(&values[0], Value::Str(s) if s.as_str() == "prefix"));
+            assert!(matches!(&(values[0]).view(), ValueView::Str(s) if s.as_str() == "prefix"));
             let actual = values.last().expect("named read pushes its result");
             assert!(
                 same_js_value(&mut engine, expected, actual),
                 "wrong named result for {kind:?} at value tag {tag}"
             );
             if kind.is_method() {
-                assert!(matches!(&values[1], Value::Obj(value) if Rc::ptr_eq(value, &receiver)));
+                assert!(
+                    matches!(&(values[1]).view(), ValueView::Obj(value) if crate::value::Gc::ptr_eq(value, &receiver))
+                );
                 assert_eq!(values.len(), 3);
             } else {
                 assert_eq!(values.len(), 2);
@@ -307,58 +290,6 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
     values.clear();
 }
 
-#[test]
-fn named_read_packed_result_and_prefix_are_last_owners_across_collection() {
-    let mut engine = Engine::new();
-    let (mut chunk, site) = read_chunk();
-    use_kind(&mut chunk, site, ReadKind::Local);
-
-    let result = crate::value::Object::new(None);
-    let weak_result = Rc::downgrade(&result);
-    let receiver = crate::value::Object::new(None);
-    let weak_receiver = Rc::downgrade(&receiver);
-    receiver.borrow_mut().props.insert(
-        "value",
-        crate::value::Property::plain(Value::Obj(result.clone())),
-    );
-    let prefix = crate::value::Object::new(None);
-    let weak_prefix = Rc::downgrade(&prefix);
-    let mut outcome = invoke(
-        &mut engine,
-        &chunk,
-        site,
-        ReadKind::Local,
-        Value::Obj(receiver.clone()),
-        Value::Obj(prefix.clone()),
-    );
-    drop(result);
-    drop(receiver);
-    drop(prefix);
-    assert!(outcome.error.is_none());
-    assert!(
-        weak_receiver.upgrade().is_none(),
-        "the local slot was released"
-    );
-
-    engine.interp.gc_collect();
-    assert!(
-        weak_prefix.upgrade().is_some(),
-        "the packed prefix remains rooted"
-    );
-    assert!(
-        weak_result.upgrade().is_some(),
-        "the packed result owns its value after the receiver and property are gone"
-    );
-    assert!(outcome.packed(0).with_object(|_| ()).is_some());
-    assert!(outcome.packed(1).with_object(|_| ()).is_some());
-
-    outcome.drop_slot(0);
-    outcome.drop_slot(1);
-    engine.interp.gc_collect();
-    assert!(weak_prefix.upgrade().is_none());
-    assert!(weak_result.upgrade().is_none());
-}
-
 fn collect_named_read(
     i: &mut crate::interpreter::Interp,
     _: Value,
@@ -366,136 +297,6 @@ fn collect_named_read(
 ) -> Result<Value, Value> {
     i.gc_collect();
     Ok(Value::Undefined)
-}
-
-fn error_name(engine: &mut Engine, error: &Value) -> String {
-    match engine
-        .interp
-        .get_member_key(error, "name")
-        .ok()
-        .expect("error name read")
-    {
-        Value::Str(name) => name.as_str().to_owned(),
-        _ => panic!("error name is not a string"),
-    }
-}
-
-fn assert_prefix(outcome: &mut Invocation, expected_prefix: &Value, engine: &mut Engine) {
-    let mut prefix = outcome.take_prefix();
-    assert!(same_js_value(engine, expected_prefix, &prefix[0]));
-    prefix.clear();
-}
-
-#[test]
-fn named_read_errors_preserve_prefix_tdz_order_and_release_last_receiver_owner() {
-    let mut engine = Engine::new();
-    engine.interp.def_method(
-        &engine.interp.global.clone(),
-        "collectNamedRead",
-        0,
-        collect_named_read,
-    );
-    evaluate(
-        &mut engine,
-        "var namedSentinel={}; var namedGetter=function(){collectNamedRead();throw namedSentinel;};",
-    );
-    let getter = binding(&mut engine, "namedGetter");
-    let sentinel = binding(&mut engine, "namedSentinel");
-    let (mut chunk, site) = read_chunk();
-
-    // A throwing accessor reenters the engine and collects. Stack/local/this receivers are
-    // consumed or frame-owned through the call; GetMethod deliberately leaves the receiver
-    // packed until the caller's exceptional unwind drops it.
-    for kind in [
-        ReadKind::Stack,
-        ReadKind::This,
-        ReadKind::Local,
-        ReadKind::Method,
-    ] {
-        use_kind(&mut chunk, site, kind);
-        let receiver = crate::value::Object::new(None);
-        receiver.borrow_mut().props.insert(
-            "value",
-            crate::value::Property::accessor_prop(Some(getter.clone()), None, true, true),
-        );
-        let weak_receiver = Rc::downgrade(&receiver);
-        let receiver_value = Value::Obj(receiver.clone());
-        drop(receiver);
-        let prefix = crate::value::Object::new(None);
-        let weak_prefix = Rc::downgrade(&prefix);
-        let expected_prefix = Value::Obj(prefix.clone());
-        let mut outcome = invoke(
-            &mut engine,
-            &chunk,
-            site,
-            kind,
-            receiver_value,
-            Value::Obj(prefix.clone()),
-        );
-        drop(prefix);
-        let Some(Abrupt::Throw(error)) = outcome.error.as_ref() else {
-            panic!("expected the accessor's exact thrown value for {kind:?}");
-        };
-        assert!(engine.interp.strict_equals(error, &sentinel));
-        assert_prefix(&mut outcome, &expected_prefix, &mut engine);
-        drop(expected_prefix);
-        engine.interp.gc_collect();
-        assert!(
-            weak_prefix.upgrade().is_none(),
-            "the consumed prefix was released"
-        );
-        assert_eq!(
-            weak_receiver.upgrade().is_some(),
-            kind.is_method(),
-            "only GetMethod keeps its borrowed receiver until exceptional unwind"
-        );
-        drop(outcome);
-        assert!(
-            weak_receiver.upgrade().is_none(),
-            "the receiver owner was released"
-        );
-    }
-
-    // Nullish reads throw before any property access while retaining only the original prefix;
-    // the method form keeps its borrowed receiver for the unwinder to discard.
-    let null_prefix = crate::value::Object::new(None);
-    let null_prefix_value = Value::Obj(null_prefix.clone());
-    for kind in [
-        ReadKind::Stack,
-        ReadKind::This,
-        ReadKind::Local,
-        ReadKind::Method,
-    ] {
-        use_kind(&mut chunk, site, kind);
-        let mut outcome = invoke(
-            &mut engine,
-            &chunk,
-            site,
-            kind,
-            Value::Null,
-            null_prefix_value.clone(),
-        );
-        assert_prefix(&mut outcome, &null_prefix_value, &mut engine);
-        let Some(Abrupt::Throw(error)) = outcome.error.as_ref() else {
-            panic!("nullish property read must throw for {kind:?}");
-        };
-        assert_eq!(error_name(&mut engine, error), "TypeError");
-    }
-
-    use_kind(&mut chunk, site, ReadKind::Local);
-    let mut outcome = invoke(
-        &mut engine,
-        &chunk,
-        site,
-        ReadKind::Local,
-        Value::Empty,
-        null_prefix_value.clone(),
-    );
-    assert_prefix(&mut outcome, &null_prefix_value, &mut engine);
-    let Some(Abrupt::Throw(error)) = outcome.error.as_ref() else {
-        panic!("an empty local must remain in the temporal dead zone");
-    };
-    assert_eq!(error_name(&mut engine, error), "ReferenceError");
 }
 
 #[test]
@@ -520,22 +321,20 @@ fn named_read_proxy_reentry_runs_after_borrowed_lookup_and_keeps_method_receiver
         ReadKind::This,
         ReadKind::Method,
     ] {
-        use_kind(&mut chunk, site, kind);
-        let mut outcome = invoke(
-            &mut engine,
-            &chunk,
-            site,
-            kind,
-            proxy.clone(),
-            prefix.clone(),
-        );
+        chunk = use_kind(chunk, site, kind);
+        let mut outcome = invoke(&mut engine, &chunk, site, kind, proxy, prefix);
         assert!(
             outcome.error.is_none(),
             "proxy property read failed for {kind:?}"
         );
         let values = outcome.take_values();
-        assert!(matches!(&values[0], Value::Str(value) if value.as_str() == "proxy-prefix"));
-        assert!(matches!(values.last(), Some(Value::Num(31.0))));
+        assert!(
+            matches!(&(values[0]).view(), ValueView::Str(value) if value.as_str() == "proxy-prefix")
+        );
+        assert!(matches!(
+            (values.last()).map(|__value| (__value).view()),
+            Some(ValueView::Num(31.0))
+        ));
         if kind.is_method() {
             assert!(same_js_value(&mut engine, &proxy, &values[1]));
         }

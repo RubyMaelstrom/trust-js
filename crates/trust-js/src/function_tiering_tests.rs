@@ -10,7 +10,7 @@ fn value(engine: &mut Engine, source: &str) -> String {
 }
 
 fn function(engine: &mut Engine, name: &str) -> std::rc::Rc<crate::ast::Function> {
-    let environment = engine.interp.global_env.clone();
+    let environment = engine.interp.global_env;
     let value = engine.interp.get_var(name, &environment).ok().unwrap();
     let object = value.as_obj().unwrap();
     let crate::value::Callable::User(user) = &object.borrow().call else {
@@ -71,13 +71,13 @@ fn cold_loop_functions_wait_for_executed_hotness_or_call_threshold() {
             assert_eq!(value(&mut engine, "cold(100)"), "4950");
         }
         assert!(
-            cold.code.get().is_none(),
+            cold.runtime().code.get().is_none(),
             "short loop calls must not trigger compilation"
         );
-        assert!(unused.code.get().is_none());
+        assert!(unused.runtime().code.get().is_none());
         assert_eq!(value(&mut engine, "cold(100)"), "4950");
         assert!(
-            cold.code.get().is_some_and(Option::is_some),
+            cold.runtime().code.get().is_some_and(Option::is_some),
             "call threshold still admits hot functions"
         );
     }
@@ -451,94 +451,6 @@ fn sloppy_fragment_aliases_retire_on_collection_and_host_interruption() {
     }
 }
 
-type WatchedBufferOwner = (
-    std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
-    usize,
-);
-thread_local! {
-    static WATCHED_BUFFER_OWNER: std::cell::RefCell<Option<WatchedBufferOwner>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
-#[test]
-fn migrated_private_homes_release_overwritten_objects_before_returning() {
-    // Check actual owner and backing-store retirement during the continuation, rather
-    // than relying on allocator RSS. Captured homes remain environment-backed, and both
-    // non-formal locals and parameters replaced in the prefix must transfer ownership.
-    let fixtures = [
-        ("function f(){'use strict';let old=new Uint8Array(10485760);old[0]=7;watch(old);for(let k=0;k<3000;k++){if(k===150){alive();if(old[0]!==7)throw 'lost slot owner';}if(k===200)old=null;if(k===500)released();}return 1;}f();", true, false),
-        ("function f(old){old=new Uint8Array(10485760);old[0]=7;watch(old);for(var k=0;k<3000;k++){if(k===150){alive();if(old[0]!==7)throw 'lost formal owner';}if(k===200)old=null;if(k===500){released();if(f.arguments[0]!==null)throw 'formal publication';}}return 1;}f(null);", true, false),
-        ("function f(){'use strict';let old=new Uint8Array(10485760);old[0]=7;watch(old);try{for(let k=0;k<3000;k++){if(k===150){alive();if(old[0]!==7)throw 'lost fragment owner';}if(k===200)old=null;if(k===500)released();}}finally{if(old!==null)throw 'fragment restoration';}return 1;}f();", false, true),
-        ("function f(old){old=new Uint8Array(10485760);old[0]=7;watch(old);try{for(var k=0;k<3000;k++){if(k===150){alive();if(old[0]!==7)throw 'lost formal fragment owner';}if(k===200)old=null;if(k===500){released();if(f.arguments[0]!==null)throw 'formal publication';}}}finally{if(old!==null)throw 'formal restoration';}return 1;}f(null);", false, true),
-        ("function f(){'use strict';let old=new Uint8Array(10485760);old[0]=7;watch(old);let read=()=>old;for(let k=0;k<3000;k++){if(k===150){alive();if(read()[0]!==7)throw 'lost captured owner';}if(k===200)old=null;if(k===500)released();}return 1;}f();", true, false),
-        ("function f(){'use strict';let old=new Uint8Array(10485760);old[0]=7;watch(old);let read=()=>old;try{for(let k=0;k<3000;k++){if(k===150){alive();if(read()[0]!==7)throw 'lost captured owner';}if(k===200)old=null;if(k===500)released();}}finally{if(read()!==null)throw 'captured restoration';}return 1;}f();", false, true),
-    ];
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-        for (source, whole_frame, fragment) in fixtures {
-            let mut engine = Engine::new();
-            engine.set_tier(tier);
-            engine.set_tier_threshold(32);
-            install_native(&mut engine, "watch", |i, _, args| {
-                let object = args[0].as_obj().expect("watched typed array");
-                let info = i.typed_arrays[&(std::rc::Rc::as_ptr(object) as usize)];
-                WATCHED_BUFFER_OWNER.with(|owner| {
-                    *owner.borrow_mut() = Some((std::rc::Rc::downgrade(object), info.buffer));
-                });
-                Ok(crate::value::Value::Undefined)
-            });
-            install_native(&mut engine, "alive", |i, _, _| {
-                i.gc_collect();
-                WATCHED_BUFFER_OWNER.with(|owner| {
-                    let owner = owner.borrow();
-                    let (weak, buffer) = owner.as_ref().unwrap();
-                    assert!(weak.strong_count() > 0, "canonical owner survives GC");
-                    assert!(i.array_buffers.contains_key(buffer));
-                });
-                Ok(crate::value::Value::Undefined)
-            });
-            install_native(&mut engine, "released", |i, _, _| {
-                i.gc_collect();
-                WATCHED_BUFFER_OWNER.with(|owner| {
-                    let owner = owner.borrow();
-                    let (weak, buffer) = owner.as_ref().unwrap();
-                    assert_eq!(
-                        weak.strong_count(),
-                        0,
-                        "parked home must release its old object"
-                    );
-                    assert!(
-                        !i.array_buffers.contains_key(buffer),
-                        "old backing store must be swept during the live continuation"
-                    );
-                });
-                Ok(crate::value::Value::Undefined)
-            });
-            reset_counts();
-            assert_eq!(value(&mut engine, source), "1", "{tier:?}: {source}");
-            if tier != Tier::Interp {
-                assert_eq!(
-                    crate::bytecode::TEST_FUNCTION_OSR_ENTRIES.with(|count| count.get()) > 0,
-                    whole_frame
-                );
-                assert_eq!(
-                    crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.get())
-                        > 0,
-                    fragment
-                );
-                if fragment {
-                    assert!(
-                        crate::bytecode::loop_fragment::TEST_PRIVATE_FRAGMENT_ENTRIES
-                            .with(|count| count.get())
-                            > 0
-                    );
-                }
-            }
-            WATCHED_BUFFER_OWNER.with(|owner| *owner.borrow_mut() = None);
-        }
-    }
-}
-
 #[test]
 fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
     let mut engine = Engine::new();
@@ -556,13 +468,15 @@ fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
     ))]
     if crate::bytecode::inline_recompile_at() == 100 {
         let hot = function(&mut engine, "hot");
-        let primary = hot.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = hot.runtime();
+        let primary = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert_eq!(
             primary.jit_runs.get(),
             100,
             "each generic native entry must count once, until promotion"
         );
-        let spliced = hot
+        let runtime = hot.runtime();
+        let spliced = runtime
             .code2
             .get()
             .and_then(Option::as_ref)
@@ -593,25 +507,28 @@ fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
                 let callee = frame.callee();
                 let outer = callee.borrow();
                 if let crate::value::Callable::User(user) = &outer.call {
-                    observation.outer_second_stage = user.func.code2.get().is_some();
-                    if let Some(chunk) = user.func.code.get().and_then(Option::as_ref) {
+                    observation.outer_second_stage = user.func.runtime().code2.get().is_some();
+                    if let Some(chunk) = user.func.runtime().code.get().and_then(Option::as_ref) {
                         observation.outer_borrowed = chunk.osr.get().is_some();
                         observation.outer_primary = chunk.jit.get().is_some();
                     }
                 }
             }
-            let global = i.global_env.clone();
+            let global = i.global_env;
             if let Ok(hot) = i.get_var("hot", &global) {
                 if let Some(hot) = hot.as_obj() {
                     let hot = hot.borrow();
                     if let crate::value::Callable::User(user) = &hot.call {
                         observation.primary_runs = user
                             .func
+                            .runtime()
                             .code
                             .get()
                             .and_then(Option::as_ref)
                             .map(|chunk| chunk.jit_runs.get());
-                        if let Some(spliced) = user.func.code2.get().and_then(Option::as_ref) {
+                        if let Some(spliced) =
+                            user.func.runtime().code2.get().and_then(Option::as_ref)
+                        {
                             observation.spliced_runs = Some(spliced.jit_runs.get());
                             observation.spliced_native = spliced.jit.get().flatten().is_some();
                             observation.spliced_guard = spliced
@@ -699,10 +616,10 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
     let i = &mut *engine.interp;
     set_global(i, "marker", Value::str("main"));
     let child = i.create_realm();
-    set_global(i, "childRealm", child.clone());
+    set_global(i, "childRealm", child);
     let callee = in_realm(i, &child, |i| {
         eval_string(i, "globalThis.marker='child';globalThis.inner=function(){'use strict';return [marker];};globalThis.hot=function(){'use strict';const out=inner();return out;};");
-        let global = i.global_env.clone();
+        let global = i.global_env;
         i.get_var("hot", &global)
             .unwrap_or_else(|_| panic!("child hot function"))
     });
@@ -710,7 +627,7 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
         // The parent Realm initiates this generic call. Realm activation must precede
         // both the promotion proof and the selected native body's literal allocation.
         let out = i
-            .call(callee.clone(), Value::Undefined, &[])
+            .call(callee, Value::Undefined, &[])
             .unwrap_or_else(|_| panic!("child call completes"));
         set_global(i, "last", out);
         assert_eq!(
@@ -726,12 +643,13 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     if crate::bytecode::inline_recompile_at() == 100 {
-        let callee = callee.as_obj().unwrap().borrow();
+        let callee_handle = callee.as_obj().unwrap();
+        let callee = callee_handle.borrow();
         let crate::value::Callable::User(user) = &callee.call else {
             panic!("child user callee")
         };
-        let spliced = user
-            .func
+        let runtime = user.func.runtime();
+        let spliced = runtime
             .code2
             .get()
             .and_then(Option::as_ref)

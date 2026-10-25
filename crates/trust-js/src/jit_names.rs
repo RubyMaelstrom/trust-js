@@ -11,17 +11,38 @@ use crate::bytecode::lexical_cache::{
 #[cfg(test)]
 thread_local! {
     pub(super) static TEST_NATIVE_DEEP_NAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Successful value load, value store, numeric update, numeric chain load, loop preload.
+    pub(super) static TEST_NATIVE_NAME_COMMITS: [std::cell::Cell<usize>; 5] = const {
+        [const { std::cell::Cell::new(0) }; 5]
+    };
     pub(super) static TEST_NATIVE_REFERENCES: [std::cell::Cell<usize>; 3] = const {
         [std::cell::Cell::new(0), std::cell::Cell::new(0), std::cell::Cell::new(0)]
     };
+}
+
+/// A successful operation, after its final guard and value/stack mutation. No call or poll;
+/// x9/x10 are scratch at these commit sites and all live words stay in their original homes.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(super) fn record_name_commit(a: &mut asm::Asm, kind: usize) {
+    let address = TEST_NATIVE_NAME_COMMITS.with(|counts| counts[kind].as_ptr() as usize);
+    a.mov_imm64(9, address as u64);
+    a.ldr_imm(10, 9, 0);
+    a.add_imm(10, 10, 1);
+    a.str_imm(10, 9, 0);
 }
 
 #[cfg(test)]
 #[path = "jit_names_tests.rs"]
 mod tests;
 
-/// x12: descriptor; x9: current Rc::as_ptr(Scope). On success x14 is Value/PackedValue address,
-/// x7 identifies packed property(1) or wide binding(0). Clobbers x7,x9..x17 and NZCV only.
+#[cfg(test)]
+#[path = "jit_packed_name_tests.rs"]
+mod packed_tests;
+
+/// x12: descriptor; x9: the current scope's `Env::as_ptr`. On success x14 is Value
+/// address, x7 identifies Property(1) or Binding(0). Both store words; the flag preserves
+/// descriptor/initialization/mutability rules and the actual owner. Clobbers x7,x9..x17 and NZCV
+/// only.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "macos", target_os = "windows")
@@ -30,7 +51,7 @@ fn emit_deep_name_target_ptr(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     slow: usize,
-    packed_ok: bool,
+    property_ok: bool,
 ) {
     use std::mem::offset_of;
     let loop_head = a.new_label();
@@ -52,8 +73,9 @@ fn emit_deep_name_target_ptr(
     a.cmp_imm_x(11, 16);
     a.b_cond(C_HI, slow);
     a.bind(loop_head);
-    a.ldrb_imm(13, 9, layout.scope_with as u32);
-    a.cmp_imm_w(13, layout.scope_with_none as u32);
+    a.ldr_imm(13, 9, layout.scope_with as u32);
+    a.mov_imm64(14, layout.scope_with_none);
+    a.cmp_reg_x(13, 14);
     a.b_cond(C_NE, slow);
     a.ldr_imm(13, 10, NAME_GUARD_IDENTITY as u32);
     a.cmp_reg_x(13, 9);
@@ -75,7 +97,6 @@ fn emit_deep_name_target_ptr(
     a.cbz(11, true, holder);
     a.ldr_imm(9, 9, layout.scope_parent as u32);
     a.cbz(9, true, slow);
-    a.add_imm(9, 9, layout.scope_data_off as u32);
     a.add_imm(10, 10, NAME_GUARD_SIZE as u32);
     a.b(loop_head);
     a.bind(holder);
@@ -95,17 +116,17 @@ fn emit_deep_name_target_ptr(
     a.ldr_imm(14, 12, offset_of!(NativeNameDescriptor, binding) as u32);
     a.b(binding_ready);
     a.bind(holder_slot);
-    if layout.scope_small_valid {
+    if scope_entries_fit(layout) {
         a.ldrb_imm(13, 9, layout.scope_small_tag as u32);
         a.cmp_imm_w(13, 1);
         a.b_cond(C_EQ, slow);
         a.cmp_imm_w(13, 2);
         a.b_cond(C_HI, slow);
         a.ldr_imm(13, 12, offset_of!(NativeNameDescriptor, slot) as u32);
-        a.ldr_imm(14, 9, (layout.scope_small_vec + layout.vec_len_off) as u32);
+        scope_entries_len(a, layout, 14, 9);
         a.cmp_reg_x(13, 14);
         a.b_cond(C_HS, slow);
-        a.ldr_imm(14, 9, (layout.scope_small_vec + layout.vec_ptr_off) as u32);
+        scope_entries_data(a, layout, 14, 9);
         a.mov_imm64(15, layout.scope_binding_stride as u64);
         a.madd(14, 13, 15, 14);
         a.add_imm(14, 14, layout.scope_binding_offset as u32);
@@ -117,7 +138,7 @@ fn emit_deep_name_target_ptr(
     a.movz(7, 0, 0);
     a.b(done);
     a.bind(global);
-    if !packed_ok {
+    if !property_ok {
         a.b(slow);
     }
     a.cmp_imm_w(13, 1);
@@ -137,18 +158,10 @@ fn emit_deep_name_target_ptr(
     a.cmp_reg_w(13, 15);
     a.b_cond(C_NE, slow);
     a.ldr_imm(13, 12, offset_of!(NativeNameDescriptor, slot) as u32);
-    a.ldr_imm(
-        15,
-        14,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    fields_len(a, layout, 15, 14);
     a.cmp_reg_x(13, 15);
     a.b_cond(C_HS, slow);
-    a.ldr_imm(
-        15,
-        14,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    fields_data(a, layout, 15, 14);
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
     a.mov(14, 15);
@@ -156,7 +169,7 @@ fn emit_deep_name_target_ptr(
     a.bind(done);
 }
 
-fn deep_layout_supported(layout: &crate::value::JitLayout) -> bool {
+pub(super) fn deep_layout_supported(layout: &crate::value::JitLayout) -> bool {
     layout.scope_parent_valid
         && layout.scope_with_valid
         && layout.scope_parent.is_multiple_of(8)
@@ -164,10 +177,7 @@ fn deep_layout_supported(layout: &crate::value::JitLayout) -> bool {
         && layout.scope_with < 4096
         && (!layout.scope_small_valid
             || (layout.scope_small_tag < 4096
-                && (layout.scope_small_vec + layout.vec_ptr_off).is_multiple_of(8)
-                && (layout.scope_small_vec + layout.vec_ptr_off) / 8 < 4096
-                && (layout.scope_small_vec + layout.vec_len_off).is_multiple_of(8)
-                && (layout.scope_small_vec + layout.vec_len_off) / 8 < 4096
+                && scope_entries_fit(layout)
                 && layout.scope_binding_offset < 4096))
 }
 
@@ -177,9 +187,9 @@ pub(super) fn emit_deep_name_value_ptr(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     slow: usize,
-    packed_ok: bool,
+    property_ok: bool,
 ) {
-    emit_deep_name_target_ptr(a, layout, slow, packed_ok);
+    emit_deep_name_target_ptr(a, layout, slow, property_ok);
     emit_target_value_ptr(a, layout, slow);
     #[cfg(test)]
     {
@@ -218,7 +228,6 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.cbnz(7, false, property);
     a.ldr_imm(9, 8, offset_of!(R, scope) as u32);
     a.cbz(9, true, slow);
-    a.add_imm(9, 9, layout.scope_data_off as u32);
     a.ldr_w_imm(10, 8, offset_of!(R, generation) as u32);
     a.cmn_imm_w(10, 1);
     a.b_cond(C_EQ, slow);
@@ -233,10 +242,9 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.b_cond(C_NE, slow);
     a.ldr_imm(9, 8, offset_of!(R, object) as u32);
     a.cbz(9, true, slow);
-    a.add_imm(9, 9, layout.obj_from_rc as u32);
+    a.add_imm(9, 9, layout.obj_from_cell as u32);
     a.ldrb_imm(10, 9, layout.obj_exotic as u32);
-    a.cmp_imm_w(10, layout.exotic_none_tag as u32);
-    a.b_cond(C_NE, slow);
+    guard_exotic_ordinary(a, layout, 10, 10, slow);
     a.ldrb_imm(10, 9, layout.obj_ic_plain as u32);
     a.cbz(10, false, slow);
     a.ldr_w_imm(10, 8, offset_of!(R, shape) as u32);
@@ -247,21 +255,30 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.cmp_reg_w(10, 11);
     a.b_cond(C_NE, slow);
     a.ldr_imm(10, 8, offset_of!(R, slot) as u32);
-    a.ldr_imm(
-        11,
-        9,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    fields_len(a, layout, 11, 9);
     a.cmp_reg_x(10, 11);
     a.b_cond(C_HS, slow);
-    a.ldr_imm(
-        14,
-        9,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    fields_data(a, layout, 14, 9);
     a.mov_imm64(11, layout.entry_size as u64);
     a.madd(14, 10, 11, 14);
     a.bind(done);
+}
+
+/// Whether the Reference `reference` read at `pc` can name `prototype`, the one key whose value
+/// can be a function's deferred prototype. The compiler gives every `ResolveNameRef` a fresh
+/// Reference, emitted before the Reference's uses, so the nearest one before `pc` names it; a
+/// Reference whose `ResolveNameRef` is not found is treated as if it could.
+fn reference_may_name_prototype(chunk: &Chunk, pc: usize, reference: u16) -> bool {
+    chunk.jit_ops()[..pc]
+        .iter()
+        .rev()
+        .find_map(|op| match *op {
+            crate::bytecode::Op::ResolveNameRef(name, resolved) if resolved == reference => {
+                Some(chunk.jit_name(name) == "prototype")
+            }
+            _ => None,
+        })
+        .unwrap_or(true)
 }
 
 /// Whole-operation native Reference template. All proof/owner guards precede mutation. The
@@ -325,7 +342,6 @@ pub(super) fn emit_reference_op(
             a.cbnz(7, false, property);
             a.ldr_imm(13, 8, offset_of!(R, scope) as u32);
             a.cbz(13, true, slow);
-            a.add_imm(13, 13, layout.scope_data_off as u32);
             a.cmp_reg_x(13, 9);
             a.b_cond(C_NE, slow);
             // Commit only non-owning address hints; exact record/name owners stay unchanged.
@@ -336,7 +352,7 @@ pub(super) fn emit_reference_op(
             a.bind(property);
             a.ldr_imm(13, 8, offset_of!(R, object) as u32);
             a.cbz(13, true, slow);
-            a.add_imm(13, 13, layout.obj_from_rc as u32);
+            a.add_imm(13, 13, layout.obj_from_cell as u32);
             a.ldr_imm(15, 19, offset_of!(JitCtx, global_body) as u32);
             a.cmp_reg_x(13, 15);
             a.b_cond(C_NE, slow);
@@ -354,13 +370,20 @@ pub(super) fn emit_reference_op(
         Op::LoadRef(_) => {
             emit_reference_target_ptr(a, layout, slow);
             emit_target_value_ptr(a, layout, slow);
-            emit_load_name_value(a, layout, None, slow, false);
+            let prototype_key = reference_may_name_prototype(chunk, pc as usize, reference);
+            emit_load_name_value(a, slow, false, prototype_key);
             a.b(fast_done);
         }
         Op::StoreRef(_) => {
             emit_reference_target_ptr(a, layout, slow);
             emit_target_value_ptr(a, layout, slow);
-            emit_store_name_value(a, layout, slow, fast_done);
+            emit_store_name_value(
+                a,
+                layout,
+                NameStoreOwner::Reference(reference),
+                slow,
+                fast_done,
+            );
         }
         _ => unreachable!(),
     }

@@ -14,16 +14,16 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn chunk(i: &mut Interp, name: &str) -> Rc<Chunk> {
-    let env = i.global_env.clone();
+    let env = i.global_env;
     let value = i.get_var(name, &env).ok().expect("fixture function");
-    let object = value.as_obj().expect("function object").borrow();
+    let object_handle = value.as_obj().expect("function object");
+    let object = object_handle.borrow();
     let Callable::User(user) = &object.call else {
         panic!("user function")
     };
     user.func
-        .code2
-        .get()
-        .or_else(|| user.func.code.get())
+        .runtime()
+        .execution_code()
         .and_then(Option::as_ref)
         .expect("fixture bytecode")
         .clone()
@@ -131,7 +131,7 @@ fn direct_return_and_throw_survive_reentrant_reclamation() {
     };
     assert!(matches!(mode.as_str(), "stable" | "stale"));
     let mut e = engine();
-    let global = e.interp.global.clone();
+    let global = e.interp.global;
     e.interp
         .def_method(&global, "reclaimNow", 0, reclaim_from_native);
     eval(
@@ -447,7 +447,7 @@ fn recompiled_functions_keep_their_original_realm() {
         .global
         .borrow_mut()
         .props
-        .insert("other", crate::value::Property::plain(child.clone()));
+        .insert("other", crate::value::Property::plain(child));
     e.interp
         .eval_in_realm(
             &child,
@@ -483,6 +483,11 @@ fn recompiled_functions_keep_their_original_realm() {
     assert_eq!(lease.residency.active.get(), 0);
 }
 
+/// Code owners' deaths and the cache states they leave, observed through collections with
+/// every strong handle and cell address the test uses kept in helper frames (the collector
+/// scans the stack, and a cached entry's raw callee address would retain its callee). A cache's
+/// object pin is a weak handle, so the dead callee's address stays reserved while the cache
+/// names it.
 #[test]
 fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() {
     // Epoch is process-global. Isolate this proof from other tests deliberately
@@ -506,14 +511,16 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         );
         return;
     }
-    use crate::value::Value;
+    use crate::gc_test::{alive, in_frame, HiddenAddress};
+    use crate::value::{Gc, Value};
     use std::sync::atomic::Ordering::Relaxed;
     fn value(e: &mut Engine, name: &str) -> Value {
-        let env = e.interp.global_env.clone();
+        let env = e.interp.global_env;
         e.interp.get_var(name, &env).ok().expect("fixture binding")
     }
     fn function_pin(value: &Value) -> std::rc::Weak<crate::ast::Function> {
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let Callable::User(user) = &object.call else {
             panic!("ordinary function")
         };
@@ -528,6 +535,29 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
             "5"
         );
     }
+    /// The address-free part of `caller`'s cached entry for the callee at `key`: its code and
+    /// function.
+    #[inline(never)]
+    fn cached(caller: &Chunk, key: HiddenAddress) -> Option<(usize, usize)> {
+        caller
+            .cached_call_for(key.get())
+            .map(|ic| (ic.code as usize, ic.func as usize))
+    }
+    /// The native code of the global function `name`, weakly.
+    fn native_code(e: &mut Engine, name: &str) -> std::rc::Weak<JitCode> {
+        let callee = chunk(&mut e.interp, name);
+        let code = callee.jit.get().flatten().expect("native callee");
+        Rc::downgrade(&code)
+    }
+    /// Whether the cell at `key` is still allocated (live, or dead and weakly pinned).
+    #[inline(never)]
+    fn reserved(e: &Engine, key: HiddenAddress) -> bool {
+        e.interp
+            .gc_heap
+            .core
+            .borrow()
+            .is_allocated_word(key.get() as u64)
+    }
     // ECMA-262 OrdinaryFunctionCreate / PrepareForOrdinaryCall (local e28783d5):
     // a new function retains its own identity/context even when code storage
     // from an unreachable earlier function has been released and reused.
@@ -537,59 +567,50 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
             &mut e,
             "var target=new Function('x','return x+1');function invokeTarget(f,x){return f(x,99);}",
         );
-        let target = value(&mut e, "target");
-        let object = target.as_obj().unwrap();
-        let object_pin = Rc::downgrade(object);
-        let function_pin = function_pin(&target);
-        let object_weak_before = object_pin.weak_count();
+        let (object_pin, function_pin, key) = in_frame(|| {
+            let target = value(&mut e, "target");
+            (
+                Gc::downgrade(&target.as_obj().unwrap()),
+                function_pin(&target),
+                HiddenAddress::of(&target),
+            )
+        });
         let function_weak_before = function_pin.weak_count();
-        let key = Rc::as_ptr(object) as usize;
         warm(&mut e);
         let caller = chunk(&mut e.interp, "invokeTarget");
         assert!(caller.jit.get().flatten().is_some(), "real compiled caller");
-        let ic = caller
-            .cached_call_for(key)
-            .expect("actual populated primary IC");
-        assert_eq!(ic.func, function_pin.as_ptr());
-        assert!(
-            object_pin.weak_count() > object_weak_before,
-            "cache separately pins object allocation"
-        );
+        let ic = cached(&caller, key).expect("actual populated primary IC");
+        assert_eq!(ic.1, function_pin.as_ptr() as usize);
         assert!(
             function_pin.weak_count() > function_weak_before,
             "code sharing separately pins AST allocation"
         );
-        let callee = chunk(&mut e.interp, "target");
-        let code = Rc::downgrade(&callee.jit.get().flatten().expect("real compiled callee"));
-        drop(callee);
-        drop(target);
+        let code = in_frame(|| native_code(&mut e, "target"));
         // Interp assignment avoids compiling unrelated Script/inline code in
         // the observed interval. Collection does not mean cache eviction.
         e.set_tier(Tier::Interp);
         eval(&mut e, "target=null;");
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(Relaxed);
         e.interp.gc_collect();
-        assert!(object_pin.upgrade().is_none());
+        assert!(!alive(&object_pin));
         assert!(function_pin.upgrade().is_none());
         assert!(
             code.upgrade().is_none(),
             "mapping owner died while caller cache survived"
         );
-        assert_eq!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
-        let stale = caller
-            .cached_call_for(key)
-            .expect("stale identity intentionally remains weak-pinned");
-        assert_eq!(stale.code, ic.code);
-        assert_eq!(stale.func, function_pin.as_ptr());
+        assert_ne!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
+        let stale = cached(&caller, key).expect("stale identity intentionally remains weak-pinned");
+        assert_eq!(stale, ic);
+        // Without the test's own pin, the cache's keeps the dead callee's address reserved.
+        drop(object_pin);
+        e.interp.gc_collect();
+        assert!(reserved(&e, key), "cache separately pins object allocation");
         e.set_tier(Tier::Jit);
         assert_eq!(eval(&mut e, "target=new Function('x','return x+70');target(1);invokeTarget(target,2);invokeTarget(target,3);"), "73");
-        assert_ne!(
-            value(&mut e, "target")
-                .as_obj()
-                .map(|object| Rc::as_ptr(object))
-                .unwrap() as usize,
-            key
-        );
+        assert!(in_frame(|| {
+            let target = value(&mut e, "target");
+            Gc::as_ptr(&target.as_obj().unwrap()) as usize != key.get()
+        }));
     }
     // The first closure may die while a sibling with the SAME immutable AST
     // remains. A code-sharing hit must use the live sibling's environment, not
@@ -597,13 +618,30 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
     {
         let mut e = engine();
         eval(&mut e, "var factory=new Function('offset','return function(x){return offset+x}');var first=factory(17),sibling=factory(37);function invokeShared(f,x){return f(x,99);}");
-        let first = value(&mut e, "first");
-        let first_pin = Rc::downgrade(first.as_obj().unwrap());
-        let first_key = Rc::as_ptr(first.as_obj().unwrap()) as usize;
-        let ast = function_pin(&first);
-        let sibling = value(&mut e, "sibling");
-        let sibling_key = Rc::as_ptr(sibling.as_obj().unwrap()) as usize;
-        assert_eq!(ast.as_ptr(), function_pin(&sibling).as_ptr());
+        let (first_pin, first_key, ast, sibling_key, factory_pin) = in_frame(|| {
+            let first = value(&mut e, "first");
+            let sibling = value(&mut e, "sibling");
+            let factory = value(&mut e, "factory");
+            let ast = function_pin(&first);
+            assert_eq!(ast.as_ptr(), function_pin(&sibling).as_ptr());
+            (
+                Gc::downgrade(&first.as_obj().unwrap()),
+                HiddenAddress::of(&first),
+                ast,
+                HiddenAddress::of(&sibling),
+                Gc::downgrade(&factory.as_obj().unwrap()),
+            )
+        });
+        // Retire the factory's separate runtime before warming the sharing proof. After the
+        // first closure dies below, only the sibling retains the inner AST and runtime.
+        e.set_tier(Tier::Interp);
+        eval(&mut e, "factory=null;");
+        e.interp.gc_collect();
+        assert!(
+            !alive(&factory_pin),
+            "factory no longer retains the inner AST"
+        );
+        e.set_tier(Tier::Jit);
         assert_eq!(
             eval(
                 &mut e,
@@ -613,17 +651,14 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         );
         let caller = chunk(&mut e.interp, "invokeShared");
         assert!(caller.jit.get().flatten().is_some());
-        assert!(caller.cached_call_for(first_key).is_some());
-        assert!(caller.cached_call_for(sibling_key).is_none());
-        let callee = chunk(&mut e.interp, "first");
-        let code = Rc::downgrade(&callee.jit.get().flatten().expect("native shared body"));
-        drop(callee);
-        drop(first);
+        assert!(cached(&caller, first_key).is_some());
+        assert!(cached(&caller, sibling_key).is_none());
+        let code = in_frame(|| native_code(&mut e, "first"));
         e.set_tier(Tier::Interp);
-        eval(&mut e, "first=null;factory=null;");
+        eval(&mut e, "first=null;");
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(Relaxed);
         e.interp.gc_collect();
-        assert!(first_pin.upgrade().is_none());
+        assert!(!alive(&first_pin));
         assert!(ast.upgrade().is_some());
         assert!(
             code.upgrade().is_some(),
@@ -633,15 +668,14 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         e.set_tier(Tier::Jit);
         assert_eq!(eval(&mut e, "invokeShared(sibling,4);"), "41");
         assert!(
-            caller.cached_call_for(sibling_key).is_none(),
+            cached(&caller, sibling_key).is_none(),
             "Function-only hit did not refill identity"
         );
-        assert!(caller.cached_call_for(first_key).is_some());
-        drop(sibling);
+        assert!(cached(&caller, first_key).is_some());
     }
     // Overflow owns an independent object pin after its original caller Chunk
-    // disappears. Seed it from a REAL compiled primary entry, then exercise its
-    // normal guarded Rust hit through the reusable native callback entry.
+    // disappears. First prove its current-epoch hit through a fresh empty callback cache;
+    // caller retirement must then fence that entry, while a later callback recovers normally.
     {
         let mut e = engine();
         eval(
@@ -649,17 +683,48 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
             "var target=new Function('x','return x+1');function invokeTarget(f,x){return f(x,99);}",
         );
         warm(&mut e);
-        let target = value(&mut e, "target");
-        let pin = Rc::downgrade(target.as_obj().unwrap());
-        let key = Rc::as_ptr(target.as_obj().unwrap()) as usize;
-        let caller = chunk(&mut e.interp, "invokeTarget");
-        let caller_code = Rc::downgrade(&caller.jit.get().flatten().unwrap());
-        let ic = caller.cached_call_for(key).expect("native primary entry");
-        let callee = chunk(&mut e.interp, "target");
-        let callee_code = Rc::downgrade(&callee.jit.get().flatten().unwrap());
-        drop(callee);
-        e.interp.call_overflow.insert(ic, pin.clone());
-        drop(caller);
+        let (pin, key) = in_frame(|| {
+            let target = value(&mut e, "target");
+            (
+                Gc::downgrade(&target.as_obj().unwrap()),
+                HiddenAddress::of(&target),
+            )
+        });
+        let caller_code = in_frame(|| {
+            let caller = chunk(&mut e.interp, "invokeTarget");
+            let ic = caller
+                .cached_call_for(key.get())
+                .expect("native primary entry");
+            e.interp.call_overflow.insert(ic, pin.clone());
+            Rc::downgrade(&caller.jit.get().flatten().unwrap())
+        });
+        let callee_code = in_frame(|| native_code(&mut e, "target"));
+        /// Whether the overflow table holds an entry for the callee at `key` in this epoch.
+        #[inline(never)]
+        fn overflow_hit(e: &Engine, key: HiddenAddress) -> bool {
+            let epoch = crate::bytecode::CALL_IC_EPOCH.load(Relaxed);
+            let genv = crate::interpreter::Env::as_ptr(&e.interp.global_env) as usize;
+            e.interp
+                .call_overflow
+                .lookup(key.get(), genv, epoch)
+                .is_some()
+        }
+        assert!(
+            overflow_hit(&e, key),
+            "a current-epoch overflow entry is published"
+        );
+        assert!(in_frame(|| {
+            let target = value(&mut e, "target");
+            // This callback cache has no primary entry: the published overflow is the only
+            // cached route to the live target's native code on its first call.
+            let callback = crate::callback::CallbackCache::new();
+            matches!(
+                (callback.call(&mut e.interp, &target, Value::Undefined, [Value::Num(8.0)]))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(9.0))
+            )
+        }));
+        assert!(overflow_hit(&e, key));
         e.set_tier(Tier::Interp);
         eval(&mut e, "invokeTarget=null;");
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(Relaxed);
@@ -668,36 +733,34 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
             caller_code.upgrade().is_none(),
             "overflow does not retain original caller Chunk"
         );
-        assert_eq!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
-        assert!(e
-            .interp
-            .call_overflow
-            .lookup(key, ic.global_env, epoch)
-            .is_some());
+        assert_ne!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
+        assert!(
+            !overflow_hit(&e, key),
+            "caller runtime retirement fences old raw overflow addresses"
+        );
         assert!(
             pin.weak_count() >= 2,
             "overflow retains its own pin besides the observer"
         );
         e.set_tier(Tier::Jit);
-        let callback = crate::callback::CallbackCache::new();
-        assert!(matches!(
-            callback.call(&mut e.interp, &target, Value::Undefined, [Value::Num(9.0)]),
-            Ok(Value::Num(10.0))
-        ));
-        drop(callback);
-        drop(target);
+        assert!(in_frame(|| {
+            let target = value(&mut e, "target");
+            let callback = crate::callback::CallbackCache::new();
+            matches!(
+                (callback.call(&mut e.interp, &target, Value::Undefined, [Value::Num(9.0)]))
+                    .map(|__value| (__value).view()),
+                Ok(crate::value::ValueView::Num(10.0))
+            )
+        }));
         e.set_tier(Tier::Interp);
         eval(&mut e, "target=null;");
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(Relaxed);
         e.interp.gc_collect();
-        assert!(pin.upgrade().is_none());
+        assert!(!alive(&pin));
         assert!(callee_code.upgrade().is_none());
-        assert_eq!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
+        assert_ne!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
         assert!(
-            e.interp
-                .call_overflow
-                .lookup(key, ic.global_env, epoch)
-                .is_none(),
+            !overflow_hit(&e, key),
             "GC retires dead overflow entry and its pin together"
         );
     }

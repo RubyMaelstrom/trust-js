@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// ECMA-262 #sec-math.random (snapshot e28783d5fc9d) gives each realm's
 /// Math.random a distinct stream. Keep the state on that function, so borrowed
@@ -32,13 +33,15 @@ impl RandomStream {
 impl crate::value::NativeCallableRetained for RandomStream {
     fn scan_retained_memory(&self, _visitor: &mut dyn crate::value::NativeRetainedMemoryVisitor) {
         // The reporter's inline Cell is counted by the native-callable walker;
-        // there are no further allocations or captured JavaScript values.
+        // there are no further allocations.
     }
 }
 
 pub(crate) fn nf_math_sqrt(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    if let [Value::Num(x)] = args {
-        return Ok(Value::Num(x.sqrt()));
+    if let [argument] = args {
+        if let ValueView::Num(x) = argument.view() {
+            return Ok(Value::Num(x.sqrt()));
+        }
     }
     let x = ab(i.to_number(&arg(args, 0)))?;
     Ok(Value::Num(x.sqrt()))
@@ -70,8 +73,10 @@ pub(super) fn install_math(it: &mut Interp) {
     macro_rules! unary {
         ($name:expr, $f:expr, $intrinsic:expr) => {{
             let f: NativeFn = |i, _t, a| {
-                if let [Value::Num(x)] = a {
-                    return Ok(Value::Num($f(*x)));
+                if let [argument] = a {
+                    if let ValueView::Num(x) = argument.view() {
+                        return Ok(Value::Num($f(x)));
+                    }
                 }
                 let x = ab(i.to_number(&arg(a, 0)))?;
                 Ok(Value::Num($f(x)))
@@ -86,8 +91,10 @@ pub(super) fn install_math(it: &mut Interp) {
                 // (§7.1.4), so bypass the generic dispatch for the common numeric case.
                 // All other inputs retain the complete coercive path with its abrupt
                 // completions and valueOf/toString side effects in order.
-                if let [Value::Num(x)] = a {
-                    return Ok(Value::Num($f(*x)));
+                if let [argument] = a {
+                    if let ValueView::Num(x) = argument.view() {
+                        return Ok(Value::Num($f(x)));
+                    }
                 }
                 let x = ab(i.to_number(&arg(a, 0)))?;
                 Ok(Value::Num($f(x)))
@@ -169,13 +176,9 @@ pub(super) fn install_math(it: &mut Interp) {
         let (iter, next) = ab(i.get_iterator(&arg(a, 0)))?;
         let mut finite: Vec<f64> = Vec::new();
         let (mut pos_inf, mut neg_inf, mut nan) = (false, false, false);
-        loop {
-            let item = match ab(i.iterator_step(&iter, &next))? {
-                Some(v) => v,
-                None => break,
-            };
-            match item {
-                Value::Num(n) => {
+        while let Some(item) = ab(i.iterator_step(&iter, &next))? {
+            match item.view() {
+                ValueView::Num(n) => {
                     if n.is_nan() {
                         nan = true;
                     } else if n.is_infinite() {
@@ -227,13 +230,33 @@ pub(super) fn install_math(it: &mut Interp) {
         // work; small numeric calls use the allocation-free common-case helper below
         // (ECMA-262 §21.3.2.19).
         match a {
-            [Value::Num(x)] => return Ok(Value::Num(x.abs())),
-            [Value::Num(x), Value::Num(y)] => return Ok(Value::Num(x.hypot(*y))),
-            [Value::Num(x), Value::Num(y), Value::Num(z)] => {
-                return Ok(Value::Num(hypot_converted(&[*x, *y, *z])))
+            [x] => {
+                if let ValueView::Num(x) = x.view() {
+                    return Ok(Value::Num(x.abs()));
+                }
             }
-            [Value::Num(x), Value::Num(y), Value::Num(z), Value::Num(w)] => {
-                return Ok(Value::Num(hypot_converted(&[*x, *y, *z, *w])))
+            [x, y] => {
+                if let (ValueView::Num(x), ValueView::Num(y)) = (x.view(), y.view()) {
+                    return Ok(Value::Num(x.hypot(y)));
+                }
+            }
+            [x, y, z] => {
+                if let (ValueView::Num(x), ValueView::Num(y), ValueView::Num(z)) =
+                    (x.view(), y.view(), z.view())
+                {
+                    return Ok(Value::Num(hypot_converted(&[x, y, z])));
+                }
+            }
+            [x, y, z, w] => {
+                if let (
+                    ValueView::Num(x),
+                    ValueView::Num(y),
+                    ValueView::Num(z),
+                    ValueView::Num(w),
+                ) = (x.view(), y.view(), z.view(), w.view())
+                {
+                    return Ok(Value::Num(hypot_converted(&[x, y, z, w])));
+                }
             }
             _ => {}
         }
@@ -244,10 +267,12 @@ pub(super) fn install_math(it: &mut Interp) {
         Ok(Value::Num(hypot_converted(&nums)))
     });
     let imul_fn: NativeFn = |i, _t, a| {
-        if let [Value::Num(x), Value::Num(y)] = a {
-            let x = to_uint32(*x) as i32;
-            let y = to_uint32(*y) as i32;
-            return Ok(Value::Num(x.wrapping_mul(y) as f64));
+        if let [x, y] = a {
+            if let (ValueView::Num(x), ValueView::Num(y)) = (x.view(), y.view()) {
+                let x = to_uint32(x) as i32;
+                let y = to_uint32(y) as i32;
+                return Ok(Value::Num(x.wrapping_mul(y) as f64));
+            }
         }
         let x = to_uint32(ab(i.to_number(&arg(a, 0)))?) as i32;
         let y = to_uint32(ab(i.to_number(&arg(a, 1)))?) as i32;
@@ -259,11 +284,11 @@ pub(super) fn install_math(it: &mut Interp) {
     it.def_method(&math, "imul", 2, imul_fn);
     let random_stream = Rc::new(RandomStream::new());
     let captured = random_stream.clone();
-    let random = it.new_native_fn_with_retained_memory(
+    let random = it.new_native_fn(
         "random",
         0,
         Rc::new(move |_i, _t, _a| Ok(Value::Num(captured.next()))),
-        random_stream,
+        crate::value::NativeCaptures::Reported(random_stream),
     );
     math.borrow_mut()
         .props
@@ -279,16 +304,20 @@ pub(super) fn install_math(it: &mut Interp) {
     unary!("asin", f64::asin);
     unary!("acos", f64::acos);
     it.def_method(&math, "pow", 2, |i, _t, a| {
-        if let [Value::Num(base), Value::Num(exp)] = a {
-            return Ok(Value::Num(math_pow_numbers(*base, *exp)));
+        if let [base, exp] = a {
+            if let (ValueView::Num(base), ValueView::Num(exp)) = (base.view(), exp.view()) {
+                return Ok(Value::Num(math_pow_numbers(base, exp)));
+            }
         }
         let base = ab(i.to_number(&arg(a, 0)))?;
         let exp = ab(i.to_number(&arg(a, 1)))?;
         Ok(Value::Num(math_pow_numbers(base, exp)))
     });
     it.def_method(&math, "atan2", 2, |i, _t, a| {
-        if let [Value::Num(y), Value::Num(x)] = a {
-            return Ok(Value::Num(y.atan2(*x)));
+        if let [y, x] = a {
+            if let (ValueView::Num(y), ValueView::Num(x)) = (y.view(), x.view()) {
+                return Ok(Value::Num(y.atan2(x)));
+            }
         }
         Ok(Value::Num(
             ab(i.to_number(&arg(a, 0)))?.atan2(ab(i.to_number(&arg(a, 1)))?),
@@ -302,18 +331,18 @@ pub(super) fn install_math(it: &mut Interp) {
         let mut highest = f64::NEG_INFINITY;
         let mut saw_nan = false;
         for v in a {
-            let Value::Num(number) = v else {
+            let ValueView::Num(number) = v.view() else {
                 return math_max_generic(i, a);
             };
             if number.is_nan() {
                 saw_nan = true;
-            } else if (*number == 0.0
+            } else if (number == 0.0
                 && highest == 0.0
                 && number.is_sign_positive()
                 && highest.is_sign_negative())
-                || *number > highest
+                || number > highest
             {
-                highest = *number;
+                highest = number;
             }
         }
         Ok(Value::Num(if saw_nan { f64::NAN } else { highest }))
@@ -327,18 +356,18 @@ pub(super) fn install_math(it: &mut Interp) {
         let mut lowest = f64::INFINITY;
         let mut saw_nan = false;
         for v in a {
-            let Value::Num(number) = v else {
+            let ValueView::Num(number) = v.view() else {
                 return math_min_generic(i, a);
             };
             if number.is_nan() {
                 saw_nan = true;
-            } else if (*number == 0.0
+            } else if (number == 0.0
                 && lowest == 0.0
                 && number.is_sign_negative()
                 && lowest.is_sign_positive())
-                || *number < lowest
+                || number < lowest
             {
-                lowest = *number;
+                lowest = number;
             }
         }
         Ok(Value::Num(if saw_nan { f64::NAN } else { lowest }))

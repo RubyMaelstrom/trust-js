@@ -1,5 +1,7 @@
 //! ECMA-262 ScriptEvaluation / PrepareForOrdinaryCall / BuiltinCallOrConstruct.
-use crate::{Engine, Value};
+use crate::embed::Value;
+use crate::scope::ValueKind;
+use crate::Engine;
 
 #[test]
 fn host_entry_survives_foreign_calls_and_eval_but_changes_for_callbacks() {
@@ -13,15 +15,14 @@ fn host_entry_survives_foreign_calls_and_eval_but_changes_for_callbacks() {
         engine.set_tier_threshold(0);
         engine.define_global("entry", 0, |ctx, _, _| Ok(ctx.script_entry_global()));
         engine.define_global("callback", 1, |ctx, _, args| {
-            ctx.invoke_callback_entry(args[0].clone(), Value::Undefined, &[])
+            ctx.invoke_callback_entry(args[0], Value::Undefined, &[])
         });
-        let root = engine.global_this();
-        let child = engine.ctx().create_embed_realm();
-        assert!(engine
-            .ctx()
-            .member_set(&root, "child", child.clone())
-            .is_ok());
-        assert!(engine.ctx().member_set(&child, "parent", root).is_ok());
+        engine.scope(|cx| {
+            let root = cx.global_this();
+            let child = cx.create_embed_realm();
+            assert!(cx.member_set(&root, "child", child).is_ok());
+            assert!(cx.member_set(&child, "parent", root).is_ok());
+        });
         let result=engine.eval(r#"
             let step=0; function check(v) { step++; if (!v) throw Error('entry realm '+step); }
             child.eval('globalThis.f=()=>parent.entry(); globalThis.fail=()=>{throw 42}; parent.check(parent.entry()===parent)');
@@ -56,22 +57,21 @@ fn native_operation_observes_script_caller_across_realms_and_eval() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         engine.define_global("caller", 0, |ctx, _, _| Ok(ctx.script_caller_global()));
-        let root = engine.global_this();
-        let child = engine.ctx().create_embed_realm();
-        assert!(engine
-            .ctx()
-            .member_set(&root, "child", child.clone())
-            .is_ok());
-        assert!(engine
-            .ctx()
-            .member_set(&child, "parent", root.clone())
-            .is_ok());
-        assert!(engine
-            .ctx()
-            .with_embed_realm(&child, |ctx| {
-                ctx.define_embed_global("caller", 0, |ctx, _, _| Ok(ctx.script_caller_global()));
-            })
-            .is_ok());
+        engine.scope(|cx| {
+            let root = cx.global_this();
+            let child = cx.create_embed_realm();
+            assert!(cx.member_set(&root, "child", child).is_ok());
+            assert!(cx.member_set(&child, "parent", root).is_ok());
+            assert!(cx
+                .with_embed_realm(&child, |ctx| {
+                    ctx.define_embed_global(
+                        "caller",
+                        0,
+                        |ctx, _, _| Ok(ctx.script_caller_global()),
+                    );
+                })
+                .is_ok());
+        });
         let outcome = engine.eval(r#"
             function assert(x) { if (!x) throw Error('script caller'); }
             assert(child.caller() === globalThis);
@@ -98,7 +98,7 @@ fn native_operation_observes_script_caller_across_realms_and_eval() {
             matches!(module, crate::Completion::Value(_)),
             "module {tier:?}"
         );
-        assert!(matches!(engine.ctx().script_caller_global(), Value::Obj(_)));
+        assert!(engine.scope(|cx| matches!((cx.script_caller_global()).kind(), ValueKind::Obj(_))));
     }
 }
 
@@ -133,44 +133,50 @@ fn import_resolves_against_the_active_script_or_module() {
         engine.set_job_callback_script_caller_capture(true);
         let seen = recording_loader(&mut engine);
         engine.set_import_base("https://a.test/a.js");
-        let script_a = engine.eval_value(
-            "globalThis.fromA = () => import('./fn.js');
+        let script_a = engine.scope(|cx| {
+            matches!(
+                cx.eval_value(
+                    "globalThis.fromA = () => import('./fn.js');
              globalThis.dynamicA = new Function(\"return import('./dynamic.js')\");
              (0, eval)(\"globalThis.evalA = () => import('./eval.js')\");
              Promise.resolve(\"import('./job.js')\").then(eval);
              Promise.resolve().then(() => import('./arrow-job.js'));
              Promise.resolve({then(resolve) { resolve(\"import('./thenable.js')\"); }}).then(eval);",
-        );
-        assert!(matches!(script_a, Ok(Ok(_))), "{tier:?}");
+                ),
+                Ok(Ok(_))
+            )
+        });
+        assert!(script_a, "{tier:?}");
         // The host restores the document's base after the script, before the checkpoint.
         engine.set_import_base("https://doc.test/page.html");
         engine.run_microtasks();
         engine.set_import_base("https://b.test/b.js");
-        let script_b = engine.eval_value(
-            "fromA(); dynamicA(); evalA();
+        let script_b = engine.scope(|cx| {
+            matches!(
+                cx.eval_value(
+                    "fromA(); dynamicA(); evalA();
              (0, eval)(\"import('./indirect.js')\");
              new Function(\"return import('./function-b.js')\")();",
-        );
-        assert!(matches!(script_b, Ok(Ok(_))), "{tier:?}");
+                ),
+                Ok(Ok(_))
+            )
+        });
+        assert!(script_b, "{tier:?}");
         engine.set_import_base("https://doc.test/page.html");
         engine.run_microtasks();
         // With no active script, the current Realm's base applies.
-        engine
-            .ctx()
-            .define_embed_global("hostImport", 1, |ctx, _, args| {
+        engine.scope(|cx| {
+            cx.define_embed_global("hostImport", 1, |ctx, _, args| {
                 let import = ctx.member_get(&ctx.global_this(), "eval")?;
-                ctx.invoke(import, Value::Undefined, &[args[0].clone()])
+                ctx.invoke(import, Value::Undefined, &[args[0]])
             });
-        let host = engine.global_this();
-        let host_import = engine
-            .ctx()
-            .member_get(&host, "hostImport")
-            .unwrap_or_else(|_| panic!("hostImport"));
-        let _ = engine.ctx().invoke(
-            host_import,
-            Value::Undefined,
-            &[Value::lstr("import('./host.js')")],
-        );
+            let host = cx.global_this();
+            let host_import = cx
+                .member_get(&host, "hostImport")
+                .unwrap_or_else(|_| panic!("hostImport"));
+            let source = cx.str("import('./host.js')");
+            let _ = cx.invoke(host_import, Value::Undefined, &[source]);
+        });
         engine.run_microtasks();
         assert_eq!(
             *seen.borrow(),
@@ -220,10 +226,10 @@ fn non_browser_hosts_keep_the_default_job_callbacks() {
     let mut engine = Engine::new();
     let seen = recording_loader(&mut engine);
     engine.set_import_base("https://a.test/a.js");
-    assert!(matches!(
-        engine.eval_value("Promise.resolve(\"import('./job.js')\").then(eval);"),
+    assert!(engine.scope(|cx| matches!(
+        cx.eval_value("Promise.resolve(\"import('./job.js')\").then(eval);"),
         Ok(Ok(_))
-    ));
+    )));
     engine.set_import_base("https://doc.test/page.html");
     engine.run_microtasks();
     assert_eq!(*seen.borrow(), ["./job.js <- https://doc.test/page.html"]);

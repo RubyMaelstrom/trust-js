@@ -13,6 +13,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use trust_js_host::ValueKind;
 
 use trust_js_host::{CompletionSender, Ctx, TaskRegistry, Value};
 
@@ -33,7 +34,8 @@ pub(crate) struct SseRegistry {
 struct SseEntry {
     closed: Arc<AtomicBool>,
     cancel: Arc<Mutex<Option<Arc<TcpStream>>>>,
-    dispatch: Value,
+    /// The JavaScript dispatch function, held while the entry is registered.
+    dispatch: trust_js_host::Handle,
     dead: bool,
 }
 
@@ -81,7 +83,7 @@ struct StreamReader {
 trait SseStream: Read + Write + Send {}
 impl<T: Read + Write + Send> SseStream for T {}
 
-fn sse_registry(ctx: &mut Ctx) -> &mut SseRegistry {
+fn sse_registry<'a>(ctx: &'a mut Ctx<'_>) -> &'a mut SseRegistry {
     ctx.host_mut::<SseRegistry>()
         .expect("web installs SseRegistry")
 }
@@ -90,7 +92,11 @@ fn sse_registry(ctx: &mut Ctx) -> &mut SseRegistry {
 /// executor; the JS side
 /// then receives `("open")`, `("chunk", u8array)`, `("fatal", message)` (no reconnect), or
 /// `("drop", message)` (reconnect per the retry interval).
-pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_sse_connect<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let target = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -98,7 +104,7 @@ pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
         .to_string();
     let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
+        Some(v) if v.is_callable() => trust_js_host::handle(ctx, v)?,
         _ => return Err(ctx.make_error("TypeError", "connect: dispatch must be a function")),
     };
 
@@ -285,10 +291,10 @@ fn open_stream(
     Err(ConnectError::Fatal("too many redirects".into()))
 }
 
-fn decode_connect(
-    ctx: &mut Ctx,
+fn decode_connect<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let ConnectResult { id, outcome } = *payload.downcast::<ConnectResult>().expect("sse payload");
     match outcome {
         Ok(stream) => {
@@ -296,32 +302,26 @@ fn decode_connect(
                 Some(e) if !e.dead => Arc::clone(&e.closed),
                 _ => {
                     return Ok(vec![
-                        Value::from_string("fatal".into()),
-                        Value::from_string("closed".into()),
+                        ctx.string("fatal".into()),
+                        ctx.string("closed".into()),
                     ])
                 }
             };
             arm_read(ctx, id, StreamReader { stream, closed });
-            Ok(vec![Value::from_string("open".into())])
+            Ok(vec![ctx.string("open".into())])
         }
         Err(ConnectError::Fatal(msg)) => {
             sse_registry(ctx).conns.remove(&id);
-            Ok(vec![
-                Value::from_string("fatal".into()),
-                Value::from_string(msg),
-            ])
+            Ok(vec![ctx.string("fatal".into()), ctx.string(msg)])
         }
         Err(ConnectError::Retriable(msg)) => {
             sse_registry(ctx).conns.remove(&id);
-            Ok(vec![
-                Value::from_string("drop".into()),
-                Value::from_string(msg),
-            ])
+            Ok(vec![ctx.string("drop".into()), ctx.string(msg)])
         }
     }
 }
 
-fn arm_read(ctx: &mut Ctx, id: u64, reader: StreamReader) {
+fn arm_read<'s>(ctx: &mut Ctx<'s>, id: u64, reader: StreamReader) {
     let dispatch = match sse_registry(ctx).conns.get(&id) {
         Some(e) if !e.dead => e.dispatch.clone(),
         _ => return,
@@ -354,7 +354,10 @@ fn arm_read(ctx: &mut Ctx, id: u64, reader: StreamReader) {
     });
 }
 
-fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_read<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let ReadResult {
         id,
         outcome,
@@ -372,39 +375,40 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
             if let Some(r) = reader {
                 arm_read(ctx, id, r);
             }
-            Ok(vec![Value::from_string("chunk".into()), arr])
+            Ok(vec![ctx.string("chunk".into()), arr])
         }
         Ok(_) => {
             // EOF or closed: end this connection. A user close() is final; a server-side EOF
             // reconnects (the JS side decides based on its readyState).
             sse_registry(ctx).conns.remove(&id);
             if closed_now {
-                Ok(vec![Value::from_string("closed".into())])
+                Ok(vec![ctx.string("closed".into())])
             } else {
                 Ok(vec![
-                    Value::from_string("drop".into()),
-                    Value::from_string("stream ended".into()),
+                    ctx.string("drop".into()),
+                    ctx.string("stream ended".into()),
                 ])
             }
         }
         Err(e) => {
             sse_registry(ctx).conns.remove(&id);
             if closed_now {
-                Ok(vec![Value::from_string("closed".into())])
+                Ok(vec![ctx.string("closed".into())])
             } else {
-                Ok(vec![
-                    Value::from_string("drop".into()),
-                    Value::from_string(e.to_string()),
-                ])
+                Ok(vec![ctx.string("drop".into()), ctx.string(e.to_string())])
             }
         }
     }
 }
 
 /// `__sse.close(id)` — flip the closed flag; the reader loop tears down and reports `closed`.
-pub(crate) fn op_sse_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
+pub(crate) fn op_sse_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) => n as u64,
         _ => return Err(ctx.make_error("TypeError", "close: bad connection id")),
     };
     if let Some(e) = sse_registry(ctx).conns.get_mut(&id) {

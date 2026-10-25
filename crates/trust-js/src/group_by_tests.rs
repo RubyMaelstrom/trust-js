@@ -278,23 +278,27 @@ fn group_by_cached_callees_keep_then_release_their_final_owners() {
                 position=0;'ready'
             "#;
             assert!(matches!(engine.eval(setup, false), Ok(Completion::Value(v)) if v == "ready"));
-            let mut weak_callees = Vec::new();
-            let mut weak_fields = Vec::new();
-            for name in ["callback", "next"] {
-                let env = engine.interp.global_env.clone();
-                let callee = engine
-                    .interp
-                    .get_var(name, &env)
-                    .unwrap_or_else(|_| panic!("fixture callee {name}"));
-                let object = callee.as_obj().unwrap();
-                weak_callees.push(std::rc::Rc::downgrade(object));
-                let sentinel = engine.interp.new_object();
-                weak_fields.push(std::rc::Rc::downgrade(&sentinel));
-                object.borrow_mut().props.insert(
-                    "sentinel",
-                    crate::value::Property::plain(Value::Obj(sentinel)),
-                );
-            }
+            // Strong handles live only in this helper frame (the collector scans the stack).
+            let (weak_callees, weak_fields) = crate::gc_test::in_frame(|| {
+                let mut weak_callees = Vec::new();
+                let mut weak_fields = Vec::new();
+                for name in ["callback", "next"] {
+                    let env = engine.interp.global_env;
+                    let callee = engine
+                        .interp
+                        .get_var(name, &env)
+                        .unwrap_or_else(|_| panic!("fixture callee {name}"));
+                    let object = callee.as_obj().unwrap();
+                    weak_callees.push(crate::value::Gc::downgrade(&object));
+                    let sentinel = engine.interp.new_object();
+                    weak_fields.push(crate::value::Gc::downgrade(&sentinel));
+                    object.borrow_mut().props.insert(
+                        "sentinel",
+                        crate::value::Property::plain(Value::Obj(sentinel)),
+                    );
+                }
+                (weak_callees, weak_fields)
+            });
             let run = format!(
                 "release=true;var result={owner}.groupBy(items,callback);var first={};\
                 [first.length,first[63].n,callback===null,next===null].join('|')",
@@ -319,7 +323,10 @@ fn group_by_cached_callees_keep_then_release_their_final_owners() {
             // Each field was owned only by its callee. Its independent Weak proves the
             // callee destructor ran, rather than just an incorrect zero owner count.
             for weak in weak_fields {
-                assert!(weak.upgrade().is_none(), "{tier:?}/{owner} field retained");
+                assert!(
+                    !crate::gc_test::alive(&weak),
+                    "{tier:?}/{owner} field retained"
+                );
             }
             assert!(engine.interp.fn_frames.is_empty());
         }

@@ -16,9 +16,10 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine.interp.get_var(name, &env).ok().unwrap();
-    let object = value.as_obj().unwrap().borrow();
+    let object_handle = value.as_obj().unwrap();
+    let object = object_handle.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("user function")
     };
@@ -38,10 +39,7 @@ fn strings(chunk: &Chunk) -> Vec<&str> {
     chunk
         .consts
         .iter()
-        .filter_map(|value| match value {
-            Value::Str(string) => Some(string.as_str()),
-            _ => None,
-        })
+        .filter_map(Value::as_engine_text)
         .collect()
 }
 
@@ -262,7 +260,8 @@ fn live_function_loop_keeps_original_ast_site_and_current_bytecode_pc() {
         TEST_FUNCTION_OSR_ENTRIES.with(|count| count.set(0));
         assert_eq!(eval(&mut engine, "subject()"), "4498500:1");
         assert!(TEST_FUNCTION_OSR_ENTRIES.with(|count| count.get()) > 0);
-        let chunk = function.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = function.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert!(strings(chunk)
             .iter()
             .all(|value| *value != "vendor" && *value != "use strict"));
@@ -319,13 +318,14 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
         assert!(primary.prepared_entry);
         primary.inline_attempted.set(true);
         primary.inline_retry_at.set(0);
-        assert!(function.code.set(Some(primary.clone())).is_ok());
+        assert!(function.runtime().code.set(Some(primary.clone())).is_ok());
         for _ in 0..8 {
             eval(&mut engine, "subject(5)");
         }
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let value = engine.interp.get_var("subject", &env).ok().unwrap();
-        let object = value.as_obj().unwrap().borrow();
+        let object_handle = value.as_obj().unwrap();
+        let object = object_handle.borrow();
         let crate::value::Callable::User(user) = &object.call else {
             panic!("prepared user")
         };
@@ -361,6 +361,7 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
                 panic!("leaf")
             };
             user.func
+                .runtime()
                 .code
                 .get()
                 .and_then(Option::as_ref)
@@ -375,10 +376,11 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
             "original native leaf ran during warmup"
         );
         leaf_code.test_residency_marks(true);
-        assert!(function.code2.set(Some(chunk.clone())).is_ok());
+        assert!(function.runtime().code2.set(Some(chunk.clone())).is_ok());
         assert!(Rc::ptr_eq(
             function
-                .execution_code_for(Rc::as_ptr(&engine.interp.global_env) as usize)
+                .runtime()
+                .execution_code_for(Env::as_ptr(&engine.interp.global_env) as usize)
                 .and_then(Option::as_ref)
                 .unwrap(),
             &chunk

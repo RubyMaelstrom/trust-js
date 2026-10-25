@@ -6,9 +6,10 @@ use super::service::{
 };
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "RelativeTimeFormat", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "format", 2, |i, this, args| {
@@ -77,13 +78,14 @@ fn singular(unit: &str) -> Option<&'static str> {
 }
 
 fn string_slot(object: &Gc, key: &str, fallback: &str) -> String {
-    match object
+    match (object
         .borrow()
         .internal_slots()
         .get(key)
-        .map(|property| property.value())
+        .map(|property| property.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Str(value)) => value.to_string(),
+        Some(ValueView::Str(value)) => value.to_string(),
         _ => fallback.to_string(),
     }
 }
@@ -151,8 +153,8 @@ fn format(
     set_data(&nf_options, "signDisplay", Value::lstr("never"));
     let number_format = new_service(i, "NumberFormat", &locale, nf_options)?;
     let format = ab(i.get_member_key(&number_format, "format"))?;
-    let formatted = match ab(i.call(format, number_format.clone(), &[Value::Num(number)]))? {
-        Value::Str(value) => value.to_string(),
+    let formatted = match (ab(i.call(format, number_format, &[Value::Num(number)]))?).view() {
+        ValueView::Str(value) => value.to_string(),
         _ => magnitude.to_string(),
     };
     if !to_parts {
@@ -164,8 +166,9 @@ fn format(
         )));
     }
 
-    let mut output = Vec::new();
-    let push_literal = |i: &mut Interp, output: &mut Vec<Value>, text: &str| {
+    // Rooted across the formatToParts call and part reads (I1).
+    let mut output = crate::rooting::RootedVec::new();
+    let push_literal = |i: &mut Interp, output: &mut crate::rooting::RootedVec, text: &str| {
         if text.is_empty() {
             return;
         }
@@ -177,8 +180,8 @@ fn format(
     push_literal(i, &mut output, &pattern[..marker]);
     let format_to_parts = ab(i.get_member_key(&number_format, "formatToParts"))?;
     let number_parts = ab(i.call(format_to_parts, number_format, &[Value::Num(number)]))?;
-    let length = match ab(i.get_member_key(&number_parts, "length"))? {
-        Value::Num(value) => value as usize,
+    let length = match (ab(i.get_member_key(&number_parts, "length"))?).view() {
+        ValueView::Num(value) => value as usize,
         _ => 0,
     };
     for index in 0..length {
@@ -190,7 +193,7 @@ fn format(
         output.push(Value::Obj(part));
     }
     push_literal(i, &mut output, &pattern[marker + 3..]);
-    Ok(i.make_array(output))
+    Ok(i.make_array(output.into_vec()))
 }
 
 fn new_service(i: &mut Interp, service: &str, locale: &str, options: Gc) -> Result<Value, Value> {

@@ -20,7 +20,7 @@ impl Write for Captured {
 fn tty_streams_wrap_process_io_without_claiming_terminal_support() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

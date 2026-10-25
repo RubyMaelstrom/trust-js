@@ -273,50 +273,27 @@ pub fn unit_str(unit: u16) -> String {
     from_units(&[unit])
 }
 
-thread_local! {
-    /// Immutable one-code-unit ASCII strings are returned constantly by `charAt`, string
-    /// indexing, and string iterators. Share their buffers instead of allocating the same 128
-    /// values repeatedly.
-    static ASCII_UNITS: [crate::lstr::LStr; 128] =
-        std::array::from_fn(|unit| unit_str(unit as u16).into());
-}
-
 /// Canonical array-index strings below this bound are interned (see [`index_lstr`]).
 pub(crate) const INDEX_STRINGS: u32 = 1024;
 
-thread_local! {
-    /// ToString of the small array indices that integer-keyed property operations pass as
-    /// ECMAScript String values (a Proxy trap's property key, for instance). Filled lazily;
-    /// never more than `INDEX_STRINGS` short buffers per thread.
-    static INDEX_UNITS: std::cell::RefCell<Vec<Option<crate::lstr::LStr>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
 /// The canonical decimal string of array index `index` (ECMA-262 Number::toString), shared for
-/// indices below [`INDEX_STRINGS`]. Engine strings are immutable values; an append to a shared
-/// buffer copies it first.
+/// indices below [`INDEX_STRINGS`]. Engine strings are immutable values; an interned one has no
+/// spare capacity, so an append to it copies.
 pub(crate) fn index_lstr(index: u32) -> crate::lstr::LStr {
     if index >= INDEX_STRINGS {
         return crate::lstr::LStr::from(index.to_string().as_str());
     }
-    INDEX_UNITS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.is_empty() {
-            cache.resize(INDEX_STRINGS as usize, None);
-        }
-        cache[index as usize]
-            .get_or_insert_with(|| crate::lstr::LStr::from(index.to_string().as_str()))
-            .clone()
+    crate::value::interned_string(128 + index as usize, || {
+        crate::lstr::LStr::from(index.to_string().as_str())
     })
 }
 
 /// The engine string for one UTF-16 code unit, interned for ASCII.
 pub fn unit_lstr(unit: u16) -> crate::lstr::LStr {
-    if unit < 128 {
-        ASCII_UNITS.with(|units| units[unit as usize].clone())
-    } else {
-        unit_str(unit).into()
+    if unit >= 128 {
+        return unit_str(unit).into();
     }
+    crate::value::interned_string(unit as usize, || unit_str(unit).into())
 }
 
 /// The spec's code-unit-wise string comparison (differs from `str` byte order for strings mixing

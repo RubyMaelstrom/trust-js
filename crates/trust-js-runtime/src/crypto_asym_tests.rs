@@ -36,7 +36,7 @@ fn test_runtime() -> (Runtime, Captured) {
     let mut rt = Runtime::new();
     let out = Captured::default();
     let err = Captured::default();
-    rt.engine().ctx().op_state().put(console::ConsoleOut {
+    rt.engine().op_state().put(console::ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(err),
     });

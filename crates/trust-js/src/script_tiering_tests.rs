@@ -2,6 +2,7 @@
 //! ECMA-262 local official snapshot e28783d5fc9dc12b3de905961e2c71410b38a202.
 //! OSR changes execution machinery only: declarations, side effects, identity and
 //! completion records must not be recreated or replayed at a hot header.
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn value(engine: &mut Engine, source: &str) -> String {
@@ -219,7 +220,7 @@ fn hot_script_borrowed_this_is_the_global_environment_this_value() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(32);
-        let wrapper = Object::new(Some(engine.interp.object_proto.clone()));
+        let wrapper = Object::new(Some(engine.interp.object_proto));
         wrapper
             .borrow_mut()
             .props
@@ -231,7 +232,7 @@ fn hot_script_borrowed_this_is_the_global_environment_this_value() {
             .vars
             .get_mut("this")
             .unwrap()
-            .value = Value::Obj(wrapper);
+            .set_value(Value::Obj(wrapper));
         reset_counts();
         assert_eq!(
             value(
@@ -251,7 +252,6 @@ fn hot_script_borrowed_this_is_the_global_environment_this_value() {
 #[test]
 fn hot_script_completion_owner_survives_gc_at_borrowed_entry_and_finalizer() {
     use crate::value::{Property, Value};
-    use std::rc::Rc;
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -276,24 +276,29 @@ fn hot_script_completion_owner_survives_gc_at_borrowed_entry_and_finalizer() {
         .ok()
         .expect("GC fixture parses");
         reset_counts();
-        let result = engine
-            .interp
-            .run_program(&body)
-            .ok()
-            .expect("GC fixture completes");
-        assert_osr(tier);
-        let Value::Obj(object) = &result else {
-            panic!("completion is owned object");
-        };
-        assert!(matches!(
-            object.borrow().props.get("k").unwrap().value(),
-            Value::Num(1999.0)
-        ));
-        let weak = Rc::downgrade(object);
-        drop(result);
+        // The completion lives only in this helper frame (the collector scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let result = engine
+                .interp
+                .run_program(&body)
+                .ok()
+                .expect("GC fixture completes");
+            assert_osr(tier);
+            let ValueView::Obj(object) = &(result).view() else {
+                panic!("completion is owned object");
+            };
+            assert!(matches!(
+                (object.borrow().props.get("k").unwrap().value()).view(),
+                ValueView::Num(1999.0)
+            ));
+            crate::value::Gc::downgrade(object)
+        });
         drop(body);
         engine.interp.gc_collect();
-        assert!(weak.upgrade().is_none(), "completion leaked after {tier:?}");
+        assert!(
+            !crate::gc_test::alive(&weak),
+            "completion leaked after {tier:?}"
+        );
     }
 }
 

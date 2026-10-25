@@ -1,16 +1,19 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Value> {
-    if !matches!(target, Value::Obj(_)) || !matches!(handler, Value::Obj(_)) {
+    if !matches!((target).view(), ValueView::Obj(_))
+        || !matches!((handler).view(), ValueView::Obj(_))
+    {
         return Err(i.make_error(
             "TypeError",
             "Cannot create proxy with a non-object as target or handler",
         ));
     }
-    let proto = match &target {
-        Value::Obj(o) => o.borrow().proto.clone(),
+    let proto = match &(target).view() {
+        ValueView::Obj(o) => o.borrow().proto,
         _ => None,
     };
     let obj = Object::new(proto);
@@ -19,23 +22,32 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
         // A proxy is a constructor exactly when its target is one.
         obj.borrow_mut().is_constructor = is_constructor_value(&target);
     }
-    let p = Rc::as_ptr(&obj) as usize;
+    let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.inline_ic_safe.set(false);
     obj.borrow().ic_plain.set(false);
-    i.proxies.insert(p, (target, handler));
+    i.proxies.insert(&i.gc_heap, p, (target, handler));
     Ok(Value::Obj(obj))
 }
 
 fn revoke_proxy(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
-    if let Value::Obj(o) = arg(a, 0) {
-        let ptr = Rc::as_ptr(&o) as usize;
+    if let ValueView::Obj(o) = (arg(a, 0)).view() {
+        let ptr = Gc::as_ptr(&o) as usize;
         // Keep the entry but null the handler, so the object stays a (revoked) Proxy and every
         // operation throws a TypeError rather than silently acting like a plain object.
-        if let Some((target, _)) = i.proxies.get(&ptr).cloned() {
+        if let Some(owner) = i.metadata_owner(ptr, |owner, ptr| owner.proxies.contains_key(&ptr)) {
             i.inline_ic_safe.set(false);
             o.borrow().ic_plain.set(false);
-            i.proxies.insert(ptr, (target, Value::Null));
+            let heap = i.gc_heap.clone();
+            i.with_metadata_table(
+                owner,
+                |owner| &mut owner.proxies,
+                |proxies| {
+                    if let Some((target, _)) = proxies.get(&ptr).copied() {
+                        proxies.insert(&heap, ptr, (target, Value::Null));
+                    }
+                },
+            );
         }
     }
     Ok(Value::Undefined)
@@ -51,9 +63,9 @@ pub(super) fn install_proxy(it: &mut Interp) {
     ctor.borrow_mut().is_constructor = true; // Proxy is a constructor but has no `.prototype`
     it.def_method(&ctor, "revocable", 2, |i, _t, a| {
         let proxy = make_proxy(i, arg(a, 0), arg(a, 1))?;
-        let revoke = make_bound(i, revoke_proxy, vec![proxy.clone()]);
+        let revoke = make_bound(i, revoke_proxy, vec![proxy]);
         // The revocation function has own `length` (0) then `name` ("") like a built-in function.
-        if let Value::Obj(ro) = &revoke {
+        if let ValueView::Obj(ro) = &(revoke).view() {
             ro.borrow_mut().props.insert(
                 "length",
                 Property::data(Value::Num(0.0), false, false, true),

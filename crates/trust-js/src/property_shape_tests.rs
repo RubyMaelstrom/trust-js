@@ -1,16 +1,21 @@
-//! Shared embed objects obey ordinary [[Get]]/[[Set]] across Engine boundaries.
-//! Official local ECMA-262 snapshot e28783d5, OrdinaryGet, OrdinarySetWithOwnDescriptor,
-//! OrdinaryGetOwnProperty. Cache identities are not part of the observable semantics.
+//! Property shapes stay distinct across Engines' transition caches, while each Engine's
+//! objects and layouts remain on its own heap. Official local ECMA-262 snapshot e28783d5,
+//! OrdinaryGet, OrdinarySetWithOwnDescriptor, OrdinaryGetOwnProperty. Cache identities are not
+//! part of the observable semantics. Scoped values and checked handles prevent an embedder
+//! from creating a strong object edge between these separate Agents (I6).
 
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
+/// The engine value of `source` (unbranded: the crate's own form).
 fn value(engine: &mut Engine, source: &str) -> Value {
-    engine
-        .eval_value(source)
-        .expect("parse")
-        .ok()
-        .expect("evaluate")
+    engine.scope(|cx| {
+        cx.eval_value(source)
+            .expect("parse")
+            .unwrap_or_else(|_| panic!("evaluate"))
+            .into_internal()
+    })
 }
 
 fn run(engine: &mut Engine, source: &str) -> String {
@@ -20,78 +25,66 @@ fn run(engine: &mut Engine, source: &str) -> String {
     }
 }
 
-fn pair(reader: &mut Engine) -> (Engine, Engine) {
-    let mut first = Engine::new();
-    let mut second = Engine::new();
-    let a = value(&mut first, "({alpha:1})");
-    let b = value(&mut second, "({beta:2})");
-    assert_ne!(
-        a.as_obj().unwrap().borrow().props.shape(),
-        b.as_obj().unwrap().borrow().props.shape()
-    );
-    let global = reader.global_this();
-    assert!(reader.ctx().set_member_key(&global, "first", a).is_ok());
-    assert!(reader.ctx().set_member_key(&global, "second", b).is_ok());
-    // Keep the producing Engines alive: their explicit shutdown clears their own
-    // heaps. The active TLS heap is the reader, not either producer.
-    (first, second)
-}
-
-#[test]
-fn property_shapes_foreign_own_absent_computed_and_prototype_reads() {
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-        for (source, expected) in [
-            ("function read(o){return o.alpha;}for(var n=0;n<200;n++)read(first);read(first)+'|'+read(second)+'|'+read(first)", "1|undefined|1"),
-            ("function read(o){return o.beta;}for(var n=0;n<200;n++)read(first);read(first)+'|'+read(second)+'|'+read(first)", "undefined|2|undefined"),
-            ("function read(o,k){return o[k];}for(var n=0;n<200;n++)read(first,'alpha');read(first,'alpha')+'|'+read(second,'alpha')+'|'+read(second,'beta')", "1|undefined|2"),
-            ("var a=Object.create(first),b=Object.create(second);function read(o){return o.alpha;}for(var n=0;n<200;n++)read(a);read(a)+'|'+read(b)+'|'+read(a)", "1|undefined|1"),
-        ] {
-            let mut reader = Engine::new();
-            reader.set_tier(tier);
-            reader.set_tier_threshold(0);
-            let _owners = pair(&mut reader);
-            assert_eq!(run(&mut reader, source), expected, "{tier:?}");
-        }
-    }
-}
-
-#[test]
-fn property_shapes_foreign_writes_preserve_key_and_descriptor_selection() {
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-        let mut reader = Engine::new();
-        reader.set_tier(tier);
-        reader.set_tier_threshold(0);
-        let _owners = pair(&mut reader);
-        assert_eq!(
-            run(
-                &mut reader,
-                r#"
-            function write(o,v){o.alpha=v;}
-            for(var n=0;n<200;n++)write(first,1);
-            write(second,9);
-            var out=Object.keys(second).join(',')+'|'+second.beta+'|'+second.alpha;
-            var seen=0; Object.defineProperty(second,'alpha',{set(v){seen=v},configurable:true});
-            write(second,13);out+='|'+seen+'|'+second.beta;
-            Object.defineProperty(second,'alpha',{value:17,writable:false,configurable:true});
-            write(second,99);out+'|'+second.alpha;
-        "#
-            ),
-            "beta,alpha|2|9|13|2|17",
-            "{tier:?}"
-        );
-    }
-}
-
 #[test]
 fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
+    use crate::gc_core::CollectionKind;
+
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut owner = Engine::new();
         let original = value(&mut owner, "({alpha:1})");
         let local = value(&mut owner, "({alpha:1,gamma:2})");
+        let parent_shape = original.as_obj().unwrap().borrow().props.shape();
+        let local_shape = local.as_obj().unwrap().borrow().props.shape();
+        let global = owner.interp.global_this();
+        owner
+            .interp
+            .set_member_key(&global, "a", local)
+            .ok()
+            .unwrap();
+        owner
+            .interp
+            .set_member_key(&global, "b", original)
+            .ok()
+            .unwrap();
+
         let mut foreign = Engine::new();
         let _different_prefix = value(&mut foreign, "({beta:1})");
-        assert!(foreign
-            .ctx()
+        foreign.interp.activate_gc_heap();
+        // Reproduce a foreign cache learning a transition from an unknown parent using
+        // only neutral keys and an integer identity. Heap-local shape counters would give
+        // this alpha/delta child the same ID as the owner's alpha/gamma child. The layout
+        // allocated here belongs to foreign; publishing it in original would violate I6.
+        let prefix = [(Rc::from("alpha"), PropClass::DataWritable)];
+        let (foreign_shape, foreign_layout) = shape_transition(
+            parent_shape,
+            &Rc::from("delta"),
+            PropClass::DataWritable,
+            Some(&prefix),
+        );
+        assert_ne!(
+            foreign_shape, local_shape,
+            "foreign child identity, {tier:?}"
+        );
+        let foreign_layout = foreign_layout.expect("foreign transition layout");
+        assert_eq!(&*foreign_layout[0], "alpha");
+        assert_eq!(&*foreign_layout[1], "delta");
+        let foreign_word = foreign_layout.cell_word() as usize;
+        assert_eq!(
+            foreign
+                .interp
+                .gc_heap
+                .shapes
+                .borrow()
+                .layouts
+                .get(foreign_shape)
+                .unwrap()
+                .cell_word() as usize,
+            foreign_word
+        );
+
+        owner.interp.activate_gc_heap();
+        assert!(owner
+            .interp
             .set_member_key(&original, "delta", Value::Num(3.0))
             .is_ok());
         assert_ne!(
@@ -100,18 +93,40 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
         );
         owner.set_tier(tier);
         owner.set_tier_threshold(0);
-        let global = owner.global_this();
-        owner
-            .ctx()
-            .set_member_key(&global, "a", local)
-            .ok()
-            .unwrap();
-        owner
-            .ctx()
-            .set_member_key(&global, "b", original)
-            .ok()
-            .unwrap();
+        let owner_words = [&original, &local].map(|value| {
+            value
+                .as_obj()
+                .unwrap()
+                .borrow()
+                .props
+                .shared_layout()
+                .expect("owner transition layout")
+                .cell_word() as usize
+        });
         assert_eq!(run(&mut owner, "function read(o){return o.gamma;}for(var n=0;n<200;n++)read(a);read(a)+'|'+read(b)+'|'+b.delta"), "2|undefined|3", "{tier:?}");
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            owner.interp.activate_gc_heap();
+            owner.interp.gc_heap_collect_explicit(kind);
+            foreign.interp.activate_gc_heap();
+            foreign.interp.gc_heap_collect_explicit(kind);
+            let owner_core = owner.interp.gc_heap.core.borrow();
+            let foreign_core = foreign.interp.gc_heap.core.borrow();
+            for word in owner_words {
+                assert!(owner_core.owns_cell(word, owner.interp.gc_heap.property_layout_desc));
+                assert!(!foreign_core.owns_cell(word, foreign.interp.gc_heap.property_layout_desc));
+            }
+            assert!(
+                foreign_core.owns_cell(foreign_word, foreign.interp.gc_heap.property_layout_desc)
+            );
+            assert!(!owner_core.owns_cell(foreign_word, owner.interp.gc_heap.property_layout_desc));
+            drop(foreign_core);
+            drop(owner_core);
+            assert_eq!(
+                run(&mut owner, "read(a)+'|'+read(b)+'|'+b.delta"),
+                "2|undefined|3",
+                "{tier:?}, {kind:?}"
+            );
+        }
     }
 }
 
@@ -178,15 +193,18 @@ fn property_shapes_exhausted_array_length_hint_does_not_hide_named_properties() 
         .array_length_shape
         .set(SHAPE_UNCACHEABLE);
     assert!(matches!(
-        props.get("named").unwrap().value(),
-        Value::Num(37.0)
+        (props.get("named").unwrap().value()).view(),
+        ValueView::Num(37.0)
     ));
     assert!(props.get("missing").is_none());
     assert!(matches!(
-        props.get("length").unwrap().value(),
-        Value::Num(12.0)
+        (props.get("length").unwrap().value()).view(),
+        ValueView::Num(12.0)
     ));
-    assert!(matches!(props.get("11").unwrap().value(), Value::Num(11.0)));
+    assert!(matches!(
+        (props.get("11").unwrap().value()).view(),
+        ValueView::Num(11.0)
+    ));
 }
 
 #[test]
@@ -250,7 +268,9 @@ fn value_only_writes_keep_shape_but_mutable_escape_demotes() {
     assert_eq!(props.shape(), shared, "value-only write by key");
     assert!(props.set_value_at(0, Value::Num(3.0)));
     assert_eq!(props.shape(), shared, "value-only write by slot");
-    assert!(matches!(props.take_value("pc_k"), Some(Value::Num(n)) if n == 3.0));
+    assert!(
+        matches!((props.take_value("pc_k")).map(|__value| (__value).view()), Some(ValueView::Num(n)) if n == 3.0)
+    );
     assert_eq!(props.shape(), shared, "value-only take");
     assert!(props.set_value("pc_k", Value::Num(4.0)));
     // Acquiring &mut Property demotes even before any descriptor is touched: the
@@ -285,7 +305,7 @@ fn value_only_writes_keep_shape_but_mutable_escape_demotes() {
 fn replace_properties_preserves_live_prototype_flag() {
     let mut engine = Engine::new();
     let obj = value(&mut engine, "({keep: 1})");
-    let o = obj.as_obj().unwrap().clone();
+    let o = obj.as_obj().unwrap();
     o.borrow().props.mark_proto();
     o.borrow_mut().replace_properties(Props::with_capacity(0));
     let epoch = proto_epoch();

@@ -1,12 +1,13 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// WeakRef / FinalizationRegistry (ECMA-262 §9.9–9.13 and §26.1–26.2). Targets and unregister
 /// tokens are real weak handles; held values and cleanup callbacks remain strong edges of a live
 /// registry, and successful dereferences enter the Agent's kept-alive list for the current job.
 pub(super) fn install_weak_refs(it: &mut Interp) {
-    let wr_proto = Object::new(Some(it.object_proto.clone()));
+    let wr_proto = Object::new(Some(it.object_proto));
     it.def_method(&wr_proto, "deref", 0, |i, this, _| {
         let Some(ptr) = map_ptr(&this).filter(|ptr| i.weak_refs.contains_key(ptr)) else {
             return Err(i.make_error("TypeError", "deref called on a non-WeakRef"));
@@ -18,7 +19,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             .and_then(crate::interpreter::WeakTarget::upgrade);
         if let Some(target) = target {
             // WeakRefDeref -> AddToKeptObjects. The host clears this at the next job boundary.
-            i.kept_alive.push(target.clone());
+            i.add_kept_object(target);
             Ok(target)
         } else {
             Ok(Value::Undefined)
@@ -34,9 +35,9 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         }
         i.gc_weak_metadata_safepoint(false);
         let obj = new_from_ctor(i, "WeakRef")?;
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.kept_alive.push(target.clone());
+        i.add_kept_object(target);
         let target = crate::interpreter::WeakTarget::of(&target)
             .expect("CanBeHeldWeakly accepted the WeakRef target");
         i.weak_metadata.subscribe(
@@ -46,15 +47,15 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         i.weak_refs.insert(ptr, Some(target));
         Ok(Value::Obj(obj))
     });
-    Rc::make_mut(&mut it.extra_protos).insert("WeakRef", wr_proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("WeakRef", wr_proto);
     wr_ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(wr_proto.clone()), false, false, false),
+        Property::data(Value::Obj(wr_proto), false, false, false),
     );
-    wr_proto.borrow_mut().props.insert(
-        "constructor",
-        Property::builtin(Value::Obj(wr_ctor.clone())),
-    );
+    wr_proto
+        .borrow_mut()
+        .props
+        .insert("constructor", Property::builtin(Value::Obj(wr_ctor)));
     if let Some(key) = well_known_key(it, "toStringTag") {
         wr_proto.borrow_mut().props.insert(
             key,
@@ -63,7 +64,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
     }
     set_builtin(&it.global, "WeakRef", Value::Obj(wr_ctor));
 
-    let fr_proto = Object::new(Some(it.object_proto.clone()));
+    let fr_proto = Object::new(Some(it.object_proto));
     it.def_method(&fr_proto, "register", 2, |i, this, a| {
         // Brand check, then: target must be registerable, distinct from its held value, and any
         // unregister token must itself be registerable.
@@ -79,7 +80,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             return Err(i.make_error("TypeError", "target and held value must not be the same"));
         }
         let token = arg(a, 2);
-        if !matches!(token, Value::Undefined) && !can_be_held_weakly(i, &token) {
+        if !matches!((token).view(), ValueView::Undefined) && !can_be_held_weakly(i, &token) {
             return Err(i.make_error("TypeError", "unregister token cannot be held weakly"));
         }
         i.gc_weak_metadata_safepoint(false);
@@ -90,12 +91,12 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         );
         let state = i
             .finalization_registries
-            .get_mut(&ptr)
+            .get_mut(&i.gc_heap, &ptr)
             .expect("brand check found FinalizationRegistry state");
         state.cells.push(crate::interpreter::FinalizationCell {
             target: Some(weak_target),
             held_value: arg(a, 1),
-            unregister_token: (!matches!(token, Value::Undefined))
+            unregister_token: (!matches!((token).view(), ValueView::Undefined))
                 .then(|| crate::interpreter::WeakTarget::of(&token))
                 .flatten(),
         });
@@ -115,7 +116,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         }
         let cells = &mut i
             .finalization_registries
-            .get_mut(&ptr)
+            .get_mut(&i.gc_heap, &ptr)
             .expect("brand check found FinalizationRegistry state")
             .cells;
         let mut removed_targets = Vec::new();
@@ -138,28 +139,35 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             return Err(i.make_error("TypeError", "cleanup callback must be callable"));
         }
         let obj = new_from_ctor(i, "FinalizationRegistry")?;
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         let cleanup_callback = i.make_job_callback(arg(a, 0));
+        let (callback_realm, callback_context) =
+            i.promise_job_target(&arg(a, 0), i.host_job_context);
         i.finalization_registries.insert(
+            &i.gc_heap,
             ptr,
             crate::interpreter::FinalizationState {
                 cleanup_callback,
                 cells: Default::default(),
                 cleanup_scheduled: false,
+                registry_realm: i.global,
+                registry_context: i.host_job_context,
+                callback_realm,
+                callback_context,
             },
         );
         Ok(Value::Obj(obj))
     });
-    Rc::make_mut(&mut it.extra_protos).insert("FinalizationRegistry", fr_proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("FinalizationRegistry", fr_proto);
     fr_ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(fr_proto.clone()), false, false, false),
+        Property::data(Value::Obj(fr_proto), false, false, false),
     );
-    fr_proto.borrow_mut().props.insert(
-        "constructor",
-        Property::builtin(Value::Obj(fr_ctor.clone())),
-    );
+    fr_proto
+        .borrow_mut()
+        .props
+        .insert("constructor", Property::builtin(Value::Obj(fr_ctor)));
     if let Some(key) = well_known_key(it, "toStringTag") {
         fr_proto.borrow_mut().props.insert(
             key,

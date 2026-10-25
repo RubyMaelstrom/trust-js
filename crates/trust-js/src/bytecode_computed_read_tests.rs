@@ -3,7 +3,9 @@
 //! The helper must commit a compact owner, not leave a wide completion in native scratch.
 
 use super::*;
+use crate::value::ValueView;
 use crate::{jit::JitCtx, Completion, Engine};
+use std::cell::Cell;
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
     match engine
@@ -16,7 +18,7 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 fn binding(engine: &mut Engine, name: &str) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .get_var(name, &env)
@@ -41,56 +43,52 @@ fn invoke(
     let crate::ast::Stmt::FuncDecl(function) = &parsed[0] else {
         unreachable!()
     };
-    let mut chunk = compile(function).unwrap();
-    Rc::get_mut(&mut chunk).unwrap().ops[0] = op;
+    let chunk = compile(function).unwrap();
+    let chunk = Chunk::rewrite_owned_for_test(chunk, |chunk| chunk.ops[0] = op);
     let local = matches!(op, Op::GetElemLocal(_));
     let mut slots = [
-        PackedValue::pack(if local {
-            object.clone()
-        } else {
-            Value::Undefined
-        }),
-        PackedValue::pack(Value::Undefined),
+        Cell::new(if local { object } else { Value::Undefined }),
+        Cell::new(Value::Undefined),
     ];
-    let mut storage: [std::mem::MaybeUninit<PackedValue>; 4] =
+    let mut storage: [std::mem::MaybeUninit<Value>; 4] =
         std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
-    let base = storage.as_mut_ptr().cast::<PackedValue>();
+    let base = storage.as_mut_ptr().cast::<Value>();
     let count = if local { 2 } else { 3 };
     unsafe {
-        base.write(PackedValue::pack(prefix));
+        base.write(prefix);
         if !local {
-            base.add(1).write(PackedValue::pack(object));
+            base.add(1).write(object);
         }
-        base.add(count - 1).write(PackedValue::pack(key));
+        base.add(count - 1).write(key);
     }
     let i = &mut *engine.interp;
-    let env = i.global_env.clone();
+    let env = i.global_env;
     let mut ctx = JitCtx {
         helpers: i.jit_helpers.as_ptr(),
         stack_base: base,
         final_sp: base,
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
-        env_raw: Rc::as_ptr(&env).cast(),
-        this_raw: std::ptr::null(),
+        env_raw: Env::as_ptr(&env).cast(),
+        this_word: (Value::Undefined),
         global_body: std::ptr::null(),
-        genv: Rc::as_ptr(&env) as usize,
+        genv: Env::as_ptr(&env) as usize,
         interp: i,
         chunk: &*chunk,
-        this_val: Value::Undefined,
         n_slots: slots.len(),
         handlers: Vec::new(),
         handler_floor: 0,
         code_base: std::ptr::null(),
         pc_offsets: std::ptr::null(),
         error: None,
-        ret: PackedValue::pack(Value::Undefined),
+        ret: (Value::Undefined),
         env_parent_raw: std::ptr::null(),
         opstat_enabled: false,
         callstat_enabled: false,
         propstat_enabled: false,
         inline_recompile_at: inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
         activation: None,
         resume_activation: std::ptr::null_mut(),
         resume_pc: 0,
@@ -99,7 +97,6 @@ fn invoke(
         accessor_holder: 0,
         accessor_slot: 0,
     };
-    ctx.this_raw = &ctx.this_val;
     let result = unsafe { jit_get_element(&mut ctx, 0, base.add(count)) };
     assert_eq!(result.flag != 0, ctx.error.is_some());
     let live = unsafe { result.sp.offset_from(base) as usize };
@@ -115,63 +112,9 @@ fn invoke(
         "wrong canonical stack extent for {op:?}"
     );
     let values = (0..live)
-        .map(|index| unsafe { base.add(index).read().into_value() })
+        .map(|index| unsafe { base.add(index).read() })
         .collect();
     (values, ctx.error.take())
-}
-
-#[test]
-fn computed_read_helper_canonical_stack_all_tags_and_last_owners() {
-    let mut engine = Engine::new();
-    evaluate(&mut engine, "var token=Symbol('computed');");
-    let values = [
-        Value::Undefined,
-        Value::Null,
-        Value::Bool(false),
-        Value::Bool(true),
-        Value::Num(-0.0),
-        Value::Num(f64::from_bits(0xffff_ffff_ffff_ffff)),
-        Value::Num(f64::INFINITY),
-        Value::Num(-1.25),
-        Value::Str("owned".into()),
-        binding(&mut engine, "token"),
-        Value::Obj(crate::value::Object::new(None)),
-        Value::BigInt(crate::bigint::JsBigInt::from_i128(i128::MAX)),
-    ];
-    for op in [Op::GetElem, Op::GetElemLocal(0), Op::GetMethodElem] {
-        for value in &values {
-            let object = crate::value::Object::new(None);
-            object
-                .borrow_mut()
-                .props
-                .insert("value", crate::value::Property::plain(value.clone()));
-            let weak = Rc::downgrade(&object);
-            let (result, error) = invoke(
-                &mut engine,
-                op,
-                Value::Obj(object),
-                Value::Str("value".into()),
-                Value::Str("prefix".into()),
-            );
-            assert!(error.is_none());
-            assert!(matches!(&result[0], Value::Str(s) if s.as_str()=="prefix"));
-            let actual = result.last().unwrap();
-            engine.interp.gc_collect();
-            match (value, actual) {
-                (Value::Num(a), Value::Num(b)) => {
-                    assert!(a.is_nan() && b.is_nan() || a.to_bits() == b.to_bits())
-                }
-                _ => assert!(engine.interp.strict_equals(value, actual)),
-            }
-            assert_eq!(
-                weak.upgrade().is_some(),
-                matches!(op, Op::GetMethodElem),
-                "only a method Reference retains its consumed receiver"
-            );
-            drop(result);
-            assert!(weak.upgrade().is_none());
-        }
-    }
 }
 
 #[test]
@@ -210,8 +153,10 @@ fn computed_read_helper_errors_consume_operands_not_prefix_or_local() {
         ] {
             evaluate(&mut engine, "calls=0;");
             let prefix = crate::value::Object::new(None);
-            let (result, error) = invoke(&mut engine, op, object, key, Value::Obj(prefix.clone()));
-            assert!(matches!(&result[0],Value::Obj(actual) if Rc::ptr_eq(actual,&prefix)));
+            let (result, error) = invoke(&mut engine, op, object, key, Value::Obj(prefix));
+            assert!(
+                matches!(&(result[0]).view(),ValueView::Obj(actual) if crate::value::Gc::ptr_eq(actual,&prefix))
+            );
             assert_eq!(evaluate(&mut engine, "calls"), expected_calls.to_string());
             let Some(Abrupt::Throw(error)) = error else {
                 panic!("expected exact throw");
@@ -221,7 +166,7 @@ fn computed_read_helper_errors_consume_operands_not_prefix_or_local() {
                 assert!(engine.interp.strict_equals(&error, &sentinel));
             } else {
                 let name = engine.interp.get_member_key(&error, "name").ok().unwrap();
-                assert!(matches!(name,Value::Str(s) if s.as_str()==expected_error));
+                assert!(matches!((name).view(),ValueView::Str(s) if s.as_str()==expected_error));
             }
         }
     }

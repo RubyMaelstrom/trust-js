@@ -5,9 +5,10 @@ use super::service::{
 };
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "NumberFormat", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "format", 1, |i, this, a| {
@@ -38,7 +39,7 @@ fn range_endpoints(
     y: &Value,
 ) -> Result<(Gc, IntlMv, IntlMv), Value> {
     let o = instance(i, this)?;
-    if matches!(x, Value::Undefined) || matches!(y, Value::Undefined) {
+    if matches!(&(x).view(), ValueView::Undefined) || matches!(&(y).view(), ValueView::Undefined) {
         return Err(i.make_error("TypeError", "formatRange requires two arguments"));
     }
     let a = to_intl_mv(i, x)?;
@@ -169,8 +170,8 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
         }
         let f = i.make_native("", 1, |i, that, a| format_number(i, &that, &arg(a, 0)));
         // Bind `this` = the (possibly unwrapped) NumberFormat instance.
-        let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o.clone()));
-        set_internal_slot(&o, "#\u{0}nf_boundformat", bound.clone());
+        let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o));
+        set_internal_slot(&o, "#\u{0}nf_boundformat", bound);
         Ok(bound)
     });
     proto.borrow_mut().props.insert(
@@ -183,8 +184,8 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
 /// spec's `format`/`compare` bound functions: name `""`, length 1, and not a constructor.
 pub(crate) fn bind_this(i: &mut Interp, target: Value, this_arg: Value) -> Value {
     if let Ok(bindfn) = i.get_member_key(&target, "bind") {
-        if let Ok(bound) = i.call(bindfn, target.clone(), &[this_arg]) {
-            if let Value::Obj(o) = &bound {
+        if let Ok(bound) = i.call(bindfn, target, &[this_arg]) {
+            if let ValueView::Obj(o) = &(bound).view() {
                 o.borrow_mut().is_constructor = false;
                 o.borrow_mut().props.insert(
                     "name",
@@ -308,7 +309,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
 
     let rounding_increment = {
         let v = ab(i.get_member_key(&options, "roundingIncrement"))?;
-        if matches!(v, Value::Undefined) {
+        if matches!((v).view(), ValueView::Undefined) {
             1u32
         } else {
             let n = ab(i.to_number(&v))?;
@@ -608,7 +609,7 @@ fn read_range_opt(
     hi: u32,
 ) -> Result<Option<u32>, Value> {
     let v = ab(i.get_member_key(options, prop))?;
-    if matches!(v, Value::Undefined) {
+    if matches!((v).view(), ValueView::Undefined) {
         return Ok(None);
     }
     let n = ab(i.to_number(&v))?;
@@ -632,10 +633,10 @@ fn read_use_grouping(i: &mut Interp, options: &Value, notation: &str) -> Result<
     } else {
         "auto"
     });
-    if matches!(v, Value::Undefined) {
+    if matches!((v).view(), ValueView::Undefined) {
         return Ok(default);
     }
-    if matches!(v, Value::Bool(true)) {
+    if matches!((v).view(), ValueView::Bool(true)) {
         return Ok(Value::lstr("always"));
     }
     if !i.to_boolean(&v) {
@@ -677,8 +678,8 @@ fn instance_unwrap(i: &mut Interp, this: &Value) -> Result<Gc, Value> {
 }
 
 fn get_str(o: &Gc, k: &str) -> String {
-    match o.borrow().internal_slots().get(k).map(|p| p.value()) {
-        Some(Value::Str(s)) => s.to_string(),
+    match (o.borrow().internal_slots().get(k).map(|p| p.value())).map(|__value| (__value).view()) {
+        Some(ValueView::Str(s)) => s.to_string(),
         _ => String::new(),
     }
 }
@@ -713,8 +714,8 @@ fn cldr_number_symbols(o: &Gc) -> crate::cldr_numbers::Symbols {
 }
 
 fn get_num(o: &Gc, k: &str) -> Option<u32> {
-    match o.borrow().internal_slots().get(k).map(|p| p.value()) {
-        Some(Value::Num(n)) => Some(n as u32),
+    match (o.borrow().internal_slots().get(k).map(|p| p.value())).map(|__value| (__value).view()) {
+        Some(ValueView::Num(n)) => Some(n as u32),
         _ => None,
     }
 }
@@ -925,9 +926,10 @@ fn group_integer(
     sizes: (usize, usize),
     minimum_grouping: usize,
 ) -> String {
-    let enabled = !matches!(grouping, Value::Bool(false));
-    let min2 = matches!(grouping, Value::Str(s) if &**s == "min2")
-        || (minimum_grouping >= 2 && matches!(grouping, Value::Str(s) if &**s == "auto"));
+    let enabled = !matches!(&(grouping).view(), ValueView::Bool(false));
+    let min2 = matches!(&(grouping).view(), ValueView::Str(s) if &**s == "min2")
+        || (minimum_grouping >= 2
+            && matches!(&(grouping).view(), ValueView::Str(s) if &**s == "auto"));
     let (primary, secondary) = sizes;
     if !enabled || int_part.len() <= primary || (min2 && int_part.len() <= primary + 1) {
         return int_part.to_string();
@@ -1062,9 +1064,9 @@ impl IntlMv {
 /// ECMA-402 #sec-tointlmathematicalvalue (snapshot b1c961988b9a).
 pub(crate) fn to_intl_mv(i: &mut Interp, value: &Value) -> Result<IntlMv, Value> {
     let primitive = ab(i.to_primitive(value, crate::eval::Hint::Number))?;
-    match primitive {
+    match primitive.view() {
         // A BigInt is its exact value, without RoundMVResult.
-        Value::BigInt(b) => {
+        ValueView::BigInt(b) => {
             let text = b.to_string_radix(10);
             let digits = text.trim_start_matches('-');
             Ok(IntlMv::Finite(ExactDec::from_digits(
@@ -1073,9 +1075,9 @@ pub(crate) fn to_intl_mv(i: &mut Interp, value: &Value) -> Result<IntlMv, Value>
                 b.is_negative(),
             )))
         }
-        Value::Str(s) => Ok(string_intl_mv(&s)),
-        other => {
-            let x = ab(i.to_number(&other))?;
+        ValueView::Str(s) => Ok(string_intl_mv(&s)),
+        _ => {
+            let x = ab(i.to_number(&primitive))?;
             if x == 0.0 && x.is_sign_negative() {
                 return Ok(IntlMv::Finite(ExactDec::from_digits("0", 1, true)));
             }
@@ -2305,7 +2307,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     );
     put(i, &res, "notation", "#\u{0}nf_notation");
     // compactDisplay only appears when notation is compact.
-    if matches!(o.borrow().internal_slots().get("#\u{0}nf_notation").map(|p| p.value()), Some(Value::Str(s)) if &*s == "compact")
+    if matches!((o.borrow().internal_slots().get("#\u{0}nf_notation").map(|p| p.value())).map(|__value| (__value).view()), Some(ValueView::Str(s)) if &*s == "compact")
     {
         put(i, &res, "compactDisplay", "#\u{0}nf_compactdisplay");
     }

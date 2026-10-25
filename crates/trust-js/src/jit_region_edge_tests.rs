@@ -1,6 +1,7 @@
 //! ECMA-262 e28783d5 If/Logical/Conditional/ForBody/Try evaluation.
 //! Removing pure control-flow stubs must not change owners, polls, effects or values.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, value::Value, Completion, Engine};
 
 #[test]
@@ -104,7 +105,7 @@ fn engine(tier: Tier) -> Engine {
 fn cfg_edges_actual_branching_region_keeps_backedge_poll_and_deadline() {
     let mut engine = engine(Tier::Bytecode);
     evaluate(&mut engine, "function cfgEdges(n){var sum=0;for(var i=0;i<n;i++){if((i&3)===0)sum+=i;else if((i&3)===1)sum-=i;else sum+=2;}return sum;}cfgEdges(64);");
-    let global = Value::Obj(engine.interp.global.clone());
+    let global = Value::Obj(engine.interp.global);
     let function = engine
         .interp
         .get_member_key(&global, "cfgEdges")
@@ -117,7 +118,7 @@ fn cfg_edges_actual_branching_region_keeps_backedge_poll_and_deadline() {
         .call(function, Value::Undefined, &[Value::Num(40000.0)])
         .ok()
         .unwrap();
-    assert!(matches!(value, Value::Num(n) if n == 30000.0));
+    assert!(matches!((value).view(), ValueView::Num(n) if n == 30000.0));
     assert!(
         EXECUTED_REGIONS.with(std::cell::Cell::get) > before,
         "direct host call must execute the tested function's optimized region"

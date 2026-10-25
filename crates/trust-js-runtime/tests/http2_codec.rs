@@ -22,7 +22,7 @@ impl Write for Captured {
 fn frames_and_hpack_round_trip_and_reject_invalid_input() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

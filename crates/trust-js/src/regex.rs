@@ -1957,6 +1957,17 @@ fn elem_of_cp(cp: u32) -> char {
     }
 }
 
+/// The source string a prepared subject keeps (and its window's parent's), the GC edges of a
+/// cached subject.
+impl crate::gc_trace::GcTrace for ReText {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        crate::gc_trace::GcTrace::trace_gc(&self.ascii_src, sink);
+        if let Some(parent) = &self.parent {
+            crate::gc_trace::GcTrace::trace_gc(&**parent, sink);
+        }
+    }
+}
+
 /// A subject string prepared for matching: its elements plus each element's unit offset.
 /// A flat subject's `unit_of` is `None` when element index == unit offset; otherwise it records
 /// each element's offset and the final unit length. A window resolves both elements and offsets
@@ -2048,7 +2059,7 @@ impl ReText {
                 parent.subject_shape
             },
             unicode: parent.unicode,
-            ascii_src: ascii.then(|| source.clone()),
+            ascii_src: ascii.then_some(*source),
             parent: (!ascii).then_some(parent),
             elem_base: first,
             unit_base: start,
@@ -2063,7 +2074,7 @@ impl ReText {
         }
     }
 
-    /// Prepare `s` for matching, keeping the caller's `Rc` for zero-copy ASCII slicing.
+    /// Prepare `s` for matching, keeping the caller's string for zero-copy ASCII slicing.
     pub fn new_rc(unicode: bool, s: &crate::lstr::LStr) -> ReText {
         // Engine strings maintain an exact one-way ASCII hint in their allocation header.
         // RegExp workloads commonly stream many distinct ASCII subjects through the tiny
@@ -2076,15 +2087,15 @@ impl ReText {
                 n_elems: s.len(),
                 subject_shape: SUBJECT_ASCII,
                 unicode,
-                ascii_src: Some(s.clone()),
+                ascii_src: Some(*s),
                 parent: None,
                 elem_base: 0,
                 unit_base: 0,
             };
         }
-        // Keep the engine string itself: `LStr::clone` is one refcount bump and its immutable
+        // Keep the engine string itself: `LStr::clone` copies a handle, and its immutable
         // bytes can be matched and sliced directly.
-        Self::build(unicode, s, Some(s.clone()))
+        Self::build(unicode, s, Some(*s))
     }
 
     fn build(unicode: bool, s: &str, src: Option<crate::lstr::LStr>) -> ReText {

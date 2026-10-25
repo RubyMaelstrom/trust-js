@@ -1,4 +1,5 @@
 use super::*;
+use crate::value::ValueView;
 
 thread_local! {
     static BEFORE_RETIREMENT_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -481,7 +482,7 @@ fn admission_denial_precedes_actual_ordinary_continuation_and_osr_compilation() 
         }
     }
     fn call(e: &mut Engine, name: &str) -> Value {
-        let env = e.interp.global_env.clone();
+        let env = e.interp.global_env;
         let f = e.interp.get_var(name, &env).ok().expect("fixture function");
         e.interp
             .call(f, Value::Undefined, &[])
@@ -498,7 +499,10 @@ fn admission_denial_precedes_actual_ordinary_continuation_and_osr_compilation() 
     e.set_tier(Tier::Jit);
     e.set_tier_threshold(0);
     let before = super::super::PERF_COMPILE_ATTEMPTS.load(Relaxed);
-    assert!(matches!(call(&mut e, "ordinary"), Value::Num(41.0)));
+    assert!(matches!(
+        (call(&mut e, "ordinary")).view(),
+        crate::value::ValueView::Num(41.0)
+    ));
     let generator = call(&mut e, "generator");
     let next = e
         .interp
@@ -511,8 +515,8 @@ fn admission_denial_precedes_actual_ordinary_continuation_and_osr_compilation() 
         .ok()
         .expect("continuation fallback");
     assert!(matches!(
-        e.interp.get_member_key(&item, "value"),
-        Ok(Value::Num(7.0))
+        (e.interp.get_member_key(&item, "value")).map(|__value| (__value).view()),
+        Ok(ValueView::Num(7.0))
     ));
     e.set_tier_threshold(32);
     assert_eq!(
@@ -531,6 +535,9 @@ fn admission_denial_precedes_actual_ordinary_continuation_and_osr_compilation() 
     eval(&mut e, "function admitted(){return 42;}");
     e.set_tier(Tier::Jit);
     e.set_tier_threshold(0);
-    assert!(matches!(call(&mut e, "admitted"), Value::Num(42.0)));
+    assert!(matches!(
+        (call(&mut e, "admitted")).view(),
+        crate::value::ValueView::Num(42.0)
+    ));
     assert!(super::super::PERF_COMPILE_ATTEMPTS.load(Relaxed) > before);
 }

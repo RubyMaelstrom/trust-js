@@ -6,15 +6,15 @@
 //! the shared slot until teardown; mapped parameters consult this canonical slot as well.
 
 use crate::interpreter::Env;
-use crate::value::{PackedValue, Value};
-use std::cell::RefCell;
+use crate::value::Value;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
 struct Alias {
     environment: Env,
     name: Rc<str>,
-    slot: *const PackedValue,
+    slot: *const Cell<Value>,
 }
 
 #[derive(Default, Clone)]
@@ -24,7 +24,7 @@ pub(crate) struct Scope<'a> {
     registry: Registry,
     floor: usize,
     end: usize,
-    _slots: PhantomData<&'a [PackedValue]>,
+    _slots: PhantomData<&'a [Cell<Value>]>,
 }
 
 impl Registry {
@@ -42,7 +42,7 @@ impl Registry {
     pub(crate) unsafe fn enter<'a>(
         &self,
         homes: &[(Env, Rc<str>, u16)],
-        slots: &'a [PackedValue],
+        slots: &'a [Cell<Value>],
     ) -> Scope<'a> {
         for (environment, name, slot) in homes {
             assert!((*slot as usize) < slots.len());
@@ -51,7 +51,7 @@ impl Registry {
         let mut aliases = self.0.borrow_mut();
         let floor = aliases.len();
         aliases.extend(homes.iter().map(|(environment, name, slot)| Alias {
-            environment: environment.clone(),
+            environment: *environment,
             name: name.clone(),
             slot: &slots[*slot as usize],
         }));
@@ -62,16 +62,16 @@ impl Registry {
             _slots: PhantomData,
         };
         drop(aliases);
-        // Registration is complete and the restoration guard exists before releasing any
-        // parked owner. The binding's initialization/mutability state remains unchanged;
-        // only the canonical slot owns its current Value while this AST record is parked.
+        // Registration and the restoration guard precede clearing parked words. The binding's
+        // initialization/mutability flags stay independent; the canonical slot retains its
+        // current word while this AST record is parked.
         for (environment, name, _) in homes {
             environment
                 .borrow_mut()
                 .vars
                 .get_mut(name)
                 .expect("borrowed binding remains present")
-                .value = Value::Undefined;
+                .set_value(Value::Undefined);
         }
         scope
     }
@@ -79,21 +79,21 @@ impl Registry {
     pub(crate) fn read(&self, environment: &Env, name: &str) -> Option<Value> {
         let aliases = self.0.borrow();
         let alias = aliases.iter().rev().find(|alias| {
-            Rc::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
+            Env::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
         })?;
         // The scoped registration pins this shared Cell owner; it cannot resize or move.
-        Some(unsafe { &*alias.slot }.unpack())
+        Some(unsafe { &*alias.slot }.get())
     }
 
     pub(crate) fn write(&self, environment: &Env, name: &str, value: &Value) -> bool {
         let aliases = self.0.borrow();
         let Some(alias) = aliases.iter().rev().find(|alias| {
-            Rc::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
+            Env::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
         }) else {
             return false;
         };
-        // Match ordinary VM writes: transfer a new owner through the Cell, releasing the old.
-        unsafe { &*alias.slot }.replace_value(value.clone());
+        // Match ordinary VM writes: replace the Cell's value so every parameter alias sees it.
+        unsafe { &*alias.slot }.set(*value);
         true
     }
 
@@ -115,16 +115,35 @@ impl Drop for Scope<'_> {
         // Restore every parked record before removing its canonical lookup or allowing its
         // slot owner to be cleared/reused. Value destruction invokes no JavaScript here.
         for alias in &aliases[self.floor..] {
-            let value = unsafe { &*alias.slot }.unpack();
+            let word = unsafe { &*alias.slot }.get();
             let mut scope = alias.environment.borrow_mut();
             let binding = scope
                 .vars
                 .get_mut(&alias.name)
                 .expect("borrowed binding remains present");
-            binding.initialized = !matches!(value, Value::Empty);
-            binding.value = value;
+            binding.initialized = !word.is_empty();
+            binding.set_value(word);
         }
         aliases.truncate(self.floor);
+    }
+}
+
+impl crate::gc_trace::GcTrace for Registry {
+    /// Aliased homes' environments; the aliased slots belong to registered VM frames.
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        for alias in self
+            .0
+            .try_borrow()
+            .expect("borrowed parameter registry mutably borrowed at a safepoint (I9)")
+            .iter()
+        {
+            let Alias {
+                environment,
+                name: _,
+                slot: _,
+            } = alias;
+            sink.env(environment);
+        }
     }
 }
 
@@ -132,55 +151,66 @@ impl Drop for Scope<'_> {
 mod tests {
     use super::*;
     use crate::interpreter::{new_scope, Binding};
+    use crate::value::ValueView;
 
+    /// A Rust unwind out of a borrowed scope restores every parked binding from its slot, with
+    /// the binding's attributes, and leaves no stale slot pointer. The object the slot held
+    /// before its overwrite is then reachable from neither, so a collection frees it.
     #[test]
     fn transferred_owners_and_binding_attributes_restore_on_unwind() {
+        let mut engine = crate::Engine::new();
         let environment = new_scope(None);
-        let old = crate::value::Object::new(None);
-        let weak = Rc::downgrade(&old);
-        environment
-            .borrow_mut()
-            .vars
-            .insert("old", Binding::data(Value::Obj(old.clone()), false, true));
-        environment
-            .borrow_mut()
-            .vars
-            .insert("later", Binding::data(Value::Undefined, true, false));
-        let slots = [
-            PackedValue::pack(Value::Obj(old)),
-            PackedValue::pack(Value::Empty),
-        ];
-        let homes = [
-            (environment.clone(), Rc::from("old"), 0),
-            (environment.clone(), Rc::from("later"), 1),
-        ];
         let registry = Registry::default();
-        assert_eq!(weak.strong_count(), 2);
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _scope = unsafe { registry.enter(&homes, &slots) };
-            assert_eq!(weak.strong_count(), 1, "only the slot retains its owner");
-            {
-                let parked = environment.borrow();
-                let old = parked.vars.get("old").unwrap();
-                assert!(matches!(old.value, Value::Undefined));
-                assert!(old.initialized && !old.mutable && old.strict_immutable);
-                assert!(!parked.vars.get("later").unwrap().initialized);
-            }
-            slots[0].replace_value(Value::Num(7.0));
-            assert_eq!(weak.strong_count(), 0, "overwrite releases the old owner");
-            panic!("test restoration on Rust unwind");
-        }));
-        assert!(unwind.is_err());
+        // The object's handles and the slots live only in this helper frame (the collector
+        // scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let old = crate::value::Object::new(None);
+            let weak = crate::value::Gc::downgrade(&old);
+            environment
+                .borrow_mut()
+                .vars
+                .insert("old", Binding::data(Value::Obj(old), false, true));
+            environment
+                .borrow_mut()
+                .vars
+                .insert("later", Binding::data(Value::Undefined, true, false));
+            let slots = [Cell::new(Value::Obj(old)), Cell::new(Value::Empty)];
+            let homes = [
+                (environment, Rc::from("old"), 0),
+                (environment, Rc::from("later"), 1),
+            ];
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = unsafe { registry.enter(&homes, &slots) };
+                {
+                    let parked = environment.borrow();
+                    let old = parked.vars.get("old").unwrap();
+                    assert!(matches!((old.value()).view(), ValueView::Undefined));
+                    assert!(old.initialized && !old.mutable && old.strict_immutable);
+                    assert!(!parked.vars.get("later").unwrap().initialized);
+                }
+                slots[0].set(Value::Num(7.0));
+                panic!("test restoration on Rust unwind");
+            }));
+            assert!(unwind.is_err());
+            weak
+        });
         assert!(
             registry.0.borrow().is_empty(),
             "no stale slot pointer survives"
         );
-        let restored = environment.borrow();
-        let old = restored.vars.get("old").unwrap();
-        assert!(matches!(old.value, Value::Num(7.0)));
-        assert!(old.initialized && !old.mutable && old.strict_immutable);
-        let later = restored.vars.get("later").unwrap();
-        assert!(!later.initialized && later.mutable);
-        assert!(matches!(later.value, Value::Empty));
+        {
+            let restored = environment.borrow();
+            let old = restored.vars.get("old").unwrap();
+            assert!(matches!((old.value()).view(), ValueView::Num(7.0)));
+            assert!(old.initialized && !old.mutable && old.strict_immutable);
+            let later = restored.vars.get("later").unwrap();
+            assert!(!later.initialized && later.mutable);
+            assert!(matches!((later.value()).view(), ValueView::Empty));
+        }
+        engine.interp.gc_collect();
+        assert!(
+            !crate::gc_test::alive(&weak),
+            "the overwritten object is released"
+        );
     }
 }

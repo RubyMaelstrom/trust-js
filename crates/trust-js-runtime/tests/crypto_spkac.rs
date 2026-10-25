@@ -58,7 +58,7 @@ fn certificate_parses_and_verifies_openssl_spkac() {
 
     let mut rt = Runtime::new();
     let out = Captured::default();
-    rt.engine().ctx().op_state().put(ConsoleOut {
+    rt.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

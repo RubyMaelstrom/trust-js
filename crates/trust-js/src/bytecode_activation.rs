@@ -7,7 +7,6 @@
 //! instantiation path. Structural eval mutations invalidate VarMap's layout proof.
 
 use super::{CapInit, Chunk};
-use crate::execution_storage::CallArgs;
 use crate::interpreter::{
     new_var_scope_with_bindings, Binding, BindingLayout, Env, Interp, VarMap,
 };
@@ -150,22 +149,31 @@ impl ActivationPlan {
         interp: &mut Interp,
         parent: &Env,
         this_value: &Value,
-        arguments: CallArgs<'_>,
+        arguments: &[Value],
     ) -> Env {
-        let mut vars = VarMap::from_fixed_bindings(self.bindings.clone(), self.layout.as_ref());
+        let mut vars = VarMap::from_fixed_bindings(
+            self.bindings.iter().cloned().collect(),
+            self.layout.as_ref(),
+        );
         for &(slot, parameter) in &self.parameters {
-            vars.initialize_fixed_value(slot, arguments.read(usize::from(parameter)));
+            vars.initialize_fixed_value(
+                slot,
+                arguments
+                    .get(usize::from(parameter))
+                    .copied()
+                    .unwrap_or(Value::Undefined),
+            );
         }
         if let Some((slot, first)) = self.rest {
             vars.initialize_fixed_value(
                 slot,
-                interp.make_array(arguments.rest_values(usize::from(first))),
+                interp.make_array(arguments.get(usize::from(first)..).unwrap_or(&[]).to_vec()),
             );
         }
         if let Some(slot) = self.this_slot {
-            vars.initialize_fixed_value(slot, this_value.clone());
+            vars.initialize_fixed_value(slot, *this_value);
         }
-        let activation = new_var_scope_with_bindings(Some(parent.clone()), vars);
+        let activation = new_var_scope_with_bindings(Some(*parent), vars);
         {
             let mut scope = activation.borrow_mut();
             for name in &self.lexicals {
@@ -175,19 +183,15 @@ impl ActivationPlan {
         // Every closure captures this invocation's actual environment. The
         // plan contains no JS object, closure environment, or argument owner.
         for &(slot, function) in &self.functions {
-            let value = interp.make_function(
-                chunk.funcs[usize::from(function)].clone(),
-                activation.clone(),
-            );
+            let value =
+                interp.make_function(chunk.funcs[usize::from(function)].clone(), activation);
             activation
                 .borrow_mut()
                 .vars
                 .initialize_fixed_value(slot, value);
         }
         if let Some(slot) = self.arguments_slot {
-            let value = arguments.with_values(|arguments| {
-                Value::Obj(interp.make_compiled_arguments_object(arguments, &activation))
-            });
+            let value = Value::Obj(interp.make_compiled_arguments_object(arguments, &activation));
             activation
                 .borrow_mut()
                 .vars
@@ -221,6 +225,7 @@ impl ActivationPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
     use crate::{bytecode::Tier, Completion, Engine};
 
     fn evaluate(engine: &mut Engine, source: &str) -> String {
@@ -345,16 +350,16 @@ mod tests {
                 ),
                 "true"
             );
-            let global = engine.interp.global_env.clone();
-            let Value::Obj(one) = engine
+            let global = engine.interp.global_env;
+            let ValueView::Obj(one) = (engine
                 .interp
                 .get_var("one", &global)
-                .unwrap_or_else(|_| panic!("missing closure"))
-            else {
+                .unwrap_or_else(|_| panic!("missing closure")))
+            .view() else {
                 panic!("expected closure")
             };
             let activation = match &one.borrow().call {
-                crate::value::Callable::User(user) => user.env.clone(),
+                crate::value::Callable::User(user) => user.env,
                 _ => panic!("expected user closure"),
             };
             if activation_plans_enabled() {
@@ -414,20 +419,21 @@ mod tests {
             );
             assert_eq!(evaluate(&mut engine, &source), "4656|4752", "{tier:?}");
             let environment = |engine: &mut Engine, name| {
-                let global = engine.interp.global_env.clone();
+                let global = engine.interp.global_env;
                 let value = engine
                     .interp
                     .get_var(name, &global)
                     .unwrap_or_else(|_| panic!("missing fixture closure {name}"));
-                let object = value.as_obj().unwrap().borrow();
+                let object_handle = value.as_obj().unwrap();
+                let object = object_handle.borrow();
                 let crate::value::Callable::User(user) = &object.call else {
                     panic!("fixture closure")
                 };
-                user.env.clone()
+                user.env
             };
             let left = environment(&mut engine, "left59");
             let right = environment(&mut engine, "right59");
-            assert!(!Rc::ptr_eq(&left, &right));
+            assert!(!Env::ptr_eq(&left, &right));
             if tier != Tier::Interp
                 && activation_plans_enabled()
                 && crate::interpreter::indexed_activations_enabled()
@@ -440,7 +446,11 @@ mod tests {
                 ));
                 assert!(l.vars.binding_slot("v95").is_some());
             }
-            left.borrow_mut().vars.get_mut("v95").unwrap().value = Value::Num(1.);
+            left.borrow_mut()
+                .vars
+                .get_mut("v95")
+                .unwrap()
+                .set_value(Value::Num(1.));
             assert_eq!(evaluate(&mut engine, "left59()+'|'+right59()"), "4561|4752");
             left.borrow_mut()
                 .vars

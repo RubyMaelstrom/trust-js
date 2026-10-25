@@ -6,11 +6,13 @@
 //! the original operations and owners untouched. No post-RHS name re-resolution
 //! is used to guess the original Reference.
 
+use crate::value::ValueView;
+use std::cell::Cell;
+
 use super::{observe_arithmetic_operands, observe_arithmetic_result, Chunk, Op};
-use crate::execution_storage::{SlotAccess, StoredValue, ValueStack};
+use crate::execution_storage::{SlotAccess, ValueStack};
 use crate::interpreter::{Env, Interp, MAX_STR_LEN};
-use crate::value::{PackedValue, Value};
-use std::rc::Rc;
+use crate::value::Value;
 
 const MAX_SCOPES: usize = 16;
 
@@ -84,18 +86,18 @@ fn try_store(
     plan: Plan,
     right: Value,
 ) -> Option<Stored> {
-    let Value::Str(ref suffix) = right else {
+    let ValueView::Str(ref suffix) = (right).view() else {
         return None;
     };
     let name = &chunk.names[plan.name as usize];
-    let mut current = env.clone();
+    let mut current = *env;
     for _ in 0..MAX_SCOPES {
-        if Rc::ptr_eq(&current, &interp.global_env) {
+        if Env::ptr_eq(&current, &interp.global_env) {
             return None;
         }
         let parent = {
             let mut record = current.borrow_mut();
-            if record.with_obj.is_some() || record.parent.is_none() {
+            if record.has_with_object() || record.parent.is_none() {
                 return None;
             }
             if let Some(binding) = record.vars.get_mut(name) {
@@ -106,28 +108,25 @@ fn try_store(
                 {
                     return None;
                 }
-                let Value::Str(prefix) = &binding.value else {
+                let original = binding.value();
+                let ValueView::Str(prefix) = original.view() else {
                     return None;
                 };
                 if prefix.len().saturating_add(suffix.len()) > MAX_STR_LEN {
                     return None;
                 }
-                let profiling = observe_arithmetic_operands(
-                    &chunk.feedback,
-                    plan.pc + 2,
-                    &binding.value,
-                    &right,
-                );
-                // The binding remains populated, including throughout allocation. There is no
-                // copied left operand to retain the prefix: no observer or interior resume can
-                // enter this region. Real aliases (including the RHS/view owners) remain live.
-                let Value::Str(prefix) = &mut binding.value else {
-                    unreachable!()
-                };
+                let profiling =
+                    observe_arithmetic_operands(&chunk.feedback, plan.pc + 2, &original, &right);
+                // Keep the original binding populated and rooted throughout decode/append.
+                // Commit the copied prefix before any observer or interior resume can enter;
+                // real aliases, including the RHS and substring views, keep their old text.
+                let mut prefix = prefix;
                 prefix.append_or_replace(suffix);
-                observe_arithmetic_result(&chunk.feedback, plan.pc + 2, profiling, &binding.value);
+                let result = Value::Str(prefix);
+                binding.set_value(result);
+                observe_arithmetic_result(&chunk.feedback, plan.pc + 2, profiling, &result);
                 let stored = Stored {
-                    result: plan.keep.then(|| binding.value.clone()),
+                    result: plan.keep.then_some(result),
                 };
                 drop(record);
                 // Pure scalar/weak cache population, as after the ordinary checked store.
@@ -136,19 +135,19 @@ fn try_store(
                 let _ = chunk.name_ic_fill(interp, env, plan.name, plan.write_cache);
                 return Some(stored);
             }
-            record.parent.clone()
+            record.parent
         };
         current = parent?;
     }
     None
 }
 
-pub(super) fn try_vm<S: StoredValue>(
+pub(super) fn try_vm(
     chunk: &Chunk,
     interp: &mut Interp,
     env: &Env,
-    slots: &[S],
-    stack: &mut ValueStack<S>,
+    slots: &[Cell<Value>],
+    stack: &mut ValueStack,
     pc: usize,
     stop_at: Option<usize>,
 ) -> Option<usize> {
@@ -177,7 +176,7 @@ pub(super) fn try_vm<S: StoredValue>(
 pub(crate) unsafe extern "C" fn jit_try(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut PackedValue,
+    sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     // OPSTAT counts operations that actually reach their original checked helpers. Keep
@@ -195,7 +194,9 @@ pub(crate) unsafe extern "C" fn jit_try(
     }
     // As in jit_exec_inner, the running callee's swapped env_raw is authoritative.
     let env = std::mem::ManuallyDrop::new(unsafe {
-        Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
+        crate::interpreter::Env::from_raw(
+            ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+        )
     });
     let right = unsafe { ctx.clone_slot(plan.slot as usize) };
     let Some(stored) = try_store(chunk, unsafe { &mut *ctx.interp }, &env, plan, right) else {
@@ -203,7 +204,7 @@ pub(crate) unsafe extern "C" fn jit_try(
     };
     let end_sp = if let Some(result) = stored.result {
         unsafe {
-            sp.write(PackedValue::pack(result));
+            sp.write(result);
             sp.add(1)
         }
     } else {

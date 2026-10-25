@@ -18,9 +18,9 @@ stacker = "0.1.25"
 [features]
 default = ["intl"]
 # ECMA-402 (`Intl`) and the CLDR data tables backing it — the single largest contributor to
-# binary size. Disable (`--no-default-features`) for a small build: the `Intl` global is absent
-# and the `toLocale*` methods degrade to their locale-independent forms (like engines built
-# without i18n support).
+# binary size. Disable it for a small build (`--no-default-features`): the `Intl` global is
+# absent and the `toLocale*` methods degrade to their locale-independent forms (like engines
+# built without i18n support).
 intl = []
 # The curated embedder surface (`trust_js::embed`: Ctx, host state, define_global, event-loop
 # hooks) used by the trust-js-host/trust-js-runtime crates. Off by default: everything under it is a
@@ -31,10 +31,6 @@ embed = []
 bench = []
 # Allocation/call-cache observations compiled out of ordinary engine builds.
 architecture-diagnostics = []
-# Opt-in central-heap handle bridge used by migration tests. It records one checked handle per
-# live object while the existing `Rc<RefCell<Object>>` graph remains authoritative; never enabled
-# by the default production build until relocation and differential gates are complete.
-heap-bridge = []
 
 [lints]
 workspace = true

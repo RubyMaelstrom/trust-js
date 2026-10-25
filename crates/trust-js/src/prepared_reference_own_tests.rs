@@ -1,6 +1,7 @@
 //! Own-data shortcuts for captured Object Environment Records. ECMA-262 snapshot
 //! e28783d5fc9d: HasBinding, GetBindingValue, SetMutableBinding, OrdinaryHasProperty/Get/Set.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn run(engine: &mut Engine, source: &str) -> String {
@@ -14,7 +15,7 @@ fn run(engine: &mut Engine, source: &str) -> String {
 }
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .get_var(name, &env)
@@ -22,7 +23,6 @@ fn object(engine: &mut Engine, name: &str) -> Gc {
         .unwrap()
         .as_obj()
         .unwrap()
-        .clone()
 }
 
 fn reset_paths() {
@@ -94,11 +94,11 @@ fn prepared_reference_own_refresh_keeps_saved_owner_and_live_descriptor_strictne
         .borrow_mut()
         .props
         .insert("value", Property::plain(Value::Num(3.0)));
-    let mut reference = PreparedReference::object(Rc::from("value"), owner.clone(), false);
+    let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
     reset_paths();
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(3.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(3.0))
     ));
     let prior_shape = reference.shape;
     owner.borrow_mut().props.remove("first");
@@ -120,8 +120,8 @@ fn prepared_reference_own_refresh_keeps_saved_owner_and_live_descriptor_strictne
         .insert("value", Property::plain(Value::Num(99.0)));
     assert_ne!(owner.borrow().props.shape(), prior_shape);
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(7.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(7.0))
     ));
     engine.interp.strict = true; // must not override the captured sloppy Reference.
     owner
@@ -135,8 +135,8 @@ fn prepared_reference_own_refresh_keeps_saved_owner_and_live_descriptor_strictne
         .write_prepared_reference(&mut reference, Value::Num(11.0))
         .is_ok());
     assert!(matches!(
-        owner.borrow().props.get("value").unwrap().value(),
-        Value::Num(7.0)
+        (owner.borrow().props.get("value").unwrap().value()).view(),
+        ValueView::Num(7.0)
     ));
     reference.strict = 1;
     engine.interp.strict = false;
@@ -237,16 +237,16 @@ fn prepared_reference_own_numeric_internal_names_never_bypass_mapped_arguments()
         "var observe;var owner=(function(a){observe=()=>a;return arguments})(3);",
     );
     let owner = object(&mut engine, "owner");
-    let pointer = Rc::as_ptr(&owner) as usize;
+    let pointer = Gc::as_ptr(&owner) as usize;
     assert!(engine.interp.mapped_arguments.contains_key(&pointer));
-    let mut reference = PreparedReference::object(Rc::from("0"), owner.clone(), false);
+    let mut reference = PreparedReference::object(Rc::from("0"), owner, false);
     // Simulate a previously published ordinary shape hint: owner kind must still be checked.
     reference.shape = owner.borrow().props.shape();
     reference.slot = owner.borrow().props.slot_of("0").unwrap_or(usize::MAX);
     reset_paths();
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(3.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(3.0))
     ));
     assert_eq!(reference.shape, 0);
     assert!(engine
@@ -254,8 +254,8 @@ fn prepared_reference_own_numeric_internal_names_never_bypass_mapped_arguments()
         .write_prepared_reference(&mut reference, Value::Num(7.0))
         .is_ok());
     assert!(matches!(
-        engine.interp.mapped_arg_value(pointer, "0"),
-        Some(Value::Num(7.0))
+        (engine.interp.mapped_arg_value(pointer, "0")).map(|__value| (__value).view()),
+        Some(ValueView::Num(7.0))
     ));
     assert_eq!(run(&mut engine, "observe()"), "7");
     assert_eq!(paths()[2], 0);
@@ -288,14 +288,15 @@ fn prepared_reference_own_exotic_host_and_exhausted_shapes_withdraw_hints() {
         .borrow_mut()
         .props
         .insert("value", Property::plain(Value::Num(9.0)));
-    let mut reference = PreparedReference::object(Rc::from("value"), owner.clone(), false);
+    let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
     assert!(engine
         .interp
         .refresh_reference_own_data_hint(&mut reference));
-    let pointer = Rc::as_ptr(&owner) as usize;
+    let pointer = Gc::as_ptr(&owner) as usize;
     // Registration marks the object as side-table exotic, as install_indexed_properties does.
     owner.borrow().ic_plain.set(false);
     engine.interp.host_indexed.insert(
+        &engine.interp.gc_heap,
         pointer,
         crate::interpreter::HostIndexedProperties {
             length: 0,
@@ -313,8 +314,8 @@ fn prepared_reference_own_exotic_host_and_exhausted_shapes_withdraw_hints() {
     owner.borrow_mut().props.force_uncacheable_shape_for_test();
     reset_paths();
     assert!(matches!(
-        engine.interp.read_prepared_reference(&mut reference),
-        Ok(Value::Num(9.0))
+        (engine.interp.read_prepared_reference(&mut reference)).map(|__value| (__value).view()),
+        Ok(crate::value::ValueView::Num(9.0))
     ));
     assert!(engine
         .interp
@@ -350,7 +351,7 @@ fn prepared_reference_own_values_and_last_owner_survive_gc_without_reboxing_chan
         owner
             .borrow_mut()
             .props
-            .insert("value", Property::plain(value.clone()));
+            .insert("value", Property::plain(value));
         let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
         reset_paths();
         let actual = engine
@@ -361,7 +362,7 @@ fn prepared_reference_own_values_and_last_owner_survive_gc_without_reboxing_chan
         assert!(crate::builtins::same_value_pub(&actual, &value));
         assert!(engine
             .interp
-            .write_prepared_reference(&mut reference, value.clone())
+            .write_prepared_reference(&mut reference, value)
             .is_ok());
         engine.interp.gc_collect();
         assert!(crate::builtins::same_value_pub(
@@ -375,39 +376,46 @@ fn prepared_reference_own_values_and_last_owner_survive_gc_without_reboxing_chan
         assert_eq!(paths()[2], 2);
         assert_eq!(paths()[3], 1);
     }
-    let child = Object::new(None);
-    child
-        .borrow_mut()
-        .props
-        .insert("value", Property::plain(Value::Num(29.0)));
-    let weak_child = Rc::downgrade(&child);
-    let owner = Object::new(None);
-    owner
-        .borrow_mut()
-        .props
-        .insert("value", Property::plain(Value::Obj(child)));
-    let weak_owner = Rc::downgrade(&owner);
-    let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
-    let returned = engine
-        .interp
-        .read_prepared_reference(&mut reference)
-        .ok()
-        .unwrap();
+    // Strong handles live only in helper frames (the collector scans the stack): the outer frame
+    // holds the returned value, the inner one the reference.
+    let weak_child = crate::gc_test::in_frame(|| {
+        let (weak_owner, weak_child, returned) = crate::gc_test::in_frame(|| {
+            let child = Object::new(None);
+            child
+                .borrow_mut()
+                .props
+                .insert("value", Property::plain(Value::Num(29.0)));
+            let weak_child = Gc::downgrade(&child);
+            let owner = Object::new(None);
+            owner
+                .borrow_mut()
+                .props
+                .insert("value", Property::plain(Value::Obj(child)));
+            let weak_owner = Gc::downgrade(&owner);
+            let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
+            let returned = engine
+                .interp
+                .read_prepared_reference(&mut reference)
+                .ok()
+                .unwrap();
+            engine.interp.gc_collect();
+            assert!(
+                crate::gc_test::alive(&weak_owner),
+                "saved base is a strong external owner"
+            );
+            (weak_owner, weak_child, returned)
+        });
+        engine.interp.gc_collect();
+        assert!(!crate::gc_test::alive(&weak_owner));
+        assert!(
+            crate::gc_test::alive(&weak_child),
+            "returned Value owns the last child"
+        );
+        drop(returned);
+        weak_child
+    });
     engine.interp.gc_collect();
-    assert!(
-        weak_owner.upgrade().is_some(),
-        "saved base is a strong external owner"
-    );
-    drop(reference);
-    engine.interp.gc_collect();
-    assert!(weak_owner.upgrade().is_none());
-    assert!(
-        weak_child.upgrade().is_some(),
-        "returned Value owns the last child"
-    );
-    drop(returned);
-    engine.interp.gc_collect();
-    assert!(weak_child.upgrade().is_none());
+    assert!(!crate::gc_test::alive(&weak_child));
 }
 
 #[test]

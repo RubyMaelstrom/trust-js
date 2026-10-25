@@ -2,11 +2,192 @@
 //! ephemerons and atomic weak-target clearing happen before this step; no liveness decision
 //! is made here. Choose key removal or a table scan according to the smaller working set.
 
-use crate::fasthash::FastSet;
+use crate::gc_core::{self, DescId};
+use crate::value::Object;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
-pub(crate) fn map<T, S: BuildHasher>(table: &mut HashMap<usize, T, S>, dead: &FastSet<usize>) {
+/// The objects a collection found dead, which the engine evicts from its tables between the
+/// collection's phases ([`gc_core::Heap::start_marking`], [`gc_core::Heap::finish_collection`]):
+/// the cells of the object descriptor that marking left unmarked, zombies apart. Walks
+/// ([`DeadObjects::iter`]) use the list that [`gc_core::Heap::dead_cells`] made as the view was
+/// built; membership ([`DeadObjects::contains`]) reads the heap's bits, without hashing. Between
+/// the phases nothing changes a dead cell's bits (a cell allocated there is allocated marked),
+/// so the two agree. After the sweep the bits no longer say what died (marks are cleared, dead
+/// cells freed or kept as zombies, pages released) and only the list stays meaningful: debug
+/// builds assert that every query comes between the phases of the view's collection, and that
+/// every answer is the list's.
+pub(crate) struct DeadObjects<'h> {
+    /// The dead cells' addresses, listed on the first walk ([`DeadObjects::iter`]): a table
+    /// smaller than the dead count is swept by membership alone and needs no list.
+    list: std::cell::OnceCell<Vec<usize>>,
+    count: usize,
+    membership: Membership<'h>,
+}
+
+/// What answers [`DeadObjects::contains`].
+enum Membership<'h> {
+    /// The heap's bits for its object descriptor ([`gc_core::Heap::is_dead_small_cell`]).
+    Bits {
+        core: &'h RefCell<gc_core::Heap>,
+        desc: DescId,
+        /// The collection that listed the dead: every query comes between its phases.
+        #[cfg(debug_assertions)]
+        collection: u64,
+        /// The list as a set: every answer must be its.
+        #[cfg(debug_assertions)]
+        listed: crate::fasthash::FastSet<usize>,
+    },
+    /// A test view's list, as a set.
+    #[cfg(test)]
+    List(crate::fasthash::FastSet<usize>),
+}
+
+// Objects are never large cells (value.rs keeps an object's cell within the 192-byte class), so
+// membership reads the pages alone and never the heap's map of large cells.
+const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= gc_core::LARGEST_SMALL_CELL);
+
+impl<'h> DeadObjects<'h> {
+    /// The objects of `heap` found dead by the collection between whose phases the heap is.
+    pub(crate) fn new(heap: &'h crate::value::GcState) -> Self {
+        let core = heap.core.borrow();
+        let count = core.dead_count(heap.object_desc);
+        #[cfg(debug_assertions)]
+        let collection = core
+            .collection_in_progress()
+            .expect("dead objects are listed between a collection's phases");
+        #[cfg(debug_assertions)]
+        let listed: crate::fasthash::FastSet<usize> =
+            core.dead_cells(heap.object_desc).into_iter().collect();
+        drop(core);
+        Self {
+            membership: Membership::Bits {
+                core: &heap.core,
+                desc: heap.object_desc,
+                #[cfg(debug_assertions)]
+                collection,
+                #[cfg(debug_assertions)]
+                listed,
+            },
+            list: std::cell::OnceCell::new(),
+            count,
+        }
+    }
+
+    /// A view of `list` with no heap behind it, whose membership is the list's.
+    #[cfg(test)]
+    pub(crate) fn from_list(list: Vec<usize>) -> Self {
+        Self {
+            membership: Membership::List(list.iter().copied().collect()),
+            count: list.len(),
+            list: list.into(),
+        }
+    }
+
+    /// Whether the object whose cell starts at `addr` is dead. Only between the phases of the
+    /// view's collection (see [`DeadObjects`]).
+    pub(crate) fn contains(&self, addr: usize) -> bool {
+        match &self.membership {
+            Membership::Bits {
+                core,
+                desc,
+                #[cfg(debug_assertions)]
+                collection,
+                #[cfg(debug_assertions)]
+                listed,
+            } => {
+                // Borrowed per query: the window between the phases may allocate.
+                let core = core.borrow();
+                #[cfg(debug_assertions)]
+                assert_eq!(
+                    core.collection_in_progress(),
+                    Some(*collection),
+                    "a dead-object view queried outside its collection's phases"
+                );
+                let dead = core.is_dead_small_cell(addr, *desc);
+                #[cfg(debug_assertions)]
+                assert_eq!(
+                    dead,
+                    listed.contains(&addr),
+                    "the heap's bits and the list of dead objects disagree on {addr:#x}"
+                );
+                dead
+            }
+            #[cfg(test)]
+            Membership::List(listed) => listed.contains(&addr),
+        }
+    }
+
+    /// How many objects died.
+    pub(crate) fn len(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The dead objects' addresses, in the list's order. The first walk lists them from the
+    /// heap's bits, so it must come between the phases of the view's collection.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.list
+            .get_or_init(|| match &self.membership {
+                Membership::Bits {
+                    core,
+                    desc,
+                    #[cfg(debug_assertions)]
+                    collection,
+                    #[cfg(debug_assertions)]
+                        listed: _,
+                } => {
+                    let core = core.borrow();
+                    #[cfg(debug_assertions)]
+                    assert_eq!(
+                        core.collection_in_progress(),
+                        Some(*collection),
+                        "dead objects listed outside their collection's phases"
+                    );
+                    core.dead_cells(*desc)
+                }
+                #[cfg(test)]
+                Membership::List(_) => unreachable!("a test view's list is given"),
+            })
+            .iter()
+            .copied()
+    }
+}
+
+thread_local! {
+    static EVICTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks a collector's eviction step on this thread while it lives (see
+/// `Interp::gc_evict_dead_owners`).
+pub(crate) struct Evicting(bool);
+
+impl Evicting {
+    pub(crate) fn enter() -> Self {
+        Self(EVICTING.replace(true))
+    }
+}
+
+impl Drop for Evicting {
+    fn drop(&mut self) {
+        EVICTING.set(self.0);
+    }
+}
+
+/// Whether this thread is in a collector's eviction step, which runs no VM code: what it drops
+/// ends as memory (I5).
+pub(crate) fn evicting() -> bool {
+    EVICTING.get()
+}
+
+/// Remove the dead objects' entries from `table`, walking the smaller side: each dead object's
+/// key is removed, which hashes it, or, when the dead outnumber the table's capacity (closure
+/// churn), the table is scanned once, each key asking the view, which tests the heap's bits.
+pub(crate) fn map<T, S: BuildHasher>(table: &mut HashMap<usize, T, S>, dead: &DeadObjects<'_>) {
     if table.is_empty() || dead.is_empty() {
         return;
     }
@@ -14,24 +195,25 @@ pub(crate) fn map<T, S: BuildHasher>(table: &mut HashMap<usize, T, S>, dead: &Fa
     // be rescanned for a handful of dead objects; conversely, closure churn must not
     // probe every internal-slot table once for every ordinary function/prototype.
     if dead.len() < table.capacity() {
-        for key in dead {
-            table.remove(key);
+        for key in dead.iter() {
+            table.remove(&key);
         }
     } else {
-        table.retain(|key, _| !dead.contains(key));
+        table.retain(|&key, _| !dead.contains(key));
     }
 }
 
-pub(crate) fn set<S: BuildHasher>(table: &mut HashSet<usize, S>, dead: &FastSet<usize>) {
+/// [`map`] for a set of addresses.
+pub(crate) fn set<S: BuildHasher>(table: &mut HashSet<usize, S>, dead: &DeadObjects<'_>) {
     if table.is_empty() || dead.is_empty() {
         return;
     }
     if dead.len() < table.capacity() {
-        for key in dead {
-            table.remove(key);
+        for key in dead.iter() {
+            table.remove(&key);
         }
     } else {
-        table.retain(|key| !dead.contains(key));
+        table.retain(|&key| !dead.contains(key));
     }
 }
 
@@ -52,11 +234,11 @@ mod tests {
                     table.insert(key, value.clone());
                     set_table.insert(key);
                 }
-                let dead: FastSet<_> = (0..dead_count).map(|key| key * 2).collect();
+                let dead = DeadObjects::from_list((0..dead_count).map(|key| key * 2).collect());
                 map(&mut table, &dead);
                 set(&mut set_table, &dead);
                 for (key, value) in values.iter().enumerate() {
-                    let live = !dead.contains(&key);
+                    let live = !dead.contains(key);
                     assert_eq!(table.contains_key(&key), live);
                     assert_eq!(set_table.contains(&key), live);
                     assert_eq!(Rc::strong_count(value), 1 + usize::from(live));

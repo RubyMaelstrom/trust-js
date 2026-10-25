@@ -167,7 +167,7 @@ pub(crate) fn enter(
         return Ok(Some(completion));
     }
     let token = site.token();
-    let realm = i.global.clone();
+    let realm = i.global;
     let context = Context::current(i);
     let kind = source.kind();
     let plan = match i
@@ -221,33 +221,33 @@ pub(crate) fn enter(
 
     // No make_run_env, ScriptEvaluation, FDI, binding initialization, iterator acquisition or
     // receiver binding occurs here. Rust-owned outer environments remain collector roots.
-    let mut current_env = env.clone();
-    let cap_env = env.clone();
+    let mut current_env = *env;
+    let cap_env = *env;
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     debug_assert!(slots.is_empty() && stack.is_empty());
-    slots.resize_with(chunk.n_slots, || PackedValue::pack(Value::Undefined));
-    slots.write_value(completion_slot as usize, completion.clone());
+    slots.resize_with(chunk.n_slots, || std::cell::Cell::new(Value::Undefined));
+    slots.write_value(completion_slot as usize, *completion);
     // Proven private homes can live in frame slots while this loop runs. Keep their original
     // records pinned and publish the final values before any parked AST catch/finally resumes.
     let mut private = Vec::with_capacity(plan.private_slots.len());
     for (name, slot) in &plan.private_slots {
         let before = private.len();
-        let mut cursor = Some(env.clone());
+        let mut cursor = Some(*env);
         while let Some(environment) = cursor {
             let scope = environment.borrow();
             if let Some(binding) = scope.vars.get(name) {
                 slots.write_value(
                     *slot as usize,
                     if binding.initialized {
-                        binding.value.clone()
+                        binding.value()
                     } else {
                         Value::Empty
                     },
                 );
-                private.push((environment.clone(), name.clone(), *slot));
+                private.push((environment, name.clone(), *slot));
                 break;
             }
-            cursor = scope.parent.clone();
+            cursor = scope.parent;
         }
         assert_eq!(
             private.len(),
@@ -258,13 +258,13 @@ pub(crate) fn enter(
     match seed {
         Seed::None => debug_assert!(seed_slots.is_empty()),
         Seed::ForIn(source, keys, cursor) => {
-            slots.write_value(seed_slots[0] as usize, source.clone());
+            slots.write_value(seed_slots[0] as usize, *source);
             slots.write_value(seed_slots[1] as usize, keys.clone().into_value());
             slots.write_value(seed_slots[2] as usize, Value::Num(cursor as f64));
         }
         Seed::ForOf(iterator, next) => {
-            slots.write_value(seed_slots[0] as usize, iterator.clone());
-            slots.write_value(seed_slots[1] as usize, next.clone());
+            slots.write_value(seed_slots[0] as usize, *iterator);
+            slots.write_value(seed_slots[1] as usize, *next);
         }
     }
     let mut pc = 0;
@@ -302,7 +302,7 @@ pub(crate) fn enter(
         &slots,
         &mut stack,
         &mut pc,
-        &Value::Undefined,
+        &(Value::Undefined),
         &mut handlers,
         &mut disposal_frames,
         &mut class_states,
@@ -416,7 +416,7 @@ fn function_private_bindings(
     };
     let callee = frame.callee();
     let (function, closure) = match &callee.borrow().call {
-        crate::value::Callable::User(user) => (user.func.clone(), user.env.clone()),
+        crate::value::Callable::User(user) => (user.func.clone(), user.env),
         _ => return Vec::new(),
     };
     if env.borrow().under_with || !function_owns_loop(&function, site) {
@@ -430,8 +430,8 @@ fn function_private_bindings(
         return Vec::new();
     }
     let root = crate::interpreter::nearest_var_env(env);
-    if Rc::ptr_eq(&root, &closure)
-        || Rc::ptr_eq(&root, &i.global_env)
+    if Env::ptr_eq(&root, &closure)
+        || Env::ptr_eq(&root, &i.global_env)
         || root.borrow().parent.is_none()
     {
         return Vec::new();
@@ -468,7 +468,7 @@ fn function_private_bindings(
             if captured.contains(&name) || runtime_lexicals.contains(&name) {
                 continue;
             }
-            let mut cursor = Some(env.clone());
+            let mut cursor = Some(*env);
             while let Some(environment) = cursor {
                 let scope = environment.borrow();
                 if let Some(binding) = scope.vars.get(name.as_str()) {
@@ -476,21 +476,21 @@ fn function_private_bindings(
                     names.push((Rc::from(name.as_str()), !binding.mutable));
                     break;
                 }
-                cursor = scope.parent.clone();
+                cursor = scope.parent;
             }
         }
     }
     // A surrounding block/catch can shadow a function home. Both the value and its immutable
     // binding rules belong to that exact nearest record, rather than the root's same name.
     for (name, is_const) in &mut names {
-        let mut cursor = Some(env.clone());
+        let mut cursor = Some(*env);
         while let Some(environment) = cursor {
             let scope = environment.borrow();
             if let Some(binding) = scope.vars.get(name) {
                 *is_const = !binding.mutable;
                 break;
             }
-            cursor = scope.parent.clone();
+            cursor = scope.parent;
         }
     }
     names
@@ -753,6 +753,7 @@ impl Compiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
 
     #[test]
     fn fragment_implicit_async_generator_await_is_an_own_suspension() {
@@ -799,7 +800,7 @@ mod tests {
     fn fragment_precompile_cancellation_keeps_parked_state_uncommitted() {
         let mut engine = crate::Engine::new();
         engine.set_tier(Tier::Bytecode);
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let source = crate::parser::parse_script("while(true){throw 17}", false)
             .ok()
             .expect("loop parses");
@@ -836,7 +837,7 @@ mod tests {
                 &Value::Num(23.0),
                 Seed::None
             ),
-            Ok(Some(Err(Abrupt::Throw(Value::Num(17.0)))))
+            Ok(Some(Err(Abrupt::Throw(value)))) if matches!(value.view(), ValueView::Num(17.0))
         ));
         assert_eq!(TEST_FRAGMENT_ENTRIES.with(|counter| counter.get()), 1);
     }

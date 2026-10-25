@@ -1,7 +1,7 @@
 //! One native operation vocabulary for baseline code and SSA region barriers.
 //!
 //! The caller publishes canonical operands/affected locals before entering this
-//! emitter. It therefore preserves the baseline's guards, ownership transfers,
+//! emitter. It therefore preserves the baseline's guards, operand moves,
 //! exact-PC checked fallback and exception landing instead of degrading operations
 //! inside a region to generic VM dispatch. Control-flow/state publication remains
 //! the caller's responsibility. A declined emission writes no instructions.
@@ -25,10 +25,9 @@ pub(super) fn emit(
     unwind: usize,
     direct_finish: usize,
 ) -> bool {
-    let rc_ok = layout.valid && layout.rc_strong_off < 256;
     let op = &chunk.jit_ops()[pc];
     match op {
-        Op::TypeofIs(test, negate) if fast & 2 != 0 && rc_ok && layout.rc_strong_off == 0 => {
+        Op::TypeofIs(test, negate) if fast & 2 != 0 && layout.valid => {
             use crate::value::TypeofTest;
             let slow = a.new_label();
             let done = a.new_label();
@@ -50,9 +49,6 @@ pub(super) fn emit(
             };
             a.cmp_imm_w(9, kind);
             a.cset_w(11, if *negate { C_NE } else { C_EQ });
-            // Every declining owner guard precedes the decrement. Last owners and
-            // BigInt retain the real destructor through the checked operation.
-            emit_exec_drop_shared(a, layout, 12, 13, 14, slow);
             a.mov_imm64(9, crate::value::PACK_BOOL);
             a.logic_x(1, 9, 9, 11);
             emit_exec_word_store(a, 9, 20, -8);
@@ -146,42 +142,30 @@ pub(super) fn emit(
             emit_exec(a, pc as u32, unwind);
             a.bind(done);
         }
-        Op::Dup if fast & 64 != 0 && rc_ok => {
-            // Copy the top value; refcounted payloads bump inline, BigInt takes the helper.
-            let slow = a.new_label();
-            let done = a.new_label();
+        Op::Dup if fast & 64 != 0 && layout.valid => {
+            // Copy the top word as it is.
             emit_exec_word_load(a, 9, 20, -8);
-            emit_exec_clone(a, layout, 9, 10, 11, slow);
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc as u32, unwind);
-            a.bind(done);
         }
-        Op::LoadThis if fast & 32768 != 0 && rc_ok => {
-            // `this_raw` is deliberately a wide host-boundary Value; encode before
-            // acquiring the compact operand owner. BigInt uses the checked helper.
-            let slow = a.new_label();
-            let done = a.new_label();
-            a.ldr_imm(9, 19, 48); // ctx.this_raw
-            a.ldr_imm(10, 9, 0);
-            a.ldr_imm(11, 9, 8);
-            emit_exec_encode_wide(a, 10, 11, 12, 13, 14, 0, slow);
-            emit_exec_clone(a, layout, 12, 13, 14, slow);
+        Op::LoadThis if fast & 32768 != 0 && layout.valid => {
+            // [48] is the packed `this` word, which owns nothing: push a copy.
+            a.ldr_imm(12, 19, 48); // ctx.this_word
             emit_exec_word_store(a, 12, 20, 0);
             a.add_imm(20, 20, 8);
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc as u32, unwind);
-            a.bind(done);
+            #[cfg(test)]
+            {
+                a.mov_imm64(9, chunk.test_this_commits.as_ptr() as u64);
+                a.ldr_imm(10, 9, 0);
+                a.add_imm(10, 10, 1);
+                a.str_imm(10, 9, 0);
+            }
         }
         Op::LoadName(_, cache) if fast & 8192 != 0 && load_name_inlinable(layout) => {
             emit_load_name_inline(
                 a,
                 layout,
                 chunk.jit_name_cache_ptr(*cache),
-                chunk.jit_name_number(*cache),
                 pc as u32,
                 unwind,
                 false,
@@ -199,8 +183,7 @@ pub(super) fn emit(
                 a,
                 layout,
                 chunk.jit_name_cache_ptr(*cache),
-                chunk.jit_name_number(*cache),
-                std::rc::Rc::as_ptr(&env) as u64,
+                crate::interpreter::Env::as_ptr(&env) as u64,
                 pc as u32,
                 unwind,
                 matches!(op, Op::LoadNameForCallIn(..)),
@@ -211,7 +194,6 @@ pub(super) fn emit(
                 a,
                 layout,
                 chunk.jit_name_cache_ptr(*cache),
-                chunk.jit_name_number(*cache),
                 pc as u32,
                 unwind,
                 true,
@@ -247,7 +229,6 @@ pub(super) fn emit(
                 a,
                 layout,
                 chunk.jit_cap_cache_ptr(*name),
-                None,
                 pc as u32,
                 unwind,
                 false,
@@ -450,7 +431,7 @@ pub(super) fn emit(
                 None,
             );
         }
-        Op::InstanceOf(cache) if rc_ok && instanceof_inlinable(layout, ilayout) => {
+        Op::InstanceOf(cache) if layout.valid && instanceof_inlinable(layout, ilayout) => {
             emit_instanceof_inline(
                 a,
                 layout,
@@ -478,7 +459,7 @@ pub(super) fn emit(
             a.bind(done);
         }
         Op::SetProp(_, cache) | Op::SetPropDrop(_, cache)
-            if fast & 65536 != 0 && rc_ok && set_prop_inlinable(layout) =>
+            if fast & 65536 != 0 && layout.valid && set_prop_inlinable(layout) =>
         {
             emit_set_prop_inline(
                 a,
@@ -495,7 +476,7 @@ pub(super) fn emit(
             );
         }
         Op::SetPropThisDrop(_, cache)
-            if fast & 65536 != 0 && rc_ok && set_prop_inlinable(layout) =>
+            if fast & 65536 != 0 && layout.valid && set_prop_inlinable(layout) =>
         {
             emit_set_prop_inline(
                 a,
@@ -513,7 +494,7 @@ pub(super) fn emit(
         }
         Op::SetPropLocalDrop(s, _, cache)
             if fast & 65536 != 0
-                && rc_ok
+                && layout.valid
                 && set_prop_inlinable(layout)
                 && (*s as u32) * 8 + 8 < 4096 =>
         {
@@ -532,7 +513,7 @@ pub(super) fn emit(
             );
         }
         Op::UpdateProp(_, cache, kind)
-            if fast & 65536 != 0 && rc_ok && set_prop_inlinable(layout) =>
+            if fast & 65536 != 0 && layout.valid && set_prop_inlinable(layout) =>
         {
             emit_update_prop_inline(
                 a,
@@ -546,7 +527,7 @@ pub(super) fn emit(
         Op::UpdateElem(kind)
             if fast & 2048 != 0
                 && fast & 65536 != 0
-                && rc_ok
+                && layout.valid
                 && elem_inlinable(layout)
                 && layout.entry_accessor == layout.entry_value + 8 =>
         {
@@ -589,7 +570,7 @@ pub(super) fn emit(
             emit_exec(a, pc as u32, unwind);
             a.bind(done);
         }
-        Op::LoadLocal(slot) if fast & 8 != 0 && rc_ok && (*slot as u32) * 8 + 8 < 4096 => {
+        Op::LoadLocal(slot) if fast & 8 != 0 && layout.valid && (*slot as u32) * 8 + 8 < 4096 => {
             let off = *slot as i32 * 8;
             let slow = a.new_label();
             let done = a.new_label();
@@ -597,7 +578,6 @@ pub(super) fn emit(
             a.mov_imm64(10, crate::value::PACK_EMPTY);
             a.cmp_reg_x(9, 10); // Empty = TDZ throw → slow
             a.b_cond(C_EQ, slow);
-            emit_exec_clone(a, layout, 9, 10, 11, slow);
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
             a.b(done);
@@ -608,19 +588,17 @@ pub(super) fn emit(
         Op::StoreLocal(slot) if fast & 16 != 0 && (*slot as u32) * 8 + 8 < 4096 => {
             emit_store_local(
                 a,
-                layout,
                 *slot as u32 * 8,
                 &[pc as u32],
                 unwind,
                 false,
-                rc_ok,
+                layout.valid,
             );
         }
         Op::UpdateLocal(slot, kind) if fast & 32 != 0 && (*slot as u32) * 8 + 8 < 4096 => {
             emit_update_local(a, *slot, *kind, pc as u32, unwind);
         }
-        Op::Pop if fast & 64 != 0 && rc_ok => {
-            emit_exec_release_word(a, layout, 20, -8);
+        Op::Pop if fast & 64 != 0 && layout.valid => {
             a.sub_imm(20, 20, 8);
         }
         Op::DestructureGuard if fast & 1024 != 0 => {
@@ -649,10 +627,8 @@ pub(super) fn emit(
             emit_exec(a, pc as u32, unwind);
             a.bind(done);
         }
-        Op::Void if fast & (64 | 128) == (64 | 128) && rc_ok => {
-            // GetValue/effects already ran. Release the consumed owner exactly as Pop (a last
-            // owner's destructor runs through the drop helper), then return undefined.
-            emit_exec_release_word(a, layout, 20, -8);
+        Op::Void if fast & (64 | 128) == (64 | 128) && layout.valid => {
+            // GetValue/effects already ran: the operand becomes undefined.
             a.mov_imm64(9, crate::value::PACK_UNDEFINED);
             emit_exec_word_store(a, 9, 20, -8);
         }
@@ -662,27 +638,21 @@ pub(super) fn emit(
             a.add_imm(20, 20, 8);
         }
         Op::Const(k) if fast & 128 != 0 && chunk.jit_const_copyable(*k) => {
-            let Some(bits) = chunk.jit_const_packed_bits(*k) else {
+            let Some(bits) = chunk.jit_const_scalar_bits(*k) else {
                 return false;
             };
             a.mov_imm64(9, bits);
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
         }
-        Op::Const(k)
-            if fast & 128 != 0
-                && rc_ok
-                && layout.rc_strong_off == 0
-                && chunk.jit_const_is_str(*k) =>
-        {
-            a.mov_imm64(9, chunk.jit_const_ptr(*k) as u64);
-            a.ldr_imm(11, 9, 8);
-            a.mov_imm64(10, crate::value::PACK_STR);
-            a.logic_x(1, 10, 10, 11);
-            emit_exec_word_store(a, 10, 20, 0);
-            a.ldur(13, 11, 0); // strong (payload+0)
-            a.add_imm(13, 13, 1);
-            a.stur(13, 11, 0);
+        // The constant's word owns nothing and names a cell the chunk's pool roots while this
+        // code can run, so it is an immediate (see `jit_const_str_word`).
+        Op::Const(k) if fast & 128 != 0 && chunk.jit_const_is_str(*k) => {
+            let Some(word) = chunk.jit_const_str_word(*k) else {
+                return false;
+            };
+            a.mov_imm64(9, word);
+            emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
         }
         Op::DestructureGuard => {
@@ -699,18 +669,18 @@ pub(super) fn emit(
             emit_exec(a, pc as u32, unwind);
             a.bind(done);
         }
-        // Block entry puts the slot in its temporal dead zone. The previous iteration's value
-        // is commonly the slot's last owner; release it in place (no generic dispatch).
-        Op::Tdz(slot) if fast & 16 != 0 && rc_ok && (*slot as u32) * 8 + 8 < 4096 => {
+        // Block entry puts the slot in its temporal dead zone: the store overwrites the previous
+        // iteration's value (no generic dispatch).
+        Op::Tdz(slot) if fast & 16 != 0 && layout.valid && (*slot as u32) * 8 + 8 < 4096 => {
             let off = *slot as i32 * 8;
-            emit_exec_release_word(a, layout, 22, off);
             a.mov_imm64(9, crate::value::PACK_EMPTY);
             emit_exec_word_store(a, 9, 22, off);
         }
-        Op::ResetSlots(start, count) if rc_ok && (*start as u32 + *count as u32) * 8 < 4096 => {
+        Op::ResetSlots(start, count)
+            if layout.valid && (*start as u32 + *count as u32) * 8 < 4096 =>
+        {
             for k in *start..*start + *count {
                 let off = k as i32 * 8;
-                emit_exec_release_word(a, layout, 22, off);
                 a.mov_imm64(9, crate::value::PACK_UNDEFINED);
                 emit_exec_word_store(a, 9, 22, off);
             }
@@ -767,6 +737,8 @@ pub(super) fn emit(
             a.blr(16);
             a.mov(20, 0);
             a.cbnz(1, false, unwind);
+            // A native constructor allocates after the call's last safepoint.
+            emit_helper_end_poll(a, unwind);
         }
         Op::SetProp(..)
         | Op::SetPropDrop(..)

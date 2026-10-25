@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// Opt-in reflection metadata only: no source bodies, argument values, getters or
 /// Proxy traps. Useful for identifying the actual platform functions a page inspects.
@@ -12,12 +13,14 @@ fn trace_function_to_string(value: &Value) {
     {
         return;
     }
-    let Value::Obj(object) = value else {
+    let ValueView::Obj(object) = &(value).view() else {
         return;
     };
     let object = object.borrow();
-    let name = match object.props.get("name").map(|property| property.value()) {
-        Some(Value::Str(name)) => name.chars().take(80).collect::<String>(),
+    let name = match (object.props.get("name").map(|property| property.value()))
+        .map(|__value| (__value).view())
+    {
+        Some(ValueView::Str(name)) => name.chars().take(80).collect::<String>(),
         _ => String::new(),
     };
     let source = match &object.call {
@@ -34,7 +37,7 @@ fn trace_function_to_string(value: &Value) {
 }
 
 pub(super) fn install_function_proto(it: &mut Interp) {
-    let fp = it.function_proto.clone();
+    let fp = it.function_proto;
     // %Function.prototype% is itself a callable function object that accepts any arguments and
     // returns undefined, with length 0 and the empty name.
     {
@@ -52,8 +55,8 @@ pub(super) fn install_function_proto(it: &mut Interp) {
     it.def_method(&fp, "apply", 2, nf_function_apply);
     it.def_method(&fp, "bind", 1, |i, this, args| {
         // Any callable (including a callable proxy) can be bound.
-        let target = match &this {
-            Value::Obj(o) if this.is_callable() => o.clone(),
+        let target = match &(this).view() {
+            ValueView::Obj(o) if this.is_callable() => *o,
             _ => return Err(i.make_error("TypeError", "bind must be called on a function")),
         };
         let bound_this = arg(args, 0);
@@ -67,23 +70,25 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         // max(0, ToIntegerOrInfinity(len) - boundArgs). name = "bound " + Get(target, "name").
         let has_own_len = has_own_property_trapped(i, &this, "length")?;
         let l: f64 = if has_own_len {
-            match ab(i.get_member_key(&this, "length"))? {
-                Value::Num(n) if n == f64::INFINITY => f64::INFINITY,
-                Value::Num(n) if n.is_finite() => (n.trunc() - bound_args.len() as f64).max(0.0),
+            match (ab(i.get_member_key(&this, "length"))?).view() {
+                ValueView::Num(n) if n == f64::INFINITY => f64::INFINITY,
+                ValueView::Num(n) if n.is_finite() => {
+                    (n.trunc() - bound_args.len() as f64).max(0.0)
+                }
                 _ => 0.0,
             }
         } else {
             0.0
         };
         let target_name = ab(i.get_member_key(&this, "name"))?;
-        let name = match &target_name {
-            Value::Str(s) => format!("bound {s}"),
+        let name = match &(target_name).view() {
+            ValueView::Str(s) => format!("bound {s}"),
             _ => "bound ".to_string(),
         };
         // BoundFunctionCreate: the bound function's [[Prototype]] is the target's (via
         // [[GetPrototypeOf]], so a proxy trap participates) — possibly null.
-        let bound_proto = match js_get_prototype_of(i, &this)? {
-            Value::Obj(p) => Some(p),
+        let bound_proto = match (js_get_prototype_of(i, &this)?).view() {
+            ValueView::Obj(p) => Some(p),
             _ => None,
         };
         let obj = Object::new(bound_proto);
@@ -111,7 +116,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         trace_function_to_string(&this);
         // A user function returns the source text it was parsed from; everything else
         // (natives, bound functions, proxies) renders as a native function carrying its name.
-        if let Value::Obj(o) = &this {
+        if let ValueView::Obj(o) = &(this).view() {
             if let Callable::User(user) = &o.borrow().call {
                 if let Some(src) = &user.func.source {
                     // SourceText is already immutable; copy it directly into the engine string
@@ -119,8 +124,10 @@ pub(super) fn install_function_proto(it: &mut Interp) {
                     return Ok(Value::Str(crate::lstr::LStr::from(src.as_ref())));
                 }
             }
-            let name = match o.borrow().props.get("name").map(|p| p.value()) {
-                Some(Value::Str(n)) => n,
+            let name = match (o.borrow().props.get("name").map(|p| p.value()))
+                .map(|__value| (__value).view())
+            {
+                Some(ValueView::Str(n)) => n,
                 _ => crate::lstr::LStr::from(""),
             };
             // Render the name only when it's a well-formed PropertyName (optionally get/set
@@ -168,15 +175,15 @@ pub(super) fn install_function_proto(it: &mut Interp) {
             .insert("name", Property::data(Value::lstr(""), false, false, false));
         b.extensible = false;
     }
-    Rc::make_mut(&mut it.extra_protos).insert("%ThrowTypeError%", throw_type_error.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%ThrowTypeError%", throw_type_error);
     // Function.prototype.caller / .arguments: accessor properties whose getter AND setter are
     // the single %ThrowTypeError% intrinsic (the spec requires the same function object).
     for name in ["caller", "arguments"] {
         fp.borrow_mut().props.insert(
             name,
             Property::accessor_prop(
-                Some(Value::Obj(throw_type_error.clone())),
-                Some(Value::Obj(throw_type_error.clone())),
+                Some(Value::Obj(throw_type_error)),
+                Some(Value::Obj(throw_type_error)),
                 false,
                 true,
             ),
@@ -190,15 +197,15 @@ pub(super) fn install_function_proto(it: &mut Interp) {
     });
     // `Function.prototype` is the shared function prototype, so `f instanceof Function` holds for
     // every function (their [[Prototype]] is `function_proto`).
-    ctor.borrow_mut().proto = Some(fp.clone());
+    ctor.borrow_mut().proto = Some(fp);
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(fp.clone()), false, false, false),
+        Property::data(Value::Obj(fp), false, false, false),
     );
     fp.borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
-    set_builtin(&it.global, "Function", Value::Obj(ctor.clone()));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
+    set_builtin(&it.global, "Function", Value::Obj(ctor));
 }
 
 pub(crate) fn nf_function_call(
@@ -216,9 +223,11 @@ pub(crate) fn nf_function_call(
 /// %Function%, with a `.prototype` object stored in extra_protos so `make_function` installs it as
 /// the [[Prototype]] of the corresponding kind of function. Runs after Symbol so @@toStringTag works.
 pub(super) fn install_generator_function_ctors(it: &mut Interp) {
-    let fp = it.function_proto.clone();
-    let function_ctor = match it.global.borrow().props.get("Function").map(|p| p.value()) {
-        Some(Value::Obj(o)) => o,
+    let fp = it.function_proto;
+    let function_ctor = match (it.global.borrow().props.get("Function").map(|p| p.value()))
+        .map(|__value| (__value).view())
+    {
+        Some(ValueView::Obj(o)) => o,
         _ => return,
     };
     for (tag, make_fn) in [
@@ -241,15 +250,15 @@ pub(super) fn install_generator_function_ctors(it: &mut Interp) {
         ),
     ] {
         // The constructor's `.prototype` object; its [[Prototype]] is %Function.prototype%.
-        let kind_proto = Object::new(Some(fp.clone()));
+        let kind_proto = Object::new(Some(fp));
         set_to_string_tag(it, &kind_proto, tag);
         let key = super::static_name(&format!("%{tag}.prototype%"));
-        Rc::make_mut(&mut it.extra_protos).insert(key, kind_proto.clone());
+        Rc::make_mut(&mut it.extra_protos).insert(key, kind_proto);
         let kind_ctor = it.make_native(tag, 1, make_fn);
-        kind_ctor.borrow_mut().proto = Some(function_ctor.clone()); // [[Prototype]] is %Function%
+        kind_ctor.borrow_mut().proto = Some(function_ctor); // [[Prototype]] is %Function%
         kind_ctor.borrow_mut().props.insert(
             "prototype",
-            Property::data(Value::Obj(kind_proto.clone()), false, false, false),
+            Property::data(Value::Obj(kind_proto), false, false, false),
         );
         kind_proto.borrow_mut().props.insert(
             "constructor",
@@ -294,28 +303,28 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
     }
     match program.into_iter().next() {
         Some(crate::ast::Stmt::FuncDecl(f)) => {
-            let env = i.global_env.clone();
+            let env = i.global_env;
             let func = i.make_function(f, env);
             // GetPrototypeFromConstructor(new.target, ...): a cross-realm `new other.Function()`
             // gets the other realm's prototype as its [[Prototype]] — including the *fallback*
             // when newTarget.prototype isn't an object (resolved in newTarget's realm).
-            let nt = i.new_target.clone();
-            if matches!(nt, Value::Obj(_)) {
+            let nt = i.constructor_new_target();
+            if matches!((nt).view(), ValueView::Obj(_)) {
                 let kind_key = match prefix {
                     "function*" => "%GeneratorFunction.prototype%",
                     "async function" => "%AsyncFunction.prototype%",
                     "async function*" => "%AsyncGeneratorFunction.prototype%",
                     _ => "Function",
                 };
-                match ab(i.get_member_key(&nt, "prototype"))? {
-                    Value::Obj(p) => {
-                        if let Value::Obj(fo) = &func {
+                match (ab(i.get_member_key(&nt, "prototype"))?).view() {
+                    ValueView::Obj(p) => {
+                        if let ValueView::Obj(fo) = &(func).view() {
                             fo.borrow_mut().proto = Some(p);
                         }
                     }
                     _ => {
                         if let Some(p) = ctor_realm_proto(i, &nt, kind_key)? {
-                            if let Value::Obj(fo) = &func {
+                            if let ValueView::Obj(fo) = &(func).view() {
                                 fo.borrow_mut().proto = Some(p);
                             }
                         }

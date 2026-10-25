@@ -1,10 +1,11 @@
 //! Storage proof for ECMA-262 Array.prototype.shift, snapshot e28783d5.
 use super::*;
+use crate::value::ValueView;
 
 fn array(values: Vec<Value>, packed: bool, reverse: bool, named_tail: bool) -> Props {
     let len = values.len();
     let mut properties = if packed {
-        let mut words: Vec<_> = values.into_iter().map(PackedValue::pack).collect();
+        let mut words: Vec<_> = values.into_iter().collect();
         let props = unsafe { Props::packed_array_from_raw(words.as_mut_ptr(), len) };
         unsafe { words.set_len(0) };
         props
@@ -48,8 +49,8 @@ fn numbers(len: usize, packed: bool, reverse: bool, named_tail: bool) -> Props {
 }
 
 fn number(value: Value) -> f64 {
-    match value {
-        Value::Num(value) => value,
+    match (value).view() {
+        ValueView::Num(value) => value,
         _ => panic!("expected a Number"),
     }
 }
@@ -112,7 +113,7 @@ fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
                     }
                     if named {
                         assert!(
-                            matches!(props.get("named").unwrap().value(), Value::Str(s) if &*s == "preserved")
+                            matches!((props.get("named").unwrap().value()).view(), ValueView::Str(s) if &*s == "preserved")
                         );
                         assert_eq!(props.get("01").unwrap().number_value(), Some(71.0));
                         assert_eq!(props.get("4294967295").unwrap().number_value(), Some(72.0));
@@ -159,39 +160,6 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
             props.shift_dense_array(2).is_none(),
             "non-configurable tail must reject"
         );
-    }
-}
-
-#[test]
-fn dense_shift_storage_moves_reference_owners_without_retain_or_loss() {
-    for (packed, reverse, named, len) in [
-        (false, false, false, 32),
-        (false, true, true, 16),
-        (true, false, false, 8),
-        (true, false, true, 16),
-    ] {
-        let objects: Vec<_> = (0..len).map(|_| Object::new(None)).collect();
-        let mut props = array(
-            objects.iter().cloned().map(Value::Obj).collect(),
-            packed,
-            reverse,
-            named,
-        );
-        assert!(objects.iter().all(|o| Rc::strong_count(o) == 2));
-        for removed in 0..len {
-            let first = props.shift_dense_array(len - removed).unwrap();
-            assert!(matches!(&first, Value::Obj(o) if Rc::ptr_eq(o, &objects[removed])));
-            for (index, object) in objects.iter().enumerate() {
-                assert_eq!(
-                    Rc::strong_count(object),
-                    if index < removed { 1 } else { 2 }
-                );
-            }
-            drop(first);
-            assert_eq!(Rc::strong_count(&objects[removed]), 1);
-        }
-        drop(props);
-        assert!(objects.iter().all(|o| Rc::strong_count(o) == 1));
     }
 }
 
@@ -342,32 +310,32 @@ fn packed_creation_and_prepend_do_not_certify_holes_or_nonplain_descriptors() {
     assert!(descriptor.shift_dense_array(3).is_none());
 }
 
+/// Prepending one element at a time keeps a packed array inline up to its inline capacity and
+/// promotes it once past it; every element keeps its identity and order through the prepends
+/// and the shifts that drain them.
 #[test]
-fn tiny_prepends_retain_inline_owners_before_promoting_once() {
+fn tiny_prepends_stay_inline_before_promoting_once() {
     let owners: Vec<_> = (0..12).map(|_| Object::new(None)).collect();
-    let mut properties = Props::packed_array_from_values(Vec::new());
+    let mut properties = Props::packed_array(std::iter::empty());
     for (index, owner) in owners.iter().enumerate() {
-        assert!(properties.unshift_dense_array(index, &[Value::Obj(owner.clone())]));
+        assert!(properties.unshift_dense_array(index, &[Value::Obj(*owner)]));
         assert_eq!(
             properties.elems.packed.is_none(),
             index < INLINE_PACKED_CAPACITY
         );
-        assert_eq!(Rc::strong_count(owner), 2);
         for n in 0..=index {
             assert!(
-                matches!(properties.get_index(n as u32).unwrap().value(), Value::Obj(value)
-                if Rc::ptr_eq(&value, &owners[index-n]))
+                matches!((properties.get_index(n as u32).unwrap().value()).view(), ValueView::Obj(value)
+                if Gc::ptr_eq(&value, &owners[index-n]))
             );
         }
     }
     for index in (0..12).rev() {
         let first = properties.shift_dense_array(index + 1).unwrap();
-        assert!(matches!(&first, Value::Obj(value) if Rc::ptr_eq(value, &owners[index])));
-        drop(first);
-        assert_eq!(Rc::strong_count(&owners[index]), 1);
+        assert!(
+            matches!(first.view(), ValueView::Obj(value) if Gc::ptr_eq(&value, &owners[index]))
+        );
     }
-    drop(properties);
-    assert!(owners.iter().all(|owner| Rc::strong_count(owner) == 1));
 }
 
 #[test]

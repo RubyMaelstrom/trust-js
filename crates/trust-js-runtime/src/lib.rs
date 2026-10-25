@@ -17,10 +17,11 @@
 
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+use trust_js_host::ValueKind;
 
 use trust_js_host::{
-    install, CallbackQueue, DedicatedExecutor, Engine, EvalError, RuntimeInterrupt, TaskCompletion,
-    TaskDecoder, TaskRegistry, ThreadPool, Value,
+    install, CallbackQueue, DedicatedExecutor, Engine, EvalError, Handle, RuntimeInterrupt,
+    TaskCompletion, TaskDecoder, TaskRegistry, ThreadPool, Value,
 };
 
 mod console;
@@ -46,9 +47,22 @@ pub struct Runtime {
     completions: mpsc::Receiver<TaskCompletion>,
     /// The error-reporting shims (see `Runtime::new`): `(error) -> suppressed` for the global
     /// `onerror` convention and `(promise, reason) -> suppressed` for `onunhandledrejection`.
-    fire_error: Value,
-    fire_rejection: Value,
+    /// No JavaScript reference keeps them alive once their globals are deleted: the handles do.
+    fire_error: Handle,
+    fire_rejection: Handle,
 }
+
+/// The callback batch the loop is running. A pass takes everything queued so far out of the
+/// [`CallbackQueue`] (callbacks queued meanwhile wait for the next pass); each stays held here,
+/// like the queue, until it starts, so a collection inside one callback cannot reclaim the rest.
+#[derive(Default)]
+struct RunningCallbacks(std::collections::VecDeque<(Handle, Vec<Handle>)>);
+
+/// Unhandled rejections being reported, taken from the engine in one batch: each (promise,
+/// reason) pair stays held here until its report starts, since `onunhandledrejection` runs
+/// script (and may collect) between reports.
+#[derive(Default)]
+struct ReportingRejections(std::collections::VecDeque<(Handle, Handle)>);
 
 impl Default for Runtime {
     fn default() -> Self {
@@ -103,12 +117,11 @@ impl Runtime {
         // own initialization and make the installer mistake host control flow for broken glue.
         let mut engine = Engine::new();
         // Substrate first: fs's js_init runs during install and its ops need these.
-        engine.ctx().op_state().put(pool.handle());
+        engine.op_state().put(pool.handle());
         // Dedicated-thread completions for unbounded-blocking work (child stdio) that must not
         // occupy a shared pool worker.
-        engine.ctx().op_state().put(dedicated.handle());
+        engine.op_state().put(dedicated.handle());
         engine
-            .ctx()
             .op_state()
             .put(TaskRegistry::with_canceller(canceller));
         install(
@@ -197,15 +210,19 @@ impl Runtime {
                 false,
             )
             .expect("error-reporting shim parses");
-        let global = engine.global_this();
-        let fire_error = engine
-            .ctx()
-            .get_member(&global, "__trust_js_fire_error")
-            .unwrap_or_else(|_| panic!("error-reporting shim installed"));
-        let fire_rejection = engine
-            .ctx()
-            .get_member(&global, "__trust_js_fire_rejection")
-            .unwrap_or_else(|_| panic!("error-reporting shim installed"));
+        let (fire_error, fire_rejection) = engine.scope(|cx| {
+            let global = cx.global_this();
+            let mut shim = |name: &str| {
+                let shim = cx
+                    .get_member(&global, name)
+                    .unwrap_or_else(|_| panic!("error-reporting shim installed"));
+                Handle::new(cx, &shim).expect("the engine's own function")
+            };
+            (
+                shim("__trust_js_fire_error"),
+                shim("__trust_js_fire_rejection"),
+            )
+        });
         engine
             .eval(
                 "delete globalThis.__trust_js_fire_error; delete globalThis.__trust_js_fire_rejection;",
@@ -213,6 +230,9 @@ impl Runtime {
             )
             .expect("shim cleanup");
         engine.set_interrupt_handle(interrupt);
+        let state = engine.op_state();
+        state.put(RunningCallbacks::default());
+        state.put(ReportingRejections::default());
         Runtime {
             engine,
             _dedicated: dedicated,
@@ -248,25 +268,22 @@ impl Runtime {
         if let Ok(abs) = std::fs::canonicalize(path) {
             self.engine.set_import_base(&abs.to_string_lossy());
         }
-        let global = self.engine.global_this();
-        let run_main = self
-            .engine
-            .ctx()
-            .get_member(&global, "__runMain")
-            .map_err(|_| "node runtime not installed".to_string())?;
-        let result = self.engine.call_function_interruptible(
-            &run_main,
-            Value::Undefined,
-            &[Value::from_string(path.to_string())],
-        );
-        if let Err(reason) = self.engine.run_microtasks_interruptible() {
-            return Err(reason.message().to_string());
-        }
-        match result {
-            Ok(_) => Ok(()),
-            Err(EvalError::Throw(error)) => Err(describe_error(self.engine.ctx(), &error)),
-            Err(EvalError::Interrupted(reason)) => Err(reason.message().to_string()),
-        }
+        self.engine.scope(|cx| {
+            let global = cx.global_this();
+            let run_main = cx
+                .get_member(&global, "__runMain")
+                .map_err(|_| "node runtime not installed".to_string())?;
+            let path = cx.string(path.to_string());
+            let result = cx.call_function_interruptible(&run_main, Value::Undefined, &[path]);
+            if let Err(reason) = cx.run_microtasks_interruptible() {
+                return Err(reason.message().to_string());
+            }
+            match result {
+                Ok(_) => Ok(()),
+                Err(EvalError::Throw(error)) => Err(describe_error(cx, &error)),
+                Err(EvalError::Interrupted(reason)) => Err(reason.message().to_string()),
+            }
+        })
     }
 
     /// Run `path` as an ES module: its `import` graph resolves against disk + `node_modules`
@@ -351,9 +368,10 @@ impl Runtime {
             self.report_unhandled_rejections();
             loop {
                 let mut progressed = false;
-                for (cb, args) in self.take_queued_callbacks() {
+                self.start_callback_batch();
+                while let Some((cb, args)) = self.next_batch_callback() {
                     progressed = true;
-                    self.fire(&cb, &args);
+                    self.fire_held(&cb, &args);
                 }
                 for task in self.take_due_timers() {
                     progressed = true;
@@ -392,8 +410,12 @@ impl Runtime {
     /// Pull the JS-precomputed synthetic ESM source for each `node:` builtin out of the engine
     /// (the loader can't enumerate a builtin's exports from Rust; see the node module glue).
     fn builtin_modules(&mut self) -> esm::BuiltinModules {
-        let global = self.engine.global_this();
-        let ctx = self.engine.ctx();
+        self.engine.scope(Self::builtin_modules_in)
+    }
+
+    /// [`Runtime::builtin_modules`] in the scope `ctx`.
+    fn builtin_modules_in(ctx: &mut Ctx<'_>) -> esm::BuiltinModules {
+        let global = ctx.global_this();
         let mut map = std::collections::HashMap::new();
         let names = ctx
             .get_member(&global, "__builtinNames")
@@ -424,17 +446,17 @@ impl Runtime {
     }
 
     /// Spawn blocking work on the pool; when it finishes, `decode` turns its payload into
-    /// arguments and `callback` runs on the loop thread. This is the pattern async fs ops
-    /// will use from inside native fns (via the `SpawnHandle`/`TaskRegistry` in `OpState`).
+    /// arguments and `callback`, held by a handle of this runtime's engine, runs on the loop
+    /// thread. This is the pattern async fs ops will use from inside native fns (via the
+    /// `SpawnHandle`/`TaskRegistry` in `OpState`).
     pub fn spawn_blocking(
         &mut self,
         work: impl FnOnce() -> Box<dyn std::any::Any + Send> + Send + 'static,
-        callback: Value,
+        callback: Handle,
         decode: TaskDecoder,
     ) {
         let registry = self
             .engine
-            .ctx()
             .host_mut::<TaskRegistry>()
             .expect("installed in new()");
         let id = registry.register(callback, None, decode);
@@ -453,9 +475,10 @@ impl Runtime {
             self.report_unhandled_rejections();
             loop {
                 let mut progressed = false;
-                for (cb, args) in self.take_queued_callbacks() {
+                self.start_callback_batch();
+                while let Some((cb, args)) = self.next_batch_callback() {
                     progressed = true;
-                    self.fire(&cb, &args);
+                    self.fire_held(&cb, &args);
                 }
                 for task in self.take_due_timers() {
                     progressed = true;
@@ -504,7 +527,7 @@ impl Runtime {
         if self.engine.has_pending_jobs() {
             return false;
         }
-        let state = self.engine.ctx().op_state();
+        let state = self.engine.op_state();
         let callbacks_queued = state
             .get::<CallbackQueue>()
             .is_some_and(|q| !q.queue.is_empty());
@@ -517,16 +540,29 @@ impl Runtime {
         !callbacks_queued && !timers_pending && !tasks_pending
     }
 
-    fn take_queued_callbacks(&mut self) -> Vec<(Value, Vec<Value>)> {
-        match self.engine.ctx().host_mut::<CallbackQueue>() {
-            Some(q) => std::mem::take(&mut q.queue).into(),
-            None => Vec::new(),
-        }
+    /// Start a pass's callback batch: move everything queued so far into [`RunningCallbacks`].
+    fn start_callback_batch(&mut self) {
+        let state = self.engine.op_state();
+        let queued = match state.get_mut::<CallbackQueue>() {
+            Some(q) if !q.queue.is_empty() => std::mem::take(&mut q.queue),
+            _ => return,
+        };
+        state
+            .get_mut::<RunningCallbacks>()
+            .expect("installed in new()")
+            .0
+            .extend(queued);
+    }
+
+    /// The batch's next callback. It leaves the batch as it starts, its handles held by the
+    /// caller until the call returns.
+    fn next_batch_callback(&mut self) -> Option<(Handle, Vec<Handle>)> {
+        self.engine.host_mut::<RunningCallbacks>()?.0.pop_front()
     }
 
     fn take_due_timers(&mut self) -> Vec<trust_js_timers::TimerTask> {
         let now = Instant::now();
-        match self.engine.ctx().host_mut::<trust_js_timers::Timers>() {
+        match self.engine.host_mut::<trust_js_timers::Timers>() {
             Some(t) => t.take_due(now),
             None => Vec::new(),
         }
@@ -537,7 +573,6 @@ impl Runtime {
     fn next_timer_deadline(&mut self) -> Option<Instant> {
         let timer = self
             .engine
-            .ctx()
             .host_mut::<trust_js_timers::Timers>()
             .and_then(|timers| timers.next_deadline());
         match (timer, self.engine.next_atomics_wait_deadline()) {
@@ -551,39 +586,63 @@ impl Runtime {
     fn dispatch(&mut self, done: TaskCompletion) {
         let entry = self
             .engine
-            .ctx()
             .host_mut::<TaskRegistry>()
             .and_then(|r| r.take(done.task));
         let Some(entry) = entry else {
             return; // cancelled while in flight
         };
-        let result = match done.result {
-            Ok(payload) => (entry.decode)(self.engine.ctx(), payload),
-            Err(failure) => Err(self.engine.ctx().make_error("Error", failure.message)),
-        };
-        match result {
-            Ok(args) => self.fire(&entry.on_ok, &args),
-            Err(e) => match &entry.on_err {
-                Some(reject) => self.fire(reject, std::slice::from_ref(&e)),
-                None => self.report_uncaught(&e),
-            },
+        let fire_error = &self.fire_error;
+        // Whether a callback ran, and if so whether it was interrupted. The entry's handles hold
+        // its callbacks until it is dropped, after the call.
+        let fired = self.engine.scope(|cx| {
+            let result = match done.result {
+                Ok(payload) => (entry.decode)(cx, payload),
+                Err(failure) => Err(cx.make_error("Error", failure.message)),
+            };
+            match result {
+                Ok(args) => {
+                    let on_ok = trust_js_host::value(cx, &entry.on_ok);
+                    Some(call_reporting(cx, fire_error, &on_ok, &args))
+                }
+                Err(e) => match &entry.on_err {
+                    Some(reject) => {
+                        let reject = trust_js_host::value(cx, reject);
+                        Some(call_reporting(
+                            cx,
+                            fire_error,
+                            &reject,
+                            std::slice::from_ref(&e),
+                        ))
+                    }
+                    None => {
+                        report_uncaught(cx, fire_error, &e);
+                        None
+                    }
+                },
+            }
+        });
+        if fired == Some(false) {
+            self.checkpoint();
         }
-        if self.engine.run_microtasks_interruptible().is_err() {
-            return;
-        }
-        self.report_unhandled_rejections();
+        self.checkpoint();
     }
 
-    /// One JS callback entry: call, report an uncaught throw, then the microtask checkpoint.
-    fn fire(&mut self, callback: &Value, args: &[Value]) {
-        match self
-            .engine
-            .call_function_interruptible(callback, Value::Undefined, args)
-        {
-            Ok(_) => {}
-            Err(EvalError::Throw(error)) => self.report_uncaught(&error),
-            Err(EvalError::Interrupted(_)) => return,
+    /// A callback entry for a callback and arguments host state held, which their handles hold
+    /// until the call returns: call, report an uncaught throw, then the microtask checkpoint.
+    fn fire_held(&mut self, callback: &Handle, args: &[Handle]) {
+        let fire_error = &self.fire_error;
+        let interrupted = self.engine.scope(|cx| {
+            let callback = trust_js_host::value(cx, callback);
+            let args = trust_js_host::values(cx, args);
+            call_reporting(cx, fire_error, &callback, &args)
+        });
+        if !interrupted {
+            self.checkpoint();
         }
+    }
+
+    /// The microtask checkpoint after a JS entry, then the unhandled rejections' reports.
+    fn checkpoint(&mut self) {
         if self.engine.run_microtasks_interruptible().is_err() {
             return;
         }
@@ -596,88 +655,126 @@ impl Runtime {
     fn fire_timer(&mut self, task: trust_js_timers::TimerTask) {
         let valid = self
             .engine
-            .ctx()
             .host_mut::<trust_js_timers::Timers>()
             .is_some_and(|timers| timers.begin_task(&task));
         if !valid {
             return;
         }
 
-        let thrown = match &task.handler {
-            trust_js_timers::TimerHandler::Function(callback) => {
-                let this = self.engine.global_this();
-                match self
-                    .engine
-                    .call_function_interruptible(callback, this, &task.args)
-                {
-                    Ok(_) => None,
-                    Err(EvalError::Throw(error)) => Some(error),
-                    Err(EvalError::Interrupted(_)) => None,
+        let fire_error = &self.fire_error;
+        self.engine.scope(|cx| {
+            let thrown = match &task.handler {
+                trust_js_timers::TimerHandler::Function(callback) => {
+                    let this = cx.global_this();
+                    // The task's handles hold the handler and arguments until it is dropped.
+                    let callback = trust_js_host::value(cx, callback);
+                    let args = trust_js_host::values(cx, &task.args);
+                    match cx.call_function_interruptible(&callback, this, &args) {
+                        Ok(_) => None,
+                        Err(EvalError::Throw(error)) => Some(error),
+                        Err(EvalError::Interrupted(_)) => None,
+                    }
                 }
-            }
-            trust_js_timers::TimerHandler::Code(code) => {
-                match self.engine.eval_value_interruptible(code) {
-                    Ok(Ok(_)) => None,
-                    Ok(Err(EvalError::Throw(error))) => Some(error),
-                    Ok(Err(EvalError::Interrupted(_))) => None,
-                    Err(error) => Some(self.engine.ctx().make_error(
-                        "SyntaxError",
-                        format!("{} (line {})", error.message, error.line),
-                    )),
+                trust_js_timers::TimerHandler::Code(code) => {
+                    match cx.eval_value_interruptible(code) {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(EvalError::Throw(error))) => Some(error),
+                        Ok(Err(EvalError::Interrupted(_))) => None,
+                        Err(error) => Some(cx.make_error(
+                            "SyntaxError",
+                            format!("{} (line {})", error.message, error.line),
+                        )),
+                    }
                 }
+            };
+            if let Some(error) = thrown {
+                report_uncaught(cx, fire_error, &error);
             }
-        };
-        if let Some(error) = thrown {
-            self.report_uncaught(&error);
-        }
+        });
 
-        if let Some(timers) = self.engine.ctx().host_mut::<trust_js_timers::Timers>() {
+        if let Some(timers) = self.engine.host_mut::<trust_js_timers::Timers>() {
             timers.finish_task(&task, Instant::now());
         }
-        if self.engine.run_microtasks_interruptible().is_err() {
-            return;
-        }
-        self.report_unhandled_rejections();
-    }
-
-    /// An exception escaped a loop-fired callback. Node prints and keeps the loop alive (we
-    /// don't model `process.on('uncaughtException')`/exit semantics yet).
-    fn report_uncaught(&mut self, error: &Value) {
-        // HTML "report an exception": the global `onerror` handler runs first; returning `true`
-        // suppresses the default report.
-        let fire = self.fire_error.clone();
-        match self.engine.call_function_interruptible(
-            &fire,
-            Value::Undefined,
-            std::slice::from_ref(error),
-        ) {
-            Ok(Value::Bool(true)) | Err(EvalError::Interrupted(_)) => return,
-            _ => {}
-        }
-        let text = console::describe_error(self.engine.ctx(), error);
-        console::write_err_line(self.engine.ctx(), format!("Uncaught {text}"));
+        self.checkpoint();
     }
 
     /// Report promises rejected without a handler (Node prints `Uncaught (in promise) …`). Called
     /// after each microtask checkpoint; a rejection handled in the same checkpoint won't appear.
     fn report_unhandled_rejections(&mut self) {
-        for (promise, reason) in self.engine.take_unhandled_rejections_full() {
-            // The global `onunhandledrejection` handler runs first; `event.preventDefault()`
-            // suppresses the default report.
-            let fire = self.fire_rejection.clone();
-            match self.engine.call_function_interruptible(
-                &fire,
-                Value::Undefined,
-                &[promise, reason.clone()],
-            ) {
-                Ok(Value::Bool(true)) => continue,
-                Err(EvalError::Interrupted(_)) => return,
-                _ => {}
+        let taken = self.engine.take_unhandled_rejections_full();
+        if taken.is_empty() {
+            return;
+        }
+        self.reporting_rejections().0.extend(taken);
+        while let Some(pair) = self.reporting_rejections().0.pop_front() {
+            // The pair's handles hold it until this report ends.
+            let fire_rejection = &self.fire_rejection;
+            let interrupted = self.engine.scope(|cx| {
+                let (promise, reason) = (
+                    trust_js_host::value(cx, &pair.0),
+                    trust_js_host::value(cx, &pair.1),
+                );
+                // The global `onunhandledrejection` handler runs first; `event.preventDefault()`
+                // suppresses the default report.
+                let fire = trust_js_host::value(cx, fire_rejection);
+                match (cx.call_function_interruptible(&fire, Value::Undefined, &[promise, reason]))
+                    .map(|__value| (__value).kind())
+                {
+                    Ok(ValueKind::Bool(true)) => return false,
+                    Err(EvalError::Interrupted(_)) => return true,
+                    _ => {}
+                }
+                let text = console::describe_error(cx, &reason);
+                console::write_err_line(cx, format!("Uncaught (in promise) {text}"));
+                false
+            });
+            if interrupted {
+                // An interruption abandons the rest of the batch.
+                self.reporting_rejections().0.clear();
+                return;
             }
-            let text = console::describe_error(self.engine.ctx(), &reason);
-            console::write_err_line(self.engine.ctx(), format!("Uncaught (in promise) {text}"));
         }
     }
+
+    fn reporting_rejections(&mut self) -> &mut ReportingRejections {
+        self.engine
+            .host_mut::<ReportingRejections>()
+            .expect("installed in new()")
+    }
+}
+
+/// Call a loop-fired callback with no receiver, reporting an uncaught throw; whether a host
+/// interruption stopped it.
+fn call_reporting<'s>(
+    ctx: &mut Ctx<'s>,
+    fire_error: &Handle,
+    callback: &Value<'s>,
+    args: &[Value<'s>],
+) -> bool {
+    match ctx.call_function_interruptible(callback, Value::Undefined, args) {
+        Ok(_) => false,
+        Err(EvalError::Throw(error)) => {
+            report_uncaught(ctx, fire_error, &error);
+            false
+        }
+        Err(EvalError::Interrupted(_)) => true,
+    }
+}
+
+/// An exception escaped a loop-fired callback. Node prints and keeps the loop alive (we don't
+/// model `process.on('uncaughtException')`/exit semantics yet).
+fn report_uncaught<'s>(ctx: &mut Ctx<'s>, fire_error: &Handle, error: &Value<'s>) {
+    // HTML "report an exception": the global `onerror` handler runs first; returning `true`
+    // suppresses the default report.
+    let fire = trust_js_host::value(ctx, fire_error);
+    match (ctx.call_function_interruptible(&fire, Value::Undefined, std::slice::from_ref(error)))
+        .map(|__value| (__value).kind())
+    {
+        Ok(ValueKind::Bool(true)) | Err(EvalError::Interrupted(_)) => return,
+        _ => {}
+    }
+    let text = console::describe_error(ctx, error);
+    console::write_err_line(ctx, format!("Uncaught {text}"));
 }
 
 fn env_usize(name: &str, default: usize, minimum: usize, maximum: usize) -> usize {

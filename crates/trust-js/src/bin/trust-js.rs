@@ -48,9 +48,9 @@ fn main() {
                 false
             } else if let Some(t) = a.strip_prefix("--tier=") {
                 tier = Some(match t {
-                    "bytecode" => trust_js::bytecode::Tier::Bytecode,
-                    "jit" => trust_js::bytecode::Tier::Jit,
-                    "interp" => trust_js::bytecode::Tier::Interp,
+                    "bytecode" => trust_js::Tier::Bytecode,
+                    "jit" => trust_js::Tier::Jit,
+                    "interp" => trust_js::Tier::Interp,
                     other => {
                         eprintln!("error: unknown tier '{other}' (interp|bytecode|jit)");
                         std::process::exit(2);
@@ -177,7 +177,6 @@ Options:
 Environment:
   TRUST_JS_TIER=TIER         Default execution tier (--tier overrides it)
   TRUST_JS_TIER_THRESHOLD=N  Default tier-up threshold (--tier-threshold overrides it)
-  TRUST_JS_TAGGED_ARITHMETIC=1  Enable the opt-in tagged Number frame migration slice
                             (arithmetic and comparison operators in the bytecode VM)
 
 Diagnostics (env, unstable):

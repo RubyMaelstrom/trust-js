@@ -247,9 +247,10 @@ fn binding_reference_host_interrupt_bypasses_cleanup_and_releases_activation() {
             // Arm only once execution reaches the requested semantic boundary. This avoids
             // relying on compile duration, scheduling or a wall-clock sleep in the fixture.
             engine.define_global("interruptNow", 0, |ctx, _, _| {
-                ctx.runtime_interrupt
+                ctx.interp()
+                    .runtime_interrupt
                     .set_deadline(Some(std::time::Instant::now()));
-                Ok(crate::Value::Undefined)
+                Ok(crate::embed::Value::Undefined)
             });
             let source = format!(
                 r#"

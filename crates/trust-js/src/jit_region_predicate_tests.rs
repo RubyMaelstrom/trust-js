@@ -1,11 +1,12 @@
 //! Predicate/ownership lowering, ECMA-262 e28783d5: Number::equal, IsStrictlyEqual,
 //! ToBoolean, OrdinaryGet, and left-to-right equality Evaluation/GetValue.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, value::Value, Completion, Engine};
 
 #[test]
 fn equality_numeric_template_executes_all_number_pairs() {
-    use crate::value::{PackedValue, PACK_BOOL};
+    use crate::value::{Value, PACK_BOOL};
 
     #[repr(C)]
     struct Outcome {
@@ -78,8 +79,8 @@ fn equality_numeric_template_executes_all_number_pairs() {
                         // the fast template cannot call a helper or drop an owner.
                         // The executable allocation outlives every invocation.
                         let mut stack = [
-                            PackedValue::scalar_bits(&Value::Num(left)).unwrap(),
-                            PackedValue::scalar_bits(&Value::Num(right)).unwrap(),
+                            Value::scalar_bits(&Value::Num(left)).unwrap(),
+                            Value::scalar_bits(&Value::Num(right)).unwrap(),
                         ];
                         let result = unsafe { call(stack.as_mut_ptr()) };
                         let equal = (left == right) ^ negate;
@@ -255,21 +256,17 @@ fn region_predicates_native_peeks_do_not_call_condition_helper() {
         ),
         Ok(Completion::Value(_))
     ));
-    let global = Value::Obj(engine.interp.global.clone());
+    let global = Value::Obj(engine.interp.global);
     let function = engine.interp.get_member_key(&global, "f").ok().unwrap();
     let regions = EXECUTED_REGIONS.with(std::cell::Cell::get);
     let helpers = crate::bytecode::TEST_JIT_COND_HELPERS.with(std::cell::Cell::get);
     for (x, y, want) in [(1.0, 1.0, 1.0), (1.0, 2.0, 2.0), (0.0, 0.0, 0.0)] {
         let result = engine
             .interp
-            .call(
-                function.clone(),
-                Value::Undefined,
-                &[Value::Num(x), Value::Num(y)],
-            )
+            .call(function, Value::Undefined, &[Value::Num(x), Value::Num(y)])
             .ok()
             .unwrap();
-        assert!(matches!(result,Value::Num(n) if n==want));
+        assert!(matches!((result).view(),ValueView::Num(n) if n==want));
     }
     assert!(
         EXECUTED_REGIONS.with(std::cell::Cell::get) > regions,

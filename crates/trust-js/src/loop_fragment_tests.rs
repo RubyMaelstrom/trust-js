@@ -1,5 +1,6 @@
 //! ECMA-262 LoopEvaluation, UpdateEmpty, IteratorClose and DisposeResources.
 //! Actual fragment/native counters prevent an AST fallback from masking transfer bugs.
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn enable_callback(tier: Tier) -> crate::value::NativeFn {
@@ -321,7 +322,7 @@ fn fragment_tail_return_preserves_pending_trampoline_transfer() {
         let site = &body.site;
         engine.interp.strict = true;
         engine.interp.tco_ok = true;
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         // Past the ordinary-call depth (see `Op::TailDeep`) the tail call must be staged.
         let depth = engine.interp.depth;
         engine.interp.depth = crate::bytecode::ordinary_tail_call_depth();
@@ -338,24 +339,26 @@ fn fragment_tail_return_preserves_pending_trampoline_transfer() {
         .expect("admitted")
         .expect("compiled");
         engine.interp.depth = depth;
-        assert!(matches!(outcome, Err(Abrupt::Return(Value::Undefined))));
+        assert!(
+            matches!(outcome, Err(Abrupt::Return(value)) if matches!(value.view(), ValueView::Undefined))
+        );
         let pending = engine
             .interp
             .pending_tail
             .take()
             .expect("tail call staged, not executed");
         assert!(matches!(
-            engine.interp.get_var("called", &env),
-            Ok(Value::Num(0.0))
+            (engine.interp.get_var("called", &env)).map(|__value| (__value).view()),
+            Ok(ValueView::Num(0.0))
         ));
         let (callee, receiver, arguments) = *pending;
         assert!(matches!(
-            engine.interp.call(callee, receiver, &arguments),
-            Ok(Value::Num(9.0))
+            (engine.interp.call(callee, receiver, &arguments)).map(|__value| (__value).view()),
+            Ok(ValueView::Num(9.0))
         ));
         assert!(matches!(
-            engine.interp.get_var("called", &env),
-            Ok(Value::Num(1.0))
+            (engine.interp.get_var("called", &env)).map(|__value| (__value).view()),
+            Ok(ValueView::Num(1.0))
         ));
         // A shallow tail call runs as an ordinary call and returns its result directly.
         engine.eval("k=0", false).unwrap();
@@ -371,11 +374,13 @@ fn fragment_tail_return_preserves_pending_trampoline_transfer() {
         .ok()
         .expect("admitted")
         .expect("compiled");
-        assert!(matches!(outcome, Err(Abrupt::Return(Value::Num(9.0)))));
+        assert!(
+            matches!(outcome, Err(Abrupt::Return(value)) if matches!(value.view(), ValueView::Num(9.0)))
+        );
         assert!(engine.interp.pending_tail.is_none());
         assert!(matches!(
-            engine.interp.get_var("called", &env),
-            Ok(Value::Num(2.0))
+            (engine.interp.get_var("called", &env)).map(|__value| (__value).view()),
+            Ok(ValueView::Num(2.0))
         ));
     }
 }

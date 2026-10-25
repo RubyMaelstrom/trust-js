@@ -42,7 +42,7 @@ impl Captured {
 fn test_runtime() -> (Runtime, Captured) {
     let mut rt = Runtime::new();
     let out = Captured::default();
-    rt.engine().ctx().op_state().put(ConsoleOut {
+    rt.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

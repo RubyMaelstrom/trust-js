@@ -6,17 +6,36 @@
 
 use super::{
     JitCode, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COMPLETE, H_COND, H_EXEC, H_GET_ELEM,
-    H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN,
-    H_SET_PROP, H_SLICE_OP, H_UNWIND,
+    H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_SET_PROP,
+    H_SLICE_OP, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
 
 #[path = "jit_x64_names.rs"]
 mod names;
+#[path = "jit_x64_storage.rs"]
+mod storage;
 
-// JavaScript slots are owned PackedValues; C ABI stack alignment is independent.
+// JavaScript slots are owned Values; C ABI stack alignment is independent.
 const SLOT_BYTES: i32 = 8;
+
+// Register numbers and condition codes of the register-generic forms (`Asm::nr_*`).
+const AX: u8 = 0;
+const CX: u8 = 1;
+const DX: u8 = 2;
+const R8: u8 = 8;
+const R9: u8 = 9;
+const R10: u8 = 10;
+const R11: u8 = 11;
+const CTX: u8 = 12;
+const SP: u8 = 13;
+const EQ: u8 = 0x84;
+const NE: u8 = 0x85;
+const BELOW: u8 = 0x82;
+const ABOVE: u8 = 0x87;
+const AE: u8 = 0x83;
+const BE: u8 = 0x86;
 
 #[derive(Clone, Copy)]
 enum PropRecv {
@@ -102,25 +121,18 @@ impl Asm {
         self.bytes(&(disp + 6).to_le_bytes());
         self.bytes(&tag.to_le_bytes());
     }
-    /// Transfer an owned packed return word only after checking the full vacant
-    /// sentinel. Occupied destinations retain the checked destructor boundary.
+    /// The completion router has already handled finalizers and iterator pads. Publish the
+    /// new word even when an earlier result occupies the destination; GC owns displaced cells.
     fn return_value(&mut self, mode: u32, ret_ok: usize) {
-        let slow = self.label();
         let ret = std::mem::offset_of!(super::JitCtx, ret) as i32;
-        self.mov_word_imm(PACK_UNDEFINED);
-        self.bytes(&[0x49, 0x39, 0x84, 0x24]); // cmp [r12+ret],rax
-        self.bytes(&ret.to_le_bytes());
-        self.jcc(0x85, slow);
         if mode == 1 {
             self.add_sp(-SLOT_BYTES as i8);
             self.load_word_r13(0);
-            self.bytes(&[0x49, 0x89, 0x84, 0x24]); // mov [r12+ret],rax
-            self.bytes(&ret.to_le_bytes());
+        } else {
+            self.mov_word_imm(PACK_UNDEFINED);
         }
-        self.jmp(ret_ok);
-        self.bind(slow);
-        self.call_helper_ptr(H_RETURN, mode);
-        self.bytes(&[0x49, 0x89, 0xc5]); // r13=sp
+        self.bytes(&[0x49, 0x89, 0x84, 0x24]); // mov [r12+ret],rax
+        self.bytes(&ret.to_le_bytes());
         self.jmp(ret_ok);
     }
     fn cmp_qword_r13_rax(&mut self, disp: i32) {
@@ -174,19 +186,10 @@ impl Asm {
             0x48, 0xc1, 0xea, 0x10, // shr rdx,16 (unsigned low48)
         ]);
     }
-    /// EAX contains the high16 tag. Only exact String/Symbol/Object tags may
-    /// touch an Rc count. BigInt and reserved property tags remain checked.
-    fn reference_or_immediate(&mut self, rc_ok: bool, immediate: usize, slow: usize) {
-        let reference = self.label();
-        self.cmp_eax(0x7ffd);
-        self.jcc(0x84, slow);
-        for tag in [0x7ffe, 0x7fff, 0xfff9] {
-            self.cmp_eax(tag);
-            self.jcc(0x84, if rc_ok { reference } else { slow });
-        }
-        self.jcc(0x87, slow); // above PACK_OBJ is reserved, never an execution Number
-        self.jmp(immediate);
-        self.bind(reference);
+    /// Property-only deferred words must materialize before entering execution storage.
+    fn guard_execution_tag(&mut self, slow: usize) {
+        self.cmp_eax((crate::value::PACK_LAZY_PROTO >> 48) as u32);
+        self.jcc(0x83, slow);
     }
     fn guard_number_r13(&mut self, disp: i32, slow: usize) {
         self.load_tag_r13(disp);
@@ -198,18 +201,6 @@ impl Asm {
         self.cmp_eax(0xfff9);
         self.jcc(0x83, slow);
         self.bind(number);
-    }
-    fn inc_strong_rdx(&mut self, disp: i32) {
-        self.bytes(&[0x48, 0xff, 0x82]);
-        self.bytes(&disp.to_le_bytes());
-    }
-    fn guard_dec_strong_rdx(&mut self, disp: i32, slow: usize) {
-        self.bytes(&[0x48, 0x8b, 0x82]); // rax=[payload+strong]
-        self.bytes(&disp.to_le_bytes());
-        self.bytes(&[0x48, 0x83, 0xf8, 0x01]);
-        self.jcc(0x86, slow); // last reference needs the real destructor
-        self.bytes(&[0x48, 0xff, 0x8a]);
-        self.bytes(&disp.to_le_bytes());
     }
     fn numeric_compare(&mut self, setcc: u8, reject_unordered: bool) {
         // Packed Numbers are raw f64 bits; ucomisd supplies ordered scalar flags.
@@ -230,8 +221,8 @@ impl Asm {
         self.add_sp(-8);
     }
 
-    /// Equality for owner-free Undefined/Null/Bool pairs, after the numeric path declined.
-    /// Do not infer string/BigInt equality from raw bits or drop reference owners here.
+    /// Equality for Undefined/Null/Bool pairs, after the numeric path declined.
+    /// String/BigInt content and coercion keep their semantic checked paths.
     fn scalar_equality(&mut self, strict: bool, negate: bool, slow: usize) {
         let booleans = self.label();
         let compare = self.label();
@@ -271,10 +262,9 @@ impl Asm {
         self.add_sp(-8);
     }
 
-    /// Borrow ToBoolean into edx without changing the live operand/its owner. Consuming
-    /// callers use only scalar arms; a peek may also inspect String/Symbol/ordinary Object.
-    /// BigInt, exotic HTMLDDA and destructor-running drops retain the checked helpers.
-    fn truthy_r13(&mut self, peek: bool, layout: &crate::value::JitLayout, slow: usize) {
+    /// ToBoolean into edx without changing the operand. String/Symbol/ordinary Object work
+    /// for both consuming and peek operations; BigInt and possible HTMLDDA keep checked paths.
+    fn truthy_r13(&mut self, layout: &crate::value::JitLayout, slow: usize) {
         let tagged = self.label();
         let boolean = self.label();
         let falsy = self.label();
@@ -300,10 +290,10 @@ impl Asm {
             self.jcc(0x84, label);
         }
         let object_flag = layout
-            .obj_from_rc
+            .obj_from_cell
             .checked_add(layout.obj_ic_plain)
             .filter(|offset| *offset <= i32::MAX as usize);
-        if peek && layout.valid {
+        if layout.valid {
             self.cmp_eax(0x7fff);
             self.jcc(0x84, truthy);
             self.cmp_eax(0x7ffe);
@@ -364,26 +354,72 @@ impl Asm {
         self.bytes(&(-2 * SLOT_BYTES).to_le_bytes());
         self.add_sp(-8);
     }
+    /// Call `helper` with the `(ctx, imm, sp)` contract: r13 takes the returned sp, and a set flag
+    /// (a throw) goes to `unwind`. A call of an allocating helper then ends in the explicit poll
+    /// (see [`Asm::helper_end_poll`]).
     fn helper_spflag(&mut self, helper: usize, imm: u32, unwind: usize) {
         self.call_helper_pair(helper, imm);
         self.bytes(&[0x49, 0x89, 0xc5]); // r13 = rax (new sp)
         self.bytes(&[0x48, 0x85, 0xd2]); // test rdx, rdx (throw flag)
         self.jcc(0x85, unwind); // jne
+        if super::helper_ends_in_poll(helper) {
+            self.helper_end_poll(unwind);
+        }
     }
-    fn interrupt_poll(&mut self, interp_offsets: Option<(i32, i32)>, unwind: usize) {
+    /// rcx = `ctx.live_objects`, the address of the live-object count (`value::LiveCount`).
+    fn load_live_count_address(&mut self) {
+        self.bytes(&[0x49, 0x8b, 0x8c, 0x24]); // mov rcx,[r12+live_objects]
+        self.bytes(&(std::mem::offset_of!(super::JitCtx, live_objects) as i32).to_le_bytes());
+    }
+    /// Compare the cell heap's due word, which follows the live-object count at rcx
+    /// (`value::LiveCount`), with zero. The word is set exactly while a collection is due (the
+    /// byte budget is spent, the stress interval reached or a request deferred), none of which
+    /// moves the count.
+    fn cmp_due_word_rcx(&mut self) {
+        const _: () = assert!(crate::value::LIVE_DUE_OFF < 0x80);
+        // cmp qword [rcx+LIVE_DUE_OFF],0
+        self.bytes(&[0x48, 0x83, 0x79, crate::value::LIVE_DUE_OFF as u8, 0x00]);
+    }
+    /// The explicit poll that ends a call to an allocating helper (see
+    /// `jit::helper_ends_in_poll`), and the calls of `H_CALL` and `H_NEW` and string
+    /// accumulation's committed exit: the recorded S5 deviation, in place of an allocation slow
+    /// path that collects. It runs once the call has returned, with its results in canonical
+    /// places (operand words below r13, slots, context fields): this backend keeps no value in a
+    /// caller-saved register across a helper call, only the context, operand top, helper table
+    /// and slot base in r12-r15. Three instructions while the due word is clear; a set word
+    /// calls `H_INTERRUPT` (`POLL_HELPER_END`), whose throw unwinds from here.
+    fn helper_end_poll(&mut self, unwind: usize) {
+        #[cfg(test)]
+        if super::TEST_NO_END_POLLS.with(std::cell::Cell::get) {
+            return;
+        }
+        let done = self.label();
+        self.load_live_count_address();
+        self.cmp_due_word_rcx();
+        self.jcc(0x84, done); // je: no collection due
+        self.helper_spflag(H_INTERRUPT, super::POLL_HELPER_END, unwind);
+        self.bind(done);
+    }
+    /// Generated code's entry and loop safepoint (`kind` is `POLL_ENTRY` or `POLL_LOOP`): the
+    /// heap's due word, the live-object count against `gc_next`, then the shared
+    /// interrupt divider; the slow path is `H_INTERRUPT` (`jit_interrupt`: the host interrupt,
+    /// then `Interp::gc_check`). While collections are suppressed or deferred the word stays set
+    /// and every poll calls the helper until one can collect.
+    fn interrupt_poll(&mut self, interp_offsets: Option<(i32, i32)>, kind: u32, unwind: usize) {
         let Some((offset, gc_next)) = interp_offsets else {
-            self.helper_spflag(H_INTERRUPT, 0, unwind);
+            self.helper_spflag(H_INTERRUPT, kind, unwind);
             return;
         };
         let done = self.label();
         let slow = self.label();
         self.bytes(&[0x49, 0x8b, 0x44, 0x24, 0x48]); // rax = ctx.interp
-        self.bytes(&[0x49, 0x8b, 0x8c, 0x24]); // rcx = ctx.live_objects
-        self.bytes(&(std::mem::offset_of!(super::JitCtx, live_objects) as i32).to_le_bytes());
+        self.load_live_count_address();
+        self.cmp_due_word_rcx();
+        self.jcc(0x85, slow); // jne: a collection is due
         self.bytes(&[0x48, 0x8b, 0x09]); // rcx = current live object count
         self.bytes(&[0x48, 0x3b, 0x88]); // cmp rcx, [rax+gc_next]
         self.bytes(&gc_next.to_le_bytes());
-        self.jcc(0x8f, slow); // signed greater: allocation pressure
+        self.jcc(0x8f, slow); // signed greater: over the live-object ceiling
         self.bytes(&[0xff, 0x80]); // inc dword ptr [rax+offset]
         self.bytes(&offset.to_le_bytes());
         self.bytes(&[0xf7, 0x80]); // test dword ptr [rax+offset], 0x3fff
@@ -391,7 +427,7 @@ impl Asm {
         self.bytes(&0x3fffu32.to_le_bytes());
         self.jcc(0x85, done); // nonzero: skip the shared-state helper
         self.bind(slow);
-        self.helper_spflag(H_INTERRUPT, 0, unwind);
+        self.helper_spflag(H_INTERRUPT, kind, unwind);
         self.bind(done);
     }
     fn finish(mut self) -> Vec<u8> {
@@ -405,23 +441,150 @@ impl Asm {
     }
 }
 
+// Only ABI-volatile registers are scratch (also on Win64). No push/pop changes
+// the established helper-call alignment. Always use a full disp32 addressing form.
+impl Asm {
+    fn nr_rex(&mut self, wide: bool, reg: u8, base: u8) {
+        self.code
+            .push(0x40 | (u8::from(wide) << 3) | ((reg >> 3) << 2) | (base >> 3));
+    }
+    fn nr_mem(&mut self, wide: bool, opcode: &[u8], reg: u8, base: u8, off: i32) {
+        self.nr_rex(wide, reg, base);
+        self.bytes(opcode);
+        self.code.push(0x80 | ((reg & 7) << 3) | (base & 7));
+        if base & 7 == 4 {
+            self.code.push(0x24);
+        }
+        self.bytes(&off.to_le_bytes());
+    }
+    fn nr_load(&mut self, reg: u8, base: u8, off: usize) {
+        self.nr_mem(true, &[0x8b], reg, base, off as i32);
+    }
+    fn nr_load32(&mut self, reg: u8, base: u8, off: usize) {
+        self.nr_mem(false, &[0x8b], reg, base, off as i32);
+    }
+    fn nr_load8(&mut self, reg: u8, base: u8, off: usize) {
+        self.nr_mem(false, &[0x0f, 0xb6], reg, base, off as i32);
+    }
+    fn nr_store(&mut self, base: u8, off: usize, reg: u8) {
+        self.nr_mem(true, &[0x89], reg, base, off as i32);
+    }
+    fn nr_store32(&mut self, base: u8, off: usize, reg: u8) {
+        self.nr_mem(false, &[0x89], reg, base, off as i32);
+    }
+    fn nr_lea(&mut self, reg: u8, base: u8, off: i32) {
+        self.nr_mem(true, &[0x8d], reg, base, off);
+    }
+    fn nr_reg(&mut self, opcode: u8, dst: u8, src: u8) {
+        self.nr_rex(true, src, dst);
+        self.bytes(&[opcode, 0xc0 | ((src & 7) << 3) | (dst & 7)]);
+    }
+    fn nr_mov(&mut self, dst: u8, src: u8) {
+        self.nr_reg(0x89, dst, src);
+    }
+    fn nr_cmp(&mut self, lhs: u8, rhs: u8) {
+        self.nr_reg(0x39, lhs, rhs);
+    }
+    fn nr_test(&mut self, reg: u8) {
+        self.nr_reg(0x85, reg, reg);
+    }
+    fn nr_imm(&mut self, reg: u8, value: u64) {
+        self.nr_rex(true, 0, reg);
+        self.code.push(0xb8 | (reg & 7));
+        self.bytes(&value.to_le_bytes());
+    }
+    fn nr_op_imm(&mut self, group: u8, reg: u8, value: i32) {
+        self.nr_rex(true, 0, reg);
+        self.bytes(&[0x81, 0xc0 | (group << 3) | (reg & 7)]);
+        self.bytes(&value.to_le_bytes());
+    }
+    fn nr_shift(&mut self, right: bool, reg: u8, count: u8) {
+        self.nr_rex(true, 0, reg);
+        self.bytes(&[
+            0xc1,
+            0xc0 | ((if right { 5 } else { 4 }) << 3) | (reg & 7),
+            count,
+        ]);
+    }
+    fn nr_mul_imm(&mut self, reg: u8, stride: usize) {
+        self.nr_rex(true, reg, reg);
+        self.bytes(&[0x69, 0xc0 | ((reg & 7) << 3) | (reg & 7)]);
+        self.bytes(&(stride as i32).to_le_bytes());
+    }
+    fn nr_zero_guard(&mut self, reg: u8, slow: usize) {
+        self.nr_test(reg);
+        self.jcc(EQ, slow);
+    }
+    fn nr_max_guard(&mut self, reg: u8, scratch: u8, slow: usize) {
+        self.nr_imm(scratch, u32::MAX as u64);
+        self.nr_cmp(reg, scratch);
+        self.jcc(EQ, slow);
+    }
+    /// Branch to `slow` unless the Object at `obj` has ordinary internal methods
+    /// ([`crate::value::Exotic::is_ordinary`]), as ARM64's `guard_exotic_ordinary`: its exotic
+    /// tag is None's, or, where `jit::exotic_collection_admitted` holds, a Map's or Set's
+    /// Collection's, which one unsigned range test from None's tag admits. Clobbers `scratch`
+    /// and the flags.
+    fn guard_exotic_ordinary(
+        &mut self,
+        layout: &crate::value::JitLayout,
+        obj: u8,
+        scratch: u8,
+        slow: usize,
+    ) {
+        self.nr_load8(scratch, obj, layout.obj_exotic);
+        if super::exotic_collection_admitted(layout) {
+            self.nr_op_imm(5, scratch, i32::from(layout.exotic_none_tag)); // sub
+            self.nr_op_imm(7, scratch, 1);
+            self.jcc(ABOVE, slow);
+        } else {
+            self.nr_op_imm(7, scratch, i32::from(layout.exotic_none_tag));
+            self.jcc(NE, slow);
+        }
+    }
+}
+
 fn a_jne_or_unordered(a: &mut Asm, slow: usize) {
     a.jcc(0x85, slow);
     a.jcc(0x8a, slow);
 }
 
 // ECMA-262 e28783d5, OrdinaryGet: an ordinary own data descriptor returns its live value.
-// No getter, prototype walk, conversion or JavaScript call occurs on this path.
+// No getter, prototype walk, conversion or JavaScript call occurs on this path. Test-only counts
+// of the reads `emit_prop_own` committed, by receiver form: [slot, `this`].
 #[cfg(test)]
 thread_local! {
-    static TEST_OWN_PROPERTY_READS: [std::cell::Cell<usize>; 2] = const {
+    pub(super) static TEST_OWN_PROPERTY_READS: [std::cell::Cell<usize>; 2] = const {
         [std::cell::Cell::new(0), std::cell::Cell::new(0)]
     };
 }
 
+/// r10 = the receiver's cell word, untagged, once its tag is Object's: other receivers (Empty, a
+/// primitive) keep the checked helper. Either form reads a packed word as a slot holds one: the
+/// local slot's, or the context's [r12+0x30] (`JitCtx::this_word`), the packed `this` itself.
+/// That slot or context keeps the receiver alive throughout the read.
+fn receiver_cell(a: &mut Asm, recv: PropRecv, slow: usize) {
+    match recv {
+        PropRecv::This => {
+            a.nr_mem(false, &[0x0f, 0xb7], AX, CTX, 0x30 + 6); // eax=ctx.this_word tag
+            a.cmp_eax((PACK_OBJ >> 48) as u32);
+            a.jcc(0x85, slow);
+            a.nr_load(R10, CTX, 0x30); // r10=ctx.this_word
+        }
+        PropRecv::Slot(slot) => {
+            let off = i32::from(slot) * SLOT_BYTES;
+            a.load_tag_r15(off);
+            a.cmp_eax((PACK_OBJ >> 48) as u32);
+            a.jcc(0x85, slow);
+            a.bytes(&[0x4d, 0x8b, 0x97]); // r10=[r15+off]
+            a.bytes(&off.to_le_bytes());
+        }
+    }
+    a.bytes(&[0x49, 0xc1, 0xe2, 0x10, 0x49, 0xc1, 0xea, 0x10]); // untag r10
+}
+
 /// Probe the live property IC, including fills made after this machine body was compiled.
-/// Receiver, cache, bounds, descriptor and owner checks precede the single clone/push commit.
-/// The canonical local/this owner keeps the receiver alive throughout the borrowed lookup.
+/// Receiver, cache, bounds, descriptor and value-tag checks precede the single push.
 fn emit_prop_own(
     a: &mut Asm,
     layout: &crate::value::JitLayout,
@@ -431,47 +594,27 @@ fn emit_prop_own(
 ) -> bool {
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT, PROP_IC_WAYS};
     let offsets = [
-        layout.obj_from_rc,
+        layout.obj_from_cell,
         layout.obj_exotic,
         layout.obj_ic_plain,
         layout.obj_props + layout.props_shape,
-        layout.obj_props + layout.props_entries + layout.vec_len_off,
-        layout.obj_props + layout.props_entries + layout.vec_ptr_off,
         layout.entry_size,
         layout.entry_value,
         layout.entry_accessor,
-        layout.rc_strong_off,
     ];
     if !layout.valid
+        || !storage::fields_len_fits(layout)
+        || !storage::fields_data_fits(layout)
         || layout.entry_accessor != layout.entry_value + 8
         || cache == 0
         || offsets.iter().any(|offset| *offset > i32::MAX as usize)
     {
         return false;
     }
-    match recv {
-        PropRecv::This => {
-            a.bytes(&[0x49, 0x8b, 0x84, 0x24, 0x30, 0, 0, 0]); // rax=ctx.this_raw
-            a.bytes(&[0x80, 0x38, 0x08]); // wide Value::Obj
-            a.jcc(0x85, slow);
-            a.bytes(&[0x4c, 0x8b, 0x50, 0x08]); // r10=stored receiver owner
-        }
-        PropRecv::Slot(slot) => {
-            let off = i32::from(slot) * SLOT_BYTES;
-            a.load_tag_r15(off);
-            a.cmp_eax((PACK_OBJ >> 48) as u32); // Empty/primitive receivers retain the helper
-            a.jcc(0x85, slow);
-            a.bytes(&[0x4d, 0x8b, 0x97]);
-            a.bytes(&off.to_le_bytes());
-            a.bytes(&[0x49, 0xc1, 0xe2, 0x10, 0x49, 0xc1, 0xea, 0x10]); // untag r10
-        }
-    }
-    a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]); // r11=Object body
-    a.bytes(&(layout.obj_from_rc as i32).to_le_bytes());
-    a.bytes(&[0x41, 0x80, 0xbb]); // receiver must have ordinary internal methods
-    a.bytes(&(layout.obj_exotic as i32).to_le_bytes());
-    a.bytes(&[layout.exotic_none_tag]);
-    a.jcc(0x85, slow);
+    receiver_cell(a, recv, slow);
+    a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]); // r11=Object
+    a.bytes(&(layout.obj_from_cell as i32).to_le_bytes());
+    a.guard_exotic_ordinary(layout, R11, AX, slow); // ordinary internal methods
     a.bytes(&[0x41, 0x80, 0xbb]);
     a.bytes(&(layout.obj_ic_plain as i32).to_le_bytes());
     a.bytes(&[0]);
@@ -505,11 +648,10 @@ fn emit_prop_own(
     a.jcc(0x85, probe);
     a.jmp(slow);
     a.bind(found);
-    a.bytes(&[0x49, 0x3b, 0x93]); // cmp rdx,live entry count
-    a.bytes(&((layout.obj_props + layout.props_entries + layout.vec_len_off) as i32).to_le_bytes());
-    a.jcc(0x83, slow);
-    a.bytes(&[0x49, 0x8b, 0x83]); // rax=live entries buffer
-    a.bytes(&((layout.obj_props + layout.props_entries + layout.vec_ptr_off) as i32).to_le_bytes());
+    storage::fields_len(a, layout, CX, R11); // rcx=live entry count
+    a.nr_cmp(DX, CX);
+    a.jcc(AE, slow);
+    storage::fields_data(a, layout, AX, R11); // rax=live entries
     a.bytes(&[0x48, 0x69, 0xd2]); // imul rdx,rdx,entry_size
     a.bytes(&(layout.entry_size as i32).to_le_bytes());
     a.bytes(&[0x48, 0x01, 0xd0]); // rax=Property address
@@ -522,17 +664,8 @@ fn emit_prop_own(
     a.bytes(&[0x4c, 0x89, 0xd0, 0x48, 0xc1, 0xe8, 0x30]); // eax=value tag
     a.cmp_eax((crate::value::PACK_EMPTY >> 48) as u32);
     a.jcc(0x84, slow);
-    let immediate = a.label();
-    let copied = a.label();
-    // BigInt and reserved/lazy-prototype words keep their checked materialization.
-    a.reference_or_immediate(true, immediate, slow);
-    a.bytes(&[0x4c, 0x89, 0xd0]);
-    a.payload_rax_to_rdx();
-    a.inc_strong_rdx(layout.rc_strong_off as i32);
-    a.jmp(copied);
-    a.bind(immediate);
-    a.bytes(&[0x4c, 0x89, 0xd0]); // rax=immediate word; no ownership traffic
-    a.bind(copied);
+    a.guard_execution_tag(slow);
+    a.bytes(&[0x4c, 0x89, 0xd0]); // rax=the live property word, including BigInt
     a.store_word_r13(0);
     a.add_sp(8);
     #[cfg(test)]
@@ -574,7 +707,7 @@ fn emit_prop_read(
 }
 
 /// Compact monomorphic property-number load. Every cached structural fact is rechecked against
-/// the live object graph; a miss reaches H_GET_PROP before stack or refcount state changes.
+/// the live object graph; a miss reaches H_GET_PROP before the operand stack changes.
 fn emit_prop_num(
     a: &mut Asm,
     layout: &crate::value::JitLayout,
@@ -583,16 +716,15 @@ fn emit_prop_num(
     slow: usize,
 ) -> bool {
     if !layout.valid
+        || !storage::fields_data_fits(layout)
+        || layout.obj_exotic > i32::MAX as usize
         || st.depth > 2
         || (st.depth == 2 && st.mid_ok & 1 == 0)
         || layout.entry_size.checked_mul(st.slot as usize).is_none()
     {
         return false;
     }
-    let Ok(rcv) = i32::try_from(layout.obj_from_rc) else {
-        return false;
-    };
-    let Ok(exotic) = i32::try_from(layout.obj_exotic) else {
+    let Ok(obj_off) = i32::try_from(layout.obj_from_cell) else {
         return false;
     };
     let Ok(plain) = i32::try_from(layout.obj_ic_plain) else {
@@ -602,10 +734,6 @@ fn emit_prop_num(
         return false;
     };
     let Ok(proto) = i32::try_from(layout.obj_proto) else {
-        return false;
-    };
-    let Ok(entries) = i32::try_from(layout.obj_props + layout.props_entries + layout.vec_ptr_off)
-    else {
         return false;
     };
     let Some(entry_base) = layout.entry_size.checked_mul(st.slot as usize) else {
@@ -618,33 +746,13 @@ fn emit_prop_num(
         return false;
     };
 
-    match recv {
-        PropRecv::This => {
-            // rax=ctx.this_raw; receiver must be Value::Obj; r10=stored Rc pointer.
-            a.bytes(&[0x49, 0x8b, 0x84, 0x24, 0x30, 0, 0, 0]);
-            a.bytes(&[0x80, 0x38, 0x08]);
-            a.jcc(0x85, slow);
-            a.bytes(&[0x4c, 0x8b, 0x50, 0x08]);
-        }
-        PropRecv::Slot(slot) => {
-            let off = i32::from(slot) * SLOT_BYTES;
-            a.load_tag_r15(off);
-            a.cmp_eax(0xfff9);
-            a.jcc(0x85, slow);
-            a.bytes(&[0x4d, 0x8b, 0x97]);
-            a.bytes(&off.to_le_bytes());
-            a.bytes(&[0x49, 0xc1, 0xe2, 0x10, 0x49, 0xc1, 0xea, 0x10]); // untag r10
-        }
-    }
+    receiver_cell(a, recv, slow);
 
     let guard_object = |a: &mut Asm, expected: u32, slow: usize| {
-        // r11 = Object body for the stored Rc in r10.
+        // r11 = the Object in the cell whose word is in r10.
         a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]);
-        a.bytes(&rcv.to_le_bytes());
-        a.bytes(&[0x41, 0x80, 0xbb]);
-        a.bytes(&exotic.to_le_bytes());
-        a.bytes(&[layout.exotic_none_tag]);
-        a.jcc(0x85, slow);
+        a.bytes(&obj_off.to_le_bytes());
+        a.guard_exotic_ordinary(layout, R11, AX, slow);
         a.bytes(&[0x41, 0x80, 0xbb]);
         a.bytes(&plain.to_le_bytes());
         a.bytes(&[0]);
@@ -656,7 +764,7 @@ fn emit_prop_num(
     };
     guard_object(a, st.recv_shape, slow);
     if st.depth >= 1 {
-        a.bytes(&[0x4d, 0x8b, 0x93]); // r10=[r11+proto]
+        a.bytes(&[0x4d, 0x8b, 0x93]); // r10=[r11+proto], the prototype's cell word or null
         a.bytes(&proto.to_le_bytes());
         a.bytes(&[0x4d, 0x85, 0xd2]);
         a.jcc(0x84, slow);
@@ -678,9 +786,9 @@ fn emit_prop_num(
         guard_object(a, st.holder_shape, slow);
     }
 
-    // rax=entries data; reject a live accessor descriptor, then decode only packed Numbers.
-    a.bytes(&[0x49, 0x8b, 0x83]);
-    a.bytes(&entries.to_le_bytes());
+    // rax=the holder's entries; reject a live accessor descriptor, then decode only packed
+    // Numbers.
+    storage::fields_data(a, layout, AX, R11);
     a.bytes(&[0xf6, 0x80]);
     a.bytes(&accessor_off.to_le_bytes());
     a.bytes(&[crate::value::PROP_ACCESSOR as u8]);
@@ -775,8 +883,6 @@ pub(super) fn compile_entry(
     let unwind = a.label();
     let ret_ok = a.label();
     let ret_throw = a.label();
-    let rc_ok = layout.valid && layout.rc_strong_off <= i32::MAX as usize;
-    let rc_strong = layout.rc_strong_off as i32;
     let interrupt_offset = (ilayout.valid
         && ilayout.interrupt_poll_tick <= i32::MAX as usize
         && ilayout.gc_next <= i32::MAX as usize)
@@ -848,7 +954,7 @@ pub(super) fn compile_entry(
     // a user agent may abort a running script at any time (HTML "Killing scripts"). The frame
     // is fully established and the operand stack empty, as at a back-edge target at pc 0.
     if !borrowed_entry {
-        a.interrupt_poll(interrupt_offset, unwind);
+        a.interrupt_poll(interrupt_offset, super::POLL_ENTRY, unwind);
     }
 
     if borrowed_entry {
@@ -870,7 +976,7 @@ pub(super) fn compile_entry(
         a.bind(pcs[pc]);
         pc_offsets.push(a.code.len() as u32);
         if interrupt_targets[pc] {
-            a.interrupt_poll(interrupt_offset, unwind);
+            a.interrupt_poll(interrupt_offset, super::POLL_LOOP, unwind);
         }
         if borrowed_entry && crate::bytecode::jit_slice_exit_op(op) {
             a.helper_spflag(H_SLICE_OP, pc as u32, ret_throw);
@@ -887,7 +993,9 @@ pub(super) fn compile_entry(
             a.call_helper_pair(super::H_STRING_ACCUMULATION, pc as u32);
             a.bytes(&[0x49, 0x89, 0xc5]); // r13 = canonical sp
             a.bytes(&[0x48, 0x85, 0xd2]); // flag0 is complete success
-            a.jcc(0x84, pcs[plan.end]);
+            a.jcc(0x85, ordinary); // an unchanged miss
+            a.helper_end_poll(unwind); // the committed exit ends in the explicit poll
+            a.jmp(pcs[plan.end]);
             a.bind(ordinary);
         }
         if names::emit_op(&mut a, chunk, layout, ilayout, op, pc as u32, unwind) {
@@ -895,7 +1003,14 @@ pub(super) fn compile_entry(
         }
         match op {
             Op::Const(k) if chunk.jit_const_copyable(*k) => {
-                a.mov_word_imm(chunk.jit_const_packed_bits(*k)?);
+                a.mov_word_imm(chunk.jit_const_scalar_bits(*k)?);
+                a.store_word_r13(0);
+                a.add_sp(8);
+            }
+            // The constant's word owns nothing and names a cell the chunk's pool roots while
+            // this code, which the chunk owns, can run: an immediate (see `jit_const_str_word`).
+            Op::Const(k) if chunk.jit_const_is_str(*k) => {
+                a.mov_word_imm(chunk.jit_const_str_word(*k)?);
                 a.store_word_r13(0);
                 a.add_sp(8);
             }
@@ -906,80 +1021,31 @@ pub(super) fn compile_entry(
             }
             Op::LoadLocal(slot) => {
                 let slow = a.label();
-                let done = a.label();
-                let copy = a.label();
+                let exit = a.label();
                 let off = i32::from(*slot) * SLOT_BYTES;
                 a.load_tag_r15(off);
                 a.cmp_eax(0x7ffa); // Empty is a TDZ throw
                 a.jcc(0x84, slow);
-                a.reference_or_immediate(rc_ok, copy, slow);
+                a.guard_execution_tag(slow);
                 a.load_word_r15(off);
-                a.payload_rax_to_rdx();
-                a.inc_strong_rdx(rc_strong);
-                a.jmp(done);
-                a.bind(copy);
-                a.load_word_r15(off);
-                a.bind(done);
                 a.store_word_r13(0);
                 a.add_sp(8);
-                let exit = a.label();
                 a.jmp(exit);
                 a.bind(slow);
                 a.helper_spflag(H_EXEC, pc as u32, unwind);
                 a.bind(exit);
             }
             Op::StoreLocal(slot) => {
-                let slow = a.label();
-                let commit = a.label();
-                let exit = a.label();
-                let off = i32::from(*slot) * SLOT_BYTES;
-                a.load_tag_r15(off);
-                a.reference_or_immediate(rc_ok, commit, slow);
-                a.load_word_r15(off);
-                a.payload_rax_to_rdx();
-                a.guard_dec_strong_rdx(rc_strong, slow);
-                a.bind(commit);
-                a.load_word_r13(-SLOT_BYTES); // transfer one owner, no retain
-                a.store_word_r15(off);
-                a.add_sp(-8);
-                a.jmp(exit);
-                a.bind(slow);
-                a.helper_spflag(H_EXEC, pc as u32, unwind);
-                a.bind(exit);
-            }
-            Op::Pop => {
-                let slow = a.label();
-                let commit = a.label();
-                let exit = a.label();
-                a.load_tag_r13(-SLOT_BYTES);
-                a.reference_or_immediate(rc_ok, commit, slow);
+                // The incoming execution word replaces the old local without reading it.
                 a.load_word_r13(-SLOT_BYTES);
-                a.payload_rax_to_rdx();
-                a.guard_dec_strong_rdx(rc_strong, slow);
-                a.bind(commit);
+                a.store_word_r15(i32::from(*slot) * SLOT_BYTES);
                 a.add_sp(-8);
-                a.jmp(exit);
-                a.bind(slow);
-                a.helper_spflag(H_EXEC, pc as u32, unwind);
-                a.bind(exit);
             }
+            Op::Pop => a.add_sp(-8),
             Op::Dup => {
-                let slow = a.label();
-                let copy = a.label();
-                let exit = a.label();
-                a.load_tag_r13(-SLOT_BYTES);
-                a.reference_or_immediate(rc_ok, copy, slow);
-                a.load_word_r13(-SLOT_BYTES);
-                a.payload_rax_to_rdx();
-                a.inc_strong_rdx(rc_strong);
-                a.bind(copy);
                 a.load_word_r13(-SLOT_BYTES);
                 a.store_word_r13(0);
                 a.add_sp(8);
-                a.jmp(exit);
-                a.bind(slow);
-                a.helper_spflag(H_EXEC, pc as u32, unwind);
-                a.bind(exit);
             }
             Op::EqEq | Op::StrictEq | Op::NotEq | Op::StrictNotEq => {
                 let slow = a.label();
@@ -1043,7 +1109,7 @@ pub(super) fn compile_entry(
             Op::JumpIfFalse(target) => {
                 let slow = a.label();
                 let have = a.label();
-                a.truthy_r13(false, layout, slow);
+                a.truthy_r13(layout, slow);
                 a.add_sp(-SLOT_BYTES as i8);
                 a.jmp(have);
                 a.bind(slow);
@@ -1056,7 +1122,7 @@ pub(super) fn compile_entry(
             Op::JumpIfFalsePeek(target) | Op::JumpIfTruePeek(target) => {
                 let slow = a.label();
                 let have = a.label();
-                a.truthy_r13(true, layout, slow);
+                a.truthy_r13(layout, slow);
                 a.jmp(have);
                 a.bind(slow);
                 a.call_helper_pair(H_COND, COND_PEEK_TRUTHY);
@@ -1084,7 +1150,7 @@ pub(super) fn compile_entry(
             Op::Not => {
                 let slow = a.label();
                 let done = a.label();
-                a.truthy_r13(false, layout, slow);
+                a.truthy_r13(layout, slow);
                 a.bytes(&[0x83, 0xf2, 0x01]); // negate truthiness
                 a.mov_word_imm(PACK_BOOL);
                 a.bytes(&[0x48, 0x09, 0xd0]);
@@ -1097,7 +1163,7 @@ pub(super) fn compile_entry(
             Op::InlineGuard(t, target) => {
                 let it = chunk.jit_inline_target(*t);
                 let stored = it.pin.upgrade().filter(|_| layout.valid).map(|o| {
-                    let some: Option<crate::value::Gc> = Some(crate::value::Gc::from(o));
+                    let some: Option<crate::value::Gc> = Some(o);
                     unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
                 });
                 match stored {
@@ -1161,9 +1227,13 @@ pub(super) fn compile_entry(
             }
             Op::Call(..) | Op::CallWithThis(..) => {
                 a.helper_spflag(H_CALL, pc as u32, unwind);
+                // A native callee can allocate after the call's last safepoint.
+                a.helper_end_poll(unwind);
             }
             Op::New(argc, _) => {
                 a.helper_spflag(H_NEW, pc as u32 | ((*argc as u32) << 16), unwind);
+                // A native constructor allocates after the call's last safepoint.
+                a.helper_end_poll(unwind);
             }
             Op::GetPropThis(_, cache) => {
                 emit_prop_read(
@@ -1319,7 +1389,8 @@ mod encoding_tests {
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
-    use crate::{bytecode::Tier, value::Callable, value::Value, Completion, Engine};
+    use crate::value::ValueView;
+    use crate::{bytecode::Tier, value::Callable, Completion, Engine};
 
     fn engine() -> Engine {
         let mut engine = Engine::new();
@@ -1336,19 +1407,20 @@ mod tests {
     }
 
     fn assert_native_code(engine: &mut Engine, name: &str, expected: bool) {
-        let env = engine.interp.global_env.clone();
-        let Value::Obj(object) = engine
+        let env = engine.interp.global_env;
+        let ValueView::Obj(object) = (engine
             .interp
             .get_var(name, &env)
-            .unwrap_or_else(|_| panic!("missing {name}"))
-        else {
+            .unwrap_or_else(|_| panic!("missing {name}")))
+        .view() else {
             panic!("{name} is not an object");
         };
         let object = object.borrow();
         let Callable::User(user) = &object.call else {
             panic!("{name} is not a user function");
         };
-        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = user.func.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert_eq!(
             chunk.jit.get().map(|code| code.is_some()),
             Some(expected),

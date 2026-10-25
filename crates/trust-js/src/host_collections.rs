@@ -3,8 +3,8 @@
 //! effects; indexed/named value getters remain ordinary traced callables.
 
 use crate::interpreter::{Abrupt, Interp};
+use crate::value::ValueView;
 use crate::value::{Gc, Value};
-use std::rc::Rc;
 
 impl Interp {
     pub(crate) fn host_named_supported(&self, object: &Gc, key: &str) -> bool {
@@ -12,11 +12,12 @@ impl Interp {
             return false;
         }
         self.host_indexed
-            .get(&(Rc::as_ptr(object) as usize))
+            .get(&(Gc::as_ptr(object) as usize))
             .and_then(|properties| properties.live.as_ref())
             .is_some_and(|live| {
                 live.names.is_some_and(|names| {
-                    names(self, &live.state)
+                    let supported = self.with_host_query(|interp| names(interp, &live.state));
+                    supported
                         .iter()
                         .any(|name| name == crate::value::decode_string_key(key))
                 })
@@ -29,7 +30,7 @@ impl Interp {
             || Self::is_sym_key(key)
             || !self
                 .host_indexed
-                .get(&(Rc::as_ptr(object) as usize))
+                .get(&(Gc::as_ptr(object) as usize))
                 .is_some_and(|properties| {
                     properties
                         .live
@@ -48,7 +49,7 @@ impl Interp {
         {
             return Ok(false);
         }
-        let mut prototype = object.borrow().proto.clone();
+        let mut prototype = object.borrow().proto;
         while let Some(current) = prototype {
             let current = current.borrow();
             if !current.ic_plain.get() {
@@ -57,14 +58,14 @@ impl Interp {
             if current.props.contains(key) {
                 return Ok(false);
             }
-            prototype = current.proto.clone();
+            prototype = current.proto;
         }
         if !self.host_named_supported(object, key) {
             return Ok(false);
         }
-        let mut prototype = crate::builtins::js_get_prototype_of(self, &Value::Obj(object.clone()))
+        let mut prototype = crate::builtins::js_get_prototype_of(self, &Value::Obj(*object))
             .map_err(Abrupt::Throw)?;
-        while matches!(prototype, Value::Obj(_)) {
+        while matches!((prototype).view(), ValueView::Obj(_)) {
             if crate::builtins::has_own_property_trapped(self, &prototype, key)
                 .map_err(Abrupt::Throw)?
             {
@@ -86,13 +87,13 @@ impl Interp {
         }
         let getter = self
             .host_indexed
-            .get(&(Rc::as_ptr(object) as usize))
+            .get(&(Gc::as_ptr(object) as usize))
             .and_then(|properties| properties.live.as_ref())
-            .and_then(|live| live.named_getter.clone())
+            .and_then(|live| live.named_getter)
             .expect("named membership requires a getter");
         self.call_callback(
             getter,
-            Value::Obj(object.clone()),
+            Value::Obj(*object),
             &[crate::value::string_key_value(key)],
         )
         .map(Some)
@@ -110,7 +111,7 @@ impl Interp {
     pub(crate) fn host_named_keys(&mut self, object: &Gc) -> Result<Vec<String>, Abrupt> {
         let Some(live) = self
             .host_indexed
-            .get(&(Rc::as_ptr(object) as usize))
+            .get(&(Gc::as_ptr(object) as usize))
             .and_then(|properties| properties.live.clone())
         else {
             return Ok(Vec::new());
@@ -119,7 +120,8 @@ impl Interp {
             return Ok(Vec::new());
         };
         let mut result = Vec::new();
-        for name in names(self, &live.state) {
+        let supported = self.with_host_query(|interp| names(interp, &live.state));
+        for name in supported {
             let name = crate::value::encode_owned_string_key(name);
             if self.host_named_visible(object, &name)? {
                 result.push(name);
@@ -137,11 +139,13 @@ impl Interp {
 
 #[cfg(all(test, feature = "embed"))]
 mod tests {
-    use super::*;
+    use crate::embed::{Ctx, Value};
     use crate::{bytecode::Tier, Completion, Engine};
 
-    fn length(_: &Interp, state: &Value) -> u32 {
+    /// The state's `length`, read natively (the test reads the engine's object directly).
+    fn length<'s>(_: &Ctx<'s>, state: &Value<'s>) -> u32 {
         state
+            .as_internal()
             .as_obj()
             .unwrap()
             .borrow()
@@ -152,7 +156,7 @@ mod tests {
             .as_num_opt()
             .unwrap() as u32
     }
-    fn names(ctx: &Interp, state: &Value) -> Vec<String> {
+    fn names<'s>(ctx: &Ctx<'s>, state: &Value<'s>) -> Vec<String> {
         if length(ctx, state) == 0 {
             Vec::new()
         } else {
@@ -168,9 +172,8 @@ mod tests {
             Completion::Throw { name, message } => panic!("{name}: {message}"),
         }
     }
-    fn value(engine: &mut Engine, source: &str) -> Value {
-        engine
-            .eval_value(source)
+    fn value<'s>(cx: &mut Ctx<'s>, source: &str) -> Value<'s> {
+        cx.eval_value(source)
             .expect("fixture parses")
             .unwrap_or_else(|_| panic!("fixture evaluates"))
     }
@@ -178,28 +181,22 @@ mod tests {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
-        let state = value(
-            &mut engine,
-            "globalThis.collectionState={length:3};collectionState",
-        );
-        let target = value(
-            &mut engine,
-            "globalThis.liveCollection=Object.create({hidden:42});liveCollection",
-        );
-        let getter = value(
-            &mut engine,
-            "(key)=>typeof key==='number' ? key+10 : key+' value'",
-        );
-        engine
-            .ctx()
-            .install_live_readonly_indexed_properties(
+        engine.scope(|cx| {
+            let state = value(cx, "globalThis.collectionState={length:3};collectionState");
+            let target = value(
+                cx,
+                "globalThis.liveCollection=Object.create({hidden:42});liveCollection",
+            );
+            let getter = value(cx, "(key)=>typeof key==='number' ? key+10 : key+' value'");
+            cx.install_live_readonly_indexed_properties(
                 &target,
                 state,
                 length,
-                getter.clone(),
+                getter,
                 Some((names, getter)),
             )
             .unwrap_or_else(|_| panic!("live collection installs"));
+        });
         engine
     }
 
@@ -263,19 +260,16 @@ mod tests {
             ),
             "ok"
         );
-        let state = value(&mut engine, "collectionState");
-        let target = value(
-            &mut engine,
-            "globalThis.shrinking=Object.create(null);shrinking",
-        );
-        let getter = value(
-            &mut engine,
-            "index=>{if(index===0)collectionState.length=1;return index+20}",
-        );
-        engine
-            .ctx()
-            .install_live_readonly_indexed_properties(&target, state, length, getter, None)
-            .unwrap_or_else(|_| panic!("install"));
+        engine.scope(|cx| {
+            let state = value(cx, "collectionState");
+            let target = value(cx, "globalThis.shrinking=Object.create(null);shrinking");
+            let getter = value(
+                cx,
+                "index=>{if(index===0)collectionState.length=1;return index+20}",
+            );
+            cx.install_live_readonly_indexed_properties(&target, state, length, getter, None)
+                .unwrap_or_else(|_| panic!("install"));
+        });
         assert_eq!(
             run(
                 &mut engine,
@@ -288,14 +282,18 @@ mod tests {
     #[test]
     fn live_collections53_state_and_getters_are_traced_without_pinning_cycles() {
         let mut engine = setup(Tier::Jit);
-        let target = value(&mut engine, "liveCollection");
-        let pointer = Rc::as_ptr(target.as_obj().unwrap()) as usize;
+        // The target lives only in this helper frame (the collector scans the stack).
+        let pointer = crate::gc_test::in_frame(|| {
+            engine.scope(|cx| {
+                let target = value(cx, "liveCollection");
+                crate::gc_test::HiddenAddress::of(target.as_internal())
+            })
+        });
         run(
             &mut engine,
             "collectionState.owner=liveCollection;collectionState=null;liveCollection=null",
         );
-        drop(target);
-        engine.ctx().collect_garbage_for_host();
-        assert!(!engine.ctx().host_indexed.contains_key(&pointer));
+        engine.collect_garbage_at_idle();
+        assert!(!pointer.in_map(&engine.interp.host_indexed));
     }
 }

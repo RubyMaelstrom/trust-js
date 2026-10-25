@@ -28,6 +28,156 @@ fn all_tiers(source: &str, expected: &str) {
 }
 
 #[test]
+fn packed_new_target_survives_direct_normal_throw_nested_and_lexical_calls() {
+    const CHILD: &str = "TRUST_JS_TEST_PACKED_NEW_TARGET_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The direct-call IC epoch is process-global; parallel Engine startup must not make
+        // an actual native-return/throw assertion depend on unrelated tests' cache fences.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "jit::call_closure_tests::packed_new_target_survives_direct_normal_throw_nested_and_lexical_calls",
+                "--exact", "--nocapture", "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.interp.def_method(
+            &engine.interp.global,
+            "collectPackedTarget",
+            0,
+            |interp, _, _| {
+                interp.gc_collect();
+                Ok(crate::value::Value::Undefined)
+            },
+        );
+        evaluate(
+            &mut engine,
+            r#"
+            function plain(mode) {
+                var sum=0;
+                for(var k=0;k<3;k++)sum+=k;
+                collectPackedTarget();
+                if(mode<0)throw 17;
+                return new.target;
+            }
+            function Nested(){this.correct=new.target===Nested;}
+            function Outer(mode){
+                var initial=new.target;
+                var ordinary=plain(0),afterNormal=new.target===initial,threw=false;
+                try{plain(mode);}catch(error){threw=error===17;}
+                var afterThrow=new.target===initial,nested=new Nested();
+                var afterNested=new.target===initial,ordinaryAfterNested=plain(0);
+                collectPackedTarget();
+                this.answer=[initial===Outer,ordinary===undefined,afterNormal,
+                    threw===(mode<0),afterThrow,nested.correct,afterNested,
+                    ordinaryAfterNested===undefined,new.target===initial].join(',');
+            }
+            function lexicalPlain(mode){collectPackedTarget();if(mode<0)throw 19;}
+            function Lexical(mode){
+                var expected=new.target,read=()=>new.target;
+                try{lexicalPlain(mode);}catch(error){if(error!==19)throw error;}
+                collectPackedTarget();this.read=read;this.correct=read()===expected;
+            }
+            function drive(mode){var made=new Outer(mode),lexical=new Lexical(mode);
+                return made.answer+'|'+(lexical.correct&&lexical.read()===Lexical);}
+            for(var warm=0;warm<100;warm++){drive(0);drive(-1);}
+            0;
+        "#,
+        );
+        #[cfg(target_arch = "aarch64")]
+        let plain_function = if tier == Tier::Jit {
+            let env = engine.interp.global_env;
+            let outer = engine.interp.get_var("Outer", &env).ok().unwrap();
+            let outer_handle = outer.as_obj().unwrap();
+            let outer_object = outer_handle.borrow();
+            let crate::value::Callable::User(outer_user) = &outer_object.call else {
+                panic!("Outer user function")
+            };
+            let outer_runtime = outer_user.func.runtime();
+            let outer_chunk = outer_runtime
+                .execution_code_for(crate::interpreter::Env::as_ptr(&env) as usize)
+                .and_then(Option::as_ref)
+                .expect("compiled Outer");
+            assert!(outer_chunk.lean_new_target,
+                "ordinary constructor observations must read the packed interpreter register, not an Env copy");
+            drop(outer_object);
+            let value = engine.interp.get_var("plain", &env).ok().unwrap();
+            let handle = value.as_obj().unwrap();
+            let object = handle.borrow();
+            let crate::value::Callable::User(user) = &object.call else {
+                panic!("plain user function")
+            };
+            Some(user.func.clone())
+        } else {
+            None
+        };
+        #[cfg(target_arch = "aarch64")]
+        let direct_counts = || {
+            let mut returns = 0;
+            let mut throws = 0;
+            if let Some(function) = &plain_function {
+                let runtime = function.runtime();
+                for chunk in [runtime.code.get(), runtime.code2.get()]
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    returns += chunk.test_direct_returns.get();
+                    throws += chunk.test_direct_throws.get();
+                }
+            }
+            (returns, throws)
+        };
+        for mode in [0, -1] {
+            #[cfg(target_arch = "aarch64")]
+            let before = (
+                super::TEST_DIRECT_PACKED_RETURNS.with(std::cell::Cell::get),
+                super::TEST_DIRECT_PACKED_THROWS.with(std::cell::Cell::get),
+                direct_counts(),
+            );
+            assert_eq!(
+                evaluate(&mut engine, &format!("var measured;for(var measure=0;measure<32;measure++){{measured=drive({mode});if(measured!=='true,true,true,true,true,true,true,true,true|true')throw Error(measured);}}measured")),
+                "true,true,true,true,true,true,true,true,true|true",
+                "{tier:?}, mode={mode}"
+            );
+            assert_eq!(
+                engine.interp.new_target.bits(),
+                crate::value::PACK_UNDEFINED
+            );
+            #[cfg(target_arch = "aarch64")]
+            if tier == Tier::Jit {
+                assert!(
+                    super::TEST_DIRECT_PACKED_RETURNS.with(std::cell::Cell::get) > before.0,
+                    "direct native return must pass state restoration"
+                );
+                assert!(direct_counts().0 > before.2.0,
+                    "the exact ordinary plain callee must complete directly; lexical read() cannot mask fallback");
+                if mode < 0 {
+                    assert!(
+                        super::TEST_DIRECT_PACKED_THROWS.with(std::cell::Cell::get) > before.1,
+                        "the direct native error path must restore state before caller unwind"
+                    );
+                    assert!(direct_counts().1 > before.2.1,
+                        "the exact ordinary plain callee must throw directly after collecting inside its saved-state area");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn direct_call_frames_start_undefined_and_release_owners() {
     all_tiers(
         r####"// Direct-call frames: every local starts undefined, every owner is released at exit.
@@ -352,47 +502,27 @@ out.join('|');
 }
 
 #[cfg(target_arch = "aarch64")]
-fn owners(engine: &mut Engine, name: &str) -> usize {
-    use crate::value::Value;
-    let env = engine.interp.global_env.clone();
-    match engine.interp.get_var(name, &env).ok().expect("binding") {
-        Value::Obj(object) => std::rc::Rc::strong_count(&object) - 1,
-        Value::Str(text) => text.strong_count() - 1,
-        _ => panic!("{name} is not an owner"),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
 fn settle(engine: &mut Engine, name: &str) {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let function = engine.interp.get_var(name, &env).ok().expect("function");
-    let object = function.as_obj().expect("object").borrow();
+    let function_handle = function.as_obj().expect("object");
+    let object = function_handle.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
-    let chunk = user
-        .func
-        .code
-        .get()
-        .and_then(Option::as_ref)
-        .expect("chunk");
+    let runtime = user.func.runtime();
+    let chunk = runtime.code.get().and_then(Option::as_ref).expect("chunk");
     assert!(chunk.jit.get().flatten().is_some(), "{name} runs natively");
     chunk.inline_attempted.set(true);
     chunk.inline_retry_at.set(0);
 }
 
-/// The shared finish stub scans every callee slot: a slot count of any residue, with an owner
-/// at any position (first or second word of a pair, the odd tail, beside negative Numbers
-/// that take the slow pair path), releases that owner exactly once.
+/// Callees with every slot count from 1 to 13 holding the owner `a` at the first, middle and
+/// last slot, each with a driver that calls it `n` times: the program (after `prelude`, which
+/// binds `token` and `text`) and the (callee, driver) names.
 #[cfg(target_arch = "aarch64")]
-#[test]
-fn direct_calls_release_slot_owners_exactly_once() {
-    let mut engine = Engine::new();
-    engine.set_tier(Tier::Jit);
-    engine.set_tier_threshold(0);
-    let mut source = String::from(
-        "var token={}, text='abc'+String(Math.random()), big=12345678901234567890n, sym=Symbol('s');\n",
-    );
+fn slot_owner_program(prelude: &str) -> (String, Vec<(String, String)>) {
+    let mut source = String::from(prelude);
     let mut names = Vec::new();
     for n in 1..=13usize {
         for position in [0, n / 2, n - 1] {
@@ -417,27 +547,34 @@ fn direct_calls_release_slot_owners_exactly_once() {
             names.push((name, driver));
         }
     }
-    evaluate(&mut engine, &source);
+    (source, names)
+}
+
+/// Owners carry no count and the finish stub releases nothing. Every slot shape runs
+/// through the direct sequence, also with a collection due at every poll (stress 1), and keeps
+/// its results; once the program drops `token`, no finished callee's record retains it.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn direct_calls_release_slot_owners_exactly_once() {
+    use super::rooting_tests::{assert_tracked_collectable, jit_engine, run};
+    let mut engine = jit_engine(0);
+    let (source, names) = slot_owner_program(
+        "var token=track({}), text='abc'+String(Math.random()), big=12345678901234567890n, sym=Symbol('s');\n",
+    );
+    run(&mut engine, &source);
     for (_, driver) in &names {
-        evaluate(&mut engine, &format!("{driver}(2);"));
+        run(&mut engine, &format!("{driver}(2);"));
     }
     for (name, driver) in &names {
         settle(&mut engine, name);
         settle(&mut engine, driver);
     }
-    let token = owners(&mut engine, "token");
-    let text = owners(&mut engine, "text");
-    // Another test may exhaust the process-wide call-cache epoch while this one runs, which
-    // sends calls through the checked helper for a moment; retry until the whole batch has
-    // gone through the direct sequence. Ownership must be exact after every round.
     let mut direct = false;
     for _ in 0..200 {
         super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
         for (_, driver) in &names {
-            assert_eq!(evaluate(&mut engine, &format!("{driver}(40);")), "0");
+            assert_eq!(run(&mut engine, &format!("{driver}(40);")), "0");
         }
-        assert_eq!(owners(&mut engine, "token"), token);
-        assert_eq!(owners(&mut engine, "text"), text);
         if super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) >= names.len() * 40 {
             direct = true;
             break;
@@ -447,4 +584,16 @@ fn direct_calls_release_slot_owners_exactly_once() {
         direct,
         "the callees must run through the direct-call sequence"
     );
+    super::take_poll_census();
+    engine.interp.gc_heap.core.borrow_mut().set_stress_every(1);
+    for (_, driver) in &names {
+        assert_eq!(run(&mut engine, &format!("{driver}(3);")), "0");
+    }
+    engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
+    assert!(
+        super::take_poll_census().collections.iter().sum::<u64>() > 0,
+        "generated code's polls collected"
+    );
+    assert_eq!(run(&mut engine, "token=null;text=null;0"), "0");
+    assert_tracked_collectable(&mut engine);
 }

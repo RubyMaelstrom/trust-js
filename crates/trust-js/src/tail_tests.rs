@@ -3,6 +3,7 @@
 //! spec.html:19922 (EvaluateCall), :26255 (tail positions), :26617 (PrepareForTailCall).
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
@@ -13,20 +14,20 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 }
 
 fn assert_compiled(engine: &mut Engine, name: &str, native: bool) {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine
         .interp
         .get_var(name, &env)
         .unwrap_or_else(|_| panic!("missing {name}"));
-    let crate::value::Value::Obj(object) = value else {
+    let ValueView::Obj(object) = (value).view() else {
         panic!("{name} is not an object")
     };
     let object = object.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
-    let chunk = user
-        .func
+    let runtime = user.func.runtime();
+    let chunk = runtime
         .code
         .get()
         .and_then(Option::as_ref)
@@ -65,7 +66,7 @@ fn engine(tier: Tier) -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(tier);
     engine.set_tier_threshold(0);
-    let global = engine.interp.global.clone();
+    let global = engine.interp.global;
     engine
         .interp
         .def_method(&global, "checkTailDepth", 0, bounded_depth);

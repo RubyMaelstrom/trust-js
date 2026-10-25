@@ -1,6 +1,7 @@
 //! ECMA-262 ScriptEvaluation, GlobalDeclarationInstantiation, StatementList/UpdateEmpty and
 //! TryStatement Evaluation. Local official snapshot e28783d5fc9dc12b3de905961e2c71410b38a202.
 
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn value(engine: &mut Engine, source: &str) -> String {
@@ -241,7 +242,7 @@ fn compiled_script_uses_global_environment_this_value_not_property_object() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
-        let wrapper = Object::new(Some(engine.interp.object_proto.clone()));
+        let wrapper = Object::new(Some(engine.interp.object_proto));
         wrapper
             .borrow_mut()
             .props
@@ -253,7 +254,7 @@ fn compiled_script_uses_global_environment_this_value_not_property_object() {
             .vars
             .get_mut("this")
             .unwrap()
-            .value = Value::Obj(wrapper);
+            .set_value(Value::Obj(wrapper));
         assert_eq!(value(&mut engine,
             "var actual=3;let get=()=>this;[this.marker,get()===this,this!==globalThis,globalThis.actual].join('|');"),
             "41|true|true|3");
@@ -263,7 +264,6 @@ fn compiled_script_uses_global_environment_this_value_not_property_object() {
 #[test]
 fn compiled_script_completion_owners_survive_finalizer_gc_and_are_released() {
     use crate::value::{Property, Value};
-    use std::rc::Rc;
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -279,24 +279,26 @@ fn compiled_script_completion_owners_survive_finalizer_gc_and_are_released() {
         let body = crate::parser::parse_script(
             "try {(function(){var result={n:42};result.self=result;return result;})();} finally {collect();}",
             false).ok().expect("GC script parses");
-        let result = engine
-            .interp
-            .run_program(&body)
-            .ok()
-            .expect("GC script completes");
-        let Value::Obj(object) = &result else {
-            panic!("completion lost on {tier:?}");
-        };
-        assert!(matches!(
-            object.borrow().props.get("n").unwrap().value(),
-            Value::Num(42.0)
-        ));
-        let weak = Rc::downgrade(object);
-        drop(result);
+        // The completion lives only in this helper frame (the collector scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let result = engine
+                .interp
+                .run_program(&body)
+                .ok()
+                .expect("GC script completes");
+            let ValueView::Obj(object) = &(result).view() else {
+                panic!("completion lost on {tier:?}");
+            };
+            assert!(matches!(
+                (object.borrow().props.get("n").unwrap().value()).view(),
+                ValueView::Num(42.0)
+            ));
+            crate::value::Gc::downgrade(object)
+        });
         drop(body);
         engine.interp.gc_collect();
         assert!(
-            weak.upgrade().is_none(),
+            !crate::gc_test::alive(&weak),
             "hidden Script completion retained on {tier:?}"
         );
     }
@@ -330,7 +332,6 @@ fn compiled_script_top_level_deadline_bypasses_author_handlers_and_recovers() {
 #[cfg(feature = "embed")]
 #[test]
 fn compiled_script_nested_host_entry_masks_outer_function_caller_and_restores_it() {
-    use crate::Value;
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -345,21 +346,15 @@ fn compiled_script_nested_host_entry_masks_outer_function_caller_and_restores_it
             match result {
                 Ok(Ok(value)) => Ok(value),
                 Ok(Err(crate::embed::EvalError::Throw(error))) => Err(error),
-                _ => Err(Value::lstr("nested Script failed".to_owned())),
+                _ => Err(ctx.str("nested Script failed")),
             }
         });
-        let root = engine.global_this();
-        let child = engine.ctx().create_embed_realm();
-        engine
-            .ctx()
-            .member_set(&root, "child", child.clone())
-            .ok()
-            .unwrap();
-        engine
-            .ctx()
-            .member_set(&child, "parent", root)
-            .ok()
-            .unwrap();
+        engine.scope(|cx| {
+            let root = cx.global_this();
+            let child = cx.create_embed_realm();
+            cx.member_set(&root, "child", child).ok().unwrap();
+            cx.member_set(&child, "parent", root).ok().unwrap();
+        });
         assert_eq!(
             value(
                 &mut engine,

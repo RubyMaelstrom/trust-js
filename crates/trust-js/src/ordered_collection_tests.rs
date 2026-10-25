@@ -231,44 +231,80 @@ fn ordered_collection_iterator_gc_edges_and_exhaustion_release() {
             false,
         )
         .unwrap();
-    let global = Value::Obj(engine.interp.global.clone());
-    let value = engine
-        .interp
-        .member_get(&global, "collection")
-        .unwrap_or_else(|_| panic!("collection lookup"));
-    let weak = engine.interp.downgrade_object_value(&value).unwrap();
-    drop(value);
+    // Strong handles live only in this helper frame (the collector scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let global = Value::Obj(engine.interp.global);
+        let value = engine
+            .interp
+            .member_get(&global, "collection")
+            .unwrap_or_else(|_| panic!("collection lookup"));
+        engine.interp.downgrade_object_value(&value).unwrap()
+    });
     engine.eval("collection = null", false).unwrap();
     engine.interp.gc_collect();
-    assert!(weak.upgrade().is_some(), "live iterator retains collection");
+    assert!(
+        crate::gc_test::alive(&weak),
+        "live iterator retains collection"
+    );
     engine
         .eval("iterator.next(); iterator.next();", false)
         .unwrap();
     engine.interp.gc_collect();
     assert!(
-        weak.upgrade().is_none(),
+        !crate::gc_test::alive(&weak),
         "completed iterator releases collection"
     );
-    assert_eq!(engine.interp.collection_iterators.len(), 1);
-    engine.eval("iterator = null", false).unwrap();
-    engine.interp.gc_collect();
-    assert!(engine.interp.collection_iterators.is_empty());
+    // An exhausted iterator keeps its brand: a Set iterator's next still rejects it.
+    assert!(matches!(
+        engine
+            .eval(
+                "var setNext = new Set().values().next, done = iterator.next().done, threw = false;
+                 try { setNext.call(iterator); } catch (e) { threw = e instanceof TypeError; }
+                 done && threw",
+                false,
+            )
+            .unwrap(),
+        crate::Completion::Value(ref value) if value == "true"
+    ));
 }
 
 #[test]
 fn ordered_collection_iterator_cycle_is_collectable() {
     let mut engine = Engine::new();
     engine.eval("var collection = new Map(); var iterator = collection.values(); collection.set(iterator, iterator);", false).unwrap();
-    let global = Value::Obj(engine.interp.global.clone());
-    let value = engine
-        .interp
-        .member_get(&global, "collection")
-        .unwrap_or_else(|_| panic!("collection lookup"));
-    let weak = engine.interp.downgrade_object_value(&value).unwrap();
-    drop(value);
+    // Strong handles live only in this helper frame (the collector scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let global = Value::Obj(engine.interp.global);
+        let value = engine
+            .interp
+            .member_get(&global, "collection")
+            .unwrap_or_else(|_| panic!("collection lookup"));
+        engine.interp.downgrade_object_value(&value).unwrap()
+    });
     engine.eval("collection = iterator = null", false).unwrap();
     engine.interp.gc_collect();
-    assert!(weak.upgrade().is_none());
-    assert!(engine.interp.map_data.is_empty());
-    assert!(engine.interp.collection_iterators.is_empty());
+    assert!(!crate::gc_test::alive(&weak));
+}
+
+/// A super() call's native result hands its [[MapData]]/[[SetData]] to `this`. A result holding
+/// neither keeps its own exotic state, and nothing moves.
+#[test]
+fn move_collection_moves_only_map_and_set_data() {
+    use crate::ordered_collection::{CollectionKind, OrderedCollection};
+    use crate::value::{Exotic, Object};
+    let mut engine = Engine::new();
+    let interp = &mut engine.interp;
+    let array = Object::new(None);
+    array.borrow_mut().exotic = Exotic::Array;
+    let to = Object::new(None);
+    assert!(!interp.move_collection(&array, &to));
+    assert!(matches!(array.borrow().exotic, Exotic::Array));
+    assert!(matches!(to.borrow().exotic, Exotic::None));
+    let map = Object::new(None);
+    interp.set_collection(&map, OrderedCollection::new(CollectionKind::Map));
+    assert!(interp.move_collection(&map, &to));
+    assert!(matches!(map.borrow().exotic, Exotic::None));
+    assert!(interp
+        .collection(&to)
+        .is_some_and(|data| data.kind() == CollectionKind::Map));
 }

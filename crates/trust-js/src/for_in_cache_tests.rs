@@ -1,6 +1,7 @@
 //! EnumerateObjectProperties / CreateForInIterator, official ECMA-262 local snapshot
 //! e28783d5fc9dc12b3de905961e2c71410b38a202. Candidate storage is unobservable; live
 //! deletion, key order, shadowing and each activation's independent cursor are not.
+use crate::value::ValueView;
 use crate::value::{heap_allocated_objects, Object, Property, Value};
 use crate::{bytecode::Tier, Completion, Engine};
 use std::rc::Rc;
@@ -20,41 +21,20 @@ fn backing(engine: &mut Engine, source: &Value) -> Value {
     engine.interp.for_in_keys(source).ok().unwrap().into_value()
 }
 
+/// The engine value of `source` (unbranded: the crate's own form).
 #[cfg(feature = "embed")]
 fn owned_value(engine: &mut Engine, source: &str) -> Value {
-    engine
-        .eval_value(source)
-        .expect("parse")
-        .ok()
-        .expect("evaluate")
+    engine.scope(|cx| {
+        cx.eval_value(source)
+            .expect("parse")
+            .unwrap_or_else(|_| panic!("evaluate"))
+            .into_internal()
+    })
 }
 
-#[test]
-#[cfg(feature = "embed")]
-fn for_in_cache_distinguishes_foreign_heaps_and_mixed_prototypes() {
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-        let mut first = Engine::new();
-        let mut second = Engine::new();
-        let a = owned_value(&mut first, "({alpha:1})");
-        let b = owned_value(&mut second, "({beta:2})");
-        assert_ne!(
-            a.as_obj().unwrap().borrow().props.shape(),
-            b.as_obj().unwrap().borrow().props.shape(),
-            "foreign key sequences must have distinct global identities"
-        );
-        let mut reader = Engine::new();
-        reader.set_tier(tier);
-        reader.set_tier_threshold(0);
-        let global = reader.global_this();
-        assert!(reader.ctx().set_member_key(&global, "first", a).is_ok());
-        assert!(reader.ctx().set_member_key(&global, "second", b).is_ok());
-        assert_eq!(run(&mut reader, "function keys(o){var out='';for(var k in o)out+=k+',';return out;}keys(first)+'|'+keys(second)+'|'+keys(first)"),
-            "alpha,|beta,|alpha,", "{tier:?}");
-        assert_eq!(run(&mut reader, "var a=Object.create(first),b=Object.create(second);a.own=1;b.own=2;keys(a)+'|'+keys(b)+'|'+keys(a)"),
-            "own,alpha,|own,beta,|own,alpha,", "{tier:?}");
-    }
-}
-
+/// An internal test (S6 step 11b): no embedder can give one Engine's object to another (scoped
+/// values are branded by their scope, and handles are checked), so the foreign mutation is made
+/// through the other engine's interpreter directly.
 #[test]
 #[cfg(feature = "embed")]
 fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
@@ -63,8 +43,9 @@ fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
     let same_heap = owned_value(&mut owner, "({alpha:1,gamma:2})");
     let mut foreign = Engine::new();
     let _foreign_shape = owned_value(&mut foreign, "({beta:1})");
+    foreign.interp.activate_gc_heap();
     assert!(foreign
-        .ctx()
+        .interp
         .set_member_key(&original, "delta", Value::Num(3.0))
         .is_ok());
     assert_ne!(
@@ -82,7 +63,7 @@ fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
         (key_at(&second, 0), key_at(&second, 1)),
         ("alpha".into(), "delta".into())
     );
-    foreign.ctx();
+    foreign.interp.activate_gc_heap();
     original
         .as_obj()
         .unwrap()
@@ -113,43 +94,53 @@ fn predicted_object(layout: &crate::value::PropertyLayout, count: usize) -> Valu
 #[test]
 fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
     let mut engine = Engine::new();
-    let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
-    let weak_layout = Rc::downgrade(&layout);
-    let a = predicted_object(&layout, 1);
-    let b = predicted_object(&layout, 2);
-    let weak_a = Rc::downgrade(a.as_obj().unwrap());
-    let first = backing(&mut engine, &a);
-    let second = backing(&mut engine, &b);
-    assert_eq!(key_at(&first, 0), "a");
-    assert_eq!(key_at(&second, 1), "b");
+    // Receivers live only in this helper frame (the collector scans the stack).
+    let (weak_layout, weak_a, first, second) = crate::gc_test::in_frame(|| {
+        let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
+        let weak_layout = crate::gc_handle::WeakRef::to(layout.as_ptr() as usize);
+        let a = predicted_object(&layout, 1);
+        let b = predicted_object(&layout, 2);
+        let weak_a = crate::value::Gc::downgrade(&a.as_obj().unwrap());
+        let first = backing(&mut engine, &a);
+        let second = backing(&mut engine, &b);
+        assert_eq!(key_at(&first, 0), "a");
+        assert_eq!(key_at(&second, 1), "b");
+        assert!(
+            !crate::value::Gc::ptr_eq(&first.as_obj().unwrap(), &second.as_obj().unwrap()),
+            "live prefix participates in proof"
+        );
+        let identity = layout.as_ptr();
+        for _ in 0..10 {
+            backing(&mut engine, &a);
+            backing(&mut engine, &b); // leave stale recency entries for both pinned layouts.
+        }
+        assert_eq!(
+            layout.as_ptr(),
+            identity,
+            "recency updates preserve the live layout identity"
+        );
+        (weak_layout, weak_a, first, second)
+    });
+    // A minor also traces the Rust cache's newly published layout pins.
+    engine.interp.gc_collect_minor();
+    assert!(crate::gc_test::alive(&weak_layout));
+    // A collection reclaims the dropped receivers.
+    engine.interp.gc_collect();
     assert!(
-        !Rc::ptr_eq(first.as_obj().unwrap(), second.as_obj().unwrap()),
-        "live prefix participates in proof"
+        !crate::gc_test::alive(&weak_a),
+        "cache does not root receiver"
     );
-    let references = Rc::strong_count(&layout);
-    for _ in 0..10 {
-        backing(&mut engine, &a);
-        backing(&mut engine, &b); // leave stale recency entries for both pinned layouts.
-    }
-    assert_eq!(
-        Rc::strong_count(&layout),
-        references,
-        "recency keys must not retain layout pins"
-    );
-    drop(a);
-    drop(b);
-    drop(layout);
-    assert!(weak_a.upgrade().is_none(), "cache does not root receiver");
     assert!(
-        weak_layout.upgrade().is_some(),
+        crate::gc_test::alive(&weak_layout),
         "live cache entries own layout proof"
     );
     for index in 0..400 {
         let layout = crate::value::new_property_layout(vec![Rc::from(format!("fresh{index}"))]);
         backing(&mut engine, &predicted_object(&layout, 1));
     }
+    engine.interp.gc_collect();
     assert!(
-        weak_layout.upgrade().is_none(),
+        !crate::gc_test::alive(&weak_layout),
         "stale recency records must not own evicted layouts"
     );
     engine.interp.gc_collect();
@@ -184,11 +175,11 @@ fn for_in_cache_accounts_unused_predictions_and_detaches_on_mutation() {
     let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
     let source = predicted_object(&layout, 2);
     let original = backing(&mut engine, &source);
-    let old_layout = Rc::downgrade(&layout);
+    let old_layout = crate::gc_handle::WeakRef::to(layout.as_ptr() as usize);
     drop(layout);
     source.as_obj().unwrap().borrow_mut().props.remove("a");
     assert!(
-        old_layout.upgrade().is_some(),
+        crate::gc_test::alive(&old_layout),
         "cache pins immutable pre-mutation allocation"
     );
     assert_eq!(key_at(&original, 0), "a");
@@ -196,16 +187,17 @@ fn for_in_cache_accounts_unused_predictions_and_detaches_on_mutation() {
 }
 
 fn key_at(backing: &Value, index: u32) -> String {
-    match backing
+    match (backing
         .as_obj()
         .unwrap()
         .borrow()
         .props
         .get_index(index)
         .unwrap()
-        .value()
+        .value())
+    .view()
     {
-        Value::Str(key) => key.to_string(),
+        ValueView::Str(key) => key.to_string(),
         _ => panic!("candidate must be a string"),
     }
 }
@@ -214,39 +206,47 @@ fn key_at(backing: &Value, index: u32) -> String {
 fn for_in_backing_hits_share_identity_without_retaining_author_objects() {
     let mut engine = Engine::new();
     engine.interp.activate_gc_heap();
-    let prototype = Object::new(None);
-    prototype
-        .borrow_mut()
-        .props
-        .insert("inherited", Property::plain(Value::Num(1.0)));
-    let object = Object::new(Some(prototype.clone()));
-    object
-        .borrow_mut()
-        .props
-        .insert("own", Property::plain(Value::Num(2.0)));
-    let weak_object = Rc::downgrade(&object);
-    let weak_proto = Rc::downgrade(&prototype);
-    let source = Value::Obj(object);
-    let keys = backing(&mut engine, &source);
-    let allocated = heap_allocated_objects(&engine.interp.gc_heap);
-    for _ in 0..1000 {
-        let next = backing(&mut engine, &source);
-        assert!(Rc::ptr_eq(keys.as_obj().unwrap(), next.as_obj().unwrap()));
-    }
-    assert_eq!(heap_allocated_objects(&engine.interp.gc_heap), allocated);
-    {
-        let object = keys.as_obj().unwrap().borrow();
-        assert!(object.proto.is_none());
-        assert!(!object.extensible);
-        for index in 0..2 {
-            let property = object.props.get_index(index).unwrap();
-            assert!(!property.writable() && !property.configurable());
+    // Sources live only in this helper frame (the collector scans the stack).
+    let (weak_object, weak_proto, keys) = crate::gc_test::in_frame(|| {
+        let prototype = Object::new(None);
+        prototype
+            .borrow_mut()
+            .props
+            .insert("inherited", Property::plain(Value::Num(1.0)));
+        let object = Object::new(Some(prototype));
+        object
+            .borrow_mut()
+            .props
+            .insert("own", Property::plain(Value::Num(2.0)));
+        let weak_object = crate::value::Gc::downgrade(&object);
+        let weak_proto = crate::value::Gc::downgrade(&prototype);
+        let source = Value::Obj(object);
+        let keys = backing(&mut engine, &source);
+        let allocated = heap_allocated_objects(&engine.interp.gc_heap);
+        for _ in 0..1000 {
+            let next = backing(&mut engine, &source);
+            assert!(crate::value::Gc::ptr_eq(
+                &keys.as_obj().unwrap(),
+                &next.as_obj().unwrap()
+            ));
         }
-    }
-    drop(source);
-    drop(prototype);
-    assert!(weak_object.upgrade().is_none());
-    assert!(weak_proto.upgrade().is_none());
+        assert_eq!(heap_allocated_objects(&engine.interp.gc_heap), allocated);
+        {
+            let object_handle = keys.as_obj().unwrap();
+            let object = object_handle.borrow();
+            assert!(object.proto.is_none());
+            assert!(!object.extensible);
+            for index in 0..2 {
+                let property = object.props.get_index(index).unwrap();
+                assert!(!property.writable() && !property.configurable());
+            }
+        }
+        (weak_object, weak_proto, keys)
+    });
+    // A collection reclaims the dropped sources.
+    engine.interp.gc_collect();
+    assert!(!crate::gc_test::alive(&weak_object));
+    assert!(!crate::gc_test::alive(&weak_proto));
     engine.interp.gc_collect();
     assert_eq!(key_at(&keys, 0), "own");
 }

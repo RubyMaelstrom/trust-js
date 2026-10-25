@@ -4,6 +4,7 @@
 //! algorithm, never reject a valid program or reuse an unrelated descriptor location.
 use super::*;
 use crate::bytecode::{IcState, Tier, IC_EMPTY, PROP_IC_WAYS};
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 use std::cell::Cell;
 
@@ -15,13 +16,13 @@ fn run(engine: &mut Engine, source: &str) -> String {
 }
 
 fn object(engine: &mut Engine, name: &str) -> Gc {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let value = engine
         .interp
         .get_var(name, &env)
         .ok()
         .expect("fixture object");
-    value.as_obj().expect("object").clone()
+    value.as_obj().expect("object")
 }
 
 fn unknown(object: &Gc) {
@@ -54,20 +55,24 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
     let i = &mut engine.interp;
     for _ in 0..4 {
         assert!(matches!(
-            i.get_prop_keyed(&Value::Obj(first.clone()), "alpha", &cache[0]),
-            Ok(Value::Num(7.0))
+            (i.get_prop_keyed(&Value::Obj(first), "alpha", &cache[0]))
+                .map(|__value| (__value).view()),
+            Ok(ValueView::Num(7.0))
         ));
         assert!(matches!(
-            i.get_prop_keyed(&Value::Obj(second.clone()), "alpha", &cache[0]),
-            Ok(Value::Undefined)
+            (i.get_prop_keyed(&Value::Obj(second), "alpha", &cache[0]))
+                .map(|__value| (__value).view()),
+            Ok(ValueView::Undefined)
         ));
         assert!(matches!(
-            i.get_computed_property(&Value::Obj(first.clone()), &computed),
-            Ok(Value::Num(7.0))
+            (i.get_computed_property(&Value::Obj(first), &computed))
+                .map(|__value| (__value).view()),
+            Ok(ValueView::Num(7.0))
         ));
         assert!(matches!(
-            i.get_computed_property(&Value::Obj(second.clone()), &computed),
-            Ok(Value::Undefined)
+            (i.get_computed_property(&Value::Obj(second), &computed))
+                .map(|__value| (__value).view()),
+            Ok(ValueView::Undefined)
         ));
     }
     assert!(cache.iter().all(|way| way.get().depth == IC_EMPTY));
@@ -80,16 +85,16 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
     assert!(i.try_ic_set(&second, &key, &Value::Num(13.0), &cache[0]));
     assert!(cache.iter().all(|way| way.get().depth == IC_EMPTY));
     assert!(matches!(
-        first.borrow().props.get("alpha").unwrap().value(),
-        Value::Num(11.0)
+        (first.borrow().props.get("alpha").unwrap().value()).view(),
+        ValueView::Num(11.0)
     ));
     assert!(matches!(
-        second.borrow().props.get("alpha").unwrap().value(),
-        Value::Num(13.0)
+        (second.borrow().props.get("alpha").unwrap().value()).view(),
+        ValueView::Num(13.0)
     ));
     assert!(matches!(
-        second.borrow().props.get("beta").unwrap().value(),
-        Value::Num(9.0)
+        (second.borrow().props.get("beta").unwrap().value()).view(),
+        ValueView::Num(9.0)
     ));
 }
 
@@ -146,7 +151,7 @@ fn uncacheable_shapes_preserve_direct_and_deep_global_names_all_tiers() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         run(&mut engine, "function deep(){let captured=0;return function(){return sentinelValue+captured;};}var load=deep();");
-        let global = engine.interp.global.clone();
+        let global = engine.interp.global;
         global
             .borrow_mut()
             .props
@@ -197,20 +202,21 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
         engine
             .interp
             .construct_ics
-            .remove(&(Rc::as_ptr(&ctor) as usize));
+            .remove(&(Gc::as_ptr(&ctor) as usize));
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
-        let global_env = Rc::as_ptr(&engine.interp.global_env) as usize;
+        let global_env = Env::as_ptr(&engine.interp.global_env) as usize;
         assert!(engine
             .interp
-            .construct_ic_fill(&ctor, Rc::as_ptr(&ctor) as usize, epoch, global_env)
+            .construct_ic_fill(&ctor, Gc::as_ptr(&ctor) as usize, epoch, global_env)
             .is_none());
         let cache = Cell::new(IcState::EMPTY);
         let old = object(&mut engine, "old");
         assert!(matches!(
-            engine
+            (engine
                 .interp
-                .instanceof_ic(&Value::Obj(old), &Value::Obj(ctor.clone()), &cache),
-            Ok(Value::Bool(true))
+                .instanceof_ic(&Value::Obj(old), &Value::Obj(ctor), &cache))
+            .map(|__value| (__value).view()),
+            Ok(ValueView::Bool(true))
         ));
         assert_eq!(cache.get().depth, IC_EMPTY);
         assert_eq!(
@@ -224,7 +230,7 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
         assert!(!engine
             .interp
             .construct_ics
-            .contains_key(&(Rc::as_ptr(&ctor) as usize)));
+            .contains_key(&(Gc::as_ptr(&ctor) as usize)));
         run(
             &mut engine,
             "function makeAfter(x){return new C(x);}for(var j=0;j<160;j++)makeAfter(j);",
@@ -249,10 +255,11 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
         );
         let fresh = object(&mut engine, "fresh");
         assert!(matches!(
-            engine
+            (engine
                 .interp
-                .instanceof_ic(&Value::Obj(fresh), &Value::Obj(ctor.clone()), &cache),
-            Ok(Value::Bool(true))
+                .instanceof_ic(&Value::Obj(fresh), &Value::Obj(ctor), &cache))
+            .map(|__value| (__value).view()),
+            Ok(ValueView::Bool(true))
         ));
         assert_eq!(run(&mut engine, "C.prototype={tag:7};var fresh=make(6);fresh.x+'|'+fresh.tag+'|'+(fresh instanceof C)+'|'+(old instanceof C)"), "6|7|true|false", "{tier:?}");
     }
@@ -265,7 +272,7 @@ fn uncacheable_shapes_keep_regexp_dependencies_live_without_publishing_slots() {
         &engine.interp
     ));
     let before = engine.interp.regexp_dependency_cache.get().shape;
-    let proto = engine.interp.extra_protos.get("RegExp").unwrap().clone();
+    let proto = *engine.interp.extra_protos.get("RegExp").unwrap();
     unknown(&proto);
     assert!(crate::builtins::regexp_dependencies_canonical(
         &engine.interp

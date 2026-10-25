@@ -4,6 +4,7 @@
 //! rounding or Rust's private `RcBox`/`HashMap` layouts. Every partial category says so in the
 //! emitted record; unavailable owners are never represented by a misleading zero.
 
+use crate::value::ValueView;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
@@ -256,6 +257,14 @@ pub(crate) struct Snapshot {
     shared_array_buffer_backing: SharedBackingCategory,
     wasm_backing: WasmBackingCategory,
     host_resources: HostCategory,
+    /// The heap's live rooted handles, strong and weak (S6 step 11a): a leaked handle keeps
+    /// its value, and what the value reaches, alive.
+    handles: (usize, usize),
+}
+
+/// The `handles` member of the record: the live rooted handles, strong and weak.
+fn handles_json((strong, weak): (usize, usize)) -> String {
+    format!("{{\"strong\":{strong},\"weak\":{weak}}}")
 }
 
 impl Snapshot {
@@ -365,6 +374,7 @@ impl Snapshot {
                 "\"safepoint\":\"post_gc\",\"complete\":{},",
                 "\"managed_requested_bytes\":{},",
                 "\"managed_external_bytes\":{},",
+                "\"handles\":{},",
                 "\"categories\":{{",
                 "\"object_bodies\":{},\"property_storage\":{},",
                 "\"scope_bodies\":{},\"scope_storage\":{},",
@@ -382,6 +392,7 @@ impl Snapshot {
             self.complete(),
             managed_requested.json(),
             managed_external.json(),
+            handles_json(self.handles),
             self.object_bodies.json(),
             self.property_storage.json(),
             self.scope_bodies.json(),
@@ -409,6 +420,8 @@ pub(crate) struct Visitor {
     fragment_source_only: bool,
     loop_site_tokens: HashSet<usize>,
     gc_heaps: HashSet<usize>,
+    agent_routes: HashSet<usize>,
+    heap_ids: HashSet<u64>,
     lstrs: HashSet<usize>,
     rc_strs: HashSet<usize>,
     property_layouts: HashSet<usize>,
@@ -423,6 +436,7 @@ pub(crate) struct Visitor {
     native_managed_identity_conflict: bool,
     host_managed_allocations: HashMap<(&'static str, usize), usize>,
     functions: HashSet<usize>,
+    function_runtimes: HashSet<usize>,
     classes: HashSet<usize>,
     chunks: HashSet<usize>,
     inline_site_allocations: HashSet<usize>,
@@ -499,6 +513,7 @@ impl Visitor {
         if !self.gc_heaps.insert(identity) {
             return (0, true);
         }
+        self.heap_ids.insert(crate::value::heap_id(heap));
         crate::value::scan_gc_heap_retained_memory(heap, self)
     }
 
@@ -515,6 +530,15 @@ impl Visitor {
     }
 
     pub(crate) fn bigint(&mut self, value: &crate::bigint::JsBigInt) {
+        if self.bigints.insert(value.allocation_identity()) {
+            self.strings_symbols_bigints = self
+                .strings_symbols_bigints
+                .saturating_add(value.retained_requested_bytes());
+        }
+    }
+
+    /// A BigInt literal's digits, held by source code.
+    pub(crate) fn bigint_literal(&mut self, value: &crate::bigint::BigIntLiteral) {
         if self.bigints.insert(value.allocation_identity()) {
             self.strings_symbols_bigints = self
                 .strings_symbols_bigints
@@ -541,8 +565,8 @@ impl Visitor {
         }
     }
 
-    pub(crate) fn symbol(&mut self, value: &Rc<SymbolData>) {
-        let identity = Rc::as_ptr(value) as usize;
+    pub(crate) fn symbol(&mut self, value: &crate::value::SymbolRef) {
+        let identity = crate::value::symbol_identity(value);
         if self.symbols.insert(identity) {
             self.strings_symbols_bigints = self
                 .strings_symbols_bigints
@@ -560,27 +584,31 @@ impl Visitor {
     }
 
     pub(crate) fn value(&mut self, value: &Value) {
-        match value {
-            Value::BigInt(value) => {
+        match &(value).view() {
+            ValueView::BigInt(value) => {
                 self.bigint(value);
             }
-            Value::Str(value) => {
+            ValueView::Str(value) => {
                 self.lstr(value);
             }
-            Value::Sym(value) => self.symbol(value),
-            Value::Undefined
-            | Value::Empty
-            | Value::Null
-            | Value::Bool(_)
-            | Value::Num(_)
-            | Value::Obj(_) => {}
+            ValueView::Sym(value) => self.symbol(value),
+            ValueView::Undefined
+            | ValueView::Empty
+            | ValueView::Null
+            | ValueView::Bool(_)
+            | ValueView::Num(_)
+            | ValueView::Obj(_) => {}
         }
     }
 
     fn callable(&mut self, callable: &Callable) {
         match callable {
             Callable::None | Callable::Native(_) => {}
+            #[cfg(feature = "embed")]
+            Callable::ScopedNative(_) => {}
             Callable::NativeData(value) => {
+                // The shared Rc inside the object's payload cell.
+                let value: &Rc<crate::value::NativeCallable> = value;
                 let identity = Rc::as_ptr(value) as usize;
                 let first = self.callable_allocations.insert(identity);
                 if first {
@@ -590,25 +618,48 @@ impl Visitor {
                 }
                 // Keep the immutable registration label in the canonical string family.
                 self.rc_str(&value.identity);
-                let crate::value::NativeCallableBody::Opaque(function) = &value.body else {
-                    if let crate::value::NativeCallableBody::Captured { captures, .. } = &value.body
-                    {
-                        if first {
-                            self.callable_metadata = self
-                                .callable_metadata
-                                .saturating_add(size_of_val(captures.as_ref()));
-                        }
-                        for capture in captures {
-                            self.value(capture);
-                        }
+                // A closure's Rust state: its allocation, and what its reporter describes (an
+                // unreported closure leaves the record a lower bound).
+                let closure: Option<(usize, usize)> = match &value.body {
+                    crate::value::NativeCallableBody::Opaque(function) => Some((
+                        Rc::as_ptr(function) as *const () as usize,
+                        size_of_val(function.as_ref()),
+                    )),
+                    crate::value::NativeCallableBody::Captured { .. } => None,
+                    #[cfg(feature = "embed")]
+                    crate::value::NativeCallableBody::ScopedCaptured { .. } => None,
+                    crate::value::NativeCallableBody::CapturedClosure { function, .. } => Some((
+                        Rc::as_ptr(function) as *const () as usize,
+                        size_of_val(function.as_ref()),
+                    )),
+                };
+                // Engine-owned captures.
+                let captures = match &value.body {
+                    crate::value::NativeCallableBody::Captured { captures, .. }
+                    | crate::value::NativeCallableBody::CapturedClosure { captures, .. } => {
+                        Some(captures)
                     }
+                    #[cfg(feature = "embed")]
+                    crate::value::NativeCallableBody::ScopedCaptured { captures, .. } => {
+                        Some(captures)
+                    }
+                    crate::value::NativeCallableBody::Opaque(_) => None,
+                };
+                if let Some(captures) = captures {
+                    if first {
+                        self.callable_metadata = self
+                            .callable_metadata
+                            .saturating_add(size_of_val(captures.as_ref()));
+                    }
+                    for capture in captures {
+                        self.value(capture);
+                    }
+                }
+                let Some((closure_identity, closure_bytes)) = closure else {
                     return;
                 };
-                let closure_identity = Rc::as_ptr(function) as *const () as usize;
                 if self.native_closure_allocations.insert(closure_identity) {
-                    self.callable_metadata = self
-                        .callable_metadata
-                        .saturating_add(size_of_val(function.as_ref()));
+                    self.callable_metadata = self.callable_metadata.saturating_add(closure_bytes);
                 }
                 if let Some(reporter) = &value.retained {
                     self.reported_native_closures.insert(closure_identity);
@@ -624,34 +675,57 @@ impl Visitor {
                 }
             }
             Callable::User(value) => {
-                let identity = Rc::as_ptr(value) as usize;
+                let identity = crate::value::user_fn_ptr(value) as usize;
                 if self.callable_allocations.insert(identity) {
                     self.callable_metadata = self
                         .callable_metadata
                         .saturating_add(size_of_val(value.as_ref()));
-                    if let Some(cache) = value.binding_getter_cache.take() {
+                    if let Some(sidecar) = value.cache.take() {
                         self.callable_metadata = self
                             .callable_metadata
-                            .saturating_add(cache.retained_requested_storage_bytes());
-                        self.rc_str(&cache.name);
-                        value.binding_getter_cache.set(Some(cache));
+                            .saturating_add(size_of::<crate::value::UserCallableCache>());
+                        if let Some(runtime) = &sidecar.runtime {
+                            self.function_runtime(runtime, true);
+                        }
+                        if let Some(origin) = &sidecar.origin {
+                            if let Some(source) = &origin.source {
+                                self.script_source(source);
+                            }
+                            if let Some(referrer) = &origin.referrer {
+                                self.rc_str(referrer);
+                            }
+                        }
+                        if let Some(cache) = &sidecar.binding_getter {
+                            self.callable_metadata = self.callable_metadata.saturating_add(
+                                cache
+                                    .retained_requested_storage_bytes()
+                                    .saturating_sub(size_of_val(cache)),
+                            );
+                            self.rc_str(&cache.name);
+                        }
+                        value.cache.set(Some(sidecar));
                     }
                 }
                 self.function(&value.func);
             }
             Callable::Bound(value) => {
-                // Box-backed variants have one allocation per containing Object, and the object
-                // snapshot is identity-unique, so they need no shared-allocation identity set.
-                self.callable_metadata = self
-                    .callable_metadata
-                    .saturating_add(size_of_val(value.as_ref()))
-                    .saturating_add(value.args.capacity().saturating_mul(size_of::<Value>()));
+                // A shared payload cell: a constructor's result can share its function's (see
+                // `gc_storage::SharedPayload`), so count each cell once.
+                let identity = value.as_ref() as *const crate::value::BoundCallable as usize;
+                if self.callable_allocations.insert(identity) {
+                    self.callable_metadata = self
+                        .callable_metadata
+                        .saturating_add(size_of_val(value.as_ref()))
+                        .saturating_add(value.args.capacity().saturating_mul(size_of::<Value>()));
+                }
                 self.value(&value.this);
                 for argument in &value.args {
                     self.value(argument);
                 }
             }
             Callable::WrappedShadow(value) => {
+                // The shared Rc inside the object's payload cell.
+                let value: &Rc<crate::value::WrappedShadowCallable> = value;
                 let identity = Rc::as_ptr(value) as usize;
                 if self.callable_allocations.insert(identity) {
                     self.callable_metadata = self
@@ -665,8 +739,7 @@ impl Visitor {
                 // See Bound above: this Box cannot be shared between object holders.
                 self.callable_metadata = self
                     .callable_metadata
-                    .saturating_add(size_of_val(value.as_ref()))
-                    .saturating_add(size_of::<Value>());
+                    .saturating_add(size_of_val(value.as_ref()));
                 self.value(&value.target);
             }
             Callable::AccessorGet(name)
@@ -760,6 +833,14 @@ impl Visitor {
         self.regexp_backref_groups.insert(identity)
     }
 
+    fn agent_route(&mut self, route: &Rc<crate::agent_control::Route>) -> usize {
+        if !self.agent_routes.insert(Rc::as_ptr(route) as usize) {
+            return 0;
+        }
+        size_of::<crate::agent_control::Route>()
+            .saturating_add(route.owners.len().saturating_mul(size_of::<Gc>()))
+    }
+
     fn array_buffer(&mut self, buffer: &crate::interpreter::ArrayBufferBytes) {
         let identity = Rc::as_ptr(buffer) as usize;
         self.array_buffers
@@ -846,21 +927,9 @@ impl Visitor {
                 }
             }
         }
-        if let Some(chunk) = function.code.get().and_then(Option::as_ref) {
-            self.chunk(chunk);
-        }
-        if let Some(chunk) = function.code2.get().and_then(Option::as_ref) {
-            self.chunk(chunk);
-        }
-        if let Some(maps) = function.fn_maps.get() {
-            self.props(&maps.function);
-            if let Some(prototype_map) = &maps.prototype {
-                self.props(prototype_map);
-            }
-            if let Some((name, named)) = &*maps.named.borrow() {
-                bytes = bytes.saturating_add(name.len());
-                self.props(named);
-            }
+        if let Some(cache) = function.runtime.get() {
+            bytes = bytes.saturating_add(cache.retained_bytes());
+            cache.for_each(|runtime, allocated| self.function_runtime(runtime, allocated));
         }
         if let Some(layouts) = function.env_layouts.get() {
             bytes = bytes.saturating_add(size_of::<
@@ -871,6 +940,53 @@ impl Visitor {
             }
         }
         self.add_function_bytecode_bytes(bytes);
+    }
+
+    fn function_runtime(
+        &mut self,
+        runtime: &crate::function_runtime::FunctionRuntime,
+        allocated: bool,
+    ) {
+        if !self
+            .function_runtimes
+            .insert(std::ptr::from_ref(runtime) as usize)
+        {
+            return;
+        }
+        if allocated {
+            self.add_function_bytecode_bytes(size_of_val(runtime));
+        }
+        // Check only Rust metadata before following a runtime that may outlive its heap.
+        if let Some(chunk) = runtime.code.get().and_then(Option::as_ref) {
+            self.chunk(chunk);
+        }
+        if let Some(chunk) = runtime.code2.get().and_then(Option::as_ref) {
+            self.chunk(chunk);
+        }
+        if let Some(maps) = runtime.fn_maps.get() {
+            self.add_function_bytecode_bytes(size_of::<crate::ast::FunctionMaps>());
+            let cells_live = self.includes_heap(&runtime.heap);
+            if cells_live {
+                self.props(&maps.function);
+            } else {
+                self.retired_props(&maps.function);
+            }
+            if let Some(prototype_map) = &maps.prototype {
+                if cells_live {
+                    self.props(prototype_map);
+                } else {
+                    self.retired_props(prototype_map);
+                }
+            }
+            if let Some((name, named)) = &*maps.named.borrow() {
+                self.rc_str(name);
+                if cells_live {
+                    self.props(named);
+                } else {
+                    self.retired_props(named);
+                }
+            }
+        }
     }
 
     pub(crate) fn binding_layout(&mut self, layout: &Rc<crate::interpreter::BindingLayout>) {
@@ -940,12 +1056,24 @@ impl Visitor {
         }
     }
 
+    pub(crate) fn includes_heap(&self, heap: &crate::value::HeapLifetime) -> bool {
+        heap.is_alive() && (self.heap_ids.is_empty() || self.heap_ids.contains(&heap.id))
+    }
+
+    /// A dead/foreign template still owns Rust buffers; its cell-backed layouts and values
+    /// cannot be followed. This method reads only the Props' inline Rust storage metadata.
+    pub(crate) fn retired_props(&mut self, props: &crate::value::Props) {
+        let (bytes, exact) = props.retained_requested_storage_bytes();
+        self.detached_property_storage = self.detached_property_storage.saturating_add(bytes);
+        self.detached_property_storage_opaque |= !exact;
+    }
+
     pub(crate) fn property_layout(&mut self, layout: &crate::value::PropertyLayout) {
-        if self.property_layouts.insert(Rc::as_ptr(layout) as usize) {
-            // Requested payload, like the other Rc-backed categories: one layout body and key
-            // buffer per shared layout, not private allocator/refcount headers or one copy per
-            // instance. The optional standard HashMap has a known entry-capacity lower bound;
-            // Rust does not expose its exact bucket allocation.
+        if self.property_layouts.insert(layout.as_ptr() as usize) {
+            // Requested payload: one layout cell body and key buffer per layout, not one copy
+            // per instance or a second copy through the arena's reserved-page accounting.
+            // The optional standard HashMap has a known entry-capacity lower bound; Rust
+            // does not expose its exact bucket allocation.
             self.detached_property_storage = self.detached_property_storage.saturating_add(
                 size_of::<crate::value::PropertyLayoutData>()
                     + layout.capacity() * size_of::<Rc<str>>(),
@@ -1017,9 +1145,9 @@ impl Visitor {
             internal_bytes += self.native_buffer(&view.buffer);
         }
         match &object.exotic {
-            Exotic::StrWrap(value) => self.value(&Value::Str((**value).clone())),
+            Exotic::StrWrap(value) => self.value(&Value::Str(**value)),
             Exotic::SymWrap(value) => self.symbol(value),
-            Exotic::BigIntWrap(value) => self.value(&Value::BigInt((**value).clone())),
+            Exotic::BigIntWrap(value) => self.value(&Value::BigInt(**value)),
             Exotic::Error(trace) => {
                 internal_bytes += trace
                     .as_deref()
@@ -1032,7 +1160,21 @@ impl Visitor {
             Exotic::StringIterator(state) => {
                 internal_bytes += std::mem::size_of_val(&**state);
                 if let Some(string) = &state.string {
-                    self.value(&Value::Str(string.clone()));
+                    self.value(&Value::Str(*string));
+                }
+            }
+            Exotic::CollectionIterator(state) => {
+                internal_bytes += std::mem::size_of_val(&**state);
+                if let Some(target) = &state.target {
+                    self.value(&Value::Obj(*target));
+                }
+            }
+            Exotic::Collection(entries) => {
+                internal_bytes += std::mem::size_of_val(&**entries)
+                    .saturating_add(entries.storage_bytes_lower_bound());
+                for (key, value) in entries.iter() {
+                    self.value(key);
+                    self.value(value);
                 }
             }
             Exotic::None
@@ -1069,7 +1211,7 @@ impl Visitor {
         bytes = bytes.saturating_add(scope.lexical_names.retained_requested_storage_bytes());
         for (name, binding) in scope.vars.iter() {
             self.rc_str(name);
-            self.value(&binding.value);
+            self.value(&binding.value());
             if let Some((_, import_name)) = binding.import_ref.as_deref() {
                 bytes =
                     bytes.saturating_add(size_of::<(crate::interpreter::Env, std::rc::Rc<str>)>());
@@ -1104,10 +1246,6 @@ impl crate::value::NativeRetainedMemoryVisitor for Visitor {
             }
         }
     }
-
-    fn value(&mut self, value: &Value) {
-        Visitor::value(self, value);
-    }
 }
 
 struct HostMemoryAdapter<'a> {
@@ -1140,10 +1278,6 @@ impl crate::host::HostRetainedMemoryVisitor for HostMemoryAdapter<'_> {
                 }
             }
         }
-    }
-
-    fn value(&mut self, value: &Value) {
-        self.visitor.value(value);
     }
 
     fn opaque_storage(&mut self) {
@@ -1200,6 +1334,11 @@ fn scan_realm(
             memory: &mut host_memory,
         });
     totals.host_resources.add(host_memory);
+    // The JavaScript values a host keeps are its handles' (S6 step 11b).
+    interp
+        .gc_heap
+        .handles
+        .for_each_value(|value| visitor.value(value));
     let (gc_heap_bytes, gc_heap_exact) = visitor.gc_heap(&interp.gc_heap);
     totals.interpreter_side_tables.add(gc_heap_bytes);
     if !gc_heap_exact {
@@ -1299,7 +1438,7 @@ fn scan_realm(
         interp
             .vm_pool
             .capacity()
-            .saturating_mul(size_of::<crate::execution_storage::CompactFrame>())
+            .saturating_mul(size_of::<crate::execution_storage::ExecutionFrame>())
             .saturating_add(
                 interp
                     .stub_cache
@@ -1329,21 +1468,22 @@ fn scan_realm(
                 interp
                     .creation_pins
                     .len()
-                    .saturating_mul(size_of::<(usize, std::rc::Weak<RefCell<Object>>)>()),
+                    .saturating_mul(size_of::<(usize, crate::value::WeakGc)>()),
             )
             .saturating_add(
                 interp
                     .global_env_pins
                     .capacity()
-                    .saturating_mul(size_of::<std::rc::Weak<RefCell<Scope>>>()),
+                    .saturating_mul(size_of::<crate::interpreter::WeakEnv>()),
             ),
     );
+    totals.engine_caches.add(interp.frame_pool.registry_bytes());
     for (slots, stack) in &interp.vm_pool {
         totals.engine_caches.add(
             slots
                 .capacity()
                 .saturating_add(stack.capacity())
-                .saturating_mul(size_of::<crate::value::PackedValue>()),
+                .saturating_mul(size_of::<crate::value::Value>()),
         );
         debug_assert!(slots.is_empty() && stack.is_empty());
     }
@@ -1452,7 +1592,7 @@ fn scan_realm(
                     .native_function_realms
                     .borrow()
                     .len()
-                    .saturating_mul(size_of::<(usize, (std::rc::Weak<RefCell<Object>>, usize))>()),
+                    .saturating_mul(size_of::<(usize, (crate::value::WeakGc, usize))>()),
             )
             .saturating_add(
                 interp
@@ -1460,14 +1600,14 @@ fn scan_realm(
                     .len()
                     .saturating_mul(size_of::<(
                         usize,
-                        (std::rc::Weak<RefCell<Object>>, crate::value::PropertyLayout),
+                        (crate::value::WeakGc, crate::value::PropertyLayout),
                     )>()),
             )
             .saturating_add(
                 interp
                     .htmldda
                     .len()
-                    .saturating_mul(size_of::<(usize, std::rc::Weak<RefCell<Object>>)>()),
+                    .saturating_mul(size_of::<(usize, crate::value::WeakGc)>()),
             ),
     );
     for line in &interp.console {
@@ -1502,12 +1642,6 @@ fn scan_realm(
                     .len()
                     .saturating_mul(size_of::<(String, crate::modules::ModuleRec)>()),
             )
-            .saturating_add(
-                interp
-                    .pending_dynamic_imports
-                    .len()
-                    .saturating_mul(size_of::<(u64, crate::modules::PendingDynamicImport)>()),
-            )
             .saturating_add(interp.module_ns.len().saturating_mul(size_of::<(
                 usize,
                 crate::fasthash::FastMap<String, crate::modules::NsBinding>,
@@ -1523,11 +1657,34 @@ fn scan_realm(
                 .saturating_add(record.scan_retained_memory(visitor)),
         );
     }
-    for pending in interp.pending_dynamic_imports.values() {
+    totals.interpreter_side_tables.add(
+        interp
+            .routed_imports
+            .len()
+            .saturating_mul(size_of::<(usize, crate::agent_control::RoutedImport)>()),
+    );
+    for bridge in interp.routed_imports.values() {
+        totals.interpreter_side_tables.add(
+            match &bridge.mode {
+                crate::agent_control::ImportMode::Namespace => 0usize,
+                crate::agent_control::ImportMode::Shadow { shadow, name } => {
+                    visitor.value(&Value::Obj(*shadow));
+                    name.capacity()
+                }
+            }
+            .saturating_add(visitor.agent_route(&bridge.requester))
+            .saturating_add(visitor.agent_route(&bridge.source)),
+        );
+        visitor.value(&bridge.request);
+    }
+    if !interp.routed_imports.is_empty() {
         totals
             .interpreter_side_tables
-            .add(pending.scan_retained_memory(visitor));
+            .make_lower_bound("opaque intrinsic bridge HashMap bucket storage");
     }
+    totals
+        .interpreter_side_tables
+        .add(visitor.agent_route(&interp.realm_route()));
     for bindings in interp.module_ns.values() {
         totals.interpreter_side_tables.add(
             bindings
@@ -1541,10 +1698,7 @@ fn scan_realm(
             );
         }
     }
-    if !interp.modules.is_empty()
-        || !interp.module_recs.is_empty()
-        || !interp.pending_dynamic_imports.is_empty()
-        || !interp.module_ns.is_empty()
+    if !interp.modules.is_empty() || !interp.module_recs.is_empty() || !interp.module_ns.is_empty()
     {
         totals
             .interpreter_side_tables
@@ -1568,12 +1722,6 @@ fn scan_realm(
                     .capacity()
                     .saturating_mul(size_of::<(Value, Value)>()),
             )
-            .saturating_add(
-                interp
-                    .microtasks
-                    .capacity()
-                    .saturating_mul(size_of::<crate::interpreter::Job>()),
-            )
             .saturating_add(interp.host_settings_states.len().saturating_mul(size_of::<(
                 (usize, u64),
                 crate::interpreter::HostSettingsState,
@@ -1583,12 +1731,6 @@ fn scan_realm(
                     .retired_host_job_contexts
                     .len()
                     .saturating_mul(size_of::<u64>()),
-            )
-            .saturating_add(
-                interp
-                    .kept_alive
-                    .capacity()
-                    .saturating_mul(size_of::<Value>()),
             )
             .saturating_add(
                 interp
@@ -1611,10 +1753,10 @@ fn scan_realm(
             visitor.value(&on_fulfilled.callback);
             visitor.value(&on_rejected.callback);
             if let Some(global) = &on_fulfilled.script_caller {
-                visitor.value(&Value::Obj(global.clone()));
+                visitor.value(&Value::Obj(*global));
             }
             if let Some(global) = &on_rejected.script_caller {
-                visitor.value(&Value::Obj(global.clone()));
+                visitor.value(&Value::Obj(*global));
             }
             visitor.value(result);
         }
@@ -1633,14 +1775,6 @@ fn scan_realm(
         visitor.value(promise);
         visitor.value(reason);
     }
-    for job in &interp.microtasks {
-        visitor.value(&job.handler.callback);
-        if let Some(global) = &job.handler.script_caller {
-            visitor.value(&Value::Obj(global.clone()));
-        }
-        visitor.value(&job.result);
-        visitor.value(&job.value);
-    }
     for state in interp.host_settings_states.values() {
         // Environments are already canonical to the collector's scope snapshot. The parallel
         // global-name set is not part of an Env and therefore needs its own identity registry.
@@ -1658,9 +1792,6 @@ fn scan_realm(
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
-    }
-    for value in &interp.kept_alive {
-        visitor.value(value);
     }
     for value in interp.promise_forward.values() {
         visitor.value(value);
@@ -1729,12 +1860,6 @@ fn scan_realm(
                     .finalization_registries
                     .len()
                     .saturating_mul(size_of::<(usize, crate::interpreter::FinalizationState)>()),
-            )
-            .saturating_add(
-                interp
-                    .pending_finalization_cleanup
-                    .capacity()
-                    .saturating_mul(size_of::<Value>()),
             ),
     );
     totals
@@ -1743,7 +1868,7 @@ fn scan_realm(
     for registry in interp.finalization_registries.values() {
         visitor.value(&registry.cleanup_callback.callback);
         if let Some(global) = &registry.cleanup_callback.script_caller {
-            visitor.value(&Value::Obj(global.clone()));
+            visitor.value(&Value::Obj(*global));
         }
         totals
             .interpreter_side_tables
@@ -1754,9 +1879,6 @@ fn scan_realm(
             // includes their inline Weak handles; only [[HeldValue]] is strongly retained.
             visitor.value(&cell.held_value);
         }
-    }
-    for registry in &interp.pending_finalization_cleanup {
-        visitor.value(registry);
     }
     if !interp.weak_refs.is_empty() || !interp.finalization_registries.is_empty() {
         totals
@@ -1779,10 +1901,7 @@ fn scan_realm(
                 interp
                     .job_script_contexts
                     .capacity()
-                    .saturating_mul(size_of::<(
-                        u32,
-                        std::rc::Rc<crate::stack_trace::ScriptSource>,
-                    )>()),
+                    .saturating_mul(size_of::<(u32, crate::agent_control::RuntimeOrigin)>()),
             )
             .saturating_add(interp.pending_fn_name.as_ref().map_or(0, String::capacity))
             .saturating_add(
@@ -1798,7 +1917,15 @@ fn scan_realm(
                     .saturating_mul(size_of::<Value>()),
             ),
     );
-    visitor.value(&interp.new_target);
+    if let Some(source) = interp
+        .caller_origin
+        .as_ref()
+        .and_then(|caller| caller.origin.as_ref())
+        .and_then(|origin| origin.source.as_ref())
+    {
+        visitor.script_source(source);
+    }
+    visitor.value(&interp.constructor_new_target());
     visitor.value(&interp.pending_new_target);
     for frame in &interp.fn_frames {
         if let Some(extra) = &frame.extra {
@@ -2068,31 +2195,6 @@ fn scan_realm(
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
 
-    totals.interpreter_side_tables.add(
-        interp
-            .pending_async_waits
-            .capacity()
-            .saturating_mul(size_of::<crate::interpreter::AsyncWait>())
-            .saturating_add(
-                interp
-                    .async_wait_inbox
-                    .as_ref()
-                    .map_or(0, |_| size_of::<crate::interpreter::AsyncWaitInbox>()),
-            )
-            .saturating_add(
-                interp
-                    .pending_timers
-                    .capacity()
-                    .saturating_mul(size_of::<(Value, std::time::Instant)>()),
-            ),
-    );
-    for wait in &interp.pending_async_waits {
-        visitor.value(&wait.promise);
-        visitor.shared_array_buffer(wait.block.id());
-    }
-    for (callback, _) in &interp.pending_timers {
-        visitor.value(callback);
-    }
     if let Some(agent) = &interp.agent {
         totals.interpreter_side_tables.add(
             size_of::<crate::interpreter::AgentChannels>().saturating_add(
@@ -2103,38 +2205,12 @@ fn scan_realm(
             ),
         );
     }
-    if interp.async_wait_inbox.is_some() || interp.agent.is_some() {
+    if interp.agent.is_some() {
         totals.interpreter_side_tables.make_lower_bound(
             "standard-library channel backing and queued message storage are opaque",
         );
     }
 
-    totals
-        .interpreter_side_tables
-        .add(interp.map_data.len().saturating_mul(size_of::<(
-            usize,
-            crate::ordered_collection::OrderedCollection,
-        )>()));
-    for entries in interp.map_data.values() {
-        totals
-            .interpreter_side_tables
-            .add(entries.storage_bytes_lower_bound());
-        for (key, value) in entries.iter() {
-            visitor.value(key);
-            visitor.value(value);
-        }
-    }
-    totals
-        .interpreter_side_tables
-        .add(interp.collection_iterators.len().saturating_mul(size_of::<(
-            usize,
-            crate::ordered_collection::CollectionIterator,
-        )>()));
-    for state in interp.collection_iterators.values() {
-        if let Some(target) = &state.target {
-            visitor.value(&Value::Obj(target.clone()));
-        }
-    }
     totals
         .interpreter_side_tables
         .add(interp.weak_collection_data.len().saturating_mul(size_of::<(
@@ -2167,11 +2243,7 @@ fn scan_realm(
                 .saturating_mul(size_of::<(crate::interpreter::WeakKey, usize)>()),
         );
     }
-    if !interp.map_data.is_empty()
-        || !interp.collection_iterators.is_empty()
-        || !interp.weak_collection_data.is_empty()
-        || !interp.weak_collection_index.is_empty()
-    {
+    if !interp.weak_collection_data.is_empty() || !interp.weak_collection_index.is_empty() {
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap bucket storage");
@@ -2272,18 +2344,115 @@ fn scan_realm(
         interp
             .shadow_realms
             .len()
-            .saturating_mul(size_of::<(usize, Box<Interp>)>()),
+            .saturating_mul(size_of::<(usize, crate::agent_access::Owned<Interp>)>()),
     );
     if !interp.shadow_realms.is_empty() {
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
-    for sub in interp.shadow_realms.values() {
-        let objects = crate::value::heap_gc_snapshot(&sub.gc_heap);
-        let scopes = crate::value::gc_scope_snapshot(&sub.gc_heap);
-        scan_realm(sub, &objects, &scopes, visitor, totals);
+}
+
+/// Agent queues/kept objects are scanned once, not once per active/owned interpreter. Routes
+/// are shared immutable allocations; the topology cache is not a collector root.
+fn scan_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut DirectTotals) {
+    use crate::agent_control::{Cleanup, Routed, Timer};
+    let agent = &interp.gc_heap.agent;
+    totals.interpreter_side_tables.add(
+        size_of::<crate::agent_control::AgentControl>()
+            .saturating_add(agent.access.retained_metadata_bytes())
+            .saturating_add(visitor.agent_route(&agent.root_route)),
+    );
+    let kept = agent.kept_alive.borrow();
+    totals
+        .interpreter_side_tables
+        .add(kept.capacity().saturating_mul(size_of::<Value>()));
+    for value in kept.iter() {
+        visitor.value(value);
     }
+    drop(kept);
+    let work = agent.work.borrow();
+    totals.interpreter_side_tables.add(
+        work.promises
+            .capacity()
+            .saturating_mul(size_of::<Routed<crate::interpreter::Job>>())
+            .saturating_add(
+                work.cleanup
+                    .capacity()
+                    .saturating_mul(size_of::<Routed<Cleanup>>()),
+            )
+            .saturating_add(
+                work.waits
+                    .capacity()
+                    .saturating_mul(size_of::<Routed<crate::interpreter::AsyncWait>>()),
+            )
+            .saturating_add(
+                work.timers
+                    .capacity()
+                    .saturating_mul(size_of::<Routed<Timer>>()),
+            )
+            .saturating_add(
+                work.imports
+                    .len()
+                    .saturating_mul(
+                        size_of::<(u64, Routed<crate::modules::PendingDynamicImport>)>(),
+                    ),
+            )
+            .saturating_add(
+                work.inbox
+                    .as_ref()
+                    .map_or(0, |_| size_of::<crate::interpreter::AsyncWaitInbox>()),
+            ),
+    );
+    for job in &work.promises {
+        totals
+            .interpreter_side_tables
+            .add(visitor.agent_route(&job.route));
+        visitor.value(&job.payload.handler.callback);
+        if let Some(global) = job.payload.handler.script_caller {
+            visitor.value(&Value::Obj(global));
+        }
+        if let Some(origin) = &job.payload.handler.active_script {
+            if let Some(source) = &origin.source {
+                visitor.script_source(source);
+            }
+            if let Some(referrer) = &origin.referrer {
+                visitor.rc_str(referrer);
+            }
+        }
+        visitor.value(&job.payload.result);
+        visitor.value(&job.payload.value);
+    }
+    for cleanup in &work.cleanup {
+        totals
+            .interpreter_side_tables
+            .add(visitor.agent_route(&cleanup.route));
+        visitor.value(&cleanup.payload.registry);
+    }
+    for wait in &work.waits {
+        totals
+            .interpreter_side_tables
+            .add(visitor.agent_route(&wait.route));
+        visitor.value(&wait.payload.promise);
+        visitor.shared_array_buffer(wait.payload.block.id());
+    }
+    for timer in &work.timers {
+        totals
+            .interpreter_side_tables
+            .add(visitor.agent_route(&timer.route));
+        visitor.value(&timer.payload.callback);
+    }
+    for pending in work.imports.values() {
+        totals.interpreter_side_tables.add(
+            visitor
+                .agent_route(&pending.route)
+                .saturating_add(pending.payload.scan_retained_memory(visitor))
+                .saturating_add(visitor.agent_route(&pending.payload.authority_route)),
+        );
+    }
+    totals
+        .interpreter_side_tables
+        .make_lower_bound("opaque Agent directory/HashMap/channel backing storage");
 }
 
 fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut DirectTotals) {
@@ -2295,12 +2464,12 @@ fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut Direct
         agent
             .symbols
             .len()
-            .saturating_mul(size_of::<(u64, std::rc::Weak<SymbolData>)>())
+            .saturating_mul(size_of::<(u64, crate::value::WeakSymbol)>())
             .saturating_add(
                 agent
                     .global_by_key
                     .len()
-                    .saturating_mul(size_of::<(Rc<str>, Rc<SymbolData>)>()),
+                    .saturating_mul(size_of::<(Rc<str>, crate::value::SymbolRef)>()),
             )
             .saturating_add(
                 agent
@@ -2312,7 +2481,7 @@ fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut Direct
                 agent
                     .well_known
                     .len()
-                    .saturating_mul(size_of::<(&'static str, Rc<SymbolData>)>()),
+                    .saturating_mul(size_of::<(&'static str, crate::value::SymbolRef)>()),
             ),
     );
     totals
@@ -2335,7 +2504,31 @@ fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut Direct
 fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     let mut visitor = Visitor::default();
     let mut totals = DirectTotals::default();
-    scan_realm(interp, objects, scopes, &mut visitor, &mut totals);
+    let members = interp
+        .gc_heap
+        .agent
+        .access
+        .shared_snapshot(interp.realm_id, interp);
+    let mut sampled_heaps = HashSet::new();
+    for (_, pointer) in members {
+        // SAFETY: shared snapshot resolves current/suspended lineages; no GC or JS runs in
+        // this synchronous diagnostic. All references end with this measurement.
+        let member = unsafe { &*pointer };
+        let heap_id = crate::value::heap_id(&member.gc_heap);
+        visitor.heap_ids.insert(heap_id);
+        if sampled_heaps.insert(heap_id) {
+            scan_agent(member, &mut visitor, &mut totals);
+            if Rc::ptr_eq(&member.gc_heap, &interp.gc_heap) {
+                scan_realm(member, objects, scopes, &mut visitor, &mut totals);
+            } else {
+                let objects = crate::value::heap_gc_snapshot(&member.gc_heap);
+                let scopes = crate::value::gc_scope_snapshot(&member.gc_heap);
+                scan_realm(member, &objects, &scopes, &mut visitor, &mut totals);
+            }
+        } else {
+            scan_realm(member, &[], &[], &mut visitor, &mut totals);
+        }
+    }
     scan_symbol_agent(interp, &mut visitor, &mut totals);
     visitor
         .shared_array_buffer_allocations
@@ -2405,9 +2598,14 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
             unclassified_external_entries: totals.host_resources.unclassified_external_entries,
         },
         host_resources: totals.host_resources.into(),
+        handles: interp.gc_heap.handles.counts(),
     }
 }
 
+/// Record the managed-memory snapshot of a finished collection, for `TRUST_JS_PERF_METRICS`.
+/// Only the reference-counted collectors called it: under the GC heap the record says
+/// "unavailable" (open since P1 S2; see docs/v8-chase-2026-10-15.txt, S6 step 4).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn record_post_gc(interp: &Interp, objects: &[Gc], scopes: &[Env]) {
     let snapshot = measure(interp, objects, scopes);
     let heap_id = crate::value::heap_id(&interp.gc_heap);
@@ -2423,14 +2621,19 @@ pub(crate) fn json(interp: &Interp) -> String {
     let agent = interp.symbol_agent.borrow();
     match agent.memory_snapshots.get(&heap_id) {
         Some(snapshot) => snapshot.json(agent.agent_id, heap_id),
+        // The live handles are counted as they are made and dropped, so they are available
+        // without a recorded snapshot.
         None => format!(
             concat!(
                 "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
                 "\"safepoint\":null,\"complete\":false,",
                 "\"managed_requested_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"no post-collection safepoint has been recorded\"}},",
-                "\"managed_external_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"no post-collection safepoint has been recorded\"}}}}"
+                "\"managed_external_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"no post-collection safepoint has been recorded\"}},",
+                "\"handles\":{}}}"
             ),
-            agent.agent_id, heap_id
+            agent.agent_id,
+            heap_id,
+            handles_json(interp.gc_heap.handles.counts())
         ),
     }
 }
@@ -2438,12 +2641,12 @@ pub(crate) fn json(interp: &Interp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{
-        HostRetainedMemoryVisitor, RetainedBytes, RetainedExternalAllocation,
-        RetainedExternalMemory, RetainedMemory,
-    };
+    #[cfg(feature = "embed")]
+    use crate::host::{HostRetainedMemoryVisitor, RetainedMemory};
+    use crate::host::{RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory};
     use crate::lstr::LStr;
     use crate::value::Props;
+    use crate::value::ValueView;
 
     struct ReportedHostState(Vec<u8>);
 
@@ -2451,12 +2654,14 @@ mod tests {
 
     struct ReportedNativeClosure {
         allocation: Rc<RefCell<Vec<u8>>>,
-        value: Value,
     }
 
+    /// Host state reporting a shared allocation; its JavaScript values are handles.
+    #[cfg(feature = "embed")]
     struct ReportedManagedHostState {
         allocation: Rc<RefCell<Vec<u8>>>,
-        value: Value,
+        /// Held for its value, which the snapshot reads through the handle table.
+        _value: Option<crate::handles::Handle>,
         requested_bytes: usize,
     }
 
@@ -2472,6 +2677,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embed")]
     impl RetainedMemory for ReportedManagedHostState {
         fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
             visitor.allocation(crate::value::RetainedManagedAllocation::rc(
@@ -2479,7 +2685,6 @@ mod tests {
                 &self.allocation,
                 self.requested_bytes,
             ));
-            visitor.value(&self.value);
         }
     }
 
@@ -2495,7 +2700,6 @@ mod tests {
                 &self.allocation,
                 requested_bytes,
             ));
-            visitor.value(&self.value);
         }
     }
 
@@ -2527,7 +2731,8 @@ mod tests {
         assert_eq!(visitor.rc_strs.len(), 3);
         assert_eq!(
             visitor.detached_property_storage,
-            3 * size_of::<crate::value::Property>()
+            crate::value::detached_field_bytes(1)
+                + crate::value::detached_field_bytes(2)
                 + size_of::<crate::value::PropertyLayoutData>()
                 + layout.capacity() * size_of::<Rc<str>>()
         );
@@ -2543,28 +2748,31 @@ mod tests {
                 false,
             )
             .expect("layout fixture parses");
-        let env = engine.interp.global_env.clone();
-        let Value::Obj(a) = engine
+        let env = engine.interp.global_env;
+        let ValueView::Obj(a) = (engine
             .interp
             .get_var("a", &env)
             .ok()
-            .expect("a is initialized")
-        else {
+            .expect("a is initialized"))
+        .view() else {
             panic!("a is an object")
         };
-        let Value::Obj(b) = engine
+        let ValueView::Obj(b) = (engine
             .interp
             .get_var("b", &env)
             .ok()
-            .expect("b is initialized")
-        else {
+            .expect("b is initialized"))
+        .view() else {
             panic!("b is an object")
         };
         let a = a.borrow().props.clone();
         let b = b.borrow().props.clone();
         let layout = a.shared_layout().expect("shared layout");
         assert!(layout.has_index());
-        assert!(Rc::ptr_eq(layout, b.shared_layout().expect("b layout")));
+        assert!(crate::value::PropertyLayout::ptr_eq(
+            layout,
+            b.shared_layout().expect("b layout")
+        ));
 
         let expected_layout = size_of::<crate::value::PropertyLayoutData>()
             + layout.capacity() * size_of::<Rc<str>>()
@@ -2592,29 +2800,36 @@ mod tests {
             Rc::from("live"),
             Rc::from("unused prediction"),
         ]);
-        let weak_layout = Rc::downgrade(&layout);
+        let weak_layout = crate::gc_handle::WeakRef::to(layout.as_ptr() as usize);
         let expected_layout_bytes = size_of::<crate::value::PropertyLayoutData>()
             + layout.capacity() * size_of::<Rc<str>>();
-        let mut props = Props::with_layout(1, Some(layout.clone()));
-        props.append_initialized_field(&layout[0], crate::value::Property::plain(Value::Undefined));
-        let source = Value::Obj(crate::value::Object::new_with_parts(
-            None,
-            props,
-            Exotic::None,
-        ));
-        let weak_source = Rc::downgrade(source.as_obj().unwrap());
-        let _keys = engine
-            .interp
-            .for_in_keys(&source)
-            .ok()
-            .expect("ordinary keys");
-        drop(source);
+        // The source lives only in this helper frame (the collector scans the stack).
+        let (weak_source, _keys) = crate::gc_test::in_frame(|| {
+            let mut props = Props::with_layout(1, Some(layout.clone()));
+            props.append_initialized_field(
+                &layout[0],
+                crate::value::Property::plain(Value::Undefined),
+            );
+            let source = Value::Obj(crate::value::Object::new_with_parts(
+                None,
+                props,
+                Exotic::None,
+            ));
+            let weak_source = Gc::downgrade(&source.as_obj().unwrap());
+            let keys = engine
+                .interp
+                .for_in_keys(&source)
+                .ok()
+                .expect("ordinary keys");
+            (weak_source, keys)
+        });
         drop(layout);
-        assert!(weak_source.upgrade().is_none());
-        assert_eq!(
-            weak_layout.strong_count(),
-            1,
-            "cache is the only layout owner"
+        // A collection reclaims the dropped source.
+        engine.interp.gc_collect();
+        assert!(!crate::gc_test::alive(&weak_source));
+        assert!(
+            crate::gc_test::alive(&weak_layout),
+            "cache retains the layout after its source dies"
         );
         let mut visitor = Visitor::default();
         for _ in 0..2 {
@@ -2661,11 +2876,13 @@ mod tests {
                 identity_conflict: false,
                 opaque_storage: false,
             },
+            handles: (2, 1),
         }
         .json(1, 1);
         assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":12"));
         assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":71"));
         assert!(json.contains("\"host_resources\":{\"bytes\":null"));
+        assert!(json.contains("\"handles\":{\"strong\":2,\"weak\":1}"));
     }
 
     #[test]
@@ -2741,25 +2958,36 @@ mod tests {
         );
     }
 
+    /// The allocations host state reports are counted once per identity, and the JavaScript
+    /// values it keeps, in handles (S6 step 11b), once per value.
+    #[cfg(feature = "embed")]
     #[test]
     fn identity_aware_host_allocations_and_values_are_deduplicated() {
-        let mut interp = Interp::new();
-        let baseline_strings = measure(&interp, &[], &[]).strings_symbols_bigints.bytes;
+        let mut engine = crate::Engine::new();
+        let baseline_strings = measure(&engine.interp, &[], &[])
+            .strings_symbols_bigints
+            .bytes;
         let allocation = Rc::new(RefCell::new(Vec::<u8>::with_capacity(83)));
         let string = LStr::from("host-retained string");
         let requested_bytes = size_of::<RefCell<Vec<u8>>>() + allocation.borrow().capacity();
+        let held = engine.scope(|cx| {
+            crate::handles::Handle::new(cx, &crate::scope::Value::from_internal(Value::Str(string)))
+                .expect("a handle")
+        });
         let make_reporter = || ReportedManagedHostState {
             allocation: allocation.clone(),
-            value: Value::Str(string.clone()),
+            _value: Some(held.clone()),
             requested_bytes,
         };
-        interp.host_state.put_retained_memory(make_reporter());
-        interp
-            .host_state
+        engine.op_state().put_retained_memory(make_reporter());
+        engine
+            .op_state()
             .resources
             .add_retained_memory(make_reporter());
+        drop(held);
+        let interp = &mut engine.interp;
 
-        let snapshot = measure(&interp, &[], &[]);
+        let snapshot = measure(interp, &[], &[]);
         assert_eq!(snapshot.host_resources.unavailable_entries, 0);
         assert!(!snapshot.host_resources.identity_conflict);
         assert!(snapshot.host_resources.reported_bytes >= requested_bytes);
@@ -2776,10 +3004,10 @@ mod tests {
             .host_state
             .put_retained_memory(ReportedManagedHostState {
                 allocation,
-                value: Value::Undefined,
+                _value: None,
                 requested_bytes: requested_bytes + 1,
             });
-        let conflicting = measure(&interp, &[], &[]);
+        let conflicting = measure(interp, &[], &[]);
         assert!(conflicting.host_resources.identity_conflict);
         assert!(!conflicting.complete());
         assert!(conflicting
@@ -2819,7 +3047,7 @@ mod tests {
         let string = LStr::from("shared allocation");
         let expected = string.retained_requested_bytes();
         let mut visitor = Visitor::default();
-        visitor.value(&Value::Str(string.clone()));
+        visitor.value(&Value::Str(string));
         visitor.value(&Value::Str(string));
         assert_eq!(visitor.strings_symbols_bigints, expected);
     }
@@ -2915,7 +3143,8 @@ mod tests {
                 Ok(Value::Undefined)
             },
         );
-        let object = interp.make_native_closure("capturing", 0, closure);
+        let object =
+            interp.make_native_closure("capturing", 0, closure, crate::value::NativeCaptures::None);
         let snapshot = measure(&interp, &[object], &[]);
 
         assert!(!snapshot.callable_metadata.coverage_complete);
@@ -2932,11 +3161,10 @@ mod tests {
     #[test]
     fn explicit_native_captures_are_complete_and_shared_storage_is_counted_once() {
         let string = LStr::from("explicit native capture");
-        let callable = Callable::NativeData(Rc::new(crate::value::NativeCallable {
+        let callable = Callable::native_data(Rc::new(crate::value::NativeCallable {
             body: crate::value::NativeCallableBody::Captured {
-                function: |_, _, _, captures| Ok(captures[0].clone()),
-                captures: vec![Value::Str(string.clone()), Value::Str(string.clone())]
-                    .into_boxed_slice(),
+                function: |_, _, _, captures| Ok(captures[0]),
+                captures: vec![Value::Str(string), Value::Str(string)].into_boxed_slice(),
             },
             retained: None,
             identity: Rc::from("captured"),
@@ -2966,6 +3194,8 @@ mod tests {
         assert!(snapshot.complete());
     }
 
+    /// Native closures with Rust state and engine captures (S6 step 11b): the allocations
+    /// their reporters describe and the values they capture are each counted once.
     #[test]
     fn reported_native_closure_allocations_and_values_are_deduplicated() {
         let interp = Interp::new();
@@ -2974,11 +3204,10 @@ mod tests {
         let make_closure = || {
             let state = Rc::new(ReportedNativeClosure {
                 allocation: allocation.clone(),
-                value: Value::Str(string.clone()),
             });
             let callable_state = state.clone();
-            let callable: Rc<crate::value::NativeClosure> = Rc::new(
-                move |_: &mut Interp, _: Value, _: &[Value]| -> Result<Value, Value> {
+            let callable: Rc<crate::value::CaptureClosure> = Rc::new(
+                move |_: &mut Interp, _: Value, _: &[Value], _: &[Value]| -> Result<Value, Value> {
                     std::hint::black_box(&callable_state);
                     Ok(Value::Undefined)
                 },
@@ -2989,18 +3218,20 @@ mod tests {
             )
         };
         let (first_callable, first_reporter) = make_closure();
-        let first = interp.make_native_closure_with_retained_memory(
+        let first = interp.make_native_capture_closure(
             "first",
             0,
             first_callable,
-            first_reporter,
+            vec![Value::Str(string)],
+            crate::value::NativeCaptures::Reported(first_reporter),
         );
         let (second_callable, second_reporter) = make_closure();
-        let second = interp.make_native_closure_with_retained_memory(
+        let second = interp.make_native_capture_closure(
             "second",
             0,
             second_callable,
-            second_reporter,
+            vec![Value::Str(string)],
+            crate::value::NativeCaptures::Reported(second_reporter),
         );
         let snapshot = measure(&interp, &[first, second], &[]);
 
@@ -3011,15 +3242,21 @@ mod tests {
         let mut visitor = Visitor::default();
         let (first_func, first_retained) = make_closure();
         let first_callable =
-            crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
-                body: crate::value::NativeCallableBody::Opaque(first_func),
+            crate::value::Callable::native_data(Rc::new(crate::value::NativeCallable {
+                body: crate::value::NativeCallableBody::CapturedClosure {
+                    function: first_func,
+                    captures: vec![Value::Str(string)].into_boxed_slice(),
+                },
                 retained: Some(first_retained),
                 identity: Rc::from("first"),
             }));
         let (second_func, second_retained) = make_closure();
         let second_callable =
-            crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
-                body: crate::value::NativeCallableBody::Opaque(second_func),
+            crate::value::Callable::native_data(Rc::new(crate::value::NativeCallable {
+                body: crate::value::NativeCallableBody::CapturedClosure {
+                    function: second_func,
+                    captures: vec![Value::Str(string)].into_boxed_slice(),
+                },
                 retained: Some(second_retained),
                 identity: Rc::from("second"),
             }));
@@ -3040,6 +3277,7 @@ mod tests {
             "registeredOperation",
             0,
             Rc::new(|_i, _this, _args| Ok(Value::Undefined)),
+            crate::value::NativeCaptures::None,
         );
         callable.borrow_mut().props.insert(
             "name",
@@ -3075,43 +3313,45 @@ mod tests {
     }
 
     #[test]
-    fn agent_snapshot_aggregates_shadow_heaps_with_global_deduplication() {
+    fn agent_snapshot_counts_one_shadow_heap_and_deduplicates_backings() {
         use crate::interpreter::BufferData;
         let mut root = Interp::new();
-        let mut shadow = Interp::new_with_symbol_agent(root.symbol_agent.clone());
+        let object = Object::new(None);
+        root.global.borrow_mut().props.insert(
+            "diagnosticRealm",
+            crate::value::Property::plain(Value::Obj(object)),
+        );
+        let shadow = Interp::new_shadow(&root, &object);
+        let id = shadow.id();
+        root.shadow_realms
+            .insert(Gc::as_ptr(&object) as usize, shadow);
         let shared_buffer = Rc::new(RefCell::new(Vec::with_capacity(333)));
         root.array_buffers
             .insert(1, BufferData::Local(shared_buffer.clone()));
-        shadow
-            .array_buffers
-            .insert(2, BufferData::Local(shared_buffer));
         let shared_data_block = crate::interpreter::alloc_shared_mem(337).unwrap();
         let shared_id = shared_data_block.id();
         root.array_buffers
             .insert(3, BufferData::Shared(shared_data_block.clone()));
-        shadow
-            .array_buffers
-            .insert(4, BufferData::Shared(shared_data_block));
-
-        let root_objects = crate::value::heap_gc_snapshot(&root.gc_heap);
-        let root_scopes = crate::value::gc_scope_snapshot(&root.gc_heap);
-        let shadow_objects = crate::value::heap_gc_snapshot(&shadow.gc_heap);
-        let shadow_scopes = crate::value::gc_scope_snapshot(&shadow.gc_heap);
-        let root_only = measure(&root, &root_objects, &root_scopes);
-        let shadow_only = measure(&shadow, &shadow_objects, &shadow_scopes);
-        let expected_objects = root_objects.len().saturating_add(shadow_objects.len());
-        let expected_scopes = root_scopes.len().saturating_add(shadow_scopes.len());
-
-        root.shadow_realms.insert(7, Box::new(shadow));
-        let aggregate = measure(&root, &root_objects, &root_scopes);
-
+        let heap = root.gc_heap.clone();
+        root.with_route(id, |shadow| {
+            assert!(Rc::ptr_eq(&heap, &shadow.gc_heap));
+            shadow
+                .array_buffers
+                .insert(2, BufferData::Local(shared_buffer));
+            shadow
+                .array_buffers
+                .insert(4, BufferData::Shared(shared_data_block));
+        });
+        let objects = crate::value::heap_gc_snapshot(&root.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&root.gc_heap);
+        let aggregate = measure(&root, &objects, &scopes);
         assert_eq!(
             aggregate.object_bodies.bytes,
-            expected_objects.saturating_mul(size_of::<RefCell<Object>>())
+            objects.len().saturating_mul(size_of::<RefCell<Object>>())
         );
         assert_eq!(
             aggregate.scope_bodies.bytes,
-            expected_scopes.saturating_mul(size_of::<RefCell<Scope>>())
+            scopes.len().saturating_mul(size_of::<RefCell<Scope>>())
         );
         assert_eq!(aggregate.array_buffer_backing.bytes, 333);
         assert_eq!(aggregate.shared_array_buffer_backing.allocations.len(), 1);
@@ -3125,14 +3365,6 @@ mod tests {
             "\"allocation_id\":\"shared-data-block:{shared_id}\""
         )));
         assert!(json.contains("\"externally_shared\":true"));
-        assert!(
-            aggregate.strings_symbols_bigints.bytes
-                < root_only
-                    .strings_symbols_bigints
-                    .bytes
-                    .saturating_add(shadow_only.strings_symbols_bigints.bytes),
-            "Agent-shared symbol/string payload must be credited once"
-        );
         assert!(aggregate.interpreter_side_tables.bytes >= 2 * size_of::<Interp>());
     }
 
@@ -3174,8 +3406,6 @@ mod tests {
         let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let after = measure(&engine.interp, &objects, &scopes);
 
-        assert!(!engine.interp.map_data.is_empty());
-        assert!(!engine.interp.collection_iterators.is_empty());
         assert!(!engine.interp.weak_collection_data.is_empty());
         assert!(!engine.interp.weak_collection_index.is_empty());
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
@@ -3229,6 +3459,51 @@ mod tests {
 
         assert!(!engine.interp.vm_pool.is_empty());
         assert!(snapshot.engine_caches.bytes >= stub_bytes);
+    }
+
+    /// A function's deferred prototype counts once, in property storage, as its own
+    /// `LazyFunctionPrototype` payload: 48 requested bytes, as before the payload became a
+    /// cell (no report counts cells by bytes, so the cell is not counted twice). Measuring
+    /// does not materialize it. Of functions made by one expression (their prototype
+    /// template's key layout is counted with the template), replacing one's `prototype`, after
+    /// a warm-up replacement and with the garbage collected, lowers property storage by exactly
+    /// that payload.
+    #[test]
+    fn deferred_prototype_payload_is_counted_once_in_property_storage() {
+        let mut engine = crate::Engine::new();
+        let run = |engine: &mut crate::Engine, source: &str| {
+            engine
+                .eval(source, false)
+                .expect("memory fixture evaluates");
+            engine.interp.gc_collect();
+        };
+        let property_storage = |engine: &crate::Engine| {
+            let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+            let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+            measure(&engine.interp, &objects, &scopes)
+                .property_storage
+                .bytes
+        };
+        run(
+            &mut engine,
+            "function make() { return function () {}; } \
+             var F = make(), G = make(), H = make(); \
+             Object.defineProperty(H, 'prototype', { value: null }); 0",
+        );
+        let materialized = crate::value::prototypes_materialized();
+        let before = property_storage(&engine);
+        run(
+            &mut engine,
+            "Object.defineProperty(F, 'prototype', { value: null }); 0",
+        );
+        let after = property_storage(&engine);
+        assert_eq!(crate::value::DEFERRED_PROTOTYPE_BYTES, 48);
+        assert_eq!(before - after, crate::value::DEFERRED_PROTOTYPE_BYTES);
+        assert_eq!(
+            crate::value::prototypes_materialized() - materialized,
+            1,
+            "only the store materialized (F's prototype, through its descriptor snapshot)"
+        );
     }
 
     #[test]
@@ -3303,7 +3578,7 @@ mod tests {
         let pending_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let pending = measure(&engine.interp, &pending_objects, &pending_scopes);
         assert_eq!(engine.interp.promises.len(), 2);
-        assert_eq!(engine.interp.microtasks.len(), 0);
+        assert_eq!(engine.interp.gc_heap.agent.work.borrow().promises.len(), 0);
         assert!(engine
             .interp
             .promises
@@ -3317,7 +3592,7 @@ mod tests {
         let queued_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let queued_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let queued = measure(&engine.interp, &queued_objects, &queued_scopes);
-        assert_eq!(engine.interp.microtasks.len(), 1);
+        assert_eq!(engine.interp.gc_heap.agent.work.borrow().promises.len(), 1);
         assert!(queued.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
         assert!(queued.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
     }
@@ -3399,7 +3674,7 @@ mod tests {
         engine
             .interp
             .async_gen_queue
-            .entry(request_key)
+            .entry(&engine.interp.gc_heap, request_key)
             .or_default()
             .push_back((
                 Value::lstr("queued request promise"),
@@ -3452,15 +3727,12 @@ mod tests {
         );
         let registry = match engine
             .interp
-            .get_member_key(&Value::Obj(engine.interp.global.clone()), "memoryFinalizer")
+            .get_member_key(&Value::Obj(engine.interp.global), "memoryFinalizer")
         {
             Ok(registry) => registry,
             Err(_) => panic!("registry global is readable"),
         };
-        engine
-            .interp
-            .pending_finalization_cleanup
-            .push_back(registry);
+        engine.interp.enqueue_test_cleanup(registry);
 
         let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
@@ -3528,15 +3800,17 @@ mod tests {
         let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let before = measure(&engine.interp, &before_objects, &before_scopes);
-        let object = engine.interp.global.clone();
-        let identity = Rc::as_ptr(&object) as usize;
+        let object = engine.interp.global;
+        let identity = Gc::as_ptr(&object) as usize;
 
-        engine.interp.gc_pins.insert(identity, object.clone());
+        engine.interp.gc_pins.insert(identity, object);
         engine.interp.proxies.insert(
+            &engine.interp.gc_heap,
             identity,
-            (Value::Obj(object.clone()), Value::Obj(object.clone())),
+            (Value::Obj(object), Value::Obj(object)),
         );
         engine.interp.host_indexed.insert(
+            &engine.interp.gc_heap,
             identity,
             crate::interpreter::HostIndexedProperties {
                 length: 1,
@@ -3558,10 +3832,11 @@ mod tests {
         );
         let mut mapped_names = Vec::with_capacity(5);
         mapped_names.push(Some("mappedParameterWithCapacity".to_string()));
-        engine
-            .interp
-            .mapped_arguments
-            .insert(identity, (engine.interp.global_env.clone(), mapped_names));
+        engine.interp.mapped_arguments.insert(
+            &engine.interp.gc_heap,
+            identity,
+            (engine.interp.global_env, mapped_names),
+        );
         engine.interp.module_source_objs.insert(
             "source/module.js".to_string(),
             Value::lstr("module source payload"),
@@ -3654,11 +3929,17 @@ mod tests {
         let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let before = measure(&engine.interp, &before_objects, &before_scopes);
 
-        engine.interp.pending_async_waits.reserve(3);
         engine
             .interp
-            .pending_async_waits
-            .push(crate::interpreter::AsyncWait {
+            .gc_heap
+            .agent
+            .work
+            .borrow_mut()
+            .waits
+            .reserve(3);
+        engine
+            .interp
+            .enqueue_async_wait(crate::interpreter::AsyncWait {
                 promise: Value::lstr("wait promise payload"),
                 token: 0,
                 id: 0,
@@ -3666,12 +3947,19 @@ mod tests {
                 index: 0,
                 deadline: None,
             });
-        engine.interp.async_wait_inbox = Some(Default::default());
-        engine.interp.pending_timers.reserve(4);
-        engine.interp.pending_timers.push((
+        let _inbox = engine.interp.agent_async_inbox();
+        engine
+            .interp
+            .gc_heap
+            .agent
+            .work
+            .borrow_mut()
+            .timers
+            .reserve(4);
+        engine.interp.enqueue_agent_timer(
             Value::lstr("timer callback payload"),
             std::time::Instant::now(),
-        ));
+        );
 
         let (broadcast_tx, broadcast_rx) = std::sync::mpsc::channel();
         let (report_tx, report_rx) = std::sync::mpsc::channel();

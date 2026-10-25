@@ -83,17 +83,18 @@ impl Interp {
                 })
             })
             .clone();
-        object.borrow_mut().native_typed_array = Some(Box::new(NativeTypedArray {
-            buffer_ptr: Rc::as_ptr(&buffer),
-            offset: info.offset,
-            end,
-            // Native element counts stay within the signed 32-bit range: generated code may
-            // then reject a negative key by its unsigned magnitude alone.
-            limit: if info.track { 0 } else { info.len.min(1 << 31) },
-            kind,
-            shift: size.trailing_zeros() as u8,
-            buffer,
-        }));
+        object.borrow_mut().native_typed_array =
+            Some(crate::gc_storage::PayloadBox::new(NativeTypedArray {
+                buffer_ptr: Rc::as_ptr(&buffer),
+                offset: info.offset,
+                end,
+                // Native element counts stay within the signed 32-bit range: generated code may
+                // then reject a negative key by its unsigned magnitude alone.
+                limit: if info.track { 0 } else { info.len.min(1 << 31) },
+                kind,
+                shift: size.trailing_zeros() as u8,
+                buffer,
+            }));
     }
 
     pub(crate) fn invalidate_native_buffer(&mut self, ptr: usize) {
@@ -240,6 +241,16 @@ mod tests {
         }
     }
 
+    /// The engine value of `source` (unbranded: the crate's own form), for internal checks.
+    fn engine_value(engine: &mut Engine, source: &str) -> crate::value::Value {
+        engine.scope(|cx| {
+            cx.eval_value(source)
+                .unwrap()
+                .unwrap_or_else(|_| panic!("read {source}"))
+                .into_internal()
+        })
+    }
+
     #[test]
     fn native_typed_array_writes_publish_versions_ranges_and_survive_throws() {
         let mut engine = Engine::new();
@@ -254,11 +265,8 @@ mod tests {
             captured(1000); local(heap, 1000);
         "#,
         );
-        let buffer = engine
-            .eval_value("buffer")
-            .unwrap()
-            .unwrap_or_else(|_| panic!("read buffer"));
-        let ptr = Rc::as_ptr(buffer.as_obj().unwrap()) as usize;
+        let buffer = engine_value(&mut engine, "buffer");
+        let ptr = Gc::as_ptr(&buffer.as_obj().unwrap()) as usize;
         #[cfg(all(
             target_arch = "aarch64",
             any(target_os = "linux", target_os = "macos", target_os = "windows")
@@ -361,44 +369,21 @@ mod tests {
             &mut engine,
             "var buffer = new ArrayBuffer(64); var a = new Uint8Array(buffer); a.self = a;",
         );
-        let buffer = engine
-            .eval_value("buffer")
-            .unwrap()
-            .unwrap_or_else(|_| panic!("read buffer"));
-        let ptr = Rc::as_ptr(buffer.as_obj().unwrap()) as usize;
-        let storage = Rc::downgrade(engine.interp.local_buffer(ptr).unwrap());
-        drop(buffer);
+        // The buffer and its address live only in this helper frame (the collector scans the
+        // stack).
+        let (ptr, storage) = crate::gc_test::in_frame(|| {
+            let buffer = engine_value(&mut engine, "buffer");
+            let ptr = crate::gc_test::HiddenAddress::of(&buffer);
+            let storage = Rc::downgrade(engine.interp.local_buffer(ptr.get()).unwrap());
+            (ptr, storage)
+        });
         eval(&mut engine, "a = null; buffer = null;");
         engine.interp.gc_collect();
-        assert!(!engine.interp.native_buffers.contains_key(&ptr));
+        assert!(!ptr.in_map(&engine.interp.native_buffers));
         assert!(
-            storage.upgrade().is_none(),
+            !crate::gc_test::alive(&storage),
             "native metadata must not root dead byte storage"
         );
-    }
-
-    #[test]
-    fn native_typed_array_teardown_releases_backing_even_with_external_wrapper() {
-        let mut engine = Engine::new();
-        eval(&mut engine, "var a = new Uint8Array(64);");
-        let view = engine
-            .eval_value("a")
-            .unwrap()
-            .unwrap_or_else(|_| panic!("read view"));
-        let buffer = view
-            .as_obj()
-            .unwrap()
-            .borrow()
-            .native_typed_array
-            .as_ref()
-            .unwrap()
-            .buffer
-            .clone();
-        let storage = Rc::downgrade(buffer.storage.borrow().as_ref().unwrap());
-        drop(buffer);
-        drop(engine);
-        assert!(view.as_obj().unwrap().borrow().native_typed_array.is_none());
-        assert!(storage.upgrade().is_none());
     }
 
     #[test]
@@ -410,11 +395,8 @@ mod tests {
             &mut engine,
             "var buffer = new ArrayBuffer(64), a = new Uint8Array(buffer);",
         );
-        let buffer = engine
-            .eval_value("buffer")
-            .unwrap()
-            .unwrap_or_else(|_| panic!("read buffer"));
-        let ptr = Rc::as_ptr(buffer.as_obj().unwrap()) as usize;
+        let buffer = engine_value(&mut engine, "buffer");
+        let ptr = Gc::as_ptr(&buffer.as_obj().unwrap()) as usize;
         let storage = Rc::downgrade(engine.interp.local_buffer(ptr).unwrap());
         assert!(engine.interp.detach_array_buffer(&buffer));
         assert!(

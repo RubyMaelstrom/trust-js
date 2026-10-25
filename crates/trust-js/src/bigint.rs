@@ -1,6 +1,7 @@
-//! Arbitrary-precision BigInt, from scratch: sign + little-endian u64 magnitude behind an `Rc`
-//! (clones are cheap; every operation allocates a fresh value). Conformance needs exactness far
-//! past 128 bits (e.g. comparing a 1024-bit literal with `Number.MAX_VALUE`), not speed.
+//! Arbitrary-precision BigInt, from scratch: sign + little-endian u64 magnitude in a GC cell
+//! (clones are cheap; every operation allocates a fresh value).
+//! Conformance needs exactness far past 128 bits (e.g. comparing a 1024-bit literal with
+//! `Number.MAX_VALUE`), not speed.
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -67,8 +68,11 @@ fn unstoppable<T>(result: Result<T, Stop>) -> T {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct JsBigInt(Rc<BigIntData>);
+/// `repr(transparent)`: one cell handle, which the embedder's scoped BigInts
+/// (`scope::BigInt`) are too.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct JsBigInt(Payload);
 
 #[derive(Debug)]
 struct BigIntData {
@@ -76,6 +80,93 @@ struct BigIntData {
     neg: bool,
     /// Little-endian base-2^64 digits, no trailing zero limbs.
     mag: Vec<u64>,
+}
+
+/// The owner of a value's digits: a cell in the Agent heap that was active when the value was
+/// made (P1 S2).
+type Payload = crate::gc_box::GcBox<BigIntData>;
+
+#[inline]
+fn payload(data: BigIntData) -> Payload {
+    crate::gc_box::new(data)
+}
+
+impl crate::gc_box::Payload for BigIntData {
+    fn desc(heap: &crate::value::GcState) -> crate::gc_core::DescId {
+        heap.bigint_desc
+    }
+}
+
+/// The descriptor of BigInt cells: no edges; the finalizer frees the digits.
+pub(crate) fn cell_layout() -> crate::gc_core::LayoutDesc {
+    crate::gc_core::LayoutDesc {
+        name: "bigint",
+        trace: crate::gc_box::trace_none,
+        mark_trace: None,
+        finalize: Some(crate::gc_box::finalize::<BigIntData>),
+        carded: false,
+    }
+}
+
+/// A BigInt literal as the lexer, the AST and snapshots hold it: digits in the Rust heap,
+/// outside any GC heap, shared by every evaluation of the literal. [`BigIntLiteral::value`]
+/// makes the runtime value, a fresh cell.
+#[derive(Clone, Debug)]
+pub struct BigIntLiteral(Rc<BigIntData>);
+
+impl BigIntLiteral {
+    /// Parse digits (no sign) in the given radix.
+    pub fn parse_radix(text: &str, radix: u32) -> Option<Self> {
+        let mag = unstoppable(parse_magnitude(text, radix, &mut Poll::never()))?;
+        Some(BigIntLiteral(Rc::new(BigIntData {
+            neg: false,
+            mag: trim(mag),
+        })))
+    }
+
+    /// The literal's value.
+    #[inline]
+    pub fn value(&self) -> JsBigInt {
+        JsBigInt(payload(BigIntData {
+            neg: self.0.neg,
+            mag: self.0.mag.clone(),
+        }))
+    }
+
+    pub fn to_string_radix(&self, radix: u32) -> String {
+        unstoppable(digits_to_string(&self.0, radix, &mut Poll::never()))
+    }
+
+    pub(crate) fn allocation_identity(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
+    /// Requested payload/capacity bytes, excluding the implementation-private `RcBox` header.
+    pub(crate) fn retained_requested_bytes(&self) -> usize {
+        self.0.retained_requested_bytes()
+    }
+}
+
+impl PartialEq for BigIntLiteral {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.neg == other.0.neg && self.0.mag == other.0.mag
+    }
+}
+
+impl std::fmt::Display for BigIntLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_string_radix(10))
+    }
+}
+
+impl BigIntData {
+    fn retained_requested_bytes(&self) -> usize {
+        std::mem::size_of::<BigIntData>().saturating_add(
+            self.mag
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u64>()),
+        )
+    }
 }
 
 fn trim(mut mag: Vec<u64>) -> Vec<u64> {
@@ -220,28 +311,30 @@ fn radix_chunk(radix: u32) -> (u64, usize) {
 
 impl JsBigInt {
     pub(crate) fn allocation_identity(&self) -> usize {
-        Rc::as_ptr(&self.0) as usize
+        let identity = crate::gc_box::GcBox::as_ptr(&self.0);
+        identity as usize
     }
 
-    /// Requested payload/capacity bytes, excluding the implementation-private `RcBox` header.
+    /// The value's cell, as a GC edge.
+    #[inline]
+    pub(crate) fn cell_word(&self) -> u64 {
+        crate::gc_box::GcBox::as_ptr(&self.0) as u64
+    }
+
+    /// Requested payload/capacity bytes, excluding the cell's size-class rounding.
     pub(crate) fn retained_requested_bytes(&self) -> usize {
-        std::mem::size_of::<BigIntData>().saturating_add(
-            self.0
-                .mag
-                .capacity()
-                .saturating_mul(std::mem::size_of::<u64>()),
-        )
+        self.0.retained_requested_bytes()
     }
 
     pub fn zero() -> Self {
-        JsBigInt(Rc::new(BigIntData {
+        JsBigInt(payload(BigIntData {
             neg: false,
             mag: Vec::new(),
         }))
     }
     fn make(neg: bool, mag: Vec<u64>) -> Self {
         let mag = trim(mag);
-        JsBigInt(Rc::new(BigIntData {
+        JsBigInt(payload(BigIntData {
             neg: neg && !mag.is_empty(),
             mag,
         }))
@@ -347,7 +440,7 @@ impl JsBigInt {
         Some(unstoppable(self.pow_with(e, &mut Poll::never())))
     }
     fn pow_with(&self, mut e: u128, poll: &mut Poll) -> Result<Self, Stop> {
-        let mut base = self.clone();
+        let mut base = *self;
         let mut acc = Self::from_u64(1);
         while e > 0 {
             if e & 1 == 1 {
@@ -410,7 +503,7 @@ impl JsBigInt {
             return Ok(if self.0.neg && !odd {
                 Self::from_u64(1)
             } else {
-                self.clone()
+                *self
             });
         }
         // |base| >= 2, so base^e has at least (bits - 1) * e + 1 bits.
@@ -658,30 +751,7 @@ impl JsBigInt {
         radix: u32,
         poll: &mut Poll,
     ) -> Result<Option<Self>, Stop> {
-        if text.is_empty() {
-            return Ok(None);
-        }
-        // Fold a limb's worth of digits at a time into the accumulator.
-        let (_, width) = radix_chunk(radix);
-        let mut mag = Vec::new();
-        let mut digits = text.chars();
-        loop {
-            let mut scale = 1u64;
-            let mut value = 0u64;
-            for c in digits.by_ref().take(width) {
-                let Some(digit) = c.to_digit(radix) else {
-                    return Ok(None);
-                };
-                scale *= radix as u64;
-                value = value * radix as u64 + digit as u64;
-            }
-            if scale == 1 {
-                break;
-            }
-            poll.spend(mag.len() + 1)?;
-            mag_mul_add_small(&mut mag, scale, value);
-        }
-        Ok(Some(Self::make(false, mag)))
+        Ok(parse_magnitude(text, radix, poll)?.map(|mag| Self::make(false, mag)))
     }
     /// Decimal digits (used by StringToBigInt with an optional leading sign handled outside).
     pub fn parse_dec(text: &str) -> Option<Self> {
@@ -700,40 +770,72 @@ impl JsBigInt {
         radix: u32,
         poll: &mut Poll,
     ) -> Result<String, Stop> {
-        if self.is_zero() {
-            return Ok("0".to_string());
-        }
-        // Each pass divides by the largest power of the radix that fits in a limb and emits
-        // that many digits (least significant first; the last pass drops leading zeros).
-        let (chunk, width) = radix_chunk(radix);
-        let mut digits = Vec::new();
-        let mut cur = self.0.mag.clone();
-        while !cur.is_empty() {
-            poll.spend(cur.len())?;
-            let mut rem = 0u128;
-            for limb in cur.iter_mut().rev() {
-                let value = (rem << 64) | *limb as u128;
-                *limb = (value / chunk as u128) as u64;
-                rem = value % chunk as u128;
-            }
-            while cur.last() == Some(&0) {
-                cur.pop();
-            }
-            let mut rem = rem as u64;
-            for _ in 0..width {
-                if cur.is_empty() && rem == 0 {
-                    break;
-                }
-                let digit = (rem % radix as u64) as u32;
-                digits.push(std::char::from_digit(digit, radix).unwrap());
-                rem /= radix as u64;
-            }
-        }
-        if self.0.neg {
-            digits.push('-');
-        }
-        Ok(digits.iter().rev().collect())
+        digits_to_string(&self.0, radix, poll)
     }
+}
+
+/// The magnitude of digits (no sign) in the given radix; `Ok(None)` for a malformed string.
+fn parse_magnitude(text: &str, radix: u32, poll: &mut Poll) -> Result<Option<Vec<u64>>, Stop> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    // Fold a limb's worth of digits at a time into the accumulator.
+    let (_, width) = radix_chunk(radix);
+    let mut mag = Vec::new();
+    let mut digits = text.chars();
+    loop {
+        let mut scale = 1u64;
+        let mut value = 0u64;
+        for c in digits.by_ref().take(width) {
+            let Some(digit) = c.to_digit(radix) else {
+                return Ok(None);
+            };
+            scale *= radix as u64;
+            value = value * radix as u64 + digit as u64;
+        }
+        if scale == 1 {
+            break;
+        }
+        poll.spend(mag.len() + 1)?;
+        mag_mul_add_small(&mut mag, scale, value);
+    }
+    Ok(Some(mag))
+}
+
+fn digits_to_string(data: &BigIntData, radix: u32, poll: &mut Poll) -> Result<String, Stop> {
+    if data.mag.is_empty() {
+        return Ok("0".to_string());
+    }
+    // Each pass divides by the largest power of the radix that fits in a limb and emits
+    // that many digits (least significant first; the last pass drops leading zeros).
+    let (chunk, width) = radix_chunk(radix);
+    let mut digits = Vec::new();
+    let mut cur = data.mag.clone();
+    while !cur.is_empty() {
+        poll.spend(cur.len())?;
+        let mut rem = 0u128;
+        for limb in cur.iter_mut().rev() {
+            let value = (rem << 64) | *limb as u128;
+            *limb = (value / chunk as u128) as u64;
+            rem = value % chunk as u128;
+        }
+        while cur.last() == Some(&0) {
+            cur.pop();
+        }
+        let mut rem = rem as u64;
+        for _ in 0..width {
+            if cur.is_empty() && rem == 0 {
+                break;
+            }
+            let digit = (rem % radix as u64) as u32;
+            digits.push(std::char::from_digit(digit, radix).unwrap());
+            rem /= radix as u64;
+        }
+    }
+    if data.neg {
+        digits.push('-');
+    }
+    Ok(digits.iter().rev().collect())
 }
 
 impl std::fmt::Display for JsBigInt {

@@ -5,6 +5,7 @@
 //! other heaps sharing the Agent. Queue and index storage shrink geometrically under churn.
 
 use crate::fasthash::{FastMap, FastSet};
+use crate::gc_sweep::DeadObjects;
 use crate::interpreter::Interp;
 use crate::interpreter::{WeakKey, WeakTarget};
 use crate::value::Value;
@@ -270,7 +271,7 @@ impl Interp {
     /// are scheduled. ClearKeptObjects still belongs exclusively to the host job boundary.
     #[inline]
     pub(crate) fn gc_weak_metadata_safepoint(&mut self, force: bool) {
-        if self.gc_suppressed != 0 {
+        if self.gc_heap.agent.suppressed.get() != 0 {
             return;
         }
         let pending = self.weak_metadata.deaths.pending_len();
@@ -283,7 +284,10 @@ impl Interp {
         // A prior drain can have readied cells without queued deaths remaining. Forced job
         // checkpoints must still request owner validation/scheduling in that case. Neither
         // ClearKeptObjects nor host end_job is gated here (ECMA-262 #sec-weakref-invariants).
-        self.gc_task_pending |= !self.weak_metadata.ready_registries.is_empty();
+        self.gc_heap.agent.task_pending.set(
+            self.gc_heap.agent.task_pending.get()
+                || !self.weak_metadata.ready_registries.is_empty(),
+        );
     }
 
     /// Delete one weak entry and its identity index together. Weak collection order is not
@@ -296,21 +300,14 @@ impl Interp {
         else {
             return false;
         };
-        let entries = self
-            .weak_collection_data
-            .get_mut(&owner)
-            .expect("weak collection backing data");
-        let removed = entries.swap_remove(index);
+        let removed = self.weak_collection_data.swap_remove(owner, index);
         let lookup = &mut self
             .weak_collection_index
             .get_mut(&owner)
             .expect("weak collection index")
             .entries;
-        if let Some((moved, _)) = entries.get(index) {
+        if let Some((moved, _)) = self.weak_collection_data[&owner].get(index) {
             lookup.insert(moved.key(), index);
-        }
-        if entries.capacity() > entries.len().saturating_mul(4).max(32) {
-            entries.shrink_to(entries.len().saturating_mul(2).max(16));
         }
         shrink_map(lookup);
         self.weak_metadata
@@ -335,7 +332,9 @@ impl Interp {
                     self.weak_collection_remove(owner, key);
                 }
                 Subscriber::Registry(owner) => {
-                    if let Some(registry) = self.finalization_registries.get_mut(&owner) {
+                    if let Some(registry) =
+                        self.finalization_registries.get_mut(&self.gc_heap, &owner)
+                    {
                         if registry.cells.clear_target(key) != 0 {
                             self.weak_metadata.ready_registries.insert(owner);
                         }
@@ -345,21 +344,39 @@ impl Interp {
         }
     }
 
-    /// ECMA-262's atomic weak-clearing phase. Collector-proven cycles and acyclic destructor
-    /// notifications share this path. Never invoke author code here or while a queue is borrowed.
-    pub(crate) fn gc_clear_weak_targets(&mut self, dead: &FastSet<usize>) {
+    /// ECMA-262's atomic weak-clearing phase, for the objects a collection found dead and the
+    /// death notifications queued so far. Never invoke author code here or while a queue is
+    /// borrowed.
+    pub(crate) fn gc_clear_weak_targets(&mut self, dead: &DeadObjects<'_>) {
         #[cfg(test)]
         {
             self.weak_metadata.cleared_subscribers = 0;
         }
-        for &object in dead {
-            self.clear_weak_identity(WeakKey::Object(object));
+        // Walk the smaller side: the observed targets (a few hundred at most on the gate
+        // workloads), asking the view about each, or the dead (tens of thousands).
+        if self.weak_metadata.targets.len() < dead.len() {
+            let objects: Vec<usize> = self
+                .weak_metadata
+                .targets
+                .keys()
+                .filter_map(|&key| match key {
+                    WeakKey::Object(object) if dead.contains(object) => Some(object),
+                    _ => None,
+                })
+                .collect();
+            for object in objects {
+                self.clear_weak_identity(WeakKey::Object(object));
+            }
+        } else {
+            for object in dead.iter() {
+                self.clear_weak_identity(WeakKey::Object(object));
+            }
         }
         self.gc_drain_weak_deaths();
     }
 
-    /// Also called after snapshots/strong edges are released: symbols and acyclic descendants
-    /// can die during that phase, so a single pre-sweep drain is insufficient.
+    /// Also called after the sweep: finalizers (an object's, a Symbol's) queue death
+    /// notifications as cells are freed, so a single pre-sweep drain is insufficient.
     #[inline(never)]
     pub(crate) fn gc_drain_weak_deaths(&mut self) {
         loop {
@@ -377,20 +394,43 @@ impl Interp {
         }
     }
 
-    pub(crate) fn gc_schedule_finalization_cleanup(&mut self, dead: &FastSet<usize>) {
+    /// Schedule the cleanup of every ready registry that has ready cells. Between a
+    /// collection's phases `dead` names the objects it found dead, whose registries are
+    /// skipped; after its sweep, where no view can answer, it is `None` (see
+    /// `Interp::gc_heap_after_sweep` for why no ready registry is dead there).
+    pub(crate) fn gc_schedule_finalization_cleanup(&mut self, dead: Option<&DeadObjects<'_>>) {
         let ready: Vec<_> = self.weak_metadata.ready_registries.drain().collect();
+        let route = self.realm_route();
         for owner in ready {
-            if dead.contains(&owner) {
+            if dead.is_some_and(|dead| dead.contains(owner)) {
                 continue;
             }
-            let Some(registry) = self.finalization_registries.get_mut(&owner) else {
+            let Some(registry) = self.finalization_registries.get_mut(&self.gc_heap, &owner) else {
                 continue;
             };
+            // A destroyed registry task context cannot regain queued work at a later GC.
+            // Inactive contexts, and a distinct callback/incumbent context, are not discarded.
+            if self
+                .retired_host_job_contexts
+                .contains(&registry.registry_context)
+            {
+                continue;
+            }
             if !registry.cleanup_scheduled && registry.cells.has_ready() {
                 if let Some(object) = self.gc_pins.get(&owner) {
                     registry.cleanup_scheduled = true;
-                    self.pending_finalization_cleanup
-                        .push_back(Value::Obj(object.clone()));
+                    self.gc_heap.agent.work.borrow_mut().cleanup.push_back(
+                        crate::agent_control::Routed {
+                            route: route.clone(),
+                            payload: crate::agent_control::Cleanup {
+                                registry: Value::Obj(*object),
+                                registry_realm: registry.registry_realm,
+                                registry_context: registry.registry_context,
+                                callback_realm: registry.callback_realm,
+                                callback_context: registry.callback_context,
+                            },
+                        },
+                    );
                 }
             }
         }
@@ -400,18 +440,17 @@ impl Interp {
         }
     }
 
-    pub(crate) fn gc_forget_weak_owners(&mut self, dead: &FastSet<usize>) {
-        fn owners<V>(table: &FastMap<usize, V>, dead: &FastSet<usize>) -> Vec<usize> {
+    pub(crate) fn gc_forget_weak_owners(&mut self, dead: &DeadObjects<'_>) {
+        fn owners<V>(table: &FastMap<usize, V>, dead: &DeadObjects<'_>) -> Vec<usize> {
             if table.len() < dead.len() {
                 table
                     .keys()
-                    .filter(|owner| dead.contains(owner))
+                    .filter(|&&owner| dead.contains(owner))
                     .copied()
                     .collect()
             } else {
                 dead.iter()
                     .filter(|owner| table.contains_key(owner))
-                    .copied()
                     .collect()
             }
         }
@@ -440,9 +479,9 @@ impl Interp {
             drop(registry);
         }
         shrink_map(&mut self.weak_refs);
-        shrink_map(&mut self.weak_collection_data);
+        self.weak_collection_data.shrink();
         shrink_map(&mut self.weak_collection_index);
-        shrink_map(&mut self.finalization_registries);
+        self.finalization_registries.shrink();
     }
 
     /// Native base constructors graft their internal slots onto a derived instance. Subscription
@@ -466,7 +505,8 @@ impl Interp {
                 self.weak_metadata
                     .unsubscribe(target.key(), Subscriber::Collection(source));
             }
-            self.weak_collection_data.insert(destination, entries);
+            self.weak_collection_data
+                .insert(&self.gc_heap, destination, entries);
             if let Some(index) = self.weak_collection_index.remove(&source) {
                 self.weak_collection_index.insert(destination, index);
             }
@@ -479,7 +519,8 @@ impl Interp {
                 self.weak_metadata
                     .unsubscribe(target.key(), Subscriber::Registry(source));
             }
-            self.finalization_registries.insert(destination, registry);
+            self.finalization_registries
+                .insert(&self.gc_heap, destination, registry);
             if self.weak_metadata.ready_registries.remove(&source) {
                 self.weak_metadata.ready_registries.insert(destination);
             }
@@ -492,7 +533,8 @@ impl Interp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{Gc, GcCause, Object};
+    use crate::value::ValueView;
+    use crate::value::{Gc, Object};
     use crate::{Completion, Engine};
 
     fn eval(engine: &mut Engine, source: &str, expected: &str) {
@@ -507,7 +549,7 @@ mod tests {
 
     fn reference(interp: &mut Interp, target: &WeakTarget) -> Gc {
         let owner = Object::new(None);
-        let identity = Rc::as_ptr(&owner) as usize;
+        let identity = Gc::as_ptr(&owner) as usize;
         interp.gc_pin(&owner);
         interp.weak_refs.insert(identity, Some(target.clone()));
         interp
@@ -570,24 +612,33 @@ mod tests {
         }
     }
 
+    /// Subscribing to a target that has already died journals its death at once, once per
+    /// queue whatever the queue's number of subscribers; consuming the queue's batch and the
+    /// subscribers leaves nothing pending.
     #[test]
     fn weak_metadata_already_dead_subscription_counts_each_queue_once() {
         for symbol in [false, true] {
             let mut engine = Engine::new();
-            let value = if symbol {
-                engine.interp.new_symbol(None)
-            } else {
-                Value::Obj(Object::new(None))
-            };
-            let target = WeakTarget::of(&value).unwrap();
-            drop(value);
-            assert!(target.upgrade().is_none());
+            // The target's strong handles live only in this helper frame (the collector scans the
+            // stack). Keep the weak token itself off the scanned stack too: inactive enum
+            // payload words can contain an old cell address.
+            let target = crate::gc_test::in_frame(|| {
+                let value = if symbol {
+                    engine.interp.new_symbol(None)
+                } else {
+                    Value::Obj(Object::new(None))
+                };
+                Box::new(WeakTarget::of(&value).unwrap())
+            });
+            let target = target.as_ref();
+            engine.interp.gc_collect();
+            assert!(!crate::gc_test::alive(target));
             let mut first = WeakMetadata::default();
             let mut second = WeakMetadata::default();
             first.subscribe(target.clone(), Subscriber::WeakRef(1));
             first.subscribe(target.clone(), Subscriber::WeakRef(2));
             second.subscribe(target.clone(), Subscriber::WeakRef(3));
-            crate::value::observe_weak_target(&target, &second.deaths);
+            crate::value::observe_weak_target(target, &second.deaths);
             assert_eq!(first.deaths.pending_len(), 1);
             assert_eq!(second.deaths.pending_len(), 1);
             first.unsubscribe(target.key(), Subscriber::WeakRef(1));
@@ -610,55 +661,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn weak_metadata_empty_safepoints_do_not_borrow_and_preserve_ready_cleanup() {
-        let mut engine = Engine::new();
-        let queue = engine.interp.weak_metadata.deaths.clone();
-        {
-            let _borrowed = queue.entries.borrow_mut();
-            engine.interp.gc_weak_metadata_safepoint(false);
-            engine.interp.gc_weak_metadata_safepoint(true);
-            engine.interp.gc_drain_weak_deaths();
-            assert_eq!(queue.pending_len(), 0);
-        }
-        // A previous drain can leave ready registries while the death journal is empty.
-        // These cells request scheduling only at a task boundary; no callback runs here.
-        engine.interp.gc_suppressed += 1;
-        eval(&mut engine,
-            "var calls=0, registry=new FinalizationRegistry(()=>calls++);registry.register(Symbol('ready'),7);calls", "0");
-        engine.interp.gc_suppressed -= 1;
-        engine.interp.gc_drain_weak_deaths();
-        assert_eq!(queue.pending_len(), 0);
-        assert!(!engine.interp.weak_metadata.ready_registries.is_empty());
-        assert!(engine.interp.pending_finalization_cleanup.is_empty());
-        engine.interp.gc_task_pending = false;
-        let _borrowed = queue.entries.borrow_mut();
-        engine.interp.gc_suppressed += 1;
-        engine.interp.gc_weak_metadata_safepoint(true);
-        assert!(
-            !engine.interp.gc_task_pending,
-            "suppression preserves the scheduling boundary"
-        );
-        engine.interp.gc_suppressed -= 1;
-        engine.interp.gc_weak_metadata_safepoint(false);
-        assert!(
-            !engine.interp.gc_task_pending,
-            "nonforced empty gate retains batching policy"
-        );
-        engine.interp.gc_weak_metadata_safepoint(true);
-        assert!(engine.interp.gc_task_pending);
-        assert!(engine.interp.pending_finalization_cleanup.is_empty());
-    }
-
+    /// A task boundary runs ClearKeptObjects and the host's end_job hook even with no death
+    /// queued, where a safepoint runs neither: the target kept for the job survives a
+    /// collection until then, and the first collection after it clears the target's WeakRef. An
+    /// entirely empty later boundary still runs the hook.
+    #[cfg(feature = "embed")]
     #[test]
     fn weak_metadata_empty_queue_does_not_skip_kept_objects_or_host_job_hooks() {
+        /// Reports `held` as a root until the job ends.
         struct JobRoots {
             calls: Rc<Cell<usize>>,
-            held: Option<Value>,
+            held: Option<crate::handles::WeakHandle>,
         }
+        impl crate::host::HostTrace for JobRoots {
+            fn trace_gc(&self, visitor: &mut dyn crate::host::HostGcVisitor) {
+                if let Some(held) = &self.held {
+                    visitor.root(held);
+                }
+            }
+        }
+
         impl crate::host::HostGc for JobRoots {
-            fn trace_gc(&self, _: &mut dyn crate::host::HostGcVisitor) {}
-            fn sweep_gc(&mut self, _: &dyn Fn(&Value) -> bool) {}
+            fn sweep_gc_with_native(&mut self, _: &dyn Fn(crate::host::NativeGcId) -> bool) {}
             fn end_job(&mut self) {
                 self.calls.set(self.calls.get() + 1);
                 self.held = None;
@@ -666,33 +690,46 @@ mod tests {
         }
         let mut engine = Engine::new();
         let calls = Rc::new(Cell::new(0));
-        let value = Value::Obj(Object::new(None));
-        let target = WeakTarget::of(&value).unwrap();
-        let owner = reference(&mut engine.interp, &target);
-        engine.interp.kept_alive.push(value.clone());
-        engine.interp.host_state.put(JobRoots {
-            calls: calls.clone(),
-            held: Some(value),
+        // The target's strong handles live only in this helper frame (the collector scans the
+        // stack). Keep the weak token itself off the scanned stack too: inactive enum
+        // payload words can contain an old cell address.
+        let (target, owner) = crate::gc_test::in_frame(|| {
+            let value = Value::Obj(Object::new(None));
+            let target = WeakTarget::of(&value).unwrap();
+            let owner = reference(&mut engine.interp, &target);
+            engine.interp.add_kept_object(value);
+            let held = engine.scope(|cx| {
+                crate::handles::WeakHandle::new(cx, &crate::scope::Value::from_internal(value))
+                    .expect("a weak handle")
+            });
+            engine.interp.host_state.put(JobRoots {
+                calls: calls.clone(),
+                held: Some(held),
+            });
+            (Box::new(target), owner)
         });
+        let target = target.as_ref();
         engine.interp.host_state.register_gc::<JobRoots>();
         let queue = engine.interp.weak_metadata.deaths.clone();
         engine.interp.gc_weak_metadata_safepoint(true);
         assert_eq!(calls.get(), 0);
+        engine.interp.gc_collect();
         assert!(
-            target.upgrade().is_some(),
+            crate::gc_test::alive(target),
             "safepoints do not end synchronous work"
         );
-        assert_eq!(engine.interp.kept_alive.len(), 1);
-        engine.interp.gc_task_deferred = true;
-        engine.interp.gc_task_boundary();
+        assert_eq!(engine.interp.gc_heap.agent.kept_alive.borrow().len(), 1);
+        engine.interp.gc_heap.agent.task_deferred.set(true);
+        engine.interp.drain_microtasks();
         assert_eq!(calls.get(), 1);
-        assert!(engine.interp.kept_alive.is_empty());
-        assert!(target.upgrade().is_none());
-        assert!(engine.interp.weak_refs[&(Rc::as_ptr(&owner) as usize)].is_none());
+        assert!(engine.interp.gc_heap.agent.kept_alive.borrow().is_empty());
+        engine.interp.gc_collect();
+        assert!(!crate::gc_test::alive(target));
+        assert!(engine.interp.weak_refs[&(Gc::as_ptr(&owner) as usize)].is_none());
         assert_eq!(queue.pending_len(), 0);
         // Even an entirely empty subsequent checkpoint must notify the host exactly once.
         let _borrowed = queue.entries.borrow_mut();
-        engine.interp.gc_task_boundary();
+        engine.interp.drain_microtasks();
         assert_eq!(calls.get(), 2);
         assert_eq!(queue.pending_len(), 0);
     }
@@ -731,8 +768,8 @@ mod tests {
         "#,
                 "true",
             );
-            assert!(engine.interp.kept_alive.is_empty());
-            engine.interp.gc_collect_young(GcCause::Explicit);
+            assert!(engine.interp.gc_heap.agent.kept_alive.borrow().is_empty());
+            engine.interp.gc_collect();
             assert_eq!(engine.interp.weak_metadata.cleared_subscribers, 5);
             assert_eq!(engine.interp.weak_metadata.targets.len(), stable_count);
             assert_eq!(
@@ -774,13 +811,15 @@ mod tests {
                     }
                 );
                 eval(&mut engine, &source, "true");
+                // The collection reclaims the target.
+                engine.interp.gc_collect();
                 assert!(
                     engine
                         .interp
                         .weak_refs
                         .values()
                         .flatten()
-                        .all(|target| target.upgrade().is_none()),
+                        .all(|target| !crate::gc_test::alive(&target)),
                     "WeakSet retained its acyclic target"
                 );
                 assert!(engine
@@ -788,8 +827,8 @@ mod tests {
                     .weak_collection_data
                     .values()
                     .flatten()
-                    .all(|(_, value)| matches!(value, Value::Undefined)));
-                engine.interp.gc_collect_young(GcCause::Explicit);
+                    .all(|(_, value)| matches!((value).view(), ValueView::Undefined)));
+                engine.interp.gc_collect();
                 assert!(engine
                     .interp
                     .weak_collection_data
@@ -851,74 +890,24 @@ mod tests {
         }
     }
 
+    /// Symbol-only weak churn inside one job: once a collection has found the Symbols dead, the
+    /// weak index, the death queue and the collections' entries are empty again, with their
+    /// storage shrunk back from the churn's high-water mark.
     #[test]
-    fn weak_metadata_acyclic_ephemeron_value_deaths_drain_to_fixed_point() {
-        for symbol in [false, true] {
-            let mut engine = Engine::new();
-            let source = format!(
-                r#"
-                var map=new WeakMap(), refs=[], cleaned=[];
-                var registry=new FinalizationRegistry(x=>cleaned.push(x));
-                (()=>{{let a={{}},b={};
-                    map.set(a,b);refs.push(new WeakRef(a),new WeakRef(b));
-                    registry.register(a,'a');registry.register(b,'b');}})();true
-            "#,
-                if symbol { "Symbol('cascade')" } else { "{}" }
-            );
-            // Isolate the collector's fixed point from normal job-boundary queue draining.
-            engine.interp.gc_suppressed += 1;
-            eval(&mut engine, &source, "true");
-            engine.interp.gc_suppressed -= 1;
-            engine.interp.clear_kept_objects();
-            // a died at the job boundary, before any nursery snapshot; b is held only by its
-            // ephemeron payload. Processing a must release b and consume b's new notification.
-            assert_ne!(engine.interp.weak_metadata.deaths.pending_len(), 0);
-            engine.interp.gc_collect_young(GcCause::Explicit);
-            assert!(engine
-                .interp
-                .weak_collection_data
-                .values()
-                .all(Vec::is_empty));
-            assert!(engine.interp.weak_refs.values().all(Option::is_none));
-            assert!(engine.interp.weak_metadata.targets.is_empty());
-            assert_eq!(engine.interp.weak_metadata.deaths.pending_len(), 0);
-            eval(&mut engine, "true", "true");
-            eval(&mut engine, "cleaned.sort().join(',')", "a,b");
-        }
-    }
-
-    #[test]
-    fn weak_metadata_symbol_only_churn_is_bounded_inside_one_job() {
+    fn weak_metadata_symbol_only_churn_shrinks_once_collected() {
         let mut engine = Engine::new();
-        let global = engine.interp.global.clone();
-        engine
-            .interp
-            .def_method(&global, "checkWeakChurn", 0, |interp, _, _| {
-                assert!(interp.weak_metadata.deaths.pending_len() <= DEATH_BATCH_LIMIT);
-                assert!(interp.weak_metadata.targets.len() <= DEATH_BATCH_LIMIT + 1);
-                for entries in interp.weak_collection_data.values() {
-                    assert!(entries.len() <= DEATH_BATCH_LIMIT + 1);
-                    assert!(entries.capacity() <= DEATH_BATCH_LIMIT * 4);
-                }
-                Ok(Value::Undefined)
-            });
-        let allocated = crate::value::heap_allocated_objects(&engine.interp.gc_heap);
         eval(
             &mut engine,
             r#"
             var map=new WeakMap(),set=new WeakSet();
             for(let i=0;i<30000;i++) {
                 let target=Symbol('churn');map.set(target,i);set.add(target);
-                if((i&1023)===0)checkWeakChurn();
             }
             true
         "#,
             "true",
         );
-        assert!(
-            crate::value::heap_allocated_objects(&engine.interp.gc_heap) - allocated < 1000,
-            "fixture accidentally relied on heavy object allocation GC"
-        );
+        engine.interp.gc_collect();
         assert!(engine.interp.weak_metadata.targets.is_empty());
         assert_eq!(engine.interp.weak_metadata.deaths.pending_len(), 0);
         assert!(engine.interp.weak_metadata.targets.capacity() <= 64);
@@ -940,19 +929,15 @@ mod tests {
     }
 
     #[test]
-    fn weak_metadata_safepoint_honors_suppression_and_validates_cleanup_owners() {
-        let mut engine = Engine::new();
-        let value = engine.interp.new_symbol(None);
-        let target = WeakTarget::of(&value).unwrap();
-        let reference = reference(&mut engine.interp, &target);
-        drop(value);
-        engine.interp.gc_suppressed += 1;
-        engine.interp.gc_weak_metadata_safepoint(true);
-        assert_eq!(engine.interp.weak_metadata.deaths.pending_len(), 1);
-        engine.interp.gc_suppressed -= 1;
-        engine.interp.gc_weak_metadata_safepoint(true);
-        assert!(engine.interp.weak_refs[&(Rc::as_ptr(&reference) as usize)].is_none());
+    fn weak_metadata_safepoint_validates_cleanup_owners() {
+        // Under GC stress a collection inside the loop finds targets dead while the registry
+        // is still live and enqueues its cleanup job, which keeps the registry alive and runs at
+        // the evaluation's own checkpoint: only the kept registry's final results are timing-free.
+        let stress = crate::gc_test::stress_active();
         for keep_owner in [false, true] {
+            if !keep_owner && stress {
+                continue;
+            }
             let mut engine = Engine::new();
             let source = format!(
                 r#"
@@ -965,43 +950,20 @@ mod tests {
                 if keep_owner { "registry=owner;" } else { "" }
             );
             eval(&mut engine, &source, "0");
-            assert_eq!(
-                !engine.interp.pending_finalization_cleanup.is_empty(),
-                keep_owner
-            );
+            // The collection finds the registered Symbols dead, with a dead registry's cells.
+            engine.interp.gc_collect();
+            if !stress {
+                assert_eq!(
+                    !engine.interp.gc_heap.agent.work.borrow().cleanup.is_empty(),
+                    keep_owner
+                );
+            }
             eval(&mut engine, "true", "true");
             eval(
                 &mut engine,
                 "results.length",
                 if keep_owner { "600" } else { "0" },
             );
-        }
-    }
-
-    #[test]
-    fn weak_metadata_object_and_symbol_notify_separate_observer_heaps() {
-        for symbol in [false, true] {
-            let mut first = Engine::new();
-            let target = if symbol {
-                first.interp.new_symbol(None)
-            } else {
-                Value::Obj(Object::new(None))
-            };
-            let weak = WeakTarget::of(&target).unwrap();
-            let first_ref = reference(&mut first.interp, &weak);
-            let first_ref_again = reference(&mut first.interp, &weak);
-            let mut second = Interp::new_with_symbol_agent(first.interp.symbol_agent.clone());
-            let second_ref = reference(&mut second, &weak);
-            drop(target); // currently active Agent/heap is deliberately the *other* one
-            assert_eq!(first.interp.weak_metadata.deaths.pending_len(), 1);
-            assert_eq!(second.weak_metadata.deaths.pending_len(), 1);
-            first.interp.gc_clear_weak_targets(&FastSet::default());
-            second.gc_clear_weak_targets(&FastSet::default());
-            assert!(first.interp.weak_refs[&(Rc::as_ptr(&first_ref) as usize)].is_none());
-            assert!(first.interp.weak_refs[&(Rc::as_ptr(&first_ref_again) as usize)].is_none());
-            assert!(second.weak_refs[&(Rc::as_ptr(&second_ref) as usize)].is_none());
-            assert_eq!(first.interp.weak_metadata.deaths.pending_len(), 0);
-            assert_eq!(second.weak_metadata.deaths.pending_len(), 0);
         }
     }
 
@@ -1021,37 +983,54 @@ mod tests {
             "target retained its observer heap queue"
         );
         drop(target);
-        second.interp.gc_clear_weak_targets(&FastSet::default());
-        assert!(second.interp.weak_refs[&(Rc::as_ptr(&other_owner) as usize)].is_none());
+        second
+            .interp
+            .gc_clear_weak_targets(&DeadObjects::from_list(Vec::new()));
+        assert!(second.interp.weak_refs[&(Gc::as_ptr(&other_owner) as usize)].is_none());
     }
 
+    /// A target kept for the current job survives a collection, and the first collection after
+    /// ClearKeptObjects clears its WeakRef. A WeakRef that dies before its target leaves no
+    /// subscription behind, and the target lives on.
     #[test]
     fn weak_metadata_kept_target_and_owner_retirement_preserve_job_semantics() {
         let mut engine = Engine::new();
-        let target = Value::Obj(Object::new(None));
-        let weak = WeakTarget::of(&target).unwrap();
-        let owner = reference(&mut engine.interp, &weak);
-        engine.interp.kept_alive.push(target.clone());
-        drop(target);
-        engine.interp.gc_collect_young(GcCause::Explicit);
+        // The target's strong handles live only in this helper frame (the collector scans the
+        // stack). Keep the weak token itself off the scanned stack too: inactive enum
+        // payload words can contain an old cell address.
+        let (weak, owner) = crate::gc_test::in_frame(|| {
+            let target = Value::Obj(Object::new(None));
+            let weak = WeakTarget::of(&target).unwrap();
+            let owner = reference(&mut engine.interp, &weak);
+            engine.interp.add_kept_object(target);
+            (Box::new(weak), owner)
+        });
+        let weak = weak.as_ref();
+        engine.interp.gc_collect();
         assert!(
-            weak.upgrade().is_some(),
+            crate::gc_test::alive(weak),
             "same-job KeptAlive target was cleared"
         );
-        engine.interp.clear_kept_objects();
-        engine.interp.gc_collect_young(GcCause::Explicit);
-        assert!(engine.interp.weak_refs[&(Rc::as_ptr(&owner) as usize)].is_none());
+        engine.interp.drain_microtasks();
+        engine.interp.gc_collect();
+        assert!(engine.interp.weak_refs[&(Gc::as_ptr(&owner) as usize)].is_none());
         let other = Value::Obj(Object::new(None));
         let other_weak = WeakTarget::of(&other).unwrap();
-        let ephemeral_owner = reference(&mut engine.interp, &other_weak);
-        drop(ephemeral_owner);
-        engine.interp.gc_collect_young(GcCause::Explicit);
+        // The second WeakRef's handle lives only in this helper frame; after it only the
+        // WeakRef's pin, which is not a root, names it.
+        crate::gc_test::in_frame(|| {
+            let _owner = reference(&mut engine.interp, &other_weak);
+        });
+        engine.interp.gc_collect();
         assert!(!engine
             .interp
             .weak_metadata
             .targets
             .contains_key(&other_weak.key()));
-        assert!(other_weak.upgrade().is_some());
+        assert!(crate::gc_test::alive(&other_weak));
+        // `other` holds the target through the collections: a Value is a plain word, which an
+        // optimized build would otherwise let go after its last use above.
+        std::hint::black_box(&other);
     }
 
     #[test]
@@ -1150,22 +1129,6 @@ mod tests {
     }
 
     #[test]
-    fn weak_metadata_symbol_destruction_does_not_reborrow_its_agent() {
-        let mut engine = Engine::new();
-        let Value::Sym(symbol) = engine.interp.new_symbol(None) else {
-            unreachable!()
-        };
-        let target = WeakTarget::Symbol(Rc::downgrade(&symbol), symbol.id);
-        let owner = reference(&mut engine.interp, &target);
-        let agent = engine.interp.symbol_agent.clone();
-        let borrowed = agent.borrow_mut();
-        drop(symbol);
-        drop(borrowed);
-        engine.interp.gc_drain_weak_deaths();
-        assert!(engine.interp.weak_refs[&(Rc::as_ptr(&owner) as usize)].is_none());
-    }
-
-    #[test]
     fn weak_metadata_symbol_property_keys_are_strong_and_registered_symbols_stay_ineligible() {
         let mut engine = Engine::new();
         eval(
@@ -1183,7 +1146,7 @@ mod tests {
         engine.interp.gc_collect();
         eval(&mut engine, "typeof reference.deref()", "symbol");
         eval(&mut engine, "holder=null;true", "true");
-        engine.interp.gc_collect_young(GcCause::Explicit);
+        engine.interp.gc_collect();
         eval(&mut engine, "String(reference.deref()===undefined)", "true");
     }
 }

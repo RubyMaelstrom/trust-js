@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::value::ValueView;
 
 /// `DisposableStack` / `AsyncDisposableStack` (explicit resource management). Disposers are
 /// stored as `[fn, thisArg(, adoptedValue)]` entries in an internal array and run LIFO on
@@ -20,8 +21,8 @@ fn ds_brand(i: &mut Interp, this: &Value, async_kind: bool) -> Result<Gc, Value>
         .internal_slots()
         .get("#\u{0}ds_kind")
         .map(|p| p.value());
-    match kind {
-        Some(Value::Str(k)) if &*k == want => Ok(o),
+    match (kind).map(|__value| (__value).view()) {
+        Some(ValueView::Str(k)) if &*k == want => Ok(o),
         _ => Err(i.make_error("TypeError", format!("receiver is not a {name}"))),
     }
 }
@@ -51,7 +52,7 @@ fn ds_combine_error(i: &mut Interp, pending: Option<Value>, new: Value) -> Value
                 .get("SuppressedError")
                 .map(|p| p.value())
                 .unwrap_or(Value::Undefined);
-            i.construct(ctor, &[new.clone(), prev]).unwrap_or(new)
+            i.construct(ctor, &[new, prev]).unwrap_or(new)
         }
     }
 }
@@ -126,35 +127,35 @@ fn adisp_reaction(
             adisp_react_reject
         },
     );
-    let bound = Object::new(Some(i.function_proto.clone()));
+    let bound = Object::new(Some(i.function_proto));
     bound.borrow_mut().call = Callable::bound(
         target,
         Value::Undefined,
         vec![
-            list.clone(),
+            *list,
             Value::Num(idx as f64),
-            result.clone(),
+            *result,
             Value::Bool(err.is_some()),
-            err.clone().unwrap_or(Value::Undefined),
+            (*err).unwrap_or(Value::Undefined),
         ],
     );
     Value::Obj(bound)
 }
 fn adisp_react_fulfil(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let idx = match arg(a, 1) {
-        Value::Num(n) => n as i64,
+    let idx = match (arg(a, 1)).view() {
+        ValueView::Num(n) => n as i64,
         _ => return Ok(Value::Undefined),
     };
-    let err = matches!(arg(a, 3), Value::Bool(true)).then(|| arg(a, 4));
+    let err = matches!((arg(a, 3)).view(), ValueView::Bool(true)).then(|| arg(a, 4));
     adisp_run(i, arg(a, 0), idx, arg(a, 2), err);
     Ok(Value::Undefined)
 }
 fn adisp_react_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let idx = match arg(a, 1) {
-        Value::Num(n) => n as i64,
+    let idx = match (arg(a, 1)).view() {
+        ValueView::Num(n) => n as i64,
         _ => return Ok(Value::Undefined),
     };
-    let prev = matches!(arg(a, 3), Value::Bool(true)).then(|| arg(a, 4));
+    let prev = matches!((arg(a, 3)).view(), ValueView::Bool(true)).then(|| arg(a, 4));
     let err = Some(ds_combine_error(i, prev, arg(a, 5)));
     adisp_run(i, arg(a, 0), idx, arg(a, 2), err);
     Ok(Value::Undefined)
@@ -167,8 +168,8 @@ fn ds_sync_dispose_wrapper(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Val
 }
 
 pub(super) fn install_disposable_stack(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("DisposableStack", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("DisposableStack", proto);
     set_to_string_tag(it, &proto, "DisposableStack");
 
     it.def_method(&proto, "use", 1, |i, this, a| {
@@ -177,13 +178,13 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
             return Err(i.make_error("ReferenceError", "DisposableStack already disposed"));
         }
         let v = arg(a, 0);
-        if !matches!(v, Value::Undefined | Value::Null) {
+        if !matches!((v).view(), ValueView::Undefined | ValueView::Null) {
             let key = well_known_key(i, "dispose").unwrap_or_default();
             let disp = ab(i.get_member_key(&v, &key))?;
             if !disp.is_callable() {
                 return Err(i.make_error("TypeError", "value is not disposable"));
             }
-            let entry = i.make_array(vec![disp, v.clone()]);
+            let entry = i.make_array(vec![disp, v]);
             ds_push(i, &this, entry)?;
         }
         Ok(v)
@@ -198,7 +199,7 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
         if !on.is_callable() {
             return Err(i.make_error("TypeError", "onDispose is not callable"));
         }
-        let entry = i.make_array(vec![on, Value::Undefined, v.clone()]);
+        let entry = i.make_array(vec![on, Value::Undefined, v]);
         ds_push(i, &this, entry)?;
         Ok(v)
     });
@@ -221,7 +222,7 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
             return Ok(Value::Undefined);
         }
         set_internal(
-            this.as_obj().unwrap(),
+            &this.as_obj().unwrap(),
             "#\u{0}ds_disposed",
             Value::Bool(true),
         );
@@ -252,9 +253,9 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
         set_internal(&fresh, "#\u{0}ds_kind", Value::lstr("sync"));
         set_internal(&fresh, "#\u{0}ds_disposed", Value::Bool(false));
         let empty = i.make_array(Vec::new());
-        set_internal(this.as_obj().unwrap(), "#\u{0}ds", empty);
+        set_internal(&this.as_obj().unwrap(), "#\u{0}ds", empty);
         set_internal(
-            this.as_obj().unwrap(),
+            &this.as_obj().unwrap(),
             "#\u{0}ds_disposed",
             Value::Bool(true),
         );
@@ -289,12 +290,12 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     set_builtin(&it.global, "DisposableStack", Value::Obj(ctor));
 
     install_async_disposable_stack(it);
@@ -303,8 +304,8 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
 /// `AsyncDisposableStack`: like DisposableStack but disposers may be async; `disposeAsync` returns
 /// a promise, awaiting each disposer result through real microtasks.
 pub(super) fn install_async_disposable_stack(it: &mut Interp) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("AsyncDisposableStack", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("AsyncDisposableStack", proto);
     set_to_string_tag(it, &proto, "AsyncDisposableStack");
 
     it.def_method(&proto, "use", 1, |i, this, a| {
@@ -313,7 +314,7 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
             return Err(i.make_error("ReferenceError", "AsyncDisposableStack already disposed"));
         }
         let v = arg(a, 0);
-        if matches!(v, Value::Undefined | Value::Null) {
+        if matches!((v).view(), ValueView::Undefined | ValueView::Null) {
             // AddDisposableResource records an await-only sentinel for a nullish async resource.
             let entry = i.make_array(vec![Value::Undefined]);
             ds_push(i, &this, entry)?;
@@ -333,12 +334,11 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         // A sync @@dispose fallback has its result discarded — only Await(undefined) follows —
         // so wrap it rather than exposing the raw method to the awaiting disposal loop.
         let entry = if from_async {
-            i.make_array(vec![disp, v.clone()])
+            i.make_array(vec![disp, v])
         } else {
             let target = i.make_native("", 0, ds_sync_dispose_wrapper);
-            let bound = Object::new(Some(i.function_proto.clone()));
-            bound.borrow_mut().call =
-                Callable::bound(target, Value::Undefined, vec![disp, v.clone()]);
+            let bound = Object::new(Some(i.function_proto));
+            bound.borrow_mut().call = Callable::bound(target, Value::Undefined, vec![disp, v]);
             i.make_array(vec![Value::Obj(bound), Value::Undefined])
         };
         ds_push(i, &this, entry)?;
@@ -354,7 +354,7 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         if !on.is_callable() {
             return Err(i.make_error("TypeError", "onDisposeAsync is not callable"));
         }
-        let entry = i.make_array(vec![on, Value::Undefined, v.clone()]);
+        let entry = i.make_array(vec![on, Value::Undefined, v]);
         ds_push(i, &this, entry)?;
         Ok(v)
     });
@@ -383,14 +383,14 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
             return Ok(result);
         }
         set_internal(
-            this.as_obj().unwrap(),
+            &this.as_obj().unwrap(),
             "#\u{0}ds_disposed",
             Value::Bool(true),
         );
         let list = ds_list(i, &this)?;
         let len = ab(i.get_member_key(&list, "length"))?;
         let n = ab(i.to_number(&len))? as i64;
-        adisp_run(i, list, n - 1, result.clone(), None);
+        adisp_run(i, list, n - 1, result, None);
         Ok(result)
     });
     it.def_method(&proto, "move", 0, |i, this, _| {
@@ -404,9 +404,9 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         set_internal(&fresh, "#\u{0}ds_kind", Value::lstr("async"));
         set_internal(&fresh, "#\u{0}ds_disposed", Value::Bool(false));
         let empty = i.make_array(Vec::new());
-        set_internal(this.as_obj().unwrap(), "#\u{0}ds", empty);
+        set_internal(&this.as_obj().unwrap(), "#\u{0}ds", empty);
         set_internal(
-            this.as_obj().unwrap(),
+            &this.as_obj().unwrap(),
             "#\u{0}ds_disposed",
             Value::Bool(true),
         );
@@ -443,11 +443,11 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
     });
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     set_builtin(&it.global, "AsyncDisposableStack", Value::Obj(ctor));
 }

@@ -1,81 +1,27 @@
-//! Owned execution storage. JavaScript abstract operations and host APIs still consume `Value`;
-//! persistent local/operand owners use `PackedValue` in both the VM and native backends. Local
-//! cells are shared during execution so scoped parameter aliases can replace their owning
-//! words through Cell, without an overlapping exclusive slice borrow. Only actual argument
-//! lists cross the public wide-Value API; whole activations are never widened.
+//! Canonical execution values and scoped read-only argument loans. Mutable local slots use
+//! Cell so parameter aliases can replace values without an overlapping exclusive slice loan.
+//! Only immutable evaluated argument windows may be loaned as Value slices; Cell-backed
+//! slots and live property storage must first be copied to such a window.
 
-use crate::value::{PackedValue, Value};
+use crate::value::Value;
+use std::cell::Cell;
 
-pub(crate) trait StoredValue: Sized + Clone {
-    fn from_value(value: Value) -> Self;
-    fn replace_stored(&self, value: Self);
-    fn into_value(self) -> Value;
-    fn clone_value(&self) -> Value;
-    fn is_empty(&self) -> bool;
-    fn with_values<R>(values: &[Self], f: impl FnOnce(&[Value]) -> R) -> R;
-}
-
-impl StoredValue for PackedValue {
-    #[inline]
-    fn from_value(value: Value) -> Self {
-        Self::pack(value)
-    }
-    #[inline]
-    fn replace_stored(&self, value: Self) {
-        PackedValue::replace_stored(self, value);
-    }
-    #[inline]
-    fn into_value(self) -> Value {
-        PackedValue::into_value(self)
-    }
-    #[inline]
-    fn clone_value(&self) -> Value {
-        self.unpack()
-    }
-    #[inline]
-    fn is_empty(&self) -> bool {
-        PackedValue::is_empty(self)
-    }
-    #[inline]
-    fn with_values<R>(values: &[Self], f: impl FnOnce(&[Value]) -> R) -> R {
-        // Decode only the actual argument list, never a whole activation. Common arities stay
-        // on the Rust stack; each temporary owns its handle across arbitrary JS/GC reentry.
-        match values {
-            [] => return f(&[]),
-            [a] => return f(&[a.unpack()]),
-            [a, b] => return f(&[a.unpack(), b.unpack()]),
-            [a, b, c] => return f(&[a.unpack(), b.unpack(), c.unpack()]),
-            [a, b, c, d] => return f(&[a.unpack(), b.unpack(), c.unpack(), d.unpack()]),
-            _ => {}
-        }
-        let arguments: Vec<Value> = values.iter().map(PackedValue::unpack).collect();
-        f(&arguments)
-    }
-}
-
-/// Move `argc` owned packed words starting at `args` into wide values for the duration of `f`
-/// (the caller forgets the words). Common arities stay on the Rust stack.
+/// Loan canonical arguments for the complete operation, including any post-call polls and
+/// tail calls performed by `f`. The caller retires its window only after this returns.
 ///
 /// # Safety
-/// `args..args + argc` must be initialized, owned words that the caller never reads or drops
-/// again.
-pub(crate) unsafe fn with_moved_values<R>(
-    args: *mut PackedValue,
+/// `args` must be aligned and non-null even when `argc` is zero. `args..args + argc` must be
+/// initialized execution values in an immutable evaluated argument window whose allocation is
+/// neither modified, pooled nor reused until `f` returns. The caller roots the window through
+/// every poll performed by `f`. Production empty windows come from Rust slices or the
+/// initialized native stack and retain that canonical empty-slice address.
+#[inline]
+pub(crate) unsafe fn with_borrowed_values<R>(
+    args: *const Value,
     argc: usize,
     f: impl FnOnce(&[Value]) -> R,
 ) -> R {
-    let take = |k: usize| unsafe { args.add(k).read() }.into_value();
-    match argc {
-        0 => f(&[]),
-        1 => f(&[take(0)]),
-        2 => f(&[take(0), take(1)]),
-        3 => f(&[take(0), take(1), take(2)]),
-        4 => f(&[take(0), take(1), take(2), take(3)]),
-        _ => {
-            let values: Vec<Value> = (0..argc).map(take).collect();
-            f(&values)
-        }
-    }
+    f(unsafe { std::slice::from_raw_parts(args, argc) })
 }
 
 pub(crate) trait SlotAccess {
@@ -83,60 +29,70 @@ pub(crate) trait SlotAccess {
     fn write_value(&self, index: usize, value: Value);
 }
 
-impl<S: StoredValue> SlotAccess for [S] {
+impl SlotAccess for [Cell<Value>] {
     #[inline]
     fn read_value(&self, index: usize) -> Value {
-        self[index].clone_value()
+        self[index].get()
     }
     #[inline]
     fn write_value(&self, index: usize, value: Value) {
-        self[index].replace_stored(S::from_value(value));
+        self[index].set(value);
     }
 }
 
-pub(crate) struct ValueStack<S: StoredValue>(Vec<S>);
+/// An operand stack. Its whole capacity is initialized memory — new capacity is
+/// zero-filled where the buffer is created or grown, and nothing else changes it — so native
+/// code that borrows the buffer past its length (`jit::run`, `jit::run_borrowed_frame`) can
+/// have the collector scan values it has not written yet without reading uninitialized memory.
+#[derive(Default)]
+pub(crate) struct ValueStack(Vec<Value>);
 
-impl<S: StoredValue> Default for ValueStack<S> {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
-}
-
-impl<S: StoredValue> ValueStack<S> {
+impl ValueStack {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity))
+        let mut stack = Self(Vec::with_capacity(capacity));
+        stack.zero_spare_capacity();
+        stack
     }
     #[inline]
     pub(crate) fn push(&mut self, value: Value) {
-        self.0.push(S::from_value(value));
+        let len = self.0.len();
+        if len == self.0.capacity() {
+            self.grow(1);
+        }
+        // SAFETY: the capacity exceeds the length; the slot past it becomes the top.
+        unsafe {
+            self.0.as_mut_ptr().add(len).write(value);
+            self.0.set_len(len + 1);
+        }
     }
-    #[inline]
-    pub(crate) fn push_stored(&mut self, value: S) {
-        self.0.push(value);
+    /// Grow by at least `additional` and zero-fill the new spare capacity.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, additional: usize) {
+        self.0.reserve(additional);
+        self.zero_spare_capacity();
     }
-    #[inline]
-    pub(crate) fn pop_stored(&mut self) -> Option<S> {
-        self.0.pop()
-    }
-    #[inline]
-    pub(crate) fn last_stored(&self) -> Option<&S> {
-        self.0.last()
+    fn zero_spare_capacity(&mut self) {
+        let spare = self.0.spare_capacity_mut();
+        // SAFETY: the spare capacity is this Vec's memory past its length; zero bytes are a
+        // valid fill for it (a canonical zero word is the Number +0).
+        unsafe { std::ptr::write_bytes(spare.as_mut_ptr(), 0, spare.len()) };
     }
     #[inline]
     pub(crate) fn pop(&mut self) -> Option<Value> {
-        self.0.pop().map(S::into_value)
+        self.0.pop()
     }
     #[inline]
     pub(crate) fn last(&self) -> Option<Value> {
-        self.0.last().map(S::clone_value)
+        self.0.last().copied()
     }
     #[inline]
     pub(crate) fn read_value(&self, index: usize) -> Value {
-        self.0[index].clone_value()
+        self.0[index]
     }
     #[inline]
     pub(crate) fn get(&self, index: usize) -> Option<Value> {
-        self.0.get(index).map(S::clone_value)
+        self.0.get(index).copied()
     }
     #[inline]
     pub(crate) fn len(&self) -> usize {
@@ -160,31 +116,33 @@ impl<S: StoredValue> ValueStack<S> {
     }
     #[inline]
     pub(crate) fn reserve(&mut self, additional: usize) {
-        self.0.reserve(additional);
+        if self.0.capacity() - self.0.len() < additional {
+            self.grow(additional);
+        }
     }
     #[cfg(test)]
     #[inline]
     pub(crate) fn extend(&mut self, values: impl IntoIterator<Item = Value>) {
-        self.0.extend(values.into_iter().map(S::from_value));
+        for value in values {
+            self.push(value);
+        }
     }
     pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
-        self.0.drain(at..).map(S::into_value).collect()
+        self.0.drain(at..).collect()
     }
     pub(crate) fn with_tail<R>(&self, at: usize, f: impl FnOnce(&[Value]) -> R) -> R {
-        S::with_values(&self.0[at..], f)
+        f(&self.0[at..])
     }
-    pub(crate) fn raw_slice(&self) -> &[S] {
+    pub(crate) fn raw_slice(&self) -> &[Value] {
         &self.0
     }
-}
 
-// These raw transfers only connect native code to the same representation of the VM adapter.
-// There is no cast from packed owners to Value. Capacity/initialization ownership is the caller's.
-impl<S: StoredValue> ValueStack<S> {
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut S {
+    // Native code borrows the same values the VM owns; Cell-backed mutable slots remain
+    // separate. Capacity and initialization of raw native storage are the caller's contract.
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut Value {
         self.0.as_mut_ptr()
     }
-    pub(crate) fn as_ptr(&self) -> *const S {
+    pub(crate) fn as_ptr(&self) -> *const Value {
         self.0.as_ptr()
     }
     pub(crate) unsafe fn set_len(&mut self, len: usize) {
@@ -192,173 +150,14 @@ impl<S: StoredValue> ValueStack<S> {
     }
 }
 
-pub(crate) type CompactFrame = (Vec<PackedValue>, ValueStack<PackedValue>);
-
-/// Borrow an actual call's owners while seeding an activation. Only captured parameters need
-/// decoding; an arguments object can still request the complete, owning public Value list.
-/// The caller keeps every input initialized and rooted until instantiation finishes.
-#[derive(Clone, Copy)]
-pub(crate) enum CallArgs<'a> {
-    Values(&'a [Value]),
-    Packed(&'a [PackedValue]),
-}
-
-impl CallArgs<'_> {
-    pub(crate) fn read(&self, index: usize) -> Value {
-        match self {
-            Self::Values(values) => values.get(index).cloned(),
-            Self::Packed(values) => values.get(index).map(PackedValue::unpack),
-        }
-        .unwrap_or(Value::Undefined)
-    }
-
-    pub(crate) fn with_values<R>(&self, f: impl FnOnce(&[Value]) -> R) -> R {
-        match self {
-            Self::Values(values) => f(values),
-            Self::Packed(values) => PackedValue::with_values(values, f),
-        }
-    }
-
-    /// Owned copies of the arguments from `first` on (a rest parameter's list).
-    pub(crate) fn rest_values(&self, first: usize) -> Vec<Value> {
-        match self {
-            Self::Values(values) => values.get(first..).unwrap_or(&[]).to_vec(),
-            Self::Packed(values) => values
-                .get(first..)
-                .unwrap_or(&[])
-                .iter()
-                .map(PackedValue::unpack)
-                .collect(),
-        }
-    }
-}
-
-/// A bounded argument-boundary decode, never an activation conversion. Most JS/native calls
-/// fit four arguments and need no heap allocation; all temporary handles remain rooted until
-/// the called operation returns or throws.
-pub(crate) enum DecodedArgs {
-    Inline { values: [Value; 4], len: usize },
-    Heap(Vec<Value>),
-}
-
-impl DecodedArgs {
-    pub(crate) fn new(arguments: &[PackedValue]) -> Self {
-        if arguments.len() <= 4 {
-            let mut values = std::array::from_fn(|_| Value::Undefined);
-            for (value, argument) in values.iter_mut().zip(arguments) {
-                *value = argument.unpack();
-            }
-            Self::Inline {
-                values,
-                len: arguments.len(),
-            }
-        } else {
-            Self::Heap(arguments.iter().map(PackedValue::unpack).collect())
-        }
-    }
-}
-
-impl std::ops::Deref for DecodedArgs {
-    type Target = [Value];
-    fn deref(&self) -> &[Value] {
-        match self {
-            Self::Inline { values, len } => &values[..*len],
-            Self::Heap(values) => values,
-        }
-    }
-}
+pub(crate) type ExecutionFrame = (Vec<Cell<Value>>, ValueStack);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
     use crate::{bytecode::Tier, Completion, Engine};
-    use std::cell::RefCell;
     use std::rc::Rc;
-
-    thread_local! {
-        static BOUNDARY_KEY_WEAK: RefCell<Option<std::rc::Weak<RefCell<crate::value::Object>>>> = const {
-            RefCell::new(None)
-        };
-        static BOUNDARY_RECEIVER_WEAK: RefCell<Option<std::rc::Weak<RefCell<crate::value::Object>>>> = const {
-            RefCell::new(None)
-        };
-    }
-
-    fn boundary_gc_then_call(
-        interp: &mut crate::interpreter::Interp,
-        this: Value,
-        args: &[Value],
-    ) -> Result<Value, Value> {
-        let Value::Obj(receiver) = &this else {
-            panic!("native receiver owner")
-        };
-        assert_eq!(
-            Rc::strong_count(receiver),
-            2,
-            "packed receiver plus native value"
-        );
-        let Value::Obj(key) = &args[1] else {
-            panic!("native argument owner")
-        };
-        assert_eq!(
-            Rc::strong_count(key),
-            1,
-            "argument moved without a second owner"
-        );
-        interp.gc_collect();
-        assert_eq!(Rc::strong_count(key), 1, "argument remains a GC root");
-        match interp.call(args[0].clone(), Value::Undefined, &[args[1].clone()]) {
-            Ok(value) => Ok(value),
-            Err(crate::interpreter::Abrupt::Throw(error)) => Err(error),
-            Err(_) => panic!("callback produced a non-throw completion"),
-        }
-    }
-
-    fn boundary_tail_probe(
-        _interp: &mut crate::interpreter::Interp,
-        _this: Value,
-        _args: &[Value],
-    ) -> Result<Value, Value> {
-        let key_count = BOUNDARY_KEY_WEAK.with(|weak| {
-            weak.borrow()
-                .as_ref()
-                .expect("key weak handle")
-                .strong_count()
-        });
-        let receiver_count = BOUNDARY_RECEIVER_WEAK.with(|weak| {
-            weak.borrow()
-                .as_ref()
-                .expect("receiver weak handle")
-                .strong_count()
-        });
-        assert_eq!(
-            key_count, 1,
-            "moved argument stays rooted through tail drain"
-        );
-        assert_eq!(
-            receiver_count, 1,
-            "original receiver owner stays through tail drain"
-        );
-        Ok(Value::Undefined)
-    }
-
-    fn boundary_enqueue_tail(
-        interp: &mut crate::interpreter::Interp,
-        _this: Value,
-        args: &[Value],
-    ) -> Result<Value, Value> {
-        let Value::Obj(key) = &args[0] else {
-            panic!("native argument owner")
-        };
-        assert_eq!(
-            Rc::strong_count(key),
-            1,
-            "argument moved without a second owner"
-        );
-        let tail = Value::Obj(interp.make_native("boundaryTailProbe", 0, boundary_tail_probe));
-        interp.pending_tail = Some(Box::new((tail, Value::Undefined, Vec::new())));
-        Ok(Value::Undefined)
-    }
 
     fn eval(engine: &mut Engine, source: &str) -> String {
         match engine.eval(source, false).expect("storage fixture parses") {
@@ -367,23 +166,26 @@ mod tests {
         }
     }
 
+    /// An operand stack and shared slots keep scalar bits (-0, infinities, NaN) and object
+    /// identity through pushes, pops, an immutable argument loan and a split.
     #[test]
-    fn compact_storage_preserves_scalar_bits_and_heap_ownership() {
-        assert_eq!(std::mem::size_of::<PackedValue>(), 8);
+    fn execution_storage_preserves_scalar_bits_and_object_identity() {
+        assert_eq!(std::mem::size_of::<Value>(), 8);
         let interp = crate::interpreter::Interp::new();
         let object = interp.new_object();
-        let baseline = Rc::strong_count(&object);
-        let mut stack = ValueStack::<PackedValue>::default();
-        stack.push(Value::Obj(object.clone()));
-        assert_eq!(Rc::strong_count(&object), baseline + 1);
+        let mut stack = ValueStack::default();
+        stack.push(Value::Obj(object));
+        let word = crate::value::PACK_OBJ | crate::value::Gc::as_ptr(&object) as u64;
+        assert_eq!(stack.last().unwrap().bits(), word);
         stack.with_tail(0, |args| {
-            assert!(matches!(&args[0], Value::Obj(actual) if Rc::ptr_eq(actual, &object)));
-            assert_eq!(Rc::strong_count(&object), baseline + 2);
+            assert!(
+                matches!(&(args[0]).view(), ValueView::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))
+            );
         });
-        assert_eq!(Rc::strong_count(&object), baseline + 1);
+        assert_eq!(stack.last().unwrap().bits(), word);
         stack.push(Value::Num(-0.0));
         assert!(
-            matches!(stack.pop(), Some(Value::Num(value)) if value.to_bits() == (-0.0f64).to_bits())
+            matches!((stack.pop()).map(|__value| (__value).view()), Some(ValueView::Num(value)) if value.to_bits() == (-0.0f64).to_bits())
         );
         for number in [
             f64::INFINITY,
@@ -392,68 +194,61 @@ mod tests {
             f64::from_bits(0xfffb_0000_0000_1234),
         ] {
             stack.push(Value::Num(number));
-            assert!(matches!(stack.pop(), Some(Value::Num(value)) if
-                (number.is_nan() && value.is_nan()) || value.to_bits() == number.to_bits()));
+            assert!(
+                matches!((stack.pop()).map(|__value| (__value).view()), Some(ValueView::Num(value)) if
+                (number.is_nan() && value.is_nan()) || value.to_bits() == number.to_bits())
+            );
         }
         let moved = stack.split_off(0);
         assert!(stack.is_empty());
-        assert_eq!(Rc::strong_count(&object), baseline + 1);
+        assert!(matches!(
+            moved.first().map(Value::view),
+            Some(ValueView::Obj(actual)) if moved.len() == 1 && crate::value::Gc::ptr_eq(&actual, &object)
+        ));
         drop(moved);
-        assert_eq!(Rc::strong_count(&object), baseline);
 
-        let slots = [PackedValue::pack(Value::Obj(object.clone()))];
+        let slots = [Cell::new(Value::Obj(object))];
         slots.write_value(0, Value::Empty);
-        assert_eq!(Rc::strong_count(&object), baseline);
-        assert!(matches!(slots.read_value(0), Value::Empty));
+        assert!(matches!((slots.read_value(0)).view(), ValueView::Empty));
         slots.write_value(0, Value::Undefined);
-        assert!(matches!(slots.read_value(0), Value::Undefined));
+        assert!(matches!((slots.read_value(0)).view(), ValueView::Undefined));
+    }
+
+    /// Even an empty loan retains the canonical window address; no substitute slice or
+    /// decoded argument storage is introduced.
+    #[test]
+    fn empty_argument_loans_keep_the_interior_canonical_window_address() {
+        let words = [Value::Num(1.0); 4];
+        let empty = &words[2..2];
+        assert_ne!(empty.as_ptr(), [].as_ptr());
+        // SAFETY: the zero-length interior slice is aligned/non-null and its array stays live.
+        unsafe {
+            with_borrowed_values(empty.as_ptr(), 0, |values| {
+                assert!(values.is_empty());
+                assert_eq!(values.as_ptr(), empty.as_ptr());
+            })
+        };
     }
 
     #[test]
-    fn compact_storage_decodes_only_argument_owners_with_exact_lifetime() {
+    fn execution_storage_loans_the_original_argument_window_without_copying() {
         let object = crate::value::Object::new(None);
-        let baseline = Rc::strong_count(&object);
+        let word = Value::Obj(object).bits();
         for count in 0..=8 {
-            let packed: Vec<_> = (0..count)
-                .map(|_| PackedValue::pack(Value::Obj(object.clone())))
-                .collect();
-            let decoded = DecodedArgs::new(&packed);
-            assert_eq!(decoded.len(), count);
-            assert_eq!(Rc::strong_count(&object), baseline + count * 2);
-            assert!(matches!(&decoded, DecodedArgs::Inline { .. }) == (count <= 4));
-            assert!(decoded
-                .iter()
-                .all(|value| matches!(value, Value::Obj(actual) if Rc::ptr_eq(actual, &object))));
-            drop(decoded);
-            assert_eq!(Rc::strong_count(&object), baseline + count);
-            drop(packed);
-            assert_eq!(Rc::strong_count(&object), baseline);
-        }
-    }
-
-    #[test]
-    fn compact_native_arguments_move_without_refcount_churn_and_stay_live_for_the_call() {
-        let object = crate::value::Object::new(None);
-        let weak = Rc::downgrade(&object);
-        let baseline = weak.strong_count();
-        for count in [0, 1, 4, 5, 9] {
-            let mut packed: Vec<_> = (0..count)
-                .map(|_| PackedValue::pack(Value::Obj(object.clone())))
-                .collect();
-            assert_eq!(weak.strong_count(), baseline + count);
+            let values = vec![Value::Obj(object); count];
+            // SAFETY: values is an immutable initialized window for this complete loan. This
+            // inspection has no allocation or poll, and the original object stays live.
             unsafe {
-                with_moved_values(packed.as_mut_ptr(), count, |arguments| {
-                    assert_eq!(arguments.len(), count);
-                    assert_eq!(weak.strong_count(), baseline + count);
-                    assert!(arguments.iter().all(
-                        |value| matches!(value, Value::Obj(actual) if Rc::ptr_eq(actual, &object))
-                    ));
+                with_borrowed_values(values.as_ptr(), count, |loan| {
+                    assert_eq!(loan.len(), count);
+                    assert_eq!(loan.as_ptr(), values.as_ptr());
+                    assert!(loan.iter().all(|value| {
+                        matches!(value.view(), ValueView::Obj(actual)
+                            if crate::value::Gc::ptr_eq(&actual, &object))
+                    }));
+                    assert!(loan.iter().all(|value| value.bits() == word));
                 });
-                // The packed words were moved out; the helper's unsafe contract transfers
-                // responsibility for shortening the source slice back to this caller.
-                packed.set_len(0);
             }
-            assert_eq!(weak.strong_count(), baseline);
         }
     }
 
@@ -493,193 +288,105 @@ mod tests {
         }
     }
 
+    /// Slot-to-stack copies (LoadLocal, Dup) and stack-to-slot moves (StoreLocal) of an object's
+    /// word: every copy and move has the source value's bits.
+    /// Copies are bit copies and drops and overwrites release nothing, so the object
+    /// outlives every word until a collection finds it dead.
     #[test]
-    fn committed_native_arguments_remain_rooted_across_collection_callback_throw_and_tail() {
-        let mut interp = crate::interpreter::Interp::new();
-        let realm = Value::Obj(interp.global.clone());
-        interp
-            .eval_in_realm(
-                &realm,
-                "globalThis.boundaryCallback = function (key) { throw 'callback-error'; };",
-            )
-            .ok()
-            .expect("callback fixture evaluates");
-        let callback = interp
-            .global
-            .borrow()
-            .props
-            .get("boundaryCallback")
-            .expect("callback global")
-            .value();
-        let receiver = interp.new_object();
-        let receiver_weak = Rc::downgrade(&receiver);
-        let this_slot = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Obj(receiver)));
-        let key = interp.new_object();
-        let key_weak = Rc::downgrade(&key);
-        let mut args = vec![
-            PackedValue::pack(callback),
-            PackedValue::pack(Value::Obj(key)),
-        ];
-        assert_eq!(key_weak.strong_count(), 1);
-        let result = unsafe {
-            interp.call_native_committed(
-                boundary_gc_then_call,
-                &*this_slot,
-                args.as_mut_ptr(),
-                args.len(),
-            )
-        };
-        unsafe { args.set_len(0) };
-        assert!(matches!(
-            result,
-            Err(crate::interpreter::Abrupt::Throw(Value::Str(ref value)))
-                if &**value == "callback-error"
-        ));
-        assert_eq!(
-            key_weak.strong_count(),
-            0,
-            "throw path releases moved argument"
-        );
-        assert_eq!(
-            receiver_weak.strong_count(),
-            0,
-            "throw path releases receiver"
-        );
-
-        let key = interp.new_object();
-        let key_weak = Rc::downgrade(&key);
-        BOUNDARY_KEY_WEAK.with(|weak| *weak.borrow_mut() = Some(key_weak.clone()));
-        let receiver = interp.new_object();
-        let receiver_weak = Rc::downgrade(&receiver);
-        BOUNDARY_RECEIVER_WEAK.with(|weak| *weak.borrow_mut() = Some(receiver_weak.clone()));
-        let this_slot = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Obj(receiver)));
-        let mut args = vec![PackedValue::pack(Value::Obj(key))];
-        let result = unsafe {
-            interp.call_native_committed(
-                boundary_enqueue_tail,
-                &*this_slot,
-                args.as_mut_ptr(),
-                args.len(),
-            )
-        };
-        unsafe { args.set_len(0) };
-        assert!(matches!(result, Ok(Value::Undefined)));
-        assert_eq!(
-            key_weak.strong_count(),
-            0,
-            "tail path releases moved argument"
-        );
-        assert_eq!(
-            receiver_weak.strong_count(),
-            0,
-            "tail path releases receiver after draining"
-        );
-        BOUNDARY_KEY_WEAK.with(|weak| *weak.borrow_mut() = None);
-        BOUNDARY_RECEIVER_WEAK.with(|weak| *weak.borrow_mut() = None);
-    }
-
-    #[test]
-    fn compact_storage_owner_moves_and_duplicates_do_not_cross_value_boundary() {
+    fn slot_stack_copies_and_replacements_preserve_the_cell_identity() {
         let object = crate::value::Object::new(None);
-        let weak = Rc::downgrade(&object);
-        let slots = [
-            PackedValue::pack(Value::Obj(object)),
-            PackedValue::pack(Value::Empty),
-        ];
-        let mut stack = ValueStack::<PackedValue>::default();
-        assert!(slots[1].is_empty());
-        stack.push_stored(slots[0].clone());
-        assert_eq!(weak.strong_count(), 2);
-        stack.push_stored(stack.last_stored().unwrap().clone());
-        assert_eq!(weak.strong_count(), 3);
-        slots[1].replace_stored(stack.pop_stored().unwrap());
-        assert_eq!(
-            weak.strong_count(),
-            3,
-            "slot move does not retain or release"
-        );
-        drop(stack.pop_stored());
-        assert_eq!(weak.strong_count(), 2);
-        slots[0].replace_stored(PackedValue::pack(Value::Undefined));
-        assert_eq!(weak.strong_count(), 1);
+        let weak = crate::value::Gc::downgrade(&object);
+        let slots = [Cell::new(Value::Obj(object)), Cell::new(Value::Empty)];
+        let word = slots[0].get().bits();
+        let mut stack = ValueStack::default();
+        assert!(slots[1].get().is_empty());
+        stack.push(slots[0].get());
+        stack.push(stack.last().unwrap());
+        assert!(stack.raw_slice().iter().all(|copy| copy.bits() == word));
+        slots[1].set(stack.pop().unwrap());
+        assert_eq!(slots[1].get().bits(), word);
+        drop(stack.pop());
+        slots[0].set(Value::Undefined);
         drop(slots);
-        assert_eq!(weak.strong_count(), 0);
+        assert!(crate::gc_test::alive(&weak), "a word released its object");
     }
 
+    /// A shared alias of a slot (a mapped parameter's) observes a replacement written through
+    /// the slice, and a replacement through the alias empties the slot. The alias's
+    /// word is the replacement's bits, and replacements release nothing: both objects outlive
+    /// their words until a collection.
     #[test]
-    fn compact_storage_shared_alias_observes_replacement_and_exact_owner_release() {
+    fn shared_slot_aliases_observe_canonical_value_replacement() {
         let first = crate::value::Object::new(None);
-        let first_weak = Rc::downgrade(&first);
+        let first_weak = crate::value::Gc::downgrade(&first);
         let second = crate::value::Object::new(None);
-        let second_weak = Rc::downgrade(&second);
-        let slots = [PackedValue::pack(Value::Obj(first))];
+        let second_weak = crate::value::Gc::downgrade(&second);
+        let second_word = crate::value::PACK_OBJ | crate::value::Gc::as_ptr(&second) as u64;
+        let slots = [Cell::new(Value::Obj(first))];
         let shared = &slots[..];
         let alias = &shared[0];
         shared.write_value(0, Value::Obj(second));
-        assert_eq!(first_weak.strong_count(), 0);
-        assert_eq!(second_weak.strong_count(), 1);
-        let seen = alias.unpack();
-        assert!(Rc::ptr_eq(
-            seen.as_obj().unwrap(),
+        assert_eq!(alias.get().bits(), second_word);
+        let seen = alias.get();
+        assert!(crate::value::Gc::ptr_eq(
+            &seen.as_obj().unwrap(),
             &second_weak.upgrade().unwrap()
         ));
-        assert_eq!(second_weak.strong_count(), 2);
-        alias.replace_value(Value::Empty);
-        assert!(shared[0].is_empty());
-        assert_eq!(second_weak.strong_count(), 1);
+        alias.set(Value::Empty);
+        assert!(shared[0].get().is_empty());
         drop(seen);
-        assert_eq!(second_weak.strong_count(), 0);
+        assert!(
+            crate::gc_test::alive(&first_weak) && crate::gc_test::alive(&second_weak),
+            "a replacement released its object"
+        );
     }
 
+    /// The raw literal factories (inline, heap-packed and large arrays; templated objects) move
+    /// their operand words into elements and fields: lengths, identities and -0 hold.
     #[test]
-    fn compact_storage_raw_literals_move_packed_owners_without_refcount_churn() {
+    fn raw_literal_construction_copies_canonical_values() {
         let mut interp = crate::interpreter::Interp::new();
         let object = interp.new_object();
-        let baseline = Rc::strong_count(&object);
         // Exercise inline-packed, heap-packed and large dense array factories.
         for count in [0, 1, 10, 11, 32, 33, 70] {
-            let mut operands: Vec<_> = (0..count)
-                .map(|_| PackedValue::pack(Value::Obj(object.clone())))
-                .collect();
+            let mut operands: Vec<_> = (0..count).map(|_| Value::Obj(object)).collect();
             let array = unsafe { interp.make_array_from_raw(operands.as_mut_ptr(), count) };
             unsafe { operands.set_len(0) };
-            assert_eq!(Rc::strong_count(&object), baseline + count);
-            let Value::Obj(array) = array else {
+            let ValueView::Obj(array) = (array).view() else {
                 panic!("array factory returned a primitive")
             };
             assert!(
-                matches!(array.borrow().props.get("length").unwrap().value(),
-                Value::Num(length) if length == count as f64)
+                matches!((array.borrow().props.get("length").unwrap().value()).view(),
+                ValueView::Num(length) if length == count as f64)
             );
             for index in 0..count {
                 assert!(
-                    matches!(array.borrow().props.get_index(index as u32).unwrap().value(),
-                    Value::Obj(actual) if Rc::ptr_eq(&actual, &object))
+                    matches!((array.borrow().props.get_index(index as u32).unwrap().value()).view(),
+                    ValueView::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object))
                 );
             }
             drop(array);
-            assert_eq!(Rc::strong_count(&object), baseline);
         }
         let template = std::cell::OnceCell::new();
         let keys = [Rc::from("held"), Rc::from("negativeZero")];
         for _ in 0..3 {
-            let mut operands = std::mem::ManuallyDrop::new([
-                PackedValue::pack(Value::Obj(object.clone())),
-                PackedValue::pack(Value::Num(-0.0)),
-            ]);
+            let mut operands = std::mem::ManuallyDrop::new([Value::Obj(object), Value::Num(-0.0)]);
             let result = unsafe {
                 interp.make_plain_object_templated_from(&template, &keys, operands.as_mut_ptr(), 2)
             };
-            assert_eq!(Rc::strong_count(&object), baseline + 1);
-            let Value::Obj(result) = result else {
+            let ValueView::Obj(result) = (result).view() else {
                 panic!("object factory returned a primitive")
             };
             assert!(
-                matches!(result.borrow().props.get("negativeZero").unwrap().value(),
-                Value::Num(number) if number.to_bits() == (-0.0f64).to_bits())
+                matches!((result.borrow().props.get("negativeZero").unwrap().value()).view(),
+                ValueView::Num(number) if number.to_bits() == (-0.0f64).to_bits())
+            );
+            assert!(
+                matches!((result.borrow().props.get("held").unwrap().value()).view(),
+                ValueView::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object)),
+                "the field holds the moved operand's object"
             );
             drop(result);
-            assert_eq!(Rc::strong_count(&object), baseline);
         }
     }
 

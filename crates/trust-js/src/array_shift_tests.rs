@@ -14,15 +14,6 @@ fn check(source: &str, expected: &str) {
                     i.gc_collect();
                     Ok(Value::Undefined)
                 });
-            engine.interp.def_method(
-                &engine.interp.global,
-                "collectShiftYoungTest",
-                0,
-                |i, _, _| {
-                    i.gc_collect_young(crate::value::GcCause::Explicit);
-                    Ok(Value::Undefined)
-                },
-            );
             match engine.eval(source, false).expect("shift fixture parses") {
                 Completion::Value(actual) => assert_eq!(actual, expected, "{tier:?}/{threshold}"),
                 Completion::Throw { name, message } => {
@@ -208,7 +199,7 @@ fn array_shift_warm_calls_keep_named_symbols_owners_and_old_to_young_edges() {
             if(item.id!==round)throw 'queue order';
             total+=item.id;a.push({id:round+16});
             if(scan(a)!==16*round+136)throw 'shift/append values';
-            if(round%3===0)collectShiftYoungTest();
+            if(round%3===0)collectShiftTest();
             if(round%7===0)collectShiftTest();
             if(a.named.id!==91||a[key].id!==92||a.length!==16)throw 'owners';
         }
@@ -240,7 +231,7 @@ fn array_end_edits_keep_logical_indices_descriptors_and_gc_roots_after_relocatio
             var item={id:-k-1};prepend(a,item);
             if(a[0]!==item||a.length!==49)throw 'prepend';
             if(a.pop().id!==(k<48?207-k:47-k))throw 'pop';
-            if(k%13===0)collectShiftYoungTest();
+            if(k%13===0)collectShiftTest();
         }
         if(a.named!==named||a[key]!==named)throw 'named owner';
         for(var k=0;k<80;k++){

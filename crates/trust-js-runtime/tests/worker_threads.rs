@@ -32,7 +32,7 @@ impl Captured {
 fn worker_threads_exchange_structured_messages() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });
@@ -68,7 +68,7 @@ fn worker_threads_exchange_structured_messages() {
 fn worker_threads_transfer_worker_data_and_reply_arraybuffers() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

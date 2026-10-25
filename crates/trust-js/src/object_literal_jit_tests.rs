@@ -4,6 +4,7 @@
 
 use crate::bytecode::Tier;
 use crate::value::Value;
+use crate::value::ValueView;
 use crate::{Completion, Engine};
 
 fn check(source: &str, expected: &str) {
@@ -58,7 +59,7 @@ fn object_literal_builders_have_real_native_entries() {
         "numericLiteral",
         "protoLiteral",
     ] {
-        let global = Value::Obj(engine.interp.global.clone());
+        let global = Value::Obj(engine.interp.global);
         let function = engine
             .interp
             .get_member_key(&global, name)
@@ -66,12 +67,13 @@ fn object_literal_builders_have_real_native_entries() {
         // The hot-call counter is updated at compiled call sites, not direct Rust calls.
         let calls = format!("(function() {{ for (var n=0;n<16;n++) {name}(n); return true; }})()");
         assert!(matches!(engine.eval(&calls, false), Ok(Completion::Value(v)) if v == "true"));
-        let Value::Obj(object) = function else {
+        let ValueView::Obj(object) = (function).view() else {
             panic!("function object")
         };
         let chunk = match &object.borrow().call {
             Callable::User(user) => user
                 .func
+                .runtime()
                 .code
                 .get()
                 .and_then(Option::as_ref)

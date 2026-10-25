@@ -35,8 +35,6 @@ fn warmed(tier: Tier, source: &str) -> Engine {
 
 #[test]
 fn scalar_state_clean_publication_is_empty_and_residency_is_lazy() {
-    let interp = crate::interpreter::Interp::new();
-    let layout = crate::value::jit_layout(&interp.object_proto);
     assert!(
         std::mem::size_of::<Operand>() <= 8,
         "bounded operand metadata"
@@ -44,7 +42,7 @@ fn scalar_state_clean_publication_is_empty_and_residency_is_lazy() {
     for kind in [ScalarKind::Number, ScalarKind::Integer, ScalarKind::Boolean] {
         let mut a = asm::Asm::new();
         let mut stack = vec![Operand::clean(kind, 0, false)];
-        materialize(&mut a, &layout, &stack, 1);
+        materialize(&mut a, &stack, 1);
         assert!(
             a.buf.is_empty(),
             "clean canonical value needs no store or SP pair"
@@ -53,7 +51,7 @@ fn scalar_state_clean_publication_is_empty_and_residency_is_lazy() {
         assert_eq!(a.buf.len(), 2, "one word load and one bit-preserving move");
         assert_eq!(stack[0], Operand::clean(kind, 0, true));
         scalar_register(&mut a, &mut stack, 1, 0);
-        materialize(&mut a, &layout, &stack, 1);
+        materialize(&mut a, &stack, 1);
         assert_eq!(
             a.buf.len(),
             2,
@@ -68,7 +66,7 @@ fn scalar_state_clean_publication_is_empty_and_residency_is_lazy() {
             "Dup creates a distinct dirty slot"
         );
         let checkpoint = a.buf.len();
-        materialize(&mut a, &layout, &stack, 1);
+        materialize(&mut a, &stack, 1);
         assert!(
             a.buf.len() > checkpoint,
             "new duplicate really gets published"
@@ -85,12 +83,10 @@ fn scalar_state_clean_publication_is_empty_and_residency_is_lazy() {
 
 #[test]
 fn scalar_state_clean_identity_is_checked_before_publication_or_reload() {
-    let interp = crate::interpreter::Interp::new();
-    let layout = crate::value::jit_layout(&interp.object_proto);
     let malformed = Operand::clean(ScalarKind::Number, 1, false);
     let mut a = asm::Asm::new();
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        materialize(&mut a, &layout, &[malformed], 1);
+        materialize(&mut a, &[malformed], 1);
     }))
     .is_err());
     assert!(a.buf.is_empty());
@@ -103,8 +99,6 @@ fn scalar_state_clean_identity_is_checked_before_publication_or_reload() {
 
 #[test]
 fn scalar_state_native_materialization_uses_original_base_and_exact_new_extent() {
-    let interp = crate::interpreter::Interp::new();
-    let layout = crate::value::jit_layout(&interp.object_proto);
     for duplicate in [true, false] {
         let physical = if duplicate { 1 } else { 2 };
         let mut a = asm::Asm::new();
@@ -122,7 +116,7 @@ fn scalar_state_native_materialization_uses_original_base_and_exact_new_extent()
         stack[index] = Operand::temporary(ScalarKind::Number);
         // Grow at offset0, or overwrite offset-16 and shrink. Both addresses
         // refer to the original x20 and must preserve neighboring canary words.
-        materialize(&mut a, &layout, &stack, physical);
+        materialize(&mut a, &stack, physical);
         a.sub_reg(0, 20, 19);
         a.ldp_post(19, 20, 16);
         a.ret();

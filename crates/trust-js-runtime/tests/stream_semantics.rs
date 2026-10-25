@@ -20,7 +20,7 @@ impl Write for Captured {
 fn streams_account_for_exact_reads_backpressure_and_corking() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

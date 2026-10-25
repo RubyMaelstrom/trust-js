@@ -32,7 +32,7 @@ fn test_runtime() -> (Runtime, Captured, Captured) {
     let mut rt = Runtime::new();
     let out = Captured::default();
     let err = Captured::default();
-    rt.engine().ctx().op_state().put(console::ConsoleOut {
+    rt.engine().op_state().put(console::ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(err.clone()),
     });
@@ -178,6 +178,50 @@ fn next_tick_and_set_immediate_run_before_timers() {
     assert_eq!(out.lines(), ["immediate", "tick 42", "timer"]);
 }
 
+/// A callback batch stays rooted while it runs: a collection inside its first callback must not
+/// reclaim the callbacks and arguments queued behind it, which only the batch still holds.
+#[test]
+fn queued_callbacks_survive_a_collection_inside_their_batch() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        setImmediate(() => $262.gc());
+        setImmediate((text) => console.log("second", text), "arg-".repeat(3));
+        setImmediate(() => console.log("third"));
+        "#,
+    );
+    assert_eq!(out.lines(), ["second arg-arg-arg-", "third"]);
+}
+
+/// Unhandled rejections are reported one at a time from a rooted batch: a collection inside the
+/// `onunhandledrejection` handler of the first must not reclaim the later promises and reasons.
+#[test]
+fn unhandled_rejection_batch_survives_a_collection_in_its_handler() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        onunhandledrejection = (event) => {
+            $262.gc();
+            console.log("rejection", event.reason, event.promise instanceof Promise);
+            event.preventDefault();
+        };
+        Promise.reject("first-".repeat(2));
+        Promise.reject("second-".repeat(2));
+        Promise.reject("third-".repeat(2));
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "rejection first-first- true",
+            "rejection second-second- true",
+            "rejection third-third- true",
+        ]
+    );
+}
+
 #[test]
 fn timer_args_pass_through_and_nested_timers_work() {
     let (mut rt, out, _err) = test_runtime();
@@ -214,13 +258,14 @@ fn spawn_blocking_completion_settles_on_the_loop() {
         &mut rt,
         "globalThis.onDone = (n) => console.log('got', n); 0",
     );
-    let g = rt.engine().global_this();
-    let cb = rt
-        .engine()
-        .ctx()
-        .get_member(&g, "onDone")
-        .map_err(|_| ())
-        .expect("defined above");
+    let cb = rt.engine().scope(|cx| {
+        let g = cx.global_this();
+        let cb = cx
+            .get_member(&g, "onDone")
+            .map_err(|_| ())
+            .expect("defined above");
+        trust_js_host::Handle::new(cx, &cb).expect("a handle")
+    });
     rt.spawn_blocking(
         || {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -244,13 +289,14 @@ fn panicking_blocking_task_reports_failure_without_stranding_the_loop() {
         &mut rt,
         "globalThis.onDone = (n) => console.log('after panic', n); 0",
     );
-    let global = rt.engine().global_this();
-    let callback = rt
-        .engine()
-        .ctx()
-        .get_member(&global, "onDone")
-        .map_err(|_| ())
-        .expect("callback exists");
+    let callback = rt.engine().scope(|cx| {
+        let global = cx.global_this();
+        let callback = cx
+            .get_member(&global, "onDone")
+            .map_err(|_| ())
+            .expect("callback exists");
+        trust_js_host::Handle::new(cx, &callback).expect("a handle")
+    });
     rt.spawn_blocking(
         || panic!("native boom"),
         callback.clone(),
@@ -1604,6 +1650,38 @@ fn worker_message_round_trip_and_structured_clone() {
     assert_eq!(lines, ["reply 10 1000 hi"]);
 }
 
+/// A worker's main-side dispatch function is held by the worker registry's handle (and its
+/// armed inbox task's): a worker that no script variable keeps survives collections on both
+/// threads, and its reply still arrives.
+#[test]
+fn worker_kept_only_by_its_dispatch_survives_collections() {
+    let lines = worker_drive(
+        &[(
+            "collect.mjs",
+            r#"
+            onmessage = (e) => {
+                $262.gc();
+                for (let i = 0; i < 2000; i++) ({ i });
+                $262.gc();
+                postMessage(e.data + 1);
+                close();
+            };
+            "#,
+        )],
+        r#"
+        (() => {
+            const w = new Worker("{DIR}/collect.mjs", { type: "module" });
+            w.onmessage = (e) => console.log("reply", e.data);
+            w.postMessage(41);
+        })();
+        $262.gc();
+        for (let i = 0; i < 2000; i++) ({ i });
+        $262.gc();
+        "#,
+    );
+    assert_eq!(lines, ["reply 42"]);
+}
+
 #[test]
 fn worker_arraybuffer_transfer_detaches_sender_and_preserves_views() {
     let lines = worker_drive(
@@ -2025,8 +2103,8 @@ fn perf_boot_breakdown() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let pool = ThreadPool::new(4, tx);
         let mut engine = trust_js_host::Engine::new();
-        engine.ctx().op_state().put(pool.handle());
-        engine.ctx().op_state().put(TaskRegistry::default());
+        engine.op_state().put(pool.handle());
+        engine.op_state().put(TaskRegistry::default());
         let exts = [
             trust_js_timers::extension(),
             console::extension(),
@@ -2089,6 +2167,31 @@ fn web_serve_roundtrip_over_loopback() {
         out.lines(),
         ["200 hi pong", "200 true 42", "200 got:hey", "closed"]
     );
+}
+
+/// A server's dispatch function is held by the server registry's handle and by each armed
+/// accept's task: collections between requests leave the server serving.
+#[test]
+fn web_serve_dispatch_survives_collections_between_requests() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        (async () => {
+            const server = TRustJS.serve(() => new Response("pong"),
+                                         { hostname: "127.0.0.1", port: 0 });
+            const base = `http://127.0.0.1:${server.port}`;
+            for (let i = 0; i < 3; i++) {
+                $262.gc();
+                for (let j = 0; j < 2000; j++) ({ j });
+                const r = await fetch(base + "/");
+                console.log(r.status, await r.text());
+            }
+            await server.shutdown();
+        })();
+        "#,
+    );
+    assert_eq!(out.lines(), ["200 pong", "200 pong", "200 pong"]);
 }
 
 #[test]

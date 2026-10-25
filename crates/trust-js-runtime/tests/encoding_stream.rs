@@ -34,7 +34,7 @@ impl Captured {
 fn encoding_labels_incremental_state_bom_errors_and_streams() {
     let mut runtime = Runtime::new();
     let output = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(output.clone()),
         err: Box::new(Captured::default()),
     });

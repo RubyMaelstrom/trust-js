@@ -9,6 +9,7 @@ use super::{
     ab, arg, canonicalize_locale_list, get_options_object as coerce_options, make_service,
 };
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 /// (plural, singular, index): years..nanoseconds.
@@ -25,7 +26,7 @@ const UNITS: &[(&str, &str)] = &[
     ("nanoseconds", "nanosecond"),
 ];
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "DurationFormat", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "format", 1, |i, this, a| {
@@ -169,7 +170,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     // fractionalDigits (0..9).
     let frac = {
         let v = ab(i.get_member_key(&options, "fractionalDigits"))?;
-        if matches!(v, Value::Undefined) {
+        if matches!((v).view(), ValueView::Undefined) {
             None
         } else {
             let n = ab(i.to_number(&v))?;
@@ -284,18 +285,18 @@ fn valid_type(s: &str) -> bool {
 /// calendar units (< 2^32) and total time (< 2^53 seconds).
 fn read_duration(i: &mut Interp, v: &Value) -> Result<[f64; 10], Value> {
     // A string is parsed as an ISO 8601 duration; a bad string is a RangeError, not a TypeError.
-    if let Value::Str(s) = v {
+    if let ValueView::Str(s) = &(v).view() {
         return parse_iso_duration(s)
             .ok_or_else(|| i.make_error("RangeError", "invalid ISO 8601 duration string"));
     }
-    if !matches!(v, Value::Obj(_)) {
+    if !matches!(&(v).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "duration must be an object"));
     }
     // A Temporal.Duration carries its fields in internal slots; user-visible prototype getters
     // are NOT consulted (they may be redefined).
-    if let Value::Obj(o) = v {
+    if let ValueView::Obj(o) = &(v).view() {
         if let Some(crate::temporal::Temporal::Duration(d)) =
-            i.temporal.get(&(std::rc::Rc::as_ptr(o) as usize))
+            i.temporal.get(&(crate::value::Gc::as_ptr(o) as usize))
         {
             return Ok([
                 d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, d.ms, d.us, d.ns,
@@ -306,7 +307,7 @@ fn read_duration(i: &mut Interp, v: &Value) -> Result<[f64; 10], Value> {
     let mut any_present = false;
     for (k, (plural, _s)) in UNITS.iter().enumerate() {
         let fv = ab(i.get_member_key(v, plural))?;
-        if matches!(fv, Value::Undefined) {
+        if matches!((fv).view(), ValueView::Undefined) {
             continue;
         }
         any_present = true;
@@ -356,8 +357,8 @@ fn read_duration(i: &mut Interp, v: &Value) -> Result<[f64; 10], Value> {
 }
 
 fn get_str(o: &Gc, k: &str) -> String {
-    match o.borrow().internal_slots().get(k).map(|p| p.value()) {
-        Some(Value::Str(s)) => s.to_string(),
+    match (o.borrow().internal_slots().get(k).map(|p| p.value())).map(|__value| (__value).view()) {
+        Some(ValueView::Str(s)) => s.to_string(),
         _ => String::new(),
     }
 }
@@ -385,7 +386,7 @@ fn format_string(i: &mut Interp, this: &Value, dur: &Value) -> Result<String, Va
     let arr = i.make_array(strings.into_iter().map(Value::lstr).collect());
     let fmt = ab(i.get_member_key(&lf, "format"))?;
     let out = ab(i.call(fmt, lf, &[arr]))?;
-    Ok(if let Value::Str(s) = out {
+    Ok(if let ValueView::Str(s) = (out).view() {
         s.to_string()
     } else {
         String::new()
@@ -404,13 +405,14 @@ fn partition(
     let locale = get_str(&o, "#\u{0}df_locale");
     let base_style = get_str(&o, "#\u{0}df_style");
     let numbering = get_str(&o, "#\u{0}df_nu");
-    let frac_digits = match o
+    let frac_digits = match (o
         .borrow()
         .internal_slots()
         .get("#\u{0}df_frac")
-        .map(|p| p.value())
+        .map(|p| p.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Num(n)) => Some(n as u32),
+        Some(ValueView::Num(n)) => Some(n as u32),
         _ => None,
     };
 
@@ -505,10 +507,10 @@ fn partition(
                 Some(sd) if !(value == 0.0 && value.is_sign_negative()) => Value::lstr(sd.clone()),
                 _ => Value::Num(value),
             };
-            let parts_arr = ab(i.call(ftp, nf.clone(), &[nf_arg]))?;
+            let parts_arr = ab(i.call(ftp, nf, &[nf_arg]))?;
             // Read the {type,value} objects into (type,value,unit=singular) parts.
             let len = ab(i.get_member_key(&parts_arr, "length"))?;
-            let len = if let Value::Num(n) = len {
+            let len = if let ValueView::Num(n) = (len).view() {
                 n as usize
             } else {
                 0
@@ -516,12 +518,12 @@ fn partition(
             let mut parts: Vec<DurPart> = Vec::with_capacity(len);
             for k in 0..len {
                 let el = ab(i.get_member_key(&parts_arr, &k.to_string()))?;
-                let ty = match ab(i.get_member_key(&el, "type"))? {
-                    Value::Str(s) => s.to_string(),
+                let ty = match (ab(i.get_member_key(&el, "type"))?).view() {
+                    ValueView::Str(s) => s.to_string(),
                     _ => String::new(),
                 };
-                let va = match ab(i.get_member_key(&el, "value"))? {
-                    Value::Str(s) => s.to_string(),
+                let va = match (ab(i.get_member_key(&el, "value"))?).view() {
+                    ValueView::Str(s) => s.to_string(),
                     _ => String::new(),
                 };
                 parts.push((ty, va, Some(sing.to_string())));
@@ -584,16 +586,17 @@ fn format_to_parts(i: &mut Interp, this: &Value, dur: &Value) -> Result<Value, V
     let arr = i.make_array(strings.into_iter().map(Value::lstr).collect());
     let ftp = ab(i.get_member_key(&lf, "formatToParts"))?;
     let list_parts = ab(i.call(ftp, lf, &[arr]))?;
-    let len = match ab(i.get_member_key(&list_parts, "length"))? {
-        Value::Num(n) => n as usize,
+    let len = match (ab(i.get_member_key(&list_parts, "length"))?).view() {
+        ValueView::Num(n) => n as usize,
         _ => 0,
     };
-    let mut out: Vec<Value> = Vec::new();
+    // Rooted across the part reads, which can run getters (I1).
+    let mut out = crate::rooting::RootedVec::new();
     let mut giter = groups.drain(..);
     for k in 0..len {
         let el = ab(i.get_member_key(&list_parts, &k.to_string()))?;
-        let ty = match ab(i.get_member_key(&el, "type"))? {
-            Value::Str(s) => s.to_string(),
+        let ty = match (ab(i.get_member_key(&el, "type"))?).view() {
+            ValueView::Str(s) => s.to_string(),
             _ => String::new(),
         };
         if ty == "element" {
@@ -616,7 +619,7 @@ fn format_to_parts(i: &mut Interp, this: &Value, dur: &Value) -> Result<Value, V
             out.push(Value::Obj(ob));
         }
     }
-    Ok(i.make_array(out))
+    Ok(i.make_array(out.into_vec()))
 }
 
 /// The fractional seconds/ms/us value combining sub-second fields, truncated as a decimal string

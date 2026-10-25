@@ -20,7 +20,7 @@ impl Write for Captured {
 fn secrets_validate_credential_identity_without_accessing_store() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

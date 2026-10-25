@@ -128,11 +128,10 @@ fn uncacheable_shapes_do_not_allocate_computed_cache_or_replace_valid_ways() {
         recv_shape: UNKNOWN,
         ..state()
     };
-    cache.insert(&key, invalid);
+    cache.insert(&key, invalid, false, 0);
     assert!(cache.raw_sets.is_null());
-    assert_eq!(key.strong_count(), 1);
-    cache.insert(&key, state());
-    cache.insert(&key, invalid);
+    cache.insert(&key, state(), false, 0);
+    cache.insert(&key, invalid, false, 0);
     assert!(cache.lookup(key.as_ptr() as usize, UNKNOWN).is_none());
     assert_eq!(
         cache
@@ -141,7 +140,6 @@ fn uncacheable_shapes_do_not_allocate_computed_cache_or_replace_valid_ways() {
             .holder_shape,
         23
     );
-    assert_eq!(key.strong_count(), 2);
 }
 
 #[test]

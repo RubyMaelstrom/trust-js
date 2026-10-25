@@ -12,14 +12,13 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn array(engine: &mut Engine, name: &str) -> crate::value::Gc {
-    let global = crate::value::Value::Obj(engine.interp.global.clone());
+    let global = crate::value::Value::Obj(engine.interp.global);
     engine
         .interp
         .get_member_key(&global, name)
         .unwrap_or_else(|_| panic!("{name}"))
         .as_obj()
         .unwrap()
-        .clone()
 }
 
 fn reset_entries() {
@@ -57,9 +56,6 @@ fn numeric_array_shift_keeps_warm_native_views_coherent_across_gc_and_append() {
             );
             entered(tier);
             assert_eq!(eval(&mut engine, "a.shift()"), "1");
-            engine
-                .interp
-                .gc_collect_young(crate::value::GcCause::Explicit);
             engine.interp.gc_collect();
             reset_entries();
             assert_eq!(
@@ -122,9 +118,6 @@ fn numeric_front_edits_reload_native_views_within_the_same_activation() {
                 ),
                 "64:1:64"
             );
-            engine
-                .interp
-                .gc_collect_young(crate::value::GcCause::Explicit);
             engine.interp.gc_collect();
         }
     }

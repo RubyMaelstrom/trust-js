@@ -1,6 +1,7 @@
 //! ECMA-262 e28783d5, Declarative Environment Records, GetValue/PutValue,
 //! OrdinaryGet and EvaluateCall. Region publication must precede observations.
 use super::*;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
@@ -39,19 +40,20 @@ fn local_typeof_literals_avoid_strings_and_use_native_scalar_classification() {
     "#,
     );
     evaluate(&mut engine, "for(var warm=0;warm<64;warm++)scalarTypes(7);");
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let function = engine
         .interp
         .get_var("scalarTypes", &env)
         .unwrap_or_else(|_| panic!("fixture binding exists"));
-    let crate::value::Value::Obj(object) = function else {
+    let ValueView::Obj(object) = (function).view() else {
         panic!("fixture is callable")
     };
     let object = object.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("fixture is an ordinary function")
     };
-    let chunk = user.func.execution_code().and_then(Option::as_ref).unwrap();
+    let runtime = user.func.runtime();
+    let chunk = runtime.execution_code().and_then(Option::as_ref).unwrap();
     assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
     drop(object);
     let before = crate::bytecode::TEST_JIT_TYPEOF_HELPERS.with(std::cell::Cell::get);
@@ -244,19 +246,20 @@ fn native_void_releases_scalars_and_shared_owners_without_a_general_helper() {
         "function nativeVoid(v){return void v;}nativeVoid(7);",
     );
     evaluate(&mut engine, "for(var warm=0;warm<64;warm++)nativeVoid(7);");
-    let env = engine.interp.global_env.clone();
-    let crate::value::Value::Obj(object) = engine
+    let env = engine.interp.global_env;
+    let ValueView::Obj(object) = (engine
         .interp
         .get_var("nativeVoid", &env)
-        .unwrap_or_else(|_| panic!("fixture binding exists"))
-    else {
+        .unwrap_or_else(|_| panic!("fixture binding exists")))
+    .view() else {
         panic!("fixture is callable")
     };
     let object = object.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("ordinary fixture")
     };
-    let chunk = user.func.execution_code().and_then(Option::as_ref).unwrap();
+    let runtime = user.func.runtime();
+    let chunk = runtime.execution_code().and_then(Option::as_ref).unwrap();
     assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
     drop(object);
     let before = crate::bytecode::TEST_JIT_VOID_HELPERS.with(std::cell::Cell::get);
@@ -294,9 +297,9 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
             0,
             Rc::new(move |i, _, _| {
                 let probe = Probe(count.clone());
-                let object = crate::value::Object::new(Some(i.object_proto.clone()));
+                let object = crate::value::Object::new(Some(i.object_proto));
                 object.borrow_mut().call =
-                    crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
+                    crate::value::Callable::native_data(Rc::new(crate::value::NativeCallable {
                         body: crate::value::NativeCallableBody::Opaque(Rc::new(move |_, _, _| {
                             let _ = &probe;
                             Ok(crate::value::Value::Undefined)
@@ -306,6 +309,7 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
                     }));
                 Ok(crate::value::Value::Obj(object))
             }),
+            crate::value::NativeCaptures::None,
         );
         engine.interp.global.borrow_mut().props.insert(
             "makeVoidTemp",
@@ -328,10 +332,12 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
         );
         let before = crate::bytecode::TEST_JIT_VOID_HELPERS.with(Cell::get);
         assert_eq!(evaluate(&mut engine, "temporaryVoid()===undefined"), "true");
+        // The next collection finds the last owner dead and destroys it.
+        engine.interp.gc_collect();
         assert_eq!(drops.get(), 1, "last owner is destroyed at void, {tier:?}");
         if tier == Tier::Jit {
-            // The native template destroys a last owner through the packed drop helper (Rust
-            // destruction only), without the generic Void operation.
+            // The native template discards the value (traced ownership releases nothing),
+            // without the generic Void operation.
             assert_eq!(
                 crate::bytecode::TEST_JIT_VOID_HELPERS.with(Cell::get),
                 before,
@@ -412,19 +418,20 @@ fn in_operator_dense_element_hits_stay_native() {
         &mut engine,
         "for(var warm=0;warm<64;warm++)has(warm&1,[1,2]);",
     );
-    let env = engine.interp.global_env.clone();
-    let crate::value::Value::Obj(object) = engine
+    let env = engine.interp.global_env;
+    let ValueView::Obj(object) = (engine
         .interp
         .get_var("has", &env)
-        .unwrap_or_else(|_| panic!("fixture binding exists"))
-    else {
+        .unwrap_or_else(|_| panic!("fixture binding exists")))
+    .view() else {
         panic!("fixture is callable")
     };
     let object = object.borrow();
     let crate::value::Callable::User(user) = &object.call else {
         panic!("ordinary fixture")
     };
-    let chunk = user.func.execution_code().and_then(Option::as_ref).unwrap();
+    let runtime = user.func.runtime();
+    let chunk = runtime.execution_code().and_then(Option::as_ref).unwrap();
     assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
     drop(object);
     let before = crate::bytecode::TEST_JIT_IN_HELPERS.with(std::cell::Cell::get);
@@ -497,8 +504,8 @@ fn html_all_collection_is_a_live_falsy_callable_platform_object() {
     // [[IsHTMLDDA]] object with the interface prototype, live read-only
     // indexed and unenumerable named properties, and a legacy caller.
     fn length(_: &crate::interpreter::Interp, state: &Value) -> u32 {
-        match state {
-            Value::Num(count) => *count as u32,
+        match &(state).view() {
+            ValueView::Num(count) => *count as u32,
             _ => 0,
         }
     }

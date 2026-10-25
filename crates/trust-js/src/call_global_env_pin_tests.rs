@@ -54,36 +54,45 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
         .member_get(&main, "nativeRealmProbe")
         .ok()
         .expect("installed native probe");
-    let native_id = Rc::as_ptr(native.as_obj().unwrap()) as usize;
-    let native_pin = Rc::downgrade(native.as_obj().unwrap());
+    let native_id = crate::value::Gc::as_ptr(&native.as_obj().unwrap()) as usize;
+    let native_pin = crate::value::Gc::downgrade(&native.as_obj().unwrap());
     let bytes =
         crate::compile_snapshot("globalThis.subject = function(native) { return native(); };")
             .expect("shared caller snapshot");
     // The program's function AST, unlike its per-Realm callable, survives the settings change.
     let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
     let program = engine.interp.shared_snapshot_program(bytes).unwrap();
-    assert!(engine.interp.run_classic_program(&program, None).is_ok());
+    // The completion value (the caller function) stays in a helper frame: the collector scans
+    // the stack.
+    assert!(crate::gc_test::in_frame(|| engine
+        .interp
+        .run_classic_program(&program, None)
+        .is_ok()));
     for _ in 0..8 {
         assert_eq!(
             eval(&mut engine, "subject(nativeRealmProbe) === globalThis"),
             "true"
         );
     }
-    let subject = engine
-        .interp
-        .member_get(&main, "subject")
-        .ok()
-        .expect("shared caller callable");
-    let function = match &subject.as_obj().unwrap().borrow().call {
-        Callable::User(user) => user.func.clone(),
-        _ => panic!("shared caller function"),
-    };
-    let chunk = function
-        .code
-        .get()
-        .and_then(Option::as_ref)
-        .unwrap()
-        .clone();
+    // Handles and addresses of the old settings environment's objects stay in helper frames:
+    // the collector scans the stack.
+    let (subject, function) = crate::gc_test::in_frame(|| {
+        let subject = engine
+            .interp
+            .member_get(&main, "subject")
+            .ok()
+            .expect("shared caller callable");
+        let function = match &subject.as_obj().unwrap().borrow().call {
+            Callable::User(user) => user.func.clone(),
+            _ => panic!("shared caller function"),
+        };
+        (
+            crate::value::Gc::downgrade(&subject.as_obj().unwrap()),
+            function,
+        )
+    });
+    let runtime = function.runtime();
+    let chunk = runtime.code.get().and_then(Option::as_ref).unwrap().clone();
     let code = chunk.jit.get().flatten().expect("real template caller");
     assert!(!code.pc_offsets.is_empty());
     let cache = chunk
@@ -100,17 +109,19 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             CALL_IC_WAYS,
         )
     };
-    let original = cells
-        .iter()
-        .map(Cell::get)
-        .find(|entry| entry.callee == native_id)
-        .expect("warmed live native entry");
-    assert_ne!(original.native, 0);
-    assert_eq!(
-        original.global_env,
-        Rc::as_ptr(&engine.interp.global_env) as usize
-    );
-    let retired_env = Rc::downgrade(&engine.interp.global_env);
+    let retired_env = crate::gc_test::in_frame(|| {
+        let original = cells
+            .iter()
+            .map(Cell::get)
+            .find(|entry| entry.callee == native_id)
+            .expect("warmed live native entry");
+        assert_ne!(original.native, 0);
+        assert_eq!(
+            original.global_env,
+            crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize
+        );
+        crate::interpreter::Env::downgrade(&engine.interp.global_env)
+    });
     assert!(engine
         .interp
         .global_env_pins
@@ -122,27 +133,26 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     let unchanged = CALL_IC_EPOCH.load(Relaxed);
     engine.interp.gc_collect();
     assert_eq!(CALL_IC_EPOCH.load(Relaxed), unchanged);
-    assert_eq!(
+    let epoch = crate::gc_test::in_frame(|| {
         cells
             .iter()
             .map(Cell::get)
             .find(|entry| entry.callee == native_id)
             .unwrap()
-            .epoch,
-        unchanged
-    );
+            .epoch
+    });
+    assert_eq!(epoch, unchanged);
 
     eval(&mut engine, "delete globalThis.subject;");
     drop(subject);
     assert!(engine.interp.release_host_job_context(41));
     engine.interp.switch_host_job_context(42);
-    assert_eq!(
-        retired_env.strong_count(),
-        0,
-        "callee/code do not retain the old settings environment"
-    );
     let before = CALL_IC_EPOCH.load(Relaxed);
     engine.interp.gc_collect();
+    assert!(
+        !crate::gc_test::alive(&retired_env),
+        "callee/code do not retain the old settings environment"
+    );
     assert_eq!(
         CALL_IC_EPOCH.load(Relaxed),
         before + 1,
@@ -161,13 +171,14 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     let child = engine.interp.create_realm();
     in_realm(&mut engine.interp, &child, |i| {
         assert!(i.run_classic_program(&program, None).is_ok());
-        set_global(i, "mainRealm", main.clone());
-        set_global(i, "mainNative", native.clone());
+        set_global(i, "mainRealm", main);
+        set_global(i, "mainNative", native);
         let child_subject = i
             .member_get(&i.global_this(), "subject")
             .ok()
             .expect("child caller callable");
-        let body = child_subject.as_obj().unwrap().borrow();
+        let body_handle = child_subject.as_obj().unwrap();
+        let body = body_handle.borrow();
         let Callable::User(user) = &body.call else {
             panic!("child caller");
         };
@@ -183,7 +194,7 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             let entry = cell.get();
             if entry.callee == native_id {
                 cell.set(CallIc {
-                    global_env: Rc::as_ptr(&i.global_env) as usize,
+                    global_env: crate::interpreter::Env::as_ptr(&i.global_env) as usize,
                     ..entry
                 });
             }

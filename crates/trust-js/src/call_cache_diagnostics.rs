@@ -2,7 +2,8 @@
 //! Raw entries are observed as integer metadata only, never dereferenced by diagnostics.
 use super::{CallIc, CallSite, CALL_IC_EPOCH};
 use crate::value::Value;
-use std::{cell::Cell, panic::Location, rc::Rc, sync::atomic::Ordering::Relaxed};
+use crate::value::ValueView;
+use std::{cell::Cell, panic::Location, sync::atomic::Ordering::Relaxed};
 
 thread_local! { static COUNTS: Cell<[u64; 8]> = const { Cell::new([0; 8]) }; }
 fn add(index: usize) {
@@ -37,10 +38,10 @@ pub(super) fn fill(site: &CallSite, incoming: CallIc) {
 }
 pub(crate) fn probe(site: &CallSite, callee: &Value) {
     add(5);
-    let Value::Obj(callee) = callee else {
+    let ValueView::Obj(callee) = &(callee).view() else {
         return;
     };
-    let key = Rc::as_ptr(callee) as usize;
+    let key = crate::value::Gc::as_ptr(callee) as usize;
     let epoch = CALL_IC_EPOCH.load(Relaxed);
     for old in site.entries.iter().map(Cell::get) {
         if old.callee == key {

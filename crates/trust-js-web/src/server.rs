@@ -33,8 +33,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, Tc
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use trust_js_host::ValueKind;
 
-use trust_js_host::{CompletionSender, Ctx, SpawnHandle, TaskRegistry, Value};
+use trust_js_host::{CompletionSender, Ctx, Handle, SpawnHandle, TaskRegistry, Value};
 
 use crate::http_syntax::{
     self, body_framing, field_value_bytes, header_values, read_body, read_fields, read_line,
@@ -46,7 +47,8 @@ use crate::read_header_pairs;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Live servers, keyed by the id handed to JS. Lives in `OpState`; the accept decoder reads it
 /// to re-arm and the `close` op flips the `closed` flag. JS values (`dispatch`) are `!Send` and
-/// so only ever touched on the loop thread — never moved into a pool closure.
+/// so only ever touched on the loop thread — never moved into a pool closure. Each open entry
+/// holds its dispatch function in a handle while it is registered.
 #[derive(Default)]
 pub(crate) struct ServerRegistry {
     next: u64,
@@ -60,7 +62,7 @@ struct ServerEntry {
     closed: Arc<AtomicBool>,
     /// The fixed JS `__dispatch(serverId, connId, ...)` callback (same for every accept of
     /// this server); it looks the user handler up by id.
-    dispatch: Value,
+    dispatch: Handle,
 }
 
 impl Drop for ServerRegistry {
@@ -128,22 +130,24 @@ struct Accepted {
 
 /// `__http_server.listen(hostname, port, dispatch)` -> `[serverId, boundPort]`. Binds, registers
 /// the server, and arms the first accept. Throws if the bind fails.
-pub(crate) fn op_server_listen(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(crate) fn op_server_listen<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let host = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
-    let port = match args.get(1) {
-        Some(Value::Num(n)) if n.is_finite() && n.fract() == 0.0 && (0.0..=65535.0).contains(n) => {
-            *n as u16
+    let port = match (args.get(1)).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n))
+            if n.is_finite() && n.fract() == 0.0 && (0.0..=65535.0).contains(&n) =>
+        {
+            n as u16
         }
         _ => return Err(ctx.make_error("TypeError", "listen: port must be 0..=65535")),
     };
     let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
+        Some(v) if v.is_callable() => trust_js_host::handle(ctx, v)?,
         _ => return Err(ctx.make_error("TypeError", "listen: dispatch must be a function")),
     };
 
@@ -186,18 +190,20 @@ pub(crate) fn op_server_listen(
 /// Serializes the response and writes it on the pool; the promise settles when the write
 /// finishes (or the client hung up). The socket is taken out of the resource table here, so a
 /// second respond on the same connection rejects.
-pub(crate) fn op_server_respond(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
-    let conn_id = match args.first() {
-        Some(Value::Num(n)) if *n >= 0.0 => *n as u32,
+pub(crate) fn op_server_respond<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let conn_id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) if n >= 0.0 => n as u32,
         _ => return Err(ctx.make_error("TypeError", "respond: bad connection id")),
     };
-    let status = match args.get(1) {
-        Some(Value::Num(n)) if n.is_finite() && n.fract() == 0.0 && (200.0..=599.0).contains(n) => {
-            *n as u16
+    let status = match (args.get(1)).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n))
+            if n.is_finite() && n.fract() == 0.0 && (200.0..=599.0).contains(&n) =>
+        {
+            n as u16
         }
         _ => return Err(ctx.make_error("TypeError", "respond: status must be 200..=599")),
     };
@@ -205,8 +211,8 @@ pub(crate) fn op_server_respond(
         .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
         .to_string();
     let headers = read_header_pairs(ctx, args.get(3).unwrap_or(&Value::Undefined))?;
-    let body = match args.get(4) {
-        None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
+    let body = match args.get(4).filter(|value| !value.is_nullish()) {
+        None => Vec::new(),
         Some(v) => ctx.typed_array_bytes(v).unwrap_or_default(),
     };
     if body.len() as u64 > MAX_BODY {
@@ -216,9 +222,7 @@ pub(crate) fn op_server_respond(
         .coerce_string(args.get(5).unwrap_or(&Value::Undefined))?
         .to_string();
     let (resolve, reject) = match (args.get(6), args.get(7)) {
-        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
-            (res.clone(), rej.clone())
-        }
+        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => (*res, *rej),
         _ => return Err(ctx.make_error("TypeError", "respond expects (resolve, reject)")),
     };
 
@@ -239,10 +243,7 @@ pub(crate) fn op_server_respond(
     let bytes = build_response(status, &status_text, &headers, &body, &request_method)
         .map_err(|error| ctx.make_error("TypeError", format!("respond: {error}")))?;
 
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_write);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_write)?;
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()
@@ -255,9 +256,13 @@ pub(crate) fn op_server_respond(
 
 /// `__http_server.close(serverId)`. Flags the listener closed and pokes it with a throwaway
 /// connection so the blocked `accept()` wakes, sees the flag, and stops re-arming.
-pub(crate) fn op_server_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) if *n >= 0.0 => *n as u64,
+pub(crate) fn op_server_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let id = match (args.first()).map(|__value| (__value).kind()) {
+        Some(ValueKind::Num(n)) if n >= 0.0 => n as u64,
         _ => return Ok(Value::Undefined),
     };
     let target = ctx
@@ -288,12 +293,12 @@ fn wake_listener(local_addr: SocketAddr) {
 }
 
 /// `__http_server.version()` -> the runtime version string (backs `TRustJS.version`).
-pub(crate) fn op_server_version(
-    _ctx: &mut Ctx,
-    _this: Value,
-    _args: &[Value],
-) -> Result<Value, Value> {
-    Ok(Value::from_string(env!("CARGO_PKG_VERSION").to_string()))
+pub(crate) fn op_server_version<'s>(
+    _ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    Ok(_ctx.string(env!("CARGO_PKG_VERSION").to_string()))
 }
 
 // ---- completion decoders (run on the loop thread with &mut Ctx) --------------------------------
@@ -301,10 +306,10 @@ pub(crate) fn op_server_version(
 /// Settle one accept: on a request, stash the socket, re-arm the next accept, and return the
 /// args for `__dispatch(serverId, connId, method, url, headers, body, remoteHost, remotePort)`.
 /// On close, return `[serverId, -1]` (JS resolves `finished`) and do not re-arm.
-fn decode_accept(
-    ctx: &mut Ctx,
+fn decode_accept<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let AcceptTaskResult { server_id, outcome } = *payload
         .downcast::<AcceptTaskResult>()
         .expect("accept payload");
@@ -353,21 +358,21 @@ fn decode_accept(
     Ok(vec![
         Value::Num(server_id as f64),
         Value::Num(conn_id as f64),
-        Value::from_string(method),
-        Value::from_string(url),
+        ctx.string(method),
+        ctx.string(url),
         headers_val,
         body_val,
-        Value::from_string(peer.ip().to_string()),
+        ctx.string(peer.ip().to_string()),
         Value::Num(peer.port() as f64),
     ])
 }
 
 /// Settle a response write: `resolve()` on success, `reject(error)` if the socket write failed
 /// (client hung up mid-response, etc.).
-fn decode_write(
-    ctx: &mut Ctx,
+fn decode_write<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<(), String>>()
         .expect("write payload")
@@ -380,13 +385,13 @@ fn decode_write(
 // ---- helpers ----------------------------------------------------------------------------------
 
 /// Register a fresh accept task (its `on_ok` is `dispatch`) and spawn it on the pool.
-fn arm_accept(
-    ctx: &mut Ctx,
+fn arm_accept<'s>(
+    ctx: &mut Ctx<'s>,
     server_id: u64,
     listener: Arc<TcpListener>,
     closed: Arc<AtomicBool>,
     local_addr: SocketAddr,
-    dispatch: Value,
+    dispatch: Handle,
 ) {
     let id = ctx
         .host_mut::<TaskRegistry>()
@@ -673,15 +678,10 @@ fn write_all_and_close(stream: TcpStream, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn header_pairs_to_js(ctx: &Ctx, headers: &[(String, String)]) -> Value {
+fn header_pairs_to_js<'s>(ctx: &Ctx<'s>, headers: &[(String, String)]) -> Value<'s> {
     let pairs = headers
         .iter()
-        .map(|(k, v)| {
-            ctx.make_array(vec![
-                Value::from_string(k.clone()),
-                Value::from_string(v.clone()),
-            ])
-        })
+        .map(|(k, v)| ctx.make_array(vec![ctx.string(k.clone()), ctx.string(v.clone())]))
         .collect();
     ctx.make_array(pairs)
 }

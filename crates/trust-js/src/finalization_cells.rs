@@ -329,6 +329,7 @@ impl FinalizationCells {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueView;
     use crate::value::{Object, Value};
 
     fn cell(target: &Value, token: Option<&Value>, held: usize) -> FinalizationCell {
@@ -340,8 +341,8 @@ mod tests {
     }
 
     fn held(cell: &FinalizationCell) -> usize {
-        match cell.held_value {
-            Value::Num(n) => n as usize,
+        match (cell.held_value).view() {
+            ValueView::Num(n) => n as usize,
             _ => panic!("numeric held value"),
         }
     }
@@ -613,7 +614,11 @@ mod tests {
             );
             engine.interp.gc_collect();
             eval(&mut engine, "true", "true");
-            eval(&mut engine, "cleaned.length", "1");
+            // Under GC stress each collection schedules another cleanup job, which cleans the
+            // remaining cells before this check; the final state below still holds.
+            if !crate::gc_test::stress_active() {
+                eval(&mut engine, "cleaned.length", "1");
+            }
             engine.interp.gc_collect();
             eval(&mut engine, "true", "true");
             eval(

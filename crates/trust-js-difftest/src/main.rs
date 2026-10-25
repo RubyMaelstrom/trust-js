@@ -17,25 +17,22 @@
 //! divergence, written to the regression corpus, and the process halts with a nonzero exit.
 //! On startup the whole corpus is replayed first — regressions stay fixed forever.
 //!
-//! The engine's Rc heap frees realms only via the in-interpreter cycle collector, so a dropped
-//! Engine leaks its realm (one big cycle). Like the test262 runner, the fuzzer therefore runs
-//! programs in short-lived child processes (batches), keeping the parent's memory flat.
-//!
 //! Usage:
 //!   trust-js-difftest [--seed N] [--count N] [--corpus DIR]
 //!
 //! Each candidate program runs in a short-lived child (`--check`) that the parent caps on memory
-//! and wall-clock: the Rc heap frees realms only via the cycle collector (a dropped Engine leaks
-//! its realm), and generated programs can be non-terminating or allocate without bound, so
-//! isolation + budget is what keeps the parent flat and turns pathological programs into skipped
-//! "inconclusive" results rather than false divergences or an OOM.
+//! and wall-clock: generated programs can be non-terminating or allocate without bound, and a
+//! tier can crash, so isolation + budget is what keeps the parent flat and turns pathological
+//! programs into skipped "inconclusive" results rather than false divergences or an OOM. (A
+//! dropped Engine frees its heap; the children are for the budget, not for memory a run leaves
+//! behind.)
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use trust_js::bytecode::Tier;
+use trust_js::Tier;
 use trust_js::{Completion, Engine};
 
 /// A counting allocator with a hard live-bytes cap. When a `--check` child engages the cap, any
@@ -153,8 +150,8 @@ fn run_tier(src: &str, tier: Tier) -> Outcome {
 fn diverges(src: &str) -> bool {
     let oracle = run_tier(src, Tier::Interp);
     // The tree-walker is the reference: both compiled tiers must match it (Jit exercises the
-    // machine-code templates + register chains on aarch64-macos and degrades to the bytecode VM
-    // elsewhere — still a valid, if redundant, comparison).
+    // machine-code templates on aarch64 and x86-64, with register chains on aarch64, and
+    // degrades to the bytecode VM elsewhere — still a valid, if redundant, comparison).
     oracle != run_tier(src, Tier::Bytecode) || oracle != run_tier(src, Tier::Jit)
 }
 
@@ -410,7 +407,6 @@ fn main() {
 fn dispatch() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        // Child: run a seed range in-process; leaked realms die with the process.
         Some("--one") => {
             // Debug: run a single seed in a single tier (which=interp|bytecode).
             let s: u64 = args[1].parse().unwrap();
@@ -489,12 +485,67 @@ mod observation_tests {
     }
 }
 
+#[cfg(test)]
+mod crash_tests {
+    use super::*;
+
+    /// The verdict when the reruns end as listed, in interp, bytecode and jit.
+    fn verdict(ends: [Run; 3]) -> Verdict {
+        crash_verdict(|tier| match tier {
+            Tier::Interp => ends[0],
+            Tier::Bytecode => ends[1],
+            Tier::Jit => ends[2],
+        })
+    }
+
+    #[test]
+    fn a_compiled_tier_crash_fails_only_when_the_oracle_completes() {
+        use Run::{Completed, Crashed, Exhausted};
+        assert_eq!(
+            verdict([Completed, Crashed, Completed]),
+            Verdict::Crash(Tier::Bytecode)
+        );
+        assert_eq!(
+            verdict([Completed, Exhausted, Crashed]),
+            Verdict::Crash(Tier::Jit)
+        );
+        assert_eq!(
+            verdict([Completed, Exhausted, Exhausted]),
+            Verdict::Inconclusive
+        );
+        // An oracle that ran out of budget, or crashed, never completed: nothing to compare.
+        assert_eq!(
+            verdict([Exhausted, Crashed, Crashed]),
+            Verdict::Inconclusive
+        );
+        assert_eq!(verdict([Crashed, Crashed, Crashed]), Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn a_rerun_completes_runs_out_of_budget_or_crashes() {
+        assert_eq!(run_end(true, ""), Run::Completed);
+        assert_eq!(
+            run_end(false, "memory allocation of 1048576 bytes failed\n"),
+            Run::Exhausted
+        );
+        assert_eq!(
+            run_end(false, "thread 'main' has overflowed its stack\n"),
+            Run::Crashed
+        );
+        assert_eq!(run_end(false, ""), Run::Crashed);
+    }
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum Verdict {
     Agree,
     Diverge,
-    /// Killed for exceeding the memory/time budget — inconclusive, not a divergence.
+    /// Killed for exceeding the memory/time budget, or crashed where the oracle did not complete
+    /// — inconclusive, not a divergence.
     Inconclusive,
+    /// The oracle tier completes on its own but this tier's child crashed (a signal, panic or
+    /// abort): a failure, like a divergence.
+    Crash(Tier),
 }
 
 /// Run `src` in a capped child (`--check`), polling its RSS and enforcing a wall-clock deadline.
@@ -514,9 +565,11 @@ fn run_capped(exe: &std::path::Path, src: &str, tmp: &std::path::Path) -> Verdic
             return match status.code() {
                 Some(3) => Verdict::Diverge,
                 Some(0) => Verdict::Agree,
-                // Nonzero-but-not-3 (a crash/abort in BOTH tiers, e.g. a stack overflow on a
-                // deeply-recursive program) is inconclusive, not a divergence.
-                _ => Verdict::Inconclusive,
+                // Nonzero-but-not-3: a crash or abort somewhere in the run. It is inconclusive
+                // unless the oracle completes (it crashes too, as on a deeply recursive program's
+                // stack overflow, or runs out of budget); a tier that crashes where the oracle
+                // completes fails.
+                _ => classify_crash(exe, tmp),
             };
         }
         // Poll RSS via `ps` (dependency-free); kill if over budget or past the deadline.
@@ -536,6 +589,83 @@ fn run_capped(exe: &std::path::Path, src: &str, tmp: &std::path::Path) -> Verdic
             let _ = child.kill();
             let _ = child.wait();
             return Verdict::Inconclusive;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+}
+
+/// How a capped `--observe` child ended.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum Run {
+    /// It exited normally: the tier ran the program to its end.
+    Completed,
+    /// It ran out of budget: the wall clock, or the allocation cap's abort.
+    Exhausted,
+    /// It died another way: a signal, a panic or an abort.
+    Crashed,
+}
+
+/// How an `--observe` child that exited ended, from its exit status and its stderr, where the
+/// allocation cap's abort reports the failed allocation.
+fn run_end(success: bool, stderr: &str) -> Run {
+    if success {
+        Run::Completed
+    } else if stderr.contains("memory allocation of") {
+        Run::Exhausted
+    } else {
+        Run::Crashed
+    }
+}
+
+/// A `--check` child died: rerun the program (still in `tmp`) one tier at a time (`--observe`,
+/// under the same caps). The first tier that crashes while the oracle completes is the verdict.
+fn classify_crash(exe: &std::path::Path, tmp: &std::path::Path) -> Verdict {
+    crash_verdict(|tier| observe_run(exe, tmp, tier))
+}
+
+/// [`classify_crash`]'s decision from how each tier's rerun ends. Only an oracle that completes
+/// can convict a compiled tier: one that runs out of budget or crashes leaves the program
+/// inconclusive, and so does a compiled tier that only runs out of budget.
+fn crash_verdict(mut observe: impl FnMut(Tier) -> Run) -> Verdict {
+    if observe(Tier::Interp) != Run::Completed {
+        return Verdict::Inconclusive;
+    }
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        if observe(tier) == Run::Crashed {
+            return Verdict::Crash(tier);
+        }
+    }
+    Verdict::Inconclusive
+}
+
+/// Run `tmp` in `tier` in a capped `--observe` child, and say how it ended.
+fn observe_run(exe: &std::path::Path, tmp: &std::path::Path, tier: Tier) -> Run {
+    let tier = match tier {
+        Tier::Interp => "interp",
+        Tier::Bytecode => "bytecode",
+        Tier::Jit => "jit",
+    };
+    let err_path = tmp.with_extension("err");
+    let mut child = std::process::Command::new(exe)
+        .arg("--observe")
+        .arg(tmp)
+        .arg(tier)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let err = std::fs::read_to_string(&err_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&err_path);
+            return run_end(status.success(), &err);
+        }
+        if start.elapsed().as_millis() as u64 > TIMEOUT_MS {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&err_path);
+            return Run::Exhausted;
         }
         std::thread::sleep(std::time::Duration::from_millis(4));
     }
@@ -598,9 +728,19 @@ fn fuzz_parent(args: Vec<String>) {
         entries.sort();
         for p in &entries {
             let src = std::fs::read_to_string(p).unwrap();
-            if run_capped(&exe, &src, &tmp) == Verdict::Diverge {
-                eprintln!("REGRESSION: corpus case {} diverges again", p.display());
-                std::process::exit(1);
+            match run_capped(&exe, &src, &tmp) {
+                Verdict::Diverge => {
+                    eprintln!("REGRESSION: corpus case {} diverges again", p.display());
+                    std::process::exit(1);
+                }
+                Verdict::Crash(tier) => {
+                    eprintln!(
+                        "REGRESSION: corpus case {} crashes in {tier:?}",
+                        p.display()
+                    );
+                    std::process::exit(1);
+                }
+                Verdict::Agree | Verdict::Inconclusive => {}
             }
         }
         if !entries.is_empty() {
@@ -614,6 +754,17 @@ fn fuzz_parent(args: Vec<String>) {
         match run_capped(&exe, &generate(s), &tmp) {
             Verdict::Agree => agreed += 1,
             Verdict::Inconclusive => skipped += 1,
+            Verdict::Crash(tier) => {
+                std::fs::create_dir_all(&corpus).unwrap();
+                let path = corpus.join(format!("seed-{s}-crash.js"));
+                std::fs::write(&path, generate(s)).unwrap();
+                eprintln!(
+                    "CRASH at seed {s} in {tier:?} (the interp oracle completes); saved {}",
+                    path.display()
+                );
+                let _ = std::fs::remove_file(&tmp);
+                std::process::exit(1);
+            }
             Verdict::Diverge => {
                 eprintln!("DIVERGENCE at seed {s} — minimizing…");
                 let min = minimize_capped(&exe, &generate(s), &tmp);

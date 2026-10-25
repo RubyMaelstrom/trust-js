@@ -11,17 +11,17 @@
 use crate::bytecode::Tier;
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
+use crate::value::ValueView;
 use crate::Engine;
-use std::rc::Rc;
 
 pub(crate) const TIERS: [Tier; 3] = [Tier::Interp, Tier::Bytecode, Tier::Jit];
 
 /// Run `f` with `realm` installed as the active Realm, as an embedder's host operation does.
 pub(crate) fn in_realm<R>(it: &mut Interp, realm: &Value, f: impl FnOnce(&mut Interp) -> R) -> R {
-    let Value::Obj(global) = realm else {
+    let ValueView::Obj(global) = &(realm).view() else {
         panic!("a Realm is named by its global object");
     };
-    let key = Rc::as_ptr(global) as usize;
+    let key = crate::value::Gc::as_ptr(global) as usize;
     let target = it
         .realms
         .get(&key)
@@ -44,7 +44,7 @@ pub(crate) fn render(it: &mut Interp, value: &Value) -> String {
 }
 
 pub(crate) fn eval_string(it: &mut Interp, source: &str) -> String {
-    let env = it.global_env.clone();
+    let env = it.global_env;
     match it.perform_eval(source, &env, false) {
         Ok(value) => render(it, &value),
         Err(Abrupt::Throw(error)) => panic!("{source:.40} threw: {}", render(it, &error)),
@@ -53,7 +53,7 @@ pub(crate) fn eval_string(it: &mut Interp, source: &str) -> String {
 }
 
 pub(crate) fn set_global(it: &mut Interp, name: &str, value: Value) {
-    let global = Value::Obj(it.global.clone());
+    let global = Value::Obj(it.global);
     assert!(
         it.set_member_key(&global, name, value).is_ok(),
         "set global {name}"
@@ -69,7 +69,7 @@ fn self_hosted_methods_run_another_realms_inlined_callback_in_its_realm() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         let it = &mut *engine.interp;
-        let main = Value::Obj(it.global.clone());
+        let main = Value::Obj(it.global);
         // `map` is strict; only a callee of the same strictness is spliced into it.
         assert_eq!(
             eval_string(
@@ -84,7 +84,7 @@ fn self_hosted_methods_run_another_realms_inlined_callback_in_its_realm() {
             "2000"
         );
         let child = it.create_realm();
-        in_realm(it, &child, |it| set_global(it, "mainRealm", main.clone()));
+        in_realm(it, &child, |it| set_global(it, "mainRealm", main));
         let result = in_realm(it, &child, |it| {
             eval_string(
                 it,

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use trust_js_host::ValueKind;
 
 use trust_js_host::{ops, CompletionSender, Ctx, OpDecl, TaskId, TaskRegistry, Value};
 
@@ -72,13 +73,13 @@ pub const CHILD_OPS: &[OpDecl] = ops![
 
 // ---- helpers ----------------------------------------------------------------------------------
 
-fn read_string_array(ctx: &mut Ctx, v: &Value) -> Result<Vec<String>, Value> {
+fn read_string_array<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>) -> Result<Vec<String>, Value<'s>> {
     let mut out = Vec::new();
     if v.as_obj().is_none() {
         return Ok(out);
     }
-    let len = match ctx.get_member(v, "length") {
-        Ok(Value::Num(n)) => n as usize,
+    let len = match (ctx.get_member(v, "length")).map(|__value| (__value).kind()) {
+        Ok(ValueKind::Num(n)) => n as usize,
         _ => return Ok(out),
     };
     for i in 0..len {
@@ -99,21 +100,23 @@ fn stdio_for(name: &str) -> Stdio {
     }
 }
 
-fn opt_string(ctx: &mut Ctx, v: Option<&Value>) -> Option<String> {
+fn opt_string<'s>(ctx: &mut Ctx<'s>, v: Option<&Value<'s>>) -> Option<String> {
     match v {
-        Some(text @ Value::Str(_)) => text.as_text().map(|text| text.into_owned()),
-        Some(v) if !matches!(v, Value::Undefined | Value::Null) => {
+        Some(text) if matches!(text.kind(), ValueKind::Str(_)) => {
+            text.as_text().map(|text| text.into_owned())
+        }
+        Some(v) if !matches!(&(v).kind(), ValueKind::Undefined | ValueKind::Null) => {
             ctx.coerce_string(v).ok().map(|s| s.to_string())
         }
         _ => None,
     }
 }
 
-fn build_command(
-    ctx: &mut Ctx,
+fn build_command<'s>(
+    ctx: &mut Ctx<'s>,
     cmd: &str,
-    args: &[Value],
-) -> Result<(Command, [String; 3]), Value> {
+    args: &[Value<'s>],
+) -> Result<(Command, [String; 3]), Value<'s>> {
     let arg_list = read_string_array(ctx, args.get(1).unwrap_or(&Value::Undefined))?;
     let cwd = opt_string(ctx, args.get(2));
     let env_pairs = args.get(3).cloned().unwrap_or(Value::Undefined);
@@ -126,7 +129,9 @@ fn build_command(
     }
     // env: an array of [k, v] pairs *replaces* the environment (Node semantics); absent = inherit.
     if env_pairs.as_obj().is_some() {
-        if let Ok(Value::Num(n)) = ctx.get_member(&env_pairs, "length") {
+        if let Ok(ValueKind::Num(n)) =
+            (ctx.get_member(&env_pairs, "length")).map(|__value| (__value).kind())
+        {
             command.env_clear();
             for i in 0..(n as usize) {
                 let pair = ctx
@@ -148,7 +153,11 @@ fn build_command(
 // ---- ops --------------------------------------------------------------------------------------
 
 /// `(cmd, argsArray, cwd, envPairsOrNull, stdioArray) -> { childId, pid }`.
-fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_spawn<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let cmd = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -185,13 +194,13 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(o)
 }
 
-fn take_resolve_reject(
-    ctx: &mut Ctx,
-    res: Option<&Value>,
-    rej: Option<&Value>,
-) -> Result<(Value, Value), Value> {
+fn take_resolve_reject<'s>(
+    ctx: &mut Ctx<'s>,
+    res: Option<&Value<'s>>,
+    rej: Option<&Value<'s>>,
+) -> Result<(Value<'s>, Value<'s>), Value<'s>> {
     match (res, rej) {
-        (Some(r), Some(j)) if r.is_callable() && j.is_callable() => Ok((r.clone(), j.clone())),
+        (Some(r), Some(j)) if r.is_callable() && j.is_callable() => Ok((*r, *j)),
         _ => Err(ctx.make_error("TypeError", "child op expects (resolve, reject)")),
     }
 }
@@ -199,7 +208,7 @@ fn take_resolve_reject(
 /// Child stdio blocks for an unbounded time, so it runs on dedicated threads (via CompletionSender)
 /// rather than the shared pool — otherwise a long-lived child (e.g. an esbuild service) would pin
 /// pool workers for its whole lifetime and starve everything else.
-fn completions(ctx: &mut Ctx) -> CompletionSender {
+fn completions<'s>(ctx: &mut Ctx<'s>) -> CompletionSender {
     ctx.op_state()
         .get::<CompletionSender>()
         .expect("runtime installs the completion sender")
@@ -208,7 +217,11 @@ fn completions(ctx: &mut Ctx) -> CompletionSender {
 
 /// `(childId, which, resolve, reject)` — read a chunk from stdout (which=1) or stderr (which=2).
 /// Resolves with a Uint8Array, or `null` at EOF.
-fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_read<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     let which = args.get(1).and_then(Value::as_num_opt).unwrap_or(1.0) as u32;
     let (resolve, reject) = take_resolve_reject(ctx, args.get(2), args.get(3))?;
@@ -226,11 +239,12 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         })
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
 
-    let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_read);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_read)?;
     // The task inherits the child's current ref state; `child.ref()`/`unref()` can toggle it later.
     if unref {
-        reg.set_unref(id);
+        ctx.host_mut::<TaskRegistry>()
+            .expect("registry")
+            .set_unref(id);
     }
     track_child_task(ctx, child_id, id);
     completions(ctx).run_blocking(id, move || {
@@ -254,7 +268,10 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
-fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_read<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<Vec<u8>, String>>()
         .expect("read payload")
@@ -266,7 +283,11 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
 }
 
 /// `(childId, bytes, resolve, reject)` — write to the child's stdin.
-fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_write<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     let data = ctx
         .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
@@ -279,11 +300,7 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         .map(|p| p.stdin.clone())
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
-        resolve,
-        Some(reject),
-        decode_ok,
-    );
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_ok)?;
     completions(ctx).run_blocking(id, move || {
         let mut guard = handle.lock().expect("stdin lock");
         let result: Result<(), String> = match guard.as_mut() {
@@ -298,7 +315,10 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
-fn decode_ok(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_ok<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<(), String>>()
         .expect("ok payload")
@@ -309,7 +329,11 @@ fn decode_ok(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Ve
 }
 
 /// `(childId, resolve, reject)` — wait for exit; resolves with the exit code (or null if signaled).
-fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_wait<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
     let (handle, unref) = ctx
@@ -318,10 +342,11 @@ fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         .map(|p| (p.child.clone(), p.unref))
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
 
-    let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_exit);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_exit)?;
     if unref {
-        reg.set_unref(id);
+        ctx.host_mut::<TaskRegistry>()
+            .expect("registry")
+            .set_unref(id);
     }
     track_child_task(ctx, child_id, id);
     completions(ctx).run_blocking(id, move || {
@@ -342,7 +367,10 @@ fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
-fn decode_exit(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_exit<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<Option<i32>, String>>()
         .expect("exit payload")
@@ -354,7 +382,7 @@ fn decode_exit(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
 }
 
 /// Remember a child's in-flight task so `unref()` can mark it later (see [`ChildProc::pending_tasks`]).
-fn track_child_task(ctx: &mut Ctx, child_id: u32, task: TaskId) {
+fn track_child_task<'s>(ctx: &mut Ctx<'s>, child_id: u32, task: TaskId) {
     if let Some(p) = ctx
         .host_mut::<ChildRegistry>()
         .and_then(|r| r.procs.get_mut(&child_id))
@@ -366,7 +394,7 @@ fn track_child_task(ctx: &mut Ctx, child_id: u32, task: TaskId) {
 /// Set the child's ref state and apply it to every in-flight read/wait. esbuild toggles this per
 /// request (`refCount`): the persistent service child is unref'd while idle so it doesn't block
 /// exit, and ref'd during a transform so the loop waits for the response.
-fn set_child_ref(ctx: &mut Ctx, child_id: u32, unref: bool) {
+fn set_child_ref<'s>(ctx: &mut Ctx<'s>, child_id: u32, unref: bool) {
     let pending = ctx
         .host_mut::<ChildRegistry>()
         .and_then(|r| r.procs.get_mut(&child_id))
@@ -387,20 +415,32 @@ fn set_child_ref(ctx: &mut Ctx, child_id: u32, unref: bool) {
 }
 
 /// `(childId)` — `child.unref()`.
-fn op_unref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_unref<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     set_child_ref(ctx, child_id, true);
     Ok(Value::Undefined)
 }
 
 /// `(childId)` — `child.ref()`.
-fn op_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_ref<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     set_child_ref(ctx, child_id, false);
     Ok(Value::Undefined)
 }
 
-fn op_kill(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_kill<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     let killed = ctx
         .host_mut::<ChildRegistry>()
@@ -410,7 +450,11 @@ fn op_kill(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Bool(killed))
 }
 
-fn op_close_stdin(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_close_stdin<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     if let Some(p) = ctx
         .host_mut::<ChildRegistry>()
@@ -423,7 +467,11 @@ fn op_close_stdin(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
 
 /// `(cmd, argsArray, inputBytesOrNull, cwd) -> { stdout, stderr, status }`. Synchronous: spawns,
 /// writes optional stdin, waits, and captures output — for `execFileSync`/`spawnSync`/`execSync`.
-fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_exec_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let cmd = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();

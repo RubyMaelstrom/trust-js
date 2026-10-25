@@ -12,10 +12,11 @@ use super::{
     ab, arg, canonicalize_locale_list, get_options_object as coerce_options, make_service,
 };
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{set_data, set_internal_slot, Gc, Object, Property, Value};
 use std::rc::Rc;
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "Segmenter", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "segment", 1, |i, this, a| {
@@ -27,9 +28,9 @@ pub fn install(it: &mut Interp, ns: &Gc) {
 
 /// ECMA-402 #sec-%intlsegmentsprototype%-object and #sec-%intlsegmentiteratorprototype%-object.
 fn install_segments_prototypes(it: &mut Interp) {
-    let segments_proto = Object::new(Some(it.object_proto.clone()));
+    let segments_proto = Object::new(Some(it.object_proto));
     it.def_method(&segments_proto, "containing", 1, segments_containing);
-    if let Some(symbol) = it.iterator_sym.clone() {
+    if let Some(symbol) = it.iterator_sym {
         let iterator = it.make_native("[Symbol.iterator]", 0, segments_iterator);
         segments_proto.borrow_mut().props.insert(
             Interp::sym_key(&symbol),
@@ -608,9 +609,9 @@ fn slots_of(this: &Value, segmenter_slot: &str, string_slot: &str) -> Option<Seg
         let object = holder.borrow();
         let segmenter = object.internal_slots().get(segmenter_slot)?.value();
         let string = object.internal_slots().get(string_slot)?.value();
-        match (segmenter, string) {
-            (Value::Obj(segmenter), Value::Str(string)) => Some(SegmentsSlots {
-                holder: holder.clone(),
+        match (segmenter.view(), string.view()) {
+            (ValueView::Obj(segmenter), ValueView::Str(string)) => Some(SegmentsSlots {
+                holder,
                 segmenter,
                 string,
             }),
@@ -620,13 +621,14 @@ fn slots_of(this: &Value, segmenter_slot: &str, string_slot: &str) -> Option<Seg
 }
 
 fn granularity_of(segmenter: &Gc) -> String {
-    match segmenter
+    match (segmenter
         .borrow()
         .internal_slots()
         .get("#\u{0}sg_granularity")
-        .map(|p| p.value())
+        .map(|p| p.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Str(s)) => s.to_string(),
+        Some(ValueView::Str(s)) => s.to_string(),
         _ => "grapheme".to_string(),
     }
 }
@@ -639,8 +641,8 @@ fn boundary_records(i: &mut Interp, slots: &SegmentsSlots) -> crate::interpreter
         .internal_slots()
         .get(BOUNDARIES_SLOT)
         .map(|p| p.value());
-    if let Some(Value::Obj(buffer)) = cached {
-        if let Some(bytes) = i.local_buffer(Rc::as_ptr(&buffer) as usize) {
+    if let Some(ValueView::Obj(buffer)) = (cached).map(|__value| (__value).view()) {
+        if let Some(bytes) = i.local_buffer(Gc::as_ptr(&buffer) as usize) {
             return bytes.clone();
         }
     }
@@ -719,7 +721,7 @@ fn segment_data(i: &mut Interp, slots: &SegmentsSlots, bytes: &[u8], index: usiz
         Value::Str(slots.string.slice_bytes(start_byte, end_byte)),
     );
     set_data(&result, "index", Value::Num(start as f64));
-    set_data(&result, "input", Value::Str(slots.string.clone()));
+    set_data(&result, "input", Value::Str(slots.string));
     if granularity_of(&slots.segmenter) == "word" {
         set_data(&result, "isWordLike", Value::Bool(word_like));
     }
@@ -755,13 +757,9 @@ fn segments_iterator(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value,
     set_internal_slot(
         &iterator,
         ITERATING_SEGMENTER_SLOT,
-        Value::Obj(slots.segmenter.clone()),
+        Value::Obj(slots.segmenter),
     );
-    set_internal_slot(
-        &iterator,
-        ITERATED_STRING_SLOT,
-        Value::Str(slots.string.clone()),
-    );
+    set_internal_slot(&iterator, ITERATED_STRING_SLOT, Value::Str(slots.string));
     set_internal_slot(&iterator, NEXT_INDEX_SLOT, Value::Num(0.0));
     boundary_records(i, &slots);
     let buffer = slots
@@ -780,14 +778,15 @@ fn segments_iterator(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value,
 fn segment_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     let slots = slots_of(&this, ITERATING_SEGMENTER_SLOT, ITERATED_STRING_SLOT)
         .ok_or_else(|| i.make_error("TypeError", "receiver is not a Segment Iterator"))?;
-    let start = match slots
+    let start = match (slots
         .holder
         .borrow()
         .internal_slots()
         .get(NEXT_INDEX_SLOT)
-        .map(|p| p.value())
+        .map(|p| p.value()))
+    .map(|__value| (__value).view())
     {
-        Some(Value::Num(start)) => start as usize,
+        Some(ValueView::Num(start)) => start as usize,
         _ => 0,
     };
     let storage = boundary_records(i, &slots);

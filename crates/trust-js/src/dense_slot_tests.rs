@@ -3,12 +3,13 @@
 //! OrdinaryOwnPropertyKeys 13531, Array [[DefineOwnProperty]] 14659.
 
 use crate::bytecode::Tier;
+use crate::value::ValueView;
 use crate::value::{Property, Props, Value};
 use crate::{Completion, Engine};
 
 fn number(prop: Option<&Property>) -> f64 {
-    match prop.expect("existing property").value() {
-        Value::Num(n) => n,
+    match (prop.expect("existing property").value()).view() {
+        ValueView::Num(n) => n,
         _ => panic!("not numeric"),
     }
 }

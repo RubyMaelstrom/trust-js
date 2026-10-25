@@ -2,6 +2,7 @@
 //! accessors and exotic receivers retain their observable [[Get]] algorithm.
 use super::*;
 use crate::value::Value;
+use crate::value::ValueView;
 use crate::{bytecode::Tier, Engine};
 use std::rc::Rc;
 
@@ -20,7 +21,7 @@ fn compile(engine: &mut Engine, source: &str) -> (Rc<Chunk>, JitCode) {
 }
 
 fn eval(engine: &mut Engine, source: &str) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     engine
         .interp
         .perform_eval(source, &env, false)
@@ -38,11 +39,11 @@ fn run(
     receiver: &Value,
     this: bool,
 ) -> Value {
-    let env = engine.interp.global_env.clone();
+    let env = engine.interp.global_env;
     let (receiver_this, args) = if this {
-        (receiver.clone(), Vec::new())
+        (*receiver, Vec::new())
     } else {
-        (Value::Undefined, vec![receiver.clone()])
+        (Value::Undefined, vec![*receiver])
     };
     crate::jit::run(&mut engine.interp, chunk, code, &env, receiver_this, &args)
         .unwrap_or_else(|_| panic!("native read throws"))
@@ -63,8 +64,8 @@ fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
             .set_member_key(&receiver, "value", Value::Num(1.0))
             .unwrap_or_else(|_| panic!("fixture operation throws"));
         assert!(matches!(
-            run(&mut engine, &chunk, &code, &receiver, this),
-            Value::Num(1.0)
+            (run(&mut engine, &chunk, &code, &receiver, this)).view(),
+            crate::value::ValueView::Num(1.0)
         ));
         let values = eval(&mut engine,
             "[undefined,null,false,true,0,-0,NaN,Infinity,'owned string',Symbol('owned'),{identity:42},12345678901234567890n]");
@@ -76,34 +77,54 @@ fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
                 .unwrap_or_else(|_| panic!("fixture operation throws"));
             engine
                 .interp
-                .set_member_key(&receiver, "value", expected.clone())
+                .set_member_key(&receiver, "value", expected)
                 .unwrap_or_else(|_| panic!("fixture operation throws"));
-            let object_owners = match &expected {
-                Value::Obj(object) => Some(Rc::strong_count(object)),
-                _ => None,
-            };
             let result = run(&mut engine, &chunk, &code, &receiver, this);
             assert!(crate::builtins::same_value_pub(&result, &expected));
-            if let (Some(before), Value::Obj(object)) = (object_owners, &result) {
-                assert_eq!(
-                    Rc::strong_count(object),
-                    before + 1,
-                    "native read must retain one result owner"
-                );
-            }
             // Removing the property owner must leave the returned value intact through collection.
             engine
                 .interp
                 .set_member_key(&receiver, "value", Value::Undefined)
                 .unwrap_or_else(|_| panic!("fixture operation throws"));
-            engine.collect_garbage_at_idle();
+            engine.interp.collect_garbage_for_host();
             assert!(crate::builtins::same_value_pub(&result, &expected));
         }
         assert_eq!(
             reads(usize::from(this)) - before,
-            11,
-            "all ordinary values except BigInt use native reads"
+            12,
+            "all ordinary execution values use native reads"
         );
+    }
+}
+
+/// The template finds a named field in place and spilled (an object's fifth field spills its
+/// fields from the cell to a heap buffer), from a local slot's receiver and from `this`, the
+/// packed word at [48].
+#[test]
+fn own_data_reads_find_fields_in_place_and_spilled() {
+    for (this, source) in [
+        (false, "function read(receiver){return receiver.value;}"),
+        (true, "function read(){'use strict';return this.value;}"),
+    ] {
+        // `value` is the last of `count` fields.
+        for count in [1usize, 4, 5, 9] {
+            let mut engine = Engine::new();
+            let (chunk, code) = compile(&mut engine, source);
+            let fields: String = (1..count).map(|k| format!("f{k}:{k},")).collect();
+            let receiver = eval(&mut engine, &format!("({{{fields}value:{count}}})"));
+            run(&mut engine, &chunk, &code, &receiver, this);
+            let before = reads(usize::from(this));
+            let result = run(&mut engine, &chunk, &code, &receiver, this);
+            assert!(
+                matches!((result).view(), ValueView::Num(n) if n == count as f64),
+                "{count} fields (this: {this})"
+            );
+            assert_eq!(
+                reads(usize::from(this)) - before,
+                1,
+                "{count} fields (this: {this}): the read is native"
+            );
+        }
     }
 }
 
@@ -181,7 +202,10 @@ fn descriptor_exotic_shape_and_value_changes_preserve_get_effects_across_tiers()
         engine.set_tier_threshold(0);
         let before = reads(0) + reads(1);
         assert!(
-            matches!(eval(&mut engine, source), Value::Bool(true)),
+            matches!(
+                (eval(&mut engine, source)).view(),
+                crate::value::ValueView::Bool(true)
+            ),
             "{tier:?}"
         );
         if tier == Tier::Jit {
@@ -212,7 +236,7 @@ fn one_native_chunk_reads_live_receivers_in_each_realm() {
             ),
             "child"
         );
-        let env = it.global_env.clone();
+        let env = it.global_env;
         it.get_var("receiver", &env)
             .unwrap_or_else(|_| panic!("fixture operation throws"))
     });
@@ -224,7 +248,7 @@ fn one_native_chunk_reads_live_receivers_in_each_realm() {
             .unwrap_or_else(|_| panic!("fixture operation throws"));
         let before = reads(0);
         let result = in_realm(&mut engine.interp, &child, |it| {
-            let env = it.global_env.clone();
+            let env = it.global_env;
             crate::jit::run(
                 it,
                 &chunk,

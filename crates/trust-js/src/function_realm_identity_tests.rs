@@ -5,7 +5,6 @@
 use crate::realm_inline_guard_tests::{set_global, TIERS};
 use crate::value::Value;
 use crate::{Completion, Engine};
-use std::rc::Rc;
 
 fn eval(engine: &mut Engine, source: &str) -> String {
     match engine.eval(source, false).expect("Realm fixture parses") {
@@ -31,9 +30,9 @@ fn function_realm_identity_survives_host_environment_and_prototype_changes() {
         );
         let foreign = engine.interp.create_realm();
         set_global(&mut engine.interp, "foreign", foreign);
-        let previous_environment = engine.interp.global_env.clone();
+        let previous_environment = engine.interp.global_env;
         engine.interp.switch_host_job_context(42);
-        assert!(!Rc::ptr_eq(
+        assert!(!crate::interpreter::Env::ptr_eq(
             &previous_environment,
             &engine.interp.global_env
         ));
@@ -55,14 +54,14 @@ fn function_realm_identity_survives_host_environment_and_prototype_changes() {
                 $262.gc();
             "#,
         );
-        let env = engine.interp.global_env.clone();
+        let env = engine.interp.global_env;
         let owner = engine
             .interp
             .get_var("OwnerCtor", &env)
             .ok()
             .expect("retained owner constructor");
         assert_eq!(
-            engine.interp.callee_realm_global(owner.as_obj().unwrap()),
+            engine.interp.callee_realm_global(&owner.as_obj().unwrap()),
             None,
             "the changed environment/prototype cannot move [[Realm]]: {tier:?}"
         );

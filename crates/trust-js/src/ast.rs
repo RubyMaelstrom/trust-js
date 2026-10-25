@@ -296,7 +296,7 @@ pub enum Expr {
     /// transparently.
     Paren(P<Expr>),
     Num(f64),
-    BigInt(crate::bigint::JsBigInt),
+    BigInt(crate::bigint::BigIntLiteral),
     Str(Rc<str>),
     /// A template-literal substitution: evaluate the inner expression and apply ToString (which uses
     /// the `string` hint — toString before valueOf — unlike `+` which uses the `default` hint).
@@ -556,8 +556,8 @@ pub enum PropKey {
     Computed(Expr),
 }
 
-/// See [`Function::fn_maps`].
-#[derive(Debug, Clone)]
+/// Heap-local function/prototype property templates, selected by [`Function::runtime`].
+#[derive(Debug)]
 pub struct FunctionMaps {
     /// The function object's own properties: `length`, `name` and, for prototype-bearing kinds,
     /// a `prototype` placeholder patched per closure.
@@ -568,6 +568,26 @@ pub struct FunctionMaps {
     /// anonymous function (`var f = () => {}`): a creation site's inferred name is fixed, so
     /// later closures clone it instead of running SetFunctionName per instance.
     pub named: std::cell::RefCell<Option<(Rc<str>, crate::value::Props)>>,
+    /// The Agent heap whose cells the templates hold (layouts and `name` values; see
+    /// `value::active_heap_id`). Parsed code can outlive an engine or serve several:
+    /// another heap's runtime rebuilds these templates from neutral source facts.
+    pub(crate) heap: u64,
+}
+
+impl crate::gc_trace::GcTrace for FunctionMaps {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            function,
+            prototype,
+            named,
+            heap: _,
+        } = self;
+        function.trace_gc(sink);
+        prototype.trace_gc(sink);
+        if let Some((_, props)) = &*named.borrow() {
+            props.trace_gc(sink);
+        }
+    }
 }
 
 /// The FunctionBody of a [`Function`]: the statements that ECMA-262 OrdinaryFunctionCreate
@@ -729,7 +749,7 @@ impl Drop for Function {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[allow(dead_code)] // expr_body is recorded for a future `toString`/source-fidelity pass
 pub struct Function {
     pub name: Option<String>,
@@ -781,24 +801,66 @@ pub struct Function {
     /// ops), so calls replay a flat list instead of re-walking the AST (see
     /// `interpreter::collect_hoist_ops`).
     pub hoist: std::cell::OnceCell<(bool, Rc<Vec<HoistOp>>)>,
-    /// Bytecode-tier state: call count until tier-up, and the compile result once attempted
-    /// (`None` = uses constructs outside the bytecode subset; runs in the tree-walker forever).
-    pub calls: std::cell::Cell<u32>,
-    pub code: std::cell::OnceCell<Option<Rc<crate::bytecode::Chunk>>>,
-    /// Second-stage compile: the body re-compiled with hot monomorphic callees inlined (see
-    /// `bytecode::plan_inlines`). Preferred over `code` wherever a chunk is fetched; `code`
-    /// stays alive because filled call ICs hold raw pointers into it.
-    pub code2: std::cell::OnceCell<Option<Rc<crate::bytecode::Chunk>>>,
-    /// Lazily-built object-map templates for closures of this function (see
-    /// `Interp::make_function`): the function object's `Props` (length/name and a `prototype`
-    /// placeholder) and, for prototype-bearing kinds, the fresh `.prototype`'s `Props` — cloned
-    /// per closure instance instead of rebuilt insert by insert, so key hashing and shape
-    /// transitions are paid once per FUNCTION rather than once per closure.
-    pub fn_maps: std::cell::OnceCell<FunctionMaps>,
+    /// Heap-bound runtime caches. Parsed code can outlive an Engine or serve several Agents;
+    /// templates and compiled constants never cross their owning heap. Kept out of line for
+    /// the many cold parsed functions, with a borrowed primary entry and bounded foreign cache.
+    pub(crate) runtime: std::cell::OnceCell<Box<crate::function_runtime::FunctionRuntimeCache>>,
     /// Actual parameter/body key layouts observed before tier-up. Each cache is
     /// bounded to one layout; eval-dependent alternatives keep dynamic storage.
     pub(crate) env_layouts:
         std::cell::OnceCell<Box<[std::cell::OnceCell<Rc<crate::interpreter::BindingLayout>>; 2]>>,
+}
+
+impl Clone for Function {
+    fn clone(&self) -> Self {
+        // Cloning neutral parsed code is valid without an active Agent, including after its
+        // former heap was released. A caller can then edit source fields; no derived cache
+        // from the old source or heap may migrate with the clone.
+        let Self {
+            name,
+            params,
+            body,
+            is_arrow,
+            is_strict,
+            expr_body,
+            is_generator,
+            is_async,
+            is_method,
+            is_fn_expr,
+            default_ctor,
+            self_hosted,
+            run_once,
+            source,
+            script,
+            start,
+            scan: _,
+            hoist: _,
+            runtime: _,
+            env_layouts: _,
+        } = self;
+        Self {
+            name: name.clone(),
+            params: params.clone(),
+            body: body.clone(),
+            is_arrow: *is_arrow,
+            is_strict: *is_strict,
+            expr_body: *expr_body,
+            is_generator: *is_generator,
+            is_async: *is_async,
+            is_method: *is_method,
+            is_fn_expr: *is_fn_expr,
+            default_ctor: *default_ctor,
+            self_hosted: *self_hosted,
+            run_once: *run_once,
+            source: source.clone(),
+            script: script.clone(),
+            start: *start,
+            scan: std::cell::Cell::new(0),
+            hoist: std::cell::OnceCell::new(),
+            runtime: std::cell::OnceCell::new(),
+            env_layouts: std::cell::OnceCell::new(),
+        }
+    }
 }
 
 /// One pre-scanned hoisting action for a statement list, replayed against a scope at function
@@ -1072,7 +1134,7 @@ impl RetainedAst<'_> {
             | Expr::Super
             | Expr::ImportMeta
             | Expr::NewTarget => {}
-            Expr::BigInt(value) => self.visitor.bigint(value),
+            Expr::BigInt(value) => self.visitor.bigint_literal(value),
             Expr::Str(value) => self.rc_str(value),
             Expr::Ident(name, _) => self.string(name),
             Expr::Regex { body, flags } => {
@@ -1433,29 +1495,21 @@ impl Expr {
 }
 
 impl Function {
-    /// Select code for a new invocation; live activations retain their own chunk.
-    /// ECMA-262 e28783d5, Execution Contexts / PrepareForOrdinaryCall: changing a
-    /// later entry must not replace an existing invocation's evaluation state.
     #[inline]
-    #[cfg(test)]
-    pub(crate) fn execution_code(&self) -> Option<&Option<Rc<crate::bytecode::Chunk>>> {
-        self.code2.get().or_else(|| self.code.get())
+    /// The runtime ScriptOrModule shared by this function's primary-heap closures, if any.
+    pub(crate) fn shared_origin(&self) -> Option<&crate::agent_control::RuntimeOrigin> {
+        self.runtime.get()?.primary_origin()
     }
 
-    /// Shared snapshot ASTs have one second-stage slot for every Realm. A body planned
-    /// exclusively for another Realm cannot win any inline guard, so a new invocation
-    /// retains its warmed primary body. Mixed/unrestricted chunks remain eligible.
-    /// Active frames and code leases keep their already selected immutable chunk.
+    pub(crate) fn runtime(&self) -> crate::function_runtime::RuntimeLease<'_> {
+        self.runtime_cache().current()
+    }
+
+    /// The function's heap-bound runtime caches, made on first use.
     #[inline]
-    pub(crate) fn execution_code_for(
-        &self,
-        genv: usize,
-    ) -> Option<&Option<Rc<crate::bytecode::Chunk>>> {
-        match self.code2.get() {
-            Some(Some(chunk)) if !chunk.inline_realm_compatible(genv) => self.code.get(),
-            Some(_) => self.code2.get(),
-            None => self.code.get(),
-        }
+    pub(crate) fn runtime_cache(&self) -> &crate::function_runtime::FunctionRuntimeCache {
+        self.runtime
+            .get_or_init(|| Box::new(crate::function_runtime::FunctionRuntimeCache::new()))
     }
 
     /// What this function's own activation must provide: whether the body (or a nested arrow, or a
@@ -1488,7 +1542,7 @@ impl Function {
     /// but the slot is observable only through `super` references and direct `eval` in the
     /// method's own code (see [`SCAN_HOME`]). Leaving it unset otherwise avoids retaining the home
     /// object from each of its methods: an object literal and its methods would form a
-    /// reference cycle that only the cycle collector could reclaim.
+    /// reference cycle that only a collection could reclaim.
     pub(crate) fn observes_home_object(&self) -> bool {
         self.scan_flags() & SCAN_HOME != 0
     }

@@ -66,11 +66,11 @@ comment/example in the same change.
 - `TRUST_JS_TIER_LOG=1` helps diagnose compilation bailouts.
 - `TRUST_JS_JIT_DUMP=<names>` prints the bytecode of chunks whose first four slot names contain
   the text, and `TRUST_JS_JIT_CODEDUMP=<names>[@<offset>]` the finished ARM64 words of the same
-  chunks (hex, one per line; assemble them with `clang --target=aarch64-linux-gnu -c` and
-  `objdump -d`). `@<offset>` also requires the function's source start offset, the `@N` that
-  `TRUST_JS_JIT_MAP=1` prints in its `[jit-map-range]` lines, which singles out one function among
-  many that share names. Any value of `TRUST_JS_JIT_CODEDUMP` adds a `[jit-map]` line (runtime base
-  and length) per compiled chunk.
+  chunks (`*` dumps every chunk; hex, one per line; assemble them with `clang
+  --target=aarch64-linux-gnu -c` and `objdump -d`). `@<offset>` also requires the function's
+  source start offset, the `@N` that `TRUST_JS_JIT_MAP=1` prints in its `[jit-map-range]` lines,
+  which singles out one function among many that share names. Any value of
+  `TRUST_JS_JIT_CODEDUMP` adds a `[jit-map]` line (runtime base and length) per compiled chunk.
 - `TRUST_JS_JIT_NO_NAME_ELEM=1` compiles `LoadName K; <pure key>; GetElem/SetElemDrop` register
   regions with the ordinary LoadName and element templates instead of reading a typed array
   straight from its binding (see `NameElementPlan` in `jit_regions.rs`).
@@ -84,8 +84,15 @@ comment/example in the same change.
   register for the next operator, comparison or branch (`Operand::Int` in `jit_regions.rs`).
 - `TRUST_JS_PERF_METRICS=1` prints one JSON JIT/collector performance summary at normal
   exit (compile attempts/seconds/bytes, inline attempts, lex/parse/bytecode-compile time,
-  native-call time, GC pauses and post-GC managed memory). Diagnostic only; excluded from
-  acceptance timing.
+  native-call time, GC pauses and managed-memory availability metadata). The shell collects once more at
+  exit, before printing it, so the GC counts and pauses include that collection (cause
+  `explicit`, a major collection). Collections are counted by cause (`gc_causes`) and by kind
+  (`gc_kinds`: `minor`, `major`), and their pauses are also reported by cause
+  (`gc_pause_seconds_by_cause`) and by kind (`gc_pause_seconds_by_kind`). Production GC does
+  not record a managed-memory snapshot: `managed_memory` reports `safepoint: null`,
+  `complete: false`, and unavailable requested/external byte totals, not measured zeros.
+  Live rooted-handle counts (`handles`: `strong` and `weak`) remain available independently;
+  a leaked strong handle keeps its value alive. Diagnostic only; excluded from acceptance timing.
 - Helper-traffic tallies print their top entries to stderr at exit and are diagnostic only:
   `TRUST_JS_JIT_OPSTAT=1` counts ops that reach a JIT helper (`=2` adds the function and
   pc), `TRUST_JS_JIT_CALLSTAT=1` counts why calls reaching the call helper missed the
@@ -100,9 +107,62 @@ comment/example in the same change.
 - `TRUST_JS_FEEDBACK_PROFILE=1` enables the detailed per-site feedback vector; it changes
   the execution paths that collect it, so its observations are not observations of ordinary
   optimized execution and it is never an acceptance setting.
-- `TRUST_JS_GC_LOG=1` logs collections; `TRUST_JS_GC_DUMP=1` dumps external-root shapes
-  (bounded by `TRUST_JS_GC_DUMP_MIN_OBJECTS`/`TRUST_JS_GC_DUMP_ROOT_LIMIT`), and
-  `TRUST_JS_GC_RETAINING_PATHS=1` adds retaining paths.
+- `TRUST_JS_GC_LOG=1` logs collections, each line with its phases' times in microseconds:
+  `mark` and `sweep` as the engine drives them, `engine` for what the engine does around the
+  heap's phases, the heap's phases (`begin`: cards and marks; `roots`; `stack`; `side`:
+  side-table edges and side-slot owners; `drain`: tracing; `finalize`; `free`), the engine's
+  steps (`scrub`: zeroing the native stack below the collection's frames; `client`: building
+  the marking client; `dead`: listing the dead objects for the tables' sweeps; `weak`:
+  clearing weak handles and weak cells; `tables`: evicting the dead from the engine's tables;
+  `after`: the Agent's bookkeeping after the sweep), then the cells finalized, by kind
+  (`fin:<kind>=count`).
+- Collections are minor or major. A minor collection traces from the roots and from the old
+  cells (cells an earlier collection kept) whose cards the write barrier set since the last
+  collection, and of the engine's side tables (internal slots kept outside objects, WeakMap and
+  WeakSet entries, built-ins' [[Realm]]) only the entries written since then, and sweeps only
+  the pages that received cells since then, so an old object that died stays allocated until a
+  major collection, which marks and sweeps everything.
+  Allocation safepoints and task boundaries collect minorly unless a major collection is due;
+  explicit and idle collections, the shell's exit collection, ArrayBuffer pressure and the
+  live-object limit collect majorly. For collector tuning, `TRUST_JS_GC_NURSERY_BYTES=N`
+  replaces the 2 MiB nursery budget: a minor collection is due once N bytes of cells have
+  been allocated since the last collection (0 turns minor collections off: every collection
+  is then major, due once the allocated bytes pass the byte budget). Objects' property and
+  element storage and environments' binding storage are cells too. Bytes that cells own
+  outside the heap (Map and Set tables, hash indexes, internal slots, bound arguments, stack
+  traces) count as well: a collection is due once a nursery budget of them was acquired since
+  the last one, and those still held count with the cells against the byte budget.
+  `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget (twice
+  the bytes a major collection leaves, at least the floor): a major collection is due once
+  the heap holds more than the budget after a minor collection, its old cells counted whether
+  they live or not. Outside GC stress, cell allocation makes collections due through these
+  budgets alone, and the live-object count only enforces the engine's live-object limit.
+- `TRUST_JS_GC_STRESS=N` collects at the first safepoint after every N cell allocations and
+  polls at every call (N=1 finds unrooted values; run each test in its own process, since a
+  use-after-free can take down the whole run). Its collections are minor but for every Mth,
+  which is major (`TRUST_JS_GC_STRESS_MAJOR=M`, 8 by default; 1 makes every one major). Debug
+  builds also check the write barrier as every collection starts, minor or major, so stress
+  checks it at every safepoint: an old cell (one a collection kept) that holds a cell
+  allocated since the last collection must have had its card set when it was written, and a
+  panic `write barrier: old cell …` names both cells. The side tables' records are checked
+  the same way: a side-table entry that holds such a cell, or belongs to such a cell, must
+  have been recorded when it was written, and a panic `side-slot table …`,
+  `weak_collection_data: …` or `native_function_realms: …` names the table, the owner and
+  the value. So are the rooted handles' (the values host code keeps): a handle not written
+  since the last collection must name a cell that collection kept (or, if weak, nothing), and
+  a panic `handle table of heap …` names the entry and the cell.
+  `TRUST_JS_GC_LOG=1` lines name each collection's kind and report live cells, live bytes,
+  small-cell pages (64 KiB each) and released pages kept for reuse (`spare`) after it, the
+  heap's collections so far, those that were due but postponed (`deferred`) and the bytes
+  its cells own outside it, not yet released (`external`); a minor collection's line adds
+  the young pages it swept, the old cells it traced because their cards were set
+  (`card_cells`) and the bytes it promoted. `TRUST_JS_GC_CENSUS=1`
+  adds a `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
+  live objects after every collection and of objects as they die, by family (it walks the
+  heap at each collection; diagnostic only). In test builds, `TRUST_JS_GC_WHY=1` records
+  why each cell was marked (tests print the path with `gc_test::why`/`why_address`; a
+  stack root names its frame's return address, for `addr2line`, and its depth below that
+  frame's record), and `TRUST_JS_SEGV_BACKTRACE=1` prints a backtrace on a fault.
 - On GNU/Linux, `TRUST_JS_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
   registers live generated-code symbols with the already-loaded gprofng collector.
   Labels show the chunk's first local names, not source function names. This is
@@ -112,8 +172,8 @@ comment/example in the same change.
 ## Architecture diagnostics
 
 The `architecture-diagnostics` feature records allocation sites/lifetimes
-in the live Rc heap and call-cache epoch/refill traffic. It adds no object owners;
-site and registry-slot limits report untracked allocations. Initial exotic family
+in the live object heap and call-cache epoch/refill traffic. It adds no object owners;
+site and tracked-live-allocation limits report untracked allocations. Initial exotic family
 is recorded at allocation, before later function/exotic initialization. Lifetimes
 use heap allocation ordinals and completed collections, not elapsed time. Live
 families at collection are a separate population sample. These probes compile out
@@ -139,3 +199,35 @@ selected workloads. Octane scores are higher-is-better; ARES-6 reports a geomean
 milliseconds, lower-is-better. A selected ARES-6 run is a partial result, not the
 official full-suite score. Missing completion markers or failed workloads invalidate
 a run.
+
+
+### Optional Miri checks for root and interpreter access storage
+
+The standalone harnesses import the actual engine modules without building the engine.
+They are optional diagnostics and are not workspace build dependencies. The recorded
+probe toolchain is `nightly-2026-10-23` (`rustc 1.101.0-nightly`, commit `7189d39d9`,
+Miri `0.1.0`, LLVM `23.1.4`). Install that nightly's `miri` and `rust-src` components
+separately if using these commands; normal builds do not require them.
+
+```sh
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/agent-access-miri/Cargo.toml
+MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-tree-borrows" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/agent-access-miri/Cargo.toml
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/rooting-miri/Cargo.toml
+MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-tree-borrows" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/rooting-miri/Cargo.toml
+```
+
+The access harness exercises current-borrow publication, nested/reentrant access,
+root movement, marking/sweep phase separation, quarantine and unwind. The rooting
+harness uses inert Value/trace interfaces around the directly imported module;
+it exercises raw ownership, registration, short mutation loans, argument/iterator
+reentry, reallocation, transfer, registry-slot reuse and teardown. Passing these
+checks covers those module call shapes, not the JIT, native stack scanner or the
+whole JavaScript engine.
+
+This explicit negative control must run one selected test and fail with Miri's
+undefined-behavior diagnostic under either model; a compile failure or zero selected
+tests is not a successful negative control:
+
+```sh
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly-2026-10-23 miri test --offline --manifest-path tools/agent-access-miri/Cargo.toml --features stale-suspension --lib tests::stale_suspension_is_a_miri_negative_control -- --exact
+```

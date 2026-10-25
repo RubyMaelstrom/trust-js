@@ -5,8 +5,8 @@
 //! Collector and memory traversal must not count as value observations.
 
 use super::{Exotic, Gc, Object, PropClass, Property, PropertyLayout, Props};
+use crate::gc_trace::GcTrace;
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
 
 enum State {
     Parent(Gc),
@@ -14,7 +14,14 @@ enum State {
 }
 
 pub(super) struct LazyFunctionPrototype {
-    owner: Weak<RefCell<Object>>,
+    /// The function whose `prototype` this is, for the materialized prototype's `constructor`.
+    /// A lazy word lives only in that function's properties (copying one out of its property
+    /// materializes it: `PropWord::materialize`), so the function is alive whenever
+    /// the prototype materializes. A traced edge of this cell ([`trace_cell`]): the function
+    /// and its cell form a cycle that dies in one collection, and a stale stack word that
+    /// conservatively keeps the cell keeps the function too. A weak handle would allocate a
+    /// weak cell per constructor and keep a dead constructor's cell reserved for a collection.
+    owner: Gc,
     state: RefCell<State>,
     // Reuse the creation Agent's exact key layout/shape, not whichever Agent first reads it.
     // Keys contain no ECMAScript object edges and do not keep the function/realm alive.
@@ -37,7 +44,7 @@ impl LazyFunctionPrototype {
             "lazy prototype template with a non-writable or accessor field"
         );
         Self {
-            owner: Rc::downgrade(owner),
+            owner: *owner,
             state: RefCell::new(State::Parent(parent)),
             layout: template.shared_layout().cloned(),
             shape: template.shape(),
@@ -46,10 +53,14 @@ impl LazyFunctionPrototype {
     }
 
     pub(super) fn materialize(&self) -> Gc {
+        // Held across one allocation, the prototype's cell. Allocation never collects, so no
+        // collection can trace this state while it is borrowed (I9; see `trace_cell`).
         let mut state = self.state.borrow_mut();
         if let State::Materialized(prototype) = &*state {
-            return prototype.clone();
+            return *prototype;
         }
+        #[cfg(test)]
+        MATERIALIZED.with(|count| count.set(count.get() + 1));
         let State::Parent(parent) = &*state else {
             unreachable!()
         };
@@ -57,26 +68,31 @@ impl LazyFunctionPrototype {
         if self.constructor {
             // A descriptor clone materializes before it can outlive the function. All other
             // value reads retain their receiver, including reads while its RefCell is borrowed.
-            let owner = self
-                .owner
-                .upgrade()
-                .expect("live function owns deferred prototype");
+            let owner = self.owner;
             props
                 .entries
                 .fields
-                .push(Property::builtin(super::Value::Obj(super::Gc::from(owner))));
+                .push(Property::builtin(super::Value::Obj(owner)));
         }
         props.shape = self.shape;
-        let prototype = Object::new_with_parts(Some(parent.clone()), props, Exotic::None);
-        *state = State::Materialized(prototype.clone());
+        let prototype = Object::new_with_parts(Some(*parent), props, Exotic::None);
+        // The write barrier: this cell now names the fresh prototype. No safepoint lies between
+        // the card and the store.
+        // SAFETY: `self` is the payload of a live deferred-prototype cell (`gc_box::new` moves
+        // it in at the cell's start; it is only ever read through its handle), a small cell
+        // of a carded kind.
+        unsafe { crate::gc_core::card_mark(std::ptr::from_ref(self).cast()) };
+        *state = State::Materialized(prototype);
         prototype
     }
 
-    pub(super) fn with_gc_edge(&self, f: impl FnOnce(&Gc)) {
-        match &*self.state.borrow() {
-            State::Parent(parent) => f(parent),
-            State::Materialized(prototype) => f(prototype),
-        }
+    /// Record a write of the function's `prototype` word in the function's card (the write
+    /// barrier): a property read promotes the word to the materialized prototype's, under
+    /// a shared borrow of the function.
+    pub(super) fn mark_owner_card(&self) {
+        // SAFETY: the function is alive while its deferred prototype is read (see `owner`), and
+        // an object's cell is a small cell of the carded object kind.
+        unsafe { crate::gc_core::card_mark(Gc::as_ptr(&self.owner).cast()) };
     }
 
     pub(super) fn visit_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
@@ -88,10 +104,49 @@ impl LazyFunctionPrototype {
     }
 }
 
+/// The trace of a deferred-prototype cell: its function and the prototype's parent,
+/// or once materialized the prototype, and its predicted key layout.
+pub(super) fn trace_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
+    // SAFETY: deferred-prototype cells are initialized by `gc_box::new` before any collection.
+    let lazy = unsafe { &*cell.cast::<LazyFunctionPrototype>() };
+    lazy.trace_gc(&mut crate::gc_trace::VisitSink(visit));
+}
+
+impl crate::gc_trace::GcTrace for LazyFunctionPrototype {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            owner,
+            state,
+            layout,
+            shape: _,
+            constructor: _,
+        } = self;
+        sink.object(owner);
+        layout.trace_gc(sink);
+        // SAFETY: collections run at safepoints, where materialization holds no mutable borrow.
+        let state = unsafe { state.try_borrow_unguarded() }
+            .expect("deferred prototype mutably borrowed during GC (I9)");
+        let (State::Parent(edge) | State::Materialized(edge)) = state;
+        sink.object(edge);
+    }
+}
+
+/// Prototypes materialized on this thread so far (tests).
+#[cfg(test)]
+pub(crate) fn materialized() -> u64 {
+    MATERIALIZED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static MATERIALIZED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bytecode::Tier;
+    use crate::value::ValueView;
     use crate::value::{Value, PACK_LAZY_PROTO, PACK_OBJ};
     use crate::{Completion, Engine};
 
@@ -106,12 +161,12 @@ mod tests {
     }
 
     fn object(engine: &mut Engine, name: &str) -> Gc {
-        let env = engine.interp.global_env.clone();
-        let Value::Obj(object) = engine
+        let env = engine.interp.global_env;
+        let ValueView::Obj(object) = (engine
             .interp
             .get_var(name, &env)
-            .unwrap_or_else(|_| panic!("{name}"))
-        else {
+            .unwrap_or_else(|_| panic!("{name}")))
+        .view() else {
             panic!("object")
         };
         object
@@ -249,35 +304,419 @@ mod tests {
         );
     }
 
+    /// P1 S4: a dead constructor's cell is freed by the collection that finds it
+    /// dead. Its deferred prototype holds no weak handle that would keep the cell reserved (a
+    /// zombie) until the next collection.
     #[test]
-    fn lazy_prototype_drops_without_a_cycle_and_materialized_escape_keeps_constructor() {
+    fn dead_constructors_leave_no_reserved_cells() {
         let mut engine = Engine::new();
-        eval(&mut engine, "var F=function(){}, G=function(){};");
-        let function = object(&mut engine, "F");
-        let weak = Rc::downgrade(&function);
-        assert_eq!(
-            function
+        engine.interp.gc_collect();
+        let cells = |engine: &Engine| engine.interp.gc_heap.core.borrow().stats().live_cells;
+        let before = cells(&engine);
+        eval(
+            &mut engine,
+            "(() => { for (let i = 0; i < 1000; i++) (function () {}); })(); 0",
+        );
+        engine.interp.gc_collect();
+        let after = cells(&engine);
+        assert!(
+            after < before + 100,
+            "dead constructors' cells stay reserved: {before} -> {after}"
+        );
+    }
+
+    /// The deferred-prototype cells `engine`'s heap holds.
+    fn lazy_cells(engine: &Engine) -> usize {
+        let heap = &engine.interp.gc_heap;
+        heap.core.borrow().live_count(heap.lazy_proto_desc)
+    }
+
+    /// The tag of the global function `name`'s `prototype` word, read in a helper frame: the
+    /// conservative stack scan would keep a handle left in the caller's frame.
+    fn prototype_tag(engine: &mut Engine, name: &str) -> u64 {
+        crate::gc_test::in_frame(|| {
+            object(engine, name)
                 .borrow()
                 .props
                 .get("prototype")
                 .unwrap()
                 .packed
-                .tag(),
-            PACK_LAZY_PROTO
+                .tag()
+        })
+    }
+
+    /// P1 S5: a function's deferred prototype is a cell that its function keeps
+    /// alive. Across forced collections (in the stress child, also one at every safepoint) the
+    /// heap keeps one such cell per live function, the words stay lazy and none is
+    /// materialized, and a cell's first marker in a traced collection is its function's cell:
+    /// it is marked through the function's property word, not by a stack word. Once the
+    /// functions are unreachable, the collection that frees them frees their cells: both
+    /// counts return to their baselines (give or take a stale stack or pooled-frame word).
+    #[test]
+    fn deferred_prototype_cells_live_and_die_with_their_functions() {
+        const N: usize = 256;
+        let mut engine = Engine::new();
+        eval(
+            &mut engine,
+            "function make() { return function () {}; } var fns = [], F = null; 0",
         );
-        drop(function);
+        engine.interp.gc_collect();
+        let objects = |engine: &Engine| crate::value::heap_live_objects(&engine.interp.gc_heap);
+        let (cells_before, objects_before) = (lazy_cells(&engine), objects(&engine));
+        let materialized = super::materialized();
+        eval(
+            &mut engine,
+            &format!("for (var i = 0; i < {N}; i++) fns.push(make()); F = fns[7]; 0"),
+        );
+        for _ in 0..3 {
+            engine.interp.gc_collect();
+            assert_eq!(
+                lazy_cells(&engine),
+                cells_before + N,
+                "one cell per function"
+            );
+            assert_eq!(prototype_tag(&mut engine, "F"), PACK_LAZY_PROTO);
+        }
+        assert_eq!(super::materialized(), materialized, "nothing materialized");
+        let heap = engine.interp.gc_heap.clone();
+        heap.core.borrow_mut().set_retention_tracing(true);
+        engine.interp.gc_collect();
+        let marked_through_function = crate::gc_test::in_frame(|| {
+            let function = object(&mut engine, "F");
+            let word = function
+                .borrow()
+                .props
+                .get("prototype")
+                .unwrap()
+                .packed
+                .bits();
+            let cell = (word & 0xffff_ffff_ffff) as usize;
+            let path = heap.core.borrow().retention_path(cell);
+            matches!(
+                path.first(),
+                Some(&(start, "lazy prototype", crate::gc_core::MarkSource::Cell(owner)))
+                    if start == cell && owner == Gc::as_ptr(&function) as usize
+            )
+        });
+        heap.core.borrow_mut().set_retention_tracing(false);
+        assert!(marked_through_function, "F's cell is marked through F");
+        eval(&mut engine, "fns = null; F = null; 0");
+        engine.interp.gc_collect();
+        let (cells_after, objects_after) = (lazy_cells(&engine), objects(&engine));
+        assert!(
+            cells_after <= cells_before + 2 && objects_after <= objects_before + 2,
+            "the functions and their cells die in one collection: cells {cells_before} -> \
+             {cells_after}, objects {objects_before} -> {objects_after}"
+        );
+    }
+
+    /// The descriptor reports the function, its key layout, then the prototype's parent
+    /// while deferred or the prototype once materialized. The promoted word no longer names
+    /// the cell, which stays allocated until a collection.
+    #[test]
+    fn deferred_prototype_cell_traces_its_function_and_state_edge() {
+        let mut engine = Engine::new();
+        eval(&mut engine, "var F = function () {}; 0");
+        let edges = |cell: *const u8| {
+            let mut edges = Vec::new();
+            super::trace_cell(cell, &mut |edge| edges.push(edge as usize));
+            edges
+        };
+        let (deferred, materialized, expected_deferred, expected_materialized) =
+            crate::gc_test::in_frame(|| {
+                let function = object(&mut engine, "F");
+                let word = function
+                    .borrow()
+                    .props
+                    .get("prototype")
+                    .unwrap()
+                    .packed
+                    .bits();
+                assert_eq!(word & !0xffff_ffff_ffff, PACK_LAZY_PROTO);
+                let cell = (word & 0xffff_ffff_ffff) as *const u8;
+                // SAFETY: the live function's validated deferred word names this initialized
+                // cell; no safepoint occurs while inspecting it or materializing its value.
+                let layout = unsafe { &*cell.cast::<LazyFunctionPrototype>() }
+                    .layout
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr() as usize;
+                let deferred = edges(cell);
+                let prototype = function.borrow().props.get("prototype").unwrap().value();
+                let materialized = edges(cell);
+                let owner = Gc::as_ptr(&function) as usize;
+                let parent = Gc::as_ptr(&engine.interp.object_proto) as usize;
+                let prototype = Gc::as_ptr(&prototype.as_obj().expect("an object")) as usize;
+                (
+                    deferred,
+                    materialized,
+                    vec![owner, layout, parent],
+                    vec![owner, layout, prototype],
+                )
+            });
+        assert_eq!(deferred, expected_deferred, "function, layout, then parent");
+        assert_eq!(
+            materialized, expected_materialized,
+            "function, layout, then prototype"
+        );
+    }
+
+    /// P1 S5: deferred prototypes that collections traced as cells materialize as
+    /// they did before the cell. For an ordinary function of this realm, a function made by a
+    /// `$262.createRealm()` realm's `Function` and a generator of that realm, after forced
+    /// collections each word is still lazy; the first reads materialize each prototype once,
+    /// and after more collections every read returns that object, whose `constructor` is its
+    /// function (a generator's prototype has none) and whose prototype is the creation realm's
+    /// intrinsic.
+    #[test]
+    fn deferred_prototypes_materialize_after_collections_in_their_creation_realm() {
+        let mut engine = Engine::new();
+        eval(
+            &mut engine,
+            r#"
+            var other = $262.createRealm().global;
+            var F = function () {}, G = new other.Function(''), H = other.eval('(function* () {})');
+            var otherGenerator = other.eval('Object.getPrototypeOf(function* () {}).prototype');
+            var pf, pg, ph;
+            0"#,
+        );
+        for _ in 0..3 {
+            engine.interp.gc_collect();
+        }
+        for name in ["F", "G", "H"] {
+            assert_eq!(prototype_tag(&mut engine, name), PACK_LAZY_PROTO, "{name}");
+        }
+        let materialized = super::materialized();
+        eval(
+            &mut engine,
+            "pf = F.prototype; pg = G.prototype; ph = H.prototype; 0",
+        );
+        assert_eq!(super::materialized() - materialized, 3);
+        for _ in 0..3 {
+            engine.interp.gc_collect();
+        }
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"[pf === F.prototype, pf.constructor === F,
+                    Object.getPrototypeOf(pf) === Object.prototype,
+                    pg === G.prototype, pg.constructor === G,
+                    Object.getPrototypeOf(pg) === other.Object.prototype,
+                    other.Object.prototype !== Object.prototype,
+                    ph === H.prototype, !Object.hasOwn(ph, 'constructor'),
+                    Object.getPrototypeOf(ph) === otherGenerator,
+                    Object.getPrototypeOf(H()) === ph].join()"#
+            ),
+            "true,true,true,true,true,true,true,true,true,true,true"
+        );
+        assert_eq!(
+            super::materialized() - materialized,
+            3,
+            "later reads share the materialized prototypes"
+        );
+    }
+
+    /// P1 S5: `F.prototype = p` over unobserved deferred prototypes through Rust's
+    /// `Object.defineProperty` ([[DefineOwnProperty]]) and `Reflect.set` ([[Set]]): the new
+    /// value reads back, and every old cell is gone after the next collection. Both operations
+    /// first snapshot the current descriptor with `Property::clone`, which materializes the old
+    /// prototype (as before the cell): one materialization per function, and the
+    /// materialized object is garbage once the store completes.
+    #[test]
+    fn rust_overwrites_of_deferred_prototypes_free_their_cells() {
+        const N: usize = 16;
+        for store in [
+            "Object.defineProperty(f, 'prototype', { value: p })",
+            "Reflect.set(f, 'prototype', p)",
+        ] {
+            let mut engine = Engine::new();
+            eval(
+                &mut engine,
+                &format!(
+                    "function make() {{ return function () {{}}; }} \
+                     function store(f) {{ {store}; }} var p = {{}}, fns = []; 0"
+                ),
+            );
+            engine.interp.gc_collect();
+            let cells = lazy_cells(&engine);
+            eval(
+                &mut engine,
+                &format!("for (var i = 0; i < {N}; i++) fns.push(make()); 0"),
+            );
+            assert_eq!(lazy_cells(&engine), cells + N, "{store}");
+            let materialized = super::materialized();
+            eval(&mut engine, "fns.forEach(store); 0");
+            assert_eq!(
+                super::materialized() - materialized,
+                N as u64,
+                "{store}: the descriptor snapshot materializes each old prototype"
+            );
+            assert_eq!(
+                eval(&mut engine, "fns.every(f => f.prototype === p)"),
+                "true",
+                "{store}"
+            );
+            engine.interp.gc_collect();
+            assert_eq!(
+                lazy_cells(&engine),
+                cells,
+                "{store}: the old cells died by the next collection"
+            );
+        }
+    }
+
+    /// Every read that copies or moves a deferred prototype's word out of its property
+    /// materializes it: `PropWord::materialize`, a descriptor snapshot
+    /// (`Property::clone`), `Property::value` and a move (`Property::take_value`),
+    /// each on a function of its own, at every tier. The
+    /// first read materializes the prototype exactly once and yields its object, as an object
+    /// word from the word reads, and the property's word is then that object's. A second read,
+    /// and a script's read of the property, materialize nothing and yield the same object. Its
+    /// `constructor` is the function and its prototype is `Object.prototype`. A move leaves
+    /// `undefined` in the property instead.
+    #[test]
+    fn deferred_prototype_transfers_materialize_once_through_each_explicit_read() {
+        type Read = fn(&Gc) -> (Option<u64>, Value);
+        fn property<R>(function: &Gc, read: impl FnOnce(&Property) -> R) -> R {
+            read(
+                function
+                    .borrow()
+                    .props
+                    .get("prototype")
+                    .expect("a prototype"),
+            )
+        }
+        const MOVE: &str = "Property::take_value";
+        let reads: [(&str, Read); 4] = [
+            ("PropWord::materialize", |function| {
+                let value = property(function, |stored| stored.packed.materialize());
+                (Some(value.tag()), value)
+            }),
+            ("Property::clone", |function| {
+                let snapshot = property(function, Property::clone);
+                (Some(snapshot.packed.tag()), snapshot.value())
+            }),
+            ("Property::value", |function| {
+                (None, property(function, Property::value))
+            }),
+            (MOVE, |function| {
+                let value = function.borrow_mut().props.take_value("prototype");
+                (None, value.expect("a prototype"))
+            }),
+        ];
+        let functions: String = (0..reads.len())
+            .map(|k| format!("function F{k}() {{}} "))
+            .collect();
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, &format!("{functions}0"));
+            for (k, (read_name, read)) in reads.iter().enumerate() {
+                let label = format!("{tier:?} {read_name}");
+                let name = format!("F{k}");
+                let function = object(&mut engine, &name);
+                let tag = || property(&function, |stored| stored.packed.tag());
+                assert_eq!(tag(), PACK_LAZY_PROTO, "{label}");
+                let before = super::materialized();
+                let (word, first) = read(&function);
+                assert_eq!(super::materialized() - before, 1, "{label}: materialized");
+                if let Some(word) = word {
+                    assert_eq!(word, PACK_OBJ, "{label}: an object word");
+                }
+                let ValueView::Obj(prototype) = (first).view() else {
+                    panic!("{label}: not an object")
+                };
+                let constructor = prototype
+                    .borrow()
+                    .props
+                    .get("constructor")
+                    .map(Property::value);
+                assert!(
+                    matches!((constructor).map(|__value| (__value).view()), Some(ValueView::Obj(c)) if Gc::ptr_eq(&c, &function)),
+                    "{label}: constructor"
+                );
+                assert!(
+                    prototype
+                        .borrow()
+                        .proto
+                        .as_ref()
+                        .is_some_and(|parent| Gc::ptr_eq(parent, &engine.interp.object_proto)),
+                    "{label}: parent"
+                );
+                if *read_name == MOVE {
+                    assert!(matches!(
+                        (property(&function, Property::value)).view(),
+                        ValueView::Undefined
+                    ));
+                    assert_eq!(eval(&mut engine, &format!("{name}.prototype")), "undefined");
+                } else {
+                    assert_eq!(tag(), PACK_OBJ, "{label}: the property's word");
+                    let (_, second) = read(&function);
+                    assert!(
+                        matches!((second).view(), ValueView::Obj(o) if Gc::ptr_eq(&o, &prototype)),
+                        "{label}: a second read"
+                    );
+                    eval(&mut engine, &format!("var seen = {name}.prototype; 0"));
+                    assert!(
+                        Gc::ptr_eq(&object(&mut engine, "seen"), &prototype),
+                        "{label}: a script's read"
+                    );
+                }
+                assert_eq!(
+                    super::materialized() - before,
+                    1,
+                    "{label}: later reads materialize nothing"
+                );
+            }
+        }
+    }
+
+    /// A deferred prototype stays in PropWord. Constructing a plain execution word from its
+    /// bits instead of reading through the materializing property boundary must fail.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a deferred prototype's word copied without materializing")]
+    fn deferred_prototype_word_copied_as_bits_trips_the_debug_assertion() {
+        let mut engine = Engine::new();
+        eval(&mut engine, "function F() {} 0");
+        let function = object(&mut engine, "F");
+        let body = function.borrow();
+        let property = body.props.get("prototype").expect("a prototype");
+        assert_eq!(property.packed.tag(), PACK_LAZY_PROTO);
+        let _copy = unsafe { crate::value::Value::from_bits(property.packed.bits()) };
+    }
+
+    #[test]
+    fn lazy_prototype_drops_without_a_cycle_and_materialized_escape_keeps_constructor() {
+        let mut engine = Engine::new();
+        eval(&mut engine, "var F=function(){}, G=function(){};");
+        // Strong handles live in helper frames: the conservative stack scan would keep a
+        // handle in this frame alive after `drop`.
+        let weak = crate::gc_test::in_frame(|| {
+            let function = object(&mut engine, "F");
+            assert_eq!(
+                function
+                    .borrow()
+                    .props
+                    .get("prototype")
+                    .unwrap()
+                    .packed
+                    .tag(),
+                PACK_LAZY_PROTO
+            );
+            Gc::downgrade(&function)
+        });
         eval(&mut engine, "F=null;");
         engine.interp.gc_collect();
-        assert!(weak.upgrade().is_none());
-        let g = object(&mut engine, "G");
-        let weak_g = Rc::downgrade(&g);
-        drop(g);
+        assert!(!crate::gc_test::alive(&weak));
+        let weak_g = crate::gc_test::in_frame(|| Gc::downgrade(&object(&mut engine, "G")));
         eval(&mut engine, "var escaped=G.prototype;G=null;");
         engine.interp.gc_collect();
-        assert!(weak_g.upgrade().is_some());
+        assert!(crate::gc_test::alive(&weak_g));
         assert_eq!(eval(&mut engine, "typeof escaped.constructor"), "function");
         eval(&mut engine, "delete escaped.constructor;");
         engine.interp.gc_collect();
-        assert!(weak_g.upgrade().is_none());
+        assert!(!crate::gc_test::alive(&weak_g));
     }
 }

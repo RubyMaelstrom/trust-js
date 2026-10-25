@@ -4,6 +4,7 @@
 //! with named time zones from the IANA database ([`crate::tz`]) and UTC offset time zones.
 
 use crate::interpreter::Interp;
+use crate::value::ValueView;
 use crate::value::{Gc, NativeFn, Object, Property, Value};
 use std::rc::Rc;
 
@@ -133,14 +134,14 @@ fn balance_year_month(year: i64, month: i64) -> (i64, u8) {
 // ----- helpers --------------------------------------------------------------------------------
 
 fn get(i: &Interp, this: &Value) -> Option<Temporal> {
-    match this {
-        Value::Obj(o) => i.temporal.get(&(Rc::as_ptr(o) as usize)).cloned(),
+    match &(this).view() {
+        ValueView::Obj(o) => i.temporal.get(&(Gc::as_ptr(o) as usize)).cloned(),
         _ => None,
     }
 }
 fn make(i: &mut Interp, proto: &str, data: Temporal) -> Value {
     let obj = Object::new(i.extra_protos.get(proto).cloned());
-    let p = Rc::as_ptr(&obj) as usize;
+    let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.temporal.insert(p, data);
     Value::Obj(obj)
@@ -166,8 +167,8 @@ fn to_int(i: &mut Interp, v: &Value) -> Result<i64, Value> {
     Ok(n.trunc() as i64)
 }
 fn to_int_default(i: &mut Interp, v: &Value, d: i64) -> Result<i64, Value> {
-    match v {
-        Value::Undefined => Ok(d),
+    match &(v).view() {
+        ValueView::Undefined => Ok(d),
         _ => to_int(i, v),
     }
 }
@@ -386,9 +387,9 @@ const KNOWN_CALENDARS: &[&str] = &[
 /// Validate a constructor's calendar argument and return its canonical id. `undefined` → "iso8601".
 /// A non-string (other than undefined) is a TypeError; an unknown id is a RangeError.
 fn check_calendar(i: &mut Interp, v: &Value) -> Result<std::rc::Rc<str>, Value> {
-    match v {
-        Value::Undefined => Ok(std::rc::Rc::from("iso8601")),
-        Value::Str(s) => {
+    match &(v).view() {
+        ValueView::Undefined => Ok(std::rc::Rc::from("iso8601")),
+        ValueView::Str(s) => {
             // A bare (CLDR-aliased) calendar id...
             if let Some(canon) = canon_cal(s) {
                 return Ok(std::rc::Rc::from(canon));
@@ -1741,17 +1742,17 @@ fn make_like(i: &mut Interp, src: &Value, kind: &str, t: Temporal) -> Value {
 
 /// Record the calendar id on a just-created Temporal object.
 fn set_cal(i: &mut Interp, v: &Value, cal: std::rc::Rc<str>) {
-    if let Value::Obj(o) = v {
-        i.temporal_cal.insert(Rc::as_ptr(o) as usize, cal);
+    if let ValueView::Obj(o) = &(v).view() {
+        i.temporal_cal.insert(Gc::as_ptr(o) as usize, cal);
     }
 }
 
 /// The calendar id of a Temporal receiver (default "iso8601").
 fn cal_of(i: &Interp, this: &Value) -> std::rc::Rc<str> {
-    match this {
-        Value::Obj(o) => i
+    match &(this).view() {
+        ValueView::Obj(o) => i
             .temporal_cal
-            .get(&(Rc::as_ptr(o) as usize))
+            .get(&(Gc::as_ptr(o) as usize))
             .cloned()
             .unwrap_or_else(|| std::rc::Rc::from("iso8601")),
         _ => std::rc::Rc::from("iso8601"),
@@ -1761,8 +1762,8 @@ fn cal_of(i: &Interp, this: &Value) -> std::rc::Rc<str> {
 /// Read a Duration property-bag field via ToIntegerIfIntegral, defaulting when absent.
 /// Read a positional Duration constructor argument via ToIntegerIfIntegral, defaulting to 0.
 fn dur_arg(i: &mut Interp, v: &Value) -> Result<f64, Value> {
-    match v {
-        Value::Undefined => Ok(0.0),
+    match &(v).view() {
+        ValueView::Undefined => Ok(0.0),
         _ => to_f64_integral(i, v),
     }
 }
@@ -1816,32 +1817,38 @@ fn fmt_time(t: IsoTime) -> String {
 }
 /// Read `fractionalSecondDigits` (0..=9 or "auto"); None means auto (trim trailing zeros).
 fn read_frac_digits(i: &mut Interp, opts: &Value) -> Result<Option<usize>, Value> {
-    if matches!(opts, Value::Undefined | Value::Str(_)) {
+    if matches!(&(opts).view(), ValueView::Undefined | ValueView::Str(_)) {
         return Ok(None);
     }
     let v = getm(i, opts, "fractionalSecondDigits")?;
-    match v {
-        Value::Undefined => Ok(None),
-        // A Number floors, then must land in [0, 9]; anything else stringifies and must be "auto".
-        Value::Num(n) => {
-            if n.is_nan() || !n.is_finite() {
-                return Err(i.make_error("RangeError", "fractionalSecondDigits out of range"));
+    {
+        let __value_match_original = v;
+        match (__value_match_original).view() {
+            ValueView::Undefined => Ok(None),
+            // A Number floors, then must land in [0, 9]; anything else stringifies and must be "auto".
+            ValueView::Num(n) => {
+                if n.is_nan() || !n.is_finite() {
+                    return Err(i.make_error("RangeError", "fractionalSecondDigits out of range"));
+                }
+                let f = n.floor();
+                if !(0.0..=9.0).contains(&f) {
+                    return Err(i.make_error("RangeError", "fractionalSecondDigits out of range"));
+                }
+                Ok(Some(f as usize))
             }
-            let f = n.floor();
-            if !(0.0..=9.0).contains(&f) {
-                return Err(i.make_error("RangeError", "fractionalSecondDigits out of range"));
-            }
-            Ok(Some(f as usize))
-        }
-        other => {
-            let sv = i.to_string(&other).map_err(unab)?;
-            if &*sv == "auto" {
-                Ok(None)
-            } else {
-                Err(i.make_error(
-                    "RangeError",
-                    "fractionalSecondDigits must be 'auto' or a number",
-                ))
+            _ => {
+                let other = __value_match_original;
+                {
+                    let sv = i.to_string(&other).map_err(unab)?;
+                    if &*sv == "auto" {
+                        Ok(None)
+                    } else {
+                        Err(i.make_error(
+                            "RangeError",
+                            "fractionalSecondDigits must be 'auto' or a number",
+                        ))
+                    }
+                }
             }
         }
     }
@@ -2513,7 +2520,7 @@ fn parse_month_day(s: &str) -> Option<IsoDate> {
 // ----- install --------------------------------------------------------------------------------
 
 pub fn install(it: &mut Interp) {
-    let ns = Object::new(Some(it.object_proto.clone()));
+    let ns = Object::new(Some(it.object_proto));
     if let Some(key) = crate::builtins::to_string_tag_key(it) {
         ns.borrow_mut().props.insert(
             key,
@@ -2576,16 +2583,16 @@ pub fn install(it: &mut Interp) {
                         ))
                     }
                 };
-                if matches!(options, Value::Obj(_)) {
+                if matches!((options).view(), ValueView::Obj(_)) {
                     let ds = i.get_member_key(&options, "dateStyle").map_err(unab)?;
                     let ts = i.get_member_key(&options, "timeStyle").map_err(unab)?;
-                    if required == "date" && !matches!(ts, Value::Undefined) {
+                    if required == "date" && !matches!((ts).view(), ValueView::Undefined) {
                         return Err(i.make_error(
                             "TypeError",
                             "timeStyle cannot format a date-only Temporal value",
                         ));
                     }
-                    if required == "time" && !matches!(ds, Value::Undefined) {
+                    if required == "time" && !matches!((ds).view(), ValueView::Undefined) {
                         return Err(i.make_error(
                             "TypeError",
                             "dateStyle cannot format a time-only Temporal value",
@@ -2618,10 +2625,10 @@ pub fn install(it: &mut Interp) {
 fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     use crate::value::set_data;
     let obj = match this.as_obj() {
-        Some(o) => o.clone(),
+        Some(o) => o,
         None => return Err(i.make_error("TypeError", "not an object")),
     };
-    let ptr = Rc::as_ptr(&obj) as usize;
+    let ptr = Gc::as_ptr(&obj) as usize;
     let (epoch_ns, tz) = match i.temporal.get(&ptr) {
         Some(Temporal::Zoned { epoch_ns, tz, .. }) => (*epoch_ns, tz.clone()),
         _ => return Err(i.make_error(
@@ -2637,9 +2644,9 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
 
     let locales = a.first().cloned().unwrap_or(Value::Undefined);
     let user_opts = a.get(1).cloned().unwrap_or(Value::Undefined);
-    let user_obj = match &user_opts {
-        Value::Undefined => None,
-        Value::Obj(o) => Some(o.clone()),
+    let user_obj = match &(user_opts).view() {
+        ValueView::Undefined => None,
+        ValueView::Obj(o) => Some(*o),
         _ => return Err(i.make_error("TypeError", "options must be an object")),
     };
 
@@ -2649,15 +2656,15 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
     if let Some(uo) = &user_obj {
         // A timeZone option is disallowed (the instance's zone always wins).
         if !matches!(
-            i.get_member_key(&user_opts, "timeZone").map_err(unab)?,
-            Value::Undefined
+            (i.get_member_key(&user_opts, "timeZone").map_err(unab)?).view(),
+            ValueView::Undefined
         ) {
             return Err(i.make_error(
                 "TypeError",
                 "the timeZone option is not allowed for Temporal.ZonedDateTime.prototype.toLocaleString",
             ));
         }
-        opts.borrow_mut().proto = Some(uo.clone());
+        opts.borrow_mut().proto = Some(*uo);
         for k in [
             "weekday",
             "era",
@@ -2673,8 +2680,8 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
             "timeStyle",
         ] {
             if !matches!(
-                i.get_member_key(&user_opts, k).map_err(unab)?,
-                Value::Undefined
+                (i.get_member_key(&user_opts, k).map_err(unab)?).view(),
+                ValueView::Undefined
             ) {
                 any_comp = true;
                 break;
@@ -2698,7 +2705,7 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
             Some(_) => i.get_member_key(&user_opts, "timeZoneName").map_err(unab)?,
             None => Value::Undefined,
         };
-        if matches!(user_tzname, Value::Undefined) {
+        if matches!((user_tzname).view(), ValueView::Undefined) {
             set_data(&opts, "timeZoneName", Value::lstr("short"));
         }
     }
@@ -2716,9 +2723,9 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
 
     // A non-ISO instance calendar must match the formatter's resolved calendar.
     let ropts_fn = i.get_member_key(&dtf, "resolvedOptions").map_err(unab)?;
-    let ropts = i.call(ropts_fn, dtf.clone(), &[]).map_err(unab)?;
-    let dcal = match i.get_member_key(&ropts, "calendar").map_err(unab)? {
-        Value::Str(s) => s.to_string(),
+    let ropts = i.call(ropts_fn, dtf, &[]).map_err(unab)?;
+    let dcal = match (i.get_member_key(&ropts, "calendar").map_err(unab)?).view() {
+        ValueView::Str(s) => s.to_string(),
         _ => "iso8601".to_string(),
     };
     if zcal != "iso8601" && zcal != dcal {
@@ -2742,12 +2749,12 @@ fn add_ctor(
     ctor.borrow_mut().is_constructor = true;
     ctor.borrow_mut().props.insert(
         "prototype",
-        Property::data(Value::Obj(proto.clone()), false, false, false),
+        Property::data(Value::Obj(proto), false, false, false),
     );
     proto
         .borrow_mut()
         .props
-        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+        .insert("constructor", Property::builtin(Value::Obj(ctor)));
     if let Some(key) = crate::builtins::to_string_tag_key(it) {
         proto.borrow_mut().props.insert(
             key,
@@ -2756,29 +2763,29 @@ fn add_ctor(
     }
     ns.borrow_mut()
         .props
-        .insert(name, Property::builtin(Value::Obj(ctor.clone())));
+        .insert(name, Property::builtin(Value::Obj(ctor)));
     ctor
 }
 
 /// GetPrototypeFromConstructor: a construct via a subclass new-target adopts that target's
 /// `prototype` object (an observable Get that may throw); a non-object value keeps the default.
 fn sub_proto(i: &mut Interp, v: &Value) -> Result<(), Value> {
-    let nt = i.new_target.clone();
-    if !matches!(nt, Value::Obj(_)) {
+    let nt = i.constructor_new_target();
+    if !matches!((nt).view(), ValueView::Obj(_)) {
         return Ok(());
     }
     let p = i.get_member_key(&nt, "prototype").map_err(unab)?;
-    if let (Value::Obj(o), Value::Obj(po)) = (v, &p) {
-        o.borrow_mut().proto = Some(po.clone());
+    if let (ValueView::Obj(o), ValueView::Obj(po)) = (&(v).view(), &(p).view()) {
+        o.borrow_mut().proto = Some(*po);
     }
     Ok(())
 }
 
 /// A constructor's calendar parameter: a bare identifier only (never an ISO string).
 fn ctor_calendar(i: &mut Interp, v: &Value) -> Result<std::rc::Rc<str>, Value> {
-    match v {
-        Value::Undefined => Ok(std::rc::Rc::from("iso8601")),
-        Value::Str(c) => match canon_cal(c) {
+    match &(v).view() {
+        ValueView::Undefined => Ok(std::rc::Rc::from("iso8601")),
+        ValueView::Str(c) => match canon_cal(c) {
             Some(canon) => Ok(std::rc::Rc::from(canon)),
             None => Err(i.make_error("RangeError", "invalid calendar identifier")),
         },
@@ -2796,8 +2803,8 @@ fn require_new(i: &Interp) -> Result<(), Value> {
 // ===== PlainDate ==============================================================================
 
 fn install_plain_date(it: &mut Interp, ns: &Gc) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainDate", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainDate", proto);
 
     def_getter(it, &proto, "year", |i, t, _| {
         let d = as_date(i, &t)?;
@@ -2910,21 +2917,21 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
         let d = as_date(i, &t)?;
         let cal = cal_of(i, &t);
         let f = arg(a, 0);
-        if !matches!(f, Value::Obj(_)) || get(i, &f).is_some() {
+        if !matches!((f).view(), ValueView::Obj(_)) || get(i, &f).is_some() {
             return Err(i.make_error("TypeError", "with() argument must be a plain object"));
         }
-        if !matches!(getm(i, &f, "calendar")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "calendar")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'calendar'"));
         }
-        if !matches!(getm(i, &f, "timeZone")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "timeZone")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'timeZone'"));
         }
         let uses_era = cal_uses_era(&cal);
         let mut any = false;
         let day = {
             let fv = getm(i, &f, "day")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let n = to_int(i, &fv)?;
@@ -2937,16 +2944,16 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
         };
         let (era, era_year) = if uses_era {
             let ev = getm(i, &f, "era")?;
-            let era = match ev {
-                Value::Undefined => None,
+            let era = match (ev).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
                 }
             };
             let eyv = getm(i, &f, "eraYear")?;
-            let ey = match eyv {
-                Value::Undefined => None,
+            let ey = match (eyv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(to_int(i, &eyv)?)
@@ -2958,8 +2965,8 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
         };
         let month = {
             let fv = getm(i, &f, "month")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let n = to_int(i, &fv)?;
@@ -2972,15 +2979,15 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
         };
         let month_code = {
             let fv = getm(i, &f, "monthCode")?;
-            match &fv {
-                Value::Undefined => None,
+            match &(fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let prim = i
                         .to_primitive(&fv, crate::eval::Hint::String)
                         .map_err(unab)?;
-                    let sv = match &prim {
-                        Value::Str(sv) => sv.clone(),
+                    let sv = match &(prim).view() {
+                        ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
                     let b = sv.as_bytes();
@@ -2997,8 +3004,8 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
         };
         let year = {
             let fv = getm(i, &f, "year")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(to_int(i, &fv)?)
@@ -3016,7 +3023,7 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
         }
         let ovf = to_overflow(i, &get_opts_obj(i, &arg(a, 1))?)?;
         let cf = cal_fields(&cal, d);
-        let bag = Object::new(Some(i.object_proto.clone()));
+        let bag = Object::new(Some(i.object_proto));
         {
             let mut b = bag.borrow_mut();
             match year {
@@ -3055,7 +3062,7 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
                     }
                     if let Some(mc) = &month_code {
                         b.props
-                            .insert("monthCode", Property::builtin(Value::Str(mc.clone())));
+                            .insert("monthCode", Property::builtin(Value::Str(*mc)));
                     }
                 }
             }
@@ -3092,16 +3099,22 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "since", 1, |i, t, a| pd_until_since(i, &t, a, -1));
     it.def_method(&proto, "toPlainDateTime", 0, |i, t, a| {
         let d = as_date(i, &t)?;
-        let time = match arg(a, 0) {
-            Value::Undefined => IsoTime {
-                hour: 0,
-                minute: 0,
-                second: 0,
-                ms: 0,
-                us: 0,
-                ns: 0,
-            },
-            v => to_time(i, &v, &Value::Undefined)?,
+        let time = {
+            let __value_match_original = arg(a, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined => IsoTime {
+                    hour: 0,
+                    minute: 0,
+                    second: 0,
+                    ms: 0,
+                    us: 0,
+                    ns: 0,
+                },
+                _ => {
+                    let v = __value_match_original;
+                    to_time(i, &v, &Value::Undefined)?
+                }
+            }
         };
         if !iso_datetime_within_limits(d, time) {
             return Err(i.make_error("RangeError", "date-time is outside the representable range"));
@@ -3152,11 +3165,11 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "withCalendar", 1, |i, t, a| {
         let d = as_date(i, &t)?;
         let cv = arg(a, 0);
-        let cal = match &cv {
-            Value::Undefined => {
+        let cal = match &(cv).view() {
+            ValueView::Undefined => {
                 return Err(i.make_error("TypeError", "calendar argument is required"))
             }
-            Value::Obj(_) => match get(i, &cv) {
+            ValueView::Obj(_) => match get(i, &cv) {
                 Some(
                     Temporal::Date(_)
                     | Temporal::DateTime(_, _)
@@ -3175,15 +3188,21 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "toZonedDateTime", 1, |i, t, a| {
         let d = as_date(i, &t)?;
         let item = arg(a, 0);
-        let (tzv, timev) = match &item {
-            Value::Obj(_) => (getm(i, &item, "timeZone")?, getm(i, &item, "plainTime")?),
-            other => (other.clone(), Value::Undefined),
+        let (tzv, timev) = {
+            let __value_match_original = &item;
+            match &(__value_match_original).view() {
+                ValueView::Obj(_) => (getm(i, &item, "timeZone")?, getm(i, &item, "plainTime")?),
+                _ => {
+                    let other = __value_match_original;
+                    (*other, Value::Undefined)
+                }
+            }
         };
         let tz = tz_from_field(i, &tzv)?;
-        let epoch = match timev {
-            Value::Undefined => start_of_day_ns(i, &tz, d)?,
-            v => {
-                let time = to_time(i, &v, &Value::Undefined)?;
+        let epoch = match timev.view() {
+            ValueView::Undefined => start_of_day_ns(i, &tz, d)?,
+            _ => {
+                let time = to_time(i, &timev, &Value::Undefined)?;
                 if !iso_datetime_within_limits(d, time) {
                     return Err(
                         i.make_error("RangeError", "date-time is outside the representable range")
@@ -3244,10 +3263,10 @@ fn epoch_days(d: IsoDate) -> i64 {
 /// round()/total() accept a bare string as the `smallestUnit`/`unit` shorthand; otherwise the
 /// argument is an options object. Returns (options-object-or-undefined, shorthand-unit).
 fn round_opts(arg0: &Value) -> (Value, Option<String>) {
-    if let Value::Str(s) = arg0 {
+    if let ValueView::Str(s) = &(arg0).view() {
         (Value::Undefined, Some(s.to_string()))
     } else {
-        (arg0.clone(), None)
+        (*arg0, None)
     }
 }
 
@@ -3266,12 +3285,12 @@ fn opt_enum(
     Ok(s)
 }
 fn opt_str(i: &mut Interp, opts: &Value, key: &str, default: &str) -> Result<String, Value> {
-    match opts {
-        Value::Undefined => Ok(default.to_string()),
-        Value::Obj(_) => {
+    match &(opts).view() {
+        ValueView::Undefined => Ok(default.to_string()),
+        ValueView::Obj(_) => {
             let v = getm(i, opts, key)?;
-            match v {
-                Value::Undefined => Ok(default.to_string()),
+            match (v).view() {
+                ValueView::Undefined => Ok(default.to_string()),
                 _ => Ok(i.to_string(&v).map_err(unab)?.to_string()),
             }
         }
@@ -3279,9 +3298,9 @@ fn opt_str(i: &mut Interp, opts: &Value, key: &str, default: &str) -> Result<Str
     }
 }
 fn opt_num(i: &mut Interp, opts: &Value, key: &str, default: i64) -> Result<i64, Value> {
-    match opts {
-        Value::Undefined => Ok(default),
-        Value::Obj(_) => {
+    match &(opts).view() {
+        ValueView::Undefined => Ok(default),
+        ValueView::Obj(_) => {
             let v = getm(i, opts, key)?;
             to_int_default(i, &v, default)
         }
@@ -3848,19 +3867,19 @@ fn read_date_raw_cal(
     // errors are only raised after every field has been read.
     let uses_era = cal_uses_era(cal);
     let day_f = getm(i, v, "day")?;
-    let day = match day_f {
-        Value::Undefined => None,
+    let day = match (day_f).view() {
+        ValueView::Undefined => None,
         _ => Some(to_int(i, &day_f)?),
     };
     let (era, era_year) = if uses_era {
         let e = getm(i, v, "era")?;
-        let e = match e {
-            Value::Undefined => None,
+        let e = match (e).view() {
+            ValueView::Undefined => None,
             _ => Some(i.to_string(&e).map_err(unab)?.to_lowercase()),
         };
         let ey = getm(i, v, "eraYear")?;
-        let ey = match ey {
-            Value::Undefined => None,
+        let ey = match (ey).view() {
+            ValueView::Undefined => None,
             _ => Some(to_int(i, &ey)?),
         };
         (e, ey)
@@ -3868,8 +3887,8 @@ fn read_date_raw_cal(
         (None, None)
     };
     let month_f = getm(i, v, "month")?;
-    let month = match month_f {
-        Value::Undefined => None,
+    let month = match (month_f).view() {
+        ValueView::Undefined => None,
         _ => {
             let n = to_int(i, &month_f)?;
             if n < 1 {
@@ -3879,13 +3898,13 @@ fn read_date_raw_cal(
         }
     };
     let mc_f = getm(i, v, "monthCode")?;
-    let month_code = match mc_f {
-        Value::Undefined => None,
+    let month_code = match (mc_f).view() {
+        ValueView::Undefined => None,
         _ => Some(i.to_string(&mc_f).map_err(unab)?.to_string()),
     };
     let year_f = getm(i, v, "year")?;
-    let year_opt = match year_f {
-        Value::Undefined => None,
+    let year_opt = match (year_f).view() {
+        ValueView::Undefined => None,
         _ => Some(to_int(i, &year_f)?),
     };
 
@@ -4208,7 +4227,7 @@ fn read_time_raw(i: &mut Interp, v: &Value) -> Result<([i64; 6], bool), Value> {
     let mut any = false;
     for (k, slot) in keys {
         let fv = getm(i, v, k)?;
-        if !matches!(fv, Value::Undefined) {
+        if !matches!((fv).view(), ValueView::Undefined) {
             any = true;
             vals[slot] = to_int(i, &fv)?;
         }
@@ -4252,8 +4271,8 @@ fn to_date_cal(
         }
         _ => {}
     }
-    let (d, cal) = match v {
-        Value::Str(s) => {
+    let (d, cal) = match &(v).view() {
+        ValueView::Str(s) => {
             let p =
                 parse_iso(s).ok_or_else(|| i.make_error("RangeError", "invalid date string"))?;
             if p.offset == Off::Z {
@@ -4277,11 +4296,11 @@ fn to_date_cal(
             );
             (d, cal)
         }
-        Value::Obj(_) => {
+        ValueView::Obj(_) => {
             let bag = read_dt_bag(i, v, false, false, true)?;
             {
-                let b = match &bag.date_bag {
-                    Value::Obj(o) => o.clone(),
+                let b = match &(bag.date_bag).view() {
+                    ValueView::Obj(o) => *o,
                     _ => unreachable!(),
                 };
                 let has = |k: &str| b.borrow().props.get(k).is_some();
@@ -4377,8 +4396,8 @@ fn dt_add(
 // ===== PlainTime ==============================================================================
 
 fn install_plain_time(it: &mut Interp, ns: &Gc) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainTime", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainTime", proto);
 
     def_getter(it, &proto, "hour", |i, t, _| {
         Ok(Value::Num(as_time(i, &t)?.hour as f64))
@@ -4424,13 +4443,13 @@ fn install_plain_time(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "with", 1, |i, t, a| {
         let x = as_time(i, &t)?;
         let f = arg(a, 0);
-        if !matches!(f, Value::Obj(_)) || get(i, &f).is_some() {
+        if !matches!((f).view(), ValueView::Obj(_)) || get(i, &f).is_some() {
             return Err(i.make_error("TypeError", "with() argument must be a plain object"));
         }
-        if !matches!(getm(i, &f, "calendar")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "calendar")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'calendar'"));
         }
-        if !matches!(getm(i, &f, "timeZone")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "timeZone")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'timeZone'"));
         }
         let mut merged = [
@@ -4452,7 +4471,7 @@ fn install_plain_time(it: &mut Interp, ns: &Gc) {
         ];
         for (k, slot) in keys {
             let fv = getm(i, &f, k)?;
-            if !matches!(fv, Value::Undefined) {
+            if !matches!((fv).view(), ValueView::Undefined) {
                 any = true;
                 merged[slot] = to_int(i, &fv)?;
             }
@@ -4501,7 +4520,7 @@ fn install_plain_time(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "round", 1, |i, t, a| {
         let x = as_time(i, &t)?;
         let arg0 = arg(a, 0);
-        if !matches!(arg0, Value::Obj(_) | Value::Str(_)) {
+        if !matches!((arg0).view(), ValueView::Obj(_) | ValueView::Str(_)) {
             return Err(i.make_error("TypeError", "options must be an object or a string"));
         }
         let (o, shorthand) = round_opts(&arg0);
@@ -4590,8 +4609,8 @@ fn to_time(i: &mut Interp, v: &Value, opts: &Value) -> Result<IsoTime, Value> {
         }
         _ => {}
     }
-    match v {
-        Value::Str(s) => {
+    match &(v).view() {
+        ValueView::Str(s) => {
             let p = parse_iso(s)
                 .ok_or_else(|| i.make_error("RangeError", "invalid PlainTime string"))?;
             // A PlainTime string may not carry a UTC designator.
@@ -4615,7 +4634,7 @@ fn to_time(i: &mut Interp, v: &Value, opts: &Value) -> Result<IsoTime, Value> {
             to_overflow(i, opts)?;
             Ok(t)
         }
-        Value::Obj(_) => {
+        ValueView::Obj(_) => {
             // At least one time field must be present.
             let (vals, any) = read_time_raw(i, v)?;
             if !any {
@@ -4631,8 +4650,8 @@ fn to_time(i: &mut Interp, v: &Value, opts: &Value) -> Result<IsoTime, Value> {
 // ===== PlainDateTime ==========================================================================
 
 fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainDateTime", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainDateTime", proto);
 
     def_getter(it, &proto, "year", |i, t, _| {
         let d = as_datetime(i, &t)?.0;
@@ -4771,9 +4790,15 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
     });
     it.def_method(&proto, "withPlainTime", 0, |i, t, a| {
         let (d, _) = as_datetime(i, &t)?;
-        let nt = match arg(a, 0) {
-            Value::Undefined => MIDNIGHT,
-            v => to_time(i, &v, &Value::Undefined)?,
+        let nt = {
+            let __value_match_original = arg(a, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined => MIDNIGHT,
+                _ => {
+                    let v = __value_match_original;
+                    to_time(i, &v, &Value::Undefined)?
+                }
+            }
         };
         if !iso_datetime_within_limits(d, nt) {
             return Err(i.make_error("RangeError", "date-time is outside the representable range"));
@@ -4788,11 +4813,11 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "withCalendar", 1, |i, t, a| {
         let (d, tm) = as_datetime(i, &t)?;
         let cv = arg(a, 0);
-        let cal = match &cv {
-            Value::Undefined => {
+        let cal = match &(cv).view() {
+            ValueView::Undefined => {
                 return Err(i.make_error("TypeError", "calendar argument is required"))
             }
-            Value::Obj(_) => match get(i, &cv) {
+            ValueView::Obj(_) => match get(i, &cv) {
                 Some(
                     Temporal::Date(_)
                     | Temporal::DateTime(_, _)
@@ -4881,21 +4906,21 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
         let (d, tm) = as_datetime(i, &t)?;
         let cal = cal_of(i, &t);
         let f = arg(a, 0);
-        if !matches!(f, Value::Obj(_)) || get(i, &f).is_some() {
+        if !matches!((f).view(), ValueView::Obj(_)) || get(i, &f).is_some() {
             return Err(i.make_error("TypeError", "with() argument must be a plain object"));
         }
-        if !matches!(getm(i, &f, "calendar")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "calendar")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'calendar'"));
         }
-        if !matches!(getm(i, &f, "timeZone")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "timeZone")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'timeZone'"));
         }
         let uses_era = cal_uses_era(&cal);
         let mut any = false;
         let read_int = |i: &mut Interp, key: &str, any: &mut bool| -> Result<Option<i64>, Value> {
             let fv = getm(i, &f, key)?;
-            match fv {
-                Value::Undefined => Ok(None),
+            match (fv).view() {
+                ValueView::Undefined => Ok(None),
                 _ => {
                     *any = true;
                     Ok(Some(to_int(i, &fv)?))
@@ -4910,8 +4935,8 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
         };
         let (era, era_year) = if uses_era {
             let ev = getm(i, &f, "era")?;
-            let era = match ev {
-                Value::Undefined => None,
+            let era = match (ev).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
@@ -4928,8 +4953,8 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
         let minute = read_int(i, "minute", &mut any)?;
         let month = {
             let fv = getm(i, &f, "month")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let n = to_int(i, &fv)?;
@@ -4942,15 +4967,15 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
         };
         let month_code = {
             let fv = getm(i, &f, "monthCode")?;
-            match &fv {
-                Value::Undefined => None,
+            match &(fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let prim = i
                         .to_primitive(&fv, crate::eval::Hint::String)
                         .map_err(unab)?;
-                    let sv = match &prim {
-                        Value::Str(sv) => sv.clone(),
+                    let sv = match &(prim).view() {
+                        ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
                     let b = sv.as_bytes();
@@ -4979,7 +5004,7 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
         }
         let ovf = to_overflow(i, &get_opts_obj(i, &arg(a, 1))?)?;
         let cf = cal_fields(&cal, d);
-        let bag = Object::new(Some(i.object_proto.clone()));
+        let bag = Object::new(Some(i.object_proto));
         {
             let mut b = bag.borrow_mut();
             match year {
@@ -5018,7 +5043,7 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
                     }
                     if let Some(mc) = &month_code {
                         b.props
-                            .insert("monthCode", Property::builtin(Value::Str(mc.clone())));
+                            .insert("monthCode", Property::builtin(Value::Str(*mc)));
                     }
                 }
             }
@@ -5052,7 +5077,7 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "round", 1, |i, t, a| {
         let (d, tm) = as_datetime(i, &t)?;
         let arg0 = arg(a, 0);
-        if !matches!(arg0, Value::Obj(_) | Value::Str(_)) {
+        if !matches!((arg0).view(), ValueView::Obj(_) | ValueView::Str(_)) {
             return Err(i.make_error("TypeError", "options must be an object or a string"));
         }
         let (o, shorthand) = round_opts(&arg0);
@@ -5169,8 +5194,8 @@ fn to_datetime_cal(i: &mut Interp, v: &Value, opts: &Value) -> Result<DtParts, V
         }
         _ => {}
     }
-    match v {
-        Value::Str(s) => {
+    match &(v).view() {
+        ValueView::Str(s) => {
             let p = parse_iso(s).ok_or_else(|| i.make_error("RangeError", "invalid datetime"))?;
             if p.offset == Off::Z {
                 return Err(
@@ -5204,13 +5229,13 @@ fn to_datetime_cal(i: &mut Interp, v: &Value, opts: &Value) -> Result<DtParts, V
             );
             Ok((d, t, cal))
         }
-        Value::Obj(_) => {
+        ValueView::Obj(_) => {
             // All fields read once in alphabetical order (with per-field coercion), requiredness
             // TypeErrors after the reads, options next, then calendar resolution and regulation.
             let bag = read_dt_bag(i, v, false, true, true)?;
             {
-                let b = match &bag.date_bag {
-                    Value::Obj(o) => o.clone(),
+                let b = match &(bag.date_bag).view() {
+                    ValueView::Obj(o) => *o,
                     _ => unreachable!(),
                 };
                 let has = |k: &str| b.borrow().props.get(k).is_some();
@@ -5242,8 +5267,8 @@ fn to_datetime_cal(i: &mut Interp, v: &Value, opts: &Value) -> Result<DtParts, V
 // ===== PlainYearMonth / PlainMonthDay =========================================================
 
 fn install_year_month(it: &mut Interp, ns: &Gc) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainYearMonth", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainYearMonth", proto);
     def_getter(it, &proto, "year", |i, t, _| {
         let d = as_yearmonth(i, &t)?;
         Ok(Value::Num(cal_year_num(&cal_of(i, &t), d) as f64))
@@ -5279,12 +5304,12 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "toPlainDate", 1, |i, t, a| {
         let ym = as_yearmonth(i, &t)?;
         let f = arg(a, 0);
-        if !matches!(f, Value::Obj(_)) {
+        if !matches!((f).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "toPlainDate() argument must be an object"));
         }
         // The day is required to complete a date from a year-month.
         let dv = getm(i, &f, "day")?;
-        if matches!(dv, Value::Undefined) {
+        if matches!((dv).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "toPlainDate() requires a day"));
         }
         let day = to_int(i, &dv)?;
@@ -5369,29 +5394,29 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
         let d = as_yearmonth(i, &t)?;
         let cal = cal_of(i, &t);
         let f = arg(a, 0);
-        if !matches!(f, Value::Obj(_)) || get(i, &f).is_some() {
+        if !matches!((f).view(), ValueView::Obj(_)) || get(i, &f).is_some() {
             return Err(i.make_error("TypeError", "with() argument must be a plain object"));
         }
-        if !matches!(getm(i, &f, "calendar")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "calendar")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'calendar'"));
         }
-        if !matches!(getm(i, &f, "timeZone")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "timeZone")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'timeZone'"));
         }
         let uses_era = cal_uses_era(&cal);
         let mut any = false;
         let (era, era_year) = if uses_era {
             let ev = getm(i, &f, "era")?;
-            let era = match ev {
-                Value::Undefined => None,
+            let era = match (ev).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
                 }
             };
             let eyv = getm(i, &f, "eraYear")?;
-            let ey = match eyv {
-                Value::Undefined => None,
+            let ey = match (eyv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(to_int(i, &eyv)?)
@@ -5403,8 +5428,8 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
         };
         let month = {
             let fv = getm(i, &f, "month")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let n = to_int(i, &fv)?;
@@ -5417,15 +5442,15 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
         };
         let month_code = {
             let fv = getm(i, &f, "monthCode")?;
-            match &fv {
-                Value::Undefined => None,
+            match &(fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let prim = i
                         .to_primitive(&fv, crate::eval::Hint::String)
                         .map_err(unab)?;
-                    let sv = match &prim {
-                        Value::Str(sv) => sv.clone(),
+                    let sv = match &(prim).view() {
+                        ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
                     let b = sv.as_bytes();
@@ -5442,8 +5467,8 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
         };
         let year = {
             let fv = getm(i, &f, "year")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(to_int(i, &fv)?)
@@ -5460,7 +5485,7 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
             return Err(i.make_error("TypeError", "eraYear and year are mutually exclusive"));
         }
         let ovf = to_overflow(i, &get_opts_obj(i, &arg(a, 1))?)?;
-        let bag = Object::new(Some(i.object_proto.clone()));
+        let bag = Object::new(Some(i.object_proto));
         {
             let mut b = bag.borrow_mut();
             match year {
@@ -5499,7 +5524,7 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
                     }
                     if let Some(mc) = &month_code {
                         b.props
-                            .insert("monthCode", Property::builtin(Value::Str(mc.clone())));
+                            .insert("monthCode", Property::builtin(Value::Str(*mc)));
                     }
                 }
             }
@@ -5593,8 +5618,8 @@ fn to_yearmonth_cal(
         to_overflow(i, opts)?;
         return Ok((d, cal_of(i, v)));
     }
-    let (d, cal) = match v {
-        Value::Str(s) => {
+    let (d, cal) = match &(v).view() {
+        ValueView::Str(s) => {
             let ym = parse_year_month(s)
                 .ok_or_else(|| i.make_error("RangeError", "invalid year-month"))?;
             let cal: std::rc::Rc<str> = std::rc::Rc::from(
@@ -5616,10 +5641,10 @@ fn to_yearmonth_cal(
                 (ym, cal)
             }
         }
-        Value::Obj(_) => {
+        ValueView::Obj(_) => {
             let bag = read_dt_bag(i, v, false, false, false)?;
-            let b = match &bag.date_bag {
-                Value::Obj(o) => o.clone(),
+            let b = match &(bag.date_bag).view() {
+                ValueView::Obj(o) => *o,
                 _ => unreachable!(),
             };
             {
@@ -5651,8 +5676,8 @@ fn to_yearmonth_cal(
 }
 
 fn install_month_day(it: &mut Interp, ns: &Gc) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainMonthDay", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainMonthDay", proto);
     def_getter(it, &proto, "monthCode", |i, t, _| {
         let d = as_monthday(i, &t)?;
         Ok(Value::lstr(cal_month_code(&cal_of(i, &t), d)))
@@ -5715,13 +5740,13 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
         let md = as_monthday(i, &t)?;
         let cal = cal_of(i, &t);
         let f = arg(a, 0);
-        if !matches!(f, Value::Obj(_)) || get(i, &f).is_some() {
+        if !matches!((f).view(), ValueView::Obj(_)) || get(i, &f).is_some() {
             return Err(i.make_error("TypeError", "with() argument must be a plain object"));
         }
-        if !matches!(getm(i, &f, "calendar")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "calendar")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'calendar'"));
         }
-        if !matches!(getm(i, &f, "timeZone")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "timeZone")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'timeZone'"));
         }
         // Partial fields, read once in alphabetical order.
@@ -5729,8 +5754,8 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
         let mut any = false;
         let day = {
             let fv = getm(i, &f, "day")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let n = to_int(i, &fv)?;
@@ -5743,16 +5768,16 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
         };
         let (era, era_year) = if uses_era {
             let ev = getm(i, &f, "era")?;
-            let era = match ev {
-                Value::Undefined => None,
+            let era = match (ev).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
                 }
             };
             let eyv = getm(i, &f, "eraYear")?;
-            let ey = match eyv {
-                Value::Undefined => None,
+            let ey = match (eyv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(to_int(i, &eyv)?)
@@ -5764,8 +5789,8 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
         };
         let month = {
             let fv = getm(i, &f, "month")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let n = to_int(i, &fv)?;
@@ -5778,15 +5803,15 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
         };
         let month_code = {
             let fv = getm(i, &f, "monthCode")?;
-            match &fv {
-                Value::Undefined => None,
+            match &(fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let prim = i
                         .to_primitive(&fv, crate::eval::Hint::String)
                         .map_err(unab)?;
-                    let sv = match &prim {
-                        Value::Str(sv) => sv.clone(),
+                    let sv = match &(prim).view() {
+                        ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
                     let b = sv.as_bytes();
@@ -5803,8 +5828,8 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
         };
         let year = {
             let fv = getm(i, &f, "year")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(to_int(i, &fv)?)
@@ -5836,7 +5861,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
                     setm(&snap, "month", Value::Num(m as f64));
                 }
                 if let Some(mc) = &month_code {
-                    setm(&snap, "monthCode", Value::Str(mc.clone()));
+                    setm(&snap, "monthCode", Value::Str(*mc));
                 }
             }
         }
@@ -5858,7 +5883,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
                     if year.is_none() {
                         setm(&snap, "year", Value::Num(1972.0));
                     }
-                    let raw = read_date_raw_cal(i, &Value::Obj(snap.clone()), &cal, ovf)?;
+                    let raw = read_date_raw_cal(i, &Value::Obj(snap), &cal, ovf)?;
                     raw.1
                 }
             };
@@ -5887,7 +5912,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "toPlainDate", 1, |i, t, a| {
         let md = as_monthday(i, &t)?;
         let f = arg(a, 0);
-        if !matches!(f, Value::Obj(_)) {
+        if !matches!((f).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "toPlainDate() argument must be an object"));
         }
         let cal = cal_of(i, &t);
@@ -5895,13 +5920,13 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
         // (or era pair) is required to complete a date from a month-day.
         let (era, era_year) = if cal_uses_era(&cal) {
             let ev = getm(i, &f, "era")?;
-            let era = match ev {
-                Value::Undefined => None,
+            let era = match (ev).view() {
+                ValueView::Undefined => None,
                 _ => Some(i.to_string(&ev).map_err(unab)?.to_lowercase()),
             };
             let eyv = getm(i, &f, "eraYear")?;
-            let ey = match eyv {
-                Value::Undefined => None,
+            let ey = match (eyv).view() {
+                ValueView::Undefined => None,
                 _ => Some(to_int(i, &eyv)?),
             };
             (era, ey)
@@ -5909,11 +5934,11 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
             (None, None)
         };
         let yv = getm(i, &f, "year")?;
-        if matches!(yv, Value::Undefined) && (era.is_none() || era_year.is_none()) {
+        if matches!((yv).view(), ValueView::Undefined) && (era.is_none() || era_year.is_none()) {
             return Err(i.make_error("TypeError", "toPlainDate() requires a year"));
         }
-        let year = match yv {
-            Value::Undefined => None,
+        let year = match (yv).view() {
+            ValueView::Undefined => None,
             _ => Some(to_int(i, &yv)?),
         };
         let d = if &*cal == "iso8601" {
@@ -6138,14 +6163,14 @@ fn cal_month_day_reference(
     // A wildly out-of-range year can never produce a representable month-day; bail before any
     // (potentially expensive) calendar computation.
     {
-        let yv = getm(i, &Value::Obj(snap.clone()), "year")?;
-        if let Value::Num(y) = yv {
+        let yv = getm(i, &Value::Obj(*snap), "year")?;
+        if let ValueView::Num(y) = (yv).view() {
             if !(-300_000.0..=300_000.0).contains(&y) {
                 return Err(i.make_error("RangeError", "date is outside the supported range"));
             }
         }
-        let eyv = getm(i, &Value::Obj(snap.clone()), "eraYear")?;
-        if let Value::Num(ey) = eyv {
+        let eyv = getm(i, &Value::Obj(*snap), "eraYear")?;
+        if let ValueView::Num(ey) = (eyv).view() {
             if !(-600_000.0..=600_000.0).contains(&ey) {
                 return Err(i.make_error("RangeError", "date is outside the supported range"));
             }
@@ -6154,8 +6179,8 @@ fn cal_month_day_reference(
     // A bare ordinal `month` (no monthCode) can't be interpreted without a year in a non-ISO calendar,
     // so a year is required (a TypeError raised before any month/monthCode-conflict RangeError).
     let has_month = !matches!(
-        getm(i, &Value::Obj(snap.clone()), "month")?,
-        Value::Undefined
+        (getm(i, &Value::Obj(*snap), "month")?).view(),
+        ValueView::Undefined
     );
     if has_month && !has_year {
         return Err(i.make_error(
@@ -6173,8 +6198,8 @@ fn cal_month_day_reference(
     let resolve = |i: &mut Interp, cy: i64| -> Result<IsoDate, Value> {
         let merged = i.new_object();
         for k in ["day", "month", "monthCode"] {
-            let fv = getm(i, &Value::Obj(snap.clone()), k)?;
-            if !matches!(fv, Value::Undefined) {
+            let fv = getm(i, &Value::Obj(*snap), k)?;
+            if !matches!((fv).view(), ValueView::Undefined) {
                 setm(&merged, k, fv);
             }
         }
@@ -6187,8 +6212,8 @@ fn cal_month_day_reference(
     let anchor = if has_year {
         let merged = i.new_object();
         for k in ["day", "era", "eraYear", "month", "monthCode", "year"] {
-            let fv = getm(i, &Value::Obj(snap.clone()), k)?;
-            if !matches!(fv, Value::Undefined) {
+            let fv = getm(i, &Value::Obj(*snap), k)?;
+            if !matches!((fv).view(), ValueView::Undefined) {
                 setm(&merged, k, fv);
             }
         }
@@ -6208,13 +6233,25 @@ fn cal_month_day_reference(
         // The year applied its own overflow to the anchor; use its resolved code and day.
         (cal_month_code(cal, anchor), cal_fields(cal, anchor).2)
     } else {
-        let w = match getm(i, &Value::Obj(snap.clone()), "monthCode")? {
-            Value::Undefined => cal_month_code(cal, anchor),
-            mc => i.to_string(&mc).map_err(unab)?.to_string(),
+        let w = {
+            let __value_match_original = getm(i, &Value::Obj(*snap), "monthCode")?;
+            match (__value_match_original).view() {
+                ValueView::Undefined => cal_month_code(cal, anchor),
+                _ => {
+                    let mc = __value_match_original;
+                    i.to_string(&mc).map_err(unab)?.to_string()
+                }
+            }
         };
-        let wd = match getm(i, &Value::Obj(snap.clone()), "day")? {
-            Value::Undefined => 0,
-            dv => to_int(i, &dv)?,
+        let wd = {
+            let __value_match_original = getm(i, &Value::Obj(*snap), "day")?;
+            match (__value_match_original).view() {
+                ValueView::Undefined => 0,
+                _ => {
+                    let dv = __value_match_original;
+                    to_int(i, &dv)?
+                }
+            }
         };
         (w, wd)
     };
@@ -6293,8 +6330,8 @@ fn to_monthday_cal(
         to_overflow(i, opts)?;
         return Ok((d, cal_of(i, v)));
     }
-    match v {
-        Value::Str(s) => {
+    match &(v).view() {
+        ValueView::Str(s) => {
             let md = parse_month_day(s)
                 .ok_or_else(|| i.make_error("RangeError", "invalid month-day"))?;
             let cal: std::rc::Rc<str> = std::rc::Rc::from(
@@ -6324,13 +6361,13 @@ fn to_monthday_cal(
             }
             Ok((md, cal))
         }
-        Value::Obj(_) => {
+        ValueView::Obj(_) => {
             let cal: std::rc::Rc<str> = {
                 let c = getm(i, v, "calendar")?;
-                match &c {
-                    Value::Undefined => std::rc::Rc::from("iso8601"),
-                    Value::Str(_) => check_calendar(i, &c)?,
-                    Value::Obj(_)
+                match &(c).view() {
+                    ValueView::Undefined => std::rc::Rc::from("iso8601"),
+                    ValueView::Str(_) => check_calendar(i, &c)?,
+                    ValueView::Obj(_)
                         if matches!(
                             get(i, &c),
                             Some(
@@ -6356,7 +6393,7 @@ fn to_monthday_cal(
             let mut has_month_code = false;
             {
                 let fv = getm(i, v, "day")?;
-                if !matches!(fv, Value::Undefined) {
+                if !matches!((fv).view(), ValueView::Undefined) {
                     has_day = true;
                     let n = to_int(i, &fv)?;
                     if n < 1 {
@@ -6367,13 +6404,13 @@ fn to_monthday_cal(
             }
             if uses_era {
                 let ev = getm(i, v, "era")?;
-                if !matches!(ev, Value::Undefined) {
+                if !matches!((ev).view(), ValueView::Undefined) {
                     has_year = true;
                     let e2 = i.to_string(&ev).map_err(unab)?.to_lowercase();
                     setm(&snap, "era", Value::lstr(e2.as_str()));
                 }
                 let eyv = getm(i, v, "eraYear")?;
-                if !matches!(eyv, Value::Undefined) {
+                if !matches!((eyv).view(), ValueView::Undefined) {
                     has_year = true;
                     let ey = to_int(i, &eyv)?;
                     setm(&snap, "eraYear", Value::Num(ey as f64));
@@ -6381,7 +6418,7 @@ fn to_monthday_cal(
             }
             {
                 let fv = getm(i, v, "month")?;
-                if !matches!(fv, Value::Undefined) {
+                if !matches!((fv).view(), ValueView::Undefined) {
                     has_month = true;
                     let n = to_int(i, &fv)?;
                     if n < 1 {
@@ -6392,13 +6429,13 @@ fn to_monthday_cal(
             }
             {
                 let fv = getm(i, v, "monthCode")?;
-                if !matches!(fv, Value::Undefined) {
+                if !matches!((fv).view(), ValueView::Undefined) {
                     has_month_code = true;
                     let prim = i
                         .to_primitive(&fv, crate::eval::Hint::String)
                         .map_err(unab)?;
-                    let sv = match &prim {
-                        Value::Str(sv) => sv.clone(),
+                    let sv = match &(prim).view() {
+                        ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
                     let b = sv.as_bytes();
@@ -6414,7 +6451,7 @@ fn to_monthday_cal(
             }
             {
                 let fv = getm(i, v, "year")?;
-                if !matches!(fv, Value::Undefined) {
+                if !matches!((fv).view(), ValueView::Undefined) {
                     has_year = true;
                     let n = to_int(i, &fv)?;
                     setm(&snap, "year", Value::Num(n as f64));
@@ -6434,7 +6471,7 @@ fn to_monthday_cal(
                 if !has_year {
                     setm(&snap, "year", Value::Num(1972.0));
                 }
-                let raw = read_date_raw_cal(i, &Value::Obj(snap.clone()), &cal, ovf)?;
+                let raw = read_date_raw_cal(i, &Value::Obj(snap), &cal, ovf)?;
                 let year = if has_year { raw.0 } else { 1972 };
                 let month = regulate_high(i, raw.1, 12, ovf, "month")? as u8;
                 let day =
@@ -6584,11 +6621,11 @@ fn total_time_f64(time: i128, unit: &str) -> f64 {
 
 /// GetRoundingIncrementOption: 1..=10^9, truncated, RangeError outside.
 fn read_rounding_increment(i: &mut Interp, opts: &Value) -> Result<i64, Value> {
-    let v = match opts {
-        Value::Obj(_) => getm(i, opts, "roundingIncrement")?,
+    let v = match &(opts).view() {
+        ValueView::Obj(_) => getm(i, opts, "roundingIncrement")?,
         _ => Value::Undefined,
     };
-    if matches!(v, Value::Undefined) {
+    if matches!((v).view(), ValueView::Undefined) {
         return Ok(1);
     }
     let n = i.to_number(&v).map_err(unab)?;
@@ -6600,8 +6637,8 @@ fn read_rounding_increment(i: &mut Interp, opts: &Value) -> Result<i64, Value> {
 
 /// GetOptionsObject: undefined or an object, else TypeError.
 fn get_opts_obj(i: &Interp, v: &Value) -> Result<Value, Value> {
-    match v {
-        Value::Undefined | Value::Obj(_) => Ok(v.clone()),
+    match &(v).view() {
+        ValueView::Undefined | ValueView::Obj(_) => Ok(*v),
         _ => Err(i.make_error("TypeError", "options must be an object or undefined")),
     }
 }
@@ -6694,9 +6731,9 @@ fn parse_offset_option(i: &Interp, s: &str) -> Result<i64, Value> {
 
 /// ToTemporalTimeZoneIdentifier for a relativeTo bag's `timeZone` field.
 fn tz_from_field(i: &mut Interp, tzv: &Value) -> Result<std::rc::Rc<str>, Value> {
-    match tzv {
-        Value::Str(s) => tz_ident_of_string(i, s),
-        Value::Obj(_) => match get(i, tzv) {
+    match &(tzv).view() {
+        ValueView::Str(s) => tz_ident_of_string(i, s),
+        ValueView::Obj(_) => match get(i, tzv) {
             Some(Temporal::Zoned { tz, .. }) => Ok(tz),
             _ => Err(i.make_error("TypeError", "timeZone must be a string or ZonedDateTime")),
         },
@@ -6740,7 +6777,7 @@ fn tz_ident_of_string(i: &Interp, s: &str) -> Result<std::rc::Rc<str>, Value> {
 
 /// GetTemporalRelativeToOption: read and resolve `options.relativeTo`.
 fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Value> {
-    if !matches!(opts, Value::Obj(_)) {
+    if !matches!(&(opts).view(), ValueView::Obj(_)) {
         return Ok(None);
     }
     let v = getm(i, opts, "relativeTo")?;
@@ -6760,38 +6797,38 @@ fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Valu
         }
         _ => {}
     }
-    match &v {
-        Value::Undefined => Ok(None),
-        Value::Obj(_) => {
+    match &(v).view() {
+        ValueView::Undefined => Ok(None),
+        ValueView::Obj(_) => {
             // Property bag: calendar first, then every field in alphabetical order (day, hour,
             // microsecond, millisecond, minute, month, monthCode, nanosecond, offset, second,
             // timeZone, year), then interpretation with `constrain` overflow.
             let cal: std::rc::Rc<str> = {
                 let c = getm(i, &v, "calendar")?;
-                match &c {
-                    Value::Undefined => std::rc::Rc::from("iso8601"),
-                    Value::Str(_) => check_calendar(i, &c)?,
-                    Value::Obj(_) if get(i, &c).is_some() => cal_of(i, &c),
+                match &(c).view() {
+                    ValueView::Undefined => std::rc::Rc::from("iso8601"),
+                    ValueView::Str(_) => check_calendar(i, &c)?,
+                    ValueView::Obj(_) if get(i, &c).is_some() => cal_of(i, &c),
                     _ => return Err(i.make_error("TypeError", "calendar is not a string")),
                 }
             };
             let uses_era = cal_uses_era(&cal);
             let day = {
                 let f = getm(i, &v, "day")?;
-                match f {
-                    Value::Undefined => None,
+                match (f).view() {
+                    ValueView::Undefined => None,
                     _ => Some(to_int(i, &f)?),
                 }
             };
             let (era, era_year) = if uses_era {
                 let e = getm(i, &v, "era")?;
-                let e = match e {
-                    Value::Undefined => None,
+                let e = match (e).view() {
+                    ValueView::Undefined => None,
                     _ => Some(i.to_string(&e).map_err(unab)?.to_lowercase()),
                 };
                 let ey = getm(i, &v, "eraYear")?;
-                let ey = match ey {
-                    Value::Undefined => None,
+                let ey = match (ey).view() {
+                    ValueView::Undefined => None,
                     _ => Some(to_int(i, &ey)?),
                 };
                 (e, ey)
@@ -6804,48 +6841,48 @@ fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Valu
             let minute = field_int(i, &v, "minute", 0)?;
             let month = {
                 let f = getm(i, &v, "month")?;
-                match f {
-                    Value::Undefined => Value::Undefined,
+                match (f).view() {
+                    ValueView::Undefined => Value::Undefined,
                     _ => Value::Num(to_int(i, &f)? as f64),
                 }
             };
             let month_code = {
                 let f = getm(i, &v, "monthCode")?;
-                match f {
-                    Value::Undefined => Value::Undefined,
+                match (f).view() {
+                    ValueView::Undefined => Value::Undefined,
                     _ => Value::lstr(i.to_string(&f).map_err(unab)?.to_string()),
                 }
             };
             let ns_f = field_int(i, &v, "nanosecond", 0)?;
             let offset_v = getm(i, &v, "offset")?;
-            let offset_ns = match &offset_v {
-                Value::Undefined => None,
-                Value::Str(sv) => Some(parse_offset_option(i, sv)?),
+            let offset_ns = match &(offset_v).view() {
+                ValueView::Undefined => None,
+                ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
                 _ => {
                     let prim = i
                         .to_primitive(&offset_v, crate::eval::Hint::String)
                         .map_err(unab)?;
-                    match &prim {
-                        Value::Str(sv) => Some(parse_offset_option(i, sv)?),
+                    match &(prim).view() {
+                        ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
                         _ => return Err(i.make_error("TypeError", "offset must be a string")),
                     }
                 }
             };
             let second = field_int(i, &v, "second", 0)?;
             let tzv = getm(i, &v, "timeZone")?;
-            let tz = match &tzv {
-                Value::Undefined => None,
+            let tz = match &(tzv).view() {
+                ValueView::Undefined => None,
                 _ => Some(tz_from_field(i, &tzv)?),
             };
             let year = {
                 let f = getm(i, &v, "year")?;
-                match f {
-                    Value::Undefined => None,
+                match (f).view() {
+                    ValueView::Undefined => None,
                     _ => Some(to_int(i, &f)?),
                 }
             };
             // Re-resolve the date through the calendar machinery using already-read plain values.
-            let bag = Object::new(Some(i.object_proto.clone()));
+            let bag = Object::new(Some(i.object_proto));
             {
                 let mut b = bag.borrow_mut();
                 if let Some(y) = year {
@@ -6856,12 +6893,11 @@ fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Valu
                     b.props
                         .insert("day", Property::builtin(Value::Num(d as f64)));
                 }
-                if !matches!(month, Value::Undefined) {
-                    b.props.insert("month", Property::builtin(month.clone()));
+                if !matches!((month).view(), ValueView::Undefined) {
+                    b.props.insert("month", Property::builtin(month));
                 }
-                if !matches!(month_code, Value::Undefined) {
-                    b.props
-                        .insert("monthCode", Property::builtin(month_code.clone()));
+                if !matches!((month_code).view(), ValueView::Undefined) {
+                    b.props.insert("monthCode", Property::builtin(month_code));
                 }
                 if let Some(e) = &era {
                     b.props
@@ -6924,7 +6960,7 @@ fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Valu
                 }
             }
         }
-        Value::Str(sv) => {
+        ValueView::Str(sv) => {
             let p = parse_iso(sv)
                 .ok_or_else(|| i.make_error("RangeError", "invalid relativeTo string"))?;
             let date = p
@@ -7743,8 +7779,8 @@ fn diff_zdt_total(
 }
 
 fn install_duration(it: &mut Interp, ns: &Gc) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Temporal.Duration", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.Duration", proto);
     def_getter(it, &proto, "years", |i, t, _| {
         Ok(Value::Num(as_duration(i, &t)?.years))
     });
@@ -7853,14 +7889,14 @@ fn install_duration(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "with", 1, |i, t, a| {
         let d = as_duration(i, &t)?;
         let f = arg(a, 0);
-        if !matches!(f, Value::Obj(_)) {
+        if !matches!((f).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "with() argument must be an object"));
         }
         // ToTemporalPartialDurationRecord: read alphabetically; at least one field must be present.
         let mut any = false;
         let mut read = |i: &mut Interp, key: &str, cur: f64| -> Result<f64, Value> {
             let fv = getm(i, &f, key)?;
-            if matches!(fv, Value::Undefined) {
+            if matches!((fv).view(), ValueView::Undefined) {
                 Ok(cur)
             } else {
                 any = true;
@@ -7916,10 +7952,10 @@ fn install_duration(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "round", 1, |i, t, a| {
         let d = as_duration(i, &t)?;
         let arg0 = arg(a, 0);
-        if matches!(arg0, Value::Undefined) {
+        if matches!((arg0).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "round() requires an options argument"));
         }
-        if !matches!(arg0, Value::Obj(_) | Value::Str(_)) {
+        if !matches!((arg0).view(), ValueView::Obj(_) | ValueView::Str(_)) {
             return Err(i.make_error("TypeError", "options must be an object or a string"));
         }
         let (o, shorthand) = round_opts(&arg0);
@@ -8034,10 +8070,10 @@ fn install_duration(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "total", 1, |i, t, a| {
         let d = as_duration(i, &t)?;
         let arg0 = arg(a, 0);
-        if matches!(arg0, Value::Undefined) {
+        if matches!((arg0).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "total() requires an options argument"));
         }
-        if !matches!(arg0, Value::Obj(_) | Value::Str(_)) {
+        if !matches!((arg0).view(), ValueView::Obj(_) | ValueView::Str(_)) {
             return Err(i.make_error("TypeError", "options must be an object or a string"));
         }
         let (o, shorthand) = round_opts(&arg0);
@@ -8335,20 +8371,20 @@ fn to_duration(i: &mut Interp, v: &Value) -> Result<IsoDuration, Value> {
     if let Some(Temporal::Duration(d)) = get(i, v) {
         return Ok(d);
     }
-    match v {
-        Value::Str(s) => {
+    match &(v).view() {
+        ValueView::Str(s) => {
             let d = parse_duration_str(s)
                 .ok_or_else(|| i.make_error("RangeError", "invalid duration"))?;
             validate_duration(i, d)?;
             Ok(d)
         }
-        Value::Obj(_) => {
+        ValueView::Obj(_) => {
             // ToTemporalPartialDurationRecord: read the fields in alphabetical order; at least one
             // recognized field must be present (an empty object / array / singular-name is a TypeError).
             let mut any = false;
             let mut read = |i: &mut Interp, key: &str| -> Result<f64, Value> {
                 let fv = getm(i, v, key)?;
-                if matches!(fv, Value::Undefined) {
+                if matches!((fv).view(), ValueView::Undefined) {
                     Ok(0.0)
                 } else {
                     any = true;
@@ -8531,8 +8567,8 @@ fn parse_duration_str(s: &str) -> Option<IsoDuration> {
 // ===== Instant ================================================================================
 
 fn install_instant(it: &mut Interp, ns: &Gc) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Temporal.Instant", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.Instant", proto);
     def_getter(it, &proto, "epochMilliseconds", |i, t, _| {
         Ok(Value::Num(
             (as_instant(i, &t)?.div_euclid(1_000_000)) as f64,
@@ -8554,12 +8590,12 @@ fn install_instant(it: &mut Interp, ns: &Gc) {
         if !smallest.is_empty() && unit_rank(su).is_none() {
             return Err(i.make_error("RangeError", "invalid smallestUnit"));
         }
-        let tzv = match &opts {
-            Value::Obj(_) => getm(i, &opts, "timeZone")?,
+        let tzv = match &(opts).view() {
+            ValueView::Obj(_) => getm(i, &opts, "timeZone")?,
             _ => Value::Undefined,
         };
-        let tz = match &tzv {
-            Value::Undefined => None,
+        let tz = match &(tzv).view() {
+            ValueView::Undefined => None,
             _ => Some(tz_from_field(i, &tzv)?),
         };
         if !smallest.is_empty()
@@ -8673,7 +8709,7 @@ fn install_instant(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "round", 1, |i, t, a| {
         let x = as_instant(i, &t)?;
         let arg0 = arg(a, 0);
-        if !matches!(arg0, Value::Obj(_) | Value::Str(_)) {
+        if !matches!((arg0).view(), ValueView::Obj(_) | ValueView::Str(_)) {
             return Err(i.make_error("TypeError", "options must be an object or a string"));
         }
         let (o, shorthand) = round_opts(&arg0);
@@ -8758,12 +8794,18 @@ fn to_instant(i: &mut Interp, v: &Value) -> Result<i128, Value> {
     }
     // ToTemporalInstant: a non-Temporal value is coerced to a string (ToPrimitive, string hint) and
     // parsed as an ISO instant.
-    let prim = match v {
-        Value::Obj(_) => i.to_primitive(v, crate::eval::Hint::String).map_err(unab)?,
-        other => other.clone(),
+    let prim = {
+        let __value_match_original = v;
+        match &(__value_match_original).view() {
+            ValueView::Obj(_) => i.to_primitive(v, crate::eval::Hint::String).map_err(unab)?,
+            _ => {
+                let other = __value_match_original;
+                *other
+            }
+        }
     };
-    match &prim {
-        Value::Str(sv) => {
+    match &(prim).view() {
+        ValueView::Str(sv) => {
             parse_instant(sv).ok_or_else(|| i.make_error("RangeError", "invalid Instant string"))
         }
         _ => Err(i.make_error("TypeError", "cannot convert to Temporal.Instant")),
@@ -8772,12 +8814,12 @@ fn to_instant(i: &mut Interp, v: &Value) -> Result<i128, Value> {
 /// ToBigInt for an epoch-nanosecond argument: BigInt/boolean/numeric-string only; number, null,
 /// undefined, symbol, and object are a TypeError.
 fn to_epoch_bigint(i: &mut Interp, v: &Value) -> Result<i128, Value> {
-    match v {
-        Value::BigInt(n) => n
+    match &(v).view() {
+        ValueView::BigInt(n) => n
             .to_i128()
             .ok_or_else(|| i.make_error("RangeError", "epochNanoseconds out of range")),
-        Value::Bool(b) => Ok(*b as i128),
-        Value::Str(s) => s
+        ValueView::Bool(b) => Ok(*b as i128),
+        ValueView::Str(s) => s
             .trim()
             .parse::<i128>()
             .map_err(|_| i.make_error("SyntaxError", "cannot convert string to a BigInt")),
@@ -9093,10 +9135,10 @@ fn read_dt_bag(
 ) -> Result<DtBag, Value> {
     let cal: std::rc::Rc<str> = {
         let c = getm(i, v, "calendar")?;
-        match &c {
-            Value::Undefined => std::rc::Rc::from("iso8601"),
-            Value::Str(_) => check_calendar(i, &c)?,
-            Value::Obj(_)
+        match &(c).view() {
+            ValueView::Undefined => std::rc::Rc::from("iso8601"),
+            ValueView::Str(_) => check_calendar(i, &c)?,
+            ValueView::Obj(_)
                 if matches!(
                     get(i, &c),
                     Some(
@@ -9116,8 +9158,8 @@ fn read_dt_bag(
     let uses_era = cal_uses_era(&cal);
     let read_int = |i: &mut Interp, key: &str| -> Result<Option<i64>, Value> {
         let f = getm(i, v, key)?;
-        match f {
-            Value::Undefined => Ok(None),
+        match (f).view() {
+            ValueView::Undefined => Ok(None),
             _ => Ok(Some(to_int(i, &f)?)),
         }
     };
@@ -9131,8 +9173,8 @@ fn read_dt_bag(
     };
     let (era, era_year) = if uses_era {
         let e = getm(i, v, "era")?;
-        let e = match e {
-            Value::Undefined => None,
+        let e = match (e).view() {
+            ValueView::Undefined => None,
             _ => Some(i.to_string(&e).map_err(unab)?.to_lowercase()),
         };
         let ey = read_int(i, "eraYear")?;
@@ -9149,8 +9191,8 @@ fn read_dt_bag(
     }
     let month = {
         let f = getm(i, v, "month")?;
-        match f {
-            Value::Undefined => None,
+        match (f).view() {
+            ValueView::Undefined => None,
             _ => {
                 let n = to_int(i, &f)?;
                 if n < 1 {
@@ -9162,16 +9204,16 @@ fn read_dt_bag(
     };
     let month_code = {
         let f = getm(i, v, "monthCode")?;
-        match &f {
-            Value::Undefined => None,
+        match &(f).view() {
+            ValueView::Undefined => None,
             _ => {
                 // ToPrimitive, then the value must be a string with well-formed `Mnn[L]` syntax
                 // (the value's suitability for the calendar is checked later, after requiredness).
                 let prim = i
                     .to_primitive(&f, crate::eval::Hint::String)
                     .map_err(unab)?;
-                let sv = match &prim {
-                    Value::Str(sv) => sv.clone(),
+                let sv = match &(prim).view() {
+                    ValueView::Str(sv) => *sv,
                     _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                 };
                 let b = sv.as_bytes();
@@ -9191,15 +9233,15 @@ fn read_dt_bag(
     }
     let offset_ns = if want_offset_tz {
         let offset_v = getm(i, v, "offset")?;
-        match &offset_v {
-            Value::Undefined => None,
-            Value::Str(sv) => Some(parse_offset_option(i, sv)?),
+        match &(offset_v).view() {
+            ValueView::Undefined => None,
+            ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
             _ => {
                 let prim = i
                     .to_primitive(&offset_v, crate::eval::Hint::String)
                     .map_err(unab)?;
-                match &prim {
-                    Value::Str(sv) => Some(parse_offset_option(i, sv)?),
+                match &(prim).view() {
+                    ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
                     _ => return Err(i.make_error("TypeError", "offset must be a string")),
                 }
             }
@@ -9212,8 +9254,8 @@ fn read_dt_bag(
     }
     let tz = if want_offset_tz {
         let tzv = getm(i, v, "timeZone")?;
-        match &tzv {
-            Value::Undefined => None,
+        match &(tzv).view() {
+            ValueView::Undefined => None,
             _ => Some(tz_from_field(i, &tzv)?),
         }
     } else {
@@ -9221,7 +9263,7 @@ fn read_dt_bag(
     };
     let year = read_int(i, "year")?;
 
-    let bag = Object::new(Some(i.object_proto.clone()));
+    let bag = Object::new(Some(i.object_proto));
     {
         let mut b = bag.borrow_mut();
         if let Some(y) = year {
@@ -9234,7 +9276,7 @@ fn read_dt_bag(
         }
         if let Some(mc) = &month_code {
             b.props
-                .insert("monthCode", Property::builtin(Value::Str(mc.clone())));
+                .insert("monthCode", Property::builtin(Value::Str(*mc)));
         }
         if let Some(d) = day {
             b.props
@@ -9378,8 +9420,8 @@ fn to_zoned(i: &mut Interp, v: &Value, opts: &Value) -> Result<ZonedParts, Value
         let cal = cal_of(i, v);
         return Ok((epoch_ns, offset_ns, tz, cal));
     }
-    match v {
-        Value::Str(s) => {
+    match &(v).view() {
+        ValueView::Str(s) => {
             let p =
                 parse_iso(s).ok_or_else(|| i.make_error("RangeError", "invalid ZonedDateTime"))?;
             if !cal_ok(&p.calendar) {
@@ -9424,7 +9466,7 @@ fn to_zoned(i: &mut Interp, v: &Value, opts: &Value) -> Result<ZonedParts, Value
             )?;
             Ok((epoch, (local - epoch) as i64, tz, cal))
         }
-        Value::Obj(_) => {
+        ValueView::Obj(_) => {
             let bag = read_dt_bag(i, v, true, true, true)?;
             let tz = bag
                 .tz
@@ -9432,8 +9474,8 @@ fn to_zoned(i: &mut Interp, v: &Value, opts: &Value) -> Result<ZonedParts, Value
             // Required fields (TypeError) are checked after every field has been read but before
             // any value validation.
             {
-                let b = match &bag.date_bag {
-                    Value::Obj(o) => o.clone(),
+                let b = match &(bag.date_bag).view() {
+                    ValueView::Obj(o) => *o,
                     _ => unreachable!(),
                 };
                 let has = |k: &str| b.borrow().props.get(k).is_some();
@@ -9749,8 +9791,8 @@ fn zdt_until_since(i: &mut Interp, t: &Value, a: &[Value], dir: i64) -> Result<V
 }
 
 fn install_zoned(it: &mut Interp, ns: &Gc) {
-    let proto = Object::new(Some(it.object_proto.clone()));
-    Rc::make_mut(&mut it.extra_protos).insert("Temporal.ZonedDateTime", proto.clone());
+    let proto = Object::new(Some(it.object_proto));
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.ZonedDateTime", proto);
 
     macro_rules! date_get {
         ($name:literal, $f:expr) => {
@@ -10091,7 +10133,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         let (d, tm) = zoned_local(e, o);
         let cal = cal_of(i, &t);
         let f = arg(a, 0);
-        if !matches!(f, Value::Obj(_)) {
+        if !matches!((f).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "with() argument must be an object"));
         }
         // RejectObjectWithCalendarOrTimeZone: a Temporal object, or any object carrying a
@@ -10099,10 +10141,10 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         if get(i, &f).is_some() {
             return Err(i.make_error("TypeError", "with() argument must be a plain object"));
         }
-        if !matches!(getm(i, &f, "calendar")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "calendar")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'calendar'"));
         }
-        if !matches!(getm(i, &f, "timeZone")?, Value::Undefined) {
+        if !matches!((getm(i, &f, "timeZone")?).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "with() argument must not have 'timeZone'"));
         }
         // Read the partial fields in alphabetical order, coerced as read.
@@ -10110,8 +10152,8 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         let mut any = false;
         let read_int = |i: &mut Interp, key: &str, any: &mut bool| -> Result<Option<i64>, Value> {
             let fv = getm(i, &f, key)?;
-            match fv {
-                Value::Undefined => Ok(None),
+            match (fv).view() {
+                ValueView::Undefined => Ok(None),
                 _ => {
                     *any = true;
                     Ok(Some(to_int(i, &fv)?))
@@ -10126,8 +10168,8 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         };
         let (era, era_year) = if uses_era {
             let ev = getm(i, &f, "era")?;
-            let era = match ev {
-                Value::Undefined => None,
+            let era = match (ev).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
@@ -10144,8 +10186,8 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         let minute = read_int(i, "minute", &mut any)?;
         let month = {
             let fv = getm(i, &f, "month")?;
-            match fv {
-                Value::Undefined => None,
+            match (fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let n = to_int(i, &fv)?;
@@ -10158,15 +10200,15 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         };
         let month_code = {
             let fv = getm(i, &f, "monthCode")?;
-            match &fv {
-                Value::Undefined => None,
+            match &(fv).view() {
+                ValueView::Undefined => None,
                 _ => {
                     any = true;
                     let prim = i
                         .to_primitive(&fv, crate::eval::Hint::String)
                         .map_err(unab)?;
-                    let sv = match &prim {
-                        Value::Str(sv) => sv.clone(),
+                    let sv = match &(prim).view() {
+                        ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
                     let b = sv.as_bytes();
@@ -10183,9 +10225,9 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         };
         let ns_f = read_int(i, "nanosecond", &mut any)?;
         let offv = getm(i, &f, "offset")?;
-        let off_field = match &offv {
-            Value::Undefined => None,
-            Value::Str(sv) => {
+        let off_field = match &(offv).view() {
+            ValueView::Undefined => None,
+            ValueView::Str(sv) => {
                 any = true;
                 Some(parse_offset_option(i, sv)?)
             }
@@ -10194,8 +10236,8 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
                 let prim = i
                     .to_primitive(&offv, crate::eval::Hint::String)
                     .map_err(unab)?;
-                match &prim {
-                    Value::Str(sv) => Some(parse_offset_option(i, sv)?),
+                match &(prim).view() {
+                    ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
                     _ => return Err(i.make_error("TypeError", "offset must be a string")),
                 }
             }
@@ -10231,7 +10273,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         let ovf = to_overflow(i, &opts)?;
         // Merge with the receiver's calendar fields: a provided month or monthCode replaces both.
         let cf = cal_fields(&cal, d);
-        let bag = Object::new(Some(i.object_proto.clone()));
+        let bag = Object::new(Some(i.object_proto));
         {
             let mut b = bag.borrow_mut();
             match year {
@@ -10270,7 +10312,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
                     }
                     if let Some(mc) = &month_code {
                         b.props
-                            .insert("monthCode", Property::builtin(Value::Str(mc.clone())));
+                            .insert("monthCode", Property::builtin(Value::Str(*mc)));
                     }
                 }
             }
@@ -10331,11 +10373,11 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "withCalendar", 1, |i, t, a| {
         let (e, o, tz) = as_zoned(i, &t)?;
         let cv = arg(a, 0);
-        let cal = match &cv {
-            Value::Undefined => {
+        let cal = match &(cv).view() {
+            ValueView::Undefined => {
                 return Err(i.make_error("TypeError", "calendar argument is required"))
             }
-            Value::Obj(_) => match get(i, &cv) {
+            ValueView::Obj(_) => match get(i, &cv) {
                 Some(
                     Temporal::Date(_)
                     | Temporal::DateTime(_, _)
@@ -10361,18 +10403,18 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
     });
     it.def_method(&proto, "getTimeZoneTransition", 1, |i, t, a| {
         let (e, _, tz) = as_zoned(i, &t)?;
-        let dir = match arg(a, 0) {
-            Value::Str(s) => s.to_string(),
-            Value::Obj(o_) => {
+        let dir = match (arg(a, 0)).view() {
+            ValueView::Str(s) => s.to_string(),
+            ValueView::Obj(o_) => {
                 let dv = getm(i, &Value::Obj(o_), "direction")?;
-                match dv {
-                    Value::Undefined => {
+                match (dv).view() {
+                    ValueView::Undefined => {
                         return Err(i.make_error("RangeError", "direction is required"))
                     }
                     _ => i.to_string(&dv).map_err(unab)?.to_string(),
                 }
             }
-            Value::Undefined => return Err(i.make_error("TypeError", "direction is required")),
+            ValueView::Undefined => return Err(i.make_error("TypeError", "direction is required")),
             _ => {
                 return Err(i.make_error(
                     "TypeError",
@@ -10425,17 +10467,24 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "withPlainTime", 0, |i, t, a| {
         let (e, o, tz) = as_zoned(i, &t)?;
         let (d, _) = zoned_local(e, o);
-        let epoch = match arg(a, 0) {
-            Value::Undefined => start_of_day_ns(i, &tz, d)?,
-            v => {
-                let nt = to_time(i, &v, &Value::Undefined)?;
-                let local = dt_ns(d, nt);
-                if !iso_datetime_within_limits(d, nt) {
-                    return Err(
-                        i.make_error("RangeError", "date-time is outside the representable range")
-                    );
+        let epoch = {
+            let __value_match_original = arg(a, 0);
+            match (__value_match_original).view() {
+                ValueView::Undefined => start_of_day_ns(i, &tz, d)?,
+                _ => {
+                    let v = __value_match_original;
+                    {
+                        let nt = to_time(i, &v, &Value::Undefined)?;
+                        let local = dt_ns(d, nt);
+                        if !iso_datetime_within_limits(d, nt) {
+                            return Err(i.make_error(
+                                "RangeError",
+                                "date-time is outside the representable range",
+                            ));
+                        }
+                        check_instant(i, local_to_epoch(i, &tz, local, "compatible")?)?
+                    }
                 }
-                check_instant(i, local_to_epoch(i, &tz, local, "compatible")?)?
             }
         };
         let off = zone_offset(&tz, epoch);
@@ -10455,10 +10504,10 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "round", 1, |i, t, a| {
         let (e, o, tz) = as_zoned(i, &t)?;
         let arg0 = arg(a, 0);
-        if matches!(arg0, Value::Undefined) {
+        if matches!((arg0).view(), ValueView::Undefined) {
             return Err(i.make_error("TypeError", "round() requires an options argument"));
         }
-        if !matches!(arg0, Value::Obj(_) | Value::Str(_)) {
+        if !matches!((arg0).view(), ValueView::Obj(_) | ValueView::Str(_)) {
             return Err(i.make_error("TypeError", "options must be an object or a string"));
         }
         let (opts, shorthand) = round_opts(&arg0);
@@ -10561,8 +10610,8 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         let epoch_ns = check_instant(i, epoch_ns)?;
         let tzv = arg(a, 1);
         // The constructor takes only a bare time-zone identifier (never an ISO string).
-        let tz: Rc<str> = match &tzv {
-            Value::Str(t) => {
+        let tz: Rc<str> = match &(tzv).view() {
+            ValueView::Str(t) => {
                 let t2 = t.trim();
                 if let Some(name) = crate::tz::registry_name(t2) {
                     Rc::from(name)
@@ -10572,13 +10621,13 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
                     return Err(i.make_error("RangeError", "invalid time zone identifier"));
                 }
             }
-            Value::Undefined => return Err(i.make_error("TypeError", "missing timeZone")),
+            ValueView::Undefined => return Err(i.make_error("TypeError", "missing timeZone")),
             _ => return Err(i.make_error("TypeError", "time zone must be a string")),
         };
         // Likewise the calendar: a bare identifier only.
-        let cal: std::rc::Rc<str> = match &arg(a, 2) {
-            Value::Undefined => std::rc::Rc::from("iso8601"),
-            Value::Str(c) => match canon_cal(c) {
+        let cal: std::rc::Rc<str> = match &(arg(a, 2)).view() {
+            ValueView::Undefined => std::rc::Rc::from("iso8601"),
+            ValueView::Str(c) => match canon_cal(c) {
                 Some(canon) => std::rc::Rc::from(canon),
                 None => return Err(i.make_error("RangeError", "invalid calendar identifier")),
             },
@@ -10622,15 +10671,15 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
 // ===== Now ====================================================================================
 
 fn install_now(it: &mut Interp, ns: &Gc) {
-    let now = Object::new(Some(it.object_proto.clone()));
+    let now = Object::new(Some(it.object_proto));
     // The system clock, in epoch nanoseconds (millisecond resolution, like Date.now()).
     fn now_ns(i: &Interp) -> i128 {
         i.wall_now_ms().trunc() as i128 * 1_000_000
     }
     fn now_zone(i: &mut Interp, v: &Value) -> Result<Rc<str>, Value> {
-        match v {
+        match &(v).view() {
             // #sec-temporal-systemdatetime: SystemTimeZoneIdentifier().
-            Value::Undefined => Ok(Rc::from(crate::builtins::system_time_zone())),
+            ValueView::Undefined => Ok(Rc::from(crate::builtins::system_time_zone())),
             _ => tz_from_field(i, v),
         }
     }
