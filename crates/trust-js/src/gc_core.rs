@@ -50,6 +50,8 @@ use std::rc::Rc;
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
 pub(crate) const PAGE_SHIFT: u32 = PAGE_SIZE.trailing_zeros();
 const PAYLOAD_MASK: u64 = 0x0000_ffff_ffff_ffff;
+/// No cell lies in the first page of the address space.
+const MIN_CELL_ADDRESS: usize = 4096;
 /// Cells larger than the last class are large objects.
 const SIZE_CLASSES: [usize; 16] = [
     16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
@@ -84,6 +86,14 @@ const _: () = assert!(CARD_TABLE_BYTES == 512 && CARD_TABLE_OFFSET == 65_024);
 /// instead of the table (see `PageMeta::take_card_cells`).
 pub(crate) const CARD_SUMMARY: usize = PAGE_SIZE - 1;
 const _: () = assert!((CARD_SUMMARY - CARD_TABLE_OFFSET) == CARD_TABLE_BYTES - 1);
+
+/// Whether `word` (a raw pointer or a packed word, its tag masked) can name a cell at all.
+/// Zero and small integers, the most common words in frames and records, cannot: conservative
+/// scans drop them before anything else.
+#[inline(always)]
+pub(crate) fn may_name_cell(word: u64) -> bool {
+    (word & PAYLOAD_MASK) as usize >= MIN_CELL_ADDRESS
+}
 
 /// The write barrier: record that the cell starting at `cell` was written, by setting its card
 /// (a nonzero byte at its page's base + `CARD_TABLE_OFFSET` + its start's offset in the page >>
@@ -2327,10 +2337,10 @@ impl Heap {
     /// page's tail past its last cell or in its card table: the bound on the cell's index
     /// rejects both.
     fn locate(&self, word: u64) -> Option<CellRef> {
-        let addr = (word & PAYLOAD_MASK) as usize;
-        if addr < 4096 {
+        if !may_name_cell(word) {
             return None;
         }
+        let addr = (word & PAYLOAD_MASK) as usize;
         if let Some(index) = self.page_table.get(addr >> PAGE_SHIFT) {
             let page = self.pages[index as usize].as_ref()?;
             let cell = page.cell_index(addr);
@@ -2502,6 +2512,9 @@ impl Heap {
         #[cfg(test)]
         {
             m.word_lookups += 1;
+        }
+        if !may_name_cell(word) {
+            return;
         }
         let addr = (word & PAYLOAD_MASK) as usize;
         let live = match self.page_table.get(addr >> PAGE_SHIFT) {

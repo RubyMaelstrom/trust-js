@@ -382,14 +382,18 @@ pub(crate) fn jit_frames_registered() -> Vec<[usize; 2]> {
 
 /// Report each of the `len` words at `start` as a candidate cell word: a conservative root
 /// range. The heap resolves the words that address an allocated cell (masking a packed word's
-/// tag) and ignores the rest, so a stale or numeric word can only retain.
+/// tag) and ignores the rest, so a stale or numeric word can only retain. Words that can name
+/// no cell (zero, small integers: most of a JIT record's buffer) are not reported.
 ///
 /// # Safety
 /// `start..start + len` is readable, and every word in it has been written.
 pub(crate) unsafe fn scan_words(start: *const u64, len: usize, sink: &mut dyn GcSink) {
     for k in 0..len {
         // SAFETY: the caller's contract.
-        sink.word(unsafe { start.add(k).read() });
+        let word = unsafe { start.add(k).read() };
+        if crate::gc_core::may_name_cell(word) {
+            sink.word(word);
+        }
     }
 }
 
