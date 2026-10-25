@@ -275,15 +275,9 @@ impl NapiConstructorClosure {
         args: &[Value<'s>],
         prototype: &Value<'s>,
     ) -> Result<Value<'s>, Value<'s>> {
-        let instance = {
-            let __value_match_original = this;
-            match (__value_match_original).kind() {
-                ValueKind::Undefined => interp.new_object_with_proto(prototype),
-                _ => {
-                    let other = __value_match_original;
-                    other
-                }
-            }
+        let instance = match this.kind() {
+            ValueKind::Undefined => interp.new_object_with_proto(prototype),
+            _ => this,
         };
         invoke_napi_callback(interp, self.callback, self.data, instance, args)?;
         Ok(instance)
