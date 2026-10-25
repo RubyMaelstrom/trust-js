@@ -109,9 +109,12 @@ comment/example in the same change.
   optimized execution and it is never an acceptance setting.
 - `TRUST_JS_GC_LOG=1` logs collections, each line with its phases' times in microseconds:
   `mark` and `sweep` as the engine drives them, `engine` for what the engine does around the
-  heap's phases (building the marking client, sweeping its tables and weak handles), and the
-  heap's phases (`begin`: cards and marks; `roots`; `stack`; `side`: side-table edges and
-  side-slot owners; `drain`: tracing; `finalize`; `free`), then the cells finalized, by kind
+  heap's phases, the heap's phases (`begin`: cards and marks; `roots`; `stack`; `side`:
+  side-table edges and side-slot owners; `drain`: tracing; `finalize`; `free`), the engine's
+  steps (`scrub`: zeroing the native stack below the collection's frames; `client`: building
+  the marking client; `dead`: listing the dead objects for the tables' sweeps; `weak`:
+  clearing weak handles and weak cells; `tables`: evicting the dead from the engine's tables;
+  `after`: the Agent's bookkeeping after the sweep), then the cells finalized, by kind
   (`fin:<kind>=count`).
 - Collections are minor or major. A minor collection traces from the roots and from the old
   cells (cells an earlier collection kept) whose cards the write barrier set since the last
@@ -149,9 +152,11 @@ comment/example in the same change.
   since the last collection must name a cell that collection kept (or, if weak, nothing), and
   a panic `handle table of heap …` names the entry and the cell.
   `TRUST_JS_GC_LOG=1` lines name each collection's kind and report live cells, live bytes,
-  small-cell pages (64 KiB each) and released pages kept for reuse (`spare`) after it; a
-  minor collection's line adds the young pages it swept, the old cells it traced because
-  their cards were set (`card_cells`) and the bytes it promoted. `TRUST_JS_GC_CENSUS=1`
+  small-cell pages (64 KiB each) and released pages kept for reuse (`spare`) after it, the
+  heap's collections so far, those that were due but postponed (`deferred`) and the bytes
+  its cells own outside it, not yet released (`external`); a minor collection's line adds
+  the young pages it swept, the old cells it traced because their cards were set
+  (`card_cells`) and the bytes it promoted. `TRUST_JS_GC_CENSUS=1`
   adds a `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
   live objects after every collection and of objects as they die, by family (it walks the
   heap at each collection; diagnostic only). In test builds, `TRUST_JS_GC_WHY=1` records
