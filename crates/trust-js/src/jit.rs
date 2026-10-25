@@ -8033,6 +8033,9 @@ mod direct_call_tests {
             &mut *engine.interp as *mut _ as usize;
         for depth in 0..=3 {
             let key = crate::lstr::LStr::from(format!("method{depth}"));
+            // An old key's entry outlives the collections below; a young key's would be evicted
+            // as the first starts (`ComputedReadCache::evict_young`).
+            engine.interp.gc_collect();
             let holder = Object::new(None);
             holder
                 .borrow_mut()

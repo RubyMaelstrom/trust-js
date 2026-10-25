@@ -1160,6 +1160,7 @@ impl Interp {
     ))]
     pub(crate) fn gc_collect_precise_for_test(&mut self, kind: CollectionKind) {
         let heap = self.gc_heap.clone();
+        self.gc_evict_young_cache_keys();
         let marking = Marking::new(self, kind);
         heap.handles.set_collecting(true);
         assert!(crate::value::mark_agent_heap(&heap, false, &marking, kind));
@@ -1179,6 +1180,7 @@ impl Interp {
         heap: &crate::value::GcHeap,
         kind: CollectionKind,
     ) -> Option<FastMap<usize, NativeGcGraph>> {
+        self.gc_evict_young_cache_keys();
         let marking = timed(EngineStep::Client, || Marking::new(self, kind));
         // Building the client just enumerated every Realm member and host value, dead or
         // alive, in frames below this one; the marker's frames reuse that region.
@@ -1259,6 +1261,20 @@ impl Interp {
         drop(dead);
         timed(EngineStep::After, || self.gc_heap_after_sweep_agent(kind));
         reclaimed
+    }
+
+    /// As a collection starts, drop each interpreter's cache entries keyed by strings made since
+    /// the last one (`ComputedReadCache::evict_young`), so that the collection need not pin them.
+    fn gc_evict_young_cache_keys(&mut self) {
+        let access = self.gc_heap.agent.access.clone();
+        self.with_raw_access(|_| {
+            for (_, pointer) in access.snapshot() {
+                // SAFETY: as in `gc_heap_sweep_tree`: no marking reference exists yet, and this
+                // mutable snapshot ends before the client takes its shared one.
+                let interp = unsafe { &mut *pointer.as_ptr() };
+                interp.computed_reads.evict_young();
+            }
+        });
     }
 
     /// Evict the dead from every interpreter's tables in this ShadowRealm tree. A dead

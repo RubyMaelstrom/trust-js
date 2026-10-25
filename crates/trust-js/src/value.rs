@@ -4470,6 +4470,11 @@ impl GcState {
     pub(crate) fn markings(&self) -> u64 {
         self.ledger.markings()
     }
+
+    /// Whether `word` names a cell of this heap allocated since the last collection.
+    pub(crate) fn is_young(&self, word: u64) -> bool {
+        self.core.borrow().cell_age(word) == Some(crate::gc_core::CellAge::Young)
+    }
 }
 
 /// The active Agent heap's identity (never reused).

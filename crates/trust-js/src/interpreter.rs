@@ -8608,8 +8608,13 @@ impl Interp {
                 // pointer-indexed stub table adds work on high-cardinality/transient inputs.
                 // Derive once and retain the key only in the bounded computed cache.
                 if let Some(value) = self.ic_get_rederive(&object, key, &scratch[0], false) {
-                    self.computed_reads
-                        .insert(key, scratch[0].get(), self.gc_heap.markings());
+                    let young = self.gc_heap.is_young(key.cell_word());
+                    self.computed_reads.insert(
+                        key,
+                        scratch[0].get(),
+                        young,
+                        self.gc_heap.markings(),
+                    );
                     return self.finish_cached_get(value, base, None);
                 }
             }
