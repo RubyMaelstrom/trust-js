@@ -1694,7 +1694,12 @@ fn ta_species_create(
     args: &[Value],
     write: bool,
 ) -> Result<Value, Value> {
-    let default_ctor = ab(i.get_member_key(&Value::Obj(i.global), kind.name()))?;
+    // The current Realm's intrinsic constructor for the exemplar's [[TypedArrayName]] (ECMA-262
+    // TypedArraySpeciesCreate), not whatever the global object's property now holds.
+    let default_ctor = match i.extra_protos.get(kind.intrinsic_key()) {
+        Some(ctor) => Value::Obj(*ctor),
+        None => return Err(i.make_error("TypeError", "no intrinsic TypedArray constructor")),
+    };
     let ctor = ab(i.get_member_key(this, "constructor"))?;
     let chosen = if matches!((ctor).view(), ValueView::Undefined) {
         default_ctor
@@ -2220,10 +2225,12 @@ fn ta_subarray(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Val
     let es = info.kind.elsize();
     // srcLength is the length at entry (0 if the view is already out of bounds); the begin/end
     // coercions below clamp against it even if they resize the buffer.
+    // The view's [[ViewedArrayBuffer]] (ECMA-262 %TypedArray%.prototype.subarray step 4), read
+    // from its slot: the `buffer` getter is a property page script can replace.
+    let buf_val = i.ta_buffer.get(&ptr).cloned().unwrap_or(Value::Undefined);
     let len = i.ta_len(&info).unwrap_or(0);
     let begin = rel_index(ab(i.to_number(&arg(args, 0)))?, len);
     let new_offset = info.offset + begin * es;
-    let buf_val = ab(i.get_member_key(&this, "buffer"))?;
     // A length-tracking source subarrayed with no explicit end stays length-tracking: pass only
     // «buffer, byteOffset» so the result auto-sizes to the buffer (TypedArraySpeciesCreate honors
     // a subclass `@@species`).
@@ -2428,6 +2435,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
         );
         // from/of are inherited from %TypedArray% (they construct through `this`), not own here.
         set_builtin(&it.global, kind.name(), Value::Obj(ctor));
+        Rc::make_mut(&mut it.extra_protos).insert(kind.intrinsic_key(), ctor);
     }
     install_uint8_base64(it);
 }

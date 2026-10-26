@@ -5172,6 +5172,24 @@ impl TaKind {
             TaKind::U64 => "BigUint64Array",
         }
     }
+    /// The key of the constructor's intrinsic in a Realm's `extra_protos`, e.g. "%Int8Array%":
+    /// TypedArraySpeciesCreate's default constructor, which page script cannot replace.
+    pub(crate) fn intrinsic_key(self) -> &'static str {
+        match self {
+            TaKind::I8 => "%Int8Array%",
+            TaKind::U8 => "%Uint8Array%",
+            TaKind::U8Clamped => "%Uint8ClampedArray%",
+            TaKind::I16 => "%Int16Array%",
+            TaKind::U16 => "%Uint16Array%",
+            TaKind::I32 => "%Int32Array%",
+            TaKind::U32 => "%Uint32Array%",
+            TaKind::F16 => "%Float16Array%",
+            TaKind::F32 => "%Float32Array%",
+            TaKind::F64 => "%Float64Array%",
+            TaKind::I64 => "%BigInt64Array%",
+            TaKind::U64 => "%BigUint64Array%",
+        }
+    }
     /// Read a BigInt element (little-endian) from `b` (8 bytes) as an i128.
     pub(crate) fn read_bigint(self, b: &[u8]) -> i128 {
         let arr = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];

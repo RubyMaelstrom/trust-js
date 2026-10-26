@@ -260,3 +260,28 @@ fn internal_slot_tests_gc_traces_live_slots_and_breaks_internal_slot_cycles() {
         );
     }
 }
+
+#[test]
+fn internal_slot_tests_typed_array_species_and_subarray_use_slots_and_intrinsics() {
+    // %TypedArray%.prototype.subarray takes the view's [[ViewedArrayBuffer]] from its slot, and
+    // TypedArraySpeciesCreate's default constructor is the Realm's intrinsic: neither a replaced
+    // `buffer` getter nor a replaced global constructor is observable.
+    check(
+        r#"(function(){
+            var calls = 0;
+            var proto = Object.getPrototypeOf(Uint8Array.prototype);
+            var RealU8 = Uint8Array;
+            var a = new RealU8([1, 2, 3, 4, 5, 6]);
+            Object.defineProperty(proto, 'buffer', {
+                get() { calls++; return new ArrayBuffer(1); }, configurable: true });
+            globalThis.Uint8Array = function () { calls++; throw new Error('global'); };
+            a.constructor = undefined;
+            var s = a.subarray(1, 4), t = a.slice(2), m = a.map(x => x * 2), f = a.filter(x => x & 1);
+            a[1] = 9;
+            return [calls, Object.getPrototypeOf(s) === RealU8.prototype,
+                    Object.getPrototypeOf(m) === RealU8.prototype, Array.from(s).join(),
+                    Array.from(t).join(), Array.from(m).join(), Array.from(f).join()].join('|');
+        })()"#,
+        "0|true|true|9,3,4|3,4,5,6|2,4,6,8,10,12|1,3,5",
+    );
+}
