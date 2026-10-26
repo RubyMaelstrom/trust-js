@@ -1511,6 +1511,7 @@ fn scan_realm(
         .descriptor_maps
         .iter()
         .chain(std::iter::once(&interp.iter_result_map))
+        .chain(&interp.regexp_array_maps)
     {
         if let Some(map) = map.get() {
             visitor.props(map);

@@ -412,3 +412,209 @@ fn deeply_nested_patterns_are_syntax_errors_not_crashes() {
         "1001:0,1:0,1:0,1:1,SyntaxError,SyntaxError,SyntaxError,SyntaxError",
     );
 }
+
+/// A match array has its elements, then ArrayCreate's `length` (writable only), then `index`,
+/// `input` and `groups` and, with the `d` flag, `indices`, all CreateDataPropertyOrThrow data
+/// properties in that creation order; the indices array has `groups` after its `length`, and
+/// both `groups` objects have a null prototype (ECMA-262 §22.2.7.2, §22.2.7.8).
+#[test]
+fn match_arrays_have_the_spec_keys_attributes_and_order() {
+    check(
+        r#"
+        function describe(object) {
+            return Object.getOwnPropertyNames(object).map(function (key) {
+                var d = Object.getOwnPropertyDescriptor(object, key);
+                return key + ':' + (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') +
+                    (d.configurable ? 'c' : '-');
+            }).join(' ');
+        }
+        var plain = /(a)(b)?/.exec('xa');
+        var named = /(?<first>a)(?<second>z)?/.exec('xa');
+        var indexed = /(?<first>a)(b)?/d.exec('xa');
+        var unnamed = /(a)/d.exec('ba');
+        [
+            describe(plain),
+            describe(named),
+            Object.getPrototypeOf(named.groups) === null,
+            describe(named.groups),
+            describe(indexed),
+            describe(indexed.indices),
+            Object.getPrototypeOf(indexed.indices.groups) === null,
+            describe(indexed.indices.groups),
+            JSON.stringify(indexed.indices),
+            String(unnamed.indices.groups),
+            Object.keys(plain).join(),
+            Object.getPrototypeOf(plain) === Array.prototype,
+            Array.isArray(indexed.indices),
+            plain.length + ':' + plain.index + ':' + plain.input + ':' + plain.groups,
+            'abcabc'.match(/b/).index + ':' + 'abcabc'.search(/c/),
+            Array.from('a1b22'.matchAll(/\d+/g), function (m) { return describe(m); }).join(' | '),
+        ].join('\n')
+        "#,
+        "0:wec 1:wec 2:wec length:w-- index:wec input:wec groups:wec\n\
+         0:wec 1:wec 2:wec length:w-- index:wec input:wec groups:wec\n\
+         true\n\
+         first:wec second:wec\n\
+         0:wec 1:wec 2:wec length:w-- index:wec input:wec groups:wec indices:wec\n\
+         0:wec 1:wec 2:wec length:w-- groups:wec\n\
+         true\n\
+         first:wec\n\
+         [[1,2],[1,2],null]\n\
+         undefined\n\
+         0,1,2,index,input,groups\n\
+         true\n\
+         true\n\
+         3:1:xa:undefined\n\
+         1:2\n\
+         0:wec length:w-- index:wec input:wec groups:wec | \
+         0:wec length:w-- index:wec input:wec groups:wec",
+    );
+}
+
+/// Match arrays share their named keys' layout, but each is an ordinary array: one that gains,
+/// loses or redefines a property, is truncated or grows changes alone, and later matches are
+/// built as before.
+#[test]
+fn match_arrays_change_independently() {
+    check(
+        r#"
+        function keys(object) { return Object.getOwnPropertyNames(object).join(); }
+        var re = /(\d+)/;
+        var a = re.exec('x1'), b = re.exec('y22'), c = re.exec('z333');
+        a.extra = 'a';
+        delete b.index;
+        Object.defineProperty(c, 'input', { writable: false, enumerable: false });
+        c.input = 'ignored';
+        b.groups = 'b';
+        var d = re.exec('w4444');
+        var e = /(a)/d.exec('a');
+        e.indices.groups = 'e';
+        delete e.indices[0];
+        var f = /(a)/d.exec('a');
+        var forIn = [];
+        for (var key in d) forIn.push(key);
+        [
+            keys(a), keys(b), keys(c), keys(d),
+            a.extra + ':' + ('extra' in b) + ':' + ('extra' in d),
+            b.index + ':' + d.index + ':' + b.groups + ':' + d.groups,
+            c.input + ':' + Object.getOwnPropertyDescriptor(c, 'input').writable + ':' +
+                Object.getOwnPropertyDescriptor(d, 'input').writable,
+            Object.keys(c).join() + '|' + Object.keys(d).join(),
+            (b.index = 9, keys(b)),
+            (a.length = 0, keys(a)),
+            (a.push('p', 'q'), keys(a) + ':' + a.extra),
+            forIn.join(),
+            e.indices.groups + ':' + f.indices.groups + ':' + keys(e.indices) + ':' +
+                keys(f.indices),
+            JSON.stringify([d, f.indices]),
+            Object.isFrozen(Object.freeze(d)) + ':' + keys(re.exec('v55555')) + ':' +
+                Object.isFrozen(re.exec('u6')),
+        ].join('\n')
+        "#,
+        "0,1,length,index,input,groups,extra\n\
+         0,1,length,input,groups\n\
+         0,1,length,index,input,groups\n\
+         0,1,length,index,input,groups\n\
+         a:false:false\n\
+         undefined:1:b:undefined\n\
+         z333:false:true\n\
+         0,1,index,groups|0,1,index,input,groups\n\
+         0,1,length,input,groups,index\n\
+         length,index,input,groups,extra\n\
+         0,1,length,index,input,groups,extra:a\n\
+         0,1,index,input,groups\n\
+         e:undefined:1,length,groups:0,1,length,groups\n\
+         [[\"4444\",\"4444\"],[[0,1],[0,1]]]\n\
+         true:0,1,length,index,input,groups:false",
+    );
+}
+
+/// Every match array of a kind shares one key layout, so a match allocates none, and has the
+/// shape that inserting its named keys into an array gives (V8 shares one map the same way).
+/// The layout outlives collections, and an array that gains a key leaves it to the others.
+#[test]
+fn match_arrays_share_one_layout_and_the_ordinary_shape() {
+    use crate::value::{PropertyLayout, ValueView};
+    fn eval(engine: &mut Engine, source: &str) {
+        match engine.eval(source, false).expect("fixture parses") {
+            Completion::Value(_) => {}
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
+    /// The key layout and shape of the global `name`'s object.
+    fn layout(engine: &mut Engine, name: &str) -> (PropertyLayout, u32) {
+        let env = engine.interp.global_env;
+        let value = engine
+            .interp
+            .get_var(name, &env)
+            .unwrap_or_else(|_| panic!("missing {name}"));
+        let ValueView::Obj(object) = value.view() else {
+            panic!("{name} is not an object")
+        };
+        let object = object.borrow();
+        let layout = object.props.shared_layout().expect("named keys").clone();
+        (layout, object.props.shape())
+    }
+    let mut engine = Engine::new();
+    eval(
+        &mut engine,
+        r#"
+        var a = /(a)/.exec('xa'), b = /(b)(c)(d)/.exec('bcd'), s = 'xyz'.match(/y/);
+        var ordinary = ['a', 'a'];
+        ordinary.index = 1; ordinary.input = 'xa'; ordinary.groups = undefined;
+        var da = /(a)/d.exec('a'), db = /(?<n>b)/d.exec('b');
+        var ordinaryD = ['a'];
+        ordinaryD.index = 0; ordinaryD.input = 'a'; ordinaryD.groups = undefined;
+        ordinaryD.indices = undefined;
+        var ordinaryIndices = [[0, 1]];
+        ordinaryIndices.groups = undefined;
+        "#,
+    );
+    for (first, other, ordinary) in [
+        ("a", "b", "ordinary"),
+        ("a", "s", "ordinary"),
+        ("da", "db", "ordinaryD"),
+        ("da.indices", "db.indices", "ordinaryIndices"),
+    ] {
+        eval(
+            &mut engine,
+            &format!("var first = {first}, other = {other};"),
+        );
+        let (first_layout, first_shape) = layout(&mut engine, "first");
+        let (other_layout, other_shape) = layout(&mut engine, "other");
+        let (ordinary_layout, ordinary_shape) = layout(&mut engine, ordinary);
+        assert!(
+            PropertyLayout::ptr_eq(&first_layout, &other_layout),
+            "{other}: one layout"
+        );
+        assert!(
+            !PropertyLayout::ptr_eq(&first_layout, &ordinary_layout),
+            "{ordinary}: insertion copies the layout"
+        );
+        assert_eq!(&first_layout[..], &ordinary_layout[..], "{other}: keys");
+        assert_eq!(first_shape, other_shape, "{other}: one shape");
+        assert_eq!(
+            first_shape, ordinary_shape,
+            "{other}: the shape of insertion"
+        );
+    }
+    let (a, a_shape) = layout(&mut engine, "a");
+    engine.interp.gc_collect();
+    eval(&mut engine, "var later = /(q)/.exec('q'); a.extra = 1;");
+    let (later, later_shape) = layout(&mut engine, "later");
+    assert!(PropertyLayout::ptr_eq(&a, &later));
+    assert_eq!(a_shape, later_shape);
+    let (changed, changed_shape) = layout(&mut engine, "a");
+    assert!(!PropertyLayout::ptr_eq(&changed, &later));
+    assert_ne!(changed_shape, later_shape);
+    let (b, _) = layout(&mut engine, "b");
+    assert!(PropertyLayout::ptr_eq(&b, &later));
+    assert_eq!(
+        changed.iter().map(|key| &**key).collect::<Vec<_>>(),
+        ["length", "index", "input", "groups", "extra"]
+    );
+    assert_eq!(
+        later.iter().map(|key| &**key).collect::<Vec<_>>(),
+        ["length", "index", "input", "groups"]
+    );
+}

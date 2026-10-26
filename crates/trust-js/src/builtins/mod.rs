@@ -2394,6 +2394,60 @@ fn to_length_val(i: &mut Interp, v: &Value) -> Result<usize, Value> {
     })
 }
 
+/// The arrays RegExpBuiltinExec returns, by the named properties each gains after ArrayCreate's
+/// `length`, in their creation order: a match array's (ECMA-262 §22.2.7.2 steps 22-34) and the
+/// `d` flag's indices array's (MakeMatchIndicesIndexPairArray, §22.2.7.8 step 7).
+#[derive(Clone, Copy)]
+enum RegexpArray {
+    Match,
+    MatchWithIndices,
+    Indices,
+}
+
+impl RegexpArray {
+    fn keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Match => &["index", "input", "groups"],
+            Self::MatchWithIndices => &["index", "input", "groups", "indices"],
+            Self::Indices => &["groups"],
+        }
+    }
+}
+
+/// An array of `items` that gains `kind`'s named data properties (CreateDataPropertyOrThrow:
+/// writable, enumerable, configurable) with the values `named`. Every array of a kind has the
+/// same named keys, so they share one key layout and shape (`Interp::regexp_array_maps`), as
+/// V8's match arrays share one map, instead of each copying the array `length` layout into a
+/// new one as it gains a key.
+fn regexp_array(i: &mut Interp, kind: RegexpArray, items: Vec<Value>, named: &[Value]) -> Value {
+    let keys = kind.keys();
+    debug_assert_eq!(keys.len(), named.len());
+    // The ablation's classic large arrays keep their elements' keys among the named entries,
+    // which a template's layout does not list (see `Interp::make_array`).
+    if items.len() > 32 && !crate::value::dense_elements_enabled() {
+        let array = i.make_array(items);
+        if let ValueView::Obj(o) = &(array).view() {
+            for (key, value) in keys.iter().zip(named) {
+                set_data(o, key, *value);
+            }
+        }
+        return array;
+    }
+    let map = i.regexp_array_maps[kind as usize].get_or_init(|| {
+        let mut map = Props::packed_array(std::iter::empty());
+        for key in keys {
+            map.insert(*key, Property::plain(Value::Undefined));
+        }
+        map
+    });
+    let props = map.packed_array_from_template(items.into_iter(), named.iter().copied());
+    Value::Obj(Object::new_with_parts(
+        Some(i.array_proto),
+        props,
+        Exotic::Array,
+    ))
+}
+
 /// `RegExp.prototype.exec`: returns the match array (with `index`/`input`) or `null`, advancing
 /// `lastIndex` for global/sticky regexes.
 pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -2458,14 +2512,14 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
                 )?;
             }
             update_regexp_legacy_statics(i, &re, &caps, &text, &input);
-            let mut items = vec![Value::lstr(text.slice(start, end))];
+            let mut items = Vec::with_capacity(re.ngroups + 1);
+            items.push(Value::lstr(text.slice(start, end)));
             for g in 1..=re.ngroups {
                 items.push(match caps[g] {
                     Some((a, b)) => Value::lstr(text.slice(a, b)),
                     None => Value::Undefined,
                 });
             }
-            let result = i.make_array(items);
             let groups = regexp_groups(i, &re, &caps, &text);
             // `indices` (the `d` flag): [start, end] pairs per capture (undefined if unmatched),
             // plus a null-prototype `groups` of the same for named captures.
@@ -2482,7 +2536,6 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
                     let span = caps.get(g).copied().flatten();
                     idx_items.push(pair(i, span));
                 }
-                let arr = i.make_array(idx_items);
                 let igroups = if re.names.is_empty() {
                     Value::Undefined
                 } else {
@@ -2504,22 +2557,21 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
                     }
                     Value::Obj(g)
                 };
-                if let ValueView::Obj(o) = &(arr).view() {
-                    set_data(o, "groups", igroups);
-                }
-                Some(arr)
+                Some(regexp_array(i, RegexpArray::Indices, idx_items, &[igroups]))
             } else {
                 None
             };
-            if let ValueView::Obj(o) = &(result).view() {
-                set_data(o, "index", Value::Num(text.unit_index(start) as f64));
-                set_data(o, "input", Value::Str(input));
-                set_data(o, "groups", groups);
-                if let Some(ind) = indices {
-                    set_data(o, "indices", ind);
-                }
-            }
-            Ok(result)
+            let index = Value::Num(text.unit_index(start) as f64);
+            let input = Value::Str(input);
+            Ok(match indices {
+                Some(indices) => regexp_array(
+                    i,
+                    RegexpArray::MatchWithIndices,
+                    items,
+                    &[index, input, groups, indices],
+                ),
+                None => regexp_array(i, RegexpArray::Match, items, &[index, input, groups]),
+            })
         }
     }
 }

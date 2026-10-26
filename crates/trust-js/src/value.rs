@@ -7502,6 +7502,21 @@ impl Props {
     }
 
     fn packed_array_properties(items: impl ExactSizeIterator<Item = Property>) -> Props {
+        let length_key = fn_key(0);
+        let shape = array_length_shape(&length_key);
+        Self::packed_array_named(items, shape, array_length_layout(), std::iter::empty())
+    }
+
+    /// The map of an array of `items`, packed, whose named properties are ArrayCreate's `length`
+    /// and then plain data properties valued `named`: `layout` lists their keys, and `shape` is
+    /// the map's shape.
+    #[inline(always)]
+    fn packed_array_named(
+        items: impl ExactSizeIterator<Item = Property>,
+        shape: u32,
+        layout: PropertyLayout,
+        named: impl ExactSizeIterator<Item = Value>,
+    ) -> Props {
         let len = items.len();
         let mut all_plain = true;
         let items = items.inspect(|property| all_plain &= property.is_plain_element());
@@ -7515,17 +7530,13 @@ impl Props {
             )
         };
         inline_packed.packed_plain.set(all_plain);
-        let length_key = fn_key(0);
-        let shape = array_length_shape(&length_key);
+        let length = Property::data(Value::Num(len as f64), true, false, false);
         let mut props = Props {
             entries: NamedEntries {
-                fields: std::mem::ManuallyDrop::new(Fields::from_iter([Property::data(
-                    Value::Num(len as f64),
-                    true,
-                    false,
-                    false,
-                )])),
-                layout: Some(array_length_layout()),
+                fields: std::mem::ManuallyDrop::new(Fields::from_iter(
+                    std::iter::once(length).chain(named.map(Property::plain)),
+                )),
+                layout: Some(layout),
             },
             shape,
             // An empty InlinePacked has no active packed representation. Preserve the
@@ -7601,6 +7612,46 @@ impl Props {
             proto_slot: std::cell::Cell::new(self.proto_slot.get()),
             len_slot: std::cell::Cell::new(self.len_slot.get()),
         }
+    }
+
+    /// The map of an array of `items` that then gained the named properties of `self`, an array
+    /// template: an empty array's map (ArrayCreate's `length`) into which plain data properties
+    /// (writable, enumerable, configurable) were inserted. `named` gives their values, in the
+    /// template's key order. An array's shape records its named keys only, so the template's
+    /// shape is the one that inserting the same keys gives an array of any elements; its key
+    /// layout is shared by every instance, where inserting the keys copies the shared `length`
+    /// layout into a new private one per array. An instance that later gains, loses or redefines
+    /// a named property diverges by the ordinary copy-on-write and shape-transition paths, as
+    /// any map sharing a layout does.
+    pub(crate) fn packed_array_from_template(
+        &self,
+        items: impl ExactSizeIterator<Item = Value>,
+        named: impl ExactSizeIterator<Item = Value>,
+    ) -> Props {
+        assert_eq!(named.len() + 1, self.entries.len(), "array-template arity");
+        debug_assert!(
+            self.elem_mode.get()
+                && self.elems.len() == 0
+                && !self.elems.packed_is_some()
+                && self
+                    .entries
+                    .keys()
+                    .first()
+                    .is_some_and(|key| &**key == "length")
+                && self.entries.iter().skip(1).all(|(key, property)| {
+                    canonical_index(key).is_none()
+                        && property.class() == PropClass::DataWritable
+                        && property.enumerable()
+                        && property.configurable()
+                }),
+            "array template: an empty array's `length` and plain named properties"
+        );
+        let layout = self
+            .entries
+            .layout
+            .clone()
+            .expect("an array template lists its keys");
+        Self::packed_array_named(items.map(Property::plain), self.shape, layout, named)
     }
 
     /// Grow tiny property maps exactly: `Vec`'s default first allocation has room for four

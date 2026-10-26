@@ -1693,6 +1693,7 @@ impl Interp {
             arguments_shapes: _,
             descriptor_maps,
             iter_result_map,
+            regexp_array_maps,
             computed_reads: _, // keys pinned by collection kind (`Marking::trace_interp_roots`)
             fragment_cache: _, // weak Realm keys and compiled plans
             enumeration_keys: _, // by collection kind (`Marking::trace_interp_roots`)
@@ -1843,7 +1844,11 @@ impl Interp {
         }
         frame_pool.trace_gc(sink);
         native_arg_pool.trace_gc(sink);
-        for map in descriptor_maps.iter().chain([iter_result_map]) {
+        for map in descriptor_maps
+            .iter()
+            .chain([iter_result_map])
+            .chain(regexp_array_maps)
+        {
             if let Some(props) = map.get() {
                 props.trace_gc(sink);
             }
