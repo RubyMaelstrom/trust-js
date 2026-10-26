@@ -189,7 +189,10 @@ mod tests {
         assert!(graph.is_live(node(1, 5)), "an unreported old identity");
         assert!(graph.is_live(node(1, 3)) && graph.is_live(node(1, 12)));
         assert!(!graph.is_live(node(1, 13)) && !graph.is_live(node(1, 14)));
-        assert!(!graph.is_live(node(2, 5)), "another owner's identities have no old prefix");
+        assert!(
+            !graph.is_live(node(2, 5)),
+            "another owner's identities have no old prefix"
+        );
     }
 
     #[test]
