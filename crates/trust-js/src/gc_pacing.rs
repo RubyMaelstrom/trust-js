@@ -132,7 +132,8 @@ pub(crate) struct Pacing {
     /// what reached the old generation.
     allocation: Events,
     old_allocation: Events,
-    /// The collections' speeds: bytes marked over their pauses.
+    /// The collections' speeds over their pauses: a minor collection's in the young bytes it
+    /// processed, a major one's in the bytes it marked.
     minor_speed: Events,
     major_speed: Events,
     /// The collection in progress reduces memory (the memory reducer's).
@@ -247,7 +248,9 @@ impl Pacing {
                 }
             })
         } else {
-            self.minor_speed.push(marked, pause);
+            // V8's young generation speed: the young bytes a collection processed (all that was
+            // allocated since the last one), not just those it promoted.
+            self.minor_speed.push(self.allocated_at_start, pause);
             None
         };
         self.resize_nursery(major, marked, reduce);
@@ -631,7 +634,7 @@ mod tests {
         let t0 = Instant::now();
         let mut now = t0;
         let mut pacing = Pacing::new(Some(MIN_NURSERY_BYTES), false);
-        // 2 MB per ms, against minor collections marking 20 MB per ms: busy.
+        // 2 MB per ms, against minor collections processing 20 MB per ms: busy.
         for _ in 0..4 {
             minor(
                 &mut pacing,
@@ -644,8 +647,9 @@ mod tests {
         assert!(!pacing.low_allocation_rate(now, 0));
         // Six quiet seconds later the window holds only quiet time.
         assert!(pacing.low_allocation_rate(now + Duration::from_secs(6), 1000));
-        // Unless the program allocated much since.
-        assert!(!pacing.low_allocation_rate(now + Duration::from_secs(6), 512 * MB));
+        // Unless the program allocated much since: 8 GiB in 6 s against minor collections that
+        // process 20 MB per ms.
+        assert!(!pacing.low_allocation_rate(now + Duration::from_secs(6), 8192 * MB));
     }
 
     #[test]
