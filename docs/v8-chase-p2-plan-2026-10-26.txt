@@ -1,0 +1,494 @@
+# Phase 2 plan: baseline strengthening (draft for owner approval, 2026-10-26)
+
+Program: [docs/v8-chase-2026-10-15.txt](/big/Code/trust-js/docs/v8-chase-2026-10-15.txt).
+Phase 1's plan and record, including its close-out:
+[docs/v8-chase-p1-plan-2026-10-15.txt](/big/Code/trust-js/docs/v8-chase-p1-plan-2026-10-15.txt).
+Citations are to the tree at the close-out (main after it merges); re-verify them when touching
+code. This plan is the design record P2 needs before code, as P1's was.
+
+## Goal
+
+Make the existing tiers (the AST interpreter, the bytecode VM and the template JIT) and the
+object model cheap enough, and make what they record complete enough, that Phase 3's
+speculative optimizing tier (inlining, type speculation with deoptimization, escape analysis)
+starts from a sound base; and close the gaps to Node/V8 that do not need speculation. The
+program defines P2 as "call path (frame/argument costs), feedback completeness for the future
+tier, builtin algorithmics (shift class), RegExp"; P1's closing record assigned P2 the object
+layout costs its collector still carries. This plan covers both.
+
+Acceptance surface, unchanged from the program's Decision 1: the Vue, React and Djot fixtures
+and Speedometer 3.1 against Node/V8 on Crystal (ARM64), x64 on zombie secondary. New standing
+comparisons from the close-out: full Octane 2, the Web Tooling Benchmark, ARES-6 and a call-path
+microbenchmark set (the harness and suites are under target/claude-closeout; see "Measurement").
+
+The yardstick is Node limited to its non-speculative tiers, Ignition and Sparkplug
+(`--max-opt=1`). Node's lead on the fixtures does not depend on speculation: limited to
+Sparkplug it runs them 3.4-3.8x faster than the close-out, against 2.9-3.9x in full (Node by
+tier, below). Proposed phase exit: each fixture within 2x of Node limited to Sparkplug
+(Decision 2).
+
+## Where we start
+
+### Measured starting point
+
+Crystal (ARM64), 2026-10-26, quiet (the other cores ~0.3 busy, recorded per run); fat-LTO
+builds from frozen exports with rustc 1.99.1; engine runs pinned to CPU 5, rounds interleaved;
+Node v24.22.0 as the reference. close-out = 03f8e4f0; main = f7966b1d (P1 as merged); old =
+e3310993 (before P1, reference counting). Results, logs and binaries: target/claude-closeout
+(final/, lto-*/, bins/; `bench/tables.py final/engine.jsonl final/ares6-full.jsonl
+final/node-tiers.jsonl` prints these tables).
+
+| Workload (unit; runs) | old | main | close-out | Node | Node's lead |
+| --- | --- | --- | --- | --- | --- |
+| Vue fixture (ms; median of 5) | 528 | 386 | 385 | 100 | 3.9x |
+| React fixture (ms; 5) | 71 | 55 | 55 | 18 | 3.1x |
+| Djot fixture (ms; 5) | 184 | 150 | 141 | 46 | 3.1x |
+| Sustained allocation, JIT (s; 5) | 1.077 | 0.538 | 0.521 | 0.157 | 3.3x |
+| Sustained allocation, bytecode (s; 5) | 1.349 | 0.736 | 0.727 | 0.152 | 4.8x |
+| Octane 2 score (3) | 2445 | 2609 | 2790 | (a) | |
+| Web Tooling geomean, runs/s (1) | 0.59 | 0.55 | 0.72 | 8.82 | 12x |
+| ARES-6 summary, ms (1) | 423.3 | 327.9 | 318.7 | 31.8 | 10x |
+
+(a) Node runs Octane as one combined script, in which CodeLoad and PdfJS do not run, so it
+reports no total.
+
+Node by tier: limited to Sparkplug (`--max-opt=1`: Ignition and Sparkplug, V8's
+non-speculative tiers; builtins are compiled ahead of time and Irregexp compiles RegExps to
+machine code in every tier) and limited to Maglev (`--max-opt=2`). The fixtures ran in one
+session with the close-out and full Node (medians of 5); the suites once each, against the
+close-out's and full Node's runs above:
+
+| | close-out | Node | Sparkplug only | up to Maglev | Sparkplug only's lead |
+| --- | --- | --- | --- | --- | --- |
+| Vue fixture (ms) | 387 | 100 | 113 | 47 | 3.4x |
+| React fixture (ms) | 55 | 18 | 16 | 13 | 3.4x |
+| Djot fixture (ms) | 143 | 49 | 38 | 35 | 3.8x |
+| Sustained allocation, JIT (s) | 0.520 | 0.153 | 0.203 | 0.139 | 2.6x |
+| Octane 2, geomean of the 15 benchmarks Node runs (b) | 2463 | 26115 | 4360 | 19886 | 1.8x |
+| ARES-6 summary (ms) | 318.7 | 31.8 | 76.3 | 28.8 | 4.2x |
+| Web Tooling geomean (runs/s) | 0.72 | 8.82 | 3.48 | 9.68 | 4.8x |
+
+(b) Each column's geometric mean over the same 15 benchmarks (the score Octane reports
+includes CodeLoad and PdfJS).
+
+Octane 2, per benchmark (score, median of 3; higher is better). Sparkplug only: Node limited
+to its non-speculative tiers, one run (Node by tier, above):
+
+| | old | main | close-out | Node | Node's lead | Sparkplug only | its lead |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Richards | 1010 | 1507 | 1509 | 16744 | 11x | 1483 | 0.98x |
+| DeltaBlue | 918 | 1268 | 1337 | 45965 | 34x | 1465 | 1.1x |
+| Crypto | 6136 | 7464 | 7479 | 27250 | 3.6x | 1604 | 0.21x |
+| RayTrace | 1780 | 2240 | 2326 | 43246 | 19x | 4229 | 1.8x |
+| EarleyBoyer | 1187 | 1710 | 1991 | 43535 | 22x | 6910 | 3.5x |
+| RegExp | 308 | 279 | 349 | 6475 | 19x | 3902 | 11x |
+| Splay | 2903 | 1929 | 2466 | 19753 | 8.0x | 3176 | 1.3x |
+| SplayLatency | 6446 | 3182 | 3845 | 13180 | 3.4x | 2715 | 0.71x |
+| NavierStokes | 2510 | 2969 | 2978 | 20102 | 6.8x | 1987 | 0.67x |
+| PdfJS | 3214 | 3202 | 3534 |  |  |  |  |
+| Mandreel | 916 | 1050 | 1048 | 17667 | 17x | 1505 | 1.4x |
+| MandreelLatency | 5893 | 6391 | 6375 | 32163 | 5.0x | 8240 | 1.3x |
+| Gameboy | 2983 | 3448 | 3438 | 25951 | 7.5x | 8089 | 2.4x |
+| CodeLoad | 15621 | 13283 | 14402 |  |  |  |  |
+| Box2D | 1957 | 2219 | 2286 | 36796 | 16x | 4738 | 2.1x |
+| zlib | 2465 | 2744 | 2747 | 59484 | 22x | 59415 | 22x |
+| Typescript | 5786 | 7271 | 7515 | 41492 | 5.5x | 20326 | 2.7x |
+
+Web Tooling, per tool (runs/s, one run each; higher is better):
+
+| | old | main | close-out | Node | Node's lead | Sparkplug only | its lead |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| acorn | 0.40 | 0.46 | 0.49 | 11.38 | 23x | 1.48 | 3.0x |
+| babel | 0.67 | 0.81 | 0.87 | 9.05 | 10x | 2.91 | 3.3x |
+| babel-minify | 0.87 | 0.95 | 1.10 | 10.29 | 9.4x | 4.26 | 3.9x |
+| babylon | 0.33 | 0.35 | 0.38 | 8.52 | 22x | 2.13 | 5.6x |
+| buble | 0.87 | 0.94 | 1.07 | 5.73 | 5.4x | 3.41 | 3.2x |
+| chai | 1.63 | 1.72 | 2.01 | 16.17 | 8.0x | 6.13 | 3.0x |
+| coffeescript | 0.21 | 0.19 | 0.21 | 7.58 | 36x | 4.92 | 23x |
+| espree | 0.32 | 0.31 | 0.39 | 3.83 | 9.8x | 1.44 | 3.7x |
+| esprima | 0.44 | 0.46 | 0.64 | 12.59 | 20x | 1.79 | 2.8x |
+| jshint | 0.63 | 0.62 | 0.85 | 13.49 | 16x | 5.71 | 6.7x |
+| lebab | 0.71 | 0.55 | 0.82 | 11.91 | 15x | 4.11 | 5.0x |
+| postcss | 0.60 | 0.53 | 0.79 | 6.43 | 8.1x | 3.56 | 4.5x |
+| prepack | 0.79 | 0.66 | 0.86 | 7.00 | 8.1x | 3.47 | 4.0x |
+| prettier | 0.57 | 0.52 | 0.71 | 7.07 | 10x | 3.65 | 5.1x |
+| source-map | 0.31 | 0.31 | 0.36 | 10.45 | 29x | 3.86 | 11x |
+| terser | 1.53 | 1.22 | 1.93 | 16.14 | 8.4x | 10.13 | 5.2x |
+| typescript | 0.83 | 0.76 | 1.09 | 6.90 | 6.3x | 4.35 | 4.0x |
+| uglify-js | 0.42 | 0.21 | 0.49 | 5.74 | 12x | 2.98 | 6.1x |
+
+ARES-6 (ms, one run each; lower is better). Each benchmark runs 200 iterations (ML 60) and the
+driver repeats the suite 6 times: first = the first iteration, worst 4 = the mean of the four
+slowest after it, steady = the mean of all after it:
+
+| | old | main | close-out | Node | Node's lead | Sparkplug only | its lead |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Air first | 264.3 | 248.2 | 257.1 | 82.7 | 3.1x | 35.4 | 7.3x |
+| Air worst 4 | 332.6 | 262.8 | 262.4 | 44.0 | 6.0x | 47.1 | 5.6x |
+| Air steady | 233.9 | 206.4 | 205.0 | 8.6 | 24x | 24.4 | 8.4x |
+| Basic first | 201.8 | 167.9 | 151.6 | 36.5 | 4.2x | 32.6 | 4.6x |
+| Basic worst 4 | 344.3 | 159.2 | 165.3 | 29.8 | 5.5x | 33.7 | 4.9x |
+| Basic steady | 193.8 | 149.9 | 153.3 | 6.5 | 23x | 29.5 | 5.2x |
+| Babylon first | 319.0 | 201.5 | 176.3 | 59.3 | 3.0x | 42.6 | 4.1x |
+| Babylon worst 4 | 182.4 | 141.1 | 143.8 | 23.8 | 6.0x | 38.1 | 3.8x |
+| Babylon steady | 167.0 | 124.1 | 107.7 | 4.9 | 22x | 35.8 | 3.0x |
+| ML first | 2343.3 | 2044.8 | 1969.8 | 168.1 | 12x | 814.5 | 2.4x |
+| ML worst 4 | 2350.6 | 2007.6 | 1974.0 | 72.2 | 27x | 812.9 | 2.4x |
+| ML steady | 2311.7 | 1974.7 | 1952.5 | 58.0 | 34x | 811.0 | 2.4x |
+
+Against main, the close-out lost in both this run and an earlier run of Air and Basic alone
+(before b008469d gave Babylon the shells' `read`): Basic's worst 4 by 3.8% and 5.0%, its
+steady state by 2.2% and 3.1%, Air's first iteration by 3.6% and 1.0%. One run each, so these
+are small but consistent.
+
+Call microbenchmarks (target/claude-closeout/bench/micro/calls.js, JIT tier; ms for each case's
+loop, median of 3, in one session with Node's tiers; ns/iter = the close-out's time per
+iteration; main was within 3% of the close-out on every case):
+
+| Case (iterations) | close-out ms | ns/iter | Node | Sparkplug only | up to Maglev | close-out / Sparkplug |
+| --- | --- | --- | --- | --- | --- | --- |
+| direct call `add(s, k)` (5M) | 206 | 41 | 40.3 | 108 | 49.4 | 1.9x |
+| method call `obj.get(k)` (5M) | 239 | 48 | 5.58 | 164 | 46.2 | 1.5x |
+| closure call `add3(k)` (5M) | 211 | 42 | 38.1 | 117 | 46.1 | 1.8x |
+| `arguments` object `args(k, 2, 3)` (1M) | 233 | 233 | 1.13 | 52.5 | 16.4 | 4.4x |
+| rest parameters `rest(k, 2, 3)` (1M) | 171 | 171 | 1.13 | 52.9 | 14.9 | 3.2x |
+| spread call `add(...arr3)` (1M) | 488 | 488 | 23.2 | 34.7 | 22.0 | 14x |
+| `add.call` + `add.apply` (1M) | 298 | 298 | 36.8 | 81.6 | 36.3 | 3.7x |
+| constructor `new Point(k, 1)` (1M) | 124 | 124 | 12.8 | 58.1 | 13.0 | 2.1x |
+| class and getter `new C(k).double` (1M) | 482 | 482 | 1.11 | 70.1 | 15.0 | 6.9x |
+| recursion, fib(27) (635,621 calls) | 27 | 42 | 5.09 | 12.1 | 4.38 | 2.2x |
+| push/pop (5M) | 667 | 133 | 37.5 | 282 | 54.1 | 2.4x |
+| push/shift, 2,000 elements (1M) | 234 | 234 | 115 | 159 | 115 | 1.5x |
+| the same with one hole (100k) | 300 | 3000 | 14.1 | 17.2 | 12.0 | 17x |
+
+TRust (offline replays: median wall time of 20 samples, 4 interleaved rounds on the X925
+cores; Octane through TRust: its 8 benchmarks, median of 2). old = TRust be37666 on engine
+e3310993; P1 port = TRust 9bdbe7e on 487967dd; close-out = TRust b72b45a on 03f8e4f0.
+Outputs were identical across all three.
+
+| | old | P1 port | close-out |
+| --- | --- | --- | --- |
+| event-loop replay (s) | 0.220 | 0.216 | 0.205 |
+| dom-reconcile replay (s) | 2.354 | 2.293 | 1.982 |
+| Speedometer 3.1 Vue TodoMVC replay (s) | 0.886 | 0.804 | 0.761 |
+| Octane through TRust (score) | 1606 | 1843 | 2049 |
+| of which Splay | 1824 | 1644 | 2045 |
+| of which RegExp | 436 | 364 | 478 |
+| peak RSS (MB) | 461 | 661 | 1174 |
+
+Peak RSS (MB; median of the runs above):
+
+| | old | main | close-out | Node |
+| --- | --- | --- | --- | --- |
+| Vue fixture | 30 | 25 | 27 | 66 |
+| React fixture | 14 | 18 | 19 | 65 |
+| Djot fixture | 40 | 39 | 40 | 69 |
+| Sustained allocation (JIT) | 149 | 70 | 102 | 108 |
+| Octane 2 (whole run) | 1678 | 2340 | 2583 | 703 |
+| Web Tooling | 2454 | 3304 | 4673 | 1362 |
+| ARES-6 | 300 | 339 | 529 | 340 |
+
+What the numbers say:
+- The close-out is the fastest of the three engines on every suite: Octane +6.9% over main
+  (Splay +28%, RegExp +25%, SplayLatency +21%, EarleyBoyer +16%, PdfJS +10%; nothing slower
+  than 0.3%), Web Tooling +31% with every tool faster, ARES-6's summary 2.8% lower (Babylon's
+  steady state 13% lower; Basic 2-5% and Air's first iteration 1-4% slower), Djot -6%, TRust's
+  replays 5-14% faster; the call microbenchmarks did not move (within 3%). Against the old
+  engine it trails by more than 2% only on Splay (-15%), SplayLatency (-40%) and CodeLoad
+  (-8%): major-collection pauses and the object layout (W2, Decision 4).
+- Node leads by 3-4x on the fixtures, 10x on ARES-6, 12x on Web Tooling and 3.4-34x on
+  Octane's benchmarks. Limited to Sparkplug, it keeps all of its lead on the fixtures
+  (3.4-3.8x) and leads by 4.2x on ARES-6 and 4.8x on Web Tooling, but by 1.8x on Octane's
+  geomean, where the close-out is faster on Crypto (4.7x), NavierStokes (1.5x) and
+  SplayLatency (1.4x) and level on Richards: most of Octane's gaps are speculation's (P3). The
+  gaps Sparkplug-only Node keeps are this phase's; the largest: Web Tooling's coffeescript
+  (23x) and source-map (11x), not yet attributed; the holey shift (17x) and spread calls (14x;
+  W1, W3); RegExp (11x; Irregexp, W5); the other Web Tooling tools (2.8-6.7x); EarleyBoyer,
+  Typescript, Gameboy and Box2D (2.1-3.5x). zlib's 22x does not move with the tier: V8 runs
+  its asm.js module (zlib-data.js, "use asm") as WebAssembly.
+- Memory: V8's sizing raises peak RSS where allocation is heavy: against main, Octane +10%,
+  Web Tooling +41%, ARES-6 +56%, sustained allocation +45%, Octane through TRust +78%.
+  Node's peaks are 3.7x (Octane), 3.4x (Web Tooling) and 1.6x (ARES-6) lower; its objects
+  are smaller (W2). V8's cap of each limit at halfway to its heap maximum, which the
+  close-out did not port, would bind only on Web Tooling: the close-out's largest live heap
+  after a major collection (cells and their external payloads, TRUST_JS_GC_LOG; logs in
+  final/gclog) is 1027 MB there, 458 MB on Octane and 39 MB on ARES-6, and the cap binds
+  above ~585 MB (Decision 5).
+
+### The code (survey of the close-out tree)
+
+Call path.
+- Generic entry (natives calling back, VM calls, uncached sites): `Interp::call`
+  (interpreter.rs:12286) roots arguments, checks depth/stack/GC; `call_dispatch` (12491)
+  probes the proxy side table and, once any class exists, the `class_info` hash map on every
+  call (12593); bound functions concatenate a new Vec per call (12604); `call_user_inner`
+  (15032) counts calls, compiles at threshold 8, runs `run_compiled_chunk` (13220).
+- Prepared entries (sloppy `arguments` with non-simple parameters, eval/with, destructuring
+  rest, unsafe defaults; bytecode.rs:6562-7115) allocate one var scope per call (three with
+  parameter expressions), a `"this"` string when the body reads `this` (15235), and an
+  arguments object or a boxed stash (15253, 15264).
+- The VM's `Op::Call` ignores the call cache and re-enters the generic chain
+  (bytecode.rs:17329-17364); rest parameters are `to_vec` + `make_array` (15361); an
+  activation is built only when an inner function captures (bytecode.rs:3418), and
+  `ActivationPlan::instantiate` clones every `(Rc<str>, Binding)` entry
+  (bytecode_activation.rs:145-205).
+- ARM64 JIT: a 4-way identity cache per site (bytecode.rs:1262; jit.rs:7340-7470) and a direct
+  sequence (jit.rs:7596) that allocates nothing, but declines callees with an activation or
+  any `arguments` slot (`CALL_IC_NEEDS_ENV`, bytecode.rs:1013), which is most framework code.
+  Native calls from JIT pay depth/stack/GC checks, two interrupt polls and a host-callback swap
+  (interpreter.rs:13841); ~30 intrinsics are inlined (bytecode.rs:1033-1084). Spread and
+  args-array calls have no cache (bytecode.rs:16841-16880; spread.rs:129-190). x64 calls go
+  through the `H_CALL` helper (jit_x64.rs:1227).
+- Inlining is guarded bytecode splicing only (InlineGuard, bytecode.rs:17242; recompilation
+  after 100 machine-code runs, budgets 320/384 source ops, an allowlist without closures,
+  handlers, activations or `super`). The optional Cranelift tier was removed before P1
+  (6b210624, 2026-10-15); docs from 2026-10-14 that cite `jit_optimizing*.rs` are history.
+- Microbenchmarks (the call table): against Node limited to Sparkplug, its non-speculative
+  baseline, the direct, method and closure calls take 1.5-1.9x as long, the constructor and
+  recursion 2.1-2.2x, the argument shapes 3.2-4.4x, `call`/`apply` 3.7x, the getter 6.9x and
+  spread 14x. Full Node inlines the method, `arguments`, rest and getter cases (about 1 ns an
+  iteration).
+
+Feedback.
+- feedback.rs defines a versioned per-function schema (named/element loads and stores, call,
+  construct, arithmetic, branch, loop, allocation; feedback.rs:46-187) with mono/poly/absent/
+  generic states (373). Collection is opt-in (`TRUST_JS_FEEDBACK_PROFILE`, feedback.rs:28) and
+  reroutes JIT templates through helpers (jit.rs:3940); nothing reads it in production (`read`
+  is cfg(test), 1454); inlined or recompiled chunks write nothing (733-741). The schema file
+  feedback.rs:3 names (FEEDBACK_SCHEMA.md) does not exist.
+- What the tiers consume are their inline caches: the 4-way property IcState (up to 6
+  prototype levels, bytecode.rs:87-139, baked into JIT probes jit.rs:5895-5946), call caches
+  (whose way count the inliner reads), name/capture caches, creation caches, construct
+  capacity hints, per-array mirror flags.
+- A speculative tier would still lack: feedback that is on by default; comparison, `in`,
+  `instanceof`, `typeof`, free-name, captured-variable, iteration and for-in sites; call-target
+  identity, megamorphic state and per-way counts; elements kinds (packed/holey x int32/double/
+  any); allocation-site records (boilerplate, kind transitions, survival, for pretenuring); a
+  PC map through inlining; shapes as a proof (value.rs:5378, Pilot C unfinished); dependency
+  records for invalidation.
+
+Builtins (the "shift class").
+- Packed elements are 16-byte `Property` words (10 inline, value.rs:5633; then a deque with
+  front room, dense_deque.rs:15-25); holes are `Value::Empty`. Packed storage starts only at
+  creation or a first write at index <= 256 on an empty array (value.rs:7836-7844); a farther
+  write sets `has_far` (9120) and nothing converts a classic array back.
+- push/pop are O(1) under the prototype protector (interpreter.rs:8353-8397); `shift` is O(1)
+  for a packed, all-plain array (value.rs:8408), else an O(n) rotation, else the generic loop
+  (builtins/mod.rs:6311) that formats a string key per index. unshift/splice/reverse need
+  packed all-plain storage; indexOf/lastIndexOf/includes (6413), sort (6835) and copyWithin
+  have no bulk path; partial fill sets per index by string key (6749). A delete writes Empty in
+  place (9242) and fails every all-plain guard until refilled.
+- Vue's cost is not storage: the fixture shifts `model.items` (benchmarks/fixtures/vue.js:41,
+  54), a Vue `reactive()` Proxy, so the generic loop runs 50+ trap calls per shift, each with a
+  freshly allocated key string (value.rs:1286). On the close-out, `shift` is ~47% of Vue's
+  elapsed time (671 calls, ~275 us each; TRUST_JS_PERF_METRICS).
+
+RegExp.
+- A backtracking matcher over a flat instruction program with a heap stack (regex.rs:1-12,
+  `run` ~5714); case folding at match time; literal and first-element fast paths (2376); a
+  one-byte tier after 64 executions for capture-free, alternation-free programs (machine code
+  only without anchors, and on AArch64 without classes; regex.rs:1129-1167). The close-out
+  fixed that tier's anchors (/a^/ matched "a" after 64 runs).
+- Prepared subjects: one hot ASCII entry plus an LRU of widened subjects (32 MiB / 8,192
+  entries, interpreter.rs:3398); views of ASCII strings match as bytes since the close-out.
+  Exec results share one pre-shaped layout per kind (close-out); each capture is still a fresh
+  string copy (builtins/mod.rs ~2516).
+- Fixed per-call costs: `regexps` hash lookups, a string-keyed `lastIndex`, ~20 guard lookups;
+  every RegExp creation inserts into `gc_pin` and `regexps` (eval.rs:5477-5494), whose removal
+  is now the largest per-minor-collection cost on Octane RegExp (~66 us of ~180 us). `match`
+  with /g, `search` and `matchAll` build throwaway match arrays; no required-literal prefilter.
+
+Object model and collector.
+- The object cell is `RefCell<Object>` <= 192 B in the 192 B size class (value.rs:4069-4072):
+  proto; `Props` with 4 inline 16-byte slots, a layout pointer, a u32 shape, a 2-word element
+  sidecar, mirror flags, `has_far`, `elem_mode`, two slot memos; a 16-byte `Callable` that only
+  functions need; an `Exotic`; a typed-array pointer; flag bytes. A fifth named property moves
+  all fields to a spill block (inline_vec.rs:3-7). A 1-element array is a 192 B cell plus a
+  ~256 B element block. V8's JSObject is 12 B plus 4 B per in-object field (pointer
+  compression).
+- Property layouts are GC cells holding `Vec<Rc<str>>` and run finalizers (value.rs:3185);
+  environments (`Scope`, 128 B class) hold 40-byte `(Rc<str>, Binding)` entries and run
+  `finalize_scope_cell` (value.rs:3621). Shape ids are process-wide; transitions per heap.
+- The write barrier stores two bytes (card and page summary, gc_core.rs:110); a minor collection
+  reads every carded page's summary (~0.4 ms per minor on Splay's ~480 MB heap). Generated code
+  allocates only through helpers followed by a poll (jit.rs:1973-2003, 16982).
+- Exotic state still lives in address-keyed side tables (proxies, promises, generators,
+  `class_info`, mapped arguments, regexps, typed arrays; interpreter.rs:3423-3756).
+- Heap sizing follows V8 since the close-out (`gc_pacing.rs`): dynamic growing factor 1.1-4,
+  nursery 2-32 MiB, the memory reducer. Splay's heap peaks at twice P1's because of that
+  factor; its live heap (~246 MB) is the layout's doing. Not ported: V8's cap of each limit
+  at halfway between the live size and the heap maximum (heap-controller.cc,
+  `BoundAllocationLimit`), since the engine has no maximum (V8's old generation may reach
+  half of physical memory, clamped to 256 MB-4 GB on 64-bit desktop hosts, heap.cc
+  `OldGenerationSizeFromPhysicalMemory`; Node reports a 4288 MB limit here). With a 4 GB
+  maximum the cap binds only above ~585 MB live (4L > (L + 4 GB) / 2).
+
+Unmerged pre-P1 branches.
+- agent/jit-arith and agent/jit-calls: already on main (9 of 11 commits patch-identical by
+  `git cherry`, the others same-subject); the refs can go.
+- review/borrowed-own-reads-sparse-20261015 (6) and review/borrowed-main-integration-20261015:
+  built on the removed tier and pre-P1 ownership; design input for P3 only (a9ba62d2's x64
+  call templates could be harvested separately).
+- compiler-logical-legacy-arguments-v5-20261015 (2): appears to target compiled frames reading
+  `f.arguments` as null (interpreter.rs:15063), the cause of the two staging/sm Test262 failures
+  at threshold 0; it touches the removed tier and would be re-done, not re-landed.
+
+## Workstreams
+
+W1. Builtins and Proxy-heavy paths (first: the largest single measured win)
+- Index keys without allocation: the generic algorithms take numeric keys (interned index
+  atoms or an index key variant) instead of formatting strings; Proxy trap calls pass them.
+- Cheaper Proxy traps: a trap call from a builtin's generic loop without the full call chain's
+  per-call checks (still observable-equivalent: the trap is a user function).
+- Holey fast paths under the existing protector (holes stay holes), in-place deque splice
+  (no whole-array copies, dense_deque.rs:227-236), bulk indexOf/lastIndexOf/includes, dense
+  sort and fill; a census of generic-path hits on the acceptance set picks the rest.
+- Exit (proposed): Vue's `shift` time cut by 10x; no builtin in the acceptance set spends more
+  than 5% of a workload's time on a generic path that a fast path could take.
+
+W2. Object model, second pass (layout and the collector's remaining costs)
+- W2a Atoms: property keys and binding names interned per Agent heap (with a static table for
+  the names compiled code embeds, since ASTs are shared across Agents), compared by identity;
+  layouts and environments stop finalizing (the P1 record: a fifth of the sustained workload's
+  minor collection time).
+- W2b Per-chunk scope descriptors: environments index slots through a shared descriptor (V8's
+  ScopeInfo, JSC's SymbolTable) instead of owning `(Rc<str>, Binding)` entries; eval/with and
+  reflection keep a name path through the descriptor.
+- W2c Elements as 8-byte words under a per-array "all plain" kind (the proof exists,
+  value.rs:5640); a non-plain element moves the array to a dictionary representation (V8's
+  elements kinds). Halves arrays; one load per JIT element read.
+- W2d A slimmer cell: `Callable`, the typed-array pointer and mirror state move to kind-specific
+  payloads, flags pack, only the overflow spills; then either the 128 B class or more inline
+  slots at 192 B, chosen by allocation-site slack tracking (V8's).
+- W2e Inline allocation in generated code: cursor take, byte charge and template copy, keeping
+  the poll after allocation.
+- W2f A chunk-level card summary (one more barrier store in both backends).
+- W2g Exotic state into payload cells, as P1 did for Map and Set: proxies, promises, generators,
+  `class_info`, RegExps (with W5), typed arrays.
+- Exit (proposed): Splay's live heap halved; fixtures' peak RSS at or below the close-out's;
+  the sustained workload's minor collection time down by the finalizer share; JIT dump checks
+  unchanged apart from intended layout changes.
+
+W3. Call path
+- Measure first (TRUST_JS_JIT_CALLSTAT, DIAGNOSTICS.md) which direct-call misses dominate on
+  the acceptance set; the code alone does not size them.
+- The direct sequence's own cost: the bare call takes 41 ns an iteration against Sparkplug's
+  22, though all but 872 of its 5,001,000 calls take the direct sequence
+  (TRUST_JS_JIT_CALLSTAT); count what each call executes (the JIT dump) and trim it.
+- A class-constructor bit on the function object instead of `class_info` probes on every call
+  (interpreter.rs:12593, 14860, 15067).
+- With W2b's descriptors: slot-indexed environments that the direct sequence or a lean helper
+  builds, so functions with closures take the direct path.
+- `arguments[i]`, `arguments.length` and rest length served from the caller's argument window
+  (which the moved-frame entry already keeps alive, jit.rs:17937); mapped arguments as a slot
+  map in the object.
+- Call caches for the VM's `Op::Call` and `CallSpread`, and bound-function cache entries.
+- A lighter native boundary for natives that cannot re-enter JS.
+- Exit (proposed), against Node limited to Sparkplug on the call table: the direct, method,
+  closure and constructor calls and recursion within 1.25x (today 1.5-2.2x); `arguments`,
+  rest, `call`/`apply`, spread and the getter within 2x (today 3.2-14x); Vue/React elapsed
+  improved by the measured call share.
+
+W4. Feedback for the speculative tier
+- Always-on value classes for arithmetic and comparison sites, written only on VM and miss
+  paths; a production read API; the schema documented in the tree (tracked .txt).
+- Call-target identity exported from CallSite; elements kinds from the mirror flags; a
+  megamorphic state.
+- Allocation-site records keyed by allocation PC, with survival counted at minor collections
+  (boilerplates, slack tracking for W2d, and pretenuring: Splay-like workloads promote nearly
+  everything they allocate).
+- PCs of inlined and recompiled code mapped to their baseline sites.
+- Finish Pilot C (descriptor classes as a proof) and add a dependency registry for
+  invalidation.
+- Exit (proposed): feedback on by default at <= 2% cost on the acceptance set; coverage (share
+  of executed operations with usable feedback) reported as a standing metric and >= 95% on it.
+
+W5. RegExp
+- Slice-view captures; direct paths for `match` with /g, `search` and `matchAll` (no
+  throwaway arrays); a protector bit replacing the per-call guard lookups; the compiled program
+  and `lastIndex` in the RegExp's own payload (no `regexps`/`gc_pin` hashing per exec and
+  creation, which also removes the largest per-minor cost left on Octane RegExp); case closure
+  at compile time; required-literal and NEON prefilters.
+- Then, decided on measurements: a native tier with captures and alternation behind a
+  differential gate (V8's Irregexp compiles to machine code), or growing the interpreted tier.
+- Exit (proposed): Octane RegExp and Djot's `exec` time each cut by 2x from the close-out.
+
+## Order
+
+1. W1 (independent, largest measured win).
+2. W2a + W2b (atoms and scope descriptors: they remove finalizers and unblock W3's environment
+   work).
+3. W3 with W4's call-target feedback.
+4. W2c-W2g (layout; each touches JIT templates and carries dump checks).
+5. W4's remainder; W5 alongside wherever it shares no code with the stage in progress.
+
+Each stage: a recorded design note before code (as P1's stages), its own commit series, the
+gates below, and its exit measurement.
+
+## Gates
+
+As P1's working agreements (docs/v8-chase-p1-plan-2026-10-15.txt), per commit series: rustfmt,
+clippy in the five configurations and the workspace, rustdoc warnings, the lib suite and its
+test list, the downstream crates (with TRUST_JS_GC_VERIFY=1), the fixtures, difftest, the dump
+checks, Test262 in full at --tier=jit threshold 8 (report identical apart from intended changes),
+targeted GC stress; on zombie the compile checks, the x86-64 and Windows lib suites and the
+release checks. Stage exits add the whole lib suite under GC stress, Test262 under GC stress at
+threshold 0, Test262 on x86-64, TRust's handoff checks and its GC-relevant tests under stress.
+
+## Measurement
+
+Every stage exit, on a quiet machine (no other load over a minute), one job at a time,
+interleaved rounds, engine runs pinned to CPU 5: the fixtures (vue, react, djot, sustained
+allocation, empty) at their tiers; Octane 2 in full; Web Tooling; ARES-6 in full (about 21
+minutes an engine run, 12 of them ML's); the call microbenchmarks; TRust's offline browser
+replays (dom-reconcile, Speedometer Vue, event loop) and Octane through TRust; Node v24
+alongside as the reference, in full, limited to Sparkplug (`--max-opt=1`) and limited to
+Maglev (`--max-opt=2`). Pinned to one CPU, Node's background compiler and collector threads
+share that CPU; on the fixtures Node is faster limited to Maglev than in full. The harness:
+target/claude-closeout/bench (bench.py, tables.py, final-timing.sh, node-tiers.sh,
+run-when-quiet.sh, and gc-live.sh for the live heaps); the external suites' checkouts:
+target/claude-closeout/ext (chromium/octane 570ad1cc, v8/web-tooling-benchmark 4a12828c built
+with `npm install --ignore-scripts` and its build steps, WebKit PerformanceTests/ARES-6, whose
+Babylon reads its inputs with the shells' `read`, which the harness and scripts/run-ares6.sh
+define).
+
+## Decisions for the owner
+
+0. Profiling access. Crystal refuses `perf` at kernel.perf_event_paranoid=2 even for user-space
+   software events. Attribution beyond the engine's own counters (TRUST_JS_PERF_METRICS,
+   TRUST_JS_GC_LOG, TRUST_JS_JIT_CALLSTAT) needs paranoid <= 1 or CAP_PERFMON on a perf binary.
+1. Branching. P2's stages are separable: land each on main behind its gates (recommended), or
+   a P2 branch as P1 had.
+2. The exit numbers: the phase's (each fixture within 2x of Node limited to Sparkplug) and
+   each stage's (proposals above).
+3. W5's direction once its interpreter-level stage is measured: a native tier with captures
+   and alternation, or a larger interpreted tier.
+4. Incremental marking (a marking barrier) in P2 or after P3. V8 marks incrementally and
+   concurrently; TRust's pages pay full major pauses today (Splay's are ~85 ms).
+5. Memory policy: V8's sizing (adopted in the close-out) trades peak RSS for throughput on
+   allocation-heavy workloads (against main: Octane +10%, Web Tooling +41% to 4.67 GB,
+   ARES-6 +56%, sustained allocation +45%, Octane through TRust +78%), and P2's layout work
+   (W2) is the intended answer. Options: confirm as is; port V8's halfway-to-the-maximum cap
+   with V8's maximum (half of physical memory, 256 MB-4 GB) for pacing only, without V8's
+   out-of-memory failure at the maximum (recommended: it is V8's own rule); or set a
+   different cap or a lower ceiling for the growing factor. Of the standalone suites, V8's
+   cap would bind only on Web Tooling (live heap up to 1027 MB); Octane's, ARES-6's and the
+   sustained workload's increases come with the growing factor and the nursery, which only
+   a lower ceiling, or W2's smaller live heaps, would reduce.
+6. The dead refs agent/jit-arith and agent/jit-calls: delete.
+
+## Non-goals
+
+Speculative optimization, inlining beyond today's guarded splicing, deoptimization (P3); moving
+or compacting collection; concurrent marking; string representation work beyond W2a's atoms;
+startup snapshots (P4); Speedometer acceptance beyond the replays.
+
+## Risks
+
+- Atoms and scope descriptors (W2a/W2b) touch every name path, eval/with and reflection; the
+  ShadowRealm and multi-Agent cases (shared ASTs) need the static name table to be sound.
+- Element words (W2c) change the JIT's element templates on both backends; dump checks and
+  difftest must hold, and the dictionary transition must be exactly specification-equivalent.
+- Always-on feedback (W4) must not tax the baseline beyond its budget; measure per stage.
+- A native RegExp tier (W5) is a second code generator; it lands only behind a differential
+  gate against the interpreter on Test262's RegExp suites plus a fuzzed corpus.
