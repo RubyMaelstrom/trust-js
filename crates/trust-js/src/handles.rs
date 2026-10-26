@@ -16,7 +16,7 @@
 //! strong again), which the table records as they are written and each collection's marking
 //! consumes beside the side tables' records (`gc_collect::ClientRecords`): an entry not written
 //! since names an old cell, one the last collection marked, which no minor collection unmarks
-//! or frees, or, if weak, nothing. Debug builds check that as each collection starts
+//! or frees, or, if weak, nothing. Heap verification checks that as each collection starts
 //! ([`HandleTable::check_records`]). Handles write no cell, so the write barrier is not
 //! involved.
 
@@ -186,7 +186,7 @@ impl HandleTable {
         cleared
     }
 
-    /// Debug builds, as each collection starts, beside the side tables' check
+    /// Heap verification, as each collection starts, beside the side tables' check
     /// (`MarkClient::check_records`), against the last collection's marks: an entry not written
     /// since the last collection names an old cell or, if weak, nothing, since a minor collection
     /// reads only the entries written since. Panics naming the entry, its strength and the cell.

@@ -37,8 +37,9 @@
 //!   sweeps only the pages that received cells since the last collection, and
 //!   the large cells. A cell is old once any collection has marked it, so an
 //!   old cell that died waits for a major collection.
-//! - Debug builds poison freed cells, verify the marked graph and check the
-//!   write barrier and the young pages' bookkeeping as each collection starts.
+//! - Debug builds poison freed cells. Heap verification ([`Heap::set_heap_verification`];
+//!   debug builds, opt-in but for the engine's unit tests) checks the write barrier and the
+//!   young pages' bookkeeping as each collection starts and verifies the marked graph.
 
 use crate::fasthash::FastMap;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -73,7 +74,7 @@ const POISON: u64 = 0xdddd_dddd_dddd_dddd;
 /// S6 step 10b: a page of a kind whose cells gain references after their initialization
 /// ([`LayoutDesc::carded`]) ends in a card table, a byte per card of `1 << CARD_SHIFT` bytes of
 /// the page. The write barrier sets the card of a written cell's start ([`card_mark`]); a
-/// collection checks the cards (debug builds) and clears them when it starts.
+/// collection checks the cards (heap verification) and clears them when it starts.
 pub(crate) const CARD_SHIFT: u32 = 7;
 /// The bytes of a carded page's card table, its last: one per card of the page.
 pub(crate) const CARD_TABLE_BYTES: usize = PAGE_SIZE >> CARD_SHIFT;
@@ -1285,8 +1286,8 @@ pub(crate) trait MarkClient {
     fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64));
     /// Ephemeron entries kept in side tables (WeakMap/WeakSet data).
     fn ephemerons(&self, sink: &mut EdgeSink<'_>);
-    /// Debug builds, as each collection starts (beside the write barrier's check, before any
-    /// mark is cleared): check what the embedder recorded since the last collection against
+    /// Heap verification, as each collection starts (beside the write barrier's check, before
+    /// any mark is cleared): check what the embedder recorded since the last collection against
     /// that collection's marks, read with [`Heap::cell_age`], and panic on a violation. A minor
     /// collection's client may report only what changed since the last collection (S6 step
     /// 10d): an old owner whose entries were not written holds old values, which the last
@@ -1468,7 +1469,7 @@ pub(crate) const COUNTED_DESCS: usize = 32;
 /// The phases of a collection the heap times (diagnostics; [`Heap::set_phase_timing`]).
 #[derive(Clone, Copy)]
 pub(crate) enum Phase {
-    /// Checking (debug builds), clearing or gathering the cards and marks.
+    /// Checking (heap verification), clearing or gathering the cards and marks.
     Begin,
     /// The client's roots.
     Roots,
@@ -1548,6 +1549,8 @@ pub(crate) struct Heap {
     /// ([`Heap::request_major`]). Cleared as a major collection starts.
     major_requested: bool,
     stress_every: usize,
+    /// Heap verification at every collection (debug builds; [`Heap::set_heap_verification`]).
+    verify_heap: bool,
     /// With a nursery and a stress interval, every this many collections one is major.
     stress_major_every: usize,
     /// Collections started under a stress interval.
@@ -1635,6 +1638,7 @@ impl Heap {
             major_due: false,
             major_requested: false,
             stress_every: 0,
+            verify_heap: cfg!(test),
             stress_major_every: DEFAULT_STRESS_MAJOR_EVERY,
             stress_collections: 0,
             allocs_since_gc: 0,
@@ -1757,6 +1761,23 @@ impl Heap {
         self.stress_every = allocs;
         self.update_fast_alloc();
         self.refresh_due();
+    }
+
+    /// Heap verification, in debug builds: as every collection starts, check the write barrier's
+    /// invariant, the young pages' bookkeeping and the client's records ([`Heap::begin_marking`]);
+    /// after its marking, check every marked cell's edges ([`Heap::verify`]); after its sweep,
+    /// the live-cell accounting. Each walks the whole heap, which makes a minor collection cost
+    /// what a major one does, so it is off but in the engine's unit tests (`TRUST_JS_GC_VERIFY`
+    /// turns it on for an Agent's heap; see `gc_collect::gc_verify`). Release builds never
+    /// verify. Checks proportional to a collection's own work run in every debug build.
+    pub(crate) fn set_heap_verification(&mut self, on: bool) {
+        self.verify_heap = on;
+    }
+
+    /// Whether collections verify the heap ([`Heap::set_heap_verification`]): never in release
+    /// builds.
+    pub(crate) fn verifies(&self) -> bool {
+        cfg!(debug_assertions) && self.verify_heap
     }
 
     /// With a nursery and a stress interval, make every `collections`-th collection that the heap
@@ -3064,7 +3085,7 @@ impl Heap {
         self.phase_done(Phase::Side, &mut clock);
         self.drain(&mut m, client);
         self.phase_done(Phase::Drain, &mut clock);
-        if cfg!(debug_assertions) {
+        if self.verifies() {
             self.verify(&m);
         }
         #[cfg(test)]
@@ -3073,17 +3094,18 @@ impl Heap {
         }
     }
 
-    /// As a collection starts: in debug builds, check the write barrier's invariant against the
-    /// last collection's marks and the cards set since ([`Heap::check_write_barrier`]), the
-    /// young pages' bookkeeping ([`Heap::check_young_pages`]) and the client's records of what
-    /// changed since ([`MarkClient::check_records`]). Then a major collection clears every mark
+    /// As a collection starts: with heap verification, check the write barrier's invariant
+    /// against the last collection's marks and the cards set since
+    /// ([`Heap::check_write_barrier`]), the young pages' bookkeeping
+    /// ([`Heap::check_young_pages`]) and the client's records of what changed since
+    /// ([`MarkClient::check_records`]). Then a major collection clears every mark
     /// and every card, so that marking starts from nothing; a minor one gathers the old cells
     /// whose cards are set into `card_cells` (S6 step 10c) and clears those cards. Either way
     /// the next collection's cards record only what is written from now on. Out of line, so
     /// that `mark_phase` can zero the frames it used (see there).
     #[inline(never)]
     fn begin_marking(&mut self, kind: CollectionKind, client: &dyn MarkClient) {
-        if cfg!(debug_assertions) {
+        if self.verifies() {
             self.check_write_barrier();
             self.check_young_pages();
             client.check_records(self);
@@ -3111,10 +3133,10 @@ impl Heap {
         }
     }
 
-    /// The young pages' bookkeeping, checked in debug builds as each collection starts: the list
-    /// names exactly the pages flagged young, each once, and every other page's allocated cells
-    /// are old (marked) or zombies. A minor collection sweeps the young pages alone, and lists
-    /// the dead there, so it relies on the second.
+    /// The young pages' bookkeeping, checked by heap verification as each collection starts:
+    /// the list names exactly the pages flagged young, each once, and every other page's
+    /// allocated cells are old (marked) or zombies. A minor collection sweeps the young pages
+    /// alone, and lists the dead there, so it relies on the second.
     fn check_young_pages(&self) {
         let flagged = self
             .pages
@@ -3153,13 +3175,14 @@ impl Heap {
         }
     }
 
-    /// The write barrier's invariant, checked in debug builds as each collection starts, before
-    /// it clears any mark or card: an old cell (one a collection marked) whose card is clean
-    /// holds no traced edge to an allocated, unmarked cell of this heap (one allocated since the
-    /// last collection). A cell of a kind without cards, or a large cell, has no card: it never
-    /// holds such an edge. Every collection runs it, minor and major, so GC stress runs it at
-    /// every safepoint. Minor collections, which trace an old cell only through its set card,
-    /// rely on it. Panics naming the holder's descriptor and address and the target's.
+    /// The write barrier's invariant, checked by heap verification as each collection starts,
+    /// before it clears any mark or card: an old cell (one a collection marked) whose card is
+    /// clean holds no traced edge to an allocated, unmarked cell of this heap (one allocated since
+    /// the last collection). A cell of a kind without cards, or a large cell, has no card: it
+    /// never holds such an edge. Every verifying collection runs it, minor and major, so GC
+    /// stress with verification runs it at every safepoint. Minor collections, which trace an
+    /// old cell only through its set card, rely on it. Panics naming the holder's descriptor and
+    /// address and the target's.
     fn check_write_barrier(&self) {
         let mut edges: Vec<*const u8> = Vec::new();
         let mut check = |holder: usize, desc: DescId| {
@@ -3213,7 +3236,7 @@ impl Heap {
     fn sweep_phase(&mut self) {
         let kind = self.collecting_kind;
         let freed = self.sweep(kind);
-        if cfg!(debug_assertions) {
+        if self.verifies() {
             if let Some((desc, count)) = self.live_count {
                 // SAFETY: `attach_live_count`'s contract.
                 assert_eq!(
@@ -4131,8 +4154,8 @@ pub(crate) fn register_thread_native_stack() -> bool {
 }
 
 /// Native stack a collection zeroes below its frame once `Heap::begin_marking` has run, before it
-/// scans the stack: the frames of debug builds' barrier check, which traces every old cell, and
-/// of the clearing of marks and cards, which reads page addresses.
+/// scans the stack: the frames of heap verification's barrier check, which traces every old
+/// cell, and of the clearing of marks and cards, which reads page addresses.
 #[cfg(not(target_arch = "wasm32"))]
 const BEGIN_MARKING_SCRUB_BYTES: usize = if cfg!(debug_assertions) {
     256 << 10

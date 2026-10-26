@@ -817,7 +817,7 @@ impl ComputedReadCache {
         }
     }
 
-    /// Debug builds, after a minor collection's marking: every cached key is marked, so the
+    /// Heap verification, after a minor collection's marking: every cached key is marked, so the
     /// minor collection, which traced only the keys cached since the last one, missed none.
     #[cfg(debug_assertions)]
     pub(crate) fn check_pins_marked(&self, core: &crate::gc_core::Heap) {

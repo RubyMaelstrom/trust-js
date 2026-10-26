@@ -3355,9 +3355,9 @@ pub(crate) fn trace_heap_roots_for(
     }
 }
 
-/// Debug builds, after a minor collection's marking: every code root's edges are marked, so the
-/// minor collection, which traced only the young code roots and the reported stores, missed no
-/// store of a young cell into an older root (see [`remember_code_edges`]).
+/// Heap verification, after a minor collection's marking: every code root's edges are marked, so
+/// the minor collection, which traced only the young code roots and the reported stores, missed
+/// no store of a young cell into an older root (see [`remember_code_edges`]).
 #[cfg(debug_assertions)]
 pub(crate) fn check_code_roots_marked(heap: &GcState, core: &crate::gc_core::Heap) {
     use crate::gc_trace::GcTrace;
@@ -3382,7 +3382,7 @@ pub(crate) fn check_code_roots_marked(heap: &GcState, core: &crate::gc_core::Hea
     }
 }
 
-/// Debug builds, after a minor collection's marking: every layout the shape directory holds is
+/// Heap verification, after a minor collection's marking: every layout the shape directory holds is
 /// marked, so the minor collection, which traced only the entries written since the last one
 /// (`ShapeLayouts::trace_roots`), missed none.
 #[cfg(debug_assertions)]
@@ -4809,8 +4809,8 @@ pub(crate) fn register_code_roots<T: crate::gc_trace::GcTrace + 'static>(owner: 
 /// Record the edges of `value`, which was just stored into a registered code root (a late
 /// template or layout fill): the next minor collection traces them, since it traces only the
 /// code roots registered since the last collection (see `GcState::young_code_roots`). Every
-/// store of a new cell into an older code root must be reported here; debug builds check it
-/// after every minor collection's marking ([`check_code_roots_marked`]).
+/// store of a new cell into an older code root must be reported here; heap verification checks
+/// it after every minor collection's marking ([`check_code_roots_marked`]).
 pub(crate) fn remember_code_edges(value: &dyn crate::gc_trace::GcTrace) {
     struct Words<'a>(&'a mut Vec<u64>);
     impl crate::gc_trace::GcSink for Words<'_> {

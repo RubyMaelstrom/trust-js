@@ -140,18 +140,26 @@ comment/example in the same change.
 - `TRUST_JS_GC_STRESS=N` collects at the first safepoint after every N cell allocations and
   polls at every call (N=1 finds unrooted values; run each test in its own process, since a
   use-after-free can take down the whole run). Its collections are minor but for every Mth,
-  which is major (`TRUST_JS_GC_STRESS_MAJOR=M`, 8 by default; 1 makes every one major). Debug
-  builds also check the write barrier as every collection starts, minor or major, so stress
-  checks it at every safepoint: an old cell (one a collection kept) that holds a cell
-  allocated since the last collection must have had its card set when it was written, and a
-  panic `write barrier: old cell …` names both cells. The side tables' records are checked
-  the same way: a side-table entry that holds such a cell, or belongs to such a cell, must
-  have been recorded when it was written, and a panic `side-slot table …`,
-  `weak_collection_data: …` or `native_function_realms: …` names the table, the owner and
-  the value. So are the rooted handles' (the values host code keeps): a handle not written
-  since the last collection must name a cell that collection kept (or, if weak, nothing), and
-  a panic `handle table of heap …` names the entry and the cell.
-  `TRUST_JS_GC_LOG=1` lines name each collection's kind and report live cells, live bytes,
+  which is major (`TRUST_JS_GC_STRESS_MAJOR=M`, 8 by default; 1 makes every one major). With
+  `TRUST_JS_GC_VERIFY=1`, a debug build under stress also verifies the heap at every
+  safepoint.
+- `TRUST_JS_GC_VERIFY=1` verifies the heap at every collection, minor or major, in a debug
+  build. The engine's unit tests always do; any other debug build only with it set (to
+  anything but `0`), and release builds never. Each check walks the whole heap, so a verifying
+  minor collection costs what a major one does; checks proportional to a collection's own
+  work run in every debug build. As each collection starts it checks the write barrier: an
+  old cell (one a collection kept) that holds a cell allocated since the last collection must
+  have had its card set when it was written, and a panic `write barrier: old cell …` names
+  both cells. The side tables' records are checked the same way: a side-table entry that
+  holds such a cell, or belongs to such a cell, must have been recorded when it was written,
+  and a panic `side-slot table …`, `weak_collection_data: …` or `native_function_realms: …`
+  names the table, the owner and the value. So are the rooted handles' (the values host code
+  keeps): a handle not written since the last collection must name a cell that collection
+  kept (or, if weak, nothing), and a panic `handle table of heap …` names the entry and the
+  cell. After marking, every edge of a marked cell must name a marked cell
+  (`heap verifier: …`), and after a minor collection's marking the engine's caches and code
+  roots must hold no unmarked young cell.
+- `TRUST_JS_GC_LOG=1` lines name each collection's kind and report live cells, live bytes,
   small-cell pages (64 KiB each) and released pages kept for reuse (`spare`) after it, the
   heap's collections so far, those that were due but postponed (`deferred`) and the bytes
   its cells own outside it, not yet released (`external`); a minor collection's line adds

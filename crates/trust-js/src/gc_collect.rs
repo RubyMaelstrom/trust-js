@@ -90,6 +90,17 @@ pub(crate) fn gc_stress() -> usize {
     })
 }
 
+/// `TRUST_JS_GC_VERIFY=1`: verify an Agent's heap at every collection, in debug builds (see
+/// `gc_core::Heap::set_heap_verification`). The engine's unit tests always verify; any other
+/// debug build only when it is set to anything but `0`, since each check walks the whole heap.
+fn gc_verify() -> bool {
+    static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test)
+        || *VERIFY.get_or_init(|| {
+            std::env::var_os("TRUST_JS_GC_VERIFY").is_some_and(|value| value != "0")
+        })
+}
+
 /// `TRUST_JS_GC_STRESS_MAJOR=M`: under GC stress, every Mth collection is major
 /// ([`GC_STRESS_MAJOR_EVERY`] by default; 1 makes every collection major).
 fn gc_stress_major() -> usize {
@@ -190,6 +201,7 @@ pub(crate) fn configure_heap(core: &mut crate::gc_core::Heap) {
     core.set_nursery_bytes(gc_nursery_bytes());
     core.set_stress_every(gc_stress());
     core.set_stress_major_every(gc_stress_major());
+    core.set_heap_verification(gc_verify());
     // `TRUST_JS_GC_WHY=1`: record retention paths, which only tests read (see `gc_test::why`).
     #[cfg(test)]
     if std::env::var_os("TRUST_JS_GC_WHY").is_some() {
@@ -283,7 +295,7 @@ impl ClientRecords {
 /// can write one; removing an entry adds no edge and records nothing. A minor collection
 /// reports the recorded owners only: an old owner whose entries were not written holds old
 /// values, which the last collection traced, and a young owner's entries were all inserted
-/// since it was allocated. Debug builds check both as each collection starts
+/// since it was allocated. Heap verification checks both as each collection starts
 /// (`Interp::check_side_slot_records`), which also catches a write through a value's interior
 /// mutability, out of the methods' sight.
 #[repr(transparent)]
@@ -365,8 +377,8 @@ impl<V, S: std::hash::BuildHasher> SideSlotTable<V, S> {
 /// registers the recorded entries only as ephemerons: an entry not written since the last
 /// collection whose key is old holds an old value (the last collection marked it, or found its
 /// key or its collection dead and evicted the entry), and an entry whose key is young was
-/// written since the key was allocated. Debug builds check both as each collection starts
-/// (`Interp::check_weak_entry_records`).
+/// written since the key was allocated. Heap verification checks both as each collection
+/// starts (`Interp::check_weak_entry_records`).
 #[repr(transparent)]
 #[derive(Default)]
 pub(crate) struct WeakCollectionData(FastMap<usize, Vec<(WeakTarget, Value)>>);
@@ -460,7 +472,8 @@ impl WeakCollectionData {
 /// [`ClientRecords`]; S6 step 10d). A minor collection reports the [[Realm]] edges of the
 /// functions registered since the last collection only (an old function's Realm was marked
 /// when the function was), and sweeps the table from them, the only functions it can find dead.
-/// Debug builds check the first as each collection starts (`Interp::check_native_realm_records`).
+/// Heap verification checks the first as each collection starts
+/// (`Interp::check_native_realm_records`).
 #[repr(transparent)]
 #[derive(Default)]
 pub(crate) struct NativeFunctionRealms(FastMap<usize, (crate::value::WeakGc, usize)>);
@@ -594,8 +607,8 @@ struct Marking<'a> {
     templates: FastMap<(usize, usize), Vec<u64>>,
     activated_realms: RefCell<FastSet<(usize, usize)>>,
     activated_homes: RefCell<FastSet<usize>>,
-    /// Debug builds: the interpreters whose roots this marking traced, the ones the checks
-    /// after a minor marking examine (`Interp::gc_heap_mark`).
+    /// Debug builds: the interpreters whose roots this marking traced, the ones heap verification
+    /// examines after a minor marking (`Interp::gc_heap_mark`).
     #[cfg(debug_assertions)]
     traced: RefCell<FastSet<usize>>,
 }
@@ -1230,7 +1243,7 @@ impl Interp {
             heap.handles.set_collecting(false);
         }
         #[cfg(debug_assertions)]
-        if started && kind == CollectionKind::Minor {
+        if started && kind == CollectionKind::Minor && heap.core.borrow().verifies() {
             let core = heap.core.borrow();
             crate::value::check_code_roots_marked(heap, &core);
             crate::value::check_shape_layouts_marked(heap, &core);
@@ -1449,7 +1462,7 @@ impl Interp {
         }
     }
 
-    /// S6 step 10d, debug builds, as each collection starts (`Marking::check_records`): a
+    /// S6 step 10d, heap verification, as each collection starts (`Marking::check_records`): a
     /// side-slot owner whose entries were not written since the last collection is old, and its
     /// side slots hold only cells the last collection marked, since a minor collection does not
     /// report it. Panics naming the table, the owner and the value.
@@ -1494,7 +1507,7 @@ impl Interp {
         }
     }
 
-    /// S6 step 10d, debug builds, as each collection starts: a WeakMap or WeakSet entry not
+    /// S6 step 10d, heap verification, as each collection starts: a WeakMap or WeakSet entry not
     /// written since the last collection has an old key (or a dead one), and with an old key an
     /// old value, since a minor collection does not register it. Panics naming the collection,
     /// the key and the value.
@@ -1529,7 +1542,7 @@ impl Interp {
         }
     }
 
-    /// S6 step 10d, debug builds, as each collection starts: a built-in registered before the
+    /// S6 step 10d, heap verification, as each collection starts: a built-in registered before the
     /// last collection (not in `registered`) is old, and its [[Realm]], the Realm's global
     /// object, was marked when it was, since a minor collection does not report the edge.
     /// Panics naming the function and the Realm.
@@ -1578,7 +1591,7 @@ impl Interp {
         });
     }
 
-    /// Debug builds, after a minor collection's marking: every cell the string caches pin is
+    /// Heap verification, after a minor collection's marking: every cell the string caches pin is
     /// marked, so the minor collection, which traced only the entries made since the last one,
     /// missed none.
     #[cfg(debug_assertions)]
