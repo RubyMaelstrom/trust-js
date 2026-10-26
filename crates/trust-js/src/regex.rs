@@ -1246,9 +1246,11 @@ impl OneByteNativeProgram {
                 if index & INTERRUPT_POLL_MASK == 0 {
                     poll_interrupt(control)?;
                 }
+                // An assertion holds at the current position, wherever it sits in the pattern
+                // (`/a^/` must never match).
                 let hit = match op {
-                    OneByteNativeOp::AssertStart => from == 0,
-                    OneByteNativeOp::AssertEnd => from == last,
+                    OneByteNativeOp::AssertStart => from + offset == 0,
+                    OneByteNativeOp::AssertEnd => from + offset == subject.len(),
                     _ => {
                         let element = subject.element_at(from + offset);
                         offset += 1;

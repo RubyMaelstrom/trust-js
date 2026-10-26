@@ -675,3 +675,29 @@ fn regexp_subjects_that_view_ascii_strings_match_as_ascii() {
         );
     }
 }
+
+/// An assertion holds at the position it is reached, wherever it sits in the pattern: the
+/// tiered one-byte matcher, which takes over after 64 executions, tested `^` and `$` at the
+/// candidate's start, so `/a^/` began matching "a".
+#[test]
+fn anchors_inside_a_pattern_keep_holding_after_the_pattern_tiers_up() {
+    check(
+        r#"
+        function run() {
+            var cases = [[/a^/, 'a'], [/a^b/, 'ab'], [/x$y/, 'xy'], [/a.^/, 'ab'], [/^ab/, 'ab'],
+                         [/ab$/, 'zab'], [/^b/, 'ab'], [/a$/, 'ab'], [/^a.c$/, 'abc'],
+                         [/^a.c$/, 'abcd'], [/^b./, 'abc'], [/x.$/, 'zxy']];
+            return cases.map(function (c) {
+                var seen = [];
+                for (var i = 0; i < 200; i++) {
+                    var r = c[0].test(c[1]);
+                    if (seen.indexOf(r) < 0) seen.push(r);
+                }
+                return seen.join('/');
+            }).join();
+        }
+        run()
+        "#,
+        "false,false,false,false,true,true,false,false,true,false,false,true",
+    );
+}
