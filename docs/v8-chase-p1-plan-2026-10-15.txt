@@ -1078,6 +1078,96 @@ Recorded disposition (merge and TRust port, 2026-10-25):
   - zombie (x86-64 release): the same four environment failures as
     before; the GPU raster tests pass when run one at a time.
 
+Recorded close-out (2026-10-26; the owner: "proceed with the close-out of
+P1, including the two TRust spec bugs, then prepare the plan for P2"):
+
+- P1's gates had measured the fixtures alone. The close-out compared the
+  engine standalone on full Octane 2, the Web Tooling Benchmark and ARES-6
+  too: old = e3310993, main = f7966b1d, close-out = 03f8e4f0, all fat LTO
+  from frozen exports, rustc 1.99.1, Node v24 as the reference. Harness
+  and suites: target/claude-closeout (bench/, ext/); results below.
+- What the comparison found:
+  - Splay: nearly everything it allocates survives its first minor
+    collection. With a fixed 2 MiB nursery and a fixed 2x growth, 724 minor
+    collections promoted ~2 MB each and 11 major ones re-marked its ~246 MB
+    live heap at ~85 ms each.
+  - RegExp: every match array copied the shared `length` layout into a new
+    layout cell with a finalizer (686,000 per run); every RegExp pin was
+    recorded for the next minor collection (~230 us each); views of ASCII
+    strings missed the byte matcher, filling the prepared-subject cache
+    whose new entries each minor collection marked as roots (~250 us).
+  - The one-byte RegExp tier (after 64 executions) tested `^` and `$` at
+    the candidate's start: /a^/ matched "a" (pre-existing).
+- Engine (branch p1-closeout):
+  - 9aae7cef, 706ce608, cdd5d3d4: the heap sizes itself as V8 does
+    (gc_pacing.rs, V8 296ba5e0): a major collection's budget grows by V8's
+    dynamic factor (1.1-4, from marking speed against the rate at which
+    the old generation grows), at least 8 MiB, plus the nursery; the
+    nursery doubles from 2 to 32 MiB while its survivors pass it and
+    returns to 2 MiB when allocation slows; V8's memory reducer (8 s after
+    a major collection that left the heap 10% and 10 MiB larger than its
+    last run, or 30 s after possible garbage or the heap's first 1 MiB of
+    growth past bootstrap; at most two collections, 0.5 s apart, while
+    allocation is slow; slow growth, <= 1.3x, after a run) through
+    Engine::memory_reducer_deadline and run_memory_reducer. The engine's
+    unit tests keep fixed budgets (TRUST_JS_GC_PACING=0 by default there).
+  - 682b26ac: the runtime's event loop runs the reducer, as Node's
+    platform does.
+  - d141ef75, 1ec8b5d5, f76eab43 (RegExp): match arrays share one
+    pre-shaped layout per kind; only ShadowRealm interpreters record pins
+    for minor collections; views of ASCII strings match as ASCII. Octane
+    RegExp's minor collections' marking p50 541 -> 77 us.
+  - b316a28b: the tier's anchors hold where they are reached.
+  - f362a882: %TypedArray%.prototype.subarray reads [[ViewedArrayBuffer]]
+    from its slot, and TypedArraySpeciesCreate's default constructor is
+    the Realm's intrinsic (TRust's platform code saw both).
+  - b008469d: scripts/run-ares6.sh gives ARES-6's Babylon the shells'
+    `read`; it stopped with a ReferenceError, so ML never ran.
+  - bbdfa8d7, 03f8e4f0: formatting.
+- TRust (branch p1-closeout, on 4aabcc7):
+  - da1e847: the two pre-existing spec bugs, and their class: the platform
+    no longer calls page-replaceable Promise statics, constructors,
+    `then`/`catch` or Promise.all (Web IDL's "a promise resolved with",
+    "react to", "wait for all"), nor %TypedArray%/DataView/ArrayBuffer
+    accessors and methods (the specifications read internal slots).
+  - e990343: the page actor and workers run the memory reducer instead of
+    a full collection after 8 s parked (pages) or at every park (workers):
+    Chrome has no idle-time or periodic full collection.
+  - b72b45a: formatting.
+- Gates, engine 03f8e4f0: rustfmt; clippy in the five configurations and
+  the workspace; rustdoc at its pre-existing 13 diagnostics, none from the
+  close-out; lib (embed) 2508/0/7 (with TRUST_JS_GC_PACING=1, 2507 and the
+  one test whose 48 MB bound assumes fixed growth); doctests; the
+  downstream crates with TRUST_JS_GC_VERIFY=1; GC stress 1 on the pacing,
+  internal-slot and RegExp tests; Test262 at threshold 8 53,575/53,575,
+  identical to part D's report. zombie (03f8e4f0): clippy clean on x86-64,
+  Windows's 23 baseline diagnostics; x86-64 2335/0/7 (a first run's one
+  failure, agent_control_tests' host-buffer safepoint test, passed 8/8
+  alone and in a full rerun), Wine 2326 and the three known snapshot codec
+  failures; fixture outputs unchanged, difftest 138 agree, 12 skipped.
+  TRust b72b45a: debug and release 4072/0/49, clippy the five known
+  warnings, release build.
+- Timing (Crystal, quiet; the tables are in the P2 plan), close-out
+  against main: Octane 2 2609 -> 2790 (+6.9%; Splay +28%, RegExp +25%,
+  SplayLatency +21%, EarleyBoyer +16%, PdfJS +10%; nothing slower by
+  more than 0.3%); Web Tooling 0.55 -> 0.72 runs/s (+31%, every tool
+  faster); ARES-6's summary 327.9 -> 318.7 ms (-2.8%; Babylon's steady
+  state -13%, Basic 2-5% slower in two runs); Djot 150 -> 141 ms; Vue,
+  React and the call microbenchmarks within 3%. Against old, it trails
+  by more than 2% only on Splay (-15%), SplayLatency (-40%) and CodeLoad
+  (-8%). TRust: the replays 5-14% faster than the P1 port
+  (dom-reconcile 2.293 -> 1.982 s), Octane through TRust 1843 -> 2049.
+  Peak RSS rose where allocation is heavy (Octane 2340 -> 2583 MB, Web
+  Tooling 3304 -> 4673 MB, ARES-6 339 -> 529 MB, sustained allocation
+  70 -> 102 MB, Octane through TRust 661 -> 1174 MB; the fixtures
+  within 2 MB): the P2 plan's Decision 5.
+- Left: the instanceof brand checks and other call-time globals in TRust's
+  prelude; RegExp's per-minor `regexps`/`gc_pin` removal (~66 us); P2's
+  layout work for Splay's live heap; V8's cap of each heap limit at
+  halfway to the heap's maximum, not ported (the P2 plan's Decision 5).
+  The P2 plan:
+  [docs/v8-chase-p2-plan-2026-10-26.txt](/big/Code/trust-js/docs/v8-chase-p2-plan-2026-10-26.txt).
+
 ### Working agreements (all agents)
 
 - Branch `rearch/v8-chase` only; one agent at a time. **Syncing `main`

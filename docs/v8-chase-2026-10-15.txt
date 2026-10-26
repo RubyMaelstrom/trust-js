@@ -9536,3 +9536,21 @@ page's summary byte (a chunk-level summary would need one more barrier
 store in both backends); elements stay 16-byte Properties and the object
 cell 192 bytes; generated code still calls Rust to allocate; and an
 incremental or concurrent marker would need a marking barrier.
+
+
+Phase status, 2026-10-26
+
+P1 merged into main (941a8a06, 2026-10-25) with its post-merge fixes and
+TRust's port; its close-out (standalone Octane 2, Web Tooling and ARES-6,
+V8's heap sizing and memory reducer, the RegExp regression, TRust's two
+standards bugs) is recorded in docs/v8-chase-p1-plan-2026-10-15.txt. P2's
+plan, for the owner's approval before code, is
+docs/v8-chase-p2-plan-2026-10-26.txt.
+
+On the program's expectation that V8-class ratios become reachable only
+after P3 (after the phase list): Node limited to its non-speculative tiers
+(Ignition and Sparkplug, --max-opt=1) still runs the Vue, React and Djot
+fixtures 3.4-3.8x faster than the close-out (113, 16 and 38 ms against
+387, 55 and 143; CPU 5, medians of 5), about the lead full Node has
+(2.9-3.9x). On the acceptance fixtures V8's lead is baseline work, P2's,
+rather than speculation's.
