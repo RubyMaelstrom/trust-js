@@ -535,6 +535,8 @@ struct HostGraph {
     /// The collecting heap's identity: the weak handles a host reports are read for it alone.
     #[cfg_attr(not(feature = "embed"), allow(dead_code))]
     heap_id: u64,
+    /// Whether the collection is minor ([`HostGcVisitor::is_minor`]).
+    minor: bool,
     roots: Vec<u64>,
     /// Logical edges: each value is reachable while its owner is.
     edges: Vec<(usize, u64)>,
@@ -542,6 +544,23 @@ struct HostGraph {
 }
 
 impl HostGcVisitor for HostGraph {
+    fn is_minor(&self) -> bool {
+        self.minor
+    }
+
+    fn native_old_generation(
+        &mut self,
+        domain: &'static str,
+        owner: usize,
+        first_young_id: usize,
+    ) -> bool {
+        if self.minor {
+            self.native
+                .declare_old_generation(domain, owner, first_young_id);
+        }
+        self.minor
+    }
+
     fn native_edge(&mut self, from: NativeGcId, to: NativeGcId) {
         self.native.native_edge(from, to);
     }
@@ -651,6 +670,7 @@ impl<'a> Marking<'a> {
         for (index, interp) in interps.iter().enumerate() {
             let mut host = HostGraph {
                 heap_id: crate::value::heap_id(&root.gc_heap),
+                minor: kind == CollectionKind::Minor,
                 ..HostGraph::default()
             };
             interp.host_state.trace_gc(&mut host);

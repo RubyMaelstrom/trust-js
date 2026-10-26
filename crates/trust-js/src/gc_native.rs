@@ -32,9 +32,29 @@ pub(crate) struct NativeGcGraph {
     roots: Vec<usize>,
     marked: Vec<bool>,
     pending: Vec<usize>,
+    /// A minor collection's old prefixes, by identity domain and owner: the identities below the
+    /// first young one are live (`HostGcVisitor::native_old_generation`).
+    old_prefixes: FastMap<(&'static str, usize), usize>,
+}
+
+/// Whether `id` is below its domain and owner's first young identity.
+fn is_old(prefixes: &FastMap<(&'static str, usize), usize>, id: NativeGcId) -> bool {
+    prefixes
+        .get(&(id.domain, id.owner))
+        .is_some_and(|&first_young| id.id < first_young)
 }
 
 impl NativeGcGraph {
+    pub(crate) fn declare_old_generation(
+        &mut self,
+        domain: &'static str,
+        owner: usize,
+        first_young_id: usize,
+    ) {
+        let first_young = self.old_prefixes.entry((domain, owner)).or_default();
+        *first_young = (*first_young).max(first_young_id);
+    }
+
     fn index(&mut self, id: NativeGcId) -> usize {
         if let Some(&index) = self.ids.get(&id) {
             return index;
@@ -99,6 +119,15 @@ impl NativeGcGraph {
 
     pub(crate) fn trace_roots(&mut self, javascript: &mut Vec<usize>) {
         self.pending.extend_from_slice(&self.roots);
+        // The old identities are live: the edges reported from them are traced, whichever host
+        // reported them, once every host has reported.
+        if !self.old_prefixes.is_empty() {
+            for (&id, &index) in &self.ids {
+                if is_old(&self.old_prefixes, id) {
+                    self.pending.push(index);
+                }
+            }
+        }
         self.drain(javascript);
     }
 
@@ -132,7 +161,7 @@ impl NativeGcGraph {
     }
 
     pub(crate) fn is_live(&self, id: NativeGcId) -> bool {
-        self.ids.get(&id).is_some_and(|&index| self.marked[index])
+        is_old(&self.old_prefixes, id) || self.ids.get(&id).is_some_and(|&index| self.marked[index])
     }
 }
 
@@ -146,6 +175,21 @@ mod tests {
             owner,
             id,
         }
+    }
+
+    /// S6 step 11c: a minor collection's old prefix. An old identity is live unreported, the
+    /// edges reported from old identities are traced, and a young identity lives only if reached.
+    #[test]
+    fn native_graph_old_prefix_is_live_and_traces_its_reported_edges() {
+        let mut graph = NativeGcGraph::default();
+        graph.declare_old_generation("test.dom", 1, 10);
+        graph.native_edge(node(1, 3), node(1, 12));
+        graph.native_edge(node(1, 13), node(1, 14));
+        graph.trace_roots(&mut Vec::new());
+        assert!(graph.is_live(node(1, 5)), "an unreported old identity");
+        assert!(graph.is_live(node(1, 3)) && graph.is_live(node(1, 12)));
+        assert!(!graph.is_live(node(1, 13)) && !graph.is_live(node(1, 14)));
+        assert!(!graph.is_live(node(2, 5)), "another owner's identities have no old prefix");
     }
 
     #[test]
@@ -198,6 +242,93 @@ mod tests {
                 .map(|id| native_live(node(5, id)))
                 .collect();
         }
+    }
+
+    /// A host that reports its native graph generationally (S6 step 11c): identity 0 is a root
+    /// holding `old`, 0 → 1 → 10, 10 holds `young` and 11 holds `stray`. In a minor collection it
+    /// declares the identities below 10 old and reports only the young identities' edges and the
+    /// edge of old identity 1, which changed since the last collection.
+    #[cfg(feature = "embed")]
+    #[derive(Default)]
+    struct GenerationalHost {
+        old: Option<crate::handles::WeakHandle>,
+        young: Option<crate::handles::WeakHandle>,
+        stray: Option<crate::handles::WeakHandle>,
+        /// Whether each collection's report took the young part alone.
+        reports: std::cell::RefCell<Vec<bool>>,
+        live_native: Vec<bool>,
+    }
+
+    #[cfg(feature = "embed")]
+    impl crate::host::HostTrace for GenerationalHost {
+        fn trace_gc(&self, visitor: &mut dyn crate::host::HostGcVisitor) {
+            let minor = visitor.is_minor() && visitor.native_old_generation("test.dom", 7, 10);
+            self.reports.borrow_mut().push(minor);
+            if !minor {
+                visitor.native_root(node(7, 0));
+                visitor.native_edge(node(7, 0), node(7, 1));
+                if let Some(old) = &self.old {
+                    visitor.native_to_js(node(7, 0), old);
+                }
+            }
+            visitor.native_edge(node(7, 1), node(7, 10));
+            if let Some(young) = &self.young {
+                visitor.native_to_js(node(7, 10), young);
+            }
+            if let Some(stray) = &self.stray {
+                visitor.native_to_js(node(7, 11), stray);
+            }
+        }
+    }
+
+    #[cfg(feature = "embed")]
+    impl crate::host::HostGc for GenerationalHost {
+        fn sweep_gc_with_native(&mut self, native_live: &dyn Fn(NativeGcId) -> bool) {
+            self.live_native = [0, 1, 10, 11].map(|id| native_live(node(7, id))).to_vec();
+        }
+    }
+
+    /// The weak handle of a new object, which lives only in this helper's frame (the collector
+    /// scans the stack) and in the handle.
+    #[cfg(feature = "embed")]
+    fn weakly_held_object(engine: &mut crate::Engine) -> crate::handles::WeakHandle {
+        crate::gc_test::in_frame(|| {
+            engine.scope(|cx| {
+                let object = crate::embed::Value::Obj(cx.new_object());
+                crate::handles::WeakHandle::new(cx, &object).expect("a weak handle")
+            })
+        })
+    }
+
+    /// S6 step 11c: a minor collection keeps a host's old native identities, reported or not,
+    /// traces the edges reported from them to young values, and frees the young values no
+    /// reported edge reaches. A major collection takes the whole graph.
+    #[cfg(feature = "embed")]
+    #[test]
+    fn minor_collections_keep_a_hosts_old_native_identities_and_trace_their_edges() {
+        let mut engine = crate::Engine::new();
+        engine.op_state().put(GenerationalHost::default());
+        engine.op_state().register_gc::<GenerationalHost>();
+        let old = weakly_held_object(&mut engine);
+        engine.host_mut::<GenerationalHost>().unwrap().old = Some(old);
+        engine.interp.gc_collect();
+        let young = weakly_held_object(&mut engine);
+        let stray = weakly_held_object(&mut engine);
+        let host = engine.host_mut::<GenerationalHost>().unwrap();
+        host.young = Some(young);
+        host.stray = Some(stray);
+        engine.interp.gc_collect_minor();
+        let host = engine.host::<GenerationalHost>().unwrap();
+        assert_eq!(*host.reports.borrow(), [false, true]);
+        assert_eq!(host.live_native, [true, true, true, false]);
+        assert!(!host.old.as_ref().unwrap().is_cleared());
+        assert!(!host.young.as_ref().unwrap().is_cleared());
+        assert!(host.stray.as_ref().unwrap().is_cleared());
+        engine.interp.gc_collect();
+        let host = engine.host::<GenerationalHost>().unwrap();
+        assert_eq!(host.reports.borrow().last(), Some(&false));
+        assert_eq!(host.live_native, [true, true, true, false]);
+        assert!(!host.young.as_ref().unwrap().is_cleared());
     }
 
     #[cfg(feature = "embed")]

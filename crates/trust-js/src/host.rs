@@ -54,7 +54,8 @@ pub trait RetainedMemory {
 /// none of this: it keeps the value in a [`Handle`](crate::embed::Handle) (S6 step 11a),
 /// wherever it is stored. A type is reported at every collection, minor or major, once it is
 /// registered with [`OpState::register_trace`] or [`ResourceTable::register_trace`] (or, as a
-/// [`HostGc`], with [`OpState::register_gc`]). These callbacks must not execute JavaScript,
+/// [`HostGc`], with [`OpState::register_gc`]). A minor collection's report may leave out what
+/// is old ([`HostGcVisitor::is_minor`]). These callbacks must not execute JavaScript,
 /// allocate JS objects, or re-enter collection.
 pub trait HostTrace {
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor);
@@ -90,9 +91,33 @@ pub struct NativeGcId {
 }
 
 /// The collector's side of a [`HostTrace`] report. Its JavaScript ends are weak handles of the
-/// collecting Engine (another Engine's, or a cleared one, report nothing); the host reports its
-/// whole graph at every collection, minor or major.
+/// collecting Engine (another Engine's, or a cleared one, report nothing). A major collection
+/// takes the host's whole graph; a minor one may take only its young part (S6 step 11c).
 pub trait HostGcVisitor {
+    /// Whether this collection is minor: it frees only values allocated since the last
+    /// collection, and no native identity the host declares old
+    /// ([`HostGcVisitor::native_old_generation`]). A host may then report only what it began to
+    /// hold since the last collection, as long as every value it leaves out is one an earlier
+    /// collection kept, which a minor collection keeps whatever the report says. A host that
+    /// reports its whole graph is right in every collection.
+    fn is_minor(&self) -> bool {
+        false
+    }
+    /// In a minor collection, declare the identities of `domain` and `owner` below
+    /// `first_young_id` old: the host numbers an owner's identities in allocation order and
+    /// counts them all old once a collection's sweep has seen them. The collection keeps the old
+    /// identities live, reported or not, and traces the edges reported from them, so the host
+    /// reports, of that owner's graph, its young identities' edges and roots and the edges of
+    /// each old identity whose edges changed since the last collection. Returns false in a major
+    /// collection, which takes the whole graph.
+    fn native_old_generation(
+        &mut self,
+        _domain: &'static str,
+        _owner: usize,
+        _first_young_id: usize,
+    ) -> bool {
+        false
+    }
     /// A logical edge from a live owner to a retained value: `value` stays alive while `owner`
     /// does.
     #[cfg(feature = "embed")]

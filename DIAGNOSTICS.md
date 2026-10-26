@@ -121,7 +121,9 @@ comment/example in the same change.
   collection, and of the engine's side tables (internal slots kept outside objects, WeakMap and
   WeakSet entries, built-ins' [[Realm]]) only the entries written since then, and sweeps only
   the pages that received cells since then, so an old object that died stays allocated until a
-  major collection, which marks and sweeps everything.
+  major collection, which marks and sweeps everything. A host may likewise report only its
+  young state to a minor collection (`HostGcVisitor::is_minor`), declaring its old native
+  identities live (`HostGcVisitor::native_old_generation`).
   Allocation safepoints and task boundaries collect minorly unless a major collection is due;
   explicit and idle collections, the shell's exit collection, ArrayBuffer pressure and the
   live-object limit collect majorly. For collector tuning, `TRUST_JS_GC_NURSERY_BYTES=N`
