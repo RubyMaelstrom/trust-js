@@ -747,7 +747,10 @@ mod tests {
         }
         assert_eq!(pacing.nursery(), Some(256 << 10));
         pacing.start(now, MB);
-        assert_eq!(pacing.end(now + Duration::from_millis(10), true, 100 * MB), None);
+        assert_eq!(
+            pacing.end(now + Duration::from_millis(10), true, 100 * MB),
+            None
+        );
         // Allocation is still sampled after a major collection that applies no factor.
         assert!(!pacing.low_allocation_rate(now + Duration::from_millis(10), 64 * MB));
     }
