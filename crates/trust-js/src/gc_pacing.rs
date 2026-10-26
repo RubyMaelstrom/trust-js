@@ -113,8 +113,12 @@ impl Events {
 pub(crate) struct Pacing {
     /// The nursery's budget, `None` without a nursery (every collection major).
     nursery: Option<usize>,
-    /// Whether the nursery's budget follows the measurements (off when a diagnostic fixes it).
+    /// Whether the nursery's budget follows the measurements (off when a diagnostic or an
+    /// explicit setting fixes it).
     dynamic_nursery: bool,
+    /// Whether a major collection's budget grows by the measured factor (off once an explicit
+    /// setting fixes the growth).
+    dynamic_growth: bool,
     /// Bytes promoted since the nursery last grew: past its budget, it grows.
     survived_since_growth: usize,
     /// When the current collection started, the bytes allocated since the last one ended, and
@@ -146,6 +150,7 @@ impl Pacing {
         Self {
             nursery,
             dynamic_nursery: dynamic_nursery && nursery.is_some(),
+            dynamic_growth: true,
             survived_since_growth: 0,
             started: None,
             mutator: None,
@@ -164,6 +169,18 @@ impl Pacing {
     /// The nursery's budget.
     pub(crate) fn nursery(&self) -> Option<usize> {
         self.nursery
+    }
+
+    /// Fix the nursery's budget at `nursery` (an explicit setting, `Heap::set_nursery_bytes`).
+    pub(crate) fn fix_nursery(&mut self, nursery: Option<usize>) {
+        self.nursery = nursery;
+        self.dynamic_nursery = false;
+    }
+
+    /// Fix the heap's growth (an explicit setting, `Heap::set_heap_growth`): major collections
+    /// return no factor, and the heap applies its own.
+    pub(crate) fn fix_growth(&mut self) {
+        self.dynamic_growth = false;
     }
 
     /// Make the next collection reduce memory: minimal growth, the smallest nursery.
@@ -231,20 +248,22 @@ impl Pacing {
         let reduce = std::mem::take(&mut self.reduce_memory);
         let factor = if major {
             self.major_speed.push(marked, pause);
-            Some(if reduce {
-                MIN_GROWING_FACTOR
-            } else {
-                let gc_speed = self.major_speed.speed(NOTHING, None);
-                let mutator_speed = self.old_allocation.speed(NOTHING, Some(THROUGHPUT_WINDOW));
-                let factor = dynamic_growing_factor(
-                    gc_speed.unwrap_or(0.0),
-                    mutator_speed.unwrap_or(0.0),
-                    MAX_GROWING_FACTOR,
-                );
-                if self.reducer.grow_slowly() {
-                    factor.min(SLOW_GROWING_FACTOR)
+            self.dynamic_growth.then(|| {
+                if reduce {
+                    MIN_GROWING_FACTOR
                 } else {
-                    factor
+                    let gc_speed = self.major_speed.speed(NOTHING, None);
+                    let mutator_speed = self.old_allocation.speed(NOTHING, Some(THROUGHPUT_WINDOW));
+                    let factor = dynamic_growing_factor(
+                        gc_speed.unwrap_or(0.0),
+                        mutator_speed.unwrap_or(0.0),
+                        MAX_GROWING_FACTOR,
+                    );
+                    if self.reducer.grow_slowly() {
+                        factor.min(SLOW_GROWING_FACTOR)
+                    } else {
+                        factor
+                    }
                 }
             })
         } else {
@@ -714,6 +733,23 @@ mod tests {
         assert!(reducer.timer(t0 + START_DELAY, 40 * MB, true, true));
         reducer.mark_compact(t0 + START_DELAY, 40 * MB, 40 * MB, 10 * MB);
         assert_eq!(reducer.deadline(), Some(t0 + START_DELAY + SHORT_DELAY));
+    }
+
+    #[test]
+    fn explicit_settings_fix_the_nursery_and_the_growth() {
+        let t0 = Instant::now();
+        let mut pacing = Pacing::new(Some(MIN_NURSERY_BYTES), true);
+        pacing.fix_nursery(Some(256 << 10));
+        pacing.fix_growth();
+        let mut now = t0;
+        for _ in 0..4 {
+            minor(&mut pacing, &mut now, Duration::from_millis(1), MB, MB);
+        }
+        assert_eq!(pacing.nursery(), Some(256 << 10));
+        pacing.start(now, MB);
+        assert_eq!(pacing.end(now + Duration::from_millis(10), true, 100 * MB), None);
+        // Allocation is still sampled after a major collection that applies no factor.
+        assert!(!pacing.low_allocation_rate(now + Duration::from_millis(10), 64 * MB));
     }
 
     #[test]

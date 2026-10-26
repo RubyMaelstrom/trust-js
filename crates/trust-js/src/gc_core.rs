@@ -1802,6 +1802,9 @@ impl Heap {
     /// The nursery budget (see the `nursery_bytes` field); `None` makes every collection major.
     pub(crate) fn set_nursery_bytes(&mut self, bytes: Option<usize>) {
         self.nursery_bytes = bytes;
+        if let Some(pacing) = &mut self.pacing {
+            pacing.fix_nursery(bytes);
+        }
         self.reset_external_budget();
         self.refresh_due();
     }
@@ -2070,6 +2073,9 @@ impl Heap {
     /// once the heap's bytes and the external bytes after a minor collection do. Until the next
     /// major collection, the budget is `min_bytes`.
     pub(crate) fn set_heap_growth(&mut self, min_bytes: usize, growth_percent: usize) {
+        if let Some(pacing) = &mut self.pacing {
+            pacing.fix_growth();
+        }
         self.min_trigger_bytes = min_bytes;
         self.growth_percent = growth_percent;
         self.trigger_bytes = min_bytes;
