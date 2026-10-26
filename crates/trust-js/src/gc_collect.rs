@@ -140,6 +140,18 @@ fn gc_nursery_bytes() -> Option<usize> {
     })
 }
 
+/// Whether Agent heaps follow V8's sizing policy (see `gc_pacing`): outside the engine's unit
+/// tests, unless `TRUST_JS_GC_PACING=0` (diagnostic) fixes the budgets; `TRUST_JS_GC_PACING=1`
+/// turns it on in the unit tests too.
+#[cfg(not(target_arch = "wasm32"))]
+fn gc_pacing_enabled() -> bool {
+    static PACING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PACING.get_or_init(|| match std::env::var_os("TRUST_JS_GC_PACING") {
+        Some(value) => value != "0",
+        None => !cfg!(test),
+    })
+}
+
 /// `TRUST_JS_GC_LOG=1` (diagnostic): log every collection, with its phases' times.
 fn gc_log() -> bool {
     static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -199,6 +211,13 @@ pub(crate) fn configure_heap(core: &mut crate::gc_core::Heap) {
     // `TRUST_JS_GC_LOG=1`: each collection's log line includes its phases' times.
     core.set_phase_timing(gc_log());
     core.set_nursery_bytes(gc_nursery_bytes());
+    // V8's sizing policy and memory reducer (see `gc_pacing`), with a nursery that grows and
+    // shrinks unless a diagnostic fixes it. The engine's unit tests keep the fixed policy, whose
+    // budgets do not depend on time.
+    #[cfg(not(target_arch = "wasm32"))]
+    if gc_pacing_enabled() {
+        core.enable_pacing(std::env::var_os("TRUST_JS_GC_NURSERY_BYTES").is_none());
+    }
     core.set_stress_every(gc_stress());
     core.set_stress_major_every(gc_stress_major());
     core.set_heap_verification(gc_verify());

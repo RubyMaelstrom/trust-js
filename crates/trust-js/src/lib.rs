@@ -105,6 +105,9 @@ mod function_realm_lifetime_tests;
 mod function_runtime;
 mod gc_box;
 mod gc_core;
+mod gc_pacing;
+#[cfg(test)]
+mod gc_pacing_tests;
 #[cfg(test)]
 mod gc_test;
 #[cfg(test)]
@@ -689,6 +692,9 @@ impl Engine {
     pub fn new_with_interrupt(interrupt: std::sync::Arc<RuntimeInterrupt>) -> Engine {
         let mut interp = Interp::new();
         interp.runtime_interrupt = interrupt;
+        // V8's `NotifyBootstrapComplete`: the memory reducer measures growth from here (see
+        // `gc_core::Heap::bootstrapped`).
+        interp.gc_heap.core.borrow_mut().bootstrapped();
         Engine {
             interp: Box::new(interp),
         }
@@ -1787,6 +1793,36 @@ impl Engine {
     #[inline(always)]
     pub fn collect_garbage_at_idle(&mut self) -> i64 {
         self.interp.collect_garbage_for_host()
+    }
+
+    /// When the host should next call [`Engine::run_memory_reducer`], if the memory reducer
+    /// waits: V8's memory reducer (src/heap/memory-reducer.cc), which after a major collection
+    /// that left the heap holding noticeably more memory, or after
+    /// [`Engine::notify_possible_garbage`], waits 8 s and then collects to give memory back
+    /// while the program allocates slowly. A host runs it from its event loop between tasks,
+    /// whether or not other work is scheduled.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn memory_reducer_deadline(&self) -> Option<std::time::Instant> {
+        self.interp.memory_reducer_deadline()
+    }
+
+    /// Run the memory reducer's timer at `now`, between tasks (see
+    /// [`Engine::memory_reducer_deadline`]): a major collection that reduces memory when the
+    /// program has been allocating slowly, or else another wait. Returns whether it collected.
+    /// Inlined: the stack below the host's frame is zeroed before the collection's frames are
+    /// built (see `Interp::gc_collect`).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(always)]
+    pub fn run_memory_reducer(&mut self, now: std::time::Instant) -> bool {
+        self.interp.run_memory_reducer(now)
+    }
+
+    /// Tell the memory reducer that much of the heap may just have become garbage, as V8's
+    /// embedders do when a document or frame goes away: unless it waits already, it collects
+    /// 8 s later if the program is quiet then.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn notify_possible_garbage(&mut self) {
+        self.interp.notify_possible_garbage();
     }
 
     /// Defer optional task-boundary collections during a short latency-sensitive

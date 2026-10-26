@@ -1541,6 +1541,16 @@ pub(crate) struct Heap {
     /// bytes have been allocated since the last collection. `None`, the default: every
     /// collection is major, due once the allocated bytes pass the byte budget.
     nursery_bytes: Option<usize>,
+    /// The sizing policy's measurements ([`crate::gc_pacing::Pacing`], after V8's): with them a
+    /// major collection's budget grows by V8's dynamic factor instead of `growth_percent`, the
+    /// nursery's budget follows V8's young generation sizing, and the memory reducer runs.
+    /// `None`, the default, keeps the fixed policy.
+    pacing: Option<Box<crate::gc_pacing::Pacing>>,
+    /// The memory the heap held from the system as the major collection in progress started.
+    committed_at_mark: usize,
+    /// The memory the heap held from the system once the engine finished bootstrapping
+    /// ([`Heap::bootstrapped`]), until the memory reducer was told the heap first grew past it.
+    bootstrap_committed: Option<usize>,
     /// A major collection is due (with a nursery): the heap held more than the byte budget after
     /// a minor collection's sweep, or a major collection was requested and deferred. Cleared as
     /// a major collection starts.
@@ -1635,6 +1645,9 @@ impl Heap {
             min_trigger_bytes: DEFAULT_MIN_TRIGGER,
             growth_percent: DEFAULT_GROWTH_PERCENT,
             nursery_bytes: None,
+            pacing: None,
+            committed_at_mark: 0,
+            bootstrap_committed: None,
             major_due: false,
             major_requested: false,
             stress_every: 0,
@@ -1791,6 +1804,90 @@ impl Heap {
         self.nursery_bytes = bytes;
         self.reset_external_budget();
         self.refresh_due();
+    }
+
+    /// Follow V8's sizing policy from now on (see [`crate::gc_pacing`] and the `pacing` field),
+    /// with the nursery budget set: when `dynamic_nursery`, that budget is the policy's first
+    /// and smallest, and it grows and shrinks with the measurements.
+    pub(crate) fn enable_pacing(&mut self, dynamic_nursery: bool) {
+        self.pacing = Some(Box::new(crate::gc_pacing::Pacing::new(
+            self.nursery_bytes,
+            dynamic_nursery,
+        )));
+    }
+
+    /// The memory the heap holds from the system: its pages, spare ones included, and its large
+    /// cells.
+    fn committed_bytes(&self) -> usize {
+        let pages = self.pages.len() - self.free_page_slots.len() + self.spare_pages.len();
+        pages * PAGE_SIZE + self.larges.values().map(|large| large.size).sum::<usize>()
+    }
+
+    /// The engine finished bootstrapping its first Realm (V8's `NotifyBootstrapComplete`): the
+    /// first time a minor collection finds the heap holding 1 MB more than now, with no major
+    /// collection yet, the memory reducer is told of possible garbage.
+    pub(crate) fn bootstrapped(&mut self) {
+        if self.pacing.is_some() {
+            self.bootstrap_committed = Some(self.committed_bytes());
+        }
+    }
+
+    /// The nursery's budget (see the `nursery_bytes` field).
+    #[cfg(test)]
+    pub(crate) fn nursery_budget(&self) -> Option<usize> {
+        self.nursery_bytes
+    }
+
+    /// The memory the heap holds from the system (see `committed_bytes`).
+    #[cfg(test)]
+    pub(crate) fn committed(&self) -> usize {
+        self.committed_bytes()
+    }
+
+    /// The memory reducer's state.
+    #[cfg(test)]
+    pub(crate) fn memory_reducer(&self) -> Option<crate::gc_pacing::MemoryReducer> {
+        self.pacing.as_ref().map(|pacing| pacing.reducer)
+    }
+
+    /// When the memory reducer's timer should next run ([`Heap::memory_reducer_timer`]), if it
+    /// waits to.
+    pub(crate) fn memory_reducer_deadline(&self) -> Option<std::time::Instant> {
+        self.pacing
+            .as_ref()
+            .and_then(|pacing| pacing.reducer.deadline())
+    }
+
+    /// Run the memory reducer's timer at `now` ([`crate::gc_pacing::MemoryReducer`]);
+    /// `can_start` is whether a collection could run now. True when the caller is to collect
+    /// majorly now to reduce memory: that collection then grows the budget minimally, returns
+    /// the nursery to its smallest and keeps no spare pages beyond the minimum.
+    pub(crate) fn memory_reducer_timer(
+        &mut self,
+        now: std::time::Instant,
+        can_start: bool,
+    ) -> bool {
+        let allocated = self.allocated_bytes.saturating_sub(self.swept_bytes);
+        let committed = self.committed_bytes();
+        let Some(pacing) = &mut self.pacing else {
+            return false;
+        };
+        // V8's timer samples allocation, then asks whether its rate is low.
+        pacing.sample(now, allocated);
+        let low = pacing.low_allocation_rate(now, allocated);
+        let start = pacing.reducer.timer(now, committed, low, can_start);
+        if start {
+            pacing.reduce_memory_next();
+        }
+        start
+    }
+
+    /// Tell the memory reducer, at `now`, that much of the heap may just have died (the host
+    /// let a document go, say): it collects after its start delay if the program is quiet.
+    pub(crate) fn notify_possible_garbage(&mut self, now: std::time::Instant) {
+        if let Some(pacing) = &mut self.pacing {
+            pacing.reducer.possible_garbage(now);
+        }
     }
 
     /// The external budget a new setting starts from: the nursery's, or without a nursery the
@@ -3035,6 +3132,15 @@ impl Heap {
         self.stats.last_finalized = [0; COUNTED_DESCS];
         let mut clock = self.phase_clock();
         self.flush_cursors();
+        if self.pacing.is_some() {
+            if kind == CollectionKind::Major {
+                self.committed_at_mark = self.committed_bytes();
+            }
+            let allocated = self.allocated_bytes.saturating_sub(self.swept_bytes);
+            if let Some(pacing) = &mut self.pacing {
+                pacing.start(std::time::Instant::now(), allocated);
+            }
+        }
         self.begin_marking(kind, client);
         // `begin_marking` handled cells' and pages' addresses in frames below this one, which the
         // native stack scan's frames reuse: zero that region first, as the engine zeroes its own
@@ -3259,9 +3365,30 @@ impl Heap {
         let external = &self.control.external;
         let external_live = external.live.get();
         let size = held.saturating_add(external_live);
+        // With pacing: V8's growing factor for a major collection's budget, and its nursery.
+        let ended = self.pacing.is_some().then(std::time::Instant::now);
+        let reducing = self
+            .pacing
+            .as_ref()
+            .is_some_and(|pacing| pacing.reducing_memory());
+        let factor = match (&mut self.pacing, ended) {
+            (Some(pacing), Some(now)) => {
+                let factor = pacing.end(now, kind == CollectionKind::Major, self.marked_bytes);
+                self.nursery_bytes = pacing.nursery();
+                factor
+            }
+            _ => None,
+        };
         match kind {
             CollectionKind::Major => {
-                let budget = size.saturating_add(size.saturating_mul(self.growth_percent) / 100);
+                // V8's limit adds the young generation's capacity, which the next minor
+                // collection may promote.
+                let budget = match factor {
+                    Some(factor) => ((size as f64 * factor) as usize)
+                        .max(size.saturating_add(crate::gc_pacing::MIN_GROWING_STEP))
+                        .saturating_add(self.nursery_bytes.unwrap_or(0)),
+                    None => size.saturating_add(size.saturating_mul(self.growth_percent) / 100),
+                };
                 self.trigger_bytes = self.min_trigger_bytes.max(budget);
             }
             // The old cells, live or not, and the payloads still charged have passed the byte
@@ -3289,7 +3416,31 @@ impl Heap {
             base
         };
         external.budget.set(budget);
-        self.trim_spare_pages();
+        self.trim_spare_pages(reducing);
+        if let Some(now) = ended {
+            match kind {
+                CollectionKind::Major => {
+                    let (before, used) = (self.committed_at_mark, self.swept_bytes);
+                    let committed = self.committed_bytes();
+                    self.bootstrap_committed = None;
+                    if let Some(pacing) = &mut self.pacing {
+                        pacing.reducer.mark_compact(now, before, committed, used);
+                    }
+                }
+                // V8's `NotifyOldGenerationExpansion`: the heap grew 1 MB past its bootstrap with
+                // no major collection yet (a major one ends this check).
+                CollectionKind::Minor => {
+                    if let Some(bootstrap) = self.bootstrap_committed {
+                        if self.committed_bytes() >= bootstrap + (1 << 20) {
+                            self.bootstrap_committed = None;
+                            if let Some(pacing) = &mut self.pacing {
+                                pacing.reducer.possible_garbage(now);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.allocs_since_gc = 0;
         self.control.collecting.set(false);
         self.update_fast_alloc();
@@ -3912,8 +4063,13 @@ impl Heap {
     /// Give the spare pages beyond the cap back to the page source, once the sweep has released
     /// its empty pages and set the next budget. (A cap checked as each page went would shrink
     /// with the pages still to go, and keep about half of a large heap that emptied at once.)
-    fn trim_spare_pages(&mut self) {
-        let cap = self.spare_page_cap();
+    /// A collection that reduces memory keeps only the minimum.
+    fn trim_spare_pages(&mut self, reducing: bool) {
+        let cap = if reducing {
+            MIN_SPARE_PAGES_WITH_NURSERY
+        } else {
+            self.spare_page_cap()
+        };
         while self.spare_pages.len() > cap {
             let base = self
                 .spare_pages

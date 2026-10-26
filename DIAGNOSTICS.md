@@ -125,20 +125,35 @@ comment/example in the same change.
   young state to a minor collection (`HostGcVisitor::is_minor`), declaring its old native
   identities live (`HostGcVisitor::native_old_generation`).
   Allocation safepoints and task boundaries collect minorly unless a major collection is due;
-  explicit and idle collections, the shell's exit collection, ArrayBuffer pressure and the
-  live-object limit collect majorly. For collector tuning, `TRUST_JS_GC_NURSERY_BYTES=N`
-  replaces the 2 MiB nursery budget: a minor collection is due once N bytes of cells have
-  been allocated since the last collection (0 turns minor collections off: every collection
-  is then major, due once the allocated bytes pass the byte budget). Objects' property and
-  element storage and environments' binding storage are cells too. Bytes that cells own
-  outside the heap (Map and Set tables, hash indexes, internal slots, bound arguments, stack
-  traces) count as well: a collection is due once a nursery budget of them was acquired since
-  the last one, and those still held count with the cells against the byte budget.
-  `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget (twice
-  the bytes a major collection leaves, at least the floor): a major collection is due once
-  the heap holds more than the budget after a minor collection, its old cells counted whether
-  they live or not. Outside GC stress, cell allocation makes collections due through these
-  budgets alone, and the live-object count only enforces the engine's live-object limit.
+  explicit and idle collections, the shell's exit collection, ArrayBuffer pressure, the
+  live-object limit and the memory reducer collect majorly.
+- The heap sizes itself as V8 does (`gc_pacing.rs`). A minor collection is due once the
+  nursery budget's bytes of cells have been allocated since the last collection: 2 MiB at
+  first, doubling up to 32 MiB whenever the bytes promoted since it last grew pass it, and back
+  to 2 MiB while allocation is slower than 1 KB/ms. A major collection leaves a byte budget of
+  the bytes it kept times V8's dynamic growing factor (1.1 to 4: smaller the faster marking is
+  than the program's promotion, so that major collections take about 3% of the time), at least
+  8 MiB more than it kept, plus the nursery budget. V8's memory reducer runs when the host
+  calls `Engine::run_memory_reducer` at `Engine::memory_reducer_deadline`: 8 s after a major
+  collection that left the heap holding at least 10% and 10 MiB more than the reducer's last
+  run (30 s after `Engine::notify_possible_garbage`, or after the heap first grew 1 MiB past its
+  bootstrap without a major collection), it collects majorly to reduce memory if the program
+  allocates slowly, at most twice, 0.5 s apart; such a collection grows the budget by 1.1,
+  returns the nursery to 2 MiB and keeps no spare pages beyond the minimum, and while the
+  reducer is done the budget grows by at most 1.3. `TRUST_JS_GC_PACING=0` fixes the budgets
+  instead (the engine's unit tests' default; `1` turns pacing on there): a 2 MiB nursery and a
+  byte budget of twice the bytes a major collection kept. For collector tuning,
+  `TRUST_JS_GC_NURSERY_BYTES=N` fixes the nursery budget at N bytes (0 turns minor collections
+  off: every collection is then major, due once the allocated bytes pass the byte budget).
+  Objects' property and element storage and environments' binding storage are cells too.
+  Bytes that cells own outside the heap (Map and Set tables, hash indexes, internal slots,
+  bound arguments, stack traces) count as well: a collection is due once a nursery budget of
+  them was acquired since the last one, and those still held count with the cells against the
+  byte budget. `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte
+  budget: a major collection is due once the heap holds more than the budget after a minor
+  collection, its old cells counted whether they live or not. Outside GC stress, cell
+  allocation makes collections due through these budgets alone, and the live-object count
+  only enforces the engine's live-object limit.
 - `TRUST_JS_GC_STRESS=N` collects at the first safepoint after every N cell allocations and
   polls at every call (N=1 finds unrooted values; run each test in its own process, since a
   use-after-free can take down the whole run). Its collections are minor but for every Mth,

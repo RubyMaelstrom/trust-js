@@ -6619,6 +6619,42 @@ impl Interp {
         before.saturating_sub(live)
     }
 
+    /// When the memory reducer's timer should next run (`Engine::memory_reducer_deadline`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn memory_reducer_deadline(&self) -> Option<std::time::Instant> {
+        self.gc_heap
+            .core
+            .try_borrow()
+            .ok()
+            .and_then(|core| core.memory_reducer_deadline())
+    }
+
+    /// Run the memory reducer's timer at `now` (`Engine::run_memory_reducer`): a collection can
+    /// start outside JS execution and GC suppression only. Returns whether it collected.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(always)]
+    pub fn run_memory_reducer(&mut self, now: std::time::Instant) -> bool {
+        let agent = &self.gc_heap.agent;
+        let can_start = agent.suppressed.get() == 0 && agent.execution_depth.get() == 0;
+        let start = self
+            .gc_heap
+            .core
+            .try_borrow_mut()
+            .is_ok_and(|mut core| core.memory_reducer_timer(now, can_start));
+        if start {
+            self.collect_garbage_for_host();
+        }
+        start
+    }
+
+    /// `Engine::notify_possible_garbage`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn notify_possible_garbage(&mut self) {
+        if let Ok(mut core) = self.gc_heap.core.try_borrow_mut() {
+            core.notify_possible_garbage(std::time::Instant::now());
+        }
+    }
+
     /// Run an explicit minor collection (a major one when a major request is pending) and
     /// return the number of reclaimed heap objects: the test hook behind
     /// `Ctx::unstable_collect_young_for_host_tests`.
