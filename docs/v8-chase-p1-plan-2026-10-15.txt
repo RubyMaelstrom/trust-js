@@ -1039,6 +1039,44 @@ Recorded disposition (merge and TRust port, 2026-10-25):
 - Measured on YouTube: the host graph (the client step) is 0.69 ms
   median per minor collection, 12.6% of minor time; a minor-aware host
   trace is a follow-up. Old/new TRust timing waits for a quiet machine.
+- Follow-ups (2026-10-26). Quiet-machine timing on Crystal's X925 cores,
+  old = TRust be37666 on e3310993 with its companion patch, new = the
+  port. The offline replays ran 11.5% faster on Speedometer's Vue
+  TodoMVC and 5.6% faster on the event loop, but 11.4% slower on
+  dom-reconcile. Octane through TRust scored 18.5% higher (RegExp -15%,
+  Splay -8%; peak RSS +41%). Ten live sites used 1.5% more CPU.
+- The port reported TRust's whole DOM graph to every collection, because
+  the engine had no way to say a collection was minor. 487967dd gives
+  HostGcVisitor `is_minor` and `native_old_generation` back, as the
+  reference-counted engine had them. TRust 9bdbe7e again reports only its
+  young DOM, Range and DOMRect state to minor collections. Results
+  against old:
+  - dom-reconcile is now 7.1% faster. Its minor collections take 338 ms
+    per sample instead of 759 ms.
+  - Speedometer Vue is 14.3% faster and the event loop 6.5% faster.
+  - Five DOM-heavy live sites use 4% less CPU.
+- 0cd30d3a makes the collector's whole-heap debug checks opt-in with
+  TRUST_JS_GC_VERIFY=1; the unit tests always verify. V8's
+  --verify-heap, SpiderMonkey's JS_GC_ZEAL and JSC's verifyGC work the
+  same way.
+- TRust keeps the engine optimized in its debug builds (4aabcc7).
+  Unoptimized, its debug suite took 610 s instead of 186 s, and optimizing
+  costs about 20 s of build time.
+- TRust 5febb99 runs a full collection only after 8 s of idleness, not
+  right after every input burst on a page without timers. No browser
+  collects fully when input stops.
+- Gate for both engine commits:
+  - clippy in five configurations and the workspace;
+  - lib (embed) 2489/0/7, and doctests;
+  - the downstream crates with TRUST_JS_GC_VERIFY=1;
+  - Test262 buffer families 3528/0/1, the same as at be303e28.
+  TRust's GC-relevant tests pass under TRUST_JS_GC_STRESS=101 with
+  verification.
+- TRust 4aabcc7 on engine 487967dd:
+  - Crystal: debug and release suites 3989/0/43; clippy shows only
+    be37666's five warnings.
+  - zombie (x86-64 release): the same four environment failures as
+    before; the GPU raster tests pass when run one at a time.
 
 ### Working agreements (all agents)
 
