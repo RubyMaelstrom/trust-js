@@ -11627,9 +11627,17 @@ impl Interp {
     pub(crate) fn gc_pin(&mut self, o: &Gc) {
         let owner = Gc::as_ptr(o) as usize;
         // All callers install native metadata, a Realm group, or a template/namespace owner;
-        // cache keys and weak targets use separate registries. Attaching new ownership to an
-        // OLD object is still a changed conditional edge, including before child publication.
-        self.gc_heap.records.borrow_mut().remember_owner(owner);
+        // cache keys and weak targets use separate registries. A ShadowRealm interpreter's pin
+        // is a conditional edge from its owner to the interpreter's place in the tree
+        // (`Marking::trace_side_slots`), which a minor collection follows for the owners
+        // recorded since the last one. Attaching new ownership to an OLD object is still a
+        // changed conditional edge, including before child publication. A root interpreter has
+        // no place to keep, so its pins add no edge and need no record: every RegExp object is
+        // pinned, and recording each made every minor collection visit every one allocated
+        // since the last. The side-slot tables' writes record their owners themselves.
+        if !self.gc_heap_root() {
+            self.gc_heap.records.borrow_mut().remember_owner(owner);
+        }
         self.remember_metadata_owner(owner);
         self.gc_pins.insert(owner, *o);
     }

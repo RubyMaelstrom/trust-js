@@ -266,8 +266,9 @@ pub(crate) struct ClientRecords {
 }
 
 impl ClientRecords {
-    /// A newly installed native owner may already be old. Recording is unconditional, even
-    /// during unpublished child bootstrap: publication of shadow_home happens before marking.
+    /// A ShadowRealm interpreter's newly pinned owner (`Interp::gc_pin`), which may already be
+    /// old. A child records each, even during its unpublished bootstrap: publication of
+    /// shadow_home happens before marking.
     pub(crate) fn remember_owner(&mut self, owner: usize) {
         self.side_slot_owners.insert(owner);
     }

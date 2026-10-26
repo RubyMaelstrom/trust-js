@@ -130,6 +130,51 @@ fn a_minor_collection_reports_written_and_young_side_slot_owners_only() {
     }
 }
 
+/// Make a RegExp object no one keeps, in a frame of its own.
+#[inline(never)]
+fn dropped_regexp(engine: &mut Engine) -> HiddenAddress {
+    let regexp = engine
+        .interp
+        .make_regexp("dropped", "g")
+        .unwrap_or_else(|_| panic!("a RegExp"));
+    HiddenAddress::of(&regexp)
+}
+
+/// A pin of the root interpreter adds no edge (a ShadowRealm interpreter's pin keeps its place in
+/// the tree), so a minor collection does not report a pinned object as a side-slot owner: every
+/// RegExp object is pinned, and reporting each made every minor collection visit every one made
+/// since the last. A pinned object keeps its metadata while it lives, and a minor collection that
+/// finds a young one dead evicts its pin and metadata.
+#[test]
+fn a_minor_collection_reports_no_pins_of_the_root_interpreter() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = engine(tier);
+        engine.interp.gc_collect();
+        eval(&mut engine, "var kept = /k(e)pt/g; 0");
+        let kept = global_address(&mut engine, "kept");
+        let dropped = dropped_regexp(&mut engine);
+        assert!(kept.in_map(&engine.interp.gc_pins), "{tier:?}: pinned");
+        assert!(dropped.in_map(&engine.interp.gc_pins), "{tier:?}: pinned");
+        engine.interp.gc_collect_minor();
+        let minor = report(&engine);
+        assert!(
+            !listed(kept, &minor.side_slot_owners),
+            "{tier:?}: {minor:?}"
+        );
+        assert!(kept.in_map(&engine.interp.regexps), "{tier:?}: live");
+        assert!(kept.in_map(&engine.interp.gc_pins), "{tier:?}: live");
+        assert!(!dropped.in_map(&engine.interp.regexps), "{tier:?}: dead");
+        assert!(!dropped.in_map(&engine.interp.gc_pins), "{tier:?}: dead");
+        assert_eq!(
+            eval(
+                &mut engine,
+                "kept.exec('a kept').index + ':' + kept.lastIndex"
+            ),
+            "2:6"
+        );
+    }
+}
+
 /// Young values written into old owners' entries survive a minor collection, reached only
 /// through those entries: a reaction added to an old promise, a value sent into an old
 /// suspended generator, a held value registered with an old FinalizationRegistry. Each is used
