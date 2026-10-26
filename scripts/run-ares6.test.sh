@@ -342,6 +342,7 @@ test_trust_js_bin_skips_build_and_good_output_passes() {
   assert_contains "$ENTRY_CAPTURE" "function print(...args)"
   assert_contains "$ENTRY_CAPTURE" "function makeBenchmarkRunner(sources, name, count = 200)"
   assert_contains "$ENTRY_CAPTURE" "const readFileSync = require('node:fs').readFileSync;"
+  assert_contains "$ENTRY_CAPTURE" 'globalThis.read = (path) => readFileSync(ares6Prefix + path, "utf8");'
   assert_contains "$ENTRY_CAPTURE" "new Function(code).call(globalThis);"
   assert_contains "$ENTRY_CAPTURE" "globalThis.reportResult = reportResult;"
   assert_contains "$ENTRY_CAPTURE" "driver.start(6);"

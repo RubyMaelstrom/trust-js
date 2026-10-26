@@ -271,6 +271,10 @@ if (!ares6Root) {
 
 const ares6Prefix = /[\\/]$/.test(ares6Root) ? ares6Root : `${ares6Root}/`;
 
+// Babylon's benchmark loads its inputs with the JavaScript shells' read(), relative to the
+// suite's directory.
+globalThis.read = (path) => readFileSync(ares6Prefix + path, "utf8");
+
 function makeBenchmarkRunner(sources, name, count = 200) {
   return function runBenchmark() {
     let code = "";
