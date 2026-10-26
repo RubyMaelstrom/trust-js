@@ -146,6 +146,16 @@ impl LStr {
         self.hdr().cap.get() & ASCII_HINT != 0
     }
 
+    /// [`Self::ascii_hint`], or for a view its owner's. A view's `cap` is the view marker, so it
+    /// has no hint of its own, but it reads a range of its owner's buffer below the frontier,
+    /// and every write there clears the owner's hint unless its bytes are ASCII: while the
+    /// owner's hint holds, so does the view's content. Views come from slices and from in-place
+    /// appends, so a string built by appending to an ASCII string is one.
+    #[inline]
+    pub(crate) fn known_ascii(&self) -> bool {
+        self.ascii_hint() || self.view_owner().is_some_and(LStr::ascii_hint)
+    }
+
     #[inline]
     fn and_ascii(&self, extra_is_ascii: bool) {
         if !extra_is_ascii {
@@ -228,7 +238,7 @@ impl LStr {
         }
         debug_assert_eq!(offset, total);
         s.set_fresh_len(total);
-        s.and_ascii(parts.iter().all(LStr::ascii_hint));
+        s.and_ascii(parts.iter().all(LStr::known_ascii));
         s
     }
 
@@ -411,7 +421,7 @@ impl LStr {
         let need = self.len().checked_add(x.len()).expect("string too large");
         assert!(need < VIEW_CAP as usize, "string too large");
         let cap = need.saturating_mul(2).max(32).min((VIEW_CAP - 1) as usize) as u32;
-        let s = LStr::alloc_with_hint(self.as_str(), cap, self.ascii_hint());
+        let s = LStr::alloc_with_hint(self.as_str(), cap, self.known_ascii());
         unsafe {
             let data = (s.p.as_ptr() as *mut u8).add(HDR);
             std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(self.as_str().len()), x.len());
@@ -442,16 +452,16 @@ impl LStr {
             *self = *right;
             return;
         }
-        if !self.ascii_hint()
-            && !right.ascii_hint()
+        if !self.known_ascii()
+            && !right.known_ascii()
             && crate::jstr::needs_join_fixup(self.as_str(), right)
         {
             let replacement = crate::jstr::concat(self.as_str(), right).into();
             *self = replacement;
             return;
         }
-        if !self.append_with_hint(right.as_str(), right.ascii_hint()) {
-            let replacement = self.grow_with_hint(right.as_str(), right.ascii_hint());
+        if !self.append_with_hint(right.as_str(), right.known_ascii()) {
+            let replacement = self.grow_with_hint(right.as_str(), right.known_ascii());
             *self = replacement;
         }
     }
@@ -483,7 +493,7 @@ impl LStr {
             }
             repeated.set_fresh_len(total);
         }
-        repeated.and_ascii(self.ascii_hint());
+        repeated.and_ascii(self.known_ascii());
         repeated
     }
 
@@ -716,6 +726,34 @@ mod tests {
         assert_eq!(s.buffer_ptr(), p);
         assert!(!s.ascii_hint());
         assert_eq!(s.as_str(), "abé");
+    }
+
+    /// A view reads its owner's buffer, every write to which ANDs its bytes into the owner's
+    /// hint: a view of a hinted owner is known ASCII, and copies made from such views (a
+    /// regrown accumulator, an append of one, a concatenation, a repeat) keep the hint. A
+    /// non-ASCII append clears the owner's hint, and with it every view's, conservatively.
+    #[test]
+    fn views_of_ascii_buffers_are_known_ascii_and_their_copies_keep_the_hint() {
+        let mut accumulator = LStr::from("start").concat_owned(&LStr::from(":"));
+        accumulator.append_or_replace(&LStr::from("ab"));
+        assert!(accumulator.view_owner().is_some(), "an in-place append");
+        assert!(!accumulator.ascii_hint() && accumulator.known_ascii());
+        let slice = LStr::from("x".repeat(1024)).slice_bytes(0, 900);
+        assert!(slice.view_owner().is_some() && slice.known_ascii());
+        assert!(accumulator.concat_grown(&"y".repeat(4096)).ascii_hint());
+        let mut left = LStr::alloc_with_hint("left", 4096, true);
+        left.append_or_replace(&slice);
+        assert!(
+            left.known_ascii(),
+            "an appended view keeps the left buffer's hint"
+        );
+        let total = slice.len() + accumulator.len();
+        assert!(LStr::concat_many(&[slice, accumulator], total).ascii_hint());
+        assert!(slice.repeat_direct(2).ascii_hint());
+        let mut wide = accumulator;
+        wide.append_or_replace(&LStr::from("é"));
+        assert!(!wide.known_ascii() && !accumulator.known_ascii());
+        assert_eq!(accumulator.as_str(), "start:ab");
     }
 
     #[test]

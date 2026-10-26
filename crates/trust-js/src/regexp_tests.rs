@@ -618,3 +618,60 @@ fn match_arrays_share_one_layout_and_the_ordinary_shape() {
         ["length", "index", "input", "groups"]
     );
 }
+
+/// A view of a known-ASCII string, a long slice or a string appended to in place, is known
+/// ASCII too: RegExp methods match over its bytes, as on a flat copy, and leave the prepared
+/// subject cache, whose entries keep their strings alive, to other subjects.
+#[test]
+fn regexp_subjects_that_view_ascii_strings_match_as_ascii() {
+    use crate::value::ValueView;
+    const FIXTURE: &str = r#"
+        var base = 'x'.repeat(300) + ' needle 42 haystack';
+        var sliced = base.slice(10);
+        var appended = 'start:' + 'go'.repeat(4);
+        for (var i = 0; i < 40; i++) appended += ' ab' + i;
+        [
+            /needle (\d+)/.exec(sliced)[1],
+            sliced.replace(/x+/, '-').slice(0, 9),
+            sliced.split(/\s/).length,
+            /ab(39)$/.exec(appended)[1] + ':' + /ab(39)$/.exec(appended).index,
+            appended.match(/ab\d+/g).length,
+            appended.search(/ab7\b/),
+            /(?<w>go)+/.exec(appended).groups.w,
+            appended.replace(/ab(\d)\b/g, '<$1>').slice(0, 40),
+        ].join()
+    "#;
+    const EXPECTED: &str =
+        "42,- needle ,4,39:200,40,43,go,start:gogogogo <0> <1> <2> <3> <4> <5> <";
+    check(FIXTURE, EXPECTED);
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine.eval(FIXTURE, false).expect("fixture parses") {
+            Completion::Value(value) => assert_eq!(value, EXPECTED, "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+        for name in ["sliced", "appended"] {
+            let env = engine.interp.global_env;
+            let value = engine
+                .interp
+                .get_var(name, &env)
+                .unwrap_or_else(|_| panic!("missing {name}"));
+            let ValueView::Str(string) = value.view() else {
+                panic!("{name} is not a string")
+            };
+            assert!(string.view_range().is_some(), "{tier:?}: {name} is a view");
+            assert!(
+                !string.ascii_hint(),
+                "{tier:?}: a view has no hint of its own"
+            );
+            assert!(string.known_ascii(), "{tier:?}: {name} is known ASCII");
+        }
+        assert_eq!(
+            engine.interp.re_texts.values().count(),
+            0,
+            "{tier:?}: no subject entered the cache"
+        );
+    }
+}

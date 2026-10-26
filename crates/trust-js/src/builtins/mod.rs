@@ -11236,7 +11236,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
             let mut parts: Vec<Value> = if sep.is_empty() {
                 // Split's empty separator only returns the first `limit` code units. Decode
                 // that prefix lazily, including lone halves of an ordinary astral scalar.
-                if s.ascii_hint() || s.view_owner().is_some_and(|owner| owner.ascii_hint()) {
+                if s.known_ascii() {
                     // Bytes are already code units. The exact iterator length reserves the
                     // complete result once, including when `limit` requests the whole string.
                     // An ASCII owner proves the same for a view without scanning its bytes.

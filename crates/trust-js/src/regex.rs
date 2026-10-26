@@ -2079,8 +2079,8 @@ impl ReText {
         // Engine strings maintain an exact one-way ASCII hint in their allocation header.
         // RegExp workloads commonly stream many distinct ASCII subjects through the tiny
         // identity cache; consulting the hint avoids rescanning every subject just to select
-        // the byte matcher.
-        if s.ascii_hint() {
+        // the byte matcher. A view answers with its owner's.
+        if s.known_ascii() {
             return ReText {
                 elems: Vec::new(),
                 unit_of: None,

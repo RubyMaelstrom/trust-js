@@ -11645,13 +11645,16 @@ impl Interp {
     /// A regex-ready view of `s`, cached by string identity: repeated exec/replace/split over the
     /// same subject (the common shape of both real code and the regexp benchmarks) skips the
     /// O(len) element-vector rebuild. Strings are immutable, and each entry holds its `LStr` so the
-    /// pointer can't be reused by a new allocation while cached.
+    /// pointer can't be reused by a new allocation while cached. A known-ASCII subject, a view
+    /// of a known-ASCII string included, is matched over its bytes, which costs nothing to
+    /// prepare: it takes the one hot entry instead of a cache entry, which would keep it alive
+    /// (a minor collection marks the strings of the entries made since the last one).
     pub(crate) fn re_text(
         &mut self,
         unicode: bool,
         s: &crate::lstr::LStr,
     ) -> Rc<crate::regex::ReText> {
-        if s.ascii_hint() {
+        if s.known_ascii() {
             if let Some((cached, cached_unicode, text)) = &self.re_text_ascii_hot {
                 if *cached_unicode == unicode && crate::lstr::LStr::ptr_eq(cached, s) {
                     return text.clone();
