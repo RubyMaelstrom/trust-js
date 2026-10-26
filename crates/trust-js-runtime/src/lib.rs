@@ -503,8 +503,19 @@ impl Runtime {
                 return;
             }
 
-            // Blocked: only a timer deadline or a task completion can make progress now.
-            match self.next_timer_deadline() {
+            // Blocked: only a timer deadline or a task completion can make progress now. V8's
+            // memory reducer runs meanwhile when due, as Node's platform runs V8's delayed tasks;
+            // it never keeps the loop alive by itself.
+            let now = Instant::now();
+            let reducer = self.engine.memory_reducer_deadline();
+            if reducer.is_some_and(|due| due <= now) {
+                let collected = self.engine.run_memory_reducer(now);
+                if collected || self.engine.memory_reducer_deadline() != reducer {
+                    continue;
+                }
+            }
+            let reducer = reducer.filter(|due| *due > now);
+            match self.next_timer_deadline().into_iter().chain(reducer).min() {
                 Some(deadline) => {
                     let now = Instant::now();
                     if deadline > now {
