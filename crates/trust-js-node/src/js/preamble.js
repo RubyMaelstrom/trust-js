@@ -53,12 +53,24 @@ Error.captureStackTrace = function captureStackTrace(target, ctorOpt) {
     // Leave this wrapper out of the captured frames.
     return nativeCaptureStackTrace(target, ctorOpt || captureStackTrace);
   }
-  const sites = Array.from({ length: Error.stackTraceLimit || 10 }, makeCallSite);
+  // As in V8, the hook gets a CallSite per captured frame: Error.stackTraceLimit only bounds the
+  // capture, and may be Infinity (CoffeeScript sets it so). The engine captures the frames on a
+  // holder of their own; its formatted stack, a `\n    at` line per frame, counts them when the
+  // hook first runs.
+  const frames = Object.create(null);
+  nativeCaptureStackTrace(frames, ctorOpt || captureStackTrace);
+  let sites;
   Object.defineProperty(target, "stack", {
     configurable: true,
     get() {
       const hook = Error.prepareStackTrace;
-      if (typeof hook === "function") return hook(target, sites);
+      if (typeof hook === "function") {
+        sites ??= Array.from(
+          { length: (frames.stack ?? "").split("\n    at ").length - 1 },
+          makeCallSite,
+        );
+        return hook(target, sites);
+      }
       return `${target.name || "Error"}: ${target.message || ""}\n    at <trust-js>:0:0`;
     },
     set(value) {

@@ -2398,6 +2398,38 @@ fn node_require_missing_module_throws() {
     assert_eq!(out.lines(), ["MODULE_NOT_FOUND true"]);
 }
 
+#[test]
+fn node_prepare_stack_trace_hook_gets_a_call_site_per_captured_frame() {
+    // CoffeeScript installs an `Error.prepareStackTrace` hook and sets `Error.stackTraceLimit` to
+    // Infinity when it loads. `Error.captureStackTrace` made the hook's placeholder CallSites
+    // with `Array.from({ length: Infinity })`, a RangeError that failed chai's assertions in the
+    // Web Tooling Benchmark. As in V8, the limit only bounds the captured frames, and the frames
+    // up to the constructor option are left out.
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        Error.prepareStackTrace = (error, sites) => `${error.name}: ${sites.length}`;
+        function capture(ctorOpt) {
+          const target = { name: "T" };
+          Error.captureStackTrace(target, ctorOpt);
+          return target.stack;
+        }
+        const inner = (ctorOpt) => capture(ctorOpt);
+        const outer = (ctorOpt) => inner(ctorOpt);
+        const rows = [];
+        for (const limit of [Infinity, 2, 0]) {
+          Error.stackTraceLimit = limit;
+          rows.push(outer());
+        }
+        Error.stackTraceLimit = Infinity;
+        rows.push(outer(inner), outer(outer));
+        console.log(rows.join(", "));
+        "#,
+    );
+    assert_eq!(out.lines(), ["T: 4, T: 2, T: 0, T: 2, T: 1"]);
+}
+
 // ---- ESM (run_module: the import graph resolves against disk + node_modules) ----
 
 #[test]
