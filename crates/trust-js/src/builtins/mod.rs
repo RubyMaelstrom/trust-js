@@ -97,6 +97,29 @@ pub(crate) fn check_string_length(i: &mut Interp, len: usize) -> Result<(), Valu
 
 /// Append `piece` to a string result under construction, checking the new length first so the
 /// buffer never grows past [`MAX_STR_LEN`].
+/// Unicode Default Case Conversion of a two-byte string, by code units: the string itself when
+/// nothing changes, and through `str` only for a lowered U+03A3 (Final_Sigma).
+fn map_case(s: crate::lstr::LStr, upper: bool) -> Value {
+    let units = s.units().to_utf16();
+    match crate::jstr::map_case_units(&units, upper) {
+        Some(mapped) if mapped[..] == units[..] => Value::Str(s),
+        Some(mapped) => Value::Str(crate::lstr::LStr::from_utf16(&mapped)),
+        None if upper => Value::lstr(s.text().to_uppercase()),
+        None => Value::lstr(s.text().to_lowercase()),
+    }
+}
+
+/// Append `piece` to the engine string `out` after the string length check.
+fn append_checked(
+    i: &mut Interp,
+    out: &mut crate::lstr::LStr,
+    piece: &crate::lstr::LStr,
+) -> Result<(), Value> {
+    check_string_length(i, out.unit_len().saturating_add(piece.unit_len()))?;
+    out.append_or_replace(piece);
+    Ok(())
+}
+
 pub(crate) fn push_str_checked(i: &mut Interp, out: &mut String, piece: &str) -> Result<(), Value> {
     check_string_length(i, out.len().saturating_add(piece.len()))?;
     out.push_str(piece);
@@ -6503,21 +6526,20 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             }
         };
         // ECMA-262 §23.1.3.18 performs separator conversion before the left-to-right element
-        // Gets/ToStrings.  Append directly to one result buffer in that same order: `to_string`
-        // already returns an LStr, so this avoids one temporary Rust String per element while
-        // retaining the canonical UTF-16 fixup pass for the final sequence.
-        let mut out = String::new();
+        // Gets/ToStrings, appending each to one result in that same order. The result grows in
+        // place with geometric capacity, at the narrowest width its units allow.
+        let mut out = crate::lstr::LStr::from("");
         for k in 0..len {
             if k > 0 {
-                push_str_checked(i, &mut out, &sep.text())?;
+                append_checked(i, &mut out, &sep)?;
             }
             let v = array_get_index(i, &o, &ov, k)?;
             if !matches!((v).view(), ValueView::Undefined | ValueView::Null) {
                 let piece = ab(i.to_string(&v))?;
-                push_str_checked(i, &mut out, &piece.text())?;
+                append_checked(i, &mut out, &piece)?;
             }
         }
-        Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
+        Ok(Value::Str(out))
     });
     it.def_method(&ap, "concat", 1, |i, this, args| {
         // ToObject(this): a primitive receiver is boxed (and spread/appended as its wrapper).
@@ -11234,7 +11256,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                         .map(|u| Value::Str(crate::jstr::unit_lstr(u)))
                         .collect()
                 }
-            } else if s.ascii_hint() && sep.is_ascii() {
+            } else if s.known_ascii() && sep.is_ascii() {
                 // For ASCII operands, byte and UTF-16-unit boundaries coincide. Keep each
                 // substring as an LStr directly instead of allocating a Rust String before the
                 // engine copies it; `.take(limit)` preserves Split's post-processing truncation
@@ -11244,29 +11266,34 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                     .take(limit)
                     .map(Value::lstr)
                     .collect()
+            } else if s.known_ascii() {
+                // A non-ASCII separator never occurs in an ASCII string.
+                vec![Value::Str(s)]
             } else {
-                // String separators are matched by UTF-16 code units (ECMA-262 §22.1.3.23),
-                // not Rust scalar values. This matters when a separator is one half of an astral
-                // character: splitting `"😀"` on its high surrogate must leave the low surrogate
-                // in the second result. Convert once, search the unit sequence, and rebuild each
-                // piece independently so a separator boundary cannot accidentally recombine the
-                // pair across pieces.
+                // String separators are matched by UTF-16 code units (ECMA-262 §22.1.3.23), so a
+                // separator can be one half of an astral character: splitting `"😀"` on its high
+                // surrogate leaves the low surrogate in the second result. Each piece is a range
+                // of the receiver's units.
                 let units = s.units().to_utf16();
                 let sep_units = crate::jstr::units(sep.as_ref());
+                let find = |from: usize| -> Option<usize> {
+                    let rest = &units[from..];
+                    match sep_units[..] {
+                        [single] => rest.iter().position(|&unit| unit == single),
+                        _ => rest
+                            .windows(sep_units.len())
+                            .position(|window| window == sep_units.as_slice()),
+                    }
+                    .map(|offset| from + offset)
+                };
                 let mut parts = Vec::new();
                 let mut start = 0usize;
-                while start <= units.len() && parts.len() < limit {
-                    let found = units[start..]
-                        .windows(sep_units.len())
-                        .position(|window| window == sep_units.as_slice())
-                        .map(|offset| start + offset);
-                    let Some(position) = found else {
-                        parts.push(Value::lstr(crate::jstr::from_units(&units[start..])));
+                while parts.len() < limit {
+                    let Some(position) = find(start) else {
+                        parts.push(Value::Str(s.slice_units(start, units.len())));
                         break;
                     };
-                    parts.push(Value::lstr(crate::jstr::from_units(
-                        &units[start..position],
-                    )));
+                    parts.push(Value::Str(s.slice_units(start, position)));
                     start = position + sep_units.len();
                 }
                 parts
@@ -11684,25 +11711,25 @@ fn install_string(it: &mut Interp) {
         // ECMA-262 §22.1.3.30 applies Unicode Default Case Conversion. ASCII has no
         // one-to-many or context-sensitive mappings, so return unchanged strings by reference
         // and map changed strings directly into one LStr allocation.
-        if s.ascii_hint() {
-            if !s.text().bytes().any(|byte| byte.is_ascii_lowercase()) {
+        if let Some(text) = s.as_ascii() {
+            if !text.bytes().any(|byte| byte.is_ascii_lowercase()) {
                 return Ok(Value::Str(s));
             }
             return Ok(Value::Str(crate::lstr::LStr::map_ascii_case(&s, true)));
         }
-        Ok(Value::lstr(s.text().to_uppercase()))
+        Ok(map_case(s, true))
     });
     it.def_method(&sp, "toLowerCase", 0, |i, this, _| {
         let s = this_string(i, &this)?;
         // ECMA-262 §22.1.3.28 uses the same Unicode mapping with lowercase output. The ASCII
         // fast path is exact and avoids both a Unicode iterator and a temporary Rust String.
-        if s.ascii_hint() {
-            if !s.text().bytes().any(|byte| byte.is_ascii_uppercase()) {
+        if let Some(text) = s.as_ascii() {
+            if !text.bytes().any(|byte| byte.is_ascii_uppercase()) {
                 return Ok(Value::Str(s));
             }
             return Ok(Value::Str(crate::lstr::LStr::map_ascii_case(&s, false)));
         }
-        Ok(Value::lstr(s.text().to_lowercase()))
+        Ok(map_case(s, false))
     });
     // TRust JS strings are valid UTF-8, so they're always well-formed.
     it.def_method(&sp, "isWellFormed", 0, |i, this, _| {

@@ -195,6 +195,49 @@ pub(crate) fn code_points_of_units(units: &[u16]) -> Vec<u32> {
     out
 }
 
+/// Unicode Default Case Conversion of code units (ECMA-262 §22.1.3.28, §22.1.3.30), through
+/// `char`'s mappings: each code point maps, one-to-many included, and a lone surrogate stays.
+/// `None` when lowering units that hold U+03A3, whose Final_Sigma context `str::to_lowercase`
+/// resolves.
+pub(crate) fn map_case_units(units: &[u16], upper: bool) -> Option<Vec<u16>> {
+    let mut out = Vec::with_capacity(units.len());
+    let mut index = 0;
+    let mut buffer = [0u16; 2];
+    while index < units.len() {
+        // ASCII maps within ASCII, one to one.
+        if let Ok(byte) = u8::try_from(units[index]) {
+            if byte.is_ascii() {
+                let mapped = if upper {
+                    byte.to_ascii_uppercase()
+                } else {
+                    byte.to_ascii_lowercase()
+                };
+                out.push(u16::from(mapped));
+                index += 1;
+                continue;
+            }
+        }
+        let point = code_point_from_pair(units[index], units.get(index + 1).copied());
+        index += if point >= 0x10000 { 2 } else { 1 };
+        let Some(c) = char::from_u32(point) else {
+            out.push(point as u16);
+            continue;
+        };
+        if upper {
+            for mapped in c.to_uppercase() {
+                out.extend_from_slice(mapped.encode_utf16(&mut buffer));
+            }
+        } else if c == '\u{03A3}' {
+            return None;
+        } else {
+            for mapped in c.to_lowercase() {
+                out.extend_from_slice(mapped.encode_utf16(&mut buffer));
+            }
+        }
+    }
+    Some(out)
+}
+
 /// The single-unit string for one code unit.
 pub fn unit_str(unit: u16) -> String {
     from_units(&[unit])
