@@ -9039,20 +9039,20 @@ pub(crate) fn cdp_or_throw(
                 && b.props.get("length").map(|p| p.writable()).unwrap_or(true)
         };
         if fast {
-            if let Ok(idx) = key.parse::<u64>() {
-                if idx < 4294967295 {
-                    let len = i.array_length(o);
-                    o.borrow_mut()
-                        .props
-                        .insert(key, Property::data(v, true, true, true));
-                    if idx as usize >= len {
-                        o.borrow_mut().props.insert(
-                            "length",
-                            Property::data(Value::Num((idx + 1) as f64), true, false, false),
-                        );
-                    }
-                    return Ok(());
+            // Only an array index (canonical, below 2^32 - 1) moves `length`; "01" or "+1" is
+            // an ordinary key.
+            if let Some(idx) = crate::value::canonical_index(key) {
+                let len = i.array_length(o);
+                o.borrow_mut()
+                    .props
+                    .insert(key, Property::data(v, true, true, true));
+                if idx as usize >= len {
+                    o.borrow_mut().props.insert(
+                        "length",
+                        Property::data(Value::Num(f64::from(idx) + 1.0), true, false, false),
+                    );
                 }
+                return Ok(());
             }
         }
     }

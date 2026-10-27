@@ -3213,8 +3213,8 @@ impl Interp {
             if key == "length" {
                 return Ok(true);
             }
-            if let Ok(idx) = key.parse::<usize>() {
-                if idx < crate::jstr::unit_len(s) {
+            if let Some(idx) = crate::value::canonical_index(key) {
+                if (idx as usize) < crate::jstr::unit_len(s) {
                     return Ok(true);
                 }
             }
@@ -7501,10 +7501,7 @@ impl Interp {
         if key == "length" {
             return true;
         }
-        match key.parse::<usize>() {
-            Ok(i) => (key.len() == 1 || !key.starts_with('0')) && i < crate::jstr::unit_len(s),
-            Err(_) => false,
-        }
+        crate::value::canonical_index(key).is_some_and(|i| (i as usize) < crate::jstr::unit_len(s))
     }
 
     fn eval_delete(&mut self, arg: &Expr, env: &Env) -> Result<Value, Abrupt> {

@@ -9768,15 +9768,16 @@ impl Interp {
                     let s = *s;
                     return Ok(Value::Num(self.str_len(&s) as f64));
                 }
-                if let Ok(i) = key.parse::<usize>() {
-                    if let Some(trace) = trace.as_deref_mut() {
-                        trace.record(crate::feedback::PropertyOutcome::Exotic, None, 0, None);
-                    }
+                // StringGetOwnProperty: only a canonical numeric index below the length is own
+                // ("01", "+1" and indices past the end are read from the prototype chain).
+                if let Some(i) = crate::value::canonical_index(key) {
                     let s = *s;
-                    return Ok(match self.unit_at(&s, i) {
-                        Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
-                        None => Value::Undefined,
-                    });
+                    if let Some(u) = self.unit_at(&s, i as usize) {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(crate::feedback::PropertyOutcome::Exotic, None, 0, None);
+                        }
+                        return Ok(Value::Str(crate::jstr::unit_lstr(u)));
+                    }
                 }
                 let proto = self.string_proto;
                 self.get_from_chain(&proto, key, &receiver, trace)
@@ -9845,8 +9846,8 @@ impl Interp {
                         }
                         return Ok(Value::Num(self.str_len(&s) as f64));
                     }
-                    if let Ok(i) = key.parse::<usize>() {
-                        if let Some(u) = self.unit_at(&s, i) {
+                    if let Some(i) = crate::value::canonical_index(key) {
+                        if let Some(u) = self.unit_at(&s, i as usize) {
                             if let Some(trace) = trace.as_deref_mut() {
                                 trace.record(
                                     crate::feedback::PropertyOutcome::Exotic,
