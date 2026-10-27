@@ -726,7 +726,7 @@ mod packed_value_tests {
             assert_eq!(borrowed, prefix);
             assert_eq!(borrowed.len(), original_len);
             assert_eq!(borrowed.as_ptr(), original_address);
-            assert_eq!(current.as_engine_text(), Some(expected.as_str()));
+            assert_eq!(current.as_engine_text().as_deref(), Some(expected.as_str()));
         }
 
         let suffix = "replacement growth: ".repeat(prefix.len());
@@ -745,7 +745,7 @@ mod packed_value_tests {
             assert_eq!(borrowed, prefix);
             assert_eq!(borrowed.len(), original_len);
             assert_eq!(borrowed.as_ptr(), original_address);
-            assert_eq!(current.as_engine_text(), Some(expected.as_str()));
+            assert_eq!(current.as_engine_text().as_deref(), Some(expected.as_str()));
         }
 
         drop(current);
@@ -2100,21 +2100,27 @@ impl Value {
     pub fn from_engine_text(s: impl Into<String>) -> Value {
         Value::Str(s.into().into())
     }
-    /// Borrow a string's immutable cell text for this original receiver's lifetime.
-    pub(crate) fn as_engine_text(&self) -> Option<&str> {
+    /// A string's engine text: borrowed from a one-byte string's immutable cell for this
+    /// original receiver's lifetime, converted from a two-byte one.
+    pub(crate) fn as_engine_text(&self) -> Option<std::borrow::Cow<'_, str>> {
         let ValueView::Str(string) = self.view() else {
             return None;
         };
-        let text = string.storage_text() as *const str;
-        // SAFETY: the view copied the original receiver's cell handle. The bytes belong to
-        // that cell, not the temporary handle, and already exposed bytes never change. The
-        // original receiver remains the root/lifetime owner of the returned cell borrow.
-        Some(unsafe { &*text })
+        Some(match string.as_ascii() {
+            Some(text) => {
+                let text = text as *const str;
+                // SAFETY: the view copied the original receiver's cell handle. The bytes belong
+                // to that cell, not the temporary handle, and already exposed bytes never change.
+                // The original receiver remains the root/lifetime owner of the returned borrow.
+                std::borrow::Cow::Borrowed(unsafe { &*text })
+            }
+            None => std::borrow::Cow::Owned(string.text().into_owned()),
+        })
     }
 
-    /// Borrow a string as USVString text, replacing lone surrogates with U+FFFD.
+    /// A string as USVString text, replacing lone surrogates with U+FFFD.
     pub(crate) fn as_text(&self) -> Option<std::borrow::Cow<'_, str>> {
-        self.as_engine_text().map(crate::jstr::to_text)
+        self.as_engine_text().map(crate::jstr::to_text_cow)
     }
     /// A BigInt from an `i64` (for the embedder's 64-bit integer bridge, e.g. wasm i64).
     pub fn bigint_from_i64(v: i64) -> Value {
@@ -2566,8 +2572,8 @@ pub struct ArrayIteratorState {
     pub(crate) kind: u8,
 }
 
-/// String iterator closure state. `index` is a byte boundary in TRust JS's string
-/// representation; each transition consumes exactly one ECMAScript code point.
+/// String iterator closure state. `index` is a code unit index; each transition consumes exactly
+/// one ECMAScript code point.
 #[derive(Clone)]
 pub struct StringIteratorState {
     pub(crate) string: Option<crate::lstr::LStr>,

@@ -1439,38 +1439,13 @@ impl crate::gc_trace::GcTrace for FramePool {
     }
 }
 
-/// Cached UTF-16 view of one string, keyed by string identity (see `Interp::str_units`).
-/// JS string semantics are code units but the engine stores UTF-8 `str`; without a cache every
-/// `charCodeAt`/`[i]`/`.length` is O(len) (a full `is_ascii` scan or unit walk), which turns a
-/// scanner loop — a JS parser reading a megabytes-long source one char at a time — into O(n²).
-#[derive(Clone)]
-pub(crate) enum StrUnits {
-    /// Pure ASCII: unit `i` is byte `i` — index the `str` directly.
+/// A string's code units as the UTF-16 view readers take them (see [`crate::lstr::Units`]).
+#[derive(Clone, Copy)]
+pub(crate) enum StrUnits<'a> {
+    /// One-byte: unit `i` is byte `i`.
     Ascii,
-    /// The materialized code units.
-    Units(Rc<[u16]>),
-}
-
-const STR_UNIT_CACHE_BYTES: usize = 16 << 20;
-
-fn retained_str_units_bytes(
-    s: &crate::lstr::LStr,
-    units: &StrUnits,
-    index: Option<&crate::jstr::Utf8Index>,
-) -> usize {
-    let materialized = match units {
-        StrUnits::Ascii => 0,
-        StrUnits::Units(units) => units.len().saturating_mul(std::mem::size_of::<u16>()),
-    };
-    s.retained_requested_bytes()
-        .saturating_add(materialized)
-        .saturating_add(index.map_or(0, crate::jstr::Utf8Index::heap_bytes))
-        .saturating_add(std::mem::size_of::<(
-            usize,
-            crate::lstr::LStr,
-            StrUnits,
-            Option<Rc<crate::jstr::Utf8Index>>,
-        )>())
+    /// Two-byte: the stored units.
+    Units(&'a [u16]),
 }
 
 /// Raw state of the last successful regex match, deferred for the legacy `RegExp.$1` statics.
@@ -3389,17 +3364,6 @@ pub struct Interp {
     /// Realm-wide proof that no Proxy has been created. Raw prototype-chain walks read it live;
     /// side-table exotics are guarded per receiver by `Object::ic_plain`.
     pub(crate) inline_ic_safe: std::cell::Cell<bool>,
-    /// Recently indexed strings' UTF-16 views, keyed by string identity (the held `LStr` pins the
-    /// pointer) — see [`StrUnits`]. Bounded by retained bytes as well as entry count, so one large
-    /// source cannot escape the cache budget.
-    pub(crate) str_units: crate::cache::ByteLru<
-        usize,
-        (
-            crate::lstr::LStr,
-            StrUnits,
-            Option<Rc<crate::jstr::Utf8Index>>,
-        ),
-    >,
     /// Prepared regex subjects keyed by string identity and Unicode mode. The retained `LStr`
     /// pins each pointer, making the integer key ABA-safe. This cache is deliberately larger
     /// than the tiny UTF-16 indexing LRU: web workloads commonly prepare thousands of immutable
@@ -3838,7 +3802,6 @@ interp_memory_inventory! {
     jit_layout => "non_owning",
     interp_layout => "non_owning",
     inline_ic_safe => "non_owning",
-    str_units => "measured",
     re_texts => "measured",
     re_text_ascii_hot => "measured",
     regexp_dependency_cache => "non_owning",
@@ -3967,7 +3930,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 154);
+    assert_eq!(names.len(), 153);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4683,7 +4646,7 @@ pub const MAX_STR_LEN: usize = 1 << 26; // ~67M
 // Builders check MAX_STR_LEN as they accumulate. A few (escaping, case mapping, normalization)
 // only bound their result by a fixed expansion of an input that is within the limit (at most
 // 12x, for NFKD); keep that headroom below what an engine string can represent.
-const _: () = assert!(MAX_STR_LEN * 16 <= crate::lstr::MAX_LEN);
+const _: () = assert!(MAX_STR_LEN * 15 <= crate::lstr::MAX_LEN);
 
 #[derive(Clone)]
 pub(crate) struct HostSettingsState {
@@ -5574,7 +5537,6 @@ impl Interp {
             jit_layout: std::cell::OnceCell::new(),
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
             inline_ic_safe: std::cell::Cell::new(true),
-            str_units: crate::cache::ByteLru::new(STR_UNIT_CACHE_BYTES, 64),
             re_texts: crate::cache::ByteLru::new(32 << 20, 8_192),
             re_text_ascii_hot: None,
             regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
@@ -7676,7 +7638,7 @@ impl Interp {
     /// ToString as UTF-16 code units, lone surrogates included (a Web IDL `DOMString`).
     pub fn coerce_utf16(&mut self, v: &Value) -> Result<Vec<u16>, Value> {
         let value = self.to_string(v).map_err(abrupt_value)?;
-        Ok(crate::jstr::units(&value.text()))
+        Ok(value.units().to_utf16().into_owned())
     }
 
     /// ToString as engine text, lone surrogates included (a Web IDL `DOMString` kept as a Rust
@@ -9328,7 +9290,7 @@ impl Interp {
         let ValueView::Str(lv) = &(lval).view() else {
             return Err(lval);
         };
-        if lv.text().len() + x.text().len() > MAX_STR_LEN {
+        if lv.unit_len() + x.unit_len() > MAX_STR_LEN {
             return Err(lval); // the generic path raises the RangeError
         }
         let mut b = o.borrow_mut();
@@ -11344,183 +11306,41 @@ impl Interp {
 
     // ----- garbage collection -----------------------------------------------------------------
 
-    /// The cached UTF-16 view of `s` (see [`StrUnits`]): first access per string is O(len),
-    /// every later one O(1) — pointer-compared against a small LRU. Short strings skip the
-    /// cache entirely (the O(len) walk is trivial; caching them would just churn the LRU under
-    /// code that touches thousands of small strings once each).
-    pub(crate) fn units_of(&mut self, s: &crate::lstr::LStr) -> StrUnits {
-        // An ASCII byte already is its UTF-16 code unit (ECMA-262 String type).
-        // No derived representation needs caching. Besides avoiding prefix scans, bypassing
-        // the owning LRU keeps metadata/character reads from pinning an otherwise unique
-        // accumulator and forcing its next append to copy the entire prefix.
-        if s.ascii_hint() {
-            return StrUnits::Ascii;
+    /// `s`'s UTF-16 view (see [`StrUnits`]), read from its storage.
+    #[inline]
+    pub(crate) fn units_of<'a>(&mut self, s: &'a crate::lstr::LStr) -> StrUnits<'a> {
+        match s.units() {
+            crate::lstr::Units::Ascii(_) => StrUnits::Ascii,
+            crate::lstr::Units::Utf16(units) => StrUnits::Units(units),
         }
-        let text = s.text();
-        if text.len() < 64 {
-            return if text.is_ascii() {
-                StrUnits::Ascii
-            } else {
-                StrUnits::Units(crate::jstr::units(&text).into())
-            };
-        }
-        let key = s.as_ptr() as usize;
-        if let Some(hit) = self.str_units.get_mapped(&key, |(cached, units, _)| {
-            debug_assert!(crate::lstr::LStr::ptr_eq(cached, s));
-            units.clone()
-        }) {
-            return hit;
-        }
-        let u = if text.is_ascii() {
-            StrUnits::Ascii
-        } else {
-            StrUnits::Units(crate::jstr::units(&text).into())
-        };
-        let bytes = retained_str_units_bytes(s, &u, None);
-        self.str_units.insert(key, (*s, u.clone(), None), bytes);
-        u
     }
 
-    /// Code unit `idx` of `s`, through the cache. `None` = out of range.
+    /// Code unit `idx` of `s`. `None` = out of range.
+    #[inline]
     pub(crate) fn unit_at(&mut self, s: &crate::lstr::LStr, idx: usize) -> Option<u16> {
-        if s.ascii_hint() {
-            return s.text().as_bytes().get(idx).map(|&byte| byte as u16);
-        }
-        if s.text().len() < 64 {
-            return crate::jstr::unit_iter(&s.text()).nth(idx);
-        }
-        let read = |units: &StrUnits| match units {
-            StrUnits::Ascii => s.text().as_bytes().get(idx).map(|&b| b as u16),
-            StrUnits::Units(u) => u.get(idx).copied(),
-        };
-        // A warm entry answers without cloning the cached unit vector's ownership.
-        if let Some(unit) =
-            self.str_units
-                .get_mapped(&(s.as_ptr() as usize), |(cached, units, _)| {
-                    debug_assert!(crate::lstr::LStr::ptr_eq(cached, s));
-                    read(units)
-                })
-        {
-            return unit;
-        }
-        read(&self.units_of(s))
+        s.unit_at(idx)
     }
 
-    /// CodePointAt after receiver/index coercions. Short Unicode strings use a
-    /// bounded iterator; warm Unicode entries project two units without cloning
-    /// cache ownership. This uses the existing owning cache and its byte budget.
+    /// CodePointAt after receiver/index coercions.
+    #[inline]
     pub(crate) fn code_point_at(&mut self, s: &crate::lstr::LStr, idx: usize) -> Option<u32> {
-        if s.ascii_hint() {
-            return s.text().as_bytes().get(idx).map(|&byte| byte as u32);
-        }
-        if s.text().len() < 64 {
-            let text = s.text();
-            let mut units = crate::jstr::unit_iter(&text);
-            let first = units.nth(idx)?;
-            return Some(crate::jstr::code_point_from_pair(first, units.next()));
-        }
-        let read = |units: &StrUnits| match units {
-            StrUnits::Ascii => s.text().as_bytes().get(idx).map(|&byte| byte as u32),
-            StrUnits::Units(units) => units.get(idx).map(|&first| {
-                crate::jstr::code_point_from_pair(first, units.get(idx + 1).copied())
-            }),
-        };
-        if let Some(result) =
-            self.str_units
-                .get_mapped(&(s.as_ptr() as usize), |(cached, units, _)| {
-                    debug_assert!(crate::lstr::LStr::ptr_eq(cached, s));
-                    read(units)
-                })
-        {
-            return result;
-        }
-        read(&self.units_of(s))
+        s.code_point_at(idx)
     }
 
-    /// The fully materialized unit vector (for range/search operations): an ASCII entry is
-    /// promoted in place, so the copy happens once per string, not per call.
-    pub(crate) fn units_full(&mut self, s: &crate::lstr::LStr) -> Rc<[u16]> {
-        if s.text().len() < 64 {
-            return crate::jstr::units(&s.text()).into();
-        }
-        let key = s.as_ptr() as usize;
-        if let Some(hit) = self.str_units.get_mapped(&key, |(cached, units, _)| {
-            debug_assert!(crate::lstr::LStr::ptr_eq(cached, s));
-            units.clone()
-        }) {
-            if let StrUnits::Units(u) = hit {
-                return u.clone();
-            }
-            let u: Rc<[u16]> = crate::jstr::units(&s.text()).into();
-            let cached = StrUnits::Units(u.clone());
-            let bytes = retained_str_units_bytes(s, &cached, None);
-            self.str_units.insert(key, (*s, cached, None), bytes);
-            return u;
-        }
-        let u: Rc<[u16]> = crate::jstr::units(&s.text()).into();
-        let cached = StrUnits::Units(u.clone());
-        let bytes = retained_str_units_bytes(s, &cached, None);
-        self.str_units.insert(key, (*s, cached, None), bytes);
-        u
-    }
-
-    /// Substrings of a cached Unicode string can usually copy UTF-8 directly. Preserve the
-    /// existing cache's byte/entry limits and owning identity pin; do not add a second cache or
-    /// alter LStr's native layout. Coercions have finished before the caller enters this helper.
-    #[inline(never)]
-    pub(crate) fn slice_units(
+    /// The units as one UTF-16 slice (for range/search operations): a two-byte string's own,
+    /// a one-byte string's widened.
+    #[inline]
+    pub(crate) fn units_full<'a>(
         &mut self,
-        s: &crate::lstr::LStr,
-        units: &Rc<[u16]>,
-        start: usize,
-        end: usize,
-    ) -> crate::lstr::LStr {
-        if start == end {
-            return crate::lstr::LStr::from("");
-        }
-        if s.text().len() >= 64 {
-            // A conversion may have evicted this source. Oversized, uncached and short strings
-            // keep their established reconstruction; never repeatedly index an uncacheable body.
-            if let Some(index) = self.cached_utf8_index(s) {
-                let text = s.text();
-                if let Some(bytes) = index.range(&text, start, end) {
-                    return if bytes.len() == text.len() {
-                        *s
-                    } else {
-                        let start_byte = bytes.as_ptr() as usize - text.as_ptr() as usize;
-                        s.slice_bytes(start_byte, start_byte + bytes.len())
-                    };
-                }
-            }
-        }
-        crate::jstr::from_units(&units[start..end]).into()
+        s: &'a crate::lstr::LStr,
+    ) -> std::borrow::Cow<'a, [u16]> {
+        s.units().to_utf16()
     }
 
-    fn cached_utf8_index(&mut self, s: &crate::lstr::LStr) -> Option<Rc<crate::jstr::Utf8Index>> {
-        let key = s.as_ptr() as usize;
-        let (cached, view, index) = self.str_units.get_cloned(&key)?;
-        debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
-        if index.is_some() {
-            return index;
-        }
-        let base = retained_str_units_bytes(s, &view, None)
-            .saturating_add(std::mem::size_of::<crate::jstr::Utf8Index>());
-        if base > STR_UNIT_CACHE_BYTES {
-            return None;
-        }
-        let index = Rc::new(crate::jstr::Utf8Index::new(s, STR_UNIT_CACHE_BYTES - base));
-        let bytes = retained_str_units_bytes(s, &view, Some(&index));
-        self.str_units
-            .insert(key, (cached, view, Some(index.clone())), bytes);
-        Some(index)
-    }
-
-    /// `s.length` (UTF-16 units), through the cache.
+    /// `s.length` (UTF-16 units).
+    #[inline]
     pub(crate) fn str_len(&mut self, s: &crate::lstr::LStr) -> usize {
-        match self.units_of(s) {
-            StrUnits::Ascii => s.text().len(),
-            StrUnits::Units(u) => u.len(),
-        }
+        s.unit_len()
     }
 
     /// [`gc_check`] amortized for layered calls. A direct JIT call does not come here: its
@@ -11692,16 +11512,6 @@ impl Interp {
             if owner.retained_requested_bytes() > 1 << 20 {
                 return None;
             }
-            let (start, end) = if owner.ascii_hint() {
-                (start, end)
-            } else {
-                self.units_full(owner);
-                let index = self.cached_utf8_index(owner)?;
-                (
-                    index.units_at_byte(&owner.text(), start)?,
-                    index.units_at_byte(&owner.text(), end)?,
-                )
-            };
             let parent = self.re_text(unicode, owner);
             crate::regex::ReText::window(parent, s, start, end)
         });
@@ -11833,7 +11643,6 @@ impl Interp {
             host_settings_states: _,
             computed_reads: _,
             property_key_strings: _,
-            str_units: _,
             re_texts: _,
             re_text_ascii_hot: _,
             // Keyed weakly; a dead key misses on lookup.

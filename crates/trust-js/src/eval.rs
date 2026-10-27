@@ -8351,7 +8351,7 @@ impl Interp {
             let (ValueView::Str(left), ValueView::Str(right)) = ((l).view(), (r).view()) else {
                 unreachable!()
             };
-            if left.text().len().saturating_add(right.text().len()) > MAX_STR_LEN {
+            if left.unit_len().saturating_add(right.unit_len()) > MAX_STR_LEN {
                 return Err(self.throw("RangeError", "Invalid string length"));
             }
             return Ok(Value::Str(left.concat_owned(&right)));
@@ -8440,7 +8440,7 @@ impl Interp {
             {
                 let ls = self.to_string(&lp)?;
                 let rs = self.to_string(&rp)?;
-                if ls.text().len() + rs.text().len() > MAX_STR_LEN {
+                if ls.unit_len() + rs.unit_len() > MAX_STR_LEN {
                     return Err(self.throw("RangeError", "Invalid string length"));
                 }
                 return Ok(Value::Str(ls.concat_owned(&rs)));
@@ -8619,7 +8619,7 @@ impl Interp {
         if let (ValueView::Str(a), ValueView::Str(b)) = (&(lp).view(), &(rp).view()) {
             // String relational comparison is per UTF-16 code unit (which differs from `str`
             // byte order once supplementary-plane characters are involved).
-            let ord = crate::jstr::cmp_units(&a.text(), &b.text());
+            let ord = a.cmp_units(b);
             let res = match op {
                 "<" => ord.is_lt(),
                 ">" => ord.is_gt(),

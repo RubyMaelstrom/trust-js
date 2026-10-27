@@ -84,11 +84,9 @@ pub(super) fn install_json(it: &mut Interp) {
             // JSON.stringify takes the first ten UTF-16 code units, including a lone
             // surrogate when that boundary splits an astral character. Decode only
             // this bounded prefix instead of materializing the full indentation string.
-            ValueView::Str(s) => crate::jstr::from_units(
-                &crate::jstr::unit_iter(&s.text())
-                    .take(10)
-                    .collect::<Vec<_>>(),
-            ),
+            ValueView::Str(s) => {
+                crate::jstr::from_units(&s.units().iter().take(10).collect::<Vec<_>>())
+            }
             _ => String::new(),
         };
         // SerializeJSONProperty starts from a wrapper holder `{ "": value }`; only a replacer
@@ -601,7 +599,7 @@ fn json_serialize_property(
         }
         ValueView::Str(text) => {
             // Escaping only lengthens the text.
-            check_string_length(i, s.out.len().saturating_add(text.text().len()))?;
+            check_string_length(i, s.out.len().saturating_add(text.unit_len()))?;
             json_quote_into(&mut s.out, &text.text());
         }
         ValueView::Obj(o) => {

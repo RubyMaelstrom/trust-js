@@ -293,7 +293,7 @@ impl<'s> Value<'s> {
 
     /// A string value's engine text, unchanged (see [`JsString::as_engine_text`]). `None` for
     /// any other value; see [`Ctx::coerce_engine_text`] for ToString.
-    pub fn as_engine_text(&self) -> Option<&str> {
+    pub fn as_engine_text(&self) -> Option<Cow<'_, str>> {
         self.as_internal().as_engine_text()
     }
 
@@ -436,23 +436,24 @@ impl<'s> JsString<'s> {
         unsafe { std::mem::transmute::<crate::lstr::LStr, JsString<'s>>(string) }
     }
 
-    /// The string's engine text, unchanged: UTF-8 in which a lone surrogate is a scalar in
-    /// U+10F800..=U+10FFFF (and a character in that range is a pair of them). Every code unit
-    /// survives a round trip through [`Ctx::string_from_engine_text`]. Convert it with
+    /// The string's engine text: UTF-8 in which a lone surrogate is a scalar in
+    /// U+10F800..=U+10FFFF (and a character in that range is a pair of them), borrowed from an
+    /// ASCII string and converted from any other. Every code unit survives a round trip through
+    /// [`Ctx::string_from_engine_text`]. Convert it with
     /// [`engine_to_text`](crate::embed::engine_to_text) before treating it as Rust text.
-    pub fn as_engine_text(&self) -> &str {
-        self.lstr().storage_text()
+    pub fn as_engine_text(&self) -> Cow<'_, str> {
+        self.lstr().text()
     }
 
     /// The string as Rust text: the Web IDL `USVString` conversion, in which every lone
     /// surrogate becomes U+FFFD.
     pub fn as_text(&self) -> Cow<'_, str> {
-        crate::jstr::to_text(self.as_engine_text())
+        crate::jstr::to_text_cow(self.as_engine_text())
     }
 
     /// The string's UTF-16 code units, lone surrogates included.
     pub fn to_utf16(&self) -> Vec<u16> {
-        crate::jstr::units(self.as_engine_text())
+        self.lstr().units().to_utf16().into_owned()
     }
 }
 

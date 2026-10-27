@@ -21743,7 +21743,7 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
     let ValueView::Str(right) = (unsafe { base.add(1).read() }).view() else {
         unreachable!()
     };
-    if left.text().len().saturating_add(right.text().len()) > crate::interpreter::MAX_STR_LEN {
+    if left.unit_len().saturating_add(right.unit_len()) > crate::interpreter::MAX_STR_LEN {
         let ctx = unsafe { &mut *ctx };
         let i = unsafe { &mut *ctx.interp };
         let error = i.throw("RangeError", "Invalid string length");
@@ -21941,7 +21941,7 @@ unsafe fn jit_intrinsic_inner(
                         };
                         let (start, end) = (norm(*start), norm(*end));
                         Ok(if start < end {
-                            Value::Str(s.slice_bytes(start as usize, end as usize))
+                            Value::Str(s.slice_units(start as usize, end as usize))
                         } else {
                             Value::lstr("")
                         })

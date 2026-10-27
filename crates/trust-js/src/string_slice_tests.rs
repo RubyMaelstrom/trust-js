@@ -83,68 +83,43 @@ fn substring_coercions_keep_original_receiver_and_abrupt_order() {
 }
 
 #[test]
-fn sparse_byte_index_matches_utf16_reconstruction_and_declines_splits() {
+fn unit_slices_of_two_byte_strings_match_the_unit_reconstruction() {
     for tail in ["é中😀z", "\u{10f800}x\u{10ffff}", "😀😀é", "éa中b"] {
         let source: crate::lstr::LStr = format!("{}{}", "x".repeat(64), tail).into();
-        let units = crate::jstr::units(&source.text());
-        let index = crate::jstr::Utf8Index::new(&source, usize::MAX);
-        let mut copied = 0;
+        let units = source.units().to_utf16().into_owned();
+        assert_eq!(
+            units,
+            crate::jstr::units(&format!("{}{}", "x".repeat(64), tail))
+        );
         for start in 60..=units.len() {
             for end in start..=units.len() {
-                if let Some(bytes) = index.range(&source.text(), start, end) {
-                    assert_eq!(bytes, crate::jstr::from_units(&units[start..end]));
-                    copied += 1;
-                }
+                let slice = source.slice_units(start, end);
+                assert_eq!(slice.units().to_utf16(), &units[start..end]);
+                assert_eq!(slice.text(), crate::jstr::from_units(&units[start..end]));
             }
         }
-        assert!(copied > 0);
     }
+    // A slice inside a surrogate pair holds the lone half.
     let source: crate::lstr::LStr = format!("{}😀z", "x".repeat(64)).into();
-    let index = crate::jstr::Utf8Index::new(&source, usize::MAX);
-    assert!(index.range(&source.text(), 64, 65).is_none());
-    assert!(index.range(&source.text(), 65, 66).is_none());
-    assert_eq!(index.range(&source.text(), 64, 66), Some("😀"));
-    let noncanonical: crate::lstr::LStr = format!(
-        "{}{}{}",
-        "x".repeat(64),
-        crate::jstr::smuggle(0xd83d),
-        crate::jstr::smuggle(0xde00)
-    )
-    .into();
-    let index = crate::jstr::Utf8Index::new(&noncanonical, usize::MAX);
-    assert!(index.range(&noncanonical.text(), 64, 66).is_none());
-    let dense: crate::lstr::LStr = "é".repeat(128).into();
-    let declined = crate::jstr::Utf8Index::new(&dense, 24);
-    assert!(declined.range(&dense.text(), 0, 10).is_none());
-    assert_eq!(declined.heap_bytes(), std::mem::size_of_val(&declined));
+    assert_eq!(
+        source.slice_units(64, 65).units().to_utf16().as_ref(),
+        [0xd83d]
+    );
+    assert_eq!(
+        source.slice_units(65, 66).units().to_utf16().as_ref(),
+        [0xde00]
+    );
+    assert_eq!(source.slice_units(64, 66).text(), "😀");
 }
 
 #[test]
-fn unicode_slice_index_stays_in_existing_cache_budget_and_pins_identity() {
-    let mut engine = Engine::new();
+fn unit_slices_keep_identity_and_need_no_cache() {
     let original: crate::lstr::LStr = format!("{}é😀z", "x".repeat(128)).into();
-    let units = engine.interp.units_full(&original);
-    let before = engine.interp.str_units.stats();
-    let whole = engine.interp.slice_units(&original, &units, 0, units.len());
+    let whole = original.slice_units(0, original.unit_len());
     assert!(crate::lstr::LStr::ptr_eq(&original, &whole));
-    let after = engine.interp.str_units.stats();
-    assert_eq!(before.0, after.0);
-    assert!(
-        after.1 > before.1,
-        "the sparse index is charged to the existing cache"
-    );
-    let high = engine.interp.slice_units(&original, &units, 129, 130);
-    assert_eq!(crate::jstr::units(&high.text()), [0xd83d]);
-    for n in 0..80 {
-        let source: crate::lstr::LStr = format!("{n}{}é", "x".repeat(128)).into();
-        let view = engine.interp.units_full(&source);
-        engine.interp.slice_units(&source, &view, 1, view.len());
-    }
-    let (entries, bytes) = engine.interp.str_units.stats();
-    assert!(entries <= 64 && bytes <= 16 << 20);
-    let copied = engine
-        .interp
-        .slice_units(&original, &units, 128, units.len());
+    let high = original.slice_units(129, 130);
+    assert_eq!(high.units().to_utf16().as_ref(), [0xd83d]);
+    let copied = original.slice_units(128, original.unit_len());
     assert!(matches!((Value::Str(copied)).view(), ValueView::Str(s) if s.text() == "é😀z"));
 }
 
@@ -207,14 +182,14 @@ fn prepared_windows_pin_shared_tables_and_map_astral_offsets() {
         let mut engine = Engine::new();
         let cached_parent = engine.interp.re_text(unicode, &source);
         let parent = Rc::new(ReText::new_rc(unicode, &source));
-        let input = source.slice_bytes(102, source.text().len());
+        let input = source.slice_units(101, source.unit_len());
         let cached_window = engine.interp.re_text(unicode, &input);
         assert!(
             Rc::strong_count(&cached_parent) >= 3,
             "window shares the cached table"
         );
         assert_eq!(cached_window.slice(0, cached_window.len()), input.text());
-        let start = crate::jstr::unit_len(&source.text()[..102]);
+        let start = 101;
         let window = ReText::window(parent.clone(), &input, start, 1028).unwrap();
         assert_eq!(window.unit_index(window.len()), input.unit_len());
         let reference = ReText::new_rc(unicode, &input);

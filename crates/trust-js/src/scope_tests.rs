@@ -57,7 +57,7 @@ fn scoped_text_borrows_survive_copied_frontier_append_growth_and_gc() {
         assert_eq!(borrowed.as_ptr(), original_address);
         assert_eq!(cow.as_ref(), prefix);
         assert_eq!(cow.as_ptr(), original_address);
-        assert_eq!(current.as_engine_text(), Some(expected.as_str()));
+        assert_eq!(current.as_engine_text().as_deref(), Some(expected.as_str()));
 
         let suffix = "replacement growth: ".repeat(prefix.len());
         assert!(!copied.append_in_place(&suffix));
@@ -72,7 +72,7 @@ fn scoped_text_borrows_survive_copied_frontier_append_growth_and_gc() {
         assert_eq!(cow.as_ref(), prefix);
         assert_eq!(cow.len(), original_len);
         assert_eq!(cow.as_ptr(), original_address);
-        assert_eq!(current.as_engine_text(), Some(expected.as_str()));
+        assert_eq!(current.as_engine_text().as_deref(), Some(expected.as_str()));
     }
     Engine::new().scope(check);
 }

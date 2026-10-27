@@ -1640,8 +1640,6 @@ impl Interp {
             .trace_roots(kind, |keys| keys.trace_gc(sink));
         self.property_key_strings
             .trace_roots(kind, |(_, string)| string.trace_gc(sink));
-        self.str_units
-            .trace_roots(kind, |(string, _, _)| string.trace_gc(sink));
         self.re_texts.trace_roots(kind, |(string, text)| {
             string.trace_gc(sink);
             text.trace_gc(sink);
@@ -1668,9 +1666,6 @@ impl Interp {
             keys.trace_gc(sink);
         }
         for (_, string) in self.property_key_strings.values() {
-            string.trace_gc(sink);
-        }
-        for (string, _, _) in self.str_units.values() {
             string.trace_gc(sink);
         }
         for (string, text) in self.re_texts.values() {
@@ -1727,8 +1722,7 @@ impl Interp {
             jit_layout: _,
             interp_layout: _,
             inline_ic_safe: _,
-            str_units: _, // by collection kind
-            re_texts: _,  // by collection kind
+            re_texts: _, // by collection kind
             re_text_ascii_hot,
             regexp_dependency_cache: _,
             regexp_last,

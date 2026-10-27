@@ -35,11 +35,11 @@ fn parsed_function(source: &str) -> Rc<Function> {
     function.clone()
 }
 
-fn strings(chunk: &Chunk) -> Vec<&str> {
+fn strings(chunk: &Chunk) -> Vec<String> {
     chunk
         .consts
         .iter()
-        .filter_map(Value::as_engine_text)
+        .filter_map(|value| value.as_engine_text().map(std::borrow::Cow::into_owned))
         .collect()
 }
 
@@ -182,7 +182,7 @@ fn defaults_nested_eval_class_static_blocks_and_disposal_keep_their_semantics() 
         parsed_function("function subject(value=eval(\"'use strict'\")){'vendor';return value;}");
     let chunk = compile(&function).unwrap();
     assert!(chunk.prepared_entry);
-    assert!(!strings(&chunk).contains(&"vendor"));
+    assert!(!strings(&chunk).iter().any(|text| text == "vendor"));
 }
 
 const COMPLETIONS: &str = r#"
@@ -340,7 +340,7 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
         assert!(chunk.prepared_entry);
         assert!(chunk.ops.iter().any(|op| matches!(op, Op::InlineGuard(..))));
         for removed in ["caller directive", "leaf directive", "use strict"] {
-            assert!(!strings(&chunk).contains(&removed));
+            assert!(!strings(&chunk).iter().any(|text| text == removed));
         }
         let leaf = chunk
             .ops

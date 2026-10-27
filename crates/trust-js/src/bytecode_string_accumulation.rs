@@ -112,7 +112,7 @@ fn try_store(
                 let ValueView::Str(prefix) = original.view() else {
                     return None;
                 };
-                if prefix.text().len().saturating_add(suffix.text().len()) > MAX_STR_LEN {
+                if prefix.unit_len().saturating_add(suffix.unit_len()) > MAX_STR_LEN {
                     return None;
                 }
                 let profiling =

@@ -11035,15 +11035,12 @@ fn reconstructible_string_and_regexp_caches_account_retained_bytes() {
     let source = crate::lstr::LStr::from(source.as_str());
     let units = engine.interp.units_full(&source);
     assert_eq!(units.len(), 128);
-    let (unit_entries, unit_bytes) = engine.interp.str_units.stats();
-    assert_eq!(unit_entries, 1);
-    assert!(unit_bytes >= source.text().len() + units.len() * 2);
 
     let text = engine.interp.re_text(true, &source);
     assert!(text.heap_bytes() > 0);
     let (text_entries, text_bytes) = engine.interp.re_texts.stats();
     assert_eq!(text_entries, 1);
-    assert!(text_bytes >= source.text().len() + text.heap_bytes());
+    assert!(text_bytes >= source.allocation_requested_bytes() + text.heap_bytes());
 
     let first = engine
         .interp

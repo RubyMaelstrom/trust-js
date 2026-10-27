@@ -327,7 +327,7 @@ pub(crate) fn locale_compare(
     options: &Value,
 ) -> Result<Value, Value> {
     let key = match ((locales).view(), (options).view()) {
-        (ValueView::Undefined, ValueView::Undefined) => Some(""),
+        (ValueView::Undefined, ValueView::Undefined) => Some(std::borrow::Cow::Borrowed("")),
         (ValueView::Str(locale), ValueView::Undefined) if !locale.is_empty() => {
             locales.as_engine_text()
         }
@@ -337,7 +337,7 @@ pub(crate) fn locale_compare(
         let opts = initialize(i, locales, options)?.collate_opts();
         return Ok(compare_strings(a, b, &opts));
     };
-    if let Some(opts) = LOCALE_COMPARE.with_borrow(|cache| cache.get(key).cloned()) {
+    if let Some(opts) = LOCALE_COMPARE.with_borrow(|cache| cache.get(&*key).cloned()) {
         return Ok(compare_strings(a, b, &opts));
     }
     let opts = Rc::new(initialize(i, locales, options)?.collate_opts());
@@ -346,7 +346,7 @@ pub(crate) fn locale_compare(
         if cache.len() >= 16 {
             cache.clear();
         }
-        cache.insert(key.to_owned(), opts.clone());
+        cache.insert(key.into_owned(), opts.clone());
     });
     Ok(compare_strings(a, b, &opts))
 }

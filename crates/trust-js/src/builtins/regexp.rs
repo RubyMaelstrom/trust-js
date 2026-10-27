@@ -719,7 +719,7 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         if match_str.is_empty() {
             let li = ab(i.get_member_key(&this, "lastIndex"))?;
             let li = to_length_val(i, &li)?;
-            let next = advance_string_index(li, &s.text(), unicode);
+            let next = advance_string_index(li, &s, unicode);
             set_throw(i, &this, "lastIndex", Value::Num(next as f64))?;
         }
     }
@@ -765,7 +765,7 @@ pub(super) fn re_sym_match_discard_direct(
                 Some(ValueView::Num(n)) => n as usize,
                 _ => unreachable!("direct match lastIndex guard"),
             };
-            let next = advance_string_index(li, &input.text(), unicode);
+            let next = advance_string_index(li, input, unicode);
             obj.borrow_mut()
                 .props
                 .set_value("lastIndex", Value::Num(next as f64));
@@ -828,7 +828,7 @@ pub(super) fn re_sym_replace_discard_direct(
                 Some(ValueView::Num(n)) => n as usize,
                 _ => unreachable!("direct replace lastIndex guard"),
             };
-            let next = advance_string_index(li, &input.text(), unicode);
+            let next = advance_string_index(li, input, unicode);
             obj.borrow_mut()
                 .props
                 .set_value("lastIndex", Value::Num(next as f64));
@@ -944,7 +944,7 @@ fn re_sym_replace_impl(
                             Some(ValueView::Num(n)) => n as usize,
                             _ => unreachable!("discard matcher guarded lastIndex"),
                         };
-                        let next = advance_string_index(li, &s.text(), unicode);
+                        let next = advance_string_index(li, &s, unicode);
                         obj.borrow_mut()
                             .props
                             .set_value("lastIndex", Value::Num(next as f64));
@@ -971,7 +971,7 @@ fn re_sym_replace_impl(
         if m0.is_empty() {
             let li_v = ab(i.get_member_key(&this, "lastIndex"))?;
             let li = to_length_val(i, &li_v)?;
-            let next = advance_string_index(li, &s.text(), unicode);
+            let next = advance_string_index(li, &s, unicode);
             set_throw(i, &this, "lastIndex", Value::Num(next as f64))?;
         }
     }
@@ -1135,9 +1135,9 @@ fn re_sym_replace_direct(
     let sunits = if substitutes {
         i.units_full(s)
     } else {
-        Rc::from(Vec::new())
+        std::borrow::Cow::Borrowed(&[][..])
     };
-    let mut out = String::with_capacity(s.text().len());
+    let mut out = String::with_capacity(s.unit_len());
     let mut next = 0usize;
     for caps in &matches {
         let (start, end) = caps[0].expect("successful regexp match has a span");
@@ -1594,7 +1594,7 @@ pub(super) fn re_sym_split_discard_fast(
         }
         update_regexp_legacy_statics_lazy(i, &search_re, whole, search_start, &text, input);
         if e == p {
-            q = advance_string_index(a, &input.text(), unicode);
+            q = advance_string_index(a, input, unicode);
         } else {
             p = e;
             q = p;
@@ -1610,7 +1610,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         return result;
     }
     // All positions are UTF-16 unit offsets.
-    let sunits: Vec<u16> = crate::jstr::units(&s.text());
+    let sunits: Vec<u16> = s.units().to_utf16().into_owned();
     let size = sunits.len();
     // SpeciesConstructor(rx, %RegExp%), then a sticky-flagged splitter constructed from it.
     let default_ctor = regexp_intrinsic(i);
@@ -1654,13 +1654,13 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         ab(i.set_member_key(&splitter, "lastIndex", Value::Num(q as f64)))?;
         let z = regexp_exec_abstract(i, &splitter, s)?;
         if matches!((z).view(), ValueView::Null) {
-            q = advance_string_index(q, &s.text(), unicode);
+            q = advance_string_index(q, &s, unicode);
             continue;
         }
         let li_v = ab(i.get_member_key(&splitter, "lastIndex"))?;
         let e = to_length_val(i, &li_v)?.min(size);
         if e == p {
-            q = advance_string_index(q, &s.text(), unicode);
+            q = advance_string_index(q, &s, unicode);
             continue;
         }
         out.push(Value::lstr(crate::jstr::from_units(&sunits[p..q])));

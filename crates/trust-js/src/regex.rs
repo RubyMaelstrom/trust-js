@@ -2056,11 +2056,9 @@ impl ReText {
         if parent.unit_index(first) != start || parent.unit_index(last) != end {
             return None;
         }
-        // Every non-ASCII UTF-8 scalar needs more bytes than UTF-16 units, including
-        // astral characters and smuggled surrogates. Equality for this proven unit
-        // range therefore proves the visible source is ASCII without scanning it.
-        // A wide prefix/tail must not prevent the slice from using the byte matcher.
-        let ascii = source.text().len() == end - start;
+        // A one-byte view's units are ASCII bytes, so it matches over them whatever its
+        // owner's width; a two-byte one reads its parent's elements.
+        let ascii = source.known_ascii();
         Some(Self {
             elems: Vec::new(),
             unit_of: None,
@@ -2096,7 +2094,7 @@ impl ReText {
             return ReText {
                 elems: Vec::new(),
                 unit_of: None,
-                n_elems: s.text().len(),
+                n_elems: s.unit_len(),
                 subject_shape: SUBJECT_ASCII,
                 unicode,
                 ascii_src: Some(*s),
@@ -2105,28 +2103,27 @@ impl ReText {
                 unit_base: 0,
             };
         }
-        // Keep the engine string itself: `LStr::clone` copies a handle, and its immutable
-        // bytes can be matched and sliced directly.
-        Self::build(unicode, &s.text(), Some(*s))
+        Self::build(unicode, &s.units().to_utf16())
     }
 
-    fn build(unicode: bool, s: &str, src: Option<crate::lstr::LStr>) -> ReText {
-        // ASCII: elements are the bytes, and element index == unit offset in both modes.
-        if s.is_ascii() {
+    fn build(unicode: bool, units: &[u16]) -> ReText {
+        // ASCII units (a two-byte string can hold only those): elements are the bytes of a
+        // one-byte copy, and element index == unit offset in both modes.
+        if units.iter().all(|&unit| unit < 0x80) {
             return ReText {
                 elems: Vec::new(),
                 unit_of: None,
-                n_elems: s.len(),
+                n_elems: units.len(),
                 subject_shape: SUBJECT_ASCII,
                 unicode,
-                ascii_src: Some(src.unwrap_or_else(|| crate::lstr::LStr::from(s))),
+                ascii_src: Some(crate::lstr::LStr::from_utf16(units)),
                 parent: None,
                 elem_base: 0,
                 unit_base: 0,
             };
         }
         if unicode {
-            let cps = crate::jstr::code_points(s);
+            let cps = crate::jstr::code_points_of_units(units);
             if cps.iter().all(|&cp| cp < 0x10000) {
                 // BMP-only: one unit per element.
                 let subject_shape = if cps.iter().all(|&cp| cp <= 0xff) {
@@ -2165,7 +2162,6 @@ impl ReText {
                 unit_base: 0,
             }
         } else {
-            let units = crate::jstr::units(s);
             ReText {
                 n_elems: units.len(),
                 elems: units.iter().map(|&u| u as u32).collect(),
@@ -2222,7 +2218,7 @@ impl ReText {
     /// [`Self::slice`] as an engine string, sharing an ASCII source's storage where `LStr` can.
     pub(crate) fn slice_lstr(&self, a: usize, b: usize) -> crate::lstr::LStr {
         match &self.ascii_src {
-            Some(src) => src.slice_bytes(a, b),
+            Some(src) => src.slice_units(a, b),
             None => self.slice(a, b).into(),
         }
     }
@@ -6534,7 +6530,8 @@ mod internal_engine_diagnostics {
         let body = format!("x\nA1.z\n{}z", "a".repeat(1024));
         let prefix = "😀é";
         let root: crate::lstr::LStr = format!("{prefix}{body}é").into();
-        let source = root.slice_bytes(prefix.len(), prefix.len() + body.len());
+        let prefix_units = crate::jstr::unit_len(prefix);
+        let source = root.slice_units(prefix_units, prefix_units + body.len());
         assert!(source.view_range().is_some());
         assert!(
             !source.ascii_hint(),
@@ -6548,13 +6545,8 @@ mod internal_engine_diagnostics {
             let start = crate::jstr::unit_len(prefix);
             let window =
                 ReText::window(parent.clone(), &source, start, start + body.len()).unwrap();
-            assert!(window.ascii_src.is_some());
-            assert_eq!(window.subject_shape(), SUBJECT_ASCII);
-            assert_eq!(
-                Rc::strong_count(&parent),
-                1,
-                "ASCII needs no parent table owner"
-            );
+            // A view of a two-byte root is two-byte too: it reads its parent's elements.
+            assert!(window.ascii_src.is_none() && window.parent.is_some());
             assert_eq!(window.slice(0, window.len()), body);
             for pattern in [
                 "^x",
@@ -6590,7 +6582,7 @@ mod internal_engine_diagnostics {
     fn wide_windows_keep_unit_mapping_and_surrogate_boundary_guards() {
         use super::*;
         let root: crate::lstr::LStr = format!("😀{}éz", "a".repeat(1024)).into();
-        let source = root.slice_bytes(4, root.text().len());
+        let source = root.slice_units(2, root.unit_len());
         for unicode in [false, true] {
             let parent = Rc::new(ReText::new_rc(unicode, &root));
             let end = root.unit_len();

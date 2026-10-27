@@ -87,7 +87,7 @@ pub(super) fn install_globals(it: &mut Interp) {
     global_fn(it, "escape", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
         let mut out = String::new();
-        for c in crate::jstr::units(&s.text()) {
+        for c in s.units().iter() {
             let ch = c as u32;
             let keep = c < 128 && {
                 let a = ch as u8 as char;
@@ -109,7 +109,7 @@ pub(super) fn install_globals(it: &mut Interp) {
         // `%uXXXX`; all other units pass through unchanged. Indexing the one unit snapshot keeps
         // lookahead allocation-free and, unlike `char` casts, preserves astral pairs and lone
         // surrogates exactly.
-        let input = crate::jstr::units(&s.text());
+        let input = s.units().to_utf16();
         let mut units: Vec<u16> = Vec::with_capacity(input.len());
         let mut k = 0;
         while k < input.len() {

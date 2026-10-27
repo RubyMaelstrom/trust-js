@@ -59,6 +59,17 @@ pub(crate) fn from_text(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// [`to_text`] of engine text that may be owned already, copying only what it must.
+pub(crate) fn to_text_cow(s: std::borrow::Cow<'_, str>) -> std::borrow::Cow<'_, str> {
+    match s {
+        std::borrow::Cow::Borrowed(text) => to_text(text),
+        std::borrow::Cow::Owned(text) => match to_text(&text) {
+            std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Owned(text),
+            std::borrow::Cow::Owned(converted) => std::borrow::Cow::Owned(converted),
+        },
+    }
+}
+
 /// An engine string as host text: the conversion of a JS string to a Web IDL `USVString`
 /// (§3.2.11). Surrogate pairs, including the smuggled pairs of smuggle-range characters, become
 /// their characters, and every lone surrogate becomes U+FFFD.
@@ -171,101 +182,17 @@ pub fn from_units(units: &[u16]) -> String {
     out
 }
 
-/// Sparse UTF-16-to-UTF-8 index for repeated substrings of an immutable engine string. ASCII
-/// runs need no entries: each entry records the cumulative extra bytes after a non-ASCII
-/// scalar. An index inside an astral pair maps to a continuation byte and is rejected, leaving
-/// the caller's code-unit reconstruction to produce the appropriate lone surrogate.
-pub(crate) struct Utf8Index {
-    changes: Vec<(u32, u32)>,
-    copy_safe: bool,
-}
-
-impl Utf8Index {
-    /// `max_bytes` is the remaining budget of the existing owning string cache. Keep a small
-    /// declined index on exhaustion so repeated slices do not retry an oversized index build.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn new(s: &crate::lstr::LStr, max_bytes: usize) -> Self {
-        let mut index = Self {
-            changes: Vec::new(),
-            copy_safe: true,
-        };
-        let max_entries = max_bytes / std::mem::size_of::<(u32, u32)>();
-        let mut extra = 0;
-        let mut previous_high = false;
-        for (byte, c) in s.text().char_indices() {
-            if previous_high && smuggled_low(c).is_some() {
-                // Conservatively retain from_units canonicalization for smuggled pairs,
-                // including host-created non-canonical input.
-                index.copy_safe = false;
-                break;
-            }
-            previous_high = smuggled_high(c).is_some();
-            if c.is_ascii() {
-                continue;
-            }
-            let units = if smuggled(c).is_some() {
-                1
-            } else {
-                c.len_utf16()
-            };
-            extra += c.len_utf8() - units;
-            if index.changes.len() == max_entries {
-                index.copy_safe = false;
-                break;
-            }
-            if index.changes.len() == index.changes.capacity() {
-                let additional =
-                    (max_entries - index.changes.len()).min(index.changes.len().max(16));
-                index.changes.reserve_exact(additional);
-            }
-            let byte_end = byte + c.len_utf8();
-            // LStr's byte length and capacity fit below its u32 ASCII-hint bit.
-            index
-                .changes
-                .push(((byte_end - extra) as u32, extra as u32));
-        }
-        if !index.copy_safe {
-            index.changes = Vec::new();
-        }
-        index
+/// The code points of a unit sequence: a surrogate pair is one, and any other unit, a lone
+/// surrogate included, is its own (as [`CodePointIter`] reads engine text).
+pub(crate) fn code_points_of_units(units: &[u16]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(units.len());
+    let mut index = 0;
+    while index < units.len() {
+        let point = code_point_from_pair(units[index], units.get(index + 1).copied());
+        index += if point >= 0x10000 { 2 } else { 1 };
+        out.push(point);
     }
-
-    pub(crate) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.changes.capacity() * std::mem::size_of::<(u32, u32)>()
-    }
-
-    /// Invert the sparse boundary map for an already validated UTF-8 slice of the source.
-    pub(crate) fn units_at_byte(&self, s: &str, byte: usize) -> Option<usize> {
-        if !self.copy_safe || !s.is_char_boundary(byte) {
-            return None;
-        }
-        let past = self
-            .changes
-            .partition_point(|&(end, extra)| end as usize + extra as usize <= byte);
-        Some(
-            byte - past
-                .checked_sub(1)
-                .map_or(0, |n| self.changes[n].1 as usize),
-        )
-    }
-
-    /// Only copy complete UTF-8 scalars. Both offsets have already been clamped to the source's
-    /// UTF-16 length; checking Rust's boundaries also rejects an interior surrogate-pair index.
-    pub(crate) fn range<'a>(&self, s: &'a str, start: usize, end: usize) -> Option<&'a str> {
-        if !self.copy_safe {
-            return None;
-        }
-        let byte_offset = |unit| {
-            let past = self
-                .changes
-                .partition_point(|&(end, _)| end as usize <= unit);
-            unit + past
-                .checked_sub(1)
-                .map_or(0, |n| self.changes[n].1 as usize)
-        };
-        s.get(byte_offset(start)..byte_offset(end))
-    }
+    out
 }
 
 /// The single-unit string for one code unit.
@@ -291,46 +218,9 @@ pub(crate) fn index_lstr(index: u32) -> crate::lstr::LStr {
 /// The engine string for one UTF-16 code unit, interned for ASCII.
 pub fn unit_lstr(unit: u16) -> crate::lstr::LStr {
     if unit >= 128 {
-        return unit_str(unit).into();
+        return crate::lstr::LStr::from_utf16(&[unit]);
     }
-    crate::value::interned_string(unit as usize, || unit_str(unit).into())
-}
-
-/// The spec's code-unit-wise string comparison (differs from `str` byte order for strings mixing
-/// supplementary-plane characters with U+E000..U+FFFF, and for smuggled surrogates).
-pub fn cmp_units(a: &str, b: &str) -> std::cmp::Ordering {
-    // Equal bytes are equal units, so only the suffixes from the character holding the first
-    // differing byte matter. Equal prefixes start that character at the same offset in both.
-    let common = a
-        .bytes()
-        .zip(b.bytes())
-        .position(|(x, y)| x != y)
-        .unwrap_or(a.len().min(b.len()));
-    let mut start = common;
-    while !a.is_char_boundary(start) {
-        start -= 1;
-    }
-    let (a, b) = (&a[start..], &b[start..]);
-    // Two BMP characters (smuggled surrogates are above U+10F800) order by code point.
-    if let (Some(x), Some(y)) = (a.chars().next(), b.chars().next()) {
-        if (x as u32) < 0x10000 && (y as u32) < 0x10000 {
-            return x.cmp(&y);
-        }
-    }
-    let mut ia = UnitIter::new(a);
-    let mut ib = UnitIter::new(b);
-    loop {
-        match (ia.next(), ib.next()) {
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            (Some(_), None) => return std::cmp::Ordering::Greater,
-            (Some(x), Some(y)) => {
-                if x != y {
-                    return x.cmp(&y);
-                }
-            }
-        }
-    }
+    crate::value::interned_string(unit as usize, || crate::lstr::LStr::from_utf16(&[unit]))
 }
 
 /// Iterator over `s`'s UTF-16 code units.
@@ -472,23 +362,6 @@ pub fn needs_join_fixup(a: &str, b: &str) -> bool {
         (Some(last), Some(first)) => smuggled_high(last).is_some() && smuggled_low(first).is_some(),
         _ => false,
     }
-}
-
-/// Whether repeating `s` can create an adjacent smuggled surrogate pair that requires the
-/// canonicalizing `from_units` pass.  The scan also rejects a source that already contains such a
-/// pair; retaining the conservative fallback keeps direct byte copies limited to canonical input.
-pub fn needs_repeat_fixup(s: &str, count: usize) -> bool {
-    if count == 0 {
-        return false;
-    }
-    let mut prev_high = false;
-    for c in s.chars() {
-        if prev_high && smuggled_low(c).is_some() {
-            return true;
-        }
-        prev_high = smuggled_high(c).is_some();
-    }
-    count > 1 && needs_join_fixup(s, s)
 }
 
 /// Canonicalize any adjacent smuggled high+low surrogate pairs inside `s` (needed after building

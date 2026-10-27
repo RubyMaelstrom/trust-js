@@ -712,13 +712,13 @@ fn segment_at(bytes: &[u8], n: usize) -> usize {
 
 /// ECMA-402 #sec-createsegmentdataobject for segment `index`.
 fn segment_data(i: &mut Interp, slots: &SegmentsSlots, bytes: &[u8], index: usize) -> Value {
-    let (start, start_byte, word_like) = record_at(bytes, index);
-    let (_, end_byte, _) = record_at(bytes, index + 1);
+    let (start, _, word_like) = record_at(bytes, index);
+    let (end, _, _) = record_at(bytes, index + 1);
     let result = i.new_object();
     set_data(
         &result,
         "segment",
-        Value::Str(slots.string.slice_bytes(start_byte, end_byte)),
+        Value::Str(slots.string.slice_units(start, end)),
     );
     set_data(&result, "index", Value::Num(start as f64));
     set_data(&result, "input", Value::Str(slots.string));

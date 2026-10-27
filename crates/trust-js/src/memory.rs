@@ -451,8 +451,6 @@ pub(crate) struct Visitor {
     regexp_char_classes: HashSet<usize>,
     regexp_string_sets: HashSet<usize>,
     regexp_backref_groups: HashSet<usize>,
-    rc_u16_slices: HashSet<usize>,
-    string_utf8_indexes: HashSet<usize>,
     rc_value_slices: HashSet<usize>,
     array_buffers: HashMap<usize, usize>,
     native_buffers: HashSet<usize>,
@@ -776,17 +774,6 @@ impl Visitor {
 
     pub(crate) fn add_jit_heap_metadata_bytes(&mut self, bytes: usize) {
         self.jit_heap_metadata = self.jit_heap_metadata.saturating_add(bytes);
-    }
-
-    pub(crate) fn str_units(&mut self, units: &crate::interpreter::StrUnits) {
-        if let crate::interpreter::StrUnits::Units(units) = units {
-            let identity = Rc::as_ptr(units) as *const () as usize;
-            if self.rc_u16_slices.insert(identity) {
-                self.strings_symbols_bigints = self
-                    .strings_symbols_bigints
-                    .saturating_add(units.len().saturating_mul(std::mem::size_of::<u16>()));
-            }
-        }
     }
 
     fn value_slice(&mut self, values: &Rc<[Value]>) -> usize {
@@ -1384,28 +1371,6 @@ fn scan_realm(
         .scan_retained_memory(|(key, string)| {
             visitor.rc_str(key);
             visitor.lstr(string);
-        });
-    totals.engine_caches.add(bytes);
-    if !exact {
-        totals
-            .engine_caches
-            .make_lower_bound("opaque standard-library HashMap bucket storage");
-    }
-    let (bytes, exact) = interp
-        .str_units
-        .scan_retained_memory(|(string, units, index)| {
-            visitor.lstr(string);
-            visitor.str_units(units);
-            if let Some(index) = index {
-                if visitor
-                    .string_utf8_indexes
-                    .insert(Rc::as_ptr(index) as usize)
-                {
-                    visitor.strings_symbols_bigints = visitor
-                        .strings_symbols_bigints
-                        .saturating_add(index.heap_bytes());
-                }
-            }
         });
     totals.engine_caches.add(bytes);
     if !exact {
@@ -2921,8 +2886,8 @@ mod tests {
     #[test]
     fn string_view_census_deduplicates_flat_owner() {
         let source: LStr = "x".repeat(1024).into();
-        let a = source.slice_bytes(0, 900);
-        let b = a.slice_bytes(20, 880);
+        let a = source.slice_units(0, 900);
+        let b = a.slice_units(20, 880);
         let mut visitor = Visitor::default();
         visitor.lstr(&a);
         visitor.lstr(&b);
@@ -2944,8 +2909,8 @@ mod tests {
     fn prepared_window_census_retains_and_deduplicates_shared_tables() {
         let source: LStr = format!("{}é😀", "x".repeat(1024)).into();
         let parent = Rc::new(crate::regex::ReText::new_rc(true, &source));
-        let a = source.slice_bytes(100, source.text().len());
-        let b = source.slice_bytes(200, source.text().len());
+        let a = source.slice_units(100, source.unit_len());
+        let b = source.slice_units(200, source.unit_len());
         let first = Rc::new(crate::regex::ReText::window(parent.clone(), &a, 100, 1027).unwrap());
         let second = Rc::new(crate::regex::ReText::window(parent.clone(), &b, 200, 1027).unwrap());
         let mut visitor = Visitor::default();

@@ -1,43 +1,54 @@
-//! The engine string: a thin UTF-8 buffer with spare capacity, in a GC cell.
+//! The engine string: UTF-16 code units with spare capacity, in a GC cell.
 //!
 //! `Value::Str` used to hold `Rc<str>` — immutable and exactly sized, which makes an append loop
 //! (`s += x`, astring's `this.output += e`) inherently O(n²): every step materializes a fresh
 //! allocation of the whole accumulated string. `LStr` is the classic engine fix (QuickJS's
-//! JSString): a `{frontier, len, cap}` header + bytes, one thin pointer.
+//! JSString): a `{frontier, len, cap}` header + units, one thin pointer.
 //!
 //! A string is a cell of the active Agent's heap (P1 S2): a handle is the cell's address,
 //! cloning copies it and nothing is counted. Word 0 of a flat buffer records its *frontier*, how
-//! many bytes have been written into it. An append to a string that ends at its buffer's
+//! many units have been written into it. An append to a string that ends at its buffer's
 //! frontier, with spare capacity, writes past the frontier and returns a view of the same
-//! buffer; bytes a string can read never change afterwards, so aliases keep their own length
+//! buffer; units a string can read never change afterwards, so aliases keep their own length
 //! and no uniqueness is needed (Decision 4 as revised at step 4d). Any other append copies into
 //! a new buffer with geometric capacity.
 //!
-//! Logical content is always `len` bytes of valid UTF-8 (lone surrogates smuggled, as before —
-//! see [`crate::jstr`]); capacity beyond `len` is invisible to every reader, since the readers
-//! ([`LStr::text`], [`LStr::as_ascii`]) slice to `len`. Large substrings may instead hold a
-//! bounded view of a flat buffer. Their
-//! header has the same length offset, but no ASCII hint: native byte readers must take their
-//! checked path for a view.
+//! ECMAScript strings are sequences of UTF-16 code units (ECMA-262 §6.1.4), and a buffer stores
+//! them at a width fixed when it is allocated, as V8, SpiderMonkey and JavaScriptCore do: one
+//! byte a unit when every unit is ASCII, two otherwise (a lone surrogate is an ordinary unit).
+//! A concatenation or in-place append stays one-byte only when both sides are one-byte; a
+//! two-byte suffix on a one-byte buffer copies into a two-byte buffer. (The browsers' one-byte
+//! width holds Latin-1; here it holds ASCII until the byte-level fast paths read storage by
+//! width: the P2 plan's W7, step S4.) Capacity beyond `len` is invisible to every reader, since
+//! the readers ([`LStr::units`], [`LStr::as_ascii`], [`LStr::text`]) slice to `len`.
+//!
+//! Large substrings may instead hold a bounded view of a flat buffer, at its width. A view's
+//! header has the same length offset, but no ASCII hint: generated code reads a flat one-byte
+//! buffer's bytes only under the hint, and takes its checked path for anything else.
 //!
 //! `LStr` is neither `Send` nor `Sync`: the engine is one thread per realm.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::ptr::NonNull;
 
 #[repr(C)]
 struct Header {
-    /// A flat buffer's frontier (see the module docs); unused by a view.
+    /// A flat buffer's frontier, in units (see the module docs); unused by a view.
     frontier: Cell<usize>,
+    /// The length in UTF-16 code units.
     len: Cell<u32>,
+    /// A flat buffer's capacity in units below its width and hint bits; a view's is
+    /// [`VIEW_CAP`].
     cap: Cell<u32>,
-    // `cap` bytes of UTF-8 follow.
+    // `cap` units of one or two bytes follow.
 }
 
 #[repr(C)]
 struct View {
     header: Header,
     owner: LStr,
+    /// The first unit's index in the owner.
     offset: usize,
 }
 
@@ -49,6 +60,13 @@ pub struct LStr {
     p: NonNull<Header>,
 }
 
+/// A string's stored code units: one byte a unit (ASCII) or two.
+#[derive(Clone, Copy)]
+pub(crate) enum Units<'a> {
+    Ascii(&'a [u8]),
+    Utf16(&'a [u16]),
+}
+
 const HDR: usize = std::mem::size_of::<Header>();
 
 /// Byte offset of the length within the header — the JIT's inline equality/truthiness templates
@@ -58,20 +76,25 @@ pub(crate) const LEN_OFF: usize = std::mem::offset_of!(Header, len);
 /// intrinsic tests the hint from machine code.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const CAP_OFF: usize = std::mem::offset_of!(Header, cap);
-/// Byte offset of the first content byte in a flat buffer. Views require checked resolution.
+/// Byte offset of the first content unit in a flat buffer. Views require checked resolution.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const DATA_OFF: usize = HDR;
-/// Top bit of `cap`: the content is KNOWN all-ASCII (byte index == UTF-16 unit index, and every
-/// byte IS its unit). Purely a hint — never set for non-ASCII content, may be clear for ASCII
-/// content. Maintained by every constructor/mutator; capacity readers mask it off.
+/// Top bit of `cap`: a flat one-byte buffer, whose units are ASCII bytes (byte index == UTF-16
+/// unit index, and every byte IS its unit). Set on every one-byte buffer and on nothing else; a
+/// view of one does not carry it.
 pub(crate) const ASCII_HINT: u32 = 1 << 31;
+/// A flat two-byte buffer.
+const TWO_BYTE: u32 = 1 << 30;
+/// The capacity bits of a flat buffer's `cap`.
+const CAP_BITS: u32 = TWO_BYTE - 1;
 
-// Reserve one capacity value, rather than changing the native count/length layout. A view is
-// never ASCII-hinted even when its bytes are ASCII. The optimizing tier's decimal-key reader
-// also rejects it by its <=10-byte length guard before accessing inline bytes.
+// Reserve one capacity value, rather than changing the native count/length layout. No flat
+// buffer reaches it: a two-byte buffer's capacity is at most MAX_LEN, below CAP_BITS, and a
+// one-byte buffer's carries ASCII_HINT. A view is never ASCII-hinted even when its units are.
 const VIEW_CAP: u32 = ASCII_HINT - 1;
-/// The longest content, in bytes, an engine string can hold; constructing a longer one panics.
-pub(crate) const MAX_LEN: usize = VIEW_CAP as usize - 1;
+/// The longest content, in units, an engine string can hold; constructing a longer one panics.
+pub(crate) const MAX_LEN: usize = CAP_BITS as usize - 1;
+/// Slices shorter than this many bytes of content copy.
 const MIN_VIEW_BYTES: usize = 256;
 /// A view may keep an owner of at most this size alive regardless of the slice's length; larger
 /// owners are pinned only by slices covering at least half of them. Copying every short slice
@@ -102,37 +125,136 @@ pub(crate) fn cell_layout() -> crate::gc_core::LayoutDesc {
     }
 }
 
-impl LStr {
-    /// Allocate with `cap` bytes of capacity, seeding `content` (must fit).
-    fn alloc(content: &str, cap: u32) -> LStr {
-        Self::alloc_with_hint(content, cap, content.is_ascii())
+impl<'a> Units<'a> {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Units::Ascii(bytes) => bytes.len(),
+            Units::Utf16(units) => units.len(),
+        }
     }
 
-    /// Reuse representation metadata when copying an engine string. A conservative false
-    /// hint is valid; never rescan a growing prefix just to rediscover that it is ASCII.
-    fn alloc_with_hint(content: &str, cap: u32, ascii: bool) -> LStr {
-        debug_assert!(content.len() <= cap as usize);
-        assert!(cap < VIEW_CAP, "capacity claims representation bits");
-        debug_assert!(!ascii || content.is_ascii());
+    /// Code unit `index`, if in range.
+    #[inline]
+    pub(crate) fn get(&self, index: usize) -> Option<u16> {
+        match self {
+            Units::Ascii(bytes) => bytes.get(index).map(|&byte| u16::from(byte)),
+            Units::Utf16(units) => units.get(index).copied(),
+        }
+    }
+
+    /// Units `start..end`.
+    #[inline]
+    pub(crate) fn slice(&self, start: usize, end: usize) -> Units<'a> {
+        match *self {
+            Units::Ascii(bytes) => Units::Ascii(&bytes[start..end]),
+            Units::Utf16(units) => Units::Utf16(&units[start..end]),
+        }
+    }
+
+    /// The units as a UTF-16 slice: borrowed from two-byte storage, widened from one-byte.
+    pub(crate) fn to_utf16(&self) -> Cow<'a, [u16]> {
+        match *self {
+            Units::Ascii(bytes) => Cow::Owned(bytes.iter().map(|&byte| u16::from(byte)).collect()),
+            Units::Utf16(units) => Cow::Borrowed(units),
+        }
+    }
+
+    /// The units one by one.
+    #[inline]
+    pub(crate) fn iter(&self) -> UnitsIter<'a> {
+        match *self {
+            Units::Ascii(bytes) => UnitsIter::Ascii(bytes.iter()),
+            Units::Utf16(units) => UnitsIter::Utf16(units.iter()),
+        }
+    }
+
+    /// Whether every unit is ASCII.
+    fn is_ascii(&self) -> bool {
+        match self {
+            Units::Ascii(_) => true,
+            Units::Utf16(units) => units.iter().all(|&unit| unit < 0x80),
+        }
+    }
+}
+
+/// [`Units::iter`].
+#[derive(Clone)]
+pub(crate) enum UnitsIter<'a> {
+    Ascii(std::slice::Iter<'a, u8>),
+    Utf16(std::slice::Iter<'a, u16>),
+}
+
+impl Iterator for UnitsIter<'_> {
+    type Item = u16;
+
+    #[inline]
+    fn next(&mut self) -> Option<u16> {
+        match self {
+            UnitsIter::Ascii(bytes) => bytes.next().map(|&byte| u16::from(byte)),
+            UnitsIter::Utf16(units) => units.next().copied(),
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            UnitsIter::Ascii(bytes) => bytes.size_hint(),
+            UnitsIter::Utf16(units) => units.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for UnitsIter<'_> {}
+
+impl LStr {
+    /// An empty flat buffer for `cap` units at the given width.
+    fn alloc_flat(two_byte: bool, cap: usize) -> LStr {
+        assert!(cap <= MAX_LEN, "string too large");
+        let bytes = HDR + if two_byte { cap * 2 } else { cap };
         unsafe {
-            let p = crate::value::alloc_string_cell(HDR + cap as usize) as *mut Header;
+            let p = crate::value::alloc_string_cell(bytes) as *mut Header;
             let p = NonNull::new(p).expect("allocation failed");
-            // The hint holds for `content`; constructors that append more bytes afterwards
-            // re-AND it with the extra bytes' ASCII-ness (see concat2/concat_grown).
-            let hint = if ascii { ASCII_HINT } else { 0 };
+            let flags = if two_byte { TWO_BYTE } else { ASCII_HINT };
             p.as_ptr().write(Header {
-                // The content's end.
-                frontier: Cell::new(content.len()),
-                len: Cell::new(content.len() as u32),
-                cap: Cell::new(cap | hint),
+                frontier: Cell::new(0),
+                len: Cell::new(0),
+                cap: Cell::new(cap as u32 | flags),
             });
-            let data = (p.as_ptr() as *mut u8).add(HDR);
-            std::ptr::copy_nonoverlapping(content.as_ptr(), data, content.len());
             LStr { p }
         }
     }
 
-    /// Set a fresh, unpublished flat string's length after writing its bytes, and its frontier
+    /// Write `units` at unit `at` of this flat buffer, widening ASCII bytes into a two-byte one.
+    ///
+    /// # Safety
+    /// `at + units.len()` is within capacity, and no string reads units at or past `at`: the
+    /// buffer is fresh, or `at` is its frontier.
+    unsafe fn write_units(&self, at: usize, units: Units<'_>) {
+        let data = self.p.as_ptr().cast::<u8>().add(HDR);
+        if self.hdr().cap.get() & TWO_BYTE != 0 {
+            let dst = data.cast::<u16>().add(at);
+            match units {
+                Units::Ascii(bytes) => {
+                    for (index, &byte) in bytes.iter().enumerate() {
+                        dst.add(index).write(u16::from(byte));
+                    }
+                }
+                Units::Utf16(units) => {
+                    std::ptr::copy_nonoverlapping(units.as_ptr(), dst, units.len())
+                }
+            }
+        } else {
+            match units {
+                Units::Ascii(bytes) => {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.add(at), bytes.len())
+                }
+                Units::Utf16(_) => unreachable!("two-byte units into a one-byte buffer"),
+            }
+        }
+    }
+
+    /// Set a fresh, unpublished flat string's length after writing its units, and its frontier
     /// to match.
     #[inline]
     fn set_fresh_len(&self, len: usize) {
@@ -141,105 +263,107 @@ impl LStr {
         h.frontier.set(len);
     }
 
-    /// Whether the content is KNOWN all-ASCII (see [`ASCII_HINT`]).
+    /// A flat string of `units`, at the narrowest width that holds them.
+    fn from_units_at_width(units: Units<'_>) -> LStr {
+        let two_byte = !units.is_ascii();
+        let s = LStr::alloc_flat(two_byte, units.len());
+        match units {
+            Units::Utf16(wide) if !two_byte => {
+                // SAFETY: fresh, sized for every unit; each is ASCII.
+                let data = unsafe { s.p.as_ptr().cast::<u8>().add(HDR) };
+                for (index, &unit) in wide.iter().enumerate() {
+                    unsafe { data.add(index).write(unit as u8) };
+                }
+            }
+            // SAFETY: fresh and sized for `units`.
+            _ => unsafe { s.write_units(0, units) },
+        }
+        s.set_fresh_len(units.len());
+        s
+    }
+
+    /// The string of these UTF-16 code units.
+    pub(crate) fn from_utf16(units: &[u16]) -> LStr {
+        LStr::from_units_at_width(Units::Utf16(units))
+    }
+
+    /// The string of engine text `s` (UTF-8 with lone surrogates smuggled; see
+    /// [`crate::jstr`]).
+    fn from_text(s: &str) -> LStr {
+        if s.is_ascii() {
+            LStr::from_units_at_width(Units::Ascii(s.as_bytes()))
+        } else {
+            LStr::from_utf16(&crate::jstr::units(s))
+        }
+    }
+
+    /// Whether the content is KNOWN all-ASCII (see [`ASCII_HINT`]): a flat one-byte buffer.
     #[inline]
     pub(crate) fn ascii_hint(&self) -> bool {
         self.hdr().cap.get() & ASCII_HINT != 0
     }
 
-    /// [`Self::ascii_hint`], or for a view its owner's. A view's `cap` is the view marker, so it
-    /// has no hint of its own, but it reads a range of its owner's buffer below the frontier,
-    /// and every write there clears the owner's hint unless its bytes are ASCII: while the
-    /// owner's hint holds, so does the view's content. Views come from slices and from in-place
-    /// appends, so a string built by appending to an ASCII string is one.
+    /// Whether the units are ASCII: the string is one-byte, a flat buffer or a view of one.
     #[inline]
     pub(crate) fn known_ascii(&self) -> bool {
-        self.ascii_hint() || self.view_owner().is_some_and(LStr::ascii_hint)
+        !self.is_two_byte()
     }
 
+    /// Whether the string's units are stored two bytes each.
     #[inline]
-    fn and_ascii(&self, extra_is_ascii: bool) {
-        if !extra_is_ascii {
-            let h = self.hdr();
-            h.cap.set(h.cap.get() & !ASCII_HINT);
-        }
+    fn is_two_byte(&self) -> bool {
+        self.flat().0.hdr().cap.get() & TWO_BYTE != 0
     }
 
-    /// The two halves concatenated (a single copy of each into the result).
-    pub fn concat2(a: &str, b: &str) -> LStr {
-        let total = a.len() + b.len();
-        let s = LStr::alloc("", u32::try_from(total).expect("string too large"));
-        unsafe {
-            let data = (s.p.as_ptr() as *mut u8).add(HDR);
-            std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
-            std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
+    /// The concatenation of engine-text pieces into one allocation.
+    fn concat_text(parts: &[&str]) -> LStr {
+        if parts.iter().all(|part| part.is_ascii()) {
+            let total = parts
+                .iter()
+                .try_fold(0usize, |total, part| total.checked_add(part.len()))
+                .expect("string too large");
+            let s = LStr::alloc_flat(false, total);
+            let mut at = 0;
+            for part in parts {
+                // SAFETY: fresh, sized for every part.
+                unsafe { s.write_units(at, Units::Ascii(part.as_bytes())) };
+                at += part.len();
+            }
             s.set_fresh_len(total);
+            return s;
         }
-        s.and_ascii(a.is_ascii() && b.is_ascii());
-        s
+        let units: Vec<u16> = parts
+            .iter()
+            .flat_map(|part| crate::jstr::unit_iter(part))
+            .collect();
+        LStr::from_utf16(&units)
     }
 
     /// The three pieces concatenated into one engine allocation.
     #[inline]
     pub(crate) fn concat3(a: &str, b: &str, c: &str) -> LStr {
-        let total = a
-            .len()
-            .checked_add(b.len())
-            .and_then(|total| total.checked_add(c.len()))
-            .expect("string too large");
-        let s = LStr::alloc("", u32::try_from(total).expect("string too large"));
-        unsafe {
-            let data = (s.p.as_ptr() as *mut u8).add(HDR);
-            std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
-            std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
-            std::ptr::copy_nonoverlapping(c.as_ptr(), data.add(a.len() + b.len()), c.len());
-            s.set_fresh_len(total);
-        }
-        s.and_ascii(a.is_ascii() && b.is_ascii() && c.is_ascii());
-        s
+        LStr::concat_text(&[a, b, c])
     }
 
     /// The four pieces concatenated into one engine allocation.
     #[inline]
     pub(crate) fn concat4(a: &str, b: &str, c: &str, d: &str) -> LStr {
-        let total = a
-            .len()
-            .checked_add(b.len())
-            .and_then(|total| total.checked_add(c.len()))
-            .and_then(|total| total.checked_add(d.len()))
-            .expect("string too large");
-        let s = LStr::alloc("", u32::try_from(total).expect("string too large"));
-        unsafe {
-            let data = (s.p.as_ptr() as *mut u8).add(HDR);
-            std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
-            std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
-            std::ptr::copy_nonoverlapping(c.as_ptr(), data.add(a.len() + b.len()), c.len());
-            std::ptr::copy_nonoverlapping(
-                d.as_ptr(),
-                data.add(a.len() + b.len() + c.len()),
-                d.len(),
-            );
-            s.set_fresh_len(total);
-        }
-        s.and_ascii(a.is_ascii() && b.is_ascii() && c.is_ascii() && d.is_ascii());
-        s
+        LStr::concat_text(&[a, b, c, d])
     }
 
-    /// Concatenate already-coerced strings into one engine allocation.
+    /// Concatenate already-coerced strings, `total` units in all, into one engine allocation.
     pub(crate) fn concat_many(parts: &[LStr], total: usize) -> LStr {
-        let s = LStr::alloc("", u32::try_from(total).expect("string too large"));
-        let mut offset = 0;
-        unsafe {
-            let data = (s.p.as_ptr() as *mut u8).add(HDR);
-            for part in parts {
-                let bytes = part.as_str().as_bytes();
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.add(offset), bytes.len());
-                offset += bytes.len();
-            }
+        let s = LStr::alloc_flat(parts.iter().any(LStr::is_two_byte), total);
+        let mut at = 0;
+        for part in parts {
+            let units = part.units();
+            assert!(at + units.len() <= total, "parts exceed the total");
+            // SAFETY: fresh, and the check above keeps every part within capacity.
+            unsafe { s.write_units(at, units) };
+            at += units.len();
         }
-        debug_assert_eq!(offset, total);
-        s.set_fresh_len(total);
-        s.and_ascii(parts.iter().all(LStr::known_ascii));
+        debug_assert_eq!(at, total);
+        s.set_fresh_len(at);
         s
     }
 
@@ -249,54 +373,54 @@ impl LStr {
     }
 
     #[inline]
-    fn data(&self) -> *const u8 {
-        unsafe {
-            if let Some(view) = self.view() {
-                // Views always own a flat buffer; nested slices flatten at construction.
-                (view.owner.p.as_ptr() as *const u8)
-                    .add(HDR)
-                    .add(view.offset)
-            } else {
-                (self.p.as_ptr() as *const u8).add(HDR)
-            }
-        }
-    }
-
-    #[inline]
     fn view(&self) -> Option<&View> {
         (self.hdr().cap.get() == VIEW_CAP).then(|| unsafe { &*self.p.as_ptr().cast::<View>() })
+    }
+
+    /// The flat buffer this string reads and its first unit's index there.
+    #[inline]
+    fn flat(&self) -> (LStr, usize) {
+        match self.view() {
+            // Views always own a flat buffer; nested slices flatten at construction.
+            Some(view) => (view.owner, view.offset),
+            None => (*self, 0),
+        }
     }
 
     pub(crate) fn view_owner(&self) -> Option<&LStr> {
         self.view().map(|view| &view.owner)
     }
 
+    /// A view's owner and its unit range there.
     pub(crate) fn view_range(&self) -> Option<(&LStr, usize, usize)> {
         self.view()
             .map(|view| (&view.owner, view.offset, view.offset + self.raw_len()))
     }
 
-    /// Slice already-proven UTF-8 boundaries. Copy small tokens, and ranges that would pin a
-    /// large owner (over `VIEW_PIN_BYTES`) more than twice their byte length; other slices
-    /// share their flat source owner.
-    pub(crate) fn slice_bytes(&self, start: usize, end: usize) -> LStr {
-        let bytes = &self.as_str()[start..end];
+    /// Units `start..end`. Copy small slices (at the narrowest width) and ranges that would pin
+    /// a large owner (over `VIEW_PIN_BYTES`) more than twice their size; other slices share
+    /// their flat source owner, at its width.
+    pub(crate) fn slice_units(&self, start: usize, end: usize) -> LStr {
+        assert!(start <= end && end <= self.raw_len(), "slice out of range");
         if start == 0 && end == self.raw_len() {
             return *self;
         }
-        let (owner, offset) = self
-            .view()
-            .map_or((self, start), |view| (&view.owner, view.offset + start));
+        let (owner, offset) = self.flat();
+        let bytes = if owner.is_two_byte() {
+            (end - start) * 2
+        } else {
+            end - start
+        };
         let owner_bytes = owner.allocation_requested_bytes();
-        if bytes.len() < MIN_VIEW_BYTES
-            || (owner_bytes > bytes.len().saturating_mul(2) && owner_bytes > VIEW_PIN_BYTES)
+        if bytes < MIN_VIEW_BYTES
+            || (owner_bytes > bytes.saturating_mul(2) && owner_bytes > VIEW_PIN_BYTES)
         {
-            return LStr::from(bytes);
+            return LStr::from_units_at_width(self.units().slice(start, end));
         }
-        LStr::new_view(*owner, offset, bytes.len())
+        LStr::new_view(owner, offset + start, end - start)
     }
 
-    /// A view of `len` bytes of flat `owner` from `offset`.
+    /// A view of `len` units of flat `owner` from unit `offset`.
     fn new_view(owner: LStr, offset: usize, len: usize) -> LStr {
         debug_assert!(owner.view().is_none(), "views own flat buffers");
         let view = View {
@@ -325,46 +449,80 @@ impl LStr {
         self.p.as_ptr() as u64
     }
 
-    /// The stored engine text; readers outside this module use [`Self::text`].
+    /// The stored code units, borrowed from the cell.
     #[inline]
-    fn as_str(&self) -> &str {
+    pub(crate) fn units(&self) -> Units<'_> {
+        let (buffer, offset) = self.flat();
+        let len = self.raw_len();
+        // SAFETY: a flat buffer's units below its frontier are initialized and never change;
+        // the buffer and each of its views read within them.
         unsafe {
-            let bytes = std::slice::from_raw_parts(self.data(), self.hdr().len.get() as usize);
-            std::str::from_utf8_unchecked(bytes)
+            let data = buffer.p.as_ptr().cast::<u8>().add(HDR);
+            if buffer.hdr().cap.get() & TWO_BYTE != 0 {
+                Units::Utf16(std::slice::from_raw_parts(
+                    data.cast::<u16>().add(offset),
+                    len,
+                ))
+            } else {
+                Units::Ascii(std::slice::from_raw_parts(data.add(offset), len))
+            }
+        }
+    }
+
+    /// Code unit `index`, if in range.
+    #[inline]
+    pub(crate) fn unit_at(&self, index: usize) -> Option<u16> {
+        self.units().get(index)
+    }
+
+    /// The code point at unit `index` (CodePointAt's value, ECMA-262 §11.1.4): a surrogate pair
+    /// starting there decodes, and any other unit, a lone surrogate included, is its own.
+    pub(crate) fn code_point_at(&self, index: usize) -> Option<u32> {
+        let units = self.units();
+        let first = units.get(index)?;
+        Some(crate::jstr::code_point_from_pair(
+            first,
+            units.get(index + 1),
+        ))
+    }
+
+    /// The order of IsLessThan for two Strings (ECMA-262 §7.2.13): code unit by code unit, a
+    /// proper prefix first.
+    pub(crate) fn cmp_units(&self, other: &LStr) -> std::cmp::Ordering {
+        match (self.units(), other.units()) {
+            (Units::Ascii(a), Units::Ascii(b)) => a.cmp(b),
+            (Units::Utf16(a), Units::Utf16(b)) => a.cmp(b),
+            (a, b) => a.iter().cmp(b.iter()),
         }
     }
 
     /// The content as engine text: UTF-8 with lone surrogates smuggled as plane-16 scalars (see
-    /// [`crate::jstr`]). Borrowed, since the cell stores engine text.
+    /// [`crate::jstr`]). Borrowed from a one-byte string; a two-byte string converts.
     #[inline]
-    pub fn text(&self) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Borrowed(self.as_str())
+    pub fn text(&self) -> Cow<'_, str> {
+        match self.units() {
+            // SAFETY: one-byte units are ASCII.
+            Units::Ascii(bytes) => Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(bytes) }),
+            Units::Utf16(units) => Cow::Owned(crate::jstr::from_units(units)),
+        }
     }
 
-    /// The stored engine text, borrowed from the cell. Outside this module only the embedding
-    /// API's `as_engine_text`, which lends a host the text for its receiver's lifetime, reads
-    /// it; it goes when strings are stored as code units.
-    #[inline]
-    pub(crate) fn storage_text(&self) -> &str {
-        self.as_str()
-    }
-
-    /// The content as `&str`, without copying, when it is known ASCII: then engine text, Latin-1
-    /// and UTF-16 code units agree, byte for unit. `None` for other strings, and for ASCII
-    /// content not known to be ASCII.
+    /// The content as `&str`, without copying, when the string is one-byte: then engine text,
+    /// Latin-1 and UTF-16 code units agree, byte for unit. `None` for a two-byte string, even
+    /// one whose units happen to be ASCII.
     #[inline]
     pub fn as_ascii(&self) -> Option<&str> {
-        self.known_ascii().then(|| self.as_str())
+        match self.units() {
+            // SAFETY: one-byte units are ASCII.
+            Units::Ascii(bytes) => Some(unsafe { std::str::from_utf8_unchecked(bytes) }),
+            Units::Utf16(_) => None,
+        }
     }
 
     /// The length in UTF-16 code units (ECMAScript's `length`).
     #[inline]
     pub fn unit_len(&self) -> usize {
-        if self.known_ascii() {
-            self.raw_len()
-        } else {
-            crate::jstr::unit_len(self.as_str())
-        }
+        self.raw_len()
     }
 
     /// Whether the string is empty.
@@ -373,7 +531,7 @@ impl LStr {
         self.hdr().len.get() == 0
     }
 
-    /// The stored length, in bytes of engine text.
+    /// The length, in units.
     #[inline]
     fn raw_len(&self) -> usize {
         self.hdr().len.get() as usize
@@ -406,7 +564,7 @@ impl LStr {
     /// Requested bytes retained by this allocation, excluding allocator rounding.
     ///
     /// This includes TRust JS's stable string header because [`LStr`] allocates that header and its
-    /// byte capacity as one explicit allocation. It intentionally does not include allocator
+    /// unit capacity as one explicit allocation. It intentionally does not include allocator
     /// metadata outside that request.
     pub(crate) fn retained_requested_bytes(&self) -> usize {
         self.allocation_requested_bytes().saturating_add(
@@ -419,72 +577,81 @@ impl LStr {
     /// multiple views and other roots; cache admission charges the entire retained owner.
     pub(crate) fn allocation_requested_bytes(&self) -> usize {
         if self.view().is_some() {
-            std::mem::size_of::<View>()
-        } else {
-            HDR.saturating_add((self.hdr().cap.get() & !ASCII_HINT) as usize)
+            return std::mem::size_of::<View>();
         }
+        let cap = self.hdr().cap.get();
+        let units = (cap & CAP_BITS) as usize;
+        HDR.saturating_add(if cap & TWO_BYTE != 0 {
+            units * 2
+        } else {
+            units
+        })
     }
 
-    /// Append in place when this string ends at its buffer's frontier and the capacity
-    /// suffices: the bytes go past the frontier, where no string reads, and `self` becomes a
-    /// view of the longer content. Returns false (without modifying anything) otherwise — the
-    /// caller copies.
-    pub fn append_in_place(&mut self, x: &str) -> bool {
-        self.append_with_hint(x, x.is_ascii())
-    }
-
-    fn append_with_hint(&mut self, x: &str, ascii: bool) -> bool {
+    /// Append in place when this string ends at its buffer's frontier, the capacity suffices
+    /// and the buffer's width holds the units: they go past the frontier, where no string reads,
+    /// and `self` becomes a view of the longer content. Returns false (without modifying
+    /// anything) otherwise — the caller copies.
+    fn append_units_in_place(&mut self, right: Units<'_>) -> bool {
         // Frontier append: only the string ending where its buffer's writes end may extend it.
-        let (buffer, offset) = match self.view() {
-            Some(view) => (view.owner, view.offset),
-            None => (*self, 0),
-        };
+        let (buffer, offset) = self.flat();
         let len = self.raw_len();
         let h = buffer.hdr();
         let frontier = h.frontier.get();
-        if offset + len != frontier || frontier + x.len() > (h.cap.get() & !ASCII_HINT) as usize {
+        let cap = h.cap.get();
+        if offset + len != frontier
+            || frontier + right.len() > (cap & CAP_BITS) as usize
+            || (cap & TWO_BYTE == 0 && matches!(right, Units::Utf16(_)))
+        {
             return false;
         }
-        // SAFETY: past the frontier, within capacity: no string can read these bytes yet.
-        unsafe {
-            let data = (buffer.p.as_ptr() as *mut u8).add(HDR);
-            std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(frontier), x.len());
-        }
-        h.frontier.set(frontier + x.len());
-        // The buffer's hint covers only the flat string's own bytes, so clearing it for a
-        // non-ASCII suffix is conservative.
-        buffer.and_ascii(ascii);
-        *self = LStr::new_view(buffer, offset, len + x.len());
+        // SAFETY: past the frontier, within capacity: no string can read these units yet. A
+        // right operand sharing this buffer reads below the frontier.
+        unsafe { buffer.write_units(frontier, right) };
+        h.frontier.set(frontier + right.len());
+        *self = LStr::new_view(buffer, offset, len + right.len());
         true
     }
 
-    /// `self + x` with growth capacity: used by the fused append ops when in-place didn't apply.
-    /// Doubles (at least) so a rebuilt accumulator amortizes the next appends.
-    pub fn concat_grown(&self, x: &str) -> LStr {
-        self.grow_with_hint(x, x.is_ascii())
-    }
-
-    fn grow_with_hint(&self, x: &str, ascii: bool) -> LStr {
-        let need = self
-            .raw_len()
-            .checked_add(x.len())
-            .expect("string too large");
-        assert!(need < VIEW_CAP as usize, "string too large");
-        let cap = need.saturating_mul(2).max(32).min((VIEW_CAP - 1) as usize) as u32;
-        let s = LStr::alloc_with_hint(self.as_str(), cap, self.known_ascii());
+    /// `self` + `right` in a new buffer with growth capacity, two-byte when either is. Doubles
+    /// (at least) so a rebuilt accumulator amortizes the next appends.
+    fn grown(&self, right: Units<'_>) -> LStr {
+        let len = self.raw_len();
+        let need = len.checked_add(right.len()).expect("string too large");
+        assert!(need <= MAX_LEN, "string too large");
+        let two_byte = self.is_two_byte() || matches!(right, Units::Utf16(_));
+        let s = LStr::alloc_flat(two_byte, need.saturating_mul(2).clamp(32, MAX_LEN));
+        // SAFETY: fresh, with capacity for both.
         unsafe {
-            let data = (s.p.as_ptr() as *mut u8).add(HDR);
-            std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(self.as_str().len()), x.len());
+            s.write_units(0, self.units());
+            s.write_units(len, right);
         }
         s.set_fresh_len(need);
-        s.and_ascii(ascii);
         s
     }
 
+    /// Append engine text in place (see [`Self::append_units_in_place`]).
+    pub fn append_in_place(&mut self, x: &str) -> bool {
+        if x.is_ascii() {
+            self.append_units_in_place(Units::Ascii(x.as_bytes()))
+        } else {
+            self.append_units_in_place(Units::Utf16(&crate::jstr::units(x)))
+        }
+    }
+
+    /// `self + x` with growth capacity, for engine text `x`.
+    pub fn concat_grown(&self, x: &str) -> LStr {
+        if x.is_ascii() {
+            self.grown(Units::Ascii(x.as_bytes()))
+        } else {
+            self.grown(Units::Utf16(&crate::jstr::units(x)))
+        }
+    }
+
     /// ECMAScript code-unit concatenation after the caller's coercions and length check.
-    /// Shared by all execution tiers and String#concat. Cached ASCII hints eliminate prefix
-    /// rescans; a left string that ends at its buffer's frontier appends there, amortized by
-    /// geometric capacity, whatever aliases it has (`s + s` included).
+    /// Shared by all execution tiers and String#concat. A left string that ends at its buffer's
+    /// frontier appends there, amortized by geometric capacity, whatever aliases it has
+    /// (`s + s` included).
     pub(crate) fn concat_owned(mut self, right: &LStr) -> LStr {
         self.append_or_replace(right);
         self
@@ -492,8 +659,9 @@ impl LStr {
 
     /// Append without temporarily removing an owning binding. Build a replacement before
     /// assigning it, so allocation failure cannot strand a cleared binding. A string that ends
-    /// at its buffer's frontier, with spare capacity, writes past it (bytes no string reads) and
-    /// becomes a view of the longer content; any other keeps its contents and is replaced.
+    /// at its buffer's frontier, with spare capacity of a width that holds the right operand,
+    /// writes past it (units no string reads) and becomes a view of the longer content; any
+    /// other keeps its contents and is replaced.
     pub(crate) fn append_or_replace(&mut self, right: &LStr) {
         if right.is_empty() {
             return;
@@ -502,21 +670,13 @@ impl LStr {
             *self = *right;
             return;
         }
-        if !self.known_ascii()
-            && !right.known_ascii()
-            && crate::jstr::needs_join_fixup(self.as_str(), right.as_str())
-        {
-            let replacement = crate::jstr::concat(self.as_str(), right.as_str()).into();
-            *self = replacement;
-            return;
-        }
-        if !self.append_with_hint(right.as_str(), right.known_ascii()) {
-            let replacement = self.grow_with_hint(right.as_str(), right.known_ascii());
-            *self = replacement;
+        let units = right.units();
+        if !self.append_units_in_place(units) {
+            *self = self.grown(units);
         }
     }
 
-    /// Repeat the byte representation directly into one engine allocation.
+    /// Repeat the units directly into one engine allocation, at this string's width.
     ///
     /// The caller has already performed the observable `String.prototype.repeat` coercions and
     /// length check (ECMA-262 §22.1.3.18).  Keeping this representation-local avoids first
@@ -524,43 +684,41 @@ impl LStr {
     /// `ptr::copy`, which is explicitly overlap-safe as each completed prefix becomes the source
     /// for the next block.
     pub(crate) fn repeat_direct(&self, count: usize) -> LStr {
-        let source_len = self.hdr().len.get() as usize;
+        let source_len = self.raw_len();
         let total = source_len
             .checked_mul(count)
             .expect("repeat length checked by caller");
-        let repeated = LStr::alloc("", u32::try_from(total).expect("string too large"));
-        if source_len == 0 || count == 0 {
+        let two_byte = self.is_two_byte();
+        let repeated = LStr::alloc_flat(two_byte, total);
+        if total == 0 {
             return repeated;
         }
+        let width = if two_byte { 2 } else { 1 };
         unsafe {
+            repeated.write_units(0, self.units());
             let destination = repeated.p.as_ptr().cast::<u8>().add(HDR);
-            std::ptr::copy_nonoverlapping(self.data(), destination, source_len);
             let mut filled = source_len;
             while filled < total {
                 let copy_len = filled.min(total - filled);
-                std::ptr::copy(destination, destination.add(filled), copy_len);
+                std::ptr::copy(
+                    destination,
+                    destination.add(filled * width),
+                    copy_len * width,
+                );
                 filled += copy_len;
             }
-            repeated.set_fresh_len(total);
         }
-        repeated.and_ascii(self.known_ascii());
+        repeated.set_fresh_len(total);
         repeated
-    }
-
-    /// Repeat an ASCII string directly into one engine allocation.
-    #[inline]
-    pub(crate) fn repeat_ascii(&self, count: usize) -> LStr {
-        debug_assert!(self.ascii_hint());
-        self.repeat_direct(count)
     }
 
     /// Build an ASCII-padded string directly in its final engine allocation. The caller has
     /// already applied StringPad's UTF-16 length and coercion rules, and both operands are known
-    /// ASCII, so repeating/truncating the fill cannot require surrogate fixup.
+    /// ASCII, so repeating/truncating the fill cannot split a surrogate pair.
     pub(crate) fn pad_ascii(source: &str, pad: &str, need: usize, at_start: bool) -> LStr {
         debug_assert!(source.is_ascii() && pad.is_ascii() && !pad.is_empty());
         let total = source.len() + need;
-        let padded = LStr::alloc("", u32::try_from(total).expect("string too large"));
+        let padded = LStr::alloc_flat(false, total);
         unsafe {
             let destination = padded.p.as_ptr().cast::<u8>().add(HDR);
             let (fill_start, source_start) = if at_start {
@@ -581,7 +739,6 @@ impl LStr {
             );
         }
         padded.set_fresh_len(total);
-        padded.and_ascii(true);
         padded
     }
 
@@ -589,9 +746,10 @@ impl LStr {
     /// selected the ASCII representation; non-ASCII case mappings (including one-to-many and
     /// context-sensitive mappings) remain on the Unicode implementation path.
     pub(crate) fn map_ascii_case(&self, upper: bool) -> LStr {
-        debug_assert!(self.ascii_hint());
-        let source = self.as_str().as_bytes();
-        let mapped = LStr::alloc("", u32::try_from(source.len()).expect("string too large"));
+        let Units::Ascii(source) = self.units() else {
+            panic!("map_ascii_case of a two-byte string");
+        };
+        let mapped = LStr::alloc_flat(false, source.len());
         unsafe {
             let destination = mapped.p.as_ptr().cast::<u8>().add(HDR);
             for (index, &byte) in source.iter().enumerate() {
@@ -610,74 +768,118 @@ impl LStr {
 
 impl From<&str> for LStr {
     fn from(s: &str) -> LStr {
-        LStr::alloc(s, u32::try_from(s.len()).expect("string too large"))
+        LStr::from_text(s)
     }
 }
 
 impl From<String> for LStr {
     fn from(s: String) -> LStr {
-        LStr::from(s.as_str())
+        LStr::from_text(&s)
     }
 }
 
 impl From<std::rc::Rc<str>> for LStr {
     fn from(s: std::rc::Rc<str>) -> LStr {
-        LStr::from(&*s)
+        LStr::from_text(&s)
     }
 }
 
 impl From<&String> for LStr {
     fn from(s: &String) -> LStr {
-        LStr::from(s.as_str())
+        LStr::from_text(s)
     }
 }
 
 impl From<char> for LStr {
     fn from(c: char) -> LStr {
-        LStr::from(c.encode_utf8(&mut [0u8; 4]) as &str)
+        LStr::from_text(c.encode_utf8(&mut [0u8; 4]))
     }
 }
 
 impl PartialEq for LStr {
     fn eq(&self, other: &LStr) -> bool {
-        LStr::ptr_eq(self, other) || self.as_str() == other.as_str()
+        if LStr::ptr_eq(self, other) {
+            return true;
+        }
+        if self.raw_len() != other.raw_len() {
+            return false;
+        }
+        match (self.units(), other.units()) {
+            (Units::Ascii(a), Units::Ascii(b)) => a == b,
+            (Units::Utf16(a), Units::Utf16(b)) => a == b,
+            (Units::Ascii(a), Units::Utf16(b)) | (Units::Utf16(b), Units::Ascii(a)) => a
+                .iter()
+                .zip(b)
+                .all(|(&byte, &unit)| u16::from(byte) == unit),
+        }
     }
 }
 impl Eq for LStr {}
 
+/// Equality with engine text.
 impl PartialEq<str> for LStr {
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        match self.units() {
+            Units::Ascii(bytes) => bytes == other.as_bytes(),
+            Units::Utf16(units) => units.iter().copied().eq(crate::jstr::unit_iter(other)),
+        }
     }
 }
 
 impl std::hash::Hash for LStr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state)
+        // Equal strings hash equally at either width: ASCII content goes in as its bytes and
+        // any other as little-endian units, in the same blocks whichever way it is stored.
+        const BLOCK: usize = 64;
+        let mut block = [0u8; BLOCK];
+        match self.units() {
+            Units::Ascii(bytes) => {
+                for chunk in bytes.chunks(BLOCK) {
+                    state.write(chunk);
+                }
+            }
+            Units::Utf16(units) if units.iter().all(|&unit| unit < 0x80) => {
+                for chunk in units.chunks(BLOCK) {
+                    for (byte, &unit) in block.iter_mut().zip(chunk) {
+                        *byte = unit as u8;
+                    }
+                    state.write(&block[..chunk.len()]);
+                }
+            }
+            Units::Utf16(units) => {
+                for chunk in units.chunks(BLOCK / 2) {
+                    for (index, &unit) in chunk.iter().enumerate() {
+                        block[2 * index..2 * index + 2].copy_from_slice(&unit.to_le_bytes());
+                    }
+                    state.write(&block[..chunk.len() * 2]);
+                }
+            }
+        }
+        state.write_u8(0xff);
     }
 }
 
 impl std::fmt::Display for LStr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.text())
     }
 }
 
 impl std::fmt::Debug for LStr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self.as_str(), f)
+        std::fmt::Debug::fmt(&*self.text(), f)
     }
 }
 
 impl From<&LStr> for std::rc::Rc<str> {
     fn from(s: &LStr) -> std::rc::Rc<str> {
-        std::rc::Rc::from(s.as_str())
+        std::rc::Rc::from(&*s.text())
     }
 }
 
 impl From<LStr> for std::rc::Rc<str> {
     fn from(s: LStr) -> std::rc::Rc<str> {
-        std::rc::Rc::from(s.as_str())
+        std::rc::Rc::from(&*s.text())
     }
 }
 
@@ -685,24 +887,39 @@ impl From<LStr> for std::rc::Rc<str> {
 mod tests {
     use super::*;
 
+    /// A one-byte flat buffer holding `text` with `cap` units of capacity.
+    fn ascii_with_capacity(text: &str, cap: usize) -> LStr {
+        let s = LStr::alloc_flat(false, cap);
+        unsafe { s.write_units(0, Units::Ascii(text.as_bytes())) };
+        s.set_fresh_len(text.len());
+        s
+    }
+
+    fn hash_of(s: &LStr) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut state = crate::fasthash::FxHasher::default();
+        s.hash(&mut state);
+        state.finish()
+    }
+
     #[test]
     fn owned_concat_reuses_unique_capacity_and_preserves_aliases() {
         let mut s = LStr::from("a").concat_owned(&LStr::from("b"));
         let p = s.buffer_ptr();
         s = s.concat_owned(&LStr::from("c"));
         assert_eq!(s.buffer_ptr(), p);
-        assert_eq!(s.as_str(), "abc");
+        assert_eq!(s.text(), "abc");
         // A frontier append returns a view, which carries no hint.
         assert!(s.ascii_hint() || s.view_owner().is_some());
         let alias = s;
         s = s.concat_owned(&LStr::from("d"));
         assert!(!LStr::ptr_eq(&s, &alias));
-        assert_eq!(alias.as_str(), "abc");
-        assert_eq!(s.as_str(), "abcd");
+        assert_eq!(alias.text(), "abc");
+        assert_eq!(s.text(), "abcd");
         let right = s;
         s = s.concat_owned(&right);
-        assert_eq!(right.as_str(), "abcd");
-        assert_eq!(s.as_str(), "abcdabcd");
+        assert_eq!(right.text(), "abcd");
+        assert_eq!(s.text(), "abcdabcd");
     }
 
     /// P1-S0e oracle: JS `s += x` accumulation must stay amortized after
@@ -712,136 +929,155 @@ mod tests {
     /// uniqueness-based one fails the aliasing assertions above.
     #[test]
     fn accumulation_scaling_oracle_geometric_capacity_and_aliasing() {
-        let chunk = LStr::from("abcdefgh");
-        let mut s = LStr::from("");
-        let mut alias_at_1k = None;
-        for i in 0..10_000 {
-            s = s.concat_owned(&chunk);
-            if i == 999 {
-                alias_at_1k = Some(s);
+        for chunk in [LStr::from("abcdefgh"), LStr::from("abcdefg\u{e9}")] {
+            let mut s = LStr::from("");
+            let mut alias_at_1k = None;
+            for i in 0..10_000 {
+                s = s.concat_owned(&chunk);
+                if i == 999 {
+                    alias_at_1k = Some(s);
+                }
             }
+            assert_eq!(s.unit_len(), 80_000);
+            assert!(s.text().starts_with(&*chunk.text()));
+            assert!(s.text().ends_with(&*chunk.text()));
+            // The buffer the accumulated string reads (a view's owner).
+            let buffer = s.view_owner().unwrap_or(&s);
+            let cap = (buffer.hdr().cap.get() & CAP_BITS) as usize;
+            assert!(
+                cap <= 4 * s.unit_len(),
+                "capacity {cap} not geometric vs len {}",
+                s.unit_len()
+            );
+            let alias = alias_at_1k.unwrap();
+            assert_eq!(
+                alias.unit_len(),
+                8_000,
+                "alias must not observe later appends"
+            );
         }
-        assert_eq!(s.raw_len(), 80_000);
-        assert!(s.as_str().starts_with("abcdefgh"));
-        assert!(s.as_str().ends_with("abcdefgh"));
-        // The buffer the accumulated string reads (a view's owner).
-        let buffer = s.view_owner().unwrap_or(&s);
-        let cap = (buffer.hdr().cap.get() & !ASCII_HINT) as usize;
-        assert!(
-            cap <= 4 * s.raw_len(),
-            "capacity {cap} not geometric vs len {}",
-            s.raw_len()
-        );
-        let alias = alias_at_1k.unwrap();
-        assert_eq!(
-            alias.raw_len(),
-            8_000,
-            "alias must not observe later appends"
-        );
         // Doubling self-append through an alias stays correct.
         let a = LStr::from("xy");
         let b = a;
         let a = a.concat_owned(&b);
-        assert_eq!(a.as_str(), "xyxy");
-        assert_eq!(b.as_str(), "xy");
+        assert_eq!(a.text(), "xyxy");
+        assert_eq!(b.text(), "xy");
     }
 
+    /// The width is fixed when a buffer is allocated: ASCII text is one-byte, any other text
+    /// two-byte, and a two-byte suffix on a one-byte buffer copies into a two-byte one, after
+    /// which appends are in place again. One-byte units widen into a two-byte buffer in place.
     #[test]
-    fn owned_concat_retains_conservative_hints_and_clears_for_unicode() {
-        let s = LStr::alloc_with_hint("abc", 3, false);
-        let s = s.concat_owned(&LStr::from("d"));
-        assert!(!s.ascii_hint(), "growth must not rescan the prefix");
-        assert_eq!(s.as_str(), "abcd");
-        let s = LStr::from("abc").concat_owned(&LStr::alloc_with_hint("d", 1, false));
-        assert!(!s.ascii_hint(), "right hint must also be preserved");
-        let s = LStr::from("a").concat_owned(&LStr::from("b"));
+    fn widths_follow_the_content_and_appends_keep_them() {
+        let ascii = LStr::from("abc");
+        assert!(ascii.ascii_hint() && ascii.known_ascii() && ascii.as_ascii() == Some("abc"));
+        let wide = LStr::from("ab\u{e9}");
+        assert!(!wide.known_ascii() && wide.as_ascii().is_none());
+        assert_eq!(wide.unit_len(), 3);
+        assert_eq!(wide.unit_at(2), Some(0xe9));
+        let mut s = ascii_with_capacity("start", 64);
         let p = s.buffer_ptr();
-        let s = s.concat_owned(&LStr::from("é"));
-        assert_eq!(s.buffer_ptr(), p);
-        assert!(!s.ascii_hint());
-        assert_eq!(s.as_str(), "abé");
+        s.append_or_replace(&LStr::from(":ab"));
+        assert_eq!(s.buffer_ptr(), p, "one-byte onto one-byte appends in place");
+        assert!(s.known_ascii());
+        let before = s;
+        s.append_or_replace(&wide);
+        assert_ne!(s.buffer_ptr(), p, "two-byte onto one-byte copies");
+        assert!(!s.known_ascii());
+        assert_eq!(s.text(), "start:abab\u{e9}");
+        assert_eq!(before.text(), "start:ab");
+        let q = s.buffer_ptr();
+        s.append_or_replace(&LStr::from("xyz"));
+        assert_eq!(s.buffer_ptr(), q, "one-byte onto two-byte appends in place");
+        assert_eq!(s.text(), "start:abab\u{e9}xyz");
+        assert_eq!(s.unit_len(), 14);
     }
 
-    /// A view reads its owner's buffer, every write to which ANDs its bytes into the owner's
-    /// hint: a view of a hinted owner is known ASCII, and copies made from such views (a
-    /// regrown accumulator, an append of one, a concatenation, a repeat) keep the hint. A
-    /// non-ASCII append clears the owner's hint, and with it every view's, conservatively.
+    /// Strings compare and hash by code units, whatever their width: a two-byte view whose
+    /// units are ASCII equals and hashes like the one-byte string of the same text.
     #[test]
-    fn views_of_ascii_buffers_are_known_ascii_and_their_copies_keep_the_hint() {
-        let mut accumulator = LStr::from("start").concat_owned(&LStr::from(":"));
-        accumulator.append_or_replace(&LStr::from("ab"));
-        assert!(accumulator.view_owner().is_some(), "an in-place append");
-        assert!(!accumulator.ascii_hint() && accumulator.known_ascii());
-        let slice = LStr::from("x".repeat(1024)).slice_bytes(0, 900);
-        assert!(slice.view_owner().is_some() && slice.known_ascii());
-        assert!(accumulator.concat_grown(&"y".repeat(4096)).ascii_hint());
-        let mut left = LStr::alloc_with_hint("left", 4096, true);
-        left.append_or_replace(&slice);
-        assert!(
-            left.known_ascii(),
-            "an appended view keeps the left buffer's hint"
-        );
-        let total = slice.raw_len() + accumulator.raw_len();
-        assert!(LStr::concat_many(&[slice, accumulator], total).ascii_hint());
-        assert!(slice.repeat_direct(2).ascii_hint());
-        let mut wide = accumulator;
-        wide.append_or_replace(&LStr::from("é"));
-        assert!(!wide.known_ascii() && !accumulator.known_ascii());
-        assert_eq!(accumulator.as_str(), "start:ab");
+    fn equality_and_hashes_ignore_the_width() {
+        let owner = LStr::from(format!("{}\u{4e2d}", "x".repeat(400)));
+        assert!(!owner.known_ascii());
+        let view = owner.slice_units(0, 300);
+        assert!(view.view_owner().is_some() && !view.known_ascii());
+        let narrow = LStr::from("x".repeat(300));
+        assert!(narrow.known_ascii());
+        assert!(view == narrow && narrow == view);
+        assert_eq!(hash_of(&view), hash_of(&narrow));
+        assert!(view == *"x".repeat(300).as_str());
+        let tail = owner.slice_units(100, 401);
+        let copy = LStr::from(format!("{}\u{4e2d}", "x".repeat(300)));
+        assert!(tail == copy);
+        assert_eq!(hash_of(&tail), hash_of(&copy));
+        assert!(tail != narrow);
+        assert!(LStr::from("ab") != LStr::from("a\u{e9}"));
     }
 
+    /// Lone surrogates are ordinary two-byte units; engine text smuggles them and a surrogate
+    /// pair joined from two halves is the character.
     #[test]
-    fn owned_concat_empty_and_surrogate_boundaries() {
-        let s = LStr::from("abc");
-        let p = s.as_ptr();
-        let s = s.concat_owned(&LStr::from(""));
-        assert_eq!(s.as_ptr(), p);
-        assert!(LStr::ptr_eq(&LStr::from("").concat_owned(&s), &s));
-        let high = LStr::from(crate::jstr::from_units(&[0xD834]));
-        let low = LStr::from(crate::jstr::from_units(&[0xDF06]));
-        assert_eq!(high.concat_owned(&low).as_str(), "𝌆");
+    fn surrogates_are_units_and_join_across_appends() {
+        let high = LStr::from_utf16(&[0xD834]);
+        let low = LStr::from_utf16(&[0xDF06]);
+        assert_eq!(high.unit_len(), 1);
+        assert_eq!(high.text(), crate::jstr::from_units(&[0xD834]));
+        assert_eq!(high.concat_owned(&low).text(), "𝌆");
+        let mut joined = high;
+        joined.append_or_replace(&low);
+        assert_eq!(joined.text(), "𝌆");
+        assert_eq!(joined.unit_len(), 2);
+        assert!(LStr::from("𝌆") == joined);
         assert_eq!(std::mem::size_of::<LStr>(), std::mem::size_of::<usize>());
         assert_eq!(LEN_OFF, std::mem::size_of::<usize>());
         assert_eq!(CAP_OFF, LEN_OFF + 4);
     }
 
     #[test]
+    fn owned_concat_empty_boundaries() {
+        let s = LStr::from("abc");
+        let p = s.as_ptr();
+        let s = s.concat_owned(&LStr::from(""));
+        assert_eq!(s.as_ptr(), p);
+        assert!(LStr::ptr_eq(&LStr::from("").concat_owned(&s), &s));
+    }
+
+    #[test]
     fn populated_append_reuses_unique_capacity_and_keeps_aliases_immutable() {
-        let mut value = LStr::alloc_with_hint("a", 16, true);
+        let mut value = ascii_with_capacity("a", 16);
         let pointer = value.buffer_ptr();
         value.append_or_replace(&LStr::from("b"));
         assert_eq!(value.buffer_ptr(), pointer);
-        assert_eq!(value.as_str(), "ab");
+        assert_eq!(value.text(), "ab");
         let snapshot = value;
         value.append_or_replace(&LStr::from("c"));
-        assert_eq!(snapshot.as_str(), "ab");
-        assert_eq!(value.as_str(), "abc");
+        assert_eq!(snapshot.text(), "ab");
+        assert_eq!(value.text(), "abc");
         assert!(!LStr::ptr_eq(&value, &snapshot));
         let rhs = value;
         value.append_or_replace(&rhs);
-        assert_eq!(rhs.as_str(), "abc");
-        assert_eq!(value.as_str(), "abcabc");
-        let mut high = LStr::from(crate::jstr::from_units(&[0xd834]));
-        high.append_or_replace(&LStr::from(crate::jstr::from_units(&[0xdf06])));
-        assert_eq!(high.as_str(), "𝌆");
-        assert!(!high.ascii_hint());
+        assert_eq!(rhs.text(), "abc");
+        assert_eq!(value.text(), "abcabc");
     }
 
     #[test]
     fn bounded_views_flatten_and_preserve_root_immutability() {
-        let mut source = LStr::from("x".repeat(1024));
-        let mut prefix = source.slice_bytes(0, 900);
-        let nested = prefix.slice_bytes(100, 800);
-        assert!(LStr::ptr_eq(nested.view_owner().unwrap(), &source));
-        assert!(!prefix.ascii_hint());
-        assert_eq!(prefix.raw_len(), 900);
-        assert_eq!(nested.as_str(), &source.as_str()[100..800]);
-        assert!(!source.append_in_place("changed"));
-        assert!(!prefix.append_in_place("changed"));
-        let alias = prefix;
-        let appended = prefix.concat_owned(&LStr::from("!"));
-        assert_eq!(appended.as_str(), format!("{}!", "x".repeat(900)));
-        assert_eq!(alias.raw_len(), 900);
+        for unit in ["x", "\u{4e2d}"] {
+            let source = LStr::from(unit.repeat(1024));
+            let mut prefix = source.slice_units(0, 900);
+            let nested = prefix.slice_units(100, 800);
+            assert!(LStr::ptr_eq(nested.view_owner().unwrap(), &source));
+            assert!(!prefix.ascii_hint());
+            assert_eq!(prefix.unit_len(), 900);
+            assert_eq!(nested.text(), unit.repeat(700));
+            let mut source = source;
+            assert!(!source.append_in_place("changed"));
+            assert!(!prefix.append_in_place("changed"));
+            let alias = prefix;
+            let appended = prefix.concat_owned(&LStr::from("!"));
+            assert_eq!(appended.text(), format!("{}!", unit.repeat(900)));
+            assert_eq!(alias.unit_len(), 900);
+        }
         assert_eq!(std::mem::offset_of!(View, header), 0);
     }
 
@@ -850,39 +1086,46 @@ mod tests {
         // Small tokens always copy; a moderately sized owner may be shared by any other slice.
         let source = LStr::from("x".repeat(2048));
         for (start, end) in [(0, 10), (1024, 1030)] {
-            let slice = source.slice_bytes(start, end);
+            let slice = source.slice_units(start, end);
             assert!(slice.view_owner().is_none());
-            assert_eq!(slice.as_str(), &source.as_str()[start..end]);
+            assert_eq!(slice.text(), "x".repeat(end - start));
         }
-        let shared = source.slice_bytes(0, 900);
+        let shared = source.slice_units(0, 900);
         assert!(shared.view_owner().is_some());
         drop(shared);
         // A large owner is pinned only by a slice covering at least half of it.
         let large = LStr::from("x".repeat(VIEW_PIN_BYTES + 4096));
         for (start, end) in [(0, 900), (1024, 300_000)] {
-            let slice = large.slice_bytes(start, end);
+            let slice = large.slice_units(start, end);
             assert!(slice.view_owner().is_none());
-            assert_eq!(slice.as_str(), &large.as_str()[start..end]);
+            assert_eq!(slice.unit_len(), end - start);
         }
         assert!(large
-            .slice_bytes(0, large.raw_len() / 2 + 1024)
+            .slice_units(0, large.unit_len() / 2 + 1024)
             .view_owner()
             .is_some());
         // The pinning bound charges the owner's allocation, including spare capacity, rather
         // than its visible length.
         let base = LStr::from("x".repeat(VIEW_PIN_BYTES - 4096));
         let spare = base.concat_grown("x");
-        assert!(spare.raw_len() <= VIEW_PIN_BYTES);
+        assert!(spare.unit_len() <= VIEW_PIN_BYTES);
         assert!(spare.allocation_requested_bytes() > VIEW_PIN_BYTES);
-        let slice = spare.slice_bytes(0, 1100);
+        let slice = spare.slice_units(0, 1100);
         assert!(
             slice.view_owner().is_none(),
             "charge spare capacity, not visible length"
         );
-        let unicode = LStr::from(format!("{}😀é", "x".repeat(1024)));
-        let tail = unicode.slice_bytes(200, unicode.raw_len());
+        // A two-byte owner counts its content's bytes: 128 units of it already make a view, and
+        // a short copy of ASCII units narrows to one-byte.
+        let unicode = LStr::from(format!("{}😀\u{e9}", "x".repeat(1024)));
+        assert_eq!(unicode.unit_len(), 1027);
+        let tail = unicode.slice_units(200, unicode.unit_len());
+        assert!(tail.view_owner().is_some());
         drop(unicode);
-        assert_eq!(tail.as_str(), format!("{}😀é", "x".repeat(824)));
-        assert_eq!(tail.repeat_direct(2).raw_len(), tail.raw_len() * 2);
+        assert_eq!(tail.text(), format!("{}😀\u{e9}", "x".repeat(824)));
+        assert_eq!(tail.repeat_direct(2).unit_len(), tail.unit_len() * 2);
+        let short = tail.slice_units(0, 10);
+        assert!(short.view_owner().is_none() && short.known_ascii());
+        assert_eq!(short.text(), "x".repeat(10));
     }
 }

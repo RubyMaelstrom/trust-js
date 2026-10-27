@@ -61,7 +61,7 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
     let chunk = chunk();
     let plan = first_plan(&chunk);
     let root = crate::lstr::LStr::from("x".repeat(1024));
-    let view = root.slice_bytes(0, 900);
+    let view = root.slice_units(0, 900);
     let alias = view;
     let env = scope(&engine, Value::Str(view));
     let stored = try_store(&chunk, &mut engine.interp, &env, plan, Value::lstr("!"))
@@ -725,7 +725,7 @@ fn borrowed_native_every_original_interior_resumes_without_replaying_the_prefix(
         }
         .unwrap_or_else(|_| panic!("native continuation must complete without error"));
         assert!(
-            matches!(step,bytecode::VmStep::Yield(value) if value.as_engine_text()==Some("AB"))
+            matches!(step,bytecode::VmStep::Yield(value) if value.as_engine_text().as_deref()==Some("AB"))
         );
         assert_eq!(result(&holder).as_engine_text().unwrap(), "AB");
         assert_eq!(
@@ -793,7 +793,9 @@ fn borrowed_native_preentry_interrupt_leaves_binding_then_commits_before_yield()
         )
     }
     .unwrap_or_else(|_| panic!("native continuation must complete without error"));
-    assert!(matches!(step,bytecode::VmStep::Yield(value) if value.as_engine_text()==Some("AB")));
+    assert!(
+        matches!(step,bytecode::VmStep::Yield(value) if value.as_engine_text().as_deref()==Some("AB"))
+    );
     assert_eq!(TEST_NATIVE_HITS.with(Cell::get), hits + 1);
     assert_eq!(result(&holder).as_engine_text().unwrap(), "AB");
 }

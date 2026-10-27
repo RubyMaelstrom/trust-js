@@ -259,7 +259,10 @@ fn engine_text_round_trips_every_code_unit() {
         panic!("a string converts");
     };
     let engine_text = engine_text.to_string();
-    assert_eq!(original.as_engine_text(), Some(engine_text.as_str()));
+    assert_eq!(
+        original.as_engine_text().as_deref(),
+        Some(engine_text.as_str())
+    );
     let rebuilt = Value::from_engine_text(engine_text.clone());
     assert_eq!(
         it.coerce_utf16(&rebuilt).ok(),

@@ -1062,7 +1062,7 @@ fn agent_cleanup_task_eligibility_uses_registry_context_and_whole_loop_callback_
                 panic!("callback result")
             };
             assert_eq!(
-                result.as_engine_text(),
+                result.as_engine_text().as_deref(),
                 Some("callback,callback,promise,promise:true")
             );
         }

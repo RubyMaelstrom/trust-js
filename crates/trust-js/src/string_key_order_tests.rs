@@ -100,7 +100,8 @@ fn strings_sort_and_compare_by_utf16_code_units() {
 
 #[test]
 fn unit_comparison_matches_a_unit_by_unit_reference() {
-    use crate::jstr::{cmp_units, from_units, units};
+    use crate::jstr::{from_units, units};
+    use crate::lstr::LStr;
     let samples: Vec<Vec<u16>> = vec![
         vec![],
         vec![0x61],
@@ -125,7 +126,11 @@ fn unit_comparison_matches_a_unit_by_unit_reference() {
         for b in &samples {
             let (sa, sb) = (from_units(a), from_units(b));
             assert_eq!(units(&sa), *a);
-            assert_eq!(cmp_units(&sa, &sb), a.cmp(b), "{a:x?} vs {b:x?}");
+            assert_eq!(
+                LStr::from(sa.as_str()).cmp_units(&LStr::from(sb.as_str())),
+                a.cmp(b),
+                "{a:x?} vs {b:x?}"
+            );
         }
     }
 }
