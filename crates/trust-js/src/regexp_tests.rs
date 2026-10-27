@@ -322,6 +322,63 @@ fn regexp_fast_paths_yield_to_observable_lookups() {
     );
 }
 
+/// The RegExp protector proves %RegExp.prototype%'s methods and `constructor` by identity at
+/// each use: assigning one changes no structure and bumps no epoch, yet String.prototype's
+/// methods and RegExpExec observe it at once, and the intrinsic paths return once it is
+/// restored. A non-global replace or match still reads `lastIndex` with ToLength when its
+/// result is unused.
+#[test]
+fn regexp_protector_observes_assigned_members() {
+    check(
+        r###"
+        (function () {
+        function run() {
+            var log = [];
+            var r = [];
+            r.push('a-b'.replace(/-/, '+'), 'a-b'.split(/-/).join('|'), 'xa'.search(/a/), 'aa'.match(/a/g).length);
+            var proto = RegExp.prototype;
+            var saved = {};
+            var keys = ['exec', Symbol.match, Symbol.matchAll, Symbol.replace, Symbol.search, Symbol.split, 'constructor'];
+            keys.forEach(function (k) { saved[typeof k === 'symbol' ? k.description.slice(7) : k] = proto[k]; });
+            proto[Symbol.replace] = function (s, v) { log.push('replace:' + s + ':' + v); return 'R'; };
+            r.push('a-b'.replace(/-/, '+'), 'a-b'.replaceAll(/-/g, '+'));
+            proto[Symbol.replace] = saved.replace;
+            proto[Symbol.match] = function (s) { log.push('match:' + s); return ['M']; };
+            r.push('a-b'.match(/-/)[0]);
+            proto[Symbol.match] = saved.match;
+            proto[Symbol.split] = function (s, lim) { log.push('split:' + s + ':' + lim); return ['S']; };
+            r.push('a-b'.split(/-/, 3)[0]);
+            proto[Symbol.split] = saved.split;
+            proto[Symbol.search] = function (s) { log.push('search:' + s); return 42; };
+            r.push('a-b'.search(/-/));
+            proto[Symbol.search] = saved.search;
+            proto[Symbol.matchAll] = function (s) { log.push('matchAll:' + s); return [['A']].values(); };
+            r.push([...'a-b'.matchAll(/-/g)][0][0]);
+            proto[Symbol.matchAll] = saved.matchAll;
+            proto.exec = function (s) { log.push('exec:' + this.source + ':' + s); return saved.exec.call(this, s); };
+            r.push('a-b'.replace(/-/, '+'), /b/.test('ab'), 'a-b'.split(/-/).join('|'), 'xa'.search(/a/));
+            proto.exec = saved.exec;
+            proto.constructor = { [Symbol.species]: function (p, f) { log.push('species:' + f); return new RegExp(p, f); } };
+            r.push('a-b'.split(/-/).join('|'));
+            proto.constructor = saved.constructor;
+            r.push('a-b'.replace(/-/, '+'), 'a-b'.split(/-/).join('|'), 'xa'.search(/a/), 'aa'.match(/a/g).length);
+            var reads = 0, plain = /a/;
+            plain.lastIndex = { valueOf: function () { reads++; return 0; } };
+            'a'.replace(plain, 'b');
+            'a'.match(plain);
+            r.push(reads);
+            try { 'a'.matchAll(/a/); r.push('no throw'); } catch (e) { r.push(e.name); }
+            try { 'a'.replaceAll(/a/, 'b'); r.push('no throw'); } catch (e) { r.push(e.name); }
+            r.push(log.join(' '));
+            return r.join(';');
+        }
+        return run();
+        })()
+        "###,
+        r###"a+b;a|b;1;2;R;R;M;S;42;A;a+b;true;a|b;1;a|b;a+b;a|b;1;2;2;TypeError;TypeError;replace:a-b:+ replace:a-b:+ match:a-b split:a-b:3 search:a-b matchAll:a-b exec:-:a-b exec:b:ab exec:-:a-b exec:-:a-b exec:-:a-b exec:a:xa species:y"###,
+    );
+}
+
 /// A pattern whose alternatives begin with `^` or with an element (`(^|\s)name`) is only
 /// attempted where one of them can begin, including the empty end of the input.
 #[test]

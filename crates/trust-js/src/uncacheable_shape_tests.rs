@@ -266,26 +266,26 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
 }
 
 #[test]
-fn uncacheable_shapes_keep_regexp_dependencies_live_without_publishing_slots() {
+fn uncacheable_shapes_keep_the_regexp_protector_live() {
     let mut engine = Engine::new();
     assert!(crate::builtins::regexp_dependencies_canonical(
         &engine.interp
     ));
-    let before = engine.interp.regexp_dependency_cache.get().shape;
+    // The protector's slots are proven by the epoch, not by %RegExp.prototype%'s shape.
     let proto = *engine.interp.extra_protos.get("RegExp").unwrap();
     unknown(&proto);
     assert!(crate::builtins::regexp_dependencies_canonical(
         &engine.interp
     ));
-    assert_eq!(engine.interp.regexp_dependency_cache.get().shape, before);
     run(&mut engine, "Object.defineProperty(RegExp.prototype,'global',{get:function(){return true;},configurable:true});");
     unknown(&proto);
     assert!(!crate::builtins::regexp_dependencies_canonical(
         &engine.interp
     ));
     assert_eq!(run(&mut engine, "(/a/).flags"), "g");
+    // A RegExp of an uncacheable shape is never taken for one of RegExpAlloc's shape.
     assert_ne!(
-        engine.interp.regexp_dependency_cache.get().shape,
+        crate::builtins::regexp_instance_shape(&engine.interp),
         SHAPE_UNCACHEABLE
     );
 }

@@ -1464,23 +1464,6 @@ pub(crate) struct RegexpLastMatch {
     pub lazy_captures: Option<(Rc<crate::regex::Regex>, usize)>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct RegexpDependencyCache {
-    pub proto: usize,
-    pub shape: u32,
-    pub slots: [u32; 10],
-}
-
-impl Default for RegexpDependencyCache {
-    fn default() -> Self {
-        RegexpDependencyCache {
-            proto: 0,
-            shape: u32::MAX,
-            slots: [u32::MAX; 10],
-        }
-    }
-}
-
 /// One scope's binding map, wrapping the raw hash map so every *structural* mutation — anything
 /// that can move entries or change what a name resolves to (insert, remove, clear) — bumps a
 /// generation counter. The bytecode tier's per-site name caches hold a raw `&Binding` pointer
@@ -3374,9 +3357,9 @@ pub struct Interp {
     /// bytes directly, so retaining thousands of these trivial views in the general LRU costs
     /// more than rebuilding them. One hot entry preserves the common consecutive reuse case.
     pub(crate) re_text_ascii_hot: Option<(crate::lstr::LStr, bool, Rc<crate::regex::ReText>)>,
-    /// Shape-validated entry slots for the ten RegExp prototype dependencies checked by
-    /// dead-result specializations. Values/accessors remain live-checked on every operation.
-    pub(crate) regexp_dependency_cache: std::cell::Cell<RegexpDependencyCache>,
+    /// The RegExp protector (see [`crate::builtins::RegexpProof`]): the current Realm's RegExp
+    /// algorithms read the intrinsic methods, flag getters and species.
+    pub(crate) regexp_protector: RefCell<crate::builtins::RegexpProof>,
     /// The last successful `exec` match, kept raw for the legacy `RegExp.$1`-style statics:
     /// the 14 strings materialize into the constructor's internal slots only when an accessor
     /// actually reads them (see `builtins::flush_regexp_legacy`), not on every match.
@@ -3804,7 +3787,7 @@ interp_memory_inventory! {
     inline_ic_safe => "non_owning",
     re_texts => "measured",
     re_text_ascii_hot => "measured",
-    regexp_dependency_cache => "non_owning",
+    regexp_protector => "non_owning",
     regexp_last => "measured",
     depth => "non_owning",
     direct_call_depth => "non_owning",
@@ -4787,6 +4770,7 @@ impl Interp {
         self.elems_protector.set((0, false));
         self.species_protector.set((0, u32::MAX));
         *self.array_iteration_protector.borrow_mut() = Default::default();
+        self.regexp_protector.borrow_mut().invalidate();
     }
 
     /// Exchange an owned Realm snapshot with the active one. Cross-Realm calls
@@ -4812,6 +4796,7 @@ impl Interp {
         self.elems_protector.set((0, false));
         self.species_protector.set((0, u32::MAX));
         *self.array_iteration_protector.borrow_mut() = Default::default();
+        self.regexp_protector.borrow_mut().invalidate();
     }
 
     /// Select the global lexical state associated with an embedder settings
@@ -5539,7 +5524,7 @@ impl Interp {
             inline_ic_safe: std::cell::Cell::new(true),
             re_texts: crate::cache::ByteLru::new(32 << 20, 8_192),
             re_text_ascii_hot: None,
-            regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
+            regexp_protector: RefCell::default(),
             regexp_last: None,
             weak_collection_data: Default::default(),
             weak_collection_index: Default::default(),
@@ -11727,7 +11712,7 @@ impl Interp {
             jit_layout: _,
             interp_layout: _,
             inline_ic_safe: _,
-            regexp_dependency_cache: _,
+            regexp_protector: _,
             regexp_last: _,
             depth: _,
             direct_call_depth: _,

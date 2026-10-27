@@ -37,6 +37,7 @@ mod promise;
 mod proxy;
 mod reflect;
 mod regexp;
+pub(crate) use regexp::RegexpProof;
 mod shadowrealm;
 mod typedarray;
 pub(crate) use typedarray::{
@@ -2297,6 +2298,11 @@ fn advance_string_index(index: usize, s: &crate::lstr::LStr, unicode: bool) -> u
 /// RegExpExec(R, S): call `R.exec` if it is callable (validating the result is an Object or null),
 /// otherwise fall back to the built-in `RegExp.prototype.exec` (which requires a real RegExp).
 fn regexp_exec_abstract(i: &mut Interp, r: &Value, s: crate::lstr::LStr) -> Result<Value, Value> {
+    // Under the RegExp protector the Get of `exec` finds the intrinsic, which returns an Object
+    // or null: RegExpExec is RegExpBuiltinExec (ECMA-262 §22.2.7.1).
+    if regexp::intrinsic_regexp(i, r, &[regexp::RegexpMember::Exec]).is_some() {
+        return regexp_exec(i, *r, &[Value::Str(s)]);
+    }
     let exec = ab(i.get_member_key(r, "exec"))?;
     if exec.is_callable() {
         let res = ab(i.call(exec, *r, &[Value::Str(s)]))?;
@@ -2335,11 +2341,16 @@ fn regexp_match_result<T>(
     result.map_err(|error| regexp_match_error_value(i, error))
 }
 
-/// Whether every RegExp.prototype member the native symbol methods may read is the intrinsic
-/// (see `regexp::literal_match_dependencies_canonical`).
+/// Whether the RegExp protector holds with the intrinsic `exec` (see [`RegexpProof`]).
 #[cfg(test)]
 pub(crate) fn regexp_dependencies_canonical(i: &Interp) -> bool {
-    regexp::literal_match_dependencies_canonical(i)
+    regexp::regexp_protector_holds(i)
+}
+
+/// The shape the RegExp protector expects of a RegExp that RegExpAlloc made.
+#[cfg(test)]
+pub(crate) fn regexp_instance_shape(i: &Interp) -> u32 {
+    regexp::regexp_instance_shape(i)
 }
 
 #[inline]
@@ -2731,70 +2742,23 @@ pub(crate) fn string_replace_discard_fast(
     search: &Value,
     replacement: &Value,
 ) -> Option<Result<Value, Value>> {
-    let (ValueView::Str(input), ValueView::Obj(obj), ValueView::Str(_)) =
+    let (ValueView::Str(input), ValueView::Obj(_), ValueView::Str(_)) =
         (&(input).view(), &(search).view(), &(replacement).view())
     else {
         return None;
     };
-    let ptr = Gc::as_ptr(obj) as usize;
-    let re = i.regexps.get(&ptr)?.clone();
-    let proto = *i.extra_protos.get("RegExp")?;
-    let replace_key = well_known_key(i, "replace")?;
-    {
-        let b = obj.borrow();
-        if !matches!(b.exotic, Exotic::None)
-            || b.props.contains(&replace_key)
-            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, &proto))
-            || [
-                "exec",
-                "flags",
-                "hasIndices",
-                "global",
-                "ignoreCase",
-                "multiline",
-                "dotAll",
-                "unicode",
-                "unicodeSets",
-                "sticky",
-            ]
-            .iter()
-            .any(|name| b.props.contains(name))
-        {
+    let members = [regexp::RegexpMember::Replace, regexp::RegexpMember::Exec];
+    let (obj, re) = regexp::intrinsic_regexp(i, search, &members)?;
+    // A global replace sets `lastIndex` to 0 before RegExpBuiltinExec reads it; any other reads
+    // it with ToLength.
+    if re.global {
+        if !obj.borrow().props.property_at(0)?.writable() {
             return None;
         }
-        let last = b.props.get("lastIndex")?;
-        if last.accessor() || !last.writable() {
-            return None;
-        }
-        if re.sticky
-            && !re.global
-            && !matches!(
-                (last.value()).view(),
-                ValueView::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0
-            )
-        {
-            return None;
-        }
+    } else {
+        regexp::plain_last_index(&obj)?;
     }
-    if !regexp::literal_match_dependencies_canonical(i) {
-        return None;
-    }
-    let canonical = {
-        let p = proto.borrow();
-        let ValueView::Obj(method) = (p.props.get(&replace_key)?.value()).view() else {
-            return None;
-        };
-        let canonical = matches!(
-            method.borrow().call,
-            Callable::Native(nf)
-                if nf as usize == regexp::re_sym_replace as *const () as usize
-        );
-        canonical
-    };
-    if !canonical {
-        return None;
-    }
-    Some(regexp::re_sym_replace_discard_direct(i, obj, &re, input))
+    Some(regexp::re_sym_replace_discard_direct(i, &obj, &re, input))
 }
 
 /// Allocation-free dead-result `String.prototype.split` for a direct ordinary RegExp separator.
@@ -2818,63 +2782,13 @@ pub(crate) fn string_match_discard_fast(
     input: &Value,
     search: &Value,
 ) -> Option<Result<Value, Value>> {
-    let (ValueView::Str(input), ValueView::Obj(obj)) = (&(input).view(), &(search).view()) else {
+    let (ValueView::Str(input), ValueView::Obj(_)) = (&(input).view(), &(search).view()) else {
         return None;
     };
-    let ptr = Gc::as_ptr(obj) as usize;
-    let re = i.regexps.get(&ptr)?.clone();
-    let proto = *i.extra_protos.get("RegExp")?;
-    let match_key = well_known_key(i, "match")?;
-    {
-        let b = obj.borrow();
-        if !matches!(b.exotic, Exotic::None)
-            || b.props.contains(&match_key)
-            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, &proto))
-            || [
-                "exec",
-                "flags",
-                "hasIndices",
-                "global",
-                "ignoreCase",
-                "multiline",
-                "dotAll",
-                "unicode",
-                "unicodeSets",
-                "sticky",
-            ]
-            .iter()
-            .any(|name| b.props.contains(name))
-        {
-            return None;
-        }
-        let last = b.props.get("lastIndex")?;
-        if last.accessor() || !last.writable() {
-            return None;
-        }
-        match (last.value()).view() {
-            ValueView::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => {}
-            _ => return None,
-        }
-    }
-    if !regexp::literal_match_dependencies_canonical(i) {
-        return None;
-    }
-    let canonical = {
-        let p = proto.borrow();
-        let ValueView::Obj(method) = (p.props.get(&match_key)?.value()).view() else {
-            return None;
-        };
-        let canonical = matches!(
-            method.borrow().call,
-            Callable::Native(nf)
-                if nf as usize == regexp::re_sym_match as *const () as usize
-        );
-        canonical
-    };
-    if !canonical {
-        return None;
-    }
-    Some(regexp::re_sym_match_discard_direct(i, obj, &re, input))
+    let members = [regexp::RegexpMember::Match, regexp::RegexpMember::Exec];
+    let (obj, re) = regexp::intrinsic_regexp(i, search, &members)?;
+    regexp::plain_last_index(&obj)?;
+    Some(regexp::re_sym_match_discard_direct(i, &obj, &re, input))
 }
 
 /// Dead-result call routing for the bytecode VM. A `CallWithThis` immediately followed by
@@ -11080,9 +10994,13 @@ pub(crate) fn nf_string_replace(
             "String.prototype.replace called on null or undefined",
         ));
     }
-    // An object search value with a @@replace method handles the operation.
+    // An object search value with a @@replace method handles the operation. An intrinsic
+    // RegExp's is RegExp.prototype[@@replace], which GetMethod finds running no code.
     let search = arg(args, 0);
     if matches!((search).view(), ValueView::Obj(_)) {
+        if regexp::intrinsic_regexp(i, &search, &[regexp::RegexpMember::Replace]).is_some() {
+            return regexp::re_sym_replace(i, search, &[this, arg(args, 1)]);
+        }
         if let Some(key) = well_known_key(i, "replace") {
             let replacer = ab(i.get_member_key(&search, &key))?;
             if !matches!((replacer).view(), ValueView::Undefined | ValueView::Null) {
@@ -11172,6 +11090,9 @@ pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Resul
     }
     let regexp = arg(a, 0);
     if matches!((regexp).view(), ValueView::Obj(_)) {
+        if regexp::intrinsic_regexp(i, &regexp, &[regexp::RegexpMember::Match]).is_some() {
+            return regexp::re_sym_match(i, regexp, std::slice::from_ref(&this));
+        }
         if let Some(key) = well_known_key(i, "match") {
             let matcher = ab(i.get_member_key(&regexp, &key))?;
             if !matches!((matcher).view(), ValueView::Undefined | ValueView::Null) {
@@ -11205,6 +11126,9 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
     }
     let separator = arg(args, 0);
     if matches!((separator).view(), ValueView::Obj(_)) {
+        if regexp::intrinsic_regexp(i, &separator, &[regexp::RegexpMember::Split]).is_some() {
+            return regexp::re_sym_split(i, separator, &[this, arg(args, 1)]);
+        }
         if let Some(key) = well_known_key(i, "split") {
             let splitter = ab(i.get_member_key(&separator, &key))?;
             if !matches!((splitter).view(), ValueView::Undefined | ValueView::Null) {
@@ -11938,6 +11862,9 @@ fn install_string(it: &mut Interp) {
         }
         let regexp = arg(a, 0);
         if matches!((regexp).view(), ValueView::Obj(_)) {
+            if regexp::intrinsic_regexp(i, &regexp, &[regexp::RegexpMember::Search]).is_some() {
+                return regexp::re_sym_search(i, regexp, std::slice::from_ref(&this));
+            }
             if let Some(key) = well_known_key(i, "search") {
                 let searcher = ab(i.get_member_key(&regexp, &key))?;
                 if !matches!((searcher).view(), ValueView::Undefined | ValueView::Null) {
@@ -11970,6 +11897,18 @@ fn install_string(it: &mut Interp) {
         }
         let regexp = arg(a, 0);
         if !matches!((regexp).view(), ValueView::Undefined | ValueView::Null) {
+            // An intrinsic RegExp is one to IsRegExp, its `flags` its own, and its @@matchAll
+            // RegExp.prototype's.
+            let members = [regexp::RegexpMember::Match, regexp::RegexpMember::MatchAll];
+            if let Some((_, re)) = regexp::intrinsic_regexp(i, &regexp, &members) {
+                if !re.global {
+                    return Err(i.make_error(
+                        "TypeError",
+                        "String.prototype.matchAll called with a non-global RegExp",
+                    ));
+                }
+                return regexp::re_sym_matchall(i, regexp, std::slice::from_ref(&this));
+            }
             // A RegExp argument must be global; then dispatch to its @@matchAll if present.
             if arg_is_regexp(i, &regexp)? {
                 let flags = ab(i.get_member_key(&regexp, "flags"))?;
@@ -12023,6 +11962,18 @@ fn install_string(it: &mut Interp) {
         // Only an *Object* searchValue is inspected for regexp-ness / @@replace; a primitive's
         // Symbol.replace is never accessed.
         if matches!((search).view(), ValueView::Obj(_)) {
+            // An intrinsic RegExp is one to IsRegExp, its `flags` its own, and its @@replace
+            // RegExp.prototype's.
+            let members = [regexp::RegexpMember::Match, regexp::RegexpMember::Replace];
+            if let Some((_, re)) = regexp::intrinsic_regexp(i, &search, &members) {
+                if !re.global {
+                    return Err(i.make_error(
+                        "TypeError",
+                        "replaceAll must be called with a global RegExp",
+                    ));
+                }
+                return regexp::re_sym_replace(i, search, &[this, arg(args, 1)]);
+            }
             // A RegExp search value must be global: read `flags`, require it coercible, and check
             // for "g" — a non-global (or missing-flags) regexp is a TypeError.
             if arg_is_regexp(i, &search)? {

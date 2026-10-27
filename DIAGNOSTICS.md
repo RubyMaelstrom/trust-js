@@ -247,6 +247,14 @@ comment/example in the same change.
 - `TRUST_JS_REGEXP_NO_SIMD=1` keeps the subject scans (for the prefilter's literal, and for a
   match's first element by byte or by table) on their portable loops instead of AArch64 vector
   code.
+- `TRUST_JS_REGEXP_NO_PROTECTOR=1` keeps the RegExp protector from holding. The protector
+  proves for the running Realm that %RegExp.prototype%'s flag getters, `exec`, symbol methods
+  and `constructor`, and %RegExp%'s @@species getter, are the intrinsics, and lets a RegExp of
+  the shape and prototype RegExpAlloc gave it skip their lookups: String.prototype's `match`,
+  `matchAll`, `replace`, `replaceAll`, `search` and `split` then call the RegExp algorithms
+  directly, RegExpExec calls RegExpBuiltinExec, and the direct replace, split, test, flags and
+  dead-result paths need no other guard. With the switch set, every one of them takes the
+  observable steps.
 
 The fast paths' switches exist so that a workload can run with each forced off and be compared,
 by instruction counts (`perf stat -e instructions:u`); none changes a result.

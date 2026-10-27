@@ -5486,6 +5486,11 @@ impl Interp {
             "lastIndex",
             Property::data(Value::Num(0.0), true, false, false),
         );
+        // Every RegExp starts at the same shape, which the RegExp protector's receivers keep.
+        let shape = obj.borrow().props.shape();
+        self.regexp_protector
+            .borrow_mut()
+            .note_instance_shape(shape);
         self.gc_pin(&obj);
         self.regexps.insert(ptr, re);
         Value::Obj(obj)

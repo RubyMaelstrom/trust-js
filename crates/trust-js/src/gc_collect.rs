@@ -1725,7 +1725,7 @@ impl Interp {
             inline_ic_safe: _,
             re_texts: _, // by collection kind
             re_text_ascii_hot,
-            regexp_dependency_cache: _,
+            regexp_protector: _, // weak pins
             regexp_last,
             depth: _,
             direct_call_depth: _,

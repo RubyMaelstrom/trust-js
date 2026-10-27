@@ -140,155 +140,295 @@ regexp_flag_getter!(re_unicode_get, 'u');
 regexp_flag_getter!(re_unicode_sets_get, 'v');
 regexp_flag_getter!(re_sticky_get, 'y');
 
-/// The native symbol methods may read `flags`, every component flag getter, and `exec`.
-/// A wrapper-eliding specialization must prove those live inherited dependencies, not merely
-/// the outer symbol-method identity.
-pub(super) fn literal_match_dependencies_canonical(i: &Interp) -> bool {
-    let Some(proto) = i.extra_protos.get("RegExp") else {
-        return false;
-    };
-    let p = proto.borrow();
-    let names = [
-        "flags",
-        "hasIndices",
-        "global",
-        "ignoreCase",
-        "multiline",
-        "dotAll",
-        "unicode",
-        "unicodeSets",
-        "sticky",
-        "exec",
-    ];
-    let proto_ptr = Gc::as_ptr(proto) as usize;
-    let shape = p.props.shape();
-    let cached = i.regexp_dependency_cache.get();
-    let slots = if cached.proto == proto_ptr && cached.shape == shape {
-        cached.slots
-    } else {
-        let mut slots = [u32::MAX; 10];
-        for (index, name) in names.iter().enumerate() {
-            let Some(slot) = p.props.slot_of(name) else {
-                return false;
-            };
-            slots[index] = slot as u32;
-        }
-        if crate::value::is_cacheable_shape(shape) {
-            i.regexp_dependency_cache
-                .set(crate::interpreter::RegexpDependencyCache {
-                    proto: proto_ptr,
-                    shape,
-                    slots,
-                });
-        }
-        slots
-    };
-    let property_at = |index: usize| {
-        p.props
-            .entry_at(slots[index] as usize)
-            .filter(|(key, _)| &***key == names[index])
-            .map(|(_, property)| property)
-    };
-    let getter_is = |index: usize, native: NativeFn| {
-        property_at(index).is_some_and(|property| {
-            matches!(
-                (property.getter()).map(|__value| (__value).view()),
-                Some(ValueView::Obj(function))
-                    if matches!(
-                        function.borrow().call,
-                        Callable::Native(found)
-                            if found as usize == native as *const () as usize
-                    )
-            )
-        })
-    };
-    getter_is(0, re_flags_get)
-        && getter_is(1, re_has_indices_get)
-        && getter_is(2, re_global_get)
-        && getter_is(3, re_ignore_case_get)
-        && getter_is(4, re_multiline_get)
-        && getter_is(5, re_dot_all_get)
-        && getter_is(6, re_unicode_get)
-        && getter_is(7, re_unicode_sets_get)
-        && getter_is(8, re_sticky_get)
-        && property_at(9)
-            .filter(|property| !property.accessor())
-            .map(Property::value)
-            .is_some_and(|value| {
-                matches!(
-                    (value).view(),
-                    ValueView::Obj(ref function)
-                        if matches!(
-                            function.borrow().call,
-                            Callable::Native(native)
-                                if native as usize == regexp_exec as *const () as usize
-                        )
-                )
-            })
+/// A data property of %RegExp.prototype% that the RegExp algorithms read: `exec` (RegExpExec), a
+/// symbol method (String.prototype's dispatch to it) or `constructor` (SpeciesConstructor).
+#[derive(Clone, Copy)]
+pub(super) enum RegexpMember {
+    Exec,
+    Match,
+    MatchAll,
+    Replace,
+    Search,
+    Split,
+    Constructor,
 }
 
-/// Flag names `RegExp.prototype.flags` observes on its receiver (ECMA-262 §22.2.6.6). An own
-/// property with any of these names makes the observable flags string depend on that property,
-/// so the generic `Get` path must run instead of a direct engine-side read.
-const FLAG_PROP_NAMES: [&str; 9] = [
-    "hasIndices",
-    "global",
-    "ignoreCase",
-    "multiline",
-    "dotAll",
-    "unicode",
-    "unicodeSets",
-    "sticky",
-    "flags",
+const REGEXP_MEMBERS: usize = 7;
+
+/// The getters RegExp.prototype.flags reads on its receiver (ECMA-262 §22.2.6.4), and its own.
+const REGEXP_FLAG_GETTERS: [(&str, NativeFn); 9] = [
+    ("flags", re_flags_get),
+    ("hasIndices", re_has_indices_get),
+    ("global", re_global_get),
+    ("ignoreCase", re_ignore_case_get),
+    ("multiline", re_multiline_get),
+    ("dotAll", re_dot_all_get),
+    ("unicode", re_unicode_get),
+    ("unicodeSets", re_unicode_sets_get),
+    ("sticky", re_sticky_get),
 ];
 
-/// Read the engine-owned flags of a RegExp without dispatching the `flags` getter, when the
-/// observable `RegExp.prototype.flags` string is provably canonical: `this` is an ordinary
-/// direct-RegExp instance with no own flag-named property overrides, and the live
-/// %RegExp.prototype% still carries the canonical `flags` and component-flag getters. Returns
-/// the compiled Regex for a direct read; `None` keeps the generic getter with its observable
-/// Gets (a user-overridden `flags`, a subclass prototype, or an own flag property all force it).
-fn direct_reg_exp_flags(i: &Interp, this: &Value) -> Option<std::rc::Rc<crate::regex::Regex>> {
-    let ValueView::Obj(obj) = &(this).view() else {
-        return None;
-    };
-    let ptr = Gc::as_ptr(obj) as usize;
-    let re = i.regexps.get(&ptr).cloned()?;
-    let b = obj.borrow();
-    if !matches!(b.exotic, Exotic::None)
-        || !b
-            .proto
-            .as_ref()
-            .zip(i.extra_protos.get("RegExp"))
-            .is_some_and(|(a, b)| Gc::ptr_eq(a, b))
-        || FLAG_PROP_NAMES.iter().any(|name| b.props.contains(name))
+/// [`Interp::regexp_protector`]: while `epoch` matches the live [`crate::value::proto_epoch`],
+/// the current Realm's RegExp algorithms read only intrinsics. %RegExp.prototype% has the
+/// intrinsic `flags` and flag getters, and a data property for each [`RegexpMember`] at `slots`
+/// that held the verified object (%RegExp% for `constructor`); %RegExp% has the intrinsic
+/// @@species getter. Both are marked prototypes: a defineProperty, a structural change or a
+/// [[SetPrototypeOf]] bumps the epoch. An assignment can still replace a member, so each use
+/// compares its slot with the verified object, which a weak pin keeps from being reused (as
+/// [`super::ArrayIterationProof`] does). A RegExp of the shape RegExpAlloc gives it
+/// (`instance_shape`) with %RegExp.prototype% as its prototype has no own property that these
+/// algorithms read but `lastIndex`.
+pub(crate) struct RegexpProof {
+    epoch: u32,
+    /// Noted as RegExps are made (see [`RegexpProof::note_instance_shape`]) and kept when the
+    /// proof is invalidated: shapes belong to the Agent, not to a Realm.
+    instance_shape: u32,
+    slots: [u32; REGEXP_MEMBERS],
+    /// `None` when the proof failed at `epoch`.
+    pins: Option<Box<RegexpPins>>,
+}
+
+/// %RegExp.prototype% and the objects its [`RegexpMember`]s held when [`RegexpProof`] was
+/// established, weakly pinned.
+struct RegexpPins {
+    prototype: crate::value::WeakGc,
+    members: [crate::value::WeakGc; REGEXP_MEMBERS],
+}
+
+impl Default for RegexpProof {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            instance_shape: crate::value::SHAPE_UNCACHEABLE,
+            slots: [0; REGEXP_MEMBERS],
+            pins: None,
+        }
+    }
+}
+
+impl RegexpProof {
+    /// Record the shape a freshly allocated RegExp has.
+    pub(crate) fn note_instance_shape(&mut self, shape: u32) {
+        if crate::value::is_cacheable_shape(shape) {
+            self.instance_shape = shape;
+        }
+    }
+
+    /// Forget the proof, as when another Realm becomes current; epoch 0 is never live.
+    pub(crate) fn invalidate(&mut self) {
+        self.epoch = 0;
+        self.pins = None;
+    }
+
+    /// Whether `prototype` (%RegExp.prototype%) still holds the verified object at `member`.
+    fn holds(&self, pins: &RegexpPins, prototype: &Gc, member: RegexpMember) -> bool {
+        let member = member as usize;
+        prototype
+            .borrow()
+            .props
+            .property_at(self.slots[member] as usize)
+            .is_some_and(|property| property.holds_object(pins.members[member].as_ptr()))
+    }
+}
+
+/// Establish [`RegexpProof`]'s slots and pins from scratch, marking %RegExp.prototype% and
+/// %RegExp% as prototypes. `None` when the current Realm's RegExp machinery is not the
+/// intrinsic one.
+fn verify_regexp_proof(i: &Interp) -> Option<([u32; REGEXP_MEMBERS], Box<RegexpPins>)> {
+    let prototype = *i.extra_protos.get("RegExp")?;
+    let constructor = *i.extra_protos.get("%RegExpCtor%")?;
+    let species_getter = *i.extra_protos.get("%RegExpSpeciesGetter%")?;
+    if !i.ordinary_get_ptr(Gc::as_ptr(&prototype) as usize)
+        || !i.ordinary_get_ptr(Gc::as_ptr(&constructor) as usize)
     {
         return None;
     }
-    drop(b);
-    literal_match_dependencies_canonical(i).then_some(re)
+    let in_this_realm = |value: &Value, behaviour: NativeFn| {
+        is_native_function(value, behaviour)
+            && value
+                .as_obj()
+                .is_some_and(|function| i.native_call_in_current_realm(&function))
+    };
+    let symbol = |name| well_known_key(i, name);
+    let keys: [Rc<str>; REGEXP_MEMBERS] = [
+        Rc::from("exec"),
+        symbol("match")?,
+        symbol("matchAll")?,
+        symbol("replace")?,
+        symbol("search")?,
+        symbol("split")?,
+        Rc::from("constructor"),
+    ];
+    let behaviours: [NativeFn; REGEXP_MEMBERS - 1] = [
+        regexp_exec,
+        re_sym_match,
+        re_sym_matchall,
+        re_sym_replace,
+        re_sym_search,
+        re_sym_split,
+    ];
+    let mut slots = [0u32; REGEXP_MEMBERS];
+    let mut members: [crate::value::WeakGc; REGEXP_MEMBERS] = Default::default();
+    {
+        let body = prototype.borrow();
+        for (name, behaviour) in REGEXP_FLAG_GETTERS {
+            let property = body.props.get(name)?;
+            if !property.accessor()
+                || !property
+                    .getter()
+                    .is_some_and(|getter| in_this_realm(getter, behaviour))
+            {
+                return None;
+            }
+        }
+        for (member, key) in keys.iter().enumerate() {
+            let slot = body.props.slot_of(key)?;
+            let property = body.props.property_at(slot)?;
+            let value = property.value();
+            let object = value.as_obj()?;
+            let intrinsic = match behaviours.get(member) {
+                Some(&behaviour) => in_this_realm(&value, behaviour),
+                None => Gc::ptr_eq(&object, &constructor),
+            };
+            if property.accessor() || !intrinsic {
+                return None;
+            }
+            slots[member] = u32::try_from(slot).ok()?;
+            members[member] = Gc::downgrade(&object);
+        }
+    }
+    {
+        // SpeciesConstructor finds the intrinsic getter, which returns %RegExp%; constructing
+        // with %RegExp% reads its non-writable, non-configurable `prototype`.
+        let body = constructor.borrow();
+        let species = body.props.get(&symbol("species")?)?;
+        let species_intrinsic = species.setter().is_none()
+            && matches!(
+                species.getter().map(|getter| getter.view()),
+                Some(ValueView::Obj(getter)) if Gc::ptr_eq(&getter, &species_getter)
+            );
+        let prototype_intrinsic = body
+            .props
+            .get("prototype")
+            .is_some_and(|property| property.holds_object(Gc::as_ptr(&prototype)));
+        if !species_intrinsic || !prototype_intrinsic {
+            return None;
+        }
+    }
+    prototype.borrow().props.mark_proto();
+    constructor.borrow().props.mark_proto();
+    let prototype = Gc::downgrade(&prototype);
+    Some((slots, Box::new(RegexpPins { prototype, members })))
+}
+
+/// Run `f` with the current [`RegexpProof`], its pins and %RegExp.prototype%, re-establishing
+/// the proof after an epoch change. `None` when the intrinsic machinery does not hold, and
+/// always under `TRUST_JS_REGEXP_NO_PROTECTOR=1`, which keeps every RegExp operation on its
+/// observable steps.
+fn with_regexp_proof<R>(
+    i: &Interp,
+    f: impl FnOnce(&RegexpProof, &RegexpPins, &Gc) -> Option<R>,
+) -> Option<R> {
+    let epoch = crate::value::proto_epoch();
+    // u32::MAX: permanently invalidated, never trust a proof.
+    if epoch == u32::MAX || env_flag!("TRUST_JS_REGEXP_NO_PROTECTOR") {
+        return None;
+    }
+    if i.regexp_protector.borrow().epoch != epoch {
+        let verified = verify_regexp_proof(i);
+        let mut proof = i.regexp_protector.borrow_mut();
+        proof.epoch = epoch;
+        (proof.slots, proof.pins) = match verified {
+            Some((slots, pins)) => (slots, Some(pins)),
+            None => ([0; REGEXP_MEMBERS], None),
+        };
+    }
+    let proof = i.regexp_protector.borrow();
+    let pins = proof.pins.as_deref()?;
+    let prototype = pins.prototype.upgrade()?;
+    f(&proof, pins, &prototype)
+}
+
+/// The object and matcher of `value` when the RegExp algorithms read nothing but intrinsics
+/// through it: a RegExp of the running Realm with the shape RegExpAlloc gave it and
+/// %RegExp.prototype% as its prototype, under the RegExp protector, with `members` of
+/// %RegExp.prototype% still holding their intrinsics (see [`RegexpProof`]).
+pub(super) fn intrinsic_regexp(
+    i: &Interp,
+    value: &Value,
+    members: &[RegexpMember],
+) -> Option<(Gc, Rc<crate::regex::Regex>)> {
+    let object = value.as_obj()?;
+    with_regexp_proof(i, |proof, pins, prototype| {
+        {
+            let body = object.borrow();
+            if body.props.shape() != proof.instance_shape
+                || !crate::value::is_cacheable_shape(proof.instance_shape)
+                || !body
+                    .proto
+                    .as_ref()
+                    .is_some_and(|p| Gc::ptr_eq(p, prototype))
+            {
+                return None;
+            }
+        }
+        if !members
+            .iter()
+            .all(|&member| proof.holds(pins, prototype, member))
+        {
+            return None;
+        }
+        let re = i.regexps.get(&(Gc::as_ptr(&object) as usize))?.clone();
+        Some((object, re))
+    })
+}
+
+/// `lastIndex` of a RegExp of RegExpAlloc's shape (its only own property, at slot 0) when
+/// ToLength of it runs no code and writing it cannot throw: a writable data property holding a
+/// non-negative integral Number.
+pub(super) fn plain_last_index(object: &Gc) -> Option<f64> {
+    let body = object.borrow();
+    let last = body.props.property_at(0)?;
+    if !last.writable() {
+        return None;
+    }
+    last.number_value()
+        .filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0)
+}
+
+/// Read the engine-owned flags of a RegExp without dispatching the `flags` getter, when the
+/// observable `RegExp.prototype.flags` string is provably canonical (see [`intrinsic_regexp`]).
+/// `None` keeps the generic getter with its observable Gets (a user-overridden `flags`, a
+/// subclass prototype, or an own flag property all force it).
+fn direct_reg_exp_flags(i: &Interp, this: &Value) -> Option<std::rc::Rc<crate::regex::Regex>> {
+    intrinsic_regexp(i, this, &[]).map(|(_, re)| re)
 }
 
 /// The object and matcher of `this` when RegExpExec(this, S) is RegExpBuiltinExec without
-/// observable lookups (ECMA-262 §22.2.7.1): a direct, ordinary RegExp instance with no own `exec`
-/// or flag properties whose prototype carries the intrinsic `exec` and flag getters, and whose own
-/// `lastIndex` is a writable non-negative integral Number, so neither reading it (ToLength) nor
-/// writing it runs user code or throws.
+/// observable lookups (ECMA-262 §22.2.7.1): an intrinsic RegExp ([`intrinsic_regexp`]) whose
+/// `exec` is the intrinsic, with a plain `lastIndex` ([`plain_last_index`]), so neither reading
+/// it (ToLength) nor writing it runs user code or throws.
 fn direct_regexp_exec(i: &Interp, this: &Value) -> Option<(Gc, std::rc::Rc<crate::regex::Regex>)> {
-    let ValueView::Obj(obj) = &(this).view() else {
-        return None;
-    };
-    let re = direct_reg_exp_flags(i, this)?;
-    let b = obj.borrow();
-    let last = b.props.get("lastIndex")?;
-    let plain_last = !last.accessor()
-        && last.writable()
-        && matches!((last.value()).view(), ValueView::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0);
-    if !plain_last || b.props.contains("exec") {
-        return None;
-    }
-    drop(b);
-    Some((*obj, re))
+    let (object, re) = intrinsic_regexp(i, this, &[RegexpMember::Exec])?;
+    plain_last_index(&object)?;
+    Some((object, re))
+}
+
+/// Whether the current Realm's RegExp protector holds with the intrinsic `exec` (for tests).
+#[cfg(test)]
+pub(super) fn regexp_protector_holds(i: &Interp) -> bool {
+    with_regexp_proof(i, |proof, pins, prototype| {
+        proof
+            .holds(pins, prototype, RegexpMember::Exec)
+            .then_some(())
+    })
+    .is_some()
+}
+
+/// The shape the RegExp protector expects of a RegExp RegExpAlloc made (for tests).
+#[cfg(test)]
+pub(super) fn regexp_instance_shape(i: &Interp) -> u32 {
+    i.regexp_protector.borrow().instance_shape
 }
 
 /// The second (flags) argument to RegExp / RegExp.prototype.compile: undefined → "", else ToString.
@@ -773,7 +913,7 @@ pub(super) fn re_sym_match_discard_direct(
     }
     Ok(Value::Undefined)
 }
-fn re_sym_search(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+pub(super) fn re_sym_search(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.search]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
     let prev = ab(i.get_member_key(&this, "lastIndex"))?;
@@ -1298,7 +1438,7 @@ fn regexp_intrinsic(i: &Interp) -> Value {
         .map_or(Value::Undefined, Value::Obj)
 }
 
-fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+pub(super) fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.matchAll]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
     let default_ctor = regexp_intrinsic(i);
@@ -1322,82 +1462,13 @@ fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
 /// The matcher of `rx` when every observable step of RegExp.prototype[@@split] before its
 /// matching loop resolves to the realm's intrinsics (ECMA-262 §22.2.6.14 steps 4-10):
 /// SpeciesConstructor reads the intrinsic `constructor` and @@species, `flags` reads the
-/// intrinsic getters, and constructing the splitter reads `rx`'s @@match (IsRegExp) and
-/// %RegExp%.prototype without running user code. The splitter's own RegExpExec then finds the
-/// intrinsic `exec`. `None` when any of them could run user code.
+/// intrinsic getters, and constructing the splitter reads `rx`'s @@match (IsRegExp; a data
+/// property under the protector) and %RegExp%.prototype without running user code. The
+/// splitter's own RegExpExec then finds the intrinsic `exec`. `None` when any of them could run
+/// user code.
 fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Regex>> {
-    let ptr = Gc::as_ptr(obj) as usize;
-    let re = i.regexps.get(&ptr)?.clone();
-    let proto = *i.extra_protos.get("RegExp")?;
-    let ctor = *i.extra_protos.get("%RegExpCtor%")?;
-    let species_getter = *i.extra_protos.get("%RegExpSpeciesGetter%")?;
-    let species_key = well_known_key(i, "species")?;
-    let match_key = well_known_key(i, "match")?;
-    {
-        let b = obj.borrow();
-        if !matches!(b.exotic, Exotic::None)
-            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, &proto))
-            || b.props.contains(&match_key)
-            || [
-                "constructor",
-                "flags",
-                "hasIndices",
-                "global",
-                "ignoreCase",
-                "multiline",
-                "dotAll",
-                "unicode",
-                "unicodeSets",
-                "sticky",
-            ]
-            .iter()
-            .any(|name| b.props.contains(name))
-        {
-            return None;
-        }
-    }
-    if !literal_match_dependencies_canonical(i) {
-        return None;
-    }
-    {
-        let p = proto.borrow();
-        let constructor_ok = p
-            .props
-            .get("constructor")
-            .filter(|property| !property.accessor())
-            .map(Property::value)
-            .is_some_and(
-                |value| matches!((value).view(), ValueView::Obj(ref found) if Gc::ptr_eq(found, &ctor)),
-            );
-        let match_ok = p
-            .props
-            .get(&match_key)
-            .is_some_and(|property| !property.accessor());
-        if !constructor_ok || !match_ok {
-            return None;
-        }
-    }
-    {
-        let c = ctor.borrow();
-        let species_ok = c.props.get(&species_key).is_some_and(|property| {
-            matches!(
-                (property.getter()).map(|__value| (__value).view()),
-                Some(ValueView::Obj(function)) if Gc::ptr_eq(&function, &species_getter)
-            ) && property.setter().is_none()
-        });
-        let prototype_ok = c
-            .props
-            .get("prototype")
-            .filter(|property| !property.accessor())
-            .map(Property::value)
-            .is_some_and(
-                |value| matches!((value).view(), ValueView::Obj(ref found) if Gc::ptr_eq(found, &proto)),
-            );
-        if !species_ok || !prototype_ok {
-            return None;
-        }
-    }
-    Some(re)
+    let members = [RegexpMember::Constructor, RegexpMember::Exec];
+    intrinsic_regexp(i, &Value::Obj(*obj), &members).map(|(_, re)| re)
 }
 
 /// The non-sticky form of the splitter's pattern. A sticky attempt at each position until one
@@ -1520,34 +1591,13 @@ pub(super) fn re_sym_split_discard_fast(
     else {
         return None;
     };
-    let re = split_species_canonical(i, obj)?;
     // String#split's own @@split lookup must find the intrinsic method too.
-    let split_key = well_known_key(i, "split")?;
-    if obj.borrow().props.contains(&split_key) {
-        return None;
-    }
-    let split_ok = i
-        .extra_protos
-        .get("RegExp")?
-        .borrow()
-        .props
-        .get(&split_key)
-        .filter(|property| !property.accessor())
-        .map(Property::value)
-        .is_some_and(|value| {
-            matches!(
-                (value).view(),
-                ValueView::Obj(ref function)
-                    if matches!(
-                        function.borrow().call,
-                        Callable::Native(native)
-                            if native as usize == re_sym_split as *const () as usize
-                    )
-            )
-        });
-    if !split_ok {
-        return None;
-    }
+    let members = [
+        RegexpMember::Split,
+        RegexpMember::Constructor,
+        RegexpMember::Exec,
+    ];
+    let (_, re) = intrinsic_regexp(i, &Value::Obj(*obj), &members)?;
     // A sticky split loop that advances one unit after every miss is equivalent to one ordinary
     // forward search for its next success. Removing `y` performs that search in the matcher while
     // preserving the successful captures and their legacy-static side effects. The AArch64 class
