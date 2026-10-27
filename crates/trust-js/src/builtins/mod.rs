@@ -2636,7 +2636,7 @@ fn regexp_builtin_exec(
             };
             // The match and its captures are slices of the subject, at its width.
             let items = caps.iter().map(|span| match *span {
-                Some((a, b)) => Value::Str(input.slice_units(a, b)),
+                Some((a, b)) => Value::Str(subject_slice(&input, a, b)),
                 None => Value::Undefined,
             });
             let index = Value::Num(start as f64);
@@ -2652,6 +2652,19 @@ fn regexp_builtin_exec(
             })
         }
     }
+}
+
+/// Units `a..b` of a RegExp subject as a String, for a match, a capture or a split piece: a
+/// slice of it at its width, or for one ASCII unit the shared one-unit String, as V8 takes a
+/// one-character substring from its single-character string table.
+#[inline]
+pub(super) fn subject_slice(subject: &crate::lstr::LStr, a: usize, b: usize) -> crate::lstr::LStr {
+    if b == a + 1 {
+        if let Some(unit) = subject.unit_at(a).filter(|&unit| unit < 0x80) {
+            return crate::jstr::unit_lstr(unit);
+        }
+    }
+    subject.slice_units(a, b)
 }
 
 /// A match's `groups`: a null-prototype object of its named captures, or undefined if the
@@ -2680,7 +2693,7 @@ pub(super) fn regexp_groups(
             .iter()
             .filter(|(n, _)| n == name)
             .find_map(|(_, idx)| caps.get(*idx).copied().flatten())
-            .map(|(a, b)| Value::Str(subject.slice_units(a, b)))
+            .map(|(a, b)| Value::Str(subject_slice(subject, a, b)))
             .unwrap_or(Value::Undefined);
         set_data(&g, name, v);
     }

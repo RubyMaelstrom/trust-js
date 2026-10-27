@@ -1340,7 +1340,7 @@ fn re_sym_replace_direct(
         let captures = || {
             (1..=re.ngroups)
                 .map(|group| match caps[group] {
-                    Some((a, b)) => Value::Str(s.slice_units(a, b)),
+                    Some((a, b)) => Value::Str(subject_slice(s, a, b)),
                     None => Value::Undefined,
                 })
                 .collect::<Vec<_>>()
@@ -1348,7 +1348,7 @@ fn re_sym_replace_direct(
         let replacement = match replacer {
             Some(function) => {
                 let mut args = Vec::with_capacity(re.ngroups + 4);
-                args.push(Value::Str(s.slice_units(start, end)));
+                args.push(Value::Str(subject_slice(s, start, end)));
                 args.extend(captures());
                 args.push(Value::Num(position as f64));
                 args.push(Value::Str(*s));
@@ -1619,14 +1619,14 @@ fn split_direct(
             q = advance_string_index(a, s, search.unicode);
             continue;
         }
-        parts.push(Value::Str(s.slice_units(p, a)));
+        parts.push(Value::Str(subject_slice(s, p, a)));
         if parts.len() == lim {
             return Ok(i.make_array(parts));
         }
         p = e;
         for group in 1..=search.ngroups {
             parts.push(match caps[group] {
-                Some((x, y)) => Value::Str(s.slice_units(x, y)),
+                Some((x, y)) => Value::Str(subject_slice(s, x, y)),
                 None => Value::Undefined,
             });
             if parts.len() == lim {
@@ -1635,7 +1635,7 @@ fn split_direct(
         }
         q = p;
     }
-    parts.push(Value::Str(s.slice_units(p, len)));
+    parts.push(Value::Str(subject_slice(s, p, len)));
     Ok(i.make_array(parts))
 }
 
