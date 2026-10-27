@@ -747,10 +747,10 @@ impl Interp {
                     );
                     for (pat, _) in decls {
                         let mut names = Vec::new();
-                        pattern_idents(pat, &mut names);
+                        crate::interpreter::pattern_ident_strs(pat, &mut names);
                         for name in names {
                             let mut b = scope.borrow_mut();
-                            b.lexical_names.push(name.clone());
+                            b.lexical_names.push(name);
                             b.vars
                                 .insert(name, Binding::data(Value::Undefined, !immutable, false));
                         }
@@ -2554,9 +2554,13 @@ impl Interp {
         // take the owned slow path.
         type ScopeCell = std::cell::RefCell<crate::interpreter::Scope>;
         let mut cur: *const ScopeCell = Env::as_ptr(env);
+        // Every binding's name is an atom of the heap: one lookup serves the whole chain, each
+        // record then compares words, and a name with no atom is bound in no record (until
+        // author code runs: a `with` object's checks look again).
+        let mut atom = crate::atom::lookup(name);
         loop {
             let b = unsafe { (*cur).borrow() };
-            if let Some(binding) = b.vars.get(name) {
+            if let Some(binding) = atom.and_then(|atom| b.vars.get_atom(atom)) {
                 if !binding.initialized {
                     return Err(self.throw(
                         "ReferenceError",
@@ -2588,6 +2592,8 @@ impl Interp {
                     return Ok((self.get_member_key(&obj, name)?, Some(obj)));
                 }
                 // `with_has_binding` said no — continue up the chain. Re-borrow to read `parent`.
+                // Its traps and getters may have declared the name since.
+                atom = atom.or_else(|| crate::atom::lookup(name));
                 let b = unsafe { (*cur).borrow() };
                 match b.parent.as_ref() {
                     Some(p) => cur = Env::as_ptr(p),
@@ -2605,7 +2611,10 @@ impl Interp {
         if self.ordinary_get_ptr(Gc::as_ptr(&self.global) as usize) {
             let b = self.global.borrow();
             if matches!(b.exotic, crate::value::Exotic::None) {
-                if let Some(p) = b.props.get(name) {
+                if let Some(p) = b
+                    .props
+                    .get_walking(name, &mut atom.map(crate::atom::PropKey::atom))
+                {
                     if !p.accessor() {
                         let v = p.value();
                         drop(b);
@@ -2929,10 +2938,13 @@ impl Interp {
 
     pub(crate) fn assign_var(&mut self, name: &str, value: Value, env: &Env) -> Result<(), Abrupt> {
         let mut cur = Some(*env);
+        // As in `get_var_with_mode`: the name's atom once for the whole chain, looked up again
+        // after a `with` object's checks ran author code.
+        let mut atom = crate::atom::lookup(name);
         while let Some(s) = cur {
             let (with_obj, parent) = {
                 let mut b = s.borrow_mut();
-                if let Some(binding) = b.vars.get_mut(name) {
+                if let Some(binding) = atom.and_then(|atom| b.vars.get_atom_mut(atom)) {
                     // Var initializers and assignment-pattern/loop-head writes perform
                     // PutValue, not InitializeBinding. Hoisted var bindings are already
                     // initialized; a lexical binding found here must retain its TDZ.
@@ -2967,6 +2979,7 @@ impl Interp {
                     }
                     return self.set_member_key(obj, name, value);
                 }
+                atom = atom.or_else(|| crate::atom::lookup(name));
             }
             cur = parent;
         }

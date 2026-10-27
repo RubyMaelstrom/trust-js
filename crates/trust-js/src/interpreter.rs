@@ -1821,14 +1821,7 @@ impl Names {
         } else if self.own_names().is_some_and(|own| own.index.is_some()) {
             return self.slot_of(crate::atom::lookup(text)?);
         }
-        // Compare lengths before contents: most names differ in length.
-        let ascii = text.is_ascii();
-        self.with_slice(|names| {
-            names.iter().position(|name| {
-                let name = name.as_lstr();
-                (!ascii || name.unit_len() == text.len()) && name == *text
-            })
-        })
+        self.with_slice(|names| names.iter().position(|name| name.is(text)))
     }
 
     /// Exchange the names at `a` and `b`, owning the names first, without updating an own
@@ -2224,6 +2217,12 @@ impl VarMap {
     pub(crate) fn get_atom(&self, name: crate::atom::Atom) -> Option<&Binding> {
         let slot = self.names.slot_of(name)?;
         self.values.get(slot)
+    }
+
+    /// In-place binding write by atom (see [`VarMap::get_mut`]).
+    pub(crate) fn get_atom_mut(&mut self, name: crate::atom::Atom) -> Option<&mut Binding> {
+        let slot = self.names.slot_of(name)?;
+        self.values.get_mut(slot)
     }
 
     pub(crate) fn iter(&self) -> VarIter<'_> {
@@ -3013,6 +3012,32 @@ pub fn unwrap_export(stmt: &Stmt) -> &Stmt {
 }
 
 /// Collect every identifier bound by a pattern (for `var` hoisting and TDZ pre-declaration).
+/// [`pattern_idents`] borrowing the AST's names: text at a stable address, which the atom
+/// table's recent lookups serve.
+pub(crate) fn pattern_ident_strs<'a>(pat: &'a Pattern, out: &mut Vec<&'a str>) {
+    match pat {
+        Pattern::Ident(n) => out.push(n),
+        Pattern::Array(elems) => {
+            for e in elems {
+                match e {
+                    ArrayPatElem::Hole => {}
+                    ArrayPatElem::Elem { pattern, .. } => pattern_ident_strs(pattern, out),
+                    ArrayPatElem::Rest(p) => pattern_ident_strs(p, out),
+                }
+            }
+        }
+        Pattern::Object(o) => {
+            for p in &o.props {
+                pattern_ident_strs(&p.value, out);
+            }
+            if let Some(r) = &o.rest {
+                out.push(r);
+            }
+        }
+        Pattern::Member(_) => {}
+    }
+}
+
 pub fn pattern_idents(pat: &Pattern, out: &mut Vec<String>) {
     match pat {
         Pattern::Ident(n) => out.push(n.clone()),
