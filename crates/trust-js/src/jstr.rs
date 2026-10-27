@@ -299,6 +299,24 @@ pub fn unit_lstr(unit: u16) -> crate::lstr::LStr {
 /// The spec's code-unit-wise string comparison (differs from `str` byte order for strings mixing
 /// supplementary-plane characters with U+E000..U+FFFF, and for smuggled surrogates).
 pub fn cmp_units(a: &str, b: &str) -> std::cmp::Ordering {
+    // Equal bytes are equal units, so only the suffixes from the character holding the first
+    // differing byte matter. Equal prefixes start that character at the same offset in both.
+    let common = a
+        .bytes()
+        .zip(b.bytes())
+        .position(|(x, y)| x != y)
+        .unwrap_or(a.len().min(b.len()));
+    let mut start = common;
+    while !a.is_char_boundary(start) {
+        start -= 1;
+    }
+    let (a, b) = (&a[start..], &b[start..]);
+    // Two BMP characters (smuggled surrogates are above U+10F800) order by code point.
+    if let (Some(x), Some(y)) = (a.chars().next(), b.chars().next()) {
+        if (x as u32) < 0x10000 && (y as u32) < 0x10000 {
+            return x.cmp(&y);
+        }
+    }
     let mut ia = UnitIter::new(a);
     let mut ib = UnitIter::new(b);
     loop {

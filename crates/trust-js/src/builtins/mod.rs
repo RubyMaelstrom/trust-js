@@ -7734,7 +7734,8 @@ fn compare_sort_keys(a: &Option<LStr>, b: &Option<LStr>) -> Ordering {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
-        (Some(a), Some(b)) => a.as_ref().cmp(b.as_ref()),
+        // IsLessThan orders Strings by UTF-16 code units, not by code points.
+        (Some(a), Some(b)) => crate::jstr::cmp_units(a, b),
     }
 }
 
@@ -7767,7 +7768,7 @@ fn compare_values(
     } else {
         let sa = ab(i.to_string(a))?;
         let sb = ab(i.to_string(b))?;
-        Ok(sa.as_ref().cmp(sb.as_ref()))
+        Ok(crate::jstr::cmp_units(&sa, &sb))
     }
 }
 

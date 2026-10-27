@@ -1,5 +1,5 @@
 //! ECMA-262 editor's draft e28783d5, spec.html: CanonicalNumericIndexString 5787,
-//! StringGetOwnProperty 14889.
+//! IsLessThan 6085, StringGetOwnProperty 14889, CompareArrayElements 41667.
 
 use crate::bytecode::Tier;
 use crate::value::Value;
@@ -62,6 +62,72 @@ fn only_canonical_in_range_indices_are_a_strings_own_properties() {
          |4294967295:undefined,undefined,own,false,false,-\
          |0 1 5 +0|false|false|1|p3|p3",
     );
+}
+
+#[test]
+fn strings_sort_and_compare_by_utf16_code_units() {
+    // U+1F600 is the surrogate pair D83D DE00, below U+FF61 and U+E000 in code units though
+    // above them in code points; a lone surrogate sorts by its own unit.
+    check(
+        r#"
+        function hex(list) {
+            return list.map(function (s) {
+                var out = [];
+                for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i).toString(16));
+                return out.join(' ');
+            }).join(',');
+        }
+        function run() {
+            var words = ['｡', '\u{1F600}', '', '\uD800', '\u{10000}', 'a', '\uDC00x',
+                         'a\u{1F600}', 'a￿', 'é', 'z'];
+            var sorted = words.slice().sort();
+            var ok = true;
+            for (var i = 1; i < sorted.length; i++) ok = ok && !(sorted[i] < sorted[i - 1]);
+            var objects = words.map(function (w) { return {toString: function () { return w; }}; });
+            return [hex(sorted), ok, hex(objects.sort().map(String)), hex(words.toSorted()),
+                    '\u{1F600}' < '｡', 'a\u{1F600}' < 'a￿', '\uDBFF' < '\u{10FFFF}'
+                   ].join('|');
+        }
+        run()
+        "#,
+        "61,61 d83d de00,61 ffff,7a,e9,d800,d800 dc00,d83d de00,dc00 78,e000,ff61\
+         |true\
+         |61,61 d83d de00,61 ffff,7a,e9,d800,d800 dc00,d83d de00,dc00 78,e000,ff61\
+         |61,61 d83d de00,61 ffff,7a,e9,d800,d800 dc00,d83d de00,dc00 78,e000,ff61\
+         |true|true|true",
+    );
+}
+
+#[test]
+fn unit_comparison_matches_a_unit_by_unit_reference() {
+    use crate::jstr::{cmp_units, from_units, units};
+    let samples: Vec<Vec<u16>> = vec![
+        vec![],
+        vec![0x61],
+        vec![0x61, 0x62],
+        vec![0xE9],
+        vec![0x4E2D],
+        vec![0xE000],
+        vec![0xFF61],
+        vec![0xFFFF],
+        vec![0xD83D, 0xDE00],
+        vec![0xD83D],
+        vec![0xD83D, 0x61],
+        vec![0xDE00],
+        vec![0xD800, 0xDC00],
+        vec![0xDBFF, 0xDFFF],
+        vec![0x61, 0xD83D, 0xDE00],
+        vec![0x61, 0xFFFF],
+        vec![0x61, 0xE9, 0x62],
+        vec![0x61, 0xE9, 0x63],
+    ];
+    for a in &samples {
+        for b in &samples {
+            let (sa, sb) = (from_units(a), from_units(b));
+            assert_eq!(units(&sa), *a);
+            assert_eq!(cmp_units(&sa, &sb), a.cmp(b), "{a:x?} vs {b:x?}");
+        }
+    }
 }
 
 #[test]
