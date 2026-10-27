@@ -912,10 +912,14 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     require_regexp_this(i, &this, "[Symbol.match]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
     // An intrinsic RegExp's `flags` are its own and RegExpExec is RegExpBuiltinExec: without `g`
-    // the match is one exec, by the matcher just read.
-    if let Some((_, re)) = intrinsic_regexp(i, &this, &[RegexpMember::Exec]) {
+    // the match is one exec, by the matcher just read, and with it the matches come straight
+    // from the matcher while `lastIndex` stays a plain Number at its slot.
+    if let Some((obj, re)) = intrinsic_regexp(i, &this, &[RegexpMember::Exec]) {
         if !re.global {
             return regexp_builtin_exec(i, this, s, Some(re));
+        }
+        if plain_last_index(&obj).is_some() {
+            return re_sym_match_direct(i, &obj, &re, &s);
         }
     }
     let (flags, unicode) = match direct_reg_exp_flags(i, &this) {
@@ -959,6 +963,51 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     }
 }
 
+/// RegExp.prototype[@@match] (ECMA-262 §22.2.6.8 step 6) for a global RegExp whose RegExpExec is
+/// the intrinsic and whose `lastIndex` is a plain Number (see [`plain_last_index`]), after ToString
+/// of the subject. Each RegExpBuiltinExec runs straight on the matcher, with its `lastIndex`
+/// writes and legacy statics, and only the matched strings are made, not a match array for each
+/// to read its "0" from; an empty match advances `lastIndex` as step 6.e.iii.3 does.
+fn re_sym_match_direct(
+    i: &mut Interp,
+    obj: &Gc,
+    re: &Rc<crate::regex::Regex>,
+    s: &crate::lstr::LStr,
+) -> Result<Value, Value> {
+    // `lastIndex` stays at its slot: no code runs between the guard and the last write.
+    let read_last =
+        |obj: &Gc| plain_last_index(obj).expect("direct match lastIndex guard") as usize;
+    set_last_index_at_slot(obj, 0.0);
+    let mut found = Vec::new();
+    loop {
+        if let Err(error) = regexp_interrupt_tick(i) {
+            return Err(regexp_match_error_value(i, error));
+        }
+        let last = read_last(obj);
+        if last > s.unit_len() {
+            set_last_index_at_slot(obj, 0.0);
+            break;
+        }
+        let matched = regexp_exec_text_shared(i, re, s, last);
+        let Some(caps) = regexp_match_result(i, matched)? else {
+            set_last_index_at_slot(obj, 0.0);
+            break;
+        };
+        let (start, end) = caps[0].expect("successful regexp match has a span");
+        set_last_index_at_slot(obj, end as f64);
+        update_regexp_legacy_statics(i, re, &caps, s);
+        found.push(Value::Str(subject_slice(s, start, end)));
+        if start == end {
+            set_last_index_at_slot(obj, advance_string_index(end, s, re.unicode) as f64);
+        }
+    }
+    if found.is_empty() {
+        Ok(Value::Null)
+    } else {
+        Ok(i.make_array(found))
+    }
+}
+
 /// Execute a dead-result `String.prototype.match` for the fully canonical direct-RegExp case.
 /// Every observable lookup is proven by the caller to resolve to the realm intrinsics, so the
 /// matcher runs (updating `lastIndex` and the legacy statics exactly like live match) while the
@@ -996,6 +1045,9 @@ pub(super) fn re_sym_match_discard_direct(
 pub(super) fn re_sym_search(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.search]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
+    if let Some((_, re)) = direct_regexp_exec(i, &this) {
+        return re_sym_search_direct(i, &re, &s);
+    }
     let prev = ab(i.get_member_key(&this, "lastIndex"))?;
     if !same_value(&prev, &Value::Num(0.0)) {
         set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
@@ -1010,6 +1062,26 @@ pub(super) fn re_sym_search(i: &mut Interp, this: Value, a: &[Value]) -> Result<
         _ => ab(i.get_member_key(&result, "index")),
     }
 }
+/// RegExp.prototype[@@search] (ECMA-262 §22.2.6.12) for a RegExp whose RegExpExec is the
+/// intrinsic and whose `lastIndex` is a plain Number, after ToString of the subject.
+/// RegExpBuiltinExec runs with `lastIndex` +0 (step 5), so from the subject's start, and steps 7
+/// and 8 leave `lastIndex` as it was, whatever it wrote: no code runs to see the writes between,
+/// so none is made. The index comes straight from the matcher, without a match array.
+fn re_sym_search_direct(
+    i: &mut Interp,
+    re: &Rc<crate::regex::Regex>,
+    s: &crate::lstr::LStr,
+) -> Result<Value, Value> {
+    let matched = regexp_find_text_shared(i, re, s, 0);
+    match regexp_match_result(i, matched)? {
+        None => Ok(Value::Num(-1.0)),
+        Some(whole @ (start, _)) => {
+            update_regexp_legacy_statics_lazy(i, re, whole, 0, s);
+            Ok(Value::Num(start as f64))
+        }
+    }
+}
+
 pub(super) fn re_sym_replace(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     re_sym_replace_impl(i, this, a, false)
 }

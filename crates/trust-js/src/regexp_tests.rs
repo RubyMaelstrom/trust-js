@@ -182,6 +182,53 @@ fn single_element_patterns_match_as_the_matcher_does() {
     );
 }
 
+/// RegExp.prototype[@@match] with `g` (§22.2.6.8) and [@@search] (§22.2.6.12): the matches,
+/// empty ones advancing by code point in Unicode mode, `lastIndex` as each step leaves it (also
+/// a -0 that @@search restores), the legacy statics of the last match, and the TypeError of a
+/// non-writable `lastIndex`.
+#[test]
+fn global_match_and_search_keep_their_observable_steps() {
+    check(
+        r#"
+        function li(re, f) { var r = f(); return [r, re.lastIndex, Object.is(re.lastIndex, -0)]; }
+        var g = /a(b)?/g; g.lastIndex = 3;
+        var e = /x*/g;
+        var u = /(?:)/gu;
+        var nu = /(?:)/g;
+        var gy = /a/gy;
+        var s1 = /b/g; s1.lastIndex = 7;
+        var s2 = /b/y; s2.lastIndex = -0;
+        var s3 = /b/; s3.lastIndex = 2;
+        var s4 = /c/gy; s4.lastIndex = 1;
+        var frozen = /a/g; Object.defineProperty(frozen, "lastIndex", { writable: false, value: 0 });
+        var r1 = "xabyab".match(/a(b)/g);
+        var statics1 = [RegExp.lastMatch, RegExp.$1, RegExp.leftContext, RegExp.rightContext];
+        var r2 = "q1w2".search(/(\d)/);
+        var statics2 = [RegExp.lastMatch, RegExp.$1, RegExp.leftContext, RegExp.rightContext];
+        var frozenErr;
+        try { "aaa".match(frozen); } catch (err) { frozenErr = err.name; }
+        JSON.stringify([
+            li(g, () => "xababa".match(g)),
+            li(e, () => "ab".match(e)),
+            li(u, () => "\u{1F600}x".match(u)),
+            li(nu, () => "\u{1F600}x".match(nu)),
+            li(gy, () => "aab".match(gy)),
+            "abc".match(/z/g),
+            li(s1, () => "abcb".search(s1)),
+            li(s2, () => "abcb".search(s2)),
+            li(s2, () => "bbcb".search(s2)),
+            li(s3, () => "abcb".search(s3)),
+            li(s4, () => "abc".search(s4)),
+            "abc".search(/z/),
+            r1, statics1, r2, statics2, frozenErr,
+            "a’b’".match(/’/g),
+            "AbAB".match(/b/gi),
+        ])
+        "#,
+        r#"[[["ab","ab","a"],0,false],[["","",""],0,false],[["","",""],0,false],[["","","",""],0,false],[["a","a"],0,false],null,[1,7,false],[-1,0,true],[0,0,true],[1,2,false],[-1,1,false],-1,["ab","ab"],["ab","b","xaby",""],1,["1","1","q","w2"],"TypeError",["’","’"],["b","B"]]"#,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).
