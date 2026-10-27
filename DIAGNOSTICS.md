@@ -96,7 +96,11 @@ comment/example in the same change.
 - Helper-traffic tallies print their top entries to stderr at exit and are diagnostic only:
   `TRUST_JS_JIT_OPSTAT=1` counts ops that reach a JIT helper (`=2` adds the function and
   pc), `TRUST_JS_JIT_CALLSTAT=1` counts why calls reaching the call helper missed the
-  direct-call sequence, `TRUST_JS_JIT_NATIVESTAT=1` counts those calls by native callee,
+  direct-call sequence (`=2` adds `[jit-callpath]` counts of calls by the path that entered
+  the callee: the direct sequence, the call-hit helper for user callees and for natives with
+  and without the native-call boundary, the generic call helper, the intrinsic helper, cached
+  calls from Rust and `Interp::call`), `TRUST_JS_JIT_NATIVESTAT=1` counts those calls by native
+  callee,
   and `TRUST_JS_JIT_PROPSTAT=1` counts why named reads reaching a JIT property helper were
   not served by the inline template (proxy, exotic/side-table, accessor, array holder,
   depth, absent, or uncached/cached data; `=2` adds the site). `TRUST_JS_JIT_PROFILE_AFTER_MS=N`

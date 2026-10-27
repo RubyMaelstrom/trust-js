@@ -7707,6 +7707,15 @@ fn emit_direct_call(
     }
 
     // ---- mutations ----
+    if crate::bytecode::call_paths_enabled() {
+        // TRUST_JS_JIT_CALLSTAT=2 (diagnostic): count the entry; x4 and x5 are written below
+        // before they are read.
+        let count = &crate::bytecode::CALL_PATHS[crate::bytecode::CallPath::Direct as usize];
+        a.mov_imm64(4, count as *const _ as u64);
+        a.ldr_imm(5, 4, 0);
+        a.add_imm(5, 5, 1);
+        a.str_imm(5, 4, 0);
+    }
     a.add_imm(11, 11, 1);
     a.str_w_imm(11, 14, il.depth as u32); // depth++ (u32 field)
                                           // FnFrame push: entry = ptr + len*24

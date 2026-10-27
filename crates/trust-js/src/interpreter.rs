@@ -12332,6 +12332,7 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
+        crate::bytecode::note_call_path(crate::bytecode::CallPath::Uncached);
         // I1: callers often hold the argument list in a Rust-heap buffer.
         let _arguments = crate::rooting::root_slice(args);
         self.depth += 1;
@@ -13505,6 +13506,7 @@ impl Interp {
         let ic = match self.resolve_cached_call_entry(site, callee) {
             CachedCall::Miss => return None,
             CachedCall::Entry(entry) => {
+                crate::bytecode::note_call_path(crate::bytecode::CallPath::Cached);
                 // A native entry needs only its builtin: read it in place rather than from a
                 // copy whose stores are still in flight.
                 // SAFETY: `entry` is live and nothing re-entrant has run since the probe.
@@ -13528,7 +13530,10 @@ impl Interp {
                 // The callee may refill this way; run from a copy.
                 unsafe { entry.read() }
             }
-            CachedCall::Shared(ic) => ic,
+            CachedCall::Shared(ic) => {
+                crate::bytecode::note_call_path(crate::bytecode::CallPath::Cached);
+                ic
+            }
         };
         let code = unsafe { crate::jit::cache::lease_raw(ic.code) };
         self.note_compiled_call(&ic);

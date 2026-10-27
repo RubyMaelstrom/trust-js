@@ -21799,6 +21799,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
     sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let site = (packed & 0xFFFF) as usize;
+    note_call_path(CallPath::Intrinsic);
     let i = unsafe { &mut *(*ctx).interp };
     let position = call_op_position(unsafe { &*(*ctx).chunk }, site);
     explicit_call(i, position, |_| unsafe {
@@ -22484,6 +22485,7 @@ unsafe fn jit_call_hit_inner(
     // The emitted probe already validated this epoch. Acquire before inline
     // recompilation, which may now reclaim other inactive native code.
     let code = crate::jit::cache::lease_raw(ic.code);
+    note_call_path(CallPath::HitHelper);
     jit_callstat(i, ctx, &ic, argc, with_this, sp);
     let chunk_ref = &*ic.chunk;
     let runs = chunk_ref.jit_runs.get().saturating_add(1);
@@ -22579,8 +22581,14 @@ unsafe fn jit_call_hit_native(
         // The exact builtin is proven: when its class runs no author code for these operands,
         // it runs on them directly, without an arbitrary native's call boundary.
         match i.call_native_light(nf, intrinsic, this_slot, args_ptr, argc) {
-            Some(r) => r,
-            None => i.call_native_committed(nf, this_slot, args_ptr, argc),
+            Some(r) => {
+                note_call_path(CallPath::NativeLight);
+                r
+            }
+            None => {
+                note_call_path(CallPath::NativeBoundary);
+                i.call_native_committed(nf, this_slot, args_ptr, argc)
+            }
         }
     };
     // The boundary's loans are finished; this owning caller retires the operand window.
@@ -23839,6 +23847,7 @@ pub(crate) unsafe extern "C" fn jit_call(
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
+    note_call_path(CallPath::Generic);
     let i = &mut *ctx.interp;
     let position = call_op_position(&*ctx.chunk, pc as usize);
     match explicit_call(i, position, |_| jit_call_inner(ctx, pc, &mut sp)) {
@@ -24197,9 +24206,86 @@ fn jit_propstat(
 pub(crate) fn jit_callstat_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
+        if std::env::var("TRUST_JS_JIT_CALLSTAT").as_deref() == Ok("2") {
+            CALL_PATHS_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         std::env::var_os("TRUST_JS_JIT_CALLSTAT").is_some()
             || std::env::var_os("TRUST_JS_JIT_NATIVESTAT").is_some()
     })
+}
+
+/// `TRUST_JS_JIT_CALLSTAT=2`: calls counted by the path that entered the callee, printed at exit
+/// as `[jit-callpath]` lines. The direct sequence counts itself, in code compiled while the
+/// count is on; the other paths count in their helpers.
+#[derive(Clone, Copy)]
+pub(crate) enum CallPath {
+    /// The machine-code direct sequence (ARM64), counted by the generated code itself.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    Direct,
+    /// A user callee through the call-hit helper (`jit_call_hit`).
+    HitHelper,
+    /// A native through the call-hit helper, without the native-call boundary.
+    NativeLight,
+    /// A native through the call-hit helper and the native-call boundary.
+    NativeBoundary,
+    /// The generic call helper (`jit_call`): x86-64's every call, ARM64's misses.
+    Generic,
+    /// The intrinsic helper (`jit_intrinsic`), a template's fallback.
+    Intrinsic,
+    /// A call-cache hit entered from Rust or the generic helper (`Interp::call_jit_cached`).
+    Cached,
+    /// `Interp::call`, the uncached dispatcher.
+    Uncached,
+}
+
+const CALL_PATH_NAMES: [&str; 8] = [
+    "direct sequence",
+    "call-hit helper, user callee",
+    "call-hit helper, native without the boundary",
+    "call-hit helper, native through the boundary",
+    "generic call helper",
+    "intrinsic helper",
+    "cached call (Rust callers, generic helper)",
+    "Interp::call",
+];
+
+/// The [`CallPath`] counts, global so that generated code can count the direct sequence.
+pub(crate) static CALL_PATHS: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+static CALL_PATHS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `TRUST_JS_JIT_CALLSTAT=2` counts call paths (set as the JIT reads its switches).
+#[inline(always)]
+pub(crate) fn call_paths_enabled() -> bool {
+    CALL_PATHS_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one call by `path` (see [`CallPath`]); prints the counts as the thread exits.
+#[inline(always)]
+pub(crate) fn note_call_path(path: CallPath) {
+    if !call_paths_enabled() {
+        return;
+    }
+    struct Printer;
+    impl Drop for Printer {
+        fn drop(&mut self) {
+            for (name, count) in CALL_PATH_NAMES.iter().zip(&CALL_PATHS) {
+                let count = count.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[jit-callpath] {count:>12}  {name}");
+            }
+        }
+    }
+    thread_local! {
+        static PRINTER: Printer = const { Printer };
+    }
+    PRINTER.with(|_| ());
+    CALL_PATHS[path as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Exclude startup from opt-in helper counts without adding a clock read to normal execution.
@@ -24304,19 +24390,26 @@ unsafe fn jit_callstat(
             break 'r "native entry";
         }
         if ic.direct & CALL_IC_NEEDS_ENV != 0 {
-            break 'r "env entry";
+            let callee = &*ic.chunk_raw;
+            break 'r if callee.makes_env() {
+                "env entry: activation environment"
+            } else if callee.prepared_entry {
+                "env entry: prepared entry"
+            } else {
+                "env entry: arguments slot, no environment"
+            };
         }
         if argc > 64 {
             break 'r "emit: argc > 64";
         }
         if ic.direct & 1 == 0 {
-            break 'r "gate: var force resets";
+            break 'r "callee: resumable or rest parameters (no direct entry)";
         }
         if ic.direct & 8 == 0 {
             break 'r "gate: frame > FRAME_BUF";
         }
         if !(*ic.chunk_raw).inline_attempted.get() {
-            break 'r "gate: recompile not settled";
+            break 'r "warm-up: callee's inline attempt pending";
         }
         if ic.direct & 2 != 0 && ctx.global_body.is_null() {
             break 'r "gate: needs_global, no live global_body";
@@ -24345,7 +24438,11 @@ unsafe fn jit_callstat(
         if retry_at != 0 && callee.jit_runs.get().wrapping_add(1) >= retry_at {
             break 'r "gate: inline retry due";
         }
-        break 'r "all gates pass (direct not emitted at site?)";
+        if !ctx.resume_activation.is_null() {
+            // A borrowed frame's code is compiled without direct sequences (`compile_entry`).
+            break 'r "site: borrowed frame, no direct sequence";
+        }
+        break 'r "all gates pass (no direct sequence at the site)";
     };
     let _ = COUNTS.try_with(|c| *c.borrow_mut().0.entry(reason).or_insert(0) += 1);
 }
