@@ -920,6 +920,38 @@ sustained workload, the fixtures, ARES-6 and Web Tooling; minor-collection time 
 measured finalize share; one-binding environments sit in the 96-byte class; no suite slower
 beyond noise. Splay's live heap stays W2c/W2d's.
 
+Progress (2026-10-27): steps 1-5 (803aea93..a1535a6f).
+1. 803aea93: TRUST_JS_GC_LOG reports each kind's finalize time (`fin_us:<kind>`). Census (main
+   15933355, no-LTO, under load): ARES-6 spends 40% of its collection time finalizing,
+   environments 20.1 s of 27.5 s (119M cells, 168 ns each), property-map extras 4.6 s (19.6M,
+   233 ns), layouts 2.2 s (19.6M, 113 ns); Web Tooling 10% (extras 0.76 s, layouts 0.63 s,
+   environments 0.55 s); on the fixtures environments take up to 1 ms (Vue, 25,845 cells).
+2. 66ae368b: atoms (exact-size flat string cells, one per text per heap; the table hashes code
+   units with a folded multiply from random seeds), PropKey, 69 static names (the internal
+   `%...%` bindings among them), and each heap's atoms and their bytes in the GC log.
+3. 7b4f8a2c: binding names as atoms. Lookups by text compare an atom's units with the text; a
+   cache of recent lookups keyed by the text's address serves the tree-walker's AST names.
+   Binding layouts stay text, because a function's AST, which every heap shares, caches them.
+4. 0c25a2bf: environments without drop glue. Entries are never dropped, a large map lives in a
+   payload cell, lexical names and imports in storage blocks; the environment descriptor has
+   no finalizer but the census's, and the fixtures' GC logs show no finalized environment.
+5. a1535a6f: scope descriptors. Names live apart from values: a compiled scope's in a
+   descriptor its heap keeps, a tree-walked function's derived per heap from its AST's text
+   layout, a dynamic record's in its own list (or, with one binding, in the names word).
+   Bindings are 24 bytes and an environment with one binding fits the 96-byte class (checked
+   at compile time); generated code reads values at stride 24 and no longer tests a storage
+   tag, on both backends.
+Instructions on the fixtures (pinned to the A725 cores, fixed GC budgets) against 15933355:
+compiled code Djot -3.6%, React +0.2%, Vue +0.2%; the tree-walker 1.2-4.0% fewer. Validation:
+Test262 identical, the fixtures' output, difftest, the lib suite (with GC pacing on, only the
+failure every P2 gate has) and GC stress on the environment tests; on zombie, clippy on x86-64
+and Windows, both lib suites with only the failures they had before (one GC test on x86-64,
+three snapshot stack tests under Wine), and the x86-64 fixtures and difftest, whose output
+matches ARM64's. The dumps differ only in the environment's and the interpreter's field
+offsets, the binding stride and offset, absolute addresses and the dropped tag test.
+Left: step 6 (property keys as PropKeys, layouts without finalizers), step 7, and the exit's
+measurements on ARES-6 and Web Tooling.
+
 ### W5: RegExp (census and design, 2026-10-27)
 
 Census: the string rework's engine (56c28010, no-LTO) on Crystal, CPU 5, under load (two other
