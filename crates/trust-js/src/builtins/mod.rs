@@ -2599,7 +2599,7 @@ fn regexp_builtin_exec(
             let groups = regexp_groups(i, &re, &caps, &input);
             // `indices` (the `d` flag): [start, end] pairs per capture (undefined if unmatched),
             // plus a null-prototype `groups` of the same for named captures.
-            let indices = if re.flags.contains('d') {
+            let indices = if re.has_indices {
                 let pair = |i: &mut Interp, span: Option<(usize, usize)>| match span {
                     Some((a, b)) => i.make_array(vec![Value::Num(a as f64), Value::Num(b as f64)]),
                     None => Value::Undefined,

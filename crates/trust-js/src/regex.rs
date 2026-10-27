@@ -290,14 +290,19 @@ pub struct Regex {
     one_byte_native: RefCell<Option<OneByteNativeProgram>>,
     /// The matcher's working state between executions.
     scratch: RefCell<MatchScratch>,
+    /// Unicode mode: the `u` or the `v` flag.
     pub unicode: bool,
     pub ngroups: usize,
     pub source: String,
+    /// The flags in canonical order, for `flags` and `source`-style reads; matching and the
+    /// RegExp algorithms test the booleans, computed with it.
     pub flags: String,
+    pub has_indices: bool,
     pub global: bool,
     pub ignore_case: bool,
     pub multiline: bool,
     pub dotall: bool,
+    pub unicode_sets: bool,
     pub sticky: bool,
     /// `(?<name>…)` group names paired with their capture index.
     pub names: Vec<(String, usize)>,
@@ -2632,10 +2637,12 @@ impl Regex {
                 pattern.to_string()
             },
             flags: canonical,
+            has_indices: flags.contains('d'),
             global: flags.contains('g'),
             ignore_case: flags.contains('i'),
             multiline: flags.contains('m'),
             dotall: flags.contains('s'),
+            unicode_sets,
             sticky: flags.contains('y'),
             names: p.names,
         };
@@ -2655,6 +2662,21 @@ impl Regex {
         }
         re.first_lut = lut;
         Ok(re)
+    }
+
+    /// Whether the pattern has flag `flag`, one of `dgimsuvy`.
+    pub(crate) fn has_flag(&self, flag: char) -> bool {
+        match flag {
+            'd' => self.has_indices,
+            'g' => self.global,
+            'i' => self.ignore_case,
+            'm' => self.multiline,
+            's' => self.dotall,
+            'u' => self.unicode && !self.unicode_sets,
+            'v' => self.unicode_sets,
+            'y' => self.sticky,
+            _ => false,
+        }
     }
 
     /// Count an execution over a subject of `storage` ([`SUBJECT_ONE_BYTE`] or
@@ -2702,7 +2724,7 @@ impl Regex {
     /// Deliberately a superset of what the matcher accepts (e.g. `Any` only excludes `\n`), so a
     /// pass costs a wasted attempt at worst; only a reject skips work.
     fn first_matches(&self, atoms: &[Rep], c: u32) -> bool {
-        let unicode = self.unicode || self.flags.contains('v');
+        let unicode = self.unicode;
         atoms.iter().any(|rep| match rep {
             Rep::Char(ch) => {
                 *ch == c
@@ -2995,7 +3017,7 @@ impl Regex {
             back: false,
             flags: base_flags,
             outer_flags: std::mem::take(&mut scratch.outer_flags),
-            unicode: self.flags.contains('u') || self.flags.contains('v'),
+            unicode: self.unicode,
             control,
             abort: None,
             // With no observable capture groups, failure at a StringSet instruction depends only

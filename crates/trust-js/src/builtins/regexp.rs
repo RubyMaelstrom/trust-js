@@ -8,7 +8,7 @@ fn re_flag_get(i: &Interp, this: &Value, flag: Option<char>) -> Result<Value, Va
     if let Some(ptr) = map_ptr(this) {
         if let Some(re) = i.regexps.get(&ptr) {
             return Ok(match flag {
-                Some(c) => Value::Bool(re.flags.contains(c)),
+                Some(c) => Value::Bool(re.has_flag(c)),
                 None => Value::lstr(re.flags.clone()),
             });
         }
