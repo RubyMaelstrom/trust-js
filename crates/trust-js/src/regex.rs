@@ -1616,11 +1616,11 @@ impl StringTrie {
             let mut node = 0usize;
             if backwards {
                 for character in string.iter().rev() {
-                    node = trie.insert_edge(node, *character as u32);
+                    node = trie.insert_edge(node, cp_of_elem(*character));
                 }
             } else {
                 for character in string {
-                    node = trie.insert_edge(node, *character as u32);
+                    node = trie.insert_edge(node, cp_of_elem(*character));
                 }
             }
             trie.nodes[node].terminal = true;
@@ -1880,6 +1880,9 @@ struct Parser {
     /// contains a named group (`(?<name>…)`). Otherwise `\k` is the literal character `k` (Annex B).
     /// The `v` flag: classes are ClassSetExpressions (nested classes, `&&`, `--`, `\q{}`).
     unicode_sets: bool,
+    /// Whether matching ignores case at the current position: the `i` flag, as inline
+    /// modifier groups change it. A `v`-mode class set is computed case-folded under it.
+    icase: bool,
     named_mode: bool,
     /// `\k<name>` references collected during parsing, validated against `names` afterwards.
     name_refs: Vec<String>,
@@ -2414,6 +2417,7 @@ impl Regex {
             names: Vec::new(),
             unicode,
             unicode_sets,
+            icase: flags.contains('i'),
             named_mode,
             name_refs: Vec::new(),
             depth: 0,
@@ -3459,13 +3463,27 @@ impl Parser {
         if (add.0 && remove.0) || (add.1 && remove.1) || (add.2 && remove.2) {
             return Err("inline modifier flag added and removed".into());
         }
-        let inner = self.parse_alt()?;
+        let outer = self.icase;
+        self.icase = (outer || add.0) && !remove.0;
+        let inner = self.parse_alt();
+        self.icase = outer;
+        let inner = inner?;
         self.expect(')')?;
         Ok(Node::Modifier {
             add,
             remove,
             inner: Box::new(inner),
         })
+    }
+
+    /// `set` as ECMA-262's MaybeSimpleCaseFolding leaves it for the set operations here: closed
+    /// over case when matching ignores case (see [`ClassSet::close_over_case`]).
+    fn case_folded(&self, set: ClassSet) -> ClassSet {
+        if self.icase {
+            set.close_over_case()
+        } else {
+            set
+        }
     }
 
     /// `v`-mode `[...]`: parse a ClassSetExpression, computing the concrete set, and compile it
@@ -3493,7 +3511,7 @@ impl Parser {
         let first = self.parse_class_set_operand()?;
         // Decide the expression kind from the following operator.
         if self.peek() == Some('&') && self.chars.get(self.pos + 1) == Some(&'&') {
-            let mut acc = first;
+            let mut acc = self.case_folded(first);
             while self.peek() == Some('&') && self.chars.get(self.pos + 1) == Some(&'&') {
                 self.bump();
                 self.bump();
@@ -3501,22 +3519,23 @@ impl Parser {
                     return Err("unexpected '&&&' in class set".into());
                 }
                 let rhs = self.parse_class_set_operand()?;
-                acc = acc.intersect(rhs);
+                acc = acc.intersect(self.case_folded(rhs));
             }
             return Ok(acc);
         }
         if self.peek() == Some('-') && self.chars.get(self.pos + 1) == Some(&'-') {
-            let mut acc = first;
+            let mut acc = self.case_folded(first);
             while self.peek() == Some('-') && self.chars.get(self.pos + 1) == Some(&'-') {
                 self.bump();
                 self.bump();
                 let rhs = self.parse_class_set_operand()?;
-                acc = acc.subtract(rhs);
+                acc = acc.subtract(self.case_folded(rhs));
             }
             return Ok(acc);
         }
         // Union (with a-z ranges).
-        let mut acc = self.maybe_class_set_range(first)?;
+        let first = self.maybe_class_set_range(first)?;
+        let mut acc = self.case_folded(first);
         while self.peek() != Some(']') && self.peek().is_some() {
             if self.peek() == Some('&') && self.chars.get(self.pos + 1) == Some(&'&') {
                 return Err("cannot mix '&&' with a union in a class set".into());
@@ -3526,7 +3545,7 @@ impl Parser {
             }
             let next = self.parse_class_set_operand()?;
             let next = self.maybe_class_set_range(next)?;
-            acc = acc.union(next);
+            acc = acc.union(self.case_folded(next));
         }
         Ok(acc)
     }
@@ -3603,7 +3622,7 @@ impl Parser {
                                 Some('\\') => {
                                     self.bump();
                                     let v = self.class_set_escape_char()?;
-                                    cur.push(char::from_u32(v).unwrap_or('\u{FFFD}'));
+                                    cur.push(elem_of_cp(v));
                                 }
                                 Some(c) => {
                                     self.bump();
@@ -3616,7 +3635,7 @@ impl Parser {
                     }
                     Some(b @ ('d' | 'D' | 'w' | 'W' | 's' | 'S')) => {
                         self.bump();
-                        Ok(builtin_class_set(b))
+                        Ok(builtin_class_set(b, self.icase))
                     }
                     Some(pc @ ('p' | 'P')) => {
                         self.bump();
@@ -3693,11 +3712,15 @@ impl Parser {
         }
         match crate::unicode_props::lookup_strict(name, value) {
             Some((complement, ranges)) => {
-                let set = ClassSet {
+                let mut set = ClassSet {
                     ranges: ranges.to_vec(),
                     strings: Vec::new(),
                 };
-                if negate != complement {
+                if complement {
+                    set = set.complement()?;
+                }
+                let set = self.case_folded(set);
+                if negate {
                     set.complement()
                 } else {
                     Ok(set)
@@ -6229,7 +6252,8 @@ impl<'a, I: ReInput> Matcher<'a, I> {
 // a concrete set of code-point ranges plus a set of multi-code-point strings.
 // ---------------------------------------------------------------------------------------------
 
-/// A `v`-mode class set: sorted, disjoint code-point ranges plus multi-code-point strings.
+/// A `v`-mode class set: sorted, disjoint code-point ranges plus multi-code-point strings of
+/// pattern elements (a lone surrogate smuggled; see [`elem_of_cp`]).
 #[derive(Default, Clone)]
 struct ClassSet {
     ranges: Vec<(u32, u32)>,
@@ -6323,6 +6347,34 @@ impl ClassSet {
         Ok(self)
     }
 
+    /// The set closed over case: each member's case-fold orbit joins it, and each string's
+    /// elements become their orbits' representatives. ECMA-262 folds every operand of a `v`
+    /// class under `i` (MaybeSimpleCaseFolding) and complements within the folded characters
+    /// (CharacterComplement); a matcher that ignores case accepts a character when its orbit
+    /// meets the set, so set operations over closed sets give what those over folded ones do.
+    fn close_over_case(mut self) -> ClassSet {
+        self.normalize();
+        let mut orbits = Vec::new();
+        for &(c, _) in crate::regex_fold::FOLD_CANON {
+            if self.contains(c) {
+                orbits.extend(fold_orbit(c).map(|member| (member, member)));
+            }
+        }
+        self.ranges.extend(orbits);
+        for string in &mut self.strings {
+            for c in string.iter_mut() {
+                *c = elem_of_cp(fold_canon(cp_of_elem(*c)));
+            }
+        }
+        self.normalize();
+        self
+    }
+
+    fn contains(&self, c: u32) -> bool {
+        let at = self.ranges.partition_point(|&(_, hi)| hi < c);
+        self.ranges.get(at).is_some_and(|&(lo, _)| lo <= c)
+    }
+
     fn from_cp(c: u32) -> ClassSet {
         ClassSet {
             ranges: vec![(c, c)],
@@ -6332,7 +6384,9 @@ impl ClassSet {
 }
 
 /// The concrete ranges of a `\d`/`\w`/`\s` class escape (for `v`-mode set arithmetic).
-fn builtin_class_set(b: char) -> ClassSet {
+/// `\d`, `\w`, `\s` or a complement of one, as a class set; folded over case before the
+/// complement when matching ignores case.
+fn builtin_class_set(b: char, icase: bool) -> ClassSet {
     let base = match b.to_ascii_lowercase() {
         'd' => vec![(0x30, 0x39)],
         'w' => vec![(0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A)],
@@ -6340,7 +6394,6 @@ fn builtin_class_set(b: char) -> ClassSet {
             let mut r = vec![
                 (0x09, 0x0D),
                 (0x20, 0x20),
-                (0x85, 0x85),
                 (0xA0, 0xA0),
                 (0x1680, 0x1680),
                 (0x2000, 0x200A),
@@ -6359,6 +6412,9 @@ fn builtin_class_set(b: char) -> ClassSet {
         ranges: base,
         strings: Vec::new(),
     };
+    if icase {
+        set = set.close_over_case();
+    }
     if b.is_ascii_uppercase() {
         set = set.complement().unwrap();
     }
@@ -6476,37 +6532,24 @@ fn property_of_strings(name: &str) -> Option<ClassSet> {
     }
 }
 
-/// A `\q{...}` alternative: a single char joins the ranges; longer sequences join the strings.
+/// A `\q{...}` alternative of pattern elements: a single one joins the ranges; longer
+/// sequences join the strings.
 fn push_q_alternative(set: &mut ClassSet, alt: Vec<char>) {
     match alt.len() {
         0 => set.strings.push(Vec::new()),
-        1 => set.ranges.push((alt[0] as u32, alt[0] as u32)),
+        1 => set.ranges.push((cp_of_elem(alt[0]), cp_of_elem(alt[0]))),
         _ => set.strings.push(alt),
     }
 }
 
 /// Compile a computed class set: an alternation of its strings (longest first, so the greedy
-/// match prefers the longest sequence) plus a plain range class. Lone-surrogate ranges are
-/// dropped (input is scalar values).
+/// match prefers the longest sequence) plus a plain range class. A lone surrogate is a code
+/// point of the subject, so surrogate ranges stay.
 fn class_set_to_node(mut set: ClassSet) -> Node {
     set.normalize();
-    let mut ranges: Vec<(u32, u32)> = Vec::new();
-    for &(lo, hi) in &set.ranges {
-        let mut push = |a: u32, b: u32| {
-            if a <= b {
-                ranges.push((a, b));
-            }
-        };
-        if lo <= 0xD7FF && hi >= 0xE000 {
-            push(lo, 0xD7FF);
-            push(0xE000, hi);
-        } else if !(0xD800..=0xDFFF).contains(&lo) || !(0xD800..=0xDFFF).contains(&hi) {
-            push(lo.clamp(0, 0x10FFFF), hi.min(0x10FFFF));
-        }
-    }
     let class = CharClass {
         negate: false,
-        ranges,
+        ranges: std::mem::take(&mut set.ranges),
         builtins: Vec::new(),
         props: Vec::new(),
         ascii_lut: None,

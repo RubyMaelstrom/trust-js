@@ -701,3 +701,42 @@ fn anchors_inside_a_pattern_keep_holding_after_the_pattern_tiers_up() {
         "false,false,false,false,true,true,false,false,true,false,false,true",
     );
 }
+
+/// ECMA-262 §22.2.2.9 (CompileToCharSet): under `v` a lone surrogate is a code point of the
+/// subject that classes, properties, ranges and `\q{}` strings can hold, and under `i` every
+/// operand is folded (MaybeSimpleCaseFolding) before complements, differences and
+/// intersections, as is a property or a `\w`, `\d` or `\s` before its complement. An inline
+/// modifier group decides `i` for the classes inside it. V8 (node 24) leaks a group's `i`
+/// into the class after it: it finds no match for the last `scoped` pattern.
+#[test]
+fn unicode_sets_classes_keep_lone_surrogates_and_fold_their_operands() {
+    check(
+        r#"
+        function run() {
+            var lone = [/\p{Any}/v.test('\ud83d'), /[\s\S]/v.test('\udc00'), /[^a]/v.test('\ud800'),
+                /\P{L}/v.test('\ud800'), /\p{Cs}/v.test('\ud800'), /[\ud800-\udbff]/v.test('\udb00'),
+                /[\q{\ud800}]/v.test('\ud800'), /[\q{\ud800}]/v.test('�'),
+                /[\q{\ud800x|ab}]/v.test('\ud800x'), /^[\p{Any}--\p{Cs}]$/v.test('\udc00'),
+                /^[\p{Any}--\p{Cs}]$/v.test('😀')];
+            var fold = [/[^a-z]/iv.test('b'), /[^a-z]/iv.test('B'), /[^a-z]/iv.test('1'),
+                /[\p{L}--[a-z]]/iv.test('A'), /[\p{L}--[a-z]]/iv.test('é'),
+                /[[a-z]&&[A-Z]]/iv.test('q'), /[\w--\d]/iv.test('ſ'), /[^\P{Ll}]/iv.test('A'),
+                /[ẞ]/vi.test('ß'), /[^ß]/vi.test('ẞ'),
+                /[\p{Lu}--ẞ]/vi.test('ß'), /[\q{AB}--\q{ab}]/vi.test('AB'),
+                /[\q{AB}]/vi.test('ab'), /[\W]/vi.test('ſ'), /[^\w]/vi.test('K'),
+                /\W/vi.test('ſ'), /\P{Ll}/iv.test('a'), /[\P{Ll}]/iv.test('a'),
+                /[^\p{Lu}]/iv.test('a')];
+            var scoped = [/(?i:[^a-z])/v.test('B'), /(?i:[\p{L}--[a-z]])/v.test('A'),
+                /[^a-z]/v.test('B'), /(?-i:[^a-z])/vi.test('B'), /[\p{L}--[a-z]]/v.test('A'),
+                /(?i:[^a-z])[^a-z]/v.test('BB'), /(?i:x)[^a-z]/v.test('XB')];
+            var space = [/[\s]/v.test('\x85'), /[\S]/v.test('\x85'), /[\s]/v.test('﻿'),
+                /[\s--\n]/v.test('\n')];
+            return [lone, fold, scoped, space].map(function (group) {
+                return group.map(Number).join('');
+            }).join('|');
+        }
+        run()
+        "#,
+        "11111110101|0010111110001000000|0011101|0110",
+    );
+}
