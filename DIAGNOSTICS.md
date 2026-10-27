@@ -114,8 +114,8 @@ comment/example in the same change.
   steps (`scrub`: zeroing the native stack below the collection's frames; `client`: building
   the marking client; `dead`: listing the dead objects for the tables' sweeps; `weak`:
   clearing weak handles and weak cells; `tables`: evicting the dead from the engine's tables;
-  `after`: the Agent's bookkeeping after the sweep), then the cells finalized, by kind
-  (`fin:<kind>=count`).
+  `after`: the Agent's bookkeeping after the sweep), then the cells finalized, by kind, and
+  the time their finalizers took (`fin:<kind>=count fin_us:<kind>=microseconds`).
 - Collections are minor or major. A minor collection traces from the roots and from the old
   cells (cells an earlier collection kept) whose cards the write barrier set since the last
   collection, and of the engine's side tables (internal slots kept outside objects, WeakMap and

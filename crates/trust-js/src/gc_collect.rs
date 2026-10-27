@@ -1197,13 +1197,12 @@ impl Interp {
             let finalized = stats
                 .last_finalized
                 .iter()
+                .zip(stats.last_finalize_nanos)
                 .enumerate()
-                .filter(|(_, &count)| count != 0)
-                .map(|(desc, count)| {
-                    format!(
-                        " fin:{}={count}",
-                        names.get(desc).copied().unwrap_or("?").replace(' ', "_")
-                    )
+                .filter(|(_, (&count, _))| count != 0)
+                .map(|(desc, (count, nanos))| {
+                    let name = names.get(desc).copied().unwrap_or("?").replace(' ', "_");
+                    format!(" fin:{name}={count} fin_us:{name}={:.0}", micros(nanos))
                 })
                 .collect::<String>();
             let steps = ENGINE_STEP_NANOS.with(|steps| steps.replace([0; ENGINE_STEPS]));

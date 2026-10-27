@@ -1461,6 +1461,8 @@ pub(crate) struct GcStats {
     /// The cells the last collection finalized, by descriptor (the first [`COUNTED_DESCS`]),
     /// while phases are timed.
     pub(crate) last_finalized: [u32; COUNTED_DESCS],
+    /// The time their finalizers took, in nanoseconds, by descriptor as `last_finalized`.
+    pub(crate) last_finalize_nanos: [u64; COUNTED_DESCS],
 }
 
 /// How many descriptors [`GcStats::last_finalized`] counts.
@@ -3153,6 +3155,7 @@ impl Heap {
         self.stats.collections += 1;
         self.stats.last_phase_nanos = [0; PHASES];
         self.stats.last_finalized = [0; COUNTED_DESCS];
+        self.stats.last_finalize_nanos = [0; COUNTED_DESCS];
         let mut clock = self.phase_clock();
         self.flush_cursors();
         if self.pacing.is_some() {
@@ -3915,6 +3918,7 @@ impl Heap {
         let Some(finalize) = self.descs[page.desc.0 as usize].finalize else {
             return;
         };
+        let clock = self.phase_clock();
         let mut finalized = 0u32;
         for word in 0..page.next_unused.div_ceil(64) {
             let used = (page.next_unused - word * 64).min(64);
@@ -3928,18 +3932,28 @@ impl Heap {
             }
         }
         let desc = page.desc.0 as usize;
-        if self.phase_timing && desc < COUNTED_DESCS {
+        if let Some(start) = clock.filter(|_| desc < COUNTED_DESCS) {
             self.stats.last_finalized[desc] += finalized;
+            self.stats.last_finalize_nanos[desc] += start.elapsed().as_nanos() as u64;
         }
     }
 
     /// The first pass's large cells: finalize the newly dead ones among those the collection of
     /// `kind` sweeps (a minor collection's young ones, or all).
-    fn finalize_larges(&self, kind: CollectionKind) {
-        let finalize = |start: usize, large: &LargeObj| {
+    fn finalize_larges(&mut self, kind: CollectionKind) {
+        let timing = self.phase_timing;
+        let mut finalized = [0u32; COUNTED_DESCS];
+        let mut nanos = [0u64; COUNTED_DESCS];
+        let mut finalize = |start: usize, large: &LargeObj| {
             if !large.marked && !large.zombie {
                 if let Some(finalize) = self.descs[large.desc.0 as usize].finalize {
+                    let clock = timing.then(std::time::Instant::now);
                     finalize(start as *mut u8);
+                    let desc = large.desc.0 as usize;
+                    if let Some(start) = clock.filter(|_| desc < COUNTED_DESCS) {
+                        finalized[desc] += 1;
+                        nanos[desc] += start.elapsed().as_nanos() as u64;
+                    }
                 }
             }
         };
@@ -3956,6 +3970,10 @@ impl Heap {
                     finalize(start, large);
                 }
             }
+        }
+        for desc in 0..COUNTED_DESCS {
+            self.stats.last_finalized[desc] += finalized[desc];
+            self.stats.last_finalize_nanos[desc] += nanos[desc];
         }
     }
 
