@@ -2386,17 +2386,6 @@ pub(crate) fn regexp_find_text_shared(
     re.find_at(subject, start, &i.runtime_interrupt)
 }
 
-/// Units `a..b` of a RegExp subject as engine text.
-fn subject_text(subject: &crate::lstr::LStr, a: usize, b: usize) -> String {
-    match subject.units().slice(a, b) {
-        // SAFETY: one-byte units are ASCII.
-        crate::lstr::Units::Ascii(bytes) => {
-            unsafe { std::str::from_utf8_unchecked(bytes) }.to_string()
-        }
-        crate::lstr::Units::Utf16(units) => crate::jstr::from_units(units),
-    }
-}
-
 /// All non-overlapping matches of `re` in `subject`, each as capture spans (unit offsets).
 fn regex_find_all(
     i: &mut Interp,
@@ -2583,11 +2572,12 @@ fn regexp_builtin_exec(
                 set_last(i, end)?;
             }
             update_regexp_legacy_statics(i, &re, &caps, &input);
+            // The match and its captures are slices of the subject, at its width.
             let mut items = Vec::with_capacity(re.ngroups + 1);
-            items.push(Value::lstr(subject_text(&input, start, end)));
+            items.push(Value::Str(input.slice_units(start, end)));
             for g in 1..=re.ngroups {
                 items.push(match caps[g] {
-                    Some((a, b)) => Value::lstr(subject_text(&input, a, b)),
+                    Some((a, b)) => Value::Str(input.slice_units(a, b)),
                     None => Value::Undefined,
                 });
             }
@@ -2670,7 +2660,7 @@ pub(super) fn regexp_groups(
             .iter()
             .filter(|(n, _)| n == name)
             .find_map(|(_, idx)| caps.get(*idx).copied().flatten())
-            .map(|(a, b)| Value::lstr(subject_text(subject, a, b)))
+            .map(|(a, b)| Value::Str(subject.slice_units(a, b)))
             .unwrap_or(Value::Undefined);
         set_data(&g, name, v);
     }
@@ -2960,32 +2950,30 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
         }
     }
     let (caps, input, ctor) = (&m.caps, &m.input, &ctor);
-    let put = |k: &'static str, v: String| {
+    let put = |k: &'static str, v: crate::lstr::LStr| {
         ctor.borrow_mut()
             .internal_slots_mut()
-            .insert(k, Property::data(Value::lstr(v), true, false, false));
+            .insert(k, Property::data(Value::Str(v), true, false, false));
     };
+    // The match, its contexts and captures are slices of the input, at its width.
     let (start, end) = caps[0].unwrap();
-    put("#\u{0}legacy_input", input.to_string());
-    put("#\u{0}legacy_lastMatch", subject_text(input, start, end));
-    put("#\u{0}legacy_leftContext", subject_text(input, 0, start));
+    put("#\u{0}legacy_input", *input);
+    put("#\u{0}legacy_lastMatch", input.slice_units(start, end));
+    put("#\u{0}legacy_leftContext", input.slice_units(0, start));
     put(
         "#\u{0}legacy_rightContext",
-        subject_text(input, end, input.unit_len()),
+        input.slice_units(end, input.unit_len()),
     );
-    let cap_str = |k: usize| {
-        caps.get(k)
-            .copied()
-            .flatten()
-            .map(|(a, b)| subject_text(input, a, b))
-            .unwrap_or_default()
+    let cap_str = |k: usize| match caps.get(k).copied().flatten() {
+        Some((a, b)) => input.slice_units(a, b),
+        None => crate::lstr::LStr::from(""),
     };
     put(
         "#\u{0}legacy_lastParen",
         if m.ngroups >= 1 {
             cap_str(m.ngroups)
         } else {
-            String::new()
+            crate::lstr::LStr::from("")
         },
     );
     const DOLLARS: [&str; 9] = [
@@ -11170,13 +11158,13 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 if a == b && (b == 0 || a >= s.unit_len()) {
                     continue;
                 }
-                parts.push(Value::lstr(subject_text(&s, last, a)));
+                parts.push(Value::Str(s.slice_units(last, a)));
                 if parts.len() >= limit {
                     break;
                 }
                 for g in 1..=re.ngroups {
                     parts.push(match caps[g] {
-                        Some((x, y)) => Value::lstr(subject_text(&s, x, y)),
+                        Some((x, y)) => Value::Str(s.slice_units(x, y)),
                         None => Value::Undefined,
                     });
                     if parts.len() >= limit {
@@ -11186,7 +11174,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 last = b;
             }
             if parts.len() < limit {
-                parts.push(Value::lstr(subject_text(&s, last, s.unit_len())));
+                parts.push(Value::Str(s.slice_units(last, s.unit_len())));
             }
             parts.truncate(limit);
             return Ok(i.make_array(parts));

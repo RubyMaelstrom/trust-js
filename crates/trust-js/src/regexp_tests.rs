@@ -322,6 +322,41 @@ fn regexp_fast_paths_yield_to_observable_lookups() {
     );
 }
 
+/// GetSubstitution and a match's strings read code units: templates and subjects of either
+/// width, astral characters and lone surrogates expand as Node expands them, the generic path
+/// expands every result (a skipped one's named-group getter included), and captures, contexts
+/// and split pieces come straight from two-byte subjects.
+#[test]
+fn substitutions_and_captures_read_code_units() {
+    check(
+        r###"
+        (function () {
+        var r = [];
+        function codes(s) { return Array.prototype.map.call(s, function (c) { return c.charCodeAt(0).toString(16); }).join('.'); }
+        r.push('x\u00e9y\u00e9z'.replace(/\u00e9/g, '[$`|$&|$\']'));
+        r.push(codes('a\ud83d\ude00b'.replace(/(\ud83d\ude00)/u, '\u00e9$1\ud800$$')));
+        r.push('ab-cd'.replace(/(?<x>\w)(\w)/g, '$<x>$2$01$10$<y>$<'));
+        r.push('ab'.replace(/(a)/, '$0$3$9$'));
+        var custom = /./g, calls = 0;
+        custom.exec = function () {
+            if (++calls > 3) return null;
+            var m = ['\u00e9' + calls];
+            m.index = [4, 1, 6][calls - 1];
+            m.groups = { get g() { r.push('get' + calls); return 'G'; } };
+            return m;
+        };
+        r.push('abcdefghij'.replace(custom, '[$&|$`|$\'|$<g>]'));
+        var m = /(\u00e9+)(X)(y*)/.exec('a' + '\u00e9'.repeat(3) + 'Xyy');
+        r.push(m.index + ':' + m.join(',') + ':' + RegExp.$1 + RegExp['$`'] + RegExp["$'"] + RegExp.lastParen);
+        r.push('\u00e91\u00e922'.split(/(\d)/).join('|'));
+        return r.join(';');
+        })()
+        "###,
+        "x[x|é|yéz]y[xéy|é|z]z;61.e9.d83d.de00.d800.24.62;abaa0$<-cdcc0$<;$0$3$9$b;get4;get4;get4;\
+         abcd[é1|abcd|ghij|G][é3|abcdef|ij|G]ij;1:éééXyy,ééé,X,yy:éééayy;é|1|é|2||2|",
+    );
+}
+
 /// A RegExp of the shape RegExpAlloc gave it reads and writes `lastIndex` at its slot when it
 /// holds a plain Number; any other value, a RegExp with another own property and a
 /// non-writable `lastIndex` keep ToLength and [[Set]]. An object of that shape that is no RegExp

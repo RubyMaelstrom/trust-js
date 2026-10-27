@@ -1192,9 +1192,8 @@ fn re_sym_replace_impl(
     if results.is_empty() {
         return Ok(Value::Str(s));
     }
-    let sunits = i.units_full(&s);
-    let size = sunits.len();
-    let mut accumulated = String::new();
+    let size = s.unit_len();
+    let mut accumulated = crate::lstr::Builder::with_capacity(size);
     let mut next_pos = 0usize;
     for result in &results {
         let length_v = ab(i.get_member_key(result, "length"))?;
@@ -1242,21 +1241,26 @@ fn re_sym_replace_impl(
                 cbargs.push(named);
             }
             let r = ab(i.call(repl, Value::Undefined, &cbargs))?;
-            ab(i.to_string(&r))?.to_string()
+            ab(i.to_string(&r))?
         } else {
+            // GetSubstitution runs for every result: a named group's Get and ToString may run
+            // code even where the replacement is not used.
+            let mut expansion = crate::lstr::Builder::with_capacity(repl_str.unit_len());
             get_substitution(
                 i,
-                &matched.text(),
-                &sunits,
+                &mut expansion,
+                matched.units(),
+                &s,
                 position,
                 &captures,
                 &named,
-                &repl_str.text(),
-            )?
+                &repl_str,
+            )?;
+            expansion.finish()
         };
         if position >= next_pos {
-            accumulated.push_str(&crate::jstr::from_units(&sunits[next_pos..position]));
-            accumulated.push_str(&replacement);
+            accumulated.push_units(s.units().slice(next_pos, position));
+            accumulated.push_units(replacement.units());
             // Pathological expansion ($1 of a huge match, repeated) dies as a RangeError.
             if accumulated.len() > MAX_STR_LEN {
                 return Err(i.make_error("RangeError", "Invalid string length"));
@@ -1265,9 +1269,9 @@ fn re_sym_replace_impl(
         }
     }
     if next_pos < size {
-        accumulated.push_str(&crate::jstr::from_units(&sunits[next_pos..]));
+        accumulated.push_units(s.units().slice(next_pos, size));
     }
-    Ok(Value::lstr(accumulated))
+    Ok(Value::Str(accumulated.finish()))
 }
 
 /// RegExp.prototype[@@replace] (ECMA-262 §22.2.6.11) for a regexp whose RegExpExec is the
@@ -1326,17 +1330,13 @@ fn re_sym_replace_direct(
     if matches.is_empty() {
         return Ok(Value::Str(*s));
     }
-    let substitutes = replacer.is_none() && template.text().contains('$');
-    let sunits = if substitutes {
-        i.units_full(s)
-    } else {
-        std::borrow::Cow::Borrowed(&[][..])
-    };
+    let substitutes = replacer.is_none() && template.units().iter().any(|unit| unit == 0x24);
     let mut out = crate::lstr::Builder::with_capacity(s.unit_len());
     let mut next = 0usize;
     for caps in &matches {
         let (start, end) = caps[0].expect("successful regexp match has a span");
         let position = start;
+        // The match and its captures are slices of the subject, at its width.
         let captures = || {
             (1..=re.ngroups)
                 .map(|group| match caps[group] {
@@ -1345,38 +1345,44 @@ fn re_sym_replace_direct(
                 })
                 .collect::<Vec<_>>()
         };
-        let replacement: crate::lstr::LStr = if let Some(function) = replacer {
-            let mut args = Vec::with_capacity(re.ngroups + 4);
-            args.push(Value::Str(s.slice_units(start, end)));
-            args.extend(captures());
-            args.push(Value::Num(position as f64));
-            args.push(Value::Str(*s));
-            let groups = regexp_groups(i, re, caps, s);
-            if !matches!((groups).view(), ValueView::Undefined) {
-                args.push(groups);
+        let replacement = match replacer {
+            Some(function) => {
+                let mut args = Vec::with_capacity(re.ngroups + 4);
+                args.push(Value::Str(s.slice_units(start, end)));
+                args.extend(captures());
+                args.push(Value::Num(position as f64));
+                args.push(Value::Str(*s));
+                let groups = regexp_groups(i, re, caps, s);
+                if !matches!((groups).view(), ValueView::Undefined) {
+                    args.push(groups);
+                }
+                let result = ab(i.call(*function, Value::Undefined, &args))?;
+                Some(ab(i.to_string(&result))?)
             }
-            let result = ab(i.call(*function, Value::Undefined, &args))?;
-            ab(i.to_string(&result))?
-        } else if substitutes {
-            let captures = captures();
-            let named = regexp_groups(i, re, caps, s);
-            let matched = subject_text(s, start, end);
-            get_substitution(
-                i,
-                &matched,
-                &sunits,
-                position,
-                &captures,
-                &named,
-                &template.text(),
-            )?
-            .into()
-        } else {
-            *template
+            None => None,
         };
+        // Matches begin in order, each at or past the previous one's end, and the expansion of
+        // a template, from engine-made captures and groups, runs no code: it is written in place.
         if start >= next {
             out.push_units(s.units().slice(next, start));
-            out.push_units(replacement.units());
+            match replacement {
+                Some(replacement) => out.push_units(replacement.units()),
+                None if substitutes => {
+                    let captures = captures();
+                    let named = regexp_groups(i, re, caps, s);
+                    get_substitution(
+                        i,
+                        &mut out,
+                        s.units().slice(start, end),
+                        s,
+                        position,
+                        &captures,
+                        &named,
+                        template,
+                    )?;
+                }
+                None => out.push_units(template.units()),
+            }
             // Pathological expansion ($1 of a huge match, repeated) dies as a RangeError.
             if out.len() > MAX_STR_LEN {
                 return Err(i.make_error("RangeError", "Invalid string length"));
@@ -1388,99 +1394,105 @@ fn re_sym_replace_direct(
     Ok(Value::Str(out.finish()))
 }
 
-/// GetSubstitution: expand a `$`-template against a match. `captures` are already `Value::Str` /
-/// `Value::Undefined`; `named` is the match's `groups` object (or `undefined`).
+/// GetSubstitution (ECMA-262 §22.1.3.19.1): append to `out` the expansion of `template`'s `$`
+/// patterns for the match `matched` at unit `position` of `subject`, as code units. `captures`
+/// are already `Value::Str` / `Value::Undefined`; `named` is the match's `groups` object (or
+/// `undefined`).
+#[allow(clippy::too_many_arguments)]
 fn get_substitution(
     i: &mut Interp,
-    matched: &str,
-    sunits: &[u16],
+    out: &mut crate::lstr::Builder,
+    matched: crate::lstr::Units<'_>,
+    subject: &crate::lstr::LStr,
     position: usize,
     captures: &[Value],
     named: &Value,
-    template: &str,
-) -> Result<String, Value> {
-    let tail = (position + crate::jstr::unit_len(matched)).min(sunits.len());
-    let push_cap = |out: &mut String, cap: &Value| {
-        if let ValueView::Str(s) = (cap).view() {
-            out.push_str(&s.text());
+    template: &crate::lstr::LStr,
+) -> Result<(), Value> {
+    let size = subject.unit_len();
+    let position = position.min(size);
+    let tail = (position + matched.len()).min(size);
+    let push_capture = |out: &mut crate::lstr::Builder, capture: &Value| {
+        if let ValueView::Str(capture) = capture.view() {
+            out.push_units(capture.units());
         }
     };
-    let t: Vec<char> = template.chars().collect();
-    let mut out = String::new();
+    let t = template.units();
+    let unit = |k: usize| t.get(k).unwrap_or(0);
+    let digit = |k: usize| {
+        t.get(k)
+            .filter(|unit| (0x30..=0x39).contains(unit))
+            .map(|unit| usize::from(unit - 0x30))
+    };
+    let start = out.len();
     let mut k = 0;
     while k < t.len() {
         // A pathological template ($1 of a megabyte match, tens of thousands of times) must die
         // as a RangeError before it exhausts memory.
-        if out.len() > MAX_STR_LEN {
+        if out.len() - start > MAX_STR_LEN {
             return Err(i.make_error("RangeError", "Invalid string length"));
         }
-        if t[k] != '$' || k + 1 >= t.len() {
-            out.push(t[k]);
+        if unit(k) != 0x24 || k + 1 >= t.len() {
+            out.push_unit(unit(k));
             k += 1;
             continue;
         }
-        match t[k + 1] {
-            '$' => {
-                out.push('$');
+        match unit(k + 1) {
+            0x24 => {
+                out.push_ascii(b'$');
                 k += 2;
             }
-            '&' => {
-                out.push_str(matched);
+            0x26 => {
+                out.push_units(matched);
                 k += 2;
             }
-            '`' => {
-                out.push_str(&crate::jstr::from_units(
-                    &sunits[..position.min(sunits.len())],
-                ));
+            0x60 => {
+                out.push_units(subject.units().slice(0, position));
                 k += 2;
             }
-            '\'' => {
-                out.push_str(&crate::jstr::from_units(&sunits[tail..]));
+            0x27 => {
+                out.push_units(subject.units().slice(tail, size));
                 k += 2;
             }
-            '<' if !matches!(&(named).view(), ValueView::Undefined) => {
-                if let Some(rel) = t[k + 2..].iter().position(|&c| c == '>') {
-                    let name: String = t[k + 2..k + 2 + rel].iter().collect();
+            0x3c if !matches!(named.view(), ValueView::Undefined) => {
+                if let Some(close) = (k + 2..t.len()).find(|&at| unit(at) == 0x3e) {
+                    let name = crate::jstr::from_units(&t.slice(k + 2, close).to_utf16());
                     let v = ab(i.get_member_key(named, &name))?;
                     if !matches!((v).view(), ValueView::Undefined) {
-                        out.push_str(&ab(i.to_string(&v))?.text());
+                        out.push_units(ab(i.to_string(&v))?.units());
                     }
-                    k = k + 2 + rel + 1;
+                    k = close + 1;
                 } else {
-                    out.push('$');
+                    out.push_ascii(b'$');
                     k += 1;
                 }
             }
-            d if d.is_ascii_digit() => {
-                let one = d.to_digit(10).unwrap() as usize;
-                let two = if k + 2 < t.len() && t[k + 2].is_ascii_digit() {
-                    Some(one * 10 + t[k + 2].to_digit(10).unwrap() as usize)
-                } else {
-                    None
-                };
-                // Prefer a two-digit group reference when it is in range.
-                if let Some(tw) = two {
-                    if tw >= 1 && tw <= captures.len() {
-                        push_cap(&mut out, &captures[tw - 1]);
-                        k += 3;
-                        continue;
+            _ => match digit(k + 1) {
+                Some(one) => {
+                    // Prefer a two-digit group reference when it is in range.
+                    if let Some(two) = digit(k + 2).map(|second| one * 10 + second) {
+                        if two >= 1 && two <= captures.len() {
+                            push_capture(out, &captures[two - 1]);
+                            k += 3;
+                            continue;
+                        }
+                    }
+                    if one >= 1 && one <= captures.len() {
+                        push_capture(out, &captures[one - 1]);
+                        k += 2;
+                    } else {
+                        out.push_ascii(b'$');
+                        k += 1;
                     }
                 }
-                if one >= 1 && one <= captures.len() {
-                    push_cap(&mut out, &captures[one - 1]);
-                    k += 2;
-                } else {
-                    out.push('$');
+                None => {
+                    out.push_ascii(b'$');
                     k += 1;
                 }
-            }
-            _ => {
-                out.push('$');
-                k += 1;
-            }
+            },
         }
     }
-    Ok(out)
+    Ok(())
 }
 /// The running realm's %RegExp%: the default constructor that RegExp.prototype[@@split] and
 /// [@@matchAll] pass to SpeciesConstructor (ECMA-262 §22.2.6.14 step 4, §22.2.6.9 step 4). It is
@@ -1709,9 +1721,8 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     if let Some(result) = re_sym_split_direct(i, &this, &s, &arg(a, 1)) {
         return result;
     }
-    // All positions are UTF-16 unit offsets.
-    let sunits: Vec<u16> = s.units().to_utf16().into_owned();
-    let size = sunits.len();
+    // All positions are UTF-16 unit offsets; the pieces are slices of the subject.
+    let size = s.unit_len();
     // SpeciesConstructor(rx, %RegExp%), then a sticky-flagged splitter constructed from it.
     let default_ctor = regexp_intrinsic(i);
     let c = species_constructor(i, &this, &default_ctor)?;
@@ -1763,7 +1774,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
             q = advance_string_index(q, &s, unicode);
             continue;
         }
-        out.push(Value::lstr(crate::jstr::from_units(&sunits[p..q])));
+        out.push(Value::Str(s.slice_units(p, q)));
         if out.len() == limit {
             return Ok(i.make_array(out.into_vec()));
         }
@@ -1779,6 +1790,6 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         }
         q = p;
     }
-    out.push(Value::lstr(crate::jstr::from_units(&sunits[p..size])));
+    out.push(Value::Str(s.slice_units(p, size)));
     Ok(i.make_array(out.into_vec()))
 }
