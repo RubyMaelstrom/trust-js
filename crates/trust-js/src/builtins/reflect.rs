@@ -7,13 +7,27 @@ pub(super) fn install_reflect(it: &mut Interp) {
     let r = it.new_object();
     it.def_method(&r, "get", 2, |i, _t, a| {
         let target = arg(a, 0);
-        if !matches!((target).view(), ValueView::Obj(_)) {
+        let ValueView::Obj(object) = target.view() else {
             return Err(i.make_error("TypeError", "Reflect.get called on non-object"));
-        }
-        let key = ab(i.to_property_key(&arg(a, 1)))?;
+        };
         // Reflect.get(target, key, receiver) — the receiver is the third argument.
         let receiver = if a.len() > 2 { arg(a, 2) } else { target };
-        reflect_ordinary_get(i, &target, &key, &receiver)
+        let key = arg(a, 1);
+        match key.view() {
+            // ToPropertyKey of a String is itself: an ordinary chain answers through the property
+            // ICs, by the key's atom, as `object[key]` would.
+            ValueView::Str(name) => {
+                let text = crate::value::encode_lstr_key(&name);
+                if let Some(result) = i.get_named_cached(&object, &text, &receiver) {
+                    return ab(result);
+                }
+                reflect_ordinary_get(i, &target, &text, &receiver)
+            }
+            _ => {
+                let text = property_key_text(i, &key)?;
+                reflect_ordinary_get(i, &target, &text, &receiver)
+            }
+        }
     });
     it.def_method(&r, "set", 3, |i, _t, a| {
         let target = arg(a, 0);
@@ -213,6 +227,38 @@ pub(super) fn install_reflect(it: &mut Interp) {
     });
     set_to_string_tag(it, &r, "Reflect");
     set_builtin(&it.global, "Reflect", Value::Obj(r));
+}
+
+/// ToPropertyKey(key) (ECMA-262 §7.1.19) as engine key text, for a key other than a String
+/// (whose text is its own): a Symbol's encoded key and an integral Number's decimal text are
+/// written without allocating, as neither conversion runs code; any other key is converted.
+/// The key value keeps a Symbol alive while its text is used.
+enum PropertyKeyText {
+    Written(crate::value::KeyText),
+    Converted(crate::value::PropertyKey),
+}
+
+impl std::ops::Deref for PropertyKeyText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            PropertyKeyText::Written(text) => text.as_str(),
+            PropertyKeyText::Converted(key) => key,
+        }
+    }
+}
+
+fn property_key_text(i: &mut Interp, key: &Value) -> Result<PropertyKeyText, Value> {
+    let written = match key.view() {
+        ValueView::Sym(symbol) => Some(crate::value::KeyText::symbol(symbol.id)),
+        ValueView::Num(n) => crate::value::KeyText::integer(n),
+        _ => None,
+    };
+    match written {
+        Some(text) => Ok(PropertyKeyText::Written(text)),
+        None => Ok(PropertyKeyText::Converted(ab(i.to_property_key(key))?)),
+    }
 }
 
 /// `Reflect.apply` (named so the JIT call cache can prove and tag its exact identity).

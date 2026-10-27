@@ -8936,6 +8936,61 @@ impl Interp {
         self.get_member_key(base, &text)
     }
 
+    /// [[Get]](P, Receiver) of `object` for a String key P whose engine text is `name`, resolved
+    /// as a named read's helper resolves it when every object on the chain is one the property
+    /// ICs read: the key's atom (text with none names no property) probes the megamorphic stub
+    /// cache, and a miss re-derives the read along the chain and fills it. A getter is called
+    /// on `receiver`. `None` declines, having run no code, for an exotic or side-table object on
+    /// the chain or a name the ICs leave to the general [[Get]] (index-like or NUL-led text,
+    /// `length`, `description`); the caller then runs that [[Get]].
+    pub(crate) fn get_named_cached(
+        &mut self,
+        object: &Gc,
+        name: &str,
+        receiver: &Value,
+    ) -> Option<Result<Value, Abrupt>> {
+        if name.len() > COMPUTED_STUB_KEY_MAX_BYTES
+            || name == "length"
+            || name == "description"
+            || name
+                .as_bytes()
+                .first()
+                .is_some_and(|&byte| byte == 0 || byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let key = crate::atom::PropKey::lookup_text(name);
+        let read = self.ic_read_by_key(object, name, key)?;
+        Some(self.finish_cached_get(read, receiver, None))
+    }
+
+    /// The property ICs' resolution of the read of `key`, whose text is `name`, on `object`'s
+    /// chain (see [`Interp::get_named_cached`]): the stub cache's entry for the receiver's
+    /// shape, else a re-derivation that fills it. `None` for text with no atom proves the
+    /// read absent along a chain of ordinary objects.
+    fn ic_read_by_key(
+        &self,
+        object: &Gc,
+        name: &str,
+        key: Option<crate::atom::PropKey>,
+    ) -> Option<CachedGet> {
+        if let Some(key) = key {
+            let shape = object.borrow().props.shape();
+            if let Some(entry) = self.stub_cache_get(shape, key) {
+                if entry.st.recv_shape == shape {
+                    if let Some(read) =
+                        self.ic_shape_probe(Gc::as_ptr(object), name, Some(key), entry.st)
+                    {
+                        return Some(read);
+                    }
+                }
+            }
+        }
+        let scratch = [const { std::cell::Cell::new(crate::bytecode::IcState::EMPTY) };
+            crate::bytecode::PROP_IC_WAYS];
+        self.ic_get_rederive(object, name, key, &scratch[0], key.is_some())
+    }
+
     fn get_prop_ic_impl(
         &mut self,
         base: &Value,
