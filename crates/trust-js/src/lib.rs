@@ -52,6 +52,7 @@ mod array_binding;
 #[cfg(test)]
 mod array_binding_tests;
 mod ast;
+mod atom;
 mod atomic_compat;
 mod bigint;
 #[cfg(test)]

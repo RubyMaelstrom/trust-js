@@ -2930,6 +2930,8 @@ pub(crate) struct GcState {
     /// This heap's interned one-unit ASCII and small array-index strings (`jstr::unit_lstr`,
     /// `jstr::index_lstr`), roots for the heap's lifetime.
     pub(crate) interned_strings: RefCell<Vec<Option<crate::lstr::LStr>>>,
+    /// This heap's atoms, roots for the heap's lifetime (see [`crate::atom`]).
+    pub(crate) atoms: RefCell<crate::atom::AtomTable>,
     /// Actual AST template and compiled chunk owners, weakly registered in their heap. Their
     /// constants and layouts are roots for the Rust owner's lifetime, including late fields.
     pub(crate) code_roots: RefCell<Vec<std::rc::Weak<dyn crate::gc_trace::GcTrace>>>,
@@ -3319,6 +3321,9 @@ fn trace_fixed_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink
     trace_fixed_heap_roots_but_shapes(heap, sink);
     use crate::gc_trace::GcTrace;
     heap.shapes.borrow().layouts.trace_gc(sink);
+    for atom in heap.atoms.borrow().atoms() {
+        sink.word(atom.cell_word());
+    }
 }
 
 /// The heap's roots other than its code roots and its shape directory's layouts.
@@ -3353,8 +3358,10 @@ pub(crate) fn trace_heap_roots_for(
     kind: crate::gc_core::CollectionKind,
 ) {
     trace_fixed_heap_roots_but_shapes(heap, sink);
-    // A minor collection traces the layouts the directory took since the last collection.
+    // A minor collection traces the layouts the directory took since the last collection, and
+    // the atoms made since.
     heap.shapes.borrow().layouts.trace_roots(kind, sink);
+    heap.atoms.borrow_mut().trace_roots(kind, sink);
     let young_roots = std::mem::take(&mut *heap.young_code_roots.borrow_mut());
     let young_words = std::mem::take(&mut *heap.young_code_words.borrow_mut());
     match kind {
@@ -4510,6 +4517,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         lazy_proto_desc: descs.lazy_proto,
         property_layout_desc: descs.property_layout,
         interned_strings: RefCell::default(),
+        atoms: RefCell::default(),
         code_roots: RefCell::default(),
         young_code_roots: RefCell::default(),
         young_code_words: RefCell::default(),

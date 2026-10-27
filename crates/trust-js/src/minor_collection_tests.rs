@@ -452,3 +452,39 @@ fn a_minor_collection_drops_a_young_unreachable_shadow_realm_with_its_caches() {
         }
     }
 }
+
+/// The atom table is its atoms' only root, for the heap's whole life: a minor collection marks
+/// the atoms made since the last one, the older ones being old cells, and a major collection
+/// marks them all. Their words are kept where the stack scan cannot see them, and heap
+/// verification checks the table after each minor collection.
+#[test]
+fn atoms_live_as_long_as_their_heap() {
+    use crate::lstr::Units;
+    let mut engine = engine(Tier::Interp);
+    let heap = engine.interp.gc_heap.clone();
+    heap.core.borrow_mut().set_heap_verification(true);
+    let text = |n: usize| format!("atom{n}");
+    let atomize = |from: usize| -> Box<Vec<u64>> {
+        let mut atoms = heap.atoms.borrow_mut();
+        Box::new(
+            (from..from + 100)
+                .map(|n| atoms.atomize(Units::Ascii(text(n).as_bytes())).cell_word())
+                .collect(),
+        )
+    };
+    let first = atomize(0);
+    engine.interp.gc_collect_minor();
+    let second = atomize(100);
+    engine.interp.gc_collect_minor();
+    engine.interp.gc_collect();
+    engine.interp.gc_collect_minor();
+    let core = heap.core.borrow();
+    let atoms = heap.atoms.borrow();
+    for (n, &word) in first.iter().chain(second.iter()).enumerate() {
+        assert_eq!(core.cell_age(word), Some(crate::gc_core::CellAge::Old));
+        let atom = atoms
+            .lookup(Units::Ascii(text(n).as_bytes()))
+            .expect("kept");
+        assert!(atom.cell_word() == word && atom.as_lstr() == *text(n).as_str());
+    }
+}

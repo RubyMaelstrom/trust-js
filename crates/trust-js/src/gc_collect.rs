@@ -1221,7 +1221,7 @@ impl Interp {
                 CollectionKind::Major => String::new(),
             };
             eprintln!(
-                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor} external={} budget={} us: mark={:.0} sweep={:.0} engine={:.0}{phases}{steps}{finalized}",
+                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor} external={} budget={} atoms={} atom_bytes={} us: mark={:.0} sweep={:.0} engine={:.0}{phases}{steps}{finalized}",
                 match kind {
                     CollectionKind::Minor => "minor",
                     CollectionKind::Major => "major",
@@ -1234,6 +1234,8 @@ impl Interp {
                 stats.deferred_collections,
                 stats.external_bytes,
                 stats.trigger_bytes,
+                heap.atoms.borrow().len(),
+                heap.atoms.borrow().heap_bytes(),
                 micros(mark_nanos),
                 micros(sweep_nanos),
                 micros((mark_nanos + sweep_nanos).saturating_sub(core_nanos)),
@@ -1304,6 +1306,7 @@ impl Interp {
             let core = heap.core.borrow();
             crate::value::check_code_roots_marked(heap, &core);
             crate::value::check_shape_layouts_marked(heap, &core);
+            heap.atoms.borrow().check_marked(&core);
             // An interpreter whose roots the marking did not trace is a ShadowRealm's that
             // died young: the sweep drops it, caches and all, before it frees a cell.
             let traced = marking.traced.borrow();

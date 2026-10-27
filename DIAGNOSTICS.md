@@ -186,12 +186,13 @@ comment/example in the same change.
   kept (or, if weak, nothing), and a panic `handle table of heap …` names the entry and the
   cell. After marking, every edge of a marked cell must name a marked cell
   (`heap verifier: …`), and after a minor collection's marking the engine's caches and code
-  roots must hold no unmarked young cell.
+  roots and the atom table must hold no unmarked young cell.
 - `TRUST_JS_GC_LOG=1` lines name each collection's kind and report live cells, live bytes,
   small-cell pages (64 KiB each) and released pages kept for reuse (`spare`) after it, the
   heap's collections so far, those that were due but postponed (`deferred`), the bytes its
-  cells own outside it, not yet released (`external`), and the byte budget, which each major
-  collection sets (`budget`); a minor collection's line adds
+  cells own outside it, not yet released (`external`), the byte budget, which each major
+  collection sets (`budget`), and the heap's atoms, static names included, with the bytes of
+  its own (`atoms`, `atom_bytes`); a minor collection's line adds
   the young pages it swept, the old cells it traced because their cards were set
   (`card_cells`) and the bytes it promoted. `TRUST_JS_GC_CENSUS=1`
   adds a `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the

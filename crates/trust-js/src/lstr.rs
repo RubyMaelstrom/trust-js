@@ -170,10 +170,24 @@ impl<'a> Units<'a> {
     }
 
     /// Whether every unit is ASCII.
-    fn is_ascii(&self) -> bool {
+    pub(crate) fn is_ascii(&self) -> bool {
         match self {
             Units::Ascii(_) => true,
             Units::Utf16(units) => units.iter().all(|&unit| unit < 0x80),
+        }
+    }
+
+    /// Whether `self` and `other` are the same code units, whatever their widths.
+    pub(crate) fn same_units(&self, other: &Units<'_>) -> bool {
+        match (*self, *other) {
+            (Units::Ascii(a), Units::Ascii(b)) => a == b,
+            (Units::Utf16(a), Units::Utf16(b)) => a == b,
+            (Units::Ascii(a), Units::Utf16(b)) | (Units::Utf16(b), Units::Ascii(a)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(&byte, &unit)| u16::from(byte) == unit)
+            }
         }
     }
 }
@@ -280,6 +294,50 @@ impl LStr {
         }
         s.set_fresh_len(units.len());
         s
+    }
+
+    /// An exact-size flat string of `units`, at the narrowest width that holds them: nothing
+    /// is ever written past its units (see [`LStr::is_exact`]).
+    pub(crate) fn exact(units: Units<'_>) -> LStr {
+        LStr::from_units_at_width(units)
+    }
+
+    /// Whether this is a flat buffer with no room past its units, which no append writes into,
+    /// stored at the narrowest width that holds them.
+    pub(crate) fn is_exact(&self) -> bool {
+        self.view().is_none()
+            && (self.hdr().cap.get() & CAP_BITS) as usize == self.raw_len()
+            && !(self.is_two_byte() && self.units().is_ascii())
+    }
+
+    /// The bytes an exact one-byte string of `len` units takes.
+    pub(crate) const fn exact_ascii_size(len: usize) -> usize {
+        HDR + len
+    }
+
+    /// An exact one-byte string of `text` (ASCII) written at `cell`, outside every heap.
+    ///
+    /// # Safety
+    /// `cell` is aligned for a string header, valid for [`LStr::exact_ascii_size`] bytes and
+    /// never written or freed while the string is in use.
+    pub(crate) unsafe fn write_exact_ascii(cell: NonNull<u8>, text: &[u8]) -> LStr {
+        debug_assert!(text.is_ascii() && text.len() <= MAX_LEN);
+        let header = cell.cast::<Header>();
+        header.as_ptr().write(Header {
+            frontier: Cell::new(text.len()),
+            len: Cell::new(text.len() as u32),
+            cap: Cell::new(text.len() as u32 | ASCII_HINT),
+        });
+        std::ptr::copy_nonoverlapping(text.as_ptr(), cell.as_ptr().add(HDR), text.len());
+        LStr { p: header }
+    }
+
+    /// The string whose cell is at `cell`.
+    ///
+    /// # Safety
+    /// `cell` addresses an initialized string cell that outlives the handle.
+    pub(crate) unsafe fn from_cell(cell: NonNull<u8>) -> LStr {
+        LStr { p: cell.cast() }
     }
 
     /// The string of these ASCII bytes.
