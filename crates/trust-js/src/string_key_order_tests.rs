@@ -1,6 +1,6 @@
 //! ECMA-262 editor's draft e28783d5, spec.html: CanonicalNumericIndexString 5787,
 //! IsLessThan 6085, StringGetOwnProperty 14889, StringToCodePoints 16749, SV 17829,
-//! CompareArrayElements 41667.
+//! String.raw 36175, CompareArrayElements 41667.
 
 use crate::bytecode::Tier;
 use crate::value::Value;
@@ -218,3 +218,19 @@ fn literal_keys_rejoin_surrogate_pairs_split_in_source() {
     );
 }
 
+#[test]
+fn string_raw_converts_raw_with_to_object() {
+    // A string `raw` is boxed: its code units are the segments, a pair's halves apart.
+    check(
+        r#"
+        var raw=[];
+        for(var r of ['abc','a\ud83d\ude00b','',7,true]){
+            raw.push(JSON.stringify(String.raw({raw:r},'-','+')));
+        }
+        try{String.raw({raw:undefined});}catch(e){raw.push(e.constructor.name);}
+        try{String.raw();}catch(e){raw.push(e.constructor.name);}
+        raw.join('|')
+        "#,
+        r#""a-b+c"|"a-\ud83d+\ude00b"|""|""|""|TypeError|TypeError"#,
+    );
+}

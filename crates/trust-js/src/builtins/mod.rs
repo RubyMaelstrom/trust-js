@@ -12199,24 +12199,25 @@ fn install_string(it: &mut Interp) {
         .insert("constructor", Property::builtin(Value::Obj(ctor)));
     it.def_method(&ctor, "fromCharCode", 1, nf_from_char_code);
     it.def_method(&ctor, "raw", 1, |i, _this, args| {
-        let template = arg(args, 0);
-        let raw = ab(i.get_member_key(&template, "raw"))?;
-        let raw_obj =
-            this_obj(&raw).ok_or_else(|| i.make_error("TypeError", "raw is not an object"))?;
-        let len = ab(i.to_length(&raw_obj))?;
-        let mut out = String::new();
+        // The template and its `raw` go through ToObject, so a string's code units are the
+        // segments.
+        let cooked = to_object_arg(i, arg(args, 0), "String.raw")?;
+        let raw = ab(i.get_member_key(&Value::Obj(cooked), "raw"))?;
+        let literals = to_object_arg(i, raw, "String.raw")?;
+        let len = ab(i.to_length(&literals))?;
+        let mut out = crate::lstr::LStr::from("");
         for k in 0..len {
-            let seg = ab(i.get_member_key(&raw, &k.to_string()))?;
+            let seg = ab(i.get_member_key(&Value::Obj(literals), &k.to_string()))?;
             let piece = ab(i.to_string(&seg))?;
-            push_str_checked(i, &mut out, &piece.text())?;
+            append_checked(i, &mut out, &piece)?;
             if k + 1 < len {
                 if let Some(sub) = args.get(k + 1) {
                     let piece = ab(i.to_string(sub))?;
-                    push_str_checked(i, &mut out, &piece.text())?;
+                    append_checked(i, &mut out, &piece)?;
                 }
             }
         }
-        Ok(Value::lstr(out))
+        Ok(Value::Str(out))
     });
     it.def_method(&ctor, "fromCodePoint", 1, |i, _this, args| {
         let mut s = String::new();
