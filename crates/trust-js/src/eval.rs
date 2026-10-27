@@ -6551,11 +6551,15 @@ impl Interp {
             ClassInfo {
                 fields,
                 field_env: inst_env,
-                derived,
                 instance_initializers: instance_inits.into_vec(),
                 private_members,
             },
         );
+        ctor_obj.borrow_mut().class_kind = if derived {
+            crate::value::CLASS_DERIVED
+        } else {
+            crate::value::CLASS_BASE
+        };
 
         // Borrow each record without detaching the backing list: both the current key and
         // the remaining static records stay traced through initializer/decorator callbacks.
@@ -6959,12 +6963,9 @@ impl Interp {
             let nt = self.constructor_new_target();
             return self.construct_nt(*ctor, args, nt);
         }
-        let is_class = self.class_info.contains_key(&ptr);
-        let derived = self
-            .class_info
-            .get(&ptr)
-            .map(|i| i.derived)
-            .unwrap_or(false);
+        let class_kind = obj.borrow().class_kind;
+        let is_class = class_kind != 0;
+        let derived = class_kind == crate::value::CLASS_DERIVED;
         let call = obj.borrow().call.clone();
         match call {
             // A bound-function parent constructs through its target with the bound arguments

@@ -4416,8 +4416,6 @@ pub struct ClassInfo {
     pub fields: Rc<[FieldInit]>,
     /// The environment field initializers evaluate in (carries the class's super bindings).
     pub field_env: Env,
-    /// True if the class has an `extends` clause (derived: `this` is set up by `super()`).
-    pub derived: bool,
     /// Instance initializers registered by decorators via `context.addInitializer`, run on each new
     /// instance after its fields are set, with `this` = the instance.
     pub instance_initializers: Vec<Value>,
@@ -12634,9 +12632,7 @@ impl Interp {
             Callable::User(user) => {
                 // A class constructor cannot be [[Call]]ed. (Empty-map guard: this runs on every
                 // single call, and most programs define no classes.)
-                if !self.class_info.is_empty()
-                    && self.class_info.contains_key(&(Gc::as_ptr(&obj) as usize))
-                {
+                if obj.borrow().class_kind != 0 {
                     return Err(self.throw(
                         "TypeError",
                         "Class constructor cannot be invoked without 'new'",
@@ -13628,8 +13624,9 @@ impl Interp {
                     }
                     _ => return CachedCall::Miss,
                 };
+                let class_constructor = object.class_kind != 0;
                 drop(object);
-                if !self.class_info.is_empty() && self.class_info.contains_key(&key) {
+                if class_constructor {
                     return CachedCall::Miss;
                 }
                 let mut found = None;
@@ -14228,7 +14225,6 @@ impl Interp {
         let ValueView::Obj(apply_obj) = &(apply).view() else {
             return None;
         };
-        let initializer_ptr = Gc::as_ptr(initializer_obj) as usize;
         let apply_ptr = Gc::as_ptr(apply_obj) as usize;
 
         // A large family of Prototype.js-era constructors forwards directly into a tiny
@@ -14255,15 +14251,11 @@ impl Interp {
                 ) {
                     return None;
                 }
-                let key = initializer_ptr;
                 let callable = initializer_obj.borrow();
                 let Callable::User(user) = &callable.call else {
                     return None;
                 };
-                if user.func.is_arrow
-                    || user.env.borrow().under_with
-                    || (!self.class_info.is_empty() && self.class_info.contains_key(&key))
-                {
+                if user.func.is_arrow || user.env.borrow().under_with || callable.class_kind != 0 {
                     None
                 } else {
                     let same_realm = user.realm == Gc::as_ptr(&self.global) as usize;
@@ -14822,6 +14814,7 @@ impl Interp {
             }
             _ => return None,
         };
+        let class_constructor = object.class_kind != 0;
         drop(object);
         if func.is_arrow || func.is_method || func.is_generator || func.is_async {
             return None;
@@ -14829,7 +14822,7 @@ impl Interp {
         if env.borrow().under_with {
             return None;
         }
-        if !self.class_info.is_empty() && self.class_info.contains_key(&key) {
+        if class_constructor {
             return None;
         }
         let (prototype_shape, prototype_slot) = {
@@ -14972,7 +14965,7 @@ impl Interp {
         if realm != Gc::as_ptr(&self.global) as usize {
             return None;
         }
-        if !self.class_info.is_empty() && self.class_info.contains_key(&(Gc::as_ptr(o) as usize)) {
+        if o.borrow().class_kind != 0 {
             return None;
         }
         // Not yet tiered / didn't compile / no machine code → generic (which counts calls up).
@@ -15179,11 +15172,8 @@ impl Interp {
         // so legacy `f.arguments` reflection during an active VM frame reads null (the VM's
         // slot-based locals never aliased it faithfully anyway).
         let allow_compiled_body = !closure.borrow().under_with;
-        let derived_class_construct = is_construct
-            && self
-                .class_info
-                .get(&(Gc::as_ptr(fn_obj) as usize))
-                .is_some_and(|class| class.derived);
+        let derived_class_construct =
+            is_construct && fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
         if !matches!(self.tier, crate::bytecode::Tier::Interp)
             && !func.is_generator
             && !func.is_async
@@ -15327,13 +15317,9 @@ impl Interp {
             // `super.x` resolves its receiver through it, and a constructor's non-object return
             // reads the *current* binding back out of the scope. Otherwise it exists only for
             // bodies that can name `this`.
-            let is_class_fn = self.class_info.contains_key(&(Gc::as_ptr(fn_obj) as usize));
-            let derived_tdz = is_construct
-                && self
-                    .class_info
-                    .get(&(Gc::as_ptr(fn_obj) as usize))
-                    .map(|ci| ci.derived)
-                    .unwrap_or(false);
+            let class_kind = fn_obj.borrow().class_kind;
+            let is_class_fn = class_kind != 0;
+            let derived_tdz = is_construct && class_kind == crate::value::CLASS_DERIVED;
             if scan & crate::ast::SCAN_THIS != 0 || func.is_method || is_class_fn || is_construct {
                 // Strict: pass through. Sloppy: undefined/null → global; primitive → box.
                 let this_val = if func.is_strict || is_construct {
@@ -15381,7 +15367,7 @@ impl Interp {
             }
             // Methods and class constructors may reference `super.x` — including from a direct
             // eval in a nested arrow, which resolves this marker lexically long after the call.
-            if func.is_method || self.class_info.contains_key(&(Gc::as_ptr(fn_obj) as usize)) {
+            if func.is_method || fn_obj.borrow().class_kind != 0 {
                 scope.borrow_mut().vars.insert(
                     crate::atom::names::SUPER_PROP_OK.atom(),
                     Binding::data(Value::Bool(true), false, true),
@@ -15537,11 +15523,7 @@ impl Interp {
         // and its `this` must have been initialized by super() (ReferenceError otherwise); both
         // errors are created in the caller's realm (the callee context has conceptually popped).
         if is_construct && !func.is_arrow {
-            let derived = self
-                .class_info
-                .get(&(Gc::as_ptr(fn_obj) as usize))
-                .map(|c| c.derived)
-                .unwrap_or(false);
+            let derived = fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
             if let Ok(v) = &result {
                 if !matches!((v).view(), ValueView::Obj(_)) {
                     if derived && !matches!((v).view(), ValueView::Undefined | ValueView::Empty) {
@@ -16232,15 +16214,11 @@ impl Interp {
                 {
                     return Err(self.throw("TypeError", "this function is not a constructor"));
                 }
-                let ctor_key = Gc::as_ptr(&obj) as usize;
                 // ECMA-262 §10.2.2 [[Construct]] step 3 allocates only for a base constructor. A
                 // derived constructor's `this` is bound by super(), whose base constructor reads
                 // new.target's `prototype` exactly once for the whole chain.
-                if self
-                    .class_info
-                    .get(&ctor_key)
-                    .is_some_and(|class| class.derived)
-                {
+                let class_kind = obj.borrow().class_kind;
+                if class_kind == crate::value::CLASS_DERIVED {
                     if user.func.default_ctor {
                         return self.construct_default_derived(&obj, args, new_target);
                     }
@@ -16273,7 +16251,7 @@ impl Interp {
                 self.pending_new_target = new_target;
                 // Base class constructors run their field initializers before the body; plain
                 // function constructors just run their body.
-                let ret = if self.class_info.contains_key(&ctor_key) {
+                let ret = if class_kind != 0 {
                     self.run_constructor_on(&callee, &this_val, args)?
                 } else {
                     self.call_user(&user.func, user.env, this_val, args, true, &obj)?

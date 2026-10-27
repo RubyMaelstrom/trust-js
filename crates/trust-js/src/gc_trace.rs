@@ -622,7 +622,6 @@ impl GcTrace for crate::interpreter::ClassInfo {
         let crate::interpreter::ClassInfo {
             fields,
             field_env,
-            derived: _,
             instance_initializers,
             private_members,
         } = self;

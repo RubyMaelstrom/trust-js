@@ -2668,7 +2668,17 @@ pub(crate) struct Object {
     /// and for bound functions and callable proxies whose target was one. A native with an own
     /// data `prototype` is a constructor too (`Interp::value_is_constructor`).
     pub(crate) is_constructor: bool,
+    /// A class constructor's kind ([`CLASS_BASE`] or [`CLASS_DERIVED`]; 0 for every other
+    /// object), set as the class is defined: calls refuse a class constructor, and construction
+    /// treats a derived class's specially, by this byte rather than a probe of the class side
+    /// table (`Interp::class_info`), which keeps the class's elements.
+    pub(crate) class_kind: u8,
 }
+
+/// [`Object::class_kind`] of a base class's constructor.
+pub(crate) const CLASS_BASE: u8 = 1;
+/// [`Object::class_kind`] of a derived class's constructor (`class C extends B`).
+pub(crate) const CLASS_DERIVED: u8 = 2;
 
 // An object cell owns nothing to release: its Rust-heap payloads (a Map's tables, a bound
 // function's arguments, an error's stack trace, a map's hash index...) sit in payload cells of
@@ -2763,6 +2773,7 @@ impl Object {
                     ic_plain: Cell::new(true),
                     native_typed_array: None,
                     is_constructor: false,
+                    class_kind: 0,
                 }),
             );
             #[cfg(feature = "architecture-diagnostics")]
@@ -3758,6 +3769,7 @@ impl Object {
             ic_plain: _,
             native_typed_array,
             is_constructor: _,
+            class_kind: _,
         } = self;
         if let Some(proto) = proto {
             sink.object(proto);

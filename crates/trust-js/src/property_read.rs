@@ -457,7 +457,7 @@ impl Interp {
             chunk.clone()
         };
         if !self.ordinary_get_ptr(crate::value::Gc::as_ptr(&receiver) as usize)
-            || (!self.class_info.is_empty() && self.class_info.contains_key(&key))
+            || getter.borrow().class_kind != 0
             || self.gc_tick.wrapping_add(1) & GC_CALL_POLL_MASK == 0
             || crate::value::heap_live_objects(&self.gc_heap) > self.gc_next
             || execution_stack_exhausted(self.depth + 1)

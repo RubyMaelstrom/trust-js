@@ -251,7 +251,6 @@ fn table_writes() -> [TableWrite; 11] {
                     ClassInfo {
                         fields: Vec::new().into(),
                         field_env: env,
-                        derived: false,
                         instance_initializers: vec![Value::Obj(young)],
                         private_members: Vec::new(),
                     },

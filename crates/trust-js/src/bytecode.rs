@@ -15175,10 +15175,7 @@ pub(crate) fn try_function_osr(
     let address = site as *const _ as usize;
     if function.is_async
         || function.is_generator
-        || (construct
-            && i.class_info
-                .get(&(crate::value::Gc::as_ptr(&callee) as usize))
-                .is_some_and(|class| class.derived))
+        || (construct && callee.borrow().class_kind == crate::value::CLASS_DERIVED)
         || !function
             .body
             .iter()
