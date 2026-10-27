@@ -73,6 +73,17 @@ impl Atom {
         self.0.cell_word()
     }
 
+    /// The atom whose address is `word`.
+    ///
+    /// # Safety
+    /// `word` is an atom's [`Atom::cell_word`], and the atom's heap is alive.
+    #[inline]
+    pub(crate) unsafe fn from_cell_word(word: u64) -> Atom {
+        Atom(LStr::from_cell(NonNull::new_unchecked(
+            word as usize as *mut u8,
+        )))
+    }
+
     /// Whether this is a static name, which lives outside every heap.
     pub(crate) fn is_static(self) -> bool {
         static_names().contains(self)

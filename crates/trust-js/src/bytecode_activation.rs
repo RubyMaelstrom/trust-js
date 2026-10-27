@@ -9,8 +9,7 @@
 use super::{CapInit, Chunk};
 use crate::atom::Atom;
 use crate::interpreter::{
-    new_var_scope_with_bindings, Binding, BindingLayout, BindingName, Env, Interp, LayoutRef,
-    VarMap,
+    new_var_scope_with_bindings, Binding, DescRef, Env, Interp, ScopeDesc, VarMap,
 };
 use crate::value::Value;
 use std::rc::Rc;
@@ -20,12 +19,13 @@ pub(super) fn activation_plans_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("TRUST_JS_ACTIVATION_PLANS").as_deref() != Ok("0"))
 }
 
-/// A chunk's plan, made in the chunk's heap: its names are that heap's atoms.
+/// A chunk's plan, made in the chunk's heap: its names are that heap's atoms, in a descriptor
+/// every activation shares, so that making one copies binding values only.
 pub(super) struct ActivationPlan {
-    bindings: Vec<(BindingName, Binding)>,
-    layout: Option<Rc<BindingLayout>>,
-    /// `layout`, kept by the chunk's heap for its activations to name.
-    kept_layout: Option<LayoutRef>,
+    bindings: Vec<Binding>,
+    desc: Rc<ScopeDesc>,
+    /// `desc`, kept by the chunk's heap for its activations to name.
+    kept_desc: DescRef,
     parameters: Vec<(usize, u16)>,
     /// A captured rest parameter: (binding index, first argument index).
     rest: Option<(usize, u16)>,
@@ -37,10 +37,11 @@ pub(super) struct ActivationPlan {
 
 impl ActivationPlan {
     pub(super) fn new(chunk: &Chunk) -> Self {
+        let mut names = Vec::with_capacity(chunk.cap_inits.len() + 2);
         let mut plan = Self {
             bindings: Vec::with_capacity(chunk.cap_inits.len() + 2),
-            layout: None,
-            kept_layout: None,
+            desc: ScopeDesc::new(Vec::new()),
+            kept_desc: DescRef::empty(),
             parameters: Vec::new(),
             rest: None,
             functions: Vec::new(),
@@ -49,24 +50,24 @@ impl ActivationPlan {
             arguments_slot: None,
         };
         let mut slots = crate::fasthash::FastMap::<Rc<str>, usize>::default();
-        fn slot(
-            bindings: &mut Vec<(BindingName, Binding)>,
-            slots: &mut crate::fasthash::FastMap<Rc<str>, usize>,
-            name: &Rc<str>,
-            binding: Binding,
-            replace: bool,
-        ) -> usize {
+        let mut slot = |bindings: &mut Vec<Binding>,
+                        slots: &mut crate::fasthash::FastMap<Rc<str>, usize>,
+                        name: &Rc<str>,
+                        binding: Binding,
+                        replace: bool|
+         -> usize {
             if let Some(&slot) = slots.get(name) {
                 if replace {
-                    bindings[slot].1 = binding;
+                    bindings[slot] = binding;
                 }
                 return slot;
             }
             let index = bindings.len();
             slots.insert(name.clone(), index);
-            bindings.push((BindingName::new(crate::atom::atomize(name)), binding));
+            names.push(crate::atom::atomize(name));
+            bindings.push(binding);
             index
-        }
+        };
         let mut functions = Vec::new();
         for init in &chunk.cap_inits {
             match init {
@@ -144,9 +145,10 @@ impl ActivationPlan {
         }
         // ECMA-262 e28783d5 FunctionDeclarationInstantiation/GetBindingValue:
         // names are static here, while initialization, mutability and values stay
-        // per invocation. The builder has already produced this exact ordered index.
-        plan.layout = BindingLayout::fixed(chunk.binding_layout_id, slots);
-        plan.kept_layout = plan.layout.as_ref().map(crate::value::keep_binding_layout);
+        // per invocation.
+        drop(slot);
+        plan.desc = ScopeDesc::new(names);
+        plan.kept_desc = crate::value::keep_scope_desc(&plan.desc);
         plan
     }
 
@@ -159,7 +161,7 @@ impl ActivationPlan {
         arguments: &[Value],
     ) -> Env {
         let mut vars =
-            VarMap::from_fixed_bindings(self.bindings.iter().cloned().collect(), self.kept_layout);
+            VarMap::from_fixed_bindings(self.bindings.iter().cloned().collect(), self.kept_desc);
         for &(slot, parameter) in &self.parameters {
             vars.initialize_fixed_value(
                 slot,
@@ -210,12 +212,10 @@ impl ActivationPlan {
     }
 
     pub(super) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
-        if let Some(layout) = &self.layout {
-            visitor.binding_layout(layout);
-        }
+        visitor.scope_desc(&self.desc);
         // The names are atoms, which their heap's table accounts.
         std::mem::size_of::<Self>()
-            + self.bindings.capacity() * std::mem::size_of::<(BindingName, Binding)>()
+            + self.bindings.capacity() * std::mem::size_of::<Binding>()
             + (self.parameters.capacity() + self.functions.capacity())
                 * std::mem::size_of::<(usize, u16)>()
             + self.lexicals.capacity() * std::mem::size_of::<Atom>()
@@ -434,15 +434,12 @@ mod tests {
             let left = environment(&mut engine, "left59");
             let right = environment(&mut engine, "right59");
             assert!(!Env::ptr_eq(&left, &right));
-            if tier != Tier::Interp
-                && activation_plans_enabled()
-                && crate::interpreter::indexed_activations_enabled()
-            {
+            if tier != Tier::Interp && activation_plans_enabled() {
                 let l = left.borrow();
                 let r = right.borrow();
                 assert!(std::ptr::eq(
-                    l.vars.shared_layout().unwrap(),
-                    r.vars.shared_layout().unwrap()
+                    l.vars.shared_desc().unwrap(),
+                    r.vars.shared_desc().unwrap()
                 ));
                 assert!(l.vars.binding_slot("v95").is_some());
             }

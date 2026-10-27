@@ -96,6 +96,12 @@ impl<T> StorageBox<T> {
     pub(crate) fn trace<S: GcSink + ?Sized>(this: &Self, sink: &mut S) {
         trace_block(this.0.as_ptr().cast(), sink);
     }
+
+    /// The block's address, for an owner that keeps it in a word of its own (and reports it).
+    #[inline]
+    pub(crate) fn into_raw(this: Self) -> *mut T {
+        this.0.as_ptr()
+    }
 }
 
 impl<T> Deref for StorageBox<T> {

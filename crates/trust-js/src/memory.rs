@@ -987,6 +987,17 @@ impl Visitor {
         }
     }
 
+    /// A scope descriptor's bytes, counted once however many records share it.
+    pub(crate) fn scope_desc(&mut self, desc: &crate::interpreter::ScopeDesc) {
+        if self
+            .binding_layouts
+            .insert(desc as *const crate::interpreter::ScopeDesc as usize)
+        {
+            self.add_function_bytecode_bytes(desc.retained_memory());
+            self.function_bytecode_opaque_storage = true;
+        }
+    }
+
     pub(crate) fn class(&mut self, class: &Rc<crate::ast::Class>) {
         if self.fragment_plan_root.is_some() {
             return;
@@ -1194,8 +1205,8 @@ impl Visitor {
     }
 
     fn scope(&mut self, scope: &Scope) -> (usize, bool) {
-        if let Some(layout) = scope.vars.shared_layout() {
-            self.binding_layout(layout);
+        if let Some(desc) = scope.vars.shared_desc() {
+            self.scope_desc(desc);
         }
         let (mut bytes, exact) = scope.vars.retained_requested_storage_bytes();
         bytes = bytes.saturating_add(scope.lexical_names.retained_requested_storage_bytes());

@@ -11344,11 +11344,6 @@ fn emit_name_ic_value_ptr_in(
         a.ldr_w_imm(11, 9, layout.scope_layout as u32);
         a.cmp_reg_w(11, 13);
         a.b_cond(C_NE, slow);
-        a.ldrb_imm(11, 9, layout.scope_small_tag as u32);
-        a.cmp_imm_w(11, 1); // reject Large; Small(0) and Indexed(2) share the probed entries
-        a.b_cond(C_EQ, slow);
-        a.cmp_imm_w(11, 2);
-        a.b_cond(C_HI, slow);
         a.ldr_imm(14, 12, NAME_IC_OFF_BINDING);
         scope_entries_len(a, layout, 11, 9);
         a.cmp_reg_x(14, 11);

@@ -1464,17 +1464,18 @@ pub(crate) struct RegexpLastMatch {
     pub lazy_captures: Option<(Rc<crate::regex::Regex>, usize)>,
 }
 
-/// One scope's binding map, wrapping the raw hash map so every *structural* mutation — anything
-/// that can move entries or change what a name resolves to (insert, remove, clear) — bumps a
-/// generation counter. The bytecode tier's per-site name caches hold a raw `&Binding` pointer
-/// plus the generation they resolved it at (see `bytecode::NameIc`): a matching generation
-/// proves the map hasn't changed shape since, so the pointer is still valid *and* still the
-/// right resolution. In-place binding writes (`get_mut`) intentionally don't bump — they can't
-/// move entries, and a cache read-through observes the new value, which is exactly correct.
-/// Reads pass through via `Deref`; mutations only exist as the inherent methods below, so a new
-/// mutation site can't forget the bump (it won't compile).
+/// One scope's bindings: their names ([`Names`]) and, slot for slot, their values. Every
+/// *structural* mutation, anything that can move a binding or change what a name resolves to
+/// (insert, remove, clear), bumps a generation counter. The bytecode tier's per-site name caches
+/// hold a raw `&Binding` pointer plus the generation they resolved it at (see
+/// `bytecode::NameIc`): a matching generation proves the map hasn't changed shape since, so the
+/// pointer is still valid *and* still the right resolution. In-place binding writes (`get_mut`)
+/// intentionally don't bump: they can't move a binding, and a cache read-through observes the
+/// new value, which is exactly correct. Mutations only exist as the inherent methods below, so
+/// a new mutation site can't forget the bump (it won't compile).
 pub struct VarMap {
-    map: VarStorage,
+    names: Names,
+    values: BindingValues,
     generation: std::cell::Cell<u32>,
     /// Nonzero after a fully instantiated activation publishes its ordered key
     /// layout. Changes to that key set or storage invalidate the proof.
@@ -1496,17 +1497,14 @@ fn allocate_binding_layout_id(next: &std::sync::atomic::AtomicU32) -> u32 {
         .unwrap_or(0)
 }
 
+/// Past this many names a descriptor or a record's own list keeps an index of them.
 const SMALL_VAR_MAP_CAPACITY: usize = 8;
 
-pub(crate) fn indexed_activations_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("TRUST_JS_INDEXED_ACTIVATIONS").as_deref() != Ok("0"))
-}
-
-/// Shared names and slot positions, with no binding values or environment owners.
+/// Shared names and slot positions, as text, with no binding values or environment owners:
+/// the shape a tree-walked function's activations share, which its AST, shared by every heap,
+/// caches. Each heap turns it into a [`ScopeDesc`] of its atoms ([`crate::value::scope_desc_for`]).
 /// Created from a completed FunctionDeclarationInstantiation, so parameter eval
-/// and conditional constructor metadata cannot masquerade as a static key set. The names
-/// are text, not atoms: a function's AST, which every heap shares, caches its layouts.
+/// and conditional constructor metadata cannot masquerade as a static key set.
 #[derive(Debug)]
 pub(crate) struct BindingLayout {
     id: u32,
@@ -1514,20 +1512,6 @@ pub(crate) struct BindingLayout {
 }
 
 impl BindingLayout {
-    /// Reuse the instantiation plan's index instead of linearly scanning wide
-    /// activation vectors on checked/cold/reflective name reads. Values remain
-    /// private to each environment; only the immutable key-to-slot map is shared.
-    pub(crate) fn fixed(
-        id: u32,
-        slots: crate::fasthash::FastMap<Rc<str>, usize>,
-    ) -> Option<Rc<Self>> {
-        if id == 0 || slots.len() <= SMALL_VAR_MAP_CAPACITY || !indexed_activations_enabled() {
-            None
-        } else {
-            Some(Rc::new(Self { id, slots }))
-        }
-    }
-
     pub(crate) fn retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         for name in self.slots.keys() {
             visitor.rc_str(name);
@@ -1536,32 +1520,413 @@ impl BindingLayout {
         std::mem::size_of::<Self>() + self.slots.len() * std::mem::size_of::<(Rc<str>, usize)>()
     }
 
-    /// The slot of the binding named by `text`, if the layout has one.
-    #[inline]
-    fn slot_of(&self, text: &str) -> Option<usize> {
-        self.slots.get(text).copied()
+    /// The slot of the binding named by `name`, if the layout has one.
+    fn slot_of_atom(&self, name: crate::atom::Atom) -> Option<usize> {
+        self.slots.get(&*name.text()).copied()
     }
 
-    /// The slot of the binding named by `name`, if the layout has one.
-    #[inline]
-    fn slot_of_atom(&self, name: crate::atom::Atom) -> Option<usize> {
-        self.slot_of(&name.text())
+    /// The names, by slot.
+    pub(crate) fn ordered_names(&self) -> Vec<&str> {
+        let mut names = vec![""; self.slots.len()];
+        for (name, &slot) in &self.slots {
+            names[slot] = name;
+        }
+        names
     }
 }
 
-/// A binding map's ordered entries. P1 S4: the first entry lives in the environment cell, so a
-/// record with one binding (most block and many function records) allocates nothing beside it;
-/// more move the entries to one storage block (`gc_storage`), which the record reports
-/// ([`VarMap::trace_storage`]). The entries are never dropped: they own nothing (names are
-/// atoms, bindings hold no drop glue) and the collector frees their block, so an environment
-/// carries no drop glue and needs no finalizer.
+/// The names of a scope's bindings in slot order, shared by every record the scope makes (a
+/// compiled scope's, or a tree-walked function's activation shape). Its heap keeps it for as
+/// long as the heap lives ([`crate::value::keep_scope_desc`]), and its records name it without
+/// owning it ([`DescRef`]). Making a record then copies binding values, not names.
+pub(crate) struct ScopeDesc {
+    names: Box<[crate::atom::Atom]>,
+    /// Name → slot, past [`SMALL_VAR_MAP_CAPACITY`] names.
+    index: Option<crate::fasthash::FastMap<crate::atom::Atom, u32>>,
+    /// Text → slot, past [`SMALL_VAR_MAP_CAPACITY`] names: the tree-walker and the runtime's
+    /// name references look names up as text.
+    text: Option<Rc<BindingLayout>>,
+}
+
+impl ScopeDesc {
+    pub(crate) fn new(names: Vec<crate::atom::Atom>) -> Rc<Self> {
+        let large = names.len() > SMALL_VAR_MAP_CAPACITY;
+        let text = large.then(|| {
+            Rc::new(BindingLayout {
+                id: 0,
+                slots: names
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, name)| (Rc::from(&*name.text()), slot))
+                    .collect(),
+            })
+        });
+        Self::with_text(names, text)
+    }
+
+    /// A descriptor of `names` whose text index, if it needs one, is `text`'s.
+    fn with_text(names: Vec<crate::atom::Atom>, text: Option<Rc<BindingLayout>>) -> Rc<Self> {
+        let large = names.len() > SMALL_VAR_MAP_CAPACITY;
+        let index = large.then(|| {
+            names
+                .iter()
+                .enumerate()
+                .map(|(slot, &name)| (name, slot as u32))
+                .collect()
+        });
+        Rc::new(Self {
+            names: names.into_boxed_slice(),
+            index,
+            text: text.filter(|_| large),
+        })
+    }
+
+    /// The descriptor of a tree-walked function's activation layout, in the active heap's
+    /// atoms; the layout serves as its text index.
+    pub(crate) fn of_layout(layout: &Rc<BindingLayout>) -> Rc<Self> {
+        let names = layout
+            .ordered_names()
+            .into_iter()
+            .map(crate::atom::atomize)
+            .collect();
+        Self::with_text(names, Some(layout.clone()))
+    }
+
+    #[inline]
+    fn slot_of(&self, name: crate::atom::Atom) -> Option<usize> {
+        match &self.index {
+            Some(index) => index.get(&name).map(|&slot| slot as usize),
+            None => self.names.iter().position(|&known| known == name),
+        }
+    }
+
+    pub(crate) fn retained_memory(&self) -> usize {
+        // The names are atoms, which their heap's table accounts, and a text index a layout's,
+        // counted with the layout. HashMap does not expose its bucket allocation; a lower bound.
+        std::mem::size_of::<Self>()
+            + self.names.len() * std::mem::size_of::<crate::atom::Atom>()
+            + self.index.as_ref().map_or(0, |index| {
+                index.len() * std::mem::size_of::<(crate::atom::Atom, u32)>()
+            })
+    }
+}
+
+/// A scope descriptor its heap keeps for as long as the heap lives
+/// ([`crate::value::keep_scope_desc`]), named by the records that share it without owning it.
+#[derive(Clone, Copy)]
 #[repr(transparent)]
-pub(crate) struct BindingEntries(std::mem::ManuallyDrop<BindingVec>);
+pub(crate) struct DescRef(std::ptr::NonNull<ScopeDesc>);
 
-type BindingVec =
-    crate::inline_vec::InlineVec<(BindingName, Binding), 1, crate::gc_storage::GcSpill>;
+impl DescRef {
+    /// # Safety
+    /// `desc` outlives every record that names it: the active heap keeps it, or it is static.
+    pub(crate) unsafe fn kept(desc: &ScopeDesc) -> Self {
+        Self(std::ptr::NonNull::from(desc))
+    }
 
-impl BindingEntries {
+    /// The descriptor of no names, which every heap shares.
+    pub(crate) fn empty() -> Self {
+        struct Empty(ScopeDesc);
+        // SAFETY: the descriptor is immutable and holds no atom.
+        unsafe impl Sync for Empty {}
+        // SAFETY: as for `Sync`.
+        unsafe impl Send for Empty {}
+        static EMPTY: std::sync::OnceLock<Empty> = std::sync::OnceLock::new();
+        let empty = EMPTY.get_or_init(|| {
+            Empty(ScopeDesc {
+                names: Box::new([]),
+                index: None,
+                text: None,
+            })
+        });
+        // SAFETY: the empty descriptor is static.
+        unsafe { Self::kept(&empty.0) }
+    }
+}
+
+impl std::ops::Deref for DescRef {
+    type Target = ScopeDesc;
+    #[inline]
+    fn deref(&self) -> &ScopeDesc {
+        // SAFETY: the heap of the record that names the descriptor keeps it (or it is static),
+        // and the record lives no longer than its heap.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+/// A record's own names: those of a record built name by name (the tree-walker's, eval's) or
+/// changed after a descriptor's (a sloppy eval's `var`), in a storage block the record reports.
+/// It is never dropped: the names are atoms, the spill is a block, and a large list's index
+/// lives in a payload cell whose finalizer drops it.
+struct OwnNames {
+    names: std::mem::ManuallyDrop<
+        crate::inline_vec::InlineVec<crate::atom::Atom, 2, crate::gc_storage::GcSpill>,
+    >,
+    index: Option<crate::gc_storage::PayloadBox<NameIndex>>,
+}
+
+/// An [`OwnNames`]' name → slot index, past [`SMALL_VAR_MAP_CAPACITY`] names.
+#[derive(Default)]
+pub(crate) struct NameIndex(crate::fasthash::FastMap<crate::atom::Atom, u32>);
+
+impl std::ops::Deref for NameIndex {
+    type Target = crate::fasthash::FastMap<crate::atom::Atom, u32>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for NameIndex {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// A record's binding names, by slot, in one word: a descriptor records share ([`DescRef`]), the
+/// record's own list ([`OwnNames`], in a storage block), or, while a record that owns its names
+/// has one binding, that name itself, which needs no block. Cells are 16-byte aligned, so the
+/// low bits tag the kind.
+#[derive(Clone, Copy)]
+struct Names(std::num::NonZeroUsize);
+
+impl Names {
+    const SHARED: usize = 0;
+    const OWN: usize = 1;
+    const ONE: usize = 2;
+    const TAG: usize = 3;
+
+    #[inline]
+    fn shared(desc: DescRef) -> Self {
+        Self(std::num::NonZeroUsize::new(desc.0.as_ptr() as usize).expect("non-null"))
+    }
+
+    #[inline]
+    fn one(name: crate::atom::Atom) -> Self {
+        let word = name.cell_word() as usize;
+        debug_assert_eq!(word & Self::TAG, 0, "string cells are aligned");
+        Self(std::num::NonZeroUsize::new(word | Self::ONE).expect("non-null"))
+    }
+
+    fn own(names: crate::gc_storage::StorageBox<OwnNames>) -> Self {
+        let word = crate::gc_storage::StorageBox::into_raw(names) as usize;
+        debug_assert_eq!(word & Self::TAG, 0, "blocks are aligned");
+        Self(std::num::NonZeroUsize::new(word | Self::OWN).expect("non-null"))
+    }
+
+    #[inline]
+    fn kind(self) -> usize {
+        self.0.get() & Self::TAG
+    }
+
+    #[inline]
+    fn untagged(self) -> usize {
+        self.0.get() & !Self::TAG
+    }
+
+    #[inline]
+    fn desc(&self) -> Option<&ScopeDesc> {
+        // SAFETY: a shared word is a kept descriptor's address (see `DescRef`).
+        (self.kind() == Self::SHARED).then(|| unsafe { &*(self.untagged() as *const ScopeDesc) })
+    }
+
+    #[inline]
+    fn own_names(&self) -> Option<&OwnNames> {
+        // SAFETY: an own word is the address of the record's block, which the record reports.
+        (self.kind() == Self::OWN).then(|| unsafe { &*(self.untagged() as *const OwnNames) })
+    }
+
+    #[inline]
+    fn own_names_mut(&mut self) -> Option<&mut OwnNames> {
+        // SAFETY: as in `own_names`; the record, borrowed mutably, is the block's one owner.
+        (self.kind() == Self::OWN).then(|| unsafe { &mut *(self.untagged() as *mut OwnNames) })
+    }
+
+    #[inline]
+    fn single(self) -> Option<crate::atom::Atom> {
+        // SAFETY: a one word is an atom's address (see `Names::one`).
+        (self.kind() == Self::ONE)
+            .then(|| unsafe { crate::atom::Atom::from_cell_word(self.untagged() as u64) })
+    }
+
+    fn len(&self) -> usize {
+        match self.kind() {
+            Self::SHARED => self.desc().expect("shared").names.len(),
+            Self::OWN => self.own_names().expect("own").names.len(),
+            _ => 1,
+        }
+    }
+
+    /// The name at `slot`.
+    #[inline]
+    fn get(&self, slot: usize) -> Option<crate::atom::Atom> {
+        match self.kind() {
+            Self::SHARED => self.desc().expect("shared").names.get(slot).copied(),
+            Self::OWN => self.own_names().expect("own").names.get(slot).copied(),
+            _ => (slot == 0).then(|| self.single().expect("one")),
+        }
+    }
+
+    /// The slot of `name`.
+    #[inline]
+    fn slot_of(&self, name: crate::atom::Atom) -> Option<usize> {
+        match self.kind() {
+            Self::SHARED => self.desc().expect("shared").slot_of(name),
+            Self::OWN => {
+                let own = self.own_names().expect("own");
+                match &own.index {
+                    Some(index) => index.get(&name).map(|&slot| slot as usize),
+                    None => own.names.iter().position(|&known| known == name),
+                }
+            }
+            _ => (self.single() == Some(name)).then_some(0),
+        }
+    }
+
+    /// `f` on the names, in slot order.
+    #[inline]
+    fn with_slice<R>(&self, f: impl FnOnce(&[crate::atom::Atom]) -> R) -> R {
+        match self.kind() {
+            Self::SHARED => f(&self.desc().expect("shared").names),
+            Self::OWN => f(&self.own_names().expect("own").names),
+            _ => f(std::slice::from_ref(&self.single().expect("one"))),
+        }
+    }
+
+    /// The slot of the name whose text is `text`.
+    fn slot_of_text(&self, text: &str) -> Option<usize> {
+        if let Some(desc) = self.desc() {
+            if let Some(layout) = &desc.text {
+                return layout.slots.get(text).copied();
+            }
+        } else if self.own_names().is_some_and(|own| own.index.is_some()) {
+            return self.slot_of(crate::atom::lookup(text)?);
+        }
+        // Compare lengths before contents: most names differ in length.
+        let ascii = text.is_ascii();
+        self.with_slice(|names| {
+            names.iter().position(|name| {
+                let name = name.as_lstr();
+                (!ascii || name.unit_len() == text.len()) && name == *text
+            })
+        })
+    }
+
+    /// Exchange the names at `a` and `b`, owning the names first, without updating an own
+    /// list's index: for a permutation whose names a descriptor then replaces.
+    fn swap_unindexed(&mut self, a: usize, b: usize) {
+        if a != b {
+            self.own_mut().names.swap(a, b);
+        }
+    }
+
+    /// The names as the record's own list, copied out of a descriptor or the one-name word
+    /// first (the generation's bump is the caller's).
+    fn own_mut(&mut self) -> &mut OwnNames {
+        if self.kind() != Self::OWN {
+            let mut names = crate::inline_vec::InlineVec::new();
+            for slot in 0..self.len() {
+                names.push(self.get(slot).expect("in range"));
+            }
+            *self = Self::own(crate::gc_storage::StorageBox::new(OwnNames {
+                names: std::mem::ManuallyDrop::new(names),
+                index: None,
+            }));
+            self.reindex();
+        }
+        self.own_names_mut().expect("own")
+    }
+
+    /// Rebuild an own list's index after its names changed: one past
+    /// [`SMALL_VAR_MAP_CAPACITY`] names, none below.
+    fn reindex(&mut self) {
+        let own = self.own_names_mut().expect("own");
+        if own.names.len() <= SMALL_VAR_MAP_CAPACITY {
+            own.index = None;
+            return;
+        }
+        let index: crate::fasthash::FastMap<crate::atom::Atom, u32> = own
+            .names
+            .iter()
+            .enumerate()
+            .map(|(slot, &name)| (name, slot as u32))
+            .collect();
+        match &mut own.index {
+            Some(existing) => (**existing).0 = index,
+            None => own.index = Some(crate::gc_storage::PayloadBox::new(NameIndex(index))),
+        }
+    }
+
+    /// Append `name` at the next slot, owning the names first.
+    fn push(&mut self, name: crate::atom::Atom) {
+        if self.kind() == Self::SHARED && self.len() == 0 {
+            *self = Self::one(name);
+            return;
+        }
+        let own = self.own_mut();
+        own.names.push(name);
+        let slot = own.names.len() - 1;
+        match &mut own.index {
+            Some(index) => {
+                index.insert(name, slot as u32);
+            }
+            None if own.names.len() > SMALL_VAR_MAP_CAPACITY => self.reindex(),
+            None => {}
+        }
+    }
+
+    /// Remove the name at `slot`, moving the last into its place (as `swap_remove`).
+    fn swap_remove(&mut self, slot: usize) {
+        if self.kind() == Self::ONE {
+            *self = Self::shared(DescRef::empty());
+            return;
+        }
+        let own = self.own_mut();
+        own.names.swap_remove(slot);
+        self.reindex();
+    }
+
+    /// Report an own list's blocks and cells.
+    fn trace<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
+        if let Some(own) = self.own_names() {
+            crate::gc_storage::trace_block(self.untagged() as *const u8, sink);
+            if let Some(block) = own.names.spill_ptr() {
+                crate::gc_storage::trace_block(block, sink);
+            }
+            if let Some(index) = &own.index {
+                crate::gc_storage::PayloadBox::trace(index, sink);
+            }
+        }
+    }
+
+    /// The bytes the names own beside the record, and whether the count is exact.
+    fn retained_requested_storage_bytes(&self) -> (usize, bool) {
+        match self.own_names() {
+            Some(own) => (
+                std::mem::size_of::<OwnNames>()
+                    + own.names.heap_capacity() * std::mem::size_of::<crate::atom::Atom>()
+                    + own.index.as_ref().map_or(0, |index| {
+                        index.len() * std::mem::size_of::<(crate::atom::Atom, u32)>()
+                    }),
+                own.index.is_none(),
+            ),
+            None => (0, true),
+        }
+    }
+}
+
+/// A record's binding values in slot order. P1 S4: the first lives in the environment cell, so
+/// a record with one binding (most block and many function records) allocates nothing beside
+/// it; more move the values to one storage block (`gc_storage`), which the record reports
+/// ([`VarMap::trace_storage`]). The values are never dropped: bindings own nothing and the
+/// collector frees their block, so an environment carries no drop glue and needs no finalizer.
+#[repr(transparent)]
+pub(crate) struct BindingValues(std::mem::ManuallyDrop<BindingVec>);
+
+type BindingVec = crate::inline_vec::InlineVec<Binding, 1, crate::gc_storage::GcSpill>;
+
+impl BindingValues {
     pub(crate) fn new() -> Self {
         Self(std::mem::ManuallyDrop::new(BindingVec::new()))
     }
@@ -1571,20 +1936,15 @@ impl BindingEntries {
             capacity,
         )))
     }
-
-    /// The entries as a vector, to consume.
-    fn into_vec(self) -> BindingVec {
-        std::mem::ManuallyDrop::into_inner(self.0)
-    }
 }
 
-impl Default for BindingEntries {
+impl Default for BindingValues {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl std::ops::Deref for BindingEntries {
+impl std::ops::Deref for BindingValues {
     type Target = BindingVec;
     #[inline]
     fn deref(&self) -> &BindingVec {
@@ -1592,179 +1952,60 @@ impl std::ops::Deref for BindingEntries {
     }
 }
 
-impl std::ops::DerefMut for BindingEntries {
+impl std::ops::DerefMut for BindingValues {
     #[inline]
     fn deref_mut(&mut self) -> &mut BindingVec {
         &mut self.0
     }
 }
 
-impl FromIterator<(BindingName, Binding)> for BindingEntries {
-    fn from_iter<I: IntoIterator<Item = (BindingName, Binding)>>(iter: I) -> Self {
+impl FromIterator<Binding> for BindingValues {
+    fn from_iter<I: IntoIterator<Item = Binding>>(iter: I) -> Self {
         Self(std::mem::ManuallyDrop::new(iter.into_iter().collect()))
     }
-}
-
-/// A large binding map, kept in a payload cell beside its environment
-/// ([`crate::gc_storage::PayloadBox`]): the payload cell's finalizer drops the table, so the
-/// environment itself has nothing to drop.
-#[derive(Default)]
-pub(crate) struct LargeBindings(crate::fasthash::FastMap<crate::atom::Atom, Binding>);
-
-impl std::ops::Deref for LargeBindings {
-    type Target = crate::fasthash::FastMap<crate::atom::Atom, Binding>;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for LargeBindings {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-/// A binding layout its heap keeps for as long as the heap lives
-/// ([`crate::value::keep_binding_layout`]), named by the environments that share it without
-/// owning it, so that they carry no drop glue.
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub(crate) struct LayoutRef(std::ptr::NonNull<BindingLayout>);
-
-impl LayoutRef {
-    /// # Safety
-    /// The active heap keeps `layout` (see [`crate::value::keep_binding_layout`]).
-    pub(crate) unsafe fn kept(layout: &Rc<BindingLayout>) -> Self {
-        Self(std::ptr::NonNull::from(&**layout))
-    }
-}
-
-impl std::ops::Deref for LayoutRef {
-    type Target = BindingLayout;
-    #[inline]
-    fn deref(&self) -> &BindingLayout {
-        // SAFETY: the heap of the environment that names the layout keeps it, and the
-        // environment lives no longer than its heap.
-        unsafe { self.0.as_ref() }
-    }
-}
-
-/// A binding's name: an atom of its environment's heap (see [`crate::atom`]), padded to the two
-/// words an entry gave its name before atoms, so generated code finds each binding where it
-/// did.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub(crate) struct BindingName {
-    atom: crate::atom::Atom,
-    _pad: usize,
-}
-
-impl BindingName {
-    #[inline]
-    pub(crate) fn new(atom: crate::atom::Atom) -> Self {
-        Self { atom, _pad: 0 }
-    }
-}
-
-const _: () = assert!(std::mem::size_of::<BindingName>() == std::mem::size_of::<Rc<str>>());
-
-/// The bytes of `entries`' storage beside the environment cell.
-fn binding_entries_heap_bytes(entries: &BindingEntries) -> usize {
-    let capacity = entries.heap_capacity();
-    capacity.saturating_mul(std::mem::size_of::<(BindingName, Binding)>())
-}
-
-/// The entries are first so their native layout can share the Small storage path.
-/// `VarMap::jit_small_storage_layout` verifies that fact against the actual Rust enum layout.
-#[repr(C)]
-struct IndexedBindings {
-    entries: BindingEntries,
-    layout: LayoutRef,
-}
-
-#[repr(u8)]
-enum VarStorage {
-    Small(BindingEntries),
-    Large(crate::gc_storage::PayloadBox<LargeBindings>),
-    Indexed(IndexedBindings),
 }
 
 impl Default for VarMap {
     fn default() -> Self {
         Self {
-            map: VarStorage::Small(BindingEntries::new()),
+            names: Names::shared(DescRef::empty()),
+            values: BindingValues::new(),
             generation: std::cell::Cell::new(0),
             layout_id: 0,
         }
     }
 }
 
-pub(crate) enum VarIter<'a> {
-    Small(std::slice::Iter<'a, (BindingName, Binding)>),
-    Large(std::collections::hash_map::Iter<'a, crate::atom::Atom, Binding>),
+/// The bindings of a [`VarMap`] with their names, in slot order.
+pub(crate) struct VarIter<'a> {
+    map: &'a VarMap,
+    slot: usize,
 }
 
 impl<'a> Iterator for VarIter<'a> {
     type Item = (crate::atom::Atom, &'a Binding);
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            VarIter::Small(iter) => iter.next().map(|(name, binding)| (name.atom, binding)),
-            VarIter::Large(iter) => iter.next().map(|(&name, binding)| (name, binding)),
-        }
-    }
-}
-
-pub(crate) enum VarKeys<'a> {
-    Small(std::slice::Iter<'a, (BindingName, Binding)>),
-    Large(std::collections::hash_map::Keys<'a, crate::atom::Atom, Binding>),
-}
-
-impl Iterator for VarKeys<'_> {
-    type Item = crate::atom::Atom;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            VarKeys::Small(iter) => iter.next().map(|(name, _)| name.atom),
-            VarKeys::Large(iter) => iter.next().copied(),
-        }
-    }
-}
-
-pub(crate) enum VarValues<'a> {
-    Small(std::slice::Iter<'a, (BindingName, Binding)>),
-    Large(std::collections::hash_map::Values<'a, crate::atom::Atom, Binding>),
-}
-
-impl<'a> Iterator for VarValues<'a> {
-    type Item = &'a Binding;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            VarValues::Small(iter) => iter.next().map(|(_, binding)| binding),
-            VarValues::Large(iter) => iter.next(),
-        }
+        let binding = self.map.values.get(self.slot)?;
+        let name = self.map.names.get(self.slot).expect("a name per value");
+        self.slot += 1;
+        Some((name, binding))
     }
 }
 
 impl VarMap {
-    /// Report the storage block of the ordered entries, once they have spilled into one.
+    /// Report the record's blocks: the spilled values' and the names'.
     #[inline]
     pub(crate) fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        match &self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                if let Some(block) = entries.spill_ptr() {
-                    crate::gc_storage::trace_block(block, sink);
-                }
-            }
-            VarStorage::Large(entries) => crate::gc_storage::PayloadBox::trace(entries, sink),
+        if let Some(block) = self.values.spill_ptr() {
+            crate::gc_storage::trace_block(block, sink);
         }
+        self.names.trace(sink);
     }
 
     /// Publish actual instantiated names, never assumptions about syntax. A
-    /// different eval-created key set retains the dynamic map. Moving entries
+    /// different eval-created key set retains the dynamic names. Moving bindings
     /// invalidates raw-pointer caches before any address can change.
     pub(crate) fn share_layout(&mut self, cached: &std::cell::OnceCell<Rc<BindingLayout>>) {
-        // SAFETY: the active heap keeps the layout for the environment that shares it.
         if self.layout_id != 0 {
             return;
         }
@@ -1779,68 +2020,44 @@ impl VarMap {
             })
         });
         if layout.id == 0
-            || self.keys().count() != layout.slots.len()
+            || self.values.len() != layout.slots.len()
             || self.keys().any(|name| layout.slot_of_atom(name).is_none())
         {
             return;
         }
+        let desc = crate::value::scope_desc_for(layout);
         self.bump();
-        let mut entries =
-            match std::mem::replace(&mut self.map, VarStorage::Small(BindingEntries::new())) {
-                VarStorage::Small(entries) => entries,
-                VarStorage::Large(mut entries) => std::mem::take(&mut entries.0)
-                    .into_iter()
-                    .map(|(name, binding)| (BindingName::new(name), binding))
-                    .collect(),
-                VarStorage::Indexed(indexed) => indexed.entries,
-            };
         // A linear permutation into the shared ordering, without cloning values
         // or retaining an old activation. All names were validated above.
-        for slot in 0..entries.len() {
+        for slot in 0..self.values.len() {
             loop {
-                let target = layout
-                    .slot_of_atom(entries[slot].0.atom)
-                    .expect("validated");
+                let name = self.names.get(slot).expect("a name per value");
+                let target = desc.slot_of(name).expect("validated");
                 if target == slot {
                     break;
                 }
-                entries.swap(slot, target);
+                self.names.swap_unindexed(slot, target);
+                self.values.swap(slot, target);
             }
         }
-        self.map = VarStorage::Indexed(IndexedBindings {
-            entries,
-            layout: crate::value::keep_binding_layout(layout),
-        });
+        self.names = Names::shared(desc);
         self.layout_id = layout.id;
     }
 
-    pub(crate) fn shared_layout(&self) -> Option<&BindingLayout> {
-        match &self.map {
-            VarStorage::Indexed(indexed) => Some(&indexed.layout),
-            _ => None,
-        }
+    /// The descriptor the record shares, if it does.
+    pub(crate) fn shared_desc(&self) -> Option<&ScopeDesc> {
+        self.names.desc().filter(|desc| !desc.names.is_empty())
     }
 
-    /// A compiled activation has a complete ordered key set before execution.
-    /// Keep that set in stable slots even above the dynamic map's small-object
-    /// threshold. Structural writes still use `insert`/`remove` and invalidate
-    /// the published layout before changing or replacing this storage.
-    pub(crate) fn from_fixed_bindings(entries: BindingEntries, layout: Option<LayoutRef>) -> Self {
-        debug_assert!(entries
-            .iter()
-            .all(|(_, binding)| binding.import_ref.is_none()));
-        let map = if let Some(layout) = layout {
-            debug_assert_eq!(entries.len(), layout.slots.len());
-            debug_assert!(entries
-                .iter()
-                .enumerate()
-                .all(|(slot, (name, _))| layout.slot_of_atom(name.atom) == Some(slot)));
-            VarStorage::Indexed(IndexedBindings { entries, layout })
-        } else {
-            VarStorage::Small(entries)
-        };
+    /// A compiled scope's record: `values` named by `desc`'s names, slot for slot.
+    /// Structural writes still use `insert`/`remove` and invalidate the published
+    /// layout before changing or replacing this storage.
+    pub(crate) fn from_fixed_bindings(values: BindingValues, desc: DescRef) -> Self {
+        debug_assert!(values.iter().all(|binding| binding.import_ref.is_none()));
+        debug_assert_eq!(values.len(), desc.names.len());
         Self {
-            map,
+            names: Names::shared(desc),
+            values,
             generation: std::cell::Cell::new(0),
             layout_id: 0,
         }
@@ -1849,46 +2066,28 @@ impl VarMap {
     /// Before publication only: the initialization plan owns this exact slot.
     pub(crate) fn initialize_fixed_value(&mut self, slot: usize, value: Value) {
         debug_assert_eq!(self.layout_id, 0);
-        let entries = match &mut self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                entries
-            }
-            VarStorage::Large(_) => unreachable!("fresh compiled activation has fixed storage"),
-        };
-        entries[slot].1.set_value(value);
+        self.values[slot].set_value(value);
     }
 
     /// Requested bytes owned directly by this binding map, plus whether the result is exact.
     /// `HashMap` bucket allocation sizes are intentionally reported as an incomplete lower bound
     /// because the standard library does not expose their requested layout.
     pub(crate) fn retained_requested_storage_bytes(&self) -> (usize, bool) {
-        match &self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                (binding_entries_heap_bytes(entries), true)
-            }
-            VarStorage::Large(entries) => (
-                entries
-                    .len()
-                    .saturating_mul(std::mem::size_of::<(crate::atom::Atom, Binding)>()),
-                false,
+        let (names, exact) = self.names.retained_requested_storage_bytes();
+        (
+            names.saturating_add(
+                self.values
+                    .heap_capacity()
+                    .saturating_mul(std::mem::size_of::<Binding>()),
             ),
-        }
+            exact,
+        )
     }
 
     pub(crate) fn with_capacity(capacity: usize) -> VarMap {
         VarMap {
-            map: if capacity <= SMALL_VAR_MAP_CAPACITY {
-                VarStorage::Small(BindingEntries::with_capacity(capacity))
-            } else {
-                VarStorage::Large(crate::gc_storage::PayloadBox::new(LargeBindings(
-                    crate::fasthash::FastMap::with_capacity_and_hasher(
-                        capacity,
-                        Default::default(),
-                    ),
-                )))
-            },
-            generation: std::cell::Cell::new(0),
-            layout_id: 0,
+            values: BindingValues::with_capacity(capacity),
+            ..Self::default()
         }
     }
 
@@ -1919,57 +2118,32 @@ impl VarMap {
         self.layout_id
     }
 
-    /// Stable ordered slot within an activation. A published layout proves its
-    /// ordered names; dynamic hash maps retain checked name lookup.
+    /// Stable ordered slot within an activation.
     pub(crate) fn binding_slot(&self, name: &str) -> Option<usize> {
-        match &self.map {
-            VarStorage::Small(entries) => entries.iter().position(|(key, _)| key.atom.is(name)),
-            VarStorage::Large(_) => None,
-            VarStorage::Indexed(indexed) => indexed.layout.slot_of(name),
-        }
+        self.names.slot_of_text(name)
     }
 
     pub(crate) fn binding_at(&self, slot: usize, name: &str) -> Option<&Binding> {
-        match &self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                entries
-                    .get(slot)
-                    .filter(|(key, _)| key.atom.is(name))
-                    .map(|(_, binding)| binding)
-            }
-            VarStorage::Large(_) => None,
-        }
+        self.names
+            .get(slot)
+            .filter(|key| key.is(name))
+            .and_then(|_| self.values.get(slot))
     }
 
     pub(crate) fn binding_at_mut(&mut self, slot: usize, name: &str) -> Option<&mut Binding> {
-        match &mut self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                entries
-                    .get_mut(slot)
-                    .filter(|(key, _)| key.atom.is(name))
-                    .map(|(_, binding)| binding)
-            }
-            VarStorage::Large(_) => None,
+        if !self.names.get(slot).is_some_and(|key| key.is(name)) {
+            return None;
         }
+        self.values.get_mut(slot)
     }
 
     /// The caller has checked the same nonzero published ordered-layout ID.
     pub(crate) fn fixed_binding_at(&self, slot: usize) -> Option<&Binding> {
-        match &self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                entries.get(slot).map(|(_, binding)| binding)
-            }
-            VarStorage::Large(_) => None,
-        }
+        self.values.get(slot)
     }
 
     pub(crate) fn fixed_binding_at_mut(&mut self, slot: usize) -> Option<&mut Binding> {
-        match &mut self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                entries.get_mut(slot).map(|(_, binding)| binding)
-            }
-            VarStorage::Large(_) => None,
-        }
+        self.values.get_mut(slot)
     }
 
     /// Only the creator of a fresh, fully instantiated fixed-key activation may
@@ -1977,6 +2151,7 @@ impl VarMap {
     pub(crate) fn publish_layout(&mut self, layout_id: u32) {
         self.layout_id = layout_id;
     }
+
     pub(crate) fn insert(
         &mut self,
         k: impl crate::atom::IntoAtom,
@@ -1984,147 +2159,67 @@ impl VarMap {
     ) -> Option<Binding> {
         v.imported = v.import_ref.is_some();
         let k = k.into_atom();
-        if let VarStorage::Indexed(indexed) = &mut self.map {
-            if let Some(slot) = indexed.layout.slot_of_atom(k) {
-                // InitializeBinding and same-name declaration replacement keep
-                // the key set and addresses. Native users read flags/values live.
-                self.generation.set(self.generation.get().saturating_add(1));
-                return Some(std::mem::replace(&mut indexed.entries[slot].1, v));
+        if let Some(slot) = self.names.slot_of(k) {
+            // InitializeBinding and same-name declaration replacement keep
+            // the key set and addresses. Native users read flags/values live.
+            self.generation.set(self.generation.get().saturating_add(1));
+            if self.names.kind() != Names::SHARED {
+                self.layout_id = 0;
             }
+            return Some(std::mem::replace(&mut self.values[slot], v));
         }
         self.bump();
-        match &mut self.map {
-            VarStorage::Small(entries) => {
-                if let Some((_, old)) = entries.iter_mut().find(|(name, _)| name.atom == k) {
-                    return Some(std::mem::replace(old, v));
-                }
-                if entries.len() < SMALL_VAR_MAP_CAPACITY {
-                    entries.push((BindingName::new(k), v));
-                    return None;
-                }
-                let mut large = Self::large_from(std::mem::take(entries));
-                let old = large.insert(k, v);
-                self.map = VarStorage::Large(large);
-                old
-            }
-            VarStorage::Large(entries) => entries.insert(k, v),
-            VarStorage::Indexed(indexed) => {
-                let mut entries = Self::large_from(std::mem::take(&mut indexed.entries));
-                let old = entries.insert(k, v);
-                self.map = VarStorage::Large(entries);
-                old
-            }
-        }
-    }
-
-    /// The entries as a large map, in a payload cell of the active heap.
-    fn large_from(entries: BindingEntries) -> crate::gc_storage::PayloadBox<LargeBindings> {
-        let mut large = crate::fasthash::FastMap::with_capacity_and_hasher(
-            entries.len() + 1,
-            Default::default(),
-        );
-        large.extend(
-            entries
-                .into_vec()
-                .into_iter()
-                .map(|(name, binding)| (name.atom, binding)),
-        );
-        crate::gc_storage::PayloadBox::new(LargeBindings(large))
+        self.names.push(k);
+        self.values.push(v);
+        None
     }
 
     pub fn remove(&mut self, k: &str) -> Option<Binding> {
         self.bump();
-        match &mut self.map {
-            VarStorage::Small(entries) => entries
-                .iter()
-                .position(|(name, _)| name.atom.is(k))
-                .map(|index| entries.swap_remove(index).1),
-            VarStorage::Large(entries) => entries.remove(&crate::atom::lookup(k)?),
-            VarStorage::Indexed(indexed) => {
-                let mut entries = Self::large_from(std::mem::take(&mut indexed.entries));
-                let old = crate::atom::lookup(k).and_then(|k| entries.remove(&k));
-                self.map = VarStorage::Large(entries);
-                old
-            }
-        }
+        let slot = self.names.slot_of_text(k)?;
+        self.names.swap_remove(slot);
+        Some(self.values.swap_remove(slot))
     }
+
     pub fn clear(&mut self) {
         self.bump();
-        match &mut self.map {
-            VarStorage::Small(entries) => entries.clear(),
-            VarStorage::Large(entries) => entries.clear(),
-            VarStorage::Indexed(_) => self.map = VarStorage::Small(BindingEntries::new()),
-        }
+        self.names = Names::shared(DescRef::empty());
+        self.values.clear();
     }
-    /// In-place binding write: entries don't move, so the generation stays (see the type docs).
+
+    /// In-place binding write: bindings don't move, so the generation stays (see the type docs).
     pub fn get_mut(&mut self, k: &str) -> Option<&mut Binding> {
-        match &mut self.map {
-            VarStorage::Small(entries) => entries
-                .iter_mut()
-                .find(|(name, _)| name.atom.is(k))
-                .map(|(_, binding)| binding),
-            VarStorage::Large(entries) => entries.get_mut(&crate::atom::lookup(k)?),
-            VarStorage::Indexed(indexed) => {
-                let slot = indexed.layout.slot_of(k)?;
-                Some(&mut indexed.entries[slot].1)
-            }
-        }
+        let slot = self.names.slot_of_text(k)?;
+        self.values.get_mut(slot)
     }
+
     pub fn get(&self, k: &str) -> Option<&Binding> {
-        match &self.map {
-            VarStorage::Small(entries) => entries
-                .iter()
-                .find(|(name, _)| name.atom.is(k))
-                .map(|(_, binding)| binding),
-            VarStorage::Large(entries) => entries.get(&crate::atom::lookup(k)?),
-            VarStorage::Indexed(indexed) => {
-                let slot = indexed.layout.slot_of(k)?;
-                Some(&indexed.entries[slot].1)
-            }
-        }
+        let slot = self.names.slot_of_text(k)?;
+        self.values.get(slot)
     }
+
     pub fn contains_key(&self, k: &str) -> bool {
-        self.get(k).is_some()
+        self.names.slot_of_text(k).is_some()
     }
 
     /// The binding named by `name`, an atom of this environment's heap.
     pub(crate) fn get_atom(&self, name: crate::atom::Atom) -> Option<&Binding> {
-        match &self.map {
-            VarStorage::Small(entries) => entries
-                .iter()
-                .find(|(key, _)| key.atom == name)
-                .map(|(_, binding)| binding),
-            VarStorage::Large(entries) => entries.get(&name),
-            VarStorage::Indexed(indexed) => {
-                let slot = indexed.layout.slot_of_atom(name)?;
-                Some(&indexed.entries[slot].1)
-            }
-        }
+        let slot = self.names.slot_of(name)?;
+        self.values.get(slot)
     }
+
     pub(crate) fn iter(&self) -> VarIter<'_> {
-        match &self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                VarIter::Small(entries.iter())
-            }
-            VarStorage::Large(entries) => VarIter::Large(entries.iter()),
-        }
+        VarIter { map: self, slot: 0 }
     }
-    pub(crate) fn keys(&self) -> VarKeys<'_> {
-        match &self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                VarKeys::Small(entries.iter())
-            }
-            VarStorage::Large(entries) => VarKeys::Large(entries.keys()),
-        }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = crate::atom::Atom> + '_ {
+        (0..self.values.len()).map(|slot| self.names.get(slot).expect("a name per value"))
     }
-    pub(crate) fn values(&self) -> VarValues<'_> {
-        match &self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
-                VarValues::Small(entries.iter())
-            }
-            VarStorage::Large(entries) => VarValues::Large(entries.values()),
-        }
+
+    pub(crate) fn values(&self) -> std::slice::Iter<'_, Binding> {
+        self.values.iter()
     }
+
     /// Byte offset of the generation counter within a `VarMap` (for the JIT's inline template).
     pub(crate) fn generation_offset() -> usize {
         std::mem::offset_of!(VarMap, generation)
@@ -2134,69 +2229,28 @@ impl VarMap {
         std::mem::offset_of!(VarMap, layout_id)
     }
 
-    /// Probe the repr(Rust) small-map arm rather than baking an enum/vector layout: the entries
-    /// are an `InlineVec` whose first binding stays in the environment cell. A native
-    /// fresh-activation hit additionally requires the same nonzero ordered layout identity.
-    /// Unknown compiler layouts simply retain the checked map path.
+    /// Where generated code finds a record's binding values: an `InlineVec` whose first value
+    /// stays in the environment cell, probed in place and spilled. A native fresh-activation
+    /// hit additionally requires the same nonzero ordered layout identity. Unknown compiler
+    /// layouts simply retain the checked map path.
     pub(crate) fn jit_small_storage_layout() -> Option<JitBindingStorage> {
-        let mut small = Self::with_capacity(3);
-        small.insert("probe", Binding::data(Value::Num(7.0), true, true));
-        let large = Self::with_capacity(SMALL_VAR_MAP_CAPACITY + 1);
-        let tag = std::mem::offset_of!(VarMap, map);
-        let small_tag = unsafe { *(&small.map as *const VarStorage as *const u8) };
-        let large_tag = unsafe { *(&large.map as *const VarStorage as *const u8) };
-        if small_tag != 0 || large_tag != 1 {
-            return None;
-        }
-        let VarStorage::Small(entries) = &small.map else {
-            return None;
-        };
-        let vector = entries as *const BindingEntries as usize - &small as *const VarMap as usize;
-        let elements: &[(BindingName, Binding)] = entries;
-        let binding = &elements[0].1 as *const Binding as usize - elements.as_ptr() as usize;
-        let storage = Self::jit_entries_layout(entries)?;
-        let mut indexed = Self::default();
-        indexed.insert("probe", Binding::data(Value::Num(7.0), true, true));
-        indexed.share_layout(&std::cell::OnceCell::new());
-        let indexed_tag = unsafe { *(&indexed.map as *const VarStorage as *const u8) };
-        let VarStorage::Indexed(indexed_bindings) = &indexed.map else {
-            return None;
-        };
-        let indexed_vector = &indexed_bindings.entries as *const BindingEntries as usize
-            - &indexed as *const VarMap as usize;
-        if indexed_tag != 2 || indexed_vector != vector {
-            return None;
-        }
+        let storage = BindingVec::probe_jit_layout(|| Binding::data(Value::Num(7.0), true, true))?;
         Some(JitBindingStorage {
-            tag,
-            entries: vector,
+            entries: std::mem::offset_of!(VarMap, values),
             storage,
-            stride: std::mem::size_of::<(BindingName, Binding)>(),
-            binding,
-        })
-    }
-
-    /// The entries are an `InlineVec`, probed in place and spilled.
-    fn jit_entries_layout(_: &BindingEntries) -> Option<crate::value::JitVecLayout> {
-        let probe = crate::atom::atomize("probe");
-        BindingVec::probe_jit_layout(|| {
-            (
-                BindingName::new(probe),
-                Binding::data(Value::Num(7.0), true, true),
-            )
+            stride: std::mem::size_of::<Binding>(),
+            binding: 0,
         })
     }
 }
 
-/// Where generated code finds a binding map's ordered entries, relative to its [`VarMap`]
+/// Where generated code finds a binding map's values, relative to its [`VarMap`]
 /// (see [`VarMap::jit_small_storage_layout`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct JitBindingStorage {
-    /// The storage enum's tag byte: Small 0, Large 1, Indexed 2.
-    pub(crate) tag: usize,
-    /// The Small arm's entries, which the Indexed arm keeps at the same offset.
+    /// The values' vector.
     pub(crate) entries: usize,
-    /// How the entries hold their `(BindingName, Binding)` elements.
+    /// How the vector holds its `Binding` elements.
     pub(crate) storage: crate::value::JitVecLayout,
     /// The element stride, and the `Binding` within an element.
     pub(crate) stride: usize,
@@ -2482,20 +2536,6 @@ mod binding_layout_tests {
         assert_eq!(allocate_binding_layout_id(&next), 0);
         assert_eq!(allocate_binding_layout_id(&next), 0);
     }
-
-    #[cfg(target_pointer_width = "64")]
-    #[test]
-    fn binding_layout_identity_fits_existing_var_map_padding() {
-        #[allow(dead_code)]
-        struct PreviousVarMap {
-            map: VarStorage,
-            generation: std::cell::Cell<u32>,
-        }
-        assert_eq!(
-            std::mem::size_of::<VarMap>(),
-            std::mem::size_of::<PreviousVarMap>()
-        );
-    }
 }
 
 pub struct Scope {
@@ -2580,9 +2620,10 @@ impl Scope {
     }
 }
 
-/// P1 S4: an environment cell, with its first binding in place, fills the heap's 128-byte size
-/// class.
-const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 128);
+/// P2 W2b: an environment cell, with its first binding's value in place and its names in one
+/// word, fits the heap's 96-byte size class (P1 S4's, with the name in the entry, was 128).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 96);
 
 /// Lexical-name bookkeeping is only populated by direct eval, but every call allocates a scope.
 /// Keep the common empty case to one nullable pointer and materialize the list on first use, in

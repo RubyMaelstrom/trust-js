@@ -2266,10 +2266,10 @@ struct LexicalScope {
     /// Nonzero process-unique identity of `bindings`' names and order; zero if identities are
     /// exhausted (the records then stay unpublished and caches revalidate by identity).
     layout_id: u32,
-    /// Name → slot index shared by wide records (`BindingLayout::fixed`); narrow records scan.
-    index: Option<Rc<crate::interpreter::BindingLayout>>,
-    /// `index`, kept by the chunk's heap for its records to name.
-    kept_index: Option<crate::interpreter::LayoutRef>,
+    /// The names, in slot order, which every record of the scope shares.
+    desc: Rc<crate::interpreter::ScopeDesc>,
+    /// `desc`, kept by the chunk's heap for its records to name.
+    kept_desc: crate::interpreter::DescRef,
 }
 
 impl LexicalScope {
@@ -2277,24 +2277,24 @@ impl LexicalScope {
         // One slot per name in first-declaration order; a repeated name (an early error in
         // source) keeps its first position with the last declaration's attributes, exactly like
         // successive inserts into one record.
-        let mut slots = crate::fasthash::FastMap::<Rc<str>, usize>::default();
+        let mut slots = crate::fasthash::FastMap::<crate::atom::Atom, usize>::default();
         let mut unique: Vec<LexicalBinding> = Vec::with_capacity(bindings.len());
         for binding in bindings {
-            match slots.get(&*binding.name.text()) {
+            match slots.get(&binding.name) {
                 Some(&slot) => unique[slot] = binding,
                 None => {
-                    slots.insert(Rc::from(&*binding.name.text()), unique.len());
+                    slots.insert(binding.name, unique.len());
                     unique.push(binding);
                 }
             }
         }
-        let layout_id = crate::interpreter::new_binding_layout_id();
-        let index = crate::interpreter::BindingLayout::fixed(layout_id, slots);
+        let desc =
+            crate::interpreter::ScopeDesc::new(unique.iter().map(|binding| binding.name).collect());
         Self {
             bindings: unique,
-            layout_id,
-            kept_index: index.as_ref().map(crate::value::keep_binding_layout),
-            index,
+            layout_id: crate::interpreter::new_binding_layout_id(),
+            kept_desc: crate::value::keep_scope_desc(&desc),
+            desc,
         }
     }
 }
@@ -3067,9 +3067,7 @@ impl Chunk {
                     .saturating_mul(std::mem::size_of::<LexicalBinding>()),
             );
             // The names are atoms, which their heap's table accounts.
-            if let Some(index) = &scope.index {
-                visitor.binding_layout(index);
-            }
+            visitor.scope_desc(&scope.desc);
         }
         for init in &self.cap_inits {
             let name = match init {
@@ -21294,10 +21292,7 @@ fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
         .bindings
         .iter()
         .map(|binding| {
-            (
-                crate::interpreter::BindingName::new(binding.name),
-                crate::interpreter::Binding::data(Value::Undefined, !binding.is_const, false),
-            )
+            crate::interpreter::Binding::data(Value::Undefined, !binding.is_const, false)
         })
         .collect();
     let next = if catch {
@@ -21316,10 +21311,10 @@ fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
 fn install_lexical_bindings(
     record: &Env,
     scope: &LexicalScope,
-    bindings: crate::interpreter::BindingEntries,
+    bindings: crate::interpreter::BindingValues,
 ) {
     let mut record = record.borrow_mut();
-    record.vars = crate::interpreter::VarMap::from_fixed_bindings(bindings, scope.kept_index);
+    record.vars = crate::interpreter::VarMap::from_fixed_bindings(bindings, scope.kept_desc);
     record.vars.publish_layout(scope.layout_id);
 }
 
@@ -21348,15 +21343,12 @@ fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
                     current.vars.get_atom(binding.name)
                 }
                 .expect("per-iteration binding missing");
-                (
-                    crate::interpreter::BindingName::new(binding.name),
-                    crate::interpreter::Binding::data(
-                        previous.value(),
-                        previous.mutable,
-                        previous.initialized,
-                    )
-                    .with_strict_immutable(previous.strict_immutable),
+                crate::interpreter::Binding::data(
+                    previous.value(),
+                    previous.mutable,
+                    previous.initialized,
                 )
+                .with_strict_immutable(previous.strict_immutable)
             })
             .collect()
     };

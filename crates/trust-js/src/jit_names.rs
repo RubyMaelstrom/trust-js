@@ -117,11 +117,6 @@ fn emit_deep_name_target_ptr(
     a.b(binding_ready);
     a.bind(holder_slot);
     if scope_entries_fit(layout) {
-        a.ldrb_imm(13, 9, layout.scope_small_tag as u32);
-        a.cmp_imm_w(13, 1);
-        a.b_cond(C_EQ, slow);
-        a.cmp_imm_w(13, 2);
-        a.b_cond(C_HI, slow);
         a.ldr_imm(13, 12, offset_of!(NativeNameDescriptor, slot) as u32);
         scope_entries_len(a, layout, 14, 9);
         a.cmp_reg_x(13, 14);
@@ -176,9 +171,7 @@ pub(super) fn deep_layout_supported(layout: &crate::value::JitLayout) -> bool {
         && layout.scope_parent / 8 < 4096
         && layout.scope_with < 4096
         && (!layout.scope_small_valid
-            || (layout.scope_small_tag < 4096
-                && scope_entries_fit(layout)
-                && layout.scope_binding_offset < 4096))
+            || (scope_entries_fit(layout) && layout.scope_binding_offset < 4096))
 }
 
 /// Value-read variant of the resolution proof. Capturing a Reference uses the target proof

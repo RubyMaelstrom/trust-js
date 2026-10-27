@@ -1440,10 +1440,8 @@ pub struct JitLayout {
     /// null (the handle's niche; checked live).
     pub scope_parent: usize,
     pub scope_parent_valid: bool,
-    /// Guarded repr(Rust) small binding-map arm (its tag byte: Small 0, Large 1, Indexed 2) and
-    /// its ordered entries, which the Indexed arm shares, relative to `Env::as_ptr(env)`. The
-    /// entries hold their elements as `JitRepr::scope_small` describes.
-    pub scope_small_tag: usize,
+    /// A binding map's values in slot order, relative to `Env::as_ptr(env)`: a vector whose
+    /// elements are held as `JitRepr::scope_small` describes.
     pub scope_small_vec: usize,
     pub scope_binding_stride: usize,
     pub scope_binding_offset: usize,
@@ -1850,12 +1848,11 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         + offset_of!(crate::interpreter::Scope, vars)
         + crate::interpreter::VarMap::layout_id_offset();
     let vars_offset = scope_refcell + offset_of!(crate::interpreter::Scope, vars);
-    // The ordered entries of a small (or indexed) binding map, probed per build.
+    // A binding map's values in slot order, probed per build.
     let scope_small_valid = repr.scope_small.is_some();
     let small = repr
         .scope_small
         .unwrap_or(crate::interpreter::JitBindingStorage {
-            tag: 0,
             entries: 0,
             storage: JitVecLayout::Vec {
                 ptr: 0,
@@ -1865,7 +1862,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             stride: 0,
             binding: 0,
         });
-    let scope_small_tag = vars_offset + small.tag;
     let scope_small_vec = vars_offset + small.entries;
     let scope_with = scope_refcell + crate::interpreter::Scope::with_object_offset();
     let probe_with = crate::interpreter::new_with_scope(probe_env, Value::Null);
@@ -2037,7 +2033,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         scope_layout,
         scope_parent,
         scope_parent_valid,
-        scope_small_tag,
         scope_small_vec,
         scope_binding_stride: small.stride,
         scope_binding_offset: small.binding,
@@ -2932,10 +2927,20 @@ pub(crate) struct GcState {
     pub(crate) interned_strings: RefCell<Vec<Option<crate::lstr::LStr>>>,
     /// This heap's atoms, roots for the heap's lifetime (see [`crate::atom`]).
     pub(crate) atoms: RefCell<crate::atom::AtomTable>,
-    /// The binding layouts this heap's environments have shared, kept for the heap's lifetime
-    /// so that an environment names its layout without owning it ([`keep_binding_layout`]).
-    binding_layouts:
-        RefCell<crate::fasthash::FastMap<usize, Rc<crate::interpreter::BindingLayout>>>,
+    /// The scope descriptors this heap's environments share, kept for the heap's lifetime so that
+    /// an environment names its descriptor without owning it ([`keep_scope_desc`]).
+    scope_descs: RefCell<Vec<Rc<crate::interpreter::ScopeDesc>>>,
+    /// The descriptors of the tree-walked functions' shared activation layouts, which their
+    /// ASTs cache as text ([`scope_desc_for`]), by layout, with the layout kept.
+    layout_descs: RefCell<
+        crate::fasthash::FastMap<
+            usize,
+            (
+                Rc<crate::interpreter::BindingLayout>,
+                Rc<crate::interpreter::ScopeDesc>,
+            ),
+        >,
+    >,
     /// Actual AST template and compiled chunk owners, weakly registered in their heap. Their
     /// constants and layouts are roots for the Rust owner's lifetime, including late fields.
     pub(crate) code_roots: RefCell<Vec<std::rc::Weak<dyn crate::gc_trace::GcTrace>>>,
@@ -3054,7 +3059,7 @@ pub(crate) struct PayloadDescs {
     typed_array: crate::gc_core::DescId,
     extras: crate::gc_core::DescId,
     closure_cache: crate::gc_core::DescId,
-    large_bindings: crate::gc_core::DescId,
+    name_index: crate::gc_core::DescId,
 }
 
 macro_rules! payload_kinds {
@@ -3085,7 +3090,7 @@ payload_kinds! {
     crate::native_typed_array::NativeTypedArray => typed_array,
     DenseExtras => extras,
     UserCallableCache => closure_cache,
-    crate::interpreter::LargeBindings => large_bindings,
+    crate::interpreter::NameIndex => name_index,
 }
 
 impl PayloadDescs {
@@ -3128,8 +3133,8 @@ impl PayloadDescs {
             ),
             extras: leaf(payload_layout::<DenseExtras>("property map extras")),
             closure_cache: leaf(payload_layout::<UserCallableCache>("closure cache")),
-            large_bindings: leaf(payload_layout::<crate::interpreter::LargeBindings>(
-                "environment bindings",
+            name_index: leaf(payload_layout::<crate::interpreter::NameIndex>(
+                "environment name index",
             )),
         }
     }
@@ -3289,19 +3294,36 @@ fn trace_user_fn<S: crate::gc_trace::TraceSink + ?Sized>(user: &UserCallable, si
     user.cache.set(metadata);
 }
 
-/// `layout`, which the active heap keeps from now on for as long as it lives, as its environments
-/// name it: they share it without owning it ([`crate::interpreter::LayoutRef`]).
-pub(crate) fn keep_binding_layout(
+/// `desc`, which the active heap keeps from now on for as long as it lives, as its environments
+/// name it: they share it without owning it ([`crate::interpreter::DescRef`]). A compiled scope
+/// keeps its descriptor once, when it is made.
+pub(crate) fn keep_scope_desc(
+    desc: &Rc<crate::interpreter::ScopeDesc>,
+) -> crate::interpreter::DescRef {
+    with_agent_heap(|heap| heap.scope_descs.borrow_mut().push(desc.clone()));
+    // SAFETY: the active heap keeps the descriptor from now on.
+    unsafe { crate::interpreter::DescRef::kept(desc) }
+}
+
+/// The active heap's descriptor of a tree-walked function's activation layout, made from the
+/// layout's names on first use and kept, with the layout, for as long as the heap lives.
+pub(crate) fn scope_desc_for(
     layout: &Rc<crate::interpreter::BindingLayout>,
-) -> crate::interpreter::LayoutRef {
+) -> crate::interpreter::DescRef {
     with_agent_heap(|heap| {
-        heap.binding_layouts
+        let key = Rc::as_ptr(layout) as usize;
+        if let Some((_, desc)) = heap.layout_descs.borrow().get(&key) {
+            // SAFETY: the heap keeps the descriptor.
+            return unsafe { crate::interpreter::DescRef::kept(desc) };
+        }
+        let desc = crate::interpreter::ScopeDesc::of_layout(layout);
+        // SAFETY: the heap keeps the descriptor from now on.
+        let kept = unsafe { crate::interpreter::DescRef::kept(&desc) };
+        heap.layout_descs
             .borrow_mut()
-            .entry(Rc::as_ptr(layout) as usize)
-            .or_insert_with(|| layout.clone());
-    });
-    // SAFETY: the active heap keeps the layout from now on.
-    unsafe { crate::interpreter::LayoutRef::kept(layout) }
+            .insert(key, (layout.clone(), desc));
+        kept
+    })
 }
 
 /// `f` on the active Agent heap's atom table (see [`crate::atom`]).
@@ -4549,7 +4571,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         property_layout_desc: descs.property_layout,
         interned_strings: RefCell::default(),
         atoms: RefCell::default(),
-        binding_layouts: RefCell::default(),
+        scope_descs: RefCell::default(),
+        layout_descs: RefCell::default(),
         code_roots: RefCell::default(),
         young_code_roots: RefCell::default(),
         young_code_words: RefCell::default(),

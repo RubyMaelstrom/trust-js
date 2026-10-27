@@ -257,9 +257,8 @@ fn scope_offsets_read_generation_parent_and_bindings() {
     let layout = probe(&engine);
     let entries = |env: &Env| {
         let base = Env::as_ptr(env) as usize;
-        let tag = read::<u8>(base, layout.scope_small_tag);
         let (data, len, _) = sequence(entries_of(&layout), base + layout.scope_small_vec);
-        (tag, data, len)
+        (data, len)
     };
     let check_bindings = |env: &Env, data: usize, count: usize| {
         let scope = env.borrow();
@@ -295,7 +294,8 @@ fn scope_offsets_read_generation_parent_and_bindings() {
         0,
         "a root scope's parent is the handle's niche"
     );
-    // One binding stays in the environment cell; more spill; past eight the map is Large.
+    // One binding stays in the environment cell; more spill; past eight the names are indexed,
+    // and the values stay where generated code reads them.
     for count in [1usize, 2, 5, 9] {
         let env = new_scope(Some(parent));
         for slot in 0..count {
@@ -324,15 +324,11 @@ fn scope_offsets_read_generation_parent_and_bindings() {
         let parent_word = read::<usize>(base, layout.scope_parent);
         assert_eq!(parent_word, env_stored(&parent));
         assert_eq!(parent_word, Env::as_ptr(&parent) as usize);
-        let (tag, data, len) = entries(&env);
-        if count > 8 {
-            assert_eq!(tag, 1, "a Large map");
-            continue;
-        }
-        assert_eq!((tag, len), (0, count), "a Small map");
+        let (data, len) = entries(&env);
+        assert_eq!(len, count);
         check_bindings(&env, data, count);
     }
-    // An Indexed map shares the Small arm's entries.
+    // A record that shares a descriptor keeps its values where generated code reads them.
     let env = new_scope(None);
     {
         let mut scope = env.borrow_mut();
@@ -343,8 +339,9 @@ fn scope_offsets_read_generation_parent_and_bindings() {
         }
         scope.vars.share_layout(&std::cell::OnceCell::new());
     }
-    let (tag, data, len) = entries(&env);
-    assert_eq!((tag, len), (2, 3), "an Indexed map");
+    let (data, len) = entries(&env);
+    assert_eq!(len, 3);
+    assert!(env.borrow().vars.shared_desc().is_some());
     check_bindings(&env, data, 3);
     assert_eq!(
         read::<u32>(Env::as_ptr(&env) as usize, layout.scope_layout),

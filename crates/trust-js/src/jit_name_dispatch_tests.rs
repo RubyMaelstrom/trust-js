@@ -190,20 +190,19 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
     for indexed in [false, true] {
         let identity = new_binding_layout_id();
         let shared = std::cell::OnceCell::new();
+        let desc = crate::interpreter::ScopeDesc::new(
+            (0..24)
+                .map(|n| crate::atom::atomize(&format!("v{n}")))
+                .collect(),
+        );
+        let kept = crate::value::keep_scope_desc(&desc);
         let make = || {
             let env = new_scope(None);
             env.borrow_mut().vars = VarMap::from_fixed_bindings(
                 (0..24)
-                    .map(|n| {
-                        (
-                            crate::interpreter::BindingName::new(crate::atom::atomize(&format!(
-                                "v{n}"
-                            ))),
-                            Binding::data(Value::Num(n as f64), true, true),
-                        )
-                    })
+                    .map(|n| Binding::data(Value::Num(n as f64), true, true))
                     .collect(),
-                None,
+                kept,
             );
             if indexed {
                 env.borrow_mut().vars.share_layout(&shared);

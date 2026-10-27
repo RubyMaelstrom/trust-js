@@ -124,8 +124,8 @@ fn scope_entries(layout: &JitLayout) -> JitVecLayout {
         .storage
 }
 
-/// Load the scope's entry count into `dst` ([`vec_len`]). The caller has checked that the map's
-/// tag (`JitLayout::scope_small_tag`) is Small or Indexed.
+/// Load the scope's binding count into `dst` ([`vec_len`]): every record keeps its bindings'
+/// values, slot by slot, in one vector.
 pub(super) fn scope_entries_len(a: &mut Asm, layout: &JitLayout, dst: u8, scope: u8) {
     vec_len(a, scope_entries(layout), dst, scope, layout.scope_small_vec);
 }

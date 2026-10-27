@@ -53,7 +53,6 @@ fn valid(l: &JitLayout) -> bool {
             l.scope_layout,
             l.scope_parent,
             l.scope_with,
-            l.scope_small_tag,
             l.scope_small_vec,
             l.scope_binding_stride,
             l.scope_binding_offset,
@@ -113,14 +112,9 @@ fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
 }
 
 /// R8 supplies a validated layout's slot index; R9 is its actual current scope. Address
-/// the live Small/Indexed storage instead of retaining an identity-specific Binding pointer.
+/// the live binding values instead of retaining an identity-specific Binding pointer.
 fn layout_binding_target(a: &mut Asm, l: &JitLayout, slot_offset: usize, slow: usize) {
     if storage::scope_entries_fit(l) {
-        a.nr_load8(AX, R9, l.scope_small_tag);
-        a.nr_imm(DX, 2);
-        a.nr_reg(0x09, AX, DX); // tag | 2 == 2 accepts Small(0) and Indexed(2)
-        a.nr_cmp(AX, DX);
-        a.jcc(NE, slow);
         a.nr_load(DX, R8, slot_offset);
         storage::scope_entries_len(a, l, CX, R9);
         a.nr_cmp(DX, CX);
