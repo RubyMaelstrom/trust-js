@@ -474,6 +474,16 @@ impl OneByteNativeCode {
         }
     }
 
+    /// List both programs, for byte and for word subjects, in the perf map
+    /// (`TRUST_JS_PERF_MAP`, see [`crate::jit::profiler`]) as the pattern `source` with `flags`.
+    fn list_in_perf_map(&self, source: &str, flags: &str) {
+        for executable in [&self.byte_executable, &self.word_executable] {
+            crate::jit::profiler::perf_map_code(executable.as_ptr(), executable.len(), || {
+                format!("RegExp:/{}/{flags}", crate::jstr::to_text(source))
+            });
+        }
+    }
+
     fn find_ascii(
         &self,
         subject: &[u8],
@@ -2576,6 +2586,9 @@ impl Regex {
             return;
         }
         if let Some(program) = OneByteNativeProgram::compile(&self.prog, self.multiline) {
+            if let Some(code) = &program.machine_code {
+                code.list_in_perf_map(&self.source, &self.flags);
+            }
             *self.one_byte_native.borrow_mut() = Some(program);
             regexp_prof_tier_up(true);
         } else {
@@ -7118,6 +7131,34 @@ mod internal_engine_diagnostics {
             multiline.exec_text_shared(&ascii, 0, &control).unwrap();
         }
         assert!(!multiline.tier_feedback().3);
+    }
+
+    /// The perf map (`TRUST_JS_PERF_MAP`) lists both of a pattern's machine programs, for byte
+    /// and for word subjects, under its source and flags when the pattern tiers up.
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
+    #[test]
+    fn perf_map_names_native_regexp_programs_by_source_and_flags() {
+        let capture = crate::jit::profiler::PerfMapCapture::start("regexp");
+        let re = super::Regex::new("a.c", "g").unwrap();
+        let control = crate::RuntimeInterrupt::default();
+        let text = super::ReText::new_rc(false, &crate::lstr::LStr::from("xxaXcyy"));
+        for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
+            re.exec_text_shared(&text, 0, &control).unwrap();
+        }
+        let native = re.one_byte_native.borrow();
+        let code = native
+            .as_ref()
+            .and_then(|program| program.machine_code.as_ref())
+            .expect("the dot pattern tiers up to machine code");
+        let lines = capture.lines();
+        for executable in [&code.byte_executable, &code.word_executable] {
+            let line = (
+                executable.as_ptr() as usize,
+                executable.len(),
+                "RegExp:/a.c/g".to_string(),
+            );
+            assert!(lines.contains(&line), "{line:x?} in {lines:x?}");
+        }
     }
 
     #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]

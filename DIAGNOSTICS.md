@@ -193,6 +193,32 @@ comment/example in the same change.
   Labels show the chunk's first local names, not source function names. This is
   optional compile/drop metadata; it neither instruments native instructions nor
   loads a profiler library. Keep it disabled for uninstrumented timing comparisons.
+- `TRUST_JS_PERF_MAP=1` (any value but `0`) lists every piece of code the engine
+  generates in perf's JIT map, `/tmp/perf-<pid>.map`, the file V8's `--perf-basic-prof`
+  writes: one `START SIZE name` line each, hexadecimal without `0x`, so `perf report`
+  names samples in generated code instead of showing bare addresses. A compiled chunk is
+  named as V8 names baseline code, `JS:^<name> <url>:<line>:<column>` at its function's
+  first token (`<anonymous>` for a function without a name; code without a script, such
+  as Script and module bodies, loop fragments and self-hosted built-ins, names its first
+  locals instead: `JS:^<name> locals(a,b)`), a shared stub `Stub:<kind>` and a native
+  RegExp program `RegExp:/<source>/<flags>`. The file is appended to, never truncated, and
+  freed code stays listed (the format has no unload record); delete the file once the
+  profile is reported. Off, it costs one check per piece of code; keep it off for
+  uninstrumented timing comparisons. Call graphs need `--user-callchains` where
+  `kernel.perf_event_paranoid` is 2: it refuses the kernel call chains perf otherwise
+  requests. On a host with two PMU clusters (a Cortex-X925/A725 system, for one), pin perf
+  with the workload to one core, or perf also reports a spurious count from the other
+  cluster:
+
+  ```sh
+  TRUST_JS_PERF_MAP=1 taskset -c 5 perf record -e instructions:u --call-graph fp \
+    --user-callchains -o vue.data -- target/release/trust-js benchmarks/fixtures/vue.js
+  perf report -i vue.data --no-children --sort symbol --stdio
+  ```
+
+  While another perf session holds the user's locked-memory budget
+  (`perf_event_mlock_kb`), `perf record` fails to open its events; smaller ring buffers
+  (`-m 16`) let it open them.
 
 ## Architecture diagnostics
 

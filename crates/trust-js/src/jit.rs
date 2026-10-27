@@ -62,7 +62,7 @@ mod names;
 mod typed_array;
 
 #[path = "jit_profiler.rs"]
-mod profiler;
+pub(crate) mod profiler;
 
 #[path = "jit_cache.rs"]
 pub(crate) mod cache;
@@ -10639,6 +10639,55 @@ impl SharedStub {
         }
     }
 
+    /// The stub's name in perf's map (see [`profiler`]): `Stub:` and its kind, the variant with
+    /// the options [`SharedStub::key`] encodes, such as `Stub:PropWays(arr_ok,method)`.
+    fn perf_map_name(self) -> String {
+        let named = |kind: &str, options: &[(&str, bool)]| {
+            let set: Vec<&str> = options
+                .iter()
+                .filter(|&&(_, on)| on)
+                .map(|&(option, _)| option)
+                .collect();
+            if set.is_empty() {
+                format!("Stub:{kind}")
+            } else {
+                format!("Stub:{kind}({})", set.join(","))
+            }
+        };
+        match self {
+            SharedStub::NameValuePtr { property_ok } => {
+                named("NameValuePtr", &[("property_ok", property_ok)])
+            }
+            SharedStub::NameValuePtrIn => named("NameValuePtrIn", &[]),
+            SharedStub::NameLoad { for_call } => named("NameLoad", &[("for_call", for_call)]),
+            SharedStub::Helper { idx } => format!("Stub:Helper({})", helper_name(idx.into())),
+            SharedStub::PropWays(flags) => named(
+                "PropWays",
+                &[
+                    ("arr_ok", flags.arr_ok),
+                    ("wrap_ok", flags.wrap_ok),
+                    ("method", flags.method),
+                    ("kc", flags.kc),
+                ],
+            ),
+            SharedStub::CallSecondary => named("CallSecondary", &[]),
+            SharedStub::DirectCall { argc, with_this } => format!(
+                "Stub:DirectCall(argc={argc}{})",
+                if with_this { ",with_this" } else { "" }
+            ),
+            SharedStub::Intrinsics1 {
+                array_push,
+                discard,
+            } => named(
+                "Intrinsics1",
+                &[("array_push", array_push), ("discard", discard)],
+            ),
+            SharedStub::Intrinsics2 { discard } => named("Intrinsics2", &[("discard", discard)]),
+            SharedStub::TypedElement { write } => named("TypedElement", &[("write", write)]),
+            SharedStub::NameElement { write } => named("NameElement", &[("write", write)]),
+        }
+    }
+
     /// The stub body at the current position (its entry label is already bound).
     fn emit(self, a: &mut asm::Asm, context: &StubContext<'_>) {
         let layout = context.layout;
@@ -11079,6 +11128,8 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
     };
     a.bind(entry);
     SharedStub::from_key(key).emit(&mut a, &local);
+    // Each stub in the buffer, in order, by entry label: the perf map names them one by one.
+    let mut stubs = vec![(entry, key)];
     loop {
         let requested = a.take_shared_stubs();
         if requested.is_empty() {
@@ -11087,20 +11138,50 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
         for (nested, label) in requested {
             a.bind(label);
             SharedStub::from_key(nested).emit(&mut a, &local);
+            stubs.push((label, nested));
         }
     }
     a.bind(finish);
     if matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. }) {
         emit_direct_finish_stub(&mut a, context.ilayout?, context.layout.valid);
     }
-    let (words, offsets) = a.finish_with_offsets(&[entry]);
+    let labels: Vec<usize> = stubs
+        .iter()
+        .map(|&(label, _)| label)
+        .chain([finish])
+        .collect();
+    let (words, offsets) = a.finish_with_offsets(&labels);
     let executable = ExecutableBuffer::from_bytes(unsafe {
         std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
     })?;
     let address = executable.as_ptr() as u64 + u64::from(offsets[0]);
+    list_global_stubs(&executable, &stubs, &offsets);
     // Permanent: any compiled chunk may branch here for the rest of the process.
     std::mem::forget(executable);
     Some(address)
+}
+
+/// List a process-wide stub buffer in the perf map, each stub under its own kind: the entry
+/// stub, the stubs it requested (assembled into the same buffer), and, after the `finish` label
+/// whose offset ends `offsets`, the direct-call teardown stub a direct-call stub carries.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn list_global_stubs(executable: &ExecutableBuffer, stubs: &[(usize, u32)], offsets: &[u32]) {
+    let base = executable.as_ptr();
+    for (&(_, key), bounds) in stubs.iter().zip(offsets.windows(2)) {
+        let (start, end) = (bounds[0] as usize, bounds[1] as usize);
+        profiler::perf_map_code(base.wrapping_add(start), end - start, || {
+            SharedStub::from_key(key).perf_map_name()
+        });
+    }
+    let finish = offsets[stubs.len()] as usize;
+    if finish < executable.len() {
+        profiler::perf_map_code(base.wrapping_add(finish), executable.len() - finish, || {
+            "Stub:DirectFinish".to_string()
+        });
+    }
 }
 
 #[cfg(all(

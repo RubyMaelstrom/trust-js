@@ -2421,6 +2421,10 @@ pub struct Chunk {
     /// `TRUST_JS_JIT_MAP` reports them so a profiler sample joins back to the script text).
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) debug_origin: (u32, u32),
+    /// The name perf's map lists this chunk's machine code under (`JS:^<name>
+    /// <url>:<line>:<column>`; see [`crate::jit::profiler::chunk_label`]), built from the source
+    /// function only while `TRUST_JS_PERF_MAP` is on.
+    pub(crate) perf_map_label: Option<Box<str>>,
     /// The caller must complete FunctionDeclarationInstantiation before running this body.
     /// The existing activation, including mapped arguments and parameter-expression scopes,
     /// is authoritative. Lean/moved call entries must never bypass this prologue.
@@ -2654,6 +2658,7 @@ impl crate::gc_trace::GcTrace for Chunk {
         // chunks have their own actual-owner registrations, including late compiled children.
         let Self {
             debug_origin: _,
+            perf_map_label: _,
             prepared_entry: _,
             lean_new_target: _,
             rest_slot: _,
@@ -2988,6 +2993,7 @@ impl Chunk {
                 .map_or(0, CallNames::retained_bytes),
         );
         bytes = bytes.saturating_add(self.positions.retained_bytes());
+        bytes = bytes.saturating_add(self.perf_map_label.as_deref().map_or(0, str::len));
         bytes = bytes.saturating_add(self.inline_sites.scan_retained_memory(visitor));
         bytes = bytes.saturating_add(
             (self.call_positions.len() + self.construct_positions.len())
@@ -7517,6 +7523,9 @@ fn finish_chunk(
         .iter()
         .any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray));
     let inline_planning_genv = exclusive_inline_genv(&c.inline_targets);
+    // Built only while the perf map is on; the default path pays the one check.
+    let perf_map_label = crate::jit::profiler::perf_map_enabled()
+        .then(|| crate::jit::profiler::chunk_label(source, &c.slot_names));
     let chunk = Chunk {
         debug_origin: source.map_or((0, 0), |func| {
             (
@@ -7524,6 +7533,7 @@ fn finish_chunk(
                 func.source.as_ref().map_or(0, |text| text.len() as u32),
             )
         }),
+        perf_map_label,
         prepared_entry,
         lean_new_target: c.lean_new_target,
         rest_slot: c.rest_slot,

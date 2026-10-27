@@ -191,6 +191,7 @@ Diagnostics (env, unstable):
   TRUST_JS_JIT_CODE_BUDGET_MB=N  Process-wide live executable-code cap, 1..1024 MiB
   TRUST_JS_JIT_LOOPLOG=1     Trace JIT loop back-edge compilation
   TRUST_JS_PERF_METRICS=1    Print one JSON JIT/collector performance summary at normal exit
+  TRUST_JS_PERF_MAP=1        List generated code in /tmp/perf-<pid>.map for perf report
 "
     );
 }

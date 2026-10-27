@@ -353,6 +353,11 @@ impl ScriptSource {
         self.kind
     }
 
+    /// The URL its frames report (engine text).
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
     /// The referrer of this source's ScriptOrModule, None when that is null.
     pub(crate) fn referrer(&self) -> Option<&Rc<str>> {
         self.referrer.get()
