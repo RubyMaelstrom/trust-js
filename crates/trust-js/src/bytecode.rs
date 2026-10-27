@@ -21851,6 +21851,24 @@ unsafe fn jit_intrinsic_inner(
             flag: 0,
         };
     }
+    if matches!(
+        intrinsic,
+        INTRINSIC_CHAR_AT | INTRINSIC_CODE_POINT_AT | INTRINSIC_STRING_SLICE
+    ) {
+        // [receiver, callee, index] or [receiver, callee, start, end]: charAt, codePointAt and
+        // the two-argument slice on a String receiver with Number arguments (the template's
+        // guards; ECMA-262 §22.1.3.2, §22.1.3.4, §22.1.3.23) run no author code and only read or
+        // slice the string, so like charCodeAt they need none of the native-call boundary below.
+        let value = string_intrinsic(i, intrinsic, base);
+        for k in 0..width {
+            std::ptr::drop_in_place(base.add(k));
+        }
+        base.write(value);
+        return crate::jit::SpFlag {
+            sp: base.add(1),
+            flag: 0,
+        };
+    }
     if intrinsic == INTRINSIC_ARRAY_PUSH {
         // [receiver, callee, value]. A guarded dense append runs no author code, so it needs
         // none of the native-call boundary below (depth, safepoint, new.target bookkeeping).
@@ -21888,78 +21906,6 @@ unsafe fn jit_intrinsic_inner(
                 let saved_ctor = std::mem::replace(&mut i.constructing, false);
                 let saved_nt = std::mem::replace(&mut i.new_target, Value::Undefined);
                 let r = match intrinsic {
-                    INTRINSIC_CHAR_AT => {
-                        let ValueView::Str(s) = &((*base).clone()).view() else {
-                            unreachable!("charAt intrinsic receiver guard")
-                        };
-                        let ValueView::Num(n) = &((*base.add(2)).clone()).view() else {
-                            unreachable!("charAt intrinsic index guard")
-                        };
-                        let idx = if n.is_nan() { 0.0 } else { n.trunc() };
-                        Ok(if idx < 0.0 || !idx.is_finite() {
-                            Value::lstr("")
-                        } else {
-                            match i.unit_at(s, idx as usize) {
-                                Some(unit) => Value::Str(crate::jstr::unit_lstr(unit)),
-                                None => Value::lstr(""),
-                            }
-                        })
-                    }
-                    INTRINSIC_CODE_POINT_AT => {
-                        #[cfg(test)]
-                        TEST_JIT_CODE_POINT_INTRINSICS.with(|count| count.set(count.get() + 1));
-                        let ValueView::Str(s) = &((*base).clone()).view() else {
-                            unreachable!("codePointAt intrinsic receiver guard")
-                        };
-                        let ValueView::Num(n) = &((*base.add(2)).clone()).view() else {
-                            unreachable!("codePointAt intrinsic index guard")
-                        };
-                        let idx = if n.is_nan() { 0.0 } else { n.trunc() };
-                        Ok(if idx < 0.0 || !idx.is_finite() {
-                            Value::Undefined
-                        } else {
-                            i.code_point_at(s, idx as usize)
-                                .map_or(Value::Undefined, |point| Value::Num(point as f64))
-                        })
-                    }
-                    INTRINSIC_STRING_SLICE => {
-                        let ValueView::Str(s) = &((*base).clone()).view() else {
-                            unreachable!("slice intrinsic receiver guard")
-                        };
-                        let ValueView::Num(start) = &((*base.add(2)).clone()).view() else {
-                            unreachable!("slice intrinsic start guard")
-                        };
-                        let ValueView::Num(end) = &((*base.add(3)).clone()).view() else {
-                            unreachable!("slice intrinsic end guard")
-                        };
-                        debug_assert!(s.ascii_hint());
-                        let len = s.text().len() as i64;
-                        let norm = |n: f64| {
-                            if n.is_nan() {
-                                return 0;
-                            }
-                            let n = if n.is_infinite() {
-                                if n > 0.0 {
-                                    len
-                                } else {
-                                    -len - 1
-                                }
-                            } else {
-                                n as i64
-                            };
-                            if n < 0 {
-                                (len + n).max(0)
-                            } else {
-                                n.min(len)
-                            }
-                        };
-                        let (start, end) = (norm(*start), norm(*end));
-                        Ok(if start < end {
-                            Value::Str(s.slice_units(start as usize, end as usize))
-                        } else {
-                            Value::lstr("")
-                        })
-                    }
                     INTRINSIC_OBJECT_HAS_OWN => {
                         let object = *base.add(2);
                         let ValueView::Obj(_) = object.view() else {
@@ -22198,6 +22144,87 @@ unsafe fn jit_intrinsic_inner(
         Err(ab) => {
             ctx.throw_at(packed & 0xFFFF, ab);
             crate::jit::SpFlag { sp: base, flag: 1 }
+        }
+    }
+}
+
+/// [`jit_intrinsic_inner`]'s String intrinsics, which run no author code: charAt and codePointAt
+/// at a Number index, and the two-argument slice with Number bounds, on a String receiver (the
+/// template's guards). Reads the operands at `base` in place; the caller releases them.
+unsafe fn string_intrinsic(i: &mut Interp, intrinsic: u8, base: *const Value) -> Value {
+    match intrinsic {
+        INTRINSIC_CHAR_AT => {
+            let ValueView::Str(s) = &((*base).clone()).view() else {
+                unreachable!("charAt intrinsic receiver guard")
+            };
+            let ValueView::Num(n) = &((*base.add(2)).clone()).view() else {
+                unreachable!("charAt intrinsic index guard")
+            };
+            let idx = if n.is_nan() { 0.0 } else { n.trunc() };
+            if idx < 0.0 || !idx.is_finite() {
+                Value::lstr("")
+            } else {
+                match i.unit_at(s, idx as usize) {
+                    Some(unit) => Value::Str(crate::jstr::unit_lstr(unit)),
+                    None => Value::lstr(""),
+                }
+            }
+        }
+        INTRINSIC_CODE_POINT_AT => {
+            #[cfg(test)]
+            TEST_JIT_CODE_POINT_INTRINSICS.with(|count| count.set(count.get() + 1));
+            let ValueView::Str(s) = &((*base).clone()).view() else {
+                unreachable!("codePointAt intrinsic receiver guard")
+            };
+            let ValueView::Num(n) = &((*base.add(2)).clone()).view() else {
+                unreachable!("codePointAt intrinsic index guard")
+            };
+            let idx = if n.is_nan() { 0.0 } else { n.trunc() };
+            if idx < 0.0 || !idx.is_finite() {
+                Value::Undefined
+            } else {
+                i.code_point_at(s, idx as usize)
+                    .map_or(Value::Undefined, |point| Value::Num(point as f64))
+            }
+        }
+        _ => {
+            debug_assert_eq!(intrinsic, INTRINSIC_STRING_SLICE);
+            let ValueView::Str(s) = &((*base).clone()).view() else {
+                unreachable!("slice intrinsic receiver guard")
+            };
+            let ValueView::Num(start) = &((*base.add(2)).clone()).view() else {
+                unreachable!("slice intrinsic start guard")
+            };
+            let ValueView::Num(end) = &((*base.add(3)).clone()).view() else {
+                unreachable!("slice intrinsic end guard")
+            };
+            debug_assert!(s.ascii_hint());
+            let len = s.text().len() as i64;
+            let norm = |n: f64| {
+                if n.is_nan() {
+                    return 0;
+                }
+                let n = if n.is_infinite() {
+                    if n > 0.0 {
+                        len
+                    } else {
+                        -len - 1
+                    }
+                } else {
+                    n as i64
+                };
+                if n < 0 {
+                    (len + n).max(0)
+                } else {
+                    n.min(len)
+                }
+            };
+            let (start, end) = (norm(*start), norm(*end));
+            if start < end {
+                Value::Str(s.slice_units(start as usize, end as usize))
+            } else {
+                Value::lstr("")
+            }
         }
     }
 }
