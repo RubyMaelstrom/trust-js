@@ -7281,6 +7281,21 @@ impl Interp {
     /// that String itself; a static name (no heap cell), an index or an escaped key
     /// ([`crate::value::encode_string_key`]) gets a heap String, cached by key. Live property
     /// attributes and values are always read by the enumeration caller.
+    /// A property key, as engine key text, as the value author code receives (a Proxy trap's
+    /// key argument): its Symbol, or a String, which for a key with an atom is that atom's own
+    /// cell or a static name's cached String (see [`Interp::property_key_string`]) rather than a
+    /// fresh copy. A String's identity is unobservable, and a trap that reads the key back finds
+    /// its atom at once.
+    pub(crate) fn key_value(&mut self, key: &str) -> Value {
+        if let Some(symbol) = self.sym_from_key(key) {
+            return symbol;
+        }
+        match crate::atom::PropKey::lookup_text(key) {
+            Some(key) => Value::Str(self.property_key_string(key)),
+            None => crate::value::string_key_value(key),
+        }
+    }
+
     pub(crate) fn property_key_string(&mut self, key: crate::atom::PropKey) -> crate::lstr::LStr {
         use crate::lstr::Units;
         if let Some(atom) = key.as_atom() {
@@ -10272,10 +10287,7 @@ impl Interp {
             // Forward to the target's [[Get]], preserving the original Receiver.
             return self.proxy_forward(|me| me.get_member_recv(&target, key, receiver));
         };
-        let key_value = key_value.unwrap_or_else(|| {
-            self.sym_from_key(key)
-                .unwrap_or_else(|| crate::value::string_key_value(key))
-        });
+        let key_value = key_value.unwrap_or_else(|| self.key_value(key));
         let res = self.proxy_call_trap(
             PROXY_TRAP_GET,
             &trap,
@@ -10342,9 +10354,7 @@ impl Interp {
                 let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")? else {
                     return self.proxy_forward(|me| me.get_member_recv(&target, key, *receiver));
                 };
-                let key_value = self
-                    .sym_from_key(key)
-                    .unwrap_or_else(|| crate::value::string_key_value(key));
+                let key_value = self.key_value(key);
                 let res = self.proxy_call_trap(
                     PROXY_TRAP_GET,
                     &trap,
@@ -10919,9 +10929,7 @@ impl Interp {
                     return self
                         .proxy_forward(|me| me.set_member_recv(&target, key, value, receiver));
                 };
-                let key_value = self
-                    .sym_from_key(key)
-                    .unwrap_or_else(|| crate::value::string_key_value(key));
+                let key_value = self.key_value(key);
                 let ok = self.proxy_call_trap(
                     PROXY_TRAP_SET,
                     &trap,
@@ -10990,9 +10998,7 @@ impl Interp {
                     return self
                         .proxy_forward(|me| me.set_member_recv(&target, key, value, receiver));
                 };
-                let key_value = self
-                    .sym_from_key(key)
-                    .unwrap_or_else(|| crate::value::string_key_value(key));
+                let key_value = self.key_value(key);
                 let ok = self.proxy_call_trap(
                     PROXY_TRAP_SET,
                     &trap,

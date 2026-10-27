@@ -1026,9 +1026,7 @@ pub(crate) fn proxy_get_own_property(
     else {
         return target_own_property(i, target, key);
     };
-    let key_val = i
-        .sym_from_key(key)
-        .unwrap_or_else(|| crate::value::string_key_value(key));
+    let key_val = i.key_value(key);
     let result = ab(i.proxy_call_trap(
         crate::interpreter::PROXY_TRAP_GET_OWN_PROPERTY_DESCRIPTOR,
         &trap,
@@ -1234,9 +1232,7 @@ fn proxy_define_property_record(
             Ok(false)
         };
     };
-    let key_val = i
-        .sym_from_key(key)
-        .unwrap_or_else(|| crate::value::string_key_value(key));
+    let key_val = i.key_value(key);
     // The trap receives FromPropertyDescriptor(desc): a fresh object holding only the present
     // fields, in the spec's order (value, writable, get, set, enumerable, configurable).
     let norm = i.new_object();

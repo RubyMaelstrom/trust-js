@@ -3185,9 +3185,7 @@ impl Interp {
                 return self.proxy_forward(|me| me.js_has_property(&target, key));
             };
             // The trap receives the original property key — a symbol stays a symbol.
-            let key_val = self
-                .sym_from_key(key)
-                .unwrap_or_else(|| crate::value::string_key_value(key));
+            let key_val = self.key_value(key);
             let res = self.proxy_call_trap(
                 crate::interpreter::PROXY_TRAP_HAS,
                 &trap,
@@ -7843,9 +7841,7 @@ impl Interp {
             let deleted = self.delete_prop_with(target, key, false)?;
             return Ok(matches!((deleted).view(), ValueView::Bool(true)));
         };
-        let kv = self
-            .sym_from_key(key)
-            .unwrap_or_else(|| crate::value::string_key_value(key));
+        let kv = self.key_value(key);
         let res = self.proxy_call_trap(
             crate::interpreter::PROXY_TRAP_DELETE,
             &trap,

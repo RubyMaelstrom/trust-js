@@ -253,9 +253,7 @@ fn reflect_set(
         if let Some(trap) =
             ab(i.proxy_get_trap(&handler, crate::interpreter::PROXY_TRAP_SET, "set"))?
         {
-            let key_value = i
-                .sym_from_key(key)
-                .unwrap_or_else(|| crate::value::string_key_value(key));
+            let key_value = i.key_value(key);
             let res = ab(i.proxy_call_trap(
                 crate::interpreter::PROXY_TRAP_SET,
                 &trap,
