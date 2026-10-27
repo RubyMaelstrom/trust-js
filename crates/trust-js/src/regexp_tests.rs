@@ -82,6 +82,26 @@ fn large_counted_repetitions_match_like_unrolled_ones() {
 /// saturating, for string and RegExp separators alike (§22.1.3.23, §22.2.6.14 step 13).
 /// RegExp.prototype[@@split] and [@@matchAll] default SpeciesConstructor to the realm's %RegExp%
 /// intrinsic and never read the global `RegExp` binding (§22.2.6.14 step 4, §22.2.6.9 step 4).
+/// String.prototype.split consults a separator Object's @@split only: a RegExp whose @@split
+/// was removed is converted with ToString, which reads its `source` and `flags`, and split on
+/// as a String (ECMA-262 #sec-string.prototype.split steps 3 and 5).
+#[test]
+fn split_converts_a_regexp_without_its_split_method_to_a_string() {
+    check(
+        r#"
+        delete RegExp.prototype[Symbol.split];
+        var plain = 'a/b/c'.split(/\//);
+        var re = /b/;
+        var reads = [];
+        Object.defineProperty(re, 'source', { get() { reads.push('source'); return 'x'; } });
+        Object.defineProperty(re, 'flags', { get() { reads.push('flags'); return 'g'; } });
+        var converted = 'a/x/gb/x/gc'.split(re);
+        JSON.stringify([plain, converted, reads])
+        "#,
+        r#"[["a/b/c"],["a","b","c"],["source","flags"]]"#,
+    );
+}
+
 #[test]
 fn split_limits_wrap_and_species_defaults_to_the_intrinsic() {
     check(

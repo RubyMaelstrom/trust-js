@@ -2386,37 +2386,6 @@ pub(crate) fn regexp_find_text_shared(
     re.find_at(subject, start, &i.runtime_interrupt)
 }
 
-/// All non-overlapping matches of `re` in `subject`, each as capture spans (unit offsets).
-fn regex_find_all(
-    i: &mut Interp,
-    re: &crate::regex::Regex,
-    subject: &crate::lstr::LStr,
-) -> Result<Vec<Vec<Option<(usize, usize)>>>, Value> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos <= subject.unit_len() {
-        let interrupt = regexp_interrupt_tick(i).map(|()| Some(()));
-        regexp_match_result(i, interrupt)?;
-        let matched = regexp_exec_text_shared(i, re, subject, pos);
-        match regexp_match_result(i, matched)? {
-            None => break,
-            Some(caps) => {
-                let (a, b) = caps[0].unwrap();
-                pos = if b > a {
-                    b
-                } else {
-                    advance_string_index(b, subject, re.unicode)
-                };
-                out.push(caps.as_ref().to_vec());
-                if out.len() > MAX_ARRAY_OP_LEN {
-                    break;
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// ToLength of a value (clamped to a non-negative integer).
 fn to_length_val(i: &mut Interp, v: &Value) -> Result<usize, Value> {
     let n = ab(i.to_number(v))?;
@@ -11131,12 +11100,13 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
             }
         }
     };
-    let is_live_regexp = matches!(&(arg(args, 0)).view(), ValueView::Obj(o) if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)));
+    // A separator Object without @@split is converted like any other value (ECMA-262
+    // #sec-string.prototype.split step 5): a RegExp whose @@split was removed splits on its
+    // ToString, which reads its `source` and `flags`.
     let sep_str: Option<Rc<str>> = {
         let __value_match_original = &arg(args, 0);
         match &(__value_match_original).view() {
             ValueView::Undefined => None,
-            _ if is_live_regexp => None,
             _ => {
                 let v = __value_match_original;
                 Some(ab(i.to_string(v))?.into())
@@ -11145,40 +11115,6 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
     };
     if limit == 0 {
         return Ok(i.make_array(Vec::new()));
-    }
-    // Regex separator: split on each match (group captures are inserted between pieces).
-    if let ValueView::Obj(o) = &(arg(args, 0)).view() {
-        if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
-            let re = i.regexps[&(Gc::as_ptr(o) as usize)].clone();
-            let mut parts = Vec::new();
-            let mut last = 0;
-            'outer: for caps in regex_find_all(i, &re, &s)? {
-                let (a, b) = caps[0].unwrap();
-                // Skip a zero-width match at the very start or end of the string.
-                if a == b && (b == 0 || a >= s.unit_len()) {
-                    continue;
-                }
-                parts.push(Value::Str(s.slice_units(last, a)));
-                if parts.len() >= limit {
-                    break;
-                }
-                for g in 1..=re.ngroups {
-                    parts.push(match caps[g] {
-                        Some((x, y)) => Value::Str(s.slice_units(x, y)),
-                        None => Value::Undefined,
-                    });
-                    if parts.len() >= limit {
-                        break 'outer;
-                    }
-                }
-                last = b;
-            }
-            if parts.len() < limit {
-                parts.push(Value::Str(s.slice_units(last, s.unit_len())));
-            }
-            parts.truncate(limit);
-            return Ok(i.make_array(parts));
-        }
     }
     match sep_str {
         None => Ok(i.make_array(vec![Value::Str(s)])),
