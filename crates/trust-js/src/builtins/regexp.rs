@@ -1579,6 +1579,26 @@ fn regexp_intrinsic(i: &Interp) -> Value {
 pub(super) fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.matchAll]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
+    // Under the protector SpeciesConstructor finds %RegExp%, `flags` reads the intrinsic getters,
+    // and constructing from the RegExp reads its own slots, %RegExp.prototype%[@@match]
+    // (IsRegExp) and %RegExp%.prototype, none of which runs code: the matcher is a fresh RegExp
+    // of the same program with the receiver's prototype, %RegExp.prototype%, and `lastIndex` a
+    // plain Number read and written at its slot.
+    let members = [RegexpMember::Constructor, RegexpMember::Match];
+    if let Some((obj, re)) = intrinsic_regexp(i, &this, &members) {
+        if let Some(last) = plain_last_index(&obj) {
+            let (global, unicode) = (re.global, re.unicode);
+            let prototype = obj.borrow().proto;
+            let matcher = i.make_regexp_compiled_with_proto(re, prototype);
+            match matcher.as_obj().filter(|clone| alloc_shaped(i, clone)) {
+                Some(clone) => set_last_index_at_slot(&clone, last),
+                None => ab(i.set_member_key(&matcher, "lastIndex", Value::Num(last)))?,
+            }
+            return Ok(create_regexp_string_iterator(
+                i, matcher, s, global, unicode,
+            ));
+        }
+    }
     let default_ctor = regexp_intrinsic(i);
     let c = species_constructor(i, &this, &default_ctor)?;
     let flags_v = ab(i.get_member_key(&this, "flags"))?;
@@ -1590,11 +1610,7 @@ pub(super) fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Resul
     let global = flags.text().contains('g');
     let unicode = flags.text().contains('u') || flags.text().contains('v');
     Ok(create_regexp_string_iterator(
-        i,
-        matcher,
-        s.into(),
-        global,
-        unicode,
+        i, matcher, s, global, unicode,
     ))
 }
 /// The matcher of `rx` when every observable step of RegExp.prototype[@@split] before its

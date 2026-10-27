@@ -8429,7 +8429,7 @@ fn dispose_settle_reject(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Va
 fn create_regexp_string_iterator(
     i: &Interp,
     matcher: Value,
-    s: Rc<str>,
+    s: crate::lstr::LStr,
     global: bool,
     unicode: bool,
 ) -> Value {
@@ -8439,7 +8439,7 @@ fn create_regexp_string_iterator(
             .cloned(),
     );
     set_internal(&obj, "#\u{0}rsi_regexp", matcher);
-    set_internal(&obj, "#\u{0}rsi_string", Value::Str(s.into()));
+    set_internal(&obj, "#\u{0}rsi_string", Value::Str(s));
     set_internal(&obj, "#\u{0}rsi_global", Value::Bool(global));
     set_internal(&obj, "#\u{0}rsi_unicode", Value::Bool(unicode));
     set_internal(&obj, "#\u{0}rsi_done", Value::Bool(false));

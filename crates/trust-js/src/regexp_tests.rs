@@ -229,6 +229,36 @@ fn global_match_and_search_keep_their_observable_steps() {
     );
 }
 
+/// RegExp.prototype[@@matchAll] (§22.2.6.9) matches with a copy of the RegExp made with its
+/// `lastIndex`, which later changes to the original do not reach, global or not, sticky or not.
+#[test]
+fn match_all_matches_with_a_copy_of_the_regexp() {
+    check(
+        r#"
+        function all(it) { return Array.from(it, m => [m.index, m[0], m[1]]); }
+        var g = /(\d)/g; g.lastIndex = 2;
+        var it = g[Symbol.matchAll]("a1b2c3");
+        g.lastIndex = 0;
+        var r1 = all(it);
+        var e = /(?:)/gu;
+        var y = /\d/gy; y.lastIndex = 1;
+        var once = /\d/;
+        var flagsSeen = /x/gimsuy[Symbol.matchAll]("x").next().value.index;
+        JSON.stringify([
+            r1, g.lastIndex,
+            all("a1b2".matchAll(/\d/g)),
+            all(e[Symbol.matchAll]("\u{1F600}x")),
+            all(y[Symbol.matchAll]("a12b3")), y.lastIndex,
+            all(once[Symbol.matchAll]("x1y2")),
+            flagsSeen,
+            all("A1a2".matchAll(/a(\d)/gi)),
+            Array.from("\uD800a\uDC00".matchAll(/./g), m => m[0].charCodeAt(0)),
+        ])
+        "#,
+        r#"[[[3,"2","2"],[5,"3","3"]],0,[[1,"1",null],[3,"2",null]],[[0,"",null],[2,"",null],[3,"",null]],[[1,"1",null],[2,"2",null]],1,[[1,"1",null]],0,[[0,"A1","1"],[2,"a2","2"]],[55296,97,56320]]"#,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).

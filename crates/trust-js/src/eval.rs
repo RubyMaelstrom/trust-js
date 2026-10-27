@@ -5465,6 +5465,16 @@ impl Interp {
         Ok(self.make_regexp_object(re, proto))
     }
 
+    /// A RegExp of the compiled program `re` whose prototype is `proto`, as RegExpAlloc makes it
+    /// once GetPrototypeFromConstructor found `proto`.
+    pub(crate) fn make_regexp_compiled_with_proto(
+        &mut self,
+        re: Rc<crate::regex::Regex>,
+        proto: Option<crate::value::Gc>,
+    ) -> Value {
+        self.make_regexp_object(re, proto)
+    }
+
     /// GetPrototypeFromConstructor for RegExpAlloc: `new` with a subclass/cross-realm newTarget
     /// overrides the instance prototype (falling back to newTarget's realm's %RegExp.prototype%).
     pub(crate) fn regexp_alloc_proto(&mut self) -> Result<Option<crate::value::Gc>, Abrupt> {
