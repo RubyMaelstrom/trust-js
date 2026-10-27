@@ -574,3 +574,59 @@ budgets keep their rule. Tests: the limit below, at and above the point where th
 (about 585 MB at factor 4 with a 4 GB maximum), past the maximum, and the override.
 Exit (proposed, W6): the limits match V8's rule in unit tests; Web Tooling's peak RSS falls; no
 suite slower beyond noise.
+
+### W1: builtins and Proxy paths (census and design, 2026-10-27)
+
+Census: the close-out engine (target/claude-closeout/lto-final), user-mode instructions sampled
+with call graphs on CPU 5; data, scripts and the microbenchmark in target/p2/w1-census.
+- Vue: `shift` takes 34% of the fixture's time, 212 us a call against 66 us for Node limited to
+  Sparkplug (3.2x; the fixture's own gap is 3.4x), where it is 36% of the time. The fixture's
+  `reactive()` handlers are JavaScript: under `shift`, the `set` traps take 22% of the fixture's
+  instructions and the element reads 7%, mostly Vue's handler code and the calls into it;
+  formatting index keys takes 0.4%. The generic loop's own work does not dominate, so a 10x cut
+  of `shift` (the plan's exit) is not W1's to make: it would be 3x faster than V8's.
+- A Proxy microbenchmark (micro/proxy-shift.js: a 17-element array, one push and one shift an
+  iteration, 53 trap operations a shift; ns an iteration, the least of 3 runs; trust-js /
+  Sparkplug-only Node / Node): an ordinary packed array 290 / 190 / 145; classic (holey)
+  storage 300 / 100 / 200; a Proxy without handlers 17,650 / 13,300 / 13,550; with handlers
+  forwarding through Reflect 36,750 / 20,400 / 18,800; with handlers that use the target
+  directly 17,500 / 9,050 / 8,500. V8's generic shift over a Proxy is slow too.
+- Where a Proxy operation's time goes without handlers: a forwarded [[Set]] whose receiver is
+  the proxy (OrdinarySetWithOwnDescriptor) turns the receiver's own descriptor into an object
+  and back and builds a second descriptor object for [[DefineOwnProperty]]
+  (`reflect_define_on_receiver`, `proxy_gopd_value`, `proxy_define_property`: about 25% of the
+  micro's instructions, string-keyed reads of the descriptor fields included); the
+  getOwnPropertyDescriptor, defineProperty, getPrototypeOf and ownKeys trap lookups bypass the
+  trap caches; each element step re-probes the side tables (the proxy table among them: 6-8%);
+  and each index is formatted into a heap String. With handlers, the calls into them (W3)
+  dominate. Vue's handlers call `Reflect.set(target, key, value, receiver)` with the proxy as
+  the receiver, which takes the same descriptor-object path (5% of the fixture).
+- React and Djot spend no more than 4% in any builtin's generic path (React's largest is
+  CreateDataPropertyOrThrow, 3.9%; Djot's RegExp work, about 8%, is W5's). Octane spends no more
+  than 0.2% in any array builtin; its largest builtins are String.prototype.replace with a
+  RegExp (8%, W5's) and Function.prototype.call (2.3%, W3's). Web Tooling: pending.
+
+Design:
+1. Proxy [[GetOwnProperty]] and [[DefineOwnProperty]] pass Property Descriptor records
+   (`Property`, `PartialDesc`) and make an object only to call a trap (FromPropertyDescriptor)
+   or to read a trap's result (ToPropertyDescriptor), as ECMA-262 §10.5.5 and §10.5.6 do.
+   OrdinarySetWithOwnDescriptor (§10.1.9.2 step 2.c-e) on a proxy receiver uses the records,
+   and Object.defineProperty, Object.defineProperties and Reflect.defineProperty convert their
+   attributes before the target's [[DefineOwnProperty]] runs (§20.1.2.4 step 3, ahead of the
+   proxy's GetMethod of its trap).
+2. Every trap's GetMethod goes through the trap caches (`proxy_get_trap`), all thirteen kinds.
+3. Generic array loops format each index into one reused buffer instead of a String per
+   element, and a key a trap receives comes from a per-Agent table of the strings of small
+   indices (V8 answers NumberToString from its number-string cache).
+4. Holey shift, unshift and splice: under the existing prototype protector, an Array with
+   holes shifts in its storage, holes staying holes, without the generic loop (the call table's
+   holey shift: 3,000 ns an iteration against Sparkplug-only Node's 172).
+5. The plan's other W1 items (bulk indexOf, lastIndexOf and includes; dense sort and fill)
+   wait for a workload that spends time there: none of the acceptance set or Octane does.
+   Proxy target and handler move out of the side table with W2g, as planned.
+Exit (proposed revision, needs the owner's agreement under Decision 2; the plan's was Vue's
+`shift` cut by 10x): the Proxy microbenchmark without handlers at or below Sparkplug-only
+Node's time and with Reflect-forwarding handlers within 1.5x of it (today 1.33x and 1.8x); the
+holey shift within 2x of it (today 17x); Vue's `shift` time recorded before and after; no
+builtin above 5% of a workload's time on a generic path a fast path could take (met on the
+acceptance set and Octane today).
