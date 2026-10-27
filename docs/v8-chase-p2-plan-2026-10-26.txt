@@ -1,4 +1,4 @@
-# Phase 2 plan: baseline strengthening (draft for owner approval, 2026-10-26)
+# Phase 2 plan: baseline strengthening (2026-10-26; the owner's decisions of 2026-10-27)
 
 Program: [docs/v8-chase-2026-10-15.txt](/big/Code/trust-js/docs/v8-chase-2026-10-15.txt).
 Phase 1's plan and record, including its close-out:
@@ -24,8 +24,8 @@ microbenchmark set (the harness and suites are under target/claude-closeout; see
 The yardstick is Node limited to its non-speculative tiers, Ignition and Sparkplug
 (`--max-opt=1`). Node's lead on the fixtures does not depend on speculation: limited to
 Sparkplug it runs them 3.4-3.8x faster than the close-out, against 2.9-3.9x in full (Node by
-tier, below). Proposed phase exit: each fixture within 2x of Node limited to Sparkplug
-(Decision 2).
+tier, below). Phase exit: each fixture within 2x of Node limited to Sparkplug, measured in the
+same session (Decision 2).
 
 ## Where we start
 
@@ -195,7 +195,7 @@ What the numbers say:
   steady state 13% lower; Basic 2-5% and Air's first iteration 1-4% slower), Djot -6%, TRust's
   replays 5-14% faster; the call microbenchmarks did not move (within 3%). Against the old
   engine it trails by more than 2% only on Splay (-15%), SplayLatency (-40%) and CodeLoad
-  (-8%): major-collection pauses and the object layout (W2, Decision 4).
+  (-8%): major-collection pauses and the object layout (W2, W6).
 - Node leads by 3-4x on the fixtures, 10x on ARES-6, 12x on Web Tooling and 3.4-34x on
   Octane's benchmarks. Limited to Sparkplug, it keeps all of its lead on the fixtures
   (3.4-3.8x) and leads by 4.2x on ARES-6 and 4.8x on Web Tooling, but by 1.8x on Octane's
@@ -323,15 +323,18 @@ Object model and collector.
   `OldGenerationSizeFromPhysicalMemory`; Node reports a 4288 MB limit here). With a 4 GB
   maximum the cap binds only above ~585 MB live (4L > (L + 4 GB) / 2).
 
-Unmerged pre-P1 branches.
+Unmerged pre-P1 branches. On 2026-10-27 the owner had the ones P3 does not need deleted:
+eight already on main, and seven whose commits are kept in
+target/branch-archive/pre-p1-branches-2026-10-27.bundle (tips listed beside it).
 - agent/jit-arith and agent/jit-calls: already on main (9 of 11 commits patch-identical by
-  `git cherry`, the others same-subject); the refs can go.
-- review/borrowed-own-reads-sparse-20261015 (6) and review/borrowed-main-integration-20261015:
-  built on the removed tier and pre-P1 ownership; design input for P3 only (a9ba62d2's x64
-  call templates could be harvested separately).
-- compiler-logical-legacy-arguments-v5-20261015 (2): appears to target compiled frames reading
-  `f.arguments` as null (interpreter.rs:15063), the cause of the two staging/sm Test262 failures
-  at threshold 0; it touches the removed tier and would be re-done, not re-landed.
+  `git cherry`, the others same-subject); deleted 2026-10-27 (Decision 6).
+- review/borrowed-own-reads-sparse-20261015 (6) and review/borrowed-main-integration-20261015,
+  kept: built on the removed tier and pre-P1 ownership; design input for P3 only (the sparse
+  branch also holds a9ba62d2, whose x64 call templates could be harvested separately).
+- compiler-logical-legacy-arguments-v5-20261015 (2, tip 8c03b41b, in the bundle): appears to
+  target compiled frames reading `f.arguments` as null (interpreter.rs:15063), the cause of
+  the two staging/sm Test262 failures at threshold 0; it touches the removed tier and would be
+  re-done, not re-landed.
 
 ## Workstreams
 
@@ -343,7 +346,7 @@ W1. Builtins and Proxy-heavy paths (first: the largest single measured win)
 - Holey fast paths under the existing protector (holes stay holes), in-place deque splice
   (no whole-array copies, dense_deque.rs:227-236), bulk indexOf/lastIndexOf/includes, dense
   sort and fill; a census of generic-path hits on the acceptance set picks the rest.
-- Exit (proposed): Vue's `shift` time cut by 10x; no builtin in the acceptance set spends more
+- Exit: Vue's `shift` time cut by 10x; no builtin in the acceptance set spends more
   than 5% of a workload's time on a generic path that a fast path could take.
 
 W2. Object model, second pass (layout and the collector's remaining costs)
@@ -365,7 +368,7 @@ W2. Object model, second pass (layout and the collector's remaining costs)
 - W2f A chunk-level card summary (one more barrier store in both backends).
 - W2g Exotic state into payload cells, as P1 did for Map and Set: proxies, promises, generators,
   `class_info`, RegExps (with W5), typed arrays.
-- Exit (proposed): Splay's live heap halved; fixtures' peak RSS at or below the close-out's;
+- Exit: Splay's live heap halved; fixtures' peak RSS at or below the close-out's;
   the sustained workload's minor collection time down by the finalizer share; JIT dump checks
   unchanged apart from intended layout changes.
 
@@ -384,7 +387,7 @@ W3. Call path
   map in the object.
 - Call caches for the VM's `Op::Call` and `CallSpread`, and bound-function cache entries.
 - A lighter native boundary for natives that cannot re-enter JS.
-- Exit (proposed), against Node limited to Sparkplug on the call table: the direct, method,
+- Exit, against Node limited to Sparkplug on the call table: the direct, method,
   closure and constructor calls and recursion within 1.25x (today 1.5-2.2x); `arguments`,
   rest, `call`/`apply`, spread and the getter within 2x (today 3.2-14x); Vue/React elapsed
   improved by the measured call share.
@@ -400,7 +403,7 @@ W4. Feedback for the speculative tier
 - PCs of inlined and recompiled code mapped to their baseline sites.
 - Finish Pilot C (descriptor classes as a proof) and add a dependency registry for
   invalidation.
-- Exit (proposed): feedback on by default at <= 2% cost on the acceptance set; coverage (share
+- Exit: feedback on by default at <= 2% cost on the acceptance set; coverage (share
   of executed operations with usable feedback) reported as a standing metric and >= 95% on it.
 
 W5. RegExp
@@ -409,21 +412,38 @@ W5. RegExp
   and `lastIndex` in the RegExp's own payload (no `regexps`/`gc_pin` hashing per exec and
   creation, which also removes the largest per-minor cost left on Octane RegExp); case closure
   at compile time; required-literal and NEON prefilters.
-- Then, decided on measurements: a native tier with captures and alternation behind a
-  differential gate (V8's Irregexp compiles to machine code), or growing the interpreted tier.
-- Exit (proposed): Octane RegExp and Djot's `exec` time each cut by 2x from the close-out.
+- Then a native tier with captures and alternation on both backends, behind a differential
+  gate against the interpreter (Decision 3; V8's Irregexp, which SpiderMonkey shares, and
+  JavaScriptCore's YARR JIT compile RegExps to machine code); the measurements set the order.
+- Exit: Octane RegExp and Djot's `exec` time each cut by 2x from the close-out.
+
+W6. Collector scheduling
+- V8's cap (Decision 5): each limit at most halfway between the live size and V8's heap
+  maximum (half of physical memory, 256 MB-4 GB; heap-controller.cc `BoundAllocationLimit`,
+  heap.cc `OldGenerationSizeFromPhysicalMemory`), for pacing only, without V8's out-of-memory
+  failure at that maximum. Independent of the other workstreams.
+- Incremental marking (Decision 4): a marking write barrier in the interpreter, the VM and both
+  JIT backends, and major marking in slices interleaved with the program, as V8's incremental
+  marking runs; after W2's layout work, so that P3's tier emits the barrier from its start.
+  Concurrent marking stays a non-goal.
+- Exit (proposed): the cap's limits match V8's rule in unit tests and lower Web Tooling's peak
+  RSS, with no suite slower beyond noise; marking's exit is set in its design note, with
+  SplayLatency at least the old engine's (6446) as the target.
 
 ## Order
 
-1. W1 (independent, largest measured win).
+0. A perf map for generated code (see "Measurement").
+1. W1 (independent, largest measured win); W6's cap alongside (independent).
 2. W2a + W2b (atoms and scope descriptors: they remove finalizers and unblock W3's environment
    work).
 3. W3 with W4's call-target feedback.
 4. W2c-W2g (layout; each touches JIT templates and carries dump checks).
 5. W4's remainder; W5 alongside wherever it shares no code with the stage in progress.
+6. W6's incremental marking, last, once W2 has settled the layout.
 
 Each stage: a recorded design note before code (as P1's stages), its own commit series, the
-gates below, and its exit measurement.
+gates below, and its exit measurement. Each commit series lands on main as soon as its gates
+pass, without a stage branch, and stage exits are measured on main (Decision 1).
 
 ## Gates
 
@@ -452,30 +472,41 @@ with `npm install --ignore-scripts` and its build steps, WebKit PerformanceTests
 Babylon reads its inputs with the shells' `read`, which the harness and scripts/run-ares6.sh
 define).
 
-## Decisions for the owner
+Profiles: `perf record` with `--user-callchains` for call graphs (Decision 0), perf pinned
+with the workload (`taskset -c 5 perf ...`). Generated code needs a perf map: behind an
+environment variable documented in DIAGNOSTICS.md, the engine appends the address range and
+name of each piece of code it generates to `/tmp/perf-<pid>.map`, as V8's `--perf-basic-prof`
+does (Order, step 0).
 
-0. Profiling access. Crystal refuses `perf` at kernel.perf_event_paranoid=2 even for user-space
-   software events. Attribution beyond the engine's own counters (TRUST_JS_PERF_METRICS,
-   TRUST_JS_GC_LOG, TRUST_JS_JIT_CALLSTAT) needs paranoid <= 1 or CAP_PERFMON on a perf binary.
-1. Branching. P2's stages are separable: land each on main behind its gates (recommended), or
-   a P2 branch as P1 had.
-2. The exit numbers: the phase's (each fixture within 2x of Node limited to Sparkplug) and
-   each stage's (proposals above).
-3. W5's direction once its interpreter-level stage is measured: a native tier with captures
-   and alternation, or a larger interpreted tier.
-4. Incremental marking (a marking barrier) in P2 or after P3. V8 marks incrementally and
-   concurrently; TRust's pages pay full major pauses today (Splay's are ~85 ms).
-5. Memory policy: V8's sizing (adopted in the close-out) trades peak RSS for throughput on
+## Decisions (the owner's, 2026-10-27)
+
+0. Profiling access: resolved 2026-10-27, nothing to change. At kernel.perf_event_paranoid=2
+   `perf` counts and samples user space, and records call graphs with `--user-callchains`
+   (`perf record -e instructions:u --call-graph fp --user-callchains`); without that flag perf
+   also asks for kernel call chains, which this setting refuses even for an event that
+   excludes the kernel. Only kernel-side samples (page faults, the collector's mmap, madvise
+   and munmap) would need paranoid <= 1. Generated code shows as bare addresses: the engine
+   writes no perf map.
+1. Branching: each commit series lands on main as soon as its gates pass, without a stage
+   branch; stage exits are measured on main.
+2. The exit numbers as proposed: the phase's (each fixture within 2x of Node limited to
+   Sparkplug, measured in the same session) and each stage's (above). A stage's design note
+   may revise its own numbers with the owner's agreement.
+3. RegExp: a native tier with captures and alternation on both backends after W5's
+   interpreter-level stage, behind its differential gate; the measurements set the order.
+4. Incremental marking in P2, as its last stage (W6), after W2's layout work, so that P3's
+   tier emits the barrier from its start. V8 marks incrementally and concurrently; the
+   close-out pays full major pauses (Splay's are ~85 ms).
+5. Memory policy: port V8's halfway-to-the-maximum cap with V8's maximum (half of physical
+   memory, 256 MB-4 GB), for pacing only, without V8's out-of-memory failure at the maximum
+   (W6). V8's sizing, adopted in the close-out, trades peak RSS for throughput on
    allocation-heavy workloads (against main: Octane +10%, Web Tooling +41% to 4.67 GB,
-   ARES-6 +56%, sustained allocation +45%, Octane through TRust +78%), and P2's layout work
-   (W2) is the intended answer. Options: confirm as is; port V8's halfway-to-the-maximum cap
-   with V8's maximum (half of physical memory, 256 MB-4 GB) for pacing only, without V8's
-   out-of-memory failure at the maximum (recommended: it is V8's own rule); or set a
-   different cap or a lower ceiling for the growing factor. Of the standalone suites, V8's
-   cap would bind only on Web Tooling (live heap up to 1027 MB); Octane's, ARES-6's and the
-   sustained workload's increases come with the growing factor and the nursery, which only
-   a lower ceiling, or W2's smaller live heaps, would reduce.
-6. The dead refs agent/jit-arith and agent/jit-calls: delete.
+   ARES-6 +56%, sustained allocation +45%, Octane through TRust +78%). Of the standalone
+   suites the cap binds only on Web Tooling (live heap up to 1027 MB); the other increases
+   come with the growing factor and the nursery, and W2's smaller live heaps are the answer
+   to them.
+6. agent/jit-arith (403b7681) and agent/jit-calls (23050aaf) deleted on 2026-10-27, with the
+   merged p1-closeout branches of both repositories.
 
 ## Non-goals
 
@@ -492,3 +523,6 @@ startup snapshots (P4); Speedometer acceptance beyond the replays.
 - Always-on feedback (W4) must not tax the baseline beyond its budget; measure per stage.
 - A native RegExp tier (W5) is a second code generator; it lands only behind a differential
   gate against the interpreter on Test262's RegExp suites plus a fuzzed corpus.
+- Incremental marking (W6) puts a barrier on every pointer store in the interpreter, the VM and
+  both JIT backends; it lands behind GC stress with marking forced into small slices, and
+  TRUST_JS_GC_VERIFY.

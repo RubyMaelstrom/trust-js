@@ -6836,7 +6836,10 @@ mark. The new per-object layout edge is the leading explanation; this is
 profiling evidence, not an acceptance comparison. Data:
 target/s6-step12br/pause-profile. User-space instruction samples work;
 stack sampling is denied by the current perf settings, which remain
-unchanged. No implementation repair is chosen yet.
+unchanged. (Corrected 2026-10-27: call graphs work with `perf record
+--user-callchains`; perf_event_paranoid=2 refuses only kernel call
+chains, which perf requests by default. P2 plan, Decision 0.) No
+implementation repair is chosen yet.
 
 Step 12e preflight clarifications (2026-10-22), before 12d/12e:
 
@@ -9543,9 +9546,10 @@ Phase status, 2026-10-26
 P1 merged into main (941a8a06, 2026-10-25) with its post-merge fixes and
 TRust's port; its close-out (standalone Octane 2, Web Tooling and ARES-6,
 V8's heap sizing and memory reducer, the RegExp regression, TRust's two
-standards bugs) is recorded in docs/v8-chase-p1-plan-2026-10-15.txt. P2's
-plan, for the owner's approval before code, is
-docs/v8-chase-p2-plan-2026-10-26.txt.
+standards bugs) is recorded in docs/v8-chase-p1-plan-2026-10-15.txt and
+reached main on 2026-10-27. P2's plan is
+docs/v8-chase-p2-plan-2026-10-26.txt; the owner decided its open
+questions on 2026-10-27 (its Decisions section).
 
 On the program's expectation that V8-class ratios become reachable only
 after P3 (after the phase list): Node limited to its non-speculative tiers
