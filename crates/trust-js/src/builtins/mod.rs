@@ -451,14 +451,17 @@ pub(crate) fn proxy_own_keys(
     let ValueView::Obj(target_object) = &(target).view() else {
         return Ok(crate::rooting::RootedVec::new());
     };
-    let trap = ab(i.get_member_key(handler, "ownKeys"))?;
-    if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
+    let Some(trap) =
+        ab(i.proxy_get_trap(handler, crate::interpreter::PROXY_TRAP_OWN_KEYS, "ownKeys"))?
+    else {
         return object_own_property_keys(i, target_object);
-    }
-    if !trap.is_callable() {
-        return Err(i.make_error("TypeError", "proxy 'ownKeys' trap is not callable"));
-    }
-    let res = ab(i.call(trap, *handler, std::slice::from_ref(target)))?;
+    };
+    let res = ab(i.proxy_call_trap(
+        crate::interpreter::PROXY_TRAP_OWN_KEYS,
+        &trap,
+        *handler,
+        [*target],
+    ))?;
     if !matches!((res).view(), ValueView::Obj(_)) {
         return Err(i.make_error("TypeError", "ownKeys trap must return an array-like object"));
     }
@@ -527,14 +530,20 @@ pub(crate) fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Valu
         if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
-        let trap = ab(i.get_member_key(&handler, "isExtensible"))?;
-        if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
+        let Some(trap) = ab(i.proxy_get_trap(
+            &handler,
+            crate::interpreter::PROXY_TRAP_IS_EXTENSIBLE,
+            "isExtensible",
+        ))?
+        else {
             return js_is_extensible(i, &target);
-        }
-        if !trap.is_callable() {
-            return Err(i.make_error("TypeError", "proxy 'isExtensible' trap is not callable"));
-        }
-        let res = ab(i.call(trap, handler, std::slice::from_ref(&target)))?;
+        };
+        let res = ab(i.proxy_call_trap(
+            crate::interpreter::PROXY_TRAP_IS_EXTENSIBLE,
+            &trap,
+            handler,
+            [target],
+        ))?;
         let result = i.to_boolean(&res);
         if result != js_is_extensible(i, &target)? {
             return Err(i.make_error("TypeError", "proxy 'isExtensible' must match the target"));
@@ -554,14 +563,20 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
-        let trap = ab(i.get_member_key(&handler, "setPrototypeOf"))?;
-        if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
+        let Some(trap) = ab(i.proxy_get_trap(
+            &handler,
+            crate::interpreter::PROXY_TRAP_SET_PROTOTYPE_OF,
+            "setPrototypeOf",
+        ))?
+        else {
             return js_set_prototype_of(i, &target, proto);
-        }
-        if !trap.is_callable() {
-            return Err(i.make_error("TypeError", "proxy 'setPrototypeOf' trap is not callable"));
-        }
-        let res = ab(i.call(trap, handler, &[target, *proto]))?;
+        };
+        let res = ab(i.proxy_call_trap(
+            crate::interpreter::PROXY_TRAP_SET_PROTOTYPE_OF,
+            &trap,
+            handler,
+            [target, *proto],
+        ))?;
         if !i.to_boolean(&res) {
             return Ok(false);
         }
@@ -654,17 +669,20 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
-        let trap = ab(i.get_member_key(&handler, "preventExtensions"))?;
-        if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
+        let Some(trap) = ab(i.proxy_get_trap(
+            &handler,
+            crate::interpreter::PROXY_TRAP_PREVENT_EXTENSIONS,
+            "preventExtensions",
+        ))?
+        else {
             return js_prevent_extensions(i, &target);
-        }
-        if !trap.is_callable() {
-            return Err(i.make_error(
-                "TypeError",
-                "proxy 'preventExtensions' trap is not callable",
-            ));
-        }
-        let res = ab(i.call(trap, handler, std::slice::from_ref(&target)))?;
+        };
+        let res = ab(i.proxy_call_trap(
+            crate::interpreter::PROXY_TRAP_PREVENT_EXTENSIONS,
+            &trap,
+            handler,
+            [target],
+        ))?;
         let ok = i.to_boolean(&res);
         // Invariant: a true result requires the target to actually be non-extensible.
         if ok && js_is_extensible(i, &target)? {
@@ -721,41 +739,41 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
 }
 
 fn proxy_get_prototype(i: &mut Interp, target: &Value, handler: &Value) -> Result<Value, Value> {
-    let trap = ab(i.get_member_key(handler, "getPrototypeOf"))?;
-    if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
+    let Some(trap) = ab(i.proxy_get_trap(
+        handler,
+        crate::interpreter::PROXY_TRAP_GET_PROTOTYPE_OF,
+        "getPrototypeOf",
+    ))?
+    else {
         // Forward to the target's [[GetPrototypeOf]] (recursing for a proxy target).
         return js_get_prototype_of(i, target);
+    };
+    let res = ab(i.proxy_call_trap(
+        crate::interpreter::PROXY_TRAP_GET_PROTOTYPE_OF,
+        &trap,
+        *handler,
+        [*target],
+    ))?;
+    if !matches!((res).view(), ValueView::Obj(_) | ValueView::Null) {
+        return Err(i.make_error(
+            "TypeError",
+            "getPrototypeOf trap must return an object or null",
+        ));
     }
-    if !trap.is_callable() {
-        return Err(i.make_error("TypeError", "proxy 'getPrototypeOf' trap is not callable"));
-    }
-    if trap.is_callable() {
-        let res = ab(i.call(trap, *handler, std::slice::from_ref(target)))?;
-        if !matches!((res).view(), ValueView::Obj(_) | ValueView::Null) {
+    // Step 9: IsExtensible(target) runs unconditionally (its trap is observable and may
+    // throw); a non-extensible target pins the reported prototype to the real one (via the
+    // target's own [[GetPrototypeOf]], which may itself be a trap).
+    let extensible = js_is_extensible(i, target)?;
+    if !extensible {
+        let actual = js_get_prototype_of(i, target)?;
+        if !i.strict_equals(&res, &actual) {
             return Err(i.make_error(
                 "TypeError",
-                "getPrototypeOf trap must return an object or null",
+                "getPrototypeOf trap result differs from a non-extensible target's prototype",
             ));
         }
-        // Step 9: IsExtensible(target) runs unconditionally (its trap is observable and may
-        // throw); a non-extensible target pins the reported prototype to the real one (via the
-        // target's own [[GetPrototypeOf]], which may itself be a trap).
-        let extensible = js_is_extensible(i, target)?;
-        if !extensible {
-            let actual = js_get_prototype_of(i, target)?;
-            if !i.strict_equals(&res, &actual) {
-                return Err(i.make_error(
-                    "TypeError",
-                    "getPrototypeOf trap result differs from a non-extensible target's prototype",
-                ));
-            }
-        }
-        Ok(res)
-    } else if let ValueView::Obj(t) = &(target).view() {
-        Ok(t.borrow().proto.map(Value::Obj).unwrap_or(Value::Null))
-    } else {
-        Ok(Value::Null)
     }
+    Ok(res)
 }
 
 fn ta_length_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
@@ -877,10 +895,7 @@ pub(crate) fn has_own_property_trapped(
         }
     }
     if let Some((t, h)) = proxy_pair(i, v) {
-        return Ok(!matches!(
-            (proxy_gopd_value(i, &t, &h, key)?).view(),
-            ValueView::Undefined
-        ));
+        return Ok(proxy_get_own_property(i, &t, &h, key)?.is_some());
     }
     if ab(i.host_indexed_own_value(&o, key))?.is_some() {
         return Ok(true);
@@ -970,7 +985,7 @@ fn target_own_property(
 }
 
 /// ECMA-262 §10.5.5 Proxy [[GetOwnProperty]](P), steps 1-17 in order.
-fn proxy_get_own_property(
+pub(crate) fn proxy_get_own_property(
     i: &mut Interp,
     target: &Value,
     handler: &Value,
@@ -979,20 +994,23 @@ fn proxy_get_own_property(
     if matches!(&(handler).view(), ValueView::Null) {
         return Err(i.make_error("TypeError", "proxy is revoked"));
     }
-    let trap = ab(i.get_member_key(handler, "getOwnPropertyDescriptor"))?;
-    if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
+    let Some(trap) = ab(i.proxy_get_trap(
+        handler,
+        crate::interpreter::PROXY_TRAP_GET_OWN_PROPERTY_DESCRIPTOR,
+        "getOwnPropertyDescriptor",
+    ))?
+    else {
         return target_own_property(i, target, key);
-    }
-    if !trap.is_callable() {
-        return Err(i.make_error(
-            "TypeError",
-            "proxy 'getOwnPropertyDescriptor' trap is not callable",
-        ));
-    }
+    };
     let key_val = i
         .sym_from_key(key)
         .unwrap_or_else(|| crate::value::string_key_value(key));
-    let result = ab(i.call(trap, *handler, &[*target, key_val]))?;
+    let result = ab(i.proxy_call_trap(
+        crate::interpreter::PROXY_TRAP_GET_OWN_PROPERTY_DESCRIPTOR,
+        &trap,
+        *handler,
+        [*target, key_val],
+    ))?;
     if !matches!((result).view(), ValueView::Obj(_) | ValueView::Undefined) {
         return Err(i.make_error(
             "TypeError",
@@ -1138,40 +1156,21 @@ fn is_compatible_property_descriptor(
     true
 }
 
+/// Whether a proxy's own `key` is enumerable, as EnumerableOwnProperties and Object.assign read
+/// it: the proxy's [[GetOwnProperty]] (ECMA-262 §10.5.5), the trap's result validated.
 fn proxy_key_enumerable(
     i: &mut Interp,
     target: &Value,
     handler: &Value,
     key: &str,
 ) -> Result<bool, Value> {
-    let trap = ab(i.get_member_key(handler, "getOwnPropertyDescriptor"))?;
-    if trap.is_callable() {
-        let kv = i
-            .sym_from_key(key)
-            .unwrap_or_else(|| crate::value::string_key_value(key));
-        let res = ab(i.call(trap, *handler, &[*target, kv]))?;
-        if matches!((res).view(), ValueView::Undefined) {
-            return Ok(false);
-        }
-        let enum_v = ab(i.get_member_key(&res, "enumerable"))?;
-        Ok(i.to_boolean(&enum_v))
-    } else if let Some((t2, h2)) = proxy_pair(i, target) {
-        // Absent gOPD trap over a proxy target: forward to the target's [[GetOwnProperty]].
-        proxy_key_enumerable(i, &t2, &h2, key)
-    } else if let ValueView::Obj(t) = &(target).view() {
-        if ab(i.host_indexed_own_value(t, key))?.is_some() {
-            return Ok(crate::value::canonical_index(key).is_some());
-        }
-        Ok(t.borrow()
-            .props
-            .get(key)
-            .map(|p| p.enumerable())
-            .unwrap_or(false))
-    } else {
-        Ok(false)
-    }
+    Ok(proxy_get_own_property(i, target, handler, key)?.is_some_and(|desc| desc.enumerable()))
 }
 
+/// Proxy [[DefineOwnProperty]] for a caller holding a descriptor object. ToPropertyDescriptor
+/// runs first: Object.defineProperty and Reflect.defineProperty convert their attributes before
+/// the target's [[DefineOwnProperty]] (ECMA-262 §20.1.2.4 step 3, §28.1.3 step 3), so before
+/// the proxy's GetMethod of its trap.
 fn proxy_define_property(
     i: &mut Interp,
     target: &Value,
@@ -1179,26 +1178,43 @@ fn proxy_define_property(
     key: &str,
     desc: &Value,
 ) -> Result<bool, Abrupt> {
-    let trap = i.get_member_key(handler, "defineProperty")?;
-    if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
+    let pd = build_partial(i, desc)?;
+    proxy_define_property_record(i, target, handler, key, &pd)
+}
+
+/// ECMA-262 §10.5.6 Proxy [[DefineOwnProperty]](P, Desc) with a Property Descriptor record.
+/// Only the trap observes a descriptor object (FromPropertyDescriptor), so forwarding to a
+/// target without the trap makes none.
+fn proxy_define_property_record(
+    i: &mut Interp,
+    target: &Value,
+    handler: &Value,
+    key: &str,
+    pd: &PartialDesc,
+) -> Result<bool, Abrupt> {
+    if matches!((handler).view(), ValueView::Null) {
+        return Err(i.throw("TypeError", "proxy is revoked"));
+    }
+    let Some(trap) = i.proxy_get_trap(
+        handler,
+        crate::interpreter::PROXY_TRAP_DEFINE_PROPERTY,
+        "defineProperty",
+    )?
+    else {
         if let Some((t2, h2)) = proxy_pair(i, target) {
-            return proxy_define_property(i, &t2, &h2, key, desc);
+            return proxy_define_property_record(i, &t2, &h2, key, pd);
         }
         return if let ValueView::Obj(t) = &(target).view() {
-            define_own_property(i, t, key, desc)
+            define_own_property_partial(i, t, key, pd)
         } else {
             Ok(false)
         };
-    }
-    if !trap.is_callable() {
-        return Err(i.throw("TypeError", "proxy 'defineProperty' trap is not callable"));
-    }
+    };
     let key_val = i
         .sym_from_key(key)
         .unwrap_or_else(|| crate::value::string_key_value(key));
     // The trap receives FromPropertyDescriptor(desc): a fresh object holding only the present
     // fields, in the spec's order (value, writable, get, set, enumerable, configurable).
-    let pd = build_partial(i, desc)?;
     let norm = i.new_object();
     if let Some(v) = &pd.value {
         set_data(&norm, "value", *v);
@@ -1218,7 +1234,12 @@ fn proxy_define_property(
     if let Some(c) = pd.configurable {
         set_data(&norm, "configurable", Value::Bool(c));
     }
-    let res = i.call(trap, *handler, &[*target, key_val, Value::Obj(norm)])?;
+    let res = i.proxy_call_trap(
+        crate::interpreter::PROXY_TRAP_DEFINE_PROPERTY,
+        &trap,
+        *handler,
+        [*target, key_val, Value::Obj(norm)],
+    )?;
     if !i.to_boolean(&res) {
         return Ok(false);
     }
@@ -1246,7 +1267,7 @@ fn proxy_define_property(
             }
         }
         Some(p) => {
-            if !is_compatible_property_descriptor(extensible_target, &pd, Some(&p)) {
+            if !is_compatible_property_descriptor(extensible_target, pd, Some(&p)) {
                 return Err(i.throw(
                     "TypeError",
                     format!(
@@ -1624,41 +1645,22 @@ pub(crate) fn reflect_define_on_receiver(
     key: &str,
     value: Value,
 ) -> Result<bool, Value> {
-    if proxy_pair(i, receiver).is_some() {
-        let (target, handler) = proxy_pair(i, receiver).unwrap();
-        // OrdinarySetWithOwnDescriptor: the receiver's [[GetOwnProperty]] runs first (its trap is
-        // observable); an existing accessor or non-writable property rejects, an existing data
-        // property is redefined with just {value}, and an absent one gets CreateDataProperty.
-        let existing = proxy_gopd_value(i, &target, &handler, key)?;
-        let desc = i.new_object();
-        if let ValueView::Obj(d) = &(existing).view() {
-            let (is_accessor, writable) = {
-                let db = d.borrow();
-                (
-                    db.props.contains("get") || db.props.contains("set"),
-                    matches!(
-                        (db.props.get("writable").map(|p| p.value()))
-                            .map(|__value| (__value).view()),
-                        Some(ValueView::Bool(true))
-                    ),
-                )
-            };
-            if is_accessor || !writable {
-                return Ok(false);
-            }
-            set_data(&desc, "value", value);
-        } else {
-            set_data(&desc, "value", value);
-            set_data(&desc, "writable", Value::Bool(true));
-            set_data(&desc, "enumerable", Value::Bool(true));
-            set_data(&desc, "configurable", Value::Bool(true));
-        }
-        return ab(proxy_define_property(
-            i,
-            &target,
-            &handler,
-            key,
-            &Value::Obj(desc),
+    if let Some((target, handler)) = proxy_pair(i, receiver) {
+        // OrdinarySetWithOwnDescriptor (ECMA-262 §10.1.9.2 step 2.c-h): the receiver's
+        // [[GetOwnProperty]] runs first (its trap is observable); an existing accessor or
+        // non-writable property rejects, an existing data property is redefined with just
+        // { [[Value]] }, and an absent one gets CreateDataProperty. The descriptors are records:
+        // only a trap sees an object.
+        let desc = match proxy_get_own_property(i, &target, &handler, key)? {
+            Some(existing) if existing.accessor() || !existing.writable() => return Ok(false),
+            Some(_) => PartialDesc {
+                value: Some(value),
+                ..PartialDesc::default()
+            },
+            None => data_record(value),
+        };
+        return ab(proxy_define_property_record(
+            i, &target, &handler, key, &desc,
         ));
     }
     let ro = match &(receiver).view() {
@@ -2008,9 +2010,16 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
             .collect()
     };
     for key in keys {
-        let is_accessor = if let Some((t, h)) = &proxy {
-            let d = proxy_gopd_value(i, t, h, &key)?;
-            matches!(&(d).view(), ValueView::Obj(o) if o.borrow().props.contains("get") || o.borrow().props.contains("set"))
+        // ECMA-262 §7.3.15 SetIntegrityLevel: sealing defines { [[Configurable]]: false } on
+        // every key without reading it; freezing reads each key's descriptor (a proxy's trap
+        // observes this) and skips a key that has none.
+        let is_accessor = if !freeze {
+            false
+        } else if let Some((t, h)) = &proxy {
+            match proxy_get_own_property(i, t, h, &key)? {
+                Some(current) => current.accessor(),
+                None => continue,
+            }
         } else {
             obj.as_obj()
                 .unwrap()
@@ -2020,19 +2029,19 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
                 .map(|p| p.accessor())
                 .unwrap_or(false)
         };
-        let desc = i.new_object();
-        set_data(&desc, "configurable", Value::Bool(false));
-        if freeze && !is_accessor {
-            set_data(&desc, "writable", Value::Bool(false));
-        }
+        let desc = PartialDesc {
+            configurable: Some(false),
+            writable: (freeze && !is_accessor).then_some(false),
+            ..PartialDesc::default()
+        };
         let ok = if let Some((t, h)) = &proxy {
-            ab(proxy_define_property(i, t, h, &key, &Value::Obj(desc)))?
+            ab(proxy_define_property_record(i, t, h, &key, &desc))?
         } else {
-            ab(define_own_property(
+            ab(define_own_property_partial(
                 i,
                 &obj.as_obj().unwrap(),
                 &key,
-                &Value::Obj(desc),
+                &desc,
             ))?
         };
         if !ok {
@@ -2110,20 +2119,14 @@ fn object_define_properties(
                 .map(crate::value::PropertyKey::stored)
                 .collect()
         });
-    // Collect descriptor objects for enumerable own keys first (so all Gets precede any Defines).
-    // They stay rooted through later getters and the defines' descriptor reads (I1).
-    let mut descs: Vec<(crate::value::PropertyKey, Value)> = Vec::new();
+    // ECMA-262 §20.1.2.3.1 ObjectDefineProperties: every enumerable own key's descriptor is read
+    // and converted by ToPropertyDescriptor before any is defined. The records' values stay
+    // rooted through later getters and the defines (I1).
+    let mut descs: Vec<(crate::value::PropertyKey, PartialDesc)> = Vec::new();
     let mut roots = crate::rooting::ValueRoots::new();
     for key in keys.iter().cloned() {
         let enumerable = if let Some((t, h)) = proxy_pair(i, &props) {
-            let d = proxy_gopd_value(i, &t, &h, &key)?;
-            match &(d).view() {
-                ValueView::Obj(_) => {
-                    let e = ab(i.get_member_key(&d, "enumerable"))?;
-                    i.to_boolean(&e)
-                }
-                _ => false,
-            }
+            proxy_get_own_property(i, &t, &h, &key)?.is_some_and(|p| p.enumerable())
         } else {
             let object = props.as_obj().unwrap();
             if ab(i.host_indexed_own_value(&object, &key))?.is_some() {
@@ -2139,19 +2142,22 @@ fn object_define_properties(
         };
         if enumerable {
             let desc_obj = ab(i.get_member_key(&props, &key))?;
-            roots.keep(&desc_obj);
-            descs.push((key, desc_obj));
+            let desc = ab(build_partial(i, &desc_obj))?;
+            for value in [&desc.value, &desc.get, &desc.set].into_iter().flatten() {
+                roots.keep(value);
+            }
+            descs.push((key, desc));
         }
     }
-    for (key, desc_obj) in descs {
+    for (key, desc) in descs {
         let ok = if let Some((t, h)) = proxy_pair(i, o) {
-            ab(proxy_define_property(i, &t, &h, &key, &desc_obj))?
+            ab(proxy_define_property_record(i, &t, &h, &key, &desc))?
         } else {
-            ab(define_own_property(
+            ab(define_own_property_partial(
                 i,
                 &o.as_obj().unwrap(),
                 &key,
-                &desc_obj,
+                &desc,
             ))?
         };
         if !ok {
@@ -3962,12 +3968,10 @@ fn promise_keyed_combinator(
                         continue;
                     };
                     let key = crate::value::encode_string_key(ks);
-                    let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-                    if matches!((desc).view(), ValueView::Obj(_)) {
-                        let en = ab(i.get_member_key(&desc, "enumerable"))?;
-                        if i.to_boolean(&en) {
-                            out.push(crate::value::encode_owned_string_key(ks.to_string()));
-                        }
+                    if proxy_get_own_property(i, &target, &handler, &key)?
+                        .is_some_and(|desc| desc.enumerable())
+                    {
+                        out.push(crate::value::encode_owned_string_key(ks.to_string()));
                     }
                 }
             } else if let ValueView::Obj(o) = &(input).view() {
@@ -4349,16 +4353,19 @@ fn install_object(it: &mut Interp) {
             return Err(i.make_error("TypeError", "accessor must be a function"));
         }
         // DefinePropertyOrThrow with { get/set: f, enumerable: true, configurable: true }.
-        let desc = i.new_object();
-        set_data(&desc, if is_get { "get" } else { "set" }, f);
-        set_data(&desc, "enumerable", Value::Bool(true));
-        set_data(&desc, "configurable", Value::Bool(true));
+        let desc = PartialDesc {
+            get: is_get.then_some(f),
+            set: (!is_get).then_some(f),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..PartialDesc::default()
+        };
         let key = ab(i.to_property_key(&arg(args, 0)))?;
         let ov = Value::Obj(o);
         let ok = if let Some((t, h)) = proxy_pair(i, &ov) {
-            ab(proxy_define_property(i, &t, &h, &key, &Value::Obj(desc)))?
+            ab(proxy_define_property_record(i, &t, &h, &key, &desc))?
         } else {
-            ab(define_own_property(i, &o, &key, &Value::Obj(desc)))?
+            ab(define_own_property_partial(i, &o, &key, &desc))?
         };
         if !ok {
             return Err(i.make_error(
@@ -4388,14 +4395,12 @@ fn install_object(it: &mut Interp) {
         loop {
             // [[GetOwnProperty]] goes through a proxy's trap, propagating abrupt completions.
             if let Some((t, h)) = proxy_pair(i, &cur) {
-                let desc = proxy_gopd_value(i, &t, &h, &key)?;
-                if let ValueView::Obj(d) = &(desc).view() {
-                    let is_accessor =
-                        d.borrow().props.contains("get") || d.borrow().props.contains("set");
-                    if !is_accessor {
-                        return Ok(Value::Undefined);
-                    }
-                    return ab(i.get_member_key(&desc, if is_get { "get" } else { "set" }));
+                if let Some(desc) = proxy_get_own_property(i, &t, &h, &key)? {
+                    let accessor = if is_get { desc.getter() } else { desc.setter() };
+                    return Ok(match accessor {
+                        Some(f) if desc.accessor() => *f,
+                        _ => Value::Undefined,
+                    });
                 }
             } else if let ValueView::Obj(co) = &(cur).view() {
                 if let Some(p) = co.borrow().props.get(&key) {
@@ -4456,20 +4461,8 @@ fn install_object(it: &mut Interp) {
         }
         // A proxy reads [[GetOwnProperty]]'s enumerable flag through its trap.
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
-            let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-            let e = {
-                let __value_match_original = desc;
-                match (__value_match_original).view() {
-                    ValueView::Undefined => false,
-                    _ => {
-                        let d = __value_match_original;
-                        {
-                            let ev = ab(i.get_member_key(&d, "enumerable"))?;
-                            i.to_boolean(&ev)
-                        }
-                    }
-                }
-            };
+            let e = proxy_get_own_property(i, &target, &handler, &key)?
+                .is_some_and(|desc| desc.enumerable());
             return Ok(Value::Bool(e));
         }
         if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
@@ -5054,20 +5047,11 @@ fn test_integrity_level(i: &mut Interp, v: &Value, frozen: bool) -> Result<bool,
     if let Some((t, h)) = proxy_pair(i, v) {
         for k in proxy_own_keys(i, &t, &h)? {
             let key = ab(i.to_property_key(&k))?;
-            let desc = proxy_gopd_value(i, &t, &h, &key)?;
-            let d = match &(desc).view() {
-                ValueView::Obj(d) => *d,
-                _ => continue,
+            let Some(desc) = proxy_get_own_property(i, &t, &h, &key)? else {
+                continue;
             };
-            let c = ab(i.get_member_key(&desc, "configurable"))?;
-            if i.to_boolean(&c) {
+            if desc.configurable() || (frozen && !desc.accessor() && desc.writable()) {
                 return Ok(false);
-            }
-            if frozen && d.borrow().props.contains("value") {
-                let w = ab(i.get_member_key(&desc, "writable"))?;
-                if i.to_boolean(&w) {
-                    return Ok(false);
-                }
             }
         }
         return Ok(true);
@@ -5331,9 +5315,21 @@ fn defer_trigger_v(i: &mut Interp, v: &Value, key: Option<&str>) -> Result<(), V
 }
 
 fn define_own_property(i: &mut Interp, o: &Gc, key: &str, desc: &Value) -> Result<bool, Abrupt> {
-    i.defer_trigger(o, Some(key))?;
+    // ToPropertyDescriptor precedes the object's [[DefineOwnProperty]] (ECMA-262 §20.1.2.4).
     let d = build_partial(i, desc)?;
-    define_own_property_record(i, o, key, &d)
+    define_own_property_partial(i, o, key, &d)
+}
+
+/// [[DefineOwnProperty]] of a non-proxy object with a Property Descriptor record, a deferred
+/// module namespace's evaluation included.
+fn define_own_property_partial(
+    i: &mut Interp,
+    o: &Gc,
+    key: &str,
+    d: &PartialDesc,
+) -> Result<bool, Abrupt> {
+    i.defer_trigger(o, Some(key))?;
+    define_own_property_record(i, o, key, d)
 }
 
 /// The data descriptor { [[Value]]: v, all attributes true } of CreateDataProperty.
@@ -9054,12 +9050,7 @@ pub(crate) fn cdp_or_throw(
         }
     }
     let r = if let Some((t, h)) = proxy_pair(i, target) {
-        let desc = i.new_object();
-        set_data(&desc, "value", v);
-        set_data(&desc, "writable", Value::Bool(true));
-        set_data(&desc, "enumerable", Value::Bool(true));
-        set_data(&desc, "configurable", Value::Bool(true));
-        proxy_define_property(i, &t, &h, key, &Value::Obj(desc))
+        proxy_define_property_record(i, &t, &h, key, &data_record(v))
     } else {
         define_own_property_record(i, o, key, &data_record(v))
     };
@@ -9499,12 +9490,8 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
         for k in all_keys.iter().cloned() {
             // [[GetOwnProperty]] fresh per key: skip missing or non-enumerable properties.
             let enumerable = if let Some((t, h)) = proxy_pair(i, &input) {
-                match proxy_gopd_value(i, &t, &h, &k) {
-                    Ok(value) if matches!(value.view(), ValueView::Undefined) => false,
-                    Ok(d) => {
-                        let ev = ab(i.get_member_key(&d, "enumerable"))?;
-                        i.to_boolean(&ev)
-                    }
+                match proxy_get_own_property(i, &t, &h, &k) {
+                    Ok(desc) => desc.is_some_and(|desc| desc.enumerable()),
                     Err(e) => {
                         close_setup(i, &iters, None);
                         return Err(e);

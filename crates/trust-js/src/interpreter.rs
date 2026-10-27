@@ -1156,11 +1156,20 @@ pub(crate) const PROXY_TRAP_GET: usize = 0;
 pub(crate) const PROXY_TRAP_SET: usize = 1;
 pub(crate) const PROXY_TRAP_HAS: usize = 2;
 pub(crate) const PROXY_TRAP_DELETE: usize = 3;
-const PROXY_TRAP_KINDS: usize = 4;
+pub(crate) const PROXY_TRAP_GET_OWN_PROPERTY_DESCRIPTOR: usize = 4;
+pub(crate) const PROXY_TRAP_DEFINE_PROPERTY: usize = 5;
+pub(crate) const PROXY_TRAP_GET_PROTOTYPE_OF: usize = 6;
+pub(crate) const PROXY_TRAP_SET_PROTOTYPE_OF: usize = 7;
+pub(crate) const PROXY_TRAP_IS_EXTENSIBLE: usize = 8;
+pub(crate) const PROXY_TRAP_PREVENT_EXTENSIONS: usize = 9;
+pub(crate) const PROXY_TRAP_OWN_KEYS: usize = 10;
+pub(crate) const PROXY_TRAP_APPLY: usize = 11;
+pub(crate) const PROXY_TRAP_CONSTRUCT: usize = 12;
+const PROXY_TRAP_KINDS: usize = 13;
 
-/// Caches for the hottest Proxy internal methods (ECMA-262 §10.5): each trap's GetMethod on the
-/// handler goes through a property inline cache of its own, and its Call through a callback
-/// cache of its own, so handlers shared by many proxies (framework reactivity) stay
+/// Caches for the Proxy internal methods (ECMA-262 §10.5), one per trap: each trap's GetMethod
+/// on the handler goes through a property inline cache of its own, and its Call through a
+/// callback cache of its own, so handlers shared by many proxies (framework reactivity) stay
 /// monomorphic. Neither caches a result: every operation still performs GetMethod and Call.
 pub(crate) struct ProxyTrapCaches {
     lookups: [[std::cell::Cell<crate::bytecode::IcState>; crate::bytecode::PROP_IC_WAYS];
@@ -12536,15 +12545,14 @@ impl Interp {
                 if matches!(obj.borrow().call, Callable::None) {
                     return Err(self.throw("TypeError", "value is not a function"));
                 }
-                let trap = self.get_member_key(&handler, "apply")?;
-                if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
+                if matches!((handler).view(), ValueView::Null) {
+                    return Err(self.throw("TypeError", "proxy is revoked"));
+                }
+                let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_APPLY, "apply")? else {
                     return self.call(target, this, args);
-                }
-                if !trap.is_callable() {
-                    return Err(self.throw("TypeError", "proxy 'apply' trap is not callable"));
-                }
+                };
                 let arr = self.make_array(args.to_vec());
-                return self.call_callback(trap, handler, &[target, this, arr]);
+                return self.proxy_call_trap(PROXY_TRAP_APPLY, &trap, handler, [target, this, arr]);
             }
         }
         // An indirect call to another realm's `eval` runs in that realm's global scope. (A direct
@@ -16073,16 +16081,22 @@ impl Interp {
         // Proxy with a `construct` trap (or forward to the target).
         {
             if let Some((target, handler)) = self.proxy_at(Gc::as_ptr(&obj) as usize) {
-                let trap = self.get_member_key(&handler, "construct")?;
-                if matches!((trap).view(), ValueView::Undefined | ValueView::Null) {
+                if matches!((handler).view(), ValueView::Null) {
+                    return Err(self.throw("TypeError", "proxy is revoked"));
+                }
+                let Some(trap) =
+                    self.proxy_get_trap(&handler, PROXY_TRAP_CONSTRUCT, "construct")?
+                else {
                     // Forward to the target's [[Construct]] with the original new.target.
                     return self.construct_inner(target, args, new_target);
-                }
-                if !trap.is_callable() {
-                    return Err(self.throw("TypeError", "proxy 'construct' trap is not callable"));
-                }
+                };
                 let arr = self.make_array(args.to_vec());
-                let result = self.call(trap, handler, &[target, arr, new_target])?;
+                let result = self.proxy_call_trap(
+                    PROXY_TRAP_CONSTRUCT,
+                    &trap,
+                    handler,
+                    [target, arr, new_target],
+                )?;
                 // [[Construct]] invariant: the trap must return an Object.
                 if !matches!((result).view(), ValueView::Obj(_)) {
                     return Err(

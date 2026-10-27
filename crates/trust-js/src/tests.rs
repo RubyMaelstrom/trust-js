@@ -21751,6 +21751,71 @@ fn proxy_define_property_invariants() {
 }
 
 #[test]
+fn proxy_descriptors_follow_the_specification_order() {
+    // Object.defineProperty and Reflect.defineProperty run ToPropertyDescriptor before the
+    // proxy's [[DefineOwnProperty]] reads its trap (ECMA-262 §20.1.2.4 step 3, §28.1.3 step 3).
+    let order = "var log=[]; var handler=new Proxy({},{get(t,k){log.push('trap:'+String(k))}}); var p=new Proxy({},handler); var attrs={get value(){log.push('value'); return 1}, writable:true, enumerable:true, configurable:true};";
+    assert_eq!(
+        run(&format!(
+            "{order} Object.defineProperty(p,'x',attrs); Reflect.defineProperty(p,'y',attrs); log.join()"
+        )),
+        "value,trap:defineProperty,value,trap:defineProperty"
+    );
+    // ObjectDefineProperties converts every descriptor before it defines any.
+    assert_eq!(
+        run(
+            "var log=[]; var p=new Proxy({},{defineProperty(t,k,d){log.push('define:'+k); return Reflect.defineProperty(t,k,d)}}); Object.defineProperties(p,{a:{get value(){log.push('a'); return 1}}, b:{get value(){log.push('b'); return 2}}}); log.join()"
+        ),
+        "a,b,define:a,define:b"
+    );
+    // OrdinarySetWithOwnDescriptor through a proxy receiver: an existing data property is
+    // redefined with { [[Value]] } alone, an absent one with CreateDataProperty's descriptor.
+    assert_eq!(
+        run(
+            "var log=[]; var t={x:1}; var p=new Proxy(t,{defineProperty(t,k,d){log.push(JSON.stringify(d)); return Reflect.defineProperty(t,k,d)}}); p.x=2; p.y=3; log.join(';')+';'+t.x+t.y"
+        ),
+        "{\"value\":2};{\"value\":3,\"writable\":true,\"enumerable\":true,\"configurable\":true};23"
+    );
+    // A forwarded [[Set]] without traps still defines on the target, and an existing
+    // non-writable property still rejects.
+    assert_eq!(
+        run(
+            "var t={}; var p=new Proxy(t,{}); p.x=1; p.x=2; Object.defineProperty(t,'r',{value:0,writable:false,configurable:true}); [t.x, Reflect.set(p,'r',5), t.r, Object.getOwnPropertyDescriptor(t,'x').writable].join()"
+        ),
+        "2,false,0,true"
+    );
+    // SetIntegrityLevel (§7.3.15): sealing reads no descriptor; freezing reads each key's
+    // descriptor and keeps an accessor's [[Writable]] absent.
+    let traps = "var log=[]; var h={getOwnPropertyDescriptor(t,k){log.push('gopd:'+k); return Reflect.getOwnPropertyDescriptor(t,k)}, defineProperty(t,k,d){log.push('define:'+k+':'+JSON.stringify(d)); return Reflect.defineProperty(t,k,d)}};";
+    assert_eq!(
+        run(&format!(
+            "{traps} Object.seal(new Proxy({{a:1}},h)); log.join(';')"
+        )),
+        "define:a:{\"configurable\":false}"
+    );
+    assert_eq!(
+        run(&format!(
+            "{traps} Object.freeze(new Proxy({{a:1, get b(){{return 2}}}},h)); log.join(';')"
+        )),
+        "gopd:a;define:a:{\"writable\":false,\"configurable\":false};gopd:b;define:b:{\"configurable\":false}"
+    );
+    // EnumerableOwnProperties validates a getOwnPropertyDescriptor trap's result (§10.5.5).
+    assert_eq!(
+        throws("Object.keys(new Proxy({a:1},{getOwnPropertyDescriptor(){return {get:42}}}))"),
+        "TypeError"
+    );
+    // GetMethod throws for a trap that is neither callable nor undefined (§7.3.10).
+    assert_eq!(
+        throws("Reflect.set(new Proxy({},{set:42}),'x',1)"),
+        "TypeError"
+    );
+    assert_eq!(
+        throws("Object.getPrototypeOf(new Proxy({},{getPrototypeOf:{}}))"),
+        "TypeError"
+    );
+}
+
+#[test]
 fn set_returns_boolean() {
     // [[Set]] reports failure as a boolean (Reflect.set / proxy trap), while an assignment throws.
     assert_eq!(

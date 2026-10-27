@@ -28,19 +28,18 @@ pub(super) fn install_reflect(it: &mut Interp) {
             if matches!((handler).view(), ValueView::Null) {
                 return Err(i.make_error("TypeError", "proxy is revoked"));
             }
-            let trap = ab(i.get_member_key(&handler, "set"))?;
-            if trap.is_callable() {
+            if let Some(trap) =
+                ab(i.proxy_get_trap(&handler, crate::interpreter::PROXY_TRAP_SET, "set"))?
+            {
                 let receiver = if a.len() > 3 { arg(a, 3) } else { target };
-                let res = ab(i.call(
-                    trap,
+                let key_value = i
+                    .sym_from_key(&key)
+                    .unwrap_or_else(|| crate::value::string_key_value(key.as_str()));
+                let res = ab(i.proxy_call_trap(
+                    crate::interpreter::PROXY_TRAP_SET,
+                    &trap,
                     handler,
-                    &[
-                        ptarget,
-                        i.sym_from_key(&key)
-                            .unwrap_or_else(|| crate::value::string_key_value(key.as_str())),
-                        value,
-                        receiver,
-                    ],
+                    [ptarget, key_value, value, receiver],
                 ))?;
                 let ok = i.to_boolean(&res);
                 if ok {

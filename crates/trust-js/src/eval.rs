@@ -2726,13 +2726,10 @@ impl Interp {
                 if Interp::is_sym_key(&pk) {
                     continue;
                 }
-                let desc =
-                    crate::builtins::proxy_gopd_value(self, &t, &h, &pk).map_err(Abrupt::Throw)?;
-                if matches!((desc).view(), ValueView::Undefined) {
-                    continue;
-                }
-                let e = self.get_member_key(&desc, "enumerable")?;
-                if !self.to_boolean(&e) {
+                let enumerable = crate::builtins::proxy_get_own_property(self, &t, &h, &pk)
+                    .map_err(Abrupt::Throw)?
+                    .is_some_and(|desc| desc.enumerable());
+                if !enumerable {
                     continue;
                 }
                 let v = self.get_member_key(&with, &pk)?;
@@ -7125,13 +7122,10 @@ impl Interp {
                 if is_excluded(&pk) {
                     continue;
                 }
-                let desc =
-                    crate::builtins::proxy_gopd_value(self, &t, &h, &pk).map_err(Abrupt::Throw)?;
-                if matches!((desc).view(), ValueView::Undefined) {
-                    continue;
-                }
-                let e = self.get_member_key(&desc, "enumerable")?;
-                if self.to_boolean(&e) {
+                let enumerable = crate::builtins::proxy_get_own_property(self, &t, &h, &pk)
+                    .map_err(Abrupt::Throw)?
+                    .is_some_and(|desc| desc.enumerable());
+                if enumerable {
                     let v = self.get_member_key(value, &pk)?;
                     rest.borrow_mut()
                         .props
