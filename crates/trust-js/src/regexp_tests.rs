@@ -105,6 +105,34 @@ fn attempts_start_with_captures_unset() {
     );
 }
 
+/// A sticky RegExp tries `lastIndex` alone (§22.2.7.2 step 13.a): where no match can begin,
+/// by its first element, a line start or a lookbehind, it fails there and resets `lastIndex`,
+/// and where one can, including an empty one or one through `^`, it matches.
+#[test]
+fn sticky_regexps_try_only_lastindex() {
+    check(
+        r#"
+        function at(re, s, i) { re.lastIndex = i; var m = re.exec(s); return [m, re.lastIndex]; }
+        JSON.stringify([
+            at(/(?<=a)b/y, "ab", 1),
+            at(/(?<=a)b/y, "bb", 1),
+            at(/^b|c/my, "a\nb", 2),
+            at(/^b|c/my, "a\nb", 1),
+            at(/x*/y, "ab", 1),
+            at(/[ \t]/y, "a b", 1),
+            at(/[ \t]/y, "a b", 0),
+            at(/(?:)/y, "ab", 2),
+            at(/\u{1F600}/uy, "a\u{1F600}", 2),
+            at(/./uy, "a\u{1F600}", 2),
+            at(/[^a]/uy, "a\u{1F600}", 2),
+            at(/b/y, "abc", 3),
+            at(/^/my, "a\n", 2),
+        ])
+        "#,
+        r#"[[["b"],2],[null,0],[["b"],3],[null,0],[[""],1],[[" "],2],[null,0],[[""],2],[["😀"],3],[["😀"],3],[["😀"],3],[null,0],[[""],2]]"#,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).

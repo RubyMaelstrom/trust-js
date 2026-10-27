@@ -2970,8 +2970,9 @@ impl Regex {
             return Ok(None);
         }
         // A sticky regex tries `start` alone, and one anchored at the input's start (every path
-        // first asserts `^`, outside multiline mode) position 0 alone. When the prefilter's
-        // literal is not in range of that start, the matcher is not entered at all.
+        // first asserts `^`, outside multiline mode) position 0 alone. When the first-element
+        // filter rules that start out, or the prefilter's literal is not in range of it, the
+        // matcher is not entered at all.
         let only = if self.sticky {
             Some(start)
         } else if matches!(self.first, FirstFilter::Anchored) {
@@ -2982,9 +2983,14 @@ impl Regex {
         } else {
             None
         };
-        if let (Some(at), Some(prefilter)) = (only, &self.prefilter) {
-            if !prefilter.occurs_from(input, at, control)? {
+        if let Some(at) = only {
+            if !self.may_start(input, at) {
                 return Ok(None);
+            }
+            if let Some(prefilter) = &self.prefilter {
+                if !prefilter.occurs_from(input, at, control)? {
+                    return Ok(None);
+                }
             }
         }
         // One matcher for the whole scan, on the program's own scratch. Matching runs no code, so
