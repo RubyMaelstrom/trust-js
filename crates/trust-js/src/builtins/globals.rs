@@ -232,25 +232,76 @@ fn parse_int(s: &str, mut radix: u32) -> f64 {
     if !(2..=36).contains(&radix) {
         return f64::NAN;
     }
-    let mut acc = 0.0;
-    let mut any = false;
-    for c in body.chars() {
-        match c.to_digit(radix) {
-            Some(d) => {
-                acc = acc * radix as f64 + d as f64;
-                any = true;
-            }
-            None => break,
-        }
-    }
-    if !any {
+    let digits = body
+        .find(|c: char| c.to_digit(radix).is_none())
+        .map_or(body, |end| &body[..end]);
+    if digits.is_empty() {
         return f64::NAN;
     }
+    let value = integer_of_digits(digits, radix);
     if neg {
-        -acc
+        -value
     } else {
-        acc
+        value
     }
+}
+
+/// The Number nearest the integer that `digits` (radix-`radix` digits, at least one) denote.
+/// ECMA-262's parseInt rounds it correctly in radix 10 and the powers of two, and lets other
+/// radixes approximate.
+fn integer_of_digits(digits: &str, radix: u32) -> f64 {
+    let digit = |byte: u8| u64::from(char::from(byte).to_digit(radix).unwrap_or(0));
+    // Exact while it fits in 64 bits, and `as` rounds to nearest, ties to even.
+    let mut m = 0u64;
+    let mut used = 0;
+    while let Some(&byte) = digits.as_bytes().get(used) {
+        match m
+            .checked_mul(u64::from(radix))
+            .and_then(|m| m.checked_add(digit(byte)))
+        {
+            Some(next) => m = next,
+            None => break,
+        }
+        used += 1;
+    }
+    let rest = &digits.as_bytes()[used..];
+    if rest.is_empty() {
+        return m as f64;
+    }
+    if radix == 10 {
+        // The decimal parser rounds correctly however many digits there are.
+        return digits.parse().unwrap_or(f64::NAN);
+    }
+    if radix.is_power_of_two() {
+        // `m` holds at least 60 bits, and every further digit scales it by a power of two and
+        // adds bits below its last.
+        let shift = u64::from(radix.trailing_zeros()).saturating_mul(rest.len() as u64);
+        let sticky = rest.iter().any(|&byte| digit(byte) != 0);
+        return round_scaled(m, shift, sticky);
+    }
+    rest.iter().fold(m as f64, |value, &byte| {
+        value * f64::from(radix) + digit(byte) as f64
+    })
+}
+
+/// The Number nearest `m` × 2^`shift` plus, when `sticky`, a positive amount under 2^`shift`,
+/// rounding to nearest, ties to even. `m` is nonzero.
+fn round_scaled(m: u64, shift: u64, sticky: bool) -> f64 {
+    let zeros = m.leading_zeros();
+    let top = m << zeros;
+    // Keep 53 bits; bit 10 of `top` is the first one dropped.
+    let mut mantissa = top >> 11;
+    let below = top & ((1 << 10) - 1) != 0 || sticky;
+    if top & (1 << 10) != 0 && (below || mantissa & 1 != 0) {
+        mantissa += 1;
+    }
+    let exponent = shift.saturating_add(11).saturating_sub(u64::from(zeros));
+    // The mantissa is at least 2^52, so from 2^972 on the value overflows to Infinity.
+    if exponent >= 972 {
+        return f64::INFINITY;
+    }
+    let scale = f64::from_bits((exponent + 1023) << 52);
+    mantissa as f64 * scale
 }
 
 fn parse_float(s: &str) -> f64 {

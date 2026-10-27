@@ -24084,6 +24084,48 @@ fn parse_int_radix_to_uint32() {
 }
 
 #[test]
+fn parse_int_rounds_long_digits_to_nearest() {
+    // Radix 10 and the powers of two round correctly past 64 bits (ties to even), where
+    // accumulating in floating point rounds at every digit.
+    for (digits, radix, expected) in [
+        ("'123'.repeat(65)", 10, "1.2312312312312312e+194"),
+        ("'18446744073709551617'", 10, "18446744073709552000"),
+        (
+            "'0'.repeat(40) + '9007199254740993'",
+            10,
+            "9007199254740992",
+        ),
+        ("'1' + '0'.repeat(52) + '11'", 2, "18014398509481988"),
+        ("'1' + '0'.repeat(52) + '10'", 2, "18014398509481984"),
+        ("'1' + '0'.repeat(51) + '110'", 2, "18014398509481990"),
+        (
+            "'1' + '0'.repeat(52) + '1' + '0'.repeat(26) + '1'",
+            2,
+            "1.2089258196146294e+24",
+        ),
+        ("'v'.repeat(30)", 32, "1.42724769270596e+45"),
+        (
+            "'f'.repeat(13) + '8' + '0'.repeat(242)",
+            16,
+            "1.7976931348623157e+308",
+        ),
+        (
+            "'f'.repeat(13) + 'b' + 'f'.repeat(242)",
+            16,
+            "1.7976931348623157e+308",
+        ),
+        (
+            "'-' + 'f'.repeat(13) + 'c' + '0'.repeat(242)",
+            16,
+            "-Infinity",
+        ),
+    ] {
+        let source = format!("String(parseInt({digits}, {radix}))");
+        assert_eq!(run(&source), expected, "{source}");
+    }
+}
+
+#[test]
 fn uri_decode_spec() {
     // decodeURI preserves escapes of the reserved set; decodeURIComponent decodes them.
     assert_eq!(
