@@ -53,6 +53,27 @@ fn backtracking_restores_lookaround_and_iteration_captures() {
     );
 }
 
+/// An inline modifier group's flags hold inside it only (§22.2.2.3.1, ModifiersAtom), also
+/// when backtracking re-enters or leaves the group and when a lookaround fails inside one.
+#[test]
+fn modifier_flags_hold_inside_their_group_across_backtracking() {
+    check(
+        r#"
+        JSON.stringify([
+            /(?i:a+)A/.exec("aaA"),
+            /(?i:a+)A/.exec("aaa"),
+            /a(?i:b(?-i:c))d/.exec("aBcd"),
+            /a(?i:b(?-i:c))d/.exec("aBCd"),
+            /(?:x(?i:y))*xY/.exec("xYxyxy"),
+            /(?!(?i:Ax))A/.exec("a"),
+            /(?=(?i:A))a/.exec("a"),
+            /(?i:(?<=A)b)/.exec("ab"),
+        ])
+        "#,
+        r#"[["aaA"],null,["aBcd"],null,["xY"],null,["a"],["b"]]"#,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).

@@ -2962,9 +2962,7 @@ impl Regex {
         scratch.marks.clear();
         scratch.marks.resize(self.nmarks, None);
         scratch.flags.clear();
-        scratch
-            .flags
-            .push((self.ignore_case, self.multiline, self.dotall));
+        let base_flags = (self.ignore_case, self.multiline, self.dotall);
         let mut m = Matcher {
             input,
             caps: scratch.caps,
@@ -2977,7 +2975,8 @@ impl Regex {
             looks: Vec::new(),
             state_limit: backtrack_state_limit(),
             back: false,
-            flags: scratch.flags,
+            flags: base_flags,
+            outer_flags: scratch.flags,
             unicode: self.flags.contains('u') || self.flags.contains('v'),
             control,
             abort: None,
@@ -3045,7 +3044,8 @@ impl Regex {
             debug_assert!(m.choices == 0 && m.floor == 0 && !m.back);
             m.caps.fill(None);
             m.marks.fill(None);
-            m.flags.truncate(1);
+            m.flags = base_flags;
+            m.outer_flags.clear();
             if m.run(&self.prog, from) {
                 break 'scan Ok(Some(project(&m.caps)));
             }
@@ -3066,7 +3066,7 @@ impl Regex {
             *s.borrow_mut() = Some(MatchScratch {
                 caps: m.caps,
                 marks: m.marks,
-                flags: m.flags,
+                flags: m.outer_flags,
                 bt: m.bt,
                 saved: m.saved,
             });
@@ -3313,6 +3313,7 @@ fn char_class_heap_bytes(class: &CharClass) -> usize {
 struct MatchScratch {
     caps: Vec<Option<usize>>,
     marks: Vec<Option<usize>>,
+    /// The modifier flag stack (see `Matcher::outer_flags`).
     flags: Vec<(bool, bool, bool)>,
     bt: Vec<Backtrack>,
     saved: Vec<Option<usize>>,
@@ -5605,7 +5606,7 @@ enum Backtrack {
         id: u32,
         old: usize,
     },
-    /// Undo `PushFlags` / `PopFlags`.
+    /// Undo `PushFlags` / `PopFlags` (see [`Matcher::outer_flags`]).
     PopFlags,
     PushFlags(bool, bool, bool),
     /// Restore the capture slots from `2 * lo` on from the newest snapshot, `saved[at..]`.
@@ -5693,8 +5694,9 @@ struct LookFrame<'a> {
     floor: u32,
     /// Start of the capture snapshot taken on entry, in `saved`.
     saved: usize,
-    /// Depth of the flag stack on entry.
-    flags: usize,
+    /// The flags on entry, and the depth of the modifier stack.
+    flags: (bool, bool, bool),
+    outer_flags: usize,
 }
 
 struct Matcher<'a, I: ReInput> {
@@ -5721,9 +5723,12 @@ struct Matcher<'a, I: ReInput> {
     state_limit: usize,
     /// Matching direction: a lookbehind body (compiled from the reversed AST) consumes leftward.
     back: bool,
-    /// `(icase, multiline, dotall)` stack — the base flags, plus an entry per active `(?ims-ims:…)`
-    /// inline-modifier group. Reads use the top; the group's Push/Pop instructions undo on backtrack.
-    flags: Vec<(bool, bool, bool)>,
+    /// The flags in effect, `(icase, multiline, dotall)`: the pattern's, or those of the innermost
+    /// active `(?ims-ims:…)` inline-modifier group.
+    flags: (bool, bool, bool),
+    /// The flags each active modifier group replaced, innermost last. The group's Push/Pop
+    /// instructions undo on backtrack.
+    outer_flags: Vec<(bool, bool, bool)>,
     /// Unicode mode (`u`/`v`): case-insensitive matching uses full case folding instead of the
     /// legacy Canonicalize (simple uppercase, never folding non-ASCII to ASCII).
     unicode: bool,
@@ -5792,15 +5797,15 @@ impl<'a, I: ReInput> Matcher<'a, I> {
     }
     #[inline(always)]
     fn icase(&self) -> bool {
-        self.flags.last().unwrap().0
+        self.flags.0
     }
     #[inline(always)]
     fn multiline(&self) -> bool {
-        self.flags.last().unwrap().1
+        self.flags.1
     }
     #[inline(always)]
     fn dotall(&self) -> bool {
-        self.flags.last().unwrap().2
+        self.flags.2
     }
     /// Compare two subject/pattern code points under the active case rules.
     #[inline(always)]
@@ -6486,7 +6491,8 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         self.choices = frame.choices;
                         self.floor = frame.floor;
                         self.back = frame.back;
-                        self.flags.truncate(frame.flags);
+                        self.flags = frame.flags;
+                        self.outer_flags.truncate(frame.outer_flags);
                         self.saved.truncate(frame.saved + self.caps.len());
                         prog = frame.prog;
                         if frame.negate {
@@ -6663,17 +6669,19 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         }
                     }
                     Inst::PushFlags(i, m, s) => {
-                        let cur = *self.flags.last().unwrap();
-                        self.flags.push((
-                            i.unwrap_or(cur.0),
-                            m.unwrap_or(cur.1),
-                            s.unwrap_or(cur.2),
-                        ));
+                        let outer = self.flags;
+                        self.outer_flags.push(outer);
+                        self.flags = (
+                            i.unwrap_or(outer.0),
+                            m.unwrap_or(outer.1),
+                            s.unwrap_or(outer.2),
+                        );
                         self.push_undo(Backtrack::PopFlags);
                         pc += 1;
                     }
                     Inst::PopFlags => {
-                        let (i, m, s) = self.flags.pop().unwrap();
+                        let (i, m, s) = self.flags;
+                        self.flags = self.outer_flags.pop().unwrap();
                         self.push_undo(Backtrack::PushFlags(i, m, s));
                         pc += 1;
                     }
@@ -6771,7 +6779,8 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                             choices: self.choices,
                             floor: self.floor,
                             saved,
-                            flags: self.flags.len(),
+                            flags: self.flags,
+                            outer_flags: self.outer_flags.len(),
                         });
                         self.bt.push(Backtrack::LookFail);
                         self.floor = self.choices;
@@ -6801,11 +6810,12 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         continue;
                     }
                     Backtrack::PopFlags => {
-                        self.flags.pop();
+                        self.flags = self.outer_flags.pop().unwrap();
                         continue;
                     }
                     Backtrack::PushFlags(i, m, s) => {
-                        self.flags.push((i, m, s));
+                        self.outer_flags.push(self.flags);
+                        self.flags = (i, m, s);
                         continue;
                     }
                     Backtrack::Captures { lo, at } => {
@@ -6906,7 +6916,8 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                             .expect("lookaround failure without a frame");
                         self.floor = frame.floor;
                         self.back = frame.back;
-                        self.flags.truncate(frame.flags);
+                        self.flags = frame.flags;
+                        self.outer_flags.truncate(frame.outer_flags);
                         self.restore_captures(0, frame.saved);
                         prog = frame.prog;
                         if !frame.negate {
