@@ -158,3 +158,27 @@ fn an_array_data_property_under_a_non_canonical_key_keeps_the_length() {
     let length = engine.interp.get_member_key(&array, "length").ok();
     assert_eq!(length.and_then(|length| length.as_num_opt()), Some(5.0));
 }
+
+#[test]
+fn object_spread_and_rest_copy_a_strings_code_units() {
+    // CopyDataProperties of a String copies its StringGetOwnProperty indices: one a code unit,
+    // so a surrogate pair gives two properties.
+    check(
+        r#"
+        function run() {
+            function units(o) {
+                return Object.keys(o).map(function (k) {
+                    return k + '=' + o[k].charCodeAt(0).toString(16);
+                }).join(' ');
+            }
+            var spread = {...'a\u{1F600}b'};
+            var {0: first, ...rest} = 'x\u{1F600}';
+            var assigned = Object.assign({}, 'a\u{1F600}');
+            return [units(spread), first, units(rest), units(assigned),
+                    Object.keys({...'\uD800\u00e9'}).length].join('|');
+        }
+        run()
+        "#,
+        "0=61 1=d83d 2=de00 3=62|x|1=d83d 2=de00|0=61 1=d83d 2=de00|2",
+    );
+}

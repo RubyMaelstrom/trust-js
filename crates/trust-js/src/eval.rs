@@ -7184,14 +7184,15 @@ impl Interp {
                     }
                 }
             }
-            // ToObject(string): copy the enumerable index properties.
+            // ToObject(string): copy the enumerable index properties, one a code unit
+            // (StringGetOwnProperty), a surrogate pair's halves included.
             ValueView::Str(s) => {
-                for (idx, ch) in s.text().chars().enumerate() {
+                for (idx, unit) in s.units().iter().enumerate() {
                     let k = idx.to_string();
                     if is_excluded(&k) {
                         continue;
                     }
-                    set_data(rest, &k, Value::lstr(ch.to_string()));
+                    set_data(rest, &k, Value::Str(crate::jstr::unit_lstr(unit)));
                 }
             }
             // Other primitives wrap to an object with no own enumerable properties.
