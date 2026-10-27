@@ -232,6 +232,25 @@ comment/example in the same change.
   (`perf_event_mlock_kb`), `perf record` fails to open its events; smaller ring buffers
   (`-m 16`) let it open them.
 
+## RegExp diagnostic controls
+
+- `TRUST_JS_REGEXP_PROF=1` reports at exit the matcher's executed instructions by kind, the
+  positions its prescans skipped, its attempts and backtracking entries, and the native one-byte
+  tier's promotions, runs and code size. It costs a check per instruction: diagnostic only.
+- `TRUST_JS_REGEXP_TIER_UP_AT=N` promotes an eligible pattern to the native one-byte tier after
+  N executions (default 64); 0 keeps every pattern on the backtracking matcher.
+- `TRUST_JS_REGEXP_NO_PREFILTER=1` compiles patterns without their prefilter: the literal every
+  match contains and the range of its offset from the match start. Exec scans for that literal
+  and tries only the starts that put an occurrence in range, and a sticky regex, or one anchored
+  at the input's start, enters the matcher only when the literal lies in range of its one start.
+  With the switch set, exec tries every start the first-element filter lets through.
+- `TRUST_JS_REGEXP_NO_SIMD=1` keeps the subject scans (for the prefilter's literal, and for a
+  match's first element by byte or by table) on their portable loops instead of AArch64 vector
+  code.
+
+The fast paths' switches exist so that a workload can run with each forced off and be compared,
+by instruction counts (`perf stat -e instructions:u`); none changes a result.
+
 ## Architecture diagnostics
 
 The `architecture-diagnostics` feature records allocation sites/lifetimes

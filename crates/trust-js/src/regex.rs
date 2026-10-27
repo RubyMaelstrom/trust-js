@@ -274,8 +274,13 @@ pub struct Regex {
     /// [`FirstFilter::Atoms`] baked into a byte-indexed table (elements < 256): the scan loop
     /// becomes one load per position.
     first_lut: Option<Box<[bool; 256]>>,
+    /// The table's ASCII half for the vector scan, unless a multiline `^` path lets a match
+    /// begin at every line start too.
+    first_ascii: Option<AsciiSet>,
     /// Besides the [`FirstFilter::Atoms`], a match may begin wherever `^` holds.
     first_line_start: bool,
+    /// A literal every match contains, which exec scans for before running the matcher.
+    prefilter: Option<Box<Prefilter>>,
     /// Per-pattern execution feedback. These cells add no allocation to cold patterns; the native
     /// straight-line program is compiled lazily after the tier-up threshold.
     tier_ticks: Cell<u32>,
@@ -1500,6 +1505,462 @@ fn first_filter(prog: &[Inst], multiline: bool) -> (FirstFilter, bool) {
     }
 }
 
+/// The ASCII elements that may begin a match (the [`FirstFilter::Atoms`] predicate below 128) as
+/// a vector scan tests them, by nibble lookup: bit `h` of `by_low_nibble[l]` is set when element
+/// `h << 4 | l` belongs.
+struct AsciiSet {
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    by_low_nibble: [u8; 16],
+}
+
+impl AsciiSet {
+    fn new(member: impl Fn(u32) -> bool) -> Self {
+        let mut by_low_nibble = [0u8; 16];
+        for element in 0..0x80u32 {
+            if member(element) {
+                by_low_nibble[(element & 0xf) as usize] |= 1 << (element >> 4);
+            }
+        }
+        Self { by_low_nibble }
+    }
+}
+
+/// Elements a [`Prefilter`]'s literal keeps at most. A longer run keeps its first elements, which
+/// every match still holds at the same offsets.
+const MAX_PREFILTER_LEN: usize = 256;
+
+/// How many offsets apart a single-start [`Prefilter`] may look: it checks every offset in range
+/// before the one attempt it can save.
+const MAX_SINGLE_START_RANGE: usize = 16;
+
+/// A literal every match contains, and how far from the match's start it may begin. Exec scans
+/// the subject for the literal and tries only the starts that put an occurrence of it in range;
+/// once no occurrence is left, no match can be either. A regex that tries one start alone
+/// (sticky, or anchored at the input's start) checks only the offsets in range of that start.
+struct Prefilter {
+    /// Code units, or code points in Unicode mode: the matcher's elements.
+    elements: Box<[u32]>,
+    /// The elements as bytes when all fit in one; a subject of bytes cannot hold the literal
+    /// otherwise.
+    bytes: Option<Box<[u8]>>,
+    min_offset: usize,
+    /// `None` when unbounded: occurrences then end the search only by running out.
+    max_offset: Option<usize>,
+    /// The indices of the literal's two rarest elements (one index twice for a single element):
+    /// a scan compares those first and checks the whole literal only where both agree.
+    rare: [usize; 2],
+}
+
+impl Prefilter {
+    /// The prefilter of a compiled pattern, if it has a required literal worth scanning for
+    /// (`single_start`: the regex tries one start alone). `TRUST_JS_REGEXP_NO_PREFILTER=1` turns
+    /// prefilters off.
+    fn new(pattern: &Node, ignore_case: bool, single_start: bool) -> Option<Box<Self>> {
+        if env_flag!("TRUST_JS_REGEXP_NO_PREFILTER") {
+            return None;
+        }
+        let literal = required_literal(pattern, ignore_case)?;
+        if single_start
+            && literal
+                .max_offset
+                .is_none_or(|max| max - literal.min_offset > MAX_SINGLE_START_RANGE)
+        {
+            return None;
+        }
+        let mut by_rarity: Vec<usize> = (0..literal.elements.len()).collect();
+        by_rarity.sort_by_key(|&index| element_commonness(literal.elements[index]));
+        let rare = [by_rarity[0], *by_rarity.get(1).unwrap_or(&by_rarity[0])];
+        let bytes = literal
+            .elements
+            .iter()
+            .map(|&element| u8::try_from(element).ok())
+            .collect::<Option<Vec<u8>>>()
+            .map(Vec::into_boxed_slice);
+        Some(Box::new(Self {
+            elements: literal.elements.into_boxed_slice(),
+            bytes,
+            min_offset: literal.min_offset,
+            max_offset: literal.max_offset,
+            rare,
+        }))
+    }
+
+    /// The first offset at or past `from` plus the literal's least offset where `input` holds
+    /// the literal.
+    fn find<I: ReInput>(
+        &self,
+        input: I,
+        from: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        let Some(last) = input.len().checked_sub(self.elements.len()) else {
+            return Ok(None);
+        };
+        let first = from.saturating_add(self.min_offset);
+        if first > last {
+            return Ok(None);
+        }
+        input.find_literal(first, last + 1, self, control)
+    }
+
+    /// Whether `input` holds the literal in range of the start `at` (a single-start prefilter's
+    /// offsets are bounded).
+    fn occurs_from<I: ReInput>(
+        &self,
+        input: I,
+        at: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> Result<bool, MatchError> {
+        let Some(last) = input.len().checked_sub(self.elements.len()) else {
+            return Ok(false);
+        };
+        let first = at.saturating_add(self.min_offset);
+        let last = last.min(at.saturating_add(self.max_offset.unwrap_or(usize::MAX)));
+        if first > last {
+            return Ok(false);
+        }
+        Ok(input
+            .find_literal(first, last + 1, self, control)?
+            .is_some())
+    }
+
+    fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.elements
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(self.bytes.as_ref().map_or(0, |bytes| bytes.len()))
+    }
+}
+
+/// How common element `e` tends to be in text and source code, lower being rarer. A literal's
+/// rarest elements are the ones its scan compares first.
+fn element_commonness(e: u32) -> u8 {
+    match e {
+        0x20 => 255,
+        // e t a o i n s r
+        0x65 | 0x74 | 0x61 | 0x6f | 0x69 | 0x6e | 0x73 | 0x72 => 230,
+        0x61..=0x7a => 190,
+        0x09 | 0x0a => 170,
+        // " ' ( ) , - . / : ; = _
+        0x22 | 0x27 | 0x28 | 0x29 | 0x2c | 0x2d | 0x2e | 0x2f | 0x3a | 0x3b | 0x3d | 0x5f => 160,
+        0x30..=0x39 => 150,
+        0x41..=0x5a => 120,
+        0x21..=0x7e | 0x0d => 100,
+        0x00..=0x1f | 0x7f => 40,
+        _ => 70,
+    }
+}
+
+/// A literal every match of a pattern contains (of a node, its offsets then counting from the
+/// node's start), with the least and greatest offset at which it may begin.
+struct RequiredLiteral {
+    elements: Vec<u32>,
+    min_offset: usize,
+    max_offset: Option<usize>,
+}
+
+impl RequiredLiteral {
+    /// Whether a prefilter should rather scan for this literal than for `other`. Occurrences at
+    /// bounded offsets confine the starts to try, while unbounded ones only end the search when
+    /// they run out: so a bounded literal of two or more elements wins over any unbounded one,
+    /// and otherwise the longer literal, then the narrower range.
+    fn better_than(&self, other: &Self) -> bool {
+        let key = |literal: &Self| {
+            let range = literal
+                .max_offset
+                .map_or(usize::MAX, |max| max.saturating_sub(literal.min_offset));
+            (
+                range != usize::MAX && literal.elements.len() > 1,
+                literal.elements.len(),
+                std::cmp::Reverse(range),
+            )
+        };
+        key(self) > key(other)
+    }
+}
+
+/// What every match of a pattern node shares, as [`required_literal`] works it out.
+struct LiteralFacts {
+    /// Bounds on a match's length in elements; `max` is `None` when unbounded.
+    min: usize,
+    max: Option<usize>,
+    /// Whether every match is exactly `prefix` (which `suffix` then equals).
+    exact: bool,
+    /// Elements every match begins with, and elements every match ends with.
+    prefix: Vec<u32>,
+    suffix: Vec<u32>,
+    /// The best literal required inside the node, besides its prefix and suffix.
+    best: Option<RequiredLiteral>,
+}
+
+impl LiteralFacts {
+    fn exact(elements: Vec<u32>) -> Self {
+        Self {
+            min: elements.len(),
+            max: Some(elements.len()),
+            exact: true,
+            suffix: elements.clone(),
+            prefix: elements,
+            best: None,
+        }
+    }
+
+    fn opaque(min: usize, max: Option<usize>) -> Self {
+        Self {
+            min,
+            max,
+            exact: false,
+            prefix: Vec::new(),
+            suffix: Vec::new(),
+            best: None,
+        }
+    }
+}
+
+/// The literal a [`Prefilter`] scans for: the best (see [`RequiredLiteral::better_than`]) that
+/// every match contains. A single element at the match's start is left to the first-element
+/// filter.
+fn required_literal(pattern: &Node, ignore_case: bool) -> Option<RequiredLiteral> {
+    let facts = literal_facts(pattern, ignore_case);
+    let mut best = facts.best;
+    let suffix_len = facts.suffix.len();
+    consider_literal(
+        &mut best,
+        RequiredLiteral {
+            elements: facts.prefix,
+            min_offset: 0,
+            max_offset: Some(0),
+        },
+    );
+    consider_literal(
+        &mut best,
+        RequiredLiteral {
+            elements: facts.suffix,
+            min_offset: facts.min.saturating_sub(suffix_len),
+            max_offset: facts.max.map(|max| max.saturating_sub(suffix_len)),
+        },
+    );
+    best.filter(|literal| literal.elements.len() > 1 || literal.max_offset != Some(0))
+}
+
+fn consider_literal(best: &mut Option<RequiredLiteral>, candidate: RequiredLiteral) {
+    if !candidate.elements.is_empty()
+        && best.as_ref().is_none_or(|best| candidate.better_than(best))
+    {
+        *best = Some(candidate);
+    }
+}
+
+/// Whether a pattern character matches only itself: always when case is significant, and under
+/// `i` when it is an ASCII character other than a letter, which neither Canonicalize's
+/// toUppercase nor simple case folding relates to any other character (ECMA-262 §22.2.2.7.3).
+fn literal_element(c: u32, ignore_case: bool) -> bool {
+    !ignore_case || (c < 0x80 && !(c as u8).is_ascii_alphabetic())
+}
+
+/// Bounds added, `None` (unbounded) absorbing.
+fn add_bounds(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    a.zip(b).and_then(|(a, b)| a.checked_add(b))
+}
+
+/// Append `elements` to a literal run, which keeps at most [`MAX_PREFILTER_LEN`]; `false` when
+/// some were dropped, after which the run no longer ends where the appended elements do.
+fn extend_literal_run(run: &mut Vec<u32>, elements: &[u32]) -> bool {
+    let room = MAX_PREFILTER_LEN.saturating_sub(run.len());
+    run.extend_from_slice(&elements[..elements.len().min(room)]);
+    elements.len() <= room
+}
+
+/// What every match of `node` shares (see [`LiteralFacts`]), `ignore_case` as the flags and
+/// the inline modifiers around the node leave it.
+fn literal_facts(node: &Node, ignore_case: bool) -> LiteralFacts {
+    with_pattern_stack(|| match node {
+        // Assertions and lookarounds consume nothing, so the elements matched on either side of
+        // one are adjacent in the subject: a literal runs through them.
+        Node::Empty
+        | Node::Start
+        | Node::End
+        | Node::WordB(_)
+        | Node::Look(..)
+        | Node::LookBehind(..) => LiteralFacts::exact(Vec::new()),
+        Node::Char(c) if literal_element(*c, ignore_case) => LiteralFacts::exact(vec![*c]),
+        Node::Char(_) | Node::Any | Node::Class(_) => LiteralFacts::opaque(1, Some(1)),
+        Node::StringSet(set) => {
+            LiteralFacts::opaque(usize::from(!set.empty), Some(set.forward.max_depth.max(1)))
+        }
+        Node::Backref(_) | Node::NamedBackref(_) | Node::BackrefAlt(_) => {
+            LiteralFacts::opaque(0, None)
+        }
+        Node::Group(_, inner) => literal_facts(inner, ignore_case),
+        Node::Modifier { add, remove, inner } => {
+            literal_facts(inner, (ignore_case || add.0) && !remove.0)
+        }
+        Node::Concat(items) => concat_literal_facts(items, ignore_case),
+        Node::Alt(branches) => alt_literal_facts(branches, ignore_case),
+        Node::Repeat(inner, min, max, _) => {
+            repeat_literal_facts(literal_facts(inner, ignore_case), *min, *max)
+        }
+    })
+}
+
+fn concat_literal_facts(items: &[Node], ignore_case: bool) -> LiteralFacts {
+    // Bounds on the current position's offset from the start, and the literal run that ends at
+    // the current position with bounds on its own start offset. A run that outgrew
+    // MAX_PREFILTER_LEN is not `whole`: it no longer ends at the current position.
+    let (mut min, mut max) = (0usize, Some(0usize));
+    let mut run = Vec::new();
+    let (mut run_min, mut run_max) = (0usize, Some(0usize));
+    let mut whole = true;
+    let mut prefix = None;
+    let mut best = None;
+    for item in items {
+        let facts = literal_facts(item, ignore_case);
+        whole &= extend_literal_run(&mut run, &facts.prefix);
+        if !facts.exact {
+            if prefix.is_none() {
+                prefix = Some(run.clone());
+            }
+            if let Some(inner) = facts.best {
+                consider_literal(
+                    &mut best,
+                    RequiredLiteral {
+                        elements: inner.elements,
+                        min_offset: min.saturating_add(inner.min_offset),
+                        max_offset: add_bounds(max, inner.max_offset),
+                    },
+                );
+            }
+            consider_literal(
+                &mut best,
+                RequiredLiteral {
+                    elements: run,
+                    min_offset: run_min,
+                    max_offset: run_max,
+                },
+            );
+            // The next run begins with the item's suffix, which ends where the item does.
+            run = facts.suffix;
+            whole = true;
+            run_min = min.saturating_add(facts.min).saturating_sub(run.len());
+            run_max = add_bounds(max, facts.max).map(|end| end.saturating_sub(run.len()));
+        }
+        min = min.saturating_add(facts.min);
+        max = add_bounds(max, facts.max);
+    }
+    let Some(prefix) = prefix else {
+        // Every item is exact: so is the concatenation, unless its run was cut short.
+        if whole {
+            return LiteralFacts::exact(run);
+        }
+        return LiteralFacts {
+            min,
+            max,
+            exact: false,
+            prefix: run,
+            suffix: Vec::new(),
+            best: None,
+        };
+    };
+    let suffix = if whole { run.clone() } else { Vec::new() };
+    consider_literal(
+        &mut best,
+        RequiredLiteral {
+            elements: run,
+            min_offset: run_min,
+            max_offset: run_max,
+        },
+    );
+    LiteralFacts {
+        min,
+        max,
+        exact: false,
+        prefix,
+        suffix,
+        best,
+    }
+}
+
+fn alt_literal_facts(branches: &[Node], ignore_case: bool) -> LiteralFacts {
+    let mut facts = branches
+        .iter()
+        .map(|branch| literal_facts(branch, ignore_case));
+    let Some(first) = facts.next() else {
+        return LiteralFacts::exact(Vec::new());
+    };
+    facts.fold(first, |all, branch| {
+        let shared = all
+            .prefix
+            .iter()
+            .zip(&branch.prefix)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let shared_end = all
+            .suffix
+            .iter()
+            .rev()
+            .zip(branch.suffix.iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        LiteralFacts {
+            min: all.min.min(branch.min),
+            max: all.max.zip(branch.max).map(|(a, b)| a.max(b)),
+            exact: all.exact && branch.exact && all.prefix == branch.prefix,
+            prefix: all.prefix[..shared].to_vec(),
+            suffix: all.suffix[all.suffix.len() - shared_end..].to_vec(),
+            // A literal inside one branch need not be in a match of another.
+            best: None,
+        }
+    })
+}
+
+fn repeat_literal_facts(inner: LiteralFacts, min: usize, max: Option<usize>) -> LiteralFacts {
+    if (inner.exact && inner.prefix.is_empty()) || max == Some(0) {
+        return LiteralFacts::exact(Vec::new());
+    }
+    let len_min = inner.min.saturating_mul(min);
+    let len_max = match (inner.max, max) {
+        (Some(0), _) => Some(0),
+        (Some(a), Some(b)) => a.checked_mul(b),
+        _ => None,
+    };
+    if min == 0 {
+        // No iteration at all matches the empty string, which requires nothing.
+        return LiteralFacts::opaque(0, len_max);
+    }
+    if inner.exact {
+        // Every match is `min` or more copies of the literal.
+        let mut copies = Vec::new();
+        let mut whole = true;
+        for _ in 0..min {
+            whole = extend_literal_run(&mut copies, &inner.prefix);
+            if !whole {
+                break;
+            }
+        }
+        if whole && max == Some(min) {
+            return LiteralFacts::exact(copies);
+        }
+        let suffix = if whole { copies.clone() } else { Vec::new() };
+        return LiteralFacts {
+            min: len_min,
+            max: len_max,
+            exact: false,
+            prefix: copies,
+            suffix,
+            best: None,
+        };
+    }
+    // The first iteration begins every match and the last one ends it.
+    LiteralFacts {
+        min: len_min,
+        max: len_max,
+        ..inner
+    }
+}
+
 #[derive(Default, Clone)]
 struct CharClass {
     negate: bool,
@@ -2328,6 +2789,7 @@ impl Regex {
             )
             .saturating_add(scan_program_references(&self.prog, visitor))
             .saturating_add(first)
+            .saturating_add(self.prefilter.as_ref().map_or(0, |p| p.heap_bytes()))
             .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(self.literal_fold.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(
@@ -2366,6 +2828,7 @@ impl Regex {
         std::mem::size_of::<Self>()
             .saturating_add(program_heap_bytes(&self.prog, self.prog.capacity()))
             .saturating_add(first)
+            .saturating_add(self.prefilter.as_ref().map_or(0, |p| p.heap_bytes()))
             .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(self.literal_fold.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(
@@ -2529,6 +2992,8 @@ impl Regex {
             None
         };
         let memo_string_failures = p.ngroups == 0 && program_contains_string_set(&prog);
+        let single_start = flags.contains('y') || matches!(first, FirstFilter::Anchored);
+        let prefilter = Prefilter::new(&ast, flags.contains('i'), single_start);
         let mut re = Regex {
             unicode,
             nmarks: lowering.marks,
@@ -2538,7 +3003,9 @@ impl Regex {
             literal_fold,
             memo_string_failures,
             first_lut: None,
+            first_ascii: None,
             first_line_start,
+            prefilter,
             tier_ticks: Cell::new(0),
             subject_shapes: Cell::new(0),
             tier_up_attempted: Cell::new(false),
@@ -2568,6 +3035,11 @@ impl Regex {
         } else {
             None
         };
+        if !(re.first_line_start && re.multiline) {
+            re.first_ascii = lut
+                .as_deref()
+                .map(|lut| AsciiSet::new(|element| lut[element as usize]));
+        }
         re.first_lut = lut;
         Ok(re)
     }
@@ -2636,6 +3108,92 @@ impl Regex {
             Rep::Any => self.dotall || c != '\n' as u32,
             Rep::Class(cc) => cc.matches(c, self.ignore_case, unicode),
         })
+    }
+
+    /// Whether the first-element filter lets a match begin at `at`, which is at most the input's
+    /// length: there only a match through `^` (or an empty one, which the filter never
+    /// excludes) may begin.
+    #[inline(always)]
+    fn may_start<I: ReInput>(&self, input: I, at: usize) -> bool {
+        if let Some(byte) = self.first_byte {
+            return at < input.len() && input.at(at) == byte as u32;
+        }
+        match &self.first {
+            FirstFilter::None => true,
+            // `^` (non-multiline) only matches at position 0.
+            FirstFilter::Anchored => at == 0,
+            FirstFilter::Atoms(atoms) => self.atom_start(input, atoms, at),
+        }
+    }
+
+    /// The first position in `from..=end` where the first-element filter lets a match begin
+    /// (see [`Self::may_start`]), scanning: ASCII elements by the vector form of the filter's
+    /// table when the range is worth a vector step and holds no line start.
+    fn next_start<I: ReInput>(
+        &self,
+        input: I,
+        from: usize,
+        end: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        let len = input.len();
+        if from > end {
+            return Ok(None);
+        }
+        if let Some(byte) = self.first_byte {
+            return input.find_byte(from, len.min(end + 1), byte, control);
+        }
+        let atoms = match &self.first {
+            FirstFilter::None => return Ok(Some(from)),
+            FirstFilter::Anchored => return Ok((from == 0).then_some(0)),
+            FirstFilter::Atoms(atoms) => atoms,
+        };
+        // Without a multiline `^` path (else there is no vector table) position 0 is the only
+        // line start.
+        if let Some(set) = self
+            .first_ascii
+            .as_ref()
+            .filter(|_| (from > 0 || !self.first_line_start) && end - from >= 16 && regexp_simd())
+        {
+            return input.find_viable(
+                from,
+                len.min(end + 1),
+                set,
+                |c| self.first_viable(atoms, c),
+                control,
+            );
+        }
+        let mut at = from;
+        loop {
+            if self.atom_start(input, atoms, at) {
+                return Ok(Some(at));
+            }
+            if at == end || at == len {
+                return Ok(None);
+            }
+            at += 1;
+            if at & INTERRUPT_POLL_MASK == 0 {
+                poll_interrupt(control)?;
+            }
+        }
+    }
+
+    /// Whether element `c` passes the [`FirstFilter::Atoms`] predicate, by table when small.
+    #[inline(always)]
+    fn first_viable(&self, atoms: &[Rep], c: u32) -> bool {
+        match &self.first_lut {
+            Some(lut) if (c as usize) < 256 => lut[c as usize],
+            _ => self.first_matches(atoms, c),
+        }
+    }
+
+    /// Whether a path may begin at `at` by the [`FirstFilter::Atoms`]: its element passes, or a
+    /// path through `^` begins there (where `^` may also match the input's empty end).
+    #[inline]
+    fn atom_start<I: ReInput>(&self, input: I, atoms: &[Rep], at: usize) -> bool {
+        (at < input.len() && self.first_viable(atoms, input.at(at)))
+            || (self.first_line_start
+                && (at == 0 || (self.multiline && is_line_terminator_u32(input.at(at - 1)))))
     }
 
     /// Match a prepared subject and return shared capture spans.
@@ -2791,6 +3349,24 @@ impl Regex {
         if start > input.len() {
             return Ok(None);
         }
+        // A sticky regex tries `start` alone, and one anchored at the input's start (every path
+        // first asserts `^`, outside multiline mode) position 0 alone. When the prefilter's
+        // literal is not in range of that start, the matcher is not entered at all.
+        let only = if self.sticky {
+            Some(start)
+        } else if matches!(self.first, FirstFilter::Anchored) {
+            if start > 0 {
+                return Ok(None);
+            }
+            Some(0)
+        } else {
+            None
+        };
+        if let (Some(at), Some(prefilter)) = (only, &self.prefilter) {
+            if !prefilter.occurs_from(input, at, control)? {
+                return Ok(None);
+            }
+        }
         // One matcher for the whole scan, its working buffers recycled across `exec` calls via a
         // thread-local (the engine is single-threaded per Interp).
         let mut scratch = MATCH_SCRATCH
@@ -2829,69 +3405,44 @@ impl Regex {
         };
         let mut from = start;
         let prof = m.prof;
+        // The last start in range of the prefilter literal's latest occurrence.
+        let mut window_end = None;
         let result = 'scan: loop {
-            if from > input.len() {
-                break 'scan Ok(None);
+            if only.is_none() {
+                // Prescan: skip positions that cannot begin a match.
+                let mut end = input.len();
+                if let Some(prefilter) = &self.prefilter {
+                    if window_end.is_none_or(|end| from > end) {
+                        let Some(found) = prefilter.find(input, from, control)? else {
+                            break 'scan Ok(None);
+                        };
+                        if let Some(max) = prefilter.max_offset {
+                            from = from.max(found.saturating_sub(max));
+                        }
+                        window_end = Some(found - prefilter.min_offset);
+                    }
+                    end = window_end.unwrap_or(end);
+                }
+                // A broad first atom lets most positions start: try this one before any scan.
+                if !self.may_start(input, from) {
+                    let next = self.next_start(input, from + 1, end, control)?;
+                    if prof {
+                        let skipped = next.unwrap_or(end + 1) - from;
+                        REGEXP_PROF.with(|p| p.borrow_mut().scan_positions += skipped as u64);
+                    }
+                    match next {
+                        Some(next) => from = next,
+                        // No start is left in range of this occurrence: look for the next one.
+                        None if end < input.len() => {
+                            from = end + 1;
+                            continue 'scan;
+                        }
+                        None => break 'scan Ok(None),
+                    }
+                }
             }
             if prof {
                 REGEXP_PROF.with(|p| p.borrow_mut().attempts += 1);
-            }
-            // Prescan: skip positions that cannot begin a match. Sticky regexes get exactly one
-            // attempt at `start`, so the filter only ever saves that single attempt for them.
-            if !self.sticky {
-                if let Some(byte) = self.first_byte {
-                    let Some(found) = input.find_byte(from, byte, control)? else {
-                        break 'scan Ok(None);
-                    };
-                    from = found;
-                } else {
-                    match &self.first {
-                        FirstFilter::Anchored => {
-                            // `^` (non-multiline) can only match at position 0: one attempt at
-                            // `from` decides the scan (any later position fails the assert too).
-                            if from > 0 {
-                                break 'scan Ok(None);
-                            }
-                        }
-                        FirstFilter::Atoms(atoms) => {
-                            // Every path consumes an element first, or begins where `^`
-                            // holds: find the next viable position. Small elements go
-                            // through the precomputed table (one load per position).
-                            let len = input.len();
-                            let line_start = |from: usize| {
-                                self.first_line_start
-                                    && (from == 0
-                                        || (self.multiline
-                                            && is_line_terminator_u32(input.at(from - 1))))
-                            };
-                            loop {
-                                if from >= len {
-                                    // A path through `^` may match the empty end of the input.
-                                    if from == len && line_start(from) {
-                                        break;
-                                    }
-                                    break 'scan Ok(None);
-                                }
-                                let c = input.at(from);
-                                let viable = match &self.first_lut {
-                                    Some(lut) if (c as usize) < 256 => lut[c as usize],
-                                    _ => self.first_matches(atoms, c),
-                                };
-                                if viable || line_start(from) {
-                                    break;
-                                }
-                                from += 1;
-                                if prof {
-                                    REGEXP_PROF.with(|p| p.borrow_mut().scan_positions += 1);
-                                }
-                                if from & INTERRUPT_POLL_MASK == 0 {
-                                    poll_interrupt(control)?;
-                                }
-                            }
-                        }
-                        FirstFilter::None => {}
-                    }
-                }
             }
             // A failed attempt unwinds its backtrack stack, lookarounds and direction. Captures,
             // marks and flags changed without undo records (see `Matcher::floor`) are reset here.
@@ -2906,7 +3457,7 @@ impl Regex {
             if let Some(error) = m.abort {
                 break 'scan Err(error);
             }
-            if self.sticky {
+            if only.is_some() || from == input.len() {
                 break 'scan Ok(None);
             }
             from += 1;
@@ -4742,13 +5293,11 @@ fn find_ascii_literal(
             .then_some((start, start + literal.len())));
     }
     let mut from = start;
-    while from + literal.len() <= subject.len() {
-        let Some(found) = subject.find_byte(from, literal[0], control)? else {
+    let end = subject.len() - literal.len() + 1;
+    while from < end {
+        let Some(found) = subject.find_byte(from, end, literal[0], control)? else {
             return Ok(None);
         };
-        if found + literal.len() > subject.len() {
-            return Ok(None);
-        }
         if subject[found..].starts_with(literal) {
             return Ok(Some((found, found + literal.len())));
         }
@@ -4828,29 +5377,41 @@ fn find_fold_byte(
 
 /// The matcher's view of a subject: element `i` as a code point / code unit. Monomorphized for
 /// bytes (an ASCII subject — the common case, matched with no `Vec<u32>` materialization at all)
-/// and for wide elements (anything non-ASCII).
-pub trait ReInput: Copy {
+/// and for wide elements (anything non-ASCII). The scans poll for host interruption as often as
+/// the element loops do (see [`scan_polled`]).
+trait ReInput: Copy {
     fn len(&self) -> usize;
     fn at(&self, i: usize) -> u32;
 
-    #[inline]
+    /// The first position in `from..end` holding `byte`.
     fn find_byte(
         &self,
-        mut from: usize,
+        from: usize,
+        end: usize,
         byte: u8,
         control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<usize> {
-        while from < self.len() {
-            if self.at(from) == byte as u32 {
-                return Ok(Some(from));
-            }
-            from += 1;
-            if from & INTERRUPT_POLL_MASK == 0 {
-                poll_interrupt(control)?;
-            }
-        }
-        Ok(None)
-    }
+    ) -> MatchResult<usize>;
+
+    /// The first offset in `from..end` at which the subject holds `prefilter`'s literal. The
+    /// caller keeps a literal at `end - 1` within the subject.
+    fn find_literal(
+        &self,
+        from: usize,
+        end: usize,
+        prefilter: &Prefilter,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize>;
+
+    /// The first position in `from..end` whose element `viable` accepts, `set` holding the ASCII
+    /// elements it accepts.
+    fn find_viable(
+        &self,
+        from: usize,
+        end: usize,
+        set: &AsciiSet,
+        viable: impl Fn(u32) -> bool,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize>;
 }
 
 impl ReInput for &[u8] {
@@ -4867,33 +5428,51 @@ impl ReInput for &[u8] {
     fn find_byte(
         &self,
         from: usize,
+        end: usize,
         byte: u8,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<usize> {
-        let Some(bytes) = self.get(from..) else {
+        scan_polled(from, end, control, |from, end| {
+            find_byte_in(self, from, end, byte)
+        })
+    }
+
+    fn find_literal(
+        &self,
+        from: usize,
+        end: usize,
+        prefilter: &Prefilter,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        // A subject of bytes cannot hold a literal with wider elements.
+        let Some(literal) = prefilter.bytes.as_deref() else {
             return Ok(None);
         };
-        let repeated = u64::from_ne_bytes([byte; 8]);
-        let low_bits = 0x0101_0101_0101_0101u64;
-        let high_bits = 0x8080_8080_8080_8080u64;
-        let bulk_len = bytes.len() / 8 * 8;
-        for (chunk_index, chunk) in bytes[..bulk_len].chunks(8).enumerate() {
-            if chunk_index & (INTERRUPT_POLL_MASK / 8) == 0 {
-                poll_interrupt(control)?;
+        scan_polled(from, end, control, |from, end| {
+            #[cfg(target_arch = "aarch64")]
+            if regexp_simd() {
+                return neon::find_literal_byte(self, from, end, literal, prefilter.rare);
             }
-            let word = u64::from_ne_bytes(chunk.try_into().unwrap());
-            let different = word ^ repeated;
-            if different.wrapping_sub(low_bits) & !different & high_bits != 0 {
-                if let Some(offset) = chunk.iter().position(|candidate| *candidate == byte) {
-                    return Ok(Some(from + chunk_index * 8 + offset));
-                }
+            find_literal_portable(self, from, end, literal, prefilter.rare)
+        })
+    }
+
+    fn find_viable(
+        &self,
+        from: usize,
+        end: usize,
+        set: &AsciiSet,
+        viable: impl Fn(u32) -> bool,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        scan_polled(from, end, control, |from, end| {
+            #[cfg(target_arch = "aarch64")]
+            if regexp_simd() {
+                return neon::find_viable_byte(self, from, end, set, &viable);
             }
-        }
-        let tail_start = from + bulk_len;
-        Ok(bytes[bulk_len..]
-            .iter()
-            .position(|candidate| *candidate == byte)
-            .map(|offset| tail_start + offset))
+            let _ = set;
+            (from..end).find(|&at| viable(self[at] as u32))
+        })
     }
 }
 
@@ -4905,6 +5484,361 @@ impl ReInput for &[u32] {
     #[inline(always)]
     fn at(&self, i: usize) -> u32 {
         self[i]
+    }
+
+    #[inline]
+    fn find_byte(
+        &self,
+        from: usize,
+        end: usize,
+        byte: u8,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        scan_polled(from, end, control, |from, end| {
+            #[cfg(target_arch = "aarch64")]
+            if regexp_simd() {
+                return neon::find_unit(self, from, end, byte as u32);
+            }
+            (from..end).find(|&at| self[at] == byte as u32)
+        })
+    }
+
+    fn find_literal(
+        &self,
+        from: usize,
+        end: usize,
+        prefilter: &Prefilter,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        let literal = &prefilter.elements;
+        scan_polled(from, end, control, |from, end| {
+            #[cfg(target_arch = "aarch64")]
+            if regexp_simd() {
+                return neon::find_literal_unit(self, from, end, literal, prefilter.rare);
+            }
+            find_literal_portable(self, from, end, literal, prefilter.rare)
+        })
+    }
+
+    fn find_viable(
+        &self,
+        from: usize,
+        end: usize,
+        set: &AsciiSet,
+        viable: impl Fn(u32) -> bool,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        scan_polled(from, end, control, |from, end| {
+            #[cfg(target_arch = "aarch64")]
+            if regexp_simd() {
+                return neon::find_viable_unit(self, from, end, set, &viable);
+            }
+            let _ = set;
+            (from..end).find(|&at| viable(self[at]))
+        })
+    }
+}
+
+/// Whether the subject scans use the vector unit; `TRUST_JS_REGEXP_NO_SIMD=1` keeps them on
+/// their portable loops, for comparison.
+#[inline]
+fn regexp_simd() -> bool {
+    cfg!(target_arch = "aarch64") && !env_flag!("TRUST_JS_REGEXP_NO_SIMD")
+}
+
+/// Run `scan` over `from..end` a stretch at a time, polling for host interruption between
+/// stretches: every [`INTERRUPT_POLL_MASK`] + 1 positions, as the element loops poll.
+#[inline]
+fn scan_polled(
+    from: usize,
+    end: usize,
+    control: &crate::RuntimeInterrupt,
+    mut scan: impl FnMut(usize, usize) -> Option<usize>,
+) -> MatchResult<usize> {
+    let mut at = from;
+    while at < end {
+        let stretch_end = end.min((at | INTERRUPT_POLL_MASK) + 1);
+        if let Some(found) = scan(at, stretch_end) {
+            return Ok(Some(found));
+        }
+        at = stretch_end;
+        if at < end {
+            poll_interrupt(control)?;
+        }
+    }
+    Ok(None)
+}
+
+/// The first position in `from..end` of a subject of bytes holding `byte`: sixteen bytes a step
+/// on the vector unit, eight a step in a word otherwise.
+fn find_byte_in(bytes: &[u8], from: usize, end: usize, byte: u8) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    if regexp_simd() {
+        return neon::find_byte(bytes, from, end, byte);
+    }
+    let bytes = &bytes[from..end];
+    let repeated = u64::from_ne_bytes([byte; 8]);
+    let low_bits = 0x0101_0101_0101_0101u64;
+    let high_bits = 0x8080_8080_8080_8080u64;
+    let bulk_len = bytes.len() / 8 * 8;
+    for (chunk_index, chunk) in bytes[..bulk_len].chunks(8).enumerate() {
+        let word = u64::from_ne_bytes(chunk.try_into().unwrap());
+        let different = word ^ repeated;
+        if different.wrapping_sub(low_bits) & !different & high_bits != 0 {
+            if let Some(offset) = chunk.iter().position(|candidate| *candidate == byte) {
+                return Some(from + chunk_index * 8 + offset);
+            }
+        }
+    }
+    let tail_start = from + bulk_len;
+    bytes[bulk_len..]
+        .iter()
+        .position(|candidate| *candidate == byte)
+        .map(|offset| tail_start + offset)
+}
+
+/// The first offset `q` in `from..end` at which `hay` holds `literal`, comparing the elements at
+/// `rare` first. The caller keeps `end - 1 + literal.len()` within `hay`.
+fn find_literal_portable<T: Copy + PartialEq>(
+    hay: &[T],
+    from: usize,
+    end: usize,
+    literal: &[T],
+    rare: [usize; 2],
+) -> Option<usize> {
+    let (first, second) = (literal[rare[0]], literal[rare[1]]);
+    (from..end).find(|&at| {
+        hay[at + rare[0]] == first
+            && hay[at + rare[1]] == second
+            && hay[at..at + literal.len()] == *literal
+    })
+}
+
+/// The subject scans on the vector unit, sixteen elements a step, each answering as its
+/// element loop does. NEON is part of the AArch64 baseline. Every load reads sixteen elements
+/// that the loop's bounds keep within the subject.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::AsciiSet;
+    use std::arch::aarch64::*;
+
+    /// Four bits per lane of a byte comparison's result, the first lane lowest.
+    #[inline(always)]
+    fn lane_bits(hits: uint8x16_t) -> u64 {
+        // SAFETY: register operations only.
+        unsafe {
+            vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+                hits,
+            ))))
+        }
+    }
+
+    /// The first set lane of `bits` (see [`lane_bits`]) for which `accept` holds.
+    #[inline(always)]
+    fn first_accepted(mut bits: u64, accept: impl Fn(usize) -> bool) -> Option<usize> {
+        while bits != 0 {
+            let lane = bits.trailing_zeros() as usize / 4;
+            if accept(lane) {
+                return Some(lane);
+            }
+            bits &= !(0xf << (lane * 4));
+        }
+        None
+    }
+
+    /// Sixteen units from `at`, narrowed to bytes as `narrow` narrows each four.
+    ///
+    /// SAFETY: the caller keeps `at + 16` within `hay`.
+    #[inline(always)]
+    unsafe fn load_units(
+        hay: &[u32],
+        at: usize,
+        narrow: impl Fn(uint32x4_t) -> uint16x4_t,
+    ) -> uint8x16_t {
+        let p = hay.as_ptr().add(at);
+        let low = vcombine_u16(narrow(vld1q_u32(p)), narrow(vld1q_u32(p.add(4))));
+        let high = vcombine_u16(narrow(vld1q_u32(p.add(8))), narrow(vld1q_u32(p.add(12))));
+        vcombine_u8(vqmovn_u16(low), vqmovn_u16(high))
+    }
+
+    pub(super) fn find_byte(hay: &[u8], mut from: usize, end: usize, byte: u8) -> Option<usize> {
+        assert!(end <= hay.len());
+        // SAFETY: each load reads 16 bytes below `end`.
+        unsafe {
+            let wanted = vdupq_n_u8(byte);
+            while from + 16 <= end {
+                let hits = vceqq_u8(vld1q_u8(hay.as_ptr().add(from)), wanted);
+                if vmaxvq_u8(hits) != 0 {
+                    return Some(from + lane_bits(hits).trailing_zeros() as usize / 4);
+                }
+                from += 16;
+            }
+        }
+        hay[from..end]
+            .iter()
+            .position(|&element| element == byte)
+            .map(|offset| from + offset)
+    }
+
+    pub(super) fn find_unit(hay: &[u32], mut from: usize, end: usize, unit: u32) -> Option<usize> {
+        assert!(end <= hay.len());
+        // SAFETY: each load reads 16 units below `end`.
+        unsafe {
+            let wanted = vdupq_n_u32(unit);
+            while from + 16 <= end {
+                let hits = load_units(hay, from, |units| vmovn_u32(vceqq_u32(units, wanted)));
+                if vmaxvq_u8(hits) != 0 {
+                    return Some(from + lane_bits(hits).trailing_zeros() as usize / 4);
+                }
+                from += 16;
+            }
+        }
+        hay[from..end]
+            .iter()
+            .position(|&element| element == unit)
+            .map(|offset| from + offset)
+    }
+
+    pub(super) fn find_literal_byte(
+        hay: &[u8],
+        mut from: usize,
+        end: usize,
+        literal: &[u8],
+        rare: [usize; 2],
+    ) -> Option<usize> {
+        assert!(end <= from || end - 1 + literal.len() <= hay.len());
+        assert!(rare[0] < literal.len() && rare[1] < literal.len());
+        // SAFETY: the offsets the loads start at stay below `end`, and the rare indices below
+        // the literal's length, so every load ends within `hay`.
+        unsafe {
+            let first = vdupq_n_u8(literal[rare[0]]);
+            let second = vdupq_n_u8(literal[rare[1]]);
+            while from + 16 <= end {
+                let p = hay.as_ptr().add(from);
+                let hits = vandq_u8(
+                    vceqq_u8(vld1q_u8(p.add(rare[0])), first),
+                    vceqq_u8(vld1q_u8(p.add(rare[1])), second),
+                );
+                if vmaxvq_u8(hits) != 0 {
+                    let at = |lane: usize| from + lane;
+                    if let Some(lane) = first_accepted(lane_bits(hits), |lane| {
+                        hay[at(lane)..at(lane) + literal.len()] == *literal
+                    }) {
+                        return Some(at(lane));
+                    }
+                }
+                from += 16;
+            }
+        }
+        super::find_literal_portable(hay, from, end, literal, rare)
+    }
+
+    pub(super) fn find_literal_unit(
+        hay: &[u32],
+        mut from: usize,
+        end: usize,
+        literal: &[u32],
+        rare: [usize; 2],
+    ) -> Option<usize> {
+        assert!(end <= from || end - 1 + literal.len() <= hay.len());
+        assert!(rare[0] < literal.len() && rare[1] < literal.len());
+        // SAFETY: as for bytes, with sixteen units a load.
+        unsafe {
+            let first = vdupq_n_u32(literal[rare[0]]);
+            let second = vdupq_n_u32(literal[rare[1]]);
+            while from + 16 <= end {
+                let hits = vandq_u8(
+                    load_units(hay, from + rare[0], |units| {
+                        vmovn_u32(vceqq_u32(units, first))
+                    }),
+                    load_units(hay, from + rare[1], |units| {
+                        vmovn_u32(vceqq_u32(units, second))
+                    }),
+                );
+                if vmaxvq_u8(hits) != 0 {
+                    let at = |lane: usize| from + lane;
+                    if let Some(lane) = first_accepted(lane_bits(hits), |lane| {
+                        hay[at(lane)..at(lane) + literal.len()] == *literal
+                    }) {
+                        return Some(at(lane));
+                    }
+                }
+                from += 16;
+            }
+        }
+        super::find_literal_portable(hay, from, end, literal, rare)
+    }
+
+    /// Sixteen bytes' membership in `set` (Muła's nibble lookup), elements past ASCII included
+    /// for the caller to decide.
+    ///
+    /// SAFETY: register operations only.
+    #[inline(always)]
+    unsafe fn set_candidates(bytes: uint8x16_t, by_low_nibble: uint8x16_t) -> uint8x16_t {
+        const HIGH_NIBBLE_BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+        let members = vtstq_u8(
+            vqtbl1q_u8(by_low_nibble, vandq_u8(bytes, vdupq_n_u8(0xf))),
+            vqtbl1q_u8(vld1q_u8(HIGH_NIBBLE_BITS.as_ptr()), vshrq_n_u8::<4>(bytes)),
+        );
+        vorrq_u8(members, vcgeq_u8(bytes, vdupq_n_u8(0x80)))
+    }
+
+    pub(super) fn find_viable_byte(
+        hay: &[u8],
+        mut from: usize,
+        end: usize,
+        set: &AsciiSet,
+        viable: &impl Fn(u32) -> bool,
+    ) -> Option<usize> {
+        assert!(end <= hay.len());
+        // SAFETY: each load reads 16 bytes below `end`.
+        unsafe {
+            let by_low_nibble = vld1q_u8(set.by_low_nibble.as_ptr());
+            while from + 16 <= end {
+                let hits = set_candidates(vld1q_u8(hay.as_ptr().add(from)), by_low_nibble);
+                if vmaxvq_u8(hits) != 0 {
+                    let element = |lane: usize| hay[from + lane];
+                    if let Some(lane) = first_accepted(lane_bits(hits), |lane| {
+                        element(lane) < 0x80 || viable(element(lane) as u32)
+                    }) {
+                        return Some(from + lane);
+                    }
+                }
+                from += 16;
+            }
+        }
+        (from..end).find(|&at| viable(hay[at] as u32))
+    }
+
+    pub(super) fn find_viable_unit(
+        hay: &[u32],
+        mut from: usize,
+        end: usize,
+        set: &AsciiSet,
+        viable: &impl Fn(u32) -> bool,
+    ) -> Option<usize> {
+        assert!(end <= hay.len());
+        // SAFETY: each load reads 16 units below `end`. Narrowing saturates, so a unit past
+        // ASCII stays past it and its lane is decided by `viable`.
+        unsafe {
+            let by_low_nibble = vld1q_u8(set.by_low_nibble.as_ptr());
+            while from + 16 <= end {
+                let hits = set_candidates(
+                    load_units(hay, from, |units| vqmovn_u32(units)),
+                    by_low_nibble,
+                );
+                if vmaxvq_u8(hits) != 0 {
+                    let element = |lane: usize| hay[from + lane];
+                    if let Some(lane) = first_accepted(lane_bits(hits), |lane| {
+                        element(lane) < 0x80 || viable(element(lane))
+                    }) {
+                        return Some(from + lane);
+                    }
+                }
+                from += 16;
+            }
+        }
+        (from..end).find(|&at| viable(hay[at]))
     }
 }
 
@@ -7522,5 +8456,320 @@ mod internal_engine_diagnostics {
                 crate::InterruptReason::Cancelled
             ))
         ));
+    }
+
+    /// A deterministic xorshift generator for the differential tests.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    /// A pattern's elements as its matcher sees a subject: code points in Unicode mode, code
+    /// units otherwise.
+    fn subject_elements(subject: &str, unicode: bool) -> Vec<u32> {
+        if unicode {
+            subject.chars().map(u32::from).collect()
+        } else {
+            subject.encode_utf16().map(u32::from).collect()
+        }
+    }
+
+    #[test]
+    fn required_literals_and_their_offsets() {
+        let units = |text: &str| text.encode_utf16().map(u32::from).collect::<Vec<_>>();
+        let cases: [(&str, &str, Option<(Vec<u32>, usize, Option<usize>)>); 22] = [
+            // Octane's re17: the quoted date's opening, after `^` or one other character.
+            (
+                r#"(^|[^\\])\"\\\/Qngr\((-?[0-9]+)\)\\\/\""#,
+                "g",
+                Some((units(r#""\/Qngr("#), 0, Some(1))),
+            ),
+            ("abc", "", Some((units("abc"), 0, Some(0)))),
+            // The last `a` of the run, then `bc`.
+            ("a+bc", "", Some((units("abc"), 0, None))),
+            ("x(?:ab|cd)yz", "", Some((units("yz"), 3, Some(3)))),
+            ("(?:ab){2,3}c", "", Some((units("ababc"), 0, Some(2)))),
+            ("foo\\d+bar", "", Some((units("foo"), 0, Some(0)))),
+            ("\\d+px", "", Some((units("px"), 1, None))),
+            // Lookarounds consume nothing: the literal runs through them.
+            ("a(?=bc)bcd", "", Some((units("abcd"), 0, Some(0)))),
+            ("(?<=x)abc", "", Some((units("abc"), 0, Some(0)))),
+            ("ab(?i:cd)ef", "", Some((units("ab"), 0, Some(0)))),
+            ("ab(?i:cd)efg", "", Some((units("efg"), 4, Some(4)))),
+            // Under `i` only ASCII characters other than letters are literal.
+            ("a\"b\"", "i", Some((units("\""), 1, Some(1)))),
+            ("(a)\\1bc", "", Some((units("bc"), 1, None))),
+            (".a", "", Some((units("a"), 1, Some(1)))),
+            ("😀a", "", Some((units("😀a"), 0, Some(0)))),
+            ("😀a", "u", Some((vec![0x1f600, 0x61], 0, Some(0)))),
+            ("a|b", "", None),
+            ("(?:abc)?", "", None),
+            ("ab", "i", None),
+            ("a", "", None),
+            (".{2,3}", "", None),
+            ("(?:x|)ab(?:y|)", "", Some((units("ab"), 0, Some(1)))),
+        ];
+        for (pattern, flags, expected) in cases {
+            let re = super::Regex::new(pattern, flags).unwrap();
+            let actual = re.prefilter.as_ref().map(|prefilter| {
+                (
+                    prefilter.elements.to_vec(),
+                    prefilter.min_offset,
+                    prefilter.max_offset,
+                )
+            });
+            assert_eq!(actual, expected, "/{pattern}/{flags}");
+        }
+        // A literal longer than MAX_PREFILTER_LEN keeps its first elements at the same offsets.
+        for pattern in ["a".repeat(300), "(?:x{300})y".to_string()] {
+            let re = super::Regex::new(&pattern, "").unwrap();
+            let prefilter = re.prefilter.as_ref().expect("long literal prefilter");
+            assert_eq!(prefilter.elements.len(), super::MAX_PREFILTER_LEN);
+            assert_eq!((prefilter.min_offset, prefilter.max_offset), (0, Some(0)));
+        }
+        // A sticky or anchored regex checks only a short range of offsets from its one start.
+        for (pattern, flags, kept) in [
+            ("\\d+px", "y", false),
+            ("x.{0,3}yz", "y", true),
+            ("x.{0,30}yz", "y", false),
+            ("^x.yz", "", true),
+            ("^x.*yz", "", false),
+        ] {
+            let re = super::Regex::new(pattern, flags).unwrap();
+            assert_eq!(re.prefilter.is_some(), kept, "/{pattern}/{flags}");
+        }
+    }
+
+    /// Under `i`, an ASCII character other than a letter matches only itself, as the prefilter
+    /// assumes: neither Canonicalize nor simple case folding maps anything else onto it.
+    #[test]
+    fn case_insensitive_literal_elements_match_only_themselves() {
+        for code_point in 0..=0x10ffffu32 {
+            let Some(c) = char::from_u32(code_point) else {
+                continue;
+            };
+            for folded in [
+                super::canonicalize_legacy(c) as u32,
+                super::fold_canon(code_point),
+            ] {
+                if super::literal_element(folded, true) {
+                    assert_eq!(
+                        folded, code_point,
+                        "U+{code_point:04X} folds onto {folded:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Matching with the prefilter and the vector first-element scan finds what the matcher
+    /// finds trying every start, at every start of subjects built from the patterns' literals,
+    /// over bytes and over wide elements.
+    #[test]
+    fn prefiltered_scans_match_the_unfiltered_matcher() {
+        let control = crate::RuntimeInterrupt::default();
+        let patterns = [
+            r#"(^|[^\\])\"\\\/Qngr\((-?[0-9]+)\)\\\/\""#,
+            "abc",
+            "a+bc",
+            "x(?:ab|cd)yz",
+            "(?:ab){2,3}c",
+            "foo\\d+bar",
+            "\\d+px",
+            "a(?=bc)bcd",
+            "(?<=x)abc",
+            "(?<!a)bc",
+            "ab(?i:cd)efg",
+            "a\"b\"",
+            "(a)\\1bc",
+            ".a",
+            "😀a",
+            "éab",
+            "x.{0,3}yz",
+            "x.{1,4}?yz",
+            "^x.yz",
+            "^ab|cd",
+            "(?:x|)ab(?:y|)",
+            "\\bfoo\\b",
+            "(foo|foobar)baz",
+            "[^x]ab",
+            "ab$",
+            "(?:a|b)c(?:d|e)fg",
+            "(^|\\s)ab",
+            "\\n?abc",
+        ];
+        let tokens = [
+            "a",
+            "b",
+            "c",
+            "ab",
+            "abc",
+            "bc",
+            "x",
+            "yz",
+            "xyz",
+            "foo",
+            "bar",
+            "baz",
+            "px",
+            "12",
+            "\"\\/Qngr(",
+            "-3",
+            ")\\/\"",
+            "\"",
+            "\\",
+            " ",
+            "\n",
+            "é",
+            "😀",
+            "cd",
+            "efg",
+            "EFG",
+            "abab",
+            "CD",
+            "q",
+        ];
+        let mut rng = TestRng(0x9e37_79b9_7f4a_7c15);
+        let mut subjects: Vec<String> = (0..48)
+            .map(|_| {
+                let count = rng.below(14);
+                (0..count)
+                    .map(|_| tokens[rng.below(tokens.len())])
+                    .collect()
+            })
+            .collect();
+        // Long subjects cross the scans' sixteen-element steps with literals near the end.
+        subjects.push(format!("{}\"\\/Qngr(12)\\/\"", "y".repeat(40)));
+        subjects.push(format!("{}xabcyz{}", "b".repeat(37), "c".repeat(19)));
+        subjects.push(format!("{}é{}foo1bar", "z".repeat(33), "-".repeat(17)));
+        let (mut prefiltered, mut matches) = (0, 0);
+        for pattern in patterns {
+            for flags in ["", "g", "y", "i", "m", "u", "iu", "my", "s"] {
+                let Ok(filtered) = super::Regex::new(pattern, flags) else {
+                    continue;
+                };
+                prefiltered += usize::from(filtered.prefilter.is_some());
+                let mut plain = super::Regex::new(pattern, flags).unwrap();
+                plain.prefilter = None;
+                plain.first_ascii = None;
+                for subject in &subjects {
+                    let wide = subject_elements(subject, filtered.unicode);
+                    for start in 0..=wide.len() + 1 {
+                        let found = filtered.exec_impl(&wide[..], start, &control);
+                        let reference = plain.exec_impl(&wide[..], start, &control);
+                        matches += usize::from(matches!(reference, Ok(Some(_))));
+                        assert_eq!(
+                            found.map(|c| c.map(|c| c.to_vec())),
+                            reference.map(|c| c.map(|c| c.to_vec())),
+                            "/{pattern}/{flags} at {start} in {subject:?}"
+                        );
+                    }
+                    if subject.is_ascii() {
+                        let bytes = subject.as_bytes();
+                        for start in 0..=bytes.len() + 1 {
+                            let found = filtered.exec_impl(bytes, start, &control);
+                            let reference = plain.exec_impl(bytes, start, &control);
+                            assert_eq!(
+                                found.map(|c| c.map(|c| c.to_vec())),
+                                reference.map(|c| c.map(|c| c.to_vec())),
+                                "/{pattern}/{flags} at {start} in bytes {subject:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{prefiltered} prefiltered regexes, {matches} matches");
+        assert!(
+            prefiltered > 150 && matches > 5000,
+            "{prefiltered} prefilters, {matches} matches"
+        );
+    }
+
+    /// The vector scans answer as their element loops do, at every alignment and length.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn vector_scans_agree_with_element_loops() {
+        use super::neon;
+        let mut rng = TestRng(0x2545_f491_4f6c_dd1d);
+        let set = super::AsciiSet::new(|element| matches!(element, 0x62 | 0x64 | 0x7a));
+        let viable = |element: u32| matches!(element, 0x62 | 0x64 | 0x7a | 0x101 | 0xe9);
+        for _ in 0..4000 {
+            let len = rng.below(90);
+            let letters = 1 + rng.below(4);
+            let units: Vec<u32> = (0..len)
+                .map(|_| match rng.below(12) {
+                    0 => 0xe9,
+                    1 => 0x101,
+                    _ => 0x61 + rng.below(letters) as u32,
+                })
+                .collect();
+            let bytes: Vec<u8> = units.iter().map(|&unit| unit as u8).collect();
+            let from = rng.below(len + 1);
+            let end = from + rng.below(len - from + 1);
+            let unit = 0x61 + rng.below(letters) as u32;
+            assert_eq!(
+                neon::find_unit(&units, from, end, unit),
+                (from..end).find(|&at| units[at] == unit)
+            );
+            assert_eq!(
+                neon::find_byte(&bytes, from, end, unit as u8),
+                (from..end).find(|&at| bytes[at] == unit as u8)
+            );
+            assert_eq!(
+                neon::find_viable_unit(&units, from, end, &set, &viable),
+                (from..end).find(|&at| viable(units[at]))
+            );
+            assert_eq!(
+                neon::find_viable_byte(&bytes, from, end, &set, &viable),
+                (from..end).find(|&at| viable(bytes[at] as u32))
+            );
+            let literal_len = 1 + rng.below(4);
+            if literal_len > len {
+                continue;
+            }
+            let literal_at = rng.below(len - literal_len + 1);
+            let literal = &units[literal_at..literal_at + literal_len];
+            let literal_bytes = &bytes[literal_at..literal_at + literal_len];
+            let rare = [rng.below(literal_len), rng.below(literal_len)];
+            let last = (len - literal_len + 1).min(end);
+            let from = from.min(last);
+            assert_eq!(
+                neon::find_literal_unit(&units, from, last, literal, rare),
+                super::find_literal_portable(&units, from, last, literal, rare)
+            );
+            assert_eq!(
+                neon::find_literal_byte(&bytes, from, last, literal_bytes, rare),
+                super::find_literal_portable(&bytes, from, last, literal_bytes, rare)
+            );
+        }
+    }
+
+    /// The prefilter's scan polls for host interruption along a long subject.
+    #[test]
+    fn prefilter_scan_polls_along_long_subjects() {
+        let cancelled = crate::RuntimeInterrupt::default();
+        cancelled.cancel();
+        let re = super::Regex::new("x\\d+yz", "").unwrap();
+        assert!(re.prefilter.is_some());
+        let bytes = vec![b'a'; 3 * (super::INTERRUPT_POLL_MASK + 1)];
+        let wide: Vec<u32> = bytes.iter().map(|&byte| byte as u32).collect();
+        for outcome in [
+            re.exec_impl(&bytes[..], 0, &cancelled).map(|c| c.is_some()),
+            re.exec_impl(&wide[..], 0, &cancelled).map(|c| c.is_some()),
+        ] {
+            assert!(matches!(
+                outcome,
+                Err(super::MatchError::Interrupted(
+                    crate::InterruptReason::Cancelled
+                ))
+            ));
+        }
     }
 }

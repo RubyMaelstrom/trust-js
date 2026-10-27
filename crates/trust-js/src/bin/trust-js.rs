@@ -186,6 +186,8 @@ Diagnostics (env, unstable):
   TRUST_JS_JIT_OPSTAT=1      Tally ops that reach the JIT slow path (top at exit; =2 pinpoints sites)
   TRUST_JS_REGEXP_PROF=1     Report matcher instruction/scan/attempt/backtrack/tier counts at exit
   TRUST_JS_REGEXP_TIER_UP_AT=N  Promote eligible ASCII matchers after N calls; 0 disables
+  TRUST_JS_REGEXP_NO_PREFILTER=1  Match without scanning for each pattern's required literal
+  TRUST_JS_REGEXP_NO_SIMD=1  Keep RegExp subject scans off the vector unit
   TRUST_JS_JIT_CALLSTAT=1    Tally calls that reach the inline-cache call helper
   TRUST_JS_JIT_PROPSTAT=1    Tally why named reads reach a JIT property helper (=2 adds sites)
   TRUST_JS_JIT_CODE_BUDGET_MB=N  Process-wide live executable-code cap, 1..1024 MiB
