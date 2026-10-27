@@ -560,6 +560,12 @@ on zombie, agent_control_tests::host_buffer_data_makes_a_major_collection_due_at
 crate docs' private links at the base too. Under load, gc_scan_spike and the runtime's
 worker_terminate test fail now and then and pass on rerun.
 
+Fixed outside the stages, b352febc (2026-10-27): the runtime's Node preamble gave an
+Error.prepareStackTrace hook Error.stackTraceLimit placeholder CallSites. CoffeeScript 2.2.3 sets
+the limit to Infinity when it loads, so every later captureStackTrace threw and the full Web
+Tooling suite aborted at chai on trust-js-cli (the engine shell, which the runners use, has no
+preamble). The hook now gets one CallSite per captured frame, and chai runs in the full suite.
+
 ### Step 0: a perf map for generated code (design, 2026-10-27)
 
 `TRUST_JS_PERF_MAP=1` makes the engine append a line for each piece of code it generates to
@@ -615,6 +621,11 @@ keeps the note's `size + 8 MB + nursery`; and V8's MaxGrowingFactor allows a fac
 a maximum of at least 2 GB (1.3 to 2.0 below), which the engine does not port (it differs on
 hosts with less than 4 GB of memory or under a small override). Exit measurement pending (a
 quiet machine, LTO builds).
+Both ported 2026-10-27 (05b80239, V8 at 96c72ad4): the growing factor stops at
+MaxGrowingFactor's (4 from a 2 GB maximum, 1.3 to 2 below), and within 16 MB of the maximum
+and past it the budget is the size and 8 MB. With 4 GB of memory or more and no override, only
+that floor changes. Validation: Test262 identical, the fixtures, the lib suite and the
+downstream crates' suites.
 
 ### W1: builtins and Proxy paths (census and design, 2026-10-27)
 
@@ -941,16 +952,94 @@ Progress (2026-10-27): steps 1-5 (803aea93..a1535a6f).
    Bindings are 24 bytes and an environment with one binding fits the 96-byte class (checked
    at compile time); generated code reads values at stride 24 and no longer tests a storage
    tag, on both backends.
-Instructions on the fixtures (pinned to the A725 cores, fixed GC budgets) against 15933355:
-compiled code Djot -3.6%, React +0.2%, Vue +0.2%; the tree-walker 1.2-4.0% fewer. Validation:
+Instructions on the fixtures (fat LTO, pinned to the A725 cores, fixed GC budgets) against
+b352febc, W2a's base: compiled code Vue -0.2%, React +1.2%, Djot 0.0%; the tree-walker Vue
+-0.1%, React +5.1%, Djot +2.5%, which step 7 turns into gains. These replace the first figures
+(compiled code Djot -3.6%, the tree-walker 1.2-4.0% fewer), which compared builds without the
+release profile's LTO, whose code moves by about 1% between unrelated changes, against
+15933355, below W5's items 1 and 2 (Djot -2.7%). Validation:
 Test262 identical, the fixtures' output, difftest, the lib suite (with GC pacing on, only the
 failure every P2 gate has) and GC stress on the environment tests; on zombie, clippy on x86-64
 and Windows, both lib suites with only the failures they had before (one GC test on x86-64,
 three snapshot stack tests under Wine), and the x86-64 fixtures and difftest, whose output
 matches ARM64's. The dumps differ only in the environment's and the interpreter's field
 offsets, the binding stride and offset, absolute addresses and the dropped tag test.
-Left: step 6 (property keys as PropKeys, layouts without finalizers), step 7, and the exit's
-measurements on ARES-6 and Web Tooling.
+Steps 6 and 7 (2026-10-27; step 7 rebased onto W5's items 3-5 and a split fix, d476195d):
+6. d3c66d56: property keys as PropKeys. A layout keeps its keys in a storage block and, past
+   eight keys, an index of one-byte slots in another: the layout cell traces its blocks, is
+   carded, and has no finalizer (Vue: 725 finalized layouts, 89 us, before; none now). Shape
+   transitions, the per-object index and the length and prototype memos compare words. Text
+   still finds a property: a small map compares its keys' text, a larger one takes the text's
+   atom once per prototype walk, and text with no atom names no property; debug builds check
+   that a map read by text under the active heap holds that heap's keys (I6), which caught two
+   tests reading one engine's objects under another's heap. Enumeration hands a heap atom out
+   as its own String. The static names have constant addresses (laid out at compile time).
+   Internal slots keep text names: private names are minted per class evaluation and must die
+   with it, which atoms, kept for their heap's life, would not. Generated code compares one key
+   word in the creation cache and the key-checked arm, which now covers names of any length.
+   Instructions (fat LTO from here on, pinned, fixed GC budgets) against c4d68127: compiled
+   code Vue +0.8%, React +0.2%, Djot -0.3%; the tree-walker Vue -0.2%, React -1.0%, Djot +1.1%.
+   A first version that took every text lookup through the atom table cost up to 5%.
+   Validation: Test262 identical, the fixtures' output, difftest, zombie's x86-64 fixtures and
+   difftest; the lib suites, here and on zombie's x86-64 and Windows, failed only the I6 check
+   in one test, whose objects d3c66d56 gives no prototype (test-only; with it the suites pass
+   in step 7's runs, apart from the known failures); the dumps differ in the interpreter's
+   field offsets (+-16), absolute addresses and the two key compares.
+7. c9314583..c4464dae:
+   - c9314583: the property ICs and the megamorphic stub cache by key. A named site's helpers
+     take the chunk's key for its name; key-checked entries compare words, re-derivation finds
+     slots by key and creation appends the site's key; the stub cache holds keys, so filling it
+     copies no name; Proxy trap names are static names. A computed read probes its cached
+     state by text and looks its key up only to re-derive; a prototype walk the IC declined
+     starts with the site's key.
+   - 4e7e47a2: a map's own key index (past eight keys, when its layout has none) in storage
+     blocks behind one word of the element sidecar, which keeps its 256-byte class: such a map
+     needs no extras.
+   - 6ea47677: tree-walked names by atom. A read or an assignment looks the name's atom up once
+     per scope walk and compares words in each record (a name with no atom is bound in none,
+     until a `with` object's checks run author code); block declarations atomize the AST's own
+     names. This turned the tree-walker from slower than W2a's base to faster (below).
+   - c4464dae: a property map owns no well-known or registered Symbol, which the Agent holds
+     for its life. Every arguments object has an own @@iterator, so each kept extras and
+     needed a finalizer: ARES-6's ML made 19.6M, 91% of what minor collections finalized
+     after step 6.
+   Instructions, W2a in full (0ddfdb6a, the same series before its rebase onto W5) against
+   b352febc: compiled code Vue +0.4%, React -0.1%, Djot -0.6%; the tree-walker Vue -7.7%,
+   React -12.3%, Djot -5.2%. Validation on d062ef5a, which lacked a helper only the
+   architecture-diagnostics build uses (the gate's clippy run caught it; c4464dae adds it):
+   Test262 identical, the fixtures' output, difftest, the lib suite (with pacing on, only the
+   failure every P2 gate has); the dumps are the base's but for one Djot chunk, which inlines
+   one more callee; zombie's x86-64 and Windows suites (only their known failures) and its
+   x86-64 fixtures and difftest.
+
+Exit measurement (2026-10-27; runtime CLIs built without the release profile's LTO, with
+TRUST_JS_GC_LOG, step 1's 803aea93 as the base, under load: cell counts are exact, times
+indicative). Minor collections, their time (marking, sweeping and engine work) and the
+finalizing within it, and the cells of each kind finalized:
+
+| | minor collections | time (s) | finalizing (s) | environments | layouts | map extras |
+| --- | --- | --- | --- | --- | --- | --- |
+| ARES-6, base | 6,837 | 86.0 | 27.0 | 119,001,202 | 19,590,046 | 19,571,320 |
+| ARES-6, W2a | 6,537 | 59.3 | 0.42 | 0 | 0 | 751 |
+| Web Tooling, base | 5,045 | 150.1 | 7.05 | 69,558,146 | 13,737,741 | 5,020,227 |
+| Web Tooling, W2a | 4,995 | 134.5 | 0.41 | 0 | 0 | 7,707 |
+
+`fin:environment` and `fin:property_layout` reach 0 there, on the fixtures and on the sustained
+workload at both tiers; a one-binding environment fits the 96-byte class (checked at compile
+time, step 5). Minor-collection time falls by 31% on ARES-6, where finalizing was 31% of it,
+and by 10% on Web Tooling, where it was 4.7%. What still finalizes: Map and Set data (1.1M
+cells on ARES-6, 0.36 s) and bound functions' data (2.9M on Web Tooling, 41 ms), W2g's; and
+the name indexes of records that own more than eight names (0.7M on Web Tooling, 90 ms; 705 on
+ARES-6, 24 on Vue, 48 on Djot), step 4's payload cells, which could move into storage blocks
+as the property maps' key index did. The storage that was external now sits in the old
+generation (external memory at a major collection: up to 124 MB before, 4 MB now). Web Tooling
+ran 58 major collections against 51 (marking 11.6 s against 9.8 s), where the pacing chose
+smaller limits in places (three in a row at a 703 MB limit); ARES-6 102 against 101. In the
+same runs Web Tooling's geometric mean went from 0.73 to 0.78 runs/s (typescript 1.03 to 1.27,
+babel-minify 0.94 to 1.08) and ARES-6's summary from 376 to 363 ms; the one slower figure,
+Babylon's worst 4 (167 to 201 ms, with a spread of +-105 ms), waits for the quiet run. Splay's
+live heap stays W2c/W2d's. The timed exit measurements (minor-collection time, the major
+collections, no suite slower beyond noise) wait for a quiet machine with W1's, W6a's and W7's.
 
 ### W5: RegExp (census and design, 2026-10-27)
 
@@ -1047,3 +1136,40 @@ measurable (5.2e8 today by w5cat.py; predicted 1.7-2.4x); source-map's at most h
 today; predicted a quarter to a half); Test262 identical. strings.js's RegExp cases, which W7's
 exit left to W5, are recorded (predicted ~4x Sparkplug-only Node; the rest is W2's arrays). W5b's
 exit in its design note.
+
+Landed 2026-10-27: items 1 and 2 (958fd73c: the required literal's NEON scan and the
+first-element scan; 753d3aa2: the RegExp protector, checked where the algorithms use it, and
+String.prototype's methods entering the RegExp algorithms directly). Octane RegExp ran 2.54x
+fewer instructions, source-map 10.9% fewer, Djot 2.7% fewer.
+Items 3 to 5 (3e5cc406..9524b451, a series by an agent, rebased onto W2a's step 6): 3's
+builtins part (`lastIndex` read and written at its slot under 2's proof, the matcher looked up
+once), 4 (subjects matched in place by their storage's code units: ReText, its LRU and the
+unit-element maps are gone) and 5 (captures, split pieces and replace arguments taken from the
+subject's units). Instructions (fat LTO, pinned, pacing off; each against the one before):
+
+| | b352febc | lastIndex, lookup | in place | captures |
+| --- | --- | --- | --- | --- |
+| Octane | 8.631e9 | -7.0% | -5.5% | -1.8% (7.450e9) |
+| Djot, 40 passes | 2.638e9 | -2.2% | -2.3% | -0.3% (2.513e9) |
+| strings.js | 1.616e9 | -10.6% | -10.7% | -4.9% (1.228e9) |
+| source-map | 1.930e11 | -0.8% | -0.3% | -0.3% (1.902e11) |
+
+Since 15933355: Octane 2.93x fewer instructions, Djot 7.4%, strings.js 24.0%, source-map 11.9%.
+Against the exit (no-LTO estimates): source-map's RegExp instructions about 2.2e10, under half
+the census's 5.4e10; Djot's about 3.5e8 against 2.6e8, not yet halved; Octane's score waits
+for a quiet machine. Not done: item 3's matcher entry (scratch per program, capture resets
+through the undo log, precomputed flags) and the `regexps`/`gc_pins` entries at creation,
+which need the payload; items 6 and 7 and W5b, which go on alongside W3 (Decision 9). The
+native tier now serves one-byte storage only: in-place two-byte units can exceed 0xFF, and the
+removed 32-bit-element loads on AArch64 were mis-scaled (only the first element read right).
+Views stay at 256 bytes: from 13 units cost Octane 0.5% for 0.1-0.3% elsewhere, and short
+views take the JIT's slow `length` and `charCodeAt` paths. Validation: Test262 identical, the
+fixtures, difftest, the lib suite, the string difftest over 40 seeds at three tiers (the same
+12 known mismatches, seed for seed), GC stress on the RegExp and string-slice tests, zombie's
+x86-64 and Windows suites (item 4 edits the x64 native emitter; their one new failure was step
+6's I6 test, and step 7's run, which includes the series, shows only the known failures) and
+its x86-64 fixtures and difftest; the dumps differ in the interpreter's field offsets only (the
+subject cache left it).
+Found on the way, older than P2: with RegExp.prototype[@@split] deleted, `'a/b/c'.split(/\//)`
+still split by the RegExp, in `nf_string_split`'s own RegExp path, where ECMA-262 and Node
+convert the separator with ToString (["a/b/c"]). d476195d removes that path.
