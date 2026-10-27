@@ -397,16 +397,6 @@ pub fn concat(a: &str, b: &str) -> String {
     out
 }
 
-/// Whether joining `a + b` needs the smuggled-surrogate canonicalization fix-up (a smuggled
-/// high surrogate ending `a` meeting a smuggled low starting `b` — see [`concat`]). Callers
-/// building the result allocation directly must take the slow [`concat`] path when this holds.
-pub fn needs_join_fixup(a: &str, b: &str) -> bool {
-    match (a.chars().next_back(), b.chars().next()) {
-        (Some(last), Some(first)) => smuggled_high(last).is_some() && smuggled_low(first).is_some(),
-        _ => false,
-    }
-}
-
 /// Canonicalize any adjacent smuggled high+low surrogate pairs inside `s` (needed after building
 /// a string from independently produced pieces, e.g. `join` or `repeat`).
 pub fn canonicalize(s: &str) -> Option<String> {

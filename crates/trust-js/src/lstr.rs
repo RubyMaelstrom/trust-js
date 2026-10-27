@@ -282,6 +282,12 @@ impl LStr {
         s
     }
 
+    /// The string of these ASCII bytes.
+    pub(crate) fn from_ascii(bytes: &[u8]) -> LStr {
+        debug_assert!(bytes.is_ascii());
+        LStr::from_units_at_width(Units::Ascii(bytes))
+    }
+
     /// The string of these UTF-16 code units.
     pub(crate) fn from_utf16(units: &[u16]) -> LStr {
         LStr::from_units_at_width(Units::Utf16(units))

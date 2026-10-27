@@ -104,32 +104,21 @@ pub(super) fn install_json(it: &mut Interp) {
             indent: String::new(),
             stack: Vec::new(),
             deep_stack: crate::fasthash::FastSet::default(),
-            out: String::with_capacity(64),
+            out: JsonOut::default(),
         };
         if json_serialize_property(i, &mut serializer, &holder, JsonKey::Name(""), value)? {
-            // Repeated indentation can join a trailing high surrogate to the next
-            // gap's leading low surrogate. Keep the serializer's byte-based rollback
-            // intact and canonicalize those pairs only in the completed output.
-            if crate::jstr::needs_join_fixup(&gap, &gap) {
-                if let Some(out) = crate::jstr::canonicalize(&serializer.out) {
-                    return Ok(Value::lstr(out));
-                }
-            }
-            Ok(Value::lstr(serializer.out))
+            Ok(Value::Str(serializer.out.finish()))
         } else {
             Ok(Value::Undefined)
         }
     });
     it.def_method(&j, "parse", 2, |i, _t, args| {
         let text = ab(i.to_string(&arg(args, 0)))?;
-        // JSON grammar is ASCII-delimited. Keep ASCII source in its original byte slice rather
-        // than widening every byte to a four-byte `char`; escaped `\u` sequences are still
-        // decoded by `json_parse_string` into the engine's UTF-16 representation.
-        let source = text.text();
-        let chars = (!source.is_ascii()).then(|| source.chars().collect::<Vec<_>>());
-        let input = match chars.as_deref() {
-            Some(chars) => JsonInput::Chars(chars),
-            None => JsonInput::Bytes(source.as_bytes()),
+        // JSON grammar is ASCII-delimited: parse a one-byte string's bytes and a two-byte
+        // string's code units as stored.
+        let input = match text.units() {
+            crate::lstr::Units::Ascii(bytes) => JsonInput::Bytes(bytes),
+            crate::lstr::Units::Utf16(units) => JsonInput::Units(units),
         };
         let mut pos = 0;
         let reviver = arg(args, 1);
@@ -196,73 +185,184 @@ pub(super) fn install_json(it: &mut Interp) {
     set_builtin(&it.global, "JSON", Value::Obj(j));
 }
 
-/// Append QuoteJSONString(s) (ECMA-262 §25.5.2.3) to `out`.
-fn json_quote_into(out: &mut String, s: &str) {
-    // QuoteJSONString (ECMA-262 §25.5.4.3) operates on UTF-16 code points. ASCII has no
-    // surrogate or multi-unit cases, so keep this common path byte-based and avoid the Unicode
-    // iterator/peek state entirely.
-    out.reserve(s.len() + 2);
-    if s.is_ascii() {
-        out.push('"');
-        for &b in s.as_bytes() {
-            match b {
-                b'"' => out.push_str("\\\""),
-                b'\\' => out.push_str("\\\\"),
-                b'\n' => out.push_str("\\n"),
-                b'\r' => out.push_str("\\r"),
-                b'\t' => out.push_str("\\t"),
-                0x08 => out.push_str("\\b"),
-                0x0c => out.push_str("\\f"),
-                b if b < 0x20 => push_json_unicode_escape(out, b as u16),
-                b => out.push(b as char),
-            }
+/// JSON text being built, as code units at the narrowest width so far: bytes until a non-ASCII
+/// unit arrives, then UTF-16, as V8's JsonStringifier moves from one-byte to two-byte output.
+enum JsonOut {
+    Ascii(Vec<u8>),
+    Utf16(Vec<u16>),
+}
+
+impl Default for JsonOut {
+    fn default() -> Self {
+        JsonOut::Ascii(Vec::with_capacity(64))
+    }
+}
+
+impl JsonOut {
+    /// The length in code units.
+    fn len(&self) -> usize {
+        match self {
+            JsonOut::Ascii(bytes) => bytes.len(),
+            JsonOut::Utf16(units) => units.len(),
         }
-        out.push('"');
-        return;
     }
 
-    out.push('"');
-    let mut chars = s.chars().peekable();
-    while let Some(mut c) = chars.next() {
-        // A smuggled pair round-trips as its real character. If that character itself falls in
-        // the smuggle range (a real plane-16 PUA code point), keep the smuggled representation so
-        // it isn't re-read as a lone surrogate below.
-        if let Some(real) = chars.peek().and_then(|&n| crate::jstr::paired_char(c, n)) {
-            if crate::jstr::smuggled(real).is_some() {
-                out.push(c);
-                out.push(chars.next().unwrap());
-                continue;
-            }
-            chars.next();
-            c = real;
-        }
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => push_json_unicode_escape(out, c as u16),
-            c => match crate::jstr::smuggled(c) {
-                // Well-formed JSON.stringify: a lone surrogate is written as its \u escape.
-                Some(u) => push_json_unicode_escape(out, u),
-                None => out.push(c),
-            },
+    fn truncate(&mut self, len: usize) {
+        match self {
+            JsonOut::Ascii(bytes) => bytes.truncate(len),
+            JsonOut::Utf16(units) => units.truncate(len),
         }
     }
-    out.push('"');
+
+    #[inline]
+    fn push_ascii(&mut self, byte: u8) {
+        match self {
+            JsonOut::Ascii(bytes) => bytes.push(byte),
+            JsonOut::Utf16(units) => units.push(u16::from(byte)),
+        }
+    }
+
+    /// The output as UTF-16, widening it the first time.
+    fn utf16(&mut self) -> &mut Vec<u16> {
+        if let JsonOut::Ascii(bytes) = self {
+            *self = JsonOut::Utf16(bytes.iter().map(|&byte| u16::from(byte)).collect());
+        }
+        match self {
+            JsonOut::Utf16(units) => units,
+            JsonOut::Ascii(_) => unreachable!("widened above"),
+        }
+    }
+
+    #[inline]
+    fn push_unit(&mut self, unit: u16) {
+        match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii() => self.push_ascii(byte),
+            _ => self.utf16().push(unit),
+        }
+    }
+
+    fn push(&mut self, c: char) {
+        if c.is_ascii() {
+            self.push_ascii(c as u8);
+        } else {
+            self.utf16()
+                .extend_from_slice(c.encode_utf16(&mut [0u16; 2]));
+        }
+    }
+
+    /// Append engine text (lone surrogates smuggled; see [`crate::jstr`]).
+    fn push_str(&mut self, text: &str) {
+        if !text.is_ascii() {
+            self.utf16().extend(crate::jstr::unit_iter(text));
+            return;
+        }
+        match self {
+            JsonOut::Ascii(bytes) => bytes.extend_from_slice(text.as_bytes()),
+            JsonOut::Utf16(units) => units.extend(text.bytes().map(u16::from)),
+        }
+    }
+
+    fn push_units(&mut self, units: crate::lstr::Units<'_>) {
+        match units {
+            crate::lstr::Units::Ascii(source) => match self {
+                JsonOut::Ascii(bytes) => bytes.extend_from_slice(source),
+                JsonOut::Utf16(units) => units.extend(source.iter().map(|&byte| u16::from(byte))),
+            },
+            crate::lstr::Units::Utf16(source) => self.utf16().extend_from_slice(source),
+        }
+    }
+
+    fn finish(self) -> crate::lstr::LStr {
+        match self {
+            JsonOut::Ascii(bytes) => crate::lstr::LStr::from_ascii(&bytes),
+            JsonOut::Utf16(units) => crate::lstr::LStr::from_utf16(&units),
+        }
+    }
+}
+
+impl std::fmt::Write for JsonOut {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.push_str(text);
+        Ok(())
+    }
+}
+
+/// One ASCII unit of QuoteJSONString: the quote, backslash and control characters escaped.
+#[inline]
+fn push_json_ascii(out: &mut JsonOut, b: u8) {
+    match b {
+        b'"' => out.push_str("\\\""),
+        b'\\' => out.push_str("\\\\"),
+        b'\n' => out.push_str("\\n"),
+        b'\r' => out.push_str("\\r"),
+        b'\t' => out.push_str("\\t"),
+        0x08 => out.push_str("\\b"),
+        0x0c => out.push_str("\\f"),
+        b if b < 0x20 => push_json_unicode_escape(out, u16::from(b)),
+        b => out.push_ascii(b),
+    }
+}
+
+/// Append QuoteJSONString (ECMA-262 §25.5.2.3) of a string's code units to `out`: each unit as
+/// itself, the quote, backslash and control characters escaped, and a surrogate outside a pair
+/// as its \u escape (well-formed JSON.stringify).
+fn json_quote_units(out: &mut JsonOut, units: crate::lstr::Units<'_>) {
+    out.push_ascii(b'"');
+    match units {
+        crate::lstr::Units::Ascii(bytes) => {
+            for &b in bytes {
+                push_json_ascii(out, b);
+            }
+        }
+        crate::lstr::Units::Utf16(units) => {
+            let mut index = 0;
+            while index < units.len() {
+                let unit = units[index];
+                index += 1;
+                match unit {
+                    0..=0x7f => push_json_ascii(out, unit as u8),
+                    0xD800..=0xDBFF
+                        if units
+                            .get(index)
+                            .is_some_and(|next| (0xDC00..0xE000).contains(next)) =>
+                    {
+                        out.push_unit(unit);
+                        out.push_unit(units[index]);
+                        index += 1;
+                    }
+                    0xD800..=0xDFFF => push_json_unicode_escape(out, unit),
+                    _ => out.push_unit(unit),
+                }
+            }
+        }
+    }
+    out.push_ascii(b'"');
+}
+
+/// [`json_quote_units`] of engine text (a property key).
+fn json_quote_text(out: &mut JsonOut, s: &str) {
+    if s.is_ascii() {
+        json_quote_units(out, crate::lstr::Units::Ascii(s.as_bytes()));
+    } else {
+        json_quote_units(out, crate::lstr::Units::Utf16(&crate::jstr::units(s)));
+    }
+}
+
+/// QuoteJSONString(s) of engine text, appended to a Rust string (tests).
+#[cfg(test)]
+fn json_quote_into(out: &mut String, s: &str) {
+    let mut quoted = JsonOut::default();
+    json_quote_text(&mut quoted, s);
+    out.push_str(&quoted.finish().text());
 }
 
 #[inline]
-fn push_json_unicode_escape(out: &mut String, unit: u16) {
+fn push_json_unicode_escape(out: &mut JsonOut, unit: u16) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push_str("\\u");
-    out.push(HEX[((unit >> 12) & 0x0f) as usize] as char);
-    out.push(HEX[((unit >> 8) & 0x0f) as usize] as char);
-    out.push(HEX[((unit >> 4) & 0x0f) as usize] as char);
-    out.push(HEX[(unit & 0x0f) as usize] as char);
+    for shift in [12, 8, 4, 0] {
+        out.push_ascii(HEX[((unit >> shift) & 0x0f) as usize]);
+    }
 }
 
 /// JSON.stringify options: an optional function replacer and/or an array PropertyList of keys.
@@ -436,7 +536,7 @@ struct Serializer<'a> {
     /// [`JSON_STACK_SCAN`] of them and looks the rest up in `deep_stack`.
     stack: Vec<usize>,
     deep_stack: crate::fasthash::FastSet<usize>,
-    out: String,
+    out: JsonOut,
 }
 
 /// Nesting levels whose cycle check is a linear scan: shallow values (almost all of them) skip
@@ -561,7 +661,7 @@ fn json_serialize_property(
             }
         };
         if let Some(ValueView::Str(raw)) = (raw).map(|__value| (__value).view()) {
-            s.out.push_str(&raw.text());
+            s.out.push_units(raw.units());
             return Ok(true);
         }
         // A primitive-wrapper object re-coerces through ToNumber/ToString (so an overridden
@@ -600,7 +700,7 @@ fn json_serialize_property(
         ValueView::Str(text) => {
             // Escaping only lengthens the text.
             check_string_length(i, s.out.len().saturating_add(text.unit_len()))?;
-            json_quote_into(&mut s.out, &text.text());
+            json_quote_units(&mut s.out, text.units());
         }
         ValueView::Obj(o) => {
             if !matches!(o.borrow().call, Callable::None) {
@@ -724,7 +824,7 @@ fn json_serialize_object(
     for key in &keys {
         let member_start = s.out.len();
         json_separator(s, !any);
-        json_quote_into(&mut s.out, crate::value::decode_string_key(key));
+        json_quote_text(&mut s.out, crate::value::decode_string_key(key));
         s.out.push(':');
         if !s.gap.is_empty() {
             s.out.push(' ');
@@ -771,6 +871,8 @@ fn json_serialize_array(
 enum JsonInput<'a> {
     Bytes(&'a [u8]),
     Chars(&'a [char]),
+    /// A two-byte engine string's code units, as stored.
+    Units(&'a [u16]),
 }
 
 impl JsonInput<'_> {
@@ -779,6 +881,7 @@ impl JsonInput<'_> {
         match self {
             Self::Bytes(bytes) => bytes.len(),
             Self::Chars(chars) => chars.len(),
+            Self::Units(units) => units.len(),
         }
     }
 
@@ -787,11 +890,16 @@ impl JsonInput<'_> {
         self.len() == 0
     }
 
+    /// The character at `index`: a unit of two-byte input is its own character, a surrogate
+    /// its smuggled scalar (JSON's grammar outside strings is ASCII).
     #[inline]
     fn get(self, index: usize) -> Option<char> {
         match self {
             Self::Bytes(bytes) => bytes.get(index).copied().map(char::from),
             Self::Chars(chars) => chars.get(index).copied(),
+            Self::Units(units) => units.get(index).map(|&unit| {
+                char::from_u32(u32::from(unit)).unwrap_or_else(|| crate::jstr::smuggle(unit))
+            }),
         }
     }
 
@@ -800,6 +908,7 @@ impl JsonInput<'_> {
             Self::Bytes(bytes) => String::from_utf8(bytes[start..end].to_vec())
                 .expect("ASCII JSON input is valid UTF-8"),
             Self::Chars(chars) => chars[start..end].iter().collect(),
+            Self::Units(units) => crate::jstr::from_units(&units[start..end]),
         }
     }
 
@@ -814,6 +923,33 @@ impl JsonInput<'_> {
                 .collect::<String>()
                 .parse::<f64>()
                 .map_err(|_| ()),
+            Self::Units(units) => crate::jstr::from_units(&units[start..end])
+                .parse::<f64>()
+                .map_err(|_| ()),
+        }
+    }
+}
+
+/// A parsed JSON string: engine text from byte or character input, code units from two-byte
+/// input, which becomes a string value without conversion.
+enum JsonStr {
+    Text(String),
+    Units(Vec<u16>),
+}
+
+impl JsonStr {
+    fn into_value(self) -> Value {
+        match self {
+            JsonStr::Text(text) => Value::lstr(text),
+            JsonStr::Units(units) => Value::Str(crate::lstr::LStr::from_utf16(&units)),
+        }
+    }
+
+    /// As engine text, for a property key.
+    fn into_key(self) -> String {
+        match self {
+            JsonStr::Text(text) => text,
+            JsonStr::Units(units) => crate::jstr::from_units(&units),
         }
     }
 }
@@ -861,7 +997,7 @@ fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Re
                 if input.get(*pos) != Some('"') {
                     return Err(i.make_error("SyntaxError", "Expected string key in JSON object"));
                 }
-                let key = json_parse_string(i, input, pos)?;
+                let key = json_parse_string(i, input, pos)?.into_key();
                 json_skip_ws(input, pos);
                 if input.get(*pos) != Some(':') {
                     return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
@@ -915,7 +1051,7 @@ fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Re
             }
             Ok(i.make_array(items))
         }
-        '"' => Ok(Value::lstr(json_parse_string(i, input, pos)?)),
+        '"' => Ok(json_parse_string(i, input, pos)?.into_value()),
         't' => json_parse_lit(i, input, pos, "true", Value::Bool(true)),
         'f' => json_parse_lit(i, input, pos, "false", Value::Bool(false)),
         'n' => json_parse_lit(i, input, pos, "null", Value::Null),
@@ -1039,7 +1175,7 @@ fn json_parse_recorded(
                 if input.get(*pos) != Some('"') {
                     return Err(i.make_error("SyntaxError", "Expected string key in JSON object"));
                 }
-                let key = json_parse_string(i, input, pos)?;
+                let key = json_parse_string(i, input, pos)?.into_key();
                 json_skip_ws(input, pos);
                 if input.get(*pos) != Some(':') {
                     return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
@@ -1123,7 +1259,73 @@ fn json_parse_string(
     i: &mut Interp,
     input: JsonInput<'_>,
     pos: &mut usize,
-) -> Result<String, Value> {
+) -> Result<JsonStr, Value> {
+    match input {
+        JsonInput::Units(units) => json_parse_units(i, units, pos).map(JsonStr::Units),
+        _ => json_parse_text(i, input, pos).map(JsonStr::Text),
+    }
+}
+
+/// A JSON string of two-byte input, as code units: its plain runs copied, its escapes decoded
+/// (a `\u` escape is the unit it names, a surrogate half included).
+fn json_parse_units(i: &mut Interp, units: &[u16], pos: &mut usize) -> Result<Vec<u16>, Value> {
+    *pos += 1; // opening quote
+    let mut out = Vec::new();
+    loop {
+        let start = *pos;
+        while let Some(&unit) = units.get(*pos) {
+            if unit == u16::from(b'"') || unit == u16::from(b'\\') || unit < 0x20 {
+                break;
+            }
+            *pos += 1;
+        }
+        out.extend_from_slice(&units[start..*pos]);
+        let unit = *units
+            .get(*pos)
+            .ok_or_else(|| i.make_error("SyntaxError", "Unterminated JSON string"))?;
+        *pos += 1;
+        if unit == u16::from(b'"') {
+            return Ok(out);
+        }
+        if unit < 0x20 {
+            return Err(i.make_error("SyntaxError", "Unescaped control character in JSON string"));
+        }
+        let escape = units
+            .get(*pos)
+            .and_then(|&unit| u8::try_from(unit).ok())
+            .ok_or_else(|| i.make_error("SyntaxError", "Bad escape in JSON"))?;
+        *pos += 1;
+        let decoded = match escape {
+            b'"' => u16::from(b'"'),
+            b'\\' => u16::from(b'\\'),
+            b'/' => u16::from(b'/'),
+            b'n' => u16::from(b'\n'),
+            b't' => u16::from(b'\t'),
+            b'r' => u16::from(b'\r'),
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'u' => {
+                let digits = units.get(*pos..*pos + 4).unwrap_or_default();
+                let mut value = 0u16;
+                for &digit in digits {
+                    let digit = char::from_u32(u32::from(digit))
+                        .and_then(|digit| digit.to_digit(16))
+                        .ok_or_else(|| i.make_error("SyntaxError", "Bad \\u escape in JSON"))?;
+                    value = value * 16 + digit as u16;
+                }
+                if digits.len() != 4 {
+                    return Err(i.make_error("SyntaxError", "Bad \\u escape in JSON"));
+                }
+                *pos += 4;
+                value
+            }
+            _ => return Err(i.make_error("SyntaxError", "Bad escape in JSON")),
+        };
+        out.push(decoded);
+    }
+}
+
+fn json_parse_text(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Result<String, Value> {
     *pos += 1; // opening quote
     let mut s = String::new();
     // Most JSON strings contain no escapes. Scan that prefix in bulk and copy it once; the
@@ -1168,6 +1370,7 @@ fn json_parse_string(
                 s.extend(chars[plain_start..*pos].iter().copied());
             }
         }
+        JsonInput::Units(_) => unreachable!("two-byte input parses its strings as units"),
     }
     loop {
         let c = input
