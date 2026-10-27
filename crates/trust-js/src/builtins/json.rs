@@ -104,7 +104,7 @@ pub(super) fn install_json(it: &mut Interp) {
             indent: String::new(),
             stack: Vec::new(),
             deep_stack: crate::fasthash::FastSet::default(),
-            out: JsonOut::default(),
+            out: JsonOut::with_capacity(64),
         };
         if json_serialize_property(i, &mut serializer, &holder, JsonKey::Name(""), value)? {
             Ok(Value::Str(serializer.out.finish()))
@@ -185,107 +185,7 @@ pub(super) fn install_json(it: &mut Interp) {
     set_builtin(&it.global, "JSON", Value::Obj(j));
 }
 
-/// JSON text being built, as code units at the narrowest width so far: bytes until a non-ASCII
-/// unit arrives, then UTF-16, as V8's JsonStringifier moves from one-byte to two-byte output.
-enum JsonOut {
-    Ascii(Vec<u8>),
-    Utf16(Vec<u16>),
-}
-
-impl Default for JsonOut {
-    fn default() -> Self {
-        JsonOut::Ascii(Vec::with_capacity(64))
-    }
-}
-
-impl JsonOut {
-    /// The length in code units.
-    fn len(&self) -> usize {
-        match self {
-            JsonOut::Ascii(bytes) => bytes.len(),
-            JsonOut::Utf16(units) => units.len(),
-        }
-    }
-
-    fn truncate(&mut self, len: usize) {
-        match self {
-            JsonOut::Ascii(bytes) => bytes.truncate(len),
-            JsonOut::Utf16(units) => units.truncate(len),
-        }
-    }
-
-    #[inline]
-    fn push_ascii(&mut self, byte: u8) {
-        match self {
-            JsonOut::Ascii(bytes) => bytes.push(byte),
-            JsonOut::Utf16(units) => units.push(u16::from(byte)),
-        }
-    }
-
-    /// The output as UTF-16, widening it the first time.
-    fn utf16(&mut self) -> &mut Vec<u16> {
-        if let JsonOut::Ascii(bytes) = self {
-            *self = JsonOut::Utf16(bytes.iter().map(|&byte| u16::from(byte)).collect());
-        }
-        match self {
-            JsonOut::Utf16(units) => units,
-            JsonOut::Ascii(_) => unreachable!("widened above"),
-        }
-    }
-
-    #[inline]
-    fn push_unit(&mut self, unit: u16) {
-        match u8::try_from(unit) {
-            Ok(byte) if byte.is_ascii() => self.push_ascii(byte),
-            _ => self.utf16().push(unit),
-        }
-    }
-
-    fn push(&mut self, c: char) {
-        if c.is_ascii() {
-            self.push_ascii(c as u8);
-        } else {
-            self.utf16()
-                .extend_from_slice(c.encode_utf16(&mut [0u16; 2]));
-        }
-    }
-
-    /// Append engine text (lone surrogates smuggled; see [`crate::jstr`]).
-    fn push_str(&mut self, text: &str) {
-        if !text.is_ascii() {
-            self.utf16().extend(crate::jstr::unit_iter(text));
-            return;
-        }
-        match self {
-            JsonOut::Ascii(bytes) => bytes.extend_from_slice(text.as_bytes()),
-            JsonOut::Utf16(units) => units.extend(text.bytes().map(u16::from)),
-        }
-    }
-
-    fn push_units(&mut self, units: crate::lstr::Units<'_>) {
-        match units {
-            crate::lstr::Units::Ascii(source) => match self {
-                JsonOut::Ascii(bytes) => bytes.extend_from_slice(source),
-                JsonOut::Utf16(units) => units.extend(source.iter().map(|&byte| u16::from(byte))),
-            },
-            crate::lstr::Units::Utf16(source) => self.utf16().extend_from_slice(source),
-        }
-    }
-
-    fn finish(self) -> crate::lstr::LStr {
-        match self {
-            JsonOut::Ascii(bytes) => crate::lstr::LStr::from_ascii(&bytes),
-            JsonOut::Utf16(units) => crate::lstr::LStr::from_utf16(&units),
-        }
-    }
-}
-
-impl std::fmt::Write for JsonOut {
-    fn write_str(&mut self, text: &str) -> std::fmt::Result {
-        self.push_str(text);
-        Ok(())
-    }
-}
+type JsonOut = crate::lstr::Builder;
 
 /// One ASCII unit of QuoteJSONString: the quote, backslash and control characters escaped.
 #[inline]
@@ -351,7 +251,7 @@ fn json_quote_text(out: &mut JsonOut, s: &str) {
 /// QuoteJSONString(s) of engine text, appended to a Rust string (tests).
 #[cfg(test)]
 fn json_quote_into(out: &mut String, s: &str) {
-    let mut quoted = JsonOut::default();
+    let mut quoted = JsonOut::with_capacity(16);
     json_quote_text(&mut quoted, s);
     out.push_str(&quoted.finish().text());
 }

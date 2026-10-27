@@ -9213,9 +9213,7 @@ fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Valu
             return Err(error);
         }
     }
-    Ok(Value::lstr(
-        crate::jstr::canonicalize(&result).unwrap_or(result),
-    ))
+    Ok(Value::lstr(result))
 }
 
 /// Step an iterator object (`this`) once: `Some(value)` or `None` when done.
@@ -11144,15 +11142,24 @@ pub(crate) fn nf_string_replace(
         return Ok(Value::Str(s));
     };
     let end = pos + pattern_units.len();
-    let before = crate::jstr::from_units(&source_units[..pos]);
+    // GetSubstitution sees the match, and the prefix and suffix only when the template asks
+    // for them; the result is the receiver's units around the replacement's.
     let matched = crate::jstr::from_units(&source_units[pos..end]);
-    let after = crate::jstr::from_units(&source_units[end..]);
+    let (before, after) = if replacement_needs_context(&repl) {
+        (
+            crate::jstr::from_units(&source_units[..pos]),
+            crate::jstr::from_units(&source_units[end..]),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     let rep = string_replacement_parts(i, &repl, &matched, &s, pos, &before, &after)?;
-    check_string_length(i, before.len() + rep.len() + after.len())?;
-    let joined = crate::jstr::concat(&crate::jstr::concat(&before, &rep), &after);
-    Ok(Value::lstr(
-        crate::jstr::canonicalize(&joined).unwrap_or(joined),
-    ))
+    let mut out = crate::lstr::Builder::with_capacity(source_units.len() + rep.len());
+    out.push_units(s.units().slice(0, pos));
+    out.push_str(&rep);
+    out.push_units(s.units().slice(end, source_units.len()));
+    check_string_length(i, out.len())?;
+    Ok(Value::Str(out.finish()))
 }
 
 pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
@@ -12086,7 +12093,7 @@ fn install_string(it: &mut Interp) {
                     out.push_str(&crate::jstr::unit_str(unit));
                 }
             }
-            return Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)));
+            return Ok(Value::lstr(out));
         }
         let source_ascii = s.ascii_hint();
         let pattern_ascii = pat.ascii_hint() || (source_ascii && pat.text().is_ascii());
@@ -12134,15 +12141,12 @@ fn install_string(it: &mut Interp) {
         };
         let pattern_len = pattern_units.len();
         let needs_context = replacement_needs_context(&repl);
-        let mut out = String::with_capacity(s.unit_len());
+        let mut out = crate::lstr::Builder::with_capacity(s.unit_len());
         let mut cursor = 0usize;
         let mut pos = first;
         loop {
-            push_str_checked(
-                i,
-                &mut out,
-                &crate::jstr::from_units(&source_units[cursor..pos]),
-            )?;
+            out.push_units(s.units().slice(cursor, pos));
+            check_string_length(i, out.len())?;
             let matched = crate::jstr::from_units(&source_units[pos..pos + pattern_len]);
             let before = if needs_context {
                 crate::jstr::from_units(&source_units[..pos])
@@ -12155,7 +12159,8 @@ fn install_string(it: &mut Interp) {
                 String::new()
             };
             let piece = string_replacement_parts(i, &repl, &matched, &s, pos, &before, &after)?;
-            push_str_checked(i, &mut out, &piece)?;
+            out.push_str(&piece);
+            check_string_length(i, out.len())?;
             cursor = pos + pattern_len;
             let Some(next) = source_units[cursor..]
                 .windows(pattern_len)
@@ -12165,12 +12170,9 @@ fn install_string(it: &mut Interp) {
             };
             pos = cursor + next;
         }
-        push_str_checked(
-            i,
-            &mut out,
-            &crate::jstr::from_units(&source_units[cursor..]),
-        )?;
-        Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
+        out.push_units(s.units().slice(cursor, source_units.len()));
+        check_string_length(i, out.len())?;
+        Ok(Value::Str(out.finish()))
     });
 
     let ctor = it.make_native("String", 1, |i, _this, args| {

@@ -1056,9 +1056,7 @@ fn re_sym_replace_impl(
     if next_pos < size {
         accumulated.push_str(&crate::jstr::from_units(&sunits[next_pos..]));
     }
-    Ok(Value::lstr(
-        crate::jstr::canonicalize(&accumulated).unwrap_or(accumulated),
-    ))
+    Ok(Value::lstr(accumulated))
 }
 
 /// RegExp.prototype[@@replace] (ECMA-262 §22.2.6.11) for a regexp whose RegExpExec is the
@@ -1137,7 +1135,7 @@ fn re_sym_replace_direct(
     } else {
         std::borrow::Cow::Borrowed(&[][..])
     };
-    let mut out = String::with_capacity(s.unit_len());
+    let mut out = crate::lstr::Builder::with_capacity(s.unit_len());
     let mut next = 0usize;
     for caps in &matches {
         let (start, end) = caps[0].expect("successful regexp match has a span");
@@ -1180,8 +1178,11 @@ fn re_sym_replace_direct(
             *template
         };
         if start >= next {
-            text.push_slice(&mut out, next, start);
-            out.push_str(&replacement.text());
+            out.push_units(
+                s.units()
+                    .slice(text.unit_index(next), text.unit_index(start)),
+            );
+            out.push_units(replacement.units());
             // Pathological expansion ($1 of a huge match, repeated) dies as a RangeError.
             if out.len() > MAX_STR_LEN {
                 return Err(i.make_error("RangeError", "Invalid string length"));
@@ -1189,8 +1190,8 @@ fn re_sym_replace_direct(
             next = end;
         }
     }
-    text.push_slice(&mut out, next, text.len());
-    Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
+    out.push_units(s.units().slice(text.unit_index(next), s.unit_len()));
+    Ok(Value::Str(out.finish()))
 }
 
 /// GetSubstitution: expand a `$`-template against a match. `captures` are already `Value::Str` /

@@ -2229,14 +2229,6 @@ impl ReText {
         }
     }
 
-    /// Append [`Self::slice`] to `out`, copying straight out of an ASCII source.
-    pub(crate) fn push_slice(&self, out: &mut String, a: usize, b: usize) {
-        match &self.ascii_src {
-            Some(src) => out.push_str(&src.text()[a..b]),
-            None => out.push_str(&self.slice(a, b)),
-        }
-    }
-
     /// The canonical string for elements `a..b` (surrogate halves recombine).
     pub fn slice(&self, a: usize, b: usize) -> String {
         // ASCII subject: element index == byte index — copy straight from the source.

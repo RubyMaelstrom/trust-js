@@ -355,43 +355,6 @@ fn smuggled_low(c: char) -> Option<u16> {
     smuggled(c).filter(|u| (0xDC00..0xE000).contains(&(*u as u32)))
 }
 
-/// String concatenation with the canonical-form fix-up: a smuggled high surrogate at the end of
-/// `a` followed by a smuggled low surrogate at the start of `b` combines into the astral scalar,
-/// so `"\uD834" + "\uDF06"` equals the literal `"𝌆"`.
-pub fn concat(a: &str, b: &str) -> String {
-    if let (Some(last), Some(first)) = (a.chars().next_back(), b.chars().next()) {
-        if let (Some(hi), Some(lo)) = (smuggled_high(last), smuggled_low(first)) {
-            let cp = 0x10000 + ((hi as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00);
-            // Adjacent smuggled high+low IS the canonical form for smuggle-range characters.
-            if cp < SMUGGLE_BASE {
-                let mut out = String::with_capacity(a.len() + b.len());
-                out.push_str(&a[..a.len() - last.len_utf8()]);
-                out.push(char::from_u32(cp).unwrap());
-                out.push_str(&b[first.len_utf8()..]);
-                return out;
-            }
-        }
-    }
-    let mut out = String::with_capacity(a.len() + b.len());
-    out.push_str(a);
-    out.push_str(b);
-    out
-}
-
-/// Canonicalize any adjacent smuggled high+low surrogate pairs inside `s` (needed after building
-/// a string from independently produced pieces, e.g. `join` or `repeat`).
-pub fn canonicalize(s: &str) -> Option<String> {
-    let mut prev_high = false;
-    for c in s.chars() {
-        if prev_high && smuggled_low(c).is_some() {
-            // Slow path: rebuild through the unit round-trip.
-            return Some(from_units(&units(s)));
-        }
-        prev_high = smuggled_high(c).is_some();
-    }
-    None
-}
-
 /// The code points of `s`, with lone surrogates as their surrogate values (paired smuggled
 /// high+low decode to the real character they canonically encode — see module docs).
 pub fn code_points(s: &str) -> Vec<u32> {

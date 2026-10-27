@@ -788,6 +788,109 @@ impl LStr {
     }
 }
 
+/// A string being built, as code units at the narrowest width so far: bytes until a non-ASCII
+/// unit arrives, then UTF-16, as V8's string builders move from one-byte to two-byte. For text
+/// assembled from many pieces (JSON, replacements), which an in-place append would otherwise
+/// regrow or widen piece by piece.
+pub(crate) enum Builder {
+    Ascii(Vec<u8>),
+    Utf16(Vec<u16>),
+}
+
+impl Builder {
+    pub(crate) fn with_capacity(units: usize) -> Builder {
+        Builder::Ascii(Vec::with_capacity(units))
+    }
+
+    /// The length in code units.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Builder::Ascii(bytes) => bytes.len(),
+            Builder::Utf16(units) => units.len(),
+        }
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        match self {
+            Builder::Ascii(bytes) => bytes.truncate(len),
+            Builder::Utf16(units) => units.truncate(len),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push_ascii(&mut self, byte: u8) {
+        debug_assert!(byte.is_ascii());
+        match self {
+            Builder::Ascii(bytes) => bytes.push(byte),
+            Builder::Utf16(units) => units.push(u16::from(byte)),
+        }
+    }
+
+    /// The units as UTF-16, widening them the first time.
+    fn utf16(&mut self) -> &mut Vec<u16> {
+        if let Builder::Ascii(bytes) = self {
+            *self = Builder::Utf16(bytes.iter().map(|&byte| u16::from(byte)).collect());
+        }
+        match self {
+            Builder::Utf16(units) => units,
+            Builder::Ascii(_) => unreachable!("widened above"),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push_unit(&mut self, unit: u16) {
+        match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii() => self.push_ascii(byte),
+            _ => self.utf16().push(unit),
+        }
+    }
+
+    pub(crate) fn push(&mut self, c: char) {
+        if c.is_ascii() {
+            self.push_ascii(c as u8);
+        } else {
+            self.utf16()
+                .extend_from_slice(c.encode_utf16(&mut [0u16; 2]));
+        }
+    }
+
+    /// Append engine text (lone surrogates smuggled; see [`crate::jstr`]).
+    pub(crate) fn push_str(&mut self, text: &str) {
+        if !text.is_ascii() {
+            self.utf16().extend(crate::jstr::unit_iter(text));
+            return;
+        }
+        match self {
+            Builder::Ascii(bytes) => bytes.extend_from_slice(text.as_bytes()),
+            Builder::Utf16(units) => units.extend(text.bytes().map(u16::from)),
+        }
+    }
+
+    pub(crate) fn push_units(&mut self, units: Units<'_>) {
+        match units {
+            Units::Ascii(source) => match self {
+                Builder::Ascii(bytes) => bytes.extend_from_slice(source),
+                Builder::Utf16(units) => units.extend(source.iter().map(|&byte| u16::from(byte))),
+            },
+            Units::Utf16(source) => self.utf16().extend_from_slice(source),
+        }
+    }
+
+    pub(crate) fn finish(self) -> LStr {
+        match self {
+            Builder::Ascii(bytes) => LStr::from_ascii(&bytes),
+            Builder::Utf16(units) => LStr::from_utf16(&units),
+        }
+    }
+}
+
+impl std::fmt::Write for Builder {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.push_str(text);
+        Ok(())
+    }
+}
+
 impl From<&str> for LStr {
     fn from(s: &str) -> LStr {
         LStr::from_text(s)
