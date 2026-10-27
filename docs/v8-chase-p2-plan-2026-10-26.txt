@@ -522,6 +522,10 @@ does (Order, step 0).
 8. Testing (2026-10-27): tests are a diagnostic tool, run in full at the end of a major phase or
    of a large change to what they measure rather than per commit; long runs only to diagnose
    (see "Gates").
+9. After W7 (2026-10-27): W7 lands on both mains; W2a and W2b follow (their design draft
+   goes ahead), with W5's interpreter-level stage alongside under its drafted exit (see W5's
+   stage record); W1's revised exit is accepted; the heap cap ports V8's two remaining rules
+   (the floor of size + 8 MB past the maximum, and MaxGrowingFactor).
 
 ## Non-goals
 
@@ -605,11 +609,12 @@ budgets keep their rule. Tests: the limit below, at and above the point where th
 Exit (proposed, W6): the limits match V8's rule in unit tests; Web Tooling's peak RSS falls; no
 suite slower beyond noise.
 
-Landed 2026-10-27 (7495f76b). Two follow-ups for the owner: past the maximum V8's floor is
-`size + 8 MB` (its global limit, 8f876708cf), where the engine keeps the note's `size + 8 MB +
-nursery`; and V8's MaxGrowingFactor allows a factor of 4 only for a maximum of at least 2 GB (1.3
-to 2.0 below), which the engine does not port (it differs on hosts with less than 4 GB of memory
-or under a small override). Exit measurement pending (a quiet machine, LTO builds).
+Landed 2026-10-27 (7495f76b). Two differences from V8 remain, both to be ported (Decision 9):
+past the maximum V8's floor is `size + 8 MB` (its global limit, 8f876708cf), where the engine
+keeps the note's `size + 8 MB + nursery`; and V8's MaxGrowingFactor allows a factor of 4 only for
+a maximum of at least 2 GB (1.3 to 2.0 below), which the engine does not port (it differs on
+hosts with less than 4 GB of memory or under a small override). Exit measurement pending (a
+quiet machine, LTO builds).
 
 ### W1: builtins and Proxy paths (census and design, 2026-10-27)
 
@@ -662,8 +667,8 @@ Design:
 5. The plan's other W1 items (bulk indexOf, lastIndexOf and includes; dense sort and fill)
    wait for a workload that spends time there: none of the acceptance set or Octane does.
    Proxy target and handler move out of the side table with W2g, as planned.
-Exit (proposed revision, needs the owner's agreement under Decision 2; the plan's was Vue's
-`shift` cut by 10x): the Proxy microbenchmark without handlers at or below Sparkplug-only
+Exit (revised with the owner's agreement, Decision 9; the plan's was Vue's `shift` cut by
+10x): the Proxy microbenchmark without handlers at or below Sparkplug-only
 Node's time and with Reflect-forwarding handlers within 1.5x of it (today 1.33x and 1.8x); the
 holey shift within 2x of it (today 17x); Vue's `shift` time recorded before and after; no
 builtin above 5% of a workload's time on a generic path a fast path could take (met on the
@@ -675,7 +680,7 @@ under 1% of the Proxy microbenchmark (intern_key 0.8%), whose largest cost is no
 table's probes (18%, W2g's). Under load (no-LTO, least of 3 runs, ns an iteration): without
 handlers 27,900 to 9,900 (Sparkplug-only Node 13,750), with Reflect handlers 48,250 to 26,450
 (20,350), with direct handlers 22,400 to 17,400 (9,150). Exit measurement pending (a quiet
-machine, LTO builds), as is the owner's answer on the revised exit.
+machine, LTO builds).
 
 ### W7: strings (census and design, 2026-10-27)
 
@@ -704,7 +709,7 @@ Census (no-LTO 7495f76b on Crystal, under load; data and scripts in target/p2/st
   integer parser ("abc"["01"] was "b"; a read past the end skipped String.prototype; fixed,
   1bf7973e), the default sort ordered by code point, not code unit (fixed, 9b224edd), and object
   spread and rest of a string walk code points, not units (`{...'a😀b'}` has three keys, not
-  four; open).
+  four; fixed, b2dfe9bb).
 
 What the browsers do (their source at V8 756afdd7, Firefox d9098b3e, WebKit 780058db, read
 2026-10-27): all three store code units at one of two fixed widths, Latin-1 bytes or UTF-16
@@ -760,18 +765,19 @@ of a one-byte string always borrows. Latin-1 one-byte storage, the browsers' wid
 is S4, once the remaining byte-level paths read storage by width.
 
 Order:
-- S1 (done, 7b577a5e..f4deadce): the text API with UTF-8 storage unchanged, every reader moved
+- S1 (done, 2a6d1558..637f17a8): the text API with UTF-8 storage unchanged, every reader moved
   off `Deref`/`len()` (about 470 sites; the compiler found them), then `Deref`, `AsRef`,
   `Borrow` and the public `as_str` removed. No change in behaviour or generated code.
-- S2 (963a285a): the storage change, with the view machinery answering from storage; the string
-  iterator, AdvanceStringIndex, comparison and sorting on units; length limits in units.
-- S3: the hot paths off `text()` by measured order (slice, substring, substr, indexOf, split,
-  replace, trim, case mapping, JSON, fromCharCode), the view cutoff against V8's 13, object
-  spread by units.
-- S4: Latin-1 one-byte storage, and `.length` and charCodeAt templates for every flat string.
+- S2 (done, 64ac4bea): the storage change, with the view machinery answering from storage; the
+  string iterator, AdvanceStringIndex, comparison and sorting on units; length limits in units.
+- S3 (done, 3a4bd8bd..d1ad3c45): the hot paths off `text()` by measured order (slice,
+  substring, substr, indexOf, split, replace, trim, case mapping, JSON, fromCharCode), object
+  spread by units. The view cutoff against V8's 13 waits for a case that favours it.
+- S4 (not started): Latin-1 one-byte storage, and `.length` and charCodeAt templates for every
+  flat string.
 - A string differential test (generated programs over ASCII, Latin-1, CJK, astral and
   lone-surrogate strings through every String.prototype method and the operators, compared with
-  Node) checks S2-S4.
+  Node) checks S2-S4 (done for S2 and S3; see the results).
 
 Exit (proposed): no UTF-16 view or decoding cache left; on strings.js every case's non-ASCII
 variants within 1.5x of its ASCII variant and every case within 2x of Sparkplug-only Node;
@@ -779,7 +785,61 @@ coffeescript and source-map within the other Web Tooling tools' gap to Sparkplug
 (at most 6.7x), with string conversions under 1% of the suite's instructions; Test262 identical;
 no suite slower beyond noise and no suite's peak RSS more than 5% higher.
 
-### W2a and W2b: atoms and scope descriptors (design draft, 2026-10-27, for the owner's review)
+Results (2026-10-27; no-LTO builds on Crystal under light load, against Sparkplug-only Node;
+micro/strings.js ran every engine on the same A725 core, CPU 10 or 12, and Web Tooling on the
+X925 core 5 where the plan's measurements run):
+- Landed: S1; S2 (one-byte ASCII and two-byte UTF-16 storage; the unit cache, the UTF-8 index
+  and the surrogate join fix-ups gone); RegExp windows over a buffer's written extent
+  (3a4bd8bd: a slice of an appended string had missed its owner's prepared text, which cost an
+  anchored RegExp per remaining chunk 16-20 s on 200 KB of non-ASCII text); S3 (b2dfe9bb object
+  spread and rest by code units, fixing the third deviation; ec282ba3 split, join and case
+  mapping; d2a357e5 JSON over code units; 56c28010 trim, padding, well-formedness and
+  fromCharCode; d1ad3c45 replacements over code units, through a shared builder,
+  `lstr::Builder`, that holds units at the narrowest width so far); the differential test's
+  fixes (182e9ae8..05e1f798, below).
+- micro/strings.js, non-ASCII text (before, after, Node): re-slicing lexer 33 s, 10 ms, 6 ms;
+  RegExp per remaining chunk 15-17 s, 23-28 ms, 3-4 ms; `+=` accumulator read as it grows
+  2.3 s, 3 ms, 26-200 ms; substr tokens 30 ms, 13 ms, 7 ms; split/join 35 ms, 5 ms, 3-4 ms; case
+  mapping 32 ms, 10 ms, 4-8 ms; JSON round trip 60 ms, 41 ms, 18-19 ms (micro/*.jsonl). Every
+  result agrees with Node's. Every non-ASCII case runs within 1.6x of its ASCII variant, most
+  within 1.2x, except case mapping, whose ASCII path is a byte map (10 ms against 1).
+  The gaps left are not strings': the RegExp matcher (4.5-6.5x, W5), property and Map keys (5x,
+  W2a's atoms), prepending, which V8 serves with cons strings (9-26x; ropes wait for a census of
+  real concatenation copies).
+- Web Tooling, each tool alone on CPU 5: coffeescript 0.21 to 0.78 runs/s and source-map 0.38 to
+  1.25, so their gaps to Sparkplug-only Node (4.92 and 3.86) fall from 23x and 10x to 6.3x and
+  3.1x. Neither profile shows string conversion any more (coffeescript's is flat: element and
+  property reads, equality, the RegExp matcher).
+- The string differential test (target/p2/strings-difftest, untracked: programs generated over
+  ASCII, Latin-1, CJK, astral, smuggle-range and lone-surrogate strings, about 3,000 checks each
+  through the String methods, the operators, keys, JSON, sort, spread and RegExp, run at three
+  tiers against Node and the engine before W7): 268 programs, 804,268 checks per configuration,
+  no tier-specific difference and none under GC stress. It found two regressions, both fixed:
+  RegExp on a two-byte view of an all-ASCII buffer panicked (182e9ae8; 15% of the programs hit
+  it), and a string literal key in source made at run time, with its surrogate pair split
+  between a raw unit and a `\u` escape, named a property the character could not reach
+  (f2cdb160). It found older deviations, also fixed: String.raw with a string `raw` (a358df75),
+  parseInt's rounding past 64 bits (31f24809), and `v`-mode classes, which never matched a lone
+  surrogate and combined their sets unfolded under `i` (05e1f798, with `\s`'s U+0085 and inline
+  modifiers). Rerun after the fixes, the 41 programs that had crashed complete at every tier
+  (123,041 checks). Left: localeCompare of CJK Extension A against ICU's root collation, and
+  four differences that are Node's (V8's RegExp size limit; and against ECMA-262, an empty match
+  inside a surrogate pair under `u` or `v`, JSON's gap cut at U+0000, a modifier group's `i`
+  leaking into the next `v`-mode class).
+- Validation at the end of S2, of S3 and of the fixes: Test262 identical (53,575 of 53,575), the
+  fixtures' output, difftest and the lib suite; zombie's x86-64 and Windows suites at 3a4bd8bd
+  and 56c28010; the dumps differ from the base only in the interpreter's field offsets (128
+  bytes, the removed unit cache).
+- The embedding API: `as_engine_text()` returns `Cow<str>`; TRust's port changes 10 lines
+  (8d55ad66 on TRust's trust-js-w7-strings; its lib suite passes).
+- Against the proposed exit: no UTF-16 view or decoding cache is left, coffeescript and
+  source-map are within 6.7x, and Test262 is identical. Every non-ASCII case but case mapping is
+  within 1.6x of its ASCII variant, against the exit's 1.5x; the RegExp, key and prepending
+  cases stay beyond 2x of Node, for the reasons above. String conversion's share of the whole
+  suite, suite timings and peak RSS wait for the quiet-machine LTO runs that P2's exits share.
+- Not done: S4, the view cutoff, ropes.
+
+### W2a and W2b: atoms and scope descriptors (design, 2026-10-27; going ahead, Decision 9)
 
 Census (the close-out's GC logs, target/claude-closeout/final/gclog, TRUST_JS_GC_LOG; means per
 minor collection; a read-only survey of the tree supplied the inventory, its claims checked):
@@ -854,7 +914,104 @@ Atom collection, weak transitions and dictionary maps follow with W2d. 8-byte bi
 as the empty word, a one-binding environment in the 64-byte class) are deferred to W3, which
 decides the environment layout its direct sequence builds.
 
-Exit (proposed, within W2's): `fin:environment` and `fin:property_layout` reach 0 on the
+Exit (as drafted, within W2's; going ahead, Decision 9): `fin:environment` and
+`fin:property_layout` reach 0 on the
 sustained workload, the fixtures, ARES-6 and Web Tooling; minor-collection time falls by the
 measured finalize share; one-binding environments sit in the 96-byte class; no suite slower
 beyond noise. Splay's live heap stays W2c/W2d's.
+
+### W5: RegExp (census and design, 2026-10-27)
+
+Census: the string rework's engine (56c28010, no-LTO) on Crystal, CPU 5, under load (two other
+engine runs and a game; load 4-5.5). User-mode instructions sampled with call graphs and the perf
+map. A sample is RegExp's when, walking from its leaf, a RegExp frame comes before any frame
+running JavaScript; its innermost RegExp frame, refined by that frame's callee, picks the
+category. Cycle samples agree within 4 points. Operation counts come from Node runs with
+counting wrappers. Data and scripts: target/p2/w5-census (w5cat.py classifies).
+
+Share of user instructions (%):
+
+| | RegExp | matcher | subject | results | lastIndex, statics | guards | regexps, gc_pin | compile | orchestration |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Octane RegExp | 89.1 | 63.3 | 1.4 | 4.8 | 3.2 | 5.3 | 1.5 | 0.1 | 8.9 |
+| Djot, 40 passes | 18.1 | 5.7 | 2.0 | 3.4 | 1.6 | 2.3 | 0.9 | 0.1 | 1.6 |
+| strings.js RegExp cases | 82.8 | 23.3 | 14.2 | 26.3 | 8.9 | 0 | 1.8 | 0 | 5.1 |
+| source-map | 23.5 | 4.9 | 0.2 | 1.8 | 0.6 | 8.8 | 2.2 | 0.1 | 4.4 |
+| coffeescript | 7.3 | 4.5 | 0.4 | 0.3 | 0.1 | 0.9 | 0.3 | 0.1 | 0.6 |
+
+The Djot fixture as run is 14.6% RegExp, Vue 0.1%, React none; collector work triggered inside
+RegExp (0.1-3.1%) counts in the totals only. Against Node v24 by time in the same session
+(engine / Node / Sparkplug only; medians of 3, the engine's Web Tooling runs once): Octane RegExp
+score 326 / 6,280 / 3,800 (11.7x; the close-out's LTO build scored 349); Djot 164 / 49 / 39 ms
+(4.2x); strings.js sticky lexer 60-73 / 4-8 / 8-11 ms, a RegExp per remaining chunk 10-16 / 1-4 /
+1-3 ms; source-map 1.24 / 9.95 / 3.78 runs/s (3.0x); coffeescript 0.77 / 7.46 / 4.87 (6.3x).
+
+- Octane's RegExp is mostly one pattern: re17, `/(^|[^\\])"\\\/Qngr\((-?[0-9]+)\)\\\/"/g`, replaced
+  over 2,257-unit two-byte strings 780 times a run (48.8% of instructions). Its first element
+  admits nearly every position, so the matcher starts at each: 158 us a replace, the same on an
+  ASCII copy, against at most 2.5 us in Node at either tier. Skipping the replace when its
+  required literal is absent (a JavaScript what-if; same checksum) takes a run from 284 to 166 ms.
+- Elsewhere fixed per-operation costs dominate. A Djot operation costs ~4,000 instructions (1,250
+  matching; Sparkplug-only Node ~180 in all); a source-map one ~8,500, over a third of it guards
+  (`normalize` runs `match` and `split` 2.2M times each, creating its `/\/+/` each time, and
+  `test` 1.8M).
+- Costs the plan's list misses: the matcher's entry and per-attempt resets (Octane 3.7% beyond
+  re17, Djot 2.6%, strings 9%); two-byte subject preparation (strings 14%: the prepared-text
+  LRU, widening, unit-element binary searches); replace output built as UTF-8 and canonicalized
+  (Octane 3.2%; gone with W7's d1ad3c45); match arrays and `d` indices (Djot 2.4%, strings
+  18%; W2c/W2d).
+- Little or nothing measured: `match` with /g, `search`, `matchAll` (Octane's 2,255 and
+  coffeescript's 1,040 global matches are all there are, among 1.36M and 2.6M operations), case
+  folding at match time (at most 0.11%), compilation (0.5%), the collector's `regexps`/`gc_pins`
+  sweeps (0.2%).
+
+Design (gains are shares of today's instructions):
+1. Prefilters: at compile time, the longest literal every match contains and its offset range
+   from the match start (re17: `"\/Qngr(` at 0-1); exec finds it with a NEON scan over bytes or
+   units and tries only starts in range, and its absence ends the search. The first-element
+   scan gets NEON too (byte equality, 128-entry ASCII tables). Octane 1.7-1.9x.
+2. A RegExp protector: a realm proof, epoch-keyed like the array protectors, that
+   %RegExp.prototype%'s `exec`, flag getters and symbol methods, %RegExp%[@@species] and the
+   `constructor` link are the intrinsics. Value writes to those objects bump the epoch too
+   (today only structural changes do: the objects are flagged, store caches decline them and the
+   slow store path bumps). A receiver is fast when it has the realm's initial RegExp shape and
+   prototype. String.prototype's methods then enter the RegExp algorithms directly and
+   RegExpExec calls RegExpBuiltinExec without the Get of `exec`. Removes the guards, the @@method
+   dispatch and the generic exec call: source-map 12%, Octane 7.8%, Djot 2.6%.
+3. Payload and entry: `Exotic::RegExp(PayloadBox<..>)` holds the shared program (P1's Map/Set
+   pattern; W2g's RegExp part). `lastIndex` stays an own data property at the initial shape's
+   slot, read and written directly under 2's proof; the legacy statics keep the constructor
+   cached; the matcher's scratch lives in the Interp, sized per program, capture slots reset
+   through the undo log rather than filled per attempt, flags precomputed. Removes the
+   `regexps`/`gc_pins` traffic, string-keyed `lastIndex` access and entry overhead: Octane 8%,
+   Djot 5%, strings 20%, source-map 4.5%.
+4. Subjects in place: the matcher reads one-byte storage as bytes and two-byte storage as units,
+   decoding surrogate pairs in /u and /v as it steps, positions in units throughout; ReText, its
+   32 MiB LRU and the unit-element maps go (W7's item 5). Strings 14%, Djot 2%, Octane 1.4%.
+5. Captures from storage: captures, split pieces and replace arguments as slices of the subject
+   at its width (views above V8's 13 units), with no Rust String or UTF-8 round trip. Octane
+   2%, Djot 1%, strings 8%.
+6. `match` with /g, `search` and `matchAll` without match arrays, on 2's proof: for
+   completeness, after 2.
+7. Case closure at compile time, with the native tier, which needs closed classes (`v`-mode
+   class sets are already closed under `i`, 05e1f798).
+
+Then W5b (Decision 3): the native tier with captures and alternation on both backends, behind a
+differential gate (the matcher, Test262's RegExp suites, a fuzzed corpus, the census workloads'
+patterns). After W5a it addresses the backtracking interpreter and class tests: about 9% of
+Octane's instructions today (a fifth to a quarter of what W5a leaves), coffeescript 3.6% (`clean`'s
+`/\s+$/` over a 50,176-unit source restarts inside every whitespace run: 2,150 us a call against
+Sparkplug-only Node's 375), strings 14%, source-map 2.8%. The one-byte tier's AArch64 class
+emitter has an open release-build termination fault (regex.rs:1156) that W5b fixes or replaces.
+
+Order: 1 (half of Octane, regex.rs alone); 2 (the largest fixed cost on source-map and Octane);
+3, as W2g's RegExp part, on 2's shape proof; 4; 5; 6; then W5b with 7. Each series: Test262
+identical, difftest, and the census workloads run with each new fast path forced off and compared.
+
+Exit (agreed, Decision 9): W5a: Octane RegExp's score at
+least 2x the close-out's, as planned (predicted 2.2-3.1x, as items 2-5 realize 70-100% of their
+shares); Djot's RegExp instructions in the 40-pass run halved, the plan's "exec time" made
+measurable (5.2e8 today by w5cat.py; predicted 1.7-2.4x); source-map's at most half (5.4e10
+today; predicted a quarter to a half); Test262 identical. strings.js's RegExp cases, which W7's
+exit left to W5, are recorded (predicted ~4x Sparkplug-only Node; the rest is W2's arrays). W5b's
+exit in its design note.
