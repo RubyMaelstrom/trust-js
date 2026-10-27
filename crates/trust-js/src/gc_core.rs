@@ -1537,9 +1537,9 @@ pub(crate) struct Heap {
     trigger_bytes: usize,
     min_trigger_bytes: usize,
     growth_percent: usize,
-    /// The heap's maximum ([`Heap::set_max_heap_bytes`]): with pacing, a major collection's
-    /// budget stops halfway from the bytes it kept to this. `usize::MAX`, the default, bounds
-    /// nothing.
+    /// The heap's maximum ([`Heap::set_max_heap_bytes`]): with pacing, it bounds a major
+    /// collection's growing factor, and the budget stops halfway from the bytes it kept to this.
+    /// `usize::MAX`, the default, bounds nothing.
     max_heap_bytes: usize,
     /// The nursery budget (S6 step 10c): a minor collection is due once more than this many
     /// bytes have been allocated since the last collection. `None`, the default: every
@@ -1818,10 +1818,9 @@ impl Heap {
     /// with the nursery budget set: when `dynamic_nursery`, that budget is the policy's first
     /// and smallest, and it grows and shrinks with the measurements.
     pub(crate) fn enable_pacing(&mut self, dynamic_nursery: bool) {
-        self.pacing = Some(Box::new(crate::gc_pacing::Pacing::new(
-            self.nursery_bytes,
-            dynamic_nursery,
-        )));
+        let mut pacing = crate::gc_pacing::Pacing::new(self.nursery_bytes, dynamic_nursery);
+        pacing.set_max_heap_bytes(self.max_heap_bytes);
+        self.pacing = Some(Box::new(pacing));
     }
 
     /// The memory the heap holds from the system: its pages, spare ones included, and its large
@@ -2089,12 +2088,16 @@ impl Heap {
     }
 
     /// The heap's maximum, V8's maximum old generation size (`gc_pacing::max_heap_bytes`): with
-    /// pacing, each major collection's budget stops halfway from the bytes it kept to this
-    /// ([`crate::gc_pacing::bound_allocation_limit`]), but leaves at least V8's least room, so a
-    /// heap past its maximum keeps collecting, where V8 fails. Fixed budgets ignore it. It takes
-    /// effect at the next major collection.
+    /// pacing, each major collection grows the heap by at most V8's factor for it
+    /// ([`crate::gc_pacing::max_growing_factor`]), and its budget stops halfway from the bytes it
+    /// kept to this ([`crate::gc_pacing::bound_allocation_limit`]), but leaves at least 8 MiB of
+    /// room, as V8's global limit does, so a heap past its maximum keeps collecting, where V8
+    /// fails. Fixed budgets ignore it. It takes effect at the next major collection.
     pub(crate) fn set_max_heap_bytes(&mut self, bytes: usize) {
         self.max_heap_bytes = bytes;
+        if let Some(pacing) = &mut self.pacing {
+            pacing.set_max_heap_bytes(bytes);
+        }
     }
 
     pub(crate) fn stats(&self) -> GcStats {
@@ -8127,13 +8130,15 @@ mod tests {
     }
 
     /// With pacing, a major collection's budget is V8's limit: the bytes it kept grown by the
-    /// factor (4 here, with no promotion measured), at least 8 MiB more, plus the nursery, and
-    /// at most halfway to the heap's maximum, though never below that least room, so that a heap
-    /// past its maximum keeps collecting. An explicit growth keeps its own rule.
+    /// factor (with no promotion measured, the most V8 allows for the heap's maximum: 4 from a
+    /// 2 GiB maximum, under 2 below), at least 8 MiB more, plus the nursery, and at most halfway
+    /// to the heap's maximum, though never below the 8 MiB more, so that a heap past its maximum
+    /// keeps collecting. An explicit growth keeps its own rule.
     #[test]
-    fn paced_budgets_stop_halfway_to_the_heaps_maximum() {
+    fn paced_budgets_follow_v8s_limit_for_the_heaps_maximum() {
         const MB: usize = 1 << 20;
-        const NURSERY: usize = 4 << 10;
+        const GB: usize = 1 << 30;
+        const NURSERY: usize = 2 * MB;
         let mut fx = Fixture::new();
         fx.heap.set_collect_on_alloc(false);
         fx.heap.set_nursery_bytes(Some(NURSERY));
@@ -8145,14 +8150,18 @@ mod tests {
             fx.collect();
             fx.heap.stats().trigger_bytes
         };
-        // No maximum: four times the bytes kept, and the nursery.
+        // No maximum, or one of 2 GiB: four times the bytes kept, and the nursery.
         assert_eq!(budget(&mut fx, usize::MAX), 16 * MB + NURSERY);
-        // Halfway to 24 MiB.
-        assert_eq!(budget(&mut fx, 24 * MB), 14 * MB);
-        // Halfway to 8 MiB, or to 2 MiB, which the heap is past, would leave less room than
-        // 8 MiB and the nursery.
-        assert_eq!(budget(&mut fx, 8 * MB), 12 * MB + NURSERY);
-        assert_eq!(budget(&mut fx, 2 * MB), 12 * MB + NURSERY);
+        assert_eq!(budget(&mut fx, 2 * GB), 16 * MB + NURSERY);
+        // Just below 2 GiB the factor is under 2: the 8 MiB step, and the nursery.
+        assert_eq!(budget(&mut fx, 2 * GB - 1), 12 * MB + NURSERY);
+        // Halfway to 22 MiB.
+        assert_eq!(budget(&mut fx, 22 * MB), 13 * MB);
+        // Halfway to 20 MiB leaves the 8 MiB; halfway to 8 MiB, or to 2 MiB, which the heap is
+        // past, would leave less, and the budget keeps 8 MiB more without the nursery.
+        assert_eq!(budget(&mut fx, 20 * MB), 12 * MB);
+        assert_eq!(budget(&mut fx, 8 * MB), 12 * MB);
+        assert_eq!(budget(&mut fx, 2 * MB), 12 * MB);
         assert_eq!(fx.heap.stats().live_bytes, 4 * MB);
         // An explicit growth: twice the bytes kept, whatever the maximum.
         fx.heap.set_heap_growth(MB, 100);

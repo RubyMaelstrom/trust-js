@@ -126,10 +126,11 @@ fn gc_min_heap_bytes() -> usize {
     })
 }
 
-/// The heap's maximum, which with pacing bounds each major collection's byte budget at halfway
-/// from the bytes it kept (`gc_pacing::bound_allocation_limit`): V8's, from the physical memory
-/// as V8 reads it (`gc_pacing::max_heap_bytes`), read once. `TRUST_JS_GC_MAX_HEAP_BYTES=N`
-/// (diagnostic) replaces it as V8's `--max-old-space-size` does; 0 keeps V8's.
+/// The heap's maximum, which with pacing bounds each major collection's growing factor
+/// (`gc_pacing::max_growing_factor`) and its byte budget, at halfway from the bytes it kept
+/// (`gc_pacing::bound_allocation_limit`): V8's, from the physical memory as V8 reads it
+/// (`gc_pacing::max_heap_bytes`), read once. `TRUST_JS_GC_MAX_HEAP_BYTES=N` (diagnostic)
+/// replaces it as V8's `--max-old-space-size` does; 0 keeps V8's.
 fn gc_max_heap_bytes() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {

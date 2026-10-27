@@ -4,8 +4,9 @@
 //! src/heap/heap.cc), how large the nursery is (V8's young generation growth and shrinking,
 //! src/heap/heap.cc), and when an otherwise quiet heap is collected to give memory back (V8's
 //! `MemoryReducer`, src/heap/memory-reducer.cc). Constants and rules as of V8 296ba5e0
-//! (2026-10-26); the bound and the maximum are unchanged at e9a801ca (2026-10-27). Chrome runs
-//! no idle-time or periodic full collection; V8's memory reducer is the only time-based one.
+//! (2026-10-26); the bound, the maximum and the growing factor's maximum as of 96c72ad4
+//! (2026-10-27), where heap-controller.cc is as at 296ba5e0. Chrome runs no idle-time or
+//! periodic full collection; V8's memory reducer is the only time-based one.
 //!
 //! The policy is pure: [`Pacing`] holds what the heap measured (`gc_core::Heap` feeds it the
 //! collections' times and bytes), and the engine runs the memory reducer's timer when the host
@@ -23,8 +24,8 @@ pub(crate) const MIN_GROWING_FACTOR: f64 = 1.1;
 /// V8's `kConservativeGrowingFactor`: the most a heap grows while the memory reducer, having
 /// run, is done (V8's `kSlow` growing mode).
 const SLOW_GROWING_FACTOR: f64 = 1.3;
-/// V8's `kMaxGrowingFactor`: its factor for a heap whose limit is at least 2 GB on 64-bit
-/// targets.
+/// V8's `kMaxGrowingFactor`, the most a heap grows by: [`max_growing_factor`]'s for a heap whose
+/// maximum is at least 2 GB on 64-bit hosts (its `kHighFactor`).
 pub(crate) const MAX_GROWING_FACTOR: f64 = 4.0;
 /// V8's `kMinimumAllocationLimitGrowingStep`: a major collection leaves at least this much room.
 pub(crate) const MIN_GROWING_STEP: usize = 8 << 20;
@@ -33,6 +34,9 @@ pub(crate) const MIN_GROWING_STEP: usize = 8 << 20;
 /// hosts, 4 GB.
 const DEFAULT_MIN_HEAP_SIZE: u64 = 256 << 20;
 const DEFAULT_MAX_HEAP_SIZE: u64 = 4 << 30;
+/// V8's `Heap::HeapLimitMultiplier` (src/heap/heap.cc) off Android, where low-end devices take
+/// 1: `kSystemPointerSize / 4`, 2 on 64-bit hosts.
+const HEAP_LIMIT_MULTIPLIER: u64 = std::mem::size_of::<usize>() as u64 / 4;
 
 /// The nursery's first and smallest budget, to which a quiet heap returns (V8's semi-space
 /// starts at 1 MB; this engine's cells are larger).
@@ -74,16 +78,36 @@ pub(crate) fn dynamic_growing_factor(gc_speed: f64, mutator_speed: f64, max_fact
     factor.min(max_factor).max(MIN_GROWING_FACTOR)
 }
 
+/// V8's `MemoryController::MaxGrowingFactor`, the most [`dynamic_growing_factor`] may return
+/// (`MemoryController::GrowingFactor`) for a heap whose maximum is `max_heap_size` (see
+/// [`max_heap_bytes`]): [`MAX_GROWING_FACTOR`] from 1024 MB times V8's heap limit multiplier,
+/// 2 GB on 64-bit hosts; below that, as on smaller devices, 1.3 for a maximum of 256 MB or less,
+/// rising linearly toward 2 just below the threshold.
+pub(crate) fn max_growing_factor(max_heap_size: usize) -> f64 {
+    const MIN_SMALL_FACTOR: f64 = 1.3;
+    const MAX_SMALL_FACTOR: f64 = 2.0;
+    let threshold = (1024 << 20) * HEAP_LIMIT_MULTIPLIER;
+    let max_heap_size = max_heap_size as u64;
+    if max_heap_size >= threshold {
+        return MAX_GROWING_FACTOR;
+    }
+    let max_size = max_heap_size.max(DEFAULT_MIN_HEAP_SIZE);
+    MIN_SMALL_FACTOR
+        + (MAX_SMALL_FACTOR - MIN_SMALL_FACTOR) * (max_size - DEFAULT_MIN_HEAP_SIZE) as f64
+            / (threshold - DEFAULT_MIN_HEAP_SIZE) as f64
+}
+
 /// V8's `V8HeapTrait::BoundAllocationLimit`, which `HeapLimits::UpdateAllocationLimits` applies
 /// after every major collection: the heap's next limit, for a collection that kept `size` bytes,
 /// from `limit` (`size` grown by the growing factor). It leaves at least [`MIN_GROWING_STEP`] of
 /// room, adds the `nursery`'s budget (V8's new space capacity, which the next minor collection
 /// may promote), and is clamped between `minimum` and halfway from `size` to `maximum` (see
 /// [`max_heap_bytes`]), so that the heap collects more often as it nears its maximum. V8 fails
-/// with out-of-memory once its old generation reaches the maximum; the engine does not, so the
-/// halfway bound never takes the limit below `size` + [`MIN_GROWING_STEP`] + `nursery`, V8's
-/// least room, and a heap past its maximum keeps collecting at that room. The `minimum` (the
-/// budget's floor, `TRUST_JS_GC_MIN_HEAP_BYTES`) applies last.
+/// with out-of-memory once its old generation reaches the maximum; the engine does not, and
+/// keeps the floor of V8's global limit (`GlobalMemoryTrait::BoundAllocationLimit`, since V8
+/// 8f876708cf): the halfway bound never takes the limit below `size` + [`MIN_GROWING_STEP`], so
+/// a heap past its maximum keeps collecting at that room. The `minimum` (the budget's floor,
+/// `TRUST_JS_GC_MIN_HEAP_BYTES`) applies last.
 pub(crate) fn bound_allocation_limit(
     size: usize,
     limit: usize,
@@ -94,9 +118,7 @@ pub(crate) fn bound_allocation_limit(
     let least = size.saturating_add(MIN_GROWING_STEP);
     let limit = limit.max(least).saturating_add(nursery);
     let halfway = size.midpoint(maximum);
-    limit
-        .min(halfway.max(least.saturating_add(nursery)))
-        .max(minimum)
+    limit.min(halfway).max(least).max(minimum)
 }
 
 /// The heap's maximum, V8's maximum old generation size: `configured` when positive
@@ -168,6 +190,9 @@ pub(crate) struct Pacing {
     /// Whether a major collection's budget grows by the measured factor (off once an explicit
     /// setting fixes the growth).
     dynamic_growth: bool,
+    /// The heap's maximum, which bounds that factor ([`max_growing_factor`]); `usize::MAX`, the
+    /// default, allows [`MAX_GROWING_FACTOR`].
+    max_heap_bytes: usize,
     /// Bytes promoted since the nursery last grew: past its budget, it grows.
     survived_since_growth: usize,
     /// When the current collection started, the bytes allocated since the last one ended, and
@@ -200,6 +225,7 @@ impl Pacing {
             nursery,
             dynamic_nursery: dynamic_nursery && nursery.is_some(),
             dynamic_growth: true,
+            max_heap_bytes: usize::MAX,
             survived_since_growth: 0,
             started: None,
             mutator: None,
@@ -230,6 +256,12 @@ impl Pacing {
     /// return no factor, and the heap applies its own.
     pub(crate) fn fix_growth(&mut self) {
         self.dynamic_growth = false;
+    }
+
+    /// The heap's maximum is `bytes` (`Heap::set_max_heap_bytes`): major collections' factors
+    /// are at most V8's for it ([`max_growing_factor`]).
+    pub(crate) fn set_max_heap_bytes(&mut self, bytes: usize) {
+        self.max_heap_bytes = bytes;
     }
 
     /// Make the next collection reduce memory: minimal growth, the smallest nursery.
@@ -275,9 +307,10 @@ impl Pacing {
 
     /// The collection that `start` began ends at `now`, having marked `marked` bytes (a minor
     /// collection's are the bytes it promoted). For a major one, returns the factor by which
-    /// the heap may grow until the next (the caller applies [`MIN_GROWING_STEP`] and the
-    /// budget's floor). The heap then reports a major collection's memory to the reducer
-    /// ([`MemoryReducer::mark_compact`]), once it has trimmed its spare pages.
+    /// the heap may grow until the next, at most V8's for the heap's maximum (the caller applies
+    /// [`MIN_GROWING_STEP`], the halfway bound and the budget's floor). The heap then reports a
+    /// major collection's memory to the reducer ([`MemoryReducer::mark_compact`]), once it has
+    /// trimmed its spare pages.
     pub(crate) fn end(&mut self, now: Instant, major: bool, marked: usize) -> Option<f64> {
         let pause = self.started.take().map_or(Duration::ZERO, |started| {
             now.saturating_duration_since(started)
@@ -306,7 +339,7 @@ impl Pacing {
                     let factor = dynamic_growing_factor(
                         gc_speed.unwrap_or(0.0),
                         mutator_speed.unwrap_or(0.0),
-                        MAX_GROWING_FACTOR,
+                        max_growing_factor(self.max_heap_bytes),
                     );
                     if self.reducer.grow_slowly() {
                         factor.min(SLOW_GROWING_FACTOR)
@@ -587,11 +620,6 @@ mod tests {
         assert_eq!(limit(GB), 2560 * MB);
         assert_eq!(limit(2 * GB), 3 * GB);
         assert_eq!(limit(4072 * MB), 4084 * MB);
-        // Closer to the maximum, halfway would leave less room than V8 ever leaves (8 MB and the
-        // nursery), and at the maximum V8 fails: the engine keeps collecting at that room.
-        assert_eq!(limit(4080 * MB), 4092 * MB);
-        assert_eq!(limit(4 * GB), 4 * GB + 12 * MB);
-        assert_eq!(limit(6 * GB), 6 * GB + 12 * MB);
         // Without a nursery the bound binds at about 585 MB.
         let limit = |size: usize| bound_allocation_limit(size, 4 * size, 8 * MB, 4 * GB, 0);
         assert_eq!(limit(585 * MB), 2340 * MB);
@@ -607,17 +635,45 @@ mod tests {
         assert_eq!(bound_allocation_limit(0, 0, 0, 0, 0), MIN_GROWING_STEP);
     }
 
+    /// Within 16 MB of the maximum, halfway would leave less room than V8's global limit ever
+    /// leaves (`GlobalMemoryTrait::BoundAllocationLimit`): 8 MB, the nursery not added. Past the
+    /// maximum V8 fails; the engine keeps collecting with that room.
+    #[test]
+    fn near_and_past_the_maximum_the_limit_leaves_8_mb_of_room() {
+        const GB: usize = 1 << 30;
+        let limit = |size: usize| bound_allocation_limit(size, 4 * size, 8 * MB, 4 * GB, 4 * MB);
+        // Up to 16 MB below the maximum, halfway leaves at least the 8 MB.
+        assert_eq!(limit(4072 * MB), 4084 * MB);
+        assert_eq!(limit(4079 * MB), 4087 * MB + MB / 2);
+        assert_eq!(limit(4080 * MB), 4088 * MB);
+        // Closer, and past the maximum, the size and 8 MB.
+        assert_eq!(limit(4081 * MB), 4089 * MB);
+        assert_eq!(limit(4 * GB), 4 * GB + 8 * MB);
+        assert_eq!(limit(6 * GB), 6 * GB + 8 * MB);
+        // Whatever the nursery, however far past the maximum.
+        let past = |nursery, maximum| bound_allocation_limit(GB, 4 * GB, 8 * MB, maximum, nursery);
+        assert_eq!(past(32 * MB, 256 * MB), GB + 8 * MB);
+        assert_eq!(past(0, 0), GB + 8 * MB);
+        // The budget's floor still applies last.
+        assert_eq!(
+            bound_allocation_limit(GB, 4 * GB, 2 * GB, 256 * MB, 32 * MB),
+            2 * GB
+        );
+    }
+
     /// V8's own cases (test/unittests/heap/heap-controller-unittest.cc,
     /// `OldGenerationAllocationLimit`): 128 MB kept with a 512 MB maximum and a 16 MB new space,
-    /// grown by 1.4 (V8's largest factor for that maximum), and by 1.1 with a minimum of twice
-    /// the grown size, which wins.
+    /// grown by V8's factor for a collector 100 times faster than promotion (1.48, which that
+    /// maximum caps at 1.4), and by 1.1 with a minimum of twice the grown size, which wins.
     #[test]
     fn the_limit_passes_v8s_unit_test() {
         let (size, maximum, nursery) = (128 * MB, 512 * MB, 16 * MB);
         let grown = |factor: f64| (size as f64 * factor) as usize;
+        let factor = dynamic_growing_factor(100.0, 1.0, max_growing_factor(maximum));
+        assert!((factor - 1.4).abs() < 1e-9, "{factor}");
         assert_eq!(
-            bound_allocation_limit(size, grown(1.4), 0, maximum, nursery),
-            (size as f64 * 1.4 + nursery as f64) as usize
+            bound_allocation_limit(size, grown(factor), 0, maximum, nursery),
+            (size as f64 * factor + nursery as f64) as usize
         );
         let minimum = 2 * grown(MIN_GROWING_FACTOR);
         assert_eq!(
@@ -643,6 +699,47 @@ mod tests {
         assert_eq!(max_heap_bytes(Some(512 << 20), 128 * GB), 512 << 20);
         assert_eq!(max_heap_bytes(Some(8 << 30), GB), 8 << 30);
         assert_eq!(max_heap_bytes(Some(0), 128 * GB), 4 << 30);
+    }
+
+    /// V8's `MaxGrowingFactor` (V8's `MaxHeapGrowingFactor` cases, at 256 MB, 1 GB, 2 GB less a
+    /// byte, 2 GB and 4 GB, and the thresholds' neighbours): 1.3 up to a 256 MB maximum, rising
+    /// linearly toward 2 below 2 GB, and 4 from 2 GB.
+    #[test]
+    fn the_growing_factors_maximum_is_v8s_for_the_heaps_maximum() {
+        const GB: usize = 1 << 30;
+        let close = |maximum: usize, expected: f64| {
+            let factor = max_growing_factor(maximum);
+            assert!((factor - expected).abs() < 1e-9, "{maximum}: {factor}");
+        };
+        // At 256 MB and below, 1.3; just above, a little more.
+        assert_eq!(max_growing_factor(0), 1.3);
+        assert_eq!(max_growing_factor(256 * MB - 1), 1.3);
+        assert_eq!(max_growing_factor(256 * MB), 1.3);
+        let above = max_growing_factor(256 * MB + 1);
+        assert!(above > 1.3 && above < 1.3 + 1e-9, "{above}");
+        // Linearly between.
+        close(512 * MB, 1.4);
+        close(GB, 1.6);
+        close(3 * GB / 2, 1.8);
+        // Just below 2 GB, almost 2; at 2 GB and above, 4.
+        let below = max_growing_factor(2 * GB - 1);
+        assert!(below < 2.0 && below > 2.0 - 1e-9, "{below}");
+        assert_eq!(max_growing_factor(2 * GB), MAX_GROWING_FACTOR);
+        assert_eq!(max_growing_factor(2 * GB + 1), MAX_GROWING_FACTOR);
+        assert_eq!(max_growing_factor(4 * GB), MAX_GROWING_FACTOR);
+        assert_eq!(max_growing_factor(usize::MAX), MAX_GROWING_FACTOR);
+        // With V8's maximum from physical memory, 4 needs 4 GB of memory; a small
+        // `TRUST_JS_GC_MAX_HEAP_BYTES` lowers the factor's maximum with the heap's.
+        let from_memory = |physical: u64| max_growing_factor(max_heap_bytes(None, physical));
+        assert_eq!(from_memory(16 << 30), MAX_GROWING_FACTOR);
+        assert_eq!(from_memory(4 << 30), MAX_GROWING_FACTOR);
+        assert!(from_memory((4 << 30) - (1 << 20)) < 2.0);
+        close(max_heap_bytes(None, 2 << 30), 1.6);
+        assert_eq!(from_memory(0), 1.3);
+        let configured = |bytes: usize| max_heap_bytes(Some(bytes), 128 << 30);
+        assert_eq!(max_growing_factor(configured(64 * MB)), 1.3);
+        close(configured(GB), 1.6);
+        assert_eq!(max_growing_factor(configured(8 * GB)), MAX_GROWING_FACTOR);
     }
 
     /// A minor collection at `*now` that promotes `promoted` of `allocated` bytes allocated over
@@ -902,5 +999,33 @@ mod tests {
             ),
             Some(SLOW_GROWING_FACTOR)
         );
+    }
+
+    /// A major collection's factor is at most V8's for the heap's maximum: with no promotion
+    /// measured, 1.6 for a 1 GB maximum where it would be 4, and 4 again from 2 GB; growing
+    /// slowly, still 1.3.
+    #[test]
+    fn the_heaps_maximum_bounds_a_major_collections_factor() {
+        const GB: usize = 1 << 30;
+        let t0 = Instant::now();
+        let mut now = t0;
+        let mut pacing = Pacing::new(Some(MIN_NURSERY_BYTES), false);
+        let mut major = |pacing: &mut Pacing| {
+            pacing.start(now, 0);
+            now += Duration::from_millis(10);
+            pacing.end(now, true, 100 * MB)
+        };
+        pacing.set_max_heap_bytes(GB);
+        let factor = major(&mut pacing).unwrap();
+        assert_eq!(factor, max_growing_factor(GB));
+        assert!((factor - 1.6).abs() < 1e-9, "{factor}");
+        pacing.set_max_heap_bytes(2 * GB);
+        assert_eq!(major(&mut pacing), Some(MAX_GROWING_FACTOR));
+        pacing.set_max_heap_bytes(GB);
+        pacing.reducer = MemoryReducer::Done {
+            last_gc: Some(t0),
+            committed_at_last_run: 100 * MB,
+        };
+        assert_eq!(major(&mut pacing), Some(SLOW_GROWING_FACTOR));
     }
 }
