@@ -254,7 +254,8 @@ comment/example in the same change.
   the shape and prototype RegExpAlloc gave it skip their lookups: String.prototype's `match`,
   `matchAll`, `replace`, `replaceAll`, `search` and `split` then call the RegExp algorithms
   directly, RegExpExec calls RegExpBuiltinExec, and the direct replace, split, test, flags and
-  dead-result paths need no other guard. With the switch set, every one of them takes the
+  dead-result paths need no other guard. A RegExp of that shape holding a plain Number in
+  `lastIndex` reads and writes it at its slot. With the switch set, every one of them takes the
   observable steps.
 
 The fast paths' switches exist so that a workload can run with each forced off and be compared,

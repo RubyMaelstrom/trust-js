@@ -322,6 +322,66 @@ fn regexp_fast_paths_yield_to_observable_lookups() {
     );
 }
 
+/// A RegExp of the shape RegExpAlloc gave it reads and writes `lastIndex` at its slot when it
+/// holds a plain Number; any other value, a RegExp with another own property and a
+/// non-writable `lastIndex` keep ToLength and [[Set]]. An object of that shape that is no RegExp
+/// still reaches the intrinsic symbol methods, which find no matcher, and the legacy statics
+/// follow every path's matches.
+#[test]
+fn last_index_at_its_slot_keeps_the_observable_steps() {
+    check(
+        r###"
+        (function () {
+        function run() {
+            var r = [];
+            function attempt(f) { try { return f(); } catch (e) { return e.name; } }
+            var fake = Object.create(RegExp.prototype);
+            fake.lastIndex = 0;
+            r.push(attempt(function () { return 'x'.replace(fake, 'y'); }),
+                attempt(function () { return 'x'.match(fake); }),
+                attempt(function () { return 'x'.split(fake); }),
+                attempt(function () { return 'x'.search(fake); }),
+                attempt(function () { return RegExp.prototype.exec.call(fake, 'x'); }));
+            var extra = /a/g;
+            extra.note = 1;
+            r.push([extra.exec('aaa').index, extra.lastIndex, extra.test('aaa'), extra.lastIndex,
+                'aaa'.replace(extra, 'b'), extra.lastIndex].join());
+            var y = /a/y;
+            var values = [1.5, -1, '1', 2 ** 53 + 2, { valueOf: function () { return 1; } }, NaN, Infinity];
+            r.push(values.map(function (v) {
+                y.lastIndex = v;
+                var m = y.exec('aa');
+                return (m ? m.index : 'null') + ':' + y.lastIndex;
+            }).join(' '));
+            var g = /a/g;
+            r.push(values.map(function (v) {
+                g.lastIndex = v;
+                var hit = g.test('aa');
+                return hit + ':' + g.lastIndex;
+            }).join(' '));
+            var ys = /b/y;
+            ys.lastIndex = 1;
+            r.push(['abab'.replace(ys, 'X'), ys.lastIndex, 'abab'.replace(ys, 'X'), ys.lastIndex].join());
+            /(\d)(\d)/.exec('a12b');
+            r.push([RegExp.$1, RegExp.$2, RegExp.lastMatch, RegExp['$`'], RegExp["$'"]].join());
+            'x34y'.replace(/(\d)(\d)/, '');
+            r.push([RegExp.$1, RegExp.$2, RegExp.lastMatch].join());
+            'p5q'.match(/(\d)/);
+            r.push([RegExp.$1, RegExp.lastMatch, RegExp.input].join());
+            /(z)/.test('z');
+            r.push(RegExp.$1);
+            var frozen = /a/g;
+            Object.defineProperty(frozen, 'lastIndex', { value: 0, writable: false });
+            r.push(attempt(function () { return frozen.exec('a'); }), attempt(function () { return 'a'.replace(frozen, 'b'); }));
+            return r.join(';');
+        }
+        return run();
+        })()
+        "###,
+        r###"TypeError;TypeError;TypeError;TypeError;TypeError;0,1,true,2,bbb,0;1:2 0:1 1:2 null:0 1:2 0:1 null:0;true:2 true:1 true:2 false:0 true:2 true:1 false:0;aXab,2,abab,0;1,2,12,a,b;3,4,34;5,5,p5q;z;TypeError;TypeError"###,
+    );
+}
+
 /// The RegExp protector proves %RegExp.prototype%'s methods and `constructor` by identity at
 /// each use: assigning one changes no structure and bumps no epoch, yet String.prototype's
 /// methods and RegExpExec observe it at once, and the intrinsic paths return once it is

@@ -360,22 +360,7 @@ pub(super) fn intrinsic_regexp(
 ) -> Option<(Gc, Rc<crate::regex::Regex>)> {
     let object = value.as_obj()?;
     with_regexp_proof(i, |proof, pins, prototype| {
-        {
-            let body = object.borrow();
-            if body.props.shape() != proof.instance_shape
-                || !crate::value::is_cacheable_shape(proof.instance_shape)
-                || !body
-                    .proto
-                    .as_ref()
-                    .is_some_and(|p| Gc::ptr_eq(p, prototype))
-            {
-                return None;
-            }
-        }
-        if !members
-            .iter()
-            .all(|&member| proof.holds(pins, prototype, member))
-        {
+        if !intrinsic_receiver(proof, pins, prototype, &object, members) {
             return None;
         }
         let re = i.regexps.get(&(Gc::as_ptr(&object) as usize))?.clone();
@@ -383,17 +368,114 @@ pub(super) fn intrinsic_regexp(
     })
 }
 
-/// `lastIndex` of a RegExp of RegExpAlloc's shape (its only own property, at slot 0) when
-/// ToLength of it runs no code and writing it cannot throw: a writable data property holding a
-/// non-negative integral Number.
+/// Whether GetMethod of `member` on `value` finds %RegExp.prototype%'s intrinsic without
+/// running code, under the RegExp protector: `value` has the shape RegExpAlloc gives a RegExp
+/// (no own property but `lastIndex`) and %RegExp.prototype% as its prototype. It need not be a
+/// RegExp: the method then checks what it reads, as it would after the lookup.
+pub(super) fn dispatches_to_intrinsic(i: &Interp, value: &Value, member: RegexpMember) -> bool {
+    value.as_obj().is_some_and(|object| {
+        with_regexp_proof(i, |proof, pins, prototype| {
+            intrinsic_receiver(proof, pins, prototype, &object, &[member]).then_some(())
+        })
+        .is_some()
+    })
+}
+
+/// Whether `object` has RegExpAlloc's shape and `prototype` (%RegExp.prototype%) as its
+/// prototype, and `members` still hold their intrinsics.
+fn intrinsic_receiver(
+    proof: &RegexpProof,
+    pins: &RegexpPins,
+    prototype: &Gc,
+    object: &Gc,
+    members: &[RegexpMember],
+) -> bool {
+    {
+        let body = object.borrow();
+        if body.props.shape() != proof.instance_shape
+            || !crate::value::is_cacheable_shape(proof.instance_shape)
+            || !body
+                .proto
+                .as_ref()
+                .is_some_and(|p| Gc::ptr_eq(p, prototype))
+        {
+            return false;
+        }
+    }
+    members
+        .iter()
+        .all(|&member| proof.holds(pins, prototype, member))
+}
+
+/// The slot of `lastIndex` in a RegExp of the shape RegExpAlloc gives it: its only own property.
+const LAST_INDEX_SLOT: usize = 0;
+
+/// The shape RegExpAlloc gives every RegExp, whose only own property is `lastIndex`, a writable
+/// data property, at [`LAST_INDEX_SLOT`]; `None` before one is known, or under
+/// `TRUST_JS_REGEXP_NO_PROTECTOR=1` (see [`with_regexp_proof`]).
+fn alloc_shape(i: &Interp) -> Option<u32> {
+    let shape = i.regexp_protector.borrow().instance_shape;
+    (crate::value::is_cacheable_shape(shape) && !env_flag!("TRUST_JS_REGEXP_NO_PROTECTOR"))
+        .then_some(shape)
+}
+
+/// Whether `object` has the shape RegExpAlloc gives every RegExp ([`alloc_shape`]).
+pub(super) fn alloc_shaped(i: &Interp, object: &Gc) -> bool {
+    alloc_shape(i).is_some_and(|shape| object.borrow().props.shape() == shape)
+}
+
+/// `lastIndex` of a RegExp of RegExpAlloc's shape ([`alloc_shaped`]) when ToLength of it runs no
+/// code and writing it cannot throw: a writable data property holding a non-negative integral
+/// Number.
 pub(super) fn plain_last_index(object: &Gc) -> Option<f64> {
+    plain_number(object.borrow().props.property_at(LAST_INDEX_SLOT)?)
+}
+
+/// [`plain_last_index`] of `object` when it is [`alloc_shaped`], checked under one borrow.
+pub(super) fn slot_last_index(i: &Interp, object: &Gc) -> Option<f64> {
+    let shape = alloc_shape(i)?;
     let body = object.borrow();
-    let last = body.props.property_at(0)?;
+    if body.props.shape() != shape {
+        return None;
+    }
+    plain_number(body.props.property_at(LAST_INDEX_SLOT)?)
+}
+
+fn plain_number(last: &Property) -> Option<f64> {
     if !last.writable() {
         return None;
     }
     last.number_value()
         .filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0)
+}
+
+/// Write `lastIndex` of a RegExp of RegExpAlloc's shape at its slot: OrdinarySet of a writable
+/// own data property, which runs no code and cannot fail.
+pub(super) fn set_last_index_at_slot(object: &Gc, n: f64) {
+    let mut body = object.borrow_mut();
+    debug_assert!(body
+        .props
+        .property_at(LAST_INDEX_SLOT)
+        .is_some_and(|last| last.writable() && !last.accessor()));
+    body.props.set_value_at(LAST_INDEX_SLOT, Value::Num(n));
+}
+
+/// The running Realm's %RegExp%, whose legacy static properties a successful match updates.
+/// The RegExp protector's pins, whatever the epoch, are the running Realm's (another Realm's
+/// entry invalidates them), and its `constructor` member was %RegExp%. Without pins the proof is
+/// established, and where it fails the intrinsic is looked up.
+pub(super) fn realm_regexp_constructor(i: &Interp) -> Option<Gc> {
+    let constructor =
+        |pins: &RegexpPins| pins.members[RegexpMember::Constructor as usize].upgrade();
+    let pinned = i
+        .regexp_protector
+        .borrow()
+        .pins
+        .as_deref()
+        .and_then(constructor);
+    pinned
+        .or_else(|| with_regexp_proof(i, |_, pins, _| constructor(pins)))
+        .or_else(|| i.extra_protos.get("%RegExpCtor%").copied())
 }
 
 /// Read the engine-owned flags of a RegExp without dispatching the `flags` getter, when the
@@ -829,6 +911,13 @@ fn require_regexp_this(i: &mut Interp, this: &Value, name: &str) -> Result<(), V
 pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.match]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
+    // An intrinsic RegExp's `flags` are its own and RegExpExec is RegExpBuiltinExec: without `g`
+    // the match is one exec, by the matcher just read.
+    if let Some((_, re)) = intrinsic_regexp(i, &this, &[RegexpMember::Exec]) {
+        if !re.global {
+            return regexp_builtin_exec(i, this, s, Some(re));
+        }
+    }
     let (flags, unicode) = match direct_reg_exp_flags(i, &this) {
         Some(re) => {
             let flags = re.flags.clone();
@@ -884,9 +973,7 @@ pub(super) fn re_sym_match_discard_direct(
     let global = re.global;
     let unicode = re.unicode;
     if global {
-        obj.borrow_mut()
-            .props
-            .set_value("lastIndex", Value::Num(0.0));
+        set_last_index_at_slot(obj, 0.0);
     }
     loop {
         let matched = regexp_exec_discard_direct(i, obj, re, input)?;
@@ -899,16 +986,9 @@ pub(super) fn re_sym_match_discard_direct(
             .and_then(|last| last.caps.first().copied().flatten())
             .is_some_and(|(start, end)| start == end);
         if empty {
-            let li = match (obj.borrow().props.get("lastIndex").map(Property::value))
-                .map(|__value| (__value).view())
-            {
-                Some(ValueView::Num(n)) => n as usize,
-                _ => unreachable!("direct match lastIndex guard"),
-            };
+            let li = plain_last_index(obj).expect("direct match lastIndex guard") as usize;
             let next = advance_string_index(li, input, unicode);
-            obj.borrow_mut()
-                .props
-                .set_value("lastIndex", Value::Num(next as f64));
+            set_last_index_at_slot(obj, next as f64);
         }
     }
     Ok(Value::Undefined)
@@ -947,9 +1027,7 @@ pub(super) fn re_sym_replace_discard_direct(
     let global = re.global;
     let unicode = re.unicode;
     if global {
-        obj.borrow_mut()
-            .props
-            .set_value("lastIndex", Value::Num(0.0));
+        set_last_index_at_slot(obj, 0.0);
     }
     loop {
         let matched = regexp_exec_discard_direct(i, obj, re, input)?;
@@ -962,16 +1040,9 @@ pub(super) fn re_sym_replace_discard_direct(
             .and_then(|last| last.caps.first().copied().flatten())
             .is_some_and(|(start, end)| start == end);
         if empty {
-            let li = match (obj.borrow().props.get("lastIndex").map(Property::value))
-                .map(|__value| (__value).view())
-            {
-                Some(ValueView::Num(n)) => n as usize,
-                _ => unreachable!("direct replace lastIndex guard"),
-            };
+            let li = plain_last_index(obj).expect("direct replace lastIndex guard") as usize;
             let next = advance_string_index(li, input, unicode);
-            obj.borrow_mut()
-                .props
-                .set_value("lastIndex", Value::Num(next as f64));
+            set_last_index_at_slot(obj, next as f64);
         }
     }
     Ok(Value::Undefined)
@@ -1214,17 +1285,10 @@ fn re_sym_replace_direct(
     template: &crate::lstr::LStr,
 ) -> Result<Value, Value> {
     let uses_last = re.global || re.sticky;
-    let read_last = |obj: &Gc| match (obj.borrow().props.get("lastIndex").map(Property::value))
-        .map(|__value| (__value).view())
-    {
-        Some(ValueView::Num(n)) => n as usize,
-        _ => unreachable!("direct replace lastIndex guard"),
-    };
-    let set_last = |obj: &Gc, n: usize| {
-        obj.borrow_mut()
-            .props
-            .set_value("lastIndex", Value::Num(n as f64));
-    };
+    // `lastIndex` stays at its slot: no code runs between the guard and the last write.
+    let read_last =
+        |obj: &Gc| plain_last_index(obj).expect("direct replace lastIndex guard") as usize;
+    let set_last = |obj: &Gc, n: usize| set_last_index_at_slot(obj, n as f64);
     let text = i.re_text(re.unicode, s);
     let size = text.unit_index(text.len());
     if re.global {

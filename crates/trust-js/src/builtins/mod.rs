@@ -2301,9 +2301,9 @@ fn advance_string_index(index: usize, s: &crate::lstr::LStr, unicode: bool) -> u
 /// otherwise fall back to the built-in `RegExp.prototype.exec` (which requires a real RegExp).
 fn regexp_exec_abstract(i: &mut Interp, r: &Value, s: crate::lstr::LStr) -> Result<Value, Value> {
     // Under the RegExp protector the Get of `exec` finds the intrinsic, which returns an Object
-    // or null: RegExpExec is RegExpBuiltinExec (ECMA-262 §22.2.7.1).
-    if regexp::intrinsic_regexp(i, r, &[regexp::RegexpMember::Exec]).is_some() {
-        return regexp_exec(i, *r, &[Value::Str(s)]);
+    // or null: RegExpExec is RegExpBuiltinExec (ECMA-262 §22.2.7.1), with the matcher just read.
+    if let Some((_, re)) = regexp::intrinsic_regexp(i, r, &[regexp::RegexpMember::Exec]) {
+        return regexp_builtin_exec(i, *r, s, Some(re));
     }
     let exec = ab(i.get_member_key(r, "exec"))?;
     if exec.is_callable() {
@@ -2489,43 +2489,77 @@ fn regexp_array(i: &mut Interp, kind: RegexpArray, items: Vec<Value>, named: &[V
 /// `lastIndex` for global/sticky regexes.
 pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let ptr = map_ptr(&this).ok_or_else(|| i.make_error("TypeError", "exec on non-RegExp"))?;
-    if !i.regexps.contains_key(&ptr) {
-        return Err(i.make_error("TypeError", "exec on non-RegExp"));
-    }
-    let input = ab(i.to_string(&arg(args, 0)))?;
-    // lastIndex is read (and length-coerced) unconditionally; it only *steers* the match when
-    // the regexp is global or sticky. Its valueOf can recompile the regexp (`compile()`), so the
-    // matcher slot is only sampled afterwards. Reading an own non-accessor `lastIndex` (its
-    // invariable shape — it is non-configurable) skips the [[Get]] machinery.
-    let li = {
-        let own = match &(this).view() {
-            ValueView::Obj(o) => {
-                let b = o.borrow();
-                b.props
-                    .get("lastIndex")
-                    .filter(|p| !p.accessor())
-                    .map(|p| p.value())
-            }
-            _ => None,
-        };
-        match own {
-            Some(v) => v,
-            None => ab(i.get_member_key(&this, "lastIndex"))?,
-        }
-    };
-    let read_units = to_length_val(i, &li)?;
-    let re = i
+    let matcher = i
         .regexps
         .get(&ptr)
         .cloned()
         .ok_or_else(|| i.make_error("TypeError", "exec on non-RegExp"))?;
+    let subject = arg(args, 0);
+    // ToString of a String runs no code, so nothing can have recompiled the matcher (`compile()`)
+    // by the time RegExpBuiltinExec reads it.
+    let unchanged = matches!(subject.view(), ValueView::Str(_));
+    let input = ab(i.to_string(&subject))?;
+    regexp_builtin_exec(i, this, input, unchanged.then_some(matcher))
+}
+
+/// RegExpBuiltinExec(R, S) (ECMA-262 §22.2.7.2) for a RegExp `this`. `matcher` is R's
+/// [[RegExpMatcher]] when the caller read it and no code can have run since.
+fn regexp_builtin_exec(
+    i: &mut Interp,
+    this: Value,
+    input: crate::lstr::LStr,
+    matcher: Option<Rc<crate::regex::Regex>>,
+) -> Result<Value, Value> {
+    // lastIndex is read (and length-coerced) unconditionally; it only *steers* the match when
+    // the regexp is global or sticky. A RegExp of the shape RegExpAlloc gave it, holding a plain
+    // Number, reads and writes it at its slot: ToLength runs no code and the write cannot fail.
+    // Otherwise its valueOf can recompile the regexp (`compile()`), so the matcher is only
+    // sampled afterwards, and reading an own non-accessor `lastIndex` (non-configurable, so it
+    // stays one) skips the [[Get]] machinery.
+    let at_slot = this
+        .as_obj()
+        .and_then(|object| Some((object, regexp::slot_last_index(i, &object)?)));
+    let (read_units, matcher) = match at_slot {
+        Some((_, n)) => (n.min(9_007_199_254_740_991.0) as usize, matcher),
+        None => {
+            let own = this.as_obj().and_then(|o| {
+                o.borrow()
+                    .props
+                    .get("lastIndex")
+                    .filter(|p| !p.accessor())
+                    .map(|p| p.value())
+            });
+            let li = match own {
+                Some(v) => v,
+                None => ab(i.get_member_key(&this, "lastIndex"))?,
+            };
+            (to_length_val(i, &li)?, None)
+        }
+    };
+    let re = match matcher {
+        Some(re) => re,
+        None => {
+            let ptr = map_ptr(&this).unwrap_or(0);
+            i.regexps
+                .get(&ptr)
+                .cloned()
+                .ok_or_else(|| i.make_error("TypeError", "exec on non-RegExp"))?
+        }
+    };
+    let set_last = |i: &mut Interp, units: usize| match &at_slot {
+        Some((object, _)) => {
+            regexp::set_last_index_at_slot(object, units as f64);
+            Ok(())
+        }
+        None => set_throw(i, &this, "lastIndex", Value::Num(units as f64)),
+    };
     // Elements are code units (non-unicode) or code points (u/v); JS-visible indices are units.
     let text = i.re_text(re.unicode, &input);
     let use_last = re.global || re.sticky;
     let last_units = if use_last { read_units } else { 0 };
     if last_units > text.unit_index(text.len()) {
         if use_last {
-            set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
+            set_last(i, 0)?;
         }
         return Ok(Value::Null);
     }
@@ -2534,19 +2568,14 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
     match regexp_match_result(i, matched)? {
         None => {
             if use_last {
-                set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
+                set_last(i, 0)?;
             }
             Ok(Value::Null)
         }
         Some(caps) => {
             let (start, end) = caps[0].unwrap();
             if use_last {
-                set_throw(
-                    i,
-                    &this,
-                    "lastIndex",
-                    Value::Num(text.unit_index(end) as f64),
-                )?;
+                set_last(i, text.unit_index(end))?;
             }
             update_regexp_legacy_statics(i, &re, &caps, &text, &input);
             let mut items = Vec::with_capacity(re.ngroups + 1);
@@ -2660,57 +2689,30 @@ pub(crate) fn regexp_exec_discard_fast(
     };
     let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr)?.clone();
-    {
-        let b = obj.borrow();
-        if !matches!(b.exotic, Exotic::None) {
-            return None;
-        }
-        let p = b.props.get("lastIndex")?;
-        if p.accessor() || !p.writable() {
-            return None;
-        }
-        match (p.value()).view() {
-            ValueView::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => {}
-            _ => return None,
-        }
-    }
+    regexp::slot_last_index(i, obj)?;
     Some(regexp_exec_discard_direct(i, obj, &re, input))
 }
 
 /// Committed half of [`regexp_exec_discard_fast`] for a caller that has already proven the
-/// direct ordinary RegExp object and pinned its matcher. No JavaScript runs during this routine,
-/// so a structural loop helper can validate those guards once and reuse them for every subject.
+/// direct ordinary RegExp object of RegExpAlloc's shape, with a plain `lastIndex`, and pinned
+/// its matcher. No JavaScript runs during this routine, so a structural loop helper can validate
+/// those guards once and reuse them for every subject, and `lastIndex` stays at its slot.
 pub(crate) fn regexp_exec_discard_direct(
     i: &mut Interp,
     obj: &Gc,
     re: &Rc<crate::regex::Regex>,
     input: &crate::lstr::LStr,
 ) -> Result<bool, Value> {
+    debug_assert!(regexp::alloc_shaped(i, obj));
     let use_last = re.global || re.sticky;
     let read_units = if use_last {
-        let b = obj.borrow();
-        match (b
-            .props
-            .get("lastIndex")
-            .expect("direct regexp lastIndex")
-            .value())
-        .view()
-        {
-            ValueView::Num(n) => n as usize,
-            _ => unreachable!("direct regexp lastIndex guard"),
-        }
+        regexp::plain_last_index(obj).expect("direct regexp lastIndex guard") as usize
     } else {
         0
     };
     let text = i.re_text(re.unicode, input);
     let last_units = if use_last { read_units } else { 0 };
-    let set_last = |n: usize| {
-        let mut b = obj.borrow_mut();
-        assert!(
-            b.props.set_value("lastIndex", Value::Num(n as f64)),
-            "guarded lastIndex"
-        );
-    };
+    let set_last = |n: usize| regexp::set_last_index_at_slot(obj, n as f64);
     if last_units > text.unit_index(text.len()) {
         if use_last {
             set_last(0);
@@ -2876,9 +2878,8 @@ fn update_regexp_legacy_statics(
     text: &Rc<crate::regex::ReText>,
     input: &crate::lstr::LStr,
 ) {
-    let ctor = match i.extra_protos.get("%RegExpCtor%") {
-        Some(c) => *c,
-        None => return,
+    let Some(ctor) = regexp::realm_regexp_constructor(i) else {
+        return;
     };
     if let Some(prev) = &i.regexp_last {
         if prev.ctor.as_ptr() != Gc::as_ptr(&ctor) {
@@ -2916,9 +2917,8 @@ fn update_regexp_legacy_statics_lazy(
     text: &Rc<crate::regex::ReText>,
     input: &crate::lstr::LStr,
 ) {
-    let ctor = match i.extra_protos.get("%RegExpCtor%") {
-        Some(c) => *c,
-        None => return,
+    let Some(ctor) = regexp::realm_regexp_constructor(i) else {
+        return;
     };
     if let Some(prev) = &i.regexp_last {
         if prev.ctor.as_ptr() != Gc::as_ptr(&ctor) {
@@ -10992,7 +10992,7 @@ pub(crate) fn nf_string_replace(
     // RegExp's is RegExp.prototype[@@replace], which GetMethod finds running no code.
     let search = arg(args, 0);
     if matches!((search).view(), ValueView::Obj(_)) {
-        if regexp::intrinsic_regexp(i, &search, &[regexp::RegexpMember::Replace]).is_some() {
+        if regexp::dispatches_to_intrinsic(i, &search, regexp::RegexpMember::Replace) {
             return regexp::re_sym_replace(i, search, &[this, arg(args, 1)]);
         }
         if let Some(key) = well_known_key(i, "replace") {
@@ -11084,7 +11084,7 @@ pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Resul
     }
     let regexp = arg(a, 0);
     if matches!((regexp).view(), ValueView::Obj(_)) {
-        if regexp::intrinsic_regexp(i, &regexp, &[regexp::RegexpMember::Match]).is_some() {
+        if regexp::dispatches_to_intrinsic(i, &regexp, regexp::RegexpMember::Match) {
             return regexp::re_sym_match(i, regexp, std::slice::from_ref(&this));
         }
         if let Some(key) = well_known_key(i, "match") {
@@ -11120,7 +11120,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
     }
     let separator = arg(args, 0);
     if matches!((separator).view(), ValueView::Obj(_)) {
-        if regexp::intrinsic_regexp(i, &separator, &[regexp::RegexpMember::Split]).is_some() {
+        if regexp::dispatches_to_intrinsic(i, &separator, regexp::RegexpMember::Split) {
             return regexp::re_sym_split(i, separator, &[this, arg(args, 1)]);
         }
         if let Some(key) = well_known_key(i, "split") {
@@ -11856,7 +11856,7 @@ fn install_string(it: &mut Interp) {
         }
         let regexp = arg(a, 0);
         if matches!((regexp).view(), ValueView::Obj(_)) {
-            if regexp::intrinsic_regexp(i, &regexp, &[regexp::RegexpMember::Search]).is_some() {
+            if regexp::dispatches_to_intrinsic(i, &regexp, regexp::RegexpMember::Search) {
                 return regexp::re_sym_search(i, regexp, std::slice::from_ref(&this));
             }
             if let Some(key) = well_known_key(i, "search") {
