@@ -241,6 +241,7 @@ fn simple_and_forwarded_initializers_copy_an_immutable_argument_window() {
             id: u64::MAX,
             description: None,
             weak_observers: Default::default(),
+            agent_held: Default::default(),
         })),
         Value::Obj(engine.interp.new_object()),
     ]);

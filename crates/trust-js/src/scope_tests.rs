@@ -870,6 +870,7 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
                 id: u64::MAX - count as u64,
                 description: None,
                 weak_observers: Default::default(),
+                agent_held: Default::default(),
             })),
             Internal::Undefined,
             Internal::Null,

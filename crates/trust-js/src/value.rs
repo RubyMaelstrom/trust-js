@@ -1075,6 +1075,9 @@ pub struct SymbolData {
     pub id: u64,
     pub description: Option<Rc<str>>,
     pub(crate) weak_observers: RefCell<Option<Box<crate::weak_metadata::DeathObservers>>>,
+    /// The Agent holds this Symbol for its whole life (a well-known or registered Symbol), so
+    /// a property key it names needs no owner of its own (`DenseStorage::retain_symbol_key`).
+    pub(crate) agent_held: Cell<bool>,
 }
 
 impl Drop for SymbolData {
@@ -6329,7 +6332,7 @@ impl DenseStorage {
         let Some(id) = key.symbol_id() else {
             return;
         };
-        let Some(symbol) = active_symbol(id) else {
+        let Some(symbol) = active_symbol(id).filter(|symbol| !symbol.agent_held.get()) else {
             return;
         };
         let extras = self.extras_mut();

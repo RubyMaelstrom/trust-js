@@ -6296,6 +6296,7 @@ impl Interp {
             id: agent.next_id,
             description,
             weak_observers: RefCell::new(None),
+            agent_held: std::cell::Cell::new(false),
         });
         agent
             .symbols
@@ -6326,6 +6327,7 @@ impl Interp {
         };
         let mut agent = self.symbol_agent.borrow_mut();
         agent.global_key_by_id.insert(symbol.id, key.clone());
+        symbol.agent_held.set(true);
         agent.global_by_key.insert(key, symbol);
         symbol
     }
@@ -6358,6 +6360,7 @@ impl Interp {
                 else {
                     unreachable!("new_symbol must return a symbol")
                 };
+                symbol.agent_held.set(true);
                 self.symbol_agent
                     .borrow_mut()
                     .well_known
