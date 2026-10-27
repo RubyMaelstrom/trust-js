@@ -1,6 +1,6 @@
-//! Reflect.get and Reflect.has (ECMA-262 §28.1.6, §28.1.9) through the ordinary property paths:
-//! keys taken without a key string and reads through the property ICs' stub cache, each with the
-//! steps they may not skip.
+//! Reflect.get, Reflect.has and Reflect.set (ECMA-262 §28.1.6, §28.1.9, §28.1.13) through the
+//! ordinary property paths: keys taken without a key string, reads through the property ICs'
+//! stub cache, and own data writes in place, each with the steps they may not skip.
 
 use crate::bytecode::Tier;
 use crate::{Completion, Engine};
@@ -115,6 +115,70 @@ fn reflect_has_shares_the_in_operator() {
         var key = { toString() { converted++; return 'own'; } };
         try { Reflect.has(1, key); assert(false, 'no TypeError'); } catch (e) { assert(e instanceof TypeError, 'TypeError'); }
         assert(converted === 0 && Reflect.has(o, key) && converted === 1, 'converted once, after the check');
+        'ok'
+    "#
+    ));
+}
+
+#[test]
+fn reflect_set_writes_own_data_in_place_and_keeps_every_other_case() {
+    check(&format!(
+        "{ASSERT}{}",
+        r#"
+        var t = { a: 1 };
+        for (var k = 0; k < 40; k++) assert(Reflect.set(t, 'a', k) && t.a === k, 'own data');
+        assert(Reflect.set(t, 'a', 'r', t) && t.a === 'r', 'the target as receiver');
+        var frozen = Object.freeze({ a: 1 });
+        assert(!Reflect.set(frozen, 'a', 2) && frozen.a === 1, 'read-only');
+        var log = [];
+        var withSetter = { set a(v) { log.push(this === withSetter ? v : 'wrong'); } };
+        assert(Reflect.set(withSetter, 'a', 5) && log.join() === '5', 'own setter');
+        var getterOnly = { get a() { return 1; } };
+        assert(!Reflect.set(getterOnly, 'a', 2), 'no setter');
+        var child = Object.create({ a: 'inherited' });
+        assert(Reflect.set(child, 'a', 'own') && child.hasOwnProperty('a') && child.a === 'own', 'created');
+        var sealed = Object.preventExtensions({});
+        assert(!Reflect.set(sealed, 'b', 1) && !('b' in sealed), 'not extensible');
+        var receiver = {};
+        assert(Reflect.set({ a: 1 }, 'a', 2, receiver) && receiver.a === 2, 'another receiver');
+        assert(!Reflect.set({ a: 1 }, 'a', 2, 7), 'a primitive receiver');
+        // A Proxy receiver of the target, as Vue's reactive set handler passes: its traps run.
+        var target = { a: 1 };
+        var traps = [];
+        var proxy = new Proxy(target, {
+            getOwnPropertyDescriptor(t, k) { traps.push('gopd:' + k); return Reflect.getOwnPropertyDescriptor(t, k); },
+            defineProperty(t, k, d) { traps.push('define:' + k + ':' + d.value); return Reflect.defineProperty(t, k, d); },
+        });
+        assert(Reflect.set(target, 'a', 3, proxy) && target.a === 3, 'proxy receiver');
+        assert(traps.join() === 'gopd:a,define:a:3', traps.join());
+        var setTrap = new Proxy({}, { set(t, k, v, r) { return v === 'accept'; } });
+        assert(Reflect.set(setTrap, 'x', 'accept') && !Reflect.set(setTrap, 'x', 'reject'), 'set trap');
+        // A property that turns read-only or into an accessor after warming.
+        var w = { a: 0 };
+        for (var k = 0; k < 40; k++) Reflect.set(w, 'a', k);
+        Object.defineProperty(w, 'a', { writable: false });
+        assert(!Reflect.set(w, 'a', 'no') && w.a === 39, 'became read-only');
+        var seen = [];
+        var v = { a: 0 };
+        for (var k = 0; k < 40; k++) Reflect.set(v, 'a', k);
+        Object.defineProperty(v, 'a', { set(x) { seen.push(x); }, configurable: true });
+        assert(Reflect.set(v, 'a', 'set') && seen.join() === 'set', 'became an accessor');
+        // Exotic targets keep their [[Set]].
+        var arr = [1, 2, 3];
+        assert(Reflect.set(arr, 1, 'x') && arr[1] === 'x', 'array index');
+        assert(Reflect.set(arr, 'length', 1) && arr.length === 1 && arr[1] === undefined, 'array length');
+        var s = Symbol();
+        var o = { [s]: 1, 2: 'two', '\0nul': 1 };
+        assert(Reflect.set(o, s, 2) && o[s] === 2, 'symbol key');
+        assert(Reflect.set(o, 2, 'deux') && o[2] === 'deux' && Reflect.set(o, '\0nul', 2) && o['\0nul'] === 2, 'keys');
+        var ta = new Uint8Array(2);
+        assert(Reflect.set(ta, 0, 300) && ta[0] === 44, 'typed array');
+        function mapped(a) { Reflect.set(arguments, 0, 'mapped'); return a; }
+        assert(mapped(1) === 'mapped', 'mapped arguments');
+        var converted = 0;
+        var key = { toString() { converted++; return 'a'; } };
+        try { Reflect.set(1, key, 1); assert(false, 'no TypeError'); } catch (e) { assert(e instanceof TypeError, 'TypeError'); }
+        assert(converted === 0 && Reflect.set(t, key, 'k') && converted === 1 && t.a === 'k', 'converted once');
         'ok'
     "#
     ));

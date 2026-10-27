@@ -518,16 +518,21 @@ mod tests {
 
     /// P1 S5: `F.prototype = p` over unobserved deferred prototypes through Rust's
     /// `Object.defineProperty` ([[DefineOwnProperty]]) and `Reflect.set` ([[Set]]): the new
-    /// value reads back, and every old cell is gone after the next collection. Both operations
-    /// first snapshot the current descriptor with `Property::clone`, which materializes the old
-    /// prototype (as before the cell): one materialization per function, and the
-    /// materialized object is garbage once the store completes.
+    /// value reads back, and every old cell is gone after the next collection.
+    /// `Object.defineProperty` first snapshots the current descriptor with `Property::clone`,
+    /// which materializes the old prototype (as before the cell): one materialization per
+    /// function, and the materialized object is garbage once the store completes. `Reflect.set`
+    /// writes the own writable data property in place, as the store cache does, and
+    /// materializes nothing: OrdinarySetWithOwnDescriptor never reads the old value.
     #[test]
     fn rust_overwrites_of_deferred_prototypes_free_their_cells() {
         const N: usize = 16;
-        for store in [
-            "Object.defineProperty(f, 'prototype', { value: p })",
-            "Reflect.set(f, 'prototype', p)",
+        for (store, snapshots) in [
+            (
+                "Object.defineProperty(f, 'prototype', { value: p })",
+                N as u64,
+            ),
+            ("Reflect.set(f, 'prototype', p)", 0),
         ] {
             let mut engine = Engine::new();
             eval(
@@ -548,8 +553,8 @@ mod tests {
             eval(&mut engine, "fns.forEach(store); 0");
             assert_eq!(
                 super::materialized() - materialized,
-                N as u64,
-                "{store}: the descriptor snapshot materializes each old prototype"
+                snapshots,
+                "{store}: only a descriptor snapshot materializes the old prototypes"
             );
             assert_eq!(
                 eval(&mut engine, "fns.every(f => f.prototype === p)"),

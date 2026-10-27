@@ -31,50 +31,19 @@ pub(super) fn install_reflect(it: &mut Interp) {
     });
     it.def_method(&r, "set", 3, |i, _t, a| {
         let target = arg(a, 0);
-        if !matches!((target).view(), ValueView::Obj(_)) {
+        let ValueView::Obj(object) = target.view() else {
             return Err(i.make_error("TypeError", "Reflect.set called on non-object"));
-        }
-        let key = ab(i.to_property_key(&arg(a, 1)))?;
+        };
+        let key = arg(a, 1);
         let value = arg(a, 2);
-        // A proxy's [[Set]] returns the ToBoolean of its trap result; surface that as Reflect.set's
-        // own boolean rather than always reporting success.
-        if let Some((ptarget, handler)) = proxy_pair(i, &target) {
-            if matches!((handler).view(), ValueView::Null) {
-                return Err(i.make_error("TypeError", "proxy is revoked"));
-            }
-            if let Some(trap) =
-                ab(i.proxy_get_trap(&handler, crate::interpreter::PROXY_TRAP_SET, "set"))?
-            {
-                let receiver = if a.len() > 3 { arg(a, 3) } else { target };
-                let key_value = i
-                    .sym_from_key(&key)
-                    .unwrap_or_else(|| crate::value::string_key_value(key.as_str()));
-                let res = ab(i.proxy_call_trap(
-                    crate::interpreter::PROXY_TRAP_SET,
-                    &trap,
-                    handler,
-                    [ptarget, key_value, value, receiver],
-                ))?;
-                let ok = i.to_boolean(&res);
-                if ok {
-                    ab(i.proxy_set_invariant(&ptarget, &key, &value))?;
-                }
-                return Ok(Value::Bool(ok));
-            }
-            // Missing/undefined trap: forward to the target's [[Set]] with the original receiver,
-            // returning its actual success boolean. [[Set]] reports failure as `false` (never a strict
-            // PutValue throw), so evaluate it in a non-strict context.
-            let receiver = if a.len() > 3 { arg(a, 3) } else { target };
-            let saved = i.strict;
-            i.strict = false;
-            let r = i.set_member_recv(&ptarget, &key, value, receiver);
-            i.strict = saved;
-            return Ok(Value::Bool(ab(r)?));
-        }
         let receiver = if a.len() > 3 { arg(a, 3) } else { target };
-        Ok(Value::Bool(reflect_ordinary_set(
-            i, &target, &key, value, &receiver,
-        )?))
+        // ToPropertyKey of a String is itself.
+        if let ValueView::Str(name) = key.view() {
+            let text = crate::value::encode_lstr_key(&name);
+            return reflect_set(i, &object, &text, value, &receiver);
+        }
+        let text = property_key_text(i, &key)?;
+        reflect_set(i, &object, &text, value, &receiver)
     });
     it.def_method(&r, "has", 2, |i, _t, a| {
         let target = arg(a, 0);
@@ -259,6 +228,89 @@ fn property_key_text(i: &mut Interp, key: &Value) -> Result<PropertyKeyText, Val
         Some(text) => Ok(PropertyKeyText::Written(text)),
         None => Ok(PropertyKeyText::Converted(ab(i.to_property_key(key))?)),
     }
+}
+
+/// Reflect.set's step 4 (ECMA-262 §28.1.13): `object`.[[Set]](key, value, receiver) for the key
+/// text `key`, as its success.
+fn reflect_set(
+    i: &mut Interp,
+    object: &Gc,
+    key: &str,
+    value: Value,
+    receiver: &Value,
+) -> Result<Value, Value> {
+    let receiver_is_target = matches!(receiver.view(), ValueView::Obj(r) if Gc::ptr_eq(&r, object));
+    if receiver_is_target && set_own_data_property(object, key, value) {
+        return Ok(Value::Bool(true));
+    }
+    let target = Value::Obj(*object);
+    // A proxy's [[Set]] returns the ToBoolean of its trap result; surface that as Reflect.set's
+    // own boolean rather than always reporting success.
+    if let Some((ptarget, handler)) = proxy_pair(i, &target) {
+        if matches!((handler).view(), ValueView::Null) {
+            return Err(i.make_error("TypeError", "proxy is revoked"));
+        }
+        if let Some(trap) =
+            ab(i.proxy_get_trap(&handler, crate::interpreter::PROXY_TRAP_SET, "set"))?
+        {
+            let key_value = i
+                .sym_from_key(key)
+                .unwrap_or_else(|| crate::value::string_key_value(key));
+            let res = ab(i.proxy_call_trap(
+                crate::interpreter::PROXY_TRAP_SET,
+                &trap,
+                handler,
+                [ptarget, key_value, value, *receiver],
+            ))?;
+            let ok = i.to_boolean(&res);
+            if ok {
+                ab(i.proxy_set_invariant(&ptarget, key, &value))?;
+            }
+            return Ok(Value::Bool(ok));
+        }
+        // Missing/undefined trap: forward to the target's [[Set]] with the original receiver,
+        // returning its actual success boolean. [[Set]] reports failure as `false` (never a strict
+        // PutValue throw), so evaluate it in a non-strict context.
+        let saved = i.strict;
+        i.strict = false;
+        let r = i.set_member_recv(&ptarget, key, value, *receiver);
+        i.strict = saved;
+        return Ok(Value::Bool(ab(r)?));
+    }
+    Ok(Value::Bool(reflect_ordinary_set(
+        i, &target, key, value, receiver,
+    )?))
+}
+
+/// OrdinarySet(object, P, V, object) (ECMA-262 §10.1.9.2 OrdinarySetWithOwnDescriptor) where
+/// P, whose text is `key`, is an own writable data property of an ordinary object: the
+/// receiver's own descriptor is that property, so its [[DefineOwnProperty]] replaces only the
+/// [[Value]], with no code to run. `false` declines, having changed nothing: an exotic or
+/// side-table object, or an absent, inherited, read-only or accessor property.
+fn set_own_data_property(object: &Gc, key: &str, value: Value) -> bool {
+    // Text with no atom names no property.
+    let Some(key) = crate::atom::PropKey::lookup_text(key) else {
+        return false;
+    };
+    let slot = {
+        let body = object.borrow();
+        if !body.ic_plain.get() || !body.exotic.is_ordinary() {
+            return false;
+        }
+        let Some(slot) = body.props.slot_of_key(key) else {
+            return false;
+        };
+        if body
+            .props
+            .property_at(slot)
+            .is_none_or(|property| property.accessor() || !property.writable())
+        {
+            return false;
+        }
+        slot
+    };
+    object.borrow_mut().props.set_value_at(slot, value);
+    true
 }
 
 /// `Reflect.apply` (named so the JIT call cache can prove and tag its exact identity).
