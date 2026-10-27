@@ -430,30 +430,40 @@ W6. Collector scheduling
   RSS, with no suite slower beyond noise; marking's exit is set in its design note, with
   SplayLatency at least the old engine's (6446) as the target.
 
+W7. Strings (Decision 7)
+- Store strings as code units at the browsers' two widths instead of UTF-8 with UTF-16 views
+  built per string on demand, whose cliffs make Web Tooling's two largest gaps (see the stage
+  record); fix the string deviations the survey found.
+- Exit: in its design note.
+
 ## Order
 
 0. A perf map for generated code (see "Measurement").
 1. W1 (independent, largest measured win); W6's cap alongside (independent).
-2. W2a + W2b (atoms and scope descriptors: they remove finalizers and unblock W3's environment
+2. W7 (strings), before W2a, whose atoms are string cells.
+3. W2a + W2b (atoms and scope descriptors: they remove finalizers and unblock W3's environment
    work).
-3. W3 with W4's call-target feedback.
-4. W2c-W2g (layout; each touches JIT templates and carries dump checks).
-5. W4's remainder; W5 alongside wherever it shares no code with the stage in progress.
-6. W6's incremental marking, last, once W2 has settled the layout.
+4. W3 with W4's call-target feedback.
+5. W2c-W2g (layout; each touches JIT templates and carries dump checks).
+6. W4's remainder; W5 alongside wherever it shares no code with the stage in progress.
+7. W6's incremental marking, last, once W2 has settled the layout.
 
 Each stage: a recorded design note before code (as P1's stages), its own commit series, the
-gates below, and its exit measurement. Each commit series lands on main as soon as its gates
-pass, without a stage branch, and stage exits are measured on main (Decision 1).
+gates below, and its exit measurement. A commit series lands on main once validated, without a
+stage branch, and stage exits are measured on main (Decision 1).
 
 ## Gates
 
-As P1's working agreements (docs/v8-chase-p1-plan-2026-10-15.txt), per commit series: rustfmt,
-clippy in the five configurations and the workspace, rustdoc warnings, the lib suite and its
-test list, the downstream crates (with TRUST_JS_GC_VERIFY=1), the fixtures, difftest, the dump
-checks, Test262 in full at --tier=jit threshold 8 (report identical apart from intended changes),
-targeted GC stress; on zombie the compile checks, the x86-64 and Windows lib suites and the
-release checks. Stage exits add the whole lib suite under GC stress, Test262 under GC stress at
-threshold 0, Test262 on x86-64, TRust's handoff checks and its GC-relevant tests under stress.
+Tests are a diagnostic tool (Decision 8). While a stage develops: the build and clippy in the
+configurations the change touches, and the tests nearest the change. Once at the end of a major
+phase or of a large change to what they measure: rustfmt, clippy in the five configurations and
+the workspace, rustdoc against the base, the lib suite (also with pacing on), the downstream
+crates, the fixtures, difftest, the dump checks, Test262 in full at --tier=jit threshold 8 (report
+identical apart from intended changes), and on zombie the compile checks, the x86-64 and Windows
+lib suites and the release checks. GC stress and the other long runs only to diagnose something
+about what changed (the collector, rooting, a representation). Stage exits add TRust's handoff
+checks. Until Decision 8, every commit series took this whole list, as P1's working agreements
+had it.
 
 ## Measurement
 
@@ -507,11 +517,16 @@ does (Order, step 0).
    to them.
 6. agent/jit-arith (403b7681) and agent/jit-calls (23050aaf) deleted on 2026-10-27, with the
    merged p1-closeout branches of both repositories.
+7. Strings (2026-10-27): the non-goal on string representation work is overruled. Strings are
+   P2's W7, and nothing else in this plan keeps that work from what it needs.
+8. Testing (2026-10-27): tests are a diagnostic tool, run in full at the end of a major phase or
+   of a large change to what they measure rather than per commit; long runs only to diagnose
+   (see "Gates").
 
 ## Non-goals
 
 Speculative optimization, inlining beyond today's guarded splicing, deoptimization (P3); moving
-or compacting collection; concurrent marking; string representation work beyond W2a's atoms;
+or compacting collection; concurrent marking;
 startup snapshots (P4); Speedometer acceptance beyond the replays.
 
 ## Risks
@@ -523,6 +538,9 @@ startup snapshots (P4); Speedometer acceptance beyond the replays.
 - Always-on feedback (W4) must not tax the baseline beyond its budget; measure per stage.
 - A native RegExp tier (W5) is a second code generator; it lands only behind a differential
   gate against the interpreter on Test262's RegExp suites plus a fuzzed corpus.
+- Strings (W7) touch every string path, the embedding API (TRust's port) and RegExp's subjects;
+  Test262, the fixtures, difftest and a differential test against Node over generated non-ASCII
+  programs guard them.
 - Incremental marking (W6) puts a barrier on every pointer store in the interpreter, the VM and
   both JIT backends; it lands behind GC stress with marking forced into small slices, and
   TRUST_JS_GC_VERIFY.
@@ -530,6 +548,13 @@ startup snapshots (P4); Speedometer acceptance beyond the replays.
 ## Stage records
 
 Each stage's design note, written before its code, then its gates and exit measurement.
+
+Known failures at P2's base (73e328fa), unchanged by every commit since: on Crystal, with
+TRUST_JS_GC_PACING=1, external_memory_tests::replaced_arrays_are_collected_as_their_elements_grow;
+on zombie, agent_control_tests::host_buffer_data_makes_a_major_collection_due_at_the_next_safepoint
+(x86-64) and the three snapshot::tests codec tests (Windows, under Wine). rustdoc fails on the
+crate docs' private links at the base too. Under load, gc_scan_spike and the runtime's
+worker_terminate test fail now and then and pass on rerun.
 
 ### Step 0: a perf map for generated code (design, 2026-10-27)
 
@@ -554,6 +579,11 @@ DIAGNOSTICS.md documents the switch beside `TRUST_JS_JIT_GPROFNG`, with the call
 (`perf record --call-graph fp --user-callchains`). Exit: `perf report` on the Vue fixture names
 the generated code among its 30 hottest symbols, with no bare addresses.
 
+Landed 2026-10-27 (d4e62452). The dumps differ from the base only in the displacement of the
+three Chunk fields generated code reads, 16 bytes on for the label. Exit met: `perf report` on
+the Vue fixture names generated code among its 30 hottest symbols with no bare address
+(`JS:^<anonymous> .../vue.js:4:17983` 7.8%, `Stub:NameLoad` 4.7%, ...).
+
 ### W6a: V8's cap on the heap limit (design, 2026-10-27)
 
 After a major collection V8 sets the old generation's limit to
@@ -574,6 +604,12 @@ budgets keep their rule. Tests: the limit below, at and above the point where th
 (about 585 MB at factor 4 with a 4 GB maximum), past the maximum, and the override.
 Exit (proposed, W6): the limits match V8's rule in unit tests; Web Tooling's peak RSS falls; no
 suite slower beyond noise.
+
+Landed 2026-10-27 (7495f76b). Two follow-ups for the owner: past the maximum V8's floor is
+`size + 8 MB` (its global limit, 8f876708cf), where the engine keeps the note's `size + 8 MB +
+nursery`; and V8's MaxGrowingFactor allows a factor of 4 only for a maximum of at least 2 GB (1.3
+to 2.0 below), which the engine does not port (it differs on hosts with less than 4 GB of memory
+or under a small override). Exit measurement pending (a quiet machine, LTO builds).
 
 ### W1: builtins and Proxy paths (census and design, 2026-10-27)
 
@@ -604,7 +640,9 @@ with call graphs on CPU 5; data, scripts and the microbenchmark in target/p2/w1-
 - React and Djot spend no more than 4% in any builtin's generic path (React's largest is
   CreateDataPropertyOrThrow, 3.9%; Djot's RegExp work, about 8%, is W5's). Octane spends no more
   than 0.2% in any array builtin; its largest builtins are String.prototype.replace with a
-  RegExp (8%, W5's) and Function.prototype.call (2.3%, W3's). Web Tooling: pending.
+  RegExp (8%, W5's) and Function.prototype.call (2.3%, W3's). Web Tooling (the whole suite): no
+  array builtin above 1.1% (merge_sort 1.05%), the Proxy side-table probe 1.3%; its largest
+  builtin cost is strings' UTF-16 views (9.4%, W7's).
 
 Design:
 1. Proxy [[GetOwnProperty]] and [[DefineOwnProperty]] pass Property Descriptor records
@@ -630,3 +668,193 @@ Node's time and with Reflect-forwarding handlers within 1.5x of it (today 1.33x 
 holey shift within 2x of it (today 17x); Vue's `shift` time recorded before and after; no
 builtin above 5% of a workload's time on a generic path a fast path could take (met on the
 acceptance set and Octane today).
+
+Landed 2026-10-27: items 1 and 2 (863c0939, which also fixed six observable deviations, each
+checked against Node) and 4 (a683d988). Item 3 dropped: after items 1 and 2, index formatting is
+under 1% of the Proxy microbenchmark (intern_key 0.8%), whose largest cost is now the Proxy side
+table's probes (18%, W2g's). Under load (no-LTO, least of 3 runs, ns an iteration): without
+handlers 27,900 to 9,900 (Sparkplug-only Node 13,750), with Reflect handlers 48,250 to 26,450
+(20,350), with direct handlers 22,400 to 17,400 (9,150). Exit measurement pending (a quiet
+machine, LTO builds), as is the owner's answer on the revised exit.
+
+### W7: strings (census and design, 2026-10-27)
+
+The owner's Decision 7 put strings in P2. ECMAScript strings are sequences of UTF-16 code units
+(ECMA-262 §6.1.4). The engine stored UTF-8 (lstr.rs: a 16-byte header {frontier, len, cap} with
+an ASCII hint in cap's top bit, then the bytes; a view {header, owner, offset} for slices of 256
+bytes and more), with lone surrogates as plane-16 scalars (jstr.rs, "smuggling"). Indexing needed
+a UTF-16 view, which `Interp::units_of` built per string on first use and kept in a 16 MB,
+64-entry LRU keyed by the cell's address (`str_units`), beside a `Utf8Index` for slicing; RegExp
+widened non-ASCII subjects to 32-bit elements in its own 32 MB LRU (`re_texts`). Every new string
+started cold, so code that slices or grows non-ASCII text rebuilt a view a step: quadratic.
+
+Census (no-LTO 7495f76b on Crystal, under load; data and scripts in target/p2/strings-census):
+- Web Tooling, whole suite (the close-out): 9.4% of user instructions copy UTF-16 views
+  (`units_of`: substr 3.3%, `.length` 3.3%, indexed reads 2.4%). Alone, with the perf map,
+  coffeescript spends 63% of its instructions there (`.length` 27%, charCodeAt-style reads 20%,
+  slice 17%) and source-map 56% (substr 43%, slice's index 12%): the two largest gaps
+  Sparkplug-only Node keeps on the suite (23x and 11x).
+- micro/strings.js, 14 patterns over 200 KB of ASCII, Latin-1, CJK and astral text, against
+  Sparkplug-only Node: a lexer re-slicing per token (CoffeeScript's `@chunk = code[i..]`) 18x on
+  ASCII and about 5,500x on the others (33 s against 6 ms); an anchored RegExp on each remaining
+  chunk 4.8x and about 3,700-5,700x; a `+=` accumulator read as it grows 0.5x on ASCII and
+  12-90x on the others; prepending (no ropes) 12-37x; split/join 6-12x; Map and property keys
+  5-6x; a sticky RegExp lexer 5-7x; the rest 1.6-4.4x.
+- The survey found three deviations: a string's own index properties were parsed with Rust's
+  integer parser ("abc"["01"] was "b"; a read past the end skipped String.prototype; fixed,
+  1bf7973e), the default sort ordered by code point, not code unit (fixed, 9b224edd), and object
+  spread and rest of a string walk code points, not units (`{...'a😀b'}` has three keys, not
+  four; open).
+
+What the browsers do (their source at V8 756afdd7, Firefox d9098b3e, WebKit 780058db, read
+2026-10-27): all three store code units at one of two fixed widths, Latin-1 bytes or UTF-16
+units, and none stores UTF-8 (Ladybird's LibJS moved from UTF-8 to UTF-16 in June 2026; the
+engines that keep UTF-8, Duktape, JerryScript, XS, rescan or keep a few cached offsets). The rules
+they share: a buffer's width is fixed at allocation, and a concatenation is one-byte only when
+both operands are stored one-byte (V8 factory-base.cc, SpiderMonkey ConcatStrings); they narrow
+only text they are copying anyway; the length lives in the header; a substring shares its
+parent's buffer above a small cutoff (V8 SlicedString::kMinLength 13; SpiderMonkey above its
+inline sizes) and a view never points at a view; anything needing contiguous text flattens
+first. They defer concatenation into ropes (V8 ConsString from 13 units); SpiderMonkey instead
+reuses the leftmost buffer when flattening, which is the engine's in-place append. Hashes are
+over code units whatever the width (V8 caches one in the header).
+
+Design:
+1. Representation: a string cell holds one-byte or two-byte code units. The header keeps its 16
+   bytes and offsets: `len` counts units, `cap` holds the capacity in units below the two-byte and
+   ASCII-hint bits, and a view's `cap` stays the reserved marker. Lone surrogates are ordinary
+   two-byte units; smuggling survives only in engine text, at the text boundary. The capacity
+   limit is 2^30 - 2 units; the JS-visible limit stays MAX_STR_LEN (2^26 units).
+2. Widths as the browsers choose them: text converts to one-byte when every unit fits;
+   a concatenation or in-place append is one-byte when both sides are stored one-byte (a two-byte
+   suffix on a one-byte buffer copies into a two-byte buffer, after which appends are in place
+   again); short copies narrow. Views keep the owner's width, never point at views, and keep the
+   engine's pinning rule (a slice of an owner above 1 MiB that covers less than half of it
+   copies). The view cutoff stays 256 bytes of content and is measured against V8's 13 units in
+   S3.
+3. Equality compares units across widths (identity, then length, then memcmp at equal widths).
+   Hashes run over code units, so equal strings hash equally at either width. Relational
+   comparison and sorting are unit order.
+4. Text access: `Deref<Target = str>`, `AsRef<str>` and `Borrow<str>` go. `as_ascii()` lends a
+   one-byte string as `&str` without copying; `text()` returns engine text as a `Cow<str>`,
+   copying only a two-byte string; algorithms read `units()`. Property keys (Rc<str> until
+   W2a's atoms, which become internalized string cells) borrow ASCII text and convert the rest.
+5. What goes away: the UTF-16 view cache (`str_units`), the `Utf8Index`, the surrogate join
+   fix-ups of concatenation and repeat, and RegExp's UTF-8 decoding: subjects are one-byte bytes
+   or two-byte units, widened to the matcher's 32-bit elements only for two-byte subjects until
+   W5 reads units directly.
+6. Generated code: with one-byte storage holding exactly what the ASCII hint marked, the
+   templates (length, charCodeAt, equality, truthiness) and the dumps stay as they are through
+   the storage change. S4 extends `.length` and charCodeAt to every flat string.
+7. The embedding API: `as_engine_text()` returns `Cow<str>`, borrowed for an ASCII string (TRust
+   uses it 37 times); `string_from_engine_text` converts to the right width (60 uses). TRust's
+   port lands with S2's validation, through its handoff checks.
+8. Ropes are not in this stage: the in-place append already keeps `s += x` linear (and faster
+   than V8 on ASCII); a census of concatenation copies after S3 decides on V8-style cons strings.
+
+Staging the widths: the engine's fast paths assume that a byte of a "known ASCII" string is its
+code unit, and the generated code's string templates take a string's bytes only under the ASCII
+hint. S2 therefore stores ASCII text one-byte and every other string two-byte, so one-byte
+storage is exactly the hinted ASCII case those paths and templates already handle, and `text()`
+of a one-byte string always borrows. Latin-1 one-byte storage, the browsers' width rule in full,
+is S4, once the remaining byte-level paths read storage by width.
+
+Order:
+- S1 (done, 7b577a5e..f4deadce): the text API with UTF-8 storage unchanged, every reader moved
+  off `Deref`/`len()` (about 470 sites; the compiler found them), then `Deref`, `AsRef`,
+  `Borrow` and the public `as_str` removed. No change in behaviour or generated code.
+- S2 (963a285a): the storage change, with the view machinery answering from storage; the string
+  iterator, AdvanceStringIndex, comparison and sorting on units; length limits in units.
+- S3: the hot paths off `text()` by measured order (slice, substring, substr, indexOf, split,
+  replace, trim, case mapping, JSON, fromCharCode), the view cutoff against V8's 13, object
+  spread by units.
+- S4: Latin-1 one-byte storage, and `.length` and charCodeAt templates for every flat string.
+- A string differential test (generated programs over ASCII, Latin-1, CJK, astral and
+  lone-surrogate strings through every String.prototype method and the operators, compared with
+  Node) checks S2-S4.
+
+Exit (proposed): no UTF-16 view or decoding cache left; on strings.js every case's non-ASCII
+variants within 1.5x of its ASCII variant and every case within 2x of Sparkplug-only Node;
+coffeescript and source-map within the other Web Tooling tools' gap to Sparkplug-only Node
+(at most 6.7x), with string conversions under 1% of the suite's instructions; Test262 identical;
+no suite slower beyond noise and no suite's peak RSS more than 5% higher.
+
+### W2a and W2b: atoms and scope descriptors (design draft, 2026-10-27, for the owner's review)
+
+Census (the close-out's GC logs, target/claude-closeout/final/gclog, TRUST_JS_GC_LOG; means per
+minor collection; a read-only survey of the tree supplied the inventory, its claims checked):
+
+| | minors | mark + sweep + engine (ms) | finalize (ms) | cells finalized |
+| --- | --- | --- | --- | --- |
+| ARES-6 | 6,823 | 12.6 | 4.05 (32%) | 17,429 environments, 2,866 property-map extras, 2,854 layouts |
+| Web Tooling | 5,066 | 25.6 | 1.24 (5%) | 13,449 environments, 4,842 layouts, 794 extras |
+| Octane (partial log) | 396 | 6.5 | 0.40 (6%) | 4,398 environments, 2,105 extras, 581 layouts |
+
+Environments are 75-85% of the cells finalized. Three findings change the plan's framing:
+- Compiled code belongs to one Agent heap: a Chunk records its heap (bytecode.rs `heap:
+  HeapLifetime`), its constants are that heap's cells, and FunctionRuntime picks code by the
+  active heap; only the AST is shared, and it holds names as text. Chunks and native code can
+  therefore embed per-heap atoms. A static table still pays, for the roughly 540 distinct names
+  the engine itself spells (builtins, `length`, `prototype`, the internal `%...%` bindings), as
+  V8's read-only roots and SpiderMonkey's permanent atoms do.
+- Atoms can live as long as their heap at first: ShapeTable's transitions already hold a strong
+  key for every (parent, key, class) a heap has seen, for its whole life, and every structural
+  removal mints a fresh shape, so delete/insert churn already grows that table (and walks the
+  process-wide shape ids toward exhaustion); permanent atoms retain nothing new for property
+  keys. Index keys, which do die today, will not be atoms. Collecting atoms, with weak
+  transitions and dictionary maps for churn, is a later series (with W2d).
+- W2a and W2b do not touch Splay's live heap (its objects share layouts and allocate few
+  environments): that part of W2's exit belongs to W2c and W2d.
+
+Design:
+- Atom: a Copy handle to an immutable, exact-size flat string cell in the Agent heap (an LStr
+  header with no spare room, at W7's widths), compared and hashed by address, read like any
+  engine string. `Value::Str` can wrap it, so enumeration, JSON and Proxy traps stop
+  allocating a string per key. Pointer atoms rather than u32 ids: the conservative stack scan
+  sees them, and their text needs no table lookup.
+- PropKey: one word, an atom or a tagged canonical array index (at most 2^32 - 2), as
+  SpiderMonkey's jsid; one constructor canonicalizes, so identity equality is complete and
+  classic arrays stop allocating key strings for indices above 63.
+- Each Agent heap keeps an atom table beside its interned strings, with a seeded hash (key text
+  comes from scripts): `atomize` for names that will be stored, `lookup` for reads (text with no
+  atom names no property, as V8's LookupExisting). Atom cells are allocated old. The static
+  names are a process-wide read-only table seeded into every heap's, so `names::LENGTH` is a
+  constant; a static atom is never handed out as a heap Value and is never traced.
+- Heap atoms live only in heap-bound holders (chunks, FunctionRuntime, GcState tables, cells),
+  never in the AST, script sources, snapshots or process-wide caches; debug builds check that a
+  looked-up atom is static or belongs to the active heap.
+- Environments: binding names become atoms, the environment cell loses its drop glue (the large
+  table moves into a storage block, an import becomes a small cell holding its environment and
+  name) and stops finalizing. Then ScopeDesc, one immutable descriptor per compiled scope, owned
+  by its chunk: ordered names, static flags (const, strict immutability, lexical at this level,
+  import), the existing layout id the name caches and native guards use, and an index past 8
+  bindings. An environment holds its descriptor and its binding values; a Binding without its
+  name shrinks from 40 to 24 bytes and a one-binding environment from the 128-byte to the
+  96-byte class. Creating one copies argument words instead of cloning names, the template W3's
+  direct sequence needs. Sloppy direct eval, deletable eval bindings, the global declarative
+  record and module imports copy on write to a private descriptor, as property layouts do.
+  `with` keeps resolving through its object; eval's private-name scan, TDZ messages and memory
+  accounting read names through the descriptor.
+- Property layouts: keys become PropKeys in a traced storage block, the index an open-addressing
+  table there, and layouts stop finalizing.
+- Generated code: name compares become one word compare (the ARM64 key-checked arm and creation
+  cache, references on both backends), and the binding and layout strides and offsets change.
+
+Order, each commit series behaviour-preserving (Test262 identical) and separately gated:
+1. A census in TRUST_JS_GC_LOG: finalize time by cell kind, and the atom count and bytes.
+2. Atoms, PropKey, the per-heap table and the static names, without users yet.
+3. Binding names as atoms (entries padded to their current 40 bytes, so the code dumps stay
+   identical).
+4. Environments without drop glue; `fin:environment` reaches 0.
+5. ScopeDesc and the smaller Binding (code dumps change in the binding stride and offset only).
+6. Property keys as PropKeys; layouts stop finalizing (code dumps change: the creation cache, the
+   key-checked arm, the layout stride).
+7. References and the stub cache by atom; hot builtin paths through static atoms.
+Atom collection, weak transitions and dictionary maps follow with W2d. 8-byte binding slots (TDZ
+as the empty word, a one-binding environment in the 64-byte class) are deferred to W3, which
+decides the environment layout its direct sequence builds.
+
+Exit (proposed, within W2's): `fin:environment` and `fin:property_layout` reach 0 on the
+sustained workload, the fixtures, ARES-6 and Web Tooling; minor-collection time falls by the
+measured finalize share; one-binding environments sit in the 96-byte class; no suite slower
+beyond noise. Splay's live heap stays W2c/W2d's.
