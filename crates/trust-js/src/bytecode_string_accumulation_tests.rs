@@ -70,8 +70,8 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
         stored.result.unwrap().as_engine_text().unwrap(),
         format!("{}!", "x".repeat(900))
     );
-    assert_eq!(alias.as_str(), "x".repeat(900));
-    assert_eq!(root.as_str(), "x".repeat(1024));
+    assert_eq!(alias.text(), "x".repeat(900));
+    assert_eq!(root.text(), "x".repeat(1024));
     let old = result(&env);
     let twice = try_store(&chunk, &mut engine.interp, &env, plan, old).unwrap();
     assert_eq!(

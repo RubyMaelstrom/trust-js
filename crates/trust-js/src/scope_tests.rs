@@ -49,7 +49,7 @@ fn scoped_text_borrows_survive_copied_frontier_append_growth_and_gc() {
         let mut copied = initial;
         assert!(copied.append_in_place("frontier"));
         assert!(LStr::ptr_eq(copied.view_owner().unwrap(), &initial));
-        assert_eq!(copied.as_str().as_ptr(), original_address);
+        assert_eq!(copied.text().as_ptr(), original_address);
         let mut current = Rooted::new(Internal::Str(copied));
         let mut expected = format!("{prefix}frontier");
         cx.collect_garbage_for_host();
@@ -62,7 +62,7 @@ fn scoped_text_borrows_survive_copied_frontier_append_growth_and_gc() {
         let suffix = "replacement growth: ".repeat(prefix.len());
         assert!(!copied.append_in_place(&suffix));
         copied.append_or_replace(&LStr::from(suffix.as_str()));
-        assert_ne!(copied.as_str().as_ptr(), original_address);
+        assert_ne!(copied.text().as_ptr(), original_address);
         current.replace(Internal::Str(copied));
         expected.push_str(&suffix);
         cx.collect_garbage_for_host();

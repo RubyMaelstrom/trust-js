@@ -136,7 +136,7 @@ impl Interp {
         self.interrupt_poll_force()?;
         if let ValueView::Str(text) = &(spread).view() {
             if crate::builtins::intrinsic_string_iterator_is_unmodified(self) {
-                for point in crate::jstr::CodePointIter::new(text) {
+                for point in crate::jstr::CodePointIter::new(&text.text()) {
                     if count & 255 == 0 {
                         self.interrupt_poll_force()?;
                         self.gc_check()?;

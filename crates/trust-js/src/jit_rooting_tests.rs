@@ -740,7 +740,7 @@ fn tag_of(word: &Value) -> Option<String> {
     let tag =
         word.with_object(|object| object.borrow().props.get("tag").map(Property::value))??;
     match (tag).view() {
-        ValueView::Str(tag) => Some(tag.as_str().to_owned()),
+        ValueView::Str(tag) => Some(tag.text().into_owned()),
         _ => None,
     }
 }
@@ -848,7 +848,7 @@ fn committed_from_rust(i: &mut Interp) -> String {
     unsafe { args.set_len(0) };
     std::hint::black_box(&held);
     match (result).map(|__value| (__value).view()) {
-        Ok(ValueView::Str(marks)) => marks.as_str().to_owned(),
+        Ok(ValueView::Str(marks)) => marks.text().into_owned(),
         _ => panic!("collect() returns its markers"),
     }
 }

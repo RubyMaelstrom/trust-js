@@ -245,8 +245,8 @@ fn bound_trace_preview(value: &Value, depth: usize) -> String {
     match &(value).view() {
         ValueView::Str(text) => format!(
             "string(bytes={},prefix={:?})",
-            text.len(),
-            text.chars().take(48).collect::<String>()
+            text.text().len(),
+            text.text().chars().take(48).collect::<String>()
         ),
         ValueView::Num(number) => format!("{number}"),
         ValueView::Bool(boolean) => format!("{boolean}"),
@@ -257,7 +257,7 @@ fn bound_trace_preview(value: &Value, depth: usize) -> String {
             };
             let name = match object.props.get("name") {
                 Some(property) if !property.accessor() => match (property.value()).view() {
-                    ValueView::Str(name) => name.chars().take(48).collect::<String>(),
+                    ValueView::Str(name) => name.text().chars().take(48).collect::<String>(),
                     _ => String::new(),
                 },
                 _ => String::new(),
@@ -6810,7 +6810,7 @@ impl Interp {
         };
         let message = match object.props.get("message") {
             Some(property) if !property.accessor() => match (property.value()).view() {
-                ValueView::Str(message) => message.chars().take(512).collect::<String>(),
+                ValueView::Str(message) => message.text().chars().take(512).collect::<String>(),
                 _ => "<non-string message>".to_owned(),
             },
             Some(_) => "<accessor message>".to_owned(),
@@ -7659,7 +7659,7 @@ impl Interp {
     /// becomes U+FFFD. Use [`Interp::coerce_utf16`] where lone surrogates must survive.
     pub fn coerce_string(&mut self, v: &Value) -> Result<Rc<str>, Value> {
         self.to_string(v)
-            .map(|s| match crate::jstr::to_text(&s) {
+            .map(|s| match crate::jstr::to_text(&s.text()) {
                 std::borrow::Cow::Borrowed(text) => Rc::from(text),
                 std::borrow::Cow::Owned(text) => Rc::from(text),
             })
@@ -7670,13 +7670,13 @@ impl Interp {
     /// `TextEncoder` consumes exactly this scalar-value sequence.
     pub fn coerce_usv_string(&mut self, v: &Value) -> Result<String, Value> {
         let value = self.to_string(v).map_err(abrupt_value)?;
-        Ok(crate::jstr::to_text(&value).into_owned())
+        Ok(crate::jstr::to_text(&value.text()).into_owned())
     }
 
     /// ToString as UTF-16 code units, lone surrogates included (a Web IDL `DOMString`).
     pub fn coerce_utf16(&mut self, v: &Value) -> Result<Vec<u16>, Value> {
         let value = self.to_string(v).map_err(abrupt_value)?;
-        Ok(crate::jstr::units(&value))
+        Ok(crate::jstr::units(&value.text()))
     }
 
     /// ToString as engine text, lone surrogates included (a Web IDL `DOMString` kept as a Rust
@@ -7684,7 +7684,7 @@ impl Interp {
     /// Rust text; see [`Value::as_engine_text`].
     pub fn coerce_engine_text(&mut self, v: &Value) -> Result<Rc<str>, Value> {
         self.to_string(v)
-            .map(|s| Rc::from(s.as_str()))
+            .map(|s| Rc::<str>::from(&s))
             .map_err(abrupt_value)
     }
 
@@ -8267,7 +8267,9 @@ impl Interp {
                 match (object.props.get("name").map(|property| property.value()))
                     .map(|__value| (__value).view())
                 {
-                    Some(ValueView::Str(name)) => Some(name.chars().take(80).collect::<String>()),
+                    Some(ValueView::Str(name)) => {
+                        Some(name.text().chars().take(80).collect::<String>())
+                    }
                     _ => None,
                 }
             })
@@ -8316,7 +8318,7 @@ impl Interp {
                                 .map(|__value| (__value).view())
                             {
                                 Some(ValueView::Str(name)) => {
-                                    Some(name.chars().take(80).collect::<String>())
+                                    Some(name.text().chars().take(80).collect::<String>())
                                 }
                                 _ => None,
                             }
@@ -8676,13 +8678,14 @@ impl Interp {
         base: &Value,
         key: &crate::lstr::LStr,
     ) -> Result<Value, Abrupt> {
-        if key.as_str().starts_with('\0') {
-            return self.get_member_key(base, &crate::value::encode_string_key(key));
+        let text = key.text();
+        if text.starts_with('\0') {
+            return self.get_member_key(base, &crate::value::encode_string_key(&text));
         }
-        let cacheable = key.len() <= COMPUTED_STUB_KEY_MAX_BYTES
-            && key.as_str() != "length"
-            && key.as_str() != "description"
-            && !key.as_bytes().first().is_some_and(u8::is_ascii_digit);
+        let cacheable = text.len() <= COMPUTED_STUB_KEY_MAX_BYTES
+            && &*text != "length"
+            && &*text != "description"
+            && !text.as_bytes().first().is_some_and(u8::is_ascii_digit);
         if cacheable {
             let object = match (base).view() {
                 ValueView::Obj(object) => Some(object),
@@ -8695,7 +8698,7 @@ impl Interp {
                 let head = Gc::as_ptr(&object);
                 let shape = object.borrow().props.shape();
                 if let Some(state) = self.computed_reads.lookup(key.as_ptr() as usize, shape) {
-                    if let Some(value) = self.ic_shape_probe(head, key, state) {
+                    if let Some(value) = self.ic_shape_probe(head, &text, state) {
                         return self.finish_cached_get(value, base, None);
                     }
                 }
@@ -8707,7 +8710,7 @@ impl Interp {
                 // scratch ways are empty; probing them and copying the key into a second
                 // pointer-indexed stub table adds work on high-cardinality/transient inputs.
                 // Derive once and retain the key only in the bounded computed cache.
-                if let Some(value) = self.ic_get_rederive(&object, key, &scratch[0], false) {
+                if let Some(value) = self.ic_get_rederive(&object, &text, &scratch[0], false) {
                     let young = self.gc_heap.is_young(key.cell_word());
                     self.computed_reads.insert(
                         key,
@@ -8719,7 +8722,7 @@ impl Interp {
                 }
             }
         }
-        self.get_member_key(base, key)
+        self.get_member_key(base, &text)
     }
 
     fn get_prop_ic_impl(
@@ -9325,7 +9328,7 @@ impl Interp {
         let ValueView::Str(lv) = &(lval).view() else {
             return Err(lval);
         };
-        if lv.len() + x.len() > MAX_STR_LEN {
+        if lv.text().len() + x.text().len() > MAX_STR_LEN {
             return Err(lval); // the generic path raises the RangeError
         }
         let mut b = o.borrow_mut();
@@ -11353,11 +11356,12 @@ impl Interp {
         if s.ascii_hint() {
             return StrUnits::Ascii;
         }
-        if s.len() < 64 {
-            return if s.is_ascii() {
+        let text = s.text();
+        if text.len() < 64 {
+            return if text.is_ascii() {
                 StrUnits::Ascii
             } else {
-                StrUnits::Units(crate::jstr::units(s).into())
+                StrUnits::Units(crate::jstr::units(&text).into())
             };
         }
         let key = s.as_ptr() as usize;
@@ -11367,10 +11371,10 @@ impl Interp {
         }) {
             return hit;
         }
-        let u = if s.is_ascii() {
+        let u = if text.is_ascii() {
             StrUnits::Ascii
         } else {
-            StrUnits::Units(crate::jstr::units(s).into())
+            StrUnits::Units(crate::jstr::units(&text).into())
         };
         let bytes = retained_str_units_bytes(s, &u, None);
         self.str_units.insert(key, (*s, u.clone(), None), bytes);
@@ -11380,13 +11384,13 @@ impl Interp {
     /// Code unit `idx` of `s`, through the cache. `None` = out of range.
     pub(crate) fn unit_at(&mut self, s: &crate::lstr::LStr, idx: usize) -> Option<u16> {
         if s.ascii_hint() {
-            return s.as_bytes().get(idx).map(|&byte| byte as u16);
+            return s.text().as_bytes().get(idx).map(|&byte| byte as u16);
         }
-        if s.len() < 64 {
-            return crate::jstr::unit_iter(s).nth(idx);
+        if s.text().len() < 64 {
+            return crate::jstr::unit_iter(&s.text()).nth(idx);
         }
         let read = |units: &StrUnits| match units {
-            StrUnits::Ascii => s.as_bytes().get(idx).map(|&b| b as u16),
+            StrUnits::Ascii => s.text().as_bytes().get(idx).map(|&b| b as u16),
             StrUnits::Units(u) => u.get(idx).copied(),
         };
         // A warm entry answers without cloning the cached unit vector's ownership.
@@ -11407,15 +11411,16 @@ impl Interp {
     /// cache ownership. This uses the existing owning cache and its byte budget.
     pub(crate) fn code_point_at(&mut self, s: &crate::lstr::LStr, idx: usize) -> Option<u32> {
         if s.ascii_hint() {
-            return s.as_bytes().get(idx).map(|&byte| byte as u32);
+            return s.text().as_bytes().get(idx).map(|&byte| byte as u32);
         }
-        if s.len() < 64 {
-            let mut units = crate::jstr::unit_iter(s);
+        if s.text().len() < 64 {
+            let text = s.text();
+            let mut units = crate::jstr::unit_iter(&text);
             let first = units.nth(idx)?;
             return Some(crate::jstr::code_point_from_pair(first, units.next()));
         }
         let read = |units: &StrUnits| match units {
-            StrUnits::Ascii => s.as_bytes().get(idx).map(|&byte| byte as u32),
+            StrUnits::Ascii => s.text().as_bytes().get(idx).map(|&byte| byte as u32),
             StrUnits::Units(units) => units.get(idx).map(|&first| {
                 crate::jstr::code_point_from_pair(first, units.get(idx + 1).copied())
             }),
@@ -11435,8 +11440,8 @@ impl Interp {
     /// The fully materialized unit vector (for range/search operations): an ASCII entry is
     /// promoted in place, so the copy happens once per string, not per call.
     pub(crate) fn units_full(&mut self, s: &crate::lstr::LStr) -> Rc<[u16]> {
-        if s.len() < 64 {
-            return crate::jstr::units(s).into();
+        if s.text().len() < 64 {
+            return crate::jstr::units(&s.text()).into();
         }
         let key = s.as_ptr() as usize;
         if let Some(hit) = self.str_units.get_mapped(&key, |(cached, units, _)| {
@@ -11446,13 +11451,13 @@ impl Interp {
             if let StrUnits::Units(u) = hit {
                 return u.clone();
             }
-            let u: Rc<[u16]> = crate::jstr::units(s).into();
+            let u: Rc<[u16]> = crate::jstr::units(&s.text()).into();
             let cached = StrUnits::Units(u.clone());
             let bytes = retained_str_units_bytes(s, &cached, None);
             self.str_units.insert(key, (*s, cached, None), bytes);
             return u;
         }
-        let u: Rc<[u16]> = crate::jstr::units(s).into();
+        let u: Rc<[u16]> = crate::jstr::units(&s.text()).into();
         let cached = StrUnits::Units(u.clone());
         let bytes = retained_str_units_bytes(s, &cached, None);
         self.str_units.insert(key, (*s, cached, None), bytes);
@@ -11473,15 +11478,16 @@ impl Interp {
         if start == end {
             return crate::lstr::LStr::from("");
         }
-        if s.len() >= 64 {
+        if s.text().len() >= 64 {
             // A conversion may have evicted this source. Oversized, uncached and short strings
             // keep their established reconstruction; never repeatedly index an uncacheable body.
             if let Some(index) = self.cached_utf8_index(s) {
-                if let Some(bytes) = index.range(s, start, end) {
-                    return if bytes.len() == s.len() {
+                let text = s.text();
+                if let Some(bytes) = index.range(&text, start, end) {
+                    return if bytes.len() == text.len() {
                         *s
                     } else {
-                        let start_byte = bytes.as_ptr() as usize - s.as_str().as_ptr() as usize;
+                        let start_byte = bytes.as_ptr() as usize - text.as_ptr() as usize;
                         s.slice_bytes(start_byte, start_byte + bytes.len())
                     };
                 }
@@ -11512,7 +11518,7 @@ impl Interp {
     /// `s.length` (UTF-16 units), through the cache.
     pub(crate) fn str_len(&mut self, s: &crate::lstr::LStr) -> usize {
         match self.units_of(s) {
-            StrUnits::Ascii => s.len(),
+            StrUnits::Ascii => s.text().len(),
             StrUnits::Units(u) => u.len(),
         }
     }
@@ -11692,8 +11698,8 @@ impl Interp {
                 self.units_full(owner);
                 let index = self.cached_utf8_index(owner)?;
                 (
-                    index.units_at_byte(owner, start)?,
-                    index.units_at_byte(owner, end)?,
+                    index.units_at_byte(&owner.text(), start)?,
+                    index.units_at_byte(&owner.text(), end)?,
                 )
             };
             let parent = self.re_text(unicode, owner);
@@ -12520,7 +12526,7 @@ impl Interp {
                 }) && TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32
                 {
                     let preview = match &(callee).view() {
-                        ValueView::Str(text) => text.chars().take(160).collect::<String>(),
+                        ValueView::Str(text) => text.text().chars().take(160).collect::<String>(),
                         _ => type_name(&callee).to_string(),
                     };
                     eprintln!(
@@ -12569,7 +12575,7 @@ impl Interp {
             if let Some(realm_g) = realm_g.filter(|value| value.as_obj().is_some()) {
                 return match args.first() {
                     Some(value) => match value.view() {
-                        ValueView::Str(s) => self.indirect_eval_in_realm(&realm_g, &s),
+                        ValueView::Str(s) => self.indirect_eval_in_realm(&realm_g, &s.text()),
                         _ => Ok(*value),
                     },
                     None => Ok(Value::Undefined),

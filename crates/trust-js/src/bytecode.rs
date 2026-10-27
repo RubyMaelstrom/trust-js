@@ -860,7 +860,7 @@ mod computed_read_cache_tests {
         cache.insert(&long, state, false, 0);
         assert!(cache.raw_sets.is_null());
         let spare = crate::lstr::LStr::from("s".repeat(255)).concat_grown("k");
-        assert_eq!(spare.len(), 256);
+        assert_eq!(spare.text().len(), 256);
         assert!(spare.retained_requested_bytes() > ComputedReadCache::MAX_KEY_ALLOCATION);
         cache.insert(&spare, state, false, 0);
         assert!(
@@ -1213,11 +1213,7 @@ impl PrivateSite {
             }
         }
         let key = resolve();
-        let changed = self
-            .key
-            .borrow()
-            .as_ref()
-            .is_none_or(|old| old.as_str() != key.as_str());
+        let changed = self.key.borrow().as_ref().is_none_or(|old| *old != key);
         if changed {
             self.slot.set(u32::MAX);
             *self.entry_key.borrow_mut() = None;
@@ -5869,7 +5865,7 @@ mod feedback_layout_tests {
 
         assert!(bin_num(&mut interp, &mut stack, &feedback, 0, "+", |a, b| a + b).is_ok());
         assert!(
-            matches!((stack.last()).map(|__value| (__value).view()), Some(ValueView::Str(value)) if &*value == "left1")
+            matches!((stack.last()).map(|__value| (__value).view()), Some(ValueView::Str(value)) if &*value.text() == "left1")
         );
         let site = feedback.sites().next().unwrap().0;
         assert_eq!(
@@ -15753,15 +15749,15 @@ fn for_in_next(
             let ValueView::Str(name) = &(key).view() else {
                 unreachable!("for-in candidates are strings")
             };
-            if !i.js_has_property(source, name)? {
+            if !i.js_has_property(source, &name.text())? {
                 continue;
             }
         }
         // Reuse ordinary candidates: fresh strings would discard their computed-read cache
         // identity on every iteration. Only escaped leading-NUL keys need decoding.
         return Ok(Some(match key.view() {
-            ValueView::Str(name) if name.as_str().starts_with("\0\0") => {
-                crate::value::string_key_value(name)
+            ValueView::Str(name) if name.text().starts_with("\0\0") => {
+                crate::value::string_key_value(&*name.text())
             }
             _ => key,
         }));
@@ -21747,7 +21743,7 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
     let ValueView::Str(right) = (unsafe { base.add(1).read() }).view() else {
         unreachable!()
     };
-    if left.len().saturating_add(right.len()) > crate::interpreter::MAX_STR_LEN {
+    if left.text().len().saturating_add(right.text().len()) > crate::interpreter::MAX_STR_LEN {
         let ctx = unsafe { &mut *ctx };
         let i = unsafe { &mut *ctx.interp };
         let error = i.throw("RangeError", "Invalid string length");
@@ -21923,7 +21919,7 @@ unsafe fn jit_intrinsic_inner(
                             unreachable!("slice intrinsic end guard")
                         };
                         debug_assert!(s.ascii_hint());
-                        let len = s.len() as i64;
+                        let len = s.text().len() as i64;
                         let norm = |n: f64| {
                             if n.is_nan() {
                                 return 0;
@@ -21961,7 +21957,7 @@ unsafe fn jit_intrinsic_inner(
                         crate::builtins::has_own_property_trapped(
                             i,
                             &object,
-                            &crate::value::encode_string_key(key),
+                            &crate::value::encode_lstr_key(key),
                         )
                         .map(Value::Bool)
                         .map_err(Abrupt::Throw)
@@ -23502,7 +23498,7 @@ fn set_computed_element(
     // ToPropertyKey of a String is itself, and of an integral Number its decimal text: pass
     // them without building an owned key string.
     if let ValueView::Str(key) = &(key).view() {
-        return i.set_member_key(object, &crate::value::encode_string_key(key), value);
+        return i.set_member_key(object, &crate::value::encode_lstr_key(key), value);
     }
     if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
         return i.set_member_key(object, text.as_str(), value);
@@ -24381,7 +24377,7 @@ fn jit_method_operand_stat(obj: &Value, key: &Value) {
         _ => "other receiver",
     };
     let key = match &(key).view() {
-        ValueView::Str(s) if s.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
+        ValueView::Str(s) if s.text().as_bytes().first().is_some_and(u8::is_ascii_digit) => {
             "digit-leading string"
         }
         ValueView::Str(_) => "named string",
@@ -24539,7 +24535,7 @@ fn name_call_error(
         && matches!(
             (object.props.get("message").map(crate::value::Property::value)).map(|__value| (__value).view()),
             Some(ValueView::Str(message))
-                if crate::callee_name::is_unnamed_message(&message, construct)
+                if crate::callee_name::is_unnamed_message(&message.text(), construct)
         );
     if unnamed {
         object.props.insert(
@@ -26519,7 +26515,7 @@ mod layout_cell_roots_tests {
             .consts
             .iter()
             .find_map(|value| match (value).view() {
-                ValueView::Str(text) if &*text == "kept constant" => Some(text.cell_word()),
+                ValueView::Str(text) if &*text.text() == "kept constant" => Some(text.cell_word()),
                 _ => None,
             })
             .unwrap();
@@ -26556,7 +26552,7 @@ mod layout_cell_roots_tests {
                 .borrow()
                 .owns_cell(learned_word as usize, heap.property_layout_desc));
             assert!(chunk.consts.iter().any(
-                |value| matches!((value).view(), ValueView::Str(text) if &*text == "kept constant")
+                |value| matches!((value).view(), ValueView::Str(text) if &*text.text() == "kept constant")
             ));
         }
         drop(chunk);

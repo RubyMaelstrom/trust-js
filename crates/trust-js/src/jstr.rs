@@ -193,7 +193,7 @@ impl Utf8Index {
         let max_entries = max_bytes / std::mem::size_of::<(u32, u32)>();
         let mut extra = 0;
         let mut previous_high = false;
-        for (byte, c) in s.char_indices() {
+        for (byte, c) in s.text().char_indices() {
             if previous_high && smuggled_low(c).is_some() {
                 // Conservatively retain from_units canonicalization for smuggled pairs,
                 // including host-created non-canonical input.

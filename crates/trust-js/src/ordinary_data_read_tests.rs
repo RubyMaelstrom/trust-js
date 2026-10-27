@@ -324,7 +324,7 @@ fn ordinary_data_read_proxy_dispatch_receivers_and_invariants_all_tiers() {
                     .get_member_key(&error, "name")
                     .ok()
                     .expect("error name");
-                assert!(matches!((name).view(), ValueView::Str(s) if s.as_str()=="TypeError"));
+                assert!(matches!((name).view(), ValueView::Str(s) if s.text()=="TypeError"));
                 if traced {
                     assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
                 }

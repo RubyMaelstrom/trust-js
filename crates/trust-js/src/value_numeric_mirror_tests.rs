@@ -154,7 +154,7 @@ fn packed_mirror_clone_is_independent_and_preparation_work_is_bounded() {
     drop(original);
     assert_eq!(copy.mirror_get(1), Some(1.0));
     assert!(
-        matches!((copy.get("named").unwrap().value()).view(), ValueView::Str(value) if &*value == "kept")
+        matches!((copy.get("named").unwrap().value()).view(), ValueView::Str(value) if value.text() == "kept")
     );
 
     let mut maximum = packed(4096);

@@ -271,7 +271,7 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
             );
             assert!(outcome.error.is_none());
             let values = outcome.take_values();
-            assert!(matches!(&(values[0]).view(), ValueView::Str(s) if s.as_str() == "prefix"));
+            assert!(matches!(&(values[0]).view(), ValueView::Str(s) if s.text() == "prefix"));
             let actual = values.last().expect("named read pushes its result");
             assert!(
                 same_js_value(&mut engine, expected, actual),
@@ -329,7 +329,7 @@ fn named_read_proxy_reentry_runs_after_borrowed_lookup_and_keeps_method_receiver
         );
         let values = outcome.take_values();
         assert!(
-            matches!(&(values[0]).view(), ValueView::Str(value) if value.as_str() == "proxy-prefix")
+            matches!(&(values[0]).view(), ValueView::Str(value) if value.text() == "proxy-prefix")
         );
         assert!(matches!(
             (values.last()).map(|__value| (__value).view()),

@@ -1318,7 +1318,7 @@ pub mod embed {
 fn render_value(interp: &mut interpreter::Interp, value: &Value) -> String {
     interp
         .to_string(value)
-        .map(|s| jstr::to_text(&s).into_owned())
+        .map(|s| jstr::to_text(&s.text()).into_owned())
         .unwrap_or_default()
 }
 

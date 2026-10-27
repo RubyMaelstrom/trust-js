@@ -8040,7 +8040,7 @@ mod direct_call_tests {
             holder
                 .borrow_mut()
                 .props
-                .insert(key.as_str(), Property::plain(Value::Num(17.0)));
+                .insert(&*key.text(), Property::plain(Value::Num(17.0)));
             let mut object = holder;
             for _ in 0..depth {
                 object = Object::new(Some(object));
@@ -8052,7 +8052,7 @@ mod direct_call_tests {
                 Ok(ValueView::Num(17.0))
             ));
             for value in [Value::Num(29.0), Value::Str(key), receiver] {
-                holder.borrow_mut().props.set_value(&key, value);
+                holder.borrow_mut().props.set_value(&key.text(), value);
                 let mut operands = [receiver, (Value::Str(key))];
                 let end = unsafe { operands.as_mut_ptr().add(2) };
                 assert_eq!(
@@ -8077,17 +8077,17 @@ mod direct_call_tests {
                 // the receiver's cells intact, which a collection (and, in debug builds, its
                 // heap verifier) confirms.
                 engine.interp.gc_collect();
-                assert_eq!(key.as_str(), format!("method{depth}"));
+                assert_eq!(key.text(), format!("method{depth}"));
                 assert!(holder.try_borrow_mut().is_ok() && object.try_borrow_mut().is_ok());
             }
             holder
                 .borrow_mut()
                 .props
-                .get_mut(&key)
+                .get_mut(&key.text())
                 .unwrap()
                 .set_value(Value::Num(31.0));
             // Same string contents at a different allocation must miss the identity probe.
-            let fresh = crate::lstr::LStr::from(key.as_str());
+            let fresh = crate::lstr::LStr::from(&*key.text());
             let mut operands = [(receiver), (Value::Str(fresh))];
             unsafe {
                 entry(
@@ -8110,7 +8110,7 @@ mod direct_call_tests {
             holder
                 .borrow_mut()
                 .props
-                .insert(key.as_str(), Property::plain(Value::Num(n as f64)));
+                .insert(&*key.text(), Property::plain(Value::Num(n as f64)));
         }
         let receiver = Value::Obj(holder);
         let initial_mask = engine.interp.computed_reads.mask;

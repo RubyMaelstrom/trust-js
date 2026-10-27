@@ -1670,14 +1670,16 @@ impl Interp {
                 idx += 1;
                 if let ValueView::Str(k) = &(v).view() {
                     // (A string-primitive RHS's index keys are always present.)
-                    if matches!((rhs).view(), ValueView::Obj(_)) && !me.js_has_property(&rhs, k)? {
+                    if matches!((rhs).view(), ValueView::Obj(_))
+                        && !me.js_has_property(&rhs, &k.text())?
+                    {
                         continue;
                     }
                 }
                 // Keep ordinary candidate strings and decode only escaped leading-NUL keys.
                 break match v.view() {
-                    ValueView::Str(key) if key.as_str().starts_with("\0\0") => {
-                        crate::value::string_key_value(key)
+                    ValueView::Str(key) if key.text().starts_with("\0\0") => {
+                        crate::value::string_key_value(&*key.text())
                     }
                     _ => v,
                 };
@@ -2066,14 +2068,14 @@ impl Interp {
                 // reconstruction, including lone-surrogate handling.
                 if s.ascii_hint() {
                     let result = Ok(s
-                        .as_str()
+                        .text()
                         .bytes()
                         .map(|unit| Value::Str(crate::jstr::unit_lstr(unit as u16)))
                         .collect());
                     crate::jit::perf_iterate_fast_end(perf_started);
                     return result;
                 }
-                let result = Ok(crate::jstr::CodePointIter::new(s)
+                let result = Ok(crate::jstr::CodePointIter::new(&s.text())
                     .map(|point| {
                         if point < 0x80 {
                             Value::Str(crate::jstr::unit_lstr(point as u16))
@@ -2259,7 +2261,7 @@ impl Interp {
         let mut out = Vec::new();
         // A string primitive enumerates its index keys (ToObject makes them own properties).
         if let ValueView::Str(sv) = &(v).view() {
-            for k in 0..crate::jstr::unit_len(sv) {
+            for k in 0..sv.unit_len() {
                 out.push(k.to_string());
             }
             return Ok(out);
@@ -3038,7 +3040,7 @@ impl Interp {
         }
         if let ValueView::Str(name) = &(key).view() {
             if let Some(present) =
-                Self::ordinary_chain_has_property(target, &crate::value::encode_string_key(name))
+                Self::ordinary_chain_has_property(target, &crate::value::encode_lstr_key(name))
             {
                 return Ok(present);
             }
@@ -3214,7 +3216,7 @@ impl Interp {
                 return Ok(true);
             }
             if let Some(idx) = crate::value::canonical_index(key) {
-                if (idx as usize) < crate::jstr::unit_len(s) {
+                if (idx as usize) < s.unit_len() {
                     return Ok(true);
                 }
             }
@@ -3800,8 +3802,8 @@ impl Interp {
             // module; ordinary Source Text Module Records have no source object.
             ImportPhase::Source => {
                 let promise = self.new_promise();
-                if &*specifier == "<module source>" {
-                    let source = self.module_source_of(&specifier);
+                if &*specifier.text() == "<module source>" {
+                    let source = self.module_source_of(&specifier.text());
                     self.resolve_promise(&promise, source);
                 } else {
                     let reason = crate::interpreter::abrupt_value(
@@ -3828,7 +3830,7 @@ impl Interp {
                 }
                 let referrer = self.peek_binding("%importmeta%", env);
                 Ok(self.dynamic_import(
-                    &specifier,
+                    &specifier.text(),
                     attr_type.as_deref(),
                     matches!(phase, ImportPhase::Defer),
                     referrer,
@@ -3864,8 +3866,8 @@ impl Interp {
             ValueView::Obj(object) => {
                 let object = object.borrow();
                 Ok(Value::Bool(match site {
-                    Some(site) => site.find(object.internal_slots(), &key).is_some(),
-                    None => object.internal_slots().contains(&key),
+                    Some(site) => site.find(object.internal_slots(), &key.text()).is_some(),
+                    None => object.internal_slots().contains(&key.text()),
                 }))
             }
             _ => Err(self.throw("TypeError", "the right-hand side of 'in' must be an object")),
@@ -3885,7 +3887,7 @@ impl Interp {
         if let (Some(site), ValueView::Obj(object)) = (site, &(value).view()) {
             let object = object.borrow();
             if let Some(property) = site
-                .find(object.internal_slots(), &key)
+                .find(object.internal_slots(), &key.text())
                 .and_then(|slot| object.internal_slots().property_at(slot))
             {
                 if !property.accessor() {
@@ -3893,7 +3895,7 @@ impl Interp {
                 }
             }
         }
-        self.get_private_member(value, &key)
+        self.get_private_member(value, &key.text())
     }
 
     pub(crate) fn private_set_vm(
@@ -3909,7 +3911,7 @@ impl Interp {
         // and a missing element take the general path with its TypeErrors and setter call.
         if let (Some(site), ValueView::Obj(object)) = (site, &(base).view()) {
             let mut object = object.borrow_mut();
-            if let Some(slot) = site.find(object.internal_slots(), &key) {
+            if let Some(slot) = site.find(object.internal_slots(), &key.text()) {
                 if let Some((_, property)) = object.internal_slots_mut().entry_at_mut(slot) {
                     if !property.accessor() && property.writable() {
                         property.set_value(value);
@@ -3918,7 +3920,7 @@ impl Interp {
                 }
             }
         }
-        self.set_private_member(base, &key, value)
+        self.set_private_member(base, &key.text(), value)
     }
 
     pub(crate) fn super_base_vm(&mut self, env: &Env) -> Result<Value, Abrupt> {
@@ -5526,7 +5528,7 @@ impl Interp {
             ValueView::Str(s) => s,
             _ => return Ok(*value),
         };
-        self.perform_eval(&code, env, true)
+        self.perform_eval(&code.text(), env, true)
     }
 
     /// PerformEval: parse `code`, set up its variable + lexical environments, run
@@ -7184,7 +7186,7 @@ impl Interp {
             }
             // ToObject(string): copy the enumerable index properties.
             ValueView::Str(s) => {
-                for (idx, ch) in s.chars().enumerate() {
+                for (idx, ch) in s.text().chars().enumerate() {
                     let k = idx.to_string();
                     if is_excluded(&k) {
                         continue;
@@ -7501,7 +7503,7 @@ impl Interp {
         if key == "length" {
             return true;
         }
-        crate::value::canonical_index(key).is_some_and(|i| (i as usize) < crate::jstr::unit_len(s))
+        crate::value::canonical_index(key).is_some_and(|i| (i as usize) < s.unit_len())
     }
 
     fn eval_delete(&mut self, arg: &Expr, env: &Env) -> Result<Value, Abrupt> {
@@ -8349,7 +8351,7 @@ impl Interp {
             let (ValueView::Str(left), ValueView::Str(right)) = ((l).view(), (r).view()) else {
                 unreachable!()
             };
-            if left.len().saturating_add(right.len()) > MAX_STR_LEN {
+            if left.text().len().saturating_add(right.text().len()) > MAX_STR_LEN {
                 return Err(self.throw("RangeError", "Invalid string length"));
             }
             return Ok(Value::Str(left.concat_owned(&right)));
@@ -8438,7 +8440,7 @@ impl Interp {
             {
                 let ls = self.to_string(&lp)?;
                 let rs = self.to_string(&rp)?;
-                if ls.len() + rs.len() > MAX_STR_LEN {
+                if ls.text().len() + rs.text().len() > MAX_STR_LEN {
                     return Err(self.throw("RangeError", "Invalid string length"));
                 }
                 return Ok(Value::Str(ls.concat_owned(&rs)));
@@ -8600,7 +8602,7 @@ impl Interp {
             ValueView::Bool(b) => Ok(crate::bigint::JsBigInt::from_u64(b as u64)),
             ValueView::Str(s) => {
                 let mut poll = crate::bigint::Poll::new(&self.runtime_interrupt);
-                string_to_bigint_bounded(&s, &mut poll)
+                string_to_bigint_bounded(&s.text(), &mut poll)
                     .map_err(|stop| self.bigint_stop(stop))?
                     .ok_or_else(|| self.throw("SyntaxError", "Cannot convert string to a BigInt"))
             }
@@ -8617,7 +8619,7 @@ impl Interp {
         if let (ValueView::Str(a), ValueView::Str(b)) = (&(lp).view(), &(rp).view()) {
             // String relational comparison is per UTF-16 code unit (which differs from `str`
             // byte order once supplementary-plane characters are involved).
-            let ord = crate::jstr::cmp_units(a, b);
+            let ord = crate::jstr::cmp_units(&a.text(), &b.text());
             let res = match op {
                 "<" => ord.is_lt(),
                 ">" => ord.is_gt(),
@@ -8632,9 +8634,11 @@ impl Interp {
             (ValueView::BigInt(a), ValueView::BigInt(b)) => Some(a.cmp(b)),
             (ValueView::BigInt(a), ValueView::Str(t)) => {
                 // StringToBigInt: an unparsable string makes the comparison undefined (false).
-                string_to_bigint(t).map(|b| a.cmp(&b))
+                string_to_bigint(&t.text()).map(|b| a.cmp(&b))
             }
-            (ValueView::Str(t), ValueView::BigInt(b)) => string_to_bigint(t).map(|a| a.cmp(b)),
+            (ValueView::Str(t), ValueView::BigInt(b)) => {
+                string_to_bigint(&t.text()).map(|a| a.cmp(b))
+            }
             (ValueView::BigInt(a), _) => {
                 let n = self.to_number(&rp)?;
                 a.cmp_f64(n)
@@ -8921,7 +8925,7 @@ impl Interp {
             ValueView::BigInt(_) => {
                 return Err(self.throw("TypeError", "Cannot convert a BigInt value to a number"));
             }
-            ValueView::Str(s) => parse_number(s),
+            ValueView::Str(s) => parse_number(&s.text()),
             ValueView::Sym(_) => {
                 return Err(self.throw("TypeError", "Cannot convert a Symbol value to a number"));
             }
@@ -9186,7 +9190,9 @@ impl Interp {
             (ValueView::BigInt(x), ValueView::Str(s))
             | (ValueView::Str(s), ValueView::BigInt(x)) => {
                 // StringToBigInt: an unparsable string compares unequal.
-                string_to_bigint(s).map(|n| n == *x).unwrap_or(false)
+                string_to_bigint(&s.text())
+                    .map(|n| n == *x)
+                    .unwrap_or(false)
             }
             (ValueView::BigInt(_), ValueView::Obj(_)) => {
                 let bp = self.to_primitive(b, Hint::Default)?;

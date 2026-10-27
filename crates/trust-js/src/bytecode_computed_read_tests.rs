@@ -166,7 +166,7 @@ fn computed_read_helper_errors_consume_operands_not_prefix_or_local() {
                 assert!(engine.interp.strict_equals(&error, &sentinel));
             } else {
                 let name = engine.interp.get_member_key(&error, "name").ok().unwrap();
-                assert!(matches!((name).view(),ValueView::Str(s) if s.as_str()==expected_error));
+                assert!(matches!((name).view(),ValueView::Str(s) if s.text()==expected_error));
             }
         }
     }

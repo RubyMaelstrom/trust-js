@@ -86,12 +86,12 @@ fn substring_coercions_keep_original_receiver_and_abrupt_order() {
 fn sparse_byte_index_matches_utf16_reconstruction_and_declines_splits() {
     for tail in ["é中😀z", "\u{10f800}x\u{10ffff}", "😀😀é", "éa中b"] {
         let source: crate::lstr::LStr = format!("{}{}", "x".repeat(64), tail).into();
-        let units = crate::jstr::units(&source);
+        let units = crate::jstr::units(&source.text());
         let index = crate::jstr::Utf8Index::new(&source, usize::MAX);
         let mut copied = 0;
         for start in 60..=units.len() {
             for end in start..=units.len() {
-                if let Some(bytes) = index.range(&source, start, end) {
+                if let Some(bytes) = index.range(&source.text(), start, end) {
                     assert_eq!(bytes, crate::jstr::from_units(&units[start..end]));
                     copied += 1;
                 }
@@ -101,9 +101,9 @@ fn sparse_byte_index_matches_utf16_reconstruction_and_declines_splits() {
     }
     let source: crate::lstr::LStr = format!("{}😀z", "x".repeat(64)).into();
     let index = crate::jstr::Utf8Index::new(&source, usize::MAX);
-    assert!(index.range(&source, 64, 65).is_none());
-    assert!(index.range(&source, 65, 66).is_none());
-    assert_eq!(index.range(&source, 64, 66), Some("😀"));
+    assert!(index.range(&source.text(), 64, 65).is_none());
+    assert!(index.range(&source.text(), 65, 66).is_none());
+    assert_eq!(index.range(&source.text(), 64, 66), Some("😀"));
     let noncanonical: crate::lstr::LStr = format!(
         "{}{}{}",
         "x".repeat(64),
@@ -112,10 +112,10 @@ fn sparse_byte_index_matches_utf16_reconstruction_and_declines_splits() {
     )
     .into();
     let index = crate::jstr::Utf8Index::new(&noncanonical, usize::MAX);
-    assert!(index.range(&noncanonical, 64, 66).is_none());
+    assert!(index.range(&noncanonical.text(), 64, 66).is_none());
     let dense: crate::lstr::LStr = "é".repeat(128).into();
     let declined = crate::jstr::Utf8Index::new(&dense, 24);
-    assert!(declined.range(&dense, 0, 10).is_none());
+    assert!(declined.range(&dense.text(), 0, 10).is_none());
     assert_eq!(declined.heap_bytes(), std::mem::size_of_val(&declined));
 }
 
@@ -134,7 +134,7 @@ fn unicode_slice_index_stays_in_existing_cache_budget_and_pins_identity() {
         "the sparse index is charged to the existing cache"
     );
     let high = engine.interp.slice_units(&original, &units, 129, 130);
-    assert_eq!(crate::jstr::units(&high), [0xd83d]);
+    assert_eq!(crate::jstr::units(&high.text()), [0xd83d]);
     for n in 0..80 {
         let source: crate::lstr::LStr = format!("{n}{}é", "x".repeat(128)).into();
         let view = engine.interp.units_full(&source);
@@ -145,7 +145,7 @@ fn unicode_slice_index_stays_in_existing_cache_budget_and_pins_identity() {
     let copied = engine
         .interp
         .slice_units(&original, &units, 128, units.len());
-    assert!(matches!((Value::Str(copied)).view(), ValueView::Str(s) if s.as_str() == "é😀z"));
+    assert!(matches!((Value::Str(copied)).view(), ValueView::Str(s) if s.text() == "é😀z"));
 }
 
 #[test]
@@ -207,19 +207,16 @@ fn prepared_windows_pin_shared_tables_and_map_astral_offsets() {
         let mut engine = Engine::new();
         let cached_parent = engine.interp.re_text(unicode, &source);
         let parent = Rc::new(ReText::new_rc(unicode, &source));
-        let input = source.slice_bytes(102, source.len());
+        let input = source.slice_bytes(102, source.text().len());
         let cached_window = engine.interp.re_text(unicode, &input);
         assert!(
             Rc::strong_count(&cached_parent) >= 3,
             "window shares the cached table"
         );
-        assert_eq!(cached_window.slice(0, cached_window.len()), input.as_str());
-        let start = crate::jstr::unit_len(&source[..102]);
+        assert_eq!(cached_window.slice(0, cached_window.len()), input.text());
+        let start = crate::jstr::unit_len(&source.text()[..102]);
         let window = ReText::window(parent.clone(), &input, start, 1028).unwrap();
-        assert_eq!(
-            window.unit_index(window.len()),
-            crate::jstr::unit_len(&input)
-        );
+        assert_eq!(window.unit_index(window.len()), input.unit_len());
         let reference = ReText::new_rc(unicode, &input);
         for u in 0..=window.unit_index(window.len()) + 1 {
             assert_eq!(window.elem_at_unit(u), reference.elem_at_unit(u));

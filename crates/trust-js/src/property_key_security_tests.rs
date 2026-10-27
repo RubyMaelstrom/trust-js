@@ -152,7 +152,7 @@ fn encoded_string_keys_never_claim_symbol_ownership() {
         let key = crate::value::PropertyKey::string(text.to_string());
         assert!(!Interp::is_sym_key(&key));
         assert_eq!(crate::value::decode_string_key(&key), text);
-        assert!(matches!((key.into_value()).view(), ValueView::Str(value) if &*value == text));
+        assert!(matches!((key.into_value()).view(), ValueView::Str(value) if value.text() == text));
     }
 }
 

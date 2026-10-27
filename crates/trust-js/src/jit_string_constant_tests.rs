@@ -170,11 +170,11 @@ fn returned(
     let ValueView::Str(string) = &(value).view() else {
         panic!("{call} returned no string")
     };
-    assert_eq!(string.as_str(), text, "{tier:?} {call}");
+    assert_eq!(string.text(), text, "{tier:?} {call}");
     if tier != Tier::Interp {
         with_chunk(engine, name, spliced, |chunk| {
             let constant = &constants(chunk)[index];
-            assert_eq!(constant.as_str(), text, "{tier:?} {name}'s constant");
+            assert_eq!(constant.text(), text, "{tier:?} {name}'s constant");
             assert!(
                 LStr::ptr_eq(string, constant),
                 "{tier:?} {call} returns {name}'s constant itself"
@@ -345,11 +345,11 @@ fn grown_apart(engine: &mut Engine, tier: Tier, name: &str, n: usize) {
     let ValueView::Str(grown) = &(value).view() else {
         panic!("{name}({n}) returned no string")
     };
-    assert_eq!(grown.as_str(), "abc".to_owned() + &"d".repeat(n));
+    assert_eq!(grown.text(), "abc".to_owned() + &"d".repeat(n));
     if tier != Tier::Interp {
         with_chunk(engine, name, false, |chunk| {
             let constant = &constants(chunk)[0];
-            assert_eq!(constant.as_str(), "abc", "{tier:?} {name}'s literal");
+            assert_eq!(constant.text(), "abc", "{tier:?} {name}'s literal");
             assert_eq!(
                 constant.allocation_requested_bytes(),
                 LStr::from("abc").allocation_requested_bytes(),
@@ -472,6 +472,6 @@ fn spliced_apart(engine: &mut Engine) {
 #[inline(never)]
 fn spliced_text(engine: &mut Engine, text: &str) {
     with_chunk(engine, "caller", true, |chunk| {
-        assert_eq!(constants(chunk)[0].as_str(), text);
+        assert_eq!(constants(chunk)[0].text(), text);
     });
 }

@@ -149,7 +149,7 @@ fn osr_entry_operand_prefix_is_a_root() {
             .expect("the prefix loop completes");
         let marks = engine.interp.get_var("osrMarks", &env).ok().expect("marks");
         assert!(
-            matches!(&(marks).view(), ValueView::Str(marks) if marks.as_str() == "R"),
+            matches!(&(marks).view(), ValueView::Str(marks) if marks.text() == "R"),
             "the prefix was marked by a root"
         );
         let tag = result
@@ -162,7 +162,7 @@ fn osr_entry_operand_prefix_is_a_root() {
         tag
     });
     assert!(
-        matches!((tag).map(|__value| (__value).view()), Some(ValueView::Str(tag)) if tag.as_str() == "O")
+        matches!((tag).map(|__value| (__value).view()), Some(ValueView::Str(tag)) if tag.text() == "O")
     );
     assert!(crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()) > 0);
     let census = last_census();

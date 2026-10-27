@@ -152,7 +152,7 @@ fn named_copy_shares_only_keys_and_normalizes_flags() {
     target.insert("a", Property::plain(Value::lstr("changed")));
     target.insert("tail", Property::plain(Value::Num(7.0)));
     assert!(
-        matches!((source.get("a").unwrap().value()).view(),ValueView::Str(s) if &*s == "owned")
+        matches!((source.get("a").unwrap().value()).view(),ValueView::Str(s) if s.text() == "owned")
     );
     assert!(!source.contains("tail"));
     assert!(matches!(

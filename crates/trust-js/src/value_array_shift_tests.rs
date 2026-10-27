@@ -113,7 +113,7 @@ fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
                     }
                     if named {
                         assert!(
-                            matches!((props.get("named").unwrap().value()).view(), ValueView::Str(s) if &*s == "preserved")
+                            matches!((props.get("named").unwrap().value()).view(), ValueView::Str(s) if s.text() == "preserved")
                         );
                         assert_eq!(props.get("01").unwrap().number_value(), Some(71.0));
                         assert_eq!(props.get("4294967295").unwrap().number_value(), Some(72.0));

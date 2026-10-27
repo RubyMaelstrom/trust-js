@@ -89,5 +89,5 @@ fn immutable_key_encoding_cache_is_bounded_and_owns_no_objects() {
     let (entries, bytes) = engine.interp.property_key_strings.stats();
     assert!(entries <= 512 && bytes <= 256 << 10);
     engine.interp.gc_collect();
-    assert_eq!(&*engine.interp.property_key_string(&key), &*key);
+    assert_eq!(engine.interp.property_key_string(&key).text(), &*key);
 }

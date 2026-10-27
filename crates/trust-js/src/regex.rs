@@ -2050,7 +2050,7 @@ impl ReText {
         if parent.parent.is_some() || end > parent.unit_index(parent.len()) || start > end {
             return None;
         }
-        debug_assert_eq!(crate::jstr::unit_len(source), end - start);
+        debug_assert_eq!(source.unit_len(), end - start);
         let first = parent.elem_at_unit(start);
         let last = parent.elem_at_unit(end);
         if parent.unit_index(first) != start || parent.unit_index(last) != end {
@@ -2060,7 +2060,7 @@ impl ReText {
         // astral characters and smuggled surrogates. Equality for this proven unit
         // range therefore proves the visible source is ASCII without scanning it.
         // A wide prefix/tail must not prevent the slice from using the byte matcher.
-        let ascii = source.len() == end - start;
+        let ascii = source.text().len() == end - start;
         Some(Self {
             elems: Vec::new(),
             unit_of: None,
@@ -2096,7 +2096,7 @@ impl ReText {
             return ReText {
                 elems: Vec::new(),
                 unit_of: None,
-                n_elems: s.len(),
+                n_elems: s.text().len(),
                 subject_shape: SUBJECT_ASCII,
                 unicode,
                 ascii_src: Some(*s),
@@ -2107,7 +2107,7 @@ impl ReText {
         }
         // Keep the engine string itself: `LStr::clone` copies a handle, and its immutable
         // bytes can be matched and sliced directly.
-        Self::build(unicode, s, Some(*s))
+        Self::build(unicode, &s.text(), Some(*s))
     }
 
     fn build(unicode: bool, s: &str, src: Option<crate::lstr::LStr>) -> ReText {
@@ -2230,7 +2230,7 @@ impl ReText {
     /// Append [`Self::slice`] to `out`, copying straight out of an ASCII source.
     pub(crate) fn push_slice(&self, out: &mut String, a: usize, b: usize) {
         match &self.ascii_src {
-            Some(src) => out.push_str(&src.as_str()[a..b]),
+            Some(src) => out.push_str(&src.text()[a..b]),
             None => out.push_str(&self.slice(a, b)),
         }
     }
@@ -2239,7 +2239,7 @@ impl ReText {
     pub fn slice(&self, a: usize, b: usize) -> String {
         // ASCII subject: element index == byte index — copy straight from the source.
         if let Some(src) = &self.ascii_src {
-            return src[a..b].to_string();
+            return src.text()[a..b].to_string();
         }
         let elems = &self.elements()[a..b];
         // ASCII fast path: elements are the bytes.
@@ -2657,28 +2657,30 @@ impl Regex {
         match &text.ascii_src {
             Some(s) => {
                 if let Some(literal) = &self.literal_ascii {
-                    Ok(
-                        find_ascii_literal(s.as_bytes(), start, literal, self.sticky, control)?
-                            .map(Captures::one),
-                    )
+                    Ok(find_ascii_literal(
+                        s.text().as_bytes(),
+                        start,
+                        literal,
+                        self.sticky,
+                        control,
+                    )?
+                    .map(Captures::one))
                 } else if let Some(literal) = &self.literal_fold {
-                    Ok(
-                        find_ascii_fold_literal(
-                            s.as_bytes(),
-                            start,
-                            literal,
-                            self.sticky,
-                            control,
-                        )?
-                        .map(Captures::one),
-                    )
+                    Ok(find_ascii_fold_literal(
+                        s.text().as_bytes(),
+                        start,
+                        literal,
+                        self.sticky,
+                        control,
+                    )?
+                    .map(Captures::one))
                 } else if let Some(native) = self.one_byte_native.borrow().as_ref() {
                     regexp_prof_native_exec();
                     Ok(native
-                        .find_ascii(s.as_bytes(), start, self.sticky, control)?
+                        .find_ascii(s.text().as_bytes(), start, self.sticky, control)?
                         .map(Captures::one))
                 } else {
-                    self.exec_impl(s.as_bytes(), start, control)
+                    self.exec_impl(s.text().as_bytes(), start, control)
                 }
             }
             None if text.subject_shape() == SUBJECT_ONE_BYTE => {
@@ -2716,14 +2718,20 @@ impl Regex {
         match &text.ascii_src {
             Some(s) => {
                 if let Some(literal) = &self.literal_ascii {
-                    find_ascii_literal(s.as_bytes(), start, literal, self.sticky, control)
+                    find_ascii_literal(s.text().as_bytes(), start, literal, self.sticky, control)
                 } else if let Some(literal) = &self.literal_fold {
-                    find_ascii_fold_literal(s.as_bytes(), start, literal, self.sticky, control)
+                    find_ascii_fold_literal(
+                        s.text().as_bytes(),
+                        start,
+                        literal,
+                        self.sticky,
+                        control,
+                    )
                 } else if let Some(native) = self.one_byte_native.borrow().as_ref() {
                     regexp_prof_native_exec();
-                    native.find_ascii(s.as_bytes(), start, self.sticky, control)
+                    native.find_ascii(s.text().as_bytes(), start, self.sticky, control)
                 } else {
-                    self.find_impl(s.as_bytes(), start, control)
+                    self.find_impl(s.text().as_bytes(), start, control)
                 }
             }
             None if text.subject_shape() == SUBJECT_ONE_BYTE => {
@@ -6582,15 +6590,15 @@ mod internal_engine_diagnostics {
     fn wide_windows_keep_unit_mapping_and_surrogate_boundary_guards() {
         use super::*;
         let root: crate::lstr::LStr = format!("😀{}éz", "a".repeat(1024)).into();
-        let source = root.slice_bytes(4, root.len());
+        let source = root.slice_bytes(4, root.text().len());
         for unicode in [false, true] {
             let parent = Rc::new(ReText::new_rc(unicode, &root));
-            let end = crate::jstr::unit_len(&root);
+            let end = root.unit_len();
             let window = ReText::window(parent.clone(), &source, 2, end).unwrap();
             assert!(window.ascii_src.is_none());
             assert!(window.parent.is_some());
             assert_eq!(window.unit_index(window.len()), end - 2);
-            assert_eq!(window.slice(0, window.len()), source.as_str());
+            assert_eq!(window.slice(0, window.len()), source.text());
             if unicode {
                 let empty = crate::lstr::LStr::from("");
                 assert!(ReText::window(parent, &empty, 1, 1).is_none());
