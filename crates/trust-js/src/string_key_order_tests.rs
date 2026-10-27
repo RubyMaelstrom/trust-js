@@ -1,5 +1,6 @@
 //! ECMA-262 editor's draft e28783d5, spec.html: CanonicalNumericIndexString 5787,
-//! IsLessThan 6085, StringGetOwnProperty 14889, CompareArrayElements 41667.
+//! IsLessThan 6085, StringGetOwnProperty 14889, StringToCodePoints 16749, SV 17829,
+//! CompareArrayElements 41667.
 
 use crate::bytecode::Tier;
 use crate::value::Value;
@@ -182,3 +183,38 @@ fn object_spread_and_rest_copy_a_strings_code_units() {
         "0=61 1=d83d 2=de00 3=62|x|1=d83d 2=de00|0=61 1=d83d 2=de00|2",
     );
 }
+
+#[test]
+fn literal_keys_rejoin_surrogate_pairs_split_in_source() {
+    // eval's source is the string's code points, so a raw high surrogate before a `\u` low one
+    // (or a `\u` high before a raw low) is a pair in the literal's SV: the key is the
+    // character, and reads, writes and computed keys of it reach the same property.
+    check(
+        r#"
+        function run(){
+            var out=[];
+            var o=eval('({"\ud83d\\ude00": 1, "\\ud83d\ude01": 2})'),k=Object.keys(o);
+            out.push(k[0]==='\u{1f600}',k[1]==='\u{1f601}',o[k[0]],o[k[1]],k[0] in o,o['\u{1f601}']);
+            var g=Function('return {"\ud83d\\ude00": 3}')();
+            out.push(g['\u{1f600}'],Object.keys(g)[0].length);
+            var c=eval('(class { "\ud83d\\ude00"() { return 7; } })');
+            out.push(new c()['\u{1f600}']());
+            var two=eval('({"\ud83d\\ude00": 1, ["\ud83d\ude00"]: 2})');
+            out.push(Object.keys(two).length,two['\u{1f600}']);
+            var o3={};o3['\u{1f600}']=5;
+            out.push(eval('o3["\ud83d\\ude00"]'),eval('"\ud83d\\ude00" in o3'));
+            eval('o3["\ud83d\\ude00"] = 6');
+            out.push(o3['\u{1f600}'],Object.keys(o3).length);
+            var {"\ud83d\ude00": d}=eval('({"\ud83d\\ude00": 8})');
+            out.push(d);
+            var lone=eval('({"\ud83d\\u0041": 1})'),lk=Object.keys(lone)[0];
+            out.push(lk.length,lk.charCodeAt(0),lone[lk]);
+            var big=eval('({"\udbff\\udfff": 9})'),bk=Object.keys(big)[0];
+            out.push(bk==='\u{10ffff}',big['\u{10ffff}']);
+            return out.join('|');
+        }run()
+        "#,
+        "true|true|1|2|true|2|3|2|7|1|2|5|true|6|1|8|2|55357|1|true|9",
+    );
+}
+

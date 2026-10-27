@@ -343,6 +343,40 @@ pub fn paired_char(a: char, b: char) -> Option<char> {
     char::from_u32(0x10000 + ((hi as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00))
 }
 
+/// `s` with each smuggled high+low pair that encodes a character below the smuggle range
+/// rejoined into that character, or `None` when it has none. Text built in pieces gets such a
+/// pair, as source made at run time does when a raw lone surrogate meets a `\u` escape.
+pub(crate) fn join_split_pairs(s: &str) -> Option<String> {
+    if !may_hold_smuggle_range(s) {
+        return None;
+    }
+    let mut prev = None;
+    let split = s.chars().any(|c| {
+        let joins = prev
+            .and_then(|p| paired_char(p, c))
+            .is_some_and(|c| (c as u32) < SMUGGLE_BASE);
+        prev = Some(c);
+        joins
+    });
+    split.then(|| from_units(&units(s)))
+}
+
+/// Whether `s` holds a lone surrogate: a smuggled scalar outside a smuggled pair.
+pub(crate) fn has_lone_surrogate(s: &str) -> bool {
+    if !may_hold_smuggle_range(s) {
+        return false;
+    }
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if smuggled_high(c).is_some() && chars.peek().is_some_and(|&n| smuggled_low(n).is_some()) {
+            chars.next();
+        } else if smuggled(c).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether `c` is a smuggled HIGH surrogate (U+D800..U+DBFF).
 #[inline]
 fn smuggled_high(c: char) -> Option<u16> {

@@ -626,6 +626,14 @@ impl Lexer<'_> {
                 Some(_) => return Err(self.err("unterminated string literal")),
             }
         }
+        // Source made at run time can split a surrogate pair between a raw lone surrogate and
+        // a `\u` escape. Rejoin it, so the text, which property keys use, is canonical.
+        if self.pending_lone_surrogate {
+            if let Some(joined) = crate::jstr::join_split_pairs(&s) {
+                self.pending_lone_surrogate = crate::jstr::has_lone_surrogate(&joined);
+                s = joined;
+            }
+        }
         self.push(Tok::Str(s));
         // A directive prologue string that used escapes never matches "use strict".
         if had_escape {
