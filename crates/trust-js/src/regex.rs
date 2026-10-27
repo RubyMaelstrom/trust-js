@@ -281,6 +281,10 @@ pub struct Regex {
     first_line_start: bool,
     /// A literal every match contains, which exec scans for before running the matcher.
     prefilter: Option<Box<Prefilter>>,
+    /// The one element every match is, when the program is `Save(0), X, Save(1), Match` for a
+    /// Char, Any or Class X: the first-element scan finds its candidates and one test of the
+    /// element decides each, without the matcher.
+    single: Option<Rep>,
     /// Per-pattern execution feedback. These cells add no allocation to cold patterns; the native
     /// straight-line program is compiled lazily after the tier-up threshold.
     tier_ticks: Cell<u32>,
@@ -2388,6 +2392,10 @@ impl Regex {
                 ),
             _ => 0,
         };
+        let single = self
+            .single
+            .as_ref()
+            .map_or(0, |rep| scan_rep_retained_memory(rep, visitor));
         std::mem::size_of::<Self>()
             .saturating_add(
                 self.prog
@@ -2396,6 +2404,7 @@ impl Regex {
             )
             .saturating_add(scan_program_references(&self.prog, visitor))
             .saturating_add(first)
+            .saturating_add(single)
             .saturating_add(self.prefilter.as_ref().map_or(0, |p| p.heap_bytes()))
             .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(self.literal_fold.as_ref().map_or(0, |bytes| bytes.len()))
@@ -2611,6 +2620,7 @@ impl Regex {
         let memo_string_failures = p.ngroups == 0 && program_contains_string_set(&prog);
         let single_start = flags.contains('y') || matches!(first, FirstFilter::Anchored);
         let prefilter = Prefilter::new(&ast, flags.contains('i'), single_start);
+        let single = single_element(&prog);
         let mut re = Regex {
             unicode,
             nmarks: lowering.marks,
@@ -2623,6 +2633,7 @@ impl Regex {
             first_ascii: None,
             first_line_start,
             prefilter,
+            single,
             tier_ticks: Cell::new(0),
             subject_shapes: Cell::new(0),
             tier_up_attempted: Cell::new(false),
@@ -2959,6 +2970,58 @@ impl Regex {
         })
     }
 
+    /// The first match of a single-element program (see [`Regex::single`]) from `start`, or at
+    /// `only` alone, which the caller has checked the first-element filter admits: the filter's
+    /// scan proposes each start and the element there decides it, as the matcher's one
+    /// instruction would.
+    fn find_single<I: ReInput>(
+        &self,
+        input: I,
+        start: usize,
+        only: Option<usize>,
+        element: &Rep,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<(usize, usize)> {
+        let prof = regexp_prof_enabled();
+        let mut from = start;
+        loop {
+            let at = match only {
+                Some(at) => at,
+                None if self.may_start(input, from) => from,
+                None if from >= input.len() => return Ok(None),
+                None => {
+                    let after = input.next_elem(from).1;
+                    let next = self.next_start(input, after, input.len(), control)?;
+                    if prof {
+                        let skipped = next.unwrap_or(input.len() + 1) - from;
+                        REGEXP_PROF.with(|p| p.borrow_mut().scan_positions += skipped as u64);
+                    }
+                    match next {
+                        Some(at) => at,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            if prof {
+                REGEXP_PROF.with(|p| p.borrow_mut().attempts += 1);
+            }
+            if at < input.len() {
+                let (c, next) = input.next_elem(at);
+                if element_matches(element, c, self.ignore_case, self.dotall, self.unicode) {
+                    return Ok(Some((at, next)));
+                }
+            }
+            if only.is_some() || at >= input.len() {
+                return Ok(None);
+            }
+            let next = input.next_elem(at).1;
+            if (at ^ next) > INTERRUPT_POLL_MASK {
+                poll_interrupt(control)?;
+            }
+            from = next;
+        }
+    }
+
     fn exec_impl_with<I: ReInput, T, F: Fn(&[Option<usize>]) -> T>(
         &self,
         input: I,
@@ -2992,6 +3055,10 @@ impl Regex {
                     return Ok(None);
                 }
             }
+        }
+        if let Some(element) = &self.single {
+            let found = self.find_single(input, start, only, element, control)?;
+            return Ok(found.map(|(at, next)| project(&[Some(at), Some(next)])));
         }
         // One matcher for the whole scan, on the program's own scratch. Matching runs no code, so
         // nothing enters it again while it is held; a fresh scratch would keep that harmless.
@@ -4936,6 +5003,56 @@ fn resolve_named_backrefs(node: &mut Node, names: &[(String, usize)]) {
     })
 }
 
+/// The element a program matches when it is `Save(0), X, Save(1), Match` for a Char, Any or
+/// Class X (see [`Regex::single`]). `TRUST_JS_REGEXP_NO_SINGLE_ELEMENT=1` keeps every such
+/// program on the matcher.
+fn single_element(prog: &[Inst]) -> Option<Rep> {
+    if env_flag!("TRUST_JS_REGEXP_NO_SINGLE_ELEMENT") {
+        return None;
+    }
+    match prog {
+        [Inst::Save(0), element, Inst::Save(1), Inst::Match] => match element {
+            Inst::Char(c) => Some(Rep::Char(*c)),
+            Inst::Any => Some(Rep::Any),
+            Inst::Class(class) => Some(Rep::Class(class.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether subject element `a` matches pattern element `b` under the case rules of `icase` and
+/// Unicode mode, as the matcher's Char instruction compares them.
+#[inline(always)]
+fn chars_eq(a: u32, b: u32, icase: bool, unicode: bool) -> bool {
+    if a == b {
+        return true;
+    }
+    if icase {
+        let (ca, cb) = match (char::from_u32(a), char::from_u32(b)) {
+            (Some(x), Some(y)) => (x, y),
+            _ => return false, // lone surrogates have no case
+        };
+        if unicode {
+            // Full case folding via the generated orbit table (ſ≡s, ΐ≡ΐ, K≡k, ...).
+            return fold_canon(ca as u32) == fold_canon(cb as u32);
+        }
+        return canonicalize_legacy(ca) == canonicalize_legacy(cb);
+    }
+    false
+}
+
+/// Whether subject element `c` matches `rep` under the flags `icase` and `dotall` and Unicode
+/// mode, as the matcher's Char, Any and Class instructions test it.
+#[inline(always)]
+fn element_matches(rep: &Rep, c: u32, icase: bool, dotall: bool, unicode: bool) -> bool {
+    match rep {
+        Rep::Char(ch) => chars_eq(c, *ch, icase, unicode),
+        Rep::Any => dotall || !is_line_terminator_u32(c),
+        Rep::Class(cc) => cc.matches(c, icase, unicode),
+    }
+}
+
 /// If `node` matches exactly one code point, return it as a `Rep` (for the `Inst::Many` fast path).
 fn single_char_rep(node: &Node) -> Option<Rep> {
     match node {
@@ -5912,21 +6029,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
     /// Compare two subject/pattern code points under the active case rules.
     #[inline(always)]
     fn eqc_uu(&self, a: u32, b: u32) -> bool {
-        if a == b {
-            return true;
-        }
-        if self.icase() {
-            let (ca, cb) = match (char::from_u32(a), char::from_u32(b)) {
-                (Some(x), Some(y)) => (x, y),
-                _ => return false, // lone surrogates have no case
-            };
-            if self.unicode {
-                // Full case folding via the generated orbit table (ſ≡s, ΐ≡ΐ, K≡k, ...).
-                return fold_canon(ca as u32) == fold_canon(cb as u32);
-            }
-            return canonicalize_legacy(ca) == canonicalize_legacy(cb);
-        }
-        false
+        chars_eq(a, b, self.icase(), self.unicode)
     }
 
     /// The next element to consume and the position after it, honouring the match direction.
@@ -6020,11 +6123,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
 
     #[inline(always)]
     fn rep_matches(&self, rep: &Rep, c: u32) -> bool {
-        match rep {
-            Rep::Char(ch) => self.eqc_uu(c, *ch),
-            Rep::Any => self.dotall() || !is_line_terminator_u32(c),
-            Rep::Class(cc) => cc.matches(c, self.icase(), self.unicode),
-        }
+        element_matches(rep, c, self.icase(), self.dotall(), self.unicode)
     }
 
     #[inline(always)]

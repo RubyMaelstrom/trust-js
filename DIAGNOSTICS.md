@@ -249,6 +249,9 @@ comment/example in the same change.
   and tries only the starts that put an occurrence in range, and a sticky regex, or one anchored
   at the input's start, enters the matcher only when the literal lies in range of its one start.
   With the switch set, exec tries every start the first-element filter lets through.
+- `TRUST_JS_REGEXP_NO_SINGLE_ELEMENT=1` keeps patterns that match exactly one element (one
+  character, `.` or one class, as in `/[&<>]/`) on the matcher. Otherwise exec finds the starts
+  the first-element filter admits and tests the element at each, without entering the matcher.
 - `TRUST_JS_REGEXP_NO_SIMD=1` keeps the subject scans (for the prefilter's literal, and for a
   match's first element by byte or by table) on their portable loops instead of AArch64 vector
   code.

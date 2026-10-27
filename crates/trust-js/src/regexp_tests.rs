@@ -133,6 +133,55 @@ fn sticky_regexps_try_only_lastindex() {
     );
 }
 
+/// A pattern that matches one element (a character, `.` or a class) matches as the matcher's
+/// one instruction would, at every start the scan proposes: case folding with and without `u`,
+/// line terminators and `s`, surrogate pairs as one element or two, sticky and global starts, and
+/// through `test`, `replace`, `split` and `search`, on one- and two-byte subjects.
+#[test]
+fn single_element_patterns_match_as_the_matcher_does() {
+    check(
+        r#"
+        function all(re, s) {
+            var out = [];
+            re.lastIndex = 0;
+            for (var m; (m = re.exec(s)); ) { out.push(m.index + ":" + m[0]); if (m[0] === "") re.lastIndex++; }
+            return out.join(",");
+        }
+        function at(re, s, i) {
+            re.lastIndex = i;
+            var m = re.exec(s);
+            return m ? [m.index, m[0], re.lastIndex] : [null, re.lastIndex];
+        }
+        var two = "a’<b>&c\n\r d\u{1F600}e";
+        JSON.stringify([
+            all(/[&<>]/g, two),
+            all(/[&<>]/g, "a<b>&c"),
+            /[&<>]/.test(two), /[&<>]/.test("abc’"),
+            all(/./g, "\n\r a b"),
+            all(/./gs, "\n\r"),
+            all(/./gu, "\u{1F600}x\uD800y"),
+            all(/./g, "\u{1F600}"),
+            all(/[^a]/gu, "a\u{1F600}a"),
+            all(/x/gi, "aXbx’X"),
+            all(/ſ/giu, "sSſ"),
+            all(/ſ/gi, "sSſ"),
+            all(/k/giu, "KKk"),
+            all(/\S/g, " \t ﻿a"),
+            at(/[ \t]/y, "a b", 1), at(/[ \t]/y, "a b", 0), at(/[ \t]/dy, "a b", 1),
+            at(/\u{1F600}/uy, "a\u{1F600}", 2), at(/./uy, "a\u{1F600}", 2),
+            at(/[\r\n"'()*+.:<=[\\\]^_`${}~-]/g, "abc ’ def*ghi", 2),
+            /[\r\n"'()*+.:<=[\\\]^_`${}~-]/d.exec("ab*").indices[0],
+            "a<b>c".replace(/[<>]/g, "-"),
+            "a<b>c".split(/[<>]/),
+            "a’<b".search(/[<>]/),
+            "x".repeat(70000).search(/y/),
+            ("x".repeat(70000) + "’y").search(/y/),
+        ])
+        "#,
+        r#"["2:<,4:>,5:&","1:<,3:>,4:&",true,false,"3:a,5:b","0:\n,1:\r","0:😀,2:x,3:\ud800,4:y","0:\ud83d,1:\ude00","1:😀","1:X,3:x,5:X","0:s,1:S,2:ſ","2:ſ","0:K,1:K,2:k","4:a",[1," ",2],[null,0],[1," ",2],[1,"😀",3],[1,"😀",3],[9,"*",10],[2,3],"a-b-c",["a","b","c"],2,-1,70001]"#,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).
