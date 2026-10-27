@@ -2932,6 +2932,10 @@ pub(crate) struct GcState {
     pub(crate) interned_strings: RefCell<Vec<Option<crate::lstr::LStr>>>,
     /// This heap's atoms, roots for the heap's lifetime (see [`crate::atom`]).
     pub(crate) atoms: RefCell<crate::atom::AtomTable>,
+    /// The binding layouts this heap's environments have shared, kept for the heap's lifetime
+    /// so that an environment names its layout without owning it ([`keep_binding_layout`]).
+    binding_layouts:
+        RefCell<crate::fasthash::FastMap<usize, Rc<crate::interpreter::BindingLayout>>>,
     /// Actual AST template and compiled chunk owners, weakly registered in their heap. Their
     /// constants and layouts are roots for the Rust owner's lifetime, including late fields.
     pub(crate) code_roots: RefCell<Vec<std::rc::Weak<dyn crate::gc_trace::GcTrace>>>,
@@ -3050,6 +3054,7 @@ pub(crate) struct PayloadDescs {
     typed_array: crate::gc_core::DescId,
     extras: crate::gc_core::DescId,
     closure_cache: crate::gc_core::DescId,
+    large_bindings: crate::gc_core::DescId,
 }
 
 macro_rules! payload_kinds {
@@ -3080,6 +3085,7 @@ payload_kinds! {
     crate::native_typed_array::NativeTypedArray => typed_array,
     DenseExtras => extras,
     UserCallableCache => closure_cache,
+    crate::interpreter::LargeBindings => large_bindings,
 }
 
 impl PayloadDescs {
@@ -3122,6 +3128,9 @@ impl PayloadDescs {
             ),
             extras: leaf(payload_layout::<DenseExtras>("property map extras")),
             closure_cache: leaf(payload_layout::<UserCallableCache>("closure cache")),
+            large_bindings: leaf(payload_layout::<crate::interpreter::LargeBindings>(
+                "environment bindings",
+            )),
         }
     }
 }
@@ -3173,7 +3182,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
         name: "environment",
         trace: trace_scope_cell,
         mark_trace: Some(mark_scope_cell),
-        finalize: Some(finalize_scope_cell),
+        finalize: layout_census::enabled().then_some(census_dead_scope as _),
         carded: true,
     });
     // BigInts, Symbols and property layouts hold no edges either: marking one queues no trace.
@@ -3278,6 +3287,21 @@ fn trace_user_fn<S: crate::gc_trace::TraceSink + ?Sized>(user: &UserCallable, si
         origin.trace_edges(sink);
     }
     user.cache.set(metadata);
+}
+
+/// `layout`, which the active heap keeps from now on for as long as it lives, as its environments
+/// name it: they share it without owning it ([`crate::interpreter::LayoutRef`]).
+pub(crate) fn keep_binding_layout(
+    layout: &Rc<crate::interpreter::BindingLayout>,
+) -> crate::interpreter::LayoutRef {
+    with_agent_heap(|heap| {
+        heap.binding_layouts
+            .borrow_mut()
+            .entry(Rc::as_ptr(layout) as usize)
+            .or_insert_with(|| layout.clone());
+    });
+    // SAFETY: the active heap keeps the layout from now on.
+    unsafe { crate::interpreter::LayoutRef::kept(layout) }
 }
 
 /// `f` on the active Agent heap's atom table (see [`crate::atom`]).
@@ -3645,18 +3669,19 @@ fn mark_scope_cell(
     scope.trace_fields(sink);
 }
 
-/// Release the record's Rust-heap payload when its cell dies.
-fn finalize_scope_cell(cell: *mut u8) {
-    if layout_census::enabled() {
-        // SAFETY: a dying cell is initialized and borrowed by no one.
-        if let Ok(scope) =
-            unsafe { (*(cell as *const RefCell<crate::interpreter::Scope>)).try_borrow_unguarded() }
-        {
-            layout_census::record_env(layout_census::DEAD, scope);
-        }
+/// An environment record owns nothing outside the heap: its entries spill into storage
+/// blocks, a large map lives in a payload cell, and its names are atoms. A dying record is
+/// only freed, and its cell has no finalizer but the census's ([`census_dead_scope`]).
+const _: () = assert!(!std::mem::needs_drop::<RefCell<crate::interpreter::Scope>>());
+
+/// Record a dying environment in the layout census.
+fn census_dead_scope(cell: *mut u8) {
+    // SAFETY: a dying cell is initialized and borrowed by no one.
+    if let Ok(scope) =
+        unsafe { (*(cell as *const RefCell<crate::interpreter::Scope>)).try_borrow_unguarded() }
+    {
+        layout_census::record_env(layout_census::DEAD, scope);
     }
-    // SAFETY: environment cells are initialized by `Env::new` before any collection.
-    unsafe { std::ptr::drop_in_place(cell as *mut RefCell<crate::interpreter::Scope>) };
 }
 
 /// A fresh cell for one environment record in the active heap (see `Env::new`).
@@ -4524,6 +4549,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         property_layout_desc: descs.property_layout,
         interned_strings: RefCell::default(),
         atoms: RefCell::default(),
+        binding_layouts: RefCell::default(),
         code_roots: RefCell::default(),
         young_code_roots: RefCell::default(),
         young_code_words: RefCell::default(),

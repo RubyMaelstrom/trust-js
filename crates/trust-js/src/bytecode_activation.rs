@@ -9,7 +9,8 @@
 use super::{CapInit, Chunk};
 use crate::atom::Atom;
 use crate::interpreter::{
-    new_var_scope_with_bindings, Binding, BindingLayout, BindingName, Env, Interp, VarMap,
+    new_var_scope_with_bindings, Binding, BindingLayout, BindingName, Env, Interp, LayoutRef,
+    VarMap,
 };
 use crate::value::Value;
 use std::rc::Rc;
@@ -23,6 +24,8 @@ pub(super) fn activation_plans_enabled() -> bool {
 pub(super) struct ActivationPlan {
     bindings: Vec<(BindingName, Binding)>,
     layout: Option<Rc<BindingLayout>>,
+    /// `layout`, kept by the chunk's heap for its activations to name.
+    kept_layout: Option<LayoutRef>,
     parameters: Vec<(usize, u16)>,
     /// A captured rest parameter: (binding index, first argument index).
     rest: Option<(usize, u16)>,
@@ -37,6 +40,7 @@ impl ActivationPlan {
         let mut plan = Self {
             bindings: Vec::with_capacity(chunk.cap_inits.len() + 2),
             layout: None,
+            kept_layout: None,
             parameters: Vec::new(),
             rest: None,
             functions: Vec::new(),
@@ -142,6 +146,7 @@ impl ActivationPlan {
         // names are static here, while initialization, mutability and values stay
         // per invocation. The builder has already produced this exact ordered index.
         plan.layout = BindingLayout::fixed(chunk.binding_layout_id, slots);
+        plan.kept_layout = plan.layout.as_ref().map(crate::value::keep_binding_layout);
         plan
     }
 
@@ -153,10 +158,8 @@ impl ActivationPlan {
         this_value: &Value,
         arguments: &[Value],
     ) -> Env {
-        let mut vars = VarMap::from_fixed_bindings(
-            self.bindings.iter().cloned().collect(),
-            self.layout.as_ref(),
-        );
+        let mut vars =
+            VarMap::from_fixed_bindings(self.bindings.iter().cloned().collect(), self.kept_layout);
         for &(slot, parameter) in &self.parameters {
             vars.initialize_fixed_value(
                 slot,
@@ -437,7 +440,7 @@ mod tests {
             {
                 let l = left.borrow();
                 let r = right.borrow();
-                assert!(Rc::ptr_eq(
+                assert!(std::ptr::eq(
                     l.vars.shared_layout().unwrap(),
                     r.vars.shared_layout().unwrap()
                 ));

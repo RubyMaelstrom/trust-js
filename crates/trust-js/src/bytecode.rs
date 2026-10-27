@@ -2268,6 +2268,8 @@ struct LexicalScope {
     layout_id: u32,
     /// Name → slot index shared by wide records (`BindingLayout::fixed`); narrow records scan.
     index: Option<Rc<crate::interpreter::BindingLayout>>,
+    /// `index`, kept by the chunk's heap for its records to name.
+    kept_index: Option<crate::interpreter::LayoutRef>,
 }
 
 impl LexicalScope {
@@ -2291,6 +2293,7 @@ impl LexicalScope {
         Self {
             bindings: unique,
             layout_id,
+            kept_index: index.as_ref().map(crate::value::keep_binding_layout),
             index,
         }
     }
@@ -21316,7 +21319,7 @@ fn install_lexical_bindings(
     bindings: crate::interpreter::BindingEntries,
 ) {
     let mut record = record.borrow_mut();
-    record.vars = crate::interpreter::VarMap::from_fixed_bindings(bindings, scope.index.as_ref());
+    record.vars = crate::interpreter::VarMap::from_fixed_bindings(bindings, scope.kept_index);
     record.vars.publish_layout(scope.layout_id);
 }
 

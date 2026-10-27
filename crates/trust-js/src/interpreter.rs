@@ -1552,9 +1552,104 @@ impl BindingLayout {
 /// A binding map's ordered entries. P1 S4: the first entry lives in the environment cell, so a
 /// record with one binding (most block and many function records) allocates nothing beside it;
 /// more move the entries to one storage block (`gc_storage`), which the record reports
-/// ([`VarMap::trace_storage`]).
-pub(crate) type BindingEntries =
+/// ([`VarMap::trace_storage`]). The entries are never dropped: they own nothing (names are
+/// atoms, bindings hold no drop glue) and the collector frees their block, so an environment
+/// carries no drop glue and needs no finalizer.
+#[repr(transparent)]
+pub(crate) struct BindingEntries(std::mem::ManuallyDrop<BindingVec>);
+
+type BindingVec =
     crate::inline_vec::InlineVec<(BindingName, Binding), 1, crate::gc_storage::GcSpill>;
+
+impl BindingEntries {
+    pub(crate) fn new() -> Self {
+        Self(std::mem::ManuallyDrop::new(BindingVec::new()))
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self(std::mem::ManuallyDrop::new(BindingVec::with_capacity(
+            capacity,
+        )))
+    }
+
+    /// The entries as a vector, to consume.
+    fn into_vec(self) -> BindingVec {
+        std::mem::ManuallyDrop::into_inner(self.0)
+    }
+}
+
+impl Default for BindingEntries {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for BindingEntries {
+    type Target = BindingVec;
+    #[inline]
+    fn deref(&self) -> &BindingVec {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for BindingEntries {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut BindingVec {
+        &mut self.0
+    }
+}
+
+impl FromIterator<(BindingName, Binding)> for BindingEntries {
+    fn from_iter<I: IntoIterator<Item = (BindingName, Binding)>>(iter: I) -> Self {
+        Self(std::mem::ManuallyDrop::new(iter.into_iter().collect()))
+    }
+}
+
+/// A large binding map, kept in a payload cell beside its environment
+/// ([`crate::gc_storage::PayloadBox`]): the payload cell's finalizer drops the table, so the
+/// environment itself has nothing to drop.
+#[derive(Default)]
+pub(crate) struct LargeBindings(crate::fasthash::FastMap<crate::atom::Atom, Binding>);
+
+impl std::ops::Deref for LargeBindings {
+    type Target = crate::fasthash::FastMap<crate::atom::Atom, Binding>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for LargeBindings {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// A binding layout its heap keeps for as long as the heap lives
+/// ([`crate::value::keep_binding_layout`]), named by the environments that share it without
+/// owning it, so that they carry no drop glue.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub(crate) struct LayoutRef(std::ptr::NonNull<BindingLayout>);
+
+impl LayoutRef {
+    /// # Safety
+    /// The active heap keeps `layout` (see [`crate::value::keep_binding_layout`]).
+    pub(crate) unsafe fn kept(layout: &Rc<BindingLayout>) -> Self {
+        Self(std::ptr::NonNull::from(&**layout))
+    }
+}
+
+impl std::ops::Deref for LayoutRef {
+    type Target = BindingLayout;
+    #[inline]
+    fn deref(&self) -> &BindingLayout {
+        // SAFETY: the heap of the environment that names the layout keeps it, and the
+        // environment lives no longer than its heap.
+        unsafe { self.0.as_ref() }
+    }
+}
 
 /// A binding's name: an atom of its environment's heap (see [`crate::atom`]), padded to the two
 /// words an entry gave its name before atoms, so generated code finds each binding where it
@@ -1586,13 +1681,13 @@ fn binding_entries_heap_bytes(entries: &BindingEntries) -> usize {
 #[repr(C)]
 struct IndexedBindings {
     entries: BindingEntries,
-    layout: Rc<BindingLayout>,
+    layout: LayoutRef,
 }
 
 #[repr(u8)]
 enum VarStorage {
     Small(BindingEntries),
-    Large(crate::fasthash::FastMap<crate::atom::Atom, Binding>),
+    Large(crate::gc_storage::PayloadBox<LargeBindings>),
     Indexed(IndexedBindings),
 }
 
@@ -1661,7 +1756,7 @@ impl VarMap {
                     crate::gc_storage::trace_block(block, sink);
                 }
             }
-            VarStorage::Large(_) => {}
+            VarStorage::Large(entries) => crate::gc_storage::PayloadBox::trace(entries, sink),
         }
     }
 
@@ -1669,6 +1764,7 @@ impl VarMap {
     /// different eval-created key set retains the dynamic map. Moving entries
     /// invalidates raw-pointer caches before any address can change.
     pub(crate) fn share_layout(&mut self, cached: &std::cell::OnceCell<Rc<BindingLayout>>) {
+        // SAFETY: the active heap keeps the layout for the environment that shares it.
         if self.layout_id != 0 {
             return;
         }
@@ -1692,7 +1788,7 @@ impl VarMap {
         let mut entries =
             match std::mem::replace(&mut self.map, VarStorage::Small(BindingEntries::new())) {
                 VarStorage::Small(entries) => entries,
-                VarStorage::Large(entries) => entries
+                VarStorage::Large(mut entries) => std::mem::take(&mut entries.0)
                     .into_iter()
                     .map(|(name, binding)| (BindingName::new(name), binding))
                     .collect(),
@@ -1713,12 +1809,12 @@ impl VarMap {
         }
         self.map = VarStorage::Indexed(IndexedBindings {
             entries,
-            layout: layout.clone(),
+            layout: crate::value::keep_binding_layout(layout),
         });
         self.layout_id = layout.id;
     }
 
-    pub(crate) fn shared_layout(&self) -> Option<&Rc<BindingLayout>> {
+    pub(crate) fn shared_layout(&self) -> Option<&BindingLayout> {
         match &self.map {
             VarStorage::Indexed(indexed) => Some(&indexed.layout),
             _ => None,
@@ -1729,10 +1825,7 @@ impl VarMap {
     /// Keep that set in stable slots even above the dynamic map's small-object
     /// threshold. Structural writes still use `insert`/`remove` and invalidate
     /// the published layout before changing or replacing this storage.
-    pub(crate) fn from_fixed_bindings(
-        entries: BindingEntries,
-        layout: Option<&Rc<BindingLayout>>,
-    ) -> Self {
+    pub(crate) fn from_fixed_bindings(entries: BindingEntries, layout: Option<LayoutRef>) -> Self {
         debug_assert!(entries
             .iter()
             .all(|(_, binding)| binding.import_ref.is_none()));
@@ -1742,10 +1835,7 @@ impl VarMap {
                 .iter()
                 .enumerate()
                 .all(|(slot, (name, _))| layout.slot_of_atom(name.atom) == Some(slot)));
-            VarStorage::Indexed(IndexedBindings {
-                entries,
-                layout: layout.clone(),
-            })
+            VarStorage::Indexed(IndexedBindings { entries, layout })
         } else {
             VarStorage::Small(entries)
         };
@@ -1790,10 +1880,12 @@ impl VarMap {
             map: if capacity <= SMALL_VAR_MAP_CAPACITY {
                 VarStorage::Small(BindingEntries::with_capacity(capacity))
             } else {
-                VarStorage::Large(crate::fasthash::FastMap::with_capacity_and_hasher(
-                    capacity,
-                    Default::default(),
-                ))
+                VarStorage::Large(crate::gc_storage::PayloadBox::new(LargeBindings(
+                    crate::fasthash::FastMap::with_capacity_and_hasher(
+                        capacity,
+                        Default::default(),
+                    ),
+                )))
             },
             generation: std::cell::Cell::new(0),
             layout_id: 0,
@@ -1910,13 +2002,7 @@ impl VarMap {
                     entries.push((BindingName::new(k), v));
                     return None;
                 }
-                let mut large = crate::fasthash::FastMap::with_capacity_and_hasher(
-                    entries.len() + 1,
-                    Default::default(),
-                );
-                for (name, binding) in std::mem::take(entries) {
-                    large.insert(name.atom, binding);
-                }
+                let mut large = Self::large_from(std::mem::take(entries));
                 let old = large.insert(k, v);
                 self.map = VarStorage::Large(large);
                 old
@@ -1931,11 +2017,19 @@ impl VarMap {
         }
     }
 
-    fn large_from(entries: BindingEntries) -> crate::fasthash::FastMap<crate::atom::Atom, Binding> {
-        entries
-            .into_iter()
-            .map(|(name, binding)| (name.atom, binding))
-            .collect()
+    /// The entries as a large map, in a payload cell of the active heap.
+    fn large_from(entries: BindingEntries) -> crate::gc_storage::PayloadBox<LargeBindings> {
+        let mut large = crate::fasthash::FastMap::with_capacity_and_hasher(
+            entries.len() + 1,
+            Default::default(),
+        );
+        large.extend(
+            entries
+                .into_vec()
+                .into_iter()
+                .map(|(name, binding)| (name.atom, binding)),
+        );
+        crate::gc_storage::PayloadBox::new(LargeBindings(large))
     }
 
     pub fn remove(&mut self, k: &str) -> Option<Binding> {
@@ -2085,7 +2179,7 @@ impl VarMap {
     /// The entries are an `InlineVec`, probed in place and spilled.
     fn jit_entries_layout(_: &BindingEntries) -> Option<crate::value::JitVecLayout> {
         let probe = crate::atom::atomize("probe");
-        BindingEntries::probe_jit_layout(|| {
+        BindingVec::probe_jit_layout(|| {
             (
                 BindingName::new(probe),
                 Binding::data(Value::Num(7.0), true, true),
@@ -2472,9 +2566,10 @@ impl Scope {
             under_with: _,
             var_boundary: _,
             catch_param: _,
-            lexical_names: _,
+            lexical_names,
         } = self;
         vars.trace_storage(sink);
+        lexical_names.trace(sink);
         for binding in vars.values() {
             binding.trace_edges(sink);
         }
@@ -2490,26 +2585,41 @@ impl Scope {
 const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 128);
 
 /// Lexical-name bookkeeping is only populated by direct eval, but every call allocates a scope.
-/// Keep the common empty case to one nullable pointer and materialize the Vec on first use.
+/// Keep the common empty case to one nullable pointer and materialize the list on first use, in
+/// a storage block: the names are atoms, the list is never dropped, and the record reports its
+/// blocks ([`ScopeNames::trace`]), as it does its entries'.
 #[derive(Default)]
 #[repr(transparent)]
-#[allow(clippy::box_collection)] // Keeps the common empty scope to one nullable pointer.
-pub struct ScopeNames(Option<Box<Vec<crate::atom::Atom>>>);
+pub struct ScopeNames(Option<crate::gc_storage::StorageBox<ScopeNameList>>);
+
+type ScopeNameList = std::mem::ManuallyDrop<
+    crate::inline_vec::InlineVec<crate::atom::Atom, 1, crate::gc_storage::GcSpill>,
+>;
 
 impl ScopeNames {
     /// Record a lexically declared name.
     pub(crate) fn push(&mut self, name: impl crate::atom::IntoAtom) {
         self.0
-            .get_or_insert_with(Default::default)
+            .get_or_insert_with(|| crate::gc_storage::StorageBox::new(ScopeNameList::default()))
             .push(name.into_atom());
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = crate::atom::Atom> + '_ {
         self.0
             .as_deref()
-            .map_or(&[][..], Vec::as_slice)
+            .map_or(&[][..], |names| &names[..])
             .iter()
             .copied()
+    }
+
+    /// Report the list's blocks.
+    pub(crate) fn trace<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
+        if let Some(names) = &self.0 {
+            crate::gc_storage::StorageBox::trace(names, sink);
+            if let Some(block) = names.spill_ptr() {
+                crate::gc_storage::trace_block(block, sink);
+            }
+        }
     }
 
     pub(crate) fn retained_requested_storage_bytes(&self) -> usize {
@@ -2517,9 +2627,9 @@ impl ScopeNames {
             return 0;
         };
         // The names are atoms, which their heap's table accounts.
-        std::mem::size_of::<Vec<crate::atom::Atom>>().saturating_add(
+        std::mem::size_of::<ScopeNameList>().saturating_add(
             names
-                .capacity()
+                .heap_capacity()
                 .saturating_mul(std::mem::size_of::<crate::atom::Atom>()),
         )
     }
@@ -2532,11 +2642,10 @@ pub struct Binding {
     pub mutable: bool,
     /// `false` while a `let`/`const` is in its temporal dead zone.
     pub initialized: bool,
-    /// A live module import: reads redirect to `(exporter scope, local name)`. Ordinary
-    /// bindings need only a nullable pointer. Each cold box independently owns its Env;
-    /// sharing that owner would change the collector's incoming-reference accounting.
-    /// Immutable names can share their bytes across temporary resolution snapshots.
-    pub(crate) import_ref: Option<Box<(Env, crate::atom::Atom)>>,
+    /// A live module import: reads redirect to `(exporter scope, local name)`, kept in a
+    /// storage block of its own, which the binding's record reports: ordinary bindings need
+    /// only a nullable pointer, and the record nothing to drop.
+    pub(crate) import_ref: Option<crate::gc_storage::StorageBox<(Env, crate::atom::Atom)>>,
     /// Native-visible kind bit, occupying existing flag padding. All structural insertion
     /// paths normalize it; in-place import changes must use set_import_reference.
     pub(crate) imported: bool,
@@ -2599,7 +2708,7 @@ impl Binding {
     #[cfg(test)]
     pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, crate::atom::Atom)>) {
         self.imported = reference.is_some();
-        self.import_ref = reference.map(Box::new);
+        self.import_ref = reference.map(crate::gc_storage::StorageBox::new);
     }
     pub(crate) fn data(value: Value, mutable: bool, initialized: bool) -> Binding {
         Binding {
@@ -2621,7 +2730,7 @@ impl Binding {
 
     pub(crate) fn live_import(environment: Env, name: crate::atom::Atom) -> Self {
         let mut binding = Self::data(Value::Undefined, false, true);
-        binding.import_ref = Some(Box::new((environment, name)));
+        binding.import_ref = Some(crate::gc_storage::StorageBox::new((environment, name)));
         binding.imported = true;
         binding
     }
@@ -2648,6 +2757,7 @@ impl Binding {
         } = self;
         sink.value(value);
         if let Some(import) = import_ref {
+            crate::gc_storage::StorageBox::trace(import, sink);
             sink.env(&import.0);
         }
     }

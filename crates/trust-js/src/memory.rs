@@ -976,8 +976,11 @@ impl Visitor {
         }
     }
 
-    pub(crate) fn binding_layout(&mut self, layout: &Rc<crate::interpreter::BindingLayout>) {
-        if self.binding_layouts.insert(Rc::as_ptr(layout) as usize) {
+    pub(crate) fn binding_layout(&mut self, layout: &crate::interpreter::BindingLayout) {
+        if self
+            .binding_layouts
+            .insert(layout as *const crate::interpreter::BindingLayout as usize)
+        {
             let bytes = layout.retained_memory(self);
             self.add_function_bytecode_bytes(bytes);
             self.function_bytecode_opaque_storage = true;
