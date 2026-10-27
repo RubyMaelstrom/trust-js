@@ -336,25 +336,6 @@ impl Iterator for UnitIter<'_> {
     }
 }
 
-/// Whether `s` contains a lone surrogate: a smuggled scalar NOT part of an adjacent
-/// high+low pair (which canonically encodes a real smuggle-range character).
-pub fn has_lone_surrogate(s: &str) -> bool {
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if smuggled_high(c).is_some() {
-            if chars.peek().copied().and_then(smuggled_low).is_some() {
-                chars.next();
-                continue;
-            }
-            return true;
-        }
-        if smuggled(c).is_some() {
-            return true;
-        }
-    }
-    false
-}
-
 /// If `a` and `b` are a smuggled high+low pair, the real character they encode.
 pub fn paired_char(a: char, b: char) -> Option<char> {
     let hi = smuggled_high(a)?;

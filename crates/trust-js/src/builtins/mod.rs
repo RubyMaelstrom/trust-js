@@ -10904,9 +10904,7 @@ pub(crate) fn nf_from_char_code(
         };
         units.push(uint16_of_number(num));
     }
-    // UTF-16 decode: a surrogate pair combines into one code point; a lone half is smuggled
-    // (see `jstr`), so the resulting string round-trips its exact unit sequence.
-    Ok(Value::lstr(crate::jstr::from_units(&units)))
+    Ok(Value::Str(crate::lstr::LStr::from_utf16(&units)))
 }
 
 /// `String.prototype.charCodeAt` (named: the JIT's call-IC fill compares the fn pointer to
@@ -10983,6 +10981,48 @@ fn this_string(i: &mut Interp, this: &Value) -> Result<crate::lstr::LStr, Value>
 /// whitespace predicate, it includes U+FEFF but excludes U+0085 (NEL).
 fn is_js_ws(c: char) -> bool {
     crate::regex::js_whitespace(c)
+}
+
+/// TrimString (ECMA-262 §22.1.3.32.1): the units between the leading and trailing
+/// WhiteSpace and LineTerminator units (all BMP; a surrogate is neither), as a slice.
+fn trim_string(s: crate::lstr::LStr, start: bool, end: bool) -> crate::lstr::LStr {
+    let units = s.units();
+    let is_ws = |unit: u16| char::from_u32(u32::from(unit)).is_some_and(is_js_ws);
+    let mut first = 0;
+    let mut last = units.len();
+    if start {
+        while first < last && units.get(first).is_some_and(is_ws) {
+            first += 1;
+        }
+    }
+    if end {
+        while last > first && units.get(last - 1).is_some_and(is_ws) {
+            last -= 1;
+        }
+    }
+    s.slice_units(first, last)
+}
+
+/// The index of the first unit at or after `from` that is a surrogate outside a pair.
+fn lone_surrogate_index(s: &crate::lstr::LStr, from: usize) -> Option<usize> {
+    let crate::lstr::Units::Utf16(units) = s.units() else {
+        return None;
+    };
+    let mut index = from;
+    while index < units.len() {
+        match units[index] {
+            0xD800..=0xDBFF
+                if units
+                    .get(index + 1)
+                    .is_some_and(|next| (0xDC00..0xE000).contains(next)) =>
+            {
+                index += 2;
+            }
+            0xD800..=0xDFFF => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 /// IsRegExp(arg): true if it has a truthy `@@match`, or (fallback) is a compiled RegExp object.
@@ -11734,47 +11774,24 @@ fn install_string(it: &mut Interp) {
     // TRust JS strings are valid UTF-8, so they're always well-formed.
     it.def_method(&sp, "isWellFormed", 0, |i, this, _| {
         let s = this_string(i, &this)?;
-        Ok(Value::Bool(!crate::jstr::has_lone_surrogate(&s.text())))
+        Ok(Value::Bool(lone_surrogate_index(&s, 0).is_none()))
     });
     it.def_method(&sp, "toWellFormed", 0, |i, this, _| {
         let s = this_string(i, &this)?;
-        if !crate::jstr::has_lone_surrogate(&s.text()) {
+        let Some(first) = lone_surrogate_index(&s, 0) else {
             return Ok(Value::Str(s));
+        };
+        // Every lone surrogate becomes U+FFFD (ECMA-262 §22.1.3.32).
+        let mut units = s.units().to_utf16().into_owned();
+        let mut at = Some(first);
+        while let Some(index) = at {
+            units[index] = 0xFFFD;
+            at = lone_surrogate_index(&s, index + 1);
         }
-        let fixed: String = s
-            .text()
-            .chars()
-            .map(|c| {
-                if crate::jstr::smuggled(c).is_some() {
-                    '\u{FFFD}'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        Ok(Value::lstr(fixed))
+        Ok(Value::Str(crate::lstr::LStr::from_utf16(&units)))
     });
     it.def_method(&sp, "trim", 0, |i, this, _| {
-        let s = this_string(i, &this)?;
-        // TrimString removes the ECMA-262 WhiteSpace + LineTerminator set
-        // (ECMA-262 §22.1.3.32.1). The ASCII subset includes VT (U+000B), which Rust's
-        // trim_ascii excludes. Consult cached ASCII metadata rather than scanning the body,
-        // and preserve the allocation when no code units are removed.
-        let text = s.text();
-        if s.ascii_hint() {
-            let trimmed = text.trim_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
-            return Ok(if trimmed.len() == text.len() {
-                Value::Str(s)
-            } else {
-                Value::lstr(trimmed)
-            });
-        }
-        let trimmed = text.trim_matches(is_js_ws);
-        Ok(if trimmed.len() == text.len() {
-            Value::Str(s)
-        } else {
-            Value::Str(crate::lstr::LStr::from(trimmed))
-        })
+        Ok(Value::Str(trim_string(this_string(i, &this)?, true, true)))
     });
     it.def_method(&sp, "localeCompare", 1, |i, this, args| {
         // RequireObjectCoercible + ToString this and that, then CompareStrings with a Collator.
@@ -11885,40 +11902,10 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "codePointAt", 1, nf_code_point_at);
     it.def_method(&sp, "trimStart", 0, |i, this, _| {
-        let s = this_string(i, &this)?;
-        let text = s.text();
-        if s.ascii_hint() {
-            let trimmed = text.trim_start_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
-            return Ok(if trimmed.len() == text.len() {
-                Value::Str(s)
-            } else {
-                Value::lstr(trimmed)
-            });
-        }
-        let trimmed = text.trim_start_matches(is_js_ws);
-        Ok(if trimmed.len() == text.len() {
-            Value::Str(s)
-        } else {
-            Value::Str(crate::lstr::LStr::from(trimmed))
-        })
+        Ok(Value::Str(trim_string(this_string(i, &this)?, true, false)))
     });
     it.def_method(&sp, "trimEnd", 0, |i, this, _| {
-        let s = this_string(i, &this)?;
-        let text = s.text();
-        if s.ascii_hint() {
-            let trimmed = text.trim_end_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
-            return Ok(if trimmed.len() == text.len() {
-                Value::Str(s)
-            } else {
-                Value::lstr(trimmed)
-            });
-        }
-        let trimmed = text.trim_end_matches(is_js_ws);
-        Ok(if trimmed.len() == text.len() {
-            Value::Str(s)
-        } else {
-            Value::Str(crate::lstr::LStr::from(trimmed))
-        })
+        Ok(Value::Str(trim_string(this_string(i, &this)?, false, true)))
     });
     // Annex B aliases: trimLeft/trimRight ARE trimStart/trimEnd (same function objects).
     for (alias, target) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
@@ -12433,27 +12420,20 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
     // The result has `target` UTF-16 units, so at least that many bytes: reject an oversized
     // padding before building any of it.
     check_string_length(i, target)?;
-    let text = s.text();
-    let s = &*text;
     let need = target - cur;
-    if s.is_ascii() && pad.is_ascii() {
+    if let (Some(text), true) = (s.as_ascii(), pad.is_ascii()) {
         // StringPad repeats and truncates by UTF-16 code units (ECMA-262
-        // §22.1.3.17.2); ASCII bytes are those same units, so avoid building
-        // a temporary fill string. Both operands are ASCII, so their UTF-16 concatenation needs
-        // no canonicalization pass; write the fill and source into one final LStr allocation.
+        // §22.1.3.17.2); ASCII bytes are those same units, so write the fill and source into
+        // one final LStr allocation without a temporary fill string.
         return Ok(Value::Str(crate::lstr::LStr::pad_ascii(
-            s, &pad, need, at_start,
+            text, &pad, need, at_start,
         )));
     }
     let pad_units = crate::jstr::units(&pad);
     let fill_units: Vec<u16> = pad_units.iter().copied().cycle().take(need).collect();
-    let fill = crate::jstr::from_units(&fill_units);
-    check_string_length(i, s.len() + fill.len())?;
-    Ok(Value::lstr(if at_start {
-        format!("{fill}{s}")
-    } else {
-        format!("{s}{fill}")
-    }))
+    let fill = crate::lstr::LStr::from_utf16(&fill_units);
+    let parts = if at_start { [fill, s] } else { [s, fill] };
+    Ok(Value::Str(crate::lstr::LStr::concat_many(&parts, target)))
 }
 
 /// thisStringValue: a String primitive or wrapper; anything else is a TypeError (the
