@@ -190,6 +190,167 @@ impl<'a> Units<'a> {
             }
         }
     }
+
+    /// StringIndexOf(self, `search`, `from`) (ECMA-262 §6.1.4.1): the first index at or past
+    /// `from` at which `search`'s code units occur, whatever either's width.
+    pub(crate) fn index_of(&self, search: Units<'_>, from: usize) -> Option<usize> {
+        let (len, search_len) = (self.len(), search.len());
+        if from > len {
+            return None;
+        }
+        if search_len == 0 {
+            return Some(from);
+        }
+        if search_len > len - from {
+            return None;
+        }
+        match (*self, search) {
+            (Units::Ascii(hay), Units::Ascii(needle)) => index_of_bytes(hay, needle, from),
+            (Units::Utf16(hay), Units::Utf16(needle)) => index_of_units(hay, needle, from),
+            (Units::Utf16(hay), Units::Ascii(needle)) => index_of_units(hay, needle, from),
+            (Units::Ascii(hay), Units::Utf16(needle)) => index_of_units(hay, needle, from),
+        }
+    }
+
+    /// StringLastIndexOf(self, `search`, `from`) (ECMA-262 §6.1.4.2): the last index at or
+    /// before `from` at which `search`'s code units occur. As there, `from + search.len()` is
+    /// at most the length.
+    pub(crate) fn last_index_of(&self, search: Units<'_>, from: usize) -> Option<usize> {
+        let search_len = search.len();
+        debug_assert!(from + search_len <= self.len());
+        match (*self, search) {
+            (Units::Ascii(hay), Units::Ascii(needle))
+                if from > DIRECT_SEARCH_SPAN || search_len > DIRECT_SEARCH_NEEDLE =>
+            {
+                // SAFETY: one-byte units are ASCII (see `LStr::known_ascii`).
+                let (hay, needle) = unsafe {
+                    (
+                        std::str::from_utf8_unchecked(&hay[..from + search_len]),
+                        std::str::from_utf8_unchecked(needle),
+                    )
+                };
+                hay.rfind(needle)
+            }
+            (Units::Ascii(hay), Units::Ascii(needle)) => last_index_of_units(hay, needle, from),
+            (Units::Utf16(hay), Units::Utf16(needle)) => last_index_of_units(hay, needle, from),
+            (Units::Utf16(hay), Units::Ascii(needle)) => last_index_of_units(hay, needle, from),
+            (Units::Ascii(hay), Units::Utf16(needle)) => last_index_of_units(hay, needle, from),
+        }
+    }
+}
+
+/// [`Units::index_of`] of ASCII text in ASCII text, whose byte offsets are unit offsets.
+pub(crate) fn find_ascii(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    debug_assert!(needle.is_ascii());
+    Units::Ascii(hay.as_bytes()).index_of(Units::Ascii(needle.as_bytes()), from)
+}
+
+/// A one- or two-byte code unit, for searches across widths.
+trait CodeUnit: Copy {
+    fn unit(self) -> u16;
+}
+
+impl CodeUnit for u8 {
+    #[inline(always)]
+    fn unit(self) -> u16 {
+        u16::from(self)
+    }
+}
+
+impl CodeUnit for u16 {
+    #[inline(always)]
+    fn unit(self) -> u16 {
+        self
+    }
+}
+
+/// The longest stretch of candidate positions, in units, that a one-byte search scans directly:
+/// past it the Two-Way searcher's setup (a critical factorization of the needle and a byte set,
+/// some 400 instructions for a short needle) pays for its linear, skipping search.
+const DIRECT_SEARCH_SPAN: usize = 256;
+
+/// The longest needle a one-byte search scans directly; a longer one takes the Two-Way searcher,
+/// which keeps a search linear whatever the text.
+const DIRECT_SEARCH_NEEDLE: usize = 32;
+
+/// [`Units::index_of`] for one-byte operands, with `from + needle.len() <= hay.len()` and a
+/// needle of at least one unit: candidates by the needle's first byte, eight bytes a step, each
+/// then compared whole; a long stretch or needle takes the Two-Way searcher.
+fn index_of_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    let last_start = hay.len() - needle.len();
+    if needle.len() == 1 {
+        return find_byte(hay, needle[0], from);
+    }
+    if last_start - from > DIRECT_SEARCH_SPAN || needle.len() > DIRECT_SEARCH_NEEDLE {
+        // SAFETY: one-byte units are ASCII (see `LStr::known_ascii`), so `from` is a character
+        // boundary.
+        let (rest, needle) = unsafe {
+            (
+                std::str::from_utf8_unchecked(&hay[from..]),
+                std::str::from_utf8_unchecked(needle),
+            )
+        };
+        return rest.find(needle).map(|offset| from + offset);
+    }
+    let starts = &hay[..=last_start];
+    let mut at = from;
+    while let Some(start) = find_byte(starts, needle[0], at) {
+        if hay[start + 1..start + needle.len()] == needle[1..] {
+            return Some(start);
+        }
+        at = start + 1;
+    }
+    None
+}
+
+/// The first index at or past `from` of `byte` in `bytes`: eight bytes a step, a word's bytes
+/// tested for the byte at once (the lowest flagged byte of the classic zero-byte test is exact).
+#[inline]
+fn find_byte(bytes: &[u8], byte: u8, from: usize) -> Option<usize> {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let repeated = LOW * u64::from(byte);
+    let mut at = from;
+    while at + 8 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+        let differences = word ^ repeated;
+        let equal = differences.wrapping_sub(LOW) & !differences & HIGH;
+        if equal != 0 {
+            return Some(at + equal.trailing_zeros() as usize / 8);
+        }
+        at += 8;
+    }
+    bytes[at..]
+        .iter()
+        .position(|&candidate| candidate == byte)
+        .map(|offset| at + offset)
+}
+
+/// [`Units::index_of`] unit by unit, for any widths, with `from + needle.len() <= hay.len()`
+/// and a needle of at least one unit: candidates by the first unit, then the rest compared.
+fn index_of_units<H: CodeUnit, N: CodeUnit>(hay: &[H], needle: &[N], from: usize) -> Option<usize> {
+    let first = needle[0].unit();
+    (from..=hay.len() - needle.len()).find(|&start| {
+        hay[start].unit() == first
+            && hay[start + 1..start + needle.len()]
+                .iter()
+                .zip(&needle[1..])
+                .all(|(&unit, &wanted)| unit.unit() == wanted.unit())
+    })
+}
+
+/// [`Units::last_index_of`] unit by unit, for any widths.
+fn last_index_of_units<H: CodeUnit, N: CodeUnit>(
+    hay: &[H],
+    needle: &[N],
+    from: usize,
+) -> Option<usize> {
+    (0..=from).rev().find(|&start| {
+        hay[start..start + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(&unit, &wanted)| unit.unit() == wanted.unit())
+    })
 }
 
 /// [`Units::iter`].
@@ -1330,5 +1491,102 @@ mod tests {
         let short = tail.slice_units(0, 10);
         assert!(short.view_owner().is_none() && short.known_ascii());
         assert_eq!(short.text(), "x".repeat(10));
+    }
+
+    /// StringIndexOf and StringLastIndexOf (ECMA-262 §6.1.4.1-2) as specified: every candidate
+    /// position compared unit by unit.
+    fn specified_index_of(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+        if needle.is_empty() {
+            return (from <= hay.len()).then_some(from);
+        }
+        (from..=hay.len().checked_sub(needle.len())?)
+            .find(|&at| hay[at..at + needle.len()] == *needle)
+    }
+
+    fn specified_last_index_of(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+        (0..=from)
+            .rev()
+            .find(|&at| hay[at..at + needle.len()] == *needle)
+    }
+
+    #[test]
+    fn searches_match_the_specified_loops_at_every_width() {
+        // Small alphabets make matches and near misses common; needles are often cut from the
+        // haystack. Long haystacks and needles take the Two-Way searcher, short ones the scan.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        const ASCII: [u16; 3] = [b'a' as u16, b'b' as u16, b'\0' as u16];
+        const WIDE: [u16; 4] = [b'a' as u16, b'b' as u16, 0xe9, 0xd800];
+        for round in 0..3000 {
+            let wide_hay = round % 2 == 1;
+            let wide_needle = round % 4 >= 2;
+            let hay_len = next(if round % 8 == 0 { 700 } else { 40 });
+            let hay: Vec<u16> = (0..hay_len)
+                .map(|_| {
+                    if wide_hay {
+                        WIDE[next(4)]
+                    } else {
+                        ASCII[next(3)]
+                    }
+                })
+                .collect();
+            let needle_len = next(if round % 5 == 0 { 48 } else { 6 });
+            let mut needle: Vec<u16> = if hay_len >= needle_len && next(3) != 0 {
+                let at = next(hay_len - needle_len + 1);
+                hay[at..at + needle_len].to_vec()
+            } else {
+                (0..needle_len).map(|_| ASCII[next(3)]).collect()
+            };
+            if !needle.is_empty() && next(4) == 0 {
+                let at = next(needle.len());
+                needle[at] = if wide_needle {
+                    WIDE[next(4)]
+                } else {
+                    ASCII[next(3)]
+                };
+            }
+            if !wide_needle && needle.iter().any(|&unit| unit > 0x7f) {
+                continue;
+            }
+            let hay_bytes: Vec<u8> = hay.iter().map(|&unit| unit as u8).collect();
+            let hay_units = if wide_hay {
+                Units::Utf16(&hay)
+            } else {
+                Units::Ascii(&hay_bytes)
+            };
+            let needle_bytes: Vec<u8> = needle.iter().map(|&unit| unit as u8).collect();
+            let needle_units = if wide_needle {
+                Units::Utf16(&needle)
+            } else {
+                Units::Ascii(&needle_bytes)
+            };
+            for from in 0..=hay_len + 1 {
+                assert_eq!(
+                    hay_units.index_of(needle_units, from),
+                    specified_index_of(&hay, &needle, from),
+                    "index_of {hay:?} {needle:?} {from}"
+                );
+            }
+            for from in 0..=hay_len.saturating_sub(needle_len) {
+                if from + needle_len > hay_len {
+                    break;
+                }
+                assert_eq!(
+                    hay_units.last_index_of(needle_units, from),
+                    specified_last_index_of(&hay, &needle, from),
+                    "last_index_of {hay:?} {needle:?} {from}"
+                );
+            }
+        }
+        // `find_ascii` is the same search of text.
+        assert_eq!(find_ascii("a-b-c", "-", 2), Some(3));
+        assert_eq!(find_ascii("a-b-c", "-c", 0), Some(3));
+        assert_eq!(find_ascii("abc", "", 3), Some(3));
+        assert_eq!(find_ascii("abc", "", 4), None);
     }
 }

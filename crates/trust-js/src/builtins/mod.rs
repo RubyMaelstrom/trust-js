@@ -11070,6 +11070,15 @@ pub(crate) fn nf_code_point_at(
     })
 }
 
+/// ToString(value) for a method's argument: a String is itself, without the general conversion.
+#[inline]
+fn string_arg(i: &mut Interp, value: &Value) -> Result<LStr, Value> {
+    match value.view() {
+        ValueView::Str(s) => Ok(s),
+        _ => ab(i.to_string(value)),
+    }
+}
+
 fn this_string(i: &mut Interp, this: &Value) -> Result<crate::lstr::LStr, Value> {
     match &(this).view() {
         ValueView::Str(s) => Ok(*s),
@@ -11223,7 +11232,7 @@ pub(crate) fn nf_string_replace(
     let pattern_ascii = pat.ascii_hint() || (source_ascii && pat.text().is_ascii());
     if source_ascii && pattern_ascii {
         let (text, pattern) = (s.text(), pat.text());
-        let Some(pos) = text.find(&*pattern) else {
+        let Some(pos) = crate::lstr::find_ascii(&text, &pattern, 0) else {
             return Ok(Value::Str(s));
         };
         let matched = &text[pos..pos + pattern.len()];
@@ -11498,88 +11507,32 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "charCodeAt", 1, nf_char_code_at);
     it.def_method(&sp, "indexOf", 1, |i, this, args| {
         let s = this_string(i, &this)?;
-        let needle = ab(i.to_string(&arg(args, 0)))?;
-        if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
-            // Byte index == unit index; a non-ASCII needle simply can't occur.
-            let text = s.text();
-            let pos = str_clamp_pos(i, args.get(1), text.len() as i64)?.min(text.len());
-            let r = text[pos..].find(&*needle.text()).map(|k| (pos + k) as f64);
-            return Ok(Value::Num(r.unwrap_or(-1.0)));
-        }
-        let chars = i.units_full(&s);
-        let nchars = i.units_full(&needle);
-        let len = chars.len() as i64;
-        let pos = str_clamp_pos(i, args.get(1), len)?;
-        let nlen = nchars.len();
-        let result = (pos..=chars.len())
-            .find(|&start| start + nlen <= chars.len() && chars[start..start + nlen] == nchars[..]);
-        Ok(Value::Num(result.map(|r| r as f64).unwrap_or(-1.0)))
+        let needle = string_arg(i, &arg(args, 0))?;
+        let pos = str_clamp_pos(i, args.get(1), s.unit_len() as i64)?;
+        let result = s.units().index_of(needle.units(), pos);
+        Ok(Value::Num(result.map_or(-1.0, |index| index as f64)))
     });
     it.def_method(&sp, "lastIndexOf", 1, |i, this, args| {
         let s = this_string(i, &this)?;
-        let needle = ab(i.to_string(&arg(args, 0)))?;
-        // StringLastIndexOf operates on UTF-16 code-unit indices (ECMA-262 §6.1.4.2 and
-        // §22.1.3.11). For ASCII operands byte offsets are identical, so avoid materializing
-        // two unit vectors and search the bounded byte prefix directly.
-        if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
-            && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
-        {
-            // ECMA-262 §22.1.3.11 performs ToNumber(position) before the early
-            // `maxStart < 0` return, so retain that observable coercion even when
-            // the search string is longer than the receiver.
-            let number_position = {
-                let __value_match_original = arg(args, 1);
-                match (__value_match_original).view() {
-                    ValueView::Undefined => None,
-                    _ => {
-                        let v = __value_match_original;
-                        Some(ab(i.to_number(&v))?)
-                    }
-                }
-            };
-            let (text, needle_text) = (s.text(), needle.text());
-            let Some(max_start) = text.len().checked_sub(needle_text.len()) else {
-                return Ok(Value::Num(-1.0));
-            };
-            let start = match number_position {
-                None => max_start,
-                Some(p) if p.is_nan() => max_start,
-                Some(p) => p.trunc().clamp(0.0, max_start as f64) as usize,
-            };
-            // `start <= max_start` proves this slice endpoint is in bounds.
-            let end = start + needle_text.len();
-            let result = text[..end].rfind(&*needle_text);
-            return Ok(Value::Num(result.map(|n| n as f64).unwrap_or(-1.0)));
-        }
-        // Optional `position`: search for the last occurrence starting at or before it.
-        let chars = i.units_full(&s);
-        let nchars = i.units_full(&needle);
-        let limit = {
-            let __value_match_original = arg(args, 1);
-            match (__value_match_original).view() {
-                ValueView::Undefined => chars.len(),
-                _ => {
-                    let v = __value_match_original;
-                    {
-                        let p = ab(i.to_number(&v))?;
-                        if p.is_nan() {
-                            chars.len()
-                        } else {
-                            (p.max(0.0) as usize).min(chars.len())
-                        }
-                    }
-                }
-            }
+        let needle = string_arg(i, &arg(args, 0))?;
+        // ECMA-262 §22.1.3.11 performs ToNumber(position) before the early `maxStart < 0`
+        // return, so retain that observable coercion even when the search string is longer
+        // than the receiver.
+        let number_position = match arg(args, 1).view() {
+            ValueView::Undefined => None,
+            _ => Some(ab(i.to_number(&arg(args, 1)))?),
         };
-        let mut found = -1.0;
-        let mut start = 0;
-        while start + nchars.len() <= chars.len() && start <= limit {
-            if chars[start..start + nchars.len()] == nchars[..] {
-                found = start as f64;
-            }
-            start += 1;
-        }
-        Ok(Value::Num(found))
+        let Some(max_start) = s.unit_len().checked_sub(needle.unit_len()) else {
+            return Ok(Value::Num(-1.0));
+        };
+        let start = match number_position {
+            None => max_start,
+            Some(p) if p.is_nan() => max_start,
+            Some(p) => p.trunc().clamp(0.0, max_start as f64) as usize,
+        };
+        // StringLastIndexOf over code units (ECMA-262 §6.1.4.2); `start <= max_start`.
+        let result = s.units().last_index_of(needle.units(), start);
+        Ok(Value::Num(result.map_or(-1.0, |index| index as f64)))
     });
     it.def_method(&sp, "toLocaleLowerCase", 0, |i, this, args| {
         let s = this_string(i, &this)?;
@@ -11618,21 +11571,11 @@ fn install_string(it: &mut Interp) {
         if arg_is_regexp(i, &arg(args, 0))? {
             return Err(i.make_error("TypeError", "argument must not be a regular expression"));
         }
-        let needle = ab(i.to_string(&arg(args, 0)))?;
-        if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
-            && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
-        {
-            let text = s.text();
-            let pos = str_clamp_pos(i, args.get(1), text.len() as i64)?;
-            return Ok(Value::Bool(text[pos..].contains(&*needle.text())));
-        }
-        let chars = i.units_full(&s);
-        let len = chars.len() as i64;
-        let pos = str_clamp_pos(i, args.get(1), len)?;
-        let nchars = i.units_full(&needle);
-        let found = (pos..=chars.len())
-            .any(|k| k + nchars.len() <= chars.len() && chars[k..k + nchars.len()] == nchars[..]);
-        Ok(Value::Bool(found))
+        let needle = string_arg(i, &arg(args, 0))?;
+        let pos = str_clamp_pos(i, args.get(1), s.unit_len() as i64)?;
+        Ok(Value::Bool(
+            s.units().index_of(needle.units(), pos).is_some(),
+        ))
     });
     it.def_method(&sp, "startsWith", 1, |i, this, args| {
         let s = this_string(i, &this)?;
@@ -12213,7 +12156,7 @@ fn install_string(it: &mut Interp) {
         let pattern_ascii = pat.ascii_hint() || (source_ascii && pat.text().is_ascii());
         if source_ascii && pattern_ascii {
             let (text, pattern) = (s.text(), pat.text());
-            let Some(first) = text.find(&*pattern) else {
+            let Some(first) = crate::lstr::find_ascii(&text, &pattern, 0) else {
                 return Ok(Value::Str(s));
             };
             if let Repl::Text(template) = &repl {
@@ -12230,7 +12173,7 @@ fn install_string(it: &mut Interp) {
             push_str_checked(i, &mut out, &rep)?;
             let mut rest = &text[first + pattern.len()..];
             let mut base = first + pattern.len();
-            while let Some(pos) = rest.find(&*pattern) {
+            while let Some(pos) = crate::lstr::find_ascii(rest, &pattern, 0) {
                 push_str_checked(i, &mut out, &rest[..pos])?;
                 let rep = string_replacement(i, &repl, &pattern, &s, base + pos)?;
                 push_str_checked(i, &mut out, &rep)?;
@@ -12642,7 +12585,7 @@ fn replace_all_ascii_literal(
     out.push_str(&source[..first]);
     out.push_str(replacement);
     let mut rest = &source[first + pattern.len()..];
-    while let Some(pos) = rest.find(&*pattern) {
+    while let Some(pos) = crate::lstr::find_ascii(rest, &pattern, 0) {
         if out.len() > MAX_STR_LEN {
             return None;
         }
