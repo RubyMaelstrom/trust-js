@@ -288,6 +288,8 @@ pub struct Regex {
     tier_up_attempted: Cell<bool>,
     tier_up_at: u32,
     one_byte_native: RefCell<Option<OneByteNativeProgram>>,
+    /// The matcher's working state between executions.
+    scratch: RefCell<MatchScratch>,
     pub unicode: bool,
     pub ngroups: usize,
     pub source: String,
@@ -2399,6 +2401,11 @@ impl Regex {
                     .map_or(0, OneByteNativeProgram::retained_bytes),
             )
             .saturating_add(self.first_lut.as_ref().map_or(0, |_| 256))
+            .saturating_add(
+                self.scratch
+                    .try_borrow()
+                    .map_or(0, |scratch| scratch.heap_bytes()),
+            )
             .saturating_add(self.source.capacity())
             .saturating_add(self.flags.capacity())
             .saturating_add(
@@ -2438,6 +2445,11 @@ impl Regex {
                     .map_or(0, OneByteNativeProgram::retained_bytes),
             )
             .saturating_add(self.first_lut.as_ref().map_or(0, |_| 256))
+            .saturating_add(
+                self.scratch
+                    .try_borrow()
+                    .map_or(0, |scratch| scratch.heap_bytes()),
+            )
             .saturating_add(self.source.capacity())
             .saturating_add(self.flags.capacity())
             .saturating_add(
@@ -2611,6 +2623,7 @@ impl Regex {
             tier_up_attempted: Cell::new(false),
             tier_up_at: regexp_tier_up_threshold(),
             one_byte_native: RefCell::new(None),
+            scratch: RefCell::new(MatchScratch::new(2 * (p.ngroups + 1), lowering.marks)),
             prog,
             ngroups: p.ngroups,
             source: if pattern.is_empty() {
@@ -2952,31 +2965,35 @@ impl Regex {
                 return Ok(None);
             }
         }
-        // One matcher for the whole scan, its working buffers recycled across `exec` calls via a
-        // thread-local (the engine is single-threaded per Interp).
-        let mut scratch = MATCH_SCRATCH
-            .with(|s| s.borrow_mut().take())
-            .unwrap_or_default();
-        scratch.caps.clear();
-        scratch.caps.resize(2 * (self.ngroups + 1), None);
-        scratch.marks.clear();
-        scratch.marks.resize(self.nmarks, None);
-        scratch.flags.clear();
+        // One matcher for the whole scan, on the program's own scratch. Matching runs no code, so
+        // nothing enters it again while it is held; a fresh scratch would keep that harmless.
+        let mut held;
+        let mut spare;
+        let scratch: &mut MatchScratch = match self.scratch.try_borrow_mut() {
+            Ok(guard) => {
+                held = guard;
+                &mut held
+            }
+            Err(_) => {
+                spare = MatchScratch::new(2 * (self.ngroups + 1), self.nmarks);
+                &mut spare
+            }
+        };
         let base_flags = (self.ignore_case, self.multiline, self.dotall);
         let mut m = Matcher {
             input,
-            caps: scratch.caps,
-            marks: scratch.marks,
+            caps: &mut scratch.caps,
+            marks: &mut scratch.marks,
             steps: 0,
-            bt: scratch.bt,
-            saved: scratch.saved,
+            bt: std::mem::take(&mut scratch.bt),
+            saved: std::mem::take(&mut scratch.saved),
             choices: 0,
             floor: 0,
             looks: Vec::new(),
             state_limit: backtrack_state_limit(),
             back: false,
             flags: base_flags,
-            outer_flags: scratch.flags,
+            outer_flags: std::mem::take(&mut scratch.outer_flags),
             unicode: self.flags.contains('u') || self.flags.contains('v'),
             control,
             abort: None,
@@ -2997,8 +3014,10 @@ impl Regex {
                 let mut end = input.len();
                 if let Some(prefilter) = &self.prefilter {
                     if window_end.is_none_or(|end| from > end) {
-                        let Some(found) = prefilter.find(input, from, control)? else {
-                            break 'scan Ok(None);
+                        let found = match prefilter.find(input, from, control) {
+                            Ok(Some(found)) => found,
+                            Ok(None) => break 'scan Ok(None),
+                            Err(error) => break 'scan Err(error),
                         };
                         if let Some(max) = prefilter.max_offset_in::<I>() {
                             from = from.max(input.boundary(found.saturating_sub(max)));
@@ -3014,7 +3033,10 @@ impl Regex {
                     } else {
                         from + 1
                     };
-                    let next = self.next_start(input, after, end, control)?;
+                    let next = match self.next_start(input, after, end, control) {
+                        Ok(next) => next,
+                        Err(error) => break 'scan Err(error),
+                    };
                     if prof {
                         let skipped = next.unwrap_or(end + 1) - from;
                         REGEXP_PROF.with(|p| p.borrow_mut().scan_positions += skipped as u64);
@@ -3047,7 +3069,7 @@ impl Regex {
             m.flags = base_flags;
             m.outer_flags.clear();
             if m.run(&self.prog, from) {
-                break 'scan Ok(Some(project(&m.caps)));
+                break 'scan Ok(Some(project(m.caps)));
             }
             if let Some(error) = m.abort {
                 break 'scan Err(error);
@@ -3057,20 +3079,21 @@ impl Regex {
             }
             from = input.next_elem(from).1;
         };
-        // A match leaves its backtrack state behind; a huge one's storage is released.
-        m.bt.clear();
-        m.bt.shrink_to(RETAINED_BACKTRACK_STATE);
-        m.saved.clear();
-        m.saved.shrink_to(RETAINED_BACKTRACK_STATE);
-        MATCH_SCRATCH.with(|s| {
-            *s.borrow_mut() = Some(MatchScratch {
-                caps: m.caps,
-                marks: m.marks,
-                flags: m.outer_flags,
-                bt: m.bt,
-                saved: m.saved,
-            });
-        });
+        // A match leaves its backtrack state behind; a large one's storage is released.
+        let Matcher {
+            mut bt,
+            mut saved,
+            mut outer_flags,
+            ..
+        } = m;
+        bt.clear();
+        bt.shrink_to(RETAINED_BACKTRACK_STATE);
+        saved.clear();
+        saved.shrink_to(RETAINED_BACKTRACK_STATE);
+        outer_flags.clear();
+        scratch.bt = bt;
+        scratch.saved = saved;
+        scratch.outer_flags = outer_flags;
         result
     }
 }
@@ -3308,20 +3331,45 @@ fn char_class_heap_bytes(class: &CharClass) -> usize {
         .saturating_add(class.ascii_lut.as_ref().map_or(0, |_| 256))
 }
 
-/// Recycled matcher working buffers (see `Regex::exec_at`).
-#[derive(Default)]
+/// The matcher's working state, kept with its program between executions (see
+/// [`Regex::exec_impl_with`]) instead of being allocated and sized by each: the capture and mark
+/// slots, sized for the program, and the backtrack stack, capture snapshots and modifier flag
+/// stack, empty between executions.
 struct MatchScratch {
-    caps: Vec<Option<usize>>,
-    marks: Vec<Option<usize>>,
-    /// The modifier flag stack (see `Matcher::outer_flags`).
-    flags: Vec<(bool, bool, bool)>,
+    caps: Box<[Option<usize>]>,
+    marks: Box<[Option<usize>]>,
     bt: Vec<Backtrack>,
     saved: Vec<Option<usize>>,
+    outer_flags: Vec<(bool, bool, bool)>,
 }
 
-thread_local! {
-    static MATCH_SCRATCH: std::cell::RefCell<Option<MatchScratch>> =
-        const { std::cell::RefCell::new(None) };
+impl MatchScratch {
+    fn new(slots: usize, marks: usize) -> Self {
+        Self {
+            caps: vec![None; slots].into_boxed_slice(),
+            marks: vec![None; marks].into_boxed_slice(),
+            bt: Vec::new(),
+            saved: Vec::new(),
+            outer_flags: Vec::new(),
+        }
+    }
+
+    /// Bytes of the slots and stacks, by capacity.
+    fn heap_bytes(&self) -> usize {
+        let slot = std::mem::size_of::<Option<usize>>();
+        (self.caps.len() + self.marks.len() + self.saved.capacity())
+            .saturating_mul(slot)
+            .saturating_add(
+                self.bt
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Backtrack>()),
+            )
+            .saturating_add(
+                self.outer_flags
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(bool, bool, bool)>()),
+            )
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5648,8 +5696,9 @@ enum Backtrack {
 /// alternative left at every iteration), which becomes a RangeError instead of exhausting memory.
 pub(crate) const MAX_BACKTRACK_STATE: usize = 32 << 20;
 
-/// Backtracking state capacity a thread keeps between `exec` calls; a huge match's is released.
-const RETAINED_BACKTRACK_STATE: usize = 1 << 12;
+/// Backtracking state capacity, in records and in snapshot slots, a program keeps between
+/// executions (see [`MatchScratch`]); a larger match's is released.
+const RETAINED_BACKTRACK_STATE: usize = 64;
 
 #[cfg(test)]
 thread_local! {
@@ -5701,8 +5750,9 @@ struct LookFrame<'a> {
 
 struct Matcher<'a, I: ReInput> {
     input: I,
-    caps: Vec<Option<usize>>,
-    marks: Vec<Option<usize>>,
+    /// The capture and mark slots, in the program's [`MatchScratch`].
+    caps: &'a mut [Option<usize>],
+    marks: &'a mut [Option<usize>],
     /// Executed instructions, counted only to poll for host interruption: ECMA-262 bounds no
     /// matcher's running time, so a long match runs until it ends or the host stops the script.
     steps: u64,
@@ -6768,7 +6818,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         // lookbehind body (compiled from the reversed AST) matches right-to-left
                         // from `pos`; a nested lookahead always matches forward.
                         let saved = self.saved.len();
-                        self.saved.extend_from_slice(&self.caps);
+                        self.saved.extend_from_slice(self.caps);
                         self.looks.push(LookFrame {
                             prog,
                             pc,
