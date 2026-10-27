@@ -2057,8 +2057,16 @@ impl ReText {
             return None;
         }
         // A one-byte view's units are ASCII bytes, so it matches over them whatever its
-        // owner's width; a two-byte one reads its parent's elements.
-        let ascii = source.known_ascii();
+        // owner's width. A two-byte one matches over its range of the parent's one-byte copy
+        // when the parent's units are all ASCII (it has no elements then), and otherwise reads
+        // the parent's elements. The interpreter windows only owners up to a megabyte, so the
+        // range is a view of the copy unless it is short.
+        let ascii_src = if source.known_ascii() {
+            Some(*source)
+        } else {
+            parent.ascii_src.map(|copy| copy.slice_units(start, end))
+        };
+        let ascii = ascii_src.is_some();
         Some(Self {
             elems: Vec::new(),
             unit_of: None,
@@ -2069,7 +2077,7 @@ impl ReText {
                 parent.subject_shape
             },
             unicode: parent.unicode,
-            ascii_src: ascii.then_some(*source),
+            ascii_src,
             parent: (!ascii).then_some(parent),
             elem_base: first,
             unit_base: start,
@@ -6592,6 +6600,46 @@ mod internal_engine_diagnostics {
             if unicode {
                 let empty = crate::lstr::LStr::from("");
                 assert!(ReText::window(parent, &empty, 1, 1).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn two_byte_windows_of_ascii_units_match_over_the_parents_copy() {
+        use super::*;
+        let body = format!("x\nA1.z\n{}z", "a".repeat(1024));
+        // A two-byte buffer whose units are all ASCII: a two-byte suffix's width is kept.
+        let wide: crate::lstr::LStr = format!("é{body}").into();
+        let mut root = crate::lstr::LStr::from("#");
+        root.append_or_replace(&wide.slice_units(1, wide.unit_len()));
+        assert!(!root.known_ascii() && root.view_range().is_none());
+        let source = root.slice_units(1, root.unit_len());
+        assert!(source.view_range().is_some() && !source.known_ascii());
+        let control = crate::RuntimeInterrupt::default();
+        let elements: Vec<u32> = body.bytes().map(u32::from).collect();
+        for flags in ["", "g", "y", "i", "m", "u", "v", "iu", "duy"] {
+            let unicode = flags.contains('u') || flags.contains('v');
+            let parent = Rc::new(ReText::new_rc(unicode, &root));
+            assert!(parent.ascii_src.is_some() && parent.elems.is_empty());
+            let window = ReText::window(parent, &source, 1, root.unit_len()).unwrap();
+            assert!(window.parent.is_none());
+            assert_eq!(window.subject_shape(), SUBJECT_ASCII);
+            assert_eq!(window.unit_index(window.len()), body.len());
+            assert_eq!(window.slice(0, window.len()), body);
+            for pattern in ["^x", "\\bA\\d\\b", "(?<=\\n)A\\d", "z$", "[a-z]+", "[^a]+"] {
+                let mut re = Regex::new(pattern, flags).unwrap();
+                re.tier_up_at = 1;
+                for at in [0, 1, 6, body.len() - 1, body.len(), body.len() + 1] {
+                    let actual = re
+                        .exec_text_shared(&window, at, &control)
+                        .unwrap()
+                        .map(|captures| captures.to_vec());
+                    let expected = re
+                        .exec_impl(&elements[..], at, &control)
+                        .unwrap()
+                        .map(|captures| captures.to_vec());
+                    assert_eq!(actual, expected, "/{pattern}/{flags}, start={at}");
+                }
             }
         }
     }

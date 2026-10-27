@@ -149,6 +149,32 @@ fn regexp_windows_of_appended_buffers_share_one_prepared_extent() {
 }
 
 #[test]
+fn regexps_match_views_of_two_byte_buffers_holding_only_ascii() {
+    // A stripped byte order mark leaves a two-byte view of ASCII units, and so does a slice
+    // short of a non-ASCII character; their buffers' prepared texts have no elements.
+    check(
+        r#"
+        function run(){
+            var body=('﻿'+'ab c\n'.repeat(80)+'x').slice(1);
+            var full='#'+body;
+            var v=('é'+'ab c\n'.repeat(80)).slice(1,-1);
+            v+='y';v+='z';
+            var out=[];
+            for(var s of [full.slice(1),full.slice(200),v,v.slice(150)]){
+                var re=/c\n/g;re.lastIndex=7;
+                out.push(/x$/.test(s),/^ab/.test(s),/z$/.test(s),s.search(/b c/u),
+                    re.exec(s).index,re.lastIndex,s.match(/\bab\b/gi).length,
+                    JSON.stringify(s.replace(/a(b)/g,'[$1]').slice(0,12)),s.split(/\n/v).length,
+                    [...s.matchAll(/c\n?(?=a|y|x|$)/g)].length);
+            }
+            return out.join('|');
+        }run()
+        "#,
+        r#"true|true|false|1|8|10|80|"[b] c\n[b] c\n"|81|80|true|false|false|2|9|11|40|"\n[b] c\n[b] c"|42|40|false|true|true|1|8|10|80|"[b] c\n[b] c\n"|80|80|false|true|true|1|8|10|50|"[b] c\n[b] c\n"|50|50"#,
+    );
+}
+
+#[test]
 fn large_views_keep_native_reads_and_observers_correct() {
     check(
         r#"
