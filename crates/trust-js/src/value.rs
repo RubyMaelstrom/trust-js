@@ -5819,16 +5819,148 @@ struct DenseBuffers {
     inline_packed: InlinePacked,
     elems: DenseDeque<u32>,
     mirror: DenseDeque<f64>,
+    /// The map's own index of its named keys, when it keeps one (`Props::build_index`): one
+    /// word here, so the sidecar keeps its size class.
+    index: Option<crate::gc_storage::StorageBox<KeyIndex>>,
+}
+
+/// One slot of a [`KeyIndex`]: a key and its entry's position, or empty.
+#[derive(Clone, Copy, Default)]
+struct KeySlot {
+    key: Option<PropKey>,
+    position: u32,
+}
+
+/// A property map's own index of its named keys, when its layout has none past
+/// [`INDEX_THRESHOLD`] keys: open addressing (linear probing) over a power of two of
+/// [`KeySlot`]s, at most half full, in storage blocks the element sidecar reports.
+#[derive(Clone)]
+struct KeyIndex {
+    /// Never dropped: the block is the collector's.
+    slots: std::mem::ManuallyDrop<
+        crate::inline_vec::InlineVec<KeySlot, 0, crate::gc_storage::GcSpill>,
+    >,
+    len: u32,
+}
+
+impl KeyIndex {
+    /// An index of `keys`, each at its position.
+    fn of(keys: &[PropKey]) -> Self {
+        let mut index = KeyIndex::with_room(keys.len());
+        for (position, &key) in keys.iter().enumerate() {
+            index.insert(key, position);
+        }
+        index
+    }
+
+    fn with_room(keys: usize) -> Self {
+        let capacity = (keys.max(INDEX_THRESHOLD) * 2).next_power_of_two();
+        let mut slots = crate::inline_vec::InlineVec::with_capacity(capacity);
+        slots.extend(std::iter::repeat_n(KeySlot::default(), capacity));
+        KeyIndex {
+            slots: std::mem::ManuallyDrop::new(slots),
+            len: 0,
+        }
+    }
+
+    /// The slot where `key`'s probe starts.
+    #[inline]
+    fn home(&self, key: PropKey) -> usize {
+        let bits = self.slots.len().trailing_zeros();
+        (key.word().wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
+    }
+
+    /// The slot holding `key`, or the empty one where its probe ends.
+    #[inline]
+    fn probe(&self, key: PropKey) -> Result<usize, usize> {
+        let mask = self.slots.len() - 1;
+        let mut slot = self.home(key);
+        loop {
+            match self.slots[slot].key {
+                None => return Err(slot),
+                Some(stored) if stored == key => return Ok(slot),
+                Some(_) => slot = (slot + 1) & mask,
+            }
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: PropKey) -> Option<usize> {
+        let slot = self.probe(key).ok()?;
+        Some(self.slots[slot].position as usize)
+    }
+
+    /// Map `key` to `position`, adding it if absent.
+    fn insert(&mut self, key: PropKey, position: usize) {
+        if (self.len as usize + 1) * 2 > self.slots.len() {
+            let mut grown = KeyIndex::with_room(self.len as usize + 1);
+            for entry in self.slots.iter().filter(|entry| entry.key.is_some()) {
+                grown.insert(entry.key.expect("filtered"), entry.position as usize);
+            }
+            *self = grown;
+        }
+        let slot = match self.probe(key) {
+            Ok(slot) => slot,
+            Err(slot) => {
+                self.len += 1;
+                slot
+            }
+        };
+        self.slots[slot] = KeySlot {
+            key: Some(key),
+            position: position as u32,
+        };
+    }
+
+    /// Unmap `key`: the later slots of its run move back over the gap (deletion under linear
+    /// probing), so every probe still ends at the right slot.
+    fn remove(&mut self, key: PropKey) {
+        let Ok(mut gap) = self.probe(key) else {
+            return;
+        };
+        let mask = self.slots.len() - 1;
+        let mut next = (gap + 1) & mask;
+        while let Some(stored) = self.slots[next].key {
+            // The entry can fill the gap if its probe passes the gap on the way to it.
+            let home = self.home(stored);
+            if (gap.wrapping_sub(home) & mask) < (next.wrapping_sub(home) & mask) {
+                self.slots[gap] = self.slots[next];
+                gap = next;
+            }
+            next = (next + 1) & mask;
+        }
+        self.slots[gap] = KeySlot::default();
+        self.len -= 1;
+    }
+
+    /// Every position past `removed` moves down one, after the entry there left the map.
+    fn close_gap(&mut self, removed: usize) {
+        for entry in self.slots.iter_mut() {
+            if entry.key.is_some() && entry.position as usize > removed {
+                entry.position -= 1;
+            }
+        }
+    }
+
+    /// The index's slots: a power of two, at least twice its keys.
+    #[cfg(feature = "architecture-diagnostics")]
+    fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The bytes of the index's block.
+    fn bytes(&self) -> usize {
+        self.slots.heap_capacity() * std::mem::size_of::<KeySlot>()
+    }
 }
 
 /// What a property map keeps in the Rust heap beside its sidecar, each part only once needed:
-/// a hash index, the Symbols of its Symbol keys and internal slots. The index's and the Symbol
-/// map's storage is charged to the heap's external ledger ([`DenseExtras::settle_charge`]),
-/// the internal slots' by themselves. An object whose map has extras needs its finalizer.
+/// the Symbols of its Symbol keys and internal slots. The Symbol map's storage is charged to the
+/// heap's external ledger ([`DenseExtras::settle_charge`]), the internal slots' by themselves.
+/// An object whose map has extras needs its finalizer.
 #[derive(Default)]
 struct DenseExtras {
     charge: ExternalCharge,
-    index: Option<Box<crate::fasthash::FastMap<PropKey, usize>>>,
     /// Strong ownership for Symbol-valued property keys. String keys stay inline in `entries`;
     /// this cold sidecar exists only for objects that actually acquire a Symbol key.
     symbols: Option<Box<crate::fasthash::FastMap<u64, SymbolRef>>>,
@@ -5839,7 +5971,6 @@ impl Clone for DenseExtras {
     fn clone(&self) -> Self {
         let mut copy = Self {
             charge: ExternalCharge::new(),
-            index: self.index.clone(),
             symbols: self.symbols.clone(),
             // Ordinary property templates and array copies never duplicate private brands or
             // built-in internal state. Receiver transplantation copies slots explicitly.
@@ -5851,39 +5982,16 @@ impl Clone for DenseExtras {
 }
 
 impl DenseExtras {
-    /// Bring the external charge to the hash index's and Symbol-key map's current capacity
-    /// (buckets with a control byte each, and the boxes), after either changed.
+    /// Bring the external charge to the Symbol-key map's current capacity (buckets with a
+    /// control byte each, and the box), after it changed.
     fn settle_charge(&mut self) {
         fn map_bytes<K, V>(map: &Option<Box<crate::fasthash::FastMap<K, V>>>) -> usize {
             map.as_ref().map_or(0, |map| {
                 std::mem::size_of_val(&**map) + map.capacity() * (std::mem::size_of::<(K, V)>() + 1)
             })
         }
-        let bytes = map_bytes(&self.index) + map_bytes(&self.symbols);
+        let bytes = map_bytes(&self.symbols);
         self.charge.settle(bytes);
-    }
-}
-
-/// The map's hash index, borrowed for a change: the charge follows its capacity when the
-/// borrow ends ([`DenseExtras::settle_charge`]).
-struct IndexMut<'a>(&'a mut DenseExtras);
-
-impl std::ops::Deref for IndexMut<'_> {
-    type Target = crate::fasthash::FastMap<PropKey, usize>;
-    fn deref(&self) -> &Self::Target {
-        self.0.index.as_deref().expect("an index to change")
-    }
-}
-
-impl std::ops::DerefMut for IndexMut<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.index.as_deref_mut().expect("an index to change")
-    }
-}
-
-impl Drop for IndexMut<'_> {
-    fn drop(&mut self) {
-        self.0.settle_charge();
     }
 }
 
@@ -6112,6 +6220,7 @@ static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers {
     inline_packed: InlinePacked::new(),
     elems: DenseDeque::new(),
     mirror: DenseDeque::new(),
+    index: None,
 });
 
 struct EmptyInternalSlots(InternalSlots);
@@ -6150,10 +6259,10 @@ impl DenseStorage {
         self.1.get_or_insert_with(Default::default)
     }
 
-    /// The map's own hash index, when it keeps one (`Props::build_index`).
+    /// The map's own index, when it keeps one (`Props::build_index`).
     #[inline]
-    fn index(&self) -> Option<&crate::fasthash::FastMap<PropKey, usize>> {
-        self.1.as_deref()?.index.as_deref()
+    fn index(&self) -> Option<&KeyIndex> {
+        self.0.as_deref()?.index.as_deref()
     }
 
     /// The Symbols of the map's Symbol-valued keys, if it has any.
@@ -6186,7 +6295,14 @@ impl DenseStorage {
             inline_packed: _, // in the sidecar's block
             elems,
             mirror,
+            index,
         } = &**buffers;
+        if let Some(index) = index {
+            StorageBox::trace(index, sink);
+            if let Some(block) = index.slots.spill_ptr() {
+                trace_block(block, sink);
+            }
+        }
         if let Some(packed) = packed {
             StorageBox::trace(packed, sink);
             let PackedBuffer {
@@ -6233,9 +6349,8 @@ impl DenseStorage {
             }
         }
     }
-    fn index_mut(&mut self) -> Option<IndexMut<'_>> {
-        let extras = self.1.as_deref_mut()?;
-        extras.index.is_some().then(|| IndexMut(extras))
+    fn index_mut(&mut self) -> Option<&mut KeyIndex> {
+        self.0.as_deref_mut()?.index.as_deref_mut()
     }
     fn packed_mut(&mut self) -> Option<&mut DenseDeque<Property>> {
         let dense = self.0.as_deref_mut()?;
@@ -6330,14 +6445,16 @@ impl DenseStorage {
         buffers.inline_packed.packed_plain.set(plain);
         plain
     }
-    fn set_index(&mut self, index: Option<Box<crate::fasthash::FastMap<PropKey, usize>>>) {
-        if index.is_some() {
-            let extras = self.extras_mut();
-            extras.index = index;
-            extras.settle_charge();
-        } else if let Some(extras) = self.1.as_deref_mut() {
-            extras.index = None;
-            extras.settle_charge();
+    fn set_index(&mut self, index: Option<KeyIndex>) {
+        match index {
+            Some(index) => {
+                self.buffers_mut().index = Some(crate::gc_storage::StorageBox::new(index));
+            }
+            None => {
+                if let Some(buffers) = self.0.as_deref_mut() {
+                    buffers.index = None;
+                }
+            }
         }
     }
     fn set_packed(&mut self, packed: Option<PackedProperties>) {
@@ -7680,11 +7797,10 @@ impl Props {
                     bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
                 }
             }
-            if self.elems.index().is_some() {
-                bytes = bytes.saturating_add(std::mem::size_of::<
-                    crate::fasthash::FastMap<PropKey, usize>,
-                >());
-                exact = false;
+            if let Some(index) = self.elems.index() {
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<KeyIndex>())
+                    .saturating_add(index.bytes());
             }
             if self.elems.symbols().is_some() {
                 bytes = bytes.saturating_add(std::mem::size_of::<
@@ -7778,6 +7894,7 @@ impl Props {
                         inline_packed,
                         elems: DenseDeque::new(),
                         mirror: DenseDeque::new(),
+                        index: None,
                     })),
                     None,
                 )
@@ -8445,7 +8562,7 @@ impl Props {
         self.note_structural();
         let slot = self.entries.len();
         let key = index_key(n as usize);
-        if let Some(mut index) = self.elems.index_mut() {
+        if let Some(index) = self.elems.index_mut() {
             index.insert(key, slot);
         }
         self.reserve_entry();
@@ -8511,7 +8628,7 @@ impl Props {
         self.note_structural();
         let slot = self.entries.len();
         let key = index_key(n);
-        if let Some(mut index) = self.elems.index_mut() {
+        if let Some(index) = self.elems.index_mut() {
             index.insert(key, slot);
         }
         self.reserve_entry();
@@ -8584,8 +8701,8 @@ impl Props {
         self.note_structural();
         let (_, p) = self.entries.pop().unwrap();
         self.elems.pop();
-        if let Some(mut index) = self.elems.index_mut() {
-            index.remove(&index_key(n as usize));
+        if let Some(index) = self.elems.index_mut() {
+            index.remove(index_key(n as usize));
         }
         if self.mirror_flags & MIRROR_OK != 0 {
             debug_assert_eq!(self.elems.mirror_len(), self.elems.len() + 1);
@@ -8955,7 +9072,7 @@ impl Props {
         }
         let found = match self.elems.index() {
             None => self.entries.keys().iter().position(|&k| k == key),
-            Some(index) => index.get(&key).copied(),
+            Some(index) => index.get(key),
         };
         if let Some(s) = found {
             if key == length {
@@ -9044,10 +9161,7 @@ impl Props {
     }
     /// Build the hash index for every current entry (crossing the small-map threshold).
     fn build_index(&mut self) {
-        let mut index = Box::<crate::fasthash::FastMap<PropKey, usize>>::default();
-        for (j, &k) in self.entries.keys().iter().enumerate() {
-            index.insert(k, j);
-        }
+        let index = KeyIndex::of(self.entries.keys());
         self.elems.set_index(Some(index));
     }
 
@@ -9368,7 +9482,7 @@ impl Props {
         }
         let slot = self.entries.len();
         let key = index_key(slot);
-        if let Some(mut index) = self.elems.index_mut() {
+        if let Some(index) = self.elems.index_mut() {
             index.insert(key, slot);
         }
         self.reserve_entry();
@@ -9386,7 +9500,7 @@ impl Props {
         self.note_structural();
         let slot = self.entries.len();
         if self.elems.index().is_some() {
-            if let Some(mut index) = self.elems.index_mut() {
+            if let Some(index) = self.elems.index_mut() {
                 index.insert(key, slot);
             }
         } else if self.should_build_index(key) {
@@ -9433,7 +9547,7 @@ impl Props {
         debug_assert!(self.entries.predicts(key));
         self.elems.retain_symbol_key(key);
         let slot = self.entries.len();
-        if let Some(mut index) = self.elems.index_mut() {
+        if let Some(index) = self.elems.index_mut() {
             index.insert(key, slot);
         }
         self.entries.fields.push(prop);
@@ -9507,7 +9621,7 @@ impl Props {
             self.note_structural();
             let slot = self.entries.len();
             if self.elems.index().is_some() {
-                if let Some(mut index) = self.elems.index_mut() {
+                if let Some(index) = self.elems.index_mut() {
                     index.insert(key, slot);
                 }
             } else if self.should_build_index(key) {
@@ -9629,17 +9743,13 @@ impl Props {
         }
         self.len_slot.set(SlotMemo::NONE);
         self.proto_slot.set(SlotMemo::NONE);
-        if let Some(mut index) = self.elems.index_mut() {
-            index.remove(&key);
+        if let Some(index) = self.elems.index_mut() {
+            index.remove(key);
             // Every later entry moved down one slot. The index covers every entry, so
             // adjust positions in place instead of rehashing and reinserting each later key:
             // removing the early keys of a large map (a Window bootstrap deleting its host
             // bindings from a global with a thousand properties) stays linear and cheap.
-            for slot in index.values_mut() {
-                if *slot > i {
-                    *slot -= 1;
-                }
-            }
+            index.close_gap(i);
         }
         if !self.elem_mode.get()
             && self

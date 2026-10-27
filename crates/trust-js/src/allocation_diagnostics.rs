@@ -450,8 +450,8 @@ impl PropertyInventory {
                 .observe(props.entries.len(), props.entries.capacity());
         }
 
-        // The hash index and the Symbol map live in the map's extras, which a map without
-        // element buffers can have too.
+        // The key index lives behind the element buffers, the Symbol map in the map's extras,
+        // which a map without element buffers can have too.
         result.dense_string_index_capacity = props
             .elems
             .index()
