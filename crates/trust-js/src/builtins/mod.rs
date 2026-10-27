@@ -350,11 +350,13 @@ pub(crate) fn intl_delegate(
         ("Collator", "compare") => {
             let a = ab(i.to_string(&arg(call_args, 0)))?;
             let b = ab(i.to_string(&arg(call_args, 1)))?;
-            Ok(Value::Num(match crate::jstr::cmp_units(&a, &b) {
-                std::cmp::Ordering::Less => -1.0,
-                std::cmp::Ordering::Equal => 0.0,
-                std::cmp::Ordering::Greater => 1.0,
-            }))
+            Ok(Value::Num(
+                match crate::jstr::cmp_units(&a.text(), &b.text()) {
+                    std::cmp::Ordering::Less => -1.0,
+                    std::cmp::Ordering::Equal => 0.0,
+                    std::cmp::Ordering::Greater => 1.0,
+                },
+            ))
         }
         // Number/BigInt.prototype.toLocaleString → ToString.
         ("NumberFormat", "format") => Ok(Value::Str(ab(i.to_string(&arg(call_args, 0)))?)),

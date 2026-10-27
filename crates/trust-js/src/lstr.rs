@@ -14,8 +14,9 @@
 //! a new buffer with geometric capacity.
 //!
 //! Logical content is always `len` bytes of valid UTF-8 (lone surrogates smuggled, as before —
-//! see [`crate::jstr`]); capacity beyond `len` is invisible to every reader because `Deref`
-//! slices to `len`. Large substrings may instead hold a bounded view of a flat buffer. Their
+//! see [`crate::jstr`]); capacity beyond `len` is invisible to every reader, since the readers
+//! ([`LStr::text`], [`LStr::as_ascii`]) slice to `len`. Large substrings may instead hold a
+//! bounded view of a flat buffer. Their
 //! header has the same length offset, but no ASCII hint: native byte readers must take their
 //! checked path for a view.
 //!
@@ -324,8 +325,9 @@ impl LStr {
         self.p.as_ptr() as u64
     }
 
+    /// The stored engine text; readers outside this module use [`Self::text`].
     #[inline]
-    pub fn as_str(&self) -> &str {
+    fn as_str(&self) -> &str {
         unsafe {
             let bytes = std::slice::from_raw_parts(self.data(), self.hdr().len.get() as usize);
             std::str::from_utf8_unchecked(bytes)
@@ -603,26 +605,6 @@ impl LStr {
         }
         mapped.set_fresh_len(source.len());
         mapped
-    }
-}
-
-impl std::ops::Deref for LStr {
-    type Target = str;
-    #[inline]
-    fn deref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl std::borrow::Borrow<str> for LStr {
-    fn borrow(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl AsRef<str> for LStr {
-    fn as_ref(&self) -> &str {
-        self.as_str()
     }
 }
 
