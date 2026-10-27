@@ -189,7 +189,12 @@ fn record_getter_specialization_returns_fresh_live_records() {
             let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
             let value = engine
                 .interp
-                .get_prop_ic(&source, "state", &cache[0])
+                .get_prop_ic(
+                    &source,
+                    "state",
+                    crate::atom::PropKey::from_text("state"),
+                    &cache[0],
+                )
                 .unwrap_or_else(|_| panic!("maintenance getter"));
             assert!(matches!(
                 (engine.interp.get_member_key(&value, "index")).map(|__value| (__value).view()),
@@ -362,7 +367,12 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
         for _ in 0..3 {
             let value = engine
                 .interp
-                .get_prop_ic(&base, "cached", &cache[0])
+                .get_prop_ic(
+                    &base,
+                    "cached",
+                    crate::atom::PropKey::from_text("cached"),
+                    &cache[0],
+                )
                 .ok()
                 .unwrap();
             assert!(matches!((value).view(), ValueView::Num(19.0)));
@@ -390,7 +400,13 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
             "layout caches must not pin getter values"
         );
         assert!(matches!(
-            (engine.interp.get_prop_ic(&base, "cached", &cache[0])).map(|__value| (__value).view()),
+            (engine.interp.get_prop_ic(
+                &base,
+                "cached",
+                crate::atom::PropKey::from_text("cached"),
+                &cache[0]
+            ))
+            .map(|__value| (__value).view()),
             Ok(ValueView::Num(23.0))
         ));
     }
@@ -426,7 +442,7 @@ fn getter_cache_same_shape_replacement_and_kind_changes_are_live() {
         }
         for _ in 0..3 {
             assert!(
-                matches!((engine.interp.get_prop_ic(&base, "cached", &cache[0])).map(|__value| (__value).view()), Ok(ValueView::Num(n)) if n==expected)
+                matches!((engine.interp.get_prop_ic(&base, "cached", crate::atom::PropKey::from_text("cached"), &cache[0])).map(|__value| (__value).view()), Ok(ValueView::Num(n)) if n==expected)
             );
             assert_eq!(cache[0].get().depth, IC_ACCESSOR);
         }
@@ -442,7 +458,13 @@ fn getter_cache_same_shape_replacement_and_kind_changes_are_live() {
         .insert("cached", Property::accessor_prop(None, None, false, true));
     assert_eq!(object.borrow().props.shape(), shape);
     assert!(matches!(
-        (engine.interp.get_prop_ic(&base, "cached", &cache[0])).map(|__value| (__value).view()),
+        (engine.interp.get_prop_ic(
+            &base,
+            "cached",
+            crate::atom::PropKey::from_text("cached"),
+            &cache[0]
+        ))
+        .map(|__value| (__value).view()),
         Ok(ValueView::Undefined)
     ));
     assert_eq!(calls.get(), 6);
@@ -451,7 +473,13 @@ fn getter_cache_same_shape_replacement_and_kind_changes_are_live() {
         .props
         .insert("cached", Property::plain(Value::Num(31.0)));
     assert!(matches!(
-        (engine.interp.get_prop_ic(&base, "cached", &cache[0])).map(|__value| (__value).view()),
+        (engine.interp.get_prop_ic(
+            &base,
+            "cached",
+            crate::atom::PropKey::from_text("cached"),
+            &cache[0]
+        ))
+        .map(|__value| (__value).view()),
         Ok(ValueView::Num(31.0))
     ));
     assert_eq!(cache[0].get().depth, 0);
@@ -484,7 +512,7 @@ fn getter_cache_array_holder_uses_live_key_checks_and_computed_keys() {
             .ok()
             .unwrap();
         assert!(
-            matches!((engine.interp.get_prop_ic(&array, "cached", &cache[0])).map(|__value| (__value).view()), Ok(ValueView::Num(v)) if v==n as f64+1.0)
+            matches!((engine.interp.get_prop_ic(&array, "cached", crate::atom::PropKey::from_text("cached"), &cache[0])).map(|__value| (__value).view()), Ok(ValueView::Num(v)) if v==n as f64+1.0)
         );
         assert_eq!(cache[0].get().depth, IC_ACCESSOR | IC_ARR_KEYCHK);
         assert!(
@@ -504,7 +532,13 @@ fn getter_cache_array_holder_uses_live_key_checks_and_computed_keys() {
         let mut trace = crate::feedback::CurrentPropertyTrace::default();
         assert!(engine
             .interp
-            .get_prop_ic_profiled(&array, "cached", &cache[0], &mut trace)
+            .get_prop_ic_profiled(
+                &array,
+                "cached",
+                crate::atom::PropKey::from_text("cached"),
+                &cache[0],
+                &mut trace
+            )
             .is_ok());
         assert_eq!(
             trace.outcome,
@@ -721,12 +755,25 @@ fn getter_cache_legacy_poison_stays_generic_and_getter_exceptions_propagate() {
         let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         for _ in 0..3 {
             assert!(matches!(
-                (engine.interp.get_prop_ic(&sloppy, key, &cache[0]))
-                    .map(|__value| (__value).view()),
+                (engine.interp.get_prop_ic(
+                    &sloppy,
+                    key,
+                    crate::atom::PropKey::from_text(key),
+                    &cache[0]
+                ))
+                .map(|__value| (__value).view()),
                 Ok(ValueView::Null)
             ));
             assert!(cache.iter().all(|c| c.get().depth == IC_EMPTY));
-            assert!(engine.interp.get_prop_ic(&strict, key, &cache[0]).is_err());
+            assert!(engine
+                .interp
+                .get_prop_ic(
+                    &strict,
+                    key,
+                    crate::atom::PropKey::from_text(key),
+                    &cache[0]
+                )
+                .is_err());
         }
     }
 }
@@ -859,7 +906,7 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
         let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         for _ in 0..2 {
             assert!(
-                matches!((engine.interp.get_prop_ic(&base, "__pilot", &cache[0])).map(|__value| (__value).view()), Ok(ValueView::Num(n)) if n == expected),
+                matches!((engine.interp.get_prop_ic(&base, "__pilot", crate::atom::PropKey::from_text("__pilot"), &cache[0])).map(|__value| (__value).view()), Ok(ValueView::Num(n)) if n == expected),
                 "{label}"
             );
             assert_eq!(
@@ -871,9 +918,12 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
         let absent = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         for _ in 0..2 {
             assert!(matches!(
-                (engine
-                    .interp
-                    .get_prop_ic(&base, "__pilot_absent", &absent[0]))
+                (engine.interp.get_prop_ic(
+                    &base,
+                    "__pilot_absent",
+                    crate::atom::PropKey::from_text("__pilot_absent"),
+                    &absent[0]
+                ))
                 .map(|__value| (__value).view()),
                 Ok(ValueView::Undefined)
             ));
@@ -883,17 +933,23 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
     // A cached absence must observe a late addition on the wrapper prototype.
     let late = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
     assert!(matches!(
-        (engine
-            .interp
-            .get_prop_ic(&Value::Num(1.0), "__pilot_late", &late[0]))
+        (engine.interp.get_prop_ic(
+            &Value::Num(1.0),
+            "__pilot_late",
+            crate::atom::PropKey::from_text("__pilot_late"),
+            &late[0]
+        ))
         .map(|__value| (__value).view()),
         Ok(ValueView::Undefined)
     ));
     evaluate(&mut engine, "Number.prototype.__pilot_late = 44;");
     assert!(matches!(
-        (engine
-            .interp
-            .get_prop_ic(&Value::Num(1.0), "__pilot_late", &late[0]))
+        (engine.interp.get_prop_ic(
+            &Value::Num(1.0),
+            "__pilot_late",
+            crate::atom::PropKey::from_text("__pilot_late"),
+            &late[0]
+        ))
         .map(|__value| (__value).view()),
         Ok(ValueView::Num(44.0))
     ));
@@ -901,9 +957,12 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
     let accessor = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
     for _ in 0..2 {
         assert!(matches!(
-            (engine
-                .interp
-                .get_prop_ic(&Value::Bool(false), "__pilot_g", &accessor[0]))
+            (engine.interp.get_prop_ic(
+                &Value::Bool(false),
+                "__pilot_g",
+                crate::atom::PropKey::from_text("__pilot_g"),
+                &accessor[0]
+            ))
             .map(|__value| (__value).view()),
             Ok(ValueView::Num(43.0))
         ));
@@ -923,9 +982,12 @@ fn primitive_wrapper_prototypes_fill_the_get_ic() {
     let wrap_cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
     for _ in 0..2 {
         assert!(matches!(
-            (engine
-                .interp
-                .get_prop_ic(&wrapper, "__pilot", &wrap_cache[0]))
+            (engine.interp.get_prop_ic(
+                &wrapper,
+                "__pilot",
+                crate::atom::PropKey::from_text("__pilot"),
+                &wrap_cache[0]
+            ))
             .map(|__value| (__value).view()),
             Ok(ValueView::Num(41.0))
         ));

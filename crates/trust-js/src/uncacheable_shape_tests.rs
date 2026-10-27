@@ -76,13 +76,25 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
         ));
     }
     assert!(cache.iter().all(|way| way.get().depth == IC_EMPTY));
-    assert!(i.stub_cache_get(SHAPE_UNCACHEABLE, "alpha").is_none());
+    assert!(i
+        .stub_cache_get(SHAPE_UNCACHEABLE, crate::atom::PropKey::from_text("alpha"))
+        .is_none());
     assert!(i
         .computed_reads
         .lookup(computed.as_ptr() as usize, SHAPE_UNCACHEABLE)
         .is_none());
-    assert!(i.try_ic_set(&first, &key, &Value::Num(11.0), &cache[0]));
-    assert!(i.try_ic_set(&second, &key, &Value::Num(13.0), &cache[0]));
+    assert!(i.try_ic_set(
+        &first,
+        crate::atom::PropKey::from_text(&key),
+        &Value::Num(11.0),
+        &cache[0]
+    ));
+    assert!(i.try_ic_set(
+        &second,
+        crate::atom::PropKey::from_text(&key),
+        &Value::Num(13.0),
+        &cache[0]
+    ));
     assert!(cache.iter().all(|way| way.get().depth == IC_EMPTY));
     assert!(matches!(
         (first.borrow().props.get("alpha").unwrap().value()).view(),

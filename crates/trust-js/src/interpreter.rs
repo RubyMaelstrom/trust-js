@@ -1166,6 +1166,25 @@ pub(crate) const PROXY_TRAP_OWN_KEYS: usize = 10;
 pub(crate) const PROXY_TRAP_APPLY: usize = 11;
 pub(crate) const PROXY_TRAP_CONSTRUCT: usize = 12;
 const PROXY_TRAP_KINDS: usize = 13;
+/// The traps' names, by `PROXY_TRAP_*` kind.
+const PROXY_TRAP_NAMES: [crate::atom::StaticName; PROXY_TRAP_KINDS] = {
+    use crate::atom::names;
+    [
+        names::GET,
+        names::SET,
+        names::HAS,
+        names::DELETE_PROPERTY,
+        names::GET_OWN_PROPERTY_DESCRIPTOR,
+        names::DEFINE_PROPERTY,
+        names::GET_PROTOTYPE_OF,
+        names::SET_PROTOTYPE_OF,
+        names::IS_EXTENSIBLE,
+        names::PREVENT_EXTENSIONS,
+        names::OWN_KEYS,
+        names::APPLY,
+        names::CONSTRUCT,
+    ]
+};
 
 /// Caches for the Proxy internal methods (ECMA-262 §10.5), one per trap: each trap's GetMethod
 /// on the handler goes through a property inline cache of its own, and its Call through a
@@ -3048,7 +3067,7 @@ fn pattern_has_expr(pat: &Pattern) -> bool {
 }
 
 /// One megamorphic-stub-cache entry (see [`Interp::stub_cache`]): the derived resolution for a
-/// (receiver shape, site name) pair. The key text is retained separately in `stub_cache_names`.
+/// (receiver shape, site key) pair. The key is kept separately in `stub_cache_names`.
 #[derive(Clone, Copy)]
 pub(crate) struct StubEntry {
     pub(crate) st: crate::bytecode::IcState,
@@ -3100,7 +3119,12 @@ mod deep_property_ic_tests {
         let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         let read = |interp: &mut Interp| {
             interp
-                .get_prop_ic(&object, "optional", &cache[0])
+                .get_prop_ic(
+                    &object,
+                    "optional",
+                    crate::atom::PropKey::from_text("optional"),
+                    &cache[0],
+                )
                 .unwrap_or_else(|_| panic!("ordinary read threw"))
         };
         assert!(matches!(
@@ -3156,38 +3180,32 @@ mod deep_property_ic_tests {
     }
 }
 
-/// The table index for a (receiver shape, name pointer) pair. The name pointer's low bits are
-/// alignment zeros; shift them off before mixing so they contribute entropy.
+/// The table index for a (receiver shape, key) pair. An atom key's low bits are alignment
+/// zeros; shift them off before mixing so they contribute entropy.
 #[inline(always)]
-fn stub_slot(shape: u32, name: &str) -> usize {
-    let n = name.as_ptr() as usize >> 3;
+fn stub_slot(shape: u32, key: crate::atom::PropKey) -> usize {
+    let n = key.word() as usize >> 3;
     (shape as usize ^ n ^ (n >> 7)) & (STUB_CACHE_SIZE - 1)
 }
 
 impl Interp {
-    /// Probe the megamorphic property cache without trusting a chunk-owned string address. The
-    /// cached text is retained independently, so a later chunk may reuse the old allocation
-    /// address without inheriting its resolution.
+    /// Probe the megamorphic property cache. An entry holds its key, a word that names one
+    /// property for the heap's whole life.
     #[inline]
-    fn stub_cache_get(&self, shape: u32, name: &str) -> Option<StubEntry> {
-        let slot = stub_slot(shape, name);
-        let names = self.stub_cache_names.borrow();
-        let same_name = names
-            .get(slot)
-            .and_then(Option::as_deref)
-            .is_some_and(|cached| cached == name);
-        same_name.then(|| self.stub_cache[slot].get())
+    fn stub_cache_get(&self, shape: u32, key: crate::atom::PropKey) -> Option<StubEntry> {
+        let slot = stub_slot(shape, key);
+        let same_key = self.stub_cache_names.borrow().get(slot) == Some(&Some(key));
+        same_key.then(|| self.stub_cache[slot].get())
     }
 
-    /// Store a stub resolution and retain its key text in the bounded table. A copied `Rc<str>`
-    /// is sufficient: cache identity is the property name, not the particular chunk allocation.
+    /// Store a stub resolution and its key.
     #[inline]
-    fn stub_cache_set(&self, shape: u32, name: &str, st: crate::bytecode::IcState) {
+    fn stub_cache_set(&self, shape: u32, key: crate::atom::PropKey, st: crate::bytecode::IcState) {
         if !crate::value::is_cacheable_shape(shape) || !st.has_cacheable_shapes() {
             return;
         }
-        let slot = stub_slot(shape, name);
-        self.stub_cache_names.borrow_mut()[slot] = Some(Rc::from(name));
+        let slot = stub_slot(shape, key);
+        self.stub_cache_names.borrow_mut()[slot] = Some(key);
         self.stub_cache[slot].set(StubEntry { st });
     }
 }
@@ -3240,16 +3258,17 @@ mod computed_key_cache_tests {
             (read).map(|__value| (__value).view()),
             Ok(ValueView::Num(7.0))
         ));
+        let atom = |text: &str| crate::atom::PropKey::from_text(text);
         assert!(
-            i.stub_cache_get(shape, &key).is_some(),
-            "computed reads must populate the owned-text stub cache"
+            i.stub_cache_get(shape, atom(&key)).is_some(),
+            "computed reads must populate the stub cache"
         );
 
-        // Reuse exactly the same key allocation for a different property. Pointer identity
-        // alone must not reuse alpha's resolution, even though the receiver shape is unchanged.
+        // Reuse exactly the same key allocation for a different property: the stub cache is
+        // keyed by the property's key, not the text's address, so alpha's resolution stays put.
         key.replace_range(.., "brava");
         assert_eq!(address, key.as_ptr());
-        assert!(i.stub_cache_get(shape, &key).is_none());
+        assert!(i.stub_cache_get(shape, atom(&key)).is_none());
         for cell in &cells {
             cell.set(crate::bytecode::IcState::EMPTY);
         }
@@ -3258,7 +3277,7 @@ mod computed_key_cache_tests {
             (read).map(|__value| (__value).view()),
             Ok(ValueView::Num(9.0))
         ));
-        assert!(i.stub_cache_get(shape, &key).is_some());
+        assert!(i.stub_cache_get(shape, atom(&key)).is_some());
         let computed_key = crate::lstr::LStr::from("alpha");
         assert!(matches!(
             (i.get_computed_property(&base, &computed_key)).map(|__value| (__value).view()),
@@ -3279,7 +3298,7 @@ mod computed_key_cache_tests {
             Ok(ValueView::Num(11.0))
         ));
         assert!(
-            i.stub_cache_get(object.borrow().props.shape(), &long_key)
+            i.stub_cache_get(object.borrow().props.shape(), atom(&long_key))
                 .is_none(),
             "large transient keys must not accumulate in the stub table"
         );
@@ -3484,12 +3503,10 @@ pub struct Interp {
     /// ways (constraint hierarchies, visitor patterns) still resolves by shape compares instead
     /// of re-walking the chain with hashed key lookups. Entries are validated by the same live
     /// shape probe as the per-site ways, so stale entries are misses, never wrong hits — the
-    /// table needs no invalidation. `stub_cache_names` keeps a bounded strong copy of each key:
-    /// bytecode chunks (and their interned name strings) can be destroyed during iframe
-    /// navigation, so a raw pointer alone would become an ABA key and return a stale slot to a
-    /// later chunk whose allocator reused that address.
+    /// table needs no invalidation. `stub_cache_names` holds each entry's key: an atom lives as
+    /// long as its heap, so a key word is never reused for another name.
     pub(crate) stub_cache: Vec<std::cell::Cell<StubEntry>>,
-    pub(crate) stub_cache_names: std::cell::RefCell<Vec<Option<Rc<str>>>>,
+    pub(crate) stub_cache_names: std::cell::RefCell<Vec<Option<crate::atom::PropKey>>>,
     /// The shape chain of an arguments object's named properties (`length`, @@iterator,
     /// `callee`) appended to empty or packed element storage, derived once by ordinary insertion
     /// into this interpreter's heap. Holds only keys and shape ids: no JS value or Realm.
@@ -8501,7 +8518,7 @@ impl Interp {
         trace: &mut crate::feedback::CurrentPropertyTrace,
     ) -> Result<Value, Abrupt> {
         trace.receiver_shape = self.property_receiver_shape(base);
-        self.get_member_recv_impl(base, key, *base, Some(trace))
+        self.get_member_recv_impl(base, key, *base, Some(trace), None)
     }
 
     /// Whether `o` may take the dense element fast paths: a plain object or array — not an
@@ -8733,9 +8750,10 @@ impl Interp {
         &mut self,
         base: &Value,
         name: &str,
+        key: crate::atom::PropKey,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<Value, Abrupt> {
-        self.get_prop_ic_impl(base, name, cache, true, None)
+        self.get_prop_ic_impl(base, name, key, cache, true, None)
     }
 
     /// Compact execution-storage form of OrdinaryGet. Cache resolution borrows
@@ -8752,6 +8770,7 @@ impl Interp {
         &mut self,
         base: *const Value,
         name: &str,
+        key: crate::atom::PropKey,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<Value, Abrupt> {
         // Preserve the named-read String length shortcut without widening or
@@ -8762,7 +8781,7 @@ impl Interp {
             }
         }
         let read =
-            unsafe { &*base }.with_object(|object| self.try_ic_get(object, name, cache, true));
+            unsafe { &*base }.with_object(|object| self.try_ic_get(object, name, key, cache, true));
         match read {
             Some(Some(read)) => match read.into_data() {
                 Ok(value) => Ok(value),
@@ -8775,11 +8794,11 @@ impl Interp {
                 // The object IC already declined. Do not repeat its probes before
                 // the full exotic/prototype algorithm.
                 let receiver = *unsafe { &*base };
-                self.get_member_recv_impl(&receiver, name, receiver, None)
+                self.get_member_recv_impl(&receiver, name, receiver, None, Some(key))
             }
             None => {
                 let receiver = *unsafe { &*base };
-                self.get_prop_ic(&receiver, name, cache)
+                self.get_prop_ic(&receiver, name, key, cache)
             }
         }
     }
@@ -8792,19 +8811,19 @@ impl Interp {
         &mut self,
         base: &Value,
         name: &str,
+        key: crate::atom::PropKey,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         trace: &mut crate::feedback::CurrentPropertyTrace,
     ) -> Result<Value, Abrupt> {
         trace.receiver_shape = self.property_receiver_shape(base);
-        self.get_prop_ic_impl(base, name, cache, true, Some(trace))
+        self.get_prop_ic_impl(base, name, key, cache, true, Some(trace))
     }
 
     /// Computed string-key property read. The caller clears its scratch ways for each key:
     /// unlike a named site, those cells alone do not establish the property's name. The
-    /// bounded stub cache DOES own and compare its name text (`stub_cache_get`), so it is
-    /// safe to reuse for transient keys, including a different key at a recycled address.
-    /// Long transient keys stay uncached: at most 4096 * 256 bytes of text can be retained
-    /// by computed reads, regardless of the sizes of author-generated property names.
+    /// bounded stub cache compares its entries' keys (`stub_cache_get`), so it is safe to
+    /// reuse for transient keys. Long transient keys stay out of it. Text with no atom names no
+    /// property: the full [[Get]] answers it.
     #[cfg(test)]
     fn get_prop_keyed(
         &mut self,
@@ -8812,9 +8831,13 @@ impl Interp {
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<Value, Abrupt> {
+        let Some(key) = crate::atom::PropKey::lookup_text(name) else {
+            return self.get_member_key(base, name);
+        };
         self.get_prop_ic_impl(
             base,
             name,
+            key,
             cache,
             name.len() <= COMPUTED_STUB_KEY_MAX_BYTES,
             None,
@@ -8849,7 +8872,7 @@ impl Interp {
                 let head = Gc::as_ptr(&object);
                 let shape = object.borrow().props.shape();
                 if let Some(state) = self.computed_reads.lookup(key.as_ptr() as usize, shape) {
-                    if let Some(value) = self.ic_shape_probe(head, &text, state) {
+                    if let Some(value) = self.ic_shape_probe(head, &text, None, state) {
                         return self.finish_cached_get(value, base, None);
                     }
                 }
@@ -8861,7 +8884,10 @@ impl Interp {
                 // scratch ways are empty; probing them and copying the key into a second
                 // pointer-indexed stub table adds work on high-cardinality/transient inputs.
                 // Derive once and retain the key only in the bounded computed cache.
-                if let Some(value) = self.ic_get_rederive(&object, &text, &scratch[0], false) {
+                let prop_key = crate::atom::PropKey::lookup_text(&text);
+                if let Some(value) =
+                    self.ic_get_rederive(&object, &text, prop_key, &scratch[0], false)
+                {
                     let young = self.gc_heap.is_young(key.cell_word());
                     self.computed_reads.insert(
                         key,
@@ -8880,13 +8906,14 @@ impl Interp {
         &mut self,
         base: &Value,
         name: &str,
+        key: crate::atom::PropKey,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         stable_name: bool,
         trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
     ) -> Result<Value, Abrupt> {
         match &(base).view() {
             ValueView::Obj(o) => {
-                if let Some(v) = self.try_ic_get(o, name, cache, stable_name) {
+                if let Some(v) = self.try_ic_get(o, name, key, cache, stable_name) {
                     return self.finish_cached_get(v, base, trace);
                 }
             }
@@ -8903,13 +8930,13 @@ impl Interp {
                     ValueView::Num(_) => self.number_proto,
                     _ => self.boolean_proto,
                 };
-                if let Some(v) = self.try_ic_get(&proto, name, cache, stable_name) {
+                if let Some(v) = self.try_ic_get(&proto, name, key, cache, stable_name) {
                     return self.finish_cached_get(v, base, trace);
                 }
             }
             _ => {}
         }
-        self.get_member_recv_impl(base, name, *base, trace)
+        self.get_member_recv_impl(base, name, *base, trace, Some(key))
     }
 
     fn property_receiver_shape(&self, base: &Value) -> Option<u32> {
@@ -8959,6 +8986,7 @@ impl Interp {
         &self,
         o: &Gc,
         name: &str,
+        key: crate::atom::PropKey,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         stable_name: bool,
     ) -> Option<CachedGet> {
@@ -8968,17 +8996,18 @@ impl Interp {
         // stub cache (unbounded polymorphism), then re-derive into way 1 with the older ways
         // demoted.
         for k in 0..crate::bytecode::PROP_IC_WAYS {
-            if let Some(v) = self.ic_shape_probe(head, name, self.ic_way(cache, k).get()) {
+            if let Some(v) = self.ic_shape_probe(head, name, Some(key), self.ic_way(cache, k).get())
+            {
                 return Some(v);
             }
         }
         if stable_name {
             let shape = unsafe { (*head).borrow().props.shape() };
-            let Some(e) = self.stub_cache_get(shape, name) else {
-                return self.ic_get_rederive(o, name, cache, stable_name);
+            let Some(e) = self.stub_cache_get(shape, key) else {
+                return self.ic_get_rederive(o, name, Some(key), cache, stable_name);
             };
             if e.st.recv_shape == shape {
-                if let Some(v) = self.ic_shape_probe(head, name, e.st) {
+                if let Some(v) = self.ic_shape_probe(head, name, Some(key), e.st) {
                     // Promote into the site (demoting the other ways): the next access hits
                     // way-first.
                     self.ic_insert(cache, e.st);
@@ -8986,7 +9015,7 @@ impl Interp {
                 }
             }
         }
-        self.ic_get_rederive(o, name, cache, stable_name)
+        self.ic_get_rederive(o, name, Some(key), cache, stable_name)
     }
 
     /// Cache way `k` of a property site (sites allocate `PROP_IC_WAYS` consecutive cells — see
@@ -9032,8 +9061,15 @@ impl Interp {
         &self,
         head: *const std::cell::RefCell<Object>,
         name: &str,
+        key: Option<crate::atom::PropKey>,
         st: crate::bytecode::IcState,
     ) -> Option<CachedGet> {
+        // A key-checked state compares the entry's key with the site's: by word, or by text
+        // where the caller has looked no key up (a computed read).
+        let is_key = |entry: crate::atom::PropKey| match key {
+            Some(key) => entry == key,
+            None => entry.is(name),
+        };
         use crate::bytecode::{IC_ABSENT, IC_ACCESSOR, IC_ARR_KEYCHK, IC_EMPTY};
         let _ = IC_EMPTY;
         // Cached absence: re-walk the live chain, validating each level's shape (and the same
@@ -9115,7 +9151,7 @@ impl Interp {
                     let property = if keychk {
                         rb.props
                             .entry_at(st.slot as usize)
-                            .and_then(|(key, p)| key.is(name).then_some(p))
+                            .and_then(|(entry, p)| is_key(entry).then_some(p))
                     } else {
                         rb.props.property_at(st.slot as usize)
                     };
@@ -9172,7 +9208,7 @@ impl Interp {
                         let property = if keychk {
                             hb.props
                                 .entry_at(st.slot as usize)
-                                .and_then(|(key, p)| key.is(name).then_some(p))
+                                .and_then(|(entry, p)| is_key(entry).then_some(p))
                         } else {
                             hb.props.property_at(st.slot as usize)
                         };
@@ -9196,10 +9232,12 @@ impl Interp {
 
     /// [`try_ic_get`]'s miss path: re-derive the resolution by a raw-pointer chain walk and
     /// refill the cache. Split out so the shape fast path's early bail-outs can tail into it.
+    /// `key` is the name's key, none where text with no atom names no property.
     fn ic_get_rederive(
         &self,
         o: &Gc,
         name: &str,
+        key: Option<crate::atom::PropKey>,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         stable_name: bool,
     ) -> Option<CachedGet> {
@@ -9235,7 +9273,7 @@ impl Interp {
                         b.exotic,
                         Exotic::None | Exotic::NumWrap(_) | Exotic::BoolWrap(_)
                     ) || b.exotic.is_collection());
-                if let Some(slot) = b.props.slot_of(name) {
+                if let Some(slot) = key.and_then(|key| b.props.slot_of_key(key)) {
                     let p = b.props.property_at(slot).unwrap();
                     let v = self.snapshot_cached_get(
                         p,
@@ -9294,8 +9332,8 @@ impl Interp {
                     self.ic_insert(cache, st);
                     // Mirror into the owned-text stub cache so OTHER shapes rotating through
                     // this site don't evict this resolution for good.
-                    if stable_name {
-                        self.stub_cache_set(recv_shape, name, st);
+                    if let Some(key) = key.filter(|_| stable_name) {
+                        self.stub_cache_set(recv_shape, key, st);
                     }
                     return Some(v);
                 }
@@ -9331,8 +9369,8 @@ impl Interp {
                                 mid4_shape: absent_shapes[4],
                             };
                             self.ic_insert(cache, st);
-                            if stable_name {
-                                self.stub_cache_set(recv_shape, name, st);
+                            if let Some(key) = key.filter(|_| stable_name) {
+                                self.stub_cache_set(recv_shape, key, st);
                             }
                             return Some(CachedGet::undefined());
                         }
@@ -9426,11 +9464,12 @@ impl Interp {
         &mut self,
         base: &Value,
         name: &Rc<str>,
+        key: crate::atom::PropKey,
         v: Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<(), Abrupt> {
         if let ValueView::Obj(o) = &(base).view() {
-            if self.try_ic_set(o, name, &v, cache) {
+            if self.try_ic_set(o, key, &v, cache) {
                 return Ok(());
             }
         }
@@ -9444,13 +9483,14 @@ impl Interp {
         &mut self,
         base: &Value,
         name: &Rc<str>,
+        key: crate::atom::PropKey,
         v: Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         trace: &mut crate::feedback::CurrentPropertyTrace,
     ) -> Result<(), Abrupt> {
         trace.receiver_shape = self.property_receiver_shape(base);
         if let ValueView::Obj(o) = &(base).view() {
-            if self.try_ic_set(o, name, &v, cache) {
+            if self.try_ic_set(o, key, &v, cache) {
                 return Ok(());
             }
         }
@@ -9511,7 +9551,7 @@ impl Interp {
     fn try_ic_set(
         &mut self,
         o: &Gc,
-        name: &Rc<str>,
+        key: crate::atom::PropKey,
         v: &Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> bool {
@@ -9542,7 +9582,7 @@ impl Interp {
         // hashed existence scan below. Promote into way 1 like the get path does.
         {
             let shape = b.props.shape();
-            if let Some(e) = self.stub_cache_get(shape, name) {
+            if let Some(e) = self.stub_cache_get(shape, key) {
                 if e.st.recv_shape == shape && e.st.depth == 0 {
                     if let Some(p) = b.props.property_at(e.st.slot as usize) {
                         if !p.accessor() && p.writable() {
@@ -9571,17 +9611,14 @@ impl Interp {
                 {
                     let cached_proto = (((st.mid2_shape as u64) << 32) | st.slot as u64) as usize;
                     if cached_proto == proto_ptr {
-                        b.props.append_new(
-                            crate::atom::PropKey::from_text(name),
-                            Property::plain(*v),
-                            st.holder_shape,
-                        );
+                        b.props
+                            .append_new(key, Property::plain(*v), st.holder_shape);
                         return true;
                     }
                 }
             }
         }
-        match b.props.slot_of(name) {
+        match b.props.slot_of_key(key) {
             Some(slot) => {
                 let p = b.props.property_at(slot).unwrap();
                 if p.accessor() || !p.writable() {
@@ -9602,10 +9639,10 @@ impl Interp {
                 };
                 self.ic_insert(cache, st);
                 // Mirror into the stub cache (see the probe above).
-                self.stub_cache_set(shape, name, st);
+                self.stub_cache_set(shape, key, st);
                 true
             }
-            None => self.try_ic_create(o, b, name, v, cache),
+            None => self.try_ic_create(o, b, key, v, cache),
         }
     }
 
@@ -9618,13 +9655,13 @@ impl Interp {
         &mut self,
         _o: &Gc,
         mut b: std::cell::RefMut<'_, crate::value::Object>,
-        name: &Rc<str>,
+        key: crate::atom::PropKey,
         v: &Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> bool {
         use crate::bytecode::{IcState, IC_CREATE};
         // Index-like names belong to the dense-element machinery — generic path.
-        if name.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+        if key.starts_with_digit() {
             return false;
         }
         if !b.extensible {
@@ -9660,7 +9697,7 @@ impl Interp {
                 if !(hb.exotic.is_ordinary() && hb.ic_plain.get()) {
                     return false;
                 }
-                if let Some(slot) = hb.props.slot_of(name) {
+                if let Some(slot) = hb.props.slot_of_key(key) {
                     let inherited = hb.props.property_at(slot).unwrap();
                     if inherited.accessor() || !inherited.writable() {
                         return false;
@@ -9674,7 +9711,7 @@ impl Interp {
                 walk = next;
             }
         }
-        b.props.insert(name.clone(), Property::plain(*v));
+        b.props.insert(key, Property::plain(*v));
         self.ic_insert(
             cache,
             IcState {
@@ -9876,15 +9913,17 @@ impl Interp {
         key: &str,
         receiver: Value,
     ) -> Result<Value, Abrupt> {
-        self.get_member_recv_impl(base, key, receiver, None)
+        self.get_member_recv_impl(base, key, receiver, None, None)
     }
 
+    /// `atom` is `key`'s key where the caller has it (see [`Interp::get_from_chain`]).
     fn get_member_recv_impl(
         &mut self,
         base: &Value,
         key: &str,
         receiver: Value,
         mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
+        atom: Option<crate::atom::PropKey>,
     ) -> Result<Value, Abrupt> {
         // An `import defer` namespace evaluates its module on string-keyed access.
         if let ValueView::Obj(o) = &(base).view() {
@@ -9937,15 +9976,15 @@ impl Interp {
                     }
                 }
                 let proto = self.string_proto;
-                self.get_from_chain(&proto, key, &receiver, trace)
+                self.get_from_chain(&proto, key, &receiver, trace, atom)
             }
             ValueView::Num(_) => {
                 let proto = self.number_proto;
-                self.get_from_chain(&proto, key, &receiver, trace)
+                self.get_from_chain(&proto, key, &receiver, trace, atom)
             }
             ValueView::Bool(_) => {
                 let proto = self.boolean_proto;
-                self.get_from_chain(&proto, key, &receiver, trace)
+                self.get_from_chain(&proto, key, &receiver, trace, atom)
             }
             ValueView::Sym(s) => {
                 if key == "description" {
@@ -9959,10 +9998,10 @@ impl Interp {
                         .unwrap_or(Value::Undefined));
                 }
                 let proto = self.symbol_proto;
-                self.get_from_chain(&proto, key, &receiver, trace)
+                self.get_from_chain(&proto, key, &receiver, trace, atom)
             }
             ValueView::BigInt(_) => match self.extra_protos.get("BigInt").cloned() {
-                Some(proto) => self.get_from_chain(&proto, key, &receiver, trace),
+                Some(proto) => self.get_from_chain(&proto, key, &receiver, trace, atom),
                 None => {
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.record(crate::feedback::PropertyOutcome::Absent, None, 0, None);
@@ -10123,7 +10162,7 @@ impl Interp {
                     }
                     return Ok(value);
                 }
-                self.get_from_chain(&o, key, &receiver, trace)
+                self.get_from_chain(&o, key, &receiver, trace, atom)
             }
         }
     }
@@ -10188,11 +10227,12 @@ impl Interp {
         key: &str,
         receiver: &Value,
         mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
+        atom: Option<crate::atom::PropKey>,
     ) -> Result<Value, Abrupt> {
         let mut cur = Some(*start);
         let mut depth = 0_u8;
-        // The key's atom, once a map on the chain has looked it up.
-        let mut walk_atom = None;
+        // The key's atom: the caller's, or once a map on the chain has looked it up.
+        let mut walk_atom = atom;
         while let Some(obj) = cur {
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&obj, Some(key))?;
@@ -12119,8 +12159,10 @@ impl Interp {
     ) -> Result<Option<Value>, Abrupt> {
         let caches = self.proxy_trap_caches();
         {
+            let key = PROXY_TRAP_NAMES[kind];
+            debug_assert!(key.atom().is(name));
             let __value_match_original =
-                self.get_prop_ic(handler, name, &caches.lookups[kind][0])?;
+                self.get_prop_ic(handler, name, key.key(), &caches.lookups[kind][0])?;
             match (__value_match_original).view() {
                 ValueView::Undefined | ValueView::Null => Ok(None),
                 _ if {
@@ -14056,7 +14098,13 @@ impl Interp {
         // and clones only the final value. A miss re-derives the same side-effect-free ordinary
         // data-property proof; accessors/exotics still decline before anything is consumed.
         let initializer = self
-            .try_ic_get(this, initializer_name, initializer_cache, true)?
+            .try_ic_get(
+                this,
+                initializer_name,
+                crate::atom::PropKey::from_text(initializer_name),
+                initializer_cache,
+                true,
+            )?
             .data()?;
         let ValueView::Obj(initializer_obj) = &(initializer).view() else {
             return None;
@@ -14065,7 +14113,13 @@ impl Interp {
         // is no own shadow, validate the live prototype link, and read the inherited slot by
         // index; an override/prototype swap/accessor/exotic still declines before arguments move.
         let apply = self
-            .try_ic_get(initializer_obj, "apply", apply_cache, true)?
+            .try_ic_get(
+                initializer_obj,
+                "apply",
+                crate::atom::names::APPLY.key(),
+                apply_cache,
+                true,
+            )?
             .data()?;
         let ValueView::Obj(apply_obj) = &(apply).view() else {
             return None;

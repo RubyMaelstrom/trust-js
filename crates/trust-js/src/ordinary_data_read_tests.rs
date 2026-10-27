@@ -35,7 +35,7 @@ fn read(
 ) -> (Value, CurrentPropertyTrace) {
     let mut trace = CurrentPropertyTrace::default();
     let value = interp
-        .get_from_chain(start, key, receiver, traced.then_some(&mut trace))
+        .get_from_chain(start, key, receiver, traced.then_some(&mut trace), None)
         .ok()
         .expect("ordinary read succeeds");
     (value, trace)
@@ -166,6 +166,7 @@ fn ordinary_data_read_getter_reentry_mutation_gc_and_throw_all_tiers() {
                 "bad",
                 &Value::Obj(receiver),
                 traced.then_some(&mut thrown_trace),
+                None,
             );
             assert!(
                 matches!(result, Err(Abrupt::Throw(ref thrown)) if crate::builtins::same_value_pub(thrown,&token)),
@@ -315,6 +316,7 @@ fn ordinary_data_read_proxy_dispatch_receivers_and_invariants_all_tiers() {
                     "x",
                     &receiver,
                     traced.then_some(&mut trace),
+                    None,
                 );
                 let Err(Abrupt::Throw(error)) = result else {
                     panic!("{tier:?}, {name}: expected TypeError");

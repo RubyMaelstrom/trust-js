@@ -9326,6 +9326,11 @@ impl Props {
     pub(crate) fn slot_of(&self, key: &str) -> Option<usize> {
         self.find_text(key)
     }
+    /// [`Props::slot_of`] of a key.
+    #[inline]
+    pub(crate) fn slot_of_key(&self, key: PropKey) -> Option<usize> {
+        self.find(key)
+    }
     /// The (key, property) at `slot`, or `None` if out of range. The caller re-checks the key —
     /// slots shift on `remove`, so a cached slot is only trusted after the key matches.
     #[inline]

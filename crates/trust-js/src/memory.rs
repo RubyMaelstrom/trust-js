@@ -1397,7 +1397,7 @@ fn scan_realm(
                     .stub_cache_names
                     .borrow()
                     .capacity()
-                    .saturating_mul(size_of::<Option<Rc<str>>>()),
+                    .saturating_mul(size_of::<Option<crate::atom::PropKey>>()),
             )
             .saturating_add(
                 interp
@@ -1445,9 +1445,6 @@ fn scan_realm(
             .engine_caches
             .add(buf.capacity().saturating_mul(size_of::<Value>()));
         debug_assert!(buf.is_empty());
-    }
-    for name in interp.stub_cache_names.borrow().iter().flatten() {
-        visitor.rc_str(name);
     }
     for map in interp
         .descriptor_maps
