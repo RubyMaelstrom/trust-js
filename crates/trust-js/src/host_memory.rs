@@ -1,6 +1,6 @@
-//! Physical-memory probe used to size engine-wide resource ceilings.
+//! Physical-memory probes used to size engine-wide resource ceilings and the heap's maximum.
 //!
-//! This is a sizing heuristic only: it never allocates engine memory and failures simply return
+//! These are sizing heuristics only: they never allocate engine memory and failures simply return
 //! `None`, leaving callers on a fixed fallback.
 
 /// Memory available to this process: physical RAM, further limited by a cgroup v2/v1 memory
@@ -9,8 +9,33 @@ pub(crate) fn physical_memory_bytes() -> Option<u64> {
     platform::physical_memory_bytes().filter(|&bytes| bytes > 0)
 }
 
+/// The machine's physical memory as V8 reads it (`base::SysInfo::AmountOfPhysicalMemory`,
+/// src/base/sys-info.cc), and as Chrome reads it to size V8's heap (Chromium's
+/// `base::SysInfo::AmountOfTotalPhysicalMemory`): `sysconf(_SC_PHYS_PAGES)` pages of
+/// `sysconf(_SC_PAGESIZE)` bytes on Linux, `hw.memsize` on macOS and `GlobalMemoryStatusEx`'s
+/// total on Windows, with no cgroup's limit, unlike [`physical_memory_bytes`]. `None` where the
+/// system does not say (V8 then reads 0).
+pub(crate) fn amount_of_physical_memory() -> Option<u64> {
+    platform::amount_of_physical_memory().filter(|&bytes| bytes > 0)
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
+    unsafe extern "C" {
+        fn sysconf(name: std::ffi::c_int) -> std::ffi::c_long;
+    }
+    /// glibc's and musl's `_SC_PAGESIZE` and `_SC_PHYS_PAGES`.
+    const SC_PAGESIZE: std::ffi::c_int = 30;
+    const SC_PHYS_PAGES: std::ffi::c_int = 85;
+
+    pub(super) fn amount_of_physical_memory() -> Option<u64> {
+        // SAFETY: sysconf has no preconditions.
+        let (pages, page_size) = unsafe { (sysconf(SC_PHYS_PAGES), sysconf(SC_PAGESIZE)) };
+        let pages = u64::try_from(pages).ok()?;
+        let page_size = u64::try_from(page_size).ok()?;
+        Some(pages.saturating_mul(page_size))
+    }
+
     pub(super) fn physical_memory_bytes() -> Option<u64> {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
         let total_kib = meminfo
@@ -59,6 +84,11 @@ mod platform {
         };
         (status == 0 && len == std::mem::size_of::<u64>()).then_some(bytes)
     }
+
+    /// V8's reading too (`sysctl` of `CTL_HW`, `HW_MEMSIZE`).
+    pub(super) fn amount_of_physical_memory() -> Option<u64> {
+        physical_memory_bytes()
+    }
 }
 
 #[cfg(windows)]
@@ -98,11 +128,20 @@ mod platform {
         let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
         (ok != 0).then_some(status.total_phys)
     }
+
+    /// V8's reading too (`ullTotalPhys`).
+    pub(super) fn amount_of_physical_memory() -> Option<u64> {
+        physical_memory_bytes()
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod platform {
     pub(super) fn physical_memory_bytes() -> Option<u64> {
+        None
+    }
+
+    pub(super) fn amount_of_physical_memory() -> Option<u64> {
         None
     }
 }
@@ -115,6 +154,20 @@ mod tests {
             // Any machine running the test suite has more than 64 MiB and less than 1 PiB.
             assert!(bytes > 64 << 20, "{bytes}");
             assert!(bytes < 1 << 50, "{bytes}");
+        }
+    }
+
+    #[test]
+    fn v8s_physical_memory_reading_is_plausible_and_covers_what_is_available() {
+        let total = super::amount_of_physical_memory();
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+            let bytes = total.expect("V8 reads physical memory here");
+            assert!(bytes > 64 << 20, "{bytes}");
+            assert!(bytes < 1 << 50, "{bytes}");
+        }
+        // The memory available to this process is at most all of it.
+        if let (Some(total), Some(available)) = (total, super::physical_memory_bytes()) {
+            assert!(available <= total, "{available} of {total}");
         }
     }
 }

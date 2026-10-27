@@ -133,7 +133,14 @@ comment/example in the same change.
   to 2 MiB while allocation is slower than 1 KB/ms. A major collection leaves a byte budget of
   the bytes it kept times V8's dynamic growing factor (1.1 to 4: smaller the faster marking is
   than the program's promotion, so that major collections take about 3% of the time), at least
-  8 MiB more than it kept, plus the nursery budget. V8's memory reducer runs when the host
+  8 MiB more than it kept, plus the nursery budget, and at most halfway from the bytes it kept
+  to the heap's maximum, V8's maximum old generation size: half of the physical memory as V8
+  reads it (`sysconf` on Linux, `hw.memsize` on macOS, `GlobalMemoryStatusEx` on Windows), at
+  least 256 MiB and at most 4 GiB (256 MiB where the system does not say). At the factor of 4
+  with a 4 GiB maximum, the bound binds above about 585 MiB kept. V8 fails with out-of-memory
+  at its maximum; the heap does not, and the bound never leaves less room than the 8 MiB and
+  the nursery budget, so a heap past its maximum keeps collecting at that room.
+  V8's memory reducer runs when the host
   calls `Engine::run_memory_reducer` at `Engine::memory_reducer_deadline`: 8 s after a major
   collection that left the heap holding at least 10% and 10 MiB more than the reducer's last
   run (30 s after `Engine::notify_possible_garbage`, or after the heap first grew 1 MiB past its
@@ -151,9 +158,10 @@ comment/example in the same change.
   them was acquired since the last one, and those still held count with the cells against the
   byte budget. `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte
   budget: a major collection is due once the heap holds more than the budget after a minor
-  collection, its old cells counted whether they live or not. Outside GC stress, cell
-  allocation makes collections due through these budgets alone, and the live-object count
-  only enforces the engine's live-object limit.
+  collection, its old cells counted whether they live or not. `TRUST_JS_GC_MAX_HEAP_BYTES=N`
+  replaces the heap's maximum (pacing only), as V8's `--max-old-space-size` does (0 keeps
+  V8's). Outside GC stress, cell allocation makes collections due through these budgets alone,
+  and the live-object count only enforces the engine's live-object limit.
 - `TRUST_JS_GC_STRESS=N` collects at the first safepoint after every N cell allocations and
   polls at every call (N=1 finds unrooted values; run each test in its own process, since a
   use-after-free can take down the whole run). Its collections are minor but for every Mth,
@@ -178,8 +186,9 @@ comment/example in the same change.
   roots must hold no unmarked young cell.
 - `TRUST_JS_GC_LOG=1` lines name each collection's kind and report live cells, live bytes,
   small-cell pages (64 KiB each) and released pages kept for reuse (`spare`) after it, the
-  heap's collections so far, those that were due but postponed (`deferred`) and the bytes
-  its cells own outside it, not yet released (`external`); a minor collection's line adds
+  heap's collections so far, those that were due but postponed (`deferred`), the bytes its
+  cells own outside it, not yet released (`external`), and the byte budget, which each major
+  collection sets (`budget`); a minor collection's line adds
   the young pages it swept, the old cells it traced because their cards were set
   (`card_cells`) and the bytes it promoted. `TRUST_JS_GC_CENSUS=1`
   adds a `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the

@@ -1537,6 +1537,10 @@ pub(crate) struct Heap {
     trigger_bytes: usize,
     min_trigger_bytes: usize,
     growth_percent: usize,
+    /// The heap's maximum ([`Heap::set_max_heap_bytes`]): with pacing, a major collection's
+    /// budget stops halfway from the bytes it kept to this. `usize::MAX`, the default, bounds
+    /// nothing.
+    max_heap_bytes: usize,
     /// The nursery budget (S6 step 10c): a minor collection is due once more than this many
     /// bytes have been allocated since the last collection. `None`, the default: every
     /// collection is major, due once the allocated bytes pass the byte budget.
@@ -1644,6 +1648,7 @@ impl Heap {
             trigger_bytes: DEFAULT_MIN_TRIGGER,
             min_trigger_bytes: DEFAULT_MIN_TRIGGER,
             growth_percent: DEFAULT_GROWTH_PERCENT,
+            max_heap_bytes: usize::MAX,
             nursery_bytes: None,
             pacing: None,
             committed_at_mark: 0,
@@ -2081,6 +2086,15 @@ impl Heap {
         self.trigger_bytes = min_bytes;
         self.reset_external_budget();
         self.refresh_due();
+    }
+
+    /// The heap's maximum, V8's maximum old generation size (`gc_pacing::max_heap_bytes`): with
+    /// pacing, each major collection's budget stops halfway from the bytes it kept to this
+    /// ([`crate::gc_pacing::bound_allocation_limit`]), but leaves at least V8's least room, so a
+    /// heap past its maximum keeps collecting, where V8 fails. Fixed budgets ignore it. It takes
+    /// effect at the next major collection.
+    pub(crate) fn set_max_heap_bytes(&mut self, bytes: usize) {
+        self.max_heap_bytes = bytes;
     }
 
     pub(crate) fn stats(&self) -> GcStats {
@@ -3387,15 +3401,21 @@ impl Heap {
         };
         match kind {
             CollectionKind::Major => {
-                // V8's limit adds the young generation's capacity, which the next minor
-                // collection may promote.
-                let budget = match factor {
-                    Some(factor) => ((size as f64 * factor) as usize)
-                        .max(size.saturating_add(crate::gc_pacing::MIN_GROWING_STEP))
-                        .saturating_add(self.nursery_bytes.unwrap_or(0)),
-                    None => size.saturating_add(size.saturating_mul(self.growth_percent) / 100),
+                self.trigger_bytes = match factor {
+                    // V8's limit: the size grown by the factor, plus the young generation's
+                    // capacity, which the next minor collection may promote, and at most halfway
+                    // to the heap's maximum.
+                    Some(factor) => crate::gc_pacing::bound_allocation_limit(
+                        size,
+                        (size as f64 * factor) as usize,
+                        self.min_trigger_bytes,
+                        self.max_heap_bytes,
+                        self.nursery_bytes.unwrap_or(0),
+                    ),
+                    None => self
+                        .min_trigger_bytes
+                        .max(size.saturating_add(size.saturating_mul(self.growth_percent) / 100)),
                 };
-                self.trigger_bytes = self.min_trigger_bytes.max(budget);
             }
             // The old cells, live or not, and the payloads still charged have passed the byte
             // budget: a major collection is due, at the next safepoint.
@@ -8104,6 +8124,39 @@ mod tests {
         assert_eq!(fx.heap.due_kind(), CollectionKind::Minor);
         fx.heap.set_nursery_bytes(None);
         assert_eq!(fx.heap.due_kind(), CollectionKind::Major, "no nursery");
+    }
+
+    /// With pacing, a major collection's budget is V8's limit: the bytes it kept grown by the
+    /// factor (4 here, with no promotion measured), at least 8 MiB more, plus the nursery, and
+    /// at most halfway to the heap's maximum, though never below that least room, so that a heap
+    /// past its maximum keeps collecting. An explicit growth keeps its own rule.
+    #[test]
+    fn paced_budgets_stop_halfway_to_the_heaps_maximum() {
+        const MB: usize = 1 << 20;
+        const NURSERY: usize = 4 << 10;
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        fx.heap.set_nursery_bytes(Some(NURSERY));
+        fx.heap.enable_pacing(false);
+        // 4 MiB of live 16-byte cells.
+        fx.build_chain((4 * MB / 16) as u64);
+        let budget = |fx: &mut Fixture, maximum: usize| {
+            fx.heap.set_max_heap_bytes(maximum);
+            fx.collect();
+            fx.heap.stats().trigger_bytes
+        };
+        // No maximum: four times the bytes kept, and the nursery.
+        assert_eq!(budget(&mut fx, usize::MAX), 16 * MB + NURSERY);
+        // Halfway to 24 MiB.
+        assert_eq!(budget(&mut fx, 24 * MB), 14 * MB);
+        // Halfway to 8 MiB, or to 2 MiB, which the heap is past, would leave less room than
+        // 8 MiB and the nursery.
+        assert_eq!(budget(&mut fx, 8 * MB), 12 * MB + NURSERY);
+        assert_eq!(budget(&mut fx, 2 * MB), 12 * MB + NURSERY);
+        assert_eq!(fx.heap.stats().live_bytes, 4 * MB);
+        // An explicit growth: twice the bytes kept, whatever the maximum.
+        fx.heap.set_heap_growth(MB, 100);
+        assert_eq!(budget(&mut fx, 2 * MB), 8 * MB);
     }
 
     /// A requested major collection makes none due, and makes the next collection the heap asks

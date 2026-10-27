@@ -126,6 +126,21 @@ fn gc_min_heap_bytes() -> usize {
     })
 }
 
+/// The heap's maximum, which with pacing bounds each major collection's byte budget at halfway
+/// from the bytes it kept (`gc_pacing::bound_allocation_limit`): V8's, from the physical memory
+/// as V8 reads it (`gc_pacing::max_heap_bytes`), read once. `TRUST_JS_GC_MAX_HEAP_BYTES=N`
+/// (diagnostic) replaces it as V8's `--max-old-space-size` does; 0 keeps V8's.
+fn gc_max_heap_bytes() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let configured = std::env::var("TRUST_JS_GC_MAX_HEAP_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        let physical = crate::host_memory::amount_of_physical_memory().unwrap_or(0);
+        crate::gc_pacing::max_heap_bytes(configured, physical)
+    })
+}
+
 /// `TRUST_JS_GC_NURSERY_BYTES=N` (diagnostic): the nursery budget instead of
 /// [`GC_NURSERY_BYTES`], for collector tuning; 0 turns minor collections off, so that every
 /// collection is major and due once the allocated bytes pass the byte budget.
@@ -208,6 +223,7 @@ fn timed<R>(step: EngineStep, f: impl FnOnce() -> R) -> R {
 /// Collection settings for a new Agent heap.
 pub(crate) fn configure_heap(core: &mut crate::gc_core::Heap) {
     core.set_heap_growth(gc_min_heap_bytes(), 100);
+    core.set_max_heap_bytes(gc_max_heap_bytes());
     // `TRUST_JS_GC_LOG=1`: each collection's log line includes its phases' times.
     core.set_phase_timing(gc_log());
     core.set_nursery_bytes(gc_nursery_bytes());
@@ -1205,7 +1221,7 @@ impl Interp {
                 CollectionKind::Major => String::new(),
             };
             eprintln!(
-                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor} external={} us: mark={:.0} sweep={:.0} engine={:.0}{phases}{steps}{finalized}",
+                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor} external={} budget={} us: mark={:.0} sweep={:.0} engine={:.0}{phases}{steps}{finalized}",
                 match kind {
                     CollectionKind::Minor => "minor",
                     CollectionKind::Major => "major",
@@ -1217,6 +1233,7 @@ impl Interp {
                 stats.collections,
                 stats.deferred_collections,
                 stats.external_bytes,
+                stats.trigger_bytes,
                 micros(mark_nanos),
                 micros(sweep_nanos),
                 micros((mark_nanos + sweep_nanos).saturating_sub(core_nanos)),

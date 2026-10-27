@@ -1,8 +1,10 @@
 //! The heap's sizing and memory-reduction policy, after V8's: how far the heap may grow before
-//! its next major collection (V8's `MemoryController`, src/heap/heap-controller.cc), how large
-//! the nursery is (V8's young generation growth and shrinking, src/heap/heap.cc), and when an
-//! otherwise quiet heap is collected to give memory back (V8's `MemoryReducer`,
-//! src/heap/memory-reducer.cc). Constants and rules as of V8 296ba5e0 (2026-10-26). Chrome runs
+//! its next major collection (V8's `MemoryController` and `BoundAllocationLimit`,
+//! src/heap/heap-controller.cc: at most halfway to a maximum taken from physical memory,
+//! src/heap/heap.cc), how large the nursery is (V8's young generation growth and shrinking,
+//! src/heap/heap.cc), and when an otherwise quiet heap is collected to give memory back (V8's
+//! `MemoryReducer`, src/heap/memory-reducer.cc). Constants and rules as of V8 296ba5e0
+//! (2026-10-26); the bound and the maximum are unchanged at e9a801ca (2026-10-27). Chrome runs
 //! no idle-time or periodic full collection; V8's memory reducer is the only time-based one.
 //!
 //! The policy is pure: [`Pacing`] holds what the heap measured (`gc_core::Heap` feeds it the
@@ -24,8 +26,13 @@ const SLOW_GROWING_FACTOR: f64 = 1.3;
 /// V8's `kMaxGrowingFactor`: its factor for a heap whose limit is at least 2 GB on 64-bit
 /// targets.
 pub(crate) const MAX_GROWING_FACTOR: f64 = 4.0;
-/// V8's `MinimumAllocationLimitGrowingStep`: a major collection leaves at least this much room.
+/// V8's `kMinimumAllocationLimitGrowingStep`: a major collection leaves at least this much room.
 pub(crate) const MIN_GROWING_STEP: usize = 8 << 20;
+/// V8's `kDefaultMinHeapSize` and `kDefaultMaxHeapSize` (src/heap/heap.h): the least and the
+/// most of the maximum that [`max_heap_bytes`] takes from physical memory, 256 MB and, on 64-bit
+/// hosts, 4 GB.
+const DEFAULT_MIN_HEAP_SIZE: u64 = 256 << 20;
+const DEFAULT_MAX_HEAP_SIZE: u64 = 4 << 30;
 
 /// The nursery's first and smallest budget, to which a quiet heap returns (V8's semi-space
 /// starts at 1 MB; this engine's cells are larger).
@@ -65,6 +72,48 @@ pub(crate) fn dynamic_growing_factor(gc_speed: f64, mutator_speed: f64, max_fact
         max_factor
     };
     factor.min(max_factor).max(MIN_GROWING_FACTOR)
+}
+
+/// V8's `V8HeapTrait::BoundAllocationLimit`, which `HeapLimits::UpdateAllocationLimits` applies
+/// after every major collection: the heap's next limit, for a collection that kept `size` bytes,
+/// from `limit` (`size` grown by the growing factor). It leaves at least [`MIN_GROWING_STEP`] of
+/// room, adds the `nursery`'s budget (V8's new space capacity, which the next minor collection
+/// may promote), and is clamped between `minimum` and halfway from `size` to `maximum` (see
+/// [`max_heap_bytes`]), so that the heap collects more often as it nears its maximum. V8 fails
+/// with out-of-memory once its old generation reaches the maximum; the engine does not, so the
+/// halfway bound never takes the limit below `size` + [`MIN_GROWING_STEP`] + `nursery`, V8's
+/// least room, and a heap past its maximum keeps collecting at that room. The `minimum` (the
+/// budget's floor, `TRUST_JS_GC_MIN_HEAP_BYTES`) applies last.
+pub(crate) fn bound_allocation_limit(
+    size: usize,
+    limit: usize,
+    minimum: usize,
+    maximum: usize,
+    nursery: usize,
+) -> usize {
+    let least = size.saturating_add(MIN_GROWING_STEP);
+    let limit = limit.max(least).saturating_add(nursery);
+    let halfway = size.midpoint(maximum);
+    limit
+        .min(halfway.max(least.saturating_add(nursery)))
+        .max(minimum)
+}
+
+/// The heap's maximum, V8's maximum old generation size: `configured` when positive
+/// (`TRUST_JS_GC_MAX_HEAP_BYTES`, as V8's `--max-old-space-size`, which V8 takes as it is
+/// without pointer compression and caps at its 4 GB cage with it), otherwise
+/// `Heap::OldGenerationSizeFromPhysicalMemory` (src/heap/heap.cc), which
+/// `ResourceConstraints::ConfigureDefaults` applies for d8 and Chrome: half of
+/// `physical_memory` on 64-bit hosts, at least 256 MB and at most 4 GB (V8 also rounds it up to
+/// its 256 KB pages). Where the system does not say how much memory it has, V8 reads 0
+/// (`base::SysInfo::AmountOfPhysicalMemory`) and takes the least, 256 MB, and so does the
+/// engine.
+pub(crate) fn max_heap_bytes(configured: Option<usize>, physical_memory: u64) -> usize {
+    if let Some(bytes) = configured.filter(|&bytes| bytes > 0) {
+        return bytes;
+    }
+    let bytes = (physical_memory / 2).clamp(DEFAULT_MIN_HEAP_SIZE, DEFAULT_MAX_HEAP_SIZE);
+    usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
 /// V8's `Heap::ComputeMutatorUtilization`: the share of time left to a program allocating at
@@ -518,6 +567,82 @@ mod tests {
         assert_eq!(dynamic_growing_factor(1e9, 1.0, 4.0), MIN_GROWING_FACTOR);
         assert_eq!(dynamic_growing_factor(10.0, 1.0, 4.0), 4.0);
         assert_eq!(dynamic_growing_factor(10.0, 1.0, 2.0), 2.0);
+    }
+
+    #[test]
+    fn the_limit_stops_halfway_to_v8s_maximum() {
+        const GB: usize = 1 << 30;
+        // Factor 4, a 4 GB maximum and a 4 MB nursery: 4 x size + nursery meets
+        // (size + maximum) / 2 at 584 MB (at about 585 MB without a nursery).
+        let nursery = 4 * MB;
+        let limit = |size: usize| bound_allocation_limit(size, 4 * size, 8 * MB, 4 * GB, nursery);
+        // Below that point, V8's limit is the grown size plus the nursery, as without the bound.
+        assert_eq!(limit(100 * MB), 404 * MB);
+        assert_eq!(limit(583 * MB), 2336 * MB);
+        // At it, the two agree.
+        assert_eq!(limit(584 * MB), 2340 * MB);
+        assert_eq!((584 * MB).midpoint(4 * GB), 2340 * MB);
+        // Above it, halfway to the maximum.
+        assert_eq!(limit(585 * MB), 2340 * MB + MB / 2);
+        assert_eq!(limit(GB), 2560 * MB);
+        assert_eq!(limit(2 * GB), 3 * GB);
+        assert_eq!(limit(4072 * MB), 4084 * MB);
+        // Closer to the maximum, halfway would leave less room than V8 ever leaves (8 MB and the
+        // nursery), and at the maximum V8 fails: the engine keeps collecting at that room.
+        assert_eq!(limit(4080 * MB), 4092 * MB);
+        assert_eq!(limit(4 * GB), 4 * GB + 12 * MB);
+        assert_eq!(limit(6 * GB), 6 * GB + 12 * MB);
+        // Without a nursery the bound binds at about 585 MB.
+        let limit = |size: usize| bound_allocation_limit(size, 4 * size, 8 * MB, 4 * GB, 0);
+        assert_eq!(limit(585 * MB), 2340 * MB);
+        assert_eq!(limit(586 * MB), 2341 * MB);
+        // A factor that leaves less than 8 MB of room grows by 8 MB.
+        let limit =
+            |grown, minimum, maximum| bound_allocation_limit(MB, grown, minimum, maximum, nursery);
+        assert_eq!(limit(MB + MB / 10, 0, 4 * GB), 13 * MB);
+        // The floor applies last, over the bound too.
+        assert_eq!(limit(4 * MB, 64 * MB, 4 * GB), 64 * MB);
+        assert_eq!(limit(4 * MB, 64 * MB, 2 * MB), 64 * MB);
+        // An empty heap with no maximum, which V8 never has, still leaves the step.
+        assert_eq!(bound_allocation_limit(0, 0, 0, 0, 0), MIN_GROWING_STEP);
+    }
+
+    /// V8's own cases (test/unittests/heap/heap-controller-unittest.cc,
+    /// `OldGenerationAllocationLimit`): 128 MB kept with a 512 MB maximum and a 16 MB new space,
+    /// grown by 1.4 (V8's largest factor for that maximum), and by 1.1 with a minimum of twice
+    /// the grown size, which wins.
+    #[test]
+    fn the_limit_passes_v8s_unit_test() {
+        let (size, maximum, nursery) = (128 * MB, 512 * MB, 16 * MB);
+        let grown = |factor: f64| (size as f64 * factor) as usize;
+        assert_eq!(
+            bound_allocation_limit(size, grown(1.4), 0, maximum, nursery),
+            (size as f64 * 1.4 + nursery as f64) as usize
+        );
+        let minimum = 2 * grown(MIN_GROWING_FACTOR);
+        assert_eq!(
+            bound_allocation_limit(size, grown(MIN_GROWING_FACTOR), minimum, maximum, nursery),
+            minimum
+        );
+    }
+
+    #[test]
+    fn v8s_maximum_is_half_of_physical_memory_between_256_mb_and_4_gb() {
+        const GB: u64 = 1 << 30;
+        let maximum = |physical: u64| max_heap_bytes(None, physical);
+        assert_eq!(maximum(128 * GB), 4 << 30);
+        assert_eq!(maximum(8 * GB), 4 << 30);
+        assert_eq!(maximum(6 * GB), 3 << 30);
+        assert_eq!(maximum(GB), 512 << 20);
+        assert_eq!(maximum(GB / 4), 256 << 20);
+        // Memory the system does not report reads as 0, which V8 takes to the least.
+        assert_eq!(maximum(0), 256 << 20);
+        // `TRUST_JS_GC_MAX_HEAP_BYTES` replaces it whatever the memory, below 256 MB or past
+        // 4 GB, as V8's `--max-old-space-size` does without pointer compression; 0 keeps it.
+        assert_eq!(max_heap_bytes(Some(64 << 20), 128 * GB), 64 << 20);
+        assert_eq!(max_heap_bytes(Some(512 << 20), 128 * GB), 512 << 20);
+        assert_eq!(max_heap_bytes(Some(8 << 30), GB), 8 << 30);
+        assert_eq!(max_heap_bytes(Some(0), 128 * GB), 4 << 30);
     }
 
     /// A minor collection at `*now` that promotes `promoted` of `allocated` bytes allocated over
