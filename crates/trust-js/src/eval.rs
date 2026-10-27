@@ -3024,34 +3024,47 @@ impl Interp {
     /// The `in` operator (ECMA-262 §13.10.1, RelationalExpression : RelationalExpression `in`
     /// ShiftExpression, steps 5–6): a *TypeError* unless `object` is an Object, then
     /// HasProperty(object, ? ToPropertyKey(key)). An array-index Number that names an element of
-    /// an ordinary object's own element storage is answered without building its string key;
-    /// any other case runs the general algorithm.
+    /// an ordinary object's own element storage is answered without building its string key.
+    /// Reflect.has shares it once its target is an Object (§28.1.9).
     pub(crate) fn in_operator(&mut self, key: &Value, object: &Value) -> Result<bool, Abrupt> {
         let ValueView::Obj(target) = &(object).view() else {
             return Err(self.throw("TypeError", "'in' requires an object on the right"));
         };
-        if let ValueView::Num(n) = (*key).view() {
-            if n >= 0.0
-                && n < u32::MAX as f64
-                && n.fract() == 0.0
-                && Self::plain_own_element_present(target, n as u32)
-            {
-                return Ok(true);
+        // ToPropertyKey of a String or a Symbol is itself, and of an integral Number its decimal
+        // text: none runs code, so such a key's text is tested along an ordinary chain, or given
+        // to the general algorithm, without building a key string. `key` keeps a Symbol alive.
+        match key.view() {
+            ValueView::Num(n) => {
+                if n >= 0.0
+                    && n < u32::MAX as f64
+                    && n.fract() == 0.0
+                    && Self::plain_own_element_present(target, n as u32)
+                {
+                    return Ok(true);
+                }
+                if let Some(text) = crate::value::KeyText::integer(n) {
+                    if let Some(present) = Self::ordinary_chain_has_property(target, text.as_str())
+                    {
+                        return Ok(present);
+                    }
+                    return self.js_has_property(object, text.as_str());
+                }
             }
-            // ToPropertyKey of an integral Number is its decimal text: test that key along an
-            // ordinary chain without building a String (absent and sparse indices).
-            if let Some(text) = crate::value::KeyText::integer(n) {
+            ValueView::Str(name) => {
+                let text = crate::value::encode_lstr_key(&name);
+                if let Some(present) = Self::ordinary_chain_has_property(target, &text) {
+                    return Ok(present);
+                }
+                return self.js_has_property(object, &text);
+            }
+            ValueView::Sym(symbol) => {
+                let text = crate::value::KeyText::symbol(symbol.id);
                 if let Some(present) = Self::ordinary_chain_has_property(target, text.as_str()) {
                     return Ok(present);
                 }
+                return self.js_has_property(object, text.as_str());
             }
-        }
-        if let ValueView::Str(name) = &(key).view() {
-            if let Some(present) =
-                Self::ordinary_chain_has_property(target, &crate::value::encode_lstr_key(name))
-            {
-                return Ok(present);
-            }
+            _ => {}
         }
         let key = self.to_property_key(key)?;
         self.js_has_property(object, &key)
@@ -3064,6 +3077,8 @@ impl Interp {
     /// the chain is in an interpreter side table (`ic_plain` clear: proxies, typed arrays,
     /// namespaces, Web IDL indexed objects) or is any other exotic object.
     pub(crate) fn ordinary_chain_has_property(start: &Gc, key: &str) -> Option<bool> {
+        // The key's atom, once a map on the chain has looked it up (`Props::get_walking`).
+        let mut atom = None;
         let mut current = *start;
         loop {
             let next = {
@@ -3076,7 +3091,7 @@ impl Interp {
                 {
                     return None;
                 }
-                if object.props.contains(key) {
+                if object.props.get_walking(key, &mut atom).is_some() {
                     return Some(true);
                 }
                 object.proto

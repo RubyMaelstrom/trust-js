@@ -67,9 +67,9 @@ pub(super) fn install_reflect(it: &mut Interp) {
         if !matches!((target).view(), ValueView::Obj(_)) {
             return Err(i.make_error("TypeError", "Reflect.has called on non-object"));
         }
-        let key = ab(i.to_property_key(&arg(a, 1)))?;
-        // Trap-aware [[HasProperty]] so a proxy's `has` trap (and its throws) are honored.
-        Ok(Value::Bool(ab(i.js_has_property(&target, &key))?))
+        // HasProperty(target, ? ToPropertyKey(key)) is the `in` operator's algorithm once its
+        // right operand is an Object, trap-aware for a Proxy on the chain.
+        Ok(Value::Bool(ab(i.in_operator(&arg(a, 1), &target))?))
     });
     it.def_method(&r, "getOwnPropertyDescriptor", 2, |i, _t, a| {
         // ECMA-262 §28.1.7: TypeError for a non-object target, then ToPropertyKey exactly once,

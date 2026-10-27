@@ -200,6 +200,8 @@ mod record_enumeration_tests;
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 mod reentry_rooting_tests;
+#[cfg(test)]
+mod reflect_key_tests;
 mod regex;
 mod regex_emoji;
 mod regex_fold;
