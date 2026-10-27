@@ -594,7 +594,7 @@ impl Interp {
         let env = new_scope(Some(self.global_env));
         // Top-level `this` in a module is `undefined` (not the global object).
         env.borrow_mut().vars.insert(
-            "this".to_string(),
+            crate::atom::names::THIS.atom(),
             Binding::data(Value::Undefined, false, true),
         );
         let ns_obj = Object::new(None);
@@ -833,10 +833,9 @@ impl Interp {
             let needs_tdz = matches!(&**inner, Stmt::Expr(_))
                 || matches!(&**inner, Stmt::ClassDecl(c) if c.name.is_none());
             if needs_tdz {
-                env.borrow_mut().vars.insert(
-                    "*default*".to_string(),
-                    Binding::data(Value::Undefined, false, false),
-                );
+                env.borrow_mut()
+                    .vars
+                    .insert("*default*", Binding::data(Value::Undefined, false, false));
             }
         }
     }
@@ -886,8 +885,8 @@ impl Interp {
         match self.resolve_export(dep, name, &mut Vec::new()) {
             Resolution::Local(src_env, src_local) => {
                 env.borrow_mut().vars.insert(
-                    local.to_string(),
-                    Binding::live_import(src_env, Rc::from(src_local)),
+                    local,
+                    Binding::live_import(src_env, crate::atom::atomize(&src_local)),
                 );
                 Ok(())
             }
@@ -1629,9 +1628,7 @@ impl Interp {
                 .vars
                 .iter()
                 .filter(|(name, binding)| {
-                    binding.import_ref.is_none()
-                        && name.as_ref() != "this"
-                        && name.as_ref() != "%importmeta%"
+                    binding.import_ref.is_none() && !name.is("this") && !name.is("%importmeta%")
                 })
                 .map(|(name, binding)| (name.to_string(), !binding.mutable))
                 .collect();

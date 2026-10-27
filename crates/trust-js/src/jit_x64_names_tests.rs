@@ -296,7 +296,7 @@ fn native_name_import_mutability_and_parent_changes_stay_live() {
         .vars
         .get_mut("outer")
         .unwrap()
-        .set_import_reference(Some((exporter, "source".into())));
+        .set_import_reference(Some((exporter, crate::atom::atomize("source"))));
     assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 23.0);
     exporter
         .borrow_mut()

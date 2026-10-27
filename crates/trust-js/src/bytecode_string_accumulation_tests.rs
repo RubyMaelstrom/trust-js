@@ -117,7 +117,10 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
                 .vars
                 .get_mut("result")
                 .unwrap()
-                .set_import_reference(Some((engine.interp.global_env, "exported".into()))),
+                .set_import_reference(Some((
+                    engine.interp.global_env,
+                    crate::atom::atomize("exported"),
+                ))),
             4 => env.borrow_mut().set_with_object(Some(Value::Null)),
             5 => {
                 env.borrow_mut().vars.remove("result");

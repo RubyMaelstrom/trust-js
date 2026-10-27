@@ -311,10 +311,7 @@ impl Interp {
                     (
                         binding.initialized,
                         binding.value(),
-                        binding
-                            .import_ref
-                            .as_deref()
-                            .map(|(exporter, local)| (*exporter, local.clone())),
+                        binding.import_ref.as_deref().copied(),
                     )
                 };
                 if !initialized {
@@ -324,7 +321,7 @@ impl Interp {
                     ));
                 }
                 if let Some((exporter, local)) = import {
-                    return self.get_var(&local, &exporter);
+                    return self.get_var(&local.text(), &exporter);
                 }
                 Ok(value)
             }

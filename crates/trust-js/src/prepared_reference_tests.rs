@@ -153,7 +153,7 @@ fn prepared_reference_imports_are_live_and_never_mutable_address_hints() {
         .insert("source", Binding::data(Value::Num(7.0), true, true));
     let importer = new_scope(None);
     let mut binding = Binding::data(Value::Undefined, false, true);
-    binding.set_import_reference(Some((exporter, "source".into())));
+    binding.set_import_reference(Some((exporter, crate::atom::atomize("source"))));
     importer.borrow_mut().vars.insert("alias", binding);
     let mut reference = engine
         .interp
@@ -265,7 +265,7 @@ fn prepared_reference_native_kind_flags_use_compact_binding_size_and_live_import
     let target = new_scope(None);
     let mut binding = Binding::data(Value::Undefined, false, true);
     assert!(!binding.imported);
-    binding.set_import_reference(Some((target, "exported".into())));
+    binding.set_import_reference(Some((target, crate::atom::atomize("exported"))));
     assert!(binding.imported);
     binding.set_import_reference(None);
     assert!(!binding.imported);

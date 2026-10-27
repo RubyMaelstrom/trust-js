@@ -1196,13 +1196,12 @@ impl Visitor {
         }
         let (mut bytes, exact) = scope.vars.retained_requested_storage_bytes();
         bytes = bytes.saturating_add(scope.lexical_names.retained_requested_storage_bytes());
-        for (name, binding) in scope.vars.iter() {
-            self.rc_str(name);
+        // The names are atoms, which their heap's table accounts.
+        for (_, binding) in scope.vars.iter() {
             self.value(&binding.value());
-            if let Some((_, import_name)) = binding.import_ref.as_deref() {
+            if binding.import_ref.is_some() {
                 bytes =
-                    bytes.saturating_add(size_of::<(crate::interpreter::Env, std::rc::Rc<str>)>());
-                self.rc_str(import_name);
+                    bytes.saturating_add(size_of::<(crate::interpreter::Env, crate::atom::Atom)>());
             }
         }
         (bytes, exact)

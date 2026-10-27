@@ -1392,7 +1392,7 @@ impl Interp {
         // CreatePerIterationEnvironment: a `let` head re-binds its names each round, copying the
         // previous round's values, so closures made in the test/body/update capture that round's
         // bindings. (`const` heads and expression inits share one environment.)
-        let per_iter: Vec<String> = match init.as_deref() {
+        let per_iter: Vec<crate::atom::Atom> = match init.as_deref() {
             Some(ForInit::VarDecl {
                 kind: DeclKind::Let,
                 decls,
@@ -1402,16 +1402,19 @@ impl Interp {
                     pattern_idents(pat, &mut names);
                 }
                 names
+                    .iter()
+                    .map(|name| crate::atom::atomize(name))
+                    .collect()
             }
             _ => Vec::new(),
         };
         let copy_env = |from: &Env| -> Env {
             let parent = from.borrow().parent;
             let e = new_scope(parent);
-            for n in &per_iter {
-                let b = from.borrow().vars.get(n.as_str()).cloned();
+            for &n in &per_iter {
+                let b = from.borrow().vars.get_atom(n).cloned();
                 if let Some(b) = b {
-                    e.borrow_mut().vars.insert(n.clone(), b);
+                    e.borrow_mut().vars.insert(n, b);
                 }
             }
             e
@@ -2498,7 +2501,7 @@ impl Interp {
     fn init_lexical(&mut self, name: &str, value: Value, is_const: bool, env: &Env) {
         env.borrow_mut()
             .vars
-            .insert(name.to_string(), Binding::data(value, !is_const, true));
+            .insert(name, Binding::data(value, !is_const, true));
     }
 
     /// Object-environment HasBinding for a `with (obj)` scope: HasProperty, then an object-valued
@@ -2568,10 +2571,9 @@ impl Interp {
                     ));
                 }
                 // A live module import reads through to the exporter's binding.
-                if let Some((src_env, local)) = binding.import_ref.as_deref() {
-                    let (src_env, local) = (*src_env, local.clone());
+                if let Some(&(src_env, local)) = binding.import_ref.as_deref() {
                     drop(b);
-                    return Ok((self.get_var(&local, &src_env)?, None));
+                    return Ok((self.get_var(&local.text(), &src_env)?, None));
                 }
                 return Ok((binding.value(), None));
             }
@@ -2813,7 +2815,7 @@ impl Interp {
                 if !Env::ptr_eq(&s, &self.global_env) {
                     let mut b = Binding::data(val, true, true);
                     b.deletable = true;
-                    s.borrow_mut().vars.insert(name.to_string(), b);
+                    s.borrow_mut().vars.insert(name, b);
                     return;
                 }
                 break;
@@ -5571,8 +5573,9 @@ impl Interp {
             while let Some(s) = cur {
                 let b = s.borrow();
                 for k in b.vars.keys() {
+                    let k = k.text();
                     if k.starts_with('#') {
-                        private_names.push(k.to_string());
+                        private_names.push(k.into_owned());
                     }
                 }
                 cur = b.parent;
@@ -5751,7 +5754,7 @@ impl Interp {
             // The variable environment itself may hold body-level lexicals (our function body
             // scope carries both); a var may not hoist over one of those either.
             for &(name, _) in &var_bindings {
-                if var_env.borrow().lexical_names.iter().any(|n| &**n == name) {
+                if var_env.borrow().lexical_names.iter().any(|n| n.is(name)) {
                     return Err(self.throw(
                         "SyntaxError",
                         format!("Identifier '{name}' has already been declared"),
@@ -9317,7 +9320,7 @@ fn field_init_name(which: usize) -> Rc<str> {
 pub(crate) fn bind(env: &Env, name: &str, value: Value) {
     env.borrow_mut()
         .vars
-        .insert(name.to_string(), Binding::data(value, true, true));
+        .insert(name, Binding::data(value, true, true));
 }
 
 fn opt_obj(o: &Option<Gc>) -> Value {

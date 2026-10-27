@@ -441,15 +441,16 @@ fn function_private_bindings(
         .vars
         .iter()
         .filter(|(name, binding)| {
+            let name = name.text();
             !name.starts_with('%')
-                && name.as_ref() != "this"
-                && name.as_ref() != "arguments"
+                && name != "this"
+                && name != "arguments"
                 && !binding.imported
                 && !binding.deletable
-                && !captured.contains(name.as_ref())
-                && !runtime_lexicals.contains(name.as_ref())
+                && !captured.contains(&*name)
+                && !runtime_lexicals.contains(&*name)
         })
-        .map(|(name, binding)| (name.clone(), !binding.mutable))
+        .map(|(name, binding)| (Rc::<str>::from(&*name.text()), !binding.mutable))
         .take(64)
         .collect::<Vec<_>>();
     if let Source::For(
@@ -696,7 +697,7 @@ impl Compiler {
                 names
                     .into_iter()
                     .map(|name| LexicalBinding {
-                        name: Rc::from(name),
+                        name: crate::atom::atomize(&name),
                         is_const: false,
                     })
                     .collect(),

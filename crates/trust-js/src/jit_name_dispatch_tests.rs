@@ -196,7 +196,9 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
                 (0..24)
                     .map(|n| {
                         (
-                            Rc::<str>::from(format!("v{n}")),
+                            crate::interpreter::BindingName::new(crate::atom::atomize(&format!(
+                                "v{n}"
+                            ))),
                             Binding::data(Value::Num(n as f64), true, true),
                         )
                     })
@@ -238,7 +240,7 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
             .vars
             .get_mut("v23")
             .unwrap()
-            .set_import_reference(Some((first, "v23".into())));
+            .set_import_reference(Some((first, crate::atom::atomize("v23"))));
         assert_eq!(probe(&code, &context).address, 0);
         second
             .borrow_mut()
@@ -340,7 +342,7 @@ fn name_dispatch_native_binding_preserves_identity_with_tdz_import_and_exhaustio
         .vars
         .get_mut("outer")
         .unwrap()
-        .set_import_reference(Some((other, "outer".into())));
+        .set_import_reference(Some((other, crate::atom::atomize("outer"))));
     assert_eq!(probe(&code, &context).address, 0);
     env.borrow_mut()
         .vars

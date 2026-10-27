@@ -7,8 +7,9 @@
 //! instantiation path. Structural eval mutations invalidate VarMap's layout proof.
 
 use super::{CapInit, Chunk};
+use crate::atom::Atom;
 use crate::interpreter::{
-    new_var_scope_with_bindings, Binding, BindingLayout, Env, Interp, VarMap,
+    new_var_scope_with_bindings, Binding, BindingLayout, BindingName, Env, Interp, VarMap,
 };
 use crate::value::Value;
 use std::rc::Rc;
@@ -18,14 +19,15 @@ pub(super) fn activation_plans_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("TRUST_JS_ACTIVATION_PLANS").as_deref() != Ok("0"))
 }
 
+/// A chunk's plan, made in the chunk's heap: its names are that heap's atoms.
 pub(super) struct ActivationPlan {
-    bindings: Vec<(Rc<str>, Binding)>,
+    bindings: Vec<(BindingName, Binding)>,
     layout: Option<Rc<BindingLayout>>,
     parameters: Vec<(usize, u16)>,
     /// A captured rest parameter: (binding index, first argument index).
     rest: Option<(usize, u16)>,
     functions: Vec<(usize, u16)>,
-    lexicals: Vec<Rc<str>>,
+    lexicals: Vec<Atom>,
     this_slot: Option<usize>,
     arguments_slot: Option<usize>,
 }
@@ -44,13 +46,13 @@ impl ActivationPlan {
         };
         let mut slots = crate::fasthash::FastMap::<Rc<str>, usize>::default();
         fn slot(
-            bindings: &mut Vec<(Rc<str>, Binding)>,
+            bindings: &mut Vec<(BindingName, Binding)>,
             slots: &mut crate::fasthash::FastMap<Rc<str>, usize>,
-            name: Rc<str>,
+            name: &Rc<str>,
             binding: Binding,
             replace: bool,
         ) -> usize {
-            if let Some(&slot) = slots.get(&name) {
+            if let Some(&slot) = slots.get(name) {
                 if replace {
                     bindings[slot].1 = binding;
                 }
@@ -58,7 +60,7 @@ impl ActivationPlan {
             }
             let index = bindings.len();
             slots.insert(name.clone(), index);
-            bindings.push((name, binding));
+            bindings.push((BindingName::new(crate::atom::atomize(name)), binding));
             index
         }
         let mut functions = Vec::new();
@@ -68,7 +70,7 @@ impl ActivationPlan {
                     let index = slot(
                         &mut plan.bindings,
                         &mut slots,
-                        name.clone(),
+                        name,
                         Binding::data(Value::Undefined, true, true),
                         true,
                     );
@@ -78,7 +80,7 @@ impl ActivationPlan {
                     let index = slot(
                         &mut plan.bindings,
                         &mut slots,
-                        name.clone(),
+                        name,
                         Binding::data(Value::Undefined, true, true),
                         true,
                     );
@@ -88,7 +90,7 @@ impl ActivationPlan {
                     slot(
                         &mut plan.bindings,
                         &mut slots,
-                        name.clone(),
+                        name,
                         Binding::data(Value::Undefined, true, true),
                         false,
                     );
@@ -97,11 +99,11 @@ impl ActivationPlan {
                     slot(
                         &mut plan.bindings,
                         &mut slots,
-                        name.clone(),
+                        name,
                         Binding::data(Value::Undefined, !is_const, false),
                         true,
                     );
-                    plan.lexicals.push(name.clone());
+                    plan.lexicals.push(crate::atom::atomize(name));
                 }
                 CapInit::Fn(function, name) => functions.push((*function, name.clone())),
             }
@@ -110,7 +112,7 @@ impl ActivationPlan {
             plan.this_slot = Some(slot(
                 &mut plan.bindings,
                 &mut slots,
-                Rc::from("this"),
+                &Rc::from("this"),
                 Binding::data(Value::Undefined, false, true),
                 true,
             ));
@@ -121,7 +123,7 @@ impl ActivationPlan {
             let index = slot(
                 &mut plan.bindings,
                 &mut slots,
-                name,
+                &name,
                 Binding::data(Value::Undefined, true, true),
                 true,
             );
@@ -131,7 +133,7 @@ impl ActivationPlan {
             plan.arguments_slot = Some(slot(
                 &mut plan.bindings,
                 &mut slots,
-                Rc::from("arguments"),
+                &Rc::from("arguments"),
                 Binding::data(Value::Undefined, true, true),
                 true,
             ));
@@ -176,8 +178,8 @@ impl ActivationPlan {
         let activation = new_var_scope_with_bindings(Some(*parent), vars);
         {
             let mut scope = activation.borrow_mut();
-            for name in &self.lexicals {
-                scope.lexical_names.push(name.clone());
+            for &name in &self.lexicals {
+                scope.lexical_names.push(name);
             }
         }
         // Every closure captures this invocation's actual environment. The
@@ -208,17 +210,12 @@ impl ActivationPlan {
         if let Some(layout) = &self.layout {
             visitor.binding_layout(layout);
         }
-        for (name, _) in &self.bindings {
-            visitor.rc_str(name);
-        }
-        for name in &self.lexicals {
-            visitor.rc_str(name);
-        }
+        // The names are atoms, which their heap's table accounts.
         std::mem::size_of::<Self>()
-            + self.bindings.capacity() * std::mem::size_of::<(Rc<str>, Binding)>()
+            + self.bindings.capacity() * std::mem::size_of::<(BindingName, Binding)>()
             + (self.parameters.capacity() + self.functions.capacity())
                 * std::mem::size_of::<(usize, u16)>()
-            + self.lexicals.capacity() * std::mem::size_of::<Rc<str>>()
+            + self.lexicals.capacity() * std::mem::size_of::<Atom>()
     }
 }
 

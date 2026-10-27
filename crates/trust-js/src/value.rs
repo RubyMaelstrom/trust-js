@@ -3280,6 +3280,12 @@ fn trace_user_fn<S: crate::gc_trace::TraceSink + ?Sized>(user: &UserCallable, si
     user.cache.set(metadata);
 }
 
+/// `f` on the active Agent heap's atom table (see [`crate::atom`]).
+#[inline]
+pub(crate) fn with_atoms<R>(f: impl FnOnce(&mut crate::atom::AtomTable) -> R) -> R {
+    with_agent_heap(|heap| f(&mut heap.atoms.borrow_mut()))
+}
+
 /// A fresh string cell of `size` bytes in the active Agent's heap (see `LStr`).
 #[inline]
 pub(crate) fn alloc_string_cell(size: usize) -> *mut u8 {

@@ -356,7 +356,7 @@ fn fixed_layout_flags_and_stale_layouts_decline_before_native_commit() {
                     .vars
                     .insert("source", Binding::data(Value::Num(99.0), true, true));
                 *target.borrow_mut().vars.get_mut("outer").unwrap() =
-                    Binding::live_import(exporter, Rc::from("source"));
+                    Binding::live_import(exporter, crate::atom::atomize("source"));
             }
             _ => {
                 let mut scope = target.borrow_mut();

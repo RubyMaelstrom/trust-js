@@ -52,6 +52,13 @@ impl std::fmt::Debug for Atom {
     }
 }
 
+/// The atom's text.
+impl std::fmt::Display for Atom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 impl Atom {
     /// The atom as an engine string. A static name's string is no heap cell, so it never
     /// becomes a [`crate::value::Value`] (see [`Atom::is_static`]).
@@ -69,6 +76,70 @@ impl Atom {
     /// Whether this is a static name, which lives outside every heap.
     pub(crate) fn is_static(self) -> bool {
         static_names().contains(self)
+    }
+
+    /// The atom's engine text, borrowed for a one-byte atom.
+    #[inline]
+    pub(crate) fn text(&self) -> std::borrow::Cow<'_, str> {
+        self.0.text()
+    }
+
+    /// Whether the atom's text is `text`.
+    #[inline]
+    pub(crate) fn is(&self, text: &str) -> bool {
+        self.0 == *text
+    }
+}
+
+/// The atom of engine text `text` in the active heap, made if the heap has none yet.
+pub(crate) fn atomize(text: &str) -> Atom {
+    crate::value::with_atoms(|atoms| atoms.atomize_text(text))
+}
+
+/// The active heap's atom of engine text `text`, if it has one.
+pub(crate) fn lookup(text: &str) -> Option<Atom> {
+    crate::value::with_atoms(|atoms| atoms.lookup_text(text))
+}
+
+/// What becomes an atom of the active heap: an atom, or engine text atomized there.
+pub(crate) trait IntoAtom {
+    fn into_atom(self) -> Atom;
+}
+
+impl IntoAtom for Atom {
+    #[inline]
+    fn into_atom(self) -> Atom {
+        self
+    }
+}
+
+impl IntoAtom for &str {
+    fn into_atom(self) -> Atom {
+        atomize(self)
+    }
+}
+
+impl IntoAtom for String {
+    fn into_atom(self) -> Atom {
+        atomize(&self)
+    }
+}
+
+impl IntoAtom for &String {
+    fn into_atom(self) -> Atom {
+        atomize(self)
+    }
+}
+
+impl IntoAtom for std::rc::Rc<str> {
+    fn into_atom(self) -> Atom {
+        atomize(&self)
+    }
+}
+
+impl IntoAtom for &std::rc::Rc<str> {
+    fn into_atom(self) -> Atom {
+        atomize(self)
     }
 }
 
@@ -185,7 +256,12 @@ pub(crate) struct AtomTable {
     /// A power of two, at most half full.
     slots: Vec<Slot>,
     len: usize,
-    seed: std::collections::hash_map::RandomState,
+    /// The hash's seeds, random per table.
+    seed: (u64, u64),
+    /// Recent lookups of ASCII engine text, by the text's address: names mostly come from the
+    /// same AST text again and again. A hit compares the atom's bytes, so a reused address can
+    /// only miss.
+    recent: Box<[(usize, Option<Atom>); RECENT]>,
     /// The heap atoms made since a collection's marking last reported this table's roots: a
     /// minor collection marks these, the older ones being old cells (see
     /// [`AtomTable::trace_roots`]).
@@ -194,12 +270,21 @@ pub(crate) struct AtomTable {
     bytes: usize,
 }
 
+/// The entries of [`AtomTable::recent`].
+const RECENT: usize = 256;
+
 impl Default for AtomTable {
     fn default() -> Self {
+        let random = || {
+            std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish()
+        };
         let mut table = AtomTable {
             slots: vec![Slot::default(); 1024],
             len: 0,
-            seed: std::collections::hash_map::RandomState::new(),
+            seed: (random(), random()),
+            recent: Box::new([(0, None); RECENT]),
             young: Vec::new(),
             bytes: 0,
         };
@@ -244,6 +329,50 @@ impl AtomTable {
     /// The atom whose text is `units`, if the heap has one.
     pub(crate) fn lookup(&self, units: Units<'_>) -> Option<Atom> {
         self.find(self.hash(units), units).ok()
+    }
+
+    /// [`AtomTable::atomize`] of engine text (see [`crate::jstr`]).
+    pub(crate) fn atomize_text(&mut self, text: &str) -> Atom {
+        if !text.is_ascii() {
+            return self.atomize(Units::Utf16(&crate::jstr::units(text)));
+        }
+        if let Some(atom) = self.recent(text) {
+            return atom;
+        }
+        let atom = self.atomize(Units::Ascii(text.as_bytes()));
+        self.remember(text, atom);
+        atom
+    }
+
+    /// [`AtomTable::lookup`] of engine text.
+    pub(crate) fn lookup_text(&mut self, text: &str) -> Option<Atom> {
+        if !text.is_ascii() {
+            return self.lookup(Units::Utf16(&crate::jstr::units(text)));
+        }
+        if let Some(atom) = self.recent(text) {
+            return Some(atom);
+        }
+        let atom = self.lookup(Units::Ascii(text.as_bytes()))?;
+        self.remember(text, atom);
+        Some(atom)
+    }
+
+    /// The atom [`AtomTable::recent`] holds for ASCII `text`'s address, if it is `text`'s.
+    #[inline]
+    fn recent(&self, text: &str) -> Option<Atom> {
+        let (address, atom) = self.recent[Self::recent_slot(text)];
+        let atom = atom.filter(|_| address == text.as_ptr() as usize)?;
+        (atom.0.as_ascii() == Some(text)).then_some(atom)
+    }
+
+    #[inline]
+    fn remember(&mut self, text: &str, atom: Atom) {
+        self.recent[Self::recent_slot(text)] = (text.as_ptr() as usize, Some(atom));
+    }
+
+    #[inline]
+    fn recent_slot(text: &str) -> usize {
+        (text.as_ptr() as usize >> 3) % RECENT
     }
 
     /// The number of atoms, static names included.
@@ -343,28 +472,51 @@ impl AtomTable {
     }
 
     /// The seeded hash of `units`, the same at either width: units that all fit a byte hash as
-    /// those bytes, any other as their UTF-16 code units.
+    /// those bytes, any other as their UTF-16 code units' little-endian bytes.
     fn hash(&self, units: Units<'_>) -> u32 {
-        let mut hasher = self.seed.build_hasher();
         match units {
-            Units::Ascii(bytes) => hasher.write(bytes),
+            Units::Ascii(bytes) => self.hash_bytes(bytes),
             Units::Utf16(wide) if wide.iter().all(|&unit| unit < 0x100) => {
-                let mut chunk = [0u8; 64];
-                for part in wide.chunks(chunk.len()) {
-                    for (byte, &unit) in chunk.iter_mut().zip(part) {
+                let narrow = |buffer: &mut [u8]| {
+                    for (byte, &unit) in buffer.iter_mut().zip(wide) {
                         *byte = unit as u8;
                     }
-                    hasher.write(&chunk[..part.len()]);
+                };
+                if wide.len() <= 256 {
+                    let mut buffer = [0u8; 256];
+                    narrow(&mut buffer[..wide.len()]);
+                    self.hash_bytes(&buffer[..wide.len()])
+                } else {
+                    let mut buffer = vec![0u8; wide.len()];
+                    narrow(&mut buffer);
+                    self.hash_bytes(&buffer)
                 }
             }
             Units::Utf16(wide) => {
-                for &unit in wide {
-                    hasher.write_u16(unit);
-                }
-                hasher.write_u8(0xff);
+                let bytes: Vec<u8> = wide.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+                self.hash_bytes(&bytes)
             }
         }
-        hasher.finish() as u32
+    }
+
+    /// A hash of `bytes` that folds each 8-byte word into the state with a 128-bit multiply
+    /// (wyhash's and rapidhash's mixing), from the table's random seeds.
+    fn hash_bytes(&self, bytes: &[u8]) -> u32 {
+        const P0: u64 = 0xa076_1d64_78bd_642f;
+        const P1: u64 = 0xe703_7ed1_a0b4_28db;
+        let fold = |a: u64, b: u64| {
+            let product = u128::from(a) * u128::from(b);
+            product as u64 ^ (product >> 64) as u64
+        };
+        let mut state = self.seed.0 ^ (bytes.len() as u64).wrapping_mul(P0);
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &word in words {
+            state = fold(state ^ u64::from_le_bytes(word), P1 ^ self.seed.1);
+        }
+        let mut tail = [0u8; 8];
+        tail[..rest.len()].copy_from_slice(rest);
+        state = fold(state ^ u64::from_le_bytes(tail), P1 ^ self.seed.1);
+        fold(state, P0) as u32
     }
 }
 
@@ -533,6 +685,16 @@ static_names! {
     DELETE_PROPERTY = "deleteProperty",
     CONSTRUCT = "construct",
     UNDEFINED = "undefined",
+    THIS = "this",
+    HOME_OBJECT = "%homeobject%",
+    SUPER_PROTO = "%superproto%",
+    SUPER_CLASS = "%superclass%",
+    IMPORT_META = "%importmeta%",
+    THIS_CTOR = "%thisctor%",
+    SUPER_PROP_OK = "%superpropok%",
+    SUPER_CALL_OK = "%supercallok%",
+    NEW_TARGET = "%newtarget%",
+    FIELD_INIT = "%fieldinit%",
     NAN = "NaN",
     INFINITY = "Infinity",
 }

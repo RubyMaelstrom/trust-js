@@ -2249,7 +2249,8 @@ pub(crate) enum CapInit {
 }
 
 struct LexicalBinding {
-    name: Rc<str>,
+    /// An atom of the chunk's heap.
+    name: crate::atom::Atom,
     is_const: bool,
 }
 
@@ -2277,10 +2278,10 @@ impl LexicalScope {
         let mut slots = crate::fasthash::FastMap::<Rc<str>, usize>::default();
         let mut unique: Vec<LexicalBinding> = Vec::with_capacity(bindings.len());
         for binding in bindings {
-            match slots.get(&binding.name) {
+            match slots.get(&*binding.name.text()) {
                 Some(&slot) => unique[slot] = binding,
                 None => {
-                    slots.insert(binding.name.clone(), unique.len());
+                    slots.insert(Rc::from(&*binding.name.text()), unique.len());
                     unique.push(binding);
                 }
             }
@@ -3062,9 +3063,7 @@ impl Chunk {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<LexicalBinding>()),
             );
-            for binding in &scope.bindings {
-                visitor.rc_str(&binding.name);
-            }
+            // The names are atoms, which their heap's table accounts.
             if let Some(index) = &scope.index {
                 visitor.binding_layout(index);
             }
@@ -3512,22 +3511,21 @@ impl Chunk {
             }
             if self.env_this && !self.lexical_this {
                 b.vars.insert(
-                    "this",
+                    crate::atom::names::THIS.atom(),
                     crate::interpreter::Binding::data(*this_val, false, true),
                 );
             }
         }
         for (fidx, name) in fns {
             let v = i.make_function(self.funcs[fidx as usize].clone(), act);
-            act.borrow_mut().vars.insert(
-                name.to_string(),
-                crate::interpreter::Binding::data(v, true, true),
-            );
+            act.borrow_mut()
+                .vars
+                .insert(name, crate::interpreter::Binding::data(v, true, true));
         }
         if self.env_arguments {
             let arguments = Value::Obj(i.make_compiled_arguments_object(args, &act));
             act.borrow_mut().vars.insert(
-                "arguments".to_string(),
+                crate::atom::names::ARGUMENTS.atom(),
                 crate::interpreter::Binding::data(arguments, true, true),
             );
         }
@@ -12750,7 +12748,7 @@ impl Compiler {
             bindings
                 .into_iter()
                 .map(|(name, is_const)| LexicalBinding {
-                    name: Rc::from(name),
+                    name: crate::atom::atomize(&name),
                     is_const,
                 })
                 .collect(),
@@ -21294,7 +21292,7 @@ fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
         .iter()
         .map(|binding| {
             (
-                binding.name.clone(),
+                crate::interpreter::BindingName::new(binding.name),
                 crate::interpreter::Binding::data(Value::Undefined, !binding.is_const, false),
             )
         })
@@ -21344,11 +21342,11 @@ fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
                 let previous = if ordered {
                     current.vars.fixed_binding_at(slot)
                 } else {
-                    current.vars.get(&binding.name)
+                    current.vars.get_atom(binding.name)
                 }
                 .expect("per-iteration binding missing");
                 (
-                    binding.name.clone(),
+                    crate::interpreter::BindingName::new(binding.name),
                     crate::interpreter::Binding::data(
                         previous.value(),
                         previous.mutable,

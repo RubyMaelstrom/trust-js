@@ -1505,7 +1505,8 @@ pub(crate) fn indexed_activations_enabled() -> bool {
 
 /// Shared names and slot positions, with no binding values or environment owners.
 /// Created from a completed FunctionDeclarationInstantiation, so parameter eval
-/// and conditional constructor metadata cannot masquerade as a static key set.
+/// and conditional constructor metadata cannot masquerade as a static key set. The names
+/// are text, not atoms: a function's AST, which every heap shares, caches its layouts.
 #[derive(Debug)]
 pub(crate) struct BindingLayout {
     id: u32,
@@ -1534,6 +1535,18 @@ impl BindingLayout {
         // HashMap does not expose its bucket allocation; a lower bound.
         std::mem::size_of::<Self>() + self.slots.len() * std::mem::size_of::<(Rc<str>, usize)>()
     }
+
+    /// The slot of the binding named by `text`, if the layout has one.
+    #[inline]
+    fn slot_of(&self, text: &str) -> Option<usize> {
+        self.slots.get(text).copied()
+    }
+
+    /// The slot of the binding named by `name`, if the layout has one.
+    #[inline]
+    fn slot_of_atom(&self, name: crate::atom::Atom) -> Option<usize> {
+        self.slot_of(&name.text())
+    }
 }
 
 /// A binding map's ordered entries. P1 S4: the first entry lives in the environment cell, so a
@@ -1541,12 +1554,31 @@ impl BindingLayout {
 /// more move the entries to one storage block (`gc_storage`), which the record reports
 /// ([`VarMap::trace_storage`]).
 pub(crate) type BindingEntries =
-    crate::inline_vec::InlineVec<(Rc<str>, Binding), 1, crate::gc_storage::GcSpill>;
+    crate::inline_vec::InlineVec<(BindingName, Binding), 1, crate::gc_storage::GcSpill>;
+
+/// A binding's name: an atom of its environment's heap (see [`crate::atom`]), padded to the two
+/// words an entry gave its name before atoms, so generated code finds each binding where it
+/// did.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct BindingName {
+    atom: crate::atom::Atom,
+    _pad: usize,
+}
+
+impl BindingName {
+    #[inline]
+    pub(crate) fn new(atom: crate::atom::Atom) -> Self {
+        Self { atom, _pad: 0 }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<BindingName>() == std::mem::size_of::<Rc<str>>());
 
 /// The bytes of `entries`' storage beside the environment cell.
 fn binding_entries_heap_bytes(entries: &BindingEntries) -> usize {
     let capacity = entries.heap_capacity();
-    capacity.saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>())
+    capacity.saturating_mul(std::mem::size_of::<(BindingName, Binding)>())
 }
 
 /// The entries are first so their native layout can share the Small storage path.
@@ -1560,7 +1592,7 @@ struct IndexedBindings {
 #[repr(u8)]
 enum VarStorage {
     Small(BindingEntries),
-    Large(crate::fasthash::FastMap<std::rc::Rc<str>, Binding>),
+    Large(crate::fasthash::FastMap<crate::atom::Atom, Binding>),
     Indexed(IndexedBindings),
 }
 
@@ -1574,39 +1606,39 @@ impl Default for VarMap {
     }
 }
 
-pub enum VarIter<'a> {
-    Small(std::slice::Iter<'a, (std::rc::Rc<str>, Binding)>),
-    Large(std::collections::hash_map::Iter<'a, std::rc::Rc<str>, Binding>),
+pub(crate) enum VarIter<'a> {
+    Small(std::slice::Iter<'a, (BindingName, Binding)>),
+    Large(std::collections::hash_map::Iter<'a, crate::atom::Atom, Binding>),
 }
 
 impl<'a> Iterator for VarIter<'a> {
-    type Item = (&'a std::rc::Rc<str>, &'a Binding);
+    type Item = (crate::atom::Atom, &'a Binding);
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            VarIter::Small(iter) => iter.next().map(|(name, binding)| (name, binding)),
-            VarIter::Large(iter) => iter.next(),
+            VarIter::Small(iter) => iter.next().map(|(name, binding)| (name.atom, binding)),
+            VarIter::Large(iter) => iter.next().map(|(&name, binding)| (name, binding)),
         }
     }
 }
 
-pub enum VarKeys<'a> {
-    Small(std::slice::Iter<'a, (std::rc::Rc<str>, Binding)>),
-    Large(std::collections::hash_map::Keys<'a, std::rc::Rc<str>, Binding>),
+pub(crate) enum VarKeys<'a> {
+    Small(std::slice::Iter<'a, (BindingName, Binding)>),
+    Large(std::collections::hash_map::Keys<'a, crate::atom::Atom, Binding>),
 }
 
-impl<'a> Iterator for VarKeys<'a> {
-    type Item = &'a std::rc::Rc<str>;
+impl Iterator for VarKeys<'_> {
+    type Item = crate::atom::Atom;
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            VarKeys::Small(iter) => iter.next().map(|(name, _)| name),
-            VarKeys::Large(iter) => iter.next(),
+            VarKeys::Small(iter) => iter.next().map(|(name, _)| name.atom),
+            VarKeys::Large(iter) => iter.next().copied(),
         }
     }
 }
 
-pub enum VarValues<'a> {
-    Small(std::slice::Iter<'a, (std::rc::Rc<str>, Binding)>),
-    Large(std::collections::hash_map::Values<'a, std::rc::Rc<str>, Binding>),
+pub(crate) enum VarValues<'a> {
+    Small(std::slice::Iter<'a, (BindingName, Binding)>),
+    Large(std::collections::hash_map::Values<'a, crate::atom::Atom, Binding>),
 }
 
 impl<'a> Iterator for VarValues<'a> {
@@ -1646,15 +1678,13 @@ impl VarMap {
                 slots: self
                     .keys()
                     .enumerate()
-                    .map(|(slot, name)| (name.clone(), slot))
+                    .map(|(slot, name)| (Rc::from(&*name.text()), slot))
                     .collect(),
             })
         });
         if layout.id == 0
             || self.keys().count() != layout.slots.len()
-            || self
-                .keys()
-                .any(|name| !layout.slots.contains_key(name.as_ref()))
+            || self.keys().any(|name| layout.slot_of_atom(name).is_none())
         {
             return;
         }
@@ -1662,14 +1692,19 @@ impl VarMap {
         let mut entries =
             match std::mem::replace(&mut self.map, VarStorage::Small(BindingEntries::new())) {
                 VarStorage::Small(entries) => entries,
-                VarStorage::Large(entries) => entries.into_iter().collect(),
+                VarStorage::Large(entries) => entries
+                    .into_iter()
+                    .map(|(name, binding)| (BindingName::new(name), binding))
+                    .collect(),
                 VarStorage::Indexed(indexed) => indexed.entries,
             };
         // A linear permutation into the shared ordering, without cloning values
         // or retaining an old activation. All names were validated above.
         for slot in 0..entries.len() {
             loop {
-                let target = layout.slots[entries[slot].0.as_ref()];
+                let target = layout
+                    .slot_of_atom(entries[slot].0.atom)
+                    .expect("validated");
                 if target == slot {
                     break;
                 }
@@ -1706,7 +1741,7 @@ impl VarMap {
             debug_assert!(entries
                 .iter()
                 .enumerate()
-                .all(|(slot, (name, _))| layout.slots.get(name) == Some(&slot)));
+                .all(|(slot, (name, _))| layout.slot_of_atom(name.atom) == Some(slot)));
             VarStorage::Indexed(IndexedBindings {
                 entries,
                 layout: layout.clone(),
@@ -1744,7 +1779,7 @@ impl VarMap {
             VarStorage::Large(entries) => (
                 entries
                     .len()
-                    .saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>()),
+                    .saturating_mul(std::mem::size_of::<(crate::atom::Atom, Binding)>()),
                 false,
             ),
         }
@@ -1796,9 +1831,9 @@ impl VarMap {
     /// ordered names; dynamic hash maps retain checked name lookup.
     pub(crate) fn binding_slot(&self, name: &str) -> Option<usize> {
         match &self.map {
-            VarStorage::Small(entries) => entries.iter().position(|(key, _)| &**key == name),
+            VarStorage::Small(entries) => entries.iter().position(|(key, _)| key.atom.is(name)),
             VarStorage::Large(_) => None,
-            VarStorage::Indexed(indexed) => indexed.layout.slots.get(name).copied(),
+            VarStorage::Indexed(indexed) => indexed.layout.slot_of(name),
         }
     }
 
@@ -1807,7 +1842,7 @@ impl VarMap {
             VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
                 entries
                     .get(slot)
-                    .filter(|(key, _)| &**key == name)
+                    .filter(|(key, _)| key.atom.is(name))
                     .map(|(_, binding)| binding)
             }
             VarStorage::Large(_) => None,
@@ -1819,7 +1854,7 @@ impl VarMap {
             VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
                 entries
                     .get_mut(slot)
-                    .filter(|(key, _)| &**key == name)
+                    .filter(|(key, _)| key.atom.is(name))
                     .map(|(_, binding)| binding)
             }
             VarStorage::Large(_) => None,
@@ -1850,11 +1885,15 @@ impl VarMap {
     pub(crate) fn publish_layout(&mut self, layout_id: u32) {
         self.layout_id = layout_id;
     }
-    pub fn insert(&mut self, k: impl Into<std::rc::Rc<str>>, mut v: Binding) -> Option<Binding> {
+    pub(crate) fn insert(
+        &mut self,
+        k: impl crate::atom::IntoAtom,
+        mut v: Binding,
+    ) -> Option<Binding> {
         v.imported = v.import_ref.is_some();
-        let k = k.into();
+        let k = k.into_atom();
         if let VarStorage::Indexed(indexed) = &mut self.map {
-            if let Some(&slot) = indexed.layout.slots.get(k.as_ref()) {
+            if let Some(slot) = indexed.layout.slot_of_atom(k) {
                 // InitializeBinding and same-name declaration replacement keep
                 // the key set and addresses. Native users read flags/values live.
                 self.generation.set(self.generation.get().saturating_add(1));
@@ -1864,11 +1903,11 @@ impl VarMap {
         self.bump();
         match &mut self.map {
             VarStorage::Small(entries) => {
-                if let Some((_, old)) = entries.iter_mut().find(|(name, _)| **name == *k) {
+                if let Some((_, old)) = entries.iter_mut().find(|(name, _)| name.atom == k) {
                     return Some(std::mem::replace(old, v));
                 }
                 if entries.len() < SMALL_VAR_MAP_CAPACITY {
-                    entries.push((k, v));
+                    entries.push((BindingName::new(k), v));
                     return None;
                 }
                 let mut large = crate::fasthash::FastMap::with_capacity_and_hasher(
@@ -1876,7 +1915,7 @@ impl VarMap {
                     Default::default(),
                 );
                 for (name, binding) in std::mem::take(entries) {
-                    large.insert(name, binding);
+                    large.insert(name.atom, binding);
                 }
                 let old = large.insert(k, v);
                 self.map = VarStorage::Large(large);
@@ -1884,26 +1923,32 @@ impl VarMap {
             }
             VarStorage::Large(entries) => entries.insert(k, v),
             VarStorage::Indexed(indexed) => {
-                let mut entries: crate::fasthash::FastMap<_, _> =
-                    std::mem::take(&mut indexed.entries).into_iter().collect();
+                let mut entries = Self::large_from(std::mem::take(&mut indexed.entries));
                 let old = entries.insert(k, v);
                 self.map = VarStorage::Large(entries);
                 old
             }
         }
     }
+
+    fn large_from(entries: BindingEntries) -> crate::fasthash::FastMap<crate::atom::Atom, Binding> {
+        entries
+            .into_iter()
+            .map(|(name, binding)| (name.atom, binding))
+            .collect()
+    }
+
     pub fn remove(&mut self, k: &str) -> Option<Binding> {
         self.bump();
         match &mut self.map {
             VarStorage::Small(entries) => entries
                 .iter()
-                .position(|(name, _)| &**name == k)
+                .position(|(name, _)| name.atom.is(k))
                 .map(|index| entries.swap_remove(index).1),
-            VarStorage::Large(entries) => entries.remove(k),
+            VarStorage::Large(entries) => entries.remove(&crate::atom::lookup(k)?),
             VarStorage::Indexed(indexed) => {
-                let mut entries: crate::fasthash::FastMap<_, _> =
-                    std::mem::take(&mut indexed.entries).into_iter().collect();
-                let old = entries.remove(k);
+                let mut entries = Self::large_from(std::mem::take(&mut indexed.entries));
+                let old = crate::atom::lookup(k).and_then(|k| entries.remove(&k));
                 self.map = VarStorage::Large(entries);
                 old
             }
@@ -1922,11 +1967,11 @@ impl VarMap {
         match &mut self.map {
             VarStorage::Small(entries) => entries
                 .iter_mut()
-                .find(|(name, _)| &**name == k)
+                .find(|(name, _)| name.atom.is(k))
                 .map(|(_, binding)| binding),
-            VarStorage::Large(entries) => entries.get_mut(k),
+            VarStorage::Large(entries) => entries.get_mut(&crate::atom::lookup(k)?),
             VarStorage::Indexed(indexed) => {
-                let slot = *indexed.layout.slots.get(k)?;
+                let slot = indexed.layout.slot_of(k)?;
                 Some(&mut indexed.entries[slot].1)
             }
         }
@@ -1935,11 +1980,11 @@ impl VarMap {
         match &self.map {
             VarStorage::Small(entries) => entries
                 .iter()
-                .find(|(name, _)| &**name == k)
+                .find(|(name, _)| name.atom.is(k))
                 .map(|(_, binding)| binding),
-            VarStorage::Large(entries) => entries.get(k),
+            VarStorage::Large(entries) => entries.get(&crate::atom::lookup(k)?),
             VarStorage::Indexed(indexed) => {
-                let slot = *indexed.layout.slots.get(k)?;
+                let slot = indexed.layout.slot_of(k)?;
                 Some(&indexed.entries[slot].1)
             }
         }
@@ -1947,7 +1992,22 @@ impl VarMap {
     pub fn contains_key(&self, k: &str) -> bool {
         self.get(k).is_some()
     }
-    pub fn iter(&self) -> VarIter<'_> {
+
+    /// The binding named by `name`, an atom of this environment's heap.
+    pub(crate) fn get_atom(&self, name: crate::atom::Atom) -> Option<&Binding> {
+        match &self.map {
+            VarStorage::Small(entries) => entries
+                .iter()
+                .find(|(key, _)| key.atom == name)
+                .map(|(_, binding)| binding),
+            VarStorage::Large(entries) => entries.get(&name),
+            VarStorage::Indexed(indexed) => {
+                let slot = indexed.layout.slot_of_atom(name)?;
+                Some(&indexed.entries[slot].1)
+            }
+        }
+    }
+    pub(crate) fn iter(&self) -> VarIter<'_> {
         match &self.map {
             VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
                 VarIter::Small(entries.iter())
@@ -1955,7 +2015,7 @@ impl VarMap {
             VarStorage::Large(entries) => VarIter::Large(entries.iter()),
         }
     }
-    pub fn keys(&self) -> VarKeys<'_> {
+    pub(crate) fn keys(&self) -> VarKeys<'_> {
         match &self.map {
             VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
                 VarKeys::Small(entries.iter())
@@ -1963,7 +2023,7 @@ impl VarMap {
             VarStorage::Large(entries) => VarKeys::Large(entries.keys()),
         }
     }
-    pub fn values(&self) -> VarValues<'_> {
+    pub(crate) fn values(&self) -> VarValues<'_> {
         match &self.map {
             VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
                 VarValues::Small(entries.iter())
@@ -1998,7 +2058,7 @@ impl VarMap {
             return None;
         };
         let vector = entries as *const BindingEntries as usize - &small as *const VarMap as usize;
-        let elements: &[(Rc<str>, Binding)] = entries;
+        let elements: &[(BindingName, Binding)] = entries;
         let binding = &elements[0].1 as *const Binding as usize - elements.as_ptr() as usize;
         let storage = Self::jit_entries_layout(entries)?;
         let mut indexed = Self::default();
@@ -2017,16 +2077,17 @@ impl VarMap {
             tag,
             entries: vector,
             storage,
-            stride: std::mem::size_of::<(Rc<str>, Binding)>(),
+            stride: std::mem::size_of::<(BindingName, Binding)>(),
             binding,
         })
     }
 
     /// The entries are an `InlineVec`, probed in place and spilled.
     fn jit_entries_layout(_: &BindingEntries) -> Option<crate::value::JitVecLayout> {
+        let probe = crate::atom::atomize("probe");
         BindingEntries::probe_jit_layout(|| {
             (
-                Rc::from("probe"),
+                BindingName::new(probe),
                 Binding::data(Value::Num(7.0), true, true),
             )
         })
@@ -2041,7 +2102,7 @@ pub(crate) struct JitBindingStorage {
     pub(crate) tag: usize,
     /// The Small arm's entries, which the Indexed arm keeps at the same offset.
     pub(crate) entries: usize,
-    /// How the entries hold their `(Rc<str>, Binding)` elements.
+    /// How the entries hold their `(BindingName, Binding)` elements.
     pub(crate) storage: crate::value::JitVecLayout,
     /// The element stride, and the `Binding` within an element.
     pub(crate) stride: usize,
@@ -2077,7 +2138,7 @@ mod binding_layout_tests {
                     .vars
                     .insert("source", Binding::data(Value::Obj(object), true, true));
                 let mut import = Binding::data(Value::Undefined, false, true);
-                import.set_import_reference(Some((exporter, "source".into())));
+                import.set_import_reference(Some((exporter, crate::atom::atomize("source"))));
                 global.borrow_mut().vars.insert("coldLeft", import.clone());
                 global.borrow_mut().vars.insert("coldRight", import);
                 Env::downgrade(&exporter)
@@ -2433,36 +2494,34 @@ const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 128);
 #[derive(Default)]
 #[repr(transparent)]
 #[allow(clippy::box_collection)] // Keeps the common empty scope to one nullable pointer.
-pub struct ScopeNames(Option<Box<Vec<Rc<str>>>>);
+pub struct ScopeNames(Option<Box<Vec<crate::atom::Atom>>>);
 
 impl ScopeNames {
-    /// Record a lexically declared name. Compiled scopes share their chunk's name text.
-    pub fn push(&mut self, name: impl Into<Rc<str>>) {
+    /// Record a lexically declared name.
+    pub(crate) fn push(&mut self, name: impl crate::atom::IntoAtom) {
         self.0
             .get_or_insert_with(Default::default)
-            .push(name.into());
+            .push(name.into_atom());
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, Rc<str>> {
-        self.0.as_deref().map_or(&[][..], Vec::as_slice).iter()
+    pub(crate) fn iter(&self) -> impl Iterator<Item = crate::atom::Atom> + '_ {
+        self.0
+            .as_deref()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .copied()
     }
 
     pub(crate) fn retained_requested_storage_bytes(&self) -> usize {
         let Some(names) = self.0.as_deref() else {
             return 0;
         };
-        std::mem::size_of::<Vec<Rc<str>>>()
-            .saturating_add(
-                names
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<Rc<str>>()),
-            )
-            .saturating_add(
-                names
-                    .iter()
-                    .map(|name| name.len())
-                    .fold(0usize, usize::saturating_add),
-            )
+        // The names are atoms, which their heap's table accounts.
+        std::mem::size_of::<Vec<crate::atom::Atom>>().saturating_add(
+            names
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::atom::Atom>()),
+        )
     }
 }
 
@@ -2477,7 +2536,7 @@ pub struct Binding {
     /// bindings need only a nullable pointer. Each cold box independently owns its Env;
     /// sharing that owner would change the collector's incoming-reference accounting.
     /// Immutable names can share their bytes across temporary resolution snapshots.
-    pub import_ref: Option<Box<(Env, Rc<str>)>>,
+    pub(crate) import_ref: Option<Box<(Env, crate::atom::Atom)>>,
     /// Native-visible kind bit, occupying existing flag padding. All structural insertion
     /// paths normalize it; in-place import changes must use set_import_reference.
     pub(crate) imported: bool,
@@ -2538,9 +2597,9 @@ impl Binding {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, String)>) {
+    pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, crate::atom::Atom)>) {
         self.imported = reference.is_some();
-        self.import_ref = reference.map(|(env, name)| Box::new((env, Rc::from(name))));
+        self.import_ref = reference.map(Box::new);
     }
     pub(crate) fn data(value: Value, mutable: bool, initialized: bool) -> Binding {
         Binding {
@@ -2560,7 +2619,7 @@ impl Binding {
         self
     }
 
-    pub(crate) fn live_import(environment: Env, name: Rc<str>) -> Self {
+    pub(crate) fn live_import(environment: Env, name: crate::atom::Atom) -> Self {
         let mut binding = Self::data(Value::Undefined, false, true);
         binding.import_ref = Some(Box::new((environment, name)));
         binding.imported = true;
@@ -4847,7 +4906,7 @@ impl Interp {
         } else {
             let global_env = new_var_scope(None);
             global_env.borrow_mut().vars.insert(
-                "this".to_string(),
+                crate::atom::names::THIS.atom(),
                 Binding::data(Value::Obj(self.global), false, true),
             );
             let state = HostSettingsState {
@@ -15050,7 +15109,7 @@ impl Interp {
             // would only shadow an (equally unread) outer one.
             if scan & crate::ast::SCAN_NEW_TARGET != 0 {
                 scope.borrow_mut().vars.insert(
-                    "%newtarget%".to_string(),
+                    crate::atom::names::NEW_TARGET.atom(),
                     Binding::data(self.new_target, false, true).with_strict_immutable(false),
                 );
             }
@@ -15079,7 +15138,7 @@ impl Interp {
                     }
                 };
                 scope.borrow_mut().vars.insert(
-                    "this".to_string(),
+                    crate::atom::names::THIS.atom(),
                     Binding::data(this_val, false, !derived_tdz),
                 );
             }
@@ -15089,7 +15148,7 @@ impl Interp {
             // the interpreter's transient `super_call_ok` execution flag.
             if derived_tdz {
                 scope.borrow_mut().vars.insert(
-                    "%supercallok%".to_string(),
+                    crate::atom::names::SUPER_CALL_OK.atom(),
                     Binding::data(Value::Bool(true), false, true),
                 );
             }
@@ -15102,7 +15161,7 @@ impl Interp {
                     frame.extra.get_or_insert_with(Default::default).args_obj = Value::Obj(ao);
                 }
                 scope.borrow_mut().vars.insert(
-                    "arguments".to_string(),
+                    crate::atom::names::ARGUMENTS.atom(),
                     Binding::data(Value::Obj(ao), true, true),
                 );
             } else if !func.is_strict && !func.is_generator && !func.is_async && !func.is_method {
@@ -15115,7 +15174,7 @@ impl Interp {
             // eval in a nested arrow, which resolves this marker lexically long after the call.
             if func.is_method || self.class_info.contains_key(&(Gc::as_ptr(fn_obj) as usize)) {
                 scope.borrow_mut().vars.insert(
-                    "%superpropok%".to_string(),
+                    crate::atom::names::SUPER_PROP_OK.atom(),
                     Binding::data(Value::Bool(true), false, true),
                 );
             }
