@@ -11512,20 +11512,58 @@ impl Interp {
             if owner.retained_requested_bytes() > 1 << 20 {
                 return None;
             }
-            let parent = self.re_text(unicode, owner);
+            let parent = self.re_text_extent(unicode, owner, end);
             crate::regex::ReText::window(parent, s, start, end)
         });
         let t = Rc::new(prepared.unwrap_or_else(|| crate::regex::ReText::new_rc(unicode, s)));
+        self.insert_re_text(key, *s, &t);
+        t
+    }
+
+    /// The prepared text of every unit written to flat buffer `owner` (see
+    /// [`crate::lstr::LStr::buffer_extent`]), covering at least `end` units, for windows of its
+    /// views. A view made by an in-place append reads past the buffer's own length, so the
+    /// buffer's own prepared text would not cover it: such an extent is cached under the buffer
+    /// with a tag bit (cells are aligned, so no string's key has it), and since written units
+    /// never change, a longer extent replaces a shorter one.
+    fn re_text_extent(
+        &mut self,
+        unicode: bool,
+        owner: &crate::lstr::LStr,
+        end: usize,
+    ) -> Rc<crate::regex::ReText> {
+        if !owner.written_past_length() {
+            return self.re_text(unicode, owner);
+        }
+        let key = (owner.as_ptr() as usize | 1, unicode);
+        if let Some((_, text)) = self.re_texts.get_cloned(&key) {
+            if text.unit_index(text.len()) >= end {
+                return text;
+            }
+        }
+        let extent = owner
+            .buffer_extent()
+            .expect("a buffer written past its length has an extent");
+        let text = Rc::new(crate::regex::ReText::new_rc(unicode, &extent));
+        self.insert_re_text(key, extent, &text);
+        text
+    }
+
+    fn insert_re_text(
+        &mut self,
+        key: (usize, bool),
+        s: crate::lstr::LStr,
+        text: &Rc<crate::regex::ReText>,
+    ) {
         let bytes = s
             .retained_requested_bytes()
-            .saturating_add(t.heap_bytes())
+            .saturating_add(text.heap_bytes())
             .saturating_add(std::mem::size_of::<(
                 (usize, bool),
                 crate::lstr::LStr,
                 Rc<crate::regex::ReText>,
             )>());
-        self.re_texts.insert(key, (*s, t.clone()), bytes);
-        t
+        self.re_texts.insert(key, (s, text.clone()), bytes);
     }
 
     /// Sweep one already-proven non-live set: atomic weak clearing and internal-slot eviction

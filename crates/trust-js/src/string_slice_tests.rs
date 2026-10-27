@@ -123,6 +123,31 @@ fn unit_slices_keep_identity_and_need_no_cache() {
     assert!(matches!((Value::Str(copied)).view(), ValueView::Str(s) if s.text() == "é😀z"));
 }
 
+/// A slice of a string built by appending in place is a view reading past its buffer's own
+/// length; its RegExp text is still a window of the buffer's, prepared once for every unit
+/// written to the buffer, not a fresh table per slice.
+#[test]
+fn regexp_windows_of_appended_buffers_share_one_prepared_extent() {
+    let mut engine = Engine::new();
+    let mut code = crate::lstr::LStr::from("\u{4e2d}");
+    let line = crate::lstr::LStr::from("var x = foo(bar, 42); // a comment\n");
+    while code.unit_len() < 4096 {
+        code.append_or_replace(&line);
+    }
+    assert!(code.view_owner().is_some(), "appended in place");
+    for unicode in [false, true] {
+        let before = engine.interp.re_texts.stats().0;
+        for start in [1, 100, 1000, 3000] {
+            let chunk = code.slice_units(start, code.unit_len());
+            let text = engine.interp.re_text(unicode, &chunk);
+            assert!(text.is_window(), "a window of the buffer's extent");
+            assert_eq!(text.unit_index(text.len()), chunk.unit_len());
+        }
+        // One extent and four windows.
+        assert_eq!(engine.interp.re_texts.stats().0, before + 5);
+    }
+}
+
 #[test]
 fn large_views_keep_native_reads_and_observers_correct() {
     check(

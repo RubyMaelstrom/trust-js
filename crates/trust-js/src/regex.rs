@@ -2076,6 +2076,12 @@ impl ReText {
         })
     }
 
+    /// Whether this text is a window of a parent's elements.
+    #[cfg(test)]
+    pub(crate) fn is_window(&self) -> bool {
+        self.parent.is_some()
+    }
+
     #[inline]
     fn elements(&self) -> &[u32] {
         match &self.parent {
