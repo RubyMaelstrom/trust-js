@@ -526,3 +526,51 @@ startup snapshots (P4); Speedometer acceptance beyond the replays.
 - Incremental marking (W6) puts a barrier on every pointer store in the interpreter, the VM and
   both JIT backends; it lands behind GC stress with marking forced into small slices, and
   TRUST_JS_GC_VERIFY.
+
+## Stage records
+
+Each stage's design note, written before its code, then its gates and exit measurement.
+
+### Step 0: a perf map for generated code (design, 2026-10-27)
+
+`TRUST_JS_PERF_MAP=1` makes the engine append a line for each piece of code it generates to
+`/tmp/perf-<pid>.map` in perf's JIT map format (`START SIZE name`, hexadecimal without `0x`),
+which `perf report` reads for samples no binary resolves; V8's `--perf-basic-prof` writes the
+same file. The lines come from the compile-time hook the gprofng registration uses
+(jit_profiler.rs, called from `compile_profiled_with` for both backends) and from every other
+place that makes executable code: the process-wide shared stubs (permanent), and the native
+RegExp tier's byte and word programs (regex.rs). Names follow V8's: `JS:^<name>
+<url>:<line>:<column>` for a chunk (`^` marks baseline code, as V8 marks Sparkplug's),
+`<anonymous>` for a function without a name, the first local names when there is no script;
+`Stub:<kind>` for a shared stub; `RegExp:/<source>/<flags>`. A chunk carries its label only
+while the map is on: an `Option<Box<str>>` the bytecode compiler fills from the AST function's
+name, script and start (`ScriptSource::line_column`), so the default path pays nothing. Freed
+code is not unlisted, as perf's map format has no unload record (V8's map has the same limit;
+a jitdump for `perf inject --jit` would lift it if address reuse confuses a profile). The file
+opens on first use and takes one write per line under a process-wide lock, since Agents on
+other threads compile too. Tests: a compiled function, a shared stub and a native RegExp each
+add a line that parses and names them, and nothing is written with the switch off.
+DIAGNOSTICS.md documents the switch beside `TRUST_JS_JIT_GPROFNG`, with the call-graph flags
+(`perf record --call-graph fp --user-callchains`). Exit: `perf report` on the Vue fixture names
+the generated code among its 30 hottest symbols, with no bare addresses.
+
+### W6a: V8's cap on the heap limit (design, 2026-10-27)
+
+After a major collection V8 sets the old generation's limit to
+max(min(max(size x factor, size + step) + young capacity, (size + maximum) / 2), minimum)
+(heap-controller.cc, `MemoryController::BoundAllocationLimit`). The engine computes the inner
+term today (gc_core.rs, `sweep_phase`: `size` is the cells held plus the payloads they own
+outside the heap, which V8 keeps on its heap: Map and Set tables, internal slots, bound
+arguments). The port adds the halfway bound with V8's maximum for the old generation on 64-bit
+hosts (heap.cc, `OldGenerationSizeFromPhysicalMemory`): half of physical memory, clamped to
+256 MB-4 GB, to be re-verified against V8's current source and cited at its revision as
+gc_pacing.rs does. The physical memory comes from the operating system (sysconf on Linux,
+`hw.memsize` on macOS, GlobalMemoryStatusEx on Windows); `TRUST_JS_GC_MAX_HEAP_BYTES=N`
+overrides the maximum, as V8's `--max-old-space-size` does, for tests and diagnosis. Pacing
+only (Decision 5): V8 fails with out-of-memory at its maximum and the engine does not, so the
+bound never takes the limit below size + step + nursery, V8's own least room, and a heap past
+the maximum keeps collecting at that room. The bound applies only with pacing on; fixed
+budgets keep their rule. Tests: the limit below, at and above the point where the bound binds
+(about 585 MB at factor 4 with a 4 GB maximum), past the maximum, and the override.
+Exit (proposed, W6): the limits match V8's rule in unit tests; Web Tooling's peak RSS falls; no
+suite slower beyond noise.
