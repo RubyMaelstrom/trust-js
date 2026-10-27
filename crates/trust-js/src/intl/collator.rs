@@ -298,7 +298,11 @@ fn compare(i: &mut Interp, this: &Value, a: &Value, b: &Value) -> Result<Value, 
     let o = brand_slot(i, this, "#\u{0}co")?;
     let sa = ab(i.to_string(a))?;
     let sb = ab(i.to_string(b))?;
-    Ok(compare_strings(&sa, &sb, &stored_collate_opts(&o)))
+    Ok(compare_strings(
+        &sa.text(),
+        &sb.text(),
+        &stored_collate_opts(&o),
+    ))
 }
 
 /// CompareStrings (ECMA-402 #sec-collator-comparestrings) as a Number.

@@ -390,13 +390,14 @@ fn check_calendar(i: &mut Interp, v: &Value) -> Result<std::rc::Rc<str>, Value> 
     match &(v).view() {
         ValueView::Undefined => Ok(std::rc::Rc::from("iso8601")),
         ValueView::Str(s) => {
+            let text = s.text();
             // A bare (CLDR-aliased) calendar id...
-            if let Some(canon) = canon_cal(s) {
+            if let Some(canon) = canon_cal(&text) {
                 return Ok(std::rc::Rc::from(canon));
             }
             // ...or an ISO date/time whose `[u-ca=...]` annotation (or the implicit "iso8601")
             // supplies the calendar.
-            if let Some(parsed) = parse_iso(s) {
+            if let Some(parsed) = parse_iso(&text) {
                 let cal = parsed.calendar.unwrap_or_else(|| "iso8601".to_string());
                 if let Some(canon) = canon_cal(&cal) {
                     return Ok(std::rc::Rc::from(canon));
@@ -1840,7 +1841,7 @@ fn read_frac_digits(i: &mut Interp, opts: &Value) -> Result<Option<usize>, Value
                 let other = __value_match_original;
                 {
                     let sv = i.to_string(&other).map_err(unab)?;
-                    if &*sv == "auto" {
+                    if &*sv.text() == "auto" {
                         Ok(None)
                     } else {
                         Err(i.make_error(
@@ -2785,7 +2786,7 @@ fn sub_proto(i: &mut Interp, v: &Value) -> Result<(), Value> {
 fn ctor_calendar(i: &mut Interp, v: &Value) -> Result<std::rc::Rc<str>, Value> {
     match &(v).view() {
         ValueView::Undefined => Ok(std::rc::Rc::from("iso8601")),
-        ValueView::Str(c) => match canon_cal(c) {
+        ValueView::Str(c) => match canon_cal(&c.text()) {
             Some(canon) => Ok(std::rc::Rc::from(canon)),
             None => Err(i.make_error("RangeError", "invalid calendar identifier")),
         },
@@ -2948,7 +2949,7 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
                 ValueView::Undefined => None,
                 _ => {
                     any = true;
-                    Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
+                    Some(i.to_string(&ev).map_err(unab)?.text().to_lowercase())
                 }
             };
             let eyv = getm(i, &f, "eraYear")?;
@@ -2990,7 +2991,8 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
                         ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
-                    let b = sv.as_bytes();
+                    let text = sv.text();
+                    let b = text.as_bytes();
                     let ok = (b.len() == 3 || (b.len() == 4 && b[3] == b'L'))
                         && b[0] == b'M'
                         && b[1].is_ascii_digit()
@@ -3875,7 +3877,7 @@ fn read_date_raw_cal(
         let e = getm(i, v, "era")?;
         let e = match (e).view() {
             ValueView::Undefined => None,
-            _ => Some(i.to_string(&e).map_err(unab)?.to_lowercase()),
+            _ => Some(i.to_string(&e).map_err(unab)?.text().to_lowercase()),
         };
         let ey = getm(i, v, "eraYear")?;
         let ey = match (ey).view() {
@@ -4273,8 +4275,8 @@ fn to_date_cal(
     }
     let (d, cal) = match &(v).view() {
         ValueView::Str(s) => {
-            let p =
-                parse_iso(s).ok_or_else(|| i.make_error("RangeError", "invalid date string"))?;
+            let p = parse_iso(&s.text())
+                .ok_or_else(|| i.make_error("RangeError", "invalid date string"))?;
             if p.offset == Off::Z {
                 return Err(i.make_error("RangeError", "UTC designator not valid for PlainDate"));
             }
@@ -4611,7 +4613,8 @@ fn to_time(i: &mut Interp, v: &Value, opts: &Value) -> Result<IsoTime, Value> {
     }
     match &(v).view() {
         ValueView::Str(s) => {
-            let p = parse_iso(s)
+            let text = s.text();
+            let p = parse_iso(&text)
                 .ok_or_else(|| i.make_error("RangeError", "invalid PlainTime string"))?;
             // A PlainTime string may not carry a UTC designator.
             if p.offset == Off::Z {
@@ -4622,7 +4625,7 @@ fn to_time(i: &mut Interp, v: &Value, opts: &Value) -> Result<IsoTime, Value> {
                 .ok_or_else(|| i.make_error("RangeError", "no time in PlainTime string"))?;
             // A bare time that could also be read as a year-month or month-day needs a `T` prefix.
             if !p.designator && p.date.is_none() {
-                let core = iso_core(s);
+                let core = iso_core(&text);
                 if matches_year_month(core) || matches_month_day(core) {
                     return Err(i.make_error(
                         "RangeError",
@@ -4939,7 +4942,7 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
                 ValueView::Undefined => None,
                 _ => {
                     any = true;
-                    Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
+                    Some(i.to_string(&ev).map_err(unab)?.text().to_lowercase())
                 }
             };
             let ey = read_int(i, "eraYear", &mut any)?;
@@ -4978,7 +4981,8 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
                         ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
-                    let b = sv.as_bytes();
+                    let text = sv.text();
+                    let b = text.as_bytes();
                     let ok = (b.len() == 3 || (b.len() == 4 && b[3] == b'L'))
                         && b[0] == b'M'
                         && b[1].is_ascii_digit()
@@ -5196,7 +5200,8 @@ fn to_datetime_cal(i: &mut Interp, v: &Value, opts: &Value) -> Result<DtParts, V
     }
     match &(v).view() {
         ValueView::Str(s) => {
-            let p = parse_iso(s).ok_or_else(|| i.make_error("RangeError", "invalid datetime"))?;
+            let p = parse_iso(&s.text())
+                .ok_or_else(|| i.make_error("RangeError", "invalid datetime"))?;
             if p.offset == Off::Z {
                 return Err(
                     i.make_error("RangeError", "UTC designator not valid for PlainDateTime")
@@ -5411,7 +5416,7 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
                 ValueView::Undefined => None,
                 _ => {
                     any = true;
-                    Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
+                    Some(i.to_string(&ev).map_err(unab)?.text().to_lowercase())
                 }
             };
             let eyv = getm(i, &f, "eraYear")?;
@@ -5453,7 +5458,8 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
                         ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
-                    let b = sv.as_bytes();
+                    let text = sv.text();
+                    let b = text.as_bytes();
                     let ok = (b.len() == 3 || (b.len() == 4 && b[3] == b'L'))
                         && b[0] == b'M'
                         && b[1].is_ascii_digit()
@@ -5620,10 +5626,11 @@ fn to_yearmonth_cal(
     }
     let (d, cal) = match &(v).view() {
         ValueView::Str(s) => {
-            let ym = parse_year_month(s)
+            let text = s.text();
+            let ym = parse_year_month(&text)
                 .ok_or_else(|| i.make_error("RangeError", "invalid year-month"))?;
             let cal: std::rc::Rc<str> = std::rc::Rc::from(
-                parse_iso(s)
+                parse_iso(&text)
                     .and_then(|p| p.calendar)
                     .as_deref()
                     .and_then(canon_cal)
@@ -5632,7 +5639,7 @@ fn to_yearmonth_cal(
             to_overflow(i, opts)?;
             if &*cal != "iso8601" {
                 // The stored reference is the calendar month's first day of the full date.
-                let full = parse_iso(s).and_then(|p| p.date).unwrap_or(ym);
+                let full = parse_iso(&text).and_then(|p| p.date).unwrap_or(ym);
                 if !date_in_range(full) {
                     return Err(i.make_error("RangeError", "date outside representable range"));
                 }
@@ -5772,7 +5779,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
                 ValueView::Undefined => None,
                 _ => {
                     any = true;
-                    Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
+                    Some(i.to_string(&ev).map_err(unab)?.text().to_lowercase())
                 }
             };
             let eyv = getm(i, &f, "eraYear")?;
@@ -5814,7 +5821,8 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
                         ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
-                    let b = sv.as_bytes();
+                    let text = sv.text();
+                    let b = text.as_bytes();
                     let ok = (b.len() == 3 || (b.len() == 4 && b[3] == b'L'))
                         && b[0] == b'M'
                         && b[1].is_ascii_digit()
@@ -5922,7 +5930,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
             let ev = getm(i, &f, "era")?;
             let era = match (ev).view() {
                 ValueView::Undefined => None,
-                _ => Some(i.to_string(&ev).map_err(unab)?.to_lowercase()),
+                _ => Some(i.to_string(&ev).map_err(unab)?.text().to_lowercase()),
             };
             let eyv = getm(i, &f, "eraYear")?;
             let ey = match (eyv).view() {
@@ -6332,10 +6340,11 @@ fn to_monthday_cal(
     }
     match &(v).view() {
         ValueView::Str(s) => {
-            let md = parse_month_day(s)
+            let text = s.text();
+            let md = parse_month_day(&text)
                 .ok_or_else(|| i.make_error("RangeError", "invalid month-day"))?;
             let cal: std::rc::Rc<str> = std::rc::Rc::from(
-                parse_iso(s)
+                parse_iso(&text)
                     .and_then(|p| p.calendar)
                     .as_deref()
                     .and_then(canon_cal)
@@ -6345,7 +6354,7 @@ fn to_monthday_cal(
             if &*cal != "iso8601" {
                 // A full date string in a non-ISO calendar: its calendar month-code/day determine
                 // the canonical reference date (so the date itself must be representable).
-                let full = parse_iso(s).and_then(|p| p.date).unwrap_or(md);
+                let full = parse_iso(&text).and_then(|p| p.date).unwrap_or(md);
                 if !date_in_range(full) {
                     return Err(i.make_error("RangeError", "date outside representable range"));
                 }
@@ -6406,7 +6415,7 @@ fn to_monthday_cal(
                 let ev = getm(i, v, "era")?;
                 if !matches!((ev).view(), ValueView::Undefined) {
                     has_year = true;
-                    let e2 = i.to_string(&ev).map_err(unab)?.to_lowercase();
+                    let e2 = i.to_string(&ev).map_err(unab)?.text().to_lowercase();
                     setm(&snap, "era", Value::lstr(e2.as_str()));
                 }
                 let eyv = getm(i, v, "eraYear")?;
@@ -6438,7 +6447,8 @@ fn to_monthday_cal(
                         ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
-                    let b = sv.as_bytes();
+                    let text = sv.text();
+                    let b = text.as_bytes();
                     let ok = (b.len() == 3 || (b.len() == 4 && b[3] == b'L'))
                         && b[0] == b'M'
                         && b[1].is_ascii_digit()
@@ -6732,7 +6742,7 @@ fn parse_offset_option(i: &Interp, s: &str) -> Result<i64, Value> {
 /// ToTemporalTimeZoneIdentifier for a relativeTo bag's `timeZone` field.
 fn tz_from_field(i: &mut Interp, tzv: &Value) -> Result<std::rc::Rc<str>, Value> {
     match &(tzv).view() {
-        ValueView::Str(s) => tz_ident_of_string(i, s),
+        ValueView::Str(s) => tz_ident_of_string(i, &s.text()),
         ValueView::Obj(_) => match get(i, tzv) {
             Some(Temporal::Zoned { tz, .. }) => Ok(tz),
             _ => Err(i.make_error("TypeError", "timeZone must be a string or ZonedDateTime")),
@@ -6824,7 +6834,7 @@ fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Valu
                 let e = getm(i, &v, "era")?;
                 let e = match (e).view() {
                     ValueView::Undefined => None,
-                    _ => Some(i.to_string(&e).map_err(unab)?.to_lowercase()),
+                    _ => Some(i.to_string(&e).map_err(unab)?.text().to_lowercase()),
                 };
                 let ey = getm(i, &v, "eraYear")?;
                 let ey = match (ey).view() {
@@ -6857,13 +6867,13 @@ fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Valu
             let offset_v = getm(i, &v, "offset")?;
             let offset_ns = match &(offset_v).view() {
                 ValueView::Undefined => None,
-                ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
+                ValueView::Str(sv) => Some(parse_offset_option(i, &sv.text())?),
                 _ => {
                     let prim = i
                         .to_primitive(&offset_v, crate::eval::Hint::String)
                         .map_err(unab)?;
                     match &(prim).view() {
-                        ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
+                        ValueView::Str(sv) => Some(parse_offset_option(i, &sv.text())?),
                         _ => return Err(i.make_error("TypeError", "offset must be a string")),
                     }
                 }
@@ -6961,7 +6971,7 @@ fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Valu
             }
         }
         ValueView::Str(sv) => {
-            let p = parse_iso(sv)
+            let p = parse_iso(&sv.text())
                 .ok_or_else(|| i.make_error("RangeError", "invalid relativeTo string"))?;
             let date = p
                 .date
@@ -8373,7 +8383,7 @@ fn to_duration(i: &mut Interp, v: &Value) -> Result<IsoDuration, Value> {
     }
     match &(v).view() {
         ValueView::Str(s) => {
-            let d = parse_duration_str(s)
+            let d = parse_duration_str(&s.text())
                 .ok_or_else(|| i.make_error("RangeError", "invalid duration"))?;
             validate_duration(i, d)?;
             Ok(d)
@@ -8805,9 +8815,8 @@ fn to_instant(i: &mut Interp, v: &Value) -> Result<i128, Value> {
         }
     };
     match &(prim).view() {
-        ValueView::Str(sv) => {
-            parse_instant(sv).ok_or_else(|| i.make_error("RangeError", "invalid Instant string"))
-        }
+        ValueView::Str(sv) => parse_instant(&sv.text())
+            .ok_or_else(|| i.make_error("RangeError", "invalid Instant string")),
         _ => Err(i.make_error("TypeError", "cannot convert to Temporal.Instant")),
     }
 }
@@ -8820,6 +8829,7 @@ fn to_epoch_bigint(i: &mut Interp, v: &Value) -> Result<i128, Value> {
             .ok_or_else(|| i.make_error("RangeError", "epochNanoseconds out of range")),
         ValueView::Bool(b) => Ok(*b as i128),
         ValueView::Str(s) => s
+            .text()
             .trim()
             .parse::<i128>()
             .map_err(|_| i.make_error("SyntaxError", "cannot convert string to a BigInt")),
@@ -9175,7 +9185,7 @@ fn read_dt_bag(
         let e = getm(i, v, "era")?;
         let e = match (e).view() {
             ValueView::Undefined => None,
-            _ => Some(i.to_string(&e).map_err(unab)?.to_lowercase()),
+            _ => Some(i.to_string(&e).map_err(unab)?.text().to_lowercase()),
         };
         let ey = read_int(i, "eraYear")?;
         (e, ey)
@@ -9216,7 +9226,8 @@ fn read_dt_bag(
                     ValueView::Str(sv) => *sv,
                     _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                 };
-                let b = sv.as_bytes();
+                let text = sv.text();
+                let b = text.as_bytes();
                 let well_formed = (b.len() == 3 || (b.len() == 4 && b[3] == b'L'))
                     && b[0] == b'M'
                     && b[1].is_ascii_digit()
@@ -9235,13 +9246,13 @@ fn read_dt_bag(
         let offset_v = getm(i, v, "offset")?;
         match &(offset_v).view() {
             ValueView::Undefined => None,
-            ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
+            ValueView::Str(sv) => Some(parse_offset_option(i, &sv.text())?),
             _ => {
                 let prim = i
                     .to_primitive(&offset_v, crate::eval::Hint::String)
                     .map_err(unab)?;
                 match &(prim).view() {
-                    ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
+                    ValueView::Str(sv) => Some(parse_offset_option(i, &sv.text())?),
                     _ => return Err(i.make_error("TypeError", "offset must be a string")),
                 }
             }
@@ -9422,8 +9433,8 @@ fn to_zoned(i: &mut Interp, v: &Value, opts: &Value) -> Result<ZonedParts, Value
     }
     match &(v).view() {
         ValueView::Str(s) => {
-            let p =
-                parse_iso(s).ok_or_else(|| i.make_error("RangeError", "invalid ZonedDateTime"))?;
+            let p = parse_iso(&s.text())
+                .ok_or_else(|| i.make_error("RangeError", "invalid ZonedDateTime"))?;
             if !cal_ok(&p.calendar) {
                 return Err(i.make_error("RangeError", "unsupported calendar"));
             }
@@ -10172,7 +10183,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
                 ValueView::Undefined => None,
                 _ => {
                     any = true;
-                    Some(i.to_string(&ev).map_err(unab)?.to_lowercase())
+                    Some(i.to_string(&ev).map_err(unab)?.text().to_lowercase())
                 }
             };
             let ey = read_int(i, "eraYear", &mut any)?;
@@ -10211,7 +10222,8 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
                         ValueView::Str(sv) => *sv,
                         _ => return Err(i.make_error("TypeError", "monthCode must be a string")),
                     };
-                    let b = sv.as_bytes();
+                    let text = sv.text();
+                    let b = text.as_bytes();
                     let ok = (b.len() == 3 || (b.len() == 4 && b[3] == b'L'))
                         && b[0] == b'M'
                         && b[1].is_ascii_digit()
@@ -10229,7 +10241,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
             ValueView::Undefined => None,
             ValueView::Str(sv) => {
                 any = true;
-                Some(parse_offset_option(i, sv)?)
+                Some(parse_offset_option(i, &sv.text())?)
             }
             _ => {
                 any = true;
@@ -10237,7 +10249,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
                     .to_primitive(&offv, crate::eval::Hint::String)
                     .map_err(unab)?;
                 match &(prim).view() {
-                    ValueView::Str(sv) => Some(parse_offset_option(i, sv)?),
+                    ValueView::Str(sv) => Some(parse_offset_option(i, &sv.text())?),
                     _ => return Err(i.make_error("TypeError", "offset must be a string")),
                 }
             }
@@ -10612,7 +10624,8 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         // The constructor takes only a bare time-zone identifier (never an ISO string).
         let tz: Rc<str> = match &(tzv).view() {
             ValueView::Str(t) => {
-                let t2 = t.trim();
+                let text = t.text();
+                let t2 = text.trim();
                 if let Some(name) = crate::tz::registry_name(t2) {
                     Rc::from(name)
                 } else if is_pure_offset(t2) {
@@ -10627,7 +10640,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         // Likewise the calendar: a bare identifier only.
         let cal: std::rc::Rc<str> = match &(arg(a, 2)).view() {
             ValueView::Undefined => std::rc::Rc::from("iso8601"),
-            ValueView::Str(c) => match canon_cal(c) {
+            ValueView::Str(c) => match canon_cal(&c.text()) {
                 Some(canon) => std::rc::Rc::from(canon),
                 None => return Err(i.make_error("RangeError", "invalid calendar identifier")),
             },

@@ -2944,8 +2944,8 @@ mod tests {
     fn prepared_window_census_retains_and_deduplicates_shared_tables() {
         let source: LStr = format!("{}é😀", "x".repeat(1024)).into();
         let parent = Rc::new(crate::regex::ReText::new_rc(true, &source));
-        let a = source.slice_bytes(100, source.len());
-        let b = source.slice_bytes(200, source.len());
+        let a = source.slice_bytes(100, source.text().len());
+        let b = source.slice_bytes(200, source.text().len());
         let first = Rc::new(crate::regex::ReText::window(parent.clone(), &a, 100, 1027).unwrap());
         let second = Rc::new(crate::regex::ReText::window(parent.clone(), &b, 200, 1027).unwrap());
         let mut visitor = Visitor::default();
@@ -3072,7 +3072,7 @@ mod tests {
 
         assert!(first.engine_caches.bytes > 0);
         assert!(first.regexp_metadata.bytes > 0);
-        assert!(first.strings_symbols_bigints.bytes >= non_ascii.len() + ascii.len());
+        assert!(first.strings_symbols_bigints.bytes >= non_ascii.text().len() + ascii.text().len());
         assert_eq!(first.json(9, 12), second.json(9, 12));
     }
 

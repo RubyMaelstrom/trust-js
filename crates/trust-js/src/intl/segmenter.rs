@@ -646,9 +646,9 @@ fn boundary_records(i: &mut Interp, slots: &SegmentsSlots) -> crate::interpreter
             return bytes.clone();
         }
     }
-    let text: &str = &slots.string;
+    let text = slots.string.text();
     // jstr units: lone surrogates must round-trip (each is its own single-unit segment).
-    let units = crate::jstr::units(text);
+    let units = crate::jstr::units(&text);
     let starts = boundaries(&units, &granularity_of(&slots.segmenter));
     let mut bytes = Vec::with_capacity((starts.len() + 1) * RECORD);
     let mut push = |unit: usize, byte: usize, word_like: bool| {

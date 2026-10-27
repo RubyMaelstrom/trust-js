@@ -332,7 +332,8 @@ fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
     set_data(&result, "locale", get("#\u{0}pr_locale"));
     set_data(&result, "type", get("#\u{0}pr_type"));
     set_data(&result, "notation", get("#\u{0}pr_notation"));
-    if matches!((get("#\u{0}pr_notation")).view(), ValueView::Str(value) if &*value == "compact") {
+    if matches!((get("#\u{0}pr_notation")).view(), ValueView::Str(value) if &*value.text() == "compact")
+    {
         set_data(&result, "compactDisplay", get("#\u{0}pr_compactdisplay"));
     }
     set_data(&result, "minimumIntegerDigits", get("#\u{0}pr_minint"));

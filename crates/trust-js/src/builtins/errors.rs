@@ -39,7 +39,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         } else if name.is_empty() {
             msg
         } else {
-            crate::lstr::LStr::concat3(&name, ": ", &msg)
+            crate::lstr::LStr::concat3(&name.text(), ": ", &msg.text())
         }))
     });
     // Error.prototype.stack accessor (error-stack-accessor proposal). The frames are captured

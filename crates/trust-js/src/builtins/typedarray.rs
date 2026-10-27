@@ -1669,13 +1669,14 @@ fn ta_native(
             // ECMA-262 §23.2.3.18 and §23.1.3.18. Keep the separator as an LStr so each element
             // conversion can append directly without an intermediate Rust String.
             let mut out = String::new();
+            let sep_text = sep.text();
             for k in 0..len {
                 if k > 0 {
-                    push_str_checked(i, &mut out, &sep)?;
+                    push_str_checked(i, &mut out, &sep_text)?;
                 }
                 let v = i.ta_read(&info, k);
                 if !matches!((v).view(), ValueView::Undefined | ValueView::Null) {
-                    out.push_str(&ab(i.to_string(&v))?);
+                    out.push_str(&ab(i.to_string(&v))?.text());
                 }
                 check_string_length(i, out.len())?;
             }
@@ -2342,7 +2343,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
                 return Err(i.make_error("TypeError", "toLocaleString is not a function"));
             }
             let s = ab(i.call(tls, v, &[arg(a, 0), arg(a, 1)]))?;
-            out.push_str(&ab(i.to_string(&s))?);
+            out.push_str(&ab(i.to_string(&s))?.text());
             check_string_length(i, out.len())?;
         }
         Ok(Value::lstr(out))
@@ -2683,8 +2684,8 @@ fn b64_option_url(i: &mut Interp, opts: &Value) -> Result<bool, Value> {
         let a = ab(i.get_member_key(opts, "alphabet"))?;
         match (a).view() {
             ValueView::Undefined => Ok(false),
-            ValueView::Str(s) if &*s == "base64" => Ok(false),
-            ValueView::Str(s) if &*s == "base64url" => Ok(true),
+            ValueView::Str(s) if &*s.text() == "base64" => Ok(false),
+            ValueView::Str(s) if &*s.text() == "base64url" => Ok(true),
             _ => Err(i.make_error("TypeError", "alphabet must be 'base64' or 'base64url'")),
         }
     } else if matches!(&(opts).view(), ValueView::Undefined) {
@@ -2700,7 +2701,11 @@ fn b64_decode_options(i: &mut Interp, opts: &Value) -> Result<(bool, Rc<str>), V
     let handling = if let ValueView::Obj(_) = &(opts).view() {
         match (ab(i.get_member_key(opts, "lastChunkHandling"))?).view() {
             ValueView::Undefined => crate::lstr::LStr::from("loose"),
-            ValueView::Str(s) if matches!(&*s, "loose" | "strict" | "stop-before-partial") => s,
+            ValueView::Str(s)
+                if matches!(&*s.text(), "loose" | "strict" | "stop-before-partial") =>
+            {
+                s
+            }
             _ => {
                 return Err(i.make_error(
                     "TypeError",
@@ -2755,7 +2760,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             ValueView::Str(s) => s,
             _ => return Err(i.make_error("TypeError", "fromHex requires a string")),
         };
-        let (_, bytes, err) = hex_decode_spec(&s, usize::MAX);
+        let (_, bytes, err) = hex_decode_spec(&s.text(), usize::MAX);
         if err {
             return Err(i.make_error("SyntaxError", "invalid hex string"));
         }
@@ -2767,7 +2772,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             _ => return Err(i.make_error("TypeError", "fromBase64 requires a string")),
         };
         let (url, handling) = b64_decode_options(i, &arg(a, 1))?;
-        let (_, bytes, err) = b64_decode_spec(&s, url, &handling, usize::MAX);
+        let (_, bytes, err) = b64_decode_spec(&s.text(), url, &handling, usize::MAX);
         if err {
             return Err(i.make_error("SyntaxError", "invalid base64 string"));
         }
@@ -2783,7 +2788,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             .ta_len(&info)
             .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
         // Valid chunks decoded before an error are still written, then the SyntaxError surfaces.
-        let (read, bytes, err) = hex_decode_spec(&s, max);
+        let (read, bytes, err) = hex_decode_spec(&s.text(), max);
         let result = u8_set_bytes(i, &info, read, &bytes)?;
         if err {
             return Err(i.make_error("SyntaxError", "invalid hex string"));
@@ -2801,7 +2806,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             .ta_len(&info)
             .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
         // Valid chunks decoded before an error are still written, then the SyntaxError surfaces.
-        let (read, bytes, err) = b64_decode_spec(&s, url, &handling, max);
+        let (read, bytes, err) = b64_decode_spec(&s.text(), url, &handling, max);
         let result = u8_set_bytes(i, &info, read, &bytes)?;
         if err {
             return Err(i.make_error("SyntaxError", "invalid base64 string"));

@@ -286,7 +286,7 @@ fn valid_type(s: &str) -> bool {
 fn read_duration(i: &mut Interp, v: &Value) -> Result<[f64; 10], Value> {
     // A string is parsed as an ISO 8601 duration; a bad string is a RangeError, not a TypeError.
     if let ValueView::Str(s) = &(v).view() {
-        return parse_iso_duration(s)
+        return parse_iso_duration(&s.text())
             .ok_or_else(|| i.make_error("RangeError", "invalid ISO 8601 duration string"));
     }
     if !matches!(&(v).view(), ValueView::Obj(_)) {

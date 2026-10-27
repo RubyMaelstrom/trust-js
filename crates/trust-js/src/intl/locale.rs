@@ -87,7 +87,7 @@ pub(crate) fn install(it: &mut Interp, ns: &Gc) {
         let present = o.borrow().internal_slots().contains("#\u{0}locale_kn");
         let is_false = matches!(
             (o.borrow().internal_slots().get("#\u{0}locale_kn").map(|p| p.value())).map(|__value| (__value).view()),
-            Some(ValueView::Str(s)) if &*s == "false"
+            Some(ValueView::Str(s)) if &*s.text() == "false"
         );
         Ok(Value::Bool(present && !is_false))
     });

@@ -77,12 +77,13 @@ fn string_list(i: &mut Interp, list: &Value) -> Result<Vec<String>, Value> {
         match ab(i.iterator_step(&iter, &next))?.map(|value| value.view()) {
             None => break,
             Some(ValueView::Str(s)) => {
-                total = total.saturating_add(s.len());
+                let text = s.text();
+                total = total.saturating_add(text.len());
                 if let Err(err) = crate::builtins::check_string_length(i, total) {
                     i.iterator_close(&iter);
                     return Err(err);
                 }
-                out.push(s.to_string())
+                out.push(text.into_owned())
             }
             Some(_) => {
                 let err =

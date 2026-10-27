@@ -508,7 +508,8 @@ pub(crate) struct Frame {
 impl Frame {
     fn write(&self, out: &mut String) {
         out.push_str("\n    at ");
-        let name = self.name.as_deref().filter(|name| !name.is_empty());
+        let name_text = self.name.as_ref().map(LStr::text);
+        let name = name_text.as_deref().filter(|name| !name.is_empty());
         let Some(source) = self.source.as_deref() else {
             out.push_str(name.unwrap_or(ANONYMOUS));
             if name.is_some() {

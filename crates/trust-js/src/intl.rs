@@ -164,13 +164,14 @@ fn process_locale_item(i: &mut Interp, item: &Value, seen: &mut Vec<String>) -> 
         }
         ValueView::Str(_) | ValueView::Obj(_) => {
             let s = ab(i.to_string(item))?;
-            if !is_structurally_valid_tag(&s) {
+            let text = s.text();
+            if !is_structurally_valid_tag(&text) {
                 return Err(i.make_error(
                     "RangeError",
                     format!("Incorrect locale information provided: {s}"),
                 ));
             }
-            match canonicalize_language_tag(&s) {
+            match canonicalize_language_tag(&text) {
                 Some(c) => c,
                 None => {
                     return Err(i.make_error(
@@ -190,9 +191,10 @@ fn process_locale_item(i: &mut Interp, item: &Value, seen: &mut Vec<String>) -> 
 
 fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
     let k = ab(i.to_string(key))?;
+    let text = k.text();
     // The `timeZone` list is every canonical IANA zone; the others are static. SupportedValuesOf must
     // return a sorted array with no duplicates.
-    if &*k == "timeZone" {
+    if &*text == "timeZone" {
         // Etc/GMT and Etc/UTC canonicalize to "UTC" and must not appear themselves.
         let mut zs: Vec<&str> = crate::tz::canonical_zone_names();
         zs.retain(|z| *z != "Etc/GMT" && *z != "Etc/UTC");
@@ -203,7 +205,7 @@ fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
         zs.dedup();
         return Ok(i.make_array(zs.iter().map(|s| Value::lstr(*s)).collect()));
     }
-    if &*k == "numberingSystem" {
+    if &*text == "numberingSystem" {
         // Every numeric system with a simple digit mapping, plus latn.
         let mut ns: Vec<&str> = crate::numbering::NUMBERING
             .iter()
@@ -213,7 +215,7 @@ fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
         ns.sort_unstable();
         return Ok(i.make_array(ns.iter().map(|s| Value::lstr(*s)).collect()));
     }
-    if &*k == "currency" {
+    if &*text == "currency" {
         // ECMA-402 AvailableCurrencies contains every canonical ISO 4217 code for which both
         // NumberFormat and DisplayNames provide functionality. The generated CLDR table is sorted.
         let currencies = crate::cldr_numbers::currency_codes()
@@ -221,7 +223,7 @@ fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
             .collect();
         return Ok(i.make_array(currencies));
     }
-    let vals: &[&str] = match &*k {
+    let vals: &[&str] = match &*text {
         // "islamic" and "islamic-rgsa" resolve to islamic-civil, so they are not fixed points
         // of DateTimeFormat and are excluded (the era/monthCode proposal's required set).
         "calendar" => &[

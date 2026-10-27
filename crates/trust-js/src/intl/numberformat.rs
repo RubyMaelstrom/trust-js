@@ -927,9 +927,9 @@ fn group_integer(
     minimum_grouping: usize,
 ) -> String {
     let enabled = !matches!(&(grouping).view(), ValueView::Bool(false));
-    let min2 = matches!(&(grouping).view(), ValueView::Str(s) if &**s == "min2")
+    let min2 = matches!(&(grouping).view(), ValueView::Str(s) if &*s.text() == "min2")
         || (minimum_grouping >= 2
-            && matches!(&(grouping).view(), ValueView::Str(s) if &**s == "auto"));
+            && matches!(&(grouping).view(), ValueView::Str(s) if &*s.text() == "auto"));
     let (primary, secondary) = sizes;
     if !enabled || int_part.len() <= primary || (min2 && int_part.len() <= primary + 1) {
         return int_part.to_string();
@@ -1075,7 +1075,7 @@ pub(crate) fn to_intl_mv(i: &mut Interp, value: &Value) -> Result<IntlMv, Value>
                 b.is_negative(),
             )))
         }
-        ValueView::Str(s) => Ok(string_intl_mv(&s)),
+        ValueView::Str(s) => Ok(string_intl_mv(&s.text())),
         _ => {
             let x = ab(i.to_number(&primitive))?;
             if x == 0.0 && x.is_sign_negative() {
@@ -2307,7 +2307,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     );
     put(i, &res, "notation", "#\u{0}nf_notation");
     // compactDisplay only appears when notation is compact.
-    if matches!((o.borrow().internal_slots().get("#\u{0}nf_notation").map(|p| p.value())).map(|__value| (__value).view()), Some(ValueView::Str(s)) if &*s == "compact")
+    if matches!((o.borrow().internal_slots().get("#\u{0}nf_notation").map(|p| p.value())).map(|__value| (__value).view()), Some(ValueView::Str(s)) if &*s.text() == "compact")
     {
         put(i, &res, "compactDisplay", "#\u{0}nf_compactdisplay");
     }

@@ -22,7 +22,7 @@ fn ds_brand(i: &mut Interp, this: &Value, async_kind: bool) -> Result<Gc, Value>
         .get("#\u{0}ds_kind")
         .map(|p| p.value());
     match (kind).map(|__value| (__value).view()) {
-        Some(ValueView::Str(k)) if &*k == want => Ok(o),
+        Some(ValueView::Str(k)) if &*k.text() == want => Ok(o),
         _ => Err(i.make_error("TypeError", format!("receiver is not a {name}"))),
     }
 }

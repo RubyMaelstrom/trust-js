@@ -36,7 +36,7 @@ pub(super) fn install_globals(it: &mut Interp) {
                 }
             }
         };
-        Ok(Value::Num(parse_int(&s, radix)))
+        Ok(Value::Num(parse_int(&s.text(), radix)))
     });
     global_fn(it, "parseFloat", 1, |i, _t, a| {
         let s = {
@@ -49,7 +49,7 @@ pub(super) fn install_globals(it: &mut Interp) {
                 }
             }
         };
-        Ok(Value::Num(parse_float(&s)))
+        Ok(Value::Num(parse_float(&s.text())))
     });
     // Number.parseInt / Number.parseFloat are the same functions as the globals.
     if let Some(num) = it.global.borrow().props.get("Number").map(|p| p.value()) {
@@ -87,7 +87,7 @@ pub(super) fn install_globals(it: &mut Interp) {
     global_fn(it, "escape", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
         let mut out = String::new();
-        for c in crate::jstr::units(&s) {
+        for c in crate::jstr::units(&s.text()) {
             let ch = c as u32;
             let keep = c < 128 && {
                 let a = ch as u8 as char;
@@ -109,7 +109,7 @@ pub(super) fn install_globals(it: &mut Interp) {
         // `%uXXXX`; all other units pass through unchanged. Indexing the one unit snapshot keeps
         // lookahead allocation-free and, unlike `char` casts, preserves astral pairs and lone
         // surrogates exactly.
-        let input = crate::jstr::units(&s);
+        let input = crate::jstr::units(&s.text());
         let mut units: Vec<u16> = Vec::with_capacity(input.len());
         let mut k = 0;
         while k < input.len() {
@@ -136,26 +136,26 @@ pub(super) fn install_globals(it: &mut Interp) {
     });
     global_fn(it, "encodeURIComponent", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
-        uri_encode(&s, "")
+        uri_encode(&s.text(), "")
             .map(Value::lstr)
             .ok_or_else(|| i.make_error("URIError", "URI malformed"))
     });
     global_fn(it, "encodeURI", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
-        uri_encode(&s, ";,/?:@&=+$#")
+        uri_encode(&s.text(), ";,/?:@&=+$#")
             .map(Value::lstr)
             .ok_or_else(|| i.make_error("URIError", "URI malformed"))
     });
     global_fn(it, "decodeURIComponent", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
-        uri_decode(&s, "")
+        uri_decode(&s.text(), "")
             .map(Value::lstr)
             .ok_or_else(|| i.make_error("URIError", "URI malformed"))
     });
     // decodeURI leaves escapes of the reservedSet (and '#') untouched.
     global_fn(it, "decodeURI", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
-        uri_decode(&s, ";/?:@&=+$,#")
+        uri_decode(&s.text(), ";/?:@&=+$,#")
             .map(Value::lstr)
             .ok_or_else(|| i.make_error("URIError", "URI malformed"))
     });
@@ -174,7 +174,7 @@ pub(super) fn install_globals(it: &mut Interp) {
             }
         };
         let env = i.global_env;
-        ab(i.perform_eval(&code, &env, false))
+        ab(i.perform_eval(&code.text(), &env, false))
     });
     set_builtin(&it.global, "eval", Value::Obj(eval_fn));
     it.eval_fn = Some(eval_fn);

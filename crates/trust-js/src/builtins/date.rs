@@ -938,7 +938,7 @@ fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> 
                         match prim.view() {
                             // #sec-date-constructor step 4.b.ii: parse exactly as
                             // Date.parse does, then TimeClip.
-                            ValueView::Str(s) => time_clip(parse_date_string(&s)),
+                            ValueView::Str(s) => time_clip(parse_date_string(&s.text())),
                             _ => time_clip(ab(i.to_number(&prim))?),
                         }
                     }
@@ -1233,7 +1233,7 @@ pub(super) fn install_date(it: &mut Interp) {
     it.def_method(&ctor, "now", 0, |i, _t, _a| Ok(Value::Num(now_ms(i))));
     it.def_method(&ctor, "parse", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
-        Ok(Value::Num(parse_date_string(&s)))
+        Ok(Value::Num(parse_date_string(&s.text())))
     });
     it.def_method(&ctor, "UTC", 7, |i, _t, a| {
         // The year is always read; later components only if supplied. Coerce all reads first; any

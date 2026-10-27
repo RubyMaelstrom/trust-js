@@ -45,7 +45,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         };
         let rg = ab(i.get_internal_slot(&this, "#\u{0}realm_global"))?;
         if let ValueView::Obj(_) = &(rg).view() {
-            return match i.eval_script_in_realm(&rg, &code) {
+            return match i.eval_script_in_realm(&rg, &code.text()) {
                 Ok(value) => Ok(value),
                 Err(Abrupt::Throw(value)) => Err(value),
                 Err(Abrupt::Interrupt(reason)) => {
@@ -55,7 +55,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
             };
         }
         let (body, source) = crate::parser::parse_script_from(
-            &code,
+            &code.text(),
             false,
             crate::stack_trace::SourceKind::Script,
             None,

@@ -1147,7 +1147,7 @@ impl Interp {
                 let mut p = p.clone();
                 if Interp::is_sym_key(k) {
                     if let ValueView::Str(tag) = (p.value()).view() {
-                        if &*tag == "Module" {
+                        if &*tag.text() == "Module" {
                             p.set_value(Value::lstr("Deferred Module".to_string()));
                         }
                     }
@@ -1210,7 +1210,7 @@ impl Interp {
                                     let mut p = p.clone();
                                     if Interp::is_sym_key(k) {
                                         if let ValueView::Str(tag) = (p.value()).view() {
-                                            if &*tag == "Module" {
+                                            if &*tag.text() == "Module" {
                                                 p.set_value(Value::lstr(
                                                     "Deferred Module".to_string(),
                                                 ));
