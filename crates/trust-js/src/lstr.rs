@@ -332,6 +332,43 @@ impl LStr {
         }
     }
 
+    /// The content as engine text: UTF-8 with lone surrogates smuggled as plane-16 scalars (see
+    /// [`crate::jstr`]). Borrowed, since the cell stores engine text.
+    #[inline]
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(self.as_str())
+    }
+
+    /// The content as `&str`, without copying, when it is known ASCII: then engine text, Latin-1
+    /// and UTF-16 code units agree, byte for unit. `None` for other strings, and for ASCII
+    /// content not known to be ASCII.
+    #[inline]
+    pub fn as_ascii(&self) -> Option<&str> {
+        self.known_ascii().then(|| self.as_str())
+    }
+
+    /// The length in UTF-16 code units (ECMAScript's `length`).
+    #[inline]
+    pub fn unit_len(&self) -> usize {
+        if self.known_ascii() {
+            self.raw_len()
+        } else {
+            crate::jstr::unit_len(self.as_str())
+        }
+    }
+
+    /// Whether the string is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.hdr().len.get() == 0
+    }
+
+    /// The stored length, in bytes of engine text.
+    #[inline]
+    fn raw_len(&self) -> usize {
+        self.hdr().len.get() as usize
+    }
+
     /// The flat buffer this string reads: a view's owner, else itself. An in-place append keeps
     /// it (the result is a new view of the same buffer).
     #[cfg(test)]
