@@ -20,7 +20,7 @@ fn trace_function_to_string(value: &Value) {
     let name = match (object.props.get("name").map(|property| property.value()))
         .map(|__value| (__value).view())
     {
-        Some(ValueView::Str(name)) => name.chars().take(80).collect::<String>(),
+        Some(ValueView::Str(name)) => name.text().chars().take(80).collect::<String>(),
         _ => String::new(),
     };
     let source = match &object.call {
@@ -140,13 +140,14 @@ pub(super) fn install_function_proto(it: &mut Interp) {
                     && t.chars()
                         .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
             };
-            let renderable = is_ident(&name)
-                || (name.starts_with('[') && name.ends_with(']'))
-                || name
+            let name_text = name.text();
+            let renderable = is_ident(&name_text)
+                || (name_text.starts_with('[') && name_text.ends_with(']'))
+                || name_text
                     .strip_prefix("get ")
-                    .or_else(|| name.strip_prefix("set "))
+                    .or_else(|| name_text.strip_prefix("set "))
                     .is_some_and(is_ident);
-            let name = if renderable { name.as_str() } else { "" };
+            let name = if renderable { &*name_text } else { "" };
             return Ok(Value::Str(crate::lstr::LStr::concat3(
                 "function ",
                 name,

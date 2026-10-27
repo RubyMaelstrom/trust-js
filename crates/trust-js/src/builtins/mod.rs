@@ -655,7 +655,7 @@ pub(crate) fn proxy_enum_string_keys(
     let mut out = crate::rooting::RootedVec::new();
     for k in keys {
         if let ValueView::Str(ks) = &(k).view() {
-            if proxy_key_enumerable(i, &target, &handler, &crate::value::encode_string_key(ks))? {
+            if proxy_key_enumerable(i, &target, &handler, &crate::value::encode_lstr_key(ks))? {
                 out.push(k);
             }
         }
@@ -1415,8 +1415,8 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
     if let Some((t, h)) = proxy_pair(i, o) {
         for k in proxy_own_keys(i, &t, &h)? {
             if let ValueView::Str(ks) = &(k).view() {
-                if proxy_key_enumerable(i, &t, &h, &crate::value::encode_string_key(ks))? {
-                    let v = ab(i.get_member_key(o, &crate::value::encode_string_key(ks)))?;
+                if proxy_key_enumerable(i, &t, &h, &crate::value::encode_lstr_key(ks))? {
+                    let v = ab(i.get_member_key(o, &crate::value::encode_lstr_key(ks)))?;
                     out.push(if entries {
                         i.make_array(vec![Value::Str(*ks), v])
                     } else {
@@ -3967,7 +3967,7 @@ fn promise_keyed_combinator(
                     let ValueView::Str(ks) = &(k).view() else {
                         continue;
                     };
-                    let key = crate::value::encode_string_key(ks);
+                    let key = crate::value::encode_lstr_key(ks);
                     if proxy_get_own_property(i, &target, &handler, &key)?
                         .is_some_and(|desc| desc.enumerable())
                     {
@@ -4073,7 +4073,7 @@ fn promise_keyed_result(i: &mut Interp, state: &Value) -> Result<Value, Value> {
         let kv = ab(i.get_member_key(&keys, &k.to_string()))?;
         let key = ab(i.to_string(&kv))?;
         let v = ab(i.get_member_key(&values, &k.to_string()))?;
-        set_data(&out, &key, v);
+        set_data(&out, &key.text(), v);
     }
     Ok(Value::Obj(out))
 }
@@ -4323,7 +4323,7 @@ fn install_object(it: &mut Interp) {
             return has_own_property_trapped(
                 i,
                 &Value::Obj(o),
-                &crate::value::encode_string_key(key),
+                &crate::value::encode_lstr_key(key),
             )
             .map(Value::Bool);
         }
@@ -4496,7 +4496,7 @@ fn install_object(it: &mut Interp) {
             Some(key) => match (ab(i.get_member_key(&this, &key))?).view() {
                 ValueView::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
                     "[object ",
-                    s.as_str(),
+                    &s.text(),
                     "]",
                 ))),
                 _ => Ok(Value::Str(crate::lstr::LStr::concat3(
@@ -6514,12 +6514,12 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let mut out = String::new();
         for k in 0..len {
             if k > 0 {
-                push_str_checked(i, &mut out, &sep)?;
+                push_str_checked(i, &mut out, &sep.text())?;
             }
             let v = array_get_index(i, &o, &ov, k)?;
             if !matches!((v).view(), ValueView::Undefined | ValueView::Null) {
                 let piece = ab(i.to_string(&v))?;
-                push_str_checked(i, &mut out, &piece)?;
+                push_str_checked(i, &mut out, &piece.text())?;
             }
         }
         Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
@@ -6652,7 +6652,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 Some(key) => match (ab(i.get_member_key(&ov, &key))?).view() {
                     ValueView::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
                         "[object ",
-                        s.as_str(),
+                        &s.text(),
                         "]",
                     ))),
                     _ => Ok(Value::Str(crate::lstr::LStr::concat3(
@@ -6683,7 +6683,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 }
                 let s = ab(i.call(tls, el, &[arg(args, 0), arg(args, 1)]))?;
                 let piece = ab(i.to_string(&s))?;
-                push_str_checked(i, &mut out, &piece)?;
+                push_str_checked(i, &mut out, &piece.text())?;
             }
         }
         Ok(Value::lstr(out))
@@ -7735,7 +7735,7 @@ fn compare_sort_keys(a: &Option<LStr>, b: &Option<LStr>) -> Ordering {
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
         // IsLessThan orders Strings by UTF-16 code units, not by code points.
-        (Some(a), Some(b)) => crate::jstr::cmp_units(a, b),
+        (Some(a), Some(b)) => crate::jstr::cmp_units(&a.text(), &b.text()),
     }
 }
 
@@ -7768,7 +7768,7 @@ fn compare_values(
     } else {
         let sa = ab(i.to_string(a))?;
         let sb = ab(i.to_string(b))?;
-        Ok(crate::jstr::cmp_units(&sa, &sb))
+        Ok(crate::jstr::cmp_units(&sa.text(), &sb.text()))
     }
 }
 
@@ -8357,7 +8357,7 @@ fn regexp_string_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Res
         if m0.is_empty() {
             let li_v = ab(i.get_member_key(&r, "lastIndex"))?;
             let li = to_length_val(i, &li_v)?;
-            let next = advance_string_index(li, &s, unicode);
+            let next = advance_string_index(li, &s.text(), unicode);
             ab(i.set_member_key(&r, "lastIndex", Value::Num(next as f64)))?;
         }
     } else {
@@ -9186,10 +9186,10 @@ fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Valu
         };
         let appended = if first {
             first = false;
-            push_str_checked(i, &mut result, &piece)
+            push_str_checked(i, &mut result, &piece.text())
         } else {
             push_str_checked(i, &mut result, &separator)
-                .and_then(|()| push_str_checked(i, &mut result, &piece))
+                .and_then(|()| push_str_checked(i, &mut result, &piece.text()))
         };
         if let Err(error) = appended {
             i.iterator_close(&this);
@@ -10038,7 +10038,7 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
     let f = ab(i.get_internal_slot(&this, "#\u{0}ih_fn"))?;
     let count_v = ab(i.get_internal_slot(&this, "#\u{0}ih_count"))?;
     let count = ab(i.to_number(&count_v))?;
-    match &*kind {
+    match &*kind.text() {
         "map" => match step_iter_with(i, &src, &inext)? {
             None => Ok(iter_result(i, Value::Undefined, true)),
             Some(v) => {
@@ -10337,14 +10337,15 @@ fn string_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value>
     // code-point semantics while avoiding UTF-8 char decoding and a fresh allocation for each
     // result; the shared single-unit strings are immutable and therefore valid String values.
     if s.ascii_hint() {
-        let Some(&unit) = s.as_str().as_bytes().get(idx) else {
+        let Some(&unit) = s.text().as_bytes().get(idx) else {
             state.string = None;
             return Ok(None);
         };
         state.index = idx + 1;
         return Ok(Some(Value::Str(crate::jstr::unit_lstr(unit as u16))));
     }
-    let mut rest = s[idx.min(s.len())..].chars();
+    let text = s.text();
+    let mut rest = text[idx.min(text.len())..].chars();
     let Some(ch) = rest.next() else {
         // Exhausted: clear the string so the iterator stays done.
         state.string = None;
@@ -10595,7 +10596,7 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
                     n.min(9007199254740991.0) as usize
                 }
             }
-            ValueView::Str(s) => crate::jstr::unit_len(s),
+            ValueView::Str(s) => s.unit_len(),
             _ => 0,
         }
     };
@@ -11019,7 +11020,7 @@ fn create_html(
     let mut p = format!("<{tag}");
     if !attr.is_empty() {
         let v = ab(i.to_string(value))?;
-        p.push_str(&format!(" {attr}=\"{}\"", v.replace('"', "&quot;")));
+        p.push_str(&format!(" {attr}=\"{}\"", v.text().replace('"', "&quot;")));
     }
     Ok(Value::lstr(format!("{p}>{s}</{tag}>")))
 }
@@ -11060,19 +11061,20 @@ pub(crate) fn nf_string_replace(
     let source_ascii = s.ascii_hint();
     // Views may clear the hint for ASCII bytes. Only an actual non-ASCII pattern proves that
     // the ASCII receiver cannot contain it.
-    let pattern_ascii = pat.ascii_hint() || (source_ascii && pat.is_ascii());
+    let pattern_ascii = pat.ascii_hint() || (source_ascii && pat.text().is_ascii());
     if source_ascii && pattern_ascii {
-        let Some(pos) = s.as_str().find(pat.as_ref()) else {
+        let (text, pattern) = (s.text(), pat.text());
+        let Some(pos) = text.find(&*pattern) else {
             return Ok(Value::Str(s));
         };
-        let matched = &s[pos..pos + pat.len()];
+        let matched = &text[pos..pos + pattern.len()];
         let rep = string_replacement(i, &repl, matched, &s, pos)?;
-        check_string_length(i, s.len() - pat.len() + rep.len())?;
+        check_string_length(i, text.len() - pattern.len() + rep.len())?;
         return Ok(Value::lstr(format!(
             "{}{}{}",
-            &s[..pos],
+            &text[..pos],
             rep,
-            &s[pos + pat.len()..]
+            &text[pos + pattern.len()..]
         )));
     }
     // A pure-ASCII receiver cannot contain a non-ASCII search string. This check avoids
@@ -11235,13 +11237,14 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                     // Bytes are already code units. The exact iterator length reserves the
                     // complete result once, including when `limit` requests the whole string.
                     // An ASCII owner proves the same for a view without scanning its bytes.
-                    s.as_bytes()
+                    s.text()
+                        .as_bytes()
                         .iter()
                         .take(limit)
                         .map(|&byte| Value::Str(crate::jstr::unit_lstr(byte as u16)))
                         .collect()
                 } else {
-                    crate::jstr::unit_iter(&s)
+                    crate::jstr::unit_iter(&s.text())
                         .take(limit)
                         .map(|u| Value::Str(crate::jstr::unit_lstr(u)))
                         .collect()
@@ -11251,7 +11254,11 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 // substring as an LStr directly instead of allocating a Rust String before the
                 // engine copies it; `.take(limit)` preserves Split's post-processing truncation
                 // (unlike `splitn`, whose final remainder would be incorrect here).
-                s.split(sep.as_ref()).take(limit).map(Value::lstr).collect()
+                s.text()
+                    .split(sep.as_ref())
+                    .take(limit)
+                    .map(Value::lstr)
+                    .collect()
             } else {
                 // String separators are matched by UTF-16 code units (ECMA-262 §22.1.3.23),
                 // not Rust scalar values. This matters when a separator is one half of an astral
@@ -11259,7 +11266,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 // in the second result. Convert once, search the unit sequence, and rebuild each
                 // piece independently so a separator boundary cannot accidentally recombine the
                 // pair across pieces.
-                let units = crate::jstr::units(&s);
+                let units = crate::jstr::units(&s.text());
                 let sep_units = crate::jstr::units(sep.as_ref());
                 let mut parts = Vec::new();
                 let mut start = 0usize;
@@ -11348,8 +11355,9 @@ fn install_string(it: &mut Interp) {
         let needle = ab(i.to_string(&arg(args, 0)))?;
         if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
             // Byte index == unit index; a non-ASCII needle simply can't occur.
-            let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?.min(s.len());
-            let r = s[pos..].find(&*needle).map(|k| (pos + k) as f64);
+            let text = s.text();
+            let pos = str_clamp_pos(i, args.get(1), text.len() as i64)?.min(text.len());
+            let r = text[pos..].find(&*needle.text()).map(|k| (pos + k) as f64);
             return Ok(Value::Num(r.unwrap_or(-1.0)));
         }
         let chars = i.units_full(&s);
@@ -11383,7 +11391,8 @@ fn install_string(it: &mut Interp) {
                     }
                 }
             };
-            let Some(max_start) = s.len().checked_sub(needle.len()) else {
+            let (text, needle_text) = (s.text(), needle.text());
+            let Some(max_start) = text.len().checked_sub(needle_text.len()) else {
                 return Ok(Value::Num(-1.0));
             };
             let start = match number_position {
@@ -11392,8 +11401,8 @@ fn install_string(it: &mut Interp) {
                 Some(p) => p.trunc().clamp(0.0, max_start as f64) as usize,
             };
             // `start <= max_start` proves this slice endpoint is in bounds.
-            let end = start + needle.len();
-            let result = s[..end].rfind(needle.as_str());
+            let end = start + needle_text.len();
+            let result = text[..end].rfind(&*needle_text);
             return Ok(Value::Num(result.map(|n| n as f64).unwrap_or(-1.0)));
         }
         // Optional `position`: search for the last occurrence starting at or before it.
@@ -11429,12 +11438,12 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "toLocaleLowerCase", 0, |i, this, args| {
         let s = this_string(i, &this)?;
         let lang = locale_case_lang(i, &arg(args, 0))?;
-        Ok(Value::lstr(locale_lower(&s, lang.as_deref())))
+        Ok(Value::lstr(locale_lower(&s.text(), lang.as_deref())))
     });
     it.def_method(&sp, "toLocaleUpperCase", 0, |i, this, args| {
         let s = this_string(i, &this)?;
         let lang = locale_case_lang(i, &arg(args, 0))?;
-        Ok(Value::lstr(locale_upper(&s, lang.as_deref())))
+        Ok(Value::lstr(locale_upper(&s.text(), lang.as_deref())))
     });
     it.def_method(&sp, "normalize", 0, |i, this, args| {
         let s = this_string(i, &this)?;
@@ -11454,7 +11463,7 @@ fn install_string(it: &mut Interp) {
                 "The normalization form should be one of NFC, NFD, NFKC, NFKD",
             ));
         }
-        let cps = crate::jstr::code_points(&s);
+        let cps = crate::jstr::code_points(&s.text());
         let out = crate::unicode_norm_impl::normalize(&cps, &form);
         Ok(Value::lstr(crate::jstr::from_code_points(&out)))
     });
@@ -11467,8 +11476,9 @@ fn install_string(it: &mut Interp) {
         if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
             && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
         {
-            let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
-            return Ok(Value::Bool(s[pos..].contains(needle.as_str())));
+            let text = s.text();
+            let pos = str_clamp_pos(i, args.get(1), text.len() as i64)?;
+            return Ok(Value::Bool(text[pos..].contains(&*needle.text())));
         }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
@@ -11487,8 +11497,9 @@ fn install_string(it: &mut Interp) {
         if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
             && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
         {
-            let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
-            return Ok(Value::Bool(s[pos..].starts_with(needle.as_str())));
+            let text = s.text();
+            let pos = str_clamp_pos(i, args.get(1), text.len() as i64)?;
+            return Ok(Value::Bool(text[pos..].starts_with(&*needle.text())));
         }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
@@ -11507,14 +11518,15 @@ fn install_string(it: &mut Interp) {
         if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
             && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
         {
+            let (text, needle_text) = (s.text(), needle.text());
             let end = match args.get(1) {
                 Some(v) if !matches!((v).view(), ValueView::Undefined) => {
-                    str_clamp_pos(i, Some(v), s.len() as i64)?
+                    str_clamp_pos(i, Some(v), text.len() as i64)?
                 }
-                _ => s.len(),
+                _ => text.len(),
             };
             return Ok(Value::Bool(
-                end >= needle.len() && s[..end].ends_with(needle.as_str()),
+                end >= needle_text.len() && text[..end].ends_with(&*needle_text),
             ));
         }
         let chars = i.units_full(&s);
@@ -11537,7 +11549,7 @@ fn install_string(it: &mut Interp) {
         if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii) {
             // String.prototype.substring clamps and swaps UTF-16 indices (ECMA-262 §22.1.3.25).
             // ASCII byte offsets are the same code-unit indices, so keep the common path flat.
-            let len = s.len() as i64;
+            let len = s.text().len() as i64;
             let mut a = (arg_to_number(i, args, 0)? as i64).clamp(0, len);
             let mut b = {
                 let end = arg(args, 1);
@@ -11574,7 +11586,7 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "substr", 2, |i, this, args| {
         let s = this_string(i, &this)?;
         if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii) {
-            let size = s.len() as i64;
+            let size = s.text().len() as i64;
             let n = arg_to_number(i, args, 0)?.trunc();
             let mut start = if n.is_nan() {
                 0
@@ -11693,36 +11705,37 @@ fn install_string(it: &mut Interp) {
         // one-to-many or context-sensitive mappings, so return unchanged strings by reference
         // and map changed strings directly into one LStr allocation.
         if s.ascii_hint() {
-            if !s.bytes().any(|byte| byte.is_ascii_lowercase()) {
+            if !s.text().bytes().any(|byte| byte.is_ascii_lowercase()) {
                 return Ok(Value::Str(s));
             }
             return Ok(Value::Str(crate::lstr::LStr::map_ascii_case(&s, true)));
         }
-        Ok(Value::lstr(s.to_uppercase()))
+        Ok(Value::lstr(s.text().to_uppercase()))
     });
     it.def_method(&sp, "toLowerCase", 0, |i, this, _| {
         let s = this_string(i, &this)?;
         // ECMA-262 §22.1.3.28 uses the same Unicode mapping with lowercase output. The ASCII
         // fast path is exact and avoids both a Unicode iterator and a temporary Rust String.
         if s.ascii_hint() {
-            if !s.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            if !s.text().bytes().any(|byte| byte.is_ascii_uppercase()) {
                 return Ok(Value::Str(s));
             }
             return Ok(Value::Str(crate::lstr::LStr::map_ascii_case(&s, false)));
         }
-        Ok(Value::lstr(s.to_lowercase()))
+        Ok(Value::lstr(s.text().to_lowercase()))
     });
     // TRust JS strings are valid UTF-8, so they're always well-formed.
     it.def_method(&sp, "isWellFormed", 0, |i, this, _| {
         let s = this_string(i, &this)?;
-        Ok(Value::Bool(!crate::jstr::has_lone_surrogate(&s)))
+        Ok(Value::Bool(!crate::jstr::has_lone_surrogate(&s.text())))
     });
     it.def_method(&sp, "toWellFormed", 0, |i, this, _| {
         let s = this_string(i, &this)?;
-        if !crate::jstr::has_lone_surrogate(&s) {
+        if !crate::jstr::has_lone_surrogate(&s.text()) {
             return Ok(Value::Str(s));
         }
         let fixed: String = s
+            .text()
             .chars()
             .map(|c| {
                 if crate::jstr::smuggled(c).is_some() {
@@ -11740,16 +11753,17 @@ fn install_string(it: &mut Interp) {
         // (ECMA-262 §22.1.3.32.1). The ASCII subset includes VT (U+000B), which Rust's
         // trim_ascii excludes. Consult cached ASCII metadata rather than scanning the body,
         // and preserve the allocation when no code units are removed.
+        let text = s.text();
         if s.ascii_hint() {
-            let trimmed = s.trim_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
-            return Ok(if trimmed.len() == s.len() {
+            let trimmed = text.trim_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
+            return Ok(if trimmed.len() == text.len() {
                 Value::Str(s)
             } else {
                 Value::lstr(trimmed)
             });
         }
-        let trimmed = s.trim_matches(is_js_ws);
-        Ok(if trimmed.len() == s.len() {
+        let trimmed = text.trim_matches(is_js_ws);
+        Ok(if trimmed.len() == text.len() {
             Value::Str(s)
         } else {
             Value::Str(crate::lstr::LStr::from(trimmed))
@@ -11760,7 +11774,7 @@ fn install_string(it: &mut Interp) {
         let a = this_string(i, &this)?;
         let b = ab(i.to_string(&arg(args, 0)))?;
         #[cfg(feature = "intl")]
-        return crate::intl::locale_compare(i, &a, &b, &arg(args, 1), &arg(args, 2));
+        return crate::intl::locale_compare(i, &a.text(), &b.text(), &arg(args, 1), &arg(args, 2));
         #[cfg(not(feature = "intl"))]
         intl_delegate(
             i,
@@ -11785,8 +11799,9 @@ fn install_string(it: &mut Interp) {
         // then allocate the result directly when no surrogate-boundary canonicalization is needed.
         if args.len() == 1 {
             let next = ab(i.to_string(&args[0]))?;
-            s.len()
-                .checked_add(next.len())
+            s.text()
+                .len()
+                .checked_add(next.text().len())
                 .filter(|&len| len <= MAX_STR_LEN)
                 .ok_or_else(|| i.make_error("RangeError", "Invalid string length"))?;
             return Ok(Value::Str(s.concat_owned(&next)));
@@ -11798,24 +11813,22 @@ fn install_string(it: &mut Interp) {
         // Rooted: ToString of a later argument may run user code.
         let parts = crate::rooting::Rooted::new(RefCell::new(Vec::with_capacity(args.len() + 1)));
         parts.borrow_mut().push(s);
-        let mut total = parts.borrow()[0].len();
+        let mut total = parts.borrow()[0].text().len();
         for (index, argument) in args.iter().enumerate() {
             let next = ab(i.to_string(argument))?;
-            if parts
-                .borrow()
-                .last()
-                .is_some_and(|previous| crate::jstr::needs_join_fixup(previous, &next))
-            {
+            if parts.borrow().last().is_some_and(|previous| {
+                crate::jstr::needs_join_fixup(&previous.text(), &next.text())
+            }) {
                 let mut out = parts.borrow()[0].to_string();
                 for part in parts.borrow().iter().skip(1) {
-                    out.push_str(part);
+                    out.push_str(&part.text());
                 }
-                out = crate::jstr::concat(&out, &next);
+                out = crate::jstr::concat(&out, &next.text());
                 if out.len() > MAX_STR_LEN {
                     return Err(i.make_error("RangeError", "Invalid string length"));
                 }
                 for remaining in args.iter().skip(index + 1) {
-                    out = crate::jstr::concat(&out, &ab(i.to_string(remaining))?);
+                    out = crate::jstr::concat(&out, &ab(i.to_string(remaining))?.text());
                     if out.len() > MAX_STR_LEN {
                         return Err(i.make_error("RangeError", "Invalid string length"));
                     }
@@ -11823,7 +11836,7 @@ fn install_string(it: &mut Interp) {
                 return Ok(Value::lstr(out));
             }
             total = total
-                .checked_add(next.len())
+                .checked_add(next.text().len())
                 .filter(|&len| len <= MAX_STR_LEN)
                 .ok_or_else(|| i.make_error("RangeError", "Invalid string length"))?;
             parts.borrow_mut().push(next);
@@ -11841,7 +11854,7 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("RangeError", "invalid count value"));
         }
         let count = n as usize;
-        if s.len().saturating_mul(count) > MAX_STR_LEN {
+        if s.text().len().saturating_mul(count) > MAX_STR_LEN {
             return Err(i.make_error("RangeError", "Invalid string length"));
         }
         // The observable coercion and implementation length guard above follow ECMA-262
@@ -11851,10 +11864,10 @@ fn install_string(it: &mut Interp) {
         if s.ascii_hint() {
             return Ok(Value::Str(s.repeat_ascii(count)));
         }
-        if !crate::jstr::needs_repeat_fixup(&s, count) {
+        if !crate::jstr::needs_repeat_fixup(&s.text(), count) {
             return Ok(Value::Str(s.repeat_direct(count)));
         }
-        let out = s.repeat(count);
+        let out = s.text().repeat(count);
         Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
     });
     it.def_method(&sp, "split", 2, nf_string_split);
@@ -11866,7 +11879,7 @@ fn install_string(it: &mut Interp) {
         // strings are not materialized twice on this hot indexed-read path.
         let units = i.units_of(&s);
         let len = match &units {
-            crate::interpreter::StrUnits::Ascii => s.len(),
+            crate::interpreter::StrUnits::Ascii => s.text().len(),
             crate::interpreter::StrUnits::Units(units) => units.len(),
         } as i64;
         let mut idx = arg_to_number(i, args, 0)? as i64;
@@ -11878,6 +11891,7 @@ fn install_string(it: &mut Interp) {
         } else {
             match &units {
                 crate::interpreter::StrUnits::Ascii => s
+                    .text()
                     .as_bytes()
                     .get(idx as usize)
                     .map(|&unit| Value::Str(crate::jstr::unit_lstr(unit as u16)))
@@ -11894,16 +11908,17 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "codePointAt", 1, nf_code_point_at);
     it.def_method(&sp, "trimStart", 0, |i, this, _| {
         let s = this_string(i, &this)?;
+        let text = s.text();
         if s.ascii_hint() {
-            let trimmed = s.trim_start_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
-            return Ok(if trimmed.len() == s.len() {
+            let trimmed = text.trim_start_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
+            return Ok(if trimmed.len() == text.len() {
                 Value::Str(s)
             } else {
                 Value::lstr(trimmed)
             });
         }
-        let trimmed = s.trim_start_matches(is_js_ws);
-        Ok(if trimmed.len() == s.len() {
+        let trimmed = text.trim_start_matches(is_js_ws);
+        Ok(if trimmed.len() == text.len() {
             Value::Str(s)
         } else {
             Value::Str(crate::lstr::LStr::from(trimmed))
@@ -11911,16 +11926,17 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "trimEnd", 0, |i, this, _| {
         let s = this_string(i, &this)?;
+        let text = s.text();
         if s.ascii_hint() {
-            let trimmed = s.trim_end_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
-            return Ok(if trimmed.len() == s.len() {
+            let trimmed = text.trim_end_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
+            return Ok(if trimmed.len() == text.len() {
                 Value::Str(s)
             } else {
                 Value::lstr(trimmed)
             });
         }
-        let trimmed = s.trim_end_matches(is_js_ws);
-        Ok(if trimmed.len() == s.len() {
+        let trimmed = text.trim_end_matches(is_js_ws);
+        Ok(if trimmed.len() == text.len() {
             Value::Str(s)
         } else {
             Value::Str(crate::lstr::LStr::from(trimmed))
@@ -11989,7 +12005,7 @@ fn install_string(it: &mut Interp) {
                     return Err(i.make_error("TypeError", "regexp.flags is null or undefined"));
                 }
                 let fs = ab(i.to_string(&flags))?;
-                if !fs.contains('g') {
+                if !fs.text().contains('g') {
                     return Err(i.make_error(
                         "TypeError",
                         "String.prototype.matchAll called with a non-global RegExp",
@@ -12043,7 +12059,7 @@ fn install_string(it: &mut Interp) {
                     return Err(i.make_error("TypeError", "regexp flags is null or undefined"));
                 }
                 let flags_str = ab(i.to_string(&flags))?;
-                if !flags_str.contains('g') {
+                if !flags_str.text().contains('g') {
                     return Err(i.make_error(
                         "TypeError",
                         "replaceAll must be called with a global RegExp",
@@ -12075,7 +12091,7 @@ fn install_string(it: &mut Interp) {
             if s.ascii_hint() {
                 let mut out = String::new();
                 let mut byte = 0usize;
-                for ch in s.chars() {
+                for ch in s.text().chars() {
                     let piece = string_replacement(i, &repl, "", &s, byte)?;
                     push_str_checked(i, &mut out, &piece)?;
                     out.push(ch);
@@ -12108,9 +12124,10 @@ fn install_string(it: &mut Interp) {
             return Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)));
         }
         let source_ascii = s.ascii_hint();
-        let pattern_ascii = pat.ascii_hint() || (source_ascii && pat.is_ascii());
+        let pattern_ascii = pat.ascii_hint() || (source_ascii && pat.text().is_ascii());
         if source_ascii && pattern_ascii {
-            let Some(first) = s.as_str().find(pat.as_ref()) else {
+            let (text, pattern) = (s.text(), pat.text());
+            let Some(first) = text.find(&*pattern) else {
                 return Ok(Value::Str(s));
             };
             if let Repl::Text(template) = &repl {
@@ -12121,18 +12138,18 @@ fn install_string(it: &mut Interp) {
                     return Ok(Value::lstr(out));
                 }
             }
-            let mut out = String::with_capacity(s.len());
-            out.push_str(&s[..first]);
-            let rep = string_replacement(i, &repl, pat.as_ref(), &s, first)?;
+            let mut out = String::with_capacity(text.len());
+            out.push_str(&text[..first]);
+            let rep = string_replacement(i, &repl, &pattern, &s, first)?;
             push_str_checked(i, &mut out, &rep)?;
-            let mut rest = &s[first + pat.len()..];
-            let mut base = first + pat.len();
-            while let Some(pos) = rest.find(pat.as_ref()) {
+            let mut rest = &text[first + pattern.len()..];
+            let mut base = first + pattern.len();
+            while let Some(pos) = rest.find(&*pattern) {
                 push_str_checked(i, &mut out, &rest[..pos])?;
-                let rep = string_replacement(i, &repl, pat.as_ref(), &s, base + pos)?;
+                let rep = string_replacement(i, &repl, &pattern, &s, base + pos)?;
                 push_str_checked(i, &mut out, &rep)?;
-                rest = &rest[pos + pat.len()..];
-                base += pos + pat.len();
+                rest = &rest[pos + pattern.len()..];
+                base += pos + pattern.len();
             }
             push_str_checked(i, &mut out, rest)?;
             return Ok(Value::lstr(out));
@@ -12152,7 +12169,7 @@ fn install_string(it: &mut Interp) {
         };
         let pattern_len = pattern_units.len();
         let needs_context = replacement_needs_context(&repl);
-        let mut out = String::with_capacity(s.len());
+        let mut out = String::with_capacity(s.text().len());
         let mut cursor = 0usize;
         let mut pos = first;
         loop {
@@ -12224,11 +12241,11 @@ fn install_string(it: &mut Interp) {
         for k in 0..len {
             let seg = ab(i.get_member_key(&raw, &k.to_string()))?;
             let piece = ab(i.to_string(&seg))?;
-            push_str_checked(i, &mut out, &piece)?;
+            push_str_checked(i, &mut out, &piece.text())?;
             if k + 1 < len {
                 if let Some(sub) = args.get(k + 1) {
                     let piece = ab(i.to_string(sub))?;
-                    push_str_checked(i, &mut out, &piece)?;
+                    push_str_checked(i, &mut out, &piece.text())?;
                 }
             }
         }
@@ -12286,7 +12303,7 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
     // identity), so bypass the generic dispatch for the common numeric-index case. All other inputs keep the full path with its abrupt
     // completions and valueOf/toString ordering. `undefined` end keeps its fast `len` default.
     if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
-        let len = s.len() as i64;
+        let len = s.text().len() as i64;
         let start_num = {
             let __value_match_original = arg(args, 0);
             match (__value_match_original).view() {
@@ -12365,7 +12382,7 @@ fn box_primitive(i: &mut Interp, v: Value) -> Value {
     // A String exotic object exposes each character as an own, enumerable, non-writable,
     // non-configurable index property, plus a non-enumerable `length`.
     if let Exotic::StrWrap(s) = &exotic {
-        let units = crate::jstr::units(s);
+        let units = crate::jstr::units(&s.text());
         let mut b = obj.borrow_mut();
         for (idx, u) in units.iter().enumerate() {
             b.props.insert(
@@ -12416,7 +12433,7 @@ fn maybe_box(i: &mut Interp, v: Value) -> Result<Value, Value> {
 fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Result<Value, Value> {
     let s = this_string(i, &this)?;
     let target = ab(i.to_number(&arg(args, 0)))? as usize;
-    let cur = crate::jstr::unit_len(&s);
+    let cur = s.unit_len();
     if cur >= target {
         // ECMA-262 §22.1.3.17.1 returns the already-coerced string before it reads or coerces
         // fillString. Keep that string allocation instead of copying it into a Rust String.
@@ -12438,7 +12455,8 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
     // The result has `target` UTF-16 units, so at least that many bytes: reject an oversized
     // padding before building any of it.
     check_string_length(i, target)?;
-    let s = s.as_str();
+    let text = s.text();
+    let s = &*text;
     let need = target - cur;
     if s.is_ascii() && pad.is_ascii() {
         // StringPad repeats and truncates by UTF-16 code units (ECMA-262
@@ -12510,11 +12528,12 @@ fn replace_all_ascii_literal(
     replacement: &str,
     first: usize,
 ) -> Option<String> {
+    let (source, pattern) = (source.text(), pattern.text());
     let mut out = String::with_capacity(source.len());
     out.push_str(&source[..first]);
     out.push_str(replacement);
     let mut rest = &source[first + pattern.len()..];
-    while let Some(pos) = rest.find(pattern.as_ref()) {
+    while let Some(pos) = rest.find(&*pattern) {
         if out.len() > MAX_STR_LEN {
             return None;
         }
@@ -12534,8 +12553,9 @@ fn string_replacement(
     whole: &crate::lstr::LStr,
     pos: usize,
 ) -> Result<String, Value> {
-    let before = &whole[..pos.min(whole.len())];
-    let after = whole.get(pos + matched.len()..).unwrap_or("");
+    let text = whole.text();
+    let before = &text[..pos.min(text.len())];
+    let after = text.get(pos + matched.len()..).unwrap_or("");
     // An ASCII hint proves the byte offset already is the UTF-16 callback offset. Avoid a
     // prefix scan per match; text replacements do not consume the offset at all.
     let unit_pos = if whole.ascii_hint() {

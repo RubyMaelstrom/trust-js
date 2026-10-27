@@ -441,7 +441,7 @@ impl<'s> JsString<'s> {
     /// survives a round trip through [`Ctx::string_from_engine_text`]. Convert it with
     /// [`engine_to_text`](crate::embed::engine_to_text) before treating it as Rust text.
     pub fn as_engine_text(&self) -> &str {
-        self.lstr().as_str()
+        self.lstr().storage_text()
     }
 
     /// The string as Rust text: the Web IDL `USVString` conversion, in which every lone

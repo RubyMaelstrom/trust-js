@@ -409,7 +409,10 @@ pub(super) fn install_regexp(it: &mut Interp) {
         // RegExp.prototype.toString performs the two observable Gets/ToStrings above, then
         // concatenates the four pieces directly (ECMA-262 §22.2.6.17).
         Ok(Value::Str(crate::lstr::LStr::concat4(
-            "/", &src, "/", &flags,
+            "/",
+            &src.text(),
+            "/",
+            &flags.text(),
         )))
     });
     let ctor = it.make_native("RegExp", 2, |i, _t, a| {
@@ -537,7 +540,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
             _ => return Err(i.make_error("TypeError", "RegExp.escape requires a string")),
         };
         let mut out = String::new();
-        for (idx, cp) in crate::jstr::code_points(&s).into_iter().enumerate() {
+        for (idx, cp) in crate::jstr::code_points(&s.text()).into_iter().enumerate() {
             out.push_str(&regexp_escape_cp(cp, idx == 0));
         }
         Ok(Value::lstr(out))
@@ -716,7 +719,7 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         if match_str.is_empty() {
             let li = ab(i.get_member_key(&this, "lastIndex"))?;
             let li = to_length_val(i, &li)?;
-            let next = advance_string_index(li, &s, unicode);
+            let next = advance_string_index(li, &s.text(), unicode);
             set_throw(i, &this, "lastIndex", Value::Num(next as f64))?;
         }
     }
@@ -762,7 +765,7 @@ pub(super) fn re_sym_match_discard_direct(
                 Some(ValueView::Num(n)) => n as usize,
                 _ => unreachable!("direct match lastIndex guard"),
             };
-            let next = advance_string_index(li, input, unicode);
+            let next = advance_string_index(li, &input.text(), unicode);
             obj.borrow_mut()
                 .props
                 .set_value("lastIndex", Value::Num(next as f64));
@@ -825,7 +828,7 @@ pub(super) fn re_sym_replace_discard_direct(
                 Some(ValueView::Num(n)) => n as usize,
                 _ => unreachable!("direct replace lastIndex guard"),
             };
-            let next = advance_string_index(li, input, unicode);
+            let next = advance_string_index(li, &input.text(), unicode);
             obj.borrow_mut()
                 .props
                 .set_value("lastIndex", Value::Num(next as f64));
@@ -941,7 +944,7 @@ fn re_sym_replace_impl(
                             Some(ValueView::Num(n)) => n as usize,
                             _ => unreachable!("discard matcher guarded lastIndex"),
                         };
-                        let next = advance_string_index(li, &s, unicode);
+                        let next = advance_string_index(li, &s.text(), unicode);
                         obj.borrow_mut()
                             .props
                             .set_value("lastIndex", Value::Num(next as f64));
@@ -968,7 +971,7 @@ fn re_sym_replace_impl(
         if m0.is_empty() {
             let li_v = ab(i.get_member_key(&this, "lastIndex"))?;
             let li = to_length_val(i, &li_v)?;
-            let next = advance_string_index(li, &s, unicode);
+            let next = advance_string_index(li, &s.text(), unicode);
             set_throw(i, &this, "lastIndex", Value::Num(next as f64))?;
         }
     }
@@ -988,7 +991,7 @@ fn re_sym_replace_impl(
         let ncaptures = length.saturating_sub(1);
         let matched_v = ab(i.get_member_key(result, "0"))?;
         let matched = ab(i.to_string(&matched_v))?;
-        let match_len = crate::jstr::unit_len(&matched);
+        let match_len = matched.unit_len();
         let index_v = ab(i.get_member_key(result, "index"))?;
         let pos_raw = ab(i.to_number(&index_v))?;
         let position = if pos_raw.is_nan() || pos_raw < 0.0 {
@@ -1030,7 +1033,15 @@ fn re_sym_replace_impl(
             let r = ab(i.call(repl, Value::Undefined, &cbargs))?;
             ab(i.to_string(&r))?.to_string()
         } else {
-            get_substitution(i, &matched, &sunits, position, &captures, &named, &repl_str)?
+            get_substitution(
+                i,
+                &matched.text(),
+                &sunits,
+                position,
+                &captures,
+                &named,
+                &repl_str.text(),
+            )?
         };
         if position >= next_pos {
             accumulated.push_str(&crate::jstr::from_units(&sunits[next_pos..position]));
@@ -1120,13 +1131,13 @@ fn re_sym_replace_direct(
     if matches.is_empty() {
         return Ok(Value::Str(*s));
     }
-    let substitutes = replacer.is_none() && template.contains('$');
+    let substitutes = replacer.is_none() && template.text().contains('$');
     let sunits = if substitutes {
         i.units_full(s)
     } else {
         Rc::from(Vec::new())
     };
-    let mut out = String::with_capacity(s.len());
+    let mut out = String::with_capacity(s.text().len());
     let mut next = 0usize;
     for caps in &matches {
         let (start, end) = caps[0].expect("successful regexp match has a span");
@@ -1155,13 +1166,22 @@ fn re_sym_replace_direct(
             let captures = captures();
             let named = regexp_groups(i, re, caps, &text);
             let matched = text.slice(start, end);
-            get_substitution(i, &matched, &sunits, position, &captures, &named, template)?.into()
+            get_substitution(
+                i,
+                &matched,
+                &sunits,
+                position,
+                &captures,
+                &named,
+                &template.text(),
+            )?
+            .into()
         } else {
             *template
         };
         if start >= next {
             text.push_slice(&mut out, next, start);
-            out.push_str(&replacement);
+            out.push_str(&replacement.text());
             // Pathological expansion ($1 of a huge match, repeated) dies as a RangeError.
             if out.len() > MAX_STR_LEN {
                 return Err(i.make_error("RangeError", "Invalid string length"));
@@ -1187,7 +1207,7 @@ fn get_substitution(
     let tail = (position + crate::jstr::unit_len(matched)).min(sunits.len());
     let push_cap = |out: &mut String, cap: &Value| {
         if let ValueView::Str(s) = (cap).view() {
-            out.push_str(&s);
+            out.push_str(&s.text());
         }
     };
     let t: Vec<char> = template.chars().collect();
@@ -1228,7 +1248,7 @@ fn get_substitution(
                     let name: String = t[k + 2..k + 2 + rel].iter().collect();
                     let v = ab(i.get_member_key(named, &name))?;
                     if !matches!((v).view(), ValueView::Undefined) {
-                        out.push_str(&ab(i.to_string(&v))?);
+                        out.push_str(&ab(i.to_string(&v))?.text());
                     }
                     k = k + 2 + rel + 1;
                 } else {
@@ -1288,8 +1308,8 @@ fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
     let li_v = ab(i.get_member_key(&this, "lastIndex"))?;
     let last = to_length_val(i, &li_v)?;
     ab(i.set_member_key(&matcher, "lastIndex", Value::Num(last as f64)))?;
-    let global = flags.contains('g');
-    let unicode = flags.contains('u') || flags.contains('v');
+    let global = flags.text().contains('g');
+    let unicode = flags.text().contains('u') || flags.text().contains('v');
     Ok(create_regexp_string_iterator(
         i,
         matcher,
@@ -1574,7 +1594,7 @@ pub(super) fn re_sym_split_discard_fast(
         }
         update_regexp_legacy_statics_lazy(i, &search_re, whole, search_start, &text, input);
         if e == p {
-            q = advance_string_index(a, input, unicode);
+            q = advance_string_index(a, &input.text(), unicode);
         } else {
             p = e;
             q = p;
@@ -1590,15 +1610,15 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         return result;
     }
     // All positions are UTF-16 unit offsets.
-    let sunits: Vec<u16> = crate::jstr::units(&s);
+    let sunits: Vec<u16> = crate::jstr::units(&s.text());
     let size = sunits.len();
     // SpeciesConstructor(rx, %RegExp%), then a sticky-flagged splitter constructed from it.
     let default_ctor = regexp_intrinsic(i);
     let c = species_constructor(i, &this, &default_ctor)?;
     let flags_v = ab(i.get_member_key(&this, "flags"))?;
     let flags = ab(i.to_string(&flags_v))?;
-    let unicode = flags.contains('u') || flags.contains('v');
-    let new_flags = if flags.contains('y') {
+    let unicode = flags.text().contains('u') || flags.text().contains('v');
+    let new_flags = if flags.text().contains('y') {
         flags.to_string()
     } else {
         format!("{flags}y")
@@ -1634,13 +1654,13 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         ab(i.set_member_key(&splitter, "lastIndex", Value::Num(q as f64)))?;
         let z = regexp_exec_abstract(i, &splitter, s)?;
         if matches!((z).view(), ValueView::Null) {
-            q = advance_string_index(q, &s, unicode);
+            q = advance_string_index(q, &s.text(), unicode);
             continue;
         }
         let li_v = ab(i.get_member_key(&splitter, "lastIndex"))?;
         let e = to_length_val(i, &li_v)?.min(size);
         if e == p {
-            q = advance_string_index(q, &s, unicode);
+            q = advance_string_index(q, &s.text(), unicode);
             continue;
         }
         out.push(Value::lstr(crate::jstr::from_units(&sunits[p..q])));

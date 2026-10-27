@@ -77,13 +77,18 @@ pub(super) fn install_json(it: &mut Interp) {
                 let n = if n.is_nan() { 0.0 } else { n.trunc() };
                 " ".repeat(n.clamp(0.0, 10.0) as usize)
             }
-            ValueView::Str(s) if s.ascii_hint() => s[..s.len().min(10)].to_owned(),
+            ValueView::Str(s) if s.ascii_hint() => {
+                let text = s.text();
+                text[..text.len().min(10)].to_owned()
+            }
             // JSON.stringify takes the first ten UTF-16 code units, including a lone
             // surrogate when that boundary splits an astral character. Decode only
             // this bounded prefix instead of materializing the full indentation string.
-            ValueView::Str(s) => {
-                crate::jstr::from_units(&crate::jstr::unit_iter(&s).take(10).collect::<Vec<_>>())
-            }
+            ValueView::Str(s) => crate::jstr::from_units(
+                &crate::jstr::unit_iter(&s.text())
+                    .take(10)
+                    .collect::<Vec<_>>(),
+            ),
             _ => String::new(),
         };
         // SerializeJSONProperty starts from a wrapper holder `{ "": value }`; only a replacer
@@ -122,10 +127,11 @@ pub(super) fn install_json(it: &mut Interp) {
         // JSON grammar is ASCII-delimited. Keep ASCII source in its original byte slice rather
         // than widening every byte to a four-byte `char`; escaped `\u` sequences are still
         // decoded by `json_parse_string` into the engine's UTF-16 representation.
-        let chars = (!text.as_str().is_ascii()).then(|| text.chars().collect::<Vec<_>>());
+        let source = text.text();
+        let chars = (!source.is_ascii()).then(|| source.chars().collect::<Vec<_>>());
         let input = match chars.as_deref() {
             Some(chars) => JsonInput::Chars(chars),
-            None => JsonInput::Bytes(text.as_str().as_bytes()),
+            None => JsonInput::Bytes(source.as_bytes()),
         };
         let mut pos = 0;
         let reviver = arg(args, 1);
@@ -557,7 +563,7 @@ fn json_serialize_property(
             }
         };
         if let Some(ValueView::Str(raw)) = (raw).map(|__value| (__value).view()) {
-            s.out.push_str(&raw);
+            s.out.push_str(&raw.text());
             return Ok(true);
         }
         // A primitive-wrapper object re-coerces through ToNumber/ToString (so an overridden
@@ -595,8 +601,8 @@ fn json_serialize_property(
         }
         ValueView::Str(text) => {
             // Escaping only lengthens the text.
-            check_string_length(i, s.out.len().saturating_add(text.len()))?;
-            json_quote_into(&mut s.out, text);
+            check_string_length(i, s.out.len().saturating_add(text.text().len()))?;
+            json_quote_into(&mut s.out, &text.text());
         }
         ValueView::Obj(o) => {
             if !matches!(o.borrow().call, Callable::None) {
@@ -672,9 +678,7 @@ fn json_serialize_object(
         None if proxy_pair(i, value).is_some() => proxy_enum_string_keys(i, value)?
             .iter()
             .filter_map(|key| match &(key).view() {
-                ValueView::Str(key) => {
-                    Some(Rc::from(crate::value::encode_string_key(key).as_ref()))
-                }
+                ValueView::Str(key) => Some(Rc::from(crate::value::encode_lstr_key(key).as_ref())),
                 _ => None,
             })
             .collect(),

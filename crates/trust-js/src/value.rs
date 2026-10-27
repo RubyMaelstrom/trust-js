@@ -281,7 +281,7 @@ pub(crate) fn trace_nullish_property(site: &str, key: &Value) {
         return;
     }
     let key = match &(key).view() {
-        ValueView::Str(s) => format!("string:{:?}", s.as_str()),
+        ValueView::Str(s) => format!("string:{:?}", s.text()),
         ValueView::Num(n) => format!("number:{n:?}"),
         ValueView::Bool(v) => format!("boolean:{v}"),
         ValueView::Null => "null".to_owned(),
@@ -712,7 +712,7 @@ mod packed_value_tests {
             copied.view_owner().unwrap(),
             &initial
         ));
-        assert_eq!(copied.as_str().as_ptr(), original_address);
+        assert_eq!(copied.text().as_ptr(), original_address);
         let mut current = Rooted::new(Value::Str(copied));
         let mut expected = format!("{prefix}frontier");
         // No conservative stack scan or additional explicit roots: only these Rooted
@@ -732,7 +732,7 @@ mod packed_value_tests {
         let suffix = "replacement growth: ".repeat(prefix.len());
         assert!(!copied.append_in_place(&suffix));
         copied.append_or_replace(&crate::lstr::LStr::from(suffix.as_str()));
-        assert_ne!(copied.as_str().as_ptr(), original_address);
+        assert_ne!(copied.text().as_ptr(), original_address);
         current.replace(Value::Str(copied));
         expected.push_str(&suffix);
         let replacement_word = copied.cell_word() as usize;
@@ -941,7 +941,7 @@ mod packed_value_tests {
         assert!(matches!(
             original[1].clone().view(),
             ValueView::Str(actual) if crate::lstr::LStr::ptr_eq(&actual, &string)
-                && &*actual == "copied value identity"
+                && &*actual.text() == "copied value identity"
         ));
         assert!(matches!(
             original[2].clone().view(),
@@ -1272,6 +1272,15 @@ pub(crate) fn encode_owned_string_key(mut text: String) -> String {
         text.insert(0, '\0');
     }
     text
+}
+
+/// [`encode_string_key`] of an engine string's text.
+#[inline]
+pub(crate) fn encode_lstr_key(s: &crate::lstr::LStr) -> std::borrow::Cow<'_, str> {
+    match s.text() {
+        std::borrow::Cow::Borrowed(text) => encode_string_key(text),
+        std::borrow::Cow::Owned(text) => std::borrow::Cow::Owned(encode_owned_string_key(text)),
+    }
 }
 
 #[inline]
@@ -2096,7 +2105,7 @@ impl Value {
         let ValueView::Str(string) = self.view() else {
             return None;
         };
-        let text = string.as_str() as *const str;
+        let text = string.storage_text() as *const str;
         // SAFETY: the view copied the original receiver's cell handle. The bytes belong to
         // that cell, not the temporary handle, and already exposed bytes never change. The
         // original receiver remains the root/lifetime owner of the returned cell borrow.

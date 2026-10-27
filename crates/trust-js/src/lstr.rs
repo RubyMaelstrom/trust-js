@@ -272,7 +272,7 @@ impl LStr {
 
     pub(crate) fn view_range(&self) -> Option<(&LStr, usize, usize)> {
         self.view()
-            .map(|view| (&view.owner, view.offset, view.offset + self.len()))
+            .map(|view| (&view.owner, view.offset, view.offset + self.raw_len()))
     }
 
     /// Slice already-proven UTF-8 boundaries. Copy small tokens, and ranges that would pin a
@@ -280,7 +280,7 @@ impl LStr {
     /// share their flat source owner.
     pub(crate) fn slice_bytes(&self, start: usize, end: usize) -> LStr {
         let bytes = &self.as_str()[start..end];
-        if start == 0 && end == self.len() {
+        if start == 0 && end == self.raw_len() {
             return *self;
         }
         let (owner, offset) = self
@@ -337,6 +337,14 @@ impl LStr {
     #[inline]
     pub fn text(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(self.as_str())
+    }
+
+    /// The stored engine text, borrowed from the cell. Outside this module only the embedding
+    /// API's `as_engine_text`, which lends a host the text for its receiver's lifetime, reads
+    /// it; it goes when strings are stored as code units.
+    #[inline]
+    pub(crate) fn storage_text(&self) -> &str {
+        self.as_str()
     }
 
     /// The content as `&str`, without copying, when it is known ASCII: then engine text, Latin-1
@@ -429,7 +437,7 @@ impl LStr {
             Some(view) => (view.owner, view.offset),
             None => (*self, 0),
         };
-        let len = self.len();
+        let len = self.raw_len();
         let h = buffer.hdr();
         let frontier = h.frontier.get();
         if offset + len != frontier || frontier + x.len() > (h.cap.get() & !ASCII_HINT) as usize {
@@ -455,7 +463,10 @@ impl LStr {
     }
 
     fn grow_with_hint(&self, x: &str, ascii: bool) -> LStr {
-        let need = self.len().checked_add(x.len()).expect("string too large");
+        let need = self
+            .raw_len()
+            .checked_add(x.len())
+            .expect("string too large");
         assert!(need < VIEW_CAP as usize, "string too large");
         let cap = need.saturating_mul(2).max(32).min((VIEW_CAP - 1) as usize) as u32;
         let s = LStr::alloc_with_hint(self.as_str(), cap, self.known_ascii());
@@ -491,9 +502,9 @@ impl LStr {
         }
         if !self.known_ascii()
             && !right.known_ascii()
-            && crate::jstr::needs_join_fixup(self.as_str(), right)
+            && crate::jstr::needs_join_fixup(self.as_str(), right.as_str())
         {
-            let replacement = crate::jstr::concat(self.as_str(), right).into();
+            let replacement = crate::jstr::concat(self.as_str(), right.as_str()).into();
             *self = replacement;
             return;
         }
@@ -728,19 +739,23 @@ mod tests {
                 alias_at_1k = Some(s);
             }
         }
-        assert_eq!(s.len(), 80_000);
+        assert_eq!(s.raw_len(), 80_000);
         assert!(s.as_str().starts_with("abcdefgh"));
         assert!(s.as_str().ends_with("abcdefgh"));
         // The buffer the accumulated string reads (a view's owner).
         let buffer = s.view_owner().unwrap_or(&s);
         let cap = (buffer.hdr().cap.get() & !ASCII_HINT) as usize;
         assert!(
-            cap <= 4 * s.len(),
+            cap <= 4 * s.raw_len(),
             "capacity {cap} not geometric vs len {}",
-            s.len()
+            s.raw_len()
         );
         let alias = alias_at_1k.unwrap();
-        assert_eq!(alias.len(), 8_000, "alias must not observe later appends");
+        assert_eq!(
+            alias.raw_len(),
+            8_000,
+            "alias must not observe later appends"
+        );
         // Doubling self-append through an alias stays correct.
         let a = LStr::from("xy");
         let b = a;
@@ -784,7 +799,7 @@ mod tests {
             left.known_ascii(),
             "an appended view keeps the left buffer's hint"
         );
-        let total = slice.len() + accumulator.len();
+        let total = slice.raw_len() + accumulator.raw_len();
         assert!(LStr::concat_many(&[slice, accumulator], total).ascii_hint());
         assert!(slice.repeat_direct(2).ascii_hint());
         let mut wide = accumulator;
@@ -837,14 +852,14 @@ mod tests {
         let nested = prefix.slice_bytes(100, 800);
         assert!(LStr::ptr_eq(nested.view_owner().unwrap(), &source));
         assert!(!prefix.ascii_hint());
-        assert_eq!(prefix.len(), 900);
-        assert_eq!(nested.as_str(), &source[100..800]);
+        assert_eq!(prefix.raw_len(), 900);
+        assert_eq!(nested.as_str(), &source.as_str()[100..800]);
         assert!(!source.append_in_place("changed"));
         assert!(!prefix.append_in_place("changed"));
         let alias = prefix;
         let appended = prefix.concat_owned(&LStr::from("!"));
         assert_eq!(appended.as_str(), format!("{}!", "x".repeat(900)));
-        assert_eq!(alias.len(), 900);
+        assert_eq!(alias.raw_len(), 900);
         assert_eq!(std::mem::offset_of!(View, header), 0);
     }
 
@@ -855,7 +870,7 @@ mod tests {
         for (start, end) in [(0, 10), (1024, 1030)] {
             let slice = source.slice_bytes(start, end);
             assert!(slice.view_owner().is_none());
-            assert_eq!(slice.as_str(), &source[start..end]);
+            assert_eq!(slice.as_str(), &source.as_str()[start..end]);
         }
         let shared = source.slice_bytes(0, 900);
         assert!(shared.view_owner().is_some());
@@ -865,17 +880,17 @@ mod tests {
         for (start, end) in [(0, 900), (1024, 300_000)] {
             let slice = large.slice_bytes(start, end);
             assert!(slice.view_owner().is_none());
-            assert_eq!(slice.as_str(), &large[start..end]);
+            assert_eq!(slice.as_str(), &large.as_str()[start..end]);
         }
         assert!(large
-            .slice_bytes(0, large.len() / 2 + 1024)
+            .slice_bytes(0, large.raw_len() / 2 + 1024)
             .view_owner()
             .is_some());
         // The pinning bound charges the owner's allocation, including spare capacity, rather
         // than its visible length.
         let base = LStr::from("x".repeat(VIEW_PIN_BYTES - 4096));
         let spare = base.concat_grown("x");
-        assert!(spare.len() <= VIEW_PIN_BYTES);
+        assert!(spare.raw_len() <= VIEW_PIN_BYTES);
         assert!(spare.allocation_requested_bytes() > VIEW_PIN_BYTES);
         let slice = spare.slice_bytes(0, 1100);
         assert!(
@@ -883,9 +898,9 @@ mod tests {
             "charge spare capacity, not visible length"
         );
         let unicode = LStr::from(format!("{}😀é", "x".repeat(1024)));
-        let tail = unicode.slice_bytes(200, unicode.len());
+        let tail = unicode.slice_bytes(200, unicode.raw_len());
         drop(unicode);
         assert_eq!(tail.as_str(), format!("{}😀é", "x".repeat(824)));
-        assert_eq!(tail.repeat_direct(2).len(), tail.len() * 2);
+        assert_eq!(tail.repeat_direct(2).raw_len(), tail.raw_len() * 2);
     }
 }
