@@ -2467,13 +2467,18 @@ impl RegexpArray {
 /// same named keys, so they share one key layout and shape (`Interp::regexp_array_maps`), as
 /// V8's match arrays share one map, instead of each copying the array `length` layout into a
 /// new one as it gains a key.
-fn regexp_array(i: &mut Interp, kind: RegexpArray, items: Vec<Value>, named: &[Value]) -> Value {
+fn regexp_array(
+    i: &mut Interp,
+    kind: RegexpArray,
+    items: impl ExactSizeIterator<Item = Value>,
+    named: &[Value],
+) -> Value {
     let keys = kind.keys();
     debug_assert_eq!(keys.len(), named.len());
     // The ablation's classic large arrays keep their elements' keys among the named entries,
     // which a template's layout does not list (see `Interp::make_array`).
     if items.len() > 32 && !crate::value::dense_elements_enabled() {
-        let array = i.make_array(items);
+        let array = i.make_array(items.collect());
         if let ValueView::Obj(o) = &(array).view() {
             for (key, value) in keys.iter().zip(named) {
                 set_data(o, key, *value);
@@ -2488,7 +2493,7 @@ fn regexp_array(i: &mut Interp, kind: RegexpArray, items: Vec<Value>, named: &[V
         }
         map
     });
-    let props = map.packed_array_from_template(items.into_iter(), named.iter().copied());
+    let props = map.packed_array_from_template(items, named.iter().copied());
     Value::Obj(Object::new_with_parts(
         Some(i.array_proto),
         props,
@@ -2508,9 +2513,11 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
     let subject = arg(args, 0);
     // ToString of a String runs no code, so nothing can have recompiled the matcher (`compile()`)
     // by the time RegExpBuiltinExec reads it.
-    let unchanged = matches!(subject.view(), ValueView::Str(_));
+    if let ValueView::Str(input) = subject.view() {
+        return regexp_builtin_exec(i, this, input, Some(matcher));
+    }
     let input = ab(i.to_string(&subject))?;
-    regexp_builtin_exec(i, this, input, unchanged.then_some(matcher))
+    regexp_builtin_exec(i, this, input, None)
 }
 
 /// RegExpBuiltinExec(R, S) (ECMA-262 §22.2.7.2) for a RegExp `this`. `matcher` is R's
@@ -2587,28 +2594,21 @@ fn regexp_builtin_exec(
                 set_last(i, end)?;
             }
             update_regexp_legacy_statics(i, &re, &caps, &input);
-            // The match and its captures are slices of the subject, at its width.
-            let mut items = Vec::with_capacity(re.ngroups + 1);
-            items.push(Value::Str(input.slice_units(start, end)));
-            for g in 1..=re.ngroups {
-                items.push(match caps[g] {
-                    Some((a, b)) => Value::Str(input.slice_units(a, b)),
-                    None => Value::Undefined,
-                });
-            }
             let groups = regexp_groups(i, &re, &caps, &input);
             // `indices` (the `d` flag): [start, end] pairs per capture (undefined if unmatched),
             // plus a null-prototype `groups` of the same for named captures.
             let indices = if re.has_indices {
-                let pair = |i: &mut Interp, span: Option<(usize, usize)>| match span {
-                    Some((a, b)) => i.make_array(vec![Value::Num(a as f64), Value::Num(b as f64)]),
+                let array_proto = i.array_proto;
+                let pair = |span: Option<(usize, usize)>| match span {
+                    Some((a, b)) => Value::Obj(Object::new_with_parts(
+                        Some(array_proto),
+                        Props::packed_array(
+                            [Value::Num(a as f64), Value::Num(b as f64)].into_iter(),
+                        ),
+                        Exotic::Array,
+                    )),
                     None => Value::Undefined,
                 };
-                let mut idx_items = Vec::with_capacity(re.ngroups + 1);
-                for g in 0..=re.ngroups {
-                    let span = caps.get(g).copied().flatten();
-                    idx_items.push(pair(i, span));
-                }
                 let igroups = if re.names.is_empty() {
                     Value::Undefined
                 } else {
@@ -2625,25 +2625,30 @@ fn regexp_builtin_exec(
                             .iter()
                             .filter(|(n, _)| n == name)
                             .find_map(|(_, idx)| caps.get(*idx).copied().flatten());
-                        let v = pair(i, span);
-                        set_data(&g, name, v);
+                        set_data(&g, name, pair(span));
                     }
                     Value::Obj(g)
                 };
-                Some(regexp_array(i, RegexpArray::Indices, idx_items, &[igroups]))
+                let pairs = caps.iter().map(|&span| pair(span));
+                Some(regexp_array(i, RegexpArray::Indices, pairs, &[igroups]))
             } else {
                 None
             };
+            // The match and its captures are slices of the subject, at its width.
+            let items = caps.iter().map(|span| match *span {
+                Some((a, b)) => Value::Str(input.slice_units(a, b)),
+                None => Value::Undefined,
+            });
             let index = Value::Num(start as f64);
-            let input = Value::Str(input);
+            let subject = Value::Str(input);
             Ok(match indices {
                 Some(indices) => regexp_array(
                     i,
                     RegexpArray::MatchWithIndices,
                     items,
-                    &[index, input, groups, indices],
+                    &[index, subject, groups, indices],
                 ),
-                None => regexp_array(i, RegexpArray::Match, items, &[index, input, groups]),
+                None => regexp_array(i, RegexpArray::Match, items, &[index, subject, groups]),
             })
         }
     }
