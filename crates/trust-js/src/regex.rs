@@ -2989,6 +2989,7 @@ impl Regex {
             saved: std::mem::take(&mut scratch.saved),
             choices: 0,
             floor: 0,
+            logged: 0,
             looks: Vec::new(),
             state_limit: backtrack_state_limit(),
             back: false,
@@ -3004,6 +3005,7 @@ impl Regex {
             string_failures: self.memo_string_failures.then(Default::default),
             prof: regexp_prof_enabled(),
         };
+        let wide = m.caps.len() > 64;
         let mut from = start;
         let prof = m.prof;
         // The last start in range of the prefilter literal's latest occurrence.
@@ -3060,12 +3062,19 @@ impl Regex {
             if prof {
                 REGEXP_PROF.with(|p| p.borrow_mut().attempts += 1);
             }
-            // A failed attempt unwinds its backtrack stack, lookarounds and direction. Captures,
-            // marks and flags changed without undo records (see `Matcher::floor`) are reset here.
+            // A failed attempt unwinds its backtrack stack, lookarounds and direction, and with
+            // them the captures it set (see `Matcher::logged`). Flags changed without undo records
+            // (see `Matcher::floor`) are reset here. Marks need no reset: a path reads a mark only
+            // after writing it, at the start of the loop iteration or counted loop it serves.
             debug_assert!(m.bt.is_empty() && m.saved.is_empty() && m.looks.is_empty());
             debug_assert!(m.choices == 0 && m.floor == 0 && !m.back);
-            m.caps.fill(None);
-            m.marks.fill(None);
+            if wide {
+                m.caps.fill(None);
+                m.logged = u64::MAX;
+            } else {
+                debug_assert!(m.caps[1..].iter().all(Option::is_none));
+                m.logged = 0b11;
+            }
             m.flags = base_flags;
             m.outer_flags.clear();
             if m.run(&self.prog, from) {
@@ -3079,6 +3088,13 @@ impl Regex {
             }
             from = input.next_elem(from).1;
         };
+        // The slots stay unset between execs: a match or an error leaves captures set, and no
+        // match only slot 0.
+        if wide || !matches!(result, Ok(None)) {
+            m.caps.fill(None);
+        } else {
+            m.caps[0] = None;
+        }
         // A match leaves its backtrack state behind; a large one's storage is released.
         let Matcher {
             mut bt,
@@ -3332,9 +3348,10 @@ fn char_class_heap_bytes(class: &CharClass) -> usize {
 }
 
 /// The matcher's working state, kept with its program between executions (see
-/// [`Regex::exec_impl_with`]) instead of being allocated and sized by each: the capture and mark
-/// slots, sized for the program, and the backtrack stack, capture snapshots and modifier flag
-/// stack, empty between executions.
+/// [`Regex::exec_impl_with`]) instead of being allocated, sized and filled by each: the capture
+/// slots, sized for the program and unset between executions; the mark slots, sized for it (a
+/// mark is written before it is read); and the backtrack stack, capture snapshots and modifier
+/// flag stack, empty between executions.
 struct MatchScratch {
     caps: Box<[Option<usize>]>,
     marks: Box<[Option<usize>]>,
@@ -5765,8 +5782,15 @@ struct Matcher<'a, I: ReInput> {
     choices: u32,
     /// Choice count at entry to the running (sub)program. While `choices` equals it, a failure
     /// unwinds the whole program, whose caller resets the state itself, so state changes need no
-    /// undo records.
+    /// undo records, but for the root program's capture writes (see `logged`).
     floor: u32,
+    /// The capture slots that have an undo record at the root program's floor this attempt. A
+    /// failure there unwinds the whole attempt, so one record per slot, for its first write,
+    /// unsets everything the attempt set, which leaves the slots unset for the next attempt
+    /// without filling them before each one. Slot 0, which every attempt sets first, and slot 1,
+    /// set only on success, need none. A program with more than 64 slots sets every bit and has
+    /// its slots unset before each attempt instead.
+    logged: u64,
     /// Active lookarounds, innermost last.
     looks: Vec<LookFrame<'a>>,
     /// Ceiling on `bt.len() + saved.len()` (see [`MAX_BACKTRACK_STATE`]).
@@ -5979,6 +6003,20 @@ impl<'a, I: ReInput> Matcher<'a, I> {
     fn push_choice(&mut self, record: Backtrack) {
         self.choices += 1;
         self.bt.push(record);
+    }
+
+    /// Record how to restore capture `slot` to `old`, which it held before the root program's
+    /// floor first wrote it this attempt (see [`Matcher::logged`]).
+    #[inline(always)]
+    fn log_root_write(&mut self, slot: usize, old: Option<usize>) {
+        let bit = 1u64.wrapping_shl(slot as u32);
+        if self.logged & bit == 0 {
+            self.logged |= bit;
+            self.bt.push(Backtrack::Capture {
+                slot: slot as u32,
+                old: pack_slot(old),
+            });
+        }
     }
 
     /// Record how to undo a state change, unless no choice point above the floor could resume
@@ -6550,13 +6588,22 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                             break;
                         }
                         // Captures the body set persist, undone only if the enclosing program
-                        // backtracks past the lookaround.
+                        // backtracks past the lookaround, or, at the root program's floor, when
+                        // the attempt fails.
                         if self.choices != self.floor {
                             self.bt.push(Backtrack::Captures {
                                 lo: 0,
                                 at: frame.saved,
                             });
                         } else {
+                            if self.looks.is_empty() {
+                                for slot in 0..self.caps.len() {
+                                    let before = self.saved[frame.saved + slot];
+                                    if self.caps[slot] != before {
+                                        self.log_root_write(slot, before);
+                                    }
+                                }
+                            }
                             self.saved.truncate(frame.saved);
                         }
                         pc = frame.pc + 1;
@@ -6616,10 +6663,15 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                     }
                     Inst::Save(slot) => {
                         let slot = *slot;
-                        self.push_undo(Backtrack::Capture {
-                            slot: slot as u32,
-                            old: pack_slot(self.caps[slot]),
-                        });
+                        let old = self.caps[slot];
+                        if self.choices != self.floor {
+                            self.bt.push(Backtrack::Capture {
+                                slot: slot as u32,
+                                old: pack_slot(old),
+                            });
+                        } else if self.looks.is_empty() {
+                            self.log_root_write(slot, old);
+                        }
                         self.caps[slot] = Some(pos);
                         pc += 1;
                     }
@@ -7453,6 +7505,31 @@ mod internal_engine_diagnostics {
         super::set_backtrack_state_limit(super::MAX_BACKTRACK_STATE);
         assert!(matches!(limited, Err(super::MatchError::ResourceExhausted)));
         assert!(matches!(re.exec_polled(&text, 0, &control), Ok(None)));
+    }
+
+    #[test]
+    fn root_floor_captures_take_one_undo_record_per_slot() {
+        // No choice point remains through this loop (its exit cannot match where it iterates),
+        // so the captures each iteration clears and sets again need one undo record per slot
+        // for the whole attempt, not one per iteration: a lowered ceiling is not reached.
+        let re = super::Regex::new("(?:(a)(?=(b))b)*c", "").unwrap();
+        let text = crate::lstr::LStr::from("ab".repeat(20_000) + "c");
+        let control = crate::RuntimeInterrupt::default();
+        super::set_backtrack_state_limit(1 << 6);
+        let found = re.exec_polled(&text, 0, &control);
+        super::set_backtrack_state_limit(super::MAX_BACKTRACK_STATE);
+        let spans = found
+            .ok()
+            .flatten()
+            .expect("the loop matches within the ceiling");
+        assert_eq!(
+            &spans[..],
+            &[
+                Some((0, 40_001)),
+                Some((39_998, 39_999)),
+                Some((39_999, 40_000))
+            ]
+        );
     }
 
     #[test]

@@ -74,6 +74,37 @@ fn modifier_flags_hold_inside_their_group_across_backtracking() {
     );
 }
 
+/// Each match attempt starts with every capture unset (§22.2.2.1: the Matcher runs from a fresh
+/// State at each index RegExpBuiltinExec tries): what a failed attempt captured, also through a
+/// lookaround or where no choice point remained, is gone by the next one, in programs with more
+/// than 64 capture slots too.
+#[test]
+fn attempts_start_with_captures_unset() {
+    check(
+        r#"
+        var re = /(a)b|(c)/y;
+        re.lastIndex = 1;
+        var wide = new RegExp("(a)".repeat(33) + "x|(b)").exec("ab");
+        var wideLook = new RegExp("(?:" + "(a)".repeat(33) + ")?(?=(a))ab|b").exec("acb");
+        JSON.stringify([
+            /(a)b|(c)/.exec("acx"),
+            /(a)?b|c/.exec("ac"),
+            /(?=(a))ab|b/.exec("acb"),
+            /(?:(a)b)*c/.exec("ab".repeat(50000) + "c").slice(1),
+            /(?:(a)|b)*?c/.exec("bac"),
+            /(?:(a)|(b))+?$/.exec("abab"),
+            re.exec("acx"),
+            re.lastIndex,
+            /(a)|b/g.exec("b"),
+            "xaxb".replace(/(a)?b|x/g, "[$1]"),
+            [wide.index, wide[1], wide[34]],
+            [wideLook.index, wideLook[1], wideLook[34]],
+        ])
+        "#,
+        r#"[["c",null,"c"],["c",null],["b",null],["a"],["bac","a"],["abab",null,"b"],["c",null,"c"],2,["b",null],"[]a[][]",[1,null,"b"],[2,null,null]]"#,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).
