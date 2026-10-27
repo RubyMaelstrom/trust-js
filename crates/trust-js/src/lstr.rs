@@ -491,25 +491,10 @@ impl LStr {
     }
 
     /// A view's owner and its unit range there.
+    #[cfg(test)]
     pub(crate) fn view_range(&self) -> Option<(&LStr, usize, usize)> {
         self.view()
             .map(|view| (&view.owner, view.offset, view.offset + self.raw_len()))
-    }
-
-    /// Every unit written to this flat buffer (up to its frontier), as one string, which each
-    /// of the buffer's views reads a range of, when in-place appends have run past the
-    /// buffer's own length; `None` when the buffer is its own extent.
-    pub(crate) fn buffer_extent(&self) -> Option<LStr> {
-        let (buffer, _) = self.flat();
-        let frontier = buffer.hdr().frontier.get();
-        (frontier != buffer.raw_len()).then(|| LStr::new_view(buffer, 0, frontier))
-    }
-
-    /// Whether in-place appends have written this flat buffer past its own length (see
-    /// [`Self::buffer_extent`]).
-    pub(crate) fn written_past_length(&self) -> bool {
-        let (buffer, _) = self.flat();
-        buffer.hdr().frontier.get() != buffer.raw_len()
     }
 
     /// Units `start..end`. Copy small slices (at the narrowest width) and ranges that would pin

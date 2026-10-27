@@ -124,34 +124,38 @@ fn unit_slices_keep_identity_and_need_no_cache() {
 }
 
 /// A slice of a string built by appending in place is a view reading past its buffer's own
-/// length; its RegExp text is still a window of the buffer's, prepared once for every unit
-/// written to the buffer, not a fresh table per slice.
+/// length; a RegExp reads it in place, finding what it finds in a flat copy.
 #[test]
-fn regexp_windows_of_appended_buffers_share_one_prepared_extent() {
-    let mut engine = Engine::new();
+fn regexps_read_views_of_appended_buffers_in_place() {
     let mut code = crate::lstr::LStr::from("\u{4e2d}");
     let line = crate::lstr::LStr::from("var x = foo(bar, 42); // a comment\n");
     while code.unit_len() < 4096 {
         code.append_or_replace(&line);
     }
     assert!(code.view_owner().is_some(), "appended in place");
-    for unicode in [false, true] {
-        let before = engine.interp.re_texts.stats().0;
-        for start in [1, 100, 1000, 3000] {
+    let control = crate::RuntimeInterrupt::default();
+    for flags in ["g", "u"] {
+        let re = crate::regex::Regex::new("foo\\((\\w+), (\\d+)\\)|\\u4e2d", flags).unwrap();
+        for start in [0, 1, 100, 1000, 3000] {
             let chunk = code.slice_units(start, code.unit_len());
-            let text = engine.interp.re_text(unicode, &chunk);
-            assert!(text.is_window(), "a window of the buffer's extent");
-            assert_eq!(text.unit_index(text.len()), chunk.unit_len());
+            assert!(chunk.view_range().is_some(), "a view of the buffer");
+            let flat = crate::lstr::LStr::from_utf16(&chunk.units().to_utf16());
+            for at in [0, 5, 40, 1000, chunk.unit_len()] {
+                let spans = |subject: &crate::lstr::LStr| {
+                    re.exec_polled(subject, at, &control)
+                        .unwrap()
+                        .map(|captures| captures.to_vec())
+                };
+                assert_eq!(spans(&chunk), spans(&flat), "/{flags} at {start}+{at}");
+            }
         }
-        // One extent and four windows.
-        assert_eq!(engine.interp.re_texts.stats().0, before + 5);
     }
 }
 
 #[test]
 fn regexps_match_views_of_two_byte_buffers_holding_only_ascii() {
     // A stripped byte order mark leaves a two-byte view of ASCII units, and so does a slice
-    // short of a non-ASCII character; their buffers' prepared texts have no elements.
+    // short of a non-ASCII character: the matcher reads their units in place.
     check(
         r#"
         function run(){
@@ -222,44 +226,6 @@ fn prepared_regex_windows_preserve_slice_relative_anchors_and_indices() {
         "#,
         "0|abcé😀|abcé😀|0,6|6|1199|1199,1200|4|6|true|0|true|55296|abcé😀",
     );
-}
-
-#[test]
-fn prepared_windows_pin_shared_tables_and_map_astral_offsets() {
-    use crate::regex::ReText;
-    use std::rc::Rc;
-    for unicode in [false, true] {
-        let source: crate::lstr::LStr = format!("é{}😀z", "x".repeat(1024)).into();
-        let mut engine = Engine::new();
-        let cached_parent = engine.interp.re_text(unicode, &source);
-        let parent = Rc::new(ReText::new_rc(unicode, &source));
-        let input = source.slice_units(101, source.unit_len());
-        let cached_window = engine.interp.re_text(unicode, &input);
-        assert!(
-            Rc::strong_count(&cached_parent) >= 3,
-            "window shares the cached table"
-        );
-        assert_eq!(cached_window.slice(0, cached_window.len()), input.text());
-        let start = 101;
-        let window = ReText::window(parent.clone(), &input, start, 1028).unwrap();
-        assert_eq!(window.unit_index(window.len()), input.unit_len());
-        let reference = ReText::new_rc(unicode, &input);
-        for u in 0..=window.unit_index(window.len()) + 1 {
-            assert_eq!(window.elem_at_unit(u), reference.elem_at_unit(u));
-        }
-        for e in 0..=window.len() + 1 {
-            assert_eq!(window.unit_index(e), reference.unit_index(e));
-        }
-        assert_eq!(
-            window.slice(0, window.len()),
-            reference.slice(0, reference.len())
-        );
-        drop(parent);
-        drop(source);
-        assert_eq!(window.slice(window.len() - 1, window.len()), "z");
-        let window = Rc::new(window);
-        assert!(ReText::window(window, &input, 0, 10).is_none());
-    }
 }
 
 #[test]

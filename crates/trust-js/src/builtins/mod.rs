@@ -2364,53 +2364,60 @@ pub(crate) fn regexp_interrupt_tick(i: &mut Interp) -> Result<(), crate::regex::
     }
 }
 
+/// Match `subject` in place from unit `start` (see [`crate::regex::Regex::exec_at`]).
 #[inline]
 fn regexp_exec_text_shared(
     i: &mut Interp,
     re: &crate::regex::Regex,
-    text: &crate::regex::ReText,
+    subject: &crate::lstr::LStr,
     start: usize,
 ) -> crate::regex::MatchResult<crate::regex::Captures> {
-    re.exec_text_shared_entry_polled(text, start, &i.runtime_interrupt)
+    re.exec_at(subject, start, &i.runtime_interrupt)
 }
 
-#[inline]
-fn regexp_exec_text_discard_shared(
-    i: &mut Interp,
-    re: &crate::regex::Regex,
-    text: &crate::regex::ReText,
-    start: usize,
-) -> crate::regex::MatchResult<crate::regex::Captures> {
-    re.exec_text_discard_shared_entry_polled(text, start, &i.runtime_interrupt)
-}
-
+/// The whole match of `subject` from unit `start` (see [`crate::regex::Regex::find_at`]).
 #[inline]
 pub(crate) fn regexp_find_text_shared(
     i: &mut Interp,
     re: &crate::regex::Regex,
-    text: &crate::regex::ReText,
+    subject: &crate::lstr::LStr,
     start: usize,
 ) -> crate::regex::MatchResult<(usize, usize)> {
-    re.find_text_shared_entry_polled(text, start, &i.runtime_interrupt)
+    re.find_at(subject, start, &i.runtime_interrupt)
 }
 
-/// All non-overlapping matches of `re` in `text`, each as capture spans (element indices).
+/// Units `a..b` of a RegExp subject as engine text.
+fn subject_text(subject: &crate::lstr::LStr, a: usize, b: usize) -> String {
+    match subject.units().slice(a, b) {
+        // SAFETY: one-byte units are ASCII.
+        crate::lstr::Units::Ascii(bytes) => {
+            unsafe { std::str::from_utf8_unchecked(bytes) }.to_string()
+        }
+        crate::lstr::Units::Utf16(units) => crate::jstr::from_units(units),
+    }
+}
+
+/// All non-overlapping matches of `re` in `subject`, each as capture spans (unit offsets).
 fn regex_find_all(
     i: &mut Interp,
     re: &crate::regex::Regex,
-    text: &crate::regex::ReText,
+    subject: &crate::lstr::LStr,
 ) -> Result<Vec<Vec<Option<(usize, usize)>>>, Value> {
     let mut out = Vec::new();
     let mut pos = 0;
-    while pos <= text.len() {
+    while pos <= subject.unit_len() {
         let interrupt = regexp_interrupt_tick(i).map(|()| Some(()));
         regexp_match_result(i, interrupt)?;
-        let matched = regexp_exec_text_shared(i, re, text, pos);
+        let matched = regexp_exec_text_shared(i, re, subject, pos);
         match regexp_match_result(i, matched)? {
             None => break,
             Some(caps) => {
                 let (a, b) = caps[0].unwrap();
-                pos = if b > a { b } else { b + 1 };
+                pos = if b > a {
+                    b
+                } else {
+                    advance_string_index(b, subject, re.unicode)
+                };
                 out.push(caps.as_ref().to_vec());
                 if out.len() > MAX_ARRAY_OP_LEN {
                     break;
@@ -2553,18 +2560,16 @@ fn regexp_builtin_exec(
         }
         None => set_throw(i, &this, "lastIndex", Value::Num(units as f64)),
     };
-    // Elements are code units (non-unicode) or code points (u/v); JS-visible indices are units.
-    let text = i.re_text(re.unicode, &input);
+    // The matcher reads the subject in place; every position is a unit offset.
     let use_last = re.global || re.sticky;
     let last_units = if use_last { read_units } else { 0 };
-    if last_units > text.unit_index(text.len()) {
+    if last_units > input.unit_len() {
         if use_last {
             set_last(i, 0)?;
         }
         return Ok(Value::Null);
     }
-    let last = text.elem_at_unit(last_units);
-    let matched = regexp_exec_text_discard_shared(i, &re, &text, last);
+    let matched = regexp_exec_text_shared(i, &re, &input, last_units);
     match regexp_match_result(i, matched)? {
         None => {
             if use_last {
@@ -2575,26 +2580,23 @@ fn regexp_builtin_exec(
         Some(caps) => {
             let (start, end) = caps[0].unwrap();
             if use_last {
-                set_last(i, text.unit_index(end))?;
+                set_last(i, end)?;
             }
-            update_regexp_legacy_statics(i, &re, &caps, &text, &input);
+            update_regexp_legacy_statics(i, &re, &caps, &input);
             let mut items = Vec::with_capacity(re.ngroups + 1);
-            items.push(Value::lstr(text.slice(start, end)));
+            items.push(Value::lstr(subject_text(&input, start, end)));
             for g in 1..=re.ngroups {
                 items.push(match caps[g] {
-                    Some((a, b)) => Value::lstr(text.slice(a, b)),
+                    Some((a, b)) => Value::lstr(subject_text(&input, a, b)),
                     None => Value::Undefined,
                 });
             }
-            let groups = regexp_groups(i, &re, &caps, &text);
+            let groups = regexp_groups(i, &re, &caps, &input);
             // `indices` (the `d` flag): [start, end] pairs per capture (undefined if unmatched),
             // plus a null-prototype `groups` of the same for named captures.
             let indices = if re.flags.contains('d') {
                 let pair = |i: &mut Interp, span: Option<(usize, usize)>| match span {
-                    Some((a, b)) => i.make_array(vec![
-                        Value::Num(text.unit_index(a) as f64),
-                        Value::Num(text.unit_index(b) as f64),
-                    ]),
+                    Some((a, b)) => i.make_array(vec![Value::Num(a as f64), Value::Num(b as f64)]),
                     None => Value::Undefined,
                 };
                 let mut idx_items = Vec::with_capacity(re.ngroups + 1);
@@ -2627,7 +2629,7 @@ fn regexp_builtin_exec(
             } else {
                 None
             };
-            let index = Value::Num(text.unit_index(start) as f64);
+            let index = Value::Num(start as f64);
             let input = Value::Str(input);
             Ok(match indices {
                 Some(indices) => regexp_array(
@@ -2650,7 +2652,7 @@ pub(super) fn regexp_groups(
     i: &mut Interp,
     re: &crate::regex::Regex,
     caps: &[Option<(usize, usize)>],
-    text: &crate::regex::ReText,
+    subject: &crate::lstr::LStr,
 ) -> Value {
     if re.names.is_empty() {
         return Value::Undefined;
@@ -2668,7 +2670,7 @@ pub(super) fn regexp_groups(
             .iter()
             .filter(|(n, _)| n == name)
             .find_map(|(_, idx)| caps.get(*idx).copied().flatten())
-            .map(|(a, b)| Value::lstr(text.slice(a, b)))
+            .map(|(a, b)| Value::lstr(subject_text(subject, a, b)))
             .unwrap_or(Value::Undefined);
         set_data(&g, name, v);
     }
@@ -2710,17 +2712,15 @@ pub(crate) fn regexp_exec_discard_direct(
     } else {
         0
     };
-    let text = i.re_text(re.unicode, input);
     let last_units = if use_last { read_units } else { 0 };
     let set_last = |n: usize| regexp::set_last_index_at_slot(obj, n as f64);
-    if last_units > text.unit_index(text.len()) {
+    if last_units > input.unit_len() {
         if use_last {
             set_last(0);
         }
         return Ok(false);
     }
-    let last = text.elem_at_unit(last_units);
-    let matched = regexp_find_text_shared(i, re, &text, last);
+    let matched = regexp_find_text_shared(i, re, input, last_units);
     match regexp_match_result(i, matched)? {
         None => {
             if use_last {
@@ -2730,9 +2730,9 @@ pub(crate) fn regexp_exec_discard_direct(
         }
         Some(whole @ (_, end)) => {
             if use_last {
-                set_last(text.unit_index(end));
+                set_last(end);
             }
-            update_regexp_legacy_statics_lazy(i, re, whole, last, &text, input);
+            update_regexp_legacy_statics_lazy(i, re, whole, last_units, input);
             Ok(true)
         }
     }
@@ -2875,7 +2875,6 @@ fn update_regexp_legacy_statics(
     i: &mut Interp,
     re: &crate::regex::Regex,
     caps: &[Option<(usize, usize)>],
-    text: &Rc<crate::regex::ReText>,
     input: &crate::lstr::LStr,
 ) {
     let Some(ctor) = regexp::realm_regexp_constructor(i) else {
@@ -2892,7 +2891,6 @@ fn update_regexp_legacy_statics(
         .filter(|previous| previous.ctor.as_ptr() == Gc::as_ptr(&ctor))
     {
         previous.input = *input;
-        previous.text = text.clone();
         previous.caps.clear();
         previous.caps.extend_from_slice(caps);
         previous.ngroups = re.ngroups;
@@ -2902,7 +2900,6 @@ fn update_regexp_legacy_statics(
     i.regexp_last = Some(crate::interpreter::RegexpLastMatch {
         ctor: Gc::downgrade(&ctor),
         input: *input,
-        text: text.clone(),
         caps: caps.to_vec(),
         ngroups: re.ngroups,
         lazy_captures: None,
@@ -2914,7 +2911,6 @@ fn update_regexp_legacy_statics_lazy(
     re: &Rc<crate::regex::Regex>,
     whole: (usize, usize),
     search_start: usize,
-    text: &Rc<crate::regex::ReText>,
     input: &crate::lstr::LStr,
 ) {
     let Some(ctor) = regexp::realm_regexp_constructor(i) else {
@@ -2931,7 +2927,6 @@ fn update_regexp_legacy_statics_lazy(
         .filter(|previous| previous.ctor.as_ptr() == Gc::as_ptr(&ctor))
     {
         previous.input = *input;
-        previous.text = text.clone();
         previous.caps.clear();
         previous.caps.push(Some(whole));
         previous.ngroups = re.ngroups;
@@ -2941,7 +2936,6 @@ fn update_regexp_legacy_statics_lazy(
     i.regexp_last = Some(crate::interpreter::RegexpLastMatch {
         ctor: Gc::downgrade(&ctor),
         input: *input,
-        text: text.clone(),
         caps: vec![Some(whole)],
         ngroups: re.ngroups,
         lazy_captures: Some((re.clone(), search_start)),
@@ -2959,28 +2953,31 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
         return;
     };
     if let Some((re, start)) = m.lazy_captures.take() {
-        let matched = regexp_exec_text_shared(i, &re, &m.text, start);
+        let matched = regexp_exec_text_shared(i, &re, &m.input, start);
         if let Ok(Some(captures)) = matched {
             m.caps.clear();
             m.caps.extend_from_slice(&captures);
         }
     }
-    let (caps, text, ctor) = (&m.caps, &m.text, &ctor);
+    let (caps, input, ctor) = (&m.caps, &m.input, &ctor);
     let put = |k: &'static str, v: String| {
         ctor.borrow_mut()
             .internal_slots_mut()
             .insert(k, Property::data(Value::lstr(v), true, false, false));
     };
     let (start, end) = caps[0].unwrap();
-    put("#\u{0}legacy_input", m.input.to_string());
-    put("#\u{0}legacy_lastMatch", text.slice(start, end));
-    put("#\u{0}legacy_leftContext", text.slice(0, start));
-    put("#\u{0}legacy_rightContext", text.slice(end, text.len()));
+    put("#\u{0}legacy_input", input.to_string());
+    put("#\u{0}legacy_lastMatch", subject_text(input, start, end));
+    put("#\u{0}legacy_leftContext", subject_text(input, 0, start));
+    put(
+        "#\u{0}legacy_rightContext",
+        subject_text(input, end, input.unit_len()),
+    );
     let cap_str = |k: usize| {
         caps.get(k)
             .copied()
             .flatten()
-            .map(|(a, b)| text.slice(a, b))
+            .map(|(a, b)| subject_text(input, a, b))
             .unwrap_or_default()
     };
     put(
@@ -11165,22 +11162,21 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
     if let ValueView::Obj(o) = &(arg(args, 0)).view() {
         if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
             let re = i.regexps[&(Gc::as_ptr(o) as usize)].clone();
-            let text = i.re_text(re.unicode, &s);
             let mut parts = Vec::new();
             let mut last = 0;
-            'outer: for caps in regex_find_all(i, &re, &text)? {
+            'outer: for caps in regex_find_all(i, &re, &s)? {
                 let (a, b) = caps[0].unwrap();
                 // Skip a zero-width match at the very start or end of the string.
-                if a == b && (b == 0 || a >= text.len()) {
+                if a == b && (b == 0 || a >= s.unit_len()) {
                     continue;
                 }
-                parts.push(Value::lstr(text.slice(last, a)));
+                parts.push(Value::lstr(subject_text(&s, last, a)));
                 if parts.len() >= limit {
                     break;
                 }
                 for g in 1..=re.ngroups {
                     parts.push(match caps[g] {
-                        Some((x, y)) => Value::lstr(text.slice(x, y)),
+                        Some((x, y)) => Value::lstr(subject_text(&s, x, y)),
                         None => Value::Undefined,
                     });
                     if parts.len() >= limit {
@@ -11190,7 +11186,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 last = b;
             }
             if parts.len() < limit {
-                parts.push(Value::lstr(text.slice(last, text.len())));
+                parts.push(Value::lstr(subject_text(&s, last, s.unit_len())));
             }
             parts.truncate(limit);
             return Ok(i.make_array(parts));

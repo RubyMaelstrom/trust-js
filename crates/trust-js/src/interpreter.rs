@@ -1456,7 +1456,6 @@ pub(crate) enum StrUnits<'a> {
 pub(crate) struct RegexpLastMatch {
     pub ctor: crate::value::WeakGc,
     pub input: crate::lstr::LStr,
-    pub text: Rc<crate::regex::ReText>,
     pub caps: Vec<Option<(usize, usize)>>,
     pub ngroups: usize,
     /// Dead-result regexp operations record only the whole match and defer capture extraction
@@ -3557,16 +3556,6 @@ pub struct Interp {
     /// Realm-wide proof that no Proxy has been created. Raw prototype-chain walks read it live;
     /// side-table exotics are guarded per receiver by `Object::ic_plain`.
     pub(crate) inline_ic_safe: std::cell::Cell<bool>,
-    /// Prepared regex subjects keyed by string identity and Unicode mode. The retained `LStr`
-    /// pins each pointer, making the integer key ABA-safe. This cache is deliberately larger
-    /// than the tiny UTF-16 indexing LRU: web workloads commonly prepare thousands of immutable
-    /// strings once and run several regexp passes over the same working set.
-    pub(crate) re_texts:
-        crate::cache::ByteLru<(usize, bool), (crate::lstr::LStr, Rc<crate::regex::ReText>)>,
-    /// Most recently prepared ASCII RegExp subject. ASCII matching reads the immutable string's
-    /// bytes directly, so retaining thousands of these trivial views in the general LRU costs
-    /// more than rebuilding them. One hot entry preserves the common consecutive reuse case.
-    pub(crate) re_text_ascii_hot: Option<(crate::lstr::LStr, bool, Rc<crate::regex::ReText>)>,
     /// The RegExp protector (see [`crate::builtins::RegexpProof`]): the current Realm's RegExp
     /// algorithms read the intrinsic methods, flag getters and species.
     pub(crate) regexp_protector: RefCell<crate::builtins::RegexpProof>,
@@ -3995,8 +3984,6 @@ interp_memory_inventory! {
     jit_layout => "non_owning",
     interp_layout => "non_owning",
     inline_ic_safe => "non_owning",
-    re_texts => "measured",
-    re_text_ascii_hot => "measured",
     regexp_protector => "non_owning",
     regexp_last => "measured",
     depth => "non_owning",
@@ -4123,7 +4110,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 153);
+    assert_eq!(names.len(), 151);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -5732,8 +5719,6 @@ impl Interp {
             jit_layout: std::cell::OnceCell::new(),
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
             inline_ic_safe: std::cell::Cell::new(true),
-            re_texts: crate::cache::ByteLru::new(32 << 20, 8_192),
-            re_text_ascii_hot: None,
             regexp_protector: RefCell::default(),
             regexp_last: None,
             weak_collection_data: Default::default(),
@@ -11687,94 +11672,6 @@ impl Interp {
         self.gc_pins.insert(owner, *o);
     }
 
-    /// A regex-ready view of `s`, cached by string identity: repeated exec/replace/split over the
-    /// same subject (the common shape of both real code and the regexp benchmarks) skips the
-    /// O(len) element-vector rebuild. Strings are immutable, and each entry holds its `LStr` so the
-    /// pointer can't be reused by a new allocation while cached. A known-ASCII subject, a view
-    /// of a known-ASCII string included, is matched over its bytes, which costs nothing to
-    /// prepare: it takes the one hot entry instead of a cache entry, which would keep it alive
-    /// (a minor collection marks the strings of the entries made since the last one).
-    pub(crate) fn re_text(
-        &mut self,
-        unicode: bool,
-        s: &crate::lstr::LStr,
-    ) -> Rc<crate::regex::ReText> {
-        if s.known_ascii() {
-            if let Some((cached, cached_unicode, text)) = &self.re_text_ascii_hot {
-                if *cached_unicode == unicode && crate::lstr::LStr::ptr_eq(cached, s) {
-                    return text.clone();
-                }
-            }
-            let text = Rc::new(crate::regex::ReText::new_rc(unicode, s));
-            self.re_text_ascii_hot = Some((*s, unicode, text.clone()));
-            return text;
-        }
-        let key = (s.as_ptr() as usize, unicode);
-        if let Some((cached, text)) = self.re_texts.get_cloned(&key) {
-            debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
-            return text;
-        }
-        // A bounded string view can reuse its flat source's prepared elements. Construct the
-        // table only for small roots that fit comfortably in this cache; unbounded roots,
-        // declined indexes and Unicode boundaries without an exact element mapping fall back.
-        let prepared = s.view_range().and_then(|(owner, start, end)| {
-            if owner.retained_requested_bytes() > 1 << 20 {
-                return None;
-            }
-            let parent = self.re_text_extent(unicode, owner, end);
-            crate::regex::ReText::window(parent, s, start, end)
-        });
-        let t = Rc::new(prepared.unwrap_or_else(|| crate::regex::ReText::new_rc(unicode, s)));
-        self.insert_re_text(key, *s, &t);
-        t
-    }
-
-    /// The prepared text of every unit written to flat buffer `owner` (see
-    /// [`crate::lstr::LStr::buffer_extent`]), covering at least `end` units, for windows of its
-    /// views. A view made by an in-place append reads past the buffer's own length, so the
-    /// buffer's own prepared text would not cover it: such an extent is cached under the buffer
-    /// with a tag bit (cells are aligned, so no string's key has it), and since written units
-    /// never change, a longer extent replaces a shorter one.
-    fn re_text_extent(
-        &mut self,
-        unicode: bool,
-        owner: &crate::lstr::LStr,
-        end: usize,
-    ) -> Rc<crate::regex::ReText> {
-        if !owner.written_past_length() {
-            return self.re_text(unicode, owner);
-        }
-        let key = (owner.as_ptr() as usize | 1, unicode);
-        if let Some((_, text)) = self.re_texts.get_cloned(&key) {
-            if text.unit_index(text.len()) >= end {
-                return text;
-            }
-        }
-        let extent = owner
-            .buffer_extent()
-            .expect("a buffer written past its length has an extent");
-        let text = Rc::new(crate::regex::ReText::new_rc(unicode, &extent));
-        self.insert_re_text(key, extent, &text);
-        text
-    }
-
-    fn insert_re_text(
-        &mut self,
-        key: (usize, bool),
-        s: crate::lstr::LStr,
-        text: &Rc<crate::regex::ReText>,
-    ) {
-        let bytes = s
-            .retained_requested_bytes()
-            .saturating_add(text.heap_bytes())
-            .saturating_add(std::mem::size_of::<(
-                (usize, bool),
-                crate::lstr::LStr,
-                Rc<crate::regex::ReText>,
-            )>());
-        self.re_texts.insert(key, (s, text.clone()), bytes);
-    }
-
     /// Sweep one already-proven non-live set: atomic weak clearing and internal-slot eviction
     /// (ECMA-262 #sec-weakref-execution).
     pub(crate) fn gc_sweep_dead_objects(
@@ -11890,8 +11787,6 @@ impl Interp {
             host_settings_states: _,
             computed_reads: _,
             property_key_strings: _,
-            re_texts: _,
-            re_text_ascii_hot: _,
             // Keyed weakly; a dead key misses on lookup.
             fragment_cache: _,
             // Not keyed by object addresses: intrinsics and roots, execution state, counters, and

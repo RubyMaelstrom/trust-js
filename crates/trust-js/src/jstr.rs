@@ -182,19 +182,6 @@ pub fn from_units(units: &[u16]) -> String {
     out
 }
 
-/// The code points of a unit sequence: a surrogate pair is one, and any other unit, a lone
-/// surrogate included, is its own (as [`CodePointIter`] reads engine text).
-pub(crate) fn code_points_of_units(units: &[u16]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(units.len());
-    let mut index = 0;
-    while index < units.len() {
-        let point = code_point_from_pair(units[index], units.get(index + 1).copied());
-        index += if point >= 0x10000 { 2 } else { 1 };
-        out.push(point);
-    }
-    out
-}
-
 /// Unicode Default Case Conversion of code units (ECMA-262 §22.1.3.28, §22.1.3.30), through
 /// `char`'s mappings: each code point maps, one-to-many included, and a lone surrogate stays.
 /// `None` when lowering units that hold U+03A3, whose Final_Sigma context `str::to_lowercase`

@@ -1289,8 +1289,7 @@ fn re_sym_replace_direct(
     let read_last =
         |obj: &Gc| plain_last_index(obj).expect("direct replace lastIndex guard") as usize;
     let set_last = |obj: &Gc, n: usize| set_last_index_at_slot(obj, n as f64);
-    let text = i.re_text(re.unicode, s);
-    let size = text.unit_index(text.len());
+    let size = s.unit_len();
     if re.global {
         set_last(obj, 0);
     }
@@ -1304,7 +1303,7 @@ fn re_sym_replace_direct(
             set_last(obj, 0);
             break;
         }
-        let matched = regexp_exec_text_shared(i, re, &text, text.elem_at_unit(last));
+        let matched = regexp_exec_text_shared(i, re, s, last);
         let Some(caps) = regexp_match_result(i, matched)? else {
             if uses_last {
                 set_last(obj, 0);
@@ -1313,21 +1312,15 @@ fn re_sym_replace_direct(
         };
         let (start, end) = caps[0].expect("successful regexp match has a span");
         if uses_last {
-            set_last(obj, text.unit_index(end));
+            set_last(obj, end);
         }
-        update_regexp_legacy_statics(i, re, &caps, &text, s);
+        update_regexp_legacy_statics(i, re, &caps, s);
         matches.push(caps);
         if !re.global {
             break;
         }
         if start == end {
-            // AdvanceStringIndex: one code unit, or one code point in Unicode mode.
-            let next = if end < text.len() {
-                text.unit_index(end + 1)
-            } else {
-                size + 1
-            };
-            set_last(obj, next);
+            set_last(obj, advance_string_index(end, s, re.unicode));
         }
     }
     if matches.is_empty() {
@@ -1343,22 +1336,22 @@ fn re_sym_replace_direct(
     let mut next = 0usize;
     for caps in &matches {
         let (start, end) = caps[0].expect("successful regexp match has a span");
-        let position = text.unit_index(start);
+        let position = start;
         let captures = || {
             (1..=re.ngroups)
                 .map(|group| match caps[group] {
-                    Some((a, b)) => Value::Str(text.slice_lstr(a, b)),
+                    Some((a, b)) => Value::Str(s.slice_units(a, b)),
                     None => Value::Undefined,
                 })
                 .collect::<Vec<_>>()
         };
         let replacement: crate::lstr::LStr = if let Some(function) = replacer {
             let mut args = Vec::with_capacity(re.ngroups + 4);
-            args.push(Value::Str(text.slice_lstr(start, end)));
+            args.push(Value::Str(s.slice_units(start, end)));
             args.extend(captures());
             args.push(Value::Num(position as f64));
             args.push(Value::Str(*s));
-            let groups = regexp_groups(i, re, caps, &text);
+            let groups = regexp_groups(i, re, caps, s);
             if !matches!((groups).view(), ValueView::Undefined) {
                 args.push(groups);
             }
@@ -1366,8 +1359,8 @@ fn re_sym_replace_direct(
             ab(i.to_string(&result))?
         } else if substitutes {
             let captures = captures();
-            let named = regexp_groups(i, re, caps, &text);
-            let matched = text.slice(start, end);
+            let named = regexp_groups(i, re, caps, s);
+            let matched = subject_text(s, start, end);
             get_substitution(
                 i,
                 &matched,
@@ -1382,10 +1375,7 @@ fn re_sym_replace_direct(
             *template
         };
         if start >= next {
-            out.push_units(
-                s.units()
-                    .slice(text.unit_index(next), text.unit_index(start)),
-            );
+            out.push_units(s.units().slice(next, start));
             out.push_units(replacement.units());
             // Pathological expansion ($1 of a huge match, repeated) dies as a RangeError.
             if out.len() > MAX_STR_LEN {
@@ -1394,7 +1384,7 @@ fn re_sym_replace_direct(
             next = end;
         }
     }
-    out.push_units(s.units().slice(text.unit_index(next), s.unit_len()));
+    out.push_units(s.units().slice(next, s.unit_len()));
     Ok(Value::Str(out.finish()))
 }
 
@@ -1586,24 +1576,23 @@ fn split_direct(
         return Ok(i.make_array(parts));
     }
     let search = split_search_regexp(i, re)?;
-    let text = i.re_text(search.unicode, s);
-    let len = text.len();
+    let len = s.unit_len();
     if len == 0 {
-        let matched = regexp_exec_text_shared(i, &search, &text, 0);
+        let matched = regexp_exec_text_shared(i, &search, s, 0);
         if let Some(caps) = regexp_match_result(i, matched)? {
-            update_regexp_legacy_statics(i, &search, &caps, &text, s);
+            update_regexp_legacy_statics(i, &search, &caps, s);
         } else {
             parts.push(Value::Str(*s));
         }
         return Ok(i.make_array(parts));
     }
-    // Element positions: `p` ends the last piece, `q` is where the next attempt starts.
+    // Unit positions: `p` ends the last piece, `q` is where the next attempt starts.
     let (mut p, mut q) = (0usize, 0usize);
     while q < len {
         if let Err(error) = regexp_interrupt_tick(i) {
             return Err(regexp_match_error_value(i, error));
         }
-        let matched = regexp_exec_text_shared(i, &search, &text, q);
+        let matched = regexp_exec_text_shared(i, &search, s, q);
         let Some(caps) = regexp_match_result(i, matched)? else {
             break;
         };
@@ -1612,20 +1601,20 @@ fn split_direct(
         if a >= len {
             break;
         }
-        update_regexp_legacy_statics(i, &search, &caps, &text, s);
+        update_regexp_legacy_statics(i, &search, &caps, s);
         if e == p {
             // AdvanceStringIndex past an empty match at the last split point.
-            q = a + 1;
+            q = advance_string_index(a, s, search.unicode);
             continue;
         }
-        parts.push(Value::Str(text.slice_lstr(p, a)));
+        parts.push(Value::Str(s.slice_units(p, a)));
         if parts.len() == lim {
             return Ok(i.make_array(parts));
         }
         p = e;
         for group in 1..=search.ngroups {
             parts.push(match caps[group] {
-                Some((x, y)) => Value::Str(text.slice_lstr(x, y)),
+                Some((x, y)) => Value::Str(s.slice_units(x, y)),
                 None => Value::Undefined,
             });
             if parts.len() == lim {
@@ -1634,7 +1623,7 @@ fn split_direct(
         }
         q = p;
     }
-    parts.push(Value::Str(text.slice_lstr(p, len)));
+    parts.push(Value::Str(s.slice_units(p, len)));
     Ok(i.make_array(parts))
 }
 
@@ -1671,16 +1660,15 @@ pub(super) fn re_sym_split_discard_fast(
         Ok(search) => search,
         Err(error) => return Some(Err(error)),
     };
-    let text = i.re_text(search_re.unicode, input);
-    let size = text.unit_index(text.len());
+    let size = input.unit_len();
     if size == 0 {
-        let matched = regexp_find_text_shared(i, &search_re, &text, 0);
+        let matched = regexp_find_text_shared(i, &search_re, input, 0);
         let found = match regexp_match_result(i, matched) {
             Ok(found) => found,
             Err(error) => return Some(Err(error)),
         };
         if let Some(whole) = found {
-            update_regexp_legacy_statics_lazy(i, &search_re, whole, 0, &text, input);
+            update_regexp_legacy_statics_lazy(i, &search_re, whole, 0, input);
         }
         return Some(Ok(Value::Undefined));
     }
@@ -1692,8 +1680,7 @@ pub(super) fn re_sym_split_discard_fast(
         if let Err(error) = regexp_interrupt_tick(i) {
             return Some(Err(regexp_match_error_value(i, error)));
         }
-        let search_start = text.elem_at_unit(q);
-        let matched = regexp_find_text_shared(i, &search_re, &text, search_start);
+        let matched = regexp_find_text_shared(i, &search_re, input, q);
         let found = match regexp_match_result(i, matched) {
             Ok(found) => found,
             Err(error) => return Some(Err(error)),
@@ -1701,13 +1688,11 @@ pub(super) fn re_sym_split_discard_fast(
         let Some(whole @ (a, e)) = found else {
             break;
         };
-        let a = text.unit_index(a);
-        let e = text.unit_index(e);
         // RegExp@@split's sticky loop stops before attempting a match at the final position.
         if a >= size {
             break;
         }
-        update_regexp_legacy_statics_lazy(i, &search_re, whole, search_start, &text, input);
+        update_regexp_legacy_statics_lazy(i, &search_re, whole, q, input);
         if e == p {
             q = advance_string_index(a, input, unicode);
         } else {

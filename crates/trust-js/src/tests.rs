@@ -11026,25 +11026,8 @@ fn compiled_comma_prefixes_preserve_getters_coercions_and_abrupt_completions() {
 }
 
 #[test]
-fn reconstructible_string_and_regexp_caches_account_retained_bytes() {
+fn regexp_program_cache_accounts_retained_bytes() {
     let mut engine = Engine::new();
-    let ascii = crate::lstr::LStr::from("repeated ascii subject");
-    let first_ascii = engine.interp.re_text(false, &ascii);
-    let second_ascii = engine.interp.re_text(false, &ascii);
-    assert!(std::rc::Rc::ptr_eq(&first_ascii, &second_ascii));
-    assert_eq!(engine.interp.re_texts.stats(), (0, 0));
-
-    let source = "é".repeat(128);
-    let source = crate::lstr::LStr::from(source.as_str());
-    let units = engine.interp.units_full(&source);
-    assert_eq!(units.len(), 128);
-
-    let text = engine.interp.re_text(true, &source);
-    assert!(text.heap_bytes() > 0);
-    let (text_entries, text_bytes) = engine.interp.re_texts.stats();
-    assert_eq!(text_entries, 1);
-    assert!(text_bytes >= source.allocation_requested_bytes() + text.heap_bytes());
-
     let first = engine
         .interp
         .compiled_regexp("a+", "gi")

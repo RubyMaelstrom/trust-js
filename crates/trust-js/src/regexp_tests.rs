@@ -791,11 +791,6 @@ fn regexp_subjects_that_view_ascii_strings_match_as_ascii() {
             );
             assert!(string.known_ascii(), "{tier:?}: {name} is known ASCII");
         }
-        assert_eq!(
-            engine.interp.re_texts.values().count(),
-            0,
-            "{tier:?}: no subject entered the cache"
-        );
     }
 }
 

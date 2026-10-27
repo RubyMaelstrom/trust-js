@@ -262,6 +262,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn get_cloned(&mut self, key: &K) -> Option<V>
     where
         V: Clone,

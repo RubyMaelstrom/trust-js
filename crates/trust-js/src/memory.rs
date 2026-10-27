@@ -445,7 +445,6 @@ pub(crate) struct Visitor {
     binding_layouts: HashSet<usize>,
     stmt_bodies: HashSet<usize>,
     global_var_name_sets: HashSet<usize>,
-    re_texts: HashSet<usize>,
     regexes: HashSet<usize>,
     regexp_programs: HashSet<usize>,
     regexp_char_classes: HashSet<usize>,
@@ -785,14 +784,6 @@ impl Visitor {
             self.value(value);
         }
         values.len().saturating_mul(size_of::<Value>())
-    }
-
-    pub(crate) fn re_text(&mut self, text: &Rc<crate::regex::ReText>) {
-        let identity = Rc::as_ptr(text) as usize;
-        if self.re_texts.insert(identity) {
-            let bytes = text.scan_retained_memory(self);
-            self.regexp_metadata = self.regexp_metadata.saturating_add(bytes);
-        }
     }
 
     pub(crate) fn regex(&mut self, regex: &Rc<crate::regex::Regex>) {
@@ -1383,20 +1374,6 @@ fn scan_realm(
             .engine_caches
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
-    let (bytes, exact) = interp.re_texts.scan_retained_memory(|(string, text)| {
-        visitor.lstr(string);
-        visitor.re_text(text);
-    });
-    totals.engine_caches.add(bytes);
-    if !exact {
-        totals
-            .engine_caches
-            .make_lower_bound("opaque standard-library HashMap bucket storage");
-    }
-    if let Some((string, _, text)) = &interp.re_text_ascii_hot {
-        visitor.lstr(string);
-        visitor.re_text(text);
-    }
     let (bytes, exact) = interp.regexp_programs.scan_retained_memory(visitor);
     totals.engine_caches.add(bytes);
     if !exact {
@@ -1509,7 +1486,6 @@ fn scan_realm(
                 .saturating_mul(size_of::<Option<(usize, usize)>>()),
         );
         visitor.lstr(&last.input);
-        visitor.re_text(&last.text);
         if let Some((regex, _)) = &last.lazy_captures {
             visitor.regex(regex);
         }
@@ -2901,25 +2877,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prepared_window_census_retains_and_deduplicates_shared_tables() {
-        let source: LStr = format!("{}é😀", "x".repeat(1024)).into();
-        let parent = Rc::new(crate::regex::ReText::new_rc(true, &source));
-        let a = source.slice_units(100, source.unit_len());
-        let b = source.slice_units(200, source.unit_len());
-        let first = Rc::new(crate::regex::ReText::window(parent.clone(), &a, 100, 1027).unwrap());
-        let second = Rc::new(crate::regex::ReText::window(parent.clone(), &b, 200, 1027).unwrap());
-        let mut visitor = Visitor::default();
-        visitor.re_text(&first);
-        visitor.re_text(&second);
-        visitor.re_text(&parent);
-        visitor.re_text(&first);
-        assert_eq!(
-            visitor.regexp_metadata,
-            parent.heap_bytes() + 2 * size_of::<crate::regex::ReText>()
-        );
-    }
-
     /// The allocations host state reports are counted once per identity, and the JavaScript
     /// values it keeps, in handles (S6 step 11b), once per value.
     #[cfg(feature = "embed")]
@@ -3017,11 +2974,6 @@ mod tests {
     #[test]
     fn cache_pins_are_scanned_into_canonical_allocation_families() {
         let mut interp = Interp::new();
-        let non_ascii = LStr::from("éééé");
-        interp.units_full(&non_ascii);
-        interp.re_text(true, &non_ascii);
-        let ascii = LStr::from("cache-hot-ascii");
-        interp.re_text(false, &ascii);
         interp
             .compiled_regexp("(?:cache)+", "gi")
             .unwrap_or_else(|_| panic!("regexp compiles"));
@@ -3033,7 +2985,6 @@ mod tests {
 
         assert!(first.engine_caches.bytes > 0);
         assert!(first.regexp_metadata.bytes > 0);
-        assert!(first.strings_symbols_bigints.bytes >= non_ascii.text().len() + ascii.text().len());
         assert_eq!(first.json(9, 12), second.json(9, 12));
     }
 

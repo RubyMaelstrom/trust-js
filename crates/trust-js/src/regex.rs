@@ -19,7 +19,7 @@ const MAX_REPEAT: usize = 1000;
 const INLINE_CAPTURES: usize = 4;
 const INTERRUPT_POLL_MASK: usize = 0x3fff;
 /// Keep cold patterns on the compact matcher program. A pattern is promoted only after repeated
-/// execution and only when an ASCII or one-byte subject has actually been observed.
+/// execution and only when a one-byte subject has actually been observed.
 const REGEXP_TIER_UP_THRESHOLD: u32 = 64;
 /// Override the feedback threshold for local A/B runs. Zero disables the experimental tier.
 fn regexp_tier_up_threshold() -> u32 {
@@ -29,10 +29,10 @@ fn regexp_tier_up_threshold() -> u32 {
         .unwrap_or(REGEXP_TIER_UP_THRESHOLD)
 }
 
-const SUBJECT_ASCII: u8 = 1 << 0;
-const SUBJECT_ONE_BYTE: u8 = 1 << 1;
-const SUBJECT_TWO_BYTE: u8 = 1 << 2;
-const SUBJECT_ASTRAL: u8 = 1 << 3;
+/// The storage of the subjects a pattern has matched, which its tier-up consults: one byte a
+/// code unit (ASCII), or two (see [`crate::lstr::Units`]).
+const SUBJECT_ONE_BYTE: u8 = 1 << 0;
+const SUBJECT_TWO_BYTE: u8 = 1 << 1;
 
 /// Number of [`Inst`] variants, one counter per kind for the opt-in matcher profiling report.
 const REGEXP_PROF_INST_KINDS: usize = 26;
@@ -364,16 +364,6 @@ impl OneByteSubject for [u8] {
     }
 }
 
-impl OneByteSubject for [u32] {
-    fn len(&self) -> usize {
-        <[u32]>::len(self)
-    }
-
-    fn element_at(&self, index: usize) -> u32 {
-        self[index]
-    }
-}
-
 #[repr(C)]
 struct OneByteNativeMatch {
     from: usize,
@@ -404,14 +394,10 @@ extern "C" fn regexp_native_poll(control: *const crate::RuntimeInterrupt) -> u32
 }
 
 struct OneByteNativeCode {
-    #[allow(dead_code)] // Ownership keeps both W^X mappings alive until the pattern is evicted.
-    byte_executable: crate::jit::ExecutableBuffer,
-    #[allow(dead_code)]
-    word_executable: crate::jit::ExecutableBuffer,
+    #[allow(dead_code)] // Ownership keeps the W^X mapping alive until the pattern is evicted.
+    executable: crate::jit::ExecutableBuffer,
     #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-    byte_entry: OneByteNativeEntry,
-    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-    word_entry: OneByteNativeEntry,
+    entry: OneByteNativeEntry,
 }
 
 impl OneByteNativeCode {
@@ -432,45 +418,25 @@ impl OneByteNativeCode {
             if ops.len() > 256 {
                 return None;
             }
-            let byte_code = {
+            let code = {
                 #[cfg(target_arch = "aarch64")]
                 {
-                    compile_one_byte_native_aarch64(ops, false)?
+                    compile_one_byte_native_aarch64(ops)?
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    compile_one_byte_native_x64(ops, false)?
+                    compile_one_byte_native_x64(ops)?
                 }
             };
-            let word_code = {
-                #[cfg(target_arch = "aarch64")]
-                {
-                    compile_one_byte_native_aarch64(ops, true)?
-                }
-                #[cfg(target_arch = "x86_64")]
-                {
-                    compile_one_byte_native_x64(ops, true)?
-                }
-            };
-            let byte_executable = crate::jit::ExecutableBuffer::from_bytes(&byte_code)?;
-            let word_executable = crate::jit::ExecutableBuffer::from_bytes(&word_code)?;
+            let executable = crate::jit::ExecutableBuffer::from_bytes(&code)?;
             // The emitter produces one entry at byte zero and the allocation is immutable after
             // W^X publication. Its only embedded pointers refer to immutable class LUTs retained
             // by `ops` in the owning OneByteNativeProgram.
-            let byte_entry = unsafe {
-                std::mem::transmute::<*const u8, OneByteNativeEntry>(byte_executable.as_ptr())
+            let entry = unsafe {
+                std::mem::transmute::<*const u8, OneByteNativeEntry>(executable.as_ptr())
             };
-            let word_entry = unsafe {
-                std::mem::transmute::<*const u8, OneByteNativeEntry>(word_executable.as_ptr())
-            };
-            regexp_prof_native_code(byte_executable.len());
-            regexp_prof_native_code(word_executable.len());
-            Some(Self {
-                byte_executable,
-                word_executable,
-                byte_entry,
-                word_entry,
-            })
+            regexp_prof_native_code(executable.len());
+            Some(Self { executable, entry })
         }
         #[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix)))]
         {
@@ -479,14 +445,13 @@ impl OneByteNativeCode {
         }
     }
 
-    /// List both programs, for byte and for word subjects, in the perf map
-    /// (`TRUST_JS_PERF_MAP`, see [`crate::jit::profiler`]) as the pattern `source` with `flags`.
+    /// List the program in the perf map (`TRUST_JS_PERF_MAP`, see [`crate::jit::profiler`]) as
+    /// the pattern `source` with `flags`.
     fn list_in_perf_map(&self, source: &str, flags: &str) {
-        for executable in [&self.byte_executable, &self.word_executable] {
-            crate::jit::profiler::perf_map_code(executable.as_ptr(), executable.len(), || {
-                format!("RegExp:/{}/{flags}", crate::jstr::to_text(source))
-            });
-        }
+        let executable = &self.executable;
+        crate::jit::profiler::perf_map_code(executable.as_ptr(), executable.len(), || {
+            format!("RegExp:/{}/{flags}", crate::jstr::to_text(source))
+        });
     }
 
     fn find_ascii(
@@ -499,33 +464,8 @@ impl OneByteNativeCode {
         #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
         {
             self.run_entry(
-                self.byte_entry,
+                self.entry,
                 subject.as_ptr(),
-                subject.len(),
-                start,
-                sticky,
-                control,
-            )
-        }
-        #[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix)))]
-        {
-            let _ = (subject, start, sticky, control);
-            unreachable!("machine RegExp code is unavailable on this target")
-        }
-    }
-
-    fn find_one_byte(
-        &self,
-        subject: &[u32],
-        start: usize,
-        sticky: bool,
-        control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<(usize, usize)> {
-        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-        {
-            self.run_entry(
-                self.word_entry,
-                subject.as_ptr() as *const u8,
                 subject.len(),
                 start,
                 sticky,
@@ -632,7 +572,7 @@ impl OneByteNativeAssembler {
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
-fn compile_one_byte_native_x64(ops: &[OneByteNativeOp], word_elements: bool) -> Option<Vec<u8>> {
+fn compile_one_byte_native_x64(ops: &[OneByteNativeOp]) -> Option<Vec<u8>> {
     // SysV ABI arguments enter in rdi/rsi/rdx/rcx/r8/r9. Move them into callee-saved registers so
     // the poll helper can use the ordinary argument registers without losing the scan state.
     let mut a = OneByteNativeAssembler::new();
@@ -676,31 +616,27 @@ fn compile_one_byte_native_x64(ops: &[OneByteNativeOp], word_elements: bool) -> 
     a.bytes(&[0xff, 0xd0]); // call rax
     a.bytes(&[0x84, 0xc0]); // test al, al
     a.jcc(0x85, interrupted); // jne
-    if word_elements {
-        a.bytes(&[0x4f, 0x8d, 0x14, 0xb4]); // lea r10, [r12 + r14 * 4]
-    } else {
-        a.bytes(&[0x4f, 0x8d, 0x14, 0x34]); // lea r10, [r12 + r14]
-    }
+    a.bytes(&[0x4f, 0x8d, 0x14, 0x34]); // lea r10, [r12 + r14]
 
     let mut offset = 0i32;
     for op in ops {
         match op {
             OneByteNativeOp::Char(expected) => {
                 debug_assert!(*expected < 0x100);
-                emit_x64_cmp_mem_imm(&mut a, offset, *expected as u8, word_elements);
+                emit_x64_cmp_mem_imm(&mut a, offset, *expected as u8);
                 a.jcc(0x85, fail); // jne
                 offset += 1;
             }
             OneByteNativeOp::Any => {
-                emit_x64_cmp_mem_imm(&mut a, offset, b'\n', word_elements);
+                emit_x64_cmp_mem_imm(&mut a, offset, b'\n');
                 a.jcc(0x84, fail); // je
-                emit_x64_cmp_mem_imm(&mut a, offset, b'\r', word_elements);
+                emit_x64_cmp_mem_imm(&mut a, offset, b'\r');
                 a.jcc(0x84, fail); // je
                 offset += 1;
             }
             OneByteNativeOp::Class(class) => {
                 let lut = class.ascii_lut.as_ref()?.as_ptr() as usize as u64;
-                emit_x64_load_mem(&mut a, offset, word_elements); // ecx = subject element
+                emit_x64_load_mem(&mut a, offset); // ecx = subject element
                 a.bytes(&[0x48, 0xb8]); // movabs rax, LUT
                 a.imm64(lut);
                 a.bytes(&[0x0f, 0xb6, 0x04, 0x08]); // movzx eax, byte [rax + rcx]
@@ -763,22 +699,7 @@ fn compile_one_byte_native_x64(ops: &[OneByteNativeOp], word_elements: bool) -> 
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
-fn emit_x64_cmp_mem_imm(
-    a: &mut OneByteNativeAssembler,
-    offset: i32,
-    value: u8,
-    word_elements: bool,
-) {
-    if word_elements {
-        if (0..=127).contains(&(offset * 4)) {
-            a.bytes(&[0x41, 0x81, 0x7a, (offset * 4) as u8]); // cmp dword [r10 + disp8], imm32
-        } else {
-            a.bytes(&[0x41, 0x81, 0xba]); // cmp dword [r10 + disp32], imm32
-            a.imm32((offset * 4) as u32);
-        }
-        a.imm32(u32::from(value));
-        return;
-    }
+fn emit_x64_cmp_mem_imm(a: &mut OneByteNativeAssembler, offset: i32, value: u8) {
     if (0..=127).contains(&offset) {
         a.bytes(&[0x41, 0x80, 0x7a, offset as u8, value]); // cmp byte [r10 + disp8], imm8
     } else {
@@ -789,22 +710,12 @@ fn emit_x64_cmp_mem_imm(
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
-fn emit_x64_load_mem(a: &mut OneByteNativeAssembler, offset: i32, word_elements: bool) {
-    let (opcode, scale) = if word_elements { (0x8b, 4) } else { (0xb6, 1) };
-    let byte_offset = offset * scale;
-    if (0..=127).contains(&byte_offset) {
-        if word_elements {
-            a.bytes(&[0x41, 0x8b, 0x4a, byte_offset as u8]); // mov ecx, dword [r10 + disp8]
-        } else {
-            a.bytes(&[0x41, 0x0f, opcode, 0x4a, byte_offset as u8]);
-            // movzx ecx, byte [r10 + disp8]
-        }
-    } else if word_elements {
-        a.bytes(&[0x41, 0x8b, 0x8a]); // mov ecx, dword [r10 + disp32]
-        a.imm32(byte_offset as u32);
+fn emit_x64_load_mem(a: &mut OneByteNativeAssembler, offset: i32) {
+    if (0..=127).contains(&offset) {
+        a.bytes(&[0x41, 0x0f, 0xb6, 0x4a, offset as u8]); // movzx ecx, byte [r10 + disp8]
     } else {
-        a.bytes(&[0x41, 0x0f, opcode, 0x8a]); // movzx ecx, byte [r10 + disp32]
-        a.imm32(byte_offset as u32);
+        a.bytes(&[0x41, 0x0f, 0xb6, 0x8a]); // movzx ecx, byte [r10 + disp32]
+        a.imm32(offset as u32);
     }
 }
 
@@ -958,12 +869,6 @@ fn arm64_ldrb(a: &mut OneByteNativeArm64Assembler, dst: u8, base: u8, offset: u3
 }
 
 #[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_ldr_w(a: &mut OneByteNativeArm64Assembler, dst: u8, base: u8, offset: u32) {
-    debug_assert!(offset < 1 << 12);
-    a.insn(0xb940_0000 | (offset << 10) | (u32::from(base) << 5) | u32::from(dst));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
 fn arm64_str64(a: &mut OneByteNativeArm64Assembler, src: u8, base: u8, offset: u32) {
     debug_assert_eq!(offset % 8, 0);
     debug_assert!(offset / 8 < 1 << 12);
@@ -971,10 +876,7 @@ fn arm64_str64(a: &mut OneByteNativeArm64Assembler, src: u8, base: u8, offset: u
 }
 
 #[cfg(all(target_arch = "aarch64", unix))]
-fn compile_one_byte_native_aarch64(
-    ops: &[OneByteNativeOp],
-    word_elements: bool,
-) -> Option<Vec<u8>> {
+fn compile_one_byte_native_aarch64(ops: &[OneByteNativeOp]) -> Option<Vec<u8>> {
     // AArch64 Unix ABI arguments enter in x0..x5. x19..x24 retain them, x25 retains the last
     // candidate, and x16 is the indirect-call scratch register.
     let mut a = OneByteNativeArm64Assembler::new();
@@ -1007,32 +909,20 @@ fn compile_one_byte_native_aarch64(
     a.insn(0xd63f_0200); // blr x16
     arm64_cmp_imm_w(&mut a, 0, 0);
     a.branch_cond(1, interrupted); // NE: poll returned a reason
-    if word_elements {
-        arm64_add_shifted_reg(&mut a, 10, 19, 21, 2); // add x10, x19, x21, lsl #2
-    } else {
-        arm64_add_shifted_reg(&mut a, 10, 19, 21, 0); // add x10, x19, x21
-    }
+    arm64_add_shifted_reg(&mut a, 10, 19, 21, 0); // add x10, x19, x21
 
     let mut offset = 0u32;
     for op in ops {
         match op {
             OneByteNativeOp::Char(expected) => {
                 debug_assert!(*expected < 0x100);
-                if word_elements {
-                    arm64_ldr_w(&mut a, 9, 10, offset * 4);
-                } else {
-                    arm64_ldrb(&mut a, 9, 10, offset);
-                }
+                arm64_ldrb(&mut a, 9, 10, offset);
                 arm64_cmp_imm_w(&mut a, 9, *expected);
                 a.branch_cond(1, fail); // NE
                 offset += 1;
             }
             OneByteNativeOp::Any => {
-                if word_elements {
-                    arm64_ldr_w(&mut a, 9, 10, offset * 4);
-                } else {
-                    arm64_ldrb(&mut a, 9, 10, offset);
-                }
+                arm64_ldrb(&mut a, 9, 10, offset);
                 arm64_cmp_imm_w(&mut a, 9, b'\n' as u32);
                 a.branch_cond(0, fail); // EQ
                 arm64_cmp_imm_w(&mut a, 9, b'\r' as u32);
@@ -1041,11 +931,7 @@ fn compile_one_byte_native_aarch64(
             }
             OneByteNativeOp::Class(class) => {
                 let lut = class.ascii_lut.as_ref()?.as_ptr() as usize as u64;
-                if word_elements {
-                    arm64_ldr_w(&mut a, 9, 10, offset * 4);
-                } else {
-                    arm64_ldrb(&mut a, 9, 10, offset);
-                }
+                arm64_ldrb(&mut a, 9, 10, offset);
                 arm64_mov_imm64(&mut a, 16, lut);
                 a.insn(0x8b09_0210); // add x16, x16, x9 (the byte is zero-extended)
                 arm64_ldrb(&mut a, 9, 16, 0);
@@ -1161,7 +1047,7 @@ impl OneByteNativeProgram {
         // The AArch64 class emitter still needs an optimized-release audit: on this host it can
         // lose termination on a no-match tail even though the same program is sound in debug.
         // Keep the checked native Rust matcher (and terminal Many specialization) available while
-        // declining only the unsafe LUT machine mapping. The byte/word fixed-width path remains
+        // declining only the unsafe LUT machine mapping. The fixed-width byte path remains
         // enabled for the class-free subset.
         // Assertions need to participate in the candidate scan, including the failed-candidate
         // path. Keep those programs on the checked native Rust matcher until the architecture
@@ -1210,19 +1096,6 @@ impl OneByteNativeProgram {
     ) -> MatchResult<(usize, usize)> {
         if let Some(code) = &self.machine_code {
             return code.find_ascii(subject, start, sticky, control);
-        }
-        self.find_interpreted(subject, start, sticky, control)
-    }
-
-    fn find_one_byte(
-        &self,
-        subject: &[u32],
-        start: usize,
-        sticky: bool,
-        control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<(usize, usize)> {
-        if let Some(code) = &self.machine_code {
-            return code.find_one_byte(subject, start, sticky, control);
         }
         self.find_interpreted(subject, start, sticky, control)
     }
@@ -1538,16 +1411,18 @@ const MAX_SINGLE_START_RANGE: usize = 16;
 /// once no occurrence is left, no match can be either. A regex that tries one start alone
 /// (sticky, or anchored at the input's start) checks only the offsets in range of that start.
 struct Prefilter {
-    /// Code units, or code points in Unicode mode: the matcher's elements.
-    elements: Box<[u32]>,
-    /// The elements as bytes when all fit in one; a subject of bytes cannot hold the literal
+    /// The literal's code units, as a two-byte subject stores them (a code point past the BMP
+    /// is a surrogate pair).
+    units: Box<[u16]>,
+    /// The units as bytes when all fit in one; a one-byte subject cannot hold the literal
     /// otherwise.
     bytes: Option<Box<[u8]>>,
+    /// The least and greatest offset, in elements, at which the literal may begin.
     min_offset: usize,
     /// `None` when unbounded: occurrences then end the search only by running out.
     max_offset: Option<usize>,
-    /// The indices of the literal's two rarest elements (one index twice for a single element):
-    /// a scan compares those first and checks the whole literal only where both agree.
+    /// The indices of the literal's two rarest units (one index twice for a single unit): a
+    /// scan compares those first and checks the whole literal only where both agree.
     rare: [usize; 2],
 }
 
@@ -1567,22 +1442,40 @@ impl Prefilter {
         {
             return None;
         }
-        let mut by_rarity: Vec<usize> = (0..literal.elements.len()).collect();
-        by_rarity.sort_by_key(|&index| element_commonness(literal.elements[index]));
+        let mut units = Vec::with_capacity(literal.elements.len());
+        for &element in &literal.elements {
+            match char::from_u32(element).filter(|_| element > 0xffff) {
+                Some(astral) => units.extend_from_slice(astral.encode_utf16(&mut [0; 2])),
+                None => units.push(element as u16),
+            }
+        }
+        let mut by_rarity: Vec<usize> = (0..units.len()).collect();
+        by_rarity.sort_by_key(|&index| element_commonness(u32::from(units[index])));
         let rare = [by_rarity[0], *by_rarity.get(1).unwrap_or(&by_rarity[0])];
-        let bytes = literal
-            .elements
+        let bytes = units
             .iter()
-            .map(|&element| u8::try_from(element).ok())
+            .map(|&unit| u8::try_from(unit).ok())
             .collect::<Option<Vec<u8>>>()
             .map(Vec::into_boxed_slice);
         Some(Box::new(Self {
-            elements: literal.elements.into_boxed_slice(),
+            units: units.into_boxed_slice(),
             bytes,
             min_offset: literal.min_offset,
             max_offset: literal.max_offset,
             rare,
         }))
+    }
+
+    /// The greatest offset at which the literal may begin, in positions of `I`: a [`Paired`]
+    /// subject's elements take up to two units each, other subjects' one.
+    fn max_offset_in<I: ReInput>(&self) -> Option<usize> {
+        self.max_offset.map(|max| {
+            if I::PAIRED {
+                max.saturating_mul(2)
+            } else {
+                max
+            }
+        })
     }
 
     /// The first offset at or past `from` plus the literal's least offset where `input` holds
@@ -1593,7 +1486,7 @@ impl Prefilter {
         from: usize,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<usize> {
-        let Some(last) = input.len().checked_sub(self.elements.len()) else {
+        let Some(last) = input.len().checked_sub(self.units.len()) else {
             return Ok(None);
         };
         let first = from.saturating_add(self.min_offset);
@@ -1611,11 +1504,11 @@ impl Prefilter {
         at: usize,
         control: &crate::RuntimeInterrupt,
     ) -> Result<bool, MatchError> {
-        let Some(last) = input.len().checked_sub(self.elements.len()) else {
+        let Some(last) = input.len().checked_sub(self.units.len()) else {
             return Ok(false);
         };
         let first = at.saturating_add(self.min_offset);
-        let last = last.min(at.saturating_add(self.max_offset.unwrap_or(usize::MAX)));
+        let last = last.min(at.saturating_add(self.max_offset_in::<I>().unwrap_or(usize::MAX)));
         if first > last {
             return Ok(false);
         }
@@ -1626,11 +1519,7 @@ impl Prefilter {
 
     fn heap_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            .saturating_add(
-                self.elements
-                    .len()
-                    .saturating_mul(std::mem::size_of::<u32>()),
-            )
+            .saturating_add(self.units.len().saturating_mul(std::mem::size_of::<u16>()))
             .saturating_add(self.bytes.as_ref().map_or(0, |bytes| bytes.len()))
     }
 }
@@ -2433,295 +2322,6 @@ fn elem_of_cp(cp: u32) -> char {
     }
 }
 
-/// The source string a prepared subject keeps (and its window's parent's), the GC edges of a
-/// cached subject.
-impl crate::gc_trace::GcTrace for ReText {
-    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        crate::gc_trace::GcTrace::trace_gc(&self.ascii_src, sink);
-        if let Some(parent) = &self.parent {
-            crate::gc_trace::GcTrace::trace_gc(&**parent, sink);
-        }
-    }
-}
-
-/// A subject string prepared for matching: its elements plus each element's unit offset.
-/// A flat subject's `unit_of` is `None` when element index == unit offset; otherwise it records
-/// each element's offset and the final unit length. A window resolves both elements and offsets
-/// through one flat parent. JS-visible indices (lastIndex, match.index) remain relative units.
-pub struct ReText {
-    /// Flat wide elements — empty for ASCII subjects and windows. Matchers use `elements()`;
-    /// ASCII subjects match over `ascii_src`'s bytes with no element materialization.
-    pub elems: Vec<u32>,
-    pub unit_of: Option<Vec<usize>>,
-    /// Visible element count, including windows with no privately owned elements.
-    n_elems: usize,
-    subject_shape: u8,
-    unicode: bool,
-    /// The source string when it is pure ASCII (element index == byte index): matching runs
-    /// over its bytes and `slice` copies straight out of it.
-    ascii_src: Option<crate::lstr::LStr>,
-    /// A window owns one flat prepared subject, never another window. Matcher input is sliced
-    /// before entry, so anchors, lookbehind and bounds cannot inspect the excluded prefix/tail.
-    parent: Option<std::rc::Rc<ReText>>,
-    elem_base: usize,
-    unit_base: usize,
-}
-
-impl ReText {
-    /// Retained allocation size excluding the source string itself (the identity cache owns and
-    /// accounts that allocation once alongside this prepared view).
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.own_heap_bytes().saturating_add(
-            self.parent
-                .as_ref()
-                .map_or(0, |parent| parent.own_heap_bytes()),
-        )
-    }
-
-    fn own_heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(
-                self.elems
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<u32>()),
-            )
-            .saturating_add(self.unit_of.as_ref().map_or(0, |offsets| {
-                offsets
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<usize>())
-            }))
-    }
-
-    /// Attribute the prepared view and its pinned source through the managed-memory visitor.
-    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
-        if let Some(source) = &self.ascii_src {
-            visitor.lstr(source);
-        }
-        if let Some(parent) = &self.parent {
-            visitor.re_text(parent);
-        }
-        self.own_heap_bytes()
-    }
-
-    /// The caller proves `source` is precisely the parent's unit range. Exact element
-    /// boundaries are checked here; roots and their tables remain immutable and pinned.
-    pub(crate) fn window(
-        parent: std::rc::Rc<ReText>,
-        source: &crate::lstr::LStr,
-        start: usize,
-        end: usize,
-    ) -> Option<Self> {
-        if parent.parent.is_some() || end > parent.unit_index(parent.len()) || start > end {
-            return None;
-        }
-        debug_assert_eq!(source.unit_len(), end - start);
-        let first = parent.elem_at_unit(start);
-        let last = parent.elem_at_unit(end);
-        if parent.unit_index(first) != start || parent.unit_index(last) != end {
-            return None;
-        }
-        // A one-byte view's units are ASCII bytes, so it matches over them whatever its
-        // owner's width. A two-byte one matches over its range of the parent's one-byte copy
-        // when the parent's units are all ASCII (it has no elements then), and otherwise reads
-        // the parent's elements. The interpreter windows only owners up to a megabyte, so the
-        // range is a view of the copy unless it is short.
-        let ascii_src = if source.known_ascii() {
-            Some(*source)
-        } else {
-            parent.ascii_src.map(|copy| copy.slice_units(start, end))
-        };
-        let ascii = ascii_src.is_some();
-        Some(Self {
-            elems: Vec::new(),
-            unit_of: None,
-            n_elems: last - first,
-            subject_shape: if ascii {
-                SUBJECT_ASCII
-            } else {
-                parent.subject_shape
-            },
-            unicode: parent.unicode,
-            ascii_src,
-            parent: (!ascii).then_some(parent),
-            elem_base: first,
-            unit_base: start,
-        })
-    }
-
-    /// Whether this text is a window of a parent's elements.
-    #[cfg(test)]
-    pub(crate) fn is_window(&self) -> bool {
-        self.parent.is_some()
-    }
-
-    #[inline]
-    fn elements(&self) -> &[u32] {
-        match &self.parent {
-            Some(parent) => &parent.elems[self.elem_base..self.elem_base + self.n_elems],
-            None => &self.elems,
-        }
-    }
-
-    /// Prepare `s` for matching, keeping the caller's string for zero-copy ASCII slicing.
-    pub fn new_rc(unicode: bool, s: &crate::lstr::LStr) -> ReText {
-        // Engine strings maintain an exact one-way ASCII hint in their allocation header.
-        // RegExp workloads commonly stream many distinct ASCII subjects through the tiny
-        // identity cache; consulting the hint avoids rescanning every subject just to select
-        // the byte matcher. A view answers with its owner's.
-        if s.known_ascii() {
-            return ReText {
-                elems: Vec::new(),
-                unit_of: None,
-                n_elems: s.unit_len(),
-                subject_shape: SUBJECT_ASCII,
-                unicode,
-                ascii_src: Some(*s),
-                parent: None,
-                elem_base: 0,
-                unit_base: 0,
-            };
-        }
-        Self::build(unicode, &s.units().to_utf16())
-    }
-
-    fn build(unicode: bool, units: &[u16]) -> ReText {
-        // ASCII units (a two-byte string can hold only those): elements are the bytes of a
-        // one-byte copy, and element index == unit offset in both modes.
-        if units.iter().all(|&unit| unit < 0x80) {
-            return ReText {
-                elems: Vec::new(),
-                unit_of: None,
-                n_elems: units.len(),
-                subject_shape: SUBJECT_ASCII,
-                unicode,
-                ascii_src: Some(crate::lstr::LStr::from_utf16(units)),
-                parent: None,
-                elem_base: 0,
-                unit_base: 0,
-            };
-        }
-        if unicode {
-            let cps = crate::jstr::code_points_of_units(units);
-            if cps.iter().all(|&cp| cp < 0x10000) {
-                // BMP-only: one unit per element.
-                let subject_shape = if cps.iter().all(|&cp| cp <= 0xff) {
-                    SUBJECT_ONE_BYTE
-                } else {
-                    SUBJECT_TWO_BYTE
-                };
-                return ReText {
-                    n_elems: cps.len(),
-                    elems: cps,
-                    unit_of: None,
-                    subject_shape,
-                    unicode,
-                    ascii_src: None,
-                    parent: None,
-                    elem_base: 0,
-                    unit_base: 0,
-                };
-            }
-            let mut unit_of = Vec::with_capacity(cps.len() + 1);
-            let mut u = 0usize;
-            for &cp in &cps {
-                unit_of.push(u);
-                u += if cp >= 0x10000 { 2 } else { 1 };
-            }
-            unit_of.push(u);
-            ReText {
-                n_elems: cps.len(),
-                elems: cps,
-                unit_of: Some(unit_of),
-                subject_shape: SUBJECT_ASTRAL,
-                unicode,
-                ascii_src: None,
-                parent: None,
-                elem_base: 0,
-                unit_base: 0,
-            }
-        } else {
-            ReText {
-                n_elems: units.len(),
-                elems: units.iter().map(|&u| u as u32).collect(),
-                unit_of: None,
-                subject_shape: if units.iter().all(|&unit| unit <= 0xff) {
-                    SUBJECT_ONE_BYTE
-                } else {
-                    SUBJECT_TWO_BYTE
-                },
-                unicode,
-                ascii_src: None,
-                parent: None,
-                elem_base: 0,
-                unit_base: 0,
-            }
-        }
-    }
-
-    fn subject_shape(&self) -> u8 {
-        self.subject_shape
-    }
-
-    /// The element index containing unit offset `u` (== len when `u` is at/past the end).
-    pub fn elem_at_unit(&self, u: usize) -> usize {
-        if let Some(parent) = &self.parent {
-            let u = u.min(self.unit_index(self.n_elems));
-            return parent.elem_at_unit(self.unit_base + u) - self.elem_base;
-        }
-        match &self.unit_of {
-            None => u.min(self.n_elems),
-            Some(unit_of) => match unit_of.binary_search(&u) {
-                Ok(k) => k.min(self.n_elems),
-                Err(k) => k - 1,
-            },
-        }
-    }
-
-    /// The unit offset of element `e`.
-    pub fn unit_index(&self, e: usize) -> usize {
-        if let Some(parent) = &self.parent {
-            return parent.unit_index(self.elem_base + e.min(self.n_elems)) - self.unit_base;
-        }
-        match &self.unit_of {
-            None => e.min(self.n_elems),
-            Some(unit_of) => unit_of[e.min(self.n_elems)],
-        }
-    }
-
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        self.n_elems
-    }
-
-    /// [`Self::slice`] as an engine string, sharing an ASCII source's storage where `LStr` can.
-    pub(crate) fn slice_lstr(&self, a: usize, b: usize) -> crate::lstr::LStr {
-        match &self.ascii_src {
-            Some(src) => src.slice_units(a, b),
-            None => self.slice(a, b).into(),
-        }
-    }
-
-    /// The canonical string for elements `a..b` (surrogate halves recombine).
-    pub fn slice(&self, a: usize, b: usize) -> String {
-        // ASCII subject: element index == byte index — copy straight from the source.
-        if let Some(src) = &self.ascii_src {
-            return src.text()[a..b].to_string();
-        }
-        let elems = &self.elements()[a..b];
-        // ASCII fast path: elements are the bytes.
-        if elems.iter().all(|&e| e < 0x80) {
-            let bytes: Vec<u8> = elems.iter().map(|&e| e as u8).collect();
-            return String::from_utf8(bytes).unwrap();
-        }
-        if self.unicode {
-            crate::jstr::from_code_points(elems)
-        } else {
-            let units: Vec<u16> = elems.iter().map(|&e| e as u16).collect();
-            crate::jstr::from_units(&units)
-        }
-    }
-}
-
 /// Count the capturing groups in a pattern (escapes and classes skipped): `(` not followed by
 /// `?`, plus named groups `(?<name>`.
 fn count_capture_groups(chars: &[char]) -> usize {
@@ -3044,14 +2644,15 @@ impl Regex {
         Ok(re)
     }
 
-    fn note_execution(&self, text: &ReText) {
-        self.subject_shapes
-            .set(self.subject_shapes.get() | text.subject_shape());
+    /// Count an execution over a subject of `storage` ([`SUBJECT_ONE_BYTE`] or
+    /// [`SUBJECT_TWO_BYTE`]) toward the native one-byte tier, which serves one-byte subjects.
+    fn note_execution(&self, storage: u8) {
+        self.subject_shapes.set(self.subject_shapes.get() | storage);
         self.tier_ticks.set(self.tier_ticks.get().saturating_add(1));
         if self.tier_up_attempted.get()
             || self.tier_up_at == 0
             || self.tier_ticks.get() < self.tier_up_at
-            || self.subject_shapes.get() & (SUBJECT_ASCII | SUBJECT_ONE_BYTE) == 0
+            || self.subject_shapes.get() & SUBJECT_ONE_BYTE == 0
         {
             return;
         }
@@ -3171,10 +2772,15 @@ impl Regex {
             if at == end || at == len {
                 return Ok(None);
             }
-            at += 1;
-            if at & INTERRUPT_POLL_MASK == 0 {
+            let next = input.next_elem(at).1;
+            // Past `end` lies no start in range (a pair straddles `end`).
+            if next > end {
+                return Ok(None);
+            }
+            if (at ^ next) > INTERRUPT_POLL_MASK {
                 poll_interrupt(control)?;
             }
+            at = next;
         }
     }
 
@@ -3191,122 +2797,101 @@ impl Regex {
     /// path through `^` begins there (where `^` may also match the input's empty end).
     #[inline]
     fn atom_start<I: ReInput>(&self, input: I, atoms: &[Rep], at: usize) -> bool {
-        (at < input.len() && self.first_viable(atoms, input.at(at)))
+        (at < input.len() && self.first_viable(atoms, input.next_elem(at).0))
             || (self.first_line_start
                 && (at == 0 || (self.multiline && is_line_terminator_u32(input.at(at - 1)))))
     }
 
-    /// Match a prepared subject and return shared capture spans.
+    /// [`Self::exec_at`], first polling for host interruption as an execution entry does.
     #[cfg(test)]
-    pub fn exec_text_shared(
+    pub fn exec_polled(
         &self,
-        text: &ReText,
+        subject: &crate::lstr::LStr,
         start: usize,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<Captures> {
         poll_interrupt(control)?;
-        self.exec_text_shared_entry_polled(text, start, control)
+        self.exec_at(subject, start, control)
     }
 
-    /// Match after the surrounding execution entry has already force-polled host interruption.
-    /// Long scans and backtracking still poll internally; browser/native call sites use this to
-    /// avoid a duplicate atomic read for every tiny match.
-    pub(crate) fn exec_text_shared_entry_polled(
+    /// Match `subject` in place from unit `start` and return the capture spans, in units. A
+    /// Unicode-mode start between the halves of a surrogate pair begins at the pair: the
+    /// character RegExpBuiltinExec takes from element `lastIndex` (ECMA-262 §22.2.7.2), so the
+    /// match may begin before `start`. The surrounding execution entry has already force-polled
+    /// host interruption; long scans and backtracking still poll internally, and browser and
+    /// native call sites thereby avoid a duplicate atomic read for every tiny match.
+    pub(crate) fn exec_at(
         &self,
-        text: &ReText,
+        subject: &crate::lstr::LStr,
         start: usize,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<Captures> {
-        self.note_execution(text);
-        match &text.ascii_src {
-            Some(s) => {
+        match subject.units() {
+            crate::lstr::Units::Ascii(bytes) => {
+                self.note_execution(SUBJECT_ONE_BYTE);
                 if let Some(literal) = &self.literal_ascii {
-                    Ok(find_ascii_literal(
-                        s.text().as_bytes(),
-                        start,
-                        literal,
-                        self.sticky,
-                        control,
-                    )?
-                    .map(Captures::one))
+                    Ok(
+                        find_ascii_literal(bytes, start, literal, self.sticky, control)?
+                            .map(Captures::one),
+                    )
                 } else if let Some(literal) = &self.literal_fold {
-                    Ok(find_ascii_fold_literal(
-                        s.text().as_bytes(),
-                        start,
-                        literal,
-                        self.sticky,
-                        control,
-                    )?
-                    .map(Captures::one))
-                } else if let Some(native) = self.one_byte_native.borrow().as_ref() {
-                    regexp_prof_native_exec();
-                    Ok(native
-                        .find_ascii(s.text().as_bytes(), start, self.sticky, control)?
-                        .map(Captures::one))
-                } else {
-                    self.exec_impl(s.text().as_bytes(), start, control)
-                }
-            }
-            None if text.subject_shape() == SUBJECT_ONE_BYTE => {
-                if let Some(native) = self.one_byte_native.borrow().as_ref() {
-                    regexp_prof_native_exec();
-                    Ok(native
-                        .find_one_byte(text.elements(), start, self.sticky, control)?
-                        .map(Captures::one))
-                } else {
-                    self.exec_impl(text.elements(), start, control)
-                }
-            }
-            None => self.exec_impl(text.elements(), start, control),
-        }
-    }
-
-    pub(crate) fn exec_text_discard_shared_entry_polled(
-        &self,
-        text: &ReText,
-        start: usize,
-        control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<Captures> {
-        self.exec_text_shared_entry_polled(text, start, control)
-    }
-
-    /// Whole-match-only search for operations whose JavaScript result is dead. Capture groups
-    /// can be recovered lazily if a legacy RegExp static is subsequently observed.
-    pub(crate) fn find_text_shared_entry_polled(
-        &self,
-        text: &ReText,
-        start: usize,
-        control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<(usize, usize)> {
-        self.note_execution(text);
-        match &text.ascii_src {
-            Some(s) => {
-                if let Some(literal) = &self.literal_ascii {
-                    find_ascii_literal(s.text().as_bytes(), start, literal, self.sticky, control)
-                } else if let Some(literal) = &self.literal_fold {
-                    find_ascii_fold_literal(
-                        s.text().as_bytes(),
-                        start,
-                        literal,
-                        self.sticky,
-                        control,
+                    Ok(
+                        find_ascii_fold_literal(bytes, start, literal, self.sticky, control)?
+                            .map(Captures::one),
                     )
                 } else if let Some(native) = self.one_byte_native.borrow().as_ref() {
                     regexp_prof_native_exec();
-                    native.find_ascii(s.text().as_bytes(), start, self.sticky, control)
+                    Ok(native
+                        .find_ascii(bytes, start, self.sticky, control)?
+                        .map(Captures::one))
                 } else {
-                    self.find_impl(s.text().as_bytes(), start, control)
+                    self.exec_impl(bytes, start, control)
                 }
             }
-            None if text.subject_shape() == SUBJECT_ONE_BYTE => {
-                if let Some(native) = self.one_byte_native.borrow().as_ref() {
+            crate::lstr::Units::Utf16(units) => {
+                self.note_execution(SUBJECT_TWO_BYTE);
+                if self.unicode {
+                    let input = Paired(units);
+                    self.exec_impl(input, input.boundary(start), control)
+                } else {
+                    self.exec_impl(units, start, control)
+                }
+            }
+        }
+    }
+
+    /// Whole-match-only search for operations whose JavaScript result is dead (see
+    /// [`Self::exec_at`]). Capture groups can be recovered lazily if a legacy RegExp static is
+    /// subsequently observed.
+    pub(crate) fn find_at(
+        &self,
+        subject: &crate::lstr::LStr,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<(usize, usize)> {
+        match subject.units() {
+            crate::lstr::Units::Ascii(bytes) => {
+                self.note_execution(SUBJECT_ONE_BYTE);
+                if let Some(literal) = &self.literal_ascii {
+                    find_ascii_literal(bytes, start, literal, self.sticky, control)
+                } else if let Some(literal) = &self.literal_fold {
+                    find_ascii_fold_literal(bytes, start, literal, self.sticky, control)
+                } else if let Some(native) = self.one_byte_native.borrow().as_ref() {
                     regexp_prof_native_exec();
-                    native.find_one_byte(text.elements(), start, self.sticky, control)
+                    native.find_ascii(bytes, start, self.sticky, control)
                 } else {
-                    self.find_impl(text.elements(), start, control)
+                    self.find_impl(bytes, start, control)
                 }
             }
-            None => self.find_impl(text.elements(), start, control),
+            crate::lstr::Units::Utf16(units) => {
+                self.note_execution(SUBJECT_TWO_BYTE);
+                if self.unicode {
+                    let input = Paired(units);
+                    self.find_impl(input, input.boundary(start), control)
+                } else {
+                    self.find_impl(units, start, control)
+                }
+            }
         }
     }
 
@@ -3416,8 +3001,8 @@ impl Regex {
                         let Some(found) = prefilter.find(input, from, control)? else {
                             break 'scan Ok(None);
                         };
-                        if let Some(max) = prefilter.max_offset {
-                            from = from.max(found.saturating_sub(max));
+                        if let Some(max) = prefilter.max_offset_in::<I>() {
+                            from = from.max(input.boundary(found.saturating_sub(max)));
                         }
                         window_end = Some(found - prefilter.min_offset);
                     }
@@ -3425,16 +3010,26 @@ impl Regex {
                 }
                 // A broad first atom lets most positions start: try this one before any scan.
                 if !self.may_start(input, from) {
-                    let next = self.next_start(input, from + 1, end, control)?;
+                    let after = if from < input.len() {
+                        input.next_elem(from).1
+                    } else {
+                        from + 1
+                    };
+                    let next = self.next_start(input, after, end, control)?;
                     if prof {
                         let skipped = next.unwrap_or(end + 1) - from;
                         REGEXP_PROF.with(|p| p.borrow_mut().scan_positions += skipped as u64);
                     }
                     match next {
                         Some(next) => from = next,
-                        // No start is left in range of this occurrence: look for the next one.
+                        // No start is left in range of this occurrence: look for the next one,
+                        // from the first element boundary past `end`.
                         None if end < input.len() => {
-                            from = end + 1;
+                            from = if input.boundary(end) < end {
+                                end + 1
+                            } else {
+                                input.next_elem(end).1
+                            };
                             continue 'scan;
                         }
                         None => break 'scan Ok(None),
@@ -3460,7 +3055,7 @@ impl Regex {
             if only.is_some() || from == input.len() {
                 break 'scan Ok(None);
             }
-            from += 1;
+            from = input.next_elem(from).1;
         };
         // A match leaves its backtrack state behind; a huge one's storage is released.
         m.bt.clear();
@@ -5375,13 +4970,38 @@ fn find_fold_byte(
     Ok(None)
 }
 
-/// The matcher's view of a subject: element `i` as a code point / code unit. Monomorphized for
-/// bytes (an ASCII subject — the common case, matched with no `Vec<u32>` materialization at all)
-/// and for wide elements (anything non-ASCII). The scans poll for host interruption as often as
-/// the element loops do (see [`scan_polled`]).
+/// The matcher's view of a subject, read in place from its storage: positions are code unit
+/// offsets, and an element is a code unit, or in Unicode mode over two-byte storage a code point
+/// ([`Paired`]). Monomorphized for one-byte storage (ASCII bytes, the common case), two-byte
+/// storage and two-byte storage in Unicode mode. The scans poll for host interruption as often
+/// as the element loops do (see [`scan_polled`]).
 trait ReInput: Copy {
+    /// Whether an element may take two positions: a surrogate pair of a [`Paired`] subject.
+    const PAIRED: bool = false;
+
     fn len(&self) -> usize;
+
+    /// The code unit at position `i`.
     fn at(&self, i: usize) -> u32;
+
+    /// The element that begins at position `i`, below the length, and the position after it.
+    #[inline(always)]
+    fn next_elem(&self, i: usize) -> (u32, usize) {
+        (self.at(i), i + 1)
+    }
+
+    /// The element that ends at position `i`, above zero, and the position where it begins.
+    #[inline(always)]
+    fn prev_elem(&self, i: usize) -> (u32, usize) {
+        (self.at(i - 1), i - 1)
+    }
+
+    /// The element boundary at or before position `i`: `i` itself, unless it falls between the
+    /// halves of a surrogate pair.
+    #[inline(always)]
+    fn boundary(&self, i: usize) -> usize {
+        i
+    }
 
     /// The first position in `from..end` holding `byte`.
     fn find_byte(
@@ -5402,8 +5022,8 @@ trait ReInput: Copy {
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<usize>;
 
-    /// The first position in `from..end` whose element `viable` accepts, `set` holding the ASCII
-    /// elements it accepts.
+    /// The first element boundary in `from..end`, `from` being one, whose element `viable`
+    /// accepts, `set` holding the ASCII elements it accepts.
     fn find_viable(
         &self,
         from: usize,
@@ -5444,7 +5064,7 @@ impl ReInput for &[u8] {
         prefilter: &Prefilter,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<usize> {
-        // A subject of bytes cannot hold a literal with wider elements.
+        // A subject of bytes cannot hold a literal with wider units.
         let Some(literal) = prefilter.bytes.as_deref() else {
             return Ok(None);
         };
@@ -5476,14 +5096,14 @@ impl ReInput for &[u8] {
     }
 }
 
-impl ReInput for &[u32] {
+impl ReInput for &[u16] {
     #[inline(always)]
     fn len(&self) -> usize {
-        <[u32]>::len(self)
+        <[u16]>::len(self)
     }
     #[inline(always)]
     fn at(&self, i: usize) -> u32 {
-        self[i]
+        self[i] as u32
     }
 
     #[inline]
@@ -5497,9 +5117,9 @@ impl ReInput for &[u32] {
         scan_polled(from, end, control, |from, end| {
             #[cfg(target_arch = "aarch64")]
             if regexp_simd() {
-                return neon::find_unit(self, from, end, byte as u32);
+                return neon::find_unit(self, from, end, u16::from(byte));
             }
-            (from..end).find(|&at| self[at] == byte as u32)
+            (from..end).find(|&at| self[at] == u16::from(byte))
         })
     }
 
@@ -5510,7 +5130,7 @@ impl ReInput for &[u32] {
         prefilter: &Prefilter,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<usize> {
-        let literal = &prefilter.elements;
+        let literal = &prefilter.units;
         scan_polled(from, end, control, |from, end| {
             #[cfg(target_arch = "aarch64")]
             if regexp_simd() {
@@ -5534,8 +5154,119 @@ impl ReInput for &[u32] {
                 return neon::find_viable_unit(self, from, end, set, &viable);
             }
             let _ = set;
-            (from..end).find(|&at| viable(self[at]))
+            (from..end).find(|&at| viable(self[at] as u32))
         })
+    }
+}
+
+/// Two-byte storage matched in Unicode mode (`u` or `v`), where an element is a code point
+/// (StringToCodePoints, ECMA-262 §11.1.5): a surrogate pair decodes as the matcher steps over it
+/// in either direction, and any other unit, a lone surrogate included, is its own element.
+/// Positions stay unit offsets, and every position the matcher reaches is an element boundary.
+#[derive(Clone, Copy)]
+struct Paired<'a>(&'a [u16]);
+
+#[inline(always)]
+fn is_lead_surrogate(unit: u16) -> bool {
+    unit & 0xfc00 == 0xd800
+}
+
+#[inline(always)]
+fn is_trail_surrogate(unit: u16) -> bool {
+    unit & 0xfc00 == 0xdc00
+}
+
+impl ReInput for Paired<'_> {
+    const PAIRED: bool = true;
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    #[inline(always)]
+    fn at(&self, i: usize) -> u32 {
+        self.0[i] as u32
+    }
+
+    #[inline(always)]
+    fn next_elem(&self, i: usize) -> (u32, usize) {
+        let unit = self.0[i];
+        match self.0.get(i + 1) {
+            Some(&trail) if is_lead_surrogate(unit) && is_trail_surrogate(trail) => {
+                (crate::jstr::code_point_from_pair(unit, Some(trail)), i + 2)
+            }
+            _ => (u32::from(unit), i + 1),
+        }
+    }
+
+    #[inline(always)]
+    fn prev_elem(&self, i: usize) -> (u32, usize) {
+        let unit = self.0[i - 1];
+        if i >= 2 && is_trail_surrogate(unit) && is_lead_surrogate(self.0[i - 2]) {
+            return (
+                crate::jstr::code_point_from_pair(self.0[i - 2], Some(unit)),
+                i - 2,
+            );
+        }
+        (u32::from(unit), i - 1)
+    }
+
+    #[inline(always)]
+    fn boundary(&self, i: usize) -> usize {
+        if i > 0
+            && i < self.0.len()
+            && is_trail_surrogate(self.0[i])
+            && is_lead_surrogate(self.0[i - 1])
+        {
+            i - 1
+        } else {
+            i
+        }
+    }
+
+    // A first byte is ASCII, which no surrogate pair holds. A literal's units occur wherever
+    // its elements do; an occurrence that splits a pair only adds a candidate.
+    #[inline]
+    fn find_byte(
+        &self,
+        from: usize,
+        end: usize,
+        byte: u8,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        self.0.find_byte(from, end, byte, control)
+    }
+
+    fn find_literal(
+        &self,
+        from: usize,
+        end: usize,
+        prefilter: &Prefilter,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        self.0.find_literal(from, end, prefilter, control)
+    }
+
+    fn find_viable(
+        &self,
+        from: usize,
+        end: usize,
+        _set: &AsciiSet,
+        viable: impl Fn(u32) -> bool,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        let mut at = from;
+        while at < end {
+            let (element, next) = self.next_elem(at);
+            if viable(element) {
+                return Ok(Some(at));
+            }
+            if (at ^ next) > INTERRUPT_POLL_MASK {
+                poll_interrupt(control)?;
+            }
+            at = next;
+        }
+        Ok(None)
     }
 }
 
@@ -5646,19 +5377,17 @@ mod neon {
         None
     }
 
-    /// Sixteen units from `at`, narrowed to bytes as `narrow` narrows each four.
+    /// Sixteen units from `at`, narrowed to bytes as `narrow` narrows each eight.
     ///
     /// SAFETY: the caller keeps `at + 16` within `hay`.
     #[inline(always)]
     unsafe fn load_units(
-        hay: &[u32],
+        hay: &[u16],
         at: usize,
-        narrow: impl Fn(uint32x4_t) -> uint16x4_t,
+        narrow: impl Fn(uint16x8_t) -> uint8x8_t,
     ) -> uint8x16_t {
         let p = hay.as_ptr().add(at);
-        let low = vcombine_u16(narrow(vld1q_u32(p)), narrow(vld1q_u32(p.add(4))));
-        let high = vcombine_u16(narrow(vld1q_u32(p.add(8))), narrow(vld1q_u32(p.add(12))));
-        vcombine_u8(vqmovn_u16(low), vqmovn_u16(high))
+        vcombine_u8(narrow(vld1q_u16(p)), narrow(vld1q_u16(p.add(8))))
     }
 
     pub(super) fn find_byte(hay: &[u8], mut from: usize, end: usize, byte: u8) -> Option<usize> {
@@ -5680,13 +5409,13 @@ mod neon {
             .map(|offset| from + offset)
     }
 
-    pub(super) fn find_unit(hay: &[u32], mut from: usize, end: usize, unit: u32) -> Option<usize> {
+    pub(super) fn find_unit(hay: &[u16], mut from: usize, end: usize, unit: u16) -> Option<usize> {
         assert!(end <= hay.len());
         // SAFETY: each load reads 16 units below `end`.
         unsafe {
-            let wanted = vdupq_n_u32(unit);
+            let wanted = vdupq_n_u16(unit);
             while from + 16 <= end {
-                let hits = load_units(hay, from, |units| vmovn_u32(vceqq_u32(units, wanted)));
+                let hits = load_units(hay, from, |units| vmovn_u16(vceqq_u16(units, wanted)));
                 if vmaxvq_u8(hits) != 0 {
                     return Some(from + lane_bits(hits).trailing_zeros() as usize / 4);
                 }
@@ -5734,25 +5463,25 @@ mod neon {
     }
 
     pub(super) fn find_literal_unit(
-        hay: &[u32],
+        hay: &[u16],
         mut from: usize,
         end: usize,
-        literal: &[u32],
+        literal: &[u16],
         rare: [usize; 2],
     ) -> Option<usize> {
         assert!(end <= from || end - 1 + literal.len() <= hay.len());
         assert!(rare[0] < literal.len() && rare[1] < literal.len());
         // SAFETY: as for bytes, with sixteen units a load.
         unsafe {
-            let first = vdupq_n_u32(literal[rare[0]]);
-            let second = vdupq_n_u32(literal[rare[1]]);
+            let first = vdupq_n_u16(literal[rare[0]]);
+            let second = vdupq_n_u16(literal[rare[1]]);
             while from + 16 <= end {
                 let hits = vandq_u8(
                     load_units(hay, from + rare[0], |units| {
-                        vmovn_u32(vceqq_u32(units, first))
+                        vmovn_u16(vceqq_u16(units, first))
                     }),
                     load_units(hay, from + rare[1], |units| {
-                        vmovn_u32(vceqq_u32(units, second))
+                        vmovn_u16(vceqq_u16(units, second))
                     }),
                 );
                 if vmaxvq_u8(hits) != 0 {
@@ -5811,7 +5540,7 @@ mod neon {
     }
 
     pub(super) fn find_viable_unit(
-        hay: &[u32],
+        hay: &[u16],
         mut from: usize,
         end: usize,
         set: &AsciiSet,
@@ -5824,11 +5553,11 @@ mod neon {
             let by_low_nibble = vld1q_u8(set.by_low_nibble.as_ptr());
             while from + 16 <= end {
                 let hits = set_candidates(
-                    load_units(hay, from, |units| vqmovn_u32(units)),
+                    load_units(hay, from, |units| vqmovn_u16(units)),
                     by_low_nibble,
                 );
                 if vmaxvq_u8(hits) != 0 {
-                    let element = |lane: usize| hay[from + lane];
+                    let element = |lane: usize| u32::from(hay[from + lane]);
                     if let Some(lane) = first_accepted(lane_bits(hits), |lane| {
                         element(lane) < 0x80 || viable(element(lane))
                     }) {
@@ -5838,7 +5567,7 @@ mod neon {
                 from += 16;
             }
         }
-        (from..end).find(|&at| viable(hay[at]))
+        (from..end).find(|&at| viable(u32::from(hay[at])))
     }
 }
 
@@ -5884,8 +5613,8 @@ enum Backtrack {
         lo: u32,
         at: usize,
     },
-    /// The operand of the choice directly above: a `Many` start position, or a `StringSetRepeat`
-    /// iteration count.
+    /// The operand of the choice directly above: the element count of a `Many`'s run, or a
+    /// `StringSetRepeat` iteration count.
     Extra(usize),
     /// Choice: a greedy `Many` at `pc` that now ends at `end`; retry it with fewer elements.
     Greedy {
@@ -6098,18 +5827,18 @@ impl<'a, I: ReInput> Matcher<'a, I> {
     fn step(&self, pos: usize) -> Option<(u32, usize)> {
         if self.back {
             if pos > 0 {
-                Some((self.input.at(pos - 1), pos - 1))
+                Some(self.input.prev_elem(pos))
             } else {
                 None
             }
         } else if pos < self.input.len() {
-            Some((self.input.at(pos), pos + 1))
+            Some(self.input.next_elem(pos))
         } else {
             None
         }
     }
 
-    /// The position `n` elements from `pos` in the match direction.
+    /// The position `n` units from `pos` in the match direction.
     #[inline(always)]
     fn advance(&self, pos: usize, n: usize) -> usize {
         if self.back {
@@ -6119,7 +5848,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
         }
     }
 
-    /// Elements left to consume from `pos` in the match direction.
+    /// Units left from `pos` in the match direction: at least as many as elements.
     #[inline(always)]
     fn room(&self, pos: usize) -> usize {
         if self.back {
@@ -6129,37 +5858,57 @@ impl<'a, I: ReInput> Matcher<'a, I> {
         }
     }
 
-    /// The `k`-th element from `pos` in the match direction.
+    /// Where a run consumed in the match direction and ending at `end` ends with one element
+    /// fewer.
     #[inline(always)]
-    fn element(&self, pos: usize, k: usize) -> u32 {
+    fn retreat(&self, end: usize) -> usize {
         if self.back {
-            self.input.at(pos - 1 - k)
+            self.input.next_elem(end).1
         } else {
-            self.input.at(pos + k)
+            self.input.prev_elem(end).1
         }
     }
 
     /// How many consecutive elements from `pos` in the match direction, at most `limit`, `rep`
-    /// matches; `None` if the host interrupted the scan.
+    /// matches, and the position after them; `None` if the host interrupted the scan.
     #[inline]
-    fn run_length(&mut self, rep: &Rep, pos: usize, limit: usize) -> Option<usize> {
+    fn run_length(&mut self, rep: &Rep, pos: usize, limit: usize) -> Option<(usize, usize)> {
         let back = self.back;
         let mut n = 0;
+        if !I::PAIRED {
+            // An element per unit: the run indexes the subject directly.
+            let limit = limit.min(self.room(pos));
+            while n < limit {
+                let element = if back {
+                    self.input.at(pos - 1 - n)
+                } else {
+                    self.input.at(pos + n)
+                };
+                if !self.rep_matches(rep, element) {
+                    break;
+                }
+                n += 1;
+                if !self.poll_linear(n) {
+                    return None;
+                }
+            }
+            return Some((n, self.advance(pos, n)));
+        }
+        let mut end = pos;
         while n < limit {
-            let element = if back {
-                self.input.at(pos - 1 - n)
-            } else {
-                self.input.at(pos + n)
+            let Some((element, next)) = self.step(end) else {
+                break;
             };
             if !self.rep_matches(rep, element) {
                 break;
             }
             n += 1;
+            end = next;
             if !self.poll_linear(n) {
                 return None;
             }
         }
-        Some(n)
+        Some((n, end))
     }
 
     #[inline(always)]
@@ -6270,21 +6019,21 @@ impl<'a, I: ReInput> Matcher<'a, I> {
             .is_some_and(|failures| failures.contains(key))
     }
 
-    /// Return every matching UnicodeSets string length in the normative order: multi-code-point
-    /// elements by descending length, then a singleton, then the empty element. The exact-mode
-    /// path follows one trie edge per subject code point; ignore-case mode retains the small set
-    /// of canonically equivalent branches.
-    fn string_set_lengths(&self, set: &StringSet, pos: usize) -> Vec<usize> {
+    /// Return where every matching UnicodeSets string ends, in the normative order:
+    /// multi-code-point elements by descending length, then a singleton, then the empty element
+    /// (which ends at `pos`). The exact-mode path follows one trie edge per subject code point;
+    /// ignore-case mode retains the small set of canonically equivalent branches.
+    fn string_set_ends(&self, set: &StringSet, pos: usize) -> Vec<usize> {
         let trie = if self.back {
             &set.backward
         } else {
             &set.forward
         };
-        let mut lengths = Vec::new();
+        let mut ends = Vec::new();
         if self.icase() {
             let mut nodes = vec![0usize];
             let mut cursor = pos;
-            for depth in 1..=trie.max_depth {
+            for _ in 0..trie.max_depth {
                 let Some((found, next)) = self.step(cursor) else {
                     break;
                 };
@@ -6300,7 +6049,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                     break;
                 }
                 if next_nodes.iter().any(|node| trie.nodes[*node].terminal) {
-                    lengths.push(depth);
+                    ends.push(next);
                 }
                 nodes = next_nodes;
                 cursor = next;
@@ -6308,7 +6057,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
         } else {
             let mut node = 0usize;
             let mut cursor = pos;
-            for depth in 1..=trie.max_depth {
+            for _ in 0..trie.max_depth {
                 let Some((found, next)) = self.step(cursor) else {
                     break;
                 };
@@ -6320,22 +6069,22 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                 };
                 node = trie.nodes[node].edges[edge].1;
                 if trie.nodes[node].terminal {
-                    lengths.push(depth);
+                    ends.push(next);
                 }
                 cursor = next;
             }
         }
-        lengths.reverse();
-        if self
+        ends.reverse();
+        if let Some((_, next)) = self
             .step(pos)
-            .is_some_and(|(found, _)| set.singles.matches(found, self.icase(), self.unicode))
+            .filter(|&(found, _)| set.singles.matches(found, self.icase(), self.unicode))
         {
-            lengths.push(1);
+            ends.push(next);
         }
         if set.empty {
-            lengths.push(0);
+            ends.push(pos);
         }
-        lengths
+        ends
     }
 
     /// RepeatMatcher for a variable-length UnicodeSets atom (the `StringSetRepeat` at `pc`),
@@ -6377,17 +6126,17 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                 return None;
             }
             let continuation = count >= min;
-            let mut lengths = if max.is_none_or(|limit| count < limit) {
-                self.string_set_lengths(set, pos)
+            let mut ends = if max.is_none_or(|limit| count < limit) {
+                self.string_set_ends(set, pos)
             } else {
                 Vec::new()
             };
             // RepeatMatcher rejects a further empty iteration once min is satisfied, allowing the
             // atom to try any later candidate before the repeat exits.
             if continuation {
-                lengths.retain(|&length| length != 0);
+                ends.retain(|&end| end != pos);
             }
-            let next_count = if lengths.is_empty() {
+            let next_count = if ends.is_empty() {
                 count
             } else {
                 let Some(next) = count.checked_add(1) else {
@@ -6400,21 +6149,20 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                 self.bt.push(Backtrack::Extra(memo_count));
                 self.push_choice(Backtrack::SetFailure { pc: pc as u32, pos });
             }
-            // Alternative `i` in trial order: `Some(length)` iterates, `None` continues.
-            let total = lengths.len() + continuation as usize;
+            // Alternative `i` in trial order: `Some(end)` iterates, `None` continues.
+            let total = ends.len() + continuation as usize;
             let alternative = |i: usize| -> Option<usize> {
                 if greedy {
-                    lengths.get(i).copied()
+                    ends.get(i).copied()
                 } else if continuation {
-                    i.checked_sub(1).map(|i| lengths[i])
+                    i.checked_sub(1).map(|i| ends[i])
                 } else {
-                    Some(lengths[i])
+                    Some(ends[i])
                 }
             };
             for i in (1..total).rev() {
                 match alternative(i) {
-                    Some(length) => {
-                        let next = self.advance(pos, length);
+                    Some(next) => {
                         self.bt.push(Backtrack::Extra(next_count));
                         self.push_choice(Backtrack::SetIteration {
                             pc: pc as u32,
@@ -6431,8 +6179,8 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                 return None;
             }
             match alternative(0) {
-                Some(length) => {
-                    pos = self.advance(pos, length);
+                Some(next) => {
+                    pos = next;
                     count = next_count;
                 }
                 None => return Some(pos),
@@ -6513,9 +6261,9 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         (Some(a), Some(b)) if a != b => {
                             // A backward backreference consumes the capture from its end.
                             let first = if self.back {
-                                self.input.at(a.max(b) - 1)
+                                self.input.prev_elem(a.max(b)).0
                             } else {
-                                self.input.at(a.min(b))
+                                self.input.next_elem(a.min(b)).0
                             };
                             return Some(
                                 self.step(pos)
@@ -6543,9 +6291,9 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                     match captured {
                         Some((a, b)) if a != b => {
                             let first = if self.back {
-                                self.input.at(b - 1)
+                                self.input.prev_elem(b).0
                             } else {
-                                self.input.at(a)
+                                self.input.next_elem(a).0
                             };
                             return Some(
                                 self.step(pos)
@@ -6630,51 +6378,70 @@ impl<'a, I: ReInput> Matcher<'a, I> {
         None
     }
 
-    /// The largest count in `min..n` a greedy `Many` at `pc` (entered at `start`) can retry
-    /// with: the next one whose continuation's first instruction may match.
+    /// Where `n` consecutive elements from `pos` in the match direction end when each matches
+    /// `rep`; `None` when they do not.
+    fn run_exact(&self, rep: &Rep, pos: usize, n: usize) -> Option<usize> {
+        let mut end = pos;
+        for _ in 0..n {
+            match self.step(end) {
+                Some((element, next)) if self.rep_matches(rep, element) => end = next,
+                _ => return None,
+            }
+        }
+        Some(end)
+    }
+
+    /// The largest count in `min..n` a greedy `Many` at `pc`, whose run of `n` elements ends at
+    /// `end`, can retry with, and where the shorter run ends: the next one whose continuation's
+    /// first instruction may match.
     fn greedy_retry(
         &mut self,
         prog: &[Inst],
         pc: usize,
-        start: usize,
+        mut end: usize,
         mut n: usize,
         min: usize,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         let mut tried = 0usize;
         while n > min {
             n -= 1;
+            end = self.retreat(end);
             tried += 1;
             if !self.poll_linear(tried) {
                 return None;
             }
-            if self.branch_may_match(prog, pc + 1, self.advance(start, n)) {
-                return Some(n);
+            if self.branch_may_match(prog, pc + 1, end) {
+                return Some((n, end));
             }
         }
         None
     }
 
-    /// The count a lazy `Many` at `pc` (entered at `start`) tries next: `n` itself when
-    /// `include`, otherwise the smallest larger count, skipping counts whose continuation cannot
-    /// match. The run is extended one element at a time, so a lazy quantifier never scans
-    /// further ahead than the match needs.
+    /// The count a lazy `Many` at `pc`, whose run of `n` elements ends at `end`, tries next, and
+    /// where that run ends: `n` itself when `include`, otherwise the smallest larger count,
+    /// skipping counts whose continuation cannot match. The run is extended one element at a
+    /// time, so a lazy quantifier never scans further ahead than the match needs.
     fn lazy_next(
         &mut self,
         prog: &[Inst],
         pc: usize,
-        start: usize,
+        mut end: usize,
         mut n: usize,
         include: bool,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         let Inst::Many { rep, max, .. } = &prog[pc] else {
             unreachable!("lazy repetition state outside its instruction");
         };
-        let limit = max.unwrap_or(usize::MAX).min(self.room(start));
+        let limit = max.unwrap_or(usize::MAX);
         let mut extend = !include;
         loop {
             if extend {
-                if n >= limit || !self.rep_matches(rep, self.element(start, n)) {
+                if n >= limit {
                     return None;
+                }
+                match self.step(end) {
+                    Some((element, next)) if self.rep_matches(rep, element) => end = next,
+                    _ => return None,
                 }
                 n += 1;
                 if !self.poll_linear(n) {
@@ -6683,9 +6450,8 @@ impl<'a, I: ReInput> Matcher<'a, I> {
             }
             extend = true;
             let mut budget = VIABILITY_BUDGET;
-            let end = self.advance(start, n);
             if self.continuation_viable(prog, pc + 1, end, &mut budget, 0) != Some(false) {
-                return Some(n);
+                return Some((n, end));
             }
         }
     }
@@ -6766,22 +6532,21 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         if self.memo_failed(&key) {
                             break;
                         }
-                        let lengths = self.string_set_lengths(set, pos);
+                        let ends = self.string_set_ends(set, pos);
                         if self.string_failures.is_some() {
                             self.bt.push(Backtrack::Extra(usize::MAX));
                             self.push_choice(Backtrack::SetFailure { pc: pc as u32, pos });
                         }
-                        for &length in lengths.iter().skip(1).rev() {
-                            let next = self.advance(pos, length);
+                        for &next in ends.iter().skip(1).rev() {
                             self.push_choice(Backtrack::Alt {
                                 pc: pc as u32 + 1,
                                 pos: next,
                             });
                         }
-                        let Some(&length) = lengths.first() else {
+                        let Some(&next) = ends.first() else {
                             break;
                         };
-                        pos = self.advance(pos, length);
+                        pos = next;
                         pc += 1;
                     }
                     Inst::StringSetRepeat { .. } => {
@@ -6868,34 +6633,30 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         greedy,
                     } => {
                         let min = *min;
-                        let limit = max.unwrap_or(usize::MAX).min(self.room(pos));
+                        let limit = max.unwrap_or(usize::MAX);
                         if *greedy {
                             // Consume as many as the input allows (up to `max`), iteratively;
                             // backtracking retries smaller counts (see `Backtrack::Greedy`).
-                            let Some(avail) = self.run_length(rep, pos, limit) else {
+                            let Some((avail, end)) = self.run_length(rep, pos, limit) else {
                                 return false;
                             };
                             if avail < min {
                                 break;
                             }
-                            let end = self.advance(pos, avail);
                             if avail > min {
-                                self.bt.push(Backtrack::Extra(pos));
+                                self.bt.push(Backtrack::Extra(avail));
                                 self.push_choice(Backtrack::Greedy { pc: pc as u32, end });
                             }
                             pc += 1;
                             pos = end;
                         } else {
-                            if min > limit
-                                || !(0..min).all(|k| self.rep_matches(rep, self.element(pos, k)))
-                            {
-                                break;
-                            }
-                            let Some(n) = self.lazy_next(prog, pc, pos, min, true) else {
+                            let Some(end) = self.run_exact(rep, pos, min) else {
                                 break;
                             };
-                            let end = self.advance(pos, n);
-                            self.bt.push(Backtrack::Extra(pos));
+                            let Some((n, end)) = self.lazy_next(prog, pc, end, min, true) else {
+                                break;
+                            };
+                            self.bt.push(Backtrack::Extra(n));
                             self.push_choice(Backtrack::Lazy { pc: pc as u32, end });
                             pc += 1;
                             pos = end;
@@ -7057,17 +6818,17 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                     Backtrack::Greedy { pc: p, end } => {
                         self.choices -= 1;
                         let p = p as usize;
-                        let Some(&Backtrack::Extra(start)) = self.bt.last() else {
-                            unreachable!("greedy choice without its start position");
+                        let Some(&Backtrack::Extra(n)) = self.bt.last() else {
+                            unreachable!("greedy choice without its count");
                         };
                         let Inst::Many { min, .. } = &prog[p] else {
                             unreachable!("greedy choice outside its instruction");
                         };
-                        let n = if self.back { start - end } else { end - start };
-                        match self.greedy_retry(prog, p, start, n, *min) {
-                            Some(n) => {
-                                let end = self.advance(start, n);
+                        match self.greedy_retry(prog, p, end, n, *min) {
+                            Some((n, end)) => {
                                 if n > *min {
+                                    self.bt.pop();
+                                    self.bt.push(Backtrack::Extra(n));
                                     self.push_choice(Backtrack::Greedy { pc: p as u32, end });
                                 } else {
                                     self.bt.pop();
@@ -7087,13 +6848,13 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                     Backtrack::Lazy { pc: p, end } => {
                         self.choices -= 1;
                         let p = p as usize;
-                        let Some(&Backtrack::Extra(start)) = self.bt.last() else {
-                            unreachable!("lazy choice without its start position");
+                        let Some(&Backtrack::Extra(n)) = self.bt.last() else {
+                            unreachable!("lazy choice without its count");
                         };
-                        let n = if self.back { start - end } else { end - start };
-                        match self.lazy_next(prog, p, start, n, false) {
-                            Some(n) => {
-                                let end = self.advance(start, n);
+                        match self.lazy_next(prog, p, end, n, false) {
+                            Some((n, end)) => {
+                                self.bt.pop();
+                                self.bt.push(Backtrack::Extra(n));
                                 self.push_choice(Backtrack::Lazy { pc: p as u32, end });
                                 pc = p + 1;
                                 pos = end;
@@ -7164,9 +6925,15 @@ impl<'a, I: ReInput> Matcher<'a, I> {
     }
 
     /// Match a backreference to the captured `input[a..b]` at `pos`, returning the position after
-    /// it (a backward backreference ends at `pos`).
+    /// it (a backward backreference ends at `pos`). BackreferenceMatcher compares elements
+    /// (ECMA-262 §22.2.2.7.2). Equal units are equal elements, except where the subject's run
+    /// ends inside a surrogate pair of a [`Paired`] subject, whose capture ends at an element
+    /// boundary; a case-insensitive comparison there steps through both runs' elements.
     #[inline]
     fn backref_end(&mut self, pos: usize, a: usize, b: usize) -> Option<usize> {
+        if I::PAIRED && self.icase() {
+            return self.backref_end_by_elements(pos, a, b);
+        }
         let n = b - a;
         let start = if self.back {
             pos.checked_sub(n)?
@@ -7176,8 +6943,49 @@ impl<'a, I: ReInput> Matcher<'a, I> {
             }
             pos
         };
+        let far = if self.back { start } else { start + n };
+        if self.input.boundary(far) != far {
+            return None;
+        }
         self.input_ranges_eq(start, a, n)
             .then(|| self.advance(pos, n))
+    }
+
+    /// [`Self::backref_end`] element by element: case-insensitively equal code points need not
+    /// take as many units.
+    fn backref_end_by_elements(&mut self, pos: usize, a: usize, b: usize) -> Option<usize> {
+        let mut len = 0usize;
+        let mut at = a;
+        while at < b {
+            at = self.input.next_elem(at).1;
+            len += 1;
+        }
+        // A backward backreference compares the `len` elements that end at `pos`.
+        let start = if self.back {
+            let mut start = pos;
+            for _ in 0..len {
+                if start == 0 {
+                    return None;
+                }
+                start = self.input.prev_elem(start).1;
+            }
+            start
+        } else {
+            pos
+        };
+        let (mut subject, mut captured) = (start, a);
+        for index in 0..len {
+            if !self.poll_linear(index) || subject >= self.input.len() {
+                return None;
+            }
+            let (found, after) = self.input.next_elem(subject);
+            let (expected, next) = self.input.next_elem(captured);
+            if !self.eqc_uu(found, expected) {
+                return None;
+            }
+            (subject, captured) = (after, next);
+        }
+        Some(if self.back { start } else { subject })
     }
 }
 
@@ -7507,115 +7315,65 @@ fn class_set_to_node(mut set: ClassSet) -> Node {
 mod internal_engine_diagnostics {
     include!("regex_native_generated.rs");
 
+    /// A view is matched in place over its owner's storage, as a flat copy of its units is:
+    /// anchors, word boundaries and lookbehind see nothing outside it, and a surrogate pair its
+    /// ends split leaves lone halves in it.
     #[test]
-    fn ascii_windows_of_wide_roots_match_the_reference_with_relative_boundaries() {
+    fn views_match_in_place_as_flat_copies_do() {
         use super::*;
         let body = format!("x\nA1.z\n{}z", "a".repeat(1024));
+        // The ASCII units of a two-byte root.
         let prefix = "😀é";
         let root: crate::lstr::LStr = format!("{prefix}{body}é").into();
         let prefix_units = crate::jstr::unit_len(prefix);
-        let source = root.slice_units(prefix_units, prefix_units + body.len());
-        assert!(source.view_range().is_some());
-        assert!(
-            !source.ascii_hint(),
-            "native string byte readers still decline views"
-        );
-        let control = crate::RuntimeInterrupt::default();
-        let wide: Vec<u32> = body.bytes().map(u32::from).collect();
-        for flags in ["", "g", "y", "i", "m", "u", "v", "iu", "duy"] {
-            let unicode = flags.contains('u') || flags.contains('v');
-            let parent = Rc::new(ReText::new_rc(unicode, &root));
-            let start = crate::jstr::unit_len(prefix);
-            let window =
-                ReText::window(parent.clone(), &source, start, start + body.len()).unwrap();
-            // A view of a two-byte root is two-byte too: it reads its parent's elements.
-            assert!(window.ascii_src.is_none() && window.parent.is_some());
-            assert_eq!(window.slice(0, window.len()), body);
-            for pattern in [
-                "^x",
-                "^A\\d",
-                "\\bA\\d\\b",
-                "(?<=\\n)A\\d",
-                "(?<=é)x",
-                "(?<!é)x",
-                "(?<n>A\\d)",
-                "z$",
-                "z(?=é)",
-                "[a-z]+",
-                "[^a]+",
-            ] {
-                let mut re = Regex::new(pattern, flags).unwrap();
-                re.tier_up_at = 1;
-                for at in [0, 1, 2, 6, body.len() - 1, body.len(), body.len() + 1] {
-                    let actual = re
-                        .exec_text_shared(&window, at, &control)
-                        .unwrap()
-                        .map(|captures| captures.to_vec());
-                    let expected = re
-                        .exec_impl(&wide[..], at, &control)
-                        .unwrap()
-                        .map(|captures| captures.to_vec());
-                    assert_eq!(actual, expected, "/{pattern}/{flags}, start={at}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn wide_windows_keep_unit_mapping_and_surrogate_boundary_guards() {
-        use super::*;
-        let root: crate::lstr::LStr = format!("😀{}éz", "a".repeat(1024)).into();
-        let source = root.slice_units(2, root.unit_len());
-        for unicode in [false, true] {
-            let parent = Rc::new(ReText::new_rc(unicode, &root));
-            let end = root.unit_len();
-            let window = ReText::window(parent.clone(), &source, 2, end).unwrap();
-            assert!(window.ascii_src.is_none());
-            assert!(window.parent.is_some());
-            assert_eq!(window.unit_index(window.len()), end - 2);
-            assert_eq!(window.slice(0, window.len()), source.text());
-            if unicode {
-                let empty = crate::lstr::LStr::from("");
-                assert!(ReText::window(parent, &empty, 1, 1).is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn two_byte_windows_of_ascii_units_match_over_the_parents_copy() {
-        use super::*;
-        let body = format!("x\nA1.z\n{}z", "a".repeat(1024));
+        let ascii_units = root.slice_units(prefix_units, prefix_units + body.len());
         // A two-byte buffer whose units are all ASCII: a two-byte suffix's width is kept.
         let wide: crate::lstr::LStr = format!("é{body}").into();
-        let mut root = crate::lstr::LStr::from("#");
-        root.append_or_replace(&wide.slice_units(1, wide.unit_len()));
-        assert!(!root.known_ascii() && root.view_range().is_none());
-        let source = root.slice_units(1, root.unit_len());
-        assert!(source.view_range().is_some() && !source.known_ascii());
+        let mut appended = crate::lstr::LStr::from("#");
+        appended.append_or_replace(&wide.slice_units(1, wide.unit_len()));
+        assert!(!appended.known_ascii() && appended.view_range().is_none());
+        let ascii_buffer = appended.slice_units(1, appended.unit_len());
+        // Surrogate pairs split at the start and at the end.
+        let astral: crate::lstr::LStr = format!("😀{body}é😀z").into();
+        let split_start = astral.slice_units(1, astral.unit_len());
+        let split_end = astral.slice_units(0, astral.unit_len() - 2);
         let control = crate::RuntimeInterrupt::default();
-        let elements: Vec<u32> = body.bytes().map(u32::from).collect();
-        for flags in ["", "g", "y", "i", "m", "u", "v", "iu", "duy"] {
-            let unicode = flags.contains('u') || flags.contains('v');
-            let parent = Rc::new(ReText::new_rc(unicode, &root));
-            assert!(parent.ascii_src.is_some() && parent.elems.is_empty());
-            let window = ReText::window(parent, &source, 1, root.unit_len()).unwrap();
-            assert!(window.parent.is_none());
-            assert_eq!(window.subject_shape(), SUBJECT_ASCII);
-            assert_eq!(window.unit_index(window.len()), body.len());
-            assert_eq!(window.slice(0, window.len()), body);
-            for pattern in ["^x", "\\bA\\d\\b", "(?<=\\n)A\\d", "z$", "[a-z]+", "[^a]+"] {
-                let mut re = Regex::new(pattern, flags).unwrap();
-                re.tier_up_at = 1;
-                for at in [0, 1, 6, body.len() - 1, body.len(), body.len() + 1] {
-                    let actual = re
-                        .exec_text_shared(&window, at, &control)
-                        .unwrap()
-                        .map(|captures| captures.to_vec());
-                    let expected = re
-                        .exec_impl(&elements[..], at, &control)
-                        .unwrap()
-                        .map(|captures| captures.to_vec());
-                    assert_eq!(actual, expected, "/{pattern}/{flags}, start={at}");
+        for view in [ascii_units, ascii_buffer, split_start, split_end] {
+            assert!(view.view_range().is_some() && !view.known_ascii());
+            let flat = crate::lstr::LStr::from_utf16(&view.units().to_utf16());
+            assert!(flat.view_range().is_none());
+            let len = view.unit_len();
+            for flags in ["", "g", "y", "i", "m", "u", "v", "iu", "duy"] {
+                for pattern in [
+                    "^x",
+                    "^A\\d",
+                    "\\bA\\d\\b",
+                    "(?<=\\n)A\\d",
+                    "(?<=é)x",
+                    "(?<!é)x",
+                    "(?<n>A\\d)",
+                    "z$",
+                    "z(?=é)",
+                    "[a-z]+",
+                    "[^a]+",
+                    "^.",
+                    ".$",
+                    "\\udc00",
+                    "\\ud83d$",
+                ] {
+                    let mut re = Regex::new(pattern, flags).unwrap();
+                    re.tier_up_at = 1;
+                    for at in [0, 1, 2, 6, len - 1, len, len + 1] {
+                        let actual = re
+                            .exec_polled(&view, at, &control)
+                            .unwrap()
+                            .map(|captures| captures.to_vec());
+                        let expected = re
+                            .exec_polled(&flat, at, &control)
+                            .unwrap()
+                            .map(|captures| captures.to_vec());
+                        assert_eq!(actual, expected, "/{pattern}/{flags}, start={at}");
+                    }
                 }
             }
         }
@@ -7627,14 +7385,13 @@ mod internal_engine_diagnostics {
         // untried exit (the lookahead defeats the viability proof), so a lowered ceiling is
         // reached; that is an implementation limit, not a match failure.
         let re = super::Regex::new("(?:a|b)*(?=c)", "y").unwrap();
-        let input = crate::lstr::LStr::from("ab".repeat(20_000));
-        let text = super::ReText::new_rc(false, &input);
+        let text = crate::lstr::LStr::from("ab".repeat(20_000));
         let control = crate::RuntimeInterrupt::default();
         super::set_backtrack_state_limit(1 << 12);
-        let limited = re.exec_text_shared(&text, 0, &control);
+        let limited = re.exec_polled(&text, 0, &control);
         super::set_backtrack_state_limit(super::MAX_BACKTRACK_STATE);
         assert!(matches!(limited, Err(super::MatchError::ResourceExhausted)));
-        assert!(matches!(re.exec_text_shared(&text, 0, &control), Ok(None)));
+        assert!(matches!(re.exec_polled(&text, 0, &control), Ok(None)));
     }
 
     #[test]
@@ -7684,10 +7441,9 @@ mod internal_engine_diagnostics {
         ];
         for (pattern, flags, subject, expected) in cases {
             let re = super::Regex::new(pattern, flags).unwrap();
-            let input = crate::lstr::LStr::from(subject.as_str());
-            let text = super::ReText::new_rc(false, &input);
+            let text = crate::lstr::LStr::from(subject.as_str());
             let found = re
-                .exec_text_shared(&text, 0, &control)
+                .exec_polled(&text, 0, &control)
                 .unwrap_or_else(|error| panic!("/{pattern}/{flags}: {error:?}"))
                 .map(|captures| captures.to_vec());
             assert_eq!(found, Some(expected), "/{pattern}/{flags}");
@@ -7729,9 +7485,8 @@ mod internal_engine_diagnostics {
                 "{} instructions",
                 re.prog.len()
             );
-            let input = crate::lstr::LStr::from(subject.as_str());
-            let text = super::ReText::new_rc(false, &input);
-            let found = re.exec_text_shared(&text, 0, &control).unwrap();
+            let text = crate::lstr::LStr::from(subject.as_str());
+            let found = re.exec_polled(&text, 0, &control).unwrap();
             assert_eq!(found.map(|captures| captures[0].unwrap()), expected);
         }
     }
@@ -7781,10 +7536,9 @@ mod internal_engine_diagnostics {
                 for (pattern, flags, open, close) in cases {
                     let re = super::Regex::new(&pattern, flags)
                         .unwrap_or_else(|error| panic!("{flags}: {error}"));
-                    let input = crate::lstr::LStr::from("ab");
-                    let text = super::ReText::new_rc(flags.contains('v'), &input);
+                    let text = crate::lstr::LStr::from("ab");
                     assert!(
-                        matches!(re.exec_text_shared(&text, 0, &control), Ok(Some(_))),
+                        matches!(re.exec_polled(&text, 0, &control), Ok(Some(_))),
                         "{flags} {open}"
                     );
                     let deeper = format!("{open}{pattern}{close}");
@@ -7805,10 +7559,9 @@ mod internal_engine_diagnostics {
         // ECMA-262 bounds no matcher's running time: exponential backtracking that used to stop
         // at a 2,000,000-step budget (a RangeError) now finds its result like other engines.
         let re = super::Regex::new("(a|aa)*b", "y").unwrap();
-        let input = crate::lstr::LStr::from("a".repeat(28));
-        let text = super::ReText::new_rc(false, &input);
+        let text = crate::lstr::LStr::from("a".repeat(28));
         assert!(matches!(
-            re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default()),
+            re.exec_polled(&text, 0, &crate::RuntimeInterrupt::default()),
             Ok(None)
         ));
     }
@@ -7821,30 +7574,23 @@ mod internal_engine_diagnostics {
             "an ASCII icase literal gets the fold needle"
         );
         assert!(re.literal_ascii.is_none());
-        let text = |s: &str| super::ReText::new_rc(false, &crate::lstr::LStr::from(s));
+        let text = |s: &str| crate::lstr::LStr::from(s);
         let control = crate::RuntimeInterrupt::default();
         // ASCII subjects run the fold-aware byte search: any case mix, correct spans.
         assert_eq!(
-            re.exec_text_shared(&text("xxABCyy"), 0, &control)
+            re.exec_polled(&text("xxABCyy"), 0, &control)
                 .unwrap()
                 .unwrap()[0],
             Some((2, 5))
         );
         assert_eq!(
-            re.exec_text_shared(&text("aBc"), 0, &control)
-                .unwrap()
-                .unwrap()[0],
+            re.exec_polled(&text("aBc"), 0, &control).unwrap().unwrap()[0],
             Some((0, 3))
         );
-        assert!(re
-            .exec_text_shared(&text("Abx"), 0, &control)
-            .unwrap()
-            .is_none());
+        assert!(re.exec_polled(&text("Abx"), 0, &control).unwrap().is_none());
         // A non-ASCII subject keeps the matcher path but stays equivalent.
         assert_eq!(
-            re.exec_text_shared(&text("éABC"), 0, &control)
-                .unwrap()
-                .unwrap()[0],
+            re.exec_polled(&text("éABC"), 0, &control).unwrap().unwrap()[0],
             Some((1, 4))
         );
     }
@@ -7856,21 +7602,21 @@ mod internal_engine_diagnostics {
             re.literal_fold.is_some(),
             "UTF-8 needle with a non-ASCII fold-free char"
         );
-        let text = |s: &str| super::ReText::new_rc(false, &crate::lstr::LStr::from(s));
+        let text = |s: &str| crate::lstr::LStr::from(s);
         let control = crate::RuntimeInterrupt::default();
         // 'ß' does not fold to 'ss': simple folding only (verified against V8/test262).
         assert!(re
-            .exec_text_shared(&text("STRASSE"), 0, &control)
+            .exec_polled(&text("STRASSE"), 0, &control)
             .unwrap()
             .is_none());
         // Capital eszett (U+1E9E) is not folded by non-u canonicalization either.
         assert!(re
-            .exec_text_shared(&text("STRAẞE"), 0, &control)
+            .exec_polled(&text("STRAẞE"), 0, &control)
             .unwrap()
             .is_none());
         // An exact fold hit with the raw char matches on the wide subject.
         assert_eq!(
-            re.exec_text_shared(&text("XSTRAßE"), 0, &control)
+            re.exec_polled(&text("XSTRAßE"), 0, &control)
                 .unwrap()
                 .unwrap()[0],
             Some((1, 7))
@@ -7884,10 +7630,9 @@ mod internal_engine_diagnostics {
         // the subject the count is irrelevant, and the failure memo stays linear in the subject
         // instead of growing with position × count.
         let re = super::Regex::new(r"^[\q{aa|a}]{0,100000}$", "v").unwrap();
-        let input = crate::lstr::LStr::from("a".repeat(20_000) + "b");
-        let text = super::ReText::new_rc(true, &input);
+        let text = crate::lstr::LStr::from("a".repeat(20_000) + "b");
         let start = std::time::Instant::now();
-        let found = re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default());
+        let found = re.exec_polled(&text, 0, &crate::RuntimeInterrupt::default());
         assert!(matches!(found, Ok(None)));
         assert!(start.elapsed() < std::time::Duration::from_secs(20));
     }
@@ -7908,10 +7653,9 @@ mod internal_engine_diagnostics {
                 subject.extend(string);
             }
             let re = super::Regex::new(&format!(r"^\p{{{property}}}+$"), "v").unwrap();
-            let input = crate::lstr::LStr::from(subject.as_str());
-            let text = super::ReText::new_rc(true, &input);
+            let text = crate::lstr::LStr::from(subject.as_str());
             assert!(matches!(
-                re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default()),
+                re.exec_polled(&text, 0, &crate::RuntimeInterrupt::default()),
                 Ok(Some(_))
             ));
         }
@@ -7924,9 +7668,9 @@ mod internal_engine_diagnostics {
         let deadline = crate::RuntimeInterrupt::default();
         deadline.set_deadline(Some(std::time::Instant::now()));
         let short_input = crate::lstr::LStr::from("haystack");
-        let short_text = super::ReText::new_rc(false, &short_input);
+        let short_text = short_input;
         assert!(matches!(
-            re.exec_text_shared(&short_text, 0, &deadline),
+            re.exec_polled(&short_text, 0, &deadline),
             Err(super::MatchError::Interrupted(
                 crate::InterruptReason::DeadlineExceeded
             ))
@@ -7943,8 +7687,8 @@ mod internal_engine_diagnostics {
             }
         });
         let long_input = crate::lstr::LStr::from("a".repeat(32 * 1024 * 1024));
-        let long_text = super::ReText::new_rc(false, &long_input);
-        let outcome = re.exec_text_shared(&long_text, 0, &control);
+        let long_text = long_input;
+        let outcome = re.exec_polled(&long_text, 0, &control);
         canceller.join().expect("canceller thread");
         assert!(matches!(
             outcome,
@@ -7972,10 +7716,9 @@ mod internal_engine_diagnostics {
     fn guaranteed_ascii_backreference_matches() {
         let re =
             super::Regex::new(r#"^(\[) *@?([\w-]+) *([!*$^~=]*) *('?"?)(.*?)\4 *\]"#, "").unwrap();
-        let input = crate::lstr::LStr::from("[glcr=fhozvg]");
-        let text = super::ReText::new_rc(false, &input);
+        let text = crate::lstr::LStr::from("[glcr=fhozvg]");
         let caps = re
-            .exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default())
+            .exec_polled(&text, 0, &crate::RuntimeInterrupt::default())
             .unwrap()
             .unwrap();
         assert_eq!(caps[0], Some((0, 13)));
@@ -7986,19 +7729,19 @@ mod internal_engine_diagnostics {
         for (pattern, flags, input, start, expected) in [
             ("(a)(b)(c)(d)(e)", "", "xxabcde", 0, Some((2, 7))),
             ("needle", "", "xxneedle", 1, Some((2, 8))),
+            // Spans are unit offsets in either mode.
             ("(😀)", "", "x😀y", 0, Some((1, 3))),
-            ("(😀)", "u", "x😀y", 0, Some((1, 2))),
+            ("(😀)", "u", "x😀y", 0, Some((1, 3))),
             ("needle", "", "haystack", 0, None),
         ] {
             let re = super::Regex::new(pattern, flags).unwrap();
-            let input = crate::lstr::LStr::from(input);
-            let text = super::ReText::new_rc(re.unicode, &input);
+            let text = crate::lstr::LStr::from(input);
             let captures = re
-                .exec_text_shared(&text, start, &crate::RuntimeInterrupt::default())
+                .exec_polled(&text, start, &crate::RuntimeInterrupt::default())
                 .unwrap()
                 .and_then(|caps| caps[0]);
             let whole = re
-                .find_text_shared_entry_polled(&text, start, &crate::RuntimeInterrupt::default())
+                .find_at(&text, start, &crate::RuntimeInterrupt::default())
                 .unwrap();
             assert_eq!(captures, expected);
             assert_eq!(whole, expected);
@@ -8008,10 +7751,9 @@ mod internal_engine_diagnostics {
     #[test]
     fn capture_free_ascii_lookahead_matches() {
         let re = super::Regex::new("HF(?=;)", "i").unwrap();
-        let input = crate::lstr::LStr::from("xhf;y");
-        let text = super::ReText::new_rc(false, &input);
+        let text = crate::lstr::LStr::from("xhf;y");
         assert_eq!(
-            re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default())
+            re.exec_polled(&text, 0, &crate::RuntimeInterrupt::default())
                 .unwrap()
                 .unwrap()[0],
             Some((1, 3))
@@ -8021,10 +7763,9 @@ mod internal_engine_diagnostics {
     #[test]
     fn legacy_pattern_uses_utf16_element_offsets() {
         let re = super::Regex::new(r"Qngr\((-?[0-9]+)\)", "").unwrap();
-        let input = crate::lstr::LStr::from("‰Qngr(-12)");
-        let text = super::ReText::new_rc(false, &input);
+        let text = crate::lstr::LStr::from("‰Qngr(-12)");
         let caps = re
-            .exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default())
+            .exec_polled(&text, 0, &crate::RuntimeInterrupt::default())
             .unwrap()
             .unwrap();
         assert_eq!(caps[0], Some((1, 10)));
@@ -8033,12 +7774,11 @@ mod internal_engine_diagnostics {
 
     #[test]
     fn internal_literal_plan_honors_start_and_sticky() {
-        let input = crate::lstr::LStr::from("xxneedle--needle");
-        let text = super::ReText::new_rc(false, &input);
+        let text = crate::lstr::LStr::from("xxneedle--needle");
         let search = super::Regex::new("needle", "").unwrap();
         assert_eq!(
             search
-                .exec_text_shared(&text, 3, &crate::RuntimeInterrupt::default())
+                .exec_polled(&text, 3, &crate::RuntimeInterrupt::default())
                 .unwrap()
                 .unwrap()[0],
             Some((10, 16))
@@ -8046,12 +7786,12 @@ mod internal_engine_diagnostics {
 
         let sticky = super::Regex::new("needle", "y").unwrap();
         assert!(sticky
-            .exec_text_shared(&text, 3, &crate::RuntimeInterrupt::default())
+            .exec_polled(&text, 3, &crate::RuntimeInterrupt::default())
             .unwrap()
             .is_none());
         assert_eq!(
             sticky
-                .exec_text_shared(&text, 10, &crate::RuntimeInterrupt::default())
+                .exec_polled(&text, 10, &crate::RuntimeInterrupt::default())
                 .unwrap()
                 .unwrap()[0],
             Some((10, 16))
@@ -8062,24 +7802,23 @@ mod internal_engine_diagnostics {
     fn straight_line_ascii_tier_is_lazy_and_semantically_exact() {
         let re = super::Regex::new("a.c", "").unwrap();
         let control = crate::RuntimeInterrupt::default();
-        let input = crate::lstr::LStr::from("xxaXcyy");
-        let text = super::ReText::new_rc(false, &input);
+        let text = crate::lstr::LStr::from("xxaXcyy");
 
         assert_eq!(re.tier_feedback(), (0, 0, false, false));
         for _ in 0..(super::REGEXP_TIER_UP_THRESHOLD - 1) {
             assert_eq!(
-                re.exec_text_shared(&text, 0, &control).unwrap().unwrap()[0],
+                re.exec_polled(&text, 0, &control).unwrap().unwrap()[0],
                 Some((2, 5))
             );
         }
         let (ticks, shapes, attempted, native) = re.tier_feedback();
         assert_eq!(ticks, super::REGEXP_TIER_UP_THRESHOLD - 1);
-        assert_ne!(shapes & super::SUBJECT_ASCII, 0);
+        assert_ne!(shapes & super::SUBJECT_ONE_BYTE, 0);
         assert!(!attempted);
         assert!(!native);
 
         assert_eq!(
-            re.exec_text_shared(&text, 0, &control).unwrap().unwrap()[0],
+            re.exec_polled(&text, 0, &control).unwrap().unwrap()[0],
             Some((2, 5))
         );
         let (ticks, _, attempted, native) = re.tier_feedback();
@@ -8089,54 +7828,51 @@ mod internal_engine_diagnostics {
 
         // Dot still rejects both ASCII line terminators, and the sticky path only tries its exact
         // requested position after tier-up.
-        let newline = super::ReText::new_rc(false, &crate::lstr::LStr::from("a\nc"));
-        assert!(re
-            .exec_text_shared(&newline, 0, &control)
-            .unwrap()
-            .is_none());
+        let newline = crate::lstr::LStr::from("a\nc");
+        assert!(re.exec_polled(&newline, 0, &control).unwrap().is_none());
         let sticky = super::Regex::new("a.c", "y").unwrap();
-        let sticky_text = super::ReText::new_rc(false, &crate::lstr::LStr::from("xaXc"));
+        let sticky_text = crate::lstr::LStr::from("xaXc");
         for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            sticky.exec_text_shared(&sticky_text, 1, &control).unwrap();
+            sticky.exec_polled(&sticky_text, 1, &control).unwrap();
         }
         assert_eq!(
-            sticky
-                .find_text_shared_entry_polled(&sticky_text, 1, &control)
-                .unwrap(),
+            sticky.find_at(&sticky_text, 1, &control).unwrap(),
             Some((1, 4))
         );
     }
 
+    /// The tier records the storage of the subjects a pattern matched and serves one-byte ones:
+    /// a pattern that has matched only two-byte subjects stays on the general matcher.
     #[test]
     fn ascii_tier_records_subject_shapes_and_rejects_unsafe_flags() {
         let re = super::Regex::new("a.c", "").unwrap();
         let control = crate::RuntimeInterrupt::default();
-        let ascii = super::ReText::new_rc(false, &crate::lstr::LStr::from("aXc"));
-        let one_byte = super::ReText::new_rc(false, &crate::lstr::LStr::from("aéc"));
-        assert!(re.exec_text_shared(&ascii, 0, &control).unwrap().is_some());
-        assert!(re
-            .exec_text_shared(&one_byte, 0, &control)
-            .unwrap()
-            .is_some());
+        let ascii = crate::lstr::LStr::from("aXc");
+        let two_byte = crate::lstr::LStr::from("aéc");
+        assert!(re.exec_polled(&ascii, 0, &control).unwrap().is_some());
+        assert!(re.exec_polled(&two_byte, 0, &control).unwrap().is_some());
         let (_, shapes, _, _) = re.tier_feedback();
-        assert_ne!(shapes & super::SUBJECT_ASCII, 0);
         assert_ne!(shapes & super::SUBJECT_ONE_BYTE, 0);
+        assert_ne!(shapes & super::SUBJECT_TWO_BYTE, 0);
 
         let latin = super::Regex::new("é.", "").unwrap();
-        let latin_text = super::ReText::new_rc(false, &crate::lstr::LStr::from("éX"));
+        let latin_text = crate::lstr::LStr::from("éX");
         for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            assert!(latin
-                .exec_text_shared(&latin_text, 0, &control)
-                .unwrap()
-                .is_some());
+            assert_eq!(
+                latin
+                    .exec_polled(&latin_text, 0, &control)
+                    .unwrap()
+                    .unwrap()[0],
+                Some((0, 2))
+            );
         }
-        assert!(latin.tier_feedback().3);
+        assert!(!latin.tier_feedback().3);
 
         for flags in ["i", "s", "u", "v"] {
             let guarded = super::Regex::new("a.c", flags).unwrap();
-            let input = super::ReText::new_rc(guarded.unicode, &crate::lstr::LStr::from("aXc"));
+            let input = crate::lstr::LStr::from("aXc");
             for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-                guarded.exec_text_shared(&input, 0, &control).unwrap();
+                guarded.exec_polled(&input, 0, &control).unwrap();
             }
             let (_, _, attempted, native) = guarded.tier_feedback();
             assert!(attempted, "unsafe flag should close the tier-up attempt");
@@ -8145,28 +7881,28 @@ mod internal_engine_diagnostics {
 
         let anchored = super::Regex::new("^a.c$", "").unwrap();
         for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            anchored.exec_text_shared(&ascii, 0, &control).unwrap();
+            anchored.exec_polled(&ascii, 0, &control).unwrap();
         }
         assert!(anchored.tier_feedback().3);
 
         let multiline = super::Regex::new("^a.c$", "m").unwrap();
         for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            multiline.exec_text_shared(&ascii, 0, &control).unwrap();
+            multiline.exec_polled(&ascii, 0, &control).unwrap();
         }
         assert!(!multiline.tier_feedback().3);
     }
 
-    /// The perf map (`TRUST_JS_PERF_MAP`) lists both of a pattern's machine programs, for byte
-    /// and for word subjects, under its source and flags when the pattern tiers up.
+    /// The perf map (`TRUST_JS_PERF_MAP`) lists a pattern's machine program under its source and
+    /// flags when the pattern tiers up.
     #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
     #[test]
     fn perf_map_names_native_regexp_programs_by_source_and_flags() {
         let capture = crate::jit::profiler::PerfMapCapture::start("regexp");
         let re = super::Regex::new("a.c", "g").unwrap();
         let control = crate::RuntimeInterrupt::default();
-        let text = super::ReText::new_rc(false, &crate::lstr::LStr::from("xxaXcyy"));
+        let text = crate::lstr::LStr::from("xxaXcyy");
         for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            re.exec_text_shared(&text, 0, &control).unwrap();
+            re.exec_polled(&text, 0, &control).unwrap();
         }
         let native = re.one_byte_native.borrow();
         let code = native
@@ -8174,14 +7910,12 @@ mod internal_engine_diagnostics {
             .and_then(|program| program.machine_code.as_ref())
             .expect("the dot pattern tiers up to machine code");
         let lines = capture.lines();
-        for executable in [&code.byte_executable, &code.word_executable] {
-            let line = (
-                executable.as_ptr() as usize,
-                executable.len(),
-                "RegExp:/a.c/g".to_string(),
-            );
-            assert!(lines.contains(&line), "{line:x?} in {lines:x?}");
-        }
+        let line = (
+            code.executable.as_ptr() as usize,
+            code.executable.len(),
+            "RegExp:/a.c/g".to_string(),
+        );
+        assert!(lines.contains(&line), "{line:x?} in {lines:x?}");
     }
 
     #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
@@ -8203,12 +7937,6 @@ mod internal_engine_diagnostics {
                     expected,
                     "byte mapping at {start}, sticky={sticky}"
                 );
-                assert_eq!(
-                    code.find_one_byte(&[0xe9, 0x78, 0xff], start, sticky, &control)
-                        .unwrap(),
-                    expected,
-                    "word mapping at {start}, sticky={sticky}"
-                );
             }
         }
     }
@@ -8218,25 +7946,19 @@ mod internal_engine_diagnostics {
     fn native_regexp_aarch64_poll_explicitly_tests_return_value() {
         // Debug Rust can coincidentally leave useful flags; keep an emitter-level
         // gate as well as the release executable-mapping and JS regressions.
-        for word_elements in [false, true] {
-            let bytes = super::compile_one_byte_native_aarch64(
-                &[super::OneByteNativeOp::Any],
-                word_elements,
-            )
-            .unwrap();
-            let instructions: Vec<u32> = bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .copied()
-                .map(u32::from_le_bytes)
-                .collect();
-            let poll = instructions
-                .iter()
-                .position(|&word| word == 0xd63f_0200)
-                .expect("poll call must be emitted");
-            assert_eq!(instructions[poll + 1], 0x7100_001f, "cmp w0, #0");
-        }
+        let bytes = super::compile_one_byte_native_aarch64(&[super::OneByteNativeOp::Any]).unwrap();
+        let instructions: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
+            .collect();
+        let poll = instructions
+            .iter()
+            .position(|&word| word == 0xd63f_0200)
+            .expect("poll call must be emitted");
+        assert_eq!(instructions[poll + 1], 0x7100_001f, "cmp w0, #0");
     }
 
     #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
@@ -8257,15 +7979,11 @@ mod internal_engine_diagnostics {
                     std::time::Instant::now() - std::time::Duration::from_secs(1),
                 )),
             }
-            for result in [
-                code.find_ascii(b"abc", 1, false, &control),
-                code.find_one_byte(&[0xe9, 0x78, 0xff], 1, false, &control),
-            ] {
-                assert!(
-                    matches!(result, Err(super::MatchError::Interrupted(reason)) if reason == expected),
-                    "incorrect poll completion: {result:?}, expected {expected:?}"
-                );
-            }
+            let result = code.find_ascii(b"abc", 1, false, &control);
+            assert!(
+                matches!(result, Err(super::MatchError::Interrupted(reason)) if reason == expected),
+                "incorrect poll completion: {result:?}, expected {expected:?}"
+            );
         }
     }
 
@@ -8284,18 +8002,15 @@ mod internal_engine_diagnostics {
             ("[^a].", "aabYzz", Some((2, 4))),
         ] {
             let re = super::Regex::new(pattern, "").unwrap();
-            let input = crate::lstr::LStr::from(subject);
-            let text = super::ReText::new_rc(false, &input);
+            let text = crate::lstr::LStr::from(subject);
             for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-                re.exec_text_shared(&text, 0, &control).unwrap();
+                re.exec_polled(&text, 0, &control).unwrap();
             }
             assert!(
                 re.tier_feedback().3,
                 "machine subset was not emitted for /{pattern}/"
             );
-            let machine = re
-                .find_text_shared_entry_polled(&text, 0, &control)
-                .unwrap();
+            let machine = re.find_at(&text, 0, &control).unwrap();
             let reference = re.find_impl(subject.as_bytes(), 0, &control).unwrap();
             assert_eq!(machine, expected);
             assert_eq!(
@@ -8304,36 +8019,15 @@ mod internal_engine_diagnostics {
             );
         }
 
-        for (pattern, subject, expected) in [
-            ("é.", "xxéXyy", Some((2, 4))),
-            ("[é].", "xxéYzz", Some((2, 4))),
-        ] {
-            let re = super::Regex::new(pattern, "").unwrap();
-            let input = crate::lstr::LStr::from(subject);
-            let text = super::ReText::new_rc(false, &input);
-            assert_eq!(text.subject_shape(), super::SUBJECT_ONE_BYTE);
-            for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-                re.exec_text_shared(&text, 0, &control).unwrap();
-            }
-            assert!(re.tier_feedback().3);
-            let machine = re
-                .find_text_shared_entry_polled(&text, 0, &control)
-                .unwrap();
-            let reference = re.find_impl(text.elements(), 0, &control).unwrap();
-            assert_eq!(machine, expected);
-            assert_eq!(machine, reference, "word-load machine/reference mismatch");
-        }
-
         let re = super::Regex::new("a.c", "").unwrap();
-        let input = crate::lstr::LStr::from("aXc");
-        let text = super::ReText::new_rc(false, &input);
+        let text = crate::lstr::LStr::from("aXc");
         for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            re.exec_text_shared(&text, 0, &control).unwrap();
+            re.exec_polled(&text, 0, &control).unwrap();
         }
         let cancelled = crate::RuntimeInterrupt::default();
         cancelled.cancel();
         assert!(matches!(
-            re.find_text_shared_entry_polled(&text, 0, &cancelled),
+            re.find_at(&text, 0, &cancelled),
             Err(super::MatchError::Interrupted(
                 crate::InterruptReason::Cancelled
             ))
@@ -8414,15 +8108,14 @@ mod internal_engine_diagnostics {
             }
         }
 
+        // Bytes past ASCII are their Latin-1 code units.
         let re = super::Regex::new("é+", "").unwrap();
-        let input = crate::lstr::LStr::from("xxééZ");
-        let text = super::ReText::new_rc(false, &input);
-        assert_eq!(text.subject_shape(), super::SUBJECT_ONE_BYTE);
+        let subject: &[u8] = b"xx\xe9\xe9Z";
         let native = super::OneByteNativeProgram::compile(&re.prog, re.multiline)
             .expect("one-byte non-ASCII terminal Many must compile");
-        for start in 0..=text.elements().len() {
-            let fast = native.find(text.elements(), start, false, &control);
-            let reference = re.find_impl(text.elements(), start, &control);
+        for start in 0..=subject.len() {
+            let fast = native.find(subject, start, false, &control);
+            let reference = re.find_impl(subject, start, &control);
             assert_eq!(
                 fast, reference,
                 "non-ASCII terminal Many mismatch at {start}"
@@ -8434,17 +8127,12 @@ mod internal_engine_diagnostics {
     fn terminal_many_native_path_promotes_and_polls() {
         let control = crate::RuntimeInterrupt::default();
         let re = super::Regex::new("[a-z]+", "").unwrap();
-        let input = crate::lstr::LStr::from("abcxyz");
-        let text = super::ReText::new_rc(false, &input);
+        let text = crate::lstr::LStr::from("abcxyz");
         for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            re.exec_text_shared(&text, 0, &control).unwrap();
+            re.exec_polled(&text, 0, &control).unwrap();
         }
         assert!(re.tier_feedback().3);
-        assert_eq!(
-            re.find_text_shared_entry_polled(&text, 0, &control)
-                .unwrap(),
-            Some((0, 6))
-        );
+        assert_eq!(re.find_at(&text, 0, &control).unwrap(), Some((0, 6)));
 
         let interrupted = crate::RuntimeInterrupt::default();
         interrupted.cancel();
@@ -8470,20 +8158,10 @@ mod internal_engine_diagnostics {
         }
     }
 
-    /// A pattern's elements as its matcher sees a subject: code points in Unicode mode, code
-    /// units otherwise.
-    fn subject_elements(subject: &str, unicode: bool) -> Vec<u32> {
-        if unicode {
-            subject.chars().map(u32::from).collect()
-        } else {
-            subject.encode_utf16().map(u32::from).collect()
-        }
-    }
-
     #[test]
     fn required_literals_and_their_offsets() {
-        let units = |text: &str| text.encode_utf16().map(u32::from).collect::<Vec<_>>();
-        let cases: [(&str, &str, Option<(Vec<u32>, usize, Option<usize>)>); 22] = [
+        let units = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        let cases: [(&str, &str, Option<(Vec<u16>, usize, Option<usize>)>); 22] = [
             // Octane's re17: the quoted date's opening, after `^` or one other character.
             (
                 r#"(^|[^\\])\"\\\/Qngr\((-?[0-9]+)\)\\\/\""#,
@@ -8507,7 +8185,8 @@ mod internal_engine_diagnostics {
             ("(a)\\1bc", "", Some((units("bc"), 1, None))),
             (".a", "", Some((units("a"), 1, Some(1)))),
             ("😀a", "", Some((units("😀a"), 0, Some(0)))),
-            ("😀a", "u", Some((vec![0x1f600, 0x61], 0, Some(0)))),
+            // A code point past the BMP is scanned for as its surrogate pair.
+            ("😀a", "u", Some((units("😀a"), 0, Some(0)))),
             ("a|b", "", None),
             ("(?:abc)?", "", None),
             ("ab", "i", None),
@@ -8519,7 +8198,7 @@ mod internal_engine_diagnostics {
             let re = super::Regex::new(pattern, flags).unwrap();
             let actual = re.prefilter.as_ref().map(|prefilter| {
                 (
-                    prefilter.elements.to_vec(),
+                    prefilter.units.to_vec(),
                     prefilter.min_offset,
                     prefilter.max_offset,
                 )
@@ -8530,7 +8209,7 @@ mod internal_engine_diagnostics {
         for pattern in ["a".repeat(300), "(?:x{300})y".to_string()] {
             let re = super::Regex::new(&pattern, "").unwrap();
             let prefilter = re.prefilter.as_ref().expect("long literal prefilter");
-            assert_eq!(prefilter.elements.len(), super::MAX_PREFILTER_LEN);
+            assert_eq!(prefilter.units.len(), super::MAX_PREFILTER_LEN);
             assert_eq!((prefilter.min_offset, prefilter.max_offset), (0, Some(0)));
         }
         // A sticky or anchored regex checks only a short range of offsets from its one start.
@@ -8570,9 +8249,10 @@ mod internal_engine_diagnostics {
 
     /// Matching with the prefilter and the vector first-element scan finds what the matcher
     /// finds trying every start, at every start of subjects built from the patterns' literals,
-    /// over bytes and over wide elements.
+    /// over bytes, over units and, in Unicode mode, over units decoded in pairs.
     #[test]
     fn prefiltered_scans_match_the_unfiltered_matcher() {
+        use super::ReInput;
         let control = crate::RuntimeInterrupt::default();
         let patterns = [
             r#"(^|[^\\])\"\\\/Qngr\((-?[0-9]+)\)\\\/\""#,
@@ -8659,10 +8339,21 @@ mod internal_engine_diagnostics {
                 plain.prefilter = None;
                 plain.first_ascii = None;
                 for subject in &subjects {
-                    let wide = subject_elements(subject, filtered.unicode);
-                    for start in 0..=wide.len() + 1 {
-                        let found = filtered.exec_impl(&wide[..], start, &control);
-                        let reference = plain.exec_impl(&wide[..], start, &control);
+                    let units: Vec<u16> = subject.encode_utf16().collect();
+                    let paired = super::Paired(&units);
+                    for start in 0..=units.len() + 1 {
+                        let (found, reference) = if filtered.unicode {
+                            let start = paired.boundary(start);
+                            (
+                                filtered.exec_impl(paired, start, &control),
+                                plain.exec_impl(paired, start, &control),
+                            )
+                        } else {
+                            (
+                                filtered.exec_impl(&units[..], start, &control),
+                                plain.exec_impl(&units[..], start, &control),
+                            )
+                        };
                         matches += usize::from(matches!(reference, Ok(Some(_))));
                         assert_eq!(
                             found.map(|c| c.map(|c| c.to_vec())),
@@ -8703,17 +8394,17 @@ mod internal_engine_diagnostics {
         for _ in 0..4000 {
             let len = rng.below(90);
             let letters = 1 + rng.below(4);
-            let units: Vec<u32> = (0..len)
+            let units: Vec<u16> = (0..len)
                 .map(|_| match rng.below(12) {
                     0 => 0xe9,
                     1 => 0x101,
-                    _ => 0x61 + rng.below(letters) as u32,
+                    _ => 0x61 + rng.below(letters) as u16,
                 })
                 .collect();
             let bytes: Vec<u8> = units.iter().map(|&unit| unit as u8).collect();
             let from = rng.below(len + 1);
             let end = from + rng.below(len - from + 1);
-            let unit = 0x61 + rng.below(letters) as u32;
+            let unit = 0x61 + rng.below(letters) as u16;
             assert_eq!(
                 neon::find_unit(&units, from, end, unit),
                 (from..end).find(|&at| units[at] == unit)
@@ -8724,7 +8415,7 @@ mod internal_engine_diagnostics {
             );
             assert_eq!(
                 neon::find_viable_unit(&units, from, end, &set, &viable),
-                (from..end).find(|&at| viable(units[at]))
+                (from..end).find(|&at| viable(u32::from(units[at])))
             );
             assert_eq!(
                 neon::find_viable_byte(&bytes, from, end, &set, &viable),
@@ -8759,10 +8450,12 @@ mod internal_engine_diagnostics {
         let re = super::Regex::new("x\\d+yz", "").unwrap();
         assert!(re.prefilter.is_some());
         let bytes = vec![b'a'; 3 * (super::INTERRUPT_POLL_MASK + 1)];
-        let wide: Vec<u32> = bytes.iter().map(|&byte| byte as u32).collect();
+        let units: Vec<u16> = bytes.iter().map(|&byte| u16::from(byte)).collect();
         for outcome in [
             re.exec_impl(&bytes[..], 0, &cancelled).map(|c| c.is_some()),
-            re.exec_impl(&wide[..], 0, &cancelled).map(|c| c.is_some()),
+            re.exec_impl(&units[..], 0, &cancelled).map(|c| c.is_some()),
+            re.exec_impl(super::Paired(&units), 0, &cancelled)
+                .map(|c| c.is_some()),
         ] {
             assert!(matches!(
                 outcome,

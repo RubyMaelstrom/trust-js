@@ -1643,10 +1643,6 @@ impl Interp {
             .trace_roots(kind, |keys| keys.trace_gc(sink));
         self.property_key_strings
             .trace_roots(kind, |string| string.trace_gc(sink));
-        self.re_texts.trace_roots(kind, |(string, text)| {
-            string.trace_gc(sink);
-            text.trace_gc(sink);
-        });
     }
 
     /// Heap verification, after a minor collection's marking: every cell the string caches pin is
@@ -1670,10 +1666,6 @@ impl Interp {
         }
         for string in self.property_key_strings.values() {
             string.trace_gc(sink);
-        }
-        for (string, text) in self.re_texts.values() {
-            string.trace_gc(sink);
-            text.trace_gc(sink);
         }
     }
 
@@ -1725,8 +1717,6 @@ impl Interp {
             jit_layout: _,
             interp_layout: _,
             inline_ic_safe: _,
-            re_texts: _, // by collection kind
-            re_text_ascii_hot,
             regexp_protector: _, // weak pins
             regexp_last,
             depth: _,
@@ -1874,13 +1864,8 @@ impl Interp {
         if let Some(symbol) = iterator_sym {
             sink.word(crate::value::symbol_identity(symbol) as u64);
         }
-        if let Some((string, _, text)) = re_text_ascii_hot {
-            string.trace_gc(sink);
-            text.trace_gc(sink);
-        }
         if let Some(last) = regexp_last {
             last.input.trace_gc(sink);
-            last.text.trace_gc(sink);
         }
         code_frames.trace_gc(sink);
         for (_, origin) in job_script_contexts {
