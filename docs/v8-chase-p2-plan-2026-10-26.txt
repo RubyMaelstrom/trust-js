@@ -526,6 +526,12 @@ does (Order, step 0).
    goes ahead), with W5's interpreter-level stage alongside under its drafted exit (see W5's
    stage record); W1's revised exit is accepted; the heap cap ports V8's two remaining rules
    (the floor of size + 8 MB past the maximum, and MaxGrowingFactor).
+10. After W2a and W2b (2026-10-27): W3's drafted exit is agreed: recursion within 1.6x of
+    Sparkplug-only Node, the plan's other call-table bounds, and pinned instructions on main at
+    the stage's end, React -8%, Vue -6%, Djot -4%, Web Tooling's chai -10%. W3 takes its item
+    2d's Reflect, dense indexOf and string-searcher work; WeakMap's single probe goes to W2g.
+    The exits of W1, W6a, W7, W5a and W2a/W2b are timed on a quiet machine before W3's builds.
+    The merged stage worktrees, branches and build trees are deleted.
 
 ## Non-goals
 
@@ -1040,6 +1046,10 @@ babel-minify 0.94 to 1.08) and ARES-6's summary from 376 to 363 ms; the one slow
 Babylon's worst 4 (167 to 201 ms, with a spread of +-105 ms), waits for the quiet run. Splay's
 live heap stays W2c/W2d's. The timed exit measurements (minor-collection time, the major
 collections, no suite slower beyond noise) wait for a quiet machine with W1's, W6a's and W7's.
+Stage-exit checks on c4464dae: rustdoc with the base's diagnostics, the doctests, the downstream
+crates with heap verification, and TRust's handoff checks on TRust main (78435d0) against engine
+main: both builds, both test suites (4,072 passed, 49 ignored) and clippy's warnings, the P1
+close-out's.
 
 ### W5: RegExp (census and design, 2026-10-27)
 
@@ -1173,3 +1183,299 @@ subject cache left it).
 Found on the way, older than P2: with RegExp.prototype[@@split] deleted, `'a/b/c'.split(/\//)`
 still split by the RegExp, in `nf_string_split`'s own RegExp path, where ECMA-262 and Node
 convert the separator with ToString (["a/b/c"]). d476195d removes that path.
+
+### W3: calls (census and design, 2026-10-27; exit agreed, Decision 10)
+
+Census: the W2a tip (a1535a6f, branch p2-w2a; since then main's code, c4d68127 adding only W2a's
+record), a no-LTO release build from a `git archive` export into a fresh target dir, on Crystal.
+User-mode instructions (`perf stat -e instructions:u`), perf and the engine pinned to the A725
+cores (`taskset -c 10-13`), `TRUST_JS_GC_PACING=0`: the engine's repeat runs agree to the
+instruction. Profiles: `perf record -e instructions:u --call-graph fp --user-callchains -m 16`
+with `TRUST_JS_PERF_MAP=1`, at periods under this kernel's cap of 15,000 samples/s
+(`perf_event_max_sample_rate`; shorter periods are throttled and lose most samples). A census
+build of the same export, not used for counts of instructions, adds entry-path counters, per-site
+reasons for CALLSTAT's misses and a classifier of the call-miss helper's callees
+(`TRUST_JS_JIT_CALLSITES=1`). Per-call costs come from microbenchmarks: a loop in a function,
+warmed, at 200,000 and 1,200,000 iterations; the difference over 1,000,000, less each engine's own
+empty-loop cost (14 instructions; Sparkplug ~100). Node v24.22.0 runs the same files limited to
+Sparkplug (`--max-opt=1`) and in full; every output agrees. Beside the fixtures, Web Tooling's chai
+alone (its single-tool bundle, target/p2/ext/cli-chai.js; 50 s on these cores) samples the
+standing suites: it is call-heavy, and its gap to Sparkplug-only Node was 3.0x at the close-out.
+Everything is under target/p2/w3-design: the binaries, the scripts (micro.py, callsplit.py,
+fixturecat.py, pathtrace.py, instrument*.py), per-call costs and their parts (data/micro*.jsonl,
+data/micro-perf/*.split), the census build's counts (data/callpath, data/callsites), shares
+(data/perf/*.cat, data/wtb/chai.cat) and the direct call's traced path (data/direct/prof). V8 is
+cited at c8b709085e21 (main, 2026-10-23; its sources in v8-src there).
+
+Calls by entry path (census build; "helper" = the call-hit helper, `jit_call_hit`):
+
+| | instructions | direct sequence | natives via the helper (operand-only + full boundary) | environment or `arguments` entries | other helper entries | call-miss helper | intrinsic helper | cached entries from Rust (`call_jit_cached`) | `Interp::call` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 2.76e9 | 312,804 | 550,038 (245,769 + 304,269) | 23,732 | 4,348 | 616 | 91,733 | 172,475 | 79,783 |
+| React | 5.59e8 | 448,177 | 0 | 0 | 683 | 62 | 0 | 62 | 6,749 |
+| Djot | 1.01e9 | 127,623 | 62,789 (0 + 62,789) | 208 | 14,551 | 8,363 | 276,060 | 8,385 | 18,157 |
+| Web Tooling chai | 1.37e11 | 20.2M | 29.3M (6.2M + 23.1M) | 3.36M (5.72M with Rust callers') | 17,516 | 218,395 | 25.3M | 2.77M | 630,512 |
+
+Share of each workload's instructions in the call path (sampled; a leaf in a generic utility,
+hash tables, allocation, thread-locals, takes its nearest caller's class; generated code cannot be
+split, so its direct-call part is estimated as the count above times the 257 instructions a
+two-argument direct call costs beyond its callee's body, below):
+
+| % | direct calls (in generated code) | native boundary | call helpers | intrinsic helper | compiled frames entered from Rust | environments | generic chain | total |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 2.9 | 4.6 | 2.0 | 0.6 | 3.1 | 0.5 | 0.8 | 14.5 |
+| React | 20.6 | 0.9 | 0.0 | 0.0 | 0.5 | 0.7 | 0.8 | 23.5 |
+| Djot | 3.2 | 3.0 | 0.9 | 3.7 | 1.7 | 0.4 | 1.5 | 14.4 |
+| chai | 3.8 | 6.4 | 3.1 | 4.0 | 1.8 | 1.6 | 0.7 | 21.4 |
+
+- The direct call costs 257 instructions beyond its callee's body. The census traced one
+  iteration of `s = add(s, k) | 0` through the code dump and a per-instruction profile (375
+  instructions an iteration, all accounted for): at the site, the callee load and the first
+  way's identity, epoch and realm compares 31; the gates 30; depth, `FnFrame` push and record pop
+  19; argument moves and slot fill 14; the callee context's ten fields 19; saving, clearing and
+  restoring `Interp::constructing` and `new_target` with the result push 31; the `blr` 6; the
+  finish stub 48 (five clean-frame checks, then the completion move, `FnFrame` pop, record push,
+  depth); in the callee, 59: saving x19-x22, d8-d15 and the frame record 16, context loads 4,
+  the code-residency counter's increment and decrement 14, saving, setting and restoring
+  `Interp::strict` 12, the entry poll 12, the return status 1. The rest is the loop (35), the free-
+  name read of `add` (54), argument spills (9) and `add`'s body (20). Sparkplug-only Node spends
+  123 instructions on the whole call, its read of `add` and `add`'s body included.
+- Per call (instructions, engine / Sparkplug-only Node; full Node inlines most of these): direct
+  361 / 123, method 447 / 209, closure 388 / 127, recursion (fib) 384 / 180, a function as
+  constructor 1,090 / 422, a class as constructor 3,214 / 329, a getter 1,373 / 246,
+  `Function.prototype.call` 1,020 / 285, `apply` 1,574 / 399, spread 4,480 / 231, rest
+  parameters 1,602 / 410, `arguments` (`.length` and `[0]`) 2,207 / 406, a body reading only
+  `arguments.length` 819 / 559, a callee with one captured binding 1,270 / 230, an arrow capturing
+  `this` 1,257 / 322. The call table's time ratios at the close-out track these closely: direct,
+  method, closure and fib take 1.65, 1.47, 1.73 and 2.13 times Sparkplug's instructions an
+  iteration (its loop included), against 1.9, 1.5, 1.8 and 2.2 times its time.
+- CALLSTAT's "all gates pass (direct not emitted at site?)" (Djot's 7,341) is one site, the
+  event loop of djot's `parse` (`for(const t of k)w(S,t),E=t.endpos;`, about 667 events a parse,
+  11 parses). `parse` runs once a parse, so its loop runs as a borrowed-frame loop fragment, and
+  `compile_entry` clears the direct-call bit for borrowed entries (jit.rs:3938): every call there
+  takes the helper and `run_moved`. Two other labels mislead: "var force resets" (Vue's 1,343) is
+  bit 0 of `CallIc::direct`, which `jit_direct_flags` (bytecode.rs:20599) clears for rest-parameter
+  callees, here Vue's array-method wrapper `function(...e)`; and "env entry" counts every
+  `CALL_IC_NEEDS_ENV` callee: Vue's 23,732 are real environments (all one function, Vue's
+  `trigger`, whose `let u` an arrow on a rare path captures), while 2,752,053 of chai's 3,355,594
+  are bodies with an `arguments` slot and no environment (`flag(obj, key, value)` reads only
+  `arguments.length`). "Recompile not settled" is the warm-up: the sequence waits for the callee's
+  inline attempt, under 100 calls per callee (Djot 7,170, Vue 2,984, chai 17,229).
+- An environment entry costs 882 instructions more than a plain closure call (Sparkplug: 103 more
+  for its context): about 490 make the environment (`ActivationPlan::instantiate` copies the
+  plan's 24-byte bindings into a vector, allocates the cell, publishes the layout) and about 460
+  are the Rust entry that replaces the direct sequence (the helper, `call_jit_env_committed`,
+  `run_moved_env`, `run_moved_inner`). A body reading only `arguments.length` builds nothing but
+  pays the same entry: 819 against 361 for a direct call. In Vue the environment entries are 0.7%
+  of the fixture (23,732 x 882); in chai the `arguments`-slot entries are 0.9% (2.75M x 458) and
+  the real environments 0.4%.
+- Natives through the helper (instructions per call, engine / Sparkplug-only Node; of the
+  engine's, the full boundary and the native's own work, from samples, which skid across
+  neighbouring functions, so these parts are approximate; the rest is the call template and the
+  helper's dispatch):
+
+| | engine | boundary | own work | Sparkplug |
+| --- | --- | --- | --- | --- |
+| WeakMap.prototype.get (Vue 245,085 calls) | 541 | 0 (operand-only) | 374 | 216 |
+| Map.prototype.get, object key | 668 | 0 (operand-only) | 417 | 222 |
+| Array.isArray (Vue 140,523) | 739 | 399 | 42 | 168 |
+| Reflect.get, 3 arguments (Vue 78,630) | 1,582 | 258 | 1,082 | 283 |
+| Reflect.set (Vue 23,764) | 2,263 | 341 | 1,611 | 865 |
+| Reflect.has (Vue 10,724; chai 2.3M) | 1,496 | 276 | 1,004 | 246 |
+| Object.is (Vue 23,077) | 827 | 366 | 67 | 180 |
+| parseInt (Vue 13,452) | 1,060 | 325 | 418 | 134 |
+| Number(x) (Vue 12,085) | 785 | 359 | 140 | 153 |
+| String.prototype.slice(start) (chai 12.3M) | 1,013 | 338 | 302 | 309 |
+| Math.min, 3 arguments (chai 6.1M) | 451 | 0 (numeric-only) | 97 | 225 |
+| Array.prototype.indexOf, packed (chai 4.9M) | 2,082 | 310 | 1,435 | 269 |
+| String.prototype.includes (Djot 13,003) | 1,104 | 290 | 582 | 459 |
+| String.prototype.substring (Djot 11,041) | 1,027 | 344 | 320 | 360 |
+| RegExp.prototype.exec (Djot 27,248) | 4,994 | 308 | 4,399 | 900 |
+| codePointAt, two-byte string (Djot's intrinsic helper) | 439 | 9 (the helper's own: 244) | 32 | 231 |
+
+  The boundary (`call_native_committed_with`, interpreter.rs:13898) roots the argument window in
+  the registry, which the JIT frame already roots, checks depth and the native stack, polls
+  allocation, saves and clears the construct state, polls host interruption before and after,
+  activates the Agent for host callbacks and drains pending tail calls: 260-400 instructions,
+  more than the whole call costs Sparkplug for Array.isArray, Object.is, parseInt and Number. Only
+  the 14 collection methods, Math's numeric functions and DataView's accessors with primitive
+  operands skip it today (`INTRINSIC_OPERAND_ONLY`, `_NUMERIC_ONLY`, `_DATAVIEW_*`, bytecode.rs:
+  1055-1067, assigned at fill by comparing function pointers, :23908-24025). The intrinsic helper
+  (`jit_intrinsic`), which the inline intrinsics fall back to, pays its own version (depth,
+  collector check, construct state): 244 of codePointAt's 439. Where a native's own work
+  dominates, the boundary is not the problem: WeakMap.get makes four hash lookups across
+  `weak_collection_index` and `weak_collection_data` (builtins/collections.rs:738-764); Reflect.get
+  converts the key and allocates; Array.prototype.indexOf reads and compares element by element
+  (`fast_get_elem`, `strict_equals`); String.prototype.indexOf and includes run Rust's substring
+  search, whose setup dominates on short strings (400-580).
+- Natives calling JavaScript: a Proxy `get` trap costs 3,304 an access (Sparkplug 448), ten
+  forEach callbacks 6,085 (1,666). Each compiled frame entered from Rust (by Proxy traps and
+  callbacks through `CallbackCache` and `call_jit_cached`, or by the helper, then
+  `call_jit_committed` and `run_moved_inner`) costs Vue about 430 instructions before the callee
+  runs (3.1% of the fixture over 200,129 entries).
+- Misses (the call-miss helper, then the generic path, within the generic chain's 0.7-1.5%) are
+  few: most of Djot's 8,363 come at sites with no way of the current epoch, fresh sites and sites
+  the global call-cache epoch emptied (every landed inline recompile bumps it); 848 of the 2,928
+  classified come from two sites with all four ways filled, where every new closure evicts a way.
+
+What V8 does (c8b709085e21):
+- Sparkplug's call is a builtin call: `BaselineCompiler::BuildCall` (baseline-compiler.cc:1713-
+  1729) calls `Call_ReceiverIs*_Baseline_Compact`, which loads the feedback vector from the
+  caller's frame and runs `CollectCallFeedback` (ic-callable.tq:91-168: increment the call count,
+  then return if the slot holds this target), then tail-calls `Call` and `CallFunction`
+  (builtins-arm64.cc:2373-2450, 2944-3024) and `InvokeFunctionCode` (macro-assembler-arm64.cc:
+  2884-2948), which pads missing arguments with undefined in place and jumps to the callee's
+  dispatch-table entry. The callee pushes its frame (fp, lr, then in `BaselineOutOfLinePrologue`
+  context, closure, argc, bytecode array, feedback cell and vector; builtins-arm64.cc:1147-1259)
+  and makes one stack check against a limit that also signals interrupts (:1224-1233); the
+  interrupt budget is charged at loop back-edges and returns, not at entry (baseline-compiler.cc:
+  2638-2720, 2903-2911). new.target travels in x3, undefined for a call (macro-assembler-arm64.cc:
+  2908); there is no frame stack beside the machine stack (frame-constants.h:744-785) and no
+  ambient strictness. Maglev's `CallKnownJSFunction` skips `Call` and `CallFunction` altogether:
+  it pads at the site and calls the dispatch entry (maglev-ir.cc:7434-7470).
+- A function with context-allocated variables makes its own context: `CreateFunctionContext`
+  (bytecode-generator.cc:8719-8744), in Sparkplug a call to `FastNewFunctionContextFunction`
+  (constructor.tq:63-73): one new-space allocation of map, length, ScopeInfo, previous and the
+  slots, filled with undefined (builtins-constructor-gen.cc:381-469); bytecode then copies the
+  captured parameters (bytecode-generator.cc:8746-8770) and writes the TDZ hole at each
+  declaration (:2139-2183). Slots are tagged words; modes and flags live in the ScopeInfo
+  (scope-info.tq:101-108), which slot 0 of the context names (contexts.h:545-577).
+- Builtins are machine code entered like JavaScript functions (TFJ/Torque): Map and WeakMap
+  get/has/set, Array.isArray, Object.is, Reflect.get and has, String includes and substring,
+  RegExp exec, parseInt and Number all are. Only C++ builtins (Reflect.set among these) pay a
+  boundary: an adaptor and `CEntry`'s exit frame (builtins-internal-gen.cc:1337-1402,
+  builtins-arm64.cc:4749-4926). WeakMap.get is one EphemeronHashTable probe by the key's stored
+  identity hash, and a key without one returns undefined without creating it
+  (builtins-collections-gen.cc:3036-3056, 2742-2760, 2828-2857). The embedder's boundary, API
+  callbacks, is the heavier one (an exit frame and `FunctionCallbackInfo`, builtins-arm64.cc:
+  5081-5232): the engine applies the equivalent of that boundary to its own builtins.
+- A call slot holds a weak target, a FeedbackCell (closures of one literal) or the megamorphic
+  sentinel, plus a call count and a SpeculationMode (feedback-vector.h:1115-1118;
+  ic-callable.tq:22-50, 134-149). Maglev and TurboFan check the target and reduce known builtins:
+  ArrayIsArray, ObjectIs, ReflectGet and Has, MapPrototypeGet, StringPrototypeIncludes,
+  NumberParseInt (maglev-reducer-inl.h:1258-1299, 3152-3156; js-call-reducer.cc:5382-5815), and
+  use count / invocation count as call frequency (feedback-vector.cc:1158-1167).
+
+Design (gains are shares of today's instructions; per-call counts are the census's):
+1. A cheaper direct call (ARM64), from 257 instructions beyond the body to about 140:
+   a. The static gates (compiled entry, frame size, the global-body need, a sloppy callee's
+      object receiver) fold into one ready bit at fill, and the sequence counts the callee's runs
+      itself, so the inline-attempt warm-up gate goes: 30 to ~10.
+   b. new.target and the construct flag live in the callee's record, as V8 passes new.target in
+      a register; an ordinary call stores Undefined there and the sequence stops saving, clearing
+      and restoring `Interp::constructing`/`new_target`; natives that read new.target take it from
+      the boundary (2): 31 to ~4.
+   c. The callee frame: save only the callee-saved registers the chunk uses, read strictness from
+      the running chunk instead of an ambient `Interp::strict` set and restored by every
+      prologue and epilogue, and find running code by walking the live frame records when code is
+      reclaimed instead of counting residency per activation; one entry check: 59 to ~30.
+   d. The finish stub checks one dirty bit that the slow paths set (pending tail call,
+      materialized activation, `FnFrame` extra, operands left), not five fields; the callee
+      context reads the chunk's constants instead of copying them; the record pool pops and
+      pushes by index: 86 to ~45.
+   Gains (117 instructions a direct call): React 9.4%, chai 1.7%, Djot 1.5%, Vue 1.3%; on the
+   call table, the direct, method and closure cases' instructions an iteration fall to 1.13,
+   1.10 and 1.23 times Sparkplug's, recursion to 1.48. Risks: code reclamation must see every
+   running chunk (records, Rust entries, borrowed frames: the collector already registers each
+   active context); every reader of `Interp::strict` and `new_target` moves. Dumps: every ARM64
+   chunk's prologue and epilogue, every call site's sequence, the finish stub.
+2. Natives without the full boundary (both backends, the helper):
+   a. Native classes recorded at registration, not pointer lists: pure (Array.isArray, Object.is,
+      Number.isNaN-style predicates, Math, the collection methods), primitive-pure (no author
+      code when the receiver and arguments are primitives: parseInt, parseFloat, Number, String
+      and Boolean called as functions, String.prototype's slice, substring, indexOf, includes,
+      startsWith, charAt, trim and case mapping; Array.prototype.indexOf and includes on arrays
+      the element protector covers; RegExp exec and test while W5's protector, 753d3aa2, holds),
+      and the rest. The helper runs pure and primitive-pure natives on the operand window as the
+      operand-only path does now; only natives that read new.target keep that clear. A native
+      that usually runs no author code but may (Reflect.get, set and has through a getter or a
+      Proxy) runs its fast path first and enters the boundary only on the path that calls out.
+      Gains: Vue 3.8% (Array.isArray, Object.is, parseInt and Number 2.6%, Reflect 1.2%), chai
+      5.2% (slice 3.0%, Array indexOf 1.1%, Reflect 0.9%), Djot 1.7%.
+   b. The intrinsic helper's fallback takes the same light path for its pure intrinsics: chai
+      ~2.8% (25.3M entries), Djot ~2.5% (276,060), Vue 0.4%.
+   c. Templates, after the IC's identity proof (non-speculative, unlike Maglev's reductions):
+      Array.isArray and Object.is in line (Vue ~1%), Math.min and max with three or four
+      arguments (chai 1.9%), String.prototype.slice with one argument beside the existing
+      two-argument intrinsic (chai ~1%), codePointAt on two-byte strings with W7's S4 (Djot
+      ~0.3%).
+   d. Natives' own algorithms, for their owners: WeakMap get and has as one probe in a payload
+      (W2g's pattern; Vue 2.7%), Reflect.get, has and set sharing the property-get path (Vue
+      3.7%, chai 2.7%; their key conversion changed with W2a's step 6, property keys as
+      PropKeys, d3c66d56), dense indexOf (W1's deferred bulk indexOf now has a workload: chai
+      4.3%), the string searcher's setup (Djot 0.5%).
+   Risk: a misclassified native skipping the boundary while it can run author code; debug builds
+   assert that nothing on the light path reaches `Interp::call`. No dump change apart from 2c,
+   whose stubs gain arms.
+3. The closure entry: a callee that needs an environment builds it in its prologue, as V8's do:
+   allocate the cell its ScopeDesc sizes (a lean helper first, W2e's inline allocation later),
+   link the closure's environment as parent, copy captured parameters from the argument slots,
+   fill vars with Undefined and lexicals with the empty word, and install it as the frame's
+   environment. W2b's descriptors make that a copy of words. Bindings become 8-byte slots (TDZ as
+   the empty word; mutability and strictness in the descriptor; deletable eval bindings and
+   imports in private descriptors, as W2b planned), aiming at the 64-byte class for one binding.
+   Such callees and `arguments.length`-only or lazy-`arguments` bodies (the sequence stores argc,
+   or the argument window, as the plan's W3 item has it) then take the direct sequence;
+   `CALL_IC_NEEDS_ENV` keeps prepared entries and mapped arguments. Gains: an environment entry
+   ~1,270 to ~430 (~300 after 1); chai 1.3%, Vue 0.7%, React ~0.5% (environments its Rust
+   entries build). Risk: every captured-binding path changes layout (the VM, both JIT backends,
+   eval and `with`, the collector's tracing); the prologue must initialize every word before the
+   next safepoint. Dumps: binding stride and offsets everywhere, environment callees' prologues.
+4. Coverage: direct sequences in borrowed frames (the sequence runs the callee on its own record
+   and never swaps the caller's context: check that the restriction at jit.rs:3938 is stale;
+   Djot 0.3%); rest parameters built in the callee's prologue (the call table's rest case, Vue's
+   wrapper); CALLSTAT's labels and the census counters as `TRUST_JS_JIT_CALLSTAT=2`. Risk: a
+   borrowed frame's continuation state (resume point, handlers, `ret`) must come through the call
+   untouched. Dumps: borrowed chunks' call sites, rest callees' prologues.
+5. Natives calling JavaScript: Proxy traps and accessors through a prepared entry that shares
+   1b-1d's frame (Vue ~1.3% of its 3.1%); a getter or setter that the property IC proves takes the
+   direct sequence from the IC's accessor landing (the getter 1,373 to ~450). Risk: the IC's
+   holder and slot proof must still hold when the accessor is called, and the receiver must be the
+   original object. Dumps: the property templates' accessor landing.
+6. The call table's other forms: Function.prototype.call and apply with a cached target shift
+   the arguments and take the direct sequence (V8's call builtin shifts and jumps); spread of an
+   array under the iterator protector copies its elements onto the operand stack and takes the
+   call template, instead of the generic op helper (`jit_exec`), which also binary-searches the
+   operation's source position on every call; a class-constructor bit on the function object
+   replaces the `class_info` probes (about 640 instructions of a class construction's 3,214);
+   `new` takes a direct construct sequence. Predicted: call ~450, apply ~550, spread ~650, class
+   construction ~800, function construction ~550. Risk: spread's fast path must be exactly the
+   iteration it skips (a packed array, %ArrayIteratorPrototype%.next and the array's iterator
+   unmodified, as the existing protector check proves); the class bit must live and die with
+   `class_info`'s entry. Dumps: the `call`/`apply` intrinsic arms, spread and `new` sites. The
+   plan's other W3 items wait for a workload: a call cache for the VM's `Op::Call` and
+   bound-function entries (the generic chain, all its callers included, is 0.7-1.5% of these
+   workloads); mapped arguments stay on the prepared path.
+7. W4's call feedback, where W3 needs it: 2a gives every native a builtin id, which the IC records
+   instead of comparing function pointers at fill (bytecode.rs:23908-24025) and which W4 exports
+   as a native target's identity (what the optimizing tiers' builtin reductions key on); a
+   per-site megamorphic bit after repeated evictions stops refilling (V8's sentinel); the ways'
+   `func` already plays the FeedbackCell's role for closures of one literal. A per-site call count
+   (V8 counts every call) costs ~3 instructions in the sequence; W3 leaves room for it in the
+   CallIc and W4 decides within its 2% budget. No dump change unless the count changes the way's
+   stride.
+x64 has no inline probe or direct sequence (jit_x64.rs:1228, every call takes `H_CALL`): items
+2, 3's helper path, 5 and the Rust parts of 6 serve both backends; 1, 2c and 3's template are
+ARM64 in this stage.
+
+Order:
+1. Diagnostics (4's labels and counters).
+2. 2a and 2b (Rust only, both backends, no dump change): the largest share on Vue, chai and Djot.
+3. 1 (ARM64; dumps change): React's 10% and the call table.
+4. 3 (W2b's descriptors are on main since a1535a6f).
+5. 2c, 5, 6 and the rest of 4.
+6. 7 with W4.
+2d (Decision 10): Reflect, dense indexOf and the string searcher's setup in W3, after 2a and 2b,
+which rework those natives' entry; WeakMap's single probe goes to W2g with its payload.
+
+Exit (agreed, Decision 10; the plan's numbers as the starting point, Decision 2): on the call table,
+against Node limited to Sparkplug in the same session, the direct, method and closure calls within
+1.25x (the plan's; predicted 1.1-1.25x of Sparkplug's instructions an iteration, today 1.5-1.9x in
+time), recursion within 1.6x (the plan's 1.25x needs about 160 fewer instructions a call, 40 more
+than 1a-1d remove; predicted 1.48x, today 2.2x), the constructor within 1.25x (needs 6), and
+`arguments`, rest, `call`/`apply`, spread and the class-and-getter case within 2x (the plan's; today
+3.2-14x; spread and the class-and-getter case are the tightest, predicted about 2x). The plan's
+"Vue/React elapsed improved by the measured call share" made measurable as pinned instructions on
+main at the stage's end: React -8% and Vue -6% (predicted 10% and 8.5%, without 2d), Djot -4% and
+Web Tooling's chai -10% (predicted 6% and 14%); elapsed times recorded at the exit measurement;
+Test262 identical, no suite slower beyond noise.
