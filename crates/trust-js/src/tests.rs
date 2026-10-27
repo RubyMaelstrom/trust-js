@@ -18568,6 +18568,30 @@ fn array_splice_holes_and_shift() {
         run("var b=[1,,3,4]; var r=b.splice(0,2); [r.hasOwnProperty(1), b.join(',')].join('|')"),
         "false|3,4"
     );
+    // Shift moves holes down with the elements, and a leading hole reads as undefined.
+    assert_eq!(
+        run("var a=[1,,3,4]; var r=a.shift(); [r, a.length, 0 in a, 1 in a, a[1], a[2]].join()"),
+        "1,3,false,true,3,4"
+    );
+    assert_eq!(
+        run("var a=[,2,3]; var r=a.shift(); [String(r), a.length, a[0], 1 in a].join()"),
+        "undefined,2,2,true"
+    );
+    // An inherited element fills a hole through HasProperty and Get (ECMA-262
+    // #sec-array.prototype.shift), so the storage path stands down.
+    assert_eq!(
+        run(
+            "Array.prototype[1]='p'; var a=[1,,3]; a.shift(); var r=[a[0], a.hasOwnProperty(0), a[1], a.length].join(); delete Array.prototype[1]; r"
+        ),
+        "p,true,3,2"
+    );
+    // A non-extensible Array cannot receive a hole's destination: Set fails and shift throws.
+    assert_eq!(
+        run(
+            "var a=[1,,3]; Object.preventExtensions(a); try{a.shift();'no'}catch(e){e.constructor.name+':'+a.length+':'+(0 in a)}"
+        ),
+        "TypeError:3:false"
+    );
 }
 
 #[test]

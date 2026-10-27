@@ -6314,10 +6314,17 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         }
         // ECMA-262 #sec-array.prototype.shift: own data reads/writes cannot
         // observe the prototype, even on non-extensible Arrays. The storage
-        // proof rejects holes/accessors/failing descriptors before any mutation.
+        // proof rejects accessors/failing descriptors before any mutation, and
+        // holes unless no prototype has an indexed property and the Array is
+        // extensible (see `Props::shift_dense_array`).
         if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
         {
-            if let Some(first) = o.borrow_mut().props.shift_dense_array(len) {
+            let holes_read_absent = o.borrow().extensible && i.array_append_unshadowed(&o);
+            if let Some(first) = o
+                .borrow_mut()
+                .props
+                .shift_dense_array(len, holes_read_absent)
+            {
                 return Ok(first);
             }
         }

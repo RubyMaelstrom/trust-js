@@ -71,7 +71,7 @@ fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
                 for removed in 0..initial {
                     let len = initial - removed;
                     assert_eq!(
-                        number(props.shift_dense_array(len).unwrap()),
+                        number(props.shift_dense_array(len, false).unwrap()),
                         removed as f64
                     );
                     assert_eq!(
@@ -119,12 +119,12 @@ fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
                         assert_eq!(props.get("4294967295").unwrap().number_value(), Some(72.0));
                     }
                 }
-                assert!(props.shift_dense_array(0).is_none());
+                assert!(props.shift_dense_array(0, false).is_none());
                 assert!(props
                     .try_append_element(0, Property::plain(Value::Num(42.0)))
                     .is_ok());
                 props.get_mut("length").unwrap().set_value(Value::Num(1.0));
-                assert_eq!(number(props.shift_dense_array(1).unwrap()), 42.0);
+                assert_eq!(number(props.shift_dense_array(1, false).unwrap()), 42.0);
             }
         }
     }
@@ -141,7 +141,7 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
         let zero_flags = props.get("0").unwrap().meta;
         let one_flags = props.get("1").unwrap().meta;
         let shape = props.shape();
-        assert_eq!(number(props.shift_dense_array(3).unwrap()), 0.0);
+        assert_eq!(number(props.shift_dense_array(3, false).unwrap()), 0.0);
         assert_eq!(props.get("0").unwrap().meta, zero_flags);
         assert_eq!(props.get("1").unwrap().meta, one_flags);
         assert_eq!(props.get("0").unwrap().number_value(), Some(1.0));
@@ -157,7 +157,7 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
             ["0", "1", "length", "named", "01", "4294967295"]
         );
         assert!(
-            props.shift_dense_array(2).is_none(),
+            props.shift_dense_array(2, false).is_none(),
             "non-configurable tail must reject"
         );
     }
@@ -216,7 +216,7 @@ fn dense_shift_storage_rejections_are_atomic_and_do_not_invalidate_mirrors() {
             let flags = props.mirror_flags;
             let pointer = props.elems.mirror.as_ptr();
             let shape = props.shape();
-            assert!(props.shift_dense_array(3).is_none());
+            assert!(props.shift_dense_array(3, false).is_none());
             for (key, bits, meta) in before {
                 let p = props.get(&key).unwrap();
                 assert_eq!((p.packed.0.get(), p.meta), (bits, meta));
@@ -268,7 +268,7 @@ fn dense_shift_storage_preserves_numeric_bits_and_invalidates_prototype_creation
         props.mark_proto();
         for (removed, &bits) in expected.iter().enumerate() {
             let epoch = proto_epoch();
-            let first = props.shift_dense_array(4 - removed).unwrap();
+            let first = props.shift_dense_array(4 - removed, false).unwrap();
             assert!(proto_epoch() > epoch || epoch == u32::MAX);
             assert_eq!(number(first).to_bits(), bits);
             for n in 0..3 - removed {
@@ -292,12 +292,12 @@ fn packed_creation_and_prepend_do_not_certify_holes_or_nonplain_descriptors() {
         .into_iter(),
     );
     assert!(!properties.elems.inline_packed.packed_plain.get());
-    assert!(properties.shift_dense_array(3).is_none());
+    assert!(properties.shift_dense_array(3, false).is_none());
     assert!(!properties.unshift_dense_array(3, &[Value::Num(0.0)]));
     properties.insert("1", Property::plain(Value::Num(2.0)));
     assert!(properties.unshift_dense_array(3, &[Value::Empty]));
     assert!(!properties.elems.inline_packed.packed_plain.get());
-    assert!(properties.shift_dense_array(4).is_none());
+    assert!(properties.shift_dense_array(4, false).is_none());
     let mut descriptor = Props::packed_array_properties(
         [
             Property::plain(Value::Num(1.0)),
@@ -307,7 +307,7 @@ fn packed_creation_and_prepend_do_not_certify_holes_or_nonplain_descriptors() {
         .into_iter(),
     );
     assert!(!descriptor.elems.inline_packed.packed_plain.get());
-    assert!(descriptor.shift_dense_array(3).is_none());
+    assert!(descriptor.shift_dense_array(3, false).is_none());
 }
 
 /// Prepending one element at a time keeps a packed array inline up to its inline capacity and
@@ -331,11 +331,53 @@ fn tiny_prepends_stay_inline_before_promoting_once() {
         }
     }
     for index in (0..12).rev() {
-        let first = properties.shift_dense_array(index + 1).unwrap();
+        let first = properties.shift_dense_array(index + 1, false).unwrap();
         assert!(
             matches!(first.view(), ValueView::Obj(value) if Gc::ptr_eq(&value, &owners[index]))
         );
     }
+}
+
+#[test]
+fn holes_shift_in_packed_storage_once_the_caller_proves_them_absent() {
+    // Inline (3 slots) and heap-deque (16 slots) packed storage with a leading and an inner
+    // hole: without the caller's proof the storage path refuses; with it each element and each
+    // hole moves down one index, and the leading hole reads as undefined.
+    for len in [3usize, 16] {
+        let mut elements: Vec<Property> = (0..len)
+            .map(|n| Property::plain(Value::Num(n as f64)))
+            .collect();
+        elements[0] = Property::plain(Value::Empty);
+        elements[len / 2] = Property::plain(Value::Empty);
+        let mut properties = Props::packed_array_properties(elements.into_iter());
+        assert!(properties.shift_dense_array(len, false).is_none());
+        let first = properties.shift_dense_array(len, true).unwrap();
+        assert!(matches!(first.view(), ValueView::Undefined));
+        assert_eq!(
+            properties.length_property().unwrap().number_value(),
+            Some((len - 1) as f64)
+        );
+        for n in 0..len - 1 {
+            let element = properties.get_index(n as u32);
+            if n + 1 == len / 2 {
+                assert!(element.is_none());
+            } else {
+                let element = element.unwrap();
+                assert!(element.is_plain_element());
+                assert_eq!(number(element.value()), (n + 1) as f64);
+            }
+        }
+        assert!(properties.get_index((len - 1) as u32).is_none());
+    }
+    // A slot whose attributes are not a plain element's still refuses.
+    let mut descriptor = Props::packed_array_properties(
+        [
+            Property::plain(Value::Empty),
+            Property::data(Value::Num(2.0), false, true, true),
+        ]
+        .into_iter(),
+    );
+    assert!(descriptor.shift_dense_array(2, true).is_none());
 }
 
 #[test]
@@ -365,7 +407,7 @@ fn packed_plain_proof_uses_existing_inline_padding_and_clones_independently() {
         clone.elems.packed_slice_mut().unwrap()[0] =
             Property::data(Value::Num(0.0), false, true, true);
         assert!(!clone.elems.inline_packed.packed_plain.get());
-        assert!(clone.shift_dense_array(length).is_none());
+        assert!(clone.shift_dense_array(length, false).is_none());
         assert!(original.elems.inline_packed.packed_plain.get());
         assert!(original.get_index(0).unwrap().writable());
     }

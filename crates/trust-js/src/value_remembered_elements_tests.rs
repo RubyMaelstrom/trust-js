@@ -126,7 +126,7 @@ fn mutable_escapes_reorders_clone_and_whole_replacement_start_full() {
         130
     );
     clean(properties.elems.packed.as_deref().unwrap());
-    assert!(properties.shift_dense_array(130).is_some());
+    assert!(properties.shift_dense_array(130, false).is_some());
     assert_eq!(
         selected(
             properties.elems.packed.as_deref().unwrap(),
@@ -218,7 +218,7 @@ fn precise_descriptor_replacement_still_invalidates_the_plain_element_proof() {
     assert!(properties.elems.packed_all_plain());
     properties.insert("65", Property::accessor_prop(None, None, true, true));
     assert!(!properties.elems.packed_all_plain());
-    assert!(properties.shift_dense_array(128).is_none());
+    assert!(properties.shift_dense_array(128, false).is_none());
     assert!(!properties.unshift_dense_array(128, &[Value::Null]));
     assert_eq!(
         selected(

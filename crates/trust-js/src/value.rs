@@ -5575,6 +5575,12 @@ impl Property {
     pub(crate) fn is_plain_element(&self) -> bool {
         self.meta == PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE && !self.is_empty()
     }
+    /// A plain element's attributes, whether the slot holds an element or a hole (packed
+    /// storage writes a hole as `Property::plain(Value::Empty)`).
+    #[inline]
+    pub(crate) fn has_plain_element_attributes(&self) -> bool {
+        self.meta == PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE
+    }
     #[inline]
     pub(crate) fn set_value(&mut self, value: Value) {
         self.packed = PropWord::from_value(value);
@@ -8405,7 +8411,18 @@ impl Props {
     /// operation. The caller proves ordinary Array internal methods. A miss changes
     /// no property or mirror, so the generic algorithm retains its partial effects
     /// and abrupt completions. `length` is included in the proof and update.
-    pub(crate) fn shift_dense_array(&mut self, len: usize) -> Option<Value> {
+    ///
+    /// `holes_read_absent`: the caller also proved that no prototype of the Array has an
+    /// indexed property and that the Array is extensible. A hole then reads as undefined,
+    /// reports absent to HasProperty and takes CreateDataProperty with no inherited setter, so
+    /// packed elements with holes shift in place too: each element and each hole moves down
+    /// one index, which is what the spec's HasProperty, Set and DeletePropertyOrThrow sequence
+    /// leaves, and a leading hole returns undefined.
+    pub(crate) fn shift_dense_array(
+        &mut self,
+        len: usize,
+        holes_read_absent: bool,
+    ) -> Option<Value> {
         if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
             return None;
         }
@@ -8413,14 +8430,19 @@ impl Props {
         if !length.writable() || length.number_value() != Some(len as f64) {
             return None;
         }
-        if self
-            .elems
-            .packed_ref()
-            .is_some_and(|packed| packed.len() == len)
-            && self.elems.packed_all_plain()
-        {
+        let mut holey = false;
+        if self.elems.packed_ref().is_some_and(|packed| {
+            packed.len() == len
+                && (self.elems.packed_all_plain() || {
+                    // Holes keep a plain element's attributes (`Props::remove`), so every slot
+                    // moving with its attributes in place is still a plain element or a hole.
+                    holey = holes_read_absent
+                        && packed.iter().all(Property::has_plain_element_attributes);
+                    holey
+                })
+        }) {
             self.note_structural();
-            if self.mirror_flags & MIRROR_OK != 0 && self.elems.mirror_len() == len {
+            if !holey && self.mirror_flags & MIRROR_OK != 0 && self.elems.mirror_len() == len {
                 self.elems.buffers_mut().mirror.pop_front();
             } else {
                 self.mirror_invalidate();
@@ -8442,7 +8464,12 @@ impl Props {
                 self.mirror_flags = MIRROR_OK | MIRROR_NO_HOLES | MIRROR_ALL_I32;
                 self.mirror_holes = 0;
             }
-            return Some(first.into_value());
+            let first = first.into_value();
+            return Some(if first.is_empty() {
+                Value::Undefined
+            } else {
+                first
+            });
         }
         let safe = |index: usize, property: &Property| {
             !property.is_empty()
