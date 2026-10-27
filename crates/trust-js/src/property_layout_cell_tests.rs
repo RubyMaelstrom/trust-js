@@ -75,7 +75,7 @@ fn private_mutation_reuses_its_cell_and_clone_sharing_is_sticky() {
         props
             .ordered_keys()
             .iter()
-            .map(|key| &**key)
+            .map(|key| key.text().to_string())
             .collect::<Vec<_>>(),
         ["next"]
     );

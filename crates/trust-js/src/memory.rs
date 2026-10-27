@@ -1071,24 +1071,14 @@ impl Visitor {
 
     pub(crate) fn property_layout(&mut self, layout: &crate::value::PropertyLayout) {
         if self.property_layouts.insert(layout.as_ptr() as usize) {
-            // Requested payload: one layout cell body and key buffer per layout, not one copy
-            // per instance or a second copy through the arena's reserved-page accounting.
-            // The optional standard HashMap has a known entry-capacity lower bound; Rust
-            // does not expose its exact bucket allocation.
+            // Requested payload: one layout cell body, key block and index block per layout,
+            // not one copy per instance or a second copy through the arena's reserved-page
+            // accounting. The keys' atoms are the heap's.
             self.detached_property_storage = self.detached_property_storage.saturating_add(
                 size_of::<crate::value::PropertyLayoutData>()
-                    + layout.capacity() * size_of::<Rc<str>>(),
+                    + layout.capacity() * size_of::<crate::atom::PropKey>()
+                    + layout.index_bytes().unwrap_or(0),
             );
-            if let Some(capacity) = layout.index_capacity() {
-                self.detached_property_storage = self
-                    .detached_property_storage
-                    .saturating_add(size_of::<crate::fasthash::FastMap<Rc<str>, usize>>())
-                    .saturating_add(capacity * size_of::<(Rc<str>, usize)>());
-                self.detached_property_storage_opaque = true;
-            }
-            for key in layout.iter() {
-                self.rc_str(key);
-            }
         }
     }
 
@@ -1120,7 +1110,12 @@ impl Visitor {
         for (key, _) in object.internal_slots().iter() {
             self.rc_str(key);
         }
-        for (_, property) in object.props.iter().chain(object.internal_slots().iter()) {
+        for property in object
+            .props
+            .iter()
+            .map(|(_, property)| property)
+            .chain(object.internal_slots().values())
+        {
             property.visit_retained_value(self);
             if let Some(getter) = property.getter() {
                 self.value(getter);
@@ -1381,10 +1376,7 @@ fn scan_realm(
     }
     let (bytes, exact) = interp
         .property_key_strings
-        .scan_retained_memory(|(key, string)| {
-            visitor.rc_str(key);
-            visitor.lstr(string);
-        });
+        .scan_retained_memory(|string| visitor.lstr(string));
     totals.engine_caches.add(bytes);
     if !exact {
         totals
@@ -1479,11 +1471,6 @@ fn scan_realm(
     }
     for name in interp.stub_cache_names.borrow().iter().flatten() {
         visitor.rc_str(name);
-    }
-    if let Some((keys, ..)) = &interp.arguments_shapes {
-        for key in keys {
-            visitor.rc_str(key);
-        }
     }
     for map in interp
         .descriptor_maps
@@ -2707,13 +2694,14 @@ mod tests {
         visitor.props(&b);
         visitor.property_layout(&layout); // also retained by a hypothetical constructor hint
         assert_eq!(visitor.property_layouts.len(), 1);
-        assert_eq!(visitor.rc_strs.len(), 3);
+        // The keys are atoms, the heap's table's, not the layout's.
+        assert!(visitor.rc_strs.is_empty());
         assert_eq!(
             visitor.detached_property_storage,
             crate::value::detached_field_bytes(1)
                 + crate::value::detached_field_bytes(2)
                 + size_of::<crate::value::PropertyLayoutData>()
-                + layout.capacity() * size_of::<Rc<str>>()
+                + layout.capacity() * size_of::<crate::atom::PropKey>()
         );
     }
 
@@ -2754,9 +2742,8 @@ mod tests {
         ));
 
         let expected_layout = size_of::<crate::value::PropertyLayoutData>()
-            + layout.capacity() * size_of::<Rc<str>>()
-            + size_of::<crate::fasthash::FastMap<Rc<str>, usize>>()
-            + layout.index_capacity().unwrap() * size_of::<(Rc<str>, usize)>();
+            + layout.capacity() * size_of::<crate::atom::PropKey>()
+            + layout.index_bytes().unwrap();
         let mut visitor = Visitor::default();
         visitor.props(&a);
         visitor.props(&b);
@@ -2766,8 +2753,8 @@ mod tests {
             24 * size_of::<crate::value::Property>() + expected_layout
         );
         assert!(
-            visitor.detached_property_storage_opaque,
-            "HashMap bucket bytes remain a documented lower bound"
+            !visitor.detached_property_storage_opaque,
+            "a layout's index is a block of known size"
         );
     }
 
@@ -2781,12 +2768,12 @@ mod tests {
         ]);
         let weak_layout = crate::gc_handle::WeakRef::to(layout.as_ptr() as usize);
         let expected_layout_bytes = size_of::<crate::value::PropertyLayoutData>()
-            + layout.capacity() * size_of::<Rc<str>>();
+            + layout.capacity() * size_of::<crate::atom::PropKey>();
         // The source lives only in this helper frame (the collector scans the stack).
         let (weak_source, _keys) = crate::gc_test::in_frame(|| {
             let mut props = Props::with_layout(1, Some(layout.clone()));
             props.append_initialized_field(
-                &layout[0],
+                layout[0],
                 crate::value::Property::plain(Value::Undefined),
             );
             let source = Value::Obj(crate::value::Object::new_with_parts(
@@ -2820,11 +2807,7 @@ mod tests {
                 });
         }
         assert_eq!(visitor.property_layouts.len(), 1);
-        assert_eq!(
-            visitor.rc_strs.len(),
-            2,
-            "unused predictions are retained too"
-        );
+        // Unused predictions are retained too: the layout's capacity counts them.
         assert_eq!(visitor.detached_property_storage, expected_layout_bytes);
     }
 

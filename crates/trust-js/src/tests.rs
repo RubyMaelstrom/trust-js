@@ -6974,6 +6974,8 @@ fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
         .eval("globalThis.agentMarker = { agent: 2 }", false)
         .expect("second Agent script parses");
 
+    // Each engine's objects are read under its own heap (I6), as its public entry points do.
+    first.interp.activate_gc_heap();
     let first_object = match (first
         .interp
         .global
@@ -6986,6 +6988,7 @@ fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
         Some(ValueView::Obj(object)) => object,
         _ => panic!("first Agent marker missing"),
     };
+    second.interp.activate_gc_heap();
     let second_object = match (second
         .interp
         .global

@@ -2454,6 +2454,8 @@ pub struct Chunk {
     consts: Vec<Value>,
     heap: crate::value::HeapLifetime,
     names: Vec<Rc<str>>,
+    /// The property keys of `names`, in the chunk's heap: made for every name at first use.
+    name_keys: std::cell::OnceCell<Box<[crate::atom::PropKey]>>,
     n_slots: usize,
     /// Slot names, for TDZ ReferenceError messages.
     slot_names: Vec<Rc<str>>,
@@ -2670,6 +2672,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             consts,
             heap: _,
             names: _,
+            name_keys: _, // atoms live as long as their heap
             n_slots: _,
             slot_names: _,
             borrowed_parameter_aliases: _,
@@ -3281,11 +3284,14 @@ impl SimpleConstructor<'_> {
     }
 
     #[inline(always)]
-    pub(crate) fn field(&self, index: usize) -> (usize, &Rc<str>, &std::cell::Cell<IcState>) {
+    pub(crate) fn field(
+        &self,
+        index: usize,
+    ) -> (usize, crate::atom::PropKey, &std::cell::Cell<IcState>) {
         let field = &self.fields[index];
         (
             field.slot as usize,
-            &self.chunk.names[field.name as usize],
+            self.chunk.name_key(field.name),
             &self.chunk.caches[field.cache as usize],
         )
     }
@@ -7494,8 +7500,7 @@ fn finish_chunk(
         crate::value::new_shared_indexed_property_layout(
             instance_names[..instance_capacity_hint as usize]
                 .iter()
-                .map(|&name| c.names[name as usize].clone())
-                .collect(),
+                .map(|&name| crate::atom::PropKey::from_text(&c.names[name as usize])),
         )
     });
     // The final operation stream includes inlining, fragments and prepared/coroutine entries.
@@ -7540,6 +7545,7 @@ fn finish_chunk(
         consts: c.consts.into_vec(),
         heap: crate::value::active_heap_lifetime(),
         names: c.names,
+        name_keys: std::cell::OnceCell::new(),
         n_slots: c.slot_names.len(),
         slot_names: c.slot_names,
         borrowed_parameter_aliases: c.borrowed_parameter_aliases,
@@ -20469,16 +20475,32 @@ impl Chunk {
         &self,
         plan: &InitializerPlan,
         index: usize,
-    ) -> (usize, Option<&Value>, &Rc<str>, &std::cell::Cell<IcState>) {
+    ) -> (
+        usize,
+        Option<&Value>,
+        crate::atom::PropKey,
+        &std::cell::Cell<IcState>,
+    ) {
         let field = &plan.fields[index];
         (
             field.slot as usize,
             field
                 .default
                 .map(|constant| &self.consts[constant as usize]),
-            &self.names[field.name as usize],
+            self.name_key(field.name),
             &self.caches[field.cache as usize],
         )
+    }
+
+    /// The property key of name `index`, in the chunk's heap: every name's is made at the
+    /// first use of any.
+    pub(crate) fn name_key(&self, index: u32) -> crate::atom::PropKey {
+        self.name_keys.get_or_init(|| {
+            self.names
+                .iter()
+                .map(|name| crate::atom::PropKey::from_text(name))
+                .collect()
+        })[index as usize]
     }
 
     /// Exact straight-line field constructor recognized without function or benchmark identity.

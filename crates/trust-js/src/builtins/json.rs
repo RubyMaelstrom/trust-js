@@ -20,7 +20,7 @@ pub(super) fn install_json(it: &mut Interp) {
                 ValueView::Obj(o) => ab(i.to_length(o))?,
                 _ => 0,
             };
-            let mut list: Vec<Rc<str>> = Vec::new();
+            let mut list: Vec<crate::atom::PropKey> = Vec::new();
             // JSON.stringify's PropertyList keeps the first occurrence of each String while
             // preserving input order (ECMA-262 §25.5.4.1). Hash the already-coerced keys so a
             // large replacer array does not repeatedly rescan the prefix of `list`.
@@ -40,7 +40,9 @@ pub(super) fn install_json(it: &mut Interp) {
                 };
                 if let Some(key) = key {
                     if list_seen.insert(key.clone()) {
-                        list.push(Rc::from(crate::value::encode_owned_string_key(key)));
+                        list.push(crate::atom::PropKey::from_text(
+                            &crate::value::encode_owned_string_key(key),
+                        ));
                     }
                 }
             }
@@ -268,7 +270,7 @@ fn push_json_unicode_escape(out: &mut JsonOut, unit: u16) {
 /// JSON.stringify options: an optional function replacer and/or an array PropertyList of keys.
 struct JsonOpts {
     func: Option<Value>,
-    keys: Option<Vec<Rc<str>>>,
+    keys: Option<Vec<crate::atom::PropKey>>,
 }
 
 /// [[Delete]] for the JSON reviver: trap-aware, discarding the boolean status (per `Perform ?`).
@@ -369,7 +371,7 @@ fn internalize_json_property(
                     .map(|o| {
                         ordered_enum_keys(&o)
                             .iter()
-                            .map(|k| k.to_string())
+                            .map(|k| k.text().to_string())
                             .collect()
                     })
                     .unwrap_or_default()
@@ -473,15 +475,20 @@ fn json_plain_get(i: &Interp, object: &Gc) -> bool {
 
 /// Get(holder, key) for SerializeJSONProperty: an own data property of a plain object is read
 /// directly; anything else (accessors, absent keys, exotic objects) runs the full [[Get]].
-fn json_get(i: &mut Interp, holder: &Value, object: &Gc, key: &str) -> Result<Value, Value> {
+fn json_get(
+    i: &mut Interp,
+    holder: &Value,
+    object: &Gc,
+    key: crate::atom::PropKey,
+) -> Result<Value, Value> {
     if json_plain_get(i, object) {
-        if let Some(property) = object.borrow().props.get(key) {
+        if let Some(property) = object.borrow().props.get_key(key) {
             if !property.accessor() {
                 return Ok(property.value());
             }
         }
     }
-    ab(i.get_member_key(holder, key))
+    ab(i.get_member_key(holder, &key.text()))
 }
 
 /// [`json_get`] for an array element.
@@ -671,12 +678,14 @@ fn json_serialize_object(
 ) -> Result<(), Value> {
     let stepback = json_enter(i, s, object)?;
     // K: the replacer's PropertyList, or EnumerableOwnProperties(value, key).
-    let keys: Vec<Rc<str>> = match &s.opts.keys {
+    let keys: Vec<crate::atom::PropKey> = match &s.opts.keys {
         Some(list) => list.clone(),
         None if proxy_pair(i, value).is_some() => proxy_enum_string_keys(i, value)?
             .iter()
             .filter_map(|key| match &(key).view() {
-                ValueView::Str(key) => Some(Rc::from(crate::value::encode_lstr_key(key).as_ref())),
+                ValueView::Str(key) => Some(crate::atom::PropKey::from_text(
+                    &crate::value::encode_lstr_key(key),
+                )),
                 _ => None,
             })
             .collect(),
@@ -689,11 +698,11 @@ fn json_serialize_object(
                 keys.to_vec()
             } else {
                 let mut keys = object.props.ordered_keys();
-                keys.retain(|key| {
-                    !Interp::is_sym_key(key)
+                keys.retain(|&key| {
+                    !key.is_symbol()
                         && object
                             .props
-                            .get(key)
+                            .get_key(key)
                             .is_some_and(|property| property.enumerable())
                 });
                 keys
@@ -713,7 +722,7 @@ fn json_serialize_object(
                         .is_some_and(|property| property.enumerable())
                 };
                 if enumerable {
-                    keys.push(Rc::from(key.as_str()));
+                    keys.push(crate::atom::PropKey::from_text(&key));
                 }
             }
             keys
@@ -721,16 +730,17 @@ fn json_serialize_object(
     };
     s.out.push('{');
     let mut any = false;
-    for key in &keys {
+    for &key in &keys {
         let member_start = s.out.len();
         json_separator(s, !any);
-        json_quote_text(&mut s.out, crate::value::decode_string_key(key));
+        let text = key.text();
+        json_quote_text(&mut s.out, crate::value::decode_string_key(&text));
         s.out.push(':');
         if !s.gap.is_empty() {
             s.out.push(' ');
         }
         let member = json_get(i, value, object, key)?;
-        if json_serialize_property(i, s, value, JsonKey::Name(key), member)? {
+        if json_serialize_property(i, s, value, JsonKey::Name(&text), member)? {
             any = true;
         } else {
             s.out.truncate(member_start);

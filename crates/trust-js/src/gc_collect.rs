@@ -1642,7 +1642,7 @@ impl Interp {
         self.enumeration_keys
             .trace_roots(kind, |keys| keys.trace_gc(sink));
         self.property_key_strings
-            .trace_roots(kind, |(_, string)| string.trace_gc(sink));
+            .trace_roots(kind, |string| string.trace_gc(sink));
         self.re_texts.trace_roots(kind, |(string, text)| {
             string.trace_gc(sink);
             text.trace_gc(sink);
@@ -1668,7 +1668,7 @@ impl Interp {
         for keys in self.enumeration_keys.values() {
             keys.trace_gc(sink);
         }
-        for (_, string) in self.property_key_strings.values() {
+        for string in self.property_key_strings.values() {
             string.trace_gc(sink);
         }
         for (string, text) in self.re_texts.values() {

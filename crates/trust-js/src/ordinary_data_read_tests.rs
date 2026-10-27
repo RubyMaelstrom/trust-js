@@ -78,7 +78,7 @@ fn ordinary_data_read_all_value_kinds_owned_and_traced() {
             let slot = holder
                 .borrow()
                 .props
-                .get_with_slot(key)
+                .get_with_slot_walking(key, &mut None)
                 .unwrap()
                 .1
                 .map(|n| n as u32);

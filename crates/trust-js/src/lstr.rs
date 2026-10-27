@@ -315,21 +315,56 @@ impl LStr {
         HDR + len
     }
 
-    /// An exact one-byte string of `text` (ASCII) written at `cell`, outside every heap.
-    ///
-    /// # Safety
-    /// `cell` is aligned for a string header, valid for [`LStr::exact_ascii_size`] bytes and
-    /// never written or freed while the string is in use.
-    pub(crate) unsafe fn write_exact_ascii(cell: NonNull<u8>, text: &[u8]) -> LStr {
-        debug_assert!(text.is_ascii() && text.len() <= MAX_LEN);
-        let header = cell.cast::<Header>();
-        header.as_ptr().write(Header {
-            frontier: Cell::new(text.len()),
-            len: Cell::new(text.len() as u32),
-            cap: Cell::new(text.len() as u32 | ASCII_HINT),
-        });
-        std::ptr::copy_nonoverlapping(text.as_ptr(), cell.as_ptr().add(HDR), text.len());
-        LStr { p: header }
+    /// `block` with an exact one-byte string of `text` (ASCII) written at `offset`, outside
+    /// every heap: its header, then its bytes. Constant, for a block laid out at compile time.
+    pub(crate) const fn with_exact_ascii<const N: usize>(
+        mut block: [u8; N],
+        offset: usize,
+        text: &[u8],
+    ) -> [u8; N] {
+        assert!(text.len() <= MAX_LEN && offset + HDR + text.len() <= N);
+        const fn put<const N: usize>(mut block: [u8; N], at: usize, bytes: &[u8]) -> [u8; N] {
+            let mut index = 0;
+            while index < bytes.len() {
+                block[at + index] = bytes[index];
+                index += 1;
+            }
+            block
+        }
+        let len = text.len() as u32;
+        block = put(
+            block,
+            offset + std::mem::offset_of!(Header, frontier),
+            &text.len().to_ne_bytes(),
+        );
+        block = put(
+            block,
+            offset + std::mem::offset_of!(Header, len),
+            &len.to_ne_bytes(),
+        );
+        block = put(
+            block,
+            offset + std::mem::offset_of!(Header, cap),
+            &(len | ASCII_HINT).to_ne_bytes(),
+        );
+        put(block, offset + HDR, text)
+    }
+
+    /// Whether this exact string's text is `text`, from its header and units alone: the inline
+    /// compare of an atom (see [`LStr::is_exact`]), never a view. A one-byte string's units are
+    /// ASCII, so equal bytes are equal text.
+    #[inline(always)]
+    pub(crate) fn exact_is(&self, text: &str) -> bool {
+        debug_assert!(self.view().is_none());
+        let header = self.hdr();
+        if header.cap.get() & TWO_BYTE != 0 {
+            return *self == *text;
+        }
+        let len = header.len.get() as usize;
+        // SAFETY: a flat one-byte buffer holds `len` initialized units after its header.
+        len == text.len()
+            && unsafe { std::slice::from_raw_parts(self.p.as_ptr().cast::<u8>().add(HDR), len) }
+                == text.as_bytes()
     }
 
     /// The string whose cell is at `cell`.

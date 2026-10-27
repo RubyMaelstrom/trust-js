@@ -1144,14 +1144,14 @@ impl Interp {
             let mut dst = dns.borrow_mut();
             for (k, p) in src.props.iter() {
                 let mut p = p.clone();
-                if Interp::is_sym_key(k) {
+                if k.is_symbol() {
                     if let ValueView::Str(tag) = (p.value()).view() {
                         if &*tag.text() == "Module" {
                             p.set_value(Value::lstr("Deferred Module".to_string()));
                         }
                     }
                 }
-                dst.props.insert(k.clone(), p);
+                dst.props.insert(k, p);
             }
             dst.extensible = false;
             dst.props.demote_shape();
@@ -1205,9 +1205,9 @@ impl Interp {
                             let src = base_o.borrow();
                             let mut dst = stub.borrow_mut();
                             for (k, p) in src.props.iter() {
-                                if dst.props.get(k).is_none() {
+                                if dst.props.get_key(k).is_none() {
                                     let mut p = p.clone();
-                                    if Interp::is_sym_key(k) {
+                                    if k.is_symbol() {
                                         if let ValueView::Str(tag) = (p.value()).view() {
                                             if &*tag.text() == "Module" {
                                                 p.set_value(Value::lstr(
@@ -1216,7 +1216,7 @@ impl Interp {
                                             }
                                         }
                                     }
-                                    dst.props.insert(k.clone(), p);
+                                    dst.props.insert(k, p);
                                 }
                             }
                         }

@@ -44,19 +44,12 @@ impl CachedForInKeys {
         self.layouts.iter().flatten().fold(0usize, |bytes, layout| {
             // Conservatively charge duplicates and unused predicted suffixes. The census below
             // instead de-duplicates shared allocations across objects, hints and cache entries.
+            // The keys' atoms belong to the heap's table.
             let storage = std::mem::size_of::<PropertyLayoutData>()
-                + layout.capacity() * std::mem::size_of::<Rc<str>>();
-            let storage = layout.index_capacity().map_or(storage, |capacity| {
-                storage
-                    .saturating_add(std::mem::size_of::<crate::fasthash::FastMap<Rc<str>, usize>>())
-                    .saturating_add(capacity * std::mem::size_of::<(Rc<str>, usize)>())
-            });
-            layout
-                .iter()
-                .fold(bytes.saturating_add(storage), |bytes, key| {
-                    // Rc<str>'s two-word header plus at most one word of alignment padding.
-                    bytes.saturating_add(key.len().saturating_add(3 * std::mem::size_of::<usize>()))
-                })
+                + layout.capacity() * std::mem::size_of::<crate::atom::PropKey>();
+            bytes
+                .saturating_add(storage)
+                .saturating_add(layout.index_bytes().unwrap_or(0))
         })
     }
 
@@ -2330,8 +2323,8 @@ impl Interp {
                 .props
                 .ordered_keys()
                 .into_iter()
-                .filter(|key| !Interp::is_sym_key(key))
-                .map(|key| key.to_string())
+                .filter(|key| !key.is_symbol())
+                .map(|key| key.text().to_string())
                 .collect();
             if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(&o) as usize)).copied() {
                 for idx in 0..self.ta_len(&info).unwrap_or(0) {
@@ -6993,7 +6986,7 @@ impl Interp {
                 {
                     if !Gc::ptr_eq(src, dst) {
                         for k in src.borrow().props.keys() {
-                            let p = src.borrow().props.get(&k).cloned().unwrap();
+                            let p = src.borrow().props.get_key(k).cloned().unwrap();
                             dst.borrow_mut().props.insert(k, p);
                         }
                         for (key, slot) in src.borrow().internal_slots().iter() {
@@ -7175,17 +7168,17 @@ impl Interp {
                 }
                 let keys = src.borrow().props.ordered_keys();
                 for k in keys {
-                    if is_excluded(&k) {
+                    if is_excluded(&k.text()) {
                         continue;
                     }
                     let enumerable = src
                         .borrow()
                         .props
-                        .get(&k)
+                        .get_key(k)
                         .map(|p| p.enumerable())
                         .unwrap_or(false);
                     if enumerable {
-                        let v = self.get_member_key(value, &k)?;
+                        let v = self.get_member_key(value, &k.text())?;
                         rest.borrow_mut()
                             .props
                             .insert(k, crate::value::Property::plain(v));

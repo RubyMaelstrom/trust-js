@@ -377,7 +377,7 @@ fn bound_trace_arrays(value: &Value) -> Vec<(usize, String, Vec<String>)> {
                 None => "<hole>".to_string(),
             })
             .collect();
-        arrays.push((id, key.chars().take(48).collect(), values));
+        arrays.push((id, key.text().chars().take(48).collect(), values));
         if arrays.len() == 4 {
             break;
         }
@@ -3494,7 +3494,7 @@ pub struct Interp {
     /// The shape chain of an arguments object's named properties (`length`, @@iterator,
     /// `callee`) appended to empty or packed element storage, derived once by ordinary insertion
     /// into this interpreter's heap. Holds only keys and shape ids: no JS value or Realm.
-    pub(crate) arguments_shapes: Option<([Rc<str>; 3], [u32; 3], u32)>,
+    pub(crate) arguments_shapes: Option<([crate::atom::PropKey; 3], [u32; 3], u32)>,
     /// Pre-shaped property maps of FromPropertyDescriptor results: `[data, accessor]`, built by
     /// ordinary insertion on first use. Keys and shape only; every result object is fresh and
     /// takes the active Realm's %Object.prototype%.
@@ -3512,9 +3512,9 @@ pub struct Interp {
     pub(crate) fragment_cache: crate::bytecode::fragment_cache::Cache,
     pub(crate) enumeration_keys:
         crate::cache::ByteLru<crate::eval::EnumerationShape, crate::eval::CachedForInKeys>,
-    /// Immutable property-name encodings used by ordinary record enumeration.
-    /// The Rc pin prevents address reuse; no object, descriptor or value is cached.
-    pub(crate) property_key_strings: crate::cache::ByteLru<usize, (Rc<str>, crate::lstr::LStr)>,
+    /// The Strings of property keys that are not heap Strings themselves (see
+    /// [`Interp::property_key_string`]), by key word: keys are never reused.
+    pub(crate) property_key_strings: crate::cache::ByteLru<u64, crate::lstr::LStr>,
     /// Freelist of the JIT's activation records ([`crate::jit::JitFrame`]: a context and
     /// [`crate::jit::FRAME_BUF`] slot and operand words each) — a pop and pointer math per call
     /// instead of `Vec` bookkeeping. Records hold no live values while pooled. It also
@@ -7056,10 +7056,11 @@ impl Interp {
                 && matches!(borrowed.call, Callable::None)
                 && borrowed.extensible
                 && self.ordinary_get_ptr(ptr);
-            let has_index =
-                borrowed.props.keys().iter().any(|key| {
-                    !Self::is_sym_key(key) && crate::value::canonical_index(key).is_some()
-                });
+            let has_index = borrowed
+                .props
+                .keys()
+                .iter()
+                .any(|key| key.as_index().is_some());
             if !ordinary || has_index {
                 return Err(self.make_error(
                     "TypeError",
@@ -7240,23 +7241,31 @@ impl Interp {
         ))
     }
 
-    /// Share only a String encoding of an already owned immutable key. Live
-    /// property attributes and values are always read by the enumeration caller.
-    pub(crate) fn property_key_string(&mut self, key: &Rc<str>) -> crate::lstr::LStr {
-        let identity = Rc::as_ptr(key) as *const () as usize;
+    /// The String a (String) property key names, as enumeration produces it. A heap atom is
+    /// that String itself; a static name (no heap cell), an index or an escaped key
+    /// ([`crate::value::encode_string_key`]) gets a heap String, cached by key. Live property
+    /// attributes and values are always read by the enumeration caller.
+    pub(crate) fn property_key_string(&mut self, key: crate::atom::PropKey) -> crate::lstr::LStr {
+        use crate::lstr::Units;
+        if let Some(atom) = key.as_atom() {
+            let escaped = match key.units() {
+                Some(Units::Ascii(units)) => units.starts_with(&[0, 0]),
+                Some(Units::Utf16(units)) => units.starts_with(&[0, 0]),
+                None => false,
+            };
+            if !escaped && !atom.is_static() {
+                return atom.as_lstr();
+            }
+        }
         if let Some(string) = self
             .property_key_strings
-            .get_mapped(&identity, |(pin, string)| {
-                debug_assert!(Rc::ptr_eq(pin, key));
-                *string
-            })
+            .get_mapped(&key.word(), |string| *string)
         {
             return string;
         }
-        let string = crate::lstr::LStr::from(crate::value::decode_string_key(key));
-        let bytes = key.len().saturating_add(string.retained_requested_bytes());
-        self.property_key_strings
-            .insert(identity, (key.clone(), string), bytes);
+        let string = crate::lstr::LStr::from(crate::value::decode_string_key(&key.text()));
+        let bytes = string.retained_requested_bytes();
+        self.property_key_strings.insert(key.word(), string, bytes);
         string
     }
 
@@ -8459,7 +8468,7 @@ impl Interp {
                     .props
                     .iter()
                     .take(8)
-                    .map(|(name, _)| name.chars().take(60).collect::<String>())
+                    .map(|(name, _)| name.text().chars().take(60).collect::<String>())
                     .collect::<Vec<_>>();
                 let constructor = object.proto.as_ref().and_then(|prototype| {
                     let prototype = prototype.borrow();
@@ -9121,7 +9130,7 @@ impl Interp {
                     let property = if keychk {
                         rb.props
                             .entry_at(st.slot as usize)
-                            .and_then(|(key, p)| (&**key == name).then_some(p))
+                            .and_then(|(key, p)| key.is(name).then_some(p))
                     } else {
                         rb.props.property_at(st.slot as usize)
                     };
@@ -9178,7 +9187,7 @@ impl Interp {
                         let property = if keychk {
                             hb.props
                                 .entry_at(st.slot as usize)
-                                .and_then(|(key, p)| (&**key == name).then_some(p))
+                                .and_then(|(key, p)| key.is(name).then_some(p))
                         } else {
                             hb.props.property_at(st.slot as usize)
                         };
@@ -9577,8 +9586,11 @@ impl Interp {
                 {
                     let cached_proto = (((st.mid2_shape as u64) << 32) | st.slot as u64) as usize;
                     if cached_proto == proto_ptr {
-                        b.props
-                            .append_new(name.clone(), Property::plain(*v), st.holder_shape);
+                        b.props.append_new(
+                            crate::atom::PropKey::from_text(name),
+                            Property::plain(*v),
+                            st.holder_shape,
+                        );
                         return true;
                     }
                 }
@@ -10194,6 +10206,8 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         let mut cur = Some(*start);
         let mut depth = 0_u8;
+        // The key's atom, once a map on the chain has looked it up.
+        let mut walk_atom = None;
         while let Some(obj) = cur {
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&obj, Some(key))?;
@@ -10268,7 +10282,7 @@ impl Interp {
             let getter = {
                 let b = obj.borrow();
                 if let Some(trace) = trace.as_deref_mut() {
-                    match b.props.get_with_slot(key) {
+                    match b.props.get_with_slot_walking(key, &mut walk_atom) {
                         Some((p, slot)) => {
                             let holder_shape = b.props.shape();
                             if !p.accessor() {
@@ -10298,7 +10312,7 @@ impl Interp {
                 } else {
                     // `Props::get` is the semantic lookup and also covers dense/indexed storage;
                     // an untraced data read needs neither the named slot nor the holder shape.
-                    match b.props.get(key) {
+                    match b.props.get_walking(key, &mut walk_atom) {
                         Some(p) if !p.accessor() => return Ok(p.value()),
                         Some(p) => Some(p.getter().cloned()),
                         None => None,
@@ -13153,35 +13167,26 @@ impl Interp {
     /// properties (see `Interp::arguments_shapes`), derived on first use. The third return
     /// value is the callee child shape when `callee` is the strict poison ACCESSOR: since
     /// shapes encode descriptor class, the data probe's chain must not be reused for it.
-    fn arguments_named_shapes(&mut self) -> Option<([Rc<str>; 3], [u32; 3], u32)> {
+    fn arguments_named_shapes(&mut self) -> Option<([crate::atom::PropKey; 3], [u32; 3], u32)> {
         if self.arguments_shapes.is_none() {
             let iterator = self.iterator_sym?;
-            let keys: [Rc<str>; 3] = [
-                Rc::from("length"),
-                Rc::from(Self::sym_key(&iterator)),
-                Rc::from("callee"),
+            let keys = [
+                crate::atom::names::LENGTH.key(),
+                crate::atom::PropKey::from_text(&Self::sym_key(&iterator)),
+                crate::atom::names::CALLEE.key(),
             ];
             let mut probe = Props::new();
             let mut shapes = [0u32; 3];
-            for (index, key) in keys.iter().enumerate() {
-                probe.insert(
-                    key.clone(),
-                    Property::data(Value::Undefined, true, false, true),
-                );
+            for (index, &key) in keys.iter().enumerate() {
+                probe.insert(key, Property::data(Value::Undefined, true, false, true));
                 shapes[index] = probe.shape();
             }
             // Replay the shared prefix, then take the accessor transition for `callee`.
             let mut strict_probe = Props::new();
-            for key in &keys[..2] {
-                strict_probe.insert(
-                    key.clone(),
-                    Property::data(Value::Undefined, true, false, true),
-                );
+            for &key in &keys[..2] {
+                strict_probe.insert(key, Property::data(Value::Undefined, true, false, true));
             }
-            strict_probe.insert(
-                keys[2].clone(),
-                Property::accessor_prop(None, None, false, false),
-            );
+            strict_probe.insert(keys[2], Property::accessor_prop(None, None, false, false));
             let accessor_callee_shape = strict_probe.shape();
             if !shapes
                 .iter()
@@ -13192,7 +13197,7 @@ impl Interp {
             }
             self.arguments_shapes = Some((keys, shapes, accessor_callee_shape));
         }
-        self.arguments_shapes.clone()
+        self.arguments_shapes
     }
 
     /// Materialize the dedicated unmapped arguments slot of a compiled function. The active

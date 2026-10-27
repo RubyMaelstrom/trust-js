@@ -391,8 +391,14 @@ fn property_layout_words_address_the_live_cell_payload() {
     assert_eq!(word, read(&shared as *const PropertyLayout as usize, 0));
     assert_eq!(word, shared.as_ptr() as usize);
     assert!(shared.is_shared());
-    let keys = word + layout.layout_data_off;
-    assert_eq!(keys, &shared.keys as *const Vec<Rc<str>> as usize);
+    assert_eq!(
+        read::<u32>(word, layout.layout_keys_len) as usize,
+        shared.len()
+    );
+    assert_eq!(
+        read::<usize>(word, layout.layout_keys_ptr),
+        <[crate::atom::PropKey]>::as_ptr(&shared) as usize
+    );
 }
 
 #[test]

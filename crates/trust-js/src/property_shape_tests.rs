@@ -54,10 +54,10 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
         // only neutral keys and an integer identity. Heap-local shape counters would give
         // this alpha/delta child the same ID as the owner's alpha/gamma child. The layout
         // allocated here belongs to foreign; publishing it in original would violate I6.
-        let prefix = [(Rc::from("alpha"), PropClass::DataWritable)];
+        let prefix = [(PropKey::from_text("alpha"), PropClass::DataWritable)];
         let (foreign_shape, foreign_layout) = shape_transition(
             parent_shape,
-            &Rc::from("delta"),
+            PropKey::from_text("delta"),
             PropClass::DataWritable,
             Some(&prefix),
         );
@@ -66,8 +66,8 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
             "foreign child identity, {tier:?}"
         );
         let foreign_layout = foreign_layout.expect("foreign transition layout");
-        assert_eq!(&*foreign_layout[0], "alpha");
-        assert_eq!(&*foreign_layout[1], "delta");
+        assert_eq!(&*foreign_layout[0].text(), "alpha");
+        assert_eq!(&*foreign_layout[1].text(), "delta");
         let foreign_word = foreign_layout.cell_word() as usize;
         assert_eq!(
             foreign

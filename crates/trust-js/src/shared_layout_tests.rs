@@ -70,18 +70,12 @@ fn templates_share_keys_but_not_values_or_descriptors() {
     template.insert("x", Property::plain(Value::Undefined));
     template.insert("y", Property::plain(Value::Undefined));
     let layout = template.shared_layout().unwrap().clone();
-    let key_owners = Rc::strong_count(&layout[0]);
     let mut a = template.instantiate_plain([Value::Num(1.0), Value::Num(2.0)].into_iter());
     let b = template.instantiate_plain([Value::Num(3.0), Value::Num(4.0)].into_iter());
     assert!(crate::value::PropertyLayout::ptr_eq(
         a.shared_layout().unwrap(),
         b.shared_layout().unwrap()
     ));
-    assert_eq!(
-        Rc::strong_count(&layout[0]),
-        key_owners,
-        "instances must not clone individual keys"
-    );
     assert_eq!(
         a.retained_requested_storage_bytes(),
         (crate::value::detached_field_bytes(2), true)
@@ -95,11 +89,17 @@ fn templates_share_keys_but_not_values_or_descriptors() {
     a.remove("x");
     a.insert("z", Property::plain(Value::Num(5.0)));
     assert_eq!(
-        a.ordered_keys().iter().map(|k| &**k).collect::<Vec<_>>(),
+        a.ordered_keys()
+            .iter()
+            .map(|k| k.text().to_string())
+            .collect::<Vec<_>>(),
         ["y", "z"]
     );
     assert_eq!(
-        b.ordered_keys().iter().map(|k| &**k).collect::<Vec<_>>(),
+        b.ordered_keys()
+            .iter()
+            .map(|k| k.text().to_string())
+            .collect::<Vec<_>>(),
         ["x", "y"]
     );
     assert!(!crate::value::PropertyLayout::ptr_eq(
@@ -119,19 +119,19 @@ fn ordinary_shared_index_respects_live_prefix_and_mutation() {
 
     let mut short = Props::with_layout(layout.len(), Some(layout.clone()));
     for (slot, key) in layout.iter().take(9).enumerate() {
-        short.append_initialized_field(key, Property::plain(Value::Num(slot as f64)));
+        short.append_initialized_field(*key, Property::plain(Value::Num(slot as f64)));
     }
     assert!(short.contains("field8"));
     assert!(
         !short.contains("field9"),
         "predictions are not own properties"
     );
-    short.append_initialized_field(&layout[9], Property::plain(Value::Num(9.0)));
+    short.append_initialized_field(layout[9], Property::plain(Value::Num(9.0)));
     assert_eq!(short.get("field9").unwrap().value().as_num_opt(), Some(9.0));
 
     let mut other = Props::with_layout(layout.len(), Some(layout.clone()));
     for (slot, key) in layout.iter().enumerate() {
-        other.append_initialized_field(key, Property::plain(Value::Num((100 + slot) as f64)));
+        other.append_initialized_field(*key, Property::plain(Value::Num((100 + slot) as f64)));
     }
     assert!(crate::value::PropertyLayout::ptr_eq(
         short.shared_layout().unwrap(),
@@ -162,16 +162,14 @@ fn ordinary_shared_index_respects_live_prefix_and_mutation() {
         (12 * std::mem::size_of::<Property>(), true)
     );
 
-    let private = crate::value::new_property_layout(
-        (0..20).map(|i| Rc::from(format!("private{i}"))).collect(),
-    );
+    let private = crate::value::new_property_layout((0..20).map(|i| format!("private{i}")));
     assert!(
         !private.has_index(),
         "long/private layouts use the instance table"
     );
     let mut long = Props::with_layout(private.len(), Some(private.clone()));
     for (slot, key) in private.iter().enumerate() {
-        long.append_initialized_field(key, Property::plain(Value::Num(slot as f64)));
+        long.append_initialized_field(*key, Property::plain(Value::Num(slot as f64)));
     }
     assert_eq!(
         long.get("private8").unwrap().value().as_num_opt(),
@@ -258,7 +256,7 @@ fn reserved_layout_prefix_is_not_an_own_property() {
         &layout
     ));
     assert!(!props.contains("y"));
-    assert_eq!(&*layout[1], "y");
+    assert_eq!(&*layout[1].text(), "y");
 }
 
 #[test]
@@ -494,7 +492,8 @@ fn native_creation_replaces_private_and_shared_layout_cells_without_helpers() {
             0
         );
         assert_eq!(
-            &*previous[0], "wrong",
+            &*previous[0].text(),
+            "wrong",
             "replacing a layout never mutates its data"
         );
         assert_eq!(

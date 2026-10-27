@@ -85,8 +85,10 @@ impl Atom {
     }
 
     /// Whether this is a static name, which lives outside every heap.
+    #[inline]
     pub(crate) fn is_static(self) -> bool {
-        static_names().contains(self)
+        let block = STATIC_BLOCK.0.get() as usize;
+        (block..block + STATIC_BYTES).contains(&(self.0.as_ptr() as usize))
     }
 
     /// The atom's engine text, borrowed for a one-byte atom.
@@ -98,7 +100,7 @@ impl Atom {
     /// Whether the atom's text is `text`.
     #[inline]
     pub(crate) fn is(&self, text: &str) -> bool {
-        self.0 == *text
+        self.0.exact_is(text)
     }
 }
 
@@ -217,6 +219,161 @@ impl PropKey {
     pub(crate) fn cell_word(self) -> Option<u64> {
         (self.0.get() & 1 == 0).then_some(self.0.get())
     }
+
+    /// The key as one word: an atom's address, or an index tagged in its low bit.
+    #[inline]
+    pub(crate) fn word(self) -> u64 {
+        self.0.get()
+    }
+
+    /// The key of engine text `text` in the active heap (see [`PropKey::from_units`]).
+    pub(crate) fn from_text(text: &str) -> PropKey {
+        match crate::value::canonical_index(text) {
+            Some(index) => PropKey::index(index),
+            None => PropKey::atom(atomize(text)),
+        }
+    }
+
+    /// The active heap's existing key of engine text `text` (see [`PropKey::lookup`]).
+    #[inline]
+    pub(crate) fn lookup_text(text: &str) -> Option<PropKey> {
+        match crate::value::canonical_index(text) {
+            Some(index) => Some(PropKey::index(index)),
+            None => lookup(text).map(PropKey::atom),
+        }
+    }
+
+    /// The key's units: an atom's, none for an index.
+    #[inline]
+    pub(crate) fn units(&self) -> Option<Units<'_>> {
+        let atom = self.as_atom()?;
+        // SAFETY: the atom's cell lives as long as its heap, and so at least as long as any key
+        // that names it; atoms never change.
+        Some(unsafe { std::mem::transmute::<Units<'_>, Units<'_>>(atom.as_lstr().units()) })
+    }
+
+    /// The key's engine text: borrowed from a one-byte atom, decoded from a two-byte one, or an
+    /// index's digits.
+    pub(crate) fn text(&self) -> KeyStr<'_> {
+        match self.units() {
+            // SAFETY: one-byte units are ASCII (`LStr::known_ascii`), so UTF-8.
+            Some(Units::Ascii(bytes)) => KeyStr::Text(std::borrow::Cow::Borrowed(unsafe {
+                std::str::from_utf8_unchecked(bytes)
+            })),
+            Some(Units::Utf16(_)) => KeyStr::Text(std::borrow::Cow::Owned(
+                self.as_atom()
+                    .expect("units are an atom's")
+                    .text()
+                    .into_owned(),
+            )),
+            None => KeyStr::index(self.as_index().expect("a key is an index or an atom")),
+        }
+    }
+
+    /// Whether the key's text is `text`, made no atom.
+    #[inline]
+    pub(crate) fn is(self, text: &str) -> bool {
+        match self.as_atom() {
+            Some(atom) => atom.is(text),
+            None => self.as_index() == crate::value::canonical_index(text),
+        }
+    }
+
+    /// Whether the key's text starts with an ASCII digit: an index, or text such as `"007"`.
+    #[inline]
+    pub(crate) fn starts_with_digit(self) -> bool {
+        self.units().is_none_or(|units| {
+            units
+                .get(0)
+                .is_some_and(|unit| (u16::from(b'0')..=u16::from(b'9')).contains(&unit))
+        })
+    }
+
+    /// Whether this is a Symbol's key (see `Interp::sym_key`): a NUL and the Symbol's id.
+    #[inline]
+    pub(crate) fn is_symbol(self) -> bool {
+        self.symbol_id().is_some()
+    }
+
+    /// The id of the Symbol this key encodes, if it is a Symbol's key.
+    #[inline]
+    pub(crate) fn symbol_id(self) -> Option<u64> {
+        match self.units()? {
+            Units::Ascii([0, digits @ ..]) if !digits.is_empty() => {
+                digits.iter().try_fold(0u64, |id, &digit| {
+                    digit
+                        .is_ascii_digit()
+                        .then_some(())
+                        .and_then(|()| id.checked_mul(10))
+                        .and_then(|id| id.checked_add(u64::from(digit - b'0')))
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A [`PropKey`]'s engine text ([`PropKey::text`]).
+pub(crate) enum KeyStr<'a> {
+    Text(std::borrow::Cow<'a, str>),
+    /// An index's decimal digits, from `start`.
+    Index {
+        digits: [u8; 10],
+        start: u8,
+    },
+}
+
+impl KeyStr<'_> {
+    fn index(mut index: u32) -> Self {
+        let mut digits = [0u8; 10];
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + (index % 10) as u8;
+            index /= 10;
+            if index == 0 {
+                break;
+            }
+        }
+        KeyStr::Index {
+            digits,
+            start: start as u8,
+        }
+    }
+}
+
+impl std::ops::Deref for KeyStr<'_> {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        match self {
+            KeyStr::Text(text) => text,
+            // SAFETY: only ASCII digits are written from `start` on.
+            KeyStr::Index { digits, start } => unsafe {
+                std::str::from_utf8_unchecked(&digits[*start as usize..])
+            },
+        }
+    }
+}
+
+impl AsRef<str> for KeyStr<'_> {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+
+impl std::fmt::Display for KeyStr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self)
+    }
+}
+
+impl std::fmt::Debug for KeyStr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
 }
 
 impl std::fmt::Debug for PropKey {
@@ -282,7 +439,7 @@ pub(crate) struct AtomTable {
 }
 
 /// The entries of [`AtomTable::recent`].
-const RECENT: usize = 256;
+const RECENT: usize = 1024;
 
 impl Default for AtomTable {
     fn default() -> Self {
@@ -299,7 +456,7 @@ impl Default for AtomTable {
             young: Vec::new(),
             bytes: 0,
         };
-        for &atom in &static_names().atoms {
+        for atom in static_atoms() {
             let units = atom.0.units();
             let hash = table.hash(units);
             if let Err(slot) = table.find(hash, units) {
@@ -344,11 +501,11 @@ impl AtomTable {
 
     /// [`AtomTable::atomize`] of engine text (see [`crate::jstr`]).
     pub(crate) fn atomize_text(&mut self, text: &str) -> Atom {
-        if !text.is_ascii() {
-            return self.atomize(Units::Utf16(&crate::jstr::units(text)));
-        }
         if let Some(atom) = self.recent(text) {
             return atom;
+        }
+        if !text.is_ascii() {
+            return self.atomize(Units::Utf16(&crate::jstr::units(text)));
         }
         let atom = self.atomize(Units::Ascii(text.as_bytes()));
         self.remember(text, atom);
@@ -357,23 +514,24 @@ impl AtomTable {
 
     /// [`AtomTable::lookup`] of engine text.
     pub(crate) fn lookup_text(&mut self, text: &str) -> Option<Atom> {
-        if !text.is_ascii() {
-            return self.lookup(Units::Utf16(&crate::jstr::units(text)));
-        }
         if let Some(atom) = self.recent(text) {
             return Some(atom);
+        }
+        if !text.is_ascii() {
+            return self.lookup(Units::Utf16(&crate::jstr::units(text)));
         }
         let atom = self.lookup(Units::Ascii(text.as_bytes()))?;
         self.remember(text, atom);
         Some(atom)
     }
 
-    /// The atom [`AtomTable::recent`] holds for ASCII `text`'s address, if it is `text`'s.
+    /// The atom [`AtomTable::recent`] holds for `text`'s address, if it is `text`'s (and so
+    /// `text` is ASCII: only one-byte atoms are remembered).
     #[inline]
     fn recent(&self, text: &str) -> Option<Atom> {
         let (address, atom) = self.recent[Self::recent_slot(text)];
         let atom = atom.filter(|_| address == text.as_ptr() as usize)?;
-        (atom.0.as_ascii() == Some(text)).then_some(atom)
+        atom.0.exact_is(text).then_some(atom)
     }
 
     #[inline]
@@ -539,65 +697,59 @@ fn string_bytes(string: LStr) -> usize {
     }
 }
 
-/// The static names: the atoms of [`STATIC_NAMES`], in one block outside every heap.
-pub(crate) struct StaticNames {
-    /// By [`StaticName`] index.
-    atoms: Vec<Atom>,
-    /// The block's address range, for [`StaticNames::contains`].
-    span: std::ops::Range<usize>,
+/// The bytes a static name takes in [`STATIC_BLOCK`]: an exact string, 16-byte aligned.
+const fn static_size(name: &str) -> usize {
+    LStr::exact_ascii_size(name.len()).next_multiple_of(16)
 }
 
-// SAFETY: the block is written once, before the table is published, and never again; atoms are
-// exact, so no append writes into it.
-unsafe impl Send for StaticNames {}
-unsafe impl Sync for StaticNames {}
-
-impl StaticNames {
-    fn contains(&self, atom: Atom) -> bool {
-        self.span.contains(&(atom.0.as_ptr() as usize))
+/// Each static name's offset in [`STATIC_BLOCK`], by [`StaticName`] index.
+const STATIC_OFFSETS: [usize; STATIC_NAMES.len()] = {
+    let mut offsets = [0; STATIC_NAMES.len()];
+    let (mut index, mut offset) = (0, 0);
+    while index < STATIC_NAMES.len() {
+        offsets[index] = offset;
+        offset += static_size(STATIC_NAMES[index]);
+        index += 1;
     }
-}
+    offsets
+};
 
-/// The process's static names, laid out at first use.
-pub(crate) fn static_names() -> &'static StaticNames {
-    static NAMES: std::sync::OnceLock<StaticNames> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| {
-        #[derive(Clone, Copy)]
-        #[repr(align(16))]
-        struct Unit {
-            _bytes: [u8; 16],
+/// The bytes of [`STATIC_BLOCK`].
+const STATIC_BYTES: usize = {
+    let last = STATIC_NAMES.len() - 1;
+    STATIC_OFFSETS[last] + static_size(STATIC_NAMES[last])
+};
+
+/// The static names: the atoms of [`STATIC_NAMES`], exact one-byte strings laid out at compile
+/// time in one block outside every heap, so each has a constant address. Never written: atoms
+/// are exact, so no append writes into one. (A cell, for the strings' interior mutability.)
+#[repr(C, align(16))]
+struct StaticBlock(std::cell::UnsafeCell<[u8; STATIC_BYTES]>);
+
+// SAFETY: the block is never written (see above).
+unsafe impl Sync for StaticBlock {}
+
+static STATIC_BLOCK: StaticBlock = StaticBlock(std::cell::UnsafeCell::new({
+    let mut block = [0u8; STATIC_BYTES];
+    let mut index = 0;
+    while index < STATIC_NAMES.len() {
+        let name = STATIC_NAMES[index].as_bytes();
+        // ASCII, and no array index: a static name is an atom (see `PropKey::from_units`).
+        let mut at = 0;
+        while at < name.len() {
+            assert!(name[at].is_ascii());
+            at += 1;
         }
-        const ALIGN: usize = std::mem::size_of::<Unit>();
-        let size = |name: &str| LStr::exact_ascii_size(name.len()).next_multiple_of(ALIGN);
-        let total: usize = STATIC_NAMES.iter().map(|name| size(name)).sum();
-        // Kept for the process's life: the names outlive every heap.
-        let block: &'static mut [Unit] =
-            Vec::leak(vec![Unit { _bytes: [0; ALIGN] }; total / ALIGN]);
-        let base = block.as_mut_ptr().cast::<u8>();
-        let mut offset = 0;
-        let atoms = STATIC_NAMES
-            .iter()
-            .map(|name| {
-                debug_assert!(
-                    name.is_ascii() && canonical_index(Units::Ascii(name.as_bytes())).is_none()
-                );
-                // SAFETY: the block is aligned and sized for every name, each at its own offset,
-                // and never freed or written again.
-                let atom = Atom(unsafe {
-                    LStr::write_exact_ascii(
-                        NonNull::new_unchecked(base.add(offset)),
-                        name.as_bytes(),
-                    )
-                });
-                offset += size(name);
-                atom
-            })
-            .collect();
-        StaticNames {
-            atoms,
-            span: base as usize..base as usize + total,
-        }
-    })
+        assert!(!name.is_empty() && !name[0].is_ascii_digit());
+        block = LStr::with_exact_ascii(block, STATIC_OFFSETS[index], name);
+        index += 1;
+    }
+    block
+}));
+
+/// The static names' atoms, in [`STATIC_NAMES`] order.
+fn static_atoms() -> impl Iterator<Item = Atom> {
+    (0..STATIC_NAMES.len()).map(|index| StaticName(index as u16).atom())
 }
 
 /// A static name, by its index in [`STATIC_NAMES`].
@@ -608,7 +760,16 @@ impl StaticName {
     /// The name's atom.
     #[inline]
     pub(crate) fn atom(self) -> Atom {
-        static_names().atoms[self.0 as usize]
+        // SAFETY: the block holds an exact string at each name's offset, for the process's life.
+        Atom(unsafe {
+            LStr::from_cell(NonNull::new_unchecked(
+                STATIC_BLOCK
+                    .0
+                    .get()
+                    .cast::<u8>()
+                    .add(STATIC_OFFSETS[self.0 as usize]),
+            ))
+        })
     }
 
     #[inline]

@@ -5210,10 +5210,10 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.entry_size < 0x1_0000
         && (layout.obj_props + layout.props_layout).is_multiple_of(8)
         && (layout.obj_props + layout.props_layout) / 8 < 4096
-        && (layout.layout_data_off + layout.vec_ptr_off).is_multiple_of(8)
-        && (layout.layout_data_off + layout.vec_len_off).is_multiple_of(8)
-        && layout.layout_data_off + layout.vec_ptr_off < 4096
-        && layout.layout_data_off + layout.vec_len_off < 4096
+        && layout.layout_keys_ptr.is_multiple_of(8)
+        && layout.layout_keys_len.is_multiple_of(4)
+        && layout.layout_keys_ptr < 4096
+        && layout.layout_keys_len < 4096
         && std::mem::offset_of!(JitCtx, shape_layouts).is_multiple_of(8)
         && std::mem::offset_of!(JitCtx, shape_layouts) / 8 < 4096
         && layout.shape_layout_entry_size == 16
@@ -5784,10 +5784,9 @@ fn emit_prop_load_inline(
 
     let plain = layout.obj_ic_plain as u32;
     // Key-checked entries (`IC_ARR_KEYCHK`: the holder is an Array — `arr.length`, or a method
-    // on the Array-exotic `Array.prototype`): validated by an inline byte-compare of the entry's
-    // key against the site's compile-time name. Only for short names with a good fat-pointer
-    // probe; otherwise those states keep falling to the helper.
-    let kc = layout.key_probe_ok && !name.is_empty() && name.len() <= 8;
+    // on the Array-exotic `Array.prototype`): validated by an inline compare of the entry's key
+    // with the site's compile-time name's, one word each (`PropKey`).
+    let kc = !name.is_empty();
     let slow = a.new_label();
     let done = a.new_label();
     let load = a.new_label();
@@ -6101,9 +6100,10 @@ fn emit_prop_load_inline(
     regions::emit_property_event(a, 0);
     a.b(done);
     // 6kc. Key-checked landing (out of the hit path's fall-through line): same bounds + entry
-    // compute as `load`, then verify the entry's key IS the site's name (length, then content
-    // against immediates) — an array's slots aren't pinned by its shape, so the key is the
-    // authority. Mismatch (slot shifted since fill) → helper re-derives. Ends by jumping back
+    // compute as `load`, then verify the entry's key IS the site's name — an array's slots
+    // aren't pinned by its shape, so the key is the authority. A key is one word: an atom's
+    // address (an atom lives as long as its heap, which this code belongs to) or a tagged
+    // index. Mismatch (slot shifted since fill) → helper re-derives. Ends by jumping back
     // into the shared value path.
     a.bind(load_kc);
     if kc {
@@ -6113,43 +6113,15 @@ fn emit_prop_load_inline(
         fields_data(a, layout, 15, 11);
         a.mov_imm64(16, es);
         a.madd(15, 13, 16, 15);
-        // Named fields have no inline key: follow the holder's shared layout at the same slot.
+        // Named fields have no inline key: follow the holder's shared layout at the same slot,
+        // which its keys always cover.
         a.ldr_imm(17, 11, (layout.obj_props + layout.props_layout) as u32);
         a.cbz(17, true, slow);
-        a.ldr_imm(17, 17, (layout.layout_data_off + layout.vec_ptr_off) as u32);
-        a.add_shifted(17, 17, 13, 4); // sizeof(Rc<str>) == 16
-        let klen = layout.str_len_word as i32;
-        let kptr = layout.str_ptr_word as i32;
-        a.ldur(16, 17, klen);
-        a.cmp_imm_x(16, name.len() as u32);
+        a.ldr_imm(17, 17, layout.layout_keys_ptr as u32);
+        a.ldr_x_lsl3(17, 17, 13);
+        a.mov_imm64(16, crate::atom::PropKey::from_text(name).word());
+        a.cmp_reg_x(17, 16);
         a.b_cond(C_NE, slow);
-        a.ldur(16, 17, kptr); // stored Rc<str> word (RcBox base)
-        let d = layout.str_data_off as u32;
-        let bytes = name.as_bytes();
-        let mut off = 0usize;
-        while bytes.len() - off >= 4 {
-            let imm =
-                u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-            a.ldr_w_imm(17, 16, d + off as u32);
-            a.movz(9, imm & 0xFFFF, 0);
-            a.movk(9, imm >> 16, 1);
-            a.cmp_reg_w(17, 9);
-            a.b_cond(C_NE, slow);
-            off += 4;
-        }
-        if bytes.len() - off >= 2 {
-            let imm = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as u32;
-            a.ldrh_imm(17, 16, d + off as u32);
-            a.movz(9, imm, 0);
-            a.cmp_reg_w(17, 9);
-            a.b_cond(C_NE, slow);
-            off += 2;
-        }
-        if bytes.len() - off == 1 {
-            a.ldrb_imm(17, 16, d + off as u32);
-            a.cmp_imm_w(17, bytes[off] as u32);
-            a.b_cond(C_NE, slow);
-        }
         a.b(val);
     }
     // 6a. absent landing: the read is `undefined`. Tag-only write (stale payload is fine —
@@ -9244,56 +9216,19 @@ fn emit_prop_create_probe(
     let key_ready = a.new_label();
     a.movz(7, 0, 0);
     // A predicted layout already owns the next key. Otherwise the creation IC's destination
-    // shape can supply a cached layout, with no allocation or string-keyed lookup.
+    // shape can supply a cached layout, with no allocation or string-keyed lookup. Layouts can
+    // be learned before compilation or shared with another creation site; the predicted key is
+    // one word, compared with the site's name's (an atom of this code's heap).
     a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
     a.cbz(16, true, transition_layout);
-    a.ldr_imm(17, 16, (layout.layout_data_off + layout.vec_len_off) as u32);
+    a.ldr_w_imm(17, 16, layout.layout_keys_len as u32);
     a.cmp_reg_x(13, 17);
     a.b_cond(C_HS, transition_layout);
-    a.ldr_imm(16, 16, (layout.layout_data_off + layout.vec_ptr_off) as u32);
-    a.add_shifted(16, 16, 13, 4);
-    a.ldur(17, 16, layout.str_len_word as i32);
-    a.mov_imm64(14, name.len() as u64);
+    a.ldr_imm(16, 16, layout.layout_keys_ptr as u32);
+    a.ldr_x_lsl3(17, 16, 13);
+    a.mov_imm64(14, crate::atom::PropKey::from_text(name).word());
     a.cmp_reg_x(17, 14);
     a.b_cond(C_NE, transition_layout);
-    a.ldur(17, 16, layout.str_ptr_word as i32);
-    a.mov_imm64(14, (name.as_ptr() as usize - layout.str_data_off) as u64);
-    a.cmp_reg_x(17, 14);
-    // Layouts can be learned before compilation or shared with another creation site. Equal
-    // property names need not own the same Rc allocation. Keep identity as the cheap case,
-    // then compare short names by content without calling out or changing any ownership.
-    if name.len() <= 32 {
-        let key_matches = a.new_label();
-        a.b_cond(C_EQ, key_matches);
-        let d = layout.str_data_off as u32;
-        let bytes = name.as_bytes();
-        let mut off = 0usize;
-        while bytes.len() - off >= 4 {
-            let imm = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-            a.ldr_w_imm(16, 17, d + off as u32);
-            a.movz(14, imm & 0xFFFF, 0);
-            a.movk(14, imm >> 16, 1);
-            a.cmp_reg_w(16, 14);
-            a.b_cond(C_NE, transition_layout);
-            off += 4;
-        }
-        if bytes.len() - off >= 2 {
-            let imm = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap()) as u32;
-            a.ldrh_imm(16, 17, d + off as u32);
-            a.movz(14, imm, 0);
-            a.cmp_reg_w(16, 14);
-            a.b_cond(C_NE, transition_layout);
-            off += 2;
-        }
-        if bytes.len() - off == 1 {
-            a.ldrb_imm(16, 17, d + off as u32);
-            a.cmp_imm_w(16, bytes[off] as u32);
-            a.b_cond(C_NE, transition_layout);
-        }
-        a.bind(key_matches);
-    } else {
-        a.b_cond(C_NE, transition_layout);
-    }
     a.b(key_ready);
     a.bind(transition_layout);
     // This activation's heap pins cached layouts. The shape table cannot change between
@@ -9313,7 +9248,7 @@ fn emit_prop_create_probe(
     a.b_cond(C_NE, miss);
     a.ldr_imm(7, 16, layout.shape_layout_entry_keys as u32);
     a.cbz(7, true, miss);
-    a.ldr_imm(17, 7, (layout.layout_data_off + layout.vec_len_off) as u32);
+    a.ldr_w_imm(17, 7, layout.layout_keys_len as u32);
     a.cmp_reg_x(13, 17);
     a.b_cond(C_HS, miss);
     a.bind(key_ready);
@@ -9464,8 +9399,7 @@ fn emit_set_prop_inline(
     // Creation IC: constructors repeatedly assign a named field to a fresh receiver whose map
     // lacks it (see `emit_prop_create_probe`). Its ways share the site's cells with ordinary
     // update ways; the single way loop below dispatches on each way's kind.
-    let create_ok = layout.key_probe_ok
-        && !name.is_empty()
+    let create_ok = !name.is_empty()
         && !name.as_bytes()[0].is_ascii_digit()
         && name != "length"
         && name != "prototype";

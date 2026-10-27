@@ -35,18 +35,22 @@ fn owned_value(engine: &mut Engine, source: &str) -> Value {
 /// An internal test (S6 step 11b): no embedder can give one Engine's object to another (scoped
 /// values are branded by their scope, and handles are checked), so the foreign mutation is made
 /// through the other engine's interpreter directly.
+///
+/// Property keys are atoms of a heap, so the keys here are static names, the same atoms in every
+/// heap, and the objects have no prototype: a mutation under the other heap finds and makes the
+/// keys as the owner would, and reads no map with the owner's other atoms (I6).
 #[test]
 #[cfg(feature = "embed")]
 fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
     let mut owner = Engine::new();
-    let original = owned_value(&mut owner, "({alpha:1})");
-    let same_heap = owned_value(&mut owner, "({alpha:1,gamma:2})");
+    let original = owned_value(&mut owner, "({__proto__: null, value: 1})");
+    let same_heap = owned_value(&mut owner, "({__proto__: null, value: 1, done: 2})");
     let mut foreign = Engine::new();
-    let _foreign_shape = owned_value(&mut foreign, "({beta:1})");
+    let _foreign_shape = owned_value(&mut foreign, "({next:1})");
     foreign.interp.activate_gc_heap();
     assert!(foreign
         .interp
-        .set_member_key(&original, "delta", Value::Num(3.0))
+        .set_member_key(&original, "then", Value::Num(3.0))
         .is_ok());
     assert_ne!(
         original.as_obj().unwrap().borrow().props.shape(),
@@ -57,11 +61,11 @@ fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
     let second = backing(&mut owner, &original);
     assert_eq!(
         (key_at(&first, 0), key_at(&first, 1)),
-        ("alpha".into(), "gamma".into())
+        ("value".into(), "done".into())
     );
     assert_eq!(
         (key_at(&second, 0), key_at(&second, 1)),
-        ("alpha".into(), "delta".into())
+        ("value".into(), "then".into())
     );
     foreign.interp.activate_gc_heap();
     original
@@ -69,12 +73,12 @@ fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
         .unwrap()
         .borrow_mut()
         .props
-        .remove("alpha");
+        .remove("value");
     let third = backing(&mut owner, &original);
-    assert_eq!(key_at(&third, 0), "delta");
+    assert_eq!(key_at(&third, 0), "then");
     assert_eq!(
         key_at(&first, 0),
-        "alpha",
+        "value",
         "an old cursor retains its own immutable candidates"
     );
 }
@@ -82,7 +86,7 @@ fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
 fn predicted_object(layout: &crate::value::PropertyLayout, count: usize) -> Value {
     let mut props = crate::value::Props::with_layout(count, Some(layout.clone()));
     for key in layout.iter().take(count) {
-        props.append_initialized_field(key, Property::plain(Value::Num(1.0)));
+        props.append_initialized_field(*key, Property::plain(Value::Num(1.0)));
     }
     Value::Obj(Object::new_with_parts(
         None,
@@ -155,8 +159,11 @@ fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
 #[test]
 fn for_in_cache_accounts_unused_predictions_and_detaches_on_mutation() {
     let mut engine = Engine::new();
-    let layout =
-        crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("x".repeat((1 << 20) + 1))]);
+    engine.interp.activate_gc_heap();
+    // More unused predicted keys than the cache's budget holds (a key is a word).
+    let layout = crate::value::new_property_layout(
+        std::iter::once("a".to_string()).chain((0..(1 << 17) + 1).map(|n| format!("unused{n}"))),
+    );
     let source = predicted_object(&layout, 1);
     let before = engine.interp.enumeration_keys.stats();
     assert_eq!(key_at(&backing(&mut engine, &source), 0), "a");

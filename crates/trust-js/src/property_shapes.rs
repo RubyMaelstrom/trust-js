@@ -213,8 +213,7 @@ mod tests {
         };
         // Layouts are cells of the active heap.
         let _engine = crate::Engine::new();
-        let layout =
-            |name: &str| super::super::new_shared_indexed_property_layout(vec![name.into()]);
+        let layout = |name: &str| super::super::new_shared_indexed_property_layout(vec![name]);
         let mut layouts = ShapeLayouts::default();
         let (a, b, c) = (layout("a"), layout("b"), layout("c"));
         layouts.insert(1, a.clone());
@@ -281,7 +280,7 @@ mod tests {
         let weak = crate::gc_handle::WeakRef::to(keys.as_ptr() as usize);
         layouts.insert(17, keys);
         assert_eq!(layouts.allocated_bytes(), std::mem::size_of::<LayoutPage>());
-        assert_eq!(&*layouts.get(17).unwrap()[0], "first");
+        assert_eq!(&*layouts.get(17).unwrap()[0].text(), "first");
         let collision = 17 + SHAPE_LAYOUT_CACHE_LIMIT as u32;
         assert!(layouts.get(collision).is_none());
         assert!(layouts.get_mut(collision).is_none());
@@ -297,7 +296,7 @@ mod tests {
             crate::gc_core::CollectionKind::Major,
         );
         assert!(weak.live_ptr().is_none());
-        assert_eq!(&*layouts.get(collision).unwrap()[0], "second");
+        assert_eq!(&*layouts.get(collision).unwrap()[0].text(), "second");
         layouts.insert(
             SHAPE_UNCACHEABLE,
             crate::value::new_property_layout(vec![Rc::from("untracked")]),

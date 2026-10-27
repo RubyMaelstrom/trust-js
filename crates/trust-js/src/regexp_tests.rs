@@ -667,11 +667,17 @@ fn match_arrays_share_one_layout_and_the_ordinary_shape() {
     let (b, _) = layout(&mut engine, "b");
     assert!(PropertyLayout::ptr_eq(&b, &later));
     assert_eq!(
-        changed.iter().map(|key| &**key).collect::<Vec<_>>(),
+        changed
+            .iter()
+            .map(|key| key.text().to_string())
+            .collect::<Vec<_>>(),
         ["length", "index", "input", "groups", "extra"]
     );
     assert_eq!(
-        later.iter().map(|key| &**key).collect::<Vec<_>>(),
+        later
+            .iter()
+            .map(|key| key.text().to_string())
+            .collect::<Vec<_>>(),
         ["length", "index", "input", "groups"]
     );
 }

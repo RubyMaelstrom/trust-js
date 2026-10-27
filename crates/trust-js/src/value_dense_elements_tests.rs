@@ -58,7 +58,7 @@ fn dense_elements_sparse_length_does_not_reserve_storage() {
         props
             .ordered_keys()
             .iter()
-            .map(|s| &**s)
+            .map(|s| s.text().to_string())
             .collect::<Vec<_>>(),
         ["200", "4000000000", "length"]
     );
@@ -215,7 +215,7 @@ fn dense_elements_recovery_keeps_named_indices_outside_packed_storage_guarded() 
         .try_append_element(1, Property::plain(Value::Num(2.0)))
         .is_ok());
     assert_eq!(props.get_index(1).unwrap().number_value(), Some(2.0));
-    assert_eq!(props.keys().iter().filter(|key| &***key == "1").count(), 1);
+    assert_eq!(props.keys().iter().filter(|key| key.is("1")).count(), 1);
 }
 
 #[test]

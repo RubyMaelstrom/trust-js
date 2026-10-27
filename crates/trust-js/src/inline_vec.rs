@@ -281,6 +281,22 @@ impl<T, const N: usize, S: Spill> InlineVec<T, N, S> {
         unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.as_mut_ptr(), len)) };
     }
 
+    /// Drop the elements past the first `len`, if there are more.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        let old = self.len();
+        if len >= old {
+            return;
+        }
+        self.len = len as u32;
+        // SAFETY: elements `len..old` are initialized and now outside the length.
+        unsafe {
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
+                self.as_mut_ptr().add(len),
+                old - len,
+            ))
+        };
+    }
+
     /// Where generated code finds this vector's parts ([`crate::value::JitVecLayout::Inline`]):
     /// the field offsets of the type, checked against live vectors in both states — elements in
     /// place and spilled to a heap buffer — by reading every word through them and comparing it
@@ -304,10 +320,12 @@ impl<T, const N: usize, S: Spill> InlineVec<T, N, S> {
         for _ in 0..=N {
             spilled.push(element());
         }
-        let in_place_ok = !in_place.spilled()
-            && word(&in_place, len) == in_place.len()
-            && word(&in_place, cap) == 0
-            && std::ptr::eq(at(&in_place, inline), in_place.as_ptr().cast::<u8>());
+        // With no room in place (N = 0), every element is in a heap buffer.
+        let in_place_ok = N == 0
+            || !in_place.spilled()
+                && word(&in_place, len) == in_place.len()
+                && word(&in_place, cap) == 0
+                && std::ptr::eq(at(&in_place, inline), in_place.as_ptr().cast::<u8>());
         let spilled_ok = spilled.spilled()
             && word(&spilled, len) == spilled.len()
             && word(&spilled, cap) == spilled.capacity()

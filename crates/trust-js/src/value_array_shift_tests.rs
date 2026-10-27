@@ -152,7 +152,7 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
             props
                 .ordered_keys()
                 .iter()
-                .map(|k| &**k)
+                .map(|k| k.text().to_string())
                 .collect::<Vec<_>>(),
             ["0", "1", "length", "named", "01", "4294967295"]
         );
@@ -208,7 +208,7 @@ fn dense_shift_storage_rejections_are_atomic_and_do_not_invalidate_mirrors() {
                 .ordered_keys()
                 .into_iter()
                 .map(|key| {
-                    let p = props.get(&key).unwrap();
+                    let p = props.get_key(key).unwrap();
                     (key, p.packed.0.get(), p.meta)
                 })
                 .collect();
@@ -218,7 +218,7 @@ fn dense_shift_storage_rejections_are_atomic_and_do_not_invalidate_mirrors() {
             let shape = props.shape();
             assert!(props.shift_dense_array(3, false).is_none());
             for (key, bits, meta) in before {
-                let p = props.get(&key).unwrap();
+                let p = props.get_key(key).unwrap();
                 assert_eq!((p.packed.0.get(), p.meta), (bits, meta));
             }
             assert_eq!(

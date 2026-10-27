@@ -106,7 +106,7 @@ fn dense_slot_mutation_removal_and_reinsertion_keep_sidecar_consistent() {
                 assert!(props.slot_of(&key).is_none());
             } else {
                 let (entry_key, entry) = props.entry_at(props.slot_of(&key).unwrap()).unwrap();
-                assert_eq!(&**entry_key, key);
+                assert_eq!(&*entry_key.text(), key);
                 assert_eq!(number(Some(entry)), expected);
             }
         }

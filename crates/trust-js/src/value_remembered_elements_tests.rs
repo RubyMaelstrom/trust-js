@@ -912,14 +912,14 @@ fn native_append_guards(array: &Gc) -> NativeAppendGuards {
                 .entries
                 .keys()
                 .get(slot)
-                .is_some_and(|key| key.as_ref() == "length")
+                .is_some_and(|key| key.is("length"))
         }),
         // Read the stored descriptor directly: snapshots must not prime the length memo.
         length_descriptor: body
             .props
             .entries
             .iter()
-            .find(|(key, _)| key.as_ref() == "length")
+            .find(|(key, _)| key.is("length"))
             .map(|(_, property)| {
                 (
                     property.accessor(),

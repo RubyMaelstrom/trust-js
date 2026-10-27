@@ -1491,25 +1491,26 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
                 v
             });
         }
-        let expandos: Vec<Rc<str>> = o
+        let expandos: Vec<crate::atom::PropKey> = o
             .as_obj()
             .map(|obj| {
                 obj.borrow()
                     .props
                     .ordered_keys()
                     .into_iter()
-                    .filter(|k| !Interp::is_sym_key(k))
+                    .filter(|k| !k.is_symbol())
                     .collect()
             })
             .unwrap_or_default();
         for k in expandos {
             let enumerable = o
                 .as_obj()
-                .and_then(|obj| obj.borrow().props.get(&k).map(|p| p.enumerable()));
+                .and_then(|obj| obj.borrow().props.get_key(k).map(|p| p.enumerable()));
             if enumerable == Some(true) {
-                let v = ab(i.get_member_key(o, &k))?;
+                let v = ab(i.get_member_key(o, &k.text()))?;
                 out.push(if entries {
-                    i.make_array(vec![crate::value::string_key_value(&k), v])
+                    let key = i.property_key_string(k);
+                    i.make_array(vec![Value::Str(key), v])
                 } else {
                     v
                 });
@@ -1518,27 +1519,28 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
     } else {
         // EnumerableOwnProperties: snapshot the key list, but re-read each property's descriptor
         // just before its Get — a getter may delete or hide keys not yet visited.
-        let keys: Vec<Rc<str>> = o
+        let keys: Vec<crate::atom::PropKey> = o
             .as_obj()
             .map(|obj| {
                 obj.borrow()
                     .props
                     .ordered_keys()
                     .into_iter()
-                    .filter(|k| !Interp::is_sym_key(k))
+                    .filter(|k| !k.is_symbol())
                     .collect()
             })
             .unwrap_or_default();
         for k in keys {
             let live = o
                 .as_obj()
-                .and_then(|obj| obj.borrow().props.get(&k).map(|p| p.enumerable()));
+                .and_then(|obj| obj.borrow().props.get_key(k).map(|p| p.enumerable()));
             if live != Some(true) {
                 continue;
             }
-            let v = ab(i.get_member_key(o, &k))?;
+            let v = ab(i.get_member_key(o, &k.text()))?;
             out.push(if entries {
-                i.make_array(vec![crate::value::string_key_value(k), v])
+                let key = i.property_key_string(k);
+                i.make_array(vec![Value::Str(key), v])
             } else {
                 v
             });
@@ -2030,7 +2032,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
             .props
             .ordered_keys()
             .iter()
-            .map(|k| crate::value::PropertyKey::stored(k.to_string()))
+            .map(|k| crate::value::PropertyKey::stored(k.text().to_string()))
             .collect()
     };
     for key in keys {
@@ -3306,14 +3308,12 @@ fn array_species_create(i: &mut Interp, original: &Value, len: u64) -> Result<Va
 }
 
 /// Own enumerable string keys in spec [[OwnPropertyKeys]] order (array-index ascending first).
-fn ordered_enum_keys(o: &Gc) -> Vec<Rc<str>> {
+fn ordered_enum_keys(o: &Gc) -> Vec<crate::atom::PropKey> {
     let b = o.borrow();
     b.props
         .ordered_keys()
         .into_iter()
-        .filter(|k| {
-            !Interp::is_sym_key(k) && b.props.get(k).map(|p| p.enumerable()).unwrap_or(false)
-        })
+        .filter(|&k| !k.is_symbol() && b.props.get_key(k).is_some_and(|p| p.enumerable()))
         .collect()
 }
 
@@ -4185,7 +4185,7 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
         let parent = parent.borrow();
         if !parent.ic_plain.get()
             || !matches!(parent.exotic, Exotic::None)
-            || keys.iter().any(|key| parent.props.contains(key))
+            || keys.iter().any(|&key| parent.props.contains_key(key))
         {
             return false;
         }
@@ -4613,11 +4613,9 @@ fn install_object(it: &mut Interp) {
         if let Some(info) = ta_info(i, &o) {
             let n = i.ta_len(&info).unwrap_or(0);
             let mut keys: Vec<Value> = (0..n).map(|k| Value::lstr(k.to_string())).collect();
-            keys.extend(
-                ordered_enum_keys(&o)
-                    .into_iter()
-                    .map(crate::value::string_key_value),
-            );
+            for k in ordered_enum_keys(&o) {
+                keys.push(Value::Str(i.property_key_string(k)));
+            }
             return Ok(i.make_array(keys));
         }
         let names = ordered_enum_keys(&o);
@@ -4626,14 +4624,14 @@ fn install_object(it: &mut Interp) {
         let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             for k in &names {
-                if let Some(res) = i.namespace_own_property(ptr, k) {
+                if let Some(res) = i.namespace_own_property(ptr, &k.text()) {
                     ab(res)?;
                 }
             }
         }
         let keys: Vec<Value> = names
             .into_iter()
-            .map(crate::value::string_key_value)
+            .map(|k| Value::Str(i.property_key_string(k)))
             .collect();
         Ok(i.make_array(keys))
     });
@@ -4654,8 +4652,8 @@ fn install_object(it: &mut Interp) {
             let n = i.ta_len(&info).unwrap_or(0);
             let mut keys: Vec<Value> = (0..n).map(|k| Value::lstr(k.to_string())).collect();
             for k in o.borrow().props.ordered_keys() {
-                if !Interp::is_sym_key(&k) {
-                    keys.push(crate::value::string_key_value(k));
+                if !k.is_symbol() {
+                    keys.push(crate::value::string_key_value(&*k.text()));
                 }
             }
             return Ok(i.make_array(keys));
@@ -9614,16 +9612,12 @@ pub(crate) fn ordinary_own_keys_ordered(i: &mut Interp, o: &Gc) -> Result<Vec<St
     let mut strings: Vec<String> = Vec::new();
     let mut symbols: Vec<String> = Vec::new();
     for k in all {
-        if Interp::is_sym_key(&k) {
-            symbols.push(k.to_string());
-        } else if let Ok(n) = k.parse::<u32>() {
-            if n != u32::MAX && n.to_string() == *k {
-                indices.push(n);
-            } else {
-                strings.push(k.to_string());
-            }
+        if let Some(n) = k.as_index() {
+            indices.push(n);
+        } else if k.is_symbol() {
+            symbols.push(k.text().to_string());
         } else {
-            strings.push(k.to_string());
+            strings.push(k.text().to_string());
         }
     }
     indices.sort_unstable();

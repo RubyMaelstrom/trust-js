@@ -429,7 +429,7 @@ impl PropertyInventory {
                 && property.configurable();
             // This dimension describes canonical-index key spelling, not packed storage:
             // ordinary objects also keep such keys in `entries` and the index sidecar.
-            if super::canonical_index(key).is_some() {
+            if key.as_index().is_some() {
                 result.classic_index_entries.add_property(property);
             } else {
                 result.named_entries.add_property(property);

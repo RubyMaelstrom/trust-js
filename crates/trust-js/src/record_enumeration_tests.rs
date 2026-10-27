@@ -71,23 +71,44 @@ fn enumeration_fallbacks_keep_order_traps_and_live_descriptor_effects() {
 }
 
 #[test]
-fn immutable_key_encoding_cache_is_bounded_and_owns_no_objects() {
-    use std::rc::Rc;
+fn key_strings_are_heap_atoms_or_bounded_cached_copies() {
+    use crate::atom::{names, PropKey};
+    use crate::lstr::LStr;
     let mut engine = Engine::new();
-    let key: Rc<str> = "é\u{10f800}".into();
-    let first = engine.interp.property_key_string(&key);
-    let second = engine.interp.property_key_string(&key);
-    assert!(crate::lstr::LStr::ptr_eq(&first, &second));
+    let key = PropKey::from_text("é\u{10f800}");
+    let string = engine.interp.property_key_string(key);
+    assert!(
+        LStr::ptr_eq(&string, &key.as_atom().unwrap().as_lstr()),
+        "a heap atom is its own String"
+    );
+    // A static name has no heap cell, and an index or an escaped key no String of its text:
+    // each gets a copy, cached.
+    let escaped = PropKey::from_text("\0\0escaped");
+    for key in [names::LENGTH.key(), PropKey::index(7), escaped] {
+        let first = engine.interp.property_key_string(key);
+        let second = engine.interp.property_key_string(key);
+        assert!(LStr::ptr_eq(&first, &second));
+        assert!(key
+            .as_atom()
+            .is_none_or(|atom| !LStr::ptr_eq(&first, &atom.as_lstr())));
+    }
+    assert_eq!(
+        engine.interp.property_key_string(escaped).text(),
+        "\0escaped"
+    );
+    assert_eq!(
+        engine.interp.property_key_string(PropKey::index(7)).text(),
+        "7"
+    );
     for n in 0..600 {
-        let key: Rc<str> = format!("named-key-{n}").into();
-        engine.interp.property_key_string(&key);
+        engine.interp.property_key_string(PropKey::index(n));
     }
     let (entries, bytes) = engine.interp.property_key_strings.stats();
     assert!(entries <= 512 && bytes <= 256 << 10);
-    let large: Rc<str> = "x".repeat(256 << 10).into();
-    engine.interp.property_key_string(&large);
+    let large = PropKey::from_text(&format!("\0\0{}", "x".repeat(256 << 10)));
+    engine.interp.property_key_string(large);
     let (entries, bytes) = engine.interp.property_key_strings.stats();
     assert!(entries <= 512 && bytes <= 256 << 10);
     engine.interp.gc_collect();
-    assert_eq!(engine.interp.property_key_string(&key).text(), &*key);
+    assert_eq!(engine.interp.property_key_string(key).text(), "é\u{10f800}");
 }
