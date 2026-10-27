@@ -1561,6 +1561,56 @@ fn global_fn(it: &Interp, name: &str, len: usize, f: NativeFn) {
     set_builtin(&it.global, name, Value::Obj(func));
 }
 
+/// W3's item 2a: the natives that may run on their caller's operand window without the
+/// native-call boundary, by address, with their class (`bytecode::INTRINSIC_LIGHT`,
+/// `INTRINSIC_LIGHT_PRIMITIVE_ARGS` or `INTRINSIC_LIGHT_PRIMITIVE`). Each realm's setup declares
+/// them as it installs them ([`declare_light`]), and the call cache records a native's class as
+/// it fills an entry for it. Natives with a call template take their template's id instead.
+static LIGHT_NATIVES: std::sync::RwLock<Option<crate::fasthash::FastMap<usize, u8>>> =
+    std::sync::RwLock::new(None);
+
+/// Declare the native functions installed on `target` under `names` light of `class` (see
+/// [`LIGHT_NATIVES`]). Each must run no author code for the operands `class` admits, make no tail
+/// call and reach no safepoint.
+pub(crate) fn declare_light(target: &Gc, names: &[&str], class: u8) {
+    for name in names {
+        let function = target.borrow().props.get(name).map(|p| p.value());
+        match function.map(|function| function.view()) {
+            Some(ValueView::Obj(function)) => declare_light_function(&function, class),
+            _ => debug_assert!(false, "no native {name} to declare light"),
+        }
+    }
+}
+
+/// Declare the native function object `function` light of `class` (see [`declare_light`]).
+pub(crate) fn declare_light_function(function: &Gc, class: u8) {
+    let native = match &function.borrow().call {
+        Callable::Native(f) => Some(*f),
+        _ => None,
+    };
+    let Some(f) = native else {
+        debug_assert!(false, "a light native must be a bare native function");
+        return;
+    };
+    let mut table = LIGHT_NATIVES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    table
+        .get_or_insert_with(Default::default)
+        .insert(f as usize, class);
+}
+
+/// The light class declared for `f` (see [`LIGHT_NATIVES`]), or 0.
+pub(crate) fn light_native_class(f: NativeFn) -> u8 {
+    let table = LIGHT_NATIVES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    table
+        .as_ref()
+        .and_then(|table| table.get(&(f as usize)).copied())
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Function.prototype
 // ---------------------------------------------------------------------------------------------
@@ -4894,6 +4944,8 @@ fn install_object(it: &mut Interp) {
         Ok(Value::Bool(test_integrity_level(i, &arg(args, 0), true)?))
     });
 
+    // SameValue reads its operands only.
+    declare_light(&ctor, &["is"], crate::bytecode::INTRINSIC_LIGHT);
     set_builtin(&it.global, "Object", Value::Obj(ctor));
 }
 
@@ -7095,6 +7147,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ctor, "fromAsync", 1, array_from_async);
     install_species(it, &ctor);
+    // IsArray unwraps Proxies through their internal slots, calling no trap.
+    declare_light(&ctor, &["isArray"], crate::bytecode::INTRINSIC_LIGHT);
     set_builtin(&it.global, "Array", Value::Obj(ctor));
 }
 
@@ -12126,6 +12180,40 @@ fn install_string(it: &mut Interp) {
         }
         Ok(Value::lstr(s))
     });
+    // ToString of a primitive and ToNumber of primitive code points run no author code.
+    declare_light_function(&ctor, crate::bytecode::INTRINSIC_LIGHT_PRIMITIVE_ARGS);
+    declare_light(
+        &ctor,
+        &["fromCodePoint"],
+        crate::bytecode::INTRINSIC_LIGHT_PRIMITIVE_ARGS,
+    );
+    // On a primitive receiver with primitive arguments these look up no @@-method and convert
+    // only primitives (IsRegExp reads only objects).
+    declare_light(
+        &sp,
+        &[
+            "toString",
+            "valueOf",
+            "indexOf",
+            "lastIndexOf",
+            "includes",
+            "startsWith",
+            "endsWith",
+            "substring",
+            "substr",
+            "toUpperCase",
+            "toLowerCase",
+            "trim",
+            "trimStart",
+            "trimEnd",
+            "at",
+            "padStart",
+            "padEnd",
+            "repeat",
+            "concat",
+        ],
+        crate::bytecode::INTRINSIC_LIGHT_PRIMITIVE,
+    );
     set_builtin(&it.global, "String", Value::Obj(ctor));
 }
 

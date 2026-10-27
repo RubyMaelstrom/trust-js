@@ -1065,6 +1065,18 @@ pub const INTRINSIC_REFLECT_APPLY: u8 = 18;
 /// Object offsets/values retain the complete native-call boundary before their conversions.
 pub const INTRINSIC_DATAVIEW_GET: u8 = 19;
 pub const INTRINSIC_DATAVIEW_SET: u8 = 20;
+/// A native without a call template whose algorithm runs no author code for any receiver and
+/// arguments, makes no tail call and reaches no safepoint (Array.isArray, Object.is, Number's
+/// predicates, Boolean called as a function), as its realm's setup declares it
+/// (`builtins::declare_light`). Calls the call cache proves reach it run on the caller's operand
+/// window without the native-call boundary ([`crate::interpreter::Interp::call_native_light`]).
+pub const INTRINSIC_LIGHT: u8 = 21;
+/// [`INTRINSIC_LIGHT`] when every argument is a primitive; the receiver is not read (parseInt,
+/// parseFloat, isFinite, Number and String called as functions, String.fromCodePoint).
+pub const INTRINSIC_LIGHT_PRIMITIVE_ARGS: u8 = 22;
+/// [`INTRINSIC_LIGHT`] when the receiver and every argument are primitives (String.prototype's
+/// methods that look up no @@-method: indexOf, includes, substring, trim and the like).
+pub const INTRINSIC_LIGHT_PRIMITIVE: u8 = 23;
 
 /// Math numeric functions the call template finishes inline (a Number argument list, no
 /// coercion): ECMA-262 §21.3.2.16 floor, .10 ceil, .35 trunc, .1 abs, .17 fround, .11 clz32
@@ -22561,39 +22573,17 @@ unsafe fn jit_call_hit_native(
         #[cfg(not(feature = "embed"))]
         unreachable!("a scoped native entry cannot be published without embed")
     } else {
-        let operand_only = match intrinsic {
-            INTRINSIC_OPERAND_ONLY => true,
-            INTRINSIC_NUMERIC_ONLY | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
-                (0..argc).all(|k| (*sp.sub(argc).add(k)).number().is_some())
-            }
-            INTRINSIC_DATAVIEW_GET | INTRINSIC_DATAVIEW_SET => {
-                let checked = if intrinsic == INTRINSIC_DATAVIEW_SET {
-                    2
-                } else {
-                    1
-                };
-                (0..argc.min(checked)).all(|k| (*sp.sub(argc).add(k)).is_primitive())
-            }
-            _ => false,
-        };
         if intrinsic == INTRINSIC_REFLECT_APPLY && argc == 3 {
             if let Some(flag) = jit_reflect_apply_operand_only(ctx, sp, with_this) {
                 return flag;
             }
         }
         let nf: crate::value::NativeFn = std::mem::transmute(native as *const ());
-        if operand_only {
-            // The exact builtin is proven and runs no author code for these operands: move the
-            // receiver and arguments into it directly, without an arbitrary native's call boundary.
-            let this = if with_this {
-                sp.sub(argc + 2).read()
-            } else {
-                Value::Undefined
-            };
-            crate::execution_storage::with_borrowed_values(args_ptr, argc, |args| nf(i, this, args))
-                .map_err(Abrupt::Throw)
-        } else {
-            i.call_native_committed(nf, this_slot, args_ptr, argc)
+        // The exact builtin is proven: when its class runs no author code for these operands,
+        // it runs on them directly, without an arbitrary native's call boundary.
+        match i.call_native_light(nf, intrinsic, this_slot, args_ptr, argc) {
+            Some(r) => r,
+            None => i.call_native_committed(nf, this_slot, args_ptr, argc),
         }
     };
     // The boundary's loans are finished; this owning caller retires the operand window.
@@ -22613,6 +22603,51 @@ unsafe fn jit_call_hit_native(
             ctx.error = Some(ab);
             crate::jit::SpFlag { sp, flag: 1 }
         }
+    }
+}
+
+/// Whether a native entry of class `intrinsic` runs no author code for this receiver and these
+/// arguments, so that it may run without the native-call boundary (W3's item 2a; see
+/// [`crate::interpreter::Interp::call_native_light`]). The template intrinsics on Strings and
+/// Numbers share the primitive classes: their templates finish only the guarded cases inline.
+///
+/// # Safety
+/// `this_slot` and `args..args+argc` are initialized words of the caller's operand window.
+#[inline(always)]
+pub(crate) unsafe fn native_light_operands(
+    intrinsic: u8,
+    this_slot: *const Value,
+    args: *const Value,
+    argc: usize,
+) -> bool {
+    let primitive_arguments = || (0..argc).all(|k| unsafe { (*args.add(k)).is_primitive() });
+    match intrinsic {
+        INTRINSIC_OPERAND_ONLY | INTRINSIC_LIGHT => true,
+        INTRINSIC_NUMERIC_ONLY
+        | INTRINSIC_MATH_SQRT
+        | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
+            (0..argc).all(|k| unsafe { (*args.add(k)).number().is_some() })
+        }
+        INTRINSIC_DATAVIEW_GET | INTRINSIC_DATAVIEW_SET => {
+            let checked = if intrinsic == INTRINSIC_DATAVIEW_SET {
+                2
+            } else {
+                1
+            };
+            (0..argc.min(checked)).all(|k| unsafe { (*args.add(k)).is_primitive() })
+        }
+        INTRINSIC_LIGHT_PRIMITIVE_ARGS | INTRINSIC_IS_NAN | INTRINSIC_FROM_CHAR_CODE => {
+            primitive_arguments()
+        }
+        INTRINSIC_LIGHT_PRIMITIVE
+        | INTRINSIC_CHAR_AT
+        | INTRINSIC_CHAR_CODE_AT
+        | INTRINSIC_CODE_POINT_AT
+        | INTRINSIC_STRING_SLICE => {
+            let receiver = unsafe { &*this_slot };
+            receiver.is_primitive() && primitive_arguments()
+        }
+        _ => false,
     }
 }
 
@@ -24042,7 +24077,7 @@ unsafe fn jit_call_inner(
                                             _ if crate::builtins::is_numeric_only_native(nf) => {
                                                 INTRINSIC_NUMERIC_ONLY
                                             }
-                                            _ => 0,
+                                            _ => crate::builtins::light_native_class(nf),
                                         }
                                     }),
                                     realm: 0,

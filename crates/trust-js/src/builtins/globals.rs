@@ -83,6 +83,12 @@ pub(super) fn install_globals(it: &mut Interp) {
         };
         Ok(Value::Bool(n.is_finite()))
     });
+    // ToString and ToNumber of primitives run no author code.
+    declare_light(
+        &it.global,
+        &["parseInt", "parseFloat", "isFinite"],
+        crate::bytecode::INTRINSIC_LIGHT_PRIMITIVE_ARGS,
+    );
     // Annex B escape/unescape.
     global_fn(it, "escape", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;

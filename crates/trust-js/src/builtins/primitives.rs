@@ -168,6 +168,14 @@ pub(super) fn install_number(it: &mut Interp) {
             matches!((arg(args, 0)).view(), ValueView::Num(n) if n.is_finite() && n.fract() == 0.0),
         ))
     });
+    // The predicates read their argument only; Number(x) converts a primitive without author
+    // code (the light path clears the construct state `maybe_box` reads).
+    declare_light(
+        &ctor,
+        &["isFinite", "isSafeInteger", "isInteger"],
+        crate::bytecode::INTRINSIC_LIGHT,
+    );
+    declare_light_function(&ctor, crate::bytecode::INTRINSIC_LIGHT_PRIMITIVE_ARGS);
     set_builtin(&it.global, "Number", Value::Obj(ctor));
 }
 
@@ -463,6 +471,8 @@ pub(super) fn install_boolean(it: &mut Interp) {
     bp.borrow_mut()
         .props
         .insert("constructor", Property::builtin(Value::Obj(ctor)));
+    // ToBoolean runs no author code for any value.
+    declare_light_function(&ctor, crate::bytecode::INTRINSIC_LIGHT);
     set_builtin(&it.global, "Boolean", Value::Obj(ctor));
 }
 

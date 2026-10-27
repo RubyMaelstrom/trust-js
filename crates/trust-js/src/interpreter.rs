@@ -1272,6 +1272,14 @@ enum LegacyActivation {
     Inline(usize, usize),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Natives [`Interp::call_native_light`] ran without the native-call boundary, for tests.
+    pub(crate) static TEST_LIGHT_NATIVE_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 impl Interp {
     /// The youngest activation of the function with `Gc::as_ptr` identity `function`. Callees
     /// the compiler spliced into their caller have no frame; those that made the call to a
@@ -13507,8 +13515,9 @@ impl Interp {
                 let native = unsafe { (*entry).native };
                 if native != 0 {
                     let signature = unsafe { (*entry).direct };
+                    let intrinsic = unsafe { (*entry).intrinsic };
                     let result = unsafe {
-                        self.call_native_address_committed(native, signature, this_slot, args, argc)
+                        self.call_native_entry(native, signature, intrinsic, this_slot, args, argc)
                     };
                     #[cfg(all(test, feature = "embed"))]
                     if signature & crate::bytecode::CALL_IC_SCOPED_NATIVE != 0 {
@@ -13721,7 +13730,7 @@ impl Interp {
         let ic = &prepared.ic;
         match &prepared.code {
             None => unsafe {
-                self.call_native_address_committed(ic.native, ic.direct, this_slot, args, argc)
+                self.call_native_entry(ic.native, ic.direct, ic.intrinsic, this_slot, args, argc)
             },
             Some(code) => {
                 self.note_compiled_call(ic);
@@ -13837,6 +13846,73 @@ impl Interp {
         debug_assert_eq!(signature & crate::bytecode::CALL_IC_SCOPED_NATIVE, 0);
         let function: crate::value::NativeFn = unsafe { std::mem::transmute(native as *const ()) };
         unsafe { self.call_native_committed(function, this_slot, args, argc) }
+    }
+
+    /// A native entry's call: on the caller's window when the entry's class proves the native
+    /// runs no author code for these operands ([`Interp::call_native_light`]), else through the
+    /// boundary ([`Interp::call_native_address_committed`]).
+    ///
+    /// # Safety
+    /// As [`Interp::call_native_address_committed`]; `intrinsic` is the entry's.
+    #[inline]
+    pub(crate) unsafe fn call_native_entry(
+        &mut self,
+        native: usize,
+        signature: u8,
+        intrinsic: u8,
+        this_slot: *const Value,
+        args: *const Value,
+        argc: usize,
+    ) -> Result<Value, Abrupt> {
+        if signature & crate::bytecode::CALL_IC_SCOPED_NATIVE == 0 {
+            // SAFETY: without the scoped bit the entry's address is an engine NativeFn.
+            let function: crate::value::NativeFn =
+                unsafe { std::mem::transmute(native as *const ()) };
+            if let Some(result) =
+                unsafe { self.call_native_light(function, intrinsic, this_slot, args, argc) }
+            {
+                return result;
+            }
+        }
+        unsafe { self.call_native_address_committed(native, signature, this_slot, args, argc) }
+    }
+
+    /// W3's item 2a: a native-entry hit whose class (`intrinsic`, see
+    /// [`crate::bytecode::native_light_operands`]) proves that the native runs no author code
+    /// for these operands, makes no tail call and reaches no safepoint, run on the caller's
+    /// window without [`Interp::call_native_committed_with`]'s bookkeeping. Nothing collects
+    /// before it returns, so the window needs no root of its own, and nothing in it can be
+    /// interrupted, run a host callback or leave a tail call. The construct state is cleared
+    /// around it, as the boundary does: natives that are also constructors read it. `None`: these
+    /// operands need the boundary.
+    ///
+    /// # Safety
+    /// As [`Interp::call_native_committed`]; `function` is the entry's proven native.
+    #[inline(always)]
+    pub(crate) unsafe fn call_native_light(
+        &mut self,
+        function: crate::value::NativeFn,
+        intrinsic: u8,
+        this_slot: *const Value,
+        args: *const Value,
+        argc: usize,
+    ) -> Option<Result<Value, Abrupt>> {
+        if !unsafe { crate::bytecode::native_light_operands(intrinsic, this_slot, args, argc) } {
+            return None;
+        }
+        #[cfg(test)]
+        TEST_LIGHT_NATIVE_CALLS.with(|count| count.set(count.get() + 1));
+        let saved_ctor = std::mem::replace(&mut self.constructing, false);
+        let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
+        // SAFETY: the caller's window is initialized and outlives this call.
+        let result = unsafe {
+            crate::execution_storage::with_borrowed_values(args, argc, |arguments| {
+                function(self, *this_slot, arguments)
+            })
+        };
+        self.constructing = saved_ctor;
+        self.new_target = saved_nt;
+        Some(result.map_err(Abrupt::Throw))
     }
 
     /// A native-entry IC hit, borrowing the caller's canonical evaluated argument window.

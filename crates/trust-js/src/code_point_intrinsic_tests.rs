@@ -234,6 +234,86 @@ log.join(',');
     }
 }
 
+/// Natives declared light (W3's item 2a: String's methods, parseInt and parseFloat, Number,
+/// String and Boolean called as functions, Array.isArray, Object.is, Number's predicates) run on
+/// the caller's operands without the native-call boundary when their class admits the operands,
+/// and through it otherwise: object operands still coerce in order, conversions still throw,
+/// and the construct state a surrounding `new` leaves is cleared (String(symbol) inside a
+/// constructor stringifies it; Number and Boolean return primitives). Expected values are
+/// Node's.
+#[test]
+fn light_natives_match_the_full_calls() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let before = crate::interpreter::TEST_LIGHT_NATIVE_CALLS.with(|count| count.get());
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+var log = [];
+function rec(x) { log.push(String(x)); }
+function err(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+function idx(s, n) { return s.indexOf(n); }
+function inc(s, n) { return s.includes(n); }
+function sub(s, a, b) { return s.substring(a, b); }
+function up(s) { return s.toUpperCase(); }
+function rep(s, n) { return s.repeat(n); }
+function cat(s, a, b) { return s.concat(a, b); }
+function at(s, n) { return s.at(n); }
+function pad(s, n, f) { return s.padStart(n, f); }
+function pi(x, r) { return parseInt(x, r); }
+function npi(x) { return Number.parseInt(x); }
+function pf(x) { return parseFloat(x); }
+function fin(x) { return isFinite(x); }
+function num(x) { return Number(x); }
+function str(x) { return String(x); }
+function bool(x) { return Boolean(x); }
+function isA(x) { return Array.isArray(x); }
+function same(a, b) { return Object.is(a, b); }
+function nInt(x) { return Number.isInteger(x); }
+function fcp(x) { return String.fromCodePoint(x); }
+for (var i = 0; i < 300; i++) {
+  idx('abcabc', 'c'); inc('abc', 'b'); sub('abcdef', 1, 4); up('ab'); rep('ab', 2); cat('a', 1, null);
+  at('abc', -1); pad('7', 3, '0'); pi('ff', 16); npi('10'); pf('1.5e3x'); fin('12'); num('42'); str(1n);
+  bool(0); isA([]); same(-0, 0); nInt(5); fcp(0x41);
+}
+function C() { this.s = String(Symbol('d')); this.n = Number('7'); this.b = Boolean(1); }
+var c;
+for (var j = 0; j < 300; j++) c = new C();
+rec(c.s); rec(typeof c.n + c.n); rec(typeof c.b + c.b);
+rec(idx('abcabc', 'c')); rec(idx('abcabc', 'z')); rec(inc('abc', 'b')); rec(sub('abcdef', 4, 1)); rec(up('straße'));
+rec(rep('ab', 3)); rec(err(function () { return rep('ab', -1); })); rec(cat('a', 1, null)); rec(cat('a', undefined, true));
+rec(at('abc', -1)); rec(at('abc', 5)); rec(pad('7', 3, '0')); rec(pad('7', 3));
+rec(pi('ff', 16)); rec(pi('  -12px')); rec(npi('10')); rec(pf('1.5e3x')); rec(fin('12')); rec(fin('x'));
+rec(num('42')); rec(num(1n)); rec(num('')); rec(err(function () { return num(Symbol()); }));
+rec(str(1n)); rec(str(Symbol('s'))); rec(str(null));
+rec(bool(0)); rec(bool({})); rec(bool('')); rec(isA([])); rec(isA({})); rec(isA(new Proxy([], {})));
+var revocable = Proxy.revocable([], {}); revocable.revoke();
+rec(err(function () { return isA(revocable.proxy); }));
+rec(same(-0, 0)); rec(same(NaN, NaN)); rec(nInt(5)); rec(nInt(5.5)); rec(nInt('5')); rec(fcp(0x1F600).length);
+rec(err(function () { return fcp(-1); }));
+var order = [];
+var o = { toString: function () { order.push('s'); return 'b'; }, valueOf: function () { order.push('v'); return 1; } };
+rec(idx('abc', o)); rec(inc('abc', o)); rec(pi(o)); rec(num(o)); rec(str(o)); rec(at('abc', o)); rec(rep('x', o));
+rec(order.join(''));
+var boxed = new String('xyz');
+rec(idx(boxed, 'z')); rec(up(boxed));
+log.join(',');
+        "#
+            ),
+            "Symbol(d),number7,booleantrue,2,-1,true,bcd,STRASSE,ababab,RangeError,a1null,aundefinedtrue,c,undefined,007,  7,255,-12,10,1500,true,false,42,1,0,TypeError,1,Symbol(s),null,false,true,false,true,false,true,TypeError,false,true,true,false,false,2,RangeError,1,true,NaN,1,b,b,x,sssvsvv,2,XYZ",
+            "{tier:?}"
+        );
+        let light = crate::interpreter::TEST_LIGHT_NATIVE_CALLS.with(|count| count.get()) - before;
+        if tier == Tier::Jit {
+            // The warm-up's 19 sites and the constructor's 3, 300 times each, less their fills.
+            assert!(light >= 6000, "{light} light native calls");
+        }
+    }
+}
+
 /// Private field, method and accessor operations run in the JIT's operation helper rather than
 /// through a materialized activation; they still resolve each Private Name from the running
 /// environment (ECMA-262 ResolvePrivateIdentifier), so nested classes and computed keys see
