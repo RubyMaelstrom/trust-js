@@ -5633,6 +5633,14 @@ impl Property {
                 .with_object(|object| std::ptr::eq(Gc::as_ptr(object), expected))
                 .unwrap_or(false)
     }
+    /// The value word as stored, for a search that compares words in place: a Number's bits
+    /// (every NaN as the canonical one), an undefined, null or Boolean word, or a cell's tagged
+    /// address. A deferred prototype's word equals no execution value's ([`Value::bits`]); an
+    /// accessor's is undefined's, so a caller tests [`Property::accessor`] first.
+    #[inline]
+    pub(crate) fn value_bits(&self) -> u64 {
+        self.packed.0.get()
+    }
     /// OrdinaryGet's own-data Number case, with no getter invocation or value conversion.
     /// Callers must still prove ordinary internal methods and fall back for every other case.
     #[inline]
@@ -8731,6 +8739,17 @@ impl Props {
             }
         }
         Some(p.into_value())
+    }
+
+    /// The packed element slots of an Array that keeps every index in element storage (no index
+    /// far past the others lives in the named map), for a search that reads them in place:
+    /// index `n` is slot `n`, a hole is an empty slot ([`Property::is_empty`]), and no index at
+    /// or past the slice's end is an own property. `None` for any other representation.
+    pub(crate) fn packed_array_elements(&self) -> Option<&[Property]> {
+        if !self.elem_mode.get() || self.has_far.get() {
+            return None;
+        }
+        self.elems.packed_ref()
     }
 
     /// The packed elements of an Array whose `length` is the writable data value `len` and

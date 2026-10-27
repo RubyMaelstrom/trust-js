@@ -6351,7 +6351,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ap, "indexOf", 1, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))?;
+        let len = search_length(i, &o)?;
         if len == 0 {
             // The length check precedes the fromIndex coercion.
             return Ok(Value::Num(-1.0));
@@ -6378,6 +6378,11 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 }
             }
         };
+        if let Some(found) =
+            search_packed_elements(i, &o, &target, from, len, false, ElementEquality::Strict)
+        {
+            return Ok(Value::Num(found.map_or(-1.0, |k| k as f64)));
+        }
         let ov = Value::Obj(o);
         for k in from..len {
             let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
@@ -6391,7 +6396,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ap, "includes", 1, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))? as i64;
+        let len = search_length(i, &o)? as i64;
         if len == 0 {
             // The length check precedes the fromIndex coercion.
             return Ok(Value::Bool(false));
@@ -6419,6 +6424,17 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 }
             }
         };
+        if let Some(found) = search_packed_elements(
+            i,
+            &o,
+            &target,
+            k as usize,
+            len as usize,
+            false,
+            ElementEquality::SameValueZero,
+        ) {
+            return Ok(Value::Bool(found.is_some()));
+        }
         let ov = Value::Obj(o);
         while k < len {
             let v = array_get_index(i, &o, &ov, k as usize)?;
@@ -6691,7 +6707,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ap, "lastIndexOf", 1, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))? as i64;
+        let len = search_length(i, &o)? as i64;
         if len == 0 {
             return Ok(Value::Num(-1.0));
         }
@@ -6711,6 +6727,20 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         } else {
             len - 1
         };
+        if k < 0 {
+            return Ok(Value::Num(-1.0));
+        }
+        if let Some(found) = search_packed_elements(
+            i,
+            &o,
+            &target,
+            0,
+            k as usize + 1,
+            true,
+            ElementEquality::Strict,
+        ) {
+            return Ok(Value::Num(found.map_or(-1.0, |k| k as f64)));
+        }
         let ov = Value::Obj(o);
         while k >= 0 {
             let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? else {
@@ -7226,6 +7256,171 @@ fn edit_plain_elements(
     let new_len = elements.len();
     body.props.set_array_length_value(new_len as f64);
     true
+}
+
+/// LengthOfArrayLike(object) (ECMA-262 §7.3.18) for indexOf, lastIndexOf and includes: an
+/// ordinary Array's `length` is an own data property holding a valid array length, which the Get
+/// and ToLength return as it is, so it is read with no observable step; any other object takes
+/// the specified Get and ToLength.
+fn search_length(i: &mut Interp, object: &Gc) -> Result<usize, Value> {
+    {
+        let body = object.borrow();
+        if matches!(body.exotic, Exotic::Array) && body.ic_plain.get() {
+            if let Some(length) = ordinary_array_length(&body.props) {
+                return Ok(length);
+            }
+        }
+    }
+    ab(i.to_length(object))
+}
+
+/// How indexOf, lastIndexOf and includes compare an element with the search element.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElementEquality {
+    /// IsStrictlyEqual (ECMA-262 §7.2.15), for indexOf and lastIndexOf, which skip an index
+    /// HasProperty finds absent.
+    Strict,
+    /// SameValueZero (§7.2.11), for includes, which reads every index, an absent one as
+    /// undefined.
+    SameValueZero,
+}
+
+/// The search element of [`search_packed_elements`], prepared for comparing element words.
+enum ElementMatch {
+    /// Equal to an element exactly when the words are: undefined, null, a Boolean, an Object,
+    /// or a Number other than zero and NaN.
+    Word(u64),
+    /// +0 or -0, equal to either.
+    Zero,
+    /// NaN under SameValueZero, equal to NaN.
+    NaN,
+    /// NaN under IsStrictlyEqual, equal to nothing.
+    Nothing,
+    /// A String, equal to a String of the same code units.
+    Str(LStr),
+    /// A Symbol or a BigInt, compared as values.
+    Other(Value),
+}
+
+impl ElementMatch {
+    fn new(wanted: &Value, equality: ElementEquality) -> ElementMatch {
+        match wanted.view() {
+            ValueView::Num(n) => {
+                if n.is_nan() {
+                    match equality {
+                        ElementEquality::Strict => ElementMatch::Nothing,
+                        ElementEquality::SameValueZero => ElementMatch::NaN,
+                    }
+                } else if n == 0.0 {
+                    // +0 or -0, whose words differ.
+                    ElementMatch::Zero
+                } else {
+                    ElementMatch::Word(wanted.bits())
+                }
+            }
+            ValueView::Undefined | ValueView::Null | ValueView::Bool(_) | ValueView::Obj(_) => {
+                ElementMatch::Word(wanted.bits())
+            }
+            ValueView::Str(s) => ElementMatch::Str(s),
+            _ => ElementMatch::Other(*wanted),
+        }
+    }
+
+    /// Whether `element`, a present data element, equals the search element.
+    #[inline(always)]
+    fn matches(&self, i: &Interp, element: &Property, equality: ElementEquality) -> bool {
+        match self {
+            ElementMatch::Word(word) => element.value_bits() == *word,
+            ElementMatch::Zero => element.number_value() == Some(0.0),
+            ElementMatch::NaN => element.number_value().is_some_and(f64::is_nan),
+            ElementMatch::Nothing => false,
+            ElementMatch::Str(wanted) => {
+                element.value_bits() >> 48 == PACK_STR >> 48
+                    && matches!(element.value().view(), ValueView::Str(s) if s == *wanted)
+            }
+            ElementMatch::Other(wanted) => match equality {
+                ElementEquality::Strict => i.strict_equals(&element.value(), wanted),
+                ElementEquality::SameValueZero => same_value_zero(&element.value(), wanted),
+            },
+        }
+    }
+}
+
+/// The search of indexOf (ascending), lastIndexOf (`descending`) or includes over the indices
+/// `from..end` of `object`, all below its length, read in place when `object` is an ordinary
+/// Array with packed element storage (`Props::packed_array_elements`): each index is then an
+/// own data element, a hole or past the storage. A hole and an index past the storage are
+/// absent own properties, and while the element protector holds (`object` inherits from the
+/// Realm's %Array.prototype%, and neither it nor %Object.prototype% has an indexed property),
+/// absent from the whole chain: HasProperty is false and Get is undefined. Nothing here runs
+/// code. `Some` holds the index found first, if any; `None` declines, having observed nothing,
+/// for another representation, an accessor element, or an absent index without the protector,
+/// and the caller runs the specified loop.
+fn search_packed_elements(
+    i: &Interp,
+    object: &Gc,
+    wanted: &Value,
+    from: usize,
+    end: usize,
+    descending: bool,
+    equality: ElementEquality,
+) -> Option<Option<usize>> {
+    let body = object.borrow();
+    if !matches!(body.exotic, Exotic::Array) || !body.ic_plain.get() {
+        return None;
+    }
+    let packed = body.props.packed_array_elements()?;
+    let wanted = ElementMatch::new(wanted, equality);
+    // An absent index reads undefined (includes) or is skipped (indexOf, lastIndexOf).
+    let absent_matches = equality == ElementEquality::SameValueZero
+        && matches!(wanted, ElementMatch::Word(word) if word == Value::Undefined.bits());
+    // The protector, checked at most once, when an absent index is reached.
+    let mut protected = None;
+    let absent_proved = |protected: &mut Option<bool>| {
+        *protected.get_or_insert_with(|| i.array_append_unshadowed(object))
+    };
+    let stored = from..end.min(packed.len());
+    let past = from.max(packed.len())..end;
+    // What index `k` decides: `Some(result)` ends the search, `None` goes on.
+    let visit = |k: usize, protected: &mut Option<bool>| -> Option<Option<Option<usize>>> {
+        let element = &packed[k];
+        if element.accessor() {
+            return Some(None);
+        }
+        if element.is_empty() {
+            if !absent_proved(protected) {
+                return Some(None);
+            }
+            return absent_matches.then_some(Some(Some(k)));
+        }
+        wanted
+            .matches(i, element, equality)
+            .then_some(Some(Some(k)))
+    };
+    if descending {
+        // lastIndexOf reaches the indices past the storage first.
+        if !past.is_empty() && !absent_proved(&mut protected) {
+            return None;
+        }
+        for k in stored.rev() {
+            if let Some(result) = visit(k, &mut protected) {
+                return result;
+            }
+        }
+        return Some(None);
+    }
+    for k in stored {
+        if let Some(result) = visit(k, &mut protected) {
+            return result;
+        }
+    }
+    if past.is_empty() {
+        return Some(None);
+    }
+    if !absent_proved(&mut protected) {
+        return None;
+    }
+    Some(absent_matches.then_some(past.start))
 }
 
 /// Get of every index in `range` of an ordinary Array whose elements there are own data

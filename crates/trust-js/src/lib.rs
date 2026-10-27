@@ -51,6 +51,8 @@ mod agent_activation_tests;
 mod array_binding;
 #[cfg(test)]
 mod array_binding_tests;
+#[cfg(test)]
+mod array_search_tests;
 mod ast;
 mod atom;
 mod atomic_compat;
