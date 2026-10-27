@@ -322,6 +322,50 @@ fn regexp_fast_paths_yield_to_observable_lookups() {
     );
 }
 
+/// Unicode-mode matching reads two-byte subjects in place, decoding surrogate pairs as it steps
+/// in either direction, as Node does: a start inside a pair begins at the pair, a quantifier's
+/// run and a lookbehind count code points, a backreference never ends inside a pair (under `i`
+/// it compares code points), lone surrogates are their own elements, string sets and empty
+/// matches step over pairs, and the prefilter's scans propose only element boundaries.
+#[test]
+fn unicode_matching_steps_over_surrogate_pairs_in_place() {
+    check(
+        r###"
+        (function () {
+        function show(v) {
+            if (Array.isArray(v)) return '[' + v.map(show).join(',') + ']';
+            var out = '';
+            for (var k = 0; k < v.length; k++) {
+                var c = v.charCodeAt(k);
+                out += c < 0x80 && c >= 0x20 ? v[k] : '\\u' + c.toString(16);
+            }
+            return out;
+        }
+        function ex(m) { return m ? m.index + ':' + show(Array.prototype.slice.call(m)) : 'null'; }
+        var r = [];
+        var s = 'a\ud83d\ude00b\ud800c\udc00d';
+        r.push(show(s.match(/./gu)), show(s.match(/./g)));
+        for (var li = 0; li <= 3; li++) {
+            var y = /./uy; y.lastIndex = li;
+            r.push(li + ex(y.exec('a\ud83d\ude00b')) + '/' + y.lastIndex);
+        }
+        r.push(ex(/(\ud83d)\1/u.exec('\ud83d\ud83d\ude00')), ex(/(\ud83d)\1/.exec('\ud83d\ud83d\ude00')));
+        r.push(ex(/(\u{10400})\1/ui.exec('x\u{10400}\u{10428}')), ex(/(?<=\1(.))x/ui.exec('\u{10428}\u{10400}x')));
+        r.push(ex(/(?<=\ude00)b/u.exec('a\ud83d\ude00b')), ex(/(?<=\ude00)b/.exec('a\ud83d\ude00b')));
+        r.push(ex(/(?<=^.{2})x/u.exec('\ud83d\ude00\ud83d\ude00x')), ex(/(?<=^.{2})x/u.exec('\ud83d\ude00x')));
+        r.push(ex(/^(.+)\ud83d\ude00(.*)$/u.exec('x\ud83d\ude00y\ud83d\ude00z')), ex(/a.{1,2}?b/u.exec('a\ud83d\ude00\ud83d\ude00b')));
+        r.push(ex(/\ud83d+/u.exec('\ud83d\ud83d\ud83d\ude00')), ex(/[^a]+/u.exec('a\ud800\ud83d\ude00\udc00a')));
+        r.push(show('\ud83d\udc4d\ud83c\udffd\ud83c\uddeb\ud83c\uddf7x'.match(/\p{RGI_Emoji}/gv)));
+        r.push(show('a\ud83d\ude00b'.replace(/(?:)/gu, '-')), show('a\ud83d\ude00b'.split(/(?:)/u)));
+        var long = 'b'.repeat(40) + '\ud83d\ude00'.repeat(20) + 'x\ud83d\ude00\ud83d\ude00y' + '\ud83d\ude00'.repeat(20);
+        r.push(ex(/(.)(?:\ud83d\ude00){2}y/u.exec(long)), ex(/\ude00y/u.exec(long)), ex(/\ude00y/.exec(long)));
+        return r.join(';');
+        })()
+        "###,
+        r###"[a,\ud83d\ude00,b,\ud800,c,\udc00,d];[a,\ud83d,\ude00,b,\ud800,c,\udc00,d];00:[a]/1;11:[\ud83d\ude00]/3;21:[\ud83d\ude00]/3;33:[b]/4;null;0:[\ud83d\ud83d,\ud83d];1:[\ud801\udc00\ud801\udc28,\ud801\udc00];4:[x,\ud801\udc00];null;3:[b];4:[x];null;0:[x\ud83d\ude00y\ud83d\ude00z,x\ud83d\ude00y,z];0:[a\ud83d\ude00\ud83d\ude00b];0:[\ud83d\ud83d];1:[\ud800\ud83d\ude00\udc00];[\ud83d\udc4d\ud83c\udffd,\ud83c\uddeb\ud83c\uddf7];-a-\ud83d\ude00-b-;[a,\ud83d\ude00,b];80:[x\ud83d\ude00\ud83d\ude00y,x];null;84:[\ude00y]"###,
+    );
+}
+
 /// GetSubstitution and a match's strings read code units: templates and subjects of either
 /// width, astral characters and lone surrogates expand as Node expands them, the generic path
 /// expands every result (a skipped one's named-group getter included), and captures, contexts
