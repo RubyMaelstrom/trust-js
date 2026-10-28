@@ -3354,6 +3354,10 @@ mod asm {
         pub fn str_w_lsl2(&mut self, rt: u32, rn: u32, rm: u32) {
             self.emit(0xB820_7800 | (rm << 16) | (rn << 5) | rt);
         }
+        /// str xt, [xn, xm, lsl #3]
+        pub fn str_x_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0xF820_7800 | (rm << 16) | (rn << 5) | rt);
+        }
         /// str st, [xn, xm, lsl #2]
         pub fn str_s_lsl2(&mut self, rt: u32, rn: u32, rm: u32) {
             self.emit_fp(0xBC20_7800 | (rm << 16) | (rn << 5) | rt);
@@ -6688,15 +6692,17 @@ fn emit_call_inline_marked(
                 a.sub_imm(9, 20, depth * 8);
                 a.ldr_imm(9, 9, 0);
             }
-            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, slow);
-            // x10 = the callee's payload, its cell address; x13 = the same word, its
-            // `Gc::as_ptr` identity, which the ways record.
-            emit_exec_payload(a, 9, 10);
-            a.mov(13, 10);
+            // x10 = the word EOR the Object tag: an object's payload, its cell address and
+            // `Gc::as_ptr` identity, which the ways record. Any other word keeps bits above the
+            // 48-bit payload (no other kind carries the Object tag, and Numbers are canonical),
+            // so it matches no way; the secondary probes, which read the cell, check the tag.
+            a.mov_imm64(16, crate::value::PACK_OBJ);
+            a.logic_x(2, 10, 9, 16);
             // Probe ALL 4 ways (a stable polymorphic site — e.g. one dispatch
             // loop over a handful of receiver classes — otherwise pays the full
             // helper on every call that isn't way 1): x12 = entry cursor,
-            // w14 = ways left, w15 = live epoch, x17 = ctx.genv.
+            // w15 = live epoch, x17 = ctx.genv. Way 0, a site's usual callee, is
+            // compared in line; the rest after the template (`l_rest`).
             a.mov_imm64(12, ic0 as u64);
             a.ldr_imm(11, 19, CALL_IC_EPOCH_OFF);
             a.ldr_w_imm(15, 11, 0);
@@ -6704,46 +6710,26 @@ fn emit_call_inline_marked(
             a.cmn_imm_w(15, 1);
             a.b_cond(C_EQ, slow); // exhausted generations are never raw-cache proofs
             a.ldr_imm(17, 19, 64); // ctx.genv
-            a.movz(14, crate::bytecode::CALL_IC_WAYS as u32, 0);
-            let l_probe = a.new_label();
-            let l_next = a.new_label();
+            let l_rest = a.new_label();
             let l_hit = a.new_label();
-            let l_primary_hit = a.new_label();
-            a.bind(l_probe);
-            a.ldur(11, 12, 0); // ic.callee (a `Gc::as_ptr` identity)
-            a.cmp_reg_x(13, 11);
-            a.b_cond(C_NE, l_next);
-            a.ldr_w_imm(11, 12, 56); // ic.epoch
-            a.cmp_reg_w(11, 15);
-            a.b_cond(C_NE, l_next);
-            a.ldr_imm(11, 12, 32); // ic.global_env
-            a.cmp_reg_x(11, 17);
-            a.b_cond(C_EQ, l_primary_hit);
-            a.bind(l_next);
-            // entry stride (size compile-asserted below the JitCtx asserts)
-            let stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>();
-            a.add_imm(12, 12, stride as u32);
-            a.sub_imm(14, 14, 1);
-            a.cbnz(14, false, l_probe);
-            // Secondary probes (the engine-wide identity overflow cache, then code-keyed ways):
-            // out of line in the chunk's shared stub. The primary loop left x12 exactly
-            // CALL_IC_WAYS strides past the site's first way.
-            if shared_stubs_enabled() {
-                a.sub_imm(12, 12, (crate::bytecode::CALL_IC_WAYS * stride) as u32);
-                let stub = a.shared_stub(SharedStub::CallSecondary.key());
-                a.bl_label(stub);
-                a.cbz(9, false, slow);
-                a.b(l_hit);
-            } else {
-                a.mov_imm64(6, ic0 as u64);
-                emit_call_secondary_probes(a, layout, ilayout, l_hit, slow);
-            }
-            // x15 = the hit way (ways-left counter → index), kept live through
-            // the direct sequence's NO-MUTATION gate checks (they never touch
-            // x15; every route into hit_slow happens before any blr).
-            a.bind(l_primary_hit);
-            a.movz(15, crate::bytecode::CALL_IC_WAYS as u32, 0);
-            a.sub_reg(15, 15, 14);
+            // Compare the way at x12; the flags end EQ on a match (a mismatch before the
+            // last compare branches to `miss`).
+            let compare_way = |a: &mut asm::Asm, miss: usize| {
+                a.ldur(11, 12, 0); // ic.callee (a `Gc::as_ptr` identity)
+                a.cmp_reg_x(10, 11);
+                a.b_cond(C_NE, miss);
+                a.ldr_w_imm(11, 12, 56); // ic.epoch
+                a.cmp_reg_w(11, 15);
+                a.b_cond(C_NE, miss);
+                a.ldr_imm(11, 12, 32); // ic.global_env
+                a.cmp_reg_x(11, 17);
+            };
+            compare_way(a, l_rest);
+            a.b_cond(C_NE, l_rest);
+            // x15 = the hit way's index, kept live through the direct sequence's
+            // NO-MUTATION gate checks (they never touch x15; every route into hit_slow
+            // happens before any blr).
+            a.movz(15, 0, 0);
             a.bind(l_hit);
             let with_this = matches!(op, Op::CallWithThis(..));
             let hit_slow = a.new_label();
@@ -6883,14 +6869,14 @@ fn emit_call_inline_marked(
                     a.bl_label(stub);
                     let not_returned = a.new_label();
                     const _: () = assert!(DIRECT_CALL_RETURNED == 0);
-                    a.cbnz(9, false, not_returned);
+                    a.cbnz(8, false, not_returned);
                     a.b(done);
                     // Never executed: the stub reads the call's position two instructions past
                     // its return address (see `DirectCallSite::AfterReturn`). Neither branch
                     // above can widen: both targets are in range.
                     a.word(chunk.call_position(*c));
                     a.bind(not_returned);
-                    a.cmp_imm_w(9, DIRECT_CALL_THREW);
+                    a.cmp_imm_w(8, DIRECT_CALL_THREW);
                     a.b_cond(C_EQ, l_unwind);
                     // A declined gate falls through to the H_CALL_HIT form below.
                 } else {
@@ -6929,6 +6915,46 @@ fn emit_call_inline_marked(
             a.mov(20, 0);
             a.cbnz(1, false, l_unwind);
             a.b(done);
+
+            // ---- ways 1.. (w14 = ways left), then the secondary probes ----
+            a.bind(l_rest);
+            let l_probe = a.new_label();
+            let l_next = a.new_label();
+            let l_primary_hit = a.new_label();
+            // entry stride (size compile-asserted below the JitCtx asserts)
+            let stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>();
+            a.movz(14, crate::bytecode::CALL_IC_WAYS as u32 - 1, 0);
+            a.bind(l_probe);
+            a.add_imm(12, 12, stride as u32);
+            compare_way(a, l_next);
+            a.b_cond(C_EQ, l_primary_hit);
+            a.bind(l_next);
+            a.sub_imm(14, 14, 1);
+            a.cbnz(14, false, l_probe);
+            // Secondary probes (the engine-wide identity overflow cache, then code-keyed ways):
+            // out of line in the chunk's shared stub, for an object callee (x13 = its identity).
+            // The loop left x12 at the site's last way.
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, slow);
+            a.mov(13, 10);
+            if shared_stubs_enabled() {
+                a.sub_imm(
+                    12,
+                    12,
+                    ((crate::bytecode::CALL_IC_WAYS - 1) * stride) as u32,
+                );
+                let stub = a.shared_stub(SharedStub::CallSecondary.key());
+                a.bl_label(stub);
+                a.cbz(9, false, slow);
+                a.b(l_hit);
+            } else {
+                a.mov_imm64(6, ic0 as u64);
+                emit_call_secondary_probes(a, layout, ilayout, l_hit, slow);
+            }
+            // w14 = WAYS - index for the way that matched.
+            a.bind(l_primary_hit);
+            a.movz(15, crate::bytecode::CALL_IC_WAYS as u32, 0);
+            a.sub_reg(15, 15, 14);
+            a.b(l_hit);
         }
     }
     a.bind(slow);
@@ -7840,14 +7866,15 @@ fn emit_direct_call(
     a.logic_imm_w(0, 11, 9, ready);
     a.cbz(11, false, static_gates);
     a.bind(static_done);
-    // recompile settled (live chunk byte — see attempted_off)
-    a.ldur(11, 12, IC_CHUNK_RAW);
-    a.ldrb_imm(11, 11, attempted_off as u32);
+    // recompile settled (live chunk byte — see attempted_off). x4 = the callee's chunk, kept
+    // for the retry gate below.
+    a.ldur(4, 12, IC_CHUNK_RAW);
+    a.ldrb_imm(11, 4, attempted_off as u32);
     a.cbz(11, false, hit_slow);
     // Arity needs no gate: the sequence moves min(argc, n_params) arguments into their slots,
     // tags every remaining slot Undefined (the missing-argument binding), and leaves any
     // over-applied surplus on the caller's operand stack, which pops it after the call.
-    // interp-side room: depth, gc tick, fn_frames capacity, frame pool
+    // interp-side room: depth, fn_frames capacity, frame pool
     a.ldr_imm(14, 19, 72); // ctx.interp
     a.ldr_w_imm(11, 14, il.depth as u32);
     a.ldr_w_imm(13, 14, il.direct_call_depth as u32);
@@ -7866,7 +7893,6 @@ fn emit_direct_call(
     // entries with a pending retry; on the threshold call the helper owns the increment.
     // This gate runs after every other fallback check, before committing any call state.
     let retry_done = a.new_label();
-    a.ldur(4, 12, IC_CHUNK_RAW);
     a.ldr_w_imm(5, 4, retry_off as u32);
     a.cbz(5, false, retry_done);
     a.ldr_w_imm(6, 4, runs_off as u32);
@@ -7916,8 +7942,7 @@ fn emit_direct_call(
     a.ldr_imm(6, 14, (il.fn_frames + il.fnf_ptr_word) as u32);
     a.movz(5, 24, 0);
     a.madd(6, 16, 5, 6);
-    a.mov(4, 10);
-    a.stur(4, 6, 0); // fn_ptr = the callee's as_ptr identity
+    a.stur(10, 6, 0); // fn_ptr = the callee's as_ptr identity
     match call_site {
         DirectCallSite::Position(position) => {
             a.movz(5, position & 0xffff, 0);
@@ -7941,48 +7966,34 @@ fn emit_direct_call(
     a.ldr_imm(5, 14, (il.frame_pool + il.fp_ptr_word) as u32);
     a.ldr_x_lsl3(9, 5, 7);
     a.add_imm(15, 9, FRAME_WORDS_OFF as u32);
-    // Move packed argument words byte-for-byte; there is no conversion or possible miss.
-    // ECMA-262 OrdinaryCallBindThis/FunctionDeclarationInstantiation bind the first n_params
-    // values; an over-applied call's surplus words stay on the caller's operand stack, which
-    // pops them after the call.
-    a.sub_imm(8, 20, (argc * 8) as u32);
+    // Move packed argument words byte-for-byte, in pairs; there is no conversion or possible
+    // miss. ECMA-262 OrdinaryCallBindThis/FunctionDeclarationInstantiation bind the first
+    // n_params values; an over-applied call (`surplus`, out of line) moves only those, and its
+    // surplus words stay on the caller's operand stack, which pops them after the call.
     let surplus = a.new_label();
-    let moved = a.new_label();
+    let init_body = a.new_label();
+    let init_done = a.new_label();
     a.ldrh_imm(6, 12, IC_NPARAMS);
     a.cmp_imm_w(6, argc as u32);
     a.b_cond(C_LO, surplus);
-    for k in 0..argc {
-        a.ldr_imm(4, 8, (k * 8) as u32);
-        a.str_imm(4, 15, (k * 8) as u32);
+    for k in (0..argc - argc % 2).step_by(2) {
+        a.ldp_base(4, 3, 20, -(((argc - k) * 8) as i32));
+        a.stp_base(4, 3, 15, (k * 8) as i32);
     }
-    a.movz(6, argc as u32, 0); // first slot left to initialize
-    a.b(moved);
-    a.bind(surplus);
-    // w6 = n_params < argc: move exactly those arguments.
-    {
-        let move_loop = a.new_label();
-        let move_done = a.new_label();
-        a.movz(3, 0, 0);
-        a.bind(move_loop);
-        a.cmp_reg_w(3, 6);
-        a.b_cond(C_HS, move_done);
-        a.ldr_x_lsl3(4, 8, 3);
-        a.add_shifted(16, 15, 3, 3);
-        a.str_imm(4, 16, 0);
-        a.add_imm(3, 3, 1);
-        a.b(move_loop);
-        a.bind(move_done);
+    if argc % 2 == 1 {
+        a.ldur(4, 20, -8);
+        a.str_imm(4, 15, ((argc - 1) * 8) as u32);
     }
-    a.bind(moved);
-    // Initialize every remaining local (from slot w6) to a complete packed Undefined word.
-    // The count w4 = n_slots - w6 is stored four words per iteration (two STPs), then a pair
-    // and a single word for the remainder; x5 = n_slots survives for the installation below.
+    // Initialize every remaining local, from slot argc, to a complete packed Undefined word;
+    // x5 = n_slots survives for the installation below.
     a.ldrh_imm(5, 12, IC_NSLOTS);
+    a.subs_imm_w(4, 5, argc as u32);
+    a.b_cond(C_LS, init_done); // n_slots <= argc: nothing left
+    a.add_imm(3, 15, (argc * 8) as u32);
+    // w4 words from x3: four per iteration (two STPs), then a pair and a single word for the
+    // remainder.
+    a.bind(init_body);
     a.mov_imm64(17, crate::value::PACK_UNDEFINED);
-    let init_done = a.new_label();
-    a.subs_reg_w(4, 5, 6);
-    a.b_cond(C_LS, init_done); // n_slots <= first uninitialized slot: nothing left
-    a.add_shifted(3, 15, 6, 3);
     let init_pair = a.new_label();
     let init_single = a.new_label();
     let init_quad = a.new_label();
@@ -8009,8 +8020,7 @@ fn emit_direct_call(
     // Interpreter-constant fields (helpers, interp, counters, slots) were written when the
     // record was created; this/ret/error/handlers are vacant while it is pooled.
     // stack_base = slots + n_slots*8
-    a.movz(4, 8, 0);
-    a.madd(3, 5, 4, 15);
+    a.add_shifted(3, 15, 5, 3);
     a.str_imm(3, 9, cx_stack_base);
     // env_raw (selected into x13 above), and its parent cache from that environment: the
     // parent's stored word, its `Env::as_ptr`, or null.
@@ -8120,6 +8130,7 @@ fn emit_direct_call(
     {
         a.mov_imm64(16, record_direct_packed_return as *const () as u64);
         a.blr(16);
+        a.movz(8, 0, 0); // not threw, as the shared stub's status expects
     }
     a.b(done);
 
@@ -8193,6 +8204,29 @@ fn emit_direct_call(
     } else {
         a.b(hit_slow); // no receiver + sloppy this-user: global boxing → generic
     }
+
+    // ---- an over-applied call: move the w6 = n_params < argc arguments bound ----
+    a.bind(surplus);
+    {
+        let move_loop = a.new_label();
+        let move_done = a.new_label();
+        a.sub_imm(8, 20, (argc * 8) as u32);
+        a.movz(3, 0, 0);
+        a.bind(move_loop);
+        a.cmp_reg_w(3, 6);
+        a.b_cond(C_HS, move_done);
+        a.ldr_x_lsl3(4, 8, 3);
+        a.add_shifted(16, 15, 3, 3);
+        a.str_imm(4, 16, 0);
+        a.add_imm(3, 3, 1);
+        a.b(move_loop);
+        a.bind(move_done);
+    }
+    a.ldrh_imm(5, 12, IC_NSLOTS);
+    a.subs_reg_w(4, 5, 6);
+    a.b_cond(C_LS, init_done); // n_slots <= n_params: nothing left
+    a.add_shifted(3, 15, 6, 3);
+    a.b(init_body);
     true
 }
 
@@ -8751,12 +8785,10 @@ fn emit_direct_finish_stub(
         let handlers_len_off = handlers_len_off.expect("checked above") as u32;
         a.cbnz(1, false, slow); // threw → helper
         a.ldr_imm(14, 19, 72); // ctx.interp
-                               // operand stack clean (a clean return always leaves final_sp == stack_base)
-        a.ldr_imm(9, 10, 16); // record.final_sp
-        a.ldr_imm(11, 10, 8); // record.stack_base
-        a.cmp_reg_x(9, 11);
-        a.b_cond(C_NE, slow);
-        // no pending proper-tail-call (Option<Box> niche: None = 0)
+
+        // Operands left on the record's stack need no release: a packed word owns nothing
+        // (`Value` is a Copy word), and the pooled record's words are dead.
+        // No pending proper-tail-call (Option<Box> niche: None = 0).
         a.ldr_imm(9, 14, il.pending_tail as u32);
         a.cbnz(9, true, slow);
         // No materialized native activation (Option<Box> niche: None = 0): bridge operations
@@ -8764,16 +8796,18 @@ fn emit_direct_finish_stub(
         // invariant.
         a.ldr_imm(9, 10, cx_activation);
         a.cbnz(9, true, slow);
-        // FnFrame top: no materialized `extra` (the asm push wrote None; only the callee's own
-        // arguments-object materialization could have filled it). x16 = the top's index, kept
-        // for the pop below.
+        // FnFrame top: x16 = its index, kept for the pop below. The asm push wrote `extra` None,
+        // and only the tree-walker's function entry fills one, on the frame it pushed itself
+        // (`call_user_inner`), so the pop has nothing to drop. Debug builds check, in the helper.
         a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
-        a.ldr_imm(6, 14, (il.fn_frames + il.fnf_ptr_word) as u32);
         a.sub_imm(16, 16, 1);
-        a.movz(5, 24, 0);
-        a.madd(6, 16, 5, 6);
-        a.ldur(9, 6, 16); // FnFrame.extra
-        a.cbnz(9, true, slow);
+        if cfg!(debug_assertions) {
+            a.ldr_imm(6, 14, (il.fn_frames + il.fnf_ptr_word) as u32);
+            a.movz(5, 24, 0);
+            a.madd(6, 16, 5, 6);
+            a.ldur(9, 6, 16); // FnFrame.extra
+            a.cbnz(9, true, slow);
+        }
         // pool room: len < FRAME_POOL_LIMIT, within the capacity the pool reserves at creation
         // (`FramePool::default`), so the push never reallocates the Vec from machine code.
         // Nothing below touches the pool, the frame stack, or the depth before the commit, so
@@ -8800,8 +8834,7 @@ fn emit_direct_finish_stub(
         a.str_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
         // record push: ptr[len] = record; len++ (room validated above)
         a.ldr_imm(4, 14, (il.frame_pool + il.fp_ptr_word) as u32);
-        a.add_shifted(4, 4, 7, 3);
-        a.stur(10, 4, 0);
+        a.str_x_lsl3(10, 4, 7);
         a.add_imm(7, 7, 1);
         a.str_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
         // depth--
@@ -10640,24 +10673,25 @@ enum SharedStub {
     NameElement { write: bool },
 }
 
-/// Status codes of the shared direct-call stub. The common completion is zero, so a site pays
-/// one untaken branch for it.
+/// Status codes of the shared direct-call stub, in w8. The common completion is zero, so a site
+/// pays one untaken branch for it, and a throw is one: the finish stub leaves w8 = threw, so
+/// only a decline sets it.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 const DIRECT_CALL_RETURNED: u32 = 0;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const DIRECT_CALL_THREW: u32 = 1;
 /// A gate declined before anything was mutated (the site continues with H_CALL_HIT).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-const DIRECT_CALL_DECLINED: u32 = 1;
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-const DIRECT_CALL_THREW: u32 = 2;
+const DIRECT_CALL_DECLINED: u32 = 2;
 
 /// Status codes of the shared intrinsic stubs (see [`emit_intrinsic_stub_call`]).
 #[cfg(all(
@@ -11082,16 +11116,18 @@ impl SharedStub {
                     DirectCallSite::AfterReturn,
                 );
                 assert!(emitted, "sites request the stub only when it is supported");
-                for (landing, status) in [
-                    (returned, DIRECT_CALL_RETURNED),
-                    (declined, DIRECT_CALL_DECLINED),
-                    (threw, DIRECT_CALL_THREW),
-                ] {
+                // The sequence reaches `returned` with w8 = 0 and `threw` with w8 = 1, the finish
+                // stub's threw flag.
+                const _: () = assert!(DIRECT_CALL_RETURNED == 0 && DIRECT_CALL_THREW == 1);
+                for landing in [returned, threw] {
                     a.bind(landing);
                     a.ldp_post(29, 30, 16);
-                    a.movz(9, status, 0);
                     a.ret();
                 }
+                a.bind(declined);
+                a.ldp_post(29, 30, 16);
+                a.movz(8, DIRECT_CALL_DECLINED, 0);
+                a.ret();
             }
         }
     }

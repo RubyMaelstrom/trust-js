@@ -22268,9 +22268,9 @@ unsafe fn string_intrinsic(i: &mut Interp, intrinsic: u8, base: *const Value) ->
 /// Teardown for a direct JIT→JIT call, the slow path of the generated finish stub. The callee
 /// ran on its own pooled record ([`crate::jit::JitFrame`]); this drops whatever it left (operand
 /// stack range and slots), moves its completion (return value or error) into the caller's
-/// context, returns the record to the pool, pops the FnFrame (including a materialized `extra`),
-/// drains a pending tail call and decrements the recursion depth. The caller's generated code
-/// then pushes `caller.ret` or unwinds with `caller.error`.
+/// context, returns the record to the pool, pops the FnFrame, drains a pending tail call and
+/// decrements the recursion depth. The caller's generated code then pushes `caller.ret` or
+/// unwinds with `caller.error`.
 /// Returns 0 = ok (`caller.ret` valid) / 1 = threw (`caller.error` set).
 ///
 /// # Safety
@@ -22309,10 +22309,14 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
     // Returning from inside a try bypasses the lexical PopHandler; `release` also discards the
     // callee's own handler records (ECMA-262 14.10.1 and 14.15.3) and its `this` binding.
     crate::jit::JitFrame::release(i, record);
-    // FnFrame pop (the asm pushed it; a materialized `extra` drops here). The caller's direct
-    // call never set `call_site`, so no explicit call is in progress once it returns.
+    // FnFrame pop. The asm pushed it without an `extra`, and nothing fills a direct callee's
+    // (the finish stub's fast path pops it unchecked). The caller's direct call never set
+    // `call_site`, so no explicit call is in progress once it returns.
     if let Some(f) = i.fn_frames.pop() {
-        drop(f.extra);
+        debug_assert!(
+            f.extra.is_none(),
+            "a direct callee's frame gained an `extra`"
+        );
     }
     i.call_site = crate::stack_trace::NO_POSITION;
     // Proper-tail-call trampoline, exactly like the layered paths.
