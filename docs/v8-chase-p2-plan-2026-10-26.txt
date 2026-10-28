@@ -547,6 +547,10 @@ does (Order, step 0).
 15. The worktrees and branches of landed series are deleted (2026-10-28).
 16. Constructions count toward their constructor's inline checkpoints, as calls do
     (2026-10-28).
+17. Getters in code compiled before a read site's cache saw an accessor (2026-10-28): as V8's
+    load builtin, SpiderMonkey's CacheIR stubs and JSC's data ICs do, the shared property stub
+    takes the getter case at run time, with the site's getter call cache made lazily; no
+    recompile, no growth at the sites.
 
 ## Non-goals
 
