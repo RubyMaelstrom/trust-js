@@ -23548,6 +23548,14 @@ unsafe fn jit_new_inner(
     Ok(())
 }
 
+#[cfg(all(test, target_arch = "aarch64"))]
+thread_local! {
+    /// Allocations [`jit_construct_this`] declined.
+    pub(crate) static TEST_CONSTRUCT_DECLINES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// [[Construct]] step 3 for the ARM64 direct construct sequence (`jit::emit_direct_construct`),
 /// once its probe has proved the site's cached constructor and its gates have passed:
 /// OrdinaryCreateFromConstructor (ECMA-262), as [`Interp::construct_jit_fast`] makes the instance
@@ -23579,11 +23587,16 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
         };
         match property {
             Some(p) if !p.accessor() => match (p.value()).view() {
-                ValueView::Obj(proto) => proto,
-                _ => return 0,
+                ValueView::Obj(proto) => Some(proto),
+                _ => None,
             },
-            _ => return 0,
+            _ => None,
         }
+    };
+    let Some(proto) = proto else {
+        #[cfg(all(test, target_arch = "aarch64"))]
+        TEST_CONSTRUCT_DECLINES.with(|count| count.set(count.get() + 1));
+        return 0;
     };
     // OrdinaryObjectCreate, its storage sized for the constructor's fields by its static field
     // layout, which the entry's gate bits require (`Chunk::jit_construct_flags`).

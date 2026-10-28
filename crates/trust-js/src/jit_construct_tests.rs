@@ -51,6 +51,28 @@ fn chunk(engine: &mut Engine, name: &str) -> Rc<Chunk> {
     chunk
 }
 
+/// Whether this process runs `test` alone: the parent runs it in a child process, checks that it
+/// passed, and returns false. The call-cache epoch is process-global, so other tests' engines
+/// must not make a site miss while a test takes counts.
+fn run_alone(test: &str) -> bool {
+    const CHILD: &str = "TRUST_JS_TEST_CONSTRUCT_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 /// A base class constructor whose class has no instance elements constructs through the site's
 /// cache like a function constructor; fields, private methods and a derived class keep the
 /// generic [[Construct]]. Either way the instance, its prototype, new.target, a returned object
@@ -115,6 +137,113 @@ fn base_classes_without_instance_elements_take_the_construct_cache() {
             );
         }
     }
+}
+
+/// A construction counts toward its constructor's inline checkpoints as a call does: a class
+/// constructor and a function constructor run only under `new`, through their sites' caches (on
+/// ARM64 the direct construct sequence), reach their second-stage compiles with their hot
+/// callees spliced in. The splice keeps each callee's strictness.
+#[test]
+fn constructors_run_only_under_new_reach_their_second_stage_compile() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let before = direct_constructs();
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            r#"
+            function strictStep(x) { 'use strict'; return x + 1; }
+            function sloppyStep(x) { return x + 2; }
+            class Box { constructor(x) { this.v = strictStep(x); } }
+            function Plain(x) { this.v = sloppyStep(x); }
+            function make(k) { return new Box(k).v + new Plain(k).v; }
+            var s = 0;
+            for (var k = 0; k < 400; k++) s += make(k);
+            s;
+        "#
+        ),
+        "160800"
+    );
+    if cfg!(target_arch = "aarch64") {
+        assert!(direct_constructs() > before, "no direct construction");
+    }
+    for name in ["Box", "Plain"] {
+        let constructor = object(&mut engine, name);
+        let constructor = constructor.borrow();
+        let Callable::User(user) = &constructor.call else {
+            panic!("{name} is not a user function")
+        };
+        assert!(
+            user.func
+                .runtime()
+                .code2
+                .get()
+                .is_some_and(|code| code.is_some()),
+            "{name} did not reach its second-stage compile"
+        );
+    }
+}
+
+/// Each construction counts once toward its constructor's checkpoints, whichever path makes
+/// it: one whose allocation declines (a `prototype` that is not an Object) leaves the direct
+/// sequence's count to the generic [[Construct]] that makes it.
+#[test]
+fn every_construction_counts_once() {
+    if !run_alone("jit::construct_tests::every_construction_counts_once") {
+        return;
+    }
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let runs = |engine: &mut Engine| {
+        let constructor = object(engine, "F");
+        let constructor = constructor.borrow();
+        let Callable::User(user) = &constructor.call else {
+            panic!("F is not a user function")
+        };
+        let runtime = user.func.runtime();
+        let chunk = runtime
+            .execution_code()
+            .and_then(Option::as_ref)
+            .expect("compiled F");
+        assert_ne!(chunk.inline_retry_at.get(), 0, "a checkpoint is pending");
+        chunk.jit_runs.get()
+    };
+    evaluate(
+        &mut engine,
+        r#"
+        function F(x) { this.x = x; }
+        function make(n) { var s = 0; for (var k = 0; k < n; k++) s += new F(k).x; return s; }
+        function deep(n) { return n > 0 ? deep(n - 1) + 1 : 0; }
+        make(30);
+    "#,
+    );
+    let before = runs(&mut engine);
+    #[cfg(target_arch = "aarch64")]
+    let declines = crate::bytecode::TEST_CONSTRUCT_DECLINES.with(std::cell::Cell::get);
+    // `deep` leaves records pooled, so the sequence reaches its allocation and declines there.
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            "deep(8); F.prototype = null; var o = new F(1); \
+             make(20) + ':' + (Object.getPrototypeOf(o) === Object.prototype)"
+        ),
+        "190:true"
+    );
+    #[cfg(target_arch = "aarch64")]
+    assert!(
+        crate::bytecode::TEST_CONSTRUCT_DECLINES.with(std::cell::Cell::get) > declines,
+        "no allocation declined"
+    );
+    let declined = runs(&mut engine);
+    assert_eq!(declined - before, 21, "constructions with a null prototype");
+    assert_eq!(evaluate(&mut engine, "F.prototype = {}; make(20)"), "190");
+    assert_eq!(
+        runs(&mut engine) - declined,
+        20,
+        "constructions with an Object prototype"
+    );
 }
 
 /// Constructions the ARM64 direct construct sequence has completed on this thread.
@@ -294,26 +423,7 @@ fn constructions_keep_their_instance_across_collections() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn hot_new_sites_construct_through_the_direct_sequence() {
-    // The call-cache epoch is process-global: other tests' engines must not make a site miss
-    // while the counts are taken.
-    const CHILD: &str = "TRUST_JS_TEST_DIRECT_CONSTRUCT_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "jit::construct_tests::hot_new_sites_construct_through_the_direct_sequence",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if !run_alone("jit::construct_tests::hot_new_sites_construct_through_the_direct_sequence") {
         return;
     }
     let mut engine = Engine::new();

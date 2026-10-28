@@ -14954,6 +14954,14 @@ impl Interp {
             self.depth -= 1;
             return Some(Err(e));
         }
+        // The construction enters the constructor's code (the plans below stand for it), and
+        // counts toward the code's inline checkpoints as a call does (see `note_native_entry`),
+        // while one is pending: as the direct sequences count, and nothing reads the count once
+        // the last has passed. A checkpoint that publishes a splice leaves this construction its
+        // selected chunk and leased code.
+        if chunk.inline_retry_at.get() != 0 {
+            self.note_native_entry(ic.func, chunk, ic.realm, ic.global_env);
+        }
         // Once every field site's creation IC proves the complete fresh-object shape chain, the
         // body has no remaining observable operation: append all fields under one borrow,
         // copying parameter words from the caller's immutable evaluated window. No function

@@ -8044,13 +8044,12 @@ fn emit_direct_sequence(
     a.logic_imm_w(0, 11, 9, ready);
     a.cbz(11, false, static_gates);
     a.bind(static_done);
-    // A construction counts no run toward its constructor's inline checkpoints, as the
-    // `Op::New` helper's cached path counts none: the construct form has neither the call's
-    // warm-up gate nor its retry gate.
+    // x4 = the callee's chunk, kept for the retry gate below.
+    a.ldur(4, 12, IC_CHUNK_RAW);
     if !construct {
-        // recompile settled (live chunk byte — see attempted_off). x4 = the callee's chunk,
-        // kept for the retry gate below.
-        a.ldur(4, 12, IC_CHUNK_RAW);
+        // recompile settled (live chunk byte — see attempted_off). A construct waits for no
+        // attempt: it counts from its first run (below), and its code's first checkpoint is
+        // that attempt.
         a.ldrb_imm(11, 4, attempted_off as u32);
         a.cbz(11, false, hit_slow);
     }
@@ -8072,20 +8071,21 @@ fn emit_direct_sequence(
     a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
     a.cbz(7, true, hit_slow);
 
-    if !construct {
-        // Late feedback can make a previously empty inline plan useful. Count only direct
-        // entries with a pending retry; on the threshold call the helper owns the increment.
-        // This gate runs after every other fallback check, before committing any call state.
-        let retry_done = a.new_label();
-        a.ldr_w_imm(5, 4, retry_off as u32);
-        a.cbz(5, false, retry_done);
-        a.ldr_w_imm(6, 4, runs_off as u32);
-        a.add_imm(6, 6, 1);
-        a.cmp_reg_w(6, 5);
-        a.b_cond(C_HS, hit_slow);
-        a.str_w_imm(6, 4, runs_off as u32);
-        a.bind(retry_done);
-    } else {
+    // Late feedback can make a previously empty inline plan useful. Count only direct
+    // entries with a pending retry; on the threshold call the helper owns the increment.
+    // This gate runs after every other fallback check, before committing any call state: a
+    // construct's allocation, below, can still decline, and then takes the count back.
+    let retry_done = a.new_label();
+    a.ldr_w_imm(5, 4, retry_off as u32);
+    a.cbz(5, false, retry_done);
+    a.ldr_w_imm(6, 4, runs_off as u32);
+    a.add_imm(6, 6, 1);
+    a.cmp_reg_w(6, 5);
+    a.b_cond(C_HS, hit_slow);
+    a.str_w_imm(6, 4, runs_off as u32);
+    a.bind(retry_done);
+    let uncount = a.new_label();
+    if construct {
         // [[Construct]] step 3 (ECMA-262): `this` is OrdinaryCreateFromConstructor(F,
         // "%Object.prototype%"), F being new.target too (EvaluateNew passes no other). The lean
         // helper reads F's live `prototype` and allocates the instance with F's field layout.
@@ -8111,7 +8111,7 @@ fn emit_direct_sequence(
         } else {
             a.ldp_post(12, 10, 16);
         }
-        a.cbz(0, true, hit_slow);
+        a.cbz(0, true, uncount);
         a.mov(2, 0);
         a.ldr_imm(14, 19, 72);
         a.ldr_w_imm(11, 14, il.depth as u32);
@@ -8462,6 +8462,19 @@ fn emit_direct_sequence(
         a.str_imm(4, 14, il.new_target as u32);
         a.add_imm(31, 31, 32);
         a.b(finished);
+    }
+
+    // ---- a declined allocation: the retry gate's count is taken back (the helper counts the
+    // construction it makes), then the helper ----
+    if construct {
+        a.bind(uncount);
+        a.ldur(4, 12, IC_CHUNK_RAW);
+        a.ldr_w_imm(5, 4, retry_off as u32);
+        a.cbz(5, false, hit_slow);
+        a.ldr_w_imm(6, 4, runs_off as u32);
+        a.sub_imm(6, 6, 1);
+        a.str_w_imm(6, 4, runs_off as u32);
+        a.b(hit_slow);
     }
 
     // ---- the static gates one by one (w9 = the entry's direct bits) ----
