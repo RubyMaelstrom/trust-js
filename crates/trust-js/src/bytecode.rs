@@ -1358,6 +1358,52 @@ impl CallSite {
     }
 }
 
+/// The getter call cache of a property-read site whose machine code calls its getter through
+/// the direct sequence (`jit::emit_getter_call`): made when the code is emitted for a site whose
+/// property cache has validated an accessor, its [`CallSite`] when a user function is first
+/// called as the getter there (a native getter, the common case at many sites, allocates no
+/// call cache). ECMA-262 §10.1.8.1 OrdinaryGet: the getter is the accessor's live [[Get]],
+/// which the machine code reads after the property cache's proof, then looks up here by
+/// identity like any callee.
+pub(crate) struct GetterSite {
+    /// The call cache's first way once it exists, else 0: the word the machine code loads.
+    ways: std::cell::Cell<usize>,
+    calls: std::cell::OnceCell<Box<CallSite>>,
+}
+
+/// A chunk's getter call caches, keyed by their sites' property caches. Entries are boxed and
+/// never removed: the machine code of the chunk embeds their addresses.
+pub(crate) type GetterSites = std::cell::RefCell<crate::fasthash::FastMap<u32, Box<GetterSite>>>;
+
+/// A chunk's weak pins of the callees its call caches record ([`Chunk::call_pins`]).
+pub(crate) type CalleePins =
+    std::cell::RefCell<crate::fasthash::FastMap<usize, crate::value::WeakGc>>;
+
+impl GetterSite {
+    /// The call cache for calls of `getter`, made on first use when `getter` is a user function
+    /// (only those fill a call cache, see `Interp::call_jit_fast`).
+    fn calls_for(&self, getter: &Value) -> Option<&CallSite> {
+        if let Some(calls) = self.calls.get() {
+            return Some(calls);
+        }
+        let object = getter.as_obj()?;
+        if !matches!(object.borrow().call, crate::value::Callable::User(_)) {
+            return None;
+        }
+        let calls = self.calls.get_or_init(|| Box::new(CallSite::empty()));
+        self.ways.set(calls.entries.as_ptr() as usize);
+        Some(calls)
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<GetterSite>()
+            + self
+                .calls
+                .get()
+                .map_or(0, |_| std::mem::size_of::<CallSite>())
+    }
+}
+
 const CALL_OVERFLOW_SETS: usize = 128;
 const CALL_OVERFLOW_MAX_SETS: usize = 512;
 pub(crate) const CALL_OVERFLOW_WAYS: usize = 4;
@@ -2650,6 +2696,9 @@ pub struct Chunk {
     regexp_literals: Vec<std::cell::OnceCell<Rc<crate::regex::Regex>>>,
     /// One [`CallSite`] per `Call`/`CallWithThis` site (the JIT→JIT fast call's callee cache).
     call_caches: Vec<CallSite>,
+    /// The getter call caches of the property-read sites whose machine code calls getters
+    /// directly, keyed by the sites' property caches (see [`GetterSite`]).
+    getter_sites: std::cell::OnceCell<Box<GetterSites>>,
     /// Source names of call and `new` targets, for TypeError messages (see [`Chunk::call_name`]).
     call_names: Option<Box<CallNames>>,
     /// Source positions of the operations (see [`Chunk::position`]).
@@ -2784,6 +2833,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             arguments_forwarder_runtime: _,
             regexp_literals: _,
             call_caches: _,
+            getter_sites: _,
             call_names: _,
             positions: _,
             call_positions: _,
@@ -2978,6 +3028,14 @@ impl Chunk {
         self.positions.at(pc)
     }
 
+    /// The inline position a checked operation `pc` publishes while it calls author code
+    /// implicitly (a getter, say): [`NO_POSITION`] outside spliced bodies (see
+    /// `ImplicitCallPosition`).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_implicit_position(&self, pc: usize) -> u32 {
+        self.inline_sites.implicit_position(pc)
+    }
+
     /// The position of the call made through call cache `cache`.
     #[inline]
     pub(crate) fn call_position(&self, cache: u32) -> u32 {
@@ -3046,6 +3104,17 @@ impl Chunk {
             .saturating_add(self.private_sites.len() * std::mem::size_of::<PrivateSite>())
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
+        if let Some(sites) = self.getter_sites.get() {
+            let sites = sites.borrow();
+            bytes = bytes.saturating_add(
+                std::mem::size_of::<GetterSites>()
+                    + sites.capacity() * std::mem::size_of::<(u32, Box<GetterSite>)>()
+                    + sites
+                        .values()
+                        .map(|site| site.retained_bytes())
+                        .sum::<usize>(),
+            );
+        }
         if matches!(self.record_getter.get(), Some(Some(_))) {
             bytes = bytes.saturating_add(std::mem::size_of::<RecordGetterPlan>());
         }
@@ -7708,6 +7777,7 @@ fn finish_chunk(
         arguments_forwarder_runtime: std::cell::RefCell::new(None),
         regexp_literals: (0..op_count).map(|_| std::cell::OnceCell::new()).collect(),
         call_caches: c.call_caches,
+        getter_sites: std::cell::OnceCell::new(),
         call_names: c.call_names.into_table(),
         positions: c.positions,
         call_positions,
@@ -19923,6 +19993,33 @@ impl Chunk {
     pub(crate) fn jit_construct_cache_ptr(&self, idx: u32) -> usize {
         &self.construct_caches[idx as usize] as *const std::cell::Cell<ConstructSite> as usize
     }
+    /// The stable address of the word naming property site `cache`'s getter call cache (see
+    /// [`GetterSite`]), made on first request: the box keeps it in place for the chunk's life,
+    /// which outlasts its JIT code.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_getter_site_ptr(&self, cache: u32) -> usize {
+        let sites = self.getter_sites.get_or_init(Default::default);
+        let mut sites = sites.borrow_mut();
+        let site = sites.entry(cache).or_insert_with(|| {
+            Box::new(GetterSite {
+                ways: std::cell::Cell::new(0),
+                calls: std::cell::OnceCell::new(),
+            })
+        });
+        site.ways.as_ptr() as usize
+    }
+    /// The call cache for calls of `getter` at property site `cache`, with the pins of its
+    /// callees, when the site's machine code calls getters directly (see [`GetterSite`]).
+    pub(crate) fn getter_calls(
+        &self,
+        cache: u32,
+        getter: &Value,
+    ) -> Option<(&CallSite, &CalleePins)> {
+        let site: *const GetterSite = &**self.getter_sites.get()?.borrow().get(&cache)?;
+        // SAFETY: a site is boxed and never removed or replaced while the chunk lives.
+        let site = unsafe { &*site };
+        Some((site.calls_for(getter)?, &self.call_pins))
+    }
     #[cfg(test)]
     pub(crate) fn test_call_site(&self, idx: u32) -> &CallSite {
         &self.call_caches[idx as usize]
@@ -23897,6 +23994,25 @@ mod computed_key_tests;
 #[path = "bytecode_named_read_tests.rs"]
 mod named_read_helper_tests;
 
+/// The read at `pc` threw from a getter its machine code called through the direct sequence
+/// (see `jit::emit_getter_call`), whose finish left the error in the context: give the error's
+/// pending frame this operation's position, as `throw_at` does when a getter called from the
+/// helper throws (ECMA-262 GetValue; see `Interp::place_thrown`). The code then unwinds.
+///
+/// # Safety
+/// `ctx` is the live context of the code that made the read.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) unsafe extern "C" fn jit_getter_threw(ctx: *mut crate::jit::JitCtx, pc: u32) {
+    let ctx = unsafe { &mut *ctx };
+    if let Some(error) = &ctx.error {
+        let position = unsafe { (*ctx.chunk).position(pc as usize) };
+        unsafe { (*ctx.interp).place_thrown(error, position) };
+    }
+}
+
 /// Dedicated property-read entry (same contract as [`jit_exec`]): straight into
 /// [`crate::interpreter::Interp::get_prop_ic`] for the four read shapes, skipping the generic
 /// op decode.
@@ -23904,18 +24020,40 @@ mod named_read_helper_tests;
 /// accessor landing for THIS helper call. Always clears the publication, including on
 /// decline, so it can never leak into a nested or later helper call. Detailed-feedback
 /// runs keep the canonical profiled resolution, whose observations must see every read.
+/// A site whose machine code calls getters directly (property cache `cache`) calls a user
+/// getter through its getter call cache, which the call fills. The test for a publication is
+/// made in line: the helper's other reads make no call for it.
+#[inline(always)]
 unsafe fn jit_accessor_fast(
     validated: (usize, u32),
     i: &mut Interp,
     chunk: &Chunk,
     name: &str,
     receiver: Value,
+    cache: u32,
 ) -> Option<Result<Value, Abrupt>> {
     let (holder, slot) = validated;
-    if holder == 0 || chunk.feedback.detailed_enabled() {
+    if holder == 0 {
         return None;
     }
-    unsafe { i.accessor_validated_get(holder, slot, name, &receiver) }
+    unsafe { jit_accessor_validated(holder, slot, i, chunk, name, receiver, cache) }
+}
+
+/// [`jit_accessor_fast`] with a publication.
+#[inline(never)]
+unsafe fn jit_accessor_validated(
+    holder: usize,
+    slot: u32,
+    i: &mut Interp,
+    chunk: &Chunk,
+    name: &str,
+    receiver: Value,
+    cache: u32,
+) -> Option<Result<Value, Abrupt>> {
+    if chunk.feedback.detailed_enabled() {
+        return None;
+    }
+    unsafe { i.accessor_validated_get(holder, slot, name, &receiver, Some((chunk, cache))) }
 }
 
 pub(crate) unsafe extern "C" fn jit_get_prop(
@@ -23949,7 +24087,14 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     );
                 }
                 let v = match unsafe {
-                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], obj)
+                    jit_accessor_fast(
+                        accessor_validated,
+                        i,
+                        chunk,
+                        &chunk.names[n as usize],
+                        obj,
+                        c,
+                    )
                 } {
                     Some(r) => r?,
                     None => get_named_property_from_slot(
@@ -23976,7 +24121,14 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     pc,
                 );
                 let v = match unsafe {
-                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], this)
+                    jit_accessor_fast(
+                        accessor_validated,
+                        i,
+                        chunk,
+                        &chunk.names[n as usize],
+                        this,
+                        c,
+                    )
                 } {
                     Some(r) => r?,
                     None => get_named_property(
@@ -24015,7 +24167,14 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     );
                 }
                 let v = match unsafe {
-                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], obj)
+                    jit_accessor_fast(
+                        accessor_validated,
+                        i,
+                        chunk,
+                        &chunk.names[n as usize],
+                        obj,
+                        c,
+                    )
                 } {
                     Some(r) => r?,
                     None => get_named_property_from_slot(
@@ -24044,7 +24203,14 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     );
                 }
                 let m = match unsafe {
-                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], *obj)
+                    jit_accessor_fast(
+                        accessor_validated,
+                        i,
+                        chunk,
+                        &chunk.names[n as usize],
+                        *obj,
+                        c,
+                    )
                 } {
                     Some(r) => r?,
                     None => get_named_property_from_slot(

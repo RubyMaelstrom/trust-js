@@ -5430,7 +5430,7 @@ pub struct Property {
 
 /// The getter/setter pair of an accessor property: an immutable payload cell (16-byte aligned,
 /// as every cell is, which leaves `meta`'s flag bits free). Its edges are its two functions.
-/// `repr(C)`, so that generated code can read the getter's word.
+/// `repr(C)`: generated code reads the getter's word ([`ACCESSOR_GET_WORD_OFF`]).
 #[repr(C, align(16))]
 #[derive(Clone, Default)]
 pub(crate) struct Accessors {
@@ -5466,6 +5466,12 @@ impl Default for AccessorFn {
         AccessorFn::new(None)
     }
 }
+
+/// The byte offset of an accessor pair's getter word (its [[Get]] function's, or Undefined's)
+/// from the pair cell, which `meta`'s pointer bits address.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const ACCESSOR_GET_WORD_OFF: usize =
+    std::mem::offset_of!(Accessors, get) + std::mem::offset_of!(AccessorFn, word);
 
 impl crate::gc_box::Payload for Accessors {
     fn desc(heap: &GcState) -> crate::gc_core::DescId {

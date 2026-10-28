@@ -95,6 +95,14 @@ mod call_reference_tests;
 #[path = "jit_call_closure_tests.rs"]
 mod call_closure_tests;
 
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_getter_call_tests.rs"]
+mod getter_call_tests;
+
 #[cfg(test)]
 #[path = "jit_construct_tests.rs"]
 mod construct_tests;
@@ -6003,6 +6011,8 @@ fn emit_prop_load_inline(
     // collide with one. Prototype hops stay `Exotic::None`-only.
     arr_ok: bool,
     recv: PropRecv,
+    // The site's getter call through the direct sequence (see [`getter_call`]), when it has one.
+    getter: Option<GetterCall>,
 ) {
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
@@ -6373,10 +6383,17 @@ fn emit_prop_load_inline(
         regions::emit_property_event(a, 1);
         a.b(done);
     }
-    // Validated accessor landing: x11 = holder object base, x13 = slot. Publish both for
-    // `jit_get_prop`'s validated accessor path, then take the ordinary helper call. No
-    // JavaScript can run between the validation above and the helper consuming these.
+    // Validated accessor landing: x11 = holder object base, x13 = slot, x15 = its entry. A site
+    // that calls getters directly tries that first; otherwise, or when it declines before the
+    // call, publish holder and slot for `jit_get_prop`'s validated accessor path, then take the
+    // ordinary helper call. No JavaScript can run between the validation above and the helper
+    // consuming these.
     a.bind(accessor_hit);
+    if let Some(getter) = getter {
+        emit_getter_call(
+            a, layout, il, getter, recv, method, pc, l_unwind, slow, done,
+        );
+    }
     // x11 is the Object base; the helper wants the `Gc::as_ptr` form (the RefCell, at the
     // cell address), which sits `obj_from_cell` (the RefCell value offset) before it.
     a.sub_imm(9, 11, obj_off);
@@ -6387,6 +6404,269 @@ fn emit_prop_load_inline(
     regions::emit_property_event(a, 2);
     emit_op_helper(a, H_GET_PROP, pc, l_unwind);
     a.bind(done);
+}
+
+/// A property read's getter call through the direct sequence (see [`emit_getter_call`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+struct GetterCall {
+    /// The word naming the site's getter call cache (`Chunk::jit_getter_site_ptr`).
+    site: usize,
+    /// The getter frame's `FnFrame::call_site`: the read's implicit position, which the helper's
+    /// call publishes as well (`Chunk::jit_implicit_position`).
+    position: u32,
+    direct: DirectCallContext,
+}
+
+/// The getter call of the property read at `pc` through property cache `cache`, when its code
+/// calls getters directly: direct calls are on for the chunk (`fast` bit 20, which borrowed
+/// entries and detailed feedback clear), the cache has validated an accessor its probe reaches
+/// (an `IC_ACCESSOR` state of depth 3 or less), and the sequence's preconditions hold. Makes the
+/// site's getter call cache, which the read's helper fills (`Interp::accessor_validated_get`).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn getter_call(
+    chunk: &Chunk,
+    cache: u32,
+    pc: usize,
+    fast: u32,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    finish_stub: usize,
+) -> Option<GetterCall> {
+    use crate::bytecode::{IcState, IC_ACCESSOR, PROP_IC_WAYS};
+    if fast & (1 << 20) == 0 || !crate::bytecode::direct_shared_context_enabled() {
+        return None;
+    }
+    let ways = chunk.jit_cache_ptr(cache) as *const std::cell::Cell<IcState>;
+    // SAFETY: a site's PROP_IC_WAYS cells are consecutive in the chunk's cache vector.
+    let accessor = (0..PROP_IC_WAYS).any(|way| {
+        let depth = unsafe { (*ways.add(way)).get() }.depth;
+        (IC_ACCESSOR..=IC_ACCESSOR | 3).contains(&depth)
+    });
+    let direct = DirectCallContext {
+        attempted_off: chunk.jit_inline_attempted_off(),
+        runs_off: chunk.jit_runs_off(),
+        retry_off: chunk.jit_inline_retry_at_off(),
+        finish_stub,
+    };
+    let fits8 = |o: usize| o.is_multiple_of(8) && o / 8 < 4096;
+    (accessor
+        && fits8(layout.entry_accessor)
+        && fits8(crate::value::ACCESSOR_GET_WORD_OFF)
+        && direct_call_supported(
+            ilayout,
+            layout,
+            direct.attempted_off,
+            direct.runs_off,
+            direct.retry_off,
+            0,
+        ))
+    .then(|| GetterCall {
+        site: chunk.jit_getter_site_ptr(cache),
+        position: chunk.jit_implicit_position(pc),
+        direct,
+    })
+}
+
+/// The getter call of a property read (ECMA-262 GetValue; §10.1.8.1 OrdinaryGet step 8,
+/// Call(getter, Receiver)) through the direct sequence, at the template's validated accessor
+/// landing: x11 = the holder's Object base, x13 = the accessor's slot and x15 = its entry, as
+/// the probe proved them with nothing run since. The getter is the descriptor's live [[Get]],
+/// read from its accessor pair: no proof caches it, since replacing a getter makes a new pair
+/// and may keep the holder's shape. The site's getter call cache then finds it by identity, as
+/// a call site's finds its callee (way 0 in line, the rest in the chunk's `CallSecondary`
+/// stub), and the sequence runs it with argc 0 on [receiver, getter] pushed over the operands:
+/// `this` is the read's original receiver word, never the holder or the wrapper prototype the
+/// probe walked for a primitive. The two words end at most one word above the read's own
+/// result, in the temporary word the operand stack keeps above its deepest operation
+/// (`Cfg::jit_stack_capacity`). The result takes the receiver's place (a method read keeps the
+/// receiver under it) and the read polls as a call's end does. A throw places the error's
+/// pending frame at this operation, as the helper's `throw_at` does, then unwinds.
+///
+/// Every decline leaves the state as found: an empty cache, a missing way or an entry the
+/// sequence's first gates refuse (no compiled entry that fits a record: a getter that builds an
+/// environment, say) falls through with x11 and x13 intact for the validated accessor
+/// publication; a gate of the sequence itself pops the two words and branches to `slow`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_getter_call(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    getter: GetterCall,
+    recv: PropRecv,
+    method: bool,
+    pc: u32,
+    l_unwind: usize,
+    slow: usize,
+    done: usize,
+) {
+    // An entry without a compiled user-code entry whose frame fits a record (`CallIc::direct`
+    // bits 0 and 3; a getter that builds an environment, say) would fail the sequence's first
+    // gates on every read: it keeps the validated accessor path. A ready entry has both.
+    let entry_gates = |a: &mut asm::Asm, refuse: usize| {
+        let enter = a.new_label();
+        a.ldrb_imm(
+            16,
+            12,
+            std::mem::offset_of!(crate::bytecode::CallIc, direct) as u32,
+        );
+        let ready = crate::bytecode::CALL_IC_DIRECT_READY as u32;
+        for bit in [ready, 1, 8] {
+            a.logic_imm_w(0, 14, 16, asm::logical_imm_w(bit).unwrap());
+            if bit == ready {
+                a.cbnz(14, false, enter);
+            } else {
+                a.cbz(14, false, refuse);
+            }
+        }
+        a.bind(enter);
+    };
+    let publish = a.new_label();
+    let rest = a.new_label();
+    let rest_hit = a.new_label();
+    let rest_miss = a.new_label();
+    let hit = a.new_label();
+    // x12 = the site's getter call cache, its first way: 0 until a user getter is called here.
+    a.mov_imm64(12, getter.site as u64);
+    a.ldr_imm(12, 12, 0);
+    a.cbz(12, true, publish);
+    // x9 = the live getter's word, which the entry's accessor pair (the pointer bits of its
+    // `meta` word, whose low byte holds the flags; none when the accessor never had a function)
+    // holds: Undefined's for an absent [[Get]].
+    a.ldr_imm(9, 15, layout.entry_accessor as u32);
+    a.lsr_imm(9, 9, 4);
+    a.cbz(9, true, publish);
+    a.lsl_imm(9, 9, 4);
+    a.ldr_imm(9, 9, crate::value::ACCESSOR_GET_WORD_OFF as u32);
+    // The call probe's inputs: x10 = the word EOR the Object tag (the identity the ways record,
+    // which no other kind of word matches), w15 = the live epoch, x17 = the active Realm's global
+    // scope. Way 0 compares in line through x16, keeping x11 and x13. No way holds the exhausted
+    // epoch, which fills refuse, so the compare needs no guard of its own (Decision 12).
+    a.mov_imm64(16, crate::value::PACK_OBJ);
+    a.logic_x(2, 10, 9, 16);
+    a.ldr_imm(16, 19, CALL_IC_EPOCH_OFF);
+    a.ldr_w_imm(15, 16, 0);
+    a.ldr_imm(17, 19, 64); // ctx.genv
+    a.ldur(16, 12, 0); // way 0's callee
+    a.cmp_reg_x(10, 16);
+    a.b_cond(C_NE, rest);
+    a.ldr_w_imm(16, 12, 56); // epoch
+    a.cmp_reg_w(16, 15);
+    a.b_cond(C_NE, rest);
+    a.ldr_imm(16, 12, 32); // global_env
+    a.cmp_reg_x(16, 17);
+    a.b_cond(C_NE, rest);
+    a.movz(15, 0, 0);
+    entry_gates(a, publish);
+    // ---- hit (x9 = the getter's word, x10, x12 and x15 as the call template's): push
+    // [receiver, getter]; the sequence pops both and pushes the result ----
+    a.bind(hit);
+    let pushed = match recv {
+        PropRecv::Stack if !method => {
+            a.str_imm(9, 20, 0);
+            a.add_imm(20, 20, 8);
+            8
+        }
+        _ => {
+            match recv {
+                PropRecv::Stack => a.ldur(16, 20, -8),
+                PropRecv::This => a.ldr_imm(16, 19, 48), // ctx.this_word
+                PropRecv::Slot(off) => emit_exec_word_load(a, 16, 22, off as i32),
+            }
+            a.stp_base(16, 9, 20, 0);
+            a.add_imm(20, 20, 16);
+            16
+        }
+    };
+    let declined = a.new_label();
+    let returned = a.new_label();
+    let threw = a.new_label();
+    let direct = getter.direct;
+    if use_shared_stub(a) {
+        let stub = a.shared_stub(
+            SharedStub::DirectCall {
+                argc: 0,
+                with_this: true,
+            }
+            .key(),
+        );
+        a.bl_label(stub);
+        let not_returned = a.new_label();
+        const _: () = assert!(DIRECT_CALL_RETURNED == 0);
+        a.cbnz(8, false, not_returned);
+        a.b(returned);
+        // Never executed: the stub reads the getter frame's position here (see
+        // `DirectCallSite::AfterReturn`).
+        a.word(getter.position);
+        a.bind(not_returned);
+        a.cmp_imm_w(8, DIRECT_CALL_THREW);
+        a.b_cond(C_EQ, threw);
+    } else {
+        let emitted = emit_direct_call(
+            a,
+            ilayout,
+            layout,
+            direct.attempted_off,
+            direct.runs_off,
+            direct.retry_off,
+            0,
+            true,
+            declined,
+            threw,
+            returned,
+            direct.finish_stub,
+            DirectCallSite::Position(getter.position),
+        );
+        debug_assert!(
+            emitted,
+            "`getter_call` checked the sequence's preconditions"
+        );
+    }
+    // ---- a gate of the sequence declined, before anything ran ----
+    a.bind(declined);
+    a.sub_imm(20, 20, pushed);
+    a.b(slow);
+    // ---- the getter returned: its result replaced the two words ----
+    a.bind(returned);
+    emit_helper_end_poll(a, l_unwind);
+    a.b(done);
+    // ---- the getter threw: the sequence popped the two words, the error is in the context ----
+    a.bind(threw);
+    a.mov(0, 19);
+    a.movz(1, pc, 0);
+    a.mov_imm64(16, crate::bytecode::jit_getter_threw as *const () as u64);
+    a.blr(16);
+    a.b(l_unwind);
+    // ---- the probe after way 0; x4 and x5 keep the holder and slot across it ----
+    a.bind(rest);
+    a.mov(4, 11);
+    a.mov(5, 13);
+    if shared_stubs_enabled() {
+        let stub = a.shared_stub(SharedStub::CallSecondary.key());
+        a.bl_label(stub);
+        a.cbz(9, false, rest_miss);
+    } else {
+        emit_call_ways(a, layout, ilayout, rest_hit, rest_miss);
+    }
+    a.bind(rest_hit);
+    entry_gates(a, rest_miss);
+    a.mov_imm64(16, crate::value::PACK_OBJ); // the probe used x9: the getter's word again
+    a.logic_x(2, 9, 10, 16);
+    a.b(hit);
+    a.bind(rest_miss);
+    a.mov(11, 4);
+    a.mov(13, 5);
+    a.bind(publish);
 }
 
 /// Method read `receiver[key]` for a Number key (ECMA-262 EvaluatePropertyAccessWithExpressionKey,

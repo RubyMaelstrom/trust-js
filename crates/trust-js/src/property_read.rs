@@ -185,6 +185,9 @@ impl Interp {
         slot: u32,
         name: &str,
         receiver: &Value,
+        // The read's chunk and property cache: when the site's machine code calls getters
+        // directly, a user getter's call here fills the site's getter call cache.
+        site: Option<(&crate::bytecode::Chunk, u32)>,
     ) -> Option<Result<Value, Abrupt>> {
         let holder_ref = unsafe { &*(holder as *const std::cell::RefCell<crate::value::Object>) };
         let getter = {
@@ -210,7 +213,46 @@ impl Interp {
         if let Some(result) = self.try_record_getter(&getter, receiver) {
             return Some(result);
         }
+        if let Some((calls, pins)) =
+            site.and_then(|(chunk, cache)| chunk.getter_calls(cache, &getter))
+        {
+            return Some(self.call_getter(getter, receiver, calls, pins));
+        }
         Some(self.call_callback(getter, *receiver, &[]))
+    }
+
+    /// Call(getter, Receiver), ECMA-262 §10.1.8.1 OrdinaryGet step 8, at a read site whose
+    /// machine code calls getters through the direct sequence: as [`Interp::call_callback`],
+    /// through the site's own call cache, which a compiled getter's call fills for the
+    /// sequence's probe (see `jit::emit_getter_call`).
+    fn call_getter(
+        &mut self,
+        getter: Value,
+        receiver: &Value,
+        calls: &crate::bytecode::CallSite,
+        pins: &crate::bytecode::CalleePins,
+    ) -> Result<Value, Abrupt> {
+        if self.tier != crate::bytecode::Tier::Jit {
+            return self.call(getter, *receiver, &[]);
+        }
+        let this_word = *receiver;
+        let no_arguments: [Value; 0] = [];
+        // SAFETY: the receiver word and the empty argument window stay on this native frame,
+        // which the conservative scan roots, through the whole call, its polls and tail drain
+        // (as `CallbackCache::call_values` lends them).
+        let result = unsafe {
+            self.call_jit_cached(calls, &getter, &this_word, no_arguments.as_ptr(), 0)
+                .or_else(|| {
+                    self.call_jit_fast(
+                        &getter,
+                        &this_word,
+                        no_arguments.as_ptr(),
+                        0,
+                        Some((calls, pins)),
+                    )
+                })
+        };
+        result.unwrap_or_else(|| self.call(getter, *receiver, &[]))
     }
 
     /// A getter whose entire body is `return <identifier>` — the export accessors module
