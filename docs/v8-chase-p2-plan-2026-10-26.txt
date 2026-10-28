@@ -2194,6 +2194,36 @@ and zombie's x86-64 lib suite and clippy. Not covered: in-line stubs
 (`TRUST_JS_JIT_INLINE_STUBS`) and chunks without direct calls (loop fragments, detailed
 feedback). Setters remain designed but not done.
 
+Then the safepoint poll in V8's shape (d4c51376..d14387e3, 2026-10-28, an agent's; Decisions 11,
+18 and 19; item 1c's one entry check):
+- d4c51376: each interpreter has a poll word, an atomic other threads write: one bit the heap's
+  (a collection due, the live-object ceiling included), one for host interrupts. A
+  `RuntimeInterrupt` handle keeps weak references to the words it controls and writes each bit
+  under its lock from the state at that moment, so a request racing a clear is never lost. One
+  watchdog thread expires armed deadlines (Decision 18): the first deadline starts it, it serves
+  those that follow and exits after 5 s with none armed; a burst's arm and clear costs 462 ns,
+  where a thread per deadline measured 36-90 us. The Rust-side polls read the word too.
+- ed9f6be9: every native safepoint loads the word and branches: the entry, loop and helper-end
+  polls on ARM64 (12 instructions to 3) and x86-64 (10 to 3); the helper-free region guard tests
+  the interrupt bit alone, and numeric loops keep their countdown. The allocator compares the
+  live count with the ceiling as it counts (3 instructions an object allocation) and sets the
+  heap's bit out of line.
+- d14387e3: ShadowRealm code is interruptible by the host (Decision 19): its interpreter shares
+  its creator's handle, and an interruption passes `evaluate` and wrapped functions in both
+  directions, as V8's evaluate returns while execution terminates
+  (builtins/builtins-shadow-realm.cc:182-186); ordinary throws still become TypeErrors.
+
+Per iteration against 20d78544 on ARM64: calls 18 fewer (direct 267, method 364, closure 304;
+recursion 300 a call), a polled loop's iteration 9-27 fewer, an allocation 3-16 fewer. Fixtures:
+Vue -0.34%, React -1.66%, Djot -0.55%, chai -0.22%, with the same collections. x86-64 (zombie):
+calls 14 fewer, polls 7; Vue -0.09% (within its run-to-run spread there), React -0.36%, Djot
++0.04%, chai -0.00%. Validation: the ARM64 gate (the lib suite, pacing with its known failure
+only, GC stress on the poll, interrupt, ShadowRealm-interrupt, agent-activation and agent-control
+tests, the fixtures and difftest as the base's, Test262 53,575 of 53,575, identical; the dumps
+differ by the polls only) and zombie's x86-64 lib suite and clippy. Found on the way: the
+linked-scan region (`plan_linked_scan`) does not fire on main, even for its own test's loop,
+which a general region takes instead.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
