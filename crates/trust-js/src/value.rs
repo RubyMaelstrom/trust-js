@@ -5430,11 +5430,41 @@ pub struct Property {
 
 /// The getter/setter pair of an accessor property: an immutable payload cell (16-byte aligned,
 /// as every cell is, which leaves `meta`'s flag bits free). Its edges are its two functions.
-#[repr(align(16))]
+/// `repr(C)`, so that generated code can read the getter's word.
+#[repr(C, align(16))]
 #[derive(Clone, Default)]
 pub(crate) struct Accessors {
-    pub get: Option<Value>,
-    pub set: Option<Value>,
+    get: AccessorFn,
+    set: AccessorFn,
+}
+
+/// One function of an accessor pair, its [[Get]] or [[Set]], or none (`present` 0, for
+/// undefined). An absent function's word is Undefined's: no function's identity matches it, so
+/// generated code compares the word with a cached callee's without reading `present`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AccessorFn {
+    present: u64,
+    word: Value,
+}
+
+impl AccessorFn {
+    fn new(function: Option<Value>) -> AccessorFn {
+        AccessorFn {
+            present: function.is_some().into(),
+            word: function.unwrap_or(Value::Undefined),
+        }
+    }
+
+    fn get(&self) -> Option<&Value> {
+        (self.present != 0).then_some(&self.word)
+    }
+}
+
+impl Default for AccessorFn {
+    fn default() -> Self {
+        AccessorFn::new(None)
+    }
 }
 
 impl crate::gc_box::Payload for Accessors {
@@ -5446,10 +5476,10 @@ impl crate::gc_box::Payload for Accessors {
 impl crate::gc_trace::GcTrace for Accessors {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Accessors { get, set } = self;
-        if let Some(get) = get {
+        if let Some(get) = get.get() {
             sink.value(get);
         }
-        if let Some(set) = set {
+        if let Some(set) = set.get() {
             sink.value(set);
         }
     }
@@ -5465,7 +5495,10 @@ fn trace_accessor_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
 
 /// A new accessor-pair cell in the active heap, as `meta`'s pointer bits.
 fn accessor_cell(get: Option<Value>, set: Option<Value>) -> usize {
-    let pair = crate::gc_box::new(Accessors { get, set });
+    let pair = crate::gc_box::new(Accessors {
+        get: AccessorFn::new(get),
+        set: AccessorFn::new(set),
+    });
     let ptr = crate::gc_box::GcBox::as_ptr(&pair) as usize;
     debug_assert_eq!(ptr & PROP_FLAG_MASK, 0);
     ptr
@@ -5702,17 +5735,17 @@ impl Property {
     }
     #[inline]
     pub(crate) fn getter(&self) -> Option<&Value> {
-        self.accessors().and_then(|a| a.get.as_ref())
+        self.accessors().and_then(|a| a.get.get())
     }
     #[inline]
     pub(crate) fn setter(&self) -> Option<&Value> {
-        self.accessors().and_then(|a| a.set.as_ref())
+        self.accessors().and_then(|a| a.set.get())
     }
     /// Replace the getter. The pair is immutable, so this makes a new one (with the setter), or
     /// none when there is no pair and no getter.
     pub(crate) fn set_getter(&mut self, g: Option<Value>) {
         if g.is_some() || self.accessors().is_some() {
-            let set = self.accessors().and_then(|a| a.set);
+            let set = self.setter().copied();
             let flags = self.meta & PROP_FLAG_MASK;
             self.meta = accessor_cell(g, set) | flags;
         }
@@ -5720,7 +5753,7 @@ impl Property {
     /// Replace the setter, as [`Property::set_getter`] does the getter.
     pub(crate) fn set_setter(&mut self, s: Option<Value>) {
         if s.is_some() || self.accessors().is_some() {
-            let get = self.accessors().and_then(|a| a.get);
+            let get = self.getter().copied();
             let flags = self.meta & PROP_FLAG_MASK;
             self.meta = accessor_cell(get, s) | flags;
         }
