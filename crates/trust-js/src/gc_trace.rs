@@ -359,6 +359,22 @@ pub(crate) fn enter_jit_frame(roots: JitFrameRoots) -> JitFrameGuard {
     JitFrameGuard
 }
 
+/// The code each Rust entry's JIT activation registered on this thread runs (contexts built
+/// outside the frame pool; see `crate::jit::running_code`).
+pub(crate) fn jit_frame_code() -> Vec<usize> {
+    JIT_FRAMES.with(|frames| {
+        frames
+            .borrow()
+            .iter()
+            .filter_map(|frame| {
+                // SAFETY: a registered context outlives its registration (its guard).
+                let base = unsafe { (*frame.ctx).code_base };
+                (!base.is_null()).then_some(base as usize)
+            })
+            .collect()
+    })
+}
+
 /// The contexts of the Rust entries' JIT activations registered on this thread (tests).
 #[cfg(test)]
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]

@@ -1417,6 +1417,7 @@ impl Drop for FramePool {
     fn drop(&mut self) {
         for p in self.pool.drain(..) {
             self.records.remove(&p);
+            crate::jit::note_record(p, false);
             // SAFETY: pooled records come from `JitFrame::alloc` and are not executing.
             drop(unsafe { Box::from_raw(p.as_ptr()) });
         }
@@ -1427,11 +1428,13 @@ impl FramePool {
     /// Note a record [`crate::jit::JitFrame::alloc`] just created for this interpreter.
     pub(crate) fn register(&mut self, record: std::ptr::NonNull<crate::jit::JitFrame>) {
         self.records.insert(record);
+        crate::jit::note_record(record, true);
     }
 
     /// Forget a record about to be freed.
     pub(crate) fn unregister(&mut self, record: std::ptr::NonNull<crate::jit::JitFrame>) {
         self.records.remove(&record);
+        crate::jit::note_record(record, false);
     }
 
     /// How many records are registered, pooled or active (tests).

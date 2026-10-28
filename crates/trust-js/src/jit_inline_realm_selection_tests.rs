@@ -97,8 +97,8 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
             ));
         });
         i.tier = tier;
-        primary_code.residency.referenced.set(0);
-        inline_code.residency.referenced.set(0);
+        primary_code.referenced.set(0);
+        inline_code.referenced.set(0);
         assert_eq!(
             in_realm(i, &child, |i| eval_string(
                 i,
@@ -107,15 +107,15 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
             "9:8:8|1"
         );
         assert_eq!(
-            inline_code.residency.referenced.get(),
+            inline_code.referenced.get(),
             0,
             "no guaranteed-missing inline entry"
         );
         if tier == Tier::Jit {
-            assert_eq!(primary_code.residency.referenced.get(), 1);
+            assert_ne!(primary_code.referenced.get(), 0);
         }
-        primary_code.residency.referenced.set(0);
-        inline_code.residency.referenced.set(0);
+        primary_code.referenced.set(0);
+        inline_code.referenced.set(0);
         assert_eq!(
             in_realm(i, &child, |i| eval_string(
                 i,
@@ -124,12 +124,12 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
             "9:8:8|1"
         );
         assert_eq!(
-            primary_code.residency.referenced.get(),
+            primary_code.referenced.get(),
             0,
             "callee's Realm governs cross-Realm invocation selection"
         );
         if tier == Tier::Jit {
-            assert_eq!(inline_code.residency.referenced.get(), 1);
+            assert_ne!(inline_code.referenced.get(), 0);
         }
         assert!(Rc::ptr_eq(
             function
@@ -139,8 +139,8 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
                 .unwrap(),
             &inlined
         ));
-        assert_eq!(primary_code.residency.active.get(), 0);
-        assert_eq!(inline_code.residency.active.get(), 0);
+        assert_eq!(primary_code.test_residency_marks(false).0, 0);
+        assert_eq!(inline_code.test_residency_marks(false).0, 0);
         assert_eq!(i.depth, 0);
         assert!(i.fn_frames.is_empty());
         i.gc_collect();
@@ -170,7 +170,7 @@ fn second_stage_without_realm_dependent_inlines_remains_selected_in_other_realms
     assert_eq!(eval_string(i, "subject(5)"), "6");
     let code = secondary.jit.get().flatten().expect("native second stage");
     let child = i.create_realm();
-    code.residency.referenced.set(0);
+    code.referenced.set(0);
     in_realm(i, &child, |i| {
         run(i, snapshot);
         let genv = crate::interpreter::Env::as_ptr(&i.global_env) as usize;
@@ -185,12 +185,12 @@ fn second_stage_without_realm_dependent_inlines_remains_selected_in_other_realms
         ));
         assert_eq!(eval_string(i, "subject(5)"), "6");
     });
-    assert_eq!(
-        code.residency.referenced.get(),
-        1,
+    assert_ne!(
+        code.referenced.get(),
+        0,
         "unrestricted native body remains available"
     );
-    assert_eq!(code.residency.active.get(), 0);
+    assert_eq!(code.test_residency_marks(false).0, 0);
     i.gc_collect();
 }
 

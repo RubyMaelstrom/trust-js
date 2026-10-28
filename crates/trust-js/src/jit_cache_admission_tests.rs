@@ -307,10 +307,7 @@ fn code(referenced: bool) -> Rc<JitCode> {
         entry_kind: super::super::NativeEntryKind::FreshFrame,
         osr_entry_depths: Vec::new(),
         executable,
-        residency: Box::new(CodeResidency {
-            active: Cell::new(0),
-            referenced: Cell::new(u8::from(referenced)),
-        }),
+        referenced: Cell::new(u64::from(referenced)),
     })
 }
 
@@ -342,7 +339,8 @@ fn metadata_victims_respect_active_marks_owned_leases_and_existing_cooldowns() {
         NativeCodeSlot::new().begin_compile().is_none(),
         "owned lease refuses eviction"
     );
-    lease.residency.active.set(1);
+    // A running activation (a direct call's record) holds no lease.
+    super::super::TEST_RUNNING_CODE.with(|running| running.borrow_mut().insert(lease.mem as usize));
     drop(lease);
     // Remove only shared retry delay to independently exercise protection.
     REGISTRY.with(|registry| registry.borrow_mut().metadata_retry = 0);
@@ -350,7 +348,10 @@ fn metadata_victims_respect_active_marks_owned_leases_and_existing_cooldowns() {
         NativeCodeSlot::new().begin_compile().is_none(),
         "native active frame refuses eviction"
     );
-    slot.get().flatten().unwrap().residency.active.set(0);
+    let lease = slot.get().flatten().unwrap();
+    super::super::TEST_RUNNING_CODE
+        .with(|running| running.borrow_mut().remove(&(lease.mem as usize)));
+    drop(lease);
     REGISTRY.with(|registry| registry.borrow_mut().metadata_retry = 0);
     let replacement = NativeCodeSlot::new();
     let pending = replacement
@@ -381,7 +382,7 @@ fn clock_keeps_recent_code_while_evicting_an_unreferenced_peer() {
     let cold = NativeCodeSlot::new();
     recent.begin_compile().unwrap().commit(Some(code(true)));
     cold.begin_compile().unwrap().commit(Some(code(true)));
-    cold.get().flatten().unwrap().residency.referenced.set(0);
+    cold.get().flatten().unwrap().referenced.set(0);
     REGISTRY.with(|registry| registry.borrow_mut().cursor = 0);
     reclaim(1);
     assert!(

@@ -48,14 +48,18 @@ fn inactive_code_reclaims_but_rust_leases_and_native_marks_do_not() {
         c.jit.get().flatten().is_some(),
         "owned Rust lease protects code"
     );
-    lease.residency.active.set(1);
+    // A live activation record running the code (as a direct call's does, holding no lease)
+    // protects it.
+    let record = crate::jit::JitFrame::alloc(&mut e.interp);
+    unsafe { (*record.as_ptr()).ctx.code_base = lease.mem };
     drop(lease);
     cache::reclaim(usize::MAX);
     assert!(
         c.jit.get().flatten().is_some(),
         "native return PC protects code"
     );
-    c.jit.get().flatten().unwrap().residency.active.set(0);
+    // SAFETY: the record came from this interpreter's pool and runs nothing.
+    unsafe { crate::jit::JitFrame::release(&mut e.interp, record) };
     let before = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
     cache::reclaim(usize::MAX);
     assert!(
@@ -89,12 +93,12 @@ fn reclaim_from_native(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, V
             .flatten()
             .expect("active function stays resident");
         assert!(
-            code.residency.active.get() > 0,
+            code.test_residency_marks(false).0 > 0,
             "actual native entry for {name}"
         );
     }
     // No test Rc leases are held here. In particular a direct callee is protected
-    // by its emitted entry mark, not by an accidental test-owned strong handle.
+    // by its activation record, not by an accidental test-owned strong handle.
     cache::reclaim(usize::MAX);
     i.gc_collect();
     Ok(Value::Undefined)
@@ -173,9 +177,8 @@ fn direct_return_and_throw_survive_reentrant_reclamation() {
                 .get()
                 .flatten()
                 .unwrap()
-                .residency
-                .active
-                .get(),
+                .test_residency_marks(false)
+                .0,
             0
         );
     }
@@ -209,7 +212,7 @@ fn suspended_continuation_resumes_after_its_mapping_is_reclaimed() {
     );
     let c = chunk(&mut e.interp, "suspended");
     let code = c.jit.get().flatten().expect("first slice native");
-    assert_eq!(code.residency.active.get(), 0);
+    assert_eq!(code.test_residency_marks(false).0, 0);
     let weak = Rc::downgrade(&code);
     drop(code);
     cache::reclaim(usize::MAX);
@@ -255,7 +258,7 @@ fn pending_await_reclaims_code_without_losing_rejection_or_finally_state() {
         .get()
         .flatten()
         .expect("awaiting body entered native code");
-    assert_eq!(code.residency.active.get(), 0);
+    assert_eq!(code.test_residency_marks(false).0, 0);
     let weak = Rc::downgrade(&code);
     drop(code);
     cache::reclaim(usize::MAX);
@@ -435,8 +438,8 @@ fn retained_callers_reject_evicted_call_and_constructor_addresses() {
     );
     assert!(sum.jit.get().flatten().is_some());
     assert!(constructor.jit.get().flatten().is_some());
-    assert_eq!(caller_lease.residency.active.get(), 0);
-    assert_eq!(constructor_lease.residency.active.get(), 0);
+    assert_eq!(caller_lease.test_residency_marks(false).0, 0);
+    assert_eq!(constructor_lease.test_residency_marks(false).0, 0);
 }
 
 #[test]
@@ -480,7 +483,7 @@ fn recompiled_functions_keep_their_original_realm() {
         ),
         "true"
     );
-    assert_eq!(lease.residency.active.get(), 0);
+    assert_eq!(lease.test_residency_marks(false).0, 0);
 }
 
 /// Code owners' deaths and the cache states they leave, observed through collections with

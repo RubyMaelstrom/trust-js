@@ -1,9 +1,9 @@
 //! Bounded, thread-owned native-code residency. ECMAScript execution contexts
 //! (ECMA-262 §9.4) and resumptions remain canonical VM state, not code-cache state.
 //!
-//! A resident slot owns code; Rust dispatch owns a temporary Rc lease; generated
-//! entry/exit marks protect direct-call frames, including suspended return PCs.
-//! Reclamation never changes a live activation or calls into author code.
+//! A resident slot owns code; Rust dispatch owns a temporary Rc lease; the activation records
+//! of direct calls name the code they run (`super::running_code`), which protects them, including
+//! suspended return PCs. Reclamation never changes a live activation or calls into author code.
 
 use super::JitCode;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -20,15 +20,6 @@ const MAX_RESIDENT_ENTRIES: usize = 131_072;
 const MAX_CLOCK_VISITS: usize = 4096;
 const COLD_MAINTENANCE_STEPS: usize = 8;
 const NO_REGISTRATION: u32 = u32::MAX;
-
-/// Stable allocation embedded by address in each native prologue/epilogue.
-/// Native recursion is already bounded by the engine's checked stack limit.
-#[repr(C)]
-#[derive(Default)]
-pub(super) struct CodeResidency {
-    pub active: Cell<u64>,
-    pub referenced: Cell<u8>,
-}
 
 #[derive(Default)]
 enum CodeState {
@@ -146,7 +137,7 @@ impl CompilePermit {
         let state = self.state.take().expect("live compilation permit");
         debug_assert!(matches!(*state.code.borrow(), CodeState::Pending));
         if let Some(code) = code {
-            code.residency.referenced.set(1);
+            code.referenced.set(1);
             *state.code.borrow_mut() = CodeState::Resident(code);
             REGISTRY.with(|registry| registry.borrow_mut().pending -= 1);
         } else {
@@ -286,6 +277,9 @@ impl Registry {
 
     fn collect(&mut self, goal: Goal, max_steps: usize, retired: &mut Retirement) {
         let mut bytes = 0usize;
+        // The code running in direct calls' activation records, read once a pass and only when a
+        // candidate needs it (no record changes while the pass runs: it calls no generated code).
+        let mut running: Option<crate::fasthash::FastSet<usize>> = None;
         for _ in 0..max_steps {
             if self.len() == 0
                 || match goal {
@@ -326,8 +320,10 @@ impl Registry {
                 CodeState::Cold | CodeState::Unavailable => true,
                 CodeState::Resident(code) => {
                     if Rc::strong_count(code) != 1
-                        || code.residency.active.get() != 0
-                        || code.residency.referenced.replace(0) != 0
+                        || running
+                            .get_or_insert_with(super::running_code)
+                            .contains(&(code.mem as usize))
+                        || code.referenced.replace(0) != 0
                     {
                         false
                     } else {

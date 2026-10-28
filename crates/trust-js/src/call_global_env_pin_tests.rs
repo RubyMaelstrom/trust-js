@@ -199,11 +199,11 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
                 });
             }
         }
-        code.residency.referenced.set(0);
+        code.referenced.set(0);
         assert_eq!(eval_string(i, "subject(mainNative) === mainRealm"), "true");
-        assert_eq!(
-            code.residency.referenced.get(),
-            1,
+        assert_ne!(
+            code.referenced.get(),
+            0,
             "actual cached caller body executes"
         );
     });

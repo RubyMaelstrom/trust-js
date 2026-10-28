@@ -118,7 +118,7 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
         eval(&mut engine, "subject(5);");
         assert!(SAW_REAL_LEAF_FRAME.with(std::cell::Cell::get));
         if let Some(code) = &callee_code {
-            code.residency.referenced.set(0);
+            code.referenced.set(0);
         }
         assert!(user.func.runtime().code2.set(Some(chunk.clone())).is_ok());
         engine.set_tier(tier);
@@ -135,13 +135,9 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
                 .flatten()
                 .expect("actual template native entry");
             assert!(!code.pc_offsets.is_empty(), "default template backend");
-            assert_eq!(code.residency.referenced.get(), 1);
-            assert_eq!(code.residency.active.get(), 0);
-            assert_eq!(
-                callee_code.unwrap().residency.referenced.get(),
-                0,
-                "real inline hit"
-            );
+            assert_ne!(code.referenced.get(), 0);
+            assert_eq!(code.test_residency_marks(false).0, 0);
+            assert_eq!(callee_code.unwrap().referenced.get(), 0, "real inline hit");
         }
         assert!(
             !SAW_REAL_LEAF_FRAME.with(std::cell::Cell::get),
@@ -217,10 +213,10 @@ fn prepared_native_hot_calls_publish_and_execute_baseline_inline_bodies() {
         .flatten()
         .expect("published body actually executed");
     assert!(!code.pc_offsets.is_empty());
-    code.residency.referenced.set(0);
+    code.referenced.set(0);
     assert_eq!(eval(&mut engine, "subject(5)"), "17");
-    assert_eq!(code.residency.referenced.get(), 1);
-    assert_eq!(code.residency.active.get(), 0);
+    assert_ne!(code.referenced.get(), 0);
+    assert_eq!(code.test_residency_marks(false).0, 0);
     assert_eq!(engine.interp.depth, 0);
     assert!(engine.interp.fn_frames.is_empty());
     engine.interp.gc_collect();

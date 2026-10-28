@@ -1672,17 +1672,18 @@ pub struct JitCode {
     /// stable prefix of this struct by offset.
     #[allow(dead_code)]
     executable: ExecutableBuffer,
-    /// Stable native-entry counter and CLOCK reference bit. The code embeds its
-    /// address; keep the allocation alive until after the mapping is unmapped.
-    residency: Box<cache::CodeResidency>,
+    /// The code cache's CLOCK reference word: nonzero once the code was entered since the
+    /// cache's last visit. A direct call writes its site's call-cache address through
+    /// `CallIc::code` (any nonzero word); a Rust entry writes 1. Running code is found by its
+    /// activation records instead (see [`running_code`]).
+    pub(crate) referenced: Cell<u64>,
 }
 
 impl Drop for JitCode {
     fn drop(&mut self) {
-        debug_assert_eq!(
-            self.residency.active.get(),
-            0,
-            "active native mapping dropped"
+        debug_assert!(
+            !running_code().contains(&(self.mem as usize)),
+            "running native mapping dropped"
         );
         // Unload profiler symbols before the executable mapping is released.
         profiler::unregister(self.mem);
@@ -1690,19 +1691,23 @@ impl Drop for JitCode {
 }
 
 impl JitCode {
+    /// (whether an activation record runs this code, whether it was entered since the last
+    /// reset) for tests.
     #[cfg(test)]
     pub(crate) fn test_residency_marks(&self, reset_reference: bool) -> (u64, u8) {
         if reset_reference {
-            self.residency.referenced.set(0);
+            self.referenced.set(0);
         }
-        (self.residency.active.get(), self.residency.referenced.get())
+        (
+            u64::from(running_code().contains(&(self.mem as usize))),
+            u8::from(self.referenced.get() != 0),
+        )
     }
 
     /// Heap-requested metadata only. The executable mapping is intentionally excluded and remains
     /// visible through the independent generated-code byte metric.
     pub(crate) fn retained_heap_metadata_bytes(&self) -> usize {
         std::mem::size_of::<JitCode>()
-            .saturating_add(std::mem::size_of::<cache::CodeResidency>())
             .saturating_add(
                 self.pc_offsets
                     .capacity()
@@ -1834,6 +1839,11 @@ pub struct JitCtx {
 /// `LDR` immediate).
 const STRICT_FLAG_OFF: u32 = std::mem::offset_of!(JitCtx, strict_flag) as u32;
 const _: () = assert!(STRICT_FLAG_OFF.is_multiple_of(8) && STRICT_FLAG_OFF / 8 < 4096);
+
+/// Byte offset of [`JitCode::referenced`] (an 8-byte `STR` immediate in the direct call).
+const JIT_CODE_REFERENCED_OFF: u32 = std::mem::offset_of!(JitCode, referenced) as u32;
+const _: () =
+    assert!(JIT_CODE_REFERENCED_OFF.is_multiple_of(8) && JIT_CODE_REFERENCED_OFF / 8 < 4096);
 
 /// Byte offset of [`JitCtx::call_ic_epoch`] (an 8-byte `LDR` immediate in the call template).
 const CALL_IC_EPOCH_OFF: u32 = std::mem::offset_of!(JitCtx, call_ic_epoch) as u32;
@@ -4015,8 +4025,6 @@ fn compile_entry(
     let direct_on = fast & (1 << 20) != 0 && crate::bytecode::direct_shared_context_enabled();
     let mut a = asm::Asm::new();
     a.set_stubs_ok(true);
-    let residency = Box::<cache::CodeResidency>::default();
-    let residency_ptr = &*residency as *const cache::CodeResidency as u64;
     // One label per bytecode pc (branch/catch targets bind as we emit).
     let pc_labels: Vec<usize> = (0..ops.len()).map(|_| a.new_label()).collect();
     for pc in 0..ops.len() {
@@ -4054,10 +4062,6 @@ fn compile_entry(
     a.ldr_imm(21, 19, 0); // helpers table
     a.ldr_imm(20, 19, if borrowed_entry { 16 } else { 8 }); // live top or empty stack
     a.ldr_imm(22, 19, 24); // local slots base
-
-    // Protect this mapping even when a direct callee re-enters compilation.
-    // No helper can run before this mark or after its matching epilogue release.
-    emit_residency_mark(&mut a, residency_ptr, true);
 
     // ECMA-262 Strict Mode Code / PutValue: semantic helpers must see THIS body's lexical
     // mode, including cached calls and direct shared-context calls. Save on the native frame,
@@ -4874,7 +4878,6 @@ fn compile_entry(
     a.ldr_imm(16, 19, STRICT_FLAG_OFF);
     a.ldrb_imm(9, 31, STRICT_SAVE);
     a.strb_imm(9, 16, 0);
-    emit_residency_mark(&mut a, residency_ptr, false);
     a.movz(0, 1, 0);
     let l_drestore_ok = a.new_label();
     a.bind(l_drestore_ok);
@@ -4891,7 +4894,6 @@ fn compile_entry(
     a.ldr_imm(16, 19, STRICT_FLAG_OFF);
     a.ldrb_imm(9, 31, STRICT_SAVE);
     a.strb_imm(9, 16, 0);
-    emit_residency_mark(&mut a, residency_ptr, false);
     a.movz(0, 0, 0);
     let l_drestore_throw = a.new_label();
     a.bind(l_drestore_throw);
@@ -5056,32 +5058,8 @@ fn compile_entry(
             pc_offsets,
             max_stack,
             executable,
-            residency,
+            referenced: Cell::new(0),
         })
-    }
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_residency_mark(a: &mut asm::Asm, residency: u64, enter: bool) {
-    const _: () = assert!(std::mem::offset_of!(cache::CodeResidency, active) == 0);
-    a.mov_imm64(9, residency);
-    a.ldr_imm(10, 9, 0);
-    if enter {
-        a.add_imm(10, 10, 1);
-    } else {
-        a.sub_imm(10, 10, 1);
-    }
-    a.str_imm(10, 9, 0);
-    if enter {
-        a.movz(10, 1, 0);
-        a.strb_imm(
-            10,
-            9,
-            std::mem::offset_of!(cache::CodeResidency, referenced) as u32,
-        );
     }
 }
 
@@ -7830,8 +7808,10 @@ fn emit_direct_call(
     const IC_NSLOTS: u32 = 44;
     const IC_DIRECT: i32 = 46;
     const IC_CHUNK_RAW: i32 = 64;
+    const IC_CODE: i32 = 24;
     const IC_CODE_MEM: i32 = 72;
     const IC_PC_OFFS: i32 = 80;
+    const _: () = assert!(offset_of!(crate::bytecode::CallIc, code) == IC_CODE as usize);
     // The install moves these pairs with one LDP/STP each.
     const _: () = assert!(IC_PC_OFFS == IC_CODE_MEM + 8);
     const _: () = assert!(offset_of!(JitCtx, n_slots) == offset_of!(JitCtx, chunk) + 8);
@@ -7926,6 +7906,10 @@ fn emit_direct_call(
         a.add_imm(5, 5, 1);
         a.str_imm(5, 4, 0);
     }
+    // The callee's code is entered: its CLOCK reference word takes this site's call-cache address,
+    // a nonzero word (`JitCode::referenced`).
+    a.ldur(4, 12, IC_CODE);
+    a.str_imm(12, 4, JIT_CODE_REFERENCED_OFF);
     a.add_imm(11, 11, 1);
     a.str_w_imm(11, 14, il.depth as u32); // depth++ (u32 field)
                                           // FnFrame push: entry = ptr + len*24
@@ -8799,6 +8783,8 @@ fn emit_direct_finish_stub(
         a.b_cond(C_HS, slow);
         // ---- commit (no call or write since the checks: x14, x16 and x7 are still current) ----
         emit_handler_clear(a, 10, handlers_len_off);
+        // The record returns to the pool running no code (see `running_code`).
+        a.str_imm(31, 10, std::mem::offset_of!(JitCtx, code_base) as u32);
         // Take the completion out of the record into x2: it owns nothing, so the word moves
         // as it is, and the sequence pushes it.
         a.ldr_imm(2, 10, cx_ret);
@@ -17928,6 +17914,7 @@ pub(crate) unsafe fn run_borrowed_frame(
             (stack_base.cast_const().cast(), stack.capacity()),
         ],
     });
+    code.referenced.set(1); // entered (the code cache's CLOCK)
     let entry: extern "C" fn(*mut JitCtx) -> u64 = std::mem::transmute(code.mem);
     let saved_strict = i.strict;
     let outcome = loop {
@@ -18069,6 +18056,7 @@ pub fn run(
         error: None,
         ret: (Value::Undefined),
     };
+    code.referenced.set(1); // entered (the code cache's CLOCK)
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     // The pooled buffers are this context's roots for the native run (the stack scan
     // sees the context itself): every slot, initialized above, and the operand words up to
@@ -18111,6 +18099,65 @@ pub(crate) const FRAME_BUF: usize = 256;
 /// Pooled activation records kept per interpreter. Records beyond this bound are freed on
 /// release; deeper recursion allocates (and later frees) the excess.
 pub(crate) const FRAME_POOL_LIMIT: usize = 256;
+
+thread_local! {
+    /// Every activation record allocated on this thread and not yet freed, over all of the
+    /// thread's interpreters (an interpreter never leaves its thread; each `FramePool` keeps its
+    /// own registry too): what [`running_code`] walks.
+    static LIVE_RECORDS: std::cell::RefCell<crate::fasthash::FastSet<usize>> =
+        std::cell::RefCell::new(crate::fasthash::FastSet::default());
+}
+
+/// Note a record [`JitFrame::alloc`] created (`live`), or one about to be freed.
+pub(crate) fn note_record(record: std::ptr::NonNull<JitFrame>, live: bool) {
+    LIVE_RECORDS.with(|records| {
+        let mut records = records.borrow_mut();
+        if live {
+            records.insert(record.as_ptr() as usize);
+        } else {
+            records.remove(&(record.as_ptr() as usize));
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Code addresses a test marks as running, beside the live records' (see `running_code`).
+    pub(crate) static TEST_RUNNING_CODE: std::cell::RefCell<crate::fasthash::FastSet<usize>> =
+        std::cell::RefCell::new(crate::fasthash::FastSet::default());
+}
+
+/// The code the thread's activations run: each live record's `code_base`, which an activation
+/// installs as it starts and a pooled record keeps null, and each registered Rust entry's
+/// context outside the pool (`gc_trace::enter_jit_frame`). A direct call holds no lease on its
+/// callee's code, so the code cache keeps whatever this names (a Rust entry's lease protects its
+/// code as well). Read only where no generated code runs.
+pub(crate) fn running_code() -> crate::fasthash::FastSet<usize> {
+    LIVE_RECORDS.with(|records| {
+        records
+            .borrow()
+            .iter()
+            .filter_map(|&record| {
+                // SAFETY: a registered record stays allocated until it is freed, which
+                // unregisters it first.
+                let base = unsafe { (*(record as *const JitFrame)).ctx.code_base };
+                (!base.is_null()).then_some(base as usize)
+            })
+            .chain(crate::gc_trace::jit_frame_code())
+            .chain(test_running_code())
+            .collect()
+    })
+}
+
+#[cfg(test)]
+fn test_running_code() -> Vec<usize> {
+    TEST_RUNNING_CODE.with(|running| running.borrow().iter().copied().collect())
+}
+
+#[cfg(not(test))]
+fn test_running_code() -> [usize; 0] {
+    []
+}
 
 /// A pooled JIT activation record: the frame's own [`JitCtx`] followed by its fixed
 /// [`FRAME_BUF`]-word slot and operand-stack storage.
@@ -18230,6 +18277,8 @@ impl JitFrame {
         ctx.resume_activation = std::ptr::null_mut();
         ctx.resume_pc = 0;
         ctx.references_raw = std::ptr::null_mut();
+        // A pooled record runs no code (see `running_code`).
+        ctx.code_base = std::ptr::null();
         if i.frame_pool.len() < FRAME_POOL_LIMIT {
             // Within the reserved capacity: the finish stub's push relies on it.
             debug_assert!(i.frame_pool.capacity() >= FRAME_POOL_LIMIT);
@@ -18441,6 +18490,7 @@ unsafe fn run_moved_inner(
     ctx.n_slots = n_slots;
     ctx.code_base = code.mem;
     ctx.pc_offsets = code.pc_offsets.as_ptr();
+    code.referenced.set(1); // entered (the code cache's CLOCK)
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     let ok = entry(ctx);
     unsafe {
@@ -18549,6 +18599,7 @@ unsafe fn run_moved_oversized(
         error: None,
         ret: (Value::Undefined),
     };
+    code.referenced.set(1); // entered (the code cache's CLOCK)
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     // As in `run`. The slot Vec's length stays 0, so its `n_slots` words, all written
     // above, are named here; the operand words are initialized up to `max_stack`.

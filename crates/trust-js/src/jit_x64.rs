@@ -876,8 +876,6 @@ pub(super) fn compile_entry(
     }
     .ok()?;
     let max_stack = cfg.jit_stack_capacity();
-    let residency = Box::<super::cache::CodeResidency>::default();
-    let residency_ptr = &*residency as *const super::cache::CodeResidency as u64;
     let mut a = Asm::new();
     let pcs: Vec<_> = (0..=ops.len()).map(|_| a.label()).collect();
     let unwind = a.label();
@@ -917,12 +915,6 @@ pub(super) fn compile_entry(
     a.bytes(&[0x49, 0x89, 0xfc]); // r12 = rdi (ctx)
     #[cfg(target_os = "windows")]
     a.bytes(&[0x49, 0x89, 0xcc]); // r12 = rcx (ctx)
-    const _: () = assert!(std::mem::offset_of!(super::cache::CodeResidency, active) == 0);
-    const _: () = assert!(std::mem::offset_of!(super::cache::CodeResidency, referenced) == 8);
-    a.bytes(&[0x48, 0xb8]); // movabs rax,residency
-    a.bytes(&residency_ptr.to_le_bytes());
-    a.bytes(&[0x48, 0x83, 0x00, 0x01]); // add qword [rax],1
-    a.bytes(&[0xc6, 0x40, 0x08, 0x01]); // referenced=1
     a.bytes(&[
         0x4d, 0x8b, 0x34, 0x24, // r14 = [r12] (helpers)
     ]);
@@ -1316,11 +1308,6 @@ pub(super) fn compile_entry(
         a.bytes(&[0x88, 0x88]); // byte [rax+strict_offset] = cl
         a.bytes(&strict_offset.to_le_bytes());
         a.bytes(&[0x48, 0x83, 0xc4, 0x10]); // add rsp,16
-                                            // No helper/reentrant operation between releasing this active mapping
-                                            // and RET. The selected Rust lease or caller's resident slot owns it.
-        a.bytes(&[0x48, 0xb8]);
-        a.bytes(&residency_ptr.to_le_bytes());
-        a.bytes(&[0x48, 0x83, 0x28, 0x01]); // sub qword [rax],1
         if ok {
             a.bytes(&[0xb8, 1, 0, 0, 0]);
         } else {
@@ -1363,7 +1350,7 @@ pub(super) fn compile_entry(
             )
         }),
         executable,
-        residency,
+        referenced: std::cell::Cell::new(0),
     })
 }
 
