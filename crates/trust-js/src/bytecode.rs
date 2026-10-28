@@ -24287,9 +24287,12 @@ pub(crate) static CALL_PATHS: [std::sync::atomic::AtomicU64; 8] =
 static CALL_PATHS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether `TRUST_JS_JIT_CALLSTAT=2` counts call paths (set as the JIT reads its switches).
+/// Only builds with the `architecture-diagnostics` feature count them: elsewhere this is a
+/// constant false, and the call paths' counting folds away.
 #[inline(always)]
 pub(crate) fn call_paths_enabled() -> bool {
-    CALL_PATHS_ON.load(std::sync::atomic::Ordering::Relaxed)
+    cfg!(feature = "architecture-diagnostics")
+        && CALL_PATHS_ON.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Count one call by `path` (see [`CallPath`]); prints the counts as the thread exits.

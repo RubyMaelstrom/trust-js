@@ -96,17 +96,17 @@ comment/example in the same change.
   Live rooted-handle counts (`handles`: `strong` and `weak`) remain available independently;
   a leaked strong handle keeps its value alive. Diagnostic only; excluded from acceptance timing.
 - Helper-traffic tallies print their top entries to stderr at exit and are diagnostic only:
-  `TRUST_JS_JIT_OPSTAT=1` counts ops that reach a JIT helper (`=2` adds the function and
-  pc), `TRUST_JS_JIT_CALLSTAT=1` counts why calls reaching the call helper missed the
-  direct-call sequence (`=2` adds `[jit-callpath]` counts of calls by the path that entered
-  the callee: the direct sequence, the call-hit helper for user callees and for natives with
-  and without the native-call boundary, the generic call helper, the intrinsic helper, cached
-  calls from Rust and `Interp::call`), `TRUST_JS_JIT_NATIVESTAT=1` counts those calls by native
-  callee,
-  and `TRUST_JS_JIT_PROPSTAT=1` counts why named reads reaching a JIT property helper were
-  not served by the inline template (proxy, exotic/side-table, accessor, array holder,
-  depth, absent, or uncached/cached data; `=2` adds the site). `TRUST_JS_JIT_PROFILE_AFTER_MS=N`
-  delays the OPSTAT/CALLSTAT/PROPSTAT counting window past startup.
+  `TRUST_JS_JIT_OPSTAT=1` counts ops that reach a JIT helper (`=2` adds the function and pc),
+  `TRUST_JS_JIT_CALLSTAT=1` counts why calls reaching the call helper missed the direct-call
+  sequence (`=2`, in builds with the `architecture-diagnostics` feature, adds `[jit-callpath]`
+  counts of calls by the path that entered the callee: the direct sequence, the call-hit helper
+  for user callees and for natives with and without the native-call boundary, the generic call
+  helper, the intrinsic helper, cached calls from Rust and `Interp::call`),
+  `TRUST_JS_JIT_NATIVESTAT=1` counts those calls by native callee, and `TRUST_JS_JIT_PROPSTAT=1`
+  counts why named reads reaching a JIT property helper were not served by the inline template
+  (proxy, exotic/side-table, accessor, array holder, depth, absent, or uncached/cached data;
+  `=2` adds the site). `TRUST_JS_JIT_PROFILE_AFTER_MS=N` delays the OPSTAT/CALLSTAT/PROPSTAT
+  counting window past startup.
 - `TRUST_JS_JIT_MAP=1` prints `[jit-map-range]`/`[jit-map-pc]`/`[jit-map-mark]` lines mapping
   generated code ranges to chunk source offsets, bytecode pcs and attribution families, for
   joining sampling-profiler addresses back to operations.
