@@ -3,8 +3,8 @@
 //! assemble-from-bytecode generator (`--regexp-assemble-from-bytecode`,
 //! src/regexp/regexp-code-generator.cc): the generator below walks the program and emits through
 //! a macro assembler ([`Masm`]) that each backend implements, as V8's per-architecture
-//! `RegExpMacroAssembler`s do. [`Matcher::run`] stays the reference, and the matcher runs
-//! whatever a program uses that the tier does not.
+//! `RegExpMacroAssembler`s do. [`Matcher::run`](super::Matcher::run) stays the reference, and
+//! the matcher runs whatever a program uses that the tier does not.
 //!
 //! The tier takes the core of the instruction set (characters, `.`, classes, captures and their
 //! undo rules, alternation, `^`, `$` and `\b` with the flags resolved at compile time, greedy and
@@ -24,7 +24,7 @@
 //! with the operand in a register; undo stubs restore their slot and pop again, as V8's undo
 //! code does (regexp-compiler.cc, `Trace::Flush`). A sentinel record at the stack's base ends a
 //! failed attempt, as V8 pushes its fail label. A Rust helper grows the stack and enforces
-//! [`MAX_BACKTRACK_STATE`], counted in records.
+//! [`MAX_BACKTRACK_STATE`](super::MAX_BACKTRACK_STATE), counted in records.
 //!
 //! Polling: a counter in a register, decremented at each backtrack, candidate, loop back-edge
 //! and retry step, loads the interpreter's poll word (`interrupt::PollWord`) when it reaches
@@ -166,7 +166,8 @@ pub(super) enum Value {
 /// - SLOTS, the capture slots (unset is all ones), then the marks;
 /// - TOP, the backtrack stack's top; OP, the operand of the record popped last;
 /// - CHOICES, the choice records on the stack; LOGGED, the slots whose first write at the root
-///   floor has an undo record this attempt (one bit a slot, [`Matcher::logged`]);
+///   floor has an undo record this attempt (one bit a slot,
+///   [`Matcher::logged`](super::Matcher::logged));
 /// - RS, a loop's run start (or, packed in a record, its least end); LIM and CLIM, a loop scan's
 ///   limit and the end of its current stretch; LEAD, where the leading loop's run ended.
 ///
@@ -678,8 +679,8 @@ impl<'a> Plan<'a> {
     }
 
     /// The test the branch at `pc` begins with, past capture and mark bookkeeping: what
-    /// [`Matcher::branch_may_match`] tests at run time, resolved at compile time. `None` when the
-    /// branch may match without one.
+    /// [`Matcher::branch_may_match`](super::Matcher::branch_may_match) tests at run time,
+    /// resolved at compile time. `None` when the branch may match without one.
     fn first_test(&self, mut pc: usize) -> Option<Test> {
         for _ in 0..4 {
             match &self.prog[pc] {
@@ -760,8 +761,9 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         if !plan.only {
             // The candidate loop: a start the filter's table admits, inside the prefilter's
             // window, is tried at once; the Rust scan finds the others. Up to `CANDIDATE_RUN`
-            // starts the table rules out are skipped in line first, unless a match may begin
-            // wherever `^` holds, which the table does not show.
+            // starts the table rules out are skipped in line first, unless a match may begin at
+            // a line start the table does not show: outside multiline mode only 0 is one, where
+            // a match may always begin.
             self.m.bind(cand);
             self.m.poll_tick();
             let scan = self.m.label();
@@ -772,7 +774,10 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
             }
             if let Some(table) = &plan.first {
                 let lut = self.m.lut(table);
-                if plan.first_line_start {
+                if plan.first_line_start && !plan.multiline {
+                    self.m.branch_at_start(true, attempt);
+                }
+                if plan.first_line_start && plan.multiline {
                     self.m.branch_at_end(true, scan);
                     self.m.load_elem(0);
                     if plan.width == Width::Two {
@@ -1143,7 +1148,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     }
 
     /// A greedy loop: the longest run, and a record to retry shorter ones unless they are
-    /// futile ([`Matcher`]'s `Backtrack::Greedy`).
+    /// futile ([`Matcher`](super::Matcher)'s `Backtrack::Greedy`).
     fn emit_greedy(&mut self, pc: usize, test: &Test, min: u32, max: Option<u32>, atomic: bool) {
         let bt = self.bt;
         self.m.run_start();
@@ -1166,7 +1171,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     }
 
     /// A lazy loop: the shortest run whose continuation may match, and a record to retry longer
-    /// ones ([`Matcher::lazy_next`]).
+    /// ones ([`Matcher::lazy_next`](super::Matcher::lazy_next)).
     fn emit_lazy(&mut self, pc: usize, test: &Test, min: u32, max: Option<u32>) {
         let bt = self.bt;
         self.m.run_start();
@@ -1441,7 +1446,8 @@ fn status_of(error: MatchError) -> u64 {
     }
 }
 
-/// The stack is full at `top`: grow it, up to [`MAX_BACKTRACK_STATE`] records (the context's
+/// The stack is full at `top`: grow it, up to
+/// [`MAX_BACKTRACK_STATE`](super::MAX_BACKTRACK_STATE) records (the context's
 /// limit), returning the new top, or null when the limit is reached.
 extern "C" fn helper_grow(ctx: *mut NativeCtx, top: *mut [usize; 2]) -> *mut [usize; 2] {
     // SAFETY: the generated code passes the context of the running call and its stack's top.

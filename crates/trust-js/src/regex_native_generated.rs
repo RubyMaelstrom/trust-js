@@ -62,7 +62,11 @@ fn instruction_corpus_matches_as_the_matcher_does() {
         ("\\bx.\\B", "", &["boundary", "char", "any", "not_boundary"]),
         ("(a).", "", &["save", "char", "save", "any"]),
         ("a|b.", "", &["split", "char", "jmp", "char", "any"]),
-        ("ab|ac|.d", "", &["split", "char", "char", "jmp", "split", "char", "char", "jmp", "any", "char"]),
+        (
+            "ab|ac|.d",
+            "",
+            &["split", "char", "char", "jmp", "split", "char", "char", "jmp", "any", "char"],
+        ),
         ("a*", "", &["many_char_atomic"]),
         ("a*b", "", &["many_char_atomic", "char"]),
         ("a*a", "", &["many_char", "char"]),
@@ -74,7 +78,11 @@ fn instruction_corpus_matches_as_the_matcher_does() {
         ("\\s+$", "", &["many_class_atomic", "end"]),
         ("\\s*$", "m", &["many_class", "end"]),
         ("\\b\\w+\\b", "", &["boundary", "many_class_atomic", "boundary"]),
-        ("(\\d*)(\\D*)", "", &["save", "many_class_atomic", "save", "save", "many_class_atomic", "save"]),
+        (
+            "(\\d*)(\\D*)",
+            "",
+            &["save", "many_class_atomic", "save", "save", "many_class_atomic", "save"],
+        ),
         ("(?:ab)*c", "", &["split", "set_mark", "char", "char", "check_progress", "jmp", "char"]),
         ("(?:ab)*?c", "", &["split", "set_mark", "char", "char", "check_progress", "jmp", "char"]),
         (
@@ -88,12 +96,18 @@ fn instruction_corpus_matches_as_the_matcher_does() {
         (
             "(a.){2}",
             "",
-            &["clear_caps", "save", "char", "any", "save", "clear_caps", "save", "char", "any", "save"],
+            &[
+                "clear_caps", "save", "char", "any", "save", "clear_caps", "save", "char", "any",
+                "save",
+            ],
         ),
         (
             "(?:x|(y))?z",
             "",
-            &["split", "set_mark", "clear_caps", "split", "char", "jmp", "save", "char", "save", "check_progress", "char"],
+            &[
+                "split", "set_mark", "clear_caps", "split", "char", "jmp", "save", "char", "save",
+                "check_progress", "char",
+            ],
         ),
     ];
     let texts = [
