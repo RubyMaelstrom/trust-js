@@ -2139,6 +2139,31 @@ activation, rest parameters, more than 64 arguments, a frame above FRAME_BUF, ne
 borrowed frames). Of the function constructor's 735 instructions against the plan's ~550, about
 250 are allocation, which W2e's in-line allocation addresses.
 
+Then item 5's getters (375d176e..14375e2d, 2026-10-28, an agent's):
+- 375d176e: an accessor pair keeps its getter and setter in a fixed layout (`repr(C)`: a
+  presence word and the function's word each), which machine code can read; the cell stays 32
+  bytes.
+- 5dc62eae: at the property template's validated accessor landing, the getter read from the pair
+  is probed in a getter call cache of the read site's own (way 0 in line, the rest through the
+  `CallSecondary` stub) and runs through the direct sequence with no arguments on [receiver,
+  getter], so `this` is the original receiver, not the holder (ECMA-262 OrdinaryGet,
+  Call(getter, Receiver)). A site word per read site, boxed at emission for sites whose cache has
+  seen an accessor, holds the call cache, which the helper's slow path fills on the first call of
+  a user getter. A getter the sequence cannot enter falls back to the validated helper path with
+  nothing changed; a throw places the caller's frame at the read before it unwinds.
+- 14375e2d: a monomorphic accessor state gets the compact in-line probe data states have.
+
+Per iteration against d5b4b6da: a class getter on an instance 1,250 to 362, the class
+construction and its getter 1,754 to 866; every call and construct form unchanged. Fixtures:
+Vue -0.34%, React 0.00%, Djot +0.03%, chai -0.07%; Vue's generated code 0.71% larger.
+Validation: the ARM64 gate (the lib suite, pacing with its known failure only, GC stress on the
+getter and accessor tests, the fixtures and difftest as the base's, Test262 53,575 of 53,575,
+identical; the dumps differ at Vue's accessor sites and by a new chunk field's offset) and
+zombie's x86-64 lib suite and clippy. Not done: setters (the store cache records no setter
+states, and the assignment's value must survive the call: designed in the series' notes); and a
+read site compiled before its cache saw an accessor (a function's first native code, compiled
+after tree-walked runs) keeps the helper until it is recompiled.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
