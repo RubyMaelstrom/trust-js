@@ -464,12 +464,17 @@ fn core_programs_match_as_the_matcher_does() {
 }
 
 /// Programs the fuzzer seldom makes: more capture slots than the root floor's logged-slot word
-/// has bits (each attempt unsets them instead), many loops' marks, and long straight runs.
+/// has bits (each attempt unsets them instead), many loops' marks, long straight runs, and code
+/// past AArch64's 32 KB test-and-branch reach.
 #[test]
 fn wide_and_long_programs_match_as_the_matcher_does() {
     let wide = format!("{}(y|z)*q", "(x)?".repeat(36));
     let marks = "(?:(?:a|b)*c)*(?:(?:d|e)+f)*(?:g|h)*".to_string();
     let long = format!("{}.{}", "ab".repeat(300), "cd".repeat(300));
+    // Code far past AArch64's 32 KB test-and-branch reach, ending in the candidate loop's
+    // outlines.
+    let alternatives: Vec<String> = (0..250).map(|k| format!("x{k}y")).collect();
+    let big = format!("(?:{})z", alternatives.join("|"));
     let texts = [
         "xxxyzq".to_string(),
         "xyzyzyzx".to_string(),
@@ -478,6 +483,7 @@ fn wide_and_long_programs_match_as_the_matcher_does() {
         "aabbcdddeeffhgx".to_string(),
         format!("{}X{}", "ab".repeat(300), "cd".repeat(300)),
         format!("z{}X{}", "ab".repeat(300), "cd".repeat(299)),
+        "ax17yzx249yz x3y".to_string(),
     ];
     for (pattern, flags) in [
         (wide.as_str(), ""),
@@ -485,6 +491,7 @@ fn wide_and_long_programs_match_as_the_matcher_does() {
         (marks.as_str(), ""),
         (marks.as_str(), "g"),
         (long.as_str(), ""),
+        (big.as_str(), ""),
     ] {
         for text in &texts {
             for two in [false, true] {

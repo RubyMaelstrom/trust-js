@@ -87,8 +87,10 @@ pub(super) const CANDIDATE_RUN: u32 = 16;
 /// longer subjects (engine strings never are) stay on the matcher.
 const MAX_SUBJECT_LEN: usize = 1 << 31;
 
-/// Programs longer than this stay on the matcher: their code's branches might not reach.
-const MAX_PROGRAM_LEN: usize = 4096;
+/// A program's code-size estimate (see [`code_units`]) past which it stays on the matcher, so
+/// that every branch in its code reaches: AArch64's conditional branches and ADR take a
+/// megabyte either way, and a unit is at most 100 instructions of code and stubs.
+const MAX_CODE_UNITS: usize = 2048;
 
 /// Capture and mark slots a program may have (AArch64's scaled 12-bit offsets reach 4,095).
 const MAX_SLOTS: usize = 4000;
@@ -397,8 +399,8 @@ fn decline(re: &Regex, width: Width) -> Option<&'static str> {
     }
     let prog = &re.prog;
     let n = prog.len();
-    if n > MAX_PROGRAM_LEN {
-        return Some("program length");
+    if code_units(prog, width) > MAX_CODE_UNITS {
+        return Some("code size");
     }
     if 2 * (re.ngroups + 1) + re.nmarks > MAX_SLOTS {
         return Some("slots");
@@ -449,6 +451,31 @@ fn decline(re: &Regex, width: Width) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// An upper bound on the size of `prog`'s code for `width`, in units of 100 instructions: one
+/// an instruction, but a class's (or a class loop's) table and ranges, which two-byte code tests
+/// in line, and each slot a capture clear restores.
+fn code_units(prog: &[Inst], width: Width) -> usize {
+    let class = |class: &super::CharClass| {
+        3 + match width {
+            Width::One => 0,
+            Width::Two => class_elements(class).map_or(0, |set| set.len()),
+        }
+    };
+    prog.iter()
+        .map(|inst| match inst {
+            Inst::Class(c) => class(c),
+            Inst::Many { rep, .. } => {
+                2 + match rep {
+                    Rep::Class(c) => 2 * class(c),
+                    Rep::Char(_) | Rep::Any => 0,
+                }
+            }
+            Inst::ClearCaps(lo, hi) => 1 + (hi + 1 - lo),
+            _ => 1,
+        })
+        .sum()
 }
 
 /// Compile `re` for `width`, or `None` if the tier does not take it or its code cannot be made.

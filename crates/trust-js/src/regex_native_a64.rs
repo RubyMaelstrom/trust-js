@@ -844,13 +844,15 @@ impl Masm for Asm {
     }
 
     fn next_candidate(&mut self, no_match: Label) {
-        // Nothing but the callee-saved registers is live at a candidate.
+        // Nothing but the callee-saved registers is live at a candidate. A status (bit 63) goes
+        // to an outline after the program, past TBNZ's 32 KB: through the sign's B.MI.
         let slow = self.label();
         self.mov(0, CTX);
         self.mov(1, POS);
         self.ldr_literal(IP0, self.helpers.next_candidate as u64);
         self.emit(blr(IP0));
-        self.tbnz(0, 63, slow);
+        self.emit(subs_imm(true, ZR, 0, 0));
+        self.branch(0x5400_0004, slow, Fixup::Imm19); // b.mi
         self.mov(POS, 0);
         self.pos_changed();
         self.outlines
