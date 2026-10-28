@@ -455,6 +455,9 @@ fn core_programs_match_as_the_matcher_does() {
         ("[Ω-Ϋ\\u2028]", ""),
         ("[^Ω]+", ""),
         ("\\u2028|\\n$", "m"),
+        ("ba{3000000000}|b", ""),
+        ("ba{3000000000}?|b", ""),
+        ("b(?:a{2147483648,})?", ""),
     ] {
         check_both(pattern, flags, &texts);
     }

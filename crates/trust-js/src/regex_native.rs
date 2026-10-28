@@ -958,9 +958,12 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 atomic,
             } => {
                 let test = plan.rep_test(rep);
-                let min = u32::try_from(*min).unwrap_or(u32::MAX);
-                // A count past any subject's length bounds nothing.
+                // A count past any subject's length bounds nothing, or cannot be reached.
                 let max = max.and_then(|max| u32::try_from(max).ok().filter(|&m| m < 1 << 31));
+                let Some(min) = u32::try_from(*min).ok().filter(|&m| m < 1 << 31) else {
+                    self.m.jump(bt);
+                    return pc + 1;
+                };
                 if *greedy {
                     self.emit_greedy(pc, &test, min, max, *atomic);
                 } else {
