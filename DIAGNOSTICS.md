@@ -46,6 +46,8 @@ comment/example in the same change.
   100 machine-code runs); zero disables inlining.
 - `TRUST_JS_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls (the inline call sequence
   that runs the callee on a pooled frame record) while retaining ordinary JIT calls.
+- `TRUST_JS_JIT_KEEP_FP_SAVES=1` keeps every ARM64 chunk's save and restore of d8-d15, which
+  chunks whose code writes none of them otherwise skip, with a 64-byte native frame for 128.
 - `TRUST_JS_JIT_INLINE_STUBS=1` emits ARM64 name-cache validation, whole free-name reads,
   slow-path helper calls, generic property-cache probes, secondary call-cache probes and
   direct-call sequences at every site instead of as per-chunk shared stubs (by default only

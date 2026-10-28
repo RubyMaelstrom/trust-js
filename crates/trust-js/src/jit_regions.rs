@@ -2785,9 +2785,10 @@ pub(super) fn emit(
                 // The established scalar/property/element chain has stronger local
                 // representation propagation than independent opcode templates. Reuse
                 // it only at an empty operand boundary with no private numeric locals:
-                // its d8..d15 temporaries may overwrite borrowed tagged caches, which
-                // are reloaded from their owning canonical slots on fallthrough. Any
-                // terminal branch exits through an exact original canonical entry.
+                // its d16..d23 temporaries may overwrite the region's transients, none
+                // live at an empty boundary, and the borrowed tagged caches are reloaded
+                // from their owning canonical slots on fallthrough. Any terminal branch
+                // exits through an exact original canonical entry.
                 if let Some((chain, count)) =
                     build_chain(chunk, &ops[..end], pc, source_targets, layout, fast)
                 {

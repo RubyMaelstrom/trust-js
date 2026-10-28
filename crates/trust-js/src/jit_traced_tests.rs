@@ -412,6 +412,40 @@ fn direct_calls_and_frame_teardown() {
     }
 }
 
+/// A chunk whose code writes none of d8..d15 (AAPCS64's callee-saved FP registers) skips their
+/// save and restore and runs on a 64-byte frame: `add` keeps its chain in d16..d23. Its callers'
+/// registers pass through untouched, including a caller that keeps loop values in d8..d15
+/// across the call; `scale`, which a straight-line register region may home in d8, keeps its
+/// saves.
+#[test]
+fn chunks_without_callee_saved_fp_skip_its_save() {
+    let source = r#"
+        function add(a, b) { return a + b; }
+        function scale(x) { return x * 2.5 - 1; }
+        function sum(n) {
+            var s = 0, t = 0.5;
+            for (var k = 0; k < n; k++) { s = add(s, k) | 0; t = t + scale(k & 7); }
+            return s + ':' + t;
+        }
+        sum(1000);
+    "#;
+    let mut jit = agree(source, "499500:7750.5", &["add", "scale", "sum"]);
+    for name in ["add", "scale"] {
+        settle(&mut jit, name);
+    }
+    assert_eq!(eval(&mut jit, "sum(100000)"), "704982704:775000.5");
+    #[cfg(target_arch = "aarch64")]
+    {
+        let words = with_chunk(&mut jit, "add", |chunk| {
+            let code = chunk.jit.get().flatten().expect("native code");
+            unsafe { std::slice::from_raw_parts(code.mem as *const u32, code.len / 4) }.to_vec()
+        });
+        // stp x29, x30, [sp, #-64]!, then b .+16 over the d8..d15 saves
+        assert_eq!(words[0], 0xA9BC_7BFD, "add pushes a 64-byte frame");
+        assert_eq!(words[3], 0x1400_0004, "add branches over the d8..d15 saves");
+    }
+}
+
 /// The construct state across direct calls (ECMA-262 [[Call]] passes no NewTarget). An ordinary
 /// caller already holds what its callee needs, so its sequence saves and restores nothing; a
 /// constructing caller's sequence clears the state for the callee and restores its own after

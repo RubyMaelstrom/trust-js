@@ -2621,6 +2621,9 @@ mod asm {
         /// Immutable scalar original-PC/slot/exit-label plans; no JavaScript owners.
         /// Checked numeric replay uses the same before-read transaction as ordinary entry.
         string_accumulations: Vec<(u32, u16, usize)>,
+        /// An emitted instruction writes one of d8..d15 (see `emit_fp`): the code must save and
+        /// restore them for its caller.
+        fp_callee_saved: bool,
         /// Whether the code being emitted is a chunk body's baseline code, where a call to an
         /// allocating helper ends in the explicit poll (see `super::emit_helper_end_poll`).
         /// Clear in region code, shared stubs and loose test assemblies.
@@ -2648,6 +2651,7 @@ mod asm {
                 mark_stack: Vec::new(),
                 string_accumulations: Vec::new(),
                 end_polls: false,
+                fp_callee_saved: false,
             }
         }
         /// Set whether helper calls emitted from here on end in the explicit poll (see
@@ -2767,6 +2771,19 @@ mod asm {
         }
         fn emit(&mut self, i: u32) {
             self.buf.push(i);
+        }
+        /// Emit a SIMD&FP instruction (every one comes through here), noting whether it writes one
+        /// of d8..d15, AAPCS64's callee-saved FP registers (see
+        /// `super::writes_callee_saved_fp`). Debug builds re-check the finished code.
+        fn emit_fp(&mut self, i: u32) {
+            if super::writes_callee_saved_fp(i) {
+                self.fp_callee_saved = true;
+            }
+            self.emit(i);
+        }
+        /// Whether any instruction emitted so far writes one of d8..d15.
+        pub fn writes_callee_saved_fp(&self) -> bool {
+            self.fp_callee_saved
         }
         /// A data word in the instruction stream, placed where execution never reaches it (after
         /// an unconditional branch). Branch relaxation inserts only after conditional branches
@@ -2976,7 +2993,7 @@ mod asm {
         }
         /// FCVT Sd, Dn / FCVT Dd, Sn. Narrowing uses FPCR's roundTiesToEven default.
         pub fn fcvt_float_width(&mut self, rd: u32, rn: u32, narrow: bool) {
-            self.emit((if narrow { 0x1E62_4000 } else { 0x1E22_C000 }) | (rn << 5) | rd);
+            self.emit_fp((if narrow { 0x1E62_4000 } else { 0x1E22_C000 }) | (rn << 5) | rd);
         }
         /// sdiv wd, wn, wm (truncating; wn/0 = 0 and i32::MIN/-1 = i32::MIN, no trap)
         pub fn sdiv_w(&mut self, rd: u32, rn: u32, rm: u32) {
@@ -3001,21 +3018,21 @@ mod asm {
         }
         /// ldur dt, [xn, #simm9]
         pub fn ldur_d(&mut self, rt: u32, rn: u32, simm9: i32) {
-            self.emit(0xFC40_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
+            self.emit_fp(0xFC40_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
         }
         /// stur dt, [xn, #simm9]
         pub fn stur_d(&mut self, rt: u32, rn: u32, simm9: i32) {
-            self.emit(0xFC00_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
+            self.emit_fp(0xFC00_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
         }
         /// ldr dt, [xn, #imm] (scaled)
         pub fn ldr_d_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
             debug_assert!(imm_bytes.is_multiple_of(8) && imm_bytes / 8 < 4096);
-            self.emit(0xFD40_0000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt);
+            self.emit_fp(0xFD40_0000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt);
         }
         /// str dt, [xn, #imm] (scaled)
         pub fn str_d_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
             debug_assert!(imm_bytes.is_multiple_of(8) && imm_bytes / 8 < 4096);
-            self.emit(0xFD00_0000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt);
+            self.emit_fp(0xFD00_0000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt);
         }
         /// add xd, xn, #imm12
         pub fn add_imm(&mut self, rd: u32, rn: u32, imm: u32) {
@@ -3045,11 +3062,11 @@ mod asm {
                 2 => 0x1E60_0800,
                 _ => 0x1E60_1800,
             };
-            self.emit(bits | (rm << 16) | (rn << 5) | rd);
+            self.emit_fp(bits | (rm << 16) | (rn << 5) | rd);
         }
         /// fcmp dn, dm
         pub fn fcmp(&mut self, rn: u32, rm: u32) {
-            self.emit(0x1E60_2000 | (rm << 16) | (rn << 5));
+            self.emit_fp(0x1E60_2000 | (rm << 16) | (rn << 5));
         }
         /// cset wd, cond (CSINC wd, wzr, wzr, !cond)
         pub fn cset_w(&mut self, rd: u32, cond: u32) {
@@ -3057,63 +3074,63 @@ mod asm {
         }
         /// fmov dd, #1.0
         pub fn fmov_one(&mut self, rd: u32) {
-            self.emit(0x1E6E_1000 | rd);
+            self.emit_fp(0x1E6E_1000 | rd);
         }
         /// fcvtzu wd, dn (float → unsigned 32-bit, round toward zero, saturating)
         pub fn fcvtzu_w_d(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E79_0000 | (rn << 5) | rd);
+            self.emit_fp(0x1E79_0000 | (rn << 5) | rd);
         }
         /// ucvtf dd, wn (unsigned 32-bit → double, exact)
         pub fn ucvtf_d_w(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E63_0000 | (rn << 5) | rd);
+            self.emit_fp(0x1E63_0000 | (rn << 5) | rd);
         }
         /// fcvtns wd, dn (float → signed 32-bit, round to nearest with ties to even, saturating;
         /// NaN gives 0): the rounding of ECMA-262 ToUint8Clamp before its [0, 255] clamp.
         pub fn fcvtns_w_d(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E60_0000 | (rn << 5) | rd);
+            self.emit_fp(0x1E60_0000 | (rn << 5) | rd);
         }
         /// fcvtzs xd, dn (float → signed 64-bit, round toward zero, saturating)
         pub fn fcvtzs_x_d(&mut self, rd: u32, rn: u32) {
-            self.emit(0x9E78_0000 | (rn << 5) | rd);
+            self.emit_fp(0x9E78_0000 | (rn << 5) | rd);
         }
         /// fcvtzs wd, dn (float → signed 32-bit, round toward zero, saturating)
         pub fn fcvtzs_w_d(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E78_0000 | (rn << 5) | rd);
+            self.emit_fp(0x1E78_0000 | (rn << 5) | rd);
         }
         /// fjcvtzs wd, dn (FEAT_JSCVT): ECMAScript ToInt32 of any double in one instruction —
         /// truncate toward zero, keep the low 32 bits (mod 2^32), NaN and ±Infinity give 0.
         /// Emit only when [`super::jscvt_available`].
         pub fn fjcvtzs_w_d(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E7E_0000 | (rn << 5) | rd);
+            self.emit_fp(0x1E7E_0000 | (rn << 5) | rd);
         }
         /// scvtf dd, xn (signed 64-bit → double, round to nearest)
         pub fn scvtf_d_x(&mut self, rd: u32, rn: u32) {
-            self.emit(0x9E62_0000 | (rn << 5) | rd);
+            self.emit_fp(0x9E62_0000 | (rn << 5) | rd);
         }
         /// scvtf dd, wn (signed 32-bit → double, exact)
         pub fn scvtf_d_w(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E62_0000 | (rn << 5) | rd);
+            self.emit_fp(0x1E62_0000 | (rn << 5) | rd);
         }
         /// frintz dd, dn (round toward zero to integral)
         pub fn frintz(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E65_C000 | (rn << 5) | rd);
+            self.emit_fp(0x1E65_C000 | (rn << 5) | rd);
         }
         /// frintm dd, dn (round toward minus infinity to integral)
         pub fn frintm(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E65_4000 | (rn << 5) | rd);
+            self.emit_fp(0x1E65_4000 | (rn << 5) | rd);
         }
         /// frintp dd, dn (round toward plus infinity to integral)
         pub fn frintp(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E64_C000 | (rn << 5) | rd);
+            self.emit_fp(0x1E64_C000 | (rn << 5) | rd);
         }
         /// fabs dd, dn
         pub fn fabs(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E60_C000 | (rn << 5) | rd);
+            self.emit_fp(0x1E60_C000 | (rn << 5) | rd);
         }
         /// fmin/fmax dd, dn, dm — NaN in, NaN out; -0 orders below +0 (ECMA-262 §21.3.2.25-26).
         pub fn fminmax(&mut self, max: bool, rd: u32, rn: u32, rm: u32) {
             let bits = if max { 0x1E60_4800u32 } else { 0x1E60_5800 };
-            self.emit(bits | (rm << 16) | (rn << 5) | rd);
+            self.emit_fp(bits | (rm << 16) | (rn << 5) | rd);
         }
         /// clz wd, wn
         pub fn clz_w(&mut self, rd: u32, rn: u32) {
@@ -3125,27 +3142,34 @@ mod asm {
         }
         /// fmov dd, xn (bit move)
         pub fn fmov_d_x(&mut self, rd: u32, rn: u32) {
-            self.emit(0x9E67_0000 | (rn << 5) | rd);
+            self.emit_fp(0x9E67_0000 | (rn << 5) | rd);
         }
         /// fneg dd, dn
         pub fn fneg(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E61_4000 | (rn << 5) | rd);
+            self.emit_fp(0x1E61_4000 | (rn << 5) | rd);
         }
         /// fsqrt dd, dn
         pub fn fsqrt(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E61_C000 | (rn << 5) | rd);
+            self.emit_fp(0x1E61_C000 | (rn << 5) | rd);
         }
         /// fmov dd, dn
         pub fn fmov_d_d(&mut self, rd: u32, rn: u32) {
-            self.emit(0x1E60_4000 | (rn << 5) | rd);
+            self.emit_fp(0x1E60_4000 | (rn << 5) | rd);
         }
         /// stp dt1, dt2, [sp, #imm] (SIMD&FP 64-bit, signed offset)
         pub fn stp_d_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
             let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit(0x6D00_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
+            self.emit_fp(0x6D00_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
         }
-        /// ldp dt1, dt2, [sp, #imm]
+        /// ldp dt1, dt2, [sp, #imm] (test event helpers' reloads of d16..d31)
+        #[cfg(test)]
         pub fn ldp_d_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
+            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
+            self.emit_fp(0x6D40_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
+        }
+        /// ldp dt1, dt2, [sp, #imm], for an epilogue's restore of d8..d15, which is no use of
+        /// them (so it bypasses `emit_fp`).
+        pub fn ldp_d_restore(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
             let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
             self.emit(0x6D40_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
         }
@@ -3235,7 +3259,7 @@ mod asm {
         }
         /// fcmp dn, #0.0
         pub fn fcmp_zero(&mut self, rn: u32) {
-            self.emit(0x1E60_2008 | (rn << 5));
+            self.emit_fp(0x1E60_2008 | (rn << 5));
         }
         /// sub xd, xn, xm
         pub fn sub_reg(&mut self, rd: u32, rn: u32, rm: u32) {
@@ -3274,7 +3298,7 @@ mod asm {
         }
         /// fmov xd, dn (bit move)
         pub fn fmov_x_d(&mut self, rd: u32, rn: u32) {
-            self.emit(0x9E66_0000 | (rn << 5) | rd);
+            self.emit_fp(0x9E66_0000 | (rn << 5) | rd);
         }
         /// Register-offset element accesses of the typed-array templates: the index register is
         /// scaled by the element size (`lsl #log2(size)`; bytes are unscaled). Checked against
@@ -3297,7 +3321,7 @@ mod asm {
         }
         /// ldr st, [xn, xm, lsl #2]
         pub fn ldr_s_lsl2(&mut self, rt: u32, rn: u32, rm: u32) {
-            self.emit(0xBC60_7800 | (rm << 16) | (rn << 5) | rt);
+            self.emit_fp(0xBC60_7800 | (rm << 16) | (rn << 5) | rt);
         }
         /// strb wt, [xn, xm]
         pub fn strb_reg(&mut self, rt: u32, rn: u32, rm: u32) {
@@ -3313,15 +3337,15 @@ mod asm {
         }
         /// str st, [xn, xm, lsl #2]
         pub fn str_s_lsl2(&mut self, rt: u32, rn: u32, rm: u32) {
-            self.emit(0xBC20_7800 | (rm << 16) | (rn << 5) | rt);
+            self.emit_fp(0xBC20_7800 | (rm << 16) | (rn << 5) | rt);
         }
         /// ldr dt, [xn, xm, lsl #3]
         pub fn ldr_d_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
-            self.emit(0xFC60_7800 | (rm << 16) | (rn << 5) | rt);
+            self.emit_fp(0xFC60_7800 | (rm << 16) | (rn << 5) | rt);
         }
         /// str dt, [xn, xm, lsl #3]
         pub fn str_d_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
-            self.emit(0xFC20_7800 | (rm << 16) | (rn << 5) | rt);
+            self.emit_fp(0xFC20_7800 | (rm << 16) | (rn << 5) | rt);
         }
         /// adds wd, wn, #imm12 (sets flags; V on i32 overflow)
         pub fn adds_imm_w(&mut self, rd: u32, rn: u32, imm: u32) {
@@ -4000,13 +4024,19 @@ fn compile_entry(
     let l_direct_finish = a.new_label();
 
     // ---- prologue ----
-    // Frame: fp/lr + x19..x22 + d8..d15 + saved caller strictness (16-byte alignment).
+    // Frame: fp/lr [0], x19..x22 [16, 32], the saved caller strictness [48], d8..d15 [64..128]
+    // (16-byte alignment). A chunk whose code writes none of d8..d15 drops their save and the
+    // frame's top half (`skip_unused_callee_saved_fp`).
     const FRAME_SIZE: i32 = 128;
-    const DSAVE: i32 = 48;
-    const STRICT_SAVE: u32 = 112;
+    const DSAVE: i32 = 64;
+    const STRICT_SAVE: u32 = 48;
     a.stp_pre(29, 30, -FRAME_SIZE);
     a.stp_off(19, 20, 16);
     a.stp_off(21, 22, 32);
+    // d8..d15, AAPCS64's callee-saved FP registers. Words 3..7 of every chunk: when the finished
+    // code writes none of them, the first save becomes a branch over the four (see below).
+    let l_dsave = a.new_label();
+    a.bind(l_dsave);
     a.stp_d_off(8, 9, DSAVE);
     a.stp_d_off(10, 11, DSAVE + 16);
     a.stp_d_off(12, 13, DSAVE + 32);
@@ -4837,10 +4867,12 @@ fn compile_entry(
     a.strb_imm(9, 16, 0);
     emit_residency_mark(&mut a, residency_ptr, false);
     a.movz(0, 1, 0);
-    a.ldp_d_off(8, 9, DSAVE);
-    a.ldp_d_off(10, 11, DSAVE + 16);
-    a.ldp_d_off(12, 13, DSAVE + 32);
-    a.ldp_d_off(14, 15, DSAVE + 48);
+    let l_drestore_ok = a.new_label();
+    a.bind(l_drestore_ok);
+    a.ldp_d_restore(8, 9, DSAVE);
+    a.ldp_d_restore(10, 11, DSAVE + 16);
+    a.ldp_d_restore(12, 13, DSAVE + 32);
+    a.ldp_d_restore(14, 15, DSAVE + 48);
     a.ldp_off(21, 22, 32);
     a.ldp_off(19, 20, 16);
     a.ldp_post(29, 30, FRAME_SIZE);
@@ -4852,10 +4884,12 @@ fn compile_entry(
     a.strb_imm(9, 16, 0);
     emit_residency_mark(&mut a, residency_ptr, false);
     a.movz(0, 0, 0);
-    a.ldp_d_off(8, 9, DSAVE);
-    a.ldp_d_off(10, 11, DSAVE + 16);
-    a.ldp_d_off(12, 13, DSAVE + 32);
-    a.ldp_d_off(14, 15, DSAVE + 48);
+    let l_drestore_throw = a.new_label();
+    a.bind(l_drestore_throw);
+    a.ldp_d_restore(8, 9, DSAVE);
+    a.ldp_d_restore(10, 11, DSAVE + 16);
+    a.ldp_d_restore(12, 13, DSAVE + 32);
+    a.ldp_d_restore(14, 15, DSAVE + 48);
     a.ldp_off(21, 22, 32);
     a.ldp_off(19, 20, 16);
     a.ldp_post(29, 30, FRAME_SIZE);
@@ -4886,7 +4920,15 @@ fn compile_entry(
 
     // The unwinder (ECMA-262 14.15.3) needs the same final catch addresses as patched
     // branches, including every word inserted while relaxing long conditional branches.
-    let (words, pc_offsets) = a.finish_with_offsets(&pc_labels[..ops.len()]);
+    let mut exported = pc_labels[..ops.len()].to_vec();
+    exported.extend([l_dsave, l_drestore_ok, l_drestore_throw]);
+    let fp_callee_saved = a.writes_callee_saved_fp();
+    let (mut words, mut pc_offsets) = a.finish_with_offsets(&exported);
+    let fp_saves: Vec<usize> = pc_offsets
+        .drain(ops.len()..)
+        .map(|offset| offset as usize / 4)
+        .collect();
+    skip_unused_callee_saved_fp(&mut words, &fp_saves, fp_callee_saved);
     // Debug: `TRUST_JS_JIT_CODEDUMP=<substr>` prints the finished code words (hex, one per line)
     // of chunks whose leading slot names contain the substring (`*`: every chunk) — round-trip
     // them through `clang -c` + `objdump -d` for a disassembly of exactly what runs. `names@N`
@@ -5031,6 +5073,174 @@ fn emit_residency_mark(a: &mut asm::Asm, residency: u64, enter: bool) {
             9,
             std::mem::offset_of!(cache::CodeResidency, referenced) as u32,
         );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn callee_saved_fp_writes_are_found_in_every_encoding_class() {
+    for (word, writes, what) in [
+        (0x9E67_0128u32, true, "fmov d8, x9"),
+        (0x9E66_0109, false, "fmov x9, d8"),
+        (0x9E66_0208, false, "fmov x8, d16"),
+        (0x1E62_0049, true, "scvtf d9, w2"),
+        (0x1E78_0102, false, "fcvtzs w2, d8"),
+        (0x1E69_2100, false, "fcmp d8, d9"),
+        (0x1E60_2108, false, "fcmp d8, #0.0"),
+        (0x1E69_2908, true, "fadd d8, d8, d9"),
+        (0x1E71_2A10, false, "fadd d16, d16, d17"),
+        (0xFD40_02C8, true, "ldr d8, [x22]"),
+        (0xFD40_06D0, false, "ldr d16, [x22, #8]"),
+        (0xFD00_0288, true, "str d8, [x20] (a store counts too)"),
+        (0x6D02_27E8, true, "stp d8, d9, [sp, #32]"),
+        (0x4C40_2006, true, "ld1 {v6.16b-v9.16b}, [x0]"),
+        (0xF940_0128, false, "ldr x8, [x9]"),
+        (0x9100_0528, false, "add x8, x9, #1"),
+        (0x1400_0004, false, "b .+16"),
+        (0xD2EF_FF29, false, "movz x9, #0x7ff9, lsl #48"),
+    ] {
+        assert_eq!(
+            may_write_callee_saved_fp(word),
+            writes,
+            "{what} ({word:#010x})"
+        );
+    }
+    // The tracked rule leaves stores out: they only read their registers.
+    for (word, writes, what) in [
+        (0xFD00_0288u32, false, "str d8, [x20]"),
+        (0x6D02_27E8, false, "stp d8, d9, [sp, #32]"),
+        (0xFD40_02C8, true, "ldr d8, [x22]"),
+        (0x6D42_27E8, true, "ldp d8, d9, [sp, #32]"),
+        (0x5C00_0048, true, "ldr d8, <literal>"),
+        (0x4C40_2006, true, "ld1 {v6.16b-v9.16b}, [x0]"),
+        (0x9E67_0128, true, "fmov d8, x9"),
+        (0x1E69_2100, false, "fcmp d8, d9"),
+    ] {
+        assert_eq!(
+            writes_callee_saved_fp(word),
+            writes,
+            "{what} ({word:#010x})"
+        );
+    }
+}
+
+/// Set once a process-wide stub writes one of d8..d15: chunks compiled afterwards keep their
+/// saves (a stub is compiled before any chunk that branches to it is finished).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+static STUB_WRITES_CALLEE_SAVED_FP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `word` may write one of d8..d15, the low halves of v8..v15 that AAPCS64 makes
+/// callee-saved. Conservative: every SIMD&FP load or store counts its register fields (and a
+/// structure load's next three), and every SIMD&FP data-processing instruction its destination
+/// field, except the integer conversions and moves whose destination is a general register and
+/// the compares, which have none. A data word in the instruction stream can only read as a false
+/// positive, which keeps the saves.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn may_write_callee_saved_fp(word: u32) -> bool {
+    let bank = |r: u32| (8..16).contains(&r);
+    // Loads and stores (op0 = x1x0) with V = 1: Rt, Rt+1..Rt+3, and a pair's Rt2.
+    if word & 0x0A00_0000 == 0x0800_0000 {
+        if word & (1 << 26) == 0 {
+            return false;
+        }
+        let rt = word & 31;
+        return (0..4).any(|k| bank((rt + k) % 32)) || bank((word >> 10) & 31);
+    }
+    // Data processing, SIMD&FP (op0 = x111).
+    if word & 0x0E00_0000 == 0x0E00_0000 {
+        // Conversion between floating point and integer: only SCVTF, UCVTF and FMOV to a
+        // SIMD&FP register (rmode 0, opcodes 2, 3 and 7; rmode 1, opcode 7) write one.
+        if word & 0x7F20_FC00 == 0x1E20_0000 {
+            let rmode = (word >> 19) & 3;
+            let opcode = (word >> 16) & 7;
+            let to_fp = (rmode == 0 && matches!(opcode, 2 | 3 | 7)) || (rmode == 1 && opcode == 7);
+            return to_fp && bank(word & 31);
+        }
+        // FCMP and FCMPE set the flags only.
+        if word & 0xFF20_FC07 == 0x1E20_2000 {
+            return false;
+        }
+        return bank(word & 31);
+    }
+    false
+}
+
+/// Whether `word` writes one of d8..d15: [`may_write_callee_saved_fp`] with stores, which only
+/// read their registers, left out. A SIMD&FP load writes Rt (a structure load the next three
+/// too, a pair Rt2); bit 22 distinguishes loads in every class but the literal form, which only
+/// loads.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn writes_callee_saved_fp(word: u32) -> bool {
+    let load_store = word & 0x0A00_0000 == 0x0800_0000;
+    let literal = word & 0x3B00_0000 == 0x1800_0000;
+    if load_store && word & (1 << 26) != 0 && word & (1 << 22) == 0 && !literal {
+        return false;
+    }
+    may_write_callee_saved_fp(word)
+}
+
+/// Drop a finished chunk's d8..d15 save and restores when nothing else in the chunk writes those
+/// registers: its callers' values then pass through untouched. `at[0]` is the prologue's four
+/// STPs (word 3, after the 128-byte frame's pre-index STP at word 0 and the x19..x22 pairs);
+/// each later entry is an epilogue's four LDPs, followed by the x21..x22 and x19..x20 LDPs and
+/// the post-index LDP that pops the frame. Each group becomes a branch over it, so a call and a
+/// return execute one instruction instead of four each, and the frame shrinks to the 64 bytes
+/// below the save area (fp/lr, x19..x22 and the strictness byte at 48), leaving no slot stale
+/// for the conservative stack scan.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn skip_unused_callee_saved_fp(words: &mut [u32], at: &[usize], writes: bool) {
+    // stp x29, x30, [sp, #-size]! and ldp x29, x30, [sp], #size
+    let push = |size: u32| {
+        0xA980_0000 | (((size / 8).wrapping_neg() & 0x7f) << 15) | (30 << 10) | (31 << 5) | 29
+    };
+    let pop = |size: u32| 0xA8C0_0000 | (((size / 8) & 0x7f) << 15) | (30 << 10) | (31 << 5) | 29;
+    if STUB_WRITES_CALLEE_SAVED_FP.load(std::sync::atomic::Ordering::Relaxed)
+        || env_flag!("TRUST_JS_JIT_KEEP_FP_SAVES")
+    {
+        return;
+    }
+    if writes {
+        return;
+    }
+    if cfg!(debug_assertions) {
+        // Every SIMD&FP instruction came through `Asm::emit_fp`: none outside the save groups
+        // writes d8..d15.
+        let group = |k: usize| at.iter().any(|&start| (start..start + 4).contains(&k));
+        assert!(
+            !words
+                .iter()
+                .enumerate()
+                .any(|(k, &word)| !group(k) && writes_callee_saved_fp(word)),
+            "a SIMD&FP instruction bypassed Asm::emit_fp"
+        );
+    }
+    assert_eq!(
+        at[0], 3,
+        "the d8..d15 saves follow the frame and x19..x22 pushes"
+    );
+    assert_eq!(
+        words[0],
+        push(128),
+        "the prologue pushes the 128-byte frame"
+    );
+    words[0] = push(64);
+    for (k, &start) in at.iter().enumerate() {
+        words[start] = 0x1400_0004; // b .+16: over the group's four instructions
+        if k > 0 {
+            assert_eq!(
+                words[start + 6],
+                pop(128),
+                "an epilogue pops the 128-byte frame"
+            );
+            words[start + 6] = pop(64);
+        }
     }
 }
 
@@ -11147,7 +11357,16 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
         .map(|&(label, _)| label)
         .chain([finish])
         .collect();
+    // Chunks drop their d8..d15 saves only while no stub they can reach writes those registers.
+    let fp_callee_saved = a.writes_callee_saved_fp();
     let (words, offsets) = a.finish_with_offsets(&labels);
+    debug_assert!(
+        fp_callee_saved || !words.iter().any(|&word| writes_callee_saved_fp(word)),
+        "a stub's SIMD&FP instruction bypassed Asm::emit_fp"
+    );
+    if fp_callee_saved {
+        STUB_WRITES_CALLEE_SAVED_FP.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let executable = ExecutableBuffer::from_bytes(unsafe {
         std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
     })?;
@@ -12877,7 +13096,7 @@ fn emit_local_assumed_dense_data_value(
 }
 
 /// One op of a numeric register chain (see [`build_chain`]). Every value the chain produces is a
-/// proven Num held in a callee-saved FP register (d8..d15) instead of the operand stack.
+/// proven Num held in a caller-saved FP register (d16..d23) instead of the operand stack.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -13595,7 +13814,9 @@ mod numeric_chain_tests {
 }
 
 /// Emit a numeric register chain (see [`build_chain`]): the virtual operand stack lives in
-/// d8..d15 (callee-saved — the prologue preserves them), scratch math uses d0..d3. Any guard
+/// d16..d23 (caller-saved: nothing is called while it is live), scratch math uses d0..d3. A
+/// chunk whose code writes none of d8..d15 skips their save and restore (see
+/// [`may_write_callee_saved_fp`]). Any guard
 /// failure spills the virtual values to the real operand stack — in stack order, exactly the
 /// state the ops would have produced — and re-runs the failing op and everything after it
 /// through the generic helper, so semantics are identical on every path. Side-effecting ops
@@ -13650,7 +13871,9 @@ fn emit_chain_marked(
     // Virtual stack: (d-register, known-int-valued). Int-valued means the f64 is integral and in
     // i64 range, so a ToInt32 conversion is a bare fcvtzs with no round-trip guard.
     let mut vregs: Vec<(u32, bool)> = Vec::new();
-    let mut free: Vec<u32> = vec![15, 14, 13, 12, 11, 10, 9, 8];
+    // Caller-saved: the fast path calls nothing while chain values are live, and every bail
+    // spills them before it calls a helper.
+    let mut free: Vec<u32> = vec![23, 22, 21, 20, 19, 18, 17, 16];
     // Receiver cache: slot byte offset → registers holding validated receiver state. The chain
     // fast path calls no helpers, so between element ops nothing can change the slot's tag, the
     // object's exotic status, the ic-safe flag — or, in Mirror mode, the mirror's coherence,
