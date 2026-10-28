@@ -1481,6 +1481,72 @@ main at the stage's end: React -8% and Vue -6% (predicted 10% and 8.5%, without 
 Web Tooling's chai -10% (predicted 6% and 14%); elapsed times recorded at the exit measurement;
 Test262 identical, no suite slower beyond noise.
 
+Landed 2026-10-28, with W5a's matcher entry (637a944c..b6689c4b; Decision 1): order step 1's
+diagnostics, 2a, 2b, 2d (an agent's) and item 6's class-constructor bit.
+- 637a944c (2b): the guarded String intrinsics (charAt, codePointAt, slice) run without the
+  native-call boundary.
+- 1a455cb0 (2a): natives classed at registration run on the caller's operands without the
+  boundary when their class proves that no author code runs: Object.is, Array.isArray,
+  Number.isFinite, isInteger and isSafeInteger, and Boolean as a function for any operands;
+  String, Number, String.fromCodePoint, parseInt, parseFloat and isFinite for primitive
+  arguments; nineteen String.prototype methods for a primitive receiver and arguments. Both
+  backends.
+- 4c3aaa92: a class-constructor kind on the function object replaces the `class_info` probes.
+- ed984cb7: CALLSTAT's miss labels by cause, and its counts by call path (`=2`).
+- 6dad76db..42756ffa (2d): Reflect.has through HasProperty, Reflect.get's String keys through
+  the property ICs, Reflect.set's own data properties written in place, packed Arrays'
+  indexOf, lastIndexOf and includes searched in place, short strings scanned directly.
+- ffe792dc: Proxy traps receive their keys' atoms (W1's follow-up).
+Then (cf3689f7..852a3ec2) the constructor plans' keys, made once (the stage-exit timing's
+RayTrace regression), item 1's first steps, and three corrections to 2a and the diagnostics:
+- cf3689f7: the Prototype.js forwarder and the constructor plans carry their fields' keys.
+- e7d5dee8: an ordinary caller's construct state passes through the direct sequence untouched;
+  a constructing caller's is saved and restored as before (1b in the form that moves no
+  reader).
+- b81c0845: the finish stub hands the completion back in a register and reuses its checks'
+  loads; the context install moves field pairs.
+- 9cd9e918, ef112472: the strict flag and the call-cache epoch through pointers in the record.
+- c8086cea: the static gates as one bit, filled with the call IC (1a without its counting).
+- 753e03f0: d8-d15 saved only by chunks that write them, on a 64-byte frame otherwise; numeric
+  chains keep their values in d16-d23, and the assembler records SIMD&FP writes as it emits
+  them.
+- 944acdf7: the finish stub's fast path runs without a frame of its own; the frame pool
+  reserves its capacity.
+- 3f4a4f80, a57b79b3, 852a3ec2: the call-path counters only in architecture-diagnostics
+  builds; light natives leave an ordinary caller's construct state alone; the collections'
+  methods run on their operands directly again.
+
+Instructions (fat LTO, pinned to the A725 cores, pacing off, median of 3; base c4464dae):
+
+| | base | W3 landed (ffe792dc) | with item 1's steps (852a3ec2) | stage target |
+| --- | --- | --- | --- | --- |
+| Vue | 2.455e9 | -5.8% | -7.0% | -6% |
+| React | 5.221e8 | +0.1% | -3.1% | -8% |
+| Djot | 8.401e8 | -3.4% | -6.0% | -4% |
+| Web Tooling's chai | 1.210e11 | -9.9% | -10.8% | -10% |
+
+Per call (the loop's 14 removed; Sparkplug-only Node's from the census in brackets): direct
+361 to 309 (123), method 447 to 404 (209), closure 388 to 344 (127), recursion 384 to 346
+(180), a function as constructor 877 to 854, a class construction 2,567 to 2,378, the class
+getter 3,735 to 3,535, call 1,023 to 1,004, apply 1,477 to 1,465. Natives: Array.isArray 697
+to 413, Object.is 778 to 486, Number(x) 744 to 468, parseInt 945 to 667, slice(start) 955 to
+665, substring 972 to 702, String.prototype.includes 996 to 672, Reflect.get 1,314 to 988,
+Reflect.set 1,813 to 1,057, Reflect.has 1,212 to 902, a Proxy get trap 3,103 to 2,413;
+WeakMap.prototype.get and Map.prototype.get unchanged (452, 595). RayTrace with a fixed
+iteration count: 12.084e9 instructions at w5a, 12.755e9 at ffe792dc, 12.212e9 with cf3689f7.
+
+Validation: the ARM64 gates on b6689c4b and 852a3ec2 (the lib suite, pacing, the downstream
+crates, GC stress on the new tests, the fixtures, difftest, Test262 identical: 53,575 of
+53,575), zombie's x86-64 lib suite and Test262 for W3 and W5c, and clippy in every
+configuration on both architectures. The dumps differ for W3 in an object field's offset (161
+to 162, the class kind) and one Djot chunk's inlining, and for item 1 in the prologues,
+epilogues and call sequences.
+
+Not done: React's -8% needs item 1's rest (the residency marks, the entry poll, the
+frame-record bookkeeping) and items 3-5; the call table's time ratios wait for the stage's
+end; item 6's call, apply and spread (an agent's, p2-w3-6) wait for item 1's entry; W5a's
+matcher-entry record comes with the W5 agent's Crystal counts.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
