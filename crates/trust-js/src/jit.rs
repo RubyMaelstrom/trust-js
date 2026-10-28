@@ -7847,72 +7847,65 @@ fn emit_direct_call(
         }
         a.str_imm(4, 9, 48);
     }
-    // Save area: [record, constructing (byte), new_target word, padding]. Keep SP 16-aligned.
-    // The interpreter's construct state is cleared for an ordinary callee.
-    a.sub_imm(31, 31, 32);
-    a.stur(9, 31, 0);
+    // ---- run the callee on its own record, then tear it down ----
+    // `reload` puts the record back in x10 once the callee returns. Teardown (completion
+    // transfer, record return, frame pop, tail drain, depth--) is one shared per-chunk stub (see
+    // `emit_direct_finish_stub`) whose fast path never leaves machine code; it leaves w8 = threw.
+    let run_and_finish = |a: &mut asm::Asm, reload: &dyn Fn(&mut asm::Asm)| {
+        a.mov(0, 9);
+        a.ldur(16, 12, IC_CODE_MEM);
+        a.blr(16);
+        // w0 = 1 ok / 0 threw → w1 = threw for the finish stub.
+        let field1 = asm::logical_imm_w(1).unwrap();
+        a.logic_imm_w(2, 1, 0, field1); // eor w1, w0, #1
+        reload(a);
+        #[cfg(test)]
+        {
+            // Count the exact callee while its record/FnFrame still retains its runtime and
+            // Chunk. No borrowed Chunk pointer outlives finish, and w1 (threw) remains intact.
+            let normal = a.new_label();
+            let record = a.new_label();
+            a.ldr_imm(4, 10, cx_chunk);
+            a.cbz(1, false, normal);
+            a.add_imm(
+                4,
+                4,
+                offset_of!(crate::bytecode::Chunk, test_direct_throws) as u32,
+            );
+            a.b(record);
+            a.bind(normal);
+            a.add_imm(
+                4,
+                4,
+                offset_of!(crate::bytecode::Chunk, test_direct_returns) as u32,
+            );
+            a.bind(record);
+            a.ldr_imm(5, 4, 0);
+            a.add_imm(5, 5, 1);
+            a.str_imm(5, 4, 0);
+        }
+        a.bl_label(finish_stub);
+    };
+
+    // ---- construct state ----
+    // An ordinary [[Call]] passes no NewTarget: the callee runs with `constructing` false and
+    // new.target Undefined (an arrow keeps its lexical new.target). A caller that is neither
+    // constructing nor holding a NewTarget already has exactly that state, and every path the
+    // callee can take restores the state it found, so this form saves, clears and restores
+    // nothing: the record alone rides across the call, in a 16-byte save area. A constructing
+    // caller takes the full form after the sequence.
+    let full_state = a.new_label();
+    let finished = a.new_label();
     let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
     a.ldrb_imm(4, construct_base, construct_offset);
-    a.stur(4, 31, 8);
-    a.strb_imm(31, construct_base, construct_offset);
+    a.cbnz(4, false, full_state);
     a.ldr_imm(4, 14, il.new_target as u32);
-    a.stur(4, 31, 16);
-    a.stur(31, 31, 24); // initialized padding cannot retain a stale conservative root
-    let lexical_target = a.new_label();
-    a.ldurb(4, 12, IC_DIRECT);
-    let lexical_bit = asm::logical_imm_w(crate::bytecode::CALL_IC_LEXICAL_THIS as u32).unwrap();
-    a.logic_imm_w(0, 4, 4, lexical_bit);
-    a.cbnz(4, false, lexical_target);
-    a.mov_imm64(4, crate::value::PACK_UNDEFINED);
-    a.str_imm(4, 14, il.new_target as u32); // ordinary calls clear the complete word
-    a.bind(lexical_target); // arrows retain their lexical function environment's new.target
-
-    // ---- run the callee on its own record ----
-    a.mov(0, 9);
-    a.ldur(16, 12, IC_CODE_MEM);
-    a.blr(16);
-    // w0 = 1 ok / 0 threw → w1 = threw for the finish stub; x10 = the callee record.
-    let field1 = asm::logical_imm_w(1).unwrap();
-    a.logic_imm_w(2, 1, 0, field1); // eor w1, w0, #1
-    a.ldur(10, 31, 0);
-    #[cfg(test)]
-    {
-        // Count the exact callee while its record/FnFrame still retains its runtime and
-        // Chunk. No borrowed Chunk pointer outlives finish, and w1 (threw) remains intact.
-        let normal = a.new_label();
-        let record = a.new_label();
-        a.ldr_imm(4, 10, cx_chunk);
-        a.cbz(1, false, normal);
-        a.add_imm(
-            4,
-            4,
-            offset_of!(crate::bytecode::Chunk, test_direct_throws) as u32,
-        );
-        a.b(record);
-        a.bind(normal);
-        a.add_imm(
-            4,
-            4,
-            offset_of!(crate::bytecode::Chunk, test_direct_returns) as u32,
-        );
-        a.bind(record);
-        a.ldr_imm(5, 4, 0);
-        a.add_imm(5, 5, 1);
-        a.str_imm(5, 4, 0);
-    }
-    // Teardown (completion transfer, record return, frame pop, tail drain, depth--): one
-    // shared per-chunk stub (see `emit_direct_finish_stub`) whose fast path never leaves
-    // machine code. w8 = threw.
-    a.bl_label(finish_stub);
-
-    // ---- restore the interpreter's construct state ----
-    a.ldr_imm(14, 19, 72); // ctx.interp (x14 was clobbered by the callee/helpers)
-    a.ldur(4, 31, 8);
-    let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
-    a.strb_imm(4, construct_base, construct_offset);
-    a.ldur(4, 31, 16);
-    a.str_imm(4, 14, il.new_target as u32);
-    a.add_imm(31, 31, 32);
+    a.mov_imm64(5, crate::value::PACK_UNDEFINED);
+    a.cmp_reg_x(4, 5);
+    a.b_cond(C_NE, full_state);
+    a.stp_pre(9, 31, -16); // [record, zero]: the pad cannot retain a stale conservative root
+    run_and_finish(a, &|a| a.ldp_post(10, 11, 16));
+    a.bind(finished);
 
     // ---- pop the arguments and the callee (and skip the consumed this slot); dispatch on
     // threw ----
@@ -7942,6 +7935,46 @@ fn emit_direct_call(
         a.blr(16);
     }
     a.b(done);
+
+    // ---- full form: a constructing caller, or one holding a NewTarget ----
+    // Save area: [record, constructing (byte), new_target word, padding]. Keep SP 16-aligned.
+    // The interpreter's construct state is cleared for the callee and restored after it.
+    a.bind(full_state);
+    #[cfg(test)]
+    {
+        let address = TEST_DIRECT_FULL_STATE.with(|count| count.as_ptr() as usize);
+        a.mov_imm64(4, address as u64);
+        a.ldr_imm(5, 4, 0);
+        a.add_imm(5, 5, 1);
+        a.str_imm(5, 4, 0);
+    }
+    a.sub_imm(31, 31, 32);
+    a.stur(9, 31, 0);
+    let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
+    a.ldrb_imm(4, construct_base, construct_offset);
+    a.stur(4, 31, 8);
+    a.strb_imm(31, construct_base, construct_offset);
+    a.ldr_imm(4, 14, il.new_target as u32);
+    a.stur(4, 31, 16);
+    a.stur(31, 31, 24); // initialized padding cannot retain a stale conservative root
+    let lexical_target = a.new_label();
+    a.ldurb(4, 12, IC_DIRECT);
+    let lexical_bit = asm::logical_imm_w(crate::bytecode::CALL_IC_LEXICAL_THIS as u32).unwrap();
+    a.logic_imm_w(0, 4, 4, lexical_bit);
+    a.cbnz(4, false, lexical_target);
+    a.mov_imm64(4, crate::value::PACK_UNDEFINED);
+    a.str_imm(4, 14, il.new_target as u32); // ordinary calls clear the complete word
+    a.bind(lexical_target); // arrows retain their lexical function environment's new.target
+    run_and_finish(a, &|a| a.ldur(10, 31, 0));
+    // Restore the interpreter's construct state; w8 (threw) survives.
+    a.ldr_imm(14, 19, 72); // ctx.interp (x14 was clobbered by the callee/helpers)
+    a.ldur(4, 31, 8);
+    let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
+    a.strb_imm(4, construct_base, construct_offset);
+    a.ldur(4, 31, 16);
+    a.str_imm(4, 14, il.new_target as u32);
+    a.add_imm(31, 31, 32);
+    a.b(finished);
     true
 }
 
@@ -7950,6 +7983,11 @@ thread_local! {
     static TEST_DIRECT_PACKED_RETURNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // Direct callee errors dispatched only after restoring constructing and new_target.
     static TEST_DIRECT_PACKED_THROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Direct calls whose caller was constructing or held a NewTarget (the sequence's full
+    /// save-and-restore form).
+    pub(crate) static TEST_DIRECT_FULL_STATE: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     /// Numeric-chain property operations compiled with `this` as their receiver.
     static TEST_THIS_CHAIN_OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }

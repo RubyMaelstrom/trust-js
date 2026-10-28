@@ -412,6 +412,116 @@ fn direct_calls_and_frame_teardown() {
     }
 }
 
+/// The construct state across direct calls (ECMA-262 [[Call]] passes no NewTarget). An ordinary
+/// caller already holds what its callee needs, so its sequence saves and restores nothing; a
+/// constructing caller's sequence clears the state for the callee and restores its own after
+/// the callee returns or throws. The callees see new.target Undefined and call natives as
+/// functions; lean constructors read their new.target from the interpreter after the calls; an
+/// arrow keeps its lexical new.target (`Lexical`, whose arrow names new.target, stays
+/// interpreted).
+#[test]
+fn direct_calls_keep_the_construct_state() {
+    let source = r#"
+        function plain() {
+            return (new.target === undefined) + ',' + typeof Number('3') + ',' + typeof Date();
+        }
+        function thrower(k) { if (k & 1) throw new Error('t' + k); return k; }
+        function caught(k) { try { return thrower(k); } catch (e) { return e.message; } }
+        function Ctor(k) {
+            this.inner = plain();
+            try { this.caught = thrower(k); } catch (e) { this.caught = e.message; }
+            this.after = new.target === Ctor;
+        }
+        class Base {
+            constructor(k) {
+                this.inner = plain();
+                try { this.caught = thrower(k); } catch (e) { this.caught = e.message; }
+                this.after = new.target === Base;
+            }
+        }
+        function Lexical() {
+            var arrow = () => new.target === Lexical;
+            this.arrow = arrow();
+            this.after = new.target === Lexical;
+        }
+        function ordinary(n) {
+            var r = '';
+            for (var i = 0; i < n; i++) r = plain() + '|' + caught(i);
+            return r;
+        }
+        function constructing(n) {
+            var r = '';
+            for (var i = 0; i < n; i++) {
+                var c = new Ctor(i), b = new Base(i), l = new Lexical();
+                r = [c.inner, c.caught, c.after, b.inner, b.caught, b.after, l.arrow, l.after]
+                    .join(';');
+            }
+            return r;
+        }
+        [ordinary(3), constructing(3)].join('#');
+    "#;
+    let mut jit = agree(
+        source,
+        "true,number,string|2#true,number,string;2;true;true,number,string;2;true;true;true",
+        &[
+            "plain",
+            "thrower",
+            "caught",
+            "Ctor",
+            "ordinary",
+            "constructing",
+        ],
+    );
+    for name in ["plain", "thrower", "caught"] {
+        settle(&mut jit, name);
+    }
+    let ordinary = "true,number,string|t39";
+    let constructing = "true,number,string;t39;true;true,number,string;t39;true;true;true";
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert_eq!(eval(&mut jit, "ordinary(40)"), ordinary);
+        assert_eq!(eval(&mut jit, "constructing(40)"), constructing);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let counts = || {
+            (
+                super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()),
+                super::TEST_DIRECT_FULL_STATE.with(|count| count.get()),
+            )
+        };
+        let reset = || {
+            super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
+            super::TEST_DIRECT_FULL_STATE.with(|count| count.set(0));
+        };
+        // A concurrent test can exhaust the process-wide call-cache epoch, which sends calls
+        // through the checked helper until their sites refill: retry until a round is direct.
+        let mut seen = (0, 0);
+        for _ in 0..100 {
+            reset();
+            assert_eq!(eval(&mut jit, "ordinary(40)"), ordinary);
+            seen = counts();
+            if seen.0 >= 40 {
+                break;
+            }
+        }
+        assert!(seen.0 >= 40, "ordinary callers: {seen:?}");
+        assert_eq!(seen.1, 0, "an ordinary caller takes the ordinary form");
+        for _ in 0..100 {
+            reset();
+            assert_eq!(eval(&mut jit, "constructing(40)"), constructing);
+            seen = counts();
+            if seen.1 >= 40 {
+                break;
+            }
+        }
+        assert!(
+            seen.1 >= 40,
+            "constructing callers take the full form: {seen:?}"
+        );
+    }
+}
+
 /// Maps and Sets (`Exotic::Collection`) through the ordinary-object guards: named
 /// property loads (slot and operand-stack receivers, a Collection as a prototype hop, method
 /// loads through Map.prototype and Set.prototype), stores, updates and creations (a Map
