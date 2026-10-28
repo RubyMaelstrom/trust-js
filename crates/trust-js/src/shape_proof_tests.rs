@@ -195,7 +195,7 @@ fn uncacheable_shapes_cannot_seed_initializer_transition_plans() {
         fields: vec![InitializerField {
             slot: 0,
             default: None,
-            name: 0,
+            key: crate::atom::names::APPLY.key(),
             cache: 0,
         }],
         shapes: Cell::default(),

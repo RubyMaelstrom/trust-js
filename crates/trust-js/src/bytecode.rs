@@ -3225,13 +3225,16 @@ pub(crate) struct InitializerPlan {
 struct InitializerField {
     slot: u16,
     default: Option<u32>,
-    name: u32,
+    /// The stored name's key, made once with the plan: a construction looks nothing up.
+    key: crate::atom::PropKey,
     cache: u32,
 }
 
 #[derive(Clone, Copy)]
 struct ArgumentsForwarder {
     initializer: u32,
+    /// The initializer's name as a key, made once with the plan.
+    initializer_key: crate::atom::PropKey,
     initializer_cache: u32,
     apply_cache: u32,
 }
@@ -3303,7 +3306,7 @@ impl SimpleConstructor<'_> {
         let field = &self.fields[index];
         (
             field.slot as usize,
-            self.chunk.name_key(field.name),
+            field.key,
             &self.chunk.caches[field.cache as usize],
         )
     }
@@ -20327,9 +20330,16 @@ impl Chunk {
     /// the otherwise short-lived `arguments` exotic. Property and builtin-identity guards remain
     /// live there; any accessor, proxy, `apply` override, or other body shape runs normally.
     #[inline]
+    /// The initializer's name, as text and as its key (made with the plan, so a construction
+    /// atomizes nothing), with the two property caches the forwarder reuses.
     pub(crate) fn jit_arguments_apply_forwarder(
         &self,
-    ) -> Option<(&str, &std::cell::Cell<IcState>, &std::cell::Cell<IcState>)> {
+    ) -> Option<(
+        &str,
+        crate::atom::PropKey,
+        &std::cell::Cell<IcState>,
+        &std::cell::Cell<IcState>,
+    )> {
         let plan = self.arguments_forwarder.get_or_init(|| {
             let [Op::GetPropThis(initializer, initializer_cache), Op::GetMethod(apply, apply_cache), Op::LoadThis, Op::LoadLocal(arguments), Op::CallWithThis(2, _), Op::Pop, Op::ReturnUndef] =
                 self.ops.as_slice()
@@ -20337,8 +20347,9 @@ impl Chunk {
                 return None;
             };
             (self.arguments_slot == Some(*arguments) && &*self.names[*apply as usize] == "apply")
-                .then_some(ArgumentsForwarder {
+                .then(|| ArgumentsForwarder {
                     initializer: *initializer,
+                    initializer_key: self.name_key(*initializer),
                     initializer_cache: *initializer_cache,
                     apply_cache: *apply_cache,
                 })
@@ -20346,6 +20357,7 @@ impl Chunk {
         let plan = plan.as_ref()?;
         Some((
             &self.names[plan.initializer as usize],
+            plan.initializer_key,
             &self.caches[plan.initializer_cache as usize],
             &self.caches[plan.apply_cache as usize],
         ))
@@ -20428,7 +20440,7 @@ impl Chunk {
             fields.push(InitializerField {
                 slot: *test,
                 default: Some(*default),
-                name: *name,
+                key: self.name_key(*name),
                 cache: *cache,
             });
             pc += 6;
@@ -20461,7 +20473,7 @@ impl Chunk {
             fields.push(InitializerField {
                 slot: *slot,
                 default: defaults.get(*slot as usize).copied().flatten(),
-                name: *name,
+                key: self.name_key(*name),
                 cache: *cache,
             });
             pc += 2;
@@ -20495,7 +20507,7 @@ impl Chunk {
             field
                 .default
                 .map(|constant| &self.consts[constant as usize]),
-            self.name_key(field.name),
+            field.key,
             &self.caches[field.cache as usize],
         )
     }
@@ -20548,7 +20560,7 @@ impl Chunk {
                     fields.push(InitializerField {
                         slot: *slot,
                         default: None,
-                        name: *name,
+                        key: self.name_key(*name),
                         cache: *cache,
                     });
                 }

@@ -14258,7 +14258,7 @@ impl Interp {
         args: *const crate::value::Value,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
-        let (initializer_name, initializer_cache, apply_cache) =
+        let (initializer_name, initializer_key, initializer_cache, apply_cache) =
             chunk.jit_arguments_apply_forwarder()?;
         // Reuse the exact property feedback owned by the elided bytecode body. The IC probe
         // walks prototype links by borrowed raw pointer, validates every live shape/descriptor,
@@ -14268,7 +14268,7 @@ impl Interp {
             .try_ic_get(
                 this,
                 initializer_name,
-                crate::atom::PropKey::from_text(initializer_name),
+                initializer_key,
                 initializer_cache,
                 true,
             )?
