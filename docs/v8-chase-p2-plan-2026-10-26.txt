@@ -2086,6 +2086,26 @@ direct construct sequence for `new` (class construction 2,363 instructions, a fu
 constructor 853: an agent's, under way); item 5 (a getter, 1,252; the class-and-getter case
 3,512); item 4 (rest, 1,295); `arguments` (1,707) and item 3 (an environment callee, 1,048).
 
+Then the owner's Decisions 12 and 14 (bfb0af5d, 257d9544, 2026-10-28): the call probe stops
+testing for the exhausted epoch, since no cache records it (a site's fill and the overflow
+cache's insert refuse u32::MAX, and debug builds check every write), and Linux builds link with
+packed relative relocations. Against 4fcd8a42: two fewer instructions a call (direct 271, method
+368, closure 308, recursion 309), and with RELR the loader's 102,848 relative relocations become
+a 27,888-byte bitmap, so an empty script starts in 8.82M instructions instead of 12.54M.
+
+| | the guard dropped | RELR | against c4464dae |
+| --- | --- | --- | --- |
+| Vue | -0.14% | -0.15% | -7.9% (2.261e9) |
+| React | -0.19% | -0.80% | -9.6% (4.721e8) |
+| Djot | -0.18% | -0.48% | -7.8% (7.743e8) |
+| Web Tooling's chai | -0.10% | -0.03% | -11.9% (1.066e11) |
+
+Validation: the ARM64 gate (the lib suite, pacing with its known failure only, GC stress on
+the epoch, megamorphic and closure tests, the fixtures and difftest as the base's, Test262 53,575
+of 53,575, identical; the dumps differ at the call sites) and zombie's x86-64 lib suite (its known
+failure only), clippy and a RELR release build that runs. AGENTS.md notes what Linux builds then
+need (glibc 2.36, a linker with `-z pack-relative-relocs`).
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
