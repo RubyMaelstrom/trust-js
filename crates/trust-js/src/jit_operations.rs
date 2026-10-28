@@ -785,7 +785,99 @@ pub(super) fn emit(
         | Op::IterStepL(..) => {
             emit_op_helper(a, H_ITERATION, pc as u32, unwind);
         }
+        // Decision 20e's elided `arguments` and rest reads: in a fresh frame the slot holds
+        // Undefined and the actual arguments are the record's (`JitCtx::argc`, `JitCtx::args`).
+        // A filled slot (a borrowed frame's, or a materialized object) and every key that is
+        // not an in-range array index take the operation's helper (`jit_exec`).
+        Op::ArgLength(slot, ..) | Op::RestLength(slot, ..) if u32::from(*slot) * 8 + 8 < 4096 => {
+            let skip = if matches!(op, Op::RestLength(..)) {
+                chunk.jit_frame().0 as u32
+            } else {
+                0
+            };
+            emit_elided_length(a, *slot, skip, pc as u32, unwind);
+        }
+        Op::ArgElem(slot) | Op::RestElem(slot) if u32::from(*slot) * 8 + 8 < 4096 => {
+            let skip = if matches!(op, Op::RestElem(_)) {
+                chunk.jit_frame().0 as u32
+            } else {
+                0
+            };
+            emit_elided_element(a, *slot, skip, pc as u32, unwind);
+        }
         _ => return false,
     }
     true
+}
+
+/// Whether the elided value's slot, at `slot`, still holds the fresh frame's Undefined (x9 and
+/// x10 scratch); otherwise branch to `slow`.
+fn emit_elided_slot_check(a: &mut asm::Asm, slot: u16, slow: usize) {
+    a.ldr_imm(9, 22, u32::from(slot) * 8);
+    a.mov_imm64(10, crate::value::PACK_UNDEFINED);
+    a.cmp_reg_x(9, 10);
+    a.b_cond(C_NE, slow);
+}
+
+/// [`Op::ArgLength`] and [`Op::RestLength`]: the actual count less the formals a rest
+/// parameter follows (`skip`, at least 0), pushed as a Number.
+fn emit_elided_length(a: &mut asm::Asm, slot: u16, skip: u32, pc: u32, unwind: usize) {
+    if skip >= 4096 {
+        // More formals than an immediate holds (a rest slot follows them, so the slot bound
+        // excludes this already): the helper.
+        emit_exec(a, pc, unwind);
+        return;
+    }
+    let slow = a.new_label();
+    let done = a.new_label();
+    emit_elided_slot_check(a, slot, slow);
+    a.ldr_imm(9, 19, CTX_ARGC_OFF as u32);
+    if skip != 0 {
+        a.subs_imm_w(9, 9, skip);
+        a.csel_x(9, 31, 9, C_MI); // fewer arguments than formals: none
+    }
+    a.ucvtf_d_w(0, 9);
+    a.fmov_x_d(9, 0);
+    emit_exec_word_store(a, 9, 20, 0);
+    a.add_imm(20, 20, 8);
+    a.b(done);
+    a.bind(slow);
+    emit_exec(a, pc, unwind);
+    a.bind(done);
+}
+
+/// [`Op::ArgElem`] and [`Op::RestElem`]: a key that is a Number naming an int32 index `k >= 0`
+/// with `k + skip` below the count reads argument `k + skip` in place of the key; anything else
+/// (another key, an index past the end, a filled slot) takes the helper.
+fn emit_elided_element(a: &mut asm::Asm, slot: u16, skip: u32, pc: u32, unwind: usize) {
+    if skip >= 4096 {
+        // As in `emit_elided_length`.
+        emit_exec(a, pc, unwind);
+        return;
+    }
+    let slow = a.new_label();
+    let done = a.new_label();
+    emit_elided_slot_check(a, slot, slow);
+    // An int32 Number: its truncation converts back exactly (every other execution word is a
+    // NaN, which compares unordered); -0 is index 0.
+    a.ldur_d(0, 20, -8);
+    a.fcvtzs_w_d(11, 0);
+    a.scvtf_d_w(1, 11);
+    a.fcmp(0, 1);
+    a.b_cond(C_NE, slow);
+    a.cmp_imm_w(11, 0);
+    a.b_cond(C_MI, slow);
+    if skip != 0 {
+        a.add_imm(11, 11, skip);
+    }
+    a.ldr_imm(12, 19, CTX_ARGC_OFF as u32);
+    a.cmp_reg_w(11, 12);
+    a.b_cond(C_HS, slow);
+    a.ldr_imm(13, 19, CTX_ARGC_OFF as u32 + 8); // the arguments' address
+    a.ldr_x_lsl3(14, 13, 11);
+    emit_exec_word_store(a, 14, 20, -8);
+    a.b(done);
+    a.bind(slow);
+    emit_exec(a, pc, unwind);
+    a.bind(done);
 }

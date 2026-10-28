@@ -342,7 +342,6 @@ impl Value {
         self.0 == PACK_EMPTY
     }
 
-    #[cfg(test)]
     #[inline]
     pub(crate) fn is_undefined(&self) -> bool {
         self.0 == PACK_UNDEFINED

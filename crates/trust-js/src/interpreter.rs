@@ -8671,7 +8671,7 @@ impl Interp {
     /// validated an array receiver can use this without releasing and re-borrowing it merely to
     /// repeat the prototype identity check.
     #[inline]
-    fn array_prototypes_unshadowed(&self) -> bool {
+    pub(crate) fn array_prototypes_unshadowed(&self) -> bool {
         let epoch = crate::value::proto_epoch();
         if epoch == u32::MAX {
             return false; // permanently invalidated — never trust the cache

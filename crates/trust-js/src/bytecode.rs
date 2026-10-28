@@ -2381,10 +2381,25 @@ pub enum Op {
     PushIterator(u32, u32, u32, u32),
     /// Leave a protected try/iteration region normally: drop the innermost handler.
     PopHandler,
-    /// `arguments[key]` in a body whose arguments object is never materialized (see
-    /// [`Chunk::lazy_arguments`]): the slot holds a plain Array of the actual arguments. An
-    /// in-range integer index reads it; any other key materializes the exact arguments object.
+    /// `arguments[key]` in a body whose arguments object is elided (see
+    /// [`Chunk::lazy_arguments`]). In a fresh native frame the slot holds Undefined and the
+    /// actual arguments are the frame's (`JitCtx::args`); elsewhere it holds a plain Array of
+    /// them (the VM's entries). An in-range integer index reads the argument; an index past the
+    /// count is undefined while no prototype has index keys; any other key materializes the
+    /// exact arguments object into the slot, which every later read then takes.
     ArgElem(u16),
+    /// `arguments.length` in a body whose arguments object is elided and also read by element
+    /// ([`Op::ArgElem`]): the actual argument count, or the `length` of the Array or object in
+    /// the slot, read through the site's name and cache as [`Op::GetPropLocal`] reads it.
+    ArgLength(u16, u32, u32),
+    /// `rest.length` for a rest parameter whose Array is elided ([`Chunk::rest_elided`]): the
+    /// number of arguments past the formals, or the `length` of the Array in the slot, as
+    /// [`Op::ArgLength`].
+    RestLength(u16, u32, u32),
+    /// `rest[key]` for an elided rest Array, as [`Op::ArgElem`] reads `arguments`: argument
+    /// `n_params + k` for an in-range index, undefined past the end while no prototype has
+    /// index keys, and the exact Array, materialized into the slot, for any other key.
+    RestElem(u16),
 }
 
 /// An active `try` region on the VM's handler stack.
@@ -2622,12 +2637,19 @@ pub struct Chunk {
     /// NewTarget is the interpreter's current value (see [`Compiler::lean_new_target`]).
     pub(crate) lean_new_target: bool,
     /// The local slot of an uncaptured trailing rest parameter. Every fresh-frame entry fills
-    /// it with an Array of the arguments from `n_params` on instead of dropping them.
+    /// it with an Array of the arguments from `n_params` on, unless the Array is elided
+    /// ([`Chunk::rest_elided`]).
     pub(crate) rest_slot: Option<u16>,
+    /// The body reads its rest parameter only as `rest.length` and `rest[key]` (ECMA-262
+    /// Decision 20e's compile-time proof, [`lazy_rest_rewrite`]): the Array is never stored,
+    /// passed, called, captured, written or deleted, so a fresh native frame makes none and
+    /// reads its actual arguments ([`Op::RestLength`], [`Op::RestElem`]); the VM's entries still
+    /// fill the slot with the Array.
+    pub(crate) rest_elided: bool,
     /// The body only reads `arguments.length` and `arguments[key]`: the arguments object can
-    /// never be observed, written or aliased, so `arguments_slot` holds a plain Array of the
-    /// actual arguments instead (`length` is then identical) and element reads use
-    /// [`Op::ArgElem`]. See [`lazy_arguments_rewrite`].
+    /// never be observed, written or aliased, so none is made (Decision 20e): a fresh native
+    /// frame reads its actual arguments, and the VM's entries keep a plain Array of them in
+    /// `arguments_slot` ([`Op::ArgElem`], [`Op::ArgLength`]). See [`lazy_arguments_rewrite`].
     pub(crate) lazy_arguments: bool,
     /// A [`Chunk::lazy_arguments`] body that reads only `arguments.length`: `arguments_slot`
     /// holds that length, the number of actual arguments, and the reads are plain slot loads.
@@ -2859,6 +2881,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             rest_slot: _,
             lazy_arguments: _,
             arguments_count: _,
+            rest_elided: _,
             ops: _,
             jit_needs_activation_state: _,
             has_tail_calls: _,
@@ -7067,6 +7090,10 @@ fn function_body_statements(body: &[Stmt]) -> &[Stmt] {
 #[path = "bytecode_function_directive_tests.rs"]
 mod function_directive_tests;
 
+#[cfg(test)]
+#[path = "elided_arguments_tests.rs"]
+mod elided_arguments_tests;
+
 fn compile_inner(
     func: &Function,
     plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
@@ -7754,6 +7781,11 @@ fn finish_chunk(
         .and_then(|slot| lazy_arguments_rewrite(&mut c.ops, slot, &c.names));
     let lazy_arguments = lazy.is_some();
     let arguments_count = lazy == Some(LazyArguments::Count);
+    // See `Chunk::rest_elided`. A coroutine's frame outlives its caller's argument words.
+    let rest_elided = !c.is_coroutine
+        && !prepared_entry
+        && c.rest_slot
+            .is_some_and(|slot| lazy_rest_rewrite(&mut c.ops, slot, &c.names));
     if c.arguments_length_only
         && !(lazy_arguments && !c.ops.iter().any(|op| matches!(op, Op::ArgElem(_))))
     {
@@ -7782,6 +7814,7 @@ fn finish_chunk(
         rest_slot: c.rest_slot,
         lazy_arguments,
         arguments_count,
+        rest_elided,
         ops: c.ops,
         jit_needs_activation_state,
         has_tail_calls,
@@ -8874,7 +8907,10 @@ fn op_mentions_slot(op: &Op, slot: u16) -> bool {
         | Op::ClassStart(_, a)
         | Op::ClassKey(_, a)
         | Op::ClassDecorator(_, a)
-        | Op::ArgElem(a) => a == slot,
+        | Op::ArgElem(a)
+        | Op::ArgLength(a, ..)
+        | Op::RestLength(a, ..)
+        | Op::RestElem(a) => a == slot,
         Op::IterStepL(a, b)
         | Op::IterCloseIfNotDoneL(a, b)
         | Op::IterAbortIfNotDoneL(a, b)
@@ -8928,11 +8964,128 @@ fn lazy_arguments_rewrite(ops: &mut [Op], slot: u16, names: &[Rc<str>]) -> Optio
         return Some(LazyArguments::Count);
     }
     for op in ops.iter_mut() {
-        if matches!(*op, Op::GetElemLocal(a) if a == slot) {
-            *op = Op::ArgElem(slot);
+        match *op {
+            Op::GetElemLocal(a) if a == slot => *op = Op::ArgElem(slot),
+            Op::GetPropLocal(a, n, c) if a == slot => *op = Op::ArgLength(slot, n, c),
+            _ => {}
         }
     }
     Some(LazyArguments::List)
+}
+
+/// Decision 20e's proof for a rest parameter: its Array is unobservable when its slot is read
+/// only as `rest.length` and `rest[key]`, never stored, passed, called, captured, written or
+/// deleted, so a fresh native frame need not make it (CreateArrayFromList of the arguments past
+/// the formals, ECMA-262 IteratorBindingInitialization of a BindingRestElement). Rewrite the reads
+/// to [`Op::RestLength`] and [`Op::RestElem`] and return true; otherwise leave `ops` unchanged.
+fn lazy_rest_rewrite(ops: &mut [Op], slot: u16, names: &[Rc<str>]) -> bool {
+    let only_reads = ops.iter().all(|op| match *op {
+        Op::GetPropLocal(a, name, _) if a == slot => &*names[name as usize] == "length",
+        Op::GetElemLocal(a) if a == slot => true,
+        _ => !op_mentions_slot(op, slot),
+    });
+    if !only_reads {
+        return false;
+    }
+    for op in ops.iter_mut() {
+        match *op {
+            Op::GetElemLocal(a) if a == slot => *op = Op::RestElem(slot),
+            Op::GetPropLocal(a, n, c) if a == slot => *op = Op::RestLength(slot, n, c),
+            _ => {}
+        }
+    }
+    true
+}
+
+/// The actual arguments of a fresh native frame whose `arguments` object or rest Array is
+/// elided: the count and address its prologue kept (`JitCtx::argc`, `JitCtx::args`), the caller's
+/// words, unchanged for the whole call.
+///
+/// # Safety
+/// `ctx` is a fresh frame's record whose chunk elides its arguments object or rest Array, so its
+/// prologue kept both ([`Chunk::jit_frame_args_needed`]).
+unsafe fn frame_arguments(ctx: &crate::jit::JitCtx) -> &[Value] {
+    // A borrowed frame (OSR, a resumed slice) copies its slots from a live record, which holds
+    // the object or Array itself: only a fresh frame's slot is ever the elided Undefined.
+    debug_assert!(
+        ctx.resume_activation.is_null(),
+        "elided arguments read in a borrowed frame"
+    );
+    if ctx.argc == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller's contract.
+        unsafe { std::slice::from_raw_parts(ctx.args, ctx.argc) }
+    }
+}
+
+/// The array index an elided read's key names, when it is a Number that is one (an integer `k`,
+/// `0 <= k < 2^32 - 1`; -0 is index 0, as ToPropertyKey makes "0"). Any other key, a String
+/// spelling an index included, takes the exact object's [[Get]].
+fn elided_index(key: &Value) -> Option<usize> {
+    match key.view() {
+        ValueView::Num(n) if (0.0..4_294_967_295.0).contains(&n) && n.fract() == 0.0 => {
+            Some(n as usize)
+        }
+        _ => None,
+    }
+}
+
+/// `arguments[key]` ([`Op::ArgElem`]) in a fresh native frame whose arguments object is elided
+/// (Decision 20e): the body's object would be unmapped, or sloppy without formals (no
+/// ParameterMap), so an own index below the count is that argument (ECMA-262
+/// CreateUnmappedArgumentsObject / CreateMappedArgumentsObject). An index at or past the count
+/// names no own property, and the [[Get]] reaches %Object.prototype%, which holds no index key
+/// while the array prototypes' protector holds: undefined. Any other key materializes the exact
+/// object this body would have made into `slot`, which every later read takes, and reads it.
+pub(crate) fn elided_arguments_element(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    arguments: &[Value],
+    slot: &std::cell::Cell<Value>,
+    key: &Value,
+) -> Result<Value, Abrupt> {
+    if let Some(k) = elided_index(key) {
+        if let Some(&value) = arguments.get(k) {
+            return Ok(value);
+        }
+        if i.array_prototypes_unshadowed() {
+            return Ok(Value::Undefined);
+        }
+    }
+    let scope = i.global_env;
+    let object = Value::Obj(i.make_compiled_arguments_object(arguments, &scope));
+    slot.set(object);
+    get_computed_element(i, chunk, pc, &object, key)
+}
+
+/// `rest[key]` ([`Op::RestElem`]) in a fresh native frame whose rest Array is elided (Decision
+/// 20e): the Array would hold the arguments past the formals, so an index below its length is
+/// that argument, one at or past it reaches %Array.prototype% and %Object.prototype%, which
+/// hold no index key while their protector holds (undefined), and any other key materializes
+/// the exact Array into `slot`, which every later read takes, and reads it.
+pub(crate) fn elided_rest_element(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    arguments: &[Value],
+    slot: &std::cell::Cell<Value>,
+    key: &Value,
+) -> Result<Value, Abrupt> {
+    let rest = arguments.get(chunk.n_params..).unwrap_or(&[]);
+    if let Some(k) = elided_index(key) {
+        if let Some(&value) = rest.get(k) {
+            return Ok(value);
+        }
+        if i.array_prototypes_unshadowed() {
+            return Ok(Value::Undefined);
+        }
+    }
+    // SAFETY: `rest` is a live slice of argument words.
+    let array = unsafe { i.make_array_from_raw(rest.as_ptr(), rest.len()) };
+    slot.set(array);
+    get_computed_element(i, chunk, pc, &array, key)
 }
 
 /// The `arguments[key]` read of a lazily represented arguments object (see
@@ -16669,7 +16822,10 @@ fn run_vm_inner(
                 )?;
                 stack.push(v);
             }
-            Op::GetPropLocal(s, n, c) => {
+            // The VM's entries fill an elided arguments object's or rest parameter's slot with
+            // an Array of the arguments (or a materialized object replaced it), whose own
+            // `length` is the count, as the object's would be.
+            Op::GetPropLocal(s, n, c) | Op::ArgLength(s, n, c) | Op::RestLength(s, n, c) => {
                 let obj = slots.read_value(s as usize);
                 if matches!((obj).view(), ValueView::Empty) {
                     return Err(i.throw(
@@ -17206,7 +17362,9 @@ fn run_vm_inner(
                 let obj = pop!();
                 set_computed_element(i, chunk, op_pc, &obj, &key, v)?;
             }
-            Op::GetElemLocal(s) => {
+            // The VM's entries fill an elided rest parameter's slot with its Array: its reads
+            // are the GetElemLocal and GetPropLocal they replaced.
+            Op::GetElemLocal(s) | Op::RestElem(s) => {
                 let key = pop!();
                 let obj = slots.read_value(s as usize);
                 let value = get_computed_element(i, chunk, op_pc, &obj, &key)?;
@@ -20839,15 +20997,18 @@ impl Chunk {
     pub(crate) fn jit_frame_setup_needed(&self) -> bool {
         !self.resumable
             && ((!self.prepared_entry && self.makes_env())
-                || self.rest_slot.is_some()
-                || (self.arguments_slot.is_some() && !self.arguments_count))
+                || (self.rest_slot.is_some() && !self.rest_elided)
+                || (self.arguments_slot.is_some() && !self.arguments_count && !self.lazy_arguments))
     }
 
     /// Whether a fresh frame's prologue keeps the actual argument count and arguments in its
-    /// record (`JitCtx::argc`, `JitCtx::args`): for [`jit_frame_setup`], or for the count a body
-    /// that reads only `arguments.length` keeps in its slot.
+    /// record (`JitCtx::argc`, `JitCtx::args`): for [`jit_frame_setup`], for the count a body
+    /// that reads only `arguments.length` keeps in its slot, or for the reads of an elided
+    /// arguments object or rest Array (Decision 20e), which the frame's arguments serve.
     pub(crate) fn jit_frame_args_needed(&self) -> bool {
-        self.jit_frame_setup_needed() || (!self.resumable && self.arguments_count)
+        self.jit_frame_setup_needed()
+            || (!self.resumable
+                && (self.arguments_count || self.lazy_arguments || self.rest_elided))
     }
 
     #[cfg(test)]
@@ -21226,7 +21387,8 @@ impl Chunk {
             Op::AsyncIterStepL(..) => (0, 1),
             Op::AsyncIterResumeL(..) => (1, 2),
             Op::AsyncIterCloseL(..) => (0, 0),
-            Op::GetElemLocal(_) | Op::ArgElem(_) => (1, 1),
+            Op::GetElemLocal(_) | Op::ArgElem(_) | Op::RestElem(_) => (1, 1),
+            Op::ArgLength(..) | Op::RestLength(..) => (0, 1),
             Op::SetElemLocal(_) => (2, 1),
             Op::SetElemLocalDrop(_) => (2, 0),
             Op::ToPropKey => (2, 2),
@@ -23752,10 +23914,11 @@ thread_local! {
 /// - the activation the chunk's plan describes (`Chunk::make_run_env`: captured parameters,
 ///   vars, lexicals in their temporal dead zone, `this`, hoisted closures, a captured
 ///   `arguments`), installed as the frame's environment with the closure's as its parent;
-/// - a rest parameter's Array of the arguments past the formals;
-/// - the arguments slot's value (an Array standing in for an unobservable object, or the
-///   object itself), unless the body reads only `arguments.length`, whose count the prologue
-///   stored.
+/// - a rest parameter's Array of the arguments past the formals, unless the body only reads its
+///   `length` and elements ([`Chunk::rest_elided`]), which the frame's arguments then serve;
+/// - the arguments object, for a body that observes it; a body that reads only its `length`
+///   and elements ([`Chunk::lazy_arguments`]) gets none (its slot stays Undefined, or holds the
+///   count the prologue stored when it reads only `length`).
 ///
 /// It runs no author code and reaches no safepoint (allocation never collects), so every word
 /// is set before the next one, the poll that ends this call. It never throws.
@@ -23789,7 +23952,7 @@ pub(crate) unsafe extern "C" fn jit_frame_setup(
         ctx.env_raw = Env::as_ptr(&env) as *const u8;
         ctx.env_parent_raw = Env::as_ptr(&closure) as *const u8;
     }
-    if let Some(rest) = chunk.rest_slot {
+    if let Some(rest) = chunk.rest_slot.filter(|_| !chunk.rest_elided) {
         let (n_params, _) = chunk.jit_frame();
         let surplus = args.get(n_params..).unwrap_or(&[]);
         // SAFETY: `surplus` is a live slice of argument words.
@@ -23797,7 +23960,10 @@ pub(crate) unsafe extern "C" fn jit_frame_setup(
         // SAFETY: the record's slots hold `n_slots` initialized words; the rest slot is one.
         unsafe { (*ctx.slots.add(rest as usize)).set(array) };
     }
-    if let Some(slot) = chunk.arguments_slot.filter(|_| !chunk.arguments_count) {
+    if let Some(slot) = chunk
+        .arguments_slot
+        .filter(|_| !chunk.arguments_count && !chunk.lazy_arguments)
+    {
         let value = chunk.arguments_slot_value(i, args, &env);
         // SAFETY: as above, for the arguments slot.
         unsafe { (*ctx.slots.add(slot as usize)).set(value) };
@@ -25490,9 +25656,9 @@ unsafe fn jit_exec_inner(
     // The activation env, reconstructed from the swapped `env_raw` (NOT a dedicated handle
     // pointer: the direct-call sequence swaps env_raw per activation, so this is the only
     // field that's correct for a shared-ctx callee — a separate `env_ref` silently resolved
-    // free names in the CALLER's scope). The aliased handle outlives the run: `run` holds a
-    // local, `run_moved`'s caller keeps one alive, and a direct call pins the callee object
-    // (whose `Callable::User` owns the env) on the caller's operand stack until after finish.
+    // free names in the CALLER's scope). The aliased handle outlives the run: the frame record
+    // reports it to the collector (the activation its prologue made, `jit_frame_setup`), and a
+    // callee closure's is also held by the caller's operand stack and FnFrame until after finish.
     let env_h = std::mem::ManuallyDrop::new(unsafe {
         crate::interpreter::Env::from_raw(
             ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
@@ -25934,9 +26100,25 @@ unsafe fn jit_exec_inner(
             let value = get_computed_element(i, chunk, pc as usize, &obj, &key)?;
             push!(value);
         }
+        // Undefined in the slot: a fresh frame elided the object or Array, and its actual
+        // arguments are the frame's (Decision 20e). Anything else: the Array a VM entry made (a
+        // borrowed frame), or the object a read materialized.
         Op::ArgElem(s) => {
             let key = pop!();
             let list = slots.read_value(s as usize);
+            if list.is_undefined() {
+                let arguments = frame_arguments(ctx);
+                let value = elided_arguments_element(
+                    i,
+                    chunk,
+                    pc as usize,
+                    arguments,
+                    &slots[s as usize],
+                    &key,
+                )?;
+                push!(value);
+                return Ok(());
+            }
             let mut replacement = None;
             let value = lazy_arguments_element(i, chunk, pc as usize, &list, &key, |object| {
                 replacement = Some(*object)
@@ -25945,6 +26127,32 @@ unsafe fn jit_exec_inner(
                 slots.write_value(s as usize, object);
             }
             push!(value?);
+        }
+        Op::ArgLength(s, n, c) | Op::RestLength(s, n, c) => {
+            let base = slots.read_value(s as usize);
+            if base.is_undefined() {
+                let count = frame_arguments(ctx).len();
+                let count = if matches!(chunk.ops[pc as usize], Op::RestLength(..)) {
+                    count.saturating_sub(chunk.n_params)
+                } else {
+                    count
+                };
+                push!(Value::Num(count as f64));
+            } else {
+                let cache = &chunk.caches[c as usize];
+                push!(get_named_property(i, chunk, pc as usize, &base, n, cache)?);
+            }
+        }
+        Op::RestElem(s) => {
+            let key = pop!();
+            let array = slots.read_value(s as usize);
+            let value = if array.is_undefined() {
+                let arguments = frame_arguments(ctx);
+                elided_rest_element(i, chunk, pc as usize, arguments, &slots[s as usize], &key)?
+            } else {
+                get_computed_element(i, chunk, pc as usize, &array, &key)?
+            };
+            push!(value);
         }
         Op::SetElemLocal(s) | Op::SetElemLocalDrop(s) => {
             let keep = matches!(chunk.ops[pc as usize], Op::SetElemLocal(_));

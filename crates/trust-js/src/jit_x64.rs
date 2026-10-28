@@ -139,6 +139,10 @@ impl Asm {
         self.bytes(&[0x49, 0x39, 0x85]);
         self.bytes(&disp.to_le_bytes());
     }
+    fn cmp_qword_r15_rax(&mut self, disp: i32) {
+        self.bytes(&[0x49, 0x39, 0x87]);
+        self.bytes(&disp.to_le_bytes());
+    }
     fn load_tag_r13(&mut self, disp: i32) {
         self.bytes(&[0x41, 0x0f, 0xb7, 0x85]); // movzx eax,word [r13+disp+6]
         self.bytes(&(disp + 6).to_le_bytes());
@@ -890,10 +894,11 @@ pub(super) fn compile_entry(
     ]);
     // A resumed slice starts with the owned live operand prefix, not an empty stack.
     a.bytes(&[0x4d, 0x8b, 0x7c, 0x24, 0x18]); // r15 = [r12+24] (slots)
-                                              // The actual arguments (W3 item 3): every x86-64 entry is a Rust entry, which passes the
-                                              // count and the arguments' address as the code's second and third arguments
-                                              // (`jit::FreshEntry`). A body that builds its environment, a rest parameter or an
-                                              // arguments value keeps both in its record, before anything can clobber them.
+
+    // The actual arguments (W3 item 3): every x86-64 entry is a Rust entry, which passes the
+    // count and the arguments' address as the code's second and third arguments
+    // (`jit::FreshEntry`). A body that builds its environment, a rest parameter or an arguments
+    // value, or reads elided ones, keeps both in its record before anything can clobber them.
     if !borrowed_entry && chunk.jit_frame_args_needed() {
         #[cfg(not(target_os = "windows"))]
         let (count, address) = (6u8, DX); // rsi, rdx
@@ -1242,6 +1247,67 @@ pub(super) fn compile_entry(
             Op::GetProp(..) | Op::GetMethod(..) => a.helper_spflag(H_GET_PROP, pc as u32, unwind),
             Op::GetMethodElem => a.helper_spflag(H_GET_METHOD_ELEM, pc as u32, unwind),
             Op::GetElem | Op::GetElemLocal(_) => a.helper_spflag(H_GET_ELEM, pc as u32, unwind),
+            // Decision 20e's elided `arguments` and rest reads, as ARM64's templates
+            // (`jit::operations`): in a fresh frame the slot holds Undefined and the actual
+            // arguments are the record's (`JitCtx::argc`, `JitCtx::args`). A filled slot (a
+            // borrowed frame's, or a materialized object) and every key that is not an in-range
+            // array index take the operation's helper (`bytecode::jit_exec`).
+            Op::ArgLength(slot, ..) | Op::RestLength(slot, ..) => {
+                let slow = a.label();
+                let done = a.label();
+                a.mov_word_imm(PACK_UNDEFINED);
+                a.cmp_qword_r15_rax(i32::from(*slot) * SLOT_BYTES);
+                a.jcc(NE, slow);
+                a.nr_load(AX, CTX, super::CTX_ARGC_OFF);
+                if matches!(op, Op::RestLength(..)) {
+                    // The arguments past the formals: max(count - n_params, 0).
+                    let counted = a.label();
+                    a.nr_op_imm(5, AX, chunk.jit_frame().0 as i32); // sub rax,n_params
+                    a.jcc(0x89, counted); // jns
+                    a.bytes(&[0x31, 0xc0]); // xor eax,eax
+                    a.bind(counted);
+                }
+                a.bytes(&[0xf2, 0x48, 0x0f, 0x2a, 0xc0]); // cvtsi2sd xmm0,rax
+                a.bytes(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax,xmm0
+                a.store_word_r13(0);
+                a.add_sp(8);
+                a.jmp(done);
+                a.bind(slow);
+                a.helper_spflag(H_EXEC, pc as u32, unwind);
+                a.bind(done);
+            }
+            Op::ArgElem(slot) | Op::RestElem(slot) => {
+                let slow = a.label();
+                let done = a.label();
+                a.mov_word_imm(PACK_UNDEFINED);
+                a.cmp_qword_r15_rax(i32::from(*slot) * SLOT_BYTES);
+                a.jcc(NE, slow);
+                // The key: a Number that is an integer k >= 0 (-0 is index 0). Any other word
+                // is a NaN, which ucomisd reports unordered (PF).
+                a.bytes(&[0xf2, 0x41, 0x0f, 0x10, 0x85]); // movsd xmm0,[r13-8]
+                a.bytes(&(-SLOT_BYTES).to_le_bytes());
+                a.bytes(&[0xf2, 0x48, 0x0f, 0x2c, 0xc0]); // cvttsd2si rax,xmm0
+                a.bytes(&[0xf2, 0x48, 0x0f, 0x2a, 0xc8]); // cvtsi2sd xmm1,rax
+                a.bytes(&[0x66, 0x0f, 0x2e, 0xc1]); // ucomisd xmm0,xmm1
+                a.jcc(0x8a, slow); // jp: not a Number
+                a.jcc(NE, slow); // not an integer
+                a.nr_test(AX);
+                a.jcc(0x88, slow); // js: negative
+                if matches!(op, Op::RestElem(_)) {
+                    a.nr_op_imm(0, AX, chunk.jit_frame().0 as i32); // add rax,n_params
+                }
+                // Past the count, the helper reads the prototypes (or materializes).
+                a.nr_load(DX, CTX, super::CTX_ARGC_OFF);
+                a.nr_cmp(AX, DX);
+                a.jcc(AE, slow);
+                a.nr_load(DX, CTX, super::CTX_ARGC_OFF + 8);
+                a.bytes(&[0x48, 0x8b, 0x04, 0xc2]); // mov rax,[rdx+rax*8]
+                a.store_word_r13(-SLOT_BYTES);
+                a.jmp(done);
+                a.bind(slow);
+                a.helper_spflag(H_EXEC, pc as u32, unwind);
+                a.bind(done);
+            }
             Op::SetProp(..)
             | Op::SetPropDrop(..)
             | Op::SetPropThisDrop(..)
