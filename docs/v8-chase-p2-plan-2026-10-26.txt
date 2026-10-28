@@ -545,6 +545,8 @@ does (Order, step 0).
 14. Linux builds link with packed relative relocations (RELR, 2026-10-28), which need glibc
     2.36 or later where they run.
 15. The worktrees and branches of landed series are deleted (2026-10-28).
+16. Constructions count toward their constructor's inline checkpoints, as calls do
+    (2026-10-28).
 
 ## Non-goals
 
@@ -2105,6 +2107,37 @@ the epoch, megamorphic and closure tests, the fixtures and difftest as the base'
 of 53,575, identical; the dumps differ at the call sites) and zombie's x86-64 lib suite (its known
 failure only), clippy and a RELR release build that runs. AGENTS.md notes what Linux builds then
 need (glibc 2.36, a linker with `-z pack-relative-relocs`).
+
+Then a direct construct sequence for `new` (ba2c536a..b4b31d81, 2026-10-28, an agent's):
+- ba2c536a: a base class without instance elements (fields, private methods, decorator
+  initializers) constructs through the construct cache, as a function does; the fill reads the
+  class-constructor kind (4c3aaa92). Both backends.
+- 9d66739b: on ARM64 a `new` site checks its construct cache in line and runs the constructor
+  through a construct form of the direct sequence (a shared stub per arity outside loops). A lean
+  helper allocates `this` from the live `prototype` read through the cached slot: it runs no
+  author code, never collects, and declines, allocating nothing, when `prototype` is not an
+  Object. The body runs with new.target the constructor, an Object completion replaces `this`,
+  and stack traces print the frame as `new F`. The instance stays in the native stack's save
+  area until the finish stub returns, since the stub's helper fallback releases the record's
+  `this`.
+- b4b31d81: constructions count toward their constructor's inline checkpoints, as calls do
+  (Decision 16): the sequence takes the call form's retry gate from the first run, and the Rust
+  path counts while a checkpoint is pending.
+
+Per iteration against 150899d7: a function as constructor 853 to 735, a class construction 2,363
+to 607, the class and its getter 3,512 to 1,754; the call forms unchanged. Fixtures: Vue +0.10%,
+React +0.03%, Djot -0.28%, chai 0.00% (counting costs 2-4 instructions a construction).
+Validation: the ARM64 gate (the lib suite, pacing with its known failure only, GC stress on the
+construct, constructor-transfer, new.target and frame-teardown tests, the fixtures and difftest
+as the base's, Test262 53,575 of 53,575, identical; the dumps differ in the chunks with `new`
+sites and by the helper table's new entry) and zombie's x86-64 lib suite and clippy. Still on
+the helper: derived classes (they need new.target in the record, item 1b, and environments
+built in the callee's prologue, item 3); classes with instance elements (V8 compiles their
+initializers into the constructor); constructors without a static field layout and
+Prototype.js-style forwarders; and constructors outside the direct sequence's gates (an
+activation, rest parameters, more than 64 arguments, a frame above FRAME_BUF, nesting past 128,
+borrowed frames). Of the function constructor's 735 instructions against the plan's ~550, about
+250 are allocation, which W2e's in-line allocation addresses.
 
 ### Stage-exit timing (2026-10-28)
 
