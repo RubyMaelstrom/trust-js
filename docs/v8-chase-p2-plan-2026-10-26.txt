@@ -551,6 +551,13 @@ does (Order, step 0).
     load builtin, SpiderMonkey's CacheIR stubs and JSC's data ICs do, the shared property stub
     takes the getter case at run time, with the site's getter call cache made lazily; no
     recompile, no growth at the sites.
+18. The deadline watchdog (2026-10-28) follows Node's per-run thread, kept for bursts: the
+    first armed deadline starts it, it serves the deadlines that follow, and it exits after a
+    few seconds with none armed. A thread per deadline measured 36-90 us of the JS thread's time
+    on Crystal, which TRust's URLPattern matching would pay on every match.
+19. ShadowRealm code is interruptible by the host, as in V8 (2026-10-28): a ShadowRealm's
+    interpreter shares its creator's interrupt handle, and an interruption passes through
+    `evaluate` instead of becoming a TypeError.
 
 ## Non-goals
 
