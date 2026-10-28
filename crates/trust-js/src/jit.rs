@@ -6136,11 +6136,25 @@ fn emit_prop_load_inline(
     // state machine at every site. Every fact that made the cached slot authoritative is guarded
     // live; a miss goes to the checked helper, which observes mutations and arbitrary alternate
     // shapes exactly like the generic JIT miss path.
+    // An accessor state (`IC_ACCESSOR` at depth 3 or less) bakes as its depth's data state does:
+    // its probe ends at the descriptor-checking landing, which diverts the live accessor to the
+    // validated accessor landing.
+    let accessor_state = |st: &crate::bytecode::IcState| {
+        (crate::bytecode::IC_ACCESSOR..=crate::bytecode::IC_ACCESSOR | 3).contains(&st.depth)
+    };
+    let plain_depth = |st: &crate::bytecode::IcState| {
+        if accessor_state(st) {
+            st.depth & !crate::bytecode::IC_ACCESSOR
+        } else {
+            st.depth
+        }
+    };
     let bakeable = |st: &crate::bytecode::IcState| {
-        st.depth <= 3
-            && (st.depth < 2
-                || (st.depth == 2 && st.mid_ok & 1 != 0)
-                || (st.depth == 3 && st.mid_ok & 3 == 3))
+        let depth = plain_depth(st);
+        depth <= 3
+            && (depth < 2
+                || (depth == 2 && st.mid_ok & 1 != 0)
+                || (depth == 3 && st.mid_ok & 3 == 3))
     };
     let compact = preferred.filter(bakeable);
     // A polymorphic site (virtual methods over a few receiver classes) bakes each warm way into
@@ -6157,12 +6171,13 @@ fn emit_prop_load_inline(
         None => Vec::new(),
     };
     let emit_baked = |a: &mut asm::Asm, st: crate::bytecode::IcState, miss: usize| {
+        let depth = plain_depth(&st);
         a.add_imm(11, 10, obj_off);
         a.ldrb_imm(14, 11, ex);
         if arr_ok || wrap_ok {
             let recv_exotic_ok = a.new_label();
             branch_exotic_ordinary(a, layout, 14, 15, recv_exotic_ok);
-            if arr_ok && st.depth >= 1 {
+            if arr_ok && depth >= 1 {
                 a.cmp_imm_w(14, layout.exotic_array_tag as u32);
                 a.b_cond(C_EQ, recv_exotic_ok);
             }
@@ -6185,7 +6200,7 @@ fn emit_prop_load_inline(
         a.mov_imm64(16, st.recv_shape as u64);
         a.cmp_reg_w(14, 16);
         a.b_cond(C_NE, miss);
-        if st.depth >= 1 {
+        if depth >= 1 {
             a.ldr_imm(17, 11, pr);
             a.cbz(17, true, miss);
             a.add_imm(11, 17, obj_off);
@@ -6194,7 +6209,7 @@ fn emit_prop_load_inline(
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
-            let expected = if st.depth == 1 {
+            let expected = if depth == 1 {
                 st.holder_shape
             } else {
                 st.mid_shape
@@ -6203,7 +6218,7 @@ fn emit_prop_load_inline(
             a.cmp_reg_w(14, 16);
             a.b_cond(C_NE, miss);
         }
-        if st.depth >= 2 {
+        if depth >= 2 {
             a.ldr_imm(17, 11, pr);
             a.cbz(17, true, miss);
             a.add_imm(11, 17, obj_off);
@@ -6212,7 +6227,7 @@ fn emit_prop_load_inline(
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
-            let expected = if st.depth == 2 {
+            let expected = if depth == 2 {
                 st.holder_shape
             } else {
                 st.mid2_shape
@@ -6221,7 +6236,7 @@ fn emit_prop_load_inline(
             a.cmp_reg_w(14, 16);
             a.b_cond(C_NE, miss);
         }
-        if st.depth == 3 {
+        if depth == 3 {
             a.ldr_imm(17, 11, pr);
             a.cbz(17, true, miss);
             a.add_imm(11, 17, obj_off);
@@ -6235,10 +6250,14 @@ fn emit_prop_load_inline(
             a.b_cond(C_NE, miss);
         }
         a.mov_imm64(13, st.slot as u64);
-        // Baked states are data-only by construction and their shapes now encode the
-        // descriptor class, so the validated slot is provably a data property: take
-        // the guard-free landing.
-        a.b(load_data);
+        if accessor_state(&st) {
+            a.b(load);
+        } else {
+            // Baked data states are data-only by construction and their shapes now encode the
+            // descriptor class, so the validated slot is provably a data property: take
+            // the guard-free landing.
+            a.b(load_data);
+        }
     };
     let generic_entry = a.new_label();
     for (index, st) in baked.iter().enumerate() {
