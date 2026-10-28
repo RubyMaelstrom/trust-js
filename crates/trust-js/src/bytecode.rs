@@ -1299,6 +1299,7 @@ pub struct CallSite {
 }
 
 /// Byte offset of [`CallSite::code_hint`] from the site's first way.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const CALL_SITE_CODE_HINT_OFF: usize =
     std::mem::offset_of!(CallSite, code_hint) - std::mem::offset_of!(CallSite, entries);
 
