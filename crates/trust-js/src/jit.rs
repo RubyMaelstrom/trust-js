@@ -7604,14 +7604,17 @@ fn emit_direct_call(
     const IC_CHUNK_RAW: i32 = 64;
     const IC_CODE_MEM: i32 = 72;
     const IC_PC_OFFS: i32 = 80;
+    // The install moves these pairs with one LDP/STP each.
+    const _: () = assert!(IC_PC_OFFS == IC_CODE_MEM + 8);
+    const _: () = assert!(offset_of!(JitCtx, n_slots) == offset_of!(JitCtx, chunk) + 8);
+    const _: () = assert!(offset_of!(JitCtx, pc_offsets) == offset_of!(JitCtx, code_base) + 8);
+    const _: () = assert!(offset_of!(JitCtx, genv) == offset_of!(JitCtx, global_body) + 8);
+    const _: () = assert!(offset_of!(JitCtx, global_body) == 56);
     let cx_stack_base = offset_of!(JitCtx, stack_base) as u32;
     let cx_env_raw = offset_of!(JitCtx, env_raw) as u32;
     let cx_env_parent_raw = offset_of!(JitCtx, env_parent_raw) as u32;
     let cx_chunk = offset_of!(JitCtx, chunk) as u32;
-    let cx_n_slots = offset_of!(JitCtx, n_slots) as u32;
     let cx_code_base = offset_of!(JitCtx, code_base) as u32;
-    let cx_pc_offsets = offset_of!(JitCtx, pc_offsets) as u32;
-    let cx_ret = offset_of!(JitCtx, ret) as u32;
     // The code-keyed probe is emitted only under these conditions (see `emit_call_code_probe`);
     // without it every hit is an identity hit and the way's recorded environment is the callee's.
     let call_env_from_callee = layout.call_probe_valid
@@ -7823,18 +7826,14 @@ fn emit_direct_call(
     a.str_imm(13, 9, cx_env_raw);
     a.ldr_imm(6, 13, layout.scope_parent as u32);
     a.str_imm(6, 9, cx_env_parent_raw);
+    // Adjacent fields move in pairs: chunk and n_slots (x5), code base and pc offsets.
     a.ldur(4, 12, IC_CHUNK_RAW);
-    a.str_imm(4, 9, cx_chunk);
-    a.str_imm(5, 9, cx_n_slots);
-    a.ldur(4, 12, IC_CODE_MEM);
-    a.str_imm(4, 9, cx_code_base);
-    a.ldur(4, 12, IC_PC_OFFS);
-    a.str_imm(4, 9, cx_pc_offsets);
+    a.stp_base(4, 5, 9, cx_chunk as i32);
+    a.ldp_base(4, 6, 12, IC_CODE_MEM);
+    a.stp_base(4, 6, 9, cx_code_base as i32);
     // Same Realm as the caller (the probe compared genv): its global body and scope.
-    a.ldr_imm(4, 19, 56);
-    a.str_imm(4, 9, 56);
-    a.ldr_imm(4, 19, 64);
-    a.str_imm(4, 9, 64);
+    a.ldp_base(4, 6, 19, 56);
+    a.stp_base(4, 6, 9, 56);
     if with_this {
         // Move the receiver's word as it is into the callee's [48] (its `this_word`), even when
         // the callee never reads `this`: it owns nothing, and the finish stub resets it.
@@ -7923,11 +7922,8 @@ fn emit_direct_call(
         a.bind(normal);
     }
     a.cbnz(8, true, l_unwind); // threw → caller unwind (fields restored)
-                               // Move the complete word; no decode/encode.
-    a.ldr_imm(4, 19, cx_ret);
-    a.stur(4, 20, 0);
-    a.mov_imm64(5, crate::value::PACK_UNDEFINED);
-    a.str_imm(5, 19, cx_ret);
+                               // x2 = the completion word the finish stub took out; no decode/encode.
+    a.stur(2, 20, 0);
     a.add_imm(20, 20, 8);
     #[cfg(test)]
     {
@@ -8493,10 +8489,11 @@ fn emit_handler_clear(a: &mut asm::Asm, record: u32, handlers_len_off: u32) {
 /// The direct-call teardown stub, emitted ONCE per chunk (sites reach it by `bl`; per-site
 /// inlining would grow every call site by ~90 instructions). Entry: w1 = threw, x10 = the
 /// callee's finished activation record (its `JitCtx`), x19 = the caller's context, x21 =
-/// helpers. Exit: w8 = final threw, with the completion moved into the caller's context
-/// (`ret` or `error`) and the record back in the pool; everything else caller-saved is
-/// clobbered. The fast path replicates `jit_direct_finish` for a normal return without a
-/// pending tail call or materialized `extra`.
+/// helpers. Exit: w8 = final threw, and the record back in the pool. A normal completion leaves
+/// in x2, a complete word no context owns (the caller's `ret` stays vacant); a throw leaves its
+/// error in the caller's `error`. Everything else caller-saved is clobbered. The fast path
+/// replicates `jit_direct_finish` for a normal return without a pending tail call or
+/// materialized `extra`.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -8550,7 +8547,8 @@ fn emit_direct_finish_stub(
         a.ldr_imm(9, 10, cx_activation);
         a.cbnz(9, true, slow);
         // FnFrame top: no materialized `extra` (the asm push wrote None; only the callee's own
-        // arguments-object materialization could have filled it)
+        // arguments-object materialization could have filled it). x16 = the top's index, kept
+        // for the pop below.
         a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
         a.ldr_imm(6, 14, (il.fn_frames + il.fnf_ptr_word) as u32);
         a.sub_imm(16, 16, 1);
@@ -8560,19 +8558,18 @@ fn emit_direct_finish_stub(
         a.cbnz(9, true, slow);
         // pool room: len < FRAME_POOL_LIMIT and len < capacity (a push must not reallocate the
         // Vec from machine code). Nothing below touches the pool, the frame stack, or the depth
-        // before the commit, so validating here stays sound.
+        // before the commit, so validating here stays sound. x7 = the length, kept for the push.
         a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
         a.cmp_imm_x(7, FRAME_POOL_LIMIT as u32);
         a.b_cond(C_HS, slow);
         a.ldr_imm(4, 14, (il.frame_pool + il.fp_cap_word) as u32);
         a.cmp_reg_x(7, 4);
         a.b_cond(C_HS, slow);
-        // ---- commit ----
+        // ---- commit (no call or write since the checks: x14, x16 and x7 are still current) ----
         emit_handler_clear(a, 10, handlers_len_off);
-        // Move the completion into the caller: its `ret` is vacant while it runs, so the
-        // record's word moves as it is (it owns nothing).
-        a.ldr_imm(4, 10, cx_ret);
-        a.str_imm(4, 19, cx_ret);
+        // Take the completion out of the record into x2: it owns nothing, so the word moves
+        // as it is, and the sequence pushes it.
+        a.ldr_imm(2, 10, cx_ret);
         a.mov_imm64(5, crate::value::PACK_UNDEFINED);
         a.str_imm(5, 10, cx_ret);
         // Reset the record's `this` (its packed word at [48]) to Undefined, the pooled invariant
@@ -8581,14 +8578,9 @@ fn emit_direct_finish_stub(
         // released, and the record's slots keep their words, which own nothing once it is back
         // in the pool.
         a.str_imm(5, 10, 48);
-        // Bookkeeping (re-read everything).
-        a.ldr_imm(14, 19, 72); // ctx.interp
-                               // FnFrame pop
-        a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
-        a.sub_imm(16, 16, 1);
+        // FnFrame pop
         a.str_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
         // record push: ptr[len] = record; len++ (room validated above)
-        a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
         a.ldr_imm(4, 14, (il.frame_pool + il.fp_ptr_word) as u32);
         a.add_shifted(4, 4, 7, 3);
         a.stur(10, 4, 0);
@@ -8609,6 +8601,11 @@ fn emit_direct_finish_stub(
     a.ldr_imm(16, 21, (H_DIRECT_FINISH * 8) as u32);
     a.blr(16);
     a.mov(8, 0);
+    // The helper moved a normal completion into the caller's `ret`: take it into x2 as the fast
+    // path does, leaving `ret` vacant (after a throw this moves the vacant word itself).
+    a.ldr_imm(2, 19, cx_ret);
+    a.mov_imm64(5, crate::value::PACK_UNDEFINED);
+    a.str_imm(5, 19, cx_ret);
     a.bind(done);
     a.ldp_post(29, 30, 32);
     a.ret();
