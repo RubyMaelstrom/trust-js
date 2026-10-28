@@ -533,6 +533,18 @@ does (Order, step 0).
     2d's Reflect, dense indexOf and string-searcher work; WeakMap's single probe goes to W2g.
     The exits of W1, W6a, W7, W5a and W2a/W2b are timed on a quiet machine before W3's builds.
     The merged stage worktrees, branches and build trees are deleted.
+11. The function-entry poll (2026-10-28): V8's shape. The allocator raises the heap's due word
+    when the live count passes the threshold, cancel and navigation requests set a word the
+    poll reads, and a watchdog thread sets it when a deadline expires, so entries and loop
+    back-edges test one word (12 instructions today, about 4). Collections still run at the
+    next safepoint. Built, measured and gated as its own series.
+12. The call probe's exhausted-epoch guard (2026-10-28) is dropped: the fill refuses u32::MAX,
+    and debug builds assert it there.
+13. W5b's exit (2026-10-28) is accepted as its design note drafted it; the note's census,
+    design and exit move into this plan, and W5b's native tier continues.
+14. Linux builds link with packed relative relocations (RELR, 2026-10-28), which need glibc
+    2.36 or later where they run.
+15. The worktrees and branches of landed series are deleted (2026-10-28).
 
 ## Non-goals
 
@@ -1146,7 +1158,7 @@ shares); Djot's RegExp instructions in the 40-pass run halved, the plan's "exec 
 measurable (5.2e8 today by w5cat.py; predicted 1.7-2.4x); source-map's at most half (5.4e10
 today; predicted a quarter to a half); Test262 identical. strings.js's RegExp cases, which W7's
 exit left to W5, are recorded (predicted ~4x Sparkplug-only Node; the rest is W2's arrays). W5b's
-exit in its design note.
+exit in W5b's section below.
 
 Landed 2026-10-27: items 1 and 2 (958fd73c: the required literal's NEON scan and the
 first-element scan; 753d3aa2: the RegExp protector, checked where the algorithms use it, and
@@ -1198,8 +1210,8 @@ RegExp -6.07%, Djot's 40 passes -1.91%, strings.js's RegExp cases -7.87%, source
 coffeescript -1.10%. The largest single change is in class tests: Octane 302M to 32M,
 source-map 1.24e9 to 0.28e9, coffeescript 2.04e9 to 0.28e9.
 
-Then W5b's first series (7611cf05..606e33fd, an agent's; its census, design and proposed exit in
-target/p2/drafts/w5b-design.txt, the exit awaiting the owner): a per-pattern census
+Then W5b's first series (7611cf05..606e33fd, an agent's; its census, design and exit in W5b's
+section below, Decision 13): a per-pattern census
 (`TRUST_JS_REGEXP_PROF=2`); the matcher keeps no retries for a loop whose shorter runs could only
 fail, resumes a scan past a failed leading loop's run, filters the starts of paths that begin
 with an assertion, and closes case-insensitive elements over case at compile time (item 7); the
@@ -1208,12 +1220,443 @@ compared with a register the poll can clobber), its corpus runs the machine code
 and anchors compile to it. Against main 02d5bd1b: Octane RegExp -9.96%, coffeescript -2.35%,
 source-map -0.62%, Djot -0.48%, strings.js's RegExp cases -0.17%. coffeescript's `clean`
 (`/\s+$/` over its 50 KB source) fell from 10.2M instructions a call to 3.1M, 1.54x
-Sparkplug-only Node's. Against the proposed exit, the backtracking interpreter and class tests are
+Sparkplug-only Node's. Against the exit, the backtracking interpreter and class tests are
 62% of main's on Octane, 61% on source-map and 44% on coffeescript (exit: 30%, 30% and 40%),
 which wants the native tier with captures and alternation. Validation: the ARM64 gate (the lib
 suite, pacing, GC stress on the RegExp tests, the fixtures and difftest as the base's; Test262
 53,575 of 53,575, identical), Test262's 2,518 RegExp files with the tier forced on at once and at
 64 executions, and zombie's x86-64 lib suite (its known failure only).
+
+### W5b: the RegExp native tier and W5's item 7 (census and design, 2026-10-28; Decision 13)
+
+The first census below is zombie's (x86-64); Crystal's (ARM64) and the counts of W5c and of W5b's
+matcher items follow it, under "Crystal (ARM64)". The first series (the matcher items, item 7 and
+the one-byte tier's anchors and declines) landed with W5's record above.
+
+Census (provisional): the W5c tip (c9610dfa, branch p2-w5c), a release build on zombie
+(i7-6700HQ, x86-64) from p2-w5b, which adds a diagnostic: `TRUST_JS_REGEXP_PROF=2` reports, per
+pattern, the matcher instructions dispatched, attempts, first-element scan positions, backtrack
+entries, executions, subject widths and the program's features (instruction kinds, groups, first
+filter, prefilter). Workloads as W5's census: Octane's regexp.js (the fixed 10-run driver),
+Djot's 40 passes, strings.js's RegExp cases, Web Tooling's coffeescript and source-map (their
+single-tool bundles). Dispatched instructions count `Matcher::run`'s steps, not its loops' inner
+elements (`Many` runs) nor the scans. Data and the diagnostic patch: target/p2/w5b-design (data/,
+census-diagnostic.diff); w5cat2.py, beside w5cat.py in target/p2/w5-census, adds the RegExp
+functions written since the census (`regexp_builtin_exec`, which a tail call from `regexp_exec`
+left unclassified, W5c's `find_single` and `subject_slice`). V8 is cited at c8b709085e21, as
+W3's note; its src/regexp/ (common, arm64, x64, experimental) was added to
+target/p2/w3-design/v8-src from the same commit. The engine is cited at c9610dfa.
+
+Matcher work by what a native tier needs (dispatched instructions and attempts over all patterns;
+the shares, of dispatched instructions with attempts in brackets, over each workload's top 40):
+
+| | dispatched | attempts | core (A) | `i` (B, item 7) | lookahead, backrefs (C) | Unicode mode (D) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Octane (10 runs) | 16.4M | 2.42M | 91.5 (77.6) | 8.5 (22.4) | 0 | 0 |
+| source-map | 41.2M | 4.02M | 100 | 0 | 0 | 0 |
+| coffeescript | 78.1M | 14.1M | 76.4 (91.4) | 2.2 (0.8) | 21.4 (7.8) | 0 |
+| strings.js RegExp cases | 2.6M | 0.32M | 0 | 0 | 0 | 100 |
+| Djot, 40 passes | 0.1M | 0.06M | 100 | 0 | 0 | 0 |
+
+Core (A): Char, Any, Class, captures (Save, ClearCaps), alternation (Split, Jmp), Many (greedy
+and lazy), group loops (SetMark, CheckProgress), `^`, `$`, `\b`, with the g, y, m, s and d flags.
+No hot pattern uses lookbehind, counted loops, modifier groups or `v`-mode string sets.
+
+- One pattern each dominates two workloads. source-map's URL pattern
+  `/^(?:([\w+\-.]+):)?\/\/(?:(\w+:\w+)@)?([\w.-]*)(?::(\d+))?(.*)$/` is 99% of its matcher work
+  (40.9M dispatched over 3.97M executions, 9% matching): on a path without a scheme it scans
+  `[\w+\-.]+`, finds no `:`, and retries every shorter run before giving the group up.
+  coffeescript's `clean` `/\s+$/` is 62% (48.2M dispatched, 9.5M attempts, 19.7M backtrack
+  entries for 1,480 executions): every start inside a whitespace run scans to the run's end, fails
+  `$` and retries each shorter run, so a run of k blanks costs O(k^2). Its `/$/m` makes 2.06M
+  attempts over 108,560 executions: a multiline `$` gives the first-element filter nothing.
+- Octane spreads over 237 patterns: the trim `/^\s*|\s*$/g` (32% of its dispatched instructions,
+  1.0M attempts, 0.97M backtracks: no first filter, so every position is an attempt), a URL
+  splitter with 11 groups (25%), `/\b\w+\b/g` (9%), `/^\s*(\S*(\s+\S+)*)\s*$/` (5%), ten
+  cookie readers `/\bname\s*=\s*([^;]*)/i` (8.5% of the instructions, 22% of the attempts: under
+  `i` the required literal can hold no letter, so the prefilter's window admits every start up
+  to each `=`), `/([a-zA-Z]|\s)+/`, a 26-way alternation of literals, `/(\d*)(\D*)/g`.
+- coffeescript's lexer runs its anchored patterns on every chunk: `(?!\d)`, `(?!\s)`, `(?!:)`,
+  `([-+:])\1` and `^(.?)\1*$` put 21% of its matcher work behind lookaheads and backreferences.
+- strings.js's sticky lexer `/[A-Za-z_]\w*|\d+|\s+|\/\/[^\n]*|./uy` is Unicode mode over two-byte
+  subjects for 75% of its executions.
+- The interpreter costs about 20 instructions of dispatch per matcher instruction on x86-64
+  (`tick`, the profiling test, the bounds check and a jump table over 56-byte `Inst`s) before the
+  instruction's own work: one run of `Save, Class, Save, Match`, a Djot-style scan before W5c's
+  single-element path, cost 223 instructions in `Matcher::run` there. V8's native code spends a
+  few instructions an element.
+
+Crystal (ARM64, 2026-10-28): Cortex-A725 cores 10-13 (`taskset`), fat-LTO engines from `git
+archive` exports in fresh target dirs, `TRUST_JS_GC_PACING=0`, `--tier=jit`; user instructions,
+least of 3 (`perf stat -e instructions:u`); profiles classified by w5cat2.py, one sample per
+500,000 instructions, per 2,000,000 for the two bundles. No timing. Builds: c05fc611 (p2-w3's
+tip, main without W5c), b6689c4b (main), and W5b's tip: the design's items 4, 1a-1c and 2
+(W5's item 7) on p2-w5b, 2e2cd39e..99f7fb52 on b6689c4b, counted from an export of the identical
+tree (4929181f). Data, scripts and binaries: target/p2/w5b-crystal (data/, measure.sh,
+census-table.py, w5cat2-table.py, micro-re.py, fault/).
+
+W5c on ARM64 (main's record; user instructions):
+
+| workload | c05fc611 | b6689c4b | change | RegExp's, w5cat2 | matcher's |
+| --- | --- | --- | --- | --- | --- |
+| Octane RegExp | 7.424e9 | 6.974e9 | -6.07% | 4.75e9 -> 4.42e9 | 3.02e9 -> 2.72e9 |
+| Djot, 40 passes | 2.385e9 | 2.339e9 | -1.91% | 0.24e9 -> 0.22e9 | 0.12e9 -> 0.10e9 |
+| strings.js RegExp cases | 1.221e9 | 1.125e9 | -7.87% | 0.86e9 -> 0.80e9 | 0.43e9 -> 0.43e9 |
+| source-map | 1.876e11 | 1.857e11 | -1.04% | 18.2e9 -> 16.3e9 | 10.5e9 -> 8.5e9 |
+| coffeescript | 2.579e11 | 2.550e11 | -1.10% | 15.2e9 -> 12.5e9 | 13.2e9 -> 10.7e9 |
+
+W5c's largest single change is in class tests (Octane 302M -> 32M, source-map 1.24e9 -> 0.28e9,
+coffeescript 2.04e9 -> 0.28e9). The full category tables are in data/w5c-tables.txt; strings.js
+and Djot have 2,000-5,000 samples, so their categories move within sampling noise.
+
+The census on ARM64 (`TRUST_JS_REGEXP_PROF=2`, W5b's tip; "switches off" forces the four matcher
+items off, which reproduces W5a's matcher: its counts are zombie's census's, the matcher's work
+not depending on the platform):
+
+| | dispatched | attempts | backtracks | core (A) | `i` (B) | lookaround, backrefs (C) | Unicode (D) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Octane, switches off | 16.38M | 2.42M | 1.12M | 91.5 (77.6) | 8.5 (22.4) | 0 | 0 |
+| Octane, W5b | 9.92M | 0.75M | 0.17M | 98.9 (98.1) | 1.1 (1.9) | 0 | 0 |
+| source-map, switches off | 41.21M | 4.02M | 0.00M | 100 | 0 | 0 | 0 |
+| source-map, W5b | 40.94M | 3.97M | 0.00M | 100 | 0 | 0 | 0 |
+| coffeescript, switches off | 78.02M | 14.11M | 22.50M | 76.4 (91.4) | 2.2 (0.8) | 21.4 (7.8) | 0 |
+| coffeescript, W5b | 38.82M | 7.39M | 2.41M | 55.2 (83.7) | 4.4 (1.6) | 40.4 (14.7) | 0 |
+| strings.js (either) | 2.58M | 0.32M | 0.00M | 0 | 0 | 0 | 100 |
+| Djot (either) | 0.10M | 0.06M | 0.00M | 100 | 0 | 0 | 0 |
+
+So the native tier's stage A still covers all of source-map's and Djot's matcher work and 99% of
+Octane's after W5b; coffeescript's lookaheads and backreferences (stage C) become 40% of what
+remains, as `clean`'s `/\s+$/` shrinks (48.2M dispatched -> 14.4M, 19.7M backtracks -> 0,
+9.5M attempts -> 4.8M, one per whitespace run) and `/$/m` drops from 2.06M attempts to 0.11M.
+
+W5b's matcher items against main (user instructions; switch lines are the tip with that item
+forced off):
+
+| workload | main | W5b | change | atomic loops off | run skip off | assertion filter off | case closure off | all four off |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Octane RegExp | 6.974e9 | 6.322e9 | -9.35% | -8.94% | -9.35% | -0.74% | -9.36% | +0.00% |
+| Djot, 40 passes | 2.339e9 | 2.342e9 | +0.14% | +0.16% | +0.14% | +0.16% | +0.15% | -0.03% |
+| strings.js RegExp cases | 1.125e9 | 1.130e9 | +0.48% | +0.70% | +0.48% | +0.46% | +0.46% | +0.70% |
+| source-map | 1.857e11 | 1.835e11 | -1.16% | +0.07% | -1.27% | -1.16% | -1.23% | +0.18% |
+| coffeescript | 2.550e11 | 2.492e11 | -2.29% | -1.82% | -1.47% | -1.90% | -1.96% | +0.09% |
+
+- Octane's gain is the assertion filter's (the trim, `\b\w+\b` and the ten cookie readers: those
+  now make 440 attempts for 660 executions instead of 144,760), with atomic loops 0.4 points;
+  source-map's is the atomic loops' (the URL pattern's retries); coffeescript's spreads over all
+  four (run skip 0.8 points, atomic loops 0.5, assertion filter 0.4, case closure 0.3).
+- strings.js's +0.48% is there with every switch on or off: about 17 instructions an execution of
+  the sticky lexer (324,000 executions), from the series' fixed bookkeeping and code layout (the
+  census switch's gate, the leading-run state, the closed and sorted-range flags), not from a
+  path any item takes. Forcing the execution's scan inline made it worse (+1.8%). Djot's +0.14%
+  goes with all four switches off (-0.03%) and is within its run-to-run spread.
+- w5cat2's "backtracking interpreter" plus "class tests", the proposed exit's measure, as a share
+  of main's: Octane 62% (1.59e9 -> 0.99e9), source-map 61% (6.50e9 -> 3.98e9), coffeescript 44%
+  (9.56e9 -> 4.21e9); the matcher in all, 74%, 78% and 50%. coffeescript's RegExp share of all
+  instructions goes from 4.9% to 2.9%. The interpreter/per-exec-setup split follows inlining,
+  which differs between the builds (`exec_impl` is out of line in W5b's), so the matcher's total
+  is the steadier measure.
+
+The series as it landed (7611cf05..606e33fd), with its counts against main and the fix of the
+census's strings.js overhead, is recorded under W5 above.
+
+Per call (W3's method: a warmed loop at N1 and N2 iterations, the difference over N2 - N1, less
+each engine's empty loop: 14 instructions here, Node 0, Sparkplug 104; `clean` over its 50 KB
+source at 20 and 120 iterations, the lexer lines at 20,000 and 120,000; every output agrees;
+target/p2/w5b-crystal/micro):
+
+| instructions per call | main | W5b | Node | Node, Sparkplug only | W5b / Sparkplug |
+| --- | --- | --- | --- | --- | --- |
+| `clean`'s `/\s+$/` over its source | 10,247,839 | 3,126,573 | 2,014,940 | 2,030,474 | 1.54x |
+| source-map's URL pattern, a path | 2,915 | 2,424 | 576 | 703 | 3.45x |
+| source-map's URL pattern, a URL | 7,994 | 7,436 | 2,154 | 2,276 | 3.27x |
+| Octane's trim | 24,856 | 10,405 | 3,579 | 3,764 | 2.76x |
+| Octane's URL splitter | 10,988 | 10,682 | 3,115 | 3,257 | 3.28x |
+| Octane's `\b\w+\b` (`match`, 9 words) | 20,616 | 18,455 | 3,601 | 3,767 | 4.90x |
+| strings.js's sticky lexer, one line | 33,752 | 34,257 | 9,908 | 14,839 | 2.31x |
+| the same line with one two-byte character | 43,679 | 44,067 | 10,936 | 16,408 | 2.69x |
+
+The one-byte tier today on ARM64 (census item 5's baseline: there is no 3a prototype yet; the
+census reports executions and machine-code bytes, not compile time):
+
+| workload | patterns | tier-ups tried | compiled | native runs | machine-code bytes |
+| --- | --- | --- | --- | --- | --- |
+| Octane | 237 | 235 | 18 | 491,721 | 196 |
+| source-map | 241 | 16 | 5 | 3,329,167 | 0 |
+| coffeescript | 290 | 53 | 8 | 25,745 | 0 |
+| strings.js | 2 | 2 | 0 | 0 | 0 |
+| Djot | 37 | 11 | 11 | 27,926 | 0 |
+
+Almost every native run is the Rust loops' (`find_interpreted`, `find_terminal_one_byte_many`):
+the class decline below leaves AArch64 196 bytes of machine code in all. With the declines lifted
+(below), Djot's class and anchor programs compile too (212 to 340 bytes each). RegExp
+compilation as a whole (w5cat2's "compile": parsing, lowering, filters, closure, tier-up) is 22M
+instructions of Octane on main and 35M with W5b, source-map 74M -> 129M, coffeescript 77M ->
+125M: under 0.1% of each, the analyses and the case closure W5b adds at compile time.
+
+What the native tier does today (regex.rs at c9610dfa):
+- A program tiers up after 64 executions (`REGEXP_TIER_UP_THRESHOLD`, :23; `note_execution`,
+  :2695) once a one-byte subject has been seen, never under `i`, `s`, `u` or `v`. One-byte
+  storage is ASCII until W7's step S4, and two-byte subjects stay on the matcher: in-place units
+  can exceed 0xFF.
+- `OneByteNativeProgram::compile` (:1000-1076) takes a program whose body is either one terminal
+  `Many` of a one-byte Char, Any or a Class with its 256-entry LUT, run by a Rust loop
+  (`find_terminal_one_byte_many`, :1184), or a straight line of such Chars, Anys, Classes and
+  non-multiline `^`/`$` with at least one non-literal. Captures, alternation, any other
+  quantifier, lookaround, backreferences and `\b` decline it.
+- Machine code (`OneByteNativeCode::compile`, :415-470): at most 256 ops, no assertions on
+  either backend, and no Class on AArch64 (:1058-1076); the rest runs the ops through a Rust loop
+  (`find_interpreted`, :1114). Emitters: x86-64 :586-711, AArch64 :890-992, with their own small
+  assemblers, unix only. The candidate loop calls `regexp_native_poll` (:395) at every start
+  position (`call rax` :627, `blr x16` :920): a call and `RuntimeInterrupt::current_reason` per
+  candidate, where V8 compares the stack pointer at each backtrack.
+- In the census the tier was Djot's "native code" (1.6%), almost all of it `find_interpreted`:
+  on AArch64 Djot's class programs never reach machine code.
+- The AArch64 "release-build termination fault" (the plan's regex.rs:1156 at 56c28010, now
+  :1058) was most likely a bug fixed since, by reading. 51fbed49 (2026-09-06) added the emitters
+  and, in the same commit, the class decline. Its AArch64 loop branched on the flags right after
+  `blr x16` (`b.ne interrupted`, no compare): AAPCS64 leaves NZCV undefined across a call, and
+  the poll returned `u8`, whose upper bits w0 does not define. When the flags happened to read
+  "not equal", the code added 1 to w0 and returned status 1, "match", with the output still the
+  `{0, 0}` the caller initialized: a false empty match at 0. A global replace or exec loop then
+  never advances (an empty match at 0 sets `lastIndex` to 0, AdvanceStringIndex moves it to 1,
+  and the next exec matches at 0 again), which is "termination lost on a no-match tail" in
+  release, where the poll's flags differ from debug's. The same false empty match is the
+  "anchored no-match into a false empty match" behind the assertion decline (jQuery's
+  vendor-property test). 5967822c (2026-09-10) compares w0 after the call (:921) and returns
+  `u32` (:395), with comments naming both causes; the x86-64 loop has tested `al` after its call
+  from the start, so that path was sound. The declines were not revisited. Still fragile: `sticky`
+  arrives as a `u8` in w3 and the code compares all of w22. Crystal check: a release build of
+  c9610dfa with both declines removed, run under the generated harness (regex_native_generated.rs),
+  Test262's RegExp suites with `TRUST_JS_REGEXP_TIER_UP_AT=1`, and global replaces over subjects
+  whose tails do not match; then the same build with the compare at :921 removed, which should
+  reproduce the fault.
+  Crystal's check (2026-10-28; two no-LTO release builds of 99f7fb52's tree with both declines
+  lifted, the second also with the pre-fix poll: `u8` return and no compare after `blr x16`;
+  target/p2/w5b-crystal/fault):
+  - With the compare, the class programs are sound. Test262's RegExp suites (2,518 files) pass
+    with `TRUST_JS_REGEXP_TIER_UP_AT=1` and at 64; global replaces and exec loops over no-match
+    tails give Node's output with 2,796 bytes of machine code. But the engine's own
+    `anchors_inside_a_pattern_keep_holding_after_the_pattern_tiers_up` fails: both emitters test
+    `^` and `$` against the candidate's start (`cmp x21, #0` and `cmp x21, x25` on AArch64,
+    `test r14, r14` and `cmp r14, r11` on x86-64), not the start plus the anchor's offset, so
+    `/a^/`, `/a^b/`, `/x$y/` and `/a.^/` match once tiered up. The class decline can be lifted;
+    the assertion decline stays until both emitters add the offset.
+  - With the pre-fix poll the fault reproduces. `"ab xy".replace(/[ab]c/g, "#")` never ends at
+    tier-up 1, nor does the global-replace script; the RegExp suites fall to 2,464 of 2,518 (8
+    timeouts, 46 wrong results) and the regex unit tests hang. Disassembly shows why: the no-
+    interrupt path of `RuntimeInterrupt::current_reason` sets no flags (`ldarb`, three `tbnz`), so
+    `b.ne` reads the loop's own `cmp x21, x25` from the failed candidate (current < last: NE) and
+    returns status 1 with the output `{0, 0}`.
+  - The generated harness (regex_native_generated.rs) passes in both builds because it never runs
+    machine code: `OneByteNativeProgram::find` is `find_interpreted`, and only the engine's
+    `find_ascii` enters the emitted code. It should call `find_ascii`.
+  Done on p2-w5b: both emitters test an anchor at the candidate start plus its offset (1cf6e70e;
+  the x86-64 `$` also compared with r11, which the poll call may clobber); the corpus and the
+  tier's differential tests call `find_ascii`, and the corpus gained anchors inside patterns, which
+  it fails on the old emitters (299bbdf9); both declines are lifted (606e33fd). Test262's RegExp
+  suites pass at tier-up 1 and 64, and the lib tests at tier-up 1 on both backends.
+
+What V8 does (c8b709085e21):
+- Single tier by default: a pattern is compiled to native code at its first execution
+  (`regexp_tier_up` with `regexp_tier_up_ticks` 0, flag-definitions.h:3512-3539;
+  `EnsureCompiledIrregexp`, regexp.cc:837-893), separately for one-byte (Latin-1) and two-byte
+  subjects (`CreateNativeMacroAssembler`, regexp.cc:1009-1030). The bytecode interpreter
+  (regexp-bytecode-generator.cc, regexp-interpreter.cc) serves jitless and a nonzero tick count;
+  even then a subject of 1,000 units or more, or global execution, tiers up at once (regexp.cc:
+  1283-1310; js-regexp.h:162). Patterns longer than `kMaxOptimizedPatternLength` compile without
+  optimizations; more than 65,536 registers is an error (regexp.cc:1366-1402,
+  regexp-macro-assembler.h:37). `--regexp-assemble-from-bytecode` (off by default; flag-
+  definitions.h:3544-3546) builds native code from the bytecode one instruction at a time
+  (regexp-code-generator.h:19-80), the shape proposed for item 3 below.
+- Compilation: the AST becomes a node graph wrapped in capture 0, behind a lazy `.*?` loop unless
+  anchored or sticky (`PreprocessRegExp`, regexp-compiler.cc:6469-6512); one pass analyzes it and
+  `Assemble` emits through a macro assembler with a native backend per architecture and the
+  bytecode generator as another (regexp.cc:1363-1495). A pattern anchored at its end with a
+  bounded length starts from the end (`SetCurrentPositionFromEnd`, regexp.cc:1466-1475); global
+  execution loops inside the generated code (GLOBAL, GLOBAL_NO_ZERO_LENGTH_CHECK,
+  GLOBAL_UNICODE, regexp.cc:1477-1485, regexp-macro-assembler.h:386-391).
+- Captures are registers, two per group: on ARM64 the first 16 live in x0-x7, two 32-bit positions
+  per register, the rest in the frame (regexp-macro-assembler-arm64.h:202-205, :226-281); w24 holds
+  the "unset" value for clearing (:264). Changes are deferred along a Trace, the path being
+  generated (regexp-compiler.h:292-505); at a choice point `Trace::Flush` pushes the old value of
+  each affected register (RESTORE), or notes it for clearing (CLEAR) or for nothing (IGNORE), and
+  emits undo code reached by backtracking: pop or clear, then backtrack on
+  (regexp-compiler.cc:511-527, 611-650, 706-880). Loop iterations clear their captures with
+  `ActionNode::ClearCaptures` (:981).
+- Alternation: a ChoiceNode tries its alternatives in order. Quick checks load up to four
+  characters and compare them under a mask to skip alternatives that cannot start here
+  (`GetQuickCheckDetails`, :2095; `EmitQuickCheck`, :1965); the unanchored search skips ahead
+  with a Boyer-Moore lookahead or SIMD scans (`EmitOptimizedUnanchoredSearch`, :4621;
+  `BoyerMooreLookahead::EmitSkipInstructions`, :3976; `SkipUntil*`,
+  regexp-macro-assembler-arm64.cc:655-1268), and disjoint alternatives dispatch on one masked
+  compare (`regexp_masked_dispatch`, :5393).
+- Loops: fixed-length greedy loops step back without pushing a record per iteration
+  (`SpecialLoopState`, regexp-compiler.h:507-520). A loop whose retries are futile drops its
+  backtracking (`AtomicLoopKind`, regexp-nodes.h:238-252): its continuation is `$` then accept
+  (kAtEnd), always succeeds at the greedy extent, as `\D*` after `\d*` in `/(\d*)(\D*)/`
+  (kTotal), starts with `\b` over a word-character body (kBoundary), or starts with characters
+  disjoint from the body's (kDisjoint).
+- The backtrack stack is per isolate, 32-bit slots, 1 KB static, then grown on the heap up to 64
+  MB (regexp-stack.h:62-127). Generated code pushes code offsets, positions and saved registers,
+  checks a limit kept 32 slots short of the end after its pushes (`CheckStackLimit`,
+  regexp-macro-assembler-arm64.cc:2303-2307; `PushBacktrack`, :1946-1960) and calls out to grow
+  it. Every backtrack also compares sp with the JS stack limit, which interrupt requests lower
+  (`EmitBacktrack`, :195-219; `CheckPreemption`, :2293-2300). An optional backtrack limit counts
+  backtracks and fails, or falls back to the experimental linear-time engine, which is off by
+  default (`SetBacktrackAndExperimentalFallback`, regexp.cc:1060-1077; flag-definitions.h:
+  3622-3630).
+- Case independence is compiled in. Classes under `i` gain their case equivalents
+  (`TextNode::MakeCaseIndependent`, regexp-compiler.cc:2902-2922; `CharacterRange::
+  AddCaseEquivalents`, regexp-compiler-tonode.cc:1743, from ICU's case closure minus the
+  characters ECMA-262's Canonicalize keeps apart, special-case.h:20-60), under `iu`/`iv` by simple
+  case folding (`AddUnicodeCaseEquivalents`, regexp-compiler-tonode.cc:512-540). A character
+  becomes its one to four equivalents (`GetCaseIndependentLetters`, regexp-compiler.cc:1575), and
+  two that differ in one bit match under a mask in one compare (`ShortCutEmitCharacterPair`,
+  :1077-1103; `EmitAtomLetter`, :1685).
+
+Design (gains are shares of the W5 census's instructions, 56c28010 no-LTO, from the plan's W5b
+paragraph: the backtracking interpreter and class tests are about 9% of Octane's, coffeescript
+3.6%, strings.js 14%, source-map 2.8%, and in the census Djot 1.5% besides 1.6% in the one-byte
+tier; coverage from the table above; native code assumed to remove 75-85% of the matcher work it
+covers, counted after item 1's):
+1. The matcher's futile retries (Rust only, both tiers, no dump change):
+   a. Atomic loops, as V8's four kinds: a greedy `Many` whose continuation is non-multiline `$`
+      and then the match, always succeeds at the greedy extent, starts with `\b` over a
+      word-character body, or starts with a set disjoint from the loop's takes no Greedy
+      record, so it never retries shorter runs. coffeescript's `\s+$`
+      (kAtEnd), source-map's `[\w+\-.]+` before `:` (kDisjoint), Octane's `\s*$`, `(\d*)(\D*)`
+      (kTotal) and `\b\w+\b` (kBoundary).
+   b. Restart past a failed atomic loop: when such a loop, first in the program, ran to `e` and the
+      continuation failed, no start inside its run can match (the run from there ends at `e` too,
+      and the continuation sees the same `e`), so the scan resumes at `e`. coffeescript's restarts
+      inside every whitespace run: O(k) for a run of k blanks instead of O(k^2).
+   c. First-element filters for assertion-led programs: a multiline `$` admits line terminators
+      and the end, `\s*$` the loop's set and the end, an alternative led by `^` position 0 and,
+      under `m`, line starts. coffeescript's `/$/m` (2.06M attempts), Octane's trim (1.0M).
+   Gains: coffeescript ~2.3% (`clean` from 2,150 us a call toward Sparkplug-only Node's 375),
+   source-map ~1% (its URL pattern's retries), Octane ~1%. Risk: a misclassified loop drops a
+   match that a retry would have found; each kind is a proof over the program, tested against
+   the matcher with the analysis forced off (a switch per item, as W5a's).
+2. Case closure at compile time (W5's item 7, Rust only): under `i`, every Class closes over
+   ECMA-262's case relation: Canonicalize's for legacy patterns (simple uppercasing, never
+   folding non-ASCII onto ASCII, §22.2.2.7.3), simple case folding for `u` (regex_fold.rs's
+   FOLD_CANON and orbits); `v`-mode sets are closed already (05e1f798, `ClassSet::
+   close_over_case`, :7337). A Char becomes its equivalence set, compiled as a Char, a two-member
+   mask, or a small Class. Matching then tests membership with no folding (`CharClass::matches`'
+   orbit loops, :1878-1921, go for compiled classes), the 256-entry LUTs serve `i` patterns, and
+   the prefilter and first-element filter scan for case-closed sets: Octane's cookie readers get
+   a real prefilter. Backreferences under `i` keep runtime Canonicalize. Gains: case folding at
+   match time was at most 0.11% in the census; the value is the filters (Octane's 22% of
+   attempts) and 3b. Risk: Canonicalize's exceptions (ß, ẞ, the Kelvin sign, and characters
+   whose uppercase is ASCII); a test over every BMP code point compares the closed sets with
+   `canonicalize_legacy` and `fold_canon`, as V8 generates special-case.cc.
+3. The native tier: compile the matcher's `Inst` program itself, one template per instruction,
+   for each subject width (V8's assemble-from-bytecode shape). `Matcher::run` stays the reference
+   and the fallback for everything a program uses that the tier does not.
+   a. Core, both backends: Char, Any, Class (one-byte LUT; two-byte LUT below 256, else ranges
+      searched inline for a few, by helper for more), Save with W5c's undo rules (records above
+      the floor, one first-write record per slot at the root floor, 46c93827), Split with the
+      first-instruction tests `branch_may_match` makes resolved at compile time, Jmp, the match,
+      `^`/`$`/`\b` with their flags resolved statically, greedy and lazy Many (records and retry
+      stubs; 1a's atomic loops without), SetMark and CheckProgress, ClearCaps with its snapshot;
+      one-byte and two-byte subjects. The candidate loop runs in the generated code with the
+      first-element test in line, calling the Rust vector scans for long skips. Coverage: Octane
+      91.5%, source-map 100%, coffeescript 76%, Djot 100%.
+   b. Item 2's closed `i` programs: Octane +8.5%, coffeescript +2.2%.
+   c. Lookaheads (a frame record and the capture snapshot, as `LookFrame`), backreferences
+      (inline unit compare; `i` through a helper), counted loops, modifier groups (flags fixed per
+      instruction at compile time): coffeescript +21.4%.
+   d. Unicode mode (surrogate pairs stepped as one element) and lookbehind: strings.js 100%.
+      `v`-mode string sets (StringSet) stay on the matcher.
+   Machine state: an entry `fn(*mut NativeMatch) -> u32` with today's statuses plus resource
+   exhaustion. Callee-saved registers hold the subject, length, position, the context, the
+   capture base and the backtrack stack's base, top and limit (AArch64 x19-x28; x86-64 rbx, rbp,
+   r12-r15 and the frame). Captures and marks stay in the program's `MatchScratch` (3708989b).
+   The backtrack stack is the scratch's storage taken as 16-byte native records (a resume or
+   undo-stub address and an operand), grown by a Rust helper that enforces
+   `MAX_BACKTRACK_STATE` (:5859) as the matcher does. A pop jumps to the record's address;
+   undo stubs restore and pop again, as V8's undo code (regexp-compiler.cc:861-884). Polling: a
+   counter in a register, decremented at each backtrack and candidate, loads RuntimeInterrupt's
+   state word at zero; deadlines go through the Rust helper every 2^14 steps
+   (`INTERRUPT_POLL_MASK`). Tier-up: after 64 executions as now, or at once for a subject of
+   1,000 units or more (V8's rule); each width compiles on first use; one ExecutableBuffer per
+   program and width (jit.rs:1564-1600), its code listed in the perf map as today. The one-byte
+   tier (`OneByteNativeProgram`, both emitters, `find_terminal_one_byte_many`) goes once 3a
+   covers its subset, which also retires the fault above; until then its declines are lifted
+   only after the Crystal check.
+   Gains beyond 1's: Octane 6.0-6.8% (with 3b; about a sixth of what W5a leaves), source-map
+   1.4-1.5%, coffeescript 0.8-1.0%, with 3d strings.js 10.5-12%, Djot under 1% (W5c's
+   single-element path took most of its matcher work; its RegExp cost now lies in W2's arrays).
+   Risks: two code generators on two backends; every compiled program runs under the
+   differential gate below, and the matcher remains the reference. Code memory: an mmap per
+   program and width costs a page each, so Web Tooling's hundreds of patterns may need a shared
+   arena. Polling must bound the time to an interrupt in every loop. AAPCS64's undefined flags
+   across calls and unextended narrow arguments are the fault's lesson: compare results
+   explicitly and extend every argument narrower than a register. Windows' x64 ABI stays on the
+   matcher, as today's tier does. Garbage collection: matching allocates nothing and runs no
+   JavaScript, and the caller keeps the subject rooted.
+   Dumps and tests: the JIT's dumps do not change; `TRUST_JS_REGEXP_CODEDUMP=<source>` prints a
+   compiled program's words for review, as `TRUST_JS_JIT_CODEDUMP` does; the generated harness
+   (scripts/gen-regexp-native-harness.py, regex_native_generated.rs) grows to each stage's
+   instruction set; switches force the tier off (`TRUST_JS_REGEXP_TIER_UP_AT=0`, as now) and
+   force it on (`=1`).
+4. Diagnostics: the per-pattern census (`TRUST_JS_REGEXP_PROF=2`, the patch in w5b-design) as a
+   documented switch, with native executions and compiled code bytes per pattern.
+
+Order:
+1. 4 and 1 (Rust only, both backends): coffeescript's and source-map's largest costs, and the
+   matcher's results unchanged by construction.
+2. 2 (item 7): closed classes and case-closed filters, which 3b needs.
+3. The Crystal check of the AArch64 fault; lift the declines if it holds.
+4. 3a on x86-64 (prototyped on zombie) and AArch64, behind the gate; then 3b, 3c, 3d; the
+   one-byte tier goes with 3a.
+
+The differential gate (every stage of 3, before it lands):
+- A verify switch, `TRUST_JS_REGEXP_NATIVE_VERIFY=1`: each native execution also runs the matcher
+  and compares the result, every capture span and the error kind (interruption, resource
+  exhaustion), and aborts with the pattern, flags, subject and start on a difference.
+- Test262's RegExp suites (built-ins/RegExp, String.prototype's match, matchAll, replace,
+  replaceAll, search and split, annexB's RegExp, language/literals/regexp: 2,518 tests) at
+  --tier=jit threshold 8 with the tier forced on (`TRUST_JS_REGEXP_TIER_UP_AT=1`) and verify on, and
+  with the tier off; both reports identical to the base's.
+- A fuzzed corpus: patterns generated over each stage's grammar plus near misses (programs one
+  unsupported instruction away), against one-byte, two-byte and surrogate-bearing subjects with
+  line terminators and case variants, sticky and global, from fixed seeds; at least 1M cases a
+  stage, with differences reduced to a minimal pattern and subject.
+- The census workloads' patterns: every pattern the five workloads compile, with subjects
+  sampled from their executions (recorded by the census switch), replayed under verify; and the
+  workloads themselves, run with the tier off and on, with identical output.
+- Interruption and limits: deadlines and cancellation during native scans and backtracking, and a
+  pattern exhausting `MAX_BACKTRACK_STATE` under a lowered limit, behave as the matcher does.
+
+Exit (agreed, Decision 13; Crystal, fat LTO, pinned, pacing off, against W5a's exit build):
+- The census's "backtracking interpreter" and "class tests" instructions (w5cat2) at most 30% of
+  W5a's on Octane RegExp and source-map, 40% on coffeescript, and, with 3d, 50% on strings.js's
+  RegExp cases.
+- coffeescript's `clean` within 1.5x of Sparkplug-only Node in the same session (today 5.7x).
+- Octane RegExp's score at least 1.15x W5a's (predicted 1.2-1.3x).
+- Test262 identical; the gate without a difference over Test262's RegExp suites, the fuzzed
+  corpus and the census workloads' patterns; the AArch64 fault reproduced on the pre-fix code
+  and absent from the tier that lands.
+
+Census to take on Crystal after the session (fat LTO, from `git archive` exports in fresh target
+dirs, pinned to cores 10-13, `TRUST_JS_GC_PACING=0`). Taken 2026-10-28, under "Crystal (ARM64)"
+above: item 1 as W5c's counts against c05fc611 (main without W5c) rather than 56c28010; items 2,
+3 and 4; item 5 as the one-byte tier's baseline until 3a exists.
+1. 56c28010 and c9610dfa: w5cat2.py on Octane RegExp, Djot's 40 passes, strings.js's RegExp
+   cases, source-map and coffeescript, with the matcher's sub-categories (interpreter, class
+   tests, native code, per-execution setup) and their instructions, so that W5b's shares start
+   from W5a's tip rather than from the census.
+2. The per-pattern census of those five workloads on ARM64 (p2-w5b's diagnostic build), for the
+   coverage by stage that the table above gives for x86-64.
+3. Per-call costs of the dominant patterns (W3's method: a warmed loop at 200,000 and 1,200,000
+   iterations, the difference over 1,000,000): `clean`'s `/\s+$/` over its source, source-map's
+   URL pattern on a path and on a URL, Octane's trim, URL splitter and `\b\w+\b`, strings.js's
+   sticky lexer, each against Node in full and limited to Sparkplug.
+4. The AArch64 fault check above (two release builds, the harness, Test262's RegExp suites with
+   the tier forced on, global replaces over subjects with tails that do not match).
+5. Native code bytes and compile time per program (`TRUST_JS_REGEXP_PROF` reports both) on the
+   five workloads, once a prototype of 3a exists.
 
 ### W3: calls (census and design, 2026-10-27; exit agreed, Decision 10)
 
