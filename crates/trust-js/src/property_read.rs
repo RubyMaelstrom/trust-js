@@ -185,9 +185,9 @@ impl Interp {
         slot: u32,
         name: &str,
         receiver: &Value,
-        // The read's chunk and property cache: when the site's machine code calls getters
-        // directly, a user getter's call here fills the site's getter call cache.
-        site: Option<(&crate::bytecode::Chunk, u32)>,
+        // The read's chunk, operation and getter form (see `bytecode::GetterTable`): a user
+        // getter's call here fills the read's getter call cache, which its helper stub probes.
+        site: Option<(&crate::bytecode::Chunk, u32, u32)>,
     ) -> Option<Result<Value, Abrupt>> {
         let holder_ref = unsafe { &*(holder as *const std::cell::RefCell<crate::value::Object>) };
         let getter = {
@@ -214,17 +214,17 @@ impl Interp {
             return Some(result);
         }
         if let Some((calls, pins)) =
-            site.and_then(|(chunk, cache)| chunk.getter_calls(cache, &getter))
+            site.and_then(|(chunk, pc, form)| chunk.getter_calls(pc, form, &getter))
         {
             return Some(self.call_getter(getter, receiver, calls, pins));
         }
         Some(self.call_callback(getter, *receiver, &[]))
     }
 
-    /// Call(getter, Receiver), ECMA-262 §10.1.8.1 OrdinaryGet step 8, at a read site whose
-    /// machine code calls getters through the direct sequence: as [`Interp::call_callback`],
-    /// through the site's own call cache, which a compiled getter's call fills for the
-    /// sequence's probe (see `jit::emit_getter_call`).
+    /// Call(getter, Receiver), ECMA-262 §10.1.8.1 OrdinaryGet step 8, at a read whose helper
+    /// stub calls getters through the direct sequence: as [`Interp::call_callback`], through the
+    /// read's own call cache, which a compiled getter's call fills for the stub's probe (see
+    /// `jit::emit_get_prop_getter`).
     fn call_getter(
         &mut self,
         getter: Value,

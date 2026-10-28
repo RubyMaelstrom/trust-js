@@ -3806,7 +3806,6 @@ fn emit_effect(
                     .first()
                     .is_some_and(u8::is_ascii_digit),
                 receiver,
-                getter_call(chunk, cache, pc, fast, layout, ilayout, direct_finish),
             );
         }
         Op::GetMethodElem if fast & 1024 != 0 && get_method_inlinable(layout) && ilayout.valid => {

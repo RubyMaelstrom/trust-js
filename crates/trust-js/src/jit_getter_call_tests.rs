@@ -1,18 +1,20 @@
-//! Getters called through the direct sequence from the property template's validated accessor
-//! landing (ECMA-262 GetValue; §10.1.8.1 OrdinaryGet step 8, Call(getter, Receiver); §10.2.1
-//! [[Call]] with no NewTarget). The getter is the accessor's live [[Get]] at each read, even when
-//! a replacement keeps the holder's shape; `this` is the read's original receiver (a primitive's
-//! own word into a strict getter, boxed for a sloppy one); the getter sees no arguments and
-//! new.target undefined, whatever the reading code's construct state. The programs read through
-//! every receiver form (an operand, `this`, a local, a method read), at prototype depths 0-3,
-//! through polymorphic and code-keyed getters, getters the sequence cannot enter (one that builds
-//! an environment), native getters at the same sites, and getters that throw (the error placed at
-//! the read, as the helper places it), recurse past the stack limit, collect or delete their own
-//! property. Every tier agrees; the expected values are Node's.
+//! Getters called through the direct sequence by the property reads' helper stub, from a read
+//! site's validated accessor landing (ECMA-262 GetValue; §10.1.8.1 OrdinaryGet step 8,
+//! Call(getter, Receiver); §10.2.1 [[Call]] with no NewTarget). The getter is the accessor's live
+//! [[Get]] at each read, even when a replacement keeps the holder's shape; `this` is the read's
+//! original receiver (a primitive's own word into a strict getter, boxed for a sloppy one); the
+//! getter sees no arguments and new.target undefined, whatever the reading code's construct
+//! state. The programs read through every receiver form (an operand, `this`, a local, a method
+//! read), at prototype depths 0-3, through polymorphic and code-keyed getters, getters the
+//! sequence cannot enter (one that builds an environment), native getters at the same sites, and
+//! getters that throw (the error placed at the read, as the helper places it), recurse past the
+//! stack limit, collect or replace their own property. Every tier agrees; the expected values
+//! are Node's.
 //!
-//! On ARM64 the warmed reads' getters complete through the sequence (the getter chunk's direct
-//! return and throw counters), and while one runs its receiver and the getter itself stay roots
-//! that the getter's call cache does not keep alive afterwards.
+//! On ARM64 the reads' getters complete through the sequence (the getter chunk's direct return
+//! and throw counters), from a function's first native code, made before its reads' caches saw
+//! anything, as from code made once they had; and while one runs, its receiver and the getter
+//! itself stay roots that the read's call cache does not keep alive afterwards.
 
 use crate::bytecode::Tier;
 use crate::Engine;
@@ -24,10 +26,10 @@ use super::traced_tests::{assert_native, settle};
 /// The bytecode VM runs a warm engine's loop-free functions make before native code.
 const WARM_RUNS: u32 = 20;
 
-/// A fresh engine at `tier` with `collect()`. A read's code calls getters directly when the
-/// read's property cache had seen an accessor when the code was made: a `warm` engine runs a
-/// loop-free function on the bytecode VM a while before compiling it to native code, as a cold
-/// one compiles each function at its first call.
+/// A fresh engine at `tier` with `collect()`. A cold engine compiles each function at its first
+/// call, before its reads' caches have seen anything; a `warm` one first runs a loop-free
+/// function on the bytecode VM a while, so its native code bakes the states its reads' caches
+/// hold.
 fn engine(tier: Tier, warm: bool) -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(tier);
@@ -258,8 +260,19 @@ fn direct_round(
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn warmed_getters_complete_through_the_direct_sequence() {
-    let mut engine = engine(Tier::Jit, true);
+fn getters_complete_through_the_direct_sequence_from_first_and_warm_code() {
+    // The helper's shared stub calls the getters: in-line stubs (a diagnostic) keep the helper.
+    if !super::shared_stubs_enabled() {
+        return;
+    }
+    for warm in [false, true] {
+        getters_complete_through_the_direct_sequence(warm);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn getters_complete_through_the_direct_sequence(warm: bool) {
+    let mut engine = engine(Tier::Jit, warm);
     // The read's line and column in FORMS (`bad.v`'s property name, as Node reports it).
     let (line, column) = FORMS
         .lines()
@@ -269,7 +282,8 @@ fn warmed_getters_complete_through_the_direct_sequence() {
     let position = format!("{line}:{column}");
     assert_eq!(
         eval(&mut engine, FORMS),
-        format!("350,350,700,175,{position}")
+        format!("350,350,700,175,{position}"),
+        "warm {warm}"
     );
     assert_native(
         &mut engine,
@@ -298,14 +312,14 @@ fn warmed_getters_complete_through_the_direct_sequence() {
         assert_eq!(
             direct_round(&mut engine, getter, returns, &round),
             expected,
-            "{reader}"
+            "{reader}, warm {warm}"
         );
     }
     let throws = |chunk: &crate::bytecode::Chunk| chunk.test_direct_throws.get();
     assert_eq!(
         direct_round(&mut engine, "getterBad", throws, "position()"),
         position,
-        "a direct getter's throw is placed at the read"
+        "a direct getter's throw is placed at the read, warm {warm}"
     );
 }
 
@@ -316,8 +330,11 @@ fn warmed_getters_complete_through_the_direct_sequence() {
 #[test]
 fn a_running_getter_and_its_receiver_are_roots() {
     use super::rooting_tests::{assert_tracked_collectable, jit_engine, run};
-    let mut engine = jit_engine(1);
-    engine.interp.jit_admit_runs = WARM_RUNS;
+    if !super::shared_stubs_enabled() {
+        return;
+    }
+    // `read`'s first native code, made at its first call.
+    let mut engine = jit_engine(0);
     let source = r#"
         function R(armed) { this.armed = armed; }
         function other() { return 'other'; }
@@ -358,4 +375,79 @@ fn a_running_getter_and_its_receiver_are_roots() {
         "the armed read ran its getter through the sequence"
     );
     assert_tracked_collectable(&mut engine);
+}
+
+/// Reads in spliced callees: a getter called through the sequence records the read's implicit
+/// inline position, as the helper's call does, so a stack captured inside it (and the stack of an
+/// error it throws, which the read places) shows the same logical frames as at every other tier.
+const SPLICED: &str = r#"
+function trace(e) {
+  return e.stack.split('\n').slice(0, 5).map(function (line) { return line.trim(); }).join('|');
+}
+class Q { constructor(x) { this.x = x; } get d() { return this.x * 2; }
+  get here() { return trace(new Error('here')); }
+  get bad() { throw new Error('bad'); } }
+var getterQ = Object.getOwnPropertyDescriptor(Q.prototype, 'd').get;
+var getterHereQ = Object.getOwnPropertyDescriptor(Q.prototype, 'here').get;
+var getterBadQ = Object.getOwnPropertyDescriptor(Q.prototype, 'bad').get;
+var q = new Q(5);
+function readD(o) { return o.d; }
+function readHere(o) { return o.here; }
+function readBad(o) { return o.bad; }
+function spliced(k) { return readD(q) + k; }
+function splicedHere() { return readHere(q); }
+function splicedBad() { return readBad(q); }
+var here = '', bad = '';
+function drive() {
+  var t = 0;
+  for (var k = 0; k < 300; k++) {
+    t += spliced(k);
+    here = splicedHere();
+    try { splicedBad(); } catch (e) { bad = trace(e); }
+  }
+  return t;
+}
+"#;
+
+#[test]
+fn spliced_reads_call_getters_with_their_inline_positions() {
+    let mut stacks = Vec::new();
+    for tier in [Tier::Interp, Tier::Jit] {
+        let mut engine = engine(tier, false);
+        eval(&mut engine, SPLICED);
+        assert_eq!(eval(&mut engine, "drive()"), "47850", "{tier:?}");
+        #[cfg(target_arch = "aarch64")]
+        if tier == Tier::Jit && super::shared_stubs_enabled() {
+            let returns = |chunk: &crate::bytecode::Chunk| chunk.test_direct_returns.get();
+            let throws = |chunk: &crate::bytecode::Chunk| chunk.test_direct_throws.get();
+            for (caller, getter, count) in [
+                (
+                    "spliced",
+                    "getterQ",
+                    returns as fn(&crate::bytecode::Chunk) -> usize,
+                ),
+                ("splicedHere", "getterHereQ", returns),
+                ("splicedBad", "getterBadQ", throws),
+            ] {
+                let spliced = function_of(&mut engine, caller)
+                    .runtime()
+                    .code2
+                    .get()
+                    .is_some_and(Option::is_some);
+                assert!(spliced, "{caller} has a second-stage compile");
+                settle(&mut engine, getter);
+                direct_round(&mut engine, getter, count, "drive()");
+            }
+        }
+        stacks.push(eval(&mut engine, "here + '\\n' + bad"));
+    }
+    assert!(
+        stacks[0].contains("at readHere") && stacks[0].contains("at readBad"),
+        "the logical frames of the spliced reads: {}",
+        stacks[0]
+    );
+    assert_eq!(
+        stacks[0], stacks[1],
+        "the stacks inside spliced reads' getters"
+    );
 }

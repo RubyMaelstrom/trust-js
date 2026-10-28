@@ -1358,51 +1358,135 @@ impl CallSite {
     }
 }
 
-/// The getter call cache of a property-read site whose machine code calls its getter through
-/// the direct sequence (`jit::emit_getter_call`): made when the code is emitted for a site whose
-/// property cache has validated an accessor, its [`CallSite`] when a user function is first
-/// called as the getter there (a native getter, the common case at many sites, allocates no
-/// call cache). ECMA-262 §10.1.8.1 OrdinaryGet: the getter is the accessor's live [[Get]],
-/// which the machine code reads after the property cache's proof, then looks up here by
-/// identity like any callee.
-pub(crate) struct GetterSite {
-    /// The call cache's first way once it exists, else 0: the word the machine code loads.
-    ways: std::cell::Cell<usize>,
-    calls: std::cell::OnceCell<Box<CallSite>>,
+/// How a property read finds its receiver and places its getter's result (the low byte of
+/// [`GetterSlot::form`]): `GetProp`'s receiver is its top operand, which the result replaces;
+/// `GetMethod` keeps the receiver and pushes the result above it; `GetPropThis` and
+/// `GetPropLocal` read the frame's `this` or a local (whose byte offset among the slots is the
+/// form's upper bits) and push the result.
+pub(crate) const GETTER_READ_OPERAND: u32 = 0;
+pub(crate) const GETTER_READ_METHOD: u32 = 1;
+pub(crate) const GETTER_READ_THIS: u32 = 2;
+pub(crate) const GETTER_READ_LOCAL: u32 = 3;
+
+/// A property read's getter call cache in its chunk's [`GetterTable`]: 32 bytes, so that the
+/// probe scales an index by a shift.
+#[repr(C, align(32))]
+#[derive(Clone, Copy)]
+pub(crate) struct GetterSlot {
+    /// The read's operation, or `u32::MAX` for an empty slot.
+    pub(crate) pc: u32,
+    /// `GETTER_READ_*`, with a local's byte offset above the low byte.
+    pub(crate) form: u32,
+    /// The getter frame's `FnFrame::call_site`: the read's implicit inline position, which the
+    /// helper's call publishes as well (`ImplicitCallPosition`; none outside spliced callees).
+    pub(crate) position: u32,
+    /// The read's call cache ([`CallSite`]), which its first way begins.
+    pub(crate) calls: *const CallSite,
 }
 
-/// A chunk's getter call caches, keyed by their sites' property caches. Entries are boxed and
-/// never removed: the machine code of the chunk embeds their addresses.
-pub(crate) type GetterSites = std::cell::RefCell<crate::fasthash::FastMap<u32, Box<GetterSite>>>;
+const EMPTY_GETTER_SLOT: GetterSlot = GetterSlot {
+    pc: u32::MAX,
+    form: 0,
+    position: NO_POSITION,
+    calls: std::ptr::null(),
+};
+
+/// The getter call caches of a chunk's property reads, keyed by the reads' operations: an
+/// open-addressed table the reads' helper stub probes at run time (`jit::emit_get_prop_getter`,
+/// slot `pc & mask`, then the next ones up to an empty slot). ECMA-262 §10.1.8.1 OrdinaryGet:
+/// the getter is the accessor's live [[Get]], which the stub reads after the read's property
+/// cache proved the accessor, then looks up in the read's call cache by identity like any
+/// callee. A read gains its call cache when its helper first calls a user function as its
+/// getter: a native getter, or one served in Rust, never makes one. The call caches are boxed
+/// and kept for the chunk's life; growing the table moves only its slots.
+#[repr(C)]
+pub(crate) struct GetterTable {
+    /// The slot count less one (a power of two less one).
+    mask: u32,
+    len: u32,
+    /// `storage`'s slots, as machine code reads them.
+    slots: *const GetterSlot,
+    storage: Box<[GetterSlot]>,
+    /// The call caches, each boxed so that it stays put as the vector grows.
+    #[allow(clippy::vec_box)]
+    calls: Vec<Box<CallSite>>,
+}
 
 /// A chunk's weak pins of the callees its call caches record ([`Chunk::call_pins`]).
 pub(crate) type CalleePins =
     std::cell::RefCell<crate::fasthash::FastMap<usize, crate::value::WeakGc>>;
 
-impl GetterSite {
-    /// The call cache for calls of `getter`, made on first use when `getter` is a user function
-    /// (only those fill a call cache, see `Interp::call_jit_fast`).
-    fn calls_for(&self, getter: &Value) -> Option<&CallSite> {
-        if let Some(calls) = self.calls.get() {
-            return Some(calls);
+impl GetterTable {
+    #[allow(clippy::vec_box)]
+    fn with_slots(count: usize, calls: Vec<Box<CallSite>>) -> GetterTable {
+        debug_assert!(count.is_power_of_two());
+        let storage = vec![EMPTY_GETTER_SLOT; count].into_boxed_slice();
+        GetterTable {
+            mask: (count - 1) as u32,
+            len: 0,
+            slots: storage.as_ptr(),
+            storage,
+            calls,
         }
-        let object = getter.as_obj()?;
-        if !matches!(object.borrow().call, crate::value::Callable::User(_)) {
-            return None;
+    }
+
+    /// The slot of `pc`, or the empty slot that would take it.
+    fn position(&self, pc: u32) -> usize {
+        let mut index = (pc & self.mask) as usize;
+        while self.storage[index].pc != pc && self.storage[index].pc != u32::MAX {
+            index = (index + 1) & self.mask as usize;
         }
-        let calls = self.calls.get_or_init(|| Box::new(CallSite::empty()));
-        self.ways.set(calls.entries.as_ptr() as usize);
-        Some(calls)
+        index
+    }
+
+    /// The call cache of the read at `pc` (with form `form` and position `position`), made on
+    /// first request.
+    fn calls(&mut self, pc: u32, form: u32, position: u32) -> *const CallSite {
+        let index = self.position(pc);
+        if self.storage[index].pc == pc {
+            return self.storage[index].calls;
+        }
+        // At most half full, so every probe ends at an empty slot.
+        if 2 * (self.len as usize + 1) > self.storage.len() {
+            let mut grown =
+                GetterTable::with_slots(2 * self.storage.len(), std::mem::take(&mut self.calls));
+            for slot in self.storage.iter().filter(|slot| slot.pc != u32::MAX) {
+                let index = grown.position(slot.pc);
+                grown.storage[index] = *slot;
+                grown.len += 1;
+            }
+            *self = grown;
+            return self.calls(pc, form, position);
+        }
+        let calls = Box::new(CallSite::empty());
+        let pointer: *const CallSite = &*calls;
+        self.calls.push(calls);
+        self.storage[index] = GetterSlot {
+            pc,
+            form,
+            position,
+            calls: pointer,
+        };
+        self.len += 1;
+        pointer
     }
 
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<GetterSite>()
-            + self
-                .calls
-                .get()
-                .map_or(0, |_| std::mem::size_of::<CallSite>())
+        std::mem::size_of::<GetterTable>()
+            + self.storage.len() * std::mem::size_of::<GetterSlot>()
+            + self.calls.capacity() * std::mem::size_of::<Box<CallSite>>()
+            + self.calls.len() * std::mem::size_of::<CallSite>()
     }
 }
+
+/// Machine code addresses a call cache's first way at the cache itself.
+const _: () = assert!(std::mem::offset_of!(CallSite, entries) == 0);
+/// Where machine code reads a [`GetterTable`]'s mask and slots, and a slot's fields.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const GETTER_TABLE_MASK_OFF: usize = std::mem::offset_of!(GetterTable, mask);
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const GETTER_TABLE_SLOTS_OFF: usize = std::mem::offset_of!(GetterTable, slots);
+const _: () = assert!(std::mem::size_of::<GetterSlot>() == 32);
 
 const CALL_OVERFLOW_SETS: usize = 128;
 const CALL_OVERFLOW_MAX_SETS: usize = 512;
@@ -2696,9 +2780,10 @@ pub struct Chunk {
     regexp_literals: Vec<std::cell::OnceCell<Rc<crate::regex::Regex>>>,
     /// One [`CallSite`] per `Call`/`CallWithThis` site (the JIT→JIT fast call's callee cache).
     call_caches: Vec<CallSite>,
-    /// The getter call caches of the property-read sites whose machine code calls getters
-    /// directly, keyed by the sites' property caches (see [`GetterSite`]).
-    getter_sites: std::cell::OnceCell<Box<GetterSites>>,
+    /// The getter call caches of the chunk's property reads (see [`GetterTable`]), and the table
+    /// as machine code reads it (null before the first).
+    getter_table: std::cell::RefCell<Option<Box<GetterTable>>>,
+    getter_table_raw: std::cell::Cell<*const GetterTable>,
     /// Source names of call and `new` targets, for TypeError messages (see [`Chunk::call_name`]).
     call_names: Option<Box<CallNames>>,
     /// Source positions of the operations (see [`Chunk::position`]).
@@ -2833,7 +2918,8 @@ impl crate::gc_trace::GcTrace for Chunk {
             arguments_forwarder_runtime: _,
             regexp_literals: _,
             call_caches: _,
-            getter_sites: _,
+            getter_table: _,
+            getter_table_raw: _,
             call_names: _,
             positions: _,
             call_positions: _,
@@ -3028,14 +3114,6 @@ impl Chunk {
         self.positions.at(pc)
     }
 
-    /// The inline position a checked operation `pc` publishes while it calls author code
-    /// implicitly (a getter, say): [`NO_POSITION`] outside spliced bodies (see
-    /// `ImplicitCallPosition`).
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    pub(crate) fn jit_implicit_position(&self, pc: usize) -> u32 {
-        self.inline_sites.implicit_position(pc)
-    }
-
     /// The position of the call made through call cache `cache`.
     #[inline]
     pub(crate) fn call_position(&self, cache: u32) -> u32 {
@@ -3104,16 +3182,8 @@ impl Chunk {
             .saturating_add(self.private_sites.len() * std::mem::size_of::<PrivateSite>())
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
-        if let Some(sites) = self.getter_sites.get() {
-            let sites = sites.borrow();
-            bytes = bytes.saturating_add(
-                std::mem::size_of::<GetterSites>()
-                    + sites.capacity() * std::mem::size_of::<(u32, Box<GetterSite>)>()
-                    + sites
-                        .values()
-                        .map(|site| site.retained_bytes())
-                        .sum::<usize>(),
-            );
+        if let Some(table) = self.getter_table.borrow().as_deref() {
+            bytes = bytes.saturating_add(table.retained_bytes());
         }
         if matches!(self.record_getter.get(), Some(Some(_))) {
             bytes = bytes.saturating_add(std::mem::size_of::<RecordGetterPlan>());
@@ -7777,7 +7847,8 @@ fn finish_chunk(
         arguments_forwarder_runtime: std::cell::RefCell::new(None),
         regexp_literals: (0..op_count).map(|_| std::cell::OnceCell::new()).collect(),
         call_caches: c.call_caches,
-        getter_sites: std::cell::OnceCell::new(),
+        getter_table: std::cell::RefCell::new(None),
+        getter_table_raw: std::cell::Cell::new(std::ptr::null()),
         call_names: c.call_names.into_table(),
         positions: c.positions,
         call_positions,
@@ -19993,32 +20064,35 @@ impl Chunk {
     pub(crate) fn jit_construct_cache_ptr(&self, idx: u32) -> usize {
         &self.construct_caches[idx as usize] as *const std::cell::Cell<ConstructSite> as usize
     }
-    /// The stable address of the word naming property site `cache`'s getter call cache (see
-    /// [`GetterSite`]), made on first request: the box keeps it in place for the chunk's life,
-    /// which outlasts its JIT code.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    pub(crate) fn jit_getter_site_ptr(&self, cache: u32) -> usize {
-        let sites = self.getter_sites.get_or_init(Default::default);
-        let mut sites = sites.borrow_mut();
-        let site = sites.entry(cache).or_insert_with(|| {
-            Box::new(GetterSite {
-                ways: std::cell::Cell::new(0),
-                calls: std::cell::OnceCell::new(),
-            })
-        });
-        site.ways.as_ptr() as usize
-    }
-    /// The call cache for calls of `getter` at property site `cache`, with the pins of its
-    /// callees, when the site's machine code calls getters directly (see [`GetterSite`]).
+    /// The call cache for calls of `getter` at the property read `pc` (with form `form`, see
+    /// [`GetterTable`]), with the pins of its callees, made on first request when `getter` is a
+    /// user function (only those fill a call cache, see `Interp::call_jit_fast`).
     pub(crate) fn getter_calls(
         &self,
-        cache: u32,
+        pc: u32,
+        form: u32,
         getter: &Value,
     ) -> Option<(&CallSite, &CalleePins)> {
-        let site: *const GetterSite = &**self.getter_sites.get()?.borrow().get(&cache)?;
-        // SAFETY: a site is boxed and never removed or replaced while the chunk lives.
-        let site = unsafe { &*site };
-        Some((site.calls_for(getter)?, &self.call_pins))
+        let object = getter.as_obj()?;
+        if !matches!(object.borrow().call, crate::value::Callable::User(_)) {
+            return None;
+        }
+        let calls = {
+            let mut table = self.getter_table.borrow_mut();
+            let table =
+                table.get_or_insert_with(|| Box::new(GetterTable::with_slots(8, Vec::new())));
+            let position = self.inline_sites.implicit_position(pc as usize);
+            let calls = table.calls(pc, form, position);
+            self.getter_table_raw.set(&**table);
+            calls
+        };
+        // SAFETY: a call cache is boxed and kept for the chunk's life.
+        Some((unsafe { &*calls }, &self.call_pins))
+    }
+    /// Byte offset of the field machine code reads the getter table through.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_getter_table_off() -> usize {
+        std::mem::offset_of!(Chunk, getter_table_raw)
     }
     #[cfg(test)]
     pub(crate) fn test_call_site(&self, idx: u32) -> &CallSite {
@@ -24020,9 +24094,9 @@ pub(crate) unsafe extern "C" fn jit_getter_threw(ctx: *mut crate::jit::JitCtx, p
 /// accessor landing for THIS helper call. Always clears the publication, including on
 /// decline, so it can never leak into a nested or later helper call. Detailed-feedback
 /// runs keep the canonical profiled resolution, whose observations must see every read.
-/// A site whose machine code calls getters directly (property cache `cache`) calls a user
-/// getter through its getter call cache, which the call fills. The test for a publication is
-/// made in line: the helper's other reads make no call for it.
+/// The read at `pc` (its getter form `form`, see [`GetterTable`]) calls a user getter through
+/// its getter call cache, which the call fills for the read's helper stub. The test for a
+/// publication is made in line: the helper's other reads make no call for it.
 #[inline(always)]
 unsafe fn jit_accessor_fast(
     validated: (usize, u32),
@@ -24030,13 +24104,14 @@ unsafe fn jit_accessor_fast(
     chunk: &Chunk,
     name: &str,
     receiver: Value,
-    cache: u32,
+    pc: u32,
+    form: u32,
 ) -> Option<Result<Value, Abrupt>> {
     let (holder, slot) = validated;
     if holder == 0 {
         return None;
     }
-    unsafe { jit_accessor_validated(holder, slot, i, chunk, name, receiver, cache) }
+    unsafe { jit_accessor_validated(holder, slot, i, chunk, name, receiver, (pc, form)) }
 }
 
 /// [`jit_accessor_fast`] with a publication.
@@ -24048,12 +24123,12 @@ unsafe fn jit_accessor_validated(
     chunk: &Chunk,
     name: &str,
     receiver: Value,
-    cache: u32,
+    (pc, form): (u32, u32),
 ) -> Option<Result<Value, Abrupt>> {
     if chunk.feedback.detailed_enabled() {
         return None;
     }
-    unsafe { i.accessor_validated_get(holder, slot, name, &receiver, Some((chunk, cache))) }
+    unsafe { i.accessor_validated_get(holder, slot, name, &receiver, Some((chunk, pc, form))) }
 }
 
 pub(crate) unsafe extern "C" fn jit_get_prop(
@@ -24093,7 +24168,8 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         chunk,
                         &chunk.names[n as usize],
                         obj,
-                        c,
+                        pc,
+                        GETTER_READ_OPERAND,
                     )
                 } {
                     Some(r) => r?,
@@ -24127,7 +24203,8 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         chunk,
                         &chunk.names[n as usize],
                         this,
-                        c,
+                        pc,
+                        GETTER_READ_THIS,
                     )
                 } {
                     Some(r) => r?,
@@ -24173,7 +24250,8 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         chunk,
                         &chunk.names[n as usize],
                         obj,
-                        c,
+                        pc,
+                        GETTER_READ_LOCAL | (u32::from(s) * 8) << 8,
                     )
                 } {
                     Some(r) => r?,
@@ -24209,7 +24287,8 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         chunk,
                         &chunk.names[n as usize],
                         *obj,
-                        c,
+                        pc,
+                        GETTER_READ_METHOD,
                     )
                 } {
                     Some(r) => r?,

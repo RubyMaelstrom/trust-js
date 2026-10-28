@@ -82,7 +82,6 @@ pub(super) fn emit(
                 false,
                 arr_ok,
                 PropRecv::Stack,
-                getter_call(chunk, *cache, pc, fast, layout, ilayout, direct_finish),
             );
         }
         Op::GetPropThis(n, cache) if fast & 256 != 0 && get_method_inlinable(layout) => {
@@ -103,7 +102,6 @@ pub(super) fn emit(
                 false,
                 arr_ok,
                 PropRecv::This,
-                getter_call(chunk, *cache, pc, fast, layout, ilayout, direct_finish),
             );
         }
         Op::GetPropLocal(s, n, cache)
@@ -126,7 +124,6 @@ pub(super) fn emit(
                 false,
                 arr_ok,
                 PropRecv::Slot(*s as u32 * 8),
-                getter_call(chunk, *cache, pc, fast, layout, ilayout, direct_finish),
             );
         }
         Op::ToPropKey | Op::ToPropKeyLocal(_) if fast & 64 != 0 => {
@@ -322,7 +319,6 @@ pub(super) fn emit(
                 true,
                 arr_ok,
                 PropRecv::Stack,
-                getter_call(chunk, *cache, pc, fast, layout, ilayout, direct_finish),
             );
         }
         Op::Add if fast & 1 != 0 => {
