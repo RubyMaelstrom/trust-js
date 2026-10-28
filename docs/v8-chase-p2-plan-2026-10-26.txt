@@ -467,8 +467,9 @@ had it.
 
 ## Measurement
 
-Every stage exit, on a quiet machine (no other load over a minute), one job at a time,
-interleaved rounds, engine runs pinned to CPU 5: the fixtures (vue, react, djot, sustained
+Every stage exit, on a quiet machine (other load under 2 cores over a minute, the owner's
+setting of 2026-10-28; each run records the rest), one job at a time, interleaved rounds, engine
+runs pinned to CPU 5: the fixtures (vue, react, djot, sustained
 allocation, empty) at their tiers; Octane 2 in full; Web Tooling; ARES-6 in full (about 21
 minutes an engine run, 12 of them ML's); the call microbenchmarks; TRust's offline browser
 replays (dom-reconcile, Speedometer Vue, event loop) and Octane through TRust; Node v24
@@ -625,8 +626,8 @@ Landed 2026-10-27 (7495f76b). Two differences from V8 remain, both to be ported 
 past the maximum V8's floor is `size + 8 MB` (its global limit, 8f876708cf), where the engine
 keeps the note's `size + 8 MB + nursery`; and V8's MaxGrowingFactor allows a factor of 4 only for
 a maximum of at least 2 GB (1.3 to 2.0 below), which the engine does not port (it differs on
-hosts with less than 4 GB of memory or under a small override). Exit measurement pending (a
-quiet machine, LTO builds).
+hosts with less than 4 GB of memory or under a small override). Measured 2026-10-28 (Stage-exit
+timing): no suite slower; Web Tooling's peak RSS waits for its runs.
 Both ported 2026-10-27 (05b80239, V8 at 96c72ad4): the growing factor stops at
 MaxGrowingFactor's (4 from a 2 GB maximum, 1.3 to 2 below), and within 16 MB of the maximum
 and past it the budget is the size and 8 MB. With 4 GB of memory or more and no override, only
@@ -696,8 +697,8 @@ checked against Node) and 4 (a683d988). Item 3 dropped: after items 1 and 2, ind
 under 1% of the Proxy microbenchmark (intern_key 0.8%), whose largest cost is now the Proxy side
 table's probes (18%, W2g's). Under load (no-LTO, least of 3 runs, ns an iteration): without
 handlers 27,900 to 9,900 (Sparkplug-only Node 13,750), with Reflect handlers 48,250 to 26,450
-(20,350), with direct handlers 22,400 to 17,400 (9,150). Exit measurement pending (a quiet
-machine, LTO builds).
+(20,350), with direct handlers 22,400 to 17,400 (9,150). Exit measured 2026-10-28 and met
+(Stage-exit timing).
 
 ### W7: strings (census and design, 2026-10-27)
 
@@ -1479,3 +1480,62 @@ than 1a-1d remove; predicted 1.48x, today 2.2x), the constructor within 1.25x (n
 main at the stage's end: React -8% and Vue -6% (predicted 10% and 8.5%, without 2d), Djot -4% and
 Web Tooling's chai -10% (predicted 6% and 14%); elapsed times recorded at the exit measurement;
 Test262 identical, no suite slower beyond noise.
+
+### Stage-exit timing (2026-10-28)
+
+Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
+close-out's engine), w1 a683d988, w6a 7495f76b, w7 05e1f798, w5a b352febc (with W6a's port and
+W5a's items 1-2) and now c4464dae (W2a and W2b with W5a's items 3-5); Node v24.22.0 in full and
+limited to Sparkplug. Engine runs pinned to CPU 5 (an X925 core), one at a time, rounds rotating
+the order, each run recording the rest of the machine's load (target/p2/timing: session.sh,
+bench.py and report.py; results in session/ and report.txt). The start check first required
+under 0.25 cores of other load, below the desktop's idle floor (0.33 cores), and waited all
+night; on the owner's instruction it requires under 2 cores (2026-10-28), and the session ran
+from 06:25. The other load stayed under 2 cores in most runs: the desktop, and from 07:09 a game
+at 1.2-1.5 cores. The worst run of each workload is in report.txt, up to 4 cores in one Vue and
+one Octane run, inside medians of 5 and 3. ARES-6 and Web Tooling (21-26 minutes an engine run)
+were stopped at 08:00 after ARES-6's base run: only W2a/W2b's exit needs them, at w5a and now,
+and those runs wait for a quieter time. No run failed, and every engine's output agreed.
+
+Fixtures (ms, median of 5) and Octane 2 (score, median of 3):
+
+| | base | w1 | w6a | w7 | w5a | now | Node | Sparkplug-only |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 385 | 366 | 367 | 372 | 368 | 365 | 100 | 113 |
+| React | 55 | 54 | 55 | 54 | 55 | 56 | 18 | 16 |
+| Djot | 143 | 144 | 144 | 140 | 138 | 130 | 50 | 39 |
+| sustained allocation, JIT (s) | 0.521 | 0.530 | 0.519 | 0.525 | 0.526 | 0.497 | 0.145 | 0.201 |
+| Octane | 2,728 | 2,755 | 2,778 | 2,787 | 2,963 | 3,080 | | |
+| Octane RegExp | 344 | 350 | 351 | 389 | 916 | 1,073 | 6,391 | 3,909 |
+
+Against the exits:
+- W1 (Decision 9): met. The Proxy microbenchmark without handlers takes 9,400 ns an iteration
+  against Sparkplug-only Node's 13,350 (0.70x; base 1.32x), with Reflect-forwarding handlers
+  26,600 against 20,350 (1.31x; base 1.80x); the holey shift (the call table's
+  array-shift-queue-holey) 22 ms against 17 (1.29x; base 17.8x). Vue's `shift` took 137.3 ms
+  (base), 127.9 (w1) and 122.9 (now); Sparkplug-only Node 41.0.
+- W6a (W6's exit): no suite slower beyond noise (Octane +0.8%, Splay +2.9%, the fixtures within
+  2%). Web Tooling's peak RSS waits for the Web Tooling runs.
+- W7: strings.js (ms, median of 2, ASCII/Latin-1/CJK/astral, now; Sparkplug-only Node in
+  brackets): every non-ASCII variant is within 1.5x of its ASCII one except case mapping
+  (1/4/4/4, below the harness's resolution; Node 1/3/5/5) and prepending (11/20/20/19). Within
+  2x of Sparkplug-only Node except keys (18 each; 3-4), prepending (Node 0-2), substr-tokens
+  (7; 3-4), split-join's ASCII variant (4; 1) and the RegExp cases, left to W5 (sticky lexer
+  36-38; 7-11). Octane +0.3% and the fixtures within 3% at W7; Djot's peak RSS rose 7.0% there
+  (40 to 43 MB), beyond the exit's 5%.
+- W5a (Decision 9): met. Octane RegExp at 2.66x the close-out's score at w5a and 3.12x now
+  (Node 6,391, Sparkplug-only 3,909). Djot's and source-map's RegExp instructions come from the
+  W5 census tools.
+- W2a/W2b: the collection criteria wait for ARES-6 and Web Tooling. In the stage Octane gained
+  3.9%: NavierStokes +75.5% (2,960 to 5,195), EarleyBoyer +7.1%, while RayTrace fell 5.4%
+  (2,301 to 2,176) and Richards 2.5% (1,502 to 1,464), in every round, the quiet ones included;
+  those two are bisected by instructions next. Djot -5.8%, sustained allocation -5.5% at the
+  JIT tier, Octane's peak RSS -6.4%.
+- TRust (its offline replays, 20 samples a side, all valid; engine time): dom-reconcile -3.5%,
+  Speedometer's Vue TodoMVC -0.5%, the event loop +4.8% (19.3 to 20.2 ms); Octane through TRust
+  2,071 to 2,427 (+17.2%).
+
+The call table at c4464dae (ms, median of 2, against Sparkplug-only Node), W3's starting point:
+direct 201 (108; 1.86x), method 240 (164; 1.46x), closure 212 (117; 1.81x), recursion 26 (12;
+2.2x), constructor 122 (59; 2.1x), class and getter 502 (73; 6.9x), call and apply 304 (82;
+3.7x), spread 488 (34; 14x), rest 168 (53; 3.2x), `arguments` 230 (52; 4.4x).
