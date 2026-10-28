@@ -2038,6 +2038,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_object_literal as *const () as usize,
         crate::bytecode::jit_abstract_operation as *const () as usize,
         crate::bytecode::jit_call_spread as *const () as usize,
+        crate::bytecode::jit_construct_this as *const () as usize,
     ]
 }
 
@@ -2125,7 +2126,9 @@ pub const H_OBJECT_LITERAL: usize = 29;
 pub const H_ABSTRACT: usize = 30;
 /// Dedicated `Op::CallSpread`/`Op::CallSpreadThis` entry (see `bytecode::jit_call_spread`).
 pub const H_CALL_SPREAD: usize = 31;
-pub const N_HELPERS: usize = 32;
+/// The direct construct sequence's instance allocation (see `bytecode::jit_construct_this`).
+pub const H_CONSTRUCT_THIS: usize = 32;
+pub const N_HELPERS: usize = 33;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2163,6 +2166,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "object_literal",
     "abstract_operation",
     "call_spread",
+    "construct_this",
 ];
 
 #[inline]
@@ -2316,6 +2320,7 @@ mod shared_stub_tests {
                 for with_this in [false, true] {
                     keys.push(SharedStub::DirectCall { argc, with_this }.key());
                 }
+                keys.push(SharedStub::DirectConstruct { argc }.key());
             }
         }
         for &key in &keys {
@@ -3098,6 +3103,10 @@ mod asm {
         /// cset wd, cond (CSINC wd, wzr, wzr, !cond)
         pub fn cset_w(&mut self, rd: u32, cond: u32) {
             self.emit(0x1A9F_07E0 | ((cond ^ 1) << 12) | rd);
+        }
+        /// csel xd, xn, xm, cond (xd = cond ? xn : xm)
+        pub fn csel_x(&mut self, rd: u32, rn: u32, rm: u32, cond: u32) {
+            self.emit(0x9A80_0000 | (rm << 16) | (cond << 12) | (rn << 5) | rd);
         }
         /// fmov dd, #1.0
         pub fn fmov_one(&mut self, rd: u32) {
@@ -7887,17 +7896,25 @@ pub(crate) enum DirectCallSite {
     AfterReturn,
 }
 
-/// The direct JIT→JIT call sequence, emitted after a guarded cache hit when the fill-time gates
-/// allow it (see [`crate::bytecode::CallIc::direct`]). Everything the layered path does
-/// survives — recursion depth, the `FnFrame`, constructing/new.target clearing, the callee's
-/// own handler watermark — and its safepoint is the callee's entry poll (see
-/// [`emit_interrupt_poll`]), which runs once the call has committed: the sequence checks no
-/// allocation pressure or gc tick of its own. The callee runs on an activation record popped
-/// from the frame pool, entered by a bare `blr`: no helper dispatch, no probe re-read, no
-/// `run_moved`. Teardown (pool return, frame pop, tail drain) is the chunk's finish stub; the
-/// sequence then restores the interpreter's construct state and either pushes the return value
-/// or routes to the caller's unwind. Falls back to `hit_slow` (the H_CALL_HIT path) on any gate
-/// failure, with NO state mutated.
+/// What a direct sequence enters its callee for (see [`emit_direct_sequence`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectForm {
+    /// [[Call]]: `with_this` when the site pushed a receiver below the callee (`CallWithThis`).
+    Call { with_this: bool },
+    /// [[Construct]] (`Op::New`): x12 is the site's construct cache, whose entry's `CallIc`
+    /// comes first, and the sequence allocates the callee's `this` (see
+    /// [`emit_direct_construct`]).
+    Construct,
+}
+
+/// The direct JIT→JIT call sequence: [`emit_direct_sequence`]'s [[Call]] form, emitted after a
+/// guarded call-cache hit when the fill-time gates allow it (see
+/// [`crate::bytecode::CallIc::direct`]). Falls back to `hit_slow` (the H_CALL_HIT path) on any
+/// gate failure, with NO state mutated.
 ///
 /// Returns false (nothing emitted) when an emission-time precondition fails — the caller then
 /// emits only the probe + H_CALL_HIT form.
@@ -7908,11 +7925,58 @@ pub(crate) enum DirectCallSite {
 fn emit_direct_call(
     a: &mut asm::Asm,
     ilayout: &crate::interpreter::InterpLayout,
+    layout: &crate::value::JitLayout,
+    attempted_off: usize,
+    runs_off: usize,
+    retry_off: usize,
+    argc: usize,
+    with_this: bool,
+    hit_slow: usize,
+    l_unwind: usize,
+    done: usize,
+    finish_stub: usize,
+    call_site: DirectCallSite,
+) -> bool {
+    emit_direct_sequence(
+        a,
+        ilayout,
+        layout,
+        attempted_off,
+        runs_off,
+        retry_off,
+        argc,
+        DirectForm::Call { with_this },
+        hit_slow,
+        l_unwind,
+        done,
+        finish_stub,
+        call_site,
+    )
+}
+
+/// The direct JIT→JIT sequence. Everything the layered path does survives — recursion depth,
+/// the `FnFrame`, the construct state, the callee's own handler watermark — and its safepoint
+/// is the callee's entry poll (see [`emit_interrupt_poll`]), which runs once the call has
+/// committed: the sequence checks no allocation pressure or gc tick of its own. The callee runs
+/// on an activation record popped from the frame pool, entered by a bare `blr`: no helper
+/// dispatch, no probe re-read, no `run_moved`. Teardown (pool return, frame pop, tail drain) is
+/// the chunk's finish stub; the sequence then restores the interpreter's construct state and
+/// either pushes the result or routes to the caller's unwind. Falls back to `hit_slow` on any
+/// gate failure, with NO state mutated.
+///
+/// Returns false (nothing emitted) when an emission-time precondition fails.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_direct_sequence(
+    a: &mut asm::Asm,
+    ilayout: &crate::interpreter::InterpLayout,
     // A stored handle word is the cell's `Gc::as_ptr` identity: FnFrame.fn_ptr records the
     // callee's as it is (FnFrame::callee reconstructs a `Gc` from it).
     layout: &crate::value::JitLayout,
     // Byte offset of `Chunk::inline_attempted` (computed by the caller from its own chunk —
-    // same monomorphized layout as the callee's): the sequence requires the callee's one-shot
+    // same monomorphized layout as the callee's): a call requires the callee's one-shot
     // recompile to have happened (or been attempted), else it keeps taking H_CALL_HIT, which
     // is what bumps jit_runs toward the trigger. A landed code2 bumps the epoch and refills
     // the site with the new chunk anyway.
@@ -7920,7 +7984,7 @@ fn emit_direct_call(
     runs_off: usize,
     retry_off: usize,
     argc: usize,
-    with_this: bool,
+    form: DirectForm,
     hit_slow: usize,
     l_unwind: usize,
     done: usize,
@@ -7933,6 +7997,10 @@ fn emit_direct_call(
     if !direct_call_supported(ilayout, layout, attempted_off, runs_off, retry_off, argc) {
         return false;
     }
+    let (with_this, construct) = match form {
+        DirectForm::Call { with_this } => (with_this, false),
+        DirectForm::Construct => (false, true),
+    };
     let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
     let il = ilayout;
     const IC_ENV: i32 = 8;
@@ -7959,7 +8027,9 @@ fn emit_direct_call(
     let cx_code_base = offset_of!(JitCtx, code_base) as u32;
     // The code-keyed probe is emitted only under these conditions (see `emit_call_code_probe`);
     // without it every hit is an identity hit and the way's recorded environment is the callee's.
-    let call_env_from_callee = layout.call_probe_valid
+    // A construct site's single entry is keyed by identity alone.
+    let call_env_from_callee = !construct
+        && layout.call_probe_valid
         && fits8(layout.obj_from_cell + layout.obj_call + 8)
         && fits8(layout.user_env);
 
@@ -7974,11 +8044,16 @@ fn emit_direct_call(
     a.logic_imm_w(0, 11, 9, ready);
     a.cbz(11, false, static_gates);
     a.bind(static_done);
-    // recompile settled (live chunk byte — see attempted_off). x4 = the callee's chunk, kept
-    // for the retry gate below.
-    a.ldur(4, 12, IC_CHUNK_RAW);
-    a.ldrb_imm(11, 4, attempted_off as u32);
-    a.cbz(11, false, hit_slow);
+    // A construction counts no run toward its constructor's inline checkpoints, as the
+    // `Op::New` helper's cached path counts none: the construct form has neither the call's
+    // warm-up gate nor its retry gate.
+    if !construct {
+        // recompile settled (live chunk byte — see attempted_off). x4 = the callee's chunk,
+        // kept for the retry gate below.
+        a.ldur(4, 12, IC_CHUNK_RAW);
+        a.ldrb_imm(11, 4, attempted_off as u32);
+        a.cbz(11, false, hit_slow);
+    }
     // Arity needs no gate: the sequence moves min(argc, n_params) arguments into their slots,
     // tags every remaining slot Undefined (the missing-argument binding), and leaves any
     // over-applied surplus on the caller's operand stack, which pops it after the call.
@@ -7997,18 +8072,52 @@ fn emit_direct_call(
     a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
     a.cbz(7, true, hit_slow);
 
-    // Late feedback can make a previously empty inline plan useful. Count only direct
-    // entries with a pending retry; on the threshold call the helper owns the increment.
-    // This gate runs after every other fallback check, before committing any call state.
-    let retry_done = a.new_label();
-    a.ldr_w_imm(5, 4, retry_off as u32);
-    a.cbz(5, false, retry_done);
-    a.ldr_w_imm(6, 4, runs_off as u32);
-    a.add_imm(6, 6, 1);
-    a.cmp_reg_w(6, 5);
-    a.b_cond(C_HS, hit_slow);
-    a.str_w_imm(6, 4, runs_off as u32);
-    a.bind(retry_done);
+    if !construct {
+        // Late feedback can make a previously empty inline plan useful. Count only direct
+        // entries with a pending retry; on the threshold call the helper owns the increment.
+        // This gate runs after every other fallback check, before committing any call state.
+        let retry_done = a.new_label();
+        a.ldr_w_imm(5, 4, retry_off as u32);
+        a.cbz(5, false, retry_done);
+        a.ldr_w_imm(6, 4, runs_off as u32);
+        a.add_imm(6, 6, 1);
+        a.cmp_reg_w(6, 5);
+        a.b_cond(C_HS, hit_slow);
+        a.str_w_imm(6, 4, runs_off as u32);
+        a.bind(retry_done);
+    } else {
+        // [[Construct]] step 3 (ECMA-262): `this` is OrdinaryCreateFromConstructor(F,
+        // "%Object.prototype%"), F being new.target too (EvaluateNew passes no other). The lean
+        // helper reads F's live `prototype` and allocates the instance with F's field layout.
+        // It runs no author code and collects nothing (the engine's heaps collect only at
+        // safepoints), so every check above still holds after it; it declines, with nothing
+        // allocated, when `prototype` is not an Object data property. x2 = `this`, kept until
+        // the callee's record takes it; the registers the checks left are reloaded, and in a
+        // shared stub x30, the site's return address, which the FnFrame push reads.
+        let keep_return = matches!(call_site, DirectCallSite::AfterReturn);
+        if keep_return {
+            a.stp_pre(12, 10, -32);
+            a.str_imm(30, 31, 16);
+        } else {
+            a.stp_pre(12, 10, -16);
+        }
+        a.mov(0, 12);
+        a.mov(1, 10);
+        a.ldr_imm(16, 21, (H_CONSTRUCT_THIS * 8) as u32);
+        a.blr(16);
+        if keep_return {
+            a.ldr_imm(30, 31, 16);
+            a.ldp_post(12, 10, 32);
+        } else {
+            a.ldp_post(12, 10, 16);
+        }
+        a.cbz(0, true, hit_slow);
+        a.mov(2, 0);
+        a.ldr_imm(14, 19, 72);
+        a.ldr_w_imm(11, 14, il.depth as u32);
+        a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
+        a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
+    }
 
     // x13 = the callee's [[Environment]] (`Env::as_ptr`), kept until the install below. An
     // identity hit's way recorded exactly this closure's environment; a code-keyed hit
@@ -8031,7 +8140,7 @@ fn emit_direct_call(
     }
 
     // ---- mutations ----
-    if crate::bytecode::call_paths_enabled() {
+    if !construct && crate::bytecode::call_paths_enabled() {
         // TRUST_JS_JIT_CALLSTAT=2 (diagnostic): count the entry; x4 and x5 are written below
         // before they are read.
         let count = &crate::bytecode::CALL_PATHS[crate::bytecode::CallPath::Direct as usize];
@@ -8063,7 +8172,11 @@ fn emit_direct_call(
     }
     a.str_w_imm(5, 6, 8); // call_site
     a.ldrb_imm(5, 12, IC_STRICT);
-    a.sturh(5, 6, 12); // strict, and construct = false (w5 is 0 or 1)
+    if construct {
+        // The frame runs a [[Construct]] (stack traces print `new name`).
+        a.logic_imm_w(1, 5, 5, asm::logical_imm_w(1 << 8).unwrap());
+    }
+    a.sturh(5, 6, 12); // strict (w5's low byte, 0 or 1), and construct
     a.stur(31, 6, 16); // extra = None (xzr)
     a.add_imm(16, 16, 1);
     a.str_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
@@ -8155,6 +8268,12 @@ fn emit_direct_call(
         }
         a.str_imm(4, 9, 48);
     }
+    if construct {
+        // OrdinaryCallBindThis: the instance is the callee's `this` in either mode (ToObject of
+        // an Object is itself). An active record's context is traced, so its [48] also roots
+        // the instance while the callee runs.
+        a.str_imm(2, 9, 48);
+    }
     // ---- run the callee on its own record, then tear it down ----
     // `reload` puts the record back in x10 once the callee returns. Teardown (completion
     // transfer, record return, frame pop, tail drain, depth--) is one shared per-chunk stub (see
@@ -8200,10 +8319,26 @@ fn emit_direct_call(
     // new.target Undefined (an arrow keeps its lexical new.target). A caller that is neither
     // constructing nor holding a NewTarget already has exactly that state, and every path the
     // callee can take restores the state it found, so this form saves, clears and restores
-    // nothing: the record alone rides across the call, in a 16-byte save area. A constructing
-    // caller takes the full form after the sequence.
+    // nothing: the record alone rides across the call, in a 16-byte save area. A [[Construct]]
+    // passes F as NewTarget, which PrepareForOrdinaryCall makes the callee's [[NewTarget]] and
+    // a body without an environment reads from the interpreter (`Chunk::lean_new_target`):
+    // from that caller state it sets new.target for the callee and puts Undefined back, and
+    // the save area holds [record, this] until the finish stub has returned: its helper
+    // fallback (a materialized activation, a throw) clobbers the caller-saved registers and
+    // releases the record's `this`, and can collect, so `this` waits on the scanned native
+    // stack. Any other caller takes the full form after the sequence.
     let full_state = a.new_label();
     let finished = a.new_label();
+    // F's word, on the caller's operand stack under the arguments: the construct's new.target.
+    let new_target_word = |a: &mut asm::Asm, rd: u32| {
+        let below = ((argc + 1) * 8) as u32;
+        if below <= 256 {
+            a.ldur(rd, 20, -(below as i32));
+        } else {
+            a.sub_imm(rd, 20, below);
+            a.ldr_imm(rd, rd, 0);
+        }
+    };
     let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
     a.ldrb_imm(4, construct_base, construct_offset);
     a.cbnz(4, false, full_state);
@@ -8211,8 +8346,19 @@ fn emit_direct_call(
     a.mov_imm64(5, crate::value::PACK_UNDEFINED);
     a.cmp_reg_x(4, 5);
     a.b_cond(C_NE, full_state);
-    a.stp_pre(9, 31, -16); // [record, zero]: the pad cannot retain a stale conservative root
-    run_and_finish(a, &|a| a.ldp_post(10, 11, 16));
+    if construct {
+        new_target_word(a, 4);
+        a.str_imm(4, 14, il.new_target as u32);
+        a.stp_pre(9, 2, -16); // [record, this]
+        run_and_finish(a, &|a| a.ldr_imm(10, 31, 0));
+        a.ldp_post(10, 11, 16); // x11 = this
+        a.ldr_imm(14, 19, 72); // ctx.interp (x14 was clobbered by the callee/helpers)
+        a.mov_imm64(4, crate::value::PACK_UNDEFINED);
+        a.str_imm(4, 14, il.new_target as u32);
+    } else {
+        a.stp_pre(9, 31, -16); // [record, zero]: the pad cannot retain a stale conservative root
+        run_and_finish(a, &|a| a.ldp_post(10, 11, 16));
+    }
     a.bind(finished);
 
     // ---- pop the arguments and the callee (and skip the consumed this slot); dispatch on
@@ -8232,19 +8378,33 @@ fn emit_direct_call(
     }
     a.cbnz(8, true, l_unwind); // threw → caller unwind (fields restored)
                                // x2 = the completion word the finish stub took out; no decode/encode.
+    if construct {
+        // [[Construct]]'s result (ECMA-262 steps 12-13): the body's completion if it is an
+        // Object, else `this` (x11, back from the save area).
+        a.lsr_imm(4, 2, 48);
+        a.movz(5, (crate::value::PACK_OBJ >> 48) as u32, 0);
+        a.cmp_reg_x(4, 5);
+        a.csel_x(2, 2, 11, C_EQ);
+    }
     a.stur(2, 20, 0);
     a.add_imm(20, 20, 8);
     #[cfg(test)]
     {
-        a.mov_imm64(16, record_direct_packed_return as *const () as u64);
+        let record: extern "C" fn() = if construct {
+            record_direct_construct
+        } else {
+            record_direct_packed_return
+        };
+        a.mov_imm64(16, record as *const () as u64);
         a.blr(16);
         a.movz(8, 0, 0); // not threw, as the shared stub's status expects
     }
     a.b(done);
 
     // ---- full form: a constructing caller, or one holding a NewTarget ----
-    // Save area: [record, constructing (byte), new_target word, padding]. Keep SP 16-aligned.
-    // The interpreter's construct state is cleared for the callee and restored after it.
+    // Save area: [record, constructing (byte), new_target word, padding] for a call, [record,
+    // this, constructing, new_target] for a construct. Keep SP 16-aligned. The interpreter's
+    // construct state is set for the callee and restored after it.
     a.bind(full_state);
     #[cfg(test)]
     {
@@ -8254,33 +8414,55 @@ fn emit_direct_call(
         a.add_imm(5, 5, 1);
         a.str_imm(5, 4, 0);
     }
-    a.sub_imm(31, 31, 32);
-    a.stur(9, 31, 0);
-    let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
-    a.ldrb_imm(4, construct_base, construct_offset);
-    a.stur(4, 31, 8);
-    a.strb_imm(31, construct_base, construct_offset);
-    a.ldr_imm(4, 14, il.new_target as u32);
-    a.stur(4, 31, 16);
-    a.stur(31, 31, 24); // initialized padding cannot retain a stale conservative root
-    let lexical_target = a.new_label();
-    a.ldurb(4, 12, IC_DIRECT);
-    let lexical_bit = asm::logical_imm_w(crate::bytecode::CALL_IC_LEXICAL_THIS as u32).unwrap();
-    a.logic_imm_w(0, 4, 4, lexical_bit);
-    a.cbnz(4, false, lexical_target);
-    a.mov_imm64(4, crate::value::PACK_UNDEFINED);
-    a.str_imm(4, 14, il.new_target as u32); // ordinary calls clear the complete word
-    a.bind(lexical_target); // arrows retain their lexical function environment's new.target
-    run_and_finish(a, &|a| a.ldur(10, 31, 0));
-    // Restore the interpreter's construct state; w8 (threw) survives.
-    a.ldr_imm(14, 19, 72); // ctx.interp (x14 was clobbered by the callee/helpers)
-    a.ldur(4, 31, 8);
-    let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
-    a.strb_imm(4, construct_base, construct_offset);
-    a.ldur(4, 31, 16);
-    a.str_imm(4, 14, il.new_target as u32);
-    a.add_imm(31, 31, 32);
-    a.b(finished);
+    if construct {
+        a.sub_imm(31, 31, 32);
+        a.stp_base(9, 2, 31, 0);
+        let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
+        a.ldrb_imm(4, construct_base, construct_offset);
+        a.ldr_imm(5, 14, il.new_target as u32);
+        a.stp_base(4, 5, 31, 16);
+        a.strb_imm(31, construct_base, construct_offset);
+        new_target_word(a, 4);
+        a.str_imm(4, 14, il.new_target as u32);
+        run_and_finish(a, &|a| a.ldr_imm(10, 31, 0));
+        a.ldr_imm(11, 31, 8); // this
+                              // Restore the interpreter's construct state; w8 (threw) survives.
+        a.ldr_imm(14, 19, 72);
+        a.ldp_base(4, 5, 31, 16);
+        let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
+        a.strb_imm(4, construct_base, construct_offset);
+        a.str_imm(5, 14, il.new_target as u32);
+        a.add_imm(31, 31, 32);
+        a.b(finished);
+    } else {
+        a.sub_imm(31, 31, 32);
+        a.stur(9, 31, 0);
+        let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
+        a.ldrb_imm(4, construct_base, construct_offset);
+        a.stur(4, 31, 8);
+        a.strb_imm(31, construct_base, construct_offset);
+        a.ldr_imm(4, 14, il.new_target as u32);
+        a.stur(4, 31, 16);
+        a.stur(31, 31, 24); // initialized padding cannot retain a stale conservative root
+        let lexical_target = a.new_label();
+        a.ldurb(4, 12, IC_DIRECT);
+        let lexical_bit = asm::logical_imm_w(crate::bytecode::CALL_IC_LEXICAL_THIS as u32).unwrap();
+        a.logic_imm_w(0, 4, 4, lexical_bit);
+        a.cbnz(4, false, lexical_target);
+        a.mov_imm64(4, crate::value::PACK_UNDEFINED);
+        a.str_imm(4, 14, il.new_target as u32); // ordinary calls clear the complete word
+        a.bind(lexical_target); // arrows retain their lexical function environment's new.target
+        run_and_finish(a, &|a| a.ldur(10, 31, 0));
+        // Restore the interpreter's construct state; w8 (threw) survives.
+        a.ldr_imm(14, 19, 72); // ctx.interp (x14 was clobbered by the callee/helpers)
+        a.ldur(4, 31, 8);
+        let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
+        a.strb_imm(4, construct_base, construct_offset);
+        a.ldur(4, 31, 16);
+        a.str_imm(4, 14, il.new_target as u32);
+        a.add_imm(31, 31, 32);
+        a.b(finished);
+    }
 
     // ---- the static gates one by one (w9 = the entry's direct bits) ----
     a.bind(static_gates);
@@ -8299,18 +8481,22 @@ fn emit_direct_call(
     a.cbz(11, true, hit_slow);
     a.bind(no_glob);
     // this binding: a this-using SLOPPY callee needs boxing/global fallback unless the
-    // incoming receiver is already an object.
-    a.ldrb_imm(9, 12, IC_USES_THIS);
-    a.cbz(9, false, static_done);
-    a.ldrb_imm(9, 12, IC_STRICT);
-    a.cbnz(9, false, static_done);
-    if with_this {
-        a.sub_imm(9, 20, ((argc + 2) * 8) as u32);
-        a.ldr_imm(9, 9, 0);
-        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, hit_slow);
+    // incoming receiver is already an object. A construct's `this` is its new instance.
+    if construct {
         a.b(static_done);
     } else {
-        a.b(hit_slow); // no receiver + sloppy this-user: global boxing → generic
+        a.ldrb_imm(9, 12, IC_USES_THIS);
+        a.cbz(9, false, static_done);
+        a.ldrb_imm(9, 12, IC_STRICT);
+        a.cbnz(9, false, static_done);
+        if with_this {
+            a.sub_imm(9, 20, ((argc + 2) * 8) as u32);
+            a.ldr_imm(9, 9, 0);
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, hit_slow);
+            a.b(static_done);
+        } else {
+            a.b(hit_slow); // no receiver + sloppy this-user: global boxing → generic
+        }
     }
 
     // ---- an over-applied call: move the w6 = n_params < argc arguments bound ----
@@ -8338,8 +8524,108 @@ fn emit_direct_call(
     true
 }
 
+/// The direct construct sequence of a `new` site (`Op::New(argc, cache)`): its construct cache's
+/// entry probed in line, as the call template probes a way (the constructor's identity, the
+/// live call-cache epoch, the active Realm's global environment), then
+/// [`emit_direct_sequence`]'s [[Construct]] form. A hit proves everything the fill recorded
+/// (`Interp::construct_ic_fill`): an ordinary or base class constructor of this Realm, with
+/// machine code and a cached `prototype` slot. A miss or a declined gate leaves to `slow`, the
+/// `Op::New` helper, with nothing changed. Emits nothing when the chunk's emitter options (the
+/// call template's inline probe and direct calls) or an emission-time precondition rule the
+/// sequence out.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_direct_construct(
+    a: &mut asm::Asm,
+    chunk: &Chunk,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    argc: usize,
+    cache: u32,
+    fast: u32,
+    slow: usize,
+    l_unwind: usize,
+    done: usize,
+    l_direct_finish: usize,
+) {
+    let attempted_off = chunk.jit_inline_attempted_off();
+    let runs_off = chunk.jit_runs_off();
+    let retry_off = chunk.jit_inline_retry_at_off();
+    if fast & (524288 | (1 << 20)) != 524288 | (1 << 20)
+        || !crate::bytecode::direct_shared_context_enabled()
+        || !direct_call_supported(ilayout, layout, attempted_off, runs_off, retry_off, argc)
+    {
+        return;
+    }
+    // x10 = the constructor's word EOR the Object tag: an object's cell address, which the entry
+    // records; any other word keeps bits above the payload and matches nothing.
+    let below = ((argc + 1) * 8) as u32;
+    if below <= 256 {
+        emit_exec_word_load(a, 9, 20, -(below as i32));
+    } else {
+        a.sub_imm(9, 20, below);
+        a.ldr_imm(9, 9, 0);
+    }
+    a.mov_imm64(16, crate::value::PACK_OBJ);
+    a.logic_x(2, 10, 9, 16);
+    // x12 = the entry. The fill never records the exhausted epoch (`fill_construct_cache`).
+    a.mov_imm64(12, chunk.jit_construct_cache_ptr(cache) as u64);
+    a.ldr_imm(11, 12, 0); // callee
+    a.cmp_reg_x(10, 11);
+    a.b_cond(C_NE, slow);
+    a.ldr_imm(11, 19, CALL_IC_EPOCH_OFF);
+    a.ldr_w_imm(15, 11, 0);
+    a.ldr_w_imm(11, 12, 56); // epoch
+    a.cmp_reg_w(11, 15);
+    a.b_cond(C_NE, slow);
+    a.ldr_imm(17, 19, 64); // ctx.genv
+    a.ldr_imm(11, 12, 32); // global_env
+    a.cmp_reg_x(11, 17);
+    a.b_cond(C_NE, slow);
+    if use_shared_stub(a) {
+        // The chunk's shared sequence for this arity, with the site's position after the
+        // return as a call site places it (see `DirectCallSite::AfterReturn`).
+        let stub = a.shared_stub(SharedStub::DirectConstruct { argc: argc as u8 }.key());
+        a.bl_label(stub);
+        let not_returned = a.new_label();
+        const _: () = assert!(DIRECT_CALL_RETURNED == 0);
+        a.cbnz(8, false, not_returned);
+        a.b(done);
+        // Never executed (see the call template's stub call).
+        a.word(chunk.construct_position(cache));
+        a.bind(not_returned);
+        a.cmp_imm_w(8, DIRECT_CALL_THREW);
+        a.b_cond(C_EQ, l_unwind);
+        a.b(slow);
+        return;
+    }
+    let emitted = emit_direct_sequence(
+        a,
+        ilayout,
+        layout,
+        attempted_off,
+        runs_off,
+        retry_off,
+        argc,
+        DirectForm::Construct,
+        slow,
+        l_unwind,
+        done,
+        l_direct_finish,
+        DirectCallSite::Position(chunk.construct_position(cache)),
+    );
+    debug_assert!(emitted, "its preconditions were checked above");
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 thread_local! {
+    /// Constructions the direct construct sequence completed normally.
+    pub(crate) static TEST_DIRECT_CONSTRUCTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     static TEST_DIRECT_PACKED_RETURNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // Direct callee errors dispatched only after restoring constructing and new_target.
     static TEST_DIRECT_PACKED_THROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -8355,6 +8641,11 @@ thread_local! {
 #[cfg(all(test, target_arch = "aarch64"))]
 extern "C" fn record_direct_packed_return() {
     TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+extern "C" fn record_direct_construct() {
+    TEST_DIRECT_CONSTRUCTS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(all(
@@ -10756,6 +11047,14 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     DirectCall { argc: u8, with_this: bool },
+    /// [`emit_direct_sequence`]'s [[Construct]] form for one arity, entered at a `new` site's
+    /// construct-cache hit with its registers (see [`emit_direct_construct`]) → w9 =
+    /// `DIRECT_CALL_*`.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    DirectConstruct { argc: u8 },
     /// [`emit_call_intrinsics1`] for a `CallWithThis(1)` site's live call-IC hit, with w8 = the
     /// site's pc → w9 = `INTRINSIC_*` (no-intrinsic and declined keep x10/x12/x15).
     #[cfg(all(
@@ -10866,6 +11165,7 @@ impl SharedStub {
     const HELPER: u32 = 0x800;
     const TYPED_ELEMENT: u32 = 0x900;
     const NAME_ELEMENT: u32 = 0xa00;
+    const DIRECT_CONSTRUCT: u32 = 0xb00;
 
     fn key(self) -> u32 {
         match self {
@@ -10898,6 +11198,14 @@ impl SharedStub {
             SharedStub::DirectCall { argc, with_this } => {
                 debug_assert!(argc < 128);
                 Self::DIRECT_CALL | u32::from(argc) | u32::from(with_this) << 7
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::DirectConstruct { argc } => {
+                debug_assert!(argc < 128);
+                Self::DIRECT_CONSTRUCT | u32::from(argc)
             }
             #[cfg(all(
                 target_arch = "aarch64",
@@ -10951,6 +11259,13 @@ impl SharedStub {
             Self::DIRECT_CALL => SharedStub::DirectCall {
                 argc: (key & 0x7f) as u8,
                 with_this: key & 0x80 != 0,
+            },
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::DIRECT_CONSTRUCT => SharedStub::DirectConstruct {
+                argc: (key & 0x7f) as u8,
             },
             #[cfg(all(
                 target_arch = "aarch64",
@@ -11013,6 +11328,7 @@ impl SharedStub {
                 "Stub:DirectCall(argc={argc}{})",
                 if with_this { ",with_this" } else { "" }
             ),
+            SharedStub::DirectConstruct { argc } => format!("Stub:DirectConstruct(argc={argc})"),
             SharedStub::Intrinsics1 {
                 array_push,
                 discard,
@@ -11193,7 +11509,14 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            SharedStub::DirectCall { argc, with_this } => {
+            SharedStub::DirectCall { .. } | SharedStub::DirectConstruct { .. } => {
+                let (argc, form) = match self {
+                    SharedStub::DirectCall { argc, with_this } => {
+                        (argc, DirectForm::Call { with_this })
+                    }
+                    SharedStub::DirectConstruct { argc } => (argc, DirectForm::Construct),
+                    _ => unreachable!(),
+                };
                 let ilayout = context
                     .ilayout
                     .expect("call stubs are requested only by chunk compilation");
@@ -11207,7 +11530,7 @@ impl SharedStub {
                 let declined = a.new_label();
                 let returned = a.new_label();
                 let threw = a.new_label();
-                let emitted = emit_direct_call(
+                let emitted = emit_direct_sequence(
                     a,
                     ilayout,
                     layout,
@@ -11215,7 +11538,7 @@ impl SharedStub {
                     direct.runs_off,
                     direct.retry_off,
                     usize::from(argc),
-                    with_this,
+                    form,
                     declined,
                     threw,
                     returned,
@@ -11417,7 +11740,10 @@ fn global_stub_address(key: u32, context: &StubContext<'_>) -> Option<u64> {
     let direct = context
         .direct
         .map(|direct| (direct.attempted_off, direct.runs_off, direct.retry_off));
-    let is_direct = matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. });
+    let is_direct = matches!(
+        SharedStub::from_key(key),
+        SharedStub::DirectCall { .. } | SharedStub::DirectConstruct { .. }
+    );
     if is_direct && direct.is_none() {
         return None;
     }
@@ -11481,7 +11807,10 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
         }
     }
     a.bind(finish);
-    if matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. }) {
+    if matches!(
+        SharedStub::from_key(key),
+        SharedStub::DirectCall { .. } | SharedStub::DirectConstruct { .. }
+    ) {
         emit_direct_finish_stub(&mut a, context.ilayout?, context.layout.valid);
     }
     let labels: Vec<usize> = stubs
@@ -17405,8 +17734,10 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
 /// - Not polled: `cond`, `return`, `push_handler`, `pop_handler`, `strict_eq` and
 ///   `loop_backedge` allocate no cell; `unwind` and `complete` route a completion already made
 ///   (their ABIs return a code address); `direct_finish` runs inside a direct call, whose site
-///   polls at its end (a tail call goes through `gc_check_amortized` first); `slice_op` ends the
-///   native slice, and the code that resumes or receives it polls; `interrupt` is the poll.
+///   polls at its end (a tail call goes through `gc_check_amortized` first); `construct_this`
+///   allocates the instance a direct construct sequence then commits to, whose callee's entry
+///   poll is the next safepoint; `slice_op` ends the native slice, and the code that resumes or
+///   receives it polls; `interrupt` is the poll.
 fn helper_ends_in_poll(idx: usize) -> bool {
     matches!(
         idx,

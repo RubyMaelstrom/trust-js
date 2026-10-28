@@ -1,6 +1,7 @@
-//! `new` through a site's construct cache. ECMA-262 (e28783d5): EvaluateNew, Construct,
-//! [[Construct]] for ECMAScript function objects, OrdinaryCreateFromConstructor,
-//! GetPrototypeFromConstructor and InitializeInstanceElements. Expected values are V8's.
+//! `new` through a site's construct cache, and on ARM64 through the direct construct sequence.
+//! ECMA-262 (e28783d5): EvaluateNew, Construct, [[Construct]] for ECMAScript function objects,
+//! OrdinaryCreateFromConstructor, GetPrototypeFromConstructor and InitializeInstanceElements.
+//! Expected values are V8's.
 
 #![cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
@@ -114,4 +115,253 @@ fn base_classes_without_instance_elements_take_the_construct_cache() {
             );
         }
     }
+}
+
+/// Constructions the ARM64 direct construct sequence has completed on this thread.
+fn direct_constructs() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    return super::TEST_DIRECT_CONSTRUCTS.with(std::cell::Cell::get);
+    #[cfg(not(target_arch = "aarch64"))]
+    0
+}
+
+/// Runs `source` at every tier, each giving `expected`, and checks that the frame stack and the
+/// interpreter's construct state are back to the program's. On ARM64 the machine-code tier
+/// constructs through the direct sequence.
+fn all_tiers(source: &str, expected: &str) {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let before = direct_constructs();
+        assert_eq!(evaluate(&mut engine, source), expected, "{tier:?}");
+        if cfg!(target_arch = "aarch64") && tier == Tier::Jit {
+            assert!(direct_constructs() > before, "no direct construction");
+        }
+        assert!(engine.interp.fn_frames.is_empty(), "{tier:?}");
+        assert!(!engine.interp.constructing, "{tier:?}");
+        assert_eq!(
+            engine.interp.new_target.bits(),
+            crate::value::PACK_UNDEFINED,
+            "{tier:?}"
+        );
+    }
+}
+
+/// Hot `new` sites (the direct construct sequence on ARM64) against the generic [[Construct]]:
+/// argument binding with missing and surplus arguments, sloppy and strict bodies, new.target in
+/// the body and in its own calls and constructions (the sequence's full form), an Object result
+/// replacing `this` and other results not, a throw, a base class, bodies whose operations
+/// materialize a native activation (the finish stub's helper fallback), a body that needs the
+/// global object, the constructor's live `prototype` (replaced, then not an Object), sites in a
+/// loop (the sequence in line) and elsewhere (a shared stub's), and constructions nested past
+/// the sequence's depth limit.
+#[test]
+fn constructions_match_the_specification_at_every_tier() {
+    all_tiers(
+        r#"
+        function Point(x, y) { this.x = x; this.y = y; }
+        function Nine(a, b, c, d, e, f, g, h, i) { this.sum = a + b + c + d + e + f + g + h + i; }
+        function Strict(x) { 'use strict'; this.target = new.target === Strict; this.x = x; }
+        var replacement = { replaced: true };
+        function Returns(mode) {
+            this.own = 1;
+            if (mode === 1) return replacement;
+            if (mode === 2) return 7;
+            if (mode === 3) return null;
+        }
+        function Throws(x) { this.x = x; if (x % 3 === 0) throw new RangeError('t' + x); }
+        function plain() { return new.target === undefined; }
+        function Inner() { this.target = new.target === Inner; }
+        function Outer() {
+            this.before = new.target === Outer;
+            this.inner = new Inner();
+            this.called = plain();
+            this.after = new.target === Outer;
+        }
+        class C { constructor(x) { this.x = x; } get double() { return this.x * 2; } }
+        class Supered { constructor(x) { this.x = x; this.own = super.hasOwnProperty('x'); } }
+        function Spread(a) { this.list = [...a, 1]; }
+        var scale = 3;
+        function Scaled(x) { this.v = x * scale; }
+        function Live() { this.tag = 'live'; }
+        var protoA = { kind: 'a' }, protoB = { kind: 'b' };
+        function makeLive() { return new Live(); }
+        function Deep(n) { this.next = n > 0 ? new Deep(n - 1) : null; this.n = n; }
+        function loopSum(n) {
+            var s = 0;
+            for (var i = 0; i < n; i++) { var p = new Point(i, 2); s += p.x + p.y; }
+            return s;
+        }
+        function depth(d) { var n = 0; while (d.next) { d = d.next; n++; } return n + ':' + d.n; }
+        function drive(k) {
+            var a = new Point(k), b = new Point(k, 1), c = new Point(k, 2, 3);
+            var threw = '';
+            try { new Throws(k); } catch (e) { threw = e instanceof RangeError ? e.message : 'bad'; }
+            var o = new Outer(), s = new Strict(k), d = new C(k);
+            Live.prototype = k % 2 ? protoA : protoB;
+            return [typeof a.y, b.y + c.y, Object.keys(c).join(), new Nine(k, 1, 2, 3, 4, 5, 6, 7, 8).sum,
+                s.target && s.x === k, new Returns(1) === replacement, new Returns(2).own,
+                new Returns(3).own, new Returns(0).own, threw,
+                o.before && o.inner.target && o.called && o.after, d.double, d instanceof C,
+                new Scaled(k).v, makeLive().kind, loopSum(k % 7), new Supered(k).own,
+                new Spread([k]).list.join('-')].join(';');
+        }
+        var out = [];
+        for (var k = 0; k < 300; k++) out[k % 3] = drive(k);
+        Live.prototype = 5;
+        var plainLive = makeLive();
+        out.push(Object.getPrototypeOf(plainLive) === Object.prototype, plainLive.tag);
+        out.push(depth(new Deep(300)));
+        out.join('|');
+    "#,
+        "undefined;3;x,y;333;true;true;1;1;1;t297;true;594;true;891;a;9;true;297-1|\
+         undefined;3;x,y;334;true;true;1;1;1;;true;596;true;894;b;14;true;298-1|\
+         undefined;3;x,y;335;true;true;1;1;1;;true;598;true;897;a;20;true;299-1|true|live|300:0",
+    );
+}
+
+/// The stack a constructor's body captures names its frame `new F` at its caller's position,
+/// at every tier.
+#[test]
+fn constructor_frames_appear_in_stack_traces() {
+    let source = r#"
+        function Traced(x) { this.x = x; this.stack = new Error('s').stack; }
+        function makeTraced(k) { return new Traced(k); }
+        var stack;
+        for (var k = 0; k < 200; k++) stack = makeTraced(k).stack;
+        stack;
+    "#;
+    let mut reference = None;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let stack = evaluate(&mut engine, source);
+        assert!(stack.contains("at new Traced ("), "{tier:?}: {stack}");
+        match &reference {
+            None => reference = Some(stack),
+            Some(reference) => assert_eq!(&stack, reference, "{tier:?}"),
+        }
+    }
+}
+
+/// The instance lives while its constructor runs, across collections in its body and in the
+/// bodies it constructs, whatever else refers to it.
+#[test]
+fn constructions_keep_their_instance_across_collections() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine
+            .interp
+            .def_method(&engine.interp.global, "collect", 0, |interp, _, _| {
+                interp.gc_collect();
+                Ok(crate::value::Value::Undefined)
+            });
+        let before = direct_constructs();
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            function Holder(x) { this.first = { v: x }; collect(); this.second = 'n' + x; }
+            function Wrapped(x) { var inner = new Holder(x); collect(); this.inner = inner; }
+            function Dropped(x) { this.lost = { v: x }; collect(); return { kept: x }; }
+            function make(k) { return new Wrapped(k); }
+            function drop(k) { return new Dropped(k); }
+            var okay = true;
+            for (var k = 0; k < 120; k++) {
+                var w = make(k), d = drop(k);
+                okay = okay && w.inner.first.v === k && w.inner.second === 'n' + k
+                    && w instanceof Wrapped && d.kept === k && !(d instanceof Dropped);
+            }
+            okay;
+        "#
+            ),
+            "true",
+            "{tier:?}"
+        );
+        if cfg!(target_arch = "aarch64") && tier == Tier::Jit {
+            assert!(direct_constructs() > before, "no direct construction");
+        }
+        assert!(engine.interp.fn_frames.is_empty());
+    }
+}
+
+/// Hot `new` sites of a function constructor and of a base class complete through the ARM64
+/// direct construct sequence, and a constructor's throw unwinds through it.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn hot_new_sites_construct_through_the_direct_sequence() {
+    // The call-cache epoch is process-global: other tests' engines must not make a site miss
+    // while the counts are taken.
+    const CHILD: &str = "TRUST_JS_TEST_DIRECT_CONSTRUCT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "jit::construct_tests::hot_new_sites_construct_through_the_direct_sequence",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let program = r#"
+        function Point(x, y) { this.x = x; this.y = y; }
+        class C { constructor(x) { this.x = x; } }
+        function Throws(x) { this.x = x; throw x; }
+        function make(k) { return new Point(k, 1).y + new C(k).x; }
+        function fail(k) { try { new Throws(k); } catch (e) { return e; } }
+        function drive(n) {
+            var s = 0;
+            for (var k = 0; k < n; k++) s += make(k) + fail(k) + new Point(k, 2).y;
+            return s;
+        }
+    "#;
+    // Each caller's own recompiles start its sites' caches afresh: warm them all.
+    evaluate(
+        &mut engine,
+        &format!("{program} for (var round = 0; round < 8; round++) drive(100); 0"),
+    );
+    let constructs = || super::TEST_DIRECT_CONSTRUCTS.with(std::cell::Cell::get);
+    let throws = || super::TEST_DIRECT_PACKED_THROWS.with(std::cell::Cell::get);
+    let before = (constructs(), throws());
+    assert_eq!(evaluate(&mut engine, "drive(100)"), "10200");
+    assert_eq!(
+        constructs() - before.0,
+        300,
+        "three hot sites (two through a shared stub, one in line), 100 times each"
+    );
+    assert_eq!(throws() - before.1, 100, "the throwing site, 100 times");
+    assert!(engine.interp.fn_frames.is_empty());
+
+    // A simple constructor, whose fields the helper copies without a record, at a site whose
+    // caller holds the only record: no call has filled the pool.
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    evaluate(
+        &mut engine,
+        r#"
+        function Pair(x, y) { this.x = x; this.y = y; }
+        function run(n) { var s = 0; for (var k = 0; k < n; k++) s = (s + new Pair(k, 1).y) | 0; return s; }
+        for (var round = 0; round < 4; round++) run(1000);
+    "#,
+    );
+    let before = constructs();
+    assert_eq!(evaluate(&mut engine, "run(1000)"), "1000");
+    assert_eq!(constructs() - before, 1000);
 }

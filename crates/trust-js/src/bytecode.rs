@@ -1705,9 +1705,13 @@ mod call_overflow_tests {
 
 /// Monomorphic `new`-site cache. Constructors are overwhelmingly fixed per source site, so this
 /// avoids the interpreter-wide constructor hash table after the first execution while retaining
-/// the same epoch/realm/prototype guards.
+/// the same epoch/realm/prototype guards. `repr(C)` with `call` first: the ARM64 `new` site
+/// probes the entry, and its direct construct sequence reads the entry's [`CallIc`] at the call
+/// template's offsets (see `jit::emit_direct_construct`).
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub(crate) struct ConstructSite {
+    /// The constructor's call entry. Its `direct` bits are [`Chunk::jit_construct_flags`].
     pub call: CallIc,
     pub prototype_shape: u32,
     pub prototype_slot: u32,
@@ -1722,6 +1726,8 @@ impl ConstructSite {
         arguments_apply_forwarder: false,
     };
 }
+
+const _: () = assert!(std::mem::offset_of!(ConstructSite, call) == 0);
 
 /// Which update `UpdateLocal` performs, and the value it leaves on the stack: `Pre*` push the
 /// updated value, `Post*` push the original (coerced) value, `*Discard` push nothing (the update
@@ -19905,6 +19911,18 @@ impl Chunk {
     pub(crate) fn jit_call_cache_ptr(&self, idx: u32) -> usize {
         self.call_caches[idx as usize].entries.as_ptr() as usize
     }
+    /// The stable address of construct site `idx`'s `Cell<ConstructSite>` (the same contract:
+    /// `construct_caches` is fixed once compilation finishes).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn jit_construct_cache_ptr(&self, idx: u32) -> usize {
+        &self.construct_caches[idx as usize] as *const std::cell::Cell<ConstructSite> as usize
+    }
     #[cfg(test)]
     pub(crate) fn test_call_site(&self, idx: u32) -> &CallSite {
         &self.call_caches[idx as usize]
@@ -20742,6 +20760,28 @@ impl Chunk {
             any(target_os = "macos", target_os = "linux", target_os = "windows")
         )))]
         let _ = code;
+        f
+    }
+
+    /// [`CallIc::direct`] gates for a construct site's entry ([`ConstructSite::call`]): the
+    /// call's, except that [[Construct]] binds the new instance as `this` in either mode
+    /// (OrdinaryCallBindThis: ToObject of an Object is that Object), so no receiver condition
+    /// holds back [`CALL_IC_DIRECT_READY`]. The direct construct sequence allocates through the
+    /// chunk's instance layout and neither observes the instance's capacity after the body
+    /// (`Interp::observe_construct_capacity`, which a chunk without a layout needs) nor runs a
+    /// forwarding constructor's plan: such an entry loses bit 0, and with it the sequence.
+    pub(crate) fn jit_construct_flags(
+        &self,
+        code: &crate::jit::JitCode,
+        arguments_apply_forwarder: bool,
+    ) -> u8 {
+        let mut f = self.jit_direct_flags(code) & !CALL_IC_DIRECT_READY;
+        if arguments_apply_forwarder || self.instance_layout().is_none() {
+            f &= !1;
+        }
+        if f & (1 | 2 | 8) == (1 | 8) {
+            f |= CALL_IC_DIRECT_READY;
+        }
         f
     }
 
@@ -23474,6 +23514,18 @@ unsafe fn jit_new_inner(
             site,
         )
     } {
+        // The direct construct sequence (ARM64) runs its constructor on a pooled record, and
+        // only a construction that runs a body returns one to the pool: a simple
+        // constructor's fields are copied here without one. Keep a record pooled, or a site
+        // whose caller's activation holds the last record never takes the sequence.
+        #[cfg(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
+        if i.frame_pool.is_empty() {
+            let record = crate::jit::JitFrame::alloc(i);
+            i.frame_pool.push(record);
+        }
         *sp = unsafe { args_ptr.sub(1) };
         let v = r?;
         unsafe { sp.write(v) };
@@ -23494,6 +23546,59 @@ unsafe fn jit_new_inner(
     unsafe { sp.write(v) };
     *sp = unsafe { sp.add(1) };
     Ok(())
+}
+
+/// [[Construct]] step 3 for the ARM64 direct construct sequence (`jit::emit_direct_construct`),
+/// once its probe has proved the site's cached constructor and its gates have passed:
+/// OrdinaryCreateFromConstructor (ECMA-262), as [`Interp::construct_jit_fast`] makes the instance
+/// on the `Op::New` helper's cached path. Returns the instance's execution word, or 0, with
+/// nothing allocated, when the constructor's live `prototype` is not an Object data property:
+/// the sequence then leaves for that helper. It runs no author code and reaches no safepoint
+/// (the engine's heaps never collect on allocation), so every gate the sequence passed still
+/// holds when it returns.
+///
+/// # Safety
+/// `site` is a construct site of the running chunk whose entry names `callee`, the
+/// constructor's cell address, which the caller's operand stack holds.
+pub(crate) unsafe extern "C" fn jit_construct_this(
+    site: *const std::cell::Cell<ConstructSite>,
+    callee: usize,
+) -> u64 {
+    // Read in place: nothing writes the entry while the helper runs (it runs no code).
+    let site = unsafe { &*(*site).as_ptr() };
+    debug_assert_eq!(site.call.callee, callee);
+    let constructor = unsafe { crate::value::Gc::from_raw(callee as *const _) };
+    // GetPrototypeFromConstructor(F, "%Object.prototype%"), F being new.target too: the LIVE
+    // `prototype` own data property, through the cached shape and slot.
+    let proto = {
+        let b = constructor.borrow();
+        let property = if b.props.shape() == site.prototype_shape {
+            b.props.property_at(site.prototype_slot as usize)
+        } else {
+            b.props.get("prototype")
+        };
+        match property {
+            Some(p) if !p.accessor() => match (p.value()).view() {
+                ValueView::Obj(proto) => proto,
+                _ => return 0,
+            },
+            _ => return 0,
+        }
+    };
+    // OrdinaryObjectCreate, its storage sized for the constructor's fields by its static field
+    // layout, which the entry's gate bits require (`Chunk::jit_construct_flags`).
+    let chunk = unsafe { &*site.call.chunk_raw };
+    let layout = chunk.instance_layout().cloned();
+    debug_assert!(layout.is_some(), "the entry's gates require a field layout");
+    let capacity = chunk
+        .instance_capacity_hint()
+        .max(layout.as_ref().map_or(0, |keys| keys.len()));
+    Value::Obj(crate::value::Object::new_with_parts(
+        Some(proto),
+        crate::value::Props::with_layout(capacity, layout),
+        crate::value::Exotic::None,
+    ))
+    .bits()
 }
 
 #[cfg(test)]

@@ -15233,7 +15233,7 @@ impl Interp {
             direct: if needs_env {
                 crate::bytecode::CALL_IC_NEEDS_ENV
             } else {
-                chunk.jit_direct_flags(&code)
+                chunk.jit_construct_flags(&code, arguments_apply_forwarder)
                     | (((chunk.inline_attempted.get() || func.runtime().code2.get().is_some())
                         as u8)
                         << 2)

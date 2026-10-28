@@ -44,18 +44,19 @@ comment/example in the same change.
   `TRUST_JS_TIER_LOG=1` reports each native compile.
 - `TRUST_JS_INLINE_AT=N` changes the speculative inline recompile threshold (default:
   100 machine-code runs); zero disables inlining.
-- `TRUST_JS_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls (the inline call sequence
-  that runs the callee on a pooled frame record) while retaining ordinary JIT calls.
+- `TRUST_JS_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls and constructions (the inline
+  call and `new` sequences that run the callee on a pooled frame record) while retaining
+  ordinary JIT calls.
 - `TRUST_JS_JIT_KEEP_FP_SAVES=1` keeps every ARM64 chunk's save and restore of d8-d15, which
   chunks whose code writes none of them otherwise skip, with a 64-byte native frame for 128.
 - `TRUST_JS_JIT_INLINE_STUBS=1` emits ARM64 name-cache validation, whole free-name reads,
   slow-path helper calls, generic property-cache probes, secondary call-cache probes and
-  direct-call sequences at every site instead of as per-chunk shared stubs (by default only
-  loop bodies keep name validation, whole name reads and direct calls in line, and every
-  slow-path helper call is a stub call). It is a code-size/performance ablation with the
-  same behavior. Compiled DOOM (archive.org's asm.js DOSBox) is bound by instruction-cache
-  pressure: making sites larger, by inlining stubs or sequences, slowed it by 10-18% in
-  paired runs.
+  direct call and `new` sequences at every site instead of as per-chunk shared stubs (by
+  default only loop bodies keep name validation, whole name reads and direct sequences in
+  line, and every slow-path helper call is a stub call). It is a code-size/performance
+  ablation with the same behavior. Compiled DOOM (archive.org's asm.js DOSBox) is bound by
+  instruction-cache pressure: making sites larger, by inlining stubs or sequences, slowed it
+  by 10-18% in paired runs.
 - `TRUST_JS_JIT_NO_JSCVT=1` makes ARM64 code use the portable guarded ToInt32 sequence even
   when the CPU implements FEAT_JSCVT (`fjcvtzs`).
 - `TRUST_JS_TAIL_CALL_DEPTH=N` sets the execution-context depth below which a strict

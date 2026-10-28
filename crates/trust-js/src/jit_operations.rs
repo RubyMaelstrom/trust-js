@@ -725,7 +725,25 @@ pub(super) fn emit(
         Op::Abstract(_) => {
             emit_op_helper(a, H_ABSTRACT, pc as u32, unwind);
         }
-        Op::New(argc, _) => {
+        Op::New(argc, cache) => {
+            // A site whose construct cache holds its constructor constructs through the direct
+            // sequence; a miss, or a gate the sequence declines, takes the helper.
+            let slow = a.new_label();
+            let done = a.new_label();
+            emit_direct_construct(
+                a,
+                chunk,
+                layout,
+                ilayout,
+                *argc as usize,
+                *cache,
+                fast,
+                slow,
+                unwind,
+                done,
+                direct_finish,
+            );
+            a.bind(slow);
             // H_NEW needs only the pc for optional diagnostics and the statically encoded
             // arity. Pack both so the million-call constructor path does not reload/decode
             // its bytecode op in Rust.
@@ -737,7 +755,9 @@ pub(super) fn emit(
             a.blr(16);
             a.mov(20, 0);
             a.cbnz(1, false, unwind);
-            // A native constructor allocates after the call's last safepoint.
+            // Either form lands here with its result pushed. A native constructor allocates
+            // after the call's last safepoint.
+            a.bind(done);
             emit_helper_end_poll(a, unwind);
         }
         Op::SetProp(..)
