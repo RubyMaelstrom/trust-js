@@ -36,6 +36,10 @@ their own dependencies. Check Cargo.toml and Cargo.lock before making dependency
 claims. System libraries and the vendored Streams polyfill are separate from Cargo
 dependencies.
 
+Linux builds link with packed relative relocations (RELR; see `.cargo/config.toml`), so
+their binaries need glibc 2.36 or later where they run, and a linker that supports
+`-z pack-relative-relocs` (GNU ld 2.38 or later, LLVM lld 15 or later, or mold).
+
 ## Performance work
 
 Optimize the established bytecode/native JIT pipeline and shared runtime as one engine.
