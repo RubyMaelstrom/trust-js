@@ -69,6 +69,7 @@ fn invoke(
         final_sp: base,
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
+        strict_flag: &mut i.strict as *mut bool,
         env_raw: Env::as_ptr(&env).cast(),
         this_word: (Value::Undefined),
         global_body: std::ptr::null(),

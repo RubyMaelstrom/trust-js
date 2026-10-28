@@ -1819,7 +1819,17 @@ pub struct JitCtx {
     /// state can outlive the synchronous helper call that observed it. 0 = none.
     pub accessor_holder: usize,
     pub accessor_slot: u32,
+    /// Points at `Interp::strict` (a `bool` byte), written once with the interpreter-constant
+    /// fields: every prologue saves the caller's strictness through it and every epilogue
+    /// restores it. The flag lies beyond a byte load's 12-bit offset from the interpreter, so
+    /// the pointer saves the address arithmetic.
+    pub(crate) strict_flag: *mut bool,
 }
+
+/// Byte offset of [`JitCtx::strict_flag`], loaded by every prologue and epilogue (an 8-byte
+/// `LDR` immediate).
+const STRICT_FLAG_OFF: u32 = std::mem::offset_of!(JitCtx, strict_flag) as u32;
+const _: () = assert!(STRICT_FLAG_OFF.is_multiple_of(8) && STRICT_FLAG_OFF / 8 < 4096);
 
 // The activation's `this`. Rust reads and writes it only here.
 impl JitCtx {
@@ -1902,6 +1912,7 @@ impl crate::gc_trace::GcTrace for JitCtx {
             references_raw: _,  // into `activation` or the borrowed continuation
             accessor_holder: _, // consumed before any JavaScript runs
             accessor_slot: _,
+            strict_flag: _,
         } = self;
         this_word.trace_gc(sink);
         ret.trace_gc(sink);
@@ -4012,13 +4023,13 @@ fn compile_entry(
     // ECMA-262 Strict Mode Code / PutValue: semantic helpers must see THIS body's lexical
     // mode, including cached calls and direct shared-context calls. Save on the native frame,
     // not JitCtx (which direct callees share), and restore on both normal and throwing exits.
-    a.ldr_imm(13, 19, std::mem::offset_of!(JitCtx, interp) as u32);
-    let (strict_base, strict_off) = byte_field_address(&mut a, 13, ilayout.strict, 16);
-    a.ldrb_imm(9, strict_base, strict_off);
+    // The record points at the interpreter's flag (`JitCtx::strict_flag`).
+    a.ldr_imm(16, 19, STRICT_FLAG_OFF);
+    a.ldrb_imm(9, 16, 0);
     a.strb_imm(9, 31, STRICT_SAVE);
     if !borrowed_entry {
         a.movz(9, u32::from(chunk.jit_is_strict()), 0);
-        a.strb_imm(9, strict_base, strict_off);
+        a.strb_imm(9, 16, 0);
     }
     // Function entry is a safepoint, like a loop back-edge: allocation pressure and host
     // interruption are observed here on the shared amortized cadence. Code that never takes a
@@ -4821,10 +4832,9 @@ fn compile_entry(
     // ---- epilogues ----
     a.bind(l_ret_ok);
     a.str_imm(20, 19, 16); // ctx.final_sp = sp
-    a.ldr_imm(13, 19, std::mem::offset_of!(JitCtx, interp) as u32);
-    let (strict_base, strict_off) = byte_field_address(&mut a, 13, ilayout.strict, 16);
+    a.ldr_imm(16, 19, STRICT_FLAG_OFF);
     a.ldrb_imm(9, 31, STRICT_SAVE);
-    a.strb_imm(9, strict_base, strict_off);
+    a.strb_imm(9, 16, 0);
     emit_residency_mark(&mut a, residency_ptr, false);
     a.movz(0, 1, 0);
     a.ldp_d_off(8, 9, DSAVE);
@@ -4837,10 +4847,9 @@ fn compile_entry(
     a.ret();
     a.bind(l_ret_throw);
     a.str_imm(20, 19, 16);
-    a.ldr_imm(13, 19, std::mem::offset_of!(JitCtx, interp) as u32);
-    let (strict_base, strict_off) = byte_field_address(&mut a, 13, ilayout.strict, 16);
+    a.ldr_imm(16, 19, STRICT_FLAG_OFF);
     a.ldrb_imm(9, 31, STRICT_SAVE);
-    a.strb_imm(9, strict_base, strict_off);
+    a.strb_imm(9, 16, 0);
     emit_residency_mark(&mut a, residency_ptr, false);
     a.movz(0, 0, 0);
     a.ldp_d_off(8, 9, DSAVE);
@@ -17641,6 +17650,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         final_sp: stack_base.add(initial_depth),
         slots: slots.as_ptr().cast_mut(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
+        strict_flag: &mut i.strict as *mut bool,
         env_raw: Env::as_ptr(env) as *const u8,
         this_word: *this_val,
         global_body: jit_global_body(i, code),
@@ -17805,6 +17815,7 @@ pub fn run(
         chunk: Rc::as_ptr(chunk),
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
+        strict_flag: &mut i.strict as *mut bool,
         n_slots,
         handlers: Vec::new(),
         activation: None,
@@ -17926,6 +17937,7 @@ impl JitFrame {
                 final_sp: words,
                 slots,
                 inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
+                strict_flag: &mut i.strict as *mut bool,
                 env_raw: std::ptr::null(),
                 this_word: (Value::Undefined),
                 global_body: std::ptr::null(),
@@ -18279,6 +18291,7 @@ unsafe fn run_moved_oversized(
         chunk: Rc::as_ptr(chunk),
         slots: slots_ptr,
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
+        strict_flag: &mut i.strict as *mut bool,
         n_slots,
         handlers: Vec::new(),
         activation: None,

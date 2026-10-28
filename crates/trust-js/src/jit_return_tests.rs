@@ -48,6 +48,7 @@ fn enter(
         final_sp: base,
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
+        strict_flag: &mut i.strict as *mut bool,
         env_raw: Env::as_ptr(&env) as *const u8,
         this_word: (Value::Undefined),
         global_body: super::jit_global_body(i, code),
