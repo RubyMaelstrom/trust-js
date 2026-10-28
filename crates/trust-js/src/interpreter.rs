@@ -1385,10 +1385,21 @@ fn trace_legacy_reflection(key: &str, frame: Option<&FnFrame>) {
 /// activation that has not finished yet (generated code pops with `len--` and pushes back in the
 /// finish stub; it never allocates or frees one). The collector traces every active record (see
 /// `GcTrace for FramePool`), so the registry costs nothing per call.
-#[derive(Default)]
 pub(crate) struct FramePool {
     pub(crate) pool: Vec<std::ptr::NonNull<crate::jit::JitFrame>>,
     records: crate::fasthash::FastSet<std::ptr::NonNull<crate::jit::JitFrame>>,
+}
+
+/// The freelist reserves its whole capacity at once: `JitFrame::release` pushes only below
+/// [`crate::jit::FRAME_POOL_LIMIT`], and the direct-call finish stub's push relies on it never
+/// reallocating.
+impl Default for FramePool {
+    fn default() -> Self {
+        Self {
+            pool: Vec::with_capacity(crate::jit::FRAME_POOL_LIMIT),
+            records: Default::default(),
+        }
+    }
 }
 
 impl std::ops::Deref for FramePool {

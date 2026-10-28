@@ -8750,14 +8750,10 @@ fn emit_direct_finish_stub(
         && fits8(il.fn_frames + il.fnf_len_word)
         && fits8(il.frame_pool + il.fp_ptr_word)
         && fits8(il.frame_pool + il.fp_len_word)
-        && fits8(il.frame_pool + il.fp_cap_word)
         && il.depth & 3 == 0
         && il.depth / 4 < 4096;
-    // The stub calls out (the full helper), so lr is spilled for the whole body, with the record
-    // at [sp, 16]; both exits share the epilogue.
-    let done = a.new_label();
-    a.stp_pre(29, 30, -32);
-    a.stur(10, 31, 16);
+    // The fast path calls nothing, so it runs without a frame of its own and returns straight to
+    // the sequence; only the helper fallback spills lr.
     if fast_ok {
         let handlers_len_off = handlers_len_off.expect("checked above") as u32;
         a.cbnz(1, false, slow); // threw → helper
@@ -8785,14 +8781,12 @@ fn emit_direct_finish_stub(
         a.madd(6, 16, 5, 6);
         a.ldur(9, 6, 16); // FnFrame.extra
         a.cbnz(9, true, slow);
-        // pool room: len < FRAME_POOL_LIMIT and len < capacity (a push must not reallocate the
-        // Vec from machine code). Nothing below touches the pool, the frame stack, or the depth
-        // before the commit, so validating here stays sound. x7 = the length, kept for the push.
+        // pool room: len < FRAME_POOL_LIMIT, within the capacity the pool reserves at creation
+        // (`FramePool::default`), so the push never reallocates the Vec from machine code.
+        // Nothing below touches the pool, the frame stack, or the depth before the commit, so
+        // validating here stays sound. x7 = the length, kept for the push.
         a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
         a.cmp_imm_x(7, FRAME_POOL_LIMIT as u32);
-        a.b_cond(C_HS, slow);
-        a.ldr_imm(4, 14, (il.frame_pool + il.fp_cap_word) as u32);
-        a.cmp_reg_x(7, 4);
         a.b_cond(C_HS, slow);
         // ---- commit (no call or write since the checks: x14, x16 and x7 are still current) ----
         emit_handler_clear(a, 10, handlers_len_off);
@@ -8820,10 +8814,11 @@ fn emit_direct_finish_stub(
         a.sub_imm(4, 4, 1);
         a.str_w_imm(4, 14, il.depth as u32);
         a.movz(8, 0, 0); // not threw
-        a.b(done);
+        a.ret();
     }
     // ---- helper fallback (nothing mutated above: `slow` is only reachable pre-commit) ----
     a.bind(slow);
+    a.stp_pre(29, 30, -16);
     a.mov(2, 1); // threw
     a.mov(1, 10); // callee record
     a.mov(0, 19); // caller context
@@ -8835,8 +8830,7 @@ fn emit_direct_finish_stub(
     a.ldr_imm(2, 19, cx_ret);
     a.mov_imm64(5, crate::value::PACK_UNDEFINED);
     a.str_imm(5, 19, cx_ret);
-    a.bind(done);
-    a.ldp_post(29, 30, 32);
+    a.ldp_post(29, 30, 16);
     a.ret();
 }
 
@@ -18225,6 +18219,8 @@ impl JitFrame {
         ctx.resume_pc = 0;
         ctx.references_raw = std::ptr::null_mut();
         if i.frame_pool.len() < FRAME_POOL_LIMIT {
+            // Within the reserved capacity: the finish stub's push relies on it.
+            debug_assert!(i.frame_pool.capacity() >= FRAME_POOL_LIMIT);
             i.frame_pool.push(frame);
         } else {
             i.frame_pool.unregister(frame);
