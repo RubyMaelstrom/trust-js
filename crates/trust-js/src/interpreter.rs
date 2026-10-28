@@ -13976,16 +13976,26 @@ impl Interp {
         }
         #[cfg(test)]
         TEST_LIGHT_NATIVE_CALLS.with(|count| count.set(count.get() + 1));
-        let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
+        // The native runs with a call's construct state: not constructing, new.target Undefined.
+        // An ordinary caller already holds it (the ARM64 direct sequence relies on the same), so
+        // only a constructing caller's state is saved, cleared and restored around the call.
+        let ordinary = !self.constructing && matches!(self.new_target.view(), ValueView::Undefined);
+        let saved = (!ordinary).then(|| {
+            (
+                std::mem::replace(&mut self.constructing, false),
+                std::mem::replace(&mut self.new_target, Value::Undefined),
+            )
+        });
         // SAFETY: the caller's window is initialized and outlives this call.
         let result = unsafe {
             crate::execution_storage::with_borrowed_values(args, argc, |arguments| {
                 function(self, *this_slot, arguments)
             })
         };
-        self.constructing = saved_ctor;
-        self.new_target = saved_nt;
+        if let Some((constructing, new_target)) = saved {
+            self.constructing = constructing;
+            self.new_target = new_target;
+        }
         Some(result.map_err(Abrupt::Throw))
     }
 
