@@ -15,6 +15,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+use crate::interrupt::PollWord;
+
 const MAX_REPEAT: usize = 1000;
 const INLINE_CAPTURES: usize = 4;
 const INTERRUPT_POLL_MASK: usize = 0x3fff;
@@ -378,6 +380,14 @@ pub(crate) enum MatchError {
 }
 
 pub(crate) type MatchResult<T> = Result<Option<T>, MatchError>;
+
+/// A poll word that `control` keeps from now on, as it keeps an interpreter's (tests).
+#[cfg(test)]
+pub(crate) fn test_poll_word(control: &crate::RuntimeInterrupt) -> std::sync::Arc<PollWord> {
+    let word = std::sync::Arc::new(PollWord::default());
+    control.register(&word);
+    word
+}
 
 #[inline]
 fn poll_interrupt(control: &crate::RuntimeInterrupt) -> Result<(), MatchError> {
@@ -3125,7 +3135,8 @@ impl Regex {
             && (at == 0 || (self.multiline && is_line_terminator_u32(input.at(at - 1))))
     }
 
-    /// [`Self::exec_at`], first polling for host interruption as an execution entry does.
+    /// [`Self::exec_at`], first polling for host interruption as an execution entry does, with a
+    /// poll word that `control` keeps as it keeps an interpreter's.
     #[cfg(test)]
     pub fn exec_polled(
         &self,
@@ -3134,7 +3145,20 @@ impl Regex {
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<Captures> {
         poll_interrupt(control)?;
-        self.exec_at(subject, start, control)
+        let word = test_poll_word(control);
+        self.exec_at(subject, start, control, &word)
+    }
+
+    /// [`Self::find_at`] with a poll word that `control` keeps as it keeps an interpreter's.
+    #[cfg(test)]
+    pub(crate) fn find_polled(
+        &self,
+        subject: &crate::lstr::LStr,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<(usize, usize)> {
+        let word = test_poll_word(control);
+        self.find_at(subject, start, control, &word)
     }
 
     /// Match `subject` in place from unit `start` and return the capture spans, in units. A
@@ -3142,14 +3166,17 @@ impl Regex {
     /// character RegExpBuiltinExec takes from element `lastIndex` (ECMA-262 §22.2.7.2), so the
     /// match may begin before `start`. The surrounding execution entry has already force-polled
     /// host interruption; long scans and backtracking still poll internally, and browser and
-    /// native call sites thereby avoid a duplicate atomic read for every tiny match.
+    /// native call sites thereby avoid a duplicate atomic read for every tiny match. Native code
+    /// polls `poll`, the interpreter's poll word (see `interrupt::PollWord`), and asks `control`
+    /// only while its interrupt bit is set.
     pub(crate) fn exec_at(
         &self,
         subject: &crate::lstr::LStr,
         start: usize,
         control: &crate::RuntimeInterrupt,
+        poll: &PollWord,
     ) -> MatchResult<Captures> {
-        let result = self.exec_at_inner(subject, start, control);
+        let result = self.exec_at_inner(subject, start, control, poll);
         if regexp_census_enabled() && matches!(result, Ok(Some(_))) {
             regexp_census_matched();
         }
@@ -3200,6 +3227,7 @@ impl Regex {
         subject: &crate::lstr::LStr,
         start: usize,
         control: &crate::RuntimeInterrupt,
+        poll: &PollWord,
     ) -> MatchResult<Captures> {
         match subject.units() {
             crate::lstr::Units::Ascii(bytes) => {
@@ -3220,16 +3248,16 @@ impl Regex {
                         .find_ascii(bytes, start, self.sticky, control)?
                         .map(Captures::one))
                 } else {
-                    self.exec_impl(bytes, start, control)
+                    self.exec_impl(bytes, start, control, poll)
                 }
             }
             crate::lstr::Units::Utf16(units) => {
                 self.note_execution(SUBJECT_TWO_BYTE);
                 if self.unicode {
                     let input = Paired(units);
-                    self.exec_impl(input, input.boundary(start), control)
+                    self.exec_impl(input, input.boundary(start), control, poll)
                 } else {
-                    self.exec_impl(units, start, control)
+                    self.exec_impl(units, start, control, poll)
                 }
             }
         }
@@ -3243,8 +3271,9 @@ impl Regex {
         subject: &crate::lstr::LStr,
         start: usize,
         control: &crate::RuntimeInterrupt,
+        poll: &PollWord,
     ) -> MatchResult<(usize, usize)> {
-        let result = self.find_at_inner(subject, start, control);
+        let result = self.find_at_inner(subject, start, control, poll);
         if regexp_census_enabled() && matches!(result, Ok(Some(_))) {
             regexp_census_matched();
         }
@@ -3256,6 +3285,7 @@ impl Regex {
         subject: &crate::lstr::LStr,
         start: usize,
         control: &crate::RuntimeInterrupt,
+        poll: &PollWord,
     ) -> MatchResult<(usize, usize)> {
         match subject.units() {
             crate::lstr::Units::Ascii(bytes) => {
@@ -3268,16 +3298,16 @@ impl Regex {
                     regexp_prof_native_exec();
                     native.find_ascii(bytes, start, self.sticky, control)
                 } else {
-                    self.find_impl(bytes, start, control)
+                    self.find_impl(bytes, start, control, poll)
                 }
             }
             crate::lstr::Units::Utf16(units) => {
                 self.note_execution(SUBJECT_TWO_BYTE);
                 if self.unicode {
                     let input = Paired(units);
-                    self.find_impl(input, input.boundary(start), control)
+                    self.find_impl(input, input.boundary(start), control, poll)
                 } else {
-                    self.find_impl(units, start, control)
+                    self.find_impl(units, start, control, poll)
                 }
             }
         }
@@ -3288,9 +3318,10 @@ impl Regex {
         input: I,
         start: usize,
         control: &crate::RuntimeInterrupt,
+        poll: &PollWord,
     ) -> MatchResult<Captures> {
         let groups = self.ngroups;
-        self.exec_impl_with(input, start, control, move |slots| {
+        self.exec_impl_with(input, start, control, poll, move |slots| {
             Captures::from_slots(slots, groups)
         })
     }
@@ -3304,8 +3335,9 @@ impl Regex {
         input: I,
         start: usize,
         control: &crate::RuntimeInterrupt,
+        poll: &PollWord,
     ) -> MatchResult<(usize, usize)> {
-        self.exec_impl_with(input, start, control, |slots| {
+        self.exec_impl_with(input, start, control, poll, |slots| {
             let start = slots[0].expect("successful regexp match has a start");
             let end = slots[1].expect("successful regexp match has an end");
             (start.min(end), start.max(end))
@@ -3369,6 +3401,7 @@ impl Regex {
         input: I,
         start: usize,
         control: &crate::RuntimeInterrupt,
+        poll: &PollWord,
         project: F,
     ) -> MatchResult<T> {
         if start > input.len() {
@@ -3402,8 +3435,8 @@ impl Regex {
             let found = self.find_single(input, start, only, element, control)?;
             return Ok(found.map(|(at, next)| project(&[Some(at), Some(next)])));
         }
-        // One matcher for the whole scan, on the program's own scratch. Matching runs no code, so
-        // nothing enters it again while it is held; a fresh scratch would keep that harmless.
+        // The scan runs on the program's own scratch. Matching runs no code, so nothing enters it
+        // again while it is held; a fresh scratch would keep that harmless.
         let mut held;
         let mut spare;
         let scratch: &mut MatchScratch = match self.scratch.try_borrow_mut() {
@@ -3416,6 +3449,90 @@ impl Regex {
                 &mut spare
             }
         };
+        let _ = poll;
+        let matched = self.run_matcher(input, start, only, control, scratch);
+        let found = match matched {
+            Ok(true) => Ok(Some(project(&scratch.caps))),
+            Ok(false) => Ok(None),
+            Err(error) => Err(error),
+        };
+        // The slots stay unset between execs: a match or an error leaves captures set, and no
+        // match only slot 0.
+        if scratch.caps.len() > 64 || !matches!(matched, Ok(false)) {
+            scratch.caps.fill(None);
+        } else {
+            scratch.caps[0] = None;
+        }
+        found
+    }
+
+    /// The first start at or past `from` that the scan tries: one in range of the prefilter
+    /// literal's latest occurrence (`window_end`, the last start in range of it, which the scan
+    /// keeps between calls and which is found again once `from` passes it), where the
+    /// first-element filter lets a match begin. `None` when no start is left. The matcher's scan
+    /// and native code's candidate loop both take their starts from here.
+    fn next_candidate<I: ReInput>(
+        &self,
+        input: I,
+        mut from: usize,
+        window_end: &mut Option<usize>,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        loop {
+            // Prescan: skip positions that cannot begin a match.
+            let mut end = input.len();
+            if let Some(prefilter) = &self.prefilter {
+                if window_end.is_none_or(|end| from > end) {
+                    let Some(found) = prefilter.find(input, from, control)? else {
+                        return Ok(None);
+                    };
+                    if let Some(max) = prefilter.max_offset_in::<I>() {
+                        from = from.max(input.boundary(found.saturating_sub(max)));
+                    }
+                    *window_end = Some(found - prefilter.min_offset);
+                }
+                end = window_end.unwrap_or(end);
+            }
+            // A broad first atom lets most positions start: try this one before any scan.
+            if self.may_start(input, from) {
+                return Ok(Some(from));
+            }
+            let after = if from < input.len() {
+                input.next_elem(from).1
+            } else {
+                from + 1
+            };
+            let next = self.next_start(input, after, end, control)?;
+            if regexp_prof_enabled() {
+                let skipped = next.unwrap_or(end + 1) - from;
+                REGEXP_PROF.with(|p| p.borrow_mut().scan_positions += skipped as u64);
+            }
+            match next {
+                Some(next) => return Ok(Some(next)),
+                // No start is left in range of this occurrence: look for the next one, from the
+                // first element boundary past `end`.
+                None if end < input.len() => {
+                    from = if input.boundary(end) < end {
+                        end + 1
+                    } else {
+                        input.next_elem(end).1
+                    };
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Run the backtracking matcher over the starts the scan tries from `start` (`only` alone,
+    /// when it is set). `Ok(true)` leaves the match's capture slots in `scratch`.
+    fn run_matcher<I: ReInput>(
+        &self,
+        input: I,
+        start: usize,
+        only: Option<usize>,
+        control: &crate::RuntimeInterrupt,
+        scratch: &mut MatchScratch,
+    ) -> Result<bool, MatchError> {
         let base_flags = (self.ignore_case, self.multiline, self.dotall);
         let mut m = Matcher {
             input,
@@ -3450,54 +3567,13 @@ impl Regex {
         let prof = m.prof;
         // The last start in range of the prefilter literal's latest occurrence.
         let mut window_end = None;
-        let result = 'scan: loop {
+        let result = loop {
             if only.is_none() {
-                // Prescan: skip positions that cannot begin a match.
-                let mut end = input.len();
-                if let Some(prefilter) = &self.prefilter {
-                    if window_end.is_none_or(|end| from > end) {
-                        let found = match prefilter.find(input, from, control) {
-                            Ok(Some(found)) => found,
-                            Ok(None) => break 'scan Ok(None),
-                            Err(error) => break 'scan Err(error),
-                        };
-                        if let Some(max) = prefilter.max_offset_in::<I>() {
-                            from = from.max(input.boundary(found.saturating_sub(max)));
-                        }
-                        window_end = Some(found - prefilter.min_offset);
-                    }
-                    end = window_end.unwrap_or(end);
-                }
-                // A broad first atom lets most positions start: try this one before any scan.
-                if !self.may_start(input, from) {
-                    let after = if from < input.len() {
-                        input.next_elem(from).1
-                    } else {
-                        from + 1
-                    };
-                    let next = match self.next_start(input, after, end, control) {
-                        Ok(next) => next,
-                        Err(error) => break 'scan Err(error),
-                    };
-                    if prof {
-                        let skipped = next.unwrap_or(end + 1) - from;
-                        REGEXP_PROF.with(|p| p.borrow_mut().scan_positions += skipped as u64);
-                    }
-                    match next {
-                        Some(next) => from = next,
-                        // No start is left in range of this occurrence: look for the next one,
-                        // from the first element boundary past `end`.
-                        None if end < input.len() => {
-                            from = if input.boundary(end) < end {
-                                end + 1
-                            } else {
-                                input.next_elem(end).1
-                            };
-                            continue 'scan;
-                        }
-                        None => break 'scan Ok(None),
-                    }
-                }
+                from = match self.next_candidate(input, from, &mut window_end, control) {
+                    Ok(Some(from)) => from,
+                    Ok(None) => break Ok(false),
+                    Err(error) => break Err(error),
+                };
             }
             if prof {
                 REGEXP_PROF.with(|p| p.borrow_mut().attempts += 1);
@@ -3519,13 +3595,13 @@ impl Regex {
             m.outer_flags.clear();
             m.lead_pending = self.lead_run;
             if m.run(&self.prog, from) {
-                break 'scan Ok(Some(project(m.caps)));
+                break Ok(true);
             }
             if let Some(error) = m.abort {
-                break 'scan Err(error);
+                break Err(error);
             }
             if only.is_some() || from == input.len() {
-                break 'scan Ok(None);
+                break Ok(false);
             }
             let next = input.next_elem(from).1;
             // No start inside the leading loop's first run can match (see `leading_run`).
@@ -3535,13 +3611,6 @@ impl Regex {
                 next
             };
         };
-        // The slots stay unset between execs: a match or an error leaves captures set, and no
-        // match only slot 0.
-        if wide || !matches!(result, Ok(None)) {
-            m.caps.fill(None);
-        } else {
-            m.caps[0] = None;
-        }
         // A match leaves its backtrack state behind; a large one's storage is released.
         let Matcher {
             mut bt,
@@ -8890,13 +8959,33 @@ mod internal_engine_diagnostics {
                         let (found, reference) = if filtered.unicode {
                             let start = paired.boundary(start);
                             (
-                                filtered.exec_impl(paired, start, &control),
-                                plain.exec_impl(paired, start, &control),
+                                filtered.exec_impl(
+                                    paired,
+                                    start,
+                                    &control,
+                                    &super::test_poll_word(&control),
+                                ),
+                                plain.exec_impl(
+                                    paired,
+                                    start,
+                                    &control,
+                                    &super::test_poll_word(&control),
+                                ),
                             )
                         } else {
                             (
-                                filtered.exec_impl(&units[..], start, &control),
-                                plain.exec_impl(&units[..], start, &control),
+                                filtered.exec_impl(
+                                    &units[..],
+                                    start,
+                                    &control,
+                                    &super::test_poll_word(&control),
+                                ),
+                                plain.exec_impl(
+                                    &units[..],
+                                    start,
+                                    &control,
+                                    &super::test_poll_word(&control),
+                                ),
                             )
                         };
                         matches += usize::from(matches!(reference, Ok(Some(_))));
@@ -8909,8 +8998,18 @@ mod internal_engine_diagnostics {
                     if subject.is_ascii() {
                         let bytes = subject.as_bytes();
                         for start in 0..=bytes.len() + 1 {
-                            let found = filtered.exec_impl(bytes, start, &control);
-                            let reference = plain.exec_impl(bytes, start, &control);
+                            let found = filtered.exec_impl(
+                                bytes,
+                                start,
+                                &control,
+                                &super::test_poll_word(&control),
+                            );
+                            let reference = plain.exec_impl(
+                                bytes,
+                                start,
+                                &control,
+                                &super::test_poll_word(&control),
+                            );
                             assert_eq!(
                                 found.map(|c| c.map(|c| c.to_vec())),
                                 reference.map(|c| c.map(|c| c.to_vec())),
@@ -9502,7 +9601,7 @@ mod internal_engine_diagnostics {
                 .unwrap()
                 .and_then(|caps| caps[0]);
             let whole = re
-                .find_at(&text, start, &crate::RuntimeInterrupt::default())
+                .find_polled(&text, start, &crate::RuntimeInterrupt::default())
                 .unwrap();
             assert_eq!(captures, expected);
             assert_eq!(whole, expected);
@@ -9603,7 +9702,7 @@ mod internal_engine_diagnostics {
             sticky.exec_polled(&sticky_text, 1, &control).unwrap();
         }
         assert_eq!(
-            sticky.find_at(&sticky_text, 1, &control).unwrap(),
+            sticky.find_polled(&sticky_text, 1, &control).unwrap(),
             Some((1, 4))
         );
     }
@@ -9777,8 +9876,15 @@ mod internal_engine_diagnostics {
                 re.tier_feedback().3,
                 "machine subset was not emitted for /{pattern}/"
             );
-            let machine = re.find_at(&text, 0, &control).unwrap();
-            let reference = re.find_impl(subject.as_bytes(), 0, &control).unwrap();
+            let machine = re.find_polled(&text, 0, &control).unwrap();
+            let reference = re
+                .find_impl(
+                    subject.as_bytes(),
+                    0,
+                    &control,
+                    &super::test_poll_word(&control),
+                )
+                .unwrap();
             assert_eq!(machine, expected);
             assert_eq!(
                 machine, reference,
@@ -9794,7 +9900,7 @@ mod internal_engine_diagnostics {
         let cancelled = crate::RuntimeInterrupt::default();
         cancelled.cancel();
         assert!(matches!(
-            re.find_at(&text, 0, &cancelled),
+            re.find_polled(&text, 0, &cancelled),
             Err(super::MatchError::Interrupted(
                 crate::InterruptReason::Cancelled
             ))
@@ -9834,7 +9940,12 @@ mod internal_engine_diagnostics {
                     }
                     for start in 0..=subject.len() {
                         let fast = native.find_ascii(subject, start, sticky, &control);
-                        let reference = re.find_impl(subject, start, &control);
+                        let reference = re.find_impl(
+                            subject,
+                            start,
+                            &control,
+                            &super::test_poll_word(&control),
+                        );
                         assert_eq!(
                             fast, reference,
                             "native/reference mismatch for /{pattern}/ at {start}, sticky={sticky}, subject={subject:?}"
@@ -9865,7 +9976,12 @@ mod internal_engine_diagnostics {
                     ));
                     for start in 0..=subject.len() {
                         let fast = native.find_ascii(subject, start, sticky, &control);
-                        let reference = re.find_impl(subject, start, &control);
+                        let reference = re.find_impl(
+                            subject,
+                            start,
+                            &control,
+                            &super::test_poll_word(&control),
+                        );
                         assert_eq!(
                             fast, reference,
                             "terminal Many mismatch for /{pattern}/ at {start}, sticky={sticky}, subject={subject:?}"
@@ -9882,7 +9998,8 @@ mod internal_engine_diagnostics {
             .expect("one-byte non-ASCII terminal Many must compile");
         for start in 0..=subject.len() {
             let fast = native.find_ascii(subject, start, false, &control);
-            let reference = re.find_impl(subject, start, &control);
+            let reference =
+                re.find_impl(subject, start, &control, &super::test_poll_word(&control));
             assert_eq!(
                 fast, reference,
                 "non-ASCII terminal Many mismatch at {start}"
@@ -9899,7 +10016,7 @@ mod internal_engine_diagnostics {
             re.exec_polled(&text, 0, &control).unwrap();
         }
         assert!(re.tier_feedback().3);
-        assert_eq!(re.find_at(&text, 0, &control).unwrap(), Some((0, 6)));
+        assert_eq!(re.find_polled(&text, 0, &control).unwrap(), Some((0, 6)));
 
         let interrupted = crate::RuntimeInterrupt::default();
         interrupted.cancel();
@@ -10112,13 +10229,33 @@ mod internal_engine_diagnostics {
                         let (found, reference) = if filtered.unicode {
                             let start = paired.boundary(start);
                             (
-                                filtered.exec_impl(paired, start, &control),
-                                plain.exec_impl(paired, start, &control),
+                                filtered.exec_impl(
+                                    paired,
+                                    start,
+                                    &control,
+                                    &super::test_poll_word(&control),
+                                ),
+                                plain.exec_impl(
+                                    paired,
+                                    start,
+                                    &control,
+                                    &super::test_poll_word(&control),
+                                ),
                             )
                         } else {
                             (
-                                filtered.exec_impl(&units[..], start, &control),
-                                plain.exec_impl(&units[..], start, &control),
+                                filtered.exec_impl(
+                                    &units[..],
+                                    start,
+                                    &control,
+                                    &super::test_poll_word(&control),
+                                ),
+                                plain.exec_impl(
+                                    &units[..],
+                                    start,
+                                    &control,
+                                    &super::test_poll_word(&control),
+                                ),
                             )
                         };
                         matches += usize::from(matches!(reference, Ok(Some(_))));
@@ -10131,8 +10268,18 @@ mod internal_engine_diagnostics {
                     if subject.is_ascii() {
                         let bytes = subject.as_bytes();
                         for start in 0..=bytes.len() + 1 {
-                            let found = filtered.exec_impl(bytes, start, &control);
-                            let reference = plain.exec_impl(bytes, start, &control);
+                            let found = filtered.exec_impl(
+                                bytes,
+                                start,
+                                &control,
+                                &super::test_poll_word(&control),
+                            );
+                            let reference = plain.exec_impl(
+                                bytes,
+                                start,
+                                &control,
+                                &super::test_poll_word(&control),
+                            );
                             assert_eq!(
                                 found.map(|c| c.map(|c| c.to_vec())),
                                 reference.map(|c| c.map(|c| c.to_vec())),
@@ -10219,10 +10366,27 @@ mod internal_engine_diagnostics {
         let bytes = vec![b'a'; 3 * (super::INTERRUPT_POLL_MASK + 1)];
         let units: Vec<u16> = bytes.iter().map(|&byte| u16::from(byte)).collect();
         for outcome in [
-            re.exec_impl(&bytes[..], 0, &cancelled).map(|c| c.is_some()),
-            re.exec_impl(&units[..], 0, &cancelled).map(|c| c.is_some()),
-            re.exec_impl(super::Paired(&units), 0, &cancelled)
-                .map(|c| c.is_some()),
+            re.exec_impl(
+                &bytes[..],
+                0,
+                &cancelled,
+                &super::test_poll_word(&cancelled),
+            )
+            .map(|c| c.is_some()),
+            re.exec_impl(
+                &units[..],
+                0,
+                &cancelled,
+                &super::test_poll_word(&cancelled),
+            )
+            .map(|c| c.is_some()),
+            re.exec_impl(
+                super::Paired(&units),
+                0,
+                &cancelled,
+                &super::test_poll_word(&cancelled),
+            )
+            .map(|c| c.is_some()),
         ] {
             assert!(matches!(
                 outcome,

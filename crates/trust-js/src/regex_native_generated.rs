@@ -81,7 +81,7 @@ fn generated_one_byte_native_instruction_corpus() {
                 }
                 for start in 0..=subject.len() {
                     let fast = native.find_ascii(subject, start, sticky, &control);
-                    let reference = re.find_impl(subject, start, &control);
+                    let reference = re.find_impl(subject, start, &control, &super::test_poll_word(&control));
                     assert_eq!(fast, reference,
                         "search mismatch for /{pattern}/ at {start}, sticky={sticky}, subject={subject:?}");
                 }

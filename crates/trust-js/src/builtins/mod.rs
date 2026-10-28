@@ -2418,7 +2418,7 @@ fn regexp_exec_text_shared(
     subject: &crate::lstr::LStr,
     start: usize,
 ) -> crate::regex::MatchResult<crate::regex::Captures> {
-    re.exec_at(subject, start, &i.runtime_interrupt)
+    re.exec_at(subject, start, &i.runtime_interrupt, &i.poll)
 }
 
 /// The whole match of `subject` from unit `start` (see [`crate::regex::Regex::find_at`]).
@@ -2429,7 +2429,7 @@ pub(crate) fn regexp_find_text_shared(
     subject: &crate::lstr::LStr,
     start: usize,
 ) -> crate::regex::MatchResult<(usize, usize)> {
-    re.find_at(subject, start, &i.runtime_interrupt)
+    re.find_at(subject, start, &i.runtime_interrupt, &i.poll)
 }
 
 /// ToLength of a value (clamped to a non-negative integer).
