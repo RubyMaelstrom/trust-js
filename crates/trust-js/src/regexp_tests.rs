@@ -320,6 +320,41 @@ fn loops_without_futile_retries_match_as_node_does() {
     );
 }
 
+/// A scan resumes past a failed run of a pattern's leading loop, whether the loop retries shorter
+/// runs or not, and finds what Node (v24.22.0) finds: from global `lastIndex` starts, after
+/// backreferences and lookbehinds that follow the loop, and on two-byte and surrogate subjects.
+#[test]
+fn scans_resume_past_failed_leading_runs_as_node_does() {
+    check(
+        r#"
+        function show(m) { return m === null ? null : [m.index].concat(Array.prototype.slice.call(m)); }
+        function at(re, s, i) { re.lastIndex = i; var m = re.exec(s); return [show(m), re.lastIndex]; }
+        JSON.stringify([
+            // Atomic leading loops: a failed run is not tried again from inside.
+            "a   b    c  ".replace(/\s+$/, ""),
+            show(/\s+$/.exec("    x")),
+            show(/[^x]+$/.exec("abxcd")),
+            "aa1 ab2 a3 b".match(/[a-z]+\d/g),
+            at(/\S+\s/g, "abc def", 1),
+            at(/\s*$/g, "ab  c  ", 0),
+            // Leading loops that retry shorter runs.
+            show(/a*ab/.exec("aac aab aaab")),
+            show(/(?:a+b)+c/.exec("aabab aababc")),
+            show(/\d*(\d)\1/.exec("12345 1233")),
+            show(/\w+(?<=\d\w)x/.exec("ab1cx 9ax")),
+            show(/a+B/i.exec("AAc aAb")),
+            show(/\s+$/m.exec("a  \n  b  ")),
+            // Two-byte and surrogate subjects.
+            show(/\S+\s/u.exec("\u{1F600}\u{1F600} x")),
+            show(/\S+\s$/u.exec("\u{1F600}\u{1F600} x\u{1F600} ")),
+            show(/[^a]+b/.exec("\ud800\udc00c\ud800b")),
+            "x  \u3000y \u2028".replace(/\s+$/, "|"),
+        ])
+        "#,
+        r#"["a   b    c",null,[3,"cd"],["aa1","ab2","a3"],[[1,"bc "],4],[[5,"  "],7],[4,"aab"],[6,"aababc"],[6,"1233","3"],[0,"ab1cx"],[4,"aAb"],[1,"  "],[0,"😀😀 "],[5,"x😀 "],[0,"𐀀c\ud800b"],"x  　y|"]"#,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).

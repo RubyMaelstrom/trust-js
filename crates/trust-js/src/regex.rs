@@ -248,6 +248,7 @@ fn regexp_census_features(re: &Regex) -> String {
     for (present, name) in [
         (re.prefilter.is_some(), " prefilter"),
         (re.single.is_some(), " single"),
+        (re.lead_run, " lead-run"),
         (
             re.literal_ascii.is_some() || re.literal_fold.is_some(),
             " literal",
@@ -477,6 +478,9 @@ pub struct Regex {
     /// Char, Any or Class X: the first-element scan finds its candidates and one test of the
     /// element decides each, without the matcher.
     single: Option<Rep>,
+    /// The program begins with a greedy loop of unbounded count (see [`leading_run`]): after a
+    /// failed attempt, the scan resumes where that loop's first run ended.
+    lead_run: bool,
     /// Per-pattern execution feedback. These cells add no allocation to cold patterns; the native
     /// straight-line program is compiled lazily after the tier-up threshold.
     tier_ticks: Cell<u32>,
@@ -2819,6 +2823,7 @@ impl Regex {
         let single_start = flags.contains('y') || matches!(first, FirstFilter::Anchored);
         let prefilter = Prefilter::new(&ast, flags.contains('i'), single_start);
         let single = single_element(&prog);
+        let lead_run = !env_flag!("TRUST_JS_REGEXP_NO_RUN_SKIP") && leading_run(&prog);
         let mut re = Regex {
             unicode,
             nmarks: lowering.marks,
@@ -2832,6 +2837,7 @@ impl Regex {
             first_line_start,
             prefilter,
             single,
+            lead_run,
             tier_ticks: Cell::new(0),
             subject_shapes: Cell::new(0),
             tier_up_attempted: Cell::new(false),
@@ -3352,6 +3358,8 @@ impl Regex {
             floor: 0,
             logged: 0,
             looks: Vec::new(),
+            lead_pending: false,
+            lead_end: 0,
             state_limit: backtrack_state_limit(),
             back: false,
             flags: base_flags,
@@ -3438,6 +3446,7 @@ impl Regex {
             }
             m.flags = base_flags;
             m.outer_flags.clear();
+            m.lead_pending = self.lead_run;
             if m.run(&self.prog, from) {
                 break 'scan Ok(Some(project(m.caps)));
             }
@@ -3447,7 +3456,13 @@ impl Regex {
             if only.is_some() || from == input.len() {
                 break 'scan Ok(None);
             }
-            from = input.next_elem(from).1;
+            let next = input.next_elem(from).1;
+            // No start inside the leading loop's first run can match (see `leading_run`).
+            from = if self.lead_run && !m.lead_pending {
+                next.max(m.lead_end)
+            } else {
+                next
+            };
         };
         // The slots stay unset between execs: a match or an error leaves captures set, and no
         // match only slot 0.
@@ -5517,6 +5532,27 @@ fn changes_flags(prog: &[Inst]) -> bool {
     })
 }
 
+/// Whether forward program `prog` begins, after `Save(0)`, with a greedy loop of unbounded
+/// count. When an attempt from `s` fails after that loop's first run ended at `e`, no start in
+/// `s+1..=e` can match: a run from there ends at `e` too and, being shorter, offers its
+/// continuation a subset of the positions the failed attempt offered, and the continuation, for
+/// which nothing before the loop set a capture or a mark, fares alike at a position whatever
+/// the start. `TRUST_JS_REGEXP_NO_RUN_SKIP=1` resumes at the next start instead.
+fn leading_run(prog: &[Inst]) -> bool {
+    matches!(
+        prog,
+        [
+            Inst::Save(0),
+            Inst::Many {
+                max: None,
+                greedy: true,
+                ..
+            },
+            ..
+        ]
+    )
+}
+
 /// The element a program matches when it is `Save(0), X, Save(1), Match` for a Char, Any or
 /// Class X (see [`Regex::single`]). `TRUST_JS_REGEXP_NO_SINGLE_ELEMENT=1` keeps every such
 /// program on the matcher.
@@ -6452,6 +6488,12 @@ struct Matcher<'a, I: ReInput> {
     logged: u64,
     /// Active lookarounds, innermost last.
     looks: Vec<LookFrame<'a>>,
+    /// Whether this attempt has yet to record where the program's leading loop ran to (see
+    /// [`Regex::lead_run`]): set before each attempt of such a program and cleared by the first
+    /// greedy `Many` the attempt runs, which is that loop.
+    lead_pending: bool,
+    /// Where the leading loop's first run ended.
+    lead_end: usize,
     /// Ceiling on `bt.len() + saved.len()` (see [`MAX_BACKTRACK_STATE`]).
     state_limit: usize,
     /// Matching direction: a lookbehind body (compiled from the reversed AST) consumes leftward.
@@ -7391,6 +7433,10 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                             let Some((avail, end)) = self.run_length(rep, pos, limit) else {
                                 return false;
                             };
+                            if self.lead_pending {
+                                self.lead_pending = false;
+                                self.lead_end = end;
+                            }
                             if avail < min {
                                 break;
                             }
@@ -8321,6 +8367,80 @@ mod internal_engine_diagnostics {
                             reference.map(|caps| caps.map(|caps| caps.to_vec())),
                             "/{pattern}/{flags} on {subject:?} from {start}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scans_resume_past_a_failed_leading_run_as_at_each_start() {
+        let patterns = [
+            r"\s+$",
+            r"\s*$",
+            r"[\w+\-.]+:",
+            r"a*ab",
+            r"(?:a+b)+c",
+            r"\d*(\d)\1",
+            r"\w+(?<=\d\w)x",
+            r"\w+\b",
+            r".*\n",
+            r"[^x]+$",
+            r"\S+\s",
+            r"a+B",
+        ];
+        let subjects = [
+            "",
+            "a  b  ",
+            "a  \n b",
+            "ab.cd ef:gh",
+            "aac aab aaab",
+            "aabab aababc",
+            "12345 1233",
+            "ab1cx 9ax",
+            "x\ny\n",
+            "AAc aAb",
+            "a\u{2019} \u{3000} x:",
+            "\u{1F600}\u{1F600} x\u{1F600}  ",
+        ];
+        let texts: Vec<crate::lstr::LStr> = subjects
+            .iter()
+            .map(|&subject| crate::lstr::LStr::from(subject))
+            .chain([crate::lstr::LStr::from_utf16(&[0x61, 0x62, 0xD800, 0x20])])
+            .collect();
+        let control = crate::RuntimeInterrupt::default();
+        for pattern in patterns {
+            for flags in ["", "g", "i", "m", "s", "u"] {
+                // Atomic and retrying leading loops alike.
+                for atomic in [true, false] {
+                    let mut skipping = if atomic {
+                        analysed(pattern, flags)
+                    } else {
+                        let mut re = super::Regex::new(pattern, flags).unwrap();
+                        without_atomic_loops(&mut re.prog);
+                        re
+                    };
+                    assert!(
+                        super::leading_run(&skipping.prog),
+                        "/{pattern}/ leads with a run"
+                    );
+                    skipping.lead_run = true;
+                    let mut stepping = super::Regex::new(pattern, flags).unwrap();
+                    if !atomic {
+                        without_atomic_loops(&mut stepping.prog);
+                    }
+                    stepping.lead_run = false;
+                    for text in &texts {
+                        let subject = text.to_string();
+                        for start in 0..=text.unit_len() {
+                            let found = skipping.exec_polled(text, start, &control);
+                            let reference = stepping.exec_polled(text, start, &control);
+                            assert_eq!(
+                                found.map(|caps| caps.map(|caps| caps.to_vec())),
+                                reference.map(|caps| caps.map(|caps| caps.to_vec())),
+                                "/{pattern}/{flags} (atomic: {atomic}) on {subject:?} from {start}"
+                            );
+                        }
                     }
                 }
             }

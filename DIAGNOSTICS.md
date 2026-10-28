@@ -248,9 +248,9 @@ comment/example in the same change.
   and flag pairs with the most work (dispatched instructions, four per attempt and one per four
   scanned positions), their share of those counters, their executions, matches, executions on
   two-byte subjects, native runs and native code bytes, and their programs' features (length,
-  groups, instructions by kind with lookaround bodies, atomic loops, first-element filter,
-  prefilter, single-element and literal paths). Each execution then also looks its pattern up by
-  source and flags.
+  groups, instructions by kind with lookaround bodies, atomic loops, leading run, first-element
+  filter, prefilter, single-element and literal paths). Each execution then also looks its
+  pattern up by source and flags.
 - `TRUST_JS_REGEXP_TIER_UP_AT=N` promotes an eligible pattern to the native one-byte tier after
   N executions (default 64); 0 keeps every pattern on the backtracking matcher.
 - `TRUST_JS_REGEXP_NO_PREFILTER=1` compiles patterns without their prefilter: the literal every
@@ -266,6 +266,10 @@ comment/example in the same change.
   (`\s+$` outside multiline mode), by an element its body cannot match (`[\w+\-.]+:`), by a word
   boundary after at least one word character (`\b\w+\b`), or by nothing left to test
   (`(\d*)(\D*)`). Patterns with `i` or an inline modifier keep every retry.
+- `TRUST_JS_REGEXP_NO_RUN_SKIP=1` resumes the scan after a failed attempt at the next start.
+  Otherwise, for a pattern that begins with a greedy loop of unbounded count (as `/\s+$/` and
+  `/[\w+\-.]+:/` do), it resumes where that loop's first run ended: no start inside the run can
+  match.
 - `TRUST_JS_REGEXP_NO_SIMD=1` keeps the subject scans (for the prefilter's literal, and for a
   match's first element by byte or by table) on their portable loops instead of AArch64 vector
   code.
