@@ -4,3 +4,9 @@
 # finishes. Keep this in project config so local and CI release builds agree.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/STACK:16777216"]
+
+# Linux: pack the relative relocations of the position-independent binaries (RELR). At start
+# the loader then applies a compact bitmap instead of patching about 100,000 table entries one
+# by one (1.6% of the React fixture's instructions). The binaries need glibc 2.36 or later.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))']
+rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs"]
