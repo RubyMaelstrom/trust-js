@@ -256,9 +256,9 @@ comment/example in the same change.
 - `TRUST_JS_REGEXP_TIER_UP_AT=N` compiles a pattern to native code for a subject width (one
   byte or two a unit) after N executions (default 64), or at once over a subject of 1,000 units
   or more, as V8 does, each width on its first use; 0 keeps every pattern on the backtracking
-  matcher, and 1 compiles at the first execution. The native tier (AArch64, on Unix) takes
-  patterns without `i`, `u` or `v` whose programs hold characters, `.`, classes, captures,
-  alternation, `^`, `$`, `\b`, `\B`, loops and groups' repetitions; lookaround,
+  matcher, and 1 compiles at the first execution. The native tier (AArch64 and x86-64, on
+  Unix) takes patterns without `i`, `u` or `v` whose programs hold characters, `.`, classes,
+  captures, alternation, `^`, `$`, `\b`, `\B`, loops and groups' repetitions; lookaround,
   backreferences, inline modifiers and counted loops too long to unroll stay on the matcher.
 - `TRUST_JS_REGEXP_NATIVE_VERIFY=1` runs the matcher after every native execution and aborts,
   printing the pattern, flags, subject and start, if the result, a capture span or the error
@@ -269,8 +269,8 @@ comment/example in the same change.
   `TRUST_JS_REGEXP_FUZZ_SEED`, reducing any difference to a minimal pattern and subject.
 - `TRUST_JS_REGEXP_CODEDUMP=<text>` prints the native code of each pattern whose source
   contains the text (`*`: every pattern) as it compiles: `[regexp-codedump]` lines with the
-  pattern, its width, base address and size, then its words (assemble them as
-  `TRUST_JS_JIT_CODEDUMP`'s).
+  pattern, its width, base address and size, then its words (AArch64; assemble them as
+  `TRUST_JS_JIT_CODEDUMP`'s) or bytes (x86-64).
 - `TRUST_JS_REGEXP_NO_PREFILTER=1` compiles patterns without their prefilter: the literal every
   match contains and the range of its offset from the match start. Exec scans for that literal
   and tries only the starts that put an occurrence in range, and a sticky regex, or one anchored

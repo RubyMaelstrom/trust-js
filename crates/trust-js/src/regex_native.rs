@@ -17,7 +17,8 @@
 //! Machine state: an entry `fn(*mut NativeCtx) -> u64` returning a status ([`STATUS_MATCH`] and
 //! the others). Callee-saved registers hold the subject, its length, the position, the capture
 //! slots (the marks follow them), the backtrack stack's top, the root floor's logged slots, the
-//! context, the leading loop's run end, the choice count and the poll counter (AArch64 x19-x28).
+//! context, the leading loop's run end, the choice count and the poll counter (AArch64 x19-x28;
+//! x86-64 keeps some in caller-saved registers that every helper call saves, and the context).
 //! The backtrack stack is the program's [`MatchScratch`] storage taken as 16-byte records: the
 //! address of a resume point or an undo stub, and an operand. A pop jumps to the record's address
 //! with the operand in a register; undo stubs restore their slot and pop again, as V8's undo
@@ -34,8 +35,11 @@
 //! `TRUST_JS_REGEXP_NATIVE_VERIFY=1` runs the matcher after every native execution and aborts on
 //! any difference in result, capture spans or error kind (see [`verify`]).
 
-// Targets without a backend keep every pattern on the matcher.
-#![cfg_attr(not(all(target_arch = "aarch64", unix)), allow(dead_code))]
+// Targets without a backend (Windows' x64 ABI, wasm32) keep every pattern on the matcher.
+#![cfg_attr(
+    not(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix)),
+    allow(dead_code)
+)]
 
 use super::{
     backtrack_state_limit, class_elements, regexp_prof_enabled, regexp_prof_native_code,
@@ -45,8 +49,12 @@ use super::{
 use crate::interrupt::PollWord;
 use std::rc::Rc;
 
-/// Whether this target has a backend: AArch64 on Unix.
-pub(super) const BACKEND: bool = cfg!(all(target_arch = "aarch64", unix));
+/// Whether this target has a backend: AArch64 and x86-64 on Unix (Windows' x64 ABI stays on
+/// the matcher).
+pub(super) const BACKEND: bool = cfg!(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    unix
+));
 
 /// A label in code being generated.
 pub(super) type Label = usize;
@@ -468,7 +476,7 @@ fn compile(re: &Regex, width: Width) -> Option<NativeCode> {
 }
 
 /// Print a compiled program (`TRUST_JS_REGEXP_CODEDUMP=<source text>`, `*` for every pattern):
-/// its words, as `TRUST_JS_JIT_CODEDUMP` prints them.
+/// its words as `TRUST_JS_JIT_CODEDUMP` prints them on AArch64, its bytes on x86-64.
 fn codedump(re: &Regex, width: Width, bytes: &[u8], base: *const u8) {
     eprintln!(
         "[regexp-codedump] /{}/{} {} base={:#x} {} bytes",
@@ -509,6 +517,12 @@ fn assemble(plan: &Plan) -> Option<Vec<u8>> {
         Generator::new(&mut masm, plan).emit();
         return masm.finish();
     }
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        let mut masm = x64::Asm::new(plan.width, helpers);
+        Generator::new(&mut masm, plan).emit();
+        return masm.finish();
+    }
     let _ = (plan, helpers);
     None
 }
@@ -516,6 +530,10 @@ fn assemble(plan: &Plan) -> Option<Vec<u8>> {
 #[cfg(all(target_arch = "aarch64", unix))]
 #[path = "regex_native_a64.rs"]
 mod a64;
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[path = "regex_native_x64.rs"]
+mod x64;
 
 /// An element test the templates make.
 #[derive(Clone)]
