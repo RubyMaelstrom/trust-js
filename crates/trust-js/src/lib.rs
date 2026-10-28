@@ -223,6 +223,8 @@ mod script_scope_tests;
 mod script_tiering_tests;
 mod self_hosted;
 #[cfg(test)]
+mod shadow_realm_interrupt_tests;
+#[cfg(test)]
 mod shared_buffer_lifetime_tests;
 #[cfg(test)]
 mod shared_layout_tests;

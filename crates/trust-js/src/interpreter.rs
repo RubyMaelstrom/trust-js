@@ -3519,8 +3519,9 @@ pub struct Interp {
     /// milliseconds for ECMAScript `Date`. Each Window/Worker realm owns its own time origin and
     /// virtual-time anchor; a process-global callback cannot model that.
     pub(crate) wall_clock: Option<Rc<dyn Fn() -> f64>>,
-    /// The host's control handle. Replace it only through [`Interp::set_runtime_interrupt`],
-    /// which moves `poll`'s registration.
+    /// The host's control handle, shared by every interpreter of the Agent (a ShadowRealm's
+    /// answers to its creator's). Replace it only through [`Interp::set_runtime_interrupt`],
+    /// which moves their poll words' registrations.
     pub(crate) runtime_interrupt: std::sync::Arc<crate::RuntimeInterrupt>,
     /// The word this interpreter's execution polls (see `interrupt::PollWord`): `gc_heap`
     /// keeps its heap bit, `runtime_interrupt` its interrupt bit.
@@ -5612,19 +5613,30 @@ impl Interp {
     /// an isolated global/object heap, but ECMA-262 §20.4 requires its global and well-known
     /// Symbols to retain Agent-wide identity.
     pub(crate) fn new_with_symbol_agent(symbol_agent: crate::value::SymbolAgent) -> Interp {
-        Self::new_in_heap(symbol_agent, crate::value::new_gc_heap(), true)
+        Self::new_in_heap(
+            symbol_agent,
+            crate::value::new_gc_heap(),
+            true,
+            Default::default(),
+        )
     }
 
     /// A ShadowRealm's implementation interpreter, owned by the ShadowRealm object `owner`:
     /// same Agent (Symbols), isolated globals and intrinsics. It allocates in its parent's heap
     /// — one heap per Agent, so no edge between the two realms' objects ever crosses heaps (I6)
-    /// — and the root of the ShadowRealm tree collects for all of it.
+    /// — and the root of the ShadowRealm tree collects for all of it. It answers to its
+    /// creator's interrupt handle, as V8 runs a ShadowRealm in its creator's isolate, which
+    /// `TerminateExecution` reaches (Decision 19).
     pub(crate) fn new_shadow(parent: &Interp, owner: &Gc) -> crate::agent_access::Owned<Interp> {
         let _unpublished = crate::agent_control::Suppression::new(&parent.gc_heap);
         let access = parent.gc_heap.agent.access.clone();
         let id = access.fresh_id();
-        let mut realm =
-            Self::new_in_heap(parent.symbol_agent.clone(), parent.gc_heap.clone(), false);
+        let mut realm = Self::new_in_heap(
+            parent.symbol_agent.clone(),
+            parent.gc_heap.clone(),
+            false,
+            parent.runtime_interrupt.clone(),
+        );
         realm.realm_id = id;
         let mut owners = parent.realm_route().owners.to_vec();
         owners.push(*owner);
@@ -5687,6 +5699,7 @@ impl Interp {
         symbol_agent: crate::value::SymbolAgent,
         gc_heap: crate::value::GcHeap,
         owns_heap: bool,
+        runtime_interrupt: std::sync::Arc<crate::RuntimeInterrupt>,
     ) -> Interp {
         let _unpublished = crate::agent_control::Suppression::new(&gc_heap);
         // Decision 0: every engine frame on this thread lies below the scanned stack top.
@@ -5709,7 +5722,6 @@ impl Interp {
         let global = Object::new(Some(object_proto));
         let global_env = new_var_scope(None);
         let live_object_limit = gc_heap.agent.next.get();
-        let runtime_interrupt = std::sync::Arc::<crate::RuntimeInterrupt>::default();
         let poll = std::sync::Arc::new(crate::interrupt::PollWord::default());
         runtime_interrupt.register(&poll);
         crate::value::attach_poll_word(&gc_heap, &poll);
@@ -6969,12 +6981,29 @@ impl Interp {
         }
     }
 
-    /// Answer to `interrupt` from now on: its requests set this interpreter's poll word, and the
-    /// previous handle's no longer do.
+    /// Answer to `interrupt` from now on, with every interpreter of the Agent (its ShadowRealms
+    /// share their creator's handle): its requests set their poll words, and the previous
+    /// handle's no longer do.
     pub(crate) fn set_runtime_interrupt(
         &mut self,
         interrupt: std::sync::Arc<crate::RuntimeInterrupt>,
     ) {
+        if self.single_interpreter() {
+            self.answer_to(interrupt);
+            return;
+        }
+        let access = self.gc_heap.agent.access.clone();
+        self.with_raw_access(|_| {
+            for (_, pointer) in access.snapshot() {
+                // SAFETY: the published current lineages of this Agent, on its thread; the swap
+                // runs no JavaScript and keeps no reference.
+                unsafe { (*pointer.as_ptr()).answer_to(interrupt.clone()) };
+            }
+        });
+    }
+
+    /// Move this interpreter's poll word from its handle to `interrupt`.
+    fn answer_to(&mut self, interrupt: std::sync::Arc<crate::RuntimeInterrupt>) {
         self.runtime_interrupt.unregister(&self.poll);
         interrupt.register(&self.poll);
         self.runtime_interrupt = interrupt;
@@ -12817,13 +12846,12 @@ impl Interp {
                     }
                 }
                 let host_result =
-                    self.with_route(parent, |host| -> Result<Result<Value, Abrupt>, ()> {
+                    self.with_route(parent, |host| -> Result<Result<Value, Abrupt>, Abrupt> {
                         // Wrapping copies name/length, which can run getters (I1).
                         let mut out_args = crate::rooting::RootedVec::new();
                         for a in args {
                             if a.is_callable() {
-                                out_args
-                                    .push(host.make_wrapped_shadow(&realm, *a).map_err(|_| ())?);
+                                out_args.push(host.make_wrapped_shadow(&realm, *a)?);
                             } else {
                                 out_args.push(*a);
                             }
@@ -12832,7 +12860,8 @@ impl Interp {
                     });
                 let host_result = match host_result {
                     Ok(result) => result,
-                    Err(()) => {
+                    Err(Abrupt::Interrupt(reason)) => return Err(Abrupt::Interrupt(reason)),
+                    Err(_) => {
                         return Err(self.throw(
                             "TypeError",
                             "cannot wrap the callable argument for the host realm",
@@ -12845,6 +12874,8 @@ impl Interp {
                     Ok(_) => {
                         Err(self.throw("TypeError", "a wrapped function returned a non-primitive"))
                     }
+                    // A host interruption passes the boundary (see `call_wrapped_shadow`).
+                    Err(Abrupt::Interrupt(reason)) => Err(Abrupt::Interrupt(reason)),
                     Err(e) => {
                         if std::env::var("TRUST_JS_DBG").is_ok() {
                             eprintln!(
@@ -13060,12 +13091,14 @@ impl Interp {
         match result {
             Ok(v) => self
                 .marshal_from_shadow(realm, v)
-                .map_err(|_| {
-                    abrupt_value(
-                        self.throw("TypeError", "a wrapped function returned a non-primitive"),
-                    )
-                })
-                .map_err(Abrupt::Throw),
+                .map_err(|error| match error {
+                    Abrupt::Interrupt(reason) => Abrupt::Interrupt(reason),
+                    _ => self.throw("TypeError", "a wrapped function returned a non-primitive"),
+                }),
+            // OrdinaryWrappedFunctionCall copies a throw completion into a TypeError. A host
+            // interruption is none (HTML "abort a running script"): it passes, as V8's
+            // termination passes a wrapped function's call (Decision 19).
+            Err(Abrupt::Interrupt(reason)) => Err(Abrupt::Interrupt(reason)),
             Err(e) => {
                 if std::env::var("TRUST_JS_DBG").is_ok() {
                     eprintln!(

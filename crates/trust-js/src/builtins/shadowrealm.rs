@@ -99,6 +99,10 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
     match result {
         // Primitives cross the realm boundary directly; callables wrap; other objects throw.
         Ok(v) => ab(i.make_shadow_result(&realm, v)),
+        // A host interruption is no completion for the boundary to copy (HTML "abort a running
+        // script"): it passes, as V8's evaluate returns at once while execution terminates, and
+        // the native boundary resumes it from this lowering.
+        Err(crate::interpreter::Abrupt::Interrupt(_)) => Err(Value::Undefined),
         // An error thrown inside the shadow realm is re-thrown as a TypeError of the calling realm.
         Err(_) => Err(i.make_error(
             "TypeError",
