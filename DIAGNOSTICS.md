@@ -265,7 +265,8 @@ comment/example in the same change.
   shorter runs could only fail keeps no record to retry one: a loop followed by the input's end
   (`\s+$` outside multiline mode), by an element its body cannot match (`[\w+\-.]+:`), by a word
   boundary after at least one word character (`\b\w+\b`), or by nothing left to test
-  (`(\d*)(\D*)`). Patterns with `i` or an inline modifier keep every retry.
+  (`(\d*)(\D*)`). Patterns with an inline modifier keep every retry, as do `i` patterns under
+  `TRUST_JS_REGEXP_NO_CASE_CLOSURE=1`.
 - `TRUST_JS_REGEXP_NO_RUN_SKIP=1` resumes the scan after a failed attempt at the next start.
   Otherwise, for a pattern that begins with a greedy loop of unbounded count (as `/\s+$/` and
   `/[\w+\-.]+:/` do), it resumes where that loop's first run ended: no start inside the run can
@@ -275,6 +276,13 @@ comment/example in the same change.
   that begins with `$` may begin only at the input's end or, in multiline mode, before a line
   terminator (as in `/$/m` and trimming's `/^\s*|\s*$/g`), and one that begins with `\b`, `\B`
   or a lookaround only where the path after it may.
+- `TRUST_JS_REGEXP_NO_CASE_CLOSURE=1` leaves the characters, classes and loops of a pattern's
+  case-insensitive parts (under `i`, or in a `(?i:…)` group) to fold case as they match.
+  Otherwise they are closed over case when the pattern is compiled: a character becomes the
+  class of the characters with its Canonicalize, a class takes in those of its members, and
+  they match with no folding, which also lets the first-element filter take an exact leading
+  byte and the loop analysis prove loops of `i` patterns atomic. Backreferences, word boundaries
+  and `v`-mode class strings still compare case-insensitively as they match.
 - `TRUST_JS_REGEXP_NO_SIMD=1` keeps the subject scans (for the prefilter's literal, and for a
   match's first element by byte or by table) on their portable loops instead of AArch64 vector
   code.

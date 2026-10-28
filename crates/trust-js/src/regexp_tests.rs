@@ -410,6 +410,83 @@ fn assertion_led_patterns_match_as_node_does() {
     );
 }
 
+/// Case-insensitive characters, classes and loops match what Node (v24.22.0) matches: by the
+/// legacy Canonicalize's uppercase without Unicode mode (σ and ς, ϑ and θ, never ſ or K onto
+/// ASCII) and by simple case folding with it (ẞ and ß, the Ohm sign, `\w` with ſ and K,
+/// properties and their complements, orbits beyond the BMP), beside backreferences, modifiers,
+/// word boundaries, `v`-mode strings and sticky and global starts in two-byte subjects.
+#[test]
+fn case_insensitive_elements_match_as_node_does() {
+    check(
+        r##"
+        function show(m) { return m === null ? null : [m.index].concat(Array.prototype.slice.call(m)); }
+        JSON.stringify([
+            // Legacy Canonicalize: a class matches what shares an uppercase with any member.
+            /[σ]/i.test("ς"),
+            /[ς]/i.test("σ"),
+            /[Σ]/i.test("ς"),
+            /σ/i.test("ς"),
+            /[ϑ]/i.test("θ"),
+            /[θ]/i.test("ϴ"),
+            /[θ]/iu.test("ϴ"),
+            /[ǆ]/i.test("ǅ"),
+            /ǅ/i.test("Ǆ"),
+            // Without Unicode mode nothing non-ASCII canonicalizes onto ASCII: ſ, K, ı, İ.
+            /[a-z]/i.test("\u017f"),
+            /[a-z]/iu.test("\u017f"),
+            /k/i.test("\u212a"),
+            /k/iu.test("\u212a"),
+            /[\u212a]/i.test("k"),
+            /[\u212a]/iu.test("K"),
+            /ı/i.test("I"),
+            /İ/i.test("i"),
+            /[İı]/iu.test("i"),
+            // ß has no one-character uppercase; ẞ folds to it.
+            /ß/i.test("ẞ"),
+            /ß/iu.test("ẞ"),
+            /[ẞ]/iu.test("ß"),
+            // The Ohm sign, as in the specification's note.
+            /[ω]/i.test("\u2126"),
+            /[ω]/iu.test("\u2126"),
+            /[\u03a9]/iu.test("\u2126"),
+            // Word characters under `iu` take in ſ and K.
+            /\w/iu.test("\u017f"),
+            /\W/iu.test("\u017f"),
+            /[\W]/iu.test("S"),
+            /[^\W]/iu.test("\u212a"),
+            /\w/i.test("\u017f"),
+            // Properties and their complements under `iu`.
+            /\p{Lu}/iu.test("a"),
+            /\P{Lu}/iu.test("A"),
+            /[^\p{Lu}]/iu.test("A"),
+            // Orbits beyond the BMP.
+            /\u{10400}/iu.test("\u{10428}"),
+            /[\u{10400}-\u{1040f}]/iu.test("\u{10430}"),
+            // Runs, backreferences, modifiers and word boundaries.
+            "AbC aBc".replace(/[a-c]+/gi, "_"),
+            "ΣΑΣ σας".match(/[σς]+/gi),
+            /(a)\1/i.test("aA"),
+            /(σ)\1/i.test("σς"),
+            /(ſ)\1/iu.test("ſS"),
+            /(?i:a)b/.test("Ab"),
+            /(?i:a)b/.test("AB"),
+            /a(?-i:b)/i.test("AB"),
+            /a(?-i:b)/i.test("Ab"),
+            /^[^σ]$/i.test("ς"),
+            show(/\bK\w*/iu.exec("x \u212aelvin")),
+            "Straße STRASSE".match(/straße/gi),
+            // `v`-mode strings.
+            /[\q{ss}x]/iv.test("SS"),
+            /[\w--k]/iv.test("\u212a"),
+            // Two-byte subjects with sticky and global starts.
+            (function () { var re = /σ+/giy; re.lastIndex = 1; var m = re.exec("aΣσς"); return [show(m), re.lastIndex]; })(),
+            (function () { var re = /[a-z]+/gi; re.lastIndex = 2; var m = re.exec("ab ĀbC"); return [show(m), re.lastIndex]; })(),
+        ])
+        "##,
+        r##"[true,true,true,true,true,false,true,true,true,false,true,false,true,false,true,false,false,false,false,true,true,false,true,true,true,false,false,true,false,true,true,false,true,true,"_ _",["Σ","Σ","σ","ς"],true,true,true,true,false,false,true,false,[2,"Kelvin"],["Straße"],true,false,[[1,"Σσς"],4],[[4,"bC"],6]]"##,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).

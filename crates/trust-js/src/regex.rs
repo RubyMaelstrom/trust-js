@@ -485,6 +485,10 @@ pub struct Regex {
     /// The program begins with a greedy loop of unbounded count (see [`leading_run`]): after a
     /// failed attempt, the scan resumes where that loop's first run ended.
     lead_run: bool,
+    /// The characters, classes and loops of the program's case-insensitive parts were closed over
+    /// case (see [`close_program_over_case`]): they match with no case folding.
+    /// `TRUST_JS_REGEXP_NO_CASE_CLOSURE=1` leaves them to fold as they match.
+    case_closed: bool,
     /// Per-pattern execution feedback. These cells add no allocation to cold patterns; the native
     /// straight-line program is compiled lazily after the tier-up threshold.
     tier_ticks: Cell<u32>,
@@ -1534,8 +1538,21 @@ enum FirstFilter {
 /// `\s*$`; and `\b`, `\B` and lookarounds, which only narrow where the path after them begins,
 /// are walked through. Anything else not modelled (backrefs, inline flags, or an ε-reachable
 /// `Match` — an empty-matchable pattern) disables the filter.
-/// `TRUST_JS_REGEXP_NO_ASSERTION_FILTER=1` gives up on assertions other than `^` too.
-fn first_filter(prog: &[Inst], multiline: bool, assertions: bool) -> (FirstFilter, bool, bool) {
+/// `TRUST_JS_REGEXP_NO_ASSERTION_FILTER=1` gives up on assertions other than `^` too. With
+/// `close` (`Some` of the Unicode flag), the first elements of `v`-mode class strings, which match
+/// case-insensitively as they run, are closed over case like the program's other elements.
+fn first_filter(
+    prog: &[Inst],
+    multiline: bool,
+    assertions: bool,
+    close: Option<bool>,
+) -> (FirstFilter, bool, bool) {
+    let string_atom = |set: &StringSet| {
+        Rep::Class(Rc::new(match close {
+            Some(unicode) => closed_class(&set.first, unicode),
+            None => clone_class(&set.first),
+        }))
+    };
     let mut atoms: Vec<Rep> = Vec::new();
     let mut asserts = 0usize;
     let mut at_end = false;
@@ -1566,13 +1583,13 @@ fn first_filter(prog: &[Inst], multiline: bool, assertions: bool) -> (FirstFilte
             Inst::Any => atoms.push(Rep::Any),
             Inst::Class(cc) => atoms.push(Rep::Class(cc.clone())),
             Inst::StringSet(set) => {
-                atoms.push(Rep::Class(Rc::new(clone_class(&set.first))));
+                atoms.push(string_atom(set));
                 if set.empty {
                     stack.push(pc + 1);
                 }
             }
             Inst::StringSetRepeat { set, min, .. } => {
-                atoms.push(Rep::Class(Rc::new(clone_class(&set.first))));
+                atoms.push(string_atom(set));
                 if *min == 0 || set.empty {
                     stack.push(pc + 1);
                 }
@@ -1617,6 +1634,7 @@ fn line_terminator_atom() -> Rep {
         builtins: Vec::new(),
         props: Vec::new(),
         ascii_lut: None,
+        sorted: true,
     })))
 }
 
@@ -2103,6 +2121,9 @@ struct CharClass {
     /// Exact membership for non-case-insensitive inputs in the byte range. Compiled classes
     /// exercise this table for one-byte subjects; all other inputs retain the range/property path.
     ascii_lut: Option<Box<[bool; 256]>>,
+    /// `ranges` are sorted and disjoint, so a long list is searched by halves (a class closed
+    /// over case, see [`closed_class`]).
+    sorted: bool,
 }
 
 impl CharClass {
@@ -2115,36 +2136,17 @@ impl CharClass {
             }
         }
         let mut hit = self.matches_raw2(u, icase, unicode);
-        let c = char::from_u32(u);
         if !hit && icase {
-            if let Some(c) = c {
-                if unicode {
-                    // Try every member of the character's case-fold orbit.
-                    for alt in fold_orbit(u) {
-                        if alt != u && self.matches_raw2(alt, icase, unicode) {
-                            hit = true;
-                            break;
-                        }
-                    }
-                } else {
-                    // Legacy Canonicalize: compare via simple uppercase, never folding a
-                    // non-ASCII character onto an ASCII one.
-                    let cu = canonicalize_legacy(c);
-                    if cu != c && self.matches_raw2(cu as u32, icase, unicode) {
-                        hit = true;
-                    }
-                    // A member whose canonical form equals cu also matches (/[k]/i vs 'K').
-                    if !hit {
-                        for alt in c.to_lowercase().chain(c.to_uppercase()) {
-                            if alt != c
-                                && canonicalize_legacy(alt) == cu
-                                && self.matches_raw2(alt as u32, icase, unicode)
-                            {
-                                hit = true;
-                                break;
-                            }
-                        }
-                    }
+            // CharacterSetMatcher (§22.2.2.7.1): a member whose Canonicalize is the element's,
+            // one of its case group (see `case_tables`).
+            if u < 0x80 {
+                hit = ascii_case_partners(u, unicode)
+                    .any(|alt| self.matches_raw2(alt, icase, unicode));
+            } else {
+                let (canon, groups) = case_tables(unicode);
+                if let Ok(at) = canon.binary_search_by_key(&u, |&(member, _)| member) {
+                    hit = group_members(groups, canon[at].1)
+                        .any(|alt| alt != u && self.matches_raw2(alt, icase, unicode));
                 }
             }
         }
@@ -2153,9 +2155,16 @@ impl CharClass {
     fn matches_raw2(&self, u: u32, icase: bool, unicode: bool) -> bool {
         // Class membership is decided in true code-point space: smuggled surrogate atoms in the
         // class's own ranges decode to their surrogate values.
-        for &(lo, hi) in &self.ranges {
-            if u >= lo && u <= hi {
+        if self.sorted && self.ranges.len() > 8 {
+            let at = self.ranges.partition_point(|&(_, hi)| hi < u);
+            if self.ranges.get(at).is_some_and(|&(lo, _)| lo <= u) {
                 return true;
+            }
+        } else {
+            for &(lo, hi) in &self.ranges {
+                if u >= lo && u <= hi {
+                    return true;
+                }
             }
         }
         for &b in &self.builtins {
@@ -2711,6 +2720,16 @@ impl Regex {
     }
 
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
+        Self::with_case_closure(
+            pattern,
+            flags,
+            !env_flag!("TRUST_JS_REGEXP_NO_CASE_CLOSURE"),
+        )
+    }
+
+    /// [`Self::new`], closing the program over case (see [`Regex::case_closed`]) when
+    /// `case_closure`.
+    fn with_case_closure(pattern: &str, flags: &str, case_closure: bool) -> Result<Regex, String> {
         let mut seen = String::new();
         for f in flags.chars() {
             if !"dgimsuvy".contains(f) {
@@ -2775,9 +2794,6 @@ impl Regex {
         compile(&ast, &mut prog, &mut lowering, false)?;
         prog.push(Inst::Save(1));
         prog.push(Inst::Match);
-        if !env_flag!("TRUST_JS_REGEXP_NO_ATOMIC_LOOPS") {
-            analyse_loops(&mut prog, flags);
-        }
         // The `flags` accessor returns flags in canonical order.
         let canonical: String = "dgimsuvy".chars().filter(|c| flags.contains(*c)).collect();
         let literal_ascii = if !flags.contains('i') && p.ngroups == 0 {
@@ -2839,6 +2855,15 @@ impl Regex {
         } else {
             None
         };
+        // The literal paths above read the characters as written; the matcher, the filters and
+        // the analyses below read them closed over case.
+        let case_closed = case_closure;
+        if case_closed && (flags.contains('i') || changes_flags(&prog)) {
+            close_program_over_case(&mut prog, flags.contains('i'), unicode);
+        }
+        if !env_flag!("TRUST_JS_REGEXP_NO_ATOMIC_LOOPS") {
+            analyse_loops(&mut prog, flags, case_closed);
+        }
         let memo_string_failures = p.ngroups == 0 && program_contains_string_set(&prog);
         let single = single_element(&prog);
         let lead_run = !env_flag!("TRUST_JS_REGEXP_NO_RUN_SKIP") && leading_run(&prog);
@@ -2857,6 +2882,7 @@ impl Regex {
             prefilter: None,
             single,
             lead_run,
+            case_closed,
             tier_ticks: Cell::new(0),
             subject_shapes: Cell::new(0),
             tier_up_attempted: Cell::new(false),
@@ -2890,10 +2916,12 @@ impl Regex {
     /// and the forms its scans take: an exact leading byte, a byte-indexed table and its vector
     /// form.
     fn filter_starts(&mut self, assertions: bool) {
-        let (first, line_start, at_end) = first_filter(&self.prog, self.multiline, assertions);
+        let close = (self.ignore_case && self.case_closed).then_some(self.unicode);
+        let (first, line_start, at_end) =
+            first_filter(&self.prog, self.multiline, assertions, close);
         self.first_byte = match &first {
             FirstFilter::Atoms(atoms)
-                if atoms.len() == 1 && !self.ignore_case && !line_start && !at_end =>
+                if atoms.len() == 1 && !self.atoms_fold() && !line_start && !at_end =>
             {
                 match &atoms[0] {
                     Rep::Char(c) if *c < 0x80 => Some(*c as u8),
@@ -2987,10 +3015,11 @@ impl Regex {
     /// pass costs a wasted attempt at worst; only a reject skips work.
     fn first_matches(&self, atoms: &[Rep], c: u32) -> bool {
         let unicode = self.unicode;
+        let icase = self.atoms_fold();
         atoms.iter().any(|rep| match rep {
             Rep::Char(ch) => {
                 *ch == c
-                    || (self.ignore_case && {
+                    || (icase && {
                         match (char::from_u32(c), char::from_u32(*ch)) {
                             (Some(x), Some(y)) => {
                                 if unicode {
@@ -3004,8 +3033,14 @@ impl Regex {
                     })
             }
             Rep::Any => self.dotall || c != '\n' as u32,
-            Rep::Class(cc) => cc.matches(c, self.ignore_case, unicode),
+            Rep::Class(cc) => cc.matches(c, icase, unicode),
         })
+    }
+
+    /// Whether the program's characters and classes fold case as they match: under `i`, unless
+    /// they were closed over case (see [`Regex::case_closed`]).
+    fn atoms_fold(&self) -> bool {
+        self.ignore_case && !self.case_closed
     }
 
     /// Whether the first-element filter lets a match begin at `at`, which is at most the input's
@@ -3332,7 +3367,7 @@ impl Regex {
             }
             if at < input.len() {
                 let (c, next) = input.next_elem(at);
-                if element_matches(element, c, self.ignore_case, self.dotall, self.unicode) {
+                if element_matches(element, c, self.atoms_fold(), self.dotall, self.unicode) {
                     return Ok(Some((at, next)));
                 }
             }
@@ -3418,6 +3453,7 @@ impl Regex {
             flags: base_flags,
             outer_flags: std::mem::take(&mut scratch.outer_flags),
             unicode: self.unicode,
+            closed: self.case_closed,
             control,
             abort: None,
             // With no observable capture groups, failure at a StringSet instruction depends only
@@ -5460,6 +5496,219 @@ fn rep_elements(rep: &Rep, dotall: bool) -> Option<ElementSet> {
     }
 }
 
+/// The case relation of `i` as two tables over the characters equivalent to another: `(member,
+/// key)` sorted by member and `(key, member)` sorted by key. In Unicode mode the key is the
+/// simple case folding's (the fold orbits' least member, [`fold_canon`]); otherwise the legacy
+/// Canonicalize's (§22.2.2.7.3, [`canonicalize_legacy`]) over code units.
+fn case_tables(unicode: bool) -> (&'static [(u32, u32)], &'static [(u32, u32)]) {
+    if unicode {
+        (
+            crate::regex_fold::FOLD_CANON,
+            crate::regex_fold::FOLD_ORBITS,
+        )
+    } else {
+        let (canon, groups) = legacy_case_tables();
+        (canon, groups)
+    }
+}
+
+/// The legacy tables of [`case_tables`], made on first use. Canonicalize relates a code unit to
+/// another only through an uppercase mapping, which only cased characters have: lowercase ones,
+/// which the scan finds outside the CJK, Hangul, surrogate and private-use blocks, and those the
+/// fold orbits relate (titlecase letters). Their uppercase forms complete the groups. A test
+/// checks the tables against Canonicalize over the whole BMP.
+fn legacy_case_tables() -> &'static (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+    static TABLES: std::sync::OnceLock<(Vec<(u32, u32)>, Vec<(u32, u32)>)> =
+        std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let canonical = |unit: u32| char::from_u32(unit).map(|c| canonicalize_legacy(c) as u32);
+        let caseless = |unit: u32| matches!(unit, 0x3400..=0x9FFF | 0xAC00..=0xF8FF);
+        let lowercase = (0..=0xFFFF).filter(|&unit| {
+            !caseless(unit) && char::from_u32(unit).is_some_and(char::is_lowercase)
+        });
+        let mut units: Vec<u32> = crate::regex_fold::FOLD_CANON
+            .iter()
+            .map(|&(member, _)| member)
+            .filter(|&member| member <= 0xFFFF)
+            .chain(lowercase)
+            .collect();
+        let uppercase: Vec<u32> = units.iter().filter_map(|&unit| canonical(unit)).collect();
+        units.extend(uppercase);
+        units.sort_unstable();
+        units.dedup();
+        let mut pairs: Vec<(u32, u32)> = units
+            .iter()
+            .filter_map(|&unit| Some((canonical(unit)?, unit)))
+            .collect();
+        pairs.sort_unstable();
+        let mut groups = Vec::new();
+        for group in pairs.chunk_by(|a, b| a.0 == b.0) {
+            if group.len() > 1 {
+                groups.extend_from_slice(group);
+            }
+        }
+        let mut canon: Vec<(u32, u32)> = groups.iter().map(|&(key, unit)| (unit, key)).collect();
+        canon.sort_unstable();
+        (canon, groups)
+    })
+}
+
+/// The other members of ASCII element `u`'s case group under `i` (see [`case_tables`]), without
+/// a table: a letter's other case, and in Unicode mode the Kelvin sign beside `k` and the long s
+/// beside `s`, the only characters whose simple case folding is an ASCII one.
+fn ascii_case_partners(u: u32, unicode: bool) -> impl Iterator<Item = u32> {
+    let letter = (u as u8).is_ascii_alphabetic();
+    let folded = (u | 0x20) as u8;
+    let extra = match folded {
+        b'k' if unicode => Some(0x212A),
+        b's' if unicode => Some(0x17F),
+        _ => None,
+    };
+    letter.then_some(u ^ 0x20).into_iter().chain(extra)
+}
+
+/// The members of `c`'s case group under `i` (see [`case_tables`]), sorted: `c` alone when no
+/// other character is equivalent.
+fn case_group(c: u32, unicode: bool) -> Vec<u32> {
+    let (canon, groups) = case_tables(unicode);
+    match canon.binary_search_by_key(&c, |&(member, _)| member) {
+        Ok(at) => group_members(groups, canon[at].1).collect(),
+        Err(_) => vec![c],
+    }
+}
+
+/// The members of the group keyed `key` in `groups`, sorted.
+fn group_members(groups: &[(u32, u32)], key: u32) -> impl Iterator<Item = u32> + '_ {
+    let lo = groups.partition_point(|&(k, _)| k < key);
+    let hi = groups.partition_point(|&(k, _)| k <= key);
+    groups[lo..hi].iter().map(|&(_, member)| member)
+}
+
+/// `set` with the case group of each of its elements: what an element of `set` matches under
+/// `i`.
+fn close_elements_over_case(set: &[(u32, u32)], unicode: bool) -> ElementSet {
+    let (canon, groups) = case_tables(unicode);
+    let mut parts = set.to_vec();
+    for &(lo, hi) in set {
+        let from = canon.partition_point(|&(member, _)| member < lo);
+        for &(_, key) in canon[from..]
+            .iter()
+            .take_while(|&&(member, _)| member <= hi)
+        {
+            parts.extend(group_members(groups, key).map(|member| (member, member)));
+        }
+    }
+    element_set(parts)
+}
+
+/// The elements a class letter (see [`builtin_matches_ic`]) matches under `i`, before closing
+/// over case: in Unicode mode `\w` holds the characters that fold into it (ſ, K) and `\W` lacks
+/// them (WordCharacters, §22.2.2.9.3).
+fn builtin_elements_ignoring_case(builtin: char, unicode: bool) -> Option<ElementSet> {
+    match builtin {
+        'w' | 'W' if unicode => {
+            let word = close_elements_over_case(&WORD_ELEMENTS, true);
+            Some(if builtin == 'w' {
+                word
+            } else {
+                element_complement(&word)
+            })
+        }
+        _ => builtin_elements(builtin),
+    }
+}
+
+/// `class` closed over case: a class whose ranges hold every element the class matches under
+/// `i`, one whose Canonicalize some member's is (CharacterSetMatcher, §22.2.2.7.1), so that it
+/// matches with no case folding.
+fn closed_class(class: &CharClass, unicode: bool) -> CharClass {
+    let mut parts = class.ranges.clone();
+    for &builtin in &class.builtins {
+        parts.extend(builtin_elements_ignoring_case(builtin, unicode).unwrap_or_default());
+    }
+    for &(negate, ranges) in &class.props {
+        if negate {
+            parts.extend(element_complement(ranges));
+        } else {
+            parts.extend_from_slice(ranges);
+        }
+    }
+    clone_class(&CharClass {
+        negate: class.negate,
+        ranges: close_elements_over_case(&element_set(parts), unicode),
+        builtins: Vec::new(),
+        props: Vec::new(),
+        ascii_lut: None,
+        sorted: true,
+    })
+}
+
+/// Character `c` closed over case: the class of its case group, or `None` when `c` has no
+/// equivalent and matches only itself.
+fn closed_char(c: u32, unicode: bool) -> Option<CharClass> {
+    let group = case_group(c, unicode);
+    (group.len() > 1).then(|| {
+        clone_class(&CharClass {
+            ranges: element_set(group.iter().map(|&member| (member, member)).collect()),
+            sorted: true,
+            ..Default::default()
+        })
+    })
+}
+
+/// Close the elements program `prog` matches case-insensitively over case (see [`closed_char`],
+/// [`closed_class`]), and those of its lookaround bodies, so that the matcher compares them with
+/// no case folding: `icase` holds where `prog` begins, and inline modifiers change it for their
+/// groups' bodies. Strings of `v`-mode classes, backreferences and word boundaries still compare
+/// case-insensitively as they match.
+fn close_program_over_case(prog: &mut [Inst], icase: bool, unicode: bool) {
+    close_over_case_sharing(prog, icase, unicode, &mut Default::default());
+}
+
+/// The classes of a program's characters closed over case, by character (`None` for one with no
+/// equivalent), which its occurrences share.
+type ClosedChars = std::collections::HashMap<u32, Option<Rc<CharClass>>>;
+
+/// [`close_program_over_case`], sharing each character's class through `chars`.
+fn close_over_case_sharing(prog: &mut [Inst], icase: bool, unicode: bool, chars: &mut ClosedChars) {
+    let closed = |chars: &mut ClosedChars, c: u32| {
+        chars
+            .entry(c)
+            .or_insert_with(|| closed_char(c, unicode).map(Rc::new))
+            .clone()
+    };
+    let mut scopes = vec![icase];
+    for inst in prog.iter_mut() {
+        let icase = *scopes.last().expect("the program's own scope");
+        match inst {
+            Inst::PushFlags(add, ..) => scopes.push(add.unwrap_or(icase)),
+            Inst::PopFlags => {
+                scopes.pop();
+            }
+            Inst::Char(c) if icase => {
+                if let Some(class) = closed(chars, *c) {
+                    *inst = Inst::Class(class);
+                }
+            }
+            Inst::Class(class) if icase => *class = Rc::new(closed_class(class, unicode)),
+            Inst::Many { rep, .. } if icase => match rep {
+                Rep::Char(c) => {
+                    if let Some(class) = closed(chars, *c) {
+                        *rep = Rep::Class(class);
+                    }
+                }
+                Rep::Any => {}
+                Rep::Class(class) => *class = Rc::new(closed_class(class, unicode)),
+            },
+            Inst::Look { prog: body, .. } | Inst::LookBehind { prog: body, .. } => {
+                let body = Rc::make_mut(body).as_mut_slice();
+                close_over_case_sharing(body, icase, unicode, chars)
+            }
+            _ => {}
+        }
+    }
+}
+
 /// What a path through a forward program does first from a point it reaches without consuming
 /// (see [`loop_retries_futile`]).
 enum PathStart {
@@ -5549,11 +5798,12 @@ fn loop_retries_futile(prog: &[Inst], pc: usize, multiline: bool, dotall: bool) 
 }
 
 /// Mark the loops of program `prog`, compiled with `flags`, whose retries are futile
-/// ([`mark_atomic_loops`]). Under `i` or an inline modifier the proofs would need the case
-/// relation and the flags in effect at each loop; those patterns keep every retry.
+/// ([`mark_atomic_loops`]). The proofs take elements as matched case-sensitively, which under
+/// `i` holds once the program is `closed` over case, and the flags as the pattern's: patterns
+/// with an inline modifier, or with `i` and not closed, keep every retry.
 /// `TRUST_JS_REGEXP_NO_ATOMIC_LOOPS=1` keeps every loop's retries.
-fn analyse_loops(prog: &mut [Inst], flags: &str) {
-    if !flags.contains('i') && !changes_flags(prog) {
+fn analyse_loops(prog: &mut [Inst], flags: &str, closed: bool) {
+    if (closed || !flags.contains('i')) && !changes_flags(prog) {
         mark_atomic_loops(prog, flags.contains('m'), flags.contains('s'));
     }
 }
@@ -5673,6 +5923,7 @@ fn clone_class(cc: &CharClass) -> CharClass {
         builtins: cc.builtins.clone(),
         props: cc.props.clone(),
         ascii_lut: None,
+        sorted: cc.sorted,
     };
     let mut lut = Box::new([false; 256]);
     for (code, slot) in lut.iter_mut().enumerate() {
@@ -6560,6 +6811,9 @@ struct Matcher<'a, I: ReInput> {
     /// Unicode mode (`u`/`v`): case-insensitive matching uses full case folding instead of the
     /// legacy Canonicalize (simple uppercase, never folding non-ASCII to ASCII).
     unicode: bool,
+    /// The program's characters, classes and loops are closed over case (see
+    /// [`Regex::case_closed`]) and compare with no case folding under `i`.
+    closed: bool,
     control: &'a crate::RuntimeInterrupt,
     abort: Option<MatchError>,
     string_failures: Option<std::collections::HashSet<(usize, usize, usize, usize, bool, u8)>>,
@@ -6639,6 +6893,17 @@ impl<'a, I: ReInput> Matcher<'a, I> {
     #[inline(always)]
     fn eqc_uu(&self, a: u32, b: u32) -> bool {
         chars_eq(a, b, self.icase(), self.unicode)
+    }
+    /// Whether a Char, Class or Many instruction folds case as it matches: under `i`, unless the
+    /// program was closed over case.
+    #[inline(always)]
+    fn atom_icase(&self) -> bool {
+        self.icase() && !self.closed
+    }
+    /// Compare a subject element with a Char instruction's character.
+    #[inline(always)]
+    fn eqc_atom(&self, a: u32, b: u32) -> bool {
+        chars_eq(a, b, self.atom_icase(), self.unicode)
     }
 
     /// The next element to consume and the position after it, honouring the match direction.
@@ -6732,7 +6997,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
 
     #[inline(always)]
     fn rep_matches(&self, rep: &Rep, c: u32) -> bool {
-        element_matches(rep, c, self.icase(), self.dotall(), self.unicode)
+        element_matches(rep, c, self.atom_icase(), self.dotall(), self.unicode)
     }
 
     #[inline(always)]
@@ -6775,11 +7040,11 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                 Inst::Char(expected) => {
                     return self
                         .step(pos)
-                        .is_some_and(|(found, _)| self.eqc_uu(found, *expected));
+                        .is_some_and(|(found, _)| self.eqc_atom(found, *expected));
                 }
                 Inst::Class(class) => {
                     return self.step(pos).is_some_and(|(found, _)| {
-                        class.matches(found, self.icase(), self.unicode)
+                        class.matches(found, self.atom_icase(), self.unicode)
                     });
                 }
                 Inst::Any => {
@@ -7037,7 +7302,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                 Inst::Char(expected) => {
                     return Some(
                         self.step(pos)
-                            .is_some_and(|(found, _)| self.eqc_uu(found, *expected)),
+                            .is_some_and(|(found, _)| self.eqc_atom(found, *expected)),
                     );
                 }
                 Inst::Any => {
@@ -7047,7 +7312,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                 }
                 Inst::Class(class) => {
                     return Some(self.step(pos).is_some_and(|(found, _)| {
-                        class.matches(found, self.icase(), self.unicode)
+                        class.matches(found, self.atom_icase(), self.unicode)
                     }));
                 }
                 // `first` holds the elements a string can begin with, which a backward match
@@ -7346,7 +7611,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         pos = frame.pos;
                     }
                     Inst::Char(c) => match self.step(pos) {
-                        Some((e, next)) if self.eqc_uu(e, *c) => {
+                        Some((e, next)) if self.eqc_atom(e, *c) => {
                             pc += 1;
                             pos = next;
                         }
@@ -7360,7 +7625,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         _ => break,
                     },
                     Inst::Class(cc) => match self.step(pos) {
-                        Some((e, next)) if cc.matches(e, self.icase(), self.unicode) => {
+                        Some((e, next)) if cc.matches(e, self.atom_icase(), self.unicode) => {
                             pc += 1;
                             pos = next;
                         }
@@ -8150,6 +8415,7 @@ fn class_set_to_node(mut set: ClassSet) -> Node {
         builtins: Vec::new(),
         props: Vec::new(),
         ascii_lut: None,
+        sorted: false,
     };
     if set.strings.is_empty() {
         return Node::Class(class);
@@ -8279,7 +8545,7 @@ mod internal_engine_diagnostics {
     fn analysed(pattern: &str, flags: &str) -> super::Regex {
         let mut re = super::Regex::new(pattern, flags).unwrap();
         without_atomic_loops(&mut re.prog);
-        super::analyse_loops(&mut re.prog, flags);
+        super::analyse_loops(&mut re.prog, flags, re.case_closed);
         re
     }
 
@@ -8349,21 +8615,29 @@ mod internal_engine_diagnostics {
             (r"(\d*)(\D*)", "", 2),
             (r"a+", "", 1),
             (r"x\s*", "", 1),
-            // Lazy loops, other continuations, `i` and modifiers keep their retries.
+            // Lazy loops, other continuations and modifiers keep their retries.
             (r"a+?b", "", 0),
             (r"a+(?=b)", "", 0),
             (r"(b)a+\1", "", 0),
-            (r"a+b", "i", 0),
             (r"(?i:a+)b", "", 0),
+            // Under `i` the proofs read the elements closed over case: the Kelvin sign is a `k`
+            // in Unicode mode alone.
+            (r"a+b", "i", 1),
+            (r"a+A", "i", 0),
+            (r"k+\u212a", "i", 1),
+            (r"k+\u212a", "iu", 0),
             // Lookahead bodies are analysed; lookbehind bodies, which match backward, are not.
             (r"(?=\d+x)", "", 1),
             (r"(?<=\d+x)", "", 0),
         ] {
-            assert_eq!(
-                atomic_loop_count(&analysed(pattern, flags).prog),
-                atomic,
-                "/{pattern}/{flags}"
-            );
+            let re = analysed(pattern, flags);
+            // Without the case closure, `i` patterns keep every retry.
+            let atomic = if re.ignore_case && !re.case_closed {
+                0
+            } else {
+                atomic
+            };
+            assert_eq!(atomic_loop_count(&re.prog), atomic, "/{pattern}/{flags}");
         }
     }
 
@@ -8666,6 +8940,212 @@ mod internal_engine_diagnostics {
             }
         }
         assert!(matches > 1000, "{matches} matches");
+    }
+
+    /// The case groups of `i` are the classes of elements with one Canonicalize (§22.2.2.7.3):
+    /// every BMP code unit by `canonicalize_legacy`, and every code point by `fold_canon` for
+    /// Unicode mode.
+    #[test]
+    fn case_groups_agree_with_canonicalize() {
+        let legacy =
+            |unit: u32| char::from_u32(unit).map_or(unit, |c| super::canonicalize_legacy(c) as u32);
+        let modes: [(bool, u32, &dyn Fn(u32) -> u32); 2] = [
+            (false, 0xFFFF, &legacy),
+            (true, super::MAX_ELEMENT, &super::fold_canon),
+        ];
+        for (unicode, last, canonicalize) in modes {
+            let mut keyed: Vec<(u32, u32)> = (0..=last).map(|c| (canonicalize(c), c)).collect();
+            keyed.sort_unstable();
+            let mut related = 0;
+            for group in keyed.chunk_by(|a, b| a.0 == b.0) {
+                let members: Vec<u32> = group.iter().map(|&(_, c)| c).collect();
+                related += usize::from(members.len() > 1) * members.len();
+                for &c in &members {
+                    assert_eq!(
+                        super::case_group(c, unicode),
+                        members,
+                        "{c:#x} (Unicode mode: {unicode})"
+                    );
+                }
+            }
+            assert!(related > 2000, "{related} related elements");
+        }
+    }
+
+    /// A class closed over case matches, with no folding, every element some member of the class
+    /// shares a Canonicalize with (CharacterSetMatcher, §22.2.2.7.1), as the folding match does:
+    /// every BMP element, and every 61st beyond it in Unicode mode.
+    #[test]
+    fn closed_classes_match_as_canonicalize_compares() {
+        let classes = [
+            ("[a-z]", false),
+            ("[a-z]", true),
+            ("[^k]", false),
+            ("[^k]", true),
+            (r"\w", false),
+            (r"\w", true),
+            (r"\W", false),
+            (r"\W", true),
+            (r"[^\W]", true),
+            (r"[\s\d]", false),
+            ("[\u{3c3}]", false),
+            ("[\u{3c3}]", true),
+            ("[^\u{3c2}]", false),
+            ("[\u{df}\u{1e9e}]", false),
+            ("[\u{1e9e}]", true),
+            ("[\u{130}\u{131}]", false),
+            ("[\u{130}\u{131}]", true),
+            ("[\u{17f}\u{212a}]", false),
+            ("[\u{17f}\u{212a}]", true),
+            ("[\u{2126}]", false),
+            ("[\u{2126}]", true),
+            ("[\u{1c80}]", false),
+            ("[\u{1c5}]", false),
+            ("[\u{ab70}-\u{abbf}]", false),
+            ("[\u{10400}]", true),
+            (r"\p{Lu}", true),
+            (r"[^\p{Ll}]", true),
+            (r"\P{L}", true),
+        ];
+        let elements = |unicode: bool| -> Vec<u32> {
+            let astral: Vec<u32> = if unicode {
+                (0x10000..=super::MAX_ELEMENT)
+                    .step_by(61)
+                    .chain([0x10400, 0x10428, 0x1E900, 0x1E922])
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (0..=0xFFFF).chain(astral).collect()
+        };
+        for (pattern, unicode) in classes {
+            let re = super::Regex::with_case_closure(pattern, if unicode { "u" } else { "" }, true)
+                .unwrap();
+            let class = match &re.prog[1] {
+                super::Inst::Class(class) => super::clone_class(class),
+                super::Inst::Char(c) => super::CharClass {
+                    ranges: vec![(*c, *c)],
+                    ..Default::default()
+                },
+                other => panic!("/{pattern}/ compiled to {}", super::regexp_prof_kind(other)),
+            };
+            let closed = super::closed_class(&class, unicode);
+            for element in elements(unicode) {
+                let found = super::case_group(element, unicode)
+                    .iter()
+                    .any(|&member| class.matches_raw2(member, true, unicode));
+                let expected = found ^ class.negate;
+                assert_eq!(
+                    closed.matches(element, false, unicode),
+                    expected,
+                    "closed /{pattern}/ (Unicode mode: {unicode}) at {element:#x}"
+                );
+                assert_eq!(
+                    class.matches(element, true, unicode),
+                    expected,
+                    "folding /{pattern}/ (Unicode mode: {unicode}) at {element:#x}"
+                );
+            }
+        }
+    }
+
+    /// Programs closed over case match as programs that fold case as they match, from every
+    /// start of one- and two-byte subjects built from characters with case relations.
+    #[test]
+    fn closed_programs_match_as_folding_ones() {
+        let patterns = [
+            "[a-z]+",
+            r"\w+",
+            "[^k]+",
+            "\u{3c3}+",
+            "[\u{3c3}]",
+            "\u{3c2}",
+            "k",
+            r"\u212a",
+            "\u{17f}",
+            "\u{df}|\u{1e9e}",
+            "\u{130}|\u{131}",
+            "\u{1c5}+",
+            "(?i:a)b",
+            "a(?-i:b)",
+            r"\bk\w*\b",
+            r"(a|\u{3c3})\1",
+            r"[\W]+",
+            r"[^\W]+",
+            r"\p{Lu}+",
+            r"\u{10400}",
+            r"[^\p{Ll}]",
+            r"[\w--\d]+",
+            r"[\q{ss|abc}x]",
+            r"k+\u212a",
+            "(?=K)\\w+",
+        ];
+        let tokens = [
+            "a",
+            "A",
+            "b",
+            "B",
+            "k",
+            "K",
+            "\u{212a}",
+            "s",
+            "S",
+            "\u{17f}",
+            "\u{3c3}",
+            "\u{3c2}",
+            "\u{3a3}",
+            "\u{df}",
+            "\u{1e9e}",
+            "ss",
+            "SS",
+            "\u{130}",
+            "i",
+            "I",
+            "\u{131}",
+            "\u{1c4}",
+            "\u{1c5}",
+            "\u{1c6}",
+            "\u{10400}",
+            "\u{10428}",
+            "1",
+            " ",
+            "_",
+            "x",
+            "abc",
+        ];
+        let mut rng = TestRng(0x6a09_e667_f3bc_c908);
+        let subjects: Vec<crate::lstr::LStr> = (0..48)
+            .map(|_| {
+                let count = rng.below(7);
+                let text: String = (0..count)
+                    .map(|_| tokens[rng.below(tokens.len())])
+                    .collect();
+                crate::lstr::LStr::from(text.as_str())
+            })
+            .collect();
+        let control = crate::RuntimeInterrupt::default();
+        let mut closed_programs = 0;
+        for pattern in patterns {
+            for flags in ["i", "iu", "iv", "", "u", "v", "ig", "iy"] {
+                let Ok(closed) = super::Regex::with_case_closure(pattern, flags, true) else {
+                    continue;
+                };
+                let folding = super::Regex::with_case_closure(pattern, flags, false).unwrap();
+                closed_programs += usize::from(closed.ignore_case);
+                for subject in &subjects {
+                    for start in 0..=subject.unit_len() {
+                        let found = closed.exec_polled(subject, start, &control);
+                        let reference = folding.exec_polled(subject, start, &control);
+                        assert_eq!(
+                            found.map(|caps| caps.map(|caps| caps.to_vec())),
+                            reference.map(|caps| caps.map(|caps| caps.to_vec())),
+                            "/{pattern}/{flags} on {subject} from {start}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(closed_programs > 60, "{closed_programs} programs closed");
     }
 
     #[test]
