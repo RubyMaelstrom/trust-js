@@ -1577,6 +1577,72 @@ frame-record bookkeeping) and items 3-5; the call table's time ratios wait for t
 end; item 6's call, apply and spread (an agent's, p2-w3-6) wait for item 1's entry; W5a's
 matcher-entry record comes with the W5 agent's Crystal counts.
 
+Then item 1's next steps, the probe and item 6's call, apply and spread (c4bf3b4b..4fcd8a42,
+2026-10-28; item 6 an agent's):
+- c4bf3b4b: the code cache finds running native code by walking the live activation records
+  and the frames the collector registers, instead of counting residency at every entry and
+  exit; a direct call marks its callee's code referenced with one store into the code's CLOCK
+  word, and the finish stub and a record's release clear the record's code base.
+- 27902319: the finish stub stops checking the callee's operand stack (a packed word owns
+  nothing) and, outside debug builds, the popped frame's `extra` (only the tree-walker's
+  function entry fills one, on the frame it pushed; the helper asserts it). The probe compares
+  the callee's word EOR the Object tag with the ways' identities, which no other kind of word
+  can match, so the tag check leaves the hit path; way 0 is compared in line. Arguments move in
+  pairs, an over-applied call's move goes out of line, and the shared stub returns its status
+  in w8, where the finish stub leaves the threw flag.
+- dfd1d4b2, 541e2b80, 6976d97c: a site whose callee is made afresh for each pass missed all
+  four identity ways, called the secondary stub and missed the overflow cache before the
+  code-keyed probe matched, about 80 instructions of probing a call. React's reducer passes a
+  new arrow to `map` or `filter` on every call, so most of its calls were such. The code-keyed
+  probe records the way it matched in the site (`CallSite::code_hint`), and once way 0's
+  identity misses, the site tests that way's function first; a stale hint costs one failed
+  test. Testing way 0's function instead measured React +1.01%: warm-up refills the ways round
+  robin, and way 0 held another arrow. Emitted at every site, the probe after way 0 grew the
+  generated code 7.4% on Vue, 5.1% on Djot and 3.8% on React, so it runs in the chunk's shared
+  stub (`CallSecondary`, which already held the secondary probes): React +0.85% against the
+  sites' own copies, and the code 2.4%, 1.5% and 1.8% smaller than before the series.
+- 6ca778dd, 4fcd8a42 (item 6): Function.prototype.call and apply enter a compiled target as
+  its ordinary call, and spread calls take their own helper and call cache. Per iteration
+  (ARM64): call 991 to 866, apply 1,452 to 1,161, spread 3,489 to 1,237; chai's
+  `m.apply(this, arguments)` -313, `getter.call(this)` -127, `Math.max(...a)` -1,606. Light
+  and boundary natives stay at +0 on both backends: x86-64's native entry (`call_native_entry`)
+  classes its target once, through a match of its own (`native_entry_class`: the light classes
+  and call and apply's forwarding, which a test checks against the light classes for all 256
+  values). x86-64: call 2,241 to 1,490, apply 3,216 to 1,774, spread 3,848 to 1,503. Slower:
+  `apply` with a mapped arguments object (+41 ARM64, +159 x86-64), a generator's `.call` (+107,
+  +359), `.call` and `apply` of a native on x86-64 (+33).
+
+Instructions (as above; each step against the one before, the last column against c4464dae;
+the steps from 541e2b80 on include W5b):
+
+| | c4bf3b4b | 27902319 | dfd1d4b2 | 541e2b80 | 6976d97c..4fcd8a42 | against the base | stage target |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | -0.22% | -0.39% | -0.31% | -0.06% | -0.02% | -7.6% (2.269e9) | -6% |
+| React | -0.95% | -1.42% | -4.22% | +0.85% | -0.09% | -8.7% (4.768e8) | -8% |
+| Djot | +0.43% | -0.56% | -0.58% | -0.27% | +0.02% | -7.2% (7.795e8) | -4% |
+| Web Tooling's chai | -0.25% | -0.80% | -0.00% | +0.02% | -0.04% | -11.8% (1.067e11) | -10% |
+
+Djot's +0.43% at c4bf3b4b is one more major collection (22 against 21) at the object
+threshold. Per call against 852a3ec2: direct 309 to 273, method 404 to 370, closure 344 to 310,
+recursion 346 to 311, an environment callee, rest and `arguments` 6 fewer, the constructor and
+the class cases unchanged. The probe keeps its exhausted-epoch guard (two instructions a call;
+the fill already refuses u32::MAX, and jit_call_epoch_tests forges a MAX way): without it Djot
+measured 0.6% and React 0.3% fewer.
+
+Validation: the ARM64 gates on 51718c8d (the first three steps before their rebase onto W5b)
+and on 4fcd8a42 (all of it, against 51718c8d's): the lib suite, pacing (its known failure only), GC stress on the call,
+closure, apply and spread tests, the fixtures and difftest as the base's, and Test262 53,575 of
+53,575, identical; item 6's own gate on 51718c8d; zombie's x86-64 lib suite (its known failure
+only), and clippy on both architectures. The dumps differ at every call site and in the stub,
+and by item 6's 8-byte `Interp` field. Under GC stress,
+`agent_collections_finish_inside_child_and_grandchild_loops_all_tiers` and `gc_reclaims_cycles`
+outrun the gate's hour on 852a3ec2's build as well.
+
+The fixture targets are met. Not done: the call table's time ratios (the stage's end); a
+direct construct sequence for `new` (class construction 2,363 instructions, a function as
+constructor 853: an agent's, under way); item 5 (a getter, 1,252; the class-and-getter case
+3,512); item 4 (rest, 1,295); `arguments` (1,707) and item 3 (an environment callee, 1,048).
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
