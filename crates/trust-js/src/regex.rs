@@ -1270,29 +1270,12 @@ impl OneByteNativeProgram {
             return None;
         }
         let ops = ops.into_boxed_slice();
-        // The AArch64 class emitter still needs an optimized-release audit: on this host it can
-        // lose termination on a no-match tail even though the same program is sound in debug.
-        // Keep the checked native Rust matcher (and terminal Many specialization) available while
-        // declining only the unsafe LUT machine mapping. The fixed-width byte path remains
-        // enabled for the class-free subset.
-        // Assertions need to participate in the candidate scan, including the failed-candidate
-        // path. Keep those programs on the checked native Rust matcher until the architecture
-        // emitters have a dedicated assertion differential gate; this preserves the tier-up win
-        // for the atom matcher without allowing an optimized executable mapping to turn an
-        // anchored no-match into a false empty match (which affects jQuery's vendor-property
-        // detection).
-        let machine_code = if ops.iter().any(|op| {
-            matches!(
-                op,
-                OneByteNativeOp::AssertStart | OneByteNativeOp::AssertEnd
-            )
-        }) || (cfg!(target_arch = "aarch64")
-            && ops.iter().any(|op| matches!(op, OneByteNativeOp::Class(_))))
-        {
-            None
-        } else {
-            OneByteNativeCode::compile(&ops)
-        };
+        // Classes and anchors compile on both backends. The AArch64 loop once branched on flags
+        // a call left undefined, which turned a failed candidate into a false empty match and
+        // stalled global replaces on no-match tails; it tests the poll's result since 5967822c.
+        // Anchors test the candidate start plus their offset. The instruction corpus and the
+        // differential tests run this machine code (`find_ascii`) against the matcher.
+        let machine_code = OneByteNativeCode::compile(&ops);
         Some(Self { machine_code, ops })
     }
 
