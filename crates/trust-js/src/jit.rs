@@ -7631,44 +7631,23 @@ fn emit_direct_call(
         && fits8(layout.user_env);
 
     // ---- checks (entry state: x12 = ic0 ptr, x10 = callee cell address; NO mutations) ----
-    // direct bits 0 (no force resets) and 2 (recompile settled)
+    // The static gates (a compiled entry whose frame fits, the global body it needs, a sloppy
+    // callee's object receiver) fold into one bit at fill (`CALL_IC_DIRECT_READY`). An entry
+    // without it checks them one by one after the sequence, then rejoins here.
+    let static_gates = a.new_label();
+    let static_done = a.new_label();
     a.ldurb(9, 12, IC_DIRECT);
-    let field1b = asm::logical_imm_w(1).unwrap();
-    a.logic_imm_w(0, 11, 9, field1b); // bit 0: no force resets
-    a.cbz(11, false, hit_slow);
-    let field8 = asm::logical_imm_w(8).unwrap();
-    a.logic_imm_w(0, 11, 9, field8); // bit 3: frame fits FRAME_BUF
-    a.cbz(11, false, hit_slow);
+    let ready = asm::logical_imm_w(crate::bytecode::CALL_IC_DIRECT_READY as u32).unwrap();
+    a.logic_imm_w(0, 11, 9, ready);
+    a.cbz(11, false, static_gates);
+    a.bind(static_done);
     // recompile settled (live chunk byte — see attempted_off)
     a.ldur(11, 12, IC_CHUNK_RAW);
     a.ldrb_imm(11, 11, attempted_off as u32);
     a.cbz(11, false, hit_slow);
-    // needs_global (bit 1) requires a live ctx.global_body
-    let no_glob = a.new_label();
-    let field2 = asm::logical_imm_w(2).unwrap();
-    a.logic_imm_w(0, 11, 9, field2);
-    a.cbz(11, false, no_glob);
-    a.ldr_imm(11, 19, 56); // ctx.global_body
-    a.cbz(11, true, hit_slow);
-    a.bind(no_glob);
     // Arity needs no gate: the sequence moves min(argc, n_params) arguments into their slots,
     // tags every remaining slot Undefined (the missing-argument binding), and leaves any
     // over-applied surplus on the caller's operand stack, which pops it after the call.
-    // this binding: a this-using SLOPPY callee needs boxing/global fallback unless the
-    // incoming receiver is already an object.
-    a.ldrb_imm(9, 12, IC_USES_THIS);
-    let this_ok = a.new_label();
-    a.cbz(9, false, this_ok);
-    a.ldrb_imm(9, 12, IC_STRICT);
-    a.cbnz(9, false, this_ok);
-    if with_this {
-        a.sub_imm(9, 20, ((argc + 2) * 8) as u32);
-        a.ldr_imm(9, 9, 0);
-        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, hit_slow);
-    } else {
-        a.b(hit_slow); // no receiver + sloppy this-user: global boxing → generic
-    }
-    a.bind(this_ok);
     // interp-side room: depth, gc tick, fn_frames capacity, frame pool
     a.ldr_imm(14, 19, 72); // ctx.interp
     a.ldr_w_imm(11, 14, il.depth as u32);
@@ -7980,6 +7959,37 @@ fn emit_direct_call(
     a.str_imm(4, 14, il.new_target as u32);
     a.add_imm(31, 31, 32);
     a.b(finished);
+
+    // ---- the static gates one by one (w9 = the entry's direct bits) ----
+    a.bind(static_gates);
+    let field1b = asm::logical_imm_w(1).unwrap();
+    a.logic_imm_w(0, 11, 9, field1b); // bit 0: a compiled user-code entry, no force resets
+    a.cbz(11, false, hit_slow);
+    let field8 = asm::logical_imm_w(8).unwrap();
+    a.logic_imm_w(0, 11, 9, field8); // bit 3: frame fits FRAME_BUF
+    a.cbz(11, false, hit_slow);
+    // needs_global (bit 1) requires a live ctx.global_body
+    let no_glob = a.new_label();
+    let field2 = asm::logical_imm_w(2).unwrap();
+    a.logic_imm_w(0, 11, 9, field2);
+    a.cbz(11, false, no_glob);
+    a.ldr_imm(11, 19, 56); // ctx.global_body
+    a.cbz(11, true, hit_slow);
+    a.bind(no_glob);
+    // this binding: a this-using SLOPPY callee needs boxing/global fallback unless the
+    // incoming receiver is already an object.
+    a.ldrb_imm(9, 12, IC_USES_THIS);
+    a.cbz(9, false, static_done);
+    a.ldrb_imm(9, 12, IC_STRICT);
+    a.cbnz(9, false, static_done);
+    if with_this {
+        a.sub_imm(9, 20, ((argc + 2) * 8) as u32);
+        a.ldr_imm(9, 9, 0);
+        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, hit_slow);
+        a.b(static_done);
+    } else {
+        a.b(hit_slow); // no receiver + sloppy this-user: global boxing → generic
+    }
     true
 }
 

@@ -974,7 +974,10 @@ pub struct CallIc {
     pub n_slots: u16,
     /// Direct-call gates computed at fill: bit 0 = a compiled user-code entry; bit 1 = the chunk
     /// needs the realm's global body pointer (the sequence requires the caller's
-    /// `ctx.global_body` to be live).
+    /// `ctx.global_body` to be live); bit 2 = the callee's inline attempt had been made; bit 3 =
+    /// the frame fits a pooled record; bits 4-6 = [`CALL_IC_NEEDS_ENV`],
+    /// [`CALL_IC_LEXICAL_THIS`] and [`CALL_IC_SCOPED_NATIVE`]; bit 7 =
+    /// [`CALL_IC_DIRECT_READY`], all of the sequence's static gates at once.
     pub direct: u8,
     /// `Rc::as_ptr` of the callee's `ast::Function` (alive while the callee object is: `call`
     /// is never reassigned) — the inline-recompile trigger needs the AST.
@@ -1019,6 +1022,14 @@ pub const CALL_IC_LEXICAL_THIS: u8 = 32;
 /// The native address has the scoped callback signature. Bit 0 stays clear, so emitted
 /// compiled-entry gates retain their existing helper route. Such entries have no intrinsic.
 pub const CALL_IC_SCOPED_NATIVE: u8 = 64;
+
+/// [`CallIc::direct`] bit 7: every static gate of the ARM64 direct-call sequence passes. The
+/// entry is compiled user code (bit 0) whose frame fits a pooled record (bit 3) and that needs
+/// no global body (bit 1 clear), and its `this` binding needs no receiver check (the body reads
+/// no `this`, or it is strict). The sequence tests this one bit; only an entry without it takes
+/// the gates one by one.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub const CALL_IC_DIRECT_READY: u8 = 128;
 
 #[cfg(all(test, feature = "embed"))]
 thread_local! {
@@ -20660,6 +20671,9 @@ impl Chunk {
             let (_, n_slots) = self.jit_frame();
             if n_slots + code.max_stack <= crate::jit::FRAME_BUF {
                 f |= 8;
+            }
+            if f & (1 | 2 | 8) == (1 | 8) && (!self.needs_frame_this() || self.jit_is_strict()) {
+                f |= CALL_IC_DIRECT_READY;
             }
         }
         #[cfg(not(all(
