@@ -1159,15 +1159,17 @@ pub struct InlineTarget {
 }
 
 /// Invalidated before native code is reclaimed and when a function gains its
-/// second-stage compile. Every raw call/construct/overflow probe requires the
-/// current non-sentinel value, so stale executable/landing pointers are never read.
+/// second-stage compile. A raw call/construct/overflow probe matches only an entry of the
+/// current value, and no cache records the exhausted value (u32::MAX), so stale
+/// executable/landing pointers are never read.
 pub static CALL_IC_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[cfg(feature = "architecture-diagnostics")]
 #[path = "call_cache_diagnostics.rs"]
 pub(crate) mod call_cache_diagnostics;
 
 /// Exhaustion permanently disables raw call caches instead of admitting a
-/// repeated generation after code has been reclaimed. All probes reject MAX.
+/// repeated generation after code has been reclaimed: the fills refuse u32::MAX, so no probe
+/// matches once the epoch reaches it.
 #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
 pub(crate) fn invalidate_call_caches() {
     #[cfg(feature = "architecture-diagnostics")]
@@ -1333,15 +1335,26 @@ impl CallSite {
         for (way, e) in self.entries.iter().enumerate() {
             if e.get().callee == ic.callee {
                 pins[way] = pin;
-                e.set(ic);
+                self.store(way, ic);
                 return None;
             }
         }
         let k = self.next.get() as usize & 3;
         pins[k] = pin;
-        let evicted = self.entries[k].replace(ic);
+        let evicted = self.store(k, ic);
         self.next.set((k as u8 + 1) & 3);
         (evicted.callee != 0).then_some(evicted)
+    }
+    /// Write way `way`, returning what it held. The call probe compares a way's epoch with the
+    /// live one and nothing more, so no way may record the exhausted generation (see
+    /// `invalidate_call_caches`): `fill` refuses it, and debug builds check every write.
+    fn store(&self, way: usize, ic: CallIc) -> CallIc {
+        debug_assert_ne!(
+            ic.epoch,
+            u32::MAX,
+            "a call-cache way recorded the exhausted epoch"
+        );
+        self.entries[way].replace(ic)
     }
 }
 
@@ -1441,6 +1454,12 @@ impl CallOverflow {
     }
 
     fn insert_entry(&mut self, entry: CallOverflowEntry) {
+        // The overflow probe matches epochs as the call probe does (see `CallSite::store`).
+        debug_assert_ne!(
+            entry.call.epoch,
+            u32::MAX,
+            "an overflow entry recorded the exhausted epoch"
+        );
         let set =
             &mut self.sets.as_mut().unwrap()[Self::set_index(entry.call.callee, self.hash_shift)];
         // An epoch/realm refill replaces the same callee, rather than consuming another way.
@@ -19885,6 +19904,10 @@ impl Chunk {
     /// outlives its JIT code).
     pub(crate) fn jit_call_cache_ptr(&self, idx: u32) -> usize {
         self.call_caches[idx as usize].entries.as_ptr() as usize
+    }
+    #[cfg(test)]
+    pub(crate) fn test_call_site(&self, idx: u32) -> &CallSite {
+        &self.call_caches[idx as usize]
     }
     #[cfg(test)]
     pub(crate) fn cached_call_for(&self, callee: usize) -> Option<CallIc> {

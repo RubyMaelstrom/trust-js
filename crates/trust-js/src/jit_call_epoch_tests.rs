@@ -1,7 +1,7 @@
 //! Exact native call-cache exhaustion proof. ECMA-262 e28783d5 §9.4/[[Call]]:
 //! changing a predicate must preserve the live callee/Realm and safe fallback.
 use super::*;
-use crate::bytecode::{CallIc, CallOverflow, Tier, CALL_IC_EPOCH, CALL_IC_WAYS};
+use crate::bytecode::{CallIc, Tier, CALL_IC_EPOCH, CALL_IC_WAYS};
 use crate::value::ValueView;
 use crate::value::{Callable, Object};
 use std::cell::Cell;
@@ -157,20 +157,14 @@ fn call_probe(engine: &mut crate::Engine, chunk: &Chunk) -> (ExecutableBuffer, u
             }),
         },
     );
-    let words = a.finish();
-    assert_eq!(
-        words.iter().filter(|&&word| word == 0x3100_05ff).count(),
-        1,
-        "actual call emitter must contain exactly one CMN W15 guard"
-    );
-    (executable(words), cache)
+    (executable(a.finish()), cache)
 }
 
 #[test]
 fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     // The epoch is process-global and may not be restored after exhaustion. Isolate
     // this test so parallel GC/cache tests cannot change its boundary observations.
-    const CHILD: &str = "TRUST_JS_TEST_CALL_EPOCH_CMN_CHILD";
+    const CHILD: &str = "TRUST_JS_TEST_CALL_EPOCH_MAX_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::call_epoch_tests::call_epoch_native_primary_and_overflow_permanently_miss_at_max", "--test-threads=1"])
@@ -237,47 +231,60 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
             "real overflow hit at {epoch}"
         );
     }
-    // Forge an otherwise matching MAX entry: real producers refuse these, but a
-    // consumer must still reject MAX BEFORE using any cached raw addresses.
+    // Exhaustion: the epoch stays at u32::MAX. A way or overflow entry of the generation before
+    // it no longer matches, and the probe falls through every cache to the generic call (H_CALL,
+    // with w15 still the live epoch).
     crate::bytecode::invalidate_call_caches();
     assert_eq!(CALL_IC_EPOCH.load(Relaxed), u32::MAX);
     cells[0].set(CallIc {
-        epoch: u32::MAX,
+        epoch: u32::MAX - 1,
         ..seed
     });
     assert_eq!(
         invoke(&mut context),
         (1, u32::MAX as usize),
-        "primary must take pre-probe fallback"
+        "a way of the generation before exhaustion misses"
     );
     cells[0].set(CallIc::EMPTY);
-    let set = ((key as u64).wrapping_mul(crate::bytecode::CALL_OVERFLOW_HASH)
-        >> engine.interp.call_overflow.hash_shift) as usize;
-    // Build exclusively machine-readable backing with a deliberately matching MAX
-    // entry. Never mutate through a pointer derived from the real shared table and
-    // never create/drop Rust CallOverflowSet/Weak values from synthetic bytes.
-    let count = 1usize << (64 - engine.interp.call_overflow.hash_shift);
-    let mut forged = vec![0usize; count * CallOverflow::SET_STRIDE / size_of::<usize>()];
-    unsafe {
-        forged
-            .as_mut_ptr()
-            .cast::<u8>()
-            .add(set * CallOverflow::SET_STRIDE)
-            .cast::<CallIc>()
-            .write(CallIc {
+    // No cache records the exhausted generation, which is what lets the probe compare epochs
+    // without testing for it: the site's fill and the overflow cache's insert refuse it.
+    let site = chunk.test_call_site(cache);
+    assert!(site
+        .fill(
+            CallIc {
                 epoch: u32::MAX,
                 ..seed
-            });
-    }
-    let original_sets = engine.interp.call_overflow.raw_sets;
-    engine.interp.call_overflow.raw_sets = forged.as_ptr().cast();
+            },
+            None
+        )
+        .is_none());
+    assert!(
+        cells.iter().all(|way| way.get().callee == 0),
+        "the site's fill refuses the exhausted epoch"
+    );
+    // An accepted insert would replace the same callee's entry of the generation before.
+    engine.interp.call_overflow.insert(
+        CallIc {
+            epoch: u32::MAX,
+            ..seed
+        },
+        crate::value::Gc::downgrade(&object),
+    );
+    assert!(
+        engine
+            .interp
+            .call_overflow
+            .lookup(key, realm, u32::MAX - 1)
+            .is_some(),
+        "the overflow cache refuses the exhausted epoch"
+    );
     for _ in 0..4 {
         crate::bytecode::invalidate_call_caches();
         assert_eq!(CALL_IC_EPOCH.load(Relaxed), u32::MAX);
         assert_eq!(
             invoke(&mut context),
             (1, u32::MAX as usize),
-            "overflow must take pre-probe fallback"
+            "every cache misses at the exhausted epoch"
         );
         assert!(engine
             .interp
@@ -285,7 +292,6 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
             .lookup(key, realm, u32::MAX)
             .is_none());
     }
-    engine.interp.call_overflow.raw_sets = original_sets;
     // Owners carry no count: the probe leaves the callee's operand word and cell
     // intact, which a collection (and, in debug builds, its heap verifier) confirms.
     assert!(

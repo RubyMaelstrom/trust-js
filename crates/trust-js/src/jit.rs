@@ -6712,10 +6712,9 @@ fn emit_call_inline_marked(
             // compared in line; the rest in the chunk's shared stub (`emit_call_ways`).
             a.mov_imm64(12, ic0 as u64);
             a.ldr_imm(11, 19, CALL_IC_EPOCH_OFF);
+            // LDR W15 zero-extends the u32 epoch: compare it with W arithmetic, preserve X15.
+            // An exhausted generation (u32::MAX) matches no entry: no cache records it.
             a.ldr_w_imm(15, 11, 0);
-            // LDR W15 zero-extends the u32 epoch: use W arithmetic, preserve X15.
-            a.cmn_imm_w(15, 1);
-            a.b_cond(C_EQ, slow); // exhausted generations are never raw-cache proofs
             a.ldr_imm(17, 19, 64); // ctx.genv
             let l_rest = a.new_label();
             let l_hit = a.new_label();
