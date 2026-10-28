@@ -22604,16 +22604,28 @@ unsafe fn jit_call_hit_native(
             }
         }
         let nf: crate::value::NativeFn = std::mem::transmute(native as *const ());
-        // The exact builtin is proven: when its class runs no author code for these operands,
-        // it runs on them directly, without an arbitrary native's call boundary.
-        match i.call_native_light(nf, intrinsic, this_slot, args_ptr, argc) {
-            Some(r) => {
-                note_call_path(CallPath::NativeLight);
-                r
-            }
-            None => {
-                note_call_path(CallPath::NativeBoundary);
-                i.call_native_committed(nf, this_slot, args_ptr, argc)
+        if intrinsic == INTRINSIC_OPERAND_ONLY {
+            // The collections' methods run no author code for any operands and read no
+            // construct state: they run on the operands directly, as before the light classes.
+            let this = if with_this {
+                sp.sub(argc + 2).read()
+            } else {
+                Value::Undefined
+            };
+            crate::execution_storage::with_borrowed_values(args_ptr, argc, |args| nf(i, this, args))
+                .map_err(Abrupt::Throw)
+        } else {
+            // The exact builtin is proven: when its class runs no author code for these operands,
+            // it runs on them directly, without an arbitrary native's call boundary.
+            match i.call_native_light(nf, intrinsic, this_slot, args_ptr, argc) {
+                Some(r) => {
+                    note_call_path(CallPath::NativeLight);
+                    r
+                }
+                None => {
+                    note_call_path(CallPath::NativeBoundary);
+                    i.call_native_committed(nf, this_slot, args_ptr, argc)
+                }
             }
         }
     };
