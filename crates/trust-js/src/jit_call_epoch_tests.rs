@@ -195,6 +195,9 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     context.0[offset_of!(JitCtx, interp) / size_of::<usize>()] =
         &mut *engine.interp as *mut _ as usize;
     context.0[offset_of!(JitCtx, genv) / size_of::<usize>()] = realm;
+    // The probe loads the live epoch through the record's pointer to it.
+    context.0[offset_of!(JitCtx, call_ic_epoch) / size_of::<usize>()] =
+        crate::bytecode::CALL_IC_EPOCH.as_ptr() as usize;
     let slow = helper(1);
     let hit = helper(2);
     let mut helpers = [0usize; N_HELPERS];

@@ -26302,6 +26302,7 @@ mod return_slot_tests {
             slots: std::ptr::null_mut(),
             inline_ic_safe: std::ptr::null(),
             strict_flag: std::ptr::null_mut(),
+            call_ic_epoch: std::ptr::null(),
             env_raw: std::ptr::null(),
             this_word: (Value::Undefined),
             global_body: std::ptr::null(),

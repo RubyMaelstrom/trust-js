@@ -1824,12 +1824,20 @@ pub struct JitCtx {
     /// restores it. The flag lies beyond a byte load's 12-bit offset from the interpreter, so
     /// the pointer saves the address arithmetic.
     pub(crate) strict_flag: *mut bool,
+    /// Points at [`crate::bytecode::CALL_IC_EPOCH`], written once with the interpreter-constant
+    /// fields: the call template's inline probe loads the live epoch through it (one load, where
+    /// the static's address took three instructions to build).
+    pub(crate) call_ic_epoch: *const u32,
 }
 
 /// Byte offset of [`JitCtx::strict_flag`], loaded by every prologue and epilogue (an 8-byte
 /// `LDR` immediate).
 const STRICT_FLAG_OFF: u32 = std::mem::offset_of!(JitCtx, strict_flag) as u32;
 const _: () = assert!(STRICT_FLAG_OFF.is_multiple_of(8) && STRICT_FLAG_OFF / 8 < 4096);
+
+/// Byte offset of [`JitCtx::call_ic_epoch`] (an 8-byte `LDR` immediate in the call template).
+const CALL_IC_EPOCH_OFF: u32 = std::mem::offset_of!(JitCtx, call_ic_epoch) as u32;
+const _: () = assert!(CALL_IC_EPOCH_OFF.is_multiple_of(8) && CALL_IC_EPOCH_OFF / 8 < 4096);
 
 // The activation's `this`. Rust reads and writes it only here.
 impl JitCtx {
@@ -1913,6 +1921,7 @@ impl crate::gc_trace::GcTrace for JitCtx {
             accessor_holder: _, // consumed before any JavaScript runs
             accessor_slot: _,
             strict_flag: _,
+            call_ic_epoch: _,
         } = self;
         this_word.trace_gc(sink);
         ret.trace_gc(sink);
@@ -6711,7 +6720,7 @@ fn emit_call_inline_marked(
             // helper on every call that isn't way 1): x12 = entry cursor,
             // w14 = ways left, w15 = live epoch, x17 = ctx.genv.
             a.mov_imm64(12, ic0 as u64);
-            a.mov_imm64(11, &crate::bytecode::CALL_IC_EPOCH as *const _ as u64);
+            a.ldr_imm(11, 19, CALL_IC_EPOCH_OFF);
             a.ldr_w_imm(15, 11, 0);
             // LDR W15 zero-extends the u32 epoch: use W arithmetic, preserve X15.
             a.cmn_imm_w(15, 1);
@@ -17878,6 +17887,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         slots: slots.as_ptr().cast_mut(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
         strict_flag: &mut i.strict as *mut bool,
+        call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         env_raw: Env::as_ptr(env) as *const u8,
         this_word: *this_val,
         global_body: jit_global_body(i, code),
@@ -18043,6 +18053,7 @@ pub fn run(
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         strict_flag: &mut i.strict as *mut bool,
+        call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         n_slots,
         handlers: Vec::new(),
         activation: None,
@@ -18165,6 +18176,7 @@ impl JitFrame {
                 slots,
                 inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
                 strict_flag: &mut i.strict as *mut bool,
+                call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
                 env_raw: std::ptr::null(),
                 this_word: (Value::Undefined),
                 global_body: std::ptr::null(),
@@ -18521,6 +18533,7 @@ unsafe fn run_moved_oversized(
         slots: slots_ptr,
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         strict_flag: &mut i.strict as *mut bool,
+        call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         n_slots,
         handlers: Vec::new(),
         activation: None,
