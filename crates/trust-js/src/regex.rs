@@ -1302,17 +1302,6 @@ impl OneByteNativeProgram {
             .saturating_mul(std::mem::size_of::<OneByteNativeOp>())
     }
 
-    #[cfg(test)]
-    fn find<S: OneByteSubject + ?Sized>(
-        &self,
-        subject: &S,
-        start: usize,
-        sticky: bool,
-        control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<(usize, usize)> {
-        self.find_interpreted(subject, start, sticky, control)
-    }
-
     fn find_ascii(
         &self,
         subject: &[u8],
@@ -9593,16 +9582,22 @@ mod internal_engine_diagnostics {
         let control = crate::RuntimeInterrupt::default();
         let text = crate::lstr::LStr::from("xxaXcyy");
 
+        // The pattern's own threshold: `TRUST_JS_REGEXP_TIER_UP_AT` may lower the default, or
+        // turn the tier off (0), when there is no tier-up to test.
+        let threshold = re.tier_up_at;
+        if threshold == 0 {
+            return;
+        }
         assert_eq!(re.tier_feedback(), (0, 0, false, false));
-        for _ in 0..(super::REGEXP_TIER_UP_THRESHOLD - 1) {
+        for _ in 0..(threshold - 1) {
             assert_eq!(
                 re.exec_polled(&text, 0, &control).unwrap().unwrap()[0],
                 Some((2, 5))
             );
         }
         let (ticks, shapes, attempted, native) = re.tier_feedback();
-        assert_eq!(ticks, super::REGEXP_TIER_UP_THRESHOLD - 1);
-        assert_ne!(shapes & super::SUBJECT_ONE_BYTE, 0);
+        assert_eq!(ticks, threshold - 1);
+        assert_eq!(shapes & super::SUBJECT_ONE_BYTE != 0, threshold > 1);
         assert!(!attempted);
         assert!(!native);
 
@@ -9611,7 +9606,7 @@ mod internal_engine_diagnostics {
             Some((2, 5))
         );
         let (ticks, _, attempted, native) = re.tier_feedback();
-        assert_eq!(ticks, super::REGEXP_TIER_UP_THRESHOLD);
+        assert_eq!(ticks, threshold);
         assert!(attempted);
         assert!(native);
 
@@ -9855,7 +9850,7 @@ mod internal_engine_diagnostics {
                         }
                     }
                     for start in 0..=subject.len() {
-                        let fast = native.find(subject, start, sticky, &control);
+                        let fast = native.find_ascii(subject, start, sticky, &control);
                         let reference = re.find_impl(subject, start, &control);
                         assert_eq!(
                             fast, reference,
@@ -9886,7 +9881,7 @@ mod internal_engine_diagnostics {
                         [super::OneByteNativeOp::Many { .. }]
                     ));
                     for start in 0..=subject.len() {
-                        let fast = native.find(subject, start, sticky, &control);
+                        let fast = native.find_ascii(subject, start, sticky, &control);
                         let reference = re.find_impl(subject, start, &control);
                         assert_eq!(
                             fast, reference,
@@ -9903,7 +9898,7 @@ mod internal_engine_diagnostics {
         let native = super::OneByteNativeProgram::compile(&re.prog, re.multiline)
             .expect("one-byte non-ASCII terminal Many must compile");
         for start in 0..=subject.len() {
-            let fast = native.find(subject, start, false, &control);
+            let fast = native.find_ascii(subject, start, false, &control);
             let reference = re.find_impl(subject, start, &control);
             assert_eq!(
                 fast, reference,
@@ -9928,7 +9923,7 @@ mod internal_engine_diagnostics {
         let long = vec![b'a'; super::INTERRUPT_POLL_MASK + 1];
         let native = super::OneByteNativeProgram::compile(&re.prog, re.multiline).unwrap();
         assert!(matches!(
-            native.find(&long[..], 0, false, &interrupted),
+            native.find_ascii(&long[..], 0, false, &interrupted),
             Err(super::MatchError::Interrupted(
                 crate::InterruptReason::Cancelled
             ))
