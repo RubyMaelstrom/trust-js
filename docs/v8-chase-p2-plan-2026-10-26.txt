@@ -558,6 +558,26 @@ does (Order, step 0).
 19. ShadowRealm code is interruptible by the host, as in V8 (2026-10-28): a ShadowRealm's
     interpreter shares its creator's interrupt handle, and an interruption passes through
     `evaluate` instead of becoming a TypeError.
+20. W3 item 3's design (2026-10-28, on its design note's open questions):
+    a. Step 1 first: a callee that needs an environment builds it in its prologue on today's
+       representation; the representation change follows as its own series.
+    b. The environment record keeps every binding in line, in a cell its scope descriptor sizes,
+       as V8, SpiderMonkey and JSC do.
+    c. Captured parameters: the helper copies them during step 1, and generated stores take over
+       as soon as bindings are fixed slots.
+    d. Every ARM64 call site passes the argument count (one instruction), as V8 does.
+    e. `arguments` and rest arrays are elided when a compile-time proof shows every use is a
+       length or element read (no run-time placeholder): a formal's index reads the parameter
+       slot, an out-of-range read goes through the prototype. The exemplars leave this to their
+       optimizing tiers; TRust JS has one native tier.
+    f. Mapped arguments alias environment slots (step 7), as all three engines do; the side
+       table goes.
+    g. TDZ checks on a function's own captured lexicals are elided after the first in each
+       basic block, as SpiderMonkey does; inner functions keep theirs.
+    h. Derived constructors and instance elements are a series of their own, after item 1b's
+       full form (new.target in the frame record).
+21. Captured names resolve statically, as (hops, slot) with guards only under sloppy direct eval
+    and `with` (2026-10-28): a new item after item 3's representation change.
 
 ## Non-goals
 
