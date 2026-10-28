@@ -270,6 +270,11 @@ comment/example in the same change.
   Otherwise, for a pattern that begins with a greedy loop of unbounded count (as `/\s+$/` and
   `/[\w+\-.]+:/` do), it resumes where that loop's first run ended: no start inside the run can
   match.
+- `TRUST_JS_REGEXP_NO_ASSERTION_FILTER=1` gives patterns whose paths may begin with an
+  assertion other than `^` no first-element filter: exec then tries every start. Otherwise a path
+  that begins with `$` may begin only at the input's end or, in multiline mode, before a line
+  terminator (as in `/$/m` and trimming's `/^\s*|\s*$/g`), and one that begins with `\b`, `\B`
+  or a lookaround only where the path after it may.
 - `TRUST_JS_REGEXP_NO_SIMD=1` keeps the subject scans (for the prefilter's literal, and for a
   match's first element by byte or by table) on their portable loops instead of AArch64 vector
   code.

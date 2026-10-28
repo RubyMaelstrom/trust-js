@@ -249,6 +249,8 @@ fn regexp_census_features(re: &Regex) -> String {
         (re.prefilter.is_some(), " prefilter"),
         (re.single.is_some(), " single"),
         (re.lead_run, " lead-run"),
+        (re.first_line_start, " first-line-start"),
+        (re.first_at_end, " first-at-end"),
         (
             re.literal_ascii.is_some() || re.literal_fold.is_some(),
             " literal",
@@ -472,6 +474,8 @@ pub struct Regex {
     first_ascii: Option<AsciiSet>,
     /// Besides the [`FirstFilter::Atoms`], a match may begin wherever `^` holds.
     first_line_start: bool,
+    /// Besides the [`FirstFilter::Atoms`], a match may begin at the input's end, where `$` holds.
+    first_at_end: bool,
     /// A literal every match contains, which exec scans for before running the matcher.
     prefilter: Option<Box<Prefilter>>,
     /// The one element every match is, when the program is `Save(0), X, Save(1), Match` for a
@@ -1512,21 +1516,29 @@ enum FirstFilter {
     /// Every path first asserts `^` in non-multiline mode: a match can only begin at position 0,
     /// so one attempt decides the whole scan.
     Anchored,
-    /// Every path begins by consuming one element matching one of these atoms; positions whose
-    /// element matches none can be skipped without entering the backtracker. The predicate is a
-    /// superset of what the matcher accepts, so a pass is never wrong — only a reject is binding.
+    /// Every path begins at an element matching one of these atoms (the first element it
+    /// consumes, or the line terminator before which a multiline `$` holds), but for paths that
+    /// begin where `^` or a non-multiline `$` holds (see `Regex::first_line_start` and
+    /// `Regex::first_at_end`); positions whose element matches none can be skipped without
+    /// entering the backtracker. The predicate is a superset of what the matcher accepts, so a
+    /// pass is never wrong — only a reject is binding.
     Atoms(Vec<Rep>),
 }
 
 /// Compute the [`FirstFilter`] by ε-walking the program from its entry: through saves, jumps,
 /// splits, capture clears and marks, collecting the first thing each path does. A path that
-/// begins with `^` can only begin where `^` holds; the returned flag says such paths exist, so a
-/// match may also begin at the start of the input (or of a line, in multiline mode), as in
-/// `(^|\s)name`. Anything else not modelled (other assertions, backrefs, lookarounds, inline flags,
-/// or an ε-reachable `Match` — an empty-matchable pattern) disables the filter.
-fn first_filter(prog: &[Inst], multiline: bool) -> (FirstFilter, bool) {
+/// begins with `^` can only begin where `^` holds; the first returned flag says such paths exist,
+/// so a match may also begin at the start of the input (or of a line, in multiline mode), as in
+/// `(^|\s)name`. With `assertions`, a path that begins with `$` can only begin at the input's end,
+/// the second flag, or in multiline mode at a line terminator, which joins the atoms, as in
+/// `\s*$`; and `\b`, `\B` and lookarounds, which only narrow where the path after them begins,
+/// are walked through. Anything else not modelled (backrefs, inline flags, or an ε-reachable
+/// `Match` — an empty-matchable pattern) disables the filter.
+/// `TRUST_JS_REGEXP_NO_ASSERTION_FILTER=1` gives up on assertions other than `^` too.
+fn first_filter(prog: &[Inst], multiline: bool, assertions: bool) -> (FirstFilter, bool, bool) {
     let mut atoms: Vec<Rep> = Vec::new();
     let mut asserts = 0usize;
+    let mut at_end = false;
     let mut stack = vec![0usize];
     let mut seen = vec![false; prog.len()];
     while let Some(pc) = stack.pop() {
@@ -1572,20 +1584,40 @@ fn first_filter(prog: &[Inst], multiline: bool) -> (FirstFilter, bool) {
                 }
             }
             Inst::AssertStart => asserts += 1,
-            _ => return (FirstFilter::None, false),
+            Inst::AssertEnd if assertions => {
+                at_end = true;
+                if multiline {
+                    atoms.push(line_terminator_atom());
+                }
+            }
+            Inst::WordBoundary(_) | Inst::Look { .. } | Inst::LookBehind { .. } if assertions => {
+                stack.push(pc + 1)
+            }
+            _ => return (FirstFilter::None, false, false),
         }
     }
     if asserts > 0 {
-        if atoms.is_empty() && !multiline {
-            (FirstFilter::Anchored, false)
+        if atoms.is_empty() && !multiline && !at_end {
+            (FirstFilter::Anchored, false, false)
         } else {
-            (FirstFilter::Atoms(atoms), true)
+            (FirstFilter::Atoms(atoms), true, at_end)
         }
-    } else if !atoms.is_empty() {
-        (FirstFilter::Atoms(atoms), false)
+    } else if !atoms.is_empty() || at_end {
+        (FirstFilter::Atoms(atoms), false, at_end)
     } else {
-        (FirstFilter::None, false)
+        (FirstFilter::None, false, false)
     }
+}
+
+/// The line terminators, where a multiline `$` holds, as a [`FirstFilter`] atom.
+fn line_terminator_atom() -> Rep {
+    Rep::Class(Rc::new(clone_class(&CharClass {
+        negate: false,
+        ranges: LINE_TERMINATOR_ELEMENTS.to_vec(),
+        builtins: Vec::new(),
+        props: Vec::new(),
+        ascii_lut: None,
+    })))
 }
 
 /// The ASCII elements that may begin a match (the [`FirstFilter::Atoms`] predicate below 128) as
@@ -2748,18 +2780,6 @@ impl Regex {
         }
         // The `flags` accessor returns flags in canonical order.
         let canonical: String = "dgimsuvy".chars().filter(|c| flags.contains(*c)).collect();
-        let (first, first_line_start) = first_filter(&prog, flags.contains('m'));
-        let first_byte = if !flags.contains('i') && !first_line_start {
-            match &first {
-                FirstFilter::Atoms(atoms) if atoms.len() == 1 => match &atoms[0] {
-                    Rep::Char(c) if *c < 0x80 => Some(*c as u8),
-                    _ => None,
-                },
-                _ => None,
-            }
-        } else {
-            None
-        };
         let literal_ascii = if !flags.contains('i') && p.ngroups == 0 {
             let chars = if prog.len() >= 4
                 && matches!(prog.first(), Some(Inst::Save(0)))
@@ -2820,22 +2840,21 @@ impl Regex {
             None
         };
         let memo_string_failures = p.ngroups == 0 && program_contains_string_set(&prog);
-        let single_start = flags.contains('y') || matches!(first, FirstFilter::Anchored);
-        let prefilter = Prefilter::new(&ast, flags.contains('i'), single_start);
         let single = single_element(&prog);
         let lead_run = !env_flag!("TRUST_JS_REGEXP_NO_RUN_SKIP") && leading_run(&prog);
         let mut re = Regex {
             unicode,
             nmarks: lowering.marks,
-            first,
-            first_byte,
+            first: FirstFilter::None,
+            first_byte: None,
             literal_ascii,
             literal_fold,
             memo_string_failures,
             first_lut: None,
             first_ascii: None,
-            first_line_start,
-            prefilter,
+            first_line_start: false,
+            first_at_end: false,
+            prefilter: None,
             single,
             lead_run,
             tier_ticks: Cell::new(0),
@@ -2861,22 +2880,47 @@ impl Regex {
             sticky: flags.contains('y'),
             names: p.names,
         };
-        let lut = if let FirstFilter::Atoms(atoms) = &re.first {
+        re.filter_starts(!env_flag!("TRUST_JS_REGEXP_NO_ASSERTION_FILTER"));
+        let single_start = re.sticky || matches!(re.first, FirstFilter::Anchored);
+        re.prefilter = Prefilter::new(&ast, re.ignore_case, single_start);
+        Ok(re)
+    }
+
+    /// Derive the first-element filter (see [`first_filter`], which `assertions` is passed to)
+    /// and the forms its scans take: an exact leading byte, a byte-indexed table and its vector
+    /// form.
+    fn filter_starts(&mut self, assertions: bool) {
+        let (first, line_start, at_end) = first_filter(&self.prog, self.multiline, assertions);
+        self.first_byte = match &first {
+            FirstFilter::Atoms(atoms)
+                if atoms.len() == 1 && !self.ignore_case && !line_start && !at_end =>
+            {
+                match &atoms[0] {
+                    Rep::Char(c) if *c < 0x80 => Some(*c as u8),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        self.first = first;
+        self.first_line_start = line_start;
+        self.first_at_end = at_end;
+        let lut = if let FirstFilter::Atoms(atoms) = &self.first {
             let mut lut = Box::new([false; 256]);
             for (c, slot) in lut.iter_mut().enumerate() {
-                *slot = re.first_matches(atoms, c as u32);
+                *slot = self.first_matches(atoms, c as u32);
             }
             Some(lut)
         } else {
             None
         };
-        if !(re.first_line_start && re.multiline) {
-            re.first_ascii = lut
-                .as_deref()
-                .map(|lut| AsciiSet::new(|element| lut[element as usize]));
-        }
-        re.first_lut = lut;
-        Ok(re)
+        self.first_ascii = if line_start && self.multiline {
+            None
+        } else {
+            lut.as_deref()
+                .map(|lut| AsciiSet::new(|element| lut[element as usize]))
+        };
+        self.first_lut = lut;
     }
 
     /// Whether the pattern has flag `flag`, one of `dgimsuvy`.
@@ -3009,13 +3053,15 @@ impl Regex {
             .as_ref()
             .filter(|_| (from > 0 || !self.first_line_start) && end - from >= 16 && regexp_simd())
         {
-            return input.find_viable(
+            let found = input.find_viable(
                 from,
                 len.min(end + 1),
                 set,
                 |c| self.first_viable(atoms, c),
                 control,
-            );
+            )?;
+            // The vector scan stops short of the input's end, where `$` may begin a match.
+            return Ok(found.or((self.first_at_end && end >= len).then_some(len)));
         }
         let mut at = from;
         loop {
@@ -3047,12 +3093,19 @@ impl Regex {
     }
 
     /// Whether a path may begin at `at` by the [`FirstFilter::Atoms`]: its element passes, or a
-    /// path through `^` begins there (where `^` may also match the input's empty end).
+    /// path through `^` begins there (where `^` may also match the input's empty end), or one
+    /// through `$` at the input's end.
     #[inline]
     fn atom_start<I: ReInput>(&self, input: I, atoms: &[Rep], at: usize) -> bool {
-        (at < input.len() && self.first_viable(atoms, input.next_elem(at).0))
-            || (self.first_line_start
-                && (at == 0 || (self.multiline && is_line_terminator_u32(input.at(at - 1)))))
+        if at < input.len() {
+            if self.first_viable(atoms, input.next_elem(at).0) {
+                return true;
+            }
+        } else if self.first_at_end {
+            return true;
+        }
+        self.first_line_start
+            && (at == 0 || (self.multiline && is_line_terminator_u32(input.at(at - 1))))
     }
 
     /// [`Self::exec_at`], first polling for host interruption as an execution entry does.
@@ -8445,6 +8498,174 @@ mod internal_engine_diagnostics {
                 }
             }
         }
+    }
+
+    /// The shape of `re`'s first-element filter: `none`, `anchored`, or `atoms:N`, with `+line`
+    /// and `+end` when paths also begin where `^` or `$` holds.
+    fn filter_shape(re: &super::Regex) -> String {
+        let mut shape = match &re.first {
+            super::FirstFilter::None => "none".to_string(),
+            super::FirstFilter::Anchored => "anchored".to_string(),
+            super::FirstFilter::Atoms(atoms) => format!("atoms:{}", atoms.len()),
+        };
+        if re.first_line_start {
+            shape.push_str("+line");
+        }
+        if re.first_at_end {
+            shape.push_str("+end");
+        }
+        shape
+    }
+
+    #[test]
+    fn assertion_led_programs_filter_their_starts() {
+        for (pattern, flags, with, without) in [
+            // `$` holds at the input's end and, in multiline mode, before a line terminator.
+            ("$", "", "atoms:0+end", "none"),
+            ("$", "m", "atoms:1+end", "none"),
+            (r"\s*$", "", "atoms:1+end", "none"),
+            (r"\s+$", "", "atoms:1", "atoms:1"),
+            (r"$|x", "", "atoms:1+end", "none"),
+            (r"^\s*|\s*$", "", "atoms:1+line+end", "none"),
+            ("^|$", "", "atoms:0+line+end", "none"),
+            ("^|$", "m", "atoms:1+line+end", "none"),
+            ("^a", "", "anchored", "anchored"),
+            ("^a", "m", "atoms:0+line", "atoms:0+line"),
+            // Other assertions narrow where the path after them begins.
+            (r"\b\w+\b", "", "atoms:1", "none"),
+            (r"\Bb+", "", "atoms:1", "none"),
+            (r"(?=a)\w", "", "atoms:1", "none"),
+            (r"(?<!a)b+", "", "atoms:1", "none"),
+            // A path that reaches the match through assertions alone may begin anywhere, and
+            // modifier groups are not modelled.
+            (r"\b", "", "none", "none"),
+            (r"(?=a)", "", "none", "none"),
+            (r"(?i:$)", "", "none", "none"),
+        ] {
+            let mut re = super::Regex::new(pattern, flags).unwrap();
+            re.filter_starts(true);
+            assert_eq!(filter_shape(&re), with, "/{pattern}/{flags}");
+            re.filter_starts(false);
+            assert_eq!(
+                filter_shape(&re),
+                without,
+                "/{pattern}/{flags} without assertions"
+            );
+        }
+    }
+
+    #[test]
+    fn assertion_filters_admit_every_start_that_matches() {
+        use super::ReInput;
+        let patterns = [
+            "$",
+            r"\s*$",
+            r"\s+$",
+            r"^\s*|\s*$",
+            "^|$",
+            r"$|x",
+            r"a*$",
+            r"[ab]*$",
+            r"\b\w+\b",
+            r"\b",
+            r"\Bb+",
+            r"(?=a)\w",
+            r"(?!a)\w+",
+            r"(?<=a)b",
+            r"(?<!a)b+",
+            r"(?=\d)\w+$",
+            r"\s*(?:$|,)",
+            r"$(?<=a)",
+            r"\b(?:foo|$)",
+        ];
+        let tokens = [
+            "a",
+            "b",
+            "ab",
+            "x",
+            "1",
+            ",",
+            "foo",
+            " ",
+            "  ",
+            "\n",
+            "\r",
+            "\u{2028}",
+            "\u{3000}",
+            "\u{e9}",
+            "\u{1F600}",
+        ];
+        let mut rng = TestRng(0x2545_f491_4f6c_dd1d);
+        let subjects: Vec<String> = (0..40)
+            .map(|_| {
+                let count = rng.below(9);
+                (0..count)
+                    .map(|_| tokens[rng.below(tokens.len())])
+                    .collect()
+            })
+            // Long subjects cross the vector scan's sixteen-element steps; those with no element a
+            // path may begin at leave the scan to find the input's end.
+            .chain([
+                "".to_string(),
+                format!("{} ab  \n", "x".repeat(40)),
+                "x".repeat(40),
+                format!("{}ab", "y".repeat(33)),
+                format!("{}\u{e9}", "z".repeat(30)),
+            ])
+            .collect();
+        let control = crate::RuntimeInterrupt::default();
+        let mut matches = 0;
+        for pattern in patterns {
+            for flags in ["", "g", "y", "i", "m", "u", "s", "my", "mu", "iu"] {
+                let mut filtered = super::Regex::new(pattern, flags).unwrap();
+                filtered.filter_starts(true);
+                // Every start tried.
+                let mut plain = super::Regex::new(pattern, flags).unwrap();
+                plain.first = super::FirstFilter::None;
+                plain.first_byte = None;
+                plain.first_lut = None;
+                plain.first_ascii = None;
+                plain.first_line_start = false;
+                plain.first_at_end = false;
+                for subject in &subjects {
+                    let units: Vec<u16> = subject.encode_utf16().collect();
+                    let paired = super::Paired(&units);
+                    for start in 0..=units.len() + 1 {
+                        let (found, reference) = if filtered.unicode {
+                            let start = paired.boundary(start);
+                            (
+                                filtered.exec_impl(paired, start, &control),
+                                plain.exec_impl(paired, start, &control),
+                            )
+                        } else {
+                            (
+                                filtered.exec_impl(&units[..], start, &control),
+                                plain.exec_impl(&units[..], start, &control),
+                            )
+                        };
+                        matches += usize::from(matches!(reference, Ok(Some(_))));
+                        assert_eq!(
+                            found.map(|c| c.map(|c| c.to_vec())),
+                            reference.map(|c| c.map(|c| c.to_vec())),
+                            "/{pattern}/{flags} at {start} in {subject:?}"
+                        );
+                    }
+                    if subject.is_ascii() {
+                        let bytes = subject.as_bytes();
+                        for start in 0..=bytes.len() + 1 {
+                            let found = filtered.exec_impl(bytes, start, &control);
+                            let reference = plain.exec_impl(bytes, start, &control);
+                            assert_eq!(
+                                found.map(|c| c.map(|c| c.to_vec())),
+                                reference.map(|c| c.map(|c| c.to_vec())),
+                                "/{pattern}/{flags} at {start} in bytes {subject:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(matches > 1000, "{matches} matches");
     }
 
     #[test]

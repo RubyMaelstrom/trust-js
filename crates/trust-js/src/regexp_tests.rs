@@ -355,6 +355,61 @@ fn scans_resume_past_failed_leading_runs_as_node_does() {
     );
 }
 
+/// Patterns whose paths begin with `$`, `^`, `\b`, `\B` or a lookaround find the starts Node
+/// (v24.22.0) finds: at line terminators and the input's end for `$`, with sticky and global
+/// `lastIndex` starts, loops before `$`, trimming, and two-byte and surrogate subjects.
+#[test]
+fn assertion_led_patterns_match_as_node_does() {
+    check(
+        r##"
+        function show(m) { return m === null ? null : [m.index].concat(Array.prototype.slice.call(m)); }
+        function at(re, s, i) { re.lastIndex = i; var m = re.exec(s); return [show(m), re.lastIndex]; }
+        JSON.stringify([
+            // `$` alone, in and out of multiline mode: line terminators and the input's end.
+            show(/$/m.exec("a\nb")),
+            "a\nb\n".replace(/$/gm, "!"),
+            "a\r\nb".replace(/$/gm, "!"),
+            show(/$/m.exec("a\u2028b")),
+            show(/$/.exec("ab")),
+            "".replace(/$/g, "!"),
+            "x\u{1F600}".replace(/$/gu, "!"),
+            show(/$/y.exec("ab")),
+            at(/$/y, "ab", 2),
+            at(/$/my, "a\nb", 1),
+            // Loops before `$`, and `^` alternatives: trim.
+            " a b ".replace(/^\s*|\s*$/g, ""),
+            "\u3000a\u2019 ".replace(/^\s*|\s*$/g, ""),
+            "  ".replace(/^\s*|\s*$/g, "|"),
+            "ab".replace(/^|$/g, "#"),
+            "a\nb".replace(/^|$/gm, "#"),
+            show(/\s*$|q/.exec("aq  ")),
+            show(/[ab]*$/.exec("xab")),
+            show(/a*$/m.exec("aa\nb")),
+            show(/\s*$/y.exec("a ")),
+            at(/\s*$/g, "a b  ", 2),
+            show(/$|x/.exec("abx")),
+            // Word boundaries and lookarounds before the first element.
+            "ab".replace(/\B/g, "-"),
+            "ab cd".replace(/\b/g, "|"),
+            show(/\b\w+/.exec("  hello")),
+            show(/\Bb+/.exec("b abb")),
+            show(/(?=a)\w/.exec("xa")),
+            show(/(?!a)\w/.exec("ab")),
+            show(/(?<=a)b/.exec("cbab")),
+            "abab".replace(/(?<=a)b/g, "B"),
+            show(/(?<!a)b+/.exec("abbcb")),
+            show(/\b\w+\b/u.exec("\u{1F600}x\u{1F600}")),
+            show(/(?=\d)\w+$/.exec("a1 2b")),
+            // Two-byte and surrogate subjects.
+            show(/$/m.exec("\u00e9\r\u00e9")),
+            show(/\s*$/.exec("\ud800 \u3000")),
+            "\ud83d\ude00\n\ud800".replace(/$/gmu, "!"),
+        ])
+        "##,
+        r##"[[1,""],"a!\nb!\n!","a!\r!\nb!",[1,""],[2,""],"!","x😀!",null,[[2,""],2],[[1,""],1],"a b","a’","||","#ab#","#a#\n#b#",[1,"q"],[1,"ab"],[0,"aa"],null,[[3,"  "],5],[2,"x"],"a-b","|ab| |cd|",[2,"hello"],[3,"bb"],[1,"a"],[1,"b"],[3,"b"],"aBaB",[2,"b"],[2,"x"],[3,"2b"],[1,""],[1," 　"],"😀!\n\ud800!"]"##,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).
