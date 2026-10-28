@@ -3521,9 +3521,14 @@ pub struct Interp {
     /// milliseconds for ECMAScript `Date`. Each Window/Worker realm owns its own time origin and
     /// virtual-time anchor; a process-global callback cannot model that.
     pub(crate) wall_clock: Option<Rc<dyn Fn() -> f64>>,
+    /// The host's control handle. Replace it only through [`Interp::set_runtime_interrupt`],
+    /// which moves `poll`'s registration.
     pub(crate) runtime_interrupt: std::sync::Arc<crate::RuntimeInterrupt>,
-    /// Hot-loop poll divider. Execution tiers increment this cheaply and consult the shared
-    /// atomics/deadline only once per bounded batch.
+    /// The word this interpreter's execution polls (see `interrupt::PollWord`), whose interrupt
+    /// bit `runtime_interrupt` keeps.
+    pub(crate) poll: std::sync::Arc<crate::interrupt::PollWord>,
+    /// Native code's hot-loop poll divider: generated loops and entries increment it and consult
+    /// the shared state only once per bounded batch.
     pub(crate) interrupt_poll_tick: u32,
     /// The tree-walking evaluator's stack-gateway divider: it queries the native stack once per
     /// eight evaluations, so at least once every eight levels of nesting (see `Interp::eval`).
@@ -4023,6 +4028,7 @@ interp_memory_inventory! {
     console => "measured",
     wall_clock => "external",
     runtime_interrupt => "external",
+    poll => "external",
     interrupt_poll_tick => "non_owning",
     ast_tick => "non_owning",
     strict => "non_owning",
@@ -4210,6 +4216,7 @@ fn drop_collected_realm(mut realm: crate::agent_access::Owned<Interp>) {
 
 impl Drop for Interp {
     fn drop(&mut self) {
+        self.runtime_interrupt.unregister(&self.poll);
         // libtest exits the process before persistent runtime-worker TLS destructors run. Flush
         // the opt-in function profile when the owning Agent is destroyed so browser-workload
         // diagnostics retain their measurements; `dump` clears the TLS aggregate, preventing a
@@ -5707,6 +5714,9 @@ impl Interp {
         let global = Object::new(Some(object_proto));
         let global_env = new_var_scope(None);
         let live_object_limit = gc_heap.agent.next.get();
+        let runtime_interrupt = std::sync::Arc::<crate::RuntimeInterrupt>::default();
+        let poll = std::sync::Arc::new(crate::interrupt::PollWord::default());
+        runtime_interrupt.register(&poll);
         let mut interp = Interp {
             gc_heap: gc_heap.clone(),
             realm_id: if owns_heap {
@@ -5728,7 +5738,8 @@ impl Interp {
             error_protos: Default::default(),
             console: Vec::new(),
             wall_clock: None,
-            runtime_interrupt: Default::default(),
+            runtime_interrupt,
+            poll,
             interrupt_poll_tick: 0,
             ast_tick: 0,
             strict: false,
@@ -6943,22 +6954,35 @@ impl Interp {
             .unwrap_or(0.0)
     }
 
-    /// Poll the shared host control at a bounded hot-loop cadence.
+    /// Poll the host's control at a hot safepoint (a loop back-edge, a call): the poll word's
+    /// interrupt bit, and only while it is set the handle's reasons. A request is seen at the
+    /// next poll after it sets the bit; a deadline once the watchdog has seen it pass.
     #[inline]
-    pub(crate) fn interrupt_poll(&mut self) -> Result<(), Abrupt> {
-        self.interrupt_poll_tick = self.interrupt_poll_tick.wrapping_add(1);
-        if self.interrupt_poll_tick & 0x3fff != 0 {
+    pub(crate) fn interrupt_poll(&self) -> Result<(), Abrupt> {
+        if !self.poll.interrupt_pending() {
             return Ok(());
         }
         self.interrupt_poll_force()
     }
 
-    /// Poll without the cadence divider (script/callback entry and JIT slow poll).
+    /// Poll the handle's reasons themselves (script/callback entry and JIT slow poll): a
+    /// deadline counts from the moment it passes, before the watchdog reports it.
     pub(crate) fn interrupt_poll_force(&self) -> Result<(), Abrupt> {
         match self.runtime_interrupt.current_reason() {
             Some(reason) => Err(Abrupt::Interrupt(reason)),
             None => Ok(()),
         }
+    }
+
+    /// Answer to `interrupt` from now on: its requests set this interpreter's poll word, and the
+    /// previous handle's no longer do.
+    pub(crate) fn set_runtime_interrupt(
+        &mut self,
+        interrupt: std::sync::Arc<crate::RuntimeInterrupt>,
+    ) {
+        self.runtime_interrupt.unregister(&self.poll);
+        interrupt.register(&self.poll);
+        self.runtime_interrupt = interrupt;
     }
 
     /// Execute all currently queued promise reaction jobs synchronously.
@@ -7852,7 +7876,7 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, crate::EvalFailure> {
-        // Callback entry polls without the cadence divider, as the engine-level entry points do.
+        // Callback entry asks the handle itself, as the engine-level entry points do.
         self.interrupt_poll_force()
             .and_then(|()| self.call_callback(callee, this, args))
             .map_err(|abrupt| match abrupt {
@@ -11972,6 +11996,7 @@ impl Interp {
             console: _,
             wall_clock: _,
             runtime_interrupt: _,
+            poll: _,
             interrupt_poll_tick: _,
             ast_tick: _,
             strict: _,
@@ -12660,8 +12685,8 @@ impl Interp {
                 ));
             }
         };
-        // A call is a safepoint on the shared amortized interruption cadence, so loop-free
-        // recursion in the interpreter and bytecode tiers stays abortable (HTML §8.1.4.5).
+        // A call is a safepoint that polls the interrupt bit, so loop-free recursion in the
+        // interpreter and bytecode tiers stays abortable (HTML §8.1.4.5).
         self.interrupt_poll()?;
         // Proxy with an `apply` trap (or forward to the target).
         {

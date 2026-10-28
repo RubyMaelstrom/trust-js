@@ -702,7 +702,7 @@ impl Engine {
     /// entry script.
     pub fn new_with_interrupt(interrupt: std::sync::Arc<RuntimeInterrupt>) -> Engine {
         let mut interp = Interp::new();
-        interp.runtime_interrupt = interrupt;
+        interp.set_runtime_interrupt(interrupt);
         // V8's `NotifyBootstrapComplete`: the memory reducer measures growth from here (see
         // `gc_core::Heap::bootstrapped`).
         interp.gc_heap.core.borrow_mut().bootstrapped();
@@ -741,7 +741,7 @@ impl Engine {
     /// an owner may already have cancelled the supplied handle, in which case the first author
     /// script entry observes that cancellation immediately.
     pub fn set_interrupt_handle(&mut self, interrupt: std::sync::Arc<RuntimeInterrupt>) {
-        self.interp.runtime_interrupt = interrupt;
+        self.interp.set_runtime_interrupt(interrupt);
     }
 
     /// Run `src` as a spawned `$262.agent`: the agent may block in `Atomics.wait`, receives

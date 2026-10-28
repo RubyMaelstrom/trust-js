@@ -1688,6 +1688,7 @@ impl Interp {
             console: _,
             wall_clock: _,
             runtime_interrupt: _,
+            poll: _,
             interrupt_poll_tick: _,
             ast_tick: _,
             strict: _,

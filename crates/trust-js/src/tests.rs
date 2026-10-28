@@ -1534,8 +1534,9 @@ fn regexp_resource_exhaustion_throws_instead_of_becoming_no_match() {
 fn repeated_short_regexp_matches_amortize_but_do_not_starve_host_interruption() {
     // A native RegExp operation is force-polled by dispatch before it starts. Model cancellation
     // arriving immediately afterwards: a Rust loop of individually tiny successful matches must
-    // observe it through the shared execution cadence instead of doing an atomic read per match
-    // or postponing cancellation until the whole native operation returns.
+    // observe it through the interpreter's poll word, a plain load per match, instead of asking
+    // the handle at every match or postponing cancellation until the whole native operation
+    // returns.
     let control = std::sync::Arc::new(crate::RuntimeInterrupt::default());
     let mut engine = Engine::new();
     engine.set_interrupt_handle(control.clone());
