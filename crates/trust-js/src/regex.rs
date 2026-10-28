@@ -2613,7 +2613,9 @@ impl Regex {
     }
 
     /// Run the backtracking matcher over the starts the scan tries from `start` (`only` alone,
-    /// when it is set). `Ok(true)` leaves the match's capture slots in `scratch`.
+    /// when it is set). `Ok(true)` leaves the match's capture slots in `scratch`. In line in
+    /// its caller, as the loop was before it was split out; the matcher's run stays out of line.
+    #[inline(always)]
     fn run_matcher<I: ReInput>(
         &self,
         input: I,
@@ -6730,7 +6732,9 @@ impl<'a, I: ReInput> Matcher<'a, I> {
 
     /// Match `root` from `pos`. On success the capture slots hold the match. Backtracking state
     /// lives in `bt` (see [`Backtrack`]) and lookarounds in `looks`, so the native stack depth
-    /// is constant whatever the subject or pattern.
+    /// is constant whatever the subject or pattern. Out of line, as the scan loop around it
+    /// (`Regex::run_matcher`) is in line in its caller.
+    #[inline(never)]
     fn run(&mut self, root: &'a [Inst], pos: usize) -> bool {
         let mut prog = root;
         let mut pc = 0usize;

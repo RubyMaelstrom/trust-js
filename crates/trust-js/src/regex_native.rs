@@ -357,6 +357,7 @@ pub(super) const TIER_UP_LENGTH: usize = 1000;
 /// compile the pattern for `width` once it is hot: after the pattern's threshold of executions
 /// (`TRUST_JS_REGEXP_TIER_UP_AT`, 64 by default; 0 keeps every pattern on the matcher), or at
 /// once over a subject of [`TIER_UP_LENGTH`] units or more.
+#[inline]
 pub(super) fn note_execution(re: &Regex, width: Width, len: usize) {
     if re.tier_up_at == 0 {
         return;
@@ -366,13 +367,18 @@ pub(super) fn note_execution(re: &Regex, width: Width, len: usize) {
     if ticks < re.tier_up_at && len < TIER_UP_LENGTH {
         return;
     }
-    let cell = &re.native.codes[width.index()];
-    if cell.get().is_some() {
-        return;
+    if re.native.codes[width.index()].get().is_none() {
+        tier_up(re, width);
     }
+}
+
+/// Compile `re` for `width`, once: out of line, so that executions pay only the tests above.
+#[cold]
+#[inline(never)]
+fn tier_up(re: &Regex, width: Width) {
     let code = compile(re, width);
     super::regexp_prof_tier_up(code.is_some());
-    let _ = cell.set(code);
+    let _ = re.native.codes[width.index()].set(code);
 }
 
 /// The code to run for `input`, if the pattern has some for its width.
@@ -1337,13 +1343,10 @@ fn run_native<I: ReInput>(
     debug_assert_eq!(I::NATIVE_WIDTH, Some(code.width));
     let nslots = 2 * (re.ngroups + 1);
     let slots = slot_count(re);
-    if scratch.native_slots.len() != slots {
-        scratch.native_slots = vec![usize::MAX; slots].into_boxed_slice();
+    if scratch.native_slots.len() != slots || scratch.native_stack.capacity() < INITIAL_RECORDS {
+        prepare(scratch, slots);
     }
     let stack = &mut scratch.native_stack;
-    if stack.capacity() < INITIAL_RECORDS {
-        stack.reserve(INITIAL_RECORDS);
-    }
     debug_assert!(stack.is_empty());
     let base = stack.as_mut_ptr();
     let (subject, len) = input.native_parts();
@@ -1374,7 +1377,7 @@ fn run_native<I: ReInput>(
     let stack = &mut scratch.native_stack;
     debug_assert!(stack.is_empty());
     if stack.capacity() > super::RETAINED_BACKTRACK_STATE.max(INITIAL_RECORDS) {
-        stack.shrink_to(INITIAL_RECORDS);
+        release(stack);
     }
     let native = &mut scratch.native_slots[..nslots];
     let result = match status {
@@ -1404,10 +1407,30 @@ fn run_native<I: ReInput>(
     result
 }
 
+/// Size the scratch's native slots for a program of `slots`, all unset, and give its stack its
+/// first records: once a program, out of line.
+#[cold]
+#[inline(never)]
+fn prepare(scratch: &mut MatchScratch, slots: usize) {
+    if scratch.native_slots.len() != slots {
+        scratch.native_slots = vec![usize::MAX; slots].into_boxed_slice();
+    }
+    scratch.native_stack.reserve(INITIAL_RECORDS);
+}
+
+/// Release a large match's backtrack stack, keeping its first records.
+#[cold]
+#[inline(never)]
+fn release(stack: &mut Vec<[usize; 2]>) {
+    stack.shrink_to(INITIAL_RECORDS);
+}
+
 /// `TRUST_JS_REGEXP_NATIVE_VERIFY=1`: run the matcher where the native code ran and abort, with
 /// the pattern, flags, subject and start, on any difference in the result, the capture spans or
 /// the error kind. An interruption only one of the two saw is no difference: each polls at its
 /// own points.
+#[cold]
+#[inline(never)]
 fn verify<I: ReInput>(
     re: &Regex,
     input: I,
