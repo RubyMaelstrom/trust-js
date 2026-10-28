@@ -1470,7 +1470,8 @@ impl CallOverflow {
 
     /// The address of the entry for `key` in `global_env` at `epoch`, valid until the table
     /// next changes (an insertion, or a re-entrant call that fills it): copy what outlives
-    /// that.
+    /// that. Inline: a megamorphic site's every call probes it.
+    #[inline]
     pub(crate) fn lookup_entry(
         &self,
         key: usize,
@@ -21974,18 +21975,20 @@ unsafe fn jit_intrinsic_inner(
                         .map_err(Abrupt::Throw)
                     }
                     INTRINSIC_FUNCTION_CALL => {
-                        // `target.call(thisArg, arg)`: transfer thisArg + the single forwarded argument
-                        // directly into a compiled target frame. A failed applicability probe has no
-                        // side effects, so proxies, native targets, and unusual closures invoke the
-                        // exact Function.prototype.call builtin.
+                        // `target.call(thisArg, ...args)`: enter a compiled target with thisArg
+                        // and the forwarded arguments, through the call cache (see
+                        // `Interp::call_forwarded`). A failed applicability probe has no side
+                        // effects, so proxies, native targets, and unusual closures invoke the
+                        // exact Function.prototype.call builtin; a target other than an ordinary
+                        // function (Vue's and chai's `hasOwnProperty.call`) declines before the
+                        // call cache is probed.
                         debug_assert!(call_argc >= 1);
                         let forwarded = call_argc - 1;
-                        match i.call_jit_fast(
-                            &(*base).clone(),
+                        match i.call_forwarded(
+                            INTRINSIC_FUNCTION_CALL,
+                            base,
                             base.add(2),
-                            base.add(3),
-                            forwarded,
-                            None,
+                            call_argc,
                         ) {
                             Some(r) => {
                                 this_moved = true;
@@ -22001,79 +22004,23 @@ unsafe fn jit_intrinsic_inner(
                         }
                     }
                     INTRINSIC_FUNCTION_APPLY => {
-                        // The dominant `initialize.apply(this, arguments)` shape has an unmapped,
-                        // own-dense arguments object. Clone its entries once, then move them straight
-                        // into an already-JIT-compiled target frame. No observable operation occurs
-                        // before every list guard has passed; unusual array-likes and non-JIT targets
-                        // execute the named builtin unchanged.
-                        let dense =
-                            match (&((*base).clone()).view(), &((*base.add(3)).clone()).view()) {
-                                (ValueView::Obj(_), ValueView::Obj(list))
-                                    if i.ordinary_get_ptr(
-                                        crate::value::Gc::as_ptr(list) as usize
-                                    ) && !i.mapped_arguments.contains_key(
-                                        &(crate::value::Gc::as_ptr(list) as usize),
-                                    ) =>
-                                {
-                                    let b = list.borrow();
-                                    let len = match b.props.get("length") {
-                                        Some(p) if !p.accessor() => match (p.value()).view() {
-                                            ValueView::Num(n)
-                                                if n >= 0.0
-                                                    && n.is_finite()
-                                                    && n.fract() == 0.0
-                                                    && n <= crate::interpreter::MAX_ARGUMENTS_LEN
-                                                        as f64 =>
-                                            {
-                                                Some(n as usize)
-                                            }
-                                            _ => None,
-                                        },
-                                        _ => None,
-                                    };
-                                    len.and_then(|len| {
-                                        let mut values = Vec::with_capacity(len);
-                                        for k in 0..len {
-                                            let value = b
-                                                .props
-                                                .get_index(k as u32)
-                                                .filter(|p| !p.accessor())
-                                                .map(|p| p.value())?;
-                                            values.push(value);
-                                        }
-                                        Some(values)
-                                    })
-                                }
-                                _ => None,
-                            };
-                        if let Some(mut values) = dense {
-                            match i.call_jit_fast(
-                                &(*base).clone(),
-                                base.add(2),
-                                values.as_mut_ptr(),
-                                values.len(),
-                                None,
-                            ) {
-                                Some(r) => {
-                                    // `call_jit_fast` moved every Vec element and the original thisArg.
-                                    values.set_len(0);
-                                    this_moved = true;
-                                    r
-                                }
-                                None => crate::builtins::nf_function_apply(
-                                    i,
-                                    *base,
-                                    std::slice::from_raw_parts(base.add(2), 2),
-                                )
-                                .map_err(Abrupt::Throw),
+                        // `target.apply(thisArg, list)`: the dominant `f.apply(this, arguments)`
+                        // shape, an unmapped own-dense arguments object or a dense Array, enters
+                        // a compiled target through the call cache with the list read in place
+                        // (see `Interp::call_forwarded`). No observable operation occurs before
+                        // every guard has passed; unusual array-likes and other targets execute
+                        // the named builtin unchanged.
+                        match i.call_forwarded(INTRINSIC_FUNCTION_APPLY, base, base.add(2), 2) {
+                            Some(r) => {
+                                this_moved = true;
+                                r
                             }
-                        } else {
-                            crate::builtins::nf_function_apply(
+                            None => crate::builtins::nf_function_apply(
                                 i,
                                 *base,
                                 std::slice::from_raw_parts(base.add(2), 2),
                             )
-                            .map_err(Abrupt::Throw)
+                            .map_err(Abrupt::Throw),
                         }
                     }
                     INTRINSIC_ARRAY_PUSH => {
@@ -22710,6 +22657,74 @@ pub(crate) unsafe fn native_light_operands(
             receiver.is_primitive() && primitive_arguments()
         }
         _ => false,
+    }
+}
+
+/// How [`crate::interpreter::Interp::call_native_entry`] runs a native entry of class
+/// `intrinsic` for this receiver and these arguments.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NativeEntryClass {
+    /// Through the native-call boundary.
+    Boundary,
+    /// On the caller's window: the native runs no author code for these operands (W3's item
+    /// 2a; see [`native_light_operands`]).
+    Light,
+    /// Function.prototype.call or apply, whose compiled target is entered as their ordinary
+    /// call (item 6; see [`crate::interpreter::Interp::call_forwarded`]).
+    Forward,
+}
+
+/// [`native_light_operands`] with call's and apply's classes besides, for
+/// [`crate::interpreter::Interp::call_native_entry`]: one match on the class decides all three
+/// ways, so that the forwarding classes cost the other natives nothing. The native-entry hit
+/// keeps [`native_light_operands`] itself; `call_apply_forward_tests` checks that the two
+/// matches agree.
+///
+/// # Safety
+/// As [`native_light_operands`].
+#[inline(always)]
+pub(crate) unsafe fn native_entry_class(
+    intrinsic: u8,
+    this_slot: *const Value,
+    args: *const Value,
+    argc: usize,
+) -> NativeEntryClass {
+    let primitive_arguments = || (0..argc).all(|k| unsafe { (*args.add(k)).is_primitive() });
+    let light = |runs_no_code: bool| {
+        if runs_no_code {
+            NativeEntryClass::Light
+        } else {
+            NativeEntryClass::Boundary
+        }
+    };
+    match intrinsic {
+        INTRINSIC_FUNCTION_CALL | INTRINSIC_FUNCTION_APPLY => NativeEntryClass::Forward,
+        INTRINSIC_OPERAND_ONLY | INTRINSIC_LIGHT => NativeEntryClass::Light,
+        INTRINSIC_NUMERIC_ONLY
+        | INTRINSIC_MATH_SQRT
+        | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
+            light((0..argc).all(|k| unsafe { (*args.add(k)).number().is_some() }))
+        }
+        INTRINSIC_DATAVIEW_GET | INTRINSIC_DATAVIEW_SET => {
+            let checked = if intrinsic == INTRINSIC_DATAVIEW_SET {
+                2
+            } else {
+                1
+            };
+            light((0..argc.min(checked)).all(|k| unsafe { (*args.add(k)).is_primitive() }))
+        }
+        INTRINSIC_LIGHT_PRIMITIVE_ARGS | INTRINSIC_IS_NAN | INTRINSIC_FROM_CHAR_CODE => {
+            light(primitive_arguments())
+        }
+        INTRINSIC_LIGHT_PRIMITIVE
+        | INTRINSIC_CHAR_AT
+        | INTRINSIC_CHAR_CODE_AT
+        | INTRINSIC_CODE_POINT_AT
+        | INTRINSIC_STRING_SLICE => {
+            let receiver = unsafe { &*this_slot };
+            light(receiver.is_primitive() && primitive_arguments())
+        }
+        _ => NativeEntryClass::Boundary,
     }
 }
 

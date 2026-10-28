@@ -1943,6 +1943,8 @@ impl Engine {
 }
 
 #[cfg(test)]
+mod call_apply_forward_tests;
+#[cfg(test)]
 mod call_error_name_tests;
 #[cfg(test)]
 mod call_guard_tests;

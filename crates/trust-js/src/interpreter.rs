@@ -1278,6 +1278,10 @@ thread_local! {
     pub(crate) static TEST_LIGHT_NATIVE_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// Calls [`Interp::call_compiled_target`] entered (W3's item 6).
+    pub(crate) static TEST_COMPILED_TARGET_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 impl Interp {
@@ -4869,6 +4873,9 @@ pub const MAX_ARRAY_OP_LEN: usize = 1 << 27; // ~134M elements
 /// is copied into the callee's frame and `arguments`; V8 runs out of stack near 120,000 of them
 /// and SpiderMonkey stops at 500,000.
 pub const MAX_ARGUMENTS_LEN: usize = 1 << 20; // ~1M arguments
+/// The longest `apply` list [`Interp::call_forwarded`] passes from its own frame; a longer one
+/// leaves the call to Function.prototype.apply.
+const FORWARDED_LIST_MAX: usize = 32;
 
 // A string splits or spreads into at most one piece per byte (plus one), so string operations
 // never reach the array limit.
@@ -13942,16 +13949,210 @@ impl Interp {
         argc: usize,
     ) -> Result<Value, Abrupt> {
         if signature & crate::bytecode::CALL_IC_SCOPED_NATIVE == 0 {
-            // SAFETY: without the scoped bit the entry's address is an engine NativeFn.
-            let function: crate::value::NativeFn =
-                unsafe { std::mem::transmute(native as *const ()) };
-            if let Some(result) =
-                unsafe { self.call_native_light(function, intrinsic, this_slot, args, argc) }
-            {
+            // SAFETY: the caller's window, as this function's.
+            match unsafe { crate::bytecode::native_entry_class(intrinsic, this_slot, args, argc) } {
+                crate::bytecode::NativeEntryClass::Light => {
+                    // SAFETY: without the scoped bit the entry's address is an engine NativeFn.
+                    let function: crate::value::NativeFn =
+                        unsafe { std::mem::transmute(native as *const ()) };
+                    return unsafe {
+                        self.call_native_light_proven(function, this_slot, args, argc)
+                    };
+                }
+                crate::bytecode::NativeEntryClass::Forward => {
+                    return unsafe {
+                        self.call_forwarding_entry(
+                            native, signature, intrinsic, this_slot, args, argc,
+                        )
+                    };
+                }
+                crate::bytecode::NativeEntryClass::Boundary => {}
+            }
+        }
+        unsafe { self.call_native_address_committed(native, signature, this_slot, args, argc) }
+    }
+
+    /// Function.prototype.call and apply's native entry: a compiled target is entered as their
+    /// ordinary call ([`Interp::call_forwarded`]); anything else runs the builtin through the
+    /// boundary. Out of line, so that other natives' entries keep their registers.
+    ///
+    /// # Safety
+    /// As [`Interp::call_native_entry`].
+    #[cold]
+    #[inline(never)]
+    unsafe fn call_forwarding_entry(
+        &mut self,
+        native: usize,
+        signature: u8,
+        intrinsic: u8,
+        this_slot: *const Value,
+        args: *const Value,
+        argc: usize,
+    ) -> Result<Value, Abrupt> {
+        // SAFETY: the caller's window.
+        if Self::forwardable_target(unsafe { &*this_slot }) {
+            if let Some(result) = unsafe { self.call_forwarded(intrinsic, this_slot, args, argc) } {
                 return result;
             }
         }
         unsafe { self.call_native_address_committed(native, signature, this_slot, args, argc) }
+    }
+
+    /// W3's item 6: Function.prototype.call and apply (ECMA-262 §20.2.3.3, §20.2.3.1) on a
+    /// compiled function of this Realm. Their steps run here, and their target is entered as the
+    /// ordinary call they make, through the call cache ([`Interp::call_compiled_target`]),
+    /// instead of running the builtin through the native-call boundary and [`Interp::call`].
+    /// `this_slot` holds the target, the builtin's `this`, whose IsCallable step then holds:
+    /// `call` passes thisArg and the arguments after it, in place; `apply` passes thisArg and no
+    /// arguments for an undefined or null argArray, else the list [`Interp::inert_argument_list`]
+    /// reads without running code. `None` declines, having run nothing, for any other target (a
+    /// native, a bound function, a class constructor, a Proxy, a function not yet compiled or of
+    /// another Realm) or list: the builtin then runs as it is.
+    ///
+    /// # Safety
+    /// As [`Interp::call_native_entry`]: `this_slot` and `args..args+argc` are the caller's
+    /// rooted, immutable window for the whole call.
+    pub(crate) unsafe fn call_forwarded(
+        &mut self,
+        intrinsic: u8,
+        this_slot: *const Value,
+        args: *const Value,
+        argc: usize,
+    ) -> Option<Result<Value, Abrupt>> {
+        // SAFETY: the caller's window (see above).
+        let target = unsafe { *this_slot };
+        if !Self::forwardable_target(&target) {
+            return None;
+        }
+        let undefined = Value::Undefined;
+        let this_arg: *const Value = if argc > 0 { args } else { &undefined };
+        if intrinsic == crate::bytecode::INTRINSIC_FUNCTION_CALL {
+            // Call(func, thisArg, args): the arguments after thisArg, where they are.
+            let (rest, count) = if argc > 0 {
+                (unsafe { args.add(1) }, argc - 1)
+            } else {
+                (args, 0)
+            };
+            return unsafe { self.call_compiled_target(&target, this_arg, rest, count) };
+        }
+        debug_assert_eq!(intrinsic, crate::bytecode::INTRINSIC_FUNCTION_APPLY);
+        let list = if argc > 1 {
+            unsafe { *args.add(1) }
+        } else {
+            Value::Undefined
+        };
+        if matches!(list.view(), ValueView::Undefined | ValueView::Null) {
+            // Call(func, thisArg).
+            return unsafe { self.call_compiled_target(&target, this_arg, args, 0) };
+        }
+        // The list lives in this frame for the call, where the conservative stack scan roots it
+        // (Decision 0).
+        let mut list_buffer = [std::mem::MaybeUninit::<Value>::uninit(); FORWARDED_LIST_MAX];
+        let count = self.inert_argument_list(&list, &mut list_buffer)?;
+        unsafe { self.call_compiled_target(&target, this_arg, list_buffer.as_ptr().cast(), count) }
+    }
+
+    /// Whether `target` may be one [`Interp::call_compiled_target`] enters: an ordinary function
+    /// object with ECMAScript code. Decides nothing else; it only spares a forwarded call the
+    /// list of a target that cannot take it.
+    #[inline]
+    fn forwardable_target(target: &Value) -> bool {
+        target
+            .with_object(|object| {
+                let body = object.borrow();
+                body.ic_plain.get() && matches!(body.call, Callable::User(_))
+            })
+            .unwrap_or(false)
+    }
+
+    /// CreateListFromArrayLike(list) (ECMA-262 §7.3.20) when it runs no code, written to `out`:
+    /// an ordinary Array, or an unmapped arguments object whose `length` is an own data property
+    /// holding an integral Number, whose every index below that length is an own data property
+    /// (no hole, no accessor), and which has at most `out.len()` elements. LengthOfArrayLike and
+    /// every Get then read exactly those values, with no prototype or code involved. `None`
+    /// otherwise, having changed nothing.
+    pub(crate) fn inert_argument_list(
+        &self,
+        list: &Value,
+        out: &mut [std::mem::MaybeUninit<Value>],
+    ) -> Option<usize> {
+        let object = list.as_obj()?;
+        let body = object.borrow();
+        if !body.ic_plain.get() {
+            return None;
+        }
+        let length = match body.exotic {
+            Exotic::Array => crate::builtins::ordinary_array_length(&body.props)?,
+            Exotic::Arguments
+                if !self
+                    .mapped_arguments
+                    .contains_key(&(Gc::as_ptr(&object) as usize)) =>
+            {
+                // Writable and configurable: author code may have changed or removed it.
+                let length = body.props.length_property()?.number_value()?;
+                if !(length >= 0.0 && length.fract() == 0.0 && length <= out.len() as f64) {
+                    return None;
+                }
+                length as usize
+            }
+            _ => return None,
+        };
+        let out = out.get_mut(..length)?;
+        for (index, slot) in out.iter_mut().enumerate() {
+            slot.write(crate::builtins::own_data_element(&body.props, index)?);
+        }
+        Some(length)
+    }
+
+    /// The ordinary call of a compiled function of this Realm through its call-cache entry in the
+    /// overflow table, which [`Interp::call_jit_cached`] also consults: keyed by the function's
+    /// identity, as a call site's ways are, and valid for this Realm and call-cache epoch. A miss
+    /// runs [`Interp::call_jit_fast`]'s guards, enters the function and records its entry there.
+    /// `None` declines, having run nothing: a native entry, or a function those guards refuse.
+    ///
+    /// # Safety
+    /// As [`Interp::call_jit_cached`].
+    pub(crate) unsafe fn call_compiled_target(
+        &mut self,
+        target: &Value,
+        this_slot: *const Value,
+        args: *const Value,
+        argc: usize,
+    ) -> Option<Result<Value, Abrupt>> {
+        let ValueView::Obj(object) = target.view() else {
+            return None;
+        };
+        let key = Gc::as_ptr(&object) as usize;
+        let global_env = Env::as_ptr(&self.global_env) as usize;
+        let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(entry) = self.call_overflow.lookup_entry(key, global_env, epoch) {
+            // SAFETY: a live entry, copied before anything re-entrant runs (the callee may
+            // refill the table).
+            let ic = unsafe { entry.read() };
+            if ic.native != 0 {
+                return None;
+            }
+            let code = unsafe { crate::jit::cache::lease_raw(ic.code) };
+            self.note_compiled_call(&ic);
+            #[cfg(test)]
+            TEST_COMPILED_TARGET_CALLS.with(|count| count.set(count.get() + 1));
+            return Some(unsafe { self.call_jit_committed(&ic, &code, this_slot, args, argc) });
+        }
+        let site = crate::bytecode::CallSite::empty();
+        let pins = RefCell::new(crate::fasthash::FastMap::default());
+        let result =
+            unsafe { self.call_jit_fast(target, this_slot, args, argc, Some((&site, &pins))) }?;
+        #[cfg(test)]
+        TEST_COMPILED_TARGET_CALLS.with(|count| count.set(count.get() + 1));
+        // The guards passed and filled the scratch site; an epoch moved since only makes the
+        // recorded entry miss.
+        let ic = site.entries[0].get();
+        if ic.callee == key {
+            if let Some(pin) = pins.borrow_mut().remove(&key) {
+                self.call_overflow.insert(ic, pin);
+            }
+        }
+        Some(result)
     }
 
     /// W3's item 2a: a native-entry hit whose class (`intrinsic`, see
@@ -14000,6 +14201,44 @@ impl Interp {
             self.new_target = new_target;
         }
         Some(result.map_err(Abrupt::Throw))
+    }
+
+    /// [`Interp::call_native_light`] for operands their class has proven light
+    /// ([`crate::bytecode::native_entry_class`]), for [`Interp::call_native_entry`].
+    ///
+    /// # Safety
+    /// As [`Interp::call_native_light`], whose class check these operands passed.
+    #[inline(always)]
+    pub(crate) unsafe fn call_native_light_proven(
+        &mut self,
+        function: crate::value::NativeFn,
+        this_slot: *const Value,
+        args: *const Value,
+        argc: usize,
+    ) -> Result<Value, Abrupt> {
+        #[cfg(test)]
+        TEST_LIGHT_NATIVE_CALLS.with(|count| count.set(count.get() + 1));
+        // The native runs with a call's construct state: not constructing, new.target Undefined.
+        // An ordinary caller already holds it (the ARM64 direct sequence relies on the same), so
+        // only a constructing caller's state is saved, cleared and restored around the call.
+        let ordinary = !self.constructing && matches!(self.new_target.view(), ValueView::Undefined);
+        let saved = (!ordinary).then(|| {
+            (
+                std::mem::replace(&mut self.constructing, false),
+                std::mem::replace(&mut self.new_target, Value::Undefined),
+            )
+        });
+        // SAFETY: the caller's window is initialized and outlives this call.
+        let result = unsafe {
+            crate::execution_storage::with_borrowed_values(args, argc, |arguments| {
+                function(self, *this_slot, arguments)
+            })
+        };
+        if let Some((constructing, new_target)) = saved {
+            self.constructing = constructing;
+            self.new_target = new_target;
+        }
+        result.map_err(Abrupt::Throw)
     }
 
     /// A native-entry IC hit, borrowing the caller's canonical evaluated argument window.
