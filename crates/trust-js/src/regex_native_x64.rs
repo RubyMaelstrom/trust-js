@@ -9,7 +9,7 @@
 //! after the entry's pushes are kept in the context.
 
 use super::{ctx, Cond, Data, Helpers, Label, Masm, Operand, Value, Width};
-use super::{POLL_INTERRUPT_BIT, POLL_PERIOD, SCAN_STRETCH, STATUS_EXHAUSTED};
+use super::{CANDIDATE_RUN, POLL_INTERRUPT_BIT, POLL_PERIOD, SCAN_STRETCH, STATUS_EXHAUSTED};
 
 const RAX: u8 = 0;
 const RCX: u8 = 1;
@@ -43,6 +43,9 @@ const RS: u8 = RCX;
 const LIM: u8 = RSI;
 const CLIM: u8 = RDI;
 const SCRATCH: u8 = R11;
+/// A loop's held table address (see [`Masm::hold_lut`]): the popped operand's register, which
+/// no loop's scan or candidate test reads.
+const HELD: u8 = RDX;
 
 /// The caller-saved registers the code keeps values in, which helper calls' routines save.
 const SAVED: [u8; 8] = [RCX, RDX, RSI, RDI, R8, R9, R10, R11];
@@ -83,6 +86,8 @@ pub(super) struct Asm {
     grow_routine: Label,
     candidate_routine: Label,
     exit: Label,
+    /// The table whose address rdx holds.
+    held: Option<Data>,
 }
 
 impl Asm {
@@ -102,6 +107,7 @@ impl Asm {
             grow_routine: 0,
             candidate_routine: 0,
             exit: 0,
+            held: None,
         };
         asm.poll_routine = asm.label();
         asm.grow_routine = asm.label();
@@ -523,11 +529,26 @@ impl Masm for Asm {
     }
 
     fn branch_lut(&mut self, lut: Data, member: bool, label: Label) {
-        self.lea_data(SCRATCH, lut);
-        // cmp byte [r11 + rax], 0
-        self.op_sib(false, &[0x80], 7, SCRATCH, E, 0, 0);
+        let base = if self.held == Some(lut) {
+            HELD
+        } else {
+            self.lea_data(SCRATCH, lut);
+            SCRATCH
+        };
+        // cmp byte [base + rax], 0
+        self.op_sib(false, &[0x80], 7, base, E, 0, 0);
         self.byte(0);
         self.jcc(if member { Cond::Ne } else { Cond::Eq }, label);
+    }
+
+    fn hold_lut(&mut self, lut: Data) {
+        debug_assert!(self.held.is_none());
+        self.lea_data(HELD, lut);
+        self.held = Some(lut);
+    }
+
+    fn release_lut(&mut self) {
+        self.held = None;
     }
 
     fn push(&mut self, stub: Label, operand: Operand) {
@@ -643,9 +664,20 @@ impl Masm for Asm {
         self.cmov(Cond::Hi, CLIM, LIM);
     }
 
-    fn branch_pos_ge_stretch(&mut self, label: Label) {
+    fn set_candidate_bound(&mut self, window: bool) {
+        self.op_mem(true, &[0x8d], CLIM, POS, CANDIDATE_RUN as i32);
+        self.alu(true, 0x39, CLIM, LEN);
+        self.cmov(Cond::Hi, CLIM, LEN);
+        if window {
+            self.load(SCRATCH, CTX, ctx::WINDOW);
+            self.alu(true, 0x39, CLIM, SCRATCH);
+            self.cmov(Cond::Hi, CLIM, SCRATCH);
+        }
+    }
+
+    fn branch_pos_stretch(&mut self, cond: Cond, label: Label) {
         self.alu(true, 0x39, POS, CLIM);
-        self.jcc(Cond::Hs, label);
+        self.jcc(cond, label);
     }
 
     fn branch_stretch_is_limit(&mut self, label: Label) {

@@ -12,7 +12,7 @@
 //! results are compared after it, never assumed.
 
 use super::{ctx, Cond, Data, Helpers, Label, Masm, Operand, Value, Width};
-use super::{POLL_INTERRUPT_BIT, POLL_PERIOD, SCAN_STRETCH, STATUS_EXHAUSTED};
+use super::{CANDIDATE_RUN, POLL_INTERRUPT_BIT, POLL_PERIOD, SCAN_STRETCH, STATUS_EXHAUSTED};
 
 const SUBJ: u32 = 19;
 const LEN: u32 = 20;
@@ -29,6 +29,8 @@ const OP: u32 = 10;
 const RS: u32 = 11;
 const LIM: u32 = 12;
 const CLIM: u32 = 13;
+/// A loop's held table address (see [`Masm::hold_lut`]).
+const HELD: u32 = 14;
 const ADDR: u32 = 15;
 const IP0: u32 = 16;
 const IP1: u32 = 17;
@@ -245,6 +247,8 @@ pub(super) struct Asm {
     exit: Label,
     /// Whether x15 holds the address of the position's element.
     addr_valid: bool,
+    /// The table whose address x14 holds.
+    held: Option<Data>,
 }
 
 impl Asm {
@@ -264,6 +268,7 @@ impl Asm {
             grow_routine: 0,
             exit: 0,
             addr_valid: false,
+            held: None,
         };
         asm.poll_routine = asm.label();
         asm.grow_routine = asm.label();
@@ -660,9 +665,23 @@ impl Masm for Asm {
     }
 
     fn branch_lut(&mut self, lut: Data, member: bool, label: Label) {
-        self.adr_data(IP0, lut);
-        self.emit(ldrb_reg(IP0, IP0, E));
+        if self.held == Some(lut) {
+            self.emit(ldrb_reg(IP0, HELD, E));
+        } else {
+            self.adr_data(IP0, lut);
+            self.emit(ldrb_reg(IP0, IP0, E));
+        }
         self.cbz(false, member, IP0, label);
+    }
+
+    fn hold_lut(&mut self, lut: Data) {
+        debug_assert!(self.held.is_none());
+        self.adr_data(HELD, lut);
+        self.held = Some(lut);
+    }
+
+    fn release_lut(&mut self) {
+        self.held = None;
     }
 
     fn push(&mut self, stub: Label, operand: Operand) {
@@ -777,9 +796,20 @@ impl Masm for Asm {
         self.emit(csel(CLIM, CLIM, LIM, Cond::Lo));
     }
 
-    fn branch_pos_ge_stretch(&mut self, label: Label) {
+    fn set_candidate_bound(&mut self, window: bool) {
+        self.emit(add_imm(true, CLIM, POS, CANDIDATE_RUN, false));
+        self.emit(subs_reg(true, ZR, CLIM, LEN));
+        self.emit(csel(CLIM, CLIM, LEN, Cond::Lo));
+        if window {
+            self.emit(ldr_imm(IP0, CTX, ctx::WINDOW));
+            self.emit(subs_reg(true, ZR, CLIM, IP0));
+            self.emit(csel(CLIM, CLIM, IP0, Cond::Lo));
+        }
+    }
+
+    fn branch_pos_stretch(&mut self, cond: Cond, label: Label) {
         self.emit(subs_reg(true, ZR, POS, CLIM));
-        self.b_cond(Cond::Hs, label);
+        self.b_cond(cond, label);
     }
 
     fn branch_stretch_is_limit(&mut self, label: Label) {

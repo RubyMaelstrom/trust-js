@@ -460,6 +460,42 @@ fn core_programs_match_as_the_matcher_does() {
     }
 }
 
+/// Programs the fuzzer seldom makes: more capture slots than the root floor's logged-slot word
+/// has bits (each attempt unsets them instead), many loops' marks, and long straight runs.
+#[test]
+fn wide_and_long_programs_match_as_the_matcher_does() {
+    let wide = format!("{}(y|z)*q", "(x)?".repeat(36));
+    let marks = "(?:(?:a|b)*c)*(?:(?:d|e)+f)*(?:g|h)*".to_string();
+    let long = format!("{}.{}", "ab".repeat(300), "cd".repeat(300));
+    let texts = [
+        "xxxyzq".to_string(),
+        "xyzyzyzx".to_string(),
+        format!("{}yzq", "x".repeat(40)),
+        "abcabcdefdeffgh".to_string(),
+        "aabbcdddeeffhgx".to_string(),
+        format!("{}X{}", "ab".repeat(300), "cd".repeat(300)),
+        format!("z{}X{}", "ab".repeat(300), "cd".repeat(299)),
+    ];
+    for (pattern, flags) in [
+        (wide.as_str(), ""),
+        (wide.as_str(), "y"),
+        (marks.as_str(), ""),
+        (marks.as_str(), "g"),
+        (long.as_str(), ""),
+    ] {
+        for text in &texts {
+            for two in [false, true] {
+                let subject = Subject::of(text, two);
+                let (native, _) = pair(pattern, flags, subject.width()).unwrap();
+                compiled(&native, subject.width());
+                if let Some(difference) = compare_from(pattern, flags, &subject, [0, 1, 3]) {
+                    panic!("/{pattern}/{flags} over {text:?}: {difference:?}");
+                }
+            }
+        }
+    }
+}
+
 /// Every element of the two-byte range against classes with members on both sides of 256, as
 /// the matcher tests them: the byte table below 256 and the ranges above.
 #[test]

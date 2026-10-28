@@ -79,6 +79,10 @@ pub(super) const POLL_PERIOD: u32 = 1 << 14;
 /// Elements a loop's scan takes between two polls.
 pub(super) const SCAN_STRETCH: u32 = 1 << 14;
 
+/// Starts the candidate loop tests in line, by the first-element filter's table, before it
+/// calls the Rust scan, whose vector loops take longer stretches.
+pub(super) const CANDIDATE_RUN: u32 = 16;
+
 /// A subject's positions fit in 32 bits below this, as the tier's packed record operands need:
 /// longer subjects (engine strings never are) stay on the matcher.
 const MAX_SUBJECT_LEN: usize = 1 << 31;
@@ -204,6 +208,10 @@ pub(super) trait Masm {
     fn lut(&mut self, table: &[u8; 256]) -> Data;
     /// Branch if `lut` holds a nonzero byte at E (`member`), or a zero one; E is below 256.
     fn branch_lut(&mut self, lut: Data, member: bool, label: Label);
+    /// Keep `lut`'s address in a register for the [`Self::branch_lut`]s of a loop, emitted
+    /// until [`Self::release_lut`]; the loop's code is entered only through what follows.
+    fn hold_lut(&mut self, lut: Data);
+    fn release_lut(&mut self);
     /// Push the record (`stub`'s address, `operand`), growing the stack if it is full.
     fn push(&mut self, stub: Label, operand: Operand);
     /// Pop a record into OP and jump to its address.
@@ -228,7 +236,10 @@ pub(super) trait Masm {
     fn set_limit(&mut self, max: Option<u32>);
     /// CLIM = min(LIM, POS + [`SCAN_STRETCH`]).
     fn set_stretch_limit(&mut self);
-    fn branch_pos_ge_stretch(&mut self, label: Label);
+    /// CLIM = min(LEN, POS + [`CANDIDATE_RUN`]), and with `window` the context's window.
+    fn set_candidate_bound(&mut self, window: bool);
+    /// Branch if POS `cond` CLIM.
+    fn branch_pos_stretch(&mut self, cond: Cond, label: Label);
     fn branch_stretch_is_limit(&mut self, label: Label);
     /// POS = LIM.
     fn pos_to_limit(&mut self);
@@ -585,6 +596,8 @@ struct Plan<'a> {
     window: bool,
     /// The first-element filter's table, which the candidate loop tests in line.
     first: Option<[u8; 256]>,
+    /// A match may also begin where `^` holds, whatever the element there.
+    first_line_start: bool,
     /// The pcs a branch or a resumed record reaches, which begin a run of templates.
     targets: Vec<bool>,
     /// Tests by class, made once per class (by address).
@@ -629,6 +642,7 @@ impl<'a> Plan<'a> {
             lead_run: re.lead_run,
             window: re.prefilter.is_some(),
             first,
+            first_line_start: re.first_line_start,
             targets,
             classes: Default::default(),
         }
@@ -745,7 +759,9 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         self.m.prologue(sentinel);
         if !plan.only {
             // The candidate loop: a start the filter's table admits, inside the prefilter's
-            // window, is tried at once; any other goes to the Rust scan.
+            // window, is tried at once; the Rust scan finds the others. Up to `CANDIDATE_RUN`
+            // starts the table rules out are skipped in line first, unless a match may begin
+            // wherever `^` holds, which the table does not show.
             self.m.bind(cand);
             self.m.poll_tick();
             let scan = self.m.label();
@@ -755,17 +771,35 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 scans = true;
             }
             if let Some(table) = &plan.first {
-                self.m.branch_at_end(true, scan);
-                self.m.load_elem(0);
-                if plan.width == Width::Two {
-                    self.m.branch_elem(Cond::Hs, 0x100, scan);
-                }
                 let lut = self.m.lut(table);
-                self.m.branch_lut(lut, false, scan);
+                if plan.first_line_start {
+                    self.m.branch_at_end(true, scan);
+                    self.m.load_elem(0);
+                    if plan.width == Width::Two {
+                        self.m.branch_elem(Cond::Hs, 0x100, scan);
+                    }
+                    self.m.branch_lut(lut, false, scan);
+                    self.m.jump(attempt);
+                } else {
+                    let next = self.m.label();
+                    self.m.hold_lut(lut);
+                    self.m.set_candidate_bound(plan.window);
+                    self.m.bind(next);
+                    self.m.branch_pos_stretch(Cond::Hs, scan);
+                    self.m.load_elem(0);
+                    if plan.width == Width::Two {
+                        self.m.branch_elem(Cond::Hs, 0x100, scan);
+                    }
+                    self.m.branch_lut(lut, true, attempt);
+                    self.m.advance(1);
+                    self.m.jump(next);
+                    self.m.release_lut();
+                }
                 scans = true;
+            } else if scans {
+                self.m.jump(attempt);
             }
             if scans {
-                self.m.jump(attempt);
                 self.m.bind(scan);
                 self.m.next_candidate(no_match);
             }
@@ -1082,19 +1116,30 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         let scan = self.m.label();
         let bound = self.m.label();
         let done = self.m.label();
+        let held = match test {
+            Test::Class(class) => {
+                let lut = self.m.lut(&class.lut);
+                self.m.hold_lut(lut);
+                true
+            }
+            _ => false,
+        };
         self.m.bind(stretch);
         self.m.set_stretch_limit();
+        self.m.branch_pos_stretch(Cond::Hs, bound);
         self.m.bind(scan);
-        self.m.branch_pos_ge_stretch(bound);
         self.m.load_elem(0);
         self.emit_test(test, done);
         self.m.advance(1);
-        self.m.jump(scan);
+        self.m.branch_pos_stretch(Cond::Lo, scan);
         self.m.bind(bound);
         self.m.branch_stretch_is_limit(done);
         self.m.poll_now();
         self.m.jump(stretch);
         self.m.bind(done);
+        if held {
+            self.m.release_lut();
+        }
     }
 
     /// A greedy loop: the longest run, and a record to retry shorter ones unless they are
