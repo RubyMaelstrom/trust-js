@@ -151,17 +151,14 @@ fn unconditional_target(word: u32, pc: usize) -> usize {
 
 #[test]
 fn loop_latch_emission_preserves_false_exits_in_all_six_cases_after_integer_mapping() {
-    let mut engine = Engine::new();
+    let engine = Engine::new();
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
-    let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
-    assert!(ilayout.valid);
     for negative in [5, 13, 8, 11, 1, 0] {
         for case in 0..6 {
             let (plan, compare, integer) = comparison_plan(case, negative);
             let mut a = asm::Asm::new();
             let labels = [a.new_label(), a.new_label()];
-            let fallback =
-                emit_loop_chain(&mut a, &layout, &ilayout, &plan, &labels, &mut [false; 2]);
+            let fallback = emit_loop_chain(&mut a, &layout, &plan, &labels, &mut [false; 2]);
             a.bind(fallback);
             for label in labels {
                 a.bind(label);

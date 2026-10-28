@@ -1171,7 +1171,7 @@ impl Interp {
         crate::value::gc_finish_generation(&heap);
         if let Some(pending) = heap.agent.pending.get() {
             // A request made while the core was borrowed could publish only Agent metadata.
-            // Reattach it to the native due word AFTER finish_collection's budget reset.
+            // Reattach it to the poll words' heap bit AFTER finish_collection's budget reset.
             heap.core.borrow_mut().request_collection(pending);
         }
         let live = crate::value::heap_live_objects(&heap);
@@ -1689,7 +1689,6 @@ impl Interp {
             wall_clock: _,
             runtime_interrupt: _,
             poll: _,
-            interrupt_poll_tick: _,
             ast_tick: _,
             strict: _,
             tier: _,

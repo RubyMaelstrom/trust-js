@@ -34,23 +34,47 @@ impl InterruptReason {
     }
 }
 
-/// The word an interpreter's execution polls at its safepoints (the Rust tiers'
-/// `Interp::interrupt_poll`). It is zero while no poll needs its slow path. Its interrupt bit
-/// ([`POLL_INTERRUPT`]) is the interpreter's [`RuntimeInterrupt`]'s, set while a host
-/// interruption may be pending and written from any thread with atomic read-modify-writes. The
-/// slow path asks the authority, [`RuntimeInterrupt::current_reason`], so a bit set spuriously
-/// costs one slow path.
+/// The word an interpreter's execution polls at its safepoints: native code's function entries,
+/// loop back-edges and the ends of allocating helpers' calls (a load through
+/// `JitCtx::poll_word`, a load of the word and a branch), and the Rust tiers'
+/// `Interp::interrupt_poll`. It is zero while no poll needs its slow path. Two writers keep a
+/// bit each, with atomic read-modify-writes, so neither clobbers the other's:
+/// - [`POLL_HEAP`], the interpreter's heap's: set exactly while a collection is due, the
+///   live-object count above its ceiling included (see `gc_core::Control::attach_poll_word`);
+///   written on the interpreter's thread.
+/// - [`POLL_INTERRUPT`], the interpreter's [`RuntimeInterrupt`]'s: set while a host
+///   interruption may be pending; written from any thread.
+///
+/// The slow path asks the authorities ([`RuntimeInterrupt::current_reason`] and
+/// `Interp::gc_check`), so a bit set spuriously costs one slow path.
 #[derive(Debug, Default)]
 pub(crate) struct PollWord(AtomicU64);
 
+/// The heap's bit of a [`PollWord`]: a collection is due.
+pub(crate) const POLL_HEAP: u64 = 1 << 0;
 /// The interrupt handle's bit of a [`PollWord`]: a host interruption may be pending.
 pub(crate) const POLL_INTERRUPT: u64 = 1 << 1;
 
 impl PollWord {
+    /// The word's address, through which native code loads it.
+    pub(crate) fn as_ptr(&self) -> *const AtomicU64 {
+        &self.0
+    }
+
     /// Whether the interrupt bit is set: a host interruption may be pending.
     #[inline(always)]
     pub(crate) fn interrupt_pending(&self) -> bool {
         self.0.load(Ordering::Relaxed) & POLL_INTERRUPT != 0
+    }
+
+    /// Whether the heap's bit is set: a collection is due.
+    pub(crate) fn heap_due(&self) -> bool {
+        self.0.load(Ordering::Relaxed) & POLL_HEAP != 0
+    }
+
+    /// Set the heap's bit to `due`, leaving the interrupt bit as it is.
+    pub(crate) fn set_heap_due(&self, due: bool) {
+        self.set(POLL_HEAP, due);
     }
 
     fn set(&self, bit: u64, on: bool) {

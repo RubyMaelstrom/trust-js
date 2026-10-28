@@ -704,7 +704,7 @@ fn return_context() -> super::JitCtx {
         callstat_enabled: false,
         propstat_enabled: false,
         inline_recompile_at: 0,
-        live_objects: std::ptr::null(),
+        poll_word: std::ptr::null(),
         shape_layouts: std::ptr::null(),
         activation: None,
         resume_activation: std::ptr::null_mut(),

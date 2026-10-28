@@ -6439,19 +6439,25 @@ fn compiled_allocation_guard_accepts_maximum_signed_threshold() {
         engine.set_tier_threshold(0);
         engine.defer_task_garbage_collection(true);
         engine.interp.set_agent_next(i64::MAX);
+        crate::jit::take_poll_census();
         let result = engine.scope(|cx| {
             value_in(cx, "function allocate(){let index=0;while(index<1000){let cycle={};cycle.self=cycle;index++;}return index;}allocate()").as_num_opt()
         });
+        let census = crate::jit::take_poll_census();
         assert_eq!(result, Some(1000.0), "{tier:?}");
         // A GC stress collection sets a new threshold.
         if !crate::gc_test::stress_active() {
             assert_eq!(engine.interp.gc_next, i64::MAX, "{tier:?}");
-        }
-        // Generated code counts a tick only on its poll's fast path. Under GC stress each poll
-        // after an allocation finds a collection due and takes the slow path (`jit_interrupt`),
-        // which checks the interrupt on every call without counting.
-        if tier == crate::bytecode::Tier::Bytecode || !crate::gc_test::stress_active() {
-            assert!(engine.interp.interrupt_poll_tick >= 1000, "{tier:?}");
+            // The allocator compares the live-object count with the maximum threshold without
+            // overflow: the poll word's heap bit says only what the heap's budgets say, and
+            // generated code's polls take their slow path only for a collection.
+            let core = engine.interp.gc_heap.core.borrow();
+            assert_eq!(
+                engine.interp.poll.heap_due(),
+                core.collection_due(),
+                "{tier:?}"
+            );
+            assert_eq!(census.calls, census.collections, "{tier:?}");
         }
     }
 }

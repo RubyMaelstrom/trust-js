@@ -1814,11 +1814,11 @@ pub struct JitCtx {
     pub callstat_enabled: bool,
     pub propstat_enabled: bool,
     pub inline_recompile_at: u32,
-    /// Address of this Agent heap's live-object counter. Compiled chunks may cross thread
-    /// boundaries with generator/async interpreter handoff, so this heap address must be captured
-    /// when an activation starts rather than embedded while machine code is compiled. The
-    /// heap's due word follows the count (`value::LiveCount`): polls load both.
-    pub live_objects: *const i64,
+    /// Address of the interpreter's poll word (`interrupt::PollWord`), which every poll of
+    /// generated code loads: nonzero while a collection is due or a host interruption may be
+    /// pending. Compiled chunks are shared by interpreters and Agents, so the address is
+    /// captured when an activation starts rather than embedded while machine code is compiled.
+    pub poll_word: *const std::sync::atomic::AtomicU64,
     /// The active heap's fixed shape-directory array. Creation ICs index this directly instead
     /// of following an owning heap pointer in each receiver. Layouts remain pinned by the heap.
     pub shape_layouts: *const u8,
@@ -1931,7 +1931,7 @@ impl crate::gc_trace::GcTrace for JitCtx {
             callstat_enabled: _,
             propstat_enabled: _,
             inline_recompile_at: _,
-            live_objects: _,
+            poll_word: _,
             shape_layouts: _, // Rust-owned layouts, not managed cell edges
             activation,
             // `drive_vm`'s borrow of its own frame state, which it registers (VM_FRAMES) for
@@ -4104,13 +4104,13 @@ fn compile_entry(
         a.strb_imm(9, 16, 0);
     }
     // Function entry is a safepoint, like a loop back-edge: allocation pressure and host
-    // interruption are observed here on the shared amortized cadence. Code that never takes a
-    // back-edge (loop-free recursion makes billions of calls) must still be interruptible, since
-    // a user agent may abort a running script at any time (HTML §8.1.4.5). The frame is fully
+    // interruption are observed here, through the poll word. Code that never takes a back-edge
+    // (loop-free recursion makes billions of calls) must still be interruptible, since a user
+    // agent may abort a running script at any time (HTML §8.1.4.5). The frame is fully
     // established and the operand stack empty, so the helper sees every owned root. A direct
     // call `blr`s to the code start: this is its safepoint too.
     if !borrowed_entry {
-        emit_interrupt_poll(&mut a, ilayout, POLL_ENTRY, l_unwind);
+        emit_interrupt_poll(&mut a, POLL_ENTRY, l_unwind);
     }
     if borrowed_entry {
         // The Rust entry validates the bytecode PC and its settled stack before dispatch.
@@ -4215,7 +4215,7 @@ fn compile_entry(
         a.bind(pc_labels[pc]);
         a.set_hot(in_loop[pc]);
         if interrupt_targets[pc] {
-            emit_interrupt_poll(&mut a, ilayout, POLL_LOOP, l_unwind);
+            emit_interrupt_poll(&mut a, POLL_LOOP, l_unwind);
         }
         if skip > 0 {
             // Consumed by a fusion (chain / compare+branch / key-producer pair). The label and
@@ -4262,7 +4262,7 @@ fn compile_entry(
             }
             let mut emitted_region = false;
             if let Some(plan) = plan_linked_scan(chunk, ops, pc, &cfg, layout, fast) {
-                let plain_h = emit_linked_scan_region(&mut a, layout, ilayout, &plan, &pc_labels);
+                let plain_h = emit_linked_scan_region(&mut a, layout, &plan, &pc_labels);
                 a.bind(plain_h);
                 for p in pc + 1..pc + 9 {
                     targeted[p] = true;
@@ -4277,8 +4277,7 @@ fn compile_entry(
                 // General CFG lowering adds effect/call coverage, not a reason to spill
                 // already-proven numeric and element loops at every operation.
                 if let Some(plan) = plan_loop(chunk, ops, pc, &source_targets, layout, fast, &cfg) {
-                    let plain_h =
-                        emit_loop_chain(&mut a, layout, ilayout, &plan, &pc_labels, &mut targeted);
+                    let plain_h = emit_loop_chain(&mut a, layout, &plan, &pc_labels, &mut targeted);
                     a.bind(plain_h);
                 } else if let Some(plan) = regions::Plan::build(chunk, &cfg, pc) {
                     for &(start, end) in plan.ranges() {
@@ -8177,7 +8176,7 @@ fn direct_call_supported(
         // The handlers Vec's length-word offset within JitCtx (per-instantiation, probed).
         && jit_handlers_len_offset().is_some_and(fits8)
         && fits8(offset_of!(JitCtx, ret))
-        && fits8(offset_of!(JitCtx, live_objects))
+        && fits8(offset_of!(JitCtx, poll_word))
         && attempted_off < 4096
         && fits4(runs_off)
         && fits4(retry_off)
@@ -14497,16 +14496,7 @@ mod numeric_chain_tests {
         .expect("numeric loop plan");
         let mut assembler = super::asm::Asm::new();
         let labels: Vec<_> = (0..=ops.len()).map(|_| assembler.new_label()).collect();
-        let mut poll_engine = crate::Engine::new();
-        let ilayout = crate::interpreter::interp_layout(&mut poll_engine.interp);
-        super::emit_loop_chain(
-            &mut assembler,
-            &layout,
-            &ilayout,
-            &plan,
-            &labels,
-            &mut targeted,
-        );
+        super::emit_loop_chain(&mut assembler, &layout, &plan, &labels, &mut targeted);
         let guard_pc = ops
             .windows(2)
             .position(|pair| matches!(pair, [Op::LoadLocal(_), Op::Pop]))
@@ -16823,7 +16813,6 @@ fn emit_linked_scan_materialize(a: &mut asm::Asm, plan: &LinkedScanPlan, peek_ob
 fn emit_linked_scan_region(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
-    ilayout: &crate::interpreter::InterpLayout,
     plan: &LinkedScanPlan,
     pc_labels: &[usize],
 ) -> usize {
@@ -16863,7 +16852,7 @@ fn emit_linked_scan_region(
     }
     a.mov(0, 15);
     a.movz(8, 1, 0);
-    emit_region_poll_guard(a, ilayout, fail, false);
+    emit_region_poll_guard(a, fail, false);
     a.b(body);
 
     a.bind(found_null);
@@ -16897,19 +16886,10 @@ extern "C" fn record_numeric_region_entry() {
 fn emit_loop_chain(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
-    ilayout: &crate::interpreter::InterpLayout,
     plan: &LoopPlan,
     pc_labels: &[usize],
     targeted: &mut [bool],
 ) -> usize {
-    // A helper-free region can keep its poll divider in a register, writing the
-    // shared tick at every exit. Unsupported layouts retain canonical polling.
-    if !ilayout.valid
-        || !ilayout.interrupt_poll_tick.is_multiple_of(4)
-        || ilayout.interrupt_poll_tick / 4 >= 4096
-    {
-        return a.new_label();
-    }
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
@@ -17907,7 +17887,9 @@ fn emit_loop_chain(
     }
 
     // ---- rotated loop ----------------------------------------------------------------------
-    emit_region_poll_start(a, ilayout, 28);
+    // A helper-free region keeps its poll countdown in a register (see
+    // `emit_region_poll_start`).
+    emit_region_poll_start(a, 28);
     emit_pass!(0..plan.cond_len, exit_a, Vec::new());
     // Keep hot-loop placement stable when cold preamble checks grow. The override is for
     // release A/B diagnostics, not a semantic switch; 0 disables padding. Large-branch
@@ -17952,19 +17934,15 @@ fn emit_loop_chain(
     };
     a.bind(exit_a);
     emit_flush(a, &cond_virgins);
-    emit_region_poll_finish(a, ilayout, 28);
     restore_ext(a);
     a.b(pc_labels[plan.exit_pc]);
     a.bind(exit_b);
     emit_flush(a, &all_virgins);
-    emit_region_poll_finish(a, ilayout, 28);
     restore_ext(a);
     a.b(pc_labels[plan.exit_pc]);
     a.bind(poll_bail);
     emit_flush(a, &all_virgins);
-    // Leave the due increment to the canonical header, with every root materialized.
-    a.movz(28, 1, 0);
-    emit_region_poll_finish(a, ilayout, 28);
+    // The canonical header polls the word, with every root materialized, and re-enters.
     restore_ext(a);
     a.b(pc_labels[plan.head]);
     a.bind(pre_fail);
@@ -17997,7 +17975,6 @@ fn emit_loop_chain(
             a.add_imm(20, 20, 8);
         }
         emit_flush(a, &seen);
-        emit_region_poll_finish(a, ilayout, 28);
         restore_ext(a);
         let pc = plan.chain[idx].1;
         if pc == plan.head {
@@ -18117,10 +18094,10 @@ fn helper_ends_in_poll(idx: usize) -> bool {
 /// run with virtual operands and private homes, and shared stubs, which region sites share,
 /// emit none (see `Asm::set_end_polls`): a region collects at its canonical header.
 ///
-/// Three instructions while the heap's due word is clear (the context's count pointer, the
-/// word, a CBZ). A set word calls `H_INTERRUPT` (`POLL_HELPER_END`), whose `gc_check` collects
-/// and so clears it; a throw from there (the live-object limit's RangeError, a host interrupt)
-/// unwinds from here. The object count is left to the entry and loop polls.
+/// The poll word, as entry and loop polls test it ([`emit_poll_word`]): three instructions
+/// while it is clear. A set word calls `H_INTERRUPT` (`POLL_HELPER_END`), whose `gc_check`
+/// collects and so clears the heap's bit; a throw from there (the live-object limit's
+/// RangeError, a host interrupt) unwinds from here.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -18134,8 +18111,7 @@ fn emit_helper_end_poll(a: &mut asm::Asm, l_unwind: usize) {
         return;
     }
     let done = a.new_label();
-    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, live_objects) as u32);
-    a.ldr_imm(9, 9, crate::value::LIVE_DUE_OFF);
+    emit_poll_word(a, 9);
     a.cbz(9, true, done);
     emit_op_helper(a, H_INTERRUPT, POLL_HELPER_END, l_unwind);
     a.bind(done);
@@ -18187,13 +18163,15 @@ pub(crate) const POLL_HELPER_END: u32 = 2;
 
 /// Test-only: what generated code's `H_INTERRUPT` calls on this thread did, indexed by
 /// the caller's `POLL_*` kind: the calls, the collections they ran, and the most bytes the heap
-/// had allocated past its trigger when a call collected.
+/// had allocated past its trigger, and the most objects live past the live-object ceiling, when
+/// a call collected.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PollCensus {
     pub(crate) calls: [u64; 3],
     pub(crate) collections: [u64; 3],
     pub(crate) max_overshoot: usize,
+    pub(crate) max_live_overshoot: i64,
 }
 
 #[cfg(test)]
@@ -18203,6 +18181,7 @@ thread_local! {
             calls: [0; 3],
             collections: [0; 3],
             max_overshoot: 0,
+            max_live_overshoot: 0,
         })
     };
     /// Test-only switch: chunks compiled while it is set end no helper call in a poll (see
@@ -18218,10 +18197,10 @@ pub(crate) fn take_poll_census() -> PollCensus {
     POLL_CENSUS.with(|census| census.replace(PollCensus::default()))
 }
 
-/// `jit_interrupt`'s record of one call (tests): its caller, whether it collected, and the
-/// heap's allocated bytes past the trigger before it ran.
+/// `jit_interrupt`'s record of one call (tests): its caller, whether it collected, and before
+/// it ran the heap's allocated bytes past the trigger and the objects live past the ceiling.
 #[cfg(test)]
-pub(crate) fn record_poll(kind: u32, collected: bool, overshoot: usize) {
+pub(crate) fn record_poll(kind: u32, collected: bool, overshoot: usize, live_overshoot: i64) {
     POLL_CENSUS.with(|census| {
         let mut current = census.get();
         let kind = kind as usize;
@@ -18229,161 +18208,81 @@ pub(crate) fn record_poll(kind: u32, collected: bool, overshoot: usize) {
         if collected {
             current.collections[kind] += 1;
             current.max_overshoot = current.max_overshoot.max(overshoot);
+            current.max_live_overshoot = current.max_live_overshoot.max(live_overshoot);
         }
         census.set(current);
     });
 }
 
-/// Load the live-object count into x9 from its address in x9 (`JitCtx::live_objects`). The
-/// cell heap's due word follows the count (`value::LiveCount`): one LDP loads both (the word
-/// into x10) and a set word takes `slow`, so the poll sees the heap's byte budget, stress
-/// interval and deferred requests, none of which moves the count. x10 is clobbered, which both
-/// polls reload with `gc_next` next.
+/// Load the interpreter's poll word (`interrupt::PollWord`) into `reg`, through the context's
+/// pointer to it: nonzero while a collection is due (the heap's bit) or a host interruption may
+/// be pending (the interrupt bit).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_live_count(a: &mut asm::Asm, slow: usize) {
-    const _: () = assert!(crate::value::LIVE_DUE_OFF == 8);
-    a.ldp_base(9, 10, 9, 0);
-    a.cbnz(10, true, slow);
+fn emit_poll_word(a: &mut asm::Asm, reg: u32) {
+    a.ldr_imm(reg, 19, std::mem::offset_of!(JitCtx, poll_word) as u32);
+    a.ldr_imm(reg, reg, 0);
 }
 
-/// Generated-loop safepoint. Allocation pressure must not wait for the interrupt divider:
-/// call-free loops can allocate cycles, and deferring optional task collection does not
-/// defer the live-object ceiling. The cold helper sees canonical owned frame roots.
-///
-/// The fast path loads `ctx.interp`, the count and the heap's due word ([`emit_live_count`]),
-/// compares the count with `gc_next`, then bumps the shared interrupt divider (12
-/// instructions); the slow path is `H_INTERRUPT` (`jit_interrupt`: the host interrupt, then
-/// `Interp::gc_check`), taken when the count passes `gc_next`, every 16384 ticks and while the
-/// heap's due word is set. There `gc_check` collects, which clears the word,
+/// Generated code's function-entry and loop safepoint, V8's shape: the poll word, one load
+/// through the context and a branch (three instructions), with no divider and no compare of
+/// the live-object count. The word is set while a collection is due (allocation pressure,
+/// which must not wait: call-free loops can allocate cycles, and deferring optional task
+/// collection does not defer the live-object ceiling), and while a host interruption may be
+/// pending (the host's requests and the deadline watchdog set it). The slow path is
+/// `H_INTERRUPT` (`jit_interrupt`: the host interrupt, then `Interp::gc_check`), whose helper
+/// sees canonical owned frame roots. There `gc_check` collects, which clears the heap's bit,
 /// unless collections are suppressed or deferred (a no-GC region, an outstanding borrow, an
-/// interpreter that does not own its heap): then the word stays set and every poll calls the
+/// interpreter that does not own its heap): then the bit stays set and every poll calls the
 /// helper until one can collect. `kind` is `POLL_LOOP` or `POLL_ENTRY`.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_interrupt_poll(
-    a: &mut asm::Asm,
-    ilayout: &crate::interpreter::InterpLayout,
-    kind: u32,
-    l_unwind: usize,
-) {
-    let offset = ilayout.interrupt_poll_tick;
-    if !ilayout.valid
-        || !offset.is_multiple_of(4)
-        || offset / 4 >= 4096
-        || !ilayout.gc_next.is_multiple_of(8)
-        || ilayout.gc_next / 8 >= 4096
-    {
-        emit_op_helper(a, H_INTERRUPT, kind, l_unwind);
-        return;
-    }
+fn emit_interrupt_poll(a: &mut asm::Asm, kind: u32, l_unwind: usize) {
     let done = a.new_label();
-    let slow = a.new_label();
-    a.ldr_imm(14, 19, 72); // ctx.interp
-    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, live_objects) as u32);
-    emit_live_count(a, slow);
-    a.ldr_imm(10, 14, ilayout.gc_next as u32);
-    a.cmp_reg_x(9, 10);
-    a.b_cond(C_GT, slow);
-    a.ldr_w_imm(9, 14, offset as u32);
-    a.add_imm(9, 9, 1);
-    a.str_w_imm(9, 14, offset as u32);
-    let mask = asm::logical_imm_w(0x3fff).expect("interrupt divider mask is encodable");
-    a.logic_imm_w(0, 10, 9, mask);
-    a.cbnz(10, false, done);
-    a.bind(slow);
+    emit_poll_word(a, 9);
+    a.cbz(9, true, done);
     emit_op_helper(a, H_INTERRUPT, kind, l_unwind);
     a.bind(done);
 }
 
-/// Start a helper-free region's register countdown. Since its body cannot enter author
-/// code, helpers or GC, the shared tick cannot change before its matching finish.
+/// Start a helper-free region's register countdown: its back-edges reach the canonical
+/// header, which polls the word, at least once every 16,384 iterations. Since the region's body
+/// cannot enter author code, helpers or GC, only a host interruption can need it, and the
+/// header's poll before each entry and at each countdown sees one.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_region_poll_start(
-    a: &mut asm::Asm,
-    ilayout: &crate::interpreter::InterpLayout,
-    counter: u32,
-) {
-    a.ldr_imm(14, 19, 72);
-    a.ldr_w_imm(9, 14, ilayout.interrupt_poll_tick as u32);
-    a.logic_imm_w(0, 9, 9, asm::logical_imm_w(0x3fff).unwrap());
+fn emit_region_poll_start(a: &mut asm::Asm, counter: u32) {
     a.movz(counter, 16384, 0);
-    a.sub_reg(counter, counter, 9);
 }
 
-/// Commit all private backedges, including wraparound, to the shared divider. Cold exits
-/// amortize this memory traffic; the hot loop needs only SUBS + conditional branch.
+/// A region's back-edge poll: a set word bails to `bail`, whose canonical code reaches the
+/// header's poll. A general region (`check_allocation`) tests the whole word: its checked
+/// effects may allocate, and they never poll themselves. While collections are suppressed or
+/// deferred the heap's bit stays set and every back-edge bails, but each bail follows a whole
+/// iteration run in the region, and the header re-enters the region after its poll: the loop
+/// makes progress at the cost of a materialization, a helper call and a reload per iteration.
+/// A helper-free region, which cannot allocate, tests only the interrupt bit (+1 instruction).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_region_poll_finish(
-    a: &mut asm::Asm,
-    ilayout: &crate::interpreter::InterpLayout,
-    counter: u32,
-) {
-    a.ldr_imm(14, 19, 72);
-    a.ldr_w_imm(9, 14, ilayout.interrupt_poll_tick as u32);
-    a.logic_imm_w(1, 9, 9, asm::logical_imm_w(0x3fff).unwrap());
-    a.add_imm(9, 9, 1);
-    a.sub_reg(9, 9, counter);
-    a.str_w_imm(9, 14, ilayout.interrupt_poll_tick as u32);
-}
-
-/// Private optimized backedges must participate in the same cancellation cadence as
-/// canonical headers. On a due tick materialize and revisit that header without storing
-/// the tick: it performs the poll exactly once with all owned roots visible to helpers.
-///
-/// A general region (`check_allocation`) also bails while the live-object count passes
-/// `gc_next` and while the heap's due word is set (+1 instruction, see
-/// [`emit_live_count`]); its checked effects never poll themselves. The bail lands on the
-/// canonical header, whose poll collects. While collections are suppressed or deferred the
-/// word stays set and every backedge bails, but each bail follows a whole iteration run in the
-/// region, and the header re-enters the region after its poll: the loop makes progress at
-/// the cost of a materialization, a helper call and a reload per iteration.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_region_poll_guard(
-    a: &mut asm::Asm,
-    ilayout: &crate::interpreter::InterpLayout,
-    bail: usize,
-    check_allocation: bool,
-) {
-    let offset = ilayout.interrupt_poll_tick;
-    if !ilayout.valid || !offset.is_multiple_of(4) || offset / 4 >= 4096 {
-        a.b(bail);
-        return;
-    }
-    a.ldr_imm(14, 19, 72);
-    // A general region may allocate through checked effects. Bail to its canonical
-    // header before collection, so virtual operands/private homes are materialized.
-    // Helper-free numeric regions use their separate register-only countdown.
+fn emit_region_poll_guard(a: &mut asm::Asm, bail: usize, check_allocation: bool) {
+    emit_poll_word(a, 9);
     if check_allocation {
-        if !ilayout.gc_next.is_multiple_of(8) || ilayout.gc_next / 8 >= 4096 {
-            a.b(bail);
-            return;
-        }
-        a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, live_objects) as u32);
-        emit_live_count(a, bail);
-        a.ldr_imm(10, 14, ilayout.gc_next as u32);
-        a.cmp_reg_x(9, 10);
-        a.b_cond(C_GT, bail);
+        a.cbnz(9, true, bail);
+    } else {
+        const _: () = assert!(crate::interrupt::POLL_INTERRUPT <= u32::MAX as u64);
+        let bit = asm::logical_imm_w(crate::interrupt::POLL_INTERRUPT as u32)
+            .expect("the interrupt bit is encodable");
+        a.logic_imm_w(0, 9, 9, bit);
+        a.cbnz(9, false, bail);
     }
-    a.ldr_w_imm(9, 14, offset as u32);
-    a.add_imm(9, 9, 1);
-    let mask = asm::logical_imm_w(0x3fff).unwrap();
-    a.logic_imm_w(0, 10, 9, mask);
-    a.cbz(10, false, bail);
-    a.str_w_imm(9, 14, offset as u32);
 }
 
 /// An infallible helper (returns the new sp): return/handler bookkeeping.
@@ -18715,7 +18614,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
         propstat_enabled: crate::bytecode::jit_propstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
-        live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        poll_word: i.poll.as_ptr(),
         shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
         activation: None,
         resume_activation: state,
@@ -18856,7 +18755,7 @@ pub fn run(
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
         propstat_enabled: crate::bytecode::jit_propstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
-        live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        poll_word: i.poll.as_ptr(),
         shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
@@ -18988,7 +18887,7 @@ fn test_running_code() -> [usize; 0] {
 /// Every activation that fits runs on a record of its own — Rust entries and direct JIT→JIT
 /// calls alike — so entering a frame writes only the callee's per-frame fields. Nothing is
 /// saved, swapped into a shared context, or restored afterwards. Interpreter-constant fields
-/// (helper table, interpreter, live-object counter, IC-safety byte, diagnostic switches and the
+/// (helper table, interpreter, poll word, IC-safety byte, diagnostic switches and the
 /// `slots` self-pointer) are written once, when the record is created; a record never leaves its
 /// interpreter's pool.
 ///
@@ -19065,7 +18964,7 @@ impl JitFrame {
                 callstat_enabled: crate::bytecode::jit_callstat_enabled(),
                 propstat_enabled: crate::bytecode::jit_propstat_enabled(),
                 inline_recompile_at: crate::bytecode::inline_recompile_at(),
-                live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+                poll_word: i.poll.as_ptr(),
                 shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
                 activation: None,
                 resume_activation: std::ptr::null_mut(),
@@ -19399,7 +19298,7 @@ unsafe fn run_moved_oversized(
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
         propstat_enabled: crate::bytecode::jit_propstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
-        live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        poll_word: i.poll.as_ptr(),
         shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),

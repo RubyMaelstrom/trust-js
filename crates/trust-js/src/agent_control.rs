@@ -224,7 +224,8 @@ impl Drop for Suppression {
 
 impl Interp {
     /// Agent policy is canonical; every native cache mirrors the same allowance before a Rust
-    /// poll returns. An idle child's next entry must not inherit an obsolete ceiling.
+    /// poll returns. An idle child's next entry must not inherit an obsolete ceiling. The heap
+    /// keeps the poll words' heap bit set while the live-object count is above it.
     pub(crate) fn set_agent_next(&mut self, next: i64) {
         // All writers use this method, and new_in_heap initializes every member from this
         // same canonical Cell before adoption (bootstrap cannot run host callbacks). Thus
@@ -233,6 +234,7 @@ impl Interp {
             return;
         }
         self.gc_heap.agent.next.set(next);
+        self.gc_heap.core.borrow_mut().set_live_limit(next);
         let access = self.gc_heap.agent.access.clone();
         self.with_raw_access(|_| {
             for (_, pointer) in access.snapshot() {

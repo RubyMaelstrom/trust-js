@@ -42,11 +42,13 @@
 //!   young pages' bookkeeping as each collection starts and verifies the marked graph.
 
 use crate::fasthash::FastMap;
+use crate::interrupt::PollWord;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
 pub(crate) const PAGE_SHIFT: u32 = PAGE_SIZE.trailing_zeros();
@@ -1595,13 +1597,16 @@ pub(crate) struct Heap {
     /// sweeps): not when allocation may collect, under a stress interval or during a
     /// collection, which count each cell as it is taken ([`Heap::update_fast_alloc`]).
     fast_alloc: bool,
-    /// The embedder's copy of [`Heap::collection_due`], as a word that code polls without
-    /// calling into the heap (see [`Heap::attach_due_word`]).
-    due_word: Option<NonNull<Cell<u64>>>,
-    /// The embedder's live-cell count for one descriptor, stored at a stable address beside
-    /// its due word. Allocation increments it; each swept page subtracts its newly dead cells.
+    /// The embedder's live-cell count for one descriptor, stored at a stable address.
+    /// Allocation increments it; each swept page subtracts its newly dead cells.
     live_count: Option<(DescId, NonNull<Cell<i64>>)>,
-    /// Allocated bytes past which [`Heap::alloc`] recomputes the due word: the byte trigger;
+    /// The embedder's threshold for `live_count` (its live-object ceiling): a count above it
+    /// makes the poll words' heap bit set ([`Heap::poll_due`]).
+    live_limit: i64,
+    /// The count past which [`Heap::count_live`] recomputes the heap bit: `live_limit` while
+    /// the bit is clear, `i64::MAX` while it is set (no allocation can clear it).
+    live_check: i64,
+    /// Allocated bytes past which [`Heap::alloc`] recomputes the heap bit: the byte trigger;
     /// under a stress interval the current total (the allocation count decides, so every
     /// allocation recomputes); `usize::MAX` once due (no allocation can make it false; marking,
     /// sweeping and the settings recompute it).
@@ -1670,8 +1675,9 @@ impl Heap {
             external_due_at_mark: false,
             collect_on_alloc: true,
             fast_alloc: false,
-            due_word: None,
             live_count: None,
+            live_limit: i64::MAX,
+            live_check: i64::MAX,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
             stats: GcStats::default(),
             phase_timing: false,
@@ -1962,22 +1968,26 @@ impl Heap {
         }
     }
 
-    /// Keep `word` equal to [`Heap::collection_due`] (1 or 0) from now on, for code that polls
-    /// for a collection without calling into the heap (the native JIT's polls; see
-    /// `value::LiveCount`). The heap is the word's only writer, with its control block's external
-    /// ledger. An allocation that spends a budget or reaches the stress interval sets it
-    /// ([`Heap::alloc`]), and so do a deferred request and an external charge that spends the
-    /// external budget ([`Control::charge_external`]); marking (which takes the pending request
-    /// and a due major collection), the end of every sweep (new budgets and interval, a major
-    /// collection a minor one made due, and any request that arrived meanwhile) and the settings
-    /// recompute it. Nothing else changes what `collection_due` reads.
-    ///
-    /// # Safety
-    /// `word` must stay valid at its address, and written by no one else, for as long as the
-    /// heap lives.
-    pub(crate) unsafe fn attach_due_word(&mut self, word: NonNull<Cell<u64>>) {
-        self.due_word = Some(word);
-        self.control.external.due_word.set(Some(word));
+    /// Whether the poll words' heap bit is set ([`Control::attach_poll_word`]): a collection is
+    /// due ([`Heap::collection_due`]), or the counted cells exceed their threshold
+    /// ([`Heap::set_live_limit`]).
+    pub(crate) fn poll_due(&self) -> bool {
+        self.collection_due() || self.over_live_limit()
+    }
+
+    /// Whether the counted cells (`live_count`) exceed `live_limit`.
+    fn over_live_limit(&self) -> bool {
+        self.live_count.is_some_and(|(_, count)| {
+            // SAFETY: `attach_live_count`'s contract.
+            unsafe { count.as_ref() }.get() > self.live_limit
+        })
+    }
+
+    /// The threshold for the counted cells (the embedder's live-object ceiling): the poll words'
+    /// heap bit is set while more are live, which the allocation that passes it sees
+    /// ([`Heap::count_live`]).
+    pub(crate) fn set_live_limit(&mut self, limit: i64) {
+        self.live_limit = limit;
         self.refresh_due();
     }
 
@@ -1991,6 +2001,7 @@ impl Heap {
         // SAFETY: the caller keeps the count valid until the heap is dropped.
         unsafe { count.as_ref() }.set(self.live_count(desc) as i64);
         self.live_count = Some((desc, count));
+        self.refresh_due();
     }
 
     /// Whether `addr` is the start of an initialized, non-zombie cell of `desc`. This resolves
@@ -2043,19 +2054,18 @@ impl Heap {
         }
     }
 
-    /// Whether the attached due word (if any) agrees with [`Heap::collection_due`]: the
-    /// invariant [`Heap::attach_due_word`] promises, for debug assertions.
-    pub(crate) fn due_word_agrees(&self) -> bool {
-        // SAFETY: `attach_due_word`'s contract.
-        self.due_word
-            .is_none_or(|word| (unsafe { word.as_ref() }.get() != 0) == self.collection_due())
+    /// Whether the attached poll words' heap bit agrees with [`Heap::poll_due`]: the invariant
+    /// [`Control::attach_poll_word`] promises, for debug assertions.
+    pub(crate) fn poll_bit_agrees(&self) -> bool {
+        self.control.poll_words.agree(self.poll_due())
     }
 
-    /// Recompute the due word and the allocation check after an input of
-    /// [`Heap::collection_due`] changed.
+    /// Recompute the poll words' heap bit and the allocation checks after an input of
+    /// [`Heap::poll_due`] changed.
     #[cold]
     fn refresh_due(&mut self) {
         let due = self.collection_due();
+        let over = self.over_live_limit();
         self.due_check_bytes = if due {
             usize::MAX
         } else if self.stress_every > 0 {
@@ -2066,10 +2076,12 @@ impl Heap {
                 None => self.trigger_bytes,
             }
         };
-        if let Some(word) = self.due_word {
-            // SAFETY: `attach_due_word`'s contract.
-            unsafe { word.as_ref() }.set(u64::from(due));
-        }
+        self.live_check = if due || over {
+            i64::MAX
+        } else {
+            self.live_limit
+        };
+        self.control.poll_words.publish(due || over);
     }
 
     /// The byte budget: max(`min_bytes`, the bytes a major collection's sweep leaves, with the
@@ -2273,12 +2285,18 @@ impl Heap {
 
     /// Count a new cell of `desc` in the embedder's live count, if it keeps one for `desc`.
     #[inline(always)]
-    fn count_live(&self, desc: DescId) {
+    fn count_live(&mut self, desc: DescId) {
         if let Some((counted, count)) = self.live_count {
             if desc == counted {
                 // SAFETY: `attach_live_count` keeps the count valid until this heap is dropped.
                 let count = unsafe { count.as_ref() };
-                count.set(count.get() + 1);
+                let live = count.get() + 1;
+                count.set(live);
+                // The heap bit's other compare: the cell that passes the threshold recomputes
+                // it, out of line, as `charge_bytes` does for the byte budgets.
+                if live > self.live_check {
+                    self.refresh_due_cold();
+                }
             }
         }
     }
@@ -2288,7 +2306,7 @@ impl Heap {
     #[inline(always)]
     fn charge_bytes(&mut self, bytes: usize) {
         self.allocated_bytes = self.allocated_bytes.saturating_add(bytes);
-        // The due word's one compare: an allocation past the budget (any allocation under a
+        // The heap bit's byte compare: an allocation past the budget (any allocation under a
         // stress interval) recomputes it, out of line.
         if self.allocated_bytes > self.due_check_bytes {
             self.refresh_due_cold();
@@ -3118,7 +3136,7 @@ impl Heap {
     }
 
     fn defer(&mut self, native_stack: bool, kind: CollectionKind) -> bool {
-        // With a request pending the due word is set already.
+        // With a request pending the heap bit is set already.
         self.major_due |= kind == CollectionKind::Major;
         if !self.control.pending_collect.replace(true) {
             self.stats.deferred_collections += 1;
@@ -4204,10 +4222,9 @@ impl Drop for Heap {
         if !std::thread::panicking() {
             self.debug_assert_quiescent();
         }
-        // The due word belongs to the heap's owner, which may be dropping it too, and a charge
-        // that outlives the heap keeps its ledger (`value::ExternalCharge`): neither may write it.
-        self.due_word = None;
-        self.control.external.due_word.set(None);
+        // A charge that outlives the heap keeps its ledger (`value::ExternalCharge`): it must no
+        // longer write the poll words of the heap's interpreters.
+        self.control.poll_words.words.borrow_mut().clear();
         self.release_all();
     }
 }
@@ -4222,6 +4239,36 @@ pub(crate) struct Control {
     markings: Cell<u64>,
     /// The bytes this heap's cells own outside it (see [`ExternalBytes`]).
     external: ExternalBytes,
+    /// The poll words whose heap bit this heap keeps (see [`Control::attach_poll_word`]).
+    poll_words: PollWords,
+}
+
+/// The poll words of the interpreters that allocate in a heap (`interrupt::PollWord`), and their
+/// heap bit as last written: the heap and its external ledger write it, only when it changes.
+#[derive(Default)]
+struct PollWords {
+    words: RefCell<Vec<Arc<PollWord>>>,
+    due: Cell<bool>,
+}
+
+impl PollWords {
+    fn publish(&self, due: bool) {
+        if self.due.replace(due) != due {
+            for word in self.words.borrow().iter() {
+                word.set_heap_due(due);
+            }
+        }
+    }
+
+    /// Whether every word's heap bit says `due` (debug assertions and tests).
+    fn agree(&self, due: bool) -> bool {
+        self.due.get() == due
+            && self
+                .words
+                .borrow()
+                .iter()
+                .all(|word| word.heap_due() == due)
+    }
 }
 
 /// The ledger of the bytes the heap's cells own outside the heap: Rust-heap payloads (ordered
@@ -4242,8 +4289,6 @@ struct ExternalBytes {
     budget: Cell<usize>,
     /// `since` passed `budget`: a collection is due. Cleared by every sweep.
     due: Cell<bool>,
-    /// The heap's due word (see [`Heap::attach_due_word`]), set to 1 with `due`.
-    due_word: Cell<Option<NonNull<Cell<u64>>>>,
 }
 
 impl Control {
@@ -4261,7 +4306,7 @@ impl Control {
 
     /// Record `bytes` of Rust-heap payload acquired by a cell of this heap, or by a container a
     /// cell will own. A collection becomes due once the bytes charged since the last one pass the
-    /// external budget; the due word says so at once, so the next safepoint collects.
+    /// external budget; the poll words' heap bit says so at once, so the next safepoint collects.
     pub(crate) fn charge_external(&self, bytes: usize) {
         let external = &self.external;
         external.live.set(external.live.get().saturating_add(bytes));
@@ -4269,12 +4314,31 @@ impl Control {
         external.since.set(since);
         let budget = external.budget.get();
         if budget != 0 && since > budget && !external.due.replace(true) {
-            if let Some(word) = external.due_word.get() {
-                // SAFETY: `Heap::attach_due_word`'s contract: the word stays valid while the heap,
-                // whose control block this is, lives, and only the heap and this ledger write it.
-                unsafe { word.as_ref() }.set(1);
-            }
+            self.poll_words.publish(true);
         }
+    }
+
+    /// Keep `word`'s heap bit equal to [`Heap::poll_due`] from now on, for code that polls for a
+    /// collection without calling into the heap (an interpreter's safepoints, in every tier;
+    /// see `interrupt::PollWord`). The heap is the bit's only writer, with this external ledger.
+    /// An allocation that spends a budget, reaches the stress interval or passes the live-cell
+    /// threshold sets it ([`Heap::alloc`]), and so do a deferred request and an external charge
+    /// that spends the external budget ([`Control::charge_external`]); marking (which takes the
+    /// pending request and a due major collection), the end of every sweep (new budgets,
+    /// interval and live count, a major collection a minor one made due, and any request that
+    /// arrived meanwhile) and the settings recompute it. Nothing else changes what `poll_due`
+    /// reads.
+    pub(crate) fn attach_poll_word(&self, word: &Arc<PollWord>) {
+        word.set_heap_due(self.poll_words.due.get());
+        self.poll_words.words.borrow_mut().push(word.clone());
+    }
+
+    /// Stop writing `word`'s heap bit (its interpreter ends).
+    pub(crate) fn detach_poll_word(&self, word: &Arc<PollWord>) {
+        self.poll_words
+            .words
+            .borrow_mut()
+            .retain(|kept| !Arc::ptr_eq(kept, word));
     }
 
     /// Record that `bytes` charged by [`Control::charge_external`] were released.
@@ -6441,22 +6505,21 @@ mod tests {
         black_box(&top);
     }
 
-    /// The attached due word follows `collection_due` through each of its inputs: the byte
-    /// budget (set by the allocation that spends it, not before), the stress interval, a
-    /// deferred request (also one deferred while a collection runs) and the collections that
+    /// An attached poll word's heap bit follows `collection_due` through each of its inputs:
+    /// the byte budget (set by the allocation that spends it, not before), the stress interval,
+    /// a deferred request (also one deferred while a collection runs) and the collections that
     /// reset them.
     #[test]
-    fn due_word_tracks_collection_due() {
-        // Declared before the fixture: the word outlives the heap.
-        let word = Box::new(Cell::new(7u64));
+    fn poll_bit_tracks_collection_due() {
+        let word = Arc::new(PollWord::default());
+        word.set_heap_due(true);
         let mut fx = Fixture::new();
         // As in an engine heap: allocation never collects.
         fx.heap.set_collect_on_alloc(false);
-        // SAFETY: `word` outlives the heap and nothing else writes it.
-        unsafe { fx.heap.attach_due_word(NonNull::from(&*word)) };
+        fx.heap.control().attach_poll_word(&word);
         let due = |fx: &Fixture| {
-            assert!(fx.heap.due_word_agrees());
-            word.get() == 1
+            assert!(fx.heap.poll_bit_agrees());
+            word.heap_due()
         };
         assert!(!due(&fx), "attaching writes the current state");
 
@@ -6516,6 +6579,59 @@ mod tests {
         assert!(due(&fx) && fx.heap.collection_pending());
         fx.collect();
         assert!(!due(&fx));
+    }
+
+    /// The heap bit also follows the counted cells against their threshold: the allocation
+    /// that passes it sets the bit (and nothing before it), the collection that brings the count
+    /// back clears it, and a new threshold recomputes it. Each word keeps the interrupt bit as
+    /// another writer left it, and a detached word is no longer written.
+    #[test]
+    fn poll_bit_follows_the_live_cell_threshold() {
+        let count = Box::new(Cell::new(-1));
+        let (word, other) = (Arc::new(PollWord::default()), Arc::new(PollWord::default()));
+        let interrupt = crate::RuntimeInterrupt::default();
+        interrupt.register(&other);
+        interrupt.cancel();
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        // SAFETY: `count` outlives the heap and no other code writes it.
+        unsafe { fx.heap.attach_live_count(fx.leaf, NonNull::from(&*count)) };
+        fx.heap.control().attach_poll_word(&word);
+        fx.heap.control().attach_poll_word(&other);
+        let due = |fx: &Fixture| {
+            assert!(fx.heap.poll_bit_agrees());
+            assert_eq!(word.heap_due(), other.heap_due());
+            word.heap_due()
+        };
+        fx.heap.set_live_limit(10);
+        let mut cells = Vec::new();
+        for _ in 0..10 {
+            cells.push(fx.heap.alloc(fx.leaf, 16));
+            fx.alloc_node(0, 1); // another descriptor never counts
+            assert!(!due(&fx));
+        }
+        cells.push(fx.heap.alloc(fx.leaf, 16));
+        assert!(due(&fx), "the eleventh counted cell passes the threshold");
+        assert!(!fx.heap.collection_due(), "no budget is spent");
+        assert!(other.interrupt_pending() && !word.interrupt_pending());
+        for (root, cell) in fx.roots.iter_mut().zip(&cells[..4]) {
+            *root = *cell as u64;
+        }
+        fx.collect();
+        assert_eq!(count.get(), 4);
+        assert!(!due(&fx), "the collection brought the count back");
+        assert!(other.interrupt_pending(), "the interrupt bit is left alone");
+        fx.heap.set_live_limit(3);
+        assert!(due(&fx), "a lower threshold recomputes the bit");
+        fx.heap.set_live_limit(4);
+        assert!(!due(&fx));
+        fx.heap.control().detach_poll_word(&other);
+        fx.heap.set_live_limit(0);
+        assert!(word.heap_due() && !other.heap_due());
+        fx.heap.set_live_limit(i64::MAX);
+        assert!(!word.heap_due());
+        fx.roots.fill(0);
+        fx.collect();
     }
 
     /// Descriptor accounting follows allocations and newly finalized cells, independently of
@@ -8076,22 +8192,20 @@ mod tests {
         assert_eq!(fx.heap.minor_collections(), 3);
     }
 
-    /// The due logic with a nursery, and the due word with it: a minor collection is due once
+    /// The due logic with a nursery, and the heap bit with it: a minor collection is due once
     /// the bytes allocated since the last collection pass the nursery budget; a major one once
     /// a minor collection leaves the heap holding more than the byte budget (live or not), at
     /// once and until a major collection runs, which sets the next budget; and a major request
     /// that is deferred makes one due. Without a nursery the heap asks for major collections.
     #[test]
     fn minor_and_major_collections_fall_due_by_their_budgets() {
-        // Declared before the fixture: the word outlives the heap.
-        let word = Box::new(Cell::new(7u64));
+        let word = Arc::new(PollWord::default());
         let mut fx = Fixture::new();
         fx.heap.set_collect_on_alloc(false);
-        // SAFETY: `word` outlives the heap and nothing else writes it.
-        unsafe { fx.heap.attach_due_word(NonNull::from(&*word)) };
+        fx.heap.control().attach_poll_word(&word);
         let due = |fx: &Fixture| {
-            assert!(fx.heap.due_word_agrees());
-            word.get() == 1
+            assert!(fx.heap.poll_bit_agrees());
+            word.heap_due()
         };
         assert_eq!(fx.heap.due_kind(), CollectionKind::Major, "no nursery");
         // A nursery of 256 16-byte cells, and a byte budget of 16 KiB.

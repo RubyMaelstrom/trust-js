@@ -26844,11 +26844,11 @@ unsafe fn jit_complete_target(
     }
 }
 
-/// Full loop safepoint reached by the generated tier's interrupt divider or allocation
-/// pressure guard (also the heap's due word, at entry and loop polls and at the end of
-/// allocating helpers' calls; `_imm` names the caller, see `jit::POLL_LOOP`). KeptAlive roots
-/// remain intact until the host's job boundary; optional task collection deferral must not
-/// suppress allocation-limit/collection safepoints.
+/// The slow path of generated code's polls, taken while the interpreter's poll word is set (at
+/// entry and loop polls, and at the end of allocating helpers' calls; `_imm` names the caller,
+/// see `jit::POLL_LOOP`): a host interruption may be pending, or a collection is due. KeptAlive
+/// roots remain intact until the host's job boundary; optional task collection deferral must
+/// not suppress allocation-limit/collection safepoints.
 pub(crate) unsafe extern "C" fn jit_interrupt(
     ctx: *mut crate::jit::JitCtx,
     _imm: u32,
@@ -26857,15 +26857,17 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
     #[cfg(test)]
-    let (collections, overshoot) = {
+    let (collections, overshoot, live_overshoot) = {
         let core = i.gc_heap.core.borrow();
-        (core.collections(), core.budget_overshoot())
+        let live = crate::value::heap_live_objects(&i.gc_heap);
+        let past = live.saturating_sub(i.gc_heap.agent.next.get()).max(0);
+        (core.collections(), core.budget_overshoot(), past)
     };
     let result = i.interrupt_poll_force().and_then(|()| i.gc_check());
     #[cfg(test)]
     {
         let collected = i.gc_heap.core.borrow().collections() != collections;
-        crate::jit::record_poll(_imm, collected, overshoot);
+        crate::jit::record_poll(_imm, collected, overshoot, live_overshoot);
     }
     match result {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
@@ -26946,7 +26948,7 @@ mod return_slot_tests {
             callstat_enabled: false,
             propstat_enabled: false,
             inline_recompile_at: 100,
-            live_objects: std::ptr::null(),
+            poll_word: std::ptr::null(),
             shape_layouts: std::ptr::null(),
         }
     }

@@ -3004,23 +3004,16 @@ pub(crate) struct EnteredRealm {
     pub(crate) saved: crate::interpreter::RealmState,
 }
 
-/// The live-object count and, beside it, the cell heap's due word: 1 exactly while
-/// `gc_core::Heap::collection_due` holds (the byte budget is spent, the stress interval reached
-/// or a request deferred), which the heap keeps current as their only writer (attached by
-/// [`new_gc_heap`]). None of these moves the count. `JitCtx::live_objects` holds the count's
-/// address, so a JIT poll loads both words with one LDP: the count for its `gc_next` compare,
-/// the due word for its slow path (see `jit::emit_live_count`).
-#[repr(C)]
+/// The live-object count, which the cell heap keeps (attached by [`new_gc_heap`]): allocation
+/// increments it, and each sweep subtracts the objects it finds dead.
 pub(crate) struct LiveCount {
     count: Cell<i64>,
-    due: Cell<u64>,
 }
 
 impl LiveCount {
     fn new(count: i64) -> Self {
         Self {
             count: Cell::new(count),
-            due: Cell::new(0),
         }
     }
 
@@ -3028,37 +3021,34 @@ impl LiveCount {
         self.count.get()
     }
 
+    #[cfg(test)]
     fn as_ptr(&self) -> *mut i64 {
         self.count.as_ptr()
     }
 }
 
-/// Byte offset of the due word from the live-object count (see [`LiveCount`]).
-pub(crate) const LIVE_DUE_OFF: u32 = 8;
-
-const _: () = assert!(
-    std::mem::offset_of!(LiveCount, count) == 0
-        && std::mem::offset_of!(LiveCount, due) == LIVE_DUE_OFF as usize
-);
-
-/// Whether the cell heap has a collection due, as generated code reads it (tests; see
-/// [`LiveCount`]).
-#[cfg(test)]
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-pub(crate) fn heap_collection_due(heap: &GcHeap) -> bool {
-    heap.live.due.get() != 0
+/// Keep `word`'s heap bit (`interrupt::POLL_HEAP`) for `heap` from now on: set exactly while a
+/// collection is due, the live-object count above its ceiling included (see
+/// `gc_core::Control::attach_poll_word`).
+pub(crate) fn attach_poll_word(heap: &GcHeap, word: &std::sync::Arc<crate::interrupt::PollWord>) {
+    heap.ledger.attach_poll_word(word);
 }
 
-/// Debug builds: the due word agrees with the core's `collection_due` (checked at
+/// Stop keeping `word`'s heap bit (its interpreter ends). Needs no borrow of the core: a
+/// ShadowRealm's interpreter may end inside its parent's collection.
+pub(crate) fn detach_poll_word(heap: &GcHeap, word: &std::sync::Arc<crate::interrupt::PollWord>) {
+    heap.ledger.detach_poll_word(word);
+}
+
+/// Debug builds: the poll words' heap bit agrees with the core's `poll_due` (checked at
 /// `Interp::gc_check`).
-pub(crate) fn debug_assert_due_word(heap: &GcHeap) {
+pub(crate) fn debug_assert_poll_bit(heap: &GcHeap) {
     if cfg!(debug_assertions) {
         if let Ok(core) = heap.core.try_borrow() {
             assert!(
-                core.due_word_agrees(),
-                "the due word ({}) disagrees with collection_due ({})",
-                heap.live.due.get(),
-                core.collection_due()
+                core.poll_bit_agrees(),
+                "the poll words' heap bit disagrees with poll_due ({})",
+                core.poll_due()
             );
         }
     }
@@ -4603,13 +4593,14 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         #[cfg(test)]
         client_report: RefCell::default(),
     });
-    // SAFETY: the word lives in this heap's `GcState`, which the `Rc` keeps at one address for
-    // as long as the core, one of its fields, lives; nothing but the core writes it.
-    unsafe {
-        let word = std::ptr::NonNull::from(&heap.live.due);
+    {
         let mut core = heap.core.borrow_mut();
-        core.attach_due_word(word);
-        core.attach_live_count(heap.object_desc, std::ptr::NonNull::from(&heap.live.count));
+        // SAFETY: the count lives in this heap's `GcState`, which the `Rc` keeps at one address
+        // for as long as the core, one of its fields, lives; nothing but the core writes it.
+        unsafe {
+            core.attach_live_count(heap.object_desc, std::ptr::NonNull::from(&heap.live.count))
+        };
+        core.set_live_limit(heap.agent.next.get());
     }
     remember_gc_heap(&heap);
     heap
@@ -5111,12 +5102,8 @@ pub(crate) fn active_shape_transition_count() -> u64 {
     })
 }
 
-/// Stable address of this Agent's live-object counter. JIT activations capture it when execution
-/// starts; reusable compiled chunks must not embed it because a chunk can be shared across Agents.
-/// Both native backends capture this pointer in the shared JIT entry paths. Those
-/// wrappers are also type-checked on fallback targets; obtaining this stable Cell
-/// address does not depend on native code generation or a platform ABI. The
-/// cell heap's due word follows the count ([`LiveCount`]).
+/// Stable address of this Agent's live-object counter (tests).
+#[cfg(test)]
 pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
     heap.live.as_ptr()
 }
@@ -5148,7 +5135,7 @@ mod jit_heap_tests {
     #[test]
     fn jit_live_object_counters_follow_their_heaps_across_agent_switches() {
         // ECMA-262, Agents (https://tc39.es/ecma262/#sec-agents): independent Agents may
-        // share a native thread. A captured JIT counter must keep tracking its owning heap.
+        // share a native thread. A heap's counter must keep tracking that heap.
         use crate::gc_test::{alive, in_frame};
         let mut first = crate::Engine::new();
         let mut second = crate::Engine::new();

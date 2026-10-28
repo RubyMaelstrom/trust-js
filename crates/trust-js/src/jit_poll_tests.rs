@@ -1,20 +1,22 @@
-//! The native JIT's polls see the cell heap's "collection due" (P1 S5 step 7b; ARM64, and
-//! x86-64 from S6 step 7): its byte budget, stress interval and deferred requests, none of
-//! which moves the live-object count, through the due word beside that count
-//! (`value::LiveCount`). Entry and loop polls take their slow path while the word is set, a
-//! general region's backedge guard bails to its canonical header (ARM64), and in baseline code
-//! the calls of allocating helpers end in an explicit poll (`jit::emit_helper_end_poll`,
-//! `x64::Asm::helper_end_poll`). x64 has no regions and no direct call sequence: its loops run
-//! in baseline code and its calls through the checked helper.
+//! The native JIT's polls test the interpreter's poll word (`interrupt::PollWord`; Decision 11,
+//! V8's shape), whose heap bit is set exactly while a collection is due: the cell heap's byte
+//! budget, stress interval and deferred requests (P1 S5 step 7b; ARM64, and x86-64 from S6 step
+//! 7), and the live-object count above its ceiling, which the allocator compares. Its interrupt
+//! bit is set while a host interruption may be pending. Entry and loop polls take their slow
+//! path while the word is set, a general region's backedge guard bails to its canonical header
+//! (ARM64), and in baseline code the calls of allocating helpers end in an explicit poll
+//! (`jit::emit_helper_end_poll`, `x64::Asm::helper_end_poll`). No poll counts a divider: while
+//! the word is clear none takes its slow path. x64 has no regions and no direct call sequence:
+//! its loops run in baseline code and its calls through the checked helper.
 //!
 //! The programs run at `Tier::Jit` with collections on and, in debug builds, the heap verifier
-//! after every marking. Each counts the
-//! collections generated code's polls ran, by caller (`jit::take_poll_census`), checks that its
-//! functions ran natively, and checks the due word against the heap's `collection_due` (as
-//! `Interp::gc_check` does at every safepoint in debug builds). "Stress 1" is the heap setting
-//! `TRUST_JS_GC_STRESS=1` gives every heap, a collection due after each cell allocation,
-//! applied to the test's own heap. `jit::TEST_NO_END_POLLS` compiles without helper-end polls,
-//! to watch the entry and loop polls alone.
+//! after every marking. Each counts the slow-path calls and the collections generated code's
+//! polls ran, by caller (`jit::take_poll_census`), checks that its functions ran natively, and
+//! checks the heap bit against the heap's `poll_due` (as `Interp::gc_check` does at every
+//! safepoint in debug builds). "Stress 1" is the heap setting `TRUST_JS_GC_STRESS=1` gives every
+//! heap, a collection due after each cell allocation, applied to the test's own heap.
+//! `jit::TEST_NO_END_POLLS` compiles without helper-end polls, to watch the entry and loop polls
+//! alone.
 
 use crate::bytecode::Tier;
 use crate::interpreter::Interp;
@@ -48,14 +50,11 @@ fn collections(i: &Interp) -> u64 {
     i.gc_heap.core.borrow().collections()
 }
 
-/// The due word generated code reads agrees with the heap's `collection_due`.
-fn assert_due_word(i: &Interp) {
+/// The heap bit generated code reads agrees with the heap's `poll_due`.
+fn assert_poll_bit(i: &Interp) {
     let core = i.gc_heap.core.borrow();
-    assert!(core.due_word_agrees());
-    assert_eq!(
-        crate::value::heap_collection_due(&i.gc_heap),
-        core.collection_due()
-    );
+    assert!(core.poll_bit_agrees());
+    assert_eq!(i.poll.heap_due(), core.poll_due());
 }
 
 /// Region entries so far on this thread (`regions::executed_regions`); x64 has no regions.
@@ -94,7 +93,7 @@ fn measured(engine: &mut Engine, source: &str) -> (String, PollCensus) {
 /// calls collects on (nearly) every iteration. `wide` runs in baseline code (its 16-element
 /// literal is deeper than a region's operand stack): with helper-end polls each allocation is
 /// collected where its helper returns, with them off at the loop header's poll, which now sees
-/// the due word. On ARM64 `narrow` runs as a general region, whose backedge bails to the
+/// the heap bit. On ARM64 `narrow` runs as a general region, whose backedge bails to the
 /// canonical header's poll either way; on x86-64 it runs in baseline code, as `wide` does.
 #[test]
 fn loop_only_code_collects_every_iteration_at_stress_1() {
@@ -128,7 +127,7 @@ fn loop_only_code_collects_every_iteration_at_stress_1() {
                 let entries = executed_regions();
                 let (result, census) = measured(&mut engine, &format!("{function}({N});"));
                 assert_eq!(result, (N * (N - 1) / 2).to_string());
-                assert_due_word(&engine.interp);
+                assert_poll_bit(&engine.interp);
                 (census, executed_regions() - entries)
             })
         };
@@ -196,7 +195,7 @@ fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
             {
                 let (result, census) = measured(&mut engine, &format!("down({N});"));
                 assert_eq!(result, (N * (N + 1) / 2).to_string());
-                assert_due_word(&engine.interp);
+                assert_poll_bit(&engine.interp);
                 census
             }
             // A concurrent test that recompiles a chunk or reclaims native code advances the
@@ -214,7 +213,7 @@ fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
                     super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
                     let (result, census) = measured(&mut engine, &format!("down({N});"));
                     assert_eq!(result, (N * (N + 1) / 2).to_string());
-                    assert_due_word(&engine.interp);
+                    assert_poll_bit(&engine.interp);
                     if super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) as u64 >= 2 * N {
                         return census;
                     }
@@ -249,10 +248,10 @@ fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
 }
 
 /// (3) The nursery budget, no stress: a loop allocating only strings, which move no live-object
-/// count, collects within one poll of spending its budget, not at the interrupt divider: the
-/// loop takes fewer polls than the divider's 16384, and the most bytes a collecting poll found
-/// allocated past the budget stays within one iteration's allocations. (Until S6 step 10c the
-/// byte budget made allocation's collections due; the nursery budget does now.)
+/// count, collects within one poll of spending its budget: every collection runs at a poll of
+/// generated code, and the most bytes a collecting poll found allocated past the budget stays
+/// within one iteration's allocations. (Until S6 step 10c the byte budget made allocation's
+/// collections due; the nursery budget does now.)
 #[test]
 fn a_spent_byte_budget_collects_within_one_poll() {
     const SOURCE: &str = r#"
@@ -284,11 +283,10 @@ fn a_spent_byte_budget_collects_within_one_poll() {
     let objects = engine.interp.live_object_count();
     let allocations = stats.allocations;
     let before = collections(&engine.interp);
-    engine.interp.interrupt_poll_tick = 1; // the divider is due 16383 polls from here
     let (result, census) = measured(&mut engine, &format!("strings({N});"));
     let expected: u64 = (0..N).map(|i| 1 + i.to_string().len() as u64).sum();
     assert_eq!(result, expected.to_string());
-    assert_due_word(&engine.interp);
+    assert_poll_bit(&engine.interp);
     let collected = collections(&engine.interp) - before;
     let cells = engine.interp.gc_heap.core.borrow().stats().allocations - allocations;
     eprintln!(
@@ -332,8 +330,8 @@ fn a_deferred_request_is_honoured_at_the_next_poll() {
             i.gc_collect();
         }
         assert_eq!(collections(i), before, "the request was deferred");
-        assert!(crate::value::heap_collection_due(&i.gc_heap));
-        assert_due_word(i);
+        assert!(i.poll.heap_due());
+        assert_poll_bit(i);
         Ok(Value::Num(before as f64))
     }
     fn count(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
@@ -372,7 +370,7 @@ fn a_deferred_request_is_honoured_at_the_next_poll() {
             ]
             .map(|call| {
                 let (result, census) = measured(&mut engine, call);
-                assert_due_word(&engine.interp);
+                assert_poll_bit(&engine.interp);
                 (result, census)
             });
             (calls, executed_regions() > regions)
@@ -466,21 +464,21 @@ fn operand_temporaries_survive_helper_end_polls() {
         let census = take_poll_census();
         eprintln!("operand temporaries, g({n}): {census:?}");
         assert!(census.collections[END] >= 2, "{census:?}");
-        assert_due_word(&engine.interp);
+        assert_poll_bit(&engine.interp);
     }
     assert_tracked_collectable(&mut engine);
 }
 
-/// (6) A general region's backedge bails to its canonical header while the due word is set.
+/// (6) A general region's backedge bails to its canonical header while the heap bit is set.
 /// At stress 1 the header's poll collects on every iteration and the loop re-enters the region.
 /// With collections suppressed (`gc_suppressed`) or deferred (a no-GC region) the word stays
 /// set: every backedge bails and every header poll calls the helper, which collects nothing,
 /// yet each bail follows a whole iteration in the region and the loop completes. The request
 /// left pending is honoured at the next poll after the no-GC region ends. On x86-64 the loop
 /// runs in baseline code: at stress 1 its object's helper-end poll collects on every iteration,
-/// and while the word stays set its header and end polls call the helper on every iteration.
+/// and while the bit stays set its header and end polls call the helper on every iteration.
 #[test]
-fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
+fn a_region_loop_completes_when_the_poll_word_makes_it_bail() {
     const SOURCE: &str = r#"
         function regionLoop(n) {
             var sum = 0, o = null;
@@ -518,7 +516,7 @@ fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
     assert!(census.collections[LOOP] >= N - 2, "{census:?}");
     #[cfg(target_arch = "x86_64")]
     assert!(census.collections[END] >= N - 2, "{census:?}");
-    assert_due_word(&engine.interp);
+    assert_poll_bit(&engine.interp);
 
     engine.interp.suspend_gc();
     let entries = regions();
@@ -530,7 +528,7 @@ fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
     assert!(reentered(entered), "an iteration per bail: {entered}");
     assert!(census.calls[LOOP] >= N - 2, "{census:?}");
     assert_eq!(census.collections, [0; 3], "suppressed");
-    assert!(crate::value::heap_collection_due(&engine.interp.gc_heap));
+    assert!(engine.interp.poll.heap_due());
 
     stress(&engine.interp, 0);
     let (result, census) = {
@@ -550,7 +548,7 @@ fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
     assert!(census.calls[LOOP] >= N - 2, "{census:?}");
     assert_eq!(census.collections, [0; 3], "deferred");
     assert!(engine.interp.gc_heap.core.borrow().collection_pending());
-    assert_due_word(&engine.interp);
+    assert_poll_bit(&engine.interp);
 
     let (result, census) = measured(&mut engine, "regionLoop(4);");
     assert_eq!(result, "6");
@@ -559,5 +557,300 @@ fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
         "the pending request ran at a poll: {census:?}"
     );
     assert!(!engine.interp.gc_heap.core.borrow().collection_pending());
-    assert_due_word(&engine.interp);
+    assert_poll_bit(&engine.interp);
+}
+
+/// (7) No poll counts a divider: while the word is clear none takes its slow path. Loop-free
+/// recursion (a million entry polls, and as many call-site end polls) and a call-free loop
+/// (its header's polls) that allocate nothing make no `H_INTERRUPT` call; the interrupt bit
+/// alone then sends every poll to its slow path.
+#[test]
+fn no_poll_takes_its_slow_path_while_the_word_is_clear() {
+    const SOURCE: &str = r#"
+        function depth(n) { return n === 0 ? 0 : depth(n - 1) + 1; }
+        function deep(rounds) {
+            var sum = 0;
+            for (var r = 0; r < rounds; r++) sum += depth(100);
+            return sum;
+        }
+        function spin(n) {
+            var sum = 0;
+            for (var i = 0; i < n; i++) sum = (sum + i) | 0;
+            return sum;
+        }
+        deep(2) + spin(3);
+    "#;
+    let mut engine = engine();
+    stress(&engine.interp, 0);
+    assert_eq!(eval(&mut engine, SOURCE), "203");
+    assert_native(&mut engine, &["depth", "deep", "spin"]);
+    settle(&mut engine, "depth");
+    settle(&mut engine, "deep");
+    engine.interp.gc_collect();
+    assert!(!engine.interp.poll.heap_due() && !engine.interp.poll.interrupt_pending());
+    let (result, census) = measured(&mut engine, "deep(10000);");
+    assert_eq!(result, "1000000");
+    eprintln!("recursion: {census:?}");
+    if !crate::gc_test::stress_active() {
+        assert_eq!(census.calls, [0; 3], "no slow path while the word is clear");
+    }
+    let (result, census) = measured(&mut engine, "spin(1000000);");
+    assert_eq!(result, "1783293664");
+    eprintln!("loop: {census:?}");
+    if !crate::gc_test::stress_active() {
+        assert_eq!(census.calls, [0; 3], "no slow path while the word is clear");
+    }
+
+    // A spurious interrupt bit (another handle's, here) costs slow paths and never interrupts:
+    // the slow path asks the interpreter's own handle. Rewriting the bit from that handle
+    // clears it.
+    let other = crate::RuntimeInterrupt::default();
+    other.register(&engine.interp.poll);
+    other.cancel();
+    let (result, census) = measured(&mut engine, "deep(10);");
+    other.unregister(&engine.interp.poll);
+    engine.interrupt_handle().begin_user_interaction();
+    eprintln!("spurious bit: {census:?}");
+    assert_eq!(result, "1000");
+    assert!(census.calls[ENTRY] >= 1010, "{census:?}");
+    assert!(!engine.interp.poll.interrupt_pending());
+}
+
+/// (8) Loop-free recursion stops at its entry polls (the reason they exist; HTML §8.1.4.5):
+/// exponential recursion, compiled without helper-end polls, stops for a cancellation from
+/// another thread and for a deadline the watchdog reports, each seen by an entry poll.
+#[test]
+fn loop_free_recursion_stops_at_entry_polls_for_cancellation_and_deadlines() {
+    const SOURCE: &str = "function f(n) { return n === 0 ? 0 : f(n - 1) + f(n - 1); } f(3);";
+    for deadline in [false, true] {
+        let census = without_end_polls(|| {
+            let mut engine = engine();
+            assert_eq!(eval(&mut engine, SOURCE), "0");
+            assert_native(&mut engine, &["f"]);
+            settle(&mut engine, "f");
+            let interrupt = engine.interrupt_handle();
+            let canceller = (!deadline).then(|| {
+                let interrupt = interrupt.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    interrupt.cancel();
+                })
+            });
+            if deadline {
+                interrupt.set_deadline(Some(
+                    std::time::Instant::now() + std::time::Duration::from_millis(20),
+                ));
+            }
+            take_poll_census();
+            let started = std::time::Instant::now();
+            let outcome = engine.eval_interruptible("f(60);", false).expect("parses");
+            let census = take_poll_census();
+            if let Some(canceller) = canceller {
+                canceller.join().expect("canceller");
+            }
+            let expected = if deadline {
+                crate::InterruptReason::DeadlineExceeded
+            } else {
+                crate::InterruptReason::Cancelled
+            };
+            assert!(
+                matches!(outcome, crate::ExecutionOutcome::Interrupted { reason } if reason == expected),
+                "deadline {deadline}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "deadline {deadline}: {:?}",
+                started.elapsed()
+            );
+            census
+        });
+        eprintln!("recursion, deadline {deadline}: {census:?}");
+        assert!(census.calls[ENTRY] >= 1, "{census:?}");
+        assert_eq!(census.calls[LOOP] + census.calls[END], 0, "{census:?}");
+    }
+}
+
+/// (9) The live-object ceiling, no stress: a call-free loop allocating objects passes the
+/// ceiling (`Interp::set_agent_next`), and the allocation that passes it sets the heap bit, so
+/// the next poll collects, with at most one iteration's objects past the ceiling: where the
+/// object's helper returns, or with helper-end polls off (and on ARM64 in a general region) at
+/// the loop header. The collection restores the ceiling to the engine's limit.
+#[test]
+fn passing_the_live_object_ceiling_collects_at_the_next_poll() {
+    const SOURCE: &str = r#"
+        function fill(n) {
+            var last = null;
+            for (var i = 0; i < n; i++) last = {v: i};
+            return last.v;
+        }
+        fill(3);
+    "#;
+    const N: i64 = 4000;
+    for end_polls in [true, false] {
+        let measure = || {
+            let mut engine = engine();
+            stress(&engine.interp, 0);
+            assert_eq!(eval(&mut engine, SOURCE), "2");
+            assert_native(&mut engine, &["fill"]);
+            // A nursery larger than the loop's allocations: only the ceiling makes a
+            // collection due.
+            engine.interp.gc_collect();
+            engine
+                .interp
+                .gc_heap
+                .core
+                .borrow_mut()
+                .set_nursery_bytes(Some(64 << 20));
+            let limit = engine.interp.gc_heap.agent.limit.get();
+            let live = engine.interp.live_object_count();
+            engine.interp.set_agent_next(live + N / 2);
+            assert!(!engine.interp.poll.heap_due());
+            let before = collections(&engine.interp);
+            let (result, census) = measured(&mut engine, &format!("fill({N});"));
+            assert_eq!(result, (N - 1).to_string());
+            assert_poll_bit(&engine.interp);
+            assert_eq!(
+                engine.interp.gc_next, limit,
+                "the collection restored the ceiling"
+            );
+            (census, collections(&engine.interp) - before)
+        };
+        let (census, collected) = if end_polls {
+            measure()
+        } else {
+            without_end_polls(measure)
+        };
+        eprintln!("ceiling, end polls {end_polls}: {collected} collections, {census:?}");
+        if crate::gc_test::stress_active() {
+            continue;
+        }
+        assert_eq!(collected, 1, "{census:?}");
+        assert_eq!(
+            census.collections.iter().sum::<u64>(),
+            1,
+            "a poll of generated code collected: {census:?}"
+        );
+        assert_eq!(census.collections[ENTRY], 0, "{census:?}");
+        assert!(
+            census.max_live_overshoot <= 2,
+            "the collection waited {} objects past the ceiling",
+            census.max_live_overshoot
+        );
+        if !end_polls {
+            assert_eq!(census.calls[END], 0, "{census:?}");
+        }
+    }
+}
+
+/// (10) A collection the live-object ceiling makes due while collections are suppressed keeps
+/// the heap bit set: every poll calls the helper, which collects nothing, and the first
+/// collection after the suppression ends clears it and restores the ceiling.
+#[test]
+fn a_suppressed_ceiling_collection_keeps_the_bit_until_one_runs() {
+    let mut engine = engine();
+    stress(&engine.interp, 0);
+    let source = "function spin(n){var s=0;for(var i=0;i<n;i++)s=(s+i)|0;return s;} spin(3);";
+    assert_eq!(eval(&mut engine, source), "3");
+    assert_native(&mut engine, &["spin"]);
+    engine.interp.gc_collect();
+    let limit = engine.interp.gc_heap.agent.limit.get();
+    engine.interp.suspend_gc();
+    let live = engine.interp.live_object_count();
+    engine.interp.set_agent_next(live - 1);
+    assert!(engine.interp.poll.heap_due(), "over the ceiling at once");
+    let before = collections(&engine.interp);
+    let (result, census) = measured(&mut engine, "spin(100000);");
+    engine.interp.resume_gc();
+    eprintln!("suppressed ceiling: {census:?}");
+    assert_eq!(result, "704982704");
+    assert_eq!(collections(&engine.interp), before, "suppressed");
+    assert_eq!(census.collections, [0; 3]);
+    assert!(census.calls[ENTRY] >= 1, "{census:?}");
+    // The loop polls at its header at least every 16,384 iterations (a helper-free region's
+    // countdown on ARM64; every iteration in baseline code).
+    assert!(census.calls[LOOP] >= 6, "{census:?}");
+    assert!(engine.interp.poll.heap_due(), "still due");
+    assert_poll_bit(&engine.interp);
+
+    assert_eq!(eval(&mut engine, "spin(10);"), "45");
+    assert!(
+        collections(&engine.interp) > before,
+        "collected once resumed"
+    );
+    assert!(!engine.interp.poll.heap_due());
+    assert_eq!(engine.interp.gc_next, limit);
+    assert_poll_bit(&engine.interp);
+}
+
+/// (11) A loop that only an interruption ends, walking a cyclic list, stops for a cancellation
+/// from another thread and for a deadline the watchdog reports. On ARM64 it runs as a general
+/// region, whose back-edge guard tests the whole word and bails to the loop header, whose poll
+/// reports the interruption; on x86-64 in baseline code, where the end poll of the property
+/// read's helper comes first.
+#[test]
+fn a_cyclic_list_walk_stops_for_cancellation_and_deadlines() {
+    const SOURCE: &str = r#"
+        function last(next) {
+            var peek;
+            while ((peek = next.link) != null) next = peek;
+            return next;
+        }
+        for (var i = 0; i < 600; i++) {
+            var tail = {link: null};
+            last({link: tail});
+        }
+        var ring = {link: null};
+        ring.link = ring;
+    "#;
+    for deadline in [false, true] {
+        let mut engine = engine();
+        eval(&mut engine, SOURCE);
+        assert_native(&mut engine, &["last"]);
+        let interrupt = engine.interrupt_handle();
+        let canceller = (!deadline).then(|| {
+            let interrupt = interrupt.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                interrupt.cancel();
+            })
+        });
+        if deadline {
+            interrupt.set_deadline(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(20),
+            ));
+        }
+        take_poll_census();
+        let started = std::time::Instant::now();
+        let outcome = engine
+            .eval_interruptible("last(ring);", false)
+            .expect("parses");
+        let census = take_poll_census();
+        if let Some(canceller) = canceller {
+            canceller.join().expect("canceller");
+        }
+        eprintln!("cyclic walk, deadline {deadline}: {census:?}");
+        let expected = if deadline {
+            crate::InterruptReason::DeadlineExceeded
+        } else {
+            crate::InterruptReason::Cancelled
+        };
+        assert!(
+            matches!(outcome, crate::ExecutionOutcome::Interrupted { reason } if reason == expected),
+            "deadline {deadline}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "deadline {deadline}: {:?}",
+            started.elapsed()
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            census.calls[LOOP] >= 1,
+            "the loop header reported it: {census:?}"
+        );
+        assert!(
+            census.calls.iter().sum::<u64>() >= 1,
+            "a poll reported it: {census:?}"
+        );
+    }
 }

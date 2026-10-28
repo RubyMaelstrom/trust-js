@@ -3368,7 +3368,6 @@ pub(crate) struct InterpLayout {
     pub direct_call_depth: usize,
     pub gc_tick: usize,
     pub gc_next: usize,
-    pub interrupt_poll_tick: usize,
     pub call_site: usize,
     pub constructing: usize,
     /// Ambient mode used by semantic helpers; every native function body saves/restores it.
@@ -3457,7 +3456,6 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         direct_call_depth: off(&i.direct_call_depth as *const _ as usize),
         gc_tick: off(&i.gc_tick as *const _ as usize),
         gc_next: off(&i.gc_next as *const _ as usize),
-        interrupt_poll_tick: off(&i.interrupt_poll_tick as *const _ as usize),
         call_site: off(&i.call_site as *const _ as usize),
         constructing: off(&i.constructing as *const _ as usize),
         strict: off(&i.strict as *const _ as usize),
@@ -3524,12 +3522,9 @@ pub struct Interp {
     /// The host's control handle. Replace it only through [`Interp::set_runtime_interrupt`],
     /// which moves `poll`'s registration.
     pub(crate) runtime_interrupt: std::sync::Arc<crate::RuntimeInterrupt>,
-    /// The word this interpreter's execution polls (see `interrupt::PollWord`), whose interrupt
-    /// bit `runtime_interrupt` keeps.
+    /// The word this interpreter's execution polls (see `interrupt::PollWord`): `gc_heap`
+    /// keeps its heap bit, `runtime_interrupt` its interrupt bit.
     pub(crate) poll: std::sync::Arc<crate::interrupt::PollWord>,
-    /// Native code's hot-loop poll divider: generated loops and entries increment it and consult
-    /// the shared state only once per bounded batch.
-    pub(crate) interrupt_poll_tick: u32,
     /// The tree-walking evaluator's stack-gateway divider: it queries the native stack once per
     /// eight evaluations, so at least once every eight levels of nesting (see `Interp::eval`).
     pub(crate) ast_tick: u32,
@@ -4029,7 +4024,6 @@ interp_memory_inventory! {
     wall_clock => "external",
     runtime_interrupt => "external",
     poll => "external",
-    interrupt_poll_tick => "non_owning",
     ast_tick => "non_owning",
     strict => "non_owning",
     tier => "non_owning",
@@ -4217,6 +4211,7 @@ fn drop_collected_realm(mut realm: crate::agent_access::Owned<Interp>) {
 impl Drop for Interp {
     fn drop(&mut self) {
         self.runtime_interrupt.unregister(&self.poll);
+        crate::value::detach_poll_word(&self.gc_heap, &self.poll);
         // libtest exits the process before persistent runtime-worker TLS destructors run. Flush
         // the opt-in function profile when the owning Agent is destroyed so browser-workload
         // diagnostics retain their measurements; `dump` clears the TLS aggregate, preventing a
@@ -5717,6 +5712,7 @@ impl Interp {
         let runtime_interrupt = std::sync::Arc::<crate::RuntimeInterrupt>::default();
         let poll = std::sync::Arc::new(crate::interrupt::PollWord::default());
         runtime_interrupt.register(&poll);
+        crate::value::attach_poll_word(&gc_heap, &poll);
         let mut interp = Interp {
             gc_heap: gc_heap.clone(),
             realm_id: if owns_heap {
@@ -5740,7 +5736,6 @@ impl Interp {
             wall_clock: None,
             runtime_interrupt,
             poll,
-            interrupt_poll_tick: 0,
             ast_tick: 0,
             strict: false,
             depth: 0,
@@ -11748,8 +11743,8 @@ impl Interp {
     /// if that leaves more than the engine's live-object limit alive, throws a RangeError rather
     /// than exhaust RAM.
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
-        // The due word JIT polls read is the core's `collection_due` (debug builds).
-        crate::value::debug_assert_due_word(&self.gc_heap);
+        // The heap bit polls read is the core's `poll_due` (debug builds).
+        crate::value::debug_assert_poll_bit(&self.gc_heap);
         if self.gc_heap.agent.suppressed.get() != 0 {
             return Ok(());
         }
@@ -11997,7 +11992,6 @@ impl Interp {
             wall_clock: _,
             runtime_interrupt: _,
             poll: _,
-            interrupt_poll_tick: _,
             ast_tick: _,
             strict: _,
             tier: _,

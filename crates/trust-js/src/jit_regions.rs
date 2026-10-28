@@ -3635,7 +3635,7 @@ pub(super) fn emit(
             if target <= from {
                 let poll = a.new_label();
                 exits.push((poll, target));
-                emit_region_poll_guard(a, ilayout, poll, true);
+                emit_region_poll_guard(a, poll, true);
             }
             a.b(to);
         } else {

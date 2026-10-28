@@ -366,67 +366,34 @@ impl Asm {
             self.helper_end_poll(unwind);
         }
     }
-    /// rcx = `ctx.live_objects`, the address of the live-object count (`value::LiveCount`).
-    fn load_live_count_address(&mut self) {
-        self.bytes(&[0x49, 0x8b, 0x8c, 0x24]); // mov rcx,[r12+live_objects]
-        self.bytes(&(std::mem::offset_of!(super::JitCtx, live_objects) as i32).to_le_bytes());
-    }
-    /// Compare the cell heap's due word, which follows the live-object count at rcx
-    /// (`value::LiveCount`), with zero. The word is set exactly while a collection is due (the
-    /// byte budget is spent, the stress interval reached or a request deferred), none of which
-    /// moves the count.
-    fn cmp_due_word_rcx(&mut self) {
-        const _: () = assert!(crate::value::LIVE_DUE_OFF < 0x80);
-        // cmp qword [rcx+LIVE_DUE_OFF],0
-        self.bytes(&[0x48, 0x83, 0x79, crate::value::LIVE_DUE_OFF as u8, 0x00]);
-    }
     /// The explicit poll that ends a call to an allocating helper (see
     /// `jit::helper_ends_in_poll`), and the calls of `H_CALL` and `H_NEW` and string
     /// accumulation's committed exit: the recorded S5 deviation, in place of an allocation slow
     /// path that collects. It runs once the call has returned, with its results in canonical
     /// places (operand words below r13, slots, context fields): this backend keeps no value in a
     /// caller-saved register across a helper call, only the context, operand top, helper table
-    /// and slot base in r12-r15. Three instructions while the due word is clear; a set word
-    /// calls `H_INTERRUPT` (`POLL_HELPER_END`), whose throw unwinds from here.
+    /// and slot base in r12-r15. The poll word, as entry and loop polls test it
+    /// ([`Asm::interrupt_poll`]).
     fn helper_end_poll(&mut self, unwind: usize) {
         #[cfg(test)]
         if super::TEST_NO_END_POLLS.with(std::cell::Cell::get) {
             return;
         }
-        let done = self.label();
-        self.load_live_count_address();
-        self.cmp_due_word_rcx();
-        self.jcc(0x84, done); // je: no collection due
-        self.helper_spflag(H_INTERRUPT, super::POLL_HELPER_END, unwind);
-        self.bind(done);
+        self.interrupt_poll(super::POLL_HELPER_END, unwind);
     }
-    /// Generated code's entry and loop safepoint (`kind` is `POLL_ENTRY` or `POLL_LOOP`): the
-    /// heap's due word, the live-object count against `gc_next`, then the shared
-    /// interrupt divider; the slow path is `H_INTERRUPT` (`jit_interrupt`: the host interrupt,
-    /// then `Interp::gc_check`). While collections are suppressed or deferred the word stays set
-    /// and every poll calls the helper until one can collect.
-    fn interrupt_poll(&mut self, interp_offsets: Option<(i32, i32)>, kind: u32, unwind: usize) {
-        let Some((offset, gc_next)) = interp_offsets else {
-            self.helper_spflag(H_INTERRUPT, kind, unwind);
-            return;
-        };
+    /// Generated code's safepoint (`kind` is `POLL_ENTRY`, `POLL_LOOP` or `POLL_HELPER_END`):
+    /// the interpreter's poll word (`interrupt::PollWord`), set while a collection is due or a
+    /// host interruption may be pending. Three instructions while it is clear: the context's
+    /// pointer, a compare of the word with zero and a branch. The slow path is `H_INTERRUPT`
+    /// (`jit_interrupt`: the host interrupt, then `Interp::gc_check`), whose throw unwinds from
+    /// here. While collections are suppressed or deferred the heap's bit stays set and every
+    /// poll calls the helper until one can collect.
+    fn interrupt_poll(&mut self, kind: u32, unwind: usize) {
         let done = self.label();
-        let slow = self.label();
-        self.bytes(&[0x49, 0x8b, 0x44, 0x24, 0x48]); // rax = ctx.interp
-        self.load_live_count_address();
-        self.cmp_due_word_rcx();
-        self.jcc(0x85, slow); // jne: a collection is due
-        self.bytes(&[0x48, 0x8b, 0x09]); // rcx = current live object count
-        self.bytes(&[0x48, 0x3b, 0x88]); // cmp rcx, [rax+gc_next]
-        self.bytes(&gc_next.to_le_bytes());
-        self.jcc(0x8f, slow); // signed greater: over the live-object ceiling
-        self.bytes(&[0xff, 0x80]); // inc dword ptr [rax+offset]
-        self.bytes(&offset.to_le_bytes());
-        self.bytes(&[0xf7, 0x80]); // test dword ptr [rax+offset], 0x3fff
-        self.bytes(&offset.to_le_bytes());
-        self.bytes(&0x3fffu32.to_le_bytes());
-        self.jcc(0x85, done); // nonzero: skip the shared-state helper
-        self.bind(slow);
+        self.bytes(&[0x49, 0x8b, 0x8c, 0x24]); // mov rcx,[r12+poll_word]
+        self.bytes(&(std::mem::offset_of!(super::JitCtx, poll_word) as i32).to_le_bytes());
+        self.bytes(&[0x48, 0x83, 0x39, 0x00]); // cmp qword [rcx],0
+        self.jcc(0x84, done); // je: nothing pending
         self.helper_spflag(H_INTERRUPT, kind, unwind);
         self.bind(done);
     }
@@ -881,10 +848,6 @@ pub(super) fn compile_entry(
     let unwind = a.label();
     let ret_ok = a.label();
     let ret_throw = a.label();
-    let interrupt_offset = (ilayout.valid
-        && ilayout.interrupt_poll_tick <= i32::MAX as usize
-        && ilayout.gc_next <= i32::MAX as usize)
-        .then_some((ilayout.interrupt_poll_tick as i32, ilayout.gc_next as i32));
     let mut interrupt_targets = vec![false; ops.len()];
     for (pc, op) in ops.iter().enumerate() {
         match op {
@@ -941,12 +904,12 @@ pub(super) fn compile_entry(
         a.code.push(u8::from(chunk.jit_is_strict()));
     }
     // Function entry is a safepoint, like a loop back-edge: allocation pressure and host
-    // interruption are observed here on the shared amortized cadence. Code that never takes a
+    // interruption are observed here, through the poll word. Code that never takes a
     // back-edge (loop-free recursion makes billions of calls) must still be interruptible, since
     // a user agent may abort a running script at any time (HTML "Killing scripts"). The frame
     // is fully established and the operand stack empty, as at a back-edge target at pc 0.
     if !borrowed_entry {
-        a.interrupt_poll(interrupt_offset, super::POLL_ENTRY, unwind);
+        a.interrupt_poll(super::POLL_ENTRY, unwind);
     }
 
     if borrowed_entry {
@@ -968,7 +931,7 @@ pub(super) fn compile_entry(
         a.bind(pcs[pc]);
         pc_offsets.push(a.code.len() as u32);
         if interrupt_targets[pc] {
-            a.interrupt_poll(interrupt_offset, super::POLL_LOOP, unwind);
+            a.interrupt_poll(super::POLL_LOOP, unwind);
         }
         if borrowed_entry && crate::bytecode::jit_slice_exit_op(op) {
             a.helper_spflag(H_SLICE_OP, pc as u32, ret_throw);

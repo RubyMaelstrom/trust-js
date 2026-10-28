@@ -168,7 +168,7 @@ fn invoke(
         callstat_enabled: false,
         propstat_enabled: false,
         inline_recompile_at: inline_recompile_at(),
-        live_objects: crate::value::live_objects_ptr(&interp.gc_heap),
+        poll_word: interp.poll.as_ptr(),
         shape_layouts: crate::value::shape_layouts_ptr(&interp.gc_heap),
         activation: None,
         resume_activation: std::ptr::null_mut(),
