@@ -6916,13 +6916,33 @@ fn emit_call_inline_marked(
             a.cbnz(1, false, l_unwind);
             a.b(done);
 
-            // ---- ways 1.. (w14 = ways left), then the secondary probes ----
+            // ---- the hinted way's function, ways 1.. (w14 = ways left), then the secondary
+            // probes ----
             a.bind(l_rest);
+            // entry stride (size compile-asserted below the JitCtx asserts)
+            let stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>();
+            // An object callee from here on (the code-keyed tests read its cell); x13 = its
+            // identity, the secondary probes' input.
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, slow);
+            a.mov(13, 10);
+            // Another closure of the function in the way of the site's last code-keyed hit
+            // (`CallSite::code_hint`, w6): a site whose callee is made afresh for each pass (a
+            // callback, say) hits here, without the other ways or the secondary probes.
+            let l_ways = a.new_label();
+            if call_code_probe_supported(layout) {
+                a.ldrb_imm(6, 12, crate::bytecode::CALL_SITE_CODE_HINT_OFF as u32);
+                a.movz(16, stride as u32, 0);
+                a.madd(14, 6, 16, 12);
+                emit_call_code_way(a, layout, 14, l_ways);
+                a.mov(12, 14);
+                let code_bit = asm::logical_imm_w(CALL_CODE_HIT).unwrap();
+                a.logic_imm_w(1, 15, 6, code_bit);
+                a.b(l_hit);
+            }
+            a.bind(l_ways);
             let l_probe = a.new_label();
             let l_next = a.new_label();
             let l_primary_hit = a.new_label();
-            // entry stride (size compile-asserted below the JitCtx asserts)
-            let stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>();
             a.movz(14, crate::bytecode::CALL_IC_WAYS as u32 - 1, 0);
             a.bind(l_probe);
             a.add_imm(12, 12, stride as u32);
@@ -6932,10 +6952,7 @@ fn emit_call_inline_marked(
             a.sub_imm(14, 14, 1);
             a.cbnz(14, false, l_probe);
             // Secondary probes (the engine-wide identity overflow cache, then code-keyed ways):
-            // out of line in the chunk's shared stub, for an object callee (x13 = its identity).
-            // The loop left x12 at the site's last way.
-            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, slow);
-            a.mov(13, 10);
+            // out of line in the chunk's shared stub. The loop left x12 at the site's last way.
             if shared_stubs_enabled() {
                 a.sub_imm(
                     12,
@@ -7584,21 +7601,9 @@ fn emit_call_code_probe(
     let call_tag = layout.obj_from_cell + layout.obj_call;
     let call_payload = call_tag + 8;
     let ic_plain = layout.obj_from_cell + layout.obj_ic_plain;
-    let fits8 = |o: usize| o.is_multiple_of(8) && o / 8 < 4096;
     let ic_func = offset_of!(crate::bytecode::CallIc, func);
     let ic_realm = offset_of!(crate::bytecode::CallIc, realm);
-    if !(layout.valid
-        && layout.call_probe_valid
-        && layout.scope_parent_valid
-        && call_tag < 4096
-        && ic_plain < 4096
-        && fits8(call_payload)
-        && fits8(layout.user_func)
-        && fits8(layout.user_env)
-        && fits8(layout.user_realm)
-        && layout.func_data_off < 4096
-        && layout.scope_under_with < 4096)
-    {
+    if !call_code_probe_supported(layout) {
         a.b(miss);
         return;
     }
@@ -7641,7 +7646,74 @@ fn emit_call_code_probe(
     a.cbnz(7, false, miss);
     a.movz(15, crate::bytecode::CALL_IC_WAYS as u32 + CALL_CODE_HIT, 0);
     a.sub_reg(15, 15, 14);
+    // The site tests this way first next time (`CallSite::code_hint`).
+    let index = asm::logical_imm_w(crate::bytecode::CALL_IC_WAYS as u32 - 1).unwrap();
+    a.logic_imm_w(0, 7, 15, index);
+    a.strb_imm(7, 6, crate::bytecode::CALL_SITE_CODE_HINT_OFF as u32);
     a.b(hit);
+}
+
+/// Whether the layout lets the code-keyed tests address the callee's cell and closure (see
+/// [`emit_call_code_probe`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn call_code_probe_supported(layout: &crate::value::JitLayout) -> bool {
+    let call_tag = layout.obj_from_cell + layout.obj_call;
+    let fits8 = |o: usize| o.is_multiple_of(8) && o / 8 < 4096;
+    layout.valid
+        && layout.call_probe_valid
+        && layout.scope_parent_valid
+        && call_tag < 4096
+        && layout.obj_from_cell + layout.obj_ic_plain < 4096
+        && fits8(call_tag + 8)
+        && fits8(layout.user_func)
+        && fits8(layout.user_env)
+        && fits8(layout.user_realm)
+        && layout.func_data_off < 4096
+        && layout.scope_under_with < 4096
+}
+
+/// The code-keyed probe's test (see [`emit_call_code_probe`]) of the one way at `way`: falls
+/// through when the callee is another closure of the way's function, which the call then runs
+/// as a code-keyed hit, and branches to `miss` otherwise. Inputs are the code-keyed probe's
+/// (x10 = an object callee's cell, w15 = live epoch, x17 = the active Realm's global scope);
+/// only x7, x9, x11 and x16 are clobbered. The layout must allow the test
+/// ([`call_code_probe_supported`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_call_code_way(a: &mut asm::Asm, layout: &crate::value::JitLayout, way: u32, miss: usize) {
+    use std::mem::offset_of;
+    debug_assert!(call_code_probe_supported(layout));
+    debug_assert!(![7, 9, 11, 16].contains(&way));
+    let call_tag = layout.obj_from_cell + layout.obj_call;
+    a.ldrb_imm(9, 10, call_tag as u32);
+    a.cmp_imm_w(9, crate::value::CALLABLE_USER_TAG as u32);
+    a.b_cond(C_NE, miss);
+    a.ldrb_imm(9, 10, (layout.obj_from_cell + layout.obj_ic_plain) as u32);
+    a.cbz(9, false, miss);
+    a.ldr_imm(9, 10, (call_tag + 8) as u32); // the closure cell (a `UserFn`)
+    a.ldr_imm(11, 9, layout.user_func as u32);
+    a.add_imm(11, 11, layout.func_data_off as u32); // the closure's function identity
+    a.ldr_imm(7, way, offset_of!(crate::bytecode::CallIc, func) as u32);
+    a.cmp_reg_x(7, 11);
+    a.b_cond(C_NE, miss);
+    a.ldr_w_imm(7, way, 56); // epoch
+    a.cmp_reg_w(7, 15);
+    a.b_cond(C_NE, miss);
+    a.ldr_imm(7, way, 32); // global_env
+    a.cmp_reg_x(7, 17);
+    a.b_cond(C_NE, miss);
+    a.ldr_imm(16, 9, layout.user_realm as u32);
+    a.ldr_imm(7, way, offset_of!(crate::bytecode::CallIc, realm) as u32);
+    a.cmp_reg_x(7, 16);
+    a.b_cond(C_NE, miss);
+    a.ldr_imm(7, 9, layout.user_env as u32); // the closure's environment, its `Env::as_ptr`
+    a.ldrb_imm(7, 7, layout.scope_under_with as u32);
+    a.cbnz(7, false, miss);
 }
 
 /// Way-index tag (x15 at a call template's hit label) marking a code-keyed hit (see
@@ -7663,6 +7735,12 @@ const _: () = assert!(crate::bytecode::CALL_IC_WAYS.is_power_of_two());
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 const _: () = assert!((crate::bytecode::CALL_IC_WAYS as u32) < CALL_CODE_HIT);
+// The hint byte is addressed by an unsigned immediate from the site's first way.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const _: () = assert!(crate::bytecode::CALL_SITE_CODE_HINT_OFF < 4096);
 
 /// Secondary identity probe. Inputs match the primary probe: x13 = live callee identity,
 /// w15 = epoch, x17 = realm, x10 = stored callee pointer. On hit x12 points at a CallIc and

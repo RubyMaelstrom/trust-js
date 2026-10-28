@@ -1280,6 +1280,8 @@ impl PrivateSite {
 /// Way count of [`CallSite::entries`] — the JIT call template's inline probe walks all of them.
 pub const CALL_IC_WAYS: usize = 4;
 
+/// `repr(C)`: machine code addresses `code_hint` from the first way (`CALL_SITE_CODE_HINT_OFF`).
+#[repr(C)]
 pub struct CallSite {
     pub entries: [std::cell::Cell<CallIc>; CALL_IC_WAYS],
     /// Code-sharing retries compare AST identities even after the original closure dies. Pin
@@ -1288,7 +1290,17 @@ pub struct CallSite {
     func_pins: std::cell::RefCell<[std::rc::Weak<Function>; CALL_IC_WAYS]>,
     /// Round-robin fill cursor.
     pub next: std::cell::Cell<u8>,
+    /// The way of the site's last code-keyed hit, which the call template tests first once way
+    /// 0's identity misses (a site whose callee is made afresh for each pass, a callback, say).
+    /// Only a hint: machine code writes it (the secondary probe's code-keyed hit, see
+    /// `jit::emit_call_code_probe`), any value below `CALL_IC_WAYS` names a way, and a stale one
+    /// costs one failed test.
+    pub code_hint: std::cell::Cell<u8>,
 }
+
+/// Byte offset of [`CallSite::code_hint`] from the site's first way.
+pub(crate) const CALL_SITE_CODE_HINT_OFF: usize =
+    std::mem::offset_of!(CallSite, code_hint) - std::mem::offset_of!(CallSite, entries);
 
 impl CallSite {
     pub fn empty() -> CallSite {
@@ -1301,6 +1313,7 @@ impl CallSite {
             ],
             func_pins: std::cell::RefCell::new(std::array::from_fn(|_| std::rc::Weak::new())),
             next: std::cell::Cell::new(0),
+            code_hint: std::cell::Cell::new(0),
         }
     }
     /// Record `ic`, replacing an existing way for the same callee (epoch or realm refills must
@@ -9122,6 +9135,7 @@ impl Compiler {
                 entries: std::array::from_fn(|way| std::cell::Cell::new(entries[way])),
                 func_pins: std::cell::RefCell::new(func_pins),
                 next: std::cell::Cell::new(next),
+                code_hint: std::cell::Cell::new(0),
             }
         } else {
             CallSite::empty()
