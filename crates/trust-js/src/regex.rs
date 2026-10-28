@@ -859,12 +859,18 @@ fn compile_one_byte_native_x64(ops: &[OneByteNativeOp]) -> Option<Vec<u8>> {
                 a.jcc(0x84, fail); // je
                 offset += 1;
             }
+            // An anchor holds at the candidate start plus its offset in the pattern (`/a^/` and
+            // `/x$y/` never match). `^` past offset 0 never holds; `$` compares with the length,
+            // in a callee-saved register, which the poll call cannot have clobbered.
+            OneByteNativeOp::AssertStart if offset > 0 => a.jmp(fail),
             OneByteNativeOp::AssertStart => {
                 a.bytes(&[0x4d, 0x85, 0xf6]); // test r14, r14
                 a.jcc(0x85, fail); // jne
             }
             OneByteNativeOp::AssertEnd => {
-                a.bytes(&[0x4d, 0x39, 0xde]); // cmp r14, r11
+                a.bytes(&[0x49, 0x8d, 0x86]); // lea rax, [r14 + offset]
+                a.imm32(offset as u32);
+                a.bytes(&[0x4c, 0x39, 0xe8]); // cmp rax, r13
                 a.jcc(0x85, fail); // jne
             }
             OneByteNativeOp::Many { .. } => return None,
@@ -1154,12 +1160,16 @@ fn compile_one_byte_native_aarch64(ops: &[OneByteNativeOp]) -> Option<Vec<u8>> {
                 a.branch_cond(0, fail); // EQ
                 offset += 1;
             }
+            // An anchor holds at the candidate start plus its offset in the pattern (`/a^/` and
+            // `/x$y/` never match): `^` past offset 0 never holds, `$` compares with the length.
+            OneByteNativeOp::AssertStart if offset > 0 => a.branch(fail),
             OneByteNativeOp::AssertStart => {
                 arm64_cmp_imm(&mut a, 21, 0);
                 a.branch_cond(1, fail); // NE
             }
             OneByteNativeOp::AssertEnd => {
-                arm64_cmp_reg(&mut a, 21, 25);
+                arm64_add_imm(&mut a, 9, 21, offset);
+                arm64_cmp_reg(&mut a, 9, 20);
                 a.branch_cond(1, fail); // NE
             }
             OneByteNativeOp::Many { .. } => return None,

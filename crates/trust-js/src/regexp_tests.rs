@@ -1353,6 +1353,51 @@ fn anchors_inside_a_pattern_keep_holding_after_the_pattern_tiers_up() {
     );
 }
 
+/// `^` and `$` hold at their own offsets in a pattern, not at the candidate's start or end, once
+/// the one-byte tier has compiled the pattern, as Node (v24.22.0) finds: inside a pattern, at its
+/// ends, in multiline mode, in global replaces and from sticky starts. Each case runs past the
+/// tier's threshold; the tier's tests also run with `TRUST_JS_REGEXP_TIER_UP_AT=1`.
+#[test]
+fn anchors_hold_at_their_offsets_in_the_one_byte_tier_as_node_finds() {
+    check(
+        r##"
+        // Each case runs 70 times, past the one-byte tier's threshold of 64.
+        function seen(re, s) { var out = []; for (var i = 0; i < 70; i++) { var r = re.test(s); if (out.indexOf(r) < 0) out.push(r); } return out.join("/"); }
+        function all(re, s) { var r = ""; for (var i = 0; i < 70; i++) r = s.replace(re, "#"); return r; }
+        function at(re, s, i) { var r; for (var k = 0; k < 70; k++) { re.lastIndex = i; r = [re.test(s), re.lastIndex]; } return r; }
+        JSON.stringify([
+            // Anchors inside a pattern hold at their own offsets.
+            seen(/a^/, "a"),
+            seen(/a^b/, "ab"),
+            seen(/x$y/, "xy"),
+            seen(/a.^/, "ab"),
+            seen(/$x/, "x"),
+            seen(/^[a-z]$/, "q"),
+            seen(/[xa]$./, "ab"),
+            seen(/^a.c$/, "abc"),
+            seen(/x.$/, "zxy"),
+            // Multiline variants, where `^` and `$` also hold at line terminators.
+            seen(/a^/m, "a\nb"),
+            seen(/a$\nb/m, "a\nb"),
+            seen(/x$\ny/m, "x\ny"),
+            seen(/a.^/m, "a\nb"),
+            seen(/^b/m, "a\nb"),
+            seen(/[ab]$/m, "a\nc"),
+            // Global replaces and sticky starts.
+            all(/a^|b/g, "abab"),
+            all(/x$y|y/g, "xyxy"),
+            all(/[ab]$/g, "ab ab"),
+            all(/^[ab]/g, "ab ab"),
+            all(/[ab]$/gm, "ab\nab"),
+            at(/a^/y, "a", 0),
+            at(/[a-z]$/y, "abc", 2),
+            at(/[a-z]$/y, "abc", 1),
+        ])
+        "##,
+        r##"["false","false","false","false","false","true","false","true","true","false","true","true","false","true","true","a#a#","x#x#","ab a#","#b ab","a#\na#",[false,0],[true,3],[false,0]]"##,
+    );
+}
+
 /// ECMA-262 §22.2.2.9 (CompileToCharSet): under `v` a lone surrogate is a code point of the
 /// subject that classes, properties, ranges and `\q{}` strings can hold, and under `i` every
 /// operand is folded (MaybeSimpleCaseFolding) before complements, differences and
