@@ -2033,6 +2033,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_make_closure as *const () as usize,
         crate::bytecode::jit_object_literal as *const () as usize,
         crate::bytecode::jit_abstract_operation as *const () as usize,
+        crate::bytecode::jit_call_spread as *const () as usize,
     ]
 }
 
@@ -2118,7 +2119,9 @@ pub const H_MAKE_CLOSURE: usize = 28;
 pub const H_OBJECT_LITERAL: usize = 29;
 /// Self-hosted built-ins' abstract operations (see `bytecode::jit_abstract_operation`).
 pub const H_ABSTRACT: usize = 30;
-pub const N_HELPERS: usize = 31;
+/// Dedicated `Op::CallSpread`/`Op::CallSpreadThis` entry (see `bytecode::jit_call_spread`).
+pub const H_CALL_SPREAD: usize = 31;
+pub const N_HELPERS: usize = 32;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2155,6 +2158,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "make_closure",
     "object_literal",
     "abstract_operation",
+    "call_spread",
 ];
 
 #[inline]
@@ -4820,6 +4824,9 @@ fn compile_entry(
                         }
                     }
                 }
+            }
+            Op::CallSpread(..) | Op::CallSpreadThis(..) => {
+                emit_op_helper(&mut a, H_CALL_SPREAD, pc as u32, l_unwind);
             }
             _ => {
                 emit_exec(&mut a, pc as u32, l_unwind);
@@ -17415,6 +17422,7 @@ fn helper_ends_in_poll(idx: usize) -> bool {
             | H_SET_ELEM
             | H_INSTANCEOF
             | H_REFERENCE_OP
+            | H_CALL_SPREAD
     )
 }
 

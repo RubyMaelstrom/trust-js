@@ -230,6 +230,8 @@ mod shared_layout_tests;
 mod shared_snapshot_realm_tests;
 mod snapshot;
 mod spread;
+#[cfg(test)]
+mod spread_call_tests;
 mod stack_trace;
 #[cfg(test)]
 mod string_concat_tests;

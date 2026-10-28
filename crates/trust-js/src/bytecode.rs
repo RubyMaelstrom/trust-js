@@ -1934,10 +1934,11 @@ pub enum Op {
     /// `f(a, b, ...c)` — a spread argument in the LAST position (the only shape whose
     /// evaluate-everything-then-expand lowering matches the spec's interleaved evaluation
     /// order): pops the iterable and `argc-1` plain arguments, expands via the iterator
-    /// protocol, and calls through the generic path (no call IC — spread sites are cold).
-    CallSpread(u16),
+    /// protocol, and calls. Second operand = the per-site [`CallIc`] index, which also records
+    /// the call's position.
+    CallSpread(u16, u32),
     /// [`Op::CallSpread`] with a receiver beneath the callee (method calls, with-object hits).
-    CallSpreadThis(u16),
+    CallSpreadThis(u16, u32),
     /// Call with an internally-built dense argument array. This is the general
     /// ArgumentListEvaluation path for interleaved/multiple spreads; the array never escapes.
     CallArgsArray,
@@ -7535,9 +7536,10 @@ fn finish_chunk(
     let mut construct_positions = vec![NO_POSITION; c.construct_caches.len()].into_boxed_slice();
     for (pc, op) in c.ops.iter().enumerate() {
         let slot = match *op {
-            Op::Call(_, cache) | Op::CallWithThis(_, cache) => {
-                call_positions.get_mut(cache as usize)
-            }
+            Op::Call(_, cache)
+            | Op::CallWithThis(_, cache)
+            | Op::CallSpread(_, cache)
+            | Op::CallSpreadThis(_, cache) => call_positions.get_mut(cache as usize),
             Op::New(_, cache) => construct_positions.get_mut(cache as usize),
             _ => None,
         };
@@ -8000,8 +8002,8 @@ fn inline_capability(op: &Op) -> InlineCapability {
         | Op::JumpIfNotNullishPeek(_)
         | Op::Call(..)
         | Op::CallWithThis(..)
-        | Op::CallSpread(_)
-        | Op::CallSpreadThis(_)
+        | Op::CallSpread(..)
+        | Op::CallSpreadThis(..)
         | Op::CallArgsArray
         | Op::CallArgsArrayThis
         | Op::New(..)
@@ -8043,6 +8045,21 @@ fn inline_capability(op: &Op) -> InlineCapability {
     }
 }
 
+/// For each call-cache site of `chunk`, whether it is a spread call's
+/// ([`Op::CallSpread`], [`Op::CallSpreadThis`]): its cache serves the call, but the planner
+/// splices fixed-argument calls only.
+fn spread_call_sites(chunk: &Chunk) -> Vec<bool> {
+    let mut spread = vec![false; chunk.call_caches.len()];
+    for op in &chunk.ops {
+        if let Op::CallSpread(_, c) | Op::CallSpreadThis(_, c) = *op {
+            if let Some(slot) = spread.get_mut(c as usize) {
+                *slot = true;
+            }
+        }
+    }
+    spread
+}
+
 fn plan_inlines_at(
     chunk: &Chunk,
     caller: &Function,
@@ -8070,7 +8087,11 @@ fn plan_inlines_at(
     }
     let pins = chunk.call_pins.borrow();
     let sites_in_loops = call_sites_in_loops(chunk);
+    let spread_sites = spread_call_sites(chunk);
     for (idx, site) in chunk.call_caches.iter().enumerate() {
+        if spread_sites[idx] {
+            skip!(idx, "spread call (never spliced)")
+        }
         let in_loop = outer_in_loop || sites_in_loops[idx];
         let mut filled: Vec<CallIc> = site
             .entries
@@ -8170,8 +8191,8 @@ fn plan_inlines_at(
                     op,
                     Op::Call(..)
                         | Op::CallWithThis(..)
-                        | Op::CallSpread(_)
-                        | Op::CallSpreadThis(_)
+                        | Op::CallSpread(..)
+                        | Op::CallSpreadThis(..)
                         | Op::CallArgsArray
                         | Op::CallArgsArrayThis
                         | Op::New(..)
@@ -8687,8 +8708,8 @@ fn op_mentions_slot(op: &Op, slot: u16) -> bool {
         | Op::IterAbortL(a)
         | Op::DestructureArr(a)
         | Op::ObjectRest(a)
-        | Op::CallSpread(a)
-        | Op::CallSpreadThis(a)
+        | Op::CallSpread(a, _)
+        | Op::CallSpreadThis(a, _)
         | Op::ClassStart(_, a)
         | Op::ClassKey(_, a)
         | Op::ClassDecorator(_, a)
@@ -9957,10 +9978,11 @@ impl Compiler {
                 }
             }
             CallArgsMode::FinalSpread(argc) => {
+                let cache = self.new_call_cache();
                 let call = self.emit(if with_this {
-                    Op::CallSpreadThis(argc)
+                    Op::CallSpreadThis(argc, cache)
                 } else {
-                    Op::CallSpread(argc)
+                    Op::CallSpread(argc, cache)
                 });
                 self.name_call(call, name.as_deref());
             }
@@ -10822,8 +10844,8 @@ impl Compiler {
         let tail = match call {
             Op::Call(argc, _) => Op::TailCall(CallArgsMode::Fixed(argc), false),
             Op::CallWithThis(argc, _) => Op::TailCall(CallArgsMode::Fixed(argc), true),
-            Op::CallSpread(argc) => Op::TailCall(CallArgsMode::FinalSpread(argc), false),
-            Op::CallSpreadThis(argc) => Op::TailCall(CallArgsMode::FinalSpread(argc), true),
+            Op::CallSpread(argc, _) => Op::TailCall(CallArgsMode::FinalSpread(argc), false),
+            Op::CallSpreadThis(argc, _) => Op::TailCall(CallArgsMode::FinalSpread(argc), true),
             Op::CallArgsArray => Op::TailCall(CallArgsMode::Array, false),
             Op::CallArgsArrayThis => Op::TailCall(CallArgsMode::Array, true),
             Op::EvalCallArgsArray => {
@@ -16891,13 +16913,13 @@ fn run_vm_inner(
                 stage_tail_call(i, chunk, op_pc, callee, receiver, args)?;
                 stack.push(Value::Undefined);
             }
-            Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
+            Op::CallSpread(argc, cache) | Op::CallSpreadThis(argc, cache) => {
                 let spread = pop!();
                 let at = stack.len() - (argc as usize - 1);
                 let mut args = crate::rooting::RootedVec::from_vec(stack.split_off(at));
                 i.append_spread_arguments(&spread, &mut args)?;
                 let callee = pop!();
-                let this = if matches!(op, Op::CallSpreadThis(_)) {
+                let this = if matches!(op, Op::CallSpreadThis(..)) {
                     pop!()
                 } else {
                     Value::Undefined
@@ -16905,7 +16927,7 @@ fn run_vm_inner(
                 if !callee.is_callable() {
                     return Err(not_callable_error(i, chunk, op_pc, &callee, false));
                 }
-                let v = explicit_call(i, chunk.position(op_pc), |i| {
+                let v = explicit_call(i, chunk.call_position(cache), |i| {
                     if chunk.feedback.detailed_enabled() {
                         call_profiled(i, chunk, op_pc, callee, this, &args)
                     } else {
@@ -20927,8 +20949,8 @@ impl Chunk {
             Op::DeleteElem(_) => (2, 1),
             Op::DeleteName(_) => (0, 1),
             Op::DeleteSuper => (0, 0),
-            Op::CallSpread(argc) => (*argc as usize + 1, 1),
-            Op::CallSpreadThis(argc) => (*argc as usize + 2, 1),
+            Op::CallSpread(argc, _) => (*argc as usize + 1, 1),
+            Op::CallSpreadThis(argc, _) => (*argc as usize + 2, 1),
             Op::CallArgsArray => (2, 1),
             Op::CallArgsArrayThis => (3, 1),
             Op::EvalCallArgsArray | Op::TailEvalCallArgsArray => (3, 1),
@@ -24226,6 +24248,183 @@ unsafe fn jit_call_inner(
     Ok(())
 }
 
+/// The most arguments [`jit_call_spread`] passes from its own frame: plain arguments and a
+/// final spread's elements together. A longer list takes the general path.
+const SPREAD_ARGS_MAX: usize = 32;
+
+/// [`Op::CallSpread`] and [`Op::CallSpreadThis`] (W3's item 6): `f(a, ...list)`, the call
+/// position read from the site's cache rather than searched for. ArgumentListEvaluation's final
+/// spread of an Array whose intrinsic iteration runs no code (see [`inert_spread_arguments`])
+/// copies the plain arguments and the elements into this frame, where the conservative stack
+/// scan roots them (Decision 0), and the call takes the ordinary path: the site's call cache,
+/// then the compiled-call guards that fill it, then [`Interp::call`]. Anything else expands the
+/// spread through the iterator protocol ([`call_spread_general`]).
+pub(crate) unsafe extern "C" fn jit_call_spread(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    mut sp: *mut Value,
+) -> crate::jit::SpFlag {
+    let ctx = &mut *ctx;
+    jit_opstat(ctx, pc);
+    let i = &mut *ctx.interp;
+    let position = call_op_position(&*ctx.chunk, pc as usize);
+    match explicit_call(i, position, |_| jit_call_spread_inner(ctx, pc, &mut sp)) {
+        Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
+        Err(ab) => {
+            ctx.throw_at(pc, ab);
+            crate::jit::SpFlag { sp, flag: 1 }
+        }
+    }
+}
+
+unsafe fn jit_call_spread_inner(
+    ctx: &mut crate::jit::JitCtx,
+    pc: u32,
+    sp: &mut *mut Value,
+) -> Result<(), Abrupt> {
+    let i = &mut *ctx.interp;
+    let chunk = &*ctx.chunk;
+    let (argc, cache, with_this) = match chunk.ops[pc as usize] {
+        Op::CallSpread(argc, cache) => (argc as usize, cache, false),
+        Op::CallSpreadThis(argc, cache) => (argc as usize, cache, true),
+        _ => unreachable!("jit_call_spread emitted only for spread calls"),
+    };
+    // [this] callee plain.. spread: `argc` counts the spread.
+    let callee_slot = sp.sub(argc + 1);
+    let mut buffer = [std::mem::MaybeUninit::<Value>::uninit(); SPREAD_ARGS_MAX];
+    let count = if chunk.feedback.detailed_enabled() {
+        None
+    } else {
+        inert_spread_arguments(i, sp.sub(argc), argc - 1, &*sp.sub(1), &mut buffer)
+    };
+    let Some(count) = count else {
+        return call_spread_general(i, chunk, pc, sp);
+    };
+    #[cfg(test)]
+    TEST_INERT_SPREAD_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let callee = *callee_slot;
+    if !callee.is_callable() {
+        return Err(not_callable_error(i, chunk, pc as usize, &callee, false));
+    }
+    let undefined = Value::Undefined;
+    let this_slot: *const Value = if with_this {
+        callee_slot.sub(1)
+    } else {
+        &undefined
+    };
+    let args = buffer.as_ptr().cast::<Value>();
+    let site = &chunk.call_caches[cache as usize];
+    let mut r = i.call_jit_cached(site, &callee, this_slot, args, count);
+    if r.is_none() {
+        r = i.call_jit_fast(
+            &callee,
+            this_slot,
+            args,
+            count,
+            Some((site, &chunk.call_pins)),
+        );
+    }
+    let r = match r {
+        Some(r) => r,
+        None => i.call(callee, *this_slot, std::slice::from_raw_parts(args, count)),
+    };
+    // The call's loans have ended: retire the operand window, then publish the result.
+    *sp = if with_this {
+        callee_slot.sub(1)
+    } else {
+        callee_slot
+    };
+    sp.write(r?);
+    *sp = sp.add(1);
+    Ok(())
+}
+
+/// ArgumentListEvaluation (ECMA-262 §13.3.8.1) of `plain_count` evaluated arguments at `plain`
+/// and a final spread of `spread`, into `out`, when the spread's iteration runs no code: the
+/// intrinsic Array iteration (`builtins::array_iteration_is_intrinsic`: no own @@iterator, and
+/// %Array.prototype%[@@iterator] and %ArrayIteratorPrototype%.next unmodified) of an ordinary
+/// Array whose every index below its length is an own data property (no hole, no accessor),
+/// with at most `out.len()` arguments in all. Each IteratorStepValue then reads the length and
+/// the next element and nothing else, and the iterator is never closed, so the list is the plain
+/// arguments followed by the elements. `None` otherwise, having run nothing.
+///
+/// # Safety
+/// `plain..plain+plain_count` are initialized words of the caller's operand window.
+unsafe fn inert_spread_arguments(
+    i: &Interp,
+    plain: *const Value,
+    plain_count: usize,
+    spread: &Value,
+    out: &mut [std::mem::MaybeUninit<Value>],
+) -> Option<usize> {
+    if !crate::builtins::array_iteration_is_intrinsic(i, spread) {
+        return None;
+    }
+    let array = spread.as_obj()?;
+    let body = array.borrow();
+    let length = crate::builtins::ordinary_array_length(&body.props)?;
+    let out = out.get_mut(..plain_count.checked_add(length)?)?;
+    let (plain_out, elements) = out.split_at_mut(plain_count);
+    for (index, slot) in plain_out.iter_mut().enumerate() {
+        slot.write(unsafe { *plain.add(index) });
+    }
+    for (index, slot) in elements.iter_mut().enumerate() {
+        slot.write(crate::builtins::own_data_element(&body.props, index)?);
+    }
+    Some(plain_count + length)
+}
+
+/// [`Op::CallSpread`] and [`Op::CallSpreadThis`] in general: the plain arguments, then the
+/// spread through the iterator protocol ([`Interp::append_spread_arguments`]), into a rooted
+/// list, then [`Interp::call`].
+///
+/// # Safety
+/// `sp` is the operand stack's top, holding the operation's operands.
+unsafe fn call_spread_general(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: u32,
+    sp: &mut *mut Value,
+) -> Result<(), Abrupt> {
+    macro_rules! pop {
+        () => {{
+            *sp = sp.sub(1);
+            sp.read()
+        }};
+    }
+    let (argc, with_this) = match chunk.ops[pc as usize] {
+        Op::CallSpread(argc, _) => (argc, false),
+        Op::CallSpreadThis(argc, _) => (argc, true),
+        _ => unreachable!("a spread call"),
+    };
+    let spread = pop!();
+    let mut plain: Vec<Value> = (1..argc).map(|_| pop!()).collect();
+    plain.reverse();
+    let callee = pop!();
+    let this = if with_this { pop!() } else { Value::Undefined };
+    let mut args = crate::rooting::RootedVec::from_vec(plain);
+    i.append_spread_arguments(&spread, &mut args)?;
+    if !callee.is_callable() {
+        return Err(not_callable_error(i, chunk, pc as usize, &callee, false));
+    }
+    let v = if chunk.feedback.detailed_enabled() {
+        call_profiled(i, chunk, pc as usize, callee, this, &args)?
+    } else {
+        i.call(callee, this, &args)?
+    };
+    sp.write(v);
+    *sp = sp.add(1);
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Spread calls [`jit_call_spread`] made from its own frame, for tests.
+    pub(crate) static TEST_INERT_SPREAD_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// Debug: `TRUST_JS_JIT_CALLSTAT=1` tallies, for every call that reaches the way-1 HIT helper,
 /// which direct-call gate would have (or did) reject the shared-ctx fast path. Temporary
 /// diagnostic mirroring `emit_direct_call`'s runtime checks in emission order.
@@ -24632,7 +24831,12 @@ pub(crate) fn ordinary_tail_call_depth() -> u32 {
 #[inline]
 fn call_op_position(chunk: &Chunk, pc: usize) -> u32 {
     match chunk.ops.get(pc) {
-        Some(Op::Call(_, cache) | Op::CallWithThis(_, cache)) => chunk.call_position(*cache),
+        Some(
+            Op::Call(_, cache)
+            | Op::CallWithThis(_, cache)
+            | Op::CallSpread(_, cache)
+            | Op::CallSpreadThis(_, cache),
+        ) => chunk.call_position(*cache),
         Some(Op::New(_, cache)) => chunk.construct_position(*cache),
         _ => chunk.position(pc),
     }
@@ -24644,8 +24848,8 @@ fn makes_explicit_call(op: &Op) -> bool {
         op,
         Op::Call(..)
             | Op::CallWithThis(..)
-            | Op::CallSpread(_)
-            | Op::CallSpreadThis(_)
+            | Op::CallSpread(..)
+            | Op::CallSpreadThis(..)
             | Op::CallArgsArray
             | Op::CallArgsArrayThis
             | Op::EvalCallArgsArray
@@ -25208,28 +25412,7 @@ unsafe fn jit_exec_inner(
             stage_tail_call(i, chunk, pc as usize, callee, receiver, args)?;
             push!(Value::Undefined);
         }
-        Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
-            let spread = pop!();
-            let mut plain: Vec<Value> = (1..argc).map(|_| pop!()).collect();
-            plain.reverse();
-            let callee = pop!();
-            let this = if matches!(chunk.ops[pc as usize], Op::CallSpreadThis(_)) {
-                pop!()
-            } else {
-                Value::Undefined
-            };
-            let mut args = crate::rooting::RootedVec::from_vec(plain);
-            i.append_spread_arguments(&spread, &mut args)?;
-            if !callee.is_callable() {
-                return Err(not_callable_error(i, chunk, pc as usize, &callee, false));
-            }
-            let v = if chunk.feedback.detailed_enabled() {
-                call_profiled(i, chunk, pc as usize, callee, this, &args)?
-            } else {
-                i.call(callee, this, &args)?
-            };
-            push!(v);
-        }
+        Op::CallSpread(..) | Op::CallSpreadThis(..) => call_spread_general(i, chunk, pc, sp)?,
         Op::CallArgsArray | Op::CallArgsArrayThis => {
             let args = argument_array_values(i, pop!());
             let callee = pop!();

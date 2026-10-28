@@ -5,9 +5,9 @@
 //! can then be ported without duplicating runtime semantics or compromising deoptimization.
 
 use super::{
-    JitCode, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COMPLETE, H_COND, H_EXEC, H_GET_ELEM,
-    H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_SET_PROP,
-    H_SLICE_OP, H_UNWIND,
+    JitCode, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_CALL_SPREAD, H_COMPLETE, H_COND, H_EXEC,
+    H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER,
+    H_SET_PROP, H_SLICE_OP, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
@@ -1221,6 +1221,10 @@ pub(super) fn compile_entry(
                 a.helper_spflag(H_CALL, pc as u32, unwind);
                 // A native callee can allocate after the call's last safepoint.
                 a.helper_end_poll(unwind);
+            }
+            // Ends in the helper end poll (`jit::helper_ends_in_poll`).
+            Op::CallSpread(..) | Op::CallSpreadThis(..) => {
+                a.helper_spflag(H_CALL_SPREAD, pc as u32, unwind)
             }
             Op::New(argc, _) => {
                 a.helper_spflag(H_NEW, pc as u32 | ((*argc as u32) << 16), unwind);
