@@ -1185,6 +1185,36 @@ Found on the way, older than P2: with RegExp.prototype[@@split] deleted, `'a/b/c
 still split by the RegExp, in `nf_string_split`'s own RegExp path, where ECMA-262 and Node
 convert the separator with ToString (["a/b/c"]). d476195d removes that path.
 
+Landed 2026-10-28, with W3's first series (Decision 1): W5c, item 3's matcher entry and item 6
+(ec28905d..b6689c4b, an agent's). The flags in effect stay out of the modifier stack and are
+tested as booleans computed with the program, the matcher's scratch stays with the program, a
+failed attempt's captures are unset through its undo records, and a sticky RegExp is tried at
+its one start only where a match can begin; exec builds its result without intermediate
+vectors, a single-element pattern is matched by its first-element scan, and one-unit ASCII
+results come from the shared one-unit Strings. Item 6: a global `match` and `search` without
+match arrays, and `matchAll`'s iterator set up without its observable lookups. Instructions
+(fat LTO, pinned to the A725 cores, pacing off; against c05fc611, main without W5c): Octane
+RegExp -6.07%, Djot's 40 passes -1.91%, strings.js's RegExp cases -7.87%, source-map -1.04%,
+coffeescript -1.10%. The largest single change is in class tests: Octane 302M to 32M,
+source-map 1.24e9 to 0.28e9, coffeescript 2.04e9 to 0.28e9.
+
+Then W5b's first series (7611cf05..606e33fd, an agent's; its census, design and proposed exit in
+target/p2/drafts/w5b-design.txt, the exit awaiting the owner): a per-pattern census
+(`TRUST_JS_REGEXP_PROF=2`); the matcher keeps no retries for a loop whose shorter runs could only
+fail, resumes a scan past a failed leading loop's run, filters the starts of paths that begin
+with an assertion, and closes case-insensitive elements over case at compile time (item 7); the
+one-byte tier tests an anchor at its own offset in machine code (both backends: x86-64's `$` also
+compared with a register the poll can clobber), its corpus runs the machine code, and classes
+and anchors compile to it. Against main 02d5bd1b: Octane RegExp -9.96%, coffeescript -2.35%,
+source-map -0.62%, Djot -0.48%, strings.js's RegExp cases -0.17%. coffeescript's `clean`
+(`/\s+$/` over its 50 KB source) fell from 10.2M instructions a call to 3.1M, 1.54x
+Sparkplug-only Node's. Against the proposed exit, the backtracking interpreter and class tests are
+62% of main's on Octane, 61% on source-map and 44% on coffeescript (exit: 30%, 30% and 40%),
+which wants the native tier with captures and alternation. Validation: the ARM64 gate (the lib
+suite, pacing, GC stress on the RegExp tests, the fixtures and difftest as the base's; Test262
+53,575 of 53,575, identical), Test262's 2,518 RegExp files with the tier forced on at once and at
+64 executions, and zombie's x86-64 lib suite (its known failure only).
+
 ### W3: calls (census and design, 2026-10-27; exit agreed, Decision 10)
 
 Census: the W2a tip (a1535a6f, branch p2-w2a; since then main's code, c4d68127 adding only W2a's
