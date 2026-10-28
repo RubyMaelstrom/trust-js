@@ -2175,6 +2175,25 @@ states, and the assignment's value must survive the call: designed in the series
 read site compiled before its cache saw an accessor (a function's first native code, compiled
 after tree-walked runs) keeps the helper until it is recompiled.
 
+Then the getter case at run time (76b05c41, 2026-10-28, an agent's; Decision 17): the property
+reads' helper stub, which every site's accessor landing already calls with the read's pc, probes
+a per-chunk table keyed by pc for the read's getter call cache, which the helper's slow path
+makes the first time the read calls a user getter. On a hit it pushes [receiver, getter] for the
+read's form and runs the direct sequence; the frame records the read's in-line position
+(`DirectCallSite::Register`), so reads inside inlined callees are covered. The emission-time
+path at the sites goes. Per iteration against abed1f82: a getter read in a function's first
+native code 1,502 to 671; a warm class getter 362 to 401 and the class construction with its
+getter 866 to 906 (the per-site path cost Vue 0.7% of its code for the 39 instructions); the call
+and construct forms unchanged. Fixtures: Vue +0.22% (every read-helper call tests for a
+published accessor, two instructions, and binding getters also probe the table), React +0.02%,
+Djot -0.03%, chai +0.03%; Vue's generated code 0.68% smaller. x86-64 (zombie, now with perf):
+the getter cases within 7 instructions, Vue -0.06%, React +0.01%, Djot -0.03%. Validation: the
+ARM64 gate (the lib suite, pacing with its known failure only, GC stress on the getter and
+accessor tests, the fixtures and difftest as the base's, Test262 53,575 of 53,575, identical)
+and zombie's x86-64 lib suite and clippy. Not covered: in-line stubs
+(`TRUST_JS_JIT_INLINE_STUBS`) and chunks without direct calls (loop fragments, detailed
+feedback). Setters remain designed but not done.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
