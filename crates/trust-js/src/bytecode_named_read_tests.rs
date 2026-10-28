@@ -150,6 +150,8 @@ fn invoke(
         inline_ic_safe: &interp.inline_ic_safe as *const _ as *const u8,
         strict_flag: &mut interp.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
+        argc: 0,
+        args: std::ptr::null(),
         env_raw: Env::as_ptr(&env).cast(),
         this_word: (this_value),
         global_body: std::ptr::null(),

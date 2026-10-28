@@ -30752,6 +30752,42 @@ for (var round = 0; round < 20; round++) {
     }
 }
 
+/// A body with more formals than an ARM64 store's scaled immediate reaches (4,096 slots) keeps
+/// its `arguments.length` in a slot past them, which the prologue indexes, and makes its rest
+/// Array from the arguments past them. Expected output from Node.
+#[test]
+fn bodies_with_thousands_of_formals_count_and_collect_their_arguments_in_every_tier() {
+    use crate::bytecode::Tier;
+    let params = (0..5000)
+        .map(|k| format!("p{k}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!(
+        r#"function f({params}) {{ return arguments.length; }}
+function g({params}, ...rest) {{ return rest.length + ":" + rest[0]; }}
+var many = [];
+for (var k = 0; k < 5003; k++) many.push(k);
+var s;
+for (var round = 0; round < 40; round++) {{
+  s = [f(1, 2, 3), f.apply(null, many), g(1, 2), g.apply(null, many)].join();
+}}
+s;
+"#
+    );
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, &source),
+                "3,5003,0:undefined,3:5000",
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}
+
 // ---- Error.prototype.stack source positions (see crate::stack_trace) ----------------------
 //
 // Expected strings come from Node 24 (V8) running the same source as

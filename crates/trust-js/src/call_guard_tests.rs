@@ -261,9 +261,9 @@ fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {
                 .cached_call_for(Gc::as_ptr(&victim) as usize)
                 .expect("capturing callee is cached");
             assert_ne!(
-                entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV,
+                entry.direct & 1,
                 0,
-                "activation-homed callee forces the checked helper rather than direct machine call"
+                "an activation-homed callee is a compiled entry: its prologue makes the activation"
             );
             (Gc::downgrade(&victim), Gc::downgrade(&token))
         });
@@ -423,7 +423,8 @@ fn fresh_closure_call_cache_uses_the_live_function_identity() {
             let entry = driver
                 .cached_call_for(Gc::as_ptr(&original) as usize)
                 .expect("original closure filled the call cache");
-            assert_ne!(entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV, 0);
+            // A compiled entry whose prologue makes its activation (`jit_frame_setup`).
+            assert_ne!(entry.direct & 1, 0);
         }
         // Keep the old closure alive for a deterministic wrong-identity failure,
         // instead of depending on a use-after-free to crash the test process.

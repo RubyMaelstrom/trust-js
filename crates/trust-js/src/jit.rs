@@ -34,7 +34,6 @@ use crate::bytecode::Chunk;
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 use crate::bytecode::UpdKind;
-use crate::execution_storage::SlotAccess;
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;
 
@@ -1845,7 +1844,39 @@ pub struct JitCtx {
     /// fields: the call template's inline probe loads the live epoch through it (one load, where
     /// the static's address took three instructions to build).
     pub(crate) call_ic_epoch: *const u32,
+    /// The actual argument count and the address of the actual arguments, kept by the prologue
+    /// of a chunk that builds its environment, rest parameter or arguments object (see
+    /// `Chunk::jit_frame_setup_needed`). Every entry passes both to the code (see
+    /// [`FreshEntry`]): the ARM64 call sequence the count in w1, the arguments
+    /// lying under the caller's operand top, and a Rust entry the count and the address. The
+    /// words are the caller's, unchanged for the whole call, and owned by it.
+    pub(crate) argc: usize,
+    pub(crate) args: *const Value,
 }
+
+/// Byte offset of [`JitCtx::argc`]; [`JitCtx::args`] follows it, so the prologue stores both
+/// with one `stp`.
+pub(crate) const CTX_ARGC_OFF: usize = std::mem::offset_of!(JitCtx, argc);
+const _: () = assert!(std::mem::offset_of!(JitCtx, args) == CTX_ARGC_OFF + 8);
+const _: () = assert!(CTX_ARGC_OFF.is_multiple_of(8) && CTX_ARGC_OFF / 8 < 4096);
+
+/// The count a Rust entry passes to fresh-frame code as its second argument, with the
+/// arguments' address as the third: on ARM64 bit 31 marks it, telling the prologue that the
+/// address is in x2 and not under the caller's operand top, where the call sequence leaves
+/// them. x86-64 code is entered from Rust only.
+#[inline]
+pub(crate) fn entry_argc(argc: usize) -> usize {
+    debug_assert!(argc < 1 << 31, "argument counts fit 31 bits");
+    if cfg!(target_arch = "aarch64") {
+        argc | 1 << 31
+    } else {
+        argc
+    }
+}
+
+/// Fresh-frame code's entry: the frame record, the flagged count ([`entry_argc`]) and the
+/// address of the actual arguments.
+pub(crate) type FreshEntry = extern "C" fn(*mut JitCtx, usize, *const Value) -> u64;
 
 /// Byte offset of [`JitCtx::strict_flag`], loaded by every prologue and epilogue (an 8-byte
 /// `LDR` immediate).
@@ -1909,11 +1940,11 @@ impl crate::gc_trace::GcTrace for JitCtx {
             final_sp: _,
             slots: _, // the slot words: scanned by the registration
             inline_ic_safe: _,
-            // The running environment, owned by the entry's frame (`run`'s environment, a
-            // moved entry's activation or callee closure), by the callee closure a direct call
-            // keeps on the caller's operand stack and in its FnFrame, by `activation`, or by
-            // the VM frame a borrowed entry runs (registered by `drive_vm`).
-            env_raw: _,
+            // The running environment: the callee closure's (which the caller's operand stack
+            // and FnFrame also hold), a borrowed entry's VM frame's (registered by `drive_vm`),
+            // or the activation the prologue made (`bytecode::jit_frame_setup`), which only this
+            // record owns until a closure captures it.
+            env_raw,
             this_word,
             global_body: _, // the realm's global object and scope
             genv: _,
@@ -1944,7 +1975,17 @@ impl crate::gc_trace::GcTrace for JitCtx {
             accessor_slot: _,
             strict_flag: _,
             call_ic_epoch: _,
+            argc: _,
+            args: _, // the caller's words, which it owns
         } = self;
+        if !env_raw.is_null() {
+            // SAFETY: a traced record's `env_raw` names a live environment cell: its entry or
+            // its prologue installed it before any safepoint. The handle is a copied word.
+            let env = unsafe {
+                Env::from_raw(*env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
+            };
+            sink.env(&env);
+        }
         this_word.trace_gc(sink);
         ret.trace_gc(sink);
         error.trace_gc(sink);
@@ -2047,6 +2088,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_abstract_operation as *const () as usize,
         crate::bytecode::jit_call_spread as *const () as usize,
         crate::bytecode::jit_construct_this as *const () as usize,
+        crate::bytecode::jit_frame_setup as *const () as usize,
     ]
 }
 
@@ -2136,7 +2178,11 @@ pub const H_ABSTRACT: usize = 30;
 pub const H_CALL_SPREAD: usize = 31;
 /// The direct construct sequence's instance allocation (see `bytecode::jit_construct_this`).
 pub const H_CONSTRUCT_THIS: usize = 32;
-pub const N_HELPERS: usize = 33;
+/// The prologue's environment, rest parameter and arguments object
+/// (`bytecode::jit_frame_setup`, the `(ctx, imm, sp)` contract): it allocates, so its call ends
+/// in the explicit poll, and it never throws.
+pub const H_FRAME_SETUP: usize = 33;
+pub const N_HELPERS: usize = 34;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2175,6 +2221,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "abstract_operation",
     "call_spread",
     "construct_this",
+    "frame_setup",
 ];
 
 #[inline]
@@ -4092,6 +4139,36 @@ fn compile_entry(
     a.ldr_imm(20, 19, if borrowed_entry { 16 } else { 8 }); // live top or empty stack
     a.ldr_imm(22, 19, 24); // local slots base
 
+    // The actual arguments (W3 item 3, Decision 20d): a body that builds its environment, a
+    // rest parameter or an arguments value keeps their count and address in its record. The
+    // call sequence passes the count in w1, its arguments the caller's top words under x20
+    // (saved at [sp, #24] above); a Rust entry passes the count with bit 31 set and the address
+    // in x2 (`entry_argc`). Taken before anything can clobber w1 and x2.
+    if !borrowed_entry && chunk.jit_frame_args_needed() {
+        const _: () = assert!(CTX_ARGC_OFF <= 504, "one STP stores the count and address");
+        let have = a.new_label();
+        a.lsr_imm_w(9, 1, 31);
+        a.cbnz(9, false, have);
+        a.ldr_imm(2, 31, 24); // the caller's operand top
+        a.lsl_imm(9, 1, 3);
+        a.sub_reg(2, 2, 9); // the arguments' address
+        a.bind(have);
+        a.logic_imm_w(0, 1, 1, asm::logical_imm_w(0x7fff_ffff).unwrap());
+        a.stp_base(1, 2, 19, CTX_ARGC_OFF as i32);
+        if let Some(slot) = chunk.jit_arguments_count_slot() {
+            // A body that reads only `arguments.length` keeps the count, a Number, in its slot.
+            a.ucvtf_d_w(0, 1);
+            if slot < 4096 {
+                a.str_d_imm(0, 22, u32::from(slot) * 8);
+            } else {
+                // Past the scaled immediate's reach (thousands of formals): index the slot.
+                a.fmov_x_d(10, 0);
+                a.movz(9, u32::from(slot), 0);
+                a.str_x_lsl3(10, 22, 9);
+            }
+        }
+    }
+
     // ECMA-262 Strict Mode Code / PutValue: semantic helpers must see THIS body's lexical
     // mode, including cached calls and direct shared-context calls. Save on the native frame,
     // not JitCtx (which direct callees share), and restore on both normal and throwing exits.
@@ -4111,6 +4188,12 @@ fn compile_entry(
     // call `blr`s to the code start: this is its safepoint too.
     if !borrowed_entry {
         emit_interrupt_poll(&mut a, POLL_ENTRY, l_unwind);
+    }
+    if !borrowed_entry && chunk.jit_frame_setup_needed() {
+        // FunctionDeclarationInstantiation's environment, rest Array and arguments object, made
+        // by the callee itself as V8's first bytecode, CreateFunctionContext, makes its context
+        // (Decision 20a): `bytecode::jit_frame_setup`, whose call ends in the explicit poll.
+        emit_op_helper(&mut a, H_FRAME_SETUP, 0, l_unwind);
     }
     if borrowed_entry {
         // The Rust entry validates the bytecode PC and its settled stack before dispatch.
@@ -8593,6 +8676,9 @@ fn emit_direct_sequence(
     // `emit_direct_finish_stub`) whose fast path never leaves machine code; it leaves w8 = threw.
     let run_and_finish = |a: &mut asm::Asm, reload: &dyn Fn(&mut asm::Asm)| {
         a.mov(0, 9);
+        // The argument count, as V8 passes it in a register on every call (Decision 20d): a
+        // callee that needs its arguments finds them under this frame's operand top.
+        a.movz(1, argc as u32, 0);
         a.ldur(16, 12, IC_CODE_MEM);
         a.blr(16);
         // w0 = 1 ok / 0 threw → w1 = threw for the finish stub.
@@ -18053,7 +18139,8 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
 ///   `make_array`, `make_regexp`, `make_closure`, `object_literal`, `abstract_operation`,
 ///   `iteration`, `add_strings`, `get_prop`, `set_prop`, `get_method_elem`/`get_elem`,
 ///   `set_elem`, `instanceof` and `reference_op` (natives, host accessors, lazy prototypes,
-///   key and string conversions). Calls (`call`, `call_hit`, `intrinsic`, direct calls) poll
+///   key and string conversions), and `frame_setup` (the prologue's environment, rest Array and
+///   arguments object, made before the first safepoint after the entry poll). Calls (`call`, `call_hit`, `intrinsic`, direct calls) poll
 ///   once at their site's end, `new` after its own sequence and `string_accumulation` on its
 ///   committed exit, outside this table.
 /// - Not polled: `cond`, `return`, `push_handler`, `pop_handler`, `strict_eq` and
@@ -18082,6 +18169,7 @@ fn helper_ends_in_poll(idx: usize) -> bool {
             | H_INSTANCEOF
             | H_REFERENCE_OP
             | H_CALL_SPREAD
+            | H_FRAME_SETUP
     )
 }
 
@@ -18596,6 +18684,8 @@ pub(crate) unsafe fn run_borrowed_frame(
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
+        argc: 0,
+        args: std::ptr::null(),
         env_raw: Env::as_ptr(env) as *const u8,
         this_word: *this_val,
         global_body: jit_global_body(i, code),
@@ -18723,19 +18813,14 @@ pub fn run(
         NativeEntryKind::FreshFrame,
         "ordinary entry cannot borrow a live frame"
     );
-    let env = chunk.jit_make_run_env(i, env, &this_val, args);
+    // The prologue makes the activation, the rest Array and the arguments value
+    // (`bytecode::jit_frame_setup`) from the count and arguments this entry passes.
+    let env = *env;
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     let (n_params, n_slots) = chunk.jit_frame();
     let seed = n_params.min(args.len());
     slots.extend(args[..seed].iter().copied().map(Cell::new));
     slots.resize_with(n_slots, || Cell::new(Value::Undefined));
-    if let Some(rest) = chunk.rest_slot {
-        let rest_values = args.get(n_params..).unwrap_or(&[]).to_vec();
-        slots.write_value(rest as usize, i.make_array(rest_values));
-    }
-    if let Some(s) = chunk.jit_arguments_slot() {
-        slots.write_value(s as usize, chunk.arguments_slot_value(i, args, &env));
-    }
     stack.clear();
     stack.reserve(code.max_stack);
 
@@ -18763,6 +18848,8 @@ pub fn run(
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
+        argc: 0,
+        args: std::ptr::null(),
         n_slots,
         handlers: Vec::new(),
         activation: None,
@@ -18779,10 +18866,11 @@ pub fn run(
         ret: (Value::Undefined),
     };
     code.referenced.set(1); // entered (the code cache's CLOCK)
-    let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
+    let entry: FreshEntry = unsafe { std::mem::transmute(code.mem) };
     // The pooled buffers are this context's roots for the native run (the stack scan
     // sees the context itself): every slot, initialized above, and the operand words up to
     // `max_stack`, initialized because a ValueStack's whole capacity is (see `ValueStack`).
+    // The context reports its environment, which the prologue may have made.
     let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
         ctx: std::ptr::addr_of!(ctx),
         words: [
@@ -18790,10 +18878,9 @@ pub fn run(
             (stack_base.cast_const().cast(), code.max_stack),
         ],
     });
-    let ok = entry(&mut ctx);
+    let ok = entry(&mut ctx, entry_argc(args.len()), args.as_ptr());
     drop(roots);
-    drop(env); // the env handle must outlive the run (ctx.env_ref aliases it)
-               // Drop any operands left on the raw stack (a throw can leave temporaries).
+    // Drop any operands left on the raw stack (a throw can leave temporaries).
     unsafe {
         let mut p = ctx.stack_base;
         while p < ctx.final_sp {
@@ -18946,6 +19033,8 @@ impl JitFrame {
                 inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
                 strict_flag: &mut i.strict as *mut bool,
                 call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
+                argc: 0,
+                args: std::ptr::null(),
                 env_raw: std::ptr::null(),
                 this_word: (Value::Undefined),
                 global_body: std::ptr::null(),
@@ -19042,7 +19131,7 @@ pub(crate) unsafe fn run_moved(
     // `chunk.jit_frame()`, precomputed by the caller (the cached call reads it from its IC).
     frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
-    unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame, None) }
+    unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame) }
 }
 
 /// Constructor entry from the `Op::New` helper, after allocation and `prototype` validation
@@ -19073,63 +19162,7 @@ pub(crate) unsafe fn run_moved_shared(
     argc: usize,
     frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
-    unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame, None) }
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(crate) static TEST_PACKED_ENV_ENTRIES: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
-    };
-}
-
-/// Entry for a callee that needs a real activation environment. Copy captured parameters into
-/// that environment and canonical words into the private fixed frame buffer. The caller's
-/// immutable argument window remains available through materialization and the entire call;
-/// ordinary captured calls need no temporary decoded argument array.
-#[cfg(any(
-    all(
-        target_arch = "aarch64",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    ),
-    all(
-        target_arch = "x86_64",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    )
-))]
-pub(crate) unsafe fn run_moved_env(
-    i: &mut Interp,
-    chunk: &Rc<Chunk>,
-    code: &JitCode,
-    definition_env: *const Env,
-    this_val: Value,
-    args: *const Value,
-    argc: usize,
-    frame: (usize, usize),
-) -> Result<Value, Abrupt> {
-    #[cfg(test)]
-    TEST_PACKED_ENV_ENTRIES.with(|entries| entries.set(entries.get() + 1));
-    let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
-    let activation = chunk.jit_make_run_env(i, unsafe { &*definition_env }, &this_val, args_ref);
-    let arguments = chunk.jit_arguments_slot().map(|slot| {
-        (
-            slot as usize,
-            chunk.arguments_slot_value(i, args_ref, &activation),
-        )
-    });
-    unsafe {
-        run_moved_inner(
-            i,
-            chunk,
-            code,
-            &activation as *const Env,
-            this_val,
-            args,
-            argc,
-            frame,
-            arguments,
-        )
-    }
+    unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame) }
 }
 
 #[cfg(any(
@@ -19151,7 +19184,6 @@ unsafe fn run_moved_inner(
     args: *const Value,
     argc: usize,
     (n_params, n_slots): (usize, usize),
-    arguments: Option<(usize, Value)>,
 ) -> Result<Value, Abrupt> {
     assert_eq!(
         code.entry_kind,
@@ -19169,7 +19201,6 @@ unsafe fn run_moved_inner(
                 args,
                 argc,
                 (n_params, n_slots),
-                arguments,
             )
         };
     }
@@ -19186,19 +19217,9 @@ unsafe fn run_moved_inner(
         for k in seed..n_slots {
             slots_ptr.add(k).write(Cell::new(Value::Undefined));
         }
-        // A rest parameter copies the surplus argument words into its own Array. Without
-        // rest, the caller's surplus words stay untouched until it retires the input window.
-        if let Some(rest) = chunk.rest_slot {
-            let array = i.make_array_from_raw(args.add(seed), argc - seed);
-            std::ptr::drop_in_place(slots_ptr.add(rest as usize));
-            slots_ptr.add(rest as usize).write(Cell::new(array));
-        }
-        if let Some((slot, value)) = arguments {
-            if slot < seed {
-                std::ptr::drop_in_place(slots_ptr.add(slot));
-            }
-            slots_ptr.add(slot).write(Cell::new(value));
-        }
+        // The caller's argument words stay untouched until it retires the input window: the
+        // prologue makes the activation, a rest Array and an arguments value from them
+        // (`bytecode::jit_frame_setup`).
     }
     let env = unsafe { &*env };
     ctx.stack_base = stack_base;
@@ -19213,8 +19234,8 @@ unsafe fn run_moved_inner(
     ctx.code_base = code.mem;
     ctx.pc_offsets = code.pc_offsets.as_ptr();
     code.referenced.set(1); // entered (the code cache's CLOCK)
-    let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
-    let ok = entry(ctx);
+    let entry: FreshEntry = unsafe { std::mem::transmute(code.mem) };
+    let ok = entry(ctx, entry_argc(argc), args);
     unsafe {
         let mut p = ctx.stack_base;
         while p < ctx.final_sp {
@@ -19259,7 +19280,6 @@ unsafe fn run_moved_oversized(
     args: *const Value,
     argc: usize,
     (n_params, n_slots): (usize, usize),
-    arguments: Option<(usize, Value)>,
 ) -> Result<Value, Abrupt> {
     let seed = n_params.min(argc);
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
@@ -19271,17 +19291,6 @@ unsafe fn run_moved_oversized(
         std::ptr::copy_nonoverlapping(args, slots_ptr.cast::<Value>(), seed);
         for k in seed..n_slots {
             slots_ptr.add(k).write(Cell::new(Value::Undefined));
-        }
-        if let Some(rest) = chunk.rest_slot {
-            let array = i.make_array_from_raw(args.add(seed), argc - seed);
-            std::ptr::drop_in_place(slots_ptr.add(rest as usize));
-            slots_ptr.add(rest as usize).write(Cell::new(array));
-        }
-        if let Some((slot, value)) = arguments {
-            if slot < seed {
-                std::ptr::drop_in_place(slots_ptr.add(slot));
-            }
-            slots_ptr.add(slot).write(Cell::new(value));
         }
     }
     let env = unsafe { &*env };
@@ -19306,6 +19315,8 @@ unsafe fn run_moved_oversized(
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
+        argc: 0,
+        args: std::ptr::null(),
         n_slots,
         handlers: Vec::new(),
         activation: None,
@@ -19322,7 +19333,7 @@ unsafe fn run_moved_oversized(
         ret: (Value::Undefined),
     };
     code.referenced.set(1); // entered (the code cache's CLOCK)
-    let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
+    let entry: FreshEntry = unsafe { std::mem::transmute(code.mem) };
     // As in `run`. The slot Vec's length stays 0, so its `n_slots` words, all written
     // above, are named here; the operand words are initialized up to `max_stack`.
     let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
@@ -19332,7 +19343,7 @@ unsafe fn run_moved_oversized(
             (stack_base.cast_const().cast(), code.max_stack),
         ],
     });
-    let ok = entry(&mut ctx);
+    let ok = entry(&mut ctx, entry_argc(argc), args);
     drop(roots);
     unsafe {
         let mut p = ctx.stack_base;
@@ -19415,30 +19426,6 @@ pub(crate) unsafe fn run_moved(
 pub(crate) unsafe fn run_moved_shared(
     _i: &mut Interp,
     _caller: &mut JitCtx,
-    _chunk: &Rc<Chunk>,
-    _code: &JitCode,
-    _env: *const Env,
-    _this_val: Value,
-    _args: *const Value,
-    _argc: usize,
-    _frame: (usize, usize),
-) -> Result<Value, Abrupt> {
-    unreachable!("jit code cannot exist on this platform")
-}
-
-/// See the aarch64-macos definition; without machine code the fast call never commits.
-#[cfg(not(any(
-    all(
-        target_arch = "aarch64",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    ),
-    all(
-        target_arch = "x86_64",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    )
-)))]
-pub(crate) unsafe fn run_moved_env(
-    _i: &mut Interp,
     _chunk: &Rc<Chunk>,
     _code: &JitCode,
     _env: *const Env,

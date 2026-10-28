@@ -244,7 +244,7 @@ mod tests {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            crate::jit::TEST_PACKED_ENV_ENTRIES.with(|entries| entries.set(0));
+            crate::bytecode::TEST_FRAME_SETUPS.with(|entries| entries.set(0));
             assert_eq!(
                 evaluate(
                     &mut engine,
@@ -279,7 +279,8 @@ mod tests {
                 any(target_os = "linux", target_os = "macos", target_os = "windows")
             ))]
             if tier == Tier::Jit {
-                assert!(crate::jit::TEST_PACKED_ENV_ENTRIES.with(|entries| entries.get()) > 0);
+                // The callee's prologue made its activation (`bytecode::jit_frame_setup`).
+                assert!(crate::bytecode::TEST_FRAME_SETUPS.with(|entries| entries.get()) > 0);
             }
         }
     }

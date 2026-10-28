@@ -50,6 +50,8 @@ fn enter(
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
+        argc: 0,
+        args: std::ptr::null(),
         env_raw: Env::as_ptr(&env) as *const u8,
         this_word: (Value::Undefined),
         global_body: super::jit_global_body(i, code),

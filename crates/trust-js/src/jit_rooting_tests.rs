@@ -686,6 +686,8 @@ fn return_context() -> super::JitCtx {
         inline_ic_safe: std::ptr::null(),
         strict_flag: std::ptr::null_mut(),
         call_ic_epoch: std::ptr::null(),
+        argc: 0,
+        args: std::ptr::null(),
         env_raw: std::ptr::null(),
         this_word: (Value::Undefined),
         global_body: std::ptr::null(),

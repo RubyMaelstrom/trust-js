@@ -13884,78 +13884,6 @@ impl Interp {
         }
     }
 
-    /// A needs-env IC hit ([`crate::bytecode::CALL_IC_NEEDS_ENV`]): same guards and frame
-    /// bookkeeping as [`Interp::call_jit_committed`]. The activation is built before the owned
-    /// arguments move into a fixed JIT frame, so captured values are cloned only where required
-    /// and the ordinary frame slots do not duplicate the caller's arguments.
-    ///
-    /// # Safety
-    /// Same contract as `call_jit_committed`.
-    pub(crate) unsafe fn call_jit_env_committed(
-        &mut self,
-        ic: &crate::bytecode::CallIc,
-        code: &crate::jit::JitCode,
-        env_ptr: *const RefCell<Scope>,
-        this_slot: *const crate::value::Value,
-        args: *const crate::value::Value,
-        argc: usize,
-    ) -> Result<Value, Abrupt> {
-        self.depth += 1;
-        if execution_stack_exhausted(self.depth) {
-            self.depth -= 1;
-            return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
-        }
-        if let Err(e) = self.gc_check_amortized() {
-            self.depth -= 1;
-            return Err(e);
-        }
-        let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        // ECMA-262 OrdinaryCallBindThis / arrow FunctionDeclarationInstantiation:
-        // lexical calls do not introduce this/new.target bindings of their own.
-        let saved_nt = if ic.direct & crate::bytecode::CALL_IC_LEXICAL_THIS != 0 {
-            self.new_target
-        } else {
-            std::mem::replace(&mut self.new_target, Value::Undefined)
-        };
-        self.fn_frames.push(FnFrame {
-            fn_ptr: ic.callee,
-            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
-            strict: ic.strict,
-            construct: false,
-            extra: None,
-        });
-        // Same non-owning env borrow as the moved path: the callee object on the caller's
-        // operand stack keeps it alive through its never-reassigned `call` field. `env_ptr`
-        // is the LIVE callee's env — for a func-keyed hit it differs from `ic.env` (which
-        // belongs to whichever closure instance filled the entry).
-        let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(env_ptr) });
-        let chunk = unsafe { &*ic.chunk };
-        let this_val = self.bind_this_word(unsafe { this_slot.read() }, ic.uses_this, ic.strict);
-        let mut r = with_execution_stack(self.depth, || unsafe {
-            crate::jit::run_moved_env(
-                self,
-                chunk,
-                code,
-                &*env as *const Env,
-                this_val,
-                args,
-                argc,
-                (ic.n_params as usize, ic.n_slots as usize),
-            )
-        });
-        self.pop_fn_frame();
-        self.constructing = saved_ctor;
-        self.new_target = saved_nt;
-        while r.is_ok() {
-            match self.run_pending_tail(false) {
-                Some(next) => r = next,
-                None => break,
-            }
-        }
-        self.depth -= 1;
-        r
-    }
-
     /// Invoke a cached bare native using the original callback signature. Inspect the signature
     /// before reconstructing a typed pointer; an address alone cannot distinguish Rust Results.
     ///
@@ -14405,9 +14333,6 @@ impl Interp {
         args: *const crate::value::Value,
         argc: usize,
     ) -> Result<Value, Abrupt> {
-        if ic.direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 {
-            return unsafe { self.call_jit_env_committed(ic, code, ic.env, this_slot, args, argc) };
-        }
         // --- committed: identical to call_jit_fast's committed path ---
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
@@ -15130,19 +15055,6 @@ impl Interp {
                 .flatten();
             if let Some(r) = forwarded {
                 r
-            } else if ic.direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 {
-                unsafe {
-                    crate::jit::run_moved_env(
-                        self,
-                        chunk,
-                        &code,
-                        &*env as *const Env,
-                        tv,
-                        args,
-                        argc,
-                        (ic.n_params as usize, ic.n_slots as usize),
-                    )
-                }
             } else {
                 match caller_ctx {
                     Some(caller_ctx) => unsafe {
@@ -15262,9 +15174,8 @@ impl Interp {
         if chunk.has_tail_calls() || chunk.prepared_entry {
             return None;
         }
-        // Activation-requiring chunks use the same fresh-frame entry as cached calls,
-        // materializing captured bindings/arguments while retaining the caller's argument loan.
-        let needs_env = !chunk.jit_no_activation();
+        // A constructor that needs an activation, a rest Array or an arguments value makes them
+        // in its prologue (`bytecode::jit_frame_setup`), whichever entry runs it.
         let (n_params, n_slots) = chunk.jit_frame();
         if n_params > u16::MAX as usize || n_slots > u16::MAX as usize {
             return None;
@@ -15290,14 +15201,9 @@ impl Interp {
             uses_this: chunk.needs_frame_this(),
             n_params: n_params as u16,
             n_slots: n_slots as u16,
-            direct: if needs_env {
-                crate::bytecode::CALL_IC_NEEDS_ENV
-            } else {
-                chunk.jit_construct_flags(&code, arguments_apply_forwarder)
-                    | (((chunk.inline_attempted.get() || func.runtime().code2.get().is_some())
-                        as u8)
-                        << 2)
-            },
+            direct: chunk.jit_construct_flags(&code, arguments_apply_forwarder)
+                | (((chunk.inline_attempted.get() || func.runtime().code2.get().is_some()) as u8)
+                    << 2),
             func: Rc::as_ptr(&func),
             epoch,
             chunk_raw: Rc::as_ptr(chunk),
@@ -15395,11 +15301,9 @@ impl Interp {
         if chunk.prepared_entry || chunk.jit_is_resumable() {
             return None;
         }
-        // A callee that needs an activation env (captured locals / lexical this) is cacheable
-        // too: its committed path enters through `jit::run` (which builds the activation)
-        // instead of `run_moved`. IC entries carry direct bit 4; bits 0-3 stay clear, so the
-        // machine-code direct sequence's first gate routes them to the helper.
-        let needs_env = !chunk.jit_no_activation();
+        // A callee that needs an activation (captured locals, a captured `this` or `arguments`),
+        // a rest Array or an arguments value makes them in its prologue
+        // (`bytecode::jit_frame_setup`): it enters like any other, the direct sequence included.
         // Every guard passed: remember the callee at this site so the next call takes the
         // one-compare cached path. The Weak pin makes the raw identity compare ABA-safe (the
         // address can't be recycled while pinned); a megamorphic site stops refilling at the cap
@@ -15434,19 +15338,16 @@ impl Interp {
                             uses_this: chunk.needs_frame_this(),
                             n_params: n_params as u16,
                             n_slots: n_slots as u16,
-                            direct: (if needs_env {
-                                crate::bytecode::CALL_IC_NEEDS_ENV
-                            } else {
-                                chunk.jit_direct_flags(&code)
-                                    | (((chunk.inline_attempted.get()
-                                        || func.runtime().code2.get().is_some())
-                                        as u8)
-                                        << 2)
-                            }) | if func.is_arrow {
-                                crate::bytecode::CALL_IC_LEXICAL_THIS
-                            } else {
-                                0
-                            },
+                            direct: chunk.jit_direct_flags(&code)
+                                | (((chunk.inline_attempted.get()
+                                    || func.runtime().code2.get().is_some())
+                                    as u8)
+                                    << 2)
+                                | if func.is_arrow {
+                                    crate::bytecode::CALL_IC_LEXICAL_THIS
+                                } else {
+                                    0
+                                },
                             func: Rc::as_ptr(&func),
                             epoch: crate::bytecode::CALL_IC_EPOCH
                                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -15504,34 +15405,17 @@ impl Interp {
             realm,
             Env::as_ptr(&self.global_env) as usize,
         );
-        let mut r = with_execution_stack(self.depth, || {
-            if needs_env {
-                unsafe {
-                    crate::jit::run_moved_env(
-                        self,
-                        chunk,
-                        &code,
-                        &env as *const Env,
-                        this_val,
-                        args,
-                        argc,
-                        chunk.jit_frame(),
-                    )
-                }
-            } else {
-                unsafe {
-                    crate::jit::run_moved(
-                        self,
-                        chunk,
-                        &code,
-                        &env as *const Env,
-                        this_val,
-                        args,
-                        argc,
-                        chunk.jit_frame(),
-                    )
-                }
-            }
+        let mut r = with_execution_stack(self.depth, || unsafe {
+            crate::jit::run_moved(
+                self,
+                chunk,
+                &code,
+                &env as *const Env,
+                this_val,
+                args,
+                argc,
+                chunk.jit_frame(),
+            )
         });
         self.pop_fn_frame();
         self.constructing = saved_ctor;

@@ -975,7 +975,8 @@ pub struct CallIc {
     /// Direct-call gates computed at fill: bit 0 = a compiled user-code entry; bit 1 = the chunk
     /// needs the realm's global body pointer (the sequence requires the caller's
     /// `ctx.global_body` to be live); bit 2 = the callee's inline attempt had been made; bit 3 =
-    /// the frame fits a pooled record; bits 4-6 = [`CALL_IC_NEEDS_ENV`],
+    /// the frame fits a pooled record; bit 4 is unused (it marked a callee whose activation
+    /// the Rust entry built, before callees built their own); bits 5-6 =
     /// [`CALL_IC_LEXICAL_THIS`] and [`CALL_IC_SCOPED_NATIVE`]; bit 7 =
     /// [`CALL_IC_DIRECT_READY`], all of the sequence's static gates at once.
     pub direct: u8,
@@ -1008,12 +1009,6 @@ pub struct CallIc {
     /// this Realm: the entry's same-realm proof was made for it.
     pub realm: usize,
 }
-
-/// [`CallIc::direct`] bit 4: the callee needs an activation environment (captured locals or
-/// lexical `this`) — the committed path enters through `jit::run` (which builds it) instead of
-/// `run_moved`. Bits 0-3 stay clear on such entries, so the machine-code direct sequence's
-/// first gate routes them to the helper.
-pub const CALL_IC_NEEDS_ENV: u8 = 16;
 
 /// Lexical [[ThisMode]]: the call inherits `new.target` and resolves `this` through its
 /// definition environment. Keep this bit independent of activation/direct-entry eligibility.
@@ -20563,9 +20558,6 @@ impl Chunk {
     pub(crate) fn jit_frame(&self) -> (usize, usize) {
         (self.n_params, self.n_slots)
     }
-    pub(crate) fn jit_arguments_slot(&self) -> Option<u16> {
-        self.arguments_slot
-    }
 
     /// The initial value of `arguments_slot`: the arguments object, or for a
     /// [`Chunk::lazy_arguments`] body the plain Array of actual arguments standing in for it
@@ -20839,6 +20831,38 @@ impl Chunk {
     pub(crate) fn jit_no_activation(&self) -> bool {
         !self.resumable && !self.needs_env()
     }
+
+    /// Whether a fresh frame's prologue calls [`jit_frame_setup`] (W3 item 3, Decision 20a): the
+    /// body makes an activation environment, has a rest parameter, or keeps an arguments value
+    /// other than the bare count in its slot. A prepared entry's caller has already made its
+    /// environment; a resumable body's coroutine owns its frame and never enters fresh.
+    pub(crate) fn jit_frame_setup_needed(&self) -> bool {
+        !self.resumable
+            && ((!self.prepared_entry && self.makes_env())
+                || self.rest_slot.is_some()
+                || (self.arguments_slot.is_some() && !self.arguments_count))
+    }
+
+    /// Whether a fresh frame's prologue keeps the actual argument count and arguments in its
+    /// record (`JitCtx::argc`, `JitCtx::args`): for [`jit_frame_setup`], or for the count a body
+    /// that reads only `arguments.length` keeps in its slot.
+    pub(crate) fn jit_frame_args_needed(&self) -> bool {
+        self.jit_frame_setup_needed() || (!self.resumable && self.arguments_count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn jit_arguments_slot(&self) -> Option<u16> {
+        self.arguments_slot
+    }
+
+    /// The slot of a body that reads only `arguments.length` ([`Chunk::arguments_count`]), which
+    /// its prologue fills with the count, a Number.
+    pub(crate) fn jit_arguments_count_slot(&self) -> Option<u16> {
+        if self.resumable || !self.arguments_count {
+            return None;
+        }
+        self.arguments_slot
+    }
     pub(crate) fn jit_is_resumable(&self) -> bool {
         self.resumable
     }
@@ -20900,9 +20924,9 @@ impl Chunk {
     /// that record's closure environment, and the finish stub hands any materialized
     /// activation to `jit_direct_finish`, whose record release drops it.
     pub(crate) fn jit_direct_flags(&self, code: &crate::jit::JitCode) -> u8 {
-        // The machine-code sequence seeds positional parameters only; a rest parameter's Array
-        // is built by the Rust frame entries.
-        if self.resumable || !direct_shared_context_enabled() || self.rest_slot.is_some() {
+        // The sequence seeds positional parameters; the callee's prologue makes its
+        // environment, rest Array and arguments value (`jit_frame_setup`).
+        if self.resumable || !direct_shared_context_enabled() {
             return 0;
         }
         #[allow(unused_mut)] // Only the ARM64 shared-call backend adds frame flags.
@@ -21001,16 +21025,6 @@ impl Chunk {
             _ => None,
         }
     }
-    pub(crate) fn jit_make_run_env(
-        &self,
-        i: &mut Interp,
-        env: &Env,
-        this_val: &Value,
-        args: &[Value],
-    ) -> Env {
-        self.make_run_env(i, env, this_val, args)
-    }
-
     /// (pops, pushes) of the op at `pc`, for the static stack-depth analysis. `None` = an op the
     /// JIT can't account for (which refuses compilation).
     pub(crate) fn jit_stack_effect(&self, pc: usize) -> Option<(usize, usize)> {
@@ -23719,6 +23733,78 @@ unsafe fn jit_new_inner(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls of [`jit_frame_setup`], from either backend's prologue.
+    pub(crate) static TEST_FRAME_SETUPS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// A fresh frame's FunctionDeclarationInstantiation work, called by the prologue of a chunk whose
+/// [`Chunk::jit_frame_setup_needed`] holds, after its entry poll (W3 item 3, Decision 20a): the
+/// callee makes its own environment, as V8's first bytecode `CreateFunctionContext`, SpiderMonkey
+/// Baseline's prologue and JSC's `op_create_lexical_environment` do, so any caller reaches it
+/// through an ordinary call. From the frame record: the closure's environment (`env_raw`), the
+/// bound `this` (`this_word`), and the actual count and arguments the prologue kept
+/// (`JitCtx::argc`, `JitCtx::args`), which are the caller's and unchanged for the whole call.
+/// It makes, as the Rust entries did before:
+/// - the activation the chunk's plan describes (`Chunk::make_run_env`: captured parameters,
+///   vars, lexicals in their temporal dead zone, `this`, hoisted closures, a captured
+///   `arguments`), installed as the frame's environment with the closure's as its parent;
+/// - a rest parameter's Array of the arguments past the formals;
+/// - the arguments slot's value (an Array standing in for an unobservable object, or the
+///   object itself), unless the body reads only `arguments.length`, whose count the prologue
+///   stored.
+///
+/// It runs no author code and reaches no safepoint (allocation never collects), so every word
+/// is set before the next one, the poll that ends this call. It never throws.
+///
+/// # Safety
+/// `ctx` is the running frame's record, entered fresh by a prologue that kept the count and
+/// arguments, and `sp` its operand top.
+pub(crate) unsafe extern "C" fn jit_frame_setup(
+    ctx: *mut crate::jit::JitCtx,
+    _pc: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    #[cfg(test)]
+    TEST_FRAME_SETUPS.with(|count| count.set(count.get() + 1));
+    let ctx = unsafe { &mut *ctx };
+    let i = unsafe { &mut *ctx.interp };
+    let chunk = unsafe { &*ctx.chunk };
+    let args: &[Value] = if ctx.argc == 0 {
+        &[]
+    } else {
+        // SAFETY: the entry's argument words, live and unchanged for the call (see above).
+        unsafe { std::slice::from_raw_parts(ctx.args, ctx.argc) }
+    };
+    // SAFETY: the record's environment is the live closure's, installed by its entry.
+    let closure = unsafe {
+        Env::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
+    };
+    let this_val = ctx.this_value();
+    let env = chunk.make_run_env(i, &closure, &this_val, args);
+    if Env::as_ptr(&env) != Env::as_ptr(&closure) {
+        ctx.env_raw = Env::as_ptr(&env) as *const u8;
+        ctx.env_parent_raw = Env::as_ptr(&closure) as *const u8;
+    }
+    if let Some(rest) = chunk.rest_slot {
+        let (n_params, _) = chunk.jit_frame();
+        let surplus = args.get(n_params..).unwrap_or(&[]);
+        // SAFETY: `surplus` is a live slice of argument words.
+        let array = unsafe { i.make_array_from_raw(surplus.as_ptr(), surplus.len()) };
+        // SAFETY: the record's slots hold `n_slots` initialized words; the rest slot is one.
+        unsafe { (*ctx.slots.add(rest as usize)).set(array) };
+    }
+    if let Some(slot) = chunk.arguments_slot.filter(|_| !chunk.arguments_count) {
+        let value = chunk.arguments_slot_value(i, args, &env);
+        // SAFETY: as above, for the arguments slot.
+        unsafe { (*ctx.slots.add(slot as usize)).set(value) };
+    }
+    crate::jit::SpFlag { sp, flag: 0 }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 thread_local! {
     /// Allocations [`jit_construct_this`] declined.
@@ -25049,21 +25135,11 @@ unsafe fn jit_callstat(
         if ic.native != 0 {
             break 'r "native entry";
         }
-        if ic.direct & CALL_IC_NEEDS_ENV != 0 {
-            let callee = &*ic.chunk_raw;
-            break 'r if callee.makes_env() {
-                "env entry: activation environment"
-            } else if callee.prepared_entry {
-                "env entry: prepared entry"
-            } else {
-                "env entry: arguments slot, no environment"
-            };
-        }
         if argc > 64 {
             break 'r "emit: argc > 64";
         }
         if ic.direct & 1 == 0 {
-            break 'r "callee: resumable or rest parameters (no direct entry)";
+            break 'r "callee: resumable (no direct entry)";
         }
         if ic.direct & 8 == 0 {
             break 'r "gate: frame > FRAME_BUF";
@@ -26923,6 +26999,8 @@ mod return_slot_tests {
             inline_ic_safe: std::ptr::null(),
             strict_flag: std::ptr::null_mut(),
             call_ic_epoch: std::ptr::null(),
+            argc: 0,
+            args: std::ptr::null(),
             env_raw: std::ptr::null(),
             this_word: (Value::Undefined),
             global_body: std::ptr::null(),

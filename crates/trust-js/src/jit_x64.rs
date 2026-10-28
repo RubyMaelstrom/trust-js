@@ -6,8 +6,8 @@
 
 use super::{
     JitCode, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_CALL_SPREAD, H_COMPLETE, H_COND, H_EXEC,
-    H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER,
-    H_SET_PROP, H_SLICE_OP, H_UNWIND,
+    H_FRAME_SETUP, H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER,
+    H_PUSH_HANDLER, H_SET_PROP, H_SLICE_OP, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
@@ -890,8 +890,26 @@ pub(super) fn compile_entry(
     ]);
     // A resumed slice starts with the owned live operand prefix, not an empty stack.
     a.bytes(&[0x4d, 0x8b, 0x7c, 0x24, 0x18]); // r15 = [r12+24] (slots)
-                                              // ECMA-262 Strict Mode Code / PutValue. Preserve the caller's ambient mode on this
-                                              // native frame and install the body's mode for every semantic helper and nested call.
+                                              // The actual arguments (W3 item 3): every x86-64 entry is a Rust entry, which passes the
+                                              // count and the arguments' address as the code's second and third arguments
+                                              // (`jit::FreshEntry`). A body that builds its environment, a rest parameter or an
+                                              // arguments value keeps both in its record, before anything can clobber them.
+    if !borrowed_entry && chunk.jit_frame_args_needed() {
+        #[cfg(not(target_os = "windows"))]
+        let (count, address) = (6u8, DX); // rsi, rdx
+        #[cfg(target_os = "windows")]
+        let (count, address) = (DX, R8);
+        a.nr_store(CTX, super::CTX_ARGC_OFF, count);
+        a.nr_store(CTX, super::CTX_ARGC_OFF + 8, address);
+        if let Some(slot) = chunk.jit_arguments_count_slot() {
+            // A body that reads only `arguments.length` keeps the count, a Number, in its slot.
+            a.bytes(&[0xf2, 0x48 | (count >> 3), 0x0f, 0x2a, 0xc0 | (count & 7)]); // cvtsi2sd xmm0, count
+            a.bytes(&[0xf2, 0x41, 0x0f, 0x11, 0x87]); // movsd [r15+disp32], xmm0
+            a.bytes(&(i32::from(slot) * SLOT_BYTES).to_le_bytes());
+        }
+    }
+    // ECMA-262 Strict Mode Code / PutValue. Preserve the caller's ambient mode on this
+    // native frame and install the body's mode for every semantic helper and nested call.
     a.bytes(&[0x48, 0x83, 0xec, 0x10]); // sub rsp,16 (keep helper-call alignment)
     a.bytes(&[0x49, 0x8b, 0x84, 0x24]); // rax = [r12+interp_offset]
     a.bytes(&interp_offset.to_le_bytes());
@@ -910,6 +928,11 @@ pub(super) fn compile_entry(
     // is fully established and the operand stack empty, as at a back-edge target at pc 0.
     if !borrowed_entry {
         a.interrupt_poll(super::POLL_ENTRY, unwind);
+    }
+    if !borrowed_entry && chunk.jit_frame_setup_needed() {
+        // FunctionDeclarationInstantiation's environment, rest Array and arguments object, made
+        // by the callee (`bytecode::jit_frame_setup`); the call ends in the explicit poll.
+        a.helper_spflag(H_FRAME_SETUP, 0, unwind);
     }
 
     if borrowed_entry {
