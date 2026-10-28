@@ -96,6 +96,10 @@ mod call_reference_tests;
 mod call_closure_tests;
 
 #[cfg(test)]
+#[path = "jit_construct_tests.rs"]
+mod construct_tests;
+
+#[cfg(test)]
 #[path = "jit_osr_entry_tests.rs"]
 mod osr_entry_tests;
 

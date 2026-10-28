@@ -4443,6 +4443,15 @@ pub struct ClassInfo {
 }
 
 impl ClassInfo {
+    /// Whether InitializeInstanceElements (ECMA-262) adds anything to an instance: private
+    /// methods and accessors, fields, or decorators' initializers. ClassDefinitionEvaluation
+    /// installs all of them before the class can be constructed, and none changes afterwards.
+    pub(crate) fn has_instance_elements(&self) -> bool {
+        !self.fields.is_empty()
+            || !self.instance_initializers.is_empty()
+            || !self.private_members.is_empty()
+    }
+
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         let mut bytes = self
             .fields
@@ -14767,7 +14776,7 @@ impl Interp {
     }
 
     /// The identity-cached JIT construct (`Op::New` with a plain, same-realm compiled function
-    /// constructor): replicates `construct` → `construct_dispatch`'s
+    /// or base class constructor): replicates `construct` → `construct_dispatch`'s
     /// observable effects for that case — IsConstructor, prototype read (LIVE, each time:
     /// `F.prototype = other` is a plain value write no epoch sees), OrdinaryCreateFromConstructor,
     /// depth guard, gc tick, `FnFrame`, new.target = the callee for the body's duration,
@@ -15125,8 +15134,8 @@ impl Interp {
     }
 
     /// [`Interp::construct_jit_fast`]'s miss path: revalidate the full guard set (the same one
-    /// `call_jit_fast` uses, plus [[Construct]]'s own arrow/method/generator/async and
-    /// class-constructor exclusions) and cache the derived state under the callee's identity.
+    /// `call_jit_fast` uses, plus [[Construct]]'s own arrow/method/generator/async and class
+    /// exclusions) and cache the derived state under the callee's identity.
     fn construct_ic_fill(
         &mut self,
         o: &Gc,
@@ -15143,7 +15152,7 @@ impl Interp {
             }
             _ => return None,
         };
-        let class_constructor = object.class_kind != 0;
+        let class_kind = object.class_kind;
         drop(object);
         if func.is_arrow || func.is_method || func.is_generator || func.is_async {
             return None;
@@ -15151,7 +15160,19 @@ impl Interp {
         if env.borrow().under_with {
             return None;
         }
-        if class_constructor {
+        // ECMA-262 [[Construct]] allocates `this` only for a base constructor (step 3): a derived
+        // class's comes from super(). A base class constructor then runs
+        // InitializeInstanceElements before its body (step 6.b), which has nothing to add for a
+        // class without instance elements (`ClassInfo::has_instance_elements`, fixed once
+        // ClassDefinitionEvaluation installs them); such a constructor's body runs exactly as an
+        // ordinary function constructor's.
+        if class_kind == crate::value::CLASS_DERIVED
+            || (class_kind == crate::value::CLASS_BASE
+                && self
+                    .class_info
+                    .get(&key)
+                    .is_none_or(ClassInfo::has_instance_elements))
+        {
             return None;
         }
         let (prototype_shape, prototype_slot) = {

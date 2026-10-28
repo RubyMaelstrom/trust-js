@@ -7251,13 +7251,7 @@ impl Interp {
         let ptr = Gc::as_ptr(&obj) as usize;
         let (fields, field_env, initializers, priv_members) = match self.class_info.get(&ptr) {
             // InitializeInstanceElements has nothing to add for a class without elements.
-            Some(i)
-                if i.fields.is_empty()
-                    && i.instance_initializers.is_empty()
-                    && i.private_members.is_empty() =>
-            {
-                return Ok(());
-            }
+            Some(i) if !i.has_instance_elements() => return Ok(()),
             Some(i) => (
                 i.fields.clone(),
                 i.field_env,
