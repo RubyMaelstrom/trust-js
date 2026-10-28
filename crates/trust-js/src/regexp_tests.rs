@@ -259,6 +259,67 @@ fn match_all_matches_with_a_copy_of_the_regexp() {
     );
 }
 
+/// Greedy loops whose shorter runs could only fail, and their neighbours that need them, match as
+/// Node (v24.22.0) does: `\s+$` in and out of multiline mode, `[\w+\-.]+:` misses, `\b\w+\b` at
+/// word edges and with a bounded run, `(\d*)(\D*)`, empty runs, sticky and global starts from
+/// `lastIndex`, two-byte and surrogate subjects, and runs that begin a pattern.
+#[test]
+fn loops_without_futile_retries_match_as_node_does() {
+    check(
+        r#"
+        function show(m) { return m === null ? null : [m.index].concat(Array.prototype.slice.call(m)); }
+        function at(re, s, i) { re.lastIndex = i; var m = re.exec(s); return [show(m), re.lastIndex]; }
+        var url = /^(?:([\w+\-.]+):)?\/\/(?:(\w+:\w+)@)?([\w.-]*)(?::(\d+))?(.*)$/;
+        JSON.stringify([
+            // kAtEnd: `\s+$` outside and inside multiline mode, empty runs, sticky and global.
+            show(/\s+$/.exec("a  b  ")),
+            show(/\s+$/.exec("a  \n b")),
+            show(/\s+$/m.exec("a  \n b")),
+            show(/\s+$/.exec("   ")),
+            show(/\s*$/.exec("abc")),
+            show(/\s+$/.exec("abc")),
+            "x \t ".replace(/\s+$/, ""),
+            at(/\s+$/g, "ab  c  ", 2),
+            at(/\s+$/y, "ab   ", 3),
+            at(/\s+$/y, "ab  c", 2),
+            "a’ 　 ".replace(/\s+$/, "|"),
+            show(/\s+$/u.exec("\u{1F600}  ")),
+            show(/[^x]+$/.exec("ab\ud800")),
+            // kDisjoint: `[\w+\-.]+:` misses and hits, URL parsing.
+            show(url.exec("foo/bar.js")),
+            show(url.exec("http://x.com:80/a")),
+            show(url.exec("a+b-c.d:")),
+            show(url.exec("//host/p")),
+            show(/[\w+\-.]+:/.exec("ab.cd ef:gh")),
+            at(/[\w+\-.]+:/g, "x.y z:w q:", 2),
+            show(/[\w+\-.]+:/.exec("été ab:")),
+            show(/\d+x/.exec("123 456x")),
+            show(/\S*\s/.exec("abc")),
+            show(/a+[^a]/.exec("aaa")),
+            // kBoundary: `\b\w+\b` at word edges, with a bounded run.
+            "  foo bar_9  ".match(/\b\w+\b/g),
+            show(/\b\w+\b/.exec("é a")),
+            show(/\w+\b/.exec("abc")),
+            show(/\w{1,2}\b/.exec("abcd")),
+            show(/\w*\b/.exec(" ab")),
+            at(/\b\w+\b/g, "one two", 1),
+            show(/\b\w+\b/u.exec("\u{1F600}x\u{1F600}")),
+            // kTotal: `(\d*)(\D*)`.
+            "12ab34".match(/(\d*)(\D*)/g),
+            show(/(\d*)(\D*)/.exec("x")),
+            show(/(\d*)(\D*)$/.exec("12ab")),
+            show(/a*(?:b|)/.exec("aaac")),
+            // A leading run bounded by `max` restarts inside it.
+            show(/a{1,2}b/.exec("aaab")),
+            show(/\s*x/.exec("   yx")),
+            show(/a+b/.exec("aaac aab")),
+            show(/a+?b/.exec("aaac aab")),
+        ])
+        "#,
+        r#"[[4,"  "],null,[1,"  "],[0,"   "],[3,""],null,"x",[[5,"  "],7],[[3,"  "],5],[null,0],"a’|",[2,"  "],[0,"ab\ud800"],null,[0,"http://x.com:80/a","http",null,"x.com","80","/a"],null,[0,"//host/p",null,null,"host",null,"/p"],[6,"ef:"],[[4,"z:"],6],[4,"ab:"],[4,"456x"],null,null,["foo","bar_9"],[2,"a"],[0,"abc"],[2,"cd"],[1,"ab"],[[4,"two"],7],[2,"x"],["12ab","34",""],[0,"x","","x"],[0,"12ab","12","ab"],[0,"aaa"],[1,"aab"],[4,"x"],[5,"aab"],[5,"aab"]]"#,
+    );
+}
+
 /// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
 /// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
 /// `min`, and greedy versus lazy order (§22.2.2.3.1).

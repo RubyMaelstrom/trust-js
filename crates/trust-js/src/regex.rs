@@ -221,11 +221,24 @@ fn regexp_census_features(re: &Regex) -> String {
     }
     let mut counts = std::collections::BTreeMap::new();
     walk(&re.prog, &mut counts);
+    fn atomic_loops(prog: &[Inst]) -> usize {
+        prog.iter()
+            .map(|inst| match inst {
+                Inst::Many { atomic: true, .. } => 1,
+                Inst::Look { prog, .. } | Inst::LookBehind { prog, .. } => atomic_loops(prog),
+                _ => 0,
+            })
+            .sum()
+    }
     let mut out = format!("len={} groups={}", re.prog.len(), re.ngroups);
     for (kind, n) in counts {
         if !matches!(kind, "save" | "match") {
             out.push_str(&format!(" {kind}={n}"));
         }
+    }
+    let atomic = atomic_loops(&re.prog);
+    if atomic > 0 {
+        out.push_str(&format!(" atomic={atomic}"));
     }
     out.push_str(match &re.first {
         FirstFilter::None => " first=none",
@@ -1187,6 +1200,7 @@ impl OneByteNativeProgram {
                 min,
                 max,
                 greedy,
+                ..
             } = &body[0]
             {
                 if one_byte_native_rep(rep) {
@@ -1436,12 +1450,14 @@ enum Inst {
         prog: Rc<Vec<Inst>>,
     },
     /// A repeated single-character matcher (`a*`, `\w+`, `.{2,5}`, `\p{L}+`). Consumed iteratively,
-    /// with one backtrack record for the whole run rather than one per character.
+    /// with one backtrack record for the whole run rather than one per character. An `atomic`
+    /// greedy one keeps none: a shorter run could only fail (see [`loop_retries_futile`]).
     Many {
         rep: Rep,
         min: usize,
         max: Option<usize>,
         greedy: bool,
+        atomic: bool,
     },
     /// `(?ims-ims:…)` inline modifiers: push a new `(icase, multiline, dotall)` flag set for the
     /// group body (`Some` = add/remove, `None` = inherit), then `PopFlags` restores it.
@@ -2723,6 +2739,9 @@ impl Regex {
         compile(&ast, &mut prog, &mut lowering, false)?;
         prog.push(Inst::Save(1));
         prog.push(Inst::Match);
+        if !env_flag!("TRUST_JS_REGEXP_NO_ATOMIC_LOOPS") {
+            analyse_loops(&mut prog, flags);
+        }
         // The `flags` accessor returns flags in canonical order.
         let canonical: String = "dgimsuvy".chars().filter(|c| flags.contains(*c)).collect();
         let (first, first_line_start) = first_filter(&prog, flags.contains('m'));
@@ -5068,6 +5087,7 @@ fn compile_repeat(
             min,
             max,
             greedy,
+            atomic: false,
         });
         return Ok(());
     }
@@ -5251,6 +5271,249 @@ fn resolve_named_backrefs(node: &mut Node, names: &[(String, usize)]) {
         | Node::LookBehind(_, inner)
         | Node::Modifier { inner, .. } => resolve_named_backrefs(inner, names),
         _ => {}
+    })
+}
+
+/// Sorted, disjoint, non-adjacent closed ranges of elements (code points, or code units outside
+/// Unicode mode): what an instruction may consume, for proofs about where paths can fail.
+type ElementSet = Vec<(u32, u32)>;
+
+const MAX_ELEMENT: u32 = 0x10_FFFF;
+const DIGIT_ELEMENTS: [(u32, u32); 1] = [(0x30, 0x39)];
+const WORD_ELEMENTS: [(u32, u32); 4] = [(0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A)];
+/// WhiteSpace and LineTerminator (see [`js_whitespace`]).
+const SPACE_ELEMENTS: [(u32, u32); 10] = [
+    (0x09, 0x0D),
+    (0x20, 0x20),
+    (0xA0, 0xA0),
+    (0x1680, 0x1680),
+    (0x2000, 0x200A),
+    (0x2028, 0x2029),
+    (0x202F, 0x202F),
+    (0x205F, 0x205F),
+    (0x3000, 0x3000),
+    (0xFEFF, 0xFEFF),
+];
+const LINE_TERMINATOR_ELEMENTS: [(u32, u32); 3] = [(0x0A, 0x0A), (0x0D, 0x0D), (0x2028, 0x2029)];
+
+/// `ranges` as an [`ElementSet`].
+fn element_set(mut ranges: Vec<(u32, u32)>) -> ElementSet {
+    ranges.sort_unstable();
+    let mut set: ElementSet = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        match set.last_mut() {
+            Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+            _ => set.push((lo, hi)),
+        }
+    }
+    set
+}
+
+/// The elements up to [`MAX_ELEMENT`] that `set` lacks.
+fn element_complement(set: &[(u32, u32)]) -> ElementSet {
+    let mut out = Vec::with_capacity(set.len() + 1);
+    let mut next = 0u32;
+    for &(lo, hi) in set {
+        if lo > next {
+            out.push((next, lo - 1));
+        }
+        next = next.max(hi.saturating_add(1));
+    }
+    if next <= MAX_ELEMENT {
+        out.push((next, MAX_ELEMENT));
+    }
+    out
+}
+
+fn elements_disjoint(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].1 < b[j].0 {
+            i += 1;
+        } else if b[j].1 < a[i].0 {
+            j += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn elements_within(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    elements_disjoint(a, &element_complement(b))
+}
+
+/// The elements a builtin class letter (see [`builtin_matches_ic`]) matches case-sensitively.
+fn builtin_elements(builtin: char) -> Option<ElementSet> {
+    let (set, negate): (&[(u32, u32)], bool) = match builtin {
+        'd' => (&DIGIT_ELEMENTS, false),
+        'D' => (&DIGIT_ELEMENTS, true),
+        'w' => (&WORD_ELEMENTS, false),
+        'W' => (&WORD_ELEMENTS, true),
+        's' => (&SPACE_ELEMENTS, false),
+        'S' => (&SPACE_ELEMENTS, true),
+        _ => return None,
+    };
+    Some(if negate {
+        element_complement(set)
+    } else {
+        set.to_vec()
+    })
+}
+
+/// The elements `class` matches case-sensitively (see [`CharClass::matches`]).
+fn class_elements(class: &CharClass) -> Option<ElementSet> {
+    let mut parts = class.ranges.clone();
+    for &builtin in &class.builtins {
+        parts.extend(builtin_elements(builtin)?);
+    }
+    for &(negate, ranges) in &class.props {
+        if negate {
+            parts.extend(element_complement(ranges));
+        } else {
+            parts.extend_from_slice(ranges);
+        }
+    }
+    let set = element_set(parts);
+    Some(if class.negate {
+        element_complement(&set)
+    } else {
+        set
+    })
+}
+
+/// The elements `rep` matches case-sensitively, under `dotall`.
+fn rep_elements(rep: &Rep, dotall: bool) -> Option<ElementSet> {
+    match rep {
+        Rep::Char(c) => Some(vec![(*c, *c)]),
+        Rep::Any if dotall => Some(vec![(0, MAX_ELEMENT)]),
+        Rep::Any => Some(element_complement(&LINE_TERMINATOR_ELEMENTS)),
+        Rep::Class(class) => class_elements(class),
+    }
+}
+
+/// What a path through a forward program does first from a point it reaches without consuming
+/// (see [`loop_retries_futile`]).
+enum PathStart {
+    /// It reaches the program's `Match` without consuming or testing anything.
+    Succeeds,
+    /// It asserts the input's end (`$` outside multiline mode).
+    AtEnd,
+    /// It asserts a word boundary (`\b`).
+    WordBoundary,
+    /// It consumes an element of the set.
+    Consumes(ElementSet),
+}
+
+/// How the paths of forward program `prog` from `pc` begin, or `None` when one begins with
+/// anything else (another assertion, a lookaround, a backreference, a counted loop or a loop's
+/// progress check, a string set) or the walk runs out of budget.
+fn path_starts(prog: &[Inst], pc: usize, multiline: bool, dotall: bool) -> Option<Vec<PathStart>> {
+    let mut starts = Vec::new();
+    let mut stack = vec![pc];
+    let mut seen = vec![false; prog.len()];
+    let mut budget = 64usize;
+    while let Some(pc) = stack.pop() {
+        if std::mem::replace(&mut seen[pc], true) {
+            continue;
+        }
+        budget = budget.checked_sub(1)?;
+        match &prog[pc] {
+            Inst::Save(_) | Inst::ClearCaps(..) | Inst::SetMark(_) => stack.push(pc + 1),
+            Inst::Jmp(target) => stack.push(*target),
+            Inst::Split(a, b) => {
+                stack.push(*a);
+                stack.push(*b);
+            }
+            Inst::Match => starts.push(PathStart::Succeeds),
+            Inst::AssertEnd if !multiline => starts.push(PathStart::AtEnd),
+            Inst::WordBoundary(true) => starts.push(PathStart::WordBoundary),
+            Inst::Char(c) => starts.push(PathStart::Consumes(vec![(*c, *c)])),
+            Inst::Any => starts.push(PathStart::Consumes(rep_elements(&Rep::Any, dotall)?)),
+            Inst::Class(class) => starts.push(PathStart::Consumes(class_elements(class)?)),
+            Inst::Many { rep, min, .. } => {
+                starts.push(PathStart::Consumes(rep_elements(rep, dotall)?));
+                if *min == 0 {
+                    stack.push(pc + 1);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(starts)
+}
+
+/// Whether a greedy `Many` at `pc` of forward program `prog`, matched case-sensitively with no
+/// inline modifier, never needs a shorter run: V8's atomic loops (`AtomicLoopKind`,
+/// regexp-nodes.h). Either some path of its continuation reaches the match without testing
+/// anything, so the continuation succeeds wherever the longest run ends (kTotal), or every path
+/// fails at once wherever a shorter run would end: it asserts the input's end, which a shorter run
+/// never reaches (kAtEnd); it asserts `\b` within a run of word characters, which a run of at
+/// least one cannot have (kBoundary); or it consumes an element the run's elements exclude, while
+/// the element after a shorter run belongs to the run (kDisjoint).
+fn loop_retries_futile(prog: &[Inst], pc: usize, multiline: bool, dotall: bool) -> bool {
+    let Inst::Many {
+        rep,
+        min,
+        greedy: true,
+        ..
+    } = &prog[pc]
+    else {
+        return false;
+    };
+    let Some(starts) = path_starts(prog, pc + 1, multiline, dotall) else {
+        return false;
+    };
+    if starts
+        .iter()
+        .any(|start| matches!(start, PathStart::Succeeds))
+    {
+        return true;
+    }
+    let Some(body) = rep_elements(rep, dotall) else {
+        return false;
+    };
+    starts.iter().all(|start| match start {
+        PathStart::Succeeds | PathStart::AtEnd => true,
+        PathStart::WordBoundary => *min >= 1 && elements_within(&body, &WORD_ELEMENTS),
+        PathStart::Consumes(set) => elements_disjoint(&body, set),
+    })
+}
+
+/// Mark the loops of program `prog`, compiled with `flags`, whose retries are futile
+/// ([`mark_atomic_loops`]). Under `i` or an inline modifier the proofs would need the case
+/// relation and the flags in effect at each loop; those patterns keep every retry.
+/// `TRUST_JS_REGEXP_NO_ATOMIC_LOOPS=1` keeps every loop's retries.
+fn analyse_loops(prog: &mut [Inst], flags: &str) {
+    if !flags.contains('i') && !changes_flags(prog) {
+        mark_atomic_loops(prog, flags.contains('m'), flags.contains('s'));
+    }
+}
+
+/// Mark the greedy loops of forward program `prog`, and of its lookahead bodies, whose shorter
+/// runs are futile ([`loop_retries_futile`]): they keep no record to retry one.
+fn mark_atomic_loops(prog: &mut [Inst], multiline: bool, dotall: bool) {
+    for pc in 0..prog.len() {
+        if let Inst::Look { prog: body, .. } = &mut prog[pc] {
+            if let Some(body) = Rc::get_mut(body) {
+                mark_atomic_loops(body, multiline, dotall);
+            }
+            continue;
+        }
+        if loop_retries_futile(prog, pc, multiline, dotall) {
+            if let Inst::Many { atomic, .. } = &mut prog[pc] {
+                *atomic = true;
+            }
+        }
+    }
+}
+
+/// Whether `prog` or a lookaround body in it changes the flags (an inline modifier group).
+fn changes_flags(prog: &[Inst]) -> bool {
+    prog.iter().any(|inst| match inst {
+        Inst::PushFlags(..) | Inst::PopFlags => true,
+        Inst::Look { prog, .. } | Inst::LookBehind { prog, .. } => changes_flags(prog),
+        _ => false,
     })
 }
 
@@ -7117,19 +7380,21 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         min,
                         max,
                         greedy,
+                        atomic,
                     } => {
                         let min = *min;
                         let limit = max.unwrap_or(usize::MAX);
                         if *greedy {
                             // Consume as many as the input allows (up to `max`), iteratively;
-                            // backtracking retries smaller counts (see `Backtrack::Greedy`).
+                            // backtracking retries smaller counts (see `Backtrack::Greedy`),
+                            // unless they are futile.
                             let Some((avail, end)) = self.run_length(rep, pos, limit) else {
                                 return false;
                             };
                             if avail < min {
                                 break;
                             }
-                            if avail > min {
+                            if avail > min && !*atomic {
                                 self.bt.push(Backtrack::Extra(avail));
                                 self.push_choice(Backtrack::Greedy { pc: pc as u32, end });
                             }
@@ -7883,6 +8148,183 @@ mod internal_engine_diagnostics {
         super::set_backtrack_state_limit(super::MAX_BACKTRACK_STATE);
         assert!(matches!(limited, Err(super::MatchError::ResourceExhausted)));
         assert!(matches!(re.exec_polled(&text, 0, &control), Ok(None)));
+    }
+
+    /// The atomic loops of `pattern` with `flags`, lookahead bodies included.
+    fn atomic_loop_count(prog: &[super::Inst]) -> usize {
+        prog.iter()
+            .map(|inst| match inst {
+                super::Inst::Many { atomic: true, .. } => 1,
+                super::Inst::Look { prog, .. } | super::Inst::LookBehind { prog, .. } => {
+                    atomic_loop_count(prog)
+                }
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Give every loop of `prog` its retries back, as with `TRUST_JS_REGEXP_NO_ATOMIC_LOOPS`.
+    fn without_atomic_loops(prog: &mut [super::Inst]) {
+        for inst in prog.iter_mut() {
+            match inst {
+                super::Inst::Many { atomic, .. } => *atomic = false,
+                super::Inst::Look { prog, .. } | super::Inst::LookBehind { prog, .. } => {
+                    without_atomic_loops(std::rc::Rc::get_mut(prog).expect("a fresh body"))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `pattern` compiled with its loop analysis, even under `TRUST_JS_REGEXP_NO_ATOMIC_LOOPS`.
+    fn analysed(pattern: &str, flags: &str) -> super::Regex {
+        let mut re = super::Regex::new(pattern, flags).unwrap();
+        without_atomic_loops(&mut re.prog);
+        super::analyse_loops(&mut re.prog, flags);
+        re
+    }
+
+    #[test]
+    fn element_sets_agree_with_class_matching() {
+        // Every element of the BMP, and every 61st and each range edge beyond it.
+        let elements: Vec<u32> = (0..=0xFFFF)
+            .chain((0x10000..=super::MAX_ELEMENT).step_by(61))
+            .chain([0x10FFFF, 0x1F600, 0xE0000])
+            .collect();
+        for (pattern, flags) in [
+            (r"\d", ""),
+            (r"\D", ""),
+            (r"\w", ""),
+            (r"\W", "u"),
+            (r"\s", ""),
+            (r"\S", "u"),
+            (r"[\w+\-.]", ""),
+            (r"[^\s\d]", ""),
+            (r"[a-zA-Z\u0100-\u017f]", ""),
+            (r"[^\0-\x7f\s]", "u"),
+            (r"\p{L}", "u"),
+            (r"[\P{N}x]", "u"),
+            (r"[\ud800-\udbff]", ""),
+            (r"[\w--\d]", "v"),
+            (r"[[a-z\p{Lu}]&&[^aeiou]]", "v"),
+            (r".", ""),
+            (r".", "s"),
+        ] {
+            let re = super::Regex::new(pattern, flags).unwrap();
+            let (rep, dotall) = match &re.prog[1] {
+                super::Inst::Class(class) => (super::Rep::Class(class.clone()), false),
+                super::Inst::Any => (super::Rep::Any, re.dotall),
+                other => panic!("/{pattern}/ compiled to {}", super::regexp_prof_kind(other)),
+            };
+            let set = super::rep_elements(&rep, dotall).expect("a modelled class");
+            for &element in &elements {
+                let in_set = set.iter().any(|&(lo, hi)| lo <= element && element <= hi);
+                let matches = super::element_matches(&rep, element, false, dotall, re.unicode);
+                assert_eq!(in_set, matches, "/{pattern}/{flags} at {element:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_loops_are_the_futile_ones() {
+        for (pattern, flags, atomic) in [
+            // kAtEnd: `$` then the match; not in multiline mode, where a line end ends shorter runs.
+            (r"\s+$", "", 1),
+            (r"\s+$", "m", 0),
+            (r"a*$", "", 1),
+            // kDisjoint: the continuation consumes what the run cannot hold.
+            (r"[\w+\-.]+:", "", 1),
+            (r"\d+x", "", 1),
+            (r"\S*\s", "", 1),
+            (r"\d+\w", "", 0),
+            (r"a+(?:b|c)", "", 1),
+            (r"a+(?:b|a)", "", 0),
+            (r"[^\n]*\n", "", 1),
+            (r".*\n", "", 1),
+            (r".*\n", "s", 0),
+            // kBoundary: `\b` after a run of word characters at least one long.
+            (r"\b\w+\b", "", 1),
+            (r"\w*\b", "", 0),
+            (r"\s+\b", "", 0),
+            // kTotal: the continuation reaches the match without testing anything.
+            (r"(\d*)(\D*)", "", 2),
+            (r"a+", "", 1),
+            (r"x\s*", "", 1),
+            // Lazy loops, other continuations, `i` and modifiers keep their retries.
+            (r"a+?b", "", 0),
+            (r"a+(?=b)", "", 0),
+            (r"(b)a+\1", "", 0),
+            (r"a+b", "i", 0),
+            (r"(?i:a+)b", "", 0),
+            // Lookahead bodies are analysed; lookbehind bodies, which match backward, are not.
+            (r"(?=\d+x)", "", 1),
+            (r"(?<=\d+x)", "", 0),
+        ] {
+            assert_eq!(
+                atomic_loop_count(&analysed(pattern, flags).prog),
+                atomic,
+                "/{pattern}/{flags}"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_loops_match_as_retrying_loops() {
+        let patterns = [
+            r"\s+$",
+            r"\s*$",
+            r"[\w+\-.]+:",
+            r"^(?:([\w+\-.]+):)?\/\/(?:(\w+:\w+)@)?([\w.-]*)(?::(\d+))?(.*)$",
+            r"\b\w+\b",
+            r"\w{1,2}\b",
+            r"(\d*)(\D*)",
+            r"\S*\s",
+            r"a+(?:b|c)",
+            r"[^\n]*\n",
+            r"(?=\d+x)\d",
+            r"^\s*(\S*(\s+\S+)*)\s*$",
+            r"[^x]+$",
+        ];
+        let subjects = [
+            "",
+            "a  b  ",
+            "a  \n b",
+            "   ",
+            "ab.cd ef:gh",
+            "http://x.com:80/a",
+            "foo/bar.js",
+            "  foo bar_9  ",
+            "12ab34",
+            "abcd 12x",
+            "a\u{2019} \u{3000} x:",
+            "\u{1F600}x  \u{1F600}\n",
+        ];
+        // Two-byte subjects, and one with a lone surrogate.
+        let texts: Vec<crate::lstr::LStr> = subjects
+            .iter()
+            .map(|&subject| crate::lstr::LStr::from(subject))
+            .chain([crate::lstr::LStr::from_utf16(&[0x61, 0x62, 0xD800, 0x20])])
+            .collect();
+        let control = crate::RuntimeInterrupt::default();
+        for pattern in patterns {
+            for flags in ["", "y", "s", "u"] {
+                let atomic = analysed(pattern, flags);
+                let mut retrying = super::Regex::new(pattern, flags).unwrap();
+                without_atomic_loops(&mut retrying.prog);
+                for text in &texts {
+                    let subject = text.to_string();
+                    for start in 0..=text.unit_len() {
+                        let found = atomic.exec_polled(text, start, &control);
+                        let reference = retrying.exec_polled(text, start, &control);
+                        assert_eq!(
+                            found.map(|caps| caps.map(|caps| caps.to_vec())),
+                            reference.map(|caps| caps.map(|caps| caps.to_vec())),
+                            "/{pattern}/{flags} on {subject:?} from {start}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
