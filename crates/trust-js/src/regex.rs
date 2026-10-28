@@ -108,6 +108,185 @@ fn regexp_prof_enabled() -> bool {
     *REGEXP_PROF_GATE.get_or_init(|| std::env::var_os("TRUST_JS_REGEXP_PROF").is_some())
 }
 
+/// `TRUST_JS_REGEXP_PROF=2`: the profile per pattern as well (see [`RegexpCensusEntry`]).
+fn regexp_census_enabled() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("TRUST_JS_REGEXP_PROF").is_ok_and(|value| value == "2"))
+}
+
+/// One pattern's share of the profile (`TRUST_JS_REGEXP_PROF=2`): the programs of one source and
+/// flags, whichever RegExps and caches held them, with what a native tier must cover to run them.
+#[derive(Default)]
+struct RegexpCensusEntry {
+    execs: u64,
+    two_byte: u64,
+    matched: u64,
+    totals: RegexpProfTotals,
+    features: String,
+}
+
+/// The profile's counters that a census entry takes its share of.
+#[derive(Default, Clone, Copy)]
+struct RegexpProfTotals {
+    insts: u64,
+    attempts: u64,
+    scan: u64,
+    backtracks: u64,
+    native_execs: u64,
+    native_code_bytes: u64,
+}
+
+impl RegexpProfTotals {
+    fn now() -> Self {
+        REGEXP_PROF.with(|cell| {
+            let prof = cell.borrow();
+            Self {
+                insts: prof.inst.iter().sum(),
+                attempts: prof.attempts,
+                scan: prof.scan_positions,
+                backtracks: prof.backtrack_entries,
+                native_execs: prof.native_execs,
+                native_code_bytes: prof.native_code_bytes,
+            }
+        })
+    }
+
+    fn add_since(&mut self, before: &Self, after: &Self) {
+        self.insts += after.insts - before.insts;
+        self.attempts += after.attempts - before.attempts;
+        self.scan += after.scan - before.scan;
+        self.backtracks += after.backtracks - before.backtracks;
+        self.native_execs += after.native_execs - before.native_execs;
+        self.native_code_bytes += after.native_code_bytes - before.native_code_bytes;
+    }
+}
+
+thread_local! {
+    static REGEXP_CENSUS: RefCell<RegexpCensus> = RefCell::new(RegexpCensus::default());
+}
+
+/// The census (`TRUST_JS_REGEXP_PROF=2`): entries by source, then flags, and the latest
+/// execution's pattern. The profile's counters grow only while a pattern executes, so all they
+/// grew by since that execution began is that execution's, settled when the next one begins (see
+/// [`Regex::census_start`]) or the report is made: no hook wraps an execution.
+#[derive(Default)]
+struct RegexpCensus {
+    entries:
+        std::collections::HashMap<String, std::collections::HashMap<String, RegexpCensusEntry>>,
+    current: Option<(String, String)>,
+    since: RegexpProfTotals,
+}
+
+impl RegexpCensus {
+    fn current_entry(&mut self) -> Option<&mut RegexpCensusEntry> {
+        let (source, flags) = self.current.as_ref()?;
+        self.entries
+            .get_mut(source.as_str())?
+            .get_mut(flags.as_str())
+    }
+
+    /// Give the latest execution what the counters grew by since it began, as of `now`.
+    fn settle(&mut self, now: &RegexpProfTotals) {
+        let since = self.since;
+        if let Some(entry) = self.current_entry() {
+            entry.totals.add_since(&since, now);
+        }
+        self.since = *now;
+    }
+}
+
+/// Count the latest execution's match (`TRUST_JS_REGEXP_PROF=2`).
+#[cold]
+#[inline(never)]
+fn regexp_census_matched() {
+    REGEXP_CENSUS.with(|cell| {
+        if let Some(entry) = cell.borrow_mut().current_entry() {
+            entry.matched += 1;
+        }
+    });
+}
+
+/// A program's features for the census: its length, groups, instructions by kind (lookaround
+/// bodies included), first-element filter and the paths exec takes before the matcher.
+fn regexp_census_features(re: &Regex) -> String {
+    fn walk(prog: &[Inst], counts: &mut std::collections::BTreeMap<&'static str, usize>) {
+        for inst in prog {
+            *counts
+                .entry(REGEXP_PROF_INST_NAMES[regexp_prof_kind(inst)])
+                .or_insert(0) += 1;
+            if let Inst::Look { prog, .. } | Inst::LookBehind { prog, .. } = inst {
+                walk(prog, counts);
+            }
+        }
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    walk(&re.prog, &mut counts);
+    let mut out = format!("len={} groups={}", re.prog.len(), re.ngroups);
+    for (kind, n) in counts {
+        if !matches!(kind, "save" | "match") {
+            out.push_str(&format!(" {kind}={n}"));
+        }
+    }
+    out.push_str(match &re.first {
+        FirstFilter::None => " first=none",
+        FirstFilter::Anchored => " first=anchored",
+        FirstFilter::Atoms(_) => " first=atoms",
+    });
+    for (present, name) in [
+        (re.prefilter.is_some(), " prefilter"),
+        (re.single.is_some(), " single"),
+        (
+            re.literal_ascii.is_some() || re.literal_fold.is_some(),
+            " literal",
+        ),
+    ] {
+        if present {
+            out.push_str(name);
+        }
+    }
+    out
+}
+
+/// The census lines of the profile report: the 40 patterns with the most work, by dispatched
+/// instructions, four per attempt and one per four scanned positions.
+fn regexp_census_report(report: &mut String) {
+    let now = RegexpProfTotals::now();
+    REGEXP_CENSUS.with(|cell| {
+        let mut census = cell.borrow_mut();
+        census.settle(&now);
+        let mut rows: Vec<_> = census
+            .entries
+            .iter()
+            .flat_map(|(source, by_flags)| {
+                by_flags
+                    .iter()
+                    .map(move |(flags, entry)| (source, flags, entry))
+            })
+            .collect();
+        let work = |e: &RegexpCensusEntry| e.totals.insts + 4 * e.totals.attempts + e.totals.scan / 4;
+        rows.sort_by_key(|&(_, _, entry)| std::cmp::Reverse(work(entry)));
+        report.push_str(&format!("\n[regexp-census] {} patterns", rows.len()));
+        for (source, flags, e) in rows.iter().take(40) {
+            let shown: String = source.chars().take(70).collect();
+            report.push_str(&format!(
+                "\n[regexp-census] insts={} attempts={} scan={} bt={} execs={} matched={} two_byte={} native={} native_bytes={} | {} | /{}/{}",
+                e.totals.insts,
+                e.totals.attempts,
+                e.totals.scan,
+                e.totals.backtracks,
+                e.execs,
+                e.matched,
+                e.two_byte,
+                e.totals.native_execs,
+                e.totals.native_code_bytes,
+                e.features,
+                shown,
+                flags
+            ));
+        }
+    });
+}
+
 fn regexp_prof_tier_up(success: bool) {
     if regexp_prof_enabled() {
         REGEXP_PROF.with(|cell| {
@@ -2693,6 +2872,9 @@ impl Regex {
     /// Count an execution over a subject of `storage` ([`SUBJECT_ONE_BYTE`] or
     /// [`SUBJECT_TWO_BYTE`]) toward the native one-byte tier, which serves one-byte subjects.
     fn note_execution(&self, storage: u8) {
+        if regexp_census_enabled() {
+            self.census_start(storage);
+        }
         self.subject_shapes.set(self.subject_shapes.get() | storage);
         self.tier_ticks.set(self.tier_ticks.get().saturating_add(1));
         if self.tier_up_attempted.get()
@@ -2872,6 +3054,58 @@ impl Regex {
         start: usize,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<Captures> {
+        let result = self.exec_at_inner(subject, start, control);
+        if regexp_census_enabled() && matches!(result, Ok(Some(_))) {
+            regexp_census_matched();
+        }
+        result
+    }
+
+    /// Begin an execution's census entry (`TRUST_JS_REGEXP_PROF=2`) for a subject of `storage`,
+    /// settling the previous execution's share of the profile (see [`RegexpCensus`]). Out of
+    /// line: an execution without the census pays only its gate's test.
+    #[cold]
+    #[inline(never)]
+    fn census_start(&self, storage: u8) {
+        let now = RegexpProfTotals::now();
+        REGEXP_CENSUS.with(|cell| {
+            let mut census = cell.borrow_mut();
+            census.settle(&now);
+            // Keys are copied only for a pattern's first execution.
+            if !census.entries.contains_key(self.source.as_str()) {
+                census
+                    .entries
+                    .insert(self.source.clone(), Default::default());
+            }
+            let by_flags = census
+                .entries
+                .get_mut(self.source.as_str())
+                .expect("census entry just made");
+            if !by_flags.contains_key(self.flags.as_str()) {
+                let features = regexp_census_features(self);
+                by_flags.insert(
+                    self.flags.clone(),
+                    RegexpCensusEntry {
+                        features,
+                        ..Default::default()
+                    },
+                );
+            }
+            let entry = by_flags
+                .get_mut(self.flags.as_str())
+                .expect("census entry just made");
+            entry.execs += 1;
+            entry.two_byte += u64::from(storage == SUBJECT_TWO_BYTE);
+            census.current = Some((self.source.clone(), self.flags.clone()));
+        });
+    }
+
+    fn exec_at_inner(
+        &self,
+        subject: &crate::lstr::LStr,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<Captures> {
         match subject.units() {
             crate::lstr::Units::Ascii(bytes) => {
                 self.note_execution(SUBJECT_ONE_BYTE);
@@ -2910,6 +3144,19 @@ impl Regex {
     /// [`Self::exec_at`]). Capture groups can be recovered lazily if a legacy RegExp static is
     /// subsequently observed.
     pub(crate) fn find_at(
+        &self,
+        subject: &crate::lstr::LStr,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<(usize, usize)> {
+        let result = self.find_at_inner(subject, start, control);
+        if regexp_census_enabled() && matches!(result, Ok(Some(_))) {
+            regexp_census_matched();
+        }
+        result
+    }
+
+    fn find_at_inner(
         &self,
         subject: &crate::lstr::LStr,
         start: usize,
@@ -3235,7 +3482,7 @@ pub(crate) fn regexp_prof_report() -> Option<String> {
                 body.push_str(&format!(" {name}:{count}"));
             }
         }
-        Some(format!(
+        let mut report = format!(
             "matcher inst[{}] scan:{} attempts:{} backtrack:{} tier_attempts:{} tier_successes:{} native_execs:{} native_code_bytes:{}",
             body.trim(),
             prof.scan_positions,
@@ -3245,7 +3492,11 @@ pub(crate) fn regexp_prof_report() -> Option<String> {
             prof.tier_up_successes,
             prof.native_execs,
             prof.native_code_bytes
-        ))
+        );
+        if regexp_census_enabled() {
+            regexp_census_report(&mut report);
+        }
+        Some(report)
     })
 }
 

@@ -244,6 +244,13 @@ comment/example in the same change.
 - `TRUST_JS_REGEXP_PROF=1` reports at exit the matcher's executed instructions by kind, the
   positions its prescans skipped, its attempts and backtracking entries, and the native one-byte
   tier's promotions, runs and code size. It costs a check per instruction: diagnostic only.
+  `TRUST_JS_REGEXP_PROF=2` adds a census by pattern (`[regexp-census]` lines): for the 40 source
+  and flag pairs with the most work (dispatched instructions, four per attempt and one per four
+  scanned positions), their share of those counters, their executions, matches, executions on
+  two-byte subjects, native runs and native code bytes, and their programs' features (length,
+  groups, instructions by kind with lookaround bodies, first-element filter, prefilter,
+  single-element and literal paths). Each execution then also looks its pattern up by source and
+  flags.
 - `TRUST_JS_REGEXP_TIER_UP_AT=N` promotes an eligible pattern to the native one-byte tier after
   N executions (default 64); 0 keeps every pattern on the backtracking matcher.
 - `TRUST_JS_REGEXP_NO_PREFILTER=1` compiles patterns without their prefilter: the literal every
