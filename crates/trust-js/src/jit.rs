@@ -6910,8 +6910,8 @@ fn emit_call_inline_marked(
             if shared_stubs_enabled() {
                 let stub = a.shared_stub(SharedStub::CallSecondary.key());
                 a.bl_label(stub);
-                a.cbz(9, false, slow);
-                a.b(l_hit);
+                // A miss falls through to the generic call, `slow`, bound next.
+                a.cbnz(9, false, l_hit);
             } else {
                 emit_call_ways(a, layout, ilayout, l_hit, slow);
             }
