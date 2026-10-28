@@ -243,17 +243,34 @@ comment/example in the same change.
 ## RegExp diagnostic controls
 
 - `TRUST_JS_REGEXP_PROF=1` reports at exit the matcher's executed instructions by kind, the
-  positions its prescans skipped, its attempts and backtracking entries, and the native one-byte
-  tier's promotions, runs and code size. It costs a check per instruction: diagnostic only.
-  `TRUST_JS_REGEXP_PROF=2` adds a census by pattern (`[regexp-census]` lines): for the 40 source
-  and flag pairs with the most work (dispatched instructions, four per attempt and one per four
-  scanned positions), their share of those counters, their executions, matches, executions on
-  two-byte subjects, native runs and native code bytes, and their programs' features (length,
-  groups, instructions by kind with lookaround bodies, atomic loops, leading run, first-element
-  filter, prefilter, single-element and literal paths). Each execution then also looks its
-  pattern up by source and flags.
-- `TRUST_JS_REGEXP_TIER_UP_AT=N` promotes an eligible pattern to the native one-byte tier after
-  N executions (default 64); 0 keeps every pattern on the backtracking matcher.
+  positions its prescans skipped, its attempts and backtracking entries, and the native tier's
+  compilations (tried and made), runs, code size and compile time. It costs a check per
+  instruction: diagnostic only. `TRUST_JS_REGEXP_PROF=2` adds a census by pattern
+  (`[regexp-census]` lines): for the 40 source and flag pairs with the most work (dispatched
+  instructions, four per attempt or native run and one per four scanned positions), their share
+  of those counters, their executions, matches, executions on two-byte subjects, native runs,
+  native code bytes and compile time (`native_us`), and their programs' features (length, groups,
+  instructions by kind with lookaround bodies, atomic loops, leading run, first-element filter,
+  prefilter, single-element and literal paths). Each execution then also looks its pattern up by
+  source and flags.
+- `TRUST_JS_REGEXP_TIER_UP_AT=N` compiles a pattern to native code for a subject width (one
+  byte or two a unit) after N executions (default 64), or at once over a subject of 1,000 units
+  or more, as V8 does, each width on its first use; 0 keeps every pattern on the backtracking
+  matcher, and 1 compiles at the first execution. The native tier (AArch64, on Unix) takes
+  patterns without `i`, `u` or `v` whose programs hold characters, `.`, classes, captures,
+  alternation, `^`, `$`, `\b`, `\B`, loops and groups' repetitions; lookaround,
+  backreferences, inline modifiers and counted loops too long to unroll stay on the matcher.
+- `TRUST_JS_REGEXP_NATIVE_VERIFY=1` runs the matcher after every native execution and aborts,
+  printing the pattern, flags, subject and start, if the result, a capture span or the error
+  kind differs (an interruption that only one of the two saw is no difference). With
+  `TRUST_JS_REGEXP_TIER_UP_AT=1` it checks every execution of every pattern the tier takes.
+  The lib tests' fuzzer (`regex::native::tests::fuzzed_programs_match_as_the_matcher_does`)
+  runs `TRUST_JS_REGEXP_FUZZ_CASES` executions (40,000 by default) from the seed
+  `TRUST_JS_REGEXP_FUZZ_SEED`, reducing any difference to a minimal pattern and subject.
+- `TRUST_JS_REGEXP_CODEDUMP=<text>` prints the native code of each pattern whose source
+  contains the text (`*`: every pattern) as it compiles: `[regexp-codedump]` lines with the
+  pattern, its width, base address and size, then its words (assemble them as
+  `TRUST_JS_JIT_CODEDUMP`'s).
 - `TRUST_JS_REGEXP_NO_PREFILTER=1` compiles patterns without their prefilter: the literal every
   match contains and the range of its offset from the match start. Exec scans for that literal
   and tries only the starts that put an occurrence in range, and a sticky regex, or one anchored

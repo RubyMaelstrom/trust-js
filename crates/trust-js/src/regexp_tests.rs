@@ -1354,14 +1354,14 @@ fn anchors_inside_a_pattern_keep_holding_after_the_pattern_tiers_up() {
 }
 
 /// `^` and `$` hold at their own offsets in a pattern, not at the candidate's start or end, once
-/// the one-byte tier has compiled the pattern, as Node (v24.22.0) finds: inside a pattern, at its
+/// the native tier has compiled the pattern, as Node (v24.22.0) finds: inside a pattern, at its
 /// ends, in multiline mode, in global replaces and from sticky starts. Each case runs past the
 /// tier's threshold; the tier's tests also run with `TRUST_JS_REGEXP_TIER_UP_AT=1`.
 #[test]
 fn anchors_hold_at_their_offsets_in_the_one_byte_tier_as_node_finds() {
     check(
         r##"
-        // Each case runs 70 times, past the one-byte tier's threshold of 64.
+        // Each case runs 70 times, past the native tier's threshold of 64.
         function seen(re, s) { var out = []; for (var i = 0; i < 70; i++) { var r = re.test(s); if (out.indexOf(r) < 0) out.push(r); } return out.join("/"); }
         function all(re, s) { var r = ""; for (var i = 0; i < 70; i++) r = s.replace(re, "#"); return r; }
         function at(re, s, i) { var r; for (var k = 0; k < 70; k++) { re.lastIndex = i; r = [re.test(s), re.lastIndex]; } return r; }

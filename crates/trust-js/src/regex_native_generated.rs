@@ -1,90 +1,125 @@
-// The one-byte native tier's instruction corpus. It was generated once; the generator was never
-// committed, so the corpus is maintained here. Each case runs the engine's path, `find_ascii`,
-// which enters the emitted machine code wherever the tier compiled some, against the matcher.
+// The native RegExp tier's instruction corpus, maintained by hand: its first version was generated
+// once, for the one-byte tier the native tier replaced, by a generator that was never committed.
+// Each case names the instructions of its program between `Save(0)` and `Save(1), Match`, and
+// runs through the native code of both widths against the matcher, from every start of every
+// subject.
+
+/// The corpus's name for an instruction.
+fn instruction_kind(inst: &super::super::Inst) -> String {
+    use super::super::{Inst, Rep};
+    match inst {
+        Inst::Char(_) => "char".into(),
+        Inst::Any => "any".into(),
+        Inst::Class(_) => "class".into(),
+        Inst::Save(_) => "save".into(),
+        Inst::Split(..) => "split".into(),
+        Inst::Jmp(_) => "jmp".into(),
+        Inst::AssertStart => "start".into(),
+        Inst::AssertEnd => "end".into(),
+        Inst::WordBoundary(true) => "boundary".into(),
+        Inst::WordBoundary(false) => "not_boundary".into(),
+        Inst::SetMark(_) => "set_mark".into(),
+        Inst::CheckProgress(_) => "check_progress".into(),
+        Inst::ClearCaps(..) => "clear_caps".into(),
+        Inst::Many {
+            rep,
+            greedy,
+            atomic,
+            ..
+        } => {
+            let element = match rep {
+                Rep::Char(_) => "char",
+                Rep::Any => "any",
+                Rep::Class(_) => "class",
+            };
+            let kind = match (greedy, atomic) {
+                (false, _) => "_lazy",
+                (true, true) => "_atomic",
+                (true, false) => "",
+            };
+            format!("many_{element}{kind}")
+        }
+        _ => "other".into(),
+    }
+}
 
 #[test]
-fn generated_one_byte_native_instruction_corpus() {
-    let cases: &[(&str, &[&str])] = &[
-        ("a.c", &["char", "any", "char"]),
-        ("a+", &["many_char"]),
-        ("a+?", &["many_char"]),
-        ("[a-z]+", &["many_class"]),
-        ("\\d{2,4}", &["many_class"]),
-        (".*", &["many_any"]),
-        ("^a.c$", &["start", "char", "any", "char", "end"]),
-        ("a.c$", &["char", "any", "char", "end"]),
-        // Anchors hold at their own offsets: these never match, or only at an end.
-        ("a^", &["char", "start"]),
-        ("a^b", &["char", "start", "char"]),
-        ("a.^", &["char", "any", "start"]),
-        ("x$y", &["char", "end", "char"]),
-        ("$x", &["end", "char"]),
-        ("^[a-z]$", &["start", "class", "end"]),
-        ("[xa]$.", &["class", "end", "any"]),
-        ("[a-z].", &["class", "any"]),
-        ("[^a].", &["class", "any"]),
-        ("\\d[a-z]", &["class", "class"]),
-        ("\\w\\s.", &["class", "class", "any"]),
-        ("[A-Cx-z]0", &["class", "char"]),
-        ("[\\x80-\\xff]é", &["class", "char"]),
-        ("é.", &["char", "any"]),
-        ("[\\0-\\x7f][^\\n]", &["class", "class"]),
+fn instruction_corpus_matches_as_the_matcher_does() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("a.c", "", &["char", "any", "char"]),
+        ("a.c", "s", &["char", "any", "char"]),
+        ("é.Ω", "", &["char", "any", "char"]),
+        ("[a-z]\\d", "", &["class", "class"]),
+        ("[^\\n\\u2028][é-ü]", "", &["class", "class"]),
+        ("\\w\\s.", "", &["class", "class", "any"]),
+        ("^a.", "", &["start", "char", "any"]),
+        ("^a.", "m", &["start", "char", "any"]),
+        ("a.$", "", &["char", "any", "end"]),
+        ("a.$", "m", &["char", "any", "end"]),
+        ("a^b", "m", &["char", "start", "char"]),
+        ("x$\\ny", "m", &["char", "end", "char", "char"]),
+        ("a.^", "", &["char", "any", "start"]),
+        ("\\bx.\\B", "", &["boundary", "char", "any", "not_boundary"]),
+        ("(a).", "", &["save", "char", "save", "any"]),
+        ("a|b.", "", &["split", "char", "jmp", "char", "any"]),
+        ("ab|ac|.d", "", &["split", "char", "char", "jmp", "split", "char", "char", "jmp", "any", "char"]),
+        ("a*", "", &["many_char_atomic"]),
+        ("a*b", "", &["many_char_atomic", "char"]),
+        ("a*a", "", &["many_char", "char"]),
+        (".*x", "", &["many_any", "char"]),
+        (".*x", "s", &["many_any", "char"]),
+        ("[ab]+?c", "", &["many_class_lazy", "char"]),
+        ("a{2,3}?a", "", &["many_char_lazy", "char"]),
+        ("a{2,3}a", "", &["many_char", "char"]),
+        ("\\s+$", "", &["many_class_atomic", "end"]),
+        ("\\s*$", "m", &["many_class", "end"]),
+        ("\\b\\w+\\b", "", &["boundary", "many_class_atomic", "boundary"]),
+        ("(\\d*)(\\D*)", "", &["save", "many_class_atomic", "save", "save", "many_class_atomic", "save"]),
+        ("(?:ab)*c", "", &["split", "set_mark", "char", "char", "check_progress", "jmp", "char"]),
+        ("(?:ab)*?c", "", &["split", "set_mark", "char", "char", "check_progress", "jmp", "char"]),
+        (
+            "(a|b)*c",
+            "",
+            &[
+                "split", "set_mark", "clear_caps", "save", "split", "char", "jmp", "char", "save",
+                "check_progress", "jmp", "char",
+            ],
+        ),
+        (
+            "(a.){2}",
+            "",
+            &["clear_caps", "save", "char", "any", "save", "clear_caps", "save", "char", "any", "save"],
+        ),
+        (
+            "(?:x|(y))?z",
+            "",
+            &["split", "set_mark", "clear_caps", "split", "char", "jmp", "save", "char", "save", "check_progress", "char"],
+        ),
     ];
-    let subjects: &[&[u8]] = &[
-        b"", b"a", b"aXc", b"xxaXcyy", b"a\nc", b"a\rc",
-        b"0a", b"za", b"_9", b"!a", b"ab", b"xy", b"ax", &[0x80, 0xe9, 0xff],
+    let texts = [
+        "", "a", "ab", "abc", "aXc", "xxaXcyy", "a\nc", "a\r\nb", "ab ab", "aab", "aaab", "abababc",
+        "x\ny", "xy z", "12ab", "  \n", "\u{e9}x\u{3a9}", "abcabc d", "yz xz z", "a\u{2028}c",
     ];
-    let control = crate::RuntimeInterrupt::default();
-    for &(pattern, expected_kinds) in cases {
-        for &subject in subjects {
-            for sticky in [false, true] {
-                let flags = if sticky { "y" } else { "" };
-                let re = super::Regex::new(pattern, flags).unwrap();
-                let native = super::OneByteNativeProgram::compile(&re.prog, re.multiline)
-                    .expect("generated subset case must compile");
-                assert_eq!(native.ops.len(), expected_kinds.len(), "/{pattern}/");
-                for ((instruction, op), expected) in re.prog[1..re.prog.len() - 2]
-                    .iter()
-                    .zip(native.ops.iter())
-                    .zip(expected_kinds.iter())
-                {
-                    let actual = match instruction {
-                        super::Inst::Char(_) => "char",
-                        super::Inst::Any => "any",
-                        super::Inst::Class(_) => "class",
-                        super::Inst::AssertStart => "start",
-                        super::Inst::AssertEnd => "end",
-                        super::Inst::Many { rep, .. } => match rep {
-                            super::Rep::Char(_) => "many_char",
-                            super::Rep::Any => "many_any",
-                            super::Rep::Class(_) => "many_class",
-                        },
-                        _ => panic!("unexpected instruction in /{pattern}/"),
-                    };
-                    assert_eq!(actual, *expected, "/{pattern}/");
-                    for byte in 0..=u8::MAX {
-                        let reference = match instruction {
-                            super::Inst::Char(c) => *c == byte as u32,
-                            super::Inst::Any => !super::is_line_terminator_u32(byte as u32),
-                            super::Inst::Class(class) => class.matches(byte as u32, false, false),
-                            super::Inst::AssertStart | super::Inst::AssertEnd => true,
-                            super::Inst::Many { rep, .. } => match rep {
-                                super::Rep::Char(c) => *c == byte as u32,
-                                super::Rep::Any => !super::is_line_terminator_u32(byte as u32),
-                                super::Rep::Class(class) => class.matches(byte as u32, false, false),
-                            },
-                            _ => unreachable!(),
-                        };
-                        assert_eq!(op.matches(byte as u32), reference,
-                            "predicate mismatch for /{pattern}/ byte {byte}");
-                    }
+    for &(pattern, flags, kinds) in cases {
+        let re = super::super::Regex::new(pattern, flags).unwrap();
+        let actual: Vec<String> = re.prog[1..re.prog.len() - 2]
+            .iter()
+            .map(instruction_kind)
+            .collect();
+        assert_eq!(actual, kinds, "/{pattern}/{flags}");
+        for text in texts {
+            for two in [false, true] {
+                if !two && text.chars().any(|c| c as u32 > 0xff) {
+                    continue;
                 }
-                for start in 0..=subject.len() {
-                    let fast = native.find_ascii(subject, start, sticky, &control);
-                    let reference = re.find_impl(subject, start, &control, &super::test_poll_word(&control));
-                    assert_eq!(fast, reference,
-                        "search mismatch for /{pattern}/ at {start}, sticky={sticky}, subject={subject:?}");
+                let subject = Subject::of(text, two);
+                if let Some((native, _)) = pair(pattern, flags, subject.width()) {
+                    assert!(
+                        compiled(&native, subject.width()) || !BACKEND,
+                        "/{pattern}/{flags} is in the tier's instruction set"
+                    );
                 }
+                check(pattern, flags, &subject);
             }
         }
     }

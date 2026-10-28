@@ -17,16 +17,19 @@ use std::sync::OnceLock;
 
 use crate::interrupt::PollWord;
 
+#[path = "regex_native.rs"]
+mod native;
+
 const MAX_REPEAT: usize = 1000;
 const INLINE_CAPTURES: usize = 4;
 const INTERRUPT_POLL_MASK: usize = 0x3fff;
-/// Keep cold patterns on the compact matcher program. A pattern is promoted only after repeated
-/// execution and only when a one-byte subject has actually been observed.
+/// Keep cold patterns on the matcher: a pattern is compiled to native code for a subject width
+/// after this many executions (or at once over a long subject, see [`native::note_execution`]).
 const REGEXP_TIER_UP_THRESHOLD: u32 = 64;
-/// Override the feedback threshold for local A/B runs. Zero disables the experimental tier.
+/// The tier-up threshold, `TRUST_JS_REGEXP_TIER_UP_AT` (for A/B runs; 0 keeps every pattern on
+/// the matcher, 1 compiles at the first execution).
 fn regexp_tier_up_threshold() -> u32 {
-    std::env::var("TRUST_JS_REGEXP_TIER_UP_AT")
-        .ok()
+    env_value!("TRUST_JS_REGEXP_TIER_UP_AT")
         .and_then(|value| value.parse().ok())
         .unwrap_or(REGEXP_TIER_UP_THRESHOLD)
 }
@@ -81,6 +84,8 @@ pub(crate) struct RegexpProf {
     pub(crate) tier_up_successes: u64,
     pub(crate) native_execs: u64,
     pub(crate) native_code_bytes: u64,
+    /// Time spent compiling native code, in nanoseconds.
+    pub(crate) native_compile_ns: u64,
 }
 
 impl RegexpProf {
@@ -94,6 +99,7 @@ impl RegexpProf {
             tier_up_successes: 0,
             native_execs: 0,
             native_code_bytes: 0,
+            native_compile_ns: 0,
         }
     }
 }
@@ -136,6 +142,7 @@ struct RegexpProfTotals {
     backtracks: u64,
     native_execs: u64,
     native_code_bytes: u64,
+    native_compile_ns: u64,
 }
 
 impl RegexpProfTotals {
@@ -149,6 +156,7 @@ impl RegexpProfTotals {
                 backtracks: prof.backtrack_entries,
                 native_execs: prof.native_execs,
                 native_code_bytes: prof.native_code_bytes,
+                native_compile_ns: prof.native_compile_ns,
             }
         })
     }
@@ -160,6 +168,7 @@ impl RegexpProfTotals {
         self.backtracks += after.backtracks - before.backtracks;
         self.native_execs += after.native_execs - before.native_execs;
         self.native_code_bytes += after.native_code_bytes - before.native_code_bytes;
+        self.native_compile_ns += after.native_compile_ns - before.native_compile_ns;
     }
 }
 
@@ -281,13 +290,18 @@ fn regexp_census_report(report: &mut String) {
                     .map(move |(flags, entry)| (source, flags, entry))
             })
             .collect();
-        let work = |e: &RegexpCensusEntry| e.totals.insts + 4 * e.totals.attempts + e.totals.scan / 4;
+        // A native execution weighs as an attempt: the native tier's patterns stay in view.
+        let work = |e: &RegexpCensusEntry| {
+            e.totals.insts
+                + 4 * (e.totals.attempts + e.totals.native_execs)
+                + e.totals.scan / 4
+        };
         rows.sort_by_key(|&(_, _, entry)| std::cmp::Reverse(work(entry)));
         report.push_str(&format!("\n[regexp-census] {} patterns", rows.len()));
         for (source, flags, e) in rows.iter().take(40) {
             let shown: String = source.chars().take(70).collect();
             report.push_str(&format!(
-                "\n[regexp-census] insts={} attempts={} scan={} bt={} execs={} matched={} two_byte={} native={} native_bytes={} | {} | /{}/{}",
+                "\n[regexp-census] insts={} attempts={} scan={} bt={} execs={} matched={} two_byte={} native={} native_bytes={} native_us={} | {} | /{}/{}",
                 e.totals.insts,
                 e.totals.attempts,
                 e.totals.scan,
@@ -297,6 +311,7 @@ fn regexp_census_report(report: &mut String) {
                 e.two_byte,
                 e.totals.native_execs,
                 e.totals.native_code_bytes,
+                e.totals.native_compile_ns / 1000,
                 e.features,
                 shown,
                 flags
@@ -499,13 +514,14 @@ pub struct Regex {
     /// case (see [`close_program_over_case`]): they match with no case folding.
     /// `TRUST_JS_REGEXP_NO_CASE_CLOSURE=1` leaves them to fold as they match.
     case_closed: bool,
-    /// Per-pattern execution feedback. These cells add no allocation to cold patterns; the native
-    /// straight-line program is compiled lazily after the tier-up threshold.
+    /// Per-pattern execution feedback: executions, and the storage of the subjects matched. These
+    /// cells add no allocation to cold patterns; the native tier compiles a width on its first use
+    /// once the pattern is hot (see [`native::note_execution`]).
     tier_ticks: Cell<u32>,
     subject_shapes: Cell<u8>,
-    tier_up_attempted: Cell<bool>,
     tier_up_at: u32,
-    one_byte_native: RefCell<Option<OneByteNativeProgram>>,
+    /// The native tier's code, by subject width.
+    native: native::NativeTiers,
     /// The matcher's working state between executions.
     scratch: RefCell<MatchScratch>,
     /// Unicode mode: the `u` or the `v` flag.
@@ -524,900 +540,6 @@ pub struct Regex {
     pub sticky: bool,
     /// `(?<name>…)` group names paired with their capture index.
     pub names: Vec<(String, usize)>,
-}
-
-/// The first native RegExp subset: a capture-free, straight-line sequence over one-byte
-/// characters, dot, and precomputed ASCII/Latin-1 classes. It has no control-flow or capture
-/// state, so its candidate loop is semantically equivalent to the corresponding matcher bytecode
-/// and can return the group-0 span directly. Unsupported instructions stay on the general matcher.
-#[derive(Clone)]
-enum OneByteNativeOp {
-    Char(u32),
-    Any,
-    Class(Rc<CharClass>),
-    AssertStart,
-    AssertEnd,
-    /// A terminal repeated single-element matcher. This keeps the native boundary free of
-    /// continuation/backtracking state: the whole match is the run selected by `greedy`.
-    Many {
-        rep: Rep,
-        min: usize,
-        max: Option<usize>,
-        greedy: bool,
-    },
-}
-
-impl OneByteNativeOp {
-    fn matches(&self, element: u32) -> bool {
-        match self {
-            OneByteNativeOp::Char(expected) => element == *expected,
-            OneByteNativeOp::Any => !is_line_terminator_u32(element),
-            OneByteNativeOp::Class(class) => class.matches(element, false, false),
-            OneByteNativeOp::AssertStart | OneByteNativeOp::AssertEnd => true,
-            OneByteNativeOp::Many { rep, .. } => one_byte_rep_matches(rep, element),
-        }
-    }
-
-    fn consumes_element(&self) -> bool {
-        !matches!(
-            self,
-            OneByteNativeOp::AssertStart | OneByteNativeOp::AssertEnd
-        )
-    }
-}
-
-fn one_byte_rep_matches(rep: &Rep, element: u32) -> bool {
-    match rep {
-        Rep::Char(expected) => element == *expected,
-        Rep::Any => !is_line_terminator_u32(element),
-        Rep::Class(class) => class.matches(element, false, false),
-    }
-}
-
-trait OneByteSubject {
-    fn len(&self) -> usize;
-    fn element_at(&self, index: usize) -> u32;
-}
-
-impl OneByteSubject for [u8] {
-    fn len(&self) -> usize {
-        <[u8]>::len(self)
-    }
-
-    fn element_at(&self, index: usize) -> u32 {
-        self[index] as u32
-    }
-}
-
-#[repr(C)]
-struct OneByteNativeMatch {
-    from: usize,
-    to: usize,
-}
-
-#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-type OneByteNativeEntry = unsafe extern "C" fn(
-    subject: *const u8,
-    len: usize,
-    start: usize,
-    sticky: u8,
-    control: *const crate::RuntimeInterrupt,
-    out: *mut OneByteNativeMatch,
-) -> u8;
-
-#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-extern "C" fn regexp_native_poll(control: *const crate::RuntimeInterrupt) -> u32 {
-    // The generated code returns 0 for no interruption and 1..=3 in the same priority order as
-    // RuntimeInterrupt. The helper keeps deadline/mutex semantics out of the generated loop.
-    // Return a full word so all of w0 is defined for the AArch64 caller's comparison.
-    match unsafe { control.as_ref() }.and_then(crate::RuntimeInterrupt::current_reason) {
-        None => 0,
-        Some(crate::InterruptReason::Cancelled) => 1,
-        Some(crate::InterruptReason::UserNavigation) => 2,
-        Some(crate::InterruptReason::DeadlineExceeded) => 3,
-    }
-}
-
-struct OneByteNativeCode {
-    #[allow(dead_code)] // Ownership keeps the W^X mapping alive until the pattern is evicted.
-    executable: crate::jit::ExecutableBuffer,
-    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-    entry: OneByteNativeEntry,
-}
-
-impl OneByteNativeCode {
-    fn compile(ops: &[OneByteNativeOp]) -> Option<Self> {
-        // Terminal Many has a specialized Rust loop for now. Keep it out of the fixed-width
-        // machine emitter until the emitter grows a bounded repeat counter and interruption
-        // poll path; the representation remains shared with the generated differential gate.
-        if ops
-            .iter()
-            .any(|op| matches!(op, OneByteNativeOp::Many { .. }))
-        {
-            return None;
-        }
-        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-        {
-            // Keep the straight-line emitter's relocation and branch ranges bounded. Live bytes
-            // are charged by the shared W^X allocation owner below, alongside ordinary JIT code.
-            if ops.len() > 256 {
-                return None;
-            }
-            let code = {
-                #[cfg(target_arch = "aarch64")]
-                {
-                    compile_one_byte_native_aarch64(ops)?
-                }
-                #[cfg(target_arch = "x86_64")]
-                {
-                    compile_one_byte_native_x64(ops)?
-                }
-            };
-            let executable = crate::jit::ExecutableBuffer::from_bytes(&code)?;
-            // The emitter produces one entry at byte zero and the allocation is immutable after
-            // W^X publication. Its only embedded pointers refer to immutable class LUTs retained
-            // by `ops` in the owning OneByteNativeProgram.
-            let entry = unsafe {
-                std::mem::transmute::<*const u8, OneByteNativeEntry>(executable.as_ptr())
-            };
-            regexp_prof_native_code(executable.len());
-            Some(Self { executable, entry })
-        }
-        #[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix)))]
-        {
-            let _ = ops;
-            None
-        }
-    }
-
-    /// List the program in the perf map (`TRUST_JS_PERF_MAP`, see [`crate::jit::profiler`]) as
-    /// the pattern `source` with `flags`.
-    fn list_in_perf_map(&self, source: &str, flags: &str) {
-        let executable = &self.executable;
-        crate::jit::profiler::perf_map_code(executable.as_ptr(), executable.len(), || {
-            format!("RegExp:/{}/{flags}", crate::jstr::to_text(source))
-        });
-    }
-
-    fn find_ascii(
-        &self,
-        subject: &[u8],
-        start: usize,
-        sticky: bool,
-        control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<(usize, usize)> {
-        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-        {
-            self.run_entry(
-                self.entry,
-                subject.as_ptr(),
-                subject.len(),
-                start,
-                sticky,
-                control,
-            )
-        }
-        #[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix)))]
-        {
-            let _ = (subject, start, sticky, control);
-            unreachable!("machine RegExp code is unavailable on this target")
-        }
-    }
-
-    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-    fn run_entry(
-        &self,
-        entry: OneByteNativeEntry,
-        subject: *const u8,
-        len: usize,
-        start: usize,
-        sticky: bool,
-        control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<(usize, usize)> {
-        let mut out = OneByteNativeMatch { from: 0, to: 0 };
-        let status = unsafe { (entry)(subject, len, start, sticky as u8, control, &mut out) };
-        match status {
-            0 => Ok(None),
-            1 => Ok(Some((out.from, out.to))),
-            2 => Err(MatchError::Interrupted(crate::InterruptReason::Cancelled)),
-            3 => Err(MatchError::Interrupted(
-                crate::InterruptReason::UserNavigation,
-            )),
-            4 => Err(MatchError::Interrupted(
-                crate::InterruptReason::DeadlineExceeded,
-            )),
-            _ => Err(MatchError::ResourceExhausted),
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", unix))]
-struct OneByteNativeAssembler {
-    code: Vec<u8>,
-    labels: Vec<Option<usize>>,
-    branches: Vec<(usize, usize)>,
-}
-
-#[cfg(all(target_arch = "x86_64", unix))]
-impl OneByteNativeAssembler {
-    fn new() -> Self {
-        Self {
-            code: Vec::new(),
-            labels: Vec::new(),
-            branches: Vec::new(),
-        }
-    }
-
-    fn label(&mut self) -> usize {
-        self.labels.push(None);
-        self.labels.len() - 1
-    }
-
-    fn bind(&mut self, label: usize) {
-        self.labels[label] = Some(self.code.len());
-    }
-
-    fn bytes(&mut self, bytes: &[u8]) {
-        self.code.extend_from_slice(bytes);
-    }
-
-    fn imm32(&mut self, value: u32) {
-        self.bytes(&value.to_le_bytes());
-    }
-
-    fn imm64(&mut self, value: u64) {
-        self.bytes(&value.to_le_bytes());
-    }
-
-    fn rel32(&mut self, label: usize) {
-        self.branches.push((self.code.len(), label));
-        self.imm32(0);
-    }
-
-    fn jmp(&mut self, label: usize) {
-        self.bytes(&[0xe9]);
-        self.rel32(label);
-    }
-
-    fn jcc(&mut self, condition: u8, label: usize) {
-        self.bytes(&[0x0f, condition]);
-        self.rel32(label);
-    }
-
-    fn finish(mut self) -> Option<Vec<u8>> {
-        for (at, label) in self.branches {
-            let target = self.labels.get(label).and_then(|offset| *offset)?;
-            let next = at.checked_add(4)?;
-            let displacement = (target as isize).checked_sub(next as isize)?;
-            let displacement = i32::try_from(displacement).ok()?;
-            self.code[at..at + 4].copy_from_slice(&displacement.to_le_bytes());
-        }
-        Some(self.code)
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", unix))]
-fn compile_one_byte_native_x64(ops: &[OneByteNativeOp]) -> Option<Vec<u8>> {
-    // SysV ABI arguments enter in rdi/rsi/rdx/rcx/r8/r9. Move them into callee-saved registers so
-    // the poll helper can use the ordinary argument registers without losing the scan state.
-    let mut a = OneByteNativeAssembler::new();
-    let no_match = a.label();
-    let interrupted = a.label();
-    let ret = a.label();
-    let fail = a.label();
-    let loop_start = a.label();
-
-    a.bytes(&[
-        0x53, // push rbx
-        0x55, // push rbp
-        0x41, 0x54, // push r12
-        0x41, 0x55, // push r13
-        0x41, 0x56, // push r14
-        0x41, 0x57, // push r15
-        0x48, 0x83, 0xec, 0x08, // sub rsp, 8 (align calls)
-        0x49, 0x89, 0xfc, // mov r12, rdi (subject)
-        0x49, 0x89, 0xf5, // mov r13, rsi (length)
-        0x49, 0x89, 0xd6, // mov r14, rdx (current start)
-        0x49, 0x89, 0xcf, // mov r15, rcx (sticky)
-        0x4c, 0x89, 0xc3, // mov rbx, r8 (interrupt)
-        0x4c, 0x89, 0xcd, // mov rbp, r9 (result)
-        0x4d, 0x39, 0xee, // cmp r14, r13
-    ]);
-    a.jcc(0x87, no_match); // ja
-    let width = ops.iter().filter(|op| op.consumes_element()).count();
-    a.bytes(&[0x4d, 0x89, 0xeb]); // mov r11, r13 (last = length - width)
-    a.bytes(&[0x49, 0x81, 0xeb]);
-    a.imm32(width as u32);
-    a.bytes(&[0x4c, 0x89, 0xe8]); // mov rax, r13
-    a.bytes(&[0x4c, 0x29, 0xf0]); // sub rax, r14
-    a.bytes(&[0x48, 0x81, 0xf8]); // cmp rax, width
-    a.imm32(width as u32);
-    a.jcc(0x82, no_match); // jb
-
-    a.bind(loop_start);
-    a.bytes(&[0x48, 0x89, 0xdf]); // mov rdi, rbx
-    a.bytes(&[0x48, 0xb8]); // movabs rax, regexp_native_poll
-    a.imm64(regexp_native_poll as *const () as usize as u64);
-    a.bytes(&[0xff, 0xd0]); // call rax
-    a.bytes(&[0x84, 0xc0]); // test al, al
-    a.jcc(0x85, interrupted); // jne
-    a.bytes(&[0x4f, 0x8d, 0x14, 0x34]); // lea r10, [r12 + r14]
-
-    let mut offset = 0i32;
-    for op in ops {
-        match op {
-            OneByteNativeOp::Char(expected) => {
-                debug_assert!(*expected < 0x100);
-                emit_x64_cmp_mem_imm(&mut a, offset, *expected as u8);
-                a.jcc(0x85, fail); // jne
-                offset += 1;
-            }
-            OneByteNativeOp::Any => {
-                emit_x64_cmp_mem_imm(&mut a, offset, b'\n');
-                a.jcc(0x84, fail); // je
-                emit_x64_cmp_mem_imm(&mut a, offset, b'\r');
-                a.jcc(0x84, fail); // je
-                offset += 1;
-            }
-            OneByteNativeOp::Class(class) => {
-                let lut = class.ascii_lut.as_ref()?.as_ptr() as usize as u64;
-                emit_x64_load_mem(&mut a, offset); // ecx = subject element
-                a.bytes(&[0x48, 0xb8]); // movabs rax, LUT
-                a.imm64(lut);
-                a.bytes(&[0x0f, 0xb6, 0x04, 0x08]); // movzx eax, byte [rax + rcx]
-                a.bytes(&[0x84, 0xc0]); // test al, al
-                a.jcc(0x84, fail); // je
-                offset += 1;
-            }
-            // An anchor holds at the candidate start plus its offset in the pattern (`/a^/` and
-            // `/x$y/` never match). `^` past offset 0 never holds; `$` compares with the length,
-            // in a callee-saved register, which the poll call cannot have clobbered.
-            OneByteNativeOp::AssertStart if offset > 0 => a.jmp(fail),
-            OneByteNativeOp::AssertStart => {
-                a.bytes(&[0x4d, 0x85, 0xf6]); // test r14, r14
-                a.jcc(0x85, fail); // jne
-            }
-            OneByteNativeOp::AssertEnd => {
-                a.bytes(&[0x49, 0x8d, 0x86]); // lea rax, [r14 + offset]
-                a.imm32(offset as u32);
-                a.bytes(&[0x4c, 0x39, 0xe8]); // cmp rax, r13
-                a.jcc(0x85, fail); // jne
-            }
-            OneByteNativeOp::Many { .. } => return None,
-        }
-    }
-
-    a.bytes(&[0x4c, 0x89, 0x75, 0x00]); // mov [rbp], r14
-    a.bytes(&[0x4c, 0x89, 0xf0]); // mov rax, r14
-    a.bytes(&[0x48, 0x81, 0xc0]);
-    a.imm32(width as u32);
-    a.bytes(&[0x48, 0x89, 0x45, 0x08]); // mov [rbp + 8], rax
-    a.bytes(&[0xb8, 1, 0, 0, 0]); // match
-    a.jmp(ret);
-
-    a.bind(fail);
-    a.bytes(&[0x45, 0x84, 0xff]); // test r15b, r15b
-    a.jcc(0x85, no_match); // jne
-                           // r11 is caller-saved and the polling helper may clobber it. Recompute the final candidate
-                           // after every poll instead of trusting the value initialized before the loop.
-    a.bytes(&[0x4d, 0x89, 0xeb]); // mov r11, r13 (last = length - width)
-    a.bytes(&[0x49, 0x81, 0xeb]);
-    a.imm32(width as u32);
-    a.bytes(&[0x4d, 0x39, 0xde]); // cmp r14, r11
-    a.jcc(0x83, no_match); // jae
-    a.bytes(&[0x49, 0xff, 0xc6]); // inc r14
-    a.jmp(loop_start);
-
-    a.bind(interrupted);
-    a.bytes(&[0x83, 0xc0, 0x01]); // status = interruption reason + match/no-match offset
-    a.jmp(ret);
-
-    a.bind(no_match);
-    a.bytes(&[0x31, 0xc0]); // no match
-
-    a.bind(ret);
-    a.bytes(&[
-        0x48, 0x83, 0xc4, 0x08, // add rsp, 8
-        0x41, 0x5f, // pop r15
-        0x41, 0x5e, // pop r14
-        0x41, 0x5d, // pop r13
-        0x41, 0x5c, // pop r12
-        0x5d, // pop rbp
-        0x5b, // pop rbx
-        0xc3, // ret
-    ]);
-    a.finish()
-}
-
-#[cfg(all(target_arch = "x86_64", unix))]
-fn emit_x64_cmp_mem_imm(a: &mut OneByteNativeAssembler, offset: i32, value: u8) {
-    if (0..=127).contains(&offset) {
-        a.bytes(&[0x41, 0x80, 0x7a, offset as u8, value]); // cmp byte [r10 + disp8], imm8
-    } else {
-        a.bytes(&[0x41, 0x80, 0xba]); // cmp byte [r10 + disp32], imm8
-        a.imm32(offset as u32);
-        a.bytes(&[value]);
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", unix))]
-fn emit_x64_load_mem(a: &mut OneByteNativeAssembler, offset: i32) {
-    if (0..=127).contains(&offset) {
-        a.bytes(&[0x41, 0x0f, 0xb6, 0x4a, offset as u8]); // movzx ecx, byte [r10 + disp8]
-    } else {
-        a.bytes(&[0x41, 0x0f, 0xb6, 0x8a]); // movzx ecx, byte [r10 + disp32]
-        a.imm32(offset as u32);
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-struct OneByteNativeArm64Assembler {
-    code: Vec<u32>,
-    labels: Vec<Option<usize>>,
-    branches: Vec<(usize, usize, bool, u8)>,
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-impl OneByteNativeArm64Assembler {
-    fn new() -> Self {
-        Self {
-            code: Vec::new(),
-            labels: Vec::new(),
-            branches: Vec::new(),
-        }
-    }
-
-    fn label(&mut self) -> usize {
-        self.labels.push(None);
-        self.labels.len() - 1
-    }
-
-    fn bind(&mut self, label: usize) {
-        self.labels[label] = Some(self.code.len());
-    }
-
-    fn insn(&mut self, instruction: u32) {
-        self.code.push(instruction);
-    }
-
-    fn branch(&mut self, label: usize) {
-        self.branches.push((self.code.len(), label, false, 0));
-        self.insn(0);
-    }
-
-    fn branch_cond(&mut self, condition: u8, label: usize) {
-        self.branches
-            .push((self.code.len(), label, true, condition));
-        self.insn(0);
-    }
-
-    fn finish(mut self) -> Option<Vec<u8>> {
-        for (at, label, conditional, condition) in self.branches {
-            let target = self.labels.get(label).and_then(|offset| *offset)?;
-            let delta = isize::try_from(target)
-                .ok()?
-                .checked_sub(isize::try_from(at).ok()?)?;
-            let instruction = if conditional {
-                let delta = i32::try_from(delta).ok()?;
-                if !(-(1 << 18)..(1 << 18)).contains(&delta) {
-                    return None;
-                }
-                0x5400_0000 | (((delta as u32) & 0x7ffff) << 5) | u32::from(condition)
-            } else {
-                let delta = i32::try_from(delta).ok()?;
-                if !(-(1 << 25)..(1 << 25)).contains(&delta) {
-                    return None;
-                }
-                0x1400_0000 | ((delta as u32) & 0x03ff_ffff)
-            };
-            self.code[at] = instruction;
-        }
-        Some(self.code.into_iter().flat_map(u32::to_le_bytes).collect())
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_mov_reg(a: &mut OneByteNativeArm64Assembler, dst: u8, src: u8) {
-    // ORR Xd, XZR, Xm (the architectural MOV register alias).
-    a.insn(0xaa00_03e0 | (u32::from(src) << 16) | u32::from(dst));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_mov_imm64(a: &mut OneByteNativeArm64Assembler, reg: u8, value: u64) {
-    for halfword in 0..4 {
-        let immediate = ((value >> (halfword * 16)) & 0xffff) as u32;
-        let opcode = if halfword == 0 {
-            0xd280_0000
-        } else {
-            0xf280_0000
-        };
-        a.insn(opcode | (halfword << 21) | (immediate << 5) | u32::from(reg));
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_add_imm(a: &mut OneByteNativeArm64Assembler, dst: u8, src: u8, immediate: u32) {
-    debug_assert!(immediate < 1 << 12);
-    a.insn(0x9100_0000 | (immediate << 10) | (u32::from(src) << 5) | u32::from(dst));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_add_imm_w(a: &mut OneByteNativeArm64Assembler, dst: u8, src: u8, immediate: u32) {
-    debug_assert!(immediate < 1 << 12);
-    a.insn(0x1100_0000 | (immediate << 10) | (u32::from(src) << 5) | u32::from(dst));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_add_shifted_reg(
-    a: &mut OneByteNativeArm64Assembler,
-    dst: u8,
-    left: u8,
-    right: u8,
-    shift: u8,
-) {
-    debug_assert!(shift < 64);
-    a.insn(
-        0x8b00_0000
-            | (u32::from(right) << 16)
-            | (u32::from(shift) << 10)
-            | (u32::from(left) << 5)
-            | u32::from(dst),
-    );
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_sub_imm(a: &mut OneByteNativeArm64Assembler, dst: u8, src: u8, immediate: u32) {
-    debug_assert!(immediate < 1 << 12);
-    a.insn(0xd100_0000 | (immediate << 10) | (u32::from(src) << 5) | u32::from(dst));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_sub_reg(a: &mut OneByteNativeArm64Assembler, dst: u8, left: u8, right: u8) {
-    a.insn(0xcb00_0000 | (u32::from(right) << 16) | (u32::from(left) << 5) | u32::from(dst));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_cmp_reg(a: &mut OneByteNativeArm64Assembler, left: u8, right: u8) {
-    a.insn(0xeb00_001f | (u32::from(right) << 16) | (u32::from(left) << 5));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_cmp_imm_w(a: &mut OneByteNativeArm64Assembler, reg: u8, immediate: u32) {
-    debug_assert!(immediate < 1 << 12);
-    a.insn(0x7100_001f | (immediate << 10) | (u32::from(reg) << 5));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_cmp_imm(a: &mut OneByteNativeArm64Assembler, reg: u8, immediate: u32) {
-    debug_assert!(immediate < 1 << 12);
-    a.insn(0xf100_001f | (immediate << 10) | (u32::from(reg) << 5));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_ldrb(a: &mut OneByteNativeArm64Assembler, dst: u8, base: u8, offset: u32) {
-    debug_assert!(offset < 1 << 12);
-    a.insn(0x3940_0000 | (offset << 10) | (u32::from(base) << 5) | u32::from(dst));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn arm64_str64(a: &mut OneByteNativeArm64Assembler, src: u8, base: u8, offset: u32) {
-    debug_assert_eq!(offset % 8, 0);
-    debug_assert!(offset / 8 < 1 << 12);
-    a.insn(0xf900_0000 | ((offset / 8) << 10) | (u32::from(base) << 5) | u32::from(src));
-}
-
-#[cfg(all(target_arch = "aarch64", unix))]
-fn compile_one_byte_native_aarch64(ops: &[OneByteNativeOp]) -> Option<Vec<u8>> {
-    // AArch64 Unix ABI arguments enter in x0..x5. x19..x24 retain them, x25 retains the last
-    // candidate, and x16 is the indirect-call scratch register.
-    let mut a = OneByteNativeArm64Assembler::new();
-    let no_match = a.label();
-    let interrupted = a.label();
-    let ret = a.label();
-    let fail = a.label();
-    let loop_start = a.label();
-
-    for (left, right) in [(19u8, 20u8), (21, 22), (23, 24), (25, 30)] {
-        a.insn(0xa9bf_0000 | (u32::from(right) << 10) | (31u32 << 5) | u32::from(left));
-    }
-    for (dst, src) in [(19, 0), (20, 1), (21, 2), (22, 3), (23, 4), (24, 5)] {
-        arm64_mov_reg(&mut a, dst, src);
-    }
-    arm64_cmp_reg(&mut a, 21, 20);
-    a.branch_cond(8, no_match); // HI: start > length
-    let width = ops.iter().filter(|op| op.consumes_element()).count();
-    arm64_sub_imm(&mut a, 25, 20, width as u32);
-    arm64_sub_reg(&mut a, 9, 20, 21);
-    arm64_cmp_imm(&mut a, 9, width as u32);
-    a.branch_cond(3, no_match); // LO: remaining length < width
-
-    a.bind(loop_start);
-    arm64_mov_reg(&mut a, 0, 23);
-    arm64_mov_imm64(&mut a, 16, regexp_native_poll as *const () as usize as u64);
-    // AAPCS64 6.1.1: NZCV is undefined across a public call. Test the returned
-    // status, not flags left by Rust; a false interrupt with w0 == 0 would be
-    // encoded below as a successful empty match and could stall global replace.
-    a.insn(0xd63f_0200); // blr x16
-    arm64_cmp_imm_w(&mut a, 0, 0);
-    a.branch_cond(1, interrupted); // NE: poll returned a reason
-    arm64_add_shifted_reg(&mut a, 10, 19, 21, 0); // add x10, x19, x21
-
-    let mut offset = 0u32;
-    for op in ops {
-        match op {
-            OneByteNativeOp::Char(expected) => {
-                debug_assert!(*expected < 0x100);
-                arm64_ldrb(&mut a, 9, 10, offset);
-                arm64_cmp_imm_w(&mut a, 9, *expected);
-                a.branch_cond(1, fail); // NE
-                offset += 1;
-            }
-            OneByteNativeOp::Any => {
-                arm64_ldrb(&mut a, 9, 10, offset);
-                arm64_cmp_imm_w(&mut a, 9, b'\n' as u32);
-                a.branch_cond(0, fail); // EQ
-                arm64_cmp_imm_w(&mut a, 9, b'\r' as u32);
-                a.branch_cond(0, fail); // EQ
-                offset += 1;
-            }
-            OneByteNativeOp::Class(class) => {
-                let lut = class.ascii_lut.as_ref()?.as_ptr() as usize as u64;
-                arm64_ldrb(&mut a, 9, 10, offset);
-                arm64_mov_imm64(&mut a, 16, lut);
-                a.insn(0x8b09_0210); // add x16, x16, x9 (the byte is zero-extended)
-                arm64_ldrb(&mut a, 9, 16, 0);
-                arm64_cmp_imm_w(&mut a, 9, 0);
-                a.branch_cond(0, fail); // EQ
-                offset += 1;
-            }
-            // An anchor holds at the candidate start plus its offset in the pattern (`/a^/` and
-            // `/x$y/` never match): `^` past offset 0 never holds, `$` compares with the length.
-            OneByteNativeOp::AssertStart if offset > 0 => a.branch(fail),
-            OneByteNativeOp::AssertStart => {
-                arm64_cmp_imm(&mut a, 21, 0);
-                a.branch_cond(1, fail); // NE
-            }
-            OneByteNativeOp::AssertEnd => {
-                arm64_add_imm(&mut a, 9, 21, offset);
-                arm64_cmp_reg(&mut a, 9, 20);
-                a.branch_cond(1, fail); // NE
-            }
-            OneByteNativeOp::Many { .. } => return None,
-        }
-    }
-
-    arm64_str64(&mut a, 21, 24, 0);
-    arm64_add_imm(&mut a, 0, 21, width as u32);
-    arm64_str64(&mut a, 0, 24, 8);
-    a.insn(0x5280_0020); // mov w0, #1
-    a.branch(ret);
-
-    a.bind(fail);
-    arm64_cmp_imm_w(&mut a, 22, 0);
-    a.branch_cond(1, no_match); // NE: sticky
-    arm64_cmp_reg(&mut a, 21, 25);
-    a.branch_cond(2, no_match); // HS: current >= last
-    arm64_add_imm(&mut a, 21, 21, 1);
-    a.branch(loop_start);
-
-    a.bind(interrupted);
-    arm64_add_imm_w(&mut a, 0, 0, 1);
-    a.branch(ret);
-
-    a.bind(no_match);
-    a.insn(0x5280_0000); // mov w0, #0
-
-    a.bind(ret);
-    for (left, right) in [(25u8, 30u8), (23, 24), (21, 22), (19, 20)] {
-        a.insn(0xa8c1_0000 | (u32::from(right) << 10) | (31u32 << 5) | u32::from(left));
-    }
-    a.insn(0xd65f_03c0); // ret
-    a.finish()
-}
-
-struct OneByteNativeProgram {
-    ops: Box<[OneByteNativeOp]>,
-    machine_code: Option<OneByteNativeCode>,
-}
-
-impl OneByteNativeProgram {
-    fn compile(prog: &[Inst], multiline: bool) -> Option<Self> {
-        let body = prog.get(1..prog.len().checked_sub(2)?)?;
-        if body.is_empty() {
-            return None;
-        }
-        if body.len() == 1 {
-            if let Inst::Many {
-                rep,
-                min,
-                max,
-                greedy,
-                ..
-            } = &body[0]
-            {
-                if one_byte_native_rep(rep) {
-                    let ops = vec![OneByteNativeOp::Many {
-                        rep: rep.clone(),
-                        min: *min,
-                        max: *max,
-                        greedy: *greedy,
-                    }]
-                    .into_boxed_slice();
-                    return Some(Self {
-                        machine_code: None,
-                        ops,
-                    });
-                }
-            }
-        }
-        let mut has_non_literal = false;
-        let mut ops = Vec::with_capacity(body.len());
-        for instruction in body {
-            match instruction {
-                Inst::Char(c) if *c < 0x100 => ops.push(OneByteNativeOp::Char(*c)),
-                Inst::Any => {
-                    has_non_literal = true;
-                    ops.push(OneByteNativeOp::Any);
-                }
-                Inst::Class(class) if class.ascii_lut.is_some() => {
-                    has_non_literal = true;
-                    ops.push(OneByteNativeOp::Class(class.clone()));
-                }
-                Inst::AssertStart | Inst::AssertEnd if !multiline => {
-                    has_non_literal = true;
-                    ops.push(if matches!(instruction, Inst::AssertStart) {
-                        OneByteNativeOp::AssertStart
-                    } else {
-                        OneByteNativeOp::AssertEnd
-                    });
-                }
-                _ => return None,
-            }
-        }
-        // Pure literals already use the eager SIMD-friendly literal path. The tiered path is for
-        // the next useful subset, where the old matcher paid one instruction dispatch per atom.
-        if !has_non_literal {
-            return None;
-        }
-        let ops = ops.into_boxed_slice();
-        // Classes and anchors compile on both backends. The AArch64 loop once branched on flags
-        // a call left undefined, which turned a failed candidate into a false empty match and
-        // stalled global replaces on no-match tails; it tests the poll's result since 5967822c.
-        // Anchors test the candidate start plus their offset. The instruction corpus and the
-        // differential tests run this machine code (`find_ascii`) against the matcher.
-        let machine_code = OneByteNativeCode::compile(&ops);
-        Some(Self { machine_code, ops })
-    }
-
-    fn retained_bytes(&self) -> usize {
-        self.ops
-            .len()
-            .saturating_mul(std::mem::size_of::<OneByteNativeOp>())
-    }
-
-    fn find_ascii(
-        &self,
-        subject: &[u8],
-        start: usize,
-        sticky: bool,
-        control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<(usize, usize)> {
-        if let Some(code) = &self.machine_code {
-            return code.find_ascii(subject, start, sticky, control);
-        }
-        self.find_interpreted(subject, start, sticky, control)
-    }
-
-    fn find_interpreted<S: OneByteSubject + ?Sized>(
-        &self,
-        subject: &S,
-        start: usize,
-        sticky: bool,
-        control: &crate::RuntimeInterrupt,
-    ) -> MatchResult<(usize, usize)> {
-        if let [OneByteNativeOp::Many {
-            rep,
-            min,
-            max,
-            greedy,
-        }] = self.ops.as_ref()
-        {
-            return find_terminal_one_byte_many(
-                subject, start, rep, *min, *max, *greedy, sticky, control,
-            );
-        }
-        let width = self.ops.iter().filter(|op| op.consumes_element()).count();
-        if start > subject.len() || width > subject.len().saturating_sub(start) {
-            return Ok(None);
-        }
-        let last = subject.len() - width;
-        let mut from = start;
-        while from <= last {
-            if from & INTERRUPT_POLL_MASK == 0 {
-                poll_interrupt(control)?;
-            }
-            let mut matched = true;
-            let mut offset = 0;
-            for (index, op) in self.ops.iter().enumerate() {
-                if index & INTERRUPT_POLL_MASK == 0 {
-                    poll_interrupt(control)?;
-                }
-                // An assertion holds at the current position, wherever it sits in the pattern
-                // (`/a^/` must never match).
-                let hit = match op {
-                    OneByteNativeOp::AssertStart => from + offset == 0,
-                    OneByteNativeOp::AssertEnd => from + offset == subject.len(),
-                    _ => {
-                        let element = subject.element_at(from + offset);
-                        offset += 1;
-                        op.matches(element)
-                    }
-                };
-                if !hit {
-                    matched = false;
-                    break;
-                }
-            }
-            if matched {
-                return Ok(Some((from, from + width)));
-            }
-            if sticky {
-                return Ok(None);
-            }
-            from += 1;
-        }
-        Ok(None)
-    }
-}
-
-fn one_byte_native_rep(rep: &Rep) -> bool {
-    match rep {
-        Rep::Char(c) => *c < 0x100,
-        Rep::Any => true,
-        Rep::Class(class) => class.ascii_lut.is_some(),
-    }
-}
-
-fn find_terminal_one_byte_many<S: OneByteSubject + ?Sized>(
-    subject: &S,
-    start: usize,
-    rep: &Rep,
-    min: usize,
-    max: Option<usize>,
-    greedy: bool,
-    sticky: bool,
-    control: &crate::RuntimeInterrupt,
-) -> MatchResult<(usize, usize)> {
-    if start > subject.len() {
-        return Ok(None);
-    }
-    let cap = max.unwrap_or(usize::MAX);
-    let mut from = start;
-    while from <= subject.len() {
-        if from & INTERRUPT_POLL_MASK == 0 {
-            poll_interrupt(control)?;
-        }
-        let room = subject.len() - from;
-        let mut avail = 0usize;
-        while avail < cap
-            && avail < room
-            && one_byte_rep_matches(rep, subject.element_at(from + avail))
-        {
-            avail += 1;
-            if avail & INTERRUPT_POLL_MASK == 0 {
-                poll_interrupt(control)?;
-            }
-        }
-        if avail >= min {
-            let count = if greedy { avail } else { min };
-            return Ok(Some((from, from + count)));
-        }
-        if sticky {
-            return Ok(None);
-        }
-        from += 1;
-    }
-    Ok(None)
 }
 
 #[derive(Clone)]
@@ -2640,12 +1762,6 @@ impl Regex {
             .saturating_add(self.prefilter.as_ref().map_or(0, |p| p.heap_bytes()))
             .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(self.literal_fold.as_ref().map_or(0, |bytes| bytes.len()))
-            .saturating_add(
-                self.one_byte_native
-                    .borrow()
-                    .as_ref()
-                    .map_or(0, OneByteNativeProgram::retained_bytes),
-            )
             .saturating_add(self.first_lut.as_ref().map_or(0, |_| 256))
             .saturating_add(
                 self.scratch
@@ -2684,12 +1800,6 @@ impl Regex {
             .saturating_add(self.prefilter.as_ref().map_or(0, |p| p.heap_bytes()))
             .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(self.literal_fold.as_ref().map_or(0, |bytes| bytes.len()))
-            .saturating_add(
-                self.one_byte_native
-                    .borrow()
-                    .as_ref()
-                    .map_or(0, OneByteNativeProgram::retained_bytes),
-            )
             .saturating_add(self.first_lut.as_ref().map_or(0, |_| 256))
             .saturating_add(
                 self.scratch
@@ -2877,9 +1987,8 @@ impl Regex {
             case_closed,
             tier_ticks: Cell::new(0),
             subject_shapes: Cell::new(0),
-            tier_up_attempted: Cell::new(false),
             tier_up_at: regexp_tier_up_threshold(),
-            one_byte_native: RefCell::new(None),
+            native: Default::default(),
             scratch: RefCell::new(MatchScratch::new(2 * (p.ngroups + 1), lowering.marks)),
             prog,
             ngroups: p.ngroups,
@@ -2958,47 +2067,33 @@ impl Regex {
         }
     }
 
-    /// Count an execution over a subject of `storage` ([`SUBJECT_ONE_BYTE`] or
-    /// [`SUBJECT_TWO_BYTE`]) toward the native one-byte tier, which serves one-byte subjects.
-    fn note_execution(&self, storage: u8) {
+    /// Count an execution over a subject of `len` units of `storage` ([`SUBJECT_ONE_BYTE`] or
+    /// [`SUBJECT_TWO_BYTE`]) toward the native tier, which compiles the pattern for the subject's
+    /// width once it is hot (see [`native::note_execution`]).
+    fn note_execution(&self, storage: u8, len: usize) {
         if regexp_census_enabled() {
             self.census_start(storage);
         }
         self.subject_shapes.set(self.subject_shapes.get() | storage);
-        self.tier_ticks.set(self.tier_ticks.get().saturating_add(1));
-        if self.tier_up_attempted.get()
-            || self.tier_up_at == 0
-            || self.tier_ticks.get() < self.tier_up_at
-            || self.subject_shapes.get() & SUBJECT_ONE_BYTE == 0
-        {
-            return;
-        }
-        self.tier_up_attempted.set(true);
-        // The native subset currently uses legacy exact byte membership. Case folding, dotAll,
-        // and Unicode/UnicodeSets mode change those predicates, so those patterns remain on the
-        // general matcher until their semantics have dedicated native operations.
-        if self.ignore_case || self.dotall || self.unicode {
-            regexp_prof_tier_up(false);
-            return;
-        }
-        if let Some(program) = OneByteNativeProgram::compile(&self.prog, self.multiline) {
-            if let Some(code) = &program.machine_code {
-                code.list_in_perf_map(&self.source, &self.flags);
-            }
-            *self.one_byte_native.borrow_mut() = Some(program);
-            regexp_prof_tier_up(true);
+        let width = if storage == SUBJECT_ONE_BYTE {
+            native::Width::One
         } else {
-            regexp_prof_tier_up(false);
-        }
+            native::Width::Two
+        };
+        native::note_execution(self, width, len);
     }
 
+    /// The tier's feedback: executions, the storage of the subjects seen, and for each width
+    /// whether a compilation was tried and made code.
     #[cfg(test)]
-    fn tier_feedback(&self) -> (u32, u8, bool, bool) {
+    fn tier_feedback(&self) -> (u32, u8, [(bool, bool); 2]) {
         (
             self.tier_ticks.get(),
             self.subject_shapes.get(),
-            self.tier_up_attempted.get(),
-            self.one_byte_native.borrow().is_some(),
+            [
+                self.native.state(native::Width::One),
+                self.native.state(native::Width::Two),
+            ],
         )
     }
 
@@ -3231,7 +2326,7 @@ impl Regex {
     ) -> MatchResult<Captures> {
         match subject.units() {
             crate::lstr::Units::Ascii(bytes) => {
-                self.note_execution(SUBJECT_ONE_BYTE);
+                self.note_execution(SUBJECT_ONE_BYTE, bytes.len());
                 if let Some(literal) = &self.literal_ascii {
                     Ok(
                         find_ascii_literal(bytes, start, literal, self.sticky, control)?
@@ -3242,17 +2337,12 @@ impl Regex {
                         find_ascii_fold_literal(bytes, start, literal, self.sticky, control)?
                             .map(Captures::one),
                     )
-                } else if let Some(native) = self.one_byte_native.borrow().as_ref() {
-                    regexp_prof_native_exec();
-                    Ok(native
-                        .find_ascii(bytes, start, self.sticky, control)?
-                        .map(Captures::one))
                 } else {
                     self.exec_impl(bytes, start, control, poll)
                 }
             }
             crate::lstr::Units::Utf16(units) => {
-                self.note_execution(SUBJECT_TWO_BYTE);
+                self.note_execution(SUBJECT_TWO_BYTE, units.len());
                 if self.unicode {
                     let input = Paired(units);
                     self.exec_impl(input, input.boundary(start), control, poll)
@@ -3289,20 +2379,17 @@ impl Regex {
     ) -> MatchResult<(usize, usize)> {
         match subject.units() {
             crate::lstr::Units::Ascii(bytes) => {
-                self.note_execution(SUBJECT_ONE_BYTE);
+                self.note_execution(SUBJECT_ONE_BYTE, bytes.len());
                 if let Some(literal) = &self.literal_ascii {
                     find_ascii_literal(bytes, start, literal, self.sticky, control)
                 } else if let Some(literal) = &self.literal_fold {
                     find_ascii_fold_literal(bytes, start, literal, self.sticky, control)
-                } else if let Some(native) = self.one_byte_native.borrow().as_ref() {
-                    regexp_prof_native_exec();
-                    native.find_ascii(bytes, start, self.sticky, control)
                 } else {
                     self.find_impl(bytes, start, control, poll)
                 }
             }
             crate::lstr::Units::Utf16(units) => {
-                self.note_execution(SUBJECT_TWO_BYTE);
+                self.note_execution(SUBJECT_TWO_BYTE, units.len());
                 if self.unicode {
                     let input = Paired(units);
                     self.find_impl(input, input.boundary(start), control, poll)
@@ -3449,8 +2536,10 @@ impl Regex {
                 &mut spare
             }
         };
-        let _ = poll;
-        let matched = self.run_matcher(input, start, only, control, scratch);
+        let matched = match native::code_for(self, &input) {
+            Some(code) => native::run(self, code, input, start, only, control, poll, scratch),
+            None => self.run_matcher(input, start, only, control, scratch),
+        };
         let found = match matched {
             Ok(true) => Ok(Some(project(&scratch.caps))),
             Ok(false) => Ok(None),
@@ -3657,7 +2746,7 @@ pub(crate) fn regexp_prof_report() -> Option<String> {
             }
         }
         let mut report = format!(
-            "matcher inst[{}] scan:{} attempts:{} backtrack:{} tier_attempts:{} tier_successes:{} native_execs:{} native_code_bytes:{}",
+            "matcher inst[{}] scan:{} attempts:{} backtrack:{} tier_attempts:{} tier_successes:{} native_execs:{} native_code_bytes:{} native_compile_us:{}",
             body.trim(),
             prof.scan_positions,
             prof.attempts,
@@ -3665,7 +2754,8 @@ pub(crate) fn regexp_prof_report() -> Option<String> {
             prof.tier_up_attempts,
             prof.tier_up_successes,
             prof.native_execs,
-            prof.native_code_bytes
+            prof.native_code_bytes,
+            prof.native_compile_ns / 1000
         );
         if regexp_census_enabled() {
             regexp_census_report(&mut report);
@@ -3871,13 +2961,16 @@ fn char_class_heap_bytes(class: &CharClass) -> usize {
 /// [`Regex::exec_impl_with`]) instead of being allocated, sized and filled by each: the capture
 /// slots, sized for the program and unset between executions; the mark slots, sized for it (a
 /// mark is written before it is read); and the backtrack stack, capture snapshots and modifier
-/// flag stack, empty between executions.
+/// flag stack, empty between executions. The native tier keeps its capture and mark slots, as
+/// words ([`UNSET`] for an unset one), and its backtrack stack, of 16-byte records, beside them.
 struct MatchScratch {
     caps: Box<[Option<usize>]>,
     marks: Box<[Option<usize>]>,
     bt: Vec<Backtrack>,
     saved: Vec<Option<usize>>,
     outer_flags: Vec<(bool, bool, bool)>,
+    native_slots: Box<[usize]>,
+    native_stack: Vec<[usize; 2]>,
 }
 
 impl MatchScratch {
@@ -3888,6 +2981,8 @@ impl MatchScratch {
             bt: Vec::new(),
             saved: Vec::new(),
             outer_flags: Vec::new(),
+            native_slots: Box::default(),
+            native_stack: Vec::new(),
         }
     }
 
@@ -3905,6 +3000,16 @@ impl MatchScratch {
                 self.outer_flags
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(bool, bool, bool)>()),
+            )
+            .saturating_add(
+                self.native_slots
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+            .saturating_add(
+                self.native_stack
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<[usize; 2]>()),
             )
     }
 }
@@ -6095,6 +5200,14 @@ trait ReInput: Copy {
     /// Whether an element may take two positions: a surrogate pair of a [`Paired`] subject.
     const PAIRED: bool = false;
 
+    /// The width the native tier compiles for subjects of this kind, if it runs on them.
+    const NATIVE_WIDTH: Option<native::Width> = None;
+
+    /// The subject's units and its length, for native code (subjects of a [`Self::NATIVE_WIDTH`]).
+    fn native_parts(&self) -> (*const u8, usize) {
+        unreachable!("no native code runs on this subject")
+    }
+
     fn len(&self) -> usize;
 
     /// The code unit at position `i`.
@@ -6151,6 +5264,13 @@ trait ReInput: Copy {
 }
 
 impl ReInput for &[u8] {
+    const NATIVE_WIDTH: Option<native::Width> = Some(native::Width::One);
+
+    #[inline(always)]
+    fn native_parts(&self) -> (*const u8, usize) {
+        (self.as_ptr(), <[u8]>::len(self))
+    }
+
     #[inline(always)]
     fn len(&self) -> usize {
         <[u8]>::len(self)
@@ -6213,6 +5333,13 @@ impl ReInput for &[u8] {
 }
 
 impl ReInput for &[u16] {
+    const NATIVE_WIDTH: Option<native::Width> = Some(native::Width::Two);
+
+    #[inline(always)]
+    fn native_parts(&self) -> (*const u8, usize) {
+        (self.as_ptr() as *const u8, <[u16]>::len(self))
+    }
+
     #[inline(always)]
     fn len(&self) -> usize {
         <[u16]>::len(self)
@@ -8485,8 +7612,6 @@ fn class_set_to_node(mut set: ClassSet) -> Node {
 
 #[cfg(test)]
 mod internal_engine_diagnostics {
-    include!("regex_native_generated.rs");
-
     /// A view is matched in place over its owner's storage, as a flat copy of its units is:
     /// anchors, word boundaries and lookbehind see nothing outside it, and a surrogate pair its
     /// ends split leaves lone halves in it.
@@ -9656,378 +8781,6 @@ mod internal_engine_diagnostics {
                 .unwrap()[0],
             Some((10, 16))
         );
-    }
-
-    #[test]
-    fn straight_line_ascii_tier_is_lazy_and_semantically_exact() {
-        let re = super::Regex::new("a.c", "").unwrap();
-        let control = crate::RuntimeInterrupt::default();
-        let text = crate::lstr::LStr::from("xxaXcyy");
-
-        // The pattern's own threshold: `TRUST_JS_REGEXP_TIER_UP_AT` may lower the default, or
-        // turn the tier off (0), when there is no tier-up to test.
-        let threshold = re.tier_up_at;
-        if threshold == 0 {
-            return;
-        }
-        assert_eq!(re.tier_feedback(), (0, 0, false, false));
-        for _ in 0..(threshold - 1) {
-            assert_eq!(
-                re.exec_polled(&text, 0, &control).unwrap().unwrap()[0],
-                Some((2, 5))
-            );
-        }
-        let (ticks, shapes, attempted, native) = re.tier_feedback();
-        assert_eq!(ticks, threshold - 1);
-        assert_eq!(shapes & super::SUBJECT_ONE_BYTE != 0, threshold > 1);
-        assert!(!attempted);
-        assert!(!native);
-
-        assert_eq!(
-            re.exec_polled(&text, 0, &control).unwrap().unwrap()[0],
-            Some((2, 5))
-        );
-        let (ticks, _, attempted, native) = re.tier_feedback();
-        assert_eq!(ticks, threshold);
-        assert!(attempted);
-        assert!(native);
-
-        // Dot still rejects both ASCII line terminators, and the sticky path only tries its exact
-        // requested position after tier-up.
-        let newline = crate::lstr::LStr::from("a\nc");
-        assert!(re.exec_polled(&newline, 0, &control).unwrap().is_none());
-        let sticky = super::Regex::new("a.c", "y").unwrap();
-        let sticky_text = crate::lstr::LStr::from("xaXc");
-        for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            sticky.exec_polled(&sticky_text, 1, &control).unwrap();
-        }
-        assert_eq!(
-            sticky.find_polled(&sticky_text, 1, &control).unwrap(),
-            Some((1, 4))
-        );
-    }
-
-    /// The tier records the storage of the subjects a pattern matched and serves one-byte ones:
-    /// a pattern that has matched only two-byte subjects stays on the general matcher.
-    #[test]
-    fn ascii_tier_records_subject_shapes_and_rejects_unsafe_flags() {
-        let re = super::Regex::new("a.c", "").unwrap();
-        let control = crate::RuntimeInterrupt::default();
-        let ascii = crate::lstr::LStr::from("aXc");
-        let two_byte = crate::lstr::LStr::from("aéc");
-        assert!(re.exec_polled(&ascii, 0, &control).unwrap().is_some());
-        assert!(re.exec_polled(&two_byte, 0, &control).unwrap().is_some());
-        let (_, shapes, _, _) = re.tier_feedback();
-        assert_ne!(shapes & super::SUBJECT_ONE_BYTE, 0);
-        assert_ne!(shapes & super::SUBJECT_TWO_BYTE, 0);
-
-        let latin = super::Regex::new("é.", "").unwrap();
-        let latin_text = crate::lstr::LStr::from("éX");
-        for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            assert_eq!(
-                latin
-                    .exec_polled(&latin_text, 0, &control)
-                    .unwrap()
-                    .unwrap()[0],
-                Some((0, 2))
-            );
-        }
-        assert!(!latin.tier_feedback().3);
-
-        for flags in ["i", "s", "u", "v"] {
-            let guarded = super::Regex::new("a.c", flags).unwrap();
-            let input = crate::lstr::LStr::from("aXc");
-            for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-                guarded.exec_polled(&input, 0, &control).unwrap();
-            }
-            let (_, _, attempted, native) = guarded.tier_feedback();
-            assert!(attempted, "unsafe flag should close the tier-up attempt");
-            assert!(!native, "unsafe flag must remain on the exact matcher");
-        }
-
-        let anchored = super::Regex::new("^a.c$", "").unwrap();
-        for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            anchored.exec_polled(&ascii, 0, &control).unwrap();
-        }
-        assert!(anchored.tier_feedback().3);
-
-        let multiline = super::Regex::new("^a.c$", "m").unwrap();
-        for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            multiline.exec_polled(&ascii, 0, &control).unwrap();
-        }
-        assert!(!multiline.tier_feedback().3);
-    }
-
-    /// The perf map (`TRUST_JS_PERF_MAP`) lists a pattern's machine program under its source and
-    /// flags when the pattern tiers up.
-    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-    #[test]
-    fn perf_map_names_native_regexp_programs_by_source_and_flags() {
-        let capture = crate::jit::profiler::PerfMapCapture::start("regexp");
-        let re = super::Regex::new("a.c", "g").unwrap();
-        let control = crate::RuntimeInterrupt::default();
-        let text = crate::lstr::LStr::from("xxaXcyy");
-        for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            re.exec_polled(&text, 0, &control).unwrap();
-        }
-        let native = re.one_byte_native.borrow();
-        let code = native
-            .as_ref()
-            .and_then(|program| program.machine_code.as_ref())
-            .expect("the dot pattern tiers up to machine code");
-        let lines = capture.lines();
-        let line = (
-            code.executable.as_ptr() as usize,
-            code.executable.len(),
-            "RegExp:/a.c/g".to_string(),
-        );
-        assert!(lines.contains(&line), "{line:x?} in {lines:x?}");
-    }
-
-    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-    #[test]
-    fn native_regexp_machine_poll_with_armed_deadline_preserves_match_offsets() {
-        let control = crate::RuntimeInterrupt::default();
-        control.set_deadline(Some(
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-        ));
-        // Exercise the executable mappings directly: the checked native Rust matcher
-        // cannot reveal an ABI error at the generated code's host-interrupt call.
-        let code = super::OneByteNativeCode::compile(&[super::OneByteNativeOp::Any])
-            .expect("the fixed-width dot pattern must have executable code");
-        for sticky in [false, true] {
-            for start in 0..=4 {
-                let expected = (start < 3).then_some((start, start + 1));
-                assert_eq!(
-                    code.find_ascii(b"abc", start, sticky, &control).unwrap(),
-                    expected,
-                    "byte mapping at {start}, sticky={sticky}"
-                );
-            }
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", unix))]
-    #[test]
-    fn native_regexp_aarch64_poll_explicitly_tests_return_value() {
-        // Debug Rust can coincidentally leave useful flags; keep an emitter-level
-        // gate as well as the release executable-mapping and JS regressions.
-        let bytes = super::compile_one_byte_native_aarch64(&[super::OneByteNativeOp::Any]).unwrap();
-        let instructions: Vec<u32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .copied()
-            .map(u32::from_le_bytes)
-            .collect();
-        let poll = instructions
-            .iter()
-            .position(|&word| word == 0xd63f_0200)
-            .expect("poll call must be emitted");
-        assert_eq!(instructions[poll + 1], 0x7100_001f, "cmp w0, #0");
-    }
-
-    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-    #[test]
-    fn native_regexp_machine_poll_preserves_host_interrupt_reasons() {
-        let code = super::OneByteNativeCode::compile(&[super::OneByteNativeOp::Any])
-            .expect("the fixed-width dot pattern must have executable code");
-        for expected in [
-            crate::InterruptReason::Cancelled,
-            crate::InterruptReason::UserNavigation,
-            crate::InterruptReason::DeadlineExceeded,
-        ] {
-            let control = crate::RuntimeInterrupt::default();
-            match expected {
-                crate::InterruptReason::Cancelled => control.cancel(),
-                crate::InterruptReason::UserNavigation => control.request_user_navigation(),
-                crate::InterruptReason::DeadlineExceeded => control.set_deadline(Some(
-                    std::time::Instant::now() - std::time::Duration::from_secs(1),
-                )),
-            }
-            let result = code.find_ascii(b"abc", 1, false, &control);
-            assert!(
-                matches!(result, Err(super::MatchError::Interrupted(reason)) if reason == expected),
-                "incorrect poll completion: {result:?}, expected {expected:?}"
-            );
-        }
-    }
-
-    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-    #[test]
-    fn machine_code_subset_matches_reference_and_preserves_interrupts() {
-        let control = crate::RuntimeInterrupt::default();
-        for (pattern, subject, expected) in [
-            ("a.c", "xxaXcyy", Some((2, 5))),
-            ("^a.c$", "aXc", Some((0, 3))),
-            ("a.c$", "xxaXc", Some((2, 5))),
-            ("^a.c", "xxaXcyy", None),
-            ("^-ms-", "background-image", None),
-            ("[a-z].", "123aYzz", Some((3, 5))),
-            (r"\d[a-z]", "xx7ayzz", Some((2, 4))),
-            ("[^a].", "aabYzz", Some((2, 4))),
-        ] {
-            let re = super::Regex::new(pattern, "").unwrap();
-            let text = crate::lstr::LStr::from(subject);
-            for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-                re.exec_polled(&text, 0, &control).unwrap();
-            }
-            assert!(
-                re.tier_feedback().3,
-                "machine subset was not emitted for /{pattern}/"
-            );
-            let machine = re.find_polled(&text, 0, &control).unwrap();
-            let reference = re
-                .find_impl(
-                    subject.as_bytes(),
-                    0,
-                    &control,
-                    &super::test_poll_word(&control),
-                )
-                .unwrap();
-            assert_eq!(machine, expected);
-            assert_eq!(
-                machine, reference,
-                "machine/reference mismatch for /{pattern}/"
-            );
-        }
-
-        let re = super::Regex::new("a.c", "").unwrap();
-        let text = crate::lstr::LStr::from("aXc");
-        for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            re.exec_polled(&text, 0, &control).unwrap();
-        }
-        let cancelled = crate::RuntimeInterrupt::default();
-        cancelled.cancel();
-        assert!(matches!(
-            re.find_polled(&text, 0, &cancelled),
-            Err(super::MatchError::Interrupted(
-                crate::InterruptReason::Cancelled
-            ))
-        ));
-    }
-
-    #[test]
-    fn one_byte_native_subset_differentially_matches_bytecode() {
-        let subjects: &[&[u8]] = &[
-            b"", b"a", b"aXc", b"xxaXcyy", b"a\nc", b"a\rc", b"0a", b"za", b"_9", b"!a",
-        ];
-        let control = crate::RuntimeInterrupt::default();
-        for pattern in ["a.c", "[a-z].", r"\d[a-z]", r"[^a]."] {
-            for &subject in subjects {
-                for sticky in [false, true] {
-                    let re = super::Regex::new(pattern, if sticky { "y" } else { "" }).unwrap();
-                    let native = super::OneByteNativeProgram::compile(&re.prog, re.multiline)
-                        .expect("subset pattern must compile to the native representation");
-                    for (instruction, op) in
-                        re.prog[1..re.prog.len() - 2].iter().zip(native.ops.iter())
-                    {
-                        for byte in 0..=u8::MAX {
-                            let reference = match instruction {
-                                super::Inst::Char(c) => *c == byte as u32,
-                                super::Inst::Any => !super::is_line_terminator_u32(byte as u32),
-                                super::Inst::Class(class) => {
-                                    class.matches(byte as u32, false, false)
-                                }
-                                _ => panic!("unsupported instruction in subset test"),
-                            };
-                            assert_eq!(
-                                op.matches(byte as u32),
-                                reference,
-                                "operation predicate mismatch for /{pattern}/ and byte {byte}"
-                            );
-                        }
-                    }
-                    for start in 0..=subject.len() {
-                        let fast = native.find_ascii(subject, start, sticky, &control);
-                        let reference = re.find_impl(
-                            subject,
-                            start,
-                            &control,
-                            &super::test_poll_word(&control),
-                        );
-                        assert_eq!(
-                            fast, reference,
-                            "native/reference mismatch for /{pattern}/ at {start}, sticky={sticky}, subject={subject:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn terminal_many_native_subset_differentially_matches_bytecode() {
-        let subjects: &[&[u8]] = &[
-            b"", b"a", b"aa", b"xxaaay", b"bbb", b"12abc", b"a\na", b"a\ra",
-        ];
-        let control = crate::RuntimeInterrupt::default();
-        for pattern in [
-            "a+", "a+?", "a{2,4}", "a{2,4}?", "[a-z]+", r"\d{2,4}", ".*", ".*?",
-        ] {
-            for &subject in subjects {
-                for sticky in [false, true] {
-                    let re = super::Regex::new(pattern, if sticky { "y" } else { "" }).unwrap();
-                    let native = super::OneByteNativeProgram::compile(&re.prog, re.multiline)
-                        .expect("terminal Many pattern must compile to the native representation");
-                    assert!(matches!(
-                        native.ops.as_ref(),
-                        [super::OneByteNativeOp::Many { .. }]
-                    ));
-                    for start in 0..=subject.len() {
-                        let fast = native.find_ascii(subject, start, sticky, &control);
-                        let reference = re.find_impl(
-                            subject,
-                            start,
-                            &control,
-                            &super::test_poll_word(&control),
-                        );
-                        assert_eq!(
-                            fast, reference,
-                            "terminal Many mismatch for /{pattern}/ at {start}, sticky={sticky}, subject={subject:?}"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Bytes past ASCII are their Latin-1 code units.
-        let re = super::Regex::new("é+", "").unwrap();
-        let subject: &[u8] = b"xx\xe9\xe9Z";
-        let native = super::OneByteNativeProgram::compile(&re.prog, re.multiline)
-            .expect("one-byte non-ASCII terminal Many must compile");
-        for start in 0..=subject.len() {
-            let fast = native.find_ascii(subject, start, false, &control);
-            let reference =
-                re.find_impl(subject, start, &control, &super::test_poll_word(&control));
-            assert_eq!(
-                fast, reference,
-                "non-ASCII terminal Many mismatch at {start}"
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_many_native_path_promotes_and_polls() {
-        let control = crate::RuntimeInterrupt::default();
-        let re = super::Regex::new("[a-z]+", "").unwrap();
-        let text = crate::lstr::LStr::from("abcxyz");
-        for _ in 0..super::REGEXP_TIER_UP_THRESHOLD {
-            re.exec_polled(&text, 0, &control).unwrap();
-        }
-        assert!(re.tier_feedback().3);
-        assert_eq!(re.find_polled(&text, 0, &control).unwrap(), Some((0, 6)));
-
-        let interrupted = crate::RuntimeInterrupt::default();
-        interrupted.cancel();
-        let long = vec![b'a'; super::INTERRUPT_POLL_MASK + 1];
-        let native = super::OneByteNativeProgram::compile(&re.prog, re.multiline).unwrap();
-        assert!(matches!(
-            native.find_ascii(&long[..], 0, false, &interrupted),
-            Err(super::MatchError::Interrupted(
-                crate::InterruptReason::Cancelled
-            ))
-        ));
     }
 
     /// A deterministic xorshift generator for the differential tests.

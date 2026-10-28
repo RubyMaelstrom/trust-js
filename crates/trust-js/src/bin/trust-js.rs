@@ -185,7 +185,8 @@ Diagnostics (env, unstable):
   TRUST_JS_JIT_CODEDUMP=SUB  Dump the finished machine code of matching chunks (hex)
   TRUST_JS_JIT_OPSTAT=1      Tally ops that reach the JIT slow path (top at exit; =2 pinpoints sites)
   TRUST_JS_REGEXP_PROF=1     Report matcher instruction/scan/attempt/backtrack/tier counts at exit
-  TRUST_JS_REGEXP_TIER_UP_AT=N  Promote eligible ASCII matchers after N calls; 0 disables
+  TRUST_JS_REGEXP_TIER_UP_AT=N  Compile eligible RegExps to native code after N calls; 0 disables
+  TRUST_JS_REGEXP_NATIVE_VERIFY=1  Check every native RegExp execution against the matcher
   TRUST_JS_REGEXP_NO_PREFILTER=1  Match without scanning for each pattern's required literal
   TRUST_JS_REGEXP_NO_SIMD=1  Keep RegExp subject scans off the vector unit
   TRUST_JS_REGEXP_NO_PROTECTOR=1  Run every RegExp operation through its observable lookups
