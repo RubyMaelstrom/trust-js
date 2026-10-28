@@ -2244,6 +2244,522 @@ differ by the polls only) and zombie's x86-64 lib suite and clippy. Found on the
 linked-scan region (`plan_linked_scan`) does not fire on main, even for its own test's loop,
 which a general region takes instead.
 
+### W3 item 3: the closure entry (census and design, 2026-10-28; decided, Decisions 20 and 21)
+
+Item 3, as the stage's design has it: a callee that needs an environment builds it in its prologue,
+as V8's do; bindings become 8-byte slots; such callees and `arguments.length`-only or
+lazy-`arguments` bodies take the direct sequence. This note sizes that, and records the design
+the owner decided on its questions (Decisions 20 and 21).
+
+Method. The census was measured on 20d78544 (76b05c41's code), and the citations are to its tree.
+Main is now 6e3c3ec8, whose code differs by Decision 11's safepoint poll (d4c51376..d14387e3):
+its counts, re-measured by the same method on both architectures, follow the census where they
+moved, and the predicted gains are against them. A fat-LTO engine from a `git archive` export
+into a fresh target dir (rustc 1.99.1), on Crystal: `perf stat -e instructions:u`, perf and the
+engine pinned to the A725 cores (`taskset -c 10-13`), `TRUST_JS_GC_PACING=0`, `--tier=jit`.
+Per-call costs by the W3 census's method (a loop in a function, warmed, at 200,000 and 1,200,000
+iterations; the engine's 14-instruction loop removed, Sparkplug-only Node's 99), with the census's
+cases and eleven more (micro.py); every output agrees with Node's, and repeat runs agree within 3
+instructions an iteration. Profiles: `TRUST_JS_PERF_MAP=1`, `perf record -e instructions:u
+-c 400000 --call-graph fp --user-callchains -m 16` on 6M-iteration copies of the cases and on 5-10
+runs of each fixture (Web Tooling's chai, target/p2/ext/cli-chai.js, once at -c 2000000), none
+throttled; split.py and fixenv.py classify the samples (LTO inlines `call_jit_env_committed` into
+`call_jit_committed` and `ActivationPlan::instantiate` into `make_run_env`). A census build of the
+same export (census/instrument.py: counters printed at exit under TRUST_JS_ENV_CENSUS=1; release
+without LTO; counts only) gives activations by shape, the arguments slot's modes, arguments
+objects, prepared entries and derived constructions. x86-64: the same commits built fat-LTO on
+zombie, pinned to CPU 2, median of 3 (counts and fixture profiles; zombie has no Node). All of it
+is in target/p2/w3-item3. Exemplars: V8 at c8b709085e21 (target/p2/w3-design/v8-src, paths from
+its root; the files missing there fetched at that commit), SpiderMonkey at mozilla-firefox/firefox
+6bb811006a50 (paths under js/src, js/public named in full) and JavaScriptCore at WebKit/WebKit
+260278048486 (paths under Source/JavaScriptCore), both main on 2026-10-28. ECMA-262 at e28783d5:
+spec.html is /big/web-standards/repositories/tc39/ecma262/spec.html.
+
+Census
+
+Per call (instructions; Crystal, and the engine on x86-64):
+
+| case | the callee | ARM64 | Sparkplug-only Node | x86-64 |
+| --- | --- | --- | --- | --- |
+| direct-call | `add(s, k)` | 271 | 131 | 967 |
+| closure-call | a closure reading one captured binding | 308 | 129 | 995 |
+| env-call | one captured `var` (`() => t` on a path not taken) | 1,044 | 236 | 1,370 |
+| env-param-call | one captured parameter | 1,047 | 234 | 1,366 |
+| env-let-call | one captured `let` | 1,328 | 239 | 1,667 |
+| env3-call | a captured parameter, `var` and `let` | 1,807 | 297 | 2,361 |
+| env6-call | six captured bindings | 2,580 | 360 | 3,152 |
+| env-this-call | a method whose arrow captures `this` | 1,029 | 327 | 1,601 |
+| env-closure-call | makes that arrow and calls it | 2,083 | 420 | 2,978 |
+| arguments-length | reads only `arguments.length` (chai's `flag`) | 760 | 559 | 845 |
+| arguments-call | `arguments.length + arguments[0]`, no parameters (the call table's case) | 1,702 | 416 | 2,316 |
+| arguments-strict-call | the same, strict, two parameters | 1,703 | 396 | 2,314 |
+| arguments-mapped-call | the same, sloppy, two parameters | 10,284 | 595 | 10,242 |
+| arguments-apply-call | `inner.apply(this, arguments)` | 3,670 | 655 | 4,634 |
+| rest-call | `function rest(...xs) { return xs.length + xs[0]; }` (the call table's) | 1,294 | 415 | 2,117 |
+| class-construct | a base class, no fields (the construct sequence) | 607 | 335 | 1,058 |
+| field-construct | a base class with one field | 3,477 | 564 | 4,154 |
+| derived-default-construct | `class D extends B {}` | 2,913 | 569 | 3,502 |
+| derived-construct | `constructor(x) { super(x); }` | 8,555 | 562 | 9,414 |
+
+Where env-call's instructions go, against closure-call's (split.py; per iteration, the
+14-instruction loop in the first row):
+
+| part | env-call | closure-call |
+| --- | --- | --- |
+| the caller's code: the loop and call template (closure-call: with the in-line direct sequence and finish stub) | 151 | 240 |
+| the callee's code | 72 | 72 |
+| shared stubs (the read of the callee's name) | 26 | 11 |
+| the call-hit helper (`jit_call_hit`) | 185 | 0 |
+| the Rust entry (`call_jit_committed` holding `call_jit_env_committed`, `run_moved_inner`, `JitFrame::release`, `run_pending_tail`, the record's `NativeActivation` drop) | 331 | 0 |
+| the activation (`make_run_env` with `instantiate` 214, the cell's allocation 45, copying the plan's bindings 21) | 280 | 0 |
+| collections | 12 | 0 |
+| total | 1,058 | 322 |
+
+Of the 736 instructions env-call spends beyond a closure call, the Rust entry that stands in for
+the direct sequence takes 516 and the activation 292 (with its collection); the caller's code is
+89 shorter without the in-line sequence. Sparkplug-only Node spends 107 more on env-call than on
+its closure call: a builtin call that allocates and fills the context (below). The other shapes:
+- A captured `let` (env-let-call, 284 more than env-call): `instantiate` records the name in the
+  record's `lexical_names` (bytecode_activation.rs:185-188), a storage block (52) and an atom push
+  (27) per activation, for EvalDeclarationInstantiation's var/let conflict walk (spec.html:30558),
+  which no compiled entry can reach: a body with direct eval is a prepared entry. And
+  `StoreCapInit` has no template on either backend (jit_regions.rs:3924-3944 and
+  jit_x64_names.rs:561-566 serve LoadCap and StoreCap only), so the declaration takes the generic
+  op helper (`jit_exec`, 89).
+- More bindings (env3-call 763 more, env6-call 1,536): past the first, values spill into a storage
+  block (102), which grows (40), and the callee reads its own captured bindings through the name
+  stub (113 for env3's three reads).
+- `arguments.length` alone: the arguments slot holds argc (`Chunk::arguments_count`,
+  bytecode.rs:2637-2639, proven by `lazy_arguments_rewrite`, 8908-8941), so nothing is built, but
+  `needs_env` counts the slot (3638-3640): the call takes the helper and the Rust entry, 498 of
+  its 760.
+- `arguments[i]` (arguments-call): a plain Array of the arguments stands in for the object
+  (`lazy_arguments`, 2632-2636), 503 to make (`make_array` 212, `Object::new_with_parts` 164, a
+  storage block 75, `arguments_slot_value` 52); `arguments[0]` takes the generic op helper
+  (`jit_exec` 125), `lazy_arguments_element` (44) and `fast_get_elem` (39); the entry 557.
+- rest-call: rest callees are kept off the sequence (bytecode.rs:20905); the Rust entry (488)
+  builds the Array (jit.rs:19290-19296; about 390: `make_array_from_raw` 149,
+  `Object::new_with_parts` 135, a storage block 46, the array's length layout and shape 61).
+- arguments-mapped-call: a sloppy body with parameters that reads `arguments[i]` fails the lean
+  compilation ("mapped arguments observed beyond length", bytecode.rs:7762-7766) and runs as a
+  prepared entry: the general FunctionDeclarationInstantiation in Rust, by name (`call_user_inner`
+  418, `VarMap::insert` and `share_layout` 439, text-keyed lookups 324, `bind_pattern` and
+  `pattern_idents` 177), the mapped object (`make_arguments_object` 518, `mapped_arg_name` and
+  `_value` 317) and its address-keyed side-table entry (`gc_pin` 241, the set's insert and rehash
+  501, `gc_evict_dead_owners` 229), allocation (`__rust_alloc` 428, storage blocks 571,
+  `finish_grow` 166), then `jit::run` (214).
+- derived-construct: the derived constructor's Function Environment Record is made by name
+  (`%newtarget%`, `this`, `%supercallok%`, `%superpropok%`, interpreter.rs:13446-13474;
+  `VarMap::insert` 266, `Names::slot_of_text` 498, `AtomTable::recent` 302), its body runs on the
+  bytecode VM by design (13483-13485: `run_vm_inner` 724, `run_inner` 239, `drive_vm` 236), then
+  `super()` and the base construction (`prepare_super_call` and `finish_super_call` 227,
+  `learned_construct_layout` 205, `init_instance_fields` 229, `Object::new_with_parts` 252,
+  `construct_dispatch` 118, `observe_construct_capacity` 105).
+
+The code.
+- `CALL_IC_NEEDS_ENV` (bytecode.rs:1012-1016) is set at fill for every chunk whose
+  `jit_no_activation()` is false (interpreter.rs:15215, 15350; bytecode.rs:20839-20841): an
+  activation (`makes_env`: captured bindings, a captured `this` or `arguments`) or an arguments
+  slot (bytecode.rs:3632-3640); prepared entries are never cached (interpreter.rs:15343-15344).
+  An entry with the bit clears bits 0-3, so the ARM64 sequence's first gate routes it to
+  `jit_call_hit`, then `call_jit_env_committed` (interpreter.rs:13842) and `run_moved_env`
+  (jit.rs:19201-19234): `make_run_env` (bytecode.rs:3654-3750) runs the chunk's `ActivationPlan`
+  (bytecode_activation.rs:24-212), whose `instantiate` collects the plan's 24-byte bindings into a
+  vector (164), allocates the cell, seeds parameters, records lexical names, makes hoisted
+  closures and a captured `arguments` object, and publishes the layout id (210);
+  `arguments_slot_value` (bytecode.rs:20573-20586) fills the arguments slot; `run_moved_inner`
+  (jit.rs:19246) then enters on a pooled record as the sequence does. On x86-64 every call takes
+  `H_CALL` (jit_x64.rs:1220-1224), and environment callees the same Rust entry.
+- The prepared entry (bytecode.rs:2622-2625): `compile` (6816-6826) retries a body the lean
+  compilation refuses (direct eval, `with`, Annex B or unanalyzable patterns in `CaptureScan`,
+  7147-7166; sloppy `arguments` with non-simple parameters, 7131-7140; mapped arguments beyond
+  `length`) as a chunk whose caller completes FunctionDeclarationInstantiation in Rust
+  (interpreter.rs:15796-15840) and passes the instantiated record, which `make_run_env` returns
+  as it is (bytecode.rs:3655-3657).
+- Derived constructors compile against a record their caller makes (bytecode.rs:6828-6838;
+  interpreter.rs:13439-13510). The construct record (above) lists them, classes with instance
+  elements and constructors outside the sequence's gates (an activation among them) as the
+  helper's cases.
+- The representation (W2b): an environment is a `RefCell<Scope>` (interpreter.rs:2584-2608) in
+  the 96-byte class (2669): a `VarMap` (1520-1528: a names word; `BindingValues`, the first
+  binding in place and the rest in a storage block, 1962-1964; a generation and a layout id), the
+  parent, a `with` object word, three flags and `lexical_names` (2677). Names live apart from
+  values: a kept `ScopeDesc` (1586-1594), the record's own list (1705-1710) or one atom (1736). A
+  `Binding` (2723-2744) is 24 bytes: the value, `mutable`, `initialized` (TDZ), `import_ref`,
+  `imported`, `deletable`, `strict_immutable`.
+- Readers: the callee's own captured bindings go through per-chunk cap caches (bytecode.rs:
+  20346-20403: a layout-id mode that derives the slot, or a pinned pointer and its generation) and
+  their templates (above); free names through `NameIc` (bytecode.rs:239-259) and the shared name
+  stubs (jit.rs:12272-12420; deep chains, jit_names.rs:50-160), which check each record's `with`
+  word and generation or layout id, the slot's bound, then the binding's `initialized` byte (for
+  imports and stores also `imported` and `mutable`), at stride 24 (value.rs:1452-1464,
+  1889-1890; x86-64 jit_x64_names.rs:57-62, 311-317). The tree-walker and the VM use `Binding`'s
+  fields directly at about 400 sites (`Binding::data` 115, `initialized` 86, `vars.get` and
+  `get_mut` 81, `vars.insert` 43, `import_ref` 32, `mutable` 31, `strict_immutable` 10,
+  `deletable` 9).
+- Tracing: `Scope::trace_fields` (interpreter.rs:2644-2664) reports the storage blocks, the
+  lexical names, each binding's value and import, the parent and the `with` word. A record's
+  `env_raw` is not traced (jit.rs:1912-1916): its owners are the entry's Rust frame, the callee
+  object a direct call leaves on the caller's stack, or a `NativeActivation`, whose base is
+  `env_raw` (bytecode.rs:21520-21536).
+- Snapshots encode parser output only (snapshot.rs:8-11), and neither the embed API nor the
+  downstream crates name an environment type: item 3 touches neither.
+
+Main against 20d78544 (per call, both fat LTO, the same method; the census's counts of calls,
+activations and arguments objects do not depend on the poll):
+
+| case | ARM64, 20d78544 | ARM64, main | x86-64, 20d78544 | x86-64, main |
+| --- | --- | --- | --- | --- |
+| direct-call | 271 | 253 | 967 | 960 |
+| closure-call | 308 | 290 | 995 | 988 |
+| env-call | 1,044 | 1,026 | 1,370 | 1,367 |
+| env-let-call | 1,328 | 1,313 | 1,667 | 1,668 |
+| env3-call | 1,807 | 1,794 | 2,361 | 2,367 |
+| env6-call | 2,580 | 2,572 | 3,152 | 3,161 |
+| env-this-call | 1,029 | 1,011 | 1,601 | 1,598 |
+| arguments-length | 760 | 742 | 845 | 838 |
+| arguments-call | 1,702 | 1,691 | 2,316 | 2,325 |
+| arguments-strict-call | 1,703 | 1,691 | 2,314 | 2,331 |
+| arguments-mapped-call | 10,284 | 10,300 | 10,242 | 10,284 |
+| rest-call | 1,294 | 1,282 | 2,117 | 2,126 |
+| field-construct | 3,477 | 3,463 | 4,154 | 4,160 |
+| derived-construct | 8,555 | 8,564 | 9,414 | 9,460 |
+
+Every call lost the entry poll's 18 instructions on ARM64 (7 on x86-64), and every allocation
+gained 3 (the allocator's ceiling compare). The fixtures (pinned instructions, main against
+20d78544): Vue 2.255e9 (-0.26%), React 4.644e8 (-1.67%), Djot 7.681e8 (-0.55%), chai 1.0617e11
+(-0.29%); x86-64 Vue +0.06%, React -0.35%, Djot +0.06%. The shares below are 20d78544's.
+
+Fixture shares. Counts (census build; "helper" = the call-hit helper):
+
+| | activations made by compiled entries | through the helper | arguments slot: count / list / object | mapped arguments objects | tree-walked instantiations |
+| --- | --- | --- | --- | --- | --- |
+| Vue | 23,765: 23,757 one captured `let`, 8 three parameters | 23,732 | none | 1 | 487 |
+| React | 4,480, one captured parameter each | 0 | none | 0 | 50 |
+| Djot | 243: 237 a captured `this`, 3 three lexicals, 3 twenty-one bindings | 208 | none | 0 | 1,003 |
+| chai | 2,993,606: one binding 2,779,353 (2,711,448 a parameter), two 75,632, three 12,201, four 3,336, five 111,475, six to ten 11,609 | 619,207 (with the Rust callers' entries, 5,737,645 in all) | 2,731,249 / 735 / 123,240 | 95,552 (95,504 prepared entries) | 104,170 |
+
+No fixture constructs through a compiled derived constructor; Djot initializes instance fields 55
+times. Shares of each workload's instructions (fixenv.py: a sample counts when its leaf, past
+generic utilities, is environment work; the owner is the nearest frame that names one):
+
+| % | activations (`make_run_env`) | arguments objects and the mapped side table | general instantiation | block records | name reads in Rust | name-load stubs | Rust frame entries (all) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 0.55 | 0.49 | 0.07 | 0.13 | 7.07 | 8.29 | 2.33 |
+| React | 0.36 | 0.14 | 0.46 | 0 | 4.55 | 3.39 | 0.02 |
+| Djot | 0.07 | 0.15 | 0.63 | 0.23 | 2.02 | 2.60 | 0.66 |
+| chai | 1.25 | 0.92 | 0.66 | 0 | 3.33 | 3.01 | 1.55 |
+| Vue, x86-64 | 0.11 | 0.34 | 0.04 | 0.05 | 4.24 | (in line) | 3.95 |
+| React, x86-64 | 0.03 | 0.06 | 0.01 | 0 | 1.18 | (in line) | 8.14 |
+| Djot, x86-64 | 0.05 | 0.09 | 0.21 | 0.11 | 0.98 | (in line) | 3.20 |
+
+- The environment callees are few on the fixtures and many on chai. Vue's are one function
+  (`trigger`, vue.js:4:16562, whose `let u` an arrow on a rare path captures), React's are entered
+  from Rust (native callbacks), Djot's 208 through the helper. chai has 2.73M bodies that read only
+  `arguments.length` (chai's `flag(obj, key, value)`), 3.0M activations, mostly one captured
+  parameter, mostly entered from natives' callbacks, and 95,504 calls of chai's
+  `assert(expr, msg, negateMsg, expected, _actual, showDiff)`, which passes `arguments` on and so
+  runs as a prepared entry with a mapped object.
+- The arguments column on Vue and chai is mostly not objects being made: the generic property
+  paths probe the mapped-arguments side table by address on every read and write that reaches
+  them (interpreter.rs:10146-10150, 10632-10652): Vue 0.36%, chai 0.52%.
+- Name reads dominate the environment work (Vue 15.4%, React 7.9%, Djot 4.6%, chai 6.3%): the
+  stubs' guarded chain walks and, in Rust, `try_binding_getter` (Vue 3.2%), `get_from_chain`,
+  `AtomTable::recent` (the tree-walker's text-to-atom lookups, 0.3-1.4%) and `name_ic_fill`
+  (chai 1.0%). Item 3 changes their binding stride and checks only (below); resolving captured
+  names statically, as the exemplars do, is Decision 21's new item.
+
+What V8, SpiderMonkey and JSC do (baseline tiers: Sparkplug, Baseline, the Baseline JIT):
+
+| | V8 | SpiderMonkey | JSC |
+| --- | --- | --- | --- |
+| who needs a record | scope analysis: `NeedsContext()` is `num_heap_slots() > 0` (src/ast/scopes.h:456) | `needsFunctionEnvironmentObjects` (frontend/Parser.cpp:2072-2074; frontend/SharedContext.h:514) | `needsActivation()`: captured variables, eval or with (parser/Nodes.h:1951) |
+| who makes it | the callee's first bytecode, `CreateFunctionContext` (src/interpreter/bytecode-generator.cc:1728-1733, 8726-8741); Sparkplug calls the builtin `FastNewFunctionContextFunction` (src/baseline/baseline-compiler.cc:2587-2593); Ignition's handler, Maglev and TurboFan allocate in line | the callee's prologue: Baseline allocates in line from a per-script template, calling the VM only when that fails (jit/BaselineCodeGen.cpp:1507-1606; jit/JitScript.cpp:616); the Baseline Interpreter calls the VM | `op_create_lexical_environment` at entry (bytecompiler/BytecodeGenerator.cpp:1444-1446); the Baseline JIT calls an operation (jit/JITOpcodes.cpp:1861); the DFG and FTL allocate in line |
+| what the allocation writes | map, length, ScopeInfo and previous, then every slot undefined (src/builtins/builtins-constructor-gen.cc:381-468) | the template's shape and slots, then the enclosing environment and the callee (BaselineCodeGen.cpp:1566-1581) | the scope and symbol table, then every slot the op's initial value (runtime/JSLexicalEnvironmentInlines.h:43-46) |
+| layout | 4 tagged header words (map, length, ScopeInfo, previous; a fifth, the extension, after sloppy eval), then the slots (src/objects/contexts.h:548-570, 737-739, 756-758); 4-byte slots under pointer compression (src/common/globals.h:586-591) | a NativeObject with two reserved slots, enclosing environment and callee (vm/EnvironmentObject.h:535, 615, 624-625), 8-byte Values, 16 fixed slots then dynamic ones | JSCell, butterfly, next scope, symbol table (32 bytes), then 8-byte slots in line (runtime/JSLexicalEnvironment.h:72-91) |
+| names and modes | ScopeInfo: per slot mode, init flag, maybe-assigned (src/objects/scope-info.tq:101-108) | a Shape built once per scope (vm/Scope.cpp:125-149) | a SymbolTable per function's code (runtime/SymbolTable.h:427) |
+| captured parameters | copied by bytecode after creation, receiver first (bytecode-generator.cc:8749-8769) | copied by bytecode, GetFrameArg then SetAliasedVar (frontend/FunctionEmitter.cpp:371-439); the C++ copy loop went in 2023 (7e3cad0e) | `op_put_to_scope` per captured parameter (BytecodeGenerator.cpp:725-744) |
+| TDZ | the hole, stored when the declaring scope is entered (bytecode-generator.cc:2163-2168); explicit checks | a zero-payload magic Value (js/public/Value.h:343-346); function-level lexicals form their own record, poisoned when made (vm/EnvironmentObject.cpp:1069-1072); a check once per basic block (frontend/BytecodeEmitter.cpp:1603-1633) | the empty JSValue (runtime/JSCJSValue.h:499-502); `op_check_tdz`, lifted after the declaration in the same function (BytecodeGenerator.cpp:3302-3313) |
+| `arguments.length` alone | an object anyway (Ignition and Sparkplug have no special case) | `JSOp::ArgumentsLength`, no object (frontend/Parser.cpp:11092-11101) | `op_argument_count`, no object (bytecompiler/NodesCodegen.cpp:1101-1102) |
+| `arguments` objects | eager in the prologue (bytecode-generator.cc:1778-1781); Sparkplug calls the FastNewSloppy/Strict/RestArguments builtins (baseline-compiler.cc:2622-2636), which allocate in line | eager, a VM call (BaselineCodeGen.cpp:6276); run-time laziness removed in 2021 (bug 1700443) | eager, a C++ operation (JITOpcodes.cpp:1864-1891); the FTL eliminates them (dfg/DFGArgumentsEliminationPhase.cpp) |
+| mapped arguments and captured parameters | every parameter is forced into the context, and the map holds context slot numbers (src/ast/scopes.cc:2654-2690; src/objects/arguments.tq:29-33, upstream) | captured formals are forwarded to their CallObject slot (vm/ArgumentsObject.cpp:82-87) | ScopedArguments read the activation through a table (runtime/ScopedArguments.h:97-100); without a captured parameter, DirectArguments are the parameters' storage |
+| rest | the FastNewRestArguments builtin | an IC whose fallback allocates in C++ (BaselineCodeGen.cpp:6284-6295) | `op_create_rest`, a slow path (jit/JIT.cpp:270) |
+| sloppy eval | every binding of the scope and its parents in contexts; eval's vars in the extension slot's object; outer reads `LdaLookupContextSlot` with extension checks (src/ast/scopes.cc:2630; src/interpreter/interpreter-generator.cc:424-453) | every binding in environment objects; eval's vars as properties of the var object (vm/EnvironmentObject.cpp:4040); outer reads dynamic | every variable captured; eval's vars as properties of the activation; a var-injection watchpoint (interpreter/Interpreter.cpp:1501-1531) |
+| `with` | a with context; names inside dynamic (bytecode-generator.cc:8784-8785) | WithEnvironmentObject; names dynamic; Warp declines the script | JSWithScope through a slow path; names dynamic |
+| a derived constructor's `this` | the hole until `super()` returns, in a context slot when an arrow captures it (src/ast/scopes.cc:819-825; bytecode-generator.cc:7251) | the TDZ magic in `.this` (jit/BaselineCacheIRCompiler.cpp:3203-3204; frontend/BytecodeEmitter.cpp:2284-2327) | the empty value (BytecodeGenerator.cpp:922-923; NodesCodegen.cpp:1400-1411) |
+| instance fields | an initializer function, called at a base constructor's start or after `super()` (bytecode-generator.cc:1827-1830, 7285-7288) | `.initializers`, called likewise (frontend/FunctionEmitter.cpp:356-358; BytecodeEmitter.cpp:11151-11184) | the field initializer, called likewise (BytecodeGenerator.cpp:916-920, 3256-3259) |
+| the argument count | passed in a register on every call (InvokeFunctionCode, src/codegen/arm64/macro-assembler-arm64.cc:2884-2916; Sparkplug's prologue takes it, src/codegen/interface-descriptors-inl.h:462-470) | in every frame, whence `JSOp::ArgumentsLength` loads it (BaselineCodeGen.cpp:4701) | in every frame header, whence `op_argument_count` reads it (jit/JITOpcodes.cpp:2002-2010) |
+
+Three points carry over to TRust. Every engine makes the record in the callee, from a static
+descriptor: Sparkplug and JSC's Baseline JIT by a call, SpiderMonkey's Baseline in line since 2023
+(6f790d09: most of Speedometer's calls to the VM's InitFunctionEnvironmentObjects came from
+Baseline code; a micro-benchmark went from 55 to 23 ms with `--no-ion`). So any caller reaches it
+through its ordinary call. TDZ is a word no language value can be, never a flag. And no baseline
+tier elides an arguments object beyond a lone `arguments.length` (SpiderMonkey and JSC; V8 not
+even that): their optimizing tiers do the rest (TurboFan reads elements from the frame, JSC's FTL
+eliminates the objects), and TRust JS has one native tier, so it does that work there (20e).
+
+Design (Decisions 20 and 21)
+
+The environment record. A binding is one 8-byte word in its record: its value, or `Value::Empty`
+while a `let`, `const`, `class` or a derived constructor's `this` is uninitialized (the word local
+slots already use for TDZ, bytecode.rs:16513). The static attributes (mutable, strict, lexical at
+this level, deletable, import) live with the names: a kept descriptor's per-name byte, the
+record's own list beside its atoms, or two spare alignment bits of the one-name word (immutable,
+strict; a single deletable or imported binding takes an own list). An import keeps its
+(environment, name) in its record's own list, its slot holding the empty word. A descriptor's
+address is the layout identity name caches compare (kept for its heap's life, so never reused
+under a cache), which retires `layout_id`; `lexical_names` goes, its use being the lexical
+attribute. Every binding is in line, in a cell its descriptor sizes (20b), as V8's contexts,
+SpiderMonkey's CallObjects and JSC's lexical environments are:
+
+| bytes | field |
+| --- | --- |
+| 0-7 | the RefCell's borrow flag |
+| 8-15 | names: a kept descriptor, the record's own list, or one name with its attributes (tagged) |
+| 16-23 | parent |
+| 24-31 | the `with` object word (empty unless a `with` record) |
+| 32-39 | slot count and capacity (0: the slots are in line) |
+| 40-47 | generation (own lists' structural changes), `under_with`, `var_boundary`, `catch_param` |
+| 48- | the slots, one word each |
+
+One or two bindings take the 64-byte class (96 bytes today), three to six the 96-byte class (today
+96 bytes and a block of 24 bytes a binding), seven to ten 128 bytes, up to 506 the 4,096-byte
+class. A record that outgrows its cell (a sloppy eval's `var`, a tree-walked record's later
+insert) moves its slots into a storage block and leaves its in-line words unused, as `InlineVec`
+does today (inline_vec.rs:3-7); the collector reads the count from the header. chai's five-binding
+activations (111,475) take one 96-byte cell where they take 96 bytes and a 120-byte block today.
+
+Steps, each landing and gated on its own (the lib suite, pacing, GC stress on the environment,
+closure, arguments, eval and construct tests, the fixtures and difftest as the base's, Test262
+identical, zombie's x86-64 lib suite and clippy; the dumps differ only as each says):
+
+1. The callee makes its environment and the arguments it needs, on today's representation (20a,
+   20d, 20e); `CALL_IC_NEEDS_ENV` retires.
+   - The count. Every ARM64 call site passes the argument count in w1, one `movz` (20d). The
+     arguments are the caller's top argc words under x20 until it pops them (jit.rs:8504-8507,
+     8678-8681), and every prologue already saves the caller's x20 (4080), so a prologue that needs
+     the arguments finds them from that word. Rust entries pass the count flagged (bit 31) and the
+     arguments' address as the code's second and third arguments; on x86-64, whose calls all enter
+     from Rust, the prologue takes both from its argument registers. A prologue that needs them
+     keeps them in two new words of its frame record.
+   - The environment. The prologue of a non-resumable chunk that makes an activation calls a lean
+     helper after its entry poll (jit.rs:4112-4114, the frame's first safepoint), as Sparkplug's
+     first bytecode calls FastNewFunctionContext. The helper runs the chunk's plan with the
+     closure's environment (`env_raw`) as parent, captured parameters copied from the arguments
+     (20c), `this` from `this_word`, hoisted closures over the new environment, then sets
+     `env_parent_raw = env_raw` and `env_raw` to it. It reaches no safepoint and collects nothing,
+     so every word is initialized before the next safepoint; the frame record's trace reports
+     `env_raw`, which the record now owns.
+   - `arguments` and rest (20e). Where a compile-time proof shows that every use of `arguments` or
+     of a rest parameter is a `length` or element read (`lazy_arguments_rewrite`'s,
+     bytecode.rs:8908-8941, extended to rest and to sloppy bodies with parameters: never stored,
+     passed, called, captured, written or deleted, in a body that is not resumable), no object or
+     Array exists at run time. `length` is the count (for rest, the count less the formals, at
+     least 0). `arguments[k]`, k an integer index below the count, reads formal k's slot when k is
+     a formal's index: in sloppy code that is the mapped alias (MakeArgGetter, spec.html:
+     15130-15148), and in strict code it holds the argument while the body never assigns that
+     formal (otherwise the k-th argument word). Past the formals it reads the k-th argument word;
+     `rest[k]` reads argument word n_params + k. An index at or past the count is undefined while
+     the no-elements protector holds (interpreter.rs:3658-3665: `Array.prototype` and
+     `Object.prototype`, where the [[Get]] would go, have no index keys). Any other key, or a lapsed
+     protector, materializes the exact object this body would have made into its slot, and every
+     later read takes it. A sloppy body with parameters whose `arguments` the proof covers leaves
+     the prepared entry. Elsewhere the prologue fills the slot as the Rust entries do today: a count
+     body stores the count as a Number (three instructions); an object body (unmapped, or sloppy
+     without parameters) and a rest parameter the proof does not cover get theirs from the helper,
+     made from the arguments.
+   - What goes. The Rust entries (`jit::run`, `run_moved_inner`, `run_moved_oversized`) stop
+     building environments, rest Arrays and arguments values, and pass the count and arguments
+     instead; `run_moved_env` and `call_jit_env_committed` go; `jit_direct_flags` stops refusing
+     rest callees (bytecode.rs:20905). Prepared entries are never cached (interpreter.rs:
+     15343-15344), so once activation and arguments-slot callees enter like any other nothing sets
+     `CALL_IC_NEEDS_ENV`, and the bit goes. The ARM64 call and construct sequences admit these
+     callees with no change but the count. The VM keeps building environments in Rust through the
+     same plan, with its own access to the arguments; borrowed entries resume in a frame that has
+     its environment. x86-64's prologue calls the same helper.
+   Dumps: every ARM64 call site (the count), the prologues of chunks with an environment, an
+   arguments mode or rest, the elided reads, the helper table, the frame record's two words.
+2. Binding accessors. Every reader and writer of a binding's fields moves behind `VarMap` methods
+   (value or TDZ, attributes, initialize, set), so that the representation changes in one place.
+   No behaviour or dump changes.
+3. Attributes with the names. `mutable`, `strict_immutable`, `deletable`, `imported` and the
+   import's target leave `Binding` for the names, and `lexical_names` goes. Copy on write stays the
+   rule: a sloppy eval's `var` (spec.html:30667) or a `delete` gives the record its own list,
+   bumping the generation; a kept descriptor never changes. The name stubs check attributes when a
+   cache fills (a store into an immutable binding, an import, keep the helper) and drop the
+   `mutable` and `imported` loads from the hit path. Dumps: binding stride 16, the stubs' hit paths.
+4. TDZ as the empty word, 8-byte bindings, the records above (20b). `initialized` goes: a read
+   compares the word with the empty word (two or three instructions where a byte load and a test
+   were); InitializeBinding stores the value; `typeof` of a binding in TDZ still throws. Records
+   are allocated at their descriptor's size; the tree-walker's records, the VM's block records and
+   module records take the same layout. Cached binding pointers (cap caches, `BindingGetterCache`,
+   the name caches' pointer mode) become slot pointers, validated by generation, which a spill
+   bumps. `trace_fields` reports the slots, in line or spilled, the own lists with their imports
+   and the spill block. Dumps: the slot stride and offsets everywhere, the TDZ compare, the
+   record's field offsets.
+5. Fixed slots, generated stores, TDZ checks per basic block (20c, 20g). In a chunk without
+   bridge-op state (`jit_needs_activation_state`, which block records, `with` or eval would need),
+   the record's shape is fixed for the call: no direct eval can reach it (such bodies are prepared
+   entries) and nested functions' evals hoist into their own records. So LoadCap, StoreCap,
+   StoreCapInit (now with a template) and UpdateCap load and store at a fixed offset from
+   `env_raw`, storing with the card mark (as `store_cap_ic` does, bytecode.rs:20437-20442), on both
+   backends; the chunk's cap caches go. The helper only allocates and fills the header and template
+   words, and the prologue's generated stores copy the captured parameters from their slots, as all
+   three exemplars copy them. A read of the function's own captured lexical checks the empty word
+   once in each basic block (SpiderMonkey's frontend/BytecodeEmitter.cpp:1603-1633); inner
+   functions keep their checks. Dumps: the cap templates, the prologues.
+6. Mapped arguments alias environment slots, and the side table goes (20f). A sloppy body with
+   simple parameters whose `arguments` the proof does not cover keeps its parameters in its
+   environment, and its arguments object holds that environment and, per mapped index, a slot
+   number (V8's SloppyArgumentsElements, JSC's ScopedArguments): `arguments[i]` and the parameter
+   share one word, as MakeArgGetter and MakeArgSetter alias them (spec.html:15130-15168), and a
+   define or a delete unmaps the index (14960-14992, 15039). The map lives in the object (W2g's
+   pattern): the address-keyed side table and its probe on the generic get and set paths
+   (interpreter.rs:10146-10150, 10632-10652) go, and such bodies leave the prepared entry.
+7. (W2e) In-line allocation of the record in the prologue: cursor take, header and template words,
+   as SpiderMonkey's Baseline does.
+
+Outside item 3. Derived constructors and instance elements become a series of their own, after
+item 1b's full form puts new.target in the frame record (20h). The design drafted for them here
+stands as its starting point: the derived record from a descriptor, `this` the empty word until
+`super()` returns; the chunk as machine code (today it stays on the VM, interpreter.rs:
+13483-13485); the construct sequence without allocating `this` (spec.html:14013-14014), its
+finish per 14028-14033; `super(...)` through the construct sequence with the caller's new.target,
+whose `prototype` the lean `this` allocation must read (19977-19982), then BindThisValue
+(11277-11293) and InitializeInstanceElements (19988); a class's field definitions as an
+initializer chunk called with the instance as `this`, as all three exemplars call an initializer
+function. Captured names read by nested closures resolve statically, as (hops, slot) with guards
+only under sloppy direct eval and `with`: a new item after the representation change
+(Decision 21).
+
+Predicted gains (against main 6e3c3ec8)
+
+Per call (ARM64 unless marked; instructions, loop excluded):
+
+| case | main | after step 1 | after steps 2-5 | after step 7 (W2e) | Sparkplug-only Node |
+| --- | --- | --- | --- | --- | --- |
+| env-call | 1,026 | ~600 | ~380 | ~320 | 236 |
+| env-let-call | 1,313 | ~870 | ~380 | ~320 | 239 |
+| env3-call | 1,794 | ~1,280 | ~400 | ~340 | 297 |
+| env6-call | 2,572 | ~2,060 | ~440 | ~370 | 360 |
+| env-this-call | 1,011 | ~600 | ~440 | ~380 | 327 |
+| arguments-length | 742 | ~265 | ~265 | ~265 | 559 |
+| arguments-call | 1,691 | ~280 | ~280 | ~280 | 416 |
+| arguments-strict-call | 1,691 | ~285 | ~285 | ~285 | 396 |
+| arguments-mapped-call | 10,300 | ~285 | ~285 | ~285 | 595 |
+| rest-call | 1,282 | ~280 | ~280 | ~280 | 415 |
+| env-call, x86-64 | 1,367 | ~1,320 | ~1,100 | | |
+| arguments-call, x86-64 | 2,325 | ~1,050 | ~1,050 | | |
+| rest-call, x86-64 | 2,126 | ~1,050 | ~1,050 | | |
+
+The decisions' extra margin over the draft (which predicted against 20d78544): Q4's elision takes
+rest-call to ~280 where the draft's helper-built Array left ~900, arguments-call to ~280 from ~330,
+and puts the read-only sloppy body of arguments-mapped-call (10,300 today, a prepared entry) on the
+same path; Q1's in-line records take env3-call to ~400 from ~520 and env6-call to ~440, the spill
+block's 100-140 instructions gone; the poll series took 18 off every call. Per iteration against
+Sparkplug-only Node, which the call table's times track (the W3 census): `arguments` and rest
+0.57x after step 1 (the stage's exit: within 2x; main 3.31x and 2.52x), an environment callee
+1.18x after step 5 (main 3.10x). Every other ARM64 call pays step 1's `movz`. Step 6 takes an
+escaping mapped object (chai's `assert`) from about 10,000 instructions a call to ~1,200.
+
+Fixtures (pinned instructions against main):
+
+| | step 1 | steps 2-5 | total | step 6 |
+| --- | --- | --- | --- | --- |
+| Vue | -0.44% (23,732 entries at ~430, less the `movz`) | -0.43% (23,765 activations at ~410: the `let`'s block and `jit_exec`, the build, the cap caches) | -0.9% | -0.36% (the side table's probe) |
+| React | +0.10% (the `movz` at each of its 448,177 direct calls, the W3 census's count) | -0.21% (4,480 activations at ~220) | -0.1% | 0 |
+| Djot | ~0 | ~0 | ~0 | 0 |
+| chai | -1.46% (2.73M count entries at ~475, 619,207 activations at ~430, less the `movz`) | -0.62% (3.0M activations at ~220) | -2.1% | -1.3% (95,504 prepared entries at ~8,500, 0.76%; the probe, 0.52%) |
+
+Against the plan's prediction for item 3 (chai 1.3%, Vue 0.7%, React ~0.5%): chai gains more (its
+count-mode bodies), React less (its activations come from Rust callers, whose entries stay). Not
+counted: the name stubs' cheaper hit paths (steps 3-4), measured at those steps, and the
+collector's work, which falls with the bytes (a one-binding record from 96 to 64 bytes; chai makes
+3.0M records).
+
+Risks
+
+Semantic, with the clauses they touch (spec.html at e28783d5):
+- FunctionDeclarationInstantiation (14247-14391): the prologue must make what it makes in the
+  algorithm's order: parameter bindings (14302-14308), then the arguments object (14309-14321),
+  then the parameters' values (14330; with duplicate names the last wins, as the plan's
+  `slot(..., replace)` does), vars as undefined (14331-14341), lexicals uninitialized
+  (14376-14383), hoisted functions last, closing over the new environment (14385-14388). A
+  non-strict function's separate lexical record (14373-14374) is observable only through a direct
+  eval's conflict walk (30558), which a compiled entry never runs; prepared entries keep the
+  lexical attribute for it.
+- TDZ (InitializeBinding 10828-10848, SetMutableBinding 10850-10886, GetBindingValue
+  10887-10905): the empty word must never leave a slot as a value; every read path tests it (the
+  stubs, the fixed slots, the tree-walker, `typeof`, reflection), and step 5's per-block elision
+  holds only where the block's earlier check dominates the read; a derived constructor's `this` is
+  the same word (BindThisValue 11277-11293).
+- The elided objects (CreateUnmappedArgumentsObject 15059-15082, CreateMappedArgumentsObject
+  15083-15168): the proof must see every use on the final operation stream; the argument words
+  must stay unchanged for the call (the caller's operand stack under its top, the Rust entries'
+  slices) and be read only while the frame runs, so a resumable body keeps its object; in strict
+  code a formal the body assigns must read the argument, not its slot; an out-of-range read's
+  undefined holds only under the protector; and a materialization must come before any author code
+  (a getter on the prototype) can see the object, after which every read takes the object. Step 6
+  must keep the map's aliasing exact through defineProperty, delete and freezing (14960-14992,
+  15039-15058).
+- Direct eval (PerformEval 30442-30535, EvalDeclarationInstantiation 30536-30671): bodies with
+  direct eval stay prepared; their records take own lists with the deletable attribute; a deleted
+  binding (DeleteBinding 10908) and SetMutableBinding's missing-binding step (10866-10870) must
+  keep working once attributes leave `Binding`; a kept descriptor must never change in place, or
+  every activation of the function would see another's eval.
+- `with` (Object Environment Records, 10974-11040): unchanged; records under `with` keep the
+  tree-walker, and the stubs keep testing each record's `with` word.
+- OrdinaryCallBindThis (13887-13918) for a captured `this`: sloppy callees with non-object
+  receivers keep the sequence's receiver gate (`CALL_IC_DIRECT_READY`).
+
+Implementation:
+- The collector: a prologue's environment is reachable only through the frame record's `env_raw`
+  until a closure takes it, so the frame record's trace must report it (step 1), and the helper
+  must reach no safepoint. Records sized by their descriptor (step 4): the trace and the marker
+  read the count from the header, and a spill must set the count and capacity before the next
+  safepoint.
+- About 400 sites move in step 2; the tree-walker's records, module imports and the global
+  declarative record are the cases with own lists.
+- Cached binding pointers become slot pointers, which a spill moves: the generation must bump on
+  every spill, as on every structural change today.
+- Generators and async functions keep Rust-made records (their coroutine owns them); the prologue
+  step is not emitted for resumable chunks.
+- Every ARM64 call site grows by one instruction (20d).
+
+Decided (Decision 20; the exemplars' answers kept)
+
+Q1. The environment record keeps every binding in line, in a cell its descriptor sizes (20b), not
+the draft's 64-byte record with two slots in place. [All three in line: V8's contexts,
+SpiderMonkey's fixed slots (16, then dynamic), JSC's variables after a 32-byte header.]
+Q2. Step 1 first, on today's representation; the representation change follows as its own series
+(20a). [No exemplar bearing.]
+Q3. The helper copies captured parameters during step 1, and generated stores take over as soon as
+bindings are fixed slots: step 5, not W2e (20c). [All three copy in bytecode after creation;
+SpiderMonkey removed its C++ copy loop in 2023 for that.]
+Q4. `arguments` and rest arrays are elided where a compile-time proof shows every use is a length
+or element read, with no run-time placeholder: a formal's index reads its parameter slot, an
+out-of-range read goes through the prototype (20e, step 1). [Baselines elide only a lone
+`arguments.length` (SpiderMonkey, JSC); TurboFan reads elements from the frame and JSC's FTL
+eliminates Direct and Cloned arguments and CreateRest; SpiderMonkey removed run-time lazy arguments
+in 2021. The exemplars leave this to their optimizing tiers; TRust JS has one native tier.]
+Q5. Mapped arguments alias environment slots and the side table goes (20f, step 6). [V8 forces the
+parameters into the context and maps context slots; JSC's ScopedArguments read the activation;
+SpiderMonkey forwards captured formals to the CallObject.]
+Q6. TDZ checks on a function's own captured lexicals are elided after the first in each basic
+block; inner functions keep theirs (20g, step 5). [V8 elides per block by a bitmap; SpiderMonkey
+checks once per basic block; JSC lifts the check after the declaration within the function and
+keeps it in inner functions.]
+Q7. Derived constructors and instance elements are a series of their own, after item 1b's full
+form (20h). [All three: `this` is the TDZ word until `super()`, and fields run in an initializer
+function.]
+Q8. Captured names resolve statically, as (hops, slot) with guards only under sloppy direct eval and
+`with`: a new item after the representation change (Decision 21). [All three resolve statically;
+V8 falls back to `LdaLookupContextSlot` with extension checks, JSC to var-injection checks behind
+a watchpoint, SpiderMonkey to dynamic name ops.]
+Q9. Every ARM64 call site passes the argument count, one instruction (20d). [V8 passes it in a
+register on every call; JSC and SpiderMonkey keep it in every frame.]
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
