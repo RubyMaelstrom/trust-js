@@ -6700,9 +6700,9 @@ fn emit_call_inline_marked(
             a.logic_x(2, 10, 9, 16);
             // Probe ALL 4 ways (a stable polymorphic site — e.g. one dispatch
             // loop over a handful of receiver classes — otherwise pays the full
-            // helper on every call that isn't way 1): x12 = entry cursor,
+            // helper on every call that isn't way 1): x12 = the site's first way,
             // w15 = live epoch, x17 = ctx.genv. Way 0, a site's usual callee, is
-            // compared in line; the rest after the template (`l_rest`).
+            // compared in line; the rest in the chunk's shared stub (`emit_call_ways`).
             a.mov_imm64(12, ic0 as u64);
             a.ldr_imm(11, 19, CALL_IC_EPOCH_OFF);
             a.ldr_w_imm(15, 11, 0);
@@ -6712,19 +6712,7 @@ fn emit_call_inline_marked(
             a.ldr_imm(17, 19, 64); // ctx.genv
             let l_rest = a.new_label();
             let l_hit = a.new_label();
-            // Compare the way at x12; the flags end EQ on a match (a mismatch before the
-            // last compare branches to `miss`).
-            let compare_way = |a: &mut asm::Asm, miss: usize| {
-                a.ldur(11, 12, 0); // ic.callee (a `Gc::as_ptr` identity)
-                a.cmp_reg_x(10, 11);
-                a.b_cond(C_NE, miss);
-                a.ldr_w_imm(11, 12, 56); // ic.epoch
-                a.cmp_reg_w(11, 15);
-                a.b_cond(C_NE, miss);
-                a.ldr_imm(11, 12, 32); // ic.global_env
-                a.cmp_reg_x(11, 17);
-            };
-            compare_way(a, l_rest);
+            emit_call_identity_way(a, l_rest);
             a.b_cond(C_NE, l_rest);
             // x15 = the hit way's index, kept live through the direct sequence's
             // NO-MUTATION gate checks (they never touch x15; every route into hit_slow
@@ -6916,62 +6904,17 @@ fn emit_call_inline_marked(
             a.cbnz(1, false, l_unwind);
             a.b(done);
 
-            // ---- the hinted way's function, ways 1.. (w14 = ways left), then the secondary
-            // probes ----
+            // ---- the probe after way 0: the chunk's shared stub, a site reaching it only
+            // after its usual callee misses ----
             a.bind(l_rest);
-            // entry stride (size compile-asserted below the JitCtx asserts)
-            let stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>();
-            // An object callee from here on (the code-keyed tests read its cell); x13 = its
-            // identity, the secondary probes' input.
-            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, slow);
-            a.mov(13, 10);
-            // Another closure of the function in the way of the site's last code-keyed hit
-            // (`CallSite::code_hint`, w6): a site whose callee is made afresh for each pass (a
-            // callback, say) hits here, without the other ways or the secondary probes.
-            let l_ways = a.new_label();
-            if call_code_probe_supported(layout) {
-                a.ldrb_imm(6, 12, crate::bytecode::CALL_SITE_CODE_HINT_OFF as u32);
-                a.movz(16, stride as u32, 0);
-                a.madd(14, 6, 16, 12);
-                emit_call_code_way(a, layout, 14, l_ways);
-                a.mov(12, 14);
-                let code_bit = asm::logical_imm_w(CALL_CODE_HIT).unwrap();
-                a.logic_imm_w(1, 15, 6, code_bit);
-                a.b(l_hit);
-            }
-            a.bind(l_ways);
-            let l_probe = a.new_label();
-            let l_next = a.new_label();
-            let l_primary_hit = a.new_label();
-            a.movz(14, crate::bytecode::CALL_IC_WAYS as u32 - 1, 0);
-            a.bind(l_probe);
-            a.add_imm(12, 12, stride as u32);
-            compare_way(a, l_next);
-            a.b_cond(C_EQ, l_primary_hit);
-            a.bind(l_next);
-            a.sub_imm(14, 14, 1);
-            a.cbnz(14, false, l_probe);
-            // Secondary probes (the engine-wide identity overflow cache, then code-keyed ways):
-            // out of line in the chunk's shared stub. The loop left x12 at the site's last way.
             if shared_stubs_enabled() {
-                a.sub_imm(
-                    12,
-                    12,
-                    ((crate::bytecode::CALL_IC_WAYS - 1) * stride) as u32,
-                );
                 let stub = a.shared_stub(SharedStub::CallSecondary.key());
                 a.bl_label(stub);
                 a.cbz(9, false, slow);
                 a.b(l_hit);
             } else {
-                a.mov_imm64(6, ic0 as u64);
-                emit_call_secondary_probes(a, layout, ilayout, l_hit, slow);
+                emit_call_ways(a, layout, ilayout, l_hit, slow);
             }
-            // w14 = WAYS - index for the way that matched.
-            a.bind(l_primary_hit);
-            a.movz(15, crate::bytecode::CALL_IC_WAYS as u32, 0);
-            a.sub_reg(15, 15, 14);
-            a.b(l_hit);
         }
     }
     a.bind(slow);
@@ -7548,6 +7491,83 @@ fn emit_intrinsic_stub_call(
     a.cmp_imm_w(9, INTRINSIC_DECLINED);
     a.b_cond(C_EQ, hit_slow);
     a.b(l_unwind);
+}
+
+/// Compare the call-cache way at x12 with the callee (x10 = its identity, w15 = the live epoch,
+/// x17 = the active Realm's global scope): the flags end EQ on a match, and a mismatch before
+/// the last compare branches to `miss`. Clobbers x11.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_call_identity_way(a: &mut asm::Asm, miss: usize) {
+    a.ldur(11, 12, 0); // ic.callee (a `Gc::as_ptr` identity)
+    a.cmp_reg_x(10, 11);
+    a.b_cond(C_NE, miss);
+    a.ldr_w_imm(11, 12, 56); // ic.epoch
+    a.cmp_reg_w(11, 15);
+    a.b_cond(C_NE, miss);
+    a.ldr_imm(11, 12, 32); // ic.global_env
+    a.cmp_reg_x(11, 17);
+}
+
+/// The call probe after way 0's identity misses (in the chunk's shared stub, `CallSecondary`):
+/// the callee must be an object from here on, since the code-keyed tests read its cell. Then the
+/// code-keyed test of the way of the site's last code-keyed hit (`CallSite::code_hint`: a site
+/// whose callee is made afresh for each pass, a callback, say, hits there), ways 1.. by
+/// identity, and the secondary probes. Inputs: x9 = the callee's word, x10 = that word EOR the
+/// Object tag, x12 = the site's first way, w15 = the live epoch, x17 = the active Realm's global
+/// scope. A hit branches to `hit` with x12 at the matching entry and x15 = its index (tagged
+/// with `CALL_CODE_HIT` for a code-keyed hit; `CALL_IC_WAYS` for an overflow hit); anything else
+/// branches to `miss`. Clobbers x6, x7, x9, x11, x13, x14 and x16; writes nothing but the hint.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_call_ways(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    hit: usize,
+    miss: usize,
+) {
+    // entry stride (size compile-asserted below the JitCtx asserts)
+    let stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>();
+    // x13 = the callee's identity, the secondary probes' input.
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, miss);
+    a.mov(13, 10);
+    let ways = a.new_label();
+    if call_code_probe_supported(layout) {
+        // w6 = the hinted way's index, x14 = its entry.
+        a.ldrb_imm(6, 12, crate::bytecode::CALL_SITE_CODE_HINT_OFF as u32);
+        a.movz(16, stride as u32, 0);
+        a.madd(14, 6, 16, 12);
+        emit_call_code_way(a, layout, 14, ways);
+        a.mov(12, 14);
+        let code_bit = asm::logical_imm_w(CALL_CODE_HIT).unwrap();
+        a.logic_imm_w(1, 15, 6, code_bit);
+        a.b(hit);
+    }
+    a.bind(ways);
+    // x6 = the site's first way, the secondary probes' input; w14 = ways left.
+    let probe = a.new_label();
+    let next = a.new_label();
+    let primary_hit = a.new_label();
+    a.mov(6, 12);
+    a.movz(14, crate::bytecode::CALL_IC_WAYS as u32 - 1, 0);
+    a.bind(probe);
+    a.add_imm(12, 12, stride as u32);
+    emit_call_identity_way(a, next);
+    a.b_cond(C_EQ, primary_hit);
+    a.bind(next);
+    a.sub_imm(14, 14, 1);
+    a.cbnz(14, false, probe);
+    emit_call_secondary_probes(a, layout, ilayout, hit, miss);
+    // w14 = WAYS - index for the way that matched.
+    a.bind(primary_hit);
+    a.movz(15, crate::bytecode::CALL_IC_WAYS as u32, 0);
+    a.sub_reg(15, 15, 14);
+    a.b(hit);
 }
 
 /// The call site's secondary probes after its primary identity ways miss: the engine-wide
@@ -10711,8 +10731,8 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     PropWays(PropProbeFlags),
-    /// [`emit_call_secondary_probes`]: the call-site probe inputs plus x12 = the site's first
-    /// way → w9 = hit, with x12/x15 set as at the primary hit label.
+    /// [`emit_call_ways`], a call site's probe after way 0's identity misses: its inputs →
+    /// w9 = hit, with x12/x15 set as at the primary hit label.
     #[cfg(all(
         target_arch = "aarch64",
         any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -11100,8 +11120,7 @@ impl SharedStub {
                     .expect("call stubs are requested only by chunk compilation");
                 let hit = a.new_label();
                 let miss = a.new_label();
-                a.mov(6, 12);
-                emit_call_secondary_probes(a, layout, ilayout, hit, miss);
+                emit_call_ways(a, layout, ilayout, hit, miss);
                 a.bind(hit);
                 a.movz(9, 1, 0);
                 a.ret();
