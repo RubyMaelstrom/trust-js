@@ -789,7 +789,7 @@ pub(super) fn emit(
         // Undefined and the actual arguments are the record's (`JitCtx::argc`, `JitCtx::args`).
         // A filled slot (a borrowed frame's, or a materialized object) and every key that is
         // not an in-range array index take the operation's helper (`jit_exec`).
-        Op::ArgLength(slot, ..) | Op::RestLength(slot, ..) if u32::from(*slot) * 8 + 8 < 4096 => {
+        Op::ArgLength(slot, ..) | Op::RestLength(slot, ..) => {
             let skip = if matches!(op, Op::RestLength(..)) {
                 chunk.jit_frame().0 as u32
             } else {
@@ -797,7 +797,7 @@ pub(super) fn emit(
             };
             emit_elided_length(a, *slot, skip, pc as u32, unwind);
         }
-        Op::ArgElem(slot) | Op::RestElem(slot) if u32::from(*slot) * 8 + 8 < 4096 => {
+        Op::ArgElem(slot) | Op::RestElem(slot) => {
             let skip = if matches!(op, Op::RestElem(_)) {
                 chunk.jit_frame().0 as u32
             } else {
@@ -822,12 +822,6 @@ fn emit_elided_slot_check(a: &mut asm::Asm, slot: u16, slow: usize) {
 /// [`Op::ArgLength`] and [`Op::RestLength`]: the actual count less the formals a rest
 /// parameter follows (`skip`, at least 0), pushed as a Number.
 fn emit_elided_length(a: &mut asm::Asm, slot: u16, skip: u32, pc: u32, unwind: usize) {
-    if skip >= 4096 {
-        // More formals than an immediate holds (a rest slot follows them, so the slot bound
-        // excludes this already): the helper.
-        emit_exec(a, pc, unwind);
-        return;
-    }
     let slow = a.new_label();
     let done = a.new_label();
     emit_elided_slot_check(a, slot, slow);
@@ -850,11 +844,6 @@ fn emit_elided_length(a: &mut asm::Asm, slot: u16, skip: u32, pc: u32, unwind: u
 /// with `k + skip` below the count reads argument `k + skip` in place of the key; anything else
 /// (another key, an index past the end, a filled slot) takes the helper.
 fn emit_elided_element(a: &mut asm::Asm, slot: u16, skip: u32, pc: u32, unwind: usize) {
-    if skip >= 4096 {
-        // As in `emit_elided_length`.
-        emit_exec(a, pc, unwind);
-        return;
-    }
     let slow = a.new_label();
     let done = a.new_label();
     emit_elided_slot_check(a, slot, slow);

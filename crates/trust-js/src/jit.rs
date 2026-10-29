@@ -237,6 +237,26 @@ mod poll_tests;
 #[path = "jit_regions.rs"]
 mod regions;
 
+/// ARM64 operands past their instruction's own form that the encoders legalized on this thread
+/// (Decision 23; 0 on other targets).
+#[cfg(test)]
+pub(crate) fn legalized_operands() -> usize {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    {
+        asm::legalized()
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )))]
+    {
+        0
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_local_array_fusion_hits() -> [u64; 5] {
     #[cfg(all(
@@ -4755,14 +4775,7 @@ fn compile_entry(
         if let Some(slot) = chunk.jit_arguments_count_slot() {
             // A body that reads only `arguments.length` keeps the count, a Number, in its slot.
             a.ucvtf_d_w(0, 1);
-            if slot < 4096 {
-                a.str_d_imm(0, 22, u32::from(slot) * 8);
-            } else {
-                // Past the scaled immediate's reach (thousands of formals): index the slot.
-                a.fmov_x_d(10, 0);
-                a.movz(9, u32::from(slot), 0);
-                a.str_x_lsl3(10, 22, 9);
-            }
+            a.str_d_imm(0, 22, u32::from(slot) * 8);
         }
     }
 

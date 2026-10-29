@@ -30788,6 +30788,66 @@ s;
     }
 }
 
+/// Bodies with thousands of slots, read and written past what an ARM64 load's or store's own
+/// form reaches (4,095 slots), in every tier (Decision 23). At the JIT tier the prologue's
+/// `arguments.length` store and the elided `arguments` and rest reads (their slot checks, and a
+/// rest's count and index past 5,000 formals) run as legalized operands; the plain locals take
+/// their templates' helpers. Expected output from Node.
+#[test]
+fn bodies_past_four_thousand_slots_read_and_write_them_in_every_tier() {
+    use crate::bytecode::Tier;
+    let names = |prefix: &str| {
+        (0..5000)
+            .map(|k| format!("{prefix}{k}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let (params, vars) = (names("p"), names("v"));
+    let source = format!(
+        r#"function f({params}) {{ return arguments.length; }}
+function e({params}) {{ "use strict"; return arguments.length + ":" + arguments[1] + ":" + arguments[5001] + ":" + arguments[9999]; }}
+function g({params}, ...rest) {{ return rest.length + ":" + rest[0] + ":" + rest[2] + ":" + rest[3]; }}
+function h() {{ var {vars}; v4999 = 1; v4500 = 2; v100 = 3; for (var i = 0; i < 50; i++) {{ v4999 = v4999 + v4500; v100 += v4999; }} return v4999 + ":" + v100 + ":" + v4998; }}
+var many = [];
+for (var k = 0; k < 5003; k++) many.push(k);
+var s;
+for (var round = 0; round < 40; round++) {{
+  s = [f(1, 2, 3), f.apply(null, many), e(7, 8), e.apply(null, many), g(1, 2), g.apply(null, many), h()].join();
+}}
+s;
+"#
+    );
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            let legalized = crate::jit::legalized_operands();
+            assert_eq!(
+                run_in(&mut engine, &source),
+                "3,5003,2:8:undefined:undefined,5003:1:5001:undefined,\
+                 0:undefined:undefined:undefined,3:5000:5002:undefined,101:2603:undefined",
+                "tier {tier:?} threshold {threshold}"
+            );
+            if matches!(tier, Tier::Jit)
+                && cfg!(all(
+                    target_arch = "aarch64",
+                    any(
+                        target_os = "macos",
+                        target_os = "linux",
+                        target_os = "windows"
+                    )
+                ))
+            {
+                assert!(
+                    crate::jit::legalized_operands() > legalized,
+                    "the compiled bodies legalize their slot operands (threshold {threshold})"
+                );
+            }
+        }
+    }
+}
+
 // ---- Error.prototype.stack source positions (see crate::stack_trace) ----------------------
 //
 // Expected strings come from Node 24 (V8) running the same source as

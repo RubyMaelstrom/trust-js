@@ -39,12 +39,12 @@ pub(super) fn emit_exec_kind(a: &mut asm::Asm, raw: u32, kind: u32, scratch: u32
     a.bind(done);
 }
 
-/// No scratch registers or flags changed. Far-negative addresses need a caller-computed base.
+/// No scratch registers or flags changed, at any offset (the encoders legalize one past their
+/// forms without a scratch register; see `asm::Asm::mem`).
 pub(super) fn emit_exec_word_load(a: &mut asm::Asm, dst: u32, base: u32, off: i32) {
     if off >= 0 && off & 7 == 0 {
         a.ldr_imm(dst, base, off as u32);
     } else {
-        assert!((-256..256).contains(&off));
         a.ldur(dst, base, off);
     }
 }
@@ -53,7 +53,6 @@ pub(super) fn emit_exec_word_store(a: &mut asm::Asm, src: u32, base: u32, off: i
     if off >= 0 && off & 7 == 0 {
         a.str_imm(src, base, off as u32);
     } else {
-        assert!((-256..256).contains(&off));
         a.stur(src, base, off);
     }
 }
@@ -134,7 +133,6 @@ pub(super) fn emit_exec_number_store(
     if off >= 0 && off & 7 == 0 {
         a.str_d_imm(dreg, base, off as u32);
     } else {
-        assert!((-256..256).contains(&off));
         a.stur_d(dreg, base, off);
     }
     a.bind(done);
