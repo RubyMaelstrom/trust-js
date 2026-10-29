@@ -1323,7 +1323,45 @@ pub struct CallSite {
     /// `jit::emit_call_code_probe`), any value below `CALL_IC_WAYS` names a way, and a stale one
     /// costs one failed test.
     pub code_hint: std::cell::Cell<u8>,
+    /// The live ways the site's fills have evicted in the epoch `counted_epoch`, up to
+    /// [`CALL_SITE_MEGAMORPHIC_EVICTIONS`], where the site is megamorphic for good (see
+    /// [`CallSite::fill`]).
+    evictions: std::cell::Cell<u8>,
+    /// The callees a megamorphic site has put in the overflow table in the epoch
+    /// `counted_epoch`, up to [`CALL_SITE_OVERFLOW_ADMISSIONS`] (see
+    /// [`CallSite::admits_overflow`]).
+    admissions: std::cell::Cell<u8>,
+    /// The [`CALL_IC_EPOCH`] whose events `evictions` counts, and `admissions` once the site is
+    /// megamorphic.
+    counted_epoch: std::cell::Cell<u32>,
 }
+
+/// The live ways a call site may evict in one call-cache epoch before it is megamorphic: having
+/// seen four more callees than its ways hold, eight in all, it keeps its ways and stops refilling
+/// them (W3's item 7). V8 marks a call slot megamorphic at its second target that is not a
+/// closure of the first's literal (src/builtins/ic-callable.tq:132-149, kMegamorphicSymbol at
+/// :45-50); SpiderMonkey's ICs go megamorphic after six attached stubs (js/src/jit/ICState.h:
+/// 24-34, MaxOptimizedStubs); JavaScriptCore links up to eight callees before a virtual call
+/// (Source/JavaScriptCore/bytecode/Repatch.cpp:171-184, maxPolymorphicCallVariantListSize). A site
+/// here dispatches through four ways and the engine-wide overflow table, so it waits for its
+/// ways to churn. An epoch's bump stales every way and overflow entry at once, and the refills
+/// after it evict ways filled since: those evictions say nothing of the site's callees, so the
+/// count starts again with each epoch.
+pub(crate) const CALL_SITE_MEGAMORPHIC_EVICTIONS: u8 = 4;
+
+/// The callees a megamorphic call site may put in the engine-wide overflow table in one epoch
+/// (W3's item 7): an eighth of the smallest table. Its other callees still run, through the full
+/// guards, but get no entry: past its ways and this many more, a site meets callees that seldom
+/// repeat (a fresh closure on each call), whose entries would each cost a pin and an insertion
+/// and push other sites' entries out. SpiderMonkey's megamorphic IC attaches generic stubs up to
+/// its limit, then stops attaching (js/src/jit/ICState.h:24-29, MaxOptimizedStubs at :58);
+/// JavaScriptCore links at most eight callees a site, then calls virtually
+/// (Source/JavaScriptCore/bytecode/Repatch.cpp:171-184); V8 caches no target at a megamorphic
+/// slot. TRust's call without an entry takes the full guards, so a site keeps a budget rather
+/// than none, and a large one: Djot's busiest polymorphic site calls 28 functions.
+pub(crate) const CALL_SITE_OVERFLOW_ADMISSIONS: u8 = 64;
+const _: () =
+    assert!(CALL_SITE_OVERFLOW_ADMISSIONS as usize == CALL_OVERFLOW_SETS * CALL_OVERFLOW_WAYS / 8);
 
 /// Byte offset of [`CallSite::code_hint`] from the site's first way.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
@@ -1342,12 +1380,46 @@ impl CallSite {
             func_pins: std::cell::RefCell::new(std::array::from_fn(|_| std::rc::Weak::new())),
             next: std::cell::Cell::new(0),
             code_hint: std::cell::Cell::new(0),
+            evictions: std::cell::Cell::new(0),
+            admissions: std::cell::Cell::new(0),
+            counted_epoch: std::cell::Cell::new(0),
         }
+    }
+    /// Whether the site is megamorphic: its fills have evicted
+    /// [`CALL_SITE_MEGAMORPHIC_EVICTIONS`] live ways in one epoch (V8's megamorphic sentinel), so
+    /// that its ways stay as they are and its other callees go to the engine-wide overflow table.
+    pub fn megamorphic(&self) -> bool {
+        self.evictions.get() >= CALL_SITE_MEGAMORPHIC_EVICTIONS
+    }
+    /// Whether a fill of `callee` at `epoch` would evict a live way of this megamorphic site,
+    /// which [`CallSite::fill`] refuses: the caller records the callee in the overflow table
+    /// instead, and pins it there alone.
+    pub fn refuses(&self, callee: usize, epoch: u32) -> bool {
+        self.megamorphic() && !self.entries.iter().any(|e| e.get().callee == callee) && {
+            let next = self.entries[self.next.get() as usize & 3].get();
+            next.callee != 0 && next.epoch == epoch
+        }
+    }
+    /// Whether this megamorphic site may put one more callee it [refuses](CallSite::refuses)
+    /// in the overflow table in `epoch`, which then counts it (see
+    /// [`CALL_SITE_OVERFLOW_ADMISSIONS`]).
+    pub fn admits_overflow(&self, epoch: u32) -> bool {
+        if self.counted_epoch.get() != epoch {
+            self.counted_epoch.set(epoch);
+            self.admissions.set(0);
+        }
+        let admitted = self.admissions.get();
+        if admitted >= CALL_SITE_OVERFLOW_ADMISSIONS {
+            return false;
+        }
+        self.admissions.set(admitted + 1);
+        true
     }
     /// Record `ic`, replacing an existing way for the same callee (epoch or realm refills must
     /// not fan one callee across ways — the inline planner reads way-count as polymorphism),
     /// else the next way round-robin. Return an occupied eviction so the caller can transfer
-    /// its existing Weak pin into the engine's bounded secondary cache.
+    /// its existing Weak pin into the engine's bounded secondary cache. A megamorphic site
+    /// evicts no live way (see [`CallSite::refuses`]): the fill leaves it unchanged.
     pub fn fill(&self, ic: CallIc, func: Option<&Rc<Function>>) -> Option<CallIc> {
         if ic.epoch == u32::MAX {
             return None;
@@ -1365,6 +1437,23 @@ impl CallSite {
             }
         }
         let k = self.next.get() as usize & 3;
+        let next = self.entries[k].get();
+        if next.callee != 0 && next.epoch == ic.epoch {
+            if self.megamorphic() {
+                return None;
+            }
+            // Count within the epoch (see `CALL_SITE_MEGAMORPHIC_EVICTIONS`); a megamorphic
+            // site, above, stays so.
+            if self.counted_epoch.get() != ic.epoch {
+                self.counted_epoch.set(ic.epoch);
+                self.evictions.set(0);
+            }
+            self.evictions.set(self.evictions.get() + 1);
+            #[cfg(feature = "architecture-diagnostics")]
+            if self.megamorphic() {
+                call_cache_diagnostics::megamorphic();
+            }
+        }
         pins[k] = pin;
         let evicted = self.store(k, ic);
         self.next.set((k as u8 + 1) & 3);
@@ -1708,6 +1797,12 @@ impl CallOverflow {
         self.sets
             .as_ref()
             .map_or(0, |sets| std::mem::size_of_val(&**sets))
+    }
+
+    /// The entries the table holds.
+    #[cfg(test)]
+    pub(crate) fn occupied(&self) -> usize {
+        self.occupied
     }
 }
 
@@ -7300,6 +7395,10 @@ struct CallSeed {
     entries: [CallIc; CALL_IC_WAYS],
     func_pins: [std::rc::Weak<Function>; CALL_IC_WAYS],
     next: u8,
+    /// The site's evictions and their epoch, so that a megamorphic site stays megamorphic in
+    /// recompiled code.
+    evictions: u8,
+    counted_epoch: u32,
     pins: Vec<(usize, CallPin)>,
 }
 
@@ -7373,6 +7472,8 @@ fn call_cache_seeds(chunk: &Chunk) -> Vec<CallSeed> {
                     }
                 }),
                 next: site.next.get(),
+                evictions: site.evictions.get(),
+                counted_epoch: site.counted_epoch.get(),
                 pins: seed_pins,
             })
         })
@@ -8788,6 +8889,10 @@ fn plan_inlines_at(
         if spread_sites[idx] {
             skip!(idx, "spread call (never spliced)")
         }
+        // As V8's optimizing tiers inline no callee at a megamorphic call slot.
+        if site.megamorphic() {
+            skip!(idx, "megamorphic site")
+        }
         let in_loop = outer_in_loop || sites_in_loops[idx];
         let mut filled: Vec<CallIc> = site
             .entries
@@ -10182,11 +10287,12 @@ impl Compiler {
                     seed.entries,
                     seed.func_pins.clone(),
                     seed.next,
+                    (seed.evictions, seed.counted_epoch),
                     seed.pins.clone(),
                 )
             })
         });
-        let site = if let Some((entries, func_pins, next, pins)) = seed {
+        let site = if let Some((entries, func_pins, next, evictions, pins)) = seed {
             for (callee, pin) in pins {
                 self.call_pins.entry(callee).or_insert(pin);
             }
@@ -10195,6 +10301,9 @@ impl Compiler {
                 func_pins: std::cell::RefCell::new(func_pins),
                 next: std::cell::Cell::new(next),
                 code_hint: std::cell::Cell::new(0),
+                evictions: std::cell::Cell::new(evictions.0),
+                admissions: std::cell::Cell::new(0),
+                counted_epoch: std::cell::Cell::new(evictions.1),
             }
         } else {
             CallSite::empty()
@@ -25813,10 +25922,17 @@ unsafe fn jit_call_inner(
                 if let Some((native, signature, engine_native)) = nf {
                     {
                         let key = crate::value::Gc::as_ptr(o) as usize;
+                        let site = &chunk.call_caches[c as usize];
+                        let epoch = CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+                        // A megamorphic site keeps its ways (see `Interp::call_jit_fast`).
+                        let refused = site.refuses(key, epoch);
+                        let megamorphic = refused && site.admits_overflow(epoch);
                         let mut p = chunk.call_pins.borrow_mut();
-                        if p.len() < 4096 || p.contains_key(&key) {
-                            p.entry(key)
-                                .or_insert_with(|| crate::value::Gc::downgrade(o));
+                        if megamorphic || !refused && (p.len() < 4096 || p.contains_key(&key)) {
+                            if !megamorphic {
+                                p.entry(key)
+                                    .or_insert_with(|| crate::value::Gc::downgrade(o));
+                            }
                             if !i
                                 .global_env_pins
                                 .iter()
@@ -25826,34 +25942,33 @@ unsafe fn jit_call_inner(
                                 i.global_env_pins.push(g);
                             }
                             let (builtin, class) = crate::builtins::builtin(native);
-                            let evicted = chunk.call_caches[c as usize].fill(
-                                CallIc {
-                                    callee: key,
-                                    env: std::ptr::null(),
-                                    chunk: std::ptr::null(),
-                                    code: std::ptr::null(),
-                                    global_env: Env::as_ptr(&i.global_env) as usize,
-                                    strict: true,
-                                    uses_this: true,
-                                    n_params: 0,
-                                    n_slots: 0,
-                                    direct: signature, // bit 0 clear: compiled-entry gate uses the helper
-                                    func: std::ptr::null(),
-                                    epoch: CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
-                                    chunk_raw: std::ptr::null(),
-                                    code_mem: std::ptr::null(),
-                                    pc_offs_ptr: std::ptr::null(),
-                                    native,
-                                    // The class its realm's setup declared, and its builtin id,
-                                    // in one lookup (W3's item 7). A scoped native has another
-                                    // signature: no class.
-                                    intrinsic: engine_native.map_or(0, |_| class),
-                                    builtin,
-                                    realm: 0,
-                                },
-                                None,
-                            );
-                            if let Some(evicted) = evicted {
+                            let ic = CallIc {
+                                callee: key,
+                                env: std::ptr::null(),
+                                chunk: std::ptr::null(),
+                                code: std::ptr::null(),
+                                global_env: Env::as_ptr(&i.global_env) as usize,
+                                strict: true,
+                                uses_this: true,
+                                n_params: 0,
+                                n_slots: 0,
+                                direct: signature, // bit 0 clear: compiled-entry gate uses the helper
+                                func: std::ptr::null(),
+                                epoch,
+                                chunk_raw: std::ptr::null(),
+                                code_mem: std::ptr::null(),
+                                pc_offs_ptr: std::ptr::null(),
+                                native,
+                                // The class its realm's setup declared, and its builtin id,
+                                // in one lookup (W3's item 7). A scoped native has another
+                                // signature: no class.
+                                intrinsic: engine_native.map_or(0, |_| class),
+                                builtin,
+                                realm: 0,
+                            };
+                            if megamorphic {
+                                i.call_overflow.insert(ic, crate::value::Gc::downgrade(o));
+                            } else if let Some(evicted) = site.fill(ic, None) {
                                 let pin =
                                     p.get(&evicted.callee).expect("call entry has an ABA pin");
                                 i.call_overflow.insert(evicted, pin.clone());

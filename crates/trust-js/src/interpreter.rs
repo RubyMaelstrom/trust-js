@@ -16712,9 +16712,17 @@ impl Interp {
         // instead of growing the pin list without bound.
         if let Some((cs, pins)) = site {
             let key = Gc::as_ptr(o) as usize;
+            let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+            // A megamorphic site keeps its ways: the callee goes to the overflow table, which
+            // pins it, and never into the chunk's pins, while the site's budget for the epoch
+            // lasts (`CALL_SITE_OVERFLOW_ADMISSIONS`); past it, nothing is recorded.
+            let refused = cs.refuses(key, epoch);
+            let megamorphic = refused && cs.admits_overflow(epoch);
             let mut p = pins.borrow_mut();
-            if p.len() < 4096 || p.contains_key(&key) {
-                p.entry(key).or_insert_with(|| Gc::downgrade(o));
+            if megamorphic || !refused && (p.len() < 4096 || p.contains_key(&key)) {
+                if !megamorphic {
+                    p.entry(key).or_insert_with(|| Gc::downgrade(o));
+                }
                 // Pin the active global scope's address too: the cached same-realm proof
                 // compares it raw, so it must never be recycled while cached (realms already
                 // outlive their caches in practice; this makes it airtight). Fills are rare, so
@@ -16729,41 +16737,39 @@ impl Interp {
                 }
                 let (n_params, n_slots) = chunk.jit_frame();
                 if n_params <= u16::MAX as usize && n_slots <= u16::MAX as usize {
-                    let evicted = cs.fill(
-                        crate::bytecode::CallIc {
-                            callee: key,
-                            env: Env::as_ptr(&env),
-                            chunk: chunk as *const Rc<crate::bytecode::Chunk>,
-                            code: Rc::as_ptr(&code),
-                            global_env: Env::as_ptr(&self.global_env) as usize,
-                            strict: func.is_strict,
-                            uses_this: chunk.needs_frame_this(),
-                            n_params: n_params as u16,
-                            n_slots: n_slots as u16,
-                            direct: chunk.jit_direct_flags(&code)
-                                | (((chunk.inline_attempted.get()
-                                    || func.runtime().code2.get().is_some())
-                                    as u8)
-                                    << 2)
-                                | if func.is_arrow {
-                                    crate::bytecode::CALL_IC_LEXICAL_THIS
-                                } else {
-                                    0
-                                },
-                            func: Rc::as_ptr(&func),
-                            epoch: crate::bytecode::CALL_IC_EPOCH
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                            chunk_raw: Rc::as_ptr(chunk),
-                            code_mem: code.mem_ptr(),
-                            pc_offs_ptr: code.pc_offsets_ptr(),
-                            native: 0,
-                            intrinsic: 0,
-                            builtin: 0,
-                            realm,
-                        },
-                        Some(&func),
-                    );
-                    if let Some(evicted) = evicted {
+                    let ic = crate::bytecode::CallIc {
+                        callee: key,
+                        env: Env::as_ptr(&env),
+                        chunk: chunk as *const Rc<crate::bytecode::Chunk>,
+                        code: Rc::as_ptr(&code),
+                        global_env: Env::as_ptr(&self.global_env) as usize,
+                        strict: func.is_strict,
+                        uses_this: chunk.needs_frame_this(),
+                        n_params: n_params as u16,
+                        n_slots: n_slots as u16,
+                        direct: chunk.jit_direct_flags(&code)
+                            | (((chunk.inline_attempted.get()
+                                || func.runtime().code2.get().is_some())
+                                as u8)
+                                << 2)
+                            | if func.is_arrow {
+                                crate::bytecode::CALL_IC_LEXICAL_THIS
+                            } else {
+                                0
+                            },
+                        func: Rc::as_ptr(&func),
+                        epoch,
+                        chunk_raw: Rc::as_ptr(chunk),
+                        code_mem: code.mem_ptr(),
+                        pc_offs_ptr: code.pc_offsets_ptr(),
+                        native: 0,
+                        intrinsic: 0,
+                        builtin: 0,
+                        realm,
+                    };
+                    if megamorphic {
+                        self.call_overflow.insert(ic, Gc::downgrade(o));
+                    } else if let Some(evicted) = cs.fill(ic, Some(&func)) {
                         let pin = p.get(&evicted.callee).expect("call entry has an ABA pin");
                         self.call_overflow.insert(evicted, pin.clone());
                     }

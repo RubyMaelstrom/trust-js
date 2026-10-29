@@ -5,7 +5,7 @@ use crate::value::Value;
 use crate::value::ValueView;
 use std::{cell::Cell, panic::Location, sync::atomic::Ordering::Relaxed};
 
-thread_local! { static COUNTS: Cell<[u64; 8]> = const { Cell::new([0; 8]) }; }
+thread_local! { static COUNTS: Cell<[u64; 9]> = const { Cell::new([0; 9]) }; }
 fn add(index: usize) {
     COUNTS.with(|counts| {
         let mut c = counts.get();
@@ -36,6 +36,10 @@ pub(super) fn fill(site: &CallSite, incoming: CallIc) {
         add(4);
     }
 }
+/// A call site went megamorphic (see `CallSite::megamorphic`).
+pub(super) fn megamorphic() {
+    add(8);
+}
 pub(crate) fn probe(site: &CallSite, callee: &Value) {
     add(5);
     let ValueView::Obj(callee) = &(callee).view() else {
@@ -56,5 +60,5 @@ pub(crate) fn probe(site: &CallSite, callee: &Value) {
 }
 pub(crate) fn report() {
     let c = COUNTS.with(Cell::get);
-    eprintln!("[call-cache-diagnostic] {{\"scope\":\"cumulative thread\",\"native_retirements\":{},\"inline_publications\":{},\"other_invalidations\":{},\"fills\":{},\"same_callee_stale_refills\":{},\"checked_probes\":{},\"same_callee_current_probes\":{},\"same_callee_stale_probes\":{},\"process_epoch\":{}}}",c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],CALL_IC_EPOCH.load(Relaxed));
+    eprintln!("[call-cache-diagnostic] {{\"scope\":\"cumulative thread\",\"native_retirements\":{},\"inline_publications\":{},\"other_invalidations\":{},\"fills\":{},\"same_callee_stale_refills\":{},\"checked_probes\":{},\"same_callee_current_probes\":{},\"same_callee_stale_probes\":{},\"megamorphic_sites\":{},\"process_epoch\":{}}}",c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],CALL_IC_EPOCH.load(Relaxed));
 }

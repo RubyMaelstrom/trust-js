@@ -165,3 +165,202 @@ run(50) + run(50)"#;
         );
     }
 }
+
+/// Call sites by their callees: `churn` calls fresh closures of ten function literals in turn
+/// (and the ten makers, from another site), `stable` six functions in turn, `wide` twelve.
+const SITES: &str = r#"
+var makers = [];
+for (var q = 0; q < 10; q++) makers.push(new Function('return function (a) { return a + ' + q + '; }'));
+function churn(n) { var s = 0; for (var k = 0; k < n; k++) { var f = makers[k % 10](); s += f(k); } return s; }
+var six = []; for (var q = 0; q < 6; q++) six.push(new Function('a', 'return a * ' + q));
+function stable(n) { var s = 0; for (var k = 0; k < n; k++) s += six[k % 6](k); return s; }
+var twelve = []; for (var q = 0; q < 12; q++) twelve.push(new Function('a', 'return a - ' + q));
+function wide(n) { var s = 0; for (var k = 0; k < n; k++) s += twelve[k % 12](k); return s; }
+[churn(400) + churn(400), stable(400) + stable(400), wide(480) + wide(480)].join()"#;
+
+/// The call sites of the global function `name`'s chunk that went megamorphic, by index.
+fn megamorphic_sites(engine: &mut Engine, name: &str) -> Vec<usize> {
+    let chunk = chunk_of(engine, name);
+    (0..chunk.call_caches.len())
+        .filter(|&site| chunk.call_caches[site].megamorphic())
+        .collect()
+}
+
+#[test]
+fn a_site_whose_callees_churn_goes_megamorphic_and_keeps_its_ways() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        // CALL_IC_EPOCH is process-wide: a test running beside this one that recompiles a
+        // chunk or reclaims code stales every way, and the refills after it evict ways again.
+        // A site counts its evictions within one epoch (see `CallSite::fill`), so which sites
+        // go megamorphic does not depend on such bumps; the pins and the ways are checked on a
+        // run that ended at the epoch it started at.
+        for attempt in 0..200 {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let start = CALL_IC_EPOCH.load(Relaxed);
+            assert_eq!(eval(&mut engine, SITES), "163200,398140,224640", "{tier:?}");
+            #[cfg(all(
+                any(target_arch = "aarch64", target_arch = "x86_64"),
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            if tier == Tier::Jit {
+                // Both of `churn`'s sites see more than eight callees; `wide`'s twelve stay
+                // stable, but its ways churned before the overflow table held them all.
+                assert_eq!(megamorphic_sites(&mut engine, "churn").len(), 2);
+                assert_eq!(megamorphic_sites(&mut engine, "wide").len(), 1);
+                assert!(megamorphic_sites(&mut engine, "stable").is_empty());
+                if CALL_IC_EPOCH.load(Relaxed) != start && attempt < 199 {
+                    continue;
+                }
+                // A megamorphic site pins only the callees its ways held: the others went to
+                // the overflow table, which pins its own.
+                let pins = chunk_of(&mut engine, "churn").call_pins.borrow().len();
+                assert!(pins <= 2 * (CALL_IC_WAYS + usize::from(CALL_SITE_MEGAMORPHIC_EVICTIONS)));
+                // The ways of a megamorphic site are not refilled: more calls leave them as they
+                // were (while the call-cache epoch stays).
+                let chunk = chunk_of(&mut engine, "churn");
+                let before: Vec<Vec<usize>> = chunk
+                    .call_caches
+                    .iter()
+                    .map(|site| site.entries.iter().map(|e| e.get().callee).collect())
+                    .collect();
+                let epoch = CALL_IC_EPOCH.load(Relaxed);
+                assert_eq!(eval(&mut engine, "churn(100)"), "5400");
+                if epoch == CALL_IC_EPOCH.load(Relaxed) {
+                    let after: Vec<Vec<usize>> = chunk
+                        .call_caches
+                        .iter()
+                        .map(|site| site.entries.iter().map(|e| e.get().callee).collect())
+                        .collect();
+                    assert_eq!(before, after);
+                }
+            }
+            break;
+        }
+    }
+}
+
+#[test]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn a_stable_site_counts_its_evictions_within_one_epoch() {
+    // Six callees through four ways evict two ways once; each epoch's bump stales the ways and
+    // the overflow table, and the refills evict two again. Counted across epochs, three bumps
+    // would make the site megamorphic; counted within one, it never is.
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    eval(
+        &mut engine,
+        "var six = []; for (var q = 0; q < 6; q++) six.push(new Function('a', 'return a * ' + q));
+         function stable(n) { var s = 0; for (var k = 0; k < n; k++) s += six[k % 6](k); return s; }",
+    );
+    for _ in 0..6 {
+        assert_eq!(eval(&mut engine, "stable(60)"), "4600");
+        crate::bytecode::invalidate_call_caches();
+    }
+    assert!(megamorphic_sites(&mut engine, "stable").is_empty());
+}
+
+#[test]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn a_megamorphic_site_puts_a_budget_of_callees_in_the_overflow_table() {
+    use std::sync::atomic::Ordering::Relaxed;
+    // As in the test above, on a run that ended at the epoch it started at.
+    for attempt in 0..200 {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        let start = CALL_IC_EPOCH.load(Relaxed);
+        assert_eq!(eval(&mut engine, SITES), "163200,398140,224640");
+        let epoch = CALL_IC_EPOCH.load(Relaxed);
+        if epoch != start && attempt < 199 {
+            continue;
+        }
+        // `churn`'s fresh closures never come back: each of its two sites put its evicted ways
+        // and its budget in the table, not one entry for each of its 800 calls. `stable` and
+        // `wide` add at most two and eight.
+        let budget = usize::from(CALL_SITE_MEGAMORPHIC_EVICTIONS + CALL_SITE_OVERFLOW_ADMISSIONS);
+        let occupied = engine.interp.call_overflow.occupied();
+        assert!(
+            occupied <= 2 * budget + 2 + 8,
+            "{occupied} overflow entries"
+        );
+        // `wide`'s twelve callees repeat: its ways and the table hold them all.
+        let chunk = chunk_of(&mut engine, "wide");
+        let site = (0..chunk.call_caches.len())
+            .find(|&site| chunk.call_caches[site].megamorphic())
+            .expect("wide's megamorphic site");
+        let genv = crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize;
+        for q in 0..12 {
+            eval(&mut engine, &format!("var probedCallee = twelve[{q}];"));
+            let env = engine.interp.global_env;
+            let value: Value = engine
+                .interp
+                .get_var("probedCallee", &env)
+                .ok()
+                .expect("bound name");
+            let ValueView::Obj(function) = value.view() else {
+                panic!("twelve[{q}] is not an object")
+            };
+            let key = crate::value::Gc::as_ptr(&function) as usize;
+            let in_ways = chunk.call_caches[site]
+                .entries
+                .iter()
+                .any(|way| way.get().callee == key && way.get().epoch == epoch);
+            assert!(
+                in_ways
+                    || engine
+                        .interp
+                        .call_overflow
+                        .lookup(key, genv, epoch)
+                        .is_some(),
+                "twelve[{q}] is not cached"
+            );
+        }
+        break;
+    }
+}
+
+#[test]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn the_inline_planner_skips_megamorphic_sites_and_recompiles_keep_them() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    assert_eq!(eval(&mut engine, SITES), "163200,398140,224640");
+    let chunk = chunk_of(&mut engine, "wide");
+    let megamorphic = megamorphic_sites(&mut engine, "wide");
+    let env = engine.interp.global_env;
+    let value: Value = engine
+        .interp
+        .get_var("wide", &env)
+        .ok()
+        .expect("bound name");
+    let ValueView::Obj(function) = value.view() else {
+        panic!("wide is not an object")
+    };
+    let (func, realm) = match &function.borrow().call {
+        Callable::User(user) => (std::rc::Rc::clone(&user.func), user.realm),
+        _ => panic!("wide is not a user function"),
+    };
+    let plan = plan_inlines(&chunk, &func, realm, &env);
+    for site in &megamorphic {
+        assert!(!plan.contains_key(&(*site as u32)), "site {site} spliced");
+    }
+    // A recompilation's sites start from the old chunk's (see `call_cache_seeds`).
+    let seeds = call_cache_seeds(&chunk);
+    assert!(seeds
+        .iter()
+        .any(|seed| seed.evictions >= CALL_SITE_MEGAMORPHIC_EVICTIONS));
+}
