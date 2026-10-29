@@ -9059,6 +9059,10 @@ struct Compiler {
     runtime_depth: u16,
     /// Nonzero while compiling code that runs under records not counted (a class's).
     static_blocked: u32,
+    /// Per active splice: its callee's outer context (when its free names may resolve
+    /// statically, from the callee's [[Environment]], `Op::LoadNameIn`) and the records open
+    /// when the splice began.
+    inline_outer: Vec<(Option<Rc<scope_plan::OuterContext>>, u16)>,
     name_seed_stack: Vec<(Vec<NameSeed>, usize)>,
     call_caches: Vec<CallSite>,
     /// See [`Chunk::call_name`]; rolled back with `ops`.
@@ -9867,8 +9871,28 @@ impl Compiler {
     /// record that binds it (`scope_plan`). Names a sloppy direct eval or a `with` could shadow
     /// keep the name caches, the guard.
     fn static_name(&self, name: &str) -> Option<StaticName> {
-        if self.inline_depth > 0 || self.static_blocked > 0 || !self.with_scope_floors.is_empty() {
+        if self.static_blocked > 0 || !self.with_scope_floors.is_empty() {
             return None;
+        }
+        if self.inline_depth > 0 {
+            // A spliced callee's free name resolves from the callee's own [[Environment]]
+            // (`Op::LoadNameIn`): its outer context's address as it is, unless the splice runs
+            // under a record of its own here.
+            let (outer, depth) = self.inline_outer.last()?;
+            if *depth != self.runtime_depth
+                || self
+                    .lexical_env_names
+                    .iter()
+                    .any(|scope| scope.contains_key(name))
+            {
+                return None;
+            }
+            let address = outer.as_ref()?.resolve(name)?;
+            return Some(StaticName {
+                hops: address.hops,
+                slot: address.slot,
+                lexical: address.lexical,
+            });
         }
         // A runtime lexical record of this function binds it, which `home` reports as None.
         if self
@@ -10202,6 +10226,10 @@ impl Compiler {
             self.scope_bind(name, param_slots[k], false);
         }
         self.inline_env_targets.push(t);
+        // Decision 21: the callee's free names may resolve statically from its [[Environment]]
+        // (a direct eval, which could shadow them, never splices: it needs the call's context).
+        self.inline_outer
+            .push((f.outer_context_rc(), self.runtime_depth));
         // The body's operations report the callee's frame: at their own nodes, or at the
         // callee's start for operations outside every positioned node.
         let outer = self.position.0;
@@ -10211,6 +10239,7 @@ impl Compiler {
         let r = self.inline_body(f);
         self.position.0 = saved_position;
         self.inline_frames.pop();
+        self.inline_outer.pop();
         self.inline_env_targets.pop();
         self.call_seed_stack.pop();
         self.name_seed_stack.pop();
@@ -20722,6 +20751,10 @@ impl Chunk {
         let env = self
             .inline_target_env(t)
             .expect("an inline name read runs only after its target's identity guard");
+        // Decision 21: a static address counts from the callee's [[Environment]] here.
+        if let Some(value) = self.static_name_value(i, &env, n, c) {
+            return Ok((Value::Undefined, value));
+        }
         if !for_call {
             return Ok((Value::Undefined, self.load_name_ic(i, &env, n, c)?));
         }

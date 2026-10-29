@@ -168,8 +168,27 @@ pub(super) fn emit(
             emit_static_name_load(
                 a,
                 layout,
+                None,
                 address,
                 matches!(op, Op::LoadNameForCall(..)),
+                pc as u32,
+                unwind,
+            );
+        }
+        Op::LoadNameIn(_, cache, target) | Op::LoadNameForCallIn(_, cache, target)
+            if fast & 8192 != 0
+                && static_name(layout, chunk, *cache).is_some()
+                && chunk.inline_target_env(*target).is_some() =>
+        {
+            // From the pinned callee's [[Environment]], which its identity guard proved.
+            let address = static_name(layout, chunk, *cache).expect("guarded");
+            let env = chunk.inline_target_env(*target).expect("guarded");
+            emit_static_name_load(
+                a,
+                layout,
+                Some(crate::interpreter::Env::as_ptr(&env) as u64),
+                address,
+                matches!(op, Op::LoadNameForCallIn(..)),
                 pc as u32,
                 unwind,
             );
@@ -1010,19 +1029,25 @@ pub(super) fn static_name(
 }
 
 /// LoadName (or LoadNameForCall, `for_call`, with the undefined `this` below the value) at a
-/// static address: `hops` parent links from the running environment, then the slot's word in
-/// place (planned records never spill), tested for TDZ when the binding is lexical. As with
+/// static address: `hops` parent links from `base` (the running environment when `None`), then
+/// the slot's word in place (planned records never spill), tested for TDZ when the binding is
+/// lexical. As with
 /// V8's LdaContextSlot and SpiderMonkey's GetAliasedVar there is no other guard: the address
 /// holds for every closure of the function (`bytecode::scope_plan`).
 pub(super) fn emit_static_name_load(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
+    base: Option<u64>,
     address: crate::bytecode::StaticName,
     for_call: bool,
     pc: u32,
     unwind: usize,
 ) {
-    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    // The running environment, or a spliced callee's [[Environment]] (`Op::LoadNameIn`).
+    match base {
+        Some(env) => a.mov_imm64(9, env),
+        None => a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32),
+    }
     for _ in 0..address.hops {
         a.ldr_imm(9, 9, layout.scope_parent as u32);
     }

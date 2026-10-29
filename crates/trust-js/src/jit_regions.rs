@@ -3902,6 +3902,7 @@ fn emit_effect(
             super::operations::emit_static_name_load(
                 a,
                 layout,
+                None,
                 address,
                 matches!(op, Op::LoadNameForCall(..)),
                 pc_u32,
