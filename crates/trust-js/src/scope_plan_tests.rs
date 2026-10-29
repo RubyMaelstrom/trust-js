@@ -284,3 +284,27 @@ fn generators_and_derived_constructors_keep_their_own_records() {
         "1,1,0|59,30,29",
     );
 }
+
+#[test]
+fn parameter_lists_with_expressions_share_the_activation_when_unobservable() {
+    // Defaults, destructuring with defaults, `this` and `arguments` in defaults, and a rest
+    // parameter make no closure: the parameters move into the planned activation, which the
+    // body's closures read at static addresses in every tier.
+    check(
+        r#"
+        function f(a = 1, b = a + 1) { var c = a + b; return () => a + ':' + b + ':' + c; }
+        function g(a, {p = a, q} = {q: 2}, ...rest) { return () => [a, p, q, rest.length].join(','); }
+        function k(a = this && this.v) { return () => a; }
+        function m(a = arguments.length) { return () => a; }
+        function n(a = 1) { function a2() { return a; } var a = 5; return a2(); }
+        function o(a = 2) { a = a * 3; return () => a; }
+        var out = [];
+        for (var i = 0; i < 30; i++) {
+            out.push([f()(), f(i)(), g(i)(), g(i, {q: 7}, 1, 2)(), k.call({v: i})(),
+                m(undefined, 2, 3)(), n(), o()(), o(i)()].join('|'));
+        }
+        out[0] + ' / ' + out[29];
+        "#,
+        "1:2:3|0:1:1|0,0,2,0|0,0,7,2|0|3|5|6|0 / 1:2:3|29:30:59|29,29,2,0|29,29,7,2|29|3|5|6|87",
+    );
+}

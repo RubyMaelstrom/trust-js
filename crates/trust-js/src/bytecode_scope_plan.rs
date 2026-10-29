@@ -65,15 +65,30 @@ pub(crate) struct FunctionPlan {
     pub(crate) capacity: usize,
     /// Why an opaque plan is (for `TRUST_JS_SCOPE_LOG`).
     pub(crate) why: &'static str,
+    /// The capture analysis the plan came from (which admits eval and `with`), which compiling
+    /// the function reuses.
+    pub(crate) scan: Option<Rc<PlanScan>>,
+}
+
+/// A function's capture analysis (`CaptureScan::run`'s results, with `with`'s presence).
+#[derive(Debug)]
+pub(crate) struct PlanScan {
+    pub(crate) captured: crate::fasthash::FastSet<String>,
+    pub(crate) env_this: bool,
+    pub(crate) homed: Vec<(String, bool)>,
+    pub(crate) runtime: crate::fasthash::FastSet<String>,
+    pub(crate) direct_eval: bool,
+    pub(crate) with: bool,
 }
 
 impl FunctionPlan {
-    fn opaque(why: &'static str) -> Rc<Self> {
+    fn opaque(why: &'static str, scan: Option<Rc<PlanScan>>) -> Rc<Self> {
         Rc::new(Self {
             kind: PlanKind::Opaque,
             prefix: Rc::from(Vec::new()),
             capacity: 0,
             why,
+            scan,
         })
     }
 }
@@ -178,18 +193,26 @@ fn home_record() -> Rc<[PlanBinding]> {
 
 fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
     if !scope_plans_enabled() {
-        return FunctionPlan::opaque("plans off");
+        return FunctionPlan::opaque("plans off", None);
     }
     if function.self_hosted || function.default_ctor {
-        return FunctionPlan::opaque("built-in");
+        return FunctionPlan::opaque("built-in", None);
     }
     let mut scan = CaptureScan::new(function, true);
     scan.children = Some(Vec::new());
-    let Some((captured, env_this, homed, _runtime, direct_eval, scan)) =
+    let Some((captured, env_this, homed, runtime, direct_eval, scan)) =
         CaptureScan::run_scan(scan, function)
     else {
-        return FunctionPlan::opaque("capture analysis");
+        return FunctionPlan::opaque("capture analysis", None);
     };
+    let analysis = Rc::new(PlanScan {
+        captured: captured.clone(),
+        env_this,
+        homed: homed.clone(),
+        runtime,
+        direct_eval,
+        with: scan.saw_with,
+    });
     let opaque = if derived {
         Some("derived constructor")
     } else if crate::interpreter::params_have_expr(&function.params)
@@ -208,7 +231,7 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
     if let Some(why) = opaque {
         // Inner functions keep their own self-name and home records.
         record_children(function, &scan, None, Some(why));
-        return FunctionPlan::opaque(why);
+        return FunctionPlan::opaque(why, Some(analysis));
     }
     // The function-level bindings an inner function can name: its own name (a function
     // expression's) lives in its self-name record instead, outside the activation.
@@ -220,7 +243,7 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
         declared.insert("arguments".to_string());
     }
     if !hoisted_vars(&function.body, true, function.is_strict, &mut declared) {
-        return FunctionPlan::opaque("hoisting");
+        return FunctionPlan::opaque("hoisting", Some(analysis));
     }
     let blocked = crate::interpreter::param_bound_names(&function.params);
     let hoist = crate::interpreter::collect_hoist_ops(&function.body, function.is_strict, &blocked);
@@ -265,12 +288,12 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
         // order, below the record FunctionDeclarationInstantiation made (`Chunk::make_activation`):
         // its closures' records differ between tiers, so their reads keep the name caches.
         record_children(function, &scan, None, Some("coroutine"));
-        return FunctionPlan::opaque("coroutine");
+        return FunctionPlan::opaque("coroutine", Some(analysis));
     } else if public {
         PlanKind::Public
     } else if mapped {
         record_children(function, &scan, None, Some("mapped arguments"));
-        return FunctionPlan::opaque("mapped arguments");
+        return FunctionPlan::opaque("mapped arguments", Some(analysis));
     } else {
         PlanKind::Private
     };
@@ -279,7 +302,7 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
     let capacity = blocked.len() + hoist.len() + lexicals.len() + 8;
     if kind == PlanKind::Public && capacity > crate::interpreter::MAX_INLINE_SLOTS {
         record_children(function, &scan, None, Some("activation too large"));
-        return FunctionPlan::opaque("activation too large");
+        return FunctionPlan::opaque("activation too large", Some(analysis));
     }
     let prefix: Rc<[PlanBinding]> = Rc::from(prefix);
     record_children(
@@ -293,6 +316,7 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
         prefix,
         capacity,
         why: "",
+        scan: Some(analysis),
     })
 }
 

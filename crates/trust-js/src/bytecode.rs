@@ -7482,11 +7482,25 @@ fn compile_inner_mode(
     // env), and whether an inner arrow chain reads `this`. `None` = unanalyzable — bail.
     // Decision 21: the function's plan, which also gives its inner functions their outer
     // contexts, whether or not this compilation succeeds.
-    if !script_body && module_bindings.is_none() {
-        func.scope_plan(derived_constructor);
-    }
+    // Its analysis is this compilation's: the same scan, which saw any eval or `with` this one
+    // would refuse.
+    let planned = (!script_body && module_bindings.is_none())
+        .then(|| func.scope_plan(derived_constructor).scan.clone())
+        .flatten();
+    let allow_dynamic = is_coroutine || prepared_entry || script_body;
+    let analysis = match planned {
+        Some(scan) if allow_dynamic || !(scan.direct_eval || scan.with) => Some((
+            scan.captured.clone(),
+            scan.env_this,
+            scan.homed.clone(),
+            scan.runtime.clone(),
+            scan.direct_eval,
+        )),
+        Some(_) => None,
+        None => CaptureScan::run(func, allow_dynamic),
+    };
     let Some((mut captured, env_this, mut block_lets, mut runtime_lexicals, direct_eval)) =
-        CaptureScan::run(func, is_coroutine || prepared_entry || script_body)
+        analysis
     else {
         let head: String = func
             .source

@@ -15574,6 +15574,9 @@ enum ChainOp {
     KeyNop,
     /// Cached free-name read that must currently hold a Num (the `NameIc` cell address).
     LoadName(usize),
+    /// A free-name read at a static address (Decision 21) that must hold a Num; straight-line
+    /// chains only (loop preambles pin names by their caches).
+    StaticName(crate::bytecode::StaticName),
     /// Monomorphic shape-validated property read whose live value must be a Num. `u32::MAX`
     /// denotes the frame's `this` binding; every other value is a local-slot byte offset.
     /// The IC state is baked only as a guarded lookup recipe: live shapes, bounds, attributes,
@@ -15762,9 +15765,10 @@ fn build_chain(
             Op::Pop if vdepth >= 1 => (ChainOp::Pop, 0, 1),
             Op::Dup if vdepth >= 1 => (ChainOp::Dup, 1, 0),
             Op::ToPropKeyLocal(_) if vdepth >= 1 => (ChainOp::KeyNop, 0, 0),
-            Op::LoadName(_, c) if name_ok => {
-                (ChainOp::LoadName(chunk.jit_name_cache_ptr(*c)), 1, 0)
-            }
+            Op::LoadName(_, c) if name_ok => match operations::static_name(layout, chunk, *c) {
+                Some(address) => (ChainOp::StaticName(address), 1, 0),
+                None => (ChainOp::LoadName(chunk.jit_name_cache_ptr(*c)), 1, 0),
+            },
             Op::GetPropThis(_, c) if prop_ok => {
                 let Some(st) = chunk.jit_cache_preferred(*c) else {
                     break;
@@ -15861,7 +15865,11 @@ fn build_chain(
     while matches!(
         chain.last(),
         Some((
-            ChainOp::ConstNum(_) | ChainOp::Load(_) | ChainOp::LoadName(_) | ChainOp::LoadProp(..),
+            ChainOp::ConstNum(_)
+                | ChainOp::Load(_)
+                | ChainOp::LoadName(_)
+                | ChainOp::StaticName(_)
+                | ChainOp::LoadProp(..),
             _
         ))
     ) {
@@ -15880,6 +15888,7 @@ fn build_chain(
                 ChainOp::ConstNum(_)
                 | ChainOp::Load(_)
                 | ChainOp::LoadName(_)
+                | ChainOp::StaticName(_)
                 | ChainOp::LoadProp(..) => (0, 1),
                 ChainOp::StoreProp(..) => (1, 0),
                 ChainOp::Update(_, k) => (
@@ -15911,6 +15920,7 @@ fn build_chain(
                     ChainOp::ConstNum(_)
                         | ChainOp::Load(_)
                         | ChainOp::LoadName(_)
+                        | ChainOp::StaticName(_)
                         | ChainOp::LoadProp(..)
                 )
             })
@@ -15975,7 +15985,7 @@ fn build_chain(
                 | crate::bytecode::Op::EqEq
                 | crate::bytecode::Op::NotEq => chain
                     .iter()
-                    .any(|(op, _)| matches!(op, ChainOp::LoadName(_))),
+                    .any(|(op, _)| matches!(op, ChainOp::LoadName(_) | ChainOp::StaticName(_))),
                 _ => false,
             },
             _ => false,
@@ -16936,6 +16946,24 @@ fn emit_chain_marked(
                 names::record_name_commit(a, 3);
                 vregs.push((rd, false));
             }
+            ChainOp::StaticName(address) => {
+                // `hops` parent links, then the slot's word (a TDZ binding's empty word fails
+                // the Num guard and replays the read, which throws).
+                a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+                for _ in 0..address.hops {
+                    a.ldr_imm(9, 9, layout.scope_parent as u32);
+                }
+                a.ldr_imm(
+                    9,
+                    9,
+                    (crate::interpreter::RECORD_HEADER + 8 * usize::from(address.slot)) as u32,
+                );
+                let rd = free.pop().expect("chain reg underflow");
+                emit_exec_number_guard(a, 9, rd, 10, guard!());
+                #[cfg(test)]
+                names::record_name_commit(a, 3);
+                vregs.push((rd, false));
+            }
             ChainOp::CmpBranch(neg, target) => {
                 let (rm, _) = vregs.pop().expect("chain vstack");
                 let (rn, _) = vregs.pop().expect("chain vstack");
@@ -17469,8 +17497,8 @@ fn plan_loop(
                 }
                 stack.push(node);
             }
-            ChainOp::LoadProp(..) | ChainOp::StoreProp(..) => {
-                unreachable!("loop discovery never admits property operations")
+            ChainOp::LoadProp(..) | ChainOp::StoreProp(..) | ChainOp::StaticName(_) => {
+                unreachable!("loop discovery admits neither property operations nor static names")
             }
         }
     }
@@ -17578,8 +17606,10 @@ fn plan_loop(
                 ChainOp::Dup => (0, 1),
                 ChainOp::KeyNop => (0, 0),
                 ChainOp::CmpBranch(..) => (2, 0),
-                ChainOp::LoadProp(..) | ChainOp::StoreProp(..) => {
-                    unreachable!("loop discovery never admits property operations")
+                ChainOp::LoadProp(..) | ChainOp::StoreProp(..) | ChainOp::StaticName(_) => {
+                    unreachable!(
+                        "loop discovery admits neither property operations nor static names"
+                    )
                 }
             };
             let mut popped: Vec<usize> = Vec::new();
@@ -18030,8 +18060,10 @@ fn plan_loop(
                         };
                         push!(PushKind::D { iv: inf.iv() }, inf);
                     }
-                    ChainOp::LoadProp(..) | ChainOp::StoreProp(..) => {
-                        unreachable!("loop discovery never admits property operations")
+                    ChainOp::LoadProp(..) | ChainOp::StoreProp(..) | ChainOp::StaticName(_) => {
+                        unreachable!(
+                            "loop discovery admits neither property operations nor static names"
+                        )
                     }
                 }
                 // Operand registers are freed only at op end, so an op needs its start-of-op
@@ -19504,8 +19536,10 @@ fn emit_loop_chain(
                         let iv = matches!(plan.kinds[idx], PushKind::D { iv: true });
                         vstack.push(LV::D(np.dreg, iv));
                     }
-                    ChainOp::LoadProp(..) | ChainOp::StoreProp(..) => {
-                        unreachable!("loop discovery never admits property operations")
+                    ChainOp::LoadProp(..) | ChainOp::StoreProp(..) | ChainOp::StaticName(_) => {
+                        unreachable!(
+                            "loop discovery admits neither property operations nor static names"
+                        )
                     }
                 }
                 if used {
