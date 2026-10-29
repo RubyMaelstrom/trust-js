@@ -591,7 +591,8 @@ does (Order, step 0).
 24. W3 item 3's steps 2-3 (2026-10-29): their minor regressions are accepted as a step toward
     steps 4-6 (benchmarks/README.md's policy). Records made name by name cost arguments-mapped-call
     +2.1% and derived-construct +0.17% on ARM64 (x86-64 +2.0% and +0.96%); steps 4-5 bring them
-    to +1.2% and -0.7%, and step 6 takes the mapped body off the prepared entry.
+    to +1.2% and -0.7%, and step 6 takes the mapped body off the prepared entry. Also accepted,
+    at steps 4-5: derived-default-construct +0.1% and arguments-apply-call +0.2%.
 25. The RegExp compiler's empty-iteration check (ECMA-262 RepeatMatcher, spec.html:38303 at
     e28783d) is emitted only where a loop's body can match empty, as V8
     (regexp-compiler-tonode.cc:2265-2375, `body_can_be_empty`), SpiderMonkey (its imported
@@ -3016,6 +3017,52 @@ with 4,096 or more slots (`arguments.length` read undefined with 5,000 formals);
 an indexed store and a test, and Decision 23 closes the class. And `perf stat ... taskset -c N
 cmd`, taskset inside perf, can add a scaled count from the other core type's PMU (about 80M on
 Djot): taskset goes outside perf.
+
+Steps 2-5's record (1a15e2b4..3290f1f4, 2026-10-29, an agent's; Decisions 20b, 20c, 20g and 24):
+- 1a15e2b4 (step 2): every reader and writer of a binding's fields goes through VarMap's views.
+- c771a7bb, 92bfe73e (step 3): binding attributes live with the names and are checked when a cache
+  fills, so the name stubs' hit paths lose the import byte's load and branch, and stores and
+  updates the mutable byte's (Vue 138 `cbnz` fewer, Djot 578); an own list's attributes sit in its
+  name words, one word an entry.
+- 6ecba8ff (test only): the host buffer test scrubs the stack before its collection: a stale word
+  under the conservative scan had kept its object, on zombie at main too, where it now passes.
+- f7762afb (step 4, 20b): bindings in line in records their descriptors size, a 48-byte header and
+  8-byte slots, TDZ as the empty word.
+- 73667de9 (step 5, 20c and 20g): a fresh frame's LoadCap, StoreCap, StoreCapInit and UpdateCap at
+  fixed offsets from its environment, stores with the card mark, the prologue's generated stores
+  copying captured parameters and `this`, and TDZ checks once a basic block (a parameter's LoadCap
+  from 12 instructions and three stub calls to 4). Not as designed: code entered from a borrowed
+  frame (a function the tree-walker started, which a loop fragment continues) runs in the
+  tree-walker's activation, whose slots lie elsewhere, so it keeps the validating cap caches, and
+  so does the VM. All three exemplars share one environment layout across their tiers; ours
+  belongs with Decision 21's static addressing, which needs it too.
+- 3290f1f4 (step 4's follow-up): step 4 alone made a one-binding activation 77 instructions
+  dearer (a run-time-sized memset to zero the cell, a memcpy of the template, the size class
+  found on every allocation). The plan keeps its size class, the cell is not zeroed (every slot the
+  record counts is written before the next safepoint, as V8 writes a fresh context once,
+  src/heap/factory.cc:1647-1660), small templates are copied with stores, and construction is
+  inlined.
+
+Per call against 50530f50 (ARM64, loop excluded): env-call 669 to 542, env-let-call 956 to 546,
+env3-call 1,436 to 594, env6-call 2,217 to 644, env-this-call 670 to 639; derived-construct -62;
+arguments-mapped-call +128 (+1.2%), derived-default-construct +0.1% and arguments-apply-call +0.2%
+(Decision 24). x86-64: env-call -125, env-let -420, env3 -848, env6 -1,585. Against the design:
+the multi-binding drops as predicted (predicted 490, 880 and 1,620), the one-binding drop 127
+against 220, and every level 160-200 above the predicted ~380-440: main after step 1 sat about 70
+above its estimate, and making an activation still costs about 190 (the helper and its
+allocation), which step 7 (W2e) removes. Fixtures (ARM64): Vue -0.60%, React -0.25%, chai -0.78%,
+Djot -0.03% (predicted -0.43%, -0.21%, -0.62%, ~0); x86-64 Vue -0.41%, React -0.39%, Djot -0.28%.
+Smaller records: React 18 minor collections to 17 (1.40 MB promoted to 1.31 MB); Djot's generated
+code 0.9% smaller.
+
+Validation: the ARM64 gate on d52094b2 (the lib suite, pacing with its known failure only; the
+downstream crates; GC stress on 19 filters, among them activation, binding layout, closure, TDZ,
+arguments, construct, fixed activation, function tiering, OSR and borrowed parameters, and the
+eval tests without the hour-long tail test; the fixtures and difftest as the base's; the dumps
+differing as steps 3-5 say; Test262 identical) and zombie's lib suite and clippy; then the head
+over W5b's 3d (3290f1f4): clippy, the lib suite (2,658, pacing as before), the fixtures,
+difftest and the dumps as d52094b2's, Test262 identical, and zombie's lib suite (2,471, none
+failing) and clippy.
 
 ### Immediates out of an instruction's range (design and record, 2026-10-29; Decision 23)
 
