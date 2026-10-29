@@ -30848,6 +30848,36 @@ s;
     }
 }
 
+/// A `new` past its body's 65,535th operation constructs in every tier: x86-64's dedicated
+/// construct helper takes the pc in the low 16 bits of its operand, under the argument count,
+/// so such a site takes the generic helper (ARM64 keeps bodies that long on the bytecode VM).
+#[test]
+fn constructions_past_operation_65535_construct_in_every_tier() {
+    use crate::bytecode::Tier;
+    // At least two operations a statement (two locals), so the `new` lies past 80,000.
+    let body = "x = y + x; ".repeat(40_000);
+    let source = format!(
+        "function C(v) {{ this.v = v; }}
+function f() {{ var x = 0, y = 1; {body}return new C(x).v; }}
+var s;
+for (var round = 0; round < 3; round++) s = f();
+s;
+"
+    );
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 2] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, &source),
+                "40000",
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}
+
 // ---- Error.prototype.stack source positions (see crate::stack_trace) ----------------------
 //
 // Expected strings come from Node 24 (V8) running the same source as

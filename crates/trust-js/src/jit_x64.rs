@@ -168,12 +168,14 @@ impl Asm {
         self.bytes(&disp.to_le_bytes());
     }
     fn add_sp(&mut self, amount: i8) {
-        self.bytes(&[
-            0x49,
-            0x83,
-            if amount >= 0 { 0xc5 } else { 0xed },
-            amount.unsigned_abs(),
-        ]);
+        // add r13, imm8 / sub r13, imm8. The byte is sign-extended, so -128's magnitude (0x80)
+        // would subtract -128: it is an add of the byte itself.
+        let (opcode, byte) = match amount {
+            i8::MIN => (0xc5, 0x80),
+            0.. => (0xc5, amount as u8),
+            _ => (0xed, amount.unsigned_abs()),
+        };
+        self.bytes(&[0x49, 0x83, opcode, byte]);
     }
     fn mov_word_imm(&mut self, word: u64) {
         self.bytes(&[0x48, 0xb8]);
@@ -1217,6 +1219,9 @@ pub(super) fn compile_entry(
             Op::CallSpread(..) | Op::CallSpreadThis(..) => {
                 a.helper_spflag(H_CALL_SPREAD, pc as u32, unwind)
             }
+            // `jit_new` reads the pc from the low 16 bits of its operand, under the count; a site
+            // past them takes the generic helper, which reads the whole pc (and ends in the poll).
+            Op::New(..) if pc > 0xFFFF => a.helper_spflag(H_EXEC, pc as u32, unwind),
             Op::New(argc, _) => {
                 a.helper_spflag(H_NEW, pc as u32 | ((*argc as u32) << 16), unwind);
                 // A native constructor allocates after the call's last safepoint.
@@ -1427,6 +1432,23 @@ mod encoding_tests {
                 0x41, 0x81, 0xbd, 0xfe, 0xff, 0xff, 0xff, 0xf9, 0xff,
             ]
         );
+    }
+
+    /// `add_sp` over the whole byte: `add r13, imm8` and `sub r13, imm8` sign-extend the byte,
+    /// so -128 is the add of 0x80 (GNU objdump 2.47: `add r13,0xffffffffffffff80`).
+    #[test]
+    fn operand_stack_moves_encode_every_byte() {
+        for (amount, expected) in [
+            (8, [0x49, 0x83, 0xc5, 0x08]),
+            (-8, [0x49, 0x83, 0xed, 0x08]),
+            (127, [0x49, 0x83, 0xc5, 0x7f]),
+            (-127, [0x49, 0x83, 0xed, 0x7f]),
+            (-128, [0x49, 0x83, 0xc5, 0x80]),
+        ] {
+            let mut a = Asm::new();
+            a.add_sp(amount);
+            assert_eq!(a.finish(), expected, "{amount}");
+        }
     }
 }
 
