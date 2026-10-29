@@ -2738,6 +2738,10 @@ mod asm {
         /// The first operand no instruction sequence can encode (see `fail`), with the buffer
         /// length where it was met: the code must not run, and the compile is refused.
         failed: Option<(usize, &'static str)>,
+        /// The code being emitted runs only in activations its chunk's plan made, at fixed slots
+        /// (`Chunk::jit_fixed_activation`): a fresh frame's body and regions. Clear in code a
+        /// borrowed frame enters, whose activation another tier may have made.
+        fixed_activation: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -2763,6 +2767,7 @@ mod asm {
                 end_polls: false,
                 fp_callee_saved: false,
                 failed: None,
+                fixed_activation: false,
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -2828,6 +2833,14 @@ mod asm {
         }
         pub fn stubs_ok(&self) -> bool {
             self.stubs_ok
+        }
+        /// Declare that the code emitted from here on runs only in activations its chunk's plan
+        /// made (see the `fixed_activation` field).
+        pub fn set_fixed_activation(&mut self, fixed: bool) {
+            self.fixed_activation = fixed;
+        }
+        pub fn fixed_activation(&self) -> bool {
+            self.fixed_activation
         }
         pub fn add_string_accumulation(&mut self, pc: u32, slot: u16, exit: usize) {
             self.string_accumulations.push((pc, slot, exit));
@@ -4716,6 +4729,8 @@ fn compile_entry(
     let direct_on = fast & (1 << 20) != 0 && crate::bytecode::direct_shared_context_enabled();
     let mut a = asm::Asm::new();
     a.set_stubs_ok(true);
+    // A borrowed frame's activation may be another tier's, without the plan's fixed slots.
+    a.set_fixed_activation(!borrowed_entry && chunk.jit_fixed_activation());
     // One label per bytecode pc (branch/catch targets bind as we emit).
     let pc_labels: Vec<usize> = (0..ops.len()).map(|_| a.new_label()).collect();
     for pc in 0..ops.len() {
@@ -4804,6 +4819,31 @@ fn compile_entry(
         // by the callee itself as V8's first bytecode, CreateFunctionContext, makes its context
         // (Decision 20a): `bytecode::jit_frame_setup`, whose call ends in the explicit poll.
         emit_op_helper(&mut a, H_FRAME_SETUP, 0, l_unwind);
+        if let Some((parameters, this_slot)) = chunk.jit_prologue_copies() {
+            // A fixed activation's captured parameters and `this`, which the helper left at
+            // their template words: generated stores copy them from the frame's parameter slots
+            // and record, as V8's, SpiderMonkey's and JSC's bytecode copies them after creation
+            // (Decision 20c). The helper's closing poll may have aged the record: one card mark.
+            const _: () = assert!(std::mem::offset_of!(JitCtx, this_word) == 48);
+            a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+            for (slot, parameter) in parameters {
+                a.ldr_imm(10, 22, u32::from(parameter) * 8);
+                a.str_imm(
+                    10,
+                    9,
+                    (crate::interpreter::RECORD_HEADER + 8 * slot as usize) as u32,
+                );
+            }
+            if let Some(slot) = this_slot {
+                a.ldr_imm(10, 19, 48); // ctx.this_word
+                a.str_imm(
+                    10,
+                    9,
+                    (crate::interpreter::RECORD_HEADER + 8 * slot as usize) as u32,
+                );
+            }
+            emit_card_mark(&mut a, 9, 15, 16);
+        }
     }
     if borrowed_entry {
         // The Rust entry validates the bytecode PC and its settled stack before dispatch.

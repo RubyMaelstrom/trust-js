@@ -220,6 +220,29 @@ pub(super) fn emit(
                 unwind,
             );
         }
+        Op::LoadCap(name) if fast & 8192 != 0 && fixed_cap(a, chunk, *name).is_some() => {
+            let (slot, attrs) = fixed_cap(a, chunk, *name).expect("guarded");
+            let tdz = attrs.lexical() && !chunk.jit_cap_initialized(pc);
+            emit_cap_load(a, cap_slot_offset(slot), tdz, pc as u32, unwind);
+        }
+        Op::StoreCap(name) | Op::StoreCapInit(name)
+            if fast & 8192 != 0
+                && fixed_cap(a, chunk, *name).is_some_and(|(_, attrs)| {
+                    attrs.mutable() || matches!(op, Op::StoreCapInit(_))
+                }) =>
+        {
+            let (slot, attrs) = fixed_cap(a, chunk, *name).expect("guarded");
+            let tdz =
+                matches!(op, Op::StoreCap(_)) && attrs.lexical() && !chunk.jit_cap_initialized(pc);
+            emit_cap_store(a, cap_slot_offset(slot), tdz, pc as u32, unwind);
+        }
+        Op::UpdateCap(name, kind)
+            if fast & 8192 != 0
+                && fixed_cap(a, chunk, *name).is_some_and(|(_, attrs)| attrs.mutable()) =>
+        {
+            let (slot, _) = fixed_cap(a, chunk, *name).expect("guarded");
+            emit_cap_update(a, cap_slot_offset(slot), *kind, pc as u32, unwind);
+        }
         Op::LoadCap(name)
             if fast & 8192 != 0
                 && load_name_inlinable(layout)
@@ -865,6 +888,127 @@ fn emit_elided_element(a: &mut asm::Asm, slot: u16, skip: u32, pc: u32, unwind: 
     a.ldr_imm(13, 19, CTX_ARGC_OFF as u32 + 8); // the arguments' address
     a.ldr_x_lsl3(14, 13, 11);
     emit_exec_word_store(a, 14, 20, -8);
+    a.b(done);
+    a.bind(slow);
+    emit_exec(a, pc, unwind);
+    a.bind(done);
+}
+
+/// The fixed slot and attributes of the captured binding name `n` names, when the code being
+/// emitted runs only in activations its chunk's plan made (`Asm::fixed_activation`; a borrowed
+/// frame's may be another tier's) and the chunk keeps it at a fixed slot
+/// (`Chunk::jit_cap_binding`).
+fn fixed_cap(
+    a: &asm::Asm,
+    chunk: &Chunk,
+    n: u32,
+) -> Option<(u32, crate::interpreter::BindingAttrs)> {
+    a.fixed_activation()
+        .then(|| chunk.jit_cap_binding(n))
+        .flatten()
+}
+
+/// A captured binding's fixed offset from its activation (`env_raw`): the record's header, then
+/// one word a slot (W3 item 3's step 5).
+fn cap_slot_offset(slot: u32) -> u32 {
+    (crate::interpreter::RECORD_HEADER + 8 * slot as usize) as u32
+}
+
+/// LoadCap from a fixed slot of the running activation (`Chunk::jit_cap_binding`): its word,
+/// tested for TDZ (the empty word) unless `tdz` is false (a binding never in TDZ, or one its
+/// basic block checked already, `Chunk::jit_cap_initialized`). A binding's word is never a
+/// deferred prototype, which only a property holds.
+fn emit_cap_load(a: &mut asm::Asm, offset: u32, tdz: bool, pc: u32, unwind: usize) {
+    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    a.ldr_imm(12, 9, offset);
+    if tdz {
+        let slow = a.new_label();
+        let done = a.new_label();
+        a.movz(13, 0x7ffa, 3); // PACK_EMPTY
+        a.cmp_reg_x(12, 13);
+        a.b_cond(C_EQ, slow);
+        emit_exec_word_store(a, 12, 20, 0);
+        a.add_imm(20, 20, 8);
+        #[cfg(test)]
+        names::record_name_commit(a, 0);
+        a.b(done);
+        a.bind(slow);
+        emit_exec(a, pc, unwind);
+        a.bind(done);
+    } else {
+        emit_exec_word_store(a, 12, 20, 0);
+        a.add_imm(20, 20, 8);
+        #[cfg(test)]
+        names::record_name_commit(a, 0);
+    }
+}
+
+/// StoreCap (or StoreCapInit, `tdz` false) into a fixed slot of the running activation: the
+/// operand's word, after the TDZ test of the old word when `tdz`, with the card mark of the
+/// record's start unless the word is a Number (as `bytecode::Chunk::store_cap_ic` and the name
+/// stores do). The binding is mutable (a const's stores are StoreConstCap) or being initialized.
+fn emit_cap_store(a: &mut asm::Asm, offset: u32, tdz: bool, pc: u32, unwind: usize) {
+    let slow = a.new_label();
+    let done = a.new_label();
+    let number = a.new_label();
+    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    if tdz {
+        a.ldr_imm(12, 9, offset);
+        a.movz(13, 0x7ffa, 3); // PACK_EMPTY
+        a.cmp_reg_x(12, 13);
+        a.b_cond(C_EQ, slow);
+    }
+    emit_exec_word_load(a, 8, 20, -8);
+    // Property-only and reserved words take the checked path, as in the name stores.
+    property_word_guard(a, 8, 10, slow);
+    a.str_imm(8, 9, offset);
+    a.fmov_d_x(0, 8);
+    a.fcmp(0, 0);
+    a.b_cond(7, number); // VC: a Number word needs no young-edge barrier
+    a.mov_imm64(10, crate::value::PACK_CANON_NAN);
+    a.cmp_reg_x(8, 10);
+    a.b_cond(C_EQ, number);
+    emit_card_mark(a, 9, 15, 16);
+    a.bind(number);
+    a.sub_imm(20, 20, 8);
+    #[cfg(test)]
+    names::record_name_commit(a, 1);
+    a.b(done);
+    a.bind(slow);
+    emit_exec(a, pc, unwind);
+    a.bind(done);
+}
+
+/// UpdateCap (`++`/`--`) on a fixed slot of the running activation holding a Number: the empty
+/// word (TDZ) and every other non-Number are NaN words, which take the checked path, as do
+/// numeric NaNs (their canonicalization). The binding is mutable.
+fn emit_cap_update(a: &mut asm::Asm, offset: u32, kind: UpdKind, pc: u32, unwind: usize) {
+    let slow = a.new_label();
+    let done = a.new_label();
+    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    a.ldr_d_imm(0, 9, offset);
+    a.fcmp(0, 0);
+    a.b_cond(C_VS, slow);
+    a.fmov_one(1);
+    let dec = matches!(
+        kind,
+        UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
+    );
+    a.f_arith(if dec { 1 } else { 0 }, 2, 0, 1);
+    a.str_d_imm(2, 9, offset);
+    match kind {
+        UpdKind::PreInc | UpdKind::PreDec => {
+            emit_exec_number_store(a, 2, 20, 0, 10);
+            a.add_imm(20, 20, 8);
+        }
+        UpdKind::PostInc | UpdKind::PostDec => {
+            emit_exec_number_store(a, 0, 20, 0, 10);
+            a.add_imm(20, 20, 8);
+        }
+        UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+    }
+    #[cfg(test)]
+    names::record_name_commit(a, 2);
     a.b(done);
     a.bind(slow);
     emit_exec(a, pc, unwind);

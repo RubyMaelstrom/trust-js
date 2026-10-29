@@ -540,6 +540,106 @@ fn capture(
     a.bind(hints_done);
 }
 
+/// A fixed activation's captured parameters and `this` (`Chunk::jit_prologue_copies`), which its
+/// frame setup helper left at their template words: generated stores copy them from the frame's
+/// parameter slots (r15) and record, then mark the record's card once (the helper's closing poll
+/// may have aged it). W3 item 3's step 5 (Decision 20c), as ARM64's prologue.
+pub(super) fn emit_activation_copies(a: &mut Asm, chunk: &Chunk) {
+    let Some((parameters, this_slot)) = chunk.jit_prologue_copies() else {
+        return;
+    };
+    let offset = |slot: u32| crate::interpreter::RECORD_HEADER + 8 * slot as usize;
+    a.nr_load(R9, CTX, offset_of!(super::super::JitCtx, env_raw));
+    for (slot, parameter) in parameters {
+        a.nr_load(AX, 15, usize::from(parameter) * 8);
+        a.nr_store(R9, offset(slot), AX);
+    }
+    if let Some(slot) = this_slot {
+        a.nr_load(AX, CTX, offset_of!(super::super::JitCtx, this_word));
+        a.nr_store(R9, offset(slot), AX);
+    }
+    card_mark(a);
+}
+
+/// LoadCap, StoreCap, StoreCapInit and UpdateCap at fixed slots of the running activation
+/// (`Chunk::jit_cap_binding`, W3 item 3's step 5): a load tests the word for TDZ (the empty
+/// word) unless the binding is never in TDZ or its basic block checked it already
+/// (`Chunk::jit_cap_initialized`); a store marks the record's card. `false`: not such an
+/// operation here.
+fn emit_fixed_cap(a: &mut Asm, chunk: &Chunk, op: &Op, pc: u32, unwind: usize) -> bool {
+    let name = match *op {
+        Op::LoadCap(n) | Op::StoreCap(n) | Op::StoreCapInit(n) | Op::UpdateCap(n, _) => n,
+        _ => return false,
+    };
+    // A borrowed frame's activation may be another tier's, without the plan's fixed slots.
+    let Some((slot, attrs)) = a
+        .fixed_activation
+        .then(|| chunk.jit_cap_binding(name))
+        .flatten()
+    else {
+        return false;
+    };
+    if matches!(op, Op::StoreCap(_) | Op::UpdateCap(..)) && !attrs.mutable() {
+        return false;
+    }
+    let offset = crate::interpreter::RECORD_HEADER + 8 * slot as usize;
+    let tdz = attrs.lexical() && !chunk.jit_cap_initialized(pc as usize);
+    let slow = a.label();
+    let done = a.label();
+    a.nr_load(R9, CTX, offset_of!(super::super::JitCtx, env_raw));
+    match *op {
+        Op::LoadCap(_) => {
+            a.nr_load(AX, R9, offset);
+            if tdz {
+                execution_word_guard(a, slow);
+            }
+            a.nr_store(SP, 0, AX);
+            a.add_sp(8);
+        }
+        Op::StoreCap(_) | Op::StoreCapInit(_) => {
+            if tdz && matches!(op, Op::StoreCap(_)) {
+                a.nr_load(AX, R9, offset);
+                a.nr_imm(DX, crate::value::PACK_EMPTY);
+                a.nr_cmp(AX, DX);
+                a.jcc(EQ, slow);
+            }
+            a.nr_mem(true, &[0x8b], AX, SP, -8);
+            execution_word_guard(a, slow);
+            a.nr_store(R9, offset, AX);
+            card_mark(a);
+            a.add_sp(-8);
+        }
+        Op::UpdateCap(_, kind) => {
+            // The empty word (TDZ) and every non-Number are NaN words: the checked path.
+            a.nr_lea(CX, R9, offset as i32);
+            update_value(a, kind, slow);
+        }
+        _ => unreachable!(),
+    }
+    #[cfg(test)]
+    {
+        // As the cached name templates count their commits.
+        record(
+            a,
+            TEST_NATIVE_NAME_OPS.with(|count| count.as_ptr() as usize),
+        );
+        let index = match op {
+            Op::LoadCap(_) => 0,
+            Op::UpdateCap(..) => 2,
+            _ => 1,
+        };
+        record(
+            a,
+            TEST_NATIVE_NAME_COMMITS.with(|counts| counts[index].as_ptr() as usize),
+        );
+    }
+    a.jmp(done);
+    a.bind(slow);
+    a.helper_spflag(H_EXEC, pc, unwind);
+    a.bind(done);
+    true
+}
+
 pub(super) fn emit_op(
     a: &mut Asm,
     chunk: &Chunk,
@@ -549,6 +649,9 @@ pub(super) fn emit_op(
     pc: u32,
     unwind: usize,
 ) -> bool {
+    if emit_fixed_cap(a, chunk, op, pc, unwind) {
+        return true;
+    }
     let reference = matches!(
         op,
         Op::ResolveNameRef(..) | Op::LoadRef(_) | Op::StoreRef(_)

@@ -154,6 +154,8 @@ impl ActivationPlan {
         plan
     }
 
+    /// Make an activation. `copy_words` false leaves the captured parameters and `this` at their
+    /// template words for a native prologue's generated stores ([`ActivationPlan::copied_words`]).
     pub(super) fn instantiate(
         &self,
         chunk: &Chunk,
@@ -161,6 +163,7 @@ impl ActivationPlan {
         parent: &Env,
         this_value: &Value,
         arguments: &[Value],
+        copy_words: bool,
     ) -> Env {
         let rest = self.rest.map(|(slot, first)| {
             let surplus = arguments.get(usize::from(first)..).unwrap_or(&[]).to_vec();
@@ -168,7 +171,7 @@ impl ActivationPlan {
         });
         // The record, at the descriptor's size, from the template's words (TDZ for lexicals).
         let activation = new_var_scope_with_desc(Some(*parent), self.kept_desc, &self.bindings);
-        {
+        if copy_words {
             let mut scope = activation.borrow_mut();
             for &(slot, parameter) in &self.parameters {
                 scope.vars.initialize_fixed_value(
@@ -179,12 +182,15 @@ impl ActivationPlan {
                         .unwrap_or(Value::Undefined),
                 );
             }
-            if let Some((slot, array)) = rest {
-                scope.vars.initialize_fixed_value(slot, array);
-            }
             if let Some(slot) = self.this_slot {
                 scope.vars.initialize_fixed_value(slot, *this_value);
             }
+        }
+        if let Some((slot, array)) = rest {
+            activation
+                .borrow_mut()
+                .vars
+                .initialize_fixed_value(slot, array);
         }
         // Every closure captures this invocation's actual environment. The
         // plan contains no JS object, closure environment, or argument owner.
@@ -204,6 +210,35 @@ impl ActivationPlan {
                 .initialize_fixed_value(slot, value);
         }
         activation
+    }
+
+    /// Whether the plan's records keep their slots in place, in their cells.
+    pub(super) fn in_place(&self) -> bool {
+        self.desc.len() <= crate::interpreter::MAX_INLINE_SLOTS
+    }
+
+    /// The slot and attributes of the captured binding `name` in every activation the plan
+    /// makes, whose slots its record keeps in place ([`crate::interpreter::MAX_INLINE_SLOTS`]):
+    /// generated code addresses it at a fixed offset from the record (W3 item 3's step 5).
+    pub(super) fn fixed_binding(&self, name: &str) -> Option<(usize, BindingAttrs)> {
+        if self.desc.len() > crate::interpreter::MAX_INLINE_SLOTS {
+            return None;
+        }
+        self.desc.binding_of_text(name)
+    }
+
+    /// The captured parameters the plan copies (binding slot, parameter index), in order, but
+    /// those whose binding a hoisted function then initializes (FunctionDeclarationInstantiation
+    /// gives the function the last word), and the slot of a captured `this`: a native prologue's
+    /// generated stores copy them, after the helper made the functions.
+    pub(super) fn copied_words(&self) -> (Vec<(usize, u16)>, Option<usize>) {
+        let parameters = self
+            .parameters
+            .iter()
+            .copied()
+            .filter(|&(slot, _)| !self.functions.iter().any(|&(function, _)| function == slot))
+            .collect();
+        (parameters, self.this_slot)
     }
 
     pub(super) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {

@@ -2748,6 +2748,11 @@ pub struct Chunk {
     /// Call-independent binding descriptors and indexed initialization actions.
     /// Values and closure identities remain fresh on every invocation.
     activation_plan: std::cell::OnceCell<Box<ActivationPlan>>,
+    /// Per operation, whether a cap operation's binding is surely initialized there
+    /// ([`Chunk::jit_cap_initialized`]), computed when native code first asks.
+    jit_cap_tdz_known: std::cell::OnceCell<Box<[bool]>>,
+    /// [`Chunk::jit_fixed_activation`], computed once.
+    jit_fixed_activation: std::cell::OnceCell<bool>,
     /// Coroutine FunctionDeclarationInstantiation already made the activation that owns mapped
     /// parameters and their arguments object. Seed additional compiled bindings into that exact
     /// environment so both access paths share storage.
@@ -2930,6 +2935,8 @@ impl crate::gc_trace::GcTrace for Chunk {
             lexical_scopes: _,
             cap_inits: _,
             activation_plan: _,
+            jit_cap_tdz_known: _,
+            jit_fixed_activation: _,
             reuse_activation: _,
             env_this: _,
             env_arguments: _,
@@ -3687,6 +3694,20 @@ impl Chunk {
     /// `MakeClosure` environments route through the result. Returns `env` untouched when nothing
     /// needs seeding.
     fn make_run_env(&self, i: &mut Interp, env: &Env, this_val: &Value, args: &[Value]) -> Env {
+        self.make_activation(i, env, this_val, args, true)
+    }
+
+    /// [`Chunk::make_run_env`]; `copy_words` false (a native prologue's, for a
+    /// [`Chunk::jit_fixed_activation`] chunk) leaves the captured parameters and `this` to the
+    /// prologue's generated stores.
+    fn make_activation(
+        &self,
+        i: &mut Interp,
+        env: &Env,
+        this_val: &Value,
+        args: &[Value],
+        copy_words: bool,
+    ) -> Env {
         if self.prepared_entry {
             return *env;
         }
@@ -3697,7 +3718,7 @@ impl Chunk {
             return self
                 .activation_plan
                 .get_or_init(|| Box::new(ActivationPlan::new(self)))
-                .instantiate(self, i, env, this_val, args);
+                .instantiate(self, i, env, this_val, args, copy_words);
         }
         let act = if self.reuse_activation {
             *env
@@ -7108,6 +7129,10 @@ mod function_directive_tests;
 #[path = "elided_arguments_tests.rs"]
 mod elided_arguments_tests;
 
+#[cfg(test)]
+#[path = "fixed_activation_tests.rs"]
+mod fixed_activation_tests;
+
 fn compile_inner(
     func: &Function,
     plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
@@ -7863,6 +7888,8 @@ fn finish_chunk(
             .collect(),
         cap_inits: c.cap_inits,
         activation_plan: std::cell::OnceCell::new(),
+        jit_cap_tdz_known: std::cell::OnceCell::new(),
+        jit_fixed_activation: std::cell::OnceCell::new(),
         reuse_activation: c.reuse_activation,
         env_this: c.env_this,
         env_arguments: c.env_arguments,
@@ -21027,6 +21054,79 @@ impl Chunk {
         !self.resumable && !self.needs_env()
     }
 
+    /// Whether every activation the native code a fresh frame enters runs in is one this chunk's
+    /// plan made, at its descriptor's size, and stays the running environment (W3 item 3's step
+    /// 5, Decisions 20b and 20c): not a prepared entry, a coroutine or a reused activation, and no
+    /// operation pushes another record or evaluates code that could add a binding to it
+    /// (`jit_needs_activation_state`). That code then reads and writes its captured bindings at
+    /// fixed offsets from `env_raw` ([`Chunk::jit_cap_binding`]), and the fresh frame's prologue
+    /// copies its captured parameters and `this` into them. A borrowed frame's activation may be
+    /// another tier's: its code keeps the checked caches.
+    pub(crate) fn jit_fixed_activation(&self) -> bool {
+        *self.jit_fixed_activation.get_or_init(|| {
+            !self.prepared_entry
+                && !self.reuse_activation
+                && !self.resumable
+                && self.makes_env()
+                && !self.jit_needs_activation_state
+                && activation_plans_enabled()
+                && self.jit_fixed_plan().is_some()
+        })
+    }
+
+    /// The plan of a [`Chunk::jit_fixed_activation`] chunk whose slots its record keeps in place.
+    fn jit_fixed_plan(&self) -> Option<&ActivationPlan> {
+        let plan = self
+            .activation_plan
+            .get_or_init(|| Box::new(ActivationPlan::new(self)));
+        plan.in_place().then_some(&**plan)
+    }
+
+    /// The fixed slot of the captured binding named by name `n` and its attributes, in a
+    /// [`Chunk::jit_fixed_activation`] chunk's activation: generated code addresses it at
+    /// `RECORD_HEADER + 8 * slot` from `env_raw`.
+    pub(crate) fn jit_cap_binding(
+        &self,
+        n: u32,
+    ) -> Option<(u32, crate::interpreter::BindingAttrs)> {
+        if !self.jit_fixed_activation() {
+            return None;
+        }
+        let (slot, attrs) = self
+            .jit_fixed_plan()?
+            .fixed_binding(&self.names[n as usize])?;
+        Some((slot as u32, attrs))
+    }
+
+    /// A [`Chunk::jit_fixed_activation`] chunk's captured parameters (binding slot, parameter
+    /// index) and captured `this` slot, which its native prologue copies into the activation.
+    pub(crate) fn jit_prologue_copies(&self) -> Option<(Vec<(u32, u16)>, Option<u32>)> {
+        if !self.jit_fixed_activation() {
+            return None;
+        }
+        let (parameters, this_slot) = self.jit_fixed_plan()?.copied_words();
+        Some((
+            parameters
+                .into_iter()
+                .map(|(slot, parameter)| (slot as u32, parameter))
+                .collect(),
+            this_slot.map(|slot| slot as u32),
+        ))
+    }
+
+    /// Whether the captured binding the cap operation at `pc` accesses is surely initialized
+    /// there (W3 item 3's step 5, Decision 20g): an earlier operation of the same basic block
+    /// checked or initialized it, so its TDZ check goes, as SpiderMonkey's per-basic-block TDZ
+    /// cache drops it (frontend/BytecodeEmitter.cpp:1603-1633). A jump target starts a block;
+    /// once initialized, a binding never returns to its temporal dead zone.
+    pub(crate) fn jit_cap_initialized(&self, pc: usize) -> bool {
+        self.jit_cap_tdz_known
+            .get_or_init(|| cap_tdz_known(&self.ops))
+            .get(pc)
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// Whether a fresh frame's prologue calls [`jit_frame_setup`] (W3 item 3, Decision 20a): the
     /// body makes an activation environment, has a rest parameter, or keeps an arguments value
     /// other than the bare count in its slot. A prepared entry's caller has already made its
@@ -21585,6 +21685,54 @@ pub(crate) fn jit_resume_after(op: &Op) -> bool {
             | Op::AsyncIterCloseL(..)
             | Op::DisposeNormal
     )
+}
+
+/// The operations a jump, guard, handler, finally or iterator operation can transfer control to.
+fn op_jump_targets(op: &Op) -> impl Iterator<Item = u32> {
+    let targets: [Option<u32>; 5] = match *op {
+        Op::Jump(t)
+        | Op::AbruptJump(t, _)
+        | Op::JumpIfFalse(t)
+        | Op::JumpIfFalsePeek(t)
+        | Op::JumpIfTruePeek(t)
+        | Op::JumpIfNotNullishPeek(t)
+        | Op::InlineGuard(_, t)
+        | Op::PushHandler(t) => [Some(t), None, None, None, None],
+        Op::PushFinally(a, b, c, d, e) => [Some(a), Some(b), Some(c), Some(d), Some(e)],
+        Op::PushIterator(a, b, c, d) => [Some(a), Some(b), Some(c), Some(d), None],
+        _ => [None; 5],
+    };
+    targets.into_iter().flatten()
+}
+
+/// [`Chunk::jit_cap_initialized`] for every operation: a cap operation whose binding an earlier
+/// operation of its basic block (from a jump target to the next) checked or initialized.
+fn cap_tdz_known(ops: &[Op]) -> Box<[bool]> {
+    let mut leader = vec![false; ops.len() + 1];
+    for op in ops {
+        for target in op_jump_targets(op) {
+            if let Some(slot) = leader.get_mut(target as usize) {
+                *slot = true;
+            }
+        }
+    }
+    let mut known: Vec<u32> = Vec::new();
+    let mut out = vec![false; ops.len()];
+    for (pc, op) in ops.iter().enumerate() {
+        if leader[pc] {
+            known.clear();
+        }
+        let name = match *op {
+            Op::LoadCap(n) | Op::StoreCap(n) | Op::UpdateCap(n, _) | Op::StoreCapInit(n) => n,
+            _ => continue,
+        };
+        if known.contains(&name) {
+            out[pc] = true;
+        } else {
+            known.push(name);
+        }
+    }
+    out.into_boxed_slice()
 }
 
 fn jit_bridge_op(op: &Op) -> bool {
@@ -23966,7 +24114,8 @@ pub(crate) unsafe extern "C" fn jit_frame_setup(
         Env::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
     };
     let this_val = ctx.this_value();
-    let env = chunk.make_run_env(i, &closure, &this_val, args);
+    // A fixed activation's captured parameters and `this` are the prologue's generated stores.
+    let env = chunk.make_activation(i, &closure, &this_val, args, !chunk.jit_fixed_activation());
     if Env::as_ptr(&env) != Env::as_ptr(&closure) {
         ctx.env_raw = Env::as_ptr(&env) as *const u8;
         ctx.env_parent_raw = Env::as_ptr(&closure) as *const u8;

@@ -1652,6 +1652,20 @@ impl ScopeDesc {
         Self::with_text(names, layout.attrs.to_vec(), Some(layout.clone()))
     }
 
+    /// The slot and attributes of the binding named `text`, if the descriptor names it.
+    pub(crate) fn binding_of_text(&self, text: &str) -> Option<(usize, BindingAttrs)> {
+        let slot = match &self.text {
+            Some(layout) => layout.slots.get(text).copied(),
+            None => self.names.iter().position(|name| name.is(text)),
+        }?;
+        Some((slot, self.attrs[slot]))
+    }
+
+    /// How many bindings the descriptor names.
+    pub(crate) fn len(&self) -> usize {
+        self.names.len()
+    }
+
     #[inline]
     fn slot_of(&self, name: crate::atom::Atom) -> Option<usize> {
         match &self.index {

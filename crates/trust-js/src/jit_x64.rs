@@ -47,6 +47,10 @@ struct Asm {
     code: Vec<u8>,
     labels: Vec<Option<usize>>,
     patches: Vec<(usize, usize)>,
+    /// The code being emitted runs only in activations its chunk's plan made, at fixed slots
+    /// (`Chunk::jit_fixed_activation`): a fresh frame's body. Clear in code a borrowed frame
+    /// enters, whose activation another tier may have made.
+    fixed_activation: bool,
 }
 
 impl Asm {
@@ -55,6 +59,7 @@ impl Asm {
             code: Vec::new(),
             labels: Vec::new(),
             patches: Vec::new(),
+            fixed_activation: false,
         }
     }
     fn label(&mut self) -> usize {
@@ -850,6 +855,8 @@ pub(super) fn compile_entry(
     .ok()?;
     let max_stack = cfg.jit_stack_capacity();
     let mut a = Asm::new();
+    // A borrowed frame's activation may be another tier's, without the plan's fixed slots.
+    a.fixed_activation = !borrowed_entry && chunk.jit_fixed_activation();
     let pcs: Vec<_> = (0..=ops.len()).map(|_| a.label()).collect();
     let unwind = a.label();
     let ret_ok = a.label();
@@ -940,6 +947,7 @@ pub(super) fn compile_entry(
         // FunctionDeclarationInstantiation's environment, rest Array and arguments object, made
         // by the callee (`bytecode::jit_frame_setup`); the call ends in the explicit poll.
         a.helper_spflag(H_FRAME_SETUP, 0, unwind);
+        names::emit_activation_copies(&mut a, chunk);
     }
 
     if borrowed_entry {
