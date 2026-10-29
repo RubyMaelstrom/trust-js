@@ -419,7 +419,7 @@ fn function_private_bindings(
         crate::value::Callable::User(user) => (user.func.clone(), user.env),
         _ => return Vec::new(),
     };
-    if env.borrow().under_with || !function_owns_loop(&function, site) {
+    if env.borrow().under_with() || !function_owns_loop(&function, site) {
         return Vec::new();
     }
     let Some((captured, _, _, runtime_lexicals, direct_eval)) = CaptureScan::run(&function, false)

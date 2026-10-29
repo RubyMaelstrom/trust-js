@@ -30152,7 +30152,7 @@ fn compiled_iteration_records_share_one_published_layout() {
         );
         let env = engine.interp.global_env;
         let fs = engine.interp.get_var("fs", &env).ok().unwrap();
-        let layouts: Vec<u32> = (0..3)
+        let layouts: Vec<usize> = (0..3)
             .map(|k| {
                 let f = engine
                     .interp

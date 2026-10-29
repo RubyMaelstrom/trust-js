@@ -11621,13 +11621,28 @@ fn load_name_inlinable(layout: &crate::value::JitLayout) -> bool {
     get_prop_inlinable(layout)
         && layout.scope_gen.is_multiple_of(4)
         && layout.scope_gen / 4 < 4096
-        && layout.scope_layout.is_multiple_of(4)
-        && layout.scope_layout / 4 < 4096
-        && layout.binding_value.is_multiple_of(8)
-        && layout.binding_value < 256
-        && layout.binding_init < 4096
+        && layout.scope_layout.is_multiple_of(8)
+        && layout.scope_layout / 8 < 4096
+        && layout.binding_value == 0
+        && layout.scope_binding_stride == 8
+        && layout.scope_binding_offset == 0
         && layout.scope_with_valid
         && layout.scope_with < 4096
+}
+
+/// TDZ: branch to `slow` when the binding slot at `slot` holds the empty word, its value in `word`
+/// for the caller (W3 item 3: the empty word is the temporal dead zone, as V8's hole and JSC's
+/// empty value). Clobbers `scratch`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(super) fn emit_tdz_guard(a: &mut asm::Asm, word: u32, slot: u32, scratch: u32, slow: usize) {
+    const _: () = assert!(crate::value::PACK_EMPTY == 0x7ffa << 48);
+    a.ldr_imm(word, slot, 0);
+    a.movz(scratch, 0x7ffa, 3);
+    a.cmp_reg_x(word, scratch);
+    a.b_cond(C_EQ, slow);
 }
 
 /// The cached numeric name update additionally writes through the resolved binding/property.
@@ -12970,10 +12985,9 @@ fn emit_name_ic_value_ptr_in(
 ) {
     use crate::bytecode::{
         NAME_IC_OFF_ACT_GEN, NAME_IC_OFF_BINDING, NAME_IC_OFF_ENV, NAME_IC_OFF_GEN,
+        NAME_IC_OFF_LAYOUT,
     };
     let sg = layout.scope_gen as u32;
-    let bv = layout.binding_value as u32;
-    let bi = layout.binding_init as u32;
     let g_ex = layout.obj_exotic as u32;
     let g_sh = (layout.obj_props + layout.props_shape) as u32;
     let g_ea = layout.entry_accessor as u32;
@@ -13053,49 +13067,51 @@ fn emit_name_ic_value_ptr_in(
     a.ldr_imm(12, 12, NAME_IC_OFF_BINDING);
     names::emit_deep_name_value_ptr(a, layout, slow, property_ok);
     a.b(have);
-    // Same published ordered layout, different activation allocation. Derive
-    // this invocation's Binding address; no previous invocation is retained.
+    // Same layout (a shared descriptor), different activation allocation. Derive this
+    // invocation's slot address; no previous invocation is retained.
     a.bind(fixed_scope);
     if scope_entries_fit(layout) {
-        a.cbz(13, false, slow); // layout ID zero never proves a slot
-        a.ldr_w_imm(11, 9, layout.scope_layout as u32);
-        a.cmp_reg_w(11, 13);
+        a.ldr_imm(13, 12, NAME_IC_OFF_LAYOUT);
+        a.cbz(13, true, slow); // layout identity zero never proves a slot
+        a.ldr_imm(11, 9, layout.scope_layout as u32);
+        a.cmp_reg_x(11, 13);
         a.b_cond(C_NE, slow);
         a.ldr_imm(14, 12, NAME_IC_OFF_BINDING);
         scope_entries_len(a, layout, 11, 9);
         a.cmp_reg_x(14, 11);
         a.b_cond(C_HS, slow);
         scope_entries_data(a, layout, 11, 9);
-        a.mov_imm64(15, layout.scope_binding_stride as u64);
-        a.madd(14, 14, 15, 11);
-        a.add_imm(14, 14, layout.scope_binding_offset as u32);
+        a.add_shifted(14, 11, 14, 3); // one word a slot
         a.b(binding_ready);
     } else {
         a.b(slow);
     }
-    // --- depth-1 mode: `act_gen` belongs to current env; `gen` belongs to parent ---
+    // --- depth-1 mode: `layout` or `act_gen` belongs to current env; `gen` to the parent ---
     a.bind(depth_one);
-    a.ldr_w_imm(15, 12, NAME_IC_OFF_ACT_GEN);
-    let activation_guard = a.new_label();
+    let generation_mode = a.new_label();
+    let activation_checked = a.new_label();
     let parent_tagged = a.new_label();
     a.movz(16, 4, 0);
     a.logic_x(0, 16, 10, 16);
-    a.cbz(16, false, activation_guard);
-    // Layout mode (parent|6): invalidation is represented by layout ID zero.
-    // Read the creator's published key-set identity, not a coincidental count
-    // of mutations in an unrelated activation.
-    a.cbz(15, false, slow);
-    a.ldr_w_imm(11, 9, layout.scope_layout as u32);
-    a.bind(activation_guard);
-    // A layout token is independently non-recycled; only the generation-mode activation
-    // needs the exhaustion guard.
-    let activation_not_saturated = a.new_label();
-    a.cbnz(16, false, activation_not_saturated);
+    a.cbz(16, false, generation_mode);
+    // Layout mode (parent|6): the activation's layout identity, a shared descriptor's address,
+    // never zero. Read the creator's key-set identity, not a coincidental count of mutations in
+    // an unrelated activation.
+    a.ldr_imm(15, 12, NAME_IC_OFF_LAYOUT);
+    a.cbz(15, true, slow);
+    a.ldr_imm(11, 9, layout.scope_layout as u32);
+    a.cmp_reg_x(11, 15);
+    a.b_cond(C_NE, slow);
+    a.b(activation_checked);
+    // Generation mode (parent|2): the activation's generation, with the exhaustion guard (w11
+    // holds the current scope's generation).
+    a.bind(generation_mode);
+    a.ldr_w_imm(15, 12, NAME_IC_OFF_ACT_GEN);
     a.cmn_imm_w(15, 1);
     a.b_cond(C_EQ, slow);
-    a.bind(activation_not_saturated);
     a.cmp_reg_w(11, 15);
     a.b_cond(C_NE, slow);
+    a.bind(activation_checked);
     if env == NameEnv::InX9 {
         // The fixed scope's live parent (a stored handle word: its `Env::as_ptr`).
         if layout.scope_parent_valid
@@ -13133,10 +13149,9 @@ fn emit_name_ic_value_ptr_in(
     a.bind(scope);
     a.ldr_imm(14, 12, NAME_IC_OFF_BINDING);
     a.bind(binding_ready);
-    // The proof covers the binding's attributes (its fill refused an import): only TDZ is live.
-    a.ldrb_imm(9, 14, bi);
-    a.cbz(9, false, slow);
-    a.add_imm(14, 14, bv); // x14 → the binding's Value
+    // x14 → the binding's slot, its value. The proof covers the binding's attributes (its fill
+    // refused an import): only TDZ, the empty word, is live.
+    emit_tdz_guard(a, 9, 14, 13, slow);
     a.movz(7, 0, 0); // Binding owner: initialization/mutability semantics
     a.bind(have);
 }

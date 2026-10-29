@@ -20,7 +20,12 @@ fn compile(engine: &mut Engine, source: &str) -> (Rc<Chunk>, JitCode) {
     (chunk, code)
 }
 
-fn scope(parent: Option<Env>, key: &str, value: f64, layout: u32) -> Env {
+fn scope(
+    parent: Option<Env>,
+    key: &str,
+    value: f64,
+    layout: impl Into<crate::interpreter::TestLayout>,
+) -> Env {
     let scope = new_scope(parent);
     scope
         .borrow_mut()
@@ -70,12 +75,12 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
         TEST_NATIVE_DEEP_NAMES.with(std::cell::Cell::get),
         before + 2
     );
-    other
+    let tdz_outer = other
         .borrow_mut()
         .vars
         .get_mut("outer")
         .unwrap()
-        .set_initialized(false);
+        .enter_tdz_for_test();
     assert!(super::super::run(
         &mut engine.interp,
         &chunk,
@@ -90,12 +95,27 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
         .vars
         .get_mut("outer")
         .unwrap()
-        .set_initialized(true);
+        .initialize(tdz_outer);
+    // A layout identity (a shared descriptor) proves the key set whatever the generation; a
+    // record with its own names proves it only by identity and generation, so an exhausted
+    // generation takes the exact-record helper.
     other.borrow_mut().vars.set_generation_for_test(u32::MAX);
     assert_eq!(run(&mut engine, &chunk, &code, &fresh), 29.0);
     assert_eq!(
         TEST_NATIVE_DEEP_NAMES.with(std::cell::Cell::get),
-        before + 2,
+        before + 3,
+        "a layout identity does not depend on the generation"
+    );
+    other
+        .borrow_mut()
+        .vars
+        .set_attributes_for_test("outer", None, None, Some(true));
+    assert_eq!(other.borrow().vars.layout_id(), 0);
+    other.borrow_mut().vars.set_generation_for_test(u32::MAX);
+    assert_eq!(run(&mut engine, &chunk, &code, &fresh), 29.0);
+    assert_eq!(
+        TEST_NATIVE_DEEP_NAMES.with(std::cell::Cell::get),
+        before + 3,
         "exhausted generation must take exact-record helper"
     );
 }

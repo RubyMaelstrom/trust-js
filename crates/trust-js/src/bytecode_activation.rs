@@ -8,8 +8,7 @@
 
 use super::{CapInit, Chunk};
 use crate::interpreter::{
-    new_var_scope_with_bindings, Binding, BindingAttrs, BindingSlot, DescRef, Env, Interp,
-    ScopeDesc, VarMap,
+    new_var_scope_with_desc, Binding, BindingAttrs, BindingSlot, DescRef, Env, Interp, ScopeDesc,
 };
 use crate::value::Value;
 use std::rc::Rc;
@@ -163,27 +162,30 @@ impl ActivationPlan {
         this_value: &Value,
         arguments: &[Value],
     ) -> Env {
-        let mut vars =
-            VarMap::from_fixed_bindings(self.bindings.iter().cloned().collect(), self.kept_desc);
-        for &(slot, parameter) in &self.parameters {
-            vars.initialize_fixed_value(
-                slot,
-                arguments
-                    .get(usize::from(parameter))
-                    .copied()
-                    .unwrap_or(Value::Undefined),
-            );
+        let rest = self.rest.map(|(slot, first)| {
+            let surplus = arguments.get(usize::from(first)..).unwrap_or(&[]).to_vec();
+            (slot, interp.make_array(surplus))
+        });
+        // The record, at the descriptor's size, from the template's words (TDZ for lexicals).
+        let activation = new_var_scope_with_desc(Some(*parent), self.kept_desc, &self.bindings);
+        {
+            let mut scope = activation.borrow_mut();
+            for &(slot, parameter) in &self.parameters {
+                scope.vars.initialize_fixed_value(
+                    slot,
+                    arguments
+                        .get(usize::from(parameter))
+                        .copied()
+                        .unwrap_or(Value::Undefined),
+                );
+            }
+            if let Some((slot, array)) = rest {
+                scope.vars.initialize_fixed_value(slot, array);
+            }
+            if let Some(slot) = self.this_slot {
+                scope.vars.initialize_fixed_value(slot, *this_value);
+            }
         }
-        if let Some((slot, first)) = self.rest {
-            vars.initialize_fixed_value(
-                slot,
-                interp.make_array(arguments.get(usize::from(first)..).unwrap_or(&[]).to_vec()),
-            );
-        }
-        if let Some(slot) = self.this_slot {
-            vars.initialize_fixed_value(slot, *this_value);
-        }
-        let activation = new_var_scope_with_bindings(Some(*parent), vars);
         // Every closure captures this invocation's actual environment. The
         // plan contains no JS object, closure environment, or argument owner.
         for &(slot, function) in &self.functions {
@@ -201,10 +203,6 @@ impl ActivationPlan {
                 .vars
                 .initialize_fixed_value(slot, value);
         }
-        activation
-            .borrow_mut()
-            .vars
-            .publish_layout(chunk.binding_layout_id);
         activation
     }
 
@@ -372,12 +370,12 @@ mod tests {
                 .insert("added", Binding::data(Value::Num(7.), true, true));
             assert_eq!(activation.borrow().vars.layout_id(), 0);
             assert_eq!(evaluate(&mut engine, "one()"), "79");
-            activation
+            let tdz_m = activation
                 .borrow_mut()
                 .vars
                 .get_mut("m")
                 .unwrap()
-                .set_initialized(false);
+                .enter_tdz_for_test();
             assert_eq!(
                 evaluate(
                     &mut engine,
@@ -390,7 +388,7 @@ mod tests {
                 .vars
                 .get_mut("m")
                 .unwrap()
-                .set_initialized(true);
+                .initialize(tdz_m);
             assert_eq!(evaluate(&mut engine, "one()"), "79");
         }
     }
@@ -451,12 +449,12 @@ mod tests {
                 .insert("added59", Binding::data(Value::Num(3.), true, true));
             assert_eq!(left.borrow().vars.layout_id(), 0);
             assert_eq!(evaluate(&mut engine, "left59()+'|'+right59()"), "4561|4752");
-            right
+            let tdz_v95 = right
                 .borrow_mut()
                 .vars
                 .get_mut("v95")
                 .unwrap()
-                .set_initialized(false);
+                .enter_tdz_for_test();
             assert_eq!(
                 evaluate(&mut engine, "try{right59();'miss'}catch(e){e.name}"),
                 "ReferenceError"
@@ -466,7 +464,7 @@ mod tests {
                 .vars
                 .get_mut("v95")
                 .unwrap()
-                .set_initialized(true);
+                .initialize(tdz_v95);
             right.borrow_mut().vars.remove("v95");
             assert_eq!(right.borrow().vars.layout_id(), 0);
             assert_eq!(

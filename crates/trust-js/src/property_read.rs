@@ -346,7 +346,7 @@ impl Interp {
             // Rechecking the live parent and with state also covers scope-chain edits.
             if scope.parent.is_none()
                 || scope.has_with_object()
-                || scope.under_with
+                || scope.under_with()
                 || !scope.vars.matches_generation(guard.generation)
             {
                 return BindingGetterProbe::Stale;
@@ -396,7 +396,7 @@ impl Interp {
             // Saturated generations cannot validate a stable Binding address.
             if scope.parent.is_none()
                 || scope.has_with_object()
-                || scope.under_with
+                || scope.under_with()
                 || scope.vars.generation() == u32::MAX
             {
                 return None;
@@ -423,7 +423,7 @@ impl Interp {
             let scope = env.borrow();
             if scope.parent.is_none()
                 || scope.has_with_object()
-                || scope.under_with
+                || scope.under_with()
                 || scope.vars.generation() == u32::MAX
             {
                 return None;

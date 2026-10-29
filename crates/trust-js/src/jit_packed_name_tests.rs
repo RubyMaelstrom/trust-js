@@ -43,7 +43,7 @@ fn holder(padding: usize) -> Env {
     holder_with_layout(padding, new_binding_layout_id())
 }
 
-fn holder_with_layout(padding: usize, layout: u32) -> Env {
+fn holder_with_layout(padding: usize, layout: impl Into<crate::interpreter::TestLayout>) -> Env {
     let holder = new_scope(None);
     let mut scope = holder.borrow_mut();
     for index in 0..padding {
@@ -55,9 +55,7 @@ fn holder_with_layout(padding: usize, layout: u32) -> Env {
     scope
         .vars
         .insert("outer", Binding::data(Value::Undefined, true, true));
-    if layout != 0 {
-        scope.vars.publish_layout(layout);
-    }
+    scope.vars.publish_layout(layout);
     drop(scope);
     holder
 }
@@ -103,7 +101,7 @@ impl Case {
         let layout = if matches!(mode, Mode::Fixed | Mode::Deep) {
             new_binding_layout_id()
         } else {
-            0
+            crate::interpreter::TestLayout::default()
         };
         let target = holder_with_layout(padding, layout);
         let first = (mode == Mode::Fixed).then(|| holder_with_layout(padding, layout));
@@ -116,11 +114,13 @@ impl Case {
         for _ in 0..depth {
             let child = new_scope(Some(*path.last().unwrap()));
             if mode == Mode::ParentLayout {
-                // A real layout proof of absence in the running child; the parent has no layout.
-                child
-                    .borrow_mut()
+                // A real layout proof of absence in the running child (a descriptor of its
+                // names); the parent has no layout.
+                let mut scope = child.borrow_mut();
+                scope
                     .vars
-                    .publish_layout(new_binding_layout_id());
+                    .insert("childpad", Binding::data(Value::Undefined, true, true));
+                scope.vars.publish_layout(new_binding_layout_id());
             } else if mode == Mode::ParentGeneration {
                 // The prepared-entry fixture below is a real own activation with these captured
                 // names. A generation proof of that fixed factory establishes child absence.
@@ -341,12 +341,14 @@ fn fixed_layout_flags_and_stale_layouts_decline_before_native_commit() {
                     "the stale slot remains in bounds and names a different binding"
                 );
             }
-            "TDZ" => target
-                .borrow_mut()
-                .vars
-                .get_mut("outer")
-                .unwrap()
-                .set_initialized(false),
+            "TDZ" => {
+                target
+                    .borrow_mut()
+                    .vars
+                    .get_mut("outer")
+                    .unwrap()
+                    .enter_tdz_for_test();
+            }
             "import" => {
                 let exporter = new_scope(None);
                 exporter
@@ -443,7 +445,8 @@ fn fixed_layout_flags_and_stale_layouts_decline_before_native_commit() {
         let binding = scope.vars.get("outer").unwrap();
         assert_eq!(
             binding.value().as_num_opt(),
-            if scenario == "import" {
+            if scenario == "import" || scenario == "TDZ" {
+                // An import's slot holds nothing; a binding in TDZ holds the empty word.
                 None
             } else if scenario == "stale layout" {
                 Some(23.0)

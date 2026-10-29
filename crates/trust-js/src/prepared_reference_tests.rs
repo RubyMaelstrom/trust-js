@@ -260,20 +260,26 @@ fn prepared_reference_native_kind_flags_use_compact_binding_size_and_live_import
     #[cfg(target_pointer_width = "64")]
     assert_eq!(
         std::mem::size_of::<crate::interpreter::BindingSlot>(),
-        16,
-        "a binding's slot holds its value and TDZ flag; its attributes live with the names"
+        8,
+        "a binding's slot is one word, the empty word in TDZ; its attributes live with the names"
     );
+    let _engine = crate::Engine::new();
     let target = new_scope(None);
-    let mut vars = VarMap::default();
+    let record = new_scope(None);
+    let mut scope = record.borrow_mut();
+    let vars = &mut scope.vars;
     vars.insert("binding", Binding::data(Value::Undefined, false, true));
     assert!(!vars.get("binding").unwrap().is_import());
     vars.set_import_for_test("binding", Some((target, crate::atom::atomize("exported"))));
     assert!(vars.get("binding").unwrap().is_import());
     vars.set_import_for_test("binding", None);
     assert!(!vars.get("binding").unwrap().is_import());
-    // The entries validate: an InlineVec keeping a map's first binding in place.
-    assert!(
-        VarMap::jit_small_storage_layout().is_some(),
-        "current Rust small map layout validates"
-    );
+    // Generated code reads the slots in place after the record, or in a spill block.
+    let slots = VarMap::jit_slots_layout();
+    assert_eq!(slots.stride, 8);
+    assert!(matches!(
+        slots.storage,
+        crate::value::JitVecLayout::Inline { inline, heap, .. }
+            if inline == heap && inline == std::mem::size_of::<crate::interpreter::Scope>()
+    ));
 }

@@ -62,16 +62,21 @@ impl Registry {
             _slots: PhantomData,
         };
         drop(aliases);
-        // Registration and the restoration guard precede clearing parked words. The binding's
-        // initialization/mutability flags stay independent; the canonical slot retains its
-        // current word while this AST record is parked.
-        for (environment, name, _) in homes {
+        // Registration and the restoration guard precede clearing parked words. The canonical
+        // slot retains its current word while this AST record is parked; the parked binding
+        // keeps only its TDZ state (the empty word), which no value can be.
+        for (environment, name, slot) in homes {
+            let parked = if slots[*slot as usize].get().is_empty() {
+                Value::Empty
+            } else {
+                Value::Undefined
+            };
             environment
                 .borrow_mut()
                 .vars
                 .get_mut(name)
                 .expect("borrowed binding remains present")
-                .set_value(Value::Undefined);
+                .set_word(parked);
         }
         scope
     }
@@ -121,8 +126,8 @@ impl Drop for Scope<'_> {
                 .vars
                 .get_mut(&alias.name)
                 .expect("borrowed binding remains present");
-            binding.set_initialized(!word.is_empty());
-            binding.set_value(word);
+            // The slot's word as it is: a value, or the TDZ word.
+            binding.set_word(word);
         }
         aliases.truncate(self.floor);
     }

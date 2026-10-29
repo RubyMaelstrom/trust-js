@@ -451,12 +451,12 @@ fn foreign_getter_fill_stale_reset_and_tdz_preserve_the_runtime_lease() {
         identity,
         "stale proof is re-resolved without losing the runtime"
     );
-    captured
+    let tdz_held = captured
         .borrow_mut()
         .vars
         .get_mut("held")
         .unwrap()
-        .set_initialized(false);
+        .enter_tdz_for_test();
     assert_eq!(
         eval(&mut outer, "try{box.value}catch(error){error.name}"),
         "ReferenceError"
@@ -467,7 +467,7 @@ fn foreign_getter_fill_stale_reset_and_tdz_preserve_the_runtime_lease() {
         .vars
         .get_mut("held")
         .unwrap()
-        .set_initialized(true);
+        .initialize(tdz_held);
     captured.borrow_mut().vars.remove("held");
     assert_eq!(
         eval(&mut outer, "try{box.value}catch(error){error.name}"),

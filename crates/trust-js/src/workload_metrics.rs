@@ -215,7 +215,11 @@ mod tests {
         assert_eq!(classify_name(&inner, "value"), (NamePath::Uninitialized, 1));
         {
             let mut scope = middle.borrow_mut();
-            scope.vars.get_mut("value").unwrap().set_initialized(true);
+            scope
+                .vars
+                .get_mut("value")
+                .unwrap()
+                .initialize(Value::Undefined);
             scope
                 .vars
                 .set_import_for_test("value", Some((outer, crate::atom::atomize("value"))));

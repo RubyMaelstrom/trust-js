@@ -87,10 +87,11 @@ fn emit_deep_name_target_ptr(
     a.cmp_reg_w(13, 14);
     a.b_cond(C_EQ, checked);
     a.bind(layout_guard);
-    a.ldr_w_imm(13, 10, NAME_GUARD_LAYOUT as u32);
-    a.cbz(13, false, slow);
-    a.ldr_w_imm(14, 9, layout.scope_layout as u32);
-    a.cmp_reg_w(13, 14);
+    // A layout identity (a shared descriptor's address) proves the key set; zero proves none.
+    a.ldr_imm(13, 10, NAME_GUARD_LAYOUT as u32);
+    a.cbz(13, true, slow);
+    a.ldr_imm(14, 9, layout.scope_layout as u32);
+    a.cmp_reg_x(13, 14);
     a.b_cond(C_NE, slow);
     a.bind(checked);
     a.sub_imm(11, 11, 1);
@@ -122,9 +123,7 @@ fn emit_deep_name_target_ptr(
         a.cmp_reg_x(13, 14);
         a.b_cond(C_HS, slow);
         scope_entries_data(a, layout, 14, 9);
-        a.mov_imm64(15, layout.scope_binding_stride as u64);
-        a.madd(14, 13, 15, 14);
-        a.add_imm(14, 14, layout.scope_binding_offset as u32);
+        a.add_shifted(14, 14, 13, 3); // one word a slot
     } else {
         a.b(slow);
     }
@@ -170,8 +169,12 @@ pub(super) fn deep_layout_supported(layout: &crate::value::JitLayout) -> bool {
         && layout.scope_parent.is_multiple_of(8)
         && layout.scope_parent / 8 < 4096
         && layout.scope_with < 4096
+        && layout.scope_layout.is_multiple_of(8)
+        && layout.scope_layout / 8 < 4096
         && (!layout.scope_small_valid
-            || (scope_entries_fit(layout) && layout.scope_binding_offset < 4096))
+            || (scope_entries_fit(layout)
+                && layout.scope_binding_stride == 8
+                && layout.scope_binding_offset == 0))
 }
 
 /// Value-read variant of the resolution proof. Capturing a Reference uses the target proof
@@ -194,16 +197,15 @@ pub(super) fn emit_deep_name_value_ptr(
     }
 }
 
-/// x14 = a Binding (x7 0) or a Property (x7 1) → its value's address, after the live checks: a
-/// binding's TDZ (the proof that found it covers its attributes: a deep cache's fill refused an
-/// import, a Reference names a plain binding only) or a property's data descriptor.
+/// x14 = a binding slot (x7 0) or a Property (x7 1) → its value's address, after the live checks:
+/// a binding's TDZ, the empty word (the proof that found it covers its attributes: a deep cache's
+/// fill refused an import, a Reference names a plain binding only), or a property's data
+/// descriptor. Clobbers x13 and x15.
 fn emit_target_value_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout, slow: usize) {
     let property = a.new_label();
     let done = a.new_label();
     a.cbnz(7, false, property);
-    a.ldrb_imm(13, 14, layout.binding_init as u32);
-    a.cbz(13, false, slow);
-    a.add_imm(14, 14, layout.binding_value as u32);
+    emit_tdz_guard(a, 13, 14, 15, slow);
     a.b(done);
     a.bind(property);
     guard_prop_data(a, 13, 14, layout.entry_accessor as u32, slow);

@@ -142,6 +142,19 @@ fn size_class(size: usize) -> Option<usize> {
     CLASS_OF.get(size.div_ceil(16)).map(|&class| class as usize)
 }
 
+/// The size class of a small cell of `size` bytes, and that class's cell size: what an
+/// allocation of `size` bytes gets. `None` past [`LARGEST_SMALL_CELL`].
+#[inline]
+pub(crate) fn small_cell_class(size: usize) -> Option<(u8, usize)> {
+    size_class(size).map(|class| (class as u8, SIZE_CLASSES[class]))
+}
+
+/// The cell size of the small size class `class` ([`small_cell_class`]).
+#[inline]
+pub(crate) fn small_class_size(class: u8) -> usize {
+    SIZE_CLASSES[usize::from(class)]
+}
+
 fn bit(bits: &[u64], index: usize) -> bool {
     bits[index / 64] >> (index % 64) & 1 == 1
 }

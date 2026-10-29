@@ -4,29 +4,37 @@
 use super::*;
 
 #[test]
-fn initialized_and_tdz_binding_flags_are_independent_of_word_contents() {
-    use crate::interpreter::{Binding, VarMap};
-    let mut vars = VarMap::default();
-    vars.insert("initialized", Binding::data(Value::Empty, true, true));
-    vars.insert("tdz", Binding::data(Value::Undefined, false, false));
+fn a_binding_in_its_temporal_dead_zone_is_the_empty_word() {
+    use crate::interpreter::Binding;
+    let _engine = crate::Engine::new();
+    let record = crate::interpreter::new_scope(None);
+    let mut scope = record.borrow_mut();
+    let vars = &mut scope.vars;
+    vars.insert("initialized", Binding::data(Value::Undefined, true, true));
+    vars.insert("tdz", Binding::data(Value::Null, false, false));
     assert!(vars.get("initialized").unwrap().initialized());
     assert_eq!(
         vars.get("initialized").unwrap().value().bits(),
-        crate::value::PACK_EMPTY
+        crate::value::PACK_UNDEFINED
     );
+    // An uninitialized binding's value word is the empty word, whatever it was created with.
     assert!(!vars.get("tdz").unwrap().initialized());
     assert_eq!(
         vars.get("tdz").unwrap().value().bits(),
-        crate::value::PACK_UNDEFINED
+        crate::value::PACK_EMPTY
     );
-    vars.get_mut("initialized")
-        .unwrap()
-        .set_value(Value::Undefined);
-    vars.get_mut("tdz").unwrap().set_value(Value::Null);
+    vars.get_mut("initialized").unwrap().set_value(Value::Null);
+    // InitializeBinding stores the value, which ends the temporal dead zone.
+    vars.get_mut("tdz").unwrap().initialize(Value::Num(1.0));
     let initialized = vars.get("initialized").unwrap();
     let tdz = vars.get("tdz").unwrap();
     assert!(initialized.initialized() && initialized.mutable());
-    assert!(!tdz.initialized() && !tdz.mutable());
+    assert_eq!(initialized.value().bits(), crate::value::PACK_NULL);
+    assert!(tdz.initialized() && !tdz.mutable());
+    assert!(matches!(
+        tdz.value().view(),
+        crate::value::ValueView::Num(1.0)
+    ));
 }
 
 #[cfg(all(

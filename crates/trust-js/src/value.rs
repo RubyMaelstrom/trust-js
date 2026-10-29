@@ -1439,14 +1439,15 @@ pub struct JitLayout {
     /// closure's `env`) holds (checked live). `Env::as_ptr(env)` → the scope's `VarMap`
     /// generation counter (through the `RefCell`).
     pub scope_gen: usize,
-    /// The live fixed-binding-layout identity, zero after structural mutation.
+    /// The record's names word (64 bits): a shared descriptor's address is its layout identity
+    /// (`VarMap::layout_id`), which caches compare whole.
     pub scope_layout: usize,
     /// Parent `Option<Env>` within `Env::as_ptr(env)`: a stored environment handle word, or
     /// null (the handle's niche; checked live).
     pub scope_parent: usize,
     pub scope_parent_valid: bool,
-    /// A binding map's values in slot order, relative to `Env::as_ptr(env)`: a vector whose
-    /// elements are held as `JitRepr::scope_small` describes.
+    /// A record's binding slots, relative to `Env::as_ptr(env)`: one word each, held as
+    /// `JitRepr::scope_small` describes (in place after the record, or in a storage block).
     pub scope_small_vec: usize,
     pub scope_binding_stride: usize,
     pub scope_binding_offset: usize,
@@ -1455,11 +1456,10 @@ pub struct JitLayout {
     pub scope_with: usize,
     pub scope_with_none: u64,
     pub scope_with_valid: bool,
-    /// The execution word within a `BindingSlot` (the LoadName template's eight-byte source).
+    /// The execution word within a `BindingSlot` (the LoadName template's eight-byte source): the
+    /// slot itself, `PACK_EMPTY` while the binding is in its TDZ. A binding's attributes live with
+    /// its record's names: caches check them when they fill.
     pub binding_value: usize,
-    /// `initialized` bool within a `BindingSlot` (TDZ check). A binding's attributes live with its
-    /// record's names: caches check them when they fill.
-    pub binding_init: usize,
     /// The length word within an `Rc<str>` fat pointer (0 or 8 — layout is unstable).
     pub str_len_word: usize,
     /// The pointer word within an `Rc<str>` fat pointer (the other one).
@@ -1633,7 +1633,7 @@ fn probe_jit_repr() -> JitRepr {
             len: 0,
             cap: 0,
         }),
-        scope_small: crate::interpreter::VarMap::jit_small_storage_layout(),
+        scope_small: Some(crate::interpreter::VarMap::jit_slots_layout()),
         slot_memo_width: if slot_memo_ok { slot_memo_width } else { 0 },
         slot_memo_none,
         exotic_collection_tag,
@@ -1851,9 +1851,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let scope_gen = scope_refcell
         + offset_of!(crate::interpreter::Scope, vars)
         + crate::interpreter::VarMap::generation_offset();
+    // The names word: a shared descriptor's address is the record's layout identity.
     let scope_layout = scope_refcell
         + offset_of!(crate::interpreter::Scope, vars)
-        + crate::interpreter::VarMap::layout_id_offset();
+        + crate::interpreter::VarMap::names_offset();
     let vars_offset = scope_refcell + offset_of!(crate::interpreter::Scope, vars);
     // A binding map's values in slot order, probed per build.
     let scope_small_valid = repr.scope_small.is_some();
@@ -1881,8 +1882,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             == PACK_EMPTY
         && unsafe { *((Env::as_ptr(&probe_with) as usize + scope_with) as *const u64) }
             == PACK_NULL;
-    let binding_value = crate::interpreter::BindingSlot::value_offset();
-    let binding_init = crate::interpreter::BindingSlot::initialized_offset();
+    let binding_value = 0;
+    const {
+        assert!(std::mem::size_of::<crate::interpreter::BindingSlot>() == 8);
+    }
 
     // Code-keyed call probe: `Callable` is repr(u8) (discriminant byte, then one payload word)
     // and `UserCallable` is repr(C). Verify both on live values: a native callable, and a
@@ -1965,7 +1968,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         }
         None => (0, 0, 0, 0, false),
     };
-    let scope_under_with = scope_refcell + offset_of!(crate::interpreter::Scope, under_with);
+    let scope_under_with = scope_refcell
+        + offset_of!(crate::interpreter::Scope, vars)
+        + crate::interpreter::VarMap::under_with_offset();
     let call_probe_valid = callable_ok && closure_ok;
 
     let valid = repr.valid
@@ -2047,7 +2052,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         scope_with_none,
         scope_with_valid,
         binding_value,
-        binding_init,
         obj_call: offset_of!(Object, call),
         user_func,
         user_env,
@@ -3188,6 +3192,8 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
         finalize: layout_census::enabled().then_some(census_dead_object as _),
         carded: true,
     });
+    // An environment record's slots follow it in its cell, after the whole RefCell.
+    crate::interpreter::check_record_layout();
     let scope = core.register_desc(crate::gc_core::LayoutDesc {
         name: "environment",
         trace: trace_scope_cell,
@@ -3715,16 +3721,12 @@ fn census_dead_scope(cell: *mut u8) {
 
 /// A fresh cell for one environment record in the active heap (see `Env::new`).
 #[inline]
-pub(crate) fn alloc_scope_cell() -> *mut RefCell<crate::interpreter::Scope> {
-    with_agent_heap(|heap| {
-        heap.core
-            .borrow_mut()
-            .alloc(
-                heap.scope_desc,
-                std::mem::size_of::<RefCell<crate::interpreter::Scope>>(),
-            )
-            .cast()
-    })
+/// A zeroed environment cell of `size` bytes (a small cell's size: the record's header and its
+/// in-place slots, see [`crate::interpreter::VarMap`]).
+pub(crate) fn alloc_scope_cell(size: usize) -> *mut RefCell<crate::interpreter::Scope> {
+    debug_assert!(size >= std::mem::size_of::<RefCell<crate::interpreter::Scope>>());
+    debug_assert!(size <= crate::gc_core::LARGEST_SMALL_CELL);
+    with_agent_heap(|heap| heap.core.borrow_mut().alloc(heap.scope_desc, size).cast())
 }
 
 impl crate::gc_trace::GcTrace for Object {
@@ -4033,7 +4035,7 @@ pub(crate) mod layout_census {
     }; 2];
 
     pub(crate) fn record_env(population: usize, scope: &crate::interpreter::Scope) {
-        let kind = usize::from(!scope.var_boundary);
+        let kind = usize::from(!scope.var_boundary());
         let bindings = scope.vars.iter().count();
         let bucket = BOUNDS.partition_point(|&bound| bound < bindings);
         let counts = &ENV_POPULATIONS[population];

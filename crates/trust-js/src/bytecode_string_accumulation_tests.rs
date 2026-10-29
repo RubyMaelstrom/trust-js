@@ -109,12 +109,13 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
     for kind in 0..7 {
         let env = scope(&engine, Value::lstr("prefix"));
         match kind {
-            0 => env
-                .borrow_mut()
-                .vars
-                .get_mut("result")
-                .unwrap()
-                .set_initialized(false),
+            0 => {
+                env.borrow_mut()
+                    .vars
+                    .get_mut("result")
+                    .unwrap()
+                    .enter_tdz_for_test();
+            }
             1 => env
                 .borrow_mut()
                 .vars

@@ -97,10 +97,11 @@ fn layout_is_valid_with_the_build_ownership() {
             ..
         }
     ));
+    // A record's cell holds at least two slots in place (more in a larger cell).
     assert!(matches!(
         entries_of(&layout),
         JitVecLayout::Inline {
-            inline_capacity: 1,
+            inline_capacity: 2,
             ..
         }
     ));
@@ -266,18 +267,16 @@ fn scope_offsets_read_generation_parent_and_bindings() {
             let binding = data + slot * layout.scope_binding_stride + layout.scope_binding_offset;
             let live = scope.vars.fixed_binding_at(slot).expect("fixed slot");
             assert_eq!(binding, live.as_ptr() as usize, "slot {slot}");
-            assert_eq!(read::<u8>(binding, layout.binding_init), 1);
-            assert_eq!(layout.binding_value, BindingSlot::value_offset());
+            // A slot is one word: its value, or the empty word in TDZ.
+            assert_eq!(layout.binding_value, 0);
+            assert_eq!(layout.scope_binding_stride, 8);
+            assert_eq!(std::mem::size_of::<BindingSlot>(), 8);
             assert!((binding + layout.binding_value).is_multiple_of(8));
-            assert!(layout.binding_value + 8 <= std::mem::size_of::<BindingSlot>());
             assert_eq!(
                 read::<u64>(binding, layout.binding_value),
                 live.value().bits()
             );
-            assert!(
-                !(layout.binding_value..layout.binding_value + 8).contains(&layout.binding_init),
-                "the execution word must not overlap the TDZ flag"
-            );
+            assert_ne!(live.value().bits(), crate::value::PACK_EMPTY);
         }
     };
     let parent = new_scope(None);
@@ -286,9 +285,9 @@ fn scope_offsets_read_generation_parent_and_bindings() {
         0,
         "a root scope's parent is the handle's niche"
     );
-    // One binding stays in the environment cell; more spill; past eight the names are indexed,
+    // A record's cell holds two slots in place; more spill; past eight the names are indexed,
     // and the values stay where generated code reads them.
-    for count in [1usize, 2, 5, 9] {
+    for count in [1usize, 2, 3, 5, 9] {
         let env = new_scope(Some(parent));
         for slot in 0..count {
             env.borrow_mut().vars.insert(
@@ -300,10 +299,9 @@ fn scope_offsets_read_generation_parent_and_bindings() {
         {
             let scope = env.borrow();
             assert_eq!(read::<u32>(base, layout.scope_gen), scope.vars.generation());
-            assert_eq!(
-                read::<u32>(base, layout.scope_layout),
-                scope.vars.layout_id()
-            );
+            // The names word: a record built name by name shares no descriptor.
+            assert_eq!(scope.vars.layout_id(), 0);
+            assert_ne!(read::<usize>(base, layout.scope_layout), 0);
             assert!((base + layout.scope_with).is_multiple_of(8));
             assert!(
                 layout.scope_with + 8
@@ -336,9 +334,10 @@ fn scope_offsets_read_generation_parent_and_bindings() {
     assert!(env.borrow().vars.shared_desc().is_some());
     check_bindings(&env, data, 3);
     assert_eq!(
-        read::<u32>(Env::as_ptr(&env) as usize, layout.scope_layout),
+        read::<usize>(Env::as_ptr(&env) as usize, layout.scope_layout),
         env.borrow().vars.layout_id()
     );
+    assert_ne!(env.borrow().vars.layout_id(), 0);
     // Presence is a complete-word test, including non-object and falsey synthetic records.
     let base = Env::as_ptr(&env) as usize;
     for value in [

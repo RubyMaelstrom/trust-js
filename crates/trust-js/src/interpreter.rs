@@ -610,7 +610,7 @@ fn function_profile_enter(
                     "tier={tier} strict={} arrow={} with={} env_depth={depth} same_realm={same_realm} prepared={} activation={} code_used={code_used} code_limit={code_limit} code_denials={code_denials}",
                     func.is_strict,
                     func.is_arrow,
-                    closure.borrow().under_with,
+                    closure.borrow().under_with(),
                     chunk.is_some_and(|chunk| chunk.prepared_entry),
                     chunk.is_some_and(|chunk| !chunk.jit_no_activation()),
                 ),
@@ -1508,37 +1508,37 @@ pub(crate) struct RegexpLastMatch {
     pub lazy_captures: Option<(Rc<crate::regex::Regex>, usize)>,
 }
 
-/// One scope's bindings: their names ([`Names`]) and, slot for slot, their values. Every
-/// *structural* mutation, anything that can move a binding or change what a name resolves to
-/// (insert, remove, clear), bumps a generation counter. The bytecode tier's per-site name caches
-/// hold a raw `&Binding` pointer plus the generation they resolved it at (see
-/// `bytecode::NameIc`): a matching generation proves the map hasn't changed shape since, so the
-/// pointer is still valid *and* still the right resolution. In-place binding writes (`get_mut`)
-/// intentionally don't bump: they can't move a binding, and a cache read-through observes the
-/// new value, which is exactly correct. Mutations only exist as the inherent methods below, so
-/// a new mutation site can't forget the bump (it won't compile).
+/// One scope's bindings: their names with their attributes ([`Names`]) and, slot for slot, their
+/// values, one word each (`Value::Empty` while a binding is in its temporal dead zone), in the
+/// record's cell right after the record, or once they outgrow the cell, in a storage block whose
+/// address the cell's first slot word then holds (W3 item 3's record, Decision 20b, as V8's
+/// contexts, SpiderMonkey's CallObjects and JSC's lexical environments keep their slots). A
+/// `VarMap` lives only as its record's first field ([`Scope`]); a record is allocated at its
+/// descriptor's size ([`new_record`]).
+///
+/// Every *structural* mutation, anything that can move a binding or change what a name resolves
+/// to or its attributes (insert, remove, clear, a spill), bumps a generation counter. The
+/// bytecode tier's per-site name caches hold a raw slot address plus the generation they resolved
+/// it at (see `bytecode::NameIc`): a matching generation proves the map hasn't changed shape
+/// since, so the address is still valid *and* still the right resolution. In-place binding
+/// writes (`get_mut`) intentionally don't bump: they can't move a binding, and a cache
+/// read-through observes the new value, which is exactly correct. Mutations only exist as the
+/// inherent methods below, so a new mutation site can't forget the bump (it won't compile).
+#[repr(C)]
 pub struct VarMap {
     names: Names,
-    values: BindingValues,
+    /// The bindings' count.
+    len: u32,
+    /// The storage block's capacity once the slots spilled; 0 while they are in the cell.
+    cap: u32,
     generation: std::cell::Cell<u32>,
-    /// Nonzero after a fully instantiated activation publishes its ordered key
-    /// layout. Changes to that key set or storage invalidate the proof.
-    /// Binding values/TDZ flags remain live and are never part of this identity.
-    layout_id: u32,
-}
-
-static NEXT_BINDING_LAYOUT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
-/// Process-unique, never-recycled binding-layout identity. Exhaustion disables
-/// new layout proofs rather than wrapping into an old cache's identity.
-pub(crate) fn new_binding_layout_id() -> u32 {
-    allocate_binding_layout_id(&NEXT_BINDING_LAYOUT)
-}
-
-fn allocate_binding_layout_id(next: &std::sync::atomic::AtomicU32) -> u32 {
-    use std::sync::atomic::Ordering::Relaxed;
-    crate::atomic_compat::try_update_u32(next, Relaxed, Relaxed, |id| id.checked_add(1))
-        .unwrap_or(0)
+    /// The record cell's size class, which fixes how many slots it holds in place.
+    class: u8,
+    /// The record's flags (see [`Scope::under_with`], [`Scope::var_boundary`] and
+    /// [`Scope::catch_param`]), in the word the generation leaves.
+    under_with: bool,
+    var_boundary: bool,
+    catch_param: bool,
 }
 
 /// Past this many names a descriptor or a record's own list keeps an index of them.
@@ -1551,7 +1551,6 @@ const SMALL_VAR_MAP_CAPACITY: usize = 8;
 /// and conditional constructor metadata cannot masquerade as a static key set.
 #[derive(Debug)]
 pub(crate) struct BindingLayout {
-    id: u32,
     slots: crate::fasthash::FastMap<Rc<str>, usize>,
     /// The bindings' attributes, by slot: those of the activation that made the layout, which
     /// every activation sharing it must have (empty in a large descriptor's text index).
@@ -1607,7 +1606,6 @@ impl ScopeDesc {
         let large = names.len() > SMALL_VAR_MAP_CAPACITY;
         let text = large.then(|| {
             Rc::new(BindingLayout {
-                id: 0,
                 slots: names
                     .iter()
                     .enumerate()
@@ -1685,6 +1683,12 @@ impl DescRef {
     /// `desc` outlives every record that names it: the active heap keeps it, or it is static.
     pub(crate) unsafe fn kept(desc: &ScopeDesc) -> Self {
         Self(std::ptr::NonNull::from(desc))
+    }
+
+    /// The layout identity of the records that share the descriptor ([`VarMap::layout_id`]).
+    #[inline]
+    pub(crate) fn identity(self) -> usize {
+        self.0.as_ptr() as usize
     }
 
     /// The descriptor of no names, which every heap shares.
@@ -2183,64 +2187,157 @@ impl Names {
     }
 }
 
-/// A record's binding values in slot order. P1 S4: the first lives in the environment cell, so
-/// a record with one binding (most block and many function records) allocates nothing beside
-/// it; more move the values to one storage block (`gc_storage`), which the record reports
-/// ([`VarMap::trace_storage`]). The values are never dropped: bindings own nothing and the
-/// collector frees their block, so an environment carries no drop glue and needs no finalizer.
-#[repr(transparent)]
-pub(crate) struct BindingValues(std::mem::ManuallyDrop<BindingVec>);
+/// The bytes of a record cell before its first in-place slot: the record (`RefCell<Scope>`),
+/// which ends with the [`Scope`] (checked when a heap is made, [`check_record_layout`]).
+pub(crate) const RECORD_HEADER: usize = std::mem::size_of::<std::cell::RefCell<Scope>>();
+const _: () = assert!(RECORD_HEADER.is_multiple_of(8));
+/// The fewest slots a record's cell holds in place: two in the 64-byte class past the 48-byte
+/// header on 64-bit targets. A spilled record keeps its block's address in the first one.
+const MIN_INLINE_SLOTS: usize = 2;
+/// The most slots a record's cell holds in place: those of the largest small cell (506 on 64-bit
+/// targets). A record of more takes the smallest cell and a storage block.
+pub(crate) const MAX_INLINE_SLOTS: usize =
+    (crate::gc_core::LARGEST_SMALL_CELL - RECORD_HEADER) / std::mem::size_of::<BindingSlot>();
 
-type BindingVec = crate::inline_vec::InlineVec<BindingSlot, 1, crate::gc_storage::GcSpill>;
-
-impl BindingValues {
-    pub(crate) fn new() -> Self {
-        Self(std::mem::ManuallyDrop::new(BindingVec::new()))
-    }
-
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self(std::mem::ManuallyDrop::new(BindingVec::with_capacity(
-            capacity,
-        )))
-    }
+/// Whether the record (`Scope`) ends the `RefCell` that holds it, so that its slots, right after
+/// it, follow the whole cell header. `RefCell`'s layout is not specified: a heap is made only
+/// where this holds.
+pub(crate) fn check_record_layout() {
+    let record = std::cell::RefCell::new(Scope {
+        vars: VarMap::header(Names::shared(DescRef::empty()), 0, false, false, false),
+        parent: None,
+        with_obj: Value::Empty,
+    });
+    let scope = record.as_ptr() as usize - std::ptr::from_ref(&record) as usize;
+    assert_eq!(
+        scope + std::mem::size_of::<Scope>(),
+        RECORD_HEADER,
+        "an environment record's slots follow its cell header"
+    );
 }
 
-impl Default for BindingValues {
-    fn default() -> Self {
-        Self::new()
-    }
+/// The size class and in-place slot capacity of a record cell for `capacity` bindings: the
+/// smallest cell holding them, or past [`MAX_INLINE_SLOTS`] the smallest cell (its bindings in a
+/// storage block).
+fn record_cell(capacity: usize) -> (u8, usize) {
+    let slots = if capacity > MAX_INLINE_SLOTS {
+        MIN_INLINE_SLOTS
+    } else {
+        capacity.max(MIN_INLINE_SLOTS)
+    };
+    let (class, size) = crate::gc_core::small_cell_class(
+        RECORD_HEADER + slots * std::mem::size_of::<BindingSlot>(),
+    )
+    .expect("a small cell");
+    (class, size)
 }
 
-impl std::ops::Deref for BindingValues {
-    type Target = BindingVec;
-    #[inline]
-    fn deref(&self) -> &BindingVec {
-        &self.0
-    }
+/// What a new record's slots hold.
+#[derive(Clone, Copy)]
+pub(crate) enum RecordSlots<'a> {
+    /// These words, slot for slot.
+    Copy(&'a [BindingSlot]),
+    /// This many bindings, each in its temporal dead zone.
+    Tdz(usize),
 }
 
-impl std::ops::DerefMut for BindingValues {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut BindingVec {
-        &mut self.0
-    }
-}
-
-impl FromIterator<BindingSlot> for BindingValues {
-    fn from_iter<I: IntoIterator<Item = BindingSlot>>(iter: I) -> Self {
-        Self(std::mem::ManuallyDrop::new(iter.into_iter().collect()))
-    }
-}
-
-impl Default for VarMap {
-    fn default() -> Self {
-        Self {
-            names: Names::shared(DescRef::empty()),
-            values: BindingValues::new(),
-            generation: std::cell::Cell::new(0),
-            layout_id: 0,
+impl RecordSlots<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Copy(slots) => slots.len(),
+            Self::Tdz(len) => len,
         }
     }
+}
+
+/// A new environment record with room for `capacity` bindings in its cell (see
+/// [`record_cell`]), holding `slots` named by `names`, slot for slot.
+fn new_record(
+    parent: Option<Env>,
+    with_obj: Value,
+    flags: (bool, bool, bool),
+    names: Names,
+    slots: RecordSlots<'_>,
+    capacity: usize,
+) -> Env {
+    let (under_with, var_boundary, catch_param) = flags;
+    let len = slots.len();
+    debug_assert_eq!(names.len(), len);
+    let (class, size) = record_cell(capacity.max(len));
+    let vars = VarMap::header(names, class, under_with, var_boundary, catch_param);
+    let spill = len > vars.inline_capacity();
+    let env = Env::new(
+        Scope {
+            vars,
+            parent,
+            with_obj,
+        },
+        size,
+    );
+    // SAFETY: a fresh record nothing else names yet: its header is written and its cell holds
+    // `inline_capacity` zeroed slots (numbers to a trace). Allocating its block reaches no
+    // safepoint, and every slot is written before the record is returned.
+    unsafe {
+        let vars = &mut (*env.scope_ptr()).vars;
+        if spill {
+            vars.spill(len);
+        }
+        let to = vars.slots_ptr();
+        match slots {
+            RecordSlots::Copy(slots) => std::ptr::copy_nonoverlapping(slots.as_ptr(), to, len),
+            RecordSlots::Tdz(len) => {
+                for slot in 0..len {
+                    to.add(slot).write(BindingSlot::TDZ);
+                }
+            }
+        }
+        vars.len = len as u32;
+    }
+    env
+}
+
+/// A layout for tests, or none (`0`): see [`VarMap::publish_layout`]. Each lives for the test
+/// process (leaked), so that it is `Copy`, as the layout ids the tests were written with were.
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TestLayout(Option<&'static std::cell::OnceCell<Rc<BindingLayout>>>);
+
+#[cfg(test)]
+impl TestLayout {
+    /// The layout identity of the records that share it (`VarMap::layout_id`), once one has.
+    pub(crate) fn identity(self) -> usize {
+        self.0
+            .and_then(std::cell::OnceCell::get)
+            .map_or(0, |layout| crate::value::scope_desc_for(layout).identity())
+    }
+}
+
+#[cfg(test)]
+impl From<i32> for TestLayout {
+    fn from(none: i32) -> Self {
+        assert_eq!(none, 0, "a test layout is made by `new_binding_layout_id`");
+        Self(None)
+    }
+}
+
+#[cfg(test)]
+impl From<&TestLayout> for TestLayout {
+    fn from(layout: &TestLayout) -> Self {
+        *layout
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TestLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TestLayout({:#x})", self.identity())
+    }
+}
+
+/// A fresh test layout (see [`VarMap::publish_layout`]).
+#[cfg(test)]
+pub(crate) fn new_binding_layout_id() -> TestLayout {
+    TestLayout(Some(Box::leak(Box::new(std::cell::OnceCell::new()))))
 }
 
 /// The bindings of a [`VarMap`] with their names, in slot order.
@@ -2260,19 +2357,132 @@ impl<'a> Iterator for VarIter<'a> {
 }
 
 impl VarMap {
-    /// Report the bindings' edges: their values and imports.
+    /// A record's header, its slots not yet counted.
+    fn header(
+        names: Names,
+        class: u8,
+        under_with: bool,
+        var_boundary: bool,
+        catch_param: bool,
+    ) -> Self {
+        Self {
+            names,
+            len: 0,
+            cap: 0,
+            generation: std::cell::Cell::new(0),
+            class,
+            under_with,
+            var_boundary,
+            catch_param,
+        }
+    }
+
+    /// The record cell's in-place slots, right after the record ([`Scope`], whose first field
+    /// this is).
+    #[inline]
+    fn inline_slots(&self) -> *mut BindingSlot {
+        // A VarMap lives only as its record's first field, in a cell `RECORD_HEADER` bytes
+        // plus its in-place slots long (see the type docs).
+        std::ptr::from_ref(self)
+            .cast::<u8>()
+            .cast_mut()
+            .wrapping_add(std::mem::size_of::<Scope>())
+            .cast()
+    }
+
+    /// The slots: in place while `cap` is 0, else in the block whose address the first in-place
+    /// slot word holds.
+    #[inline]
+    fn slots_ptr(&self) -> *mut BindingSlot {
+        if self.cap == 0 {
+            self.inline_slots()
+        } else {
+            // SAFETY: a spilled record's first in-place word holds its block's address.
+            unsafe { self.inline_slots().cast::<*mut BindingSlot>().read() }
+        }
+    }
+
+    #[inline]
+    fn slots(&self) -> &[BindingSlot] {
+        // SAFETY: the first `len` slots are initialized, in place or in the block.
+        unsafe { std::slice::from_raw_parts(self.slots_ptr(), self.len as usize) }
+    }
+
+    #[inline]
+    fn slots_mut(&mut self) -> &mut [BindingSlot] {
+        // SAFETY: as in `slots`; the record, borrowed mutably, is the slots' one owner.
+        unsafe { std::slice::from_raw_parts_mut(self.slots_ptr(), self.len as usize) }
+    }
+
+    /// The slots the record's cell holds in place.
+    #[inline]
+    fn inline_capacity(&self) -> usize {
+        (crate::gc_core::small_class_size(self.class) - RECORD_HEADER)
+            / std::mem::size_of::<BindingSlot>()
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        if self.cap == 0 {
+            self.inline_capacity()
+        } else {
+            self.cap as usize
+        }
+    }
+
+    /// Move the slots to a new storage block with room for at least `needed` (the generation's
+    /// bump is the caller's: a spill moves every slot).
+    fn spill(&mut self, needed: usize) {
+        let len = self.len as usize;
+        let cap = needed.max(len * 2).max(4);
+        let block = crate::gc_storage::alloc_block(cap * std::mem::size_of::<BindingSlot>())
+            .cast::<BindingSlot>()
+            .as_ptr();
+        // SAFETY: the block is fresh and holds `cap >= len` slots; the old storage holds `len`.
+        // A spilled record's first in-place word holds its block's address (the record reports
+        // the block, `trace_storage`).
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.slots_ptr(), block, len);
+            self.inline_slots().cast::<*mut BindingSlot>().write(block);
+        }
+        self.cap = u32::try_from(cap).expect("a record's slot count");
+    }
+
+    /// Append `slot` (the generation's bump is the caller's), spilling first if the storage is
+    /// full.
+    fn push_slot(&mut self, slot: BindingSlot) {
+        let len = self.len as usize;
+        if len == self.capacity() {
+            self.spill(len + 1);
+        }
+        // SAFETY: the storage holds more than `len` slots.
+        unsafe { self.slots_ptr().add(len).write(slot) };
+        self.len += 1;
+    }
+
+    /// Remove the slot at `slot`, moving the last into its place (as `swap_remove`).
+    fn swap_remove_slot(&mut self, slot: usize) -> BindingSlot {
+        let slots = self.slots_mut();
+        let last = slots.len() - 1;
+        slots.swap(slot, last);
+        let removed = slots[last];
+        self.len -= 1;
+        removed
+    }
+
+    /// Report the bindings' edges: their values.
     #[inline]
     pub(crate) fn trace_bindings<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        for binding in self.values.iter() {
+        for binding in self.slots() {
             binding.trace_edges(sink);
         }
     }
 
-    /// Report the record's blocks: the spilled values' and the names'.
+    /// Report the record's blocks: the spilled slots' and the names' (with their imports).
     #[inline]
     pub(crate) fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        if let Some(block) = self.values.spill_ptr() {
-            crate::gc_storage::trace_block(block, sink);
+        if self.cap != 0 {
+            crate::gc_storage::trace_block(self.slots_ptr() as *const u8, sink);
         }
         self.names.trace(sink);
     }
@@ -2281,31 +2491,26 @@ impl VarMap {
     /// different eval-created key set retains the dynamic names. Moving bindings
     /// invalidates raw-pointer caches before any address can change.
     pub(crate) fn share_layout(&mut self, cached: &std::cell::OnceCell<Rc<BindingLayout>>) {
-        if self.layout_id != 0 {
+        if self.layout_id() != 0 {
             return;
         }
+        let len = self.len as usize;
         let layout = cached.get_or_init(|| {
             Rc::new(BindingLayout {
-                id: new_binding_layout_id(),
                 slots: self
                     .keys()
                     .enumerate()
                     .map(|(slot, name)| (Rc::from(&*name.text()), slot))
                     .collect(),
-                attrs: (0..self.values.len())
-                    .map(|slot| self.names.attrs(slot))
-                    .collect(),
+                attrs: (0..len).map(|slot| self.names.attrs(slot)).collect(),
             })
         });
-        if layout.id == 0
-            || self.values.len() != layout.slots.len()
-            || self.values.len() != layout.attrs.len()
-        {
+        if len == 0 || len != layout.slots.len() || len != layout.attrs.len() {
             return;
         }
         // Every name must be the layout's, with its slot's attributes (the descriptor's): a
         // descriptor holds no import.
-        for slot in 0..self.values.len() {
+        for slot in 0..len {
             let name = self.names.get(slot).expect("a name per value");
             let Some(target) = layout.slot_of_atom(name) else {
                 return;
@@ -2318,7 +2523,7 @@ impl VarMap {
         self.bump();
         // A linear permutation into the shared ordering, without cloning values
         // or retaining an old activation. All names were validated above.
-        for slot in 0..self.values.len() {
+        for slot in 0..len {
             loop {
                 let name = self.names.get(slot).expect("a name per value");
                 let target = desc.slot_of(name).expect("validated");
@@ -2326,11 +2531,20 @@ impl VarMap {
                     break;
                 }
                 self.names.swap_unindexed(slot, target);
-                self.values.swap(slot, target);
+                self.slots_mut().swap(slot, target);
             }
         }
         self.names = Names::shared(desc);
-        self.layout_id = layout.id;
+    }
+
+    /// Share `layout` (tests): records published with one layout share a descriptor of their names
+    /// and attributes, made from the first, as a tree-walked function's activations do
+    /// ([`VarMap::share_layout`]).
+    #[cfg(test)]
+    pub(crate) fn publish_layout(&mut self, layout: impl Into<TestLayout>) {
+        if let Some(cell) = layout.into().0 {
+            self.share_layout(cell);
+        }
     }
 
     /// The descriptor the record shares, if it does.
@@ -2338,45 +2552,17 @@ impl VarMap {
         self.names.desc().filter(|desc| !desc.names.is_empty())
     }
 
-    /// A compiled scope's record: `values` named by `desc`'s names, slot for slot.
-    /// Structural writes still use `insert`/`remove` and invalidate the published
-    /// layout before changing or replacing this storage.
-    pub(crate) fn from_fixed_bindings(values: BindingValues, desc: DescRef) -> Self {
-        debug_assert_eq!(values.len(), desc.names.len());
-        Self {
-            names: Names::shared(desc),
-            values,
-            generation: std::cell::Cell::new(0),
-            layout_id: 0,
-        }
-    }
-
-    /// Before publication only: the initialization plan owns this exact slot.
-    pub(crate) fn initialize_fixed_value(&mut self, slot: usize, value: Value) {
-        debug_assert_eq!(self.layout_id, 0);
-        self.values[slot].value = value;
-    }
-
     /// Requested bytes owned directly by this binding map, plus whether the result is exact.
     /// `HashMap` bucket allocation sizes are intentionally reported as an incomplete lower bound
     /// because the standard library does not expose their requested layout.
+    /// The cell's in-place slot words count here, beyond the record's header (the scope body).
     pub(crate) fn retained_requested_storage_bytes(&self) -> (usize, bool) {
         let (names, exact) = self.names.retained_requested_storage_bytes();
+        let slots = (self.cap as usize).saturating_add(self.inline_capacity());
         (
-            names.saturating_add(
-                self.values
-                    .heap_capacity()
-                    .saturating_mul(std::mem::size_of::<BindingSlot>()),
-            ),
+            names.saturating_add(slots.saturating_mul(std::mem::size_of::<BindingSlot>())),
             exact,
         )
-    }
-
-    pub(crate) fn with_capacity(capacity: usize) -> VarMap {
-        VarMap {
-            values: BindingValues::with_capacity(capacity),
-            ..Self::default()
-        }
     }
 
     /// The structural generation (name-cache validation token).
@@ -2385,7 +2571,7 @@ impl VarMap {
         self.generation.get()
     }
     /// Exhaustion permanently disables identity/generation pointer proofs for this map.
-    /// Published fixed-layout identities are independent, non-recycled key-set proofs.
+    /// Layout identities are independent, non-recycled key-set proofs.
     #[inline]
     pub(crate) fn matches_generation(&self, generation: u32) -> bool {
         generation != u32::MAX && self.generation.get() == generation
@@ -2393,17 +2579,24 @@ impl VarMap {
     #[cfg(test)]
     pub(crate) fn set_generation_for_test(&mut self, generation: u32) {
         self.generation.set(generation);
-        self.layout_id = 0;
     }
     #[inline]
     fn bump(&mut self) {
         self.generation.set(self.generation.get().saturating_add(1));
-        self.layout_id = 0;
     }
 
+    /// The record's layout identity, which name caches compare: the address of the descriptor
+    /// whose names (and attributes) it shares, which its heap keeps for as long as it lives, so
+    /// that it is never reused under a cache; or 0 for a record without one (its own names
+    /// change in place: only its identity and generation prove anything about them). A record
+    /// that shares a descriptor has exactly its names, in its order, and keeps its slots in
+    /// place unless the descriptor's are more than a cell holds.
     #[inline]
-    pub(crate) fn layout_id(&self) -> u32 {
-        self.layout_id
+    pub(crate) fn layout_id(&self) -> usize {
+        match self.names.desc() {
+            Some(desc) if !desc.names.is_empty() => self.names.0.get(),
+            _ => 0,
+        }
     }
 
     /// Stable ordered slot within an activation.
@@ -2425,12 +2618,12 @@ impl VarMap {
         self.fixed_binding_at_mut(slot)
     }
 
-    /// The binding at `slot`. The caller has checked the same nonzero published ordered-layout
-    /// ID, or knows the slot otherwise.
+    /// The binding at `slot`. The caller has checked the same nonzero layout identity, or knows
+    /// the slot otherwise.
     #[inline]
     pub(crate) fn fixed_binding_at(&self, slot: usize) -> Option<BindingRef<'_>> {
         let names = &self.names;
-        self.values.get(slot).map(|value| BindingRef {
+        self.slots().get(slot).map(|value| BindingRef {
             slot: value,
             names,
             index: slot,
@@ -2439,18 +2632,17 @@ impl VarMap {
 
     #[inline]
     pub(crate) fn fixed_binding_at_mut(&mut self, slot: usize) -> Option<BindingMut<'_>> {
-        let names = &self.names;
-        self.values.get_mut(slot).map(|value| BindingMut {
+        if slot >= self.len as usize {
+            return None;
+        }
+        // SAFETY: `slot` is below the count; the record, borrowed mutably, owns the slots, which
+        // the names do not overlap.
+        let value = unsafe { &mut *self.slots_ptr().add(slot) };
+        Some(BindingMut {
             slot: value,
-            names,
+            names: &self.names,
             index: slot,
         })
-    }
-
-    /// Only the creator of a fresh, fully instantiated fixed-key activation may
-    /// publish its plan's identity. Never publish on a reused/dynamic environment.
-    pub(crate) fn publish_layout(&mut self, layout_id: u32) {
-        self.layout_id = layout_id;
     }
 
     /// Create the binding `k` as `v` describes it, or replace the binding of that name.
@@ -2460,23 +2652,20 @@ impl VarMap {
         if let Some(slot) = self.names.slot_of(k) {
             // InitializeBinding and same-name declaration replacement keep the key set and
             // addresses; a replacement with other attributes or an import gives the record its
-            // own names first (a descriptor never changes), and so a new layout. A lexical
+            // own names first (a descriptor never changes), and so no layout identity. A lexical
             // declaration stays one: InitializeBinding's re-insertion does not re-declare it.
             self.generation.set(self.generation.get().saturating_add(1));
             let lexical = self.names.attrs(slot).lexical();
             let attrs = v
                 .attrs
                 .with(BindingAttrs::LEXICAL, lexical || v.attrs.lexical());
-            let changed = self.names.set_attrs(slot, attrs, v.import);
-            if changed || self.names.kind() != Names::SHARED {
-                self.layout_id = 0;
-            }
-            self.values[slot] = slot_value;
+            self.names.set_attrs(slot, attrs, v.import);
+            self.slots_mut()[slot] = slot_value;
             return;
         }
         self.bump();
         self.names.push(k, v.attrs, v.import);
-        self.values.push(slot_value);
+        self.push_slot(slot_value);
     }
 
     /// Give the binding `k` other attributes, as a record's replacement of it would (tests: a
@@ -2527,13 +2716,13 @@ impl VarMap {
         self.bump();
         let slot = self.names.slot_of_text(k)?;
         self.names.swap_remove(slot);
-        Some(self.values.swap_remove(slot).value)
+        Some(self.swap_remove_slot(slot).value())
     }
 
     pub fn clear(&mut self) {
         self.bump();
         self.names = Names::shared(DescRef::empty());
-        self.values.clear();
+        self.len = 0;
     }
 
     /// In-place binding write: bindings don't move, so the generation stays (see the type docs).
@@ -2568,49 +2757,70 @@ impl VarMap {
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = crate::atom::Atom> + '_ {
-        (0..self.values.len()).map(|slot| self.names.get(slot).expect("a name per value"))
+        (0..self.len as usize).map(|slot| self.names.get(slot).expect("a name per value"))
     }
 
     /// The bindings, in slot order.
     #[cfg(test)]
     pub(crate) fn values(&self) -> impl Iterator<Item = BindingRef<'_>> + '_ {
-        (0..self.values.len()).filter_map(|slot| self.fixed_binding_at(slot))
+        (0..self.len as usize).filter_map(|slot| self.fixed_binding_at(slot))
     }
 
-    /// Byte offset of the generation counter within a `VarMap` (for the JIT's inline template).
-    pub(crate) fn generation_offset() -> usize {
+    /// The bindings' slot words, in slot order (to copy a record's: CreatePerIterationEnvironment).
+    #[inline]
+    pub(crate) fn slot_words(&self) -> &[BindingSlot] {
+        self.slots()
+    }
+
+    /// While its plan instantiates a fresh activation: initialize the binding at `slot`.
+    pub(crate) fn initialize_fixed_value(&mut self, slot: usize, value: Value) {
+        self.slots_mut()[slot].initialize(value);
+    }
+
+    /// Byte offsets within a `VarMap` that generated code reads: the generation counter, the
+    /// names word (the layout identity, [`VarMap::layout_id`]), the slot count and the spill
+    /// capacity.
+    pub(crate) const fn generation_offset() -> usize {
         std::mem::offset_of!(VarMap, generation)
     }
 
-    pub(crate) fn layout_id_offset() -> usize {
-        std::mem::offset_of!(VarMap, layout_id)
+    pub(crate) const fn names_offset() -> usize {
+        std::mem::offset_of!(VarMap, names)
     }
 
-    /// Where generated code finds a record's binding values: an `InlineVec` whose first value
-    /// stays in the environment cell, probed in place and spilled. A native fresh-activation
-    /// hit additionally requires the same nonzero ordered layout identity. Unknown compiler
-    /// layouts simply retain the checked map path.
-    pub(crate) fn jit_small_storage_layout() -> Option<JitBindingStorage> {
-        let storage =
-            BindingVec::probe_jit_layout(|| Binding::data(Value::Num(7.0), true, true).slot())?;
-        Some(JitBindingStorage {
-            entries: std::mem::offset_of!(VarMap, values),
-            storage,
+    /// Where generated code finds a record's slots, relative to its `VarMap`: one word each, the
+    /// count and the spill capacity in the header, the slots in place right after the record
+    /// while the capacity is 0, else in the block whose address the first in-place word holds.
+    pub(crate) fn jit_slots_layout() -> JitBindingStorage {
+        JitBindingStorage {
+            entries: 0,
+            storage: crate::value::JitVecLayout::Inline {
+                len: std::mem::offset_of!(VarMap, len),
+                cap: std::mem::offset_of!(VarMap, cap),
+                inline: std::mem::size_of::<Scope>(),
+                heap: std::mem::size_of::<Scope>(),
+                inline_capacity: MIN_INLINE_SLOTS,
+            },
             stride: std::mem::size_of::<BindingSlot>(),
             binding: 0,
-        })
+        }
+    }
+
+    /// The offset of the flag generated code reads to refuse a closure under a `with`.
+    pub(crate) const fn under_with_offset() -> usize {
+        std::mem::offset_of!(VarMap, under_with)
     }
 }
 
 /// Where generated code finds a binding map's values, relative to its [`VarMap`]
-/// (see [`VarMap::jit_small_storage_layout`]).
+/// (see [`VarMap::jit_slots_layout`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct JitBindingStorage {
-    /// The values' vector.
+    /// The slots' sequence.
     pub(crate) entries: usize,
-    /// How the vector holds its `Binding` elements.
+    /// How the sequence holds its slots.
     pub(crate) storage: crate::value::JitVecLayout,
-    /// The element stride, and the `Binding` within an element.
+    /// The slot stride, and the value within a slot.
     pub(crate) stride: usize,
     pub(crate) binding: usize,
 }
@@ -2677,76 +2887,85 @@ mod binding_layout_tests {
 
     #[test]
     fn cold_environment_layout_preserves_values_across_order_and_structural_changes() {
+        let _engine = crate::Engine::new();
         let cached = std::cell::OnceCell::new();
-        let mut first = VarMap::default();
-        let mut second = VarMap::default();
+        let first_record = new_var_scope(None);
+        let second_record = new_var_scope(None);
+        let mut first = first_record.borrow_mut();
+        let mut second = second_record.borrow_mut();
         for n in 0..24 {
-            first.insert(
+            first.vars.insert(
                 format!("v{n}"),
                 Binding::data(Value::Num(n as f64), true, true),
             );
-            second.insert(
+            second.vars.insert(
                 format!("v{}", 23 - n),
                 Binding::data(Value::Num((123 - n) as f64), true, true),
             );
         }
-        let before = first.generation();
-        first.share_layout(&cached);
-        second.share_layout(&cached);
+        let before = first.vars.generation();
+        first.vars.share_layout(&cached);
+        second.vars.share_layout(&cached);
         assert!(
-            first.generation() > before,
+            first.vars.generation() > before,
             "old raw pointers must fail before entries move"
         );
-        let layout = first.layout_id();
+        let layout = first.vars.layout_id();
         assert_ne!(layout, 0);
-        assert_eq!(second.layout_id(), layout);
+        assert_eq!(second.vars.layout_id(), layout);
         for n in 0..24 {
             let name = format!("v{n}");
-            let slot = first.binding_slot(&name).unwrap();
-            assert_eq!(second.binding_slot(&name), Some(slot));
+            let slot = first.vars.binding_slot(&name).unwrap();
+            assert_eq!(second.vars.binding_slot(&name), Some(slot));
             assert!(
-                matches!((second.fixed_binding_at(slot).unwrap().value()).view(), ValueView::Num(v) if v == (100+n) as f64)
+                matches!((second.vars.fixed_binding_at(slot).unwrap().value()).view(), ValueView::Num(v) if v == (100+n) as f64)
             );
         }
-        let slot = first.binding_slot("v23").unwrap();
-        first.insert("v23", Binding::data(Value::Num(998.), true, false));
+        let slot = first.vars.binding_slot("v23").unwrap();
+        first
+            .vars
+            .insert("v23", Binding::data(Value::Num(998.), true, false));
         assert_eq!(
-            first.layout_id(),
+            first.vars.layout_id(),
             layout,
             "same names and attributes preserve the key proof"
         );
-        let binding = first.fixed_binding_at(slot).unwrap();
+        let binding = first.vars.fixed_binding_at(slot).unwrap();
         assert!(binding.mutable() && !binding.initialized());
-        assert!(matches!((binding.value()).view(), ValueView::Num(998.)));
-        first.insert("v23", Binding::data(Value::Num(999.), false, false));
+        assert!(binding.value().is_empty(), "TDZ is the empty word");
+        first
+            .vars
+            .insert("v23", Binding::data(Value::Num(999.), false, true));
         assert_eq!(
-            first.layout_id(),
+            first.vars.layout_id(),
             0,
             "other attributes give the record its own names"
         );
-        assert_eq!(first.binding_slot("v23"), Some(slot), "in place");
-        let binding = first.fixed_binding_at(slot).unwrap();
-        assert!(!binding.mutable() && !binding.initialized());
+        assert_eq!(first.vars.binding_slot("v23"), Some(slot), "in place");
+        let binding = first.vars.fixed_binding_at(slot).unwrap();
+        assert!(!binding.mutable() && binding.initialized());
         assert!(matches!((binding.value()).view(), ValueView::Num(999.)));
         assert!(
-            second.shared_desc().is_some(),
+            second.vars.shared_desc().is_some(),
             "the shared descriptor never changes"
         );
-        assert!(second.get("v23").unwrap().mutable());
-        first.insert("dynamic", Binding::data(Value::Num(7.), true, true));
-        assert_eq!(first.layout_id(), 0);
-        first.share_layout(&cached);
+        assert!(second.vars.get("v23").unwrap().mutable());
+        first
+            .vars
+            .insert("dynamic", Binding::data(Value::Num(7.), true, true));
+        assert_eq!(first.vars.layout_id(), 0);
+        first.vars.share_layout(&cached);
         assert_eq!(
-            first.layout_id(),
+            first.vars.layout_id(),
             0,
             "a different key set must not adopt the layout"
         );
-        assert!(first.get("v23").is_some());
-        assert!(second.remove("v0").is_some());
-        assert_eq!(second.layout_id(), 0);
-        assert!(second.get("v0").is_none());
-        second.clear();
-        assert_eq!(second.keys().count(), 0);
+        assert!(first.vars.get("v23").is_some());
+        assert!(second.vars.remove("v0").is_some());
+        assert_eq!(second.vars.layout_id(), 0);
+        assert!(second.vars.get("v0").is_none());
+        second.vars.clear();
+        assert_eq!(second.vars.keys().count(), 0);
     }
 
     fn evaluate(engine: &mut crate::Engine, source: &str) -> String {
@@ -2834,7 +3053,7 @@ mod binding_layout_tests {
                 .vars
                 .get_mut("m")
                 .unwrap()
-                .set_initialized(false);
+                .enter_tdz_for_test();
             assert_eq!(
                 evaluate(&mut engine, "try {one(); 'bad'} catch(e) {e.name}"),
                 "ReferenceError"
@@ -2875,24 +3094,36 @@ mod binding_layout_tests {
 
     #[test]
     fn binding_layout_invalidates_every_structural_mutation_but_not_live_writes() {
-        let mut vars = VarMap::default();
+        let _engine = crate::Engine::new();
+        let record = new_var_scope(None);
+        let mut scope = record.borrow_mut();
+        let vars = &mut scope.vars;
         let id = new_binding_layout_id();
-        assert_ne!(id, 0);
         vars.insert("value", Binding::data(Value::Num(1.0), true, true));
         vars.publish_layout(id);
+        let layout = vars.layout_id();
+        assert_ne!(layout, 0);
+        assert_eq!(layout, id.identity());
         vars.get_mut("value").unwrap().set_value(Value::Num(2.0));
-        assert_eq!(vars.layout_id(), id);
-        vars.get_mut("value").unwrap().set_initialized(false);
-        assert_eq!(vars.layout_id(), id, "TDZ is checked live");
+        assert_eq!(vars.layout_id(), layout);
+        let old = vars.get_mut("value").unwrap().enter_tdz_for_test();
+        assert!(matches!(old.view(), ValueView::Num(2.0)));
+        assert_eq!(vars.layout_id(), layout, "TDZ is checked live");
         vars.insert("value", Binding::data(Value::Num(3.0), true, true));
-        assert_eq!(vars.layout_id(), 0, "even same-key replacement invalidates");
-        vars.publish_layout(id);
+        assert_eq!(
+            vars.layout_id(),
+            layout,
+            "a same-key replacement with the same attributes keeps the descriptor"
+        );
         vars.remove("missing");
+        assert_eq!(vars.layout_id(), layout, "nothing to remove");
+        vars.remove("value");
         assert_eq!(vars.layout_id(), 0);
-        vars.publish_layout(id);
         vars.clear();
         assert_eq!(vars.layout_id(), 0);
+        vars.insert("value", Binding::data(Value::Num(4.0), true, true));
         vars.publish_layout(id);
+        assert_eq!(vars.layout_id(), layout, "the same names share it again");
         for n in 0..20 {
             vars.insert(
                 n.to_string(),
@@ -2904,40 +3135,89 @@ mod binding_layout_tests {
             0,
             "small-to-large growth also invalidates"
         );
+        assert!(matches!(
+            vars.get("value").unwrap().value().view(),
+            ValueView::Num(4.0)
+        ));
+        assert!(matches!(
+            vars.get("19").unwrap().value().view(),
+            ValueView::Num(19.0)
+        ));
     }
 
     #[test]
-    fn binding_layout_id_exhaustion_never_reuses_old_id() {
-        let next = std::sync::atomic::AtomicU32::new(u32::MAX - 1);
-        assert_eq!(allocate_binding_layout_id(&next), u32::MAX - 1);
-        assert_eq!(allocate_binding_layout_id(&next), 0);
-        assert_eq!(allocate_binding_layout_id(&next), 0);
+    fn binding_layout_identities_are_kept_descriptors_never_reused() {
+        let mut engine = crate::Engine::new();
+        let (first, second) = (new_binding_layout_id(), new_binding_layout_id());
+        for (layout, name) in [(&first, "a"), (&second, "b")] {
+            let record = new_var_scope(None);
+            record
+                .borrow_mut()
+                .vars
+                .insert(name, Binding::data(Value::Num(1.0), true, true));
+            record.borrow_mut().vars.publish_layout(layout);
+            assert_eq!(record.borrow().vars.layout_id(), layout.identity());
+        }
+        assert_ne!(first.identity(), 0);
+        assert_ne!(first.identity(), second.identity());
+        // The heap keeps the descriptors once their records are gone: no later descriptor can
+        // take an address a cache may hold.
+        let kept = first.identity();
+        engine.interp.gc_collect();
+        let third = new_binding_layout_id();
+        let record = new_var_scope(None);
+        record
+            .borrow_mut()
+            .vars
+            .insert("c", Binding::data(Value::Num(1.0), true, true));
+        record.borrow_mut().vars.publish_layout(third);
+        assert_ne!(third.identity(), kept);
+        assert_eq!(first.identity(), kept);
     }
 }
 
+/// An Environment Record: its bindings ([`VarMap`], first, with the record's flags), its outer
+/// record and, for a `with` record, its object; its binding slots follow it in its cell (see
+/// [`VarMap`]): a 48-byte header on 64-bit targets.
+#[repr(C)]
 pub struct Scope {
     pub vars: VarMap,
     pub parent: Option<Env>,
     /// For a `with (obj)` block: identifier resolution checks `obj`'s properties before the parent.
     with_obj: Value,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(RECORD_HEADER == 48);
+
+impl Scope {
     /// `true` when this scope or ANY ancestor is a `with` scope (propagated at construction).
     /// Compiled tiers refuse to run a body whose closure chain is under a `with`: the VM's
     /// free-name ops re-resolve at execution time, but a with-object binding can appear or
     /// vanish between the spec's reference resolution and the store (e.g. `x = (delete env.x,
     /// 0)`) — the tree-walker models that; the ops don't.
-    pub under_with: bool,
+    #[inline]
+    pub fn under_with(&self) -> bool {
+        self.vars.under_with
+    }
+
     /// `true` if this is a *variable* environment (a function body scope, the global scope, or an
-    /// `eval` scope) — the target for `var`/function hoisting. Block, `with`, and function *parameter*
-    /// scopes are `false`, so a sloppy direct `eval` hoists its vars past them into the nearest
-    /// enclosing variable environment (see EvalDeclarationInstantiation).
-    pub var_boundary: bool,
+    /// `eval` scope) — the target for `var`/function hoisting. Block, `with`, and function
+    /// *parameter* scopes are `false`, so a sloppy direct `eval` hoists its vars past them into
+    /// the nearest enclosing variable environment (see EvalDeclarationInstantiation).
+    #[inline]
+    pub fn var_boundary(&self) -> bool {
+        self.vars.var_boundary
+    }
+
     /// `true` for a `catch` clause's parameter environment. A sloppy direct `eval`'s
     /// EvalDeclarationInstantiation walk skips it, so `eval("var e")` inside `catch (e) { … }` is
     /// allowed (the web-compatibility carve-out for VariableStatements in catch blocks).
-    pub catch_param: bool,
-}
+    #[inline]
+    pub fn catch_param(&self) -> bool {
+        self.vars.catch_param
+    }
 
-impl Scope {
     /// A with record is present exactly when its word is not EMPTY. Presence is independent
     /// of the held value's truthiness or kind (including synthetic Null records in tests).
     #[inline]
@@ -2976,9 +3256,6 @@ impl Scope {
             vars,
             parent,
             with_obj,
-            under_with: _,
-            var_boundary: _,
-            catch_param: _,
         } = self;
         vars.trace_storage(sink);
         vars.trace_bindings(sink);
@@ -2988,11 +3265,6 @@ impl Scope {
         sink.value(with_obj);
     }
 }
-
-/// P2 W2b: an environment cell, with its first binding's value in place and its names in one
-/// word, fits the heap's 96-byte size class (P1 S4's, with the name in the entry, was 128).
-#[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 96);
 
 /// A binding's attributes, which its record keeps with its name (a descriptor's per-name byte,
 /// the record's own list, or the spare bits of a one-name word; see [`Names`]): fixed for the
@@ -3118,70 +3390,63 @@ impl Binding {
         self.attrs
     }
 
-    /// The binding's storage in its record's slot.
+    /// The binding's storage in its record's slot: its value, or the TDZ word.
     #[inline]
     pub(crate) fn slot(&self) -> BindingSlot {
-        BindingSlot {
-            value: self.value,
-            initialized: self.initialized,
+        if self.initialized {
+            debug_assert!(
+                !self.value.is_empty(),
+                "a binding's value is a language value"
+            );
+            BindingSlot(self.value)
+        } else {
+            BindingSlot::TDZ
         }
     }
 }
 
-/// How a [`VarMap`] stores a binding, slot for slot: its value and whether it is initialized
-/// (TDZ). Its attributes live with the record's names. Generated code reads the fields at the
-/// offsets `value::jit_layout` measures.
+/// How a [`VarMap`] stores a binding, slot for slot: one word, its value, or `Value::Empty`
+/// while the binding is in its temporal dead zone (TDZ), a word no language value can be, as V8's
+/// hole, SpiderMonkey's uninitialized-lexical magic value and JSC's empty JSValue are (W3 item 3,
+/// Decision 20b). Its attributes live with the record's names.
 #[derive(Clone, Copy)]
-pub(crate) struct BindingSlot {
-    /// Execution word only; initialization remains an independent flag.
-    value: Value,
-    /// `false` while a `let`/`const` is in its temporal dead zone.
-    initialized: bool,
-}
+#[repr(transparent)]
+pub(crate) struct BindingSlot(Value);
 
 impl BindingSlot {
-    /// The binding's value: meaningful only while it is initialized.
+    /// A binding in its temporal dead zone.
+    pub(crate) const TDZ: BindingSlot = BindingSlot(Value::Empty);
+
+    /// The binding's value: `Value::Empty` while it is in its temporal dead zone.
     #[inline]
     pub(crate) fn value(&self) -> Value {
-        self.value
+        self.0
     }
 
     /// Whether the binding is initialized, out of its temporal dead zone.
     #[inline]
     pub(crate) fn initialized(&self) -> bool {
-        self.initialized
+        !self.0.is_empty()
     }
 
     /// Write the value of an initialized binding in place (SetMutableBinding's write).
     #[inline]
     pub(crate) fn set_value(&mut self, value: Value) {
-        self.value = value;
+        debug_assert!(!value.is_empty(), "a binding's value is a language value");
+        self.0 = value;
     }
 
-    /// InitializeBinding: write the value and end the temporal dead zone.
+    /// InitializeBinding: write the value, which ends the temporal dead zone.
     #[inline]
     pub(crate) fn initialize(&mut self, value: Value) {
-        self.value = value;
-        self.initialized = true;
-    }
-
-    pub(crate) const fn value_offset() -> usize {
-        std::mem::offset_of!(Self, value)
-    }
-
-    /// Generated code's offset of the TDZ flag.
-    pub(crate) const fn initialized_offset() -> usize {
-        std::mem::offset_of!(Self, initialized)
+        debug_assert!(!value.is_empty(), "a binding's value is a language value");
+        self.0 = value;
     }
 
     /// [`GcTrace`](crate::gc_trace::GcTrace)'s edges, for any sink.
     #[inline]
     fn trace_edges<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        let Self {
-            value,
-            initialized: _,
-        } = self;
-        sink.value(value);
+        sink.value(&self.0);
     }
 }
 
@@ -3194,16 +3459,16 @@ pub(crate) struct BindingRef<'a> {
 }
 
 impl<'a> BindingRef<'a> {
-    /// The binding's value: meaningful only while it is initialized.
+    /// The binding's value: `Value::Empty` while it is in its temporal dead zone.
     #[inline]
     pub(crate) fn value(&self) -> Value {
-        self.slot.value
+        self.slot.value()
     }
 
     /// Whether the binding is initialized, out of its temporal dead zone.
     #[inline]
     pub(crate) fn initialized(&self) -> bool {
-        self.slot.initialized
+        self.slot.initialized()
     }
 
     /// The binding's attributes.
@@ -3251,8 +3516,12 @@ impl<'a> BindingRef<'a> {
     /// The binding as a record would create it again (for copying it into another record).
     pub(crate) fn to_binding(&self) -> Binding {
         Binding {
-            value: self.slot.value,
-            initialized: self.slot.initialized,
+            value: if self.initialized() {
+                self.value()
+            } else {
+                Value::Undefined
+            },
+            initialized: self.initialized(),
             attrs: self.attrs(),
             import: self.import(),
         }
@@ -3281,16 +3550,16 @@ pub(crate) struct BindingMut<'a> {
 }
 
 impl BindingMut<'_> {
-    /// The binding's value: meaningful only while it is initialized.
+    /// The binding's value: `Value::Empty` while it is in its temporal dead zone.
     #[inline]
     pub(crate) fn value(&self) -> Value {
-        self.slot.value
+        self.slot.value()
     }
 
     /// Whether the binding is initialized, out of its temporal dead zone.
     #[inline]
     pub(crate) fn initialized(&self) -> bool {
-        self.slot.initialized
+        self.slot.initialized()
     }
 
     /// The binding's attributes.
@@ -3322,23 +3591,22 @@ impl BindingMut<'_> {
         self.slot.set_value(value);
     }
 
-    /// InitializeBinding: write the value and end the temporal dead zone.
+    /// InitializeBinding: write the value, which ends the temporal dead zone.
     #[inline]
     pub(crate) fn initialize(&mut self, value: Value) {
         self.slot.initialize(value);
     }
 
-    /// End the temporal dead zone without writing the value (the value is already in place).
+    /// Write `word`, a value or the TDZ word: a borrowed parameter's slot word as it is.
     #[inline]
-    pub(crate) fn mark_initialized(&mut self) {
-        self.slot.initialized = true;
+    pub(crate) fn set_word(&mut self, word: Value) {
+        self.slot.0 = word;
     }
 
-    /// Put the binding back in its temporal dead zone (tests, and a borrowed parameter's
-    /// empty word).
-    #[inline]
-    pub(crate) fn set_initialized(&mut self, initialized: bool) {
-        self.slot.initialized = initialized;
+    /// Put the binding back in its temporal dead zone, returning its value (tests).
+    #[cfg(test)]
+    pub(crate) fn enter_tdz_for_test(&mut self) -> Value {
+        std::mem::replace(&mut self.slot.0, Value::Empty)
     }
 
     /// The binding's storage, for a cache that validates it by its record's generation.
@@ -3379,29 +3647,42 @@ impl BindingGetterCache {
 /// the ordinary Call path.
 pub(crate) const MAX_BINDING_GETTER_SCOPES: usize = 16;
 
-/// A new environment record.
+/// Whether a record under `parent` is under a `with` (see [`Scope::under_with`]).
 #[inline]
-fn new_env(
-    vars: VarMap,
-    parent: Option<Env>,
-    with_obj: Option<Value>,
-    under_with: bool,
-    var_boundary: bool,
-    catch_param: bool,
-) -> Env {
-    Env::new(Scope {
-        vars,
-        parent,
-        with_obj: (with_obj.unwrap_or(Value::Empty)),
-        under_with,
-        var_boundary,
-        catch_param,
-    })
+fn under_with(parent: Option<&Env>) -> bool {
+    parent.is_some_and(|p| p.borrow().under_with())
 }
 
 pub fn new_scope(parent: Option<Env>) -> Env {
-    let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
-    new_env(Default::default(), parent, None, under_with, false, false)
+    let flags = (under_with(parent.as_ref()), false, false);
+    new_record(
+        parent,
+        Value::Empty,
+        flags,
+        Names::shared(DescRef::empty()),
+        RecordSlots::Copy(&[]),
+        0,
+    )
+}
+
+/// A block's or a loop iteration's record holding `slots`, named by `desc`'s names, slot for slot
+/// (a compiled lexical scope's, its key set fixed), or a `catch` parameter environment's.
+pub(crate) fn new_scope_with_desc(
+    parent: Env,
+    catch: bool,
+    desc: DescRef,
+    slots: RecordSlots<'_>,
+) -> Env {
+    let flags = (parent.borrow().under_with(), false, catch);
+    let len = slots.len();
+    new_record(
+        Some(parent),
+        Value::Empty,
+        flags,
+        Names::shared(desc),
+        slots,
+        len,
+    )
 }
 
 /// A *variable* environment: the hoisting target for `var`/function declarations (function body,
@@ -3410,38 +3691,60 @@ pub fn new_var_scope(parent: Option<Env>) -> Env {
     new_var_scope_with_capacity(parent, 0)
 }
 
+/// [`new_var_scope`] with room for `capacity` bindings in its cell.
 pub(crate) fn new_var_scope_with_capacity(parent: Option<Env>, capacity: usize) -> Env {
-    new_var_scope_with_bindings(parent, VarMap::with_capacity(capacity))
+    let flags = (under_with(parent.as_ref()), true, false);
+    new_record(
+        parent,
+        Value::Empty,
+        flags,
+        Names::shared(DescRef::empty()),
+        RecordSlots::Copy(&[]),
+        capacity,
+    )
 }
 
-pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> Env {
-    let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
-    new_env(vars, parent, None, under_with, true, false)
+/// A variable environment holding `slots`, named by `desc`'s names, slot for slot: a compiled
+/// function's activation, which its plan makes.
+pub(crate) fn new_var_scope_with_desc(
+    parent: Option<Env>,
+    desc: DescRef,
+    slots: &[BindingSlot],
+) -> Env {
+    let flags = (under_with(parent.as_ref()), true, false);
+    new_record(
+        parent,
+        Value::Empty,
+        flags,
+        Names::shared(desc),
+        RecordSlots::Copy(slots),
+        slots.len(),
+    )
 }
 
 /// A `catch (e)` parameter environment: like a block scope, but flagged so a sloppy direct `eval`'s
 /// var-hoisting walk skips it (see [`Scope::catch_param`]).
 pub fn new_catch_scope(parent: Env) -> Env {
-    let under_with = parent.borrow().under_with;
-    new_env(
-        Default::default(),
+    let flags = (parent.borrow().under_with(), false, true);
+    new_record(
         Some(parent),
-        None,
-        under_with,
-        false,
-        true,
+        Value::Empty,
+        flags,
+        Names::shared(DescRef::empty()),
+        RecordSlots::Copy(&[]),
+        0,
     )
 }
 
 /// A `with (obj)` environment: identifier lookups consult `obj` before the enclosing scope.
 pub fn new_with_scope(parent: Env, obj: Value) -> Env {
-    new_env(
-        Default::default(),
+    new_record(
         Some(parent),
-        Some(obj),
-        true,
-        false,
-        false,
+        obj,
+        (true, false, false),
+        Names::shared(DescRef::empty()),
+        RecordSlots::Copy(&[]),
+        0,
     )
 }
 
@@ -3450,7 +3753,7 @@ pub fn new_with_scope(parent: Env, obj: Value) -> Env {
 pub fn nearest_var_env(env: &Env) -> Env {
     let mut cur = *env;
     loop {
-        if cur.borrow().var_boundary {
+        if cur.borrow().var_boundary() {
             return cur;
         }
         let parent = cur.borrow().parent;
@@ -14297,7 +14600,7 @@ impl Interp {
                     Callable::User(user)
                         if object.ic_plain.get()
                             && user.realm == Gc::as_ptr(&self.global) as usize
-                            && !user.env.borrow().under_with =>
+                            && !user.env.borrow().under_with() =>
                     {
                         (Rc::as_ptr(&user.func), Env::as_ptr(&user.env))
                     }
@@ -15085,54 +15388,55 @@ impl Interp {
         {
             return None;
         }
-        let initializer_plan =
-            if let Some(runtime) = chunk.jit_forwarder_runtime(initializer_obj, apply_ptr) {
-                Some(runtime)
-            } else {
-                if !matches!(
-                    apply_obj.borrow().call,
-                    Callable::Native(native)
-                        if native as usize
-                            == crate::builtins::nf_function_apply as *const () as usize
-                ) {
-                    return None;
-                }
-                let callable = initializer_obj.borrow();
-                let Callable::User(user) = &callable.call else {
-                    return None;
-                };
-                if user.func.is_arrow || user.env.borrow().under_with || callable.class_kind != 0 {
-                    None
-                } else {
-                    let same_realm = user.realm == Gc::as_ptr(&self.global) as usize;
-                    if same_realm {
-                        let runtime = user
-                            .func
-                            .runtime()
-                            .execution_code_for(Env::as_ptr(&self.global_env) as usize)
-                            .and_then(Option::as_ref)
-                            .filter(|initializer_chunk| {
-                                initializer_chunk
-                                    .jit
-                                    .get()
-                                    .is_some_and(|code| code.is_some())
-                                    && initializer_chunk.jit_no_activation()
-                                    && initializer_chunk.jit_initializer_plan().is_some()
-                            })
-                            .cloned();
-                        if let Some(runtime) = &runtime {
-                            chunk.cache_jit_forwarder_runtime(
-                                initializer_obj,
-                                apply_ptr,
-                                runtime.clone(),
-                            );
-                        }
-                        runtime
-                    } else {
-                        None
-                    }
-                }
+        let initializer_plan = if let Some(runtime) =
+            chunk.jit_forwarder_runtime(initializer_obj, apply_ptr)
+        {
+            Some(runtime)
+        } else {
+            if !matches!(
+                apply_obj.borrow().call,
+                Callable::Native(native)
+                    if native as usize
+                        == crate::builtins::nf_function_apply as *const () as usize
+            ) {
+                return None;
+            }
+            let callable = initializer_obj.borrow();
+            let Callable::User(user) = &callable.call else {
+                return None;
             };
+            if user.func.is_arrow || user.env.borrow().under_with() || callable.class_kind != 0 {
+                None
+            } else {
+                let same_realm = user.realm == Gc::as_ptr(&self.global) as usize;
+                if same_realm {
+                    let runtime = user
+                        .func
+                        .runtime()
+                        .execution_code_for(Env::as_ptr(&self.global_env) as usize)
+                        .and_then(Option::as_ref)
+                        .filter(|initializer_chunk| {
+                            initializer_chunk
+                                .jit
+                                .get()
+                                .is_some_and(|code| code.is_some())
+                                && initializer_chunk.jit_no_activation()
+                                && initializer_chunk.jit_initializer_plan().is_some()
+                        })
+                        .cloned();
+                    if let Some(runtime) = &runtime {
+                        chunk.cache_jit_forwarder_runtime(
+                            initializer_obj,
+                            apply_ptr,
+                            runtime.clone(),
+                        );
+                    }
+                    runtime
+                } else {
+                    None
+                }
+            }
+        };
 
         let plan_shapes = initializer_plan.as_ref().and_then(|initializer_chunk| {
             let plan = initializer_chunk
@@ -15660,7 +15964,7 @@ impl Interp {
         if func.is_arrow || func.is_method || func.is_generator || func.is_async {
             return None;
         }
-        if env.borrow().under_with {
+        if env.borrow().under_with() {
             return None;
         }
         // ECMA-262 [[Construct]] allocates `this` only for a base constructor (step 3): a derived
@@ -15801,7 +16105,7 @@ impl Interp {
         // A closure under a `with` scope stays on the tree-walker (see `Scope::under_with`):
         // the VM's free-name ops re-resolve at execution time, which is observably wrong when
         // a with-object binding changes between the spec's reference resolution and its use.
-        if env.borrow().under_with {
+        if env.borrow().under_with() {
             return None;
         }
         // PrepareForOrdinaryCall selects immutable [[Realm]], independently of
@@ -15996,7 +16300,7 @@ impl Interp {
         // already saved/cleared `new_target`/`constructing`. One divergence: no `lazy` args stash,
         // so legacy `f.arguments` reflection during an active VM frame reads null (the VM's
         // slot-based locals never aliased it faithfully anyway).
-        let allow_compiled_body = !closure.borrow().under_with;
+        let allow_compiled_body = !closure.borrow().under_with();
         let derived_class_construct =
             is_construct && fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
         if !matches!(self.tier, crate::bytecode::Tier::Interp)
@@ -16273,7 +16577,7 @@ impl Interp {
         // changes here. Default expressions/hoisting/TDZ creation ran exactly
         // once; closure objects and mapped arguments keep these same Envs.
         // Sharing applies before tier-up as well as to prepared compiled bodies.
-        if cold_environment_layouts_enabled() && !body.borrow().under_with {
+        if cold_environment_layouts_enabled() && !body.borrow().under_with() {
             let layouts = func.env_layouts.get_or_init(Box::default);
             if has_param_exprs {
                 scope.borrow_mut().vars.share_layout(&layouts[0]);

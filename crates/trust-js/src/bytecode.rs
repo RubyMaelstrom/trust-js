@@ -233,7 +233,8 @@ impl IcState {
 /// global object's shape (same ordered key layout ⇒ the slot still maps this name), then
 /// re-checks `accessor` at the slot (attributes are not part of the shape).
 ///
-/// `repr(C)` with this field order gives the JIT template fixed offsets: env@0, binding@8, gen@16.
+/// `repr(C)` with this field order gives the JIT template fixed offsets: env@0, binding@8,
+/// layout@16, gen@24, act_gen@28.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct NameIc {
@@ -241,20 +242,21 @@ pub struct NameIc {
     /// are ≥8-aligned): bit 0 = global-object mode; bit 1 = depth-1 mode, where the pointer
     /// is the current env's PARENT — the current env is this chunk's activation, whose fresh
     /// per-call pointer could never hit an exact compare (see `Chunk::name_ic_fill`).
-    /// Bit 2 extends depth-1 mode to any fresh activation with the same published
-    /// binding layout. In that mode `act_gen` stores the layout ID, not a generation.
-    /// FIXED_NAME_IC instead identifies an indexed slot in the current environment;
+    /// Bit 2 extends depth-1 mode to any fresh activation with the same layout identity
+    /// (`layout`). FIXED_NAME_IC instead identifies an indexed slot in the current environment;
     /// DEEP_NAME_IC points to the separately owned chain-proof descriptor.
     pub env: usize,
-    /// Scope mode: resolved `&Binding`. Global: shape<<32|slot. FIXED_NAME_IC: slot.
-    /// `u64` (not `usize`) so the packing is well-defined on 32-bit targets (wasm).
+    /// Scope mode: the resolved binding's slot address. Global: shape<<32|slot. FIXED_NAME_IC:
+    /// the slot. `u64` (not `usize`) so the packing is well-defined on 32-bit targets (wasm).
     pub binding: u64,
-    /// Map generation, or nonzero ordered-layout identity in FIXED_NAME_IC mode.
+    /// A nonzero layout identity (`VarMap::layout_id`, a shared descriptor's address): the holder's
+    /// in FIXED_NAME_IC mode, the activation's in depth-1 layout mode (env bit 2). Ordinary
+    /// own-scope entries retain their record's as promotion feedback.
+    pub layout: u64,
+    /// Map generation (the holder's, or in depth-1 mode the parent's).
     pub gen: u32,
-    /// Depth-1 guard: a published binding-layout ID when env bit 2 is set;
-    /// otherwise this chunk's activation post-construction generation (the
-    /// legacy own-activation mode). Structural mutations invalidate either proof.
-    /// Ordinary own-scope entries retain their layout ID as promotion feedback.
+    /// Depth-1 generation mode (env bit 2 clear): this chunk's activation post-construction
+    /// generation (the legacy own-activation mode). Structural mutations invalidate either proof.
     pub act_gen: u32,
 }
 
@@ -262,6 +264,7 @@ impl NameIc {
     pub const EMPTY: NameIc = NameIc {
         env: 0,
         binding: 0,
+        layout: 0,
         gen: 0,
         act_gen: 0,
     };
@@ -269,7 +272,7 @@ impl NameIc {
     #[inline]
     fn matches_activation(&self, vars: &crate::interpreter::VarMap) -> bool {
         if self.env & 4 != 0 {
-            self.act_gen != 0 && vars.layout_id() == self.act_gen
+            self.layout != 0 && vars.layout_id() as u64 == self.layout
         } else {
             vars.matches_generation(self.act_gen)
         }
@@ -279,11 +282,17 @@ impl NameIc {
 /// Byte offsets into a [`NameIc`] `Cell`, for the JIT inline template.
 pub const NAME_IC_OFF_ENV: u32 = 0;
 pub const NAME_IC_OFF_BINDING: u32 = 8;
-pub const NAME_IC_OFF_GEN: u32 = 16;
-pub const NAME_IC_OFF_ACT_GEN: u32 = 20;
+pub const NAME_IC_OFF_LAYOUT: u32 = 16;
+pub const NAME_IC_OFF_GEN: u32 = 24;
+pub const NAME_IC_OFF_ACT_GEN: u32 = 28;
+const _: () = assert!(
+    std::mem::offset_of!(NameIc, layout) == NAME_IC_OFF_LAYOUT as usize
+        && std::mem::offset_of!(NameIc, gen) == NAME_IC_OFF_GEN as usize
+        && std::mem::offset_of!(NameIc, act_gen) == NAME_IC_OFF_ACT_GEN as usize
+);
 
 /// Same ordered binding layout in different instances of a compiled activation.
-/// `binding` is a slot, `gen` is a nonzero layout ID; neither is a raw address.
+/// `binding` is a slot, `layout` a nonzero layout identity; neither is a binding's address.
 /// The sentinel cannot equal a live Scope allocation. TDZ/import/mutability
 /// remain live guards (ECMA-262 declarative GetBindingValue/SetMutableBinding).
 pub(crate) const FIXED_NAME_IC: usize = 8;
@@ -363,19 +372,19 @@ mod binding_layout_cache_tests {
             (second.borrow().vars.get("outer").unwrap().value()).view(),
             ValueView::Num(31.)
         ));
-        second
+        let tdz_outer = second
             .borrow_mut()
             .vars
             .get_mut("outer")
             .unwrap()
-            .set_initialized(false);
+            .enter_tdz_for_test();
         assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
         second
             .borrow_mut()
             .vars
             .get_mut("outer")
             .unwrap()
-            .set_initialized(true);
+            .initialize(tdz_outer);
         second
             .borrow_mut()
             .vars
@@ -427,7 +436,7 @@ mod binding_layout_cache_tests {
                 .vars
                 .insert("outer", Binding::data(Value::Num(17.0), true, true));
             let layout = new_binding_layout_id();
-            let make_child = |parent: &Env, key: &str, layout| {
+            let make_child = |parent: &Env, key: &str, layout: &crate::interpreter::TestLayout| {
                 let child = new_scope(Some(*parent));
                 child
                     .borrow_mut()
@@ -436,14 +445,14 @@ mod binding_layout_cache_tests {
                 child.borrow_mut().vars.publish_layout(layout);
                 child
             };
-            let first = make_child(&parent, "padding", layout);
+            let first = make_child(&parent, "padding", &layout);
             assert!(matches!(
                 (chunk.load_name_ic(&mut engine.interp, &first, name, cache))
                     .map(|__value| (__value).view()),
                 Ok(crate::value::ValueView::Num(17.0))
             ));
             assert_eq!(chunk.name_caches[cache as usize].get().env & 7, 6);
-            let second = make_child(&parent, "padding", layout);
+            let second = make_child(&parent, "padding", &layout);
             assert!(!Env::ptr_eq(&first, &second));
             assert!(matches!(
                 (chunk.name_ic_hit(&engine.interp, &second, cache)).map(|__value| (__value).view()),
@@ -459,22 +468,22 @@ mod binding_layout_cache_tests {
                 (chunk.name_ic_hit(&engine.interp, &second, cache)).map(|__value| (__value).view()),
                 Some(ValueView::Num(23.0))
             ));
-            parent
+            let tdz_outer = parent
                 .borrow_mut()
                 .vars
                 .get_mut("outer")
                 .unwrap()
-                .set_initialized(false);
+                .enter_tdz_for_test();
             assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
             parent
                 .borrow_mut()
                 .vars
                 .get_mut("outer")
                 .unwrap()
-                .set_initialized(true);
+                .initialize(tdz_outer);
 
             // Same mutation count is not the same key layout.
-            let shadow = make_child(&parent, "outer", new_binding_layout_id());
+            let shadow = make_child(&parent, "outer", &new_binding_layout_id());
             assert_eq!(
                 shadow.borrow().vars.generation(),
                 second.borrow().vars.generation()
@@ -502,7 +511,7 @@ mod binding_layout_cache_tests {
                 .borrow_mut()
                 .vars
                 .insert("outer", Binding::data(Value::Num(47.0), true, true));
-            let other = make_child(&different_parent, "padding", layout);
+            let other = make_child(&different_parent, "padding", &layout);
             assert!(chunk.name_ic_hit(&engine.interp, &other, cache).is_none());
             // Reparenting is detected too; a layout identity describes keys, not links.
             other.borrow_mut().parent = Some(parent);
@@ -2469,18 +2478,15 @@ impl LexicalBinding {
     }
 }
 
-/// A compiled block/loop scope's captured bindings in their fixed record order, plus the
-/// published identity of that ordered key set (see `VarMap::publish_layout`). Every Environment
-/// Record the chunk creates for the scope — at block entry and for each
+/// A compiled block/loop scope's captured bindings in their fixed record order, in a descriptor
+/// whose address is the layout identity of that ordered key set (see `VarMap::layout_id`). Every
+/// Environment Record the chunk creates for the scope — at block entry and for each
 /// CreatePerIterationEnvironment copy — holds exactly these names in this order, and a lexical
 /// record's key set never changes afterwards (a direct eval declares its own lexical names in a
 /// new record and its vars in the variable environment). Guarded name caches filled against one
 /// such record therefore serve every later one (ECMA-262 §9.1, §14.2.3, §14.7.4.4).
 struct LexicalScope {
     bindings: Vec<LexicalBinding>,
-    /// Nonzero process-unique identity of `bindings`' names and order; zero if identities are
-    /// exhausted (the records then stay unpublished and caches revalidate by identity).
-    layout_id: u32,
     /// The names, in slot order, which every record of the scope shares.
     desc: Rc<crate::interpreter::ScopeDesc>,
     /// `desc`, kept by the chunk's heap for its records to name.
@@ -2512,7 +2518,6 @@ impl LexicalScope {
         );
         Self {
             bindings: unique,
-            layout_id: crate::interpreter::new_binding_layout_id(),
             kept_desc: crate::value::keep_scope_desc(&desc),
             desc,
         }
@@ -2743,9 +2748,6 @@ pub struct Chunk {
     /// Call-independent binding descriptors and indexed initialization actions.
     /// Values and closure identities remain fresh on every invocation.
     activation_plan: std::cell::OnceCell<Box<ActivationPlan>>,
-    /// Identity of this chunk's fresh captured-binding layout, independent of
-    /// any particular activation allocation. Never reused after chunk death.
-    binding_layout_id: u32,
     /// Coroutine FunctionDeclarationInstantiation already made the activation that owns mapped
     /// parameters and their arguments object. Seed additional compiled bindings into that exact
     /// environment so both access paths share storage.
@@ -2928,7 +2930,6 @@ impl crate::gc_trace::GcTrace for Chunk {
             lexical_scopes: _,
             cap_inits: _,
             activation_plan: _,
-            binding_layout_id: _,
             reuse_activation: _,
             env_this: _,
             env_arguments: _,
@@ -3776,11 +3777,6 @@ impl Chunk {
                 crate::atom::names::ARGUMENTS.atom(),
                 crate::interpreter::Binding::data(arguments, true, true),
             );
-        }
-        if !self.reuse_activation {
-            // All key creation is complete. Subsequent insert/remove/clear
-            // invalidates the layout in VarMap itself; value writes do not.
-            act.borrow_mut().vars.publish_layout(self.binding_layout_id);
         }
         act
     }
@@ -7867,7 +7863,6 @@ fn finish_chunk(
             .collect(),
         cap_inits: c.cap_inits,
         activation_plan: std::cell::OnceCell::new(),
-        binding_layout_id: crate::interpreter::new_binding_layout_id(),
         reuse_activation: c.reuse_activation,
         env_this: c.env_this,
         env_arguments: c.env_arguments,
@@ -15568,7 +15563,7 @@ pub(crate) fn try_function_osr(
             .body
             .iter()
             .any(|statement| function_osr_site(statement) == Some(address))
-        || live_env.borrow().under_with
+        || live_env.borrow().under_with()
     {
         return Ok(None);
     }
@@ -20307,7 +20302,10 @@ impl Chunk {
         let ic = self.name_caches[c as usize].get();
         if ic.env == FIXED_NAME_IC {
             let scope = env.borrow();
-            if scope.has_with_object() || ic.gen == 0 || scope.vars.layout_id() != ic.gen {
+            if scope.has_with_object()
+                || ic.layout == 0
+                || scope.vars.layout_id() as u64 != ic.layout
+            {
                 return None;
             }
             // The layout's descriptor has the attributes its fill checked (no import).
@@ -20395,7 +20393,7 @@ impl Chunk {
                 let v = bd.value();
                 self.record_name_number(c as usize, &v);
                 let previous = self.name_caches[c as usize].get();
-                let layout_id = b.vars.layout_id();
+                let layout_id = b.vars.layout_id() as u64;
                 // Preserve the shorter identity path for a monomorphic environment.
                 // A second instance with the same layout establishes useful sharing.
                 if layout_name_ics_enabled()
@@ -20403,13 +20401,14 @@ impl Chunk {
                     && previous.env > FIXED_NAME_IC
                     && previous.env & 7 == 0
                     && previous.env != Env::as_ptr(env) as usize
-                    && previous.act_gen == layout_id
+                    && previous.layout == layout_id
                 {
                     if let Some(slot) = b.vars.binding_slot(&self.names[n as usize]) {
                         self.name_caches[c as usize].set(NameIc {
                             env: FIXED_NAME_IC,
                             binding: slot as u64,
-                            gen: layout_id,
+                            layout: layout_id,
+                            gen: 0,
                             act_gen: 0,
                         });
                         drop(b);
@@ -20420,20 +20419,21 @@ impl Chunk {
                 self.name_caches[c as usize].set(NameIc {
                     env: Env::as_ptr(env) as usize,
                     binding: bd.as_ptr() as usize as u64,
+                    layout: layout_id,
                     gen: b.vars.generation(),
-                    act_gen: layout_id,
+                    act_gen: 0,
                 });
                 drop(b);
                 // Pin the scope allocation so the raw `env` compare stays ABA-safe.
                 self.name_pins.borrow_mut()[c as usize] = Some(Env::downgrade(env));
                 return Some(v);
             }
-            // A published binding-layout identity proves the same key set even
-            // when this chunk runs directly in a different creator's fresh
-            // activation. Generation alone cannot prove that: two unrelated
-            // scopes can have equal generations but different binding names.
-            // The older own-activation mode remains valid without a layout ID.
-            let layout_id = b.vars.layout_id();
+            // A layout identity proves the same key set even when this chunk runs
+            // directly in a different creator's fresh activation. Generation alone
+            // cannot prove that: two unrelated scopes can have equal generations but
+            // different binding names. The older own-activation mode remains valid
+            // without a layout identity.
+            let layout_id = b.vars.layout_id() as u64;
             if layout_id != 0 || self.makes_env() {
                 if let Some(p) = &b.parent {
                     let pb = p.borrow();
@@ -20449,9 +20449,10 @@ impl Chunk {
                                     env: Env::as_ptr(p) as usize
                                         | if layout_id != 0 { 6 } else { 2 },
                                     binding: bd.as_ptr() as usize as u64,
+                                    layout: layout_id,
                                     gen: pb.vars.generation(),
                                     act_gen: if layout_id != 0 {
-                                        layout_id
+                                        0
                                     } else {
                                         b.vars.generation()
                                     },
@@ -20491,6 +20492,7 @@ impl Chunk {
         self.name_caches[c as usize].set(NameIc {
             env: Env::as_ptr(env) as usize | 1,
             binding: ((g.props.shape() as u64) << 32) | slot as u64,
+            layout: 0,
             gen: env.borrow().vars.generation(),
             act_gen: 0,
         });
@@ -20527,9 +20529,9 @@ impl Chunk {
         {
             let b = env.borrow();
             if ic.env == FIXED_NAME_IC
-                && ic.gen != 0
+                && ic.layout != 0
                 && !b.has_with_object()
-                && b.vars.layout_id() == ic.gen
+                && b.vars.layout_id() as u64 == ic.layout
             {
                 if let Some(binding) = b.vars.fixed_binding_at(ic.binding as usize) {
                     return binding.as_ptr().cast_mut();
@@ -20543,13 +20545,13 @@ impl Chunk {
         let (binding, generation, layout_id, slot) = {
             let mut b = env.borrow_mut();
             let generation = b.vars.generation();
-            let layout_id = b.vars.layout_id();
+            let layout_id = b.vars.layout_id() as u64;
             let slot = (layout_name_ics_enabled()
                 && layout_id != 0
                 && ic.env > FIXED_NAME_IC
                 && ic.env & 7 == 0
                 && ic.env != raw
-                && ic.act_gen == layout_id)
+                && ic.layout == layout_id)
                 .then(|| b.vars.binding_slot(name))
                 .flatten();
             let binding = b
@@ -20563,7 +20565,8 @@ impl Chunk {
             self.cap_caches[index].set(NameIc {
                 env: FIXED_NAME_IC,
                 binding: slot as u64,
-                gen: layout_id,
+                layout: layout_id,
+                gen: 0,
                 act_gen: 0,
             });
             self.cap_pins.borrow_mut()[index] = None;
@@ -20571,8 +20574,9 @@ impl Chunk {
             self.cap_caches[index].set(NameIc {
                 env: raw,
                 binding: binding as usize as u64,
+                layout: layout_id,
                 gen: generation,
-                act_gen: layout_id,
+                act_gen: 0,
             });
             self.cap_pins.borrow_mut()[index] = Some(Env::downgrade(env));
         } else {
@@ -20666,7 +20670,10 @@ impl Chunk {
         if ic.env == FIXED_NAME_IC {
             {
                 let mut scope = env.borrow_mut();
-                if !scope.has_with_object() && ic.gen != 0 && scope.vars.layout_id() == ic.gen {
+                if !scope.has_with_object()
+                    && ic.layout != 0
+                    && scope.vars.layout_id() as u64 == ic.layout
+                {
                     if let Some(mut binding) = scope.vars.fixed_binding_at_mut(ic.binding as usize)
                     {
                         if binding.initialized() {
@@ -21822,64 +21829,54 @@ pub(crate) unsafe extern "C" fn jit_reference_op(
 /// uninitialized, pushed as the running LexicalEnvironment.
 fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
     let scope = &chunk.lexical_scopes[scope as usize];
-    let bindings = scope
-        .bindings
-        .iter()
-        .map(|binding| binding.creation(Value::Undefined, false).slot())
-        .collect();
-    let next = if catch {
-        crate::interpreter::new_catch_scope(*env)
-    } else {
-        crate::interpreter::new_scope(Some(*env))
-    };
     // A block record is never a VariableEnvironment, so its bindings carry no lexical attribute
     // (only EvalDeclarationInstantiation's variable-environment check reads it; it tests block
-    // records through HasBinding).
-    install_lexical_bindings(&next, scope, bindings);
-    *env = next;
-}
-
-/// Give a fresh block/loop record `scope`'s complete ordered key set and publish its identity.
-fn install_lexical_bindings(
-    record: &Env,
-    scope: &LexicalScope,
-    bindings: crate::interpreter::BindingValues,
-) {
-    let mut record = record.borrow_mut();
-    record.vars = crate::interpreter::VarMap::from_fixed_bindings(bindings, scope.kept_desc);
-    record.vars.publish_layout(scope.layout_id);
+    // records through HasBinding). Its bindings start in their temporal dead zone.
+    *env = crate::interpreter::new_scope_with_desc(
+        *env,
+        catch,
+        scope.kept_desc,
+        crate::interpreter::RecordSlots::Tdz(scope.bindings.len()),
+    );
 }
 
 /// CreatePerIterationEnvironment (ECMA-262 §14.7.4.4): a sibling record copying each
 /// per-iteration binding's current value and state.
 fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
     let scope = &chunk.lexical_scopes[scope as usize];
-    let parent = env
-        .borrow()
+    let current = env.borrow();
+    let parent = current
         .parent
         .expect("per-iteration lexical environment has a parent");
-    let next = crate::interpreter::new_scope(Some(parent));
-    let bindings = {
-        let current = env.borrow();
-        // A record this chunk created holds the scope's bindings in order; a borrowed first
-        // iteration (a loop fragment's tree-walker record) is read by name.
-        let ordered = scope.layout_id != 0 && current.vars.layout_id() == scope.layout_id;
-        scope
+    // A record this chunk created shares the scope's descriptor, its slots in order; a borrowed
+    // first iteration (a loop fragment's tree-walker record) is read by name.
+    let next = if current.vars.layout_id() == scope.kept_desc.identity() {
+        crate::interpreter::new_scope_with_desc(
+            parent,
+            false,
+            scope.kept_desc,
+            crate::interpreter::RecordSlots::Copy(current.vars.slot_words()),
+        )
+    } else {
+        let words: Vec<crate::interpreter::BindingSlot> = scope
             .bindings
             .iter()
-            .enumerate()
-            .map(|(slot, binding)| {
-                let previous = if ordered {
-                    current.vars.fixed_binding_at(slot)
-                } else {
-                    current.vars.get_atom(binding.name)
-                }
-                .expect("per-iteration binding missing");
-                *previous.slot()
+            .map(|binding| {
+                *current
+                    .vars
+                    .get_atom(binding.name)
+                    .expect("per-iteration binding missing")
+                    .slot()
             })
-            .collect()
+            .collect();
+        crate::interpreter::new_scope_with_desc(
+            parent,
+            false,
+            scope.kept_desc,
+            crate::interpreter::RecordSlots::Copy(&words),
+        )
     };
-    install_lexical_bindings(&next, scope, bindings);
+    drop(current);
     *env = next;
 }
 

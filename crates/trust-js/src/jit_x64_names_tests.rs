@@ -22,7 +22,12 @@ fn compile(engine: &mut Engine, source: &str) -> (Rc<Chunk>, JitCode) {
     (chunk, code)
 }
 
-fn scope(parent: Option<Env>, key: &str, value: f64, layout: u32) -> Env {
+fn scope(
+    parent: Option<Env>,
+    key: &str,
+    value: f64,
+    layout: impl Into<crate::interpreter::TestLayout>,
+) -> Env {
     let scope = new_scope(parent);
     scope
         .borrow_mut()
@@ -88,12 +93,12 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
         before + 2
     );
     let operations = TEST_NATIVE_NAME_OPS.with(std::cell::Cell::get);
-    other
+    let tdz_outer = other
         .borrow_mut()
         .vars
         .get_mut("outer")
         .unwrap()
-        .set_initialized(false);
+        .enter_tdz_for_test();
     assert!(crate::jit::run(
         &mut engine.interp,
         &chunk,
@@ -113,7 +118,17 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
         .vars
         .get_mut("outer")
         .unwrap()
-        .set_initialized(true);
+        .initialize(tdz_outer);
+    // A layout identity (a shared descriptor) proves the key set whatever the generation; a
+    // record with its own names proves it only by identity and generation.
+    other.borrow_mut().vars.set_generation_for_test(u32::MAX);
+    assert_eq!(number(run(&mut engine, &chunk, &code, &fresh)), 29.0);
+    let operations = TEST_NATIVE_NAME_OPS.with(std::cell::Cell::get);
+    other
+        .borrow_mut()
+        .vars
+        .set_attributes_for_test("outer", None, None, Some(true));
+    assert_eq!(other.borrow().vars.layout_id(), 0);
     other.borrow_mut().vars.set_generation_for_test(u32::MAX);
     assert_eq!(number(run(&mut engine, &chunk, &code, &fresh)), 29.0);
     assert_eq!(

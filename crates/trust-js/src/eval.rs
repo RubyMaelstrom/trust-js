@@ -752,7 +752,7 @@ impl Interp {
                             let mut b = scope.borrow_mut();
                             // Only a variable environment's lexical attributes are read (by
                             // EvalDeclarationInstantiation's var/lexical check).
-                            let lexical = b.var_boundary;
+                            let lexical = b.var_boundary();
                             b.vars.insert(
                                 name,
                                 Binding::data(Value::Undefined, !immutable, false).lexical(lexical),
@@ -773,7 +773,7 @@ impl Interp {
                     if let Some(name) = &class.name {
                         // Classes are lexically scoped with a TDZ until the declaration executes.
                         let mut b = scope.borrow_mut();
-                        let lexical = b.var_boundary;
+                        let lexical = b.var_boundary();
                         b.vars.insert(
                             name.clone(),
                             Binding::data(Value::Undefined, true, false).lexical(lexical),
@@ -2793,7 +2793,7 @@ impl Interp {
         // binding (a catch parameter, an outer var) is not the block binding.
         let own = {
             let b = env.borrow();
-            if b.var_boundary {
+            if b.var_boundary() {
                 None
             } else {
                 b.vars.get(name).map(|x| x.value())
@@ -2810,7 +2810,7 @@ impl Interp {
         });
         let mut cur = Some(*env);
         while let Some(s) = cur {
-            if s.borrow().var_boundary {
+            if s.borrow().var_boundary() {
                 if let Some(mut b) = s.borrow_mut().vars.get_mut(name) {
                     b.set_value(val);
                     return;
@@ -5769,7 +5769,7 @@ impl Interp {
                     let b = s.borrow();
                     // A `with` object environment holds no lexical declarations, and a `catch`
                     // parameter environment is exempt from the var/lexical conflict check.
-                    (b.has_with_object() || b.catch_param, b.parent)
+                    (b.has_with_object() || b.catch_param(), b.parent)
                 };
                 if !skip {
                     for &(name, _) in &var_bindings {
@@ -6274,12 +6274,7 @@ impl Interp {
         // A named class binds its own name in the class scope, so methods, static blocks and
         // field initializers can reference the class itself. The binding stays in its TDZ until
         // every member's computed key has evaluated (spec: InitializeBinding runs after
-        // ClassElementEvaluation), so `[Name]` as a computed key is a ReferenceError.
-        if let Some(n) = &class.name {
-            if let Some(mut b) = outer_class_env.borrow_mut().vars.get_mut(n) {
-                b.set_value(ctor_val);
-            }
-        }
+        // ClassElementEvaluation, below), so `[Name]` as a computed key is a ReferenceError.
 
         // Methods, accessors and fields retain their actual records, including computed
         // Symbol keys, while later decorators and static elements run author code (I1).
@@ -6554,10 +6549,10 @@ impl Interp {
         }
 
         // Every member key has evaluated: the class name binding leaves its TDZ before static
-        // field initializers and static blocks run.
+        // field initializers and static blocks run (InitializeBinding).
         if let Some(n) = &class.name {
             if let Some(mut b) = outer_class_env.borrow_mut().vars.get_mut(n) {
-                b.mark_initialized();
+                b.initialize(ctor_val);
             }
         }
 

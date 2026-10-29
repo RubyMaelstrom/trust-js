@@ -2,7 +2,7 @@
 //! relocation of cold code must not weaken identity, with, generation, import or TDZ checks.
 use super::*;
 use crate::bytecode::NameIc;
-use crate::interpreter::{new_binding_layout_id, new_scope, Binding, BindingSlot, Env};
+use crate::interpreter::{new_binding_layout_id, new_scope, Binding, Env};
 use std::cell::Cell;
 use std::mem::{offset_of, size_of};
 
@@ -133,11 +133,13 @@ fn binding_ic(env: &Env) -> (NameIc, ProbeResult) {
         NameIc {
             env: Env::as_ptr(env) as usize,
             binding: binding.as_ptr() as usize as u64,
+            layout: 0,
             gen: scope.vars.generation(),
             act_gen: 0,
         },
         ProbeResult {
-            address: binding.as_ptr() as usize + BindingSlot::value_offset(),
+            // A slot is its value's one word.
+            address: binding.as_ptr() as usize,
             owner_kind: 0,
         },
     )
@@ -183,12 +185,13 @@ fn name_dispatch_cmn32_max_predicate_preserves_source_and_ignores_upper_bits() {
 
 #[test]
 fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
-    use crate::interpreter::VarMap;
     let engine = crate::Engine::new();
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
     assert!(layout.scope_small_valid);
     for indexed in [false, true] {
-        let identity = new_binding_layout_id();
+        // A record shares a compiled scope's descriptor, or (indexed) a tree-walked activation's,
+        // whose text index its layout keeps: either way the descriptor's address is the layout
+        // identity every record of it has.
         let shared = std::cell::OnceCell::new();
         let desc = crate::interpreter::ScopeDesc::new(
             (0..24)
@@ -198,31 +201,37 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
         );
         let kept = crate::value::keep_scope_desc(&desc);
         let make = || {
-            let env = new_scope(None);
-            env.borrow_mut().vars = VarMap::from_fixed_bindings(
-                (0..24)
-                    .map(|n| Binding::data(Value::Num(n as f64), true, true).slot())
-                    .collect(),
-                kept,
-            );
             if indexed {
+                let env = new_scope(None);
+                for n in 0..24 {
+                    env.borrow_mut().vars.insert(
+                        format!("v{n}"),
+                        Binding::data(Value::Num(n as f64), true, true),
+                    );
+                }
                 env.borrow_mut().vars.share_layout(&shared);
+                env
+            } else {
+                let slots: Vec<_> = (0..24)
+                    .map(|n| Binding::data(Value::Num(n as f64), true, true).slot())
+                    .collect();
+                crate::interpreter::new_var_scope_with_desc(None, kept, &slots)
             }
-            env.borrow_mut().vars.publish_layout(identity);
-            env
         };
         let first = make();
-        let second = make();
+        let identity = first.borrow().vars.layout_id() as u64;
+        assert_ne!(identity, 0);
         let cache = Cell::new(NameIc {
             env: crate::bytecode::FIXED_NAME_IC,
             binding: 23,
-            gen: identity,
+            layout: identity,
+            gen: 0,
             act_gen: 0,
         });
         let code = native_probe(&layout, &cache, true);
+        let second = make();
         for env in [&first, &second] {
-            let expected = env.borrow().vars.get("v23").unwrap().as_ptr() as usize
-                + BindingSlot::value_offset();
+            let expected = env.borrow().vars.get("v23").unwrap().as_ptr() as usize;
             assert_eq!(
                 probe(&code, &ProbeContext::new(&engine, env)),
                 ProbeResult {
@@ -232,25 +241,30 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
             );
         }
         let context = ProbeContext::new(&engine, &second);
-        second
+        let tdz_v23 = second
             .borrow_mut()
             .vars
             .get_mut("v23")
             .unwrap()
-            .set_initialized(false);
+            .enter_tdz_for_test();
         assert_eq!(probe(&code, &context).address, 0);
         second
             .borrow_mut()
             .vars
             .get_mut("v23")
             .unwrap()
-            .set_initialized(true);
+            .initialize(tdz_v23);
+        assert_ne!(probe(&code, &context).address, 0);
+        // An import gives the record its own names: no layout identity.
         second
             .borrow_mut()
             .vars
             .set_import_for_test("v23", Some((first, crate::atom::atomize("v23"))));
+        assert_eq!(second.borrow().vars.layout_id(), 0);
         assert_eq!(probe(&code, &context).address, 0);
-        second.borrow_mut().vars.set_import_for_test("v23", None);
+        let second = make();
+        let context = ProbeContext::new(&engine, &second);
+        assert_ne!(probe(&code, &context).address, 0);
         cache.set(NameIc {
             binding: 24,
             ..cache.get()
@@ -258,14 +272,15 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
         assert_eq!(probe(&code, &context).address, 0);
         cache.set(NameIc {
             binding: 23,
-            gen: 0,
+            layout: 0,
             ..cache.get()
         });
         assert_eq!(probe(&code, &context).address, 0);
         cache.set(NameIc {
-            gen: identity,
+            layout: identity,
             ..cache.get()
         });
+        assert_ne!(probe(&code, &context).address, 0);
         second
             .borrow_mut()
             .set_with_object(Some(Value::Obj(engine.interp.global)));
@@ -338,17 +353,18 @@ fn name_dispatch_native_binding_preserves_identity_with_tdz_import_and_exhaustio
         .set_with_object(Some(Value::Obj(engine.interp.global)));
     assert_eq!(probe(&code, &context).address, 0);
     env.borrow_mut().set_with_object(None);
-    env.borrow_mut()
+    let tdz_outer = env
+        .borrow_mut()
         .vars
         .get_mut("outer")
         .unwrap()
-        .set_initialized(false);
+        .enter_tdz_for_test();
     assert_eq!(probe(&code, &context).address, 0);
     env.borrow_mut()
         .vars
         .get_mut("outer")
         .unwrap()
-        .set_initialized(true);
+        .initialize(tdz_outer);
     env.borrow_mut()
         .vars
         .set_import_for_test("outer", Some((other, crate::atom::atomize("outer"))));
@@ -399,6 +415,7 @@ fn name_dispatch_native_global_checks_identity_before_generation_without_losing_
     let ic = NameIc {
         env: Env::as_ptr(&env) as usize | 1,
         binding: (u64::from(shape) << 32) | slot as u64,
+        layout: 0,
         gen: env.borrow().vars.generation(),
         act_gen: 0,
     };
@@ -482,8 +499,13 @@ fn name_dispatch_native_depth_one_keeps_layout_and_parent_generation_distinct() 
         let (base, expected) = binding_ic(&parent);
         let ic = NameIc {
             env: base.env | if fixed_layout { 6 } else { 2 },
+            layout: if fixed_layout {
+                layout_id.identity() as u64
+            } else {
+                0
+            },
             act_gen: if fixed_layout {
-                layout_id
+                0
             } else {
                 child.borrow().vars.generation()
             },
@@ -498,11 +520,8 @@ fn name_dispatch_native_depth_one_keeps_layout_and_parent_generation_distinct() 
         assert_eq!(probe(&code, &context).address, 0);
         parent.borrow_mut().set_with_object(None);
         child.borrow_mut().vars.set_generation_for_test(u32::MAX);
-        if fixed_layout {
-            child.borrow_mut().vars.publish_layout(layout_id);
-        }
         cache.set(NameIc {
-            act_gen: if fixed_layout { layout_id } else { u32::MAX },
+            act_gen: if fixed_layout { 0 } else { u32::MAX },
             ..ic
         });
         assert_eq!(

@@ -42,6 +42,9 @@ fn record(a: &mut Asm, address: usize) {
 
 fn valid(l: &JitLayout) -> bool {
     l.valid
+        && l.binding_value == 0
+        && l.scope_binding_stride == 8
+        && l.scope_binding_offset == 0
         && storage::fields_len_fits(l)
         && storage::fields_data_fits(l)
         && l.scope_parent_valid
@@ -57,7 +60,6 @@ fn valid(l: &JitLayout) -> bool {
             l.scope_binding_stride,
             l.scope_binding_offset,
             l.binding_value,
-            l.binding_init,
             l.obj_props + l.props_shape,
             l.obj_ic_plain,
             l.obj_exotic,
@@ -110,7 +112,7 @@ fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
 }
 
 /// R8 supplies a validated layout's slot index; R9 is its actual current scope. Address
-/// the live binding values instead of retaining an identity-specific Binding pointer.
+/// the live binding slots (one word each) instead of retaining an identity-specific slot address.
 fn layout_binding_target(a: &mut Asm, l: &JitLayout, slot_offset: usize, slow: usize) {
     if storage::scope_entries_fit(l) {
         a.nr_load(DX, R8, slot_offset);
@@ -118,9 +120,8 @@ fn layout_binding_target(a: &mut Asm, l: &JitLayout, slot_offset: usize, slow: u
         a.nr_cmp(DX, CX);
         a.jcc(AE, slow);
         storage::scope_entries_data(a, l, CX, R9);
-        a.nr_mul_imm(DX, l.scope_binding_stride);
+        a.nr_shift(false, DX, 3);
         a.nr_reg(0x01, CX, DX);
-        a.nr_lea(CX, CX, l.scope_binding_offset as i32);
     } else {
         a.jmp(slow);
     }
@@ -155,9 +156,10 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.nr_cmp(AX, DX);
     a.jcc(EQ, checked);
     a.bind(layout);
-    a.nr_load32(AX, R10, NAME_GUARD_LAYOUT);
+    // A layout identity (a shared descriptor's address) proves the key set; zero proves none.
+    a.nr_load(AX, R10, NAME_GUARD_LAYOUT);
     a.nr_zero_guard(AX, slow);
-    a.nr_load32(DX, R9, l.scope_layout);
+    a.nr_load(DX, R9, l.scope_layout);
     a.nr_cmp(AX, DX);
     a.jcc(NE, slow);
     a.bind(checked);
@@ -209,6 +211,7 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
 fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     use crate::bytecode::{
         FIXED_NAME_IC, NAME_IC_OFF_ACT_GEN, NAME_IC_OFF_BINDING, NAME_IC_OFF_ENV, NAME_IC_OFF_GEN,
+        NAME_IC_OFF_LAYOUT,
     };
     let deep = a.label();
     let fixed = a.label();
@@ -254,17 +257,19 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     a.jcc(NE, slow);
     a.jmp(binding);
     a.bind(depth_one);
-    a.nr_load32(DX, R8, NAME_IC_OFF_ACT_GEN as usize);
     a.nr_mov(AX, R10);
     a.nr_op_imm(4, AX, 4);
     a.nr_test(AX);
     a.jcc(EQ, generation);
+    // Layout mode: the activation's layout identity, a shared descriptor's address.
+    a.nr_load(DX, R8, NAME_IC_OFF_LAYOUT as usize);
     a.nr_zero_guard(DX, slow);
-    a.nr_load32(AX, R9, l.scope_layout);
+    a.nr_load(AX, R9, l.scope_layout);
     a.nr_cmp(AX, DX);
     a.jcc(NE, slow);
     a.jmp(parent);
     a.bind(generation);
+    a.nr_load32(DX, R8, NAME_IC_OFF_ACT_GEN as usize);
     a.nr_max_guard(DX, AX, slow);
     a.nr_load32(AX, R9, l.scope_gen);
     a.nr_cmp(AX, DX);
@@ -285,10 +290,10 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     a.nr_imm(R11, 0);
     a.jmp(done);
     a.bind(fixed);
-    a.nr_load32(AX, R8, NAME_IC_OFF_GEN as usize);
+    a.nr_load(AX, R8, NAME_IC_OFF_LAYOUT as usize);
     a.nr_zero_guard(AX, slow);
-    a.nr_load32(DX, R9, l.scope_layout);
-    // Fixed layout identity, not a generation or an identity-specific binding pointer.
+    a.nr_load(DX, R9, l.scope_layout);
+    // Fixed layout identity, not a generation or an identity-specific slot address.
     a.nr_cmp(AX, DX);
     a.jcc(NE, slow);
     layout_binding_target(a, l, NAME_IC_OFF_BINDING as usize, slow);
@@ -309,9 +314,13 @@ fn value_address(a: &mut Asm, l: &JitLayout, store: bool, slow: usize) {
     let done = a.label();
     a.nr_test(R11);
     a.jcc(NE, property);
-    a.nr_load8(AX, CX, l.binding_init);
-    a.nr_zero_guard(AX, slow);
-    a.nr_lea(CX, CX, l.binding_value as i32);
+    if store {
+        // TDZ, the empty word: a load's execution word guard refuses it too.
+        a.nr_load(AX, CX, 0);
+        a.nr_imm(DX, crate::value::PACK_EMPTY);
+        a.nr_cmp(AX, DX);
+        a.jcc(EQ, slow);
+    }
     a.jmp(done);
     a.bind(property);
     a.nr_load(AX, CX, l.entry_accessor);
