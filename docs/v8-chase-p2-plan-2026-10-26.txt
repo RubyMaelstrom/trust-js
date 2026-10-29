@@ -1793,6 +1793,48 @@ without a difference; the census workloads' outputs identical off, at the defaul
 under verify; interruption and limits on both backends. Zombie's lib suite (its known failure)
 and clippy.
 
+Then 3c (20579ce7, 227fc7a6, 2026-10-29, the same agent's):
+- 20579ce7 (tests only): counted loops made catastrophic fuzz cases common, each costing the 5 s
+  deadline, so the fuzzer runs the matcher first with 250 ms and the native code only when the
+  matcher finished, still with 4 s, so a native hang remains a difference.
+- 227fc7a6: lookaheads run as the matcher's `LookFrame`: the body in line above a frame record
+  that holds the position and the choices, its offset from the stack's base kept in a slot, as
+  V8 keeps a lookaround's stack pointer as an offset (regexp-compiler-tonode.cc:1463,
+  regexp-macro-assembler-arm64.cc:1997-2014); success cuts the stack back to the frame and
+  failure pops it. The design's capture snapshot is an unset of the lookahead's own groups, which
+  are always unset on entry, as V8's NegativeSubmatchSuccess and PositiveSubmatchSuccess do
+  (regexp-compiler.cc:887-915, 5975-5998), so no slots are copied. Element-only bodies
+  (coffeescript's `(?!\d)`, `(?!\s)`, `(?!:)`) are tested in place, with no frame.
+  Backreferences compare unit by unit in line, polled between stretches, and under `i` through a
+  Rust helper. Counted loops keep their count in a mark slot (counts from 2^31 stay on the
+  matcher), and modifier groups emit nothing: each instruction's flags are fixed when it is
+  compiled. Found before landing: a positive lookahead left an undo record at every success, more
+  backtracking state than the matcher's; at the root floor it now leaves one an attempt.
+
+Against 3b (fat LTO, pinned): coffeescript -0.32% (x86-64 -0.45%), Octane RegExp -0.06%, Djot's
+40 passes +0.03%, strings.js +0.02%, source-map within its run spread. Fixtures: Vue -0.06%,
+React -0.02%, Djot -0.60%, which repeats but lies outside RegExp work (identical in both): fat
+LTO's layout of the JIT compiler, parser and VM. Coverage: coffeescript 78.6% to 100% (its
+matcher work left 15.68M to 37K dispatched instructions, all before tier-up); Octane, source-map
+and Djot 100%, strings.js 0% (3d). The exit's measure: Octane 16.6%, source-map 8.7%,
+coffeescript 4.0% (3b 17.9%), strings.js 85.5% (3d's). Per call against Sparkplug-only Node:
+coffeescript's identifier pattern 6.06x to 1.91x, its operator pattern 3.46x to 2.53x,
+`^(.?)\1*$` 4.76x to 2.24x; `clean` 0.43x.
+
+Validation: the ARM64 gate on 34bd28be, whose code equals 227fc7a6's (the lib suite, pacing with
+its known failure only; the downstream crates; GC stress on the regex and replace/split tests;
+the fixtures, difftest and dumps as the base's; Test262 identical; rustdoc's 13 errors, main's).
+The differential gate: Test262's RegExp suites forced on with verify and off, identical to each
+other and to 3a's and 3b's; six fuzz streams of at least 1M cases on each architecture, about
+18.7K of 22K programs native a stream, without a difference; the census workloads identical off,
+at the default and forced on under verify; a new test of a deadline during a long backreference
+compare (in line and under `i`, both widths), cancellation inside a lookahead and the
+backtracking-state limit inside a lookahead and a counted loop, on both backends. Zombie's lib
+suite (its known failure) and clippy; the new encodings checked with GNU objdump and llvm-mc.
+Open: 3d (Unicode mode and lookbehind, strings.js); `MAX_SLOTS`, now a policy change only; the
+code-size cap; and, in the matcher, loops whose body cannot match empty still test for an empty
+iteration (coffeescript's identifier loop), which both tiers would gain from dropping.
+
 ### W3: calls (census and design, 2026-10-27; exit agreed, Decision 10)
 
 Census: the W2a tip (a1535a6f, branch p2-w2a; since then main's code, c4d68127 adding only W2a's
