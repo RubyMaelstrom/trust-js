@@ -215,9 +215,10 @@ mod tests {
         assert_eq!(classify_name(&inner, "value"), (NamePath::Uninitialized, 1));
         {
             let mut scope = middle.borrow_mut();
-            let mut binding = scope.vars.get_mut("value").unwrap();
-            binding.set_initialized(true);
-            binding.set_import_reference(Some((outer, crate::atom::atomize("value"))));
+            scope.vars.get_mut("value").unwrap().set_initialized(true);
+            scope
+                .vars
+                .set_import_for_test("value", Some((outer, crate::atom::atomize("value"))));
         }
         assert_eq!(classify_name(&inner, "value"), (NamePath::Import, 1));
         inner

@@ -379,9 +379,7 @@ mod binding_layout_cache_tests {
         second
             .borrow_mut()
             .vars
-            .get_mut("outer")
-            .unwrap()
-            .set_attributes_for_test(Some(false), None, None);
+            .set_attributes_for_test("outer", Some(false), None, None);
         engine.interp.strict = true;
         assert!(chunk
             .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(99.))
@@ -2463,6 +2461,14 @@ struct LexicalBinding {
     is_const: bool,
 }
 
+impl LexicalBinding {
+    /// The binding BlockDeclarationInstantiation creates (CreateMutableBinding, or
+    /// CreateImmutableBinding with S true for a `const`), holding `value`.
+    fn creation(&self, value: Value, initialized: bool) -> crate::interpreter::Binding {
+        crate::interpreter::Binding::data(value, !self.is_const, initialized)
+    }
+}
+
 /// A compiled block/loop scope's captured bindings in their fixed record order, plus the
 /// published identity of that ordered key set (see `VarMap::publish_layout`). Every Environment
 /// Record the chunk creates for the scope — at block entry and for each
@@ -2497,8 +2503,13 @@ impl LexicalScope {
                 }
             }
         }
-        let desc =
-            crate::interpreter::ScopeDesc::new(unique.iter().map(|binding| binding.name).collect());
+        let desc = crate::interpreter::ScopeDesc::new(
+            unique.iter().map(|binding| binding.name).collect(),
+            unique
+                .iter()
+                .map(|binding| binding.creation(Value::Undefined, false).attrs())
+                .collect(),
+        );
         Self {
             bindings: unique,
             layout_id: crate::interpreter::new_binding_layout_id(),
@@ -3736,11 +3747,12 @@ impl Chunk {
                     CapInit::Lexical(name, is_const) => {
                         // Non-strict FunctionDeclarationInstantiation keeps body lexicals visible
                         // to EvalDeclarationInstantiation's var-conflict walk. The compact Scope
-                        // stores both binding kinds together, so preserve that distinction here.
-                        b.lexical_names.push(name.clone());
+                        // stores both binding kinds together: the lexical attribute tells them
+                        // apart.
                         b.vars.insert(
                             name.clone(),
-                            crate::interpreter::Binding::data(Value::Undefined, !is_const, false),
+                            crate::interpreter::Binding::data(Value::Undefined, !is_const, false)
+                                .lexical(true),
                         );
                     }
                 }
@@ -6992,7 +7004,9 @@ fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])
 }
 
 type NamePin = Option<crate::interpreter::WeakEnv>;
-type NameSeed = (Rc<str>, NameIc, NamePin, Option<u64>);
+/// A name cache to seed a recompilation's site with: its name, state, pin, number feedback, and
+/// whether a writing site filled it (see [`Chunk::name_ic_fill`]).
+type NameSeed = (Rc<str>, NameIc, NamePin, Option<u64>, bool);
 type CallPin = crate::value::WeakGc;
 
 struct CallSeed {
@@ -7008,11 +7022,9 @@ fn name_cache_seeds(chunk: &Chunk) -> Vec<NameSeed> {
         .ops
         .iter()
         .filter_map(|op| {
-            let (name, cache) = match *op {
-                Op::LoadName(n, c)
-                | Op::LoadNameForCall(n, c)
-                | Op::StoreNameCached(n, c)
-                | Op::UpdateNameCached(n, c, _) => (n, c as usize),
+            let (name, cache, store) = match *op {
+                Op::LoadName(n, c) | Op::LoadNameForCall(n, c) => (n, c as usize, false),
+                Op::StoreNameCached(n, c) | Op::UpdateNameCached(n, c, _) => (n, c as usize, true),
                 _ => return None,
             };
             let number = chunk.name_num_valid[cache]
@@ -7029,6 +7041,7 @@ fn name_cache_seeds(chunk: &Chunk) -> Vec<NameSeed> {
                 state,
                 pins[cache].clone(),
                 number,
+                store,
             ))
         })
         .collect()
@@ -9402,16 +9415,20 @@ impl Compiler {
         self.caches.push(std::cell::Cell::new(IcState::EMPTY));
         idx
     }
-    /// Reserve a fresh name-cache slot for a free-name op.
-    fn new_name_cache(&mut self, name: u32) -> u32 {
+    /// Reserve a fresh name-cache slot for a free-name op, one that writes (`store`:
+    /// StoreNameCached, UpdateNameCached) or not. A writing site takes only a writing site's seed:
+    /// its hits rely on the fill's mutability check (see [`Chunk::name_ic_fill`]).
+    fn new_name_cache(&mut self, name: u32, store: bool) -> u32 {
         let seed = self.name_seed_stack.last_mut().and_then(|(sites, cursor)| {
             let site = sites.get(*cursor);
             *cursor += 1;
-            site.filter(|(hot_name, ..)| hot_name.as_ref() == self.names[name as usize].as_ref())
-                .cloned()
+            site.filter(|(hot_name, .., seed_store)| {
+                hot_name.as_ref() == self.names[name as usize].as_ref() && (*seed_store || !store)
+            })
+            .cloned()
         });
         let (ic, pin, number) = match seed {
-            Some((_, ic, pin, number)) => (ic, pin, number),
+            Some((_, ic, pin, number, _)) => (ic, pin, number),
             None => (NameIc::EMPTY, None, None),
         };
         self.name_caches.push(std::cell::Cell::new(ic));
@@ -9423,7 +9440,7 @@ impl Compiler {
         (self.name_caches.len() - 1) as u32
     }
     fn emit_store_name(&mut self, name: u32) {
-        let cache = self.new_name_cache(name);
+        let cache = self.new_name_cache(name, true);
         self.emit(Op::StoreNameCached(name, cache));
     }
 
@@ -10410,7 +10427,7 @@ impl Compiler {
             }
             Expr::Ident(name, _) if self.home(name).is_none() => {
                 let name = self.name_idx(name);
-                let cache = self.new_name_cache(name);
+                let cache = self.new_name_cache(name, false);
                 self.emit(Op::LoadNameForCall(name, cache));
                 Ok((true, true))
             }
@@ -13687,7 +13704,7 @@ impl Compiler {
                         if let Some(reference) = reference {
                             self.emit(Op::LoadRef(reference));
                         } else {
-                            let c = self.new_name_cache(i);
+                            let c = self.new_name_cache(i, false);
                             self.emit(Op::LoadName(i, c));
                         }
                         self.expr(value)?;
@@ -14325,7 +14342,7 @@ impl Compiler {
                     }
                     None => {
                         let i = self.name_idx(name);
-                        let c = self.new_name_cache(i);
+                        let c = self.new_name_cache(i, false);
                         self.emit(Op::LoadName(i, c));
                     }
                 };
@@ -14346,7 +14363,7 @@ impl Compiler {
                     // normal guarded name cache reads the captured binding live on every hit.
                     // Closures under `with` are excluded by the call-entry gates.
                     let name = self.name_idx("this");
-                    let cache = self.new_name_cache(name);
+                    let cache = self.new_name_cache(name, false);
                     self.emit(Op::LoadName(name, cache));
                     return Ok(());
                 }
@@ -14682,7 +14699,7 @@ impl Compiler {
                     // arguments stays visible to this heap continuation.
                     if self.home("eval").is_none() {
                         let name = self.name_idx("eval");
-                        let cache = self.new_name_cache(name);
+                        let cache = self.new_name_cache(name, false);
                         self.emit(Op::LoadNameForCall(name, cache));
                     } else {
                         self.emit(Op::Undef);
@@ -14975,7 +14992,7 @@ impl Compiler {
                 }
                 None => {
                     let n = self.name_idx(name);
-                    let c = self.new_name_cache(n);
+                    let c = self.new_name_cache(n, true);
                     self.emit(Op::UpdateNameCached(n, c, kind));
                     Ok(())
                 }
@@ -15103,7 +15120,7 @@ impl Compiler {
                         if let Some(reference) = reference {
                             self.emit(Op::LoadRef(reference));
                         } else {
-                            let c = self.new_name_cache(i);
+                            let c = self.new_name_cache(i, false);
                             self.emit(Op::LoadName(i, c));
                         }
                         self.expr(value)?;
@@ -15328,7 +15345,7 @@ impl Compiler {
                         self.emit(Op::LoadRef(reference));
                         Some(reference)
                     } else {
-                        let cache = self.new_name_cache(name_index);
+                        let cache = self.new_name_cache(name_index, false);
                         self.emit(Op::LoadName(name_index, cache));
                         None
                     };
@@ -16703,7 +16720,7 @@ fn run_vm_inner(
             Op::UpdateNameCached(n, c, kind) => {
                 let mut reference = chunk.resolve_name_reference(i, env, n)?;
                 let old = i.read_prepared_reference(&mut reference)?;
-                let _ = chunk.name_ic_fill(i, env, n, c);
+                let _ = chunk.name_ic_fill(i, env, n, c, true);
                 step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
                     i.write_prepared_reference(&mut reference, v)
                 })?;
@@ -17743,7 +17760,7 @@ fn run_vm_inner(
                 // undefined. Only the full walk can produce a with-object receiver.
                 if let Some(v) = chunk
                     .name_ic_hit(i, env, c)
-                    .or_else(|| chunk.name_ic_fill(i, env, n, c))
+                    .or_else(|| chunk.name_ic_fill(i, env, n, c, false))
                 {
                     stack.push(Value::Undefined);
                     stack.push(v);
@@ -20171,7 +20188,7 @@ impl Chunk {
         // As for LoadNameForCall: a cache hit/fill never resolves through a `with` object.
         if let Some(v) = self
             .name_ic_hit(i, &env, c)
-            .or_else(|| self.name_ic_fill(i, &env, n, c))
+            .or_else(|| self.name_ic_fill(i, &env, n, c, false))
         {
             return Ok((Value::Undefined, v));
         }
@@ -20293,8 +20310,9 @@ impl Chunk {
             if scope.has_with_object() || ic.gen == 0 || scope.vars.layout_id() != ic.gen {
                 return None;
             }
+            // The layout's descriptor has the attributes its fill checked (no import).
             let binding = scope.vars.fixed_binding_at(ic.binding as usize)?;
-            return (binding.initialized() && !binding.is_import()).then(|| binding.value());
+            return binding.initialized().then(|| binding.value());
         }
         if ic.env == lexical_cache::DEEP_NAME_IC {
             return self.deep_name_ic_hit(i, env, c);
@@ -20306,14 +20324,10 @@ impl Chunk {
                 return None;
             }
             // The unchanged generation proves the map is structurally untouched since the fill:
-            // the pointer is live and the resolution unchanged (see NameIc). The value and TDZ
-            // flag are read live — in-place writes flow through.
+            // the pointer is live, the resolution unchanged and the attributes the fill checked
+            // (see NameIc). The value and TDZ flag are read live — in-place writes flow through.
             let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::BindingSlot) };
-            return if bd.initialized() && !bd.is_import() {
-                Some(bd.value())
-            } else {
-                None
-            };
+            return bd.initialized().then(|| bd.value());
         }
         if ic.env == raw | 1 {
             // Global-object mode (see NameIc): scope still empty of this name (generation),
@@ -20350,27 +20364,32 @@ impl Chunk {
                 return None;
             }
             let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::BindingSlot) };
-            return if bd.initialized() && !bd.is_import() {
-                Some(bd.value())
-            } else {
-                None
-            };
+            return bd.initialized().then(|| bd.value());
         }
         None
     }
     /// Depth-0 cache fill: the name resolves directly in `env` as a plain initialized binding —
-    /// no `with` object on the scope, no live import redirect. When `env` *is* the global scope
-    /// and misses, an own data property of the ordinary global object fills the global mode
-    /// instead. Returns the value on success; `None` = not cacheable at this site (the caller
-    /// runs the interpreter's full walk, uncached).
-    fn name_ic_fill(&self, i: &Interp, env: &Env, n: u32, c: u32) -> Option<Value> {
+    /// no `with` object on the scope, no live import redirect, and for a site that writes
+    /// (`store`: StoreNameCached, UpdateNameCached) a mutable binding, so that hits check only
+    /// TDZ: a binding's attributes change only with its record's names, which every proof covers.
+    /// When `env` *is* the global scope and misses, an own data property of the ordinary global
+    /// object fills the global mode instead. Returns the value on success; `None` = not cacheable
+    /// at this site (the caller runs the interpreter's full walk, uncached).
+    pub(crate) fn name_ic_fill(
+        &self,
+        i: &Interp,
+        env: &Env,
+        n: u32,
+        c: u32,
+        store: bool,
+    ) -> Option<Value> {
         {
             let b = env.borrow();
             if b.has_with_object() || b.vars.generation() == u32::MAX {
                 return None;
             }
             if let Some(bd) = b.vars.get(&self.names[n as usize]) {
-                if !bd.initialized() || bd.is_import() {
+                if !bd.initialized() || bd.is_import() || (store && !bd.mutable()) {
                     return None;
                 }
                 let v = bd.value();
@@ -20423,7 +20442,7 @@ impl Chunk {
                         && pb.vars.generation() != u32::MAX
                     {
                         if let Some(bd) = pb.vars.get(&self.names[n as usize]) {
-                            if bd.initialized() && !bd.is_import() {
+                            if bd.initialized() && !bd.is_import() && (!store || bd.mutable()) {
                                 let v = bd.value();
                                 self.record_name_number(c as usize, &v);
                                 self.name_caches[c as usize].set(NameIc {
@@ -20454,7 +20473,7 @@ impl Chunk {
         if !Env::ptr_eq(env, &i.global_env)
             || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
         {
-            return self.deep_name_ic_fill(i, env, n, c);
+            return self.deep_name_ic_fill(i, env, n, c, store);
         }
         let g = i.global.borrow();
         if !matches!(g.exotic, crate::value::Exotic::None)
@@ -20491,7 +20510,7 @@ impl Chunk {
         if let Some(v) = self.name_ic_hit(i, env, c) {
             return Ok(v);
         }
-        if let Some(v) = self.name_ic_fill(i, env, n, c) {
+        if let Some(v) = self.name_ic_fill(i, env, n, c, false) {
             return Ok(v);
         }
         crate::workload_metrics::uncached_name(env, &self.names[n as usize]);
@@ -20632,9 +20651,9 @@ impl Chunk {
     }
 
     /// Cached free-name write. A cache hit validates the same resolution proof as a read and
-    /// updates a live mutable binding/plain writable global property in place. Misses perform the
-    /// full PutValue operation, then side-effect-freely seed a cache when the resulting resolution
-    /// is cacheable.
+    /// updates a binding the fill proved mutable and not an import (the proof covers its
+    /// attributes) or a plain writable global property in place. Misses perform the full PutValue
+    /// operation, then side-effect-freely seed a cache when the resulting resolution is cacheable.
     fn store_name_ic(
         &self,
         i: &mut Interp,
@@ -20650,7 +20669,7 @@ impl Chunk {
                 if !scope.has_with_object() && ic.gen != 0 && scope.vars.layout_id() == ic.gen {
                     if let Some(mut binding) = scope.vars.fixed_binding_at_mut(ic.binding as usize)
                     {
-                        if binding.initialized() && binding.mutable() && !binding.is_import() {
+                        if binding.initialized() {
                             binding.set_value(value);
                             return Ok(());
                         }
@@ -20658,7 +20677,7 @@ impl Chunk {
                 }
             }
             i.assign_free_name(&self.names[n as usize], value, env)?;
-            let _ = self.name_ic_fill(i, env, n, c);
+            let _ = self.name_ic_fill(i, env, n, c, true);
             return Ok(());
         }
         if ic.env == lexical_cache::DEEP_NAME_IC {
@@ -20667,7 +20686,7 @@ impl Chunk {
                 return Ok(());
             }
             i.assign_free_name(&self.names[n as usize], pending.unwrap(), env)?;
-            let _ = self.name_ic_fill(i, env, n, c);
+            let _ = self.name_ic_fill(i, env, n, c, true);
             return Ok(());
         }
         let raw = Env::as_ptr(env) as usize;
@@ -20676,7 +20695,7 @@ impl Chunk {
             if b.vars.matches_generation(ic.gen) {
                 let bd =
                     unsafe { &mut *(ic.binding as usize as *mut crate::interpreter::BindingSlot) };
-                if bd.initialized() && bd.mutable() && !bd.is_import() {
+                if bd.initialized() {
                     bd.set_value(value);
                     return Ok(());
                 }
@@ -20709,7 +20728,7 @@ impl Chunk {
                         let bd = unsafe {
                             &mut *(ic.binding as usize as *mut crate::interpreter::BindingSlot)
                         };
-                        if bd.initialized() && bd.mutable() && !bd.is_import() {
+                        if bd.initialized() {
                             bd.set_value(value);
                             return Ok(());
                         }
@@ -20721,7 +20740,7 @@ impl Chunk {
             value
         };
         i.assign_free_name(&self.names[n as usize], value, env)?;
-        let _ = self.name_ic_fill(i, env, n, c);
+        let _ = self.name_ic_fill(i, env, n, c, true);
         Ok(())
     }
     pub(crate) fn jit_frame(&self) -> (usize, usize) {
@@ -21806,21 +21825,15 @@ fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
     let bindings = scope
         .bindings
         .iter()
-        .map(|binding| {
-            crate::interpreter::BindingSlot::from(crate::interpreter::Binding::data(
-                Value::Undefined,
-                !binding.is_const,
-                false,
-            ))
-        })
+        .map(|binding| binding.creation(Value::Undefined, false).slot())
         .collect();
     let next = if catch {
         crate::interpreter::new_catch_scope(*env)
     } else {
         crate::interpreter::new_scope(Some(*env))
     };
-    // A block record is never a VariableEnvironment, so it records no `lexical_names` (only
-    // EvalDeclarationInstantiation's variable-environment check reads them; it tests block
+    // A block record is never a VariableEnvironment, so its bindings carry no lexical attribute
+    // (only EvalDeclarationInstantiation's variable-environment check reads it; it tests block
     // records through HasBinding).
     install_lexical_bindings(&next, scope, bindings);
     *env = next;
@@ -21862,7 +21875,7 @@ fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
                     current.vars.get_atom(binding.name)
                 }
                 .expect("per-iteration binding missing");
-                crate::interpreter::BindingSlot::from(previous.to_binding())
+                *previous.slot()
             })
             .collect()
     };
@@ -25788,7 +25801,7 @@ unsafe fn jit_exec_inner(
         Op::UpdateNameCached(n, c, kind) => {
             let mut reference = chunk.resolve_name_reference(i, env, n)?;
             let old = i.read_prepared_reference(&mut reference)?;
-            let _ = chunk.name_ic_fill(i, env, n, c);
+            let _ = chunk.name_ic_fill(i, env, n, c, true);
             if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
                 i.write_prepared_reference(&mut reference, v)
             })? {
@@ -26452,7 +26465,7 @@ unsafe fn jit_exec_inner(
             // A depth-0 cache hit/fill can't have come through a `with` object (see the VM arm).
             if let Some(v) = chunk
                 .name_ic_hit(i, env, c)
-                .or_else(|| chunk.name_ic_fill(i, env, n, c))
+                .or_else(|| chunk.name_ic_fill(i, env, n, c, false))
             {
                 push!(Value::Undefined);
                 push!(v);

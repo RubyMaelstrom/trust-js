@@ -1455,14 +1455,11 @@ pub struct JitLayout {
     pub scope_with: usize,
     pub scope_with_none: u64,
     pub scope_with_valid: bool,
-    /// The execution word within a `Binding` (the LoadName template's eight-byte source).
+    /// The execution word within a `BindingSlot` (the LoadName template's eight-byte source).
     pub binding_value: usize,
-    /// `mutable` within a `Binding` (free-name update/store guard).
-    pub binding_mutable: usize,
-    /// `initialized` bool within a `Binding` (TDZ check).
+    /// `initialized` bool within a `BindingSlot` (TDZ check). A binding's attributes live with its
+    /// record's names: caches check them when they fill.
     pub binding_init: usize,
-    /// A live import must take its ModuleEnvironmentRecord path.
-    pub binding_import: usize,
     /// The length word within an `Rc<str>` fat pointer (0 or 8 — layout is unstable).
     pub str_len_word: usize,
     /// The pointer word within an `Rc<str>` fat pointer (the other one).
@@ -1885,8 +1882,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && unsafe { *((Env::as_ptr(&probe_with) as usize + scope_with) as *const u64) }
             == PACK_NULL;
     let binding_value = crate::interpreter::BindingSlot::value_offset();
-    let (binding_mutable, binding_init, binding_import) =
-        crate::interpreter::BindingSlot::flag_offsets();
+    let binding_init = crate::interpreter::BindingSlot::initialized_offset();
 
     // Code-keyed call probe: `Callable` is repr(u8) (discriminant byte, then one payload word)
     // and `UserCallable` is repr(C). Verify both on live values: a native callable, and a
@@ -2051,9 +2047,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         scope_with_none,
         scope_with_valid,
         binding_value,
-        binding_mutable,
         binding_init,
-        binding_import,
         obj_call: offset_of!(Object, call),
         user_func,
         user_env,

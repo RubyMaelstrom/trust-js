@@ -194,13 +194,14 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
             (0..24)
                 .map(|n| crate::atom::atomize(&format!("v{n}")))
                 .collect(),
+            vec![Binding::data(Value::Undefined, true, true).attrs(); 24],
         );
         let kept = crate::value::keep_scope_desc(&desc);
         let make = || {
             let env = new_scope(None);
             env.borrow_mut().vars = VarMap::from_fixed_bindings(
                 (0..24)
-                    .map(|n| BindingSlot::from(Binding::data(Value::Num(n as f64), true, true)))
+                    .map(|n| Binding::data(Value::Num(n as f64), true, true).slot())
                     .collect(),
                 kept,
             );
@@ -247,16 +248,9 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
         second
             .borrow_mut()
             .vars
-            .get_mut("v23")
-            .unwrap()
-            .set_import_reference(Some((first, crate::atom::atomize("v23"))));
+            .set_import_for_test("v23", Some((first, crate::atom::atomize("v23"))));
         assert_eq!(probe(&code, &context).address, 0);
-        second
-            .borrow_mut()
-            .vars
-            .get_mut("v23")
-            .unwrap()
-            .set_import_reference(None);
+        second.borrow_mut().vars.set_import_for_test("v23", None);
         cache.set(NameIc {
             binding: 24,
             ..cache.get()
@@ -357,15 +351,9 @@ fn name_dispatch_native_binding_preserves_identity_with_tdz_import_and_exhaustio
         .set_initialized(true);
     env.borrow_mut()
         .vars
-        .get_mut("outer")
-        .unwrap()
-        .set_import_reference(Some((other, crate::atom::atomize("outer"))));
+        .set_import_for_test("outer", Some((other, crate::atom::atomize("outer"))));
     assert_eq!(probe(&code, &context).address, 0);
-    env.borrow_mut()
-        .vars
-        .get_mut("outer")
-        .unwrap()
-        .set_import_reference(None);
+    env.borrow_mut().vars.set_import_for_test("outer", None);
     for generation in [0, 1, u32::MAX - 1, u32::MAX] {
         env.borrow_mut().vars.set_generation_for_test(generation);
         cache.set(NameIc {

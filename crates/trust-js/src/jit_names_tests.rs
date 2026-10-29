@@ -207,12 +207,10 @@ fn native_binding_store_keeps_its_old_input_domain_before_any_commit() {
         (crate::value::PACK_LAZY_PROTO | 0x5a5a, false),
         (0xffff_0000_0000_0000, false),
     ] {
+        // Synthetic bytes, not a Rust Binding: the leaf reads no binding field but the value (a
+        // writing site's fill checked mutability).
         let mut target = [0u64; 16];
         target[0] = 11.0f64.to_bits();
-        let mutable = layout.binding_mutable - layout.binding_value;
-        assert!(mutable < std::mem::size_of_val(&target));
-        // Synthetic bytes, not a Rust Binding: initialize only the fields this leaf reads.
-        unsafe { target.as_mut_ptr().cast::<u8>().add(mutable).write(1) };
         let original_target = target;
         let mut operands = [0x1122_3344_5566_7788, incoming, 0x8877_6655_4433_2211];
         let original_operands = operands;

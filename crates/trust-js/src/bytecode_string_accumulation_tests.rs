@@ -118,24 +118,18 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
             1 => env
                 .borrow_mut()
                 .vars
-                .get_mut("result")
-                .unwrap()
-                .set_attributes_for_test(Some(false), None, None),
-            2 => env
-                .borrow_mut()
-                .vars
-                .get_mut("result")
-                .unwrap()
-                .set_imported_flag_for_test(true),
-            3 => env
-                .borrow_mut()
-                .vars
-                .get_mut("result")
-                .unwrap()
-                .set_import_reference(Some((
-                    engine.interp.global_env,
-                    crate::atom::atomize("exported"),
-                ))),
+                .set_attributes_for_test("result", Some(false), None, None),
+            2 => env.borrow_mut().vars.set_import_for_test(
+                "result",
+                Some((
+                    crate::interpreter::new_scope(None),
+                    crate::atom::atomize("result"),
+                )),
+            ),
+            3 => env.borrow_mut().vars.set_import_for_test(
+                "result",
+                Some((engine.interp.global_env, crate::atom::atomize("exported"))),
+            ),
             4 => env.borrow_mut().set_with_object(Some(Value::Null)),
             5 => {
                 env.borrow_mut().vars.remove("result");

@@ -58,8 +58,6 @@ fn valid(l: &JitLayout) -> bool {
             l.scope_binding_offset,
             l.binding_value,
             l.binding_init,
-            l.binding_import,
-            l.binding_mutable,
             l.obj_props + l.props_shape,
             l.obj_ic_plain,
             l.obj_exotic,
@@ -302,7 +300,10 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     a.bind(done);
 }
 
-/// Convert Binding/Property address to its value address, after live semantic flags.
+/// Convert Binding/Property address to its value address, after live semantic flags: a
+/// binding's TDZ (the proof that found it covers its attributes: a cache's fill refused an
+/// import, and a writing site's an immutable binding; a Reference names a plain binding only),
+/// a property's descriptor.
 fn value_address(a: &mut Asm, l: &JitLayout, store: bool, slow: usize) {
     let property = a.label();
     let done = a.label();
@@ -310,13 +311,6 @@ fn value_address(a: &mut Asm, l: &JitLayout, store: bool, slow: usize) {
     a.jcc(NE, property);
     a.nr_load8(AX, CX, l.binding_init);
     a.nr_zero_guard(AX, slow);
-    a.nr_load8(AX, CX, l.binding_import);
-    a.nr_test(AX);
-    a.jcc(NE, slow);
-    if store {
-        a.nr_load8(AX, CX, l.binding_mutable);
-        a.nr_zero_guard(AX, slow);
-    }
     a.nr_lea(CX, CX, l.binding_value as i32);
     a.jmp(done);
     a.bind(property);

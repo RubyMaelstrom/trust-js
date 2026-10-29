@@ -7,9 +7,9 @@
 //! instantiation path. Structural eval mutations invalidate VarMap's layout proof.
 
 use super::{CapInit, Chunk};
-use crate::atom::Atom;
 use crate::interpreter::{
-    new_var_scope_with_bindings, Binding, BindingSlot, DescRef, Env, Interp, ScopeDesc, VarMap,
+    new_var_scope_with_bindings, Binding, BindingAttrs, BindingSlot, DescRef, Env, Interp,
+    ScopeDesc, VarMap,
 };
 use crate::value::Value;
 use std::rc::Rc;
@@ -20,7 +20,8 @@ pub(super) fn activation_plans_enabled() -> bool {
 }
 
 /// A chunk's plan, made in the chunk's heap: its names are that heap's atoms, in a descriptor
-/// every activation shares, so that making one copies binding values only.
+/// every activation shares with the bindings' attributes, so that making one copies binding
+/// values only.
 pub(super) struct ActivationPlan {
     bindings: Vec<BindingSlot>,
     desc: Rc<ScopeDesc>,
@@ -30,7 +31,6 @@ pub(super) struct ActivationPlan {
     /// A captured rest parameter: (binding index, first argument index).
     rest: Option<(usize, u16)>,
     functions: Vec<(usize, u16)>,
-    lexicals: Vec<Atom>,
     this_slot: Option<usize>,
     arguments_slot: Option<usize>,
 }
@@ -38,14 +38,14 @@ pub(super) struct ActivationPlan {
 impl ActivationPlan {
     pub(super) fn new(chunk: &Chunk) -> Self {
         let mut names = Vec::with_capacity(chunk.cap_inits.len() + 2);
+        let mut attrs = Vec::<BindingAttrs>::with_capacity(chunk.cap_inits.len() + 2);
         let mut plan = Self {
             bindings: Vec::with_capacity(chunk.cap_inits.len() + 2),
-            desc: ScopeDesc::new(Vec::new()),
+            desc: ScopeDesc::new(Vec::new(), Vec::new()),
             kept_desc: DescRef::empty(),
             parameters: Vec::new(),
             rest: None,
             functions: Vec::new(),
-            lexicals: Vec::new(),
             this_slot: None,
             arguments_slot: None,
         };
@@ -58,14 +58,16 @@ impl ActivationPlan {
          -> usize {
             if let Some(&slot) = slots.get(name) {
                 if replace {
-                    bindings[slot] = BindingSlot::from(binding);
+                    bindings[slot] = binding.slot();
+                    attrs[slot] = binding.attrs();
                 }
                 return slot;
             }
             let index = bindings.len();
             slots.insert(name.clone(), index);
             names.push(crate::atom::atomize(name));
-            bindings.push(BindingSlot::from(binding));
+            bindings.push(binding.slot());
+            attrs.push(binding.attrs());
             index
         };
         let mut functions = Vec::new();
@@ -101,14 +103,15 @@ impl ActivationPlan {
                     );
                 }
                 CapInit::Lexical(name, is_const) => {
+                    // Lexical at the activation's level, as FunctionDeclarationInstantiation's
+                    // separate lexical record would hold it (EvalDeclarationInstantiation).
                     slot(
                         &mut plan.bindings,
                         &mut slots,
                         name,
-                        Binding::data(Value::Undefined, !is_const, false),
+                        Binding::data(Value::Undefined, !is_const, false).lexical(true),
                         true,
                     );
-                    plan.lexicals.push(crate::atom::atomize(name));
                 }
                 CapInit::Fn(function, name) => functions.push((*function, name.clone())),
             }
@@ -144,10 +147,10 @@ impl ActivationPlan {
             ));
         }
         // ECMA-262 e28783d5 FunctionDeclarationInstantiation/GetBindingValue:
-        // names are static here, while initialization, mutability and values stay
-        // per invocation.
+        // names and attributes are static here, while initialization and values
+        // stay per invocation.
         drop(slot);
-        plan.desc = ScopeDesc::new(names);
+        plan.desc = ScopeDesc::new(names, attrs);
         plan.kept_desc = crate::value::keep_scope_desc(&plan.desc);
         plan
     }
@@ -181,12 +184,6 @@ impl ActivationPlan {
             vars.initialize_fixed_value(slot, *this_value);
         }
         let activation = new_var_scope_with_bindings(Some(*parent), vars);
-        {
-            let mut scope = activation.borrow_mut();
-            for &name in &self.lexicals {
-                scope.lexical_names.push(name);
-            }
-        }
         // Every closure captures this invocation's actual environment. The
         // plan contains no JS object, closure environment, or argument owner.
         for &(slot, function) in &self.functions {
@@ -218,7 +215,6 @@ impl ActivationPlan {
             + self.bindings.capacity() * std::mem::size_of::<BindingSlot>()
             + (self.parameters.capacity() + self.functions.capacity())
                 * std::mem::size_of::<(usize, u16)>()
-            + self.lexicals.capacity() * std::mem::size_of::<Atom>()
     }
 }
 

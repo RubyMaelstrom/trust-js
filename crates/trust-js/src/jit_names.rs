@@ -194,14 +194,15 @@ pub(super) fn emit_deep_name_value_ptr(
     }
 }
 
+/// x14 = a Binding (x7 0) or a Property (x7 1) → its value's address, after the live checks: a
+/// binding's TDZ (the proof that found it covers its attributes: a deep cache's fill refused an
+/// import, a Reference names a plain binding only) or a property's data descriptor.
 fn emit_target_value_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout, slow: usize) {
     let property = a.new_label();
     let done = a.new_label();
     a.cbnz(7, false, property);
     a.ldrb_imm(13, 14, layout.binding_init as u32);
     a.cbz(13, false, slow);
-    a.ldrb_imm(13, 14, layout.binding_import as u32);
-    a.cbnz(13, false, slow);
     a.add_imm(14, 14, layout.binding_value as u32);
     a.b(done);
     a.bind(property);

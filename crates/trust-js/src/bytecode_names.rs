@@ -132,14 +132,18 @@ impl ResolutionIc {
             }
             match self.target {
                 Target::Binding { pointer, slot } => {
+                    // A Reference keeps the address of a plain binding only (see
+                    // `PreparedReference`): another one's is null, and its reads and writes look
+                    // it up by name.
                     let binding = if guard.pin.as_ptr() == Env::as_ptr(&env)
                         && scope.vars.matches_generation(guard.generation)
                     {
                         pointer
                     } else {
-                        slot.and_then(|slot| scope.vars.binding_at(slot, name))
-                            .or_else(|| scope.vars.get(name))?
-                            .as_ptr()
+                        crate::eval::PreparedReference::plain_slot(
+                            slot.and_then(|slot| scope.vars.binding_at(slot, name))
+                                .or_else(|| scope.vars.get(name))?,
+                        )
                     };
                     return Some(crate::eval::PreparedReference::scope_with_hint(
                         name.clone(),
@@ -190,9 +194,16 @@ impl ResolutionIc {
                 layout: scope.vars.layout_id(),
             });
             let target = if let Some(binding) = scope.vars.get(name) {
+                // Only a plain binding's address and slot: a Reference to another binding (a
+                // const, an import) takes the helper, which checks its attributes.
+                let plain = binding.attrs().plain();
                 Some(Target::Binding {
-                    pointer: binding.as_ptr(),
-                    slot: scope.vars.binding_slot(name),
+                    pointer: if plain {
+                        binding.as_ptr()
+                    } else {
+                        std::ptr::null()
+                    },
+                    slot: scope.vars.binding_slot(name).filter(|_| plain),
                 })
             } else if Env::ptr_eq(&env, &i.global_env) {
                 if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize) {
@@ -319,7 +330,8 @@ impl DeepNameIc {
                             .get(&chunk.names[self.name as usize])
                             .map(|binding| binding.slot())
                     })?;
-                (binding.initialized() && !binding.is_import()).then(|| binding.value())
+                // The fill refused an import; the proof covers the attributes.
+                binding.initialized().then(|| binding.value())
             }
             Target::Global { shape, slot } => {
                 if !Env::ptr_eq(env, &i.global_env)
@@ -370,8 +382,9 @@ impl DeepNameIc {
                 } else {
                     scope.vars.get_mut(&chunk.names[self.name as usize])
                 };
+                // A writing site's fill proved the binding mutable and not an import.
                 if let Some(mut binding) = binding {
-                    if binding.initialized() && binding.mutable() && !binding.is_import() {
+                    if binding.initialized() {
                         binding.set_value(value.take().unwrap());
                         return true;
                     }
@@ -424,7 +437,16 @@ impl Chunk {
             .is_some_and(|cache| cache.store(self, i, env, 0, value))
     }
 
-    pub(super) fn deep_name_ic_fill(&self, i: &Interp, env: &Env, n: u32, c: u32) -> Option<Value> {
+    /// The chain proof for a name a deeper record binds (see [`Chunk::name_ic_fill`], whose
+    /// `store` this takes).
+    pub(super) fn deep_name_ic_fill(
+        &self,
+        i: &Interp,
+        env: &Env,
+        n: u32,
+        c: u32,
+        store: bool,
+    ) -> Option<Value> {
         let mut current = *env;
         let mut guards = Vec::new();
         for _ in 0..MAX_SCOPES {
@@ -441,7 +463,7 @@ impl Chunk {
                 layout: scope.vars.layout_id(),
             });
             let resolved = if let Some(binding) = scope.vars.get(&self.names[n as usize]) {
-                if !binding.initialized() || binding.is_import() {
+                if !binding.initialized() || binding.is_import() || (store && !binding.mutable()) {
                     return None;
                 }
                 Some((
@@ -621,15 +643,11 @@ mod tests {
             holder2
                 .borrow_mut()
                 .vars
-                .get_mut("outer")
-                .unwrap()
-                .set_attributes_for_test(Some(false), None, None);
+                .set_attributes_for_test("outer", Some(false), None, None);
             holder2
                 .borrow_mut()
                 .vars
-                .get_mut("outer")
-                .unwrap()
-                .set_attributes_for_test(None, Some(true), None);
+                .set_attributes_for_test("outer", None, Some(true), None);
             assert!(chunk
                 .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(99.0))
                 .is_err());
@@ -675,7 +693,7 @@ mod tests {
             .set_with_object(Some(Value::Obj(engine.interp.global)));
         assert!(chunk.name_ic_hit(&engine.interp, &child, cache).is_none());
         assert!(chunk
-            .deep_name_ic_fill(&engine.interp, &child, name, cache)
+            .deep_name_ic_fill(&engine.interp, &child, name, cache, false)
             .is_none());
         middle.borrow_mut().set_with_object(None);
         let mut deep = holder;
@@ -683,7 +701,7 @@ mod tests {
             deep = new_scope(Some(deep));
         }
         assert!(chunk
-            .deep_name_ic_fill(&engine.interp, &deep, name, cache)
+            .deep_name_ic_fill(&engine.interp, &deep, name, cache, false)
             .is_none());
     }
 
@@ -709,7 +727,7 @@ mod tests {
         assert_eq!(holder.borrow().vars.generation(), u32::MAX);
         assert!(chunk.name_ic_hit(&engine.interp, &holder, cache).is_none());
         assert!(chunk
-            .name_ic_fill(&engine.interp, &holder, name, cache)
+            .name_ic_fill(&engine.interp, &holder, name, cache, false)
             .is_none());
         assert!(matches!(
             (chunk.load_name_ic(&mut engine.interp, &holder, name, cache))
@@ -726,7 +744,7 @@ mod tests {
         let middle = scope(Some(holder), "middle", 0.0, 0);
         let child = scope(Some(middle), "local", 0.0, 0);
         assert!(chunk
-            .deep_name_ic_fill(&engine.interp, &child, name, cache)
+            .deep_name_ic_fill(&engine.interp, &child, name, cache, false)
             .is_none());
         // Captured-cell caches must also avoid publishing the exhausted token.
         let local = scope(None, "outer", 23.0, 0);
@@ -773,15 +791,11 @@ mod tests {
             fresh
                 .borrow_mut()
                 .vars
-                .get_mut("outer")
-                .unwrap()
-                .set_attributes_for_test(Some(false), None, None);
+                .set_attributes_for_test("outer", Some(false), None, None);
             fresh
                 .borrow_mut()
                 .vars
-                .get_mut("outer")
-                .unwrap()
-                .set_attributes_for_test(None, Some(true), None);
+                .set_attributes_for_test("outer", None, Some(true), None);
             assert!(engine
                 .interp
                 .write_prepared_reference(&mut reference, Value::Num(37.0))

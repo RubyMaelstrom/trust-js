@@ -10,8 +10,12 @@ pub(crate) const REFERENCE_OBJECT: u32 = 1;
 pub(crate) const REFERENCE_UNRESOLVABLE: u32 = 2;
 
 /// Explicit layout for native capture/load/store. Owners live in the canonical activation;
-/// `binding` is only a same-record, generation-checked hint, never an independent GC root.
-/// Interned bytecode names are shared without allocating a String at each resolution.
+/// `binding` is only a same-record, generation-checked hint, never an independent GC root, and
+/// names a plain binding only (mutable and not an import, [`BindingAttrs::plain`]): a binding's
+/// attributes live with its record's names and change only with them, which bumps the
+/// generation, so a hint's reads and writes check only TDZ. Another binding's hint is null, and
+/// its reads and writes look it up by name. Interned bytecode names are shared without allocating
+/// a String at each resolution.
 #[repr(C)]
 pub(crate) struct PreparedReference {
     pub(crate) kind: u32,
@@ -102,6 +106,16 @@ fn record_reference_own_path(index: usize) {
 }
 
 impl PreparedReference {
+    /// The hint a Reference keeps for `binding`: its storage if it is plain, else null.
+    #[inline]
+    pub(crate) fn plain_slot(binding: BindingRef<'_>) -> *const BindingSlot {
+        if binding.attrs().plain() {
+            binding.as_ptr()
+        } else {
+            std::ptr::null()
+        }
+    }
+
     /// The caller holds a matching live structural proof for this exact scope. This is not
     /// a new resolution: subsequent reads/writes validate the holder again after user code.
     pub(crate) fn scope_with_hint(
@@ -132,7 +146,7 @@ impl PreparedReference {
                 record
                     .vars
                     .get(&name)
-                    .map_or(std::ptr::null_mut(), |b| b.as_ptr().cast_mut()),
+                    .map_or(std::ptr::null_mut(), |b| Self::plain_slot(b).cast_mut()),
             )
         };
         Self::scope_with_hint(name, scope, strict, generation, binding)
@@ -295,22 +309,25 @@ impl Interp {
                     .expect("declarative Reference owner");
                 let (initialized, value, import) = {
                     let record = scope.borrow();
-                    let binding = if record.vars.matches_generation(reference.generation)
+                    if record.vars.matches_generation(reference.generation)
                         && !reference.binding.is_null()
                     {
                         // The captured record is strongly owned; only its non-recycled structural
-                        // generation proves this address. Exhaustion always takes the map lookup.
+                        // generation proves this address, and that the binding is still plain.
+                        // Exhaustion always takes the map lookup.
                         // SAFETY: as just said.
-                        Some(unsafe { crate::interpreter::BindingRef::from_ptr(reference.binding) })
+                        let binding = unsafe { &*reference.binding };
+                        (binding.initialized(), binding.value(), None)
                     } else {
-                        record.vars.get(name)
-                    };
-                    let Some(binding) = binding else {
-                        return Err(self.throw("ReferenceError", format!("{name} is not defined")));
-                    };
-                    reference.generation = record.vars.generation();
-                    reference.binding = binding.as_ptr().cast_mut();
-                    (binding.initialized(), binding.value(), binding.import())
+                        let Some(binding) = record.vars.get(name) else {
+                            return Err(
+                                self.throw("ReferenceError", format!("{name} is not defined"))
+                            );
+                        };
+                        reference.generation = record.vars.generation();
+                        reference.binding = PreparedReference::plain_slot(binding).cast_mut();
+                        (binding.initialized(), binding.value(), binding.import())
+                    }
                 };
                 if !initialized {
                     return Err(self.throw(
@@ -369,15 +386,22 @@ impl Interp {
                     .as_ref()
                     .expect("declarative Reference owner");
                 let mut record = scope.borrow_mut();
-                let binding = if record.vars.matches_generation(reference.generation)
+                if record.vars.matches_generation(reference.generation)
                     && !reference.binding.is_null()
                 {
-                    // SAFETY: the record is strongly owned and its generation unchanged.
-                    Some(unsafe { crate::interpreter::BindingMut::from_ptr(reference.binding) })
-                } else {
-                    record.vars.get_mut(name)
-                };
-                if let Some(mut binding) = binding {
+                    // SAFETY: the record is strongly owned and its generation unchanged, so the
+                    // binding is still the plain one the hint was taken from.
+                    let binding = unsafe { &mut *reference.binding };
+                    if !binding.initialized() {
+                        return Err(self.throw(
+                            "ReferenceError",
+                            format!("cannot access '{name}' before initialization"),
+                        ));
+                    }
+                    binding.set_value(value);
+                    return Ok(());
+                }
+                if let Some(mut binding) = record.vars.get_mut(name) {
                     if binding.is_import() {
                         return Err(self.throw(
                             "TypeError",
@@ -397,6 +421,7 @@ impl Interp {
                             Ok(())
                         };
                     }
+                    // Mutable and not an import: plain.
                     binding.set_value(value);
                     reference.binding = binding.as_mut_ptr();
                     reference.generation = record.vars.generation();

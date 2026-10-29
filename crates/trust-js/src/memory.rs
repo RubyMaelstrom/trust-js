@@ -1194,15 +1194,11 @@ impl Visitor {
         if let Some(desc) = scope.vars.shared_desc() {
             self.scope_desc(desc);
         }
-        let (mut bytes, exact) = scope.vars.retained_requested_storage_bytes();
-        bytes = bytes.saturating_add(scope.lexical_names.retained_requested_storage_bytes());
-        // The names are atoms, which their heap's table accounts.
+        // The names are atoms, which their heap's table accounts, and the imports' targets the
+        // names' own list.
+        let (bytes, exact) = scope.vars.retained_requested_storage_bytes();
         for (_, binding) in scope.vars.iter() {
             self.value(&binding.value());
-            if binding.is_import() {
-                bytes =
-                    bytes.saturating_add(size_of::<(crate::interpreter::Env, crate::atom::Atom)>());
-            }
         }
         (bytes, exact)
     }

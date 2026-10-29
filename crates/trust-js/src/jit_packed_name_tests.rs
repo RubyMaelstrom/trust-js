@@ -353,25 +353,18 @@ fn fixed_layout_flags_and_stale_layouts_decline_before_native_commit() {
                     .borrow_mut()
                     .vars
                     .insert("source", Binding::data(Value::Num(99.0), true, true));
-                target
-                    .borrow_mut()
-                    .vars
-                    .get_mut("outer")
-                    .unwrap()
-                    .replace_for_test(Binding::live_import(
-                        exporter,
-                        crate::atom::atomize("source"),
-                    ));
-            }
-            _ => {
-                let mut scope = target.borrow_mut();
-                let mut binding = scope.vars.get_mut("outer").unwrap();
-                binding.set_attributes_for_test(
-                    Some(false),
-                    Some(scenario == "strict immutable"),
-                    None,
+                // CreateImportBinding's replacement gives the record its own names.
+                target.borrow_mut().vars.insert(
+                    "outer",
+                    Binding::live_import(exporter, crate::atom::atomize("source")),
                 );
             }
+            _ => target.borrow_mut().vars.set_attributes_for_test(
+                "outer",
+                Some(false),
+                Some(scenario == "strict immutable"),
+                None,
+            ),
         }
 
         let before = commits();
@@ -393,16 +386,29 @@ fn fixed_layout_flags_and_stale_layouts_decline_before_native_commit() {
                 "{scenario}"
             );
         }
+        // Every scenario changes the record's names (attributes live with them), so no proof
+        // filled before holds.
+        assert_eq!(
+            commits()[0],
+            before[0],
+            "{scenario} must reject native read"
+        );
         if scenario.ends_with("immutable") {
+            // The reader's checked read refilled its cache: an initialized immutable binding is
+            // readable natively.
+            let before = commits();
+            let read = crate::jit::run(
+                &mut engine.interp,
+                &reader,
+                &read_code,
+                &case.env,
+                Value::Undefined,
+                &[],
+            );
+            assert_eq!(read.ok().and_then(|value| value.as_num_opt()), Some(17.0));
             assert!(
                 commits()[0] > before[0],
                 "an initialized immutable binding is readable"
-            );
-        } else {
-            assert_eq!(
-                commits()[0],
-                before[0],
-                "{scenario} must reject native read"
             );
         }
 

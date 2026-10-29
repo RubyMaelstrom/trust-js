@@ -127,8 +127,8 @@ fn try_store(
                 drop(record);
                 // Pure scalar/weak cache population, as after the ordinary checked store.
                 // No owner is retained by these caches and no JS operation is replayed.
-                let _ = chunk.name_ic_fill(interp, env, plan.name, plan.read_cache);
-                let _ = chunk.name_ic_fill(interp, env, plan.name, plan.write_cache);
+                let _ = chunk.name_ic_fill(interp, env, plan.name, plan.read_cache, false);
+                let _ = chunk.name_ic_fill(interp, env, plan.name, plan.write_cache, true);
                 return Some(stored);
             }
             record.parent

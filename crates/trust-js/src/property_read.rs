@@ -354,9 +354,10 @@ impl Interp {
             if index + 1 == cache.scopes.len() {
                 // SAFETY: resolution installed this pointer from this scope's VarMap. The live
                 // identity and unchanged non-saturated generation above prove no structural
-                // mutation has moved or removed it. In-place binding changes are inspected live.
+                // mutation has moved or removed it, nor changed its attributes (resolution refused
+                // an import). Its TDZ state is inspected live.
                 let binding = unsafe { &*cache.binding };
-                return if binding.initialized() && !binding.is_import() && !binding.is_import() {
+                return if binding.initialized() {
                     BindingGetterProbe::Value(binding.value())
                 } else {
                     BindingGetterProbe::UninitializedOrImport
@@ -401,7 +402,7 @@ impl Interp {
                 return None;
             }
             if let Some(binding) = scope.vars.get(name) {
-                if !binding.initialized() || binding.is_import() || binding.is_import() {
+                if !binding.initialized() || binding.is_import() {
                     return None;
                 }
                 scope_count = Some(depth);
@@ -433,7 +434,7 @@ impl Interp {
             });
             if index + 1 == scope_count {
                 let binding = scope.vars.get(name)?;
-                if !binding.initialized() || binding.is_import() || binding.is_import() {
+                if !binding.initialized() || binding.is_import() {
                     return None;
                 }
                 binding_ptr = binding.as_ptr();

@@ -260,18 +260,16 @@ fn prepared_reference_native_kind_flags_use_compact_binding_size_and_live_import
     #[cfg(target_pointer_width = "64")]
     assert_eq!(
         std::mem::size_of::<crate::interpreter::BindingSlot>(),
-        24,
-        "import kind flag fits the 24-byte packed binding"
+        16,
+        "a binding's slot holds its value and TDZ flag; its attributes live with the names"
     );
     let target = new_scope(None);
     let mut vars = VarMap::default();
     vars.insert("binding", Binding::data(Value::Undefined, false, true));
     assert!(!vars.get("binding").unwrap().is_import());
-    vars.get_mut("binding")
-        .unwrap()
-        .set_import_reference(Some((target, crate::atom::atomize("exported"))));
+    vars.set_import_for_test("binding", Some((target, crate::atom::atomize("exported"))));
     assert!(vars.get("binding").unwrap().is_import());
-    vars.get_mut("binding").unwrap().set_import_reference(None);
+    vars.set_import_for_test("binding", None);
     assert!(!vars.get("binding").unwrap().is_import());
     // The entries validate: an InlineVec keeping a map's first binding in place.
     assert!(

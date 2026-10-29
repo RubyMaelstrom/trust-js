@@ -11626,14 +11626,14 @@ fn load_name_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.binding_value.is_multiple_of(8)
         && layout.binding_value < 256
         && layout.binding_init < 4096
-        && layout.binding_import < 4096
         && layout.scope_with_valid
         && layout.scope_with < 4096
 }
 
 /// The cached numeric name update additionally writes through the resolved binding/property.
-/// Require the descriptor and binding-mutability bytes to be directly addressable, and the
-/// packed global-property representation understood by the emitted Number guard.
+/// Require the descriptor bytes to be directly addressable, and the packed global-property
+/// representation understood by the emitted Number guard. A binding's mutability needs no byte:
+/// a writing site's fill checked it.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -11643,8 +11643,6 @@ fn update_name_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.entry_accessor == layout.entry_value + 8
         && layout.entry_writable >= layout.entry_value
         && layout.entry_writable - layout.entry_value < 4096
-        && layout.binding_mutable >= layout.binding_value
-        && layout.binding_mutable - layout.binding_value < 4096
 }
 
 /// Inline `++`/`--` on a cached free name holding a Number. Cache validation proves the live
@@ -11664,12 +11662,13 @@ fn emit_update_name_inline(
 ) {
     let slow = a.new_label();
     let done = a.new_label();
-    let scope = a.new_label();
     let checked = a.new_label();
 
-    // x14 -> execution word. x7 still distinguishes Binding (0) from Property (1).
+    // x14 -> execution word. x7 still distinguishes Binding (0) from Property (1). Scope mode:
+    // the site's fill checked the binding mutable (const and named-expression bindings take the
+    // checked path), and its proof covers the attributes.
     emit_name_ic_value_ptr(a, layout, cache_ptr, slow, true);
-    a.cbz(7, false, scope);
+    a.cbz(7, false, checked);
 
     // Global-object mode: the live data property must remain writable and contain a Number.
     guard_prop_writable(
@@ -11679,17 +11678,6 @@ fn emit_update_name_inline(
         (layout.entry_writable - layout.entry_value) as u32,
         slow,
     );
-    a.b(checked);
-
-    // Scope mode retains the live mutability check (const/named-expression bindings take
-    // the checked path); changing representation does not change the owner or its flags.
-    a.bind(scope);
-    a.ldrb_imm(
-        9,
-        14,
-        (layout.binding_mutable - layout.binding_value) as u32,
-    );
-    a.cbz(9, false, slow);
 
     // Every non-number execution tag is a NaN. Keep numeric NaN canonicalization on the
     // checked path too; finite Numbers, signed zero and infinities share this word update.
@@ -11853,14 +11841,10 @@ fn emit_store_name_value(
     names::record_name_commit(a, 1);
     a.b(done);
 
-    // Scope binding: validate mutability, then copy the complete incoming execution word.
+    // Scope binding: mutable, as the site's fill checked (a captured binding's StoreCap is mutable
+    // by construction, a Reference names a plain binding only): copy the complete incoming
+    // execution word.
     a.bind(scope);
-    a.ldrb_imm(
-        9,
-        14,
-        (layout.binding_mutable - layout.binding_value) as u32,
-    );
-    a.cbz(9, false, slow);
     emit_exec_word_load(a, 8, 20, -8);
     // The old wide decoder rejected property-only/reserved words before publishing either
     // half. Retain that boundary before the one-word Binding commit; EMPTY remains distinct
@@ -13149,12 +13133,11 @@ fn emit_name_ic_value_ptr_in(
     a.bind(scope);
     a.ldr_imm(14, 12, NAME_IC_OFF_BINDING);
     a.bind(binding_ready);
+    // The proof covers the binding's attributes (its fill refused an import): only TDZ is live.
     a.ldrb_imm(9, 14, bi);
     a.cbz(9, false, slow);
-    a.ldrb_imm(9, 14, layout.binding_import as u32);
-    a.cbnz(9, false, slow);
     a.add_imm(14, 14, bv); // x14 → the binding's Value
-    a.movz(7, 0, 0); // Binding owner: initialization/import/mutability semantics
+    a.movz(7, 0, 0); // Binding owner: initialization/mutability semantics
     a.bind(have);
 }
 

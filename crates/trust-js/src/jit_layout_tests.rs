@@ -267,8 +267,6 @@ fn scope_offsets_read_generation_parent_and_bindings() {
             let live = scope.vars.fixed_binding_at(slot).expect("fixed slot");
             assert_eq!(binding, live.as_ptr() as usize, "slot {slot}");
             assert_eq!(read::<u8>(binding, layout.binding_init), 1);
-            assert_eq!(read::<u8>(binding, layout.binding_mutable), 1);
-            assert_eq!(read::<u8>(binding, layout.binding_import), 0);
             assert_eq!(layout.binding_value, BindingSlot::value_offset());
             assert!((binding + layout.binding_value).is_multiple_of(8));
             assert!(layout.binding_value + 8 <= std::mem::size_of::<BindingSlot>());
@@ -276,16 +274,10 @@ fn scope_offsets_read_generation_parent_and_bindings() {
                 read::<u64>(binding, layout.binding_value),
                 live.value().bits()
             );
-            for flag in [
-                layout.binding_init,
-                layout.binding_mutable,
-                layout.binding_import,
-            ] {
-                assert!(
-                    !(layout.binding_value..layout.binding_value + 8).contains(&flag),
-                    "the execution word must not overlap a binding flag"
-                );
-            }
+            assert!(
+                !(layout.binding_value..layout.binding_value + 8).contains(&layout.binding_init),
+                "the execution word must not overlap the TDZ flag"
+            );
         }
     };
     let parent = new_scope(None);

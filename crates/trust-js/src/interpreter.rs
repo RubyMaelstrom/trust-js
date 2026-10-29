@@ -1553,6 +1553,9 @@ const SMALL_VAR_MAP_CAPACITY: usize = 8;
 pub(crate) struct BindingLayout {
     id: u32,
     slots: crate::fasthash::FastMap<Rc<str>, usize>,
+    /// The bindings' attributes, by slot: those of the activation that made the layout, which
+    /// every activation sharing it must have (empty in a large descriptor's text index).
+    attrs: Box<[BindingAttrs]>,
 }
 
 impl BindingLayout {
@@ -1561,7 +1564,9 @@ impl BindingLayout {
             visitor.rc_str(name);
         }
         // HashMap does not expose its bucket allocation; a lower bound.
-        std::mem::size_of::<Self>() + self.slots.len() * std::mem::size_of::<(Rc<str>, usize)>()
+        std::mem::size_of::<Self>()
+            + self.slots.len() * std::mem::size_of::<(Rc<str>, usize)>()
+            + self.attrs.len() * std::mem::size_of::<BindingAttrs>()
     }
 
     /// The slot of the binding named by `name`, if the layout has one.
@@ -1579,12 +1584,16 @@ impl BindingLayout {
     }
 }
 
-/// The names of a scope's bindings in slot order, shared by every record the scope makes (a
-/// compiled scope's, or a tree-walked function's activation shape). Its heap keeps it for as
-/// long as the heap lives ([`crate::value::keep_scope_desc`]), and its records name it without
-/// owning it ([`DescRef`]). Making a record then copies binding values, not names.
+/// The names of a scope's bindings in slot order, with their attributes, shared by every record
+/// the scope makes (a compiled scope's, or a tree-walked function's activation shape). Its heap
+/// keeps it for as long as the heap lives ([`crate::value::keep_scope_desc`]), and its records
+/// name it without owning it ([`DescRef`]). Making a record then copies binding values, not
+/// names. A descriptor never changes: a record whose names or attributes change takes its own
+/// list first.
 pub(crate) struct ScopeDesc {
     names: Box<[crate::atom::Atom]>,
+    /// Each name's binding's attributes, slot for slot (no import: imports live in own lists).
+    attrs: Box<[BindingAttrs]>,
     /// Name → slot, past [`SMALL_VAR_MAP_CAPACITY`] names.
     index: Option<crate::fasthash::FastMap<crate::atom::Atom, u32>>,
     /// Text → slot, past [`SMALL_VAR_MAP_CAPACITY`] names: the tree-walker and the runtime's
@@ -1593,7 +1602,8 @@ pub(crate) struct ScopeDesc {
 }
 
 impl ScopeDesc {
-    pub(crate) fn new(names: Vec<crate::atom::Atom>) -> Rc<Self> {
+    /// A descriptor of `names` and their bindings' attributes, slot for slot.
+    pub(crate) fn new(names: Vec<crate::atom::Atom>, attrs: Vec<BindingAttrs>) -> Rc<Self> {
         let large = names.len() > SMALL_VAR_MAP_CAPACITY;
         let text = large.then(|| {
             Rc::new(BindingLayout {
@@ -1603,13 +1613,20 @@ impl ScopeDesc {
                     .enumerate()
                     .map(|(slot, name)| (Rc::from(&*name.text()), slot))
                     .collect(),
+                attrs: Box::new([]),
             })
         });
-        Self::with_text(names, text)
+        Self::with_text(names, attrs, text)
     }
 
     /// A descriptor of `names` whose text index, if it needs one, is `text`'s.
-    fn with_text(names: Vec<crate::atom::Atom>, text: Option<Rc<BindingLayout>>) -> Rc<Self> {
+    fn with_text(
+        names: Vec<crate::atom::Atom>,
+        attrs: Vec<BindingAttrs>,
+        text: Option<Rc<BindingLayout>>,
+    ) -> Rc<Self> {
+        assert_eq!(names.len(), attrs.len(), "an attribute set per name");
+        debug_assert!(attrs.iter().all(|attrs| !attrs.imported()));
         let large = names.len() > SMALL_VAR_MAP_CAPACITY;
         let index = large.then(|| {
             names
@@ -1620,6 +1637,7 @@ impl ScopeDesc {
         });
         Rc::new(Self {
             names: names.into_boxed_slice(),
+            attrs: attrs.into_boxed_slice(),
             index,
             text: text.filter(|_| large),
         })
@@ -1633,7 +1651,7 @@ impl ScopeDesc {
             .into_iter()
             .map(crate::atom::atomize)
             .collect();
-        Self::with_text(names, Some(layout.clone()))
+        Self::with_text(names, layout.attrs.to_vec(), Some(layout.clone()))
     }
 
     #[inline]
@@ -1649,6 +1667,7 @@ impl ScopeDesc {
         // counted with the layout. HashMap does not expose its bucket allocation; a lower bound.
         std::mem::size_of::<Self>()
             + self.names.len() * std::mem::size_of::<crate::atom::Atom>()
+            + self.attrs.len() * std::mem::size_of::<BindingAttrs>()
             + self.index.as_ref().map_or(0, |index| {
                 index.len() * std::mem::size_of::<(crate::atom::Atom, u32)>()
             })
@@ -1679,6 +1698,7 @@ impl DescRef {
         let empty = EMPTY.get_or_init(|| {
             Empty(ScopeDesc {
                 names: Box::new([]),
+                attrs: Box::new([]),
                 index: None,
                 text: None,
             })
@@ -1699,15 +1719,27 @@ impl std::ops::Deref for DescRef {
 }
 
 /// A record's own names: those of a record built name by name (the tree-walker's, eval's) or
-/// changed after a descriptor's (a sloppy eval's `var`), in a storage block the record reports.
-/// It is never dropped: the names are atoms, the spill is a block, and a large list's index
-/// lives in a payload cell whose finalizer drops it.
+/// changed after a descriptor's (a sloppy eval's `var`, a `delete`), in a storage block the
+/// record reports, with each name's binding's attributes and, once one of them is an import, each
+/// binding's import target. It is never dropped: the names are atoms, the spills are blocks, and
+/// a large list's index lives in a payload cell whose finalizer drops it.
 struct OwnNames {
     names: std::mem::ManuallyDrop<
         crate::inline_vec::InlineVec<crate::atom::Atom, 2, crate::gc_storage::GcSpill>,
     >,
+    attrs: std::mem::ManuallyDrop<
+        crate::inline_vec::InlineVec<BindingAttrs, 8, crate::gc_storage::GcSpill>,
+    >,
+    /// Slot for slot, each binding's import target (CreateImportBinding's module record and
+    /// name), from the first import on: a module record's.
+    imports: Option<crate::gc_storage::StorageBox<ImportTargets>>,
     index: Option<crate::gc_storage::PayloadBox<NameIndex>>,
 }
+
+/// Slot for slot, an [`OwnNames`]' import targets.
+type ImportTargets = std::mem::ManuallyDrop<
+    crate::inline_vec::InlineVec<Option<(Env, crate::atom::Atom)>, 1, crate::gc_storage::GcSpill>,
+>;
 
 /// An [`OwnNames`]' name → slot index, past [`SMALL_VAR_MAP_CAPACITY`] names.
 #[derive(Default)]
@@ -1728,10 +1760,22 @@ impl std::ops::DerefMut for NameIndex {
     }
 }
 
-/// A record's binding names, by slot, in one word: a descriptor records share ([`DescRef`]), the
-/// record's own list ([`OwnNames`], in a storage block), or, while a record that owns its names
-/// has one binding, that name itself, which needs no block. Cells are 16-byte aligned, so the
-/// low bits tag the kind.
+/// Whether two import targets are the same (environment identity and name).
+fn same_import(a: Option<(Env, crate::atom::Atom)>, b: Option<(Env, crate::atom::Atom)>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some((a, an)), Some((b, bn))) => Env::ptr_eq(&a, &b) && an == bn,
+        _ => false,
+    }
+}
+
+/// A record's binding names, by slot, with their bindings' attributes, in one word: a descriptor
+/// records share ([`DescRef`]), the record's own list ([`OwnNames`], in a storage block), or, while
+/// a record that owns its names has one binding whose attributes fit
+/// [`BindingAttrs::ONE_WORD`], that name itself, its attributes in the two alignment bits above
+/// the tag, which needs no block. Cells are 16-byte aligned, so the low bits tag the kind. A
+/// shared descriptor and a one-name word never change: changing a name or an attribute replaces
+/// the word.
 #[derive(Clone, Copy)]
 struct Names(std::num::NonZeroUsize);
 
@@ -1740,6 +1784,9 @@ impl Names {
     const OWN: usize = 1;
     const ONE: usize = 2;
     const TAG: usize = 3;
+    /// A one-name word's attribute bits.
+    const ONE_ATTRS: usize = 0xc;
+    const ONE_ATTRS_SHIFT: u32 = 2;
 
     #[inline]
     fn shared(desc: DescRef) -> Self {
@@ -1747,10 +1794,24 @@ impl Names {
     }
 
     #[inline]
-    fn one(name: crate::atom::Atom) -> Self {
+    fn one(name: crate::atom::Atom, attrs: BindingAttrs) -> Self {
+        debug_assert_eq!(
+            attrs.0 & !BindingAttrs::ONE_WORD,
+            0,
+            "attributes a word holds"
+        );
         let word = name.cell_word() as usize;
-        debug_assert_eq!(word & Self::TAG, 0, "string cells are aligned");
-        Self(std::num::NonZeroUsize::new(word | Self::ONE).expect("non-null"))
+        debug_assert_eq!(
+            word & (Self::TAG | Self::ONE_ATTRS),
+            0,
+            "string cells are 16-byte aligned"
+        );
+        Self(
+            std::num::NonZeroUsize::new(
+                word | (usize::from(attrs.0) << Self::ONE_ATTRS_SHIFT) | Self::ONE,
+            )
+            .expect("non-null"),
+        )
     }
 
     fn own(names: crate::gc_storage::StorageBox<OwnNames>) -> Self {
@@ -1789,9 +1850,18 @@ impl Names {
 
     #[inline]
     fn single(self) -> Option<crate::atom::Atom> {
-        // SAFETY: a one word is an atom's address (see `Names::one`).
-        (self.kind() == Self::ONE)
-            .then(|| unsafe { crate::atom::Atom::from_cell_word(self.untagged() as u64) })
+        // SAFETY: a one word is an atom's address and its attributes (see `Names::one`).
+        (self.kind() == Self::ONE).then(|| unsafe {
+            crate::atom::Atom::from_cell_word(
+                (self.0.get() & !(Self::TAG | Self::ONE_ATTRS)) as u64,
+            )
+        })
+    }
+
+    /// A one-name word's binding's attributes.
+    #[inline]
+    fn single_attrs(self) -> BindingAttrs {
+        BindingAttrs(((self.0.get() & Self::ONE_ATTRS) >> Self::ONE_ATTRS_SHIFT) as u8)
     }
 
     fn len(&self) -> usize {
@@ -1810,6 +1880,27 @@ impl Names {
             Self::OWN => self.own_names().expect("own").names.get(slot).copied(),
             _ => (slot == 0).then(|| self.single().expect("one")),
         }
+    }
+
+    /// The attributes of the binding at `slot`, which the caller knows exists.
+    #[inline]
+    fn attrs(&self, slot: usize) -> BindingAttrs {
+        match self.kind() {
+            Self::SHARED => self.desc().expect("shared").attrs[slot],
+            Self::OWN => self.own_names().expect("own").attrs[slot],
+            _ => self.single_attrs(),
+        }
+    }
+
+    /// The import target of the binding at `slot`, if it is an import.
+    #[inline]
+    fn import(&self, slot: usize) -> Option<(Env, crate::atom::Atom)> {
+        self.own_names()?
+            .imports
+            .as_ref()?
+            .get(slot)
+            .copied()
+            .flatten()
     }
 
     /// The slot of `name`.
@@ -1850,11 +1941,16 @@ impl Names {
         self.with_slice(|names| names.iter().position(|name| name.is(text)))
     }
 
-    /// Exchange the names at `a` and `b`, owning the names first, without updating an own
-    /// list's index: for a permutation whose names a descriptor then replaces.
+    /// Exchange the names, attributes and imports at `a` and `b`, owning the names first, without
+    /// updating an own list's index: for a permutation whose names a descriptor then replaces.
     fn swap_unindexed(&mut self, a: usize, b: usize) {
         if a != b {
-            self.own_mut().names.swap(a, b);
+            let own = self.own_mut();
+            own.names.swap(a, b);
+            own.attrs.swap(a, b);
+            if let Some(imports) = &mut own.imports {
+                imports.swap(a, b);
+            }
         }
     }
 
@@ -1863,11 +1959,15 @@ impl Names {
     fn own_mut(&mut self) -> &mut OwnNames {
         if self.kind() != Self::OWN {
             let mut names = crate::inline_vec::InlineVec::new();
+            let mut attrs = crate::inline_vec::InlineVec::new();
             for slot in 0..self.len() {
                 names.push(self.get(slot).expect("in range"));
+                attrs.push(self.attrs(slot));
             }
             *self = Self::own(crate::gc_storage::StorageBox::new(OwnNames {
                 names: std::mem::ManuallyDrop::new(names),
+                attrs: std::mem::ManuallyDrop::new(attrs),
+                imports: None,
                 index: None,
             }));
             self.reindex();
@@ -1895,15 +1995,47 @@ impl Names {
         }
     }
 
-    /// Append `name` at the next slot, owning the names first.
-    fn push(&mut self, name: crate::atom::Atom) {
-        if self.kind() == Self::SHARED && self.len() == 0 {
-            *self = Self::one(name);
+    /// Set an own list's import target at `slot`, making the list's imports first.
+    fn set_own_import(own: &mut OwnNames, slot: usize, import: Option<(Env, crate::atom::Atom)>) {
+        if own.imports.is_none() {
+            if import.is_none() {
+                return;
+            }
+            let mut targets = crate::inline_vec::InlineVec::new();
+            for _ in 0..own.names.len() {
+                targets.push(None);
+            }
+            own.imports = Some(crate::gc_storage::StorageBox::new(
+                std::mem::ManuallyDrop::new(targets),
+            ));
+        }
+        own.imports.as_mut().expect("imports")[slot] = import;
+    }
+
+    /// Append `name` at the next slot with its binding's attributes and import target, owning the
+    /// names first unless the record has no binding yet and the attributes fit a one-name word.
+    fn push(
+        &mut self,
+        name: crate::atom::Atom,
+        attrs: BindingAttrs,
+        import: Option<(Env, crate::atom::Atom)>,
+    ) {
+        if self.kind() == Self::SHARED
+            && self.len() == 0
+            && import.is_none()
+            && attrs.0 & !BindingAttrs::ONE_WORD == 0
+        {
+            *self = Self::one(name, attrs);
             return;
         }
         let own = self.own_mut();
         own.names.push(name);
+        own.attrs.push(attrs);
         let slot = own.names.len() - 1;
+        if let Some(imports) = &mut own.imports {
+            imports.push(None);
+        }
+        Self::set_own_import(own, slot, import);
         match &mut own.index {
             Some(index) => {
                 index.insert(name, slot as u32);
@@ -1911,6 +2043,27 @@ impl Names {
             None if own.names.len() > SMALL_VAR_MAP_CAPACITY => self.reindex(),
             None => {}
         }
+    }
+
+    /// Give the binding at `slot` these attributes and import target, replacing a descriptor or a
+    /// one-name word that cannot hold them by an own list. Whether anything changed.
+    fn set_attrs(
+        &mut self,
+        slot: usize,
+        attrs: BindingAttrs,
+        import: Option<(Env, crate::atom::Atom)>,
+    ) -> bool {
+        if self.attrs(slot) == attrs && same_import(self.import(slot), import) {
+            return false;
+        }
+        if self.kind() == Self::ONE && import.is_none() && attrs.0 & !BindingAttrs::ONE_WORD == 0 {
+            *self = Self::one(self.single().expect("one"), attrs);
+            return true;
+        }
+        let own = self.own_mut();
+        own.attrs[slot] = attrs;
+        Self::set_own_import(own, slot, import);
+        true
     }
 
     /// Remove the name at `slot`, moving the last into its place (as `swap_remove`).
@@ -1921,15 +2074,31 @@ impl Names {
         }
         let own = self.own_mut();
         own.names.swap_remove(slot);
+        own.attrs.swap_remove(slot);
+        if let Some(imports) = &mut own.imports {
+            imports.swap_remove(slot);
+        }
         self.reindex();
     }
 
-    /// Report an own list's blocks and cells.
+    /// Report an own list's blocks and cells, and its imports' environments.
     fn trace<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         if let Some(own) = self.own_names() {
             crate::gc_storage::trace_block(self.untagged() as *const u8, sink);
             if let Some(block) = own.names.spill_ptr() {
                 crate::gc_storage::trace_block(block, sink);
+            }
+            if let Some(block) = own.attrs.spill_ptr() {
+                crate::gc_storage::trace_block(block, sink);
+            }
+            if let Some(imports) = &own.imports {
+                crate::gc_storage::StorageBox::trace(imports, sink);
+                if let Some(block) = imports.spill_ptr() {
+                    crate::gc_storage::trace_block(block, sink);
+                }
+                for (environment, _) in imports.iter().flatten() {
+                    sink.env(environment);
+                }
             }
             if let Some(index) = &own.index {
                 crate::gc_storage::PayloadBox::trace(index, sink);
@@ -1943,6 +2112,12 @@ impl Names {
             Some(own) => (
                 std::mem::size_of::<OwnNames>()
                     + own.names.heap_capacity() * std::mem::size_of::<crate::atom::Atom>()
+                    + own.attrs.heap_capacity() * std::mem::size_of::<BindingAttrs>()
+                    + own.imports.as_ref().map_or(0, |imports| {
+                        std::mem::size_of::<ImportTargets>()
+                            + imports.heap_capacity()
+                                * std::mem::size_of::<Option<(Env, crate::atom::Atom)>>()
+                    })
                     + own.index.as_ref().map_or(0, |index| {
                         index.len() * std::mem::size_of::<(crate::atom::Atom, u32)>()
                     }),
@@ -2062,13 +2237,26 @@ impl VarMap {
                     .enumerate()
                     .map(|(slot, name)| (Rc::from(&*name.text()), slot))
                     .collect(),
+                attrs: (0..self.values.len())
+                    .map(|slot| self.names.attrs(slot))
+                    .collect(),
             })
         });
         if layout.id == 0
             || self.values.len() != layout.slots.len()
+            || self.values.len() != layout.attrs.len()
             || self.keys().any(|name| layout.slot_of_atom(name).is_none())
         {
             return;
+        }
+        // The descriptor's attributes are the layout's: every binding must have its slot's, and
+        // a descriptor holds no import.
+        for slot in 0..self.values.len() {
+            let name = self.names.get(slot).expect("a name per value");
+            let target = layout.slot_of_atom(name).expect("validated");
+            if self.names.attrs(slot) != layout.attrs[target] || self.names.import(slot).is_some() {
+                return;
+            }
         }
         let desc = crate::value::scope_desc_for(layout);
         self.bump();
@@ -2098,7 +2286,6 @@ impl VarMap {
     /// Structural writes still use `insert`/`remove` and invalidate the published
     /// layout before changing or replacing this storage.
     pub(crate) fn from_fixed_bindings(values: BindingValues, desc: DescRef) -> Self {
-        debug_assert!(values.iter().all(|binding| binding.import_ref.is_none()));
         debug_assert_eq!(values.len(), desc.names.len());
         Self {
             names: Names::shared(desc),
@@ -2186,12 +2373,22 @@ impl VarMap {
     /// ID, or knows the slot otherwise.
     #[inline]
     pub(crate) fn fixed_binding_at(&self, slot: usize) -> Option<BindingRef<'_>> {
-        self.values.get(slot).map(|slot| BindingRef { slot })
+        let names = &self.names;
+        self.values.get(slot).map(|value| BindingRef {
+            slot: value,
+            names,
+            index: slot,
+        })
     }
 
     #[inline]
     pub(crate) fn fixed_binding_at_mut(&mut self, slot: usize) -> Option<BindingMut<'_>> {
-        self.values.get_mut(slot).map(|slot| BindingMut { slot })
+        let names = &self.names;
+        self.values.get_mut(slot).map(|value| BindingMut {
+            slot: value,
+            names,
+            index: slot,
+        })
     }
 
     /// Only the creator of a fresh, fully instantiated fixed-key activation may
@@ -2202,21 +2399,71 @@ impl VarMap {
 
     /// Create the binding `k` as `v` describes it, or replace the binding of that name.
     pub(crate) fn insert(&mut self, k: impl crate::atom::IntoAtom, v: Binding) {
-        let v = BindingSlot::from(v);
+        let slot_value = v.slot();
         let k = k.into_atom();
         if let Some(slot) = self.names.slot_of(k) {
-            // InitializeBinding and same-name declaration replacement keep
-            // the key set and addresses. Native users read flags/values live.
+            // InitializeBinding and same-name declaration replacement keep the key set and
+            // addresses; a replacement with other attributes or an import gives the record its
+            // own names first (a descriptor never changes), and so a new layout. A lexical
+            // declaration stays one: InitializeBinding's re-insertion does not re-declare it.
             self.generation.set(self.generation.get().saturating_add(1));
-            if self.names.kind() != Names::SHARED {
+            let lexical = self.names.attrs(slot).lexical();
+            let attrs = v
+                .attrs
+                .with(BindingAttrs::LEXICAL, lexical || v.attrs.lexical());
+            let changed = self.names.set_attrs(slot, attrs, v.import);
+            if changed || self.names.kind() != Names::SHARED {
                 self.layout_id = 0;
             }
-            self.values[slot] = v;
+            self.values[slot] = slot_value;
             return;
         }
         self.bump();
-        self.names.push(k);
-        self.values.push(v);
+        self.names.push(k, v.attrs, v.import);
+        self.values.push(slot_value);
+    }
+
+    /// Give the binding `k` other attributes, as a record's replacement of it would (tests: a
+    /// cache filled before must miss). The record takes its own names; its generation moves.
+    #[cfg(test)]
+    pub(crate) fn set_attributes_for_test(
+        &mut self,
+        k: &str,
+        mutable: Option<bool>,
+        strict_immutable: Option<bool>,
+        deletable: Option<bool>,
+    ) {
+        let slot = self.names.slot_of_text(k).expect("an existing binding");
+        let mut attrs = self.names.attrs(slot);
+        if let Some(mutable) = mutable {
+            attrs = attrs.with(BindingAttrs::IMMUTABLE, !mutable);
+        }
+        if let Some(strict) = strict_immutable {
+            attrs = attrs.with(BindingAttrs::STRICT, strict);
+        }
+        if let Some(deletable) = deletable {
+            attrs = attrs.with(BindingAttrs::DELETABLE, deletable);
+        }
+        let import = self.names.import(slot);
+        self.names.set_attrs(slot, attrs, import);
+        self.bump();
+    }
+
+    /// Make the binding `k` a module import of `reference`, or an ordinary binding (tests), as
+    /// [`VarMap::set_attributes_for_test`] does.
+    #[cfg(test)]
+    pub(crate) fn set_import_for_test(
+        &mut self,
+        k: &str,
+        reference: Option<(Env, crate::atom::Atom)>,
+    ) {
+        let slot = self.names.slot_of_text(k).expect("an existing binding");
+        let attrs = self
+            .names
+            .attrs(slot)
+            .with(BindingAttrs::IMPORTED, reference.is_some());
+        self.names.set_attrs(slot, attrs, reference);
+        self.bump();
     }
 
     /// Remove the binding `k` (DeleteBinding), returning its value.
@@ -2271,7 +2518,7 @@ impl VarMap {
     /// The bindings, in slot order.
     #[cfg(test)]
     pub(crate) fn values(&self) -> impl Iterator<Item = BindingRef<'_>> + '_ {
-        self.values.iter().map(|slot| BindingRef { slot })
+        (0..self.values.len()).filter_map(|slot| self.fixed_binding_at(slot))
     }
 
     /// Byte offset of the generation counter within a `VarMap` (for the JIT's inline template).
@@ -2288,9 +2535,8 @@ impl VarMap {
     /// hit additionally requires the same nonzero ordered layout identity. Unknown compiler
     /// layouts simply retain the checked map path.
     pub(crate) fn jit_small_storage_layout() -> Option<JitBindingStorage> {
-        let storage = BindingVec::probe_jit_layout(|| {
-            BindingSlot::from(Binding::data(Value::Num(7.0), true, true))
-        })?;
+        let storage =
+            BindingVec::probe_jit_layout(|| Binding::data(Value::Num(7.0), true, true).slot())?;
         Some(JitBindingStorage {
             entries: std::mem::offset_of!(VarMap, values),
             storage,
@@ -2407,15 +2653,30 @@ mod binding_layout_tests {
             );
         }
         let slot = first.binding_slot("v23").unwrap();
-        first.insert("v23", Binding::data(Value::Num(999.), false, false));
+        first.insert("v23", Binding::data(Value::Num(998.), true, false));
         assert_eq!(
             first.layout_id(),
             layout,
-            "same names preserve the key proof"
+            "same names and attributes preserve the key proof"
         );
+        let binding = first.fixed_binding_at(slot).unwrap();
+        assert!(binding.mutable() && !binding.initialized());
+        assert!(matches!((binding.value()).view(), ValueView::Num(998.)));
+        first.insert("v23", Binding::data(Value::Num(999.), false, false));
+        assert_eq!(
+            first.layout_id(),
+            0,
+            "other attributes give the record its own names"
+        );
+        assert_eq!(first.binding_slot("v23"), Some(slot), "in place");
         let binding = first.fixed_binding_at(slot).unwrap();
         assert!(!binding.mutable() && !binding.initialized());
         assert!(matches!((binding.value()).view(), ValueView::Num(999.)));
+        assert!(
+            second.shared_desc().is_some(),
+            "the shared descriptor never changes"
+        );
+        assert!(second.get("v23").unwrap().mutable());
         first.insert("dynamic", Binding::data(Value::Num(7.), true, true));
         assert_eq!(first.layout_id(), 0);
         first.share_layout(&cached);
@@ -2618,10 +2879,6 @@ pub struct Scope {
     /// EvalDeclarationInstantiation walk skips it, so `eval("var e")` inside `catch (e) { … }` is
     /// allowed (the web-compatibility carve-out for VariableStatements in catch blocks).
     pub catch_param: bool,
-    /// Names declared *lexically* at this scope's own level (let/const/using/class). A function
-    /// body scope holds both hoisted vars and body-level lexicals; a sloppy direct eval's
-    /// var/lexical conflict check needs to tell them apart.
-    pub lexical_names: ScopeNames,
 }
 
 impl Scope {
@@ -2666,10 +2923,8 @@ impl Scope {
             under_with: _,
             var_boundary: _,
             catch_param: _,
-            lexical_names,
         } = self;
         vars.trace_storage(sink);
-        lexical_names.trace(sink);
         vars.trace_bindings(sink);
         if let Some(parent) = parent {
             sink.env(parent);
@@ -2683,69 +2938,80 @@ impl Scope {
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 96);
 
-/// Lexical-name bookkeeping is only populated by direct eval, but every call allocates a scope.
-/// Keep the common empty case to one nullable pointer and materialize the list on first use, in
-/// a storage block: the names are atoms, the list is never dropped, and the record reports its
-/// blocks ([`ScopeNames::trace`]), as it does its entries'.
-#[derive(Default)]
+/// A binding's attributes, which its record keeps with its name (a descriptor's per-name byte,
+/// the record's own list, or the spare bits of a one-name word; see [`Names`]): fixed for the
+/// binding's life unless its record replaces its names, which bumps the record's generation. So a
+/// cache whose proof is the record's names or generation has the attributes it checked when it was
+/// filled, and its hits test only the binding's TDZ state.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 #[repr(transparent)]
-pub struct ScopeNames(Option<crate::gc_storage::StorageBox<ScopeNameList>>);
+pub(crate) struct BindingAttrs(u8);
 
-type ScopeNameList = std::mem::ManuallyDrop<
-    crate::inline_vec::InlineVec<crate::atom::Atom, 1, crate::gc_storage::GcSpill>,
->;
+impl BindingAttrs {
+    /// CreateImmutableBinding: SetMutableBinding does not write it.
+    const IMMUTABLE: u8 = 1;
+    /// CreateImmutableBinding(N, true): a write throws even in sloppy code (meaningful for an
+    /// immutable binding only).
+    const STRICT: u8 = 2;
+    /// Declared lexically (let, const, class) at this level of a variable environment, where
+    /// EvalDeclarationInstantiation's check reads it (ECMA-262 spec.html:30558).
+    const LEXICAL: u8 = 4;
+    /// CreateMutableBinding(N, true), a sloppy direct eval's declaration: `delete` may remove it.
+    const DELETABLE: u8 = 8;
+    /// A module import (CreateImportBinding), whose target the record's own list keeps.
+    const IMPORTED: u8 = 16;
+    /// The attributes a one-name word keeps in its two spare alignment bits.
+    const ONE_WORD: u8 = Self::IMMUTABLE | Self::STRICT;
 
-impl ScopeNames {
-    /// Record a lexically declared name.
-    pub(crate) fn push(&mut self, name: impl crate::atom::IntoAtom) {
-        self.0
-            .get_or_insert_with(|| crate::gc_storage::StorageBox::new(ScopeNameList::default()))
-            .push(name.into_atom());
+    #[inline]
+    pub(crate) fn mutable(self) -> bool {
+        self.0 & Self::IMMUTABLE == 0
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = crate::atom::Atom> + '_ {
-        self.0
-            .as_deref()
-            .map_or(&[][..], |names| &names[..])
-            .iter()
-            .copied()
+    #[inline]
+    pub(crate) fn strict_immutable(self) -> bool {
+        self.0 & Self::STRICT != 0
     }
 
-    /// Report the list's blocks.
-    pub(crate) fn trace<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        if let Some(names) = &self.0 {
-            crate::gc_storage::StorageBox::trace(names, sink);
-            if let Some(block) = names.spill_ptr() {
-                crate::gc_storage::trace_block(block, sink);
-            }
-        }
+    #[inline]
+    pub(crate) fn lexical(self) -> bool {
+        self.0 & Self::LEXICAL != 0
     }
 
-    pub(crate) fn retained_requested_storage_bytes(&self) -> usize {
-        let Some(names) = self.0.as_deref() else {
-            return 0;
-        };
-        // The names are atoms, which their heap's table accounts.
-        std::mem::size_of::<ScopeNameList>().saturating_add(
-            names
-                .heap_capacity()
-                .saturating_mul(std::mem::size_of::<crate::atom::Atom>()),
-        )
+    #[inline]
+    pub(crate) fn deletable(self) -> bool {
+        self.0 & Self::DELETABLE != 0
+    }
+
+    #[inline]
+    pub(crate) fn imported(self) -> bool {
+        self.0 & Self::IMPORTED != 0
+    }
+
+    /// Neither immutable nor an import: SetMutableBinding writes it in place. Caches and
+    /// References keep the address of such a binding only, so their hits test nothing else.
+    #[inline]
+    pub(crate) fn plain(self) -> bool {
+        self.0 & (Self::IMMUTABLE | Self::IMPORTED) == 0
+    }
+
+    #[inline]
+    fn with(self, bit: u8, on: bool) -> Self {
+        Self(if on { self.0 | bit } else { self.0 & !bit })
     }
 }
 
 /// A binding as a record creates it: CreateMutableBinding (deletable for a sloppy eval's
 /// declarations), CreateImmutableBinding with its strictness, or a module's CreateImportBinding,
 /// and its value, which InitializeBinding gave it when it is initialized. [`VarMap::insert`]
-/// keeps it in the record's own representation; readers take a [`BindingRef`] and writers a
-/// [`BindingMut`], so that only `VarMap` knows how a binding is stored.
+/// keeps the value in a [`BindingSlot`] and the attributes with the record's names; readers
+/// take a [`BindingRef`] and writers a [`BindingMut`], so that only `VarMap` knows how a binding
+/// is stored.
 #[derive(Clone)]
 pub struct Binding {
     value: Value,
-    mutable: bool,
     initialized: bool,
-    deletable: bool,
-    strict_immutable: bool,
+    attrs: BindingAttrs,
     import: Option<(Env, crate::atom::Atom)>,
 }
 
@@ -2753,81 +3019,68 @@ impl Binding {
     pub(crate) fn data(value: Value, mutable: bool, initialized: bool) -> Binding {
         Binding {
             value,
-            mutable,
             initialized,
-            deletable: false,
             // An immutable binding created through this helper (const/TDZ) is strict by default.
-            strict_immutable: !mutable,
+            attrs: if mutable {
+                BindingAttrs::default()
+            } else {
+                BindingAttrs(BindingAttrs::IMMUTABLE | BindingAttrs::STRICT)
+            },
             import: None,
         }
     }
 
     pub(crate) fn with_strict_immutable(mut self, strict: bool) -> Self {
-        self.strict_immutable = strict;
+        self.attrs = self.attrs.with(BindingAttrs::STRICT, strict);
         self
     }
 
     /// The binding a sloppy direct eval's `var` or function declaration creates
     /// (CreateMutableBinding(N, true)): `delete` may remove it.
     pub(crate) fn deletable(mut self) -> Self {
-        self.deletable = true;
+        self.attrs = self.attrs.with(BindingAttrs::DELETABLE, true);
+        self
+    }
+
+    /// A lexical declaration's binding at the level of a variable environment, which a sloppy
+    /// direct eval's `var` may not hoist over (EvalDeclarationInstantiation).
+    pub(crate) fn lexical(mut self, lexical: bool) -> Self {
+        self.attrs = self.attrs.with(BindingAttrs::LEXICAL, lexical);
         self
     }
 
     pub(crate) fn live_import(environment: Env, name: crate::atom::Atom) -> Self {
         let mut binding = Self::data(Value::Undefined, false, true);
+        binding.attrs = binding.attrs.with(BindingAttrs::IMPORTED, true);
         binding.import = Some((environment, name));
         binding
     }
+
+    /// The binding's attributes, as its record keeps them.
+    #[inline]
+    pub(crate) fn attrs(&self) -> BindingAttrs {
+        self.attrs
+    }
+
+    /// The binding's storage in its record's slot.
+    #[inline]
+    pub(crate) fn slot(&self) -> BindingSlot {
+        BindingSlot {
+            value: self.value,
+            initialized: self.initialized,
+        }
+    }
 }
 
-/// How a [`VarMap`] stores a binding, slot for slot: its value, whether it is initialized (TDZ)
-/// and its attributes. Only `VarMap` and its views read the fields; generated code reads them at
-/// the offsets `value::jit_layout` measures.
-#[derive(Clone)]
+/// How a [`VarMap`] stores a binding, slot for slot: its value and whether it is initialized
+/// (TDZ). Its attributes live with the record's names. Generated code reads the fields at the
+/// offsets `value::jit_layout` measures.
+#[derive(Clone, Copy)]
 pub(crate) struct BindingSlot {
     /// Execution word only; initialization remains an independent flag.
     value: Value,
-    mutable: bool,
     /// `false` while a `let`/`const` is in its temporal dead zone.
     initialized: bool,
-    /// A live module import: reads redirect to `(exporter scope, local name)`, kept in a
-    /// storage block of its own, which the binding's record reports: ordinary bindings need
-    /// only a nullable pointer, and the record nothing to drop.
-    import_ref: Option<crate::gc_storage::StorageBox<(Env, crate::atom::Atom)>>,
-    /// Native-visible kind bit, occupying existing flag padding: `import_ref.is_some()`.
-    imported: bool,
-    /// `true` for a `var`/function binding created by a sloppy `eval` (CreateMutableBinding with
-    /// `deletable` set): `delete <name>` may remove it, unlike ordinary declarations.
-    deletable: bool,
-    /// For an *immutable* binding (`mutable == false`): whether it was created strict. A `const`
-    /// (CreateImmutableBinding(_, true)) always throws on reassignment; a named function
-    /// expression's own name (CreateImmutableBinding(_, false)) is a silent no-op in sloppy code
-    /// and throws only under strict mode. Irrelevant when `mutable` is true.
-    strict_immutable: bool,
-}
-
-impl From<Binding> for BindingSlot {
-    #[inline]
-    fn from(binding: Binding) -> Self {
-        let Binding {
-            value,
-            mutable,
-            initialized,
-            deletable,
-            strict_immutable,
-            import,
-        } = binding;
-        BindingSlot {
-            value,
-            mutable,
-            initialized,
-            imported: import.is_some(),
-            import_ref: import.map(crate::gc_storage::StorageBox::new),
-            deletable,
-            strict_immutable,
-        }
-    }
 }
 
 impl BindingSlot {
@@ -2841,18 +3094,6 @@ impl BindingSlot {
     #[inline]
     pub(crate) fn initialized(&self) -> bool {
         self.initialized
-    }
-
-    /// Whether the binding is a module import, whose reads take the import's path.
-    #[inline]
-    pub(crate) fn is_import(&self) -> bool {
-        self.imported || self.import_ref.is_some()
-    }
-
-    /// Whether the binding is mutable (SetMutableBinding may write it).
-    #[inline]
-    pub(crate) fn mutable(&self) -> bool {
-        self.mutable
     }
 
     /// Write the value of an initialized binding in place (SetMutableBinding's write).
@@ -2872,13 +3113,9 @@ impl BindingSlot {
         std::mem::offset_of!(Self, value)
     }
 
-    /// Generated code's offsets of the fields it tests: `mutable`, `initialized`, `imported`.
-    pub(crate) const fn flag_offsets() -> (usize, usize, usize) {
-        (
-            std::mem::offset_of!(Self, mutable),
-            std::mem::offset_of!(Self, initialized),
-            std::mem::offset_of!(Self, imported),
-        )
+    /// Generated code's offset of the TDZ flag.
+    pub(crate) const fn initialized_offset() -> usize {
+        std::mem::offset_of!(Self, initialized)
     }
 
     /// [`GcTrace`](crate::gc_trace::GcTrace)'s edges, for any sink.
@@ -2886,18 +3123,9 @@ impl BindingSlot {
     fn trace_edges<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         let Self {
             value,
-            mutable: _,
             initialized: _,
-            import_ref,
-            imported: _,
-            deletable: _,
-            strict_immutable: _,
         } = self;
         sink.value(value);
-        if let Some(import) = import_ref {
-            crate::gc_storage::StorageBox::trace(import, sink);
-            sink.env(&import.0);
-        }
     }
 }
 
@@ -2905,22 +3133,11 @@ impl BindingSlot {
 #[derive(Clone, Copy)]
 pub(crate) struct BindingRef<'a> {
     slot: &'a BindingSlot,
+    names: &'a Names,
+    index: usize,
 }
 
 impl<'a> BindingRef<'a> {
-    /// The view of the binding a cache's pointer names.
-    ///
-    /// # Safety
-    /// `slot` came from [`BindingRef::as_ptr`] or [`BindingMut::as_mut_ptr`] of a record that is
-    /// alive and whose generation has not changed since, and no mutable view of it is live.
-    #[inline]
-    pub(crate) unsafe fn from_ptr(slot: *const BindingSlot) -> Self {
-        // SAFETY: the caller's contract.
-        Self {
-            slot: unsafe { &*slot },
-        }
-    }
-
     /// The binding's value: meaningful only while it is initialized.
     #[inline]
     pub(crate) fn value(&self) -> Value {
@@ -2933,44 +3150,54 @@ impl<'a> BindingRef<'a> {
         self.slot.initialized
     }
 
+    /// The binding's attributes.
+    #[inline]
+    pub(crate) fn attrs(&self) -> BindingAttrs {
+        self.names.attrs(self.index)
+    }
+
     #[inline]
     pub(crate) fn mutable(&self) -> bool {
-        self.slot.mutable
+        self.attrs().mutable()
     }
 
     /// For an immutable binding, whether it was created strict (see [`Binding`]).
     #[cfg(test)]
     #[inline]
     pub(crate) fn strict_immutable(&self) -> bool {
-        self.slot.strict_immutable
+        self.attrs().strict_immutable()
     }
 
     /// Whether `delete` may remove the binding (a sloppy direct eval's declaration).
     #[inline]
     pub(crate) fn deletable(&self) -> bool {
-        self.slot.deletable
+        self.attrs().deletable()
+    }
+
+    /// Whether the binding is lexically declared at this level of a variable environment.
+    #[inline]
+    pub(crate) fn lexical(&self) -> bool {
+        self.attrs().lexical()
     }
 
     /// Whether the binding is a module import, whose reads take the import's path.
     #[inline]
     pub(crate) fn is_import(&self) -> bool {
-        self.slot.is_import()
+        self.attrs().imported()
     }
 
     /// A module import's target: the exporting module's environment and its local name.
     #[inline]
     pub(crate) fn import(&self) -> Option<(Env, crate::atom::Atom)> {
-        self.slot.import_ref.as_deref().copied()
+        self.names.import(self.index)
     }
 
     /// The binding as a record would create it again (for copying it into another record).
     pub(crate) fn to_binding(&self) -> Binding {
         Binding {
             value: self.slot.value,
-            mutable: self.slot.mutable,
             initialized: self.slot.initialized,
-            deletable: self.slot.deletable,
-            strict_immutable: self.slot.strict_immutable,
+            attrs: self.attrs(),
             import: self.import(),
         }
     }
@@ -2989,24 +3216,15 @@ impl<'a> BindingRef<'a> {
 }
 
 /// A binding of a [`VarMap`], to write in place: [`VarMap::get_mut`] and the other lookups
-/// return it. In-place writes keep the record's generation (see [`VarMap`]).
+/// return it. In-place writes keep the record's generation (see [`VarMap`]); the attributes
+/// change only through the record.
 pub(crate) struct BindingMut<'a> {
     slot: &'a mut BindingSlot,
+    names: &'a Names,
+    index: usize,
 }
 
 impl BindingMut<'_> {
-    /// The view of the binding a cache's pointer names, to write.
-    ///
-    /// # Safety
-    /// As [`BindingRef::from_ptr`], and no other view of the binding is live.
-    #[inline]
-    pub(crate) unsafe fn from_ptr(slot: *mut BindingSlot) -> Self {
-        // SAFETY: the caller's contract.
-        Self {
-            slot: unsafe { &mut *slot },
-        }
-    }
-
     /// The binding's value: meaningful only while it is initialized.
     #[inline]
     pub(crate) fn value(&self) -> Value {
@@ -3019,21 +3237,27 @@ impl BindingMut<'_> {
         self.slot.initialized
     }
 
+    /// The binding's attributes.
+    #[inline]
+    pub(crate) fn attrs(&self) -> BindingAttrs {
+        self.names.attrs(self.index)
+    }
+
     #[inline]
     pub(crate) fn mutable(&self) -> bool {
-        self.slot.mutable
+        self.attrs().mutable()
     }
 
     /// For an immutable binding, whether it was created strict (see [`Binding`]).
     #[inline]
     pub(crate) fn strict_immutable(&self) -> bool {
-        self.slot.strict_immutable
+        self.attrs().strict_immutable()
     }
 
     /// Whether the binding is a module import, whose reads take the import's path.
     #[inline]
     pub(crate) fn is_import(&self) -> bool {
-        self.slot.is_import()
+        self.attrs().imported()
     }
 
     /// Write the value in place (SetMutableBinding's write), leaving the TDZ state as it is.
@@ -3065,45 +3289,6 @@ impl BindingMut<'_> {
     #[inline]
     pub(crate) fn as_mut_ptr(&mut self) -> *mut BindingSlot {
         self.slot
-    }
-
-    /// Change the binding's attributes in place (tests: a cache must see them live).
-    #[cfg(test)]
-    pub(crate) fn set_attributes_for_test(
-        &mut self,
-        mutable: Option<bool>,
-        strict_immutable: Option<bool>,
-        deletable: Option<bool>,
-    ) {
-        if let Some(mutable) = mutable {
-            self.slot.mutable = mutable;
-        }
-        if let Some(strict) = strict_immutable {
-            self.slot.strict_immutable = strict;
-        }
-        if let Some(deletable) = deletable {
-            self.slot.deletable = deletable;
-        }
-    }
-
-    /// Set the native import kind bit alone, without a target (tests).
-    #[cfg(test)]
-    pub(crate) fn set_imported_flag_for_test(&mut self, imported: bool) {
-        self.slot.imported = imported;
-    }
-
-    /// Replace the binding in place, keeping the record's generation (tests: a cache must see
-    /// the change live).
-    #[cfg(test)]
-    pub(crate) fn replace_for_test(&mut self, binding: Binding) {
-        *self.slot = BindingSlot::from(binding);
-    }
-
-    /// Make the binding a module import of `reference`, or an ordinary binding (tests).
-    #[cfg(test)]
-    pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, crate::atom::Atom)>) {
-        self.slot.imported = reference.is_some();
-        self.slot.import_ref = reference.map(crate::gc_storage::StorageBox::new);
     }
 }
 
@@ -3155,7 +3340,6 @@ fn new_env(
         under_with,
         var_boundary,
         catch_param,
-        lexical_names: ScopeNames::default(),
     })
 }
 

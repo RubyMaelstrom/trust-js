@@ -750,9 +750,13 @@ impl Interp {
                         crate::interpreter::pattern_ident_strs(pat, &mut names);
                         for name in names {
                             let mut b = scope.borrow_mut();
-                            b.lexical_names.push(name);
-                            b.vars
-                                .insert(name, Binding::data(Value::Undefined, !immutable, false));
+                            // Only a variable environment's lexical attributes are read (by
+                            // EvalDeclarationInstantiation's var/lexical check).
+                            let lexical = b.var_boundary;
+                            b.vars.insert(
+                                name,
+                                Binding::data(Value::Undefined, !immutable, false).lexical(lexical),
+                            );
                         }
                     }
                 }
@@ -768,11 +772,12 @@ impl Interp {
                 Stmt::ClassDecl(class) => {
                     if let Some(name) = &class.name {
                         // Classes are lexically scoped with a TDZ until the declaration executes.
-                        scope.borrow_mut().lexical_names.push(name.clone());
-                        scope
-                            .borrow_mut()
-                            .vars
-                            .insert(name.clone(), Binding::data(Value::Undefined, true, false));
+                        let mut b = scope.borrow_mut();
+                        let lexical = b.var_boundary;
+                        b.vars.insert(
+                            name.clone(),
+                            Binding::data(Value::Undefined, true, false).lexical(lexical),
+                        );
                     }
                 }
                 _ => {}
@@ -5781,7 +5786,12 @@ impl Interp {
             // The variable environment itself may hold body-level lexicals (our function body
             // scope carries both); a var may not hoist over one of those either.
             for &(name, _) in &var_bindings {
-                if var_env.borrow().lexical_names.iter().any(|n| n.is(name)) {
+                if var_env
+                    .borrow()
+                    .vars
+                    .get(name)
+                    .is_some_and(|binding| binding.lexical())
+                {
                     return Err(self.throw(
                         "SyntaxError",
                         format!("Identifier '{name}' has already been declared"),
