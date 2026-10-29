@@ -1764,6 +1764,35 @@ x86-64's gains are about half of AArch64's on Octane. 3b looks nearly free: case
 programs already compare without folding, and outside Unicode mode `\b` is unaffected by `i`; most
 of Octane's remaining matcher work is `i` patterns.
 
+Then 3b, the case-closed `i` programs (dfe1c591, 2026-10-29, an agent's): once item 2 has closed
+characters and classes over case, the tier takes an `i` program like any other; outside Unicode
+mode `\b` is unchanged by `i`, and backreferences still decline (3c). A class of at most two
+elements in the subject's width is tested by element, as V8's EmitAtomLetter does: one element is
+one compare, two that differ in one bit are one masked compare (ShortCutEmitCharacterPair,
+regexp-compiler.cc:1077-1103), and two others on two-byte subjects are two compares. One-byte
+code keeps the table for other pairs and inside loops that hold it, where it takes fewer
+instructions, and three- and four-member case groups (ǅ, Σ, ι) use the table, since their compare
+chains cost more than it on misses.
+
+Against main 5be309e1's code (fat LTO, pinned): Octane RegExp -0.14%, coffeescript -0.10%,
+source-map -0.27% (within its run spread), Djot's 40 passes and strings.js flat; the fixtures
+within 0.03%. Coverage of W5a's matcher work: Octane 91.5% to 100%, coffeescript 76.4% to 78.6%
+(3c's lookaheads and backreferences remain), source-map and Djot 100%, strings.js 0% (3d). The
+exit's measure: Octane 15.3% (3a 16.5%), source-map 10.5% (9.8%, sampling noise), coffeescript
+17.9% (19.8%), strings.js 75.3% (86.3%; 3d's). Per call against Sparkplug-only Node, the `i`
+cases: Octane's cookie reader 3.84x to 2.90x, its sniffer 6.08x to 3.92x, CoffeeScript's number
+pattern 4.18x to 2.60x; the other cases unchanged.
+
+Validation: the ARM64 gate on b14d6e96, whose code equals dfe1c591's (the lib suite, pacing with
+its known failure only; the downstream crates; GC stress on the regex and replace/split tests;
+the fixtures, difftest and dumps as the base's; Test262 53,575 of 53,575, identical; rustdoc's 13
+errors, links to private items and bare URLs, are main's, as in earlier gates). The differential
+gate: Test262's RegExp suites forced on with verify and off, identical to each other and to 3a's;
+six fuzz streams of at least 1M cases on each architecture, about 19K native programs a stream,
+without a difference; the census workloads' outputs identical off, at the default and forced on
+under verify; interruption and limits on both backends. Zombie's lib suite (its known failure)
+and clippy.
+
 ### W3: calls (census and design, 2026-10-27; exit agreed, Decision 10)
 
 Census: the W2a tip (a1535a6f, branch p2-w2a; since then main's code, c4d68127 adding only W2a's
