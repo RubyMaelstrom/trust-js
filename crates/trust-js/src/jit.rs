@@ -2144,7 +2144,8 @@ pub const H_ITERATION: usize = 9;
 /// Dedicated `Op::MakeObject` entry: template clone + stack-direct value writes, no op decode.
 pub const H_MAKE_OBJECT: usize = 10;
 /// Dedicated property-store entry (`SetProp`/`SetPropDrop`/`SetPropThisDrop`/`SetPropLocalDrop`
-/// misses): straight into `set_prop_ic`, no generic op decode.
+/// misses, and the store of a numeric `AppendProp`): straight into `set_prop_ic`, no generic op
+/// decode.
 pub const H_SET_PROP: usize = 11;
 /// Dedicated property-read entry (`GetProp`/`GetPropThis`/`GetPropLocal`/`GetMethod` misses):
 /// straight into `get_prop_ic`.

@@ -272,6 +272,42 @@ function stacks() {
   return /badSetter/.test(lines[1]) + ':' + /storeBad/.test(lines[2]) + ':' + (storer[1] - setter[1]) + ':' + storer[2];
 }
 log(stacks());
+
+// 15. `o.k += v` statements: numbers add in line and store through the template (data and
+// setters); strings, BigInts and everything else keep the generic operation.
+function appends() {
+  var r = [];
+  function strictAdd(x, v) { 'use strict'; x.n += v; }
+  function sloppyAdd(x, v) { x.n += v; }
+  var o = { n: 0 };
+  for (var k = 0; k < N; k++) strictAdd(o, 0.5);
+  r.push(o.n);
+  var f = Object.freeze({ n: 1 });
+  try { strictAdd(f, 1); r.push('no'); } catch (e) { r.push(e.constructor.name); }
+  sloppyAdd(f, 1); r.push(f.n);
+  var p = Object.create({ n: 10 }); strictAdd(p, 1); r.push(p.n, Object.keys(p).join());
+  var z = { n: -0 }; strictAdd(z, -0); r.push(Object.is(z.n, -0));
+  var nan = { n: NaN }; strictAdd(nan, 1); r.push(nan.n);
+  var s = { n: 'a' }; for (var k = 0; k < 5; k++) strictAdd(s, k); r.push(s.n);
+  var ro = {}; Object.defineProperty(ro, 'n', { value: 1, writable: false });
+  try { strictAdd(ro, 1); r.push('no'); } catch (e) { r.push(e.constructor.name); }
+  sloppyAdd(ro, 1); r.push(ro.n);
+  try { strictAdd('abc', 1); r.push('no'); } catch (e) { r.push(e.constructor.name); }
+  sloppyAdd('abc', 1);
+  var big = { n: 1n }; strictAdd(big, 2n); r.push(String(big.n));
+  try { strictAdd(big, 1); } catch (e) { r.push(e.constructor.name); }
+  var obj = { n: { valueOf() { r.push('valueOf'); return 5; } } }; strictAdd(obj, 1); r.push(obj.n);
+  var acc = { _n: 1, get n() { r.push('get'); return this._n; }, set n(v) { r.push('set' + v); this._n = v; } };
+  for (var k = 0; k < 3; k++) strictAdd(acc, 1);
+  var getOnly = { get n() { return 1; } };
+  try { strictAdd(getOnly, 1); r.push('no'); } catch (e) { r.push(e.constructor.name); }
+  sloppyAdd(getOnly, 1); r.push(getOnly.n);
+  var t = 0, cnt = { n: 0 }; for (var k = 0; k < 10000; k++) { cnt.n += 1; t += cnt.n; } r.push(t);
+  class Counter { constructor() { this.c = 0; } bump() { this.c += 2; return this.c; } }
+  var cc = new Counter(), u = 0; for (var k = 0; k < N; k++) u += cc.bump(); r.push(u);
+  return r.join();
+}
+log(appends());
 out.join('\n')
 "#;
 
@@ -288,7 +324,8 @@ get,set:2,get,set:1,get,set:3,get,set:4,get,set:5,get,set:4,get,set:3,get,set:9,
 string299/object299/TypeError\n\
 3600\n\
 30:RangeError\n\
-true:true:2:11";
+true:true:2:11\n\
+150,TypeError,1,11,n,true,NaN,a01234,TypeError,1,TypeError,3,TypeError,valueOf,6,get,set2,get,set3,get,set4,TypeError,1,50005000,90300";
 
 #[test]
 fn setter_stores_agree_across_tiers() {

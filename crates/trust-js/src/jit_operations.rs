@@ -535,6 +535,39 @@ pub(super) fn emit(
                 false,
             );
         }
+        // `o.k += v` as a statement (ECMA-262 AssignmentExpression evaluation step 2: GetValue,
+        // ApplyStringOrNumericBinaryOperator, PutValue), its read made by the GetProp before:
+        // two Numbers add in line, which runs no author code, and the sum is stored through the
+        // store template under the operation's own store cache, whose helper (and its setter
+        // call) takes the operation as a `SetPropDrop` of [receiver, sum]. Strings, which append
+        // in place, and every other pair keep the generic operation, with nothing changed.
+        Op::AppendProp(n, cache)
+            if fast & 1 != 0 && fast & 65536 != 0 && layout.valid && set_prop_inlinable(layout) =>
+        {
+            let generic = a.new_label();
+            let done = a.new_label();
+            emit_exec_word_load(a, 9, 20, -16);
+            emit_exec_word_load(a, 10, 20, -8);
+            emit_exec_number_guard(a, 9, 0, 11, generic);
+            emit_exec_number_guard(a, 10, 1, 11, generic);
+            a.f_arith(0, 0, 0, 1);
+            emit_exec_number_store(a, 0, 20, -16, 11);
+            a.sub_imm(20, 20, 8);
+            emit_set_prop_inline(
+                a,
+                layout,
+                chunk.jit_cache_ptr(*cache),
+                chunk.jit_name(*n),
+                pc as u32,
+                unwind,
+                PropRecv::Stack,
+                false,
+            );
+            a.b(done);
+            a.bind(generic);
+            emit_exec(a, pc as u32, unwind);
+            a.bind(done);
+        }
         Op::UpdateProp(_, cache, kind)
             if fast & 65536 != 0 && layout.valid && set_prop_inlinable(layout) =>
         {

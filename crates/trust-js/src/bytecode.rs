@@ -24563,7 +24563,9 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
             sp = sp.add(1);
             Ok(())
         }
-        Op::SetPropDrop(n, c) => {
+        // The ARM64 `AppendProp` template adds two Numbers in line and stores the sum as a
+        // `SetPropDrop` of [receiver, sum] (see `jit::operations`).
+        Op::SetPropDrop(n, c) | Op::AppendProp(n, c) => {
             sp = sp.sub(1);
             let v = sp.read();
             sp = sp.sub(1);
