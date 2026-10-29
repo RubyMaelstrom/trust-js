@@ -2715,6 +2715,9 @@ mod asm {
         /// allocating helper ends in the explicit poll (see `super::emit_helper_end_poll`).
         /// Clear in region code, shared stubs and loose test assemblies.
         end_polls: bool,
+        /// The first operand no instruction sequence can encode (see `fail`), with the buffer
+        /// length where it was met: the code must not run, and the compile is refused.
+        failed: Option<(usize, &'static str)>,
     }
 
     #[derive(Clone, Copy)]
@@ -2739,7 +2742,13 @@ mod asm {
                 string_accumulations: Vec::new(),
                 end_polls: false,
                 fp_callee_saved: false,
+                failed: None,
             }
+        }
+        /// The operand that failed this assembly, if one did: an operand no instruction
+        /// sequence encodes (see `fail`). The compiler then refuses the code.
+        pub fn failed(&self) -> Option<&'static str> {
+            self.failed.map(|(_, what)| what)
         }
         /// Set whether helper calls emitted from here on end in the explicit poll (see
         /// the `end_polls` field); returns the previous setting.
@@ -2835,6 +2844,11 @@ mod asm {
             self.buf.truncate(checkpoint.0);
             self.patches.truncate(checkpoint.1);
             self.labels.truncate(checkpoint.2);
+            // A failure met by the discarded emission goes with it (`fail` emits a word, so an
+            // earlier failure lies before the checkpoint's length).
+            if self.failed.is_some_and(|(at, _)| at >= checkpoint.0) {
+                self.failed = None;
+            }
             // A stub first requested by the discarded emission loses its label with it.
             self.stubs.retain(|&(_, label)| label < checkpoint.2);
             self.marks.retain(|&(label, _)| label < checkpoint.2);
@@ -2888,11 +2902,10 @@ mod asm {
             }
         }
 
-        /// movz xd, #imm16, lsl #(shift*16)
-        /// str wt, [xn, #imm] (scaled, imm/4)
+        /// str wt, [xn, #imm] (scaled, imm/4; any offset, see `mem`)
+        #[inline]
         pub fn str_w_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
-            debug_assert!(imm_bytes.is_multiple_of(4) && imm_bytes / 4 < 4096);
-            self.emit(0xB900_0000 | ((imm_bytes / 4) << 10) | (rn << 5) | rt);
+            self.mem(STR_W, rt, rn, imm_bytes);
         }
         /// ldr xt, [xn, xm, lsl #3] (register-offset, scaled)
         pub fn ldr_x_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
@@ -2902,17 +2915,26 @@ mod asm {
         pub fn ldrb_reg(&mut self, rt: u32, rn: u32, rm: u32) {
             self.emit(0x3860_6800 | (rm << 16) | (rn << 5) | rt);
         }
-        /// ldrh wt, [xn, #imm] (scaled, imm/2)
+        /// ldrh wt, [xn, #imm] (scaled, imm/2; any offset, see `mem`)
+        #[inline]
         pub fn ldrh_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
-            debug_assert!(imm_bytes.is_multiple_of(2) && imm_bytes / 2 < 4096);
-            self.emit(0x7940_0000 | ((imm_bytes / 2) << 10) | (rn << 5) | rt);
+            self.mem(LDRH, rt, rn, imm_bytes);
         }
+        /// movz xd, #imm16, lsl #(shift*16)
+        #[inline]
         pub fn movz(&mut self, rd: u32, imm16: u32, shift: u32) {
+            if imm16 > 0xFFFF || shift > 3 {
+                return self.bad("a MOVZ lane past 16 bits or its shift past 48");
+            }
             self.emit(0xD280_0000 | (shift << 21) | (imm16 << 5) | rd);
         }
         /// movk xd, #imm16, lsl #(shift*16)
         #[allow(dead_code)] // the inline fast-path pass uses these
+        #[inline]
         pub fn movk(&mut self, rd: u32, imm16: u32, shift: u32) {
+            if imm16 > 0xFFFF || shift > 3 {
+                return self.bad("a MOVK lane past 16 bits or its shift past 48");
+            }
             self.emit(0xF280_0000 | (shift << 21) | (imm16 << 5) | rd);
         }
         /// mov xd, xn (ORR xd, xzr, xn)
@@ -2938,81 +2960,60 @@ mod asm {
                     0x9280_0000 | ((first as u32) << 21) | ((!lanes[first] & 0xffff) << 5) | rd,
                 );
             } else {
-                self.movz(rd, lanes[first], first as u32);
+                self.emit(0xD280_0000 | ((first as u32) << 21) | (lanes[first] << 5) | rd);
             }
             for (lane, &bits) in lanes.iter().enumerate() {
                 if lane != first && bits != fill {
-                    self.movk(rd, bits, lane as u32);
+                    // MOVK; a lane is 16 bits and its shift below 4 by construction.
+                    self.emit(0xF280_0000 | ((lane as u32) << 21) | (bits << 5) | rd);
                 }
             }
         }
-        /// ldr xd, [xn, #imm] (imm = byte offset, multiple of 8, unsigned)
+        /// ldr xt, [xn, #imm] (imm = byte offset, unsigned; any offset, see `mem`)
+        #[inline]
         pub fn ldr_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
-            debug_assert!(imm_bytes.is_multiple_of(8) && imm_bytes / 8 < 4096);
-            self.emit(0xF940_0000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt);
+            self.mem(LDR_X, rt, rn, imm_bytes);
         }
-        /// str xt, [xn, #imm]
+        /// str xt, [xn, #imm] (any offset, see `mem`)
+        #[inline]
         pub fn str_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
-            debug_assert!(imm_bytes.is_multiple_of(8) && imm_bytes / 8 < 4096);
-            self.emit(0xF900_0000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt);
+            self.mem(STR_X, rt, rn, imm_bytes);
         }
-        /// stp xt1, xt2, [sp, #-imm]! (pre-index, imm = positive byte count, multiple of 8)
+        /// stp xt1, xt2, [sp, #imm]! (pre-index; imm is the negative frame size; any size, see
+        /// `pair`)
+        #[inline]
         pub fn stp_pre(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
-            debug_assert!(
-                imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
-                "AArch64 STP pre-index offset out of signed imm7 range: {imm_bytes}"
-            );
-            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit(0xA980_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
+            self.pair(STP_X, Index::Pre, rt1, rt2, 31, imm_bytes);
         }
-        /// ldp xt1, xt2, [sp], #imm (post-index)
+        /// ldp xt1, xt2, [sp], #imm (post-index; any size, see `pair`)
+        #[inline]
         pub fn ldp_post(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
-            debug_assert!(
-                imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
-                "AArch64 LDP post-index offset out of signed imm7 range: {imm_bytes}"
-            );
-            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit(0xA8C0_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
+            self.pair(LDP_X, Index::Post, rt1, rt2, 31, imm_bytes);
         }
-        /// stp xt1, xt2, [sp, #imm] (signed offset form)
+        /// stp xt1, xt2, [sp, #imm] (signed offset form; any offset, see `pair`)
+        #[inline]
         pub fn stp_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
-            debug_assert!(
-                imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
-                "AArch64 STP signed offset out of imm7 range: {imm_bytes}"
-            );
-            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit(0xA900_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
+            self.pair(STP_X, Index::Offset, rt1, rt2, 31, imm_bytes);
         }
-        /// ldp xt1, xt2, [sp, #imm]
+        /// ldp xt1, xt2, [sp, #imm] (any offset, see `pair`)
+        #[inline]
         pub fn ldp_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
-            debug_assert!(
-                imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
-                "AArch64 LDP signed offset out of imm7 range: {imm_bytes}"
-            );
-            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit(0xA940_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
+            self.pair(LDP_X, Index::Offset, rt1, rt2, 31, imm_bytes);
         }
-        /// stp xt1, xt2, [xn, #imm] (signed offset, any base register)
+        /// stp xt1, xt2, [xn, #imm] (signed offset, any base register; any offset, see `pair`)
+        #[inline]
         pub fn stp_base(&mut self, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
-            debug_assert!(
-                imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
-                "AArch64 STP signed offset out of imm7 range: {imm_bytes}"
-            );
-            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit(0xA900_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1);
+            self.pair(STP_X, Index::Offset, rt1, rt2, rn, imm_bytes);
         }
-        /// ldp xt1, xt2, [xn, #imm] (signed offset, any base register; xn may be xt1 or xt2)
+        /// ldp xt1, xt2, [xn, #imm] (signed offset, any base register; xn may be xt1 or xt2;
+        /// any offset, see `pair`)
+        #[inline]
         pub fn ldp_base(&mut self, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
-            debug_assert!(
-                imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
-                "AArch64 LDP signed offset out of imm7 range: {imm_bytes}"
-            );
             debug_assert_ne!(
                 rt1, rt2,
                 "an LDP loading one register twice is unpredictable"
             );
-            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit(0xA940_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1);
+            self.pair(LDP_X, Index::Offset, rt1, rt2, rn, imm_bytes);
         }
         pub fn blr(&mut self, rn: u32) {
             self.emit(0xD63F_0000 | (rn << 5));
@@ -3045,38 +3046,41 @@ mod asm {
             self.emit(if is64 { 0xB500_0000 } else { 0x3500_0000 } | rt);
         }
 
-        /// ldrb wt, [xn, #imm] (unsigned byte offset)
+        /// ldrb wt, [xn, #imm] (unsigned byte offset; any offset, see `mem`)
+        #[inline]
         pub fn ldrb_imm(&mut self, rt: u32, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0x3940_0000 | (imm << 10) | (rn << 5) | rt);
+            self.mem(LDRB, rt, rn, imm);
         }
-        /// strb wt, [xn, #imm]
+        /// strb wt, [xn, #imm] (any offset, see `mem`)
         #[allow(dead_code)]
+        #[inline]
         pub fn strb_imm(&mut self, rt: u32, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0x3900_0000 | (imm << 10) | (rn << 5) | rt);
+            self.mem(STRB, rt, rn, imm);
         }
-        /// sturh wt, [xn, #simm9] (unscaled)
+        /// sturh wt, [xn, #simm9] (unscaled; any offset, see `mem`)
+        #[inline]
         pub fn sturh(&mut self, rt: u32, rn: u32, simm9: i32) {
-            debug_assert!((-256..256).contains(&simm9));
-            self.emit(0x7800_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
+            self.mem_unscaled(STRH, rt, rn, simm9);
         }
-        /// ldurb wt, [xn, #simm9]
+        /// ldurb wt, [xn, #simm9] (any offset, see `mem`)
+        #[inline]
         pub fn ldurb(&mut self, rt: u32, rn: u32, simm9: i32) {
-            self.emit(0x3840_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
+            self.mem_unscaled(LDRB, rt, rn, simm9);
         }
-        /// ldur xt, [xn, #simm9]
+        /// ldur xt, [xn, #simm9] (any offset, see `mem`)
+        #[inline]
         pub fn ldur(&mut self, rt: u32, rn: u32, simm9: i32) {
-            self.emit(0xF840_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
+            self.mem_unscaled(LDR_X, rt, rn, simm9);
         }
-        /// stur xt, [xn, #simm9]
+        /// stur xt, [xn, #simm9] (any offset, see `mem`)
+        #[inline]
         pub fn stur(&mut self, rt: u32, rn: u32, simm9: i32) {
-            self.emit(0xF800_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
+            self.mem_unscaled(STR_X, rt, rn, simm9);
         }
-        /// ldr wt, [xn, #imm] (32-bit, unsigned scaled by 4)
+        /// ldr wt, [xn, #imm] (32-bit, unsigned scaled by 4; any offset, see `mem`)
+        #[inline]
         pub fn ldr_w_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
-            debug_assert!(imm_bytes.is_multiple_of(4) && imm_bytes / 4 < 4096);
-            self.emit(0xB940_0000 | ((imm_bytes / 4) << 10) | (rn << 5) | rt);
+            self.mem(LDR_W, rt, rn, imm_bytes);
         }
         /// FCVT Sd, Dn / FCVT Dd, Sn. Narrowing uses FPCR's roundTiesToEven default.
         pub fn fcvt_float_width(&mut self, rd: u32, rn: u32, narrow: bool) {
@@ -3098,43 +3102,53 @@ mod asm {
         pub fn cmp_reg_w(&mut self, rn: u32, rm: u32) {
             self.emit(0x6B00_001F | (rm << 16) | (rn << 5));
         }
-        /// cmp xn, #imm12
+        /// cmp xn, #imm (any immediate, see `flags`)
+        #[inline]
         pub fn cmp_imm_x(&mut self, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0xF100_001F | (imm << 10) | (rn << 5));
+            self.flags(SUBS_X, 31, rn, imm);
         }
-        /// ldur dt, [xn, #simm9]
+        /// ldur dt, [xn, #simm9] (any offset, see `mem`)
+        #[inline]
         pub fn ldur_d(&mut self, rt: u32, rn: u32, simm9: i32) {
-            self.emit_fp(0xFC40_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
+            self.mem_unscaled(LDR_D, rt, rn, simm9);
         }
-        /// stur dt, [xn, #simm9]
+        /// stur dt, [xn, #simm9] (any offset, see `mem`)
+        #[inline]
         pub fn stur_d(&mut self, rt: u32, rn: u32, simm9: i32) {
-            self.emit_fp(0xFC00_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
+            self.mem_unscaled(STR_D, rt, rn, simm9);
         }
-        /// ldr dt, [xn, #imm] (scaled)
+        /// ldr dt, [xn, #imm] (scaled; any offset, see `mem`)
+        #[inline]
         pub fn ldr_d_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
-            debug_assert!(imm_bytes.is_multiple_of(8) && imm_bytes / 8 < 4096);
-            self.emit_fp(0xFD40_0000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt);
+            self.mem(LDR_D, rt, rn, imm_bytes);
         }
-        /// str dt, [xn, #imm] (scaled)
+        /// str dt, [xn, #imm] (scaled; any offset, see `mem`)
+        #[inline]
         pub fn str_d_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
-            debug_assert!(imm_bytes.is_multiple_of(8) && imm_bytes / 8 < 4096);
-            self.emit_fp(0xFD00_0000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt);
+            self.mem(STR_D, rt, rn, imm_bytes);
         }
-        /// add xd, xn, #imm12
+        /// add xd, xn, #imm (any immediate, see `add_far`)
+        #[inline]
         pub fn add_imm(&mut self, rd: u32, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0x9100_0000 | (imm << 10) | (rn << 5) | rd);
+            if imm < 4096 {
+                self.emit(0x9100_0000 | (imm << 10) | (rn << 5) | rd);
+            } else {
+                self.add_far(rd, rn, imm.into());
+            }
         }
-        /// sub xd, xn, #imm12
+        /// sub xd, xn, #imm (any immediate, see `add_far`)
+        #[inline]
         pub fn sub_imm(&mut self, rd: u32, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0xD100_0000 | (imm << 10) | (rn << 5) | rd);
+            if imm < 4096 {
+                self.emit(0xD100_0000 | (imm << 10) | (rn << 5) | rd);
+            } else {
+                self.add_far(rd, rn, -i64::from(imm));
+            }
         }
-        /// cmp wn, #imm12
+        /// cmp wn, #imm (any immediate, see `flags`)
+        #[inline]
         pub fn cmp_imm_w(&mut self, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0x7100_001F | (imm << 10) | (rn << 5));
+            self.flags(SUBS_W, 31, rn, imm);
         }
         /// b.cond label (patched; imm19 shares the CBZ patch shape)
         pub fn b_cond(&mut self, cond: u32, label: usize) {
@@ -3247,22 +3261,28 @@ mod asm {
         pub fn fmov_d_d(&mut self, rd: u32, rn: u32) {
             self.emit_fp(0x1E60_4000 | (rn << 5) | rd);
         }
-        /// stp dt1, dt2, [sp, #imm] (SIMD&FP 64-bit, signed offset)
+        /// stp dt1, dt2, [sp, #imm] (SIMD&FP 64-bit, signed offset; any offset, see `pair`)
+        #[inline]
         pub fn stp_d_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
-            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit_fp(0x6D00_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
+            self.pair(STP_D, Index::Offset, rt1, rt2, 31, imm_bytes);
         }
         /// ldp dt1, dt2, [sp, #imm] (test event helpers' reloads of d16..d31)
         #[cfg(test)]
         pub fn ldp_d_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
-            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit_fp(0x6D40_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
+            self.pair(LDP_D, Index::Offset, rt1, rt2, 31, imm_bytes);
+        }
+        /// ldp or stp dt1, dt2, [xn, #imm] on any base, which the SIMD&FP pair encoders take as
+        /// SP only (tests of the pair legalizer).
+        #[cfg(test)]
+        pub fn pair_d(&mut self, load: bool, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
+            let op = if load { LDP_D } else { STP_D };
+            self.pair(op, Index::Offset, rt1, rt2, rn, imm_bytes);
         }
         /// ldp dt1, dt2, [sp, #imm], for an epilogue's restore of d8..d15, which is no use of
         /// them (so it bypasses `emit_fp`).
+        #[inline]
         pub fn ldp_d_restore(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
-            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
-            self.emit(0x6D40_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
+            self.pair(LDP_D_RESTORE, Index::Offset, rt1, rt2, 31, imm_bytes);
         }
         /// and/orr/eor wd, wn, wm — op: 0=and, 1=orr, 2=eor
         pub fn logic_w(&mut self, op: u32, rd: u32, rn: u32, rm: u32) {
@@ -3302,8 +3322,11 @@ mod asm {
             self.emit(bits | (rm << 16) | (rn << 5) | rd);
         }
         /// add xd, xn, xm, lsl #shift
+        #[inline]
         pub fn add_shifted(&mut self, rd: u32, rn: u32, rm: u32, shift: u32) {
-            debug_assert!(shift < 64);
+            if shift >= 64 {
+                return self.bad("a register shift past 63");
+            }
             self.emit(0x8B00_0000 | (rm << 16) | (shift << 10) | (rn << 5) | rd);
         }
         /// cmp xn, xm (SUBS xzr, xn, xm)
@@ -3311,8 +3334,11 @@ mod asm {
             self.emit(0xEB00_001F | (rm << 16) | (rn << 5));
         }
         /// lsr xd, xn, #shift (UBFM xd, xn, #shift, #63)
+        #[inline]
         pub fn lsr_imm(&mut self, rd: u32, rn: u32, shift: u32) {
-            debug_assert!(shift < 64);
+            if shift >= 64 {
+                return self.bad("a shift past 63");
+            }
             self.emit(0xD340_FC00 | (shift << 16) | (rn << 5) | rd);
         }
         /// UBFX Xd, Xn, #lsb, #width: zero-extend the selected field, without changing NZCV.
@@ -3328,8 +3354,11 @@ mod asm {
             self.emit(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd);
         }
         /// lsl xd, xn, #shift (UBFM alias)
+        #[inline]
         pub fn lsl_imm(&mut self, rd: u32, rn: u32, shift: u32) {
-            debug_assert!(shift < 64);
+            if shift >= 64 {
+                return self.bad("a shift past 63");
+            }
             let immr = (64 - shift) & 63;
             let imms = 63 - shift;
             self.emit(0xD340_0000 | (immr << 16) | (imms << 10) | (rn << 5) | rd);
@@ -3338,15 +3367,17 @@ mod asm {
         pub fn mov_w(&mut self, rd: u32, rm: u32) {
             self.emit(0x2A00_03E0 | (rm << 16) | rd);
         }
-        /// cmn wn, #imm12 (ADDS wzr, wn, #imm — `cmn wn, #1` tests for 0xFFFF_FFFF)
+        /// cmn wn, #imm (ADDS wzr, wn, #imm — `cmn wn, #1` tests for 0xFFFF_FFFF; any
+        /// immediate, see `flags`)
+        #[inline]
         pub fn cmn_imm_w(&mut self, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0x3100_001F | (imm << 10) | (rn << 5));
+            self.flags(ADDS_W, 31, rn, imm);
         }
-        /// cmn xn, #imm12 (ADDS xzr, xn, #imm — `cmn xn, #1` sets V exactly for xn == i64::MAX)
+        /// cmn xn, #imm (ADDS xzr, xn, #imm — `cmn xn, #1` sets V exactly for xn == i64::MAX;
+        /// any immediate, see `flags`)
+        #[inline]
         pub fn cmn_imm_x(&mut self, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0xB100_001F | (imm << 10) | (rn << 5));
+            self.flags(ADDS_X, 31, rn, imm);
         }
         /// fcmp dn, #0.0
         pub fn fcmp_zero(&mut self, rn: u32) {
@@ -3361,25 +3392,38 @@ mod asm {
             self.emit(0x9340_7C00 | (rn << 5) | rd);
         }
         /// asr wd, wn, #shift (SBFM wd, wn, #shift, #31)
+        #[inline]
         pub fn asr_imm_w(&mut self, rd: u32, rn: u32, shift: u32) {
-            debug_assert!(shift < 32);
+            if shift >= 32 {
+                return self.bad("a 32-bit shift past 31");
+            }
             self.emit(0x1300_7C00 | (shift << 16) | (rn << 5) | rd);
         }
         /// lsr wd, wn, #shift (UBFM wd, wn, #shift, #31)
+        #[inline]
         pub fn lsr_imm_w(&mut self, rd: u32, rn: u32, shift: u32) {
-            debug_assert!(shift < 32);
+            if shift >= 32 {
+                return self.bad("a 32-bit shift past 31");
+            }
             self.emit(0x5300_7C00 | (shift << 16) | (rn << 5) | rd);
         }
         /// lsl wd, wn, #shift (UBFM wd, wn, #(32-shift)%32, #(31-shift))
+        #[inline]
         pub fn lsl_imm_w(&mut self, rd: u32, rn: u32, shift: u32) {
-            debug_assert!(shift < 32);
+            if shift >= 32 {
+                return self.bad("a 32-bit shift past 31");
+            }
             let immr = (32 - shift) & 31;
             let imms = 31 - shift;
             self.emit(0x5300_0000 | (immr << 16) | (imms << 10) | (rn << 5) | rd);
         }
         /// and/orr/eor wd, wn, #imm (logical immediate; `field` from [`logical_imm_w`]) —
         /// op: 0=and, 1=orr, 2=eor
+        #[inline]
         pub fn logic_imm_w(&mut self, op: u32, rd: u32, rn: u32, field: u32) {
+            if field >= 1 << 12 {
+                return self.bad("a logical immediate's field past 12 bits");
+            }
             let bits = match op {
                 0 => 0x1200_0000u32,
                 1 => 0x3200_0000,
@@ -3442,19 +3486,321 @@ mod asm {
         pub fn str_d_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
             self.emit_fp(0xFC20_7800 | (rm << 16) | (rn << 5) | rt);
         }
-        /// adds wd, wn, #imm12 (sets flags; V on i32 overflow)
+        /// adds wd, wn, #imm (sets flags; V on i32 overflow; any immediate, see `flags`)
+        #[inline]
         pub fn adds_imm_w(&mut self, rd: u32, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0x3100_0000 | (imm << 10) | (rn << 5) | rd);
+            self.flags(ADDS_W, rd, rn, imm);
         }
         /// subs wd, wn, wm (sets flags)
         pub fn subs_reg_w(&mut self, rd: u32, rn: u32, rm: u32) {
             self.emit(0x6B00_0000 | (rm << 16) | (rn << 5) | rd);
         }
-        /// subs wd, wn, #imm12 (sets flags; V on i32 overflow)
+        /// subs wd, wn, #imm (sets flags; V on i32 overflow; any immediate, see `flags`)
+        #[inline]
         pub fn subs_imm_w(&mut self, rd: u32, rn: u32, imm: u32) {
-            debug_assert!(imm < 4096);
-            self.emit(0x7100_0000 | (imm << 10) | (rn << 5) | rd);
+            self.flags(SUBS_W, rd, rn, imm);
+        }
+
+        // ---- operands past an instruction's range (Decision 23) ----
+        //
+        // Every encoder takes any operand. One its own form encodes gives the same word as
+        // before. One past it takes the first of these that applies, as V8's, SpiderMonkey's and
+        // JSC's macro-assemblers accept any offset:
+        // 1. the other one-instruction form: scaled or unscaled (LDUR/STUR), or a 12-bit
+        //    immediate shifted by 12;
+        // 2. no scratch register: a load's (or an add's) destination as the address register;
+        //    a base other than SP, which the access does not store or load, moved by the offset
+        //    and moved back; a pre- or post-indexed pair's base moved before or after the access;
+        // 3. a recycled register, pushed before and popped after, as SpiderMonkey's
+        //    `LoadStoreMacro` does when its scratch pool is empty.
+        // The templates keep no register for this: no form depends on which registers they hold.
+        // Field widths (shifts, MOVZ lanes, prepared logical fields) have no legal meaning past
+        // their range; such an operand is a template bug (`bad`).
+
+        /// A load or store at `[rn + off]` in its scaled form, whose 12-bit field takes multiples
+        /// of the access size up to 4,095 of them: one mask test, then the word as before; past
+        /// it, [`Asm::mem_far`].
+        #[inline(always)]
+        fn mem(&mut self, op: Mem, rt: u32, rn: u32, off: u32) {
+            if off & !(4095 * op.size) == 0 {
+                self.emit_mem(op, op.scaled | (off / op.size) << 10 | rn << 5 | rt);
+            } else {
+                self.mem_far(op, false, rt, rn, off.into());
+            }
+        }
+
+        /// A load or store at `[rn + off]` in its unscaled form (LDUR/STUR, -256..255); past it,
+        /// [`Asm::mem_far`].
+        #[inline(always)]
+        fn mem_unscaled(&mut self, op: Mem, rt: u32, rn: u32, off: i32) {
+            if (-256..256).contains(&off) {
+                self.emit_mem(
+                    op,
+                    op.unscaled() | ((off as u32) & 0x1FF) << 12 | rn << 5 | rt,
+                );
+            } else {
+                self.mem_far(op, true, rt, rn, off.into());
+            }
+        }
+
+        /// [`Asm::mem`] and [`Asm::mem_unscaled`] past their own form (`unscaled` says which):
+        /// the other one-instruction form, else the rungs above.
+        #[cold]
+        #[inline(never)]
+        fn mem_far(&mut self, op: Mem, unscaled: bool, rt: u32, rn: u32, off: i64) {
+            let other = if unscaled {
+                op.scaled_field(off).map(|field| op.scaled | field << 10)
+            } else {
+                unscaled_field(off).map(|field| op.unscaled() | field << 12)
+            };
+            if let Some(word) = other {
+                return self.emit_mem(op, word | rn << 5 | rt);
+            }
+            note_far();
+            if op.load && !op.fp && rt != 31 {
+                // The destination as the address register: the load overwrites it anyway.
+                if let Some((high, low)) = op.split(off) {
+                    self.add_high(rt, rn, high);
+                    return self.emit_mem(op, op.low_word(low) | rt << 5 | rt);
+                }
+                if rt != rn {
+                    self.mov_imm64(rt, off as u64);
+                    return self.emit_mem(op, op.register() | rt << 16 | rn << 5 | rt);
+                }
+            } else if rn != 31 && (op.fp || rt != rn) {
+                // The base moved by the offset's high part and moved back.
+                if let Some((high, low)) = op.split(off) {
+                    self.add_high(rn, rn, high);
+                    self.emit_mem(op, op.low_word(low) | rn << 5 | rt);
+                    return self.add_high(rn, rn, -high);
+                }
+            }
+            let avoid = [if op.fp { rn } else { rt }, rn];
+            self.recycling(&avoid, |a, r| {
+                let off = if rn == 31 { off + 16 } else { off };
+                match op.split(off) {
+                    Some((high, low)) => {
+                        a.add_high(r, rn, high);
+                        a.emit_mem(op, op.low_word(low) | r << 5 | rt);
+                    }
+                    None => {
+                        a.mov_imm64(r, off as u64);
+                        a.emit_mem(op, op.register() | r << 16 | rn << 5 | rt);
+                    }
+                }
+            });
+        }
+
+        #[inline(always)]
+        fn emit_mem(&mut self, op: Mem, word: u32) {
+            if op.fp {
+                self.emit_fp(word);
+            } else {
+                self.emit(word);
+            }
+        }
+
+        /// A load or store pair at `[rn + off]`, or written back by `off` before or after the
+        /// access (`index`), any `off`: imm7's -512..504 as before; past it a written-back base
+        /// moves before or after the access (V8's and SpiderMonkey's forms), and an offset goes
+        /// through the first destination (a load of general registers, which may load its own
+        /// base), through the base moved and moved back (not SP, and not one of the pair's
+        /// registers), or through a recycled register.
+        #[inline(always)]
+        fn pair(&mut self, op: Pair, index: Index, rt1: u32, rt2: u32, rn: u32, off: i32) {
+            // -512..504 in steps of 8 (imm7, scaled by 8): biased by 512, the bits of 0..1,016.
+            if (off.wrapping_add(512) as u32) & !0x3F8 == 0 {
+                let field = ((off >> 3) as u32) & 0x7F;
+                self.emit_pair(
+                    op,
+                    op.indexed(index) | field << 15 | rt2 << 10 | rn << 5 | rt1,
+                );
+            } else {
+                self.pair_far(op, index, rt1, rt2, rn, off.into());
+            }
+        }
+
+        /// [`Asm::pair`] past imm7.
+        #[cold]
+        #[inline(never)]
+        fn pair_far(&mut self, op: Pair, index: Index, rt1: u32, rt2: u32, rn: u32, off: i64) {
+            let registers = rt2 << 10 | rn << 5 | rt1;
+            note_far();
+            match index {
+                Index::Pre => {
+                    if self.add_into(rn, rn, off) {
+                        self.emit_pair(op, op.offset | registers);
+                    } else {
+                        self.fail("a pre-indexed pair's base moved by 16 MB or more");
+                    }
+                }
+                Index::Post => {
+                    self.emit_pair(op, op.offset | registers);
+                    if !self.add_into(rn, rn, off) {
+                        self.fail("a post-indexed pair's base moved by 16 MB or more");
+                    }
+                }
+                Index::Offset => self.pair_offset_far(op, rt1, rt2, rn, off),
+            }
+        }
+
+        /// [`Asm::pair`]'s signed offset past imm7.
+        fn pair_offset_far(&mut self, op: Pair, rt1: u32, rt2: u32, rn: u32, off: i64) {
+            let at = |base: u32, low: i64| {
+                let field = pair_field(low).expect("a pair's low part");
+                op.offset | field << 15 | rt2 << 10 | base << 5 | rt1
+            };
+            let (adjust, low) = pair_adjust(off);
+            if op.load && !op.fp && rt1 != 31 && self.add_into(rt1, rn, adjust) {
+                return self.emit_pair(op, at(rt1, low));
+            }
+            let names_base = !op.fp && (rn == rt1 || rn == rt2);
+            if rn != 31 && !names_base && adjust.unsigned_abs() < 1 << 24 {
+                self.add_into(rn, rn, adjust);
+                self.emit_pair(op, at(rn, low));
+                self.add_into(rn, rn, -adjust);
+                return;
+            }
+            let avoid = if op.fp { [rn; 3] } else { [rt1, rt2, rn] };
+            self.recycling(&avoid, |a, r| {
+                let (adjust, low) = pair_adjust(if rn == 31 { off + 16 } else { off });
+                // Into a register that is neither the base nor SP, which always succeeds.
+                a.add_into(r, rn, adjust);
+                a.emit_pair(op, at(r, low));
+            });
+        }
+
+        #[inline(always)]
+        fn emit_pair(&mut self, op: Pair, word: u32) {
+            if op.counted {
+                self.emit_fp(word);
+            } else {
+                self.emit(word);
+            }
+        }
+
+        /// xd = xn + `off` past ADD's and SUB's 12-bit immediate: [`Asm::add_into`], else (an add
+        /// of 16 MB or more onto its own source) the offset in a recycled register.
+        #[cold]
+        #[inline(never)]
+        fn add_far(&mut self, rd: u32, rn: u32, off: i64) {
+            note_far();
+            if self.add_into(rd, rn, off) {
+                return;
+            }
+            if rd == 31 || rn == 31 {
+                return self.fail("an SP adjustment of 16 MB or more");
+            }
+            self.recycling(&[rd, rn], |a, r| {
+                a.mov_imm64(r, off as u64);
+                a.emit(0x8B00_0000 | r << 16 | rn << 5 | rd); // add xd, xn, xr
+            });
+        }
+
+        /// xd = xn + `off` through xd alone (xd may be xn, and either may be SP): one ADD or SUB
+        /// immediate below 4,096, the 12-bit part shifted by 12 and then the low part below
+        /// 16 MB, else the offset moved into xd when it is neither xn nor SP. False, having
+        /// emitted nothing, when none of these applies.
+        fn add_into(&mut self, rd: u32, rn: u32, off: i64) -> bool {
+            let op: u32 = if off < 0 { 0xD100_0000 } else { 0x9100_0000 };
+            let magnitude = off.unsigned_abs();
+            if magnitude < 1 << 12 {
+                self.emit(op | (magnitude as u32) << 10 | rn << 5 | rd);
+            } else if magnitude < 1 << 24 {
+                self.emit(op | 1 << 22 | ((magnitude >> 12) as u32) << 10 | rn << 5 | rd);
+                if magnitude & 0xFFF != 0 {
+                    self.emit(op | ((magnitude & 0xFFF) as u32) << 10 | rd << 5 | rd);
+                }
+            } else if rd != rn && rd != 31 {
+                self.mov_imm64(rd, off as u64);
+                // ADD (extended register, UXTX) reads register 31 as SP, the shifted form as XZR.
+                let add = if rn == 31 { 0x8B20_6000 } else { 0x8B00_0000 };
+                self.emit(add | rd << 16 | rn << 5 | rd);
+            } else {
+                return false;
+            }
+            true
+        }
+
+        /// xd = xn + `high` * 4,096 for `0 < |high| < 4,096`: ADD or SUB, 12-bit immediate
+        /// shifted by 12 (SP on either side).
+        fn add_high(&mut self, rd: u32, rn: u32, high: i64) {
+            let op: u32 = if high < 0 { 0xD140_0000 } else { 0x9140_0000 };
+            self.emit(op | (high.unsigned_abs() as u32) << 10 | rn << 5 | rd);
+        }
+
+        /// rd = rn + or - `imm`, setting NZCV (rd 31: CMN or CMP): the 12-bit immediate as before,
+        /// else shifted by 12 when its low 12 bits are clear (the same operation, so the same
+        /// flags), else the immediate moved into rd when rd is not rn, else into a recycled
+        /// register, for the shifted-register form. Register 31 as rn is SP in the immediate
+        /// form and XZR in the register form, so SP fails past the first two.
+        #[inline(always)]
+        fn flags(&mut self, op: Flags, rd: u32, rn: u32, imm: u32) {
+            if imm < 1 << 12 {
+                self.emit(op.imm | imm << 10 | rn << 5 | rd);
+            } else {
+                self.flags_far(op, rd, rn, imm);
+            }
+        }
+
+        /// [`Asm::flags`] past the 12-bit immediate.
+        #[cold]
+        #[inline(never)]
+        fn flags_far(&mut self, op: Flags, rd: u32, rn: u32, imm: u32) {
+            if imm < 1 << 24 && imm & 0xFFF == 0 {
+                return self.emit(op.imm | 1 << 22 | (imm >> 12) << 10 | rn << 5 | rd);
+            }
+            note_far();
+            if rn == 31 {
+                return self.fail("a flag-setting immediate on SP past 12 bits");
+            }
+            if rd != 31 && rd != rn {
+                self.mov_imm64(rd, imm.into());
+                return self.emit(op.reg | rd << 16 | rn << 5 | rd);
+            }
+            self.recycling(&[rd, rn], |a, r| {
+                a.mov_imm64(r, imm.into());
+                a.emit(op.reg | r << 16 | rn << 5 | rd);
+            });
+        }
+
+        /// Run `body` with a recycled register, SpiderMonkey's way when its scratch pool is
+        /// empty: the first of x16, x17, x15 and x14 that `avoid` does not name, pushed before
+        /// and popped after (`str xr, [sp, #-16]!` and `ldr xr, [sp], #16`, which leave NZCV
+        /// alone). Every SP adjustment the JIT makes is a multiple of 16 and nothing lives below
+        /// SP, so the push is always safe; `body` adds 16 to an SP-based offset.
+        fn recycling(&mut self, avoid: &[u32], body: impl FnOnce(&mut Self, u32)) {
+            let r = [16, 17, 15, 14]
+                .into_iter()
+                .find(|r| !avoid.contains(r))
+                .expect("four candidates, at most three named");
+            self.emit(0xF81F_0FE0 | r);
+            body(self, r);
+            self.emit(0xF841_07E0 | r);
+        }
+
+        /// An operand that is a field width out of its range (a shift, a MOVZ lane, a prepared
+        /// logical field): a template bug, which debug builds report; release builds refuse the
+        /// compile instead of emitting a wrong word.
+        #[cold]
+        #[inline(never)]
+        fn bad(&mut self, what: &'static str) {
+            if cfg!(debug_assertions) {
+                panic!("unencodable operand: {what}");
+            }
+            self.fail(what);
+        }
+
+        /// Refuse this assembly: record the first operand no sequence encodes and emit UDF #0
+        /// (permanently undefined) in its place. The compiler checks `failed` and installs
+        /// nothing.
+        #[cold]
+        #[inline(never)]
+        fn fail(&mut self, what: &'static str) {
+            if self.failed.is_none() {
+                self.failed = Some((self.buf.len(), what));
+            }
+            self.emit(0);
         }
 
         #[cfg(test)]
@@ -3467,6 +3813,12 @@ mod asm {
         /// veneers move those destinations just as they move ordinary branch labels.
         /// Panics on an unbound label (a compiler bug).
         pub fn finish_with_offsets(mut self, exported: &[usize]) -> (Vec<u32>, Vec<u32>) {
+            // The compilers check `failed` and refuse the code before finishing it.
+            assert!(
+                self.failed.is_none(),
+                "finishing an assembly that failed: {:?}",
+                self.failed()
+            );
             self.relax_branches(8);
             for (at, label, kind) in std::mem::take(&mut self.patches) {
                 let target = self.labels[label].expect("unbound jit label");
@@ -3481,7 +3833,11 @@ mod asm {
                         self.buf[at] |= imm26;
                     }
                     PatchKind::Cb => {
-                        debug_assert!((-(1 << 18)..(1 << 18)).contains(&delta));
+                        // Branch relaxation gave every out-of-range conditional a veneer.
+                        assert!(
+                            (-(1 << 18)..(1 << 18)).contains(&delta),
+                            "JIT imm19 branch out of range: {delta} instructions"
+                        );
                         let imm19 = ((delta as u32) & 0x7FFFF) << 5;
                         self.buf[at] |= imm19;
                     }
@@ -3613,6 +3969,245 @@ mod asm {
             code.extend_from_slice(&self.buf[from..]);
             self.buf = code;
         }
+    }
+
+    /// A single-register load or store (Arm A64, "Load/store register (unsigned immediate)"):
+    /// the fixed bits of its scaled unsigned-offset form, the access size in bytes, whether it
+    /// loads, and whether Rt is a SIMD&FP register. The unscaled (LDUR/STUR) and register-offset
+    /// forms follow from the first.
+    #[derive(Clone, Copy)]
+    struct Mem {
+        scaled: u32,
+        size: u32,
+        load: bool,
+        fp: bool,
+    }
+
+    impl Mem {
+        /// LDUR/STUR: the scaled form with bit 24 clear.
+        fn unscaled(self) -> u32 {
+            self.scaled & !0x0100_0000
+        }
+        /// `[xn, xm]`: option LSL (UXTX), unshifted.
+        fn register(self) -> u32 {
+            self.unscaled() | 0x0020_6800
+        }
+        /// The scaled form's 12-bit field for `off`, if it encodes there.
+        fn scaled_field(self, off: i64) -> Option<u32> {
+            let size = i64::from(self.size);
+            (off >= 0 && off % size == 0 && off / size < 4096).then(|| (off / size) as u32)
+        }
+        /// `off` as a multiple of 4,096 (ADD's immediate shifted by 12, below 16 MB) and a low
+        /// part one of this access's forms encodes, as SpiderMonkey's `LoadStoreMacro` splits
+        /// it: the low part within 0..4,095 first, then within -4,095..-1.
+        fn split(self, off: i64) -> Option<(i64, i64)> {
+            let low = off.rem_euclid(4096);
+            let high = (off - low) / 4096;
+            [(high, low), (high + 1, low - 4096)]
+                .into_iter()
+                .find(|&(high, low)| {
+                    high != 0
+                        && high.abs() < 4096
+                        && (self.scaled_field(low).is_some() || unscaled_field(low).is_some())
+                })
+        }
+        /// The access's word at `[base + low]` for a low part from [`Mem::split`].
+        fn low_word(self, low: i64) -> u32 {
+            match self.scaled_field(low) {
+                Some(field) => self.scaled | field << 10,
+                None => self.unscaled() | unscaled_field(low).expect("split's low part") << 12,
+            }
+        }
+    }
+
+    /// LDUR/STUR's signed 9-bit field for `off`, if it encodes there.
+    fn unscaled_field(off: i64) -> Option<u32> {
+        (-256..256).contains(&off).then_some((off as u32) & 0x1FF)
+    }
+
+    const LDR_X: Mem = Mem {
+        scaled: 0xF940_0000,
+        size: 8,
+        load: true,
+        fp: false,
+    };
+    const STR_X: Mem = Mem {
+        scaled: 0xF900_0000,
+        size: 8,
+        load: false,
+        fp: false,
+    };
+    const LDR_W: Mem = Mem {
+        scaled: 0xB940_0000,
+        size: 4,
+        load: true,
+        fp: false,
+    };
+    const STR_W: Mem = Mem {
+        scaled: 0xB900_0000,
+        size: 4,
+        load: false,
+        fp: false,
+    };
+    const LDRH: Mem = Mem {
+        scaled: 0x7940_0000,
+        size: 2,
+        load: true,
+        fp: false,
+    };
+    const STRH: Mem = Mem {
+        scaled: 0x7900_0000,
+        size: 2,
+        load: false,
+        fp: false,
+    };
+    const LDRB: Mem = Mem {
+        scaled: 0x3940_0000,
+        size: 1,
+        load: true,
+        fp: false,
+    };
+    const STRB: Mem = Mem {
+        scaled: 0x3900_0000,
+        size: 1,
+        load: false,
+        fp: false,
+    };
+    const LDR_D: Mem = Mem {
+        scaled: 0xFD40_0000,
+        size: 8,
+        load: true,
+        fp: true,
+    };
+    const STR_D: Mem = Mem {
+        scaled: 0xFD00_0000,
+        size: 8,
+        load: false,
+        fp: true,
+    };
+
+    /// A load or store pair of 64-bit registers (Arm A64, "Load/store register pair"): the
+    /// fixed bits of its signed-offset form, whether it loads, whether its registers are SIMD&FP,
+    /// and whether its word goes through `emit_fp` (an epilogue's restore of d8..d15 does not).
+    #[derive(Clone, Copy)]
+    struct Pair {
+        offset: u32,
+        load: bool,
+        fp: bool,
+        counted: bool,
+    }
+
+    /// A pair's addressing: the signed offset, or the base written back before (pre-index) or
+    /// after (post-index) the access.
+    #[derive(Clone, Copy)]
+    enum Index {
+        Offset,
+        Pre,
+        Post,
+    }
+
+    impl Pair {
+        fn indexed(self, index: Index) -> u32 {
+            match index {
+                Index::Offset => self.offset,
+                Index::Pre => self.offset | 0x0080_0000,
+                Index::Post => (self.offset & !0x0100_0000) | 0x0080_0000,
+            }
+        }
+    }
+
+    /// A pair's signed 7-bit field, scaled by 8, for `off`, if it encodes there.
+    fn pair_field(off: i64) -> Option<u32> {
+        (off % 8 == 0 && (-512..=504).contains(&off)).then_some(((off / 8) as u32) & 0x7F)
+    }
+
+    /// `off` as an adjustment of the address register and a low part imm7 encodes: a multiple
+    /// of 4,096 (one ADD or SUB) when the rest fits imm7, else the whole offset.
+    fn pair_adjust(off: i64) -> (i64, i64) {
+        let low = off.rem_euclid(4096);
+        let high = off - low;
+        [(high, low), (high + 4096, low - 4096)]
+            .into_iter()
+            .find(|&(adjust, low)| {
+                adjust != 0 && adjust.unsigned_abs() < 1 << 24 && pair_field(low).is_some()
+            })
+            .unwrap_or((off, 0))
+    }
+
+    const STP_X: Pair = Pair {
+        offset: 0xA900_0000,
+        load: false,
+        fp: false,
+        counted: false,
+    };
+    const LDP_X: Pair = Pair {
+        offset: 0xA940_0000,
+        load: true,
+        fp: false,
+        counted: false,
+    };
+    const STP_D: Pair = Pair {
+        offset: 0x6D00_0000,
+        load: false,
+        fp: true,
+        counted: true,
+    };
+    #[cfg(test)]
+    const LDP_D: Pair = Pair {
+        offset: 0x6D40_0000,
+        load: true,
+        fp: true,
+        counted: true,
+    };
+    const LDP_D_RESTORE: Pair = Pair {
+        offset: 0x6D40_0000,
+        load: true,
+        fp: true,
+        counted: false,
+    };
+
+    /// A flag-setting add or subtract (CMN and CMP are its forms writing XZR): the fixed bits
+    /// of its immediate form and of its shifted-register form.
+    #[derive(Clone, Copy)]
+    struct Flags {
+        imm: u32,
+        reg: u32,
+    }
+
+    const SUBS_W: Flags = Flags {
+        imm: 0x7100_0000,
+        reg: 0x6B00_0000,
+    };
+    const SUBS_X: Flags = Flags {
+        imm: 0xF100_0000,
+        reg: 0xEB00_0000,
+    };
+    const ADDS_W: Flags = Flags {
+        imm: 0x3100_0000,
+        reg: 0x2B00_0000,
+    };
+    const ADDS_X: Flags = Flags {
+        imm: 0xB100_0000,
+        reg: 0xAB00_0000,
+    };
+
+    #[cfg(test)]
+    thread_local! {
+        /// Operands past their instruction's own form, legalized on this thread (see
+        /// [`super::legalized_operands`]).
+        static FAR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Count a legalized operand (tests only).
+    fn note_far() {
+        #[cfg(test)]
+        FAR.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Operands legalized on this thread so far.
+    #[cfg(test)]
+    pub fn legalized() -> usize {
+        FAR.with(std::cell::Cell::get)
     }
 
     /// Encode a 32-bit logical immediate for AND/ORR/EOR (immediate form): the 12-bit
@@ -4123,6 +4718,8 @@ fn compile_entry(
     const FRAME_SIZE: i32 = 128;
     const DSAVE: i32 = 64;
     const STRICT_SAVE: u32 = 48;
+    // `skip_unused_callee_saved_fp` rewrites these words in place: each pair is one instruction.
+    const _: () = assert!(FRAME_SIZE <= 512 && DSAVE + 48 <= 504);
     a.stp_pre(29, 30, -FRAME_SIZE);
     a.stp_off(19, 20, 16);
     a.stp_off(21, 22, 32);
@@ -5048,6 +5645,9 @@ fn compile_entry(
     let mut exported = pc_labels[..ops.len()].to_vec();
     exported.extend([l_dsave, l_drestore_ok, l_drestore_throw]);
     let fp_callee_saved = a.writes_callee_saved_fp();
+    if a.failed().is_some() {
+        return None; // an operand no instruction sequence encodes: the bytecode VM runs it
+    }
     let (mut words, mut pc_offsets) = a.finish_with_offsets(&exported);
     let fp_saves: Vec<usize> = pc_offsets
         .drain(ops.len()..)
@@ -5360,6 +5960,13 @@ mod x64;
 #[path = "jit_exec_memory_tests.rs"]
 mod exec_memory_tests;
 
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_asm_imm_tests.rs"]
+mod asm_imm_tests;
 #[cfg(all(test, target_arch = "aarch64"))]
 #[path = "jit_call_epoch_tests.rs"]
 mod call_epoch_tests;
@@ -12253,6 +12860,9 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
         .collect();
     // Chunks drop their d8..d15 saves only while no stub they can reach writes those registers.
     let fp_callee_saved = a.writes_callee_saved_fp();
+    if a.failed().is_some() {
+        return None; // an operand no instruction sequence encodes: the chunks emit their own
+    }
     let (words, offsets) = a.finish_with_offsets(&labels);
     debug_assert!(
         fp_callee_saved || !words.iter().any(|&word| writes_callee_saved_fp(word)),
