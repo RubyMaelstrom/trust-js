@@ -109,6 +109,14 @@ mod call_closure_tests;
 #[path = "jit_getter_call_tests.rs"]
 mod getter_call_tests;
 
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_setter_call_tests.rs"]
+mod setter_call_tests;
+
 #[cfg(test)]
 #[path = "jit_construct_tests.rs"]
 mod construct_tests;

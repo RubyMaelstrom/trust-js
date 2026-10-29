@@ -4181,6 +4181,17 @@ const COMPUTED_STUB_KEY_MAX_BYTES: usize = 256;
 mod property_read;
 use property_read::CachedGet;
 
+/// What a property store's inline cache did (see [`Interp::try_ic_set`]).
+pub(crate) enum IcSet {
+    /// The value was stored.
+    Stored,
+    /// The receiver's [[Set]] reaches the accessor at `slot` of `holder` (its `Gc::as_ptr`),
+    /// which the cache proved with nothing run since: the caller calls its setter.
+    Setter { holder: usize, slot: u32 },
+    /// Neither: the generic [[Set]].
+    Miss,
+}
+
 #[cfg(test)]
 mod deep_property_ic_tests {
     use super::*;
@@ -10665,7 +10676,10 @@ impl Interp {
 
     /// `obj.name = v` write with a per-site inline cache (bytecode `SetProp`/`SetPropDrop`). The
     /// fast path overwrites an existing own writable data property (OrdinarySet's winning case,
-    /// correct regardless of the prototype chain); everything else defers to full `[[Set]]`.
+    /// correct regardless of the prototype chain), creates one the cache proved the chain allows,
+    /// or calls the setter of an accessor the cache proved the receiver's [[Set]] reaches;
+    /// everything else defers to full `[[Set]]`.
+    #[inline(always)]
     pub(crate) fn set_prop_ic(
         &mut self,
         base: &Value,
@@ -10675,8 +10689,14 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<(), Abrupt> {
         if let ValueView::Obj(o) = &(base).view() {
-            if self.try_ic_set(o, key, &v, cache) {
-                return Ok(());
+            match self.try_ic_set::<true>(o, key, &v, cache) {
+                IcSet::Stored => return Ok(()),
+                IcSet::Setter { holder, slot } => {
+                    // SAFETY: the cache's proof was made just now and nothing has run since;
+                    // `base` (on the caller's frame) keeps the holder alive.
+                    return unsafe { self.accessor_validated_set(holder, slot, name, base, v) };
+                }
+                IcSet::Miss => {}
             }
         }
         self.set_member_key(base, name, v)
@@ -10696,7 +10716,8 @@ impl Interp {
     ) -> Result<(), Abrupt> {
         trace.receiver_shape = self.property_receiver_shape(base);
         if let ValueView::Obj(o) = &(base).view() {
-            if self.try_ic_set(o, key, &v, cache) {
+            // Accessors take the canonical [[Set]], whose trace records them.
+            if let IcSet::Stored = self.try_ic_set::<false>(o, key, &v, cache) {
                 return Ok(());
             }
         }
@@ -10705,9 +10726,47 @@ impl Interp {
         self.finish_assignment_set(name, strict, success)
     }
 
-    /// The `SetProp` inline-cache fast path; `false` means "take the slow path". Writes cache
-    /// own slots only (`depth` 0): an own writable data property wins OrdinarySet regardless of
-    /// the prototype chain.
+    /// OrdinarySetWithOwnDescriptor's accessor case (ECMA-262 §10.1.9.2 steps 3-7) for a store
+    /// whose cache proved that the receiver's [[Set]] reaches the accessor at (`holder`,
+    /// `slot`), with nothing run since: the live [[Set]] is called with the original receiver
+    /// as `this` and the value as its one argument, its result ignored. An accessor without a
+    /// setter makes [[Set]] return false, which PutValue turns into a TypeError in strict code
+    /// (its step 3.e) and a silent no-op in sloppy code.
+    ///
+    /// # Safety
+    /// `holder` must be the `Gc::as_ptr` of an object on `receiver`'s live prototype chain (or
+    /// the receiver itself), proven by the store's cache during this synchronous operation. The
+    /// caller roots `receiver`, which transitively keeps the holder alive for the read.
+    pub(crate) unsafe fn accessor_validated_set(
+        &mut self,
+        holder: usize,
+        slot: u32,
+        name: &str,
+        receiver: &Value,
+        value: Value,
+    ) -> Result<(), Abrupt> {
+        let holder_ref = unsafe { &*(holder as *const std::cell::RefCell<crate::value::Object>) };
+        let setter = {
+            let b = holder_ref.borrow();
+            let property = b.props.property_at(slot as usize);
+            debug_assert!(property.is_some_and(|p| p.accessor()), "a proven accessor");
+            property.and_then(|p| p.setter().cloned())
+        };
+        let Some(setter) = setter else {
+            if self.strict {
+                return Err(self.throw(
+                    "TypeError",
+                    format!(
+                        "cannot set getter-only property '{}'",
+                        crate::value::decode_string_key(name)
+                    ),
+                ));
+            }
+            return Ok(());
+        };
+        self.call_callback(setter, *receiver, &[value]).map(|_| ())
+    }
+
     /// The fused `obj.k += v` fast path (`bytecode::Op::AppendProp`): when the property still
     /// holds the exact string the compound read produced (`lval` — nothing replaced it while the
     /// RHS evaluated), both sides are strings, and the slot is an own writable data property on a
@@ -10754,19 +10813,25 @@ impl Interp {
         Ok(())
     }
 
-    fn try_ic_set(
+    /// The `SetProp` inline-cache fast path: an own writable data property (`depth` 0), which
+    /// wins OrdinarySet regardless of the prototype chain; a creation the cache proved the chain
+    /// allows (`IC_CREATE`); or, with `ACCESSORS`, an accessor the cache proves the receiver's
+    /// [[Set]] reaches (`IC_ACCESSOR`), whose setter the caller calls (a profiled store leaves
+    /// accessors to the canonical [[Set]]). `Miss` means "take the slow path", with nothing
+    /// written.
+    pub(crate) fn try_ic_set<const ACCESSORS: bool>(
         &mut self,
         o: &Gc,
         key: crate::atom::PropKey,
         v: &Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
-    ) -> bool {
+    ) -> IcSet {
         let mut b = o.borrow_mut();
         if !b.exotic.is_ordinary() {
-            return false;
+            return IcSet::Miss;
         }
         if !b.ic_plain.get() {
-            return false;
+            return IcSet::Miss;
         }
         // Shape fast path (own writable data property), every way: a shape match means `slot`
         // still maps `name`; skip the key compare. `accessor`/`writable` are re-checked (an
@@ -10777,7 +10842,7 @@ impl Interp {
                 if let Some(p) = b.props.property_at(st.slot as usize) {
                     if !p.accessor() && p.writable() {
                         b.props.set_value_at(st.slot as usize, *v);
-                        return true;
+                        return IcSet::Stored;
                     }
                 }
             }
@@ -10794,7 +10859,7 @@ impl Interp {
                         if !p.accessor() && p.writable() {
                             b.props.set_value_at(e.st.slot as usize, *v);
                             self.ic_insert(cache, e.st);
-                            return true;
+                            return IcSet::Stored;
                         }
                     }
                 }
@@ -10819,16 +10884,59 @@ impl Interp {
                     if cached_proto == proto_ptr {
                         b.props
                             .append_new(key, Property::plain(*v), st.holder_shape);
-                        return true;
+                        return IcSet::Stored;
                     }
                 }
+            }
+        }
+        // Accessor ways (see `IC_ACCESSOR`), every way: the chain's shapes prove that the
+        // receiver's [[Set]] reaches the accessor the state's holder keeps at its slot.
+        let head = Gc::as_ptr(o);
+        let accessor_ways = if ACCESSORS {
+            crate::bytecode::PROP_IC_WAYS
+        } else {
+            0
+        };
+        for way in 0..accessor_ways {
+            let st = self.ic_way(cache, way).get();
+            if let Some((holder, slot)) = Self::ic_set_accessor_probe(&b, st) {
+                return IcSet::Setter {
+                    holder: holder.unwrap_or(head as usize),
+                    slot,
+                };
             }
         }
         match b.props.slot_of_key(key) {
             Some(slot) => {
                 let p = b.props.property_at(slot).unwrap();
-                if p.accessor() || !p.writable() {
-                    return false; // setter, or non-writable (strict-throw) — slow path
+                if p.accessor() {
+                    if !ACCESSORS {
+                        return IcSet::Miss;
+                    }
+                    // An own accessor: OrdinarySetWithOwnDescriptor calls its setter. The
+                    // receiver's shape proves the slot (shapes encode the descriptor class).
+                    let shape = b.props.shape();
+                    self.ic_insert(
+                        cache,
+                        crate::bytecode::IcState {
+                            depth: crate::bytecode::IC_ACCESSOR,
+                            slot: slot as u32,
+                            recv_shape: shape,
+                            holder_shape: shape,
+                            mid_ok: 0,
+                            mid_shape: 0,
+                            mid2_shape: 0,
+                            mid3_shape: 0,
+                            mid4_shape: 0,
+                        },
+                    );
+                    return IcSet::Setter {
+                        holder: head as usize,
+                        slot: slot as u32,
+                    };
+                }
+                if !p.writable() {
+                    return IcSet::Miss; // non-writable (strict-throw) — slow path
                 }
                 let shape = b.props.shape();
                 b.props.set_value_at(slot, *v);
@@ -10846,10 +10954,127 @@ impl Interp {
                 self.ic_insert(cache, st);
                 // Mirror into the stub cache (see the probe above).
                 self.stub_cache_set(shape, key, st);
-                true
+                IcSet::Stored
             }
-            None => self.try_ic_create(o, b, key, v, cache),
+            None => {
+                if self.try_ic_create(o, b, key, v, cache) {
+                    return IcSet::Stored;
+                }
+                if !ACCESSORS {
+                    return IcSet::Miss;
+                }
+                match self.ic_set_accessor_rederive(o, key, cache) {
+                    Some((holder, slot)) => IcSet::Setter { holder, slot },
+                    None => IcSet::Miss,
+                }
+            }
         }
+    }
+
+    /// One store-cache accessor state's proof (see `IC_ACCESSOR`): the receiver (`b`, ordinary
+    /// and plain, borrowed by the caller) and its live prototype chain still have the state's
+    /// shapes, every hop ordinary and plain, so the receiver's [[Set]] reaches the accessor at
+    /// the state's slot of its holder (OrdinarySet: the first object on the chain with an own
+    /// property of the name; shapes pin each hop's keys and the holder's descriptor class).
+    /// The holder's `Gc::as_ptr` (none for the receiver itself) and the slot.
+    fn ic_set_accessor_probe(
+        b: &Object,
+        st: crate::bytecode::IcState,
+    ) -> Option<(Option<usize>, u32)> {
+        use crate::bytecode::{IC_ACCESSOR, IC_ARR_KEYCHK, IC_MAX_DEPTH};
+        if st.depth >= 0x80 || st.depth & IC_ACCESSOR == 0 || st.depth & IC_ARR_KEYCHK != 0 {
+            return None;
+        }
+        let depth = st.depth & !IC_ACCESSOR;
+        let required_mids = (1u8 << depth.saturating_sub(1).min(7)) - 1;
+        if depth > IC_MAX_DEPTH
+            || st.mid_ok & required_mids != required_mids
+            || b.props.shape() != st.recv_shape
+        {
+            return None;
+        }
+        if depth == 0 {
+            b.props
+                .property_at(st.slot as usize)
+                .filter(|p| p.accessor())?;
+            return Some((None, st.slot));
+        }
+        let mut hop = Gc::as_ptr(b.proto.as_ref()?);
+        let shapes = [st.mid_shape, st.mid2_shape, st.mid3_shape, st.mid4_shape];
+        for &mid in shapes.iter().take(depth as usize - 1) {
+            // SAFETY: every hop is kept alive by the receiver the caller holds, and nothing
+            // mutates the chain during the probe.
+            let mb = unsafe { (*hop).try_borrow().ok()? };
+            if !(mb.exotic.is_ordinary() && mb.ic_plain.get() && mb.props.shape() == mid) {
+                return None;
+            }
+            hop = Gc::as_ptr(mb.proto.as_ref()?);
+        }
+        // SAFETY: as above.
+        let hb = unsafe { (*hop).try_borrow().ok()? };
+        if !(hb.exotic.is_ordinary() && hb.ic_plain.get() && hb.props.shape() == st.holder_shape) {
+            return None;
+        }
+        hb.props
+            .property_at(st.slot as usize)
+            .filter(|p| p.accessor())?;
+        Some((Some(hop as usize), st.slot))
+    }
+
+    /// The store-cache fill for an accessor (see `IC_ACCESSOR`): the receiver's [[Set]] walks
+    /// its chain to the first object with an own property of the name (OrdinarySet step 2,
+    /// OrdinarySetWithOwnDescriptor step 2.c); when that is an accessor and every object up to
+    /// it is ordinary and plain within `IC_MAX_DEPTH` hops, record the state and answer the
+    /// holder's `Gc::as_ptr` and the accessor's slot. Anything else (a data property, a
+    /// Proxy or any exotic or side-table object on the way, a deeper chain) is the generic
+    /// [[Set]]'s.
+    fn ic_set_accessor_rederive(
+        &self,
+        o: &Gc,
+        key: crate::atom::PropKey,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> Option<(usize, u32)> {
+        use crate::bytecode::{IcState, IC_ACCESSOR, IC_MAX_DEPTH};
+        let mut cur = Gc::as_ptr(o);
+        let mut recv_shape = 0;
+        let mut mids = [0u32; 4];
+        for depth in 0..=IC_MAX_DEPTH {
+            // SAFETY: every object on the chain is kept alive by `o`, and nothing mutates the
+            // chain during the walk.
+            let b = unsafe { (*cur).try_borrow().ok()? };
+            if !(b.exotic.is_ordinary() && b.ic_plain.get()) {
+                return None;
+            }
+            if depth == 0 {
+                recv_shape = b.props.shape();
+            }
+            if let Some(slot) = b.props.slot_of_key(key) {
+                if !b.props.property_at(slot)?.accessor() {
+                    return None;
+                }
+                self.ic_insert(
+                    cache,
+                    IcState {
+                        depth: IC_ACCESSOR | depth,
+                        slot: slot as u32,
+                        recv_shape,
+                        holder_shape: b.props.shape(),
+                        // Every hop below the holder is ordinary and plain.
+                        mid_ok: (1u8 << depth.saturating_sub(1)) - 1,
+                        mid_shape: mids[0],
+                        mid2_shape: mids[1],
+                        mid3_shape: mids[2],
+                        mid4_shape: mids[3],
+                    },
+                );
+                return Some((cur as usize, slot as u32));
+            }
+            if (1..=4).contains(&depth) {
+                mids[depth as usize - 1] = b.props.shape();
+            }
+            cur = Gc::as_ptr(b.proto.as_ref()?);
+        }
+        None
     }
 
     /// Property *creation* through the set IC (see [`crate::bytecode::IC_CREATE`]): the hot

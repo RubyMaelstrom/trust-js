@@ -83,17 +83,23 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
         .computed_reads
         .lookup(computed.as_ptr() as usize, SHAPE_UNCACHEABLE)
         .is_none());
-    assert!(i.try_ic_set(
-        &first,
-        crate::atom::PropKey::from_text(&key),
-        &Value::Num(11.0),
-        &cache[0]
+    assert!(matches!(
+        i.try_ic_set::<true>(
+            &first,
+            crate::atom::PropKey::from_text(&key),
+            &Value::Num(11.0),
+            &cache[0]
+        ),
+        crate::interpreter::IcSet::Stored
     ));
-    assert!(i.try_ic_set(
-        &second,
-        crate::atom::PropKey::from_text(&key),
-        &Value::Num(13.0),
-        &cache[0]
+    assert!(matches!(
+        i.try_ic_set::<true>(
+            &second,
+            crate::atom::PropKey::from_text(&key),
+            &Value::Num(13.0),
+            &cache[0]
+        ),
+        crate::interpreter::IcSet::Stored
     ));
     assert!(cache.iter().all(|way| way.get().depth == IC_EMPTY));
     assert!(matches!(
