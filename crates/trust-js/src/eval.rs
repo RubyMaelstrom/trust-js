@@ -1284,7 +1284,19 @@ impl Interp {
         env: &Env,
         labels: &[&str],
     ) -> Completion {
-        let loop_env = new_scope(Some(*env));
+        // A head that declares nothing block-scoped needs no record of its own (as compiled code
+        // makes none): nothing would bind in it.
+        let loop_env = if matches!(
+            init.as_deref(),
+            Some(ForInit::VarDecl {
+                kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
+                ..
+            })
+        ) {
+            new_scope(Some(*env))
+        } else {
+            *env
+        };
         // A `for (using x = r; …)` head is a disposal boundary: its resources are disposed once,
         // when the whole loop completes (normally or abruptly).
         let dispose_async = match init.as_deref() {
@@ -1492,6 +1504,12 @@ impl Interp {
         } else {
             self.eval(right, env)?
         };
+        // Only a lexical head binds in each round's record: a `var` or assignment head's
+        // round needs none (as compiled code makes none).
+        let lexical_head = matches!(
+            decl,
+            Some(DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing)
+        );
         // No-decl form assigns to an existing binding; a declaration creates a fresh one per round.
         let mode = match decl {
             Some(DeclKind::Var) | None => BindMode::Var,
@@ -1582,7 +1600,11 @@ impl Interp {
                     return Ok(LoopStep::Done(Value::Empty));
                 }
                 step_failed = false;
-                let iter_env = new_scope(Some(*env));
+                let iter_env = if lexical_head {
+                    new_scope(Some(*env))
+                } else {
+                    *env
+                };
                 let bv = me.for_of_iteration(left, v, mode, body, &iter_env, dispose)?;
                 Ok(LoopStep::Continue(bv))
             });
@@ -1631,7 +1653,11 @@ impl Interp {
                     }
                 };
                 step_failed = false;
-                let iter_env = new_scope(Some(*env));
+                let iter_env = if lexical_head {
+                    new_scope(Some(*env))
+                } else {
+                    *env
+                };
                 let bv = me.for_of_iteration(left, v, mode, body, &iter_env, dispose)?;
                 Ok(LoopStep::Continue(bv))
             });
@@ -1685,7 +1711,11 @@ impl Interp {
                     _ => v,
                 };
             };
-            let iter_env = new_scope(Some(*env));
+            let iter_env = if lexical_head {
+                new_scope(Some(*env))
+            } else {
+                *env
+            };
             me.bind_pattern(left, v, &iter_env, mode)?;
             let bv = me.exec_stmt(body, &iter_env)?;
             Ok(LoopStep::Continue(bv))
@@ -2379,12 +2409,18 @@ impl Interp {
                     // The catch parameter lives in its own environment (flagged so a sloppy `eval`'s
                     // var-hoisting walk skips it); the body's lexicals + statements run in a child
                     // block environment.
-                    let body_env = if let Some(pat) = param {
+                    let outer = if let Some(pat) = param {
                         let catch_env = new_catch_scope(*env);
                         self.bind_pattern(pat, ex, &catch_env, BindMode::Lexical(false))?;
-                        new_scope(Some(catch_env))
+                        catch_env
                     } else {
-                        new_scope(Some(*env))
+                        *env
+                    };
+                    // A block that declares nothing block-scoped needs no record of its own.
+                    let body_env = if body.iter().any(block_declares_lexical) {
+                        new_scope(Some(outer))
+                    } else {
+                        outer
                     };
                     let mut v = Value::Empty;
                     let mut last = Ok(Value::Empty);
@@ -2450,7 +2486,15 @@ impl Interp {
 
     fn exec_switch(&mut self, disc: &Expr, cases: &[SwitchCase], env: &Env) -> Completion {
         let d = self.eval(disc, env)?;
-        let scope = new_scope(Some(*env));
+        // Cases that declare nothing block-scoped need no record of their own, as for a block.
+        let scope = if cases
+            .iter()
+            .any(|case| case.body.iter().any(block_declares_lexical))
+        {
+            new_scope(Some(*env))
+        } else {
+            *env
+        };
         for case in cases {
             for s in &case.body {
                 self.declare_block_lexicals(std::slice::from_ref(s), &scope, true);

@@ -4010,8 +4010,7 @@ struct CaptureScan {
     /// Classes entered (their records enclose their members).
     class_depth: u32,
     /// Statements entered whose evaluation the tree-walker gives a record of its own, whether
-    /// or not they declare anything: `for` heads and iterations, `catch` clauses, `switch`
-    /// blocks, an `if`'s bare function declaration (Annex B.3.4).
+    /// or not they declare anything: an `if`'s bare function declaration (Annex B.3.4).
     record_depth: u32,
     /// The next inner function is an object literal's method, getter or setter.
     home_member: bool,
@@ -4838,10 +4837,11 @@ impl CaptureScan {
         if crate::interpreter::ast_stack_low() {
             return crate::interpreter::with_ast_stack(|| self.stmt(s));
         }
-        // The tree-walker evaluates these under a record of their own, which compiled code may
-        // not make: an inner function there is behind a barrier (Decision 21's plan).
+        // The tree-walker evaluates an `if`'s bare function declaration (Annex B.3.4) under a
+        // record of its own, which compiled code may not make: an inner function there is
+        // behind a barrier (Decision 21's plan). Loops, `switch` and `catch` make records only
+        // where they declare something, which the scopes below record.
         let own_record = match s {
-            Stmt::For { .. } | Stmt::ForInOf { .. } | Stmt::Switch { .. } => true,
             Stmt::If { cons, alt, .. } => {
                 let bare_function = |s: &Stmt| {
                     let mut s = s;
@@ -4997,11 +4997,7 @@ impl CaptureScan {
             } => {
                 self.block(block)?;
                 if let Some((param, body)) = handler {
-                    // A `catch` clause's records (its parameter's and its block's).
-                    self.record_depth += 1;
-                    let caught = self.catch_clause(param.as_ref(), body);
-                    self.record_depth -= 1;
-                    caught?;
+                    self.catch_clause(param.as_ref(), body)?;
                 }
                 if let Some(f) = finalizer {
                     self.block(f)?;
@@ -5053,7 +5049,7 @@ impl CaptureScan {
             } else if self.with_depth > 0 {
                 Some("with")
             } else if self.record_depth > 0 {
-                Some("loop, switch or catch")
+                Some("bare function declaration")
             } else if self
                 .scopes
                 .iter()
