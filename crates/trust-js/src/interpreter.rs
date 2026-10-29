@@ -3913,6 +3913,34 @@ pub fn new_var_scope(parent: Option<Env>) -> Env {
 }
 
 /// [`new_var_scope`] with room for `capacity` bindings in its cell.
+/// A tree-walked function's activation as its plan describes it (Decision 21,
+/// `bytecode::scope_plan`): a public plan's in place with the plan's bindings first, which
+/// FunctionDeclarationInstantiation then initializes where they are (`VarMap::insert` keeps a
+/// slot); a private plan's marked private; an opaque plan's as the tree-walker always made it.
+fn planned_activation(plan: &crate::bytecode::scope_plan::FunctionPlan, closure: Env) -> Env {
+    match plan.kind {
+        crate::bytecode::scope_plan::PlanKind::Public => {
+            let scope = new_var_scope_with_capacity(Some(closure), plan.capacity);
+            {
+                let mut record = scope.borrow_mut();
+                for binding in plan.prefix.iter() {
+                    record.vars.insert(
+                        &*binding.name,
+                        Binding::data(Value::Undefined, true, !binding.lexical),
+                    );
+                }
+            }
+            scope
+        }
+        crate::bytecode::scope_plan::PlanKind::Private => {
+            let scope = new_var_scope(Some(closure));
+            scope.borrow_mut().set_private_record();
+            scope
+        }
+        crate::bytecode::scope_plan::PlanKind::Opaque => new_var_scope(Some(closure)),
+    }
+}
+
 /// The [[Environment]] of a closure made in `env`: the nearest record that is not private (see
 /// [`Scope::private_record`]). A private record holds no binding an inner function names, so the
 /// closure resolves every name as it would through it, and its records are those every tier
@@ -16932,38 +16960,22 @@ impl Interp {
         // gives its inner functions their outer contexts.
         let derived = fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
         let plan = func.scope_plan(derived);
-        let scope = if has_param_exprs {
+        // Decision 21: a parameter list whose expressions leave its separate record unobservable
+        // (`bytecode::parameter_expressions_safe`) runs in a record of its own, whose bindings then
+        // move into the activation the plan describes: one record, as the compiled tiers make it.
+        let planned_params =
+            has_param_exprs && plan.kind != crate::bytecode::scope_plan::PlanKind::Opaque;
+        let split_params = has_param_exprs && !planned_params;
+        let scope = if split_params {
             // Chain: callee base (variable env) → parameter env → body variable env. A direct `eval`
             // in a parameter default hoists its `var`s into the callee base, not the enclosing
             // scope, and its walk passes through the parameter env (where `arguments`/params live).
             let callee_base = new_var_scope(Some(closure));
             new_scope(Some(callee_base))
+        } else if planned_params {
+            new_scope(Some(closure))
         } else {
-            // Decision 21: the activation the function's plan describes, as the compiled tiers
-            // make it (`bytecode::scope_plan`).
-            match plan.kind {
-                crate::bytecode::scope_plan::PlanKind::Public => {
-                    // In place and with the plan's bindings first: FunctionDeclarationInstantiation
-                    // then initializes each where it is (`VarMap::insert` keeps a slot).
-                    let scope = new_var_scope_with_capacity(Some(closure), plan.capacity);
-                    {
-                        let mut record = scope.borrow_mut();
-                        for binding in plan.prefix.iter() {
-                            record.vars.insert(
-                                &*binding.name,
-                                Binding::data(Value::Undefined, true, !binding.lexical),
-                            );
-                        }
-                    }
-                    scope
-                }
-                crate::bytecode::scope_plan::PlanKind::Private => {
-                    let scope = new_var_scope(Some(closure));
-                    scope.borrow_mut().set_private_record();
-                    scope
-                }
-                crate::bytecode::scope_plan::PlanKind::Opaque => new_var_scope(Some(closure)),
-            }
+            planned_activation(plan, closure)
         };
 
         // `new.target`: an ordinary call clears it, a construct installs the pending target; an arrow
@@ -17067,12 +17079,25 @@ impl Interp {
 
         // With parameter expressions, the body runs in a fresh variable environment below the
         // parameter scope; a `var` sharing a parameter's name starts with that parameter's value.
-        let body = if has_param_exprs {
+        let body = if split_params {
             new_var_scope(Some(scope))
+        } else if planned_params {
+            // The parameter list's bindings (with `this` and `arguments`) move into the planned
+            // activation, which closes over the function's environment directly: nothing in the
+            // list could observe the record it ran in.
+            let body = planned_activation(plan, closure);
+            {
+                let list = scope.borrow();
+                let mut record = body.borrow_mut();
+                for (name, binding) in list.vars.iter() {
+                    record.vars.insert(name, binding.to_binding());
+                }
+            }
+            body
         } else {
             scope
         };
-        let param_seed = if has_param_exprs { Some(scope) } else { None };
+        let param_seed = if split_params { Some(scope) } else { None };
 
         let saved_strict = self.strict;
         self.strict = func.is_strict;
@@ -17133,7 +17158,7 @@ impl Interp {
         // Sharing applies before tier-up as well as to prepared compiled bodies.
         if cold_environment_layouts_enabled() && !body.borrow().under_with() {
             let layouts = func.env_layouts.get_or_init(Box::default);
-            if has_param_exprs {
+            if split_params {
                 scope.borrow_mut().vars.share_layout(&layouts[0]);
             }
             body.borrow_mut().vars.share_layout(&layouts[1]);

@@ -7969,12 +7969,17 @@ fn compile_inner_mode(
         && !derived_constructor
     {
         let entry_depth = if prepared_entry {
-            // FunctionDeclarationInstantiation's records: the body's, then the parameters' two.
-            Some(if crate::interpreter::params_have_expr(&func.params) {
-                3
-            } else {
-                1
-            })
+            // FunctionDeclarationInstantiation's records: the body's, then, for a parameter list
+            // whose separate records stay (an opaque plan's), the parameters' two.
+            Some(
+                if crate::interpreter::params_have_expr(&func.params)
+                    && func.scope_plan(derived_constructor).kind == scope_plan::PlanKind::Opaque
+                {
+                    3
+                } else {
+                    1
+                },
+            )
         } else if !c.reuse_activation {
             let makes_env =
                 !c.cap_inits.is_empty() || (c.env_this && !c.lexical_this) || c.env_arguments;
@@ -9628,6 +9633,42 @@ fn pattern_exprs_safe(pattern: &Pattern, banned: &crate::fasthash::FastSet<&str>
             ArrayPatElem::Rest(pattern) => pattern_exprs_safe(pattern, banned),
         }),
     }
+}
+
+/// Decision 21: whether a parameter list's expressions leave its separate parameter record
+/// unobservable, as the fresh compiled entry admits it: no closure in them, no destructuring rest
+/// or `arguments` pattern, and nothing that reads a later parameter (`default_expr_safe`,
+/// `pattern_exprs_safe`). The function's activation is then one record in every tier: the
+/// tree-walker evaluates the list in a record of its own and moves its bindings into the
+/// activation (`Interp::call_user_inner`).
+pub(crate) fn parameter_expressions_safe(func: &Function) -> bool {
+    let bound: Vec<Vec<String>> = func
+        .params
+        .iter()
+        .map(|param| {
+            let mut names = Vec::new();
+            crate::interpreter::pattern_idents(&param.pattern, &mut names);
+            names
+        })
+        .collect();
+    func.params.iter().enumerate().all(|(k, param)| {
+        let banned: crate::fasthash::FastSet<&str> =
+            bound[k..].iter().flatten().map(String::as_str).collect();
+        let default_safe = param
+            .default
+            .as_ref()
+            .is_none_or(|default| default_expr_safe(default, &banned));
+        match &param.pattern {
+            Pattern::Ident(_) => default_safe,
+            pattern @ (Pattern::Object(_) | Pattern::Array(_)) => {
+                !param.rest
+                    && default_safe
+                    && pattern_exprs_safe(pattern, &banned)
+                    && !bound[k].iter().any(|name| name == "arguments")
+            }
+            Pattern::Member(_) => false,
+        }
+    })
 }
 
 fn default_expr_safe(e: &Expr, banned: &crate::fasthash::FastSet<&str>) -> bool {

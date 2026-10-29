@@ -191,7 +191,9 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
     };
     let opaque = if derived {
         Some("derived constructor")
-    } else if crate::interpreter::params_have_expr(&function.params) {
+    } else if crate::interpreter::params_have_expr(&function.params)
+        && !parameter_expressions_safe(function)
+    {
         Some("parameter expressions")
     } else if function.scan_flags() & (crate::ast::SCAN_NEW_TARGET | crate::ast::SCAN_HOME) != 0 {
         // `new.target` and `super` (a derived constructor's `super()` among them) are found by
