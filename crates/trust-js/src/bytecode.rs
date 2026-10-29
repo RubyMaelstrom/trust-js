@@ -1084,10 +1084,10 @@ pub const INTRINSIC_REFLECT_APPLY: u8 = 18;
 pub const INTRINSIC_DATAVIEW_GET: u8 = 19;
 pub const INTRINSIC_DATAVIEW_SET: u8 = 20;
 /// A native without a call template whose algorithm runs no author code for any receiver and
-/// arguments, makes no tail call and reaches no safepoint (Array.isArray, Object.is, Number's
-/// predicates, Boolean called as a function), as its realm's setup declares it
-/// (`builtins::declare_light`). Calls the call cache proves reach it run on the caller's operand
-/// window without the native-call boundary ([`crate::interpreter::Interp::call_native_light`]).
+/// arguments, makes no tail call and reaches no safepoint (Number's predicates, Boolean called as
+/// a function), as its realm's setup declares it (`builtins::declare_light`). Calls the call
+/// cache proves reach it run on the caller's operand window without the native-call boundary
+/// ([`crate::interpreter::Interp::call_native_light`]).
 pub const INTRINSIC_LIGHT: u8 = 21;
 /// [`INTRINSIC_LIGHT`] when every argument is a primitive; the receiver is not read (parseInt,
 /// parseFloat, isFinite, Number and String called as functions, String.fromCodePoint).
@@ -1095,6 +1095,15 @@ pub const INTRINSIC_LIGHT_PRIMITIVE_ARGS: u8 = 22;
 /// [`INTRINSIC_LIGHT`] when the receiver and every argument are primitives (String.prototype's
 /// methods that look up no @@-method: indexOf, includes, substring, trim and the like).
 pub const INTRINSIC_LIGHT_PRIMITIVE: u8 = 23;
+/// `Array.isArray` (ECMA-262 IsArray, spec.html:5878 at e28783d5), light as [`INTRINSIC_LIGHT`]:
+/// its realm's setup declares it with this id (W3's item 2c). The call template answers a
+/// non-object, an Array and an object outside every side table in line; any other object (a
+/// Proxy, whose target IsArray reads, or which throws when revoked) takes the hit helper.
+pub const INTRINSIC_ARRAY_IS_ARRAY: u8 = 24;
+/// `Object.is` (ECMA-262 SameValue, spec.html:6008), light as [`INTRINSIC_LIGHT`] and declared
+/// like [`INTRINSIC_ARRAY_IS_ARRAY`]. The call template answers in line unless both operands
+/// are Strings of equal length or both BigInts, whose contents the native compares.
+pub const INTRINSIC_OBJECT_IS: u8 = 25;
 
 /// Math numeric functions the call template finishes inline (a Number argument list, no
 /// coercion): ECMA-262 §21.3.2.16 floor, .10 ceil, .35 trunc, .1 abs, .17 fround, .11 clz32
@@ -23243,7 +23252,10 @@ pub(crate) unsafe fn native_light_operands(
 ) -> bool {
     let primitive_arguments = || (0..argc).all(|k| unsafe { (*args.add(k)).is_primitive() });
     match intrinsic {
-        INTRINSIC_OPERAND_ONLY | INTRINSIC_LIGHT => true,
+        INTRINSIC_OPERAND_ONLY
+        | INTRINSIC_LIGHT
+        | INTRINSIC_ARRAY_IS_ARRAY
+        | INTRINSIC_OBJECT_IS => true,
         INTRINSIC_NUMERIC_ONLY
         | INTRINSIC_MATH_SQRT
         | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
@@ -23311,7 +23323,10 @@ pub(crate) unsafe fn native_entry_class(
     };
     match intrinsic {
         INTRINSIC_FUNCTION_CALL | INTRINSIC_FUNCTION_APPLY => NativeEntryClass::Forward,
-        INTRINSIC_OPERAND_ONLY | INTRINSIC_LIGHT => NativeEntryClass::Light,
+        INTRINSIC_OPERAND_ONLY
+        | INTRINSIC_LIGHT
+        | INTRINSIC_ARRAY_IS_ARRAY
+        | INTRINSIC_OBJECT_IS => NativeEntryClass::Light,
         INTRINSIC_NUMERIC_ONLY
         | INTRINSIC_MATH_SQRT
         | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {

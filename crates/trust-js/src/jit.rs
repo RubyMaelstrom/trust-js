@@ -2391,6 +2391,7 @@ mod shared_stub_tests {
                 );
             }
             keys.push(SharedStub::CallSecondary.key());
+            keys.push(SharedStub::PlainIsArray.key());
             for argc in [0u8, 1, 8, 64] {
                 for with_this in [false, true] {
                     keys.push(SharedStub::DirectCall { argc, with_this }.key());
@@ -7892,6 +7893,19 @@ fn emit_call_inline_marked(
                 }
                 a.bind(no_intr);
             }
+            // Array.isArray at a plain call (`const isArray = Array.isArray`, Vue's `j(e)`; W3's
+            // item 2c): a native entry declines the direct sequence at its first gate, and there,
+            // before the H_CALL_HIT form, the site tests for the template, so that a user callee
+            // taking the sequence pays nothing for it. The shared direct-call stub makes the test
+            // itself; elsewhere a shared stub of its own does, even in a loop, since few plain
+            // calls reach it.
+            let plain_is_array = !with_this && *argc == 1 && layout.valid;
+            let mut is_array_here = plain_is_array;
+            let native_hit = if plain_is_array {
+                a.new_label()
+            } else {
+                hit_slow
+            };
             a.bind(ordinary_hit);
             // Direct shared-ctx call: its own gate misses land on `hit_slow` =
             // the H_CALL_HIT form below.
@@ -7930,7 +7944,9 @@ fn emit_call_inline_marked(
                     a.bind(not_returned);
                     a.cmp_imm_w(8, DIRECT_CALL_THREW);
                     a.b_cond(C_EQ, l_unwind);
-                    // A declined gate falls through to the H_CALL_HIT form below.
+                    // A declined gate falls through to the H_CALL_HIT form below, after the
+                    // stub tried the plain Array.isArray template (`direct_stub_is_array`).
+                    is_array_here = false;
                 } else {
                     emit_direct_call(
                         a,
@@ -7941,12 +7957,30 @@ fn emit_call_inline_marked(
                         retry_off,
                         argc,
                         with_this,
-                        hit_slow,
+                        native_hit,
                         l_unwind,
                         done,
                         l_direct_finish,
                         DirectCallSite::Position(chunk.call_position(*c)),
                     );
+                }
+            }
+            if plain_is_array {
+                a.bind(native_hit);
+                if is_array_here {
+                    if shared_stubs_enabled() {
+                        // A user callee that declined the sequence (intrinsic id zero) goes on
+                        // to the H_CALL_HIT form after two instructions; only natives call the
+                        // stub.
+                        a.ldrb_imm(9, 12, 96);
+                        a.cbz(9, false, hit_slow);
+                        let stub = a.shared_stub(SharedStub::PlainIsArray.key());
+                        a.bl_label(stub);
+                        const _: () = assert!(INTRINSIC_DONE == 0);
+                        a.cbz(9, false, done);
+                    } else {
+                        emit_plain_is_array(a, layout, hit_slow, done);
+                    }
                 }
             }
             a.bind(hit_slow);
@@ -8122,6 +8156,200 @@ fn emit_math_intrinsic(
     a.b(done);
 }
 
+/// Split an intrinsic dispatch by the id in w9 (W3's item 2c): the templates of the String,
+/// Number and Array methods have ids below the native classes (`INTRINSIC_OPERAND_ONLY` through
+/// `INTRINSIC_LIGHT_PRIMITIVE`: the collections' methods, numeric-only natives, Reflect.apply,
+/// DataView's accessors and item 2a's light natives) and fall through; the classes and item 2c's
+/// Array.isArray and Object.is, above them, branch to `high`, where a class, which no arm
+/// serves, leaves after one more compare instead of every arm's. Math's ids, above both, and the
+/// most frequent calls' (the String accessors at one argument, slice at two) are dispatched
+/// before the split, so that their cost stays what it was. Clobbers NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_intrinsic_range_split(a: &mut asm::Asm, high: usize) {
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_OPERAND_ONLY as u32);
+    a.b_cond(C_HS, high);
+}
+
+// The ids [`emit_intrinsic_range_split`] separates: the low arms' below the native classes, the
+// classes', Array.isArray's and Object.is's above them and below Math's.
+const _: () = {
+    use crate::bytecode::*;
+    let low = [
+        INTRINSIC_CHAR_CODE_AT,
+        INTRINSIC_STRING_SLICE,
+        INTRINSIC_OBJECT_HAS_OWN,
+        INTRINSIC_FUNCTION_APPLY,
+        INTRINSIC_MATH_SQRT,
+        INTRINSIC_ARRAY_PUSH,
+        INTRINSIC_REGEXP_EXEC_DISCARD,
+        INTRINSIC_STRING_REPLACE_DISCARD,
+        INTRINSIC_STRING_SPLIT_DISCARD,
+        INTRINSIC_CHAR_AT,
+        INTRINSIC_CODE_POINT_AT,
+        INTRINSIC_IS_NAN,
+        INTRINSIC_FROM_CHAR_CODE,
+    ];
+    let mut k = 0;
+    while k < low.len() {
+        assert!(low[k] < INTRINSIC_OPERAND_ONLY);
+        k += 1;
+    }
+    assert!(INTRINSIC_OPERAND_ONLY < INTRINSIC_LIGHT_PRIMITIVE);
+    assert!(INTRINSIC_ARRAY_IS_ARRAY > INTRINSIC_LIGHT_PRIMITIVE);
+    assert!(INTRINSIC_OBJECT_IS > INTRINSIC_LIGHT_PRIMITIVE);
+    assert!(INTRINSIC_MATH_FIRST > INTRINSIC_OBJECT_IS);
+};
+
+/// Array.isArray(arg) in line (ECMA-262 IsArray, spec.html:5878 at e28783d5) at a call-cache hit
+/// that proved the builtin (W3's item 2c): `arg` is the top operand, and the Boolean replaces
+/// the operand `result_off` bytes below the top, `pop` more bytes popped (the receiver, at a
+/// method call; the callee, at a plain call). A non-object is not an Array, an Array exotic
+/// object is, and any other object outside every side table is not (`Object::ic_plain`: a
+/// Proxy is always in one); any other object (a Proxy, whose target IsArray reads and which
+/// throws when revoked, a typed array, a module namespace) branches to `hit_slow` with nothing
+/// written, where the native decides. Clobbers x9, x11, x14 and x16; preserves x10, x12 and x15.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_is_array_template(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    result_off: i32,
+    pop: u32,
+    hit_slow: usize,
+    done: usize,
+) {
+    let array = a.new_label();
+    let not_array = a.new_label();
+    let commit = a.new_label();
+    emit_exec_word_load(a, 9, 20, -8);
+    // x11 = the word EOR the Object tag: an Object's cell, and for any other kind a word with
+    // bits above the payload.
+    a.mov_imm64(16, crate::value::PACK_OBJ);
+    a.logic_x(2, 11, 9, 16);
+    a.lsr_imm(16, 11, 48);
+    a.cbnz(16, true, not_array);
+    a.add_imm(11, 11, layout.obj_from_cell as u32);
+    a.ldrb_imm(14, 11, layout.obj_exotic as u32);
+    a.cmp_imm_w(14, layout.exotic_array_tag as u32);
+    a.b_cond(C_EQ, array);
+    a.ldrb_imm(14, 11, layout.obj_ic_plain as u32);
+    a.cbz(14, false, hit_slow);
+    a.bind(not_array);
+    a.movz(9, 0, 0);
+    a.b(commit);
+    a.bind(array);
+    a.movz(9, 1, 0);
+    // ---- commit: the Boolean over the result slot ----
+    a.bind(commit);
+    a.mov_imm64(16, crate::value::PACK_BOOL);
+    a.logic_x(1, 9, 9, 16);
+    emit_exec_word_store(a, 9, 20, result_off);
+    a.sub_imm(20, 20, pop);
+    #[cfg(test)]
+    regions::emit_lowering_event(a, record_call_template as *const () as u64);
+    a.b(done);
+}
+
+/// Array.isArray at a plain one-argument call (`[callee, arg]`) whose call-cache hit declined the
+/// direct sequence (x12 = the hit way): the template when the way's native is Array.isArray, the
+/// Boolean over the callee; any other entry, or an operand the template declines, branches to
+/// `declined` with x10, x12 and x15 kept. See [`emit_is_array_template`].
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_plain_is_array(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    declined: usize,
+    done: usize,
+) {
+    a.ldrb_imm(9, 12, 96);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_IS_ARRAY as u32);
+    a.b_cond(C_NE, declined);
+    emit_is_array_template(a, layout, -16, 8, declined, done);
+}
+
+/// Object.is(a, b) in line (ECMA-262 SameValue, spec.html:6008 at e28783d5) at a
+/// `CallWithThis(2)` hit that proved the builtin (W3's item 2c); the Boolean replaces the
+/// receiver. Every Number word is canonical (one NaN), so equal words are the same value, and
+/// words that differ are different values unless both are Strings or both BigInts: they differ
+/// in kind (no Number word carries a tag), as Numbers (+0 and -0 differ; NaN is one word), as
+/// Booleans, or by identity (Objects and Symbols, SameValueNonNumber, :6052). Strings of
+/// different lengths differ; Strings of equal length and BigInts branch to `hit_slow` with
+/// nothing written, where the native compares their contents. Clobbers x9, x13, x14, x16 and
+/// x17; preserves x10, x12 and x15.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_object_is_template(a: &mut asm::Asm, hit_slow: usize, done: usize) {
+    let same = a.new_label();
+    let different = a.new_label();
+    let strings = a.new_label();
+    let commit = a.new_label();
+    emit_exec_word_load(a, 13, 20, -16);
+    emit_exec_word_load(a, 14, 20, -8);
+    a.cmp_reg_x(13, 14);
+    a.b_cond(C_EQ, same);
+    a.logic_x(2, 16, 13, 14);
+    a.lsr_imm(16, 16, 48);
+    a.cbnz(16, true, different);
+    a.lsr_imm(16, 13, 48);
+    a.movz(17, (crate::value::PACK_STR >> 48) as u32, 0);
+    a.cmp_reg_w(16, 17);
+    a.b_cond(C_EQ, strings);
+    a.movz(17, (crate::value::PACK_BIGINT >> 48) as u32, 0);
+    a.cmp_reg_w(16, 17);
+    a.b_cond(C_EQ, hit_slow);
+    a.b(different);
+    a.bind(strings);
+    emit_exec_payload(a, 13, 13);
+    emit_exec_payload(a, 14, 14);
+    a.ldr_w_imm(16, 13, crate::lstr::LEN_OFF as u32);
+    a.ldr_w_imm(17, 14, crate::lstr::LEN_OFF as u32);
+    a.cmp_reg_w(16, 17);
+    a.b_cond(C_EQ, hit_slow);
+    a.bind(different);
+    a.movz(9, 0, 0);
+    a.b(commit);
+    a.bind(same);
+    a.movz(9, 1, 0);
+    // ---- commit: the Boolean over the receiver slot ----
+    a.bind(commit);
+    a.mov_imm64(16, crate::value::PACK_BOOL);
+    a.logic_x(1, 9, 9, 16);
+    emit_exec_word_store(a, 9, 20, -32);
+    a.sub_imm(20, 20, 24);
+    #[cfg(test)]
+    regions::emit_lowering_event(a, record_call_template as *const () as u64);
+    a.b(done);
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+thread_local! {
+    /// Calls item 2c's in-line templates (Array.isArray and Object.is) finished, for tests.
+    pub(crate) static TEST_CALL_TEMPLATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+extern "C" fn record_call_template() {
+    TEST_CALL_TEMPLATES.with(|count| count.set(count.get() + 1));
+}
+
 /// Where an intrinsic block finds its call site's bytecode pc for the helper's operand word:
 /// an immediate in the site's own code, or w8 in the chunk's shared intrinsic stub.
 #[derive(Clone, Copy)]
@@ -8170,6 +8398,7 @@ fn emit_call_intrinsics1(
     let sqrt = a.new_label();
     let is_nan = a.new_label();
     let from_char_code = a.new_label();
+    let is_array = a.new_label();
     let regexp_exec = discard.then(|| a.new_label());
     let string_split = discard.then(|| a.new_label());
     let array_push = array_push.then(|| a.new_label());
@@ -8187,6 +8416,8 @@ fn emit_call_intrinsics1(
     a.b_cond(C_EQ, char_code);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CODE_POINT_AT as u32);
     a.b_cond(C_EQ, code_point);
+    let high = a.new_label();
+    emit_intrinsic_range_split(a, high);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_MATH_SQRT as u32);
     a.b_cond(C_EQ, sqrt);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_IS_NAN as u32);
@@ -8205,6 +8436,10 @@ fn emit_call_intrinsics1(
         a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32);
         a.b_cond(C_EQ, string_split);
     }
+    a.b(no_intr);
+    a.bind(high);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_IS_ARRAY as u32);
+    a.b_cond(C_EQ, is_array);
     a.b(no_intr);
 
     // String#charAt(number): exact builtin identity is already proven.
@@ -8321,6 +8556,10 @@ fn emit_call_intrinsics1(
     a.cbnz(1, false, l_unwind);
     a.b(done);
 
+    // Array.isArray(arg) as a method: the result replaces the receiver (W3's item 2c).
+    a.bind(is_array);
+    emit_is_array_template(a, layout, -24, 16, hit_slow, done);
+
     // Math.sqrt(number): the call IC already proved builtin identity.
     // All receiver kinds are accepted by the exact builtin.
     a.bind(math1);
@@ -8420,6 +8659,7 @@ fn emit_call_intrinsics2(
     let slice = a.new_label();
     let has_own = a.new_label();
     let apply = a.new_label();
+    let object_is = a.new_label();
     let replace = discard.then(|| a.new_label());
     a.ldrb_imm(9, 12, 96);
     let math2 = a.new_label();
@@ -8431,6 +8671,8 @@ fn emit_call_intrinsics2(
     a.b_cond(C_LO, math2);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SLICE as u32);
     a.b_cond(C_EQ, slice);
+    let high = a.new_label();
+    emit_intrinsic_range_split(a, high);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32);
     a.b_cond(C_EQ, has_own);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32);
@@ -8440,9 +8682,17 @@ fn emit_call_intrinsics2(
         a.b_cond(C_EQ, replace);
     }
     a.b(no_intr);
+    a.bind(high);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_OBJECT_IS as u32);
+    a.b_cond(C_EQ, object_is);
+    a.b(no_intr);
 
     a.bind(math2);
     emit_math_intrinsic(a, layout, 2, no_intr, hit_slow, done);
+
+    // Object.is(a, b): the result replaces the receiver (W3's item 2c).
+    a.bind(object_is);
+    emit_object_is_template(a, hit_slow, done);
 
     // ASCII String#slice(start, end), both bounds already Numbers: no
     // user code or exotic conversion can run in the dedicated helper.
@@ -12139,6 +12389,15 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     Intrinsics2 { discard: bool },
+    /// [`emit_plain_is_array`] at a plain one-argument call site whose hit declined the direct
+    /// sequence (x12 = the hit way) → w9 = `INTRINSIC_DONE`, or `INTRINSIC_DECLINED` with
+    /// x10/x12/x15 kept for the site's H_CALL_HIT form. A leaf: it calls nothing, so it needs no
+    /// frame.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    PlainIsArray,
     /// [`typed_array::emit_access`]: x11 = a typed array Object, x9 = its exact unsigned index
     /// (and d1 the Number to store) → w13 = 1 once the element is read (x12 = packed Number,
     /// d1 = value) or written, 0 when the access is declined before anything is written.
@@ -12237,6 +12496,7 @@ impl SharedStub {
     const TYPED_ELEMENT: u32 = 0x900;
     const NAME_ELEMENT: u32 = 0xa00;
     const DIRECT_CONSTRUCT: u32 = 0xb00;
+    const PLAIN_IS_ARRAY: u32 = 0xc00;
 
     fn key(self) -> u32 {
         match self {
@@ -12291,6 +12551,11 @@ impl SharedStub {
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
             SharedStub::Intrinsics2 { discard } => Self::INTRINSICS2 | u32::from(discard),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::PlainIsArray => Self::PLAIN_IS_ARRAY,
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
             SharedStub::NameElement { write } => Self::NAME_ELEMENT | u32::from(write),
         }
@@ -12369,6 +12634,11 @@ impl SharedStub {
             Self::INTRINSICS2 => SharedStub::Intrinsics2 {
                 discard: key & 1 != 0,
             },
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::PLAIN_IS_ARRAY => SharedStub::PlainIsArray,
             Self::TYPED_ELEMENT => SharedStub::TypedElement {
                 write: key & 1 != 0,
             },
@@ -12424,6 +12694,7 @@ impl SharedStub {
                 &[("array_push", array_push), ("discard", discard)],
             ),
             SharedStub::Intrinsics2 { discard } => named("Intrinsics2", &[("discard", discard)]),
+            SharedStub::PlainIsArray => named("PlainIsArray", &[]),
             SharedStub::TypedElement { write } => named("TypedElement", &[("write", write)]),
             SharedStub::NameElement { write } => named("NameElement", &[("write", write)]),
         }
@@ -12556,6 +12827,27 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
+            SharedStub::PlainIsArray => {
+                // The site left x10/x12/x15 for a decline. Nothing here calls out, so the site's
+                // return address stays in x30, except for the test builds' lowering event, which
+                // calls its recorder.
+                #[cfg(test)]
+                a.stp_pre(29, 30, -16);
+                let declined = a.new_label();
+                let done = a.new_label();
+                emit_plain_is_array(a, layout, declined, done);
+                for (landing, status) in [(done, INTRINSIC_DONE), (declined, INTRINSIC_DECLINED)] {
+                    a.bind(landing);
+                    #[cfg(test)]
+                    a.ldp_post(29, 30, 16);
+                    a.movz(9, status, 0);
+                    a.ret();
+                }
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             SharedStub::Intrinsics1 { .. } | SharedStub::Intrinsics2 { .. } => {
                 // The intrinsic helpers are calls: keep the site's return address in a frame of
                 // the stub's own, released before every status return.
@@ -12653,12 +12945,41 @@ impl SharedStub {
                     a.ret();
                 }
                 a.bind(declined);
+                if direct_stub_is_array(self, layout) {
+                    // A native entry declines at the sequence's first gate: Array.isArray at a
+                    // plain call finishes here, as `emit_call_inline_marked` does in line, and
+                    // returns as a completed call (W3's item 2c).
+                    let no_template = a.new_label();
+                    let finished = a.new_label();
+                    emit_plain_is_array(a, layout, no_template, finished);
+                    a.bind(finished);
+                    a.ldp_post(29, 30, 16);
+                    a.movz(8, DIRECT_CALL_RETURNED, 0);
+                    a.ret();
+                    a.bind(no_template);
+                }
                 a.ldp_post(29, 30, 16);
                 a.movz(8, DIRECT_CALL_DECLINED, 0);
                 a.ret();
             }
         }
     }
+}
+
+/// Whether the shared direct-call stub `stub` finishes Array.isArray at a plain one-argument call
+/// when the sequence declines (see `emit_call_inline_marked`).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn direct_stub_is_array(stub: SharedStub, layout: &crate::value::JitLayout) -> bool {
+    matches!(
+        stub,
+        SharedStub::DirectCall {
+            argc: 1,
+            with_this: false
+        }
+    ) && layout.valid
 }
 
 #[cfg(all(

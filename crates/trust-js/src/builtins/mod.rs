@@ -1561,7 +1561,10 @@ fn global_fn(it: &Interp, name: &str, len: usize, f: NativeFn) {
 /// native-call boundary, by address, with their class (`bytecode::INTRINSIC_LIGHT`,
 /// `INTRINSIC_LIGHT_PRIMITIVE_ARGS` or `INTRINSIC_LIGHT_PRIMITIVE`). Each realm's setup declares
 /// them as it installs them ([`declare_light`]), and the call cache records a native's class as
-/// it fills an entry for it. Natives with a call template take their template's id instead.
+/// it fills an entry for it. Natives with a call template take their template's id instead: the
+/// named ones by function pointer at the fill, and the anonymous Array.isArray and Object.is
+/// here, under ids their template reads (`INTRINSIC_ARRAY_IS_ARRAY`, `INTRINSIC_OBJECT_IS`;
+/// item 2c), which the light checks treat as `INTRINSIC_LIGHT`.
 static LIGHT_NATIVES: std::sync::RwLock<Option<crate::fasthash::FastMap<usize, u8>>> =
     std::sync::RwLock::new(None);
 
@@ -4958,8 +4961,8 @@ fn install_object(it: &mut Interp) {
         Ok(Value::Bool(test_integrity_level(i, &arg(args, 0), true)?))
     });
 
-    // SameValue reads its operands only.
-    declare_light(&ctor, &["is"], crate::bytecode::INTRINSIC_LIGHT);
+    // SameValue reads its operands only. The call template answers it in line (W3's item 2c).
+    declare_light(&ctor, &["is"], crate::bytecode::INTRINSIC_OBJECT_IS);
     set_builtin(&it.global, "Object", Value::Obj(ctor));
 }
 
@@ -7191,8 +7194,13 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ctor, "fromAsync", 1, array_from_async);
     install_species(it, &ctor);
-    // IsArray unwraps Proxies through their internal slots, calling no trap.
-    declare_light(&ctor, &["isArray"], crate::bytecode::INTRINSIC_LIGHT);
+    // IsArray unwraps Proxies through their internal slots, calling no trap. The call template
+    // answers it in line for everything but side-table objects, Proxies among them (item 2c).
+    declare_light(
+        &ctor,
+        &["isArray"],
+        crate::bytecode::INTRINSIC_ARRAY_IS_ARRAY,
+    );
     set_builtin(&it.global, "Array", Value::Obj(ctor));
 }
 

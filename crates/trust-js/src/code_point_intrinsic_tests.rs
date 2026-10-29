@@ -247,7 +247,22 @@ fn light_natives_match_the_full_calls() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
-        let before = crate::interpreter::TEST_LIGHT_NATIVE_CALLS.with(|count| count.get());
+        // Light natives run on the caller's operands, and on ARM64 the call templates answer
+        // Array.isArray and Object.is in line (W3's item 2c): either bypasses the boundary.
+        let served = || {
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            ))]
+            let templates = crate::jit::TEST_CALL_TEMPLATES.with(std::cell::Cell::get);
+            #[cfg(not(all(
+                target_arch = "aarch64",
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            )))]
+            let templates = 0;
+            crate::interpreter::TEST_LIGHT_NATIVE_CALLS.with(|count| count.get()) + templates
+        };
+        let before = served();
         assert_eq!(
             eval(
                 &mut engine,
@@ -306,10 +321,10 @@ log.join(',');
             "Symbol(d),number7,booleantrue,2,-1,true,bcd,STRASSE,ababab,RangeError,a1null,aundefinedtrue,c,undefined,007,  7,255,-12,10,1500,true,false,42,1,0,TypeError,1,Symbol(s),null,false,true,false,true,false,true,TypeError,false,true,true,false,false,2,RangeError,1,true,NaN,1,b,b,x,sssvsvv,2,XYZ",
             "{tier:?}"
         );
-        let light = crate::interpreter::TEST_LIGHT_NATIVE_CALLS.with(|count| count.get()) - before;
+        let light = served() - before;
         if tier == Tier::Jit {
             // The warm-up's 19 sites and the constructor's 3, 300 times each, less their fills.
-            assert!(light >= 6000, "{light} light native calls");
+            assert!(light >= 6000, "{light} light native calls and templates");
         }
     }
 }

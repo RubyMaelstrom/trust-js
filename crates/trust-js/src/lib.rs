@@ -1953,6 +1953,8 @@ mod call_error_name_tests;
 #[cfg(test)]
 mod call_guard_tests;
 #[cfg(test)]
+mod call_template_tests;
+#[cfg(test)]
 mod entry_tests;
 #[cfg(test)]
 mod tail_tests;
