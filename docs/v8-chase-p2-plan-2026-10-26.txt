@@ -1700,6 +1700,69 @@ above: item 1 as W5c's counts against c05fc611 (main without W5c) rather than 56
 5. Native code bytes and compile time per program (`TRUST_JS_REGEXP_PROF` reports both) on the
    five workloads, once a prototype of 3a exists.
 
+Then 3a, the native tier's core (4704806b..709e17a9, 2026-10-28, an agent's; landed over W3 item
+3's step 1, whose files it does not share):
+- 4704806b: RegExp execution takes the interpreter's poll word, and the scan loop splits into
+  `next_candidate` (the prefilter window and the first-element filter, shared by the matcher and
+  the native candidate loop) and `run_matcher`. No behaviour change.
+- 0fccc7fd: the tier on AArch64. A shared generator emits one template per instruction of the
+  program through a macro-assembler interface (V8's shape: code assembled from the bytecode), for
+  one-byte and two-byte subjects, with the design's machine state and tier-up rules; it polls
+  through the poll word. `TRUST_JS_REGEXP_NATIVE_VERIFY` and `TRUST_JS_REGEXP_CODEDUMP` arrive,
+  and the census reports compile time. The old one-byte tier, its emitters and
+  `find_terminal_one_byte_many` go, and the AArch64 fault with them.
+- 53d0bef4: the x86-64 backend (System V; Windows stays on the matcher), its encodings pinned by a
+  test whose cases GNU objdump disassembles as intended.
+- f9c90215, 1c5afe1d: tighter loops. The scan tests its bound once an element and keeps the class
+  table's address in a register; the candidate loop skips up to 16 ruled-out starts in line,
+  also for patterns that can start only where `^` holds outside multiline mode (Octane's trims).
+- e3d04216: a loop minimum of 2^31 or more goes straight to backtracking (on x86-64 the lazy
+  loop's limit had wrapped, failing only by accident).
+- 551d7414: AArch64's candidate status branch was a `tbnz`, which reaches 32 KB, so any program
+  past 32 KB of code silently stayed on the matcher; a compare and `b.mi` replace it, and a
+  code-size estimate keeps every branch in reach (programs past about 800 KB of code stay on the
+  matcher, where V8 compiles any size with veneers).
+- dda8d69c: strings.js's RegExp cases had risen 2.5% from inlining after the split; `Matcher::run`
+  is out of line again, `run_matcher` in line, and tier-up, verify and the scratch's first sizing
+  are cold calls.
+- 709e17a9: the fuzzer mixes its seeds with splitmix64 (it seeded with `seed | 1`, so seeds 2
+  and 3 ran the same stream).
+
+Against its parent 6e3c3ec8 (fat LTO, pinned; x86-64 on zombie): Octane RegExp 6.146e9 to
+5.379e9 (-12.5%; x86-64 -6.7%), Djot's 40 passes -1.8% (-0.35%), source-map -2.1% (-0.85%),
+coffeescript -0.80% (-0.71%), strings.js's RegExp cases +0.08% (+0.06%). Fixtures: Vue -0.23%,
+React -0.01%, Djot -1.33%. The exit's measure ("backtracking interpreter" and "class tests",
+filed by w5cat3.py, which is w5cat2 with the tier's functions, against W5a's exit build
+b6689c4b): Octane 16.5% (limit 30%), source-map 9.8% (30%), coffeescript 19.8% (40%); strings.js
+86.3%, which is 3d's (Unicode mode). coffeescript's `clean` 875,584 instructions a call against
+Sparkplug-only Node's 1,975,314 in the same session, 0.44x (exit: within 1.5x; 3,126,275 at the
+base); against Sparkplug, source-map's URL pattern 2.19x on a path and 1.85x on a URL, Octane's
+trim 1.64x, its URL splitter 1.96x, `\b\w+\b` 3.39x. Octane's score, a timing, waits for the
+stage end.
+
+Validation: the ARM64 gate on the series before its rebase (the lib suite, pacing with its known
+failure only, GC stress on the regex and string replace/split tests, the fixtures, difftest and
+dumps as the base's, Test262 53,575 of 53,575, identical) and the differential gate: Test262's
+RegExp suites (2,518 files) with the tier forced on and verify, and with it off, the reports
+identical to each other and the base's; at least 1M fuzzed cases a seed, six streams per
+architecture (over 6M cases each) without a difference (the fuzzer's check that every accepted
+program compiles caught the 32 KB branch); the census workloads' output identical with the tier
+off, at its default and forced on under verify; cancellation, deadlines, navigation and a lowered
+`MAX_BACKTRACK_STATE` during scans and backtracking as the matcher, on both backends. Zombie's
+x86-64 lib suite and clippy. After the rebase over item 3's step 1: clippy in its configurations
+and the workspace, the lib suite (pacing: the known failure, and `gc_scan_spike`'s wall-clock
+bound under load, 1.09 s against 1 s, which passes alone in 0.26 s), the fixtures, difftest and
+dumps as the base's, Test262 identical; zombie's lib suite (its known failure) and clippy.
+
+Notes: the tier counts 2^14 events (a decrement and a branch each) before it loads the poll word,
+and a scan loads it every 16K elements, where V8 checks its stack limit at every backtrack; the
+time to an interrupt has the same bound. The tier checks `MAX_BACKTRACK_STATE` as its stack grows
+and counts one record per loop retry, where the matcher checks every 2^14 steps with two records,
+so the two can differ only at the limit (verify treats that as a difference; none appeared).
+x86-64's gains are about half of AArch64's on Octane. 3b looks nearly free: case-closed `i`
+programs already compare without folding, and outside Unicode mode `\b` is unaffected by `i`; most
+of Octane's remaining matcher work is `i` patterns.
+
 ### W3: calls (census and design, 2026-10-27; exit agreed, Decision 10)
 
 Census: the W2a tip (a1535a6f, branch p2-w2a; since then main's code, c4d68127 adding only W2a's
