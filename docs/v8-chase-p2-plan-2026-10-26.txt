@@ -588,6 +588,10 @@ does (Order, step 0).
     UseScratchRegisterScope (macro-assembler-arm64.h:2556-2640, over ip0 and ip1), and covers the
     JIT's and the RegExp tier's encoders. The design found reserves no register: see "Immediates
     out of an instruction's range" below.
+24. W3 item 3's steps 2-3 (2026-10-29): their minor regressions are accepted as a step toward
+    steps 4-6 (benchmarks/README.md's policy). Records made name by name cost arguments-mapped-call
+    +2.1% and derived-construct +0.17% on ARM64 (x86-64 +2.0% and +0.96%); steps 4-5 bring them
+    to +1.2% and -0.7%, and step 6 takes the mapped body off the prepared entry.
 
 ## Non-goals
 
