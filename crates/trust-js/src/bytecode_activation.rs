@@ -570,12 +570,10 @@ mod tests {
                 .get_mut("v95")
                 .unwrap()
                 .initialize(tdz_v95);
-            right.borrow_mut().vars.remove("v95");
-            assert_eq!(right.borrow().vars.layout_id(), 0);
-            assert_eq!(
-                evaluate(&mut engine, "try{right59();'miss'}catch(e){e.name}"),
-                "ReferenceError"
-            );
+            assert_eq!(evaluate(&mut engine, "right59()"), "4752");
+            // No binding of a planned activation is ever removed (only a direct eval's are
+            // deletable, and a direct eval leaves the function's plan opaque): its closure reads
+            // `v95` at its static address (Decision 21), so this test no longer removes one.
             assert_eq!(evaluate(&mut engine, "left59()"), "4561");
             engine.interp.gc_collect();
         }

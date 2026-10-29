@@ -16928,6 +16928,10 @@ impl Interp {
         // A named expression's self-binding is already in its closure environment; body vars
         // and parameters get nearer bindings here, just as they do for every other function.
         let has_param_exprs = params_have_expr(&func.params);
+        // Decision 21: the plan of every function that runs (`bytecode::scope_plan`), which also
+        // gives its inner functions their outer contexts.
+        let derived = fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
+        let plan = func.scope_plan(derived);
         let scope = if has_param_exprs {
             // Chain: callee base (variable env) → parameter env → body variable env. A direct `eval`
             // in a parameter default hoists its `var`s into the callee base, not the enclosing
@@ -16937,8 +16941,6 @@ impl Interp {
         } else {
             // Decision 21: the activation the function's plan describes, as the compiled tiers
             // make it (`bytecode::scope_plan`).
-            let derived = fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
-            let plan = func.scope_plan(derived);
             match plan.kind {
                 crate::bytecode::scope_plan::PlanKind::Public => {
                     // In place and with the plan's bindings first: FunctionDeclarationInstantiation

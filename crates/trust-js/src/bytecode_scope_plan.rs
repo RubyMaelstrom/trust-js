@@ -62,14 +62,17 @@ pub(crate) struct FunctionPlan {
     /// A public activation's in-place capacity for the tree-walker: at least every binding its
     /// FunctionDeclarationInstantiation can make, so that its record never spills.
     pub(crate) capacity: usize,
+    /// Why an opaque plan is (for `TRUST_JS_SCOPE_LOG`).
+    pub(crate) why: &'static str,
 }
 
 impl FunctionPlan {
-    fn opaque() -> Rc<Self> {
+    fn opaque(why: &'static str) -> Rc<Self> {
         Rc::new(Self {
             kind: PlanKind::Opaque,
             prefix: Rc::from(Vec::new()),
             capacity: 0,
+            why,
         })
     }
 }
@@ -83,6 +86,9 @@ pub(crate) struct OuterContext {
     records: Vec<Rc<[PlanBinding]>>,
     /// The enclosing function's context, which continues after `records`; `None` is a barrier.
     parent: Option<Rc<OuterContext>>,
+    /// Why the context ends after `records` without a parent, when a plan found a barrier
+    /// there (for `TRUST_JS_SCOPE_LOG`).
+    stop: Option<&'static str>,
 }
 
 /// A name's static address from a function's [[Environment]]: `hops` parent links, then `slot`.
@@ -114,13 +120,35 @@ impl OuterContext {
         }
         None
     }
+
+    /// Where a resolution of a name it does not bind stops (for `TRUST_JS_SCOPE_LOG`).
+    pub(crate) fn stop(&self) -> &'static str {
+        let mut context = self;
+        while let Some(parent) = context.parent.as_deref() {
+            context = parent;
+        }
+        context.stop.unwrap_or("end of the planned records")
+    }
 }
 
 impl crate::ast::Function {
     /// The function's plan, made on first use (see the module docs). `derived` says whether the
     /// function is a derived class's constructor, which keeps its records as each tier makes them.
     pub(crate) fn scope_plan(&self, derived: bool) -> &FunctionPlan {
-        self.scopes.plan.get_or_init(|| plan(self, derived))
+        self.scopes.plan.get_or_init(|| {
+            let plan = plan(self, derived);
+            if super::scope_log_enabled() {
+                eprintln!(
+                    "[scope-plan] {}@{} {:?} {} prefix={}",
+                    self.name.as_deref().unwrap_or("<anonymous>"),
+                    self.start,
+                    plan.kind,
+                    plan.why,
+                    plan.prefix.len()
+                );
+            }
+            plan
+        })
     }
 
     /// The planned records around the function (see [`OuterContext`]), if its enclosing
@@ -148,26 +176,36 @@ fn home_record() -> Rc<[PlanBinding]> {
 }
 
 fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
-    if !scope_plans_enabled()
-        || derived
-        || function.default_ctor
-        || function.self_hosted
-        || crate::interpreter::params_have_expr(&function.params)
-        // `new.target` and `super` (a derived constructor's `super()` among them) are found by
-        // walking the records, from the arrows that read them too; keep those records whole.
-        || function.scan_flags() & (crate::ast::SCAN_NEW_TARGET | crate::ast::SCAN_HOME) != 0
-    {
-        return FunctionPlan::opaque();
+    if !scope_plans_enabled() {
+        return FunctionPlan::opaque("plans off");
+    }
+    if function.self_hosted || function.default_ctor {
+        return FunctionPlan::opaque("built-in");
     }
     let mut scan = CaptureScan::new(function, true);
     scan.children = Some(Vec::new());
     let Some((captured, env_this, homed, _runtime, direct_eval, scan)) =
         CaptureScan::run_scan(scan, function)
     else {
-        return FunctionPlan::opaque();
+        return FunctionPlan::opaque("capture analysis");
     };
-    if direct_eval || scan.saw_with {
-        return FunctionPlan::opaque();
+    let opaque = if derived {
+        Some("derived constructor")
+    } else if crate::interpreter::params_have_expr(&function.params) {
+        Some("parameter expressions")
+    } else if function.scan_flags() & (crate::ast::SCAN_NEW_TARGET | crate::ast::SCAN_HOME) != 0 {
+        // `new.target` and `super` (a derived constructor's `super()` among them) are found by
+        // walking the records, from the arrows that read them too; keep those records whole.
+        Some("new.target or super")
+    } else if direct_eval || scan.saw_with {
+        Some("direct eval or with")
+    } else {
+        None
+    };
+    if let Some(why) = opaque {
+        // Inner functions keep their own self-name and home records.
+        record_children(function, &scan, None, Some(why));
+        return FunctionPlan::opaque(why);
     }
     // The function-level bindings an inner function can name: its own name (a function
     // expression's) lives in its self-name record instead, outside the activation.
@@ -179,7 +217,7 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
         declared.insert("arguments".to_string());
     }
     if !hoisted_vars(&function.body, true, function.is_strict, &mut declared) {
-        return FunctionPlan::opaque();
+        return FunctionPlan::opaque("hoisting");
     }
     let blocked = crate::interpreter::param_bound_names(&function.params);
     let hoist = crate::interpreter::collect_hoist_ops(&function.body, function.is_strict, &blocked);
@@ -221,8 +259,12 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
         });
     let kind = if public {
         PlanKind::Public
-    } else if coroutine || mapped {
-        PlanKind::Opaque
+    } else if coroutine {
+        record_children(function, &scan, None, Some("coroutine"));
+        return FunctionPlan::opaque("coroutine");
+    } else if mapped {
+        record_children(function, &scan, None, Some("mapped arguments"));
+        return FunctionPlan::opaque("mapped arguments");
     } else {
         PlanKind::Private
     };
@@ -230,36 +272,56 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
     // lexicals, and the activation's own (`this`, `arguments`, `new.target`, the super markers).
     let capacity = blocked.len() + hoist.len() + lexicals.len() + 8;
     if kind == PlanKind::Public && capacity > crate::interpreter::MAX_INLINE_SLOTS {
-        return FunctionPlan::opaque();
+        record_children(function, &scan, None, Some("activation too large"));
+        return FunctionPlan::opaque("activation too large");
     }
     let prefix: Rc<[PlanBinding]> = Rc::from(prefix);
-    // Each inner function met directly in the body: its records out to this function's.
+    record_children(
+        function,
+        &scan,
+        (kind == PlanKind::Public).then(|| prefix.clone()),
+        None,
+    );
+    Rc::new(FunctionPlan {
+        kind,
+        prefix,
+        capacity,
+        why: "",
+    })
+}
+
+/// Give each inner function the scan met directly in `function`'s body its outer context: its
+/// own self-name or home record, then (unless a barrier or `stop` intervenes) `activation`, a
+/// public activation's planned bindings, and `function`'s own outer context.
+fn record_children(
+    function: &crate::ast::Function,
+    scan: &CaptureScan,
+    activation: Option<Rc<[PlanBinding]>>,
+    stop: Option<&'static str>,
+) {
     let outer = function.scopes.outer.get().cloned();
     for &(child, barrier, home) in scan.children.as_deref().unwrap_or_default() {
         // SAFETY: the scan borrowed `function`'s AST, which owns every child it met.
         let child = unsafe { &*child };
-        if barrier {
-            continue;
-        }
         let mut records = Vec::new();
         if child.needs_self_environment() {
             records.push(self_name_record(child));
         } else if home && child.observes_home_object() {
             records.push(home_record());
         }
-        if kind == PlanKind::Public {
-            records.push(prefix.clone());
-        }
+        let stop = barrier.or(stop);
+        let parent = if stop.is_none() {
+            records.extend(activation.clone());
+            outer.clone()
+        } else {
+            None
+        };
         let _ = child.scopes.outer.set(Rc::new(OuterContext {
             records,
-            parent: outer.clone(),
+            parent,
+            stop,
         }));
     }
-    Rc::new(FunctionPlan {
-        kind,
-        prefix,
-        capacity,
-    })
 }
 
 /// `TRUST_JS_SCOPE_PLANS=0` turns Decision 21's plans off: every function is opaque.

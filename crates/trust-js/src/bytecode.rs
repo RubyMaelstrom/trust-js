@@ -4006,7 +4006,7 @@ struct CaptureScan {
     /// function, whether a record other than the function's activation encloses it there (a
     /// block's, catch's, loop head's, class's or `with`'s: a barrier to static addressing),
     /// and whether it is an object literal's method (whose home record encloses it).
-    children: Option<Vec<(*const Function, bool, bool)>>,
+    children: Option<Vec<(*const Function, Option<&'static str>, bool)>>,
     /// Classes entered (their records enclose their members).
     class_depth: u32,
     /// Statements entered whose evaluation the tree-walker gives a record of its own, whether
@@ -5048,13 +5048,21 @@ impl CaptureScan {
         let home = std::mem::take(&mut self.home_member);
         if self.fn_depth == 0 && self.children.is_some() {
             let top = self.top_serial;
-            let barrier = self.class_depth > 0
-                || self.record_depth > 0
-                || self.with_depth > 0
-                || self
-                    .scopes
-                    .iter()
-                    .any(|(names, _, serial)| Some(*serial) != top && !names.is_empty());
+            let barrier = if self.class_depth > 0 {
+                Some("class")
+            } else if self.with_depth > 0 {
+                Some("with")
+            } else if self.record_depth > 0 {
+                Some("loop, switch or catch")
+            } else if self
+                .scopes
+                .iter()
+                .any(|(names, _, serial)| Some(*serial) != top && !names.is_empty())
+            {
+                Some("lexical block")
+            } else {
+                None
+            };
             if let Some(children) = &mut self.children {
                 children.push((std::ptr::from_ref(f), barrier, home));
             }
@@ -7472,6 +7480,11 @@ fn compile_inner_mode(
     // Neither needs a general per-call prologue merely to observe those lexical bindings.
     // Capture analysis: which locals inner functions can name (they live in a real activation
     // env), and whether an inner arrow chain reads `this`. `None` = unanalyzable — bail.
+    // Decision 21: the function's plan, which also gives its inner functions their outer
+    // contexts, whether or not this compilation succeeds.
+    if !script_body && module_bindings.is_none() {
+        func.scope_plan(derived_constructor);
+    }
     let Some((mut captured, env_this, mut block_lets, mut runtime_lexicals, direct_eval)) =
         CaptureScan::run(func, is_coroutine || prepared_entry || script_body)
     else {
@@ -7936,6 +7949,19 @@ fn compile_inner_mode(
     // statically through the function's outer context (`scope_plan`). A direct eval anywhere in
     // it could shadow any of them; a coroutine's, script's, module's or derived constructor's
     // records are their own.
+    c.static_off = if direct_eval {
+        "direct eval"
+    } else if is_coroutine {
+        "coroutine"
+    } else if script_body || module_bindings.is_some() {
+        "script or module"
+    } else if derived_constructor {
+        "derived constructor"
+    } else if c.reuse_activation {
+        "reused activation"
+    } else {
+        "no outer context"
+    };
     if !direct_eval
         && !is_coroutine
         && !script_body
@@ -9059,6 +9085,8 @@ struct Compiler {
     runtime_depth: u16,
     /// Nonzero while compiling code that runs under records not counted (a class's).
     static_blocked: u32,
+    /// Why `outer_context` is unset (for `TRUST_JS_SCOPE_LOG`).
+    static_off: &'static str,
     /// Per active splice: its callee's outer context (when its free names may resolve
     /// statically, from the callee's [[Environment]], `Op::LoadNameIn`) and the records open
     /// when the splice began.
@@ -9281,6 +9309,13 @@ fn log_bail(what: &str, detail: &str) {
     if *ON.get_or_init(|| std::env::var_os("TRUST_JS_TIER_LOG").is_some()) {
         eprintln!("[tier] unsupported {what}: {detail}");
     }
+}
+
+/// `TRUST_JS_SCOPE_LOG=1` prints each free-name read the compiler meets, with its static address
+/// or why it has none (Decision 21).
+pub(crate) fn scope_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRUST_JS_SCOPE_LOG").is_some())
 }
 
 /// Compilation bail: the construct is outside the v0 subset.
@@ -9918,6 +9953,23 @@ impl Compiler {
     fn note_static_name(&mut self, cache: u32, name: &str) {
         let address = self.static_name(name);
         self.name_statics[cache as usize] = address;
+        if scope_log_enabled() {
+            let outer = if self.inline_depth > 0 {
+                self.inline_outer
+                    .last()
+                    .and_then(|(outer, _)| outer.as_ref())
+            } else {
+                self.outer_context.as_ref()
+            };
+            let result = match (address, outer) {
+                (Some(address), _) => format!("static hops={} slot={}", address.hops, address.slot),
+                (None, Some(outer)) => format!("dynamic: {}", outer.stop()),
+                (None, None) if self.inline_depth > 0 => "dynamic: splice".to_string(),
+                (None, None) => format!("dynamic: {}", self.static_off),
+            };
+            let head: Vec<&str> = self.slot_names.iter().take(3).map(|s| &**s).collect();
+            eprintln!("[scope] {} {name}: {result}", head.join(","));
+        }
     }
     fn emit_store_name(&mut self, name: u32) {
         let cache = self.new_name_cache(name, true);
