@@ -3722,6 +3722,40 @@ parameter scopes; then the tree-walker resolving its own names by coordinate (Re
 the three exemplars' interpreters do. Risks: CaptureScan once per tree-walked function with a
 nested function (cached; compiled functions pay it already), and one flag test per closure made.
 
+Step 1's record (6e45c153..c62fbbc5, 2026-10-29, an agent's; landed on targeted tests under the
+owner's rule, at the session's pause):
+- 6e45c153: every function's environment is planned once (`bytecode_scope_plan.rs`), and a free
+  name read from an enclosing function's planned record is read by static address, (hops, slot),
+  with no guard, on the VM and ARM64; closure creation skips the records compiled code never
+  makes, so the address holds in every tier. Names a sloppy direct eval or `with` could shadow keep
+  the name caches.
+- 10d1b030: x86-64's static loads, and tests across tiers (scope_plan_tests.rs).
+- 6af5df25: a spliced callee's free names read at static addresses (LoadNameIn).
+- 4c335c15: every function that runs gets a plan; `TRUST_JS_SCOPE_LOG=1` prints each plan and why
+  a name stays dynamic.
+- c62fbbc5: functions whose parameter expressions cannot observe their own record share one
+  activation.
+Against a25e56c5 (fat LTO, ARM64, randomization off; measured before the rebase over 3b04fb1a and
+item 4's rest): Vue -8.83% (2.184e9 to 1.991e9), chai -5.04% (the name caches stop refilling),
+Djot -1.55%, React +0.13% (its closures sit inside a `switch`, whose record the tree-walker makes,
+so it pays the planning alone; minor). Collections unchanged. Per iteration: a call of an outer
+function 237 to 214, `this.v` in an arrow 84 to 65, a read two functions out 370 to 304; stores and
+a function's own captured reads in tree-walker-started frames unchanged (later steps). Tests: the
+targeted filters (closure, eval, `with`, arguments, generator, activation, scope, TDZ, name, OSR,
+fragment, self-name, home, capture, default, parameters, destructuring), clippy and fmt; zombie's
+clippy and scope_plan tests; on the combination with item 4's rest, the scope_plan and
+borrowed-call tests. Not run: GC stress and the full validation, due at the stage's end. One test
+changed: it removed a binding from a planned activation, which only an eval could do, and an eval
+keeps the function unplanned.
+Found on main, not fixed: in compiled tiers a default parameter that reads a name the body
+redeclares as a captured `var` reads undefined (`var x = 'outer'; function f(a = x) { var x =
+'body'; var g = () => x; return a; }` returns undefined; the tree-walker and Node return 'outer').
+Parked on branch p2-w3-names (old base a25e56c5; target/p2/w3-names/RESUME.txt): a54f487f, the
+compiler reusing the plan's capture analysis and straight-line numeric code reading static
+addresses (built, not counted), and d229d095 (WIP), loop, switch and catch records made only where
+they bind, which React needs (fixture outputs as main's in every tier, otherwise untested). Next:
+classes, stores, loop fragments and preambles, borrowed frames' caps, the tree-walker's reads.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
