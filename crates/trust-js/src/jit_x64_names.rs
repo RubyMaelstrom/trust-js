@@ -653,6 +653,70 @@ fn emit_fixed_cap(a: &mut Asm, chunk: &Chunk, op: &Op, pc: u32, unwind: usize) -
     true
 }
 
+/// LoadName or LoadNameForCall at a static address (Decision 21, `bytecode::StaticName`):
+/// `hops` parent links from the running environment, then the slot's word in place, tested for
+/// TDZ when the binding is lexical; the ARM64 form is `operations::emit_static_name_load`.
+/// `false`: not such an operation here.
+fn emit_static_name(
+    a: &mut Asm,
+    chunk: &Chunk,
+    l: &JitLayout,
+    op: &Op,
+    pc: u32,
+    unwind: usize,
+) -> bool {
+    let (cache, for_call) = match *op {
+        Op::LoadName(_, cache) => (cache, false),
+        Op::LoadNameForCall(_, cache) => (cache, true),
+        _ => return false,
+    };
+    let Some(address) = chunk.jit_name_static(cache) else {
+        return false;
+    };
+    if !l.scope_parent_valid {
+        return false;
+    }
+    let slow = a.label();
+    let done = a.label();
+    a.nr_load(R9, CTX, offset_of!(super::super::JitCtx, env_raw));
+    for _ in 0..address.hops {
+        a.nr_load(R9, R9, l.scope_parent);
+    }
+    a.nr_load(
+        AX,
+        R9,
+        crate::interpreter::RECORD_HEADER + 8 * usize::from(address.slot),
+    );
+    if address.lexical {
+        a.nr_imm(DX, crate::value::PACK_EMPTY);
+        a.nr_cmp(AX, DX);
+        a.jcc(EQ, slow);
+    }
+    if for_call {
+        a.nr_imm(DX, PACK_UNDEFINED);
+        a.nr_store(SP, 0, DX);
+        a.add_sp(8);
+    }
+    a.nr_store(SP, 0, AX);
+    a.add_sp(8);
+    #[cfg(test)]
+    {
+        record(
+            a,
+            TEST_NATIVE_NAME_OPS.with(|count| count.as_ptr() as usize),
+        );
+        record(
+            a,
+            TEST_NATIVE_NAME_COMMITS.with(|counts| counts[0].as_ptr() as usize),
+        );
+    }
+    a.jmp(done);
+    a.bind(slow);
+    a.helper_spflag(H_EXEC, pc, unwind);
+    a.bind(done);
+    true
+}
+
 pub(super) fn emit_op(
     a: &mut Asm,
     chunk: &Chunk,
@@ -662,7 +726,7 @@ pub(super) fn emit_op(
     pc: u32,
     unwind: usize,
 ) -> bool {
-    if emit_fixed_cap(a, chunk, op, pc, unwind) {
+    if emit_fixed_cap(a, chunk, op, pc, unwind) || emit_static_name(a, chunk, l, op, pc, unwind) {
         return true;
     }
     let reference = matches!(

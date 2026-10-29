@@ -7341,6 +7341,15 @@ mod mapped_arguments_tests;
 #[cfg(test)]
 #[path = "fixed_activation_tests.rs"]
 mod fixed_activation_tests;
+#[cfg(test)]
+#[path = "scope_plan_tests.rs"]
+mod scope_plan_tests;
+
+#[cfg(test)]
+thread_local! {
+    /// Static name reads the bytecode tier made (Decision 21, `Chunk::static_name_value`).
+    static TEST_STATIC_NAME_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 thread_local! {
     /// Set when a compilation of a sloppy body with simple formals failed only because its
@@ -20984,6 +20993,8 @@ impl Chunk {
         if self.name_caches[c as usize].get().env == 0 {
             let _ = self.name_ic_fill(i, env, n, c, false);
         }
+        #[cfg(test)]
+        TEST_STATIC_NAME_READS.with(|count| count.set(count.get() + 1));
         Some(value)
     }
 
