@@ -2444,6 +2444,53 @@ differ by the polls only) and zombie's x86-64 lib suite and clippy. Found on the
 linked-scan region (`plan_linked_scan`) does not fire on main, even for its own test's loop,
 which a general region takes instead.
 
+Then item 2c, templates for proven natives (71b4cd44..c118170b, 2026-10-29, an agent's; landed
+on targeted tests, under the owner's "If the steps make improvements, don't gate them, just do
+them"):
+- 71b4cd44: Array.isArray and Object.is in line where the call cache proves the target (template
+  ids through 2a's registration; x86-64 unchanged). isArray tests the exotic tag and `ic_plain`,
+  so a Proxy, never plain, reaches the native, which follows the target and throws when revoked
+  (V8's builtin has that shape, array-isarray.tq:11-26). Object.is compares words (NaN is
+  canonical) and strings by identity, then length, as Maglev's StringEqual does
+  (maglev-ir.cc:6464-6511); equal-length strings and BigInts reach the native. The dispatch splits
+  by id range, so native classes leave early.
+- cd8dcd39: Math.max and min over three and four Numbers fold with FMAX and FMIN in a shared stub;
+  any other argument goes to the native, which converts in order (V8's reductions speculate,
+  js-call-reducer.cc:3082-3112; ours checks first).
+- c118170b: `slice(start)` takes the intrinsic helper's path without the boundary, and the
+  two-argument slice loses its ASCII-only guard; codePointAt reads one-byte, two-byte and view
+  strings in line, pairing surrogates within the string's own length. Maglev bounds a slice's
+  trailing read by its parent's length (maglev-assembler-arm64.cc:431-441, 489-504): Node
+  v24.22.0's Maglev returns 128512 for a slice ending on a lone lead surrogate, where its
+  interpreter and TurboFan return 55357, and our test keeps the case.
+
+Against main f546d2cb (fat LTO, pinned, address randomization off, as Djot's count is bimodal
+with it on, 762.8M or 758.1M): Vue -1.62%, Djot -3.19% (228,646 codePointAt calls, about 113
+instructions each), chai -3.87% (12.9M one-argument slices, 25.8M two-argument ones, 6.4M
+three-argument Math.min calls), React +0.01% (its run spread), where the design predicted ~1%,
+~0.3% and ~2.9%; Djot's collections unchanged. Per call, Sparkplug-only Node's in brackets:
+isArray as a method 396 to 221 (171) and through an alias 318 to 143 (105), Object.is 469 to 277
+(181), Math.min of three 463 to 165 (227), Math.max of four 501 to 170 (243), `slice(start)` 648
+to 518 (310), a two-byte two-argument slice 750 to 595 (362), codePointAt 303 to 190 (224) on a
+two-byte string and 304 to 198 (251) on a view. Declined paths cost a little more (Object.is of
+equal-length strings +11, a String argument to Math.min +19); the call cases unchanged, apply
++6. Generated code grows: Vue +1.87%, React +0.37%, Djot +1.17%, nearly all of it the
+one-argument intrinsic block, which loops carry in line (about 98 instructions a hot site).
+Emitting only the arms a site's cache names, as V8's optimizing tiers inline only the builtin
+their feedback names, is the follow-up. Not templated, for want of a workload: Object.is through
+a plain alias (React's `objectIs`) and min/max past four arguments.
+
+Validation: call_template_tests.rs, each template's edge cases in every tier against Node v24
+(isArray on Proxies nested and revoked, Array.prototype, subclasses, typed arrays and `arguments`;
+Object.is on NaN, +0 and -0, equal strings and BigInts; min and max with NaN and signed zeros in
+every position, and valueOf's order; slice's negative, fractional, infinite, NaN and out-of-range
+starts; codePointAt on lone surrogates, at the end and on views; replaced builtins); the hit
+counters and the three stub placements; the string difftest (40 seeds, main's 12 known
+mismatches only); before the rebase, the lib suite (2,658), pacing with its known failure,
+doctests and the downstream crates; zombie's build and clippy, x86-64 counts unchanged. For W7's
+S4: the codePointAt template takes "one-byte" from the ASCII hint, so a Latin-1 buffer made
+without it would read as two-byte; S4 updates this arm and charCodeAt's (noted in lstr.rs).
+
 ### W3 item 3: the closure entry (census and design, 2026-10-28; decided, Decisions 20 and 21)
 
 Item 3, as the stage's design has it: a callee that needs an environment builds it in its prologue,
