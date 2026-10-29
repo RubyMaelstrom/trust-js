@@ -274,15 +274,22 @@ const ATOMS: &[&str] = &[
     "[ǅ-ǆ]",
 ];
 
-/// Near misses: programs one instruction away from what the tier takes (backreferences,
-/// lookaround, an inline modifier), which run on the matcher.
-const NEAR_MISSES: &[&str] = &[
-    "\\1", "(?=a)", "(?!b)", "(?<=a)", "(?<!b)", "(?i:a)", "(?-m:$)",
-];
+/// Near misses: programs one instruction away from what the tier takes (lookbehinds), which run
+/// on the matcher.
+const NEAR_MISSES: &[&str] = &["(?<=a)", "(?<!b)", "(?<=(a)|b)", "(?<![ab]c)"];
 
 const QUANTIFIERS: &[&str] = &[
     "*", "+", "?", "{2}", "{1,3}", "{0,}", "{2,}", "{0,2}", "{3,5}",
 ];
+
+/// Counts too large to unroll, which make a group a counted loop.
+const COUNTED: &[&str] = &["{1001}", "{0,1001}", "{1001,}", "{2,1200}"];
+
+/// Backreferences: to groups the pattern may have or not, before or inside them, and by name.
+const BACKREFS: &[&str] = &["\\1", "\\2", "\\3", "\\k<n>", "\\k<d>"];
+
+/// Inline modifier groups' flags.
+const MODIFIERS: &[&str] = &["?i", "?-i", "?m", "?-m", "?s", "?-s", "?i-s", "?ms-i"];
 
 fn gen_alternation(rng: &mut Rng, depth: usize) -> String {
     let count = if rng.chance(30) { 2 + rng.below(3) } else { 1 };
@@ -298,7 +305,7 @@ fn gen_sequence(rng: &mut Rng, depth: usize) -> String {
 }
 
 fn gen_term(rng: &mut Rng, depth: usize) -> String {
-    let (atom, quantifiable) = match rng.below(24) {
+    let (atom, quantifiable) = match rng.below(32) {
         0..=12 => (rng.pick(ATOMS).to_string(), true),
         13 => ("^".to_string(), false),
         14 => ("$".to_string(), false),
@@ -306,12 +313,44 @@ fn gen_term(rng: &mut Rng, depth: usize) -> String {
         16 => ("\\B".to_string(), false),
         17..=19 if depth < 3 => (format!("({})", gen_alternation(rng, depth + 1)), true),
         20..=21 if depth < 3 => (format!("(?:{})", gen_alternation(rng, depth + 1)), true),
-        22 if rng.chance(25) => (rng.pick(NEAR_MISSES).to_string(), false),
+        // Lookaheads, quantifiable outside Unicode mode (Annex B).
+        22..=23 if depth < 3 => {
+            let kind = if rng.chance(50) { "?=" } else { "?!" };
+            (format!("({kind}{})", gen_alternation(rng, depth + 1)), true)
+        }
+        24..=25 => (rng.pick(BACKREFS).to_string(), false),
+        // Named groups, a name repeated across alternatives.
+        26 if depth < 3 => {
+            let name = if rng.chance(50) { "n" } else { "d" };
+            let group = format!("(?<{name}>{})", gen_alternation(rng, depth + 1));
+            if name == "d" {
+                (
+                    format!("(?:{group}|(?<d>{}))", gen_sequence(rng, depth + 1)),
+                    true,
+                )
+            } else {
+                (group, true)
+            }
+        }
+        27..=28 if depth < 3 => (
+            format!(
+                "({}:{})",
+                rng.pick(MODIFIERS),
+                gen_alternation(rng, depth + 1)
+            ),
+            true,
+        ),
+        29 if rng.chance(25) => (rng.pick(NEAR_MISSES).to_string(), false),
         _ => (rng.pick(ATOMS).to_string(), true),
     };
     if quantifiable && rng.chance(35) {
         let lazy = if rng.chance(40) { "?" } else { "" };
-        format!("{atom}{}{lazy}", rng.pick(QUANTIFIERS))
+        let count = if rng.chance(8) {
+            rng.pick(COUNTED)
+        } else {
+            rng.pick(QUANTIFIERS)
+        };
+        format!("{atom}{count}{lazy}")
     } else {
         atom
     }
@@ -564,12 +603,178 @@ fn case_closed_programs_match_as_the_matcher_does() {
     }
 }
 
+/// Lookaheads, backreferences, counted loops and inline modifier groups (W5b's 3c): CoffeeScript's
+/// lexer patterns, which put a fifth of its matcher work behind lookaheads and backreferences,
+/// and the cases of their rules: captures inside lookaheads, positive and negative, nested and in
+/// loops; backreferences to unset, empty, enclosing and duplicate named groups, under `i` too;
+/// counted loops' mandatory and optional iterations; flags changed for a group's instructions.
+#[test]
+fn lookahead_backreference_counted_and_modifier_programs_match_as_the_matcher_does() {
+    let texts = [
+        "",
+        "foo: bar",
+        "$x_1:: y = 2 # note",
+        "  ### block ### x",
+        "# a\n  # b\n##c",
+        "a --> b ++ c -= d >>>= e ?. f ?:: g ... h",
+        "/re[/]x\\/y/g z",
+        "'a\\x4g' \"s #{x} \\u{12} \\u12z \\0 \\8\"",
+        "0x1E 1E5 0xE",
+        "abab:abab aaa ab ab",
+        "aAaA bB ÿŸ µΜμ kK\u{212a} ß",
+        "imguy gimg yy",
+        "aab aaab abc abcabc",
+        "\u{2028}x\ny\r\n",
+    ];
+    for (pattern, flags) in [
+        ("^(?!\\d)((?:(?!\\s)[$\\w\\x7f-\\uffff])+)([^\\n\\S]*:(?!:))?", ""),
+        ("^(?![\\d<])((?:(?!\\s)[\\.\\-$\\w\\x7f-\\uffff])+)", ""),
+        ("^\\s*###([^#][\\s\\S]*?)(?:###[^\\n\\S]*|###$)|^(?:\\s*#(?!##[^#]).*)+", ""),
+        ("^(.?)\\1*$", ""),
+        (
+            "^(?:[-=]>|[-+*\\/%<>&|^!?=]=|>>>=?|([-+:])\\1|([&|<>*\\/%])\\2=?|\\?(\\.|::)|\\.{2,3})",
+            "",
+        ),
+        ("^\\/(?!\\/)((?:[^[\\/\\n\\\\]|\\\\[^\\n]|\\[(?:\\\\[^\\n]|[^\\]\\n\\\\])*\\])*)(\\/)?", ""),
+        ("^(?:[^\\\\\\/#\\s]|\\\\[\\s\\S]|\\/(?!\\/\\/)|\\#(?!\\{)|\\s+(?:#(?!\\{).*)?)*", ""),
+        ("^\\s*(?:,|\\??\\.(?![.\\d])|::)", ""),
+        ("^(?:[^\\\\\"#]|\\\\[\\s\\S]|\\#(?!\\{))*", ""),
+        ("(\\\\\\\\)|(\\\\0(?=[1-7]))|\\\\?(\\/)|\\\\?(?:(\\n)|(\\r)|(\\u2028)|(\\u2029))|(\\\\.)", "g"),
+        ("^(?!0x).*E", ""),
+        ("\\s+(#(?!{).*)", "g"),
+        ("^(?!.*(.).*\\1)[imguy]*$", ""),
+        (
+            "((?:^|[^\\\\])(?:\\\\\\\\)*)\\\\(?:(0[0-7]|[1-7])|(x(?![\\da-fA-F]{2}).{0,2})|(u\\{(?![\\da-fA-F]{1,}\\})[^}]*\\}?)|(u(?!\\{|[\\da-fA-F]{4}).{0,4}))",
+            "",
+        ),
+        // Captures inside lookaheads: kept after a positive one, unset after a negative one,
+        // unset again when backtracking past either, in loops and nested.
+        ("(?=(a+))a*b\\1", ""),
+        ("(?=(\\w+))\\1:", ""),
+        ("(?!(a)b)\\w(\\1)", ""),
+        ("(?:(?=(\\w))\\w)+\\1", ""),
+        ("(?:(?=(a))a|b)*c\\1", ""),
+        ("(?=(?!(a)b)(a|c))\\w\\2?\\1", ""),
+        ("(?=a|(b))\\1x?", "g"),
+        ("(?=(a)(?=(b)))?\\w\\1\\2", ""),
+        ("(?!(?=(a))a)b|\\1c", ""),
+        ("x(?=(y)|z)", "y"),
+        ("(?=(?:a|ab)(c))\\w+", ""),
+        // Backreferences.
+        ("(a)|\\1b", ""),
+        ("(a\\1)", ""),
+        ("(?:(a)|b)\\1", "g"),
+        ("(a*)\\1", ""),
+        ("(a*?)\\1$", "m"),
+        ("^(a+)\\1+$", ""),
+        ("(\\w)\\1(\\w)\\2", "g"),
+        ("(?<n>a|b)\\k<n>", ""),
+        ("(?:(?<n>a)|(?<n>b))\\k<n>", "g"),
+        ("([a-z])\\1", "gi"),
+        ("(\\w+) \\1", "i"),
+        ("(ÿ|µ|k|ß)\\1", "gi"),
+        ("(.)\\1", "i"),
+        ("\\2(a)(b)", ""),
+        // Counted loops, too long to unroll.
+        ("(?:ab){1001}", ""),
+        ("(?:a|bc){2,1500}d", ""),
+        ("(a|b){0,1200}?c", ""),
+        ("(?:(a)|b){1001,}\\1?", ""),
+        ("(?:a?){1500}b", ""),
+        ("((?:a|b)c?){1002}", ""),
+        // Inline modifier groups.
+        ("a(?i:b)c", ""),
+        ("(?i:a(?-i:b)c)", ""),
+        ("(?m:^b)", ""),
+        ("x(?-m:$)|y$", "m"),
+        ("(?s:a.b)|a.c", ""),
+        ("(?-s:a.b)", "s"),
+        ("(?i:(a)\\1)", ""),
+        ("(?-i:(a)\\1)", "i"),
+        ("(?i:[a-z]+)(?-i:B)", ""),
+        ("(?i:\\bk+)", ""),
+        ("(?ims:^.a$)", ""),
+    ] {
+        for two in [false, true] {
+            let width = if two { Width::Two } else { Width::One };
+            let (native, _) = pair(pattern, flags, width).unwrap();
+            assert!(
+                compiled(&native, width) || !BACKEND,
+                "/{pattern}/{flags} is in the tier's instruction set for {width:?}"
+            );
+        }
+        check_both(pattern, flags, &texts);
+    }
+    // Counted loops over subjects long enough to leave them.
+    let long = [
+        "ab".repeat(1001),
+        format!("{}d", "abc".repeat(600)),
+        format!("{}c", "ab".repeat(700)),
+        format!("{}b", "a".repeat(1600)),
+        "abc".repeat(1100),
+    ];
+    for (pattern, flags) in [
+        ("(?:ab){1001}", ""),
+        ("(?:a|bc){2,1500}d", ""),
+        ("(a|b){0,1200}?c", ""),
+        ("(?:(a)|b){1001,}\\1?", ""),
+        ("(?:a?){1500}b", ""),
+        ("((?:a|b)c?){1002}", ""),
+    ] {
+        for text in &long {
+            for two in [false, true] {
+                let subject = Subject::of(text, two);
+                if let Some(difference) = compare_from(pattern, flags, &subject, [0, 1, 7]) {
+                    panic!(
+                        "/{pattern}/{flags} over {} units: {difference:?}",
+                        text.len()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A backreference under `i` compares Canonicalize's (the legacy one, outside Unicode mode): for
+/// every two-byte element, its case partners match it and a neighbour does not.
+#[test]
+fn case_insensitive_backreferences_compare_every_element_as_the_matcher_does() {
+    let (native, matcher) = pair("(.)\\1", "i", Width::Two).unwrap();
+    compiled(&native, Width::Two);
+    let control = crate::RuntimeInterrupt::default();
+    let mut units = Vec::new();
+    for unit in 0..=0xffffu32 {
+        let partners: Vec<u32> = super::super::case_group(unit, false)
+            .into_iter()
+            .chain([unit ^ 1, unit])
+            .filter(|&other| other <= 0xffff)
+            .collect();
+        for other in partners {
+            units.extend_from_slice(&[unit as u16, other as u16, b'\n' as u16]);
+        }
+    }
+    let subject = Subject::Two(units);
+    let mut start = 0;
+    loop {
+        let found = run(&native, &subject, start, &control);
+        let reference = run(&matcher, &subject, start, &control);
+        assert_eq!(found, reference, "/(.)\\1/i from {start}");
+        match found {
+            Ok(Some(spans)) => start = spans[0].unwrap().1,
+            _ => break,
+        }
+    }
+}
+
 /// Programs the fuzzer seldom makes: more capture slots than the root floor's logged-slot word
 /// has bits (each attempt unsets them instead), many loops' marks, long straight runs, and code
 /// past AArch64's 32 KB test-and-branch reach.
 #[test]
 fn wide_and_long_programs_match_as_the_matcher_does() {
     let wide = format!("{}(y|z)*q", "(x)?".repeat(36));
+    // A wide program's lookaheads: their captures, at the root floor and above it, and a
+    // backreference to them.
+    let wide_look = format!("{}(?=(y)|(z))(?:\\36|.)(?!(x))", "(x)?".repeat(34));
     let marks = "(?:(?:a|b)*c)*(?:(?:d|e)+f)*(?:g|h)*".to_string();
     let long = format!("{}.{}", "ab".repeat(300), "cd".repeat(300));
     // Code far past AArch64's 32 KB test-and-branch reach, ending in the candidate loop's
@@ -589,6 +794,8 @@ fn wide_and_long_programs_match_as_the_matcher_does() {
     for (pattern, flags) in [
         (wide.as_str(), ""),
         (wide.as_str(), "y"),
+        (wide_look.as_str(), ""),
+        (wide_look.as_str(), "g"),
         (marks.as_str(), ""),
         (marks.as_str(), "g"),
         (long.as_str(), ""),
@@ -795,6 +1002,89 @@ fn native_stack_exhaustion_is_the_matcher_s_resource_error() {
     }
 }
 
+/// A backreference's long compare answers a deadline, unit by unit and under `i` through the
+/// helper, on both widths: a lookahead captures the whole subject at once (`.` under `s` takes
+/// the rest of it in one step), so the time goes to the compare. Backtracking inside a lookahead
+/// answers cancellation, and exhausting the backtracking state inside a lookahead or a counted
+/// loop is the matcher's resource error.
+#[test]
+fn native_lookaheads_and_backreferences_answer_interruption_and_limits() {
+    if !BACKEND {
+        return;
+    }
+    for flags in ["s", "is"] {
+        for two in [false, true] {
+            let width = if two { Width::Two } else { Width::One };
+            let (re, _) = pair("(?=(.*))\\1", flags, width).unwrap();
+            assert!(compiled(&re, width));
+            let subject = if two {
+                Subject::Two(vec![b'a' as u16; 1 << 25])
+            } else {
+                Subject::One(vec![b'a'; 1 << 26])
+            };
+            let control = crate::RuntimeInterrupt::default();
+            control.set_deadline(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
+            ));
+            assert_eq!(
+                run(&re, &subject, 0, &control),
+                Err(MatchError::Interrupted(
+                    crate::InterruptReason::DeadlineExceeded
+                )),
+                "/(?=(.*))\\1/{flags} over {width:?}"
+            );
+            // Without a deadline the compare runs to its end and matches.
+            let small = Subject::of(&"a".repeat(40_000), two);
+            let found = run(&re, &small, 0, &crate::RuntimeInterrupt::default());
+            assert_eq!(found, Ok(Some(vec![Some((0, 40_000)), Some((0, 40_000))])));
+        }
+    }
+    // Backtracking with no end in sight, inside a lookahead's body.
+    let (looking, _) = pair("(?=(?:a|aa)*[cd])", "", Width::One).unwrap();
+    assert!(compiled(&looking, Width::One));
+    let control = Arc::new(crate::RuntimeInterrupt::default());
+    let remote = control.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        remote.cancel();
+    });
+    let found = run(&looking, &Subject::One(vec![b'a'; 80]), 0, &control);
+    canceller.join().unwrap();
+    assert_eq!(
+        found,
+        Err(MatchError::Interrupted(crate::InterruptReason::Cancelled))
+    );
+    // Every iteration leaves the loop's exit to try, until `$` fails at the `X`.
+    let text = format!("{}X", "ab".repeat(20_000));
+    for (pattern, flags) in [("(?=(?:a|b)*$)", "y"), ("(?:a|b){0,100000}$", "y")] {
+        for two in [false, true] {
+            let subject = Subject::of(&text, two);
+            let (native, matcher) = pair(pattern, flags, subject.width()).unwrap();
+            assert!(compiled(&native, subject.width()));
+            let control = crate::RuntimeInterrupt::default();
+            super::super::set_backtrack_state_limit(1 << 10);
+            let found = run(&native, &subject, 0, &control);
+            let reference = run(&matcher, &subject, 0, &control);
+            super::super::set_backtrack_state_limit(MAX_BACKTRACK_STATE);
+            assert_eq!(
+                found,
+                Err(MatchError::ResourceExhausted),
+                "/{pattern}/{flags}"
+            );
+            assert_eq!(
+                reference,
+                Err(MatchError::ResourceExhausted),
+                "/{pattern}/{flags}"
+            );
+            assert_eq!(
+                run(&native, &subject, 0, &control),
+                Ok(None),
+                "/{pattern}/{flags}"
+            );
+        }
+    }
+}
+
 /// A pattern compiles for a width at its threshold's execution over a subject of that width,
 /// or at once over a long subject (V8's rule), each width on its first use.
 #[test]
@@ -825,12 +1115,7 @@ fn hot_patterns_compile_each_width_on_its_first_use() {
     assert_eq!(long.tier_feedback().2[0], (true, BACKEND));
 
     // Patterns the tier does not take try once per width and stay on the matcher.
-    for (pattern, flags) in [
-        ("a(b)\\1", ""),
-        ("a(?=b)", ""),
-        ("a(?<=b)", ""),
-        ("a.", "u"),
-    ] {
+    for (pattern, flags) in [("a(?<=b)", ""), ("a(?=(?<!b))", ""), ("a.", "u")] {
         let mut declined = Regex::new(pattern, flags).unwrap();
         declined.tier_up_at = 1;
         declined.exec_polled(&ascii, 0, &control).unwrap();
@@ -845,6 +1130,24 @@ fn hot_patterns_compile_each_width_on_its_first_use() {
     literal.exec_polled(&ascii, 0, &control).unwrap();
     literal.exec_polled(&wide, 0, &control).unwrap();
     assert_eq!(literal.tier_feedback().2, [(true, false), (true, BACKEND)]);
+    // Backreferences, lookaheads, counted loops and modifier groups compile.
+    for (pattern, flags) in [
+        ("a(b)\\1", ""),
+        ("a(?=b)", ""),
+        ("(?:a|bc){1001}", ""),
+        ("a(?i:b)", ""),
+    ] {
+        let mut taken = Regex::new(pattern, flags).unwrap();
+        taken.tier_up_at = 1;
+        taken.exec_polled(&ascii, 0, &control).unwrap();
+        taken.exec_polled(&wide, 0, &control).unwrap();
+        let (_, _, widths) = taken.tier_feedback();
+        assert_eq!(
+            widths,
+            [(true, BACKEND), (true, BACKEND)],
+            "/{pattern}/{flags}"
+        );
+    }
 }
 
 /// The perf map (`TRUST_JS_PERF_MAP`) lists a pattern's native code under its source and flags.

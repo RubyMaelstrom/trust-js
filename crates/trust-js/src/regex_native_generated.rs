@@ -21,6 +21,16 @@ fn instruction_kind(inst: &super::super::Inst) -> String {
         Inst::SetMark(_) => "set_mark".into(),
         Inst::CheckProgress(_) => "check_progress".into(),
         Inst::ClearCaps(..) => "clear_caps".into(),
+        Inst::Look { negate: false, .. } => "look".into(),
+        Inst::Look { negate: true, .. } => "negative_look".into(),
+        Inst::Backref(_) => "backref".into(),
+        Inst::BackrefAlt(_) => "backref_alt".into(),
+        Inst::PushFlags(..) => "push_flags".into(),
+        Inst::PopFlags => "pop_flags".into(),
+        Inst::CounterReset(_) => "counter_reset".into(),
+        Inst::CounterIncr(_) => "counter_incr".into(),
+        Inst::CountedBranch { .. } => "counted_branch".into(),
+        Inst::CheckCountedProgress { .. } => "check_counted_progress".into(),
         Inst::Many {
             rep,
             greedy,
@@ -109,10 +119,30 @@ fn instruction_corpus_matches_as_the_matcher_does() {
                 "check_progress", "char",
             ],
         ),
+        // W5b's 3c: lookaheads (a body of elements alone tested in place, or one with a frame),
+        // backreferences, inline modifier groups and counted loops.
+        ("a(?=b)", "", &["char", "look"]),
+        ("a(?!b.)", "s", &["char", "negative_look"]),
+        ("a(?=(b)|c)\\1", "", &["char", "look", "backref"]),
+        ("(?!(a|b)c)..", "", &["negative_look", "any", "any"]),
+        ("(a)\\1", "", &["save", "char", "save", "backref"]),
+        ("(a)\\1", "i", &["save", "class", "save", "backref"]),
+        ("(?:(?<n>a)|(?<n>b))\\k<n>", "", &["split", "save", "char", "save", "jmp", "save", "char", "save", "backref_alt"]),
+        ("a(?i:b)c", "", &["char", "push_flags", "class", "pop_flags", "char"]),
+        ("(?m:^)a", "", &["push_flags", "start", "pop_flags", "char"]),
+        (
+            "(?:ab){1001}",
+            "",
+            &[
+                "counter_reset", "counted_branch", "set_mark", "char", "char",
+                "check_counted_progress", "counter_incr", "jmp",
+            ],
+        ),
     ];
     let texts = [
         "", "a", "ab", "abc", "aXc", "xxaXcyy", "a\nc", "a\r\nb", "ab ab", "aab", "aaab", "abababc",
         "x\ny", "xy z", "12ab", "  \n", "\u{e9}x\u{3a9}", "abcabc d", "yz xz z", "a\u{2028}c",
+        "aAbBcC", "abbab bc", "Abc aBC",
     ];
     for &(pattern, flags, kinds) in cases {
         let re = super::super::Regex::new(pattern, flags).unwrap();

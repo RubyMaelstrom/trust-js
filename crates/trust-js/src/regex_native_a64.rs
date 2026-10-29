@@ -219,6 +219,14 @@ fn ldrh_reg(rt: u32, rn: u32, rm: u32) -> u32 {
     0x7860_6800 | rm << 16 | rn << 5 | rt
 }
 
+/// `ldrb wt, [xn], #1` or `ldrh wt, [xn], #2`: the element at xn, and xn past it.
+fn ldr_elem_post(width: Width, rt: u32, rn: u32) -> u32 {
+    match width {
+        Width::One => 0x3840_0400 | 1 << 12 | rn << 5 | rt,
+        Width::Two => 0x7840_0400 | 2 << 12 | rn << 5 | rt,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PairMode {
     Pre,
@@ -283,6 +291,8 @@ enum Outline {
     Grow { slow: Label, retry: Label },
     /// The candidate scan returned a status: none left (0), or an interruption.
     CandidateStatus { slow: Label, no_match: Label },
+    /// A helper returned an interruption's status: leave with it.
+    Status { slow: Label },
 }
 
 pub(super) struct Asm {
@@ -296,9 +306,11 @@ pub(super) struct Asm {
     luts: std::collections::HashMap<[u8; 256], Data>,
     literals: std::collections::HashMap<u64, usize>,
     outlines: Vec<Outline>,
-    /// Shared routines: the poll's slow path, the stack's growth and the exit with x0's status.
+    /// Shared routines: the poll's slow path, the stack's growth, a backreference's helper
+    /// call and the exit with x0's status.
     poll_routine: Label,
     grow_routine: Label,
+    backref_routine: Label,
     exit: Label,
     /// Whether x15 holds the address of the position's element.
     addr_valid: bool,
@@ -323,6 +335,7 @@ impl Asm {
             outlines: Vec::new(),
             poll_routine: 0,
             grow_routine: 0,
+            backref_routine: 0,
             exit: 0,
             addr_valid: false,
             held: None,
@@ -330,6 +343,7 @@ impl Asm {
         };
         asm.poll_routine = asm.label();
         asm.grow_routine = asm.label();
+        asm.backref_routine = asm.label();
         asm.exit = asm.label();
         asm
     }
@@ -509,6 +523,11 @@ impl Asm {
                     self.cbz(true, false, 0, no_match);
                     self.b(self.exit);
                 }
+                Outline::Status { slow } => {
+                    self.bind(slow);
+                    self.emit(and_low_byte(0, 0));
+                    self.b(self.exit);
+                }
             }
         }
     }
@@ -552,6 +571,21 @@ impl Asm {
             self.bind(exhausted);
             self.mov_imm(true, 0, STATUS_EXHAUSTED);
             self.b(self.exit);
+        }
+        // A backreference under `i`: the helper compares the x11 units at the position with
+        // those at x10 (`helper_backref_fold`), answering in x0.
+        let backref = self.backref_routine;
+        if self.referenced(backref) {
+            self.bind(backref);
+            self.save_scratch();
+            self.mov(0, CTX);
+            self.mov(1, OP);
+            self.mov(2, POS);
+            self.mov(3, RS);
+            self.ldr_literal(IP0, self.helpers.backref_fold as u64);
+            self.emit(blr(IP0));
+            self.restore_scratch();
+            self.emit(RET);
         }
         // Leave with x0's status: the frame record restores sp, whatever routines pushed.
         self.bind(self.exit);
@@ -808,6 +842,10 @@ impl Masm for Asm {
                 self.emit(orr_reg(true, IP1, POS, high, 32));
                 IP1
             }
+            Operand::PosChoices => {
+                self.emit(orr_reg(true, IP1, POS, CHOICES, 32));
+                IP1
+            }
         };
         self.emit(stp(PairMode::Post, IP0, value, TOP, 16));
     }
@@ -841,8 +879,14 @@ impl Masm for Asm {
         let register = match value {
             Value::Pos => POS,
             Value::Op => OP,
+            Value::Zero => ZR,
             Value::Unset => {
                 self.emit(movn(IP0, 0));
+                IP0
+            }
+            Value::Next => {
+                self.ldr_x(IP0, SLOTS, Self::slot_offset(slot));
+                self.emit(add_imm(true, IP0, IP0, 1, false));
                 IP0
             }
         };
@@ -859,6 +903,96 @@ impl Masm for Asm {
         self.ldr_x(IP0, SLOTS, Self::slot_offset(slot));
         self.emit(subs_reg(true, ZR, IP0, POS));
         self.b_cond(Cond::Eq, label);
+    }
+
+    fn branch_slot_lt(&mut self, slot: usize, value: u32, lt: bool, label: Label) {
+        self.ldr_x(IP0, SLOTS, Self::slot_offset(slot));
+        self.cmp_any(true, IP0, value);
+        self.b_cond(if lt { Cond::Lo } else { Cond::Hs }, label);
+    }
+
+    fn mark_top(&mut self, slot: usize) {
+        // An offset, as V8 keeps a lookaround's stack pointer: growing the stack moves it.
+        self.emit(ldr_imm(IP0, CTX, ctx::STACK));
+        self.emit(sub_reg(true, IP0, TOP, IP0));
+        self.str_x(IP0, SLOTS, Self::slot_offset(slot));
+    }
+
+    fn cut_to(&mut self, slot: usize) {
+        self.emit(ldr_imm(IP0, CTX, ctx::STACK));
+        self.ldr_x(IP1, SLOTS, Self::slot_offset(slot));
+        self.emit(add_reg(TOP, IP0, IP1, 0));
+        self.emit(ldr_imm(OP, TOP, 8));
+    }
+
+    fn unpack_pos_choices(&mut self) {
+        self.emit(orr_reg(false, POS, ZR, OP, 0));
+        self.emit(lsr_imm(CHOICES, OP, 32));
+        self.pos_changed();
+    }
+
+    fn backref(&mut self, slot: usize, icase: bool, fail: Label) {
+        // The loop registers: no loop holds them across a backreference.
+        debug_assert!(self.held.is_none());
+        let done = self.label();
+        // x10 = the capture's start, x11 = its end: unset (all ones), it matches empty.
+        self.ldr_x(OP, SLOTS, Self::slot_offset(slot));
+        self.ldr_x(RS, SLOTS, Self::slot_offset(slot + 1));
+        self.emit(adds_imm(true, ZR, OP, 1));
+        self.b_cond(Cond::Eq, done);
+        self.emit(adds_imm(true, ZR, RS, 1));
+        self.b_cond(Cond::Eq, done);
+        // x11 = its length (a forward program's captures end at or past their start): empty, it
+        // matches empty; else the subject must have as many units left.
+        self.emit(subs_reg(true, RS, RS, OP));
+        self.b_cond(Cond::Eq, done);
+        self.emit(sub_reg(true, IP0, LEN, POS));
+        self.emit(subs_reg(true, ZR, IP0, RS));
+        self.b_cond(Cond::Lo, fail);
+        if icase {
+            // The helper answers 1 if Canonicalize's agree, 0 if not, or bit 63 and a status if
+            // the host interrupted a long compare; compared after the call, as AAPCS64 leaves
+            // the flags undefined across it.
+            let status = self.label();
+            self.bl(self.backref_routine);
+            self.emit(subs_imm(true, ZR, 0, 0));
+            self.branch(0x5400_0004, status, Fixup::Imm19); // b.mi
+            self.b_cond(Cond::Eq, fail);
+            self.outlines.push(Outline::Status { slow: status });
+            self.emit(add_reg(POS, POS, RS, 0));
+        } else {
+            // x12 = the capture's first unit, x13 = the position's, and POS past the repetition
+            // (a failure backtracks, which sets it again). Stretches of at most SCAN_STRETCH
+            // units, polled between: x15 counts the stretch's units, x11 those after it.
+            let shift = match self.width {
+                Width::One => 0,
+                Width::Two => 1,
+            };
+            let stretch = self.label();
+            let unit = self.label();
+            let end = self.label();
+            self.emit(add_reg(LIM, SUBJ, OP, shift));
+            self.emit(add_reg(CLIM, SUBJ, POS, shift));
+            self.emit(add_reg(POS, POS, RS, 0));
+            self.bind(stretch);
+            self.mov_imm(true, IP1, u64::from(SCAN_STRETCH));
+            self.emit(subs_reg(true, ZR, RS, IP1));
+            self.emit(csel(ADDR, RS, IP1, Cond::Lo));
+            self.emit(sub_reg(true, RS, RS, ADDR));
+            self.bind(unit);
+            self.emit(ldr_elem_post(self.width, E, LIM));
+            self.emit(ldr_elem_post(self.width, HELD, CLIM));
+            self.emit(subs_reg(false, ZR, E, HELD));
+            self.b_cond(Cond::Ne, fail);
+            self.emit(subs_imm(true, ADDR, ADDR, 1));
+            self.b_cond(Cond::Ne, unit);
+            self.cbz(true, false, RS, end);
+            self.poll_now();
+            self.b(stretch);
+            self.bind(end);
+        }
+        self.bind(done);
+        self.pos_changed();
     }
 
     fn pos_from_op(&mut self) {
@@ -1102,6 +1236,45 @@ mod tests {
             (orr_bit(24, 24, 63), 0xb241_0318, "orr x24, x24, #1 << 63"),
             (orr_bit(24, 24, 2), 0xb27e_0318, "orr x24, x24, #0x4"),
             (orr_bit(16, 9, 5), 0xb27b_0130, "orr x16, x9, #0x20"),
+            // W5b's 3c: lookahead frames, counted loops' counts, backreferences.
+            (
+                ldr_elem_post(Width::One, 9, 12),
+                0x3840_1589,
+                "ldrb w9, [x12], #1",
+            ),
+            (
+                ldr_elem_post(Width::Two, 14, 13),
+                0x7840_25ae,
+                "ldrh w14, [x13], #2",
+            ),
+            (subs_reg(false, ZR, 9, 14), 0x6b0e_013f, "cmp w9, w14"),
+            (
+                csel(15, 11, 17, Cond::Lo),
+                0x9a91_316f,
+                "csel x15, x11, x17, lo",
+            ),
+            (
+                orr_reg(true, 17, 21, 27, 32),
+                0xaa1b_82b1,
+                "orr x17, x21, x27, lsl #32",
+            ),
+            (orr_reg(false, 21, ZR, 10, 0), 0x2a0a_03f5, "mov w21, w10"),
+            (lsr_imm(27, 10, 32), 0xd360_fd5b, "lsr x27, x10, #32"),
+            (str_imm(ZR, 22, 64), 0xf900_22df, "str xzr, [x22, #64]"),
+            (add_reg(23, 16, 17, 0), 0x8b11_0217, "add x23, x16, x17"),
+            (ldr_imm(10, 23, 8), 0xf940_06ea, "ldr x10, [x23, #8]"),
+            (sub_reg(true, 16, 23, 16), 0xcb10_02f0, "sub x16, x23, x16"),
+            (adds_imm(true, ZR, 10, 1), 0xb100_055f, "cmn x10, #1"),
+            (
+                add_reg(12, 19, 10, 1),
+                0x8b0a_066c,
+                "add x12, x19, x10, lsl #1",
+            ),
+            (
+                add_imm(true, 16, 16, 1, false),
+                0x9100_0610,
+                "add x16, x16, #1",
+            ),
             (ldr_imm(19, 25, 8), 0xf940_0733, "ldr x19, [x25, #8]"),
             (str_imm(21, 22, 32), 0xf900_12d5, "str x21, [x22, #32]"),
             (ldrb_imm(9, 16, 5), 0x3940_1609, "ldrb w9, [x16, #5]"),
@@ -1174,6 +1347,7 @@ mod tests {
                 poll: 0,
                 grow: 0,
                 next_candidate: 0,
+                backref_fold: 0,
             },
         );
         let ahead = a.label();
@@ -1211,6 +1385,7 @@ mod tests {
             poll: 0,
             grow: 0,
             next_candidate: 0,
+            backref_fold: 0,
         };
         let mut a = Asm::new(Width::One, helpers());
         a.ldr_x(IP0, SLOTS, 32760);

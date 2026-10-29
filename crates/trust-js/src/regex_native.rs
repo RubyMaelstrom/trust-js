@@ -6,20 +6,22 @@
 //! `RegExpMacroAssembler`s do. [`Matcher::run`](super::Matcher::run) stays the reference, and
 //! the matcher runs whatever a program uses that the tier does not.
 //!
-//! The tier takes the core of the instruction set (characters, `.`, classes, captures and their
-//! undo rules, alternation, `^`, `$` and `\b` with the flags resolved at compile time, greedy and
-//! lazy loops of one element, atomic loops, group loops' progress marks and capture clears) over
-//! one-byte and two-byte subjects outside Unicode mode, under `i` once the program's characters
-//! and classes are closed over case. The candidate loop runs
+//! The tier takes the instruction set outside Unicode mode (characters, `.`, classes, captures
+//! and their undo rules, alternation, `^`, `$` and `\b` with the flags resolved at compile time,
+//! which inline modifier groups fix per instruction, greedy and lazy loops of one element, atomic
+//! loops, group loops' progress marks and capture clears, counted loops, lookaheads and
+//! backreferences) over one-byte and two-byte subjects, under `i` once the program's characters
+//! and classes are closed over case; lookbehinds stay on the matcher. The candidate loop runs
 //! in the generated code, with the first-element filter's table tested in line; the prefilter's
 //! literal and the filter's vector scans run in Rust ([`Regex::next_candidate`]), which the code
 //! calls when its own test rules a start out.
 //!
 //! Machine state: an entry `fn(*mut NativeCtx) -> u64` returning a status ([`STATUS_MATCH`] and
-//! the others). Callee-saved registers hold the subject, its length, the position, the capture
-//! slots (the marks follow them), the backtrack stack's top, the root floor's logged slots, the
-//! context, the leading loop's run end, the choice count and the poll counter (AArch64 x19-x28;
-//! x86-64 keeps some in caller-saved registers that every helper call saves, and the context).
+//! the others). Callee-saved registers hold the subject, its length, the position, the slots
+//! (captures, then marks and lookaheads' frames), the backtrack stack's top, the root floor's
+//! logged slots, the context, the leading loop's run end, the choice count and the poll counter
+//! (AArch64 x19-x28; x86-64 keeps some in caller-saved registers that every helper call saves,
+//! and the context).
 //! The backtrack stack is the program's [`MatchScratch`] storage taken as 16-byte records: the
 //! address of a resume point or an undo stub, and an operand. A pop jumps to the record's address
 //! with the operand in a register; undo stubs restore their slot and pop again, as V8's undo
@@ -151,6 +153,8 @@ pub(super) enum Operand {
     Slot(usize),
     /// The position in the low 32 bits and the run start plus `k` in the high ones.
     Pack(u32),
+    /// The position in the low 32 bits and CHOICES in the high ones: a lookahead's frame.
+    PosChoices,
 }
 
 /// What a slot store writes.
@@ -160,6 +164,10 @@ pub(super) enum Value {
     Unset,
     /// The operand of the record just popped.
     Op,
+    /// Zero: a counted loop's count, reset.
+    Zero,
+    /// The slot's value plus one: a counted loop's count, after an iteration.
+    Next,
 }
 
 /// The macro assembler the generator emits through, as V8's `RegExpMacroAssembler`. Its
@@ -233,6 +241,22 @@ pub(super) trait Masm {
     fn store_slot(&mut self, slot: usize, value: Value);
     fn branch_slot_unset(&mut self, slot: usize, label: Label);
     fn branch_slot_eq_pos(&mut self, slot: usize, label: Label);
+    /// Branch if `slot`'s value (a count) is below `value` (`lt`), or is not; `value` is below
+    /// 2^31.
+    fn branch_slot_lt(&mut self, slot: usize, value: u32, lt: bool, label: Label);
+    /// `slot` = the offset from the stack's base of the record pushed next: a lookahead's frame.
+    fn mark_top(&mut self, slot: usize);
+    /// Cut the stack back to the record whose offset `slot` keeps (see [`Self::mark_top`]),
+    /// discarding it and every record above it, with OP = its operand.
+    fn cut_to(&mut self, slot: usize);
+    /// POS = OP's low 32 bits, CHOICES = its high ones (see [`Operand::PosChoices`]).
+    fn unpack_pos_choices(&mut self);
+    /// A backreference to the capture in `slot` and `slot + 1` (unset or empty: it matches
+    /// empty), as the matcher's `backref_end` compares it: unit by unit, or under `icase`
+    /// through the helper, which compares Canonicalize's. To `fail` if the subject at POS does
+    /// not repeat the capture, else POS past the repetition. The compare polls between
+    /// stretches, as a scan does.
+    fn backref(&mut self, slot: usize, icase: bool, fail: Label);
     /// POS = OP.
     fn pos_from_op(&mut self);
     /// POS = OP's low 32 bits, RS = its high ones.
@@ -275,6 +299,7 @@ pub(super) struct Helpers {
     pub(super) poll: usize,
     pub(super) grow: usize,
     pub(super) next_candidate: usize,
+    pub(super) backref_fold: usize,
 }
 
 /// The context the generated code runs with (offsets in [`ctx`]).
@@ -331,6 +356,8 @@ pub(super) struct NativeCode {
     #[cfg_attr(not(test), allow(dead_code))]
     executable: crate::jit::ExecutableBuffer,
     width: Width,
+    /// The slots the code keeps: captures, marks, then its lookaheads' frames.
+    slots: usize,
     entry: unsafe extern "C" fn(*mut NativeCtx) -> u64,
 }
 
@@ -395,10 +422,11 @@ pub(super) fn code_for<'a, I: ReInput>(re: &'a Regex, input: &I) -> Option<&'a N
 
 /// Why `re` stays on the matcher for `width`, or `None` if the tier takes it.
 fn decline(re: &Regex, width: Width) -> Option<&'static str> {
-    // Under `i` the program's characters, classes and loops match with no case folding once
-    // they are closed over case (`Regex::case_closed`); outside Unicode mode `\b` is the same
-    // under `i`, so a closed program compiles as any other.
-    if re.ignore_case && !re.case_closed {
+    // Under `i`, and in the groups of `(?i:…)`, the program's characters, classes and loops
+    // match with no case folding once they are closed over case (`Regex::case_closed`).
+    // Outside Unicode mode `\b` is the same under `i`, and a backreference compares
+    // Canonicalize's through a helper.
+    if !re.case_closed && (re.ignore_case || super::changes_flags(&re.prog)) {
         return Some("i flag");
     }
     if re.unicode {
@@ -415,7 +443,7 @@ fn decline(re: &Regex, width: Width) -> Option<&'static str> {
     if code_units(prog, width) > MAX_CODE_UNITS {
         return Some("code size");
     }
-    if 2 * (re.ngroups + 1) + re.nmarks > MAX_SLOTS {
+    if 2 * (re.ngroups + 1) + re.nmarks + look_count(prog) > MAX_SLOTS {
         return Some("slots");
     }
     if n < 3
@@ -425,50 +453,67 @@ fn decline(re: &Regex, width: Width) -> Option<&'static str> {
     {
         return Some("program shape");
     }
-    for (pc, inst) in prog.iter().enumerate() {
-        let core = match inst {
-            Inst::Save(0) => pc == 0,
-            Inst::Save(1) => pc == n - 2,
-            Inst::Match => pc == n - 1,
-            Inst::Class(class) => class_plan(class, width).is_some(),
-            Inst::Many { rep, .. } => match rep {
-                Rep::Class(class) => class_plan(class, width).is_some(),
-                Rep::Char(_) | Rep::Any => true,
-            },
-            Inst::Char(_)
-            | Inst::Any
-            | Inst::Save(_)
-            | Inst::Split(..)
-            | Inst::Jmp(_)
-            | Inst::AssertStart
-            | Inst::AssertEnd
-            | Inst::WordBoundary(_)
-            | Inst::SetMark(_)
-            | Inst::CheckProgress(_)
-            | Inst::ClearCaps(..) => true,
-            Inst::StringSet(_)
-            | Inst::StringSetRepeat { .. }
-            | Inst::Backref(_)
-            | Inst::BackrefAlt(_)
-            | Inst::Look { .. }
-            | Inst::LookBehind { .. }
-            | Inst::PushFlags(..)
-            | Inst::PopFlags
-            | Inst::CounterReset(_)
-            | Inst::CounterIncr(_)
-            | Inst::CountedBranch { .. }
-            | Inst::CheckCountedProgress { .. } => false,
-        };
-        if !core {
-            return Some("instruction");
-        }
+    if !program_taken(prog, width, true) {
+        return Some("instruction");
     }
     None
 }
 
+/// Whether the tier takes every instruction of forward program `prog`: the pattern's (`root`),
+/// or a lookahead's body.
+fn program_taken(prog: &[Inst], width: Width, root: bool) -> bool {
+    let n = prog.len();
+    prog.iter().enumerate().all(|(pc, inst)| match inst {
+        Inst::Save(0) => root && pc == 0,
+        Inst::Save(1) => root && pc == n - 2,
+        Inst::Match => pc == n - 1,
+        Inst::Class(class) => class_plan(class, width).is_some(),
+        Inst::Many { rep, .. } => match rep {
+            Rep::Class(class) => class_plan(class, width).is_some(),
+            Rep::Char(_) | Rep::Any => true,
+        },
+        Inst::Look { prog: body, .. } => program_taken(body, width, false),
+        // The code compares counts below 2^31 (a count past it takes as many iterations to
+        // reach).
+        Inst::CountedBranch { min, max, .. } => {
+            *min < 1 << 31 && max.is_none_or(|max| max < 1 << 31)
+        }
+        Inst::Char(_)
+        | Inst::Any
+        | Inst::Save(_)
+        | Inst::Split(..)
+        | Inst::Jmp(_)
+        | Inst::AssertStart
+        | Inst::AssertEnd
+        | Inst::WordBoundary(_)
+        | Inst::SetMark(_)
+        | Inst::CheckProgress(_)
+        | Inst::ClearCaps(..)
+        | Inst::Backref(_)
+        | Inst::BackrefAlt(_)
+        | Inst::PushFlags(..)
+        | Inst::PopFlags
+        | Inst::CounterReset(_)
+        | Inst::CounterIncr(_)
+        | Inst::CheckCountedProgress { .. } => true,
+        Inst::StringSet(_) | Inst::StringSetRepeat { .. } | Inst::LookBehind { .. } => false,
+    })
+}
+
+/// The lookaheads of `prog`, those of their bodies included: the frames the code may keep.
+fn look_count(prog: &[Inst]) -> usize {
+    prog.iter()
+        .map(|inst| match inst {
+            Inst::Look { prog: body, .. } => 1 + look_count(body),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// An upper bound on the size of `prog`'s code for `width`, in units of 100 instructions: one
 /// an instruction, but a class's (or a class loop's) table and ranges, which two-byte code tests
-/// in line, and each slot a capture clear restores.
+/// in line, each slot a capture clear restores, a lookahead's frame, body and captures, and each
+/// group a backreference may compare.
 fn code_units(prog: &[Inst], width: Width) -> usize {
     let class = |class: &super::CharClass| {
         3 + match width {
@@ -486,6 +531,10 @@ fn code_units(prog: &[Inst], width: Width) -> usize {
                 }
             }
             Inst::ClearCaps(lo, hi) => 1 + (hi + 1 - lo),
+            Inst::Look { prog: body, .. } => {
+                2 + code_units(body, width) + groups_inside(body).map_or(0, |(lo, hi)| hi + 1 - lo)
+            }
+            Inst::BackrefAlt(groups) => 1 + groups.len(),
             _ => 1,
         })
         .sum()
@@ -523,6 +572,7 @@ fn compile(re: &Regex, width: Width) -> Option<NativeCode> {
     Some(NativeCode {
         executable,
         width,
+        slots: plan.slots,
         entry,
     })
 }
@@ -562,6 +612,10 @@ fn assemble(plan: &Plan) -> Option<Vec<u8>> {
             Width::One => helper_next_candidate::<&[u8]> as *const () as usize,
             Width::Two => helper_next_candidate::<&[u16]> as *const () as usize,
         },
+        backref_fold: match plan.width {
+            Width::One => helper_backref_fold::<&[u8]> as *const () as usize,
+            Width::Two => helper_backref_fold::<&[u16]> as *const () as usize,
+        },
     };
     #[cfg(all(target_arch = "aarch64", unix))]
     {
@@ -591,7 +645,10 @@ mod x64;
 #[derive(Clone)]
 enum Test {
     Char(u32),
-    Any,
+    /// `.`, with the dotall flag in effect where it is.
+    Any {
+        dotall: bool,
+    },
     Class(Rc<ClassPlan>),
 }
 
@@ -691,18 +748,144 @@ fn class_test(class: &ClassPlan, width: Width, held: bool) -> ClassTest<'_> {
     }
 }
 
-/// What the generator needs to know of a program, for one width.
-struct Plan<'a> {
+/// The flags in effect at an instruction: the pattern's, or those of the innermost inline
+/// modifier group around it. A group's `PushFlags` and `PopFlags` enclose its body in the
+/// program's order, and no jump crosses them, so the flags are fixed per instruction at compile
+/// time; a lookahead's body begins with the flags of its `Look`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Flags {
+    icase: bool,
+    multiline: bool,
+    dotall: bool,
+}
+
+/// A program the generator emits: the pattern's, or a lookahead's body.
+struct Program<'a> {
     prog: &'a [Inst],
+    /// The pcs a branch or a resumed record reaches, which begin a run of templates.
+    targets: Vec<bool>,
+    /// The flags in effect at each pc.
+    flags: Vec<Flags>,
+}
+
+impl<'a> Program<'a> {
+    fn new(prog: &'a [Inst], entry: Flags) -> Self {
+        let mut targets = vec![false; prog.len() + 1];
+        let mut flags = Vec::with_capacity(prog.len());
+        let mut scopes = vec![entry];
+        for (pc, inst) in prog.iter().enumerate() {
+            let outer = *scopes.last().expect("the program's own flags");
+            flags.push(outer);
+            match inst {
+                Inst::Split(a, b) => {
+                    targets[*a] = true;
+                    targets[*b] = true;
+                }
+                Inst::Jmp(target) => targets[*target] = true,
+                Inst::CountedBranch { body, exit, .. } => {
+                    targets[*body] = true;
+                    targets[*exit] = true;
+                }
+                // Loops resume after themselves, and a negative lookahead's failed body at the
+                // instruction after it.
+                Inst::Many { .. } | Inst::Look { .. } => targets[pc + 1] = true,
+                Inst::PushFlags(icase, multiline, dotall) => scopes.push(Flags {
+                    icase: icase.unwrap_or(outer.icase),
+                    multiline: multiline.unwrap_or(outer.multiline),
+                    dotall: dotall.unwrap_or(outer.dotall),
+                }),
+                Inst::PopFlags => {
+                    scopes.pop();
+                }
+                _ => {}
+            }
+        }
+        Program {
+            prog,
+            targets,
+            flags,
+        }
+    }
+}
+
+/// A lookahead's plan.
+struct LookPlan {
+    /// Its body's program.
+    body: usize,
+    /// The elements the body tests from the position on, when it does nothing else: the
+    /// lookahead tests them in place, with no frame.
+    simple: Option<u32>,
+    /// The slot that keeps the offset of its frame record in the stack.
+    frame: usize,
+    /// The capture groups inside the body, `lo..=hi`: unset whenever the lookahead is entered
+    /// (each iteration of a loop around it unsets them first), so that restoring them, as the
+    /// matcher's snapshot does, is unsetting them, as V8's lookarounds clear their registers
+    /// (`ActionNode::PositiveSubmatchSuccess`, `NegativeSubmatchSuccess`).
+    groups: Option<(usize, usize)>,
+}
+
+/// The elements a lookahead's body tests in place when it is only elements (a loop of one
+/// element with a fixed count is as many), or `None`.
+fn simple_body(body: &[Inst]) -> Option<u32> {
+    let (last, elements) = body.split_last()?;
+    if !matches!(last, Inst::Match) {
+        return None;
+    }
+    let mut count = 0u32;
+    for inst in elements {
+        count += match inst {
+            Inst::Char(_) | Inst::Any | Inst::Class(_) => 1,
+            Inst::Many { min, max, .. } if Some(*min) == *max && *min <= MAX_SIMPLE_RUN => {
+                *min as u32
+            }
+            _ => return None,
+        };
+    }
+    (count <= MAX_SIMPLE_RUN as u32).then_some(count)
+}
+
+/// Elements a lookahead tests in place (see [`simple_body`]).
+const MAX_SIMPLE_RUN: usize = 16;
+
+/// The capture groups whose slots `prog` writes, `lo..=hi`, its lookaheads' included.
+fn groups_inside(prog: &[Inst]) -> Option<(usize, usize)> {
+    let mut span: Option<(usize, usize)> = None;
+    let mut add = |lo: usize, hi: usize| {
+        span = Some(span.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
+    };
+    for inst in prog {
+        match inst {
+            Inst::Save(slot) => add(slot / 2, slot / 2),
+            Inst::ClearCaps(lo, hi) => add(*lo, *hi),
+            Inst::Look { prog: body, .. } => {
+                if let Some((lo, hi)) = groups_inside(body) {
+                    add(lo, hi);
+                }
+            }
+            _ => {}
+        }
+    }
+    span
+}
+
+/// What the generator needs to know of a pattern, for one width.
+struct Plan<'a> {
     width: Width,
-    /// Capture slots (two per group, group 0's included); the marks follow them.
+    /// The pattern's program (0) and its lookaheads' bodies.
+    progs: Vec<Program<'a>>,
+    /// The lookaheads, by program and pc.
+    looks: std::collections::HashMap<(usize, usize), LookPlan>,
+    /// Capture slots (two per group, group 0's included); the marks follow them, then the
+    /// lookaheads' frames.
     nslots: usize,
+    /// Every slot the code keeps.
+    slots: usize,
     /// More capture slots than LOGGED has bits: each attempt unsets them all instead.
     wide: bool,
     /// The scan tries one start (sticky, or anchored at the input's start).
     only: bool,
+    /// The pattern's own multiline flag, which the first-element filter's line starts follow.
     multiline: bool,
-    dotall: bool,
     lead_run: bool,
     /// The pattern has a prefilter, whose window the candidate loop keeps.
     window: bool,
@@ -710,28 +893,12 @@ struct Plan<'a> {
     first: Option<[u8; 256]>,
     /// A match may also begin where `^` holds, whatever the element there.
     first_line_start: bool,
-    /// The pcs a branch or a resumed record reaches, which begin a run of templates.
-    targets: Vec<bool>,
     /// Tests by class, made once per class (by address).
     classes: std::cell::RefCell<std::collections::HashMap<usize, Rc<ClassPlan>>>,
 }
 
 impl<'a> Plan<'a> {
     fn new(re: &'a Regex, width: Width) -> Self {
-        let prog = &re.prog[..];
-        let mut targets = vec![false; prog.len() + 1];
-        for (pc, inst) in prog.iter().enumerate() {
-            match inst {
-                Inst::Split(a, b) => {
-                    targets[*a] = true;
-                    targets[*b] = true;
-                }
-                Inst::Jmp(target) => targets[*target] = true,
-                // Loops resume after themselves.
-                Inst::Many { .. } => targets[pc + 1] = true,
-                _ => {}
-            }
-        }
         let nslots = 2 * (re.ngroups + 1);
         let first = match (&re.first, &re.first_lut) {
             (FirstFilter::Atoms(_), Some(lut)) => {
@@ -743,21 +910,56 @@ impl<'a> Plan<'a> {
             }
             _ => None,
         };
-        Plan {
-            prog,
+        let mut plan = Plan {
             width,
+            progs: Vec::new(),
+            looks: Default::default(),
             nslots,
+            slots: nslots + re.nmarks,
             wide: nslots > 64,
             only: re.sticky || matches!(re.first, FirstFilter::Anchored),
             multiline: re.multiline,
-            dotall: re.dotall,
             lead_run: re.lead_run,
             window: re.prefilter.is_some(),
             first,
             first_line_start: re.first_line_start,
-            targets,
             classes: Default::default(),
+        };
+        let entry = Flags {
+            icase: re.ignore_case,
+            multiline: re.multiline,
+            dotall: re.dotall,
+        };
+        plan.add_program(&re.prog, entry);
+        plan
+    }
+
+    /// Add `prog`, entered with `entry`'s flags, and its lookaheads' bodies, returning its index.
+    fn add_program(&mut self, prog: &'a [Inst], entry: Flags) -> usize {
+        let id = self.progs.len();
+        self.progs.push(Program::new(prog, entry));
+        for (pc, inst) in prog.iter().enumerate() {
+            if let Inst::Look { prog: body, .. } = inst {
+                let body = &body[..];
+                let flags = self.progs[id].flags[pc];
+                let simple = simple_body(body);
+                let frame = self.slots;
+                if simple.is_none() {
+                    self.slots += 1;
+                }
+                let body_id = self.add_program(body, flags);
+                self.looks.insert(
+                    (id, pc),
+                    LookPlan {
+                        body: body_id,
+                        simple,
+                        frame,
+                        groups: groups_inside(body),
+                    },
+                );
+            }
         }
+        id
     }
 
     fn class(&self, class: &Rc<super::CharClass>) -> Rc<ClassPlan> {
@@ -771,35 +973,47 @@ impl<'a> Plan<'a> {
             .clone()
     }
 
-    fn rep_test(&self, rep: &Rep) -> Test {
+    fn rep_test(&self, rep: &Rep, flags: Flags) -> Test {
         match rep {
             Rep::Char(c) => Test::Char(*c),
-            Rep::Any => Test::Any,
+            Rep::Any => Test::Any {
+                dotall: flags.dotall,
+            },
             Rep::Class(class) => Test::Class(self.class(class)),
         }
     }
 
-    /// The element test of an element instruction.
-    fn element_test(&self, inst: &Inst) -> Option<Test> {
-        match inst {
-            Inst::Char(c) => Some(Test::Char(*c)),
-            Inst::Any => Some(Test::Any),
-            Inst::Class(class) => Some(Test::Class(self.class(class))),
-            _ => None,
+    /// The element test of the element instruction at `pc` of program `id`.
+    fn element_test(&self, id: usize, pc: usize) -> Test {
+        let program = &self.progs[id];
+        match &program.prog[pc] {
+            Inst::Char(c) => Test::Char(*c),
+            Inst::Any => Test::Any {
+                dotall: program.flags[pc].dotall,
+            },
+            Inst::Class(class) => Test::Class(self.class(class)),
+            _ => unreachable!("an element instruction"),
         }
     }
 
-    /// The test the branch at `pc` begins with, past capture and mark bookkeeping: what
-    /// [`Matcher::branch_may_match`](super::Matcher::branch_may_match) tests at run time,
-    /// resolved at compile time. `None` when the branch may match without one.
-    fn first_test(&self, mut pc: usize) -> Option<Test> {
+    /// The test the branch at `pc` of program `id` begins with, past capture and mark
+    /// bookkeeping: what [`Matcher::branch_may_match`](super::Matcher::branch_may_match) tests
+    /// at run time, resolved at compile time. `None` when the branch may match without one.
+    fn first_test(&self, id: usize, mut pc: usize) -> Option<Test> {
+        let program = &self.progs[id];
         for _ in 0..4 {
-            match &self.prog[pc] {
+            match &program.prog[pc] {
                 Inst::Char(_) | Inst::Any | Inst::Class(_) => {
-                    return self.element_test(&self.prog[pc])
+                    return Some(self.element_test(id, pc))
                 }
-                Inst::Many { rep, min, .. } if *min > 0 => return Some(self.rep_test(rep)),
-                Inst::Save(_) | Inst::ClearCaps(..) | Inst::SetMark(_) => pc += 1,
+                Inst::Many { rep, min, .. } if *min > 0 => {
+                    return Some(self.rep_test(rep, program.flags[pc]))
+                }
+                Inst::Save(_)
+                | Inst::ClearCaps(..)
+                | Inst::SetMark(_)
+                | Inst::CounterReset(_)
+                | Inst::CounterIncr(_) => pc += 1,
                 Inst::Jmp(target) => pc = *target,
                 _ => return None,
             }
@@ -811,41 +1025,56 @@ impl<'a> Plan<'a> {
 /// Stubs the templates refer to, emitted after the program.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Stub {
-    /// Resume the branch at a pc with POS from the record.
-    Alt(usize),
+    /// Resume the branch at a program's pc with POS from the record.
+    Alt(usize, usize),
     /// Restore a slot from the record, and backtrack on.
     Undo(usize),
-    /// Retry the greedy loop at a pc with a shorter run.
-    Greedy(usize),
-    /// Retry the lazy loop at a pc with a longer run.
-    Lazy(usize),
+    /// Retry the greedy loop at a program's pc with a shorter run.
+    Greedy(usize, usize),
+    /// Retry the lazy loop at a program's pc with a longer run.
+    Lazy(usize, usize),
+    /// The body of the lookahead at a program's pc failed: POS and CHOICES from its frame record.
+    LookFail(usize, usize),
+    /// Unset capture groups `lo..=hi`, those of a positive lookahead backtracked past, and
+    /// backtrack on.
+    Clear(usize, usize),
 }
 
-/// The template generator: one pass over the program, in order.
+/// The template generator: one pass over each program, in order, a lookahead's body in line.
 struct Generator<'p, 'a, M: Masm> {
     m: &'p mut M,
     plan: &'p Plan<'a>,
-    pcs: Vec<Label>,
+    /// Each program's pcs.
+    pcs: Vec<Vec<Label>>,
     bt: Label,
+    /// Where the pattern's `Match` goes.
+    matched: Label,
     stubs: Vec<(Stub, Label)>,
     stub_labels: std::collections::HashMap<Stub, Label>,
-    /// Lazy loops' extension code, emitted after the program: (pc, check label, extend label).
-    lazy: Vec<(usize, Label, Label)>,
+    /// Lazy loops' extension code, emitted after the program: (program, pc, check label, extend
+    /// label).
+    lazy: Vec<(usize, usize, Label, Label)>,
     /// Each lazy loop's extension, which its retry stub jumps to.
-    extend: std::collections::HashMap<usize, Label>,
+    extend: std::collections::HashMap<(usize, usize), Label>,
     /// The class whose table a loop holds (see [`Masm::hold_lut`]).
     held: Option<*const ClassPlan>,
 }
 
 impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     fn new(m: &'p mut M, plan: &'p Plan<'a>) -> Self {
-        let pcs = (0..=plan.prog.len()).map(|_| m.label()).collect();
+        let pcs = plan
+            .progs
+            .iter()
+            .map(|program| (0..=program.prog.len()).map(|_| m.label()).collect())
+            .collect();
         let bt = m.label();
+        let matched = m.label();
         Generator {
             m,
             plan,
             pcs,
             bt,
+            matched,
             stubs: Vec::new(),
             stub_labels: Default::default(),
             lazy: Vec::new(),
@@ -867,7 +1096,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     fn emit(mut self) {
         let plan = self.plan;
         let sentinel = self.m.label();
-        let matched = self.m.label();
+        let matched = self.matched;
         let no_match = self.m.label();
         let attempt = self.m.label();
         let cand = self.m.label();
@@ -930,10 +1159,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         } else {
             self.m.set_logged(0b11);
         }
-        let mut pc = 0;
-        while pc < plan.prog.len() {
-            pc = self.emit_at(pc, matched);
-        }
+        self.emit_program(0);
         // Backtrack: pop a record and jump to it.
         self.m.bind(self.bt);
         self.m.poll_tick();
@@ -949,8 +1175,8 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         }
         let mut emitted = 0;
         while emitted < self.stubs.len() || !self.lazy.is_empty() {
-            if let Some((pc, check, extend)) = self.lazy.pop() {
-                self.emit_lazy_extend(pc, check, extend);
+            if let Some((id, pc, check, extend)) = self.lazy.pop() {
+                self.emit_lazy_extend(id, pc, check, extend);
                 continue;
             }
             let (stub, label) = self.stubs[emitted];
@@ -964,26 +1190,39 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         self.m.ret(STATUS_NO_MATCH);
     }
 
-    /// Emit the template of `pc` (or of the run of element instructions it begins), returning
-    /// the pc after it.
-    fn emit_at(&mut self, pc: usize, matched: Label) -> usize {
+    /// Emit program `id`'s templates, in order.
+    fn emit_program(&mut self, id: usize) {
+        let mut pc = 0;
+        while pc < self.plan.progs[id].prog.len() {
+            pc = self.emit_at(id, pc);
+        }
+    }
+
+    /// Emit the template of `pc` in program `id` (or of the run of element instructions it
+    /// begins), returning the pc after it.
+    fn emit_at(&mut self, id: usize, pc: usize) -> usize {
         let plan = self.plan;
+        let program = &plan.progs[id];
+        let flags = program.flags[pc];
         let bt = self.bt;
-        self.m.bind(self.pcs[pc]);
-        match &plan.prog[pc] {
+        self.m.bind(self.pcs[id][pc]);
+        match &program.prog[pc] {
             Inst::Char(_) | Inst::Any | Inst::Class(_) => {
                 // A straight run of elements checks the room once and tests each at its offset.
                 let mut end = pc + 1;
-                while end < plan.prog.len()
-                    && !plan.targets[end]
-                    && matches!(plan.prog[end], Inst::Char(_) | Inst::Any | Inst::Class(_))
+                while end < program.prog.len()
+                    && !program.targets[end]
+                    && matches!(
+                        program.prog[end],
+                        Inst::Char(_) | Inst::Any | Inst::Class(_)
+                    )
                 {
                     end += 1;
                 }
                 let k = (end - pc) as u32;
                 self.m.branch_room_lt(k, bt);
-                for (offset, inst) in plan.prog[pc..end].iter().enumerate() {
-                    let test = plan.element_test(inst).expect("an element instruction");
+                for offset in 0..end - pc {
+                    let test = plan.element_test(id, pc + offset);
                     self.m.load_elem(offset as i32);
                     self.emit_test(&test, bt);
                 }
@@ -993,7 +1232,8 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
             Inst::Save(slot) => {
                 let slot = *slot;
                 // Slot 0 is written first in every attempt, at the root floor, and slot 1 only
-                // before the match: neither needs an undo record.
+                // before the match: neither needs an undo record. In a lookahead's body CHOICES
+                // counts its frame record, so every write there has one.
                 if slot > 1 {
                     let record = self.m.label();
                     let store = self.m.label();
@@ -1013,34 +1253,22 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 }
                 self.m.store_slot(slot, Value::Pos);
             }
-            Inst::Split(a, b) => {
-                let (a, b) = (*a, *b);
-                // As `Matcher::branch`: a first branch that fails at once is skipped, and the
-                // second is recorded only if it may match here.
-                if let Some(test) = plan.first_test(a) {
-                    self.emit_may_match(&test, self.pcs[b]);
-                }
-                let skip = self.m.label();
-                if let Some(test) = plan.first_test(b) {
-                    self.emit_may_match(&test, skip);
-                }
-                let alt = self.stub(Stub::Alt(b));
-                self.m.push(alt, Operand::Pos);
-                self.m.choices(1);
-                self.m.bind(skip);
-                if a != pc + 1 {
-                    self.m.jump(self.pcs[a]);
-                }
-            }
+            Inst::Split(a, b) => self.emit_split(id, pc, *a, *b),
             Inst::Jmp(target) => {
                 if *target <= pc {
                     self.m.poll_tick();
                 }
-                self.m.jump(self.pcs[*target]);
+                self.m.jump(self.pcs[id][*target]);
             }
-            Inst::Match => self.m.jump(matched),
+            Inst::Match => {
+                // A lookahead's body ends in its `Match`, which falls through to the
+                // lookahead's success, emitted next (see `emit_look`).
+                if id == 0 {
+                    self.m.jump(self.matched);
+                }
+            }
             Inst::AssertStart => {
-                if plan.multiline {
+                if flags.multiline {
                     let ok = self.m.label();
                     self.m.branch_at_start(true, ok);
                     self.m.load_elem(-1);
@@ -1052,7 +1280,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 }
             }
             Inst::AssertEnd => {
-                if plan.multiline {
+                if flags.multiline {
                     let ok = self.m.label();
                     self.m.branch_at_end(true, ok);
                     self.m.load_elem(0);
@@ -1071,7 +1299,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 greedy,
                 atomic,
             } => {
-                let test = plan.rep_test(rep);
+                let test = plan.rep_test(rep, flags);
                 // A count past any subject's length bounds nothing, or cannot be reached.
                 let max = max.and_then(|max| u32::try_from(max).ok().filter(|&m| m < 1 << 31));
                 let Some(min) = u32::try_from(*min).ok().filter(|&m| m < 1 << 31) else {
@@ -1079,23 +1307,15 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                     return pc + 1;
                 };
                 if *greedy {
-                    self.emit_greedy(pc, &test, min, max, *atomic);
+                    self.emit_greedy(id, pc, &test, min, max, *atomic);
                 } else {
-                    self.emit_lazy(pc, &test, min, max);
+                    self.emit_lazy(id, pc, &test, min, max);
                 }
             }
-            Inst::SetMark(id) => {
-                let slot = plan.nslots + id;
-                let store = self.m.label();
-                let undo = self.stub(Stub::Undo(slot));
-                self.m.branch_choices(true, store);
-                self.m.push(undo, Operand::Slot(slot));
-                self.m.bind(store);
-                self.m.store_slot(slot, Value::Pos);
-            }
-            Inst::CheckProgress(id) => {
+            Inst::SetMark(mark) => self.emit_mark_write(plan.nslots + mark, Value::Pos),
+            Inst::CheckProgress(mark) => {
                 // An iteration that consumed nothing fails (RepeatMatcher's empty check).
-                self.m.branch_slot_eq_pos(plan.nslots + id, bt);
+                self.m.branch_slot_eq_pos(plan.nslots + mark, bt);
             }
             Inst::ClearCaps(lo, hi) => {
                 for slot in 2 * lo..2 * hi + 2 {
@@ -1110,9 +1330,182 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                     self.m.bind(skip);
                 }
             }
-            _ => unreachable!("declined instruction in a native program"),
+            Inst::Look { negate, .. } => self.emit_look(id, pc, *negate),
+            Inst::Backref(group) => {
+                // A reference to a group the pattern does not have matches empty, as the
+                // matcher's does.
+                if *group != 0 && 2 * group + 1 < plan.nslots {
+                    self.m.backref(2 * group, flags.icase, bt);
+                }
+            }
+            Inst::BackrefAlt(groups) => {
+                // `\k<name>` of a name several groups share: through the one that captured.
+                let done = self.m.label();
+                for &group in groups.iter() {
+                    if 2 * group + 1 >= plan.nslots {
+                        continue;
+                    }
+                    let next = self.m.label();
+                    self.m.branch_slot_unset(2 * group, next);
+                    self.m.branch_slot_unset(2 * group + 1, next);
+                    self.m.backref(2 * group, flags.icase, bt);
+                    self.m.jump(done);
+                    self.m.bind(next);
+                }
+                self.m.bind(done);
+            }
+            // Inline modifier groups emit nothing: each instruction's flags are fixed.
+            Inst::PushFlags(..) | Inst::PopFlags => {}
+            Inst::CounterReset(counter) => self.emit_mark_write(plan.nslots + counter, Value::Zero),
+            Inst::CounterIncr(counter) => self.emit_mark_write(plan.nslots + counter, Value::Next),
+            Inst::CountedBranch {
+                id: counter,
+                min,
+                max,
+                greedy,
+                body,
+                exit,
+            } => {
+                // As the matcher: a mandatory iteration while the count is below `min`, the
+                // exit once it reaches `max`, else a choice, greedy or lazy first.
+                let slot = plan.nslots + counter;
+                if *min > 0 {
+                    self.m
+                        .branch_slot_lt(slot, *min as u32, true, self.pcs[id][*body]);
+                }
+                if let Some(max) = max {
+                    self.m
+                        .branch_slot_lt(slot, *max as u32, false, self.pcs[id][*exit]);
+                }
+                let (first, second) = if *greedy {
+                    (*body, *exit)
+                } else {
+                    (*exit, *body)
+                };
+                self.emit_split(id, pc, first, second);
+            }
+            Inst::CheckCountedProgress { mark, counter, min } => {
+                // Only an optional iteration, one past `min`, fails when it consumed nothing.
+                let skip = self.m.label();
+                if *min > 0 {
+                    self.m
+                        .branch_slot_lt(plan.nslots + counter, *min as u32, true, skip);
+                }
+                self.m.branch_slot_eq_pos(plan.nslots + mark, bt);
+                self.m.bind(skip);
+            }
+            Inst::StringSet(_) | Inst::StringSetRepeat { .. } | Inst::LookBehind { .. } => {
+                unreachable!("declined instruction in a native program")
+            }
         }
         pc + 1
+    }
+
+    /// A choice between the branches at `first` and `second` of program `id`, from `pc`: as
+    /// `Matcher::branch`, a first branch that fails at once is skipped, and the second is
+    /// recorded only if it may match here.
+    fn emit_split(&mut self, id: usize, pc: usize, first: usize, second: usize) {
+        if let Some(test) = self.plan.first_test(id, first) {
+            self.emit_may_match(&test, self.pcs[id][second]);
+        }
+        let skip = self.m.label();
+        if let Some(test) = self.plan.first_test(id, second) {
+            self.emit_may_match(&test, skip);
+        }
+        let alt = self.stub(Stub::Alt(id, second));
+        self.m.push(alt, Operand::Pos);
+        self.m.choices(1);
+        self.m.bind(skip);
+        if first != pc + 1 {
+            self.m.jump(self.pcs[id][first]);
+        }
+    }
+
+    /// Write a mark or a loop's count (`value`), with an undo record above the root floor: a
+    /// failure at it unwinds the whole attempt, and a path reads a mark only after writing it.
+    fn emit_mark_write(&mut self, slot: usize, value: Value) {
+        let store = self.m.label();
+        let undo = self.stub(Stub::Undo(slot));
+        self.m.branch_choices(true, store);
+        self.m.push(undo, Operand::Slot(slot));
+        self.m.bind(store);
+        self.m.store_slot(slot, value);
+    }
+
+    /// A lookahead at `pc` of program `id`, as the matcher's `LookFrame` runs it: its body in
+    /// line, above a frame record of the position and CHOICES, which counts it as a choice so
+    /// that every write in the body has an undo record. The body's success cuts the stack back
+    /// to the record, discarding the body's records (a lookahead is atomic), and restores the
+    /// position; its failure pops the frame record. A positive lookahead's captures stay set,
+    /// and are unset when the code backtracks past it; a negative one's are always unset after
+    /// it. A body of elements alone is tested in place.
+    fn emit_look(&mut self, id: usize, pc: usize, negate: bool) {
+        let plan = self.plan;
+        let look = &plan.looks[&(id, pc)];
+        let bt = self.bt;
+        if let Some(count) = look.simple {
+            let body = &plan.progs[look.body];
+            let fail = if negate { self.m.label() } else { bt };
+            if count > 0 {
+                self.m.branch_room_lt(count, fail);
+            }
+            let mut offset = 0i32;
+            for (bpc, inst) in body.prog[..body.prog.len() - 1].iter().enumerate() {
+                let (test, repeat) = match inst {
+                    Inst::Many { rep, min, .. } => {
+                        (plan.rep_test(rep, body.flags[bpc]), *min as i32)
+                    }
+                    _ => (plan.element_test(look.body, bpc), 1),
+                };
+                for _ in 0..repeat {
+                    self.m.load_elem(offset);
+                    self.emit_test(&test, fail);
+                    offset += 1;
+                }
+            }
+            if negate {
+                self.m.jump(bt);
+                self.m.bind(fail);
+            }
+            return;
+        }
+        let failed = self.stub(Stub::LookFail(id, pc));
+        self.m.mark_top(look.frame);
+        self.m.push(failed, Operand::PosChoices);
+        self.m.choices(1);
+        self.emit_program(look.body);
+        // The body matched.
+        self.m.cut_to(look.frame);
+        self.m.unpack_pos_choices();
+        if negate {
+            if let Some((lo, hi)) = look.groups {
+                self.m.fill_unset(2 * lo..2 * hi + 2);
+            }
+            self.m.jump(bt);
+        } else if let Some((lo, hi)) = look.groups {
+            // Its captures stay set, and are unset by a record when the code backtracks past
+            // it. At the root floor the attempt's first success leaves the record, as the
+            // matcher logs a root write once (`Matcher::log_root_write`): the lookahead's slots
+            // are logged together, and nothing else logs them (its body runs above its frame
+            // record). A wide program's attempt unsets every slot itself.
+            let clear = self.stub(Stub::Clear(lo, hi));
+            let record = self.m.label();
+            let done = self.m.label();
+            if id == 0 {
+                if plan.wide {
+                    self.m.branch_choices(true, done);
+                } else {
+                    self.m.branch_choices(false, record);
+                    self.m.branch_logged(2 * lo, done);
+                    for slot in 2 * lo..2 * hi + 2 {
+                        self.m.log_slot(slot);
+                    }
+                }
+            }
+            self.m.bind(record);
+            self.m.push(clear, Operand::Pos);
+            self.m.bind(done);
+        }
     }
 
     /// Test E with `test`, going to `fail` if it does not match.
@@ -1125,8 +1518,8 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                     self.m.branch_elem(Cond::Ne, *c, fail);
                 }
             }
-            Test::Any => {
-                if !self.plan.dotall {
+            Test::Any { dotall } => {
+                if !dotall {
                     self.m.branch_elem(Cond::Eq, 0x0a, fail);
                     self.m.branch_elem(Cond::Eq, 0x0d, fail);
                     if self.plan.width == Width::Two {
@@ -1208,8 +1601,8 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         }
     }
 
-    /// Go to `hit` if E is a word character (`[0-9A-Za-z_]`, IsWordChar outside Unicode mode
-    /// and `i`).
+    /// Go to `hit` if E is a word character (`[0-9A-Za-z_]`, IsWordChar outside Unicode mode,
+    /// with `i` or without).
     fn emit_word(&mut self, hit: Label) {
         let mut table = [0u8; 256];
         for (element, member) in table.iter_mut().enumerate() {
@@ -1251,7 +1644,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     /// leaving POS past the run, polling between stretches.
     fn emit_scan(&mut self, test: &Test, max: Option<u32>) {
         self.m.set_limit(max);
-        if matches!(test, Test::Any) && self.plan.dotall {
+        if matches!(test, Test::Any { dotall: true }) {
             self.m.pos_to_limit();
             return;
         }
@@ -1289,14 +1682,22 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         }
     }
 
-    /// A greedy loop: the longest run, and a record to retry shorter ones unless they are
-    /// futile ([`Matcher`](super::Matcher)'s `Backtrack::Greedy`).
-    fn emit_greedy(&mut self, pc: usize, test: &Test, min: u32, max: Option<u32>, atomic: bool) {
+    /// A greedy loop at `pc` of program `id`: the longest run, and a record to retry shorter ones
+    /// unless they are futile ([`Matcher`](super::Matcher)'s `Backtrack::Greedy`).
+    fn emit_greedy(
+        &mut self,
+        id: usize,
+        pc: usize,
+        test: &Test,
+        min: u32,
+        max: Option<u32>,
+        atomic: bool,
+    ) {
         let bt = self.bt;
         self.m.run_start();
         self.emit_scan(test, max);
         // The program's leading loop records where its run ended (see `Regex::lead_run`).
-        if self.plan.lead_run && pc == 1 {
+        if self.plan.lead_run && id == 0 && pc == 1 {
             self.m.store_lead();
         }
         if min > 0 {
@@ -1305,16 +1706,16 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         if !atomic {
             let skip = self.m.label();
             self.m.branch_run(Cond::Ls, min, skip);
-            let retry = self.stub(Stub::Greedy(pc));
+            let retry = self.stub(Stub::Greedy(id, pc));
             self.m.push(retry, Operand::Pack(min));
             self.m.choices(1);
             self.m.bind(skip);
         }
     }
 
-    /// A lazy loop: the shortest run whose continuation may match, and a record to retry longer
-    /// ones ([`Matcher::lazy_next`](super::Matcher::lazy_next)).
-    fn emit_lazy(&mut self, pc: usize, test: &Test, min: u32, max: Option<u32>) {
+    /// A lazy loop at `pc` of program `id`: the shortest run whose continuation may match, and a
+    /// record to retry longer ones ([`Matcher::lazy_next`](super::Matcher::lazy_next)).
+    fn emit_lazy(&mut self, id: usize, pc: usize, test: &Test, min: u32, max: Option<u32>) {
         let bt = self.bt;
         self.m.run_start();
         if min > 0 {
@@ -1324,28 +1725,29 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         let check = self.m.label();
         let extend = self.m.label();
         self.m.bind(check);
-        if let Some(next) = self.plan.first_test(pc + 1) {
+        if let Some(next) = self.plan.first_test(id, pc + 1) {
             self.emit_may_match(&next, extend);
         }
         let skip = self.m.label();
         if let Some(max) = max {
             self.m.branch_run(Cond::Hs, max, skip);
         }
-        let retry = self.stub(Stub::Lazy(pc));
+        let retry = self.stub(Stub::Lazy(id, pc));
         self.m.push(retry, Operand::Pack(0));
         self.m.choices(1);
         self.m.bind(skip);
-        self.lazy.push((pc, check, extend));
-        self.extend.insert(pc, extend);
+        self.lazy.push((id, pc, check, extend));
+        self.extend.insert((id, pc), extend);
     }
 
     /// A lazy loop's extension: one more element, then the continuation's test again.
-    fn emit_lazy_extend(&mut self, pc: usize, check: Label, extend: Label) {
+    fn emit_lazy_extend(&mut self, id: usize, pc: usize, check: Label, extend: Label) {
         let bt = self.bt;
-        let Inst::Many { rep, max, .. } = &self.plan.prog[pc] else {
+        let program = &self.plan.progs[id];
+        let Inst::Many { rep, max, .. } = &program.prog[pc] else {
             unreachable!("lazy extension outside its loop");
         };
-        let test = self.plan.rep_test(rep);
+        let test = self.plan.rep_test(rep, program.flags[pc]);
         let max = max.and_then(|max| u32::try_from(max).ok().filter(|&m| m < 1 << 31));
         self.m.bind(extend);
         if let Some(max) = max {
@@ -1362,16 +1764,16 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     fn emit_stub(&mut self, stub: Stub) {
         let bt = self.bt;
         match stub {
-            Stub::Alt(target) => {
+            Stub::Alt(id, target) => {
                 self.m.pos_from_op();
                 self.m.choices(-1);
-                self.m.jump(self.pcs[target]);
+                self.m.jump(self.pcs[id][target]);
             }
             Stub::Undo(slot) => {
                 self.m.store_slot(slot, Value::Op);
                 self.m.jump(bt);
             }
-            Stub::Greedy(pc) => {
+            Stub::Greedy(id, pc) => {
                 // As `Matcher::greedy_retry`: one element shorter at a time, down to the least
                 // end, until the continuation's first test may match.
                 self.m.choices(-1);
@@ -1381,25 +1783,37 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 self.m.bind(retry);
                 self.m.retreat(1);
                 self.m.poll_tick();
-                if let Some(test) = self.plan.first_test(pc + 1) {
+                if let Some(test) = self.plan.first_test(id, pc + 1) {
                     self.emit_may_match(&test, next);
                 }
                 let skip = self.m.label();
                 self.m.branch_pos_rs(Cond::Ls, skip);
-                let again = self.stub(Stub::Greedy(pc));
+                let again = self.stub(Stub::Greedy(id, pc));
                 self.m.push(again, Operand::Pack(0));
                 self.m.choices(1);
                 self.m.bind(skip);
-                self.m.jump(self.pcs[pc + 1]);
+                self.m.jump(self.pcs[id][pc + 1]);
                 self.m.bind(next);
                 self.m.branch_pos_rs(Cond::Hi, retry);
                 self.m.jump(bt);
             }
-            Stub::Lazy(pc) => {
+            Stub::Lazy(id, pc) => {
                 self.m.choices(-1);
                 self.m.unpack_op();
-                let extend = self.extend[&pc];
+                let extend = self.extend[&(id, pc)];
                 self.m.jump(extend);
+            }
+            Stub::LookFail(id, pc) => {
+                // The body failed: a positive lookahead fails, a negative one holds.
+                self.m.unpack_pos_choices();
+                match self.plan.progs[id].prog[pc] {
+                    Inst::Look { negate: true, .. } => self.m.jump(self.pcs[id][pc + 1]),
+                    _ => self.m.jump(bt),
+                }
+            }
+            Stub::Clear(lo, hi) => {
+                self.m.fill_unset(2 * lo..2 * hi + 2);
+                self.m.jump(bt);
             }
         }
     }
@@ -1408,11 +1822,6 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
 // ---------------------------------------------------------------------------------------------
 // Running the code
 // ---------------------------------------------------------------------------------------------
-
-/// The slots the tier keeps for a program: its capture slots, then its marks.
-fn slot_count(re: &Regex) -> usize {
-    2 * (re.ngroups + 1) + re.nmarks
-}
 
 /// Run `code` over `input` from `start` (`only` alone, when it is set), as
 /// [`Regex::run_matcher`] runs the matcher: `Ok(true)` leaves the match's capture slots in
@@ -1448,7 +1857,7 @@ fn run_native<I: ReInput>(
 ) -> Result<bool, MatchError> {
     debug_assert_eq!(I::NATIVE_WIDTH, Some(code.width));
     let nslots = 2 * (re.ngroups + 1);
-    let slots = slot_count(re);
+    let slots = code.slots;
     if scratch.native_slots.len() != slots || scratch.native_stack.capacity() < INITIAL_RECORDS {
         prepare(scratch, slots);
     }
@@ -1659,6 +2068,33 @@ extern "C" fn helper_next_candidate<I: ReInput + NativeInput>(
         Ok(None) => 1 << 63,
         Err(error) => 1 << 63 | status_of(error),
     }
+}
+
+/// A backreference under `i`: whether the `n` units at `pos` repeat those at `at` under the
+/// legacy Canonicalize (1) or not (0), as the matcher's `backref_end` compares them, polling as
+/// it does; `1 << 63` with a status when the host interrupts the compare.
+extern "C" fn helper_backref_fold<I: ReInput + NativeInput>(
+    ctx: *mut NativeCtx,
+    at: usize,
+    pos: usize,
+    n: usize,
+) -> u64 {
+    // SAFETY: the generated code passes the context of the running call, whose subject has
+    // `I`'s width, and spans it checked are in the subject.
+    let ctx = unsafe { &*ctx };
+    let control = unsafe { &*ctx.control };
+    let input = unsafe { I::from_parts(ctx.subject, ctx.len) };
+    for k in 0..n {
+        if k != 0 && k & super::INTERRUPT_POLL_MASK == 0 {
+            if let Err(error) = super::poll_interrupt(control) {
+                return 1 << 63 | status_of(error);
+            }
+        }
+        if !super::chars_eq(input.at(pos + k), input.at(at + k), true, false) {
+            return 0;
+        }
+    }
+    1
 }
 
 /// The subjects the tier runs on, rebuilt from the parts the context keeps.

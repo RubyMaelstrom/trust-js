@@ -64,9 +64,22 @@ fn cc(cond: Cond) -> u8 {
 
 /// Out-of-line code that sites request, emitted after the program.
 enum Outline {
-    Poll { slow: Label, back: Label },
-    Grow { slow: Label, retry: Label },
-    CandidateStatus { slow: Label, no_match: Label },
+    Poll {
+        slow: Label,
+        back: Label,
+    },
+    Grow {
+        slow: Label,
+        retry: Label,
+    },
+    CandidateStatus {
+        slow: Label,
+        no_match: Label,
+    },
+    /// A helper returned an interruption's status: leave with it.
+    Status {
+        slow: Label,
+    },
 }
 
 pub(super) struct Asm {
@@ -85,6 +98,7 @@ pub(super) struct Asm {
     poll_routine: Label,
     grow_routine: Label,
     candidate_routine: Label,
+    backref_routine: Label,
     exit: Label,
     /// The table whose address rdx holds.
     held: Option<Data>,
@@ -108,6 +122,7 @@ impl Asm {
             poll_routine: 0,
             grow_routine: 0,
             candidate_routine: 0,
+            backref_routine: 0,
             exit: 0,
             held: None,
             unencodable: false,
@@ -115,6 +130,7 @@ impl Asm {
         asm.poll_routine = asm.label();
         asm.grow_routine = asm.label();
         asm.candidate_routine = asm.label();
+        asm.backref_routine = asm.label();
         asm.exit = asm.label();
         asm
     }
@@ -333,6 +349,11 @@ impl Asm {
                     self.jcc(Cond::Eq, no_match);
                     self.jump(self.exit);
                 }
+                Outline::Status { slow } => {
+                    self.bind(slow);
+                    self.alu_imm(false, 4, RAX, 0xff);
+                    self.jump(self.exit);
+                }
             }
         }
     }
@@ -386,6 +407,19 @@ impl Asm {
             self.mov(RDI, CTX);
             self.mov(RSI, POS);
             self.call_literal(self.helpers.next_candidate as u64);
+            self.restore_scratch();
+            self.ret_instruction();
+        }
+        // A backreference under `i`: the helper compares the rcx units at the position with
+        // those at rdx (`helper_backref_fold`), answering in rax.
+        let backref = self.backref_routine;
+        if self.referenced(backref) {
+            self.bind(backref);
+            self.save_scratch();
+            self.mov(RSI, OP);
+            self.mov(RDI, CTX);
+            self.mov(RDX, POS);
+            self.call_literal(self.helpers.backref_fold as u64);
             self.restore_scratch();
             self.ret_instruction();
         }
@@ -590,6 +624,13 @@ impl Masm for Asm {
                 self.alu(true, 0x09, RAX, POS);
                 RAX
             }
+            Operand::PosChoices => {
+                // mov rax, rbp; shl rax, 32; or rax, r12
+                self.mov(RAX, CHOICES);
+                self.shift(false, RAX, 32);
+                self.alu(true, 0x09, RAX, POS);
+                RAX
+            }
         };
         self.store(TOP, 8, value);
         self.alu_imm(true, 0, TOP, 16);
@@ -630,9 +671,15 @@ impl Masm for Asm {
         match value {
             Value::Pos => self.store(SLOTS, Self::slot_disp(slot), POS),
             Value::Op => self.store(SLOTS, Self::slot_disp(slot), OP),
-            Value::Unset => {
+            Value::Unset | Value::Zero => {
+                // mov qword [r13 + disp], -1 or 0
                 self.op_mem(true, &[0xc7], 0, SLOTS, Self::slot_disp(slot) as i32);
-                self.imm32(-1);
+                self.imm32(if value == Value::Zero { 0 } else { -1 });
+            }
+            Value::Next => {
+                // add qword [r13 + disp], 1
+                self.op_mem(true, &[0x83], 0, SLOTS, Self::slot_disp(slot) as i32);
+                self.byte(1);
             }
         }
     }
@@ -648,6 +695,114 @@ impl Masm for Asm {
         // cmp [r13 + disp], r12
         self.op_mem(true, &[0x39], POS, SLOTS, Self::slot_disp(slot) as i32);
         self.jcc(Cond::Eq, label);
+    }
+
+    fn branch_slot_lt(&mut self, slot: usize, value: u32, lt: bool, label: Label) {
+        // cmp qword [r13 + disp], imm32 (below 2^31, so its sign extension is itself)
+        debug_assert!(value < 1 << 31);
+        self.op_mem(true, &[0x81], 7, SLOTS, Self::slot_disp(slot) as i32);
+        self.imm32(value as i32);
+        self.jcc(if lt { Cond::Lo } else { Cond::Hs }, label);
+    }
+
+    fn mark_top(&mut self, slot: usize) {
+        // An offset, as V8 keeps a lookaround's stack pointer: growing the stack moves it.
+        // mov r11, r14; sub r11, [r15 + stack]; mov [r13 + disp], r11
+        self.mov(SCRATCH, TOP);
+        self.op_mem(true, &[0x2b], SCRATCH, CTX, ctx::STACK as i32);
+        self.store(SLOTS, Self::slot_disp(slot), SCRATCH);
+    }
+
+    fn cut_to(&mut self, slot: usize) {
+        // mov r14, [r15 + stack]; add r14, [r13 + disp]; mov rdx, [r14 + 8]
+        self.load(TOP, CTX, ctx::STACK);
+        self.op_mem(true, &[0x03], TOP, SLOTS, Self::slot_disp(slot) as i32);
+        self.load(OP, TOP, 8);
+    }
+
+    fn unpack_pos_choices(&mut self) {
+        // mov r12d, edx (zero-extends); mov rbp, rdx; shr rbp, 32
+        self.op_rr(false, &[0x89], OP, POS);
+        self.mov(CHOICES, OP);
+        self.shift(true, CHOICES, 32);
+    }
+
+    fn backref(&mut self, slot: usize, icase: bool, fail: Label) {
+        // The loop registers: no loop holds them across a backreference.
+        debug_assert!(self.held.is_none());
+        let done = self.label();
+        // rdx = the capture's start, rcx = its end: unset (all ones), it matches empty.
+        self.load(OP, SLOTS, Self::slot_disp(slot));
+        self.load(RS, SLOTS, Self::slot_disp(slot + 1));
+        self.alu_imm(true, 7, OP, -1);
+        self.jcc(Cond::Eq, done);
+        self.alu_imm(true, 7, RS, -1);
+        self.jcc(Cond::Eq, done);
+        // rcx = its length (a forward program's captures end at or past their start): empty, it
+        // matches empty; else the subject must have as many units left.
+        self.alu(true, 0x29, RS, OP);
+        self.jcc(Cond::Eq, done);
+        self.mov(SCRATCH, LEN);
+        self.alu(true, 0x29, SCRATCH, POS);
+        self.alu(true, 0x39, SCRATCH, RS);
+        self.jcc(Cond::Lo, fail);
+        if icase {
+            // The helper answers 1 if Canonicalize's agree, 0 if not, or bit 63 and a status if
+            // the host interrupted a long compare.
+            let status = self.label();
+            self.call(self.backref_routine);
+            self.alu(true, 0x85, RAX, RAX);
+            // js: bit 63 carries a status.
+            self.bytes(&[0x0f, 0x88]);
+            self.rel32(status);
+            self.jcc(Cond::Eq, fail);
+            self.outlines.push(Outline::Status { slow: status });
+            self.alu(true, 0x01, POS, RS);
+        } else {
+            // rsi = the capture's first unit, rdi = the position's, and POS past the repetition
+            // (a failure backtracks, which sets it again). Stretches of at most SCAN_STRETCH
+            // units, polled between: r11 counts the stretch's units, rcx those after it.
+            let (scale, step) = match self.width {
+                Width::One => (0, 1),
+                Width::Two => (1, 2),
+            };
+            let stretch = self.label();
+            let unit = self.label();
+            let end = self.label();
+            self.op_sib(true, &[0x8d], LIM, SUBJ, OP, scale, 0);
+            self.op_sib(true, &[0x8d], CLIM, SUBJ, POS, scale, 0);
+            self.alu(true, 0x01, POS, RS);
+            self.bind(stretch);
+            self.mov_imm32(SCRATCH, SCAN_STRETCH);
+            self.alu(true, 0x39, RS, SCRATCH);
+            self.cmov(Cond::Lo, SCRATCH, RS);
+            self.alu(true, 0x29, RS, SCRATCH);
+            self.bind(unit);
+            match self.width {
+                Width::One => {
+                    // movzx eax, byte [rsi]; cmp al, byte [rdi]
+                    self.op_mem(false, &[0x0f, 0xb6], E, LIM, 0);
+                    self.op_mem(false, &[0x3a], E, CLIM, 0);
+                }
+                Width::Two => {
+                    // movzx eax, word [rsi]; cmp ax, word [rdi]
+                    self.op_mem(false, &[0x0f, 0xb7], E, LIM, 0);
+                    self.byte(0x66);
+                    self.op_mem(false, &[0x3b], E, CLIM, 0);
+                }
+            }
+            self.jcc(Cond::Ne, fail);
+            self.alu_imm(true, 0, LIM, step);
+            self.alu_imm(true, 0, CLIM, step);
+            self.alu_imm(true, 5, SCRATCH, 1);
+            self.jcc(Cond::Ne, unit);
+            self.alu(true, 0x85, RS, RS);
+            self.jcc(Cond::Eq, end);
+            self.poll_now();
+            self.jump(stretch);
+            self.bind(end);
+        }
+        self.bind(done);
     }
 
     fn pos_from_op(&mut self) {
@@ -986,6 +1141,77 @@ mod tests {
                 "41 f7 c3 df ff ff ff",
                 "test r11d,0xffffffdf",
             ),
+            // W5b's 3c: lookahead frames, counted loops' counts, backreferences.
+            (|a| a.mov(RAX, RBP), "48 89 e8", "mov rax,rbp"),
+            (
+                |a| a.store_slot(4, Value::Next),
+                "49 83 85 20 00 00 00 01",
+                "add QWORD PTR [r13+0x20],0x1",
+            ),
+            (
+                |a| a.store_slot(4, Value::Zero),
+                "49 c7 85 20 00 00 00 00 00 00 00",
+                "mov QWORD PTR [r13+0x20],0x0",
+            ),
+            (
+                |a| {
+                    a.op_mem(true, &[0x81], 7, R13, 24);
+                    a.imm32(1001);
+                },
+                "49 81 bd 18 00 00 00 e9 03 00 00",
+                "cmp QWORD PTR [r13+0x18],0x3e9",
+            ),
+            (
+                |a| a.op_mem(true, &[0x2b], R11, R15, 32),
+                "4d 2b 9f 20 00 00 00",
+                "sub r11,QWORD PTR [r15+0x20]",
+            ),
+            (
+                |a| a.op_mem(true, &[0x03], R14, R13, 40),
+                "4d 03 b5 28 00 00 00",
+                "add r14,QWORD PTR [r13+0x28]",
+            ),
+            (|a| a.shift(true, RBP, 32), "48 c1 ed 20", "shr rbp,0x20"),
+            (
+                |a| a.alu_imm(true, 7, RDX, -1),
+                "48 83 fa ff",
+                "cmp rdx,0xffffffffffffffff",
+            ),
+            (|a| a.alu(true, 0x29, RCX, RDX), "48 29 d1", "sub rcx,rdx"),
+            (|a| a.alu(true, 0x01, R12, RCX), "49 01 cc", "add r12,rcx"),
+            (
+                |a| a.op_sib(true, &[0x8d], RSI, RBX, RDX, 0, 0),
+                "48 8d b4 13 00 00 00 00",
+                "lea rsi,[rbx+rdx*1+0x0]",
+            ),
+            (
+                |a| a.op_sib(true, &[0x8d], RDI, RBX, R12, 1, 0),
+                "4a 8d bc 63 00 00 00 00",
+                "lea rdi,[rbx+r12*2+0x0]",
+            ),
+            (
+                |a| a.cmov(Cond::Lo, R11, RCX),
+                "4c 0f 42 d9",
+                "cmovb r11,rcx",
+            ),
+            (
+                |a| a.op_mem(false, &[0x3a], RAX, RDI, 0),
+                "3a 87 00 00 00 00",
+                "cmp al,BYTE PTR [rdi+0x0]",
+            ),
+            (
+                |a| {
+                    a.byte(0x66);
+                    a.op_mem(false, &[0x3b], RAX, RDI, 0);
+                },
+                "66 3b 87 00 00 00 00",
+                "cmp ax,WORD PTR [rdi+0x0]",
+            ),
+            (
+                |a| a.op_mem(false, &[0x0f, 0xb7], RAX, RSI, 0),
+                "0f b7 86 00 00 00 00",
+                "movzx eax,WORD PTR [rsi+0x0]",
+            ),
         ];
         let print = std::env::var_os("TRUST_JS_REGEXP_X64_ENCODINGS").is_some();
         for (emit, expected, text) in cases {
@@ -995,6 +1221,7 @@ mod tests {
                     poll: 0,
                     grow: 0,
                     next_candidate: 0,
+                    backref_fold: 0,
                 },
             );
             emit(&mut a);
@@ -1016,6 +1243,7 @@ mod tests {
             poll: 0,
             grow: 0,
             next_candidate: 0,
+            backref_fold: 0,
         };
         for slot in [63, 64, 300] {
             let mut a = Asm::new(Width::One, helpers());
