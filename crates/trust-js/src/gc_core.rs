@@ -2219,6 +2219,27 @@ impl Heap {
         self.alloc_cell(desc, size, false)
     }
 
+    /// [`Heap::alloc`] of a small cell of size class `class` ([`small_cell_class`]), not zeroed:
+    /// for an owner that writes every word its trace reads before the next safepoint (an
+    /// environment record's header and counted slots, `interpreter::new_record`).
+    #[inline(always)]
+    pub(crate) fn alloc_small_uninit(&mut self, desc: DescId, class: u8) -> *mut u8 {
+        let class = usize::from(class);
+        if self.fast_alloc {
+            let slot = desc.0 as usize * SIZE_CLASSES.len() + class;
+            if let Some(cursor) = self.cursors.get_mut(slot) {
+                if cursor.free != 0 {
+                    let ptr = cursor.take();
+                    self.count_live(desc);
+                    self.charge_bytes(SIZE_CLASSES[class]);
+                    return ptr;
+                }
+            }
+        }
+        self.alloc_cell_slow(desc, SIZE_CLASSES[class], false)
+            .expect("a small cell")
+    }
+
     /// The allocation path: a small cell from its class's cursor, which holds the free cells of
     /// one word of a page's bitmap, unless the heap counts each allocation as it happens
     /// ([`Heap::fast_alloc`]); everything else ([`Heap::alloc_cell_slow`]) out of line. Inlined

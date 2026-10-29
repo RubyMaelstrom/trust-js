@@ -3719,14 +3719,22 @@ fn census_dead_scope(cell: *mut u8) {
     }
 }
 
-/// A fresh cell for one environment record in the active heap (see `Env::new`).
+/// A fresh cell for one environment record in the active heap, of the small size class `class`
+/// (the record's header and its in-place slots, see [`crate::interpreter::VarMap`]), not zeroed:
+/// its maker writes the header and the counted slots before the next safepoint (`Env::new`,
+/// `interpreter::new_record`), and a trace reads no other word.
 #[inline]
-/// A zeroed environment cell of `size` bytes (a small cell's size: the record's header and its
-/// in-place slots, see [`crate::interpreter::VarMap`]).
-pub(crate) fn alloc_scope_cell(size: usize) -> *mut RefCell<crate::interpreter::Scope> {
-    debug_assert!(size >= std::mem::size_of::<RefCell<crate::interpreter::Scope>>());
-    debug_assert!(size <= crate::gc_core::LARGEST_SMALL_CELL);
-    with_agent_heap(|heap| heap.core.borrow_mut().alloc(heap.scope_desc, size).cast())
+pub(crate) fn alloc_scope_cell(class: u8) -> *mut RefCell<crate::interpreter::Scope> {
+    debug_assert!(
+        crate::gc_core::small_class_size(class)
+            >= std::mem::size_of::<RefCell<crate::interpreter::Scope>>()
+    );
+    with_agent_heap(|heap| {
+        heap.core
+            .borrow_mut()
+            .alloc_small_uninit(heap.scope_desc, class)
+            .cast()
+    })
 }
 
 impl crate::gc_trace::GcTrace for Object {

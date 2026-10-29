@@ -3720,6 +3720,19 @@ impl Chunk {
                 .get_or_init(|| Box::new(ActivationPlan::new(self)))
                 .instantiate(self, i, env, this_val, args, copy_words);
         }
+        self.make_unplanned_activation(i, env, this_val, args)
+    }
+
+    /// [`Chunk::make_activation`] without a plan: a reused activation, or plans turned off
+    /// (`TRUST_JS_ACTIVATION_PLANS=0`). Out of line, so that the plan's path keeps a small frame.
+    #[inline(never)]
+    fn make_unplanned_activation(
+        &self,
+        i: &mut Interp,
+        env: &Env,
+        this_val: &Value,
+        args: &[Value],
+    ) -> Env {
         let act = if self.reuse_activation {
             *env
         } else {

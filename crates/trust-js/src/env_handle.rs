@@ -20,15 +20,17 @@ mod cell {
     pub struct Env(NonNull<RefCell<Scope>>);
 
     impl Env {
-        /// Allocate `scope`, a record's header, in the active Agent's heap, in a cell of `size`
-        /// bytes: its in-place binding slots follow the header, zeroed (see
-        /// [`crate::interpreter::VarMap`], whose size class the header records).
+        /// Allocate `scope`, a record's header, in the active Agent's heap, in a cell of the small
+        /// size class `class`: its in-place binding slots follow the header, not yet written (see
+        /// [`crate::interpreter::VarMap`], whose size class the header records). The caller
+        /// writes the `scope.vars` count's slots before the next safepoint.
         #[inline]
-        pub(crate) fn new(scope: Scope, size: usize) -> Env {
-            let cell = crate::value::alloc_scope_cell(size);
-            // SAFETY: a fresh zeroed cell of at least `RefCell<Scope>`'s size, aligned for it.
-            // Allocation never collects, so the header is written before any collection can
-            // trace it, and zeroed slots trace as numbers.
+        pub(crate) fn new(scope: Scope, class: u8) -> Env {
+            let cell = crate::value::alloc_scope_cell(class);
+            // SAFETY: a fresh cell of at least `RefCell<Scope>`'s size, aligned for it. The
+            // allocation collects, if at all, before it returns, so the header is written before
+            // any collection can trace it; a trace reads the slots the header counts, which the
+            // caller writes before the next safepoint.
             unsafe {
                 std::ptr::write(cell, RefCell::new(scope));
                 Env(NonNull::new_unchecked(cell))

@@ -8,7 +8,8 @@
 
 use super::{CapInit, Chunk};
 use crate::interpreter::{
-    new_var_scope_with_desc, Binding, BindingAttrs, BindingSlot, DescRef, Env, Interp, ScopeDesc,
+    new_activation, record_class, Binding, BindingAttrs, BindingSlot, DescRef, Env, Interp,
+    ScopeDesc,
 };
 use crate::value::Value;
 use std::rc::Rc;
@@ -32,6 +33,8 @@ pub(super) struct ActivationPlan {
     functions: Vec<(usize, u16)>,
     this_slot: Option<usize>,
     arguments_slot: Option<usize>,
+    /// The size class of an activation's cell (`record_class`).
+    class: u8,
 }
 
 impl ActivationPlan {
@@ -47,6 +50,7 @@ impl ActivationPlan {
             functions: Vec::new(),
             this_slot: None,
             arguments_slot: None,
+            class: 0,
         };
         let mut slots = crate::fasthash::FastMap::<Rc<str>, usize>::default();
         let mut slot = |bindings: &mut Vec<BindingSlot>,
@@ -151,6 +155,7 @@ impl ActivationPlan {
         drop(slot);
         plan.desc = ScopeDesc::new(names, attrs);
         plan.kept_desc = crate::value::keep_scope_desc(&plan.desc);
+        plan.class = record_class(plan.bindings.len());
         plan
     }
 
@@ -170,27 +175,26 @@ impl ActivationPlan {
             (slot, interp.make_array(surplus))
         });
         // The record, at the descriptor's size, from the template's words (TDZ for lexicals).
-        let activation = new_var_scope_with_desc(Some(*parent), self.kept_desc, &self.bindings);
-        if copy_words {
+        let activation = new_activation(*parent, self.kept_desc, self.class, &self.bindings);
+        if copy_words || rest.is_some() {
             let mut scope = activation.borrow_mut();
-            for &(slot, parameter) in &self.parameters {
-                scope.vars.initialize_fixed_value(
-                    slot,
-                    arguments
-                        .get(usize::from(parameter))
-                        .copied()
-                        .unwrap_or(Value::Undefined),
-                );
+            if copy_words {
+                for &(slot, parameter) in &self.parameters {
+                    scope.vars.initialize_fixed_value(
+                        slot,
+                        arguments
+                            .get(usize::from(parameter))
+                            .copied()
+                            .unwrap_or(Value::Undefined),
+                    );
+                }
+                if let Some(slot) = self.this_slot {
+                    scope.vars.initialize_fixed_value(slot, *this_value);
+                }
             }
-            if let Some(slot) = self.this_slot {
-                scope.vars.initialize_fixed_value(slot, *this_value);
+            if let Some((slot, array)) = rest {
+                scope.vars.initialize_fixed_value(slot, array);
             }
-        }
-        if let Some((slot, array)) = rest {
-            activation
-                .borrow_mut()
-                .vars
-                .initialize_fixed_value(slot, array);
         }
         // Every closure captures this invocation's actual environment. The
         // plan contains no JS object, closure environment, or argument owner.

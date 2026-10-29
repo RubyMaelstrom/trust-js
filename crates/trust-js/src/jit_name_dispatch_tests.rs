@@ -215,7 +215,12 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
                 let slots: Vec<_> = (0..24)
                     .map(|n| Binding::data(Value::Num(n as f64), true, true).slot())
                     .collect();
-                crate::interpreter::new_var_scope_with_desc(None, kept, &slots)
+                crate::interpreter::new_activation(
+                    new_scope(None),
+                    kept,
+                    crate::interpreter::record_class(slots.len()),
+                    &slots,
+                )
             }
         };
         let first = make();

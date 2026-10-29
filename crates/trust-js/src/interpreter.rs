@@ -2264,6 +2264,12 @@ impl RecordSlots<'_> {
     }
 }
 
+/// The size class of a record cell for `len` bindings ([`record_cell`]): what a plan's
+/// activations, `len` bindings each, are allocated in ([`new_activation`]).
+pub(crate) fn record_class(len: usize) -> u8 {
+    record_cell(len).0
+}
+
 /// A new environment record with room for `capacity` bindings in its cell (see
 /// [`record_cell`]), holding `slots` named by `names`, slot for slot.
 fn new_record(
@@ -2274,10 +2280,24 @@ fn new_record(
     slots: RecordSlots<'_>,
     capacity: usize,
 ) -> Env {
+    let (class, _) = record_cell(capacity.max(slots.len()));
+    new_record_in(class, parent, with_obj, flags, names, slots)
+}
+
+/// [`new_record`] in a cell of size class `class`, which holds at least `slots`, or the record's
+/// fewest in-place slots ([`MIN_INLINE_SLOTS`]) when they spill.
+#[inline(always)]
+fn new_record_in(
+    class: u8,
+    parent: Option<Env>,
+    with_obj: Value,
+    flags: (bool, bool, bool),
+    names: Names,
+    slots: RecordSlots<'_>,
+) -> Env {
     let (under_with, var_boundary, catch_param) = flags;
     let len = slots.len();
     debug_assert_eq!(names.len(), len);
-    let (class, size) = record_cell(capacity.max(len));
     let vars = VarMap::header(names, class, under_with, var_boundary, catch_param);
     let spill = len > vars.inline_capacity();
     let env = Env::new(
@@ -2286,11 +2306,11 @@ fn new_record(
             parent,
             with_obj,
         },
-        size,
+        class,
     );
-    // SAFETY: a fresh record nothing else names yet: its header is written and its cell holds
-    // `inline_capacity` zeroed slots (numbers to a trace). Allocating its block reaches no
-    // safepoint, and every slot is written before the record is returned.
+    // SAFETY: a fresh record nothing else names yet: its header is written, counting no slot
+    // until the last write below. Allocating its block reaches no safepoint, and every slot is
+    // written before the count includes it and the record is returned.
     unsafe {
         let vars = &mut (*env.scope_ptr()).vars;
         if spill {
@@ -2298,7 +2318,7 @@ fn new_record(
         }
         let to = vars.slots_ptr();
         match slots {
-            RecordSlots::Copy(slots) => std::ptr::copy_nonoverlapping(slots.as_ptr(), to, len),
+            RecordSlots::Copy(slots) => copy_slots(slots, to),
             RecordSlots::Tdz(len) => {
                 for slot in 0..len {
                     to.add(slot).write(BindingSlot::TDZ);
@@ -2308,6 +2328,37 @@ fn new_record(
         vars.len = len as u32;
     }
     env
+}
+
+/// Copy a record's first words: a plan's few as plain stores, more with `copy_nonoverlapping`.
+///
+/// # Safety
+/// `to` addresses room for `from.len()` slots that `from` does not overlap.
+#[inline(always)]
+unsafe fn copy_slots(from: &[BindingSlot], to: *mut BindingSlot) {
+    // SAFETY: the caller's.
+    unsafe {
+        match *from {
+            [] => {}
+            [a] => to.write(a),
+            [a, b] => {
+                to.write(a);
+                to.add(1).write(b);
+            }
+            [a, b, c] => {
+                to.write(a);
+                to.add(1).write(b);
+                to.add(2).write(c);
+            }
+            [a, b, c, d] => {
+                to.write(a);
+                to.add(1).write(b);
+                to.add(2).write(c);
+                to.add(3).write(d);
+            }
+            _ => std::ptr::copy_nonoverlapping(from.as_ptr(), to, from.len()),
+        }
+    }
 }
 
 /// A layout for tests, or none (`0`): see [`VarMap::publish_layout`]. Each lives for the test
@@ -3719,20 +3770,19 @@ pub(crate) fn new_var_scope_with_capacity(parent: Option<Env>, capacity: usize) 
 }
 
 /// A variable environment holding `slots`, named by `desc`'s names, slot for slot: a compiled
-/// function's activation, which its plan makes.
-pub(crate) fn new_var_scope_with_desc(
-    parent: Option<Env>,
-    desc: DescRef,
-    slots: &[BindingSlot],
-) -> Env {
-    let flags = (under_with(parent.as_ref()), true, false);
-    new_record(
-        parent,
+/// function's activation, which its plan makes in a cell of the size class `class`
+/// ([`record_class`] of the slots' count), computed once per plan.
+#[inline]
+pub(crate) fn new_activation(parent: Env, desc: DescRef, class: u8, slots: &[BindingSlot]) -> Env {
+    debug_assert_eq!(class, record_class(slots.len()));
+    let flags = (parent.borrow().under_with(), true, false);
+    new_record_in(
+        class,
+        Some(parent),
         Value::Empty,
         flags,
         Names::shared(desc),
         RecordSlots::Copy(slots),
-        slots.len(),
     )
 }
 
