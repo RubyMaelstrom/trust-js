@@ -320,6 +320,71 @@ fn loops_without_futile_retries_match_as_node_does() {
     );
 }
 
+/// A loop's iteration that matches empty fails where its body can match empty (ECMA-262
+/// RepeatMatcher), and loops whose bodies cannot, which take no check (Decision 25), match as
+/// before, as Node (v24.22.0) finds: empty alternatives, optional atoms, lookaheads, `\b` and
+/// `\B`, backreferences to empty groups, counted loops unrolled and not, lazy loops, lookbehinds,
+/// Unicode mode and `v`-mode string sets with and without the empty string, global replaces.
+/// Each case runs 70 times, past the native tier's threshold of 64: its result on the first run,
+/// on the matcher, and on the last, natively, with `test` between them (which keeps the case
+/// light under `TRUST_JS_GC_STRESS`).
+#[test]
+fn empty_iterations_end_loops_as_node_finds() {
+    check(
+        r##"
+        function show(m) { return m === null ? null : [m.index].concat(Array.prototype.slice.call(m)); }
+        function warm(re, s) { for (var i = 0; i < 68; i++) { re.lastIndex = 0; re.test(s); } }
+        function both(first, last) { return first === last ? first : first + "/" + last; }
+        function hot(re, s) { re.lastIndex = 0; var first = JSON.stringify(show(re.exec(s))); warm(re, s); re.lastIndex = 0; return both(first, JSON.stringify(show(re.exec(s)))); }
+        function all(re, s) { var first = s.replace(re, "[$&]"); warm(re, s); return both(first, s.replace(re, "[$&]")); }
+        JSON.stringify([
+            // Bodies that can match empty.
+            hot(/(a|)*/, "aab"),
+            hot(/(a|)*b/, "aab"),
+            hot(/(a|)*?b/, "aab"),
+            hot(/(a|){2,5}/, "a"),
+            hot(/(a|){0,1001}b/, "aab"),
+            hot(/(a|){1001}/, "aaa"),
+            hot(/(?:a?)*/, "aaa"),
+            hot(/(?:a?)+b/, "aab"),
+            hot(/(?:a?){3}/, "a"),
+            hot(/(?:a?)*?b/, "aab"),
+            hot(/(?:a?){0,1001}b/, "aaab"),
+            hot(/(?:(?=a))*a/, "a"),
+            hot(/(?:(?=a)|b)*a/, "ba"),
+            hot(/(?:\b)*x/, "ab x"),
+            hot(/(?:\b|a)+/, "aa"),
+            hot(/(?:\B)+$/, "ab"),
+            hot(/(?:\b){2,1200}a/, "a"),
+            hot(/(a*)(?:\1)*b/, "b"),
+            hot(/(?:(a|)\1)*b/, "aab"),
+            hot(/()(?:\1)+x/, "x"),
+            hot(/(?:(a)|b\1)*/, "ab"),
+            hot(/(?<=(a|)*)b/, "aab"),
+            hot(/(?<=(?:a?)*b)c/, "aabc"),
+            hot(/(?:\u{1F600}|)*x/u, "\u{1F600}\u{1F600}x"),
+            hot(/(.?)*$/u, "\u{1F600}a"),
+            all(/(a|)*/g, "aab"),
+            all(/(?:a?)*/g, "baab"),
+            hot(/(?:[\q{ab|}])*d/v, "ababd"),
+            // Bodies that cannot.
+            hot(/(?:ab)*c/, "ababc"),
+            hot(/(a|bc)+d/, "abcad"),
+            hot(/(?:(?!\s)\w)+/, " ab c"),
+            hot(/(?:a\b)*/, "a a"),
+            hot(/(?:(a)\1)*b/, "aaaab"),
+            hot(/(?:ab){2,4}/, "ababababab"),
+            hot(/(?:ab){0,1001}c/, "ababc"),
+            hot(/(?:a(?=b))+b/, "ab"),
+            hot(/(?<=(?:ab)+)c/, "ababc"),
+            hot(/(?:[\q{ab|c}])*d/v, "abcabd"),
+            hot(/(?:\u{1F600}x)+/u, "\u{1F600}x\u{1F600}x"),
+        ])
+        "##,
+        r##"["[0,\"aa\",\"a\"]","[0,\"aab\",\"a\"]","[0,\"aab\",\"a\"]","[0,\"a\",\"\"]","[0,\"aab\",\"a\"]","[0,\"aaa\",\"\"]","[0,\"aaa\"]","[0,\"aab\"]","[0,\"a\"]","[0,\"aab\"]","[0,\"aaab\"]","[0,\"a\"]","[0,\"ba\"]","[3,\"x\"]","[0,\"aa\"]","null","[0,\"a\"]","[0,\"b\",\"\"]","[0,\"aab\",\"a\"]","[0,\"x\",\"\"]","[0,\"ab\",null]","[2,\"b\",\"a\"]","[3,\"c\"]","[0,\"😀😀x\"]","[0,\"😀a\",\"a\"]","[aa][]b[]","[]b[aa][]b[]","[0,\"ababd\"]","[0,\"ababc\"]","[0,\"abcad\",\"a\"]","[1,\"ab\"]","[0,\"a\"]","[0,\"aaaab\",\"a\"]","[0,\"abababab\"]","[0,\"ababc\"]","[0,\"ab\"]","[4,\"c\"]","[0,\"abcabd\"]","[0,\"😀x😀x\"]"]"##,
+    );
+}
+
 /// A scan resumes past a failed run of a pattern's leading loop, whether the loop retries shorter
 /// runs or not, and finds what Node (v24.22.0) finds: from global `lastIndex` starts, after
 /// backreferences and lookbehinds that follow the loop, and on two-byte and surrogate subjects.

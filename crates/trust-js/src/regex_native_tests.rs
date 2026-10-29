@@ -2,7 +2,7 @@
 //! fuzzer whose differences are reduced to a minimal pattern and subject, interruption, the
 //! backtracking state's limit, and the tier-up rules.
 
-use super::super::{test_poll_word, MatchError, ReInput, Regex, MAX_BACKTRACK_STATE};
+use super::super::{test_poll_word, Inst, MatchError, ReInput, Regex, MAX_BACKTRACK_STATE};
 use super::{decline, note_execution, Width, BACKEND};
 use std::sync::Arc;
 
@@ -466,19 +466,54 @@ fn gen_subject(rng: &mut Rng, two: bool) -> Subject {
     }
 }
 
+/// What a fuzzing run covered: the cases run, the patterns compiled for a width, those the tier
+/// compiled, and of these the ones in Unicode mode, with a lookbehind, with a loop that checks
+/// for an empty iteration and with a loop that does not (Decision 25).
+#[derive(Default)]
+struct Fuzzed {
+    cases: usize,
+    patterns: usize,
+    native: usize,
+    unicode: usize,
+    lookbehind: usize,
+    checked_loops: usize,
+    unchecked_loops: usize,
+}
+
+/// Whether program `prog`, with its lookaround bodies, has a loop that checks for an empty
+/// iteration, and one that does not: a loop's back edge or count that no check precedes.
+fn loop_checks(prog: &[Inst]) -> (bool, bool) {
+    let mut checked = false;
+    let mut unchecked = false;
+    for (pc, inst) in prog.iter().enumerate() {
+        let after_check = pc > 0
+            && matches!(
+                prog[pc - 1],
+                Inst::CheckProgress(_) | Inst::CheckCountedProgress { .. }
+            );
+        match inst {
+            Inst::CheckProgress(_) | Inst::CheckCountedProgress { .. } => checked = true,
+            Inst::Jmp(target) if *target < pc && !after_check => unchecked = true,
+            Inst::CounterIncr(_) if !after_check => unchecked = true,
+            Inst::Look { prog: body, .. } | Inst::LookBehind { prog: body, .. } => {
+                let (body_checked, body_unchecked) = loop_checks(body);
+                checked |= body_checked;
+                unchecked |= body_unchecked;
+            }
+            _ => {}
+        }
+    }
+    (checked, unchecked)
+}
+
 /// Fuzz `cases` executions (subject and start) from `seed`: random patterns over the tier's
 /// grammar and its near misses, with random flags, against one-byte and two-byte subjects at
-/// every start. Returns the cases run, the patterns compiled for a width, those the tier
-/// compiled, and of those the ones in Unicode mode and the ones with a lookbehind.
-fn fuzz(seed: u64, cases: usize) -> (usize, usize, usize, usize, usize) {
+/// every start.
+fn fuzz(seed: u64, cases: usize) -> Fuzzed {
     let mut rng = Rng::seeded(seed);
     let trace = std::env::var_os("TRUST_JS_REGEXP_FUZZ_TRACE").is_some();
-    let mut run_cases = 0;
-    let mut patterns = 0;
-    let mut native_patterns = 0;
-    let mut unicode_patterns = 0;
-    let mut lookbehind_patterns = 0;
-    while run_cases < cases {
+    let mut fuzzed = Fuzzed::default();
+    while fuzzed.cases < cases {
         let pattern = gen_alternation(&mut rng, 0);
         let flags = gen_flags(&mut rng);
         if Regex::new(&pattern, &flags).is_err() {
@@ -487,17 +522,20 @@ fn fuzz(seed: u64, cases: usize) -> (usize, usize, usize, usize, usize) {
         for two in [false, true] {
             let width = if two { Width::Two } else { Width::One };
             if let Some((native, _)) = pair(&pattern, &flags, width) {
-                patterns += 1;
+                fuzzed.patterns += 1;
                 if compiled(&native, width) {
-                    native_patterns += 1;
-                    unicode_patterns += usize::from(native.unicode);
-                    lookbehind_patterns +=
+                    let (checked, unchecked) = loop_checks(&native.prog);
+                    fuzzed.native += 1;
+                    fuzzed.unicode += usize::from(native.unicode);
+                    fuzzed.lookbehind +=
                         usize::from(pattern.contains("(?<=") || pattern.contains("(?<!"));
+                    fuzzed.checked_loops += usize::from(checked);
+                    fuzzed.unchecked_loops += usize::from(unchecked);
                 }
             }
             for _ in 0..4 {
                 let subject = gen_subject(&mut rng, two);
-                run_cases += subject.len() + 2;
+                fuzzed.cases += subject.len() + 2;
                 if trace {
                     eprintln!("[fuzz] /{pattern}/{flags} {subject:?}");
                 }
@@ -505,13 +543,7 @@ fn fuzz(seed: u64, cases: usize) -> (usize, usize, usize, usize, usize) {
             }
         }
     }
-    (
-        run_cases,
-        patterns,
-        native_patterns,
-        unicode_patterns,
-        lookbehind_patterns,
-    )
+    fuzzed
 }
 
 /// The fuzzer at the lib suite's size; `TRUST_JS_REGEXP_FUZZ_CASES=N` (with
@@ -526,13 +558,22 @@ fn fuzzed_programs_match_as_the_matcher_does() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0x9e37_79b9_7f4a_7c15);
-    let (run_cases, patterns, native, unicode, lookbehind) = fuzz(seed, cases);
+    let fuzzed = fuzz(seed, cases);
     eprintln!(
-        "[regexp-native-fuzz] seed {seed}: {run_cases} cases, {native} of {patterns} programs \
-         native, {unicode} of them in Unicode mode and {lookbehind} with a lookbehind"
+        "[regexp-native-fuzz] seed {seed}: {} cases, {} of {} programs native, {} of them in \
+         Unicode mode, {} with a lookbehind, {} with a loop checking for an empty iteration and \
+         {} with a loop that need not",
+        fuzzed.cases,
+        fuzzed.native,
+        fuzzed.patterns,
+        fuzzed.unicode,
+        fuzzed.lookbehind,
+        fuzzed.checked_loops,
+        fuzzed.unchecked_loops,
     );
     if BACKEND {
-        assert!(native > 0);
+        // The grammar makes loops whose bodies can match empty and loops whose bodies cannot.
+        assert!(fuzzed.native > 0 && fuzzed.checked_loops > 0 && fuzzed.unchecked_loops > 0);
     }
 }
 
@@ -967,15 +1008,20 @@ fn case_insensitive_backreferences_compare_every_element_as_the_matcher_does() {
 }
 
 /// Programs the fuzzer seldom makes: more capture slots than the root floor's logged-slot word
-/// has bits (each attempt unsets them instead), many loops' marks, long straight runs, and code
-/// past AArch64's 32 KB test-and-branch reach.
+/// has bits (each attempt unsets them instead), many loops with and without marks, long straight
+/// runs, and code past AArch64's 32 KB test-and-branch reach.
 #[test]
 fn wide_and_long_programs_match_as_the_matcher_does() {
     let wide = format!("{}(y|z)*q", "(x)?".repeat(36));
     // A wide program's lookaheads: their captures, at the root floor and above it, and a
     // backreference to them.
     let wide_look = format!("{}(?=(y)|(z))(?:\\36|.)(?!(x))", "(x)?".repeat(34));
-    let marks = "(?:(?:a|b)*c)*(?:(?:d|e)+f)*(?:g|h)*".to_string();
+    // Many loops: bodies that cannot match empty, which take no mark, and bodies that can, each
+    // with its mark (Decision 25).
+    let loops = "(?:(?:a|b)*c)*(?:(?:d|e)+f)*(?:g|h)*".to_string();
+    let marks = "(?:(?:a|b?)*c?)*(?:(?:d|)+f?)*(?:g|h|\\b)*".to_string();
+    assert_eq!(Regex::new(&loops, "").unwrap().nmarks, 0);
+    assert_eq!(Regex::new(&marks, "").unwrap().nmarks, 5);
     let long = format!("{}.{}", "ab".repeat(300), "cd".repeat(300));
     // Code far past AArch64's 32 KB test-and-branch reach, ending in the candidate loop's
     // outlines.
@@ -996,6 +1042,8 @@ fn wide_and_long_programs_match_as_the_matcher_does() {
         (wide.as_str(), "y"),
         (wide_look.as_str(), ""),
         (wide_look.as_str(), "g"),
+        (loops.as_str(), ""),
+        (loops.as_str(), "g"),
         (marks.as_str(), ""),
         (marks.as_str(), "g"),
         (long.as_str(), ""),

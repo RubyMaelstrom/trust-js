@@ -4286,28 +4286,34 @@ fn append_relocated(prog: &mut Vec<Inst>, body: &[Inst]) {
 /// ```
 ///
 /// Each iteration clears the captures inside the atom first (RepeatMatcher step 4), and only an
-/// optional iteration, one past `min`, fails when it consumes nothing (step 2.b).
+/// optional iteration, one past `min`, fails when it consumes nothing (step 2.b): an atom that
+/// cannot match empty (`can_be_empty` false) never does, and takes neither the mark nor the check.
 fn compile_counted_repeat(
     body: &[Inst],
     min: usize,
     max: Option<usize>,
     greedy: bool,
+    can_be_empty: bool,
     prog: &mut Vec<Inst>,
     cx: &mut Lowering,
 ) {
     let counter = cx.mark();
-    let progress = cx.mark();
+    let progress = can_be_empty.then(|| cx.mark());
     prog.push(Inst::CounterReset(counter));
     let head = prog.len();
     prog.push(Inst::Match); // Patched to the loop head below.
     let start = prog.len();
-    prog.push(Inst::SetMark(progress));
+    if let Some(progress) = progress {
+        prog.push(Inst::SetMark(progress));
+    }
     append_relocated(prog, body);
-    prog.push(Inst::CheckCountedProgress {
-        mark: progress,
-        counter,
-        min,
-    });
+    if let Some(progress) = progress {
+        prog.push(Inst::CheckCountedProgress {
+            mark: progress,
+            counter,
+            min,
+        });
+    }
     prog.push(Inst::CounterIncr(counter));
     prog.push(Inst::Jmp(head));
     prog[head] = Inst::CountedBranch {
@@ -4353,6 +4359,12 @@ fn compile_repeat(
         });
         return Ok(());
     }
+    // RepeatMatcher's empty-iteration rule (step 2.b) can only fail an iteration that consumed
+    // nothing, so a loop over an atom that cannot match empty takes no progress mark and no check,
+    // as V8 plants its check only where `body_can_be_empty` (regexp-compiler-tonode.cc:2265,
+    // 2282-2284, 2353-2358) and JSC only where a group's minimum size is 0 (YarrJIT.cpp:4590,
+    // 4649); Decision 25.
+    let can_be_empty = can_match_empty(inner);
     // The atom is compiled once, as a program of its own, and copied into place. RepeatMatcher
     // clears the captures inside it at the start of every iteration.
     let mut body = Vec::new();
@@ -4370,7 +4382,7 @@ fn compile_repeat(
     let unrolled_len = min.saturating_mul(body.len()).saturating_add(optional_len);
     let added = unrolled_len.saturating_sub(body.len());
     if min > MAX_REPEAT || max.is_some_and(|max| max > MAX_REPEAT) || added > cx.unroll_budget {
-        compile_counted_repeat(&body, min, max, greedy, prog, cx);
+        compile_counted_repeat(&body, min, max, greedy, can_be_empty, prog, cx);
         return Ok(());
     }
     cx.unroll_budget -= added;
@@ -4379,17 +4391,22 @@ fn compile_repeat(
     }
     // Optional iterations enforce the RepeatMatcher empty-iteration rule: an iteration that
     // consumes nothing fails, backtracking into the body's other alternatives or out of the loop.
-    // The iterations run one after another, so they share one progress mark.
+    // The iterations run one after another, so they share one progress mark, which only an atom
+    // that can match empty needs.
     match max {
         None => {
             // Greedy: L1: Split(body, end); body; Jmp(L1); end.
-            let id = cx.mark();
+            let id = can_be_empty.then(|| cx.mark());
             let l1 = prog.len();
             prog.push(Inst::Split(0, 0));
             let start = prog.len();
-            prog.push(Inst::SetMark(id));
+            if let Some(id) = id {
+                prog.push(Inst::SetMark(id));
+            }
             append_relocated(prog, &body);
-            prog.push(Inst::CheckProgress(id));
+            if let Some(id) = id {
+                prog.push(Inst::CheckProgress(id));
+            }
             prog.push(Inst::Jmp(l1));
             let end = prog.len();
             prog[l1] = if greedy {
@@ -4399,15 +4416,19 @@ fn compile_repeat(
             };
         }
         Some(max) if max > min => {
-            let id = cx.mark();
+            let id = can_be_empty.then(|| cx.mark());
             let mut splits = Vec::new();
             for _ in min..max {
                 let split = prog.len();
                 prog.push(Inst::Split(0, 0));
                 splits.push((split, prog.len()));
-                prog.push(Inst::SetMark(id));
+                if let Some(id) = id {
+                    prog.push(Inst::SetMark(id));
+                }
                 append_relocated(prog, &body);
-                prog.push(Inst::CheckProgress(id));
+                if let Some(id) = id {
+                    prog.push(Inst::CheckProgress(id));
+                }
             }
             let end = prog.len();
             for (split, start) in splits {
@@ -4421,6 +4442,31 @@ fn compile_repeat(
         Some(_) => {}
     }
     Ok(())
+}
+
+/// Whether `node` can match without consuming input, its minimum match length being 0: an
+/// assertion, a lookaround or a backreference may consume nothing, as V8's `min_match` counts
+/// them (regexp-ast.h: `Assertion`, `Lookaround`, `BackReference` and `Empty` give 0), and a
+/// class string set may hold the empty string. A loop over an atom that cannot needs no
+/// empty-iteration check ([`compile_repeat`]).
+fn can_match_empty(node: &Node) -> bool {
+    with_pattern_stack(|| match node {
+        Node::Char(_) | Node::Any | Node::Class(_) => false,
+        Node::StringSet(set) => set.empty,
+        Node::Concat(items) => items.iter().all(can_match_empty),
+        Node::Alt(items) => items.iter().any(can_match_empty),
+        Node::Group(_, inner) | Node::Modifier { inner, .. } => can_match_empty(inner),
+        Node::Repeat(inner, min, ..) => *min == 0 || can_match_empty(inner),
+        Node::Empty
+        | Node::Start
+        | Node::End
+        | Node::WordB(_)
+        | Node::Backref(_)
+        | Node::NamedBackref(_)
+        | Node::BackrefAlt(_)
+        | Node::Look(..)
+        | Node::LookBehind(..) => true,
+    })
 }
 
 /// The min/max capture-group indices inside `node`, if any (for per-iteration capture resets).
@@ -7826,6 +7872,58 @@ mod internal_engine_diagnostics {
                 atomic
             };
             assert_eq!(atomic_loop_count(&re.prog), atomic, "/{pattern}/{flags}");
+        }
+    }
+
+    /// A loop gets the empty-iteration check (`SetMark` and `CheckProgress`, or a counted loop's
+    /// `CheckCountedProgress`) and its mark only where its body can match empty (Decision 25):
+    /// through an empty alternative, an optional atom, an assertion, a lookaround, a
+    /// backreference or a `v`-mode string set holding the empty string. A body that consumes on
+    /// every path takes neither, whatever it also asserts; a counted loop keeps its count's mark.
+    #[test]
+    fn empty_iteration_checks_only_where_a_body_can_match_empty() {
+        fn checks(prog: &[super::Inst]) -> usize {
+            prog.iter()
+                .map(|inst| match inst {
+                    super::Inst::CheckProgress(_) | super::Inst::CheckCountedProgress { .. } => 1,
+                    super::Inst::Look { prog, .. } | super::Inst::LookBehind { prog, .. } => {
+                        checks(prog)
+                    }
+                    _ => 0,
+                })
+                .sum()
+        }
+        for (pattern, flags, checked, marks) in [
+            // Bodies that can match empty.
+            ("(a|)*", "", 1, 1),
+            ("(?:a?)*", "", 1, 1),
+            ("(?:a?){2,4}", "", 2, 1),
+            ("(?:(?=a))*", "", 1, 1),
+            (r"(?:\b)*", "", 1, 1),
+            (r"(a*)(?:\1)*", "", 1, 1),
+            ("(?:a*b?)+", "", 1, 1),
+            ("(?:a|){0,1001}", "", 1, 2),
+            (r"(?:[\q{ab|}])*", "v", 1, 1),
+            ("(?<=(a|)*)", "", 1, 1),
+            // Bodies that cannot.
+            ("(?:ab)*", "", 0, 0),
+            ("(a|bc)+", "", 0, 0),
+            (r"(?:(?!\s)\w)+", "", 0, 0),
+            (r"(?:a\b)*", "", 0, 0),
+            (r"(?:(a)\1)*", "", 0, 0),
+            ("(?:ab){0,4}", "", 0, 0),
+            ("(?:ab){0,1001}", "", 0, 1),
+            ("(?:a+b?)*", "", 0, 0),
+            (r"(?:[\q{ab|c}])*", "v", 0, 0),
+            ("(?<=(?:ab)+)", "", 0, 0),
+            (r"(?:\u{1F600}x)+", "u", 0, 0),
+        ] {
+            let re = super::Regex::new(pattern, flags).unwrap();
+            assert_eq!(
+                (checks(&re.prog), re.nmarks),
+                (checked, marks),
+                "/{pattern}/{flags}"
+            );
         }
     }
 

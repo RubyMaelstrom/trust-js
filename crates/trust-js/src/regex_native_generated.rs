@@ -93,14 +93,31 @@ fn instruction_corpus_matches_as_the_matcher_does() {
             "",
             &["save", "many_class_atomic", "save", "save", "many_class_atomic", "save"],
         ),
-        ("(?:ab)*c", "", &["split", "set_mark", "char", "char", "check_progress", "jmp", "char"]),
-        ("(?:ab)*?c", "", &["split", "set_mark", "char", "char", "check_progress", "jmp", "char"]),
+        // Decision 25: a loop's progress mark and check only where its body can match empty.
+        ("(?:ab)*c", "", &["split", "char", "char", "jmp", "char"]),
+        ("(?:ab)*?c", "", &["split", "char", "char", "jmp", "char"]),
         (
             "(a|b)*c",
             "",
             &[
-                "split", "set_mark", "clear_caps", "save", "split", "char", "jmp", "char", "save",
-                "check_progress", "jmp", "char",
+                "split", "clear_caps", "save", "split", "char", "jmp", "char", "save", "jmp",
+                "char",
+            ],
+        ),
+        (
+            "(?:ab|)*c",
+            "",
+            &[
+                "split", "set_mark", "split", "char", "char", "jmp", "check_progress", "jmp",
+                "char",
+            ],
+        ),
+        (
+            "(a?)*?c",
+            "",
+            &[
+                "split", "set_mark", "clear_caps", "save", "many_char", "save", "check_progress",
+                "jmp", "char",
             ],
         ),
         (
@@ -115,8 +132,15 @@ fn instruction_corpus_matches_as_the_matcher_does() {
             "(?:x|(y))?z",
             "",
             &[
-                "split", "set_mark", "clear_caps", "split", "char", "jmp", "save", "char", "save",
-                "check_progress", "char",
+                "split", "clear_caps", "split", "char", "jmp", "save", "char", "save", "char",
+            ],
+        ),
+        (
+            "(?:x|(y)|\\b)?z",
+            "",
+            &[
+                "split", "set_mark", "clear_caps", "split", "char", "jmp", "split", "save", "char",
+                "save", "jmp", "boundary", "check_progress", "char",
             ],
         ),
         // W5b's 3c: lookaheads (a body of elements alone tested in place, or one with a frame),
@@ -133,9 +157,14 @@ fn instruction_corpus_matches_as_the_matcher_does() {
         (
             "(?:ab){1001}",
             "",
+            &["counter_reset", "counted_branch", "char", "char", "counter_incr", "jmp"],
+        ),
+        (
+            "(?:ab|){0,1001}c",
+            "",
             &[
-                "counter_reset", "counted_branch", "set_mark", "char", "char",
-                "check_counted_progress", "counter_incr", "jmp",
+                "counter_reset", "counted_branch", "set_mark", "split", "char", "char", "jmp",
+                "check_counted_progress", "counter_incr", "jmp", "char",
             ],
         ),
     ];
