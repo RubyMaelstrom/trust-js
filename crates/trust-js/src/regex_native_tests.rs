@@ -1285,6 +1285,149 @@ fn native_lookaheads_and_backreferences_answer_interruption_and_limits() {
     }
 }
 
+/// Unicode mode's loops of decoded elements and a lookbehind's backward reading answer
+/// interruption and limits as the forward code does: a deadline ends scans of elements past the
+/// BMP, forward and backward, counted or not, a backward scan of units, and a long backward
+/// backreference compare (in line and under `i` through the helper, over units and over pairs);
+/// cancellation ends backtracking inside a lookbehind; and exhausting the backtracking state
+/// inside a lookbehind, in a loop or a counted loop, is the matcher's resource error.
+#[test]
+fn unicode_and_lookbehind_code_answers_interruption_and_limits() {
+    if !BACKEND {
+        return;
+    }
+    let deadline = || {
+        let control = crate::RuntimeInterrupt::default();
+        control.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(5),
+        ));
+        control
+    };
+    let late = || -> Found {
+        Err(MatchError::Interrupted(
+            crate::InterruptReason::DeadlineExceeded,
+        ))
+    };
+    let units = Subject::One(vec![b'a'; 1 << 26]);
+    let pairs = Subject::Two([0xd83d_u16, 0xde00].repeat(1 << 24));
+    // Scans: elements past the BMP, forward and backward (from the subject's end, sticky), and
+    // units backward.
+    for (pattern, flags, subject) in [
+        ("[^x]*[01]", "u", &pairs),
+        ("[^x]{0,40000000}[01]", "u", &pairs),
+        ("(?<=[01][^x]*)", "uy", &pairs),
+        ("(?<=[01][^x]{0,40000000})", "uy", &pairs),
+        ("(?<=[01][a-z]*)", "y", &units),
+    ] {
+        let (re, _) = pair(pattern, flags, subject.width()).unwrap();
+        assert!(compiled(&re, subject.width()), "/{pattern}/{flags}");
+        let start = if flags.contains('y') {
+            subject.len()
+        } else {
+            0
+        };
+        assert_eq!(
+            run(&re, subject, start, &deadline()),
+            late(),
+            "/{pattern}/{flags}"
+        );
+    }
+    // A backward backreference's long compare: the lookahead takes the subject's second half at
+    // once (`.` under `s`), and the lookbehind compares it with the first half.
+    let two_units = Subject::Two(vec![b'a' as u16; 1 << 25]);
+    for (flags, subject, small) in [
+        ("sy", &units, Subject::of(&"a".repeat(40_000), false)),
+        ("isy", &units, Subject::of(&"a".repeat(40_000), false)),
+        ("sy", &two_units, Subject::of(&"a".repeat(40_000), true)),
+        ("isy", &two_units, Subject::of(&"a".repeat(40_000), true)),
+        (
+            "suy",
+            &pairs,
+            Subject::of(&"\u{1f600}".repeat(20_000), true),
+        ),
+        (
+            "isuy",
+            &pairs,
+            Subject::of(&"\u{1f600}".repeat(20_000), true),
+        ),
+    ] {
+        let width = subject.width();
+        let (re, _) = pair("(?=(.*))(?<=\\1)", flags, width).unwrap();
+        assert!(compiled(&re, width), "/(?=(.*))(?<=\\1)/{flags}");
+        assert_eq!(
+            run(&re, subject, subject.len() / 2, &deadline()),
+            late(),
+            "/(?=(.*))(?<=\\1)/{flags} over {width:?}"
+        );
+        // Without a deadline the compare runs to its end and matches.
+        let found = run(&re, &small, 20_000, &crate::RuntimeInterrupt::default());
+        assert_eq!(
+            found,
+            Ok(Some(vec![Some((20_000, 20_000)), Some((20_000, 40_000))])),
+            "/(?=(.*))(?<=\\1)/{flags} over {width:?}"
+        );
+    }
+    // Backtracking with no end in sight, inside a lookbehind's body.
+    for (flags, subject) in [
+        ("y", Subject::One(vec![b'a'; 80])),
+        ("uy", Subject::Two(vec![b'a' as u16; 80])),
+    ] {
+        let (looking, _) = pair("(?<=[cd](?:a|aa)*)", flags, subject.width()).unwrap();
+        assert!(
+            compiled(&looking, subject.width()),
+            "/(?<=[cd](?:a|aa)*)/{flags}"
+        );
+        let control = Arc::new(crate::RuntimeInterrupt::default());
+        let remote = control.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            remote.cancel();
+        });
+        let found = run(&looking, &subject, 80, &control);
+        canceller.join().unwrap();
+        assert_eq!(
+            found,
+            Err(MatchError::Interrupted(crate::InterruptReason::Cancelled)),
+            "/(?<=[cd](?:a|aa)*)/{flags}"
+        );
+    }
+    // Reading backward, every iteration leaves the loop's exit to try, until `^` fails at the
+    // `X`.
+    let text = format!("X{}", "ab".repeat(20_000));
+    for (pattern, flags) in [
+        ("(?<=^(?:a|b)*)", "y"),
+        ("(?<=^(?:a|b){0,100000})", "y"),
+        ("(?<=^(?:a|b)*)", "uy"),
+    ] {
+        for two in [false, true] {
+            let subject = Subject::of(&text, two);
+            let end = subject.len();
+            let (native, matcher) = pair(pattern, flags, subject.width()).unwrap();
+            assert!(compiled(&native, subject.width()), "/{pattern}/{flags}");
+            let control = crate::RuntimeInterrupt::default();
+            super::super::set_backtrack_state_limit(1 << 10);
+            let found = run(&native, &subject, end, &control);
+            let reference = run(&matcher, &subject, end, &control);
+            super::super::set_backtrack_state_limit(MAX_BACKTRACK_STATE);
+            assert_eq!(
+                found,
+                Err(MatchError::ResourceExhausted),
+                "/{pattern}/{flags}"
+            );
+            assert_eq!(
+                reference,
+                Err(MatchError::ResourceExhausted),
+                "/{pattern}/{flags}"
+            );
+            assert_eq!(
+                run(&native, &subject, end, &control),
+                Ok(None),
+                "/{pattern}/{flags}"
+            );
+        }
+    }
+}
+
 /// A pattern compiles for a width at its threshold's execution over a subject of that width,
 /// or at once over a long subject (V8's rule), each width on its first use.
 #[test]
