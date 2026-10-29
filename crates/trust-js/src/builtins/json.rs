@@ -465,12 +465,9 @@ impl JsonKey<'_> {
 /// Whether Get on `object` for a string key has no side effects to observe when it finds an own
 /// data property: an ordinary object (no Proxy, exotic host or namespace methods; `ic_plain`) that
 /// is not a mapped arguments object.
-fn json_plain_get(i: &Interp, object: &Gc) -> bool {
-    object.borrow().ic_plain.get()
-        && (i.mapped_arguments.is_empty()
-            || !i
-                .mapped_arguments
-                .contains_key(&(Gc::as_ptr(object) as usize)))
+fn json_plain_get(object: &Gc) -> bool {
+    let body = object.borrow();
+    body.ic_plain.get() && !matches!(body.exotic, crate::value::Exotic::Arguments(Some(_)))
 }
 
 /// Get(holder, key) for SerializeJSONProperty: an own data property of a plain object is read
@@ -481,7 +478,7 @@ fn json_get(
     object: &Gc,
     key: crate::atom::PropKey,
 ) -> Result<Value, Value> {
-    if json_plain_get(i, object) {
+    if json_plain_get(object) {
         if let Some(property) = object.borrow().props.get_key(key) {
             if !property.accessor() {
                 return Ok(property.value());
@@ -498,7 +495,7 @@ fn json_get_index(
     object: &Gc,
     index: usize,
 ) -> Result<Value, Value> {
-    if let (true, Ok(slot)) = (json_plain_get(i, object), u32::try_from(index)) {
+    if let (true, Ok(slot)) = (json_plain_get(object), u32::try_from(index)) {
         if let Some(property) = object.borrow().props.get_index(slot) {
             if !property.accessor() {
                 return Ok(property.value());

@@ -2605,9 +2605,9 @@ pub enum Exotic {
     /// name/message live as ordinary properties, and the tag lets `Error.prototype.toString` /
     /// the test262 runner recognise an error cheaply.
     Error(Option<crate::gc_storage::PayloadBox<crate::stack_trace::StackTrace>>),
-    /// An `arguments` exotic object (mapped index/parameter aliasing lives in
-    /// `Interp::mapped_arguments`).
-    Arguments,
+    /// An `arguments` exotic object; a mapped one's ParameterMap, while it maps an index, in a
+    /// storage block it reports (`interpreter::ParameterMap`).
+    Arguments(Option<crate::gc_storage::StorageBox<crate::interpreter::ParameterMap>>),
     ArrayIterator(crate::gc_storage::PayloadBox<ArrayIteratorState>),
     StringIterator(crate::gc_storage::PayloadBox<StringIteratorState>),
     /// ECMA-262 CreateMapIterator's and CreateSetIterator's private state: the collection and a
@@ -3828,11 +3828,15 @@ impl Object {
             }
             Exotic::Error(stack) => stack.trace_gc(sink.as_dyn()), // the cell and the frame names
             Exotic::Collection(data) => data.trace_gc(sink.as_dyn()), // the cell and the entries
+            Exotic::Arguments(Some(map)) => {
+                crate::gc_storage::StorageBox::trace(map, sink);
+                map.trace(sink);
+            }
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)
             | Exotic::NumWrap(_)
-            | Exotic::Arguments => {}
+            | Exotic::Arguments(None) => {}
         }
         match call {
             // The closure cell, which traces its environment.

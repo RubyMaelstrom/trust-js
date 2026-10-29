@@ -1247,6 +1247,110 @@ pub struct FnFrame {
     pub extra: Option<Box<FrameExtra>>,
 }
 
+/// A mapped arguments object's ParameterMap (ECMA-262 CreateMappedArgumentsObject,
+/// spec.html:15083-15148), which the object keeps (`Exotic::Arguments`; W3 item 3's step 6,
+/// Decision 20f): the Function Environment Record its mapped indices alias and, per argument
+/// index, the slot there of the formal parameter's binding the index aliases, or
+/// [`ParameterMap::UNMAPPED`]: an earlier duplicate formal's index, one past the formals, or one
+/// a define or a delete unmapped (15130-15168, 14960-14992, 15039). V8's SloppyArgumentsElements
+/// and JSC's ScopedArguments keep the same pair: the environment and a slot per mapped index.
+/// Plain data in a storage block the object reports, never dropped; its spill is a block.
+pub(crate) struct ParameterMap {
+    env: Env,
+    slots: std::mem::ManuallyDrop<crate::inline_vec::InlineVec<u32, 4, crate::gc_storage::GcSpill>>,
+}
+
+impl ParameterMap {
+    /// An index that aliases no binding.
+    pub(crate) const UNMAPPED: u32 = u32::MAX;
+
+    /// The map of `env`'s bindings at `slots`, index for index.
+    pub(crate) fn new(env: Env, slots: &[u32]) -> Self {
+        let mut vec = crate::inline_vec::InlineVec::with_capacity(slots.len());
+        for &slot in slots {
+            vec.push(slot);
+        }
+        Self {
+            env,
+            slots: std::mem::ManuallyDrop::new(vec),
+        }
+    }
+
+    /// The Function Environment Record the mapped indices alias.
+    pub(crate) fn env(&self) -> Env {
+        self.env
+    }
+
+    /// The slot of the binding `index` aliases, while it is mapped.
+    #[inline]
+    pub(crate) fn slot(&self, index: usize) -> Option<usize> {
+        self.slots
+            .get(index)
+            .copied()
+            .filter(|&slot| slot != Self::UNMAPPED)
+            .map(|slot| slot as usize)
+    }
+
+    /// Sever `index`'s alias.
+    pub(crate) fn unmap(&mut self, index: usize) {
+        if let Some(slot) = self.slots.get_mut(index) {
+            *slot = Self::UNMAPPED;
+        }
+    }
+
+    /// Report the spilled slots' block and the environment.
+    pub(crate) fn trace<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
+        if let Some(block) = self.slots.spill_ptr() {
+            crate::gc_storage::trace_block(block, sink);
+        }
+        sink.env(&self.env);
+    }
+
+    /// The bytes the map keeps beside its storage block: its spill.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.slots.heap_capacity() * std::mem::size_of::<u32>()
+    }
+}
+
+thread_local! {
+    /// Whether this thread has made a mapped arguments object: until it has, no object's
+    /// generic [[Set]] or own-property define needs to look for a ParameterMap.
+    static MAPPED_ARGUMENTS_MADE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread has made a mapped arguments object (a [`ParameterMap`]): a cheap first
+/// test before the probes that look at an object's exotic kind for one.
+#[inline]
+pub(crate) fn mapped_arguments_made() -> bool {
+    MAPPED_ARGUMENTS_MADE.with(std::cell::Cell::get)
+}
+
+/// CreateMappedArgumentsObject's ParameterMap for `argc` arguments of `func`, a sloppy function
+/// with simple formals (spec.html:15083-15148): per index below `argc` and the formals' count, the
+/// slot `slot_of` gives the formal's name, when the index is the name's last occurrence among the
+/// formals; [`ParameterMap::UNMAPPED`] otherwise. The walk covers ALL formals before checking
+/// index < argc: a missing final duplicate still keeps an earlier supplied index unmapped.
+pub(crate) fn mapped_parameter_slots(
+    func: &crate::ast::Function,
+    argc: usize,
+    mut slot_of: impl FnMut(&str) -> Option<usize>,
+) -> Vec<u32> {
+    let mut slots = vec![ParameterMap::UNMAPPED; func.params.len().min(argc)];
+    let mut seen: Vec<&str> = Vec::new();
+    for (index, parameter) in func.params.iter().enumerate().rev() {
+        let Pattern::Ident(name) = &parameter.pattern else {
+            unreachable!("mapped arguments require simple formals")
+        };
+        if !seen.contains(&name.as_str()) {
+            seen.push(name);
+            if let (Some(entry), Some(slot)) = (slots.get_mut(index), slot_of(name)) {
+                *entry = slot as u32;
+            }
+        }
+    }
+    slots
+}
+
 /// See [`FnFrame::extra`].
 pub struct FrameExtra {
     pub args_obj: Value,
@@ -4858,10 +4962,6 @@ pub struct Interp {
     /// Promise-state forwarding: when a native super() grafts a fresh promise's state onto the
     /// subclass `this`, the original object's resolvers redirect here.
     pub(crate) promise_forward: gc_collect::SideSlotTable<Value>,
-    /// Mapped `arguments` objects: object ptr → (function scope, per-index parameter name — None
-    /// once unmapped by delete/defineProperty). Reads/writes of still-mapped indices alias the
-    /// parameter bindings.
-    pub(crate) mapped_arguments: gc_collect::SideSlotTable<(Env, Vec<Option<String>>)>,
     /// Live AST-to-VM formal aliases. Allocated only while a sloppy activation needs them.
     pub(crate) borrowed_parameters: Option<borrowed_parameters::Registry>,
     /// Source-phase imports: canonical module key → its (cached) ModuleSource object.
@@ -5047,7 +5147,6 @@ interp_memory_inventory! {
     deferred_ns => "measured",
     deferred_ns_objs => "measured",
     promise_forward => "measured",
-    mapped_arguments => "measured",
     borrowed_parameters => "measured",
     module_source_objs => "measured",
     weak_refs => "measured",
@@ -5077,7 +5176,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 151);
+    assert_eq!(names.len(), 150);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -5313,7 +5412,6 @@ macro_rules! gc_side_slot_tables {
             routed_imports,
             async_gen_queue,
             finalization_registries,
-            mapped_arguments,
             construct_capacity_hints,
         )
     };
@@ -6780,7 +6878,6 @@ impl Interp {
             deferred_ns: Default::default(),
             deferred_ns_objs: Default::default(),
             promise_forward: Default::default(),
-            mapped_arguments: Default::default(),
             borrowed_parameters: None,
             module_source_objs: Default::default(),
             weak_refs: Default::default(),
@@ -9484,7 +9581,7 @@ impl Interp {
                     match &object.exotic {
                         Exotic::Array => "Array",
                         Exotic::StrWrap(_) => "String object",
-                        Exotic::Arguments => "Arguments",
+                        Exotic::Arguments(_) => "Arguments",
                         Exotic::None => "ordinary/host object",
                         _ => "other exotic",
                     }
@@ -11092,24 +11189,28 @@ impl Interp {
             ValueView::Obj(o) => {
                 let o = *o;
                 let ptr = Gc::as_ptr(&o) as usize;
+                // One look at the exotic kind: a mapped `arguments` object or a string wrapper.
+                let (mapped, wrapped_string) = match &o.borrow().exotic {
+                    Exotic::Arguments(Some(_)) => (true, None),
+                    Exotic::StrWrap(s) => (false, Some(**s)),
+                    _ => (false, None),
+                };
                 // A mapped `arguments` index aliases its parameter binding.
-                if let Some(v) = self.mapped_arg_value(ptr, key) {
-                    let shape = o.borrow().props.shape();
-                    if let Some(trace) = trace.as_deref_mut() {
-                        trace.record(
-                            crate::feedback::PropertyOutcome::Exotic,
-                            Some(shape),
-                            0,
-                            None,
-                        );
+                if mapped {
+                    if let Some(v) = self.mapped_arg_value(&o, key) {
+                        let shape = o.borrow().props.shape();
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Exotic,
+                                Some(shape),
+                                0,
+                                None,
+                            );
+                        }
+                        return Ok(v);
                     }
-                    return Ok(v);
                 }
                 // String wrapper (`new String(...)`/`Object("...")`): own indexed chars + `length`.
-                let wrapped_string = match &o.borrow().exotic {
-                    Exotic::StrWrap(s) => Some(**s),
-                    _ => None,
-                };
                 if let Some(s) = wrapped_string {
                     if key == "length" {
                         if let Some(trace) = trace.as_deref_mut() {
@@ -11572,61 +11673,71 @@ impl Interp {
         }
     }
 
-    /// Set `base[key] = value`, honouring setters, accessor-only properties, read-only data
-    /// properties, and array `length`/index bookkeeping. The receiver defaults to `base`.
-    /// The parameter name a still-mapped `arguments[key]` aliases, if any.
-    pub(crate) fn mapped_arg_name(&self, ptr: usize, key: &str) -> Option<String> {
-        let (_, names) = self.mapped_arguments.get(&ptr)?;
-        // ParameterMap keys are exact array-index strings, not every spelling
-        // accepted by an unsigned integer parser (for example, "00" or "+0").
-        let idx = crate::value::canonical_index(key)? as usize;
-        names.get(idx)?.clone()
+    /// The binding a mapped arguments object's `key` aliases, its Function Environment Record
+    /// and slot, while `key` is an array index the object maps (ECMA-262 §10.4.4: the exotic
+    /// [[Get]], [[Set]], [[GetOwnProperty]], [[DefineOwnProperty]] and [[Delete]] consult the
+    /// ParameterMap, which the object keeps, [`ParameterMap`]).
+    pub(crate) fn mapped_arg_binding(object: &Gc, key: &str) -> Option<(Env, usize)> {
+        let body = object.borrow();
+        let Exotic::Arguments(Some(map)) = &body.exotic else {
+            return None;
+        };
+        // ParameterMap keys are exact array-index strings, not every spelling accepted by an
+        // unsigned integer parser (for example, "00" or "+0").
+        let index = crate::value::canonical_index(key)? as usize;
+        Some((map.env(), map.slot(index)?))
     }
 
-    /// The current parameter value a mapped `arguments[key]` aliases, if the map is live.
-    pub(crate) fn mapped_arg_value(&self, ptr: usize, key: &str) -> Option<Value> {
-        let name = self.mapped_arg_name(ptr, key)?;
-        let (env, _) = self.mapped_arguments.get(&ptr)?;
-        if let Some(value) = self
-            .borrowed_parameters
-            .as_ref()
-            .and_then(|registry| registry.read(env, &name))
-        {
-            return Some(value);
+    /// Whether `object` is a mapped arguments object, whose indices may alias bindings: its
+    /// [[Get]] and [[Set]] are not an ordinary object's.
+    pub(crate) fn is_mapped_arguments(object: &Gc) -> bool {
+        matches!(object.borrow().exotic, Exotic::Arguments(Some(_)))
+    }
+
+    /// The current value of the parameter a mapped `arguments[key]` aliases, if the index is
+    /// mapped.
+    pub(crate) fn mapped_arg_value(&self, object: &Gc, key: &str) -> Option<Value> {
+        let (env, slot) = Self::mapped_arg_binding(object, key)?;
+        if let Some(registry) = self.borrowed_parameters.as_ref() {
+            // An AST activation's formals parked in VM slots: the registry homes them by name.
+            let name = env.borrow().vars.keys().nth(slot)?;
+            if let Some(value) = registry.read(&env, &name.text()) {
+                return Some(value);
+            }
         }
-        env.borrow().vars.get(name.as_str()).map(|b| b.value())
+        let scope = env.borrow();
+        let value = scope.vars.fixed_binding_at(slot)?.value();
+        Some(value)
     }
 
     /// Write through a mapped `arguments[key]` alias into its parameter binding.
-    pub(crate) fn mapped_arg_write(&mut self, ptr: usize, key: &str, v: &Value) -> bool {
-        let Some(name) = self.mapped_arg_name(ptr, key) else {
+    pub(crate) fn mapped_arg_write(&mut self, object: &Gc, key: &str, v: &Value) -> bool {
+        let Some((env, slot)) = Self::mapped_arg_binding(object, key) else {
             return false;
         };
-        let Some((env, _)) = self.mapped_arguments.get(&ptr) else {
-            return false;
-        };
-        if self
-            .borrowed_parameters
-            .as_ref()
-            .is_some_and(|registry| registry.write(env, &name, v))
-        {
-            return true;
+        if let Some(registry) = self.borrowed_parameters.as_ref() {
+            let name = env.borrow().vars.keys().nth(slot);
+            if name.is_some_and(|name| registry.write(&env, &name.text(), v)) {
+                return true;
+            }
         }
-        if let Some(mut b) = env.borrow_mut().vars.get_mut(&name) {
-            b.set_value(*v);
-            return true;
+        let mut scope = env.borrow_mut();
+        match scope.vars.fixed_binding_at_mut(slot) {
+            Some(mut binding) => {
+                binding.set_value(*v);
+                true
+            }
+            None => false,
         }
-        false
     }
 
     /// Unmap an `arguments` index (delete / defineProperty severs the parameter alias).
-    pub(crate) fn unmap_argument(&mut self, ptr: usize, key: &str) {
-        if let Some((_, names)) = self.mapped_arguments.get_mut(&self.gc_heap, &ptr) {
-            if let Some(idx) = crate::value::canonical_index(key) {
-                if let Some(slot) = names.get_mut(idx as usize) {
-                    *slot = None;
-                }
-            }
+    pub(crate) fn unmap_argument(object: &Gc, key: &str) {
+        let Some(index) = crate::value::canonical_index(key) else {
+            return;
+        };
+        if let Exotic::Arguments(Some(map)) = &mut object.borrow_mut().exotic {
+            map.unmap(index as usize);
         }
     }
 
@@ -11727,10 +11838,9 @@ impl Interp {
     ) -> Result<bool, Abrupt> {
         // Arguments [[Set]] updates its ParameterMap only when the arguments object
         // itself is Receiver. A proxy forwarding to it must preserve a distinct Receiver.
-        if !self.mapped_arguments.is_empty() {
+        if mapped_arguments_made() {
             if let (ValueView::Obj(o), ValueView::Obj(r)) = (&(base).view(), &(receiver).view()) {
-                let ptr = Gc::as_ptr(o) as usize;
-                if Gc::ptr_eq(o, r) && self.mapped_arg_write(ptr, key, &value) {
+                if Gc::ptr_eq(o, r) && self.mapped_arg_write(o, key, &value) {
                     // Update the own property's value in place — its attributes (e.g. a
                     // configurable:false from defineProperty) must survive.
                     let mut b = o.borrow_mut();
@@ -11851,7 +11961,7 @@ impl Interp {
         };
 
         let ptr = Gc::as_ptr(&obj) as usize;
-        if matches!(obj.borrow().exotic, Exotic::Arguments) {
+        if matches!(obj.borrow().exotic, Exotic::Arguments(_)) {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.record(
                     crate::feedback::PropertyOutcome::Exotic,
@@ -12168,7 +12278,7 @@ impl Interp {
                 }
                 // Proxy and arguments receivers require their [[DefineOwnProperty]]:
                 // observable traps and live parameter mappings must not be bypassed.
-                let arguments_receiver = matches!(r.borrow().exotic, Exotic::Arguments);
+                let arguments_receiver = matches!(r.borrow().exotic, Exotic::Arguments(_));
                 if arguments_receiver || self.proxies.contains_key(&rptr) {
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.record(
@@ -12863,7 +12973,6 @@ impl Interp {
             async_gens,
             async_gen_busy,
             async_gen_queue,
-            mapped_arguments,
             deferred_ns,
             promise_forward,
             temporal_cal,
@@ -13036,7 +13145,6 @@ impl Interp {
         crate::gc_sweep::set(async_gen_busy, dead);
         async_gen_queue.evict_dead(dead);
         routed_imports.evict_dead(dead);
-        mapped_arguments.evict_dead(dead);
         construct_capacity_hints.evict_dead(dead);
         crate::gc_sweep::map(deferred_ns, dead);
         promise_forward.evict_dead(dead);
@@ -14058,8 +14166,8 @@ impl Interp {
     /// Build the `arguments` exotic object for an activation: indexed own props + configurable
     /// `length`, `@@iterator` = Array.prototype.values. An unmapped one (strict function OR
     /// non-simple parameter list) exposes `callee` as the %ThrowTypeError% poison accessor; a
-    /// mapped one aliases still-mapped indices to the parameter bindings in `scope` (see
-    /// `mapped_arguments`) and carries the function as `callee`.
+    /// mapped one aliases still-mapped indices to the parameter bindings in `scope` (its
+    /// [`ParameterMap`]) and carries the function as `callee`.
     pub(crate) fn make_arguments_object(
         &mut self,
         func: &Rc<Function>,
@@ -14073,7 +14181,7 @@ impl Interp {
         let ao = Object::new(Some(self.object_proto));
         let packed = {
             let mut object = ao.borrow_mut();
-            object.exotic = crate::value::Exotic::Arguments;
+            object.exotic = crate::value::Exotic::Arguments(None);
             // Create{Unmapped,Mapped}ArgumentsObject defines a contiguous run of
             // ordinary indexed data properties. Use the same packed storage as
             // fresh arrays without changing the arguments object's exotic kind,
@@ -14144,31 +14252,32 @@ impl Interp {
             }
         }
         if !unmapped {
-            // Mapped: indices alias the parameter bindings (which live in `scope`). With
-            // duplicate parameter names only the LAST occurrence is mapped — earlier indices
-            // stay plain data properties holding the original argument values.
-            let mut names = vec![None; func.params.len().min(args.len())];
-            let mut seen: Vec<String> = Vec::new();
-            // CreateMappedArgumentsObject walks ALL formals before checking index < argc.
-            // A missing final duplicate still prevents an earlier supplied index from mapping.
-            for (index, parameter) in func.params.iter().enumerate().rev() {
-                let Pattern::Ident(name) = &parameter.pattern else {
-                    unreachable!("mapped arguments require simple formals")
-                };
-                if !seen.contains(name) {
-                    seen.push(name.clone());
-                    if let Some(slot) = names.get_mut(index) {
-                        *slot = Some(name.clone());
+            // Mapped: indices alias the parameter bindings, which live in `scope`, at their slots
+            // there (`ParameterMap`). With duplicate parameter names only the LAST occurrence is
+            // mapped — earlier indices stay plain data properties holding the original argument
+            // values.
+            {
+                // FunctionDeclarationInstantiation creates every formal's binding (step 21)
+                // before the arguments object that maps them (step 22): the tree-walker binds
+                // their values afterwards, in place.
+                let mut record = scope.borrow_mut();
+                for parameter in &func.params {
+                    if let Pattern::Ident(name) = &parameter.pattern {
+                        if record.vars.binding_slot(name).is_none() {
+                            record
+                                .vars
+                                .insert(name.as_str(), Binding::data(Value::Undefined, true, true));
+                        }
                     }
                 }
             }
-            if names.iter().any(Option::is_some) {
-                self.gc_pin(&ao);
-                self.mapped_arguments.insert(
-                    &self.gc_heap,
-                    Gc::as_ptr(&ao) as usize,
-                    (*scope, names),
-                );
+            let slots = mapped_parameter_slots(func, args.len(), |name| {
+                scope.borrow().vars.binding_slot(name)
+            });
+            if slots.iter().any(|&slot| slot != ParameterMap::UNMAPPED) {
+                MAPPED_ARGUMENTS_MADE.with(|made| made.set(true));
+                let map = crate::gc_storage::StorageBox::new(ParameterMap::new(*scope, &slots));
+                ao.borrow_mut().exotic = crate::value::Exotic::Arguments(Some(map));
             }
         }
         ao
@@ -14970,11 +15079,7 @@ impl Interp {
         }
         let length = match body.exotic {
             Exotic::Array => crate::builtins::ordinary_array_length(&body.props)?,
-            Exotic::Arguments
-                if !self
-                    .mapped_arguments
-                    .contains_key(&(Gc::as_ptr(&object) as usize)) =>
-            {
+            Exotic::Arguments(None) => {
                 // Writable and configurable: author code may have changed or removed it.
                 let length = body.props.length_property()?.number_value()?;
                 if !(length >= 0.0 && length.fract() == 0.0 && length <= out.len() as f64) {

@@ -826,7 +826,15 @@ pub(super) fn emit(
             } else {
                 0
             };
-            emit_elided_element(a, *slot, skip, pc as u32, unwind);
+            // A mapped body's index below its formals' count reads its formal's binding
+            // (Decision 20f): at its fixed slot in a fresh frame, else through the helper.
+            let mapped = match op {
+                Op::ArgElem(_) => chunk
+                    .jit_mapped_formals()
+                    .map(|(count, first)| (count, first.filter(|_| a.fixed_activation()))),
+                _ => None,
+            };
+            emit_elided_element(a, *slot, skip, mapped, pc as u32, unwind);
         }
         _ => return false,
     }
@@ -865,8 +873,18 @@ fn emit_elided_length(a: &mut asm::Asm, slot: u16, skip: u32, pc: u32, unwind: u
 
 /// [`Op::ArgElem`] and [`Op::RestElem`]: a key that is a Number naming an int32 index `k >= 0`
 /// with `k + skip` below the count reads argument `k + skip` in place of the key; anything else
-/// (another key, an index past the end, a filled slot) takes the helper.
-fn emit_elided_element(a: &mut asm::Asm, slot: u16, skip: u32, pc: u32, unwind: usize) {
+/// (another key, an index past the end, a filled slot) takes the helper. `mapped`, a mapped
+/// body's (`Chunk::jit_mapped_formals`): an index below its formals' count reads the formal's
+/// binding instead, at the fixed slots from the given first one, or without one through the
+/// helper.
+fn emit_elided_element(
+    a: &mut asm::Asm,
+    slot: u16,
+    skip: u32,
+    mapped: Option<(u32, Option<u32>)>,
+    pc: u32,
+    unwind: usize,
+) {
     let slow = a.new_label();
     let done = a.new_label();
     emit_elided_slot_check(a, slot, slow);
@@ -885,6 +903,23 @@ fn emit_elided_element(a: &mut asm::Asm, slot: u16, skip: u32, pc: u32, unwind: 
     a.ldr_imm(12, 19, CTX_ARGC_OFF as u32);
     a.cmp_reg_w(11, 12);
     a.b_cond(C_HS, slow);
+    if let Some((count, first)) = mapped {
+        let unmapped = a.new_label();
+        a.cmp_imm_w(11, count);
+        a.b_cond(C_HS, unmapped);
+        match first {
+            Some(first) => {
+                // The formal's word: its binding at slot `first + k` of the activation.
+                a.ldr_imm(13, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+                a.add_imm(13, 13, cap_slot_offset(first));
+                a.ldr_x_lsl3(14, 13, 11);
+                emit_exec_word_store(a, 14, 20, -8);
+                a.b(done);
+            }
+            None => a.b(slow),
+        }
+        a.bind(unmapped);
+    }
     a.ldr_imm(13, 19, CTX_ARGC_OFF as u32 + 8); // the arguments' address
     a.ldr_x_lsl3(14, 13, 11);
     emit_exec_word_store(a, 14, 20, -8);

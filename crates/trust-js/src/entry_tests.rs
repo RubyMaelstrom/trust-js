@@ -130,12 +130,14 @@ fn compiled_entry_arguments_mapping_and_parameter_body_cells() {
         [mapped(1,2),duplicate(1,2),unmapped(1),complex(),separate(),captured(1)].join('|')
     "#,
         "4:4:7|9:8|4:9|4:9|1:9|14",
+        // Mapped bodies keep their formals in their activation, which their arguments object
+        // aliases (Decision 20f); non-simple parameter lists keep the prepared entry.
         &[
-            ("mapped", Prepared),
-            ("duplicate", Prepared),
+            ("mapped", Lean),
+            ("duplicate", Lean),
             ("complex", Prepared),
             ("separate", Prepared),
-            ("captured", Prepared),
+            ("captured", Lean),
         ],
         true,
     );
@@ -171,7 +173,9 @@ fn missing_last_duplicate_formal_does_not_map_an_earlier_argument() {
             e.get()+':'+e.args[0]].join('|')
         "#,
         "3:undefined:7:undefined:9|3:4:7:9:9|undefined:undefined:7:undefined:9|undefined:8:6:8:false|undefined:7:9|9:8",
-        &[("duplicate", Prepared), ("interleaved", Prepared), ("define", Prepared), ("escaped", Prepared)],
+        // Their formals live in their activations, which their arguments objects alias
+        // (Decision 20f).
+        &[("duplicate", Lean), ("interleaved", Lean), ("define", Lean), ("escaped", Lean)],
         true,
     );
 }

@@ -204,7 +204,7 @@ impl Interp {
         let object = reference.object.as_ref().expect("object Reference owner");
         let pointer = Gc::as_ptr(object) as usize;
         let hint = if self.ordinary_get_ptr(pointer)
-            && (self.mapped_arguments.is_empty() || !self.mapped_arguments.contains_key(&pointer))
+            && !(crate::interpreter::mapped_arguments_made() && Self::is_mapped_arguments(object))
         {
             let body = object.borrow();
             let shape = body.props.shape();

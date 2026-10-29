@@ -47,7 +47,7 @@ fn initial_family(exotic: &Exotic) -> &'static str {
     match exotic {
         Exotic::None => "ordinary",
         Exotic::Array => "array",
-        Exotic::Arguments => "arguments",
+        Exotic::Arguments(_) => "arguments",
         Exotic::Error(_) => "error",
         _ => "wrapper",
     }
@@ -808,7 +808,7 @@ pub(super) fn report(heap: &GcHeap) {
             match object.exotic {
                 Exotic::None => 0,
                 Exotic::Array => 2,
-                Exotic::Arguments => 3,
+                Exotic::Arguments(_) => 3,
                 Exotic::Error(_) => 4,
                 _ => 5,
             }

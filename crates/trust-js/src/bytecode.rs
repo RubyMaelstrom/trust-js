@@ -2684,6 +2684,13 @@ pub struct Chunk {
     /// A [`Chunk::lazy_arguments`] body that reads only `arguments.length`: `arguments_slot`
     /// holds that length, the number of actual arguments, and the reads are plain slot loads.
     pub(crate) arguments_count: bool,
+    /// A sloppy body with simple formals that keeps them in its activation, which its mapped
+    /// arguments object aliases (W3 item 3's step 6, Decision 20f): per argument index below the
+    /// formals' count, the name (`names`) of the formal that index maps, when it is that name's
+    /// last occurrence (CreateMappedArgumentsObject, ECMA-262 spec.html:15083-15148). An elided
+    /// object's read of a mapped index below the count reads that binding ([`Op::ArgElem`]).
+    /// Empty for every other body.
+    pub(crate) mapped_formals: Box<[Option<u32>]>,
     // (fields below; Debug is manual — `consts` holds engine Values)
     ops: Vec<Op>,
     /// Derived after all bytecode transformations. Emission queries this for each captured
@@ -2913,6 +2920,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             rest_slot: _,
             lazy_arguments: _,
             arguments_count: _,
+            mapped_formals: _,
             rest_elided: _,
             ops: _,
             jit_needs_activation_state: _,
@@ -7152,9 +7160,23 @@ mod function_directive_tests;
 mod elided_arguments_tests;
 
 #[cfg(test)]
+#[path = "mapped_arguments_tests.rs"]
+mod mapped_arguments_tests;
+
+#[cfg(test)]
 #[path = "fixed_activation_tests.rs"]
 mod fixed_activation_tests;
 
+thread_local! {
+    /// Set when a compilation of a sloppy body with simple formals failed only because its
+    /// `arguments` is observed beyond its length: [`compile_inner`] then compiles it with its
+    /// formals in its activation, which its arguments object maps (W3 item 3's step 6).
+    static MAPPED_BEYOND_LENGTH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Compile `func`: a sloppy body with simple formals first as if it read only
+/// `arguments.length` (its formals in frame slots, no object), then, when it reads more, with
+/// its formals in its activation, which its mapped arguments object aliases (Decision 20f).
 fn compile_inner(
     func: &Function,
     plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
@@ -7163,6 +7185,39 @@ fn compile_inner(
     derived_constructor: bool,
     prepared_entry: bool,
     script_body: bool,
+) -> Option<Rc<Chunk>> {
+    MAPPED_BEYOND_LENGTH.with(|flag| flag.set(false));
+    let compile = |mapped_env| {
+        compile_inner_mode(
+            func,
+            plan,
+            hot,
+            module_bindings,
+            derived_constructor,
+            prepared_entry,
+            script_body,
+            mapped_env,
+        )
+    };
+    let chunk = compile(false);
+    if chunk.is_some() || !MAPPED_BEYOND_LENGTH.with(|flag| flag.replace(false)) {
+        return chunk;
+    }
+    compile(true)
+}
+
+/// [`compile_inner`]; `mapped_env` homes a sloppy body's simple formals in its activation, which
+/// its mapped arguments object (or, elided, its element reads) aliases.
+#[allow(clippy::too_many_arguments)]
+fn compile_inner_mode(
+    func: &Function,
+    plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
+    hot: Option<&Chunk>,
+    module_bindings: Option<&[(String, bool)]>,
+    derived_constructor: bool,
+    prepared_entry: bool,
+    script_body: bool,
+    mapped_env: bool,
 ) -> Option<Rc<Chunk>> {
     // Compilation reads the statements: decode a snapshot-encoded body once, up front.
     func.body.prepare_to_run();
@@ -7209,8 +7264,13 @@ fn compile_inner(
     // `lazy_arguments_rewrite`, with no element read), neither parameter writes nor argument
     // writes can be observed, so the parameters keep ordinary slots and no object is created.
     // An unproven body fails this compilation and takes the prepared (exactly mapped) entry.
-    let arguments_length_only = has_mapped_parameter_aliases && !is_coroutine && !prepared_entry;
-    let has_mapped_parameter_aliases = has_mapped_parameter_aliases && !arguments_length_only;
+    // Otherwise (`mapped_env`, Decision 20f) the formals live in the activation, whose slots the
+    // arguments object's ParameterMap aliases, and the body leaves the prepared entry.
+    let mapped_env = mapped_env && has_mapped_parameter_aliases && !is_coroutine && !prepared_entry;
+    let arguments_length_only =
+        has_mapped_parameter_aliases && !is_coroutine && !prepared_entry && !mapped_env;
+    let has_mapped_parameter_aliases =
+        has_mapped_parameter_aliases && !arguments_length_only && !mapped_env;
     if uses_arguments
         && !func.is_arrow
         && !is_coroutine
@@ -7218,6 +7278,7 @@ fn compile_inner(
         && !func.params.is_empty()
         && !strict_simple_arguments
         && !arguments_length_only
+        && !mapped_env
     {
         log_bail("fn", "arguments with arrow/async/parameters");
         return None;
@@ -7263,6 +7324,7 @@ fn compile_inner(
         lean_new_target,
         rest_slot: None,
         arguments_length_only,
+        mapped_env,
         // A module already has its own `this` binding, initialized to undefined. Reuse that
         // environment for nested arrows instead of synthesizing a function activation.
         // A derived constructor already runs under its mandatory Function Environment Record;
@@ -7454,7 +7516,8 @@ fn compile_inner(
                             }
                         }
                         let slot = c.fresh_slot(name);
-                        let is_captured = captured.contains(name);
+                        // A mapped arguments object aliases every formal: in the activation.
+                        let is_captured = captured.contains(name) || mapped_env;
                         if is_captured {
                             c.cap_inits
                                 .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
@@ -7699,6 +7762,16 @@ fn compile_inner(
     } else {
         c.emit(Op::ReturnUndef);
     }
+    if c.mapped_env {
+        // Per argument index, the formal its ParameterMap entry names (Decision 20f).
+        let count = func.params.len();
+        c.mapped_formals = crate::interpreter::mapped_parameter_slots(func, count, |name| {
+            Some(c.name_idx(name) as usize)
+        })
+        .into_iter()
+        .map(|name| (name != crate::interpreter::ParameterMap::UNMAPPED).then_some(name))
+        .collect();
+    }
     finish_chunk(c, hot, prepared_entry, is_coroutine, Some(func))
 }
 
@@ -7851,6 +7924,7 @@ fn finish_chunk(
         && !(lazy_arguments && !c.ops.iter().any(|op| matches!(op, Op::ArgElem(_))))
     {
         log_bail("fn", "mapped arguments observed beyond length");
+        MAPPED_BEYOND_LENGTH.with(|flag| flag.set(true));
         return None;
     }
     let jit_needs_activation_state = c.ops.iter().any(jit_bridge_op);
@@ -7875,6 +7949,7 @@ fn finish_chunk(
         rest_slot: c.rest_slot,
         lazy_arguments,
         arguments_count,
+        mapped_formals: c.mapped_formals.into_boxed_slice(),
         rest_elided,
         ops: c.ops,
         jit_needs_activation_state,
@@ -8634,6 +8709,11 @@ struct Compiler {
     /// A sloppy function with simple parameters compiled without its mapped arguments object:
     /// valid only if the body reads nothing but `arguments.length` (see `finish_chunk`).
     arguments_length_only: bool,
+    /// A sloppy function with simple parameters whose formals live in its activation, which its
+    /// mapped arguments object aliases (Decision 20f; see [`Chunk::mapped_formals`]).
+    mapped_env: bool,
+    /// See [`Chunk::mapped_formals`].
+    mapped_formals: Vec<Option<u32>>,
     /// Borrow the already-instantiated AST environment and return exact source completions.
     fragment_entry: bool,
     borrowed_parameter_aliases: bool,
@@ -9105,21 +9185,43 @@ pub(crate) fn elided_arguments_element(
     chunk: &Chunk,
     pc: usize,
     arguments: &[Value],
+    activation: &Env,
     slot: &std::cell::Cell<Value>,
     key: &Value,
 ) -> Result<Value, Abrupt> {
     if let Some(k) = elided_index(key) {
         if let Some(&value) = arguments.get(k) {
-            return Ok(value);
+            return Ok(mapped_formal_value(chunk, activation, k).unwrap_or(value));
         }
         if i.array_prototypes_unshadowed() {
             return Ok(Value::Undefined);
         }
     }
-    let scope = i.global_env;
+    let scope = materialization_scope(i, chunk, activation);
     let object = Value::Obj(i.make_compiled_arguments_object(arguments, &scope));
     slot.set(object);
     get_computed_element(i, chunk, pc, &object, key)
+}
+
+/// The current value of the formal parameter a mapped body's argument index `k`, below the
+/// actual count, aliases (W3 item 3's step 6, Decision 20f): its binding in the activation,
+/// when `k` is a mapped index ([`Chunk::mapped_formals`]); `None` for an unmapped index, whose
+/// value is the argument itself.
+fn mapped_formal_value(chunk: &Chunk, activation: &Env, k: usize) -> Option<Value> {
+    let name = (*chunk.mapped_formals.get(k)?)?;
+    let scope = activation.borrow();
+    let value = scope.vars.get(&chunk.names[name as usize])?.value();
+    Some(value)
+}
+
+/// The record a materialized arguments object of `chunk` maps: a mapped body's activation,
+/// whose formals the object aliases (Decision 20f); any other body's object maps nothing.
+fn materialization_scope(i: &Interp, chunk: &Chunk, activation: &Env) -> Env {
+    if chunk.mapped_formals.is_empty() {
+        i.global_env
+    } else {
+        *activation
+    }
 }
 
 /// `rest[key]` ([`Op::RestElem`]) in a fresh native frame whose rest Array is elided (Decision
@@ -9161,6 +9263,7 @@ pub(crate) fn lazy_arguments_element(
     pc: usize,
     list: &Value,
     key: &Value,
+    activation: &Env,
     materialized: impl FnOnce(&Value),
 ) -> Result<Value, Abrupt> {
     let still_lazy = matches!(&(list).view(), ValueView::Obj(object)
@@ -9171,13 +9274,15 @@ pub(crate) fn lazy_arguments_element(
     }
     if let (ValueView::Obj(list), ValueView::Num(index)) = (&(list).view(), &(key).view()) {
         if let Some(value) = i.fast_get_elem(list, *index) {
-            return Ok(value);
+            // A mapped index reads its formal's binding (Decision 20f).
+            let k = *index as usize;
+            return Ok(mapped_formal_value(chunk, activation, k).unwrap_or(value));
         }
     }
     // The [[Get]] may reach an inherited accessor that receives (and could keep or mutate) the
     // arguments object, so it replaces the list for every later read in this activation.
     let values = crate::builtins::dense_array_snapshot(i, list).unwrap_or_default();
-    let scope = i.global_env;
+    let scope = materialization_scope(i, chunk, activation);
     let arguments = Value::Obj(i.make_compiled_arguments_object(&values, &scope));
     materialized(&arguments);
     get_computed_element(i, chunk, pc, &arguments, key)
@@ -15631,7 +15736,32 @@ pub(crate) fn try_function_osr(
                 && parameter.default.is_none()
                 && matches!(parameter.pattern, Pattern::Ident(_))
         });
-    let chunk = baseline;
+    // A mapped body's chunk keeps its formals in its activation and its arguments object in a
+    // slot, neither of which a parked AST frame hands over; its prepared variant runs in the
+    // frame's own Function Environment Record and arguments object (Decision 20f).
+    let chunk = if baseline.mapped_formals.is_empty()
+        || baseline
+            .function_osr_entries
+            .iter()
+            .any(|entry| entry.site == address)
+    {
+        baseline
+    } else {
+        match runtime.osr_code.get_or_init(|| {
+            compile_inner(
+                &function,
+                &Default::default(),
+                None,
+                None,
+                false,
+                true,
+                false,
+            )
+        }) {
+            Some(chunk) => chunk,
+            None => return Ok(None),
+        }
+    };
     if construct && chunk.has_tail_calls() {
         return Ok(None);
     }
@@ -17440,9 +17570,10 @@ fn run_vm_inner(
                 let key = pop!();
                 let list = slots.read_value(s as usize);
                 let mut replacement = None;
-                let value = lazy_arguments_element(i, chunk, op_pc, &list, &key, |object| {
-                    replacement = Some(*object)
-                });
+                let value =
+                    lazy_arguments_element(i, chunk, op_pc, &list, &key, cap_env, |object| {
+                        replacement = Some(*object)
+                    });
                 if let Some(object) = replacement {
                     slots.write_value(s as usize, object);
                 }
@@ -21175,6 +21306,31 @@ impl Chunk {
         self.arguments_slot
     }
 
+    /// How native code reads a mapped body's elided `arguments[k]` for `k` below the formals'
+    /// count (Decision 20f; [`Chunk::mapped_formals`]): `None` for a body whose arguments
+    /// object maps nothing; else the count of formals and, when every index below it maps its
+    /// own formal at consecutive fixed slots of a fresh frame's activation (no duplicates), the
+    /// first of those slots, which generated code then reads at `RECORD_HEADER + 8 * (first + k)`.
+    /// Without it, those reads take the operation's helper.
+    pub(crate) fn jit_mapped_formals(&self) -> Option<(u32, Option<u32>)> {
+        if self.mapped_formals.is_empty() {
+            return None;
+        }
+        let count = self.mapped_formals.len() as u32;
+        let mut first = None;
+        for (k, name) in self.mapped_formals.iter().enumerate() {
+            let slot = name
+                .and_then(|name| self.jit_cap_binding(name))
+                .map(|(slot, _)| slot);
+            match (slot, first) {
+                (Some(slot), None) if k == 0 => first = Some(slot),
+                (Some(slot), Some(base)) if slot == base + k as u32 => {}
+                _ => return Some((count, None)),
+            }
+        }
+        Some((count, first))
+    }
+
     /// The slot of a body that reads only `arguments.length` ([`Chunk::arguments_count`]), which
     /// its prologue fills with the count, a Number.
     pub(crate) fn jit_arguments_count_slot(&self) -> Option<u16> {
@@ -23025,8 +23181,7 @@ fn dense_own_list(i: &Interp, list: &Value) -> Option<Vec<Value>> {
         return None;
     };
     if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(list) as usize)
-        || i.mapped_arguments
-            .contains_key(&(crate::value::Gc::as_ptr(list) as usize))
+        || (crate::interpreter::mapped_arguments_made() && Interp::is_mapped_arguments(list))
     {
         return None;
     }
@@ -26334,6 +26489,7 @@ unsafe fn jit_exec_inner(
                     chunk,
                     pc as usize,
                     arguments,
+                    cap_env,
                     &slots[s as usize],
                     &key,
                 )?;
@@ -26341,9 +26497,10 @@ unsafe fn jit_exec_inner(
                 return Ok(());
             }
             let mut replacement = None;
-            let value = lazy_arguments_element(i, chunk, pc as usize, &list, &key, |object| {
-                replacement = Some(*object)
-            });
+            let value =
+                lazy_arguments_element(i, chunk, pc as usize, &list, &key, cap_env, |object| {
+                    replacement = Some(*object)
+                });
             if let Some(object) = replacement {
                 slots.write_value(s as usize, object);
             }

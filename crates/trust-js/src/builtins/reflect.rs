@@ -76,7 +76,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
                 return Ok(Value::Bool(ab(i.proxy_delete(target, handler, &key))?));
             }
-            if matches!(o.borrow().exotic, Exotic::Arguments) {
+            if matches!(o.borrow().exotic, Exotic::Arguments(_)) {
                 // Arguments [[Delete]] severs a parameter mapping only after a
                 // successful ordinary deletion. Share the delete operator's path;
                 // a proxy trap that merely reports success never reaches this branch.

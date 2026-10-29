@@ -237,8 +237,7 @@ fn prepared_reference_own_numeric_internal_names_never_bypass_mapped_arguments()
         "var observe;var owner=(function(a){observe=()=>a;return arguments})(3);",
     );
     let owner = object(&mut engine, "owner");
-    let pointer = Gc::as_ptr(&owner) as usize;
-    assert!(engine.interp.mapped_arguments.contains_key(&pointer));
+    assert!(crate::interpreter::Interp::is_mapped_arguments(&owner));
     let mut reference = PreparedReference::object(Rc::from("0"), owner, false);
     // Simulate a previously published ordinary shape hint: owner kind must still be checked.
     reference.shape = owner.borrow().props.shape();
@@ -254,7 +253,7 @@ fn prepared_reference_own_numeric_internal_names_never_bypass_mapped_arguments()
         .write_prepared_reference(&mut reference, Value::Num(7.0))
         .is_ok());
     assert!(matches!(
-        (engine.interp.mapped_arg_value(pointer, "0")).map(|__value| (__value).view()),
+        (engine.interp.mapped_arg_value(&owner, "0")).map(|__value| (__value).view()),
         Some(ValueView::Num(7.0))
     ));
     assert_eq!(run(&mut engine, "observe()"), "7");

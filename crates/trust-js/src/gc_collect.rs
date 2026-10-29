@@ -1812,8 +1812,7 @@ impl Interp {
             annexb_fn_sync: _, // parsed functions
             deferred_ns: _,
             deferred_ns_objs,
-            promise_forward: _,  // side slots
-            mapped_arguments: _, // side slots
+            promise_forward: _, // side slots
             borrowed_parameters,
             module_source_objs,
             weak_refs: _,               // weak

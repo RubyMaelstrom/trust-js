@@ -16,6 +16,10 @@ pub(crate) struct FunctionRuntime {
     pub(crate) calls: Cell<u32>,
     pub(crate) code: OnceCell<Option<Rc<Chunk>>>,
     pub(crate) code2: OnceCell<Option<Rc<Chunk>>>,
+    /// A sloppy body with mapped `arguments` whose chunk keeps its formals in its activation
+    /// (Decision 20f): its prepared variant, which a tree-walked call parked at a loop enters
+    /// (`bytecode::try_function_osr`), compiled the first time one does.
+    pub(crate) osr_code: OnceCell<Option<Rc<Chunk>>>,
     pub(crate) fn_maps: OnceCell<Rc<FunctionMaps>>,
     /// The runtime ScriptOrModule this heap's first closure of the function had. Closures with
     /// the same record share it instead of each boxing a copy (`UserCallableCache::own_origin`).
@@ -31,6 +35,7 @@ impl FunctionRuntime {
             calls: Cell::new(0),
             code: OnceCell::new(),
             code2: OnceCell::new(),
+            osr_code: OnceCell::new(),
             fn_maps: OnceCell::new(),
             origin: OnceCell::new(),
         }
@@ -56,6 +61,7 @@ impl Drop for FunctionRuntime {
     fn drop(&mut self) {
         if self.code.get().is_some_and(Option::is_some)
             || self.code2.get().is_some_and(Option::is_some)
+            || self.osr_code.get().is_some_and(Option::is_some)
         {
             // Call ICs keep raw addresses inside these set-once slots, including code-keyed
             // entries that can match a later closure of the same AST. Fence those entries

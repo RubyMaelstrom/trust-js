@@ -7721,7 +7721,7 @@ impl Interp {
                         .map(|p| p.configurable())
                         .unwrap_or(true);
                     if configurable {
-                        self.unmap_argument(Gc::as_ptr(o) as usize, prop);
+                        Self::unmap_argument(o, prop);
                         o.borrow_mut().props.remove(prop);
                         return Ok(Value::Bool(true));
                     }

@@ -1164,11 +1164,13 @@ impl Visitor {
                     self.value(value);
                 }
             }
+            // The environment is its function's activation, which its own owners report.
+            Exotic::Arguments(Some(map)) => internal_bytes += map.retained_bytes(),
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)
             | Exotic::NumWrap(_)
-            | Exotic::Arguments => {}
+            | Exotic::Arguments(None) => {}
         }
         let (bytes, exact) = object.props.retained_requested_storage_bytes();
         (bytes.saturating_add(internal_bytes), exact)
@@ -1949,12 +1951,6 @@ fn scan_realm(
             )
             .saturating_add(
                 interp
-                    .mapped_arguments
-                    .len()
-                    .saturating_mul(size_of::<(usize, (Env, Vec<Option<String>>))>()),
-            )
-            .saturating_add(
-                interp
                     .module_source_objs
                     .len()
                     .saturating_mul(size_of::<(String, Value)>()),
@@ -1989,14 +1985,6 @@ fn scan_realm(
         totals.interpreter_side_tables.add(module.capacity());
         visitor.value(namespace);
     }
-    for (_environment, names) in interp.mapped_arguments.values() {
-        totals
-            .interpreter_side_tables
-            .add(names.capacity().saturating_mul(size_of::<Option<String>>()));
-        for name in names.iter().flatten() {
-            totals.interpreter_side_tables.add(name.capacity());
-        }
-    }
     if let Some(registry) = &interp.borrowed_parameters {
         totals
             .interpreter_side_tables
@@ -2013,7 +2001,6 @@ fn scan_realm(
         || !interp.annexb_fn_sync.is_empty()
         || !interp.deferred_ns.is_empty()
         || !interp.deferred_ns_objs.is_empty()
-        || !interp.mapped_arguments.is_empty()
         || !interp.module_source_objs.is_empty()
     {
         totals
@@ -3735,13 +3722,6 @@ mod tests {
         engine.interp.deferred_ns_objs.insert(
             "deferred/module.js".to_string(),
             Value::lstr("deferred namespace payload"),
-        );
-        let mut mapped_names = Vec::with_capacity(5);
-        mapped_names.push(Some("mappedParameterWithCapacity".to_string()));
-        engine.interp.mapped_arguments.insert(
-            &engine.interp.gc_heap,
-            identity,
-            (engine.interp.global_env, mapped_names),
         );
         engine.interp.module_source_objs.insert(
             "source/module.js".to_string(),

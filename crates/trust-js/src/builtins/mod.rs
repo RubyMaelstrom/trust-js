@@ -164,7 +164,8 @@ pub(crate) fn nf_function_apply(
             let len = ab(i.to_length(&o))?;
             check_argument_count(i, len)?;
             let direct_dense = i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
-                && !i.mapped_arguments.contains_key(&(Gc::as_ptr(&o) as usize));
+                && !(crate::interpreter::mapped_arguments_made()
+                    && Interp::is_mapped_arguments(&o));
             // CreateListFromArrayLike performs ordered Gets. A later getter may collect or
             // replace an earlier source property, so the already evaluated prefix is rooted
             // independently of the source object while this snapshot is built.
@@ -956,7 +957,10 @@ pub(crate) fn object_get_own_property(
     ab(i.defer_trigger(o, Some(key)))?;
     let ptr = Gc::as_ptr(o) as usize;
     // A mapped arguments index reports the live parameter value (§10.4.4.1).
-    if let Some(value) = i.mapped_arg_value(ptr, key) {
+    if let Some(value) = crate::interpreter::mapped_arguments_made()
+        .then(|| i.mapped_arg_value(o, key))
+        .flatten()
+    {
         let mut property = o.borrow().props.get(key).cloned();
         if let Some(property) = &mut property {
             property.set_value(value);
@@ -1762,7 +1766,7 @@ pub(crate) fn reflect_define_on_receiver(
     // OrdinarySetWithOwnDescriptor calls the receiver's [[DefineOwnProperty]], not [[Set]].
     // Re-running [[Set]] here would invoke its own/inherited setter instead of defining a
     // data property, and would repeat the prototype search on the wrong object.
-    if matches!(ro.borrow().exotic, Exotic::Array | Exotic::Arguments) {
+    if matches!(ro.borrow().exotic, Exotic::Array | Exotic::Arguments(_)) {
         let mut descriptor = PartialDesc {
             value: Some(value),
             ..PartialDesc::default()
@@ -3365,7 +3369,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
             let b = o.borrow();
             if matches!(b.exotic, Exotic::Array) {
                 "Array"
-            } else if matches!(b.exotic, Exotic::Arguments) {
+            } else if matches!(b.exotic, Exotic::Arguments(_)) {
                 "Arguments"
             } else if !matches!(b.call, Callable::None) {
                 "Function"
@@ -5308,10 +5312,10 @@ fn define_own_property_record(
     // ArgumentsExoticObject [[DefineOwnProperty]]: sync the live parameter value into the
     // ordinary property first; after a successful ordinary define, a plain value write goes
     // through the map, and only an accessor or writable:false severs the alias.
-    let args_ptr = Gc::as_ptr(o) as usize;
-    let mapped = i.mapped_arg_name(args_ptr, key).is_some();
+    let mapped =
+        crate::interpreter::mapped_arguments_made() && Interp::mapped_arg_binding(o, key).is_some();
     if mapped {
-        if let Some(cur) = i.mapped_arg_value(args_ptr, key) {
+        if let Some(cur) = i.mapped_arg_value(o, key) {
             o.borrow_mut().props.set_value(key, cur);
         }
         let allowed = define_own_property_ordinary(i, o, key, d)?;
@@ -5319,13 +5323,13 @@ fn define_own_property_record(
             return Ok(false);
         }
         if d.is_accessor() {
-            i.unmap_argument(args_ptr, key);
+            Interp::unmap_argument(o, key);
         } else {
             if let Some(v) = &d.value {
-                i.mapped_arg_write(args_ptr, key, v);
+                i.mapped_arg_write(o, key, v);
             }
             if d.writable == Some(false) {
-                i.unmap_argument(args_ptr, key);
+                Interp::unmap_argument(o, key);
             }
         }
         return Ok(true);

@@ -1313,6 +1313,34 @@ pub(super) fn compile_entry(
                 a.nr_load(DX, CTX, super::CTX_ARGC_OFF);
                 a.nr_cmp(AX, DX);
                 a.jcc(AE, slow);
+                // A mapped body's index below its formals' count reads the formal's binding
+                // (Decision 20f): at its fixed slot in a fresh frame, else through the helper.
+                let mapped = match op {
+                    Op::ArgElem(_) => chunk
+                        .jit_mapped_formals()
+                        .map(|(count, first)| (count, first.filter(|_| a.fixed_activation))),
+                    _ => None,
+                };
+                if let Some((count, first)) = mapped {
+                    let unmapped = a.label();
+                    a.nr_op_imm(7, AX, count as i32); // cmp rax,count
+                    a.jcc(AE, unmapped);
+                    match first {
+                        Some(first) => {
+                            a.nr_load(DX, CTX, std::mem::offset_of!(super::JitCtx, env_raw));
+                            a.nr_op_imm(
+                                0,
+                                DX,
+                                (crate::interpreter::RECORD_HEADER + 8 * first as usize) as i32,
+                            ); // add rdx,slots
+                            a.bytes(&[0x48, 0x8b, 0x04, 0xc2]); // mov rax,[rdx+rax*8]
+                            a.store_word_r13(-SLOT_BYTES);
+                            a.jmp(done);
+                        }
+                        None => a.jmp(slow),
+                    }
+                    a.bind(unmapped);
+                }
                 a.nr_load(DX, CTX, super::CTX_ARGC_OFF + 8);
                 a.bytes(&[0x48, 0x8b, 0x04, 0xc2]); // mov rax,[rdx+rax*8]
                 a.store_word_r13(-SLOT_BYTES);
