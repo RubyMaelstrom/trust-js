@@ -570,7 +570,7 @@ does (Order, step 0).
        length or element read (no run-time placeholder): a formal's index reads the parameter
        slot, an out-of-range read goes through the prototype. The exemplars leave this to their
        optimizing tiers; TRust JS has one native tier.
-    f. Mapped arguments alias environment slots (step 7), as all three engines do; the side
+    f. Mapped arguments alias environment slots (step 6), as all three engines do; the side
        table goes.
     g. TDZ checks on a function's own captured lexicals are elided after the first in each
        basic block, as SpiderMonkey does; inner functions keep theirs.
@@ -578,6 +578,15 @@ does (Order, step 0).
        full form (new.target in the frame record).
 21. Captured names resolve statically, as (hops, slot) with guards only under sloppy direct eval
     and `with` (2026-10-28): a new item after item 3's representation change.
+22. Sloppy bodies with formals whose `arguments` the proof covers are elided in step 6, not step 1
+    (2026-10-29): their exact mapped object, which a non-index key or a prototype getter can
+    demand, must alias the parameters while the frame runs, so the parameters live in the
+    environment, as V8 forces them into the context (src/ast/scopes.cc:2650-2690).
+23. Immediates out of an instruction's range (2026-10-29): the ARM64 encoders accept any offset, as
+    V8's, SpiderMonkey's and JSC's macro-assemblers do, instead of relying on each template's
+    guard. The design follows an investigation of a scoped scratch-register allocator like V8's
+    UseScratchRegisterScope (macro-assembler-arm64.h:2556-2640, over ip0 and ip1), and covers the
+    JIT's and the RegExp tier's encoders.
 
 ## Non-goals
 
@@ -2610,8 +2619,8 @@ identical, zombie's x86-64 lib suite and clippy; the dumps differ only as each s
    once in each basic block (SpiderMonkey's frontend/BytecodeEmitter.cpp:1603-1633); inner
    functions keep their checks. Dumps: the cap templates, the prologues.
 6. Mapped arguments alias environment slots, and the side table goes (20f). A sloppy body with
-   simple parameters whose `arguments` the proof does not cover keeps its parameters in its
-   environment, and its arguments object holds that environment and, per mapped index, a slot
+   simple parameters whose `arguments` the proof does not cover, and since Decision 22 one it
+   covers, keeps its parameters in its environment, and its arguments object holds that environment and, per mapped index, a slot
    number (V8's SloppyArgumentsElements, JSC's ScopedArguments): `arguments[i]` and the parameter
    share one word, as MakeArgGetter and MakeArgSetter alias them (spec.html:15130-15168), and a
    define or a delete unmaps the index (14960-14992, 15039). The map lives in the object (W2g's
@@ -2759,6 +2768,64 @@ V8 falls back to `LdaLookupContextSlot` with extension checks, JSC to var-inject
 a watchpoint, SpiderMonkey to dynamic name ops.]
 Q9. Every ARM64 call site passes the argument count, one instruction (20d). [V8 passes it in a
 register on every call; JSC and SpiderMonkey keep it in every frame.]
+
+Step 1's record (afca0db6, b9241ae6, 2026-10-28, an agent's; Decisions 20a, 20d and 20e):
+- afca0db6: a callee builds its activation, rest Array and arguments value in its prologue, as
+  V8's CreateFunctionContext, SpiderMonkey's Baseline prologue and JSC's
+  op_create_lexical_environment do. A helper (`bytecode::jit_frame_setup`), called after the
+  entry poll, runs the chunk's plan, installs the activation and fills the slots; it runs no
+  author code, and its call ends in the explicit poll. Every ARM64 call site passes the argument
+  count in w1 (one `movz`), the arguments lying under the caller's operand top; a Rust entry
+  passes the count with bit 31 set and the arguments' address (x86-64: the count and the
+  address). A prologue that needs them keeps both in its record (`JitCtx::argc`, `JitCtx::args`),
+  and the record's trace reports its environment. `CALL_IC_NEEDS_ENV`, `run_moved_env` and
+  `call_jit_env_committed` go: environment, rest and arguments callees take the direct sequence.
+- b9241ae6: Q4's proof (20e) for unmapped `arguments` (strict, or sloppy without formals) and for
+  rest parameters. A body that reads them only by `length` and element makes neither in a fresh
+  native frame and reads the caller's argument words instead (ArgLength, ArgElem, RestLength,
+  RestElem, with templates on both backends). An index past the count is undefined while the
+  no-elements protector holds; any other key materializes the exact object into the slot, which
+  every later read takes. The bytecode VM, coroutines and borrowed frames keep the object or Array.
+
+Per call against 6e3c3ec8 (ARM64, loop excluded): env-call 1,026 to 669 (predicted ~600; the
+helper's ABI and its closing poll), env-this-call 1,011 to 670, env3-call 1,794 to 1,437,
+arguments-length 742 to 283, arguments-call 1,690 to 302 and rest-call 1,282 to 302 (predicted
+~280; Sparkplug-only Node 416 and 415), arguments-strict-call 1,692 to 316; other calls +1 (the
+count). arguments-apply-call rose 42: its sloppy callee uses `this` with an undefined receiver, so
+it still enters through the call helper, and now also calls the prologue's helper. Step 5's
+generated stores remove that, and x86-64's +21 for environment callees, which enter from Rust and
+now make their activation in a helper call of its own. x86-64 (zombie): arguments-call 2,325 to
+963, rest-call 2,126 to 966, arguments-length 838 to 747, other calls -14.
+
+Fixtures (ARM64): Vue -0.64% (its runs spread up to 0.25%; another session of main gives -0.71%),
+React -0.08%, Djot +0.47%, chai -1.26%. x86-64: Vue -0.13%, React -0.31%, Djot -0.25%; its
+bytecode VM +0.12% on Vue and React (the new ops share the existing arms), ARM64's unchanged.
+Djot's rise is one major collection. Main ends with 21 minor collections and no major, 12 KB under
+the 8 MiB budget after the 20th; there Part A is 6 KB over it (it keeps 1 to 21 more objects
+alive at each minor collection, of about 27,700) and Part B 33 KB (it also promotes 42 KB more at
+the 16th), so their next collection is major. Not a leak: the collector traces active frame
+records only. With a 16 MiB floor Djot is -0.14%.
+
+Validation: the ARM64 gate for each part (the lib suite; pacing with its known failure, and for
+Part B two tests that failed at a load of about 13 and passed on re-run: the watchdog's burst test,
+which saw two watchdog threads, and the test that a dropped realm which ran the last RegExp is
+collected, at the tree-walking tier; GC stress on the elided-arguments, arguments, rest,
+activation, call-guard, construct and thousands-of-formals tests; clippy in its five
+configurations and the workspace; the downstream crates; the fixtures and difftest as the base's;
+Test262 53,575 of 53,575, identical; the dumps differ by the count at 615 call sites, the new
+prologue in five Djot chunks and the record's field offsets) and zombie's x86-64 lib suite (its
+known host_buffer failure) and clippy, Windows clippy as its baseline.
+
+Not done: sloppy bodies with formals, which Q4 put in step 1; arguments-mapped-call stays at
+10,258. A formal's index could read its parameter slot, but a non-index key or a prototype getter
+needs the exact mapped object, which must alias the parameters while the frame runs, and step 1
+keeps them in frame slots: step 6 takes these bodies (Decision 22). Found on the way: the ARM64
+encoders check their immediates in debug builds only, so a template that misses its range guard
+mis-encodes silently in release. The first version of afca0db6 stored the count wrongly in a body
+with 4,096 or more slots (`arguments.length` read undefined with 5,000 formals); it was fixed with
+an indexed store and a test, and Decision 23 closes the class. And `perf stat ... taskset -c N
+cmd`, taskset inside perf, can add a scaled count from the other core type's PMU (about 80M on
+Djot): taskset goes outside perf.
 
 ### Stage-exit timing (2026-10-28)
 
