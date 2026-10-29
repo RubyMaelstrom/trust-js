@@ -2368,6 +2368,30 @@ impl RecordSlots<'_> {
     }
 }
 
+/// A plan activation's header (W3 item 3's step 7): the words of the record that a fresh
+/// frame's prologue writes in line, `len` slots named by `desc` in a cell of `class`, a
+/// variable environment with no `with` above it (compiled bodies run under none), and the index
+/// of its outer record's word, which the prologue writes from its closure.
+pub(crate) fn activation_header_words(
+    desc: DescRef,
+    class: u8,
+    len: usize,
+) -> ([u64; RECORD_HEADER / 8], usize) {
+    let mut vars = VarMap::header(Names::shared(desc), class, false, true, false);
+    vars.len = len as u32;
+    let record = std::cell::RefCell::new(Scope {
+        vars,
+        parent: None,
+        with_obj: Value::Empty,
+    });
+    let base = std::ptr::from_ref(&record) as usize;
+    // SAFETY: a record holds no padding (its fields fill its 48 bytes, `check_record_layout`)
+    // and has no drop glue.
+    let words: [u64; RECORD_HEADER / 8] = unsafe { std::mem::transmute_copy(&record) };
+    let parent = unsafe { std::ptr::addr_of!((*record.as_ptr()).parent) } as usize - base;
+    (words, parent / 8)
+}
+
 /// The size class of a record cell for `len` bindings ([`record_cell`]): what a plan's
 /// activations, `len` bindings each, are allocated in ([`new_activation`]).
 pub(crate) fn record_class(len: usize) -> u8 {
@@ -3585,6 +3609,11 @@ pub(crate) struct BindingSlot(Value);
 impl BindingSlot {
     /// A binding in its temporal dead zone.
     pub(crate) const TDZ: BindingSlot = BindingSlot(Value::Empty);
+
+    /// The slot's word, as generated code stores it.
+    pub(crate) fn word(&self) -> u64 {
+        self.0.bits()
+    }
 
     /// The binding's value: `Value::Empty` while it is in its temporal dead zone.
     #[inline]

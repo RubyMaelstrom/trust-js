@@ -20,6 +20,16 @@ thread_local! {
     };
 }
 
+/// Count an in-line activation in a test build (x10 and x11 scratch, before the poll).
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(super) fn record_inline_activation(a: &mut asm::Asm) {
+    let address = super::TEST_INLINE_ACTIVATIONS.with(|count| count.as_ptr() as usize);
+    a.mov_imm64(10, address as u64);
+    a.ldr_imm(11, 10, 0);
+    a.add_imm(11, 11, 1);
+    a.str_imm(11, 10, 0);
+}
+
 /// A successful operation, after its final guard and value/stack mutation. No call or poll;
 /// x9/x10 are scratch at these commit sites and all live words stay in their original homes.
 #[cfg(all(test, target_arch = "aarch64"))]

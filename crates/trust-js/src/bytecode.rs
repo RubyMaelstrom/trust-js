@@ -34,7 +34,7 @@ use crate::stack_trace::NO_POSITION;
 use crate::value::Value;
 
 #[path = "bytecode_activation.rs"]
-mod activation;
+pub(crate) mod activation;
 use activation::{activation_plans_enabled, ActivationPlan};
 
 #[path = "bytecode_string_accumulation.rs"]
@@ -21249,6 +21249,20 @@ impl Chunk {
             .jit_fixed_plan()?
             .fixed_binding(&self.names[n as usize])?;
         Some((slot as u32, attrs))
+    }
+
+    /// The activation a fresh frame's prologue makes in line, without the frame setup helper
+    /// (W3 item 3's step 7, W2e's first use): a [`Chunk::jit_fixed_activation`] chunk's whose
+    /// prologue makes nothing but its record (no rest Array or `arguments` object in a slot,
+    /// none in the record, no hoisted function). See [`ActivationPlan::inline_activation`].
+    pub(crate) fn jit_inline_activation(&self) -> Option<activation::InlineActivation> {
+        if !self.jit_fixed_activation()
+            || (self.rest_slot.is_some() && !self.rest_elided)
+            || (self.arguments_slot.is_some() && !self.arguments_count && !self.lazy_arguments)
+        {
+            return None;
+        }
+        self.jit_fixed_plan()?.inline_activation()
     }
 
     /// A [`Chunk::jit_fixed_activation`] chunk's captured parameters (binding slot, parameter

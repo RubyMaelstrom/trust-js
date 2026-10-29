@@ -1190,6 +1190,47 @@ struct Cursor {
 /// [`Cursor::page`] of a cursor with no page.
 const NO_PAGE: u32 = u32::MAX;
 
+/// W2e's inline allocation in generated code (its first use: a fresh frame's activation, W3
+/// item 3's step 7): a small cell of one size class for one descriptor, taken from the heap's
+/// cursor as [`Heap::alloc_small_uninit`] takes it, by code that reads and writes the heap and
+/// the cursor at the offsets of [`inline_alloc`]. The code takes the fast path's steps: it
+/// branches to its slow path (a helper that allocates in Rust) unless the heap allocates fast
+/// ([`Heap::fast_alloc`]), the cursor's word has a free cell and the cell's bytes keep the
+/// allocated bytes at or under the byte check ([`Heap::due_check_bytes`]); then it charges
+/// the bytes, takes the lowest free cell (the page's bitmap bit, the cursor's `taken` and
+/// `high`) and computes its address. Collections run only at safepoints, so the code polls
+/// after it has initialized the cell, as SpiderMonkey's Baseline checks its stack after making
+/// a CallObject in line (jit/BaselineCodeGen.cpp:7059-7080, MacroAssembler.cpp:362-406).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InlineAllocSite {
+    /// The heap's address: its fields sit at [`inline_alloc`]'s offsets from it.
+    pub(crate) heap: usize,
+    /// The cursor's index in the heap's cursors ([`inline_alloc::HEAP_CURSOR_BASE`]).
+    pub(crate) cursor: usize,
+    /// The size class's cell size.
+    pub(crate) cell_size: usize,
+}
+
+/// The offsets inline allocation reads and writes ([`InlineAllocSite`]).
+pub(crate) mod inline_alloc {
+    use std::mem::{offset_of, size_of};
+    pub(crate) const HEAP_FAST_ALLOC: usize = offset_of!(super::Heap, fast_alloc);
+    pub(crate) const HEAP_ALLOCATED_BYTES: usize = offset_of!(super::Heap, allocated_bytes);
+    pub(crate) const HEAP_DUE_CHECK_BYTES: usize = offset_of!(super::Heap, due_check_bytes);
+    pub(crate) const HEAP_CURSOR_BASE: usize = offset_of!(super::Heap, cursor_base);
+    pub(crate) const CURSOR_SIZE: usize = size_of::<super::Cursor>();
+    pub(crate) const CURSOR_FREE: usize = offset_of!(super::Cursor, free);
+    pub(crate) const CURSOR_BITS: usize = offset_of!(super::Cursor, bits);
+    pub(crate) const CURSOR_PAGE_BASE: usize = offset_of!(super::Cursor, base);
+    pub(crate) const CURSOR_WORD: usize = offset_of!(super::Cursor, word);
+    pub(crate) const CURSOR_TAKEN: usize = offset_of!(super::Cursor, taken);
+    pub(crate) const CURSOR_HIGH: usize = offset_of!(super::Cursor, high);
+    const _: () = {
+        assert!(size_of::<bool>() == 1);
+        assert!(size_of::<u32>() == 4);
+    };
+}
+
 impl Cursor {
     /// Hand out the lowest free cell of the loaded word, which has one (`free` is not zero).
     /// Cells leave a page's cursor in increasing order, so the last is the highest.
@@ -1520,6 +1561,9 @@ pub(crate) struct Heap {
     classes: Vec<[ClassPages; SIZE_CLASSES.len()]>,
     /// The allocation cursors, by descriptor × size classes + class ([`Cursor`]).
     cursors: Vec<Cursor>,
+    /// `cursors`' buffer, which generated code's inline allocation reads ([`InlineAllocSite`]):
+    /// kept as the vector grows with each descriptor.
+    cursor_base: *mut Cursor,
     /// Slots are reused after release, so page indices stay stable.
     pages: Vec<Option<PageMeta>>,
     /// By page slot, what marking reads first ([`MarkPage`]).
@@ -1653,6 +1697,7 @@ impl Heap {
             leaf: Vec::new(),
             classes: Vec::new(),
             cursors: Vec::new(),
+            cursor_base: std::ptr::null_mut(),
             pages: Vec::new(),
             mark_pages: Vec::new(),
             free_page_slots: Vec::new(),
@@ -1711,7 +1756,22 @@ impl Heap {
             .push(std::array::from_fn(|_| ClassPages::default()));
         self.cursors
             .extend(std::iter::repeat_n(Cursor::EMPTY, SIZE_CLASSES.len()));
+        self.cursor_base = self.cursors.as_mut_ptr();
         id
+    }
+
+    /// Where generated code takes a cell of `class` for `desc` in line (W2e): `None` for a
+    /// descriptor whose live cells the embedder counts, which inline allocation does not do.
+    pub(crate) fn inline_alloc_site(&self, desc: DescId, class: u8) -> Option<InlineAllocSite> {
+        if self.live_count.is_some_and(|(counted, _)| counted == desc) {
+            return None;
+        }
+        let class = usize::from(class);
+        Some(InlineAllocSite {
+            heap: std::ptr::from_ref(self) as usize,
+            cursor: desc.0 as usize * SIZE_CLASSES.len() + class,
+            cell_size: SIZE_CLASSES[class],
+        })
     }
 
     /// Time each collection's phases into [`GcStats::last_phase_nanos`] (diagnostics: a clock

@@ -189,7 +189,13 @@ fn fixed_slot_stores_mark_an_old_activations_card() {
         });
         Ok(Value::Undefined)
     });
-    let setups = crate::bytecode::TEST_FRAME_SETUPS.with(Cell::get);
+    // A fresh frame makes its activation with the frame setup helper or, its slow path's
+    // alternative, in line (W3 item 3's step 7).
+    let entries = || {
+        crate::bytecode::TEST_FRAME_SETUPS.with(Cell::get)
+            + crate::jit::TEST_INLINE_ACTIVATIONS.with(Cell::get)
+    };
+    let setups = entries();
     let Completion::Value(result) = engine
         .eval(
             r#"
@@ -215,10 +221,7 @@ fn fixed_slot_stores_mark_an_old_activations_card() {
         KEPT.with(Cell::get),
         "the young referent survived the minor collection"
     );
-    assert!(
-        crate::bytecode::TEST_FRAME_SETUPS.with(Cell::get) > setups,
-        "keep ran in a fresh native frame"
-    );
+    assert!(entries() > setups, "keep ran in a fresh native frame");
     // The store went to an old record, through a fixed slot of native code.
     let env = engine.interp.global_env;
     let Ok(keep) = engine.interp.get_var("keep", &env) else {
@@ -261,5 +264,60 @@ fn fixed_slot_stores_mark_an_old_activations_card() {
             .borrow()
             .cell_age(crate::interpreter::Env::as_ptr(&user.env) as u64),
         Some(CellAge::Old)
+    );
+}
+
+/// W3 item 3's step 7 (W2e's first use): a fresh frame's prologue makes an activation that is
+/// only its record in line, from the heap's cursor, and polls after; the allocations make
+/// collections due, which those polls run, and the records their closures keep survive them.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn prologues_make_activations_in_line_across_collections() {
+    use std::cell::Cell;
+    // Under a stress interval the heap counts each allocation, which the in-line path leaves to
+    // its slow path, and a collection at each of these 250,000 calls is all the test would do.
+    if crate::gc_test::stress_active() {
+        return;
+    }
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let inline = crate::jit::TEST_INLINE_ACTIVATIONS.with(Cell::get);
+    let collections = engine.interp.gc_heap.core.borrow().stats().collections;
+    let Completion::Value(result) = engine
+        .eval(
+            r#"
+            function make(a, b) { let t = a + b; var u = a * 2; return () => t + u + a + b; }
+            var keep = [], sum = 0;
+            for (var k = 0; k < 200000; k++) {
+                var f = make(k, 1);
+                if (k % 1000 === 0) keep.push(f);
+                sum = (sum + f()) | 0;
+            }
+            var check = 0;
+            for (var j = 0; j < keep.length; j++) check = (check + keep[j]()) | 0;
+            function wide(a, b, c, d, e, f2, g, h) {
+                var r = () => a + b + c + d + e + f2 + g + h;
+                return r;
+            }
+            var s2 = 0;
+            for (var k = 0; k < 50000; k++) s2 = (s2 + wide(k, 1, 2, 3, 4, 5, 6, 7)()) | 0;
+            sum + ':' + check + ':' + s2;
+            "#,
+            false,
+        )
+        .expect("fixture parses")
+    else {
+        panic!("fixture throws")
+    };
+    assert_eq!(result, "-1604378624:79600400:1251375000");
+    let made = crate::jit::TEST_INLINE_ACTIVATIONS.with(Cell::get) - inline;
+    assert!(made > 200_000, "{made} activations made in line");
+    assert!(
+        engine.interp.gc_heap.core.borrow().stats().collections > collections,
+        "the allocations made collections due"
     );
 }

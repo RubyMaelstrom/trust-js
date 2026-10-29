@@ -542,9 +542,10 @@ fn capture(
 
 /// A fixed activation's captured parameters and `this` (`Chunk::jit_prologue_copies`), which its
 /// frame setup helper left at their template words: generated stores copy them from the frame's
-/// parameter slots (r15) and record, then mark the record's card once (the helper's closing poll
-/// may have aged it). W3 item 3's step 5 (Decision 20c), as ARM64's prologue.
-pub(super) fn emit_activation_copies(a: &mut Asm, chunk: &Chunk) {
+/// parameter slots (r15) and record, then, after the helper (`mark`), mark the record's card
+/// once (the helper's closing poll may have aged it). W3 item 3's step 5 (Decision 20c), as
+/// ARM64's prologue.
+pub(super) fn emit_activation_copies(a: &mut Asm, chunk: &Chunk, mark: bool) {
     let Some((parameters, this_slot)) = chunk.jit_prologue_copies() else {
         return;
     };
@@ -558,7 +559,19 @@ pub(super) fn emit_activation_copies(a: &mut Asm, chunk: &Chunk) {
         a.nr_load(AX, CTX, offset_of!(super::super::JitCtx, this_word));
         a.nr_store(R9, offset(slot), AX);
     }
-    card_mark(a);
+    // An in-line record is young until the poll that follows (W3 item 3's step 7).
+    if mark {
+        card_mark(a);
+    }
+}
+
+/// Count an in-line activation in a test build (rax scratch, before the poll).
+#[cfg(test)]
+pub(super) fn record_inline_activation(a: &mut Asm) {
+    record(
+        a,
+        super::super::TEST_INLINE_ACTIVATIONS.with(|count| count.as_ptr() as usize),
+    );
 }
 
 /// LoadCap, StoreCap, StoreCapInit and UpdateCap at fixed slots of the running activation

@@ -14,6 +14,15 @@ use crate::interpreter::{
 use crate::value::Value;
 use std::rc::Rc;
 
+/// A plan activation that a fresh frame's prologue makes in line ([`ActivationPlan::inline_activation`]).
+pub(crate) struct InlineActivation {
+    pub(crate) site: crate::gc_core::InlineAllocSite,
+    pub(crate) header: [u64; crate::interpreter::RECORD_HEADER / 8],
+    /// The header word that holds the outer record: the closure's environment.
+    pub(crate) parent_word: usize,
+    pub(crate) slots: Box<[u64]>,
+}
+
 pub(super) fn activation_plans_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("TRUST_JS_ACTIVATION_PLANS").as_deref() != Ok("0"))
@@ -229,6 +238,29 @@ impl ActivationPlan {
             return None;
         }
         self.desc.binding_of_text(name)
+    }
+
+    /// What a fresh frame's prologue writes to make the plan's activation in line (W3 item 3's
+    /// step 7, W2e's first use): the cell's allocation site, the header's words with its outer
+    /// record's index, and the template's words. `None` when making it needs more than the
+    /// record (a hoisted function's closure, an `arguments` object or a rest Array in it), or
+    /// when the heap cannot allocate it in line.
+    pub(super) fn inline_activation(&self) -> Option<InlineActivation> {
+        if !self.functions.is_empty() || self.arguments_slot.is_some() || self.rest.is_some() {
+            return None;
+        }
+        let site = crate::value::scope_inline_alloc_site(self.class)?;
+        let (header, parent_word) = crate::interpreter::activation_header_words(
+            self.kept_desc,
+            self.class,
+            self.bindings.len(),
+        );
+        Some(InlineActivation {
+            site,
+            header,
+            parent_word,
+            slots: self.bindings.iter().map(|slot| slot.word()).collect(),
+        })
     }
 
     /// The captured parameters the plan copies (binding slot, parameter index), in order, but

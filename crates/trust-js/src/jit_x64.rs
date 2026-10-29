@@ -12,6 +12,8 @@ use super::{
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
 
+#[path = "jit_x64_alloc.rs"]
+mod alloc;
 #[path = "jit_x64_names.rs"]
 mod names;
 #[path = "jit_x64_storage.rs"]
@@ -944,10 +946,25 @@ pub(super) fn compile_entry(
         a.interrupt_poll(super::POLL_ENTRY, unwind);
     }
     if !borrowed_entry && chunk.jit_frame_setup_needed() {
+        let done = a.label();
+        if let Some(activation) = chunk.jit_inline_activation() {
+            // W3 item 3's step 7 (W2e's first use), as ARM64's prologue: an activation that is
+            // only its record is made in line, its captured parameters and `this` copied
+            // before the next safepoint, then the poll; the helper below is its slow path.
+            let slow = a.label();
+            alloc::emit_inline_activation(&mut a, &activation, slow);
+            names::emit_activation_copies(&mut a, chunk, false);
+            #[cfg(test)]
+            names::record_inline_activation(&mut a);
+            a.helper_end_poll(unwind);
+            a.jmp(done);
+            a.bind(slow);
+        }
         // FunctionDeclarationInstantiation's environment, rest Array and arguments object, made
         // by the callee (`bytecode::jit_frame_setup`); the call ends in the explicit poll.
         a.helper_spflag(H_FRAME_SETUP, 0, unwind);
-        names::emit_activation_copies(&mut a, chunk);
+        names::emit_activation_copies(&mut a, chunk, true);
+        a.bind(done);
     }
 
     if borrowed_entry {

@@ -3719,6 +3719,16 @@ fn census_dead_scope(cell: *mut u8) {
     }
 }
 
+/// Where generated code takes an environment record's cell of `class` in line in the active
+/// heap (W2e; W3 item 3's step 7), unless `TRUST_JS_JIT_INLINE_ALLOC=0` turns it off.
+pub(crate) fn scope_inline_alloc_site(class: u8) -> Option<crate::gc_core::InlineAllocSite> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("TRUST_JS_JIT_INLINE_ALLOC").as_deref() != Ok("0")) {
+        return None;
+    }
+    with_agent_heap(|heap| heap.core.borrow().inline_alloc_site(heap.scope_desc, class))
+}
+
 /// A fresh cell for one environment record in the active heap, of the small size class `class`
 /// (the record's header and its in-place slots, see [`crate::interpreter::VarMap`]), not zeroed:
 /// its maker writes the header and the counted slots before the next safepoint (`Env::new`,

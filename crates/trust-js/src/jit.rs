@@ -57,6 +57,13 @@ mod names;
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[path = "jit_alloc.rs"]
+mod alloc;
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 #[path = "jit_typed_array.rs"]
 mod typed_array;
 
@@ -4819,35 +4826,27 @@ fn compile_entry(
         emit_interrupt_poll(&mut a, POLL_ENTRY, l_unwind);
     }
     if !borrowed_entry && chunk.jit_frame_setup_needed() {
+        let done = a.new_label();
+        if let Some(activation) = chunk.jit_inline_activation() {
+            // W3 item 3's step 7 (W2e's first use): an activation that is only its record is
+            // made in line, its captured parameters and `this` copied before the next
+            // safepoint (no barrier: the record is young), then the poll; the frame setup
+            // helper below is its slow path.
+            let slow = a.new_label();
+            alloc::emit_inline_activation(&mut a, &activation, slow);
+            emit_prologue_copies(&mut a, chunk, false);
+            #[cfg(test)]
+            names::record_inline_activation(&mut a);
+            emit_helper_end_poll(&mut a, l_unwind);
+            a.b(done);
+            a.bind(slow);
+        }
         // FunctionDeclarationInstantiation's environment, rest Array and arguments object, made
         // by the callee itself as V8's first bytecode, CreateFunctionContext, makes its context
         // (Decision 20a): `bytecode::jit_frame_setup`, whose call ends in the explicit poll.
         emit_op_helper(&mut a, H_FRAME_SETUP, 0, l_unwind);
-        if let Some((parameters, this_slot)) = chunk.jit_prologue_copies() {
-            // A fixed activation's captured parameters and `this`, which the helper left at
-            // their template words: generated stores copy them from the frame's parameter slots
-            // and record, as V8's, SpiderMonkey's and JSC's bytecode copies them after creation
-            // (Decision 20c). The helper's closing poll may have aged the record: one card mark.
-            const _: () = assert!(std::mem::offset_of!(JitCtx, this_word) == 48);
-            a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
-            for (slot, parameter) in parameters {
-                a.ldr_imm(10, 22, u32::from(parameter) * 8);
-                a.str_imm(
-                    10,
-                    9,
-                    (crate::interpreter::RECORD_HEADER + 8 * slot as usize) as u32,
-                );
-            }
-            if let Some(slot) = this_slot {
-                a.ldr_imm(10, 19, 48); // ctx.this_word
-                a.str_imm(
-                    10,
-                    9,
-                    (crate::interpreter::RECORD_HEADER + 8 * slot as usize) as u32,
-                );
-            }
-            emit_card_mark(&mut a, 9, 15, 16);
-        }
+        emit_prologue_copies(&mut a, chunk, true);
+        a.bind(done);
     }
     if borrowed_entry {
         // The Rust entry validates the bytecode PC and its settled stack before dispatch.
@@ -12075,6 +12074,43 @@ fn load_name_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.scope_binding_offset == 0
         && layout.scope_with_valid
         && layout.scope_with < 4096
+}
+
+/// A fixed activation's captured parameters and `this` (`Chunk::jit_prologue_copies`), which
+/// its maker left at their template words: generated stores copy them from the frame's
+/// parameter slots and record into the record `env_raw` names, as V8's, SpiderMonkey's and JSC's
+/// bytecode copies them after creation (Decision 20c). `card_mark`: the frame setup helper's
+/// closing poll may have aged the record, so one card mark; an in-line record is young until the
+/// poll that follows the copies.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_prologue_copies(a: &mut asm::Asm, chunk: &Chunk, card_mark: bool) {
+    let Some((parameters, this_slot)) = chunk.jit_prologue_copies() else {
+        return;
+    };
+    const _: () = assert!(std::mem::offset_of!(JitCtx, this_word) == 48);
+    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    for (slot, parameter) in parameters {
+        a.ldr_imm(10, 22, u32::from(parameter) * 8);
+        a.str_imm(
+            10,
+            9,
+            (crate::interpreter::RECORD_HEADER + 8 * slot as usize) as u32,
+        );
+    }
+    if let Some(slot) = this_slot {
+        a.ldr_imm(10, 19, 48); // ctx.this_word
+        a.str_imm(
+            10,
+            9,
+            (crate::interpreter::RECORD_HEADER + 8 * slot as usize) as u32,
+        );
+    }
+    if card_mark {
+        emit_card_mark(a, 9, 15, 16);
+    }
 }
 
 /// TDZ: branch to `slow` when the binding slot at `slot` holds the empty word, its value in `word`
@@ -19954,6 +19990,10 @@ pub(crate) unsafe fn run_borrowed_frame(
 thread_local! {
     pub(crate) static TEST_NATIVE_SLICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static TEST_OSR_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Activations a fresh frame's prologue made in line, either backend (W3 item 3's step 7).
+    pub(crate) static TEST_INLINE_ACTIVATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 /// Execute a JIT-compiled chunk: mirrors `bytecode::run` (activation env, pooled slot buffer),
