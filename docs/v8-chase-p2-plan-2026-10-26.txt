@@ -592,6 +592,11 @@ does (Order, step 0).
     steps 4-6 (benchmarks/README.md's policy). Records made name by name cost arguments-mapped-call
     +2.1% and derived-construct +0.17% on ARM64 (x86-64 +2.0% and +0.96%); steps 4-5 bring them
     to +1.2% and -0.7%, and step 6 takes the mapped body off the prepared entry.
+25. The RegExp compiler's empty-iteration check (ECMA-262 RepeatMatcher, spec.html:38303 at
+    e28783d) is emitted only where a loop's body can match empty, as V8
+    (regexp-compiler-tonode.cc:2265-2375, `body_can_be_empty`), SpiderMonkey (its imported
+    irregexp, the same code) and JSC (YarrJIT.cpp:4590, 4649) emit it (2026-10-29): both tiers stop
+    paying for a check that cannot fire. Folded into W5b's 3d.
 
 ## Non-goals
 
