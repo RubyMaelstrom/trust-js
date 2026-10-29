@@ -1844,6 +1844,52 @@ Open: 3d (Unicode mode and lookbehind, strings.js); `MAX_SLOTS`, now a policy ch
 code-size cap; and, in the matcher, loops whose body cannot match empty still test for an empty
 iteration (coffeescript's identifier loop), which both tiers would gain from dropping.
 
+Then 3d and Decision 25 (381c9d4e..b2ec0a93, 2026-10-29, the same agent's):
+- 381c9d4e: Unicode-mode programs and lookbehinds. A surrogate pair is one element, stepped as the
+  matcher's `Paired` input steps it; the code decodes an element only where a test could match a
+  surrogate or a character past the BMP, and tests code units elsewhere. V8 instead splits classes
+  into BMP ranges, surrogate pairs and guarded lone surrogates (regexp-compiler-tonode.cc:410-499,
+  609-623) because its quick checks and Boyer-Moore tables work on code units; our tier compiles
+  the matcher's code-point program and is verified against it, so it keeps the plan's element
+  stepping. As V8 does, a backreference must not end inside a pair (`CheckNotInSurrogatePair`,
+  regexp-compiler.cc:6064-6067), and a lookbehind's body is compiled reversed and read backward,
+  its captures' start and end swapped (regexp-compiler-tonode.cc:1499). Under `i` with `u`, `\b`
+  also takes the long s and the Kelvin sign, and backreferences fold through the helper. `v`-mode
+  class strings stay on the matcher.
+- 1ea59724 (tests only): deadlines, cancellation and the backtracking-state limit inside
+  Unicode-mode loops and lookbehinds, forward and backward, on both backends.
+- b2ec0a93 (Decision 25): a loop's empty-iteration check and its mark slot are emitted only where
+  the body can match empty (assertions, lookarounds, backreferences and a `v`-mode string set
+  holding the empty string count as possibly empty), with 39 cases against Node v24.22.0.
+
+Against main c404b831's code (fat LTO, least of 3): strings.js's RegExp cases -18.9% (x86-64
+-13.6%), Octane RegExp -0.23% (Decision 25 -0.11% of it), source-map -0.14% and Djot's 40 passes
+-0.03%; coffeescript +0.26% is run spread (its 78 native programs and census are identical between
+main and 3d; on x86-64 the series is -0.18%). The fixtures within 0.11%. Coverage: strings.js 0%
+to 100% (all 324,204 executions native). Decision 25 removes every matcher mark dispatch in Octane
+and source-map and half of coffeescript's, and shrinks their native code 1.8-3.0%; coffeescript's
+identifier pattern 3,461 to 3,337 instructions a call. Per call against Sparkplug-only Node:
+strings.js's sticky lexer 2.22x to 1.57x on ASCII and 2.37-2.59x to 1.68-1.85x on Latin-1, CJK
+and astral subjects, its `^.../u` chunk matcher 3.46x to 2.76x, its `keys` split 1.75x to 1.26x;
+two lookbehind cases 3.80x to 2.53x and 4.65x to 2.45x.
+
+Validation: the ARM64 gate on 057ba54c (b2ec0a93 changes only a test's warm-up, which took 528 s
+under GC stress and now takes 39 s; it passes normally, under GC stress and forced on under verify
+on both architectures): the lib suite, pacing with its known failure only; the downstream crates;
+GC stress on the regex and replace/split tests; the fixtures, difftest and dumps as the base's;
+Test262 identical; rustdoc's 13 errors as the base's. The differential gate: Test262's RegExp
+suites forced on with verify and off, identical to each other and to 3c's; six fuzz streams of at
+least 1M cases on each architecture without a difference, each with about 20.0K of 21.9K programs
+native, 4.6-4.8K in Unicode mode, 5.7-5.9K with a lookbehind, and loops with and without the empty
+check; the census workloads identical off, at the default and forced on under verify. Zombie's
+lib suite (its known failure) and clippy.
+
+W5b's exit at b2ec0a93 (Decision 13): the census's "backtracking interpreter" and "class tests"
+as a share of W5a's: Octane 14.8% (limit 30%), source-map 10.8% (30%), coffeescript 4.0% (40%),
+strings.js 0.2% (50%); coffeescript's `clean` 0.42x Sparkplug-only Node (within 1.5x); Test262
+identical and the differential gate clean throughout. Left: Octane RegExp's score, at least 1.15x
+W5a's, a timing for the stage end on a quiet machine. Open: `MAX_SLOTS` and the code-size cap.
+
 ### W3: calls (census and design, 2026-10-27; exit agreed, Decision 10)
 
 Census: the W2a tip (a1535a6f, branch p2-w2a; since then main's code, c4d68127 adding only W2a's
