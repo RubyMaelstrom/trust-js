@@ -3142,6 +3142,51 @@ lean entries for mapped, duplicate, captured, interleaved, define and escaped bo
 suite (2,666, with step 7 over it); GC stress on the mapped-arguments, arguments-set and entry
 tests; zombie's lib suite (2,477) and clippy.
 
+Then step 7, W2e's first use (59196aea, 2026-10-29, the same agent's): a fresh frame makes its
+activation in line. Where: the prologue of a chunk whose activation is only its record (fixed
+slots, no hoisted function, no `arguments` object or rest Array to make,
+`Chunk::jit_inline_activation`); every other chunk keeps the frame setup helper, which is also
+this path's slow path. The allocation is W2e's machinery for any small cell of one descriptor and
+size class: `gc_core::InlineAllocSite` fixes the heap's address, the cursor's index and the cell
+size at compile time (chunks belong to one heap), and `emit_inline_alloc` (ARM64 and x86-64)
+follows `Heap::alloc_small_uninit` and `Cursor::take`. Three guards branch to the slow path with
+nothing changed: the heap allocates fast (not collecting, no stress interval, no collect-on-alloc),
+the cursor's free word is not zero, and the bytes fit before `due_check_bytes`. Then about 30
+instructions: charge the bytes, take and clear the lowest free bit, set the page's allocation bit,
+bump the cursor's counters, and form the cell's address (the heap now keeps `cursor_base`, the
+cursor vector's buffer, for generated code). The 48-byte header comes from compile-time words, the
+outer record from the closure's environment, and the plan's template words are stored in runs from
+one register; then the activation is installed, step 5's copies of captured parameters and `this`
+run without card marks (the record is young and no safepoint has passed), and the explicit poll
+follows: allocate, then poll. `TRUST_JS_JIT_INLINE_ALLOC=0` turns it off.
+
+Grounding: SpiderMonkey's Baseline does this, making the CallObject in line from a per-script
+template (js/src/jit/BaselineCodeGen.cpp:1506-1606, createGCObject at 1567-1571) and redoing the
+whole job in the VM on failure (1589-1602), with the stack check after it as the poll (7059-7080);
+its `freeListAllocate` (MacroAssembler.cpp:362-406) is the closest match to our cursor, and
+`initGCSlots` (1035-1105) fills runs from one register. V8's Sparkplug calls FastNewFunctionContext
+(baseline-compiler.cc:2587-2614), which allocates in new space in line and stores the header
+without barriers (builtins-constructor-gen.cc:381-469). We keep SpiderMonkey's fallback shape (the
+slow path does the whole job and rejoins), since the helper existed. One difference: neither
+exemplar charges bytes per object (SpiderMonkey per arena, Allocator.cpp:483-504; V8 at each
+refill of its allocation area, main-allocator.cc:279-294); ours stays exact per cell, so the
+allocation that spends the budget makes the collection due. Charging at a cursor's refill would
+change every allocation's accounting, so it belongs to W2e's general form.
+
+Per iteration against 6c1d62c4 (ARM64, fat LTO, pinned, randomization off): env-call 555.9 to
+367.0 (-189), env-let -190, env3 -189, env6 -204, env-this -193, env-closure -190,
+arguments-mapped-call 598 to 407; the other cases unchanged. Per call, loop excluded, against the
+design's figures after step 7: env-call 353 (~320), env-let 356 (~320), env3 405 (~340), env6 441
+(~370), env-this 446 (~380); Sparkplug-only Node 236, 239, 297, 360 and 327. Fixtures, step 7
+alone: Vue -0.08%, React -0.17%, Djot -0.01%, chai -0.58% (steps 6 and 7: -0.34%, -0.38%, -0.10%,
+-2.59%); collections unchanged. x86-64 against 19fe9dc5: env-call -194 (1,070 a call, under the
+~1,100 predicted after steps 2-5), the environment cases -192 to -198, arguments-mapped-call
+-197, derived-construct +8 (+0.08%); fixtures within 0.06%. Tests: 250,000 activations made in
+line across collections they make due, with closures keeping records alive, against Node; GC
+stress on the fixed-activation and activation tests (under stress the heap counts each allocation,
+so the fast path steps aside); `TRUST_JS_GC_VERIFY`; the lib suite 2,666 on ARM64 and 2,478 on
+x86-64, where the new test ran the in-line path; clippy on both. With step 7, W3 item 3 is done.
+
 ### Immediates out of an instruction's range (design and record, 2026-10-29; Decision 23)
 
 The ARM64 encoders check their immediates with `debug_assert!` only, so a template that misses
