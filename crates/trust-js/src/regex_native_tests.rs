@@ -111,8 +111,8 @@ fn compare_from(
     let (native, matcher) = pair(pattern, flags, subject.width())?;
     let control = crate::RuntimeInterrupt::default();
     // Catastrophic backtracking is in the fuzzer's grammar: each execution has a deadline. One
-    // the matcher misses leaves nothing to compare; one the native code misses where the matcher
-    // keeps its own is a difference.
+    // the matcher misses leaves nothing to compare, so the native code runs only after it; one
+    // the native code misses where the matcher kept its own is a difference.
     let deadline = |millis| {
         control.set_deadline(Some(
             std::time::Instant::now() + std::time::Duration::from_millis(millis),
@@ -125,13 +125,13 @@ fn compare_from(
             ))
     };
     for start in starts {
-        deadline(4000);
-        let found = run(&native, subject, start, &control);
-        deadline(1000);
+        deadline(250);
         let reference = run(&matcher, subject, start, &control);
         if late(&reference) {
             break;
         }
+        deadline(4000);
+        let found = run(&native, subject, start, &control);
         if found != reference {
             return Some((start, found, reference));
         }
@@ -391,11 +391,13 @@ fn gen_subject(rng: &mut Rng, two: bool) -> Subject {
 
 /// Fuzz `cases` executions (subject and start) from `seed`: random patterns over the tier's
 /// grammar and its near misses, with random flags, against one-byte and two-byte subjects at
-/// every start. Returns the cases run and the patterns the tier compiled.
-fn fuzz(seed: u64, cases: usize) -> (usize, usize) {
+/// every start. Returns the cases run, the patterns compiled for a width, and those the tier
+/// compiled.
+fn fuzz(seed: u64, cases: usize) -> (usize, usize, usize) {
     let mut rng = Rng::seeded(seed);
     let trace = std::env::var_os("TRUST_JS_REGEXP_FUZZ_TRACE").is_some();
     let mut run_cases = 0;
+    let mut patterns = 0;
     let mut native_patterns = 0;
     while run_cases < cases {
         let pattern = gen_alternation(&mut rng, 0);
@@ -406,6 +408,7 @@ fn fuzz(seed: u64, cases: usize) -> (usize, usize) {
         for two in [false, true] {
             let width = if two { Width::Two } else { Width::One };
             if let Some((native, _)) = pair(&pattern, &flags, width) {
+                patterns += 1;
                 native_patterns += usize::from(compiled(&native, width));
             }
             for _ in 0..4 {
@@ -418,7 +421,7 @@ fn fuzz(seed: u64, cases: usize) -> (usize, usize) {
             }
         }
     }
-    (run_cases, native_patterns)
+    (run_cases, patterns, native_patterns)
 }
 
 /// The fuzzer at the lib suite's size; `TRUST_JS_REGEXP_FUZZ_CASES=N` (with
@@ -433,8 +436,10 @@ fn fuzzed_programs_match_as_the_matcher_does() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0x9e37_79b9_7f4a_7c15);
-    let (run_cases, native) = fuzz(seed, cases);
-    eprintln!("[regexp-native-fuzz] seed {seed}: {run_cases} cases, {native} native programs");
+    let (run_cases, patterns, native) = fuzz(seed, cases);
+    eprintln!(
+        "[regexp-native-fuzz] seed {seed}: {run_cases} cases, {native} of {patterns} programs native"
+    );
     if BACKEND {
         assert!(native > 0);
     }
