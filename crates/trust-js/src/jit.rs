@@ -2392,6 +2392,9 @@ mod shared_stub_tests {
             }
             keys.push(SharedStub::CallSecondary.key());
             keys.push(SharedStub::PlainIsArray.key());
+            for argc in [3u8, 4] {
+                keys.push(SharedStub::MinMax { argc }.key());
+            }
             for argc in [0u8, 1, 8, 64] {
                 for with_this in [false, true] {
                     keys.push(SharedStub::DirectCall { argc, with_this }.key());
@@ -7790,11 +7793,13 @@ fn emit_call_inline_marked(
             // A user function (and an unrecognized native) has intrinsic id zero.
             // After the live IC proof, bypass every native-id comparison at once.
             // Keep the hit entry and way registers for the ordinary call below.
+            let min_max = with_this && (3..=4).contains(argc) && layout.valid;
             if with_this
                 && ((*argc == 1 && layout.valid)
                     || (*argc == 0 && array_intrinsics_on)
                     || ((1..=8).contains(argc) && function_call_intrinsic_on)
-                    || *argc == 2)
+                    || *argc == 2
+                    || min_max)
             {
                 a.ldrb_imm(9, 12, 96);
                 a.cbz(9, false, ordinary_hit);
@@ -7871,6 +7876,30 @@ fn emit_call_inline_marked(
                 a.mov(20, 0);
                 a.cbnz(1, false, l_unwind);
                 a.b(done);
+                a.bind(no_intr);
+            }
+            if min_max {
+                // Math.max and Math.min with three or four Number arguments (W3's item 2c), in
+                // the chunk's shared stub even in a loop: few of the sites that pass three or
+                // four arguments call either, and the stub's call and return cost little beside
+                // the native's call it replaces.
+                let no_intr = a.new_label();
+                a.ldrb_imm(9, 12, 96);
+                a.sub_imm(16, 9, crate::bytecode::INTRINSIC_MATH_MAX as u32);
+                const _: () = assert!(
+                    crate::bytecode::INTRINSIC_MATH_MIN == crate::bytecode::INTRINSIC_MATH_MAX + 1
+                );
+                a.cmp_imm_x(16, 1);
+                a.b_cond(C_HI, no_intr);
+                if shared_stubs_enabled() {
+                    let stub = a.shared_stub(SharedStub::MinMax { argc: *argc as u8 }.key());
+                    a.bl_label(stub);
+                    const _: () = assert!(INTRINSIC_DONE == 0);
+                    a.cbz(9, false, done);
+                    a.b(hit_slow);
+                } else {
+                    emit_math_intrinsic(a, layout, *argc as u32, no_intr, hit_slow, done);
+                }
                 a.bind(no_intr);
             }
             if with_this && *argc == 2 {
@@ -8057,10 +8086,13 @@ extern "C" fn record_chain_property_store() {
 /// imul, max, min) at a `CallWithThis(argc)` hit whose call IC proved the exact builtin
 /// (x9 = its `INTRINSIC_MATH_*` id, x10 = the callee's cell address). Stack, top last:
 /// `[this, callee, args...]`. Every guard precedes the single commit: all arguments must be
-/// Numbers (so ToNumber/ToInt32 run no author code). The exact builtin identity permits any
-/// receiver, which these Math operations ignore. The result Number replaces `this`.
-/// Clobbers x9, x11, x13, x14, x16, x17, d0, d1; preserves x10, x12 and x15 for the ordinary
-/// call on a decline.
+/// Numbers (so ToNumber/ToInt32 run no author code, and a non-Number argument's ToNumber, which
+/// can, runs in argument order in the native). The exact builtin identity permits any receiver,
+/// which these Math operations ignore. The result Number replaces `this`. Max and min take two
+/// to four arguments (three and four since W3's item 2c), FMAX and FMIN folding them in order:
+/// both return NaN for a NaN operand and order -0 below +0, as Math.max and Math.min do
+/// (spec.html:33847, :33869 at e28783d5). Clobbers x9, x11, x13, x14, x16, x17 and d0..d<argc>;
+/// preserves x10, x12 and x15 for the ordinary call on a decline.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -8082,29 +8114,28 @@ fn emit_math_intrinsic(
         a.b(no_intr);
         return;
     }
+    debug_assert!((1..=4).contains(&argc));
     // Operand slots: argc arguments, the callee below them, `this` below that.
     let arg0 = -(argc as i32) * 8;
     let this_off = arg0 - 16;
-    // Arguments: both Numbers, in d0/d1.
-    emit_exec_word_load(a, 13, 20, arg0);
-    emit_exec_number_guard(a, 13, 0, 16, hit_slow);
-    if argc == 2 {
-        emit_exec_word_load(a, 13, 20, arg0 + 8);
-        emit_exec_number_guard(a, 13, 1, 16, hit_slow);
+    // Arguments: all Numbers, in d0..d<argc>.
+    for k in 0..argc {
+        emit_exec_word_load(a, 13, 20, arg0 + 8 * k as i32);
+        emit_exec_number_guard(a, 13, k, 16, hit_slow);
     }
     // Compute (d0 <- result). Declines here still precede every state change.
     let commit = a.new_label();
-    let ops: &[u8] = if argc == 1 {
-        &[
+    let ops: &[u8] = match argc {
+        1 => &[
             INTRINSIC_MATH_FLOOR,
             INTRINSIC_MATH_CEIL,
             INTRINSIC_MATH_TRUNC,
             INTRINSIC_MATH_ABS,
             INTRINSIC_MATH_FROUND,
             INTRINSIC_MATH_CLZ32,
-        ]
-    } else {
-        &[INTRINSIC_MATH_IMUL, INTRINSIC_MATH_MAX, INTRINSIC_MATH_MIN]
+        ],
+        2 => &[INTRINSIC_MATH_IMUL, INTRINSIC_MATH_MAX, INTRINSIC_MATH_MIN],
+        _ => &[INTRINSIC_MATH_MAX, INTRINSIC_MATH_MIN],
     };
     let labels: Vec<usize> = ops.iter().map(|_| a.new_label()).collect();
     for (&id, &label) in ops.iter().zip(&labels) {
@@ -8142,8 +8173,16 @@ fn emit_math_intrinsic(
                 a.mul_w(16, 16, 17);
                 a.scvtf_d_w(0, 16);
             }
-            INTRINSIC_MATH_MAX => a.fminmax(true, 0, 0, 1),
-            _ => a.fminmax(false, 0, 0, 1),
+            INTRINSIC_MATH_MAX => {
+                for k in 1..argc {
+                    a.fminmax(true, 0, 0, k);
+                }
+            }
+            _ => {
+                for k in 1..argc {
+                    a.fminmax(false, 0, 0, k);
+                }
+            }
         }
         a.b(commit);
     }
@@ -12398,6 +12437,15 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     PlainIsArray,
+    /// [`emit_math_intrinsic`]'s Math.max and Math.min for a `CallWithThis(argc)` site, argc 3
+    /// or 4, entered at a call-cache hit on either (w9 = its id) → w9 = `INTRINSIC_DONE`, or
+    /// `INTRINSIC_DECLINED` with x10/x12/x15 kept for the site's H_CALL_HIT form. A leaf, as
+    /// [`SharedStub::PlainIsArray`].
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    MinMax { argc: u8 },
     /// [`typed_array::emit_access`]: x11 = a typed array Object, x9 = its exact unsigned index
     /// (and d1 the Number to store) → w13 = 1 once the element is read (x12 = packed Number,
     /// d1 = value) or written, 0 when the access is declined before anything is written.
@@ -12497,6 +12545,7 @@ impl SharedStub {
     const NAME_ELEMENT: u32 = 0xa00;
     const DIRECT_CONSTRUCT: u32 = 0xb00;
     const PLAIN_IS_ARRAY: u32 = 0xc00;
+    const MIN_MAX: u32 = 0xd00;
 
     fn key(self) -> u32 {
         match self {
@@ -12556,6 +12605,11 @@ impl SharedStub {
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
             SharedStub::PlainIsArray => Self::PLAIN_IS_ARRAY,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::MinMax { argc } => Self::MIN_MAX | u32::from(argc),
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
             SharedStub::NameElement { write } => Self::NAME_ELEMENT | u32::from(write),
         }
@@ -12639,6 +12693,13 @@ impl SharedStub {
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
             Self::PLAIN_IS_ARRAY => SharedStub::PlainIsArray,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::MIN_MAX => SharedStub::MinMax {
+                argc: (key & 0xff) as u8,
+            },
             Self::TYPED_ELEMENT => SharedStub::TypedElement {
                 write: key & 1 != 0,
             },
@@ -12695,6 +12756,7 @@ impl SharedStub {
             ),
             SharedStub::Intrinsics2 { discard } => named("Intrinsics2", &[("discard", discard)]),
             SharedStub::PlainIsArray => named("PlainIsArray", &[]),
+            SharedStub::MinMax { argc } => format!("Stub:MinMax(argc={argc})"),
             SharedStub::TypedElement { write } => named("TypedElement", &[("write", write)]),
             SharedStub::NameElement { write } => named("NameElement", &[("write", write)]),
         }
@@ -12827,15 +12889,21 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            SharedStub::PlainIsArray => {
-                // The site left x10/x12/x15 for a decline. Nothing here calls out, so the site's
-                // return address stays in x30, except for the test builds' lowering event, which
-                // calls its recorder.
+            SharedStub::PlainIsArray | SharedStub::MinMax { .. } => {
+                // The site left x10/x12/x15 for a decline (and for MinMax, dispatched on w9's
+                // id). Nothing here calls out, so the site's return address stays in x30, except
+                // for the test builds' lowering event, which calls its recorder.
                 #[cfg(test)]
                 a.stp_pre(29, 30, -16);
                 let declined = a.new_label();
                 let done = a.new_label();
-                emit_plain_is_array(a, layout, declined, done);
+                match self {
+                    SharedStub::PlainIsArray => emit_plain_is_array(a, layout, declined, done),
+                    SharedStub::MinMax { argc } => {
+                        emit_math_intrinsic(a, layout, u32::from(argc), declined, declined, done)
+                    }
+                    _ => unreachable!(),
+                }
                 for (landing, status) in [(done, INTRINSIC_DONE), (declined, INTRINSIC_DECLINED)] {
                     a.bind(landing);
                     #[cfg(test)]
