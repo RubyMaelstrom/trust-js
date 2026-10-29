@@ -91,7 +91,19 @@ const CAP_BITS: u32 = TWO_BYTE - 1;
 // Reserve one capacity value, rather than changing the native count/length layout. No flat
 // buffer reaches it: a two-byte buffer's capacity is at most MAX_LEN, below CAP_BITS, and a
 // one-byte buffer's carries ASCII_HINT. A view is never ASCII-hinted even when its units are.
-const VIEW_CAP: u32 = ASCII_HINT - 1;
+// The JIT's codePointAt template recognizes a view by it, and reads a flat buffer's width from
+// ASCII_HINT, so that a `cap` without the hint and other than this is a flat two-byte buffer.
+pub(crate) const VIEW_CAP: u32 = ASCII_HINT - 1;
+/// Byte offset of a view's flat owner (a string cell's address), for the JIT's codePointAt
+/// template.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const VIEW_OWNER_OFF: usize = std::mem::offset_of!(View, owner);
+/// Byte offset of a view's first unit's index in its owner (a `usize`), for the same template.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const VIEW_OFFSET_OFF: usize = std::mem::offset_of!(View, offset);
+// The template reads both as 64-bit words.
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(std::mem::size_of::<LStr>() == 8 && std::mem::size_of::<usize>() == 8);
 /// The longest content, in units, an engine string can hold; constructing a longer one panics.
 pub(crate) const MAX_LEN: usize = CAP_BITS as usize - 1;
 /// Slices shorter than this many bytes of content copy.

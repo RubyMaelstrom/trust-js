@@ -1,8 +1,10 @@
 //! W3 item 2c's call templates for proven natives (ECMA-262 at e28783d5, spec.html): Array.isArray
-//! (IsArray, :5878), Object.is (SameValue, :6008), and Math.max and Math.min with three and four
-//! arguments (:33847, :33869). Each program runs in every tier, its call sites both outside loops
-//! (the JIT's shared stubs) and inside them; the expected values are Node v24.22.0's, and a
-//! reference written in comparisons checks every combination of the listed operands.
+//! (IsArray, :5878), Object.is (SameValue, :6008), Math.max and Math.min with three and four
+//! arguments (:33847, :33869), String.prototype.slice with one argument (:36827) and
+//! String.prototype.codePointAt (:36270, CodePointAt :16721). Each program runs in every tier,
+//! its call sites both outside loops (the JIT's shared stubs) and inside them; the expected
+//! values are Node v24.22.0's, and references written in other operations check every
+//! combination of the listed operands.
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn eval(engine: &mut Engine, source: &str) -> String {
@@ -158,6 +160,88 @@ var fake = { min: Math.min }; rec(fake.min(3, 1, 2)); rec(fake.min(3, 1, 2, -0))
 log.join(',');
 "#;
 
+/// codePointAt and slice (one and two arguments) on one- and two-byte strings, surrogate pairs,
+/// lone surrogates, views of both widths, a view ending on a leading surrogate whose owner
+/// continues with its trailing one (the code point is the lone lead), and the empty string, at
+/// negative, fractional, infinite, NaN, out-of-range and u32-boundary indices; then operands
+/// the templates do not take, whose conversions run in order, and replaced builtins.
+const SLICE_AND_CODE_POINT: &str = r#"
+var log = [];
+function rec(x) { log[log.length] = (typeof x === 'number' && x !== x ? 'NaN' : String(x)); }
+function err(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+// References over charCodeAt and element reads, which the templates do not use.
+function toIndex(n) { n = Number(n); return n !== n ? 0 : n === Infinity || n === -Infinity ? n : Math.trunc(n); }
+function refPoint(s, at) {
+  var i = toIndex(at);
+  if (i < 0 || i >= s.length) return undefined;
+  var first = s.charCodeAt(i);
+  if (first < 0xD800 || first > 0xDBFF || i + 1 === s.length) return first;
+  var second = s.charCodeAt(i + 1);
+  return second < 0xDC00 || second > 0xDFFF ? first : (first - 0xD800) * 0x400 + (second - 0xDC00) + 0x10000;
+}
+function refSlice(s, start, end) {
+  var len = s.length, from = toIndex(start), to = end === undefined ? len : toIndex(end);
+  from = from < 0 ? Math.max(len + from, 0) : Math.min(from, len);
+  to = to < 0 ? Math.max(len + to, 0) : Math.min(to, len);
+  return from < to ? s.substring(from, to) : '';
+}
+var ascii = 'hello world', two = 'héllo wörld →', astral = 'a😀b😀c',
+  lone = '\ude00x\ud83dy\ude00z\ud83d', longTwo = 'é'.repeat(300) + '😀' + 'q'.repeat(10),
+  viewTwo = longTwo.slice(1, 305), viewAscii = ('x'.repeat(600) + 'yz').slice(100, 602),
+  // A view ending on a leading surrogate whose owner continues with its trailing one.
+  viewLead = ('a' + '😀'.repeat(200)).slice(0, 300), empty = '';
+var strings = [ascii, two, astral, lone, longTwo, viewTwo, viewAscii, viewLead, empty];
+var indices = [-1.5, -1, -0.5, -0, 0, 0.5, 1, 1.5, 2, 3, 4, 7, 8, 9, 10, 11, 13, 14, 15, 298, 299, 300, 301, 303, 304, 305,
+  310, 311, 312, 400, 501, 502, NaN, Infinity, -Infinity, 4294967295, 4294967296, -4294967296, 1e300];
+// One call site per form, outside any loop (the shared stubs); the callers loop.
+function point(s, at) { return s.codePointAt(at); }
+function slice1(s, at) { return s.slice(at); }
+function slice2(s, at, end) { return s.slice(at, end); }
+var bad = 0, calls = 0;
+for (var r = 0; r < 3; r++) for (var i = 0; i < strings.length; i++) for (var j = 0; j < indices.length; j++) {
+  var s = strings[i], at = indices[j], end = indices[(j * 5 + 3) % indices.length];
+  if (point(s, at) !== refPoint(s, at)) bad++;
+  if (slice1(s, at) !== refSlice(s, at)) bad++;
+  if (slice2(s, at, end) !== refSlice(s, at, end)) bad++;
+  calls += 3;
+}
+rec(bad + '/' + calls);
+// The same calls inside loops keep their sequences in line.
+function hotPoints(s) { var t = 0; for (var q = -1; q <= s.length; q++) { var p = s.codePointAt(q); t = (t * 31 + (p === undefined ? -7 : p)) | 0; } return t; }
+function pointsOf(s) { var t = []; for (var q = -1; q <= s.length; q++) t.push(s.codePointAt(q)); return t.join(' '); }
+function hotSlices(s) { var t = 0; for (var q = -s.length - 1; q <= s.length + 1; q++) t += s.slice(q).length * (q + 3); return t; }
+var hotBad = 0, expectedPoints = [], expectedSums = [];
+for (var i2 = 0; i2 < strings.length; i2++) {
+  var s2 = strings[i2], expected = 0, sum = 0;
+  for (var q = -1; q <= s2.length; q++) { var p = refPoint(s2, q); expected = (expected * 31 + (p === undefined ? -7 : p)) | 0; }
+  for (var q2 = -s2.length - 1; q2 <= s2.length + 1; q2++) sum += Math.max(s2.length - (q2 < 0 ? Math.max(s2.length + q2, 0) : Math.min(q2, s2.length)), 0) * (q2 + 3);
+  expectedPoints.push(expected); expectedSums.push(sum);
+}
+for (var r2 = 0; r2 < 4; r2++) for (var i3 = 0; i3 < strings.length; i3++) {
+  if (hotPoints(strings[i3]) !== expectedPoints[i3] || hotSlices(strings[i3]) !== expectedSums[i3]) hotBad++;
+}
+rec(hotBad);
+rec(pointsOf(lone)); rec(pointsOf(astral)); rec(point(viewLead, 299)); rec(point(viewLead, 298)); rec(point(viewTwo, 299));
+rec(point(viewTwo, 300)); rec(point(viewTwo, 303)); rec(point(viewAscii, 500)); rec(point(viewAscii, 501)); rec(point(viewAscii, 502));
+function codes(s) { var t = []; for (var k = 0; k < s.length; k++) t.push(s.charCodeAt(k).toString(16)); return t.join('.'); }
+rec(slice1(two, -3)); rec(codes(slice1(astral, 2))); rec(slice1(viewTwo, 298).length); rec(slice1(lone, -1).charCodeAt(0));
+rec(slice2(two, 1, -1)); rec(slice2(astral, -4, 3)); rec(slice2(viewAscii, 499, 1e9));
+// Operands the templates do not take: the full call, its conversions in order.
+var order = [];
+var at3 = { valueOf: function () { order.push('i'); return 3; } };
+rec(point(two, at3)); rec(slice1(two, at3)); rec(slice2(two, at3, { valueOf: function () { order.push('e'); return 5; } }));
+rec(point(two, '2')); rec(slice1(ascii, '6')); rec(point(ascii, null)); rec(slice1(ascii, undefined)); rec(slice1(ascii, true));
+rec(order.join(''));
+rec(point(new String('😀'), 0)); rec(slice1(new String('abc'), 1)); rec(err(function () { return point(null, 0); }));
+rec(String.prototype.codePointAt.call(12345, 1)); rec(String.prototype.slice.call(12345, 2));
+var savedPoint = String.prototype.codePointAt, savedSlice = String.prototype.slice;
+String.prototype.codePointAt = function () { return 'patched'; }; String.prototype.slice = function () { return 'sliced'; };
+rec(point(ascii, 0)); rec(slice1(ascii, 1)); rec(slice2(ascii, 1, 2)); rec(pointsOf('ab'));
+String.prototype.codePointAt = savedPoint; String.prototype.slice = savedSlice;
+rec(point(ascii, 0)); rec(slice1(ascii, 1)); rec(slice2(ascii, 1, 2)); rec(pointsOf('ab'));
+log.join(',');
+"#;
+
 #[test]
 fn is_array_and_object_is_templates_match_the_full_calls() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
@@ -188,8 +272,33 @@ fn min_max_templates_match_the_full_calls() {
     }
 }
 
-/// In compiled code the templates finish warm calls without the call-hit helper: Array.isArray as a method and through a plain call, and Object.is, count their commits, and
-/// Math.max and Math.min with three and four Numbers count as the other Math templates do,
+#[test]
+fn slice_and_code_point_templates_match_the_full_calls() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            eval(&mut engine, SLICE_AND_CODE_POINT),
+            "0/3159,0, 56832 120 55357 121 56832 122 55357 , 97 128512 56832 98 128512 56832 99 ,55357,56832,128512,56832,113,121,122,undefined,d →,de00.62.d83d.de00.63,6,55357,éllo wörld ,,xyz,108,lo wörld →,lo,108,world,104,hello world,ello world,iiie,128512,bc,TypeError,50,345,patched,sliced,sliced,patched patched patched patched,104,ello world,e, 97 98 ",
+            "{tier:?}"
+        );
+        // The program's views are views: the templates' view paths ran.
+        let env = engine.interp.global_env;
+        for name in ["viewTwo", "viewAscii", "viewLead"] {
+            let value = engine.interp.get_var(name, &env).ok().unwrap();
+            let crate::value::ValueView::Str(s) = value.view() else {
+                panic!("{name} is a String")
+            };
+            assert!(s.view_owner().is_some(), "{name} is a view");
+        }
+        engine.interp.gc_collect();
+    }
+}
+
+/// In compiled code the templates finish warm calls without the call-hit helper: Array.isArray as a method and through a plain call, Object.is and codePointAt count their
+/// commits, Math.max and Math.min with three and four Numbers count as the other Math templates
+/// do, and the one-argument slice reaches the intrinsic helper's light path,
 /// both at sites outside loops (the shared stubs) and inside one (in line).
 #[test]
 #[cfg(all(
@@ -208,17 +317,21 @@ fn call_templates_finish_compiled_calls() {
         function same(a, b) { return Object.is(a, b); }
         function min3(a, b, c) { return Math.min(a, b, c); }
         function max4(a, b, c, d) { return Math.max(a, b, c, d); }
+        function point(s, n) { return s.codePointAt(n); }
+        function slice1(s, n) { return s.slice(n); }
         function hot(n) {
             var t = 0;
             for (var q = 0; q < n; q++) {
                 t += (Array.isArray(t) ? 1 : 0) + (Object.is(q, 3) ? 1 : 0) + q + Math.max(q, 1, 2) +
-                    Math.min(q, 1, 2, 3);
+                    Math.min(q, 1, 2, 3) + 'h\u00e9llo'.codePointAt(q % 5) +
+                    'abcdef'.slice(q % 6).length;
             }
             return t;
         }
-        var arr = [1];
+        var arr = [1], two = 'h\u00e9llo \ud83d\ude00';
         for (var warm = 0; warm < 200; warm++) {
-            isA(arr); isAlias(arr); same(1, 2); min3(1, 2, 3); max4(1, 2, 3, 4);
+            isA(arr); isAlias(arr); same(1, 2); min3(1, 2, 3); max4(1, 2, 3, 4); point(two, 6);
+            slice1(two, 2);
         }
         hot(50);
     "#,
@@ -227,13 +340,14 @@ fn call_templates_finish_compiled_calls() {
         (
             crate::jit::TEST_CALL_TEMPLATES.with(std::cell::Cell::get),
             crate::jit::TEST_FAST_MATH_INTRINSICS.with(std::cell::Cell::get),
+            crate::bytecode::TEST_JIT_SLICE1_INTRINSICS.with(std::cell::Cell::get),
         )
     };
     // CALL_IC_EPOCH is process-wide: a concurrently running test that recompiles a chunk or
     // reclaims native code invalidates every cached call site, and the next calls here
     // legitimately refill through the generic path. Measure a run that ended at the epoch the
     // previous run started at (see code_point_intrinsic_tests).
-    let (mut served, mut epoch_before, mut epoch_after) = ((0, 0), 0, 1);
+    let (mut served, mut epoch_before, mut epoch_after) = ((0, 0, 0), 0, 1);
     let mut previous_start = None;
     for _attempt in 0..200 {
         let before = counts();
@@ -245,26 +359,28 @@ fn call_templates_finish_compiled_calls() {
             var ok = true;
             for (var n = 0; n < 40; n++) {
                 ok = ok && isA(arr) && isAlias(arr) && !same(1, 2) && min3(3, 1, 2) === 1 &&
-                    max4(1, 2, 3, 4) === 4;
+                    max4(1, 2, 3, 4) === 4 && point(two, 6) === 0x1F600 &&
+                    slice1(two, 2) === 'llo \ud83d\ude00';
             }
-            ok && hot(30) === 903
+            ok && hot(30) === 4992
         "#
             ),
             "true"
         );
         let after = counts();
-        served = (after.0 - before.0, after.1 - before.1);
+        served = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
         epoch_after = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         if previous_start == Some(epoch_after) {
             break;
         }
         previous_start = Some(epoch_before);
     }
-    // Per run: the in-line templates, three 40 times and two 30 times; the Math calls, two 40 and 30 times.
-    let (templates, math) = served;
+    // Per run: the in-line templates, four 40 times and three 30 times; the Math calls, two 40 and 30
+    // times; the one-argument slice, 40 and 30 times.
+    let (templates, math, slices) = served;
     assert!(
-        templates >= 180 && math >= 140,
-        "templates {templates}, math {math}, epoch {epoch_before}->{epoch_after}"
+        templates >= 250 && math >= 140 && slices >= 70,
+        "templates {templates}, math {math}, slices {slices}, epoch {epoch_before}->{epoch_after}"
     );
     assert!(engine.interp.fn_frames.is_empty());
 }

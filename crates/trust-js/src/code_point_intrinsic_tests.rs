@@ -99,7 +99,13 @@ fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
     let (mut hits, mut epoch_before, mut epoch_after) = (0, 0, 1);
     let mut previous_start = None;
     for _attempt in 0..200 {
-        let before = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get);
+        // The calls run in the template's in-line read (W3's item 2c) or, for an index it does
+        // not take, the intrinsic helper: either bypasses the native's argument decoding.
+        let served = || {
+            crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get)
+                + crate::jit::TEST_CALL_TEMPLATES.with(std::cell::Cell::get)
+        };
+        let before = served();
         epoch_before = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             eval(
@@ -112,7 +118,7 @@ fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
             ),
             "true"
         );
-        hits = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get) - before;
+        hits = served() - before;
         epoch_after = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         if previous_start == Some(epoch_after) {
             break;

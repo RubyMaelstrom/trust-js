@@ -8370,13 +8370,103 @@ fn emit_object_is_template(a: &mut asm::Asm, hit_slow: usize, done: usize) {
     a.b(done);
 }
 
+/// String#codePointAt(index) in line (ECMA-262 String.prototype.codePointAt and CodePointAt,
+/// spec.html:36270 and :16721 at e28783d5) once the template's guards hold: a String receiver
+/// three words below the top and a Number index in d0 (W3's item 2c). An exact unsigned index
+/// below the length reads the string's storage, a flat one- or two-byte buffer or a view of one
+/// at its owner's width (`crate::lstr`): a one-byte unit is its code point; a two-byte leading
+/// surrogate followed, within the string, by a trailing one combines with it
+/// (UTF16SurrogatePairToCodePoint), and any other unit, a lone surrogate included, is its own
+/// code point. An index at or past the length answers undefined. A fractional, negative or NaN
+/// index branches to `helper` with nothing written. Clobbers x9, x11, x13, x14, x16, x17 and
+/// d1; preserves x10, x12 and x15.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_code_point_template(a: &mut asm::Asm, helper: usize, done: usize) {
+    use crate::lstr::{CAP_OFF, DATA_OFF, LEN_OFF, VIEW_CAP, VIEW_OFFSET_OFF, VIEW_OWNER_OFF};
+    let undefined = a.new_label();
+    let view_one_byte = a.new_label();
+    let one_byte = a.new_label();
+    let two_byte = a.new_label();
+    let unit = a.new_label();
+    // x9 = the index when it is an exact u32 (FCVTZU saturates, so a larger value fails).
+    a.fcvtzu_w_d(9, 0);
+    a.ucvtf_d_w(1, 9);
+    a.fcmp(0, 1);
+    a.b_cond(C_NE, helper);
+    emit_exec_word_load(a, 11, 20, -24);
+    emit_exec_payload(a, 11, 11);
+    a.ldr_w_imm(13, 11, LEN_OFF as u32);
+    a.cmp_reg_x(9, 13);
+    a.b_cond(C_HS, undefined);
+    // x16 = the first unit of the buffer the string reads.
+    a.ldr_w_imm(14, 11, CAP_OFF as u32);
+    a.add_imm(16, 11, DATA_OFF as u32);
+    // The ASCII hint, cap's top bit, marks a flat one-byte buffer; any other `cap` but a
+    // view's, a flat two-byte buffer.
+    a.cmp_imm_w(14, 0);
+    a.b_cond(C_MI, one_byte);
+    a.mov_imm64(17, u64::from(VIEW_CAP));
+    a.cmp_reg_w(14, 17);
+    a.b_cond(C_NE, two_byte);
+    // A view: its flat owner's units from the view's offset, at the owner's width.
+    a.ldr_imm(17, 11, VIEW_OFFSET_OFF as u32);
+    a.ldr_imm(11, 11, VIEW_OWNER_OFF as u32);
+    a.ldr_w_imm(14, 11, CAP_OFF as u32);
+    a.add_imm(16, 11, DATA_OFF as u32);
+    a.cmp_imm_w(14, 0);
+    a.b_cond(C_MI, view_one_byte);
+    a.add_shifted(16, 16, 17, 1);
+    a.b(two_byte);
+    a.bind(view_one_byte);
+    a.add_shifted(16, 16, 17, 0);
+    a.bind(one_byte);
+    a.ldrb_reg(17, 16, 9);
+    a.b(unit);
+    a.bind(two_byte);
+    a.ldrh_lsl1(17, 16, 9);
+    a.lsr_imm_w(14, 17, 10);
+    a.cmp_imm_w(14, 0xD800 >> 10); // a leading surrogate
+    a.b_cond(C_NE, unit);
+    a.add_imm(9, 9, 1);
+    a.cmp_reg_x(9, 13);
+    a.b_cond(C_HS, unit); // the string's last unit
+    a.ldrh_lsl1(14, 16, 9);
+    a.lsr_imm_w(11, 14, 10);
+    a.cmp_imm_w(11, 0xDC00 >> 10); // followed by a trailing surrogate
+    a.b_cond(C_NE, unit);
+    // (lead - 0xD800) × 0x400 + (trail - 0xDC00) + 0x10000
+    a.ubfx(17, 17, 0, 10);
+    a.ubfx(14, 14, 0, 10);
+    a.add_shifted(17, 14, 17, 10);
+    a.add_imm(17, 17, 0x10000);
+    a.bind(unit);
+    // ---- commit: the Number over the receiver slot (a code point is never NaN) ----
+    a.ucvtf_d_w(0, 17);
+    a.stur_d(0, 20, -24);
+    a.sub_imm(20, 20, 16);
+    #[cfg(test)]
+    regions::emit_lowering_event(a, record_call_template as *const () as u64);
+    a.b(done);
+    a.bind(undefined);
+    a.mov_imm64(9, crate::value::PACK_UNDEFINED);
+    emit_exec_word_store(a, 9, 20, -24);
+    a.sub_imm(20, 20, 16);
+    #[cfg(test)]
+    regions::emit_lowering_event(a, record_call_template as *const () as u64);
+    a.b(done);
+}
+
 #[cfg(all(
     test,
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 thread_local! {
-    /// Calls item 2c's in-line templates (Array.isArray and Object.is) finished, for tests.
+    /// Calls item 2c's in-line templates (Array.isArray, Object.is, codePointAt) finished, for
+    /// tests.
     pub(crate) static TEST_CALL_TEMPLATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -8438,6 +8528,7 @@ fn emit_call_intrinsics1(
     let is_nan = a.new_label();
     let from_char_code = a.new_label();
     let is_array = a.new_label();
+    let slice = a.new_label();
     let regexp_exec = discard.then(|| a.new_label());
     let string_split = discard.then(|| a.new_label());
     let array_push = array_push.then(|| a.new_label());
@@ -8475,6 +8566,9 @@ fn emit_call_intrinsics1(
         a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32);
         a.b_cond(C_EQ, string_split);
     }
+    // Item 2c's templates come last, so that the others' dispatch keeps its length.
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SLICE as u32);
+    a.b_cond(C_EQ, slice);
     a.b(no_intr);
     a.bind(high);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_IS_ARRAY as u32);
@@ -8499,14 +8593,17 @@ fn emit_call_intrinsics1(
     a.cbnz(1, false, l_unwind);
     a.b(done);
 
-    // Exact builtin identity is proven by the live call IC. Numeric
-    // indices need no author conversion; all UTF-16 cases use the
-    // compact helper with the established native activation boundaries.
+    // String#codePointAt(number): exact builtin identity is proven by the live call IC, and a
+    // Number index needs no author conversion. An exact index reads the string's units in line
+    // (W3's item 2c); a fractional or negative index takes the helper.
     a.bind(code_point);
     emit_exec_word_load(a, 9, 20, -24);
     emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
     emit_exec_word_load(a, 9, 20, -8);
     emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+    let code_point_helper = a.new_label();
+    emit_code_point_template(a, code_point_helper, done);
+    a.bind(code_point_helper);
     a.mov(0, 19);
     emit_intrinsic_pc(a, pc);
     a.movk(1, crate::bytecode::INTRINSIC_CODE_POINT_AT as u32, 1);
@@ -8598,6 +8695,28 @@ fn emit_call_intrinsics1(
     // Array.isArray(arg) as a method: the result replaces the receiver (W3's item 2c).
     a.bind(is_array);
     emit_is_array_template(a, layout, -24, 16, hit_slow, done);
+
+    // String#slice(start): a String receiver and a Number start, the end the string's length.
+    // The helper converts the start (ToClampedIndex) and slices at either width without the
+    // native-call boundary, as it does the two-argument form (W3's item 2c).
+    a.bind(slice);
+    emit_exec_word_load(a, 9, 20, -24);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+    a.mov(0, 19);
+    emit_intrinsic_pc(a, pc);
+    a.movk(
+        1,
+        crate::bytecode::INTRINSIC_STRING_SLICE as u32 | 1 << 8,
+        1,
+    );
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, l_unwind);
+    a.b(done);
 
     // Math.sqrt(number): the call IC already proved builtin identity.
     // All receiver kinds are accepted by the exact builtin.
@@ -8733,23 +8852,22 @@ fn emit_call_intrinsics2(
     a.bind(object_is);
     emit_object_is_template(a, hit_slow, done);
 
-    // ASCII String#slice(start, end), both bounds already Numbers: no
-    // user code or exotic conversion can run in the dedicated helper.
+    // String#slice(start, end), both bounds already Numbers: no user code or exotic conversion
+    // can run in the dedicated helper, which slices at either width.
     a.bind(slice);
     emit_exec_word_load(a, 9, 20, -32);
     emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
-    emit_exec_word_load(a, 11, 20, -32);
-    emit_exec_payload(a, 11, 11);
-    a.ldr_w_imm(9, 11, crate::lstr::CAP_OFF as u32);
-    a.lsr_imm(9, 9, 31);
-    a.cbz(9, false, hit_slow);
     for off in [-16i32, -8] {
         emit_exec_word_load(a, 9, 20, off);
         emit_exec_number_guard(a, 9, 0, 16, hit_slow);
     }
     a.mov(0, 19);
     emit_intrinsic_pc(a, pc);
-    a.movk(1, crate::bytecode::INTRINSIC_STRING_SLICE as u32, 1);
+    a.movk(
+        1,
+        crate::bytecode::INTRINSIC_STRING_SLICE as u32 | 2 << 8,
+        1,
+    );
     a.mov(2, 20);
     a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
     a.blr(16);

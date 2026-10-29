@@ -22449,6 +22449,10 @@ thread_local! {
     pub(crate) static TEST_JIT_CODE_POINT_INTRINSICS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// One-argument slices the intrinsic helper made (W3's item 2c), for tests.
+    pub(crate) static TEST_JIT_SLICE1_INTRINSICS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 /// Hot native intrinsics after the machine-code call IC has already proved builtin identity.
@@ -22488,6 +22492,9 @@ unsafe fn jit_intrinsic_inner(
         INTRINSIC_FUNCTION_CALL => call_argc + 2,
         INTRINSIC_REGEXP_EXEC_DISCARD => 3,
         INTRINSIC_STRING_SPLIT_DISCARD => 3,
+        // [receiver, callee, start] or [receiver, callee, start, end]: both forms of slice pass
+        // their argument count.
+        INTRINSIC_STRING_SLICE => call_argc + 2,
         _ => 4, // [receiver, callee, arg0, arg1]
     };
     let base = sp.sub(width);
@@ -22528,11 +22535,12 @@ unsafe fn jit_intrinsic_inner(
         intrinsic,
         INTRINSIC_CHAR_AT | INTRINSIC_CODE_POINT_AT | INTRINSIC_STRING_SLICE
     ) {
-        // [receiver, callee, index] or [receiver, callee, start, end]: charAt, codePointAt and
-        // the two-argument slice on a String receiver with Number arguments (the template's
-        // guards; ECMA-262 §22.1.3.2, §22.1.3.4, §22.1.3.23) run no author code and only read or
-        // slice the string, so like charCodeAt they need none of the native-call boundary below.
-        let value = string_intrinsic(i, intrinsic, base);
+        // [receiver, callee, index], [receiver, callee, start] or [receiver, callee, start, end]:
+        // charAt, codePointAt and slice on a String receiver with Number arguments (the
+        // template's guards; ECMA-262 §22.1.3.2, §22.1.3.4, §22.1.3.23) run no author code and
+        // only read or slice the string, so like charCodeAt they need none of the native-call
+        // boundary below.
+        let value = string_intrinsic(i, intrinsic, base, width);
         for k in 0..width {
             std::ptr::drop_in_place(base.add(k));
         }
@@ -22768,9 +22776,14 @@ unsafe fn jit_intrinsic_inner(
 }
 
 /// [`jit_intrinsic_inner`]'s String intrinsics, which run no author code: charAt and codePointAt
-/// at a Number index, and the two-argument slice with Number bounds, on a String receiver (the
-/// template's guards). Reads the operands at `base` in place; the caller releases them.
-unsafe fn string_intrinsic(i: &mut Interp, intrinsic: u8, base: *const Value) -> Value {
+/// at a Number index, and slice with one or two Number bounds, on a String receiver (the
+/// template's guards). Reads the `width` operands at `base` in place; the caller releases them.
+unsafe fn string_intrinsic(
+    i: &mut Interp,
+    intrinsic: u8,
+    base: *const Value,
+    width: usize,
+) -> Value {
     match intrinsic {
         INTRINSIC_CHAR_AT => {
             let ValueView::Str(s) = &((*base).clone()).view() else {
@@ -22814,11 +22827,23 @@ unsafe fn string_intrinsic(i: &mut Interp, intrinsic: u8, base: *const Value) ->
             let ValueView::Num(start) = &((*base.add(2)).clone()).view() else {
                 unreachable!("slice intrinsic start guard")
             };
-            let ValueView::Num(end) = &((*base.add(3)).clone()).view() else {
-                unreachable!("slice intrinsic end guard")
+            // String.prototype.slice (spec.html:36827 at e28783d5) over code units, at either
+            // width: ToClampedIndex (:5841) of each Number bound, the end the length when absent.
+            let len = s.unit_len() as i64;
+            let end = match width {
+                3 => {
+                    #[cfg(test)]
+                    TEST_JIT_SLICE1_INTRINSICS.with(|count| count.set(count.get() + 1));
+                    len as f64
+                }
+                _ => {
+                    debug_assert_eq!(width, 4);
+                    let ValueView::Num(end) = (*base.add(3)).view() else {
+                        unreachable!("slice intrinsic end guard")
+                    };
+                    end
+                }
             };
-            debug_assert!(s.ascii_hint());
-            let len = s.text().len() as i64;
             let norm = |n: f64| {
                 if n.is_nan() {
                     return 0;
@@ -22838,7 +22863,7 @@ unsafe fn string_intrinsic(i: &mut Interp, intrinsic: u8, base: *const Value) ->
                     n.min(len)
                 }
             };
-            let (start, end) = (norm(*start), norm(*end));
+            let (start, end) = (norm(*start), norm(end));
             if start < end {
                 Value::Str(s.slice_units(start as usize, end as usize))
             } else {
