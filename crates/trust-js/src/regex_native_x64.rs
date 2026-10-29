@@ -249,6 +249,20 @@ impl Asm {
         self.byte(by);
     }
 
+    /// A 32-bit shift (`shr`/`shl dst32, by`), which zero-extends.
+    fn shift32(&mut self, right: bool, dst: u8, by: u8) {
+        self.op_rr(false, &[0xc1], if right { 5 } else { 4 }, dst);
+        self.byte(by);
+    }
+
+    /// Go to `label` unless the unit in `reg`, which this clobbers, is a lead surrogate's
+    /// (`lead`) or a trail surrogate's: `shr reg32, 10; cmp reg32, 0x36 or 0x37; jne label`.
+    fn branch_not_surrogate(&mut self, reg: u8, lead: bool, label: Label) {
+        self.shift32(true, reg, 10);
+        self.alu_imm(false, 7, reg, if lead { 0x36 } else { 0x37 });
+        self.jcc(Cond::Ne, label);
+    }
+
     fn cmov(&mut self, cond: Cond, dst: u8, src: u8) {
         self.op_rr(true, &[0x0f, 0x40 | cc(cond)], dst, src);
     }
@@ -410,12 +424,14 @@ impl Asm {
             self.restore_scratch();
             self.ret_instruction();
         }
-        // A backreference under `i`: the helper compares the rcx units at the position with
-        // those at rdx (`helper_backref_fold`), answering in rax.
+        // A backreference under `i`: the helper compares the rcx units at rdx with the subject
+        // at the position, backward if rax is nonzero (`helper_backref_fold`), answering in
+        // rax.
         let backref = self.backref_routine;
         if self.referenced(backref) {
             self.bind(backref);
             self.save_scratch();
+            self.mov(R8, RAX);
             self.mov(RSI, OP);
             self.mov(RDI, CTX);
             self.mov(RDX, POS);
@@ -522,6 +538,11 @@ impl Masm for Asm {
         self.jcc(Cond::Lo, label);
     }
 
+    fn branch_room_back_lt(&mut self, k: u32, label: Label) {
+        self.alu_imm(true, 7, POS, k as i32);
+        self.jcc(Cond::Lo, label);
+    }
+
     fn branch_at_start(&mut self, at: bool, label: Label) {
         self.alu(true, 0x85, POS, POS);
         self.jcc(if at { Cond::Eq } else { Cond::Ne }, label);
@@ -550,6 +571,56 @@ impl Masm for Asm {
     fn branch_elem(&mut self, cond: Cond, value: u32, label: Label) {
         self.alu_imm(false, 7, E, value as i32);
         self.jcc(cond, label);
+    }
+
+    fn decode_elem(&mut self, back: bool) {
+        debug_assert_eq!(self.width, Width::Two);
+        // A lead surrogate's unit is 0x36 << 10 up, a trail's 0x37 << 10 up; a pair's element is
+        // 0x10000 + (lead - 0xd800) << 10 + (trail - 0xdc00).
+        let done = self.label();
+        if back {
+            // eax = the unit before POS: a trail?
+            self.op_sib(false, &[0x0f, 0xb7], E, SUBJ, POS, 1, -2);
+            self.op_rr(false, &[0x89], E, SCRATCH);
+            self.branch_not_surrogate(SCRATCH, false, done);
+            // A lead before it? r11d = lead - 0xd800.
+            self.alu_imm(true, 7, POS, 2);
+            self.jcc(Cond::Lo, done);
+            self.op_sib(false, &[0x0f, 0xb7], SCRATCH, SUBJ, POS, 1, -4);
+            self.alu_imm(false, 5, SCRATCH, 0xd800);
+            self.alu_imm(false, 7, SCRATCH, 0x3ff);
+            self.jcc(Cond::Hi, done);
+            self.shift32(false, SCRATCH, 10);
+            self.alu_imm(false, 5, E, 0xdc00);
+        } else {
+            // eax = the unit at POS: a lead?
+            self.op_sib(false, &[0x0f, 0xb7], E, SUBJ, POS, 1, 0);
+            self.op_rr(false, &[0x89], E, SCRATCH);
+            self.branch_not_surrogate(SCRATCH, true, done);
+            // A trail after it? r11d = trail - 0xdc00.
+            self.op_mem(true, &[0x8d], SCRATCH, POS, 1);
+            self.alu(true, 0x39, SCRATCH, LEN);
+            self.jcc(Cond::Hs, done);
+            self.op_sib(false, &[0x0f, 0xb7], SCRATCH, SUBJ, SCRATCH, 1, 0);
+            self.alu_imm(false, 5, SCRATCH, 0xdc00);
+            self.alu_imm(false, 7, SCRATCH, 0x3ff);
+            self.jcc(Cond::Hi, done);
+            self.alu_imm(false, 5, E, 0xd800);
+            self.shift32(false, E, 10);
+        }
+        self.alu(false, 0x01, E, SCRATCH);
+        self.alu_imm(false, 0, E, 0x1_0000);
+        self.bind(done);
+    }
+
+    fn step_elem(&mut self, back: bool) {
+        // cmp eax, 0x10000 sets the carry for an element of one unit: forward, sbb r12, -1 adds
+        // one without it (an element past the BMP), then one more; backward, adc r12, -1
+        // subtracts one without it, then one more.
+        self.alu_imm(false, 7, E, 0x1_0000);
+        self.op_rr(true, &[0x83], if back { 2 } else { 3 }, POS);
+        self.byte(0xff);
+        self.alu_imm(true, if back { 5 } else { 0 }, POS, 1);
     }
 
     fn branch_elem_in(&mut self, lo: u32, hi: u32, inside: bool, label: Label) {
@@ -727,7 +798,15 @@ impl Masm for Asm {
         self.shift(true, CHOICES, 32);
     }
 
-    fn backref(&mut self, slot: usize, icase: bool, fail: Label) {
+    fn backref(
+        &mut self,
+        slot: usize,
+        icase: bool,
+        back: bool,
+        paired: bool,
+        reversed: bool,
+        fail: Label,
+    ) {
         // The loop registers: no loop holds them across a backreference.
         debug_assert!(self.held.is_none());
         let done = self.label();
@@ -738,18 +817,30 @@ impl Masm for Asm {
         self.jcc(Cond::Eq, done);
         self.alu_imm(true, 7, RS, -1);
         self.jcc(Cond::Eq, done);
-        // rcx = its length (a forward program's captures end at or past their start): empty, it
-        // matches empty; else the subject must have as many units left.
-        self.alu(true, 0x29, RS, OP);
-        self.jcc(Cond::Eq, done);
-        self.mov(SCRATCH, LEN);
-        self.alu(true, 0x29, SCRATCH, POS);
-        self.alu(true, 0x39, SCRATCH, RS);
-        self.jcc(Cond::Lo, fail);
+        if reversed {
+            // A lookbehind captures backward, its start past its end: rdx = the span's low end,
+            // rcx = its length; empty, it matches empty.
+            self.alu(true, 0x39, RS, OP);
+            self.jcc(Cond::Eq, done);
+            self.mov(SCRATCH, RS);
+            self.alu(true, 0x29, SCRATCH, OP);
+            self.mov(RAX, OP);
+            self.alu(true, 0x29, RAX, RS);
+            self.alu(true, 0x39, RS, OP);
+            self.cmov(Cond::Ls, OP, RS);
+            self.cmov(Cond::Hi, RS, SCRATCH);
+            self.cmov(Cond::Ls, RS, RAX);
+        } else {
+            // rcx = its length (a capture made reading forward ends at or past its start):
+            // empty, it matches empty.
+            self.alu(true, 0x29, RS, OP);
+            self.jcc(Cond::Eq, done);
+        }
         if icase {
-            // The helper answers 1 if Canonicalize's agree, 0 if not, or bit 63 and a status if
-            // the host interrupted a long compare.
+            // The helper answers the position past the repetition plus one, 0 if it does not
+            // repeat, or bit 63 and a status if the host interrupted a long compare.
             let status = self.label();
+            self.mov_imm32(RAX, u32::from(back));
             self.call(self.backref_routine);
             self.alu(true, 0x85, RAX, RAX);
             // js: bit 63 carries a status.
@@ -757,11 +848,21 @@ impl Masm for Asm {
             self.rel32(status);
             self.jcc(Cond::Eq, fail);
             self.outlines.push(Outline::Status { slow: status });
-            self.alu(true, 0x01, POS, RS);
+            self.op_mem(true, &[0x8d], POS, RAX, -1);
         } else {
-            // rsi = the capture's first unit, rdi = the position's, and POS past the repetition
-            // (a failure backtracks, which sets it again). Stretches of at most SCAN_STRETCH
-            // units, polled between: r11 counts the stretch's units, rcx those after it.
+            // The subject must have as many units left past the position (before it).
+            if back {
+                self.alu(true, 0x39, POS, RS);
+            } else {
+                self.mov(SCRATCH, LEN);
+                self.alu(true, 0x29, SCRATCH, POS);
+                self.alu(true, 0x39, SCRATCH, RS);
+            }
+            self.jcc(Cond::Lo, fail);
+            // rsi = the capture's first unit, rdi = the subject's, and POS past the repetition
+            // (before it; a failure backtracks, which sets it again). Stretches of at most
+            // SCAN_STRETCH units, polled between: r11 counts the stretch's units, rcx those
+            // after it.
             let (scale, step) = match self.width {
                 Width::One => (0, 1),
                 Width::Two => (1, 2),
@@ -770,8 +871,13 @@ impl Masm for Asm {
             let unit = self.label();
             let end = self.label();
             self.op_sib(true, &[0x8d], LIM, SUBJ, OP, scale, 0);
-            self.op_sib(true, &[0x8d], CLIM, SUBJ, POS, scale, 0);
-            self.alu(true, 0x01, POS, RS);
+            if back {
+                self.alu(true, 0x29, POS, RS);
+                self.op_sib(true, &[0x8d], CLIM, SUBJ, POS, scale, 0);
+            } else {
+                self.op_sib(true, &[0x8d], CLIM, SUBJ, POS, scale, 0);
+                self.alu(true, 0x01, POS, RS);
+            }
             self.bind(stretch);
             self.mov_imm32(SCRATCH, SCAN_STRETCH);
             self.alu(true, 0x39, RS, SCRATCH);
@@ -801,6 +907,21 @@ impl Masm for Asm {
             self.poll_now();
             self.jump(stretch);
             self.bind(end);
+            if paired {
+                // The repetition must not end inside a surrogate pair (as the matcher's
+                // `boundary` check and V8's `CheckNotInSurrogatePair` have it): no trail at POS
+                // after a lead.
+                self.alu(true, 0x85, POS, POS);
+                self.jcc(Cond::Eq, done);
+                self.alu(true, 0x39, POS, LEN);
+                self.jcc(Cond::Hs, done);
+                self.op_sib(false, &[0x0f, 0xb7], E, SUBJ, POS, 1, 0);
+                self.branch_not_surrogate(E, false, done);
+                self.op_sib(false, &[0x0f, 0xb7], E, SUBJ, POS, 1, -2);
+                self.shift32(true, E, 10);
+                self.alu_imm(false, 7, E, 0x36);
+                self.jcc(Cond::Eq, fail);
+            }
         }
         self.bind(done);
     }
@@ -831,10 +952,45 @@ impl Masm for Asm {
         }
     }
 
+    fn set_limit_back(&mut self, max: Option<u32>) {
+        match max {
+            None => self.mov_imm32(LIM, 0),
+            Some(max) => {
+                // mov r11d, 0; mov rsi, r12; sub rsi, max; cmovb rsi, r11
+                self.mov_imm32(SCRATCH, 0);
+                self.mov(LIM, POS);
+                self.alu_imm(true, 5, LIM, max as i32);
+                self.cmov(Cond::Lo, LIM, SCRATCH);
+            }
+        }
+    }
+
     fn set_stretch_limit(&mut self) {
         self.op_mem(true, &[0x8d], CLIM, POS, SCAN_STRETCH as i32);
         self.alu(true, 0x39, CLIM, LIM);
         self.cmov(Cond::Hi, CLIM, LIM);
+    }
+
+    fn set_stretch_limit_back(&mut self) {
+        // mov rdi, r12; sub rdi, STRETCH; cmovb rdi, rsi; cmp rdi, rsi; cmovb rdi, rsi
+        self.mov(CLIM, POS);
+        self.alu_imm(true, 5, CLIM, SCAN_STRETCH as i32);
+        self.cmov(Cond::Lo, CLIM, LIM);
+        self.alu(true, 0x39, CLIM, LIM);
+        self.cmov(Cond::Lo, CLIM, LIM);
+    }
+
+    fn set_count(&mut self, count: u32) {
+        self.mov_imm32(LIM, count);
+    }
+
+    fn branch_count(&mut self, zero: bool, label: Label) {
+        self.alu(true, 0x85, LIM, LIM);
+        self.jcc(if zero { Cond::Eq } else { Cond::Ne }, label);
+    }
+
+    fn count_down(&mut self) {
+        self.alu_imm(true, 5, LIM, 1);
     }
 
     fn set_candidate_bound(&mut self, window: bool) {
@@ -862,10 +1018,28 @@ impl Masm for Asm {
         self.mov(POS, LIM);
     }
 
-    fn branch_run(&mut self, cond: Cond, n: u32, label: Label) {
-        self.mov(SCRATCH, POS);
-        self.alu(true, 0x29, SCRATCH, RS);
+    fn branch_run(&mut self, cond: Cond, n: u32, back: bool, label: Label) {
+        if back {
+            self.mov(SCRATCH, RS);
+            self.alu(true, 0x29, SCRATCH, POS);
+        } else {
+            self.mov(SCRATCH, POS);
+            self.alu(true, 0x29, SCRATCH, RS);
+        }
         self.alu_imm(true, 7, SCRATCH, n as i32);
+        self.jcc(cond, label);
+    }
+
+    fn rs_add(&mut self, k: u32, back: bool) {
+        self.alu_imm(true, if back { 5 } else { 0 }, RS, k as i32);
+    }
+
+    fn set_rs(&mut self, value: u32) {
+        self.mov_imm32(RS, value);
+    }
+
+    fn branch_rs(&mut self, cond: Cond, n: u32, label: Label) {
+        self.alu_imm(true, 7, RS, n as i32);
         self.jcc(cond, label);
     }
 
@@ -896,11 +1070,23 @@ impl Masm for Asm {
             .push(Outline::CandidateStatus { slow, no_match });
     }
 
-    fn next_start(&mut self, lead: bool, no_match: Label) {
+    fn next_start(&mut self, lead: bool, paired: bool, no_match: Label) {
         self.load(SCRATCH, SLOTS, 0);
         self.alu(true, 0x39, SCRATCH, LEN);
         self.jcc(Cond::Hs, no_match);
         self.op_mem(true, &[0x8d], POS, SCRATCH, 1);
+        if paired {
+            // Past a surrogate pair's two units: a lead at the start, a trail after it.
+            let single = self.label();
+            self.op_sib(false, &[0x0f, 0xb7], E, SUBJ, SCRATCH, 1, 0);
+            self.branch_not_surrogate(E, true, single);
+            self.alu(true, 0x39, POS, LEN);
+            self.jcc(Cond::Hs, single);
+            self.op_sib(false, &[0x0f, 0xb7], E, SUBJ, POS, 1, 0);
+            self.branch_not_surrogate(E, false, single);
+            self.alu_imm(true, 0, POS, 1);
+            self.bind(single);
+        }
         if lead {
             self.load(SCRATCH, CTX, ctx::LEAD);
             self.alu(true, 0x39, POS, SCRATCH);
@@ -1211,6 +1397,82 @@ mod tests {
                 |a| a.op_mem(false, &[0x0f, 0xb7], RAX, RSI, 0),
                 "0f b7 86 00 00 00 00",
                 "movzx eax,WORD PTR [rsi+0x0]",
+            ),
+            // W5b's 3d: surrogate pairs decoded and stepped, backward scans.
+            (|a| a.shift32(true, R11, 10), "41 c1 eb 0a", "shr r11d,0xa"),
+            (|a| a.shift32(false, RAX, 10), "c1 e0 0a", "shl eax,0xa"),
+            (
+                |a| {
+                    a.op_rr(true, &[0x83], 3, R12);
+                    a.byte(0xff);
+                },
+                "49 83 dc ff",
+                "sbb r12,0xffffffffffffffff",
+            ),
+            (
+                |a| {
+                    a.op_rr(true, &[0x83], 2, R12);
+                    a.byte(0xff);
+                },
+                "49 83 d4 ff",
+                "adc r12,0xffffffffffffffff",
+            ),
+            (
+                |a| a.op_sib(false, &[0x0f, 0xb7], RAX, RBX, R12, 1, -2),
+                "42 0f b7 84 63 fe ff ff ff",
+                "movzx eax,WORD PTR [rbx+r12*2-0x2]",
+            ),
+            (
+                |a| a.op_sib(false, &[0x0f, 0xb7], R11, RBX, R11, 1, 0),
+                "46 0f b7 9c 5b 00 00 00 00",
+                "movzx r11d,WORD PTR [rbx+r11*2+0x0]",
+            ),
+            (
+                |a| a.op_rr(false, &[0x89], RAX, R11),
+                "41 89 c3",
+                "mov r11d,eax",
+            ),
+            (
+                |a| a.alu_imm(false, 7, R11, 0x36),
+                "41 83 fb 36",
+                "cmp r11d,0x36",
+            ),
+            (
+                |a| a.op_mem(true, &[0x8d], R11, R12, 1),
+                "4d 8d 9c 24 01 00 00 00",
+                "lea r11,[r12+0x1]",
+            ),
+            (
+                |a| a.alu_imm(false, 5, R11, 0xdc00),
+                "41 81 eb 00 dc 00 00",
+                "sub r11d,0xdc00",
+            ),
+            (|a| a.alu(false, 0x01, RAX, R11), "44 01 d8", "add eax,r11d"),
+            (
+                |a| a.alu_imm(false, 0, RAX, 0x1_0000),
+                "81 c0 00 00 01 00",
+                "add eax,0x10000",
+            ),
+            (
+                |a| a.op_mem(true, &[0x8d], R12, RAX, -1),
+                "4c 8d a0 ff ff ff ff",
+                "lea r12,[rax-0x1]",
+            ),
+            (|a| a.mov(R8, RAX), "49 89 c0", "mov r8,rax"),
+            (
+                |a| a.cmov(Cond::Ls, RDX, RCX),
+                "48 0f 46 d1",
+                "cmovbe rdx,rcx",
+            ),
+            (
+                |a| a.cmov(Cond::Hi, RCX, R11),
+                "49 0f 47 cb",
+                "cmova rcx,r11",
+            ),
+            (
+                |a| a.cmov(Cond::Lo, RSI, R11),
+                "49 0f 42 f3",
+                "cmovb rsi,r11",
             ),
         ];
         let print = std::env::var_os("TRUST_JS_REGEXP_X64_ENCODINGS").is_some();

@@ -2,7 +2,7 @@
 //! fuzzer whose differences are reduced to a minimal pattern and subject, interruption, the
 //! backtracking state's limit, and the tier-up rules.
 
-use super::super::{test_poll_word, MatchError, Regex, MAX_BACKTRACK_STATE};
+use super::super::{test_poll_word, MatchError, ReInput, Regex, MAX_BACKTRACK_STATE};
 use super::{decline, note_execution, Width, BACKEND};
 use std::sync::Arc;
 
@@ -57,14 +57,15 @@ impl Subject {
 type Found = Result<Option<Vec<Option<(usize, usize)>>>, MatchError>;
 
 /// Run `re` over `subject` from `start` through exec's path, which runs the pattern's native
-/// code for the subject's width when it has some.
+/// code for the subject's width when it has some. In Unicode mode a start inside a surrogate
+/// pair begins at the pair, as RegExpBuiltinExec's (`Regex::exec_at`) does.
 fn run(re: &Regex, subject: &Subject, start: usize, control: &crate::RuntimeInterrupt) -> Found {
     let word = test_poll_word(control);
     let found = match subject {
         Subject::One(bytes) => re.exec_impl(&bytes[..], start, control, &word),
         Subject::Two(units) if re.unicode => {
             let input = super::super::Paired(units);
-            re.exec_impl(input, start, control, &word)
+            re.exec_impl(input, input.boundary(start), control, &word)
         }
         Subject::Two(units) => re.exec_impl(&units[..], start, control, &word),
     };
@@ -272,11 +273,27 @@ const ATOMS: &[&str] = &[
     "[à-þ]",
     "[k-s]",
     "[ǅ-ǆ]",
+    // Past the BMP and its surrogates: in Unicode mode a character, a class of them or a lone
+    // surrogate (a pair's half that the subject may hold alone); elsewhere their units. The
+    // Deseret letters are a case pair under `iu`.
+    "😀",
+    "\\u{1F600}",
+    "\\ud83d",
+    "\\ude00",
+    "[😀-😂]",
+    "[^😀]",
+    "[\\u{10000}-\\u{10ffff}]",
+    "[\\ud800-\\udbff]",
+    "[\\udc00-\\udfff]",
+    "\\u{10400}",
+    "\\u{10428}",
+    "\\p{ASCII}",
+    "\\P{ASCII}",
 ];
 
-/// Near misses: programs one instruction away from what the tier takes (lookbehinds), which run
-/// on the matcher.
-const NEAR_MISSES: &[&str] = &["(?<=a)", "(?<!b)", "(?<=(a)|b)", "(?<![ab]c)"];
+/// Near misses: programs one instruction away from what the tier takes (`v`-mode class strings,
+/// under `v`), which run on the matcher.
+const NEAR_MISSES: &[&str] = &["[\\q{ab|c}]", "[\\q{}a]", "[\\q{😀a}]"];
 
 const QUANTIFIERS: &[&str] = &[
     "*", "+", "?", "{2}", "{1,3}", "{0,}", "{2,}", "{0,2}", "{3,5}",
@@ -305,7 +322,7 @@ fn gen_sequence(rng: &mut Rng, depth: usize) -> String {
 }
 
 fn gen_term(rng: &mut Rng, depth: usize) -> String {
-    let (atom, quantifiable) = match rng.below(32) {
+    let (atom, quantifiable) = match rng.below(34) {
         0..=12 => (rng.pick(ATOMS).to_string(), true),
         13 => ("^".to_string(), false),
         14 => ("$".to_string(), false),
@@ -340,7 +357,15 @@ fn gen_term(rng: &mut Rng, depth: usize) -> String {
             ),
             true,
         ),
-        29 if rng.chance(25) => (rng.pick(NEAR_MISSES).to_string(), false),
+        // Lookbehinds, which no quantifier takes.
+        29..=30 if depth < 3 => {
+            let kind = if rng.chance(50) { "?<=" } else { "?<!" };
+            (
+                format!("({kind}{})", gen_alternation(rng, depth + 1)),
+                false,
+            )
+        }
+        31 if rng.chance(25) => (rng.pick(NEAR_MISSES).to_string(), false),
         _ => (rng.pick(ATOMS).to_string(), true),
     };
     if quantifiable && rng.chance(35) {
@@ -369,6 +394,10 @@ fn gen_flags(rng: &mut Rng) -> String {
         if rng.chance(percent) {
             flags.push(flag);
         }
+    }
+    // Unicode mode: `u`, or now and then `v`.
+    if rng.chance(30) {
+        flags.push(if rng.chance(15) { 'v' } else { 'u' });
     }
     flags
 }
@@ -406,21 +435,30 @@ const TWO_BYTE_UNITS: &[u16] = &[
     0x3b9, 0x1fbe,
 ];
 
+/// Surrogate pairs a two-byte subject may hold: 😀 and its neighbour, and the Deseret letters.
+const PAIRS: &[[u16; 2]] = &[
+    [0xd83d, 0xde00],
+    [0xd83d, 0xde01],
+    [0xd801, 0xdc00],
+    [0xd801, 0xdc28],
+];
+
 fn gen_subject(rng: &mut Rng, two: bool) -> Subject {
     let len = if rng.chance(10) {
         20 + rng.below(40)
     } else {
         rng.below(13)
     };
-    let units: Vec<u16> = (0..len)
-        .map(|_| {
-            if two && rng.chance(30) {
-                TWO_BYTE_UNITS[rng.below(TWO_BYTE_UNITS.len())]
-            } else {
-                ONE_BYTE_UNITS[rng.below(ONE_BYTE_UNITS.len())]
-            }
-        })
-        .collect();
+    let mut units: Vec<u16> = Vec::with_capacity(len + 2);
+    while units.len() < len {
+        if two && rng.chance(12) {
+            units.extend_from_slice(&PAIRS[rng.below(PAIRS.len())]);
+        } else if two && rng.chance(30) {
+            units.push(TWO_BYTE_UNITS[rng.below(TWO_BYTE_UNITS.len())]);
+        } else {
+            units.push(ONE_BYTE_UNITS[rng.below(ONE_BYTE_UNITS.len())]);
+        }
+    }
     if two {
         Subject::Two(units)
     } else {
@@ -430,14 +468,16 @@ fn gen_subject(rng: &mut Rng, two: bool) -> Subject {
 
 /// Fuzz `cases` executions (subject and start) from `seed`: random patterns over the tier's
 /// grammar and its near misses, with random flags, against one-byte and two-byte subjects at
-/// every start. Returns the cases run, the patterns compiled for a width, and those the tier
-/// compiled.
-fn fuzz(seed: u64, cases: usize) -> (usize, usize, usize) {
+/// every start. Returns the cases run, the patterns compiled for a width, those the tier
+/// compiled, and of those the ones in Unicode mode and the ones with a lookbehind.
+fn fuzz(seed: u64, cases: usize) -> (usize, usize, usize, usize, usize) {
     let mut rng = Rng::seeded(seed);
     let trace = std::env::var_os("TRUST_JS_REGEXP_FUZZ_TRACE").is_some();
     let mut run_cases = 0;
     let mut patterns = 0;
     let mut native_patterns = 0;
+    let mut unicode_patterns = 0;
+    let mut lookbehind_patterns = 0;
     while run_cases < cases {
         let pattern = gen_alternation(&mut rng, 0);
         let flags = gen_flags(&mut rng);
@@ -448,7 +488,12 @@ fn fuzz(seed: u64, cases: usize) -> (usize, usize, usize) {
             let width = if two { Width::Two } else { Width::One };
             if let Some((native, _)) = pair(&pattern, &flags, width) {
                 patterns += 1;
-                native_patterns += usize::from(compiled(&native, width));
+                if compiled(&native, width) {
+                    native_patterns += 1;
+                    unicode_patterns += usize::from(native.unicode);
+                    lookbehind_patterns +=
+                        usize::from(pattern.contains("(?<=") || pattern.contains("(?<!"));
+                }
             }
             for _ in 0..4 {
                 let subject = gen_subject(&mut rng, two);
@@ -460,7 +505,13 @@ fn fuzz(seed: u64, cases: usize) -> (usize, usize, usize) {
             }
         }
     }
-    (run_cases, patterns, native_patterns)
+    (
+        run_cases,
+        patterns,
+        native_patterns,
+        unicode_patterns,
+        lookbehind_patterns,
+    )
 }
 
 /// The fuzzer at the lib suite's size; `TRUST_JS_REGEXP_FUZZ_CASES=N` (with
@@ -475,9 +526,10 @@ fn fuzzed_programs_match_as_the_matcher_does() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0x9e37_79b9_7f4a_7c15);
-    let (run_cases, patterns, native) = fuzz(seed, cases);
+    let (run_cases, patterns, native, unicode, lookbehind) = fuzz(seed, cases);
     eprintln!(
-        "[regexp-native-fuzz] seed {seed}: {run_cases} cases, {native} of {patterns} programs native"
+        "[regexp-native-fuzz] seed {seed}: {run_cases} cases, {native} of {patterns} programs \
+         native, {unicode} of them in Unicode mode and {lookbehind} with a lookbehind"
     );
     if BACKEND {
         assert!(native > 0);
@@ -730,6 +782,154 @@ fn lookahead_backreference_counted_and_modifier_programs_match_as_the_matcher_do
                         text.len()
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Unicode mode and lookbehind (W5b's 3d): strings.js's lexers over subjects whose elements are
+/// units and surrogate pairs (lone surrogates too), the matcher's `Paired` input; characters,
+/// classes and loops past the BMP, `.`, negated classes and lone surrogates, decoded where they
+/// are; case-insensitive Unicode matching (simple case folding, `\w` and `\b` with the long s
+/// and the Kelvin sign); backreferences that must not end inside a pair; lookbehinds of every
+/// kind, reading backward through pairs, with captures, backreferences, loops and nested
+/// lookarounds.
+#[test]
+fn unicode_and_lookbehind_programs_match_as_the_matcher_does() {
+    let texts = [
+        "",
+        "var x = foo(bar, 42); // a comment about things\n",
+        "var x = f\u{e9}o(bar, 42); // a \u{4e2d} comment\n",
+        "var \u{1f600}x = 1; // \u{1f600}\u{1f601} smile\n",
+        "\u{1f600}\u{1f600}a\u{1f601}b\u{10400}\u{10428}c\u{1f600}",
+        "aaa\u{1f600}bbb\u{1f600}\u{1f600}ccc",
+        "x\u{2028}y\r\n\u{1f600}\n",
+        "abc abc ab\u{1f600}ab\u{1f600}",
+        "K\u{212a}k \u{17f}sS \u{10400}\u{10428} \u{3a3}\u{3c3}\u{3c2}",
+        "word \u{1f600}word w\u{17f}rd",
+        "12ab 3\u{1f600}4 56",
+    ];
+    for (pattern, flags) in [
+        // strings.js's sticky lexer and its anchored per-chunk matcher.
+        ("[A-Za-z_]\\w*|\\d+|\\s+|\\/\\/[^\\n]*|.", "uy"),
+        ("^(?:[A-Za-z_]\\w*|\\d+|\\s+|.)", "u"),
+        ("[A-Za-z_]\\w*|\\d+|\\s+|\\/\\/[^\\n]*|.", "gu"),
+        // Elements past the BMP and lone surrogates.
+        ("(.)", "gu"),
+        ("..", "gu"),
+        ("\\u{1f600}+", "gu"),
+        ("\\u{1f600}{2}a", "u"),
+        ("[\\u{1f600}-\\u{1f64f}]+\\w", "gu"),
+        ("[^a]{2,3}?b", "u"),
+        ("[^\\n]*$", "mu"),
+        ("(\\ud83d)", "gu"),
+        ("\\ude00|x", "gu"),
+        ("([\\ud800-\\udbff])", "gu"),
+        ("[\\udc00-\\udfff]\\w", "u"),
+        ("\\P{ASCII}+", "gu"),
+        ("\\p{ASCII}+\\u{1f600}", "u"),
+        (".*?\\u{1f601}", "u"),
+        ("(.)(.)\\2\\1", "u"),
+        ("a.{0,2}?c", "su"),
+        // Case-insensitive Unicode mode: simple case folding, \w and \b.
+        ("\\u{10400}+", "giu"),
+        ("k\\w", "giu"),
+        ("\\bs\\w*", "giu"),
+        ("\\w+\\B", "iu"),
+        ("(\\u{10400}|\\u{3a3})\\1", "giu"),
+        ("[a-z\\u{10428}]+", "iu"),
+        // Backreferences over pairs.
+        ("(..)\\1", "gu"),
+        ("(\\ud83d)\\1", "u"),
+        ("(a\\u{1f600}?)\\1", "gu"),
+        // Lookbehinds.
+        ("(?<=a)b", "g"),
+        ("(?<!a)b", "g"),
+        ("(?<=\\u{1f600})\\w", "gu"),
+        ("(?<!\\u{1f600})[a-z]", "gu"),
+        ("(?<=(\\d+))\\w", "g"),
+        ("(?<=\\b\\w+)\\s", "g"),
+        ("(?<=^a*)b", "gm"),
+        ("(?<=[^\\n]*)x", "u"),
+        ("(?<=.{2})\\w", "gu"),
+        ("(?<=(.)\\1)\\w", "gu"),
+        ("(?<=\\1(.))x", "u"),
+        ("(?<=(?=ab)a)b", "g"),
+        ("(?=(?<=a)b)\\w", "g"),
+        ("(?<=a(?<!ba))c", "g"),
+        ("(?<=(a|b)+?)c", "g"),
+        ("(?<=(?:ab){1001})", "y"),
+        ("(?<!(a)b)c\\1", "g"),
+        ("(?<=\\u{1f600}{2})a", "u"),
+        ("(?<=[\\u{1f600}-\\u{1f64f}]*)b", "gu"),
+        ("(?<=\\ud83d)x", "gu"),
+        ("(?<=(?i:K))\\w", "gu"),
+        ("(?<=\\w)\\b", "gu"),
+    ] {
+        for two in [false, true] {
+            let width = if two { Width::Two } else { Width::One };
+            let (native, _) = pair(pattern, flags, width).unwrap();
+            assert!(
+                compiled(&native, width) || !BACKEND,
+                "/{pattern}/{flags} is in the tier's instruction set for {width:?}"
+            );
+        }
+        check_both(pattern, flags, &texts);
+    }
+}
+
+/// The word characters `\\b` tests under `iu` beyond `[0-9A-Za-z_]` (WordCharacters with the
+/// characters that fold into it), which the native code compares in line, are the long s and
+/// the Kelvin sign, of every two-byte element.
+#[test]
+fn unicode_case_insensitive_word_characters_are_the_long_s_and_the_kelvin_sign() {
+    let extra: Vec<u32> = (0..=0xffffu32)
+        .filter(|&c| super::super::is_word_ic(c, true, true) && !super::super::is_word(c))
+        .collect();
+    assert_eq!(extra, [0x17f, 0x212a]);
+}
+
+/// In Unicode mode, every element of the two-byte range, as a unit, a lone surrogate or the
+/// halves of a pair, decodes as the matcher's `Paired` input steps it: each unit, then elements
+/// past the BMP at the edges of each plane, each followed by `x`, under `.`, a negated class
+/// and an astral class, forward and in a lookbehind.
+#[test]
+fn unicode_mode_decodes_every_element_as_the_matcher_does() {
+    let mut units: Vec<u16> = Vec::new();
+    for unit in 0..=0xffffu32 {
+        units.push(unit as u16);
+        units.push(b'x' as u16);
+    }
+    for plane in 1..=16u32 {
+        for low in [0u32, 1, 0x3ff, 0x400, 0xfffe, 0xffff] {
+            let c = char::from_u32(plane << 16 | low).unwrap();
+            let mut pair = [0u16; 2];
+            units.extend_from_slice(c.encode_utf16(&mut pair));
+            units.push(b'x' as u16);
+        }
+    }
+    let subject = Subject::Two(units);
+    for pattern in [
+        ".x",
+        "[^a]x",
+        "[\\u{10000}-\\u{10ffff}]x",
+        "(?<=.)x",
+        "(?<=[^a])x",
+    ] {
+        let (native, matcher) = pair(pattern, "u", Width::Two).unwrap();
+        assert!(
+            compiled(&native, Width::Two) || !BACKEND,
+            "/{pattern}/u compiles"
+        );
+        let control = crate::RuntimeInterrupt::default();
+        let mut start = 0;
+        loop {
+            let found = run(&native, &subject, start, &control);
+            let reference = run(&matcher, &subject, start, &control);
+            assert_eq!(found, reference, "/{pattern}/u from {start}");
+            match found {
+                Ok(Some(spans)) => start = spans[0].unwrap().1,
+                _ => break,
             }
         }
     }
@@ -1114,8 +1314,9 @@ fn hot_patterns_compile_each_width_on_its_first_use() {
     long.exec_polled(&text, 0, &control).unwrap();
     assert_eq!(long.tier_feedback().2[0], (true, BACKEND));
 
-    // Patterns the tier does not take try once per width and stay on the matcher.
-    for (pattern, flags) in [("a(?<=b)", ""), ("a(?=(?<!b))", ""), ("a.", "u")] {
+    // Patterns the tier does not take (`v`-mode class strings) try once per width and stay on
+    // the matcher.
+    for (pattern, flags) in [("a[\\q{bc|d}]", "v"), ("(?=[\\q{bc}])", "v")] {
         let mut declined = Regex::new(pattern, flags).unwrap();
         declined.tier_up_at = 1;
         declined.exec_polled(&ascii, 0, &control).unwrap();
@@ -1130,12 +1331,16 @@ fn hot_patterns_compile_each_width_on_its_first_use() {
     literal.exec_polled(&ascii, 0, &control).unwrap();
     literal.exec_polled(&wide, 0, &control).unwrap();
     assert_eq!(literal.tier_feedback().2, [(true, false), (true, BACKEND)]);
-    // Backreferences, lookaheads, counted loops and modifier groups compile.
+    // Backreferences, lookarounds, counted loops, modifier groups and Unicode mode compile.
     for (pattern, flags) in [
         ("a(b)\\1", ""),
         ("a(?=b)", ""),
         ("(?:a|bc){1001}", ""),
         ("a(?i:b)", ""),
+        ("a(?<=b)", ""),
+        ("a(?=(?<!b))", ""),
+        ("a.", "u"),
+        ("[a-z]+", "v"),
     ] {
         let mut taken = Regex::new(pattern, flags).unwrap();
         taken.tier_up_at = 1;

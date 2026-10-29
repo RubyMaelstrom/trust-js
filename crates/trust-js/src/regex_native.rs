@@ -6,12 +6,15 @@
 //! `RegExpMacroAssembler`s do. [`Matcher::run`](super::Matcher::run) stays the reference, and
 //! the matcher runs whatever a program uses that the tier does not.
 //!
-//! The tier takes the instruction set outside Unicode mode (characters, `.`, classes, captures
-//! and their undo rules, alternation, `^`, `$` and `\b` with the flags resolved at compile time,
-//! which inline modifier groups fix per instruction, greedy and lazy loops of one element, atomic
-//! loops, group loops' progress marks and capture clears, counted loops, lookaheads and
-//! backreferences) over one-byte and two-byte subjects, under `i` once the program's characters
-//! and classes are closed over case; lookbehinds stay on the matcher. The candidate loop runs
+//! The tier takes the instruction set but `v`-mode class strings (characters, `.`, classes,
+//! captures and their undo rules, alternation, `^`, `$` and `\b` with the flags resolved at
+//! compile time, which inline modifier groups fix per instruction, greedy and lazy loops of one
+//! element, atomic loops, group loops' progress marks and capture clears, counted loops,
+//! lookaheads, lookbehinds reading backward, and backreferences) over one-byte and two-byte
+//! subjects, under `i` once the program's characters and classes are closed over case. In
+//! Unicode mode a two-byte subject's surrogate pair is one element, as the matcher's `Paired`
+//! input steps it: the code decodes an element where a test may match a surrogate or one past
+//! the BMP, and tests units where it cannot. The candidate loop runs
 //! in the generated code, with the first-element filter's table tested in line; the prefilter's
 //! literal and the filter's vector scans run in Rust ([`Regex::next_candidate`]), which the code
 //! calls when its own test rules a start out.
@@ -202,16 +205,33 @@ pub(super) trait Masm {
     fn fill_unset(&mut self, slots: std::ops::Range<usize>);
     /// TOP past the sentinel record again, which the failed attempt's last pop took.
     fn rearm_sentinel(&mut self);
-    /// Branch if fewer than `k` elements are left past POS.
+    /// Branch if fewer than `k` units are left past POS.
     fn branch_room_lt(&mut self, k: u32, label: Label);
+    /// Branch if fewer than `k` units are left before POS (POS below `k`).
+    fn branch_room_back_lt(&mut self, k: u32, label: Label);
     /// Branch if POS is 0 (`at`), or is not.
     fn branch_at_start(&mut self, at: bool, label: Label);
     /// Branch if POS is LEN (`at`), or is not.
     fn branch_at_end(&mut self, at: bool, label: Label);
+    /// Branch if no element is left past POS (before it, reading backward).
+    fn branch_at_edge(&mut self, back: bool, label: Label) {
+        if back {
+            self.branch_at_start(true, label);
+        } else {
+            self.branch_at_end(true, label);
+        }
+    }
     fn advance(&mut self, k: u32);
     fn retreat(&mut self, k: u32);
-    /// E = the element at POS + `offset`, which the caller has checked is in the subject.
+    /// E = the unit at POS + `offset`, which the caller has checked is in the subject.
     fn load_elem(&mut self, offset: i32);
+    /// E = the element at POS (`back`: the one ending at POS), which the caller has checked the
+    /// subject holds, in a paired mode: a lead surrogate's unit and the trail surrogate's after it
+    /// make one element past the BMP, as the matcher's `Paired::next_elem` (`prev_elem`) has it;
+    /// any other unit is an element of its own. Uses the intra-procedure scratch.
+    fn decode_elem(&mut self, back: bool);
+    /// POS past the element in E (before it, `back`): two units for one past the BMP, else one.
+    fn step_elem(&mut self, back: bool);
     /// Branch if E `cond` `value`.
     fn branch_elem(&mut self, cond: Cond, value: u32, label: Label);
     /// Branch if E is in `lo..=hi` (`inside`), or is not.
@@ -251,12 +271,24 @@ pub(super) trait Masm {
     fn cut_to(&mut self, slot: usize);
     /// POS = OP's low 32 bits, CHOICES = its high ones (see [`Operand::PosChoices`]).
     fn unpack_pos_choices(&mut self);
-    /// A backreference to the capture in `slot` and `slot + 1` (unset or empty: it matches
-    /// empty), as the matcher's `backref_end` compares it: unit by unit, or under `icase`
-    /// through the helper, which compares Canonicalize's. To `fail` if the subject at POS does
-    /// not repeat the capture, else POS past the repetition. The compare polls between
-    /// stretches, as a scan does.
-    fn backref(&mut self, slot: usize, icase: bool, fail: Label);
+    /// A backreference to the capture in `slot` and `slot + 1`, a span whichever way round (a
+    /// lookbehind captures backward; unset or empty, it matches empty), as the matcher's
+    /// `backref_end` compares it: unit by unit, or under `icase` through the helper, which
+    /// compares case-insensitively (element by element in a paired mode). To `fail` if the
+    /// subject at POS (`back`: before it) does not repeat the capture, or, in a paired mode
+    /// (`paired`), if the repetition would end inside a surrogate pair, as V8's
+    /// `CheckNotInSurrogatePair` checks; else POS past the repetition (before it). A capture made
+    /// in a lookbehind's body (`reversed`) may have its start past its end. The compare polls
+    /// between stretches, as a scan does.
+    fn backref(
+        &mut self,
+        slot: usize,
+        icase: bool,
+        back: bool,
+        paired: bool,
+        reversed: bool,
+        fail: Label,
+    );
     /// POS = OP.
     fn pos_from_op(&mut self);
     /// POS = OP's low 32 bits, RS = its high ones.
@@ -265,8 +297,18 @@ pub(super) trait Masm {
     fn run_start(&mut self);
     /// LIM = min(LEN, POS + `max`).
     fn set_limit(&mut self, max: Option<u32>);
+    /// LIM = POS - `max`, or 0 if that is below it (`None`: 0): a backward scan's limit.
+    fn set_limit_back(&mut self, max: Option<u32>);
     /// CLIM = min(LIM, POS + [`SCAN_STRETCH`]).
     fn set_stretch_limit(&mut self);
+    /// CLIM = max(LIM, POS - [`SCAN_STRETCH`]): a backward scan's stretch.
+    fn set_stretch_limit_back(&mut self);
+    /// LIM = `count`: elements a decoded scan may still take.
+    fn set_count(&mut self, count: u32);
+    /// Branch if LIM is zero (`zero`), or is not.
+    fn branch_count(&mut self, zero: bool, label: Label);
+    /// LIM -= 1.
+    fn count_down(&mut self);
     /// CLIM = min(LEN, POS + [`CANDIDATE_RUN`]), and with `window` the context's window.
     fn set_candidate_bound(&mut self, window: bool);
     /// Branch if POS `cond` CLIM.
@@ -274,8 +316,14 @@ pub(super) trait Masm {
     fn branch_stretch_is_limit(&mut self, label: Label);
     /// POS = LIM.
     fn pos_to_limit(&mut self);
-    /// Branch if POS - RS `cond` `n`.
-    fn branch_run(&mut self, cond: Cond, n: u32, label: Label);
+    /// Branch if POS - RS (`back`: RS - POS) `cond` `n`: the run's units.
+    fn branch_run(&mut self, cond: Cond, n: u32, back: bool, label: Label);
+    /// RS += `k` (`back`: RS -= `k`).
+    fn rs_add(&mut self, k: u32, back: bool);
+    /// RS = `value`: a decoded lazy loop's count of elements.
+    fn set_rs(&mut self, value: u32);
+    /// Branch if RS `cond` `n`.
+    fn branch_rs(&mut self, cond: Cond, n: u32, label: Label);
     /// Branch if POS `cond` RS.
     fn branch_pos_rs(&mut self, cond: Cond, label: Label);
     /// LEAD = POS.
@@ -287,8 +335,9 @@ pub(super) trait Masm {
     /// `no_match` when none is left, or leave with the status of an interruption.
     fn next_candidate(&mut self, no_match: Label);
     /// After a failed attempt from the start in slot 0: to `no_match` if that start was LEN,
-    /// else POS = the start plus one, and with `lead`, at least LEAD.
-    fn next_start(&mut self, lead: bool, no_match: Label);
+    /// else POS = the start plus one element (in a paired mode, two units for a surrogate
+    /// pair's), and with `lead`, at least LEAD.
+    fn next_start(&mut self, lead: bool, paired: bool, no_match: Label);
     /// The finished code and data, or `None` if a branch does not reach.
     fn finish(self) -> Option<Vec<u8>>;
 }
@@ -356,7 +405,10 @@ pub(super) struct NativeCode {
     #[cfg_attr(not(test), allow(dead_code))]
     executable: crate::jit::ExecutableBuffer,
     width: Width,
-    /// The slots the code keeps: captures, marks, then its lookaheads' frames.
+    /// Made for Unicode mode's two-byte subjects, stepping surrogate pairs as one element: it
+    /// runs on the matcher's `Paired` input only.
+    paired: bool,
+    /// The slots the code keeps: captures, marks, then its lookarounds' frames.
     slots: usize,
     entry: unsafe extern "C" fn(*mut NativeCtx) -> u64,
 }
@@ -423,14 +475,11 @@ pub(super) fn code_for<'a, I: ReInput>(re: &'a Regex, input: &I) -> Option<&'a N
 /// Why `re` stays on the matcher for `width`, or `None` if the tier takes it.
 fn decline(re: &Regex, width: Width) -> Option<&'static str> {
     // Under `i`, and in the groups of `(?i:…)`, the program's characters, classes and loops
-    // match with no case folding once they are closed over case (`Regex::case_closed`).
-    // Outside Unicode mode `\b` is the same under `i`, and a backreference compares
-    // Canonicalize's through a helper.
+    // match with no case folding once they are closed over case (`Regex::case_closed`); `\b`
+    // tests its word characters under `i` (Unicode mode's take in the long s and the Kelvin
+    // sign), and a backreference compares case-insensitively through a helper.
     if !re.case_closed && (re.ignore_case || super::changes_flags(&re.prog)) {
         return Some("i flag");
-    }
-    if re.unicode {
-        return Some("Unicode mode");
     }
     if re.single.is_some() {
         return Some("single element");
@@ -438,9 +487,10 @@ fn decline(re: &Regex, width: Width) -> Option<&'static str> {
     if width == Width::One && (re.literal_ascii.is_some() || re.literal_fold.is_some()) {
         return Some("literal");
     }
+    let mode = Mode::of(re, width);
     let prog = &re.prog;
     let n = prog.len();
-    if code_units(prog, width) > MAX_CODE_UNITS {
+    if code_units(prog, mode) > MAX_CODE_UNITS {
         return Some("code size");
     }
     if 2 * (re.ngroups + 1) + re.nmarks + look_count(prog) > MAX_SLOTS {
@@ -453,26 +503,55 @@ fn decline(re: &Regex, width: Width) -> Option<&'static str> {
     {
         return Some("program shape");
     }
-    if !program_taken(prog, width, true) {
+    if !program_taken(prog, mode, true) {
         return Some("instruction");
     }
     None
 }
 
-/// Whether the tier takes every instruction of forward program `prog`: the pattern's (`root`),
-/// or a lookahead's body.
-fn program_taken(prog: &[Inst], width: Width, root: bool) -> bool {
+/// The subjects a program's code is made for: their width, and in Unicode mode over two-byte
+/// subjects (`paired`), elements of one unit or of a surrogate pair's two, as the matcher's
+/// `Paired` input steps them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Mode {
+    width: Width,
+    paired: bool,
+}
+
+impl Mode {
+    fn of(re: &Regex, width: Width) -> Self {
+        Mode {
+            width,
+            paired: re.unicode && width == Width::Two,
+        }
+    }
+
+    /// The greatest element a subject holds.
+    fn max_element(self) -> u32 {
+        if self.paired {
+            super::MAX_ELEMENT
+        } else {
+            self.width.max_unit()
+        }
+    }
+}
+
+/// Whether the tier takes every instruction of program `prog`: the pattern's (`root`), or a
+/// lookaround's body. `v`-mode class strings stay on the matcher.
+fn program_taken(prog: &[Inst], mode: Mode, root: bool) -> bool {
     let n = prog.len();
     prog.iter().enumerate().all(|(pc, inst)| match inst {
         Inst::Save(0) => root && pc == 0,
         Inst::Save(1) => root && pc == n - 2,
         Inst::Match => pc == n - 1,
-        Inst::Class(class) => class_plan(class, width).is_some(),
+        Inst::Class(class) => class_plan(class, mode).is_some(),
         Inst::Many { rep, .. } => match rep {
-            Rep::Class(class) => class_plan(class, width).is_some(),
+            Rep::Class(class) => class_plan(class, mode).is_some(),
             Rep::Char(_) | Rep::Any => true,
         },
-        Inst::Look { prog: body, .. } => program_taken(body, width, false),
+        Inst::Look { prog: body, .. } | Inst::LookBehind { prog: body, .. } => {
+            program_taken(body, mode, false)
+        }
         // The code compares counts below 2^31 (a count past it takes as many iterations to
         // reach).
         Inst::CountedBranch { min, max, .. } => {
@@ -496,27 +575,29 @@ fn program_taken(prog: &[Inst], width: Width, root: bool) -> bool {
         | Inst::CounterReset(_)
         | Inst::CounterIncr(_)
         | Inst::CheckCountedProgress { .. } => true,
-        Inst::StringSet(_) | Inst::StringSetRepeat { .. } | Inst::LookBehind { .. } => false,
+        Inst::StringSet(_) | Inst::StringSetRepeat { .. } => false,
     })
 }
 
-/// The lookaheads of `prog`, those of their bodies included: the frames the code may keep.
+/// The lookarounds of `prog`, those of their bodies included: the frames the code may keep.
 fn look_count(prog: &[Inst]) -> usize {
     prog.iter()
         .map(|inst| match inst {
-            Inst::Look { prog: body, .. } => 1 + look_count(body),
+            Inst::Look { prog: body, .. } | Inst::LookBehind { prog: body, .. } => {
+                1 + look_count(body)
+            }
             _ => 0,
         })
         .sum()
 }
 
-/// An upper bound on the size of `prog`'s code for `width`, in units of 100 instructions: one
+/// An upper bound on the size of `prog`'s code for `mode`, in units of 100 instructions: one
 /// an instruction, but a class's (or a class loop's) table and ranges, which two-byte code tests
-/// in line, each slot a capture clear restores, a lookahead's frame, body and captures, and each
+/// in line, each slot a capture clear restores, a lookaround's frame, body and captures, and each
 /// group a backreference may compare.
-fn code_units(prog: &[Inst], width: Width) -> usize {
+fn code_units(prog: &[Inst], mode: Mode) -> usize {
     let class = |class: &super::CharClass| {
-        3 + match width {
+        3 + match mode.width {
             Width::One => 0,
             Width::Two => class_elements(class).map_or(0, |set| set.len()),
         }
@@ -531,8 +612,8 @@ fn code_units(prog: &[Inst], width: Width) -> usize {
                 }
             }
             Inst::ClearCaps(lo, hi) => 1 + (hi + 1 - lo),
-            Inst::Look { prog: body, .. } => {
-                2 + code_units(body, width) + groups_inside(body).map_or(0, |(lo, hi)| hi + 1 - lo)
+            Inst::Look { prog: body, .. } | Inst::LookBehind { prog: body, .. } => {
+                2 + code_units(body, mode) + groups_inside(body).map_or(0, |(lo, hi)| hi + 1 - lo)
             }
             Inst::BackrefAlt(groups) => 1 + groups.len(),
             _ => 1,
@@ -572,6 +653,7 @@ fn compile(re: &Regex, width: Width) -> Option<NativeCode> {
     Some(NativeCode {
         executable,
         width,
+        paired: plan.paired,
         slots: plan.slots,
         entry,
     })
@@ -608,13 +690,15 @@ fn assemble(plan: &Plan) -> Option<Vec<u8>> {
     let helpers = Helpers {
         poll: helper_poll as *const () as usize,
         grow: helper_grow as *const () as usize,
-        next_candidate: match plan.width {
-            Width::One => helper_next_candidate::<&[u8]> as *const () as usize,
-            Width::Two => helper_next_candidate::<&[u16]> as *const () as usize,
+        next_candidate: match (plan.width, plan.paired) {
+            (Width::One, _) => helper_next_candidate::<&[u8]> as *const () as usize,
+            (Width::Two, false) => helper_next_candidate::<&[u16]> as *const () as usize,
+            (Width::Two, true) => helper_next_candidate::<super::Paired> as *const () as usize,
         },
-        backref_fold: match plan.width {
-            Width::One => helper_backref_fold::<&[u8]> as *const () as usize,
-            Width::Two => helper_backref_fold::<&[u16]> as *const () as usize,
+        backref_fold: match (plan.width, plan.paired) {
+            (Width::One, _) => helper_backref_fold::<&[u8]> as *const () as usize,
+            (Width::Two, false) => helper_backref_fold::<&[u16]> as *const () as usize,
+            (Width::Two, true) => helper_backref_fold::<super::Paired> as *const () as usize,
         },
     };
     #[cfg(all(target_arch = "aarch64", unix))]
@@ -652,12 +736,16 @@ enum Test {
     Class(Rc<ClassPlan>),
 }
 
-/// A class's tests: the byte table of its elements below 256, its ranges of two-byte elements
-/// above them, and its elements themselves when a subject of the width can hold at most two.
+/// A class's tests: the byte table of its elements below 256, its ranges of elements above them
+/// (two-byte units, or in a paired mode any element), and its elements themselves when a subject
+/// can hold at most two.
 struct ClassPlan {
     lut: [u8; 256],
     high: Vec<(u32, u32)>,
     few: Option<Vec<u32>>,
+    /// The class holds no surrogate and no element past the BMP, so in a paired mode it matches
+    /// only elements of one unit that is no surrogate: a unit test decides it.
+    units: bool,
 }
 
 /// The elements of a class its code may compare one by one, as V8 compares a character's case-
@@ -665,31 +753,35 @@ struct ClassPlan {
 /// tables take fewer instructions.
 const MAX_FEW: usize = 2;
 
-/// `class`'s tests for `width`, or `None` if it has too many ranges to test in line.
-fn class_plan(class: &super::CharClass, width: Width) -> Option<ClassPlan> {
+/// `class`'s tests for `mode`, or `None` if it has too many ranges to test in line.
+fn class_plan(class: &super::CharClass, mode: Mode) -> Option<ClassPlan> {
     let mut lut = [0u8; 256];
     for (element, member) in lut.iter_mut().enumerate() {
         *member = u8::from(class.matches(element as u32, false, false));
     }
     let elements = class_elements(class);
-    let high = match width {
+    let max = mode.max_element();
+    let high = match mode.width {
         Width::One => Vec::new(),
         Width::Two => elements
             .as_ref()?
             .iter()
             .copied()
             .filter(|&(_, hi)| hi >= 0x100)
-            .filter(|&(lo, _)| lo <= 0xffff)
-            .map(|(lo, hi)| (lo.max(0x100), hi.min(0xffff)))
+            .filter(|&(lo, _)| lo <= max)
+            .map(|(lo, hi)| (lo.max(0x100), hi.min(max)))
             .collect(),
     };
+    let units = elements
+        .as_ref()
+        .is_some_and(|set| super::elements_disjoint(set, &[(0xd800, 0xdfff), (0x1_0000, max)]));
     // The elements a subject of the width can hold: a class closed over case keeps only those of
     // its letters the width has, as V8's `GetCaseIndependentLetters` drops the ones a one-byte
     // subject cannot hold.
     let few = elements.and_then(|set| {
         let mut few = Vec::new();
         for (lo, hi) in set {
-            for element in lo..=hi.min(width.max_unit()) {
+            for element in lo..=hi.min(max) {
                 if few.len() == MAX_FEW {
                     return None;
                 }
@@ -698,7 +790,12 @@ fn class_plan(class: &super::CharClass, width: Width) -> Option<ClassPlan> {
         }
         Some(few)
     });
-    (high.len() <= MAX_HIGH_RANGES).then_some(ClassPlan { lut, high, few })
+    (high.len() <= MAX_HIGH_RANGES).then_some(ClassPlan {
+        lut,
+        high,
+        few,
+        units,
+    })
 }
 
 /// How a test of E against a set of elements `few` (see [`ClassPlan::few`]) is made, if not by
@@ -759,17 +856,20 @@ struct Flags {
     dotall: bool,
 }
 
-/// A program the generator emits: the pattern's, or a lookahead's body.
+/// A program the generator emits: the pattern's, or a lookaround's body.
 struct Program<'a> {
     prog: &'a [Inst],
     /// The pcs a branch or a resumed record reaches, which begin a run of templates.
     targets: Vec<bool>,
     /// The flags in effect at each pc.
     flags: Vec<Flags>,
+    /// A lookbehind's body, compiled from the reversed pattern: it reads the subject backward,
+    /// each element ending where the position is, as the matcher's `back` direction does.
+    back: bool,
 }
 
 impl<'a> Program<'a> {
-    fn new(prog: &'a [Inst], entry: Flags) -> Self {
+    fn new(prog: &'a [Inst], entry: Flags, back: bool) -> Self {
         let mut targets = vec![false; prog.len() + 1];
         let mut flags = Vec::with_capacity(prog.len());
         let mut scopes = vec![entry];
@@ -786,9 +886,11 @@ impl<'a> Program<'a> {
                     targets[*body] = true;
                     targets[*exit] = true;
                 }
-                // Loops resume after themselves, and a negative lookahead's failed body at the
+                // Loops resume after themselves, and a negative lookaround's failed body at the
                 // instruction after it.
-                Inst::Many { .. } | Inst::Look { .. } => targets[pc + 1] = true,
+                Inst::Many { .. } | Inst::Look { .. } | Inst::LookBehind { .. } => {
+                    targets[pc + 1] = true
+                }
                 Inst::PushFlags(icase, multiline, dotall) => scopes.push(Flags {
                     icase: icase.unwrap_or(outer.icase),
                     multiline: multiline.unwrap_or(outer.multiline),
@@ -804,16 +906,18 @@ impl<'a> Program<'a> {
             prog,
             targets,
             flags,
+            back,
         }
     }
 }
 
-/// A lookahead's plan.
+/// A lookaround's plan.
 struct LookPlan {
     /// Its body's program.
     body: usize,
-    /// The elements the body tests from the position on, when it does nothing else: the
-    /// lookahead tests them in place, with no frame.
+    /// The units the body tests from the position on (before it, for a lookbehind), when it
+    /// tests elements of fixed widths and does nothing else: the lookaround tests them in place,
+    /// with no frame.
     simple: Option<u32>,
     /// The slot that keeps the offset of its frame record in the stack.
     frame: usize,
@@ -824,30 +928,19 @@ struct LookPlan {
     groups: Option<(usize, usize)>,
 }
 
-/// The elements a lookahead's body tests in place when it is only elements (a loop of one
-/// element with a fixed count is as many), or `None`.
-fn simple_body(body: &[Inst]) -> Option<u32> {
-    let (last, elements) = body.split_last()?;
-    if !matches!(last, Inst::Match) {
-        return None;
-    }
-    let mut count = 0u32;
-    for inst in elements {
-        count += match inst {
-            Inst::Char(_) | Inst::Any | Inst::Class(_) => 1,
-            Inst::Many { min, max, .. } if Some(*min) == *max && *min <= MAX_SIMPLE_RUN => {
-                *min as u32
-            }
-            _ => return None,
-        };
-    }
-    (count <= MAX_SIMPLE_RUN as u32).then_some(count)
-}
-
-/// Elements a lookahead tests in place (see [`simple_body`]).
+/// Units a lookaround tests in place (see [`Plan::simple_body`]).
 const MAX_SIMPLE_RUN: usize = 16;
 
-/// The capture groups whose slots `prog` writes, `lo..=hi`, its lookaheads' included.
+/// How an element test reads the subject (see [`Plan::shape`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape {
+    /// Units at fixed offsets: one, or a character past the BMP's two in a paired mode.
+    Units(u32),
+    /// An element of one unit or of a surrogate pair's two, decoded where it is (a paired mode).
+    Decoded,
+}
+
+/// The capture groups whose slots `prog` writes, `lo..=hi`, its lookarounds' included.
 fn groups_inside(prog: &[Inst]) -> Option<(usize, usize)> {
     let mut span: Option<(usize, usize)> = None;
     let mut add = |lo: usize, hi: usize| {
@@ -857,7 +950,7 @@ fn groups_inside(prog: &[Inst]) -> Option<(usize, usize)> {
         match inst {
             Inst::Save(slot) => add(slot / 2, slot / 2),
             Inst::ClearCaps(lo, hi) => add(*lo, *hi),
-            Inst::Look { prog: body, .. } => {
+            Inst::Look { prog: body, .. } | Inst::LookBehind { prog: body, .. } => {
                 if let Some((lo, hi)) = groups_inside(body) {
                     add(lo, hi);
                 }
@@ -871,10 +964,17 @@ fn groups_inside(prog: &[Inst]) -> Option<(usize, usize)> {
 /// What the generator needs to know of a pattern, for one width.
 struct Plan<'a> {
     width: Width,
-    /// The pattern's program (0) and its lookaheads' bodies.
+    /// Unicode mode over two-byte subjects: an element is a unit or a surrogate pair's two.
+    paired: bool,
+    /// Unicode mode: `\b` under `i` takes in the characters that fold into word characters.
+    unicode: bool,
+    /// The pattern's program (0) and its lookarounds' bodies.
     progs: Vec<Program<'a>>,
-    /// The lookaheads, by program and pc.
+    /// The lookarounds, by program and pc.
     looks: std::collections::HashMap<(usize, usize), LookPlan>,
+    /// The capture groups a lookbehind's body captures, reading backward: their start may be
+    /// past their end.
+    reversed: std::collections::HashSet<usize>,
     /// Capture slots (two per group, group 0's included); the marks follow them, then the
     /// lookaheads' frames.
     nslots: usize,
@@ -912,8 +1012,11 @@ impl<'a> Plan<'a> {
         };
         let mut plan = Plan {
             width,
+            paired: Mode::of(re, width).paired,
+            unicode: re.unicode,
             progs: Vec::new(),
             looks: Default::default(),
+            reversed: Default::default(),
             nslots,
             slots: nslots + re.nmarks,
             wide: nslots > 64,
@@ -930,36 +1033,99 @@ impl<'a> Plan<'a> {
             multiline: re.multiline,
             dotall: re.dotall,
         };
-        plan.add_program(&re.prog, entry);
+        plan.add_program(&re.prog, entry, false);
         plan
     }
 
-    /// Add `prog`, entered with `entry`'s flags, and its lookaheads' bodies, returning its index.
-    fn add_program(&mut self, prog: &'a [Inst], entry: Flags) -> usize {
+    fn mode(&self) -> Mode {
+        Mode {
+            width: self.width,
+            paired: self.paired,
+        }
+    }
+
+    /// Add `prog`, entered with `entry`'s flags and reading backward if `back`, and its
+    /// lookarounds' bodies, returning its index.
+    fn add_program(&mut self, prog: &'a [Inst], entry: Flags, back: bool) -> usize {
         let id = self.progs.len();
-        self.progs.push(Program::new(prog, entry));
-        for (pc, inst) in prog.iter().enumerate() {
-            if let Inst::Look { prog: body, .. } = inst {
-                let body = &body[..];
-                let flags = self.progs[id].flags[pc];
-                let simple = simple_body(body);
-                let frame = self.slots;
-                if simple.is_none() {
-                    self.slots += 1;
+        self.progs.push(Program::new(prog, entry, back));
+        if back {
+            for inst in prog {
+                if let Inst::Save(slot) = inst {
+                    self.reversed.insert(slot / 2);
                 }
-                let body_id = self.add_program(body, flags);
-                self.looks.insert(
-                    (id, pc),
-                    LookPlan {
-                        body: body_id,
-                        simple,
-                        frame,
-                        groups: groups_inside(body),
-                    },
-                );
             }
         }
+        for (pc, inst) in prog.iter().enumerate() {
+            let (body, body_back) = match inst {
+                Inst::Look { prog: body, .. } => (body, false),
+                Inst::LookBehind { prog: body, .. } => (body, true),
+                _ => continue,
+            };
+            let flags = self.progs[id].flags[pc];
+            let body_id = self.add_program(&body[..], flags, body_back);
+            let simple = self.simple_body(body_id);
+            let frame = self.slots;
+            if simple.is_none() {
+                self.slots += 1;
+            }
+            self.looks.insert(
+                (id, pc),
+                LookPlan {
+                    body: body_id,
+                    simple,
+                    frame,
+                    groups: groups_inside(body),
+                },
+            );
+        }
         id
+    }
+
+    /// The units a lookaround's body `id` tests in place when it tests only elements of fixed
+    /// widths (a loop of one element with a fixed count is as many), or `None`.
+    fn simple_body(&self, id: usize) -> Option<u32> {
+        let program = &self.progs[id];
+        let (last, elements) = program.prog.split_last()?;
+        if !matches!(last, Inst::Match) {
+            return None;
+        }
+        let mut units = 0u32;
+        for (pc, inst) in elements.iter().enumerate() {
+            let (test, count) = match inst {
+                Inst::Char(_) | Inst::Any | Inst::Class(_) => (self.element_test(id, pc), 1),
+                Inst::Many { rep, min, max, .. }
+                    if Some(*min) == *max && *min <= MAX_SIMPLE_RUN =>
+                {
+                    (self.rep_test(rep, program.flags[pc]), *min as u32)
+                }
+                _ => return None,
+            };
+            let Shape::Units(width) = self.shape(&test) else {
+                return None;
+            };
+            units += width * count;
+        }
+        (units <= MAX_SIMPLE_RUN as u32).then_some(units)
+    }
+
+    /// How `test` reads the subject: a unit, unless in a paired mode it may match a surrogate
+    /// or an element past the BMP (a character past it is its pair's two units, fixed), which it
+    /// decodes. A test that matches only BMP elements other than surrogates fails on a
+    /// surrogate's unit, as on the pair it begins or ends, so its unit decides it, as V8's BMP
+    /// alternative of a class tests units (`AddBmpCharacters`, regexp-compiler-tonode.cc).
+    fn shape(&self, test: &Test) -> Shape {
+        if !self.paired {
+            return Shape::Units(1);
+        }
+        match test {
+            Test::Char(c) if *c > 0xffff => Shape::Units(2),
+            Test::Char(c) if (0xd800..=0xdfff).contains(c) => Shape::Decoded,
+            Test::Char(_) => Shape::Units(1),
+            Test::Any { .. } => Shape::Decoded,
+            Test::Class(class) if class.units => Shape::Units(1),
+            Test::Class(_) => Shape::Decoded,
+        }
     }
 
     fn class(&self, class: &Rc<super::CharClass>) -> Rc<ClassPlan> {
@@ -968,7 +1134,7 @@ impl<'a> Plan<'a> {
             .borrow_mut()
             .entry(key)
             .or_insert_with(|| {
-                Rc::new(class_plan(class, self.width).expect("declined classes never compile"))
+                Rc::new(class_plan(class, self.mode()).expect("declined classes never compile"))
             })
             .clone()
     }
@@ -1170,7 +1336,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         if plan.only {
             self.m.jump(no_match);
         } else {
-            self.m.next_start(plan.lead_run, no_match);
+            self.m.next_start(plan.lead_run, plan.paired, no_match);
             self.m.jump(cand);
         }
         let mut emitted = 0;
@@ -1208,7 +1374,14 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         self.m.bind(self.pcs[id][pc]);
         match &program.prog[pc] {
             Inst::Char(_) | Inst::Any | Inst::Class(_) => {
-                // A straight run of elements checks the room once and tests each at its offset.
+                let first = plan.element_test(id, pc);
+                if plan.shape(&first) == Shape::Decoded {
+                    self.emit_decoded(&first, program.back, bt);
+                    return pc + 1;
+                }
+                // A straight run of elements of fixed widths checks the room once and tests each
+                // at its offset.
+                let mut tests = vec![first];
                 let mut end = pc + 1;
                 while end < program.prog.len()
                     && !program.targets[end]
@@ -1217,16 +1390,14 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                         Inst::Char(_) | Inst::Any | Inst::Class(_)
                     )
                 {
+                    let test = plan.element_test(id, end);
+                    if plan.shape(&test) == Shape::Decoded {
+                        break;
+                    }
+                    tests.push(test);
                     end += 1;
                 }
-                let k = (end - pc) as u32;
-                self.m.branch_room_lt(k, bt);
-                for offset in 0..end - pc {
-                    let test = plan.element_test(id, pc + offset);
-                    self.m.load_elem(offset as i32);
-                    self.emit_test(&test, bt);
-                }
-                self.m.advance(k);
+                self.emit_run(&tests, program.back, bt);
                 return end;
             }
             Inst::Save(slot) => {
@@ -1261,8 +1432,8 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 self.m.jump(self.pcs[id][*target]);
             }
             Inst::Match => {
-                // A lookahead's body ends in its `Match`, which falls through to the
-                // lookahead's success, emitted next (see `emit_look`).
+                // A lookaround's body ends in its `Match`, which falls through to the
+                // lookaround's success, emitted next (see `emit_look`).
                 if id == 0 {
                     self.m.jump(self.matched);
                 }
@@ -1291,7 +1462,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                     self.m.branch_at_end(false, bt);
                 }
             }
-            Inst::WordBoundary(want) => self.emit_word_boundary(*want),
+            Inst::WordBoundary(want) => self.emit_word_boundary(*want, flags.icase && plan.unicode),
             Inst::Many {
                 rep,
                 min,
@@ -1306,10 +1477,14 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                     self.m.jump(bt);
                     return pc + 1;
                 };
-                if *greedy {
-                    self.emit_greedy(id, pc, &test, min, max, *atomic);
-                } else {
-                    self.emit_lazy(id, pc, &test, min, max);
+                // A loop of decoded elements counts them (a surrogate pair is one); a character
+                // past the BMP repeats as such an element too.
+                let decoded = plan.shape(&test) != Shape::Units(1);
+                match (*greedy, decoded) {
+                    (true, false) => self.emit_greedy(id, pc, &test, min, max, *atomic),
+                    (true, true) => self.emit_greedy_decoded(id, pc, &test, min, max, *atomic),
+                    (false, false) => self.emit_lazy(id, pc, &test, min, max),
+                    (false, true) => self.emit_lazy_decoded(id, pc, &test, min, max),
                 }
             }
             Inst::SetMark(mark) => self.emit_mark_write(plan.nslots + mark, Value::Pos),
@@ -1330,12 +1505,22 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                     self.m.bind(skip);
                 }
             }
-            Inst::Look { negate, .. } => self.emit_look(id, pc, *negate),
+            Inst::Look { negate, .. } | Inst::LookBehind { negate, .. } => {
+                self.emit_look(id, pc, *negate)
+            }
             Inst::Backref(group) => {
                 // A reference to a group the pattern does not have matches empty, as the
                 // matcher's does.
                 if *group != 0 && 2 * group + 1 < plan.nslots {
-                    self.m.backref(2 * group, flags.icase, bt);
+                    let reversed = plan.reversed.contains(group);
+                    self.m.backref(
+                        2 * group,
+                        flags.icase,
+                        program.back,
+                        plan.paired,
+                        reversed,
+                        bt,
+                    );
                 }
             }
             Inst::BackrefAlt(groups) => {
@@ -1348,7 +1533,15 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                     let next = self.m.label();
                     self.m.branch_slot_unset(2 * group, next);
                     self.m.branch_slot_unset(2 * group + 1, next);
-                    self.m.backref(2 * group, flags.icase, bt);
+                    let reversed = plan.reversed.contains(&group);
+                    self.m.backref(
+                        2 * group,
+                        flags.icase,
+                        program.back,
+                        plan.paired,
+                        reversed,
+                        bt,
+                    );
                     self.m.jump(done);
                     self.m.bind(next);
                 }
@@ -1394,7 +1587,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 self.m.branch_slot_eq_pos(plan.nslots + mark, bt);
                 self.m.bind(skip);
             }
-            Inst::StringSet(_) | Inst::StringSetRepeat { .. } | Inst::LookBehind { .. } => {
+            Inst::StringSet(_) | Inst::StringSetRepeat { .. } => {
                 unreachable!("declined instruction in a native program")
             }
         }
@@ -1405,12 +1598,13 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     /// `Matcher::branch`, a first branch that fails at once is skipped, and the second is
     /// recorded only if it may match here.
     fn emit_split(&mut self, id: usize, pc: usize, first: usize, second: usize) {
+        let back = self.plan.progs[id].back;
         if let Some(test) = self.plan.first_test(id, first) {
-            self.emit_may_match(&test, self.pcs[id][second]);
+            self.emit_may_match(&test, self.pcs[id][second], back);
         }
         let skip = self.m.label();
         if let Some(test) = self.plan.first_test(id, second) {
-            self.emit_may_match(&test, skip);
+            self.emit_may_match(&test, skip, back);
         }
         let alt = self.stub(Stub::Alt(id, second));
         self.m.push(alt, Operand::Pos);
@@ -1432,35 +1626,32 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         self.m.store_slot(slot, value);
     }
 
-    /// A lookahead at `pc` of program `id`, as the matcher's `LookFrame` runs it: its body in
-    /// line, above a frame record of the position and CHOICES, which counts it as a choice so
-    /// that every write in the body has an undo record. The body's success cuts the stack back
-    /// to the record, discarding the body's records (a lookahead is atomic), and restores the
-    /// position; its failure pops the frame record. A positive lookahead's captures stay set,
-    /// and are unset when the code backtracks past it; a negative one's are always unset after
-    /// it. A body of elements alone is tested in place.
+    /// A lookaround at `pc` of program `id`, as the matcher's `LookFrame` runs it: its body in
+    /// line (a lookbehind's reading backward), above a frame record of the position and CHOICES,
+    /// which counts it as a choice so that every write in the body has an undo record. The
+    /// body's success cuts the stack back to the record, discarding the body's records (a
+    /// lookaround is atomic), and restores the position; its failure pops the frame record. A
+    /// positive lookaround's captures stay set, and are unset when the code backtracks past it;
+    /// a negative one's are always unset after it. A body of elements of fixed widths alone is
+    /// tested in place.
     fn emit_look(&mut self, id: usize, pc: usize, negate: bool) {
         let plan = self.plan;
         let look = &plan.looks[&(id, pc)];
         let bt = self.bt;
-        if let Some(count) = look.simple {
+        if let Some(units) = look.simple {
             let body = &plan.progs[look.body];
             let fail = if negate { self.m.label() } else { bt };
-            if count > 0 {
-                self.m.branch_room_lt(count, fail);
+            if units > 0 {
+                self.emit_room(units, body.back, fail);
             }
-            let mut offset = 0i32;
+            let mut offset = 0u32;
             for (bpc, inst) in body.prog[..body.prog.len() - 1].iter().enumerate() {
                 let (test, repeat) = match inst {
-                    Inst::Many { rep, min, .. } => {
-                        (plan.rep_test(rep, body.flags[bpc]), *min as i32)
-                    }
+                    Inst::Many { rep, min, .. } => (plan.rep_test(rep, body.flags[bpc]), *min),
                     _ => (plan.element_test(look.body, bpc), 1),
                 };
                 for _ in 0..repeat {
-                    self.m.load_elem(offset);
-                    self.emit_test(&test, fail);
-                    offset += 1;
+                    offset += self.emit_test_at(&test, offset, body.back, fail);
                 }
             }
             if negate {
@@ -1512,7 +1703,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     fn emit_test(&mut self, test: &Test, fail: Label) {
         match test {
             Test::Char(c) => {
-                if *c > self.plan.width.max_unit() {
+                if *c > self.plan.mode().max_element() {
                     self.m.jump(fail);
                 } else {
                     self.m.branch_elem(Cond::Ne, *c, fail);
@@ -1585,11 +1776,104 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         self.emit_ranges(&ranges[..mid], ok, fail);
     }
 
-    /// Go to `fail` unless an element at POS passes `test`.
-    fn emit_may_match(&mut self, test: &Test, fail: Label) {
-        self.m.branch_at_end(true, fail);
-        self.m.load_elem(0);
+    /// Go to `fail` unless an element at POS (before it, reading backward) passes `test`.
+    fn emit_may_match(&mut self, test: &Test, fail: Label, back: bool) {
+        match self.plan.shape(test) {
+            Shape::Units(1) => {
+                if back {
+                    self.m.branch_at_start(true, fail);
+                    self.m.load_elem(-1);
+                } else {
+                    self.m.branch_at_end(true, fail);
+                    self.m.load_elem(0);
+                }
+                self.emit_test(test, fail);
+            }
+            Shape::Units(units) => {
+                self.emit_room(units, back, fail);
+                self.emit_test_at(test, 0, back, fail);
+            }
+            Shape::Decoded => {
+                self.m.branch_at_edge(back, fail);
+                self.m.decode_elem(back);
+                self.emit_test(test, fail);
+            }
+        }
+    }
+
+    /// Go to `fail` if fewer than `units` units are left past POS (before it, reading backward).
+    fn emit_room(&mut self, units: u32, back: bool, fail: Label) {
+        if back {
+            self.m.branch_room_back_lt(units, fail);
+        } else {
+            self.m.branch_room_lt(units, fail);
+        }
+    }
+
+    /// Test the element of fixed width `test` at `offset` units from POS (the element ending
+    /// that far before it, reading backward), which the caller has checked the subject holds,
+    /// returning its width: a unit, or a character past the BMP's two.
+    fn emit_test_at(&mut self, test: &Test, offset: u32, back: bool, fail: Label) -> u32 {
+        let at = |unit: u32| -> i32 {
+            if back {
+                -(unit as i32) - 1
+            } else {
+                unit as i32
+            }
+        };
+        match (self.plan.shape(test), test) {
+            (Shape::Units(2), Test::Char(c)) => {
+                // A character past the BMP is its surrogate pair: lead, then trail.
+                let lead = 0xd800 + ((c - 0x1_0000) >> 10);
+                let trail = 0xdc00 + ((c - 0x1_0000) & 0x3ff);
+                let (first, second) = if back {
+                    (at(offset + 1), at(offset))
+                } else {
+                    (at(offset), at(offset + 1))
+                };
+                self.m.load_elem(first);
+                self.m.branch_elem(Cond::Ne, lead, fail);
+                self.m.load_elem(second);
+                self.m.branch_elem(Cond::Ne, trail, fail);
+                2
+            }
+            _ => {
+                self.m.load_elem(at(offset));
+                self.emit_test(test, fail);
+                1
+            }
+        }
+    }
+
+    /// A straight run of elements of fixed widths: the room checked once, each tested at its
+    /// offset, then the position past them all (before them, reading backward).
+    fn emit_run(&mut self, tests: &[Test], back: bool, fail: Label) {
+        let units: u32 = tests
+            .iter()
+            .map(|test| match self.plan.shape(test) {
+                Shape::Units(units) => units,
+                Shape::Decoded => unreachable!("a decoded element in a run"),
+            })
+            .sum();
+        self.emit_room(units, back, fail);
+        let mut offset = 0;
+        for test in tests {
+            offset += self.emit_test_at(test, offset, back, fail);
+        }
+        if back {
+            self.m.retreat(units);
+        } else {
+            self.m.advance(units);
+        }
+    }
+
+    /// A decoded element (a paired mode): the element at POS, a unit or a surrogate pair (the
+    /// one ending at POS, reading backward), tested, then POS past it.
+    fn emit_decoded(&mut self, test: &Test, back: bool, fail: Label) {
+        self.m.branch_at_edge(back, fail);
+        self.m.decode_elem(back);
         self.emit_test(test, fail);
+        self.m.step_elem(back);
     }
 
     /// Go to `hit` if E is a line terminator.
@@ -1601,15 +1885,23 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         }
     }
 
-    /// Go to `hit` if E is a word character (`[0-9A-Za-z_]`, IsWordChar outside Unicode mode,
-    /// with `i` or without).
-    fn emit_word(&mut self, hit: Label) {
+    /// Go to `hit` if E is a word character: `[0-9A-Za-z_]`, IsWordChar outside Unicode mode
+    /// with `i` or without, and in Unicode mode under `i` (`unicode_icase`) also the long s and
+    /// the Kelvin sign, which fold into it (WordCharacters, as `is_word_ic` has it).
+    fn emit_word(&mut self, hit: Label, unicode_icase: bool) {
         let mut table = [0u8; 256];
         for (element, member) in table.iter_mut().enumerate() {
             *member = u8::from(super::is_word(element as u32));
         }
         let skip = self.m.label();
-        if self.plan.width == Width::Two {
+        if self.plan.width == Width::Two && unicode_icase {
+            let low = self.m.label();
+            self.m.branch_elem(Cond::Lo, 0x100, low);
+            self.m.branch_elem(Cond::Eq, 0x17f, hit);
+            self.m.branch_elem(Cond::Eq, 0x212a, hit);
+            self.m.jump(skip);
+            self.m.bind(low);
+        } else if self.plan.width == Width::Two {
             self.m.branch_elem(Cond::Hs, 0x100, skip);
         }
         let lut = self.m.lut(&table);
@@ -1617,33 +1909,37 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         self.m.bind(skip);
     }
 
-    /// `\b` (`want`) or `\B`: whether the elements before and after POS differ in being word
-    /// characters.
-    fn emit_word_boundary(&mut self, want: bool) {
+    /// `\b` (`want`) or `\B`: whether the units before and after POS differ in being word
+    /// characters (a surrogate is none, as the matcher reads units here).
+    fn emit_word_boundary(&mut self, want: bool, unicode_icase: bool) {
         let ok = self.m.label();
         let (boundary, none) = if want { (ok, self.bt) } else { (self.bt, ok) };
         let before_word = self.m.label();
         let before_not = self.m.label();
         self.m.branch_at_start(true, before_not);
         self.m.load_elem(-1);
-        self.emit_word(before_word);
+        self.emit_word(before_word, unicode_icase);
         self.m.bind(before_not);
         self.m.branch_at_end(true, none);
         self.m.load_elem(0);
-        self.emit_word(boundary);
+        self.emit_word(boundary, unicode_icase);
         self.m.jump(none);
         self.m.bind(before_word);
         self.m.branch_at_end(true, boundary);
         self.m.load_elem(0);
-        self.emit_word(none);
+        self.emit_word(none, unicode_icase);
         self.m.jump(boundary);
         self.m.bind(ok);
     }
 
-    /// Scan from POS while elements pass `test`, at most `max` of them (`None`: to the end),
-    /// leaving POS past the run, polling between stretches.
-    fn emit_scan(&mut self, test: &Test, max: Option<u32>) {
-        self.m.set_limit(max);
+    /// Scan from POS while units pass `test`, at most `max` of them (`None`: to the subject's
+    /// edge), leaving POS past the run (before it, reading backward), polling between stretches.
+    fn emit_scan(&mut self, test: &Test, max: Option<u32>, back: bool) {
+        if back {
+            self.m.set_limit_back(max);
+        } else {
+            self.m.set_limit(max);
+        }
         if matches!(test, Test::Any { dotall: true }) {
             self.m.pos_to_limit();
             return;
@@ -1664,13 +1960,24 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
             _ => false,
         };
         self.m.bind(stretch);
-        self.m.set_stretch_limit();
-        self.m.branch_pos_stretch(Cond::Hs, bound);
-        self.m.bind(scan);
-        self.m.load_elem(0);
-        self.emit_test(test, done);
-        self.m.advance(1);
-        self.m.branch_pos_stretch(Cond::Lo, scan);
+        if back {
+            // Downward: POS above CLIM, the stretch's end, while the run goes on.
+            self.m.set_stretch_limit_back();
+            self.m.branch_pos_stretch(Cond::Ls, bound);
+            self.m.bind(scan);
+            self.m.load_elem(-1);
+            self.emit_test(test, done);
+            self.m.retreat(1);
+            self.m.branch_pos_stretch(Cond::Hi, scan);
+        } else {
+            self.m.set_stretch_limit();
+            self.m.branch_pos_stretch(Cond::Hs, bound);
+            self.m.bind(scan);
+            self.m.load_elem(0);
+            self.emit_test(test, done);
+            self.m.advance(1);
+            self.m.branch_pos_stretch(Cond::Lo, scan);
+        }
         self.m.bind(bound);
         self.m.branch_stretch_is_limit(done);
         self.m.poll_now();
@@ -1680,6 +1987,32 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
             self.m.release_lut();
             self.held = None;
         }
+    }
+
+    /// Scan decoded elements (a paired mode) from POS while they pass `test`, at most `count`
+    /// of them (`None`: to the subject's edge), leaving POS past the run (before it, reading
+    /// backward) and LIM counting down the elements `count` left untaken. Each element counts
+    /// as an event toward the poll.
+    fn emit_elem_scan(&mut self, test: &Test, count: Option<u32>, back: bool) {
+        let next = self.m.label();
+        let done = self.m.label();
+        if let Some(count) = count {
+            self.m.set_count(count);
+        }
+        self.m.bind(next);
+        if count.is_some() {
+            self.m.branch_count(true, done);
+        }
+        self.m.branch_at_edge(back, done);
+        self.m.decode_elem(back);
+        self.emit_test(test, done);
+        self.m.step_elem(back);
+        if count.is_some() {
+            self.m.count_down();
+        }
+        self.m.poll_tick();
+        self.m.jump(next);
+        self.m.bind(done);
     }
 
     /// A greedy loop at `pc` of program `id`: the longest run, and a record to retry shorter ones
@@ -1694,20 +2027,60 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         atomic: bool,
     ) {
         let bt = self.bt;
+        let back = self.plan.progs[id].back;
         self.m.run_start();
-        self.emit_scan(test, max);
+        self.emit_scan(test, max, back);
         // The program's leading loop records where its run ended (see `Regex::lead_run`).
         if self.plan.lead_run && id == 0 && pc == 1 {
             self.m.store_lead();
         }
         if min > 0 {
-            self.m.branch_run(Cond::Lo, min, bt);
+            self.m.branch_run(Cond::Lo, min, back, bt);
         }
         if !atomic {
             let skip = self.m.label();
-            self.m.branch_run(Cond::Ls, min, skip);
+            self.m.branch_run(Cond::Ls, min, back, skip);
             let retry = self.stub(Stub::Greedy(id, pc));
-            self.m.push(retry, Operand::Pack(min));
+            if back {
+                // The record keeps the least end: `min` units before the run's start.
+                self.m.rs_add(min, true);
+                self.m.push(retry, Operand::Pack(0));
+            } else {
+                self.m.push(retry, Operand::Pack(min));
+            }
+            self.m.choices(1);
+            self.m.bind(skip);
+        }
+    }
+
+    /// A greedy loop of decoded elements (a paired mode): `min` elements, where its least end
+    /// is, then the longest run past it, and a record to retry shorter ones, one element (one
+    /// or two units) at a time, unless they are futile.
+    fn emit_greedy_decoded(
+        &mut self,
+        id: usize,
+        pc: usize,
+        test: &Test,
+        min: u32,
+        max: Option<u32>,
+        atomic: bool,
+    ) {
+        let bt = self.bt;
+        let back = self.plan.progs[id].back;
+        if min > 0 {
+            self.emit_elem_scan(test, Some(min), back);
+            self.m.branch_count(false, bt);
+        }
+        self.m.run_start();
+        self.emit_elem_scan(test, max.map(|max| max - min), back);
+        if self.plan.lead_run && id == 0 && pc == 1 {
+            self.m.store_lead();
+        }
+        if !atomic {
+            let skip = self.m.label();
+            self.m.branch_pos_rs(Cond::Eq, skip);
+            let retry = self.stub(Stub::Greedy(id, pc));
+            self.m.push(retry, Operand::Pack(0));
             self.m.choices(1);
             self.m.bind(skip);
         }
@@ -1717,20 +2090,50 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     /// record to retry longer ones ([`Matcher::lazy_next`](super::Matcher::lazy_next)).
     fn emit_lazy(&mut self, id: usize, pc: usize, test: &Test, min: u32, max: Option<u32>) {
         let bt = self.bt;
+        let back = self.plan.progs[id].back;
         self.m.run_start();
         if min > 0 {
-            self.emit_scan(test, Some(min));
-            self.m.branch_run(Cond::Lo, min, bt);
+            self.emit_scan(test, Some(min), back);
+            self.m.branch_run(Cond::Lo, min, back, bt);
         }
         let check = self.m.label();
         let extend = self.m.label();
         self.m.bind(check);
         if let Some(next) = self.plan.first_test(id, pc + 1) {
-            self.emit_may_match(&next, extend);
+            self.emit_may_match(&next, extend, back);
         }
         let skip = self.m.label();
         if let Some(max) = max {
-            self.m.branch_run(Cond::Hs, max, skip);
+            self.m.branch_run(Cond::Hs, max, back, skip);
+        }
+        let retry = self.stub(Stub::Lazy(id, pc));
+        self.m.push(retry, Operand::Pack(0));
+        self.m.choices(1);
+        self.m.bind(skip);
+        self.lazy.push((id, pc, check, extend));
+        self.extend.insert((id, pc), extend);
+    }
+
+    /// A lazy loop of decoded elements (a paired mode): `min` elements, then the shortest run
+    /// whose continuation may match, RS counting its elements (a surrogate pair is one), and a
+    /// record to retry longer ones.
+    fn emit_lazy_decoded(&mut self, id: usize, pc: usize, test: &Test, min: u32, max: Option<u32>) {
+        let bt = self.bt;
+        let back = self.plan.progs[id].back;
+        if min > 0 {
+            self.emit_elem_scan(test, Some(min), back);
+            self.m.branch_count(false, bt);
+        }
+        self.m.set_rs(min);
+        let check = self.m.label();
+        let extend = self.m.label();
+        self.m.bind(check);
+        if let Some(next) = self.plan.first_test(id, pc + 1) {
+            self.emit_may_match(&next, extend, back);
+        }
+        let skip = self.m.label();
+        if let Some(max) = max {
+            self.m.branch_rs(Cond::Hs, max, skip);
         }
         let retry = self.stub(Stub::Lazy(id, pc));
         self.m.push(retry, Operand::Pack(0));
@@ -1744,19 +2147,37 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
     fn emit_lazy_extend(&mut self, id: usize, pc: usize, check: Label, extend: Label) {
         let bt = self.bt;
         let program = &self.plan.progs[id];
+        let back = program.back;
         let Inst::Many { rep, max, .. } = &program.prog[pc] else {
             unreachable!("lazy extension outside its loop");
         };
         let test = self.plan.rep_test(rep, program.flags[pc]);
         let max = max.and_then(|max| u32::try_from(max).ok().filter(|&m| m < 1 << 31));
         self.m.bind(extend);
-        if let Some(max) = max {
-            self.m.branch_run(Cond::Hs, max, bt);
+        if self.plan.shape(&test) != Shape::Units(1) {
+            if let Some(max) = max {
+                self.m.branch_rs(Cond::Hs, max, bt);
+            }
+            self.emit_decoded(&test, back, bt);
+            self.m.rs_add(1, false);
+        } else {
+            if let Some(max) = max {
+                self.m.branch_run(Cond::Hs, max, back, bt);
+            }
+            if back {
+                self.m.branch_at_start(true, bt);
+                self.m.load_elem(-1);
+            } else {
+                self.m.branch_at_end(true, bt);
+                self.m.load_elem(0);
+            }
+            self.emit_test(&test, bt);
+            if back {
+                self.m.retreat(1);
+            } else {
+                self.m.advance(1);
+            }
         }
-        self.m.branch_at_end(true, bt);
-        self.m.load_elem(0);
-        self.emit_test(&test, bt);
-        self.m.advance(1);
         self.m.poll_tick();
         self.m.jump(check);
     }
@@ -1775,26 +2196,44 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
             }
             Stub::Greedy(id, pc) => {
                 // As `Matcher::greedy_retry`: one element shorter at a time, down to the least
-                // end, until the continuation's first test may match.
+                // end, until the continuation's first test may match. Reading backward, the run
+                // ends below its start, and a shorter one ends above.
+                let program = &self.plan.progs[id];
+                let back = program.back;
+                let Inst::Many { rep, .. } = &program.prog[pc] else {
+                    unreachable!("greedy retry outside its loop");
+                };
+                let decoded =
+                    self.plan.shape(&self.plan.rep_test(rep, program.flags[pc])) != Shape::Units(1);
                 self.m.choices(-1);
                 self.m.unpack_op();
                 let retry = self.m.label();
                 let next = self.m.label();
                 self.m.bind(retry);
-                self.m.retreat(1);
+                match (decoded, back) {
+                    // The element before POS, a unit or a pair, comes off the run's end.
+                    (true, _) => {
+                        self.m.decode_elem(!back);
+                        self.m.step_elem(!back);
+                    }
+                    (false, false) => self.m.retreat(1),
+                    (false, true) => self.m.advance(1),
+                }
                 self.m.poll_tick();
                 if let Some(test) = self.plan.first_test(id, pc + 1) {
-                    self.emit_may_match(&test, next);
+                    self.emit_may_match(&test, next, back);
                 }
                 let skip = self.m.label();
-                self.m.branch_pos_rs(Cond::Ls, skip);
+                self.m
+                    .branch_pos_rs(if back { Cond::Hs } else { Cond::Ls }, skip);
                 let again = self.stub(Stub::Greedy(id, pc));
                 self.m.push(again, Operand::Pack(0));
                 self.m.choices(1);
                 self.m.bind(skip);
                 self.m.jump(self.pcs[id][pc + 1]);
                 self.m.bind(next);
-                self.m.branch_pos_rs(Cond::Hi, retry);
+                self.m
+                    .branch_pos_rs(if back { Cond::Lo } else { Cond::Hi }, retry);
                 self.m.jump(bt);
             }
             Stub::Lazy(id, pc) => {
@@ -1804,10 +2243,12 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 self.m.jump(extend);
             }
             Stub::LookFail(id, pc) => {
-                // The body failed: a positive lookahead fails, a negative one holds.
+                // The body failed: a positive lookaround fails, a negative one holds.
                 self.m.unpack_pos_choices();
                 match self.plan.progs[id].prog[pc] {
-                    Inst::Look { negate: true, .. } => self.m.jump(self.pcs[id][pc + 1]),
+                    Inst::Look { negate: true, .. } | Inst::LookBehind { negate: true, .. } => {
+                        self.m.jump(self.pcs[id][pc + 1])
+                    }
                     _ => self.m.jump(bt),
                 }
             }
@@ -1856,6 +2297,7 @@ fn run_native<I: ReInput>(
     scratch: &mut MatchScratch,
 ) -> Result<bool, MatchError> {
     debug_assert_eq!(I::NATIVE_WIDTH, Some(code.width));
+    debug_assert_eq!(I::PAIRED, code.paired);
     let nslots = 2 * (re.ngroups + 1);
     let slots = code.slots;
     if scratch.native_slots.len() != slots || scratch.native_stack.capacity() < INITIAL_RECORDS {
@@ -2070,31 +2512,106 @@ extern "C" fn helper_next_candidate<I: ReInput + NativeInput>(
     }
 }
 
-/// A backreference under `i`: whether the `n` units at `pos` repeat those at `at` under the
-/// legacy Canonicalize (1) or not (0), as the matcher's `backref_end` compares them, polling as
-/// it does; `1 << 63` with a status when the host interrupts the compare.
+/// A backreference under `i`, as the matcher's `backref_end` compares it: the capture's `n`
+/// units at `lo` against the subject's at `pos` (`back`: those ending at `pos`), by
+/// Canonicalize's, or in Unicode mode by simple case folding's, element by element over a paired
+/// subject. Answers the position past the repetition (before it) plus one, 0 when the subject
+/// does not repeat the capture there, or `1 << 63` with a status when the host interrupts the
+/// compare, which polls as the matcher's does.
 extern "C" fn helper_backref_fold<I: ReInput + NativeInput>(
     ctx: *mut NativeCtx,
-    at: usize,
+    lo: usize,
     pos: usize,
     n: usize,
+    back: u64,
 ) -> u64 {
     // SAFETY: the generated code passes the context of the running call, whose subject has
-    // `I`'s width, and spans it checked are in the subject.
+    // `I`'s width, and a capture span it holds.
     let ctx = unsafe { &*ctx };
     let control = unsafe { &*ctx.control };
+    let re = unsafe { &*ctx.regex };
     let input = unsafe { I::from_parts(ctx.subject, ctx.len) };
-    for k in 0..n {
-        if k != 0 && k & super::INTERRUPT_POLL_MASK == 0 {
-            if let Err(error) = super::poll_interrupt(control) {
-                return 1 << 63 | status_of(error);
-            }
+    match backref_fold(input, lo, lo + n, pos, back != 0, re.unicode, control) {
+        Ok(Some(next)) => next as u64 + 1,
+        Ok(None) => 0,
+        Err(error) => 1 << 63 | status_of(error),
+    }
+}
+
+/// [`Matcher::backref_end`](super::Matcher::backref_end) under `i`, for `input` with no matcher:
+/// where a repetition of the capture `a..b` from `pos` ends, if the subject has one.
+fn backref_fold<I: ReInput>(
+    input: I,
+    a: usize,
+    b: usize,
+    pos: usize,
+    back: bool,
+    unicode: bool,
+    control: &crate::RuntimeInterrupt,
+) -> Result<Option<usize>, MatchError> {
+    let poll = |index: usize| {
+        if index == 0 || index & super::INTERRUPT_POLL_MASK != 0 {
+            Ok(())
+        } else {
+            super::poll_interrupt(control)
         }
-        if !super::chars_eq(input.at(pos + k), input.at(at + k), true, false) {
-            return 0;
+    };
+    let same = |x: u32, y: u32| super::chars_eq(x, y, true, unicode);
+    if I::PAIRED {
+        // `backref_end_by_elements`: case-insensitively equal code points need not take as
+        // many units.
+        let mut len = 0usize;
+        let mut at = a;
+        while at < b {
+            at = input.next_elem(at).1;
+            len += 1;
+        }
+        let start = if back {
+            let mut start = pos;
+            for _ in 0..len {
+                if start == 0 {
+                    return Ok(None);
+                }
+                start = input.prev_elem(start).1;
+            }
+            start
+        } else {
+            pos
+        };
+        let (mut subject, mut captured) = (start, a);
+        for index in 0..len {
+            poll(index)?;
+            if subject >= input.len() {
+                return Ok(None);
+            }
+            let (found, after) = input.next_elem(subject);
+            let (expected, next) = input.next_elem(captured);
+            if !same(found, expected) {
+                return Ok(None);
+            }
+            (subject, captured) = (after, next);
+        }
+        return Ok(Some(if back { start } else { subject }));
+    }
+    let n = b - a;
+    let start = if back {
+        let Some(start) = pos.checked_sub(n) else {
+            return Ok(None);
+        };
+        start
+    } else {
+        if pos + n > input.len() {
+            return Ok(None);
+        }
+        pos
+    };
+    for index in 0..n {
+        poll(index)?;
+        if !same(input.at(start + index), input.at(a + index)) {
+            return Ok(None);
         }
     }
-    1
+    Ok(Some(if back { pos - n } else { pos + n }))
 }
 
 /// The subjects the tier runs on, rebuilt from the parts the context keeps.
@@ -2113,6 +2630,12 @@ impl NativeInput for &[u8] {
 impl NativeInput for &[u16] {
     unsafe fn from_parts(subject: *const u8, len: usize) -> Self {
         std::slice::from_raw_parts(subject as *const u16, len)
+    }
+}
+
+impl NativeInput for super::Paired<'_> {
+    unsafe fn from_parts(subject: *const u8, len: usize) -> Self {
+        super::Paired(std::slice::from_raw_parts(subject as *const u16, len))
     }
 }
 

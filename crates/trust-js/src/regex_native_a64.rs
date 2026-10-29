@@ -144,6 +144,27 @@ fn lsr_imm(rd: u32, rn: u32, shift: u32) -> u32 {
     0xd340_0000 | shift << 16 | 63 << 10 | rn << 5 | rd
 }
 
+/// `lsr wd, wn, #shift`.
+fn lsr_w(rd: u32, rn: u32, shift: u32) -> u32 {
+    if shift >= 32 {
+        return UNENCODABLE;
+    }
+    0x5300_0000 | shift << 16 | 31 << 10 | rn << 5 | rd
+}
+
+/// `csinc xd, xn, xm, cond`: `cinc xd, xn, cond'` and `cset xd, cond'` for the inverse `cond'`.
+fn csinc(rd: u32, rn: u32, rm: u32, cond: Cond) -> u32 {
+    0x9a80_0400 | rm << 16 | cond_code(cond) << 12 | rn << 5 | rd
+}
+
+/// `cmp wn, #imm12, lsl #12`.
+fn cmp_imm_lsl12(rn: u32, imm12: u32) -> u32 {
+    if imm12 >= 1 << 12 {
+        return UNENCODABLE;
+    }
+    0x7140_0000 | imm12 << 10 | rn << 5 | ZR
+}
+
 /// `orr xd, xn, #(1 << bit)`: a logical immediate of one set bit.
 fn orr_bit(rd: u32, rn: u32, bit: u32) -> u32 {
     if bit >= 64 {
@@ -572,8 +593,8 @@ impl Asm {
             self.mov_imm(true, 0, STATUS_EXHAUSTED);
             self.b(self.exit);
         }
-        // A backreference under `i`: the helper compares the x11 units at the position with
-        // those at x10 (`helper_backref_fold`), answering in x0.
+        // A backreference under `i`: the helper compares the x11 units at x10 with the subject
+        // at the position, backward if x12 is nonzero (`helper_backref_fold`), answering in x0.
         let backref = self.backref_routine;
         if self.referenced(backref) {
             self.bind(backref);
@@ -582,6 +603,7 @@ impl Asm {
             self.mov(1, OP);
             self.mov(2, POS);
             self.mov(3, RS);
+            self.mov(4, LIM);
             self.ldr_literal(IP0, self.helpers.backref_fold as u64);
             self.emit(blr(IP0));
             self.restore_scratch();
@@ -701,6 +723,11 @@ impl Masm for Asm {
         self.b_cond(Cond::Lo, label);
     }
 
+    fn branch_room_back_lt(&mut self, k: u32, label: Label) {
+        self.cmp_any(true, POS, k);
+        self.b_cond(Cond::Lo, label);
+    }
+
     fn branch_at_start(&mut self, at: bool, label: Label) {
         self.cbz(true, !at, POS, label);
     }
@@ -758,6 +785,63 @@ impl Masm for Asm {
                 ldrb_reg(E, ADDR, IP1)
             });
         }
+    }
+
+    fn decode_elem(&mut self, back: bool) {
+        debug_assert_eq!(self.width, Width::Two);
+        // A lead surrogate's unit is 0x36 << 10 up, a trail's 0x37 << 10 up; a pair's element is
+        // 0x10000 + (lead - 0xd800) << 10 + (trail - 0xdc00), (lead << 10) + trail - 0x35fdc00.
+        let done = self.label();
+        if back {
+            // sub x16, x21, #1; ldrh w9, [x19, x16, lsl #1]: the unit before POS, a trail?
+            self.emit(sub_imm(true, IP0, POS, 1));
+            self.emit(ldrh_reg_scaled(E, SUBJ, IP0));
+            self.emit(lsr_w(IP1, E, 10));
+            self.emit(subs_imm(false, ZR, IP1, 0x37));
+            self.b_cond(Cond::Ne, done);
+            // A lead before it?
+            self.cbz(true, false, IP0, done);
+            self.emit(sub_imm(true, IP0, IP0, 1));
+            self.emit(ldrh_reg_scaled(IP1, SUBJ, IP0));
+            self.emit(lsr_w(IP0, IP1, 10));
+            self.emit(subs_imm(false, ZR, IP0, 0x36));
+            self.b_cond(Cond::Ne, done);
+            // add x9, x9, x17, lsl #10
+            self.emit(add_reg(E, E, IP1, 10));
+        } else {
+            // ldrh w9, [x19, x21, lsl #1]: the unit at POS, a lead?
+            self.emit(ldrh_reg_scaled(E, SUBJ, POS));
+            self.emit(lsr_w(IP0, E, 10));
+            self.emit(subs_imm(false, ZR, IP0, 0x36));
+            self.b_cond(Cond::Ne, done);
+            // A trail after it?
+            self.emit(add_imm(true, IP0, POS, 1, false));
+            self.emit(subs_reg(true, ZR, IP0, LEN));
+            self.b_cond(Cond::Hs, done);
+            self.emit(ldrh_reg_scaled(IP1, SUBJ, IP0));
+            self.emit(lsr_w(IP0, IP1, 10));
+            self.emit(subs_imm(false, ZR, IP0, 0x37));
+            self.b_cond(Cond::Ne, done);
+            // add x9, x17, x9, lsl #10
+            self.emit(add_reg(E, IP1, E, 10));
+        }
+        self.mov_imm(true, IP0, 0x35f_dc00);
+        self.emit(sub_reg(true, E, E, IP0));
+        self.bind(done);
+    }
+
+    fn step_elem(&mut self, back: bool) {
+        // Two units for an element past the BMP (E >= 0x10000), else one.
+        self.emit(cmp_imm_lsl12(E, 0x10));
+        if back {
+            self.emit(csinc(IP0, ZR, ZR, Cond::Lo));
+            self.emit(sub_reg(true, POS, POS, IP0));
+            self.emit(sub_imm(true, POS, POS, 1));
+        } else {
+            self.emit(csinc(POS, POS, POS, Cond::Lo));
+            self.emit(add_imm(true, POS, POS, 1, false));
+        }
+        self.pos_changed();
     }
 
     fn branch_elem(&mut self, cond: Cond, value: u32, label: Label) {
@@ -931,7 +1015,15 @@ impl Masm for Asm {
         self.pos_changed();
     }
 
-    fn backref(&mut self, slot: usize, icase: bool, fail: Label) {
+    fn backref(
+        &mut self,
+        slot: usize,
+        icase: bool,
+        back: bool,
+        paired: bool,
+        reversed: bool,
+        fail: Label,
+    ) {
         // The loop registers: no loop holds them across a backreference.
         debug_assert!(self.held.is_none());
         let done = self.label();
@@ -942,28 +1034,46 @@ impl Masm for Asm {
         self.b_cond(Cond::Eq, done);
         self.emit(adds_imm(true, ZR, RS, 1));
         self.b_cond(Cond::Eq, done);
-        // x11 = its length (a forward program's captures end at or past their start): empty, it
-        // matches empty; else the subject must have as many units left.
-        self.emit(subs_reg(true, RS, RS, OP));
-        self.b_cond(Cond::Eq, done);
-        self.emit(sub_reg(true, IP0, LEN, POS));
-        self.emit(subs_reg(true, ZR, IP0, RS));
-        self.b_cond(Cond::Lo, fail);
+        if reversed {
+            // A lookbehind captures backward, its start past its end: x10 = the span's low end,
+            // x11 = its length; empty, it matches empty.
+            self.emit(subs_reg(true, ZR, RS, OP));
+            self.b_cond(Cond::Eq, done);
+            self.emit(sub_reg(true, IP0, RS, OP));
+            self.emit(sub_reg(true, IP1, OP, RS));
+            self.emit(csel(OP, OP, RS, Cond::Hi));
+            self.emit(csel(RS, IP0, IP1, Cond::Hi));
+        } else {
+            // x11 = its length (a capture made reading forward ends at or past its start):
+            // empty, it matches empty.
+            self.emit(subs_reg(true, RS, RS, OP));
+            self.b_cond(Cond::Eq, done);
+        }
         if icase {
-            // The helper answers 1 if Canonicalize's agree, 0 if not, or bit 63 and a status if
-            // the host interrupted a long compare; compared after the call, as AAPCS64 leaves
-            // the flags undefined across it.
+            // The helper answers the position past the repetition plus one, 0 if it does not
+            // repeat, or bit 63 and a status if the host interrupted a long compare; compared
+            // after the call, as AAPCS64 leaves the flags undefined across it.
             let status = self.label();
+            self.mov_imm(true, LIM, u64::from(back));
             self.bl(self.backref_routine);
             self.emit(subs_imm(true, ZR, 0, 0));
             self.branch(0x5400_0004, status, Fixup::Imm19); // b.mi
             self.b_cond(Cond::Eq, fail);
             self.outlines.push(Outline::Status { slow: status });
-            self.emit(add_reg(POS, POS, RS, 0));
+            self.emit(sub_imm(true, POS, 0, 1));
         } else {
-            // x12 = the capture's first unit, x13 = the position's, and POS past the repetition
-            // (a failure backtracks, which sets it again). Stretches of at most SCAN_STRETCH
-            // units, polled between: x15 counts the stretch's units, x11 those after it.
+            // The subject must have as many units left past the position (before it).
+            if back {
+                self.emit(subs_reg(true, ZR, POS, RS));
+            } else {
+                self.emit(sub_reg(true, IP0, LEN, POS));
+                self.emit(subs_reg(true, ZR, IP0, RS));
+            }
+            self.b_cond(Cond::Lo, fail);
+            // x12 = the capture's first unit, x13 = the subject's, and POS past the repetition
+            // (before it; a failure backtracks, which sets it again). Stretches of at most
+            // SCAN_STRETCH units, polled between: x15 counts the stretch's units, x11 those after
+            // it.
             let shift = match self.width {
                 Width::One => 0,
                 Width::Two => 1,
@@ -972,8 +1082,13 @@ impl Masm for Asm {
             let unit = self.label();
             let end = self.label();
             self.emit(add_reg(LIM, SUBJ, OP, shift));
-            self.emit(add_reg(CLIM, SUBJ, POS, shift));
-            self.emit(add_reg(POS, POS, RS, 0));
+            if back {
+                self.emit(sub_reg(true, POS, POS, RS));
+                self.emit(add_reg(CLIM, SUBJ, POS, shift));
+            } else {
+                self.emit(add_reg(CLIM, SUBJ, POS, shift));
+                self.emit(add_reg(POS, POS, RS, 0));
+            }
             self.bind(stretch);
             self.mov_imm(true, IP1, u64::from(SCAN_STRETCH));
             self.emit(subs_reg(true, ZR, RS, IP1));
@@ -990,6 +1105,23 @@ impl Masm for Asm {
             self.poll_now();
             self.b(stretch);
             self.bind(end);
+            if paired {
+                // The repetition must not end inside a surrogate pair (as the matcher's
+                // `boundary` check and V8's `CheckNotInSurrogatePair` have it): no trail at POS
+                // after a lead.
+                self.cbz(true, false, POS, done);
+                self.emit(subs_reg(true, ZR, POS, LEN));
+                self.b_cond(Cond::Hs, done);
+                self.emit(ldrh_reg_scaled(IP0, SUBJ, POS));
+                self.emit(lsr_w(IP0, IP0, 10));
+                self.emit(subs_imm(false, ZR, IP0, 0x37));
+                self.b_cond(Cond::Ne, done);
+                self.emit(sub_imm(true, IP1, POS, 1));
+                self.emit(ldrh_reg_scaled(IP0, SUBJ, IP1));
+                self.emit(lsr_w(IP0, IP0, 10));
+                self.emit(subs_imm(false, ZR, IP0, 0x36));
+                self.b_cond(Cond::Eq, fail);
+            }
         }
         self.bind(done);
         self.pos_changed();
@@ -1021,10 +1153,42 @@ impl Masm for Asm {
         }
     }
 
+    fn set_limit_back(&mut self, max: Option<u32>) {
+        match max {
+            None => self.mov_imm(true, LIM, 0),
+            Some(max) => {
+                // subs x12, x21, max; csel x12, x12, xzr, hs
+                self.mov_imm(true, IP1, u64::from(max));
+                self.emit(subs_reg(true, LIM, POS, IP1));
+                self.emit(csel(LIM, LIM, ZR, Cond::Hs));
+            }
+        }
+    }
+
     fn set_stretch_limit(&mut self) {
         self.add_any(CLIM, POS, SCAN_STRETCH);
         self.emit(subs_reg(true, ZR, CLIM, LIM));
         self.emit(csel(CLIM, CLIM, LIM, Cond::Lo));
+    }
+
+    fn set_stretch_limit_back(&mut self) {
+        self.mov_imm(true, IP1, u64::from(SCAN_STRETCH));
+        self.emit(subs_reg(true, CLIM, POS, IP1));
+        self.emit(csel(CLIM, CLIM, ZR, Cond::Hs));
+        self.emit(subs_reg(true, ZR, CLIM, LIM));
+        self.emit(csel(CLIM, CLIM, LIM, Cond::Hs));
+    }
+
+    fn set_count(&mut self, count: u32) {
+        self.mov_imm(true, LIM, u64::from(count));
+    }
+
+    fn branch_count(&mut self, zero: bool, label: Label) {
+        self.cbz(true, !zero, LIM, label);
+    }
+
+    fn count_down(&mut self) {
+        self.emit(sub_imm(true, LIM, LIM, 1));
     }
 
     fn set_candidate_bound(&mut self, window: bool) {
@@ -1053,9 +1217,31 @@ impl Masm for Asm {
         self.pos_changed();
     }
 
-    fn branch_run(&mut self, cond: Cond, n: u32, label: Label) {
-        self.emit(sub_reg(true, IP0, POS, RS));
+    fn branch_run(&mut self, cond: Cond, n: u32, back: bool, label: Label) {
+        if back {
+            self.emit(sub_reg(true, IP0, RS, POS));
+        } else {
+            self.emit(sub_reg(true, IP0, POS, RS));
+        }
         self.cmp_any(true, IP0, n);
+        self.b_cond(cond, label);
+    }
+
+    fn rs_add(&mut self, k: u32, back: bool) {
+        if back {
+            self.mov_imm(true, IP1, u64::from(k));
+            self.emit(sub_reg(true, RS, RS, IP1));
+        } else {
+            self.add_any(RS, RS, k);
+        }
+    }
+
+    fn set_rs(&mut self, value: u32) {
+        self.mov_imm(true, RS, u64::from(value));
+    }
+
+    fn branch_rs(&mut self, cond: Cond, n: u32, label: Label) {
+        self.cmp_any(true, RS, n);
         self.b_cond(cond, label);
     }
 
@@ -1090,11 +1276,27 @@ impl Masm for Asm {
             .push(Outline::CandidateStatus { slow, no_match });
     }
 
-    fn next_start(&mut self, lead: bool, no_match: Label) {
+    fn next_start(&mut self, lead: bool, paired: bool, no_match: Label) {
         self.emit(ldr_imm(IP0, SLOTS, 0));
         self.emit(subs_reg(true, ZR, IP0, LEN));
         self.b_cond(Cond::Hs, no_match);
         self.emit(add_imm(true, POS, IP0, 1, false));
+        if paired {
+            // Past a surrogate pair's two units: a lead at the start, a trail after it.
+            let single = self.label();
+            self.emit(ldrh_reg_scaled(IP1, SUBJ, IP0));
+            self.emit(lsr_w(IP1, IP1, 10));
+            self.emit(subs_imm(false, ZR, IP1, 0x36));
+            self.b_cond(Cond::Ne, single);
+            self.emit(subs_reg(true, ZR, POS, LEN));
+            self.b_cond(Cond::Hs, single);
+            self.emit(ldrh_reg_scaled(IP1, SUBJ, POS));
+            self.emit(lsr_w(IP1, IP1, 10));
+            self.emit(subs_imm(false, ZR, IP1, 0x37));
+            self.b_cond(Cond::Ne, single);
+            self.emit(add_imm(true, POS, POS, 1, false));
+            self.bind(single);
+        }
         if lead {
             self.emit(subs_reg(true, ZR, POS, LEAD));
             self.emit(csel(POS, POS, LEAD, Cond::Hs));
@@ -1274,6 +1476,36 @@ mod tests {
                 add_imm(true, 16, 16, 1, false),
                 0x9100_0610,
                 "add x16, x16, #1",
+            ),
+            // W5b's 3d: surrogate pairs decoded and stepped, backward scans.
+            (lsr_w(16, 9, 10), 0x530a_7d30, "lsr w16, w9, #10"),
+            (lsr_w(17, 17, 10), 0x530a_7e31, "lsr w17, w17, #10"),
+            (
+                add_reg(9, 17, 9, 10),
+                0x8b09_2a29,
+                "add x9, x17, x9, lsl #10",
+            ),
+            (
+                add_reg(9, 9, 17, 10),
+                0x8b11_2929,
+                "add x9, x9, x17, lsl #10",
+            ),
+            (
+                csinc(21, 21, 21, Cond::Lo),
+                0x9a95_36b5,
+                "cinc x21, x21, hs",
+            ),
+            (csinc(16, ZR, ZR, Cond::Lo), 0x9a9f_37f0, "cset x16, hs"),
+            (cmp_imm_lsl12(9, 0x10), 0x7140_413f, "cmp w9, #16, lsl #12"),
+            (
+                csel(12, 12, ZR, Cond::Hs),
+                0x9a9f_218c,
+                "csel x12, x12, xzr, hs",
+            ),
+            (
+                csel(10, 10, 11, Cond::Hi),
+                0x9a8b_814a,
+                "csel x10, x10, x11, hi",
             ),
             (ldr_imm(19, 25, 8), 0xf940_0733, "ldr x19, [x25, #8]"),
             (str_imm(21, 22, 32), 0xf900_12d5, "str x21, [x22, #32]"),

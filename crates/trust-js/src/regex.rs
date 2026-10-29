@@ -5423,6 +5423,14 @@ fn is_trail_surrogate(unit: u16) -> bool {
 
 impl ReInput for Paired<'_> {
     const PAIRED: bool = true;
+    /// Unicode mode's two-byte subjects: the native tier compiles their programs for two-byte
+    /// units, stepping a surrogate pair as one element (see `Regex::unicode`).
+    const NATIVE_WIDTH: Option<native::Width> = Some(native::Width::Two);
+
+    #[inline(always)]
+    fn native_parts(&self) -> (*const u8, usize) {
+        (self.0.as_ptr().cast(), self.0.len())
+    }
 
     #[inline(always)]
     fn len(&self) -> usize {
