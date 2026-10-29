@@ -1938,6 +1938,10 @@ fn host_buffer_data_makes_a_major_collection_due_at_the_next_safepoint() {
             })
             .collect()
     });
+    // The buffers' frames are popped, but the frames the safepoint below builds over them may
+    // leave slots unwritten, and the conservative scan takes a stale buffer address there for a
+    // root: zero them first, as an entry point does (`gc_core::ENTRY_SCRUB_BYTES`).
+    crate::gc_core::scrub_stack(64 << 10);
     assert_eq!(
         major_collections(&engine),
         before,
