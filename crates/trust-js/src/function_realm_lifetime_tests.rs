@@ -58,7 +58,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                     {
                         let record = old.borrow();
                         let binding = record.vars.get("this").expect("global this binding");
-                        assert!(!binding.mutable && !binding.deletable);
+                        assert!(!binding.mutable() && !binding.deletable());
                         assert!(crate::value::Gc::ptr_eq(
                             &binding.value().as_obj().expect("original global"),
                             &i.global
@@ -90,7 +90,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                     {
                         let record = i.global_env.borrow();
                         let binding = record.vars.get("this").expect("replacement this binding");
-                        assert!(!binding.mutable && !binding.deletable);
+                        assert!(!binding.mutable() && !binding.deletable());
                         assert!(crate::value::Gc::ptr_eq(
                             &binding.value().as_obj().expect("same Realm global"),
                             &i.global

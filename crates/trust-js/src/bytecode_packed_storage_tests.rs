@@ -5,16 +5,28 @@ use super::*;
 
 #[test]
 fn initialized_and_tdz_binding_flags_are_independent_of_word_contents() {
-    let mut initialized = crate::interpreter::Binding::data(Value::Empty, true, true);
-    let mut tdz = crate::interpreter::Binding::data(Value::Undefined, false, false);
-    assert!(initialized.initialized);
-    assert_eq!(initialized.value().bits(), crate::value::PACK_EMPTY);
-    assert!(!tdz.initialized);
-    assert_eq!(tdz.value().bits(), crate::value::PACK_UNDEFINED);
-    initialized.set_value(Value::Undefined);
-    tdz.set_value(Value::Null);
-    assert!(initialized.initialized && initialized.mutable);
-    assert!(!tdz.initialized && !tdz.mutable);
+    use crate::interpreter::{Binding, VarMap};
+    let mut vars = VarMap::default();
+    vars.insert("initialized", Binding::data(Value::Empty, true, true));
+    vars.insert("tdz", Binding::data(Value::Undefined, false, false));
+    assert!(vars.get("initialized").unwrap().initialized());
+    assert_eq!(
+        vars.get("initialized").unwrap().value().bits(),
+        crate::value::PACK_EMPTY
+    );
+    assert!(!vars.get("tdz").unwrap().initialized());
+    assert_eq!(
+        vars.get("tdz").unwrap().value().bits(),
+        crate::value::PACK_UNDEFINED
+    );
+    vars.get_mut("initialized")
+        .unwrap()
+        .set_value(Value::Undefined);
+    vars.get_mut("tdz").unwrap().set_value(Value::Null);
+    let initialized = vars.get("initialized").unwrap();
+    let tdz = vars.get("tdz").unwrap();
+    assert!(initialized.initialized() && initialized.mutable());
+    assert!(!tdz.initialized() && !tdz.mutable());
 }
 
 #[cfg(all(
@@ -127,7 +139,7 @@ fn suspended_this_word_is_the_sole_receiver_root_across_yield_await_and_completi
                 let mut env = Some(coro.env);
                 while let Some(current) = env {
                     let mut scope = current.borrow_mut();
-                    if let Some(binding) = scope.vars.get_mut("this") {
+                    if let Some(mut binding) = scope.vars.get_mut("this") {
                         if binding.value().bits() == word {
                             binding.set_value(Value::Undefined);
                         }

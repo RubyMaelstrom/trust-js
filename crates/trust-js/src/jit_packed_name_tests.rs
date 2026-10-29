@@ -282,7 +282,7 @@ fn every_execution_kind_commits_native_name_loads_and_stores_for_each_owner() {
                 let stored = if let Some(target) = case.target {
                     let scope = target.borrow();
                     let binding = scope.vars.get("outer").unwrap();
-                    assert!(binding.initialized && binding.mutable && !binding.imported);
+                    assert!(binding.initialized() && binding.mutable() && !binding.is_import());
                     binding.value()
                 } else {
                     engine.interp.get_var("outer", &globals).ok().unwrap()
@@ -341,28 +341,36 @@ fn fixed_layout_flags_and_stale_layouts_decline_before_native_commit() {
                     "the stale slot remains in bounds and names a different binding"
                 );
             }
-            "TDZ" => {
-                target
-                    .borrow_mut()
-                    .vars
-                    .get_mut("outer")
-                    .unwrap()
-                    .initialized = false
-            }
+            "TDZ" => target
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .set_initialized(false),
             "import" => {
                 let exporter = new_scope(None);
                 exporter
                     .borrow_mut()
                     .vars
                     .insert("source", Binding::data(Value::Num(99.0), true, true));
-                *target.borrow_mut().vars.get_mut("outer").unwrap() =
-                    Binding::live_import(exporter, crate::atom::atomize("source"));
+                target
+                    .borrow_mut()
+                    .vars
+                    .get_mut("outer")
+                    .unwrap()
+                    .replace_for_test(Binding::live_import(
+                        exporter,
+                        crate::atom::atomize("source"),
+                    ));
             }
             _ => {
                 let mut scope = target.borrow_mut();
-                let binding = scope.vars.get_mut("outer").unwrap();
-                binding.mutable = false;
-                binding.strict_immutable = scenario == "strict immutable";
+                let mut binding = scope.vars.get_mut("outer").unwrap();
+                binding.set_attributes_for_test(
+                    Some(false),
+                    Some(scenario == "strict immutable"),
+                    None,
+                );
             }
         }
 

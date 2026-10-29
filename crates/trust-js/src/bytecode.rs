@@ -368,15 +368,20 @@ mod binding_layout_cache_tests {
             .vars
             .get_mut("outer")
             .unwrap()
-            .initialized = false;
+            .set_initialized(false);
         assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
         second
             .borrow_mut()
             .vars
             .get_mut("outer")
             .unwrap()
-            .initialized = true;
-        second.borrow_mut().vars.get_mut("outer").unwrap().mutable = false;
+            .set_initialized(true);
+        second
+            .borrow_mut()
+            .vars
+            .get_mut("outer")
+            .unwrap()
+            .set_attributes_for_test(Some(false), None, None);
         engine.interp.strict = true;
         assert!(chunk
             .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(99.))
@@ -461,14 +466,14 @@ mod binding_layout_cache_tests {
                 .vars
                 .get_mut("outer")
                 .unwrap()
-                .initialized = false;
+                .set_initialized(false);
             assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
             parent
                 .borrow_mut()
                 .vars
                 .get_mut("outer")
                 .unwrap()
-                .initialized = true;
+                .set_initialized(true);
 
             // Same mutation count is not the same key layout.
             let shadow = make_child(&parent, "outer", new_binding_layout_id());
@@ -15639,7 +15644,7 @@ pub(crate) fn try_function_osr(
             let scope = environment.borrow();
             if let Some(binding) = scope.vars.get(name) {
                 if shadow_depth == 0 {
-                    value = Some(if binding.initialized {
+                    value = Some(if binding.initialized() {
                         binding.value()
                     } else {
                         Value::Empty
@@ -16223,7 +16228,7 @@ fn assign_target_with_slots(
             .expect("projected assignment binding remains present");
         slots.write_value(
             local.slot as usize,
-            if binding.initialized {
+            if binding.initialized() {
                 binding.value()
             } else {
                 Value::Empty
@@ -16269,7 +16274,7 @@ fn eval_expr_with_slots(
             .expect("projected expression binding remains present");
         slots.write_value(
             local.slot as usize,
-            if binding.initialized {
+            if binding.initialized() {
                 binding.value()
             } else {
                 Value::Empty
@@ -16677,7 +16682,7 @@ fn run_vm_inner(
                 let old = {
                     let b = cap_env.borrow();
                     let bd = b.vars.get(name).expect("captured binding missing");
-                    if !bd.initialized {
+                    if !bd.initialized() {
                         let msg = format!("cannot access '{name}' before initialization");
                         drop(b);
                         return Err(i.throw("ReferenceError", msg));
@@ -20289,7 +20294,7 @@ impl Chunk {
                 return None;
             }
             let binding = scope.vars.fixed_binding_at(ic.binding as usize)?;
-            return (binding.initialized && binding.import_ref.is_none()).then(|| binding.value());
+            return (binding.initialized() && !binding.is_import()).then(|| binding.value());
         }
         if ic.env == lexical_cache::DEEP_NAME_IC {
             return self.deep_name_ic_hit(i, env, c);
@@ -20303,8 +20308,8 @@ impl Chunk {
             // The unchanged generation proves the map is structurally untouched since the fill:
             // the pointer is live and the resolution unchanged (see NameIc). The value and TDZ
             // flag are read live — in-place writes flow through.
-            let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::Binding) };
-            return if bd.initialized && bd.import_ref.is_none() {
+            let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::BindingSlot) };
+            return if bd.initialized() && !bd.is_import() {
                 Some(bd.value())
             } else {
                 None
@@ -20344,8 +20349,8 @@ impl Chunk {
             if !pb.vars.matches_generation(ic.gen) {
                 return None;
             }
-            let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::Binding) };
-            return if bd.initialized && bd.import_ref.is_none() {
+            let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::BindingSlot) };
+            return if bd.initialized() && !bd.is_import() {
                 Some(bd.value())
             } else {
                 None
@@ -20365,7 +20370,7 @@ impl Chunk {
                 return None;
             }
             if let Some(bd) = b.vars.get(&self.names[n as usize]) {
-                if !bd.initialized || bd.import_ref.is_some() {
+                if !bd.initialized() || bd.is_import() {
                     return None;
                 }
                 let v = bd.value();
@@ -20395,7 +20400,7 @@ impl Chunk {
                 }
                 self.name_caches[c as usize].set(NameIc {
                     env: Env::as_ptr(env) as usize,
-                    binding: bd as *const _ as usize as u64,
+                    binding: bd.as_ptr() as usize as u64,
                     gen: b.vars.generation(),
                     act_gen: layout_id,
                 });
@@ -20418,13 +20423,13 @@ impl Chunk {
                         && pb.vars.generation() != u32::MAX
                     {
                         if let Some(bd) = pb.vars.get(&self.names[n as usize]) {
-                            if bd.initialized && bd.import_ref.is_none() {
+                            if bd.initialized() && !bd.is_import() {
                                 let v = bd.value();
                                 self.record_name_number(c as usize, &v);
                                 self.name_caches[c as usize].set(NameIc {
                                     env: Env::as_ptr(p) as usize
                                         | if layout_id != 0 { 6 } else { 2 },
-                                    binding: bd as *const _ as usize as u64,
+                                    binding: bd.as_ptr() as usize as u64,
                                     gen: pb.vars.generation(),
                                     act_gen: if layout_id != 0 {
                                         layout_id
@@ -20496,7 +20501,7 @@ impl Chunk {
     /// Resolve a captured binding in the current activation and cache its stable map-entry
     /// address. Structural `VarMap` mutations bump `generation`; the weak scope pin prevents an
     /// activation allocation from being recycled while its raw pointer remains cached.
-    fn cap_binding_ptr(&self, env: &Env, n: u32) -> *mut crate::interpreter::Binding {
+    fn cap_binding_ptr(&self, env: &Env, n: u32) -> *mut crate::interpreter::BindingSlot {
         let index = n as usize;
         let raw = Env::as_ptr(env) as usize;
         let ic = self.cap_caches[index].get();
@@ -20508,11 +20513,11 @@ impl Chunk {
                 && b.vars.layout_id() == ic.gen
             {
                 if let Some(binding) = b.vars.fixed_binding_at(ic.binding as usize) {
-                    return binding as *const _ as *mut crate::interpreter::Binding;
+                    return binding.as_ptr().cast_mut();
                 }
             }
             if ic.env == raw && b.vars.matches_generation(ic.gen) {
-                return ic.binding as usize as *mut crate::interpreter::Binding;
+                return ic.binding as usize as *mut crate::interpreter::BindingSlot;
             }
         }
         let name = &self.names[index];
@@ -20528,8 +20533,11 @@ impl Chunk {
                 && ic.act_gen == layout_id)
                 .then(|| b.vars.binding_slot(name))
                 .flatten();
-            let binding = b.vars.get_mut(name).expect("captured binding missing")
-                as *mut crate::interpreter::Binding;
+            let binding = b
+                .vars
+                .get_mut(name)
+                .expect("captured binding missing")
+                .as_mut_ptr();
             (binding, generation, layout_id, slot)
         };
         if let Some(slot) = slot {
@@ -20557,7 +20565,7 @@ impl Chunk {
 
     pub(crate) fn load_cap_ic(&self, i: &mut Interp, env: &Env, n: u32) -> Result<Value, Abrupt> {
         let binding = unsafe { &*self.cap_binding_ptr(env, n) };
-        if !binding.initialized {
+        if !binding.initialized() {
             return Err(i.throw(
                 "ReferenceError",
                 format!(
@@ -20578,7 +20586,7 @@ impl Chunk {
         initialize: bool,
     ) -> Result<(), Abrupt> {
         let binding = unsafe { &mut *self.cap_binding_ptr(env, n) };
-        if !initialize && !binding.initialized {
+        if !initialize && !binding.initialized() {
             return Err(i.throw(
                 "ReferenceError",
                 format!(
@@ -20592,9 +20600,10 @@ impl Chunk {
         // its card, with no safepoint before the store.
         // SAFETY: `env` names a live environment cell, a small cell of a carded kind.
         unsafe { crate::gc_core::card_mark(Env::as_ptr(env).cast()) };
-        binding.set_value(value);
         if initialize {
-            binding.initialized = true;
+            binding.initialize(value);
+        } else {
+            binding.set_value(value);
         }
         Ok(())
     }
@@ -20604,7 +20613,7 @@ impl Chunk {
     /// immutability (ECMA-262 §9.1.1.1.5), so a store into a TDZ remains a ReferenceError.
     fn reject_const_cap_store(&self, i: &mut Interp, env: &Env, n: u32) -> Result<(), Abrupt> {
         let binding = unsafe { &*self.cap_binding_ptr(env, n) };
-        if !binding.initialized {
+        if !binding.initialized() {
             return Err(i.throw(
                 "ReferenceError",
                 format!(
@@ -20639,8 +20648,9 @@ impl Chunk {
             {
                 let mut scope = env.borrow_mut();
                 if !scope.has_with_object() && ic.gen != 0 && scope.vars.layout_id() == ic.gen {
-                    if let Some(binding) = scope.vars.fixed_binding_at_mut(ic.binding as usize) {
-                        if binding.initialized && binding.mutable && binding.import_ref.is_none() {
+                    if let Some(mut binding) = scope.vars.fixed_binding_at_mut(ic.binding as usize)
+                    {
+                        if binding.initialized() && binding.mutable() && !binding.is_import() {
                             binding.set_value(value);
                             return Ok(());
                         }
@@ -20664,8 +20674,9 @@ impl Chunk {
         let value = if ic.env == raw {
             let b = env.borrow_mut();
             if b.vars.matches_generation(ic.gen) {
-                let bd = unsafe { &mut *(ic.binding as usize as *mut crate::interpreter::Binding) };
-                if bd.initialized && bd.mutable && bd.import_ref.is_none() {
+                let bd =
+                    unsafe { &mut *(ic.binding as usize as *mut crate::interpreter::BindingSlot) };
+                if bd.initialized() && bd.mutable() && !bd.is_import() {
                     bd.set_value(value);
                     return Ok(());
                 }
@@ -20696,9 +20707,9 @@ impl Chunk {
                     let pb = parent.borrow_mut();
                     if pb.vars.matches_generation(ic.gen) {
                         let bd = unsafe {
-                            &mut *(ic.binding as usize as *mut crate::interpreter::Binding)
+                            &mut *(ic.binding as usize as *mut crate::interpreter::BindingSlot)
                         };
-                        if bd.initialized && bd.mutable && bd.import_ref.is_none() {
+                        if bd.initialized() && bd.mutable() && !bd.is_import() {
                             bd.set_value(value);
                             return Ok(());
                         }
@@ -21796,7 +21807,11 @@ fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
         .bindings
         .iter()
         .map(|binding| {
-            crate::interpreter::Binding::data(Value::Undefined, !binding.is_const, false)
+            crate::interpreter::BindingSlot::from(crate::interpreter::Binding::data(
+                Value::Undefined,
+                !binding.is_const,
+                false,
+            ))
         })
         .collect();
     let next = if catch {
@@ -21847,12 +21862,7 @@ fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
                     current.vars.get_atom(binding.name)
                 }
                 .expect("per-iteration binding missing");
-                crate::interpreter::Binding::data(
-                    previous.value(),
-                    previous.mutable,
-                    previous.initialized,
-                )
-                .with_strict_immutable(previous.strict_immutable)
+                crate::interpreter::BindingSlot::from(previous.to_binding())
             })
             .collect()
     };
@@ -21864,12 +21874,11 @@ fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
 fn initialize_lexical_binding(chunk: &Chunk, env: &Env, name: u32, value: Value) {
     let name = &chunk.names[name as usize];
     let mut record = env.borrow_mut();
-    let binding = record
+    record
         .vars
         .get_mut(name)
-        .expect("lexical initialization requires an own binding");
-    binding.set_value(value);
-    binding.initialized = true;
+        .expect("lexical initialization requires an own binding")
+        .initialize(value);
 }
 
 /// Restore the running LexicalEnvironment to the outer record of a compiled scope.
@@ -25754,7 +25763,7 @@ unsafe fn jit_exec_inner(
             let old = {
                 let b = cap_env.borrow();
                 let bd = b.vars.get(name).expect("captured binding missing");
-                if !bd.initialized {
+                if !bd.initialized() {
                     let msg = format!("cannot access '{name}' before initialization");
                     drop(b);
                     return Err(i.throw("ReferenceError", msg));

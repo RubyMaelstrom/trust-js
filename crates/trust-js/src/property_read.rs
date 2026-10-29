@@ -356,7 +356,7 @@ impl Interp {
                 // identity and unchanged non-saturated generation above prove no structural
                 // mutation has moved or removed it. In-place binding changes are inspected live.
                 let binding = unsafe { &*cache.binding };
-                return if binding.initialized && !binding.imported && binding.import_ref.is_none() {
+                return if binding.initialized() && !binding.is_import() && !binding.is_import() {
                     BindingGetterProbe::Value(binding.value())
                 } else {
                     BindingGetterProbe::UninitializedOrImport
@@ -401,7 +401,7 @@ impl Interp {
                 return None;
             }
             if let Some(binding) = scope.vars.get(name) {
-                if !binding.initialized || binding.imported || binding.import_ref.is_some() {
+                if !binding.initialized() || binding.is_import() || binding.is_import() {
                     return None;
                 }
                 scope_count = Some(depth);
@@ -433,10 +433,10 @@ impl Interp {
             });
             if index + 1 == scope_count {
                 let binding = scope.vars.get(name)?;
-                if !binding.initialized || binding.imported || binding.import_ref.is_some() {
+                if !binding.initialized() || binding.is_import() || binding.is_import() {
                     return None;
                 }
-                binding_ptr = binding as *const crate::interpreter::Binding;
+                binding_ptr = binding.as_ptr();
                 value = Some(binding.value());
                 break;
             }

@@ -1405,7 +1405,7 @@ impl Interp {
             let parent = from.borrow().parent;
             let e = new_scope(parent);
             for &n in &per_iter {
-                let b = from.borrow().vars.get_atom(n).cloned();
+                let b = from.borrow().vars.get_atom(n).map(|b| b.to_binding());
                 if let Some(b) = b {
                     e.borrow_mut().vars.insert(n, b);
                 }
@@ -2561,14 +2561,14 @@ impl Interp {
         loop {
             let b = unsafe { (*cur).borrow() };
             if let Some(binding) = atom.and_then(|atom| b.vars.get_atom(atom)) {
-                if !binding.initialized {
+                if !binding.initialized() {
                     return Err(self.throw(
                         "ReferenceError",
                         format!("cannot access '{name}' before initialization"),
                     ));
                 }
                 // A live module import reads through to the exporter's binding.
-                if let Some(&(src_env, local)) = binding.import_ref.as_deref() {
+                if let Some((src_env, local)) = binding.import() {
                     drop(b);
                     return Ok((self.get_var(&local.text(), &src_env)?, None));
                 }
@@ -2806,7 +2806,7 @@ impl Interp {
         let mut cur = Some(*env);
         while let Some(s) = cur {
             if s.borrow().var_boundary {
-                if let Some(b) = s.borrow_mut().vars.get_mut(name) {
+                if let Some(mut b) = s.borrow_mut().vars.get_mut(name) {
                     b.set_value(val);
                     return;
                 }
@@ -2815,9 +2815,9 @@ impl Interp {
                 // does not create (no arguments object, or one in a separate parameter scope).
                 // SetMutableBinding then creates it, deletable, as B.3.3.3 re-creates the former.
                 if !Env::ptr_eq(&s, &self.global_env) {
-                    let mut b = Binding::data(val, true, true);
-                    b.deletable = true;
-                    s.borrow_mut().vars.insert(name, b);
+                    s.borrow_mut()
+                        .vars
+                        .insert(name, Binding::data(val, true, true).deletable());
                     return;
                 }
                 break;
@@ -2944,28 +2944,27 @@ impl Interp {
         while let Some(s) = cur {
             let (with_obj, parent) = {
                 let mut b = s.borrow_mut();
-                if let Some(binding) = atom.and_then(|atom| b.vars.get_atom_mut(atom)) {
+                if let Some(mut binding) = atom.and_then(|atom| b.vars.get_atom_mut(atom)) {
                     // Var initializers and assignment-pattern/loop-head writes perform
                     // PutValue, not InitializeBinding. Hoisted var bindings are already
                     // initialized; a lexical binding found here must retain its TDZ.
-                    if !binding.initialized {
+                    if !binding.initialized() {
                         return Err(self.throw(
                             "ReferenceError",
                             format!("cannot access '{name}' before initialization"),
                         ));
                     }
-                    if !binding.mutable {
+                    if !binding.mutable() {
                         // A const always throws; a non-strict immutable binding (a named function
                         // expression's own name) is a silent no-op in sloppy code.
-                        if binding.strict_immutable || self.strict {
+                        if binding.strict_immutable() || self.strict {
                             return Err(
                                 self.throw("TypeError", format!("assignment to constant '{name}'"))
                             );
                         }
                         return Ok(());
                     }
-                    binding.set_value(value);
-                    binding.initialized = true;
+                    binding.initialize(value);
                     return Ok(());
                 }
                 (b.with_object(), b.parent)
@@ -3263,7 +3262,7 @@ impl Interp {
             let parent = {
                 let record = scope.borrow();
                 if let Some(binding) = record.vars.get("this") {
-                    if binding.initialized && binding.import_ref.is_none() {
+                    if binding.initialized() && !binding.is_import() {
                         return Ok(binding.value());
                     }
                     drop(record);
@@ -4397,7 +4396,7 @@ impl Interp {
             if binding.vars.contains_key("this") {
                 return matches!(
                     binding.vars.get("%supercallok%"),
-                    Some(marker) if marker.initialized && matches!(&(marker.value()).view(), ValueView::Bool(true))
+                    Some(marker) if marker.initialized() && matches!(&(marker.value()).view(), ValueView::Bool(true))
                 );
             }
             cursor = binding.parent;
@@ -4459,13 +4458,12 @@ impl Interp {
             .borrow()
             .vars
             .get("this")
-            .is_some_and(|binding| binding.initialized)
+            .is_some_and(|binding| binding.initialized())
         {
             return Err(self.throw("ReferenceError", "super() may only be called once"));
         }
-        if let Some(binding) = this_env.borrow_mut().vars.get_mut("this") {
-            binding.set_value(result);
-            binding.initialized = true;
+        if let Some(mut binding) = this_env.borrow_mut().vars.get_mut("this") {
+            binding.initialize(result);
         }
 
         let active_function = self.get_var("%thisctor%", env)?;
@@ -5827,17 +5825,15 @@ impl Interp {
                     self.create_global_var_binding(name);
                 }
             } else if is_func {
-                var_env.borrow_mut().vars.insert(name.to_owned(), {
-                    let mut b = Binding::data(value, true, true);
-                    b.deletable = true;
-                    b
-                });
+                var_env.borrow_mut().vars.insert(
+                    name.to_owned(),
+                    Binding::data(value, true, true).deletable(),
+                );
             } else if !var_env.borrow().vars.contains_key(name) {
-                var_env.borrow_mut().vars.insert(name.to_owned(), {
-                    let mut b = Binding::data(Value::Undefined, true, true);
-                    b.deletable = true;
-                    b
-                });
+                var_env.borrow_mut().vars.insert(
+                    name.to_owned(),
+                    Binding::data(Value::Undefined, true, true).deletable(),
+                );
             }
         }
         // The probe scope sits in every hoisted function's closure chain; empty it so their
@@ -6270,7 +6266,7 @@ impl Interp {
         // every member's computed key has evaluated (spec: InitializeBinding runs after
         // ClassElementEvaluation), so `[Name]` as a computed key is a ReferenceError.
         if let Some(n) = &class.name {
-            if let Some(b) = outer_class_env.borrow_mut().vars.get_mut(n) {
+            if let Some(mut b) = outer_class_env.borrow_mut().vars.get_mut(n) {
                 b.set_value(ctor_val);
             }
         }
@@ -6550,8 +6546,8 @@ impl Interp {
         // Every member key has evaluated: the class name binding leaves its TDZ before static
         // field initializers and static blocks run.
         if let Some(n) = &class.name {
-            if let Some(b) = outer_class_env.borrow_mut().vars.get_mut(n) {
-                b.initialized = true;
+            if let Some(mut b) = outer_class_env.borrow_mut().vars.get_mut(n) {
+                b.mark_initialized();
             }
         }
 
@@ -7770,7 +7766,7 @@ impl Interp {
                         let binding = b.vars.get(name);
                         (
                             binding.is_some(),
-                            binding.map(|x| x.deletable).unwrap_or(false),
+                            binding.is_some_and(|x| x.deletable()),
                             b.with_object(),
                             b.parent,
                         )
@@ -7892,7 +7888,7 @@ impl Interp {
                 }
                 match b.vars.get(name) {
                     Some(bd) => {
-                        if !bd.initialized || bd.import_ref.is_some() || !bd.mutable {
+                        if !bd.initialized() || bd.is_import() || !bd.mutable() {
                             return None;
                         }
                         (true, None)
@@ -7927,7 +7923,7 @@ impl Interp {
                     .unwrap_or(Value::Undefined);
                 if let ValueView::Num(n) = (old).view() {
                     let new = if op == "++" { n + 1.0 } else { n - 1.0 };
-                    if let Some(bd) = scope.borrow_mut().vars.get_mut(name) {
+                    if let Some(mut bd) = scope.borrow_mut().vars.get_mut(name) {
                         bd.set_value(Value::Num(new));
                         return Ok(Value::Num(if prefix { new } else { n }));
                     }
@@ -7997,7 +7993,7 @@ impl Interp {
                     let stored = {
                         let mut record = scope.borrow_mut();
                         match record.vars.get_mut(name) {
-                            Some(bd) if bd.mutable && bd.initialized && bd.import_ref.is_none() => {
+                            Some(mut bd) if bd.mutable() && bd.initialized() && !bd.is_import() => {
                                 bd.set_value(result);
                                 true
                             }

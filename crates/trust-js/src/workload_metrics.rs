@@ -117,9 +117,9 @@ fn classify_name(env: &Env, name: &str) -> (NamePath, usize) {
     loop {
         let scope = current.borrow();
         if let Some(binding) = scope.vars.get(name) {
-            let kind = if !binding.initialized {
+            let kind = if !binding.initialized() {
                 NamePath::Uninitialized
-            } else if binding.import_ref.is_some() {
+            } else if binding.is_import() {
                 NamePath::Import
             } else {
                 NamePath::Declarative
@@ -215,8 +215,8 @@ mod tests {
         assert_eq!(classify_name(&inner, "value"), (NamePath::Uninitialized, 1));
         {
             let mut scope = middle.borrow_mut();
-            let binding = scope.vars.get_mut("value").unwrap();
-            binding.initialized = true;
+            let mut binding = scope.vars.get_mut("value").unwrap();
+            binding.set_initialized(true);
             binding.set_import_reference(Some((outer, crate::atom::atomize("value"))));
         }
         assert_eq!(classify_name(&inner, "value"), (NamePath::Import, 1));

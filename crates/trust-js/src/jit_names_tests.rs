@@ -75,7 +75,7 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
         .vars
         .get_mut("outer")
         .unwrap()
-        .initialized = false;
+        .set_initialized(false);
     assert!(super::super::run(
         &mut engine.interp,
         &chunk,
@@ -90,7 +90,7 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
         .vars
         .get_mut("outer")
         .unwrap()
-        .initialized = true;
+        .set_initialized(true);
     other.borrow_mut().vars.set_generation_for_test(u32::MAX);
     assert_eq!(run(&mut engine, &chunk, &code, &fresh), 29.0);
     assert_eq!(

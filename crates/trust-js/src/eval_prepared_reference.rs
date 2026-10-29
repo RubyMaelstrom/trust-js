@@ -21,7 +21,7 @@ pub(crate) struct PreparedReference {
     pub(crate) object: Option<Gc>,
     pub(crate) generation: u32,
     pub(crate) shape: u32,
-    pub(crate) binding: *mut Binding,
+    pub(crate) binding: *mut BindingSlot,
     pub(crate) slot: usize,
 }
 
@@ -109,7 +109,7 @@ impl PreparedReference {
         scope: Env,
         strict: bool,
         generation: u32,
-        binding: *mut Binding,
+        binding: *mut BindingSlot,
     ) -> Self {
         Self {
             kind: REFERENCE_SCOPE,
@@ -129,9 +129,10 @@ impl PreparedReference {
             let record = scope.borrow();
             (
                 record.vars.generation(),
-                record.vars.get(&name).map_or(std::ptr::null_mut(), |b| {
-                    b as *const Binding as *mut Binding
-                }),
+                record
+                    .vars
+                    .get(&name)
+                    .map_or(std::ptr::null_mut(), |b| b.as_ptr().cast_mut()),
             )
         };
         Self::scope_with_hint(name, scope, strict, generation, binding)
@@ -299,7 +300,8 @@ impl Interp {
                     {
                         // The captured record is strongly owned; only its non-recycled structural
                         // generation proves this address. Exhaustion always takes the map lookup.
-                        Some(unsafe { &*reference.binding })
+                        // SAFETY: as just said.
+                        Some(unsafe { crate::interpreter::BindingRef::from_ptr(reference.binding) })
                     } else {
                         record.vars.get(name)
                     };
@@ -307,12 +309,8 @@ impl Interp {
                         return Err(self.throw("ReferenceError", format!("{name} is not defined")));
                     };
                     reference.generation = record.vars.generation();
-                    reference.binding = binding as *const Binding as *mut Binding;
-                    (
-                        binding.initialized,
-                        binding.value(),
-                        binding.import_ref.as_deref().copied(),
-                    )
+                    reference.binding = binding.as_ptr().cast_mut();
+                    (binding.initialized(), binding.value(), binding.import())
                 };
                 if !initialized {
                     return Err(self.throw(
@@ -374,32 +372,33 @@ impl Interp {
                 let binding = if record.vars.matches_generation(reference.generation)
                     && !reference.binding.is_null()
                 {
-                    Some(unsafe { &mut *reference.binding })
+                    // SAFETY: the record is strongly owned and its generation unchanged.
+                    Some(unsafe { crate::interpreter::BindingMut::from_ptr(reference.binding) })
                 } else {
                     record.vars.get_mut(name)
                 };
-                if let Some(binding) = binding {
-                    if binding.import_ref.is_some() {
+                if let Some(mut binding) = binding {
+                    if binding.is_import() {
                         return Err(self.throw(
                             "TypeError",
                             format!("assignment to import binding '{name}'"),
                         ));
                     }
-                    if !binding.initialized {
+                    if !binding.initialized() {
                         return Err(self.throw(
                             "ReferenceError",
                             format!("cannot access '{name}' before initialization"),
                         ));
                     }
-                    if !binding.mutable {
-                        return if binding.strict_immutable || reference.strict != 0 {
+                    if !binding.mutable() {
+                        return if binding.strict_immutable() || reference.strict != 0 {
                             Err(self.throw("TypeError", format!("assignment to constant '{name}'")))
                         } else {
                             Ok(())
                         };
                     }
                     binding.set_value(value);
-                    reference.binding = binding;
+                    reference.binding = binding.as_mut_ptr();
                     reference.generation = record.vars.generation();
                     return Ok(());
                 }
@@ -409,11 +408,11 @@ impl Interp {
                 // Declarative SetMutableBinding's missing-binding branch: recreate here, never
                 // search an outer record. This occurs when sloppy direct eval deletes its var
                 // binding while its assignment RHS is executing.
-                let mut binding = Binding::data(value, true, true);
-                binding.deletable = true;
-                record.vars.insert(name.clone(), binding);
+                record
+                    .vars
+                    .insert(name.clone(), Binding::data(value, true, true).deletable());
                 reference.generation = record.vars.generation();
-                reference.binding = record.vars.get_mut(name).expect("new binding");
+                reference.binding = record.vars.get_mut(name).expect("new binding").as_mut_ptr();
                 Ok(())
             }
             REFERENCE_OBJECT => {

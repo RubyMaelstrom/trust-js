@@ -152,9 +152,10 @@ fn prepared_reference_imports_are_live_and_never_mutable_address_hints() {
         .vars
         .insert("source", Binding::data(Value::Num(7.0), true, true));
     let importer = new_scope(None);
-    let mut binding = Binding::data(Value::Undefined, false, true);
-    binding.set_import_reference(Some((exporter, crate::atom::atomize("source"))));
-    importer.borrow_mut().vars.insert("alias", binding);
+    importer.borrow_mut().vars.insert(
+        "alias",
+        Binding::live_import(exporter, crate::atom::atomize("source")),
+    );
     let mut reference = engine
         .interp
         .prepare_name_reference("alias", &importer)
@@ -258,17 +259,20 @@ fn prepared_reference_slot_reports_its_reference_and_releases_a_replaced_one() {
 fn prepared_reference_native_kind_flags_use_compact_binding_size_and_live_imports() {
     #[cfg(target_pointer_width = "64")]
     assert_eq!(
-        std::mem::size_of::<Binding>(),
+        std::mem::size_of::<crate::interpreter::BindingSlot>(),
         24,
         "import kind flag fits the 24-byte packed binding"
     );
     let target = new_scope(None);
-    let mut binding = Binding::data(Value::Undefined, false, true);
-    assert!(!binding.imported);
-    binding.set_import_reference(Some((target, crate::atom::atomize("exported"))));
-    assert!(binding.imported);
-    binding.set_import_reference(None);
-    assert!(!binding.imported);
+    let mut vars = VarMap::default();
+    vars.insert("binding", Binding::data(Value::Undefined, false, true));
+    assert!(!vars.get("binding").unwrap().is_import());
+    vars.get_mut("binding")
+        .unwrap()
+        .set_import_reference(Some((target, crate::atom::atomize("exported"))));
+    assert!(vars.get("binding").unwrap().is_import());
+    vars.get_mut("binding").unwrap().set_import_reference(None);
+    assert!(!vars.get("binding").unwrap().is_import());
     // The entries validate: an InlineVec keeping a map's first binding in place.
     assert!(
         VarMap::jit_small_storage_layout().is_some(),

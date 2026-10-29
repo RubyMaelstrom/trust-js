@@ -9,7 +9,7 @@
 use super::{CapInit, Chunk};
 use crate::atom::Atom;
 use crate::interpreter::{
-    new_var_scope_with_bindings, Binding, DescRef, Env, Interp, ScopeDesc, VarMap,
+    new_var_scope_with_bindings, Binding, BindingSlot, DescRef, Env, Interp, ScopeDesc, VarMap,
 };
 use crate::value::Value;
 use std::rc::Rc;
@@ -22,7 +22,7 @@ pub(super) fn activation_plans_enabled() -> bool {
 /// A chunk's plan, made in the chunk's heap: its names are that heap's atoms, in a descriptor
 /// every activation shares, so that making one copies binding values only.
 pub(super) struct ActivationPlan {
-    bindings: Vec<Binding>,
+    bindings: Vec<BindingSlot>,
     desc: Rc<ScopeDesc>,
     /// `desc`, kept by the chunk's heap for its activations to name.
     kept_desc: DescRef,
@@ -50,7 +50,7 @@ impl ActivationPlan {
             arguments_slot: None,
         };
         let mut slots = crate::fasthash::FastMap::<Rc<str>, usize>::default();
-        let mut slot = |bindings: &mut Vec<Binding>,
+        let mut slot = |bindings: &mut Vec<BindingSlot>,
                         slots: &mut crate::fasthash::FastMap<Rc<str>, usize>,
                         name: &Rc<str>,
                         binding: Binding,
@@ -58,14 +58,14 @@ impl ActivationPlan {
          -> usize {
             if let Some(&slot) = slots.get(name) {
                 if replace {
-                    bindings[slot] = binding;
+                    bindings[slot] = BindingSlot::from(binding);
                 }
                 return slot;
             }
             let index = bindings.len();
             slots.insert(name.clone(), index);
             names.push(crate::atom::atomize(name));
-            bindings.push(binding);
+            bindings.push(BindingSlot::from(binding));
             index
         };
         let mut functions = Vec::new();
@@ -215,7 +215,7 @@ impl ActivationPlan {
         visitor.scope_desc(&self.desc);
         // The names are atoms, which their heap's table accounts.
         std::mem::size_of::<Self>()
-            + self.bindings.capacity() * std::mem::size_of::<Binding>()
+            + self.bindings.capacity() * std::mem::size_of::<BindingSlot>()
             + (self.parameters.capacity() + self.functions.capacity())
                 * std::mem::size_of::<(usize, u16)>()
             + self.lexicals.capacity() * std::mem::size_of::<Atom>()
@@ -381,7 +381,7 @@ mod tests {
                 .vars
                 .get_mut("m")
                 .unwrap()
-                .initialized = false;
+                .set_initialized(false);
             assert_eq!(
                 evaluate(
                     &mut engine,
@@ -394,7 +394,7 @@ mod tests {
                 .vars
                 .get_mut("m")
                 .unwrap()
-                .initialized = true;
+                .set_initialized(true);
             assert_eq!(evaluate(&mut engine, "one()"), "79");
         }
     }
@@ -455,12 +455,22 @@ mod tests {
                 .insert("added59", Binding::data(Value::Num(3.), true, true));
             assert_eq!(left.borrow().vars.layout_id(), 0);
             assert_eq!(evaluate(&mut engine, "left59()+'|'+right59()"), "4561|4752");
-            right.borrow_mut().vars.get_mut("v95").unwrap().initialized = false;
+            right
+                .borrow_mut()
+                .vars
+                .get_mut("v95")
+                .unwrap()
+                .set_initialized(false);
             assert_eq!(
                 evaluate(&mut engine, "try{right59();'miss'}catch(e){e.name}"),
                 "ReferenceError"
             );
-            right.borrow_mut().vars.get_mut("v95").unwrap().initialized = true;
+            right
+                .borrow_mut()
+                .vars
+                .get_mut("v95")
+                .unwrap()
+                .set_initialized(true);
             right.borrow_mut().vars.remove("v95");
             assert_eq!(right.borrow().vars.layout_id(), 0);
             assert_eq!(

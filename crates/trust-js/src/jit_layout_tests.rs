@@ -4,7 +4,7 @@
 //! bindings and closure cells. Nothing here runs generated code.
 
 use super::*;
-use crate::interpreter::{new_scope, Binding};
+use crate::interpreter::{new_scope, Binding, BindingSlot};
 use crate::value::ValueView;
 
 /// The `T` at byte offset `off` from `base`.
@@ -265,13 +265,13 @@ fn scope_offsets_read_generation_parent_and_bindings() {
         for slot in 0..count {
             let binding = data + slot * layout.scope_binding_stride + layout.scope_binding_offset;
             let live = scope.vars.fixed_binding_at(slot).expect("fixed slot");
-            assert_eq!(binding, live as *const Binding as usize, "slot {slot}");
+            assert_eq!(binding, live.as_ptr() as usize, "slot {slot}");
             assert_eq!(read::<u8>(binding, layout.binding_init), 1);
             assert_eq!(read::<u8>(binding, layout.binding_mutable), 1);
             assert_eq!(read::<u8>(binding, layout.binding_import), 0);
-            assert_eq!(layout.binding_value, Binding::value_offset());
+            assert_eq!(layout.binding_value, BindingSlot::value_offset());
             assert!((binding + layout.binding_value).is_multiple_of(8));
-            assert!(layout.binding_value + 8 <= std::mem::size_of::<Binding>());
+            assert!(layout.binding_value + 8 <= std::mem::size_of::<BindingSlot>());
             assert_eq!(
                 read::<u64>(binding, layout.binding_value),
                 live.value().bits()

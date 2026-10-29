@@ -456,7 +456,7 @@ fn foreign_getter_fill_stale_reset_and_tdz_preserve_the_runtime_lease() {
         .vars
         .get_mut("held")
         .unwrap()
-        .initialized = false;
+        .set_initialized(false);
     assert_eq!(
         eval(&mut outer, "try{box.value}catch(error){error.name}"),
         "ReferenceError"
@@ -467,7 +467,7 @@ fn foreign_getter_fill_stale_reset_and_tdz_preserve_the_runtime_lease() {
         .vars
         .get_mut("held")
         .unwrap()
-        .initialized = true;
+        .set_initialized(true);
     captured.borrow_mut().vars.remove("held");
     assert_eq!(
         eval(&mut outer, "try{box.value}catch(error){error.name}"),

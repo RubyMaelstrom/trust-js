@@ -1628,9 +1628,9 @@ impl Interp {
                 .vars
                 .iter()
                 .filter(|(name, binding)| {
-                    binding.import_ref.is_none() && !name.is("this") && !name.is("%importmeta%")
+                    !binding.is_import() && !name.is("this") && !name.is("%importmeta%")
                 })
-                .map(|(name, binding)| (name.to_string(), !binding.mutable))
+                .map(|(name, binding)| (name.to_string(), !binding.mutable()))
                 .collect();
             let coro = if let Some(chunk) = crate::bytecode::compile_module(&body, &bindings) {
                 let mut vm =

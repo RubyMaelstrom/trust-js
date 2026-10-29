@@ -1961,7 +1961,7 @@ impl Names {
 #[repr(transparent)]
 pub(crate) struct BindingValues(std::mem::ManuallyDrop<BindingVec>);
 
-type BindingVec = crate::inline_vec::InlineVec<Binding, 1, crate::gc_storage::GcSpill>;
+type BindingVec = crate::inline_vec::InlineVec<BindingSlot, 1, crate::gc_storage::GcSpill>;
 
 impl BindingValues {
     pub(crate) fn new() -> Self {
@@ -1996,8 +1996,8 @@ impl std::ops::DerefMut for BindingValues {
     }
 }
 
-impl FromIterator<Binding> for BindingValues {
-    fn from_iter<I: IntoIterator<Item = Binding>>(iter: I) -> Self {
+impl FromIterator<BindingSlot> for BindingValues {
+    fn from_iter<I: IntoIterator<Item = BindingSlot>>(iter: I) -> Self {
         Self(std::mem::ManuallyDrop::new(iter.into_iter().collect()))
     }
 }
@@ -2020,9 +2020,9 @@ pub(crate) struct VarIter<'a> {
 }
 
 impl<'a> Iterator for VarIter<'a> {
-    type Item = (crate::atom::Atom, &'a Binding);
+    type Item = (crate::atom::Atom, BindingRef<'a>);
     fn next(&mut self) -> Option<Self::Item> {
-        let binding = self.map.values.get(self.slot)?;
+        let binding = self.map.fixed_binding_at(self.slot)?;
         let name = self.map.names.get(self.slot).expect("a name per value");
         self.slot += 1;
         Some((name, binding))
@@ -2030,6 +2030,14 @@ impl<'a> Iterator for VarIter<'a> {
 }
 
 impl VarMap {
+    /// Report the bindings' edges: their values and imports.
+    #[inline]
+    pub(crate) fn trace_bindings<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
+        for binding in self.values.iter() {
+            binding.trace_edges(sink);
+        }
+    }
+
     /// Report the record's blocks: the spilled values' and the names'.
     #[inline]
     pub(crate) fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
@@ -2103,7 +2111,7 @@ impl VarMap {
     /// Before publication only: the initialization plan owns this exact slot.
     pub(crate) fn initialize_fixed_value(&mut self, slot: usize, value: Value) {
         debug_assert_eq!(self.layout_id, 0);
-        self.values[slot].set_value(value);
+        self.values[slot].value = value;
     }
 
     /// Requested bytes owned directly by this binding map, plus whether the result is exact.
@@ -2115,7 +2123,7 @@ impl VarMap {
             names.saturating_add(
                 self.values
                     .heap_capacity()
-                    .saturating_mul(std::mem::size_of::<Binding>()),
+                    .saturating_mul(std::mem::size_of::<BindingSlot>()),
             ),
             exact,
         )
@@ -2160,27 +2168,30 @@ impl VarMap {
         self.names.slot_of_text(name)
     }
 
-    pub(crate) fn binding_at(&self, slot: usize, name: &str) -> Option<&Binding> {
+    pub(crate) fn binding_at(&self, slot: usize, name: &str) -> Option<BindingRef<'_>> {
         self.names
             .get(slot)
             .filter(|key| key.is(name))
-            .and_then(|_| self.values.get(slot))
+            .and_then(|_| self.fixed_binding_at(slot))
     }
 
-    pub(crate) fn binding_at_mut(&mut self, slot: usize, name: &str) -> Option<&mut Binding> {
+    pub(crate) fn binding_at_mut(&mut self, slot: usize, name: &str) -> Option<BindingMut<'_>> {
         if !self.names.get(slot).is_some_and(|key| key.is(name)) {
             return None;
         }
-        self.values.get_mut(slot)
+        self.fixed_binding_at_mut(slot)
     }
 
-    /// The caller has checked the same nonzero published ordered-layout ID.
-    pub(crate) fn fixed_binding_at(&self, slot: usize) -> Option<&Binding> {
-        self.values.get(slot)
+    /// The binding at `slot`. The caller has checked the same nonzero published ordered-layout
+    /// ID, or knows the slot otherwise.
+    #[inline]
+    pub(crate) fn fixed_binding_at(&self, slot: usize) -> Option<BindingRef<'_>> {
+        self.values.get(slot).map(|slot| BindingRef { slot })
     }
 
-    pub(crate) fn fixed_binding_at_mut(&mut self, slot: usize) -> Option<&mut Binding> {
-        self.values.get_mut(slot)
+    #[inline]
+    pub(crate) fn fixed_binding_at_mut(&mut self, slot: usize) -> Option<BindingMut<'_>> {
+        self.values.get_mut(slot).map(|slot| BindingMut { slot })
     }
 
     /// Only the creator of a fresh, fully instantiated fixed-key activation may
@@ -2189,12 +2200,9 @@ impl VarMap {
         self.layout_id = layout_id;
     }
 
-    pub(crate) fn insert(
-        &mut self,
-        k: impl crate::atom::IntoAtom,
-        mut v: Binding,
-    ) -> Option<Binding> {
-        v.imported = v.import_ref.is_some();
+    /// Create the binding `k` as `v` describes it, or replace the binding of that name.
+    pub(crate) fn insert(&mut self, k: impl crate::atom::IntoAtom, v: Binding) {
+        let v = BindingSlot::from(v);
         let k = k.into_atom();
         if let Some(slot) = self.names.slot_of(k) {
             // InitializeBinding and same-name declaration replacement keep
@@ -2203,19 +2211,20 @@ impl VarMap {
             if self.names.kind() != Names::SHARED {
                 self.layout_id = 0;
             }
-            return Some(std::mem::replace(&mut self.values[slot], v));
+            self.values[slot] = v;
+            return;
         }
         self.bump();
         self.names.push(k);
         self.values.push(v);
-        None
     }
 
-    pub fn remove(&mut self, k: &str) -> Option<Binding> {
+    /// Remove the binding `k` (DeleteBinding), returning its value.
+    pub fn remove(&mut self, k: &str) -> Option<Value> {
         self.bump();
         let slot = self.names.slot_of_text(k)?;
         self.names.swap_remove(slot);
-        Some(self.values.swap_remove(slot))
+        Some(self.values.swap_remove(slot).value)
     }
 
     pub fn clear(&mut self) {
@@ -2225,14 +2234,14 @@ impl VarMap {
     }
 
     /// In-place binding write: bindings don't move, so the generation stays (see the type docs).
-    pub fn get_mut(&mut self, k: &str) -> Option<&mut Binding> {
+    pub(crate) fn get_mut(&mut self, k: &str) -> Option<BindingMut<'_>> {
         let slot = self.names.slot_of_text(k)?;
-        self.values.get_mut(slot)
+        self.fixed_binding_at_mut(slot)
     }
 
-    pub fn get(&self, k: &str) -> Option<&Binding> {
+    pub(crate) fn get(&self, k: &str) -> Option<BindingRef<'_>> {
         let slot = self.names.slot_of_text(k)?;
-        self.values.get(slot)
+        self.fixed_binding_at(slot)
     }
 
     pub fn contains_key(&self, k: &str) -> bool {
@@ -2240,15 +2249,15 @@ impl VarMap {
     }
 
     /// The binding named by `name`, an atom of this environment's heap.
-    pub(crate) fn get_atom(&self, name: crate::atom::Atom) -> Option<&Binding> {
+    pub(crate) fn get_atom(&self, name: crate::atom::Atom) -> Option<BindingRef<'_>> {
         let slot = self.names.slot_of(name)?;
-        self.values.get(slot)
+        self.fixed_binding_at(slot)
     }
 
     /// In-place binding write by atom (see [`VarMap::get_mut`]).
-    pub(crate) fn get_atom_mut(&mut self, name: crate::atom::Atom) -> Option<&mut Binding> {
+    pub(crate) fn get_atom_mut(&mut self, name: crate::atom::Atom) -> Option<BindingMut<'_>> {
         let slot = self.names.slot_of(name)?;
-        self.values.get_mut(slot)
+        self.fixed_binding_at_mut(slot)
     }
 
     pub(crate) fn iter(&self) -> VarIter<'_> {
@@ -2259,8 +2268,10 @@ impl VarMap {
         (0..self.values.len()).map(|slot| self.names.get(slot).expect("a name per value"))
     }
 
-    pub(crate) fn values(&self) -> std::slice::Iter<'_, Binding> {
-        self.values.iter()
+    /// The bindings, in slot order.
+    #[cfg(test)]
+    pub(crate) fn values(&self) -> impl Iterator<Item = BindingRef<'_>> + '_ {
+        self.values.iter().map(|slot| BindingRef { slot })
     }
 
     /// Byte offset of the generation counter within a `VarMap` (for the JIT's inline template).
@@ -2277,11 +2288,13 @@ impl VarMap {
     /// hit additionally requires the same nonzero ordered layout identity. Unknown compiler
     /// layouts simply retain the checked map path.
     pub(crate) fn jit_small_storage_layout() -> Option<JitBindingStorage> {
-        let storage = BindingVec::probe_jit_layout(|| Binding::data(Value::Num(7.0), true, true))?;
+        let storage = BindingVec::probe_jit_layout(|| {
+            BindingSlot::from(Binding::data(Value::Num(7.0), true, true))
+        })?;
         Some(JitBindingStorage {
             entries: std::mem::offset_of!(VarMap, values),
             storage,
-            stride: std::mem::size_of::<Binding>(),
+            stride: std::mem::size_of::<BindingSlot>(),
             binding: 0,
         })
     }
@@ -2328,8 +2341,7 @@ mod binding_layout_tests {
                     .borrow_mut()
                     .vars
                     .insert("source", Binding::data(Value::Obj(object), true, true));
-                let mut import = Binding::data(Value::Undefined, false, true);
-                import.set_import_reference(Some((exporter, crate::atom::atomize("source"))));
+                let import = Binding::live_import(exporter, crate::atom::atomize("source"));
                 global.borrow_mut().vars.insert("coldLeft", import.clone());
                 global.borrow_mut().vars.insert("coldRight", import);
                 Env::downgrade(&exporter)
@@ -2402,7 +2414,7 @@ mod binding_layout_tests {
             "same names preserve the key proof"
         );
         let binding = first.fixed_binding_at(slot).unwrap();
-        assert!(!binding.mutable && !binding.initialized);
+        assert!(!binding.mutable() && !binding.initialized());
         assert!(matches!((binding.value()).view(), ValueView::Num(999.)));
         first.insert("dynamic", Binding::data(Value::Num(7.), true, true));
         assert_eq!(first.layout_id(), 0);
@@ -2500,7 +2512,12 @@ mod binding_layout_tests {
                 .insert("injected", Binding::data(Value::Num(7.), true, true));
             assert_eq!(first.borrow().vars.layout_id(), 0);
             assert_eq!(evaluate(&mut engine, "one()===79 && two()===186"), "true");
-            first.borrow_mut().vars.get_mut("m").unwrap().initialized = false;
+            first
+                .borrow_mut()
+                .vars
+                .get_mut("m")
+                .unwrap()
+                .set_initialized(false);
             assert_eq!(
                 evaluate(&mut engine, "try {one(); 'bad'} catch(e) {e.name}"),
                 "ReferenceError"
@@ -2548,7 +2565,7 @@ mod binding_layout_tests {
         vars.publish_layout(id);
         vars.get_mut("value").unwrap().set_value(Value::Num(2.0));
         assert_eq!(vars.layout_id(), id);
-        vars.get_mut("value").unwrap().initialized = false;
+        vars.get_mut("value").unwrap().set_initialized(false);
         assert_eq!(vars.layout_id(), id, "TDZ is checked live");
         vars.insert("value", Binding::data(Value::Num(3.0), true, true));
         assert_eq!(vars.layout_id(), 0, "even same-key replacement invalidates");
@@ -2653,9 +2670,7 @@ impl Scope {
         } = self;
         vars.trace_storage(sink);
         lexical_names.trace(sink);
-        for binding in vars.values() {
-            binding.trace_edges(sink);
-        }
+        vars.trace_bindings(sink);
         if let Some(parent) = parent {
             sink.env(parent);
         }
@@ -2719,91 +2734,31 @@ impl ScopeNames {
     }
 }
 
+/// A binding as a record creates it: CreateMutableBinding (deletable for a sloppy eval's
+/// declarations), CreateImmutableBinding with its strictness, or a module's CreateImportBinding,
+/// and its value, which InitializeBinding gave it when it is initialized. [`VarMap::insert`]
+/// keeps it in the record's own representation; readers take a [`BindingRef`] and writers a
+/// [`BindingMut`], so that only `VarMap` knows how a binding is stored.
 #[derive(Clone)]
 pub struct Binding {
-    /// Execution word only; initialization remains an independent flag.
     value: Value,
-    pub mutable: bool,
-    /// `false` while a `let`/`const` is in its temporal dead zone.
-    pub initialized: bool,
-    /// A live module import: reads redirect to `(exporter scope, local name)`, kept in a
-    /// storage block of its own, which the binding's record reports: ordinary bindings need
-    /// only a nullable pointer, and the record nothing to drop.
-    pub(crate) import_ref: Option<crate::gc_storage::StorageBox<(Env, crate::atom::Atom)>>,
-    /// Native-visible kind bit, occupying existing flag padding. All structural insertion
-    /// paths normalize it; in-place import changes must use set_import_reference.
-    pub(crate) imported: bool,
-    /// `true` for a `var`/function binding created by a sloppy `eval` (CreateMutableBinding with
-    /// `deletable` set): `delete <name>` may remove it, unlike ordinary declarations.
-    pub deletable: bool,
-    /// For an *immutable* binding (`mutable == false`): whether it was created strict. A `const`
-    /// (CreateImmutableBinding(_, true)) always throws on reassignment; a named function
-    /// expression's own name (CreateImmutableBinding(_, false)) is a silent no-op in sloppy code
-    /// and throws only under strict mode. Irrelevant when `mutable` is true.
-    pub strict_immutable: bool,
+    mutable: bool,
+    initialized: bool,
+    deletable: bool,
+    strict_immutable: bool,
+    import: Option<(Env, crate::atom::Atom)>,
 }
-
-/// A bounded, environment-specific proof used by trivial accessor functions whose whole body is
-/// `return <identifier>`. Weak pins describe the live path from the function's captured
-/// environment through the binding's scope, prevent scope-allocation ABA, and retain no scope or
-/// value. Each structural generation validates the cached Binding pointer.
-#[derive(Clone)]
-pub(crate) struct BindingGetterScopeGuard {
-    pub(crate) pin: crate::interpreter::WeakEnv,
-    pub(crate) generation: u32,
-}
-
-#[derive(Clone)]
-pub(crate) struct BindingGetterCache {
-    pub(crate) name: Rc<str>,
-    pub(crate) scopes: Vec<BindingGetterScopeGuard>,
-    pub(crate) binding: *const Binding,
-}
-
-impl BindingGetterCache {
-    pub(crate) fn retained_requested_storage_bytes(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(
-            self.scopes
-                .capacity()
-                .saturating_mul(std::mem::size_of::<BindingGetterScopeGuard>()),
-        )
-    }
-}
-
-/// Keep getter binding caches shallow and deterministic in size; deeper lexical chains retain
-/// the ordinary Call path.
-pub(crate) const MAX_BINDING_GETTER_SCOPES: usize = 16;
 
 impl Binding {
-    #[inline]
-    pub(crate) fn value(&self) -> Value {
-        self.value
-    }
-
-    #[inline]
-    pub(crate) fn set_value(&mut self, value: Value) {
-        self.value = value;
-    }
-
-    pub(crate) const fn value_offset() -> usize {
-        std::mem::offset_of!(Self, value)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, crate::atom::Atom)>) {
-        self.imported = reference.is_some();
-        self.import_ref = reference.map(crate::gc_storage::StorageBox::new);
-    }
     pub(crate) fn data(value: Value, mutable: bool, initialized: bool) -> Binding {
         Binding {
             value,
             mutable,
             initialized,
-            import_ref: None,
-            imported: false,
             deletable: false,
             // An immutable binding created through this helper (const/TDZ) is strict by default.
             strict_immutable: !mutable,
+            import: None,
         }
     }
 
@@ -2812,21 +2767,120 @@ impl Binding {
         self
     }
 
+    /// The binding a sloppy direct eval's `var` or function declaration creates
+    /// (CreateMutableBinding(N, true)): `delete` may remove it.
+    pub(crate) fn deletable(mut self) -> Self {
+        self.deletable = true;
+        self
+    }
+
     pub(crate) fn live_import(environment: Env, name: crate::atom::Atom) -> Self {
         let mut binding = Self::data(Value::Undefined, false, true);
-        binding.import_ref = Some(crate::gc_storage::StorageBox::new((environment, name)));
-        binding.imported = true;
+        binding.import = Some((environment, name));
         binding
     }
 }
 
-impl crate::gc_trace::GcTrace for Binding {
-    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        self.trace_edges(sink);
+/// How a [`VarMap`] stores a binding, slot for slot: its value, whether it is initialized (TDZ)
+/// and its attributes. Only `VarMap` and its views read the fields; generated code reads them at
+/// the offsets `value::jit_layout` measures.
+#[derive(Clone)]
+pub(crate) struct BindingSlot {
+    /// Execution word only; initialization remains an independent flag.
+    value: Value,
+    mutable: bool,
+    /// `false` while a `let`/`const` is in its temporal dead zone.
+    initialized: bool,
+    /// A live module import: reads redirect to `(exporter scope, local name)`, kept in a
+    /// storage block of its own, which the binding's record reports: ordinary bindings need
+    /// only a nullable pointer, and the record nothing to drop.
+    import_ref: Option<crate::gc_storage::StorageBox<(Env, crate::atom::Atom)>>,
+    /// Native-visible kind bit, occupying existing flag padding: `import_ref.is_some()`.
+    imported: bool,
+    /// `true` for a `var`/function binding created by a sloppy `eval` (CreateMutableBinding with
+    /// `deletable` set): `delete <name>` may remove it, unlike ordinary declarations.
+    deletable: bool,
+    /// For an *immutable* binding (`mutable == false`): whether it was created strict. A `const`
+    /// (CreateImmutableBinding(_, true)) always throws on reassignment; a named function
+    /// expression's own name (CreateImmutableBinding(_, false)) is a silent no-op in sloppy code
+    /// and throws only under strict mode. Irrelevant when `mutable` is true.
+    strict_immutable: bool,
+}
+
+impl From<Binding> for BindingSlot {
+    #[inline]
+    fn from(binding: Binding) -> Self {
+        let Binding {
+            value,
+            mutable,
+            initialized,
+            deletable,
+            strict_immutable,
+            import,
+        } = binding;
+        BindingSlot {
+            value,
+            mutable,
+            initialized,
+            imported: import.is_some(),
+            import_ref: import.map(crate::gc_storage::StorageBox::new),
+            deletable,
+            strict_immutable,
+        }
     }
 }
 
-impl Binding {
+impl BindingSlot {
+    /// The binding's value: meaningful only while it is initialized.
+    #[inline]
+    pub(crate) fn value(&self) -> Value {
+        self.value
+    }
+
+    /// Whether the binding is initialized, out of its temporal dead zone.
+    #[inline]
+    pub(crate) fn initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Whether the binding is a module import, whose reads take the import's path.
+    #[inline]
+    pub(crate) fn is_import(&self) -> bool {
+        self.imported || self.import_ref.is_some()
+    }
+
+    /// Whether the binding is mutable (SetMutableBinding may write it).
+    #[inline]
+    pub(crate) fn mutable(&self) -> bool {
+        self.mutable
+    }
+
+    /// Write the value of an initialized binding in place (SetMutableBinding's write).
+    #[inline]
+    pub(crate) fn set_value(&mut self, value: Value) {
+        self.value = value;
+    }
+
+    /// InitializeBinding: write the value and end the temporal dead zone.
+    #[inline]
+    pub(crate) fn initialize(&mut self, value: Value) {
+        self.value = value;
+        self.initialized = true;
+    }
+
+    pub(crate) const fn value_offset() -> usize {
+        std::mem::offset_of!(Self, value)
+    }
+
+    /// Generated code's offsets of the fields it tests: `mutable`, `initialized`, `imported`.
+    pub(crate) const fn flag_offsets() -> (usize, usize, usize) {
+        (
+            std::mem::offset_of!(Self, mutable),
+            std::mem::offset_of!(Self, initialized),
+            std::mem::offset_of!(Self, imported),
+        )
+    }
+
     /// [`GcTrace`](crate::gc_trace::GcTrace)'s edges, for any sink.
     #[inline]
     fn trace_edges<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
@@ -2846,6 +2900,243 @@ impl Binding {
         }
     }
 }
+
+/// A binding of a [`VarMap`], to read: [`VarMap::get`] and the other lookups return it.
+#[derive(Clone, Copy)]
+pub(crate) struct BindingRef<'a> {
+    slot: &'a BindingSlot,
+}
+
+impl<'a> BindingRef<'a> {
+    /// The view of the binding a cache's pointer names.
+    ///
+    /// # Safety
+    /// `slot` came from [`BindingRef::as_ptr`] or [`BindingMut::as_mut_ptr`] of a record that is
+    /// alive and whose generation has not changed since, and no mutable view of it is live.
+    #[inline]
+    pub(crate) unsafe fn from_ptr(slot: *const BindingSlot) -> Self {
+        // SAFETY: the caller's contract.
+        Self {
+            slot: unsafe { &*slot },
+        }
+    }
+
+    /// The binding's value: meaningful only while it is initialized.
+    #[inline]
+    pub(crate) fn value(&self) -> Value {
+        self.slot.value
+    }
+
+    /// Whether the binding is initialized, out of its temporal dead zone.
+    #[inline]
+    pub(crate) fn initialized(&self) -> bool {
+        self.slot.initialized
+    }
+
+    #[inline]
+    pub(crate) fn mutable(&self) -> bool {
+        self.slot.mutable
+    }
+
+    /// For an immutable binding, whether it was created strict (see [`Binding`]).
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn strict_immutable(&self) -> bool {
+        self.slot.strict_immutable
+    }
+
+    /// Whether `delete` may remove the binding (a sloppy direct eval's declaration).
+    #[inline]
+    pub(crate) fn deletable(&self) -> bool {
+        self.slot.deletable
+    }
+
+    /// Whether the binding is a module import, whose reads take the import's path.
+    #[inline]
+    pub(crate) fn is_import(&self) -> bool {
+        self.slot.is_import()
+    }
+
+    /// A module import's target: the exporting module's environment and its local name.
+    #[inline]
+    pub(crate) fn import(&self) -> Option<(Env, crate::atom::Atom)> {
+        self.slot.import_ref.as_deref().copied()
+    }
+
+    /// The binding as a record would create it again (for copying it into another record).
+    pub(crate) fn to_binding(&self) -> Binding {
+        Binding {
+            value: self.slot.value,
+            mutable: self.slot.mutable,
+            initialized: self.slot.initialized,
+            deletable: self.slot.deletable,
+            strict_immutable: self.slot.strict_immutable,
+            import: self.import(),
+        }
+    }
+
+    /// The binding's storage, for a cache that validates it by its record's generation.
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const BindingSlot {
+        self.slot
+    }
+
+    /// The storage this view reads.
+    #[inline]
+    pub(crate) fn slot(&self) -> &'a BindingSlot {
+        self.slot
+    }
+}
+
+/// A binding of a [`VarMap`], to write in place: [`VarMap::get_mut`] and the other lookups
+/// return it. In-place writes keep the record's generation (see [`VarMap`]).
+pub(crate) struct BindingMut<'a> {
+    slot: &'a mut BindingSlot,
+}
+
+impl BindingMut<'_> {
+    /// The view of the binding a cache's pointer names, to write.
+    ///
+    /// # Safety
+    /// As [`BindingRef::from_ptr`], and no other view of the binding is live.
+    #[inline]
+    pub(crate) unsafe fn from_ptr(slot: *mut BindingSlot) -> Self {
+        // SAFETY: the caller's contract.
+        Self {
+            slot: unsafe { &mut *slot },
+        }
+    }
+
+    /// The binding's value: meaningful only while it is initialized.
+    #[inline]
+    pub(crate) fn value(&self) -> Value {
+        self.slot.value
+    }
+
+    /// Whether the binding is initialized, out of its temporal dead zone.
+    #[inline]
+    pub(crate) fn initialized(&self) -> bool {
+        self.slot.initialized
+    }
+
+    #[inline]
+    pub(crate) fn mutable(&self) -> bool {
+        self.slot.mutable
+    }
+
+    /// For an immutable binding, whether it was created strict (see [`Binding`]).
+    #[inline]
+    pub(crate) fn strict_immutable(&self) -> bool {
+        self.slot.strict_immutable
+    }
+
+    /// Whether the binding is a module import, whose reads take the import's path.
+    #[inline]
+    pub(crate) fn is_import(&self) -> bool {
+        self.slot.is_import()
+    }
+
+    /// Write the value in place (SetMutableBinding's write), leaving the TDZ state as it is.
+    #[inline]
+    pub(crate) fn set_value(&mut self, value: Value) {
+        self.slot.set_value(value);
+    }
+
+    /// InitializeBinding: write the value and end the temporal dead zone.
+    #[inline]
+    pub(crate) fn initialize(&mut self, value: Value) {
+        self.slot.initialize(value);
+    }
+
+    /// End the temporal dead zone without writing the value (the value is already in place).
+    #[inline]
+    pub(crate) fn mark_initialized(&mut self) {
+        self.slot.initialized = true;
+    }
+
+    /// Put the binding back in its temporal dead zone (tests, and a borrowed parameter's
+    /// empty word).
+    #[inline]
+    pub(crate) fn set_initialized(&mut self, initialized: bool) {
+        self.slot.initialized = initialized;
+    }
+
+    /// The binding's storage, for a cache that validates it by its record's generation.
+    #[inline]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut BindingSlot {
+        self.slot
+    }
+
+    /// Change the binding's attributes in place (tests: a cache must see them live).
+    #[cfg(test)]
+    pub(crate) fn set_attributes_for_test(
+        &mut self,
+        mutable: Option<bool>,
+        strict_immutable: Option<bool>,
+        deletable: Option<bool>,
+    ) {
+        if let Some(mutable) = mutable {
+            self.slot.mutable = mutable;
+        }
+        if let Some(strict) = strict_immutable {
+            self.slot.strict_immutable = strict;
+        }
+        if let Some(deletable) = deletable {
+            self.slot.deletable = deletable;
+        }
+    }
+
+    /// Set the native import kind bit alone, without a target (tests).
+    #[cfg(test)]
+    pub(crate) fn set_imported_flag_for_test(&mut self, imported: bool) {
+        self.slot.imported = imported;
+    }
+
+    /// Replace the binding in place, keeping the record's generation (tests: a cache must see
+    /// the change live).
+    #[cfg(test)]
+    pub(crate) fn replace_for_test(&mut self, binding: Binding) {
+        *self.slot = BindingSlot::from(binding);
+    }
+
+    /// Make the binding a module import of `reference`, or an ordinary binding (tests).
+    #[cfg(test)]
+    pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, crate::atom::Atom)>) {
+        self.slot.imported = reference.is_some();
+        self.slot.import_ref = reference.map(crate::gc_storage::StorageBox::new);
+    }
+}
+
+/// A bounded, environment-specific proof used by trivial accessor functions whose whole body is
+/// `return <identifier>`. Weak pins describe the live path from the function's captured
+/// environment through the binding's scope, prevent scope-allocation ABA, and retain no scope or
+/// value. Each structural generation validates the cached Binding pointer.
+#[derive(Clone)]
+pub(crate) struct BindingGetterScopeGuard {
+    pub(crate) pin: crate::interpreter::WeakEnv,
+    pub(crate) generation: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct BindingGetterCache {
+    pub(crate) name: Rc<str>,
+    pub(crate) scopes: Vec<BindingGetterScopeGuard>,
+    pub(crate) binding: *const BindingSlot,
+}
+
+impl BindingGetterCache {
+    pub(crate) fn retained_requested_storage_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            self.scopes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<BindingGetterScopeGuard>()),
+        )
+    }
+}
+
+/// Keep getter binding caches shallow and deterministic in size; deeper lexical chains retain
+/// the ordinary Call path.
+pub(crate) const MAX_BINDING_GETTER_SCOPES: usize = 16;
 
 /// A new environment record.
 #[inline]
@@ -10714,7 +11005,7 @@ impl Interp {
         {
             return true;
         }
-        if let Some(b) = env.borrow_mut().vars.get_mut(&name) {
+        if let Some(mut b) = env.borrow_mut().vars.get_mut(&name) {
             b.set_value(*v);
             return true;
         }
@@ -13554,7 +13845,7 @@ impl Interp {
             .borrow()
             .vars
             .get("this")
-            .map(|binding| (binding.value(), binding.initialized));
+            .map(|binding| (binding.value(), binding.initialized()));
         match binding {
             Some((this, true)) => Ok(this),
             _ => Err(self.throw_in_caller_realm(
@@ -15832,7 +16123,7 @@ impl Interp {
                                 .borrow()
                                 .vars
                                 .get("this")
-                                .map(|b| (b.value(), b.initialized));
+                                .map(|b| (b.value(), b.initialized()));
                             if let Some((t, init)) = found {
                                 result = if derived && !init {
                                     Err(self.throw_in_caller_realm(
@@ -16306,11 +16597,11 @@ impl Interp {
                 .borrow()
                 .vars
                 .get(name.as_str())
-                .filter(|b| b.initialized)
+                .filter(|b| b.initialized())
                 .map(|b| b.value());
             if let Some(v) = seeded {
                 let mut bs = body_scope.borrow_mut();
-                if let Some(b) = bs.vars.get_mut(&name) {
+                if let Some(mut b) = bs.vars.get_mut(&name) {
                     // Only a plain `var` slot (still `undefined`) inherits the parameter value; a
                     // function declaration keeps its function object.
                     if matches!((b.value()).view(), ValueView::Undefined) {
@@ -16868,7 +17159,7 @@ impl Interp {
         // they are visible as `globalThis.<name>` and writes stay in sync. Only the plan-computed
         // names move — lexical bindings from earlier scripts stay in the environment.
         for (name, is_func) in new_vars {
-            let Some(binding) = self.global_env.borrow_mut().vars.remove(name) else {
+            let Some(value) = self.global_env.borrow_mut().vars.remove(name) else {
                 continue;
             };
             let existing = self
@@ -16882,7 +17173,7 @@ impl Interp {
                     self.global
                         .borrow_mut()
                         .props
-                        .insert(name, Property::data(binding.value(), true, true, false));
+                        .insert(name, Property::data(value, true, true, false));
                 }
                 // CreateGlobalFunctionBinding: a configurable property is fully redefined; a
                 // non-configurable one (already validated writable) just takes the new value.
@@ -16890,13 +17181,10 @@ impl Interp {
                     self.global
                         .borrow_mut()
                         .props
-                        .insert(name, Property::data(binding.value(), true, true, false));
+                        .insert(name, Property::data(value, true, true, false));
                 }
                 Some((true, _)) if is_func => {
-                    self.global
-                        .borrow_mut()
-                        .props
-                        .set_value(name, binding.value());
+                    self.global.borrow_mut().props.set_value(name, value);
                 }
                 _ => {}
             }

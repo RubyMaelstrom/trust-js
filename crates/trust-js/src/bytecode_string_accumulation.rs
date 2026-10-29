@@ -100,12 +100,8 @@ fn try_store(
             if record.has_with_object() || record.parent.is_none() {
                 return None;
             }
-            if let Some(binding) = record.vars.get_mut(name) {
-                if !binding.initialized
-                    || !binding.mutable
-                    || binding.import_ref.is_some()
-                    || binding.imported
-                {
+            if let Some(mut binding) = record.vars.get_mut(name) {
+                if !binding.initialized() || !binding.mutable() || binding.is_import() {
                     return None;
                 }
                 let original = binding.value();

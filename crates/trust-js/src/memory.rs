@@ -1199,7 +1199,7 @@ impl Visitor {
         // The names are atoms, which their heap's table accounts.
         for (_, binding) in scope.vars.iter() {
             self.value(&binding.value());
-            if binding.import_ref.is_some() {
+            if binding.is_import() {
                 bytes =
                     bytes.saturating_add(size_of::<(crate::interpreter::Env, crate::atom::Atom)>());
             }

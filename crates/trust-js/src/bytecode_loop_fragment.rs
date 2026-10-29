@@ -238,7 +238,7 @@ pub(crate) fn enter(
             if let Some(binding) = scope.vars.get(name) {
                 slots.write_value(
                     *slot as usize,
-                    if binding.initialized {
+                    if binding.initialized() {
                         binding.value()
                     } else {
                         Value::Empty
@@ -445,12 +445,12 @@ fn function_private_bindings(
             !name.starts_with('%')
                 && name != "this"
                 && name != "arguments"
-                && !binding.imported
-                && !binding.deletable
+                && !binding.is_import()
+                && !binding.deletable()
                 && !captured.contains(&*name)
                 && !runtime_lexicals.contains(&*name)
         })
-        .map(|(name, binding)| (Rc::<str>::from(&*name.text()), !binding.mutable))
+        .map(|(name, binding)| (Rc::<str>::from(&*name.text()), !binding.mutable()))
         .take(64)
         .collect::<Vec<_>>();
     if let Source::For(
@@ -474,7 +474,7 @@ fn function_private_bindings(
                 let scope = environment.borrow();
                 if let Some(binding) = scope.vars.get(name.as_str()) {
                     names.retain(|(old, _)| old.as_ref() != name);
-                    names.push((Rc::from(name.as_str()), !binding.mutable));
+                    names.push((Rc::from(name.as_str()), !binding.mutable()));
                     break;
                 }
                 cursor = scope.parent;
@@ -488,7 +488,7 @@ fn function_private_bindings(
         while let Some(environment) = cursor {
             let scope = environment.borrow();
             if let Some(binding) = scope.vars.get(name) {
-                *is_const = !binding.mutable;
+                *is_const = !binding.mutable();
                 break;
             }
             cursor = scope.parent;

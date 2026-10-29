@@ -256,7 +256,7 @@ fn binding_entry_emitters_read_live_scopes() {
             let expected = scope
                 .vars
                 .fixed_binding_at(slot)
-                .map_or(usize::MAX, |binding| binding as *const Binding as usize);
+                .map_or(usize::MAX, |binding| binding.as_ptr() as usize);
             assert_eq!(
                 binding(base, slot),
                 expected,

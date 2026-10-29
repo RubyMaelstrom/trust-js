@@ -109,9 +109,24 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
     for kind in 0..7 {
         let env = scope(&engine, Value::lstr("prefix"));
         match kind {
-            0 => env.borrow_mut().vars.get_mut("result").unwrap().initialized = false,
-            1 => env.borrow_mut().vars.get_mut("result").unwrap().mutable = false,
-            2 => env.borrow_mut().vars.get_mut("result").unwrap().imported = true,
+            0 => env
+                .borrow_mut()
+                .vars
+                .get_mut("result")
+                .unwrap()
+                .set_initialized(false),
+            1 => env
+                .borrow_mut()
+                .vars
+                .get_mut("result")
+                .unwrap()
+                .set_attributes_for_test(Some(false), None, None),
+            2 => env
+                .borrow_mut()
+                .vars
+                .get_mut("result")
+                .unwrap()
+                .set_imported_flag_for_test(true),
             3 => env
                 .borrow_mut()
                 .vars

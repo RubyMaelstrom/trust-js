@@ -117,11 +117,11 @@ impl Drop for Scope<'_> {
         for alias in &aliases[self.floor..] {
             let word = unsafe { &*alias.slot }.get();
             let mut scope = alias.environment.borrow_mut();
-            let binding = scope
+            let mut binding = scope
                 .vars
                 .get_mut(&alias.name)
                 .expect("borrowed binding remains present");
-            binding.initialized = !word.is_empty();
+            binding.set_initialized(!word.is_empty());
             binding.set_value(word);
         }
         aliases.truncate(self.floor);
@@ -185,8 +185,8 @@ mod tests {
                     let parked = environment.borrow();
                     let old = parked.vars.get("old").unwrap();
                     assert!(matches!((old.value()).view(), ValueView::Undefined));
-                    assert!(old.initialized && !old.mutable && old.strict_immutable);
-                    assert!(!parked.vars.get("later").unwrap().initialized);
+                    assert!(old.initialized() && !old.mutable() && old.strict_immutable());
+                    assert!(!parked.vars.get("later").unwrap().initialized());
                 }
                 slots[0].set(Value::Num(7.0));
                 panic!("test restoration on Rust unwind");
@@ -202,9 +202,9 @@ mod tests {
             let restored = environment.borrow();
             let old = restored.vars.get("old").unwrap();
             assert!(matches!((old.value()).view(), ValueView::Num(7.0)));
-            assert!(old.initialized && !old.mutable && old.strict_immutable);
+            assert!(old.initialized() && !old.mutable() && old.strict_immutable());
             let later = restored.vars.get("later").unwrap();
-            assert!(!later.initialized && later.mutable);
+            assert!(!later.initialized() && later.mutable());
             assert!(matches!((later.value()).view(), ValueView::Empty));
         }
         engine.interp.gc_collect();

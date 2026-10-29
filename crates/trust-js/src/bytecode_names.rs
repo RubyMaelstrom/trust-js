@@ -5,7 +5,7 @@
 //! followed live and every holder value, mutability and TDZ flag is read live.
 
 use super::{Chunk, NameIc};
-use crate::interpreter::{Abrupt, Binding, Env, Interp, Scope, VarMap};
+use crate::interpreter::{Abrupt, BindingSlot, Env, Interp, Scope, VarMap};
 use crate::value::{Exotic, Value};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -31,7 +31,7 @@ pub(crate) struct NativeNameDescriptor {
     pub(crate) len: usize,
     pub(crate) kind: u32,
     pub(crate) shape: u32,
-    pub(crate) binding: *const Binding,
+    pub(crate) binding: *const BindingSlot,
     pub(crate) slot: usize,
 }
 
@@ -68,7 +68,7 @@ impl Guard {
 
 enum Target {
     Binding {
-        pointer: *const Binding,
+        pointer: *const BindingSlot,
         slot: Option<usize>,
     },
     Global {
@@ -135,17 +135,18 @@ impl ResolutionIc {
                     let binding = if guard.pin.as_ptr() == Env::as_ptr(&env)
                         && scope.vars.matches_generation(guard.generation)
                     {
-                        unsafe { &*pointer }
+                        pointer
                     } else {
                         slot.and_then(|slot| scope.vars.binding_at(slot, name))
                             .or_else(|| scope.vars.get(name))?
+                            .as_ptr()
                     };
                     return Some(crate::eval::PreparedReference::scope_with_hint(
                         name.clone(),
                         env,
                         i.strict,
                         scope.vars.generation(),
-                        binding as *const Binding as *mut Binding,
+                        binding.cast_mut(),
                     ));
                 }
                 Target::Global { shape, slot } => {
@@ -190,7 +191,7 @@ impl ResolutionIc {
             });
             let target = if let Some(binding) = scope.vars.get(name) {
                 Some(Target::Binding {
-                    pointer: binding,
+                    pointer: binding.as_ptr(),
                     slot: scope.vars.binding_slot(name),
                 })
             } else if Env::ptr_eq(&env, &i.global_env) {
@@ -286,7 +287,7 @@ impl Chunk {
 }
 
 impl DeepNameIc {
-    fn binding<'a>(&self, env: &Env, vars: &'a VarMap, name: &str) -> Option<&'a Binding> {
+    fn binding<'a>(&self, env: &Env, vars: &'a VarMap, name: &str) -> Option<&'a BindingSlot> {
         let Target::Binding { pointer, slot } = self.target else {
             return None;
         };
@@ -296,6 +297,7 @@ impl DeepNameIc {
             Some(unsafe { &*pointer })
         } else {
             slot.and_then(|slot| vars.binding_at(slot, name))
+                .map(|binding| binding.slot())
         }
     }
 
@@ -311,8 +313,13 @@ impl DeepNameIc {
             Target::Binding { .. } => {
                 let binding = self
                     .binding(env, &scope.vars, &chunk.names[self.name as usize])
-                    .or_else(|| scope.vars.get(&chunk.names[self.name as usize]))?;
-                (binding.initialized && binding.import_ref.is_none()).then(|| binding.value())
+                    .or_else(|| {
+                        scope
+                            .vars
+                            .get(&chunk.names[self.name as usize])
+                            .map(|binding| binding.slot())
+                    })?;
+                (binding.initialized() && !binding.is_import()).then(|| binding.value())
             }
             Target::Global { shape, slot } => {
                 if !Env::ptr_eq(env, &i.global_env)
@@ -363,8 +370,8 @@ impl DeepNameIc {
                 } else {
                     scope.vars.get_mut(&chunk.names[self.name as usize])
                 };
-                if let Some(binding) = binding {
-                    if binding.initialized && binding.mutable && binding.import_ref.is_none() {
+                if let Some(mut binding) = binding {
+                    if binding.initialized() && binding.mutable() && !binding.is_import() {
                         binding.set_value(value.take().unwrap());
                         return true;
                     }
@@ -434,12 +441,12 @@ impl Chunk {
                 layout: scope.vars.layout_id(),
             });
             let resolved = if let Some(binding) = scope.vars.get(&self.names[n as usize]) {
-                if !binding.initialized || binding.import_ref.is_some() {
+                if !binding.initialized() || binding.is_import() {
                     return None;
                 }
                 Some((
                     Target::Binding {
-                        pointer: binding,
+                        pointer: binding.as_ptr(),
                         slot: scope.vars.binding_slot(&self.names[n as usize]),
                     },
                     binding.value(),
@@ -516,7 +523,7 @@ impl Chunk {
 mod tests {
     use super::*;
     use crate::bytecode::Op;
-    use crate::interpreter::{new_binding_layout_id, new_scope};
+    use crate::interpreter::{new_binding_layout_id, new_scope, Binding};
     use crate::value::Callable;
     use crate::value::ValueView;
     use crate::Engine;
@@ -603,21 +610,26 @@ mod tests {
                 .vars
                 .get_mut("outer")
                 .unwrap()
-                .initialized = false;
+                .set_initialized(false);
             assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
             holder2
                 .borrow_mut()
                 .vars
                 .get_mut("outer")
                 .unwrap()
-                .initialized = true;
-            holder2.borrow_mut().vars.get_mut("outer").unwrap().mutable = false;
+                .set_initialized(true);
             holder2
                 .borrow_mut()
                 .vars
                 .get_mut("outer")
                 .unwrap()
-                .strict_immutable = true;
+                .set_attributes_for_test(Some(false), None, None);
+            holder2
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .set_attributes_for_test(None, Some(true), None);
             assert!(chunk
                 .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(99.0))
                 .is_err());
@@ -738,7 +750,7 @@ mod tests {
                 .vars
                 .get_mut("outer")
                 .unwrap()
-                .initialized = false;
+                .set_initialized(false);
             let mut reference = chunk
                 .resolve_name_reference(&mut engine.interp, &holder, name)
                 .ok()
@@ -758,13 +770,18 @@ mod tests {
                     .map(|__value| (__value).view()),
                 Ok(crate::value::ValueView::Num(31.0))
             ));
-            fresh.borrow_mut().vars.get_mut("outer").unwrap().mutable = false;
             fresh
                 .borrow_mut()
                 .vars
                 .get_mut("outer")
                 .unwrap()
-                .strict_immutable = true;
+                .set_attributes_for_test(Some(false), None, None);
+            fresh
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .set_attributes_for_test(None, Some(true), None);
             assert!(engine
                 .interp
                 .write_prepared_reference(&mut reference, Value::Num(37.0))

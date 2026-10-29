@@ -411,7 +411,7 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
                     .vars
                     .get("self")
                     .expect("self binding exists at closure creation");
-                assert!(!binding.mutable && binding.initialized && !binding.strict_immutable);
+                assert!(!binding.mutable() && binding.initialized() && !binding.strict_immutable());
                 assert!(
                     matches!(&(binding.value()).view(), ValueView::Obj(bound) if crate::value::Gc::ptr_eq(bound, &object))
                 );

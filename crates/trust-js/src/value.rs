@@ -1884,10 +1884,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             == PACK_EMPTY
         && unsafe { *((Env::as_ptr(&probe_with) as usize + scope_with) as *const u64) }
             == PACK_NULL;
-    let binding_value = crate::interpreter::Binding::value_offset();
-    let binding_mutable = offset_of!(crate::interpreter::Binding, mutable);
-    let binding_init = offset_of!(crate::interpreter::Binding, initialized);
-    let binding_import = offset_of!(crate::interpreter::Binding, imported);
+    let binding_value = crate::interpreter::BindingSlot::value_offset();
+    let (binding_mutable, binding_init, binding_import) =
+        crate::interpreter::BindingSlot::flag_offsets();
 
     // Code-keyed call probe: `Callable` is repr(u8) (discriminant byte, then one payload word)
     // and `UserCallable` is repr(C). Verify both on live values: a native callable, and a

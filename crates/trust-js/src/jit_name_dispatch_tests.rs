@@ -2,7 +2,7 @@
 //! relocation of cold code must not weaken identity, with, generation, import or TDZ checks.
 use super::*;
 use crate::bytecode::NameIc;
-use crate::interpreter::{new_binding_layout_id, new_scope, Binding, Env};
+use crate::interpreter::{new_binding_layout_id, new_scope, Binding, BindingSlot, Env};
 use std::cell::Cell;
 use std::mem::{offset_of, size_of};
 
@@ -132,12 +132,12 @@ fn binding_ic(env: &Env) -> (NameIc, ProbeResult) {
     (
         NameIc {
             env: Env::as_ptr(env) as usize,
-            binding: binding as *const Binding as usize as u64,
+            binding: binding.as_ptr() as usize as u64,
             gen: scope.vars.generation(),
             act_gen: 0,
         },
         ProbeResult {
-            address: binding as *const Binding as usize + Binding::value_offset(),
+            address: binding.as_ptr() as usize + BindingSlot::value_offset(),
             owner_kind: 0,
         },
     )
@@ -200,7 +200,7 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
             let env = new_scope(None);
             env.borrow_mut().vars = VarMap::from_fixed_bindings(
                 (0..24)
-                    .map(|n| Binding::data(Value::Num(n as f64), true, true))
+                    .map(|n| BindingSlot::from(Binding::data(Value::Num(n as f64), true, true)))
                     .collect(),
                 kept,
             );
@@ -220,8 +220,8 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
         });
         let code = native_probe(&layout, &cache, true);
         for env in [&first, &second] {
-            let expected = env.borrow().vars.get("v23").unwrap() as *const Binding as usize
-                + Binding::value_offset();
+            let expected = env.borrow().vars.get("v23").unwrap().as_ptr() as usize
+                + BindingSlot::value_offset();
             assert_eq!(
                 probe(&code, &ProbeContext::new(&engine, env)),
                 ProbeResult {
@@ -231,9 +231,19 @@ fn name_dispatch_fixed_layout_uses_current_word_activation_and_live_flags() {
             );
         }
         let context = ProbeContext::new(&engine, &second);
-        second.borrow_mut().vars.get_mut("v23").unwrap().initialized = false;
+        second
+            .borrow_mut()
+            .vars
+            .get_mut("v23")
+            .unwrap()
+            .set_initialized(false);
         assert_eq!(probe(&code, &context).address, 0);
-        second.borrow_mut().vars.get_mut("v23").unwrap().initialized = true;
+        second
+            .borrow_mut()
+            .vars
+            .get_mut("v23")
+            .unwrap()
+            .set_initialized(true);
         second
             .borrow_mut()
             .vars
@@ -334,9 +344,17 @@ fn name_dispatch_native_binding_preserves_identity_with_tdz_import_and_exhaustio
         .set_with_object(Some(Value::Obj(engine.interp.global)));
     assert_eq!(probe(&code, &context).address, 0);
     env.borrow_mut().set_with_object(None);
-    env.borrow_mut().vars.get_mut("outer").unwrap().initialized = false;
+    env.borrow_mut()
+        .vars
+        .get_mut("outer")
+        .unwrap()
+        .set_initialized(false);
     assert_eq!(probe(&code, &context).address, 0);
-    env.borrow_mut().vars.get_mut("outer").unwrap().initialized = true;
+    env.borrow_mut()
+        .vars
+        .get_mut("outer")
+        .unwrap()
+        .set_initialized(true);
     env.borrow_mut()
         .vars
         .get_mut("outer")
