@@ -2491,6 +2491,94 @@ doctests and the downstream crates; zombie's build and clippy, x86-64 counts unc
 S4: the codePointAt template takes "one-byte" from the ASCII hint, so a Latin-1 buffer made
 without it would read as two-byte; S4 updates this arm and charCodeAt's (noted in lstr.rs).
 
+Then item 5's setters (92874629..40bcadf6, 2026-10-29, an agent's; Decision 17's shape; landed on
+targeted tests under the owner's rule):
+- 92874629: a store's cache records accessors as a read's does (`IC_ACCESSOR` with the depth and
+  the receiver's, intermediate and holder's shapes): an own accessor at the store's own lookup, an
+  inherited one once the creation path declines, when every object up to the holder is ordinary
+  and plain within `IC_MAX_DEPTH` hops. A hit proves the chain again, so a Proxy anywhere takes the
+  generic path, and calls the live [[Set]] with the original receiver as `this` and the value as
+  its one argument, its result ignored (ECMA-262 §10.1.9.2 steps 3-7); an accessor without a
+  setter fails silently in sloppy code and throws in strict code (PutValue step 3.e). Both
+  backends. Profiled stores keep the canonical [[Set]]; `try_ic_set` takes its accessor switch
+  as a const parameter and `set_prop_ic` is inlined, so the data stores' Rust path got shorter.
+- 41c30af5 (ARM64): the stores' helper stub calls setters at run time, from any store's code
+  whenever it was made. It finds the store's setter call cache by pc in the chunk's setter table
+  (the getter table generalized: an accessor table whose slots also name a store's property
+  cache), which the helper fills the first time it calls a user setter there. A read's template
+  validates its accessor at the site; a store carries no accessor code: the stub proves it, as the
+  exemplars' shared code does, with the reads' way loop over the store's cache and an accessor at
+  the holder's slot. It reads the live [[Set]] from the pair (an absent one matches no callee and
+  takes the helper), probes the call cache by identity and runs the direct sequence on [receiver,
+  setter, V] with argc 1, dropping the setter's result. `SetProp` keeps V below the window as the
+  assignment's value; that form and the `this` and local forms need two operand words above the
+  store's depth, which chunks with such stores now reserve (`Cfg::jit_stack_capacity`). A
+  declining gate puts the operands back; a throw is placed at the store.
+- 40bcadf6: `o.k += v` statements (AppendProp) took the generic op helper; the ARM64 template now
+  adds two Numbers in line and stores the sum through the store template under the operation's
+  store cache, whose helper takes it as a `SetPropDrop` (and a setter, the stub's sequence).
+  Strings, BigInts and objects keep the generic operation.
+
+What the exemplars do (the forks the getters' notes left open):
+- V8 (c8b709085e21) calls setters from its store IC builtin, which Sparkplug calls for every named
+  store (baseline-compiler.cc:1189-1200): an own accessor's handler is the AccessorPair, whose live
+  setter it calls (accessor-assembler.cc:1750-1758); an inherited one's holds the setter weakly
+  under the chain's validity cell (:2279-2289). Only callable JSFunction setters are cached; a
+  missing setter takes the slow stub (ic.cc:2585-2649). The bytecode keeps an assignment's value in
+  a register around the store and ignores the IC's result (bytecode-generator.cc:5164-5181).
+- SpiderMonkey (firefox bf75471716c5) attaches CallScriptedSetter after the data-slot stubs
+  (CacheIR.cpp:4423-4426, 4776-4815), guarding the receiver's, prototypes' and holder's shapes and
+  the GetterSetter (:1089-1127), only for a function setter (:4700-4745). The stub pushes V, the
+  receiver as `this` and the callee and calls with argc 1, the result dropped
+  (BaselineCacheIRCompiler.cpp:1530-1607); baseline code keeps the right-hand side on its stack
+  under the IC call (BaselineCodeGen.cpp:3854-3868).
+- JavaScriptCore (WebKit 148206b06ccb) runs one global setter-handler thunk for every site
+  (InlineCacheCompiler.cpp:5977-6002): after the handler's structure check it reads the live setter
+  from the GetterSetter at the holder's offset, substitutes the strict null setter (which throws)
+  in strict code and calls the no-op one in sloppy code, and calls with two parameters (this, V)
+  through the handler's own call link info (:5909-5970).
+- Taken here: the proof and the call in shared code with per-site data (all three); the live
+  [[Set]] read from the pair (V8's own-accessor handler, JSC); a per-site call cache (JSC's
+  per-handler CallLinkInfo); V kept on the operand stack below the call (SpiderMonkey's baseline
+  stack, V8's register); a missing setter to the helper (V8, SpiderMonkey).
+
+Per iteration against 19fe9dc5, the series' parent before its rebase onto step 7 (fat LTO, user
+instructions, pinned outside perf to the A725 cores with address randomization off, pacing off, the
+loop's 14 removed; after each commit in turn): a class setter on an instance 1,666 to 1,109, 432,
+432; a setter two prototypes up 1,831 to 470; an object literal's own setter 1,430 to 437; a static
+setter 1,440 to 394; `this.x = v` in a method 1,890 to 666 (the same method storing data: 338); a
+kept value `(o.x = v)` 1,448 to 455; a store in a function's first native code 1,909 to 677;
+`o.x += 1` through a getter and setter 1,960 to 1,624, 1,631, 787, and on data 602 to 554, 555, 186;
+data stores (117), construction (721), method calls (351) and the getter cases (384, 882, 632)
+unchanged. Fixtures (median of 3): Vue -0.24%, -0.22%, -0.05%; React -0.01%, +0.01%, +0.01%; Djot
+-0.07%, -0.06%, -0.05%; Web Tooling's chai +0.01%, +0.01%, -0.02%; Djot's collections unchanged (21
+minor, 1 major). Vue's +0.17% at the third commit is the binary's layout: AppendProp never runs in
+Vue, its generated code grows 3 words, and over ten runs with randomization on (each engine's runs
+spread about 0.2%) the series' Vue mean moves -0.02%, React's +0.00% and Djot's -0.06%. Generated
+code: Vue +3 words of 169,543, React unchanged, Djot -2. x86-64, where every store takes the helper
+(zombie, the same method on one core, base against the tip): setters 413-799 fewer (a class setter
+1,878 to 1,229), data stores 339 to 294, the getters, construction and calls unchanged; Vue -0.14%,
+React -0.00%, Djot -0.41%. Rebased onto step 7 (9045a888), the tip against it: every case above
+the same; Vue -0.16%, React +0.01%, Djot -0.05%, chai -0.03%, collections unchanged.
+
+Validation: jit_setter_call_tests.rs, against Node v24 in every tier (cold and warm native code):
+every store form at depths 0-6, polymorphic, code-keyed, environment-building and native
+(`__proto__`) setters, Proxies on the chain, frozen and non-extensible receivers, primitives,
+missing setters sloppy and strict, the assignment's value whatever the setter returns, compound
+assignments and updates (the getter, then the setter), `+=` on data, frozen, read-only and
+inherited properties, -0, NaN, strings, BigInts and valueOf, and setters that throw, recurse past
+the stack limit, collect, or reshape the receiver and replace themselves; on ARM64 each form's
+setter completes through the sequence from first and warm code, a throw is placed at the store, a
+running setter's receiver, function and value are roots, and spliced stores' setters record their
+inline positions. GC stress on those four tests; the targeted lib tests (393: setters, accessors,
+getters, assignments, property reads, stores and creation, shapes, prototypes, feedback, mapped
+arguments, appends) and the JIT module's (391); Test262's assignment, compound and logical
+assignment, update, object and class expression, class statement, defineProperty and
+defineProperties, Reflect.set and Proxy set directories at the native tier, 12,563 of 12,563;
+clippy and fmt; zombie's clippy, targeted tests (334) and release build. Not covered, as for
+getters: in-line stubs and chunks without direct calls (loop fragments, detailed feedback), chain
+replays and x86-64 (their setters run from Rust, through the cache's proof).
+
 ### W3 item 3: the closure entry (census and design, 2026-10-28; decided, Decisions 20 and 21)
 
 Item 3, as the stage's design has it: a callee that needs an environment builds it in its prologue,
