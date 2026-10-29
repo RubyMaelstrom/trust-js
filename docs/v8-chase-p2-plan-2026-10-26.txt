@@ -3512,6 +3512,97 @@ records (331b9f32..50530f50 when measured and gated):
 Open: lifting the other slot guards (bodies past about 510 slots), the RegExp tier's MAX_SLOTS and
 its code-size cap, each a measured change of its own.
 
+### W3: static name addressing (census and design, 2026-10-29; Decision 21)
+
+Census (main a25e56c5, an agent's; fat LTO, ARM64, address randomization off; perf record -g
+--user-callchains on instructions:u, one sample per 250K instructions, 1M for chai, each sample
+counted where it lands; scripts in target/p2/w3-i3b/names). Share of user instructions spent
+resolving names:
+
+| | total | shared name stubs (deep-chain mode) | in-line name code | Rust IC | tree-walker |
+| --- | --- | --- | --- | --- | --- |
+| Vue | 11.4% | 8.5% (5.2%) | 2.4% | 0.5% | ~0 |
+| React | 11.7% | 4.3% (none; fixed-layout mode 0.8%) | 3.75% | - | 3.5% |
+| Djot | 4.5% | 2.2% (0.75%) | 1.5% | 0.4% | 0.4% |
+| chai | 7.9% | 3.0% (1.75%) | 0.35% | 4.4% | - |
+
+The stubs include their mode classification (Vue 2.2%); chai's Rust share is refills after JIT
+LoadName misses (name_ic_fill 3.2% inclusive, the deep IC's WeakRef pins 1.26%). Global-object
+names are almost absent: nearly all of it is function and block scopes. Per iteration: a closure
+call 261 with no outer read, +43 for one read one hop out, +39 for each more, +109 for one read
+two hops out; a let reads as a var; a function's own captured var in a frame the tree-walker
+started and a loop fragment continued 59 a read (step 5's deviation); a store to an outer var 99,
+`++` 90, `this.v` in an arrow 70; outer reads in loops about 1 (the region compiler keeps them in
+registers). A static read is 1 + hops + 1 loads, and a TDZ test of 2 for let and const: about 3-6.
+Static addressing is worth about 9-10% on Vue and 6-7% on chai, and part of React and Djot.
+
+The exemplars (V8 c8b709085e21, SpiderMonkey bf75471716c5, JSC 260278048486):
+- V8: Scope::Lookup (src/ast/scopes.cc:2224-2302) puts captured or eval-visible variables in
+  context slots (MustAllocateInContext, 2614-2631); hops count only scopes with a context
+  (ContextChainLength, 1560-1583); LdaContextSlot is depth loads and one more, unguarded
+  (interpreter-assembler.cc:209-233; Sparkplug unrolls it, baseline-assembler-arm64-inl.h:656-664).
+  Past a sloppy-eval scope a reference becomes kDynamicLocal or kDynamicGlobal, keeping its slot
+  behind per-hop extension checks (code-stub-assembler.cc:15860-15893); eval's vars go to a side
+  extension object and never move a slot (runtime-scopes.cc:440-459). `with` is dynamic
+  (scopes.cc:2311-2344); TDZ is a hole test where not proven (scopes.cc:2441-2543).
+- SpiderMonkey: closed-over bindings get environment slots (Parser.cpp:894-965); an
+  EnvironmentCoordinate is (hops, slot) over scopes with an environment (NameAnalysisTypes.h:19-67,
+  Scope.h:399-413); GetAliasedVar is unguarded and "can't be used when there's a dynamic scope (due
+  to non-strict eval or with) that might shadow" (Opcodes.h:2910-2911); such names are dynamic,
+  GetName with an IC (EmitterScope.cpp:594-599, 837-839, 940-941); TDZ checks unless proven
+  initialized (BytecodeEmitter.cpp:1583-1647).
+- JSC: resolve_scope and get_from_scope (BytecodeList.rb:514-563), linked against the closure's
+  real chain (CodeBlock.cpp:579-629, JSScope.cpp:58-108), valid for every instance since closures
+  of one function share symbol tables; ClosureVar walks depth links and loads the slot
+  (LowLevelInterpreter64.asm:2854-2866); past a sloppy-eval scope, one realm watchpoint fired by
+  the first var-declaring sloppy eval (JSScope.cpp:106-107, Interpreter.cpp:1530-1531); `with`
+  resolves by name.
+
+Why they can, and TRust cannot yet: each engine has one scope analysis that every tier follows,
+so a record exists with the same slots in every tier and a (hops, slot) proven once holds for
+every closure. TRust builds environments twice: compiled tiers by ActivationPlan (captured
+bindings only, and a record only when the function makes one), the tree-walker always (every
+binding, in insertion order, spilled past two slots). Which tier made a record changes its slots
+and whether it exists (a middle function without captures has an activation under the tree-walker
+and none compiled; Vue's module functions run once in the tree-walker), which is why the deep IC
+guards every hop and chai keeps refilling it. SpiderMonkey's rule applies directly: static (hops,
+slot) where no sloppy-eval function or `with` lies on the path, today's name ICs (the guard)
+otherwise. V8's extension checks and JSC's watchpoint would keep static slots under eval; the
+census has neither eval nor `with`.
+
+Design:
+1. A plan per function (CaptureScan, cached on the Function node): Opaque (direct eval or `with`
+   inside, its nested functions included; parameter expressions; more than 506 bindings; script,
+   module and eval code), Private (no captures, no lexical `this`, no captured `arguments`, no
+   mapped formals, no arrow observing new.target or `super`), or Public (a prefix of the captured
+   function-level names, and `this` when an arrow reads it, in sorted order).
+2. One activation layout: the tree-walker makes a Public function's activation at the plan's size
+   with the prefix first, which FunctionDeclarationInstantiation then initializes in place; the
+   compiled ActivationPlan orders the same prefix first, and a fresh-frame chunk that would
+   disagree does not compile.
+3. Private records: the tree-walker flags a Private function's activation, and closure creation
+   (`make_function_named`, every tier's) takes the nearest non-private record as [[Environment]],
+   which nothing can observe; every closure chain then has the same records in every tier.
+4. A static outer context on each Function node, innermost first: the enclosing Public
+   activation, the self-name record, barriers (blocks, catch, for-heads, class and parameter
+   scopes until they conform, `with`, module, script, global), then the enclosing function's own.
+   The compiler resolves a free name through it to (hops, slot) when only planned records lie on
+   the path, otherwise emits today's LoadName and IC (as SpiderMonkey's
+   ScopeContext::searchInEnclosingScope, Stencil.cpp:1262-1419).
+5. Static outer reads, calls' reads, stores (card-marked), updates and `typeof`: the VM walks the
+   hops; native code loads [[Environment]], the hops and the slot, with the empty-word test for
+   lexical bindings.
+6. Borrowed frames use the fixed-slot cap templates when their activation is a Public planned
+   record and the entry environment.
+
+Steps, each landed when it improves: 1, plans, the tree-walker's planned activations, the
+compiled prefix order and fixed caps in borrowed frames; 2, private records, the closure rule,
+outer contexts and static outer reads (the main gain: Vue's and chai's deep chains); 3, static
+stores, updates, `typeof` and calls' reads; 4, blocks, catch and for-heads conform; 5, class and
+parameter scopes; then the tree-walker resolving its own names by coordinate (React's 3.5%), as
+the three exemplars' interpreters do. Risks: CaptureScan once per tree-walked function with a
+nested function (cached; compiled functions pay it already), and one flag test per closure made.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
