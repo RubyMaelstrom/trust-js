@@ -185,7 +185,7 @@ impl Interp {
         slot: u32,
         name: &str,
         receiver: &Value,
-        // The read's chunk, operation and getter form (see `bytecode::GetterTable`): a user
+        // The read's chunk, operation and getter form (see `bytecode::AccessorTable`): a user
         // getter's call here fills the read's getter call cache, which its helper stub probes.
         site: Option<(&crate::bytecode::Chunk, u32, u32)>,
     ) -> Option<Result<Value, Abrupt>> {

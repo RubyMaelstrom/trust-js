@@ -10678,7 +10678,9 @@ impl Interp {
     /// fast path overwrites an existing own writable data property (OrdinarySet's winning case,
     /// correct regardless of the prototype chain), creates one the cache proved the chain allows,
     /// or calls the setter of an accessor the cache proved the receiver's [[Set]] reaches;
-    /// everything else defers to full `[[Set]]`.
+    /// everything else defers to full `[[Set]]`. `site` names a native store whose helper stub
+    /// calls setters (its chunk, operation and setter form, see `bytecode::AccessorTable`): a
+    /// user setter's call fills the store's setter call cache.
     #[inline(always)]
     pub(crate) fn set_prop_ic(
         &mut self,
@@ -10687,14 +10689,18 @@ impl Interp {
         key: crate::atom::PropKey,
         v: Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
+        site: Option<(&crate::bytecode::Chunk, u32, u32)>,
     ) -> Result<(), Abrupt> {
         if let ValueView::Obj(o) = &(base).view() {
             match self.try_ic_set::<true>(o, key, &v, cache) {
                 IcSet::Stored => return Ok(()),
                 IcSet::Setter { holder, slot } => {
+                    let site = site.map(|(chunk, pc, form)| (chunk, pc, form, cache));
                     // SAFETY: the cache's proof was made just now and nothing has run since;
                     // `base` (on the caller's frame) keeps the holder alive.
-                    return unsafe { self.accessor_validated_set(holder, slot, name, base, v) };
+                    return unsafe {
+                        self.accessor_validated_set(holder, slot, name, base, v, site)
+                    };
                 }
                 IcSet::Miss => {}
             }
@@ -10731,7 +10737,9 @@ impl Interp {
     /// `slot`), with nothing run since: the live [[Set]] is called with the original receiver
     /// as `this` and the value as its one argument, its result ignored. An accessor without a
     /// setter makes [[Set]] return false, which PutValue turns into a TypeError in strict code
-    /// (its step 3.e) and a silent no-op in sloppy code.
+    /// (its step 3.e) and a silent no-op in sloppy code. `site` names a native store whose helper
+    /// stub calls setters (its chunk, operation, setter form and property cache): a user
+    /// setter's call goes through, and fills, the store's setter call cache.
     ///
     /// # Safety
     /// `holder` must be the `Gc::as_ptr` of an object on `receiver`'s live prototype chain (or
@@ -10744,6 +10752,12 @@ impl Interp {
         name: &str,
         receiver: &Value,
         value: Value,
+        site: Option<(
+            &crate::bytecode::Chunk,
+            u32,
+            u32,
+            &std::cell::Cell<crate::bytecode::IcState>,
+        )>,
     ) -> Result<(), Abrupt> {
         let holder_ref = unsafe { &*(holder as *const std::cell::RefCell<crate::value::Object>) };
         let setter = {
@@ -10764,7 +10778,49 @@ impl Interp {
             }
             return Ok(());
         };
+        if let Some((calls, pins)) =
+            site.and_then(|(chunk, pc, form, cache)| chunk.setter_calls(pc, form, cache, &setter))
+        {
+            return self
+                .call_setter(setter, receiver, value, calls, pins)
+                .map(|_| ());
+        }
         self.call_callback(setter, *receiver, &[value]).map(|_| ())
+    }
+
+    /// Call(setter, Receiver, « V »), ECMA-262 §10.1.9.2 step 6, at a store whose helper stub
+    /// calls setters through the direct sequence: as [`Interp::call_callback`], through the
+    /// store's own call cache, which a compiled setter's call fills for the stub's probe (see
+    /// `jit::emit_set_prop_setter`).
+    fn call_setter(
+        &mut self,
+        setter: Value,
+        receiver: &Value,
+        value: Value,
+        calls: &crate::bytecode::CallSite,
+        pins: &crate::bytecode::CalleePins,
+    ) -> Result<Value, Abrupt> {
+        if self.tier != crate::bytecode::Tier::Jit {
+            return self.call(setter, *receiver, &[value]);
+        }
+        let this_word = *receiver;
+        let arguments = [value];
+        // SAFETY: the receiver word and the argument window stay on this native frame, which
+        // the conservative scan roots, through the whole call, its polls and tail drain (as
+        // `CallbackCache::call_values` lends them).
+        let result = unsafe {
+            self.call_jit_cached(calls, &setter, &this_word, arguments.as_ptr(), 1)
+                .or_else(|| {
+                    self.call_jit_fast(
+                        &setter,
+                        &this_word,
+                        arguments.as_ptr(),
+                        1,
+                        Some((calls, pins)),
+                    )
+                })
+        };
+        result.unwrap_or_else(|| self.call(setter, *receiver, &[value]))
     }
 
     /// The fused `obj.k += v` fast path (`bytecode::Op::AppendProp`): when the property still

@@ -10,11 +10,19 @@
 //! chain, frozen and non-extensible receivers, primitives, compound assignments and updates (the
 //! getter, then the setter), and setters that throw, recurse past the stack limit, collect, or
 //! reshape the receiver and replace themselves. Every tier agrees; the expected values are Node's.
+//!
+//! On ARM64 the stores' setters complete through the direct sequence from the stores' helper
+//! stub (the setter chunk's direct return and throw counters), from a function's first native
+//! code as from code made once the store's cache had seen the accessor; while one runs, its
+//! receiver, the setter and the value stay roots that the store's call cache does not keep alive
+//! afterwards.
 
 use crate::bytecode::Tier;
 use crate::Engine;
 
 use super::traced_tests::eval;
+#[cfg(target_arch = "aarch64")]
+use super::traced_tests::{assert_native, settle};
 
 /// The bytecode VM runs a warm engine's loop-free functions this many times before native code.
 const WARM_RUNS: u32 = 20;
@@ -285,8 +293,9 @@ true:true:2:11";
 #[test]
 fn setter_stores_agree_across_tiers() {
     // Under GC stress, a collection (and in debug builds the heap's verification) at every
-    // safepoint, the programs run in native code, and without the recursion to the stack limit,
-    // whose every call would scan the whole native stack.
+    // safepoint, the programs run in native code, where stores call setters directly, and
+    // without the recursion to the stack limit, whose every call would scan the whole native
+    // stack.
     let stressed = crate::gc_test::stress_active();
     let source = format!("var stressed = {stressed};{STORES}");
     let expected = if stressed {
@@ -308,4 +317,275 @@ fn setter_stores_agree_across_tiers() {
         }
         assert_eq!(result, expected, "{tier:?}, warm {warm}");
     }
+}
+
+/// One class's setter, stored through each form, and a setter that throws.
+#[cfg(target_arch = "aarch64")]
+const FORMS: &str = r#"
+class P { constructor(x) { this._x = x; } set x(v) { this._x = v * 2; } get x() { return this._x; }
+  assign(v) { this.x = v; return this._x; } }
+var setterX = Object.getOwnPropertyDescriptor(P.prototype, 'x').set;
+var ps = [new P(3), new P(4)];
+function drop(k) { ps[k & 1].x = k; return ps[k & 1]._x; }
+function keep(k) { return (ps[k & 1].x = k) + ps[k & 1]._x; }
+function local(k) { var o = ps[k & 1]; o.x = k; return o._x; }
+function viaThis(k) { return ps[k & 1].assign(k); }
+var bad = {}; Object.defineProperty(bad, 'v', { set: function badSetter(v) { throw new Error('bad'); } });
+var setterBad = Object.getOwnPropertyDescriptor(bad, 'v').set;
+function storeBad() {
+  bad.v = 1;
+}
+function sum(store) { var t = 0; for (var k = 0; k < 50; k++) t += store(k); return t; }
+function position() {
+  var stack; for (var k = 0; k < 50; k++) { try { storeBad(); } catch (e) { stack = e.stack; } }
+  return /:(\d+:\d+)\)?$/.exec(stack.split('\n')[2])[1];
+}
+[sum(drop), sum(keep), sum(local), sum(viaThis), position()].join()
+"#;
+
+/// The completions `count` reads from the chunks of `function`, the function itself and the
+/// one its inline recompile made.
+#[cfg(target_arch = "aarch64")]
+fn completions(
+    function: &crate::ast::Function,
+    count: fn(&crate::bytecode::Chunk) -> usize,
+) -> usize {
+    let runtime = function.runtime();
+    [runtime.code.get(), runtime.code2.get()]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|chunk| count(chunk))
+        .sum()
+}
+
+/// The function of the closure the global `name` holds.
+#[cfg(target_arch = "aarch64")]
+fn function_of(engine: &mut Engine, name: &str) -> std::rc::Rc<crate::ast::Function> {
+    let env = engine.interp.global_env;
+    let value = engine.interp.get_var(name, &env).ok().expect("bound name");
+    let object = value.as_obj().expect("a function object");
+    let object = object.borrow();
+    let crate::value::Callable::User(user) = &object.call else {
+        panic!("{name} is not a user function")
+    };
+    user.func.clone()
+}
+
+/// Run `round` until the counter `count` of the setter `setter`'s chunks advances, as the
+/// sequence's completions count them: a concurrent test can exhaust the process-wide call-cache
+/// epoch, which sends stores through the checked helper until their sites refill.
+#[cfg(target_arch = "aarch64")]
+fn direct_round(
+    engine: &mut Engine,
+    setter: &str,
+    count: fn(&crate::bytecode::Chunk) -> usize,
+    round: &str,
+) -> String {
+    let function = function_of(engine, setter);
+    let mut result = String::new();
+    for _ in 0..100 {
+        let before = completions(&function, count);
+        result = eval(engine, round);
+        if completions(&function, count) > before {
+            return result;
+        }
+    }
+    panic!("{round}: {setter} never completed through the direct sequence ({result})");
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn setters_complete_through_the_direct_sequence_from_first_and_warm_code() {
+    // The helper's shared stub calls the setters: in-line stubs (a diagnostic) keep the helper.
+    if !super::shared_stubs_enabled() {
+        return;
+    }
+    for warm in [false, true] {
+        setters_complete_through_the_direct_sequence(warm);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn setters_complete_through_the_direct_sequence(warm: bool) {
+    let mut engine = engine(Tier::Jit, warm);
+    // The store's line and column in FORMS (`bad.v = 1`'s operator, as Node reports it).
+    let (line, column) = FORMS
+        .lines()
+        .enumerate()
+        .find_map(|(index, text)| text.find("bad.v = 1;").map(|at| (index + 1, at + 7)))
+        .unwrap();
+    let position = format!("{line}:{column}");
+    assert_eq!(
+        eval(&mut engine, FORMS),
+        format!("2450,3675,2450,2450,{position}"),
+        "warm {warm}"
+    );
+    assert_native(
+        &mut engine,
+        &[
+            "drop",
+            "keep",
+            "local",
+            "viaThis",
+            "storeBad",
+            "setterX",
+            "setterBad",
+        ],
+    );
+    for setter in ["setterX", "setterBad"] {
+        settle(&mut engine, setter);
+    }
+    let returns = |chunk: &crate::bytecode::Chunk| chunk.test_direct_returns.get();
+    for (store, expected) in [
+        ("drop", "2450"),
+        ("keep", "3675"),
+        ("local", "2450"),
+        ("viaThis", "2450"),
+    ] {
+        let round = format!("sum({store})");
+        assert_eq!(
+            direct_round(&mut engine, "setterX", returns, &round),
+            expected,
+            "{store}, warm {warm}"
+        );
+    }
+    let throws = |chunk: &crate::bytecode::Chunk| chunk.test_direct_throws.get();
+    assert_eq!(
+        direct_round(&mut engine, "setterBad", throws, "position()"),
+        position,
+        "a direct setter's throw is placed at the store, warm {warm}"
+    );
+}
+
+/// While a setter runs through the sequence, the setter (no longer its holder's: a replacement
+/// keeps the holder's shape, and so the store's cache), the receiver and the value are roots;
+/// afterwards nothing keeps them, the setter's call cache included.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn a_running_setter_its_receiver_and_value_are_roots() {
+    use super::rooting_tests::{assert_tracked_collectable, jit_engine, run};
+    if !super::shared_stubs_enabled() {
+        return;
+    }
+    // `store`'s first native code, made at its first call.
+    let mut engine = jit_engine(0);
+    let source = r#"
+        function R(armed) { this.armed = armed; }
+        function other(v) { this.other = v; }
+        function install() {
+            Object.defineProperty(R.prototype, 's', { configurable: true, set: function self(v) {
+                if (!this.armed) { this.cold = v; return; }
+                Object.defineProperty(R.prototype, 's', { configurable: true, set: other });
+                track(self); track(this); track(v);
+                var marks = collect();
+                this.result = marks + ':' + typeof self + ':' + this.armed + ':' + v.tag;
+            } });
+        }
+        function store(o, v) { o.s = v; return o; }
+        install();
+        var probe = Object.getOwnPropertyDescriptor(R.prototype, 's').set;
+        var warm = 0; for (var k = 0; k < 100; k++) warm = store(new R(false), k).cold;
+        warm;
+    "#;
+    assert_eq!(run(&mut engine, source), "99");
+    assert_native(&mut engine, &["store", "probe"]);
+    // Every closure the rounds install runs the probe's function, whose chunk counts the
+    // sequence's returns into it.
+    settle(&mut engine, "probe");
+    let function = function_of(&mut engine, "probe");
+    run(&mut engine, "probe = null;");
+    let returns = || completions(&function, |chunk| chunk.test_direct_returns.get());
+    let mut result = String::new();
+    for _ in 0..100 {
+        let before = returns();
+        result = run(
+            &mut engine,
+            "install(); store(new R('A'), { tag: 'V' }).result;",
+        );
+        if returns() > before {
+            break;
+        }
+    }
+    assert_eq!(result, "RRR:function:A:V");
+    assert!(
+        returns() > 0,
+        "the armed store ran its setter through the sequence"
+    );
+    assert_tracked_collectable(&mut engine);
+}
+
+/// Stores in spliced callees: a setter called through the sequence records the store's implicit
+/// inline position, as the helper's call does, so a stack captured inside it (and the stack of an
+/// error it throws, which the store places) shows the same logical frames as at every other tier.
+const SPLICED: &str = r#"
+function trace(e) {
+  return e.stack.split('\n').slice(0, 5).map(function (line) { return line.trim(); }).join('|');
+}
+class Q { constructor(x) { this.x = x; } set d(v) { this.x = v * 2; }
+  set here(v) { this.stack = trace(new Error('here')); }
+  set bad(v) { throw new Error('bad'); } }
+var setterQ = Object.getOwnPropertyDescriptor(Q.prototype, 'd').set;
+var setterHereQ = Object.getOwnPropertyDescriptor(Q.prototype, 'here').set;
+var setterBadQ = Object.getOwnPropertyDescriptor(Q.prototype, 'bad').set;
+var q = new Q(5);
+function storeD(o, v) { o.d = v; }
+function storeHere(o) { o.here = 1; }
+function storeBad(o) { o.bad = 1; }
+function spliced(k) { storeD(q, k); return q.x + k; }
+function splicedHere() { storeHere(q); return q.stack; }
+function splicedBad() { storeBad(q); }
+var here = '', bad = '';
+function drive() {
+  var t = 0;
+  for (var k = 0; k < 300; k++) {
+    t += spliced(k);
+    here = splicedHere();
+    try { splicedBad(); } catch (e) { bad = trace(e); }
+  }
+  return t;
+}
+"#;
+
+#[test]
+fn spliced_stores_call_setters_with_their_inline_positions() {
+    let mut stacks = Vec::new();
+    for tier in [Tier::Interp, Tier::Jit] {
+        let mut engine = engine(tier, false);
+        eval(&mut engine, SPLICED);
+        assert_eq!(eval(&mut engine, "drive()"), "134550", "{tier:?}");
+        #[cfg(target_arch = "aarch64")]
+        if tier == Tier::Jit && super::shared_stubs_enabled() {
+            let returns = |chunk: &crate::bytecode::Chunk| chunk.test_direct_returns.get();
+            let throws = |chunk: &crate::bytecode::Chunk| chunk.test_direct_throws.get();
+            for (caller, setter, count) in [
+                (
+                    "spliced",
+                    "setterQ",
+                    returns as fn(&crate::bytecode::Chunk) -> usize,
+                ),
+                ("splicedHere", "setterHereQ", returns),
+                ("splicedBad", "setterBadQ", throws),
+            ] {
+                let spliced = function_of(&mut engine, caller)
+                    .runtime()
+                    .code2
+                    .get()
+                    .is_some_and(Option::is_some);
+                assert!(spliced, "{caller} has a second-stage compile");
+                settle(&mut engine, setter);
+                direct_round(&mut engine, setter, count, "drive()");
+            }
+        }
+        stacks.push(eval(&mut engine, "here + '\\n' + bad"));
+    }
+    assert!(
+        stacks[0].contains("at storeHere") && stacks[0].contains("at storeBad"),
+        "the logical frames of the spliced stores: {}",
+        stacks[0]
+    );
+    assert_eq!(
+        stacks[0], stacks[1],
+        "the stacks inside spliced stores' setters"
+    );
 }

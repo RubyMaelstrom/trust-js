@@ -1375,54 +1375,73 @@ impl CallSite {
 }
 
 /// How a property read finds its receiver and places its getter's result (the low byte of
-/// [`GetterSlot::form`]): `GetProp`'s receiver is its top operand, which the result replaces;
-/// `GetMethod` keeps the receiver and pushes the result above it; `GetPropThis` and
-/// `GetPropLocal` read the frame's `this` or a local (whose byte offset among the slots is the
-/// form's upper bits) and push the result.
+/// [`AccessorSlot::form`] in a getter table): `GetProp`'s receiver is its top operand, which the
+/// result replaces; `GetMethod` keeps the receiver and pushes the result above it; `GetPropThis`
+/// and `GetPropLocal` read the frame's `this` or a local (whose byte offset among the slots is
+/// the form's upper bits) and push the result.
 pub(crate) const GETTER_READ_OPERAND: u32 = 0;
 pub(crate) const GETTER_READ_METHOD: u32 = 1;
 pub(crate) const GETTER_READ_THIS: u32 = 2;
 pub(crate) const GETTER_READ_LOCAL: u32 = 3;
 
-/// A property read's getter call cache in its chunk's [`GetterTable`]: 32 bytes, so that the
-/// probe scales an index by a shift.
+/// How a property store finds its receiver and what it leaves (the low byte of
+/// [`AccessorSlot::form`] in a setter table): `SetPropDrop`'s receiver is the operand under the
+/// value and both are consumed; `SetProp` consumes both and leaves the value, the assignment's
+/// result (ECMA-262 AssignmentExpression evaluation step 1.f: the value, whatever the setter
+/// returns); `SetPropThisDrop` and `SetPropLocalDrop` read the frame's `this` or a local (whose
+/// byte offset among the slots is the form's upper bits) and consume the value.
+pub(crate) const SETTER_STORE_DROP: u32 = 0;
+pub(crate) const SETTER_STORE_KEEP: u32 = 1;
+pub(crate) const SETTER_STORE_THIS: u32 = 2;
+pub(crate) const SETTER_STORE_LOCAL: u32 = 3;
+
+/// A property access's accessor call cache in its chunk's [`AccessorTable`]: 32 bytes, so that
+/// the probe scales an index by a shift.
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
-pub(crate) struct GetterSlot {
-    /// The read's operation, or `u32::MAX` for an empty slot.
+pub(crate) struct AccessorSlot {
+    /// The access's operation, or `u32::MAX` for an empty slot.
     pub(crate) pc: u32,
-    /// `GETTER_READ_*`, with a local's byte offset above the low byte.
+    /// `GETTER_READ_*` or `SETTER_STORE_*`, with a local's byte offset above the low byte.
     pub(crate) form: u32,
-    /// The getter frame's `FnFrame::call_site`: the read's implicit inline position, which the
-    /// helper's call publishes as well (`ImplicitCallPosition`; none outside spliced callees).
+    /// The accessor frame's `FnFrame::call_site`: the access's implicit inline position, which
+    /// the helper's call publishes as well (`ImplicitCallPosition`; none outside spliced
+    /// callees).
     pub(crate) position: u32,
-    /// The read's call cache ([`CallSite`]), which its first way begins.
+    /// The access's call cache ([`CallSite`]), which its first way begins.
     pub(crate) calls: *const CallSite,
+    /// A store's property cache (its first way), whose accessor states the stores' helper stub
+    /// validates (see `jit::emit_set_prop_setter`); null for a read, whose site validates its
+    /// own.
+    pub(crate) cache: *const std::cell::Cell<IcState>,
 }
 
-const EMPTY_GETTER_SLOT: GetterSlot = GetterSlot {
+const EMPTY_ACCESSOR_SLOT: AccessorSlot = AccessorSlot {
     pc: u32::MAX,
     form: 0,
     position: NO_POSITION,
     calls: std::ptr::null(),
+    cache: std::ptr::null(),
 };
 
-/// The getter call caches of a chunk's property reads, keyed by the reads' operations: an
-/// open-addressed table the reads' helper stub probes at run time (`jit::emit_get_prop_getter`,
-/// slot `pc & mask`, then the next ones up to an empty slot). ECMA-262 §10.1.8.1 OrdinaryGet:
-/// the getter is the accessor's live [[Get]], which the stub reads after the read's property
-/// cache proved the accessor, then looks up in the read's call cache by identity like any
-/// callee. A read gains its call cache when its helper first calls a user function as its
-/// getter: a native getter, or one served in Rust, never makes one. The call caches are boxed
-/// and kept for the chunk's life; growing the table moves only its slots.
+/// The accessor call caches of a chunk's property reads (its getter table) or stores (its
+/// setter table), keyed by the accesses' operations: an open-addressed table the helper stubs
+/// probe at run time (`jit::emit_get_prop_getter` and `jit::emit_set_prop_setter`, slot
+/// `pc & mask`, then the next ones up to an empty slot). ECMA-262 §10.1.8.1 OrdinaryGet and
+/// §10.1.9.2 OrdinarySetWithOwnDescriptor: the getter or setter is the accessor's live [[Get]]
+/// or [[Set]], which the stub reads after the access's property cache proved the accessor, then
+/// looks up in the access's call cache by identity like any callee. An access gains its call
+/// cache when its helper first calls a user function as its accessor: a native one, or one
+/// served in Rust, never makes one. The call caches are boxed and kept for the chunk's life;
+/// growing the table moves only its slots.
 #[repr(C)]
-pub(crate) struct GetterTable {
+pub(crate) struct AccessorTable {
     /// The slot count less one (a power of two less one).
     mask: u32,
     len: u32,
     /// `storage`'s slots, as machine code reads them.
-    slots: *const GetterSlot,
-    storage: Box<[GetterSlot]>,
+    slots: *const AccessorSlot,
+    storage: Box<[AccessorSlot]>,
     /// The call caches, each boxed so that it stays put as the vector grows.
     #[allow(clippy::vec_box)]
     calls: Vec<Box<CallSite>>,
@@ -1432,12 +1451,12 @@ pub(crate) struct GetterTable {
 pub(crate) type CalleePins =
     std::cell::RefCell<crate::fasthash::FastMap<usize, crate::value::WeakGc>>;
 
-impl GetterTable {
+impl AccessorTable {
     #[allow(clippy::vec_box)]
-    fn with_slots(count: usize, calls: Vec<Box<CallSite>>) -> GetterTable {
+    fn with_slots(count: usize, calls: Vec<Box<CallSite>>) -> AccessorTable {
         debug_assert!(count.is_power_of_two());
-        let storage = vec![EMPTY_GETTER_SLOT; count].into_boxed_slice();
-        GetterTable {
+        let storage = vec![EMPTY_ACCESSOR_SLOT; count].into_boxed_slice();
+        AccessorTable {
             mask: (count - 1) as u32,
             len: 0,
             slots: storage.as_ptr(),
@@ -1455,9 +1474,15 @@ impl GetterTable {
         index
     }
 
-    /// The call cache of the read at `pc` (with form `form` and position `position`), made on
-    /// first request.
-    fn calls(&mut self, pc: u32, form: u32, position: u32) -> *const CallSite {
+    /// The call cache of the access at `pc` (with form `form`, position `position` and, for a
+    /// store, property cache `cache`), made on first request.
+    fn calls(
+        &mut self,
+        pc: u32,
+        form: u32,
+        position: u32,
+        cache: *const std::cell::Cell<IcState>,
+    ) -> *const CallSite {
         let index = self.position(pc);
         if self.storage[index].pc == pc {
             return self.storage[index].calls;
@@ -1465,31 +1490,32 @@ impl GetterTable {
         // At most half full, so every probe ends at an empty slot.
         if 2 * (self.len as usize + 1) > self.storage.len() {
             let mut grown =
-                GetterTable::with_slots(2 * self.storage.len(), std::mem::take(&mut self.calls));
+                AccessorTable::with_slots(2 * self.storage.len(), std::mem::take(&mut self.calls));
             for slot in self.storage.iter().filter(|slot| slot.pc != u32::MAX) {
                 let index = grown.position(slot.pc);
                 grown.storage[index] = *slot;
                 grown.len += 1;
             }
             *self = grown;
-            return self.calls(pc, form, position);
+            return self.calls(pc, form, position, cache);
         }
         let calls = Box::new(CallSite::empty());
         let pointer: *const CallSite = &*calls;
         self.calls.push(calls);
-        self.storage[index] = GetterSlot {
+        self.storage[index] = AccessorSlot {
             pc,
             form,
             position,
             calls: pointer,
+            cache,
         };
         self.len += 1;
         pointer
     }
 
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<GetterTable>()
-            + self.storage.len() * std::mem::size_of::<GetterSlot>()
+        std::mem::size_of::<AccessorTable>()
+            + self.storage.len() * std::mem::size_of::<AccessorSlot>()
             + self.calls.capacity() * std::mem::size_of::<Box<CallSite>>()
             + self.calls.len() * std::mem::size_of::<CallSite>()
     }
@@ -1497,12 +1523,12 @@ impl GetterTable {
 
 /// Machine code addresses a call cache's first way at the cache itself.
 const _: () = assert!(std::mem::offset_of!(CallSite, entries) == 0);
-/// Where machine code reads a [`GetterTable`]'s mask and slots, and a slot's fields.
+/// Where machine code reads an [`AccessorTable`]'s mask and slots, and a slot's fields.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-pub(crate) const GETTER_TABLE_MASK_OFF: usize = std::mem::offset_of!(GetterTable, mask);
+pub(crate) const ACCESSOR_TABLE_MASK_OFF: usize = std::mem::offset_of!(AccessorTable, mask);
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-pub(crate) const GETTER_TABLE_SLOTS_OFF: usize = std::mem::offset_of!(GetterTable, slots);
-const _: () = assert!(std::mem::size_of::<GetterSlot>() == 32);
+pub(crate) const ACCESSOR_TABLE_SLOTS_OFF: usize = std::mem::offset_of!(AccessorTable, slots);
+const _: () = assert!(std::mem::size_of::<AccessorSlot>() == 32);
 
 const CALL_OVERFLOW_SETS: usize = 128;
 const CALL_OVERFLOW_MAX_SETS: usize = 512;
@@ -2836,10 +2862,13 @@ pub struct Chunk {
     regexp_literals: Vec<std::cell::OnceCell<Rc<crate::regex::Regex>>>,
     /// One [`CallSite`] per `Call`/`CallWithThis` site (the JIT→JIT fast call's callee cache).
     call_caches: Vec<CallSite>,
-    /// The getter call caches of the chunk's property reads (see [`GetterTable`]), and the table
-    /// as machine code reads it (null before the first).
-    getter_table: std::cell::RefCell<Option<Box<GetterTable>>>,
-    getter_table_raw: std::cell::Cell<*const GetterTable>,
+    /// The getter call caches of the chunk's property reads (see [`AccessorTable`]), and the
+    /// table as machine code reads it (null before the first).
+    getter_table: std::cell::RefCell<Option<Box<AccessorTable>>>,
+    getter_table_raw: std::cell::Cell<*const AccessorTable>,
+    /// The setter call caches of the chunk's property stores, as the getters'.
+    setter_table: std::cell::RefCell<Option<Box<AccessorTable>>>,
+    setter_table_raw: std::cell::Cell<*const AccessorTable>,
     /// Source names of call and `new` targets, for TypeError messages (see [`Chunk::call_name`]).
     call_names: Option<Box<CallNames>>,
     /// Source positions of the operations (see [`Chunk::position`]).
@@ -2979,6 +3008,8 @@ impl crate::gc_trace::GcTrace for Chunk {
             call_caches: _,
             getter_table: _,
             getter_table_raw: _,
+            setter_table: _,
+            setter_table_raw: _,
             call_names: _,
             positions: _,
             call_positions: _,
@@ -3241,8 +3272,10 @@ impl Chunk {
             .saturating_add(self.private_sites.len() * std::mem::size_of::<PrivateSite>())
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
-        if let Some(table) = self.getter_table.borrow().as_deref() {
-            bytes = bytes.saturating_add(table.retained_bytes());
+        for table in [&self.getter_table, &self.setter_table] {
+            if let Some(table) = table.borrow().as_deref() {
+                bytes = bytes.saturating_add(table.retained_bytes());
+            }
         }
         if matches!(self.record_getter.get(), Some(Some(_))) {
             bytes = bytes.saturating_add(std::mem::size_of::<RecordGetterPlan>());
@@ -8014,6 +8047,8 @@ fn finish_chunk(
         call_caches: c.call_caches,
         getter_table: std::cell::RefCell::new(None),
         getter_table_raw: std::cell::Cell::new(std::ptr::null()),
+        setter_table: std::cell::RefCell::new(None),
+        setter_table_raw: std::cell::Cell::new(std::ptr::null()),
         call_names: c.call_names.into_table(),
         positions: c.positions,
         call_positions,
@@ -19991,9 +20026,28 @@ fn set_named_property(
     value: Value,
     cache: &std::cell::Cell<IcState>,
 ) -> Result<(), Abrupt> {
+    set_named_property_at(i, chunk, pc, base, n, value, cache, None)
+}
+
+/// [`set_named_property`] for a native store whose helper stub calls setters through the
+/// direct sequence, with its setter form (`SETTER_STORE_*`, see [`AccessorTable`]): a user
+/// setter's call there fills the store's setter call cache, which the stub probes.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn set_named_property_at(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    base: &Value,
+    n: u32,
+    value: Value,
+    cache: &std::cell::Cell<IcState>,
+    form: Option<u32>,
+) -> Result<(), Abrupt> {
     let (name, key) = (&chunk.names[n as usize], chunk.name_key(n));
     if !chunk.feedback.detailed_enabled() {
-        return i.set_prop_ic(base, name, key, value, cache);
+        let site = form.map(|form| (chunk, pc as u32, form));
+        return i.set_prop_ic(base, name, key, value, cache, site);
     }
     let mut trace = crate::feedback::CurrentPropertyTrace::default();
     let result = i.set_prop_ic_profiled(base, name, key, value, cache, &mut trace);
@@ -20415,7 +20469,7 @@ impl Chunk {
         &self.construct_caches[idx as usize] as *const std::cell::Cell<ConstructSite> as usize
     }
     /// The call cache for calls of `getter` at the property read `pc` (with form `form`, see
-    /// [`GetterTable`]), with the pins of its callees, made on first request when `getter` is a
+    /// [`AccessorTable`]), with the pins of its callees, made on first request when `getter` is a
     /// user function (only those fill a call cache, see `Interp::call_jit_fast`).
     pub(crate) fn getter_calls(
         &self,
@@ -20423,17 +20477,48 @@ impl Chunk {
         form: u32,
         getter: &Value,
     ) -> Option<(&CallSite, &CalleePins)> {
-        let object = getter.as_obj()?;
+        self.accessor_calls(
+            (&self.getter_table, &self.getter_table_raw),
+            (pc, form, std::ptr::null()),
+            getter,
+        )
+    }
+    /// The call cache for calls of `setter` at the property store `pc` (with form `form` and
+    /// property cache `cache`, see [`AccessorTable`]), as [`Chunk::getter_calls`] makes a read's.
+    pub(crate) fn setter_calls(
+        &self,
+        pc: u32,
+        form: u32,
+        cache: &std::cell::Cell<IcState>,
+        setter: &Value,
+    ) -> Option<(&CallSite, &CalleePins)> {
+        self.accessor_calls(
+            (&self.setter_table, &self.setter_table_raw),
+            (pc, form, cache),
+            setter,
+        )
+    }
+    #[allow(clippy::type_complexity)]
+    fn accessor_calls(
+        &self,
+        (table, raw): (
+            &std::cell::RefCell<Option<Box<AccessorTable>>>,
+            &std::cell::Cell<*const AccessorTable>,
+        ),
+        (pc, form, cache): (u32, u32, *const std::cell::Cell<IcState>),
+        function: &Value,
+    ) -> Option<(&CallSite, &CalleePins)> {
+        let object = function.as_obj()?;
         if !matches!(object.borrow().call, crate::value::Callable::User(_)) {
             return None;
         }
         let calls = {
-            let mut table = self.getter_table.borrow_mut();
+            let mut table = table.borrow_mut();
             let table =
-                table.get_or_insert_with(|| Box::new(GetterTable::with_slots(8, Vec::new())));
+                table.get_or_insert_with(|| Box::new(AccessorTable::with_slots(8, Vec::new())));
             let position = self.inline_sites.implicit_position(pc as usize);
-            let calls = table.calls(pc, form, position);
-            self.getter_table_raw.set(&**table);
+            let calls = table.calls(pc, form, position, cache);
+            raw.set(&**table);
             calls
         };
         // SAFETY: a call cache is boxed and kept for the chunk's life.
@@ -20443,6 +20528,11 @@ impl Chunk {
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn jit_getter_table_off() -> usize {
         std::mem::offset_of!(Chunk, getter_table_raw)
+    }
+    /// Byte offset of the field machine code reads the setter table through.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_setter_table_off() -> usize {
+        std::mem::offset_of!(Chunk, setter_table_raw)
     }
     #[cfg(test)]
     pub(crate) fn test_call_site(&self, idx: u32) -> &CallSite {
@@ -24450,13 +24540,25 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
     let _inline_position = ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize);
+    // The store's setter form, for the stores' helper stub's setter call (ARM64 only: no other
+    // code reads the setter table).
+    let form = |form: u32| cfg!(target_arch = "aarch64").then_some(form);
     let r: Result<(), Abrupt> = (|| match chunk.ops[pc as usize] {
         Op::SetProp(n, c) => {
             sp = sp.sub(1);
             let v = sp.read();
             sp = sp.sub(1);
             let obj = sp.read();
-            set_named_property(i, chunk, pc as usize, &obj, n, v, &chunk.caches[c as usize])?;
+            set_named_property_at(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                n,
+                v,
+                &chunk.caches[c as usize],
+                form(SETTER_STORE_KEEP),
+            )?;
             sp.write(v);
             sp = sp.add(1);
             Ok(())
@@ -24466,13 +24568,22 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
             let v = sp.read();
             sp = sp.sub(1);
             let obj = sp.read();
-            set_named_property(i, chunk, pc as usize, &obj, n, v, &chunk.caches[c as usize])
+            set_named_property_at(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                n,
+                v,
+                &chunk.caches[c as usize],
+                form(SETTER_STORE_DROP),
+            )
         }
         Op::SetPropThisDrop(n, c) => {
             sp = sp.sub(1);
             let v = sp.read();
             let this = ctx.this_value();
-            set_named_property(
+            set_named_property_at(
                 i,
                 chunk,
                 pc as usize,
@@ -24480,6 +24591,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
                 n,
                 v,
                 &chunk.caches[c as usize],
+                form(SETTER_STORE_THIS),
             )
         }
         Op::SetPropLocalDrop(s, n, c) => {
@@ -24495,7 +24607,16 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
                     ),
                 ));
             }
-            set_named_property(i, chunk, pc as usize, &obj, n, v, &chunk.caches[c as usize])
+            set_named_property_at(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                n,
+                v,
+                &chunk.caches[c as usize],
+                form(SETTER_STORE_LOCAL | (u32::from(s) * 8) << 8),
+            )
         }
         _ => unreachable!("jit_set_prop emitted only for property stores"),
     })();
@@ -24710,18 +24831,19 @@ mod computed_key_tests;
 #[path = "bytecode_named_read_tests.rs"]
 mod named_read_helper_tests;
 
-/// The read at `pc` threw from a getter its machine code called through the direct sequence
-/// (see `jit::emit_getter_call`), whose finish left the error in the context: give the error's
-/// pending frame this operation's position, as `throw_at` does when a getter called from the
-/// helper throws (ECMA-262 GetValue; see `Interp::place_thrown`). The code then unwinds.
+/// The read or store at `pc` threw from a getter or setter its helper stub called through the
+/// direct sequence (see `jit::emit_get_prop_getter`, `jit::emit_set_prop_setter`), whose finish
+/// left the error in the context: give the error's pending frame this operation's position, as
+/// `throw_at` does when an accessor called from the helper throws (ECMA-262 GetValue, PutValue;
+/// see `Interp::place_thrown`). The code then unwinds.
 ///
 /// # Safety
-/// `ctx` is the live context of the code that made the read.
+/// `ctx` is the live context of the code that made the access.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-pub(crate) unsafe extern "C" fn jit_getter_threw(ctx: *mut crate::jit::JitCtx, pc: u32) {
+pub(crate) unsafe extern "C" fn jit_accessor_threw(ctx: *mut crate::jit::JitCtx, pc: u32) {
     let ctx = unsafe { &mut *ctx };
     if let Some(error) = &ctx.error {
         let position = unsafe { (*ctx.chunk).position(pc as usize) };
@@ -24736,7 +24858,7 @@ pub(crate) unsafe extern "C" fn jit_getter_threw(ctx: *mut crate::jit::JitCtx, p
 /// accessor landing for THIS helper call. Always clears the publication, including on
 /// decline, so it can never leak into a nested or later helper call. Detailed-feedback
 /// runs keep the canonical profiled resolution, whose observations must see every read.
-/// The read at `pc` (its getter form `form`, see [`GetterTable`]) calls a user getter through
+/// The read at `pc` (its getter form `form`, see [`AccessorTable`]) calls a user getter through
 /// its getter call cache, which the call fills for the read's helper stub. The test for a
 /// publication is made in line: the helper's other reads make no call for it.
 #[inline(always)]

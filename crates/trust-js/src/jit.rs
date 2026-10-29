@@ -7190,8 +7190,8 @@ fn get_prop_getter_supported(
         && fits4(offset_of!(JitCtx, accessor_slot))
         && fits8(offset_of!(JitCtx, chunk))
         && fits8(crate::bytecode::Chunk::jit_getter_table_off())
-        && fits4(crate::bytecode::GETTER_TABLE_MASK_OFF)
-        && fits8(crate::bytecode::GETTER_TABLE_SLOTS_OFF)
+        && fits4(crate::bytecode::ACCESSOR_TABLE_MASK_OFF)
+        && fits8(crate::bytecode::ACCESSOR_TABLE_SLOTS_OFF)
         && layout.obj_from_cell < 4096
         && fields_data_fits(layout)
         && fits8(layout.entry_accessor)
@@ -7211,7 +7211,7 @@ fn get_prop_getter_supported(
 /// code was made: the site's validated accessor landing published the accessor's holder and
 /// slot (`JitCtx::accessor_holder`, `accessor_slot`), proven by its property cache with nothing
 /// run since, and called the helper with w1 = its pc. The read's getter call cache is found by
-/// that pc in the chunk's getter table (see [`crate::bytecode::GetterTable`]), which the helper
+/// that pc in the chunk's getter table (see [`crate::bytecode::AccessorTable`]), which the helper
 /// filled the first time the read called a user getter. The getter is the descriptor's live
 /// [[Get]], read from its accessor pair: no proof caches it, since replacing a getter makes a new
 /// pair and may keep the holder's shape. The call cache finds it by identity, as a call site's
@@ -7225,7 +7225,7 @@ fn get_prop_getter_supported(
 /// callee, none elsewhere). The stub then returns as the helper would: the result in the read's
 /// place (a method read keeps the receiver under it), x20 the new top and w1 clear; the site's
 /// own end poll follows. A throw places the error's pending frame at the read
-/// (`jit_getter_threw`, as the helper's `throw_at` does) and returns w1 set, so the site unwinds.
+/// (`jit_accessor_threw`, as the helper's `throw_at` does) and returns w1 set, so the site unwinds.
 ///
 /// The publication is consumed when the sequence is entered, before any JavaScript runs. Every
 /// decline leaves the state as found and takes `plain`, the ordinary helper call: no table or
@@ -7244,7 +7244,7 @@ fn emit_get_prop_getter(
     plain: usize,
 ) {
     use crate::bytecode::{
-        GetterSlot, GETTER_READ_THIS, GETTER_TABLE_MASK_OFF, GETTER_TABLE_SLOTS_OFF,
+        AccessorSlot, ACCESSOR_TABLE_MASK_OFF, ACCESSOR_TABLE_SLOTS_OFF, GETTER_READ_THIS,
     };
     use std::mem::offset_of;
     let holder_off = offset_of!(JitCtx, accessor_holder) as u32;
@@ -7283,12 +7283,12 @@ fn emit_get_prop_getter(
         crate::bytecode::Chunk::jit_getter_table_off() as u32,
     );
     a.cbz(17, true, plain);
-    a.ldr_w_imm(14, 17, GETTER_TABLE_MASK_OFF as u32);
-    a.ldr_imm(16, 17, GETTER_TABLE_SLOTS_OFF as u32);
+    a.ldr_w_imm(14, 17, ACCESSOR_TABLE_MASK_OFF as u32);
+    a.ldr_imm(16, 17, ACCESSOR_TABLE_SLOTS_OFF as u32);
     a.logic_w(0, 15, 1, 14);
     a.bind(probe);
     a.add_shifted(13, 16, 15, 5);
-    a.ldr_w_imm(12, 13, offset_of!(GetterSlot, pc) as u32);
+    a.ldr_w_imm(12, 13, offset_of!(AccessorSlot, pc) as u32);
     a.cmp_reg_w(12, 1);
     a.b_cond(C_EQ, found);
     a.cmn_imm_w(12, 1);
@@ -7299,9 +7299,9 @@ fn emit_get_prop_getter(
     // w3 = the read's form, w2 = the getter frame's position, x12 = the read's call cache (its
     // first way). Nothing below changes x2 or x3 before the sequence reads them.
     a.bind(found);
-    a.ldr_w_imm(3, 13, offset_of!(GetterSlot, form) as u32);
-    a.ldr_w_imm(2, 13, offset_of!(GetterSlot, position) as u32);
-    a.ldr_imm(12, 13, offset_of!(GetterSlot, calls) as u32);
+    a.ldr_w_imm(3, 13, offset_of!(AccessorSlot, form) as u32);
+    a.ldr_w_imm(2, 13, offset_of!(AccessorSlot, position) as u32);
+    a.ldr_imm(12, 13, offset_of!(AccessorSlot, calls) as u32);
     // x9 = the live getter's word, which the entry's accessor pair (the pointer bits of its
     // `meta` word, whose low byte holds the flags; none when the accessor never had a function)
     // holds: Undefined's for an absent [[Get]]. The entry is the published slot's.
@@ -7427,7 +7427,7 @@ fn emit_get_prop_getter(
     a.bind(threw);
     a.mov(0, 19);
     a.ldr_imm(1, 31, 16); // pc
-    a.mov_imm64(16, crate::bytecode::jit_getter_threw as *const () as u64);
+    a.mov_imm64(16, crate::bytecode::jit_accessor_threw as *const () as u64);
     a.blr(16);
     a.ldp_post(29, 30, 48);
     a.movz(1, 1, 0);
@@ -7441,6 +7441,328 @@ fn emit_get_prop_getter(
     a.cbz(9, false, plain);
     entry_gates(a, plain);
     a.mov_imm64(16, crate::value::PACK_OBJ); // the probe used x9: the getter's word again
+    a.logic_x(2, 9, 10, 16);
+    a.b(hit);
+}
+
+/// Whether the property stores' helper stub can call a setter (see [`emit_set_prop_setter`]):
+/// every offset it addresses fits, the read way loop it reuses is supported, and so is the
+/// direct sequence it enters.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn set_prop_setter_supported(
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    direct: DirectCallContext,
+) -> bool {
+    use crate::bytecode::AccessorSlot;
+    use std::mem::offset_of;
+    let fits8 = |o: usize| o.is_multiple_of(8) && o / 8 < 4096;
+    let fits4 = |o: usize| o.is_multiple_of(4) && o / 4 < 4096;
+    get_method_inlinable(layout)
+        && fits8(offset_of!(JitCtx, chunk))
+        && fits8(crate::bytecode::Chunk::jit_setter_table_off())
+        && fits4(crate::bytecode::ACCESSOR_TABLE_MASK_OFF)
+        && fits8(crate::bytecode::ACCESSOR_TABLE_SLOTS_OFF)
+        && fits8(offset_of!(AccessorSlot, calls))
+        && fits8(offset_of!(AccessorSlot, cache))
+        && fits8(layout.entry_accessor)
+        && fits8(crate::value::ACCESSOR_SET_WORD_OFF)
+        && direct_call_supported(
+            ilayout,
+            layout,
+            direct.attempted_off,
+            direct.runs_off,
+            direct.retry_off,
+            1,
+        )
+}
+
+/// The setter call of the property stores' helper stub (ECMA-262 PutValue, [[Set]]; §10.1.9.2
+/// OrdinarySetWithOwnDescriptor step 6, Call(setter, Receiver, « V »)), made at run time for any
+/// store site, whenever its code was made: a store whose template declined calls the helper with
+/// w1 = its pc, which finds the store's setter call cache by that pc in the chunk's setter table
+/// (see [`crate::bytecode::AccessorTable`]), with the store's form and property cache; the
+/// helper filled it the first time the store called a user setter. As V8's store IC builtin,
+/// SpiderMonkey's setter stubs and JavaScriptCore's setter access cases do, the shared code
+/// proves the accessor itself: the read way loop validates the cache's states against the live
+/// receiver and chain (receiver, intermediate and holder shapes, every hop ordinary and plain,
+/// so a Proxy anywhere declines), and the holder's entry must be an accessor. The setter is the
+/// descriptor's live [[Set]], read from its accessor pair (no proof caches it: replacing one makes
+/// a new pair and may keep the holder's shape); Undefined's word (no setter) matches no callee,
+/// so a missing setter takes the helper, which fails silently in sloppy code and throws in strict
+/// code. The call cache finds the setter by identity, as a call site's finds its callee (way 0
+/// here, the rest in the `CallSecondary` stub), and the direct sequence, in line (one argument,
+/// with `this`), runs it on [receiver, setter, V] pushed over the operands as the store's form
+/// places them: `this` is the store's original receiver (its operand, the frame's `this` or a
+/// local), never the holder. The setter's result is dropped: an assignment's value is its
+/// right-hand side (ECMA-262 AssignmentExpression evaluation), which `SetProp` keeps below the
+/// window, so that the window needs two words above the store's incoming depth there and in the
+/// `this` and local forms (`Cfg::jit_stack_capacity` reserves them). The setter frame records
+/// the store's implicit position from its slot, as the helper's call publishes it. The stub
+/// returns as the helper would: x20 the new top and w1 clear, and the site's own end poll
+/// follows. A throw places the error's pending frame at the store (`jit_accessor_threw`) and
+/// returns w1 set, so the site unwinds. Nothing above caches what the setter may change: the
+/// store is complete when it returns.
+///
+/// Every decline before the sequence leaves the operands as found and takes `plain`, the
+/// ordinary helper call; a gate of the sequence itself restores the operands first. Entry:
+/// w1 = pc, x30 = the site's return; the site's `bl` reached this stub.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_set_prop_setter(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    direct: DirectCallContext,
+    plain: usize,
+) {
+    use crate::bytecode::{
+        AccessorSlot, ACCESSOR_TABLE_MASK_OFF, ACCESSOR_TABLE_SLOTS_OFF, SETTER_STORE_KEEP,
+        SETTER_STORE_THIS,
+    };
+    use std::mem::offset_of;
+    // As the getter's (see `emit_get_prop_getter`): an entry the sequence's first gates would
+    // refuse on every store keeps the helper.
+    let entry_gates = |a: &mut asm::Asm, refuse: usize| {
+        let enter = a.new_label();
+        a.ldrb_imm(16, 12, offset_of!(crate::bytecode::CallIc, direct) as u32);
+        let ready = crate::bytecode::CALL_IC_DIRECT_READY as u32;
+        for bit in [ready, 1, 8] {
+            a.logic_imm_w(0, 14, 16, asm::logical_imm_w(bit).unwrap());
+            if bit == ready {
+                a.cbnz(14, false, enter);
+            } else {
+                a.cbz(14, false, refuse);
+            }
+        }
+        a.bind(enter);
+    };
+    let form_kind = asm::logical_imm_w(0xff).unwrap();
+    // `rd` = the receiver's word as the form (w3) names it: the operand under the value, the
+    // frame's `this`, or a local (its byte offset among the slots in the form's upper bits).
+    // Clobbers x14.
+    let receiver_word = |a: &mut asm::Asm, rd: u32| {
+        let frame = a.new_label();
+        let local = a.new_label();
+        let done = a.new_label();
+        a.logic_imm_w(0, 14, 3, form_kind);
+        a.cmp_imm_w(14, SETTER_STORE_KEEP);
+        a.b_cond(C_HI, frame);
+        a.ldur(rd, 20, -16);
+        a.b(done);
+        a.bind(frame);
+        a.cmp_imm_w(14, SETTER_STORE_THIS);
+        a.b_cond(C_NE, local);
+        a.ldr_imm(rd, 19, 48); // ctx.this_word
+        a.b(done);
+        a.bind(local);
+        a.lsr_imm_w(14, 3, 8);
+        a.add_shifted(rd, 22, 14, 0);
+        a.ldr_imm(rd, rd, 0);
+        a.bind(done);
+    };
+    let probe = a.new_label();
+    let found = a.new_label();
+    let load = a.new_label();
+    let rest = a.new_label();
+    let hit = a.new_label();
+    // x4 = the store's slot in its chunk's setter table: slot `pc & mask`, then the next ones,
+    // up to an empty slot (`u32::MAX`); the table is at most half full. Slots are 32 bytes. No
+    // table: an ordinary store.
+    a.ldr_imm(16, 19, offset_of!(JitCtx, chunk) as u32);
+    a.ldr_imm(
+        17,
+        16,
+        crate::bytecode::Chunk::jit_setter_table_off() as u32,
+    );
+    a.cbz(17, true, plain);
+    a.ldr_w_imm(14, 17, ACCESSOR_TABLE_MASK_OFF as u32);
+    a.ldr_imm(16, 17, ACCESSOR_TABLE_SLOTS_OFF as u32);
+    a.logic_w(0, 15, 1, 14);
+    a.bind(probe);
+    a.add_shifted(4, 16, 15, 5);
+    a.ldr_w_imm(12, 4, offset_of!(AccessorSlot, pc) as u32);
+    a.cmp_reg_w(12, 1);
+    a.b_cond(C_EQ, found);
+    a.cmn_imm_w(12, 1);
+    a.b_cond(C_EQ, plain);
+    a.add_imm(15, 15, 1);
+    a.logic_w(0, 15, 15, 14);
+    a.b(probe);
+    // w3 = the store's form; x10 = its receiver, which must be an Object.
+    a.bind(found);
+    a.ldr_w_imm(3, 4, offset_of!(AccessorSlot, form) as u32);
+    receiver_word(a, 9);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, plain);
+    emit_exec_payload(a, 9, 10);
+    // The accessor's proof: the read way loop over the store's property cache (x8 = its first
+    // way), whose accessor states a store's fill records (a data state that validates names an
+    // own data property, which the entry check below sends to the helper). The loop keeps x1,
+    // x3, x4 and x10. Stores take no wrapper or Array receiver, and cached absence is no
+    // resolution of theirs.
+    let flags = PropProbeFlags {
+        arr_ok: false,
+        wrap_ok: false,
+        method: true,
+        kc: false,
+    };
+    a.ldr_imm(8, 4, offset_of!(AccessorSlot, cache) as u32);
+    emit_prop_way_loop(a, layout, flags, plain, load, plain, plain);
+    // x11 = the holder's object base, x13 = the slot: the entry (bounds-checked against the
+    // live entries) must be an accessor; x9 = its live setter's word, from the pair the pointer
+    // bits of its `meta` word address (Undefined's for an absent [[Set]]).
+    a.bind(load);
+    fields_len(a, layout, 16, 11);
+    a.cmp_reg_x(13, 16);
+    a.b_cond(C_HS, plain);
+    fields_data(a, layout, 15, 11);
+    a.mov_imm64(16, layout.entry_size as u64);
+    a.madd(15, 13, 16, 15);
+    a.ldr_imm(9, 15, layout.entry_accessor as u32);
+    a.logic_imm_w(
+        0,
+        16,
+        9,
+        asm::logical_imm_w(crate::value::PROP_ACCESSOR as u32).unwrap(),
+    );
+    a.cbz(16, false, plain);
+    a.lsr_imm(9, 9, 4);
+    a.cbz(9, true, plain);
+    a.lsl_imm(9, 9, 4);
+    a.ldr_imm(9, 9, crate::value::ACCESSOR_SET_WORD_OFF as u32);
+    // w2 = the setter frame's position, x12 = the store's call cache (its first way). The call
+    // probe's inputs: x10 = the word EOR the Object tag, w15 = the live epoch, x17 = the active
+    // Realm's global scope. Nothing below changes x2 or x3 before the sequence reads them.
+    a.ldr_w_imm(2, 4, offset_of!(AccessorSlot, position) as u32);
+    a.ldr_imm(12, 4, offset_of!(AccessorSlot, calls) as u32);
+    a.mov_imm64(16, crate::value::PACK_OBJ);
+    a.logic_x(2, 10, 9, 16);
+    a.ldr_imm(16, 19, CALL_IC_EPOCH_OFF);
+    a.ldr_w_imm(15, 16, 0);
+    a.ldr_imm(17, 19, 64); // ctx.genv
+    a.ldur(16, 12, 0); // way 0's callee
+    a.cmp_reg_x(10, 16);
+    a.b_cond(C_NE, rest);
+    a.ldr_w_imm(16, 12, 56); // epoch
+    a.cmp_reg_w(16, 15);
+    a.b_cond(C_NE, rest);
+    a.ldr_imm(16, 12, 32); // global_env
+    a.cmp_reg_x(16, 17);
+    a.b_cond(C_NE, rest);
+    a.movz(15, 0, 0);
+    entry_gates(a, plain);
+    // ---- hit (x9 = the setter's word, x10, x12 and x15 as the call template's, w3 = the
+    // form): a frame of [the site's return, pc and form], then the window over the operands ----
+    a.bind(hit);
+    a.stp_pre(29, 30, -32);
+    a.stp_off(1, 3, 16);
+    let keep = a.new_label();
+    let frame = a.new_label();
+    let pushed = a.new_label();
+    a.logic_imm_w(0, 14, 3, form_kind);
+    a.cbnz(14, false, keep);
+    // SetPropDrop: [receiver, V] becomes [receiver, setter, V].
+    a.ldur(17, 20, -8);
+    a.stur(9, 20, -8);
+    a.str_imm(17, 20, 0);
+    a.add_imm(20, 20, 8);
+    a.b(pushed);
+    a.bind(keep);
+    a.cmp_imm_w(14, SETTER_STORE_KEEP);
+    a.b_cond(C_NE, frame);
+    // SetProp: [receiver, V] becomes [V, receiver, setter, V]; V stays as the result.
+    a.ldp_base(16, 17, 20, -16);
+    a.stp_base(17, 16, 20, -16);
+    a.stp_base(9, 17, 20, 0);
+    a.add_imm(20, 20, 16);
+    a.b(pushed);
+    // SetPropThisDrop and SetPropLocalDrop: [V] becomes [receiver, setter, V].
+    a.bind(frame);
+    receiver_word(a, 16);
+    a.ldur(17, 20, -8);
+    a.stur(16, 20, -8);
+    a.stp_base(9, 17, 20, 0);
+    a.add_imm(20, 20, 16);
+    a.bind(pushed);
+    let declined = a.new_label();
+    let returned = a.new_label();
+    let threw = a.new_label();
+    let emitted = emit_direct_call(
+        a,
+        ilayout,
+        layout,
+        direct.attempted_off,
+        direct.runs_off,
+        direct.retry_off,
+        1,
+        true,
+        declined,
+        threw,
+        returned,
+        direct.finish_stub,
+        DirectCallSite::Register(2),
+    );
+    debug_assert!(
+        emitted,
+        "`set_prop_setter_supported` checked the sequence's preconditions"
+    );
+    // ---- a gate of the sequence declined, before anything ran: put the operands back and
+    // take the helper ----
+    a.bind(declined);
+    let keep_back = a.new_label();
+    let frame_back = a.new_label();
+    let restored = a.new_label();
+    a.ldp_off(1, 3, 16);
+    a.logic_imm_w(0, 14, 3, form_kind);
+    a.cbnz(14, false, keep_back);
+    a.ldur(17, 20, -8);
+    a.sub_imm(20, 20, 8);
+    a.stur(17, 20, -8);
+    a.b(restored);
+    a.bind(keep_back);
+    a.cmp_imm_w(14, SETTER_STORE_KEEP);
+    a.b_cond(C_NE, frame_back);
+    a.ldur(16, 20, -24);
+    a.ldur(17, 20, -8);
+    a.sub_imm(20, 20, 16);
+    a.stp_base(16, 17, 20, -16);
+    a.b(restored);
+    a.bind(frame_back);
+    a.ldur(17, 20, -8);
+    a.sub_imm(20, 20, 16);
+    a.stur(17, 20, -8);
+    a.bind(restored);
+    a.ldp_post(29, 30, 32);
+    a.b(plain);
+    // ---- the setter returned: its result replaced the window; the store leaves none ----
+    a.bind(returned);
+    a.sub_imm(20, 20, 8);
+    a.ldp_post(29, 30, 32);
+    a.movz(1, 0, 0);
+    a.ret();
+    // ---- the setter threw: the sequence popped the window, the error is in the context ----
+    a.bind(threw);
+    a.mov(0, 19);
+    a.ldr_imm(1, 31, 16); // pc
+    a.mov_imm64(16, crate::bytecode::jit_accessor_threw as *const () as u64);
+    a.blr(16);
+    a.ldp_post(29, 30, 32);
+    a.movz(1, 1, 0);
+    a.ret();
+    // ---- the probe after way 0: the `CallSecondary` stub keeps w1, w2 and w3 ----
+    a.bind(rest);
+    let secondary = a.shared_stub(SharedStub::CallSecondary.key());
+    a.stp_pre(29, 30, -16);
+    a.bl_label(secondary);
+    a.ldp_post(29, 30, 16);
+    a.cbz(9, false, plain);
+    entry_gates(a, plain);
+    a.mov_imm64(16, crate::value::PACK_OBJ); // the probe used x9: the setter's word again
     a.logic_x(2, 9, 10, 16);
     a.b(hit);
 }
@@ -12779,8 +13101,8 @@ impl SharedStub {
 
     /// Whether the stub enters the direct sequence, so that it needs the chunk's direct-call
     /// inputs and, assembled once per process, a finish stub of its own: the direct call and
-    /// construct stubs, and the property reads' helper, whose getter call takes the direct-call
-    /// stub (see [`emit_get_prop_getter`]).
+    /// construct stubs, and the property reads' and stores' helpers, whose getter and setter
+    /// calls take the direct sequence (see [`emit_get_prop_getter`], [`emit_set_prop_setter`]).
     fn enters_direct_sequence(self) -> bool {
         match self {
             #[cfg(all(
@@ -12788,7 +13110,7 @@ impl SharedStub {
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
             SharedStub::DirectCall { .. } | SharedStub::DirectConstruct { .. } => true,
-            SharedStub::Helper { idx } => usize::from(idx) == H_GET_PROP,
+            SharedStub::Helper { idx } => matches!(usize::from(idx), H_GET_PROP | H_SET_PROP),
             _ => false,
         }
     }
@@ -12948,13 +13270,19 @@ impl SharedStub {
             }
             SharedStub::Helper { idx } => {
                 // The property reads' helper first calls the getter of an accessor its site
-                // published, through the direct sequence (see `emit_get_prop_getter`).
+                // published, and the stores' the setter of an accessor their caches prove,
+                // through the direct sequence (see `emit_get_prop_getter`,
+                // `emit_set_prop_setter`).
                 let plain = a.new_label();
-                if usize::from(idx) == H_GET_PROP {
-                    if let (Some(ilayout), Some(direct)) = (context.ilayout, context.direct) {
-                        if get_prop_getter_supported(layout, ilayout, direct) {
+                if let (Some(ilayout), Some(direct)) = (context.ilayout, context.direct) {
+                    match usize::from(idx) {
+                        H_GET_PROP if get_prop_getter_supported(layout, ilayout, direct) => {
                             emit_get_prop_getter(a, layout, ilayout, direct, plain);
                         }
+                        H_SET_PROP if set_prop_setter_supported(layout, ilayout, direct) => {
+                            emit_set_prop_setter(a, layout, ilayout, direct, plain);
+                        }
+                        _ => {}
                     }
                 }
                 a.bind(plain);

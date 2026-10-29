@@ -113,6 +113,8 @@ pub(crate) struct Cfg {
     /// a preheader reached only by fresh execution cannot justify facts at an OSR header.
     osr_entries: Vec<Option<usize>>,
     max_settled_stack: usize,
+    /// The operand words the stores' setter calls need (see [`Cfg::jit_stack_capacity`]).
+    setter_window: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1157,6 +1159,7 @@ impl Cfg {
         }
 
         let (pc_depth, max_settled_stack, handler_depths) = analyze_stack(ops, &mut effect)?;
+        let setter_window = setter_window(ops, &pc_depth);
 
         let starts = semantic_block_starts(ops)?;
         let mut blocks = Vec::with_capacity(starts.len().saturating_sub(1));
@@ -1263,6 +1266,7 @@ impl Cfg {
             resume_roots,
             osr_entries: Vec::new(),
             max_settled_stack,
+            setter_window,
         })
     }
 
@@ -1308,9 +1312,11 @@ impl Cfg {
         self.max_settled_stack
     }
 
+    /// The operand words a frame allocates: the settled maximum and a temporary word, and on
+    /// ARM64 the window a store's setter call pushes (see [`setter_window`]).
     #[inline]
     pub(crate) fn jit_stack_capacity(&self) -> usize {
-        self.max_settled_stack + 1
+        (self.max_settled_stack + 1).max(self.setter_window)
     }
 
     pub(crate) fn dominates(&self, a: BlockId, b: BlockId) -> bool {
@@ -1530,6 +1536,28 @@ fn analyze_stack(
         }
     }
     Ok((depth, max, handlers))
+}
+
+/// The operand words the stores' helper stub needs for its setter calls on ARM64 (see
+/// `jit::emit_set_prop_setter`): it runs the setter on [receiver, setter, V] over the operands,
+/// so a store that reads its receiver from the frame (`SetPropThisDrop`, `SetPropLocalDrop`) and
+/// one that keeps V as its result below the window (`SetProp`) use two words above their
+/// incoming depth; `SetPropDrop`'s window replaces its two operands and adds one, within the
+/// temporary word. 0 for a chunk without such stores, and on other targets.
+fn setter_window(ops: &[Op], pc_depth: &[Option<usize>]) -> usize {
+    if !cfg!(target_arch = "aarch64") {
+        return 0;
+    }
+    ops.iter()
+        .zip(pc_depth)
+        .filter_map(|(op, depth)| match op {
+            Op::SetProp(..) | Op::SetPropThisDrop(..) | Op::SetPropLocalDrop(..) => {
+                depth.map(|depth| depth + 2)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn graph_roots(blocks: &[Block], handlers: &[HandlerRoot], entry: Option<BlockId>) -> Vec<BlockId> {
