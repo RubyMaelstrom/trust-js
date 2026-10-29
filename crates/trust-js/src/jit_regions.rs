@@ -3895,6 +3895,20 @@ fn emit_effect(
             emit_update_prop_inline(a, layout, chunk.jit_cache_ptr(cache), kind, pc_u32, unwind);
         }
         Op::LoadName(_, cache) | Op::LoadNameForCall(_, cache)
+            if fast & 8192 != 0
+                && super::operations::static_name(layout, chunk, cache).is_some() =>
+        {
+            let address = super::operations::static_name(layout, chunk, cache).expect("guarded");
+            super::operations::emit_static_name_load(
+                a,
+                layout,
+                address,
+                matches!(op, Op::LoadNameForCall(..)),
+                pc_u32,
+                unwind,
+            );
+        }
+        Op::LoadName(_, cache) | Op::LoadNameForCall(_, cache)
             if fast & 8192 != 0 && load_name_inlinable(layout) =>
         {
             emit_load_name_inline(

@@ -161,6 +161,19 @@ pub(super) fn emit(
                 a.str_imm(10, 9, 0);
             }
         }
+        Op::LoadName(_, cache) | Op::LoadNameForCall(_, cache)
+            if fast & 8192 != 0 && static_name(layout, chunk, *cache).is_some() =>
+        {
+            let address = static_name(layout, chunk, *cache).expect("guarded");
+            emit_static_name_load(
+                a,
+                layout,
+                address,
+                matches!(op, Op::LoadNameForCall(..)),
+                pc as u32,
+                unwind,
+            );
+        }
         Op::LoadName(_, cache) if fast & 8192 != 0 && load_name_inlinable(layout) => {
             emit_load_name_inline(
                 a,
@@ -980,6 +993,62 @@ fn fixed_cap(
 /// one word a slot (W3 item 3's step 5).
 fn cap_slot_offset(slot: u32) -> u32 {
     (crate::interpreter::RECORD_HEADER + 8 * slot as usize) as u32
+}
+
+/// The static address of the free-name read at name cache `cache` (Decision 21,
+/// `bytecode::StaticName`), when the record layout lets generated code walk to it.
+pub(super) fn static_name(
+    layout: &crate::value::JitLayout,
+    chunk: &Chunk,
+    cache: u32,
+) -> Option<crate::bytecode::StaticName> {
+    (layout.scope_parent_valid
+        && layout.scope_parent.is_multiple_of(8)
+        && layout.scope_parent / 8 < 4096)
+        .then(|| chunk.jit_name_static(cache))
+        .flatten()
+}
+
+/// LoadName (or LoadNameForCall, `for_call`, with the undefined `this` below the value) at a
+/// static address: `hops` parent links from the running environment, then the slot's word in
+/// place (planned records never spill), tested for TDZ when the binding is lexical. As with
+/// V8's LdaContextSlot and SpiderMonkey's GetAliasedVar there is no other guard: the address
+/// holds for every closure of the function (`bytecode::scope_plan`).
+pub(super) fn emit_static_name_load(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    address: crate::bytecode::StaticName,
+    for_call: bool,
+    pc: u32,
+    unwind: usize,
+) {
+    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    for _ in 0..address.hops {
+        a.ldr_imm(9, 9, layout.scope_parent as u32);
+    }
+    a.ldr_imm(12, 9, cap_slot_offset(u32::from(address.slot)));
+    let slow = a.new_label();
+    let done = a.new_label();
+    if address.lexical {
+        a.movz(13, 0x7ffa, 3); // PACK_EMPTY
+        a.cmp_reg_x(12, 13);
+        a.b_cond(C_EQ, slow);
+    }
+    if for_call {
+        a.mov_imm64(13, crate::value::PACK_UNDEFINED);
+        emit_exec_word_store(a, 13, 20, 0);
+        a.add_imm(20, 20, 8);
+    }
+    emit_exec_word_store(a, 12, 20, 0);
+    a.add_imm(20, 20, 8);
+    #[cfg(test)]
+    names::record_name_commit(a, 0);
+    if address.lexical {
+        a.b(done);
+        a.bind(slow);
+        emit_exec(a, pc, unwind);
+    }
+    a.bind(done);
 }
 
 /// LoadCap from a fixed slot of the running activation (`Chunk::jit_cap_binding`): its word,

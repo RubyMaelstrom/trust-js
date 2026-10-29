@@ -809,6 +809,9 @@ pub struct Function {
     /// bounded to one layout; eval-dependent alternatives keep dynamic storage.
     pub(crate) env_layouts:
         std::cell::OnceCell<Box<[std::cell::OnceCell<Rc<crate::interpreter::BindingLayout>>; 2]>>,
+    /// Decision 21's environment plan and static outer context (see
+    /// `crate::bytecode::scope_plan`): syntactic, so shared by every heap the code runs in.
+    pub(crate) scopes: crate::bytecode::scope_plan::FunctionScopes,
 }
 
 impl Clone for Function {
@@ -837,6 +840,7 @@ impl Clone for Function {
             hoist: _,
             runtime: _,
             env_layouts: _,
+            scopes: _,
         } = self;
         Self {
             name: name.clone(),
@@ -859,6 +863,7 @@ impl Clone for Function {
             hoist: std::cell::OnceCell::new(),
             runtime: std::cell::OnceCell::new(),
             env_layouts: std::cell::OnceCell::new(),
+            scopes: Default::default(),
         }
     }
 }

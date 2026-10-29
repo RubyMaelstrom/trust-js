@@ -35,6 +35,8 @@ use crate::value::Value;
 
 #[path = "bytecode_activation.rs"]
 pub(crate) mod activation;
+#[path = "bytecode_scope_plan.rs"]
+pub(crate) mod scope_plan;
 use activation::{activation_plans_enabled, ActivationPlan};
 
 #[path = "bytecode_string_accumulation.rs"]
@@ -2499,6 +2501,30 @@ pub(crate) enum CapInit {
     Lexical(Rc<str>, bool),
 }
 
+/// Decision 21: where a free-name read finds its binding without a name cache: `hops` parent
+/// links from the running environment, then the record's slot `slot` (in place: planned records
+/// never spill, `scope_plan`). A `lexical` binding may be in its TDZ: an empty word sends the
+/// read to the name cache's checked path, which throws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StaticName {
+    pub(crate) hops: u16,
+    pub(crate) slot: u16,
+    pub(crate) lexical: bool,
+}
+
+impl CapInit {
+    /// The binding's name.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            CapInit::Param(_, name)
+            | CapInit::Rest(_, name)
+            | CapInit::Var(name)
+            | CapInit::Fn(_, name)
+            | CapInit::Lexical(name, _) => name,
+        }
+    }
+}
+
 struct LexicalBinding {
     /// An atom of the chunk's heap.
     name: crate::atom::Atom,
@@ -2787,6 +2813,9 @@ pub struct Chunk {
     /// Captured bindings to seed into a fresh activation env at entry; empty = no activation
     /// needed (closures, if any, capture the definition env directly).
     cap_inits: Vec<CapInit>,
+    /// The bindings a fresh frame's activation puts first: its function's public plan's
+    /// (Decision 21, `scope_plan`), which every tier's activation of it begins with.
+    scope_prefix: Option<Rc<[scope_plan::PlanBinding]>>,
     /// Call-independent binding descriptors and indexed initialization actions.
     /// Values and closure identities remain fresh on every invocation.
     activation_plan: std::cell::OnceCell<Box<ActivationPlan>>,
@@ -2839,6 +2868,11 @@ pub struct Chunk {
     /// this at nine bytes per site rather than padding a feedback struct to sixteen.
     name_num_bits: Vec<std::cell::Cell<u64>>,
     name_num_valid: Vec<std::cell::Cell<bool>>,
+    /// Decision 21: by name cache, a free-name read's static address (see `StaticName`).
+    name_statics: Box<[Option<StaticName>]>,
+    /// Records from the running environment where the body starts to the function's
+    /// [[Environment]], when any read has a static address (which counts them).
+    static_entry_depth: Option<u16>,
     /// Captured-binding cache keyed by the chunk's interned-name index. Unlike a free-name cache,
     /// this always resolves in the current activation; a weak pin keeps its raw scope pointer
     /// ABA-safe until a fresh/recursive activation refills the entry.
@@ -2980,6 +3014,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             assignment_targets: _,
             lexical_scopes: _,
             cap_inits: _,
+            scope_prefix: _,
             activation_plan: _,
             jit_cap_tdz_known: _,
             jit_fixed_activation: _,
@@ -2997,6 +3032,8 @@ impl crate::gc_trace::GcTrace for Chunk {
             name_pins: _,
             name_num_bits: _,
             name_num_valid: _,
+            name_statics: _,
+            static_entry_depth: _,
             cap_caches: _,
             cap_pins: _,
             initializer_plan: _,
@@ -3965,6 +4002,19 @@ struct CaptureScan {
     top_names: crate::fasthash::FastSet<String>,
     /// Arrow-ness of each enclosing function on the current path (index 0 = the outer function).
     arrow_path: Vec<bool>,
+    /// Decision 21's plan (`scope_plan`): each inner function walked directly in the analyzed
+    /// function, whether a record other than the function's activation encloses it there (a
+    /// block's, catch's, loop head's, class's or `with`'s: a barrier to static addressing),
+    /// and whether it is an object literal's method (whose home record encloses it).
+    children: Option<Vec<(*const Function, bool, bool)>>,
+    /// Classes entered (their records enclose their members).
+    class_depth: u32,
+    /// Statements entered whose evaluation the tree-walker gives a record of its own, whether
+    /// or not they declare anything: `for` heads and iterations, `catch` clauses, `switch`
+    /// blocks, an `if`'s bare function declaration (Annex B.3.4).
+    record_depth: u32,
+    /// The next inner function is an object literal's method, getter or setter.
+    home_member: bool,
 }
 
 /// Collect every binding a `Pattern` introduces.
@@ -4192,6 +4242,9 @@ mod capture_summary_tests {
             // Scopes pushed inside the function take serials the summary does not; nothing
             // records them (they are never depth-0 scopes).
             walked.next_serial = applied.next_serial;
+            // A plan's record of the inner functions it met is bookkeeping, not analysis.
+            walked.children.clone_from(&applied.children);
+            walked.home_member = applied.home_member;
             assert_eq!(
                 walked, applied,
                 "capture summary differs from walking {:?}",
@@ -4272,6 +4325,10 @@ impl CaptureScan {
             saw_with: false,
             top_names: Default::default(),
             arrow_path: vec![func.is_arrow],
+            children: None,
+            class_depth: 0,
+            record_depth: 0,
+            home_member: false,
         }
     }
 
@@ -4297,7 +4354,24 @@ impl CaptureScan {
         crate::fasthash::FastSet<String>,
         bool,
     )> {
-        let mut sc = CaptureScan::new(func, allow_direct_eval);
+        let (captured, env_this, homed, runtime, direct_eval, _) =
+            Self::run_scan(CaptureScan::new(func, allow_direct_eval), func)?;
+        Some((captured, env_this, homed, runtime, direct_eval))
+    }
+
+    /// [`CaptureScan::run`] with a prepared scan, which it returns after the analysis.
+    #[allow(clippy::type_complexity)]
+    fn run_scan(
+        mut sc: CaptureScan,
+        func: &Function,
+    ) -> Option<(
+        crate::fasthash::FastSet<String>,
+        bool,
+        Vec<(String, bool)>,
+        crate::fasthash::FastSet<String>,
+        bool,
+        CaptureScan,
+    )> {
         sc.fn_body(func)?;
         // ECMA-262 PerformEval starts a direct eval from the running context's LexicalEnvironment
         // and VariableEnvironment. A syntactic eval at any nested function depth may therefore
@@ -4410,7 +4484,15 @@ impl CaptureScan {
             }
         }
         homed.sort_by(|left, right| left.0.cmp(&right.0)); // deterministic cap_init order
-        Some((sc.captured, sc.env_this, homed, runtime, sc.saw_direct_eval))
+        let captured = std::mem::take(&mut sc.captured);
+        Some((
+            captured,
+            sc.env_this,
+            homed,
+            runtime,
+            sc.saw_direct_eval,
+            sc,
+        ))
     }
 
     fn push_scope(&mut self, names: crate::fasthash::FastSet<String>) {
@@ -4756,6 +4838,32 @@ impl CaptureScan {
         if crate::interpreter::ast_stack_low() {
             return crate::interpreter::with_ast_stack(|| self.stmt(s));
         }
+        // The tree-walker evaluates these under a record of their own, which compiled code may
+        // not make: an inner function there is behind a barrier (Decision 21's plan).
+        let own_record = match s {
+            Stmt::For { .. } | Stmt::ForInOf { .. } | Stmt::Switch { .. } => true,
+            Stmt::If { cons, alt, .. } => {
+                let bare_function = |s: &Stmt| {
+                    let mut s = s;
+                    while let Stmt::Labeled { body, .. } = s {
+                        s = body;
+                    }
+                    matches!(s, Stmt::FuncDecl(_))
+                };
+                bare_function(cons) || alt.as_deref().is_some_and(bare_function)
+            }
+            _ => false,
+        };
+        if own_record {
+            self.record_depth += 1;
+            let result = self.stmt_in_place(s);
+            self.record_depth -= 1;
+            return result;
+        }
+        self.stmt_in_place(s)
+    }
+
+    fn stmt_in_place(&mut self, s: &Stmt) -> Option<()> {
         self.spend_watch_budget()?;
         match s {
             Stmt::Expr(e) | Stmt::Throw(e) => self.expr(e),
@@ -4889,58 +4997,18 @@ impl CaptureScan {
             } => {
                 self.block(block)?;
                 if let Some((param, body)) = handler {
-                    if let Some(pattern) = param {
-                        // CatchClauseEvaluation creates a parameter environment first, then
-                        // evaluates the catch Block in its own nested block environment. Keep
-                        // those scope serials distinct so a captured parameter or block lexical
-                        // can receive the exact fresh runtime record it denotes.
-                        let mut names = crate::fasthash::FastSet::default();
-                        if self.watched_name.is_none() {
-                            pat_idents(pattern, &mut names);
-                        }
-                        self.push_scope_lets(names, Default::default(), true);
-                        let result = (|| {
-                            self.pat_decl_exprs(pattern)?;
-                            self.block(body)
-                        })();
-                        self.scopes.pop();
-                        result?;
-                    } else {
-                        self.block(body)?;
-                    }
+                    // A `catch` clause's records (its parameter's and its block's).
+                    self.record_depth += 1;
+                    let caught = self.catch_clause(param.as_ref(), body);
+                    self.record_depth -= 1;
+                    caught?;
                 }
                 if let Some(f) = finalizer {
                     self.block(f)?;
                 }
                 Some(())
             }
-            Stmt::Switch { disc, cases } => {
-                self.expr(disc)?;
-                if self.watched_name.is_some() && cases.len() > 256 {
-                    return None;
-                }
-                let mut names = crate::fasthash::FastSet::default();
-                let mut homable = crate::fasthash::FastMap::default();
-                for c in cases {
-                    if self.watched_name.is_none() {
-                        self.declare_lexicals_lets(&c.body, &mut names, &mut homable);
-                    }
-                }
-                self.push_scope_lets(names, homable, true);
-                let r = (|| {
-                    for c in cases {
-                        if let Some(t) = &c.test {
-                            self.expr(t)?;
-                        }
-                        for s in &c.body {
-                            self.stmt(s)?;
-                        }
-                    }
-                    Some(())
-                })();
-                self.scopes.pop();
-                r
-            }
+            Stmt::Switch { disc, cases } => self.switch(disc, cases),
             Stmt::Labeled { body, .. } => self.stmt(body),
             Stmt::With { obj, body } => {
                 if !self.allow_with {
@@ -4977,6 +5045,20 @@ impl CaptureScan {
     }
 
     fn walk_inner_fn(&mut self, f: &Function) -> Option<()> {
+        let home = std::mem::take(&mut self.home_member);
+        if self.fn_depth == 0 && self.children.is_some() {
+            let top = self.top_serial;
+            let barrier = self.class_depth > 0
+                || self.record_depth > 0
+                || self.with_depth > 0
+                || self
+                    .scopes
+                    .iter()
+                    .any(|(names, _, serial)| Some(*serial) != top && !names.is_empty());
+            if let Some(children) = &mut self.children {
+                children.push((std::ptr::from_ref(f), barrier, home));
+            }
+        }
         self.fn_depth += 1;
         self.arrow_path.push(f.is_arrow);
         let r = self.fn_body(f);
@@ -5015,6 +5097,58 @@ impl CaptureScan {
         Some(())
     }
 
+    /// A `catch` clause: its parameter's record, then its block's.
+    fn catch_clause(&mut self, param: Option<&Pattern>, body: &[Stmt]) -> Option<()> {
+        if let Some(pattern) = param {
+            // CatchClauseEvaluation creates a parameter environment first, then
+            // evaluates the catch Block in its own nested block environment. Keep
+            // those scope serials distinct so a captured parameter or block lexical
+            // can receive the exact fresh runtime record it denotes.
+            let mut names = crate::fasthash::FastSet::default();
+            if self.watched_name.is_none() {
+                pat_idents(pattern, &mut names);
+            }
+            self.push_scope_lets(names, Default::default(), true);
+            let result = (|| {
+                self.pat_decl_exprs(pattern)?;
+                self.block(body)
+            })();
+            self.scopes.pop();
+            result
+        } else {
+            self.block(body)
+        }
+    }
+
+    /// A `switch` statement: its discriminant, then its cases in the block's record.
+    fn switch(&mut self, disc: &Expr, cases: &[SwitchCase]) -> Option<()> {
+        self.expr(disc)?;
+        if self.watched_name.is_some() && cases.len() > 256 {
+            return None;
+        }
+        let mut names = crate::fasthash::FastSet::default();
+        let mut homable = crate::fasthash::FastMap::default();
+        for c in cases {
+            if self.watched_name.is_none() {
+                self.declare_lexicals_lets(&c.body, &mut names, &mut homable);
+            }
+        }
+        self.push_scope_lets(names, homable, true);
+        let r = (|| {
+            for c in cases {
+                if let Some(t) = &c.test {
+                    self.expr(t)?;
+                }
+                for s in &c.body {
+                    self.stmt(s)?;
+                }
+            }
+            Some(())
+        })();
+        self.scopes.pop();
+        r
+    }
+
     fn class(&mut self, c: &Class) -> Option<()> {
         if self.watched_name.is_some() && c.members.len() > 256 {
             return None;
@@ -5035,6 +5169,7 @@ impl CaptureScan {
         self.fn_depth += 1;
         self.push_scope(names);
         self.fn_depth -= 1;
+        self.class_depth += 1;
         let r = (|| {
             if let Some(sc) = &c.superclass {
                 self.expr(sc)?;
@@ -5063,6 +5198,7 @@ impl CaptureScan {
             }
             Some(())
         })();
+        self.class_depth -= 1;
         self.scopes.pop();
         r
     }
@@ -5124,7 +5260,11 @@ impl CaptureScan {
                             if let PropKey::Computed(k) = key {
                                 self.expr(k)?;
                             }
-                            self.inner_fn(func)?;
+                            // Its closure may close over a home record (`literal_define_method`).
+                            self.home_member = true;
+                            let walked = self.inner_fn(func);
+                            self.home_member = false;
+                            walked?;
                         }
                         PropDef::Spread(e) | PropDef::Proto(e) => self.expr(e)?,
                     }
@@ -6979,6 +7119,7 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         runtime: std::cell::OnceCell::new(),
 
         env_layouts: std::cell::OnceCell::new(),
+        scopes: Default::default(),
     };
     let started = crate::jit::perf_stage_start();
     let result = compile_inner(
@@ -7022,6 +7163,7 @@ pub(crate) fn compile_script(body: &[Stmt], strict: bool) -> Option<Rc<Chunk>> {
         runtime: std::cell::OnceCell::new(),
 
         env_layouts: std::cell::OnceCell::new(),
+        scopes: Default::default(),
     };
     let started = crate::jit::perf_stage_start();
     let result = compile_inner(&source, &Default::default(), None, None, false, false, true);
@@ -7781,6 +7923,35 @@ fn compile_inner_mode(
             }
         )
     });
+    // Decision 21: the activation is known from here on, so the body's free names may resolve
+    // statically through the function's outer context (`scope_plan`). A direct eval anywhere in
+    // it could shadow any of them; a coroutine's, script's, module's or derived constructor's
+    // records are their own.
+    if !direct_eval
+        && !is_coroutine
+        && !script_body
+        && module_bindings.is_none()
+        && !derived_constructor
+    {
+        let entry_depth = if prepared_entry {
+            // FunctionDeclarationInstantiation's records: the body's, then the parameters' two.
+            Some(if crate::interpreter::params_have_expr(&func.params) {
+                3
+            } else {
+                1
+            })
+        } else if !c.reuse_activation {
+            let makes_env =
+                !c.cap_inits.is_empty() || (c.env_this && !c.lexical_this) || c.env_arguments;
+            Some(u16::from(makes_env))
+        } else {
+            None
+        };
+        if let Some(entry_depth) = entry_depth {
+            c.outer_context = func.outer_context_rc();
+            c.static_entry_depth = entry_depth;
+        }
+    }
     let body_result = if has_body_using {
         c.disposal_scope(compile_body)
     } else {
@@ -7804,6 +7975,39 @@ fn compile_inner_mode(
         .into_iter()
         .map(|name| (name != crate::interpreter::ParameterMap::UNMAPPED).then_some(name))
         .collect();
+    }
+    // Decision 21: a fresh frame makes the activation its function's plan describes, as the
+    // tree-walker does (`scope_plan`); a body that would not is left to the tree-walker.
+    if !prepared_entry
+        && !is_coroutine
+        && !script_body
+        && module_bindings.is_none()
+        && !c.reuse_activation
+    {
+        let plan = func.scope_plan(derived_constructor);
+        let makes_env =
+            !c.cap_inits.is_empty() || (c.env_this && !c.lexical_this) || c.env_arguments;
+        match plan.kind {
+            scope_plan::PlanKind::Opaque => {}
+            scope_plan::PlanKind::Private => {
+                if makes_env {
+                    log_bail("scope-plan", "an activation the plan leaves private");
+                    return None;
+                }
+            }
+            scope_plan::PlanKind::Public => {
+                let holds = |name: &str| {
+                    c.cap_inits.iter().any(|init| init.name() == name)
+                        || (name == "this" && c.env_this && !c.lexical_this)
+                        || (name == "arguments" && c.env_arguments)
+                };
+                if !makes_env || plan.prefix.iter().any(|binding| !holds(&binding.name)) {
+                    log_bail("scope-plan", "an activation without the plan's bindings");
+                    return None;
+                }
+                c.scope_prefix = Some(plan.prefix.clone());
+            }
+        }
     }
     finish_chunk(c, hot, prepared_entry, is_coroutine, Some(func))
 }
@@ -8017,6 +8221,7 @@ fn finish_chunk(
             .map(LexicalScope::new)
             .collect(),
         cap_inits: c.cap_inits,
+        scope_prefix: c.scope_prefix,
         activation_plan: std::cell::OnceCell::new(),
         jit_cap_tdz_known: std::cell::OnceCell::new(),
         jit_fixed_activation: std::cell::OnceCell::new(),
@@ -8036,6 +8241,12 @@ fn finish_chunk(
         resolution_caches: std::cell::OnceCell::new(),
         name_num_bits: c.name_num_bits,
         name_num_valid: c.name_num_valid,
+        static_entry_depth: c
+            .name_statics
+            .iter()
+            .any(Option::is_some)
+            .then_some(c.static_entry_depth),
+        name_statics: c.name_statics.into_boxed_slice(),
         cap_caches: vec![std::cell::Cell::new(NameIc::EMPTY); cap_cache_len],
         cap_pins: std::cell::RefCell::new(vec![None; cap_cache_len]),
         initializer_plan: std::cell::OnceCell::new(),
@@ -8825,6 +9036,20 @@ struct Compiler {
     name_pins: Vec<NamePin>,
     name_num_bits: Vec<std::cell::Cell<u64>>,
     name_num_valid: Vec<std::cell::Cell<bool>>,
+    /// Decision 21: by name cache, a free-name read's static address (see `StaticName`).
+    name_statics: Vec<Option<StaticName>>,
+    /// The planned records around the compiled function (`Function::outer_context`), when its
+    /// free names may resolve statically: it has no direct eval, and its entry environment's
+    /// records are known (`static_entry_depth`).
+    outer_context: Option<Rc<scope_plan::OuterContext>>,
+    /// Records from the running environment where the body starts to the function's
+    /// [[Environment]]: its activation's, or a prepared entry's.
+    static_entry_depth: u16,
+    /// Records the code being compiled runs under that it pushed itself (open
+    /// `environment_scope`s and `with`s).
+    runtime_depth: u16,
+    /// Nonzero while compiling code that runs under records not counted (a class's).
+    static_blocked: u32,
     name_seed_stack: Vec<(Vec<NameSeed>, usize)>,
     call_caches: Vec<CallSite>,
     /// See [`Chunk::call_name`]; rolled back with `ops`.
@@ -8888,6 +9113,9 @@ struct Compiler {
     assignment_targets: Vec<AssignmentTargetPlan>,
     lexical_scopes: Vec<Vec<LexicalBinding>>,
     cap_inits: Vec<CapInit>,
+    /// Decision 21: a fresh frame's activation follows its function's public plan, these
+    /// bindings first (see `scope_plan`).
+    scope_prefix: Option<Rc<[scope_plan::PlanBinding]>>,
     reuse_activation: bool,
     env_this: bool,
     env_arguments: bool,
@@ -9621,7 +9849,42 @@ impl Compiler {
             .push(std::cell::Cell::new(number.unwrap_or(0)));
         self.name_num_valid
             .push(std::cell::Cell::new(number.is_some()));
+        self.name_statics.push(None);
         (self.name_caches.len() - 1) as u32
+    }
+
+    /// Decision 21: the static address of a read of the free name `name` here, from the running
+    /// environment, when only planned records lie between the function's [[Environment]] and the
+    /// record that binds it (`scope_plan`). Names a sloppy direct eval or a `with` could shadow
+    /// keep the name caches, the guard.
+    fn static_name(&self, name: &str) -> Option<StaticName> {
+        if self.inline_depth > 0 || self.static_blocked > 0 || !self.with_scope_floors.is_empty() {
+            return None;
+        }
+        // A runtime lexical record of this function binds it, which `home` reports as None.
+        if self
+            .lexical_env_names
+            .iter()
+            .any(|scope| scope.contains_key(name))
+        {
+            return None;
+        }
+        let address = self.outer_context.as_ref()?.resolve(name)?;
+        Some(StaticName {
+            hops: self
+                .static_entry_depth
+                .checked_add(self.runtime_depth)?
+                .checked_add(address.hops)?,
+            slot: address.slot,
+            lexical: address.lexical,
+        })
+    }
+
+    /// Give the read at name cache `cache` of the free name `name` its static address, if it
+    /// has one ([`Compiler::static_name`]).
+    fn note_static_name(&mut self, cache: u32, name: &str) {
+        let address = self.static_name(name);
+        self.name_statics[cache as usize] = address;
     }
     fn emit_store_name(&mut self, name: u32) {
         let cache = self.new_name_cache(name, true);
@@ -9745,6 +10008,7 @@ impl Compiler {
             self.name_pins.truncate(snap.4);
             self.name_num_bits.truncate(snap.4);
             self.name_num_valid.truncate(snap.4);
+            self.name_statics.truncate(snap.4);
             self.call_caches.truncate(snap.5);
             self.inline_targets.truncate(snap.6);
             self.slot_names.truncate(snap.7);
@@ -10610,8 +10874,10 @@ impl Compiler {
                 Ok((true, true))
             }
             Expr::Ident(name, _) if self.home(name).is_none() => {
-                let name = self.name_idx(name);
+                let text = name;
+                let name = self.name_idx(text);
                 let cache = self.new_name_cache(name, false);
+                self.note_static_name(cache, text);
                 self.emit(Op::LoadNameForCall(name, cache));
                 Ok((true, true))
             }
@@ -13406,7 +13672,11 @@ impl Compiler {
         self.finally_depths.push(self.try_depth);
         self.function_osr_environment_handlers.push(push);
 
-        compile_body(self)?;
+        // The body runs under the record just pushed (static name addresses count it).
+        self.runtime_depth += 1;
+        let compiled = compile_body(self);
+        self.runtime_depth -= 1;
+        compiled?;
         self.function_osr_environment_handlers.pop();
 
         self.emit(Op::PopHandler);
@@ -13463,7 +13733,9 @@ impl Compiler {
         self.finally_depths.push(self.try_depth);
 
         self.with_scope_floors.push(self.scopes.len());
+        self.runtime_depth += 1;
         let result = self.stmt(body);
+        self.runtime_depth -= 1;
         self.with_scope_floors.pop();
         result?;
 
@@ -14527,6 +14799,7 @@ impl Compiler {
                     None => {
                         let i = self.name_idx(name);
                         let c = self.new_name_cache(i, false);
+                        self.note_static_name(c, name);
                         self.emit(Op::LoadName(i, c));
                     }
                 };
@@ -14548,6 +14821,7 @@ impl Compiler {
                     // Closures under `with` are excluded by the call-entry gates.
                     let name = self.name_idx("this");
                     let cache = self.new_name_cache(name, false);
+                    self.note_static_name(cache, "this");
                     self.emit(Op::LoadName(name, cache));
                     return Ok(());
                 }
@@ -15858,6 +16132,29 @@ pub(crate) fn try_function_osr(
             return Ok(None);
         }
     }
+    // Decision 21: the chunk's static name addresses count records from the running
+    // environment. Enter only where the parked frame's records are the ones its code counts.
+    if let Some(depth) = chunk.static_entry_depth {
+        let mut record = if entry.environment_handlers.is_empty() {
+            if chunk.makes_env() || chunk.prepared_entry {
+                activation
+            } else {
+                closure
+            }
+        } else {
+            *live_env
+        };
+        for _ in 0..usize::from(depth) + entry.environment_handlers.len() {
+            let parent = record.borrow().parent;
+            match parent {
+                Some(parent) => record = parent,
+                None => return Ok(None),
+            }
+        }
+        if !Env::ptr_eq(&record, &closure) {
+            return Ok(None);
+        }
+    }
     // Seed by binding identity through the parked lexical chain, including TDZ cells. This
     // inspects only engine-owned bindings and performs no author property read or conversion.
     let mut initial = Vec::with_capacity(entry.bindings.len());
@@ -16952,7 +17249,10 @@ fn run_vm_inner(
                     *pc = end;
                     continue;
                 }
-                let v = chunk.load_name_ic(i, env, n, c)?;
+                let v = match chunk.static_name_value(i, env, n, c) {
+                    Some(v) => v,
+                    None => chunk.load_name_ic(i, env, n, c)?,
+                };
                 stack.push(v);
             }
             Op::LoadNameIn(n, c, t) => {
@@ -17967,9 +18267,11 @@ fn run_vm_inner(
             }
             Op::LoadNameForCall(n, c) => {
                 // A depth-0 cache hit/fill can't have come through a `with` object: `this` is
-                // undefined. Only the full walk can produce a with-object receiver.
+                // undefined. Only the full walk can produce a with-object receiver; nor can a
+                // static address (no `with` lies on its path).
                 if let Some(v) = chunk
-                    .name_ic_hit(i, env, c)
+                    .static_name_value(i, env, n, c)
+                    .or_else(|| chunk.name_ic_hit(i, env, c))
                     .or_else(|| chunk.name_ic_fill(i, env, n, c, false))
                 {
                     stack.push(Value::Undefined);
@@ -20643,6 +20945,48 @@ impl Chunk {
     /// When `env` *is* the global scope and misses, an own data property of the ordinary global
     /// object fills the global mode instead. Returns the value on success; `None` = not cacheable
     /// at this site (the caller runs the interpreter's full walk, uncached).
+    /// Decision 21: the static address of the free-name read at name cache `cache`, if it has
+    /// one (see `StaticName`).
+    pub(crate) fn jit_name_static(&self, cache: u32) -> Option<StaticName> {
+        self.name_statics.get(cache as usize).copied().flatten()
+    }
+
+    /// Decision 21: the value of the free-name read at name cache `c` (of the name `n`), found at
+    /// its static address from the running environment `env` (`StaticName`), when the read has
+    /// one and the binding is initialized; `None` leaves the read to the name cache, whose
+    /// checked path throws for a binding in its TDZ. The first such read also fills the cache,
+    /// for the generated code that probes it.
+    #[inline]
+    pub(crate) fn static_name_value(&self, i: &Interp, env: &Env, n: u32, c: u32) -> Option<Value> {
+        let address = (*self.name_statics.get(c as usize)?)?;
+        let mut record = *env;
+        for _ in 0..address.hops {
+            let parent = record.borrow().parent;
+            record = parent.expect("a planned record has its static parents");
+        }
+        let value = {
+            let scope = record.borrow();
+            debug_assert!(
+                scope
+                    .vars
+                    .keys()
+                    .nth(usize::from(address.slot))
+                    .is_some_and(|name| *name.text() == *self.names[n as usize]),
+                "the static address of {:?} names another binding",
+                self.names[n as usize]
+            );
+            let binding = scope.vars.fixed_binding_at(usize::from(address.slot))?;
+            if !binding.initialized() {
+                return None;
+            }
+            binding.value()
+        };
+        if self.name_caches[c as usize].get().env == 0 {
+            let _ = self.name_ic_fill(i, env, n, c, false);
+        }
+        Some(value)
+    }
+
     pub(crate) fn name_ic_fill(
         &self,
         i: &Interp,
@@ -23675,7 +24019,8 @@ fn literal_define_method<K: AsRef<str> + crate::value::IntoPropKey>(
     kind: u8,
 ) {
     let method_env = if func.observes_home_object() {
-        let home_env = crate::interpreter::new_scope(Some(*env));
+        // Like a closure, the home record closes over no private record (Decision 21).
+        let home_env = crate::interpreter::new_scope(Some(crate::interpreter::closure_env(*env)));
         crate::eval::bind(&home_env, "%homeobject%", Value::Obj(*object));
         home_env
     } else {
@@ -26308,7 +26653,10 @@ unsafe fn jit_exec_inner(
             push!(v);
         }
         Op::LoadName(n, c) => {
-            let v = chunk.load_name_ic(i, env, n, c)?;
+            let v = match chunk.static_name_value(i, env, n, c) {
+                Some(v) => v,
+                None => chunk.load_name_ic(i, env, n, c)?,
+            };
             push!(v);
         }
         Op::LoadNameIn(n, c, t) => {
@@ -26954,7 +27302,8 @@ unsafe fn jit_exec_inner(
         Op::LoadNameForCall(n, c) => {
             // A depth-0 cache hit/fill can't have come through a `with` object (see the VM arm).
             if let Some(v) = chunk
-                .name_ic_hit(i, env, c)
+                .static_name_value(i, env, n, c)
+                .or_else(|| chunk.name_ic_hit(i, env, c))
                 .or_else(|| chunk.name_ic_fill(i, env, n, c, false))
             {
                 push!(Value::Undefined);

@@ -162,6 +162,40 @@ impl ActivationPlan {
         // names and attributes are static here, while initialization and values
         // stay per invocation.
         drop(slot);
+        // Decision 21: the function's plan's bindings first, slot for slot, as every tier's
+        // activation of it begins (`scope_plan`); the rest keep their order after them.
+        if let Some(prefix) = chunk.scope_prefix.as_deref() {
+            let mut order = Vec::with_capacity(names.len());
+            let mut placed = vec![false; names.len()];
+            for binding in prefix {
+                let index = slots[&binding.name];
+                order.push(index);
+                placed[index] = true;
+            }
+            order.extend((0..names.len()).filter(|&index| !placed[index]));
+            let mut position = vec![0; names.len()];
+            for (to, &from) in order.iter().enumerate() {
+                position[from] = to;
+            }
+            names = order.iter().map(|&from| names[from]).collect();
+            attrs = order.iter().map(|&from| attrs[from]).collect();
+            plan.bindings = order.iter().map(|&from| plan.bindings[from]).collect();
+            for (index, _) in &mut plan.parameters {
+                *index = position[*index];
+            }
+            for (index, _) in &mut plan.functions {
+                *index = position[*index];
+            }
+            if let Some((index, _)) = &mut plan.rest {
+                *index = position[*index];
+            }
+            for index in [&mut plan.this_slot, &mut plan.arguments_slot]
+                .into_iter()
+                .flatten()
+            {
+                *index = position[*index];
+            }
+        }
         plan.desc = ScopeDesc::new(names, attrs);
         plan.kept_desc = crate::value::keep_scope_desc(&plan.desc);
         plan.class = record_class(plan.bindings.len());

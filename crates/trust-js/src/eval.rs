@@ -4055,7 +4055,8 @@ impl Interp {
                 return *env;
             }
             *home_env.get_or_insert_with(|| {
-                let home = new_scope(Some(*env));
+                // Like a closure, the home record closes over no private record (Decision 21).
+                let home = new_scope(Some(crate::interpreter::closure_env(*env)));
                 bind(&home, "%homeobject%", Value::Obj(obj));
                 home
             })
@@ -9384,6 +9385,7 @@ fn default_constructor(derived: bool, class: &Class) -> Function {
         runtime: std::cell::OnceCell::new(),
 
         env_layouts: std::cell::OnceCell::new(),
+        scopes: Default::default(),
         name: None,
         params,
         body: body.into(),

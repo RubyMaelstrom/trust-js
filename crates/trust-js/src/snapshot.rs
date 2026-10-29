@@ -1545,6 +1545,7 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         runtime: std::cell::OnceCell::new(),
 
         env_layouts: OnceCell::new(),
+        scopes: Default::default(),
     })
 }
 

@@ -3603,6 +3603,7 @@ impl Parser {
             runtime: std::cell::OnceCell::new(),
 
             env_layouts: std::cell::OnceCell::new(),
+            scopes: Default::default(),
             name,
             params,
             body: body.into(),
@@ -3821,6 +3822,7 @@ impl Parser {
                 runtime: std::cell::OnceCell::new(),
 
                 env_layouts: std::cell::OnceCell::new(),
+                scopes: Default::default(),
                 name: None,
                 params: Vec::new(),
                 body: body.into(),
@@ -4002,6 +4004,7 @@ impl Parser {
             runtime: std::cell::OnceCell::new(),
 
             env_layouts: std::cell::OnceCell::new(),
+            scopes: Default::default(),
             name: None,
             params,
             body: body.into(),
@@ -4248,6 +4251,7 @@ impl Parser {
                 runtime: std::cell::OnceCell::new(),
 
                 env_layouts: std::cell::OnceCell::new(),
+                scopes: Default::default(),
                 name: None,
                 params,
                 body: body.into(),
@@ -4273,6 +4277,7 @@ impl Parser {
                 runtime: std::cell::OnceCell::new(),
 
                 env_layouts: std::cell::OnceCell::new(),
+                scopes: Default::default(),
                 name: None,
                 params,
                 body: vec![Stmt::Return(Some(expr))].into(),

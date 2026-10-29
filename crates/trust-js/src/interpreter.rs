@@ -1642,8 +1642,16 @@ pub struct VarMap {
     /// [`Scope::catch_param`]), in the word the generation leaves.
     under_with: bool,
     var_boundary: bool,
-    catch_param: bool,
+    /// [`ROLE_CATCH_PARAM`] or [`ROLE_PRIVATE`] (see [`Scope::catch_param`],
+    /// [`Scope::private_record`]), or 0.
+    role: u8,
 }
+
+/// A `catch` clause's parameter record (see [`Scope::catch_param`]).
+const ROLE_CATCH_PARAM: u8 = 1;
+/// A tree-walked activation that Decision 21's plan leaves private (see
+/// [`Scope::private_record`]).
+const ROLE_PRIVATE: u8 = 2;
 
 /// Past this many names a descriptor or a record's own list keeps an index of them.
 const SMALL_VAR_MAP_CAPACITY: usize = 8;
@@ -2566,7 +2574,7 @@ impl VarMap {
             class,
             under_with,
             var_boundary,
-            catch_param,
+            role: if catch_param { ROLE_CATCH_PARAM } else { 0 },
         }
     }
 
@@ -3408,7 +3416,22 @@ impl Scope {
     /// allowed (the web-compatibility carve-out for VariableStatements in catch blocks).
     #[inline]
     pub fn catch_param(&self) -> bool {
-        self.vars.catch_param
+        self.vars.role == ROLE_CATCH_PARAM
+    }
+
+    /// `true` for a tree-walked function activation that Decision 21's plan leaves private
+    /// (`bytecode::scope_plan`): no inner function names a binding of it, and compiled code makes
+    /// no record there. A closure made in it takes the nearest record that is not private as its
+    /// [[Environment]] ([`closure_env`]), so that every tier gives a closure the same records.
+    #[inline]
+    pub(crate) fn private_record(&self) -> bool {
+        self.vars.role == ROLE_PRIVATE
+    }
+
+    /// Mark a fresh tree-walked activation private (see [`Scope::private_record`]).
+    pub(crate) fn set_private_record(&mut self) {
+        debug_assert!(self.vars.var_boundary && self.vars.role == 0);
+        self.vars.role = ROLE_PRIVATE;
     }
 
     /// A with record is present exactly when its word is not EMPTY. Presence is independent
@@ -3890,6 +3913,28 @@ pub fn new_var_scope(parent: Option<Env>) -> Env {
 }
 
 /// [`new_var_scope`] with room for `capacity` bindings in its cell.
+/// The [[Environment]] of a closure made in `env`: the nearest record that is not private (see
+/// [`Scope::private_record`]). A private record holds no binding an inner function names, so the
+/// closure resolves every name as it would through it, and its records are those every tier
+/// gives it (Decision 21).
+#[inline]
+pub(crate) fn closure_env(env: Env) -> Env {
+    let mut env = env;
+    loop {
+        let parent = {
+            let scope = env.borrow();
+            if !scope.private_record() {
+                return env;
+            }
+            scope.parent
+        };
+        match parent {
+            Some(parent) => env = parent,
+            None => return env,
+        }
+    }
+}
+
 pub(crate) fn new_var_scope_with_capacity(parent: Option<Env>, capacity: usize) -> Env {
     let flags = (under_with(parent.as_ref()), true, false);
     new_record(
@@ -9361,6 +9406,8 @@ impl Interp {
         env: Env,
         name: Option<&Rc<str>>,
     ) -> Value {
+        // Every tier makes its closures here: none closes over a private record (Decision 21).
+        let env = closure_env(env);
         let is_arrow = func.is_arrow;
         let is_method = func.is_method;
         let is_generator = func.is_generator;
@@ -16888,7 +16935,33 @@ impl Interp {
             let callee_base = new_var_scope(Some(closure));
             new_scope(Some(callee_base))
         } else {
-            new_var_scope(Some(closure))
+            // Decision 21: the activation the function's plan describes, as the compiled tiers
+            // make it (`bytecode::scope_plan`).
+            let derived = fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
+            let plan = func.scope_plan(derived);
+            match plan.kind {
+                crate::bytecode::scope_plan::PlanKind::Public => {
+                    // In place and with the plan's bindings first: FunctionDeclarationInstantiation
+                    // then initializes each where it is (`VarMap::insert` keeps a slot).
+                    let scope = new_var_scope_with_capacity(Some(closure), plan.capacity);
+                    {
+                        let mut record = scope.borrow_mut();
+                        for binding in plan.prefix.iter() {
+                            record.vars.insert(
+                                &*binding.name,
+                                Binding::data(Value::Undefined, true, !binding.lexical),
+                            );
+                        }
+                    }
+                    scope
+                }
+                crate::bytecode::scope_plan::PlanKind::Private => {
+                    let scope = new_var_scope(Some(closure));
+                    scope.borrow_mut().set_private_record();
+                    scope
+                }
+                crate::bytecode::scope_plan::PlanKind::Opaque => new_var_scope(Some(closure)),
+            }
         };
 
         // `new.target`: an ordinary call clears it, a construct installs the pending target; an arrow
