@@ -3572,10 +3572,13 @@ census has neither eval nor `with`.
 
 Design:
 1. A plan per function (CaptureScan, cached on the Function node): Opaque (direct eval or `with`
-   inside, its nested functions included; parameter expressions; more than 506 bindings; script,
-   module and eval code), Private (no captures, no lexical `this`, no captured `arguments`, no
-   mapped formals, no arrow observing new.target or `super`), or Public (a prefix of the captured
-   function-level names, and `this` when an arrow reads it, in sorted order).
+   inside, its nested functions included, as the scan walks them; parameter expressions; more
+   than 506 bindings; new.target observed by the function or its arrows, which the tree-walker
+   resolves by name; script, module and eval code), Private (no captures, no lexical `this` or
+   `super`, which the scan treats as `this`, no captured `arguments`, no mapped formals; never a
+   generator or async function), or Public (a prefix of the captured function-level names, and
+   `this` when an arrow reads it, in sorted order). `super`'s home object lives in the method's
+   own environment, made with the closure, which skipping an activation never hides.
 2. One activation layout: the tree-walker makes a Public function's activation at the plan's size
    with the prefix first, which FunctionDeclarationInstantiation then initializes in place; the
    compiled ActivationPlan orders the same prefix first, and a fresh-frame chunk that would
