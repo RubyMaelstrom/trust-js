@@ -81,8 +81,7 @@ pub(super) fn install_math(it: &mut Interp) {
                 let x = ab(i.to_number(&arg(a, 0)))?;
                 Ok(Value::Num($f(x)))
             };
-            register_numeric_only_native(f);
-            register_math_intrinsic(f, $intrinsic);
+            declare_native(f, $intrinsic);
             it.def_method(&math, $name, 1, f);
         }};
         ($name:expr, $f:expr) => {{
@@ -99,7 +98,7 @@ pub(super) fn install_math(it: &mut Interp) {
                 let x = ab(i.to_number(&arg(a, 0)))?;
                 Ok(Value::Num($f(x)))
             };
-            register_numeric_only_native(f);
+            declare_native(f, crate::bytecode::INTRINSIC_NUMERIC_ONLY);
             it.def_method(&math, $name, 1, f);
         }};
     }
@@ -279,8 +278,7 @@ pub(super) fn install_math(it: &mut Interp) {
         Ok(Value::Num(x.wrapping_mul(y) as f64))
     };
     // With two Number arguments no coercion runs (ECMA-262 §21.3.2.20 ToUint32 on a Number).
-    register_numeric_only_native(imul_fn);
-    register_math_intrinsic(imul_fn, crate::bytecode::INTRINSIC_MATH_IMUL);
+    declare_native(imul_fn, crate::bytecode::INTRINSIC_MATH_IMUL);
     it.def_method(&math, "imul", 2, imul_fn);
     let random_stream = Rc::new(RandomStream::new());
     let captured = random_stream.clone();
@@ -347,8 +345,7 @@ pub(super) fn install_math(it: &mut Interp) {
         }
         Ok(Value::Num(if saw_nan { f64::NAN } else { highest }))
     };
-    register_numeric_only_native(max_fn);
-    register_math_intrinsic(max_fn, crate::bytecode::INTRINSIC_MATH_MAX);
+    declare_native(max_fn, crate::bytecode::INTRINSIC_MATH_MAX);
     it.def_method(&math, "max", 2, max_fn);
     let min_fn: NativeFn = |i, _t, a| {
         // See Math.max above: the all-Number case has no observable coercion work to perform
@@ -372,8 +369,7 @@ pub(super) fn install_math(it: &mut Interp) {
         }
         Ok(Value::Num(if saw_nan { f64::NAN } else { lowest }))
     };
-    register_numeric_only_native(min_fn);
-    register_math_intrinsic(min_fn, crate::bytecode::INTRINSIC_MATH_MIN);
+    declare_native(min_fn, crate::bytecode::INTRINSIC_MATH_MIN);
     it.def_method(&math, "min", 2, min_fn);
     set_to_string_tag(it, &math, "Math");
     set_builtin(&it.global, "Math", Value::Obj(math));
@@ -528,42 +524,4 @@ fn fsum_exact(values: &[f64]) -> f64 {
         }
     }
     hi
-}
-
-thread_local! {
-    /// Natives whose complete algorithm runs no author code when every argument is a Number
-    /// (Math's numeric functions: ToNumber is then the identity). See
-    /// `bytecode::INTRINSIC_NUMERIC_ONLY`.
-    static NUMERIC_ONLY_NATIVES: std::cell::RefCell<crate::fasthash::FastSet<usize>> =
-        std::cell::RefCell::new(Default::default());
-}
-
-fn register_numeric_only_native(f: NativeFn) {
-    NUMERIC_ONLY_NATIVES.with(|set| set.borrow_mut().insert(f as *const () as usize));
-}
-
-thread_local! {
-    /// Math functions with an inline call-template implementation, keyed by native identity
-    /// (see `bytecode::INTRINSIC_MATH_FIRST`).
-    static MATH_INTRINSICS: std::cell::RefCell<crate::fasthash::FastMap<usize, u8>> =
-        std::cell::RefCell::new(Default::default());
-}
-
-fn register_math_intrinsic(f: NativeFn, id: u8) {
-    MATH_INTRINSICS.with(|map| map.borrow_mut().insert(f as *const () as usize, id));
-}
-
-/// The inline Math intrinsic id of native `f`, or 0.
-pub(crate) fn math_intrinsic(f: NativeFn) -> u8 {
-    MATH_INTRINSICS.with(|map| {
-        map.borrow()
-            .get(&(f as *const () as usize))
-            .copied()
-            .unwrap_or(0)
-    })
-}
-
-/// Whether `f` was registered by [`register_numeric_only_native`].
-pub(crate) fn is_numeric_only_native(f: NativeFn) -> bool {
-    NUMERIC_ONLY_NATIVES.with(|set| set.borrow().contains(&(f as *const () as usize)))
 }

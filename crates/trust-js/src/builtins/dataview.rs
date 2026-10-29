@@ -3,32 +3,16 @@
 use super::*;
 use crate::value::ValueView;
 
-thread_local! {
-    /// Exact native identities; the call cache validates their Realm and live callee object.
-    static DATAVIEW_INTRINSICS: std::cell::RefCell<crate::fasthash::FastMap<usize, u8>> =
-        std::cell::RefCell::new(Default::default());
-}
-
-pub(crate) fn dataview_intrinsic(f: NativeFn) -> u8 {
-    DATAVIEW_INTRINSICS.with(|map| {
-        map.borrow()
-            .get(&(f as *const () as usize))
-            .copied()
-            .unwrap_or(0)
-    })
-}
-
 fn dv_method(it: &mut Interp, proto: &Gc, name: &str, len: usize, f: NativeFn, setter: bool) {
-    DATAVIEW_INTRINSICS.with(|map| {
-        map.borrow_mut().insert(
-            f as *const () as usize,
-            if setter {
-                crate::bytecode::INTRINSIC_DATAVIEW_SET
-            } else {
-                crate::bytecode::INTRINSIC_DATAVIEW_GET
-            },
-        );
-    });
+    // The call cache validates the Realm and the live callee object.
+    declare_native(
+        f,
+        if setter {
+            crate::bytecode::INTRINSIC_DATAVIEW_SET
+        } else {
+            crate::bytecode::INTRINSIC_DATAVIEW_GET
+        },
+    );
     it.def_method(proto, name, len, f);
 }
 

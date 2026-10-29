@@ -894,7 +894,7 @@ fn weak_remove(
 }
 
 // Named collection methods: the JIT's call cache recognizes their exact identity (see
-// `is_operand_only_native`). None of them can run author code: keys compare with
+// `declare_operand_only_natives`). None of them can run author code: keys compare with
 // SameValueZero or by identity, and failures are TypeErrors created natively.
 
 /// One [[MapData]]/[[SetData]] lookup with the exact-kind brand check (`coll_obj_kind`'s
@@ -1052,11 +1052,11 @@ pub(crate) fn nf_weak_set_delete(i: &mut Interp, this: Value, a: &[Value]) -> Re
     weak_remove(i, this, a, CollectionKind::Set)
 }
 
-/// Collection methods whose complete algorithm runs no author code and needs no native-call
-/// boundary state (see `bytecode::INTRINSIC_OPERAND_ONLY`).
-pub(crate) fn is_operand_only_native(f: NativeFn) -> bool {
-    let candidates: [NativeFn; 14] = [
-        nf_map_get,
+/// Declare the collection methods whose complete algorithm runs no author code and needs no
+/// native-call boundary state (see `bytecode::INTRINSIC_OPERAND_ONLY`).
+pub(super) fn declare_operand_only_natives() {
+    for f in [
+        nf_map_get as NativeFn,
         nf_map_set,
         nf_map_has,
         nf_map_delete,
@@ -1070,8 +1070,7 @@ pub(crate) fn is_operand_only_native(f: NativeFn) -> bool {
         nf_weak_set_add,
         nf_weak_set_has,
         nf_weak_set_delete,
-    ];
-    candidates
-        .iter()
-        .any(|&candidate| std::ptr::eq(candidate as *const (), f as *const ()))
+    ] {
+        declare_native(f, crate::bytecode::INTRINSIC_OPERAND_ONLY);
+    }
 }

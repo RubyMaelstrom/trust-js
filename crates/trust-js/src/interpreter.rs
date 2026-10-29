@@ -16600,6 +16600,7 @@ impl Interp {
             pc_offs_ptr: code.pc_offsets_ptr(),
             native: 0,
             intrinsic: 0,
+            builtin: 0,
             // Checked above: the constructor belongs to the active Realm.
             realm: Gc::as_ptr(&self.global) as usize,
         };
@@ -16745,6 +16746,7 @@ impl Interp {
                             pc_offs_ptr: code.pc_offsets_ptr(),
                             native: 0,
                             intrinsic: 0,
+                            builtin: 0,
                             realm,
                         },
                         Some(&func),

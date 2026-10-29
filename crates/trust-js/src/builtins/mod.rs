@@ -17,9 +17,8 @@ use std::rc::Rc;
 // are reachable from each submodule via `use super::*`.
 mod atomics;
 mod collections;
-pub(crate) use collections::{is_operand_only_native, map_get, map_set, weak_map_get};
+pub(crate) use collections::{map_get, map_set, weak_map_get};
 mod dataview;
-pub(crate) use dataview::dataview_intrinsic;
 mod date;
 pub(crate) use date::system_time_zone;
 #[cfg(test)]
@@ -63,7 +62,7 @@ mod array_dense_edit_tests;
 
 pub(crate) use function_proto::nf_function_call;
 pub(crate) use globals::nf_is_nan;
-pub(crate) use math::{is_numeric_only_native, math_intrinsic, nf_math_sqrt};
+pub(crate) use math::nf_math_sqrt;
 pub(crate) use primitives::nf_number_is_nan;
 pub(crate) use reflect::nf_reflect_apply;
 
@@ -1561,20 +1560,111 @@ fn global_fn(it: &Interp, name: &str, len: usize, f: NativeFn) {
     set_builtin(&it.global, name, Value::Obj(func));
 }
 
-/// W3's item 2a: the natives that may run on their caller's operand window without the
-/// native-call boundary, by address, with their class (`bytecode::INTRINSIC_LIGHT`,
-/// `INTRINSIC_LIGHT_PRIMITIVE_ARGS` or `INTRINSIC_LIGHT_PRIMITIVE`). Each realm's setup declares
-/// them as it installs them ([`declare_light`]), and the call cache records a native's class as
-/// it fills an entry for it. Natives with a call template take their template's id instead: the
-/// named ones by function pointer at the fill, and the anonymous Array.isArray and Object.is
-/// here, under ids their template reads (`INTRINSIC_ARRAY_IS_ARRAY`, `INTRINSIC_OBJECT_IS`;
-/// item 2c), which the light checks treat as `INTRINSIC_LIGHT`.
-static LIGHT_NATIVES: std::sync::RwLock<Option<crate::fasthash::FastMap<usize, u8>>> =
-    std::sync::RwLock::new(None);
+/// Every native function's builtin id and call-cache class, by the native's address (W3's items
+/// 2a and 7).
+///
+/// The id is the native's identity, as a builtin function's `Builtin` id is V8's: its
+/// SharedFunctionInfo carries it (src/objects/shared-function-info.h:520, 627-628) and the
+/// optimizing tiers switch their reductions on it (src/compiler/js-call-reducer.cc:5405-5407,
+/// src/maglev/maglev-graph-builder.cc:10856). A call cache records it in a native's entry
+/// (`bytecode::CallIc::builtin`), which W4 exports as the call target's identity. Ids are dense
+/// from 1 (0: none), given in the order natives are first declared or cached, and kept for the
+/// process.
+///
+/// The class is what the entry's `intrinsic` byte records: the id of a call template that
+/// finishes the call in line (`bytecode::INTRINSIC_CHAR_CODE_AT` and the ids after it), or how
+/// the native may run without the native-call boundary (the light classes of item 2a,
+/// `INTRINSIC_OPERAND_ONLY`, `INTRINSIC_NUMERIC_ONLY`). Each realm's setup declares the classes as
+/// it installs the natives ([`declare_native`], [`declare_light`]), so that a fill reads the
+/// entry's id and class with one lookup (see [`builtin`]).
+#[derive(Default)]
+struct Builtins {
+    ids: crate::fasthash::FastMap<usize, u16>,
+    /// The class of each id; index 0, no id, has none.
+    classes: Vec<u8>,
+}
 
-/// Declare the native functions installed on `target` under `names` light of `class` (see
-/// [`LIGHT_NATIVES`]). Each must run no author code for the operands `class` admits, make no tail
-/// call and reach no safepoint.
+impl Builtins {
+    /// The id of the native at `address`, the next one if it has none yet; `None` once the ids
+    /// run out.
+    fn id(&mut self, address: usize) -> Option<u16> {
+        if let Some(&id) = self.ids.get(&address) {
+            return Some(id);
+        }
+        if self.classes.is_empty() {
+            self.classes.push(0);
+        }
+        let id = u16::try_from(self.classes.len()).ok()?;
+        self.classes.push(0);
+        self.ids.insert(address, id);
+        Some(id)
+    }
+}
+
+static BUILTINS: std::sync::RwLock<Option<Builtins>> = std::sync::RwLock::new(None);
+
+/// Declare `f`'s call-cache class (see [`Builtins`]). A class names an algorithm, so a native
+/// keeps the one class every realm's setup declares for it.
+pub(crate) fn declare_native(f: NativeFn, class: u8) {
+    let mut table = BUILTINS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let table = table.get_or_insert_with(Default::default);
+    if let Some(id) = table.id(f as usize) {
+        let declared = &mut table.classes[usize::from(id)];
+        debug_assert!(
+            *declared == 0 || *declared == class,
+            "a native declared in two classes"
+        );
+        *declared = class;
+    }
+}
+
+thread_local! {
+    /// The last native [`builtin`] found with a declared class, as (address, id, class). An id
+    /// is kept for the process and a declared class never changes, so the memo never goes
+    /// stale: Reflect.apply's target check, which looks up its target's class on every call,
+    /// reads it without the table's lock (one lookup takes about 60 instructions).
+    static LAST_BUILTIN: std::cell::Cell<(usize, u16, u8)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// The builtin id and the call-cache class of the native function at `address` (see
+/// [`Builtins`]): a native nothing declared gets the next id and no class; (0, 0) once the ids
+/// run out, and for address 0, which names no native.
+pub(crate) fn builtin(address: usize) -> (u16, u8) {
+    let (last, id, class) = LAST_BUILTIN.with(std::cell::Cell::get);
+    if last == address {
+        return (id, class);
+    }
+    let found = {
+        let table = BUILTINS
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        table.as_ref().and_then(|table| {
+            let &id = table.ids.get(&address)?;
+            Some((id, table.classes[usize::from(id)]))
+        })
+    };
+    let (id, class) = found.unwrap_or_else(|| {
+        let mut table = BUILTINS
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let table = table.get_or_insert_with(Default::default);
+        match table.id(address) {
+            Some(id) => (id, table.classes[usize::from(id)]),
+            None => (0, 0),
+        }
+    });
+    if class != 0 {
+        LAST_BUILTIN.with(|last| last.set((address, id, class)));
+    }
+    (id, class)
+}
+
+/// Declare the native functions installed on `target` under `names` of `class` (see
+/// [`Builtins`]): a light class of item 2a, each native running no author code for the operands
+/// the class admits, making no tail call and reaching no safepoint, or a template's id.
 pub(crate) fn declare_light(target: &Gc, names: &[&str], class: u8) {
     for name in names {
         let function = target.borrow().props.get(name).map(|p| p.value());
@@ -1585,7 +1675,7 @@ pub(crate) fn declare_light(target: &Gc, names: &[&str], class: u8) {
     }
 }
 
-/// Declare the native function object `function` light of `class` (see [`declare_light`]).
+/// Declare the native function object `function` of `class` (see [`declare_light`]).
 pub(crate) fn declare_light_function(function: &Gc, class: u8) {
     let native = match &function.borrow().call {
         Callable::Native(f) => Some(*f),
@@ -1595,23 +1685,35 @@ pub(crate) fn declare_light_function(function: &Gc, class: u8) {
         debug_assert!(false, "a light native must be a bare native function");
         return;
     };
-    let mut table = LIGHT_NATIVES
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    table
-        .get_or_insert_with(Default::default)
-        .insert(f as usize, class);
+    declare_native(f, class);
 }
 
-/// The light class declared for `f` (see [`LIGHT_NATIVES`]), or 0.
-pub(crate) fn light_native_class(f: NativeFn) -> u8 {
-    let table = LIGHT_NATIVES
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    table
-        .as_ref()
-        .and_then(|table| table.get(&(f as usize)).copied())
-        .unwrap_or(0)
+/// Declare the call templates' natives (see [`Builtins`]), which every realm's setup installs:
+/// what the call cache's fill compared each native's address with.
+fn declare_template_natives() {
+    use crate::bytecode::*;
+    for (f, class) in [
+        (nf_char_code_at as NativeFn, INTRINSIC_CHAR_CODE_AT),
+        (nf_code_point_at, INTRINSIC_CODE_POINT_AT),
+        (nf_char_at, INTRINSIC_CHAR_AT),
+        (nf_string_slice, INTRINSIC_STRING_SLICE),
+        (nf_object_has_own, INTRINSIC_OBJECT_HAS_OWN),
+        (nf_function_apply, INTRINSIC_FUNCTION_APPLY),
+        (nf_math_sqrt, INTRINSIC_MATH_SQRT),
+        (nf_array_push, INTRINSIC_ARRAY_PUSH),
+        (nf_array_pop, INTRINSIC_ARRAY_POP),
+        (nf_function_call, INTRINSIC_FUNCTION_CALL),
+        (regexp_exec, INTRINSIC_REGEXP_EXEC_DISCARD),
+        (nf_string_replace, INTRINSIC_STRING_REPLACE_DISCARD),
+        (nf_string_split, INTRINSIC_STRING_SPLIT_DISCARD),
+        (nf_is_nan, INTRINSIC_IS_NAN),
+        (nf_number_is_nan, INTRINSIC_IS_NAN),
+        (nf_from_char_code, INTRINSIC_FROM_CHAR_CODE),
+        (nf_reflect_apply, INTRINSIC_REFLECT_APPLY),
+    ] {
+        declare_native(f, class);
+    }
+    collections::declare_operand_only_natives();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3100,6 +3202,7 @@ pub fn install(it: &mut Interp) {
     crate::temporal::install(it);
     #[cfg(feature = "intl")]
     crate::intl::install(it);
+    declare_template_natives();
 }
 
 /// Whether a value is a constructor: a callable with an own `prototype` (built-in ctors / user

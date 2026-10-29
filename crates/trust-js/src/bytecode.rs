@@ -1015,9 +1015,15 @@ pub struct CallIc {
     /// object is pinned in `call_pins` like any cached callee, and a builtin's `call` field
     /// is never reassigned while the object lives.
     pub native: usize,
-    /// Intrinsic id for a native entry the call template can inline entirely (0 = none;
-    /// see `INTRINSIC_CHAR_CODE_AT`). Filled from the fn pointer at record time.
+    /// A native entry's class: the id of the call template that finishes it in line (see
+    /// `INTRINSIC_CHAR_CODE_AT`), or how it may run without the native-call boundary (the
+    /// light, operand-only and numeric-only classes); 0 = none. The native's realm setup
+    /// declared it (see `builtins::builtin`).
     pub intrinsic: u8,
+    /// A native entry's builtin id (see `builtins::builtin`; 0 for a user function): the
+    /// target's identity as V8's call feedback carries it, a builtin's `Builtin` id, on which
+    /// the optimizing tiers key their reductions (W4's call-target feedback).
+    pub builtin: u16,
     /// The filled closure's [[Realm]] (`UserCallable::realm`; 0 for a native entry). A
     /// code-keyed hit — another closure of the same `func` (see [`CallSite`]) — must belong to
     /// this Realm: the entry's same-realm proof was made for it.
@@ -1069,13 +1075,13 @@ pub const INTRINSIC_IS_NAN: u8 = 14;
 /// `String.fromCharCode` with one Number argument (the per-character decoder idiom).
 pub const INTRINSIC_FROM_CHAR_CODE: u8 = 15;
 /// A native whose complete algorithm runs no author code and reads no native-call boundary
-/// state (Map/Set/WeakMap/WeakSet get, has, set, add and delete; see
-/// `builtins::is_operand_only_native`). The hit helper calls it on moved operands without the
+/// state (Map/Set/WeakMap/WeakSet get, has, set, add and delete, as their realm's setup
+/// declares them; see `builtins::builtin`). The hit helper calls it on moved operands without the
 /// boundary bookkeeping (depth, safepoints, construct state) of an arbitrary native.
 pub const INTRINSIC_OPERAND_ONLY: u8 = 16;
 /// A native that runs no author code when every argument is a Number (Math's numeric
-/// functions; see `builtins::is_numeric_only_native`). The hit helper takes the operand-only
-/// path for such calls and the full native call otherwise.
+/// functions without a template of their own; see `builtins::builtin`). The hit helper takes
+/// the operand-only path for such calls and the full native call otherwise.
 pub const INTRINSIC_NUMERIC_ONLY: u8 = 17;
 /// `Reflect.apply(target, thisArg, list)`: an operand-only native target with a dense, ordinary
 /// argument list is called directly (see `jit_call_hit`).
@@ -1143,6 +1149,7 @@ impl CallIc {
         pc_offs_ptr: std::ptr::null(),
         native: 0,
         intrinsic: 0,
+        builtin: 0,
         realm: 0,
     };
 }
@@ -7233,6 +7240,9 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+#[path = "call_feedback_tests.rs"]
+mod call_feedback_tests;
 #[cfg(test)]
 #[path = "function_tiering_tests.rs"]
 mod function_tiering_tests;
@@ -23851,8 +23861,12 @@ unsafe fn jit_reflect_apply_operand_only(
         }
     };
     let list = *args_ptr.add(2);
-    let numeric = crate::builtins::is_numeric_only_native(nf);
-    if !crate::builtins::is_operand_only_native(nf) && !numeric {
+    let class = crate::builtins::builtin(nf as usize).1;
+    let numeric = matches!(
+        class,
+        INTRINSIC_NUMERIC_ONLY | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST
+    );
+    if class != INTRINSIC_OPERAND_ONLY && !numeric {
         return None;
     }
     let values = dense_own_list(i, &list)?;
@@ -25811,6 +25825,7 @@ unsafe fn jit_call_inner(
                                 let g = Env::downgrade(&i.global_env);
                                 i.global_env_pins.push(g);
                             }
+                            let (builtin, class) = crate::builtins::builtin(native);
                             let evicted = chunk.call_caches[c as usize].fill(
                                 CallIc {
                                     callee: key,
@@ -25829,122 +25844,11 @@ unsafe fn jit_call_inner(
                                     code_mem: std::ptr::null(),
                                     pc_offs_ptr: std::ptr::null(),
                                     native,
-                                    intrinsic: engine_native.map_or(0, |nf| {
-                                        match nf as *const () as usize {
-                                            p if p
-                                                == crate::builtins::nf_char_code_at as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_CHAR_CODE_AT
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_code_point_at as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_CODE_POINT_AT
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_char_at as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_CHAR_AT
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_string_slice as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_STRING_SLICE
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_object_has_own as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_OBJECT_HAS_OWN
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_function_apply as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_FUNCTION_APPLY
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_math_sqrt as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_MATH_SQRT
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_array_push as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_ARRAY_PUSH
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_array_pop as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_ARRAY_POP
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_function_call as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_FUNCTION_CALL
-                                            }
-                                            p if p
-                                                == crate::builtins::regexp_exec as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_REGEXP_EXEC_DISCARD
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_string_replace as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_STRING_REPLACE_DISCARD
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_string_split as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_STRING_SPLIT_DISCARD
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_is_nan as *const ()
-                                                    as usize
-                                                || p == crate::builtins::nf_number_is_nan
-                                                    as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_IS_NAN
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_from_char_code as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_FROM_CHAR_CODE
-                                            }
-                                            p if p
-                                                == crate::builtins::nf_reflect_apply as *const ()
-                                                    as usize =>
-                                            {
-                                                INTRINSIC_REFLECT_APPLY
-                                            }
-                                            _ if crate::builtins::math_intrinsic(nf) != 0 => {
-                                                crate::builtins::math_intrinsic(nf)
-                                            }
-                                            _ if crate::builtins::dataview_intrinsic(nf) != 0 => {
-                                                crate::builtins::dataview_intrinsic(nf)
-                                            }
-                                            _ if crate::builtins::is_operand_only_native(nf) => {
-                                                INTRINSIC_OPERAND_ONLY
-                                            }
-                                            _ if crate::builtins::is_numeric_only_native(nf) => {
-                                                INTRINSIC_NUMERIC_ONLY
-                                            }
-                                            _ => crate::builtins::light_native_class(nf),
-                                        }
-                                    }),
+                                    // The class its realm's setup declared, and its builtin id,
+                                    // in one lookup (W3's item 7). A scoped native has another
+                                    // signature: no class.
+                                    intrinsic: engine_native.map_or(0, |_| class),
+                                    builtin,
                                     realm: 0,
                                 },
                                 None,
