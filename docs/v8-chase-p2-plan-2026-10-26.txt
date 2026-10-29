@@ -586,7 +586,8 @@ does (Order, step 0).
     V8's, SpiderMonkey's and JSC's macro-assemblers do, instead of relying on each template's
     guard. The design follows an investigation of a scoped scratch-register allocator like V8's
     UseScratchRegisterScope (macro-assembler-arm64.h:2556-2640, over ip0 and ip1), and covers the
-    JIT's and the RegExp tier's encoders.
+    JIT's and the RegExp tier's encoders. The design found reserves no register: see "Immediates
+    out of an instruction's range" below.
 
 ## Non-goals
 
@@ -2889,6 +2890,331 @@ with 4,096 or more slots (`arguments.length` read undefined with 5,000 formals);
 an indexed store and a test, and Decision 23 closes the class. And `perf stat ... taskset -c N
 cmd`, taskset inside perf, can add a scaled count from the other core type's PMU (about 80M on
 Djot): taskset goes outside perf.
+
+### Immediates out of an instruction's range (design and record, 2026-10-29; Decision 23)
+
+The ARM64 encoders check their immediates with `debug_assert!` only, so a template that misses
+its range guard mis-encodes silently in release builds: the field overflows into the opcode bits
+(`ldr_imm`, `str_imm`, `add_imm`, `cmp_imm_w`, the pairs) or wraps (`ldur`, `stur`, `ldur_d`,
+`stur_d`, `ldurb` and the D pairs mask their field without even a debug check). Step 1's first
+version stored `arguments.length` wrongly in a body with 5,000 formals. Decision 23: the encoders
+accept any offset, as the exemplars' macro-assemblers do. The owner's question: does that require
+a permanently reserved scratch register across every template?
+
+Method. Exemplars: V8 at c8b709085e21 (target/p2/w3-design/v8-src, paths from its root;
+register-arm64.h fetched at that commit), SpiderMonkey at mozilla-firefox/firefox 6bb811006a50
+(paths under js/src; MacroAssembler-vixl.cpp from the copy fetched for this note, main on
+2026-10-29), JavaScriptCore at WebKit/WebKit 260278048486 (paths under Source/JavaScriptCore;
+MacroAssemblerARM64.h from the copy fetched for this note). Encodings checked with llvm-mc 23
+(`llvm-mc -triple=aarch64 -show-encoding`). The census is of main a187b1f8.
+
+How the exemplars do it
+
+V8. `MacroAssembler::LoadStoreMacro` (src/codegen/arm64/macro-assembler-arm64.cc:936-959) emits
+the scaled immediate form, else the unscaled one, else `LoadStoreMacroComplex` (961-989), which
+takes a register from a `UseScratchRegisterScope`, moves the whole offset into it and uses the
+register-offset form; out-of-range pre- and post-index forms move the base with an `add` before or
+after the access. Pairs (`LoadStorePairMacro`, 991-1028) add the offset to a scratch register.
+`AddSubMacro` (839-885) moves an unencodable immediate into a scratch (`MoveImmediateForShiftedOp`,
+789-837, pre-shifting it where that saves an instruction). The pool is `DefaultTmpList()`, ip0 and
+ip1, that is x16 and x17 (macro-assembler-arm64.cc:41; an FP pool beside it), and
+`UseScratchRegisterScope` (macro-assembler-arm64.h:2564-2651) lends and returns them, nesting by
+snapshot: `AcquireNextAvailable` is a release `CHECK` that the pool is not empty (2644-2650).
+x16 and x17 are outside the register allocators' set (src/codegen/arm64/register-arm64.h:32-46,
+`ALLOCATABLE_GENERAL_REGISTERS`), and hand-written code that names them takes them out of the
+pool first (`temps.Exclude(x17)` around `Call(x17)`, src/builtins/arm64/builtins-arm64.cc:1994-1999;
+the warning at macro-assembler-arm64.h:621-649). Sparkplug, V8's template-like baseline compiler,
+wraps the same scope and adds x14, x15 and x19 to it for baseline code
+(src/baseline/arm64/baseline-assembler-arm64-inl.h:18-41); the RegExp macro-assembler's register
+map leaves x16/x17 to the assembler ("Very volatile", src/regexp/arm64/
+regexp-macro-assembler-arm64.cc:45).
+
+SpiderMonkey. vixl's `MacroAssembler::LoadStoreMacro` (jit/arm64/vixl/MacroAssembler-vixl.cpp:
+1217-1305) takes a scratch from its `UseScratchRegisterScope` and prefers adding the offset's high
+bits to the base and encoding the low bits in the access (1260-1270), which avoids materializing
+the whole offset. When the pool is empty it recycles: it pushes two volatile registers that alias
+neither the base nor the transfer register, lends them to the scope, adds 16 to an SP-based
+offset, and pops them after the access (1241-1253, 1277-1280). Pairs add the offset to a scratch
+(`LoadStorePairMacro`, 1316-1352), out-of-range pre- and post-index forms move the base, and
+`AddSubMacro` (1069-1114) is V8's. The pool is ip0 and ip1 (MacroAssembler-vixl.cpp:36-40,
+`tmp_list_(ip0, ip1)`, `fptmp_list_(d31)`), which `NonAllocatableMask` keeps from the register
+allocator (jit/arm64/Architecture-arm64.h:196-201); `AcquireNextAvailable` is a `VIXL_CHECK`
+(MacroAssembler-vixl.cpp:2082-2088).
+
+JSC. `load64(Address, RegisterID)` (assembler/MacroAssemblerARM64.h:1849-1856) tries
+`tryLoadWithOffset` (7949-7959: the unscaled form, then the scaled one), else sign-extends the
+offset into `memoryTempRegister` and uses the register-offset form; stores are the same
+(`store64`, 2383-2390), and `add64` with an unencodable immediate goes through
+`dataTempRegister` (326-342). The two are x16 and x17 (56-57), reserved from the register
+allocators (jit/GPRInfo.h:370-379, `reservedRegisters`); a region can forbid their use, and a
+macro instruction that needs one there is a release assertion (`scratchRegister()` and the cached
+temp getters, MacroAssemblerARM64.h:64-68 and 7635-7653). JSC caches memoryTempRegister's contents
+to skip rematerializing an offset.
+
+Why they do it, and whether the reason applies here. All three serve register allocators
+(TurboFan, Maglev and Liftoff; Ion and Wasm's; DFG, FTL/B3 and the baseline JIT's register
+assignment): any allocatable register may hold a live value at any instruction, so the only
+register a macro instruction can always clobber is one the allocators never use. That is why the
+scratch registers are reserved for good, and why hand-written code must take them through the
+scope before naming them. TRust JS's ARM64 JIT has no allocator: templates name registers, and
+every register has an owner somewhere. x0-x15 are temporaries and residents (the loop regions
+allocate x0-x8 to resident values, `I_UNIVERSE`, jit.rs:16125); x16 and x17 are temporaries in
+517 emitter calls in jit.rs and its siblings, the intra-procedure-call registers of the helper
+calls (`ldr x16, [x21, #idx*8]; blr x16`), and the loop regions' first two receiver bases, live
+across whole loop bodies of slot loads and stores (jit.rs:16655-16662); x19-x22 hold the context,
+operand top, helper table and slot base; x23-x27 are the regions' pins and x28 their poll
+countdown; x29/x30 the frame. No register is free for the encoders to own.
+
+The answer to the owner's question
+
+No. A permanently reserved register is what the exemplars need because an allocator may put a
+live value in any other register; it is not what accepting any offset needs. Most out-of-range
+forms need no scratch register at all:
+
+- a load into a general register uses its destination as the address register, which the load
+  overwrites anyway: `add x9, x22, #hi, lsl #12; ldr x9, [x9, #lo]` (SpiderMonkey's add-the-high-
+  bits form, with the destination in the scratch's place);
+- an add or subtract adds the high part shifted by 12 and then the low part, into its destination:
+  `add x20, x20, #hi, lsl #12; add x20, x20, #lo`;
+- a store, a SIMD&FP load or store, or a pair whose base is not SP and not a register it
+  stores moves the base and moves it back: `add x22, x22, #hi, lsl #12; str x9, [x22, #lo];
+  sub x22, x22, #hi, lsl #12` (V8 and SpiderMonkey move the base themselves in their out-of-range
+  pre- and post-index forms; here the move is undone after the access);
+- out-of-range pre- and post-index pairs move the base before or after the access, as V8's and
+  SpiderMonkey's do.
+
+What remains needs a register for a value with no destination to borrow: a compare (or flag-
+setting add) whose immediate fits neither 12 bits nor 12 bits shifted, a store whose base is SP
+or is the register it stores, and an add of 16 MB or more onto its own source. For those the
+encoder recycles a register as SpiderMonkey's does when its pool is empty: it pushes x16 (or x17,
+x15 or x14, the first the instruction does not name), uses it, and pops it, adding 16 to an
+SP-based offset: `str x16, [sp, #-16]!; mov w16, #5000; cmp w1, w16; ldr x16, [sp], #16`.
+The push and pop leave NZCV alone. It is safe everywhere the JIT emits code: every SP adjustment
+in jit.rs and jit_regions.rs is a multiple of 16, so SP is always 16-byte aligned, and no
+template keeps data below SP.
+
+So no template's register convention changes, nothing is reserved, and no legalized form depends
+on which registers a template holds: each is correct by construction, whatever is live. The cost
+falls only on out-of-range operands, which ordinary code never has: every in-range operand
+encodes exactly as today.
+
+The design
+
+Each encoder keeps its signature and, for an operand its own form encodes, its exact word, after
+one mask test (`off & !(4095 * size) == 0` for a scaled access, a biased mask for imm7, one compare
+for a 12-bit immediate), inlined at the call site, where it folds away for a constant operand; the
+legalizing paths are out of line and cold. That keeps the compiler's own cost, which the fixture
+counts include, to about 0.6 of an instruction per word emitted (see Measurement). Out of range, an
+encoder legalizes by this ladder, taking the first rung that applies:
+
+1. the instruction's own form (unchanged);
+2. the other single-instruction form: scaled for an unscaled encoder whose offset is aligned and
+   in the scaled range, unscaled (LDUR/STUR, -256..255) for a scaled encoder; for a compare or
+   flag-setting add, the 12-bit immediate shifted by 12 when the low 12 bits are zero (identical
+   flags);
+3. no scratch: the destination as the address register (loads into a general register, LDP of
+   general registers, ADDS/SUBS whose destination is not a source); the destination itself for
+   ADD/SUB below 16 MB, through `#hi, lsl #12` then `#lo`; the base moved and restored (stores,
+   SIMD&FP accesses and pairs whose base is not SP and not a stored register); the base moved
+   before or after the access for pre- and post-index pairs;
+4. a recycled register (push, use, pop), for what is left.
+
+Offsets split as SpiderMonkey's do: the high part, a multiple of 4,096 below 16 MB, goes in an
+`add` or `sub` with `lsl #12`, and the low part in the access's own field (scaled when aligned,
+unscaled when the remainder is within -256..255); an offset that splits neither way is moved whole
+into the address register and used through the register-offset form (into the recycled register
+when the address register is the base itself).
+
+Operands that are field widths, not offsets or values (shift amounts, bitfield positions, MOVZ and
+MOVK's 16-bit lanes and their shifts, a logical immediate's prepared field), have no legal
+meaning past their range: an out-of-range one is a template bug. Debug builds panic, as today;
+release builds fail the compile instead of emitting a wrong word (the `ubfx` and
+`orr_low_ones_x` encoders keep their release assertions and tests). A compare of SP with an
+immediate past 12 bits and an add onto SP of 16 MB or more, which no template emits, fail the
+compile in every build.
+
+Failing a compile. The assembler records its first failure (`Asm::failed`); `checkpoint` and
+`rewind` save and restore it, so a discarded optional region takes its failure with it. The
+chunk compiler and the shared-stub assembler check it before finishing and return `None`, so the
+function stays on the bytecode VM; `finish_with_offsets` asserts that nothing failed. The
+conditional-branch fields checked after branch relaxation become a release assertion, like B's.
+
+Fixed shapes. The JIT patches no code once installed. The sequences whose length other code
+relies on are the prologue's first eight words and the epilogues' restore groups, which
+`skip_unused_callee_saved_fp` rewrites in place; their operands are the frame constants, so
+compile-time assertions pin them in range and no legalization can change their shape. The direct
+call's position word follows branches only. The RegExp tier patches its branches, ADRs and literal
+loads in `finish`, which already returns `None` when one does not reach.
+
+The RegExp tier (regex_native_a64.rs, landed with W5b 3a). Its register map already reserves x16
+and x17 as "the intra-procedure scratch", V8's convention, and its `add_any`, `cmp_any` and
+`load_elem` legalize through x17. Its encoders are free functions returning a word; each field
+past its range now returns UDF #0 (`UNENCODABLE`), which no instruction it emits ever is: `emit`
+notes it and `finish` returns `None`, so the pattern stays on the matcher. Its slot loads and
+stores (8 bytes a slot) legalize as the JIT's do, a load through its destination and a store
+through x17 (no store's register or base is x17), and `retreat` goes through x17 past 12 bits, as
+`advance` does through `add_any`. The single-bit operands (`orr_bit` and `tbnz` on LOGGED, below
+64 when the plan is not wide) refuse the program past 63. Its program-level guard (MAX_SLOTS,
+4,000, "AArch64's scaled 12-bit offsets reach 4,095") stays: it chooses the matcher for patterns
+with that many captures, not a cheaper path, but lifting it changes which patterns run natively.
+This design does not touch the code-size cap (MAX_CODE_UNITS: conditional branches without
+veneers); the JIT's `relax_branches` is the shape to port when that is taken up.
+
+Weighed and not chosen
+
+- V8's scope over a small pool, with templates that use pool registers taking them through it.
+  Reserving x16 and x17 means 517 emitter calls take them through scopes, and the loop regions'
+  receiver pins (x16, x17 live across whole loop bodies) move to other registers or exclude the
+  pool for the region. It is a permanent change to every template's register convention for a
+  benefit the scratch-free forms give without it, and it would touch the cap templates the W3
+  item 3 agent is changing. A template could also lend a register it knows is dead (V8's
+  `Include`, Sparkplug's x14/x15/x19) to get two-instruction forms for stores; no template has an
+  operand that reaches rung 3 in ordinary code, so nothing would use it today. When P3's
+  allocating tier arrives, its allocator can exclude x16 and x17 and lend them to the encoders for
+  its code: the ladder has a place for a lent register before rung 3.
+- Forms with no scratch only, failing the compile where they do not apply. Simpler, but compares
+  of variable immediates and SP-based stores would then fail where SpiderMonkey's recycling
+  accepts them; recycling costs two instructions and two stack accesses only past the range.
+- A debug checker that panics when an emitted instruction names a pool register the scope lent
+  out, or one the template did not take. It turns the audit of 517 calls into a test-driven one,
+  but it is the audit the pool creates: with no pool there is nothing to check, because no
+  legalized form assumes anything about which registers are live. The tests check the legalized
+  forms themselves instead: decoded words, and execution on Crystal.
+
+Census (main a187b1f8)
+
+Encoders with immediate fields: 44 of the 134 in `mod asm` (and the five patched branches), called
+about 1,900 times from jit.rs, jit_operations.rs, jit_regions.rs, jit_names.rs,
+jit_typed_array.rs, jit_exec_values.rs and jit_storage.rs (tests included). Their immediates come
+from three places:
+
+- struct and layout offsets (`offset_of!`, `JitLayout`, `InterpLayout`, the context constants),
+  in range by construction; several carry compile-time assertions already (jit.rs:1861-1893);
+- frame-slot, operand-stack and table offsets that grow with the body: slot*8 from x22, depths
+  from x20, constant-pool and cache indices. Their templates guard them by hand: 16 range checks
+  in jit_operations.rs (`(*slot as u32) * 8 + 8 < 4096` and `skip >= 4096`), 19 in
+  jit_regions.rs, 3 in jit_names.rs, `fits_scaled` in jit_storage.rs, and in jit.rs `in_range`,
+  `slot < 4096`, the call sequences' `receiver <= 256` (a SUB and an LDR past LDUR's reach) and
+  the inline caches' admission checks of layout offsets. The 4,096-byte bound is stricter than an
+  8-byte load needs (the scaled form reaches 32,760 bytes) because some of those templates also
+  read a byte at the offset;
+- compare immediates: 184 calls, 98 with literal immediates below 4,096; the rest name constants
+  (tags, cache kinds, intrinsic ids, way counts) or bounded values: `argc` below 256 at the
+  direct-call sequences, `k_imm12(..).unwrap()`, and a region compare already guarded
+  (`(0..4096).contains(&value)`, jit_regions.rs:1773).
+
+`movz(1, pc, 0)` at nine helper-call sites relies on the chunk limit of 65,535 operations
+(jit.rs:4028, "op index must fit one movz"); the checked MOVZ makes it a compile failure instead
+of a silent wrap if that limit ever moves.
+
+Hand guards: they stay, with three exceptions. Each chooses which code a template emits (a fast
+path or the helper) for bodies past about 510 slots, and lifting them changes that code; what they
+protect against is now caught by the encoders. Removed, because the legalized form is what the
+template wanted:
+- the prologue's hand fallback for `arguments.length`'s slot past 4,095 (`fmov`, `movz`,
+  `str x10, [x22, x9, lsl #3]`, jit.rs:4161-4169), now `str_d_imm`'s legalized store (three
+  instructions either way);
+- the release assertions of `emit_exec_word_load`, `emit_exec_word_store` and
+  `emit_exec_number_store` (jit_exec_values.rs:43-59 and 133-138), whose unscaled branch is the
+  legalizing `ldur`, `stur` and `stur_d`;
+- the slot and formal-count guards of step 1's elided `arguments` and rest templates (ArgLength,
+  ArgElem, RestLength, RestElem; `u32::from(*slot) * 8 + 8 < 4096` and `skip >= 4096`,
+  jit_operations.rs:792-859), the family whose missing guard surfaced the problem: past slot 510
+  or 4,095 formals they took the helper only for the encoders' sake. Ordinary code is unchanged,
+  and the thousands-of-formals tests now run their fast paths with legalized operands.
+Lifting the other slot guards is a measured change of its own for later (it gives bodies past
+about 510 slots native fast paths, which changes those bodies' code).
+
+x86-64. jit_x64.rs states its rule (jit_x64.rs:414-416, "Always use a full disp32 addressing
+form"): every variable memory operand is disp32, every branch rel32 with a checked conversion in
+`finish`, every ALU immediate imm32. The narrow forms are constant byte sequences, plus
+`add_sp(amount: i8)`, called only with +8 and -8, which would encode -128 as `sub r13, 0x80`, an
+add of 128: it gets the one-byte form's full range. One silent range hazard of the same class
+is real: `Op::New` passes `pc | argc << 16` to `jit_new`, which takes the pc as `packed & 0xFFFF`,
+and x86-64 compiles chunks of up to u32::MAX operations (ARM64 stops at 65,535), so a `new` past
+operation 65,535 would run another operation's site. Such a site takes the generic helper. The
+RegExp tier's x86-64 encoders (regex_native_x64.rs) pick imm8 or imm32 by range, use disp32 and
+rel32 (checked in `finish`), and take their counts below 2^31 from the compiler (regex_native.rs
+filters loop bounds to `m < 1 << 31`); `bt`/`bts` take LOGGED's bit as an imm8 modulo 64, below 64
+only while the plan is not wide, and `set_logged` truncated a mask past 32 bits: a bit from 64 on
+now refuses the program, and a wide mask is moved whole.
+
+Tests
+
+- Unit tests (jit_asm_imm_tests.rs, aarch64): every encoder's in-range operands at their
+  boundaries give the former formulas' exact words and legalize nothing; each legalized form, 39
+  sequences, matches llvm-mc's encodings; the refusals (SP compares and moves, a rewound region's
+  failure); field widths past range panic in debug builds. Probes run the legalized sequences on
+  the CPU, loading x0..x28, d0, d1, SP (a probe stack) and NZCV and storing them back: ten
+  single-register accesses at offsets at and past each boundary (0, 255/256, 4095/4096, 4096
+  times the size and one more, misaligned ones, -256/-257, -4096/-4104, 40,000, near 2 MB) with
+  14 register roles (the base stored, a recycling candidate named, SP); pairs with 8 roles and 14
+  offsets, and pre- and post-indexed SP moves; adds and subtracts past 12 bits and 16 MB onto
+  themselves and SP; and CMP, CMN, ADDS and SUBS past 12 bits at the flags' edges. Each checks the
+  bytes accessed (and that nothing else was written), every register, SP and NZCV.
+- RegExp tier: its legalized slot accesses and retreat against llvm-mc, and the refusals; on
+  x86-64, the wide mask's and LOGGED bits' encodings (GNU objdump 2.47) and the refusal past 63.
+- End to end (tests.rs): bodies with 5,000 formals and locals read and write slots past 4,096 in
+  every tier against Node's output, the JIT tier's compiled bodies legalizing their operands
+  (counted); a construction past operation 80,000 in every tier (x86-64's packed pc).
+- No checker test: the design has no pool to check.
+
+Measurement (2026-10-29): fat-LTO engines of main 709e17a9 (W5b 3a landed) and of this series'
+tip 50530f50, from `git archive` exports in fresh target dirs (target/p2/asm-imm/builds), on
+Crystal: `taskset -c 10-13 perf stat -e instructions:u`, `TRUST_JS_GC_PACING=0`, `--tier=jit`.
+
+Generated code. The fixtures' JIT code (TRUST_JS_JIT_CODEDUMP, dumpsum.py) is identical: vue 56,
+react 10 and djot 160 chunks. The native RegExp programs (TRUST_JS_REGEXP_CODEDUMP) are identical
+word for word apart from their literal pools' helper addresses, which move between two runs of
+one engine (ASLR): 29 programs in djot, and the micro case's.
+
+Micro cases (W3 item 3's micro.py, 52 cases, per iteration, median of 3): 33 identical, 17
+within 1.2 instructions (their runs overlap), and two lower with identical generated code:
+arguments-mapped-call 10,271.9 to 10,253.8 and regexp-exec 2,887.4 to 2,885.8, Rust helpers laid
+out differently by fat LTO.
+
+Fixtures (median of 3; chai one run):
+
+| | main 709e17a9 | this series | change | no-check variant |
+| --- | --- | --- | --- | --- |
+| vue | 2,242,289,012 | 2,238,987,154 | -0.15% | 2,238,111,877 |
+| react | 464,139,264 | 464,148,116 | +0.002% | 464,096,241 |
+| djot | 761,651,291 | 762,858,152 | +0.16% | 762,241,092 |
+| chai | 104,733,927,677 | 104,747,169,270 | +0.013% | 104,767,319,626 |
+
+Run spreads: vue up to 4.6M, react 60K to 120K, djot 150K to 190K. Djot's rise is beyond its
+spread, and fixture counts include the JIT compiler's own instructions. The no-check variant
+(the tip with only the in-range checks removed, built the same way, then discarded) splits it:
+the checks cost 617K instructions on djot (0.08%; its 160 chunks hold 1,002,292 words, so about
+0.6 of an instruction per word emitted), and the other 590K is fat LTO re-deciding inlining
+across the crate, which the variant shows too (as arguments-mapped-call's -18 in the other
+direction). The checks are within the run spreads on vue, react and chai. That is Decision 23's
+direct cost: the exemplars' macro-assemblers check every immediate the same way.
+
+Validation (2026-10-29). The ARM64 gate (target/p2/gates/asm-imm-50530f50, BASE
+target/p2/gates/w5b3a-7c0c6ae1, whose code is main 709e17a9's): rustfmt; clippy in its five
+configurations and the workspace, clean; the lib suite 2,644 passed, 0 failed, and with pacing
+on its known failure only (replaced_arrays_are_collected_as_their_elements_grow); GC stress on the
+thousands-of-slots, thousands-of-formals, elided-arguments, long-body construct and two RegExp
+native tests; the fixtures' outputs as the base's; difftest 138 agree, 12 skipped (budget); the
+dumps as the base's in all three modes; Test262 at the JIT tier 53,575 of 53,575, identical to
+the base's report. Zombie (x86-64): the lib suite 2,456 passed with its known failure
+(host_buffer_data_makes_a_major_collection_due_at_the_next_safepoint); clippy, embed and default,
+clean; the construct test fails there without the `Op::New` change (`jit_new_site`'s assertion
+meets another operation's site).
+
+Landed (2026-10-29, an agent's) as 7754c9ad..f44ea132, the series above rebased over the plan's
+records (331b9f32..50530f50 when measured and gated):
+- 7754c9ad: every encoder in `mod asm` takes any operand by the ladder above; `Asm::failed`, its
+  checkpoint and rewind, and the compilers' refusals; jit_asm_imm_tests.rs.
+- 1ea68c17: the elided `arguments` and rest templates and the prologue's count store reach any
+  slot; their hand guards go; the 5,000-formals tests in every tier.
+- ec43ff45: the RegExp tier's unencodable fields refuse the program (UNENCODABLE), its slot
+  accesses and `retreat` legalize, and a LOGGED bit from 64 refuses it on x86-64.
+- f44ea132: x86-64's `new` past operation 65,535 takes the generic helper, and `add_sp` gets the
+  one-byte form's full range.
+Open: lifting the other slot guards (bodies past about 510 slots), the RegExp tier's MAX_SLOTS and
+its code-size cap, each a measured change of its own.
 
 ### Stage-exit timing (2026-10-28)
 
