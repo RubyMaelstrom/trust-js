@@ -257,8 +257,9 @@ comment/example in the same change.
   byte or two a unit) after N executions (default 64), or at once over a subject of 1,000 units
   or more, as V8 does, each width on its first use; 0 keeps every pattern on the backtracking
   matcher, and 1 compiles at the first execution. The native tier (AArch64 and x86-64, on
-  Unix) takes patterns without `i`, `u` or `v` whose programs hold characters, `.`, classes,
-  captures, alternation, `^`, `$`, `\b`, `\B`, loops and groups' repetitions; lookaround,
+  Unix) takes patterns without `u` or `v` whose programs hold characters, `.`, classes,
+  captures, alternation, `^`, `$`, `\b`, `\B`, loops and groups' repetitions, under `i` once
+  they are closed over case (see `TRUST_JS_REGEXP_NO_CASE_CLOSURE`); lookaround,
   backreferences, inline modifiers and counted loops too long to unroll stay on the matcher.
 - `TRUST_JS_REGEXP_NATIVE_VERIFY=1` runs the matcher after every native execution and aborts,
   printing the pattern, flags, subject and start, if the result, a capture span or the error
@@ -299,8 +300,9 @@ comment/example in the same change.
   Otherwise they are closed over case when the pattern is compiled: a character becomes the
   class of the characters with its Canonicalize, a class takes in those of its members, and
   they match with no folding, which also lets the first-element filter take an exact leading
-  byte and the loop analysis prove loops of `i` patterns atomic. Backreferences, word boundaries
-  and `v`-mode class strings still compare case-insensitively as they match.
+  byte, the loop analysis prove loops of `i` patterns atomic and the native tier take them.
+  Backreferences, word boundaries and `v`-mode class strings still compare case-insensitively
+  as they match.
 - `TRUST_JS_REGEXP_NO_SIMD=1` keeps the subject scans (for the prefilter's literal, and for a
   match's first element by byte or by table) on their portable loops instead of AArch64 vector
   code.

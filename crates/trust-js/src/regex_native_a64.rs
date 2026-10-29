@@ -743,6 +743,14 @@ impl Masm for Asm {
         self.b_cond(if inside { Cond::Ls } else { Cond::Hi }, label);
     }
 
+    fn branch_elem_pair(&mut self, lo: u32, bit: u32, member: bool, label: Label) {
+        debug_assert!(bit.is_power_of_two() && lo & bit == 0);
+        // orr x16, x9, #bit; cmp w16, #(lo | bit)
+        self.emit(orr_bit(IP0, E, bit.trailing_zeros()));
+        self.cmp_any(false, IP0, lo | bit);
+        self.b_cond(if member { Cond::Eq } else { Cond::Ne }, label);
+    }
+
     fn lut(&mut self, table: &[u8; 256]) -> Data {
         if let Some(&offset) = self.luts.get(table) {
             return offset;
@@ -1093,6 +1101,7 @@ mod tests {
             (orr_bit(24, 24, 4), 0xb27c_0318, "orr x24, x24, #0x10"),
             (orr_bit(24, 24, 63), 0xb241_0318, "orr x24, x24, #1 << 63"),
             (orr_bit(24, 24, 2), 0xb27e_0318, "orr x24, x24, #0x4"),
+            (orr_bit(16, 9, 5), 0xb27b_0130, "orr x16, x9, #0x20"),
             (ldr_imm(19, 25, 8), 0xf940_0733, "ldr x19, [x25, #8]"),
             (str_imm(21, 22, 32), 0xf900_12d5, "str x21, [x22, #32]"),
             (ldrb_imm(9, 16, 5), 0x3940_1609, "ldrb w9, [x16, #5]"),

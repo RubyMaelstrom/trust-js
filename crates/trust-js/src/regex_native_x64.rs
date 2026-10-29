@@ -525,6 +525,15 @@ impl Masm for Asm {
         self.jcc(if inside { Cond::Ls } else { Cond::Hi }, label);
     }
 
+    fn branch_elem_pair(&mut self, lo: u32, bit: u32, member: bool, label: Label) {
+        debug_assert!(bit.is_power_of_two() && lo & bit == 0);
+        // lea r11d, [rax - lo]; test r11d, ~bit: zero for lo and lo + bit alone.
+        self.op_mem(false, &[0x8d], SCRATCH, E, -(lo as i32));
+        self.op_rr(false, &[0xf7], 0, SCRATCH);
+        self.imm32(!bit as i32);
+        self.jcc(if member { Cond::Eq } else { Cond::Ne }, label);
+    }
+
     fn lut(&mut self, table: &[u8; 256]) -> Data {
         if let Some(&offset) = self.luts.get(table) {
             return offset;
@@ -964,6 +973,19 @@ mod tests {
                 "movabs r9,0x100000001",
             ),
             (|a| a.log_slot(63), "49 0f ba e9 3f", "bts r9,0x3f"),
+            (
+                |a| a.op_mem(false, &[0x8d], R11, RAX, -0x41),
+                "44 8d 98 bf ff ff ff",
+                "lea r11d,[rax-0x41]",
+            ),
+            (
+                |a| {
+                    a.op_rr(false, &[0xf7], 0, R11);
+                    a.imm32(!0x20);
+                },
+                "41 f7 c3 df ff ff ff",
+                "test r11d,0xffffffdf",
+            ),
         ];
         let print = std::env::var_os("TRUST_JS_REGEXP_X64_ENCODINGS").is_some();
         for (emit, expected, text) in cases {

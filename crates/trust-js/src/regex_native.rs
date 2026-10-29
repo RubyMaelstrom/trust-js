@@ -1,4 +1,4 @@
-//! The RegExp native tier (W5b's item 3a): a pattern's [`Inst`] program compiled to machine
+//! The RegExp native tier (W5b's item 3): a pattern's [`Inst`] program compiled to machine
 //! code, one template per instruction, for one subject width, in the shape of V8's
 //! assemble-from-bytecode generator (`--regexp-assemble-from-bytecode`,
 //! src/regexp/regexp-code-generator.cc): the generator below walks the program and emits through
@@ -9,7 +9,8 @@
 //! The tier takes the core of the instruction set (characters, `.`, classes, captures and their
 //! undo rules, alternation, `^`, `$` and `\b` with the flags resolved at compile time, greedy and
 //! lazy loops of one element, atomic loops, group loops' progress marks and capture clears) over
-//! one-byte and two-byte subjects outside Unicode mode and without `i`. The candidate loop runs
+//! one-byte and two-byte subjects outside Unicode mode, under `i` once the program's characters
+//! and classes are closed over case. The candidate loop runs
 //! in the generated code, with the first-element filter's table tested in line; the prefilter's
 //! literal and the filter's vector scans run in Rust ([`Regex::next_candidate`]), which the code
 //! calls when its own test rules a start out.
@@ -207,6 +208,9 @@ pub(super) trait Masm {
     fn branch_elem(&mut self, cond: Cond, value: u32, label: Label);
     /// Branch if E is in `lo..=hi` (`inside`), or is not.
     fn branch_elem_in(&mut self, lo: u32, hi: u32, inside: bool, label: Label);
+    /// Branch if E is `lo` or `lo + bit` (`member`), or is neither: `bit` is a power of two that
+    /// `lo` lacks, so one compare under a mask decides (V8's `ShortCutEmitCharacterPair`).
+    fn branch_elem_pair(&mut self, lo: u32, bit: u32, member: bool, label: Label);
     /// A byte table for [`Self::branch_lut`].
     fn lut(&mut self, table: &[u8; 256]) -> Data;
     /// Branch if `lut` holds a nonzero byte at E (`member`), or a zero one; E is below 256.
@@ -391,7 +395,10 @@ pub(super) fn code_for<'a, I: ReInput>(re: &'a Regex, input: &I) -> Option<&'a N
 
 /// Why `re` stays on the matcher for `width`, or `None` if the tier takes it.
 fn decline(re: &Regex, width: Width) -> Option<&'static str> {
-    if re.ignore_case {
+    // Under `i` the program's characters, classes and loops match with no case folding once
+    // they are closed over case (`Regex::case_closed`); outside Unicode mode `\b` is the same
+    // under `i`, so a closed program compiles as any other.
+    if re.ignore_case && !re.case_closed {
         return Some("i flag");
     }
     if re.unicode {
@@ -588,12 +595,18 @@ enum Test {
     Class(Rc<ClassPlan>),
 }
 
-/// A class's tests: the byte table of its elements below 256, and its ranges of two-byte elements
-/// above them.
+/// A class's tests: the byte table of its elements below 256, its ranges of two-byte elements
+/// above them, and its elements themselves when a subject of the width can hold at most two.
 struct ClassPlan {
     lut: [u8; 256],
     high: Vec<(u32, u32)>,
+    few: Option<Vec<u32>>,
 }
+
+/// The elements of a class its code may compare one by one, as V8 compares a character's case-
+/// independent letters (`TextNode::EmitAtomLetter`, regexp-compiler.cc): past two, the class's
+/// tables take fewer instructions.
+const MAX_FEW: usize = 2;
 
 /// `class`'s tests for `width`, or `None` if it has too many ranges to test in line.
 fn class_plan(class: &super::CharClass, width: Width) -> Option<ClassPlan> {
@@ -601,16 +614,81 @@ fn class_plan(class: &super::CharClass, width: Width) -> Option<ClassPlan> {
     for (element, member) in lut.iter_mut().enumerate() {
         *member = u8::from(class.matches(element as u32, false, false));
     }
+    let elements = class_elements(class);
     let high = match width {
         Width::One => Vec::new(),
-        Width::Two => class_elements(class)?
-            .into_iter()
+        Width::Two => elements
+            .as_ref()?
+            .iter()
+            .copied()
             .filter(|&(_, hi)| hi >= 0x100)
             .filter(|&(lo, _)| lo <= 0xffff)
             .map(|(lo, hi)| (lo.max(0x100), hi.min(0xffff)))
             .collect(),
     };
-    (high.len() <= MAX_HIGH_RANGES).then_some(ClassPlan { lut, high })
+    // The elements a subject of the width can hold: a class closed over case keeps only those of
+    // its letters the width has, as V8's `GetCaseIndependentLetters` drops the ones a one-byte
+    // subject cannot hold.
+    let few = elements.and_then(|set| {
+        let mut few = Vec::new();
+        for (lo, hi) in set {
+            for element in lo..=hi.min(width.max_unit()) {
+                if few.len() == MAX_FEW {
+                    return None;
+                }
+                few.push(element);
+            }
+        }
+        Some(few)
+    });
+    (high.len() <= MAX_HIGH_RANGES).then_some(ClassPlan { lut, high, few })
+}
+
+/// How a test of E against a set of elements `few` (see [`ClassPlan::few`]) is made, if not by
+/// the class's tables: none can match; one is a compare; two that differ in one bit are one
+/// compare under a mask (V8's `ShortCutEmitCharacterPair`), the case pairs of `i` among them;
+/// two others, on two-byte subjects, where the tables need a range test first, a compare each.
+/// One-byte code tests two others by the table, in fewer instructions.
+fn few_test(few: &[u32], width: Width) -> Option<FewTest> {
+    match *few {
+        [] => Some(FewTest::None),
+        [element] => Some(FewTest::One(element)),
+        [lo, hi] if (lo ^ hi).is_power_of_two() && lo & (lo ^ hi) == 0 => {
+            Some(FewTest::Pair { lo, bit: lo ^ hi })
+        }
+        [_, _] if width == Width::Two => Some(FewTest::Each),
+        _ => None,
+    }
+}
+
+/// See [`few_test`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FewTest {
+    None,
+    One(u32),
+    Pair { lo: u32, bit: u32 },
+    Each,
+}
+
+/// How a test of `class` is made: by its elements (see [`few_test`]), or by its tables. A loop
+/// that holds the table (`held`) tests one-byte elements by it in two instructions, fewer than a
+/// pair's three.
+enum ClassTest<'c> {
+    Few(FewTest, &'c [u32]),
+    Table,
+}
+
+fn class_test(class: &ClassPlan, width: Width, held: bool) -> ClassTest<'_> {
+    let Some(few) = class.few.as_deref() else {
+        return ClassTest::Table;
+    };
+    match few_test(few, width) {
+        Some(FewTest::Pair { .. } | FewTest::Each) if held && width == Width::One => {
+            ClassTest::Table
+        }
+        Some(test) => ClassTest::Few(test, few),
+        None => ClassTest::Table,
+    }
 }
 
 /// What the generator needs to know of a program, for one width.
@@ -755,6 +833,8 @@ struct Generator<'p, 'a, M: Masm> {
     lazy: Vec<(usize, Label, Label)>,
     /// Each lazy loop's extension, which its retry stub jumps to.
     extend: std::collections::HashMap<usize, Label>,
+    /// The class whose table a loop holds (see [`Masm::hold_lut`]).
+    held: Option<*const ClassPlan>,
 }
 
 impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
@@ -770,6 +850,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
             stub_labels: Default::default(),
             lazy: Vec::new(),
             extend: Default::default(),
+            held: None,
         }
     }
 
@@ -1054,7 +1135,28 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
                 }
             }
             Test::Class(class) => {
-                if self.plan.width == Width::One {
+                let width = self.plan.width;
+                let held = self.held == Some(Rc::as_ptr(class));
+                match class_test(class, width, held) {
+                    ClassTest::Few(FewTest::None, _) => return self.m.jump(fail),
+                    ClassTest::Few(FewTest::One(element), _) => {
+                        return self.m.branch_elem(Cond::Ne, element, fail)
+                    }
+                    ClassTest::Few(FewTest::Pair { lo, bit }, _) => {
+                        return self.m.branch_elem_pair(lo, bit, false, fail)
+                    }
+                    ClassTest::Few(FewTest::Each, few) => {
+                        let ok = self.m.label();
+                        let (last, rest) = few.split_last().expect("a set of elements");
+                        for &element in rest {
+                            self.m.branch_elem(Cond::Eq, element, ok);
+                        }
+                        self.m.branch_elem(Cond::Ne, *last, fail);
+                        return self.m.bind(ok);
+                    }
+                    ClassTest::Table => {}
+                }
+                if width == Width::One {
                     let lut = self.m.lut(&class.lut);
                     self.m.branch_lut(lut, false, fail);
                     return;
@@ -1158,9 +1260,12 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         let bound = self.m.label();
         let done = self.m.label();
         let held = match test {
-            Test::Class(class) => {
+            Test::Class(class)
+                if matches!(class_test(class, self.plan.width, true), ClassTest::Table) =>
+            {
                 let lut = self.m.lut(&class.lut);
                 self.m.hold_lut(lut);
+                self.held = Some(Rc::as_ptr(class));
                 true
             }
             _ => false,
@@ -1180,6 +1285,7 @@ impl<'p, 'a, M: Masm> Generator<'p, 'a, M> {
         self.m.bind(done);
         if held {
             self.m.release_lut();
+            self.held = None;
         }
     }
 

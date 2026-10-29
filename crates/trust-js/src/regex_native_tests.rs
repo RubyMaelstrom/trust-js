@@ -252,6 +252,26 @@ const ATOMS: &[&str] = &[
     "[^\\s\\d]",
     "\\x00",
     "[\\u0000-\\u00ff]",
+    // Case variants, and the case relation's exceptions under `i`: characters whose uppercase is
+    // ASCII (ſ, ı) or not one character (ß), the Kelvin sign, Latin-1 letters whose case partner
+    // is outside Latin-1 (ÿ, µ), and groups of three and four (ǅ, Σ, ι).
+    "A",
+    "K",
+    "s",
+    "ß",
+    "ÿ",
+    "µ",
+    "\\u212a",
+    "\\u017f",
+    "\\u0131",
+    "\\u01c5",
+    "Σ",
+    "\\u0345",
+    "[A-Z]",
+    "[^a-z]",
+    "[à-þ]",
+    "[k-s]",
+    "[ǅ-ǆ]",
 ];
 
 /// Near misses: programs one instruction away from what the tier takes (backreferences,
@@ -305,7 +325,7 @@ fn gen_flags(rng: &mut Rng) -> String {
         ('m', 30),
         ('s', 25),
         ('y', 20),
-        ('i', 3),
+        ('i', 30),
     ] {
         if rng.chance(percent) {
             flags.push(flag);
@@ -329,9 +349,23 @@ const ONE_BYTE_UNITS: &[u16] = &[
     b'-' as u16,
     0xfc,
     0,
+    b'A' as u16,
+    b'K' as u16,
+    b'S' as u16,
+    b'X' as u16,
+    b'k' as u16,
+    b's' as u16,
+    0xc9,
+    0xdf,
+    0xff,
+    0xb5,
 ];
 
-const TWO_BYTE_UNITS: &[u16] = &[0x3a9, 0x2028, 0x2029, 0xd83d, 0xde00, 0x3b0, 0x100, 0x2005];
+const TWO_BYTE_UNITS: &[u16] = &[
+    0x3a9, 0x2028, 0x2029, 0xd83d, 0xde00, 0x3b0, 0x100, 0x2005, 0x3c9, 0x178, 0x17f, 0x212a,
+    0x39c, 0x3bc, 0x1e9e, 0x131, 0x130, 0x3a3, 0x3c3, 0x3c2, 0x1c4, 0x1c5, 0x1c6, 0x345, 0x399,
+    0x3b9, 0x1fbe,
+];
 
 fn gen_subject(rng: &mut Rng, two: bool) -> Subject {
     let len = if rng.chance(10) {
@@ -472,6 +506,59 @@ fn core_programs_match_as_the_matcher_does() {
     }
 }
 
+/// Programs under `i`, closed over case, over subjects with case variants: the census's case-
+/// insensitive patterns (Octane's cookie readers, its browser sniffers and alternations of words,
+/// CoffeeScript's number lexer) and the case relation's exceptions.
+#[test]
+fn case_closed_programs_match_as_the_matcher_does() {
+    let texts = [
+        "",
+        "HFUCJRN = abc; x",
+        "a hfucjrn=1;hFuCjRn  =  two",
+        "xHfUcJrN = 2",
+        "Fnsnev xbadhrebe XUGZY fnsNEV",
+        "0B101 0b2 0XfF 0x 1E5 1.5e-3 .5 0O17",
+        "?a=b&SEVRAQVQ=x#y ?q PunaaryVQ=",
+        "x.RONL qri-ehf3.wbg.FGBERF",
+        "ÿŸ µΜμ ßẞ SSs ſ K k İı ǄǅǆΣσς",
+        "AbCdEfGhIjKlMnOpQrStUvWxYz É é Ω ω",
+        "ǅeep σΣς ιΙ\u{345}\u{1fbe}x",
+    ];
+    for (pattern, flags) in [
+        ("\\bhfucjrn\\s*=\\s*([^;]*)", "i"),
+        ("Fnsnev|Xbadhrebe|XUGZY", "gi"),
+        (
+            "^0b[01]+|^0o[0-7]+|^0x[\\da-f]+|^\\d*\\.?\\d+(?:e[+-]?\\d+)?",
+            "i",
+        ),
+        (
+            "\\?[\\w\\W]*(sevraqvq|punaaryvq|tebhcvq)=([^\\&\\?#]*)",
+            "i",
+        ),
+        ("(^|.)(ronl|qri-ehf3.wbg)(|fgberf|zbgbef)", "i"),
+        ("[a-z]+", "i"),
+        ("[^a-z]+", "i"),
+        ("\\w+\\b", "i"),
+        ("[à-þ]+", "gi"),
+        ("ÿ|µ|ß|ſ|\\u212a", "gi"),
+        ("ss|s+", "i"),
+        ("k+", "gi"),
+        ("\\u01c5+\\u03c3*", "i"),
+        ("[ǅσ]{2,}", "i"),
+        ("(?:ι|θ)+x", "i"),
+        ("é{2}|Ω.?ω", "im"),
+        ("^[a-f]*?Z", "im"),
+        ("\\B[a-z]\\b", "gi"),
+    ] {
+        let (native, _) = pair(pattern, flags, Width::Two).unwrap();
+        assert!(
+            compiled(&native, Width::Two) || !BACKEND,
+            "/{pattern}/{flags} is in the tier's instruction set"
+        );
+        check_both(pattern, flags, &texts);
+    }
+}
+
 /// Programs the fuzzer seldom makes: more capture slots than the root floor's logged-slot word
 /// has bits (each attempt unsets them instead), many loops' marks, long straight runs, and code
 /// past AArch64's 32 KB test-and-branch reach.
@@ -519,17 +606,45 @@ fn wide_and_long_programs_match_as_the_matcher_does() {
 /// the matcher tests them: the byte table below 256 and the ranges above.
 #[test]
 fn classes_test_every_two_byte_element_as_the_matcher_does() {
-    for pattern in [
-        "[a-z\\u0100-\\u017f\\u2000-\\u200a]",
-        "[^\\u0100-\\uffff]",
-        "\\s",
-        "\\S",
-        "[\\s\\d]",
-        "[^\\w\\u3000-\\u303f]",
-        "[\\u0101\\u0103\\u0105\\u0107\\u0109\\u010b\\u010d\\u010f\\u0111\\u0113]",
-        ".",
+    for (pattern, flags) in [
+        ("[a-z\\u0100-\\u017f\\u2000-\\u200a]", ""),
+        ("[^\\u0100-\\uffff]", ""),
+        ("\\s", ""),
+        ("\\S", ""),
+        ("[\\s\\d]", ""),
+        ("[^\\w\\u3000-\\u303f]", ""),
+        (
+            "[\\u0101\\u0103\\u0105\\u0107\\u0109\\u010b\\u010d\\u010f\\u0111\\u0113]",
+            "",
+        ),
+        (".", ""),
+        ("[ab]", ""),
+        ("[\\r\\n]", ""),
+        ("[+, ]", ""),
+        ("[Aa]", ""),
+        // Closed over case: pairs that differ in one bit (a, é) or more (ÿ), groups of three and
+        // four (µ, ǅ, Σ, ι), characters with no partner under the legacy Canonicalize (ß, ſ, the
+        // Kelvin sign), classes and their complements.
+        ("a", "i"),
+        ("k", "i"),
+        ("é", "i"),
+        ("ÿ", "i"),
+        ("µ", "i"),
+        ("ß", "i"),
+        ("\\u017f", "i"),
+        ("\\u212a", "i"),
+        ("\\u01c5", "i"),
+        ("Σ", "i"),
+        ("\\u0399", "i"),
+        ("\\u1e9e", "i"),
+        ("[a-z]", "i"),
+        ("[^a-z]", "i"),
+        ("[à-þ]", "i"),
+        ("[\\w\\u0100-\\u017f]", "i"),
+        ("[^\\u01c4]", "i"),
+        ("\\W", "i"),
     ] {
-        let (native, matcher) = pair(&format!("{pattern}x"), "", Width::Two).unwrap();
+        let (native, matcher) = pair(&format!("{pattern}x"), flags, Width::Two).unwrap();
         compiled(&native, Width::Two);
         let control = crate::RuntimeInterrupt::default();
         let mut units = Vec::new();
@@ -544,7 +659,7 @@ fn classes_test_every_two_byte_element_as_the_matcher_does() {
         loop {
             let found = run(&native, &subject, start, &control);
             let reference = run(&matcher, &subject, start, &control);
-            assert_eq!(found, reference, "/{pattern}x/ from {start}");
+            assert_eq!(found, reference, "/{pattern}x/{flags} from {start}");
             match found {
                 Ok(Some(spans)) => start = spans[0].unwrap().1,
                 _ => break,
@@ -705,7 +820,12 @@ fn hot_patterns_compile_each_width_on_its_first_use() {
     assert_eq!(long.tier_feedback().2[0], (true, BACKEND));
 
     // Patterns the tier does not take try once per width and stay on the matcher.
-    for (pattern, flags) in [("a(b)\\1", ""), ("a(?=b)", ""), ("ab", "i"), ("a.", "u")] {
+    for (pattern, flags) in [
+        ("a(b)\\1", ""),
+        ("a(?=b)", ""),
+        ("a(?<=b)", ""),
+        ("a.", "u"),
+    ] {
         let mut declined = Regex::new(pattern, flags).unwrap();
         declined.tier_up_at = 1;
         declined.exec_polled(&ascii, 0, &control).unwrap();
@@ -713,6 +833,13 @@ fn hot_patterns_compile_each_width_on_its_first_use() {
         let (_, _, widths) = declined.tier_feedback();
         assert_eq!(widths, [(true, false), (true, false)], "/{pattern}/{flags}");
     }
+    // A case-insensitive literal runs on one-byte subjects by its folding search, and compiles,
+    // closed over case, for two-byte ones.
+    let mut literal = Regex::new("ab", "i").unwrap();
+    literal.tier_up_at = 1;
+    literal.exec_polled(&ascii, 0, &control).unwrap();
+    literal.exec_polled(&wide, 0, &control).unwrap();
+    assert_eq!(literal.tier_feedback().2, [(true, false), (true, BACKEND)]);
 }
 
 /// The perf map (`TRUST_JS_PERF_MAP`) lists a pattern's native code under its source and flags.
