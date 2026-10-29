@@ -2579,6 +2579,34 @@ clippy and fmt; zombie's clippy, targeted tests (334) and release build. Not cov
 getters: in-line stubs and chunks without direct calls (loop fragments, detailed feedback), chain
 replays and x86-64 (their setters run from Rust, through the cache's proof).
 
+Then item 4's rest (37b61a41, 2026-10-29, an agent's; landed on targeted tests under the owner's
+rule): borrowed frames (loop fragments, OSR'd script loops, generator and async slices) take the
+direct sequences. `compile_entry` cleared the direct-call bit for them, a restriction from when a
+callee shared its caller's context; since item 1 the callee runs on its own pooled record. Calls,
+constructions, getters and setters now take their sequences there; the resume point and the
+borrowed handlers live in the frame's own record, a callee's throw reaches the VM's handler
+routing as any helper's does, and `ret` is always empty at such a call. All three exemplars call
+ordinarily from a frame that entered faster code mid-run (V8 converts the interpreter frame in
+place, builtins-arm64.cc:5747-5750; SpiderMonkey keeps its BaselineFrame, BaselineFrame.h:212-220;
+JSC's loop_osr keeps its call frame, LLIntSlowPaths.cpp:491-528). CALLSTAT's slow calls in
+borrowed frames: Djot 7,341 (its parse loop) and chai 199 to none. Per call: a fragment's direct
+call 686 to 298, its method call 788 to 416, getter 1,192 to 428, setter 1,106 to 476; an OSR'd
+loop's direct call 798 to 396. Fixtures against 3b04fb1a: Djot -0.45%, React and chai flat, Vue
++0.09% (its 386K native calls in borrowed frames now pass the direct sequence's first gate before
+declining it, as natives from fresh frames do; minor). Tests: jit_borrowed_call_tests.rs (OSR,
+fragments, generator slices, handlers, `ret` through finally, constructs, accessors, stack
+overflow, collections, re-entry; 9 of 10 fail with the restriction restored), targeted filters,
+GC stress at N=16, zombie's clippy and targeted tests.
+
+Item 7 is parked (2026-10-29) on branch p2-w3-i4 (fae31a32, fbb8f73e, marked WIP), with
+target/p2/w3-i4/RESUME.txt. Census: sites with live evictions, none on Vue and React, five on Djot,
+nine on chai (one with 4,052 evictions over 403 functions), so a megamorphic bit saves at most
+about 0.05%. Builtin ids recorded with the class in one lookup measured Vue +0.24%, not yet
+explained (suspect: Reflect.apply's target check taking the table's lock on every call); the
+megamorphic bit (no eviction after 4, as JSC's limit of 8 callees) has a flaw found but not fixed:
+the call-cache epoch is global, so its bumps stale the overflow entries and a stable site counts
+as megamorphic (fix: count evictions per epoch). The call count is designed, not built.
+
 ### W3 item 3: the closure entry (census and design, 2026-10-28; decided, Decisions 20 and 21)
 
 Item 3, as the stage's design has it: a callee that needs an environment builds it in its prologue,
