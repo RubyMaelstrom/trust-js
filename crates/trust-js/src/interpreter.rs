@@ -1720,20 +1720,48 @@ impl std::ops::Deref for DescRef {
 
 /// A record's own names: those of a record built name by name (the tree-walker's, eval's) or
 /// changed after a descriptor's (a sloppy eval's `var`, a `delete`), in a storage block the
-/// record reports, with each name's binding's attributes and, once one of them is an import, each
-/// binding's import target. It is never dropped: the names are atoms, the spills are blocks, and
-/// a large list's index lives in a payload cell whose finalizer drops it.
+/// record reports, each with its binding's attributes ([`NameWord`]) and, once one of them is an
+/// import, each binding's import target. It is never dropped: the names are atoms, the spills are
+/// blocks, and a large list's index lives in a payload cell whose finalizer drops it.
 struct OwnNames {
     names: std::mem::ManuallyDrop<
-        crate::inline_vec::InlineVec<crate::atom::Atom, 2, crate::gc_storage::GcSpill>,
-    >,
-    attrs: std::mem::ManuallyDrop<
-        crate::inline_vec::InlineVec<BindingAttrs, 8, crate::gc_storage::GcSpill>,
+        crate::inline_vec::InlineVec<NameWord, 2, crate::gc_storage::GcSpill>,
     >,
     /// Slot for slot, each binding's import target (CreateImportBinding's module record and
-    /// name), from the first import on: a module record's.
+    /// name), from the first import on: a module record's. An import's [`BindingAttrs::IMPORTED`]
+    /// is its entry's presence.
     imports: Option<crate::gc_storage::StorageBox<ImportTargets>>,
     index: Option<crate::gc_storage::PayloadBox<NameIndex>>,
+}
+
+/// An own list's entry: a name's atom word with its binding's attributes but
+/// [`BindingAttrs::IMPORTED`] in the four low bits, which a string cell's 16-byte alignment
+/// leaves clear: one word a binding, as the names alone were.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct NameWord(usize);
+
+impl NameWord {
+    const ATTRS: usize = 0xf;
+
+    #[inline]
+    fn new(name: crate::atom::Atom, attrs: BindingAttrs) -> Self {
+        let word = name.cell_word() as usize;
+        debug_assert_eq!(word & Self::ATTRS, 0, "string cells are 16-byte aligned");
+        Self(word | (usize::from(attrs.0) & Self::ATTRS))
+    }
+
+    #[inline]
+    fn name(self) -> crate::atom::Atom {
+        // SAFETY: the word is an atom's address and attribute bits (see `NameWord::new`).
+        unsafe { crate::atom::Atom::from_cell_word((self.0 & !Self::ATTRS) as u64) }
+    }
+
+    /// The attributes but [`BindingAttrs::IMPORTED`].
+    #[inline]
+    fn attrs(self) -> BindingAttrs {
+        BindingAttrs((self.0 & Self::ATTRS) as u8)
+    }
 }
 
 /// Slot for slot, an [`OwnNames`]' import targets.
@@ -1877,7 +1905,12 @@ impl Names {
     fn get(&self, slot: usize) -> Option<crate::atom::Atom> {
         match self.kind() {
             Self::SHARED => self.desc().expect("shared").names.get(slot).copied(),
-            Self::OWN => self.own_names().expect("own").names.get(slot).copied(),
+            Self::OWN => self
+                .own_names()
+                .expect("own")
+                .names
+                .get(slot)
+                .map(|word| word.name()),
             _ => (slot == 0).then(|| self.single().expect("one")),
         }
     }
@@ -1887,7 +1920,16 @@ impl Names {
     fn attrs(&self, slot: usize) -> BindingAttrs {
         match self.kind() {
             Self::SHARED => self.desc().expect("shared").attrs[slot],
-            Self::OWN => self.own_names().expect("own").attrs[slot],
+            Self::OWN => {
+                let own = self.own_names().expect("own");
+                let imported = own
+                    .imports
+                    .as_ref()
+                    .is_some_and(|imports| imports[slot].is_some());
+                own.names[slot]
+                    .attrs()
+                    .with(BindingAttrs::IMPORTED, imported)
+            }
             _ => self.single_attrs(),
         }
     }
@@ -1912,20 +1954,30 @@ impl Names {
                 let own = self.own_names().expect("own");
                 match &own.index {
                     Some(index) => index.get(&name).map(|&slot| slot as usize),
-                    None => own.names.iter().position(|&known| known == name),
+                    None => own.names.iter().position(|known| known.name() == name),
                 }
             }
             _ => (self.single() == Some(name)).then_some(0),
         }
     }
 
-    /// `f` on the names, in slot order.
+    /// The first slot whose name passes `test`.
     #[inline]
-    fn with_slice<R>(&self, f: impl FnOnce(&[crate::atom::Atom]) -> R) -> R {
+    fn position(&self, test: impl Fn(crate::atom::Atom) -> bool) -> Option<usize> {
         match self.kind() {
-            Self::SHARED => f(&self.desc().expect("shared").names),
-            Self::OWN => f(&self.own_names().expect("own").names),
-            _ => f(std::slice::from_ref(&self.single().expect("one"))),
+            Self::SHARED => self
+                .desc()
+                .expect("shared")
+                .names
+                .iter()
+                .position(|&name| test(name)),
+            Self::OWN => self
+                .own_names()
+                .expect("own")
+                .names
+                .iter()
+                .position(|word| test(word.name())),
+            _ => test(self.single().expect("one")).then_some(0),
         }
     }
 
@@ -1938,7 +1990,7 @@ impl Names {
         } else if self.own_names().is_some_and(|own| own.index.is_some()) {
             return self.slot_of(crate::atom::lookup(text)?);
         }
-        self.with_slice(|names| names.iter().position(|name| name.is(text)))
+        self.position(|name| name.is(text))
     }
 
     /// Exchange the names, attributes and imports at `a` and `b`, owning the names first, without
@@ -1947,7 +1999,6 @@ impl Names {
         if a != b {
             let own = self.own_mut();
             own.names.swap(a, b);
-            own.attrs.swap(a, b);
             if let Some(imports) = &mut own.imports {
                 imports.swap(a, b);
             }
@@ -1958,15 +2009,17 @@ impl Names {
     /// first (the generation's bump is the caller's).
     fn own_mut(&mut self) -> &mut OwnNames {
         if self.kind() != Self::OWN {
-            let mut names = crate::inline_vec::InlineVec::new();
-            let mut attrs = crate::inline_vec::InlineVec::new();
-            for slot in 0..self.len() {
-                names.push(self.get(slot).expect("in range"));
-                attrs.push(self.attrs(slot));
+            // A descriptor or a one-name word holds no import.
+            let len = self.len();
+            let mut names = crate::inline_vec::InlineVec::with_capacity(len);
+            for slot in 0..len {
+                names.push(NameWord::new(
+                    self.get(slot).expect("in range"),
+                    self.attrs(slot),
+                ));
             }
             *self = Self::own(crate::gc_storage::StorageBox::new(OwnNames {
                 names: std::mem::ManuallyDrop::new(names),
-                attrs: std::mem::ManuallyDrop::new(attrs),
                 imports: None,
                 index: None,
             }));
@@ -1987,7 +2040,7 @@ impl Names {
             .names
             .iter()
             .enumerate()
-            .map(|(slot, &name)| (name, slot as u32))
+            .map(|(slot, word)| (word.name(), slot as u32))
             .collect();
         match &mut own.index {
             Some(existing) => (**existing).0 = index,
@@ -1996,20 +2049,27 @@ impl Names {
     }
 
     /// Set an own list's import target at `slot`, making the list's imports first.
+    #[inline]
     fn set_own_import(own: &mut OwnNames, slot: usize, import: Option<(Env, crate::atom::Atom)>) {
         if own.imports.is_none() {
             if import.is_none() {
                 return;
             }
-            let mut targets = crate::inline_vec::InlineVec::new();
-            for _ in 0..own.names.len() {
-                targets.push(None);
-            }
-            own.imports = Some(crate::gc_storage::StorageBox::new(
-                std::mem::ManuallyDrop::new(targets),
-            ));
+            Self::make_own_imports(own);
         }
         own.imports.as_mut().expect("imports")[slot] = import;
+    }
+
+    /// An own list's import targets, none an import yet.
+    #[cold]
+    fn make_own_imports(own: &mut OwnNames) {
+        let mut targets = crate::inline_vec::InlineVec::new();
+        for _ in 0..own.names.len() {
+            targets.push(None);
+        }
+        own.imports = Some(crate::gc_storage::StorageBox::new(
+            std::mem::ManuallyDrop::new(targets),
+        ));
     }
 
     /// Append `name` at the next slot with its binding's attributes and import target, owning the
@@ -2029,13 +2089,13 @@ impl Names {
             return;
         }
         let own = self.own_mut();
-        own.names.push(name);
-        own.attrs.push(attrs);
+        own.names.push(NameWord::new(name, attrs));
         let slot = own.names.len() - 1;
         if let Some(imports) = &mut own.imports {
-            imports.push(None);
+            imports.push(import);
+        } else if import.is_some() {
+            Self::set_own_import(own, slot, import);
         }
-        Self::set_own_import(own, slot, import);
         match &mut own.index {
             Some(index) => {
                 index.insert(name, slot as u32);
@@ -2061,7 +2121,7 @@ impl Names {
             return true;
         }
         let own = self.own_mut();
-        own.attrs[slot] = attrs;
+        own.names[slot] = NameWord::new(own.names[slot].name(), attrs);
         Self::set_own_import(own, slot, import);
         true
     }
@@ -2074,7 +2134,6 @@ impl Names {
         }
         let own = self.own_mut();
         own.names.swap_remove(slot);
-        own.attrs.swap_remove(slot);
         if let Some(imports) = &mut own.imports {
             imports.swap_remove(slot);
         }
@@ -2086,9 +2145,6 @@ impl Names {
         if let Some(own) = self.own_names() {
             crate::gc_storage::trace_block(self.untagged() as *const u8, sink);
             if let Some(block) = own.names.spill_ptr() {
-                crate::gc_storage::trace_block(block, sink);
-            }
-            if let Some(block) = own.attrs.spill_ptr() {
                 crate::gc_storage::trace_block(block, sink);
             }
             if let Some(imports) = &own.imports {
@@ -2111,8 +2167,7 @@ impl Names {
         match self.own_names() {
             Some(own) => (
                 std::mem::size_of::<OwnNames>()
-                    + own.names.heap_capacity() * std::mem::size_of::<crate::atom::Atom>()
-                    + own.attrs.heap_capacity() * std::mem::size_of::<BindingAttrs>()
+                    + own.names.heap_capacity() * std::mem::size_of::<NameWord>()
                     + own.imports.as_ref().map_or(0, |imports| {
                         std::mem::size_of::<ImportTargets>()
                             + imports.heap_capacity()
@@ -2245,16 +2300,17 @@ impl VarMap {
         if layout.id == 0
             || self.values.len() != layout.slots.len()
             || self.values.len() != layout.attrs.len()
-            || self.keys().any(|name| layout.slot_of_atom(name).is_none())
         {
             return;
         }
-        // The descriptor's attributes are the layout's: every binding must have its slot's, and
-        // a descriptor holds no import.
+        // Every name must be the layout's, with its slot's attributes (the descriptor's): a
+        // descriptor holds no import.
         for slot in 0..self.values.len() {
             let name = self.names.get(slot).expect("a name per value");
-            let target = layout.slot_of_atom(name).expect("validated");
-            if self.names.attrs(slot) != layout.attrs[target] || self.names.import(slot).is_some() {
+            let Some(target) = layout.slot_of_atom(name) else {
+                return;
+            };
+            if self.names.attrs(slot) != layout.attrs[target] || layout.attrs[target].imported() {
                 return;
             }
         }
