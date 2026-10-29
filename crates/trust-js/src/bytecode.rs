@@ -25854,10 +25854,6 @@ unsafe fn jit_callstat(
         if retry_at != 0 && callee.jit_runs.get().wrapping_add(1) >= retry_at {
             break 'r "gate: inline retry due";
         }
-        if !ctx.resume_activation.is_null() {
-            // A borrowed frame's code is compiled without direct sequences (`compile_entry`).
-            break 'r "site: borrowed frame, no direct sequence";
-        }
         break 'r "all gates pass (no direct sequence at the site)";
     };
     let _ = COUNTS.try_with(|c| *c.borrow_mut().0.entry(reason).or_insert(0) += 1);

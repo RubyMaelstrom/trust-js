@@ -129,6 +129,14 @@ mod osr_entry_tests;
 #[path = "jit_continuation_tests.rs"]
 mod continuation_tests;
 
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_borrowed_call_tests.rs"]
+mod borrowed_call_tests;
+
 #[cfg(test)]
 #[path = "jit_inline_context_tests.rs"]
 mod inline_context_tests;
@@ -4707,14 +4715,15 @@ fn compile_entry(
             }
         }
     }
+    // A borrowed frame (an OSR'd loop, a loop fragment, a coroutine's slice) takes the direct
+    // sequences too (W3's item 4): its callee runs on a record of its own and the sequence
+    // writes nothing of the caller's record, so the frame's continuation state comes through
+    // the call as it was: its resume point and step, the handlers it borrowed from the VM, and
+    // `ret`, which is vacant at every call (a borrowed frame's returns are slice exits, and the
+    // finish stub's fallback leaves it vacant again).
     let mut fast: u32 = env_value!("TRUST_JS_JIT_FAST")
         .and_then(|v| v.parse().ok())
         .unwrap_or(u32::MAX);
-    // A slice borrows a continuation-owned activation. Calls remain native through their
-    // ordinary entry, but cannot swap this context out from under the borrowed state view.
-    if borrowed_entry {
-        fast &= !(1 << 20);
-    }
     if chunk.jit_detailed_feedback_enabled() {
         // Detailed arithmetic observation runs in the exact-PC helper. Keep ordinary builds on
         // their inline and register-region paths; profile-enabled chunks route numeric/update
