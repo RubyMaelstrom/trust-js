@@ -188,6 +188,15 @@ fn check(pattern: &str, flags: &str, subject: &Subject) {
 struct Rng(u64);
 
 impl Rng {
+    /// The generator of `seed`'s stream: splitmix64 mixes the seed into a nonzero state, so that
+    /// every seed has a stream of its own.
+    fn seeded(seed: u64) -> Self {
+        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Rng((z ^ (z >> 31)) | 1)
+    }
+
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -350,7 +359,7 @@ fn gen_subject(rng: &mut Rng, two: bool) -> Subject {
 /// grammar and its near misses, with random flags, against one-byte and two-byte subjects at
 /// every start. Returns the cases run and the patterns the tier compiled.
 fn fuzz(seed: u64, cases: usize) -> (usize, usize) {
-    let mut rng = Rng(seed | 1);
+    let mut rng = Rng::seeded(seed);
     let trace = std::env::var_os("TRUST_JS_REGEXP_FUZZ_TRACE").is_some();
     let mut run_cases = 0;
     let mut native_patterns = 0;
