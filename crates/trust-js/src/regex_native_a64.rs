@@ -53,8 +53,15 @@ fn cond_code(cond: Cond) -> u32 {
 
 // Encodings (Arm ARM, A64 base instructions), checked against llvm-mc in the tests below.
 
+/// What an encoder returns for a field past its range (UDF #0, permanently undefined), as no
+/// instruction it emits ever is: `Asm::emit` notes it and `finish` refuses the program, so the
+/// pattern stays on the matcher instead of running a wrong word (Decision 23).
+const UNENCODABLE: u32 = 0;
+
 fn add_imm(sf: bool, rd: u32, rn: u32, imm12: u32, shift12: bool) -> u32 {
-    debug_assert!(imm12 < 1 << 12);
+    if imm12 >= 1 << 12 {
+        return UNENCODABLE;
+    }
     (if sf { 0x9100_0000 } else { 0x1100_0000 })
         | u32::from(shift12) << 22
         | imm12 << 10
@@ -63,21 +70,30 @@ fn add_imm(sf: bool, rd: u32, rn: u32, imm12: u32, shift12: bool) -> u32 {
 }
 
 fn sub_imm(sf: bool, rd: u32, rn: u32, imm12: u32) -> u32 {
-    debug_assert!(imm12 < 1 << 12);
+    if imm12 >= 1 << 12 {
+        return UNENCODABLE;
+    }
     (if sf { 0xd100_0000 } else { 0x5100_0000 }) | imm12 << 10 | rn << 5 | rd
 }
 
 fn subs_imm(sf: bool, rd: u32, rn: u32, imm12: u32) -> u32 {
-    debug_assert!(imm12 < 1 << 12);
+    if imm12 >= 1 << 12 {
+        return UNENCODABLE;
+    }
     (if sf { 0xf100_0000 } else { 0x7100_0000 }) | imm12 << 10 | rn << 5 | rd
 }
 
 fn adds_imm(sf: bool, rd: u32, rn: u32, imm12: u32) -> u32 {
-    debug_assert!(imm12 < 1 << 12);
+    if imm12 >= 1 << 12 {
+        return UNENCODABLE;
+    }
     (if sf { 0xb100_0000 } else { 0x3100_0000 }) | imm12 << 10 | rn << 5 | rd
 }
 
 fn add_reg(rd: u32, rn: u32, rm: u32, lsl: u32) -> u32 {
+    if lsl >= 64 {
+        return UNENCODABLE;
+    }
     0x8b00_0000 | rm << 16 | lsl << 10 | rn << 5 | rd
 }
 
@@ -90,18 +106,30 @@ fn subs_reg(sf: bool, rd: u32, rn: u32, rm: u32) -> u32 {
 }
 
 fn orr_reg(sf: bool, rd: u32, rn: u32, rm: u32, lsl: u32) -> u32 {
+    if lsl >= if sf { 64 } else { 32 } {
+        return UNENCODABLE;
+    }
     (if sf { 0xaa00_0000 } else { 0x2a00_0000 }) | rm << 16 | lsl << 10 | rn << 5 | rd
 }
 
 fn movz(sf: bool, rd: u32, imm16: u32, hw: u32) -> u32 {
+    if imm16 > 0xffff || hw >= if sf { 4 } else { 2 } {
+        return UNENCODABLE;
+    }
     (if sf { 0xd280_0000 } else { 0x5280_0000 }) | hw << 21 | imm16 << 5 | rd
 }
 
 fn movk(sf: bool, rd: u32, imm16: u32, hw: u32) -> u32 {
+    if imm16 > 0xffff || hw >= if sf { 4 } else { 2 } {
+        return UNENCODABLE;
+    }
     (if sf { 0xf280_0000 } else { 0x7280_0000 }) | hw << 21 | imm16 << 5 | rd
 }
 
 fn movn(rd: u32, imm16: u32) -> u32 {
+    if imm16 > 0xffff {
+        return UNENCODABLE;
+    }
     0x9280_0000 | imm16 << 5 | rd
 }
 
@@ -110,12 +138,17 @@ fn csel(rd: u32, rn: u32, rm: u32, cond: Cond) -> u32 {
 }
 
 fn lsr_imm(rd: u32, rn: u32, shift: u32) -> u32 {
+    if shift >= 64 {
+        return UNENCODABLE;
+    }
     0xd340_0000 | shift << 16 | 63 << 10 | rn << 5 | rd
 }
 
 /// `orr xd, xn, #(1 << bit)`: a logical immediate of one set bit.
 fn orr_bit(rd: u32, rn: u32, bit: u32) -> u32 {
-    debug_assert!(bit < 64);
+    if bit >= 64 {
+        return UNENCODABLE;
+    }
     0xb240_0000 | ((64 - bit) % 64) << 16 | rn << 5 | rd
 }
 
@@ -125,32 +158,49 @@ fn and_low_byte(rd: u32, rn: u32) -> u32 {
 }
 
 fn ldr_imm(rt: u32, rn: u32, offset: usize) -> u32 {
-    debug_assert!(offset.is_multiple_of(8) && offset / 8 < 1 << 12);
+    if !scaled_x(offset) {
+        return UNENCODABLE;
+    }
     0xf940_0000 | (offset as u32 / 8) << 10 | rn << 5 | rt
 }
 
 fn str_imm(rt: u32, rn: u32, offset: usize) -> u32 {
-    debug_assert!(offset.is_multiple_of(8) && offset / 8 < 1 << 12);
+    if !scaled_x(offset) {
+        return UNENCODABLE;
+    }
     0xf900_0000 | (offset as u32 / 8) << 10 | rn << 5 | rt
 }
 
+/// Whether a 64-bit load's or store's scaled 12-bit offset field encodes `offset`.
+fn scaled_x(offset: usize) -> bool {
+    offset.is_multiple_of(8) && offset / 8 < 1 << 12
+}
+
 fn ldrb_imm(rt: u32, rn: u32, offset: u32) -> u32 {
-    debug_assert!(offset < 1 << 12);
+    if offset >= 1 << 12 {
+        return UNENCODABLE;
+    }
     0x3940_0000 | offset << 10 | rn << 5 | rt
 }
 
 fn ldrh_imm(rt: u32, rn: u32, offset: u32) -> u32 {
-    debug_assert!(offset.is_multiple_of(2) && offset / 2 < 1 << 12);
+    if !offset.is_multiple_of(2) || offset / 2 >= 1 << 12 {
+        return UNENCODABLE;
+    }
     0x7940_0000 | (offset / 2) << 10 | rn << 5 | rt
 }
 
 fn ldurb(rt: u32, rn: u32, offset: i32) -> u32 {
-    debug_assert!((-256..256).contains(&offset));
+    if !(-256..256).contains(&offset) {
+        return UNENCODABLE;
+    }
     0x3840_0000 | ((offset as u32) & 0x1ff) << 12 | rn << 5 | rt
 }
 
 fn ldurh(rt: u32, rn: u32, offset: i32) -> u32 {
-    debug_assert!((-256..256).contains(&offset));
+    if !(-256..256).contains(&offset) {
+        return UNENCODABLE;
+    }
     0x7840_0000 | ((offset as u32) & 0x1ff) << 12 | rn << 5 | rt
 }
 
@@ -177,7 +227,9 @@ enum PairMode {
 }
 
 fn stp(mode: PairMode, rt1: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
-    debug_assert!(offset % 8 == 0 && (-512..512).contains(&offset));
+    if offset % 8 != 0 || !(-512..512).contains(&offset) {
+        return UNENCODABLE;
+    }
     let base = match mode {
         PairMode::Pre => 0xa980_0000,
         PairMode::Post => 0xa880_0000,
@@ -187,7 +239,10 @@ fn stp(mode: PairMode, rt1: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
 }
 
 fn ldp(mode: PairMode, rt1: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
-    stp(mode, rt1, rt2, rn, offset) | 1 << 22
+    match stp(mode, rt1, rt2, rn, offset) {
+        UNENCODABLE => UNENCODABLE,
+        word => word | 1 << 22,
+    }
 }
 
 const RET: u32 = 0xd65f_03c0;
@@ -249,6 +304,8 @@ pub(super) struct Asm {
     addr_valid: bool,
     /// The table whose address x14 holds.
     held: Option<Data>,
+    /// An encoder met a field past its range (see [`UNENCODABLE`]): `finish` refuses the code.
+    unencodable: bool,
 }
 
 impl Asm {
@@ -269,6 +326,7 @@ impl Asm {
             exit: 0,
             addr_valid: false,
             held: None,
+            unencodable: false,
         };
         asm.poll_routine = asm.label();
         asm.grow_routine = asm.label();
@@ -277,6 +335,7 @@ impl Asm {
     }
 
     fn emit(&mut self, word: u32) {
+        self.unencodable |= word == UNENCODABLE;
         self.code.push(word);
     }
 
@@ -308,6 +367,9 @@ impl Asm {
     }
 
     fn tbnz(&mut self, rt: u32, bit: u32, label: Label) {
+        if bit >= 64 {
+            return self.emit(UNENCODABLE);
+        }
         self.branch(
             0x3700_0000 | (bit >> 5) << 31 | (bit & 31) << 19 | rt,
             label,
@@ -388,6 +450,28 @@ impl Asm {
 
     fn slot_offset(slot: usize) -> usize {
         slot * 8
+    }
+
+    /// `ldr xt, [xn, #offset]` at any offset below 16 MB (Decision 23; MAX_SLOTS keeps the slots
+    /// within the scaled form): past the form, through xt, which the load overwrites, the
+    /// offset's high part added (`add xt, xn, #high, lsl #12`).
+    fn ldr_x(&mut self, rt: u32, rn: u32, offset: usize) {
+        if scaled_x(offset) || offset >= 1 << 24 || rt == ZR {
+            return self.emit(ldr_imm(rt, rn, offset));
+        }
+        self.emit(add_imm(true, rt, rn, (offset >> 12) as u32, true));
+        self.emit(ldr_imm(rt, rt, offset & 0xfff));
+    }
+
+    /// `str xt, [xn, #offset]` at any offset below 16 MB: past the scaled form, through x17,
+    /// the intra-procedure scratch that `add_any` and `cmp_any` use, which no store's register
+    /// or base is.
+    fn str_x(&mut self, rt: u32, rn: u32, offset: usize) {
+        if scaled_x(offset) || offset >= 1 << 24 || rt == IP1 || rn == IP1 {
+            return self.emit(str_imm(rt, rn, offset));
+        }
+        self.emit(add_imm(true, IP1, rn, (offset >> 12) as u32, true));
+        self.emit(str_imm(rt, IP1, offset & 0xfff));
     }
 
     /// Save x30 and x9-x15 for a call from a shared routine.
@@ -569,7 +653,7 @@ impl Masm for Asm {
     fn fill_unset(&mut self, slots: std::ops::Range<usize>) {
         self.emit(movn(IP0, 0));
         for slot in slots {
-            self.emit(str_imm(IP0, SLOTS, Self::slot_offset(slot)));
+            self.str_x(IP0, SLOTS, Self::slot_offset(slot));
         }
     }
 
@@ -598,8 +682,13 @@ impl Masm for Asm {
     }
 
     fn retreat(&mut self, k: u32) {
-        debug_assert!(k < 1 << 12);
-        self.emit(sub_imm(true, POS, POS, k));
+        if k < 1 << 12 {
+            self.emit(sub_imm(true, POS, POS, k));
+        } else {
+            // Through x17, as `add_any` advances.
+            self.mov_imm(true, IP1, u64::from(k));
+            self.emit(sub_reg(true, POS, POS, IP1));
+        }
         self.pos_changed();
     }
 
@@ -698,7 +787,7 @@ impl Masm for Asm {
         let value = match operand {
             Operand::Pos => POS,
             Operand::Slot(slot) => {
-                self.emit(ldr_imm(IP1, SLOTS, Self::slot_offset(slot)));
+                self.ldr_x(IP1, SLOTS, Self::slot_offset(slot));
                 IP1
             }
             Operand::Pack(add) => {
@@ -749,17 +838,17 @@ impl Masm for Asm {
                 IP0
             }
         };
-        self.emit(str_imm(register, SLOTS, Self::slot_offset(slot)));
+        self.str_x(register, SLOTS, Self::slot_offset(slot));
     }
 
     fn branch_slot_unset(&mut self, slot: usize, label: Label) {
-        self.emit(ldr_imm(IP0, SLOTS, Self::slot_offset(slot)));
+        self.ldr_x(IP0, SLOTS, Self::slot_offset(slot));
         self.emit(adds_imm(true, ZR, IP0, 1));
         self.b_cond(Cond::Eq, label);
     }
 
     fn branch_slot_eq_pos(&mut self, slot: usize, label: Label) {
-        self.emit(ldr_imm(IP0, SLOTS, Self::slot_offset(slot)));
+        self.ldr_x(IP0, SLOTS, Self::slot_offset(slot));
         self.emit(subs_reg(true, ZR, IP0, POS));
         self.b_cond(Cond::Eq, label);
     }
@@ -874,6 +963,9 @@ impl Masm for Asm {
     fn finish(mut self) -> Option<Vec<u8>> {
         self.emit_outlines();
         self.emit_routines();
+        if self.unencodable {
+            return None;
+        }
         let code_bytes = self.code.len() * 4;
         let data_start = code_bytes.next_multiple_of(8);
         for (at, label, fixup) in std::mem::take(&mut self.fixups) {
@@ -1099,5 +1191,57 @@ mod tests {
         assert_eq!(fixed[1], 0xb400_0055);
         assert_eq!(fixed[2], 0x54ff_ffc2);
         assert_eq!(fixed[3], 0xb747_ffb8);
+    }
+
+    /// Decision 23: a slot access or a retreat past its form legalizes (a load through its
+    /// destination, a store and a retreat through x17); a field no sequence encodes makes
+    /// `finish` refuse the program instead of emitting a wrong word.
+    #[test]
+    fn operands_past_their_forms_legalize_or_refuse_the_program() {
+        let helpers = || Helpers {
+            poll: 0,
+            grow: 0,
+            next_candidate: 0,
+        };
+        let mut a = Asm::new(Width::One, helpers());
+        a.ldr_x(IP0, SLOTS, 32760);
+        a.ldr_x(IP0, SLOTS, 40000);
+        a.str_x(POS, SLOTS, 40000);
+        a.retreat(4095);
+        a.retreat(5000);
+        assert!(!a.unencodable);
+        // llvm-mc: `ldr x16, [x22, #32760]`; `add x16, x22, #9, lsl #12; ldr x16, [x16, #3136]`;
+        // `add x17, x22, #9, lsl #12; str x21, [x17, #3136]`; `sub x21, x21, #4095`;
+        // `mov x17, #5000; sub x21, x21, x17`.
+        assert_eq!(
+            a.code,
+            [
+                0xf97f_fed0,
+                0x9140_26d0,
+                0xf946_2210,
+                0x9140_26d1,
+                0xf906_2235,
+                0xd13f_feb5,
+                0xd282_7111,
+                0xcb11_02b5,
+            ]
+        );
+        for emit in [
+            (|a: &mut Asm| a.log_slot(64)) as fn(&mut Asm),
+            |a| {
+                let label = a.label();
+                a.branch_logged(64, label);
+                a.bind(label);
+            },
+            |a| a.emit(add_imm(true, 0, 0, 1 << 12, false)),
+            |a| a.emit(ldp(PairMode::Offset, 0, 1, SP, 512)),
+            |a| a.ldr_x(IP0, SLOTS, 1 << 24),
+            |a| a.str_x(IP1, SLOTS, 40000),
+        ] {
+            let mut a = Asm::new(Width::One, helpers());
+            emit(&mut a);
+            assert!(a.unencodable);
+            assert!(a.finish().is_none());
+        }
     }
 }

@@ -88,6 +88,8 @@ pub(super) struct Asm {
     exit: Label,
     /// The table whose address rdx holds.
     held: Option<Data>,
+    /// An operand past its field (a LOGGED bit from 64 on): `finish` refuses the code.
+    unencodable: bool,
 }
 
 impl Asm {
@@ -108,6 +110,7 @@ impl Asm {
             candidate_routine: 0,
             exit: 0,
             held: None,
+            unencodable: false,
         };
         asm.poll_routine = asm.label();
         asm.grow_routine = asm.label();
@@ -457,9 +460,13 @@ impl Masm for Asm {
         if mask == u64::MAX {
             self.op_rr(true, &[0xc7], 0, LOGGED);
             self.imm32(-1);
+        } else if let Ok(mask) = u32::try_from(mask) {
+            self.mov_imm32(LOGGED, mask);
         } else {
-            debug_assert!(mask <= u64::from(u32::MAX));
-            self.mov_imm32(LOGGED, mask as u32);
+            // mov r64, imm64
+            self.rex(true, 0, 0, LOGGED);
+            self.byte(0xb8 | (LOGGED & 7));
+            self.bytes(&mask.to_le_bytes());
         }
     }
 
@@ -596,7 +603,8 @@ impl Masm for Asm {
     }
 
     fn branch_logged(&mut self, slot: usize, label: Label) {
-        // bt r9, slot: the bit lands in the carry flag.
+        // bt r9, slot: the bit lands in the carry flag. The CPU takes the imm8 modulo 64.
+        self.unencodable |= slot >= 64;
         self.op_rr(true, &[0x0f, 0xba], 4, LOGGED);
         self.byte(slot as u8);
         self.jcc(Cond::Lo, label);
@@ -604,6 +612,7 @@ impl Masm for Asm {
 
     fn log_slot(&mut self, slot: usize) {
         // bts r9, slot
+        self.unencodable |= slot >= 64;
         self.op_rr(true, &[0x0f, 0xba], 5, LOGGED);
         self.byte(slot as u8);
     }
@@ -738,6 +747,9 @@ impl Masm for Asm {
     fn finish(mut self) -> Option<Vec<u8>> {
         self.emit_outlines();
         self.emit_routines();
+        if self.unencodable {
+            return None;
+        }
         let data_start = self.code.len().next_multiple_of(8);
         for (field, label) in std::mem::take(&mut self.fixups) {
             let target = self.labels.get(label).copied().flatten()?;
@@ -945,6 +957,13 @@ mod tests {
                 "48 8d 81 03 00 00 00",
                 "lea rax,[rcx+0x3]",
             ),
+            (|a| a.set_logged(0b11), "41 b9 03 00 00 00", "mov r9d,0x3"),
+            (
+                |a| a.set_logged(0x1_0000_0001),
+                "49 b9 01 00 00 00 01 00 00 00",
+                "movabs r9,0x100000001",
+            ),
+            (|a| a.log_slot(63), "49 0f ba e9 3f", "bts r9,0x3f"),
         ];
         let print = std::env::var_os("TRUST_JS_REGEXP_X64_ENCODINGS").is_some();
         for (emit, expected, text) in cases {
@@ -963,6 +982,29 @@ mod tests {
                 eprintln!("{hex}\t{text}");
             } else {
                 assert_eq!(hex, *expected, "{text}");
+            }
+        }
+    }
+
+    /// A LOGGED bit from 64 on, which `bt` and `bts` would take modulo 64, refuses the program
+    /// (Decision 23).
+    #[test]
+    fn logged_bits_past_the_register_refuse_the_program() {
+        let helpers = || Helpers {
+            poll: 0,
+            grow: 0,
+            next_candidate: 0,
+        };
+        for slot in [63, 64, 300] {
+            let mut a = Asm::new(Width::One, helpers());
+            a.log_slot(slot);
+            let mut b = Asm::new(Width::One, helpers());
+            let label = b.label();
+            b.branch_logged(slot, label);
+            b.bind(label);
+            assert_eq!((a.unencodable, b.unencodable), (slot >= 64, slot >= 64));
+            if slot >= 64 {
+                assert!(a.finish().is_none() && b.finish().is_none());
             }
         }
     }
