@@ -12788,9 +12788,41 @@ fn emit_load_name_inline_marked(
     a.bind(done);
 }
 
-/// `Op::LoadNameIn` / `Op::LoadNameForCallIn`: [`emit_load_name_inline`] resolving from a fixed
-/// inline target's [[Environment]] (`env`, an `Env::as_ptr` scope address). Emitted at each site
-/// (in the chunk's shared fixed-environment name stub unless stubs are inlined).
+/// Where a name read that does not start at the running environment starts (x9).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+enum NameBase {
+    /// A pinned inline target's [[Environment]], an `Env::as_ptr` scope address
+    /// (`Op::LoadNameIn`).
+    Pinned(u64),
+    /// The realm's global environment, this many parent links from the running environment
+    /// (Decision 21's static globals, `Chunk::jit_name_global`).
+    Global(u16),
+}
+
+/// x9 = the scope a [`NameBase`] names.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_name_base(a: &mut asm::Asm, layout: &crate::value::JitLayout, base: NameBase) {
+    match base {
+        NameBase::Pinned(env) => a.mov_imm64(9, env),
+        NameBase::Global(hops) => {
+            a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+            for _ in 0..hops {
+                a.ldr_imm(9, 9, layout.scope_parent as u32);
+            }
+        }
+    }
+}
+
+/// `Op::LoadNameIn` / `Op::LoadNameForCallIn`, and a static global's `LoadName` /
+/// `LoadNameForCall`: [`emit_load_name_inline`] resolving from the scope `base` names. Emitted at
+/// each site (in the chunk's shared fixed-environment name stub unless stubs are inlined).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -12800,7 +12832,7 @@ fn emit_load_name_in_inline(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     cache_ptr: usize,
-    env: u64,
+    base: NameBase,
     pc: u32,
     l_unwind: usize,
     for_call: bool,
@@ -12808,7 +12840,7 @@ fn emit_load_name_in_inline(
     let slow = a.new_label();
     let done = a.new_label();
     a.mov_imm64(12, cache_ptr as u64);
-    a.mov_imm64(9, env);
+    emit_name_base(a, layout, base);
     if use_shared_stub(a) {
         let stub = a.shared_stub(SharedStub::NameValuePtrIn.key());
         a.bl_label(stub);
@@ -13863,6 +13895,35 @@ fn emit_name_ic_value_ptr(
         a.cbz(9, false, slow);
     } else {
         emit_name_ic_value_ptr_body(a, layout, slow, property_ok);
+    }
+}
+
+/// [`emit_name_ic_value_ptr`] (`property_ok`) for a chain's or a loop preamble's read, from the
+/// realm's global environment for a static global (`global`: its records from the running
+/// environment, Decision 21), as `Op::LoadNameIn` validates from its pinned scope.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_name_ic_value_ptr_from(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    cache_ptr: usize,
+    global: Option<u16>,
+    slow: usize,
+) {
+    let Some(hops) = global else {
+        emit_name_ic_value_ptr(a, layout, cache_ptr, slow, true);
+        return;
+    };
+    a.mov_imm64(12, cache_ptr as u64);
+    emit_name_base(a, layout, NameBase::Global(hops));
+    if use_shared_stub(a) {
+        let stub = a.shared_stub(SharedStub::NameValuePtrIn.key());
+        a.bl_label(stub);
+        a.cbz(9, false, slow);
+    } else {
+        emit_name_ic_value_ptr_in(a, layout, slow, true, NameEnv::InX9);
     }
 }
 
@@ -15572,8 +15633,10 @@ enum ChainOp {
     Dup,
     /// A proven no-op: numeric ToPropKeyLocal, or an unused read guarded by the loop preamble.
     KeyNop,
-    /// Cached free-name read that must currently hold a Num (the `NameIc` cell address).
-    LoadName(usize),
+    /// Cached free-name read that must currently hold a Num (the `NameIc` cell address), and,
+    /// for a static global (Decision 21), the records from the running environment to the
+    /// realm's global environment, whose search the cache then describes.
+    LoadName(usize, Option<u16>),
     /// A free-name read at a static address (Decision 21) that must hold a Num; straight-line
     /// chains only (loop preambles pin names by their caches).
     StaticName(crate::bytecode::StaticName),
@@ -15767,7 +15830,14 @@ fn build_chain(
             Op::ToPropKeyLocal(_) if vdepth >= 1 => (ChainOp::KeyNop, 0, 0),
             Op::LoadName(_, c) if name_ok => match operations::static_name(layout, chunk, *c) {
                 Some(address) => (ChainOp::StaticName(address), 1, 0),
-                None => (ChainOp::LoadName(chunk.jit_name_cache_ptr(*c)), 1, 0),
+                None => (
+                    ChainOp::LoadName(
+                        chunk.jit_name_cache_ptr(*c),
+                        operations::static_global(layout, chunk, *c),
+                    ),
+                    1,
+                    0,
+                ),
             },
             Op::GetPropThis(_, c) if prop_ok => {
                 let Some(st) = chunk.jit_cache_preferred(*c) else {
@@ -15867,7 +15937,7 @@ fn build_chain(
         Some((
             ChainOp::ConstNum(_)
                 | ChainOp::Load(_)
-                | ChainOp::LoadName(_)
+                | ChainOp::LoadName(..)
                 | ChainOp::StaticName(_)
                 | ChainOp::LoadProp(..),
             _
@@ -15887,7 +15957,7 @@ fn build_chain(
             let (pops, pushes): (usize, usize) = match op {
                 ChainOp::ConstNum(_)
                 | ChainOp::Load(_)
-                | ChainOp::LoadName(_)
+                | ChainOp::LoadName(..)
                 | ChainOp::StaticName(_)
                 | ChainOp::LoadProp(..) => (0, 1),
                 ChainOp::StoreProp(..) => (1, 0),
@@ -15919,7 +15989,7 @@ fn build_chain(
                     chain[idx].0,
                     ChainOp::ConstNum(_)
                         | ChainOp::Load(_)
-                        | ChainOp::LoadName(_)
+                        | ChainOp::LoadName(..)
                         | ChainOp::StaticName(_)
                         | ChainOp::LoadProp(..)
                 )
@@ -15985,7 +16055,7 @@ fn build_chain(
                 | crate::bytecode::Op::EqEq
                 | crate::bytecode::Op::NotEq => chain
                     .iter()
-                    .any(|(op, _)| matches!(op, ChainOp::LoadName(_) | ChainOp::StaticName(_))),
+                    .any(|(op, _)| matches!(op, ChainOp::LoadName(..) | ChainOp::StaticName(_))),
                 _ => false,
             },
             _ => false,
@@ -16934,11 +17004,11 @@ fn emit_chain_marked(
                 vregs.push((rd, iv));
             }
             ChainOp::KeyNop => {}
-            ChainOp::LoadName(cache_ptr) => {
+            ChainOp::LoadName(cache_ptr, global) => {
                 // The validator clobbers x7 and x9-x17. Receiver-cache allocation excludes
                 // x7, so cached receiver registers survive the semantic owner result.
                 // Shared cache validation leaves x14 pointing to the live execution word.
-                emit_name_ic_value_ptr(a, layout, cache_ptr, guard!(), true);
+                emit_name_ic_value_ptr_from(a, layout, cache_ptr, global, guard!());
                 let rd = free.pop().expect("chain reg underflow");
                 a.ldur(9, 14, 0);
                 emit_exec_number_guard(a, 9, rd, 10, guard!());
@@ -17137,6 +17207,8 @@ struct LoopPlan {
 struct NamePlan {
     /// The `NameIc` cell address (`Chunk::jit_name_cache_ptr`).
     ptr: usize,
+    /// A static global's records from the running environment (`ChainOp::LoadName`).
+    global: Option<u16>,
     /// f64 home in a d-register (allocated from the same d8..d15 bank as `SlotRes::F`).
     dreg: u32,
     /// Preamble adds the one-time exact-int proof (the name feeds a key or bit op).
@@ -17306,9 +17378,14 @@ fn plan_loop(
             Op::Pop if vdepth >= 1 => (ChainOp::Pop, 0, 1),
             Op::Dup if vdepth >= 1 => (ChainOp::Dup, 1, 0),
             Op::ToPropKeyLocal(_) if vdepth >= 1 => (ChainOp::KeyNop, 0, 0),
-            Op::LoadName(_, c) if name_ok => {
-                (ChainOp::LoadName(chunk.jit_name_cache_ptr(*c)), 1, 0)
-            }
+            Op::LoadName(_, c) if name_ok => (
+                ChainOp::LoadName(
+                    chunk.jit_name_cache_ptr(*c),
+                    operations::static_global(layout, chunk, *c),
+                ),
+                1,
+                0,
+            ),
             Op::Lt
             | Op::Gt
             | Op::Le
@@ -17375,6 +17452,8 @@ fn plan_loop(
     // of one cache ptr is the same node.
     let mut name_src: crate::fasthash::FastMap<usize, usize> = Default::default();
     let mut names_order: Vec<usize> = Vec::new();
+    // Each name's static global records, as the preamble searches it.
+    let mut name_globals: crate::fasthash::FastMap<usize, Option<u16>> = Default::default();
     let mut stack: Vec<usize> = Vec::new();
     let mut elem_nodes: Vec<usize> = Vec::new(); // GetElem chain indices
     let mut receivers: Vec<u32> = Vec::new();
@@ -17490,10 +17569,11 @@ fn plan_loop(
                 consumers[a_].push(Use::Cmp);
                 consumers[b].push(Use::Cmp);
             }
-            ChainOp::LoadName(ptr) => {
+            ChainOp::LoadName(ptr, global) => {
                 let node = *name_src.entry(ptr).or_insert(idx);
                 if !names_order.contains(&ptr) {
                     names_order.push(ptr);
+                    name_globals.insert(ptr, global);
                 }
                 stack.push(node);
             }
@@ -17592,7 +17672,7 @@ fn plan_loop(
         let mut src2: crate::fasthash::FastMap<u32, usize> = Default::default();
         for (idx, (cop, _)) in chain.iter().enumerate() {
             let (pops, pushes): (usize, usize) = match *cop {
-                ChainOp::ConstNum(_) | ChainOp::LoadName(_) => (0, 1),
+                ChainOp::ConstNum(_) | ChainOp::LoadName(..) => (0, 1),
                 ChainOp::Load(_) => (0, 1),
                 ChainOp::Update(_, k) => (
                     0,
@@ -18048,7 +18128,7 @@ fn plan_loop(
                         pop!();
                         pop!();
                     }
-                    ChainOp::LoadName(ptr) => {
+                    ChainOp::LoadName(ptr, _) => {
                         let inf = if int_checked_names.contains(&ptr) {
                             NumInfo {
                                 integral: true,
@@ -18191,6 +18271,7 @@ fn plan_loop(
             next_d += 1;
             NamePlan {
                 ptr,
+                global: name_globals.get(&ptr).copied().flatten(),
                 dreg,
                 int_checked: int_checked_names.contains(&ptr),
             }
@@ -18627,7 +18708,7 @@ fn emit_loop_chain(
     // Binding/Property owner result in addition to x9-x17. Large regions can legitimately assign
     // a resident local to x7, so reversing this order would silently overwrite that local.
     for np in &plan.names {
-        emit_name_ic_value_ptr(a, layout, np.ptr, pre_fail, true);
+        emit_name_ic_value_ptr_from(a, layout, np.ptr, np.global, pre_fail);
         a.ldur(9, 14, 0);
         emit_exec_number_guard(a, 9, np.dreg, 10, pre_fail);
         if np.int_checked {
@@ -19526,7 +19607,7 @@ fn emit_loop_chain(
                             }
                         }
                     }
-                    ChainOp::LoadName(ptr) => {
+                    ChainOp::LoadName(ptr, _) => {
                         // Preamble-pinned, never written in-region: a zero-copy alias.
                         let np = plan
                             .names

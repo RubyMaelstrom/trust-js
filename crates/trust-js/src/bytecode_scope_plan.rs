@@ -105,6 +105,9 @@ pub(crate) struct OuterContext {
     /// Why the context ends after `records` without a parent, when a plan found a barrier
     /// there (for `TRUST_JS_SCOPE_LOG`).
     stop: Option<&'static str>,
+    /// The context ends at the realm's global environment: a Script's own inner functions'
+    /// contexts end in one (`plan_script`), and theirs inherit it.
+    global: bool,
 }
 
 /// A name's static address from a function's [[Environment]]: `hops` parent links, then `slot`.
@@ -135,6 +138,28 @@ impl OuterContext {
             context = current.parent.as_deref();
         }
         None
+    }
+
+    /// The number of records from the function's [[Environment]] to the realm's global
+    /// environment, when `name` is bound in none of them and they are all planned: the name is
+    /// the global environment's, which a read can then search directly (as V8's LdaGlobal,
+    /// SpiderMonkey's GetGName and JSC's global resolve types do).
+    pub(crate) fn resolve_global(&self, name: &str) -> Option<u16> {
+        if self.resolve(name).is_some() {
+            return None;
+        }
+        let mut hops = 0usize;
+        let mut context = self;
+        loop {
+            hops += context.records.len();
+            match context.parent.as_deref() {
+                Some(parent) => context = parent,
+                None => break,
+            }
+        }
+        (context.global && context.stop.is_none())
+            .then(|| u16::try_from(hops).ok())
+            .flatten()
     }
 
     /// Where a resolution of a name it does not bind stops (for `TRUST_JS_SCOPE_LOG`).
@@ -378,8 +403,36 @@ fn record_children(
             records,
             parent,
             stop,
+            global: false,
         }));
     }
+}
+
+/// Decision 21: a Script's own inner functions get outer contexts that end at the realm's
+/// global environment, in which ScriptEvaluation runs the body (spec.html, ScriptEvaluation and
+/// GlobalDeclarationInstantiation): a name that no planned record on the way binds is the
+/// global environment's (`OuterContext::resolve_global`). The usual barriers apply (blocks
+/// with lexicals, `with`, classes, ...); a direct eval in the Script can only add global
+/// bindings, which the global environment's search finds. Called once per Script, before its
+/// body runs; the contexts are syntactic, shared by every realm that runs the Script.
+pub(crate) fn plan_script(body: &[Stmt], strict: bool) {
+    if !scope_plans_enabled() {
+        return;
+    }
+    let script = crate::bytecode::script_function(body, strict);
+    let mut scan = CaptureScan::new(&script, true);
+    scan.children = Some(Vec::new());
+    scan.shallow_children = true;
+    let Some((.., scan)) = CaptureScan::run_scan(scan, &script) else {
+        return;
+    };
+    let _ = script.scopes.outer.set(Rc::new(OuterContext {
+        records: Vec::new(),
+        parent: None,
+        stop: None,
+        global: true,
+    }));
+    record_children(&script, &scan, None, None);
 }
 
 /// `TRUST_JS_SCOPE_PLANS=0` turns Decision 21's plans off: every function is opaque.

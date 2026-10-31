@@ -413,3 +413,78 @@ fn a_compiled_class_closes_over_its_frame_past_the_slot_projection() {
         "s0:function,s00,function2,false|s29:function,s2929,function3,true",
     );
 }
+
+#[test]
+fn names_no_planned_record_binds_are_read_from_the_global_environment() {
+    // A Script's own inner functions' contexts end at the realm's global environment: their
+    // reads of script-level vars, lets, consts and functions, of global properties (a getter's
+    // among them, and one a direct eval added) and of globals made or deleted later search it
+    // directly, in loops and numeric chains too; a dead-zone read throws, and a function made
+    // inside a script-level `with` still sees the object's binding.
+    check(
+        r#"
+        var gv = 'v';
+        let gl = 'l';
+        const gc = 3;
+        function gf() { return 'f'; }
+        Object.defineProperty(globalThis, 'getter', { get() { return 'g' + gc; }, configurable: true });
+        var N = 50, scale = 2;
+        var obj = { shadow: 'with-object' };
+        var shadow = 'global-shadow';
+        with (obj) { var fromWith = function () { return function () { return shadow; }; }; }
+        eval('var added = "eval-added"');
+        function make(k) {
+            var mine = k;
+            return function () {
+                var t = 0;
+                for (var j = 0; j < N; j++) t += j * scale;
+                return [gv, gl, gc, gf(), getter, typeof Math, mine, t, fromWith()(), added].join(',');
+            };
+        }
+        var out = [];
+        for (var i = 0; i < 30; i++) out.push(make(i)());
+        globalThis.lateGlobal = 'late';
+        var late = (function () { return function () { return lateGlobal; }; })();
+        out.push(late());
+        delete globalThis.lateGlobal;
+        try { out.push(late()); } catch (e) { out.push(e.name); }
+        let early = (function () { try { return (function () { return later; })(); } catch (e) { return e.name; } })();
+        let later = 1;
+        out.push(early);
+        out[0] + '|' + out[29] + '|' + out.slice(30).join(',');
+        "#,
+        "v,l,3,f,g3,object,0,2450,with-object,eval-added|v,l,3,f,g3,object,29,2450,with-object,\
+         eval-added|late,ReferenceError,ReferenceError",
+    );
+}
+
+#[test]
+fn a_later_scripts_lexical_shadows_a_global_property_for_global_reads() {
+    // GlobalDeclarationInstantiation lets a later Script declare `let x` over a configurable
+    // global property `x`; reads compiled before it then find the lexical binding (Node v24.22.0,
+    // two `vm.runInThisContext` scripts).
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            let mut eval = |source: &str| match engine.eval(source, false).expect("parses") {
+                Completion::Value(value) => value,
+                Completion::Throw { name, message } => format!("throw {name}: {message}"),
+            };
+            let before = eval(
+                "globalThis.x = 'property'; function read() { return (function () { return x; })(); } \
+                 var before = []; for (var i = 0; i < 20; i++) before.push(read()); before[0] + before[19];",
+            );
+            let after = eval(
+                "let x = 'lexical'; var after = []; for (var i = 0; i < 20; i++) after.push(read()); \
+                 after[0] + after[19] + ':' + globalThis.x;",
+            );
+            assert_eq!(
+                before + "|" + &after,
+                "propertyproperty|lexicallexical:property",
+                "{tier:?}/{threshold}"
+            );
+        }
+    }
+}

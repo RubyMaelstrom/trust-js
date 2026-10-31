@@ -193,6 +193,23 @@ pub(super) fn emit(
                 unwind,
             );
         }
+        Op::LoadName(_, cache) | Op::LoadNameForCall(_, cache)
+            if fast & 8192 != 0
+                && load_name_inlinable(layout)
+                && static_global(layout, chunk, *cache).is_some() =>
+        {
+            // Searched from the realm's global environment, `hops` records up.
+            let hops = static_global(layout, chunk, *cache).expect("guarded");
+            emit_load_name_in_inline(
+                a,
+                layout,
+                chunk.jit_name_cache_ptr(*cache),
+                NameBase::Global(hops),
+                pc as u32,
+                unwind,
+                matches!(op, Op::LoadNameForCall(..)),
+            );
+        }
         Op::LoadName(_, cache) if fast & 8192 != 0 && load_name_inlinable(layout) => {
             emit_load_name_inline(
                 a,
@@ -215,7 +232,7 @@ pub(super) fn emit(
                 a,
                 layout,
                 chunk.jit_name_cache_ptr(*cache),
-                crate::interpreter::Env::as_ptr(&env) as u64,
+                NameBase::Pinned(crate::interpreter::Env::as_ptr(&env) as u64),
                 pc as u32,
                 unwind,
                 matches!(op, Op::LoadNameForCallIn(..)),
@@ -1025,6 +1042,21 @@ pub(super) fn static_name(
         && layout.scope_parent.is_multiple_of(8)
         && layout.scope_parent / 8 < 4096)
         .then(|| chunk.jit_name_static(cache))
+        .flatten()
+}
+
+/// The records from the running environment to the realm's global environment for the
+/// free-name read at name cache `cache` (Decision 21, `Chunk::jit_name_global`), when the record
+/// layout lets generated code walk to it.
+pub(super) fn static_global(
+    layout: &crate::value::JitLayout,
+    chunk: &Chunk,
+    cache: u32,
+) -> Option<u16> {
+    (layout.scope_parent_valid
+        && layout.scope_parent.is_multiple_of(8)
+        && layout.scope_parent / 8 < 4096)
+        .then(|| chunk.jit_name_global(cache))
         .flatten()
 }
 

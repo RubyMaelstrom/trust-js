@@ -18335,6 +18335,8 @@ impl Interp {
         drop(hoist_ops);
         // Top-level `let`/`const` are pre-declared in their temporal dead zone.
         self.declare_block_lexicals(body, &self.global_env.clone(), false);
+        // Decision 21: the Script's own inner functions' contexts end at this global environment.
+        crate::bytecode::scope_plan::plan_script(body, self.strict);
         let env = self.global_env;
         // Cold Script bodies retain the cheap reference path, including short/zero loops.
         // Settled hot AST loop backedges admit a borrowed fragment, then that exact VM frame

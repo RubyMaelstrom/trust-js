@@ -2972,6 +2972,10 @@ pub struct Chunk {
     name_num_valid: Vec<std::cell::Cell<bool>>,
     /// Decision 21: by name cache, a free-name read's static address (see `StaticName`).
     name_statics: Box<[Option<StaticName>]>,
+    /// Decision 21: by name cache, the records from the running environment to the realm's
+    /// global environment, when the free name is the global environment's (no planned record
+    /// on the way binds it): its read searches that environment directly.
+    name_globals: Box<[Option<u16>]>,
     /// Records from the running environment where the body starts to the function's
     /// [[Environment]], when any read has a static address (which counts them).
     static_entry_depth: Option<u16>,
@@ -3135,6 +3139,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             name_num_bits: _,
             name_num_valid: _,
             name_statics: _,
+            name_globals: _,
             static_entry_depth: _,
             cap_caches: _,
             cap_pins: _,
@@ -4120,6 +4125,10 @@ struct CaptureScan {
     home_member: bool,
     /// The next inner function is a constructor, method or accessor of the innermost class.
     class_member: bool,
+    /// Record the inner functions met directly and their barriers without walking their bodies
+    /// (`scope_plan::plan_script`: a Script's names are the global environment's, so its plan
+    /// needs no captures).
+    pub(crate) shallow_children: bool,
 }
 
 /// The records an inner function's closure is made under, inside the scope it was met in
@@ -4451,6 +4460,7 @@ impl CaptureScan {
             record_depth: 0,
             home_member: false,
             class_member: false,
+            shallow_children: false,
         }
     }
 
@@ -5150,6 +5160,9 @@ impl CaptureScan {
 
     /// Enter an inner function (declaration, expression, method, accessor…).
     fn inner_fn(&mut self, f: &Function) -> Option<()> {
+        if self.shallow_children && self.fn_depth == 0 {
+            return self.walk_inner_fn(f);
+        }
         // A function whose body is still encoded in a static snapshot is summarized instead of
         // walked (see `CaptureSummary`); the self-binding query keeps its budgeted walk.
         if self.watched_name.is_none() && !capture_summary_tests::walking() {
@@ -5199,6 +5212,9 @@ impl CaptureScan {
             };
             if let Some(children) = &mut self.children {
                 children.push((std::ptr::from_ref(f), barrier, records));
+            }
+            if self.shallow_children {
+                return Some(());
             }
         }
         self.fn_depth += 1;
@@ -7297,7 +7313,18 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
 /// returns the StatementList completion. The temporary AST container is analysis-only: no
 /// function object, parameters, arguments object, or FunctionDeclarationInstantiation is made.
 pub(crate) fn compile_script(body: &[Stmt], strict: bool) -> Option<Rc<Chunk>> {
-    let source = Function {
+    let source = script_function(body, strict);
+    let started = crate::jit::perf_stage_start();
+    let result = compile_inner(&source, &Default::default(), None, None, false, false, true);
+    crate::jit::perf_bytecode_compile_end(started, result.is_some());
+    result
+}
+
+/// The temporary function node a Script's body is analyzed and compiled as: no parameters, and
+/// arrow-like, so that no analysis invents an `arguments` binding or an Annex B parameter
+/// blocker.
+pub(crate) fn script_function(body: &[Stmt], strict: bool) -> Function {
+    Function {
         name: None,
         params: Vec::new(),
         body: body.to_vec().into(),
@@ -7321,11 +7348,7 @@ pub(crate) fn compile_script(body: &[Stmt], strict: bool) -> Option<Rc<Chunk>> {
 
         env_layouts: std::cell::OnceCell::new(),
         scopes: Default::default(),
-    };
-    let started = crate::jit::perf_stage_start();
-    let result = compile_inner(&source, &Default::default(), None, None, false, false, true);
-    crate::jit::perf_bytecode_compile_end(started, result.is_some());
-    result
+    }
 }
 
 #[cfg(test)]
@@ -8461,12 +8484,11 @@ fn finish_chunk(
         resolution_caches: std::cell::OnceCell::new(),
         name_num_bits: c.name_num_bits,
         name_num_valid: c.name_num_valid,
-        static_entry_depth: c
-            .name_statics
-            .iter()
-            .any(Option::is_some)
-            .then_some(c.static_entry_depth),
+        static_entry_depth: (c.name_statics.iter().any(Option::is_some)
+            || c.name_globals.iter().any(Option::is_some))
+        .then_some(c.static_entry_depth),
         name_statics: c.name_statics.into_boxed_slice(),
+        name_globals: c.name_globals.into_boxed_slice(),
         cap_caches: vec![std::cell::Cell::new(NameIc::EMPTY); cap_cache_len],
         cap_pins: std::cell::RefCell::new(vec![None; cap_cache_len]),
         initializer_plan: std::cell::OnceCell::new(),
@@ -9262,6 +9284,8 @@ struct Compiler {
     name_num_valid: Vec<std::cell::Cell<bool>>,
     /// Decision 21: by name cache, a free-name read's static address (see `StaticName`).
     name_statics: Vec<Option<StaticName>>,
+    /// By name cache, the records to the realm's global environment ([`Chunk::name_globals`]).
+    name_globals: Vec<Option<u16>>,
     /// The planned records around the compiled function (`Function::outer_context`), when its
     /// free names may resolve statically: it has no direct eval, and its entry environment's
     /// records are known (`static_entry_depth`).
@@ -10171,6 +10195,7 @@ impl Compiler {
         self.name_num_valid
             .push(std::cell::Cell::new(number.is_some()));
         self.name_statics.push(None);
+        self.name_globals.push(None);
         (self.name_caches.len() - 1) as u32
     }
 
@@ -10223,9 +10248,43 @@ impl Compiler {
 
     /// Give the read at name cache `cache` of the free name `name` its static address, if it
     /// has one ([`Compiler::static_name`]).
+    /// Decision 21: the records from the running environment to the realm's global environment,
+    /// when the free name `name` is that environment's: no planned record on the way binds it,
+    /// and they end there (`OuterContext::resolve_global`). The read then searches the global
+    /// environment directly, as V8's LdaGlobal, SpiderMonkey's GetGName and JSC's global
+    /// resolve types do, instead of walking the records with a cache of each.
+    fn static_global(&self, name: &str) -> Option<u16> {
+        if self.static_blocked > 0 || !self.with_scope_floors.is_empty() || self.inline_depth > 0 {
+            return None;
+        }
+        // A frame over a record the tree-walker made (a prepared entry, a mapped activation, a
+        // loop fragment) reads some of the function's own bindings by name, `arguments` among
+        // them, which the compiler does not track: its names keep the caches. A fresh frame
+        // gives every own binding a home; `arguments` is never a global name here either.
+        if self.reuse_activation || self.fragment_entry || name == "arguments" {
+            return None;
+        }
+        if self
+            .lexical_env_names
+            .iter()
+            .any(|scope| scope.contains_key(name))
+        {
+            return None;
+        }
+        let hops = self.outer_context.as_ref()?.resolve_global(name)?;
+        self.static_entry_depth
+            .checked_add(self.runtime_depth)?
+            .checked_add(hops)
+    }
+
     fn note_static_name(&mut self, cache: u32, name: &str) {
         let address = self.static_name(name);
         self.name_statics[cache as usize] = address;
+        // A lexical `this` is a binding of a function's record, never the global environment's.
+        let global = (address.is_none() && name != "this")
+            .then(|| self.static_global(name))
+            .flatten();
+        self.name_globals[cache as usize] = global;
         if scope_log_enabled() {
             let outer = if self.inline_depth > 0 {
                 self.inline_outer
@@ -10236,6 +10295,9 @@ impl Compiler {
             };
             let result = match (address, outer) {
                 (Some(address), _) => format!("static hops={} slot={}", address.hops, address.slot),
+                (None, _) if global.is_some() => {
+                    format!("global hops={}", global.expect("checked"))
+                }
                 (None, Some(outer)) => format!("dynamic: {}", outer.stop()),
                 (None, None) if self.inline_depth > 0 => "dynamic: splice".to_string(),
                 (None, None) => format!("dynamic: {}", self.static_off),
@@ -10371,6 +10433,7 @@ impl Compiler {
             self.name_num_bits.truncate(snap.4);
             self.name_num_valid.truncate(snap.4);
             self.name_statics.truncate(snap.4);
+            self.name_globals.truncate(snap.4);
             self.call_caches.truncate(snap.5);
             self.inline_targets.truncate(snap.6);
             self.slot_names.truncate(snap.7);
@@ -17632,7 +17695,7 @@ fn run_vm_inner(
                 }
                 let v = match chunk.static_name_value(i, env, n, c) {
                     Some(v) => v,
-                    None => chunk.load_name_ic(i, env, n, c)?,
+                    None => chunk.load_name_ic(i, &chunk.name_search_env(env, c), n, c)?,
                 };
                 stack.push(v);
             }
@@ -18650,10 +18713,11 @@ fn run_vm_inner(
                 // A depth-0 cache hit/fill can't have come through a `with` object: `this` is
                 // undefined. Only the full walk can produce a with-object receiver; nor can a
                 // static address (no `with` lies on its path).
+                let base = chunk.name_search_env(env, c);
                 if let Some(v) = chunk
                     .static_name_value(i, env, n, c)
-                    .or_else(|| chunk.name_ic_hit(i, env, c))
-                    .or_else(|| chunk.name_ic_fill(i, env, n, c, false))
+                    .or_else(|| chunk.name_ic_hit(i, &base, c))
+                    .or_else(|| chunk.name_ic_fill(i, &base, n, c, false))
                 {
                     stack.push(Value::Undefined);
                     stack.push(v);
@@ -21334,6 +21398,37 @@ impl Chunk {
     /// one (see `StaticName`).
     pub(crate) fn jit_name_static(&self, cache: u32) -> Option<StaticName> {
         self.name_statics.get(cache as usize).copied().flatten()
+    }
+
+    /// Decision 21: the records from the running environment to the realm's global environment
+    /// for the free-name read at name cache `cache`, when its name is that environment's (see
+    /// `Chunk::name_globals`).
+    pub(crate) fn jit_name_global(&self, cache: u32) -> Option<u16> {
+        self.name_globals.get(cache as usize).copied().flatten()
+    }
+
+    /// The realm's global environment for the read at name cache `c` (`jit_name_global`), found
+    /// `hops` parent links from the running environment `env`.
+    #[inline]
+    pub(crate) fn static_global_env(&self, env: &Env, c: u32) -> Option<Env> {
+        let hops = self.jit_name_global(c)?;
+        let mut record = *env;
+        for _ in 0..hops {
+            let parent = record.borrow().parent;
+            record = parent.expect("a planned record has its static parents");
+        }
+        debug_assert!(
+            record.borrow().parent.is_none(),
+            "a static global read reaches the global environment"
+        );
+        Some(record)
+    }
+
+    /// The environment the free-name read at name cache `c` searches from the running
+    /// environment `env`: the realm's global one for a static global (`jit_name_global`).
+    #[inline]
+    pub(crate) fn name_search_env(&self, env: &Env, c: u32) -> Env {
+        self.static_global_env(env, c).unwrap_or(*env)
     }
 
     /// Decision 21: the value of the free-name read at name cache `c` (of the name `n`), found at
@@ -26942,7 +27037,7 @@ unsafe fn jit_exec_inner(
         Op::LoadName(n, c) => {
             let v = match chunk.static_name_value(i, env, n, c) {
                 Some(v) => v,
-                None => chunk.load_name_ic(i, env, n, c)?,
+                None => chunk.load_name_ic(i, &chunk.name_search_env(env, c), n, c)?,
             };
             push!(v);
         }
@@ -27588,10 +27683,11 @@ unsafe fn jit_exec_inner(
         }
         Op::LoadNameForCall(n, c) => {
             // A depth-0 cache hit/fill can't have come through a `with` object (see the VM arm).
+            let base = chunk.name_search_env(env, c);
             if let Some(v) = chunk
                 .static_name_value(i, env, n, c)
-                .or_else(|| chunk.name_ic_hit(i, env, c))
-                .or_else(|| chunk.name_ic_fill(i, env, n, c, false))
+                .or_else(|| chunk.name_ic_hit(i, &base, c))
+                .or_else(|| chunk.name_ic_fill(i, &base, n, c, false))
             {
                 push!(Value::Undefined);
                 push!(v);

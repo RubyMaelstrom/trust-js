@@ -207,8 +207,10 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     );
 }
 
-/// Same result as deep_target, accepting the own/fixed/depth-one/global compact IC ABI.
-fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
+/// Same result as deep_target, accepting the own/fixed/depth-one/global compact IC ABI. The
+/// search starts `hops` records up from the running environment: at the realm's global
+/// environment for a static global (Decision 21, `Chunk::jit_name_global`), else at 0.
+fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, hops: u16, slow: usize) {
     use crate::bytecode::{
         FIXED_NAME_IC, NAME_IC_OFF_ACT_GEN, NAME_IC_OFF_BINDING, NAME_IC_OFF_ENV, NAME_IC_OFF_GEN,
         NAME_IC_OFF_LAYOUT,
@@ -223,6 +225,9 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     let done = a.label();
     a.nr_imm(R8, cache as u64);
     a.nr_load(R9, CTX, offset_of!(super::super::JitCtx, env_raw));
+    for _ in 0..hops {
+        a.nr_load(R9, R9, l.scope_parent);
+    }
     scope_plain(a, l, slow);
     a.nr_load(R10, R8, NAME_IC_OFF_ENV as usize);
     a.nr_op_imm(7, R10, DEEP_NAME_IC as i32);
@@ -733,6 +738,13 @@ pub(super) fn emit_op(
         op,
         Op::ResolveNameRef(..) | Op::LoadRef(_) | Op::StoreRef(_)
     );
+    // A static global's search starts at the realm's global environment (Decision 21).
+    let hops = match *op {
+        Op::LoadName(_, cache) | Op::LoadNameForCall(_, cache) if l.scope_parent_valid => {
+            chunk.jit_name_global(cache).unwrap_or(0)
+        }
+        _ => 0,
+    };
     let (cache, for_call, store) = match *op {
         Op::LoadName(_, cache) | Op::LoadNameForCall(_, cache) => (
             Some(chunk.jit_name_cache_ptr(cache)),
@@ -757,7 +769,7 @@ pub(super) fn emit_op(
             Op::ResolveNameRef(name, slot) => capture(a, l, il, chunk, name, slot, slow),
             _ => {
                 if let Some(cache) = cache {
-                    name_target(a, l, cache, slow);
+                    name_target(a, l, cache, hops, slow);
                 } else {
                     let slot = match *op {
                         Op::LoadRef(slot) | Op::StoreRef(slot) => slot,
