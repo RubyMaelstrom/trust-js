@@ -607,7 +607,9 @@ fn compile_with_private(
 }
 
 impl Compiler {
-    pub(super) fn fragment_using_for(
+    /// A `for (using …; …)` loop whose head bindings live in a record of the loop's own: a
+    /// fragment's (the tree-walker made the record) or one whose binding a closure captures.
+    pub(super) fn record_using_for(
         &mut self,
         labels: Vec<String>,
         kind: DeclKind,

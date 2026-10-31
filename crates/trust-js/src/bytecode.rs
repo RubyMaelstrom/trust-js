@@ -4915,7 +4915,7 @@ impl CaptureScan {
             } => {
                 let mut names = crate::fasthash::FastSet::default();
                 if let Some(ForInit::VarDecl {
-                    kind: DeclKind::Let | DeclKind::Const,
+                    kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
                     decls,
                 }) = init.as_deref()
                 {
@@ -4924,7 +4924,7 @@ impl CaptureScan {
                     }
                 }
                 // The head scope itself counts as in-loop: its lexicals are per-iteration
-                // fresh, never once-per-call.
+                // fresh (a `using` head's, per loop), never once-per-call.
                 self.loop_depth += 1;
                 self.push_scope_lets(names, Default::default(), true);
                 let r = (|| {
@@ -13976,13 +13976,22 @@ impl Compiler {
         // Claim any labels from an enclosing `Stmt::Labeled` before the head runs, so they land on
         // this loop's context (the head itself introduces no labelled break/continue targets).
         let labels = std::mem::take(&mut self.pending_labels);
-        if self.fragment_entry {
-            if let Some(ForInit::VarDecl {
-                kind: kind @ (DeclKind::Using | DeclKind::AwaitUsing),
-                decls,
-            }) = init
-            {
-                return self.fragment_using_for(labels, *kind, decls, test, update, body);
+        if let Some(ForInit::VarDecl {
+            kind: kind @ (DeclKind::Using | DeclKind::AwaitUsing),
+            decls,
+        }) = init
+        {
+            // A head binding that a closure captures lives in the loop's record, as every
+            // binding of a fragment's head does (the tree-walker made that record).
+            let captured = decls.iter().any(|(pattern, _)| {
+                let mut names = crate::fasthash::FastSet::default();
+                pat_idents(pattern, &mut names);
+                names
+                    .iter()
+                    .any(|name| self.runtime_lexicals.contains(name))
+            });
+            if self.fragment_entry || captured {
+                return self.record_using_for(labels, *kind, decls, test, update, body);
             }
         }
         let mut runtime_bindings = Vec::new();

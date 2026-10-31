@@ -210,6 +210,30 @@ fn closures_in_compiled_coroutines_read_their_own_and_outer_names() {
 }
 
 #[test]
+fn closures_in_a_using_head_loop_read_its_binding() {
+    // ForLoopEvaluation (spec.html:22617, e28783d5) binds a `using` head in the loop's own
+    // record, which the closures made in the loop capture; the head's resource is disposed once,
+    // after the loop. (Node v24.22.0 disposes it 4 times here.)
+    check(
+        r#"
+        var x = 'global';
+        function f(n) {
+            var y = 'y' + n, disposed = 0;
+            var fns = [];
+            for (using x = { v: 'head' + n, [Symbol.dispose]() { disposed++; } }; fns.length < 2; ) {
+                fns.push(() => x.v + y);
+            }
+            return fns.map((g) => g()).join(',') + ':' + disposed;
+        }
+        var out = [];
+        for (var i = 0; i < 20; i++) out.push(f(i));
+        out[0] + '|' + out[19];
+        "#,
+        "head0y0,head0y0:1|head19y19,head19y19:1",
+    );
+}
+
+#[test]
 fn generators_and_derived_constructors_keep_their_own_records() {
     check(
         r#"
