@@ -3907,6 +3907,16 @@ globals in a loop and a chain; a later Script's `let` over a global property), t
 script, realm, ShadowRealm, arguments, entry and earlier filters; fmt, clippy in three
 configurations; zombie's x86-64 clippy and 495 targeted tests.
 
+Tried and parked (branch p2-w3-large, 432e48df): large activations. A plan counting more than
+506 bindings stays public, its activation marked spillable in its children's contexts, and their
+static reads find its slots through the record's spill capacity (SpiderMonkey's coordinates
+address a CallObject's dynamic slots so): chai's 756 read sites in lodash's `runInContext`
+become static, and the tests pass on both architectures, but nothing measurable changes (chai
++0.15% in one run, its name resolution 2.32% to 2.41% sampled; the fixtures +0.02-0.03%, Vue's
+uniform across nursery sizes). After the static globals and W3 item 7's megamorphic sites,
+chai's name resolution is 2.32% (from 4.60% at the class step), deep-chain stubs 0.02%: those
+reads were not hot. Not landed.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
