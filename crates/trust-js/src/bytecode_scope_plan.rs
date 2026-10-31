@@ -17,7 +17,8 @@
 //!   takes the nearest record that is not private as its [[Environment]] (`closure_env`), as if
 //!   the record did not exist.
 //! - [`PlanKind::Opaque`]: anything else (a direct eval or `with` anywhere inside, parameter
-//!   expressions, an arrow reading `new.target`, a derived constructor, ...): the records stay
+//!   expressions, an arrow reading `new.target`, a derived constructor, a generator or async
+//!   function, whose compiled body makes a second activation, ...): the records stay
 //!   as each tier makes them, and no static address crosses the function's scope.
 //!
 //! Each function's [`OuterContext`] lists the planned records from its [[Environment]] outward,
@@ -259,11 +260,14 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
                 && parameter.default.is_none()
                 && matches!(parameter.pattern, Pattern::Ident(_))
         });
-    let kind = if public {
-        PlanKind::Public
-    } else if coroutine {
+    let kind = if coroutine {
+        // A compiled generator or async function makes an activation of its own, in its own
+        // order, below the record FunctionDeclarationInstantiation made (`Chunk::make_activation`):
+        // its closures' records differ between tiers, so their reads keep the name caches.
         record_children(function, &scan, None, Some("coroutine"));
         return FunctionPlan::opaque("coroutine");
+    } else if public {
+        PlanKind::Public
     } else if mapped {
         record_children(function, &scan, None, Some("mapped arguments"));
         return FunctionPlan::opaque("mapped arguments");

@@ -181,6 +181,35 @@ fn self_names_home_objects_and_arrow_this_resolve_statically() {
 }
 
 #[test]
+fn closures_in_compiled_coroutines_read_their_own_and_outer_names() {
+    // A compiled generator makes an activation of its own below the record its call's
+    // FunctionDeclarationInstantiation made, with its captured bindings in declaration order
+    // (`u` before `s`, the reverse of a planned prefix's): the method and the arrow made in it
+    // must find `u`, `s` and the outer `x` by name, not at a planned record's slots.
+    check(
+        r#"
+        function outer(o) {
+            var x = o + 'x';
+            function* gen(n) {
+                var u = 'u' + n, s = 's' + n;
+                var m = { k() { return x + s + u; } };
+                yield m.k();
+                yield (() => x + u + s)();
+            }
+            return gen;
+        }
+        var out = [];
+        for (var i = 0; i < 20; i++) {
+            var it = outer('o' + i)(i);
+            out.push(it.next().value + ',' + it.next().value);
+        }
+        out[0] + '|' + out[19];
+        "#,
+        "o0xs0u0,o0xu0s0|o19xs19u19,o19xu19s19",
+    );
+}
+
+#[test]
 fn generators_and_derived_constructors_keep_their_own_records() {
     check(
         r#"
