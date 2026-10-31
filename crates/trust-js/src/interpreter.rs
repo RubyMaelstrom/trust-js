@@ -13708,8 +13708,20 @@ impl Interp {
     /// the immutable function identity/code proof is reusable; replacement/revocation, realm
     /// switching and parameter-instantiation fallbacks remain in the ordinary Call machinery.
     fn proxy_trap_caches(&mut self) -> Rc<ProxyTrapCaches> {
+        match &self.proxy_trap_caches {
+            Some(caches) => caches.clone(),
+            None => self.make_proxy_trap_caches(),
+        }
+    }
+
+    /// The Proxy trap caches, made at the first trap, out of line: building them in place takes
+    /// a frame of about ten kilobytes, whose stack probes every trap paid twice while the build
+    /// was inlined into [`Interp::proxy_trap_caches`].
+    #[cold]
+    #[inline(never)]
+    fn make_proxy_trap_caches(&mut self) -> Rc<ProxyTrapCaches> {
         self.proxy_trap_caches
-            .get_or_insert_with(|| Rc::new(ProxyTrapCaches::new()))
+            .insert(Rc::new(ProxyTrapCaches::new()))
             .clone()
     }
 
