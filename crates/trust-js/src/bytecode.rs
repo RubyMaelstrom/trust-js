@@ -7679,8 +7679,16 @@ fn compile_inner_mode(
                     names
                 })
                 .collect();
+            // The body's captured bindings are in the activation from entry, where a parameter
+            // expression's read would find them: they are banned too (`hidden_from_parameters`).
+            let hidden = hidden_from_parameters(func, &captured, &block_lets);
             let banned_from = |k: usize| -> crate::fasthash::FastSet<&str> {
-                bound[k..].iter().flatten().map(String::as_str).collect()
+                bound[k..]
+                    .iter()
+                    .flatten()
+                    .chain(&hidden)
+                    .map(String::as_str)
+                    .collect()
             };
             let mut inits: Vec<ParamInit> = Vec::new();
             for (k, p) in func.params.iter().enumerate() {
@@ -9633,6 +9641,54 @@ fn pattern_exprs_safe(pattern: &Pattern, banned: &crate::fasthash::FastSet<&str>
             ArrayPatElem::Rest(pattern) => pattern_exprs_safe(pattern, banned),
         }),
     }
+}
+
+/// The body bindings a fresh compiled frame keeps in its activation from entry that its parameter
+/// expressions must not see. With parameter expressions, FunctionDeclarationInstantiation
+/// (spec.html:14247, e28783d5, steps 30-32 and 37) puts the body's `var`s and functions in a
+/// VariableEnvironment of their own, and its lexicals below that, so an expression in the list
+/// reads an outer binding of the same name, or the parameter a body function redeclares. The
+/// compiled tiers keep one activation instead (V8, SpiderMonkey and JSC make the body's record
+/// separately), which holds the captured ones: a parameter expression naming one stays in the
+/// tree-walker. Uncaptured body bindings have slots, which a parameter expression never sees.
+fn hidden_from_parameters(
+    func: &Function,
+    captured: &crate::fasthash::FastSet<String>,
+    homed: &[(String, bool)],
+) -> crate::fasthash::FastSet<String> {
+    let mut hidden: crate::fasthash::FastSet<String> =
+        homed.iter().map(|(name, _)| name.clone()).collect();
+    let params = crate::interpreter::param_bound_names(&func.params);
+    for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &params) {
+        match op {
+            HoistOp::Var(name) | HoistOp::AnnexB(name, _)
+                if captured.contains(&name) && !params.contains(&name) =>
+            {
+                hidden.insert(name);
+            }
+            HoistOp::Fn(name, _) if captured.contains(&name) => {
+                hidden.insert(name);
+            }
+            _ => {}
+        }
+    }
+    for statement in &func.body {
+        let mut names = crate::fasthash::FastSet::default();
+        match statement {
+            Stmt::VarDecl {
+                kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
+                decls,
+            } => {
+                for (pattern, _) in decls {
+                    pat_idents(pattern, &mut names);
+                }
+            }
+            Stmt::ClassDecl(class) => names.extend(class.name.clone()),
+            _ => {}
+        }
+        hidden.extend(names.into_iter().filter(|name| captured.contains(name)));
+    }
+    hidden
 }
 
 /// Decision 21: whether a parameter list's expressions leave its separate parameter record

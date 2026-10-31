@@ -210,6 +210,38 @@ fn closures_in_compiled_coroutines_read_their_own_and_outer_names() {
 }
 
 #[test]
+fn parameter_expressions_do_not_see_captured_body_bindings() {
+    // FunctionDeclarationInstantiation (spec.html:14247) gives a list with expressions its own
+    // record: the body's vars, functions (an Annex B block function's var among them) and
+    // lexicals are not visible to it, even where a closure captures them, and a body function
+    // that redeclares a parameter does not replace the value a later default reads.
+    check(
+        r#"
+        var x = 'outer';
+        globalThis.x2 = function () { return 'outerfn'; };
+        var cases = [
+            function (a = x) { var x = 'body'; var g = () => x; return a; },
+            function (a = x) { function x() {} var g = () => x; return typeof a; },
+            function (a = x) { let x = 'body'; var g = () => x; return a; },
+            function (a = typeof x) { var x = 1; var g = () => x; return a; },
+            function (a = x) { var x; var g = () => x; return a + ':' + g(); },
+            function (a, b = a) { function a() {} var g = () => a; return typeof b + ':' + typeof g(); },
+            function (a = x) { { function x() {} } var g = () => x; return typeof a; },
+            function (a = x2()) { function x2() { return 'inner'; } var g = () => x2; return a; },
+            function ({p = x} = {}) { var x = 'body'; var g = () => x; return p; },
+            function (a = x) { { let x = 'block'; var g = () => x; } return a; },
+            function (a, b = a) { function a() {} return typeof b; },
+        ];
+        var out = [];
+        for (var i = 0; i < 20; i++) out.push(cases.map((f) => f()).join(' '));
+        out[0] + '|' + (out[19] === out[0]);
+        "#,
+        "outer string outer string outer:undefined undefined:function string outerfn outer outer \
+         undefined|true",
+    );
+}
+
+#[test]
 fn closures_in_a_using_head_loop_read_its_binding() {
     // ForLoopEvaluation (spec.html:22617, e28783d5) binds a `using` head in the loop's own
     // record, which the closures made in the loop capture; the head's resource is disposed once,
