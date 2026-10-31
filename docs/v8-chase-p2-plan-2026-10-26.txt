@@ -3756,6 +3756,68 @@ addresses (built, not counted), and d229d095 (WIP), loop, switch and catch recor
 they bind, which React needs (fixture outputs as main's in every tier, otherwise untested). Next:
 classes, stores, loop fragments and preambles, borrowed frames' caps, the tree-walker's reads.
 
+Resumed 2026-10-31. Three bugs found on the way, fixed first (e77750d0..9b5c7049; landed on
+targeted tests under the owner's rule):
+- e77750d0: generators' and async functions' plans are opaque again, as the design above has
+  them. A compiled coroutine makes an activation of its own, in declaration order, below the
+  record its call's FunctionDeclarationInstantiation made (`Chunk::make_activation`), so under
+  step 1 a closure made in it read its own names at the plan's slots and outer names one hop
+  short. With a compile threshold of 0, reentry_rooting_tests' two async-disposal tests hit the
+  static read's debug assertion ("the static address of \"holder\" names another binding"), and
+  in release a method of an async function read undefined for an outer name. Step 1's targeted
+  filters had not included them.
+- 67448f43: a `for (using x = ...; ...)` head's binding, when a closure captures it, lives in the
+  loop's own record: the capture scan bound no names for `using` heads, so a closure in the loop
+  read an outer or global `x` once compiled (older than P2). The resource is disposed once, after
+  the loop (ForLoopEvaluation, spec.html:22617); Node v24.22.0 disposes it 4 times in the test's
+  two-iteration loop (a V8 deviation; not reported).
+- 9b5c7049: compiled parameter expressions no longer see captured body bindings (the bug found at
+  step 1, and its relatives). With parameter expressions, FunctionDeclarationInstantiation
+  (steps 30-32 and 37) gives the body's vars, functions and lexicals records of their own; a
+  fresh compiled frame keeps the captured ones in its one activation from entry, so a default
+  naming one read the body's binding (undefined for a var, the function for a body function or
+  for one that redeclares a parameter, a TDZ error for a let or a homed block let). Such a list
+  now leaves the function to the tree-walker, as one that reads a later parameter does. The
+  exemplars give the body a record of its own: V8's varblock scope for non-simple parameters
+  (parser-base.h:4869-4875, 4945-4969 at c8b709085e21), SpiderMonkey's extra body VarScope with
+  parameter expressions (Parser.cpp:2071-2084), JSC's separate var environment for non-simple
+  lists (BytecodeGenerator.cpp:633-634, 1251-1274); that is Decision 21's parameter-scope step.
+Against 8ed756bc (fat LTO, ARM64, pinned, randomization off): Vue +0.04%, React 0.00%, Djot
++0.02%, chai +0.04%.
+
+Then the parked commits, rebased onto the fixes (f454126e, e53f2fa7):
+- f454126e: compiling a function reuses its plan's capture analysis (one scan, not two), and
+  straight-line numeric chains read free names at their static addresses.
+- e53f2fa7: the tree-walker makes a `for` head's, a for-in/of round's, a `switch` block's and a
+  `catch` block's record only where the statement declares something block-scoped, as compiled
+  code does and as V8 drops such scopes (Scope::FinalizeBlockScope, scopes.cc:930-940; switch,
+  catch and for scopes at parser-base.h:6469, 6581, 6920); the capture scan's record barrier
+  keeps only Annex B.3.4's bare function declarations.
+Against 8ed756bc, measured before the rebase over the fixes (fat LTO, as above), each step
+against the one before:
+
+| | f454126e | e53f2fa7 | both |
+| --- | --- | --- | --- |
+| Vue | -0.02% | -0.19% | -0.21% (1.992e9 to 1.988e9) |
+| React | +0.01% | -4.85% | -4.84% (4.618e8 to 4.394e8) |
+| Djot | -0.49% | +0.02% | -0.47% (7.228e8 to 7.194e8) |
+| chai | -0.02% | +0.03% | +0.02% (one run each) |
+
+Collections unchanged. Tests: the targeted filters (scope plans, closures, eval, `with`,
+arguments, generators, activations, scopes, TDZ, names, OSR, fragments, self-names, home
+objects, captures, defaults, parameters, destructuring, loops, `for`, `switch`, `catch`, `try`,
+`using`, disposal, async, re-entry, await), fmt, clippy in three configurations; zombie's x86-64
+clippy and the scope plan, closure, default and parameter tests.
+
+The census after e53f2fa7 (its parent's build, as the step 1 census; share of user instructions
+resolving names, before step 1 in brackets): Vue 6.00% (11.44%), React 3.45% (11.66%; 3.03% of
+it the tree-walker's own lookups), Djot 3.41% (4.51%), chai 4.55% (7.9%). Stores are 0.09% of
+Vue. What stays dynamic, by the compiler's scope log: on Vue, reads in class members (33 sites,
+behind the class barrier: its reactivity classes' methods read module-level helpers) and
+globals (33); on Djot, class members (103) and globals (104); on chai, 756 sites inside lodash's
+`runInContext`, whose activation is over the 506 in-line slots ("activation too large", most of
+chai's 2.09% of name-cache refills and 1.31% of deep-chain stubs), and globals (381).
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
