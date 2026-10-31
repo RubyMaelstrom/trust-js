@@ -3878,6 +3878,35 @@ field calling a static method during the definition), the class, method, accesso
 private, static, field, decorator, construct and toString filters with the earlier list; fmt,
 clippy in three configurations; zombie's x86-64 clippy and the scope plan and class tests.
 
+Then static globals (2a71f547, 2026-11-01; not in the design's step list, which stopped at the
+planned records). After the class step, what the fixtures' compiled reads still resolved through
+the deep name cache, validating every record on the way, were globals (Vue's reactivity traps
+read `Reflect`, `Map`, `Object` from functions four and more records deep). Every exemplar
+proves such a name unbound on the way and searches the global environment directly: V8's
+LdaGlobal with its LoadGlobalIC (a property cell, or the script context table's slot),
+SpiderMonkey's GetGName, JSC's GlobalProperty and GlobalLexicalVar resolve types. Here
+ScriptEvaluation now plans the Script's own inner functions (`scope_plan::plan_script`, a shallow
+scan: their barriers, not their bodies), whose contexts end at the realm's global environment and
+pass that end to theirs; a free name no planned record on the way binds then compiles to the
+number of records to the global environment (`Chunk::name_globals`), and the read walks them and
+probes its name cache there, in the cache's existing modes (a script-level lexical's binding, a
+global object property), in the VM, the ARM64 templates (with numeric chains and loop preambles)
+and x86-64. A script-level `with`, blocks with lexicals, classes and the other barriers apply; a
+Script's direct eval can only add global bindings, which the search finds; eval code, module code
+and `new Function` bodies are not planned. Frames over records the tree-walker made (prepared
+entries, mapped activations, loop fragments) read some of the function's own bindings by name,
+`arguments` among them, so their names keep the caches; the first build missed that, and the
+arguments and entry tests caught it. A full scan of the Script cost Djot 0.26% (its whole AST once
+more), hence the shallow scan.
+Against 2daffbe5 (fat LTO, pinned, randomization off; means over ten nursery sizes, as the item 7
+note explains, then least of 3): Vue -0.44% (-0.16%), Djot -0.14% (-0.13%), React -0.01%
+(0.00%), chai -2.62% (one run). Tests: scope_plan_tests' global cases in every tier at
+thresholds 0 and 8 (script-level var, let, const and function reads, a global getter, an
+eval-added global, late and deleted globals, a dead-zone read, a script-level `with`, numeric
+globals in a loop and a chain; a later Script's `let` over a global property), the global,
+script, realm, ShadowRealm, arguments, entry and earlier filters; fmt, clippy in three
+configurations; zombie's x86-64 clippy and 495 targeted tests.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
