@@ -2607,6 +2607,38 @@ megamorphic bit (no eviction after 4, as JSC's limit of 8 callees) has a flaw fo
 the call-cache epoch is global, so its bumps stale the overflow entries and a stable site counts
 as megamorphic (fix: count evictions per epoch). The call count is designed, not built.
 
+Resumed and landed 2026-11-01 (afe58a1e, e12d08ba, 140d2d83, an agent's; on targeted tests under
+the owner's rule). A measurement finding first: the collector scans the native stack
+conservatively, so two binaries retain different dead objects and Vue's count moves by up to
+about 0.4% between any two builds for that alone (address-keyed tables collide differently too);
+target/p2/w3-i4/nursery.sh counts a fixture at ten nursery sizes and compares the means, which a
+commit's own cost shifts uniformly and that luck scatters. Vue's +0.24% at builtin ids was that.
+- afe58a1e: every native gets a builtin id, recorded with its class in the call cache; the one
+  real per-call cost, Reflect.apply's lock and lookup (+38 instructions with Math.max as the
+  target), takes a one-entry thread-local memo. Neutral (nursery means: Vue -0.03%, React
+  +0.01%, Djot -0.06%, chai 0.00%).
+- e12d08ba: the Proxy trap caches' first construction is out of line, which had given their
+  accessor a ~10 KB stack frame set up on every trap call: a Proxy get 2,320 to 2,270
+  instructions an iteration; Vue -0.54% (the same 10.7M fewer at every nursery size), chai
+  -0.12%.
+- 140d2d83: a call site is megamorphic after eight callees evicted within one epoch, and stays
+  so; such a site adds at most 64 callees an epoch to the overflow table (a budget of 16 cost
+  Djot +0.17%: its busiest polymorphic site calls 28 functions). SpiderMonkey's megamorphic IC
+  stops attaching stubs at its limit (ICState.h:24-29), JSC calls virtually past 8 callees
+  (Repatch.cpp:171-184), V8 caches nothing at a megamorphic site; TRust's call without an entry
+  pays all its guards, so a budget beats none. chai -0.99% (its churning sites, one calling 403
+  functions, stop pinning every new callee in their chunk: weak-cell time 145 to 45 ms over
+  1,501 minor collections, 5 major collections to 4); the fixtures within 0.06%.
+Parked for the owner (Decision needed): e854636e, item 7's per-way call count (a u32 at CallIc
+offset 60; 3 instructions a counted call in the direct sequence, the call-hit helper, the cached
+Rust call, the construct helper and fills). React +0.30% (nursery +0.27%), Djot +0.08%
+(+0.13%), chai +0.16%, Vue +0.13% (nursery). V8 counts every call per site
+(code-stub-assembler.cc:199-211) and SpiderMonkey every baseline stub entry
+(BaselineCacheIRCompiler.cpp:233-236), JSC per callee in polymorphic stubs only
+(ThunkGenerators.cpp:363-364); in all three an optimizing tier reads the counts, and TRust has
+none yet. Recommendation: land it with the first reader of the counts (P3's tier). Unexplained:
+Reflect.apply's fast path costs 20-24 more instructions with the count, not 3.
+
 ### W3 item 3: the closure entry (census and design, 2026-10-28; decided, Decisions 20 and 21)
 
 Item 3, as the stage's design has it: a callee that needs an environment builds it in its prologue,
