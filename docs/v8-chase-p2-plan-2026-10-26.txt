@@ -3818,6 +3818,34 @@ globals (33); on Djot, class members (103) and globals (104); on chai, 756 sites
 `runInContext`, whose activation is over the 506 in-line slots ("activation too large", most of
 chai's 2.09% of name-cache refills and 1.31% of deep-chain stubs), and globals (381).
 
+Then class records (2daffbe5, 2026-10-31; design step 5's classes). TRust makes three records
+for every class in every tier (`Interp::begin_class_evaluation` and `finish_class_evaluation`,
+which the VM's class ops share): the class-name record (the name, in its TDZ until the class is
+defined), the private-name record (`#`-named keys) and the instance and static records (the home
+objects and `%`-named bindings), so a constructor's, method's or accessor's outer context now
+holds those three, the class's name the last one's, in place of the class barrier. As the
+exemplars do, the coordinate is fixed by the scope analysis: V8 gives a class scope a context
+only when a variable in it is context-allocated (Scope::NeedsContext, scopes.h:451-457),
+SpiderMonkey an environment only when the scope has one (EmitterScope.cpp:415, 489 at main,
+2026-10-31); TRust always makes the records, so their count is constant and nothing needs
+deciding. Two findings on the way: a compiled frame does not lower a class (outside coroutines)
+but evaluates it through a projection of its slots (`eval_expr_with_slots`), a record the
+tree-walker never makes, so the class's records now close over the frame's own record once the
+heritage, computed keys and decorators (the projection's only readers) are done, before any
+member exists; and an explicit constructor was cloned at each evaluation to carry the class's
+source text, which the parser had already given it, so each evaluation compiled a new
+constructor without an outer context (it now keeps the parsed node). A class in a private
+function (whose activation only the tree-walker makes), static blocks, field initializers,
+closures in heritages and computed keys, and nested classes keep the barrier.
+Against 12e917c8 (fat LTO, ARM64, pinned, randomization off): Vue -2.75% (1.989e9 to 1.934e9),
+React -0.01%, Djot -1.29% (7.196e8 to 7.103e8), chai -0.20%; collections unchanged. Read sites
+left dynamic on the fixtures: globals (Vue 33, Djot 81), a few with no outer context (Vue's module
+loader), lexical blocks (8). Tests: scope_plan_tests' class cases in every tier at thresholds 0
+and 8 (members reading outer and class names, the barriers, the slot projection with a static
+field calling a static method during the definition), the class, method, accessor, super,
+private, static, field, decorator, construct and toString filters with the earlier list; fmt,
+clippy in three configurations; zombie's x86-64 clippy and the scope plan and class tests.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
