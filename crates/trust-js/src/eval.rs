@@ -5990,6 +5990,30 @@ impl Interp {
     // ----- classes ----------------------------------------------------------------------------
 
     fn eval_class(&mut self, class: &Rc<Class>, env: &Env) -> Result<Value, Abrupt> {
+        self.eval_class_under(class, env, None)
+    }
+
+    /// [`Interp::eval_class`] for a class a compiled frame evaluates through a projection of its
+    /// slots (`bytecode::eval_expr_with_slots`): `env`, the projection, resolves the class's
+    /// decorators, heritage and computed keys, which may name the frame's slots; then the
+    /// class's records close over `records`, the frame's environment, before any member exists,
+    /// as the other tiers' do (Decision 21's plans count them). Nothing after the keys reads a
+    /// slot by name: members, field initializers and static blocks capture what they name.
+    pub(crate) fn eval_class_projected(
+        &mut self,
+        class: &Rc<Class>,
+        env: &Env,
+        records: Env,
+    ) -> Result<Value, Abrupt> {
+        self.eval_class_under(class, env, Some(records))
+    }
+
+    fn eval_class_under(
+        &mut self,
+        class: &Rc<Class>,
+        env: &Env,
+        records: Option<Env>,
+    ) -> Result<Value, Abrupt> {
         // The decorators proposal evaluates class decorator expressions before
         // ClassDefinitionEvaluation (and therefore before the class name's TDZ and heritage).
         // Evaluated decorators stay rooted while later expressions run author code (I1).
@@ -6004,7 +6028,7 @@ impl Interp {
         // computed member keys included, whatever the surrounding mode.
         let saved_strict = self.strict;
         self.strict = true;
-        let r = self.eval_class_strict(class, env, class_decorators);
+        let r = self.eval_class_strict(class, env, class_decorators, records);
         self.strict = saved_strict;
         r
     }
@@ -6014,6 +6038,7 @@ impl Interp {
         class: &Rc<Class>,
         env: &Env,
         class_decorators: crate::rooting::Rooted<std::cell::RefCell<Vec<PreparedDecoratorValue>>>,
+        records: Option<Env>,
     ) -> Result<Value, Abrupt> {
         // Rooted through heritage, decorator and computed-key evaluation and the decorator
         // application that finishes the class (I1).
@@ -6055,6 +6080,9 @@ impl Interp {
                 let key = self.class_computed_key(class, index, value)?;
                 prepared.borrow_mut().publish_key(index, key);
             }
+        }
+        if let Some(records) = records {
+            prepared.borrow().outer_class_env.borrow_mut().parent = Some(records);
         }
         let prepared = crate::rooting::Rooted::new(prepared.into_inner().into_inner());
         self.finish_class_evaluation(class, prepared)
@@ -6247,7 +6275,9 @@ impl Interp {
             .find(|m| m.kind == MemberKind::Constructor)
             .and_then(|m| m.func.clone())
             .unwrap_or_else(|| Rc::new(default_constructor(derived, class)));
-        let ctor_func = if class.source.is_some() {
+        // The parser gives an explicit constructor the class's source text already; keeping its
+        // node keeps its compiled code and its place in Decision 21's plans across evaluations.
+        let ctor_func = if class.source.is_some() && ctor_func.source != class.source {
             let mut f = (*ctor_func).clone();
             f.source = class.source.clone();
             Rc::new(f)

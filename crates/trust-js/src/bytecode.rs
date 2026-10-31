@@ -4005,15 +4005,33 @@ struct CaptureScan {
     /// Decision 21's plan (`scope_plan`): each inner function walked directly in the analyzed
     /// function, whether a record other than the function's activation encloses it there (a
     /// block's, catch's, loop head's, class's or `with`'s: a barrier to static addressing),
-    /// and whether it is an object literal's method (whose home record encloses it).
-    children: Option<Vec<(*const Function, Option<&'static str>, bool)>>,
+    /// and the records its closure is made under besides those ([`ChildRecords`]).
+    children: Option<Vec<(*const Function, Option<&'static str>, ChildRecords)>>,
     /// Classes entered (their records enclose their members).
     class_depth: u32,
+    /// The name scope of each class entered, innermost last: its serial and the class's name.
+    class_scopes: Vec<(u32, Option<String>)>,
     /// Statements entered whose evaluation the tree-walker gives a record of its own, whether
     /// or not they declare anything: an `if`'s bare function declaration (Annex B.3.4).
     record_depth: u32,
     /// The next inner function is an object literal's method, getter or setter.
     home_member: bool,
+    /// The next inner function is a constructor, method or accessor of the innermost class.
+    class_member: bool,
+}
+
+/// The records an inner function's closure is made under, inside the scope it was met in
+/// (Decision 21's plan, `scope_plan::record_children`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ChildRecords {
+    /// None: the closure closes over the scope it is made in.
+    Plain,
+    /// An object literal's method, getter or setter, whose closure may close over a home record.
+    Home,
+    /// A class's constructor, method, getter or setter: the class's instance or static record
+    /// (the home object's), its private-name record and its name's record, which every tier
+    /// makes alike (`Interp::begin_class_evaluation`), with the class's name if it has one.
+    ClassMember(Option<Rc<str>>),
 }
 
 /// Collect every binding a `Pattern` introduces.
@@ -4244,6 +4262,7 @@ mod capture_summary_tests {
             // A plan's record of the inner functions it met is bookkeeping, not analysis.
             walked.children.clone_from(&applied.children);
             walked.home_member = applied.home_member;
+            walked.class_member = applied.class_member;
             assert_eq!(
                 walked, applied,
                 "capture summary differs from walking {:?}",
@@ -4326,8 +4345,10 @@ impl CaptureScan {
             arrow_path: vec![func.is_arrow],
             children: None,
             class_depth: 0,
+            class_scopes: Vec::new(),
             record_depth: 0,
             home_member: false,
+            class_member: false,
         }
     }
 
@@ -5042,25 +5063,40 @@ impl CaptureScan {
 
     fn walk_inner_fn(&mut self, f: &Function) -> Option<()> {
         let home = std::mem::take(&mut self.home_member);
+        let member = std::mem::take(&mut self.class_member);
         if self.fn_depth == 0 && self.children.is_some() {
             let top = self.top_serial;
-            let barrier = if self.class_depth > 0 {
+            // A member of the one class around it here closes over that class's records, which
+            // every tier makes alike; the class's name scope stands for them. Anything else in
+            // a class (a static block, a closure in a heritage or computed key, a nested class's
+            // member) is behind the class's barrier.
+            let class = if member && self.class_depth == 1 {
+                self.class_scopes.last().cloned()
+            } else {
+                None
+            };
+            let barrier = if self.class_depth > 0 && class.is_none() {
                 Some("class")
             } else if self.with_depth > 0 {
                 Some("with")
             } else if self.record_depth > 0 {
                 Some("bare function declaration")
-            } else if self
-                .scopes
-                .iter()
-                .any(|(names, _, serial)| Some(*serial) != top && !names.is_empty())
-            {
+            } else if self.scopes.iter().any(|(names, _, serial)| {
+                Some(*serial) != top
+                    && !names.is_empty()
+                    && class.as_ref().is_none_or(|(class, _)| class != serial)
+            }) {
                 Some("lexical block")
             } else {
                 None
             };
+            let records = match class {
+                Some((_, name)) => ChildRecords::ClassMember(name.as_deref().map(Rc::from)),
+                None if home => ChildRecords::Home,
+                None => ChildRecords::Plain,
+            };
             if let Some(children) = &mut self.children {
-                children.push((std::ptr::from_ref(f), barrier, home));
+                children.push((std::ptr::from_ref(f), barrier, records));
             }
         }
         self.fn_depth += 1;
@@ -5173,6 +5209,8 @@ impl CaptureScan {
         self.fn_depth += 1;
         self.push_scope(names);
         self.fn_depth -= 1;
+        self.class_scopes
+            .push((self.next_serial - 1, c.name.clone()));
         self.class_depth += 1;
         let r = (|| {
             if let Some(sc) = &c.superclass {
@@ -5187,7 +5225,19 @@ impl CaptureScan {
                     self.expr(k)?;
                 }
                 if let Some(f) = &m.func {
-                    self.inner_fn(f)?;
+                    // Constructors, methods and accessors close over the instance or static
+                    // record (`Interp::finish_class_evaluation`); a static block runs in a
+                    // record of its own below the static record.
+                    self.class_member = matches!(
+                        m.kind,
+                        MemberKind::Constructor
+                            | MemberKind::Method
+                            | MemberKind::Get
+                            | MemberKind::Set
+                    );
+                    let walked = self.inner_fn(f);
+                    self.class_member = false;
+                    walked?;
                 }
                 if let Some(v) = &m.value {
                     // Field initializers run in an implicit method with its own `this` (the
@@ -5203,6 +5253,7 @@ impl CaptureScan {
             Some(())
         })();
         self.class_depth -= 1;
+        self.class_scopes.pop();
         self.scopes.pop();
         r
     }
@@ -16991,7 +17042,12 @@ fn eval_expr_with_slots(
 
     let old_strict = std::mem::replace(&mut i.strict, plan.strict);
     let old_name = std::mem::replace(&mut i.pending_fn_name, plan.name.clone());
-    let result = i.eval(&plan.expr, &projected);
+    // A class's records close over this frame's environment, as in every other tier (Decision
+    // 21); the projection serves only its heritage, computed keys and decorators.
+    let result = match &plan.expr {
+        Expr::Class(class) => i.eval_class_projected(class, &projected, *env),
+        expr => i.eval(expr, &projected),
+    };
     i.pending_fn_name = old_name;
     i.strict = old_strict;
 

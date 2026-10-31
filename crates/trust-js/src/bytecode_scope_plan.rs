@@ -191,6 +191,23 @@ fn home_record() -> Rc<[PlanBinding]> {
     }])
 }
 
+/// The records a class's constructor, method or accessor closes over, innermost first, as
+/// `Interp::begin_class_evaluation` and `finish_class_evaluation` make them in every tier: the
+/// instance or static record (the home object and the class's own `%`-named bindings), the
+/// private-name record (`#`-named), and the class-name record, which binds the class's name, in
+/// its TDZ until the class is defined. None binds a name an identifier can spell but the last.
+fn class_records(name: Option<&Rc<str>>) -> [Rc<[PlanBinding]>; 3] {
+    let none: Rc<[PlanBinding]> = Rc::from(Vec::new());
+    let named = match name {
+        Some(name) => Rc::from(vec![PlanBinding {
+            name: name.clone(),
+            lexical: true,
+        }]),
+        None => none.clone(),
+    };
+    [none.clone(), none, named]
+}
+
 fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
     if !scope_plans_enabled() {
         return FunctionPlan::opaque("plans off", None);
@@ -330,16 +347,27 @@ fn record_children(
     stop: Option<&'static str>,
 ) {
     let outer = function.scopes.outer.get().cloned();
-    for &(child, barrier, home) in scan.children.as_deref().unwrap_or_default() {
+    for (child, barrier, kind) in scan.children.as_deref().unwrap_or_default() {
         // SAFETY: the scan borrowed `function`'s AST, which owns every child it met.
-        let child = unsafe { &*child };
+        let child = unsafe { &**child };
         let mut records = Vec::new();
+        let mut stop = barrier.or(stop);
         if child.needs_self_environment() {
             records.push(self_name_record(child));
-        } else if home && child.observes_home_object() {
-            records.push(home_record());
+        } else {
+            match kind {
+                ChildRecords::Home if child.observes_home_object() => records.push(home_record()),
+                ChildRecords::ClassMember(name) => {
+                    records.extend(class_records(name.as_ref()));
+                    // A private activation is a record in the tree-walker only, and the class's
+                    // records close over it there: the outer context ends with the class's.
+                    if stop.is_none() && activation.is_none() {
+                        stop = Some("class in a private function");
+                    }
+                }
+                ChildRecords::Home | ChildRecords::Plain => {}
+            }
         }
-        let stop = barrier.or(stop);
         let parent = if stop.is_none() {
             records.extend(activation.clone());
             outer.clone()

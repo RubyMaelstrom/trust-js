@@ -308,3 +308,108 @@ fn parameter_lists_with_expressions_share_the_activation_when_unobservable() {
         "1:2:3|0:1:1|0,0,2,0|0,0,7,2|0|3|5|6|0 / 1:2:3|29:30:59|29,29,2,0|29,29,7,2|29|3|5|6|87",
     );
 }
+
+#[test]
+fn class_members_read_outer_names_through_the_class_records() {
+    // A class's constructor, methods and accessors close over its instance or static record,
+    // its private-name record and its name's record, which every tier makes alike: their reads
+    // of the enclosing function's names, and of the class's own name, are static.
+    check(
+        r#"
+        function outer(k) {
+            var helper = function (v) { return v + k; };
+            var shared = 'S' + k;
+            class Box {
+                #p = 1;
+                constructor(v) { this.v = helper(v); }
+                get twice() { return this.v * 2 + shared.length + this.#p; }
+                set twice(x) { this.v = x - k; }
+                static make(v) { return new Box(v); }
+                label() { return typeof Box + ':' + Box.name + ':' + shared; }
+                arrow() { return [1, 2].map((x) => x + k + this.v).join('/'); }
+            }
+            const Anon = class { m() { return shared + k; } };
+            const Named = class Inner { m() { return Inner.name + k; } };
+            var b = Box.make(k);
+            var before = b.twice;
+            b.twice = 10;
+            return [before, b.v, b.twice, b.label(), b.arrow(), new Anon().m(), new Named().m()]
+                .join(',');
+        }
+        var out = [];
+        for (var i = 0; i < 30; i++) out.push(outer(i));
+        out[0] + '|' + out[29];
+        "#,
+        "3,10,23,function:Box:S0,11/12,S00,Inner0|120,-19,-34,function:Box:S29,11/12,S2929,Inner29",
+    );
+    assert!(
+        static_reads(
+            "function a(x) { return class { m() { return x; } }; } var t = 0; \
+             for (var k = 0; k < 20; k++) t += new (a(k))().m(); t;"
+        ) > 0
+    );
+}
+
+#[test]
+fn closures_a_class_encloses_otherwise_keep_their_names_dynamic() {
+    // A class in a private function (whose activation only the tree-walker makes), a class in
+    // a heritage, a computed key's closure, a static block, a class in a block with lexicals and
+    // field initializers' closures resolve their names by name in every tier.
+    check(
+        r#"
+        var top = 'T';
+        function wrap(k) {
+            var near = 'n' + k;
+            function priv(x) { var unused = x; return class { m() { return top + near; } }; }
+            function heritage() {
+                return class extends (class { m() { return near + k; } }) {
+                    n() { return this.m() + near; }
+                };
+            }
+            var keyed = class { [(() => 'k' + near)()]() { return near; } static { this.s = near + k; } };
+            var block;
+            { let local = 'L' + k; block = class { m() { return local + near; } }; }
+            var withField = class { f = near + k; g = () => near; };
+            var wf = new withField();
+            return [new (priv(k))().m(), new (heritage())().n(), new keyed()['kn' + k](), keyed.s,
+                new block().m(), wf.f, wf.g()].join(',');
+        }
+        var out = [];
+        for (var i = 0; i < 30; i++) out.push(wrap(i));
+        out[0] + '|' + out[29];
+        "#,
+        "Tn0,n00n0,n0,n00,L0n0,n00,n0|Tn29,n2929n29,n29,n2929,L29n29,n2929,n29",
+    );
+}
+
+#[test]
+fn a_compiled_class_closes_over_its_frame_past_the_slot_projection() {
+    // A compiled frame evaluates a class through a projection of its slots, which its heritage
+    // and computed keys read (`parent`, `name`: no closure captures them); its records then close
+    // over the frame's own record before a static field calls a static method, which reads the
+    // frame's captured names at their static addresses.
+    check(
+        r#"
+        function make(k) {
+            var parent = k % 2 ? Array : Object;
+            var name = 'm' + (k % 3);
+            var base = parent;
+            var shared = 's' + k;
+            return class extends parent {
+                static early = this.peek();
+                static peek() { return shared + ':' + typeof base; }
+                [name]() { return shared + k; }
+                get s() { return typeof base + shared.length; }
+            };
+        }
+        var out = [];
+        for (var i = 0; i < 30; i++) {
+            var C = make(i);
+            var c = new C();
+            out.push([C.early, c['m' + (i % 3)](), c.s, c instanceof Array].join(','));
+        }
+        out[0] + '|' + out[29];
+        "#,
+        "s0:function,s00,function2,false|s29:function,s2929,function3,true",
+    );
+}
