@@ -8595,6 +8595,13 @@ impl Props {
         if !self.elem_mode.get() {
             return false;
         }
+        // A far index lives in the named entries alone (`has_far`), with no slot in `elems`, so
+        // `find` would scan every entry for each index it cannot place: every absent-index insert
+        // into such an array, and every read past its packed elements, was linear in its entries.
+        // Past the threshold every key counts, as after a truncation (`remove_indices_from`).
+        if self.has_far.get() {
+            return self.entries.len() + 1 > INDEX_THRESHOLD;
+        }
         if key.as_index().is_some() {
             return false;
         }

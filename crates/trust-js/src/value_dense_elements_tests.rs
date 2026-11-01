@@ -191,6 +191,53 @@ fn dense_elements_far_deletion_and_truncation_restore_packed_coverage() {
     }
 }
 
+/// A far index lives in the named entries alone (`has_far`), so once the map holds more than
+/// INDEX_THRESHOLD entries its key index must cover index keys: without it every later
+/// absent-index insert, and every read past the packed elements, scanned all the entries
+/// (filling and reading 200,000 elements after one write at index 1000 took 106.8 s).
+#[test]
+fn dense_elements_far_keys_index_the_named_entries() {
+    // A packed array with one far write, and an empty one whose first write is past 256.
+    for (start, far) in [(3u32, 1000u32), (0, 300)] {
+        let mut props = Props::packed_array((0..start).map(|n| Value::Num(n as f64)));
+        props.insert(far.to_string().as_str(), Property::plain(Value::Num(-1.0)));
+        assert!(props.has_far.get(), "{start}, {far}");
+        for n in start..start + 2000 {
+            if n != far {
+                props.insert(
+                    n.to_string().as_str(),
+                    Property::plain(Value::Num(n as f64)),
+                );
+            }
+        }
+        assert!(props.has_far.get(), "{start}, {far}");
+        assert!(
+            props.elems.index().is_some(),
+            "{start}, {far}: no key index"
+        );
+        for n in 0..start + 2000 {
+            let expected = if n == far { -1.0 } else { n as f64 };
+            assert_eq!(
+                props.get(&n.to_string()).and_then(|p| p.number_value()),
+                Some(expected),
+                "{start}, {far}: {n}"
+            );
+        }
+        assert!(props.get(&(start + 2000).to_string()).is_none());
+        let keys = props.ordered_keys();
+        assert_eq!(
+            keys.len(),
+            (start + 2000) as usize + 1,
+            "the indices and length"
+        );
+        assert!(keys
+            .iter()
+            .take((start + 2000) as usize)
+            .enumerate()
+            .all(|(i, key)| key.as_index() == Some(i as u32)));
+    }
+}
+
 #[test]
 fn dense_elements_recovery_keeps_named_indices_outside_packed_storage_guarded() {
     let mut props = Props::packed_array([Value::Num(0.0)].into_iter());
