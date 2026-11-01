@@ -1379,7 +1379,8 @@ pub struct JitLayout {
     pub shape_layout_entry_size: usize,
     pub shape_layout_entry_id: usize,
     pub shape_layout_entry_keys: usize,
-    /// The nullable pointer to the shared boxed dense-buffer headers within `Props`.
+    /// The map's own key index within `Props`: a nullable pointer, non-null while the map keeps
+    /// an index of its own (`Props::build_index`).
     pub props_elems: usize,
     /// The element words' pointer within `Props` (W2c, [`word_block::Words`]): the address of
     /// the first word, never null (a map without words points past the static empty block's
@@ -1685,16 +1686,16 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && shape_layout_entry_size == 16
         && shape_layout_entry_id == 0
         && shape_layout_entry_keys == 8;
-    // DenseStorage's first word is deliberately a nullable pointer to the boxed sidecar (the
-    // creation template reads it as "this map has a key index"). Verify the niche rather than
-    // relying on it silently if a future compiler changes the representation.
+    // DenseStorage's first word is deliberately a nullable pointer to the map's own key index
+    // (the creation template reads it as "this map keeps a key index"). Verify the niche rather
+    // than relying on it silently if a future compiler changes the representation.
     let thin_some = DenseStorage(
-        Some(crate::gc_storage::StorageBox::new(DenseBuffers::default())),
+        Some(crate::gc_storage::StorageBox::new(KeyIndex::of(&[]))),
         None,
         word_block::Words::new(),
     );
     let thin_word = unsafe { *(&thin_some as *const DenseStorage as *const usize) };
-    let thin_expected = thin_some.0.as_deref().unwrap() as *const DenseBuffers as usize;
+    let thin_expected = thin_some.0.as_deref().unwrap() as *const KeyIndex as usize;
     let thin_none = DenseStorage(None, None, word_block::Words::new());
     let thin_none_word = unsafe { *(&thin_none as *const DenseStorage as *const usize) };
     let thin_vec_ok = thin_word == thin_expected && thin_none_word == 0;
@@ -2709,7 +2710,7 @@ impl Object {
     }
 }
 
-/// A lazy internal-slot map inside the existing property-storage sidecar. Built-in instances
+/// A lazy internal-slot map inside the property map's Rust-heap extras. Built-in instances
 /// keep their state without adding property keys, descriptors or shape transitions; ordinary
 /// objects allocate neither a separate map nor an extra pointer in their object body.
 ///
@@ -3808,7 +3809,7 @@ impl crate::gc_trace::GcTrace for Props {
 
 impl Props {
     /// Report the storage blocks this map's payloads live in (`gc_storage`): the named
-    /// properties' spill, the element sidecar and the blocks it holds. Every trace of the map's
+    /// properties' spill, the element words and the key index. Every trace of the map's
     /// owner reports them, since nothing else keeps them alive.
     #[inline]
     pub(crate) fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
@@ -4004,6 +4005,8 @@ pub(crate) mod layout_census {
         counts.named_total[family].fetch_add(named as u64, Relaxed);
         counts.named_capacity[family]
             .fetch_add(object.props.entries.fields.capacity() as u64, Relaxed);
+        // The map's first word: its own key index since W2c step 3 removed the sidecar around
+        // it (the column keeps its name).
         if object.props.elems.0.is_some() {
             counts.sidecars[family].fetch_add(1, Relaxed);
         }
@@ -5789,18 +5792,8 @@ impl Property {
 }
 
 // No Drop: properties own nothing outside the heap, so the slots need no destructor and the
-// sidecar block that holds them is plain data (see `DenseBuffers`).
+// blocks that hold them are plain data.
 const _: () = assert!(!std::mem::needs_drop::<Property>());
-
-/// The sidecar of a property map, in a storage block (`gc_storage`), whose pointer the JIT's
-/// creation template reads as "this map keeps a key index". Plain data only: dropping the map
-/// never reads the block, which may have gone with its heap (a template can outlive its Agent).
-#[derive(Clone, Default)]
-struct DenseBuffers {
-    /// The map's own index of its named keys, when it keeps one (`Props::build_index`): one
-    /// word here, so the sidecar keeps its size class.
-    index: Option<crate::gc_storage::StorageBox<KeyIndex>>,
-}
 
 /// One slot of a [`KeyIndex`]: a key and its entry's position, or empty.
 #[derive(Clone, Copy, Default)]
@@ -5811,7 +5804,9 @@ struct KeySlot {
 
 /// A property map's own index of its named keys, when its layout has none past
 /// [`INDEX_THRESHOLD`] keys: open addressing (linear probing) over a power of two of
-/// [`KeySlot`]s, at most half full, in storage blocks the element sidecar reports.
+/// [`KeySlot`]s, at most half full, in storage blocks the map reports
+/// ([`DenseStorage::trace_storage`]). Plain data only: dropping the map never reads the blocks,
+/// which may have gone with its heap (a template can outlive its Agent).
 #[derive(Clone)]
 struct KeyIndex {
     /// Never dropped: the block is the collector's.
@@ -5932,7 +5927,7 @@ impl KeyIndex {
     }
 }
 
-/// What a property map keeps in the Rust heap beside its sidecar, each part only once needed:
+/// What a property map keeps in the Rust heap beside its blocks, each part only once needed:
 /// the Symbols of its Symbol keys and internal slots. The Symbol map's storage is charged to the
 /// heap's external ledger ([`DenseExtras::settle_charge`]), the internal slots' by themselves.
 /// An object whose map has extras needs its finalizer.
@@ -5940,7 +5935,7 @@ impl KeyIndex {
 struct DenseExtras {
     charge: ExternalCharge,
     /// Strong ownership for Symbol-valued property keys. String keys stay inline in `entries`;
-    /// this cold sidecar exists only for objects that actually acquire a Symbol key.
+    /// this cold map exists only for objects that actually acquire a Symbol key.
     symbols: Option<Box<crate::fasthash::FastMap<u64, SymbolRef>>>,
     internal_slots: InternalSlots,
 }
@@ -5973,13 +5968,6 @@ impl DenseExtras {
     }
 }
 
-struct EmptyDenseBuffers(DenseBuffers);
-// This value's empty buffers and cached-proof cell are never mutated. Every writer first
-// acquires an owned allocation through DenseStorage::buffers_mut; live buffers stay thread-local.
-unsafe impl Sync for EmptyDenseBuffers {}
-
-static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers { index: None });
-
 struct EmptyInternalSlots(InternalSlots);
 // Never mutated: writers make the map's own extras first (`DenseStorage::extras_mut`).
 unsafe impl Sync for EmptyInternalSlots {}
@@ -5989,12 +5977,13 @@ static EMPTY_INTERNAL_SLOTS: EmptyInternalSlots = EmptyInternalSlots(InternalSlo
     charge: ExternalCharge::new(),
 });
 
-/// A property map's element sidecar (its first word, the nullable pointer the JIT follows), its
-/// Rust-heap extras, and its element words (W2c; the static empty block until it has elements).
+/// A property map's own key index (its first word, the nullable pointer the JIT's creation
+/// template reads), its Rust-heap extras, and its element words (W2c; the static empty block
+/// until it has elements).
 #[derive(Default)]
 #[repr(C)]
 struct DenseStorage(
-    Option<crate::gc_storage::StorageBox<DenseBuffers>>,
+    Option<crate::gc_storage::StorageBox<KeyIndex>>,
     Option<crate::gc_storage::PayloadBox<DenseExtras>>,
     word_block::Words,
 );
@@ -6018,13 +6007,6 @@ impl DenseStorage {
     }
 }
 
-impl std::ops::Deref for DenseStorage {
-    type Target = DenseBuffers;
-    fn deref(&self) -> &DenseBuffers {
-        self.0.as_deref().unwrap_or(&EMPTY_DENSE_BUFFERS.0)
-    }
-}
-
 /// Whether no used word is a hole: the kind bit, else a scan (a cleared bit is not proof of a
 /// hole).
 #[inline]
@@ -6034,11 +6016,6 @@ fn words_have_no_holes(words: &word_block::Words) -> bool {
 
 impl DenseStorage {
     #[inline]
-    fn buffers_mut(&mut self) -> &mut DenseBuffers {
-        self.0.get_or_insert_with(Default::default)
-    }
-
-    #[inline]
     fn extras_mut(&mut self) -> &mut DenseExtras {
         self.1.get_or_insert_with(Default::default)
     }
@@ -6046,7 +6023,7 @@ impl DenseStorage {
     /// The map's own index, when it keeps one (`Props::build_index`).
     #[inline]
     fn index(&self) -> Option<&KeyIndex> {
-        self.0.as_deref()?.index.as_deref()
+        self.0.as_deref()
     }
 
     /// The Symbols of the map's Symbol-valued keys, if it has any.
@@ -6063,7 +6040,8 @@ impl DenseStorage {
             .map_or(&EMPTY_INTERNAL_SLOTS.0, |extras| &extras.internal_slots)
     }
 
-    /// Report the sidecar's block and the blocks it holds (see [`Props::trace_storage`]).
+    /// Report the map's blocks: the extras, the element words and the key index with its
+    /// slots (see [`Props::trace_storage`]).
     #[inline]
     fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         use crate::gc_storage::{trace_block, StorageBox};
@@ -6073,12 +6051,7 @@ impl DenseStorage {
         if let Some(block) = self.2.block_start() {
             trace_block(block, sink);
         }
-        let Some(buffers) = &self.0 else {
-            return;
-        };
-        StorageBox::trace(buffers, sink);
-        let DenseBuffers { index } = &**buffers;
-        if let Some(index) = index {
+        if let Some(index) = &self.0 {
             StorageBox::trace(index, sink);
             if let Some(block) = index.slots.spill_ptr() {
                 trace_block(block, sink);
@@ -6111,7 +6084,7 @@ impl DenseStorage {
         }
     }
     fn index_mut(&mut self) -> Option<&mut KeyIndex> {
-        self.0.as_deref_mut()?.index.as_deref_mut()
+        self.0.as_deref_mut()
     }
     /// The element words, while the map keeps its elements as words.
     #[inline]
@@ -6136,16 +6109,7 @@ impl DenseStorage {
         self.2 = word_block::Words::new();
     }
     fn set_index(&mut self, index: Option<KeyIndex>) {
-        match index {
-            Some(index) => {
-                self.buffers_mut().index = Some(crate::gc_storage::StorageBox::new(index));
-            }
-            None => {
-                if let Some(buffers) = self.0.as_deref_mut() {
-                    buffers.index = None;
-                }
-            }
-        }
+        self.0 = index.map(crate::gc_storage::StorageBox::new);
     }
     #[cfg(test)]
     fn clear(&mut self) {
@@ -6581,7 +6545,7 @@ pub struct Props {
     /// a class-changing descriptor replacement. Only consulted for non-exotic
     /// objects (arrays keep the key-compare path — same shape can mean different element counts).
     shape: u32,
-    /// The nullable sidecar pointer (the map's own key index), the Rust-heap extras, and the
+    /// The map's own key index (a nullable pointer), the Rust-heap extras, and the
     /// element words (W2c): every map's plain data elements, as V8, SpiderMonkey and JSC give
     /// every object element storage. Ordinary small named-property objects allocate none of it.
     elems: DenseStorage,
@@ -7307,19 +7271,16 @@ impl Props {
             // The block: front room, header, words and remembered record.
             bytes = bytes.saturating_add(words.block_bytes());
         }
-        if self.elems.0.is_some() {
-            bytes = bytes.saturating_add(std::mem::size_of::<DenseBuffers>());
-            if let Some(index) = self.elems.index() {
-                bytes = bytes
-                    .saturating_add(std::mem::size_of::<KeyIndex>())
-                    .saturating_add(index.bytes());
-            }
-            if self.elems.symbols().is_some() {
-                bytes = bytes.saturating_add(std::mem::size_of::<
-                    crate::fasthash::FastMap<u64, SymbolRef>,
-                >());
-                exact = false;
-            }
+        if let Some(index) = self.elems.index() {
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<KeyIndex>())
+                .saturating_add(index.bytes());
+        }
+        if self.elems.symbols().is_some() {
+            bytes = bytes.saturating_add(std::mem::size_of::<
+                crate::fasthash::FastMap<u64, SymbolRef>,
+            >());
+            exact = false;
         }
         (bytes, exact)
     }
@@ -8121,10 +8082,9 @@ impl Props {
             if let Some(p) = self.get_index(n) {
                 return Some(p);
             }
-            // Every canonical index is recorded in the dense sidecar unless a deliberately
-            // sparse, far-ahead insertion has ever occurred. With no such insertion, a dense
-            // miss proves absence; scanning every string-key entry is both redundant and
-            // especially costly for a hole read from a large array.
+            // An index that is not a word lives in the named entries only with `has_far`:
+            // without it a word miss proves absence; scanning every string-key entry is both
+            // redundant and especially costly for a hole read from a large array.
             if !self.has_far.get() {
                 return None;
             }

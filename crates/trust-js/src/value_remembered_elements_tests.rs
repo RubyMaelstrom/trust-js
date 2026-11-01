@@ -58,9 +58,9 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 
 #[test]
 fn storage_carriers_are_plain_data_with_the_native_header_first() {
-    // The sidecar and the element words live in storage blocks (`gc_storage`): plain data, so
+    // The key index and the element words live in storage blocks (`gc_storage`): plain data, so
     // that dropping a map never reads a block, which may have gone with its heap.
-    assert!(!std::mem::needs_drop::<DenseBuffers>());
+    assert!(!std::mem::needs_drop::<KeyIndex>());
     assert!(!std::mem::needs_drop::<Words>());
     // The map's storage word the JIT follows comes first; the Rust-heap extras and the element
     // words follow it.

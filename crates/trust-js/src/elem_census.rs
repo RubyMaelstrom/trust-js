@@ -140,7 +140,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
     // Bytes by allocated size (small-cell classes; a large block counts its own bytes).
     let mut b = [0u64; PARTS.len()];
     b[0] = class_bytes(std::mem::size_of::<RefCell<Object>>());
-    let buffers = p.elems.0.as_deref();
+    let index = p.elems.index();
     let mut capacity = 0usize;
     if let Some(words) = words {
         // The word block: its header, front room, capacity and remembered record (its dirty
@@ -148,11 +148,10 @@ fn record(families: &mut [Family; 3], object: &Object) {
         capacity = words.capacity();
         b[3] = class_bytes(words.block_bytes());
     }
-    if let Some(buffers) = buffers {
-        b[1] = class_bytes(std::mem::size_of::<DenseBuffers>());
-        if let Some(index) = buffers.index.as_deref() {
-            b[7] = class_bytes(std::mem::size_of::<KeyIndex>()) + class_bytes(index.bytes());
-        }
+    // The sidecar (b[1]), the slot map (b[5]) and the mirror (b[6]) are gone (W2c step 3); their
+    // columns stay, at zero, so the lines compare with step 1's.
+    if let Some(index) = index {
+        b[7] = class_bytes(std::mem::size_of::<KeyIndex>()) + class_bytes(index.bytes());
     }
     if p.entries.fields.spilled() {
         b[8] = class_bytes(p.entries.fields.capacity() * std::mem::size_of::<Property>());
@@ -180,7 +179,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
         if named > INLINE_NAMED_SLOTS {
             model += class_bytes(named * std::mem::size_of::<Property>());
         }
-        if buffers.is_some_and(|buffers| buffers.index.is_some()) {
+        if index.is_some() {
             model += b[7];
         }
         model

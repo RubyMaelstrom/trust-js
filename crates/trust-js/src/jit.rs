@@ -11640,7 +11640,7 @@ fn emit_prop_create_probe(
     a.cbz(9, false, miss);
     a.ldrb_imm(9, 11, (layout.obj_props + layout.props_proto_flag) as u32);
     a.cbnz(9, false, miss);
-    // Named-only small map: no DenseStorage sidecar/index, <=8 entries, and spare capacity.
+    // A small map: no key index of its own, <=8 entries, and spare capacity.
     a.ldr_imm(9, 11, (layout.obj_props + layout.props_elems) as u32);
     a.cbnz(9, true, miss);
     fields_len(a, layout, 13, 11);
