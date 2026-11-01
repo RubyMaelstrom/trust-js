@@ -4822,3 +4822,70 @@ Open questions for the owner:
    small arrays (SpiderMonkey's fixed elements)? Either takes Splay to about -47% with W2d's
    128 B cells (-24.6 MB each, against the exit's halving); neither is W2c's. Recommended: decide
    with W2d's cell size, measuring both on Splay and on the fixtures' allocation.
+
+### Tiering: loop iterations toward a function's tier-up (design, 2026-11-01)
+
+The owner's go-ahead (2026-11-01, after W3's stage end): close the tiering gap NavierStokes
+exposed, as the exemplars do. Today a function compiles once its calls pass the threshold
+(interpreter.rs:16888-16902), and a tree-walked call leaves the tree-walker only at a loop that
+runs 128 backedges in one execution (Admission, bytecode_loop_fragment.rs:92-143): at a
+body-level for, while or do-while loop by moving its whole frame into the compiled function
+(try_function_osr, bytecode.rs:16488), elsewhere into a compiled fragment of that loop, which is
+cached per site (fragment_cache) but entered only after 128 more backedges of a later execution.
+Backedges count toward nothing else, so a call whose loops each run 128 times or fewer stays on
+the tree-walker throughout, and so does every call before the threshold's: lin_solve's six cold
+calls at threshold 8, 3.11 G instructions each.
+
+The exemplars:
+- One counter per function, charged by calls and by loop iterations. V8's interrupt budget lives
+  in the function's FeedbackCell; each JumpLoop charges it the loop's bytecode length
+  (JumpBackward, src/interpreter/interpreter-assembler.cc:1179-1256), and a budget is
+  invocations times the function's bytecode length (ScaleInterruptBudget and
+  TieringManager::InterruptBudgetFor, src/execution/tiering-manager.cc:187-190, 268-291; fetched
+  at c8b709085e21 into target/p2/tiering/ext-v8), 8 invocations to the first tier-up (feedback
+  vectors and Sparkplug, flag-definitions.h:1110). SpiderMonkey's warm-up counter takes a call
+  or a loop head alike, 10 to the Baseline Interpreter and 100 to the Baseline JIT
+  (vm/Interpreter.cpp:2048-2091; jit/JitOptions.cpp:209-222). JSC's execution counter takes 15
+  an entry and 1 a loop iteration, 500 to Baseline (OptionsList.h:369-376).
+- A running activation enters compiled code at its next loop header once the function has it:
+  V8's JumpLoop checks for baseline code at every backedge (interpreter-generator.cc:2472-2541),
+  SpiderMonkey's LoopHead enters the Baseline Interpreter there, JSC's loop_osr enters Baseline
+  at that loop (LLIntSlowPaths.cpp:491-536). Every loop header is an entry, nested ones included;
+  V8 orders its optimizing OSR by loop depth (control-flow-builders.cc:81-91).
+
+Design, in three steps, each landed with its own test and counts:
+1. One budget per function. A call weighs 16 and a backedge on the tree-walker 1
+   (FunctionRuntime gains `backedges`), and the function compiles once calls × 16 + backedges
+   pass threshold × 16: at the default, 8 calls or 128 backedges in any mix, today's two numbers
+   made one budget. That is JSC's proportion, nearly; SpiderMonkey's 1:1 would make a backedge
+   worth a call, and V8's weighting by size needs sizes the tree-walker does not keep. Admission
+   follows the function: once its budget is spent at a header visit, or whenever the function
+   already has code, the next header visit of each of its tree-walked loops is admitted, so the
+   call leaves the tree-walker there, by a frame transfer where one exists and otherwise into the
+   loop's cached fragment. The budget compiles the function at that visit, where the call path
+   would (not a derived constructor, a closure under `with`, a generator or an async function;
+   threshold 0 and self-hosted code unchanged). A function that cannot compile and code outside
+   functions keep today's per-execution admission. Expected: lin_solve's first call leaves the
+   tree-walker within its first inner loop, and its later calls run compiled at any threshold.
+2. Frame transfers at nested loop headers: a FunctionOsrEntry for each for, while and do-while
+   loop whose enclosing statements are blocks, ifs, labels and other such loops, under the
+   conditions body-level entries meet now (no try handler but runtime lexical scopes' own, no
+   arguments object, inline depth 0). Excluded for the enclosing state they would need: try,
+   catch and finally, with, switch, and for-in and for-of (their iterators live in the
+   tree-walker's Rust frames). The tree-walker's enclosing statements receive the call's Return
+   completion and run nothing more, as above a body-level transfer now. One compile then replaces
+   a call's fragments; measured against step 1 before it lands.
+3. Code outside functions (Scripts, modules, eval): admission by each loop site's backedges over
+   all its executions, as V8 and SpiderMonkey count top-level code like a function's.
+
+Measures: NavierStokes's fixed-work drivers (target/p2/navier-threshold) at thresholds 0, 1, 2, 4
+and 8 for each step; the fixtures, chai and CodeLoad by instructions against main; Octane at 8 and
+1 and TRust's replays on a quiet machine after step 1, since more functions compile (a call that
+loops 128 times compiles its function even if nothing calls it again, which TRust pays per page).
+DIAGNOSTICS.md and the CLI help state the new rule.
+
+Tests: lin_solve's shape (loops nested in an if/else, 128 iterations each) at threshold 8, its
+first call's loops entering fragments once the budget is spent and its second call compiled (step
+1), and no fragment at all (step 2); a function that cannot compile and a Script's loops admitted
+as now (step 1); shadowing, dead zones, captured block bindings, labeled break and continue and
+per-iteration copies across a nested transfer (step 2).
