@@ -111,19 +111,60 @@ impl Words {
 
     /// A block with room for `capacity` words, or the static empty one for none.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        let mut words = Words::new();
-        if capacity != 0 {
-            words.reallocate(capacity, 0);
+        if capacity == 0 {
+            return Words::new();
         }
-        words
+        Words::fresh(capacity)
     }
 
-    /// An exact block of `values`.
-    pub(crate) fn from_values(values: impl ExactSizeIterator<Item = Value>) -> Self {
-        let mut words = Words::with_capacity(values.len());
-        for value in values {
-            words.push(value);
+    /// A new block with room for `capacity` words and none used: its header, with every kind
+    /// bit (no word breaks one), and past 64 words a record whose next trace reports every
+    /// word. Literals and host lists start here, without the growth path's copy.
+    fn fresh(capacity: usize) -> Self {
+        assert!(capacity <= MAX_WORDS, "element block of {capacity} words");
+        let record = record_words(capacity);
+        let block = crate::gc_storage::alloc_block(block_size(capacity + record));
+        // SAFETY: a fresh block of a header, `capacity` words and the record.
+        unsafe {
+            let words = block.as_ptr().add(HEADER_BYTES).cast::<u64>();
+            words.cast::<WordHeader>().sub(1).write(WordHeader {
+                used: 0,
+                capacity: capacity as u32,
+                shifted: 0,
+                flags: KIND_ALL,
+            });
+            if record != 0 {
+                words.add(capacity).write(TRACED_NONE);
+                std::ptr::write_bytes(words.add(capacity + 1), 0, record - 1);
+            }
+            Words(NonNull::new_unchecked(words))
         }
+    }
+
+    /// An exact block of `values`, written in one pass with their kind bits (array literals
+    /// and host lists build their elements here).
+    pub(crate) fn from_values(values: impl ExactSizeIterator<Item = Value>) -> Self {
+        let capacity = values.len();
+        let mut words = Words::with_capacity(capacity);
+        if capacity == 0 {
+            return words;
+        }
+        let mut flags = KIND_ALL;
+        let mut used = 0;
+        // SAFETY: a heap block with room for `capacity` words; no more are written, whatever
+        // the iterator's length claimed.
+        unsafe {
+            let first = words.0.as_ptr();
+            for value in values.take(capacity) {
+                let word = value.bits();
+                flags &= word_kind(word);
+                first.add(used).write(word);
+                used += 1;
+            }
+        }
+        let header = words.header_mut();
+        header.used = used as u32;
+        header.flags = flags;
         words
     }
 
@@ -527,7 +568,11 @@ impl Words {
     }
 
     /// After a marker reported every edge of the owner: the used words are traced and clean.
+    #[inline]
     pub(crate) fn finish_mark_trace(&self) {
+        if self.is_static_empty() {
+            return;
+        }
         let Some(record) = self.record() else {
             return;
         };
@@ -540,7 +585,11 @@ impl Words {
 
     /// Make the next trace report every word: the block's words were moved to another owner,
     /// or changed places.
+    #[inline]
     pub(crate) fn force_full(&self) {
+        if self.is_static_empty() {
+            return;
+        }
         if let Some(record) = self.record() {
             // SAFETY: as in `finish_mark_trace`.
             unsafe { record.write(TRACED_NONE) };
@@ -667,14 +716,9 @@ impl Words {
             .record()
             .filter(|_| front == 0 && record != 0)
             .map(|old| (old, self.bitmap_words().min(record - 1)));
-        // Checked: on a 32-bit target the byte count of a large reservation can pass usize.
-        let bytes = total
-            .checked_add(record)
-            .and_then(|words| words.checked_mul(8))
-            .and_then(|bytes| bytes.checked_add(HEADER_BYTES))
-            .filter(|&bytes| bytes <= isize::MAX as usize)
-            .expect("element block size");
-        let block = crate::gc_storage::alloc_block(bytes);
+        let block = crate::gc_storage::alloc_block(block_size(
+            total.checked_add(record).expect("element block size"),
+        ));
         // SAFETY: a fresh block of the front room, a header, `capacity` words and the record;
         // the used words are copied after `front` words of room, and a kept record's words
         // into the new one's (its bitmap covers the used words, as the old one's did).
@@ -701,6 +745,17 @@ impl Words {
             self.0 = NonNull::new_unchecked(words);
         }
     }
+}
+
+/// The bytes of a block of a header and `words` words, checked: on a 32-bit target the count of
+/// a large reservation can pass usize.
+#[inline]
+fn block_size(words: usize) -> usize {
+    words
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(HEADER_BYTES))
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .expect("element block size")
 }
 
 /// The kind bits a block keeps after holding `word`.

@@ -6095,13 +6095,32 @@ static EMPTY_INTERNAL_SLOTS: EmptyInternalSlots = EmptyInternalSlots(InternalSlo
 
 /// A property map's element sidecar (its first word, the nullable pointer the JIT follows), its
 /// Rust-heap extras, and its element words (W2c; the static empty block until it has elements).
-#[derive(Clone, Default)]
+#[derive(Default)]
 #[repr(C)]
 struct DenseStorage(
     Option<crate::gc_storage::StorageBox<DenseBuffers>>,
     Option<crate::gc_storage::PayloadBox<DenseExtras>>,
     word_block::Words,
 );
+
+impl Clone for DenseStorage {
+    /// Most maps a template or literal clones keep none of the three: that copy is a few loads,
+    /// in line.
+    #[inline]
+    fn clone(&self) -> Self {
+        if self.0.is_none() && self.1.is_none() && self.2.is_empty() {
+            return DenseStorage::default();
+        }
+        self.clone_parts()
+    }
+}
+
+impl DenseStorage {
+    #[inline(never)]
+    fn clone_parts(&self) -> Self {
+        DenseStorage(self.0.clone(), self.1.clone(), self.2.clone())
+    }
+}
 
 impl std::ops::Deref for DenseStorage {
     type Target = DenseBuffers;
@@ -8783,14 +8802,11 @@ impl Props {
         if let Some(n) = index {
             if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
                 // The escape may change the element's attributes, which a word does not keep:
-                // the element leaves for the named entries first, as a non-plain one does.
-                self.elems
-                    .words_mut()
-                    .unwrap()
-                    .set(n as usize, Value::Empty);
-                self.has_far.set(true);
-                self.mirror_invalidate();
-                self.insert_entry(PropKey::index(n), Property::plain(value));
+                // the element leaves for the named entries first, as a non-plain one does (a
+                // non-configurable define moves it), then takes back its plain attributes.
+                self.insert(PropKey::index(n), Property::data(value, true, true, false));
+                let slot = self.find(PropKey::index(n)).expect("the moved element");
+                self.entries.fields[slot].set_configurable(true);
             }
         }
         if text.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
@@ -9134,12 +9150,6 @@ impl Props {
             self.has_far.set(true);
             self.mirror_invalidate();
         }
-        self.insert_entry(key, prop);
-    }
-
-    /// [`Props::insert`] into the named entries: replace `key`'s entry or append one.
-    #[inline]
-    fn insert_entry(&mut self, key: PropKey, prop: Property) {
         if let Some(i) = self.find(key) {
             // A whole-descriptor replacement that changes descriptor class cannot stay
             // on a shape that records the old class: demote to a fresh unique shape
