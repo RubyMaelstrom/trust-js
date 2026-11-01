@@ -9272,6 +9272,32 @@ fn tdz_fn_toplevel() {
     assert_eq!(run("var g=10; g"), "10");
     assert_eq!(run("let a=1; { let a=2; } a"), "1");
 }
+/// A string-keyed destructuring of an array index name (`const {"0": v} = o`) reads the element
+/// in every tier: an own element word, a named index entry or an arguments object's element,
+/// and a prototype's element only when the receiver has none (ECMA-262 GetValue, [[Get]]).
+#[test]
+fn index_names_read_elements_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#"Object.prototype[0] = 'p';
+        function f(o) { const {"0": v} = o; return v; }
+        var out = [];
+        for (var i = 0; i < 50; i++) out.push(f(["a"]));
+        var named = []; Object.defineProperty(named, '0', {value: 'named', enumerable: true});
+        [out[0], out[49], f({0: 'own'}), f({}), f((function () { return arguments; })('arg')),
+         f(named), f(Object.create(['proto']))].join()"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => {
+                assert_eq!(value, "a,a,own,p,arg,named,proto", "{tier:?}")
+            }
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        }
+    }
+}
+
 #[test]
 fn property_order() {
     assert_eq!(

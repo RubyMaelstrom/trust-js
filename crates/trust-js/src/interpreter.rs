@@ -10564,6 +10564,12 @@ impl Interp {
     ) -> Option<CachedGet> {
         use crate::bytecode::{IcState, IC_MAX_DEPTH};
         type ObjCell = std::cell::RefCell<Object>;
+        // An array index name (string-keyed destructuring, `const {"0": v} = o`) names an
+        // element: an element word or a named index entry on any level, which this cache's
+        // per-level named lookup cannot see. Such a read takes the full [[Get]].
+        if crate::value::canonical_index(name).is_some() {
+            return None;
+        }
         let head = Gc::as_ptr(o);
         // Re-derive: walk the chain by raw pointer (every object is kept alive transitively by
         // `o`, nothing mutates during the read). On an ordinary descriptor within reach record
