@@ -3022,11 +3022,20 @@ pub struct Chunk {
     construct_positions: Box<[u32]>,
     /// One monomorphic identity cache per `New` site.
     construct_caches: Vec<std::cell::Cell<ConstructSite>>,
+    /// The weak pin of each `New` site's entry (see [`CallIc`]): it keeps the address of the
+    /// constructor that `construct_caches` names from being recycled while the entry names it.
+    /// A fill that names another constructor replaces it, so a site pins one constructor at
+    /// most, as a V8 construct feedback slot holds one weak target
+    /// (src/builtins/ic-callable.tq:227-276). Kept out of `call_pins`, whose pins outlive
+    /// their ways: a site that constructs a fresh class or closure on each pass would pin every
+    /// one of them for the chunk's life, as dead cells the heap must keep reserved.
+    construct_pins: Box<[std::cell::RefCell<crate::value::WeakGc>]>,
     /// One [`PrivateSite`] per private-name operation (`Op::GetPrivate` and its siblings).
     pub(crate) private_sites: Box<[PrivateSite]>,
     /// Weak handles pinning every callee address a call cache has ever recorded (see [`CallIc`]),
     /// keyed by that address — one pin per distinct callee no matter how often sites refill, so a
-    /// megamorphic site can't exhaust the budget for the whole chunk.
+    /// megamorphic site can't exhaust the budget for the whole chunk. Construct sites pin their
+    /// constructors in `construct_pins`.
     call_pins: std::cell::RefCell<crate::fasthash::FastMap<usize, crate::value::WeakGc>>,
     /// The inline sites this chunk's positions name (`crate::stack_trace::InlineSite`).
     inline_sites: crate::stack_trace::InlineSites,
@@ -3162,6 +3171,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             call_positions: _,
             construct_positions: _,
             construct_caches: _,
+            construct_pins: _,
             private_sites,
             call_pins: _,
             inline_sites: _,
@@ -3416,6 +3426,10 @@ impl Chunk {
             ))
             .saturating_add(vec_bytes!(call_caches, CallSite))
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
+            .saturating_add(
+                self.construct_pins.len()
+                    * std::mem::size_of::<std::cell::RefCell<crate::value::WeakGc>>(),
+            )
             .saturating_add(self.private_sites.len() * std::mem::size_of::<PrivateSite>())
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
@@ -3851,21 +3865,24 @@ impl Chunk {
     pub(crate) fn construct_cache(&self, cache: u32) -> ConstructSite {
         self.construct_caches[cache as usize].get()
     }
+    /// Record `entry` at construct site `cache`, with `pin`, the weak pin of its constructor
+    /// (`entry.call.callee`): the engine's construct cache's own (`Interp::construct_ics`),
+    /// which the site shares, so a fill allocates none.
     pub(crate) fn fill_construct_cache(
         &self,
         cache: u32,
         entry: ConstructSite,
-        constructor: &crate::value::Gc,
+        pin: &crate::value::WeakGc,
     ) {
         if entry.call.epoch == u32::MAX || !crate::value::is_cacheable_shape(entry.prototype_shape)
         {
             return;
         }
+        debug_assert_eq!(pin.as_ptr() as usize, entry.call.callee);
+        // The entry and its pin change together: once the new entry is stored, no entry of this
+        // site names the old constructor's address, so its pin may go.
         self.construct_caches[cache as usize].set(entry);
-        self.call_pins
-            .borrow_mut()
-            .entry(entry.call.callee)
-            .or_insert_with(|| crate::value::Gc::downgrade(constructor));
+        *self.construct_pins[cache as usize].borrow_mut() = pin.clone();
     }
     /// Whether calls need a real activation environment (captured locals / lexical `this`).
     fn makes_env(&self) -> bool {
@@ -8510,6 +8527,9 @@ fn finish_chunk(
         call_positions,
         construct_positions,
         inline_sites,
+        construct_pins: (0..c.construct_caches.len())
+            .map(|_| std::cell::RefCell::new(crate::value::WeakGc::new()))
+            .collect(),
         construct_caches: c.construct_caches,
         private_sites: (0..c.private_sites).map(|_| PrivateSite::new()).collect(),
         call_pins: std::cell::RefCell::new(c.call_pins),

@@ -16263,7 +16263,9 @@ impl Interp {
         // compile/reclaim code, turn the validated raw pointer into a lease.
         let code = unsafe { crate::jit::cache::lease_raw(ic.code) };
         if cached_site.is_none() {
-            if let Some((chunk, cache)) = site {
+            // The site shares the engine construct cache's pin of the constructor, which the
+            // lookup above found or `construct_ic_fill` made.
+            if let (Some((chunk, cache)), Some(entry)) = (site, self.construct_ics.get(&key)) {
                 chunk.fill_construct_cache(
                     cache,
                     crate::bytecode::ConstructSite {
@@ -16272,7 +16274,7 @@ impl Interp {
                         prototype_slot,
                         arguments_apply_forwarder,
                     },
-                    o,
+                    &entry.pin,
                 );
             }
         }

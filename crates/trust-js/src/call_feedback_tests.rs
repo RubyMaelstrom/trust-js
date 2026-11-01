@@ -364,3 +364,76 @@ fn the_inline_planner_skips_megamorphic_sites_and_recompiles_keep_them() {
         .iter()
         .any(|seed| seed.evictions >= CALL_SITE_MEGAMORPHIC_EVICTIONS));
 }
+
+/// A `new` site that constructs a fresh class, or a fresh closure of one function, on each pass
+/// pins one constructor, the one its entry names, not every one it has seen: a dead
+/// constructor's pin keeps its cell reserved and its weak cell in every minor collection's scan.
+/// ARES-6 Air's `Liveness.prototype.localCalc` (`class LocalCalc` and `new LocalCalc()`) left
+/// 62,000 of them in one chunk's call pins a round. V8's construct feedback slot holds one weak
+/// target too (src/builtins/ic-callable.tq:227-276).
+#[test]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn a_construct_site_of_fresh_constructors_pins_only_its_entry() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    assert_eq!(
+        eval(
+            &mut engine,
+            "function makeClass(x) { class Local { constructor() { this.x = x; } } return new Local(); }
+             function makeFunction(x) { function Local() { this.x = x; } return new Local(); }
+             var sum = 0;
+             for (var k = 0; k < 300; k++) sum += makeClass(k).x + makeFunction(k).x;
+             sum"
+        ),
+        "89700"
+    );
+    for maker in ["makeClass", "makeFunction"] {
+        // Every chunk the function runs (a second-stage compile included) holds this.
+        let env = engine.interp.global_env;
+        let value: Value = engine.interp.get_var(maker, &env).ok().expect("bound name");
+        let ValueView::Obj(function) = value.view() else {
+            panic!("{maker} is not an object")
+        };
+        let call = &function.borrow().call;
+        let Callable::User(user) = call else {
+            panic!("{maker} is not a user function")
+        };
+        let runtime = user.func.runtime();
+        let chunks: Vec<std::rc::Rc<Chunk>> = [runtime.code.get(), runtime.code2.get()]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .cloned()
+            .collect();
+        let mut filled = 0;
+        for chunk in &chunks {
+            let named: Vec<usize> = chunk
+                .construct_caches
+                .iter()
+                .map(|site| site.get().call.callee)
+                .filter(|&callee| callee != 0)
+                .collect();
+            let pinned: Vec<usize> = chunk
+                .construct_pins
+                .iter()
+                .map(|pin| pin.borrow().as_ptr() as usize)
+                .filter(|&ptr| ptr != 0)
+                .collect();
+            assert_eq!(
+                pinned, named,
+                "{maker} pins exactly its entry's constructor"
+            );
+            assert!(
+                chunk.call_pins.borrow().is_empty(),
+                "{maker}'s call pins hold {} constructors",
+                chunk.call_pins.borrow().len()
+            );
+            filled += named.len();
+        }
+        assert!(filled >= 1, "{maker}'s site took the construct cache");
+    }
+}
