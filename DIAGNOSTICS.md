@@ -27,8 +27,10 @@ comment/example in the same change.
   bytecode remains eager, and self-hosted methods compile on their first call. Once its
   function has tiered up, a call still on the tree-walker leaves it at its next loop header,
   and any loop leaves after 128 backedges of one execution, without repeating its parameter
-  binding, hoisting or prefix effects. Eligible body-level loops transfer their whole function
-  frame; other loops enter a compiled fragment. Captures, mapped arguments and eval
+  binding, hoisting or prefix effects. A for, while or do-while loop the body reaches through
+  blocks, ifs, labels and other such loops transfers the whole function frame; a loop under
+  try, catch, finally, switch, with, for-in or for-of enters a compiled fragment. Captures,
+  mapped arguments and eval
   retain their live environments; unsupported activation projections or active outer author
   cleanup use the existing loop-fragment path. Ordinary/base constructor frames can transfer
   after `this` is initialized; derived constructors retain their contextual fragment path.
