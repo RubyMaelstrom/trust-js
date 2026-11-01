@@ -3888,7 +3888,7 @@ impl crate::gc_trace::GcTrace for Props {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         self.trace_storage(sink);
         crate::gc_trace::GcTrace::trace_gc(&self.entries.layout, sink);
-        for property in self.values() {
+        for property in self.packed_values().chain(self.entries.fields.iter()) {
             crate::gc_trace::GcTrace::trace_gc(property, sink);
         }
         self.trace_symbol_keys(sink);
@@ -10022,13 +10022,14 @@ impl Props {
     }
 
     /// Every live property value, including keyless packed elements (for GC tracing).
-    pub(crate) fn values(&self) -> impl Iterator<Item = &Property> {
+    pub(crate) fn values(&self) -> impl Iterator<Item = Element<'_>> {
         self.elems
             .packed_ref()
             .into_iter()
             .flat_map(|p| p.iter())
             .filter(|p| !p.is_empty())
             .chain(self.entries.fields.iter())
+            .map(Element::entry)
     }
 
     /// Keyless packed elements only. Managed-memory traversal visits named entries together with
@@ -10044,12 +10045,14 @@ impl Props {
     /// All own array-index descriptors, independent of physical storage. Guards
     /// for OrdinarySet / indexed Get must not mistake a packed descriptor for
     /// an absent property. Named iteration intentionally excludes packed elements.
-    pub(crate) fn indexed_properties(&self) -> impl Iterator<Item = &Property> {
-        self.packed_values().chain(
-            self.entries
-                .iter()
-                .filter_map(|(key, property)| key.as_index().map(|_| property)),
-        )
+    pub(crate) fn indexed_properties(&self) -> impl Iterator<Item = Element<'_>> {
+        self.packed_values()
+            .chain(
+                self.entries
+                    .iter()
+                    .filter_map(|(key, property)| key.as_index().map(|_| property)),
+            )
+            .map(Element::entry)
     }
 
     pub(crate) fn highest_nonconfig_index_from(&self, from: usize) -> Option<usize> {
