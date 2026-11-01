@@ -212,7 +212,12 @@ comment/example in the same change.
   (`card_cells`) and the bytes it promoted. `TRUST_JS_GC_CENSUS=1`
   adds a `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
   live objects after every collection and of objects as they die, by family (it walks the
-  heap at each collection; diagnostic only). In test builds, `TRUST_JS_GC_WHY=1` records
+  heap at each collection; diagnostic only), and prints a `[gc-elements]` line after each
+  collection: for arrays, arguments objects and other objects with index keys or element
+  storage, their count, element slots, elements and holes, the plain ones (no accessor, no
+  attributes but the defaults, no far key) and of those the holey, all-Number and all-int32
+  ones, and the bytes of each element storage part, beside the same objects' bytes under
+  W2c's 8-byte words (`w2c`). In test builds, `TRUST_JS_GC_WHY=1` records
   why each cell was marked (tests print the path with `gc_test::why`/`why_address`; a
   stack root names its frame's return address, for `addr2line`, and its depth below that
   frame's record), and `TRUST_JS_SEGV_BACKTRACE=1` prints a backtrace on a fault.

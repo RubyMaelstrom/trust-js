@@ -1168,6 +1168,15 @@ impl Interp {
         if crate::value::layout_census::enabled() {
             crate::value::layout_census::sample_live(&heap);
         }
+        if crate::value::elem_census::enabled() {
+            crate::value::elem_census::sample(
+                &heap,
+                match kind {
+                    CollectionKind::Minor => "minor",
+                    CollectionKind::Major => "major",
+                },
+            );
+        }
         crate::value::gc_finish_generation(&heap);
         if let Some(pending) = heap.agent.pending.get() {
             // A request made while the core was borrowed could publish only Agent metadata.

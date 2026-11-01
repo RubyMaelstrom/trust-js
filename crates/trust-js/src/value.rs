@@ -9,6 +9,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 #[path = "dense_deque.rs"]
 mod dense_deque;
+#[path = "elem_census.rs"]
+pub(crate) mod elem_census;
 pub(crate) use dense_deque::DenseDeque;
 #[cfg(feature = "architecture-diagnostics")]
 #[path = "allocation_diagnostics.rs"]
