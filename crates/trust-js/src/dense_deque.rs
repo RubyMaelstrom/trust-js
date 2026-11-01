@@ -77,6 +77,9 @@ impl<T> DenseDeque<T> {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
+    // Front edits and splices served packed Property elements, words since W2c step 2c; step 3
+    // retires the deque with the slot map and the mirror.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn front_capacity(&self) -> usize {
         self.front
     }
@@ -152,6 +155,7 @@ impl<T> DenseDeque<T> {
         Some(unsafe { self.ptr.as_ptr().add(self.len).read() })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn pop_front(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;
@@ -164,6 +168,7 @@ impl<T> DenseDeque<T> {
         Some(first)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn prepend(
         &mut self,
         items: impl ExactSizeIterator<Item = T> + DoubleEndedIterator,
@@ -203,14 +208,7 @@ impl<T> DenseDeque<T> {
         self.front = 0;
     }
 
-    pub(super) fn resize_with(&mut self, length: usize, mut make: impl FnMut() -> T) {
-        self.truncate(length);
-        self.reserve_exact(length.saturating_sub(self.len));
-        while self.len < length {
-            self.push(make());
-        }
-    }
-
+    #[cfg_attr(not(test), allow(dead_code))]
     fn into_vec(mut self) -> Vec<T> {
         let length = self.len;
         let mut vector = Vec::with_capacity(self.capacity());
@@ -223,6 +221,7 @@ impl<T> DenseDeque<T> {
         vector
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     /// General splices are linear as specified; shift/unshift use the end operations.
     pub(crate) fn splice(
         &mut self,

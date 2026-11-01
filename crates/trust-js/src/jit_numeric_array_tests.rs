@@ -457,7 +457,7 @@ fn check_hole_filling_region_storage(packed: bool) {
         #[cfg(target_arch = "aarch64")]
         if tier == Tier::Jit {
             assert_eq!(
-                object.borrow().props.packed_values().count(),
+                object.borrow().props.word_values().count(),
                 if packed { 4 } else { 0 },
                 "fixture must exercise the selected packed or classic storage contract"
             );

@@ -1,3 +1,5 @@
+//! Number arrays in element words: the words are the f64 view, so a word array keeps no
+//! numeric mirror, and its kind bits stay exact through every edit.
 use super::*;
 use crate::value::ValueView;
 
@@ -20,43 +22,46 @@ fn packed(length: usize) -> Props {
     properties
 }
 
+/// The kind bits a scan of the words proves, which the header's bits never exceed.
+fn exact_kind(props: &Props) -> u32 {
+    let words = props.elems.words().expect("element words");
+    assert_eq!(
+        words.kind() & !words.computed_kind(),
+        0,
+        "kind bits beyond the words"
+    );
+    words.kind()
+}
+
 #[test]
-fn packed_mirror_storage_only_adds_numeric_words_and_preserves_canonical_addresses() {
-    for length in [3, 16] {
+fn number_words_keep_no_mirror_and_their_kind_bits() {
+    for length in [3, 16, 4097] {
         let mut props = packed(length);
         props.insert("named", Property::plain(Value::lstr("kept")));
         let before = props.retained_requested_storage_bytes().0;
-        let pointer = props.elems.packed_ref().unwrap().as_ptr();
+        let pointer = props.elems.words().unwrap().as_slice().as_ptr();
         let shape = props.shape();
-        let length_slot = props.slot_of("length");
-        let keys = props.ordered_keys();
-        assert!(props.prepare_packed_numeric_mirror());
-        assert_eq!(props.elems.packed_ref().unwrap().as_ptr(), pointer);
+        assert!(!props.prepare_packed_numeric_mirror());
+        assert_eq!(props.elems.words().unwrap().as_slice().as_ptr(), pointer);
+        assert_eq!(props.shape(), shape);
+        assert_eq!(props.retained_requested_storage_bytes().0, before);
+        assert_eq!(props.elems.mirror_len(), 0);
         assert_eq!(
-            (props.shape(), props.slot_of("length")),
-            (shape, length_slot)
+            exact_kind(&props),
+            word_block::KIND_NO_HOLES | word_block::KIND_NUMBERS | word_block::KIND_INT32
         );
-        assert_eq!(props.ordered_keys(), keys);
-        assert_eq!(
-            props.retained_requested_storage_bytes().0 - before,
-            length * 8
-        );
-        assert_eq!(
-            props.mirror_flags,
-            MIRROR_OK | MIRROR_PACKED | MIRROR_NO_HOLES | MIRROR_ALL_I32
-        );
-        for index in 0..length {
-            assert_eq!(props.mirror_get(index as u32), Some(index as f64));
+        for index in [0, length / 2, length - 1] {
+            assert_eq!(
+                props.get_index(index as u32).unwrap().number_value(),
+                Some(index as f64)
+            );
         }
-        let mirror_pointer = props.elems.mirror.as_ptr();
-        assert!(props.prepare_packed_numeric_mirror());
-        assert_eq!(props.elems.mirror.as_ptr(), mirror_pointer);
     }
 }
 
 #[test]
-fn packed_mirror_mutable_escapes_and_structural_edits_invalidate_the_view() {
-    let edits: [(&str, fn(&mut Props)); 8] = [
+fn word_edits_keep_the_kind_bits_exact() {
+    let edits: [(&str, fn(&mut Props)); 9] = [
         ("get_mut", |p| {
             p.get_mut("0").unwrap().set_value(Value::Num(8.0));
         }),
@@ -68,7 +73,7 @@ fn packed_mirror_mutable_escapes_and_structural_edits_invalidate_the_view() {
                 .try_append_element(3, Property::plain(Value::Num(8.0)))
                 .is_ok())
         }),
-        ("push", |p| p.push_dense(Property::plain(Value::Num(8.0)))),
+        ("push", |p| p.push_dense(Property::plain(Value::Num(8.5)))),
         ("delete", |p| assert!(p.remove("0"))),
         ("pop", |p| {
             assert!(p.pop_last_element(2).is_some());
@@ -77,96 +82,70 @@ fn packed_mirror_mutable_escapes_and_structural_edits_invalidate_the_view() {
         ("non-number", |p| {
             assert!(p.set_index_value(0, Value::lstr("changed")).is_ok())
         }),
+        ("hole", |p| p.insert("1", Property::plain(Value::Empty))),
     ];
     for (name, edit) in edits {
         let mut props = packed(3);
-        assert!(props.prepare_packed_numeric_mirror());
         edit(&mut props);
-        if name == "pop" {
-            // A validated tail removal preserves both the canonical descriptors
-            // and their numeric view; only the removed index ceases to exist.
-            assert_eq!(props.mirror_get(0), Some(0.0));
-            assert_eq!(props.mirror_get(1), Some(1.0));
-            assert!(props.mirror_get(2).is_none());
-            assert!(props.get_index(2).is_none());
-            assert!(props.elems.inline_packed.packed_plain.get());
-            continue;
-        }
-        if dense_elements_enabled() && matches!(name, "append" | "push") {
-            assert_eq!(props.mirror_get(0), Some(0.0), "{name}");
-            assert_eq!(props.mirror_get(3), Some(8.0), "{name}");
-            assert_eq!(props.get_index(3).unwrap().number_value(), Some(8.0));
-            continue;
-        }
-        assert_eq!(props.mirror_flags & MIRROR_OK, 0, "{name}");
-        assert!(props.mirror_get(0).is_none(), "{name}");
+        let kind = exact_kind(&props);
+        let expected = match name {
+            "push" => word_block::KIND_NO_HOLES | word_block::KIND_NUMBERS,
+            "non-number" => word_block::KIND_NO_HOLES,
+            "delete" | "hole" => word_block::KIND_NUMBERS | word_block::KIND_INT32,
+            // The escape moved element 0 to the named entries, its word a hole.
+            "get_mut" => word_block::KIND_NUMBERS | word_block::KIND_INT32,
+            _ => word_block::KIND_ALL,
+        };
+        assert_eq!(kind, expected, "{name}");
+        assert_eq!(props.elems.mirror_len(), 0, "{name}");
     }
 }
 
 #[test]
-fn packed_mirror_numbers_preserve_bits_and_refused_states_recover_after_mutation() {
+fn number_words_preserve_bits_and_their_kind_comes_back_only_when_proven() {
     let mut props = packed(3);
-    assert!(props.prepare_packed_numeric_mirror());
     for number in [0.5, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         assert!(props.set_index_value(0, Value::Num(number)).is_ok());
-        assert_eq!(props.mirror_get(0).unwrap().to_bits(), number.to_bits());
-        assert_eq!(props.mirror_flags & MIRROR_ALL_I32, 0);
+        assert_eq!(
+            props
+                .get_index(0)
+                .unwrap()
+                .number_value()
+                .unwrap()
+                .to_bits(),
+            number.to_bits()
+        );
+        assert_eq!(exact_kind(&props) & word_block::KIND_INT32, 0);
     }
-    props
-        .get_mut("0")
-        .unwrap()
-        .set_value(Value::lstr("not numeric"));
-    let before = props.retained_requested_storage_bytes().0;
-    assert!(!props.prepare_packed_numeric_mirror());
-    assert_eq!(props.mirror_flags, MIRROR_PACKED_FAILED);
-    assert!(!props.prepare_packed_numeric_mirror());
-    assert_eq!(props.retained_requested_storage_bytes().0, before);
+    assert!(props.set_index_value(0, Value::lstr("not numeric")).is_ok());
+    assert_eq!(exact_kind(&props), word_block::KIND_NO_HOLES);
+    // The bits are clear-only: a Number written back leaves them clear until a proof.
     assert!(props.set_index_value(0, Value::Num(7.0)).is_ok());
-    assert!(props.prepare_packed_numeric_mirror());
-    assert_eq!(props.mirror_get(0), Some(7.0));
-    props.get_mut("0").unwrap().set_writable(false);
-    assert!(!props.prepare_packed_numeric_mirror());
-    props.get_mut("0").unwrap().set_writable(true);
-    assert!(props.prepare_packed_numeric_mirror());
-    props.remove("1");
-    assert!(!props.prepare_packed_numeric_mirror());
-    props.insert("1", Property::plain(Value::Num(1.0)));
-    assert!(props.prepare_packed_numeric_mirror());
+    assert_eq!(exact_kind(&props), word_block::KIND_NO_HOLES);
+    let words = props.elems.words_mut().unwrap();
+    assert_eq!(words.reprove(), word_block::KIND_ALL);
+    assert_eq!(exact_kind(&props), word_block::KIND_ALL);
     props.clear();
-    assert!(!props.prepare_packed_numeric_mirror());
     assert!(props.values().next().is_none());
 }
 
 #[test]
-fn packed_mirror_clone_is_independent_and_preparation_work_is_bounded() {
+fn cloned_number_words_are_independent() {
     let mut original = packed(3);
     original.insert("named", Property::plain(Value::lstr("kept")));
-    assert!(original.prepare_packed_numeric_mirror());
     let mut copy = original.clone();
-    assert_ne!(original.elems.mirror.as_ptr(), copy.elems.mirror.as_ptr());
+    assert_ne!(
+        original.elems.words().unwrap().as_slice().as_ptr(),
+        copy.elems.words().unwrap().as_slice().as_ptr()
+    );
     assert!(copy.set_index_value(0, Value::Num(0.5)).is_ok());
-    assert_eq!(original.mirror_get(0), Some(0.0));
-    assert_eq!(copy.mirror_get(0), Some(0.5));
-    original
-        .get_mut("1")
-        .unwrap()
-        .set_value(Value::lstr("changed"));
+    assert_eq!(original.get_index(0).unwrap().number_value(), Some(0.0));
+    assert_eq!(copy.get_index(0).unwrap().number_value(), Some(0.5));
+    assert_eq!(exact_kind(&original), word_block::KIND_ALL);
+    assert!(original.set_index_value(1, Value::lstr("changed")).is_ok());
     drop(original);
-    assert_eq!(copy.mirror_get(1), Some(1.0));
+    assert_eq!(copy.get_index(1).unwrap().number_value(), Some(1.0));
     assert!(
         matches!((copy.get("named").unwrap().value()).view(), ValueView::Str(value) if value.text() == "kept")
     );
-
-    let mut maximum = packed(4096);
-    assert!(maximum.prepare_packed_numeric_mirror());
-    assert_eq!(maximum.elems.mirror.len(), 4096);
-    let mut oversized = packed(4097);
-    let before = oversized.retained_requested_storage_bytes().0;
-    let pointer = oversized.elems.packed_ref().unwrap().as_ptr();
-    for _ in 0..3 {
-        assert!(!oversized.prepare_packed_numeric_mirror());
-        assert_eq!(oversized.elems.packed_ref().unwrap().as_ptr(), pointer);
-        assert_eq!(oversized.retained_requested_storage_bytes().0, before);
-        assert_eq!(oversized.mirror_flags, MIRROR_PACKED_FAILED);
-    }
 }

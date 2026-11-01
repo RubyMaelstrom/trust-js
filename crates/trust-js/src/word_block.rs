@@ -14,6 +14,13 @@
 //! A block is plain data in the heap's storage pages (`gc_storage`): dropping a [`Words`] reads
 //! nothing, the owner reports the block and traces its words ([`Words::trace`]), and growth just
 //! drops the old block's address for the collector to free.
+//!
+//! A block of more than [`REMEMBER_MIN`] words keeps a remembered record after its last word: the
+//! length its last full mark traced, and a dirty bit for each [`DIRTY_BLOCK`] words below it that
+//! an edge has been written to since. A remembered (minor) trace of an old array then reports the
+//! dirty runs and the words past the traced length, not every word, as P1's PackedBuffer did
+//! (S6). Every write of an edge goes through [`Words::set`], growth that keeps the words' indices
+//! keeps the record, and every reordering forces the next trace to report all words.
 use super::*;
 use std::ptr::NonNull;
 
@@ -61,6 +68,30 @@ static EMPTY: Empty = Empty {
 
 /// The largest block: its `used` and `capacity` must fit their u32 fields.
 const MAX_WORDS: usize = u32::MAX as usize >> 1;
+
+/// A block with room for more words than this, front room included, keeps a remembered record.
+pub(crate) const REMEMBER_MIN: usize = 64;
+/// The words one dirty bit covers.
+pub(crate) const DIRTY_BLOCK: usize = 64;
+/// A record's traced length when the next trace must report every word.
+const TRACED_NONE: u64 = u64::MAX;
+
+/// The record's words after a block with room for `words` words: none for a small block, else
+/// the traced length and the dirty bitmap.
+pub(crate) fn record_words(words: usize) -> usize {
+    if words <= REMEMBER_MIN {
+        0
+    } else {
+        1 + words.div_ceil(DIRTY_BLOCK).div_ceil(64)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The words a marker's trace visited, full and remembered.
+    pub(crate) static MARK_VISITS: std::cell::Cell<[usize; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+}
 
 /// A map's element words (see the module comment).
 pub(crate) struct Words(NonNull<u64>);
@@ -128,6 +159,12 @@ impl Words {
         self.header().capacity as usize
     }
 
+    /// The words of front room before the header, which shifts left.
+    #[inline]
+    pub(crate) fn front_room(&self) -> usize {
+        self.header().shifted as usize
+    }
+
     /// The kind bits of the used words.
     #[inline]
     pub(crate) fn kind(&self) -> u32 {
@@ -149,11 +186,12 @@ impl Words {
         (word != PACK_EMPTY).then(|| unsafe { Value::from_bits(word) })
     }
 
-    /// Store `value` at `index`, below the used length, keeping the kind bits.
+    /// Store `value` at `index`, below the used length, keeping the kind bits and the record.
     pub(crate) fn set(&mut self, index: usize, value: Value) {
         assert!(index < self.len(), "word index {index} past {}", self.len());
         let word = value.bits();
         self.note(word);
+        self.remember(index, word);
         // SAFETY: a used word of a heap block (the static block has none).
         unsafe { self.0.as_ptr().add(index).write(word) };
     }
@@ -176,6 +214,7 @@ impl Words {
         let len = self.len().checked_sub(1)?;
         let word = self.as_slice()[len];
         self.header_mut().used = len as u32;
+        self.lower_traced(len);
         Some(word)
     }
 
@@ -186,6 +225,8 @@ impl Words {
         }
         let header = *self.header();
         let first = self.as_slice()[0];
+        // Every word's index moves: the next trace reports them all.
+        self.force_full();
         // SAFETY: the header moves one word forward, onto the word just read; the words after
         // it stay where they are.
         unsafe {
@@ -212,6 +253,8 @@ impl Words {
             .iter()
             .fold(header.flags, |flags, value| flags & word_kind(value.bits()));
         if !self.is_static_empty() && header.shifted as usize >= n {
+            // Every word's index moves: the next trace reports them all.
+            self.force_full();
             // SAFETY: the front room holds `n` words and the header before them; the new
             // header is written before the words that may cover the old one.
             unsafe {
@@ -229,9 +272,12 @@ impl Words {
             }
             return;
         }
+        // Front room of at least the used words again, as P1's deque prepend kept, so repeated
+        // unshifts move the words once per doubling (SpiderMonkey's tryUnshiftDenseElements
+        // reserves room ahead the same way).
         let len = self.len();
-        self.reallocate(grown(len, n), n);
-        // SAFETY: `reallocate` left `n` words of room before the copied ones, in a heap block.
+        self.reallocate_with_room(grown(len, n), n, len.max(8));
+        // SAFETY: the new block has `n` words of room before the copied ones.
         unsafe {
             for (i, value) in values.iter().enumerate() {
                 self.0.as_ptr().add(i).write(value.bits());
@@ -242,10 +288,48 @@ impl Words {
         header.flags = flags;
     }
 
+    /// Reverse the used words in place; their kind bits stay true.
+    pub(crate) fn reverse(&mut self) {
+        let len = self.len();
+        if len > 1 {
+            // Words change places: the next trace reports them all.
+            self.force_full();
+            // SAFETY: the used words of a heap block, which `&mut self` holds uniquely.
+            unsafe { std::slice::from_raw_parts_mut(self.0.as_ptr(), len) }.reverse();
+        }
+    }
+
+    /// Replace the words in `range` by `values`, returning the values removed (holes as
+    /// `None`), as `Vec::splice` does.
+    pub(crate) fn splice(
+        &mut self,
+        range: std::ops::Range<usize>,
+        values: &[Value],
+    ) -> Vec<Option<Value>> {
+        let words = self.as_slice();
+        let removed = words[range.clone()]
+            .iter()
+            // SAFETY: a used word is a Value's bits.
+            .map(|&word| (word != PACK_EMPTY).then(|| unsafe { Value::from_bits(word) }))
+            .collect();
+        let suffix = words[range.end..].to_vec();
+        self.truncate(range.start);
+        self.reserve(values.len() + suffix.len());
+        for &value in values {
+            self.push(value);
+        }
+        for word in suffix {
+            // SAFETY: as above.
+            self.push(unsafe { Value::from_bits(word) });
+        }
+        removed
+    }
+
     /// Keep the first `len` words.
     pub(crate) fn truncate(&mut self, len: usize) {
         if len < self.len() {
             self.header_mut().used = len as u32;
+            self.lower_traced(len);
         }
     }
 
@@ -267,6 +351,14 @@ impl Words {
         let header = self.header_mut();
         header.used = len as u32;
         header.flags &= !KIND_NO_HOLES;
+    }
+
+    /// Room for exactly `additional` more words, when there is less.
+    pub(crate) fn reserve_exact(&mut self, additional: usize) {
+        let len = self.len();
+        if self.capacity() - len < additional {
+            self.reallocate(len + additional, 0);
+        }
     }
 
     /// Room for `additional` more words without growing.
@@ -304,19 +396,196 @@ impl Words {
         Some(unsafe { self.0.as_ptr().cast::<u8>().sub(front) })
     }
 
-    /// Report the block and the edges of its words. A Numbers block has none.
+    /// Report the block and the edges of its words.
+    #[cfg(test)]
     pub(crate) fn trace<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        let Some(start) = self.block_start() else {
-            return;
-        };
-        crate::gc_storage::trace_block(start, sink);
+        if let Some(start) = self.block_start() {
+            crate::gc_storage::trace_block(start, sink);
+        }
+        self.trace_values(None, sink);
+    }
+
+    /// Report the edges of the words, not the block. A Numbers block has none. A marker's
+    /// remembered trace reports only the dirty runs below the traced length and the words past
+    /// it; every other trace (a marker's full one, or `None`'s, the verifiers' and the
+    /// heap walks') reports every word.
+    pub(crate) fn trace_values<S: crate::gc_trace::GcSink + ?Sized>(
+        &self,
+        purpose: Option<crate::gc_core::TracePurpose>,
+        sink: &mut S,
+    ) {
         if self.kind() & KIND_NUMBERS != 0 {
             return;
         }
-        for &word in self.as_slice() {
-            if word != PACK_EMPTY {
-                // SAFETY: a used word is a Value's bits.
-                sink.value(&unsafe { Value::from_bits(word) });
+        let words = self.as_slice();
+        let mut report = |range: std::ops::Range<usize>| {
+            #[cfg(test)]
+            if let Some(purpose) = purpose {
+                MARK_VISITS.with(|visits| {
+                    let mut counts = visits.get();
+                    counts[usize::from(purpose == crate::gc_core::TracePurpose::Remembered)] +=
+                        range.len();
+                    visits.set(counts);
+                });
+            }
+            for &word in &words[range] {
+                if word != PACK_EMPTY {
+                    // SAFETY: a used word is a Value's bits.
+                    sink.value(&unsafe { Value::from_bits(word) });
+                }
+            }
+        };
+        let traced = match (purpose, self.record()) {
+            // SAFETY: a record's first word is its traced length.
+            (Some(crate::gc_core::TracePurpose::Remembered), Some(record)) => unsafe {
+                record.read()
+            },
+            _ => TRACED_NONE,
+        };
+        let len = words.len();
+        if traced == TRACED_NONE {
+            report(0..len);
+            return;
+        }
+        let prefix = (traced as usize).min(len);
+        let record = self.record().unwrap();
+        let bitmap = self.bitmap_words();
+        // The dirty blocks below the prefix, adjacent ones merged into one run.
+        let mut run: Option<std::ops::Range<usize>> = None;
+        'bits: for bit_word in 0..bitmap {
+            // SAFETY: the bitmap follows the traced length, `bitmap` words of it.
+            let mut bits = unsafe { record.add(1 + bit_word).read() };
+            while bits != 0 {
+                let block = bit_word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let start = block * DIRTY_BLOCK;
+                if start >= prefix {
+                    break 'bits;
+                }
+                let end = (start + DIRTY_BLOCK).min(prefix);
+                match &mut run {
+                    Some(open) if open.end == start => open.end = end,
+                    Some(open) => {
+                        report(open.clone());
+                        *open = start..end;
+                    }
+                    None => run = Some(start..end),
+                }
+            }
+        }
+        match run {
+            Some(open) if open.end == prefix => report(open.start..len),
+            Some(open) => {
+                report(open);
+                report(prefix..len);
+            }
+            None => report(prefix..len),
+        }
+    }
+
+    /// After a marker reported every edge of the owner: the used words are traced and clean.
+    pub(crate) fn finish_mark_trace(&self) {
+        let Some(record) = self.record() else {
+            return;
+        };
+        // SAFETY: the record's words, which no reference covers (see `record`).
+        unsafe {
+            record.write(self.len() as u64);
+            std::ptr::write_bytes(record.add(1).as_ptr(), 0, self.bitmap_words());
+        }
+    }
+
+    /// Make the next trace report every word: the block's words were moved to another owner,
+    /// or changed places.
+    pub(crate) fn force_full(&self) {
+        if let Some(record) = self.record() {
+            // SAFETY: as in `finish_mark_trace`.
+            unsafe { record.write(TRACED_NONE) };
+        }
+    }
+
+    /// The traced length (`None` for every word next) and the dirty blocks, for tests.
+    #[cfg(test)]
+    pub(crate) fn remembered(&self) -> Option<(Option<usize>, Vec<usize>)> {
+        let record = self.record()?;
+        // SAFETY: as in `trace_values`.
+        let traced = unsafe { record.read() };
+        let blocks = (0..self.bitmap_words() * 64)
+            .filter(
+                |&block| unsafe { record.add(1 + block / 64).read() } & (1 << (block % 64)) != 0,
+            )
+            .collect();
+        Some(((traced != TRACED_NONE).then_some(traced as usize), blocks))
+    }
+
+    /// The bytes of the block: front room, header, words and record.
+    pub(crate) fn block_bytes(&self) -> usize {
+        if self.is_static_empty() {
+            return 0;
+        }
+        let words = self.block_words();
+        HEADER_BYTES + 8 * (words + record_words(words))
+    }
+
+    /// The words the block has room for, front room included (a shift moves the first word and
+    /// the header, never the block's end).
+    #[inline]
+    fn block_words(&self) -> usize {
+        let header = self.header();
+        header.capacity as usize + header.shifted as usize
+    }
+
+    /// The remembered record, just past the block's last word, for a block that keeps one. It
+    /// is read and written only through this pointer, never a reference, so a shared `Words`
+    /// may update it (the marker's `finish_mark_trace`).
+    #[inline]
+    fn record(&self) -> Option<NonNull<u64>> {
+        // SAFETY: `capacity` words on from the first word is the block's end, where the record
+        // begins (`reallocate`); the static block keeps none.
+        (self.block_words() > REMEMBER_MIN)
+            .then(|| unsafe { self.0.add(self.header().capacity as usize) })
+    }
+
+    /// The dirty bitmap's words in the record.
+    #[inline]
+    fn bitmap_words(&self) -> usize {
+        record_words(self.block_words()).saturating_sub(1)
+    }
+
+    /// Record a write of `word` at `index` for the next remembered trace: an edge (not a Number
+    /// or a hole) below the traced length marks its dirty block.
+    #[inline]
+    fn remember(&mut self, index: usize, word: u64) {
+        if word_kind(word) & KIND_NUMBERS != 0 {
+            return;
+        }
+        let Some(record) = self.record() else {
+            return;
+        };
+        // SAFETY: as in `finish_mark_trace`; the block's bit is in the bitmap, as `index` is
+        // below the used length.
+        unsafe {
+            let traced = record.read();
+            if traced == TRACED_NONE || index as u64 >= traced {
+                return;
+            }
+            let block = index / DIRTY_BLOCK;
+            let bits = record.add(1 + block / 64).as_ptr();
+            *bits |= 1 << (block % 64);
+        }
+    }
+
+    /// Words at `len` and past it are no longer traced ones: a later push there is past the
+    /// traced length.
+    #[inline]
+    fn lower_traced(&self, len: usize) {
+        if let Some(record) = self.record() {
+            // SAFETY: as in `finish_mark_trace`.
+            unsafe {
+                let traced = record.read();
+                if traced != TRACED_NONE && traced > len as u64 {
+                    record.write(len as u64);
+                }
             }
         }
     }
@@ -334,24 +603,50 @@ impl Words {
     /// Move the used words into a fresh block with room for `capacity` words and `front` free
     /// words before them (which the caller fills), dropping any front room.
     fn reallocate(&mut self, capacity: usize, front: usize) {
+        self.reallocate_with_room(capacity, front, 0);
+    }
+
+    /// [`Words::reallocate`], with `shifted` words of front room before the header.
+    fn reallocate_with_room(&mut self, capacity: usize, front: usize, shifted: usize) {
         let len = self.len();
         assert!(
-            capacity <= MAX_WORDS && len + front <= capacity,
+            capacity <= MAX_WORDS && shifted <= MAX_WORDS && len + front <= capacity,
             "element block of {capacity} words"
         );
         let flags = self.kind();
-        let block = crate::gc_storage::alloc_block(HEADER_BYTES + 8 * capacity);
-        // SAFETY: a fresh block of a header and `capacity` words; the used words are copied
-        // after `front` words of room.
+        let total = shifted + capacity;
+        let record = record_words(total);
+        // Words that keep their indices keep the old record's traced length and dirty blocks
+        // (P1's PackedBuffer kept them across its deque's growth); otherwise, and for a block
+        // that kept none, the next trace reports every word.
+        let kept = self
+            .record()
+            .filter(|_| front == 0 && record != 0)
+            .map(|old| (old, self.bitmap_words().min(record - 1)));
+        let block = crate::gc_storage::alloc_block(HEADER_BYTES + 8 * (total + record));
+        // SAFETY: a fresh block of the front room, a header, `capacity` words and the record;
+        // the used words are copied after `front` words of room, and a kept record's words
+        // into the new one's (its bitmap covers the used words, as the old one's did).
         unsafe {
-            let words = block.as_ptr().add(HEADER_BYTES).cast::<u64>();
+            let words = block.as_ptr().add(HEADER_BYTES).cast::<u64>().add(shifted);
             words.cast::<WordHeader>().sub(1).write(WordHeader {
                 used: len as u32,
                 capacity: capacity as u32,
-                shifted: 0,
+                shifted: shifted as u32,
                 flags,
             });
             std::ptr::copy_nonoverlapping(self.0.as_ptr(), words.add(front), len);
+            if record != 0 {
+                let bitmap = words.add(capacity + 1);
+                std::ptr::write_bytes(bitmap, 0, record - 1);
+                match kept {
+                    Some((old, bits)) => {
+                        words.add(capacity).write(old.read());
+                        std::ptr::copy_nonoverlapping(old.add(1).as_ptr(), bitmap, bits);
+                    }
+                    None => words.add(capacity).write(TRACED_NONE),
+                }
+            }
             self.0 = NonNull::new_unchecked(words);
         }
     }
@@ -490,7 +785,11 @@ mod tests {
         );
         assert_eq!(words.header().shifted, 2);
         words.unshift(&[num(-1.0), num(0.0), num(1.0)]);
-        assert_eq!(words.header().shifted, 0, "a fresh block has no front room");
+        assert_eq!(
+            words.header().shifted,
+            8,
+            "a fresh block keeps front room of the used words"
+        );
         let values: Vec<f64> = (0..words.len())
             .map(|i| words.get(i).unwrap().number().unwrap())
             .collect();

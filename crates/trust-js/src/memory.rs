@@ -1089,8 +1089,8 @@ impl Visitor {
                 self.value(setter);
             }
         }
-        for property in props.packed_values() {
-            property.visit_retained_value(self);
+        for value in props.word_values() {
+            self.value(&value);
         }
     }
 
@@ -1115,15 +1115,9 @@ impl Visitor {
                 self.value(setter);
             }
         }
-        // Packed array elements have no key entry and must be visited separately.
-        for property in object.props.packed_values() {
-            property.visit_retained_value(self);
-            if let Some(getter) = property.getter() {
-                self.value(getter);
-            }
-            if let Some(setter) = property.setter() {
-                self.value(setter);
-            }
+        // Element words have no key entry and are visited separately.
+        for value in object.props.word_values() {
+            self.value(&value);
         }
         self.callable(&object.call);
         let mut internal_bytes = object.internal_slots().retained_storage_bytes();

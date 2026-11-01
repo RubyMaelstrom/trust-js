@@ -1,4 +1,6 @@
-//! Collector-only packed-element remembering; ordinary language semantics are unchanged.
+//! Collector-only remembering of element words (the word block's record); ordinary language
+//! semantics are unchanged.
+use super::word_block::Words;
 use super::*;
 use crate::gc_core::{CellAge, CollectionKind, TracePurpose};
 use crate::gc_trace::{GcSink, GcTrace};
@@ -11,23 +13,36 @@ impl GcSink for Ignore {
 }
 
 fn visits() -> [usize; 2] {
-    PACKED_MARK_VISITS.with(Cell::get)
+    word_block::MARK_VISITS.with(Cell::get)
 }
 
-fn selected(buffer: &PackedBuffer, purpose: TracePurpose) -> usize {
+fn selected(words: &Words, purpose: TracePurpose) -> usize {
     let before = visits();
-    buffer.trace_elements(purpose, &mut Ignore);
+    words.trace_values(Some(purpose), &mut Ignore);
     let after = visits();
     after[0] + after[1] - before[0] - before[1]
 }
 
-fn packed(len: usize) -> PackedBuffer {
-    (0..len).map(|_| Property::plain(Value::Null)).collect()
+/// `len` Null words in a block with room for `capacity`.
+fn nulls(len: usize, capacity: usize) -> Words {
+    let mut words = Words::with_capacity(capacity);
+    for _ in 0..len {
+        words.push(Value::Null);
+    }
+    words
 }
 
-fn clean(buffer: &PackedBuffer) {
-    assert_eq!(selected(buffer, TracePurpose::Full), buffer.len());
-    buffer.finish_mark_trace();
+fn clean(words: &Words) {
+    assert_eq!(selected(words, TracePurpose::Full), words.len());
+    words.finish_mark_trace();
+}
+
+fn elements(props: &Props) -> &Words {
+    props.elems.words().expect("element words")
+}
+
+fn remembered(array: &Gc) -> Option<(Option<usize>, Vec<usize>)> {
+    elements(&array.borrow().props).remembered()
 }
 
 fn object(value: Value) -> Gc {
@@ -43,190 +58,186 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 
 #[test]
 fn storage_carriers_are_plain_data_with_the_native_header_first() {
-    // The sidecar and the packed buffer live in storage blocks (`gc_storage`): plain data, so
+    // The sidecar and the element words live in storage blocks (`gc_storage`): plain data, so
     // that dropping a map never reads a block, which may have gone with its heap.
     assert!(!std::mem::needs_drop::<DenseBuffers>());
-    assert!(!std::mem::needs_drop::<PackedBuffer>());
-    // The map's storage word the JIT follows comes first; the Rust-heap extras follow it.
+    assert!(!std::mem::needs_drop::<Words>());
+    // The map's storage word the JIT follows comes first; the Rust-heap extras and the element
+    // words follow it.
     assert_eq!(
         std::mem::size_of::<DenseStorage>(),
-        2 * std::mem::size_of::<usize>()
+        3 * std::mem::size_of::<usize>()
     );
-    assert_eq!(std::mem::offset_of!(PackedBuffer, values), 0);
-    let sample = Object::new(None);
-    let layout = jit_layout(&sample);
-    assert!(layout.packed_elems_valid);
+    assert_eq!(std::mem::offset_of!(DenseStorage, 0), 0);
+    // The header just before the first word, where generated code reads `used` at -16,
+    // `capacity` at -12 and `flags` at -4.
+    assert_eq!(std::mem::size_of::<word_block::WordHeader>(), 16);
+    assert_eq!(std::mem::offset_of!(word_block::WordHeader, used), 0);
+    assert_eq!(std::mem::offset_of!(word_block::WordHeader, capacity), 4);
+    assert_eq!(std::mem::offset_of!(word_block::WordHeader, flags), 12);
 }
 
 #[test]
 fn distant_dirty_blocks_and_partial_prefix_tail_are_bounded_without_duplicates() {
-    let mut buffer = packed(200_003);
-    clean(&buffer);
-    assert!(buffer.dirty.borrow().is_empty());
+    // Room for the appends below: a grown block starts full.
+    let mut words = nulls(200_003, 200_008);
+    clean(&words);
+    assert_eq!(words.remembered(), Some((Some(200_003), Vec::new())));
+    // A Number or a hole is never an edge: writing one marks nothing.
+    words.set(1000, Value::Num(1000.0));
+    words.set(1001, Value::Empty);
+    assert_eq!(words.remembered(), Some((Some(200_003), Vec::new())));
     for index in [63, 64, 65, 2000, 200_002] {
-        buffer
-            .index_mut(index)
-            .unwrap()
-            .set_value(Value::Num(index as f64));
+        words.set(index, Value::Bool(true));
     }
     for _ in 0..5 {
-        buffer.push(Property::plain(Value::Null));
+        words.push(Value::Null);
     }
-    // Three complete blocks, the three-element partial block, and the five new tail slots.
-    assert_eq!(selected(&buffer, TracePurpose::Remembered), 3 * 64 + 3 + 5);
+    // Three complete blocks, the three-word partial block, and the five new tail words.
+    assert_eq!(selected(&words, TracePurpose::Remembered), 3 * 64 + 3 + 5);
     assert_eq!(
-        buffer.traced_len.get(),
-        200_003,
+        words.remembered(),
+        Some((Some(200_003), vec![0, 1, 31, 3125])),
         "reporting alone does not consume"
     );
-    buffer.finish_mark_trace();
-    assert_eq!(selected(&buffer, TracePurpose::Remembered), 0);
-    assert!(buffer.dirty.borrow().is_empty());
+    words.finish_mark_trace();
+    assert_eq!(selected(&words, TracePurpose::Remembered), 0);
+    assert_eq!(words.remembered(), Some((Some(200_008), Vec::new())));
 }
 
 #[test]
 fn shrink_same_length_regrowth_preserves_old_dirty_blocks_and_new_tail() {
-    let mut buffer = packed(130);
-    clean(&buffer);
-    buffer.index_mut(1).unwrap().set_value(Value::Bool(true));
-    buffer.pop().unwrap();
-    assert_eq!(buffer.traced_len.get(), 129);
-    buffer.push(Property::plain(Value::Bool(false)));
-    assert_eq!(selected(&buffer, TracePurpose::Remembered), 65);
-    buffer.finish_mark_trace();
-    buffer.full_mut().truncate(40);
-    buffer.push(Property::plain(Value::Null));
-    assert_eq!(selected(&buffer, TracePurpose::Remembered), 41);
+    let mut words = nulls(130, 130);
+    clean(&words);
+    words.set(1, Value::Bool(true));
+    assert_eq!(words.pop(), Some(Value::Null.bits()));
+    assert_eq!(words.remembered(), Some((Some(129), vec![0])));
+    words.push(Value::Bool(false));
+    // Block 0 and the word past the lowered traced length.
+    assert_eq!(selected(&words, TracePurpose::Remembered), 65);
+    words.finish_mark_trace();
+    words.set(1, Value::Bool(false));
+    words.set(100, Value::Bool(false));
+    words.truncate(40);
+    assert_eq!(words.remembered(), Some((Some(40), vec![0, 1])));
+    words.push(Value::Null);
+    // Block 0 up to the lowered traced length and the new word past it, one run; block 1 is
+    // past the length.
+    assert_eq!(selected(&words, TracePurpose::Remembered), 41);
 }
 
 #[test]
-fn mutable_escapes_reorders_clone_and_whole_replacement_start_full() {
+fn batch_edits_stay_bounded_but_reorders_copies_and_map_moves_start_full() {
     let mut properties = Props::packed_array(std::iter::repeat_n(Value::Null, 130));
-    clean(properties.elems.packed.as_deref().unwrap());
+    clean(elements(&properties));
+    // A copy is a fresh block, whose record starts full.
     let clone = properties.clone();
+    assert_eq!(elements(&clone).remembered(), Some((None, Vec::new())));
+    // A batch edit writes through the words: a set marks its block, and a splice lowers the
+    // traced length to its start.
+    properties
+        .plain_elements_mut(130)
+        .unwrap()
+        .set(1, Value::Bool(true));
     assert_eq!(
-        clone.elems.packed.as_deref().unwrap().traced_len.get(),
-        PACKED_TRACE_FULL
+        selected(elements(&properties), TracePurpose::Remembered),
+        64
     );
-    properties.elems.packed_slice_mut().unwrap()[1].set_value(Value::Num(1.0));
+    clean(elements(&properties));
+    properties
+        .plain_elements_mut(130)
+        .unwrap()
+        .splice(1..2, &[Value::Bool(false)]);
     assert_eq!(
-        selected(
-            properties.elems.packed.as_deref().unwrap(),
-            TracePurpose::Remembered
-        ),
-        130
-    );
-    clean(properties.elems.packed.as_deref().unwrap());
-    properties.plain_elements_mut(130).unwrap().reverse();
-    assert_eq!(
-        selected(
-            properties.elems.packed.as_deref().unwrap(),
-            TracePurpose::Remembered
-        ),
-        130
-    );
-    clean(properties.elems.packed.as_deref().unwrap());
-    assert!(properties.shift_dense_array(130, false).is_some());
-    assert_eq!(
-        selected(
-            properties.elems.packed.as_deref().unwrap(),
-            TracePurpose::Remembered
-        ),
+        selected(elements(&properties), TracePurpose::Remembered),
         129
     );
-    clean(properties.elems.packed.as_deref().unwrap());
-    assert!(properties.unshift_dense_array(129, &[Value::Null]));
+    clean(elements(&properties));
+    properties.plain_elements_mut(130).unwrap().reverse();
     assert_eq!(
-        selected(
-            properties.elems.packed.as_deref().unwrap(),
-            TracePurpose::Remembered
-        ),
+        selected(elements(&properties), TracePurpose::Remembered),
         130
     );
-    clean(properties.elems.packed.as_deref().unwrap());
-    let new_buffer = crate::gc_storage::StorageBox::new(packed(32));
-    clean(&new_buffer);
-    properties.elems.set_packed(Some(new_buffer));
+    clean(elements(&properties));
+    assert!(properties.shift_dense_array(130, false).is_some());
     assert_eq!(
-        properties.elems.packed.as_deref().unwrap().traced_len.get(),
-        PACKED_TRACE_FULL
+        selected(elements(&properties), TracePurpose::Remembered),
+        129
     );
+    clean(elements(&properties));
+    assert!(properties.unshift_dense_array(129, &[Value::Null]));
+    assert_eq!(
+        selected(elements(&properties), TracePurpose::Remembered),
+        130
+    );
+    clean(elements(&properties));
+    // The record of a map moved to another object described its old owner's marks.
+    let array = Object::new_with_parts(None, properties, Exotic::Array);
+    assert_eq!(remembered(&array), Some((None, Vec::new())));
 }
 
 #[test]
-fn bitmap_growth_failure_falls_back_full_without_losing_the_write() {
-    let mut properties = Props::packed_array(std::iter::repeat_n(Value::Null, 10_000));
-    clean(properties.elems.packed.as_deref().unwrap());
-    PACKED_BITMAP_FAIL_GROWTH.with(|flag| flag.set(true));
-    let result = properties.set_index_value(9000, Value::Bool(true));
-    PACKED_BITMAP_FAIL_GROWTH.with(|flag| flag.set(false));
-    assert!(result.is_ok());
-    assert!(matches!(
-        properties.get_index(9000).unwrap().value().view(),
-        ValueView::Bool(true)
-    ));
-    assert_eq!(
-        selected(
-            properties.elems.packed.as_deref().unwrap(),
-            TracePurpose::Remembered
-        ),
-        10_000
-    );
-}
-
-#[test]
-fn indexed_setters_and_hole_fill_record_blocks_but_generic_escapes_remain_full() {
+fn indexed_setters_hole_fill_and_gap_appends_are_bounded() {
     let mut properties = Props::packed_array(std::iter::repeat_n(Value::Null, 2000));
     for operation in 0..3 {
-        clean(properties.elems.packed.as_deref().unwrap());
+        clean(elements(&properties));
         match operation {
-            0 => {
-                assert!(properties.set_index_value(65, Value::Bool(true)).is_ok());
-            }
-            1 => {
-                assert!(properties.set_value("65", Value::Bool(false)));
-            }
-            _ => properties.insert("65", Property::plain(Value::Num(3.0))),
+            0 => assert!(properties.set_index_value(65, Value::Bool(true)).is_ok()),
+            1 => assert!(properties.set_value("65", Value::Bool(false))),
+            _ => properties.insert("65", Property::plain(Value::Undefined)),
         }
         assert_eq!(
-            selected(
-                properties.elems.packed.as_deref().unwrap(),
-                TracePurpose::Remembered
-            ),
+            selected(elements(&properties), TracePurpose::Remembered),
             64
         );
     }
-    properties.remove("65");
-    clean(properties.elems.packed.as_deref().unwrap());
+    // A deletion writes a hole, which is no edge.
+    clean(elements(&properties));
+    assert!(properties.remove("65"));
+    assert_eq!(selected(elements(&properties), TracePurpose::Remembered), 0);
+    // Filling the hole writes its word.
     assert!(properties
         .try_define_dense_element(65, Property::plain(Value::Null))
         .is_ok());
-    // The generic bounded-gap/deque path intentionally abandons precision.
     assert_eq!(
-        selected(
-            properties.elems.packed.as_deref().unwrap(),
-            TracePurpose::Remembered
-        ),
-        2000
+        selected(elements(&properties), TracePurpose::Remembered),
+        64
+    );
+    // A gap append past the capacity grows the block, which keeps its record: the holes and
+    // the word past the traced length.
+    clean(elements(&properties));
+    assert!(properties
+        .try_define_dense_element(2010, Property::plain(Value::Null))
+        .is_ok());
+    assert_eq!(
+        selected(elements(&properties), TracePurpose::Remembered),
+        11
+    );
+    // One within the capacity writes its holes and its word past the traced length.
+    clean(elements(&properties));
+    assert!(properties
+        .try_define_dense_element(2020, Property::plain(Value::Null))
+        .is_ok());
+    assert_eq!(
+        selected(elements(&properties), TracePurpose::Remembered),
+        10
     );
 }
 
 #[test]
 fn precise_descriptor_replacement_still_invalidates_the_plain_element_proof() {
     let mut properties = Props::packed_array(std::iter::repeat_n(Value::Null, 128));
-    clean(properties.elems.packed.as_deref().unwrap());
-    assert!(properties.elems.packed_all_plain());
+    clean(elements(&properties));
+    assert!(properties.element_words().is_some());
     properties.insert("65", Property::accessor_prop(None, None, true, true));
-    assert!(!properties.elems.packed_all_plain());
+    // The accessor leaves the words for the named entries, its word a hole.
+    assert!(properties.has_far.get() && properties.element_words().is_none());
+    assert!(elements(&properties).get(65).is_none());
+    assert!(properties.get("65").is_some_and(Element::accessor));
     assert!(properties.shift_dense_array(128, false).is_none());
     assert!(!properties.unshift_dense_array(128, &[Value::Null]));
-    assert_eq!(
-        selected(
-            properties.elems.packed.as_deref().unwrap(),
-            TracePurpose::Remembered
-        ),
-        64
-    );
+    // The hole marks nothing; the named entries are traced in full.
+    assert_eq!(selected(elements(&properties), TracePurpose::Remembered), 0);
 }
 
 fn witness(value: Value) -> u64 {
@@ -311,21 +322,18 @@ fn actual_marker_keeps_sole_young_trees_in_distant_blocks_and_appended_tail() {
     let value = engine.interp.make_array(vec![Value::Null; 200_003]);
     let array = object(value);
     let owner = Rooted::new(value);
+    // Room for the appends below, which then keep the block and its record.
+    array
+        .borrow_mut()
+        .props
+        .elems
+        .words_mut()
+        .unwrap()
+        .reserve_exact(5);
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Major);
-    assert_eq!(
-        array
-            .borrow()
-            .props
-            .elems
-            .packed
-            .as_deref()
-            .unwrap()
-            .traced_len
-            .get(),
-        200_003
-    );
+    assert_eq!(remembered(&array), Some((Some(200_003), Vec::new())));
     let mut words = Vec::new();
     for index in [63, 64, 65, 2000, 200_002] {
         let child = Object::new(Some(engine.interp.object_proto));
@@ -352,16 +360,8 @@ fn actual_marker_keeps_sole_young_trees_in_distant_blocks_and_appended_tail() {
     }
     array.borrow_mut().props.set_array_length_value(200_008.0);
     assert_live(&engine, &words, CellAge::Young);
-    let dirty = array
-        .borrow()
-        .props
-        .elems
-        .packed
-        .as_deref()
-        .unwrap()
-        .dirty
-        .borrow()
-        .to_vec();
+    let dirty = remembered(&array);
+    assert_eq!(dirty, Some((Some(200_003), vec![0, 1, 31, 3125])));
     {
         let heap = engine.interp.gc_heap.clone();
         let _guard = heap.core.borrow().nogc();
@@ -374,37 +374,14 @@ fn actual_marker_keeps_sole_young_trees_in_distant_blocks_and_appended_tail() {
     }
     array.borrow().trace_gc(&mut Ignore);
     array.borrow().props.trace_gc(&mut Ignore);
-    assert_eq!(
-        array
-            .borrow()
-            .props
-            .elems
-            .packed
-            .as_deref()
-            .unwrap()
-            .dirty
-            .borrow()
-            .to_vec(),
-        dirty
-    );
+    assert_eq!(remembered(&array), dirty);
     let before = visits();
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Minor);
     assert_live(&engine, &words, CellAge::Old);
     assert_eq!(visits()[1] - before[1], 200);
-    assert_eq!(
-        array
-            .borrow()
-            .props
-            .elems
-            .packed
-            .as_deref()
-            .unwrap()
-            .traced_len
-            .get(),
-        200_008
-    );
+    assert_eq!(remembered(&array), Some((Some(200_008), Vec::new())));
     let before = visits();
     array.borrow_mut().props.set_array_length_value(200_008.0); // unrelated coarse card
     engine
@@ -492,6 +469,9 @@ fn remembered_slots_keep_string_bigint_symbol_closure_and_accessor_edges() {
         "65",
         Property::accessor_prop(Some(getter), Some(setter), true, true),
     );
+    // The accessor is a named entry, its word a hole: the entries are traced in full.
+    assert!(array.borrow().props.has_far.get());
+    assert!(elements(&array.borrow().props).get(65).is_none());
     let labels = [
         "string",
         "BigInt",
@@ -610,21 +590,13 @@ fn unwinding_after_elements_before_callable_edges_does_not_consume_dirtiness() {
         assert!(body.props.set_index_value(65, Value::Obj(child)).is_ok());
         body.call = Callable::bound(target, Value::Null, Vec::new());
     }
-    let dirty = array
-        .borrow()
-        .props
-        .elems
-        .packed
-        .as_deref()
-        .unwrap()
-        .dirty
-        .borrow()
-        .to_vec();
+    let dirty = remembered(&array);
+    assert_eq!(dirty, Some((Some(128), vec![1])));
     struct PanicAt(u64);
     impl GcSink for PanicAt {
         fn word(&mut self, word: u64) {
             if word == self.0 {
-                panic!("after packed elements")
+                panic!("after element words")
             }
         }
     }
@@ -636,19 +608,7 @@ fn unwinding_after_elements_before_callable_edges_does_not_consume_dirtiness() {
         );
     }));
     assert!(result.is_err());
-    assert_eq!(
-        array
-            .borrow()
-            .props
-            .elems
-            .packed
-            .as_deref()
-            .unwrap()
-            .dirty
-            .borrow()
-            .to_vec(),
-        dirty
-    );
+    assert_eq!(remembered(&array), dirty);
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Minor);
@@ -660,57 +620,56 @@ fn unwinding_after_elements_before_callable_edges_does_not_consume_dirtiness() {
 }
 
 #[test]
-fn inline_promotion_reallocation_transplant_and_empty_heap_storage_start_safely() {
-    let mut properties = Props::packed_array(std::iter::repeat_n(Value::Null, 10));
-    assert!(properties.elems.packed.is_none());
-    assert!(properties
-        .try_append_element(10, Property::plain(Value::Null))
-        .is_ok());
-    assert_eq!(
-        properties.elems.packed.as_deref().unwrap().traced_len.get(),
-        PACKED_TRACE_FULL
-    );
-    clean(properties.elems.packed.as_deref().unwrap());
-    for index in 11..1000 {
+fn small_blocks_reallocation_transplant_and_empty_storage_start_safely() {
+    let append = |properties: &mut Props, index: usize| {
         assert!(properties
-            .try_append_element(index, Property::plain(Value::Null))
+            .try_append_element(index as u32, Property::plain(Value::Null))
             .is_ok());
+    };
+    // A block with room for at most 64 words keeps no record: every trace reports all of it.
+    let mut properties = Props::packed_array(std::iter::repeat_n(Value::Null, 10));
+    assert_eq!(elements(&properties).remembered(), None);
+    clean(elements(&properties));
+    assert_eq!(
+        selected(elements(&properties), TracePurpose::Remembered),
+        10
+    );
+    // Growth past 64 words gives a fresh block, whose record starts full.
+    for index in 10..100 {
+        append(&mut properties, index);
+    }
+    assert_eq!(elements(&properties).remembered(), Some((None, Vec::new())));
+    clean(elements(&properties));
+    // Appends within the capacity are words past the traced length.
+    let capacity = elements(&properties).capacity();
+    assert!(capacity > 100);
+    for index in 100..capacity {
+        append(&mut properties, index);
     }
     assert_eq!(
-        selected(
-            properties.elems.packed.as_deref().unwrap(),
-            TracePurpose::Remembered
-        ),
-        989
+        selected(elements(&properties), TracePurpose::Remembered),
+        capacity - 100
     );
-    clean(properties.elems.packed.as_deref().unwrap());
+    clean(elements(&properties));
+    // One more grows the block again, keeping its record: the new word is past the traced
+    // length.
+    append(&mut properties, capacity);
+    assert_eq!(selected(elements(&properties), TracePurpose::Remembered), 1);
+    clean(elements(&properties));
     let receiver = Object::new(None);
     receiver.borrow_mut().replace_properties(properties);
-    assert_eq!(
-        receiver
-            .borrow()
-            .props
-            .elems
-            .packed
-            .as_deref()
-            .unwrap()
-            .traced_len
-            .get(),
-        PACKED_TRACE_FULL
-    );
+    assert_eq!(remembered(&receiver), Some((None, Vec::new())));
+    // An empty block with a record: its first append is past the traced length 0.
     let mut properties = Props::packed_array(std::iter::empty());
-    properties.reserve_dense_exact(64, false);
-    clean(properties.elems.packed.as_deref().unwrap());
-    assert!(properties
-        .try_append_element(0, Property::plain(Value::Null))
-        .is_ok());
+    assert!(!properties.elems.has_words());
+    properties.reserve_dense_exact(word_block::REMEMBER_MIN + 1, false);
+    clean(elements(&properties));
     assert_eq!(
-        selected(
-            properties.elems.packed.as_deref().unwrap(),
-            TracePurpose::Remembered
-        ),
-        1
+        elements(&properties).remembered(),
+        Some((Some(0), Vec::new()))
     );
+    append(&mut properties, 0);
+    assert_eq!(selected(elements(&properties), TracePurpose::Remembered), 1);
 }
 
 struct ArrayRoot(u64);
@@ -738,6 +697,7 @@ fn between_phase_mutation_belongs_to_the_following_collection() {
         .props
         .set_index_value(65, Value::Null)
         .is_ok());
+    assert_eq!(remembered(&array), Some((Some(128), vec![1])));
     let heap = engine.interp.gc_heap.clone();
     // Every other engine cell is already old from the precise major. This minor has no new
     // side-table state and reports this array explicitly, without any conservative roots.
@@ -747,16 +707,7 @@ fn between_phase_mutation_belongs_to_the_following_collection() {
         &ArrayRoot(witness(value)),
         CollectionKind::Minor
     ));
-    assert!(array
-        .borrow()
-        .props
-        .elems
-        .packed
-        .as_deref()
-        .unwrap()
-        .dirty
-        .borrow()
-        .is_empty());
+    assert_eq!(remembered(&array), Some((Some(128), Vec::new())));
     let black = Object::new(None);
     assert!(array
         .borrow_mut()
@@ -764,16 +715,7 @@ fn between_phase_mutation_belongs_to_the_following_collection() {
         .set_index_value(65, Value::Obj(black))
         .is_ok());
     heap.core.borrow_mut().finish_collection(&[]);
-    assert!(!array
-        .borrow()
-        .props
-        .elems
-        .packed
-        .as_deref()
-        .unwrap()
-        .dirty
-        .borrow()
-        .is_empty());
+    assert_eq!(remembered(&array), Some((Some(128), vec![1])));
     let before = visits();
     engine
         .interp
@@ -831,7 +773,7 @@ fn classic_and_sparse_element_edges_remain_complete_outside_the_packed_blocks() 
         Property::data(Value::Num(1.0), true, false, false),
     );
     props.mark_array();
-    assert!(props.elems.packed.is_none());
+    assert!(!props.elems.has_words());
     let array = Object::new_with_parts(None, props, Exotic::Array);
     let _owner = Rooted::new(Value::Obj(array));
     engine
@@ -863,8 +805,9 @@ fn classic_and_sparse_element_edges_remain_complete_outside_the_packed_blocks() 
         .interp
         .gc_collect_precise_for_test(CollectionKind::Minor);
     let hole = Value::Obj(Object::new(None));
-    // A far key declines direct dense definition; ordinary insert still records the hole.
+    // With a far key, an index no named entry holds still fills its word, remembered.
     array.borrow_mut().props.insert("65", Property::plain(hole));
+    assert_eq!(remembered(&array), Some((Some(128), vec![1])));
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Minor);
@@ -890,9 +833,9 @@ struct NativeAppendGuards {
     length_memo: Option<usize>,
     memo_is_length: bool,
     length_descriptor: Option<(bool, bool, Option<f64>)>,
-    packed: Option<(usize, usize)>,
+    words: Option<(usize, usize)>,
     mirror_flags: u8,
-    remembered: Option<(usize, Vec<u64>)>,
+    remembered: Option<(Option<usize>, Vec<usize>)>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -927,19 +870,13 @@ fn native_append_guards(array: &Gc) -> NativeAppendGuards {
                     property.number_value(),
                 )
             }),
-        packed: body
+        words: body
             .props
             .elems
-            .packed
-            .as_deref()
-            .map(|packed| (packed.len(), packed.cap)),
+            .words()
+            .map(|words| (words.len(), words.capacity())),
         mirror_flags: body.props.mirror_flags,
-        remembered: body
-            .props
-            .elems
-            .packed
-            .as_deref()
-            .map(|packed| (packed.traced_len.get(), packed.dirty.borrow().to_vec())),
+        remembered: body.props.elems.words().and_then(Words::remembered),
     };
     snapshot
 }
@@ -1016,7 +953,8 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
         .borrow_mut()
         .props
         .insert("freshYoung", Property::plain(Value::Obj(fresh)));
-    evaluate(&mut engine, "var dst=new Array(64).fill(null); dst.length=40; var src=new Array(41);src[40]=1;src.constructor={ [Symbol.species]:function(){return dst;} };for(var w=0;w<64;w++){dst.length=40;src.map(freshYoung);}dst.length=40;0");
+    // The destination's block has room for more than 64 words, so it keeps a record.
+    evaluate(&mut engine, "var dst=new Array(128).fill(null); dst.length=40; var src=new Array(41);src[40]=1;src.constructor={ [Symbol.species]:function(){return dst;} };for(var w=0;w<64;w++){dst.length=40;src.map(freshYoung);}dst.length=40;0");
     let env = engine.interp.global_env;
     let array = object(
         engine
@@ -1052,16 +990,14 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
     )));
     {
         let body = array.borrow();
-        let packed = body
-            .props
-            .elems
-            .packed
-            .as_deref()
-            .expect("heap-packed destination");
-        assert_eq!(packed.len(), 40);
-        assert!(packed.cap > 40);
+        let words = elements(&body.props);
+        assert_eq!(words.len(), 40);
+        assert!(words.capacity() > 40 && words.remembered().is_some());
         assert_eq!(body.props.mirror_flags, 0);
     }
+    // The define element template calls its helper while the element templates do not read
+    // words (`packed_elems_valid`).
+    let native = usize::from(jit_layout(&engine.interp.object_proto).packed_elems_valid);
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Major);
@@ -1078,7 +1014,7 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
         let unprimed = native_append_guards(&array);
         eprintln!("[append-guards] trial={trial} before-prime={unprimed:?}");
         // Establish the existing native length-slot precondition through its read-only API.
-        // Preparation and append keep the SAME no-GC guard; no shrink/regrow promotion.
+        // Preparation and append keep the SAME no-GC guard.
         {
             let body = array.borrow();
             let length = body.props.length_property().expect("own Array length");
@@ -1087,7 +1023,7 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
         let primed = native_append_guards(&array);
         assert_eq!(
             unprimed.remembered, primed.remembered,
-            "priming changed packed metadata"
+            "priming changed the remembered record"
         );
         assert!(
             primed.array
@@ -1106,10 +1042,16 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
             "trial={trial} {primed:?}"
         );
         assert!(
-            matches!(primed.packed, Some((40, cap)) if cap > 40),
+            matches!(primed.words, Some((40, capacity)) if capacity > 40),
             "trial={trial} {primed:?}"
         );
         assert_eq!(primed.mirror_flags, 0, "trial={trial} {primed:?}");
+        // Traced up to 40: by the major, or lowered there by the pop or the shorter length.
+        assert_eq!(
+            primed.remembered,
+            Some((Some(40), Vec::new())),
+            "trial={trial} {primed:?}"
+        );
         let before = append_counts();
         evaluate(&mut engine, "src.map(freshYoung);0");
         let after = append_counts();
@@ -1120,14 +1062,14 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
                 after.2 - before.2,
                 after.3 - before.3
             ),
-            (1, 1, 0, 1),
+            (native, native, 1 - native, 1),
             "trial={trial} unprimed={unprimed:?} primed={primed:?} after={:?}",
             native_append_guards(&array),
         );
         let words = NATIVE_FACTORY_WORDS.with(|words| words.borrow().clone());
         {
             let body = array.borrow();
-            assert_eq!(body.props.elems.packed_ref().unwrap().len(), 41);
+            assert_eq!(elements(&body.props).len(), 41);
             assert_eq!(witness(body.props.get_index(40).unwrap().value()), words[0]);
         }
         assert_live(&engine, &words, CellAge::Young);
@@ -1136,20 +1078,10 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
         engine
             .interp
             .gc_collect_precise_for_test(CollectionKind::Minor);
-        assert_eq!(visits()[1] - before_mark[1], if trial < 2 { 1 } else { 41 });
+        // Only the appended word, past the traced length.
+        assert_eq!(visits()[1] - before_mark[1], 1, "trial={trial}");
         assert_live(&engine, &words, CellAge::Old);
-        assert_eq!(
-            array
-                .borrow()
-                .props
-                .elems
-                .packed
-                .as_deref()
-                .unwrap()
-                .traced_len
-                .get(),
-            41
-        );
+        assert_eq!(remembered(&array), Some((Some(41), Vec::new())));
     }
     // Same arming and source call, but the extensibility gate must reject before commit.
     let guard = heap.core.borrow().nogc();
@@ -1167,7 +1099,7 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
         (0, 0, 1, 1)
     );
     let words = NATIVE_FACTORY_WORDS.with(|words| words.borrow().clone());
-    assert_eq!(array.borrow().props.elems.packed_ref().unwrap().len(), 40);
+    assert_eq!(elements(&array.borrow().props).len(), 40);
     assert_live(&engine, &words, CellAge::Young);
     drop(guard);
     engine

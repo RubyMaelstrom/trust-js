@@ -5,7 +5,7 @@
 use crate::{bytecode::Tier, Completion, Engine};
 
 #[test]
-fn compiled_numeric_array_initialization_retains_coherent_mirrors() {
+fn compiled_numeric_array_initialization_keeps_number_words() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         for source in [
             "var numeric=[];for(let index=0;index<128;index++)numeric[index]=index+0.25;",
@@ -21,9 +21,12 @@ fn compiled_numeric_array_initialization_retains_coherent_mirrors() {
                 .unwrap_or_else(|_| panic!("numeric fixture binding"));
             let object_handle = value.as_obj().expect("numeric array");
             let object = object_handle.borrow();
+            // Element words are the numeric view: Number words, known so by their kind bits.
+            assert!(object.props.has_packed_elements(), "{tier:?}: {source}");
             for index in 0..128 {
-                assert_eq!(object.props.mirror_get(index), Some(index as f64 + 0.25),
-                    "{tier:?}: index {index}, {source}");
+                let element = object.props.get_index(index);
+                assert_eq!(element.and_then(|element| element.number_value()),
+                    Some(index as f64 + 0.25), "{tier:?}: index {index}, {source}");
             }
             drop(object);
             #[cfg(target_arch = "aarch64")]

@@ -7391,7 +7391,7 @@ fn edit_plain_elements(
     object: &Gc,
     len: u64,
     growth: u64,
-    edit: impl FnOnce(&mut DenseDeque<Property>),
+    edit: impl FnOnce(&mut crate::value::word_block::Words),
 ) -> bool {
     if len.saturating_add(growth) > u64::from(u32::MAX)
         || !matches!(object.borrow().exotic, Exotic::Array)
@@ -7478,21 +7478,23 @@ impl ElementMatch {
         }
     }
 
-    /// Whether `element`, a present data element, equals the search element.
+    /// Whether `word`, a present element's word, equals the search element.
     #[inline(always)]
-    fn matches(&self, i: &Interp, element: &Property, equality: ElementEquality) -> bool {
+    fn matches(&self, i: &Interp, word: u64, equality: ElementEquality) -> bool {
+        // SAFETY: a used element word is a Value's bits.
+        let value = || unsafe { Value::from_bits(word) };
         match self {
-            ElementMatch::Word(word) => element.value_bits() == *word,
-            ElementMatch::Zero => element.number_value() == Some(0.0),
-            ElementMatch::NaN => element.number_value().is_some_and(f64::is_nan),
+            ElementMatch::Word(wanted) => word == *wanted,
+            ElementMatch::Zero => value().number() == Some(0.0),
+            ElementMatch::NaN => value().number().is_some_and(f64::is_nan),
             ElementMatch::Nothing => false,
             ElementMatch::Str(wanted) => {
-                element.value_bits() >> 48 == PACK_STR >> 48
-                    && matches!(element.value().view(), ValueView::Str(s) if s == *wanted)
+                word >> 48 == PACK_STR >> 48
+                    && matches!(value().view(), ValueView::Str(s) if s == *wanted)
             }
             ElementMatch::Other(wanted) => match equality {
-                ElementEquality::Strict => i.strict_equals(&element.value(), wanted),
-                ElementEquality::SameValueZero => same_value_zero(&element.value(), wanted),
+                ElementEquality::Strict => i.strict_equals(&value(), wanted),
+                ElementEquality::SameValueZero => same_value_zero(&value(), wanted),
             },
         }
     }
@@ -7521,7 +7523,7 @@ fn search_packed_elements(
     if !matches!(body.exotic, Exotic::Array) || !body.ic_plain.get() {
         return None;
     }
-    let packed = body.props.packed_array_elements()?;
+    let packed = body.props.element_words()?;
     let wanted = ElementMatch::new(wanted, equality);
     // An absent index reads undefined (includes) or is skipped (indexOf, lastIndexOf).
     let absent_matches = equality == ElementEquality::SameValueZero
@@ -7535,19 +7537,14 @@ fn search_packed_elements(
     let past = from.max(packed.len())..end;
     // What index `k` decides: `Some(result)` ends the search, `None` goes on.
     let visit = |k: usize, protected: &mut Option<bool>| -> Option<Option<Option<usize>>> {
-        let element = &packed[k];
-        if element.accessor() {
-            return Some(None);
-        }
-        if element.is_empty() {
+        let word = packed[k];
+        if word == crate::value::PACK_EMPTY {
             if !absent_proved(protected) {
                 return Some(None);
             }
             return absent_matches.then_some(Some(Some(k)));
         }
-        wanted
-            .matches(i, element, equality)
-            .then_some(Some(Some(k)))
+        wanted.matches(i, word, equality).then_some(Some(Some(k)))
     };
     if descending {
         // lastIndexOf reaches the indices past the storage first.
@@ -7796,10 +7793,11 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
         let mut removed = Vec::new();
         let growth = (items.len() as u64).saturating_sub(delete_count as u64);
         if edit_plain_elements(i, &o, len as u64, growth, |elements| {
-            let inserted = items.iter().map(|item| Property::plain(*item));
+            // Every element is a word with no hole (`plain_elements_mut`).
             removed = elements
-                .splice(range, inserted)
-                .map(Property::into_value)
+                .splice(range, &items)
+                .into_iter()
+                .map(|value| value.expect("a plain element"))
                 .collect();
         }) {
             return Ok(i.make_array(removed));

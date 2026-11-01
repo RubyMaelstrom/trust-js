@@ -70,9 +70,9 @@ fn record(families: &mut [Family; 3], object: &Object) {
         .iter()
         .filter(|key| key.as_index().is_some())
         .count();
-    let packed = p.elems.packed_ref();
+    let words = p.elems.words();
     let classic = p.elems.len() != 0;
-    if family == 2 && packed.is_none() && !classic && index_entries == 0 {
+    if family == 2 && words.is_none() && !classic && index_entries == 0 {
         return;
     }
     let f = &mut families[family];
@@ -82,13 +82,17 @@ fn record(families: &mut [Family; 3], object: &Object) {
     let mut nonplain = false;
     let mut all_number = true;
     let mut all_int32 = true;
-    let mut visit = |property: &Property| {
+    let mut visit = |element: Element<'_>| {
         elements += 1;
-        if property.accessor() || !property.has_plain_element_attributes() {
+        let plain_attributes = match element {
+            Element::Word(_) => true,
+            Element::Entry(property) => property.has_plain_element_attributes(),
+        };
+        if element.accessor() || !plain_attributes {
             nonplain = true;
         }
-        match property.number_value() {
-            Some(n) if !property.accessor() => {
+        match element.number_value() {
+            Some(n) if !element.accessor() => {
                 if !f64_exact_i32(n) {
                     all_int32 = false;
                 }
@@ -99,15 +103,19 @@ fn record(families: &mut [Family; 3], object: &Object) {
             }
         }
     };
-    if let Some(packed) = packed {
-        slots = packed.len() as u64;
-        packed.iter().filter(|p| !p.is_empty()).for_each(&mut visit);
+    if let Some(words) = words {
+        slots = words.len() as u64;
+        for n in 0..words.len() {
+            if let Some(value) = words.get(n) {
+                visit(Element::Word(value));
+            }
+        }
     } else if classic {
         slots = p.elems.len() as u64;
         for n in 0..p.elems.len() {
             let slot = p.elems[n];
             if slot != NO_SLOT {
-                visit(&p.entries.fields[slot as usize]);
+                visit(Element::entry(&p.entries.fields[slot as usize]));
             }
         }
     }
@@ -119,7 +127,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
                 && p.elems[n as usize] != NO_SLOT
                 && p.entries.keys()[p.elems[n as usize] as usize] == key;
             if !mapped {
-                visit(property);
+                visit(Element::entry(property));
             }
         }
     }
@@ -149,15 +157,14 @@ fn record(families: &mut [Family; 3], object: &Object) {
     b[0] = class_bytes(std::mem::size_of::<RefCell<Object>>());
     let buffers = p.elems.0.as_deref();
     let mut capacity = 0usize;
-    let heap_packed = buffers.and_then(|buffers| buffers.packed.as_deref());
+    if let Some(words) = words {
+        // The word block: its header, front room, capacity and remembered record (its dirty
+        // bitmap; the packed box and the dirty column stay zero with words).
+        capacity = words.capacity();
+        b[3] = class_bytes(words.block_bytes());
+    }
     if let Some(buffers) = buffers {
         b[1] = class_bytes(std::mem::size_of::<DenseBuffers>());
-        if let Some(packed) = heap_packed {
-            b[2] = class_bytes(std::mem::size_of::<PackedBuffer>());
-            capacity = packed.values.capacity();
-            b[3] = class_bytes(capacity * std::mem::size_of::<Property>());
-            b[4] = class_bytes(packed.dirty.borrow().capacity() * 8);
-        }
         b[5] = class_bytes(buffers.elems.capacity() * 4);
         b[6] = class_bytes(buffers.mirror.capacity() * 8);
         if let Some(index) = buffers.index.as_deref() {
@@ -172,12 +179,12 @@ fn record(families: &mut [Family; 3], object: &Object) {
             + class_bytes(layout.capacity() * 8);
     }
     // The W2c model: a plain map keeps its cell and puts its elements in one block of 8-byte
-    // words behind a 16-byte header, at its packed capacity (a heap deque's) or its slots; the
-    // sidecar, the mirror, the slot map and the index entries' named storage go, and a block
-    // over 64 words keeps a dirty bitmap as today. Others keep today's bytes (the dictionary).
+    // words behind a 16-byte header, at its word capacity or its slots; the sidecar, the
+    // mirror, the slot map and the index entries' named storage go, and a block over 64 words
+    // keeps its remembered record after its words. Others keep today's bytes (the dictionary).
     let today: u64 = b[..PARTS.len() - 1].iter().sum();
     b[PARTS.len() - 1] = if plain {
-        let words = if heap_packed.is_some() {
+        let words = if p.elems.has_words() {
             capacity
         } else {
             slots as usize
@@ -185,10 +192,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
         let named = p.entries.len() - index_entries;
         let mut model = b[0];
         if words != 0 {
-            model += class_bytes(16 + 8 * words);
-        }
-        if words > 64 {
-            model += b[4];
+            model += class_bytes(16 + 8 * (words + word_block::record_words(words)));
         }
         if named > INLINE_NAMED_SLOTS {
             model += class_bytes(named * std::mem::size_of::<Property>());

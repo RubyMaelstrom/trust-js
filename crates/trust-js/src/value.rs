@@ -1759,10 +1759,11 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let thin_some = DenseStorage(
         Some(crate::gc_storage::StorageBox::new(DenseBuffers::default())),
         None,
+        word_block::Words::new(),
     );
     let thin_word = unsafe { *(&thin_some as *const DenseStorage as *const usize) };
     let thin_expected = thin_some.0.as_deref().unwrap() as *const DenseBuffers as usize;
-    let thin_none = DenseStorage(None, None);
+    let thin_none = DenseStorage(None, None, word_block::Words::new());
     let thin_none_word = unsafe { *(&thin_none as *const DenseStorage as *const usize) };
     let thin_vec_ok = thin_word == thin_expected && thin_none_word == 0;
 
@@ -1783,19 +1784,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && pv.capacity() == 3
         && mv.len() == 1
         && mv.capacity() == 3;
-    let packed_some: Option<PackedProperties> = Some(PackedProperties::new(pv.into()));
-    let packed_word = unsafe { *(&packed_some as *const Option<PackedProperties> as *const usize) };
-    let packed_expected = packed_some
-        .as_deref()
-        .map_or(0, |v| &v.values as *const DenseDeque<Property> as usize);
-    let packed_none: Option<PackedProperties> = None;
-    let packed_none_word =
-        unsafe { *(&packed_none as *const Option<PackedProperties> as *const usize) };
-    let packed_elems_valid = offset_of!(PackedBuffer, values) == 0
-        && deque_header_ok
-        && packed_word == packed_expected
-        && packed_word != 0
-        && packed_none_word == 0;
+    // W2c step 2c: elements are words, which no template reads yet; the element templates call
+    // their helpers for a map with words until they read the words themselves.
+    let packed_elems_valid = false;
 
     // Exotic::None / Exotic::Array discriminants (Exotic is repr(Rust); probe to be certain).
     let none = Exotic::None;
@@ -2023,11 +2014,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         props_elems: offset_of!(Props, elems),
         dense_elems: offset_of!(DenseBuffers, elems),
         dense_mirror: offset_of!(DenseBuffers, mirror),
-        dense_packed: offset_of!(DenseBuffers, packed),
-        dense_inline_len: offset_of!(DenseBuffers, inline_packed) + offset_of!(InlinePacked, len),
-        dense_inline_capacity: INLINE_PACKED_CAPACITY,
-        dense_inline_data: offset_of!(DenseBuffers, inline_packed)
-            + offset_of!(InlinePacked, slots),
+        dense_packed: 0,
+        dense_inline_len: 0,
+        dense_inline_capacity: 0,
+        dense_inline_data: 0,
         props_mirror_flags: offset_of!(Props, mirror_flags),
         entry_size: std::mem::size_of::<Property>(),
         str_len_word,
@@ -2726,7 +2716,8 @@ impl Object {
         } else if slots.entries.is_some() {
             properties.elems.extras_mut().internal_slots = slots;
         }
-        properties.elems.force_packed_full();
+        // The words' remembered record described their old owner's marks.
+        properties.elems.2.force_full();
         self.props = properties;
     }
 
@@ -2751,7 +2742,7 @@ impl Object {
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
         // Moving a property payload to a new receiver cannot inherit the old owner's proof.
-        props.elems.force_packed_full();
+        props.elems.2.force_full();
         #[cfg(feature = "architecture-diagnostics")]
         let caller = std::panic::Location::caller();
         with_active_gc_heap(|heap| {
@@ -3679,9 +3670,9 @@ fn mark_object<S: crate::gc_trace::TraceSink + ?Sized>(
     sink: &mut S,
 ) {
     object.trace_gc_fields(sink, Some(purpose));
-    // Commit only after ALL element and non-element edges were successfully reported. A panic
-    // leaves the original obligations intact; between-phase writes are recorded afterwards.
-    object.props.elems.finish_packed_mark_trace();
+    // Commit only after ALL element and non-element edges were reported. A panic leaves the
+    // words' obligations intact; writes between phases are recorded afterwards.
+    object.props.elems.2.finish_mark_trace();
 }
 
 /// Strong edges of an environment record.
@@ -3789,19 +3780,9 @@ impl Object {
         // The storage blocks the payloads live in, in every trace: they live as long as an owner
         // reports them (`gc_storage`).
         props.trace_storage(sink);
-        if let Some(purpose) = purpose {
-            if let Some(packed) = props.elems.packed.as_deref() {
-                packed.trace_elements(purpose, sink);
-            } else if let Some(properties) = props.elems.packed_ref() {
-                for property in properties {
-                    trace_packed_property(property, sink, Some(purpose));
-                }
-            }
-        } else {
-            for property in props.packed_values() {
-                property.trace_edges(sink);
-            }
-        }
+        // The element words' edges, in every trace (the block itself is in trace_storage); a
+        // marker's remembered trace reports only those written since its last mark.
+        props.elems.2.trace_values(purpose, sink);
         // Named/classic properties and every non-element edge are ALWAYS complete.
         for property in props
             .entries
@@ -3892,7 +3873,8 @@ impl crate::gc_trace::GcTrace for Props {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         self.trace_storage(sink);
         crate::gc_trace::GcTrace::trace_gc(&self.entries.layout, sink);
-        for property in self.packed_values().chain(self.entries.fields.iter()) {
+        self.elems.2.trace_values(None, sink);
+        for property in self.entries.fields.iter() {
             crate::gc_trace::GcTrace::trace_gc(property, sink);
         }
         self.trace_symbol_keys(sink);
@@ -5424,64 +5406,99 @@ pub enum TaIndex {
     Ordinary,
 }
 
-/// An element as a property map holds it (W2c step 2): a reference to the entry that stores it,
-/// which every element is until the elements become 8-byte words; a word will be a plain data
-/// element (writable, enumerable, configurable) of its value. It reads as a [`Property`] does,
-/// and [`Element::to_property`] makes one when a caller needs to own or store it.
+/// An element as a property map holds it (W2c step 2): a word of its element block, which is a
+/// plain data element (writable, enumerable, configurable) of that value, or the entry that
+/// stores it (an index key in the named entries: a non-plain element, a far index, a classic
+/// map's). It reads as a [`Property`] does, and [`Element::to_property`] makes one when a caller
+/// needs to own or store it.
 #[derive(Clone, Copy)]
-pub(crate) struct Element<'a>(&'a Property);
+pub(crate) enum Element<'a> {
+    Word(Value),
+    Entry(&'a Property),
+}
 
 impl<'a> Element<'a> {
     #[inline]
     pub(crate) fn entry(property: &'a Property) -> Self {
-        Element(property)
+        Element::Entry(property)
     }
     /// The property this element is.
     #[inline]
     pub(crate) fn to_property(self) -> Property {
-        self.0.clone()
+        match self {
+            Element::Word(value) => Property::plain(value),
+            Element::Entry(property) => property.clone(),
+        }
     }
-    /// The stored entry, while every element has one (until W2c's words): for tests of the
-    /// entries' own representation.
+    /// The stored entry, for tests of the entries' own representation.
     #[cfg(test)]
     pub(crate) fn as_entry(self) -> &'a Property {
-        self.0
+        match self {
+            Element::Entry(property) => property,
+            Element::Word(_) => panic!("a word element has no entry"),
+        }
     }
     #[inline]
     pub(crate) fn accessor(self) -> bool {
-        self.0.accessor()
+        matches!(self, Element::Entry(property) if property.accessor())
     }
     #[inline]
     pub(crate) fn writable(self) -> bool {
-        self.0.writable()
+        match self {
+            Element::Word(_) => true,
+            Element::Entry(property) => property.writable(),
+        }
     }
     #[inline]
     pub(crate) fn enumerable(self) -> bool {
-        self.0.enumerable()
+        match self {
+            Element::Word(_) => true,
+            Element::Entry(property) => property.enumerable(),
+        }
     }
     #[inline]
     pub(crate) fn configurable(self) -> bool {
-        self.0.configurable()
+        match self {
+            Element::Word(_) => true,
+            Element::Entry(property) => property.configurable(),
+        }
     }
     #[inline]
     pub(crate) fn value(self) -> Value {
-        self.0.value()
+        match self {
+            Element::Word(value) => value,
+            Element::Entry(property) => property.value(),
+        }
     }
     #[inline]
     pub(crate) fn number_value(self) -> Option<f64> {
-        self.0.number_value()
+        match self {
+            Element::Word(value) => value.number(),
+            Element::Entry(property) => property.number_value(),
+        }
     }
     #[inline]
     pub(crate) fn holds_object(self, expected: *const RefCell<Object>) -> bool {
-        self.0.holds_object(expected)
+        match self {
+            Element::Word(value) => value
+                .as_obj()
+                .is_some_and(|object| std::ptr::eq(Gc::as_ptr(&object), expected)),
+            Element::Entry(property) => property.holds_object(expected),
+        }
     }
     #[inline]
     pub(crate) fn getter(self) -> Option<&'a Value> {
-        self.0.getter()
+        match self {
+            Element::Word(_) => None,
+            Element::Entry(property) => property.getter(),
+        }
     }
     #[inline]
     pub(crate) fn setter(self) -> Option<&'a Value> {
-        self.0.setter()
+        match self {
+            Element::Word(_) => None,
+            Element::Entry(property) => property.setter(),
+        }
     }
 }
 
@@ -5747,14 +5764,6 @@ impl Property {
                 .with_object(|object| std::ptr::eq(Gc::as_ptr(object), expected))
                 .unwrap_or(false)
     }
-    /// The value word as stored, for a search that compares words in place: a Number's bits
-    /// (every NaN as the canonical one), an undefined, null or Boolean word, or a cell's tagged
-    /// address. A deferred prototype's word equals no execution value's ([`Value::bits`]); an
-    /// accessor's is undefined's, so a caller tests [`Property::accessor`] first.
-    #[inline]
-    pub(crate) fn value_bits(&self) -> u64 {
-        self.packed.0.get()
-    }
     /// OrdinaryGet's own-data Number case, with no getter invocation or value conversion.
     /// Callers must still prove ordinary internal methods and fall back for every other case.
     #[inline]
@@ -5854,95 +5863,6 @@ impl Property {
     }
 }
 
-/// Insertion-ordered string-keyed property map. A `Vec` of entries preserves order (good enough for
-/// `for-in`/`Object.keys`); a side `HashMap` keeps lookup O(1).
-const INLINE_PACKED_CAPACITY: usize = 10;
-
-struct InlinePacked {
-    len: u8,
-    /// Proof for either packed representation, including when `len` is zero and
-    /// the live elements use the heap deque. This byte fits beside the inline length.
-    /// Foreign descriptor escapes invalidate it; value-only writes preserve it.
-    packed_plain: Cell<bool>,
-    slots: [std::mem::MaybeUninit<Property>; INLINE_PACKED_CAPACITY],
-}
-
-impl InlinePacked {
-    const fn new() -> InlinePacked {
-        InlinePacked {
-            len: 0,
-            packed_plain: Cell::new(false),
-            slots: [const { std::mem::MaybeUninit::uninit() }; INLINE_PACKED_CAPACITY],
-        }
-    }
-
-    fn from_properties(items: impl ExactSizeIterator<Item = Property>) -> InlinePacked {
-        debug_assert!(items.len() <= INLINE_PACKED_CAPACITY);
-        let mut packed = InlinePacked::default();
-        for property in items {
-            packed.slots[packed.len as usize].write(property);
-            packed.len += 1;
-        }
-        packed
-    }
-
-    fn as_slice(&self) -> &[Property] {
-        unsafe {
-            std::slice::from_raw_parts(self.slots.as_ptr().cast::<Property>(), self.len as usize)
-        }
-    }
-
-    fn pop(&mut self) -> Option<Property> {
-        self.len = self.len.checked_sub(1)?;
-        // The live prefix owned this initialized slot; shortening it transfers the
-        // owner to the caller and prevents InlinePacked::drop from dropping it again.
-        Some(unsafe { self.slots[self.len as usize].assume_init_read() })
-    }
-
-    fn into_vec(&mut self) -> Vec<Property> {
-        let len = self.len as usize;
-        let mut values = Vec::with_capacity(len);
-        for index in 0..len {
-            values.push(unsafe { self.slots[index].assume_init_read() });
-        }
-        self.len = 0;
-        values
-    }
-
-    fn prepend(&mut self, items: &[Value]) {
-        debug_assert!(self.len as usize + items.len() <= INLINE_PACKED_CAPACITY);
-        for item in items.iter().rev() {
-            // Create the new owner before moving existing slots. Each committed
-            // step leaves a completely initialized prefix for cleanup.
-            let property = Property::plain(*item);
-            let ptr = self.slots.as_mut_ptr().cast::<Property>();
-            unsafe {
-                std::ptr::copy(ptr, ptr.add(1), self.len as usize);
-                ptr.write(property);
-            }
-            self.len += 1;
-        }
-    }
-}
-
-impl Default for InlinePacked {
-    fn default() -> Self {
-        InlinePacked::new()
-    }
-}
-
-impl Clone for InlinePacked {
-    fn clone(&self) -> Self {
-        let mut clone = InlinePacked::default();
-        for (index, property) in self.as_slice().iter().enumerate() {
-            clone.slots[index].write(property.clone());
-        }
-        clone.len = self.len;
-        clone.packed_plain.set(self.packed_plain.get());
-        clone
-    }
-}
-
 // No Drop: properties own nothing outside the heap, so the slots need no destructor and the
 // sidecar block that holds them is plain data (see `DenseBuffers`).
 const _: () = assert!(!std::mem::needs_drop::<Property>());
@@ -5952,8 +5872,6 @@ const _: () = assert!(!std::mem::needs_drop::<Property>());
 /// with its heap (a template can outlive its Agent).
 #[derive(Clone, Default)]
 struct DenseBuffers {
-    packed: Option<PackedProperties>,
-    inline_packed: InlinePacked,
     elems: DenseDeque<u32>,
     mirror: DenseDeque<f64>,
     /// The map's own index of its named keys, when it keeps one (`Props::build_index`): one
@@ -6132,229 +6050,12 @@ impl DenseExtras {
     }
 }
 
-// DenseBuffers exists for every object that leaves the inline-property representation. The
-// extra indirection keeps this optional field pointer-sized instead of adding two words to each
-// allocation; the compact representation is more valuable here than Clippy's generic Vec advice.
-#[allow(clippy::box_collection)]
-type PackedProperties = crate::gc_storage::StorageBox<PackedBuffer>;
-
-const PACKED_DIRTY_BLOCK: usize = 64;
-const PACKED_TRACE_FULL: usize = usize::MAX;
-
-#[cfg(test)]
-thread_local! {
-    static PACKED_BITMAP_FAIL_GROWTH: Cell<bool> = const { Cell::new(false) };
-    static PACKED_MARK_VISITS: Cell<[usize; 2]> = const { Cell::new([0; 2]) };
-}
-
-/// Only heap-packed arrays pay for remembered metadata. The native append code still sees
-/// the admitted DenseDeque header at offset zero; all outer carriers remain pointer-sized.
-#[repr(C)]
-struct PackedBuffer {
-    values: DenseDeque<Property>,
-    /// Full until an actual marker reports all obligations successfully. Vec's nonzero-sized
-    /// allocation bound makes usize::MAX impossible as a real live length.
-    traced_len: Cell<usize>,
-    dirty: RefCell<DenseDeque<u64>>,
-}
-
-impl From<DenseDeque<Property>> for PackedBuffer {
-    fn from(values: DenseDeque<Property>) -> Self {
-        Self {
-            values,
-            traced_len: Cell::new(PACKED_TRACE_FULL),
-            dirty: RefCell::new(DenseDeque::new()),
-        }
-    }
-}
-
-impl From<Vec<Property>> for PackedBuffer {
-    fn from(values: Vec<Property>) -> Self {
-        Self::from(DenseDeque::from(values))
-    }
-}
-
-impl FromIterator<Property> for PackedBuffer {
-    fn from_iter<T: IntoIterator<Item = Property>>(iter: T) -> Self {
-        Self::from(iter.into_iter().collect::<DenseDeque<Property>>())
-    }
-}
-
-impl Clone for PackedBuffer {
-    fn clone(&self) -> Self {
-        Self::from(self.values.clone())
-    }
-}
-
-impl std::ops::Deref for PackedBuffer {
-    type Target = DenseDeque<Property>;
-    fn deref(&self) -> &Self::Target {
-        &self.values
-    }
-}
-
-impl<'a> IntoIterator for &'a PackedBuffer {
-    type Item = &'a Property;
-    type IntoIter = std::slice::Iter<'a, Property>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.values.iter()
-    }
-}
-
-impl PackedBuffer {
-    fn force_full(&self) {
-        self.traced_len.set(PACKED_TRACE_FULL);
-    }
-
-    fn full_mut(&mut self) -> &mut DenseDeque<Property> {
-        self.force_full();
-        &mut self.values
-    }
-
-    fn note_index(&mut self, index: usize) {
-        let traced = self.traced_len.get();
-        if traced == PACKED_TRACE_FULL || index >= traced {
-            return;
-        }
-        let block = index / PACKED_DIRTY_BLOCK;
-        let word = block / 64;
-        let dirty = self.dirty.get_mut();
-        if word >= dirty.len() {
-            #[cfg(test)]
-            let fail = PACKED_BITMAP_FAIL_GROWTH.with(Cell::get);
-            #[cfg(not(test))]
-            let fail = false;
-            if fail || dirty.try_reserve_exact(word + 1 - dirty.len()).is_err() {
-                // Remembering is optional: never introduce OOM to an existing-value store.
-                self.traced_len.set(PACKED_TRACE_FULL);
-                return;
-            }
-            dirty.resize_with(word + 1, || 0);
-        }
-        dirty[word] |= 1 << (block % 64);
-    }
-
-    fn index_mut(&mut self, index: usize) -> Option<&mut Property> {
-        if index >= self.values.len() {
-            return None;
-        }
-        self.note_index(index);
-        self.values.get_mut(index)
-    }
-
-    fn push(&mut self, property: Property) {
-        self.values.push(property);
-    }
-
-    fn pop(&mut self) -> Option<Property> {
-        let result = self.values.pop();
-        if self.traced_len.get() != PACKED_TRACE_FULL {
-            self.traced_len
-                .set(self.traced_len.get().min(self.values.len()));
-        }
-        result
-    }
-
-    fn pop_front(&mut self) -> Option<Property> {
-        self.full_mut().pop_front()
-    }
-
-    fn prepend(&mut self, items: impl ExactSizeIterator<Item = Property> + DoubleEndedIterator) {
-        self.full_mut().prepend(items);
-    }
-
-    fn trace_elements<S: crate::gc_trace::GcSink + ?Sized>(
-        &self,
-        purpose: crate::gc_core::TracePurpose,
-        sink: &mut S,
-    ) {
-        let Self {
-            values,
-            traced_len,
-            dirty,
-        } = self;
-        let len = values.len();
-        let traced = traced_len.get();
-        let mut report = |start: usize, end: usize| {
-            for property in &values[start..end] {
-                trace_packed_property(property, sink, Some(purpose));
-            }
-        };
-        if purpose == crate::gc_core::TracePurpose::Full || traced == PACKED_TRACE_FULL {
-            report(0, len);
-            return;
-        }
-        let prefix = traced.min(len);
-        let dirty = dirty.borrow();
-        let mut run: Option<(usize, usize)> = None;
-        for (word_index, &word) in dirty.iter().enumerate() {
-            let mut bits = word;
-            while bits != 0 {
-                let block = word_index * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let start = block * PACKED_DIRTY_BLOCK;
-                if start >= prefix {
-                    break;
-                }
-                let end = (start + PACKED_DIRTY_BLOCK).min(prefix);
-                match run {
-                    Some((first, previous_end)) if previous_end == start => {
-                        run = Some((first, end))
-                    }
-                    Some((first, previous_end)) => {
-                        report(first, previous_end);
-                        run = Some((start, end));
-                    }
-                    None => run = Some((start, end)),
-                }
-            }
-        }
-        match run {
-            Some((start, end)) if end == prefix => report(start, len),
-            Some((start, end)) => {
-                report(start, end);
-                report(prefix, len);
-            }
-            None => report(prefix, len),
-        }
-    }
-
-    /// Called only after the actual Object marker successfully reported ALL its edges.
-    fn finish_mark_trace(&self) {
-        self.dirty.borrow_mut().clear();
-        self.traced_len.set(self.values.len());
-    }
-}
-
-#[inline]
-fn trace_packed_property<S: crate::gc_trace::GcSink + ?Sized>(
-    property: &Property,
-    sink: &mut S,
-    purpose: Option<crate::gc_core::TracePurpose>,
-) {
-    #[cfg(test)]
-    if let Some(purpose) = purpose {
-        PACKED_MARK_VISITS.with(|counts| {
-            let mut value = counts.get();
-            value[usize::from(purpose == crate::gc_core::TracePurpose::Remembered)] += 1;
-            counts.set(value);
-        });
-    }
-    #[cfg(not(test))]
-    let _ = purpose;
-    if !property.is_empty() {
-        property.trace_edges(sink);
-    }
-}
-
 struct EmptyDenseBuffers(DenseBuffers);
 // This value's empty buffers and cached-proof cell are never mutated. Every writer first
 // acquires an owned allocation through DenseStorage::buffers_mut; live buffers stay thread-local.
 unsafe impl Sync for EmptyDenseBuffers {}
 
 static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers {
-    packed: None,
-    inline_packed: InlinePacked::new(),
     elems: DenseDeque::new(),
     mirror: DenseDeque::new(),
     index: None,
@@ -6369,13 +6070,14 @@ static EMPTY_INTERNAL_SLOTS: EmptyInternalSlots = EmptyInternalSlots(InternalSlo
     charge: ExternalCharge::new(),
 });
 
-/// A property map's element sidecar (its first word, the nullable pointer the JIT follows) and
-/// its Rust-heap extras.
+/// A property map's element sidecar (its first word, the nullable pointer the JIT follows), its
+/// Rust-heap extras, and its element words (W2c; the static empty block until it has elements).
 #[derive(Clone, Default)]
 #[repr(C)]
 struct DenseStorage(
     Option<crate::gc_storage::StorageBox<DenseBuffers>>,
     Option<crate::gc_storage::PayloadBox<DenseExtras>>,
+    word_block::Words,
 );
 
 impl std::ops::Deref for DenseStorage {
@@ -6383,6 +6085,13 @@ impl std::ops::Deref for DenseStorage {
     fn deref(&self) -> &DenseBuffers {
         self.0.as_deref().unwrap_or(&EMPTY_DENSE_BUFFERS.0)
     }
+}
+
+/// Whether no used word is a hole: the kind bit, else a scan (a cleared bit is not proof of a
+/// hole).
+#[inline]
+fn words_have_no_holes(words: &word_block::Words) -> bool {
+    words.kind() & word_block::KIND_NO_HOLES != 0 || !words.as_slice().contains(&PACK_EMPTY)
 }
 
 impl DenseStorage {
@@ -6423,13 +6132,14 @@ impl DenseStorage {
         if let Some(extras) = &self.1 {
             crate::gc_storage::PayloadBox::trace(extras, sink);
         }
+        if let Some(block) = self.2.block_start() {
+            trace_block(block, sink);
+        }
         let Some(buffers) = &self.0 else {
             return;
         };
         StorageBox::trace(buffers, sink);
         let DenseBuffers {
-            packed,
-            inline_packed: _, // in the sidecar's block
             elems,
             mirror,
             index,
@@ -6437,20 +6147,6 @@ impl DenseStorage {
         if let Some(index) = index {
             StorageBox::trace(index, sink);
             if let Some(block) = index.slots.spill_ptr() {
-                trace_block(block, sink);
-            }
-        }
-        if let Some(packed) = packed {
-            StorageBox::trace(packed, sink);
-            let PackedBuffer {
-                values,
-                traced_len: _,
-                dirty,
-            } = &**packed;
-            if let Some(block) = values.block_ptr() {
-                trace_block(block, sink);
-            }
-            if let Some(block) = dirty.borrow().block_ptr() {
                 trace_block(block, sink);
             }
         }
@@ -6489,98 +6185,27 @@ impl DenseStorage {
     fn index_mut(&mut self) -> Option<&mut KeyIndex> {
         self.0.as_deref_mut()?.index.as_deref_mut()
     }
-    fn packed_mut(&mut self) -> Option<&mut DenseDeque<Property>> {
-        let dense = self.0.as_deref_mut()?;
-        dense.inline_packed.packed_plain.set(false);
-        if dense.packed.is_none() && dense.inline_packed.len != 0 {
-            dense.packed = Some(PackedProperties::new(dense.inline_packed.into_vec().into()));
-        }
-        dense.packed.as_deref_mut().map(PackedBuffer::full_mut)
+    /// The element words, while the map keeps its elements as words.
+    #[inline]
+    fn words(&self) -> Option<&word_block::Words> {
+        (!self.2.is_static_empty()).then_some(&self.2)
     }
-    fn packed_slice_mut(&mut self) -> Option<&mut [Property]> {
-        self.0.as_deref()?.inline_packed.packed_plain.set(false);
-        self.packed_values_mut()
+    #[inline]
+    fn words_mut(&mut self) -> Option<&mut word_block::Words> {
+        (!self.2.is_static_empty()).then_some(&mut self.2)
     }
-    // A generic mutable slice can change any slot, so it abandons remembered precision.
-    fn packed_values_mut(&mut self) -> Option<&mut [Property]> {
-        let dense = self.0.as_deref_mut()?;
-        match dense.packed.as_deref_mut() {
-            Some(packed) => Some(packed.full_mut().as_mut_slice()),
-            None if dense.inline_packed.len != 0 => Some(unsafe {
-                // The same initialized prefix as InlinePacked::as_slice. A mutable
-                // element access does not require promoting the backing storage.
-                std::slice::from_raw_parts_mut(
-                    dense.inline_packed.slots.as_mut_ptr().cast::<Property>(),
-                    dense.inline_packed.len as usize,
-                )
-            }),
-            None => None,
-        }
+    /// The words, the static empty block included, for a map that starts keeping them.
+    #[inline]
+    fn words_start(&mut self) -> &mut word_block::Words {
+        &mut self.2
     }
-    fn packed_index_mut(&mut self, index: usize) -> Option<&mut Property> {
-        self.0.as_deref()?.inline_packed.packed_plain.set(false);
-        self.packed_index_value_mut(index)
+    #[inline]
+    fn has_words(&self) -> bool {
+        !self.2.is_static_empty()
     }
-    // Descriptor/occupancy-preserving counterpart of the former packed_values_mut caller.
-    fn packed_index_value_mut(&mut self, index: usize) -> Option<&mut Property> {
-        let dense = self.0.as_deref_mut()?;
-        if let Some(packed) = dense.packed.as_deref_mut() {
-            packed.index_mut(index)
-        } else if index < dense.inline_packed.len as usize {
-            Some(unsafe { dense.inline_packed.slots[index].assume_init_mut() })
-        } else {
-            None
-        }
-    }
-    fn force_packed_full(&self) {
-        if let Some(packed) = self.packed.as_deref() {
-            packed.force_full();
-        }
-    }
-    fn finish_packed_mark_trace(&self) {
-        if let Some(packed) = self.packed.as_deref() {
-            packed.finish_mark_trace();
-        }
-    }
-    fn push_packed(&mut self, property: Property) {
-        let dense = self.buffers_mut();
-        if !property.is_plain_element() {
-            dense.inline_packed.packed_plain.set(false);
-        }
-        if let Some(packed) = dense.packed.as_deref_mut() {
-            packed.push(property);
-        } else if (dense.inline_packed.len as usize) < INLINE_PACKED_CAPACITY {
-            dense.inline_packed.slots[dense.inline_packed.len as usize].write(property);
-            dense.inline_packed.len += 1;
-        } else {
-            let mut packed = dense.inline_packed.into_vec();
-            packed.push(property);
-            dense.packed = Some(PackedProperties::new(packed.into()));
-        }
-    }
-    fn packed_ref(&self) -> Option<&[Property]> {
-        let dense = self.0.as_deref()?;
-        match dense.packed.as_deref() {
-            Some(packed) => Some(packed.values.as_slice()),
-            None if dense.inline_packed.len != 0 => Some(dense.inline_packed.as_slice()),
-            None => None,
-        }
-    }
-    fn packed_is_some(&self) -> bool {
-        self.packed_ref().is_some()
-    }
-    fn packed_all_plain(&self) -> bool {
-        let Some(buffers) = self.0.as_deref() else {
-            return false;
-        };
-        if buffers.inline_packed.packed_plain.get() {
-            return true;
-        }
-        let plain = self
-            .packed_ref()
-            .is_some_and(|packed| packed.iter().all(Property::is_plain_element));
-        buffers.inline_packed.packed_plain.set(plain);
-        plain
+    /// Stop keeping element words.
+    fn clear_words(&mut self) {
+        self.2 = word_block::Words::new();
     }
     fn set_index(&mut self, index: Option<KeyIndex>) {
         match index {
@@ -6592,24 +6217,6 @@ impl DenseStorage {
                     buffers.index = None;
                 }
             }
-        }
-    }
-    fn set_packed(&mut self, packed: Option<PackedProperties>) {
-        if packed.is_some() {
-            let dense = self.buffers_mut();
-            packed.as_deref().unwrap().force_full();
-            dense.inline_packed = InlinePacked::default();
-            dense.inline_packed.packed_plain.set(
-                packed
-                    .as_deref()
-                    .unwrap()
-                    .iter()
-                    .all(Property::is_plain_element),
-            );
-            dense.packed = packed;
-        } else if let Some(d) = self.0.as_deref_mut() {
-            d.packed = None;
-            d.inline_packed = InlinePacked::default();
         }
     }
     #[inline]
@@ -6640,6 +6247,7 @@ impl DenseStorage {
     #[cfg(test)]
     fn clear(&mut self) {
         self.0 = None;
+        self.2 = word_block::Words::new();
     }
     fn clear_elems(&mut self) {
         if let Some(d) = self.0.as_deref_mut() {
@@ -7119,6 +6727,8 @@ impl NamedEntries {
     }
 }
 
+/// Insertion-ordered string-keyed property map. A `Vec` of entries preserves order (good enough for
+/// `for-in`/`Object.keys`); a side `HashMap` keeps lookup O(1).
 #[derive(Clone)]
 pub struct Props {
     entries: NamedEntries,
@@ -7823,7 +7433,7 @@ impl Props {
     /// [[OwnPropertyKeys]] order and every Get observes an own data value without author code.
     pub(crate) fn named_data_keys(&self) -> Option<&[PropKey]> {
         if self.elems.len() != 0
-            || self.elems.packed_is_some()
+            || self.elems.has_words()
             || self.elem_mode.get()
             || self.has_far.get()
             || self.entries.iter().any(|(key, property)| {
@@ -7903,6 +7513,10 @@ impl Props {
         for property in self.entries.fields.iter() {
             bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
         }
+        if let Some(words) = self.elems.words() {
+            // The block: front room, header, words and remembered record.
+            bytes = bytes.saturating_add(words.block_bytes());
+        }
         if let Some(dense) = self.elems.0.as_deref() {
             bytes = bytes.saturating_add(std::mem::size_of::<DenseBuffers>());
             bytes = bytes.saturating_add(
@@ -7917,23 +7531,6 @@ impl Props {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<f64>()),
             );
-            if let Some(packed) = dense.packed.as_deref() {
-                bytes = bytes.saturating_add(std::mem::size_of::<PackedBuffer>());
-                bytes = bytes
-                    .saturating_add(packed.dirty.borrow().capacity() * std::mem::size_of::<u64>());
-                bytes = bytes.saturating_add(
-                    packed
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<Property>()),
-                );
-                for property in packed {
-                    bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
-                }
-            } else {
-                for property in dense.inline_packed.as_slice() {
-                    bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
-                }
-            }
             if let Some(index) = self.elems.index() {
                 bytes = bytes
                     .saturating_add(std::mem::size_of::<KeyIndex>())
@@ -7970,19 +7567,17 @@ impl Props {
     /// # Safety
     /// `items..items+len` contains immutable initialized execution words valid through this call.
     pub(crate) unsafe fn packed_array_from_raw(items: *const Value, len: usize) -> Props {
-        Self::packed_array_properties(
-            (0..len).map(|index| Property::plain(unsafe { items.add(index).read() })),
-        )
+        Self::packed_array_values((0..len).map(|index| unsafe { items.add(index).read() }))
     }
 
     /// CreateArrayFromList / ArrayCreate (ECMA-262 e28783d5). Host/runtime lists
     /// use the same canonical contiguous storage as literal operands. Values
     /// move into plain own properties; no getters, conversions or species run.
     pub(crate) fn packed_array(items: impl ExactSizeIterator<Item = Value>) -> Props {
-        Self::packed_array_properties(items.map(Property::plain))
+        Self::packed_array_values(items)
     }
 
-    fn packed_array_properties(items: impl ExactSizeIterator<Item = Property>) -> Props {
+    fn packed_array_values(items: impl ExactSizeIterator<Item = Value>) -> Props {
         let shape = array_length_shape();
         Self::packed_array_named(items, shape, array_length_layout(), std::iter::empty())
     }
@@ -7992,26 +7587,14 @@ impl Props {
     /// the map's shape.
     #[inline(always)]
     fn packed_array_named(
-        items: impl ExactSizeIterator<Item = Property>,
+        items: impl ExactSizeIterator<Item = Value>,
         shape: u32,
         layout: PropertyLayout,
         named: impl ExactSizeIterator<Item = Value>,
     ) -> Props {
         let len = items.len();
-        let mut all_plain = true;
-        let items = items.inspect(|property| all_plain &= property.is_plain_element());
-        let inline = len <= INLINE_PACKED_CAPACITY;
-        let (inline_packed, packed) = if inline {
-            (InlinePacked::from_properties(items), None)
-        } else {
-            (
-                InlinePacked::default(),
-                Some(PackedProperties::new(items.collect())),
-            )
-        };
-        inline_packed.packed_plain.set(all_plain);
         let length = Property::data(Value::Num(len as f64), true, false, false);
-        let mut props = Props {
+        Props {
             entries: NamedEntries {
                 fields: std::mem::ManuallyDrop::new(Fields::from_iter(
                     std::iter::once(length).chain(named.map(Property::plain)),
@@ -8019,23 +7602,10 @@ impl Props {
                 layout: Some(layout),
             },
             shape,
-            // An empty InlinePacked has no active packed representation. Preserve the
-            // same empty classic state as ArrayCreate/make_array([]): subsequent numeric
-            // growth must build its mirror rather than inherit a permanent invalidation.
-            elems: if len == 0 {
-                DenseStorage::default()
-            } else {
-                DenseStorage(
-                    Some(crate::gc_storage::StorageBox::new(DenseBuffers {
-                        packed,
-                        inline_packed,
-                        elems: DenseDeque::new(),
-                        mirror: DenseDeque::new(),
-                        index: None,
-                    })),
-                    None,
-                )
-            },
+            // An empty array keeps the static empty block and the same empty classic state as
+            // ArrayCreate/make_array([]): later numeric growth builds its mirror rather than
+            // inheriting a permanent invalidation.
+            elems: DenseStorage(None, None, word_block::Words::from_values(items)),
             mirror_flags: if len == 0 {
                 MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES
             } else {
@@ -8047,14 +7617,7 @@ impl Props {
             elem_mode: Cell::new(true),
             proto_slot: Cell::new(SlotMemo::NONE),
             len_slot: Cell::new(SlotMemo::of(0)),
-        };
-        // Previously large numeric lists built a mirror while constructing decimal
-        // property keys. Preserve native numeric-region access without those keys.
-        // This is an allocation boundary, unlike bounded non-safepoint hot preparation.
-        if len > 32 {
-            props.initialize_packed_numeric_mirror();
         }
-        props
     }
 
     /// Instantiate a compiler-proved plain-data object template with its final values.
@@ -8113,7 +7676,7 @@ impl Props {
         debug_assert!(
             self.elem_mode.get()
                 && self.elems.len() == 0
-                && !self.elems.packed_is_some()
+                && !self.elems.has_words()
                 && self
                     .entries
                     .keys()
@@ -8132,7 +7695,7 @@ impl Props {
             .layout
             .clone()
             .expect("an array template lists its keys");
-        Self::packed_array_named(items.map(Property::plain), self.shape, layout, named)
+        Self::packed_array_named(items, self.shape, layout, named)
     }
 
     /// Grow tiny property maps exactly: `Vec`'s default first allocation has room for four
@@ -8159,22 +7722,14 @@ impl Props {
     pub(crate) fn reserve_dense_exact(&mut self, len: usize, numeric: bool) {
         if (1..=32).contains(&len) || (len != 0 && dense_elements_enabled()) {
             self.entries.reserve_exact(1); // own `length`
-            self.elems.set_packed(Some(PackedProperties::new(
-                DenseDeque::with_capacity(len).into(),
-            )));
-            self.mirror_flags = if numeric && dense_elements_enabled() {
-                MIRROR_OK | MIRROR_PACKED | MIRROR_ALL_I32 | MIRROR_NO_HOLES
-            } else {
-                0
-            };
-            if numeric && dense_elements_enabled() {
-                self.elems.mirror_reserve_exact(len);
-            }
+            self.elems.words_start().reserve_exact(len);
+            // W2c step 2c: element words keep no packed numeric mirror.
+            self.mirror_flags = 0;
         } else {
             self.entries.reserve_exact(len.saturating_add(1));
             self.elems.reserve_exact(len);
         }
-        if numeric && !self.elems.packed_is_some() {
+        if numeric && !self.elems.has_words() {
             self.elems.mirror_reserve_exact(len);
         }
     }
@@ -8191,16 +7746,15 @@ impl Props {
         if !*ENABLED.get_or_init(|| std::env::var_os("TRUST_JS_JIT_NO_PACKED_HOLES").is_none())
             || len == 0
             || len > 8
-            || self.elems.packed_is_some()
+            || self.elems.has_words()
         {
             return;
         }
         debug_assert_eq!(self.elems.len(), 0);
-        let mut packed = Vec::with_capacity(len);
-        packed.resize_with(len, || Property::plain(Value::Empty));
-        self.elems
-            .set_packed(Some(PackedProperties::new(packed.into())));
-        // The raw-f64 mirror describes classic `elems` slots, not keyless packed properties.
+        let words = self.elems.words_start();
+        words.reserve_exact(len);
+        words.resize_with_holes(len);
+        // The raw-f64 mirror describes classic `elems` slots, not element words.
         self.mirror_flags = 0;
     }
 
@@ -8211,107 +7765,19 @@ impl Props {
     /// A bounded, fallible allocation keeps this non-safepoint preparation cheap and atomic.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn prepare_packed_numeric_mirror(&mut self) -> bool {
-        if self.mirror_flags & (MIRROR_OK | MIRROR_PACKED) == (MIRROR_OK | MIRROR_PACKED) {
-            return true;
-        }
-        if self.mirror_flags & MIRROR_PACKED_FAILED != 0 {
-            return false;
-        }
-        let Some(packed) = self.elems.packed_ref() else {
-            return false;
-        };
-        self.mirror_flags = MIRROR_PACKED_FAILED;
-        // Larger packed arrays retain checked native access. This bounds allocation and
-        // validation work in a helper that cannot itself run an interrupt/GC safepoint.
-        const MAX_NON_SAFEPOINT_ELEMENTS: usize = 4096;
-        if packed.is_empty() || packed.len() > MAX_NON_SAFEPOINT_ELEMENTS || self.has_far.get() {
-            return false;
-        }
-        let mut all_i32 = true;
-        for property in packed {
-            let Some(number) = property.number_value() else {
-                return false;
-            };
-            if property.accessor() || !property.writable() || number.to_bits() == MIRROR_HOLE {
-                return false;
-            }
-            all_i32 &= f64_exact_i32(number);
-        }
-        let length = packed.len();
-        let buffers = self.elems.buffers_mut();
-        let mirror = &mut buffers.mirror;
-        if mirror
-            .try_reserve_exact(length.saturating_sub(mirror.len()))
-            .is_err()
-        {
-            return false;
-        }
-        mirror.clear();
-        let packed = buffers
-            .packed
-            .as_deref()
-            .map(|packed| packed.values.as_slice())
-            .unwrap_or_else(|| buffers.inline_packed.as_slice());
-        mirror.extend(
-            packed
-                .iter()
-                .map(|property| property.number_value().unwrap()),
-        );
-        self.mirror_holes = 0;
-        self.mirror_flags =
-            MIRROR_OK | MIRROR_PACKED | MIRROR_NO_HOLES | if all_i32 { MIRROR_ALL_I32 } else { 0 };
-        true
+        // W2c step 2c: element words keep no packed numeric mirror; the templates read the
+        // words themselves next.
+        false
     }
 
-    fn initialize_packed_numeric_mirror(&mut self) {
-        let Some(packed) = self.elems.packed_ref() else {
-            return;
-        };
-        let mut all_i32 = true;
-        for property in packed {
-            let Some(number) = property.number_value() else {
-                return;
-            };
-            if property.accessor() || !property.writable() || number.to_bits() == MIRROR_HOLE {
-                return;
-            }
-            all_i32 &= f64_exact_i32(number);
-        }
-        let mirror = packed.iter().map(|p| p.number_value().unwrap()).collect();
-        self.elems.buffers_mut().mirror = mirror;
-        self.mirror_holes = 0;
-        self.mirror_flags =
-            MIRROR_OK | MIRROR_PACKED | MIRROR_NO_HOLES | if all_i32 { MIRROR_ALL_I32 } else { 0 };
-    }
-
-    /// Append one owning descriptor, with no decimal key or index-to-field map.
-    /// Array exotic validation (length, extensibility and prototype setters) stays
-    /// at the caller. ECMA-262 Array [[DefineOwnProperty]] / OrdinarySet, e28783d5.
+    /// Append one plain element as a word, with no decimal key or index-to-field map. Array
+    /// exotic validation (length, extensibility and prototype setters) stays at the caller.
+    /// ECMA-262 Array [[DefineOwnProperty]] / OrdinarySet, e28783d5.
     fn push_packed_property(&mut self, property: Property) {
-        let old_len = self.elems.packed_ref().map_or(0, <[Property]>::len);
-        if dense_elements_enabled()
-            && self.mirror_flags & MIRROR_OK != 0
-            && self.elems.mirror_len() == old_len
-            && (old_len == 0 || self.mirror_flags & MIRROR_PACKED != 0)
-        {
-            match property.number_value() {
-                Some(number)
-                    if !property.accessor()
-                        && property.writable()
-                        && number.to_bits() != MIRROR_HOLE =>
-                {
-                    self.mirror_flags |= MIRROR_PACKED;
-                    if !f64_exact_i32(number) {
-                        self.mirror_flags &= !MIRROR_ALL_I32;
-                    }
-                    self.elems.mirror_push(number);
-                }
-                _ => self.mirror_invalidate(),
-            }
-        } else {
-            self.mirror_invalidate();
-        }
-        self.elems.push_packed(property);
+        debug_assert!(property.is_plain_element(), "a word is a plain element");
+        // W2c step 2c: element words keep no packed numeric mirror.
+        self.mirror_invalidate();
+        self.elems.words_start().push(property.into_value());
     }
 
     fn can_start_packed_elements(&self, index: usize) -> bool {
@@ -8319,7 +7785,7 @@ impl Props {
             && self.elem_mode.get()
             && !self.has_far.get()
             && self.elems.len() == 0
-            && !self.elems.packed_is_some()
+            && !self.elems.has_words()
             && index <= 256
     }
 
@@ -8329,9 +7795,9 @@ impl Props {
         debug_assert!(self.can_start_packed_elements(index));
         if index != 0 {
             self.mirror_invalidate();
-            for _ in 0..index {
-                self.elems.push_packed(Property::plain(Value::Empty));
-            }
+            let words = self.elems.words_start();
+            words.reserve_exact(index + 1);
+            words.resize_with_holes(index);
         }
         self.push_packed_property(property);
     }
@@ -8389,7 +7855,7 @@ impl Props {
     /// Whether indexed elements live in the keyless packed representation (no index keys among
     /// the named entries).
     pub(crate) fn has_packed_elements(&self) -> bool {
-        self.elems.packed_is_some()
+        self.elems.has_words()
     }
 
     /// This map's shape id — the inline cache's structural validation token (see the `shape` field).
@@ -8410,7 +7876,7 @@ impl Props {
     /// identity exhaustion and avoids retaining any source object or prototype chain.
     /// Empty prefixes need no layout pin; predictions do not create observable properties.
     pub(crate) fn enumeration_layout(&self) -> Option<(Option<&PropertyLayout>, u8, u64)> {
-        if self.elem_mode.get() || self.elems.packed_ref().is_some() || self.entries.len() > 64 {
+        if self.elem_mode.get() || self.elems.has_words() || self.entries.len() > 64 {
             return None;
         }
         let layout = if self.entries.is_empty() {
@@ -8457,11 +7923,15 @@ impl Props {
     /// dense map" — the caller must fall back to the string-keyed path, not conclude absence.
     #[inline]
     pub(crate) fn get_index(&self, n: u32) -> Option<Element<'_>> {
-        if let Some(packed) = self.elems.packed_ref() {
-            return packed
-                .get(n as usize)
-                .filter(|p| !p.is_empty())
-                .map(Element::entry);
+        if let Some(words) = self.elems.words() {
+            if let Some(value) = words.get(n as usize) {
+                return Some(Element::Word(value));
+            }
+            // A hole or an index past the words: a named entry holds it only with `has_far`,
+            // and the slot map records it when it is near (`note_inserted`).
+            if !self.has_far.get() {
+                return None;
+            }
         }
         let slot = *self.elems.get(n as usize)?;
         if slot == NO_SLOT {
@@ -8557,37 +8027,13 @@ impl Props {
     /// generic path.
     #[inline]
     pub(crate) fn set_index_value(&mut self, n: u32, v: Value) -> Result<(), Value> {
-        if self.elems.packed_is_some() {
-            if self.mirror_flags & MIRROR_PACKED_FAILED != 0 {
-                self.mirror_invalidate();
-            }
-            let Some(p) = self.elems.packed_ref().unwrap().get(n as usize) else {
-                return Err(v);
-            };
-            if p.is_empty() || p.accessor() || !p.writable() {
+        if let Some(words) = self.elems.words_mut() {
+            // An existing word only: a hole is an absent element (the prototype chain's, or a
+            // named entry's after a non-plain define), which the caller's slow path handles.
+            if words.get(n as usize).is_none() {
                 return Err(v);
             }
-            let p = self.elems.packed_index_value_mut(n as usize).unwrap();
-            let number = match &(v).view() {
-                ValueView::Num(number) => Some(*number),
-                _ => None,
-            };
-            p.set_value(v);
-            if self.mirror_flags & MIRROR_OK != 0 {
-                match number {
-                    Some(number) if number.to_bits() != MIRROR_HOLE => {
-                        if !f64_exact_i32(number) {
-                            self.mirror_flags &= !MIRROR_ALL_I32;
-                        }
-                        if let Some(slot) = self.elems.mirror_get_mut(n as usize) {
-                            *slot = number;
-                        } else {
-                            self.mirror_invalidate();
-                        }
-                    }
-                    _ => self.mirror_invalidate(),
-                }
-            }
+            words.set(n as usize, v);
             return Ok(());
         }
         let Some(&slot) = self.elems.get(n as usize) else {
@@ -8630,7 +8076,7 @@ impl Props {
             // Packed elements and named index entries can coexist after a sparse write.
             // Even a named index recorded in `elems` must block packed growth: appending
             // into its index would otherwise create a second owning descriptor for it.
-            if self.elems.packed_is_some() {
+            if self.elems.has_words() {
                 self.has_far.set(true);
             }
             let n = n as usize;
@@ -8690,13 +8136,17 @@ impl Props {
     /// (`elem_mode`) maps only: the shape is untouched. Returns `false` (nothing changed) when
     /// the gates don't hold; the caller runs the generic path.
     pub(crate) fn try_append_element(&mut self, n: u32, prop: Property) -> Result<(), Property> {
-        if n == 0 && self.can_start_packed_elements(0) {
+        if n == 0 && prop.is_plain_element() && self.can_start_packed_elements(0) {
             self.note_structural();
             self.start_packed_elements(0, prop);
             return Ok(());
         }
-        if let Some(packed) = self.elems.packed_ref() {
-            if self.has_far.get() || !self.elem_mode.get() || n as usize != packed.len() {
+        if let Some(len) = self.elems.words().map(word_block::Words::len) {
+            if self.has_far.get()
+                || !self.elem_mode.get()
+                || n as usize != len
+                || !prop.is_plain_element()
+            {
                 return Err(prop);
             }
             self.note_structural();
@@ -8728,39 +8178,31 @@ impl Props {
         n: u32,
         prop: Property,
     ) -> Result<(), Property> {
-        if self.can_start_packed_elements(n as usize) {
+        if prop.is_plain_element() && self.can_start_packed_elements(n as usize) {
             self.note_structural();
             self.start_packed_elements(n as usize, prop);
             return Ok(());
         }
         if dense_elements_enabled() && self.elem_mode.get() && !self.has_far.get() {
-            if let Some(packed) = self.elems.packed_ref() {
+            if let Some(words) = self.elems.words() {
                 let index = n as usize;
-                let len = packed.len();
-                if packed
-                    .get(index)
-                    .is_some_and(|property| !property.is_empty())
-                    || index > len + 256
-                {
+                let len = words.len();
+                if !prop.is_plain_element() || words.get(index).is_some() || index > len + 256 {
                     return Err(prop);
                 }
                 self.note_structural();
-                if index == len {
-                    self.push_packed_property(prop);
+                self.mirror_invalidate();
+                let words = self.elems.words_mut().unwrap();
+                if index < len {
+                    words.set(index, prop.into_value());
                 } else {
-                    self.mirror_invalidate();
-                    let packed = self.elems.packed_mut().unwrap();
-                    if index < packed.len() {
-                        packed[index] = prop;
-                    } else {
-                        packed.resize_with(index, || Property::plain(Value::Empty));
-                        packed.push(prop);
-                    }
+                    words.resize_with_holes(index);
+                    words.push(prop.into_value());
                 }
                 return Ok(());
             }
         }
-        if self.elems.packed_is_some() || self.has_far.get() || !self.elem_mode.get() {
+        if self.elems.has_words() || self.has_far.get() || !self.elem_mode.get() {
             return Err(prop);
         }
         let n = n as usize;
@@ -8807,32 +8249,15 @@ impl Props {
         if self.has_far.get() || !self.elem_mode.get() {
             return None;
         }
-        if let Some(packed) = self.elems.packed_ref() {
-            if n as usize + 1 != packed.len() {
-                return None;
-            }
-            let p = packed.last()?;
-            if p.is_empty() || p.accessor() || !p.configurable() {
+        if let Some(words) = self.elems.words() {
+            if n as usize + 1 != words.len() || words.as_slice().last() == Some(&PACK_EMPTY) {
                 return None;
             }
             self.note_structural();
-            if self.mirror_flags & (MIRROR_OK | MIRROR_PACKED) == (MIRROR_OK | MIRROR_PACKED)
-                && self.elems.mirror_len() == n as usize + 1
-            {
-                self.elems.mirror_pop();
-            } else {
-                self.mirror_invalidate();
-            }
-            // Removing a tail cannot invalidate the proof about remaining plain
-            // descriptors. Avoid a mutable-descriptor escape, which would force
-            // every following unshift in a prepend/pop stack to scan the list.
-            let buffers = self.elems.buffers_mut();
-            let last = if let Some(packed) = buffers.packed.as_deref_mut() {
-                packed.pop()
-            } else {
-                buffers.inline_packed.pop()
-            };
-            return last.map(Property::into_value);
+            self.mirror_invalidate();
+            let word = self.elems.words_mut().unwrap().pop()?;
+            // SAFETY: a used word is a Value's bits.
+            return Some(unsafe { Value::from_bits(word) });
         }
         if n as usize + 1 != self.elems.len() {
             return None;
@@ -8869,11 +8294,14 @@ impl Props {
     /// far past the others lives in the named map), for a search that reads them in place:
     /// index `n` is slot `n`, a hole is an empty slot ([`Property::is_empty`]), and no index at
     /// or past the slice's end is an own property. `None` for any other representation.
-    pub(crate) fn packed_array_elements(&self) -> Option<&[Property]> {
+    /// The used element words of an Array whose every element is a word (no far or non-plain
+    /// index in the named entries), for a search that compares them in place; a hole is
+    /// [`PACK_EMPTY`].
+    pub(crate) fn element_words(&self) -> Option<&[u64]> {
         if !self.elem_mode.get() || self.has_far.get() {
             return None;
         }
-        self.elems.packed_ref()
+        self.elems.words().map(word_block::Words::as_slice)
     }
 
     /// The packed elements of an Array whose `length` is the writable data value `len` and
@@ -8884,7 +8312,7 @@ impl Props {
     /// indexed properties): its effect is then exactly the edited list. The numeric mirror is
     /// dropped and rebuilt on demand. The caller records the new length with
     /// [`Self::set_array_length_value`]. `None` changes nothing.
-    pub(crate) fn plain_elements_mut(&mut self, len: usize) -> Option<&mut DenseDeque<Property>> {
+    pub(crate) fn plain_elements_mut(&mut self, len: usize) -> Option<&mut word_block::Words> {
         if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
             return None;
         }
@@ -8892,13 +8320,13 @@ impl Props {
         if length.accessor() || !length.writable() || length.number_value() != Some(len as f64) {
             return None;
         }
-        let packed = self.elems.packed_ref()?;
-        if packed.len() != len || !packed.iter().all(Property::is_plain_element) {
+        let words = self.elems.words()?;
+        if words.len() != len || !words_have_no_holes(words) {
             return None;
         }
         self.note_structural();
         self.mirror_invalidate();
-        self.elems.packed_mut()
+        self.elems.words_mut()
     }
 
     /// ECMA-262 Array.prototype.shift / OrdinarySetWithOwnDescriptor (e28783d5,
@@ -8925,41 +8353,18 @@ impl Props {
         if !length.writable() || length.number_value() != Some(len as f64) {
             return None;
         }
-        let mut holey = false;
-        if self.elems.packed_ref().is_some_and(|packed| {
-            packed.len() == len
-                && (self.elems.packed_all_plain() || {
-                    // Holes keep a plain element's attributes (`Props::remove`), so every slot
-                    // moving with its attributes in place is still a plain element or a hole.
-                    holey = holes_read_absent
-                        && packed.iter().all(Property::has_plain_element_attributes);
-                    holey
-                })
-        }) {
+        if let Some(words) = self.elems.words() {
+            // Every word is a plain element or a hole, so each moves down one index with its
+            // attributes; holes need the caller's proof that they read as absent.
+            if words.len() != len || (!holes_read_absent && !words_have_no_holes(words)) {
+                return None;
+            }
             self.note_structural();
-            if !holey && self.mirror_flags & MIRROR_OK != 0 && self.elems.mirror_len() == len {
-                self.elems.buffers_mut().mirror.pop_front();
-            } else {
-                self.mirror_invalidate();
-            }
-            let buffers = self.elems.buffers_mut();
-            let first = if let Some(packed) = buffers.packed.as_deref_mut() {
-                packed.pop_front().unwrap()
-            } else {
-                // Inline arrays have at most ten slots. Retain their allocation-free
-                // representation; larger arrays advance their logical data pointer.
-                let properties = buffers.inline_packed.as_slice();
-                for pair in properties.windows(2) {
-                    pair[0].packed.swap(&pair[1].packed);
-                }
-                buffers.inline_packed.pop().unwrap()
-            };
+            self.mirror_invalidate();
+            let first = self.elems.words_mut().unwrap().shift().unwrap();
             self.set_array_length_value((len - 1) as f64);
-            if len == 1 && !self.elems.packed_is_some() {
-                self.mirror_flags = MIRROR_OK | MIRROR_NO_HOLES | MIRROR_ALL_I32;
-                self.mirror_holes = 0;
-            }
-            let first = first.into_value();
+            // SAFETY: a used word is a Value's bits.
+            let first = unsafe { Value::from_bits(first) };
             return Some(if first.is_empty() {
                 Value::Undefined
             } else {
@@ -8977,21 +8382,16 @@ impl Props {
                     property.writable()
                 }
         };
-        let packed = if let Some(properties) = self.elems.packed_ref() {
-            if properties.len() != len || !properties.iter().enumerate().all(|(n, p)| safe(n, p)) {
-                return None;
-            }
-            true
-        } else {
-            if self.elems.len() != len
-                || !self.elems.elems.iter().enumerate().all(|(n, &slot)| {
-                    slot != NO_SLOT && safe(n, &self.entries.fields[slot as usize])
-                })
-            {
-                return None;
-            }
-            false
-        };
+        if self.elems.len() != len
+            || !self
+                .elems
+                .elems
+                .iter()
+                .enumerate()
+                .all(|(n, &slot)| slot != NO_SLOT && safe(n, &self.entries.fields[slot as usize]))
+        {
+            return None;
+        }
 
         // No JavaScript, collection or fallible semantic operation follows the
         // proof. Rotate owning words, not Properties: this keeps each index's
@@ -9004,24 +8404,7 @@ impl Props {
             self.mirror_invalidate();
             0
         };
-        let first = if packed {
-            self.note_structural();
-            self.elems.force_packed_full();
-            for pair in self.elems.packed_ref().unwrap().windows(2) {
-                pair[0].packed.swap(&pair[1].packed);
-            }
-            let buffers = self.elems.0.as_deref_mut().unwrap();
-            let property = if let Some(properties) = buffers.packed.as_deref_mut() {
-                properties.pop().unwrap()
-            } else {
-                // Do not promote a small inline array just to remove an element.
-                buffers.inline_packed.pop().unwrap()
-            };
-            if mirror_flags != 0 {
-                buffers.mirror.pop();
-            }
-            property.into_value()
-        } else {
+        let first = {
             for n in 1..len {
                 let previous = self.elems[n - 1] as usize;
                 let next = self.elems[n] as usize;
@@ -9052,7 +8435,7 @@ impl Props {
                 first
             }
         };
-        if len == 1 && !self.elems.packed_is_some() {
+        if len == 1 && !self.elems.has_words() {
             // An emptied inline array resumes the ordinary empty classic state.
             self.mirror_flags = MIRROR_OK | MIRROR_NO_HOLES | MIRROR_ALL_I32;
             self.mirror_holes = 0;
@@ -9085,60 +8468,22 @@ impl Props {
         if !length.writable() || length.number_value() != Some(len as f64) {
             return false;
         }
-        if len == 0 && !self.elems.packed_is_some() {
+        if len == 0 && !self.elems.has_words() {
             if self.elems.len() != 0 {
                 return false;
             }
-        } else if !self.elems.packed_ref().is_some_and(|p| p.len() == len)
-            || !self.elems.packed_all_plain()
+        } else if self
+            .elems
+            .words()
+            .is_none_or(|words| words.len() != len || !words_have_no_holes(words))
         {
+            // A word array whose every element is present: the destinations keep plain
+            // attributes, as the spec's Set and CreateDataProperty leave them.
             return false;
         }
         self.note_structural();
-        let mirror = self.mirror_flags & MIRROR_OK != 0
-            && self.elems.mirror_len() == len
-            && (len == 0 || self.mirror_flags & MIRROR_PACKED != 0)
-            && items.iter().all(
-                |value| matches!(&(value).view(), ValueView::Num(n) if n.to_bits() != MIRROR_HOLE),
-            );
-        if mirror {
-            let buffers = self.elems.buffers_mut();
-            buffers
-                .mirror
-                .prepend(items.iter().map(|value| match &(value).view() {
-                    ValueView::Num(n) => *n,
-                    _ => unreachable!(),
-                }));
-            self.mirror_flags |= MIRROR_PACKED;
-            if items
-                .iter()
-                .any(|value| matches!(&(value).view(), ValueView::Num(n) if !f64_exact_i32(*n)))
-            {
-                self.mirror_flags &= !MIRROR_ALL_I32;
-            }
-        } else {
-            self.mirror_invalidate();
-        }
-        let buffers = self.elems.buffers_mut();
-        if buffers.packed.is_none() && next <= INLINE_PACKED_CAPACITY {
-            buffers.inline_packed.prepend(items);
-        } else {
-            if buffers.packed.is_none() {
-                buffers.packed = Some(PackedProperties::new(
-                    buffers.inline_packed.into_vec().into(),
-                ));
-            }
-            buffers
-                .packed
-                .as_deref_mut()
-                .unwrap()
-                .prepend(items.iter().map(|item| Property::plain(*item)));
-        }
-        buffers.inline_packed.packed_plain.set(
-            items
-                .iter()
-                .all(|value| !matches!(&(value).view(), ValueView::Empty)),
-        );
+        self.mirror_invalidate();
+        self.elems.words_start().unshift(items);
         self.set_array_length_value(next as f64);
         true
     }
@@ -9416,17 +8761,16 @@ impl Props {
         let text = key;
         let index = canonical_index(text);
         if let Some(n) = index {
-            if self
-                .elems
-                .packed_ref()
-                .and_then(|p| p.get(n as usize))
-                .is_some_and(|p| !p.is_empty())
-            {
+            if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
+                // The escape may change the element's attributes, which a word does not keep:
+                // the element leaves for the named entries first, as a non-plain one does.
+                self.elems
+                    .words_mut()
+                    .unwrap()
+                    .set(n as usize, Value::Empty);
+                self.has_far.set(true);
                 self.mirror_invalidate();
-                return self
-                    .elems
-                    .packed_slice_mut()
-                    .and_then(|p| p.get_mut(n as usize));
+                self.insert_entry(PropKey::index(n), Property::plain(value));
             }
         }
         if text.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
@@ -9458,17 +8802,14 @@ impl Props {
     pub(crate) fn set_value(&mut self, key: &str, v: Value) -> bool {
         let text = key;
         if let Some(n) = canonical_index(text) {
-            if self
+            if let Some(words) = self
                 .elems
-                .packed_ref()
-                .and_then(|p| p.get(n as usize))
-                .is_some_and(|p| !p.is_empty())
+                .words_mut()
+                .filter(|words| words.get(n as usize).is_some())
             {
+                words.set(n as usize, v);
                 self.mirror_invalidate();
-                return self.elems.packed_index_mut(n as usize).is_some_and(|p| {
-                    p.set_value(v);
-                    true
-                });
+                return true;
             }
         }
         if text.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
@@ -9507,18 +8848,11 @@ impl Props {
     pub(crate) fn take_value(&mut self, key: &str) -> Option<Value> {
         let text = key;
         if let Some(n) = canonical_index(text) {
-            if self
-                .elems
-                .packed_ref()
-                .and_then(|p| p.get(n as usize))
-                .is_some_and(|p| !p.is_empty())
-            {
+            // A word's value is copied out and its word kept: the caller writes the
+            // replacement back (and only ordinary objects, which keep no words, take values).
+            if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
                 self.mirror_invalidate();
-                return self
-                    .elems
-                    .packed_slice_mut()
-                    .and_then(|p| p.get_mut(n as usize))
-                    .map(Property::take_value);
+                return Some(value);
             }
         }
         if text.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
@@ -9573,12 +8907,15 @@ impl Props {
     /// and every own property non-configurable. Demotes once when a shape-tracked
     /// entry actually flips class (writable -> non-writable).
     pub(crate) fn freeze_descriptors(&mut self) {
-        if let Some(packed) = self.elems.packed_slice_mut() {
-            for p in packed.iter_mut() {
-                if !p.is_empty() {
-                    p.set_writable(false);
-                    p.set_configurable(false);
-                }
+        if let Some(words) = self.elems.words() {
+            // A frozen element is not plain: each word leaves for the named entries (until
+            // step 7's SEALED and FROZEN kinds), frozen with them below.
+            let elements: Vec<(u32, Value)> = (0..words.len())
+                .filter_map(|n| words.get(n).map(|value| (n as u32, value)))
+                .collect();
+            self.elems.clear_words();
+            for (n, value) in elements {
+                self.insert(PropKey::index(n), Property::data(value, false, true, false));
             }
         }
         let mut class_changed = false;
@@ -9639,12 +8976,18 @@ impl Props {
     /// Append the next dense element while *building a fresh array in order* (element index ==
     /// entry slot == dense slot): skips the canonical-index parse and, for small indices, the
     /// key-string allocation. Only valid on a Props whose entries so far are exactly the dense
-    /// elements 0..len.
+    /// elements 0..len. Element words hold plain elements only, so a non-plain element is
+    /// pushed only before any word (the classic slots then keep the whole array).
     pub(crate) fn push_dense(&mut self, prop: Property) {
-        if self.elems.packed_is_some() || self.can_start_packed_elements(0) {
+        if prop.is_plain_element() && (self.elems.has_words() || self.can_start_packed_elements(0))
+        {
             self.push_packed_property(prop);
             return;
         }
+        debug_assert!(
+            !self.elems.has_words(),
+            "a non-plain element after element words"
+        );
         let slot = self.entries.len();
         let key = index_key(slot);
         if let Some(index) = self.elems.index_mut() {
@@ -9729,36 +9072,54 @@ impl Props {
         let key = key.into_prop_key();
         self.elems.retain_symbol_key(key);
         if let Some(n) = key.as_index() {
-            if self.can_start_packed_elements(n as usize) {
+            if prop.is_plain_element() && self.can_start_packed_elements(n as usize) {
                 self.note_structural();
                 self.start_packed_elements(n as usize, prop);
                 return;
             }
         }
-        if let (Some(n), Some(packed)) = (key.as_index(), self.elems.packed_ref()) {
+        if let (Some(n), Some(len)) = (
+            key.as_index(),
+            self.elems.words().map(word_block::Words::len),
+        ) {
             let n = n as usize;
-            if n < packed.len() {
-                self.note_structural();
-                self.mirror_invalidate();
-                *self.elems.packed_index_mut(n).unwrap() = prop;
-                return;
-            }
-            if !self.has_far.get() && n <= packed.len() + 256 {
-                let len = packed.len();
-                self.note_structural();
-                if dense_elements_enabled() && n == len {
-                    self.push_packed_property(prop);
+            // An index a named entry already holds keeps it there (replaced below), so no
+            // element is ever stored twice.
+            let named = self.has_far.get() && self.find(key).is_some();
+            if prop.is_plain_element() && !named {
+                if n < len {
+                    self.note_structural();
+                    self.mirror_invalidate();
+                    self.elems.words_mut().unwrap().set(n, prop.into_value());
                     return;
                 }
-                self.mirror_invalidate();
-                let packed = self.elems.packed_mut().unwrap();
-                packed.resize_with(n, || Property::plain(Value::Empty));
-                packed.push(prop);
-                return;
+                if !self.has_far.get() && n <= len + 256 {
+                    self.note_structural();
+                    self.mirror_invalidate();
+                    let words = self.elems.words_mut().unwrap();
+                    words.resize_with_holes(n);
+                    words.push(prop.into_value());
+                    return;
+                }
+            } else if n < len {
+                // A non-plain element leaves the words for the named entries, its word a hole
+                // (W2c's design 3, SpiderMonkey's indexed properties); an absent one is a hole.
+                self.elems.words_mut().unwrap().set(n, Value::Empty);
+                if prop.is_empty() && !named {
+                    self.note_structural();
+                    self.mirror_invalidate();
+                    return;
+                }
             }
             self.has_far.set(true);
             self.mirror_invalidate();
         }
+        self.insert_entry(key, prop);
+    }
+
+    /// [`Props::insert`] into the named entries: replace `key`'s entry or append one.
+    #[inline]
+    fn insert_entry(&mut self, key: PropKey, prop: Property) {
         if let Some(i) = self.find(key) {
             // A whole-descriptor replacement that changes descriptor class cannot stay
             // on a shape that records the old class: demote to a fresh unique shape
@@ -9829,16 +9190,15 @@ impl Props {
             Some(n) => (n as usize) < from,
             None => true,
         };
-        let packed_remove = self
-            .elems
-            .packed_ref()
-            .is_some_and(|p| p.len() > from && p[from..].iter().any(|p| !p.is_empty()));
-        if !packed_remove && self.entries.iter().all(|(k, _)| keep(k)) {
+        let words_remove = self.elems.words().is_some_and(|words| {
+            words.len() > from && words.as_slice()[from..].iter().any(|&w| w != PACK_EMPTY)
+        });
+        if !words_remove && self.entries.iter().all(|(k, _)| keep(k)) {
             return;
         }
         self.note_structural();
-        if let Some(packed) = self.elems.packed_mut() {
-            packed.truncate(from);
+        if let Some(words) = self.elems.words_mut() {
+            words.truncate(from);
         }
         self.entries.retain(|(k, _)| keep(k));
         self.len_slot.set(SlotMemo::NONE);
@@ -9855,7 +9215,7 @@ impl Props {
             self.build_index();
         }
         self.elems.clear_elems();
-        self.mirror_flags = if self.elems.packed_is_some() {
+        self.mirror_flags = if self.elems.has_words() {
             0
         } else {
             MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES
@@ -9883,11 +9243,14 @@ impl Props {
     }
 
     pub(crate) fn remove_key(&mut self, key: PropKey) -> bool {
-        if let (Some(n), Some(packed)) = (key.as_index(), self.elems.packed_ref()) {
-            if packed.get(n as usize).is_some_and(|p| !p.is_empty()) {
+        if let (Some(n), Some(words)) = (key.as_index(), self.elems.words()) {
+            if words.get(n as usize).is_some() {
                 self.note_structural();
                 self.mirror_invalidate();
-                self.elems.packed_slice_mut().unwrap()[n as usize] = Property::plain(Value::Empty);
+                self.elems
+                    .words_mut()
+                    .unwrap()
+                    .set(n as usize, Value::Empty);
                 return true;
             }
         }
@@ -9896,7 +9259,7 @@ impl Props {
         };
         let removed_far = self.has_far.get()
             && key.as_index().is_some_and(|n| {
-                self.elems.packed_is_some() || self.elems.get(n as usize).copied() != Some(i as u32)
+                self.elems.has_words() || self.elems.get(n as usize).copied() != Some(i as u32)
             });
         self.note_structural();
         self.entries.remove(i);
@@ -9966,7 +9329,7 @@ impl Props {
         if self.entries.len() > MAX_RECOVERY_ENTRIES {
             return;
         }
-        let packed = self.elems.packed_is_some();
+        let packed = self.elems.has_words();
         let remains = self.entries.keys().iter().enumerate().any(|(slot, key)| {
             key.as_index()
                 .is_some_and(|n| packed || self.elems.get(n as usize).copied() != Some(slot as u32))
@@ -9981,14 +9344,19 @@ impl Props {
     /// Ordinary property keys in insertion order. Engine state and private elements live in a
     /// separate slot map and never participate in ordinary key, descriptor or lookup operations.
     pub(crate) fn keys(&self) -> Vec<PropKey> {
-        self.elems
-            .packed_ref()
-            .into_iter()
-            .flat_map(|p| p.iter().enumerate())
-            .filter(|(_, p)| !p.is_empty())
-            .map(|(n, _)| index_key(n))
+        self.word_indices()
+            .map(index_key)
             .chain(self.entries.keys().iter().copied())
             .collect()
+    }
+    /// The indices of the element words that are not holes.
+    fn word_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.elems
+            .words()
+            .into_iter()
+            .flat_map(|words| words.as_slice().iter().enumerate())
+            .filter(|&(_, &word)| word != PACK_EMPTY)
+            .map(|(n, _)| n)
     }
     /// Keys in spec [[OwnPropertyKeys]] order: array-index keys ascending, then other string keys
     /// in insertion order, then symbol keys in insertion order.
@@ -9996,15 +9364,7 @@ impl Props {
         let mut ints: Vec<u32> = Vec::new();
         let mut strs: Vec<PropKey> = Vec::new();
         let mut syms: Vec<PropKey> = Vec::new();
-        if let Some(packed) = self.elems.packed_ref() {
-            ints.extend(
-                packed
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| !p.is_empty())
-                    .map(|(n, _)| n as u32),
-            );
-        }
+        ints.extend(self.word_indices().map(|n| n as u32));
         for &k in self.entries.keys() {
             if let Some(n) = k.as_index() {
                 ints.push(n);
@@ -10027,63 +9387,53 @@ impl Props {
 
     /// Every live property value, including keyless packed elements (for GC tracing).
     pub(crate) fn values(&self) -> impl Iterator<Item = Element<'_>> {
-        self.elems
-            .packed_ref()
-            .into_iter()
-            .flat_map(|p| p.iter())
-            .filter(|p| !p.is_empty())
-            .chain(self.entries.fields.iter())
-            .map(Element::entry)
+        self.word_values()
+            .map(Element::Word)
+            .chain(self.entries.fields.iter().map(Element::entry))
     }
 
-    /// Keyless packed elements only. Managed-memory traversal visits named entries together with
-    /// their keys, then uses this iterator so those entries are not scanned twice.
-    pub(crate) fn packed_values(&self) -> impl Iterator<Item = &Property> {
+    /// The element words' values, holes left out: the elements no named entry holds.
+    /// Managed-memory traversal visits named entries together with their keys, then uses this
+    /// iterator so those entries are not scanned twice.
+    pub(crate) fn word_values(&self) -> impl Iterator<Item = Value> + '_ {
         self.elems
-            .packed_ref()
+            .words()
             .into_iter()
-            .flat_map(|properties| properties.iter())
-            .filter(|property| !property.is_empty())
+            .flat_map(|words| words.as_slice().iter())
+            .filter(|&&word| word != PACK_EMPTY)
+            // SAFETY: a used word is a Value's bits.
+            .map(|&word| unsafe { Value::from_bits(word) })
     }
 
     /// All own array-index descriptors, independent of physical storage. Guards
     /// for OrdinarySet / indexed Get must not mistake a packed descriptor for
     /// an absent property. Named iteration intentionally excludes packed elements.
     pub(crate) fn indexed_properties(&self) -> impl Iterator<Item = Element<'_>> {
-        self.packed_values()
-            .chain(
-                self.entries
-                    .iter()
-                    .filter_map(|(key, property)| key.as_index().map(|_| property)),
-            )
-            .map(Element::entry)
+        self.word_values().map(Element::Word).chain(
+            self.entries
+                .iter()
+                .filter_map(|(key, property)| key.as_index().map(|_| Element::entry(property))),
+        )
     }
 
+    /// The highest non-configurable index at or past `from`: always a named entry's, since a
+    /// word is a configurable element.
     pub(crate) fn highest_nonconfig_index_from(&self, from: usize) -> Option<usize> {
-        let packed = self
-            .elems
-            .packed_ref()
-            .into_iter()
-            .flat_map(|p| p.iter().enumerate())
-            .filter_map(|(n, p)| (!p.is_empty() && !p.configurable() && n >= from).then_some(n));
-        let entries = self.entries.iter().filter_map(|(k, p)| {
-            (!p.configurable())
-                .then(|| k.as_index().map(|n| n as usize))
-                .flatten()
-                .filter(|&n| n >= from)
-        });
-        packed.chain(entries).max()
+        self.entries
+            .iter()
+            .filter_map(|(k, p)| {
+                (!p.configurable())
+                    .then(|| k.as_index().map(|n| n as usize))
+                    .flatten()
+                    .filter(|&n| n >= from)
+            })
+            .max()
     }
 
     pub(crate) fn integrity_ok(&self, frozen: bool) -> bool {
         let valid = |p: &Property| !p.configurable() && (!frozen || p.accessor() || !p.writable());
-        self.elems
-            .packed_ref()
-            .into_iter()
-            .flat_map(|p| p.iter())
-            .filter(|p| !p.is_empty())
-            .all(valid)
-            && self.entries.iter().all(|(_, p)| valid(p))
+        // A word is a configurable element, so no sealed or frozen map has one.
+        self.word_indices().next().is_none() && self.entries.iter().all(|(_, p)| valid(p))
     }
 }
 

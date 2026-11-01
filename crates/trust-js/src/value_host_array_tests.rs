@@ -32,7 +32,7 @@ fn host_arrays_preserve_descriptors_at_storage_boundaries() {
         }
         if (1..=32).contains(&len) {
             assert!(
-                array.props.elems.packed_ref().is_some(),
+                array.props.elems.has_words(),
                 "host path actually uses compact storage"
             );
         }

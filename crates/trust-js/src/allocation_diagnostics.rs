@@ -3,7 +3,7 @@
 //! static Rust allocation locations only. They cannot extend JavaScript liveness.
 //! Feature-gated out of ordinary builds. Lifetimes use allocation ordinals and GC
 //! generations, not a clock per allocation; initial families are explicitly labelled.
-use super::{Callable, Exotic, GcHeap, Property, Props, INLINE_PACKED_CAPACITY, PACK_LAZY_PROTO};
+use super::{Callable, Exotic, GcHeap, Property, Props, PACK_LAZY_PROTO};
 use std::collections::BTreeMap;
 use std::panic::Location;
 
@@ -186,16 +186,6 @@ const ELIGIBLE_ENTRY_LENGTH_BOUNDS: [(usize, Option<usize>); 8] = [
     (33, None),
 ];
 
-const INLINE_DENSE_LENGTH_BOUNDS: [(usize, Option<usize>); 7] = [
-    (0, Some(0)),
-    (1, Some(1)),
-    (2, Some(2)),
-    (3, Some(3)),
-    (4, Some(4)),
-    (5, Some(8)),
-    (9, Some(INLINE_PACKED_CAPACITY)),
-];
-
 fn length_bucket_index(len: usize, bounds: &[(usize, Option<usize>)]) -> usize {
     bounds
         .iter()
@@ -280,17 +270,10 @@ impl EntryVecEligibility {
     }
 }
 
-/// Dense populations can represent holes as the existing PACK_EMPTY value, so holes remain
-/// eligible but are counted explicitly. Heap Vec capacities and inline reserved storage are
-/// reported separately; eligible capacities are subsets of the corresponding physical totals.
+/// Element words (W2c) hold holes as the PACK_EMPTY word, so holes remain eligible but are
+/// counted explicitly; eligible capacities are subsets of the corresponding physical totals.
 #[derive(Clone, Copy, Default)]
 struct DenseEligibility {
-    inline_populations: u64,
-    inline_all_default_data_or_holes: u64,
-    inline_eligible_live_length: u64,
-    inline_eligible_reserved_capacity: u64,
-    inline_eligible_reserved_property_bytes: u64,
-    inline_eligible_holes: u64,
     heap_vectors: u64,
     heap_empty_vectors: u64,
     heap_empty_reserved_capacity: u64,
@@ -300,18 +283,10 @@ struct DenseEligibility {
     heap_eligible_reserved_capacity: u64,
     heap_eligible_reserved_property_bytes: u64,
     heap_eligible_holes: u64,
-    inline_sidecar_active_length_histogram: [LengthPopulation; 7],
 }
 
 impl DenseEligibility {
     fn add_assign(&mut self, other: &Self) {
-        self.inline_populations += other.inline_populations;
-        self.inline_all_default_data_or_holes += other.inline_all_default_data_or_holes;
-        self.inline_eligible_live_length += other.inline_eligible_live_length;
-        self.inline_eligible_reserved_capacity += other.inline_eligible_reserved_capacity;
-        self.inline_eligible_reserved_property_bytes +=
-            other.inline_eligible_reserved_property_bytes;
-        self.inline_eligible_holes += other.inline_eligible_holes;
         self.heap_vectors += other.heap_vectors;
         self.heap_empty_vectors += other.heap_empty_vectors;
         self.heap_empty_reserved_capacity += other.heap_empty_reserved_capacity;
@@ -321,28 +296,11 @@ impl DenseEligibility {
         self.heap_eligible_reserved_capacity += other.heap_eligible_reserved_capacity;
         self.heap_eligible_reserved_property_bytes += other.heap_eligible_reserved_property_bytes;
         self.heap_eligible_holes += other.heap_eligible_holes;
-        for (dst, src) in self
-            .inline_sidecar_active_length_histogram
-            .iter_mut()
-            .zip(other.inline_sidecar_active_length_histogram)
-        {
-            dst.add_assign(&src);
-        }
     }
 
     fn json(&self) -> String {
-        let inline_histogram = length_population_json(
-            &self.inline_sidecar_active_length_histogram,
-            &INLINE_DENSE_LENGTH_BOUNDS,
-        );
         format!(
-            "{{\"inline_populations\":{},\"inline_all_default_data_or_holes\":{},\"inline_eligible_live_length\":{},\"inline_eligible_reserved_capacity\":{},\"inline_eligible_reserved_property_bytes\":{},\"inline_eligible_holes\":{},\"inline_sidecar_active_length_histogram\":{inline_histogram},\"heap_vectors\":{},\"heap_empty_vectors\":{},\"heap_empty_reserved_capacity\":{},\"heap_empty_reserved_property_bytes\":{},\"heap_all_default_data_or_holes\":{},\"heap_eligible_live_length\":{},\"heap_eligible_reserved_capacity\":{},\"heap_eligible_reserved_property_bytes\":{},\"heap_eligible_holes\":{},\"eligibility_rule\":\"nonempty; every initialized slot is default WEC data or PACK_EMPTY hole\"}}",
-            self.inline_populations,
-            self.inline_all_default_data_or_holes,
-            self.inline_eligible_live_length,
-            self.inline_eligible_reserved_capacity,
-            self.inline_eligible_reserved_property_bytes,
-            self.inline_eligible_holes,
+            "{{\"heap_vectors\":{},\"heap_empty_vectors\":{},\"heap_empty_reserved_capacity\":{},\"heap_empty_reserved_property_bytes\":{},\"heap_all_default_data_or_holes\":{},\"heap_eligible_live_length\":{},\"heap_eligible_reserved_capacity\":{},\"heap_eligible_reserved_property_bytes\":{},\"heap_eligible_holes\":{},\"eligibility_rule\":\"nonempty; every initialized slot is default WEC data or PACK_EMPTY hole\"}}",
             self.heap_vectors,
             self.heap_empty_vectors,
             self.heap_empty_reserved_capacity,
@@ -369,11 +327,7 @@ struct PropertyInventory {
     named_entries: FieldInventory,
     classic_index_entries: FieldInventory,
     dense_sidecars: u64,
-    dense_sidecar_body_bytes_excluding_inline_property_storage: u64,
-    dense_inline_reserved_property_slots: u64,
-    dense_inline_reserved_unused_property_slots: u64,
-    dense_inline_reserved_property_bytes: u64,
-    dense_inline_packed_len: u64,
+    dense_sidecar_body_bytes: u64,
     dense_heap_packed_len: u64,
     dense_heap_packed_vectors: u64,
     dense_heap_packed_vector_header_bytes: u64,
@@ -462,24 +416,7 @@ impl PropertyInventory {
             .map_or(0, |symbols| symbols.capacity() as u64);
         if let Some(dense) = props.elems.0.as_deref() {
             result.dense_sidecars = 1;
-            // Include every retained DenseBuffers allocation. A zero-length bin means its
-            // embedded ten-slot buffer is reserved but empty; heap-spilled packed vectors also
-            // have an empty inline prefix after ownership moves to the heap Vec.
-            let inline_len = dense.inline_packed.len as usize;
-            let bucket = length_bucket_index(inline_len, &INLINE_DENSE_LENGTH_BOUNDS);
-            result
-                .dense_eligibility
-                .inline_sidecar_active_length_histogram[bucket]
-                .observe(inline_len, INLINE_PACKED_CAPACITY);
-            let inline_property_bytes =
-                INLINE_PACKED_CAPACITY.saturating_mul(std::mem::size_of::<Property>());
-            result.dense_sidecar_body_bytes_excluding_inline_property_storage =
-                std::mem::size_of::<super::DenseBuffers>().saturating_sub(inline_property_bytes)
-                    as u64;
-            result.dense_inline_reserved_property_slots = INLINE_PACKED_CAPACITY as u64;
-            result.dense_inline_reserved_unused_property_slots =
-                INLINE_PACKED_CAPACITY.saturating_sub(dense.inline_packed.len as usize) as u64;
-            result.dense_inline_reserved_property_bytes = inline_property_bytes as u64;
+            result.dense_sidecar_body_bytes = std::mem::size_of::<super::DenseBuffers>() as u64;
             result.dense_index_directory_len = dense.elems.len() as u64;
             result.dense_index_directory_capacity = dense.elems.capacity() as u64;
             result.dense_index_directory_capacity_bytes = dense
@@ -494,66 +431,37 @@ impl PropertyInventory {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<f64>())
                 as u64;
-
-            if let Some(packed) = dense.packed.as_deref() {
-                result.dense_heap_packed_len = packed.len() as u64;
-                result.dense_eligibility.heap_vectors = 1;
-                result.dense_heap_packed_vectors = 1;
-                result.dense_heap_packed_vector_header_bytes =
-                    std::mem::size_of::<super::DenseDeque<Property>>() as u64;
-                result.dense_heap_packed_capacity = packed.capacity() as u64;
-                result.dense_heap_packed_unused_capacity =
-                    packed.capacity().saturating_sub(packed.len()) as u64;
-                result.dense_heap_packed_capacity_bytes = packed
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<Property>())
-                    as u64;
-                for property in packed {
-                    result.packed_dense_fields.add_property(property);
-                }
-                if packed.is_empty() {
-                    result.dense_eligibility.heap_empty_vectors = 1;
-                    result.dense_eligibility.heap_empty_reserved_capacity =
-                        packed.capacity() as u64;
-                    result.dense_eligibility.heap_empty_reserved_property_bytes = packed
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<Property>())
-                        as u64;
-                } else if result.packed_dense_fields.all_default_data_or_holes() {
-                    result.dense_eligibility.heap_all_default_data_or_holes = 1;
-                    result.dense_eligibility.heap_eligible_live_length = packed.len() as u64;
-                    result.dense_eligibility.heap_eligible_reserved_capacity =
-                        packed.capacity() as u64;
-                    result
-                        .dense_eligibility
-                        .heap_eligible_reserved_property_bytes = packed
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<Property>())
-                        as u64;
-                    result.dense_eligibility.heap_eligible_holes = result.packed_dense_fields.holes;
-                }
-            } else {
-                let packed = dense.inline_packed.as_slice();
-                result.dense_inline_packed_len = packed.len() as u64;
-                for property in packed {
-                    result.packed_dense_fields.add_property(property);
-                }
-                if !packed.is_empty() {
-                    result.dense_eligibility.inline_populations = 1;
-                    if result.packed_dense_fields.all_default_data_or_holes() {
-                        result.dense_eligibility.inline_all_default_data_or_holes = 1;
-                        result.dense_eligibility.inline_eligible_live_length = packed.len() as u64;
-                        result.dense_eligibility.inline_eligible_reserved_capacity =
-                            INLINE_PACKED_CAPACITY as u64;
-                        result
-                            .dense_eligibility
-                            .inline_eligible_reserved_property_bytes = INLINE_PACKED_CAPACITY
-                            .saturating_mul(std::mem::size_of::<Property>())
-                            as u64;
-                        result.dense_eligibility.inline_eligible_holes =
-                            result.packed_dense_fields.holes;
-                    }
-                }
+        }
+        // The element words: one block of a 16-byte header and 8-byte words (`heap_packed`).
+        if let Some(words) = props.elems.words() {
+            let word_bytes = |n: usize| n.saturating_mul(8) as u64;
+            result.dense_heap_packed_len = words.len() as u64;
+            result.dense_eligibility.heap_vectors = 1;
+            result.dense_heap_packed_vectors = 1;
+            result.dense_heap_packed_vector_header_bytes = 16;
+            result.dense_heap_packed_capacity = words.capacity() as u64;
+            result.dense_heap_packed_unused_capacity =
+                words.capacity().saturating_sub(words.len()) as u64;
+            result.dense_heap_packed_capacity_bytes = word_bytes(words.capacity());
+            for index in 0..words.len() {
+                let value = words.get(index).unwrap_or(super::Value::Empty);
+                result
+                    .packed_dense_fields
+                    .add_property(&Property::plain(value));
+            }
+            if words.is_empty() {
+                result.dense_eligibility.heap_empty_vectors = 1;
+                result.dense_eligibility.heap_empty_reserved_capacity = words.capacity() as u64;
+                result.dense_eligibility.heap_empty_reserved_property_bytes =
+                    word_bytes(words.capacity());
+            } else if result.packed_dense_fields.all_default_data_or_holes() {
+                result.dense_eligibility.heap_all_default_data_or_holes = 1;
+                result.dense_eligibility.heap_eligible_live_length = words.len() as u64;
+                result.dense_eligibility.heap_eligible_reserved_capacity = words.capacity() as u64;
+                result
+                    .dense_eligibility
+                    .heap_eligible_reserved_property_bytes = word_bytes(words.capacity());
+                result.dense_eligibility.heap_eligible_holes = result.packed_dense_fields.holes;
             }
         }
         result
@@ -569,13 +477,7 @@ impl PropertyInventory {
         self.classic_index_entries
             .add_assign(&other.classic_index_entries);
         self.dense_sidecars += other.dense_sidecars;
-        self.dense_sidecar_body_bytes_excluding_inline_property_storage +=
-            other.dense_sidecar_body_bytes_excluding_inline_property_storage;
-        self.dense_inline_reserved_property_slots += other.dense_inline_reserved_property_slots;
-        self.dense_inline_reserved_unused_property_slots +=
-            other.dense_inline_reserved_unused_property_slots;
-        self.dense_inline_reserved_property_bytes += other.dense_inline_reserved_property_bytes;
-        self.dense_inline_packed_len += other.dense_inline_packed_len;
+        self.dense_sidecar_body_bytes += other.dense_sidecar_body_bytes;
         self.dense_heap_packed_len += other.dense_heap_packed_len;
         self.dense_heap_packed_vectors += other.dense_heap_packed_vectors;
         self.dense_heap_packed_vector_header_bytes += other.dense_heap_packed_vector_header_bytes;
@@ -599,7 +501,7 @@ impl PropertyInventory {
 
     fn json(&self) -> String {
         format!(
-            "{{\"live_objects\":{},\"entries_len\":{},\"entries_capacity\":{},\"entries_unused_capacity\":{},\"entries_capacity_bytes\":{},\"named_entries\":{},\"classic_index_entries\":{},\"entry_vec_eligibility\":{},\"dense_sidecars\":{},\"dense_sidecar_body_bytes_excluding_inline_property_storage\":{},\"dense_inline_reserved_property_slots\":{},\"dense_inline_reserved_unused_property_slots\":{},\"dense_inline_reserved_property_bytes\":{},\"dense_inline_packed_len\":{},\"dense_heap_packed_len\":{},\"dense_heap_packed_vectors\":{},\"dense_heap_packed_vector_header_bytes\":{},\"dense_heap_packed_capacity\":{},\"dense_heap_packed_unused_capacity\":{},\"dense_heap_packed_capacity_bytes\":{},\"packed_dense_fields\":{},\"dense_eligibility\":{},\"dense_index_directory_len\":{},\"dense_index_directory_capacity\":{},\"dense_index_directory_capacity_bytes\":{},\"dense_numeric_mirror_len\":{},\"dense_numeric_mirror_capacity\":{},\"dense_numeric_mirror_capacity_bytes\":{},\"dense_string_index_capacity\":{},\"dense_symbol_sidecar_capacity\":{}}}",
+            "{{\"live_objects\":{},\"entries_len\":{},\"entries_capacity\":{},\"entries_unused_capacity\":{},\"entries_capacity_bytes\":{},\"named_entries\":{},\"classic_index_entries\":{},\"entry_vec_eligibility\":{},\"dense_sidecars\":{},\"dense_sidecar_body_bytes\":{},\"dense_heap_packed_len\":{},\"dense_heap_packed_vectors\":{},\"dense_heap_packed_vector_header_bytes\":{},\"dense_heap_packed_capacity\":{},\"dense_heap_packed_unused_capacity\":{},\"dense_heap_packed_capacity_bytes\":{},\"packed_dense_fields\":{},\"dense_eligibility\":{},\"dense_index_directory_len\":{},\"dense_index_directory_capacity\":{},\"dense_index_directory_capacity_bytes\":{},\"dense_numeric_mirror_len\":{},\"dense_numeric_mirror_capacity\":{},\"dense_numeric_mirror_capacity_bytes\":{},\"dense_string_index_capacity\":{},\"dense_symbol_sidecar_capacity\":{}}}",
             self.live_objects,
             self.entries_len,
             self.entries_capacity,
@@ -609,11 +511,7 @@ impl PropertyInventory {
             self.classic_index_entries.json(),
             self.entry_vec_eligibility.json(),
             self.dense_sidecars,
-            self.dense_sidecar_body_bytes_excluding_inline_property_storage,
-            self.dense_inline_reserved_property_slots,
-            self.dense_inline_reserved_unused_property_slots,
-            self.dense_inline_reserved_property_bytes,
-            self.dense_inline_packed_len,
+            self.dense_sidecar_body_bytes,
             self.dense_heap_packed_len,
             self.dense_heap_packed_vectors,
             self.dense_heap_packed_vector_header_bytes,
@@ -866,32 +764,26 @@ mod tests {
     }
 
     #[test]
-    fn inventory_length_bins_cover_entry_and_dense_inline_boundaries() {
-        for (len, expected_entry, expected_dense) in [
-            (0, None, Some(0)),
-            (1, Some(0), Some(1)),
-            (2, Some(1), Some(2)),
-            (3, Some(2), Some(3)),
-            (4, Some(3), Some(4)),
-            (5, Some(4), Some(5)),
-            (8, Some(4), Some(5)),
-            (9, Some(5), Some(6)),
-            (10, Some(5), Some(6)),
-            (16, Some(5), None),
-            (17, Some(6), None),
-            (32, Some(6), None),
-            (33, Some(7), None),
+    fn inventory_length_bins_cover_entry_boundaries() {
+        for (len, expected_entry) in [
+            (0, None),
+            (1, Some(0)),
+            (2, Some(1)),
+            (3, Some(2)),
+            (4, Some(3)),
+            (5, Some(4)),
+            (8, Some(4)),
+            (9, Some(5)),
+            (10, Some(5)),
+            (16, Some(5)),
+            (17, Some(6)),
+            (32, Some(6)),
+            (33, Some(7)),
         ] {
             assert_eq!(
                 expected_entry,
                 (len != 0).then(|| length_bucket_index(len, &ELIGIBLE_ENTRY_LENGTH_BOUNDS)),
                 "entry vector length {len}"
-            );
-            assert_eq!(
-                expected_dense,
-                (len <= INLINE_PACKED_CAPACITY)
-                    .then(|| length_bucket_index(len, &INLINE_DENSE_LENGTH_BOUNDS)),
-                "dense inline length {len}"
             );
         }
     }
@@ -909,14 +801,23 @@ mod tests {
             Property::accessor_prop(Some(super::super::Value::Undefined), None, true, false),
         );
 
-        let mut array = Props::packed_array_properties(
-            vec![
-                Property::plain(super::super::Value::Num(3.0)),
-                Property::plain(super::super::Value::Empty),
-                Property::data(super::super::Value::Num(4.0), false, true, true),
-                Property::accessor_prop(None, Some(super::super::Value::Undefined), false, true),
+        let mut array = Props::packed_array(
+            [
+                super::super::Value::Num(3.0),
+                super::super::Value::Empty,
+                super::super::Value::Num(4.0),
+                super::super::Value::Num(0.0),
             ]
             .into_iter(),
+        );
+        // Non-plain elements leave the words for the named entries, their words holes.
+        array.insert(
+            "2",
+            Property::data(super::super::Value::Num(4.0), false, true, true),
+        );
+        array.insert(
+            "3",
+            Property::accessor_prop(None, Some(super::super::Value::Undefined), false, true),
         );
         array.insert("label", Property::plain(super::super::Value::Num(5.0)));
 
@@ -992,76 +893,53 @@ mod tests {
         );
         assert!(empty_reserve.entry_vec_eligibility.empty_reserved_capacity >= 5);
 
-        let mut empty_inline = Props::new();
-        // Ordinary canonical indices populate the index sidecar but stay in `entries`;
-        // this leaves the DenseBuffers inline-property prefix at length zero.
-        empty_inline.insert("0", Property::plain(super::super::Value::Num(6.0)));
-        let empty_inline = PropertyInventory::from_props(&empty_inline);
-        assert_eq!(empty_inline.dense_sidecars, 1);
-        assert_eq!(empty_inline.dense_inline_packed_len, 0);
-        let empty_inline_bucket = empty_inline
-            .dense_eligibility
-            .inline_sidecar_active_length_histogram[0];
-        assert_eq!(empty_inline_bucket.populations, 1);
-        assert_eq!(empty_inline_bucket.live_length, 0);
-        assert_eq!(
-            empty_inline_bucket.reserved_capacity,
-            INLINE_PACKED_CAPACITY as u64
-        );
+        let mut indexed = Props::new();
+        // Ordinary canonical indices populate the index sidecar but stay in `entries`, with
+        // no element words.
+        indexed.insert("0", Property::plain(super::super::Value::Num(6.0)));
+        let indexed = PropertyInventory::from_props(&indexed);
+        assert_eq!(indexed.dense_sidecars, 1);
+        assert_eq!(indexed.dense_heap_packed_vectors, 0);
 
         let dense = PropertyInventory::from_props(&array);
         assert_eq!(
-            dense.entries_len, 2,
-            "array length and label share entries Vec"
+            dense.entries_len, 4,
+            "array length, the two non-plain elements and label share entries Vec"
         );
         assert_eq!(dense.named_entries.default_wec_data, 1);
         assert_eq!(dense.named_entries.exceptional_data_masks[0b001], 1);
+        assert_eq!(dense.classic_index_entries.slots, 2);
+        assert_eq!(dense.classic_index_entries.exceptional_data_masks[0b110], 1);
+        assert_eq!(dense.classic_index_entries.accessors, 1);
+        assert_eq!(
+            dense.classic_index_entries.accessor_enumerable_configurable[0b10],
+            1
+        );
+        assert_eq!(dense.classic_index_entries.accessor_getter_setter[0b10], 1);
         assert_eq!(dense.entry_vec_eligibility.nonempty_vecs, 1);
         assert_eq!(
             dense
                 .entry_vec_eligibility
                 .nonempty_all_default_wec_data_vecs,
             0,
-            "the nondefault Array length stays in entries, separate from packed indices"
+            "the nondefault Array length stays in entries, separate from the element words"
         );
         assert_eq!(dense.packed_dense_fields.slots, 4);
         assert_eq!(dense.packed_dense_fields.default_wec_data, 1);
-        assert_eq!(dense.packed_dense_fields.exceptional_data_masks[0b110], 1);
-        assert_eq!(dense.packed_dense_fields.accessors, 1);
+        assert_eq!(dense.packed_dense_fields.holes, 3);
+        assert_eq!(dense.dense_heap_packed_vectors, 1);
+        assert_eq!(dense.dense_heap_packed_len, 4);
+        assert_eq!(dense.dense_heap_packed_vector_header_bytes, 16);
         assert_eq!(
-            dense.packed_dense_fields.accessor_enumerable_configurable[0b10],
-            1
-        );
-        assert_eq!(dense.packed_dense_fields.accessor_getter_setter[0b10], 1);
-        assert_eq!(dense.packed_dense_fields.holes, 1);
-        assert_eq!(dense.dense_sidecars, 1);
-        assert_eq!(
-            dense.dense_inline_reserved_property_slots,
-            INLINE_PACKED_CAPACITY as u64
-        );
-        assert_eq!(dense.dense_inline_packed_len, 4);
-        assert_eq!(dense.dense_heap_packed_capacity, 0);
-        assert_eq!(dense.dense_eligibility.inline_populations, 1);
-        let four_slot_inline_bucket = dense
-            .dense_eligibility
-            .inline_sidecar_active_length_histogram[4];
-        assert_eq!(four_slot_inline_bucket.populations, 1);
-        assert_eq!(four_slot_inline_bucket.live_length, 4);
-        assert_eq!(
-            four_slot_inline_bucket.reserved_capacity,
-            INLINE_PACKED_CAPACITY as u64
-        );
-        assert_eq!(dense.dense_eligibility.inline_all_default_data_or_holes, 0);
-        assert_eq!(
-            dense.dense_inline_reserved_unused_property_slots,
-            dense.dense_inline_reserved_property_slots - dense.dense_inline_packed_len
+            dense.dense_heap_packed_capacity_bytes,
+            dense.dense_heap_packed_capacity * 8
         );
 
-        let compact_dense = Props::packed_array_properties(
-            vec![
-                Property::plain(super::super::Value::Num(1.0)),
-                Property::plain(super::super::Value::Empty),
-                Property::plain(super::super::Value::Num(3.0)),
+        let compact_dense = Props::packed_array(
+            [
+                super::super::Value::Num(1.0),
+                super::super::Value::Empty,
+                super::super::Value::Num(3.0),
             ]
             .into_iter(),
         );
@@ -1069,24 +947,20 @@ mod tests {
         assert_eq!(
             compact_dense
                 .dense_eligibility
-                .inline_all_default_data_or_holes,
+                .heap_all_default_data_or_holes,
             1
         );
-        assert_eq!(
-            compact_dense.dense_eligibility.inline_eligible_live_length,
-            3
-        );
-        assert_eq!(compact_dense.dense_eligibility.inline_eligible_holes, 1);
-        assert_eq!(
+        assert_eq!(compact_dense.dense_eligibility.heap_eligible_live_length, 3);
+        assert_eq!(compact_dense.dense_eligibility.heap_eligible_holes, 1);
+        assert!(
             compact_dense
                 .dense_eligibility
-                .inline_eligible_reserved_capacity,
-            INLINE_PACKED_CAPACITY as u64
+                .heap_eligible_reserved_capacity
+                >= 3
         );
 
-        let compact_heap_dense = Props::packed_array_properties(
-            (0..12).map(|index| Property::plain(super::super::Value::Num(index as f64))),
-        );
+        let compact_heap_dense =
+            Props::packed_array((0..12).map(|index| super::super::Value::Num(index as f64)));
         let compact_heap_dense = PropertyInventory::from_props(&compact_heap_dense);
         assert_eq!(compact_heap_dense.dense_eligibility.heap_vectors, 1);
         assert_eq!(
@@ -1119,7 +993,7 @@ mod tests {
             compact_heap_dense
                 .dense_eligibility
                 .heap_eligible_reserved_capacity
-                * std::mem::size_of::<Property>() as u64
+                * 8
         );
 
         let mut ordinary_numeric_name = Props::new();

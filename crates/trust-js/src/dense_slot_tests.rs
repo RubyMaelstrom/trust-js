@@ -74,11 +74,10 @@ fn dense_slot_mutation_removal_and_reinsertion_keep_sidecar_consistent() {
             props.insert(n.to_string(), Property::plain(Value::Num(n as f64)));
         }
         props.insert("named", Property::plain(Value::Num(-1.0)));
+        // Value-only writes: a mutable descriptor escape (`get_mut`) moves an element word to the
+        // named entries.
         for n in (0..4096).step_by(3) {
-            props
-                .get_mut(&n.to_string())
-                .unwrap()
-                .set_value(Value::Num(-(n as f64)));
+            assert!(props.set_value(&n.to_string(), Value::Num(-(n as f64))));
         }
         for n in (0..4096).step_by(5) {
             assert!(props.remove(&n.to_string()));

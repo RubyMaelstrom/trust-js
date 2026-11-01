@@ -7,20 +7,18 @@ use crate::{bytecode::Tier, Completion, Engine};
 
 #[test]
 fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
+    let number = |props: &Props, n: u32| props.get_index(n).and_then(|e| e.number_value());
     let mut props = Props::packed_array((0..8192).map(|n| Value::Num(n as f64)));
     assert_eq!(props.entries.len(), 1);
     assert!(props.elems.elems.is_empty());
-    assert_eq!(props.elems.packed_ref().unwrap().len(), 8192);
-    assert_eq!(props.mirror_get(8191), Some(8191.0));
+    assert_eq!(props.elems.words().unwrap().len(), 8192);
+    assert_eq!(number(&props, 8191), Some(8191.0));
     assert!(props
         .try_append_element(8192, Property::plain(Value::Num(-0.0)))
         .is_ok());
-    assert_eq!(
-        props.mirror_get(8192).unwrap().to_bits(),
-        (-0.0f64).to_bits()
-    );
+    assert_eq!(number(&props, 8192).unwrap().to_bits(), (-0.0f64).to_bits());
     assert!(props.set_index_value(8191, Value::Num(3.5)).is_ok());
-    assert_eq!(props.mirror_get(8191), Some(3.5));
+    assert_eq!(number(&props, 8191), Some(3.5));
 
     let mut grown = Props::packed_array(std::iter::empty());
     for n in 0..8192 {
@@ -30,9 +28,13 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
     }
     assert_eq!(grown.entries.len(), 1);
     assert!(grown.elems.elems.is_empty());
-    assert_eq!(grown.mirror_get(8191), Some(8191.0));
+    assert_eq!(number(&grown, 8191), Some(8191.0));
     assert!(grown.set_index_value(12, Value::lstr("mixed")).is_ok());
-    assert_eq!(grown.mirror_get(12), None);
+    assert_eq!(number(&grown, 12), None);
+    assert_eq!(
+        grown.elems.words().unwrap().kind(),
+        word_block::KIND_NO_HOLES
+    );
     assert!(
         matches!((grown.get_index(12).unwrap().value()).view(), ValueView::Str(s) if s.text() == "mixed")
     );
@@ -50,9 +52,9 @@ fn dense_elements_sparse_length_does_not_reserve_storage() {
         .try_define_dense_element(200, Property::plain(Value::Num(2.0)))
         .is_ok());
     assert!(props.get_index(199).is_none());
-    assert_eq!(props.elems.packed_ref().unwrap().len(), 201);
+    assert_eq!(props.elems.words().unwrap().len(), 201);
     props.insert("4000000000", Property::plain(Value::Num(4.0)));
-    assert_eq!(props.elems.packed_ref().unwrap().len(), 201);
+    assert_eq!(props.elems.words().unwrap().len(), 201);
     assert_eq!(props.get("4000000000").unwrap().number_value(), Some(4.0));
     assert_eq!(
         props
@@ -162,7 +164,10 @@ fn dense_elements_far_deletion_and_truncation_restore_packed_coverage() {
             props.insert("1000000", Property::plain(Value::Num(1.0)));
             props.insert("2000000", Property::plain(Value::Num(2.0)));
             assert!(props.has_far.get());
-            assert!(!props.prepare_packed_numeric_mirror());
+            assert!(
+                props.element_words().is_none(),
+                "far keys block the in-place views"
+            );
             assert!(props.remove("2000000"));
             assert!(props.has_far.get(), "another far key survives");
             if truncate {
@@ -174,9 +179,11 @@ fn dense_elements_far_deletion_and_truncation_restore_packed_coverage() {
             assert_eq!(props.entries.len(), 1);
             assert!(props.get("1000000").is_none());
             if length != 0 {
-                assert!(props.prepare_packed_numeric_mirror());
+                assert_eq!(props.element_words().map(<[u64]>::len), Some(length));
                 assert_eq!(
-                    props.mirror_get(length as u32 - 1),
+                    props
+                        .get_index(length as u32 - 1)
+                        .and_then(|element| element.number_value()),
                     Some((length - 1) as f64)
                 );
             }
@@ -273,7 +280,7 @@ fn dense_elements_classic_recovery_bounds_delete_work_and_rebuilds_on_truncation
         for n in 0..length {
             props.insert(index_key(n), Property::plain(Value::Num(n as f64)));
         }
-        assert!(!props.elems.packed_is_some());
+        assert!(!props.elems.has_words());
         assert!(props.remove("1000000"));
         assert_eq!(props.has_far.get(), length > 256);
         props.remove_indices_from(length / 2);
@@ -294,7 +301,7 @@ fn dense_elements_classic_recovery_bounds_delete_work_and_rebuilds_on_truncation
 }
 
 #[test]
-fn dense_elements_recovered_numeric_mirror_rechecks_descriptors_and_holes() {
+fn dense_elements_recovery_keeps_named_elements_far_and_word_kinds_exact() {
     for blocked in ["hole", "accessor", "non-writable", "non-number"] {
         let mut props = Props::packed_array([Value::Num(-0.0), Value::Num(2.0)].into_iter());
         props.insert("1000000", Property::plain(Value::Num(1.0)));
@@ -302,16 +309,29 @@ fn dense_elements_recovered_numeric_mirror_rechecks_descriptors_and_holes() {
             "hole" => assert!(props.remove("1")),
             "accessor" => props.insert("1", Property::accessor_prop(None, None, true, true)),
             "non-writable" => props.get_mut("1").unwrap().set_writable(false),
-            "non-number" => props.get_mut("1").unwrap().set_value(Value::lstr("s")),
+            "non-number" => assert!(props.set_index_value(1, Value::lstr("s")).is_ok()),
             _ => unreachable!(),
         }
-        assert!(!props.prepare_packed_numeric_mirror());
         assert!(props.remove("1000000"));
-        assert!(!props.has_far.get());
-        assert!(!props.prepare_packed_numeric_mirror(), "{blocked}");
+        // A non-plain element stays in the named entries, so the map keeps an index there.
+        let named = matches!(blocked, "accessor" | "non-writable");
+        assert_eq!(props.has_far.get(), named, "{blocked}");
         props.insert("1", Property::plain(Value::Num(2.0)));
-        assert!(props.prepare_packed_numeric_mirror(), "{blocked}");
-        assert_eq!(props.mirror_get(0).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(props.has_far.get(), named, "{blocked}");
+        let words = props.elems.words().unwrap();
+        assert_eq!(words.kind() & !words.computed_kind(), 0, "{blocked}");
+        assert_eq!(words.get(1).is_some(), !named, "{blocked}");
+        assert_eq!(
+            props
+                .get_index(0)
+                .unwrap()
+                .number_value()
+                .unwrap()
+                .to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(props.get("1").unwrap().number_value(), Some(2.0));
+        assert!(props.get("1").unwrap().writable());
     }
 }
 

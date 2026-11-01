@@ -78,7 +78,9 @@ impl ForInKeys {
         props.reserve_dense_exact(keys.len(), false);
         for key in keys {
             bytes = bytes.saturating_add(key.len().saturating_add(64));
-            props.push_dense(Property::data(Value::Str(key.into()), false, false, false));
+            // Plain element words: no script reaches this object, so its descriptors are
+            // unobservable, and a word is half an entry.
+            props.push_dense(Property::plain(Value::Str(key.into())));
         }
         bytes = bytes.saturating_add(props.retained_requested_storage_bytes().0);
         let object = Object::new_with_parts(None, props, Exotic::None);

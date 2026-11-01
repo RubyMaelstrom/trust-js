@@ -56,17 +56,14 @@ fn number(value: Value) -> f64 {
 }
 
 #[test]
-fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
+fn dense_shift_storage_drains_words_and_classic_without_losing_views() {
     for packed in [false, true] {
         for named in [false, true] {
             for initial in [1, 3, 10, 16, 32] {
                 let mut props = numbers(initial, packed, false, named);
-                if packed {
-                    assert!(props.prepare_packed_numeric_mirror());
-                }
                 let shape = props.shape();
-                let inline = packed && initial <= INLINE_PACKED_CAPACITY;
-                let pointer = props.elems.packed_ref().map(|p| p.as_ptr());
+                // A shift moves the words' header one word on, never the words.
+                let pointer = props.elems.words().map(|words| words.as_slice().as_ptr());
                 let mirror_pointer = props.elems.mirror.as_ptr();
                 for removed in 0..initial {
                     let len = initial - removed;
@@ -80,28 +77,20 @@ fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
                     );
                     assert_eq!(props.shape(), shape);
                     assert!(props.get_index((len - 1) as u32).is_none());
-                    assert_eq!(props.elems.mirror_len(), len - 1);
-                    let mirror_front = if packed { removed + 1 } else { 0 };
-                    assert_eq!(props.elems.mirror.as_ptr(), unsafe {
-                        mirror_pointer.add(mirror_front)
-                    });
-                    assert_eq!(props.mirror_holes, 0);
-                    assert_ne!(props.mirror_flags & MIRROR_NO_HOLES, 0);
-                    if packed && len > 1 {
-                        let expected = pointer.map(|p| {
-                            if inline {
-                                p
-                            } else {
-                                unsafe { p.add(removed + 1) }
-                            }
-                        });
-                        assert_eq!(props.elems.packed_ref().map(|p| p.as_ptr()), expected);
-                    }
-                    if inline {
-                        assert!(
-                            props.elems.packed.is_none(),
-                            "shift promoted inline storage"
+                    if packed {
+                        // Element words keep no numeric mirror.
+                        assert_eq!(props.elems.mirror_len(), 0);
+                        let words = props.elems.words().unwrap();
+                        assert_eq!(
+                            Some(words.as_slice().as_ptr()),
+                            pointer.map(|p| unsafe { p.add(removed + 1) })
                         );
+                        assert_eq!(words.front_room(), removed + 1);
+                    } else {
+                        assert_eq!(props.elems.mirror_len(), len - 1);
+                        assert_eq!(props.elems.mirror.as_ptr(), mirror_pointer);
+                        assert_eq!(props.mirror_holes, 0);
+                        assert_ne!(props.mirror_flags & MIRROR_NO_HOLES, 0);
                     }
                     for index in 0..len - 1 {
                         let expected = (removed + index + 1) as f64;
@@ -109,7 +98,9 @@ fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
                             props.get_index(index as u32).unwrap().number_value(),
                             Some(expected)
                         );
-                        assert_eq!(props.mirror_get(index as u32), Some(expected));
+                        if !packed {
+                            assert_eq!(props.mirror_get(index as u32), Some(expected));
+                        }
                     }
                     if named {
                         assert!(
@@ -132,8 +123,17 @@ fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
 
 #[test]
 fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes() {
-    for packed in [false, true] {
-        let mut props = numbers(3, packed, !packed, true);
+    // Element words hold plain elements only: an attribute change moves the element to the
+    // named entries, and the storage path then refuses, leaving the generic algorithm to run.
+    let mut words = numbers(3, true, false, true);
+    words.get_mut("0").unwrap().set_configurable(false);
+    assert!(words.has_far.get());
+    assert!(words.shift_dense_array(3, false).is_none());
+    assert_eq!(words.get("0").unwrap().number_value(), Some(0.0));
+    assert!(!words.get("0").unwrap().configurable());
+    // The classic storage keeps each index's attributes in its entry.
+    {
+        let mut props = numbers(3, false, true, true);
         props.get_mut("0").unwrap().set_configurable(false);
         props.get_mut("0").unwrap().set_enumerable(false);
         props.get_mut("1").unwrap().set_configurable(false);
@@ -197,30 +197,30 @@ fn dense_shift_storage_rejections_are_atomic_and_do_not_invalidate_mirrors() {
             p.insert("length", Property::accessor_prop(None, None, false, false));
         },
     ];
+    // Each own property's value word and attributes, as the element view reports them.
+    let snapshot = |props: &Props| -> Vec<_> {
+        props
+            .ordered_keys()
+            .into_iter()
+            .map(|key| {
+                let p = props.get_key(key).unwrap();
+                let word = if p.accessor() { 0 } else { p.value().bits() };
+                let attributes = [p.accessor(), p.writable(), p.enumerable(), p.configurable()];
+                (key, word, attributes)
+            })
+            .collect()
+    };
     for packed in [false, true] {
         for edit in edits {
             let mut props = numbers(3, packed, false, true);
-            if packed {
-                assert!(props.prepare_packed_numeric_mirror());
-            }
             edit(&mut props);
-            let before: Vec<_> = props
-                .ordered_keys()
-                .into_iter()
-                .map(|key| {
-                    let p = props.get_key(key).unwrap().as_entry();
-                    (key, p.packed.0.get(), p.meta)
-                })
-                .collect();
+            let before = snapshot(&props);
             let mirror: Vec<_> = props.elems.mirror.iter().map(|f| f.to_bits()).collect();
             let flags = props.mirror_flags;
             let pointer = props.elems.mirror.as_ptr();
             let shape = props.shape();
             assert!(props.shift_dense_array(3, false).is_none());
-            for (key, bits, meta) in before {
-                let p = props.get_key(key).unwrap().as_entry();
-                assert_eq!((p.packed.0.get(), p.meta), (bits, meta));
-            }
+            assert_eq!(snapshot(&props), before);
             assert_eq!(
                 props
                     .elems
@@ -252,9 +252,6 @@ fn dense_shift_storage_preserves_numeric_bits_and_invalidates_prototype_creation
             Value::Num(1.5),
         ];
         let mut props = array(values, packed, false, true);
-        if packed {
-            assert!(props.prepare_packed_numeric_mirror());
-        }
         let expected: Vec<_> = (0..4)
             .map(|n| {
                 props
@@ -272,65 +269,76 @@ fn dense_shift_storage_preserves_numeric_bits_and_invalidates_prototype_creation
             assert!(proto_epoch() > epoch || epoch == u32::MAX);
             assert_eq!(number(first).to_bits(), bits);
             for n in 0..3 - removed {
+                let element = props.get_index(n as u32).unwrap();
                 assert_eq!(
-                    props.mirror_get(n as u32).unwrap().to_bits(),
+                    element.number_value().unwrap().to_bits(),
                     expected[removed + n + 1]
                 );
+                if !packed {
+                    assert_eq!(
+                        props.mirror_get(n as u32).unwrap().to_bits(),
+                        expected[removed + n + 1]
+                    );
+                }
             }
         }
     }
 }
 
 #[test]
-fn packed_creation_and_prepend_do_not_certify_holes_or_nonplain_descriptors() {
-    let mut properties = Props::packed_array_properties(
-        [
-            Property::plain(Value::Num(1.0)),
-            Property::plain(Value::Empty),
-            Property::plain(Value::Num(3.0)),
-        ]
-        .into_iter(),
-    );
-    assert!(!properties.elems.inline_packed.packed_plain.get());
+fn holes_and_nonplain_descriptors_keep_words_out_of_the_storage_paths() {
+    let mut properties =
+        Props::packed_array([Value::Num(1.0), Value::Empty, Value::Num(3.0)].into_iter());
+    let words = properties.elems.words().unwrap();
+    assert_eq!(words.kind() & word_block::KIND_NO_HOLES, 0);
     assert!(properties.shift_dense_array(3, false).is_none());
     assert!(!properties.unshift_dense_array(3, &[Value::Num(0.0)]));
+    // Filling the hole leaves the kind bit clear; the storage paths prove it again.
     properties.insert("1", Property::plain(Value::Num(2.0)));
     assert!(properties.unshift_dense_array(3, &[Value::Empty]));
-    assert!(!properties.elems.inline_packed.packed_plain.get());
+    assert!(properties.get_index(0).is_none());
     assert!(properties.shift_dense_array(4, false).is_none());
-    let mut descriptor = Props::packed_array_properties(
-        [
-            Property::plain(Value::Num(1.0)),
-            Property::data(Value::Num(2.0), false, true, true),
-            Property::plain(Value::Num(3.0)),
-        ]
-        .into_iter(),
+    // A non-plain element leaves the words for the named entries.
+    let mut descriptor =
+        Props::packed_array([Value::Num(1.0), Value::Num(2.0), Value::Num(3.0)].into_iter());
+    descriptor.insert("1", Property::data(Value::Num(2.0), false, true, true));
+    assert!(descriptor.has_far.get());
+    assert!(descriptor.elems.words().unwrap().get(1).is_none());
+    assert!(
+        descriptor.get_index(1).is_none(),
+        "a named element is no word"
     );
-    assert!(!descriptor.elems.inline_packed.packed_plain.get());
+    assert!(!descriptor.get("1").unwrap().writable());
     assert!(descriptor.shift_dense_array(3, false).is_none());
 }
 
-/// Prepending one element at a time keeps a packed array inline up to its inline capacity and
-/// promotes it once past it; every element keeps its identity and order through the prepends
-/// and the shifts that drain them.
+/// Prepending one element at a time keeps front room ahead of the words, so the block moves
+/// once per doubling; every element keeps its identity and order through the prepends and the
+/// shifts that drain them.
 #[test]
-fn tiny_prepends_stay_inline_before_promoting_once() {
-    let owners: Vec<_> = (0..12).map(|_| Object::new(None)).collect();
+fn repeated_prepends_move_the_words_once_per_doubling() {
+    let owners: Vec<_> = (0..100).map(|_| Object::new(None)).collect();
     let mut properties = Props::packed_array(std::iter::empty());
+    let mut blocks = Vec::new();
     for (index, owner) in owners.iter().enumerate() {
         assert!(properties.unshift_dense_array(index, &[Value::Obj(*owner)]));
-        assert_eq!(
-            properties.elems.packed.is_none(),
-            index < INLINE_PACKED_CAPACITY
-        );
-        for n in 0..=index {
+        let block = properties.elems.words().unwrap().block_start();
+        if blocks.last() != Some(&block) {
+            blocks.push(block);
+        }
+        for n in [0, index / 2, index] {
             assert!(
                 matches!((properties.get_index(n as u32).unwrap().value()).view(), ValueView::Obj(value)
                 if Gc::ptr_eq(&value, &owners[index-n]))
             );
         }
     }
-    for index in (0..12).rev() {
+    assert!(
+        blocks.len() <= 6,
+        "{} blocks for 100 prepends",
+        blocks.len()
+    );
+    for index in (0..100).rev() {
         let first = properties.shift_dense_array(index + 1, false).unwrap();
         assert!(
             matches!(first.view(), ValueView::Obj(value) if Gc::ptr_eq(&value, &owners[index]))
@@ -339,17 +347,15 @@ fn tiny_prepends_stay_inline_before_promoting_once() {
 }
 
 #[test]
-fn holes_shift_in_packed_storage_once_the_caller_proves_them_absent() {
-    // Inline (3 slots) and heap-deque (16 slots) packed storage with a leading and an inner
-    // hole: without the caller's proof the storage path refuses; with it each element and each
-    // hole moves down one index, and the leading hole reads as undefined.
+fn holes_shift_in_words_once_the_caller_proves_them_absent() {
+    // Short (3) and longer (16) word arrays with a leading and an inner hole: without the
+    // caller's proof the storage path refuses; with it each element and each hole moves down
+    // one index, and the leading hole reads as undefined.
     for len in [3usize, 16] {
-        let mut elements: Vec<Property> = (0..len)
-            .map(|n| Property::plain(Value::Num(n as f64)))
-            .collect();
-        elements[0] = Property::plain(Value::Empty);
-        elements[len / 2] = Property::plain(Value::Empty);
-        let mut properties = Props::packed_array_properties(elements.into_iter());
+        let mut elements: Vec<Value> = (0..len).map(|n| Value::Num(n as f64)).collect();
+        elements[0] = Value::Empty;
+        elements[len / 2] = Value::Empty;
+        let mut properties = Props::packed_array(elements.into_iter());
         assert!(properties.shift_dense_array(len, false).is_none());
         let first = properties.shift_dense_array(len, true).unwrap();
         assert!(matches!(first.view(), ValueView::Undefined));
@@ -363,52 +369,31 @@ fn holes_shift_in_packed_storage_once_the_caller_proves_them_absent() {
                 assert!(element.is_none());
             } else {
                 let element = element.unwrap();
-                assert!(element.as_entry().is_plain_element());
+                assert!(matches!(element, Element::Word(_)));
                 assert_eq!(number(element.value()), (n + 1) as f64);
             }
         }
         assert!(properties.get_index((len - 1) as u32).is_none());
     }
-    // A slot whose attributes are not a plain element's still refuses.
-    let mut descriptor = Props::packed_array_properties(
-        [
-            Property::plain(Value::Empty),
-            Property::data(Value::Num(2.0), false, true, true),
-        ]
-        .into_iter(),
-    );
+    // An element whose attributes are not a plain element's still refuses.
+    let mut descriptor = Props::packed_array([Value::Empty, Value::Num(2.0)].into_iter());
+    descriptor.insert("1", Property::data(Value::Num(2.0), false, true, true));
     assert!(descriptor.shift_dense_array(2, true).is_none());
 }
 
 #[test]
-fn packed_plain_proof_uses_existing_inline_padding_and_clones_independently() {
-    #[allow(dead_code)]
-    struct PreviousInlinePacked {
-        len: u8,
-        slots: [std::mem::MaybeUninit<Property>; INLINE_PACKED_CAPACITY],
-    }
-    assert_eq!(
-        std::mem::size_of::<InlinePacked>(),
-        std::mem::size_of::<PreviousInlinePacked>()
-    );
-    assert_eq!(
-        std::mem::offset_of!(InlinePacked, len),
-        std::mem::offset_of!(PreviousInlinePacked, len)
-    );
-    assert_eq!(
-        std::mem::offset_of!(InlinePacked, slots),
-        std::mem::offset_of!(PreviousInlinePacked, slots)
-    );
-    for length in [3, 16] {
+fn cloned_words_change_independently() {
+    for length in [3, 16, 100] {
         let original = numbers(length, true, false, false);
         let mut clone = original.clone();
-        assert!(original.elems.inline_packed.packed_plain.get());
-        assert!(clone.elems.inline_packed.packed_plain.get());
-        clone.elems.packed_slice_mut().unwrap()[0] =
-            Property::data(Value::Num(0.0), false, true, true);
-        assert!(!clone.elems.inline_packed.packed_plain.get());
+        assert_ne!(
+            original.elems.words().unwrap().block_start(),
+            clone.elems.words().unwrap().block_start()
+        );
+        clone.insert("0", Property::data(Value::Num(0.0), false, true, true));
         assert!(clone.shift_dense_array(length, false).is_none());
-        assert!(original.elems.inline_packed.packed_plain.get());
+        assert!(!original.has_far.get());
         assert!(original.get_index(0).unwrap().writable());
+        assert!(matches!(original.get_index(0).unwrap(), Element::Word(_)));
     }
 }
