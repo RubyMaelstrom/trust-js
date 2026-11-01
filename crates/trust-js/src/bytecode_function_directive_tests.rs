@@ -256,7 +256,7 @@ fn live_function_loop_keeps_original_ast_site_and_current_bytecode_pc() {
         engine.set_tier_threshold(32);
         eval(&mut engine, source);
         let function = function(&mut engine, "subject");
-        let site = function.body.iter().find_map(function_osr_site).unwrap();
+        let site = function_osr_sites(&function.body)[0];
         TEST_FUNCTION_OSR_ENTRIES.with(|count| count.set(0));
         assert_eq!(eval(&mut engine, "subject()"), "4498500:1");
         assert!(TEST_FUNCTION_OSR_ENTRIES.with(|count| count.get()) > 0);

@@ -104,8 +104,8 @@ fn cold_loop_functions_wait_for_their_tier_budget() {
 fn nested_short_loops_spend_their_functions_budget_in_one_call() {
     // NavierStokes's lin_solve: loops nested in an if/else, none run more than 128 times in
     // one execution, so no execution reaches its own admission. The first call spends the
-    // budget within its second inner loop, compiles the function and moves the rest of the
-    // call into its loops' fragments; the next call runs compiled.
+    // budget within its second inner loop, compiles the function and moves its frame into
+    // the compiled body at that nested header, with no fragment; the next call runs compiled.
     for tier in [Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -123,11 +123,15 @@ fn nested_short_loops_spend_their_functions_budget_in_one_call() {
             "{tier:?}: and it leaves the tree-walker then ({} backedges)",
             solve.runtime().backedges.get()
         );
-        let fragments =
-            crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.get());
-        assert!(
-            (1..=3).contains(&fragments),
-            "{tier:?}: each enclosing loop's fragment takes over the inner ones ({fragments})"
+        assert_eq!(
+            crate::bytecode::TEST_FUNCTION_OSR_ENTRIES.with(|count| count.get()),
+            1,
+            "{tier:?}: the call moves into the compiled body at the nested header"
+        );
+        assert_eq!(
+            crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.get()),
+            0,
+            "{tier:?}: and needs no fragment"
         );
         reset_counts();
         assert_eq!(value(&mut engine, "solve(1,100)"), "98070000");
@@ -137,6 +141,41 @@ fn nested_short_loops_spend_their_functions_budget_in_one_call() {
             "{tier:?}: the second call runs compiled"
         );
     }
+}
+
+#[test]
+fn nested_loop_frames_keep_scopes_captures_labels_and_iterations_across_transfer() {
+    // Each call moves its frame at a loop nested in blocks, ifs and other loops: the bindings
+    // seeded through the parked lexical chain (shadowed, in their dead zone, captured by
+    // closures made before and after the transfer), labeled jumps out of the nested loop, an
+    // outer let loop's per-iteration copies, and the prefix effects that must not run again.
+    check("function f(n){let x='outer';var log=[];if(n>0){let x='block';for(let k=0;k<3;k++){let x='loop'+k;for(var i=0;i<n;i++){if(i===n-1)log.push(x);}}log.push(x);}log.push(x);return log.join(',');}f(3000);", "loop0,loop1,loop2,block,outer", true);
+    check("function g(){var out=[];{for(var i=0;i<3000;i++){}try{out.push(z);}catch(e){out.push(e instanceof ReferenceError);}let z=1;out.push(z);}return out.join(',');}g();", "true,1", true);
+    check("function h(){var fs=[];for(let k=0;k<3;k++){let captured=k*10;fs.push(()=>captured+k);for(var i=0;i<3000;i++){captured++;}}return fs.map(f=>f()).join(',');}h();", "3000,3011,3022", true);
+    check("function l(){var s=0;outer:for(var a=0;a<4;a++){inner:for(var b=0;b<3000;b++){if(b===2000)continue outer;if(a===3&&b===500)break outer;s+=b;}}return s;}l();", "6121750", true);
+    check("function p(){var fs=[];for(let k=0;k<4;k++){for(var i=0;i<3000;i++){}fs.push(()=>k);}return fs.map(f=>f()).join(',');}p();", "0,1,2,3", true);
+    check("var prefix=0;function q(a,n){prefix++;var s=0;if(a===0){s=-1;}else{for(var j=0;j<4;j++){for(var i=0;i<n;i++){s+=i;}}}return s+':'+prefix;}q(1,3000);", "17994000:1", true);
+}
+
+#[test]
+fn loops_under_for_of_try_and_switch_keep_their_fragments() {
+    // The tree-walker's Rust frames hold an iterator, a handler or a discriminant there, which
+    // the compiled body could not take over: no frame moves, the loops use fragments.
+    check(
+        "function r(){var s=0;for(const v of [1,2,3]){for(var i=0;i<3000;i++)s+=v;}return s;}r();",
+        "18000",
+        false,
+    );
+    check(
+        "function t(){var s=0;try{for(var i=0;i<3000;i++)s+=i;}finally{s+=1;}return s;}t();",
+        "4498501",
+        false,
+    );
+    check(
+        "function w(x){var s=0;switch(x){case 1:for(var i=0;i<3000;i++)s+=i;break;}return s;}w(1);",
+        "4498500",
+        false,
+    );
 }
 
 #[test]

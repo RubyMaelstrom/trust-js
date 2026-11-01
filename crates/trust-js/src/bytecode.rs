@@ -7250,17 +7250,37 @@ mod feedback_layout_tests {
     }
 }
 
-/// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
-fn function_osr_site(statement: &Stmt) -> Option<usize> {
-    match statement {
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
-            Some(&body.site as *const _ as usize)
+/// The loops at which a call parked on the tree-walker can move its frame into the function's
+/// compiled body, in source order: each for, while and do-while loop the body reaches through
+/// blocks, ifs, labels and the bodies of other such loops. Not through try, catch or finally,
+/// switch, with, for-in or for-of, nor into nested functions: the tree-walker's Rust frames
+/// hold their state (handlers, a discriminant, an object environment, an iterator), which the
+/// compiled body could not take over. Every loop header is an entry in V8, SpiderMonkey and
+/// JSC (the plan's tiering design).
+fn function_osr_sites(body: &[Stmt]) -> Vec<usize> {
+    let mut sites = Vec::new();
+    let mut pending: Vec<&Stmt> = body.iter().rev().collect();
+    while let Some(statement) = pending.pop() {
+        match statement {
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+                sites.push(&body.site as *const _ as usize);
+                pending.push(&body.statement);
+            }
+            Stmt::Labeled { body, .. } => pending.push(body),
+            Stmt::Block(body) => pending.extend(body.iter().rev()),
+            Stmt::If { cons, alt, .. } => {
+                if let Some(alt) = alt {
+                    pending.push(alt);
+                }
+                pending.push(cons);
+            }
+            _ => {}
         }
-        Stmt::Labeled { body, .. } => function_osr_site(body),
-        _ => None,
     }
+    sites
 }
 
+/// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
     let result =
@@ -7765,7 +7785,7 @@ fn compile_inner_mode(
         runtime_lexicals,
         reuse_activation: has_mapped_parameter_aliases || prepared_entry,
         function_osr_sites: if !script_body && !is_coroutine && hot.is_none() {
-            func.body.iter().filter_map(function_osr_site).collect()
+            function_osr_sites(&func.body)
         } else {
             Vec::new()
         },
@@ -10068,9 +10088,11 @@ impl Compiler {
     }
 
     fn record_function_osr_address(&mut self, site: usize, pc: usize) {
-        // The enclosing AST frame is parked at a body-level loop, with no active cleanup or
-        // runtime lexical cursor to reconstruct. Captured function homes can reuse the exact
-        // parked Function Environment Record; mapped arguments retain the prepared entry.
+        // The enclosing AST frame is parked at a loop of `function_osr_sites`, with no active
+        // cleanup but the runtime lexical scopes' own environment handlers, which the entry
+        // records, so a nested loop needs no other cursor reconstructed. Captured function
+        // homes can reuse the exact parked Function Environment Record; mapped arguments
+        // retain the prepared entry.
         if self.inline_depth != 0
             || self.try_depth as usize != self.function_osr_environment_handlers.len()
             || self.env_arguments
@@ -16483,8 +16505,10 @@ pub fn run(
 }
 
 /// Move a cold ordinary function's already-instantiated AST activation into its whole
-/// bytecode continuation. Only body-level settled loops are admitted: their outer parameter
-/// binding, hoisting, prefix effects and lexical initialization must never run a second time.
+/// bytecode continuation, at a settled loop header of [`function_osr_sites`]: its outer
+/// parameter binding, hoisting, prefix effects and lexical initialization must never run a
+/// second time, and the statements enclosing the loop, which receive the call's Return
+/// completion, run nothing more.
 pub(crate) fn try_function_osr(
     i: &mut Interp,
     site: &LoopSite,
@@ -16503,16 +16527,20 @@ pub(crate) fn try_function_osr(
     if function.is_async
         || function.is_generator
         || (construct && callee.borrow().class_kind == crate::value::CLASS_DERIVED)
-        || !function
-            .body
-            .iter()
-            .any(|statement| function_osr_site(statement) == Some(address))
         || live_env.borrow().under_with()
     {
         return Ok(None);
     }
+    // A compiled body has an entry at each site it admits (record_function_osr_address), and
+    // none at a direct eval's loop; before it compiles, only a site it will admit compiles it.
     if function.runtime().code.get().is_none() {
-        let _ = function.runtime().code.set(compile(&function));
+        if !function_osr_sites(&function.body).contains(&address) {
+            return Ok(None);
+        }
+        let _ = function
+            .runtime()
+            .code
+            .set(crate::interpreter::tier_compile(&function, false));
     }
     let runtime = function.runtime();
     let Some(baseline) = runtime.code.get().and_then(Option::as_ref) else {
