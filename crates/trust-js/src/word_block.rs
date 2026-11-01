@@ -630,7 +630,7 @@ impl Words {
             capacity <= MAX_WORDS && shifted <= MAX_WORDS && len + front <= capacity,
             "element block of {capacity} words"
         );
-        let flags = self.kind();
+        let flags = self.header().flags;
         let total = shifted + capacity;
         let record = record_words(total);
         // Words that keep their indices keep the old record's traced length and dirty blocks
@@ -640,7 +640,14 @@ impl Words {
             .record()
             .filter(|_| front == 0 && record != 0)
             .map(|old| (old, self.bitmap_words().min(record - 1)));
-        let block = crate::gc_storage::alloc_block(HEADER_BYTES + 8 * (total + record));
+        // Checked: on a 32-bit target the byte count of a large reservation can pass usize.
+        let bytes = total
+            .checked_add(record)
+            .and_then(|words| words.checked_mul(8))
+            .and_then(|bytes| bytes.checked_add(HEADER_BYTES))
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .expect("element block size");
+        let block = crate::gc_storage::alloc_block(bytes);
         // SAFETY: a fresh block of the front room, a header, `capacity` words and the record;
         // the used words are copied after `front` words of room, and a kept record's words
         // into the new one's (its bitmap covers the used words, as the old one's did).
