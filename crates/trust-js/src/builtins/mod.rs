@@ -950,7 +950,7 @@ pub(crate) fn object_get_own_property(
         if body.ic_plain.get()
             && (body.exotic.is_ordinary() || matches!(body.exotic, Exotic::Array))
         {
-            return Ok(body.props.get(key).cloned());
+            return Ok(body.props.get(key).map(crate::value::Element::to_property));
         }
     }
     ab(i.defer_trigger(o, Some(key)))?;
@@ -960,7 +960,11 @@ pub(crate) fn object_get_own_property(
         .then(|| i.mapped_arg_value(o, key))
         .flatten()
     {
-        let mut property = o.borrow().props.get(key).cloned();
+        let mut property = o
+            .borrow()
+            .props
+            .get(key)
+            .map(crate::value::Element::to_property);
         if let Some(property) = &mut property {
             property.set_value(value);
         }
@@ -996,7 +1000,10 @@ pub(crate) fn object_get_own_property(
             return Ok(Some(ab(result)?));
         }
     }
-    Ok(o.borrow().props.get(key).cloned())
+    Ok(o.borrow()
+        .props
+        .get(key)
+        .map(crate::value::Element::to_property))
 }
 
 /// [[GetOwnProperty]] of a Proxy's target: the target is always an object.
@@ -1790,7 +1797,11 @@ pub(crate) fn reflect_ordinary_set(
         {
             return Ok(false);
         }
-        let own = obj.borrow().props.get(key).cloned();
+        let own = obj
+            .borrow()
+            .props
+            .get(key)
+            .map(crate::value::Element::to_property);
         match own {
             Some(p) if p.accessor() => {
                 return match p.setter().cloned() {
@@ -1864,7 +1875,11 @@ pub(crate) fn reflect_define_on_receiver(
     if i.host_indexed_array_key(&ro, key) || i.host_named_reject_define(&ro, key) {
         return Ok(false);
     }
-    let existing = ro.borrow().props.get(key).cloned();
+    let existing = ro
+        .borrow()
+        .props
+        .get(key)
+        .map(crate::value::Element::to_property);
     // OrdinarySetWithOwnDescriptor calls the receiver's [[DefineOwnProperty]], not [[Set]].
     // Re-running [[Set]] here would invoke its own/inherited setter instead of defining a
     // data property, and would repeat the prototype search on the wrong object.
@@ -1944,7 +1959,11 @@ pub(crate) fn reflect_ordinary_get(
         if let Some(value) = ab(i.host_indexed_own_value(&obj, key))? {
             return Ok(value);
         }
-        let own = obj.borrow().props.get(key).cloned();
+        let own = obj
+            .borrow()
+            .props
+            .get(key)
+            .map(crate::value::Element::to_property);
         match own {
             Some(p) if p.accessor() => {
                 return match p.getter().cloned() {
@@ -3704,7 +3723,7 @@ pub(crate) fn own_data_element(props: &Props, index: usize) -> Option<Value> {
     props
         .get_index(index)
         .filter(|property| !property.accessor())
-        .map(Property::value)
+        .map(crate::value::Element::value)
 }
 
 /// %ArrayIteratorPrototype%.next without its call boundary (see [`inert_iterator_step`]).
@@ -5516,7 +5535,11 @@ fn define_own_property_ordinary(
             return Ok(false);
         }
     }
-    let existing = o.borrow().props.get(key).cloned();
+    let existing = o
+        .borrow()
+        .props
+        .get(key)
+        .map(crate::value::Element::to_property);
 
     let mut cur = match existing {
         None => {
@@ -12075,7 +12098,11 @@ fn install_string(it: &mut Interp) {
     });
     // Annex B aliases: trimLeft/trimRight ARE trimStart/trimEnd (same function objects).
     for (alias, target) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
-        let p = sp.borrow().props.get(target).cloned();
+        let p = sp
+            .borrow()
+            .props
+            .get(target)
+            .map(crate::value::Element::to_property);
         if let Some(p) = p {
             sp.borrow_mut().props.insert(alias, p);
         }

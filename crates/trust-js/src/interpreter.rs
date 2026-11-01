@@ -7463,7 +7463,7 @@ impl Interp {
             let number = source
                 .props
                 .get_index(index as u32)
-                .and_then(Property::number_value)
+                .and_then(crate::value::Element::number_value)
                 .expect("numeric array validated without running author code");
             info.kind.write_into(number, bytes);
         }
@@ -12316,7 +12316,11 @@ impl Interp {
                         }
                         return self.set_member_recv(&Value::Obj(o), key, value, receiver);
                     }
-                    let prop = o.borrow().props.get(key).cloned();
+                    let prop = o
+                        .borrow()
+                        .props
+                        .get(key)
+                        .map(crate::value::Element::to_property);
                     if let Some(p) = prop {
                         if p.accessor() {
                             if let Some(trace) = trace.as_deref_mut() {
@@ -12582,7 +12586,11 @@ impl Interp {
                 }
                 return Ok(false);
             }
-            let prop = o.borrow().props.get(key).cloned();
+            let prop = o
+                .borrow()
+                .props
+                .get(key)
+                .map(crate::value::Element::to_property);
             if let Some(p) = prop {
                 if p.accessor() {
                     if let Some(trace) = trace.as_deref_mut() {
@@ -13805,7 +13813,10 @@ impl Interp {
         let body = target.borrow();
         body.ic_plain.get()
             && (body.exotic.is_ordinary() || matches!(body.exotic, Exotic::Array))
-            && body.props.get(key).is_none_or(Property::configurable)
+            && body
+                .props
+                .get(key)
+                .is_none_or(crate::value::Element::configurable)
     }
 
     pub(crate) fn call_callback(
@@ -16314,7 +16325,7 @@ impl Interp {
             let property = if b.props.shape() == prototype_shape {
                 b.props.property_at(prototype_slot as usize)
             } else {
-                b.props.get("prototype")
+                b.props.get_named("prototype")
             };
             match property {
                 Some(p) if !p.accessor() => match (p.value()).view() {

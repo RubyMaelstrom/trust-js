@@ -158,7 +158,7 @@ fn osr_entry_operand_prefix_is_a_root() {
             .borrow()
             .props
             .get("tag")
-            .map(crate::value::Property::value);
+            .map(crate::value::Element::value);
         tag
     });
     assert!(

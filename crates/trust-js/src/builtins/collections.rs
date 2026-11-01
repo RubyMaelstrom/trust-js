@@ -631,7 +631,11 @@ pub(super) fn install_map_like(
     if is_set {
         // Set.prototype.keys is the *same* function object as Set.prototype.values.
         let _ = keys_fn;
-        let values_prop = proto.borrow().props.get("values").cloned();
+        let values_prop = proto
+            .borrow()
+            .props
+            .get("values")
+            .map(crate::value::Element::to_property);
         if let Some(p) = values_prop {
             proto.borrow_mut().props.insert("keys", p);
         }

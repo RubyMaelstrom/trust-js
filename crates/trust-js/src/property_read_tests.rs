@@ -302,7 +302,7 @@ fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_dr
                 engine
                     .interp
                     .snapshot_cached_get(
-                        object.props.get("prototype").unwrap(),
+                        object.props.get_named("prototype").unwrap(),
                         "prototype",
                         0,
                         0,

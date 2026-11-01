@@ -839,7 +839,7 @@ mod packed_value_tests {
         let function = engine.interp.get_var("unobserved", &env).ok().unwrap();
         let object_handle = function.as_obj().unwrap();
         let object = object_handle.borrow();
-        let prototype = object.props.get("prototype").unwrap();
+        let prototype = object.props.get_named("prototype").unwrap();
         assert_eq!(prototype.packed.tag(), PACK_LAZY_PROTO);
         let bits = prototype.packed.bits();
         for _ in 0..20 {
@@ -5420,6 +5420,67 @@ pub enum TaIndex {
     Ordinary,
 }
 
+/// An element as a property map holds it (W2c step 2): a reference to the entry that stores it,
+/// which every element is until the elements become 8-byte words; a word will be a plain data
+/// element (writable, enumerable, configurable) of its value. It reads as a [`Property`] does,
+/// and [`Element::to_property`] makes one when a caller needs to own or store it.
+#[derive(Clone, Copy)]
+pub(crate) struct Element<'a>(&'a Property);
+
+impl<'a> Element<'a> {
+    #[inline]
+    pub(crate) fn entry(property: &'a Property) -> Self {
+        Element(property)
+    }
+    /// The property this element is.
+    #[inline]
+    pub(crate) fn to_property(self) -> Property {
+        self.0.clone()
+    }
+    /// The stored entry, while every element has one (until W2c's words): for tests of the
+    /// entries' own representation.
+    #[cfg(test)]
+    pub(crate) fn as_entry(self) -> &'a Property {
+        self.0
+    }
+    #[inline]
+    pub(crate) fn accessor(self) -> bool {
+        self.0.accessor()
+    }
+    #[inline]
+    pub(crate) fn writable(self) -> bool {
+        self.0.writable()
+    }
+    #[inline]
+    pub(crate) fn enumerable(self) -> bool {
+        self.0.enumerable()
+    }
+    #[inline]
+    pub(crate) fn configurable(self) -> bool {
+        self.0.configurable()
+    }
+    #[inline]
+    pub(crate) fn value(self) -> Value {
+        self.0.value()
+    }
+    #[inline]
+    pub(crate) fn number_value(self) -> Option<f64> {
+        self.0.number_value()
+    }
+    #[inline]
+    pub(crate) fn holds_object(self, expected: *const RefCell<Object>) -> bool {
+        self.0.holds_object(expected)
+    }
+    #[inline]
+    pub(crate) fn getter(self) -> Option<&'a Value> {
+        self.0.getter()
+    }
+    #[inline]
+    pub(crate) fn setter(self) -> Option<&'a Value> {
+        self.0.setter()
+    }
+}
+
 /// A property descriptor. A data property uses `value`/`writable`; an accessor uses the
 /// getter/setter pair. The low bits of `meta` hold the four descriptor flags; its aligned upper
 /// bits point to an accessor pair only for accessor properties. Thus ordinary properties are 16
@@ -8391,15 +8452,18 @@ impl Props {
     /// The own property for canonical index `n`, without hashing. `None` only means "not in the
     /// dense map" — the caller must fall back to the string-keyed path, not conclude absence.
     #[inline]
-    pub(crate) fn get_index(&self, n: u32) -> Option<&Property> {
+    pub(crate) fn get_index(&self, n: u32) -> Option<Element<'_>> {
         if let Some(packed) = self.elems.packed_ref() {
-            return packed.get(n as usize).filter(|p| !p.is_empty());
+            return packed
+                .get(n as usize)
+                .filter(|p| !p.is_empty())
+                .map(Element::entry);
         }
         let slot = *self.elems.get(n as usize)?;
         if slot == NO_SLOT {
             return None;
         }
-        Some(&self.entries.fields[slot as usize])
+        Some(Element::entry(&self.entries.fields[slot as usize]))
     }
 
     /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).
@@ -9275,13 +9339,19 @@ impl Props {
     }
     /// The property whose key's text is `key` (see [`Props::find_text`]).
     #[inline]
-    pub(crate) fn get(&self, key: &str) -> Option<&Property> {
+    pub(crate) fn get(&self, key: &str) -> Option<Element<'_>> {
         if let Some(n) = canonical_index(key) {
             return self.get_key(PropKey::index(n));
         }
+        self.find_text(key)
+            .map(|i| Element::entry(&self.entries.fields[i]))
+    }
+    /// A named key's property: never an element, so always a stored entry.
+    pub(crate) fn get_named(&self, key: &str) -> Option<&Property> {
+        debug_assert!(canonical_index(key).is_none(), "get_named of an index key");
         self.find_text(key).map(|i| &self.entries.fields[i])
     }
-    pub(crate) fn get_key(&self, key: PropKey) -> Option<&Property> {
+    pub(crate) fn get_key(&self, key: PropKey) -> Option<Element<'_>> {
         if let Some(n) = key.as_index() {
             if let Some(p) = self.get_index(n) {
                 return Some(p);
@@ -9294,7 +9364,8 @@ impl Props {
                 return None;
             }
         }
-        self.find(key).map(|i| &self.entries.fields[i])
+        self.find(key)
+            .map(|i| Element::entry(&self.entries.fields[i]))
     }
     /// Semantic lookup plus the named-entry slot when the result lives in `entries`, in a walk
     /// over several maps (see [`Props::get_walking`]). Dense indexed results have no named field
@@ -9304,7 +9375,7 @@ impl Props {
         &self,
         key: &str,
         atom: &mut Option<PropKey>,
-    ) -> Option<(&Property, Option<usize>)> {
+    ) -> Option<(Element<'_>, Option<usize>)> {
         if let Some(n) = canonical_index(key) {
             if let Some(property) = self.get_index(n) {
                 return Some((property, None));
@@ -9314,17 +9385,17 @@ impl Props {
             }
         }
         self.find_text_with(key, atom)
-            .map(|slot| (&self.entries.fields[slot], Some(slot)))
+            .map(|slot| (Element::entry(&self.entries.fields[slot]), Some(slot)))
     }
     /// [`Props::get`] in a walk that reads `key` from several maps (a prototype chain): `atom`
     /// carries the text's atom from the map that looked it up to the next ones.
     #[inline]
-    pub(crate) fn get_walking(&self, key: &str, atom: &mut Option<PropKey>) -> Option<&Property> {
+    pub(crate) fn get_walking(&self, key: &str, atom: &mut Option<PropKey>) -> Option<Element<'_>> {
         if let Some(n) = canonical_index(key) {
             return self.get_key(PropKey::index(n));
         }
         self.find_text_with(key, atom)
-            .map(|i| &self.entries.fields[i])
+            .map(|i| Element::entry(&self.entries.fields[i]))
     }
     /// The memoized own `prototype` slot, for guarded constructor fast paths.
     #[inline]

@@ -741,8 +741,13 @@ fn alias_into(source: &Value, word: &mut Value) {
 /// The `tag` of the object `word` holds, read in a frame of its own.
 #[inline(never)]
 fn tag_of(word: &Value) -> Option<String> {
-    let tag =
-        word.with_object(|object| object.borrow().props.get("tag").map(Property::value))??;
+    let tag = word.with_object(|object| {
+        object
+            .borrow()
+            .props
+            .get("tag")
+            .map(crate::value::Element::value)
+    })??;
     match (tag).view() {
         ValueView::Str(tag) => Some(tag.text().into_owned()),
         _ => None,

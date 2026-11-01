@@ -1168,7 +1168,11 @@ pub(super) fn install_date(it: &mut Interp) {
         ))
     });
     // toGMTString IS toUTCString (the very same function object).
-    let utc = proto.borrow().props.get("toUTCString").cloned();
+    let utc = proto
+        .borrow()
+        .props
+        .get("toUTCString")
+        .map(crate::value::Element::to_property);
     if let Some(p) = utc {
         proto.borrow_mut().props.insert("toGMTString", p);
     }

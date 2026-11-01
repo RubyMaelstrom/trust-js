@@ -1198,7 +1198,7 @@ mod tests {
         let function = engine.interp.get_var("unobserved", &env).ok().unwrap();
         let function_handle = function.as_obj().unwrap();
         let object = function_handle.borrow();
-        let prototype = object.props.get("prototype").unwrap();
+        let prototype = object.props.get_named("prototype").unwrap();
         assert_eq!(prototype.packed.tag(), PACK_LAZY_PROTO);
         let packed_before = prototype.packed.bits();
 

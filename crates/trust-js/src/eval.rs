@@ -87,7 +87,11 @@ impl ForInKeys {
     }
 
     fn key(&self, index: u32) -> Option<Value> {
-        self.0.borrow().props.get_index(index).map(Property::value)
+        self.0
+            .borrow()
+            .props
+            .get_index(index)
+            .map(crate::value::Element::value)
     }
 
     /// Only internal compiler temporaries may contain this value; it has no JavaScript owner.
@@ -7099,7 +7103,12 @@ impl Interp {
                 {
                     if !Gc::ptr_eq(src, dst) {
                         for k in src.borrow().props.keys() {
-                            let p = src.borrow().props.get_key(k).cloned().unwrap();
+                            let p = src
+                                .borrow()
+                                .props
+                                .get_key(k)
+                                .map(crate::value::Element::to_property)
+                                .unwrap();
                             dst.borrow_mut().props.insert(k, p);
                         }
                         for (key, slot) in src.borrow().internal_slots().iter() {
@@ -8859,7 +8868,7 @@ impl Interp {
                     .props
                     .get(key)
                     .filter(|property| !property.accessor())
-                    .map(Property::value)
+                    .map(crate::value::Element::value)
                     .is_some_and(|value| {
                         matches!(
                             (value).view(),

@@ -727,8 +727,12 @@ pub(super) fn install_regexp(it: &mut Interp) {
     // trivial native body may share an address with other functions, so it cannot be recognized
     // by function pointer.
     let species_getter = well_known_key(it, "species").and_then(|key| {
-        match (ctor.borrow().props.get(&key).and_then(Property::getter))
-            .map(|__value| (__value).view())
+        match (ctor
+            .borrow()
+            .props
+            .get(&key)
+            .and_then(crate::value::Element::getter))
+        .map(|__value| (__value).view())
         {
             Some(ValueView::Obj(getter)) => Some(getter),
             _ => None,
@@ -1194,7 +1198,7 @@ fn re_sym_replace_impl(
                         p.props
                             .get("exec")
                             .filter(|prop| !prop.accessor())
-                            .map(Property::value)
+                            .map(crate::value::Element::value)
                     })
                     .is_some_and(|value| {
                         let ValueView::Obj(exec) = (value).view() else {
@@ -1221,8 +1225,12 @@ fn re_sym_replace_impl(
                         .and_then(|last| last.caps.first().copied().flatten())
                         .is_some_and(|(start, end)| start == end);
                     if empty {
-                        let li = match (obj.borrow().props.get("lastIndex").map(Property::value))
-                            .map(|__value| (__value).view())
+                        let li = match (obj
+                            .borrow()
+                            .props
+                            .get("lastIndex")
+                            .map(crate::value::Element::value))
+                        .map(|__value| (__value).view())
                         {
                             Some(ValueView::Num(n)) => n as usize,
                             _ => unreachable!("discard matcher guarded lastIndex"),

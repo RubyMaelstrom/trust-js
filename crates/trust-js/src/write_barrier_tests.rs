@@ -73,7 +73,11 @@ fn handle_borrows_record_the_write_in_their_cells_cards() {
             .insert("a", Binding::data(Value::Obj(young[3]), true, true));
         interp.gc_collect();
         for (object, target) in objects.iter().zip(&young) {
-            let value = object.borrow().props.get("a").map(Property::value);
+            let value = object
+                .borrow()
+                .props
+                .get("a")
+                .map(crate::value::Element::value);
             assert!(
                 matches!((value).map(|__value| (__value).view()), Some(ValueView::Obj(found)) if Gc::ptr_eq(&found, target)),
                 "round {round}"

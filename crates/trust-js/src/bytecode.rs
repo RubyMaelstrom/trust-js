@@ -3314,7 +3314,7 @@ impl Chunk {
                 && crate::value::is_cacheable_shape(ic.recv_shape)
                 && ic.recv_shape == receiver.shape()
             {
-                receiver.entry_at(ic.slot as usize)?.1
+                crate::value::Element::entry(receiver.entry_at(ic.slot as usize)?.1)
             } else {
                 receiver.get(name)?
             };
@@ -25492,7 +25492,7 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
         let property = if b.props.shape() == site.prototype_shape {
             b.props.property_at(site.prototype_slot as usize)
         } else {
-            b.props.get("prototype")
+            b.props.get_named("prototype")
         };
         match property {
             Some(p) if !p.accessor() => match (p.value()).view() {
@@ -26998,7 +26998,7 @@ fn name_call_error(
     let mut object = object.borrow_mut();
     let unnamed = matches!(object.exotic, crate::value::Exotic::Error(_))
         && matches!(
-            (object.props.get("message").map(crate::value::Property::value)).map(|__value| (__value).view()),
+            (object.props.get("message").map(crate::value::Element::value)).map(|__value| (__value).view()),
             Some(ValueView::Str(message))
                 if crate::callee_name::is_unnamed_message(&message.text(), construct)
         );

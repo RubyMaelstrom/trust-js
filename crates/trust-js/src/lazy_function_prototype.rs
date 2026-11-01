@@ -197,7 +197,7 @@ mod tests {
             function
                 .borrow()
                 .props
-                .get("prototype")
+                .get_named("prototype")
                 .unwrap()
                 .packed
                 .tag()
@@ -338,7 +338,7 @@ mod tests {
             object(engine, name)
                 .borrow()
                 .props
-                .get("prototype")
+                .get_named("prototype")
                 .unwrap()
                 .packed
                 .tag()
@@ -386,7 +386,7 @@ mod tests {
             let word = function
                 .borrow()
                 .props
-                .get("prototype")
+                .get_named("prototype")
                 .unwrap()
                 .packed
                 .bits();
@@ -428,7 +428,7 @@ mod tests {
                 let word = function
                     .borrow()
                     .props
-                    .get("prototype")
+                    .get_named("prototype")
                     .unwrap()
                     .packed
                     .bits();
@@ -442,7 +442,12 @@ mod tests {
                     .unwrap()
                     .as_ptr() as usize;
                 let deferred = edges(cell);
-                let prototype = function.borrow().props.get("prototype").unwrap().value();
+                let prototype = function
+                    .borrow()
+                    .props
+                    .get_named("prototype")
+                    .unwrap()
+                    .value();
                 let materialized = edges(cell);
                 let owner = Gc::as_ptr(&function) as usize;
                 let parent = Gc::as_ptr(&engine.interp.object_proto) as usize;
@@ -587,7 +592,7 @@ mod tests {
                 function
                     .borrow()
                     .props
-                    .get("prototype")
+                    .get_named("prototype")
                     .expect("a prototype"),
             )
         }
@@ -635,7 +640,7 @@ mod tests {
                 let constructor = prototype
                     .borrow()
                     .props
-                    .get("constructor")
+                    .get_named("constructor")
                     .map(Property::value);
                 assert!(
                     matches!((constructor).map(|__value| (__value).view()), Some(ValueView::Obj(c)) if Gc::ptr_eq(&c, &function)),
@@ -687,7 +692,7 @@ mod tests {
         eval(&mut engine, "function F() {} 0");
         let function = object(&mut engine, "F");
         let body = function.borrow();
-        let property = body.props.get("prototype").expect("a prototype");
+        let property = body.props.get_named("prototype").expect("a prototype");
         assert_eq!(property.packed.tag(), PACK_LAZY_PROTO);
         let _copy = unsafe { crate::value::Value::from_bits(property.packed.bits()) };
     }
@@ -704,7 +709,7 @@ mod tests {
                 function
                     .borrow()
                     .props
-                    .get("prototype")
+                    .get_named("prototype")
                     .unwrap()
                     .packed
                     .tag(),

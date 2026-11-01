@@ -138,12 +138,12 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
         props.get_mut("0").unwrap().set_enumerable(false);
         props.get_mut("1").unwrap().set_configurable(false);
         props.get_mut("2").unwrap().set_writable(false);
-        let zero_flags = props.get("0").unwrap().meta;
-        let one_flags = props.get("1").unwrap().meta;
+        let zero_flags = props.get("0").unwrap().as_entry().meta;
+        let one_flags = props.get("1").unwrap().as_entry().meta;
         let shape = props.shape();
         assert_eq!(number(props.shift_dense_array(3, false).unwrap()), 0.0);
-        assert_eq!(props.get("0").unwrap().meta, zero_flags);
-        assert_eq!(props.get("1").unwrap().meta, one_flags);
+        assert_eq!(props.get("0").unwrap().as_entry().meta, zero_flags);
+        assert_eq!(props.get("1").unwrap().as_entry().meta, one_flags);
         assert_eq!(props.get("0").unwrap().number_value(), Some(1.0));
         assert_eq!(props.get("1").unwrap().number_value(), Some(2.0));
         assert!(props.get("2").is_none());
@@ -208,7 +208,7 @@ fn dense_shift_storage_rejections_are_atomic_and_do_not_invalidate_mirrors() {
                 .ordered_keys()
                 .into_iter()
                 .map(|key| {
-                    let p = props.get_key(key).unwrap();
+                    let p = props.get_key(key).unwrap().as_entry();
                     (key, p.packed.0.get(), p.meta)
                 })
                 .collect();
@@ -218,7 +218,7 @@ fn dense_shift_storage_rejections_are_atomic_and_do_not_invalidate_mirrors() {
             let shape = props.shape();
             assert!(props.shift_dense_array(3, false).is_none());
             for (key, bits, meta) in before {
-                let p = props.get_key(key).unwrap();
+                let p = props.get_key(key).unwrap().as_entry();
                 assert_eq!((p.packed.0.get(), p.meta), (bits, meta));
             }
             assert_eq!(
@@ -363,7 +363,7 @@ fn holes_shift_in_packed_storage_once_the_caller_proves_them_absent() {
                 assert!(element.is_none());
             } else {
                 let element = element.unwrap();
-                assert!(element.is_plain_element());
+                assert!(element.as_entry().is_plain_element());
                 assert_eq!(number(element.value()), (n + 1) as f64);
             }
         }

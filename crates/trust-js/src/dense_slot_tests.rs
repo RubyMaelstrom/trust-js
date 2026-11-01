@@ -7,7 +7,7 @@ use crate::value::ValueView;
 use crate::value::{Property, Props, Value};
 use crate::{Completion, Engine};
 
-fn number(prop: Option<&Property>) -> f64 {
+fn number(prop: Option<crate::value::Element<'_>>) -> f64 {
     match (prop.expect("existing property").value()).view() {
         ValueView::Num(n) => n,
         _ => panic!("not numeric"),
@@ -107,10 +107,13 @@ fn dense_slot_mutation_removal_and_reinsertion_keep_sidecar_consistent() {
             } else {
                 let (entry_key, entry) = props.entry_at(props.slot_of(&key).unwrap()).unwrap();
                 assert_eq!(&*entry_key.text(), key);
-                assert_eq!(number(Some(entry)), expected);
+                assert_eq!(number(Some(crate::value::Element::entry(entry))), expected);
             }
         }
-        assert_eq!(number(props.length_property()), 4096.0);
+        assert_eq!(
+            number(props.length_property().map(crate::value::Element::entry)),
+            4096.0
+        );
         assert_eq!(number(props.get("named")), -1.0);
         props.remove_indices_from(100);
         assert!(props.get_mut("100").is_none());
