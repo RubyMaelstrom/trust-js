@@ -2612,6 +2612,9 @@ pub(crate) struct StaticName {
     pub(crate) hops: u16,
     pub(crate) slot: u16,
     pub(crate) lexical: bool,
+    /// The binding is mutable: a store at this address writes it in place (its TDZ checked for a
+    /// lexical one); an immutable binding's stores keep the name cache's path, which throws.
+    pub(crate) mutable: bool,
 }
 
 impl CapInit {
@@ -10225,6 +10228,7 @@ impl Compiler {
                 hops: address.hops,
                 slot: address.slot,
                 lexical: address.lexical,
+                mutable: address.mutable,
             });
         }
         // A runtime lexical record of this function binds it, which `home` reports as None.
@@ -10243,6 +10247,7 @@ impl Compiler {
                 .checked_add(address.hops)?,
             slot: address.slot,
             lexical: address.lexical,
+            mutable: address.mutable,
         })
     }
 
@@ -10306,8 +10311,24 @@ impl Compiler {
             eprintln!("[scope] {} {name}: {result}", head.join(","));
         }
     }
+    /// Give the store or update at name cache `cache` of the free name `name` its static
+    /// address, when it has one and the binding is mutable (Decision 21's step 3).
+    fn note_static_store(&mut self, cache: u32, name: &str) {
+        let address = self.static_name(name).filter(|address| address.mutable);
+        self.name_statics[cache as usize] = address;
+        if scope_log_enabled() {
+            let result = match address {
+                Some(address) => format!("static hops={} slot={}", address.hops, address.slot),
+                None => "dynamic".to_string(),
+            };
+            eprintln!("[scope] store {name}: {result}");
+        }
+    }
+
     fn emit_store_name(&mut self, name: u32) {
         let cache = self.new_name_cache(name, true);
+        let text = self.names[name as usize].clone();
+        self.note_static_store(cache, &text);
         self.emit(Op::StoreNameCached(name, cache));
     }
 
@@ -15890,6 +15911,7 @@ impl Compiler {
                 None => {
                     let n = self.name_idx(name);
                     let c = self.new_name_cache(n, true);
+                    self.note_static_store(c, name);
                     self.emit(Op::UpdateNameCached(n, c, kind));
                     Ok(())
                 }
@@ -17668,6 +17690,16 @@ fn run_vm_inner(
                 })?;
             }
             Op::UpdateNameCached(n, c, kind) => {
+                // The binding a static address names stays the Reference's through ToNumeric.
+                if let Some((record, slot)) = chunk.static_store_target(env, n, c) {
+                    let old = Chunk::static_target_value(&record, slot);
+                    step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |_, v| {
+                        Chunk::static_target_store(&record, slot, v);
+                        Ok(())
+                    })?;
+                    chunk.fill_static_store_cache(i, env, n, c);
+                    continue;
+                }
                 let mut reference = chunk.resolve_name_reference(i, env, n)?;
                 let old = i.read_prepared_reference(&mut reference)?;
                 let _ = chunk.name_ic_fill(i, env, n, c, true);
@@ -17718,7 +17750,13 @@ fn run_vm_inner(
             }
             Op::StoreNameCached(n, c) => {
                 let v = pop!();
-                chunk.store_name_ic(i, env, n, c, v)?;
+                match chunk.static_store_target(env, n, c) {
+                    Some((record, slot)) => {
+                        Chunk::static_target_store(&record, slot, v);
+                        chunk.fill_static_store_cache(i, env, n, c);
+                    }
+                    None => chunk.store_name_ic(i, env, n, c, v)?,
+                }
             }
             Op::ResolveNameRef(name, reference) => {
                 references[reference as usize].set(chunk.resolve_name_reference(i, env, name)?);
@@ -21429,6 +21467,69 @@ impl Chunk {
     #[inline]
     pub(crate) fn name_search_env(&self, env: &Env, c: u32) -> Env {
         self.static_global_env(env, c).unwrap_or(*env)
+    }
+
+    /// Decision 21's step 3: the record holding the mutable binding that the store or update at
+    /// name cache `c` (of the name `n`) writes, `hops` parent links from the running environment
+    /// `env`, and the binding's slot, when the site has a static address and the binding is out
+    /// of its TDZ. `None` leaves the site to the name cache's checked path (which throws in the
+    /// TDZ).
+    #[inline]
+    pub(crate) fn static_store_target(&self, env: &Env, n: u32, c: u32) -> Option<(Env, usize)> {
+        let address = (*self.name_statics.get(c as usize)?)?;
+        debug_assert!(
+            address.mutable,
+            "a store's static address is a mutable binding's"
+        );
+        let mut record = *env;
+        for _ in 0..address.hops {
+            let parent = record.borrow().parent;
+            record = parent.expect("a planned record has its static parents");
+        }
+        let slot = usize::from(address.slot);
+        let initialized = {
+            let scope = record.borrow();
+            debug_assert!(
+                scope
+                    .vars
+                    .keys()
+                    .nth(slot)
+                    .is_some_and(|name| *name.text() == *self.names[n as usize]),
+                "the static address of {:?} names another binding",
+                self.names[n as usize]
+            );
+            scope.vars.fixed_binding_at(slot)?.initialized()
+        };
+        initialized.then_some((record, slot))
+    }
+
+    /// Fill the name cache of the store or update at `c` once, for generated code that probes
+    /// it instead of taking the site's static address (x86-64's stores), as a static read does.
+    #[inline]
+    pub(crate) fn fill_static_store_cache(&self, i: &Interp, env: &Env, n: u32, c: u32) {
+        if self.name_caches[c as usize].get().env == 0 {
+            let _ = self.name_ic_fill(i, env, n, c, true);
+        }
+    }
+
+    /// The value of a static store target's binding ([`Chunk::static_store_target`]).
+    #[inline]
+    pub(crate) fn static_target_value(record: &Env, slot: usize) -> Value {
+        record
+            .borrow()
+            .vars
+            .fixed_binding_at(slot)
+            .expect("a static store target's slot")
+            .value()
+    }
+
+    /// Store `value` at a static store target: the record's mutable borrow is the write barrier
+    /// (`Env::borrow_mut`).
+    #[inline]
+    pub(crate) fn static_target_store(record: &Env, slot: usize, value: Value) {
+        if let Some(mut binding) = record.borrow_mut().vars.fixed_binding_at_mut(slot) {
+            binding.set_value(value);
+        }
     }
 
     /// Decision 21: the value of the free-name read at name cache `c` (of the name `n`), found at
@@ -27014,12 +27115,24 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::UpdateNameCached(n, c, kind) => {
-            let mut reference = chunk.resolve_name_reference(i, env, n)?;
-            let old = i.read_prepared_reference(&mut reference)?;
-            let _ = chunk.name_ic_fill(i, env, n, c, true);
-            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                i.write_prepared_reference(&mut reference, v)
-            })? {
+            // The binding a static address names stays the Reference's through ToNumeric.
+            let result = if let Some((record, slot)) = chunk.static_store_target(env, n, c) {
+                let old = Chunk::static_target_value(&record, slot);
+                let result = step_value(i, &chunk.feedback, pc as usize, kind, old, |_, v| {
+                    Chunk::static_target_store(&record, slot, v);
+                    Ok(())
+                })?;
+                chunk.fill_static_store_cache(i, env, n, c);
+                result
+            } else {
+                let mut reference = chunk.resolve_name_reference(i, env, n)?;
+                let old = i.read_prepared_reference(&mut reference)?;
+                let _ = chunk.name_ic_fill(i, env, n, c, true);
+                step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
+                    i.write_prepared_reference(&mut reference, v)
+                })?
+            };
+            if let Some(v) = result {
                 push!(v);
             }
         }
@@ -27065,7 +27178,13 @@ unsafe fn jit_exec_inner(
         }
         Op::StoreNameCached(n, c) => {
             let v = pop!();
-            chunk.store_name_ic(i, env, n, c, v)?;
+            match chunk.static_store_target(env, n, c) {
+                Some((record, slot)) => {
+                    Chunk::static_target_store(&record, slot, v);
+                    chunk.fill_static_store_cache(i, env, n, c);
+                }
+                None => chunk.store_name_ic(i, env, n, c, v)?,
+            }
         }
         Op::LoadThis => {
             (*sp).write(ctx.this_value());

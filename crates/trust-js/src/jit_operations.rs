@@ -248,6 +248,35 @@ pub(super) fn emit(
                 true,
             );
         }
+        // Decision 21's step 3: a store or update of a mutable binding at a static address.
+        Op::StoreNameCached(_, cache)
+            if fast & 8192 != 0 && static_name(layout, chunk, *cache).is_some() =>
+        {
+            let address = static_name(layout, chunk, *cache).expect("guarded");
+            emit_cap_store(
+                a,
+                layout,
+                address.hops,
+                cap_slot_offset(u32::from(address.slot)),
+                address.lexical,
+                pc as u32,
+                unwind,
+            );
+        }
+        Op::UpdateNameCached(_, cache, kind)
+            if fast & 8192 != 0 && static_name(layout, chunk, *cache).is_some() =>
+        {
+            let address = static_name(layout, chunk, *cache).expect("guarded");
+            emit_cap_update(
+                a,
+                layout,
+                address.hops,
+                cap_slot_offset(u32::from(address.slot)),
+                *kind,
+                pc as u32,
+                unwind,
+            );
+        }
         Op::UpdateNameCached(_, cache, kind)
             if fast & 8192 != 0 && update_name_inlinable(layout) =>
         {
@@ -283,14 +312,22 @@ pub(super) fn emit(
             let (slot, attrs) = fixed_cap(a, chunk, *name).expect("guarded");
             let tdz =
                 matches!(op, Op::StoreCap(_)) && attrs.lexical() && !chunk.jit_cap_initialized(pc);
-            emit_cap_store(a, cap_slot_offset(slot), tdz, pc as u32, unwind);
+            emit_cap_store(a, layout, 0, cap_slot_offset(slot), tdz, pc as u32, unwind);
         }
         Op::UpdateCap(name, kind)
             if fast & 8192 != 0
                 && fixed_cap(a, chunk, *name).is_some_and(|(_, attrs)| attrs.mutable()) =>
         {
             let (slot, _) = fixed_cap(a, chunk, *name).expect("guarded");
-            emit_cap_update(a, cap_slot_offset(slot), *kind, pc as u32, unwind);
+            emit_cap_update(
+                a,
+                layout,
+                0,
+                cap_slot_offset(slot),
+                *kind,
+                pc as u32,
+                unwind,
+            );
         }
         Op::LoadCap(name)
             if fast & 8192 != 0
@@ -1141,11 +1178,26 @@ fn emit_cap_load(a: &mut asm::Asm, offset: u32, tdz: bool, pc: u32, unwind: usiz
 /// operand's word, after the TDZ test of the old word when `tdz`, with the card mark of the
 /// record's start unless the word is a Number (as `bytecode::Chunk::store_cap_ic` and the name
 /// stores do). The binding is mutable (a const's stores are StoreConstCap) or being initialized.
-fn emit_cap_store(a: &mut asm::Asm, offset: u32, tdz: bool, pc: u32, unwind: usize) {
+///
+/// With `hops`, the record is that many parent links from the running environment: a store at a
+/// static address (Decision 21's step 3), to a mutable binding.
+#[allow(clippy::too_many_arguments)]
+fn emit_cap_store(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    hops: u16,
+    offset: u32,
+    tdz: bool,
+    pc: u32,
+    unwind: usize,
+) {
     let slow = a.new_label();
     let done = a.new_label();
     let number = a.new_label();
     a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    for _ in 0..hops {
+        a.ldr_imm(9, 9, layout.scope_parent as u32);
+    }
     if tdz {
         a.ldr_imm(12, 9, offset);
         a.movz(13, 0x7ffa, 3); // PACK_EMPTY
@@ -1176,10 +1228,25 @@ fn emit_cap_store(a: &mut asm::Asm, offset: u32, tdz: bool, pc: u32, unwind: usi
 /// UpdateCap (`++`/`--`) on a fixed slot of the running activation holding a Number: the empty
 /// word (TDZ) and every other non-Number are NaN words, which take the checked path, as do
 /// numeric NaNs (their canonicalization). The binding is mutable.
-fn emit_cap_update(a: &mut asm::Asm, offset: u32, kind: UpdKind, pc: u32, unwind: usize) {
+///
+/// With `hops`, the record is that many parent links from the running environment, as for
+/// [`emit_cap_store`].
+#[allow(clippy::too_many_arguments)]
+fn emit_cap_update(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    hops: u16,
+    offset: u32,
+    kind: UpdKind,
+    pc: u32,
+    unwind: usize,
+) {
     let slow = a.new_label();
     let done = a.new_label();
     a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    for _ in 0..hops {
+        a.ldr_imm(9, 9, layout.scope_parent as u32);
+    }
     a.ldr_d_imm(0, 9, offset);
     a.fcmp(0, 0);
     a.b_cond(C_VS, slow);

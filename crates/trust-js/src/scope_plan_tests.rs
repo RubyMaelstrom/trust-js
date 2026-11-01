@@ -488,3 +488,50 @@ fn a_later_scripts_lexical_shadows_a_global_property_for_global_reads() {
         }
     }
 }
+
+#[test]
+fn stores_and_updates_write_outer_bindings_at_static_addresses() {
+    // Assignments, compound assignments and `++`/`--` of an enclosing function's mutable
+    // bindings write them in place (a `let`'s after its TDZ test; objects through the record's
+    // write barrier); a `const`, a class's own name and a function expression's self-name keep
+    // the checked path, which throws (or ignores the sloppy self-name store). A `valueOf` that
+    // reassigns the variable during `++` does not change which binding the update writes.
+    check(
+        r#"
+        function outer(k) {
+            var count = 0, label = 'a', box = null;
+            let lex = 1;
+            const fixed = 5;
+            var bump = () => { count++; ++count; count--; count += 2; label = label + k; lex *= 2; return count; };
+            var put = (v) => { box = { v, list: [v, v + 1] }; return box; };
+            var konst = () => { try { fixed = 1; return 'no'; } catch (e) { return e.name; } };
+            class C { static m() { try { C = 1; return 'no'; } catch (e) { return e.name; } } }
+            var self = function me() { me = 1; return typeof me; };
+            var strictSelf = function me2() { 'use strict'; try { me2 = 1; return 'no'; } catch (e) { return e.name; } };
+            var tricky = { valueOf() { count = 100; return 7; } };
+            var trick = () => { count = tricky; count++; return count; };
+            for (var i = 0; i < 25; i++) { bump(); put(i); }
+            return [count, label.length, lex, box.v, box.list.join('/'), konst(), C.m(), self(), strictSelf(), trick()].join(',');
+        }
+        function tdzStore(k) {
+            var r = [];
+            var early = () => { late = k; };
+            try { early(); r.push('no'); } catch (e) { r.push(e.name); }
+            let late = 'init';
+            early();
+            r.push(late);
+            var upd = () => ++later;
+            try { upd(); r.push('no'); } catch (e) { r.push(e.name); }
+            let later = 1;
+            r.push(upd(), later);
+            return r.join(',');
+        }
+        var out = [];
+        for (var i = 0; i < 20; i++) out.push(outer(i) + ';' + tdzStore(i));
+        out[0] + '|' + out[19];
+        "#,
+        "75,26,33554432,24,24/25,TypeError,TypeError,function,TypeError,8;ReferenceError,0,\
+         ReferenceError,2,2|75,51,33554432,24,24/25,TypeError,TypeError,function,TypeError,8;\
+         ReferenceError,19,ReferenceError,2,2",
+    );
+}

@@ -53,6 +53,10 @@ pub(crate) struct PlanBinding {
     /// A `let`/`const`/`class` (or `this`, uninitialized in a derived constructor) may be read
     /// before its initialization: a read tests the empty word.
     pub(crate) lexical: bool,
+    /// An assignment may store into it: not a `const` or `using` binding, a class's own name, a
+    /// function expression's self-name or `this`, whose stores keep the checked path that
+    /// throws (or ignores a sloppy self-name store).
+    pub(crate) mutable: bool,
 }
 
 #[derive(Debug)]
@@ -116,6 +120,8 @@ pub(crate) struct OuterAddress {
     pub(crate) hops: u16,
     pub(crate) slot: u16,
     pub(crate) lexical: bool,
+    /// The binding is mutable (`PlanBinding::mutable`): a store may write it in place.
+    pub(crate) mutable: bool,
 }
 
 impl OuterContext {
@@ -131,6 +137,7 @@ impl OuterContext {
                         hops: u16::try_from(hops).ok()?,
                         slot: u16::try_from(slot).ok()?,
                         lexical: record[slot].lexical,
+                        mutable: record[slot].mutable,
                     });
                 }
                 hops += 1;
@@ -205,6 +212,7 @@ fn self_name_record(function: &crate::ast::Function) -> Rc<[PlanBinding]> {
     Rc::from(vec![PlanBinding {
         name: Rc::from(function.name.as_deref().unwrap_or_default()),
         lexical: false,
+        mutable: false,
     }])
 }
 
@@ -213,6 +221,7 @@ fn home_record() -> Rc<[PlanBinding]> {
     Rc::from(vec![PlanBinding {
         name: Rc::from("%homeobject%"),
         lexical: false,
+        mutable: false,
     }])
 }
 
@@ -227,6 +236,7 @@ fn class_records(name: Option<&Rc<str>>) -> [Rc<[PlanBinding]>; 3] {
         Some(name) => Rc::from(vec![PlanBinding {
             name: name.clone(),
             lexical: true,
+            mutable: false,
         }]),
         None => none.clone(),
     };
@@ -296,18 +306,33 @@ fn plan(function: &crate::ast::Function, derived: bool) -> Rc<FunctionPlan> {
     }
     let mut lexicals = crate::fasthash::FastSet::default();
     scan.declare_lexicals(&function.body, &mut lexicals);
+    // The body's immutable top-level lexicals: `const`, `using` and `await using`.
+    let mut immutable = crate::fasthash::FastSet::default();
+    for statement in function.body.iter() {
+        if let Stmt::VarDecl {
+            kind: DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
+            decls,
+        } = statement
+        {
+            for (pattern, _) in decls {
+                pat_idents(pattern, &mut immutable);
+            }
+        }
+    }
     let mut prefix: Vec<PlanBinding> = captured
         .iter()
         .filter(|name| declared.contains(*name) || lexicals.contains(*name))
         .map(|name| PlanBinding {
             name: Rc::from(name.as_str()),
             lexical: lexicals.contains(name) && !declared.contains(name),
+            mutable: !immutable.contains(name),
         })
         .collect();
     if env_this && !function.is_arrow {
         prefix.push(PlanBinding {
             name: Rc::from("this"),
             lexical: true,
+            mutable: false,
         });
     }
     prefix.sort_by(|left, right| left.name.cmp(&right.name));
