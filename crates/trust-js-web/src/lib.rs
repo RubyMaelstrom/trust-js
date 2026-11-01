@@ -1264,9 +1264,14 @@ mod api_tests {
             eval(&mut engine, "__wasmKeptGrow(1); __wasmCallbackCount"),
             "1"
         );
+        // The export alone is kept: no closure names the arrow's `module` or `instance`, so its
+        // activation is private (Decision 21) and `afterGrow` closes over the global record, as
+        // in V8. The Module and Instance wrappers are collected, their roots released and the
+        // module's entry swept; the export's own root keeps the store's instance, its functions
+        // and memory, the memory's buffer, and the import callback the store holds weakly.
         assert_eq!(
             engine.scope(|cx| crate::wasm_ops::test_stats(cx)),
-            [1, 6, 1, 4, 0, 1, 0, 1, 1]
+            [0, 1, 1, 4, 0, 1, 0, 1, 1]
         );
 
         assert_eq!(eval(&mut engine, "__wasmKeptGrow = undefined; 0"), "0");
