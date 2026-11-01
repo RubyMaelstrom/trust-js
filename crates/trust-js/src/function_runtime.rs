@@ -11,9 +11,16 @@ use std::rc::Rc;
 
 const FOREIGN_CACHE_LIMIT: usize = 4;
 
+/// A call's weight in tree-walked backedges toward a function's tier-up. At the default
+/// threshold, 8 calls or 128 backedges in any mix: JSC's proportion, nearly (15 to 1).
+pub(crate) const CALL_WEIGHT: u64 = 16;
+
 pub(crate) struct FunctionRuntime {
     pub(crate) heap: HeapLifetime,
     pub(crate) calls: Cell<u32>,
+    /// Backedges its activations have run on the tree-walker, which spend the same tier-up
+    /// budget as its calls ([`FunctionRuntime::tier_budget_spent`]).
+    pub(crate) backedges: Cell<u32>,
     pub(crate) code: OnceCell<Option<Rc<Chunk>>>,
     pub(crate) code2: OnceCell<Option<Rc<Chunk>>>,
     /// A sloppy body with mapped `arguments` whose chunk keeps its formals in its activation
@@ -33,12 +40,24 @@ impl FunctionRuntime {
         Self {
             heap: active_heap_lifetime(),
             calls: Cell::new(0),
+            backedges: Cell::new(0),
             code: OnceCell::new(),
             code2: OnceCell::new(),
             osr_code: OnceCell::new(),
             fn_maps: OnceCell::new(),
             origin: OnceCell::new(),
         }
+    }
+
+    /// Whether `calls` calls and the tree-walked backedges counted so far have spent a
+    /// `threshold`-call tier-up budget, a call weighing [`CALL_WEIGHT`] backedges. One budget
+    /// for both, as V8's interrupt budget (charged at each JumpLoop by the loop's bytecode
+    /// length, src/interpreter/interpreter-assembler.cc:1179-1256), SpiderMonkey's warm-up
+    /// counter (bumped at entry and at each LoopHead, vm/Interpreter.cpp:2048-2091) and JSC's
+    /// execution counter (15 an entry, 1 a loop iteration, OptionsList.h:369-376) count both.
+    pub(crate) fn tier_budget_spent(&self, calls: u32, threshold: u32) -> bool {
+        u64::from(calls) * CALL_WEIGHT + u64::from(self.backedges.get())
+            > u64::from(threshold) * CALL_WEIGHT
     }
 
     /// Realm specialization remains subordinate to heap ownership. Active frames keep their
@@ -77,6 +96,7 @@ impl std::fmt::Debug for FunctionRuntime {
         f.debug_struct("FunctionRuntime")
             .field("heap", &self.heap)
             .field("calls", &self.calls.get())
+            .field("backedges", &self.backedges.get())
             .field("compiled", &self.code.get().is_some())
             .field("inlined", &self.code2.get().is_some())
             .finish()

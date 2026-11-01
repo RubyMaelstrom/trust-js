@@ -4110,6 +4110,25 @@ fn block_lexical_names(stmts: &[Stmt]) -> Vec<String> {
     out
 }
 
+/// Compile `func` at its tier-up, from its call or from a loop of a call already running
+/// (`loop_fragment::Admission`); `TRUST_JS_TIER_LOG` reports a body that does not compile.
+pub(crate) fn tier_compile(
+    func: &Function,
+    derived_class_construct: bool,
+) -> Option<Rc<crate::bytecode::Chunk>> {
+    let compiled = if derived_class_construct {
+        crate::bytecode::compile_derived_constructor(func)
+    } else {
+        crate::bytecode::compile(func)
+    };
+    if compiled.is_none() && std::env::var_os("TRUST_JS_TIER_LOG").is_some() {
+        let src = func.source.as_deref().unwrap_or("<no source>");
+        let head: String = src.chars().take(70).collect();
+        eprintln!("[tier] bail: {}", head.replace('\n', " "));
+    }
+    compiled
+}
+
 /// BoundNames of a formal parameter list.
 pub(crate) fn param_bound_names(params: &[Param]) -> Vec<String> {
     let mut out = Vec::new();
@@ -16888,22 +16907,16 @@ impl Interp {
             if func.runtime().code.get().is_none() {
                 let n = func.runtime().calls.get().saturating_add(1);
                 func.runtime().calls.set(n);
-                // Cold loop-containing functions obey the same call threshold as other
-                // bodies. A long-running first invocation transfers its already-instantiated
-                // function frame at a settled hot backedge instead of replaying its prologue.
-                // Self-hosted built-ins still compile immediately.
-                if n > self.tier_threshold || func.self_hosted {
-                    let compiled = if derived_class_construct {
-                        crate::bytecode::compile_derived_constructor(func)
-                    } else {
-                        crate::bytecode::compile(func)
-                    };
-                    if compiled.is_none() && std::env::var_os("TRUST_JS_TIER_LOG").is_some() {
-                        let src = func.source.as_deref().unwrap_or("<no source>");
-                        let head: String = src.chars().take(70).collect();
-                        eprintln!("[tier] bail: {}", head.replace('\n', " "));
-                    }
-                    let _ = func.runtime().code.set(compiled);
+                // A function compiles once its calls and the backedges its calls ran on the
+                // tree-walker spend one budget (`FunctionRuntime::tier_budget_spent`); a call
+                // already running leaves the tree-walker at its next loop header then
+                // (`loop_fragment::Admission`), without replaying its prologue. Self-hosted
+                // built-ins still compile immediately.
+                if func.runtime().tier_budget_spent(n, self.tier_threshold) || func.self_hosted {
+                    let _ = func
+                        .runtime()
+                        .code
+                        .set(tier_compile(func, derived_class_construct));
                 }
             }
             if let Some(chunk) = func

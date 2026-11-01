@@ -21,12 +21,14 @@ comment/example in the same change.
 ## Execution tier and JIT diagnostic controls
 
 - `TRUST_JS_TIER=interp|bytecode|jit` selects the tier.
-- `TRUST_JS_TIER_THRESHOLD=N` changes the call threshold for tiering up. Cold ordinary
-  synchronous author functions with loops obey it too; async/generator coroutine bytecode
-  remains eager, and self-hosted methods compile on their first call. A long-running
-  synchronous invocation can tier up after 128 executed
-  backedges without repeating its parameter binding, hoisting or prefix effects. Eligible
-  body-level loops transfer their whole function frame. Captures, mapped arguments and eval
+- `TRUST_JS_TIER_THRESHOLD=N` sets the tier-up budget of ordinary synchronous author
+  functions: N calls, where each backedge the tree-walker runs in a function's own loops
+  counts as a sixteenth of a call (16·N backedges, or any mix); async/generator coroutine
+  bytecode remains eager, and self-hosted methods compile on their first call. Once its
+  function has tiered up, a call still on the tree-walker leaves it at its next loop header,
+  and any loop leaves after 128 backedges of one execution, without repeating its parameter
+  binding, hoisting or prefix effects. Eligible body-level loops transfer their whole function
+  frame; other loops enter a compiled fragment. Captures, mapped arguments and eval
   retain their live environments; unsupported activation projections or active outer author
   cleanup use the existing loop-fragment path. Ordinary/base constructor frames can transfer
   after `this` is initialized; derived constructors retain their contextual fragment path.

@@ -59,7 +59,9 @@ fn check(source: &str, expected: &str, whole_frame: bool) {
 }
 
 #[test]
-fn cold_loop_functions_wait_for_executed_hotness_or_call_threshold() {
+fn cold_loop_functions_wait_for_their_tier_budget() {
+    // One budget for calls and tree-walked backedges: at threshold 32 it is 512 backedges, a
+    // call weighing 16 of them, and each cold(100) runs 100 backedges.
     for tier in [Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -67,18 +69,96 @@ fn cold_loop_functions_wait_for_executed_hotness_or_call_threshold() {
         value(&mut engine, "function cold(n){let sum=0;for(let k=0;k<n;k++)sum+=k;return sum;}function unused(){while(false){}};");
         let cold = function(&mut engine, "cold");
         let unused = function(&mut engine, "unused");
-        for _ in 0..32 {
+        for _ in 0..4 {
             assert_eq!(value(&mut engine, "cold(100)"), "4950");
         }
         assert!(
             cold.runtime().code.get().is_none(),
-            "short loop calls must not trigger compilation"
+            "four short loop calls stay within the budget"
         );
-        assert!(unused.runtime().code.get().is_none());
+        assert_eq!(cold.runtime().backedges.get(), 400);
+        reset_counts();
         assert_eq!(value(&mut engine, "cold(100)"), "4950");
         assert!(
             cold.runtime().code.get().is_some_and(Option::is_some),
-            "call threshold still admits hot functions"
+            "the fifth call's backedges spend it"
+        );
+        assert_eq!(
+            crate::bytecode::TEST_FUNCTION_OSR_ENTRIES.with(|count| count.get()),
+            1,
+            "and that call moves into the compiled function"
+        );
+        for _ in 0..32 {
+            value(&mut engine, "unused()");
+        }
+        assert!(
+            unused.runtime().code.get().is_none(),
+            "calls alone wait for the threshold"
+        );
+        value(&mut engine, "unused()");
+        assert!(unused.runtime().code.get().is_some_and(Option::is_some));
+    }
+}
+
+#[test]
+fn nested_short_loops_spend_their_functions_budget_in_one_call() {
+    // NavierStokes's lin_solve: loops nested in an if/else, none run more than 128 times in
+    // one execution, so no execution reaches its own admission. The first call spends the
+    // budget within its second inner loop, compiles the function and moves the rest of the
+    // call into its loops' fragments; the next call runs compiled.
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(8);
+        value(&mut engine, "function solve(a,n){var s=0;if(a===0){s=-1;}else{for(var k=0;k<4;k++){for(var j=0;j<n;j++){for(var i=0;i<n;i++){s+=i*j+k;}}}}return s;}");
+        let solve = function(&mut engine, "solve");
+        reset_counts();
+        assert_eq!(value(&mut engine, "solve(1,100)"), "98070000");
+        assert!(
+            solve.runtime().code.get().is_some_and(Option::is_some),
+            "{tier:?}: the first call's backedges compile it"
+        );
+        assert!(
+            solve.runtime().backedges.get() < 120,
+            "{tier:?}: and it leaves the tree-walker then ({} backedges)",
+            solve.runtime().backedges.get()
+        );
+        let fragments =
+            crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.get());
+        assert!(
+            (1..=3).contains(&fragments),
+            "{tier:?}: each enclosing loop's fragment takes over the inner ones ({fragments})"
+        );
+        reset_counts();
+        assert_eq!(value(&mut engine, "solve(1,100)"), "98070000");
+        assert_eq!(
+            crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.get()),
+            0,
+            "{tier:?}: the second call runs compiled"
+        );
+    }
+}
+
+#[test]
+fn only_a_functions_own_loops_spend_its_budget() {
+    // A direct eval's loop and a nested function's run in the call too, but they are not the
+    // function's body: neither spends its budget.
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(8);
+        value(&mut engine, "function host(){var s=0;eval('for(var i=0;i<300;i++)s+=i');var inner=function(){for(var j=0;j<300;j++)s+=j;};inner();return s;}function own(){var s=0;for(var i=0;i<100;i++)s+=i;return s;}");
+        let host = function(&mut engine, "host");
+        let own = function(&mut engine, "own");
+        assert_eq!(value(&mut engine, "host()"), "89700");
+        assert_eq!(host.runtime().backedges.get(), 0);
+        assert_eq!(value(&mut engine, "own()"), "4950");
+        assert_eq!(own.runtime().backedges.get(), 100);
+        assert!(own.runtime().code.get().is_none());
+        assert_eq!(value(&mut engine, "own()"), "4950");
+        assert!(
+            own.runtime().code.get().is_some_and(Option::is_some),
+            "{tier:?}: two calls and 200 backedges spend threshold 8's 128"
         );
     }
 }
@@ -459,7 +539,8 @@ fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
     value(&mut engine, "'use strict';function inner(n){return n+1;}function hot(n){let sum=0;for(let k=0;k<n;k++)sum+=inner(k);return sum;}");
     for _ in 0..150 {
         // Each top-level script has no loop and executes on the reference path. The short
-        // callee becomes ordinary native code by call count; it never migrates a loop frame.
+        // callee becomes ordinary native code by its budget (its 22nd call, after 21 calls of
+        // 8 backedges at threshold 32); it never migrates a loop frame.
         assert_eq!(value(&mut engine, "hot(8)"), "36");
     }
     #[cfg(all(
@@ -487,7 +568,7 @@ fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
             .any(|op| matches!(op, crate::bytecode::Op::InlineGuard(..))));
         assert_eq!(
             spliced.jit_runs.get(),
-            18,
+            29,
             "later calls select the published chunk"
         );
     }
@@ -568,17 +649,19 @@ fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
                     );
                     assert_eq!(observation.primary_runs, Some(100));
                 }
-                // The hot function's first32 calls stay on the tree-walker. Both probes
-                // occur after compilation and splice publication: all201/210 calls so far
-                // therefore contain169/178 actual native entries across the two versions.
-                // This includes first cache fills and the epoch refill after publication.
+                // The hot function's first 21 calls stay on the tree-walker: each spends 16
+                // of threshold 32's 512-backedge budget and its loop 8 more, so the 22nd
+                // compiles it. Both probes occur after compilation and splice publication: all
+                // 201/210 calls so far therefore contain 180/189 actual native entries across
+                // the two versions. This includes first cache fills and the epoch refill after
+                // publication.
                 assert_eq!(
                     observations[0].primary_runs.unwrap() + observations[0].spliced_runs.unwrap(),
-                    169
+                    180
                 );
                 assert_eq!(
                     observations[1].primary_runs.unwrap() + observations[1].spliced_runs.unwrap(),
-                    178
+                    189
                 );
                 assert_eq!(
                     observations[1].spliced_runs.unwrap() - observations[0].spliced_runs.unwrap(),

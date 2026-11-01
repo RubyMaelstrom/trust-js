@@ -89,10 +89,29 @@ pub(crate) enum Seed<'a> {
     ForOf(&'a Value, &'a Value),
 }
 
-/// One bounded admission attempt per dynamic loop execution. Failed compilation leaves the
-/// settled AST phase untouched; no source-text or process-global executable cache is involved.
+/// When a tree-walked loop leaves the tree-walker: one bounded admission attempt per dynamic
+/// loop execution. A loop of a function's own body charges each backedge to the function's
+/// tier-up budget, which its calls spend too (`FunctionRuntime::tier_budget_spent`); once the
+/// budget is spent the function compiles, and while it has code a header visit of any of its
+/// tree-walked loops is admitted, so the call moves into the compiled function at a body-level
+/// loop and into the loop's fragment elsewhere. Every loop is also admitted after 128
+/// backedges of one execution, the only rule for a function that does not compile and for code
+/// outside functions. Failed compilation leaves the settled AST phase untouched; no source-text
+/// or process-global executable cache is involved.
 pub(crate) struct Admission {
     remaining: u32,
+    /// The function whose budget this loop spends, while its tier is undecided or compiled.
+    owner: Option<Owner>,
+}
+
+struct Owner {
+    function: Rc<Function>,
+    threshold: u32,
+    /// The call path would compile the function for this activation: not a derived
+    /// constructor's, whose bodies compile apart, nor a closure's under `with`.
+    compiles: bool,
+    /// The next header visit is the loop's first, not an executed backedge.
+    first: bool,
 }
 
 /// Only execution-policy facts are copied. This is not a new ECMAScript execution context:
@@ -125,14 +144,17 @@ impl Context {
 }
 
 impl Admission {
-    pub(crate) fn new(i: &Interp) -> Self {
+    pub(crate) fn new(i: &Interp, site: &LoopSite) -> Self {
+        if matches!(i.tier, Tier::Interp) {
+            return Self {
+                remaining: 0,
+                owner: None,
+            };
+        }
         // The first visit is the initial header, not an executed backedge.
         Self {
-            remaining: if matches!(i.tier, Tier::Interp) {
-                0
-            } else {
-                129
-            },
+            remaining: 129,
+            owner: owner(i, site),
         }
     }
 
@@ -141,9 +163,85 @@ impl Admission {
         if self.remaining == 0 {
             return false;
         }
+        if let Some(owner) = &mut self.owner {
+            if owner.spent() {
+                self.remaining = 0;
+                return true;
+            }
+        }
         self.remaining -= 1;
         self.remaining == 0
     }
+}
+
+impl Owner {
+    /// Count this header visit's backedge; whether the function's budget is spent, compiling
+    /// it the first time, or it already has code.
+    #[inline]
+    fn spent(&mut self) -> bool {
+        let runtime = self.function.runtime();
+        if !std::mem::replace(&mut self.first, false) {
+            runtime
+                .backedges
+                .set(runtime.backedges.get().saturating_add(1));
+        }
+        if let Some(code) = runtime.code.get() {
+            return code.is_some();
+        }
+        if !runtime.tier_budget_spent(runtime.calls.get(), self.threshold) {
+            return false;
+        }
+        drop(runtime);
+        self.tier_up();
+        true
+    }
+
+    #[cold]
+    fn tier_up(&self) {
+        if self.compiles {
+            let runtime = self.function.runtime();
+            if runtime.code.get().is_none() {
+                let _ = runtime
+                    .code
+                    .set(crate::interpreter::tier_compile(&self.function, false));
+            }
+        }
+    }
+}
+
+/// The function whose tree-walked activation runs `site`, when the loop is in that function's
+/// own body: not a direct eval's, nor a Script's that a host runs inside the call. A site
+/// remembers its function after the first ask (`LoopSite::owner`).
+fn owner(i: &Interp, site: &LoopSite) -> Option<Owner> {
+    let frame = i.fn_frames.last()?;
+    let callee = frame.callee();
+    let callee = callee.borrow();
+    let crate::value::Callable::User(user) = &callee.call else {
+        return None;
+    };
+    let function = &user.func;
+    if function.is_async || function.is_generator {
+        return None;
+    }
+    let key = Rc::as_ptr(function) as usize;
+    match site.owner() {
+        0 => {
+            let owned = function_owns_loop(function, site);
+            site.set_owner(if owned { key } else { LoopSite::NO_FUNCTION });
+            if !owned {
+                return None;
+            }
+        }
+        owner if owner != key => return None,
+        _ => {}
+    }
+    Some(Owner {
+        function: Rc::clone(function),
+        threshold: i.tier_threshold,
+        compiles: !(frame.construct && callee.class_kind == crate::value::CLASS_DERIVED)
+            && !user.env.borrow().under_with(),
+        first: true,
+    })
 }
 
 /// Called only after Admission::ready at an exact settled phase. An error before commitment

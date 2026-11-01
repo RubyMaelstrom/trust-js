@@ -15,7 +15,10 @@ pub struct LoopSite {
 
 #[derive(Debug, Default)]
 pub(crate) struct LoopSiteToken {
-    _identity: u8,
+    /// The Function whose body holds the loop (its `Rc::as_ptr`), [`LoopSite::NO_FUNCTION`]
+    /// for code outside every function, 0 until a tree-walked run in a function's frame first
+    /// asks (`loop_fragment::Admission`).
+    owner: std::cell::Cell<usize>,
 }
 
 impl Clone for LoopSite {
@@ -31,6 +34,18 @@ impl LoopSite {
 
     pub(crate) fn retained_token(&self) -> Option<&Rc<LoopSiteToken>> {
         self.token.get()
+    }
+
+    /// [`LoopSite::owner`]'s value for a loop of a Script, module or eval body, which no
+    /// function's budget counts.
+    pub(crate) const NO_FUNCTION: usize = 1;
+
+    pub(crate) fn owner(&self) -> usize {
+        self.token().owner.get()
+    }
+
+    pub(crate) fn set_owner(&self, owner: usize) {
+        self.token().owner.set(owner);
     }
 }
 

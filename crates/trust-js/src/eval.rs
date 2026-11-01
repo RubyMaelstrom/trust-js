@@ -1162,7 +1162,7 @@ impl Interp {
         labels: &[&str],
     ) -> Completion {
         use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
-        let mut admission = Admission::new(self);
+        let mut admission = Admission::new(self, site);
         self.run_loop(labels, env, |me, env, completion| {
             if admission.ready() {
                 if let Some(result) = enter(
@@ -1196,7 +1196,7 @@ impl Interp {
     ) -> Completion {
         use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
         let mut first = true;
-        let mut admission = Admission::new(self);
+        let mut admission = Admission::new(self, site);
         self.run_loop(labels, env, |me, env, completion| {
             // DoWhileLoopEvaluation evaluates the condition exactly once after a body that
             // completes normally or continues this loop. run_loop handles both completions
@@ -1436,7 +1436,7 @@ impl Interp {
         };
         let mut first = true;
         use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
-        let mut admission = Admission::new(self);
+        let mut admission = Admission::new(self, site);
         self.run_loop(labels, loop_env, |me, _env, completion| {
             if !first {
                 if !per_iter.is_empty() {
@@ -1628,7 +1628,7 @@ impl Interp {
             // `value` getter throwing) marks the iterator done: it is NOT closed.
             let mut step_failed = false;
             let mut transferred = false;
-            let mut admission = Admission::new(self);
+            let mut admission = Admission::new(self, site);
             let result = self.run_loop(labels, env, |me, env, completion| {
                 if admission.ready() {
                     if let Some(result) = enter(
@@ -1674,7 +1674,7 @@ impl Interp {
         let items = self.for_in_keys(&rhs)?;
         let mut idx = 0;
         use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
-        let mut admission = Admission::new(self);
+        let mut admission = Admission::new(self, site);
         self.run_loop(labels, env, |me, env, completion| {
             if admission.ready() {
                 if let Some(result) = enter(
