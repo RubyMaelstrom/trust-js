@@ -438,3 +438,68 @@ fn loop_latch_repeated_polls_gc_and_deadline_preserve_local_frame_owner() {
         )
     });
 }
+
+/// Decision 21: a loop's bound or operand read from an enclosing function's binding has a static
+/// address, and the loop's preamble pins it from there, as V8's LdaContextSlot reads a context
+/// slot. Its name cache, which code compiled straight from the tree-walker never fills, is not
+/// consulted: NavierStokes's solvers (`for (var i = 1; i <= width; i++)` in FluidField's
+/// closures) left the numeric loop on every entry while the preamble probed it. Each entry reads
+/// the binding's current value, a non-Number binding runs the original loop, and a dead-zone
+/// binding throws ReferenceError (a declarative record's GetBindingValue, spec.html:10887,
+/// e28783d5).
+#[test]
+fn loop_preambles_pin_enclosing_bindings_at_their_static_addresses() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            let warm = eval(
+                &mut engine,
+                r#"
+                function Field(w) {
+                    var width = w, scale = 0.5;
+                    function sum(x) { var s = 0; for (var i = 0; i < width; i++) s += x[i] * scale; return s; }
+                    return { sum: sum, grow: function () { width++; }, text: function () { width = '4'; } };
+                }
+                var data = [];
+                for (var k = 0; k < 64; k++) data.push(k);
+                var field = Field(10);
+                var warm = 0;
+                for (var k = 0; k < 20; k++) warm += field.sum(data);
+                function tdz() {
+                    var r;
+                    function inner() { var s = 0; for (var i = 0; i < lim; i++) s += i; return s; }
+                    try { r = inner(); } catch (e) { r = e.name; }
+                    let lim = 3;
+                    return r + ':' + inner();
+                }
+                var dead = [];
+                for (var k = 0; k < 20; k++) dead.push(tdz());
+                warm + ',' + dead[0] + ',' + dead[19];
+                "#,
+            );
+            assert_eq!(
+                warm, "450,ReferenceError:3,ReferenceError:3",
+                "{tier:?}/{threshold}"
+            );
+            reset_entries();
+            assert_eq!(
+                eval(&mut engine, "field.sum(data)"),
+                "22.5",
+                "{tier:?}/{threshold}"
+            );
+            assert_entered(tier);
+            assert_eq!(
+                eval(&mut engine, "field.grow(); field.sum(data)"),
+                "27.5",
+                "{tier:?}/{threshold}"
+            );
+            assert_eq!(
+                eval(&mut engine, "field.text(); field.sum(data)"),
+                "3",
+                "{tier:?}/{threshold}"
+            );
+        }
+    }
+}

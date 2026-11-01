@@ -15642,7 +15642,8 @@ enum ChainOp {
     /// realm's global environment, whose search the cache then describes.
     LoadName(usize, Option<u16>),
     /// A free-name read at a static address (Decision 21) that must hold a Num; straight-line
-    /// chains only (loop preambles pin names by their caches).
+    /// chains only (a loop keeps `LoadName`, keyed by the cache cell, and its preamble loads the
+    /// pin from `NamePlan::address`).
     StaticName(crate::bytecode::StaticName),
     /// Monomorphic shape-validated property read whose live value must be a Num. `u32::MAX`
     /// denotes the frame's `this` binding; every other value is a local-slot byte offset.
@@ -17193,11 +17194,11 @@ struct LoopPlan {
     conv_reuse: Vec<((usize, u8), u32)>,
     /// Per SetElem chain idx: the stored value is a proven exact-i32 (mirror flag upkeep).
     setelem_i32: crate::fasthash::FastMap<usize, bool>,
-    /// Cached free names read in the region, pinned once in the preamble. The region is
-    /// helper-free and its op vocabulary writes only locals and elements, so a name binding
-    /// cannot change while the loop spins: one validation covers every iteration (loop bounds
-    /// are typically closure vars — `i < width` — and paid a full name-IC probe per iteration
-    /// as plain chains).
+    /// Free names read in the region, cached or at static addresses, pinned once in the
+    /// preamble. The region is helper-free and its op vocabulary writes only locals and
+    /// elements, so a name binding cannot change while the loop spins: one validation covers
+    /// every iteration (loop bounds are typically closure vars — `i < width` — and paid a full
+    /// name-IC probe per iteration as plain chains).
     names: Vec<NamePlan>,
     /// Some pin drew from x23-x28 (callee-saved): the loop brackets itself with save/restore
     /// pairs — a preamble spill, and a reload on every exit and bail path.
@@ -17209,10 +17210,15 @@ struct LoopPlan {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 struct NamePlan {
-    /// The `NameIc` cell address (`Chunk::jit_name_cache_ptr`).
+    /// The `NameIc` cell address (`Chunk::jit_name_cache_ptr`): the pin's key, and the cache
+    /// the preamble validates when the read has no static address.
     ptr: usize,
     /// A static global's records from the running environment (`ChainOp::LoadName`).
     global: Option<u16>,
+    /// The read's static address (Decision 21): the preamble loads the binding through `hops`
+    /// parent links, as `ChainOp::StaticName` does, and never consults the cache, which code
+    /// compiled straight from the tree-walker leaves empty.
+    address: Option<crate::bytecode::StaticName>,
     /// f64 home in a d-register (allocated from the same d8..d15 bank as `SlotRes::F`).
     dreg: u32,
     /// Preamble adds the one-time exact-int proof (the name feeds a key or bit op).
@@ -17324,6 +17330,9 @@ fn plan_loop(
     let mut exit_pc = None;
     let mut cond_len = None;
     let mut initialization_guards = Vec::new();
+    // Each pinned name's static address (Decision 21), by its cache cell.
+    let mut name_statics: crate::fasthash::FastMap<usize, crate::bytecode::StaticName> =
+        Default::default();
     let mut pc = head;
     while pc < jump_pc {
         if let Some(slot) = local_read_discard_pair(ops, pc, targeted) {
@@ -17382,14 +17391,17 @@ fn plan_loop(
             Op::Pop if vdepth >= 1 => (ChainOp::Pop, 0, 1),
             Op::Dup if vdepth >= 1 => (ChainOp::Dup, 1, 0),
             Op::ToPropKeyLocal(_) if vdepth >= 1 => (ChainOp::KeyNop, 0, 0),
-            Op::LoadName(_, c) if name_ok => (
-                ChainOp::LoadName(
-                    chunk.jit_name_cache_ptr(*c),
-                    operations::static_global(layout, chunk, *c),
-                ),
-                1,
-                0,
-            ),
+            Op::LoadName(_, c) if name_ok => {
+                let ptr = chunk.jit_name_cache_ptr(*c);
+                if let Some(address) = operations::static_name(layout, chunk, *c) {
+                    name_statics.insert(ptr, address);
+                }
+                (
+                    ChainOp::LoadName(ptr, operations::static_global(layout, chunk, *c)),
+                    1,
+                    0,
+                )
+            }
             Op::Lt
             | Op::Gt
             | Op::Le
@@ -18276,6 +18288,7 @@ fn plan_loop(
             NamePlan {
                 ptr,
                 global: name_globals.get(&ptr).copied().flatten(),
+                address: name_statics.get(&ptr).copied(),
                 dreg,
                 int_checked: int_checked_names.contains(&ptr),
             }
@@ -18712,8 +18725,26 @@ fn emit_loop_chain(
     // Binding/Property owner result in addition to x9-x17. Large regions can legitimately assign
     // a resident local to x7, so reversing this order would silently overwrite that local.
     for np in &plan.names {
-        emit_name_ic_value_ptr_from(a, layout, np.ptr, np.global, pre_fail);
-        a.ldur(9, 14, 0);
+        match np.address {
+            Some(address) => {
+                // `hops` parent links, then the slot's word, as `ChainOp::StaticName` loads it:
+                // a TDZ binding's empty word fails the Num guard, and the original loop's read
+                // throws.
+                a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+                for _ in 0..address.hops {
+                    a.ldr_imm(9, 9, layout.scope_parent as u32);
+                }
+                a.ldr_imm(
+                    9,
+                    9,
+                    (crate::interpreter::RECORD_HEADER + 8 * usize::from(address.slot)) as u32,
+                );
+            }
+            None => {
+                emit_name_ic_value_ptr_from(a, layout, np.ptr, np.global, pre_fail);
+                a.ldur(9, 14, 0);
+            }
+        }
         emit_exec_number_guard(a, 9, np.dreg, 10, pre_fail);
         if np.int_checked {
             a.fcvtzs_w_d(9, np.dreg);
