@@ -7280,6 +7280,22 @@ fn function_osr_sites(body: &[Stmt]) -> Vec<usize> {
     sites
 }
 
+/// Whether `site` is a loop among the body's own statements, labeled or not.
+fn body_level_osr_site(body: &[Stmt], site: usize) -> bool {
+    body.iter().any(|statement| {
+        let mut statement = statement;
+        while let Stmt::Labeled { body, .. } = statement {
+            statement = body;
+        }
+        match statement {
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+                std::ptr::eq(&body.site, site as *const LoopSite)
+            }
+            _ => false,
+        }
+    })
+}
+
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
@@ -16532,15 +16548,25 @@ pub(crate) fn try_function_osr(
         return Ok(None);
     }
     // A compiled body has an entry at each site it admits (record_function_osr_address), and
-    // none at a direct eval's loop; before it compiles, only a site it will admit compiles it.
+    // none at a direct eval's loop. Before the function's budget compiles it (Admission), one
+    // execution's 128 backedges compile it here at a body-level loop, and at a nested one only
+    // while it is one size unit (`Function::tier_units`); a larger function's nested loop takes
+    // a fragment, which compiles that loop alone, until its budget says the whole is worth it.
     if function.runtime().code.get().is_none() {
-        if !function_osr_sites(&function.body).contains(&address) {
+        if !body_level_osr_site(&function.body, address)
+            && !(function.tier_units() == 1
+                && function_osr_sites(&function.body).contains(&address))
+        {
             return Ok(None);
         }
         let _ = function
             .runtime()
             .code
-            .set(crate::interpreter::tier_compile(&function, false));
+            .set(crate::interpreter::tier_compile(
+                &function,
+                false,
+                "loop transfer",
+            ));
     }
     let runtime = function.runtime();
     let Some(baseline) = runtime.code.get().and_then(Option::as_ref) else {

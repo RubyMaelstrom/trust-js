@@ -179,6 +179,42 @@ fn loops_under_for_of_try_and_switch_keep_their_fragments() {
 }
 
 #[test]
+fn a_large_functions_budget_scales_with_its_size() {
+    // V8 sizes a function's budget by its bytecode length: a large function, dearer to
+    // compile, waits for more loop work. Each call below runs 202 backedges in loops nested in
+    // an if; the 20 KB function is 4 size units, so a call weighs 64 of its 512 backedges.
+    let pad = "x".repeat(20_000);
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(8);
+        let body = "var s=0;if(n>0){for(var j=0;j<2;j++){for(var i=0;i<100;i++)s+=i;}}return s;";
+        value(
+            &mut engine,
+            &format!("function big(n){{var pad='{pad}';{body}}}function small(n){{{body}}}"),
+        );
+        let big = function(&mut engine, "big");
+        let small = function(&mut engine, "small");
+        assert_eq!(big.tier_units(), 4);
+        assert_eq!(small.tier_units(), 1);
+        assert_eq!(value(&mut engine, "big(1)+':'+small(1)"), "9900:9900");
+        assert!(
+            small.runtime().code.get().is_some_and(Option::is_some),
+            "{tier:?}: one call's 202 backedges spend a small function's 128"
+        );
+        assert!(
+            big.runtime().code.get().is_none(),
+            "{tier:?}: but not a 20 KB function's 512"
+        );
+        assert_eq!(value(&mut engine, "big(1)"), "9900");
+        assert!(
+            big.runtime().code.get().is_some_and(Option::is_some),
+            "{tier:?}: its second call's do"
+        );
+    }
+}
+
+#[test]
 fn only_a_functions_own_loops_spend_its_budget() {
     // A direct eval's loop and a nested function's run in the call too, but they are not the
     // function's body: neither spends its budget.

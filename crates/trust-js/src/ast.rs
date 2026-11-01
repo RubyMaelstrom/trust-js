@@ -5,6 +5,10 @@ use std::rc::Rc;
 
 pub type P<T> = Box<T>;
 
+/// The bytes of source (or snapshot encoding) one unit of a function's tier-up budget stands
+/// for (`Function::tier_units`): functions under twice this keep the unscaled budget.
+pub(crate) const TIER_UNIT_BYTES: usize = 4096;
+
 /// Optimization identity owned by one immutable loop syntax node. Cold sites allocate nothing.
 /// A deep AST clone is a new site; Rc<Function> sharing naturally preserves the original site.
 /// Snapshot codecs deliberately omit this execution-only state.
@@ -679,6 +683,13 @@ impl FunctionBody {
             Some(stmts) => f(stmts),
             None => f(&self.decode()),
         }
+    }
+
+    /// The length of the body's snapshot encoding, materialized or not; `None` for a parsed or
+    /// eagerly decoded body.
+    #[inline]
+    pub(crate) fn encoded_len(&self) -> Option<usize> {
+        self.encoded.map(<[u8]>::len)
     }
 
     /// The snapshot bytes of a body that is still encoded: an identity that every decode of
@@ -1515,6 +1526,20 @@ impl Expr {
 }
 
 impl Function {
+    /// The function's size in the tier-up budget's units of [`TIER_UNIT_BYTES`] (its source
+    /// text, or the body's snapshot encoding), at least 1. Compiling costs in proportion to a
+    /// function's size, so a large function waits for proportionally more loop work, as V8's
+    /// interrupt budget is a number of invocations times the function's bytecode length
+    /// (src/execution/tiering-manager.cc:187-190, 268-291).
+    #[inline]
+    pub(crate) fn tier_units(&self) -> u64 {
+        let bytes = match &self.source {
+            Some(source) => source.len(),
+            None => self.body.encoded_len().unwrap_or(0),
+        };
+        (bytes / TIER_UNIT_BYTES).max(1) as u64
+    }
+
     #[inline]
     /// The runtime ScriptOrModule shared by this function's primary-heap closures, if any.
     pub(crate) fn shared_origin(&self) -> Option<&crate::agent_control::RuntimeOrigin> {

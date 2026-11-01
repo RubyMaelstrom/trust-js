@@ -107,6 +107,8 @@ pub(crate) struct Admission {
 struct Owner {
     function: Rc<Function>,
     threshold: u32,
+    /// The function's size in tier-up units (`Function::tier_units`).
+    units: u64,
     /// The call path would compile the function for this activation: not a derived
     /// constructor's, whose bodies compile apart, nor a closure's under `with`.
     compiles: bool,
@@ -188,7 +190,7 @@ impl Owner {
         if let Some(code) = runtime.code.get() {
             return code.is_some();
         }
-        if !runtime.tier_budget_spent(runtime.calls.get(), self.threshold) {
+        if !runtime.tier_budget_spent(runtime.calls.get(), self.threshold, self.units) {
             return false;
         }
         drop(runtime);
@@ -201,9 +203,11 @@ impl Owner {
         if self.compiles {
             let runtime = self.function.runtime();
             if runtime.code.get().is_none() {
-                let _ = runtime
-                    .code
-                    .set(crate::interpreter::tier_compile(&self.function, false));
+                let _ = runtime.code.set(crate::interpreter::tier_compile(
+                    &self.function,
+                    false,
+                    "loop budget",
+                ));
             }
         }
     }
@@ -238,6 +242,7 @@ fn owner(i: &Interp, site: &LoopSite) -> Option<Owner> {
     Some(Owner {
         function: Rc::clone(function),
         threshold: i.tier_threshold,
+        units: function.tier_units(),
         compiles: !(frame.construct && callee.class_kind == crate::value::CLASS_DERIVED)
             && !user.env.borrow().under_with(),
         first: true,

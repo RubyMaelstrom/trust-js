@@ -23,13 +23,16 @@ comment/example in the same change.
 - `TRUST_JS_TIER=interp|bytecode|jit` selects the tier.
 - `TRUST_JS_TIER_THRESHOLD=N` sets the tier-up budget of ordinary synchronous author
   functions: N calls, where each backedge the tree-walker runs in a function's own loops
-  counts as a sixteenth of a call (16·N backedges, or any mix); async/generator coroutine
-  bytecode remains eager, and self-hosted methods compile on their first call. Once its
-  function has tiered up, a call still on the tree-walker leaves it at its next loop header,
-  and any loop leaves after 128 backedges of one execution, without repeating its parameter
-  binding, hoisting or prefix effects. A for, while or do-while loop the body reaches through
-  blocks, ifs, labels and other such loops transfers the whole function frame; a loop under
-  try, catch, finally, switch, with, for-in or for-of enters a compiled fragment. Captures,
+  counts as a sixteenth of a call (16·N backedges, or any mix). A function of 8 KB or more of
+  source (or snapshot encoding) needs proportionally more backedges, 16·N per 4 KB, as V8
+  scales its budget by bytecode length. Async/generator coroutine bytecode remains eager, and
+  self-hosted methods compile on their first call. Once its function has tiered up, a call
+  still on the tree-walker leaves it at its next loop header, and any loop leaves after 128
+  backedges of one execution, without repeating its parameter binding, hoisting or prefix
+  effects. A for, while or do-while loop the body reaches through blocks, ifs, labels and other
+  such loops transfers the whole function frame (before its budget is spent, a function of
+  8 KB or more transfers only at its body-level loops); a loop under try, catch, finally,
+  switch, with, for-in or for-of enters a compiled fragment. Captures,
   mapped arguments and eval
   retain their live environments; unsupported activation projections or active outer author
   cleanup use the existing loop-fragment path. Ordinary/base constructor frames can transfer
@@ -45,7 +48,8 @@ comment/example in the same change.
   skips that delay once admitted to bytecode: "first run" means its first VM/native-admission
   invocation, after the call threshold or live-frame transfer, not its first JavaScript call.
   Borrowed Script/loop-fragment entries use their own executed-backedge/work admission policy.
-  `TRUST_JS_TIER_LOG=1` reports each native compile.
+  `TRUST_JS_TIER_LOG=1` reports each native compile, and each bytecode tier-up compile with its
+  reason (calls, loop budget or loop transfer).
 - `TRUST_JS_INLINE_AT=N` changes the speculative inline recompile threshold (default:
   100 machine-code runs); zero disables inlining.
 - `TRUST_JS_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls and constructions (the inline

@@ -4111,20 +4111,30 @@ fn block_lexical_names(stmts: &[Stmt]) -> Vec<String> {
 }
 
 /// Compile `func` at its tier-up, from its call or from a loop of a call already running
-/// (`loop_fragment::Admission`); `TRUST_JS_TIER_LOG` reports a body that does not compile.
+/// (`loop_fragment::Admission`), for `reason`; `TRUST_JS_TIER_LOG` reports each compile and
+/// each body that does not compile.
 pub(crate) fn tier_compile(
     func: &Function,
     derived_class_construct: bool,
+    reason: &str,
 ) -> Option<Rc<crate::bytecode::Chunk>> {
     let compiled = if derived_class_construct {
         crate::bytecode::compile_derived_constructor(func)
     } else {
         crate::bytecode::compile(func)
     };
-    if compiled.is_none() && std::env::var_os("TRUST_JS_TIER_LOG").is_some() {
+    if std::env::var_os("TRUST_JS_TIER_LOG").is_some() {
         let src = func.source.as_deref().unwrap_or("<no source>");
         let head: String = src.chars().take(70).collect();
-        eprintln!("[tier] bail: {}", head.replace('\n', " "));
+        let name = func.name.as_deref().unwrap_or("<anon>");
+        match &compiled {
+            Some(chunk) => eprintln!(
+                "[tier] compile ({reason}): {name}, {} ops: {}",
+                chunk.jit_ops().len(),
+                head.replace('\n', " ")
+            ),
+            None => eprintln!("[tier] bail: {}", head.replace('\n', " ")),
+        }
     }
     compiled
 }
@@ -16912,11 +16922,16 @@ impl Interp {
                 // already running leaves the tree-walker at its next loop header then
                 // (`loop_fragment::Admission`), without replaying its prologue. Self-hosted
                 // built-ins still compile immediately.
-                if func.runtime().tier_budget_spent(n, self.tier_threshold) || func.self_hosted {
-                    let _ = func
-                        .runtime()
-                        .code
-                        .set(tier_compile(func, derived_class_construct));
+                if func
+                    .runtime()
+                    .tier_budget_spent(n, self.tier_threshold, func.tier_units())
+                    || func.self_hosted
+                {
+                    let _ = func.runtime().code.set(tier_compile(
+                        func,
+                        derived_class_construct,
+                        "calls",
+                    ));
                 }
             }
             if let Some(chunk) = func

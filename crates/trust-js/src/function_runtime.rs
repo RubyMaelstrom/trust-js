@@ -11,8 +11,9 @@ use std::rc::Rc;
 
 const FOREIGN_CACHE_LIMIT: usize = 4;
 
-/// A call's weight in tree-walked backedges toward a function's tier-up. At the default
-/// threshold, 8 calls or 128 backedges in any mix: JSC's proportion, nearly (15 to 1).
+/// A call's weight in tree-walked backedges toward the tier-up of a function of one size unit
+/// (`Function::tier_units`). At the default threshold, 8 calls or 128 backedges in any mix:
+/// JSC's proportion, nearly (15 to 1).
 pub(crate) const CALL_WEIGHT: u64 = 16;
 
 pub(crate) struct FunctionRuntime {
@@ -50,14 +51,17 @@ impl FunctionRuntime {
     }
 
     /// Whether `calls` calls and the tree-walked backedges counted so far have spent a
-    /// `threshold`-call tier-up budget, a call weighing [`CALL_WEIGHT`] backedges. One budget
-    /// for both, as V8's interrupt budget (charged at each JumpLoop by the loop's bytecode
-    /// length, src/interpreter/interpreter-assembler.cc:1179-1256), SpiderMonkey's warm-up
-    /// counter (bumped at entry and at each LoopHead, vm/Interpreter.cpp:2048-2091) and JSC's
-    /// execution counter (15 an entry, 1 a loop iteration, OptionsList.h:369-376) count both.
-    pub(crate) fn tier_budget_spent(&self, calls: u32, threshold: u32) -> bool {
-        u64::from(calls) * CALL_WEIGHT + u64::from(self.backedges.get())
-            > u64::from(threshold) * CALL_WEIGHT
+    /// `threshold`-call tier-up budget, a call of a function of `units` size units
+    /// (`Function::tier_units`) weighing `units` × [`CALL_WEIGHT`] backedges. One budget for
+    /// both, as V8's interrupt budget (charged at each JumpLoop by the loop's bytecode length,
+    /// src/interpreter/interpreter-assembler.cc:1179-1256), SpiderMonkey's warm-up counter
+    /// (bumped at entry and at each LoopHead, vm/Interpreter.cpp:2048-2091) and JSC's
+    /// execution counter (15 an entry, 1 a loop iteration, OptionsList.h:369-376) count both;
+    /// scaled by size as V8's is, so a large function, which costs more to compile, waits for
+    /// more loop work, and a call counts as one call at any size.
+    pub(crate) fn tier_budget_spent(&self, calls: u32, threshold: u32, units: u64) -> bool {
+        let call = CALL_WEIGHT * units;
+        u64::from(calls) * call + u64::from(self.backedges.get()) > u64::from(threshold) * call
     }
 
     /// Realm specialization remains subordinate to heap ownership. Active frames keep their
