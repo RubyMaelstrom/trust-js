@@ -524,7 +524,7 @@ fn native_name_overwrites_do_not_read_displaced_bigints_or_deferred_words() {
             );
             // Install a property-only word directly to prove that a numeric PutValue never
             // observes/materializes the value it displaces. Ordinary reads still guard it.
-            let mut property = global.borrow().props.get("outer").unwrap().clone();
+            let mut property = global.borrow().props.get_named("outer").unwrap().clone();
             property.defer_function_prototype(&owner, engine.interp.object_proto, &template);
             // Reinsert the same descriptor class: a mutable descriptor escape would demote
             // the shape and test a semantic IC miss rather than the displaced-word guard.
