@@ -5149,3 +5149,100 @@ load/store and add offsets masked as well (target/p2/w2c/maskcmp.py), React's ch
 sites (6 of 12) and Djot's (72 of 163) differ, and all but two shrink (67,602 to 66,687 and
 676,596 to 675,862 words); Djot's two longer chunks grew in every instruction kind, calls included
 (another compile's content, not a template's).
+
+### W2c step 3: words for every object; no slot map, mirror or sidecar (design, 2026-11-01)
+
+The owner's decision (2026-11-01), revisiting open question 7: ordinary objects get element words
+as arrays do, as V8, SpiderMonkey and JSC give every object element storage. The question came
+back with step 3 because the classic slot map is what gives an ordinary object with integer keys
+(`{0: 7, 1: 8}`) inline element reads, stores, `in` and updates in ARM64 generated code today
+(jit_update_elem_tests.rs:105, jit_native_operations_tests.rs:415 and jit_count_guard_tests.rs:43
+assert they stay native); keeping those keys in the named entries would have sent them to the
+helpers.
+
+Step 2 left the classic storage beside the words, on paths the census finds almost no live data
+on: at each workload's largest collection chai keeps 286 objects with a slot map (4.4 KB) and a
+mirror (4.4 KB), almost all of them frozen ones, Djot 8 objects (4.7 KB of slot map), the others
+none; no array keeps either (target/p2/w2c/census, c1fe1a65). What still uses them:
+- The classic slot map (DenseBuffers.elems: index to named-entry slot, NO_SLOT a hole) finds an
+  index key in the named entries: every index key of an ordinary object, an array's non-plain or
+  far elements, a frozen array's elements (freeze_descriptors moves its words there), and every
+  element under the TRUST_JS_DENSE_ELEMENTS=0 ablation.
+- The numeric mirror (DenseBuffers.mirror, Props::mirror_flags and mirror_holes) shadows the slot
+  map's Number elements for the ARM64 templates' classic read paths, which also chase the slot map
+  to the entry and test its descriptor (51 instructions a read against 33 through words).
+- The sidecar (DenseBuffers) carries both and the named-key index.
+
+The exemplars keep the indices outside their dense storage in a hash table: V8's
+NumberDictionary, SpiderMonkey's shape table (an `Indexed` object's sparse indices are ordinary
+properties), JSC's SparseArrayValueMap; and all three keep an ordinary object's dense indices in
+the same element storage as an array's (V8's JSObject elements, SpiderMonkey's NativeObject
+dense elements, JSC's butterfly), without a `length`.
+
+Design:
+1. Words for every map: a word is a plain data element and the rules are step 2's (a non-plain
+   element, an index past the sparse frontier, 256 for now and step 6's limit, and a frozen
+   object's elements live in the named entries). For a non-array nothing couples the words to a
+   `length`: appends, `length` and the array builtins' storage paths stay Array-only (elem_mode).
+   Which maps that reaches (the survey of the exotic kinds): ordinary objects (plain objects,
+   functions, the global object, DataView and ArrayBuffer), Map and Set, the primitive wrappers,
+   errors and iterators, arguments objects (already words; a mapped one's parameter aliases stay
+   in its exotic methods) and ForInKeys. String wrappers keep their characters as named entries
+   (non-writable, non-configurable, so never words), their indices past the length are ordinary.
+   Typed arrays, proxies, module namespaces, Web IDL indexed hosts and document.all intercept
+   index keys before the map, so they never hold one.
+2. Lookup. Props::find stops consulting a slot map: an index key in the named entries is found as
+   any key is (the shared layout's index, the map's own index past INDEX_THRESHOLD keys, else a
+   scan of at most eight), and `has_far` comes to mean SpiderMonkey's `Indexed`: some index key
+   lives in the named entries, on any map. While it is clear, an index key that is not a word is
+   absent with no lookup (find's and get_key's shortcut today). should_build_index counts index
+   keys like any other, so a frozen array's elements are a hash probe, not a scan.
+3. Prototype and indexed proofs. The proofs that a chain holds no index key
+   (array_prototypes_unshadowed, read by the elided `arguments` reads, the searches, shift,
+   unshift, push, fill, the iterators and spread) already read words and named index entries
+   alike (Props::indexed_properties), and a word added to a marked prototype bumps the creation
+   epoch through insert's note_structural, so they stay sound when Object.prototype or a class
+   prototype keeps words. The named read cache could not see words: a canonical index name never
+   fills it now (c294f96b, which fixed `const {"0": v} = ["a"]` reading a prototype's element in
+   the bytecode and JIT tiers).
+   Object-literal templates place their values by named position (instantiate_plain), so a
+   literal with an index key (`{"0": a, b: 1}`) stops qualifying for one and builds its keys one
+   by one.
+4. Shapes: index keys leave the shapes of ordinary objects, as they already have for arrays'
+   (shape transitions track named keys only): `{0: 1, a: 2}` and `{a: 2}` share `a`'s slot.
+   Literal templates keep their index keys as words (instantiate_plain clones them).
+5. The mirror goes: mirror_flags and mirror_holes leave Props, the mirror leaves the sidecar,
+   with every upkeep call (mirror_sync, mirror_grow, mirror_invalidate's callers, MIRROR_*). The
+   words are the f64 view.
+6. The sidecar goes: DenseStorage's first word becomes the key index itself
+   (Option<StorageBox<KeyIndex>>), so a map past eight named keys keeps one block for its index
+   instead of a sidecar wrapping it (design 1's "a word of its own"). The creation probe
+   (jit.rs:11717) and set_prop_inlinable read that word now. DenseDeque goes with its last users.
+7. Generated code (ARM64): the element templates keep their word paths and accept every receiver
+   that has words; a map with no words in use goes to the checked operation. The classic paths
+   (slot map, entry chase, descriptor guards) and the mirror paths (get-elem's and elem-local's
+   mirror reads, the chains' mirror pins and mirror-slim stores, emit_mirror_store) go; the
+   chain's typed-array marker (mlreg = usize::MAX) gets a mode of its own. JitLayout loses the
+   deque and mirror fields and the probes that served them, so Interp's offsets move and every
+   chunk's dump changes; the element templates shrink.
+8. The census and diagnostics keep their columns (sidecar, slot map, mirror at zero) so the exit
+   compares with step 1's lines; retained_requested_storage_bytes counts the Symbol map without
+   a sidecar too (it counts it only beside one today).
+
+Equivalence: a word is the property {[[Value]]: w, writable, enumerable, configurable}, a hole
+absence, as for arrays (W2c's design 4); for an ordinary object the transition between words and
+named entries is the same argument without `length`. [[OwnPropertyKeys]] already sorts every
+integer index first (ordered_keys reads words and named index keys alike).
+
+Risks: an index key that reaches the named entries without `has_far` would read as absent
+(find's and get_key's shortcut, eval.rs 3133-3188, bytecode.rs 25757-25760), so every path that
+places one sets it; code that read "no sidecar" or `elems.len() != 0` as "no index keys"
+(named_data_keys, observed_instance_capacity, try_copy_named_data_from) reads words and `has_far`.
+Test262 (the Object, Array, String and arguments suites), difftest and GC stress on the element
+tests are the checks, with the three tests above as canaries for the native paths.
+
+Order, on a branch, landed together after the counts, the census and zombie:
+3a. The mirror goes (design 5, the templates' mirror paths of design 7).
+3b. Words for every object and the slot map goes (designs 1-4, the classic paths of design 7, the
+    ablation).
+3c. The sidecar goes (designs 6 and 8).
