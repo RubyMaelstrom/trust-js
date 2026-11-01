@@ -313,28 +313,55 @@ impl Words {
     }
 
     /// Replace the words in `range` by `values`, returning the values removed (holes as
-    /// `None`), as `Vec::splice` does.
+    /// `None`), as `Vec::splice` does: the words after `range` move once, in place. The words
+    /// from `range.start` on count as untraced for the remembered record; the kind bits keep
+    /// what the inserted values keep, and a removal may make a cleared fact true, so a scan's
+    /// exactness goes.
     pub(crate) fn splice(
         &mut self,
         range: std::ops::Range<usize>,
         values: &[Value],
     ) -> Vec<Option<Value>> {
-        let words = self.as_slice();
-        let removed = words[range.clone()]
+        let len = self.len();
+        assert!(
+            range.start <= range.end && range.end <= len,
+            "splice {range:?} of {len}"
+        );
+        let removed = self.as_slice()[range.clone()]
             .iter()
             // SAFETY: a used word is a Value's bits.
             .map(|&word| (word != PACK_EMPTY).then(|| unsafe { Value::from_bits(word) }))
             .collect();
-        let suffix = words[range.end..].to_vec();
-        self.truncate(range.start);
-        self.reserve(values.len() + suffix.len());
-        for &value in values {
-            self.push(value);
+        let new_len = len - range.len() + values.len();
+        if new_len > self.capacity() {
+            self.reserve(new_len - len);
         }
-        for word in suffix {
-            // SAFETY: as above.
-            self.push(unsafe { Value::from_bits(word) });
+        if self.is_static_empty() {
+            return removed;
         }
+        let flags = values
+            .iter()
+            .fold(self.header().flags & !KIND_SCANNED, |flags, value| {
+                flags & (word_kind(value.bits()) | !KIND_ALL)
+            })
+            & !KIND_SCANNED;
+        // SAFETY: the block has room for `new_len` words; the suffix moves within it (the
+        // ranges may overlap), then the values fill the gap before it.
+        unsafe {
+            let words = self.0.as_ptr();
+            std::ptr::copy(
+                words.add(range.end),
+                words.add(range.start + values.len()),
+                len - range.end,
+            );
+            for (i, value) in values.iter().enumerate() {
+                words.add(range.start + i).write(value.bits());
+            }
+        }
+        let header = self.header_mut();
+        header.used = new_len as u32;
+        header.flags = flags;
+        self.lower_traced(range.start);
         removed
     }
 
