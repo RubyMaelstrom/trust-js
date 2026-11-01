@@ -3954,9 +3954,14 @@ pinned; compile work included):
 | 128 | 4.445e8 | 1.978e9 | 9.289e8 |
 
 chai at 1 against 8: -0.16%. Peak RSS at 1 against 8 within noise (React 15.4-16.7 MB against
-14.9-16.0, Vue 23.1-23.5 against 23.0-24.4, Djot 36.7-37.9 against 36.1-37.2). Threshold 2's
-React is not monotonic and unexplained. Before any change: Octane, Web Tooling and startup time,
-and TRust's own UI, on a quiet machine.
+14.9-16.0, Vue 23.1-23.5 against 23.0-24.4, Djot 36.7-37.9 against 36.1-37.2). Threshold 2's React
+(+2.2%) is the todo reducer's inlining (TRUST_JS_TIER_LOG): its one second-stage compile with
+callees inline (try_inline_recompile) comes, at thresholds 1 and 2, within its first 100 calls, all
+TOGGLE_ITEM, before its UPDATE_ITEM `map` call has run, so it inlines one `map` call (173
+operations) where threshold 8's comes after and inlines two (234). At threshold 1 `reducerBatch`,
+called twice, compiles too (a function compiles once its calls pass the threshold), which outweighs
+that. Before any change: Octane, Web Tooling and startup time, and TRust's own UI, on a quiet
+machine.
 
 ### Stage-exit timing (2026-10-28)
 
@@ -4016,3 +4021,804 @@ The call table at c4464dae (ms, median of 2, against Sparkplug-only Node), W3's 
 direct 201 (108; 1.86x), method 240 (164; 1.46x), closure 212 (117; 1.81x), recursion 26 (12;
 2.2x), constructor 122 (59; 2.1x), class and getter 502 (73; 6.9x), call and apply 304 (82;
 3.7x), spread 488 (34; 14x), rest 168 (53; 3.2x), `arguments` 230 (52; 4.4x).
+
+### W3's stage end (2026-11-01)
+
+The validation the stage's landings deferred (Decision 8: tests in full at a major phase's end),
+in two parts: an agent's on 8ed756bc, the tree at the session pause, and then the 18 commits since
+(8ed756bc..d74d9c0b) on main. Outputs in target/p2/gates (val-8ed756bc*, val-d74d9c0b*).
+
+8ed756bc (the gate's list against 3290f1f4's gate, d52094b2's for the stages 3290f1f4's skipped):
+rustfmt; clippy in the five configurations and the workspace; rustdoc with the base's
+diagnostics; the doctests; the fixtures' masked outputs, difftest (138 agree) and the dumps as
+the base's (chunk counts unchanged, 56, 10 and 160; differing as intended); Test262 at threshold 8
+identical, 53,575 of 53,575; the downstream crates but one test; the lib suite with two failures
+(below) and, with pacing, the known one; GC stress on the activation, arguments, closure, scope,
+setter, construct, regex, template, code_point and tdz filters, every test passing. zombie: x86-64
+clippy; Windows clippy, 20 diagnostics, the baseline's 23 less three regex.rs dead-code warnings;
+the x86-64 lib suite, debug and release, with the same two failures; the release checks; Test262
+at threshold 8 identical; under Wine the three known codec tests. Added: Test262 at threshold 0
+with a debug-assertion runner (the dev profile at opt-level 2), with and without GC stress, on
+both architectures: 17 failures in both and none only under stress (Crystal's 32 timeouts under
+stress pass with a 20-minute watchdog but recursion.js, which passes at stress 1000, as S6 found).
+Findings:
+- The two lib failures (reentry_rooting_tests' async-disposal tests) and 15 of the 17 Test262
+  failures (Array.fromAsync 2, AsyncDisposableStack 3, `await using` dead zones 3,
+  explicit-resource-management 7) were one bug, e77750d0's, fixed before the report: a compiled
+  coroutine's record kept compile order while its closures read the plan's sorted slots. Release
+  builds read wrong values at the default threshold once a generator or async function was hot
+  (a generator's arrows 318,329 where Node prints 309,320; an async function's inner function read
+  as a string). On main the agent's repros print Node's values at thresholds 8 and 0.
+- The other two Test262 failures, staging/sm/extensions' arguments-property-access-in-function.js
+  and function-properties.js (`f.arguments`), fail at 3290f1f4 too.
+- trust-js-web's exported_function_keeps_weak_native_import_callback_callable expected the
+  WebAssembly Module and Instance its arrow made to outlive idle collections ([1, 6, ...]). Since
+  6e45c153 the arrow's activation is private (no inner function names its bindings) and the import
+  callback closes over the global record, as in V8, so the wrappers are collected, as Node collects
+  them: the expectation follows (d74d9c0b, the agent's 79298299).
+- jit::borrowed_call_tests::borrowed_frames_recurse_past_the_stack_limit (37b61a41) runs for
+  hours at GC stress 1 (deep(1e6) to the stack limit with a collection at each allocation); it
+  passes at stress 200 (118 s on ARM64, 65 s on x86-64) and 1000. Slow, not failing.
+
+d74d9c0b (the gate's list against 8ed756bc's outputs; GC stress on the scope_plan, class, closure,
+global, tdz, using, disposal, proxy, megamorphic and store filters):
+rustfmt; clippy in the five configurations and the workspace, clean; rustdoc with the base's
+diagnostics; the doctests; the downstream crates, every test passing; the lib suite 2,702 passed
+with one failure (below), and with pacing on that one and the known one; GC stress, every test
+passing but one of the proxy filter's (below); the fixtures' masked outputs as the base's;
+difftest 138 agree, 12 skipped (budget); the dumps' chunk counts unchanged (56, 10 and 160) and
+their code smaller: Vue -4.2%, React -1.9%, Djot -0.7% (with chunk stubs -4.0, -3.8 and -1.3%,
+with inline stubs -4.2, -4.8 and -2.1%); Test262 at threshold 8 identical, 53,575 of 53,575.
+The proxy filter under GC stress reached the gate's hour with 54 of its 55 tests passed, as at
+863c0939 (2026-10-27, not recorded then). The 55th,
+tests::proxy_prototype_cycles_throw_range_error_instead_of_overflowing, runs Proxy cycles to the
+engine's depth limit and a chain of 20,000 Proxies in each tier, with a collection at every
+allocation. On zombie the filter's other tests (52 on x86-64) pass at stress 1 in 74 s, and it
+passes at stress 1000 (10 s), 200 (44 s) and, alone, 1 (4,240 s, past the gate's hour): slow,
+not failing, as borrowed_frames_recurse_past_the_stack_limit is.
+zombie: x86-64 clippy; Windows clippy as at 8ed756bc; the x86-64 lib suite 2,513 passed, none
+failing (the async-disposal tests fixed, and x86-64's known
+agent_control_tests::host_buffer_data_makes_a_major_collection_due_at_the_next_safepoint passing
+this time); under Wine 2,505 with the three codec tests; the release checks (outputs, every compile,
+difftest 138 agree); Test262 at threshold 8 identical; and at threshold 0 with the debug-assertion
+runner 53,573 of 53,575 on both architectures, the two `f.arguments` tests failing.
+One failure, fixed (ed0427e6):
+jit::shared_stub_tests::shared_stub_bodies_are_assembled_once_per_process expected the name cache's
+shared stub for its functions' reads of a Script-level var; since the static globals (2a71f547)
+those read the global environment through NameValuePtrIn. The fixture now adds a `new Function`
+body, which no plan covers and which keeps the name cache's walk, and checks both stubs. The step's
+targeted filters had not included it, and the module is ARM64-only.
+
+TRust's handoff checks (TRust 78435d0 on engine d74d9c0b, as W2's exit took them): both builds; the
+release test suite 4,072 passed, 49 ignored, as at W2's exit; clippy's warnings W2's exit's (eight
+lines); the debug suite 4,069 with three failures while the gate's lib suites and builds loaded the
+machine: the service-worker test
+no_content_worker_navigations_keep_active_documents_until_a_real_commit,
+css_animations_paint_frames_throttle_offscreen_and_slow_terminals (it counts animation frames in a
+1.5 s wall-clock window: 1 where it wants 4) and
+canvas_pixels_repaint_without_relayout_but_resize_updates_geometry. Each passes alone, three runs of
+three, under the same load, and in the release suite; under the engine's GC stress the first two
+fail at other assertions (a 30 s wait for the first presentation; a navigation's result) and the
+third passes: timing, not retention. Rerun on a quiet machine after the exit timing's fixes, on
+02ac6393, the debug suite passes in full: 4,072 passed, 49 ignored (below).
+
+W3's exit timing on Crystal, 06:04-09:04 (the other load 1.8-2.1 cores, a game; the heaviest
+during any run 3.5, empty@jit's c446 round 4), rust-analyzer paused: W3's base c4464dae ("c446",
+the 10-28 session's "now") against main d74d9c0b, and main at TRUST_JS_TIER_THRESHOLD=1 ("t1")
+for the owner's threshold decision; ARES-6 and Web Tooling add w5a b352febc, the W2a/W2b exit's
+other point, owed since 10-28. Node v24 in full and limited to Sparkplug ("node-sp"). Engine runs
+pinned to CPU 5, rounds rotating the order; then TRust 78435d0 on the X925 cores, on engine
+bc0a7716 (c446 plus two records) against d74d9c0b. c446..main holds W5b's native RegExp tier and
+Decision 23 as well as W3. Outputs and report.py's tables: target/p2/w3-exit/session
+(report.txt).
+
+Fixtures (ms, median of 5; c446 -> main, then t1 against main): Vue 368 -> 287 (-22.0%; t1
++0.3%), React 55 -> 49 (-10.9%; t1 -20.4%), Djot 130 -> 110 (-15.4%; t1 -11.8%); the empty
+script's 10 ms unchanged. Node 114, 18 and 49 (node-sp 114, 16 and 39).
+
+W3's exit (Decision 10: each case's time against node-sp, at main): met for method-call 1.20x
+(bound 1.25x), arguments-object 0.70x (2x), rest-params 0.68x (2x) and class-and-getter 1.64x
+(2x); not met for direct-call 1.48x (1.25x), closure-call 1.29x (1.25x), recursion-fib27 1.82x
+(1.6x), constructor 1.58x (1.25x), function-call-apply 2.90x (2x) and spread-call 3.95x (2x).
+From c446: arguments -84%, rest -79%, class-and-getter -77%, spread -72%, closure -29%,
+constructor -23%, call-apply -23%, direct -21%, fib27 -19%, method -18%; t1 within 1% of main.
+
+Octane 2 (median of 3): Score 3099 -> 3138 (+1.3%; t1 3253, +3.7%). EarleyBoyer +36.5%, RegExp
++35.3%, Typescript +15.6%, Box2D +13.6%, Gameboy +13.5%, PdfJS +12.9%, zlib +10.5%, RayTrace
++4.9%, DeltaBlue +4.7%, Richards +3.8%, Splay +1.8%, Mandreel +1.4%, Crypto +1.2%; SplayLatency
+-0.7%, MandreelLatency -1.9%, CodeLoad -6.1% and NavierStokes -66.3% (5193 -> 1749; Node 20082,
+node-sp 1968).
+- NavierStokes (5193 -> 1749): a numeric loop's preamble (emit_loop_chain) found each free name
+  it pins, a bound or an operand, through the read's name cache, and ran the original loop when
+  the cache was empty. Since outer names are read by static address (6e45c153), code compiled
+  straight from the tree-walker never fills those caches, so a loop bounded by an enclosing
+  function's binding never entered its numeric region: the solvers' `for (var i = 1; i <= width;
+  i++)`, `width` a FluidField var, left it on every entry. Fixed (1d3b64b8, below): 5801 after
+  the fixes, +11.6% on c446.
+- CodeLoad (15006 -> 14096): user instructions at a fixed 40 iterations of each of its two
+  benchmarks (fixed-driver.js, target/p2/w3-exit/codeload; two runs within 0.01%), c446 3.122 G,
+  main 3.579 G (+14.6%), main with TRUST_JS_SCOPE_PLANS=0 3.257 G (+4.3%). Decision 21's plans
+  are 70% of the growth: plan_script's scan of each Script before its body runs and each
+  function's plan (CaptureScan's expr, fn_statements and reference, and the hoisting collections
+  the plans run: collect_hoist_stmt, hoisted_vars_stmt, collect_annexb_funcs, collect_hoist_ops).
+  Most of the rest is the RegExp engine: CharClass::matches_raw2 2.3 times its c446 samples (the
+  interpreter's class test; b63d060e closes case-insensitive classes over case at compile time,
+  which lengthens their range lists: likely, not verified), and three new compile passes
+  (filter_starts, close_over_case_sharing, mark_atomic_loops). CodeLoad compiles two libraries
+  per iteration and runs little of them, so planning is all cost there. V8 walks no syntax tree
+  for it: the parser collects each scope's unresolved references as it parses (Scope's
+  unresolved_list_, src/ast/scopes.cc:1326), a function's compile resolves and allocates them over
+  the scope tree (DeclarationScope::Analyze, scopes.cc:762-800; ResolveVariablesRecursively,
+  2570), and a lazily parsed inner function's allocation is saved with its preparse data and
+  restored at its compile (AnalyzePartially and SavePreparseData, scopes.cc:1840-1907; 792-797).
+
+Web Tooling (runs/s, one run): geomean 0.88 -> 1.05 (+19.3%; t1 +0.0%: source-map -6.6%,
+uglify-js -3.3%, babel-minify +3.6%), every tool faster (chai +44.1% to esprima +9.8%). The
+W2a/W2b exit's owed point, w5a -> c446: geomean +6.0% (typescript +30.5%, prettier +11.0%, jshint
++9.4%; coffeescript and esprima unchanged).
+
+ARES-6 (ms, one run): summary 317.0 -> 280.6 (-11.5%; t1 +0.4%); steady states Air -16.5%, Basic
+-15.6%, Babylon -20.7%, ML -3.6%. w5a -> c446: summary -2.9% (ML steady -7.6%).
+- Its minor collections spent 29.2 s clearing weak references (the GC log's `weak` step)
+  against c446's 4.5 s: 1.7 ms a minor collection in Air's first round, 5.4-9.5 ms from the
+  fourth, and their `sweep` grew with it (ML 3.9 -> 8.5 ms a minor collection; c446 0.8-1.5). An
+  agent bisected it to 2daffbe5 (target/p2/weak-cells). Air's Liveness.prototype.localCalc
+  declares `class LocalCalc` and constructs it on every call; since 2daffbe5 shares a class's
+  constructor node, each fresh class fills the `new` site's construct cache, and the fill also put
+  the constructor's weak pin in the chunk's call pins, which last the chunk's life (only a compile
+  prunes them). Each dead class stayed reserved and its weak cell in the young list every minor
+  collection reads: about 62,000 a round, 125,000 while two rounds' chunks lived (the young list
+  censused by creation site). Fresh constructor functions took the same path before W3 (208,875
+  cells after 200,000 `function F() {}; new F()` at c446). Fixed (02ac6393, below): after the
+  fixes the step takes 0.79 s over the run (c446 4.31 s in the same session), 127 us a minor
+  collection on average and 499 us at most. The exemplars hold such targets weakly and let the
+  collector clear them: a V8 construct feedback slot holds one weak target or the megamorphic
+  sentinel (src/builtins/ic-callable.tq:227-276), cleared after a full marking
+  (mark-compact.cc:4166-4199); SpiderMonkey unlinks a stub whose weak field died
+  (BaselineIC.cpp:184-202); JavaScriptCore unlinks a call to an unmarked callee
+  (CallLinkInfo.cpp:172-219). Left for the owner: a megamorphic state for construct sites
+  (localCalc still refills on every call), per-way pins at call sites (an evicted way's pin stays
+  for the chunk's life, up to 4,096 a chunk: most of c446's dead cells), and, as the exemplars
+  do, a collector that clears entries naming dead callees, so that no address stays reserved.
+
+W2a/W2b's exit, owed since 10-28 (W2's "the sustained workload's minor collection time down by
+the finalizer share", on ARES-6 and Web Tooling, TRUST_JS_GC_LOG on the timed runs): met. w5a ->
+c446, ARES-6's minor collections 83.1 s -> 57.4 s in all (their finalization 26.9 s -> 0.4 s;
+119M environments finalized at w5a, none at c446), Web Tooling's 134.1 s -> 115.0 s
+(finalization 6.5 s -> 0.3 s); ARES-6 -2.9%, Web Tooling +6.0%, and ARES-6's peak RSS +34.9%
+(519 -> 701 MB; Web Tooling's -15.9%).
+
+Peak RSS (median): the fixtures 3-16% smaller (Vue 26 -> 24 MB, React 19 -> 16, Djot 43 -> 41),
+the call table 26 -> 21 MB, Octane 2374 -> 2415 (+1.7%), Web Tooling 3818 -> 4114 (+7.8%), ARES-6
+701 -> 656 (-6.4%); t1: Octane -15.6%, Web Tooling -6.7%, the rest within 3% but the call table
+(+5.9%). w5a -> c446: Web Tooling -15.9%, ARES-6 +34.9% (519 -> 701 MB).
+
+TRust's offline replays (median of 30 samples, ms; engine time, then wall): dom-reconcile 1748 ->
+1549 (-11.4%), 1973 -> 1800 (-8.8%); speedometer-vue-todomvc 573 -> 530 (-7.5%), 783 -> 764 (-2.4%);
+event-loop 19.8 -> 21.5 (+8.4%), 213 -> 245 (+14.6%). t1: event-loop 44.0 (+105%), 277 (+13.4%);
+todomvc +3.9%, +4.4%; dom-reconcile +0.7%, +1.2%. Wall less engine time grows 24-30 ms per page at
+main. It is TRust's platform prelude (js_platform.js and three smaller files, 3.4 MB, one strict
+IIFE evaluated from the snapshot in each page's fresh Engine), which engine_elapsed leaves out
+(TRust's page timer starts after eval_platform_prelude, src/trust_js_backend.rs:5896, 5916): 86.6 M
+more user instructions a page (785.4 -> 872.0 M on event-loop, +86.8 M on dom-reconcile, +88.5 M on
+todomvc; a page with one trivial script 825.0 -> 915.2 M; an agent's profiles,
+target/p2/replay-cost). Decision 21's plans (6e45c153; 4c335c15 plans every function that runs): the
+bootstrap IIFE's plan at its first call, 309.4 M, decodes every nested body the snapshot keeps
+encoded to summarize their captures (decode_function_body 166.8 M, dropping those trees 44.1 M, the
+name sets 40.6 M), and the bootstrap's 477 other plans take 50.1 M, while base's one scan of the
+IIFE (a loop fragment's private bindings, 280.3 M) falls to 18.9 M. The snapshot's trees and their
+plans belong to one Agent (Interp::shared_snapshots), and the capture summaries of its encoded
+bodies (a3cb1cbf) live only while one bootstrap runs (lib.rs:1449), so each page pays again. TRust's
+desktop runs each navigation in a new Agent on its own thread but warms a spare one in idle time
+(src/page_spare.rs: it evaluates the prelude once in a throwaway Realm, and the claimed page's
+bootstrap reuses that Agent's table): there the cost mostly leaves a navigation's critical path,
+which the replay harness, making its engine per page, keeps on it. With TRUST_JS_SCOPE_PLANS=0
+main's event-loop page costs 852.4 M (base 864.1, plans on 955.5); the plans still save 192 M a page
+on dom-reconcile (7968.8 against 8161.3 M) and cost 21.5 M on todomvc. At t1 event-loop's
+instructions inside the timer double (58.8 -> 116.4 M), nearly all compilation (native 20.7 -> 78.5
+M): 313 chunks and 3.99 MB of code a page against 102 and 1.15 MB, TRust's platform functions that
+run two to seven times a page (dispatch, 241 KB of code; moNotify, 180 KB) compiled again for every
+page; no page is cheaper at t1. Event-loop's +1.7 ms inside the timer at main is not explained (+1.2
+M instructions).
+
+Octane through TRust (the spike's eight benchmarks, at its own threshold 0), two rounds: 2440 and
+2442 -> 2323 and 2388 (-3.5%), all of it NavierStokes (9202 and 9211 -> 2561 and 2633, -71.8%);
+the rest faster (RegExp +64.4%, EarleyBoyer +37.8%, DeltaBlue +5.1%, RayTrace +4.9%, Richards
++3.6%, Splay +2.5%, Crypto +0.4%). On 02ac6393 (below) 2777 and 2760, +13.2%.
+
+Three fixes after the exit timing, on main since 2026-11-01 (02ac6393), each with a test that fails
+without it and counted against its parent (fat LTO, user instructions pinned to CPUs 10-13,
+median of 3; Vue also as the mean over ten nursery budgets, nursery.sh):
+- 828ec3f6 indexes an array's named entries once it holds a far index (W2c's census, item 6;
+  its repro 93.8 s -> 124 ms, below): Vue +0.035% (+0.035% at every nursery budget), React
+  -0.034%, Djot -0.018%, chai -0.010%.
+- 1d3b64b8 pins a loop's free names from their static addresses (NavierStokes, above): Vue
+  -0.064% (-0.064% over the budgets), React +0.022%, Djot +0.004%, chai -0.009%.
+- 02ac6393 keeps one pin per construct site (ARES-6, above): Vue +0.061% (+0.061% over the
+  budgets), React +0.122%, Djot -0.020%, chai -0.041%.
+The fixtures' collections are unchanged by all three.
+
+After the fixes, on Crystal 10:31-11:44 (the other load 0.44-0.73 cores during each run),
+rust-analyzer paused, as the exit session ran them (bench.py, rounds rotating, CPU 5; outputs
+and report.py's tables in target/p2/w3-exit/after-fix): Octane on c446, main before the fixes
+(ed0427e6), main with them (02ac6393) and that at t1; ARES-6 once each on c446 and 02ac6393; the
+far-index repros; then TRust 78435d0 on 02ac6393.
+- Octane (median of 3): Score 3121 -> 3407 (+9.2%; ed0427e6 3156, the fixes +8.0%); NavierStokes
+  5198 -> 5801 (+11.6%; ed0427e6 1761). The fixes moved no other benchmark more than 3% (Splay
+  +2.8%, PdfJS +2.6%, Typescript +1.5%, DeltaBlue +1.2%, Box2D -1.1%). t1 on 02ac6393: +3.5%
+  (3527), about 3.1 points of it NavierStokes (9707, +67.3%; not a steady state, the next
+  paragraph); Gameboy +11.9%, Box2D +8.4%, RayTrace +2.4%; SplayLatency -6.8%, Typescript -3.1%,
+  Splay -2.6%, CodeLoad -2.2%; peak RSS 2380 -> 2015 MB (-15.3%).
+- ARES-6 (one run): summary 314.6 -> 268.3 (-14.7%; the exit session's main 280.6); steady states
+  Air -18.9%, Basic -19.4%, Babylon -22.5%, ML -7.6%. Minor collections 54.6 s -> 41.3 s in all
+  (the exit session's main 115.2 s), their weak step 4.31 s -> 0.79 s. Peak RSS 699 -> 538 MB
+  (-23.0%; the exit session's main 656, its w5a 519).
+- The far-index repros (the census's edge/farcliff.js and farcliff2.js, jit tier, ms): filling and
+  reading back 200,000 elements after `a = [1, 2, 3]; a[1000] = 0`, 93,789 at ed0427e6 -> 124 at
+  828ec3f6 (20 without the far write; Node 15); 20,000 after `a = []; a[300] = 0`, 959 -> 11
+  (Node 1), and 40,000, 3,789 -> 20 (Node 2): linear again.
+- The call table's user instructions (fat LTO, CPU 12): ed0427e6 19,394.67 M, 02ac6393 19,394.61
+  M, the outputs identical; W3's exit stands as measured.
+- TRust: the debug suite on the quiet machine 4,072 passed, 49 ignored, none failing (the stage
+  end's three failures came from the load). The spike, two rounds against the exit session's
+  base binary: 2447 and 2443 -> 2777 and 2760 (+13.2%); NavierStokes 9211 -> 9349 and 9340
+  (+1.4%), RegExp +60.2%, EarleyBoyer +39.2%, RayTrace +6.9%, DeltaBlue +6.0%, Richards +4.2%,
+  Crypto +1.6%, Splay -0.4%.
+
+NavierStokes and the threshold (an agent's, target/p2/navier-threshold: user instructions on
+fixed work with the fat-LTO 02ac6393 and c446 on CPU 19; its scores under load). Its steady
+state is the same at every threshold, 94.2 M instructions a run at thresholds 0 to 8 (c446 99.3
+M); the difference is the calls that run on the tree-walker before a function's calls pass the
+threshold. lin_solve's a=1 path, `for (k < 20) { for (j <= 128) { for (i <= 128) ... } }` inside
+an if/else, 327,680 inner iterations a call and two calls a run, takes 3.11 G instructions a call
+there against 21.6 M compiled (144x; 58% of the tree-walked samples resolve names by string,
+Names::slot_of), and nothing tiers such a call up during it: a loop's admission counts 129 visits
+afresh at each execution of the loop (Admission, bytecode_loop_fragment.rs:92-143; eval.rs:1439),
+which a 128-iteration loop reaches only at its failing test; inner loops' backedges count toward
+neither the enclosing loop nor the function; and a frame transfers only at a loop that is a
+direct statement of the body (function_osr_site, bytecode.rs:7254, and its use at 16503-16516),
+where lin_solve's sit in an if/else. Over the first 20 runs threshold 1 costs 3.9 G more than
+threshold 0, 2 7.1 G, 4 10.5 G and 8 20.2 G (six cold calls); c446 likewise (its first three runs
+at 8: 8.25, 7.43 and 7.36 G). Octane's timed warmup absorbs the slow runs up to threshold 6; from
+7 the third run is the first measured, and the score falls (standalone: 9678 at 1 and 2, 9441 at
+4, 9137 at 6, 5572 at 7, 5810 at 8; c446 9550 at 1 and 5188 at 8). t1's Octane gain is this gap
+meeting Octane's measured window, and where the score falls moves with the machine's speed. The
+exemplars count loop iterations toward a function's tier-up and can enter compiled code at any
+loop header, nested ones included: V8 charges each backedge to the function's interrupt budget
+(JumpBackward, src/interpreter/interpreter-assembler.cc:1179-1256) and checks OSR at every
+JumpLoop against its loop depth (interpreter-generator.cc:2472-2541;
+control-flow-builders.cc:81-91); SpiderMonkey bumps the script's warm-up counter at each loop
+head and enters the Baseline Interpreter there (vm/Interpreter.cpp:2048-2091; 10 calls or loop
+iterations, jit/JitOptions.cpp:209-222); JSC adds 1 for a loop iteration and 15 for a call to one
+counter, against 500 (OptionsList.h:369-376), and enters Baseline at the loop (loop_osr,
+LLIntSlowPaths.cpp:491-536). For the owner: tree-walked backedges counted toward the function's
+tier-up, so that a function compiles once they pass a budget (one cold call at most, what
+threshold 1 pays now), then a transfer at nested loop headers as well, so that not even the rest
+of that call stays on the tree-walker. DIAGNOSTICS.md's "can tier up after 128 executed
+backedges" holds per loop execution. Not investigated: standalone and under load, threshold 0
+scores 3.4% below threshold 1, with the same instructions and CPU time a run in the fixed-work
+drivers.
+
+The plans' compile-time cost (for the owner). Two parts:
+- Snapshot bodies (TRust's prelude: about 210 M of the bootstrap plan's 309 M a page): every
+  Agent decodes and scans each still-encoded nested body again for its capture summary, though a
+  summary depends on its static encoding alone. Kept process-wide by that encoding (TRust gives
+  each navigation its own thread, so a thread's cache would not carry over), or written into the
+  snapshot when it is compiled (TRust compiles it once a process), no Agent after the first pays
+  it. V8's equivalent travels with its snapshot: a lazily compiled function's preparse data (its
+  inner functions' variable allocation) is saved with the function and restored at its compile
+  (src/ast/scopes.cc:792-797, 1840-1907), so no context analyzes it again. Recommended: in the
+  snapshot.
+- Fresh sources (CodeLoad +10%): plan_script's scan and each function's plan walk the syntax tree
+  again after parsing. V8 collects each scope's unresolved references while it parses
+  (scopes.cc:1326) and resolves them over the scope tree at compile (DeclarationScope::Analyze,
+  762). Folding the collection into the parser is the larger change: for the owner to place.
+
+### W2c: elements as 8-byte words (census and design, 2026-11-01)
+
+Census: main d74d9c0b, fat-LTO engines built from `git archive` exports into fresh target
+directories (target/p2/w2c-census/builds/main; rustc 1.99.1), ARM64 on Crystal, pinned to CPUs
+10-13 (the A725 cores) with setarch -R; instruction counts at TRUST_JS_GC_PACING=0 (least of 3,
+fixcounts2.sh's convention), everything else at the default pacing. A census build of the same
+export (census-src: patch/census.diff, then patch/census2.diff) adds TRUST_JS_ELEM_CENSUS=1: after
+each collection, every live object with element storage (and every array) classified, its bytes
+counted by size class and modeled under W2c; the reasons that take a map's elements off "all
+plain", each counted once per map in a census word; entry counters in the ARM64 element
+templates; and the marker's element trace out of line, so that profiles can attribute it. Its
+Props carry the extra census word (120 B instead of 112; the object cell stays in the 192 B class),
+and it is never used for instruction counts. Profiles: perf record -g --user-callchains on
+instructions:u, one sample per 250K instructions (1M for chai), TRUST_JS_JIT_MAP=1 and
+TRUST_JS_PERF_MAP=1, attributed by scripts/elemcensus.py. The machine carried other work
+(a validation gate, builds): counts and bytes are exact, times indicative. Data and scripts:
+target/p2/w2c-census.
+
+Splay is Octane's splay.js alone (base.js, the shells' driver; target/claude-closeout/ext/octane),
+whose live heap the W2 exit names; chai is target/p2/ext/cli-chai.js; "sustained" is
+benchmarks/sustained-allocation.js at --tier=jit.
+
+1. Arrays in the live heap. Splay and the sustained workload at their largest major collection;
+the fixtures (which run no major collection) and chai at the minor collection whose heap held the
+most element bytes, where old garbage still counts. Bytes are size classes: the array's object
+cell and every storage block its elements use (sidecar, packed deque and its box, dirty bitmap,
+slot map, mirror, and for classic storage the named entries and layout that hold the index keys).
+"W2c saves" is the model below (Design 1) applied to the same objects.
+
+| | live bytes | arrays | elements | array bytes | of live | W2c saves |
+| --- | --- | --- | --- | --- | --- | --- |
+| Splay (major 18) | 246.2 MB | 256,045 | 2,560,384 | 114.7 MB | 46.6% | 41.0 MB (16.6%) |
+| chai (minor 414) | 11.27 MB | 4,137 | 55,287 | 3.45 MB | 30.6% | 1.86 MB (16.5%) |
+| React (minor 17) | 1.71 MB | 92 | 6,984 | 261 KB | 15.3% | 133 KB (7.8%) |
+| Djot (minor 11) | 7.42 MB | 1,561 | 20,406 | 1.08 MB | 14.5% | 534 KB (7.2%) |
+| sustained (major 10) | 43.98 MB | 3 | 200,002 | 5.25 MB | 11.9% | 2.62 MB (6.0%) |
+| Vue (minor 18) | 718 KB | 65 | 113 | 30 KB | 4.2% | 13 KB (1.8%) |
+
+- Splay's arrays are its payloads' `array: [0, 1, ..., 9]` (splay.js, GeneratePayloadTree): 256,038
+  arrays of exactly 10 elements, all plain, all int32, every one in the sidecar's inline slots:
+  192 B of cell and 256 B of sidecar each, 448 B for 80 B of values. The rest of the live heap is
+  512,000 other object cells at 192 B (98.3 MB) and about 33 MB more, 128 B for each of the
+  256,000 leaves' strings of about 46 units (not examined further).
+- chai's arrays are small (lengths: 0 266, 1 563, 2 346, 3 266, 4 169, 5-8 1,091, 9-16 919,
+  17-32 253, 65-256 263); 2,074 of its 4,137 live arrays carry a numeric mirror (232 KB, 6.7% of
+  its array bytes). React's are the reducer's 70 state arrays of 100 todos (heap deques,
+  215 KB of values); Djot's 1,561 are mostly 1-2 elements.
+- Arrays made over each run (allocation, not live): chai 1,893,642, Splay 645,128, sustained
+  400,002 (the `[point, i]` pairs, 448 B each today, 224 B under the model), Djot 49,751, Vue
+  38,198, React 4,511.
+- Non-array objects with element storage are few: Vue 5 (21 KB; 3 frozen), Djot 12 (15 KB),
+  chai 290 (212 KB; 254 frozen) and chai's 470 live arguments objects (276 KB). Ordinary objects
+  with more than eight named keys and no shared layout index carry a whole 256 B sidecar for one
+  index pointer: 20-75 objects per workload, 5-19 KB.
+- Peak RSS (main, MB, three runs each, identical): empty script 13.1, Vue 23.9, React 15.1, Djot
+  40.7, sustained 93.5, Splay 1006.4 (about four times its live heap: V8's growing factor), chai
+  989.1, which is not its heap (its live bytes stay at or under 11.3 MB; not attributed here).
+  Element bytes are a fraction of a megabyte of the fixtures' RSS.
+
+2. What takes elements off "all plain". The reasons each array (or other map) ever took, from
+the census word: no array in the acceptance set ever took an accessor element, an element with
+non-default attributes, an integrity level (freeze, seal), an index far past its elements, or
+classic (named-entry) storage.
+
+| | arrays made | ever any reason | holes (padded first write) | holes filled | new Array(n <= 8) | length set past the elements | other reasons |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| chai | 1,893,642 | 222,102 (11.7%) | 216,321 | 222,068 | 5,748 | 5,781 | none |
+| Djot | 49,751 | 1 | 1 | 1 | 0 | 0 | none |
+| Vue | 38,198 | 3 | 0 | 1 | 0 | 0 | length made read-only 2, delete 1 |
+| Splay, React | 645,128; 4,511 | 0 | | | | | |
+| sustained | 400,002 | 1 | 0 | 0 | 0 | 0 | a length past 100,000 (the retained array) |
+
+- chai's holes all come from a first write past index 0 on an empty array
+  (`start_packed_elements`), sizes 1 (2,161), 2 (23,480), 3 (26,160), 4 (34,240), 5-8 (96,920),
+  9-16 (31,560), 17-64 (1,800): arrays filled from the top down, then filled completely (222,068
+  maps filled a hole); the live census holds no holey array in any workload.
+- Non-array maps that ever held an index key: chai 6,981 (6,496 with non-default attributes,
+  2,485 in classic storage, 484 padded), Djot 12, Vue 8. The 6,496 are String wrapper objects,
+  whose code units box_primitive materializes as own index properties (below).
+
+3. Element operations in generated code. Entries into the ARM64 templates (census2's counters),
+the operations that then reached a JIT helper (TRUST_JS_JIT_OPSTAT=1, main), and the templates'
+share of user instructions (perf, self samples of their code; chai's helper paths inclusive):
+
+| | element reads (stack, local) | read helpers | element stores | store helpers | map/filter appends | `k in O; O[k]` pairs | share of instructions |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| chai | 104.5M (37.3M, 67.1M) | 11.1M | 12.9M | 12.9M (99.9%) | 55.7k | 89.3k | 7.4% in templates; store helper 10.0% incl., its dense path (fast_set_elem) 4.6%, read helper 5.8% incl. |
+| React | 0 | 0 | 0 | 0 | 446.5k (40.3k helpers) | 448.7k | appends 7.6%; the pair inside the loop test's 7.6% (not separable) |
+| sustained | 1.03M | 0 | 34.9k | 34.9k (100%) | 0 | 0 | reads 2.7%; array creation 4.8% |
+| Vue | 275k (113.6k, 161.4k) | 116.8k | 61.8k | 61.8k (100%) | 58 | 63 | 0.25% in templates |
+| Djot | 93.1k | 15.7k | 198 | | 0 | 0 (`in` 8.0k) | 0.4% in templates |
+| Splay | 15.7k | 0 | 0 | | 0 | 0 | 0; array creation (MakeArray's helper) 6.8% |
+
+Instructions per execution, from the code dumps (TRUST_JS_JIT_CODEDUMP; dumps/ in the census
+directory): the stack form of GetElem spends 25 on the receiver tag, the key's u32 round trip,
+the payload and the exotic and `ic_plain` bytes, then 39 in all through the numeric mirror, 46-48
+through packed storage (heap deque, inline slots) and 51 through classic storage; the fused local
+form is 3 more. About 11 loads on the packed path (the receiver word twice, the key, three flag
+bytes, sidecar, packed pointer, inline length, the descriptor's flags, the value). The store
+templates (SetElem*, SetElemLocal*) store only Numbers over an existing writable element (56 with
+no mirror, about 75 maintaining one); every other value, every append and every store into a hole
+calls H_SET_ELEM, hence the 99.9-100% above. The map/filter append (CreateDataPropertyOrThrow,
+emit_define_elem_inline) measures about 75 an append, 21 of them finding and checking `length`
+through its slot memo.
+
+4. The collector. The census build's element trace (out of line), inclusive of its edges'
+marking, against all marking:
+
+| | element trace, of marking | of all instructions | slots traced |
+| --- | --- | --- | --- |
+| Splay | 9.1% | 5.05% | 9.76M (majors and young arrays), all Numbers |
+| sustained | 30.5% | 2.42% | 0.25M full, 3.01M remembered (the retained array's dirty blocks) |
+| chai, Vue, React, Djot | | 0.2% or less | |
+
+Collections (main, TRUST_JS_GC_LOG): Splay 40 minor (881 ms, 754 of them tracing; it promotes
+1.07 GB) and 4 major (481 ms); sustained 21 minor (32.7 ms) and 2 major (26.5 ms); chai 444 minor
+(1,157 ms, of which tracing 29 ms: its minors are side tables, stack and weak handles); the
+fixtures 12-18 minor, 3.6-15 ms. A Splay payload is 47% array bytes, as its live heap is.
+
+5. Whose saving is whose:
+- W2c alone (the model): Splay -41.0 MB (-16.6% of live), each 10-element array 448 B to 288 B;
+  chai -16.5%, React -7.8%, Djot -7.2%, sustained -6.0% of the live heap, and the sustained
+  workload's pairs 448 B to 224 B of allocation (90 MB fewer over the run); the mirror (chai 232 KB
+  live, 0.7% of its instructions in upkeep) and the classic slot map go.
+- W2d (the slimmer cell): 64 B more per array at 128 B (Splay 16.4 MB, 6.7%), and 64 B per other
+  object (Splay 32.8 MB more). With W2c an array is 224 B, half of today's 448 (the plan's "halves
+  arrays"); Splay's live heap 246.2 to about 156 MB (-36.6%). Halving it also needs one of: the
+  elements in the cell for small arrays (SpiderMonkey's fixed elements; -24.6 MB), copy-on-write
+  literal elements (Splay's payload arrays are never written; V8 shares them; -24.6 MB), or
+  smaller leaf strings (the 33 MB above).
+- W2g: the String wrappers' materialized code units (chai's 6,496 maps; the cliff below), and
+  arguments objects' exotic state (chai 470 live, 2.4% of its live bytes); typed arrays are not
+  elements here (their data lives in buffers).
+
+6. Found on main (the first fixed since, outside W2c):
+- An array that ever has an index more than 256 past its elements, or whose first write lands
+  past index 256, pays a linear scan of its named entries on every later absent-index insert,
+  and a packed one on every read past its packed prefix: filling and reading back 200,000
+  elements after `a = [1, 2, 3]; a[1000] = 0` takes 106.8 s against 33 ms without the far write
+  (Node 19 ms);
+  20,000 elements after `a = []; a[300] = 0` 1.1 s, 40,000 4.4 s (Node 1-3 ms; quadratic). With
+  `has_far` set, Props::find can no longer prove absence from the slot map and falls back to
+  `entries.keys().iter().position` (value.rs:9155), because array maps never index their index
+  keys (should_build_index, value.rs:8594), and appends at the packed frontier stop going to
+  packed storage (Props::insert, value.rs:9662). Repro: target/p2/w2c-census/edge/farcliff.js and
+  farcliff2.js. No acceptance workload hits it. Fixed outside W2c (828ec3f6): once such a map holds
+  more than eight entries its key index counts every key, as after a truncation, so the scan is a
+  probe: 93,789 -> 124 ms (20 ms without the far write, Node 15 ms), and 959 -> 11 ms and 3,789
+  -> 20 ms for the 20,000 and 40,000 (ed0427e6 against 828ec3f6 on CPU 5, an X925 core, after
+  W3's exit timing). The elements stay
+  named entries until W2c's sparse limit (Design 3)
+  keeps them in the words, as V8 does: the rest of the gap to Node.
+- ToObject of a string materializes every code unit as an own index property with a fresh key
+  and a one-unit string (box_primitive, builtins/mod.rs:12569-12582): 200 `Object(s)` of a
+  10,000-unit string take 502 ms (Node under 1 ms). V8 keeps wrappers in
+  FAST_STRING_WRAPPER_ELEMENTS (src/objects/elements-kind.h:93-171), SpiderMonkey and JSC answer
+  indices from the string; it belongs with W2g.
+- No correctness bug in today's element handling showed up: 54 edge cases (holes under indexed
+  prototype properties and setters, read-only length with push, shift, unshift, splice, pop,
+  reverse, sort and fill, non-writable and non-configurable elements in sort, reverse, fill,
+  shift, pop and truncation, accessor elements in copyWithin, slice and map, frozen, sealed and
+  non-extensible arrays, far keys and their order, huge indices, descending fills, deletes in
+  shift, reverse, splice and sort, holes in concat, spread, copyWithin and filter, arguments,
+  String wrappers, coercions that shrink the array mid-algorithm) give Node's output in the
+  tree-walker, the VM and compiled code, hot, at thresholds 0, 1 and 8 (edge/edge.js, edge-hot.js).
+
+Today's representation (d74d9c0b):
+- An element is a `Property` (value.rs:5429): a 16-byte pair of the value word and a meta word
+  holding the four attribute bits and, for an accessor, its pair cell. A hole is
+  `Property::plain(Value::Empty)` (the PACK_EMPTY word, value.rs:304).
+- `Props` (value.rs:7056, 112 B) holds the elements behind `elems: DenseStorage`
+  (value.rs:6309), a nullable pointer to the element sidecar plus the extras pointer. The sidecar,
+  `DenseBuffers` (value.rs:5887; 248 B, a 256 B block), holds five things: `inline_packed`
+  (value.rs:5794: up to INLINE_PACKED_CAPACITY = 10 Properties in place, value.rs:5792, with the
+  "all plain" proof); `packed` (value.rs:6086: a box with a DenseDeque<Property> that keeps front
+  room for shift, `traced_len` and a dirty bitmap of 64-element blocks, PACKED_DIRTY_BLOCK at
+  value.rs:6074, for minor collections); `elems`, the classic slot map (u32 entry slots, NO_SLOT
+  a hole, value.rs:7152); `mirror`, the numeric view; and `index`, a named-key hash for large
+  non-array maps. Props adds `mirror_flags` and `mirror_holes`, `has_far` (an index lives only in
+  the named entries) and `elem_mode` (an array's map: index keys never transition its shape),
+  value.rs:7076-7102.
+- Three element representations. Packed (arrays only: can_start_packed_elements requires
+  elem_mode, value.rs:8250): made by creation (packed_array_named, value.rs:7927;
+  reserve_dense_exact, 8092) or by a first write at an index up to 256 on an empty array, which
+  pads holes (start_packed_elements, 8261); it holds any Property, so an accessor or a
+  non-default attribute stays in place (Props::insert writes the slot, value.rs:9644-9661).
+  Classic: index keys as named entries (a PropKey in the layout, the Property in the fields) found
+  through the slot map, with the mirror; used by every non-array map with index keys and by arrays
+  whose first write is past 256 (or with TRUST_JS_DENSE_ELEMENTS=0, value.rs:7177). Far: an index
+  more than 256 past the frontier lives in the named entries alone and sets `has_far`
+  (note_inserted, value.rs:8555; insert, 9662-9676), cleared only by truncation or by a bounded
+  rescan after deletes (recover_dense_coverage, value.rs:9880).
+- The "all plain" proof is `InlinePacked::packed_plain` (value.rs:5797), a cached fact that every
+  packed slot is a plain element (writable, enumerable, configurable data, not a hole;
+  is_plain_element, value.rs:5728), recomputed by a scan when false (packed_all_plain,
+  value.rs:6505) and cleared by every mutable escape (packed_mut, packed_slice_mut,
+  packed_index_mut, value.rs:6425-6470). shift, unshift, splice and the bulk edits depend on it
+  (shift_dense_array 8839, unshift_dense_array 8995, plain_elements_mut 8810); generated code does
+  not: it tests each slot's flags.
+- The mirror flags W4 is to read (value.rs:7117-7133): MIRROR_OK (a coherent f64 copy), NO_HOLES,
+  ALL_I32, PACKED (the copy parallels packed storage) and PACKED_FAILED (a preparation that
+  failed). They describe a numeric copy rather than the elements: an array of objects, a holey
+  array and one never prepared all read 0. The copy is made for numeric literals over 32
+  elements, numeric reserve_dense_exact and hot numeric loops (prepare_packed_numeric_mirror,
+  value.rs:8146, from jit.rs:2204, bounded to 4,096 elements), and dual-stored by
+  set_index_value (value.rs:8489) and generated stores (emit_mirror_store, jit.rs:14412).
+- Sizes in the release build: Object 168 B, the RefCell<Object> cell 176 B in the 192 B class
+  (value.rs:4179); Props 112 B; DenseBuffers 248 B (256 B class); InlinePacked 168 B;
+  PackedBuffer 80 B (96 B class); Property 16 B; DenseDeque 32 B. An array of 1 to 10 elements is
+  448 B; past 10, a 96 B box and 16 B a slot more.
+- Who touches elements:
+  - Props (value.rs): get_index 8392, set_index_value 8489, try_append_element 8615,
+    try_define_dense_element 8649, pop_last_element 8729, packed_array_elements 8795 (searches),
+    plain_elements_mut 8810, shift_dense_array 8839, unshift_dense_array 8995, find 9074 (an index
+    through the slot map), insert 9644, remove_indices_from 9743, remove_key 9801, ordered_keys
+    9911, freeze_descriptors 9491, highest_nonconfig_index_from 9975, length_property 8281.
+  - Interpreter and VM: fast_get_elem and fast_set_elem (interpreter.rs:9850, 9890),
+    plain_own_element_present (9840), array_prototypes_unshadowed (9784, the indexed-prototype
+    protector), make_array and make_array_from_raw (8424, 8565); the VM's GetElem/SetElem family
+    (bytecode.rs:18359-18405) through get_computed_element and set_computed_element (25570,
+    25631), the JIT helpers jit_get_element (25678) and jit_set_elem (25001).
+  - ARM64 templates (jit.rs): GetElem 14237-14410; the fused local and keyed forms 15194-15457;
+    SetElem 14496-14627 with emit_packed_element_store 14629 and emit_mirror_store 14412;
+    UpdateElem 11229; the map/filter append 14855-15131; `in` 14686-14853; computed method calls
+    7792; self-hosted `k in O; O[k]` (emit_local_own_dense_data_guard and
+    emit_local_assumed_dense_data_value, 15458-15600); numeric loop chains and linked scans over
+    the mirror (emit_chain 16344, emit_loop_chain 18635); the gates 14155-14229 and the offsets
+    in JitLayout (value.rs:1367-1420). Dispatch: jit_operations.rs:357-404, 676, 865, 916;
+    jit_regions.rs:2223-2225, 2494-2513, 2650-2754, 3812-3861.
+  - x86-64 has no element template: GetElem and GetElemLocal call H_GET_ELEM (jit_x64.rs:1279),
+    every other element operation H_EXEC (jit_x64.rs:1373).
+  - Builtins (builtins/mod.rs): push 6204 and its intrinsic, pop 6266, shift 6367, unshift 6418,
+    the Array constructor 7314 (reserve_small_holes 7328), the bulk edits 7381, searches 7501,
+    try_define_dense_element 9239, ArraySetLength 5658-5760, SetIntegrityLevel 2157; JSON
+    (json.rs:499); spread and argument lists (bytecode.rs:17425).
+  - The collector: Object::trace_gc_fields (value.rs:3759) reports the blocks
+    (DenseStorage::trace_storage, 6354), then traces packed Properties
+    (PackedBuffer::trace_elements, 6199, only dirty blocks and the untraced tail in a minor
+    collection's remembered trace) and
+    classic elements with the named fields; finish_packed_mark_trace 6256; the owner's card
+    (gc_core.rs:112) through its mutable borrow and PackedBuffer::note_index (6147) record
+    writes.
+  - Snapshots: snapshot.rs encodes ASTs only, never heap elements; nothing changes there. The
+    managed-memory accounting reads packed values and the blocks' bytes (memory.rs:1058-1119).
+
+The exemplars (V8 c8b709085e21, SpiderMonkey bf75471716c5, JSC 260278048486, as in W3's static
+names; paths under src/ for V8, js/src/ for SpiderMonkey and Source/JavaScriptCore/ for JSC; the
+files read are in target/p2/w2c-census/exemplars):
+- Element words. V8: `FixedArray` slots of tagged words, 4 bytes with pointer compression, and
+  unboxed float64 in `FixedDoubleArray` (src/objects/fixed-array.h:320-322,
+  fixed-primitive-array.h:111-166); the kind lives in the map (code-stub-assembler.cc:4551-4552).
+  SpiderMonkey: 8-byte barriered Values after a 16-byte ObjectElements header of flags,
+  initializedLength, capacity and length (js/src/vm/NativeObject.h:270-287, 839-845), never null
+  (a shared empty header, NativeObject.cpp:38-63), possibly inline in the object (NativeObject.h:
+  826-831). JSC: 8-byte slots after an 8-byte {publicLength, vectorLength} header, Int32 slots
+  boxed and Double slots raw (runtime/Butterfly.h:140-150, 200-202; IndexingHeader.h:120-132), the
+  shape in the cell's indexing byte (IndexingType.h:37-79).
+- Kinds and holes. V8: PACKED and HOLEY x SMI, DOUBLE, ELEMENTS plus NONEXTENSIBLE, SEALED, FROZEN,
+  DICTIONARY and the arguments and string-wrapper kinds (src/objects/elements-kind.h:93-171), a
+  one-way lattice ("never ... backwards in the elements kind manifold", map.cc:1142-1144); the hole
+  is the_hole, or a NaN pattern in double stores (fixed-array-inl.h:379-389, globals.h:2195-2204).
+  SpiderMonkey: holes are a magic Value and NON_PACKED a one-way header flag ("guaranteed to
+  contain no hole values" while clear, NativeObject.h:234-236, set at NativeObject-inl.h:56-64);
+  no number kinds. JSC: Undecided, Int32, Double, Contiguous, ArrayStorage, SlowPutArrayStorage,
+  one-way (the least upper bound is `std::max`, IndexingType.h:217-225); a hole is the empty value
+  0, or PNaN in Double (JSCJSValue.h:367-368, ButterflyInlines.h:311-330). All three keep holes in
+  the fast representation; none goes back from holey to packed.
+- A non-plain element. V8: the whole array goes to DICTIONARY_ELEMENTS with requires_slow_elements
+  set (accessor: lookup.cc:927-953; a new index with attributes: js-objects.cc:5683-5684 and
+  elements.cc:1817-1851; reconfiguring one: lookup.cc:575-581). JSC: the whole array enters
+  dictionary indexing ("sparse") mode, every value copied into its SparseArrayValueMap
+  (JSObject.cpp:3052-3096, 1189-1219). SpiderMonkey: only that index leaves, as an ordinary property
+  in the shape's property map, its dense slot becoming a hole; the object is marked `Indexed`,
+  which stops dense growth past capacity (NativeObject.cpp:1398-1476, ObjectFlags-inl.h:18-31,
+  NativeObject-inl.h:390-397).
+- Integrity levels. V8: the array keeps fast elements under the NONEXTENSIBLE, SEALED and FROZEN
+  kinds (Smi and double kinds boxed first), dictionary only when the map can take no transition
+  (js-objects.cc:4683-4770, map.cc:1952-2007). SpiderMonkey: dense elements stay, with
+  NOT_EXTENSIBLE, SEALED and FROZEN header flags and shape flags that let a shape guard exclude
+  frozen elements (JSObject.cpp:506-590, NativeObject.h:216-232). JSC: dictionary indexing mode
+  for every array, even an empty one (JSObject.cpp:2906-2966, JSArray.cpp:197-268).
+- Non-writable length. V8: the properties normalize, the elements kind stays; growing stores are
+  refused by MayHaveReadOnlyLength (lookup.cc:954-971, objects-inl.h:874-898). SpiderMonkey: a
+  header flag and the invariant capacity <= length, so the JIT's capacity check refuses stores
+  past it (NativeObject.h:150-155, ArrayObject.h:31-35). JSC: dictionary mode with LengthIsReadOnly
+  on the map (JSArray.cpp:197-208).
+- Where length lives: V8 in the JSArray (js-array.h:161), SpiderMonkey in the elements header,
+  JSC in the butterfly's header; none keeps it in the general property table, as TRust JS does.
+- Sparse indices. V8: a gap of 1024 past capacity (kMaxGap), or past 500 slots (5000 young) a
+  growth to at least nine times the dictionary capacity the used elements need, sends the array
+  to dictionary (js-objects-inl.h:1255-1286, js-objects.h:961-974, dictionary.h:480-482); a
+  length up to 32 Mi stays fast (objects.cc:4518-4524).
+  SpiderMonkey: past index 1000 when fewer than 1/8 of the indices would be filled
+  (MIN_SPARSE_INDEX, SPARSE_DENSITY_RATIO, NativeObject.h:1877-1884; NativeObject.cpp:555-589).
+  JSC: past index 1000 beyond the vector, or 100,000 at under 1/8 density (ArrayConventions.h:
+  57-106, JSObject.cpp:3278-3332).
+- Back to fast. V8: when the dictionary "only saves 50% space", checked only as an index is added
+  (js-objects.cc:5602-5629, 5685-5689), never with requires_slow_elements. SpiderMonkey: when the
+  sparse indices fill 1/8 of the range and are all plain, checked only when the slot span reaches
+  a power of two to avoid quadratic work (NativeObject.cpp:592-659, 1490-1503). JSC: never
+  (StructureTransitionTable.h:92-115).
+- The dictionary itself. V8: NumberDictionary, (key, value, details) triplets with open addressing
+  and a max-number-key word whose low bit is requires_slow_elements (dictionary.h:382-386,
+  459-478; property-details.h:17-27). SpiderMonkey: property-map entries with full PropertyInfo,
+  merged into index order when enumerated (PropMap.h:18-60, Iteration.cpp:316-450). JSC: a
+  separate SparseArrayValueMap cell of {attributes, index, value} (SparseArrayValueMap.h:43-93).
+- Baseline element reads and writes. V8's Ignition and Sparkplug inline nothing: KeyedLoadIC and
+  KeyedStoreIC handlers check the map, load elements, bound against length, load, and test the
+  hole under NoElementsProtector (accessor-assembler.cc:3987-4018, 2693-2770, 768-778); stores add
+  a 4-instruction ARM64 barrier (code-generator-arm64.cc:1290-1295). SpiderMonkey's CacheIR dense
+  load is a shape guard, the elements pointer, an unsigned initializedLength check, the packed
+  flag or a hole test and the load: 9-10 x64 instructions and 6 loads past the operands' tag
+  tests (CacheIR.cpp:3018-3040, CacheIRCompiler.cpp:5278-5316); its in-bounds store about 16 with
+  the pre and post barriers (CacheIRCompiler.cpp:7312-7355). JSC's LLInt get_by_val loads the
+  indexing byte (no structure check), the butterfly and publicLength, then the value and the hole
+  test, about 40 interpreter instructions with profiling (LowLevelInterpreter64.asm:1840-1896);
+  its stores into holes need no check while the prototype chain is sane (JSArray.cpp:1953-1956).
+  Every exemplar stores any value in its baseline store path; TRust JS stores only Numbers.
+- The collector. V8 scans FixedArrays and skips double stores; old-to-new stores set a bit per
+  slot in the page's SlotSet (objects-body-descriptors-inl.h:1061-1066, 2027-2034;
+  basic-slot-set.h:24-29). SpiderMonkey traces [0, initializedLength); a nursery value stored into
+  an element records a SlotsEdge range when initializedLength exceeds 256, else the whole cell
+  (Tenuring.cpp:876-897; CacheIRCompiler.cpp:9190-9244). JSC scans publicLength of Contiguous
+  storage, never Int32 or Double storage, and remembers whole cells (JSObject.cpp:84-145,
+  HeapInlines.h:87-121).
+- Holes and prototypes: V8's NoElementsProtector (protectors.h:15-30, isolate.cc:7006-7042),
+  SpiderMonkey's arrayProtoHasNoIndexedPropsFuse (RealmFuses.h:328-352, Array-inl.h:40-59), JSC's
+  arrayPrototypeChainIsSane watchpoint and havingABadTime (JSGlobalObject.cpp:3320-3368,
+  2682-2847): TRust JS's array_prototypes_unshadowed (interpreter.rs:9784) is the same proof.
+- shift: V8 moves up to 100 elements, then left-trims (array-shift.tq:11-40, heap.cc:3118-3229);
+  SpiderMonkey keeps up to 2047 shifted elements in the header (NativeObject.h:177-196); JSC keeps
+  an index bias in ArrayStorage, to which it converts queues past 128 elements (JSArray.cpp:
+  1487-1555, 1766-1769). TRust JS's deque front room is the same idea.
+- Copy-on-write literals: V8 shares "simple and shallow" boilerplate stores (ast.cc:815-821,
+  runtime-literals.cc:636-641), JSC shares constant butterflies (NodesCodegen.cpp:442-512),
+  SpiderMonkey removed its COW elements (NativeObject.h:199-243).
+
+Design:
+1. Representation. An array's elements are one storage block of 8-byte Value words, a hole the
+   PACK_EMPTY word, behind a 16-byte header {length used: u32, capacity: u32, shifted: u32,
+   flags: u32}, as SpiderMonkey's ObjectElements; Props holds one word pointing at it, never null
+   (a static empty block, as SpiderMonkey's and V8's empty stores), where `elems` is now. The
+   sidecar's inline slots, the packed Property deque, the slot map and the mirror go; the named-key
+   index moves into the extras or a word of its own, so a large ordinary map stops carrying a
+   256 B sidecar for one pointer. A Number word is the double itself (TRust JS's Values box
+   everything but Numbers), so no separate double store is needed. Shift keeps its front room as
+   the `shifted` count (SpiderMonkey's numShiftedElements). A block over 64 words keeps a dirty
+   bitmap of 64-word blocks, as PackedBuffer does, in a side record its owner reports.
+2. Kinds. A byte in Props (where mirror_flags is, already read by generated code) holds facts
+   about the words: WORDS (else the dictionary below), NO_HOLES (no hole below the used length,
+   and for an array the used length is its length), NUMBERS (every word a Number) and INT32 (every
+   word an exact int32: MIRROR_ALL_I32's meaning), and, as open question 2 decides, SEALED and
+   FROZEN. Stores keep them exact: a hole clears NO_HOLES, a non-Number clears NUMBERS and INT32, a
+   fraction INT32. Unlike the exemplars' one-way kinds they may be proven again by a bounded scan,
+   as packed_all_plain and the mirror's preparation do today (open question 3): chai fills 216,321
+   arrays from the top down, and a one-way bit would keep them off the packed-only paths for life.
+   Generated code never relies on NO_HOLES (it tests the hole word); builtins re-check it under
+   the cache rules they use today. This byte is what W4 records for elements kinds.
+3. The dictionary. A non-plain element (an accessor, or attributes other than writable,
+   enumerable, configurable) and an index past the sparse limit leave the words for the named
+   entries, as SpiderMonkey does: that index alone, its word becoming a hole, with `has_far`
+   (SpiderMonkey's `Indexed`) set (open question 1 has V8's and JSC's whole-array form). Index keys
+   in the named entries keep the map's key index once there are more than eight (828ec3f6's rule),
+   so a dictionary lookup is a hash probe. The sparse limit follows V8: a gap of
+   1024 past capacity, or a growth to nine times the dictionary capacity the used elements need
+   (open question 5); and the way back follows V8's rule (words when they would take at most twice
+   the dictionary's room), checked as SpiderMonkey does only when the dictionary's count reaches a
+   power of two, and only when every dictionary index is a plain data property.
+4. Specification equivalence of the transition. The abstract state of an array is its own
+   properties (each key's value or accessor pair and attributes), their [[OwnPropertyKeys]] order,
+   [[Extensible]], [[Prototype]] and `length` with its writability. Both representations encode
+   that state: a word w at index i is the property {[[Value]]: w, [[Writable]], [[Enumerable]],
+   [[Configurable]]: true} (with SEALED or FROZEN clearing the bits they clear), a hole is no
+   property, and a dictionary entry is its key's Property. Every internal method computes from
+   the abstract state alone: [[GetOwnProperty]], [[DefineOwnProperty]] (§10.4.2.1 for arrays,
+   §10.1.6.3 ValidateAndApplyPropertyDescriptor), [[HasProperty]], [[Get]], [[Set]] (§10.1.9.2,
+   where a hole consults the prototype chain in both forms), [[Delete]], and [[OwnPropertyKeys]]
+   (§10.1.11.1: integer indices ascending first, which ordered_keys produces by sorting the
+   indices of both stores, then strings and symbols in creation order, which index keys never
+   enter). The transition maps each word to exactly that property and each hole to absence, and
+   changes nothing else; it runs inside the internal method that needs it, after that method's
+   observable steps (ToPropertyKey, ToPropertyDescriptor and their author code) and before it
+   returns, runs no author code and allocates only storage blocks, which never collects (collections
+   run at safepoints). Hence no program can tell whether or when it ran. Three consequences must
+   hold in the code and are where the risk lies: ArraySetLength deletes from the top and stops at
+   the first non-configurable index over both stores (§10.4.2.4; highest_nonconfig_index_from
+   already scans both); a for-in enumeration in progress must not re-visit or resurrect an index
+   the transition moved (EnumerateObjectProperties; arrays' keys are not cached today,
+   enumeration_layout returns None for array maps, value.rs:8346); and the indexed-prototype
+   protector moves whenever the transition gives a prototype an indexed accessor (the epoch bump
+   note_structural already makes for marked prototypes). The way back maps each plain dictionary
+   entry to its word, and is legal only when no entry is an accessor or has other attributes, so
+   the same argument covers it.
+5. Generated code (ARM64 only; x86-64 calls helpers for every element operation and changes only
+   where Props' or Object's offsets move). A read becomes: the receiver tag, the key's u32 round
+   trip, the payload, the exotic and `ic_plain` bytes (21 instructions), the elements word, its
+   used length, the bound, the word itself, the hole test, the commit: about 33 instructions and
+   8 loads against 46-48 and 11 through packed storage and 39 through the mirror. A store takes
+   any value: it tests the kind byte for FROZEN or SEALED (if they are kinds) and updates NUMBERS
+   and INT32, stores the word, and card-marks the owner when the value is a cell (the named-store
+   barrier, emit_card_mark at jit.rs:11809), calling the helper for a block with a dirty bitmap;
+   an append within capacity bumps the used length and `length`. The map/filter append, `in`,
+   UpdateElem, computed method calls, the self-hosted pair and the numeric loop chains read the
+   same words (the loops lose the mirror's separate pointer and test NUMBERS/INT32 instead of the
+   mirror flags). Dump checks change in exactly these templates (the element sequences, the
+   elements and kind offsets) and in every template whose Props or Object offsets move; typed
+   arrays' templates do not change.
+6. The collector traces a block's used words, not its capacity, and skips a NUMBERS block
+   entirely, as V8 and JSC skip double and int32 stores; a minor collection's remembered trace of
+   a large block keeps today's dirty bitmap.
+7. Builtins, interpreter, VM: the dense paths that take `&[Property]` (searches, shift, unshift,
+   splice, reverse, sort, fill, copyWithin, concat, slice, join, JSON, spread, argument lists,
+   push and pop and their intrinsics) take `&[Value]` words, searches as word compares; the
+   creation paths (make_array, make_array_from_raw, packed_array_named, templates) copy words into
+   an exact-size block instead of initializing a 256 B sidecar (Splay spends 6.8% of its
+   instructions creating its payload arrays, the sustained workload 4.8% creating pairs).
+   Non-array maps keep index keys in the named entries (open question 7), arguments objects with
+   W3's argument work.
+
+Order, each series behaviour-preserving, with Test262 identical, difftest, the fixtures' output,
+and the dump checks changing only as stated:
+1. The census in the tree: TRUST_JS_GC_LOG's element counts and bytes per collection, and the
+   kind byte's facts computed beside today's storage (no layout change, no dump change).
+2. Words: packed storage becomes the word block (the inline slots and the Property deque go), a
+   non-plain element leaves for the named entries, JIT reads and the existing Number stores read
+   words. Dumps: the element
+   templates' sequences and offsets.
+3. The mirror goes: NUMBERS and INT32 in the kind byte, numeric chains over words, the classic
+   slot map gone (non-array index keys through the key index).
+4. Stores of any value and appends in line on ARM64, with the card mark (the 12.9M helper calls
+   of chai's run).
+5. The collector: NUMBERS skips, used length only.
+6. The sparse limit and the way back to words (farcliff's gap to Node goes here).
+7. As the owner decides: SEALED and FROZEN kinds, `length` in the header (open question 6).
+
+Predicted gains, against main d74d9c0b:
+- Bytes: the model above. Splay's live heap -41.0 MB (-16.6%) and its peak RSS by about as much
+  in proportion (V8's sizing scales its limit with the live size): about -160 MB of 1006; chai,
+  React, Djot and sustained -6% to -16.5% of their live heaps; Vue -1.8%; the fixtures' peak RSS
+  within a megabyte (Djot about -0.5 MB). The sustained workload allocates 90 MB less.
+- Instructions, from the shares and per-operation counts above: chai -4% to -6% (reads about -12
+  of 46-51 each over 104.5M reads, -1.4%; its 12.9M stores in line instead of a helper path that
+  takes about 300 instructions a store, -3% to -4%; no mirror upkeep, -0.7%); React -3% (the
+  self-hosted pair about -17 and the append about -12 over 0.45M iterations each; -5% with
+  `length` in the header); sustained -3% to -4% (creation halved, the element trace halved);
+  Splay about -8% a run (the element trace, 5%, gone; creation halved); Vue and Djot -0.2% to
+  -0.7% (most of Vue's element operations reach helpers, 69% of its stack reads and all of its
+  stores, likely through its reactive Proxies, which W2c does not change).
+- Collection time: Splay's marking -9% from skipping its numeric arrays, and its minor collections
+  by about the 16% fewer bytes they promote; the sustained workload's marking about -15% (half the
+  bytes per element traced); the sustained workload's minor collections fewer by the pairs'
+  bytes. The finalizer share of the W2 exit was W2a's and is met.
+
+Risks:
+- The JIT's element templates on ARM64 change (reads, the new stores with their barrier, the
+  numeric chains); the dump checks and difftest must hold, and GC stress on the element tests
+  because stores of cells into old arrays are new to generated code.
+- The transition must be exactly specification-equivalent (Design 4); the census found no array
+  in the acceptance set that takes it, so Test262's Array and Object suites, the edge battery
+  above and difftest are its tests.
+- The kind byte's facts are proofs generated code and the collector trust (NUMBERS skips tracing):
+  a missed clear is a use-after-free. Debug builds verify the facts at every collection, as heap
+  verification checks the barrier.
+
+Exit (proposed, within W2's): Splay's live heap at or below 206 MB (-16%; the rest of the halving
+is W2d's and the open questions'); live element bytes (arrays' cells and storage) at least 35%
+lower on Splay, chai, React and Djot; the fixtures' peak RSS at or below today's (Vue 23.9, React
+15.1, Djot 40.7 MB) and the close-out's (27, 19, 40; Djot's 40 against today's 40.7 wants both
+binaries measured together, since peak RSS follows page-cache state); pinned instructions chai
+-3% or better, React -2% or better, Vue and Djot no worse than noise; one 8-byte load per element
+read and no descriptor test in generated code; the far-index cliff gone (farcliff.js within 2x of
+Node); Test262 identical; dump checks unchanged apart from the element templates and moved
+offsets.
+
+Open questions for the owner:
+1. A non-plain element: that index alone into the named entries (SpiderMonkey), or the whole array
+   into a dictionary (V8, JSC)? Recommended: SpiderMonkey's. TRust JS's `has_far` already is
+   SpiderMonkey's `Indexed`, the move is O(1), the other elements keep their words, and the
+   equivalence argument is the same; no acceptance workload takes either.
+2. Integrity levels: SEALED and FROZEN as kinds over the words (V8, SpiderMonkey), or the
+   dictionary (JSC)? Recommended: kinds, as V8 and SpiderMonkey do: reads do not change, stores
+   already read the byte, and frozen arrays occur outside the acceptance set, which has none (a
+   tagged template's strings array is frozen by the specification).
+3. NO_HOLES (and NUMBERS) one-way, as all three exemplars' kinds and flags are, or re-provable by a
+   bounded scan, as today's proof and mirror are? Recommended: re-provable. The exemplars' tiers
+   specialize on kinds and avoid invalidation by never going back; TRust JS's templates test the
+   hole word and its builtins re-check the proof, and chai's 216,321 top-down fills would
+   otherwise stay holey.
+4. Remembered-set precision for stores into large blocks from generated code: helper calls for
+   blocks with a dirty bitmap at first (as above), or the bitmap update in line now? V8 sets a
+   bit per slot, SpiderMonkey records ranges past 256 elements and whole cells below, JSC whole
+   cells. Recommended: the helper first; in line with W2f, which touches the same barrier.
+5. The sparse limit: V8's gap of 1024 and its density rule, SpiderMonkey's 1000 and 1/8, or
+   JSC's 1000 past the vector or 100,000 at 1/8? Recommended: V8's, the engine whose sizing P1
+   already follows.
+6. `length`: keep it an ordinary named entry, or move it into the elements header with a
+   LENGTH_RO kind bit, as SpiderMonkey and JSC do (V8 keeps it in the JSArray)? It costs 21 of the
+   map/filter append's ~75 instructions and every `length` read's named lookup, but touches every
+   `length` path (the named ICs' array cases, ArraySetLength, ordered_keys, descriptors).
+   Recommended: the header, as W2c's step 7, after the words have landed.
+7. Non-array maps with index keys (ordinary objects, arguments): words too, as every exemplar
+   gives all objects elements, or the named entries with their key index? Recommended: the named
+   entries for now (the census finds at most 290 such live objects and nothing hot), arguments with
+   W3's argument work, String wrappers made exotic with W2g.
+8. Copy-on-write literal elements (V8, JSC; SpiderMonkey removed them) or elements in the cell for
+   small arrays (SpiderMonkey's fixed elements)? Either takes Splay to about -47% with W2d's
+   128 B cells (-24.6 MB each, against the exit's halving); neither is W2c's. Recommended: decide
+   with W2d's cell size, measuring both on Splay and on the fixtures' allocation.
