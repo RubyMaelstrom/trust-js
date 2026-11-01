@@ -3917,6 +3917,47 @@ uniform across nursery sizes). After the static globals and W3 item 7's megamorp
 chai's name resolution is 2.32% (from 4.60% at the class step), deep-chain stubs 0.02%: those
 reads were not hot. Not landed.
 
+Then step 3's stores and updates (769afe06, 2026-11-01). An assignment, compound assignment or
+`++`/`--` of a free name whose binding a planned record holds, and which is mutable (planned
+bindings now carry that: not a `const` or `using` binding, a class's own name, a function
+expression's self-name or `this`), writes the binding in place: the VM walks the static hops
+and writes through the record's mutable borrow, the write barrier; ARM64 takes the
+own-activation store and update templates with the hops walked first (the TDZ test of a lexical
+binding's old word, the card mark unless the word is a Number). A store in the TDZ and every
+immutable binding's keep the checked path, which throws; the VM fills the site's name cache once
+for x86-64's probe, as a static read does. Against 0422d291 (fat LTO, pinned; nursery means,
+then least of 3): Vue -0.73% (-14M at every nursery size; -0.73%), Djot +0.00% (-0.02%), React
++0.01% (+0.01%), chai -0.00%. Tests: scope_plan_tests' store case in every tier at thresholds 0
+and 8 (outer var and let stores, compound assignments and updates, objects stored through the
+barrier, const, class-name and self-name stores, a `valueOf` reassigning the variable during
+`++`, stores and updates in the TDZ), the targeted filters with update, assign and store, fmt,
+clippy in three configurations, GC stress on scope_plan_tests; zombie's x86-64 clippy and 280
+targeted tests. Read sites left dynamic on the fixtures after this series: Vue 12 of 322, Djot
+74 of 1001 (mostly globals under functions no plan reaches: class field initializers' closures,
+encoded bodies).
+
+Found on the way, for the owner (no change made): the tier-up threshold is the largest lever
+left on React and Djot. The fixtures run at the default of 8 calls before a function tiers up to
+bytecode; React's `reducerBatch`, called twice, stays in the tree-walker (its name lookups, 3% of
+React's instructions, are the tree-walker's, which Decision 21's last step, coordinates for the
+tree-walker, would address). V8, SpiderMonkey and JSC compile a function to bytecode at its first
+call and run cold code in a bytecode interpreter. Main's instructions by threshold (fat LTO,
+pinned; compile work included):
+
+| threshold | React | Vue | Djot |
+| --- | --- | --- | --- |
+| 0 (Scripts too) | 3.633e8 (-17.3%) | 1.943e9 (+1.2%) | 6.726e8 (-5.2%) |
+| 1 | 3.711e8 (-15.5%) | 1.918e9 (-0.1%) | 6.654e8 (-6.2%) |
+| 2 | 4.490e8 (+2.2%) | 1.920e9 (-0.1%) | 6.706e8 (-5.5%) |
+| 8 (default) | 4.393e8 | 1.921e9 | 7.097e8 |
+| 32 | 4.405e8 | 1.927e9 | 7.614e8 |
+| 128 | 4.445e8 | 1.978e9 | 9.289e8 |
+
+chai at 1 against 8: -0.16%. Peak RSS at 1 against 8 within noise (React 15.4-16.7 MB against
+14.9-16.0, Vue 23.1-23.5 against 23.0-24.4, Djot 36.7-37.9 against 36.1-37.2). Threshold 2's
+React is not monotonic and unexplained. Before any change: Octane, Web Tooling and startup time,
+and TRust's own UI, on a quiet machine.
+
 ### Stage-exit timing (2026-10-28)
 
 Six fat-LTO builds from `git archive` exports (rustc 1.99.1): base 73e328fa (P2's base, the
