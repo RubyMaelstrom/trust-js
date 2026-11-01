@@ -4997,3 +4997,48 @@ Four parts, each landed with its tests, and the dump checks where templates chan
    x86-64 calls helpers for every element operation and changes only where offsets move.
 2d. Measures against the parent: the census's element bytes (Splay, chai, React, Djot,
    sustained), fat-LTO instruction counts, and the dump checks (the element templates only).
+
+### Capture summaries in the static snapshot (design and record, 2026-11-01)
+
+The plans' compile-time cost, as the owner chose at W3's stage end ("in the snapshot"), by an
+agent on a branch, reviewed, rebased and landed as 9325b9c0. Snapshot version 6 begins each
+function body's encoding with that function's capture summary: after the body's length, a LEB128
+summary length, a byte of effects (0 when walking the function fails, else 1, plus 2 for an outer
+`this` through its arrow chain, 4 for a direct eval, 8 for a `with`), and the free names, counted
+and in ascending order; then the statements as before. The encoder computes each summary from
+the parsed function with the CaptureScan that reads it, once a function (a memo for one
+encoding gives each enclosing function its inner functions' summaries). A plan's or a
+compilation's scan applies the stored summary of an inner function whose body keeps its
+encoding, without decoding it; the per-bootstrap cache of a3cb1cbf and its guard are gone. A
+mutable access to a body drops its encoding (FunctionBody's DerefMut), so an edited body has no
+stored summary. Validation: both decoders check a summary's structure with its body, so the
+first static decode accepts and rejects what an eager decode does; its content is trusted as the
+statements' are (this build's encoder wrote it; snapshots never outlive a build), test builds
+check every applied summary against walking the function, and a corrupt but well-formed summary
+can only misresolve names within that snapshot, never address past a record (a plan's prefix
+holds only its function's own bindings). V8 saves a lazily compiled function's preparse data
+with it and restores it at its compile (src/ast/scopes.cc:792-797, 1840-1907).
+
+TRust 78435d0's replays, user instructions a steady page against 15ff3892 (median of 3, outputs
+identical): event-loop 961.5 -> 640.4 M (-33.4%), dom-reconcile 7,929.3 -> 7,608.9 M (-4.0%),
+todomvc 2,763.3 -> 2,441.6 M (-11.6%): the prelude's plans 360.4 -> 55.6 M a page,
+decode_function_body 218.5 -> 50.1 M. A process's first page pays 126 M once (summaries at TRust's
+encode, 114.5 M; their checks at the first decode, 16 M); the prelude's snapshot is 2.86 MB, 390 KB
+of it summaries; the runtime CLI's empty script +0.55% (its eager glue decodes check summaries
+they do not use; inferred). Tests: every function's stored summary equals walking it (web and
+node glue, the corpus, TRust's assembled prelude through TRUST_JS_SUMMARY_SOURCE, 7,965
+functions); plans from stored and computed summaries and from the parsed source are equal; a
+bootstrap's plan decodes no inner body. Checks: rustfmt, clippy in the three landing
+configurations, the lib suite in full on Crystal (2,715) and zombie (2,524), TRust's tests (4,072
+with three wall-clock tests rerun alone under the machine's load).
+
+Found, not fixed (for the owner):
+- No prelude function gets static name addressing, before or after: a plan applies an inner
+  function's summary but never records it as a child (only walk_inner_fn does,
+  bytecode.rs:5307), so no prelude function nested in another has an outer context; an
+  event-loop page's 470 compiled name reads are all dynamic. Fixing it turns Decision 21 on across
+  the prelude, which wants its own validation and measurement.
+- About 12.5 M a page of other temporary decodes remain (scan_flags when object-literal methods
+  are created, 9.2 M, and on nested arrows, 3.2 M), syntax-only and storable the same way.
+- The one-time 114.5 M encode, and the plans' own 55.6 M a page, are the "fresh sources" part:
+  folding reference collection into the parser, as V8's preparser does.
