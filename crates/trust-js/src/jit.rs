@@ -2324,7 +2324,9 @@ mod shared_stub_tests {
 
     /// Chunks compiled separately branch to one process-wide copy of each shared stub, and code
     /// running through those copies (free names, property ways, direct calls, intrinsics)
-    /// computes what the tree-walker does.
+    /// computes what the tree-walker does. A Script's own functions read its globals from the
+    /// global environment (`NameValuePtrIn`, Decision 21's static globals); a `new Function`
+    /// body, which no plan covers, keeps the name cache's walk (`NameValuePtr`).
     #[test]
     fn shared_stub_bodies_are_assembled_once_per_process() {
         let source = r#"
@@ -2334,9 +2336,10 @@ mod shared_stub_tests {
             function leaf(v) { return v * 2; }
             function direct(v) { var r = leaf(v); return r; }
             function intr(s, n) { return s.charCodeAt(n); }
+            var dynamic = new Function('return base + 2');
             var t = 0;
             for (var k = 0; k < 50; k++) {
-                t += name() + prop({ x: k, y: 1 }) + direct(k) + intr(text, k % 3);
+                t += name() + dynamic() + prop({ x: k, y: 1 }) + direct(k) + intr(text, k % 3);
             }
             t
         "#;
@@ -2351,7 +2354,7 @@ mod shared_stub_tests {
             }
         }
         assert_eq!(results[0], results[1]);
-        assert_eq!(results[0], "10674");
+        assert_eq!(results[0], "12774");
         if env_flag!("TRUST_JS_JIT_CHUNK_STUBS") || !shared_stubs_enabled() {
             return;
         }
@@ -2367,6 +2370,7 @@ mod shared_stub_tests {
         .unwrap();
         let name_stub = SharedStub::NameValuePtr { property_ok: true }.key();
         assert!(keys.contains(&name_stub));
+        assert!(keys.contains(&SharedStub::NameValuePtrIn.key()));
         assert!(keys
             .iter()
             .any(|&key| matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. })));
