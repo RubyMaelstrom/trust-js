@@ -43,7 +43,6 @@ thread_local! {
     pub(crate) static TEST_PACKED_APPEND_RECEIVER: Cell<usize> = const { Cell::new(0) };
     pub(crate) static TEST_PACKED_APPEND_LENGTH: Cell<usize> = const { Cell::new(0) };
     pub(crate) static TEST_PACKED_APPEND_COMMITS: Cell<usize> = const { Cell::new(0) };
-    pub(crate) static TEST_PACKED_APPEND_HEAP_COMMITS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(all(
@@ -2181,27 +2180,18 @@ pub const H_INTERRUPT: usize = 22;
 /// Exact-PC loop back-edge feedback in diagnostic mode.
 pub const H_LOOP_BACKEDGE: usize = 23;
 
-/// Pure representation preparation: no author code or safepoint. The mirror's storage block is
-/// allocated in the heap, and allocation never collects. The activation owns `raw`; the
-/// optional f64 mirror leaves canonical Property addresses intact.
+/// Pure representation proof: a scan of the element words that makes their kind bits exact
+/// (`Words::reprove`), unless one since the last write already did. No author code, allocation
+/// or safepoint, and no edge changes. The activation owns `raw`.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-unsafe extern "C" fn jit_prepare_packed_numeric_mirror(
-    raw: *const std::cell::RefCell<crate::value::Object>,
-) {
+unsafe extern "C" fn jit_reprove_words(raw: *const std::cell::RefCell<crate::value::Object>) {
     // SAFETY: the activation owns `raw` (see above).
     let object = unsafe { &*raw };
-    let Ok(mut body) = object.try_borrow_mut() else {
-        return;
-    };
-    // The write barrier, as `Gc::borrow_mut` records it: the mirror is a new storage block
-    // (`gc_storage`), which an old array's card must report to the next minor collection.
-    // SAFETY: `raw` is a live object's cell (see above), of the carded object kind.
-    unsafe { crate::gc_core::card_mark(raw.cast()) };
-    if matches!(body.exotic, crate::value::Exotic::Array) && body.ic_plain.get() {
-        body.props.prepare_packed_numeric_mirror();
+    if let Ok(mut body) = object.try_borrow_mut() {
+        body.props.reprove_words();
     }
 }
 
@@ -3146,6 +3136,16 @@ mod asm {
         #[inline]
         pub fn ldr_w_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
             self.mem(LDR_W, rt, rn, imm_bytes);
+        }
+        /// ldur wt, [xn, #simm9] (32-bit; any offset, see `mem`)
+        #[inline]
+        pub fn ldur_w(&mut self, rt: u32, rn: u32, simm9: i32) {
+            self.mem_unscaled(LDR_W, rt, rn, simm9);
+        }
+        /// stur wt, [xn, #simm9] (32-bit; any offset, see `mem`)
+        #[inline]
+        pub fn stur_w(&mut self, rt: u32, rn: u32, simm9: i32) {
+            self.mem_unscaled(STR_W, rt, rn, simm9);
         }
         /// FCVT Sd, Dn / FCVT Dd, Sn. Narrowing uses FPCR's roundTiesToEven default.
         pub fn fcvt_float_width(&mut self, rd: u32, rn: u32, narrow: bool) {
@@ -7824,23 +7824,11 @@ fn emit_method_elem_dense(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
+    if words_inlinable(layout) {
+        emit_word_read(a, layout, 11, 9, 12, slow, commit);
+    }
     a.ldr_imm(12, 11, el);
     a.cbz(12, true, slow);
-    if packed_elem_inlinable(layout) {
-        let classic_dense = a.new_label();
-        emit_packed_elements_base(a, layout, classic_dense);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_HS, slow);
-        a.add_shifted(15, 15, 9, 4); // property_size == 16 (gate above)
-        guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
-        a.ldur(13, 15, layout.property_value as i32);
-        a.mov_imm64(14, crate::value::PACK_EMPTY);
-        a.cmp_reg_x(13, 14);
-        a.b_cond(C_EQ, slow); // an absent own element must still consult the prototype chain
-        a.mov(12, 13);
-        a.b(commit);
-        a.bind(classic_dense);
-    }
     // Dense bounds, then slot = elems[n]; NO_SLOT (0xFFFF_FFFF) is a hole.
     a.ldr_imm(14, 12, evl);
     a.cmp_reg_x(9, 14);
@@ -11271,23 +11259,33 @@ fn emit_update_elem_inline(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
-    // 5. dense element storage; x15 → the element's Property
-    a.ldr_imm(12, 11, el);
-    a.cbz(12, true, slow);
-    if packed_elem_inlinable(layout)
-        && layout.entry_value == layout.property_value
-        && layout.entry_accessor == layout.property_meta
-    {
+    let dec = matches!(
+        kind,
+        UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
+    );
+    let results = a.new_label();
+    // 5. element words: a plain element, so a writable data property; the old value is a
+    // Number (a hole and every other kind are tagged NaNs) → d5.
+    if words_inlinable(layout) {
         let classic = a.new_label();
-        emit_packed_elements_base(a, layout, classic);
+        emit_words_base(a, layout, 11, 15, 14);
+        a.cbz(14, false, classic);
         a.cmp_reg_x(9, 14);
         a.b_cond(C_HS, slow);
-        a.add_shifted(15, 15, 9, 4); // property_size == 16 (packed_elem_inlinable)
-        guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
-        guard_prop_writable(a, 14, 15, layout.property_meta as u32, slow);
-        a.b(element);
+        a.add_shifted(17, 15, 9, 3);
+        a.ldr_imm(16, 17, 0);
+        emit_exec_number_guard(a, 16, 5, 13, slow);
+        // --- commit: d6 = old ± 1 replaces the word, which is no edge; no mirror ---
+        a.fmov_one(7);
+        a.f_arith(if dec { 1 } else { 0 }, 6, 5, 7);
+        emit_exec_number_store(a, 6, 17, 0, 13);
+        emit_word_number_kind(a, layout, 15, 6, 12, 13, 14, 1);
+        a.b(results);
         a.bind(classic);
     }
+    // 6. dense element storage; x15 → the element's Property
+    a.ldr_imm(12, 11, el);
+    a.cbz(12, true, slow);
     a.ldr_imm(14, 12, evl);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
@@ -11302,15 +11300,11 @@ fn emit_update_elem_inline(
     guard_prop_data(a, 14, 15, ea, slow);
     guard_prop_writable(a, 14, 15, ew, slow);
     a.bind(element);
-    // 6. the old value is a Number (a packed hole and every other kind are tagged NaNs) → d5
+    // 7. the old value is a Number (every other kind is a tagged NaN) → d5
     a.ldur(16, 15, ev);
     emit_exec_number_guard(a, 16, 5, 13, slow);
     // --- commit: d6 = old ± 1 replaces [[Value]]; the old Number needs no drop ---
     a.fmov_one(7);
-    let dec = matches!(
-        kind,
-        UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
-    );
     a.f_arith(if dec { 1 } else { 0 }, 6, 5, 7);
     emit_exec_number_store(a, 6, 15, ev, 13);
     // Keep the element mirror coherent (clobbers x9/x12/x13/d1/d2 only).
@@ -11321,6 +11315,7 @@ fn emit_update_elem_inline(
         MirrorKey::F64InDreg(4),
         MirrorVal::Num(6, false),
     );
+    a.bind(results);
     match kind {
         UpdKind::PreInc | UpdKind::PreDec => {
             emit_exec_number_store(a, 6, 20, -16, 9);
@@ -14176,37 +14171,110 @@ fn elem_inlinable(layout: &crate::value::JitLayout) -> bool {
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn packed_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
-    layout.packed_elems_valid
-        && layout.property_size == 16
-        && layout.property_value < 256
-        && layout.property_meta < 4096
-        && layout.dense_packed.is_multiple_of(8)
-        && layout.dense_packed / 8 < 4096
-        && layout.dense_inline_len < 4096
-        && layout.dense_inline_data < 4096
-        && layout.dense_inline_data.is_multiple_of(8)
+fn words_inlinable(layout: &crate::value::JitLayout) -> bool {
+    // The words pointer at a scaled 8-byte offset from the Object, the header's u32 fields
+    // within an unscaled reach before the first word.
+    let words = layout.obj_props + layout.props_words;
+    layout.words_valid
+        && words.is_multiple_of(8)
+        && words / 8 < 4096
+        && [layout.words_used, layout.words_capacity, layout.words_flags]
+            .into_iter()
+            .all(|back| (4..=256).contains(&back) && back.is_multiple_of(4))
 }
 
-/// Resolve either current packed-element representation. x12 owns the live DenseBuffers;
-/// output x15 = Property pointer, x14 = length. A zero inline length means no packed storage.
+/// x`words` = the element words of the Object at x`obj` (W2c, [`crate::value::word_block`]),
+/// w`used` = their used length: zero for a map without words, whose pointer is the static empty
+/// block's.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_packed_elements_base(a: &mut asm::Asm, layout: &crate::value::JitLayout, legacy: usize) {
-    let heap = a.new_label();
-    let ready = a.new_label();
-    a.ldr_imm(15, 12, layout.dense_packed as u32);
-    a.cbnz(15, true, heap);
-    a.ldrb_imm(14, 12, layout.dense_inline_len as u32);
-    a.cbz(14, false, legacy);
-    a.add_imm(15, 12, layout.dense_inline_data as u32);
-    a.b(ready);
-    a.bind(heap);
-    a.ldr_imm(14, 15, layout.vec_len_off as u32);
-    a.ldr_imm(15, 15, layout.vec_ptr_off as u32);
-    a.bind(ready);
+fn emit_words_base(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    obj: u32,
+    words: u32,
+    used: u32,
+) {
+    a.ldr_imm(words, obj, (layout.obj_props + layout.props_words) as u32);
+    a.ldur_w(used, words, -(layout.words_used as i32));
+}
+
+/// Read element x`idx` (a u32) of the Object at x`obj` from its element words into x`out` and
+/// branch to `hit`. A word is a plain data element's value; a map without words falls through
+/// to its classic slots. Past the used words or at a hole, `miss`: the checked operation, which
+/// consults the named entries (an index one of them holds) and the prototype chain. Clobbers
+/// x14 and x15.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_word_read(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    obj: u32,
+    idx: u32,
+    out: u32,
+    miss: usize,
+    hit: usize,
+) {
+    debug_assert!(![14, 15].contains(&out) && ![14, 15].contains(&idx));
+    let classic = a.new_label();
+    emit_words_base(a, layout, obj, 15, 14);
+    a.cbz(14, false, classic);
+    a.cmp_reg_x(idx, 14);
+    a.b_cond(C_HS, miss);
+    a.ldr_x_lsl3(out, 15, idx);
+    a.mov_imm64(14, crate::value::PACK_EMPTY);
+    a.cmp_reg_x(out, 14);
+    a.b_cond(C_EQ, miss);
+    a.b(hit);
+    a.bind(classic);
+}
+
+/// After d`value`, a Number, replaces a present element of the words at x`words`: the kind bits
+/// keep NUMBERS and NO_HOLES, and lose INT32 unless the Number is an exact int32 (bit-identical
+/// through an i32: not -0, NaN or a fraction), as `Words::set` keeps them. With INT32 already
+/// clear, the Number may replace the one word that broke a fact, so `KIND_SCANNED` goes too.
+/// Clobbers x`t1`, x`t2`, x`t3` and d`dt`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_word_number_kind(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    words: u32,
+    value: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    dt: u32,
+) {
+    use crate::value::word_block::{KIND_INT32, KIND_SCANNED};
+    let done = a.new_label();
+    let not_int32 = a.new_label();
+    let flags = -(layout.words_flags as i32);
+    a.ldur_w(t1, words, flags);
+    a.logic_imm_w(0, t2, t1, asm::logical_imm_w(KIND_INT32).unwrap());
+    a.cbz(t2, false, not_int32);
+    a.fcvtzs_w_d(t2, value);
+    a.scvtf_d_w(dt, t2);
+    a.fmov_x_d(t2, dt);
+    a.fmov_x_d(t3, value);
+    a.cmp_reg_x(t2, t3);
+    a.b_cond(C_EQ, done);
+    a.logic_imm_w(0, t1, t1, asm::logical_imm_w(!KIND_INT32).unwrap());
+    a.stur_w(t1, words, flags);
+    a.b(done);
+    a.bind(not_int32);
+    a.logic_imm_w(0, t2, t1, asm::logical_imm_w(KIND_SCANNED).unwrap());
+    a.cbz(t2, false, done);
+    a.logic_imm_w(0, t1, t1, asm::logical_imm_w(!KIND_SCANNED).unwrap());
+    a.stur_w(t1, words, flags);
+    a.bind(done);
 }
 
 /// Packed entries can still use the numeric mirror read; the classic entry chase falls back.
@@ -14326,26 +14394,14 @@ fn emit_get_elem_inline_marked(
     a.bind(mirror_number);
     a.b(mirror_hit); // a Num
     a.bind(classic);
-    // 5b. dense bounds: n < elems.len (x9's upper bits are zero from the w-form fcvtzu)
+    // 5b. element words: a plain element's value in one indexed load, with no index string or
+    // entry-table chase; a hole is absent and consults the prototype chain.
+    if words_inlinable(layout) {
+        emit_word_read(a, layout, 11, 9, 12, slow, mirror_hit);
+    }
+    // 5c. dense bounds: n < elems.len (x9's upper bits are zero from the w-form fcvtzu)
     a.ldr_imm(12, 11, el);
     a.cbz(12, true, slow);
-    if packed_elem_inlinable(layout) {
-        let classic_dense = a.new_label();
-        emit_packed_elements_base(a, layout, classic_dense);
-        // Packed elements are a keyless Vec<Property>: Empty remains a semantic hole, while a
-        // live data slot can be decoded directly without an index string or entry-table chase.
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_HS, slow);
-        a.add_shifted(15, 15, 9, 4); // property_size == 16 (gate above)
-        guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
-        a.ldur(13, 15, layout.property_value as i32);
-        a.mov_imm64(14, crate::value::PACK_EMPTY);
-        a.cmp_reg_x(13, 14);
-        a.b_cond(C_EQ, slow); // an absent own element must still consult the prototype chain
-        a.mov(12, 13);
-        a.b(mirror_hit);
-        a.bind(classic_dense);
-    }
     a.ldr_imm(14, 12, evl);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
@@ -14556,10 +14612,10 @@ fn emit_set_elem_inline_marked(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, typed);
-    // 5. dense bounds
+    // 5. element words, then dense bounds
+    emit_word_store(a, layout, slow, done, true, keep);
     a.ldr_imm(12, 11, el);
     a.cbz(12, true, slow);
-    emit_packed_element_store(a, layout, slow, done, true, keep);
     a.ldr_imm(14, 12, evl);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
@@ -14621,16 +14677,15 @@ fn emit_set_elem_inline_marked(
     a.bind(done);
 }
 
-/// Numeric overwrites of the current keyless dense storage. ECMA-262 OrdinarySetWithOwnDescriptor
-/// and Array.[[DefineOwnProperty]] permit an existing writable data element to be overwritten
-/// without consulting prototypes or changing length. Holes, accessors, non-writable properties
-/// retain the checked path. No guard follows the first write.
-/// Entry: x12 = DenseElems, x9 = index, x10 = the receiver's cell address, x11 = Object.
+/// Overwrite an existing element word with the Number at `[x20 - 8]`: the machine-code
+/// `Words::set` for a Number, which is no edge (no card, no remembered block) and keeps the
+/// kind bits exact. A map without words falls through to its classic slots; past the used
+/// words or at a hole (a property creation), `slow`. x9 holds the u32 index, x11 the Object.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_packed_element_store(
+fn emit_word_store(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     slow: usize,
@@ -14638,31 +14693,22 @@ fn emit_packed_element_store(
     stack_receiver: bool,
     keep: bool,
 ) {
-    if !packed_elem_inlinable(layout)
-        || layout.entry_value != layout.property_value
-        || layout.entry_accessor != layout.property_meta
-    {
+    if !words_inlinable(layout) {
         return;
     }
     let classic = a.new_label();
-    emit_packed_elements_base(a, layout, classic);
+    emit_words_base(a, layout, 11, 15, 14);
+    a.cbz(14, false, classic);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
-    a.add_shifted(15, 15, 9, 4);
-    guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
-    guard_prop_writable(a, 14, 15, layout.property_meta as u32, slow);
-    emit_packed_existing_guard(a, layout, 15, slow);
+    a.ldr_x_lsl3(12, 15, 9);
+    a.mov_imm64(14, crate::value::PACK_EMPTY);
+    a.cmp_reg_x(12, 14);
+    a.b_cond(C_EQ, slow);
     emit_stack_number_load(a, -8, slow);
-    a.stur(16, 15, layout.property_value as i32);
-    // The canonical packed property stays authoritative. Hot numeric arrays can also own an
-    // f64 mirror; this numeric write preserves it exactly, including -0/NaN.
-    emit_mirror_store(
-        a,
-        layout,
-        11,
-        MirrorKey::StackF64(-16),
-        MirrorVal::Stack(-8),
-    );
+    // --- commit: the Number's word, then the kind bits ---
+    a.str_x_lsl3(16, 15, 9);
+    emit_word_number_kind(a, layout, 15, 1, 12, 13, 14, 2);
     let consumed = if stack_receiver { 24 } else { 16 };
     if keep {
         // The expression result retains the original Number, including signed zero and NaN.
@@ -14790,23 +14836,13 @@ fn emit_in_keyed(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
-    // 4. element storage sidecar (none: no elements to find here).
+    // 4. element words: a word that is not a hole is a present own element.
+    if words_inlinable(layout) {
+        emit_word_read(a, layout, 11, 9, 13, slow, present);
+    }
+    // 5. element storage sidecar (none: no elements to find here).
     a.ldr_imm(12, 11, el);
     a.cbz(12, true, slow);
-    if packed_elem_inlinable(layout) {
-        // Packed: a non-Empty Property at n (data or accessor) is a present own element.
-        let classic = a.new_label();
-        emit_packed_elements_base(a, layout, classic);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_HS, slow);
-        a.add_shifted(15, 15, 9, 4); // property_size == 16 (gate above)
-        a.ldur(13, 15, layout.property_value as i32);
-        a.mov_imm64(14, crate::value::PACK_EMPTY);
-        a.cmp_reg_x(13, 14);
-        a.b_cond(C_EQ, slow);
-        a.b(present);
-        a.bind(classic);
-    }
     // Classic: elems[n] names the element's entry slot, NO_SLOT (0xFFFF_FFFF) a hole.
     a.ldr_imm(14, 12, evl);
     a.cmp_reg_x(9, 14);
@@ -14858,15 +14894,9 @@ fn emit_in_keyed(
 ))]
 fn define_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
     let props = layout.obj_props;
-    let mirror = layout.dense_mirror;
     crate::value::dense_elements_enabled()
         && elem_inlinable(layout)
-        && packed_elem_inlinable(layout)
-        // The length entry and the packed elements are both `Property` values.
-        && layout.entry_size == layout.property_size
-        && layout.entry_value == layout.property_value
-        && layout.entry_accessor == layout.property_meta
-        && layout.dense_inline_capacity < 256
+        && words_inlinable(layout)
         && [
             layout.obj_extensible,
             props + layout.props_proto_flag,
@@ -14878,14 +14908,6 @@ fn define_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
         .all(|off| off < 4096)
         && slot_memo_fits(layout, props + layout.props_len_slot)
         && fields_data_fits(layout)
-        && [
-            mirror + layout.vec_ptr_off,
-            mirror + layout.vec_len_off,
-            mirror + layout.vec_cap_off,
-            layout.vec_cap_off,
-        ]
-        .into_iter()
-        .all(|off| off.is_multiple_of(8) && off / 8 < 4096)
 }
 
 /// Inline CreateDataPropertyOrThrow(A, k, V) ([`crate::bytecode::AbstractOp`]; ECMA-262 §7.3.7)
@@ -14907,21 +14929,10 @@ fn emit_define_elem_inline(
     pc: u32,
     l_unwind: usize,
 ) {
-    use crate::value::{MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK, MIRROR_PACKED};
     debug_assert!(define_elem_inlinable(layout));
     let props = layout.obj_props as u32;
-    let mirror = layout.dense_mirror as u32;
-    let (vec_ptr, vec_len, vec_cap) = (
-        layout.vec_ptr_off as u32,
-        layout.vec_len_off as u32,
-        layout.vec_cap_off as u32,
-    );
     let slow = a.new_label();
     let done = a.new_label();
-    let inline = a.new_label();
-    let slot_ready = a.new_label();
-    let no_mirror = a.new_label();
-    let mirror_ready = a.new_label();
     // 1. stack: [A @ -24, k @ -16, V @ -8]. A an Object; k a Number that is exactly a u32 (x9,
     //    d0); V an ordinary value word (x13) that can move into a property.
     emit_exec_word_load(a, 9, 20, -24);
@@ -14968,88 +14979,51 @@ fn emit_define_elem_inline(
     guard_prop_writable(a, 15, 14, layout.entry_writable as u32, slow);
     a.ldur(15, 14, layout.entry_value as i32);
     emit_exec_number_guard(a, 15, 1, 16, slow);
-    // 4. Packed storage ending at k with room for one more (x16 = length, x17 = the new slot;
-    //    x15 = the heap Vec header, or null for inline slots).
-    a.ldr_imm(12, 11, props + layout.props_elems as u32);
-    a.cbz(12, true, slow);
-    a.ldr_imm(15, 12, layout.dense_packed as u32);
-    a.cbz(15, true, inline);
-    a.ldr_imm(16, 15, vec_len);
+    // 4. Element words ending at k with room for one more (x15 = the words, x16 = their used
+    //    length), and no numeric mirror to keep: words keep none, and a map whose mirror is
+    //    live has classic slots, which the checked operation appends to.
+    emit_words_base(a, layout, 11, 15, 16);
     a.cmp_reg_x(9, 16);
     a.b_cond(C_NE, slow);
-    a.ldr_imm(17, 15, vec_cap);
+    a.ldur_w(17, 15, -(layout.words_capacity as i32));
     a.cmp_reg_x(16, 17);
-    a.b_cond(C_HS, slow);
-    a.ldr_imm(17, 15, vec_ptr);
-    a.add_shifted(17, 17, 16, 4); // property_size == 16 (packed_elem_inlinable)
-    a.b(slot_ready);
-    a.bind(inline);
-    a.ldrb_imm(16, 12, layout.dense_inline_len as u32);
-    a.cbz(16, false, slow); // no packed storage yet: the checked operation starts it
-    a.cmp_reg_x(9, 16);
-    a.b_cond(C_NE, slow);
-    a.cmp_imm_w(16, layout.dense_inline_capacity as u32);
-    a.b_cond(C_HS, slow);
-    a.add_imm(17, 12, layout.dense_inline_data as u32);
-    a.add_shifted(17, 17, 16, 4);
-    a.bind(slot_ready);
-    // 5. The numeric mirror (w0 = flags): inactive, or coherent with the packed elements with
-    //    room for V, which must be a Number other than the hole pattern (d2). Anything else is
-    //    the checked operation's to invalidate.
+    a.b_cond(C_HS, slow); // full, or the static empty block: the checked operation grows it
     a.ldrb_imm(0, 11, props + layout.props_mirror_flags as u32);
-    a.cbz(0, false, no_mirror);
-    for bit in [MIRROR_OK, MIRROR_PACKED] {
-        a.logic_imm_w(0, 1, 0, asm::logical_imm_w(bit as u32).unwrap());
-        a.cbz(1, false, slow);
+    a.cbnz(0, false, slow);
+    // 5. The kind bits V keeps (w0): a Number keeps NUMBERS, and INT32 only when it is an
+    //    exact int32 (not -0, NaN or a fraction); any other value keeps NO_HOLES alone. V is
+    //    no hole, so NO_HOLES stays.
+    {
+        use crate::value::word_block::{KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS};
+        let kind_ready = a.new_label();
+        let not_number = a.new_label();
+        a.ldur_w(0, 15, -(layout.words_flags as i32));
+        emit_exec_number_guard(a, 13, 2, 1, not_number);
+        a.fcvtzs_w_d(1, 2);
+        a.scvtf_d_w(3, 1);
+        a.fmov_x_d(1, 3);
+        a.cmp_reg_x(1, 13);
+        a.b_cond(C_EQ, kind_ready);
+        a.logic_imm_w(0, 0, 0, asm::logical_imm_w(!KIND_INT32).unwrap());
+        a.b(kind_ready);
+        a.bind(not_number);
+        a.logic_imm_w(
+            0,
+            0,
+            0,
+            asm::logical_imm_w(!(KIND_NUMBERS | KIND_INT32)).unwrap(),
+        );
+        debug_assert_eq!(KIND_NO_HOLES & (KIND_NUMBERS | KIND_INT32), 0);
+        a.bind(kind_ready);
     }
-    emit_exec_number_guard(a, 13, 2, 1, slow);
-    a.mov_imm64(1, MIRROR_HOLE);
-    a.cmp_reg_x(13, 1);
-    a.b_cond(C_EQ, slow);
-    a.ldr_imm(2, 12, mirror + vec_len);
-    a.cmp_reg_x(2, 16);
-    a.b_cond(C_NE, slow);
-    a.ldr_imm(3, 12, mirror + vec_cap);
-    a.cmp_reg_x(2, 3);
-    a.b_cond(C_HS, slow);
-    // --- commit: element, mirror, length; nothing below can fail ---
-    a.ldr_imm(3, 12, mirror + vec_ptr);
-    a.str_d_lsl3(2, 3, 2);
-    a.add_imm(2, 2, 1);
-    a.str_imm(2, 12, mirror + vec_len);
-    // MIRROR_ALL_I32 survives only an exact i32 (bit-identical round trip: not -0, NaN or a
-    // fraction).
-    a.fcvtzs_w_d(1, 2);
-    a.scvtf_d_w(3, 1);
-    a.fmov_x_d(1, 3);
-    a.cmp_reg_x(1, 13);
-    a.b_cond(C_EQ, mirror_ready);
-    let keep = asm::logical_imm_w(!(MIRROR_ALL_I32 as u32)).unwrap();
-    a.logic_imm_w(0, 0, 0, keep);
-    a.strb_imm(0, 11, props + layout.props_mirror_flags as u32);
-    a.b(mirror_ready);
-    a.bind(no_mirror);
-    // --- commit (no mirror) ---
-    a.bind(mirror_ready);
-    a.stur(13, 17, layout.property_value as i32);
-    a.mov_imm64(
-        1,
-        (crate::value::PROP_WRITABLE
-            | crate::value::PROP_ENUMERABLE
-            | crate::value::PROP_CONFIGURABLE) as u64,
-    );
-    a.stur(1, 17, layout.property_meta as i32);
-    // The write barrier (site E): the array's cell starts at x10.
+    // --- commit: the word, its kind bits, the card, the used length; nothing below can fail ---
+    a.str_x_lsl3(13, 15, 16);
+    a.stur_w(0, 15, -(layout.words_flags as i32));
+    // The write barrier (site E): the array's cell starts at x10. The word is past the
+    // block's traced length (an append), so its remembered record needs no dirty block.
     emit_card_mark(a, 10, 9, 17);
     a.add_imm(16, 16, 1);
-    let inline_appended = a.new_label();
-    let appended = a.new_label();
-    a.cbz(15, true, inline_appended);
-    a.str_imm(16, 15, vec_len);
-    a.b(appended);
-    a.bind(inline_appended);
-    a.strb_imm(16, 12, layout.dense_inline_len as u32);
-    a.bind(appended);
+    a.stur_w(16, 15, -(layout.words_used as i32));
     // k ≥ length: length = k + 1 (exact: k < 2^32 − 1 because it equals a storage length).
     let length_kept = a.new_label();
     a.fcmp(0, 1);
@@ -15073,11 +15047,6 @@ fn emit_define_elem_inline(
         a.cmp_reg_x(16, 17);
         a.b_cond(C_NE, skip);
         a.mov_imm64(9, TEST_PACKED_APPEND_COMMITS.with(Cell::as_ptr) as u64);
-        a.ldr_imm(17, 9, 0);
-        a.add_imm(17, 17, 1);
-        a.str_imm(17, 9, 0);
-        a.cbz(15, true, skip);
-        a.mov_imm64(9, TEST_PACKED_APPEND_HEAP_COMMITS.with(Cell::as_ptr) as u64);
         a.ldr_imm(17, 9, 0);
         a.add_imm(17, 17, 1);
         a.str_imm(17, 9, 0);
@@ -15332,27 +15301,15 @@ fn emit_elem_local_keyed(
         a.b(mirror_hit);
     }
     a.bind(classic);
-    // 5b. dense bounds
+    // 5b. element words
+    if !get {
+        emit_word_store(a, layout, slow, done, false, kind == ElemLocalKind::SetKeep);
+    } else if words_inlinable(layout) {
+        emit_word_read(a, layout, 11, 9, 12, slow, mirror_hit);
+    }
+    // 5c. dense bounds
     a.ldr_imm(12, 11, el);
     a.cbz(12, true, slow);
-    if !get {
-        emit_packed_element_store(a, layout, slow, done, false, kind == ElemLocalKind::SetKeep);
-    }
-    if get && packed_elem_inlinable(layout) {
-        let classic_dense = a.new_label();
-        emit_packed_elements_base(a, layout, classic_dense);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_HS, slow);
-        a.add_shifted(15, 15, 9, 4);
-        guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
-        a.ldur(13, 15, layout.property_value as i32);
-        a.mov_imm64(14, crate::value::PACK_EMPTY);
-        a.cmp_reg_x(13, 14);
-        a.b_cond(C_EQ, slow);
-        a.mov(12, 13);
-        a.b(mirror_hit);
-        a.bind(classic_dense);
-    }
     a.ldr_imm(14, 12, evl);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
@@ -15509,23 +15466,22 @@ fn emit_local_own_dense_data_guard(
     // its live dense sidecar, while this flag rules out any other side-table behavior.
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
-    a.ldr_imm(12, 11, el);
-    a.cbz(12, true, slow);
 
     let classic_dense = a.new_label();
     let entry_ready = a.new_label();
-    if packed_elem_inlinable(layout) {
-        // Current packed element words place the descriptor flags beside its value.
-        // The legacy branch below covers dense buffers without packed element storage.
-        emit_packed_elements_base(a, layout, classic_dense);
+    if words_inlinable(layout) {
+        // An element word is a plain data element's value; a hole fails below. A map without
+        // words takes its classic slots.
+        emit_words_base(a, layout, 11, 15, 14);
+        a.cbz(14, false, classic_dense);
         a.cmp_reg_x(9, 14);
         a.b_cond(C_HS, slow);
-        a.add_shifted(15, 15, 9, 4);
-        guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
-        a.ldur(12, 15, layout.property_value as i32);
+        a.ldr_x_lsl3(12, 15, 9);
         a.b(entry_ready);
     }
     a.bind(classic_dense);
+    a.ldr_imm(12, 11, el);
+    a.cbz(12, true, slow);
     // A classic dense index names an entry slot; NO_SLOT is a hole. Inherited values are
     // deliberately not accepted here: the checked HasProperty path handles them.
     a.ldr_imm(14, 12, evl);
@@ -15583,17 +15539,18 @@ fn emit_local_assumed_dense_data_value(
     emit_exec_word_load(a, 10, 22, receiver_off as i32);
     emit_exec_payload(a, 10, 10);
     a.add_imm(11, 10, obj_off);
-    a.ldr_imm(12, 11, el);
 
     let classic_dense = a.new_label();
     let entry_ready = a.new_label();
-    if packed_elem_inlinable(layout) {
-        emit_packed_elements_base(a, layout, classic_dense);
-        a.add_shifted(15, 15, 9, 4);
-        a.ldur(12, 15, layout.property_value as i32);
+    if words_inlinable(layout) {
+        // The representation the guard proved: words in use, or the classic slots.
+        emit_words_base(a, layout, 11, 15, 14);
+        a.cbz(14, false, classic_dense);
+        a.ldr_x_lsl3(12, 15, 9);
         a.b(entry_ready);
     }
     a.bind(classic_dense);
+    a.ldr_imm(12, 11, el);
     a.ldr_imm(12, 12, evp);
     a.add_shifted(12, 12, 9, 2);
     a.ldr_w_imm(13, 12, 0);
@@ -16682,14 +16639,12 @@ fn emit_chain_marked(
                             a.b_cond(C_NE, no_mirror);
                             a.ldr_imm(12, 11, mirror);
                             a.cbz(12, true, no_mirror);
-                            if packed_elem_inlinable(layout) {
+                            if words_inlinable(layout) {
                                 // Only indexed entry storage is updated alongside this pinned
-                                // mirror. A keyless packed store invalidates its optional mirror;
-                                // never retain such a pointer across a store through an alias.
-                                a.ldr_imm(13, 12, layout.dense_packed as u32);
-                                a.cbnz(13, true, no_mirror);
-                                a.ldrb_imm(13, 12, layout.dense_inline_len as u32);
-                                a.cbnz(13, false, no_mirror);
+                                // mirror. A map with element words in use keeps none, and its
+                                // accesses take the words below.
+                                emit_words_base(a, layout, 11, 13, 14);
+                                a.cbnz(14, false, no_mirror);
                             }
                             a.ldr_imm(mpreg, 12, mvp);
                             a.ldr_imm(mlreg, 12, mvl);
@@ -16758,44 +16713,30 @@ fn emit_chain_marked(
                     a.b(packed_done);
                     a.bind(native_elements);
                 }
-                if packed_elem_inlinable(layout)
-                    && layout.entry_value == layout.property_value
-                    && layout.entry_accessor == layout.property_meta
-                {
+                if words_inlinable(layout) {
                     // The receiver is already validated (and cached across this helper-free
-                    // chain). Packed array literals have no legacy numeric mirror.
+                    // chain). Element words are plain data elements, an f64 array in place
+                    // where they hold Numbers; a map without words takes its classic slots.
                     let indexed = a.new_label();
-                    a.ldr_imm(12, 11, el);
-                    a.cbz(12, true, guard!());
-                    emit_packed_elements_base(a, layout, indexed);
+                    emit_words_base(a, layout, 11, 15, 14);
+                    a.cbz(14, false, indexed);
                     a.cmp_reg_x(9, 14);
                     a.b_cond(C_HS, guard!());
-                    a.add_shifted(15, 15, 9, 4);
-                    guard_prop_data(a, 14, 15, layout.property_meta as u32, guard!());
+                    a.ldr_x_lsl3(12, 15, 9);
                     if is_set {
-                        guard_prop_writable(a, 14, 15, layout.property_meta as u32, guard!());
-                    }
-                    if is_set {
-                        emit_packed_existing_guard(a, layout, 15, guard!());
+                        // An existing element: a hole store would create a property.
+                        a.mov_imm64(14, crate::value::PACK_EMPTY);
+                        a.cmp_reg_x(12, 14);
+                        a.b_cond(C_EQ, guard!());
+                        // The Number's word, its NaN the canonical one.
+                        a.add_shifted(13, 15, 9, 3);
+                        emit_exec_number_store(a, dv, 13, 0, 14);
+                        emit_word_number_kind(a, layout, 15, dv, 12, 13, 14, 1);
                     } else {
-                        emit_packed_number_read_guard(a, layout, 15, guard!());
-                    }
-                    if is_set {
-                        a.fmov_x_d(16, dv);
-                        a.fcmp(dv, dv);
-                        let encoded = a.new_label();
-                        a.b_cond(C_VS ^ 1, encoded);
-                        a.mov_imm64(16, f64::NAN.to_bits());
-                        a.bind(encoded);
-                        a.stur(16, 15, layout.property_value as i32);
-                        emit_mirror_store(
-                            a,
-                            layout,
-                            11,
-                            MirrorKey::F64InDreg(dk),
-                            MirrorVal::Num(dv, false),
-                        );
-                    } else {
+                        // A Number: a hole and every other kind are tagged NaNs. The guard
+                        // checks through scratch d0, as dk still holds the key a bailout
+                        // replays with.
+                        emit_exec_number_guard(a, 12, 0, 14, guard!());
                         a.fmov_d_x(dk, 12);
                     }
                     a.b(packed_done);
@@ -17238,24 +17179,22 @@ struct ReceiverPlan {
     off: u32,
     /// x16/x17 (receivers 3-4 draw from the pin pool): the validated object base.
     reg: u32,
-    /// Element accesses go through the raw-f64 mirror (preamble-proven coherent and hole-free;
-    /// the buffer pointer/length load per access — same cache line, far cheaper than the
-    /// entry chase they replace).
+    /// Element accesses go straight to the element words (W2c), which the preamble proves in
+    /// use, Numbers and hole-free by their kind bits: an f64 array in place (the words pointer
+    /// and used length load per access unless pinned).
     mirror: bool,
     /// Any int-typed element read flows from this receiver (preamble then requires
-    /// `MIRROR_ALL_I32`, letting those reads use a bare fcvtzs).
+    /// `KIND_INT32`, letting those reads use a bare fcvtzs).
     int_reads: bool,
-    /// A numeric store in the region can clear ALL_I32 on this receiver through an alias.
+    /// A numeric store in the region can clear INT32 on this receiver through an alias.
     /// Such reads must revalidate the fact at the read, not truncate under the entry proof.
     recheck_i32: bool,
-    /// Leftover pin registers holding the mirror length / mirror data / elems data / entries
-    /// data pointers (all stable in-region: the vocabulary is helper-free and slim stores
-    /// never grow or reallocate). Each pin shaves a dependent load off every element access —
-    /// the hot lin_solve-shape loop hits one receiver 5-6 times per iteration.
+    /// Leftover pin registers holding the used length and the words pointer (stable in-region:
+    /// the vocabulary is helper-free and its stores never grow or reallocate). Each pin shaves
+    /// a dependent load off every element access — the hot lin_solve-shape loop hits one
+    /// receiver 5-6 times per iteration.
     mlreg: Option<u32>,
     mpreg: Option<u32>,
-    elpreg: Option<u32>,
-    enreg: Option<u32>,
 }
 
 /// Integer-range bookkeeping for iv decisions: |v| ≤ 2^exp and integral. 255 = unknown/not
@@ -18339,7 +18278,6 @@ fn plan_loop(
     // the pool still has after that pins the per-receiver vector fields, most-used first:
     // mirror length and data (every access), then elems/entries data (stores only).
     let mut rplans: Vec<ReceiverPlan> = Vec::new();
-    let written: Vec<u32> = elem_writes.iter().map(|&(_, off)| off).collect::<Vec<_>>();
     for (k, &off) in receivers.iter().enumerate() {
         let reg = if k < 2 {
             16 + k as u32
@@ -18357,8 +18295,6 @@ fn plan_loop(
             recheck_i32: rcv_int.contains(&off) && setelem_i32.values().any(|&exact| !exact),
             mlreg: None,
             mpreg: None,
-            elpreg: None,
-            enreg: None,
         });
     }
     if fast & 262144 != 0 {
@@ -18375,10 +18311,6 @@ fn plan_loop(
             let rp = &mut rplans[k];
             rp.mlreg = free_pin_x.pop();
             rp.mpreg = free_pin_x.pop();
-            if written.contains(&rp.off) {
-                rp.elpreg = free_pin_x.pop();
-                rp.enreg = free_pin_x.pop();
-            }
         }
     }
     let receivers = rplans;
@@ -18449,12 +18381,7 @@ fn plan_loop(
     if env_flag!("TRUST_JS_JIT_LOOPLOG") {
         let vec_pins: usize = receivers
             .iter()
-            .map(|r| {
-                [r.mlreg, r.mpreg, r.elpreg, r.enreg]
-                    .iter()
-                    .filter(|p| p.is_some())
-                    .count()
-            })
+            .map(|r| [r.mlreg, r.mpreg].iter().filter(|p| p.is_some()).count())
             .sum();
         eprintln!(
             "[jit-loop] head {head}: CHAINED {} ops, {} slots ({} I), {} receivers ({} vec pins), {} names, memo elem {}r/{}u conv {}r/{}u",
@@ -18473,13 +18400,10 @@ fn plan_loop(
             conv_reuse.len()
         );
     }
-    let uses_ext = receivers.iter().any(|r| {
-        r.reg >= 23
-            || [r.mlreg, r.mpreg, r.elpreg, r.enreg]
-                .iter()
-                .flatten()
-                .any(|&x| x >= 23)
-    }) || elem_retain.iter().any(|&(_, p)| p >= 23)
+    let uses_ext = receivers
+        .iter()
+        .any(|r| r.reg >= 23 || [r.mlreg, r.mpreg].iter().flatten().any(|&x| x >= 23))
+        || elem_retain.iter().any(|&(_, p)| p >= 23)
         || conv_retain.iter().any(|&(_, p)| p >= 23);
     Some(LoopPlan {
         head,
@@ -18658,15 +18582,8 @@ fn emit_loop_chain(
 ) -> usize {
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let mvp = (layout.dense_mirror + layout.vec_ptr_off) as u32;
-    let mvl = (layout.dense_mirror + layout.vec_len_off) as u32;
-    let num_ev = layout.entry_value as i32;
-    let es = layout.entry_size as u64;
     let plain = layout.obj_ic_plain as u32;
-    let mf = (layout.obj_props + layout.props_mirror_flags) as u32;
-    let mirror = el;
+    let words_off = (layout.obj_props + layout.props_words) as u32;
 
     let plain_h = a.new_label();
     let body_l = a.new_label();
@@ -18804,30 +18721,28 @@ fn emit_loop_chain(
         a.ldrb_imm(12, r, plain);
         a.cbz(12, false, pre_fail);
         if rp.mirror {
-            // The element buffer must be coherent, hole-free, and (for int-read receivers)
-            // all-i32: element reads become bounds + one indexed load with no tag check.
-            let mut need = (crate::value::MIRROR_OK | crate::value::MIRROR_NO_HOLES) as u32;
-            if rp.int_reads {
-                need |= crate::value::MIRROR_ALL_I32 as u32;
-            }
-            a.ldrb_imm(12, r, mf);
-            a.mov(13, 12);
-            let field = asm::logical_imm_w(need).expect("mirror mask encodable");
-            a.logic_imm_w(0, 12, 12, field);
-            a.cmp_imm_w(12, need);
-            if packed_elem_inlinable(layout) {
-                let ready = a.new_label();
-                a.b_cond(C_EQ, ready);
-                // Existing coherent non-i32 mirrors cannot satisfy an int-read proof. An
-                // earlier failed packed preparation must not rescan on every slow iteration.
-                for bit in [crate::value::MIRROR_OK, crate::value::MIRROR_PACKED_FAILED] {
-                    a.logic_imm_w(0, 12, 13, asm::logical_imm_w(bit as u32).unwrap());
-                    a.cbnz(12, false, pre_fail);
+            // The element words must be in use, every one a Number with no hole, and (for
+            // int-read receivers) an exact int32: element reads become bounds + one indexed
+            // load with no tag check. The kind bits say so, or a scan proves them again
+            // (`jit_reprove_words`) unless one since the last write found them exact.
+            use crate::value::word_block::{KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS, KIND_SCANNED};
+            if words_inlinable(layout) {
+                let mut need = KIND_NUMBERS | KIND_NO_HOLES;
+                if rp.int_reads {
+                    need |= KIND_INT32;
                 }
-                a.ldr_imm(12, r, el);
-                a.cbz(12, true, pre_fail);
-                emit_packed_elements_base(a, layout, pre_fail);
-                // Cold representation preparation preserves all already established integer
+                let field = asm::logical_imm_w(need).expect("kind mask encodable");
+                let flags = -(layout.words_flags as i32);
+                let ready = a.new_label();
+                emit_words_base(a, layout, r, 12, 13);
+                a.cbz(13, false, pre_fail);
+                a.ldur_w(13, 12, flags);
+                a.logic_imm_w(0, 14, 13, field);
+                a.cmp_imm_w(14, need);
+                a.b_cond(C_EQ, ready);
+                a.logic_imm_w(0, 14, 13, asm::logical_imm_w(KIND_SCANNED).unwrap());
+                a.cbnz(14, false, pre_fail);
+                // Cold representation proof preserves all already established integer
                 // homes/receiver pins. d8..d15 are preserved by the C ABI; no transient FP
                 // operand exists in this preamble. This helper cannot execute JS or GC.
                 a.stp_pre(0, 1, -144);
@@ -18837,40 +18752,29 @@ fn emit_loop_chain(
                 // The helper takes `Gc::as_ptr`: the cell address, `obj_off` bytes before the
                 // Object.
                 a.sub_imm(0, r, obj_off);
-                a.mov_imm64(16, jit_prepare_packed_numeric_mirror as *const () as u64);
+                a.mov_imm64(16, jit_reprove_words as *const () as u64);
                 a.blr(16);
                 for register in (2..18).step_by(2) {
                     a.ldp_off(register, register + 1, register as i32 * 8);
                 }
                 a.ldp_post(0, 1, 144);
-                a.ldrb_imm(12, r, mf);
-                a.logic_imm_w(0, 12, 12, field);
-                a.cmp_imm_w(12, need);
+                a.ldur_w(13, 12, flags);
+                a.logic_imm_w(0, 14, 13, field);
+                a.cmp_imm_w(14, need);
                 a.b_cond(C_NE, pre_fail);
                 a.bind(ready);
             } else {
-                a.b_cond(C_NE, pre_fail);
+                a.b(pre_fail);
             }
         }
-        // Pinned vector fields (stable for the whole region — helper-free vocabulary, and slim
+        // Pinned words (stable for the whole region: the vocabulary is helper-free, and its
         // stores never grow or reallocate).
-        if rp.mlreg.is_some() || rp.mpreg.is_some() {
-            a.ldr_imm(12, r, mirror);
-            a.cbz(12, true, pre_fail);
-            if let Some(x) = rp.mlreg {
-                a.ldr_imm(x, 12, mvl);
-            }
-            if let Some(x) = rp.mpreg {
-                a.ldr_imm(x, 12, mvp);
-            }
+        if let Some(x) = rp.mpreg {
+            a.ldr_imm(x, r, words_off);
         }
-        if let Some(x) = rp.elpreg {
-            a.ldr_imm(12, r, el);
-            a.cbz(12, true, pre_fail);
-            a.ldr_imm(x, 12, evp);
-        }
-        if let Some(x) = rp.enreg {
-            fields_data(a, layout, x, r);
+        if let Some(x) = rp.mlreg {
+            a.ldr_imm(x, r, words_off);
+            a.ldur_w(x, x, -(layout.words_used as i32));
         }
     }
 
@@ -18910,9 +18814,10 @@ fn emit_loop_chain(
         .filter(|x| {
             !plan.slots.iter().any(|s| s.res == SlotRes::I(*x))
                 && !pinned(*x)
-                && !plan.receivers.iter().any(|r| {
-                    r.reg == *x || [r.mlreg, r.mpreg, r.elpreg, r.enreg].contains(&Some(*x))
-                })
+                && !plan
+                    .receivers
+                    .iter()
+                    .any(|r| r.reg == *x || [r.mlreg, r.mpreg].contains(&Some(*x)))
         })
         .collect();
     let mut free_d: Vec<u32> = (16..24).rev().collect();
@@ -19189,16 +19094,15 @@ fn emit_loop_chain(
                                 .find(|&&(i, _)| i == idx)
                                 .map(|p| p.1);
                             if rp.mirror {
-                                // Mirror: bounds + one indexed load. Preamble proved coherent
-                                // + hole-free (+ all-i32 for int reads): no tag check, and int
-                                // reads need no exactness guard. Pinned length/data registers
-                                // shave the two dependent loads when the planner had room.
+                                // Words: bounds + one indexed load. The preamble proved them
+                                // Numbers and hole-free (+ int32 for int reads): no tag check,
+                                // and int reads need no exactness guard. Pinned length/data
+                                // registers shave the two dependent loads when the planner
+                                // had room.
                                 match rp.mlreg {
                                     Some(x) => a.cmp_reg_x(9, x),
                                     None => {
-                                        a.ldr_imm(12, rp.reg, mirror);
-                                        a.cbz(12, true, guard!());
-                                        a.ldr_imm(14, 12, mvl);
+                                        emit_words_base(a, layout, rp.reg, 12, 14);
                                         a.cmp_reg_x(9, 14);
                                     }
                                 }
@@ -19206,9 +19110,7 @@ fn emit_loop_chain(
                                 let mpr = match rp.mpreg {
                                     Some(x) => x,
                                     None => {
-                                        a.ldr_imm(12, rp.reg, mirror);
-                                        a.cbz(12, true, guard!());
-                                        a.ldr_imm(14, 12, mvp);
+                                        a.ldr_imm(14, rp.reg, words_off);
                                         14
                                     }
                                 };
@@ -19217,13 +19119,15 @@ fn emit_loop_chain(
                                         // A previous numeric write may target this same object
                                         // through any receiver local. Guard before consuming
                                         // this read; earlier stores remain committed on bailout.
-                                        a.ldrb_imm(12, rp.reg, mf);
+                                        a.ldur_w(12, mpr, -(layout.words_flags as i32));
                                         a.logic_imm_w(
                                             0,
                                             12,
                                             12,
-                                            asm::logical_imm_w(crate::value::MIRROR_ALL_I32 as u32)
-                                                .unwrap(),
+                                            asm::logical_imm_w(
+                                                crate::value::word_block::KIND_INT32,
+                                            )
+                                            .unwrap(),
                                         );
                                         a.cbz(12, false, guard!());
                                     }
@@ -19244,7 +19148,7 @@ fn emit_loop_chain(
                                     vstack.push(LV::D(dt, false));
                                 }
                             } else {
-                                // Packed non-mirror reads already replay through the checked
+                                // Element reads outside words mode replay through the checked
                                 // path. Keep that admission, without its dead wide-value code.
                                 a.b(guard!());
                                 // Model the unreachable successful suffix for the planner's
@@ -19276,96 +19180,34 @@ fn emit_loop_chain(
                         let r = rp.reg;
                         let i32_proven = plan.setelem_i32.get(&idx).copied().unwrap_or(false);
                         if rp.mirror {
-                            // Mirror invariant (preamble-proven): every mirrored element is a
-                            // plain writable data Num — the accessor/writable/old-value checks
-                            // and the tag write all collapse. A hole (elems NO_SLOT) bails:
-                            // that store would CREATE a property. Pinned vector registers
-                            // shave the four dependent loads when the planner had room.
+                            // Words invariant (preamble-proven): every element is a plain
+                            // writable data Number with no hole, so the accessor/writable/
+                            // old-value checks collapse to bounds and the word. Pinned
+                            // registers shave the dependent loads when the planner had room.
                             match rp.mlreg {
                                 Some(x) => a.cmp_reg_x(9, x),
                                 None => {
-                                    a.ldr_imm(12, r, mirror);
-                                    a.cbz(12, true, guard!());
-                                    a.ldr_imm(14, 12, mvl);
+                                    emit_words_base(a, layout, r, 12, 14);
                                     a.cmp_reg_x(9, 14);
                                 }
                             }
                             a.b_cond(C_HS, guard!());
-                            let canonical_stored = a.new_label();
-                            if packed_elem_inlinable(layout) {
-                                let classic_store = a.new_label();
-                                a.ldrb_imm(12, r, mf);
-                                a.logic_imm_w(
-                                    0,
-                                    12,
-                                    12,
-                                    asm::logical_imm_w(crate::value::MIRROR_PACKED as u32).unwrap(),
-                                );
-                                a.cbz(12, false, classic_store);
-                                a.ldr_imm(12, r, el);
-                                emit_packed_elements_base(a, layout, guard!());
-                                a.add_shifted(15, 15, 9, 4);
-                                emit_exec_number_store(a, 2, 15, layout.property_value as i32, 14);
-                                a.b(canonical_stored);
-                                a.bind(classic_store);
-                            }
-                            let elpr = match rp.elpreg {
+                            let wp = match rp.mpreg {
                                 Some(x) => x,
                                 None => {
-                                    a.ldr_imm(12, r, el);
-                                    a.cbz(12, true, guard!());
-                                    a.ldr_imm(14, 12, evp);
-                                    14
-                                }
-                            };
-                            a.add_shifted(12, elpr, 9, 2);
-                            a.ldr_w_imm(13, 12, 0);
-                            a.cmn_imm_w(13, 1);
-                            a.b_cond(C_EQ, guard!());
-                            let enr = match rp.enreg {
-                                Some(x) => x,
-                                None => {
-                                    fields_data(a, layout, 15, r);
+                                    a.ldr_imm(15, r, words_off);
                                     15
                                 }
                             };
-                            a.movz(12, es as u32, 0);
-                            a.madd(15, 13, 12, enr);
-                            emit_exec_number_store(a, 2, 15, num_ev, 14);
-                            a.bind(canonical_stored);
-                            match rp.mpreg {
-                                Some(x) => a.str_d_lsl3(2, x, 9),
-                                None => {
-                                    a.ldr_imm(12, r, mirror);
-                                    a.ldr_imm(12, 12, mvp);
-                                    a.str_d_lsl3(2, 12, 9);
-                                }
-                            }
+                            // The word is the Number's, its NaN the canonical one: a word is a
+                            // Value's bits, and a NaN payload must not read as a tag.
+                            a.add_shifted(13, wp, 9, 3);
+                            emit_exec_number_store(a, 2, 13, 0, 14);
                             if !i32_proven {
-                                // MIRROR_ALL_I32 upkeep, flag-first (no sentinel screen —
-                                // hole accounting is structural, see Props::mirror_sync).
-                                let i32_done = a.new_label();
-                                a.ldrb_imm(13, r, mf);
-                                let i32_bit =
-                                    asm::logical_imm_w(crate::value::MIRROR_ALL_I32 as u32)
-                                        .unwrap();
-                                a.logic_imm_w(0, 12, 13, i32_bit);
-                                a.cbz(12, false, i32_done);
-                                a.fcvtzs_w_d(12, 2);
-                                a.scvtf_d_w(1, 12);
-                                a.fmov_x_d(12, 1);
-                                a.fmov_x_d(14, 2);
-                                a.cmp_reg_x(12, 14);
-                                a.b_cond(C_EQ, i32_done);
-                                let clear =
-                                    asm::logical_imm_w(!(crate::value::MIRROR_ALL_I32 as u32))
-                                        .unwrap();
-                                a.logic_imm_w(0, 13, 13, clear);
-                                a.strb_imm(13, r, mf);
-                                a.bind(i32_done);
+                                emit_word_number_kind(a, layout, wp, 2, 12, 13, 14, 1);
                             }
                         } else {
-                            // This packed non-mirror case already bailed before mutation.
+                            // Element stores outside words mode bail before any mutation.
                             a.b(guard!());
                         }
                         if keep {

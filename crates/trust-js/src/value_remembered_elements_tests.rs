@@ -913,10 +913,9 @@ fn native_fresh_tree(it: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Va
 }
 
 #[cfg(target_arch = "aarch64")]
-fn append_counts() -> (usize, usize, usize, usize) {
+fn append_counts() -> (usize, usize, usize) {
     (
         crate::jit::TEST_PACKED_APPEND_COMMITS.with(Cell::get),
-        crate::jit::TEST_PACKED_APPEND_HEAP_COMMITS.with(Cell::get),
         crate::bytecode::TEST_JIT_DEFINE_ELEMENT_HELPERS.with(Cell::get),
         NATIVE_FACTORY_CALLS.with(Cell::get),
     )
@@ -995,9 +994,9 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
         assert!(words.capacity() > 40 && words.remembered().is_some());
         assert_eq!(body.props.mirror_flags, 0);
     }
-    // The define element template calls its helper while the element templates do not read
-    // words (`packed_elems_valid`).
-    let native = usize::from(jit_layout(&engine.interp.object_proto).packed_elems_valid);
+    // The define element template appends the word itself where generated code reads words.
+    let native = usize::from(jit_layout(&engine.interp.object_proto).words_valid);
+    assert_eq!(native, 1, "this target's element templates read words");
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Major);
@@ -1056,13 +1055,8 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
         evaluate(&mut engine, "src.map(freshYoung);0");
         let after = append_counts();
         assert_eq!(
-            (
-                after.0 - before.0,
-                after.1 - before.1,
-                after.2 - before.2,
-                after.3 - before.3
-            ),
-            (native, native, 1 - native, 1),
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            (native, 1 - native, 1),
             "trial={trial} unprimed={unprimed:?} primed={primed:?} after={:?}",
             native_append_guards(&array),
         );
@@ -1090,13 +1084,8 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
     assert_eq!(evaluate(&mut engine, "var appendRejected=false;try{src.map(freshYoung)}catch(e){appendRejected=e instanceof TypeError}appendRejected"), "true");
     let after = append_counts();
     assert_eq!(
-        (
-            after.0 - before.0,
-            after.1 - before.1,
-            after.2 - before.2,
-            after.3 - before.3
-        ),
-        (0, 0, 1, 1)
+        (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+        (0, 1, 1)
     );
     let words = NATIVE_FACTORY_WORDS.with(|words| words.borrow().clone());
     assert_eq!(elements(&array.borrow().props).len(), 40);

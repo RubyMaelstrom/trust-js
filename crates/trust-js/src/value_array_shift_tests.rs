@@ -304,11 +304,8 @@ fn holes_and_nonplain_descriptors_keep_words_out_of_the_storage_paths() {
     descriptor.insert("1", Property::data(Value::Num(2.0), false, true, true));
     assert!(descriptor.has_far.get());
     assert!(descriptor.elems.words().unwrap().get(1).is_none());
-    assert!(
-        descriptor.get_index(1).is_none(),
-        "a named element is no word"
-    );
-    assert!(!descriptor.get("1").unwrap().writable());
+    let element = descriptor.get_index(1).expect("the named element");
+    assert!(matches!(element, Element::Entry(_)) && !element.writable());
     assert!(descriptor.shift_dense_array(3, false).is_none());
 }
 

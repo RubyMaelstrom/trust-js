@@ -1399,15 +1399,16 @@ pub struct JitLayout {
     pub dense_elems: usize,
     /// The `mirror` deque's admitted Vec-compatible header within the dense sidecar.
     pub dense_mirror: usize,
-    /// Nullable boxed property deque within the dense sidecar. The box points at its admitted
-    /// Vec-compatible header; slots use [`Value::Empty`] for holes and have no key Rc.
-    pub dense_packed: usize,
-    /// Inline small-array storage within DenseBuffers (used before an indexed mutation
-    /// needs to grow it into the optional Vec). Offsets are measured from the live types.
-    pub dense_inline_len: usize,
-    pub dense_inline_data: usize,
-    /// `INLINE_PACKED_CAPACITY`: the inline slots before packed storage moves to the heap Vec.
-    pub dense_inline_capacity: usize,
+    /// The element words' pointer within `Props` (W2c, [`word_block::Words`]): the address of
+    /// the first word, never null (a map without words points past the static empty block's
+    /// header, whose used length is zero). A word is a plain element's value, a hole the
+    /// [`PACK_EMPTY`] word.
+    pub props_words: usize,
+    /// The word header's fields, as bytes before the first word: the used length, the
+    /// capacity and the kind bits ([`word_block::KIND_NO_HOLES`] and the rest), each a u32.
+    pub words_used: usize,
+    pub words_capacity: usize,
+    pub words_flags: usize,
     /// The `mirror_flags` byte within `Props`.
     pub props_mirror_flags: usize,
     /// `size_of::<Property>()` — the keyless instance-field stride.
@@ -1422,8 +1423,8 @@ pub struct JitLayout {
     pub property_size: usize,
     pub property_value: usize,
     pub property_meta: usize,
-    /// The boxed property-deque niche and header words matched the live Vec probes.
-    pub packed_elems_valid: bool,
+    /// The element words' pointer and header matched a live probe.
+    pub words_valid: bool,
     /// `Exotic::None`'s discriminant byte (the inline path requires an ordinary object).
     pub exotic_none_tag: u8,
     /// `Exotic::Array`'s discriminant byte (the element templates also accept arrays).
@@ -1784,9 +1785,31 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && pv.capacity() == 3
         && mv.len() == 1
         && mv.capacity() == 3;
-    // W2c step 2c: elements are words, which no template reads yet; the element templates call
-    // their helpers for a map with words until they read the words themselves.
-    let packed_elems_valid = false;
+    // The element words: the pointer at `props_words` is the first word's address, with the
+    // header just before it.
+    let header_bytes = std::mem::size_of::<word_block::WordHeader>();
+    let words_at = |field: usize| header_bytes - field;
+    let props_words = offset_of!(Props, elems) + offset_of!(DenseStorage, 2);
+    let (words_used, words_capacity, words_flags) = (
+        words_at(offset_of!(word_block::WordHeader, used)),
+        words_at(offset_of!(word_block::WordHeader, capacity)),
+        words_at(offset_of!(word_block::WordHeader, flags)),
+    );
+    let words_probe = Props::packed_array([Value::Num(1.0), Value::Null].into_iter());
+    let words_valid = {
+        let words = words_probe.elems.words().expect("a probe with elements");
+        let first = words.as_slice().as_ptr();
+        // SAFETY: reads of the probe's own words pointer and of its block's header fields.
+        unsafe {
+            let base = (&words_probe as *const Props).cast::<u8>();
+            let header = |back: usize| first.cast::<u8>().sub(back).cast::<u32>().read();
+            std::mem::size_of::<word_block::Words>() == 8
+                && base.add(props_words).cast::<*const u64>().read() == first
+                && header(words_used) as usize == words.len()
+                && header(words_capacity) as usize == words.capacity()
+                && header(words_flags) == words.kind()
+        }
+    };
 
     // Exotic::None / Exotic::Array discriminants (Exotic is repr(Rust); probe to be certain).
     let none = Exotic::None;
@@ -2014,10 +2037,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         props_elems: offset_of!(Props, elems),
         dense_elems: offset_of!(DenseBuffers, elems),
         dense_mirror: offset_of!(DenseBuffers, mirror),
-        dense_packed: 0,
-        dense_inline_len: 0,
-        dense_inline_capacity: 0,
-        dense_inline_data: 0,
+        props_words,
+        words_used,
+        words_capacity,
+        words_flags,
         props_mirror_flags: offset_of!(Props, mirror_flags),
         entry_size: std::mem::size_of::<Property>(),
         str_len_word,
@@ -2030,7 +2053,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         property_size: std::mem::size_of::<Property>(),
         property_value: offset_of!(Property, packed),
         property_meta: offset_of!(Property, meta),
-        packed_elems_valid,
+        words_valid,
         exotic_none_tag,
         exotic_array_tag,
         exotic_strwrap_tag,
@@ -6745,15 +6768,15 @@ pub struct Props {
     /// a class-changing descriptor replacement. Only consulted for non-exotic
     /// objects (arrays keep the key-compare path — same shape can mean different element counts).
     shape: u32,
-    /// One nullable cold-sidecar pointer shared by the optional hash index, packed elements,
-    /// dense slot map and numeric mirror. Ordinary small named-property objects allocate none of
-    /// it. Within the sidecar, `elems[n]` is the `entries` slot of canonical-index key `n`, or
-    /// `NO_SLOT`; see `note_inserted` and `get_index`.
+    /// One nullable cold-sidecar pointer shared by the optional hash index, dense slot map and
+    /// numeric mirror, the Rust-heap extras, and the element words (W2c). Ordinary small
+    /// named-property objects allocate none of it. Within the sidecar, `elems[n]` is the
+    /// `entries` slot of canonical-index key `n`, or `NO_SLOT`; see `note_inserted` and
+    /// `get_index`.
     elems: DenseStorage,
-    /// Raw-f64 read mirror of the dense elements. While `mirror_flags & MIRROR_OK`:
-    /// `mirror.len() == elems.len()` for classic storage. With [`MIRROR_PACKED`], the
-    /// mirror instead parallels the authoritative packed Property array and contains no
-    /// holes. For classic storage, `mirror[n]` is [`MIRROR_HOLE`] exactly
+    /// Raw-f64 read mirror of classic dense elements (element words keep none: they are the
+    /// f64 view). While `mirror_flags & MIRROR_OK`: `mirror.len() == elems.len()`, and
+    /// `mirror[n]` is [`MIRROR_HOLE`] exactly
     /// when `elems[n]` names no element, else the element is a plain writable data property
     /// whose value is `Num(mirror[n])`. Element reads become one indexed load (no entry chase,
     /// no tag check), and `MIRROR_ALL_I32` lets the JIT's int loops skip the exactness guard
@@ -6796,14 +6819,6 @@ pub(crate) const MIRROR_NO_HOLES: u8 = 2;
 /// Every non-hole mirror value is an exact i32 (bit-identical through an i32 round trip, which
 /// also excludes -0.0).
 pub(crate) const MIRROR_ALL_I32: u8 = 4;
-/// A coherent mirror parallels packed Properties, not the classic index-to-entry map.
-/// It is created on hot numeric-region demand; canonical properties and named IC slots do
-/// not move. Writers must select the correct authoritative storage before updating the mirror.
-pub(crate) const MIRROR_PACKED: u8 = 8;
-/// A packed view could not be prepared in this element state. Native loop entry must not
-/// rescan an unchanged heterogeneous/large array on every iteration. Any indexed mutation or
-/// mutable escape clears this hint; it conveys no semantic or descriptor proof.
-pub(crate) const MIRROR_PACKED_FAILED: u8 = 16;
 /// The mirror's hole sentinel: a quiet-NaN payload no arithmetic produces. A user CAN craft
 /// this exact bit pattern (typed-array punning), so the write paths refuse to mirror it — it is
 /// never stored as data, which is what makes reading it back as "absent" sound.
@@ -7758,16 +7773,21 @@ impl Props {
         self.mirror_flags = 0;
     }
 
-    /// Add an f64 read view to a hot numeric packed array without changing its Properties,
-    /// descriptor bits, keys, shape or length slot. No JavaScript, GC or canonical relocation
-    /// occurs. ECMA-262 OrdinaryGet/OrdinarySetWithOwnDescriptor: only existing writable
-    /// Number-valued own data properties qualify; missing indices remain prototype lookups.
-    /// A bounded, fallible allocation keeps this non-safepoint preparation cheap and atomic.
+    /// The element words, for tests outside this module (the ARM64 JIT's).
+    #[cfg(test)]
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    pub(crate) fn prepare_packed_numeric_mirror(&mut self) -> bool {
-        // W2c step 2c: element words keep no packed numeric mirror; the templates read the
-        // words themselves next.
-        false
+    pub(crate) fn words(&self) -> Option<&word_block::Words> {
+        self.elems.words()
+    }
+
+    /// Make the element words' kind bits exact by a scan (`Words::reprove`) unless one since
+    /// the last write already did, for a loop region's receiver proof. No JavaScript, GC,
+    /// allocation or edge change.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn reprove_words(&mut self) {
+        if let Some(words) = self.elems.words_mut().filter(|words| !words.scanned()) {
+            words.reprove();
+        }
     }
 
     /// Append one plain element as a word, with no decimal key or index-to-field map. Array
@@ -9335,11 +9355,6 @@ impl Props {
                 .is_some_and(|n| packed || self.elems.get(n as usize).copied() != Some(slot as u32))
         });
         self.has_far.set(remains);
-        if !remains && self.mirror_flags & MIRROR_PACKED_FAILED != 0 {
-            // The existing bounded mirror validator must retry after the far-key guard
-            // changes; it still checks every live descriptor, number and owner boundary.
-            self.mirror_invalidate();
-        }
     }
     /// Ordinary property keys in insertion order. Engine state and private elements live in a
     /// separate slot map and never participate in ordinary key, descriptor or lookup operations.

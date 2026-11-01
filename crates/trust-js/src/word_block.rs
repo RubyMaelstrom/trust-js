@@ -33,6 +33,11 @@ pub(crate) const KIND_NUMBERS: u32 = 1 << 1;
 pub(crate) const KIND_INT32: u32 = 1 << 2;
 /// The facts of a block with no words.
 pub(crate) const KIND_ALL: u32 = KIND_NO_HOLES | KIND_NUMBERS | KIND_INT32;
+/// Not a fact about the words: a scan proved the kind bits ([`Words::reprove`]) and no write
+/// since could have made a cleared fact true again (a write that keeps a fact can only clear
+/// it), so a cleared kind bit is exact and another proof need not scan. Every write through
+/// [`Words::set`] and every removal clears it.
+pub(crate) const KIND_SCANNED: u32 = 1 << 3;
 
 /// The 16 bytes before a block's first word. Generated code reads `used` at -16, `capacity` at
 /// -12 and `flags` at -4 from the words' address.
@@ -168,7 +173,13 @@ impl Words {
     /// The kind bits of the used words.
     #[inline]
     pub(crate) fn kind(&self) -> u32 {
-        self.header().flags
+        self.header().flags & KIND_ALL
+    }
+
+    /// Whether a scan made the kind bits exact ([`KIND_SCANNED`]).
+    #[inline]
+    pub(crate) fn scanned(&self) -> bool {
+        self.header().flags & KIND_SCANNED != 0
     }
 
     /// The used words.
@@ -213,7 +224,9 @@ impl Words {
     pub(crate) fn pop(&mut self) -> Option<u64> {
         let len = self.len().checked_sub(1)?;
         let word = self.as_slice()[len];
-        self.header_mut().used = len as u32;
+        let header = self.header_mut();
+        header.used = len as u32;
+        header.flags &= !KIND_SCANNED;
         self.lower_traced(len);
         Some(word)
     }
@@ -235,7 +248,7 @@ impl Words {
                 used: header.used - 1,
                 capacity: header.capacity - 1,
                 shifted: header.shifted + 1,
-                flags: header.flags,
+                flags: header.flags & !KIND_SCANNED,
             });
             self.0 = NonNull::new_unchecked(words);
         }
@@ -328,7 +341,9 @@ impl Words {
     /// Keep the first `len` words.
     pub(crate) fn truncate(&mut self, len: usize) {
         if len < self.len() {
-            self.header_mut().used = len as u32;
+            let header = self.header_mut();
+            header.used = len as u32;
+            header.flags &= !KIND_SCANNED;
             self.lower_traced(len);
         }
     }
@@ -376,11 +391,12 @@ impl Words {
             .fold(KIND_ALL, |flags, &word| flags & word_kind(word))
     }
 
-    /// Prove the kind bits again from the words, which a cleared bit needs to come back.
+    /// Prove the kind bits again from the words, which a cleared bit needs to come back; the
+    /// block is then [`KIND_SCANNED`].
     pub(crate) fn reprove(&mut self) -> u32 {
         let flags = self.computed_kind();
         if !self.is_static_empty() {
-            self.header_mut().flags = flags;
+            self.header_mut().flags = flags | KIND_SCANNED;
         }
         flags
     }
@@ -590,7 +606,8 @@ impl Words {
         }
     }
 
-    /// Clear the kind bits that `word` breaks.
+    /// Clear the kind bits that `word` breaks, and [`KIND_SCANNED`] (`word` may replace the
+    /// one word that broke a fact).
     #[inline]
     fn note(&mut self, word: u64) {
         let flags = self.header().flags;

@@ -41,7 +41,6 @@ fn number_words_keep_no_mirror_and_their_kind_bits() {
         let before = props.retained_requested_storage_bytes().0;
         let pointer = props.elems.words().unwrap().as_slice().as_ptr();
         let shape = props.shape();
-        assert!(!props.prepare_packed_numeric_mirror());
         assert_eq!(props.elems.words().unwrap().as_slice().as_ptr(), pointer);
         assert_eq!(props.shape(), shape);
         assert_eq!(props.retained_requested_storage_bytes().0, before);

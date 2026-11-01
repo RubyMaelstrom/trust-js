@@ -238,8 +238,18 @@ fn numeric_array_views_admit_inline_and_heap_packed_without_moving_named_slots()
             );
             #[cfg(target_arch = "aarch64")]
             if tier == Tier::Jit {
+                // The words are the f64 view the region read, proven Numbers with no hole.
+                use crate::value::word_block::{KIND_NO_HOLES, KIND_NUMBERS};
+                let kind = body.props.words().unwrap().kind();
+                assert_eq!(
+                    kind & (KIND_NUMBERS | KIND_NO_HOLES),
+                    KIND_NUMBERS | KIND_NO_HOLES
+                );
                 for index in 0..size {
-                    assert_eq!(body.props.mirror_get(index), Some(index as f64 + 0.25));
+                    assert_eq!(
+                        body.props.get_index(index).unwrap().number_value(),
+                        Some(index as f64 + 0.25)
+                    );
                 }
             }
             drop(body);
@@ -461,7 +471,13 @@ fn check_hole_filling_region_storage(packed: bool) {
                 if packed { 4 } else { 0 },
                 "fixture must exercise the selected packed or classic storage contract"
             );
-            assert_eq!(object.borrow().props.mirror_get(0), Some(5.0));
+            if packed {
+                // The words are the f64 view the region read.
+                let body = object.borrow();
+                assert_eq!(body.props.get_index(0).unwrap().number_value(), Some(5.0));
+            } else {
+                assert_eq!(object.borrow().props.mirror_get(0), Some(5.0));
+            }
         }
         assert_eq!(
             eval(&mut engine, "worker.fill(packet);packet.a.join(',')"),
@@ -489,10 +505,11 @@ fn check_hole_filling_region_storage(packed: bool) {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn numeric_array_native_numeric_writes_end_failed_preparation_retry_suppression() {
-    // OrdinarySetWithOwnDescriptor writes the canonical property as before. The
-    // failed-view hint is only a representation policy: every indexed mutation
-    // must permit a fresh bounded preparation, including native checked hits.
+fn numeric_array_native_numeric_writes_end_a_scan_exactness() {
+    // OrdinarySetWithOwnDescriptor writes the element word as before. A scan's exactness
+    // (`KIND_SCANNED`) is only a representation policy: a write that may restore a cleared
+    // fact must permit a fresh proof, native hits included.
+    use crate::value::word_block::{KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS};
     for (store, expected) in [
         ("a[k]=v;", "8.5"),
         ("return a[k]=v;", "8.5"),
@@ -510,22 +527,18 @@ fn numeric_array_native_numeric_writes_end_failed_preparation_retry_suppression(
             function make(){{return [1,2,3];}}
             var numeric=make();
             function store(a,k,v){{{store}}}
-            for(var warm=0;warm<100;warm++)store(numeric,0,warm);
+            for(var warm=0;warm<100;warm++)store(numeric,0,warm+0.5);
         "#
             ),
         );
         let object = array(&mut engine, "numeric");
-        let layout = crate::value::jit_layout(&engine.interp.object_proto);
-        let flags_offset = layout.obj_props + layout.props_mirror_flags;
         {
+            // A scan found the words Numbers, but not all int32: INT32 stays clear, exactly.
             let mut body = object.borrow_mut();
-            // Model the postcondition of fallible mirror allocation failure without
-            // exhausting host memory. Canonical data remain valid numeric Properties.
-            let base = (&mut *body as *mut crate::value::Object).cast::<u8>();
-            unsafe {
-                base.add(flags_offset)
-                    .write(crate::value::MIRROR_PACKED_FAILED);
-            }
+            body.props.reprove_words();
+            let words = body.props.words().unwrap();
+            assert!(words.scanned(), "{store}");
+            assert_eq!(words.kind(), KIND_NO_HOLES | KIND_NUMBERS, "{store}");
         }
         crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.set(0));
         crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.set(0));
@@ -536,7 +549,7 @@ fn numeric_array_native_numeric_writes_end_failed_preparation_retry_suppression(
         assert_eq!(
             crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.get()),
             0,
-            "the native Number-to-Number store itself must end retry suppression: {store}"
+            "the native Number-to-Number store itself must end the scan's exactness: {store}"
         );
         assert_eq!(
             crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.get()),
@@ -544,9 +557,18 @@ fn numeric_array_native_numeric_writes_end_failed_preparation_retry_suppression(
             "a numeric-chain helper bailout must not substitute for native store proof: {store}"
         );
         let mut body = object.borrow_mut();
-        let base = (&*body as *const crate::value::Object).cast::<u8>();
-        assert_eq!(unsafe { base.add(flags_offset).read() }, 0, "{store}");
-        assert!(body.props.prepare_packed_numeric_mirror(), "{store}");
-        assert_eq!(body.props.mirror_get(0).unwrap().to_string(), expected);
+        let words = body.props.words().unwrap();
+        assert!(!words.scanned(), "{store}");
+        assert_eq!(words.kind() & KIND_INT32, 0, "{store}");
+        body.props.reprove_words();
+        assert_eq!(
+            body.props
+                .get_index(0)
+                .unwrap()
+                .number_value()
+                .unwrap()
+                .to_string(),
+            expected
+        );
     }
 }
