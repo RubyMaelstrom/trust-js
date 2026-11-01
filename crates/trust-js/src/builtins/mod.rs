@@ -2603,17 +2603,6 @@ fn regexp_array(
 ) -> Value {
     let keys = kind.keys();
     debug_assert_eq!(keys.len(), named.len());
-    // The ablation's classic large arrays keep their elements' keys among the named entries,
-    // which a template's layout does not list (see `Interp::make_array`).
-    if items.len() > 32 && !crate::value::dense_elements_enabled() {
-        let array = i.make_array(items.collect());
-        if let ValueView::Obj(o) = &(array).view() {
-            for (key, value) in keys.iter().zip(named) {
-                set_data(o, key, *value);
-            }
-        }
-        return array;
-    }
     let map = i.regexp_array_maps[kind as usize].get_or_init(|| {
         let mut map = Props::packed_array(std::iter::empty());
         for key in keys {

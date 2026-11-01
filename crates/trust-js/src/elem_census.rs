@@ -41,7 +41,7 @@ const PARTS: [&str; 11] = [
 #[derive(Default)]
 struct Family {
     objects: u64,
-    /// Element slots: packed storage's length, or the classic slot map's.
+    /// Element slots: the element words' length.
     slots: u64,
     elements: u64,
     holes: u64,
@@ -71,8 +71,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
         .filter(|key| key.as_index().is_some())
         .count();
     let words = p.elems.words();
-    let classic = p.elems.len() != 0;
-    if family == 2 && words.is_none() && !classic && index_entries == 0 {
+    if family == 2 && words.is_none() && index_entries == 0 {
         return;
     }
     let f = &mut families[family];
@@ -110,25 +109,11 @@ fn record(families: &mut [Family; 3], object: &Object) {
                 visit(Element::Word(value));
             }
         }
-    } else if classic {
-        slots = p.elems.len() as u64;
-        for n in 0..p.elems.len() {
-            let slot = p.elems[n];
-            if slot != NO_SLOT {
-                visit(Element::entry(&p.entries.fields[slot as usize]));
-            }
-        }
     }
-    // Index entries that the slot map does not name (far keys).
+    // The index keys in the named entries (non-plain, far or frozen elements).
     for (key, property) in p.entries.iter() {
-        if let Some(n) = key.as_index() {
-            let mapped = classic
-                && (n as usize) < p.elems.len()
-                && p.elems[n as usize] != NO_SLOT
-                && p.entries.keys()[p.elems[n as usize] as usize] == key;
-            if !mapped {
-                visit(Element::entry(property));
-            }
+        if key.as_index().is_some() {
+            visit(Element::entry(property));
         }
     }
     let holes = slots.saturating_sub(elements.min(slots));
@@ -165,7 +150,6 @@ fn record(families: &mut [Family; 3], object: &Object) {
     }
     if let Some(buffers) = buffers {
         b[1] = class_bytes(std::mem::size_of::<DenseBuffers>());
-        b[5] = class_bytes(buffers.elems.capacity() * 4);
         if let Some(index) = buffers.index.as_deref() {
             b[7] = class_bytes(std::mem::size_of::<KeyIndex>()) + class_bytes(index.bytes());
         }

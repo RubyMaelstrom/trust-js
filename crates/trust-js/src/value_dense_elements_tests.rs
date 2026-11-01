@@ -10,7 +10,7 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
     let number = |props: &Props, n: u32| props.get_index(n).and_then(|e| e.number_value());
     let mut props = Props::packed_array((0..8192).map(|n| Value::Num(n as f64)));
     assert_eq!(props.entries.len(), 1);
-    assert!(props.elems.elems.is_empty());
+    assert!(props.elems.0.is_none());
     assert_eq!(props.elems.words().unwrap().len(), 8192);
     assert_eq!(number(&props, 8191), Some(8191.0));
     assert!(props
@@ -27,7 +27,7 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
             .is_ok());
     }
     assert_eq!(grown.entries.len(), 1);
-    assert!(grown.elems.elems.is_empty());
+    assert!(grown.elems.0.is_none());
     assert_eq!(number(&grown, 8191), Some(8191.0));
     assert!(grown.set_index_value(12, Value::lstr("mixed")).is_ok());
     assert_eq!(number(&grown, 12), None);
@@ -251,9 +251,10 @@ fn dense_elements_recovery_keeps_named_indices_outside_packed_storage_guarded() 
     props.insert("1000000", Property::plain(Value::Num(1.0)));
     // While packed growth is blocked, even a nearby canonical key is a named entry.
     props.insert("1", Property::data(Value::Num(11.0), false, true, false));
-    assert!(props.elems.get(1).is_some());
+    assert!(props.find(PropKey::index(1)).is_some());
+    assert!(props.elems.words().unwrap().get(1).is_none());
     assert!(props.remove("1000000"));
-    assert!(props.has_far.get(), "a dense-map slot is not a packed slot");
+    assert!(props.has_far.get(), "a named element remains");
     assert!(props
         .try_append_element(1, Property::plain(Value::Num(2.0)))
         .is_err());
@@ -273,18 +274,19 @@ fn dense_elements_recovery_keeps_named_indices_outside_packed_storage_guarded() 
 }
 
 #[test]
-fn dense_elements_classic_recovery_bounds_delete_work_and_rebuilds_on_truncation() {
+fn dense_elements_named_recovery_keeps_named_indices_until_truncation() {
     for length in [12, 300] {
         let mut props = Props::packed_array(std::iter::empty());
         props.insert("1000000", Property::plain(Value::Num(1.0)));
+        // With an index among the named entries, every later one joins it there.
         for n in 0..length {
             props.insert(index_key(n), Property::plain(Value::Num(n as f64)));
         }
         assert!(!props.elems.has_words());
         assert!(props.remove("1000000"));
-        assert_eq!(props.has_far.get(), length > 256);
+        assert!(props.has_far.get(), "the named elements remain");
         props.remove_indices_from(length / 2);
-        assert!(!props.has_far.get());
+        assert!(props.has_far.get());
         for n in 0..length / 2 {
             assert_eq!(
                 props.get_index(n as u32).unwrap().number_value(),
@@ -293,7 +295,14 @@ fn dense_elements_classic_recovery_bounds_delete_work_and_rebuilds_on_truncation
         }
         assert!(props
             .try_append_element((length / 2) as u32, Property::plain(Value::Num(9.0)))
+            .is_err());
+        // Truncation past every named index restores the words.
+        props.remove_indices_from(0);
+        assert!(!props.has_far.get());
+        assert!(props
+            .try_append_element(0, Property::plain(Value::Num(9.0)))
             .is_ok());
+        assert!(props.elems.has_words());
         props.insert("1000000", Property::plain(Value::Num(1.0)));
         props.clear();
         assert!(!props.has_far.get());

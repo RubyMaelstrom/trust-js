@@ -7,18 +7,15 @@ use crate::atom::PropKey;
 use crate::interpreter::{Env, Interp};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-#[path = "dense_deque.rs"]
-mod dense_deque;
+#[cfg(feature = "architecture-diagnostics")]
+#[path = "allocation_diagnostics.rs"]
+mod allocation_diagnostics;
 #[path = "elem_census.rs"]
 pub(crate) mod elem_census;
 /// W2c step 2b; its users come with step 2c (the plan's "W2c step 2: words").
 #[path = "word_block.rs"]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod word_block;
-pub(crate) use dense_deque::DenseDeque;
-#[cfg(feature = "architecture-diagnostics")]
-#[path = "allocation_diagnostics.rs"]
-mod allocation_diagnostics;
 
 #[path = "property_shapes.rs"]
 mod property_shapes;
@@ -495,11 +492,6 @@ impl PropWord {
         }
         // SAFETY: a non-deferred property contains an execution word.
         unsafe { Value::from_bits(self.0.get()) }.number()
-    }
-
-    #[inline]
-    fn swap(&self, other: &Self) {
-        self.0.swap(&other.0);
     }
 
     #[inline]
@@ -1387,16 +1379,8 @@ pub struct JitLayout {
     pub shape_layout_entry_size: usize,
     pub shape_layout_entry_id: usize,
     pub shape_layout_entry_keys: usize,
-    /// The data-pointer word within a `Vec` (not necessarily offset 0 — RawVec layout is unstable).
-    pub vec_ptr_off: usize,
-    /// The length word within a `Vec` (probed like `vec_ptr_off`).
-    pub vec_len_off: usize,
-    /// The capacity word within a `Vec` (probed alongside pointer and length).
-    pub vec_cap_off: usize,
     /// The nullable pointer to the shared boxed dense-buffer headers within `Props`.
     pub props_elems: usize,
-    /// The `elems` Vec header within the shared dense-buffer allocation.
-    pub dense_elems: usize,
     /// The element words' pointer within `Props` (W2c, [`word_block::Words`]): the address of
     /// the first word, never null (a map without words points past the static empty block's
     /// header, whose used length is zero). A word is a plain element's value, a hole the
@@ -1511,32 +1495,6 @@ pub(crate) enum JitVecLayout {
         heap: usize,
         inline_capacity: usize,
     },
-}
-
-/// Locate a `Vec`'s data pointer, length and capacity words by value, each the only word that
-/// holds it. The caller makes the three distinct (a length below the capacity).
-pub(crate) fn probe_vec_layout<T>(vec: &Vec<T>) -> Option<JitVecLayout> {
-    if vec.len() >= vec.capacity() || !std::mem::size_of::<Vec<T>>().is_multiple_of(8) {
-        return None;
-    }
-    let words = unsafe {
-        std::slice::from_raw_parts(
-            vec as *const Vec<T> as *const usize,
-            std::mem::size_of::<Vec<T>>() / 8,
-        )
-    };
-    let only = |value: usize| {
-        let mut at = words.iter().enumerate().filter(|(_, w)| **w == value);
-        match (at.next(), at.next()) {
-            (Some((index, _)), None) => Some(index * 8),
-            _ => None,
-        }
-    };
-    Some(JitVecLayout::Vec {
-        ptr: only(vec.as_ptr() as usize)?,
-        len: only(vec.len())?,
-        cap: only(vec.capacity())?,
-    })
 }
 
 /// The build's representation facts that generated code depends on beyond [`JitLayout`]'s
@@ -1684,14 +1642,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && as_ptr <= obj_addr;
     let repr = jit_repr();
 
-    // Vec data-pointer and length words (RawVec layout is not guaranteed — locate them by value).
-    // Capacity 3 / length 1 makes the three words distinguishable.
-    let mut v: Vec<Property> = Vec::with_capacity(3);
-    v.push(Property::plain(Value::Num(0.0)));
-    let (vec_ptr_off, vec_len_off, vec_cap_off) = match probe_vec_layout(&v) {
-        Some(JitVecLayout::Vec { ptr, len, cap }) => (Some(ptr), Some(len), Some(cap)),
-        _ => (None, None, None),
-    };
     // Generated creation code follows the stored cell address to PropertyLayoutData and then to
     // its key vector. Measure this path instead of relying on the Rust struct layout, and check
     // it on a live layout.
@@ -1735,24 +1685,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && shape_layout_entry_size == 16
         && shape_layout_entry_id == 0
         && shape_layout_entry_keys == 8;
-    // The element templates index a `Vec<u32>` (`Props::elems`) with the same offsets; verify the
-    // layout really is per-Vec-struct, not per-element-type.
-    let mut v32: Vec<u32> = Vec::with_capacity(3);
-    v32.push(7);
-    let v32ptr = v32.as_ptr() as usize;
-    let v32words = unsafe {
-        std::slice::from_raw_parts(
-            &v32 as *const Vec<u32> as *const usize,
-            std::mem::size_of::<Vec<u32>>() / 8,
-        )
-    };
-    let vec32_ok = vec_ptr_off.is_some_and(|o| v32words[o / 8] == v32ptr)
-        && vec_len_off.is_some_and(|o| v32words[o / 8] == 1)
-        && vec_cap_off.is_some_and(|o| v32words[o / 8] == 3);
-
-    // DenseStorage is deliberately a transparent nullable pointer to boxed buffer headers. The
-    // JIT first follows this pointer and then uses the probed Vec offsets above. Verify the niche
-    // than relying on it silently if a future compiler changes the representation.
+    // DenseStorage's first word is deliberately a nullable pointer to the boxed sidecar (the
+    // creation template reads it as "this map has a key index"). Verify the niche rather than
+    // relying on it silently if a future compiler changes the representation.
     let thin_some = DenseStorage(
         Some(crate::gc_storage::StorageBox::new(DenseBuffers::default())),
         None,
@@ -1763,17 +1698,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let thin_none = DenseStorage(None, None, word_block::Words::new());
     let thin_none_word = unsafe { *(&thin_none as *const DenseStorage as *const usize) };
     let thin_vec_ok = thin_word == thin_expected && thin_none_word == 0;
-
-    // The slot map's deque header deliberately preserves the admitted Vec word order, while
-    // its allocation owner retains the original base. Validate it against the live Vec probes
-    // before any backend reads it.
-    let mut sv = DenseDeque::with_capacity(3);
-    sv.push(1_u32);
-    let deque_header_ok = vec_ptr_off == Some(offset_of!(DenseDeque<u32>, ptr))
-        && vec_len_off == Some(offset_of!(DenseDeque<u32>, len))
-        && vec_cap_off == Some(offset_of!(DenseDeque<u32>, cap))
-        && sv.len() == 1
-        && sv.capacity() == 3;
     // The element words: the pointer at `props_words` is the first word's address, with the
     // header just before it.
     let header_bytes = std::mem::size_of::<word_block::WordHeader>();
@@ -1986,11 +1910,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && object_identity_ok
         && scope_identity_ok
         && niche_ok
-        && vec_ptr_off.is_some()
-        && vec_len_off.is_some()
-        && vec_cap_off.is_some()
-        && vec32_ok
-        && deque_header_ok
         && thin_vec_ok
         && keys_ok
         && layout_ok
@@ -2020,11 +1939,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         shape_layout_entry_size,
         shape_layout_entry_id,
         shape_layout_entry_keys,
-        vec_ptr_off: vec_ptr_off.unwrap_or(0),
-        vec_len_off: vec_len_off.unwrap_or(0),
-        vec_cap_off: vec_cap_off.unwrap_or(0),
         props_elems: offset_of!(Props, elems),
-        dense_elems: offset_of!(DenseBuffers, elems),
         props_words,
         words_used,
         words_capacity,
@@ -3793,7 +3708,7 @@ impl Object {
         // The element words' edges, in every trace (the block itself is in trace_storage); a
         // marker's remembered trace reports only those written since its last mark.
         props.elems.2.trace_values(purpose, sink);
-        // Named/classic properties and every non-element edge are ALWAYS complete.
+        // Named properties and every non-element edge are ALWAYS complete.
         for property in props
             .entries
             .fields
@@ -5418,8 +5333,8 @@ pub enum TaIndex {
 
 /// An element as a property map holds it (W2c step 2): a word of its element block, which is a
 /// plain data element (writable, enumerable, configurable) of that value, or the entry that
-/// stores it (an index key in the named entries: a non-plain element, a far index, a classic
-/// map's). It reads as a [`Property`] does, and [`Element::to_property`] makes one when a caller
+/// stores it (an index key in the named entries: a non-plain element, a far index, a frozen
+/// object's). It reads as a [`Property`] does, and [`Element::to_property`] makes one when a caller
 /// needs to own or store it.
 #[derive(Clone, Copy)]
 pub(crate) enum Element<'a> {
@@ -5877,12 +5792,11 @@ impl Property {
 // sidecar block that holds them is plain data (see `DenseBuffers`).
 const _: () = assert!(!std::mem::needs_drop::<Property>());
 
-/// The element sidecar of a property map, in a storage block (`gc_storage`), which is what the
-/// JIT reads. Plain data only: dropping the map never reads the block, which may have gone
-/// with its heap (a template can outlive its Agent).
+/// The sidecar of a property map, in a storage block (`gc_storage`), whose pointer the JIT's
+/// creation template reads as "this map keeps a key index". Plain data only: dropping the map
+/// never reads the block, which may have gone with its heap (a template can outlive its Agent).
 #[derive(Clone, Default)]
 struct DenseBuffers {
-    elems: DenseDeque<u32>,
     /// The map's own index of its named keys, when it keeps one (`Props::build_index`): one
     /// word here, so the sidecar keeps its size class.
     index: Option<crate::gc_storage::StorageBox<KeyIndex>>,
@@ -6064,10 +5978,7 @@ struct EmptyDenseBuffers(DenseBuffers);
 // acquires an owned allocation through DenseStorage::buffers_mut; live buffers stay thread-local.
 unsafe impl Sync for EmptyDenseBuffers {}
 
-static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers {
-    elems: DenseDeque::new(),
-    index: None,
-});
+static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers { index: None });
 
 struct EmptyInternalSlots(InternalSlots);
 // Never mutated: writers make the map's own extras first (`DenseStorage::extras_mut`).
@@ -6166,15 +6077,12 @@ impl DenseStorage {
             return;
         };
         StorageBox::trace(buffers, sink);
-        let DenseBuffers { elems, index } = &**buffers;
+        let DenseBuffers { index } = &**buffers;
         if let Some(index) = index {
             StorageBox::trace(index, sink);
             if let Some(block) = index.slots.spill_ptr() {
                 trace_block(block, sink);
             }
-        }
-        if let Some(block) = elems.block_ptr() {
-            trace_block(block, sink);
         }
     }
 
@@ -6239,58 +6147,10 @@ impl DenseStorage {
             }
         }
     }
-    #[inline]
-    fn len(&self) -> usize {
-        self.0.as_deref().map_or(0, |d| d.elems.len())
-    }
-    #[inline]
-    fn get(&self, index: usize) -> Option<&u32> {
-        self.0.as_deref().and_then(|d| d.elems.get(index))
-    }
-    #[inline]
-    fn get_mut(&mut self, index: usize) -> Option<&mut u32> {
-        self.0.as_deref_mut().and_then(|d| d.elems.get_mut(index))
-    }
-    fn reserve_exact(&mut self, additional: usize) {
-        if additional != 0 {
-            self.buffers_mut().elems.reserve_exact(additional);
-        }
-    }
-    #[inline]
-    fn push(&mut self, value: u32) {
-        self.buffers_mut().elems.push(value);
-    }
-    #[inline]
-    fn pop(&mut self) -> Option<u32> {
-        self.0.as_deref_mut().and_then(|d| d.elems.pop())
-    }
     #[cfg(test)]
     fn clear(&mut self) {
         self.0 = None;
         self.2 = word_block::Words::new();
-    }
-    fn clear_elems(&mut self) {
-        if let Some(d) = self.0.as_deref_mut() {
-            d.elems.clear();
-        }
-    }
-    fn iter_mut(&mut self) -> Option<std::slice::IterMut<'_, u32>> {
-        self.0
-            .as_deref_mut()
-            .map(|buffers| buffers.elems.iter_mut())
-    }
-}
-
-impl std::ops::Index<usize> for DenseStorage {
-    type Output = u32;
-    fn index(&self, index: usize) -> &u32 {
-        self.get(index).expect("dense index out of bounds")
-    }
-}
-
-impl std::ops::IndexMut<usize> for DenseStorage {
-    fn index_mut(&mut self, index: usize) -> &mut u32 {
-        self.get_mut(index).expect("dense index out of bounds")
     }
 }
 
@@ -6666,20 +6526,6 @@ impl NamedEntries {
             .as_ref()
             .is_some_and(|keys| keys.get(self.len()) == Some(&key))
     }
-    fn pop(&mut self) -> Option<(PropKey, Property)> {
-        let key = *self.keys().last()?;
-        let property = self.fields.pop()?;
-        // Do not retain the tail of large, shrinking arrays through an unused prediction.
-        if let Some(layout) = self
-            .layout
-            .as_mut()
-            .and_then(PropertyLayout::get_mut_private)
-        {
-            layout.keys_mut().truncate(self.fields.len());
-            layout.rebuild_index();
-        }
-        Some((key, property))
-    }
     fn remove(&mut self, slot: usize) {
         let len = self.len();
         let layout = self.layout.as_mut().expect("live entry layout").make_mut();
@@ -6735,16 +6581,15 @@ pub struct Props {
     /// a class-changing descriptor replacement. Only consulted for non-exotic
     /// objects (arrays keep the key-compare path — same shape can mean different element counts).
     shape: u32,
-    /// One nullable cold-sidecar pointer shared by the optional hash index and the dense slot
-    /// map, the Rust-heap extras, and the element words (W2c). Ordinary small named-property
-    /// objects allocate none of it. Within the sidecar, `elems[n]` is the
-    /// `entries` slot of canonical-index key `n`, or `NO_SLOT`; see `note_inserted` and
-    /// `get_index`.
+    /// The nullable sidecar pointer (the map's own key index), the Rust-heap extras, and the
+    /// element words (W2c): every map's plain data elements, as V8, SpiderMonkey and JSC give
+    /// every object element storage. Ordinary small named-property objects allocate none of it.
     elems: DenseStorage,
-    /// Some canonical-index key lives ONLY in the string-keyed map (inserted too far past the
-    /// dense frontier — see `note_inserted`): `elems` coverage is no longer proof of element
-    /// absence, so the dense append/pop fast paths stand down. Truncation rebuilds this proof;
-    /// deleting a far key can restore it after a bounded scan of the remaining named entries.
+    /// Some canonical-index key lives in the named entries (SpiderMonkey's `Indexed`): a
+    /// non-plain element, one past the sparse frontier, or a frozen object's (see
+    /// `note_inserted`). While it is clear, an index that is not a word is absent with no lookup;
+    /// while it is set, the words' append/pop fast paths stand down. Truncation rebuilds it;
+    /// deleting a named index can clear it after a bounded scan of the remaining entries.
     has_far: std::cell::Cell<bool>,
     /// This `Props` belongs to an `Exotic::Array` object: canonical-index key inserts skip the
     /// shape transition. Array shapes encode the *named*-key sequence only (matching
@@ -6781,9 +6626,6 @@ pub(crate) fn f64_exact_i32(f: f64) -> bool {
     (f as i32 as f64).to_bits() == f.to_bits()
 }
 
-/// `elems` hole marker (also caps how many entries dense slots can address).
-const NO_SLOT: u32 = u32::MAX;
-
 /// A memoized `entries` slot (of `length` or `prototype`), or none. Narrow, so that the object
 /// header fits its size class (S3); a slot past its range is not memoized.
 #[derive(Clone, Copy)]
@@ -6803,13 +6645,6 @@ impl SlotMemo {
     fn slot(self) -> Option<usize> {
         (self.0 != SlotMemoWord::MAX).then_some(self.0 as usize)
     }
-}
-
-/// Prototype ablation: retain the previous creation/growth policy in the same binary.
-/// The canonical descriptor and sparse-property implementations are shared in both modes.
-pub(crate) fn dense_elements_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("TRUST_JS_DENSE_ELEMENTS").as_deref() != Ok("0"))
 }
 
 /// The empty-object shape: every `Props` starts here and all empty objects share it, so adding
@@ -7388,8 +7223,7 @@ impl Props {
     /// No indexed/Symbol/private storage or filtered/accessor descriptors: insertion order is
     /// [[OwnPropertyKeys]] order and every Get observes an own data value without author code.
     pub(crate) fn named_data_keys(&self) -> Option<&[PropKey]> {
-        if self.elems.len() != 0
-            || self.elems.has_words()
+        if self.elems.has_words()
             || self.elem_mode.get()
             || self.has_far.get()
             || self.entries.iter().any(|(key, property)| {
@@ -7473,14 +7307,8 @@ impl Props {
             // The block: front room, header, words and remembered record.
             bytes = bytes.saturating_add(words.block_bytes());
         }
-        if let Some(dense) = self.elems.0.as_deref() {
+        if self.elems.0.is_some() {
             bytes = bytes.saturating_add(std::mem::size_of::<DenseBuffers>());
-            bytes = bytes.saturating_add(
-                dense
-                    .elems
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<u32>()),
-            );
             if let Some(index) = self.elems.index() {
                 bytes = bytes
                     .saturating_add(std::mem::size_of::<KeyIndex>())
@@ -7613,7 +7441,6 @@ impl Props {
         assert_eq!(named.len() + 1, self.entries.len(), "array-template arity");
         debug_assert!(
             self.elem_mode.get()
-                && self.elems.len() == 0
                 && !self.elems.has_words()
                 && self
                     .entries
@@ -7654,15 +7481,12 @@ impl Props {
         }
     }
 
-    /// Reserve contiguous elements for a fresh dense array of known size. The named-property
-    /// vector needs only `length`. The ablation keeps the old split.
+    /// Reserve the element words of a fresh dense array (or arguments object) of known size; the
+    /// named entries need only `length`.
     pub(crate) fn reserve_dense_exact(&mut self, len: usize) {
-        if (1..=32).contains(&len) || (len != 0 && dense_elements_enabled()) {
+        if len != 0 {
             self.entries.reserve_exact(1); // own `length`
             self.elems.words_start().reserve_exact(len);
-        } else {
-            self.entries.reserve_exact(len.saturating_add(1));
-            self.elems.reserve_exact(len);
         }
     }
 
@@ -7682,7 +7506,6 @@ impl Props {
         {
             return;
         }
-        debug_assert_eq!(self.elems.len(), 0);
         let words = self.elems.words_start();
         words.reserve_exact(len);
         words.resize_with_holes(len);
@@ -7713,13 +7536,11 @@ impl Props {
         self.elems.words_start().push(property.into_value());
     }
 
+    /// Whether the map's first element word may start at `index`, on any map (every object has
+    /// element storage, as in V8, SpiderMonkey and JSC): no words yet, no index key in the
+    /// named entries (its element would be stored twice), and within the sparse frontier.
     fn can_start_packed_elements(&self, index: usize) -> bool {
-        dense_elements_enabled()
-            && self.elem_mode.get()
-            && !self.has_far.get()
-            && self.elems.len() == 0
-            && !self.elems.has_words()
-            && index <= 256
+        !self.has_far.get() && !self.elems.has_words() && index <= 256
     }
 
     /// Create a bounded absent prefix on the first indexed write, never in response
@@ -7851,25 +7672,18 @@ impl Props {
         }
     }
 
-    /// The own property for canonical index `n`, without hashing. `None` only means "not in the
-    /// dense map" — the caller must fall back to the string-keyed path, not conclude absence.
+    /// The own property for canonical index `n`: its element word, or the named entry that holds
+    /// it (only with `has_far`); `None` when the map has no such own property.
     #[inline]
     pub(crate) fn get_index(&self, n: u32) -> Option<Element<'_>> {
-        if let Some(words) = self.elems.words() {
-            if let Some(value) = words.get(n as usize) {
-                return Some(Element::Word(value));
-            }
-            // A hole or an index past the words: a named entry holds it only with `has_far`,
-            // and the slot map records it when it is near (`note_inserted`).
-            if !self.has_far.get() {
-                return None;
-            }
+        if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
+            return Some(Element::Word(value));
         }
-        let slot = *self.elems.get(n as usize)?;
-        if slot == NO_SLOT {
+        if !self.has_far.get() {
             return None;
         }
-        Some(Element::entry(&self.entries.fields[slot as usize]))
+        self.find(PropKey::index(n))
+            .map(|slot| Element::entry(&self.entries.fields[slot]))
     }
 
     /// Overwrite dense element `n`'s value. `Err` hands the value
@@ -7886,122 +7700,50 @@ impl Props {
             words.set(n as usize, v);
             return Ok(());
         }
-        let Some(&slot) = self.elems.get(n as usize) else {
-            return Err(v);
-        };
-        if slot == NO_SLOT {
-            return Err(v);
-        }
-        let p = &mut self.entries.fields[slot as usize];
-        if p.accessor() || !p.writable() {
-            return Err(v);
-        }
-        p.set_value(v);
-        Ok(())
+        Err(v)
     }
 
-    /// Record a fresh entry at `slot` in the dense map when its key is a canonical index at (or
-    /// within a small pad of) the dense frontier. Far-past-the-frontier keys stay map-only.
+    /// Record a fresh named entry at `slot`: an index key there sets `has_far`, so lookups of
+    /// that index consult the named entries (find, get_key).
     fn note_inserted(&mut self, slot: usize) {
-        if slot >= NO_SLOT as usize {
-            return;
-        }
-        if let Some(n) = self.entries.keys()[slot].as_index() {
-            // Packed elements and named index entries can coexist after a sparse write.
-            // Even a named index recorded in `elems` must block packed growth: appending
-            // into its index would otherwise create a second owning descriptor for it.
-            if self.elems.has_words() {
-                self.has_far.set(true);
-            }
-            let n = n as usize;
-            if n < self.elems.len() {
-                self.elems[n] = slot as u32;
-            } else if n <= self.elems.len() + 256 {
-                // The pad tolerates *descending* first-fills (`while (--i >= 0) a[i] = 0`,
-                // `r[i+n] = x[i]` from the top — bignum/matrix code does this constantly): the
-                // first write lands well past the frontier, and a too-small pad would leave the
-                // whole upper range map-only for the array's lifetime, killing every dense fast
-                // path. 256 covers real dense workloads; a truly sparse `a[1e6]` still stays
-                // map-only at ≤1KB of hole slots per object.
-                while self.elems.len() < n {
-                    self.elems.push(NO_SLOT);
-                }
-                self.elems.push(slot as u32);
-            } else {
-                self.has_far.set(true);
-            }
+        if self.entries.keys()[slot].as_index().is_some() {
+            self.has_far.set(true);
         }
     }
 
-    /// Whether adding `key` should create the string-key hash index. Dense array elements already
-    /// have O(1) lookup through `elems`, so counting them toward the generic-map threshold creates
-    /// a redundant hash table for every modest-sized array. Ordinary maps select a shared layout
-    /// index or a per-object fallback in `ensure_fallback_index` after the insertion.
-    fn should_build_index(&self, key: PropKey) -> bool {
-        if !self.elem_mode.get() {
-            return false;
-        }
-        // A far index lives in the named entries alone (`has_far`), with no slot in `elems`, so
-        // `find` would scan every entry for each index it cannot place: every absent-index insert
-        // into such an array, and every read past its packed elements, was linear in its entries.
-        // Past the threshold every key counts, as after a truncation (`remove_indices_from`).
-        if self.has_far.get() {
-            return self.entries.len() + 1 > INDEX_THRESHOLD;
-        }
-        if key.as_index().is_some() {
-            return false;
-        }
-        self.entries
-            .keys()
-            .iter()
-            .filter(|k| k.as_index().is_none())
-            .count()
-            + 1
-            > INDEX_THRESHOLD
+    /// Whether an array map's insertion should build its own key index: past
+    /// [`INDEX_THRESHOLD`] named keys, index keys among them (an ordinary map's index is its
+    /// layout's or the fallback, `ensure_fallback_index`).
+    fn should_build_index(&self) -> bool {
+        self.elem_mode.get() && self.entries.len() + 1 > INDEX_THRESHOLD
     }
 
-    /// Dense tail append: insert element `n` when `n` is exactly the dense frontier and no
-    /// map-only ("far") canonical key exists — which together prove the key is absent, so the
-    /// whole existence scan and key-string hashing of [`Props::insert`] can be skipped. Array
-    /// (`elem_mode`) maps only: the shape is untouched. Returns `false` (nothing changed) when
-    /// the gates don't hold; the caller runs the generic path.
+    /// Dense tail append: insert element `n` as a word when `n` is exactly the words' end and no
+    /// index key lives in the named entries (`has_far`) — which together prove the key is
+    /// absent, so the existence lookup of [`Props::insert`] is skipped. The shape is untouched
+    /// (words are not in it). `Err` (nothing changed) when the gates don't hold; the caller runs
+    /// the generic path. Array validation (length, extensibility) stays at the caller.
     pub(crate) fn try_append_element(&mut self, n: u32, prop: Property) -> Result<(), Property> {
         if n == 0 && prop.is_plain_element() && self.can_start_packed_elements(0) {
             self.note_structural();
             self.start_packed_elements(0, prop);
             return Ok(());
         }
-        if let Some(len) = self.elems.words().map(word_block::Words::len) {
-            if self.has_far.get()
-                || !self.elem_mode.get()
-                || n as usize != len
-                || !prop.is_plain_element()
-            {
-                return Err(prop);
-            }
-            self.note_structural();
-            self.push_packed_property(prop);
-            return Ok(());
-        }
-        if self.has_far.get() || !self.elem_mode.get() || n as usize != self.elems.len() {
+        let Some(len) = self.elems.words().map(word_block::Words::len) else {
+            return Err(prop);
+        };
+        if self.has_far.get() || n as usize != len || !prop.is_plain_element() {
             return Err(prop);
         }
         self.note_structural();
-        let slot = self.entries.len();
-        let key = index_key(n as usize);
-        if let Some(index) = self.elems.index_mut() {
-            index.insert(key, slot);
-        }
-        self.reserve_entry();
-        self.entries.push((key, prop));
-        self.elems.push(slot as u32);
+        self.push_packed_property(prop);
         Ok(())
     }
 
-    /// Insert an absent canonical index directly into the classic dense map, including a bounded
+    /// Insert an absent canonical index directly into the element words, including a bounded
     /// run of holes. The caller has already proved ordinary Array prototype semantics. This is
     /// the numeric-key counterpart of `insert`: it avoids parsing/comparing a decimal key we
-    /// already know, while retaining the JIT-addressable entry/slot layout.
+    /// already know.
     pub(crate) fn try_define_dense_element(
         &mut self,
         n: u32,
@@ -8012,51 +7754,24 @@ impl Props {
             self.start_packed_elements(n as usize, prop);
             return Ok(());
         }
-        if dense_elements_enabled() && self.elem_mode.get() && !self.has_far.get() {
-            if let Some(words) = self.elems.words() {
-                let index = n as usize;
-                let len = words.len();
-                if !prop.is_plain_element() || words.get(index).is_some() || index > len + 256 {
-                    return Err(prop);
-                }
-                self.note_structural();
-                let words = self.elems.words_mut().unwrap();
-                if index < len {
-                    words.set(index, prop.into_value());
-                } else {
-                    words.resize_with_holes(index);
-                    words.push(prop.into_value());
-                }
-                return Ok(());
-            }
-        }
-        if self.elems.has_words() || self.has_far.get() || !self.elem_mode.get() {
+        if self.has_far.get() || !prop.is_plain_element() {
             return Err(prop);
         }
-        let n = n as usize;
-        let old_len = self.elems.len();
-        if n < old_len {
-            if self.elems[n] != NO_SLOT {
-                return Err(prop);
-            }
-        } else if n > old_len + 256 {
+        let Some(words) = self.elems.words() else {
+            return Err(prop);
+        };
+        let index = n as usize;
+        let len = words.len();
+        if words.get(index).is_some() || index > len + 256 {
             return Err(prop);
         }
         self.note_structural();
-        let slot = self.entries.len();
-        let key = index_key(n);
-        if let Some(index) = self.elems.index_mut() {
-            index.insert(key, slot);
-        }
-        self.reserve_entry();
-        self.entries.push((key, prop));
-        if n < old_len {
-            self.elems[n] = slot as u32;
+        let words = self.elems.words_mut().unwrap();
+        if index < len {
+            words.set(index, prop.into_value());
         } else {
-            while self.elems.len() < n {
-                self.elems.push(NO_SLOT);
-            }
-            self.elems.push(slot as u32);
+            words.resize_with_holes(index);
+            words.push(prop.into_value());
         }
         Ok(())
     }
@@ -8065,42 +7780,22 @@ impl Props {
         self.try_append_element(n, prop).is_ok()
     }
 
-    /// Dense tail pop: remove element `n` (the array's last) when it is also the last *entry*
-    /// (the common stack discipline — elements are appended last) and the last dense slot, and
-    /// no "far" canonical key exists. Everything is O(1) pops: no entry shift, no re-index, no
-    /// shape change (`elem_mode` maps keep their shape — element keys aren't part of it).
-    /// `Some(value)` = removed; `None` = gates failed, nothing changed, caller goes generic.
+    /// Dense tail pop: remove element `n` (the array's last) when it is the last word and no
+    /// index key lives in the named entries. An O(1) pop: no entry shift, no re-index, no shape
+    /// change (words are not in the shape). `Some(value)` = removed; `None` = gates failed,
+    /// nothing changed, caller goes generic.
     pub(crate) fn pop_last_element(&mut self, n: u32) -> Option<Value> {
         if self.has_far.get() || !self.elem_mode.get() {
             return None;
         }
-        if let Some(words) = self.elems.words() {
-            if n as usize + 1 != words.len() || words.as_slice().last() == Some(&PACK_EMPTY) {
-                return None;
-            }
-            self.note_structural();
-            let word = self.elems.words_mut().unwrap().pop()?;
-            // SAFETY: a used word is a Value's bits.
-            return Some(unsafe { Value::from_bits(word) });
-        }
-        if n as usize + 1 != self.elems.len() {
-            return None;
-        }
-        let slot = self.elems[n as usize];
-        if slot == NO_SLOT || slot as usize + 1 != self.entries.len() {
-            return None;
-        }
-        let p = &self.entries.fields[slot as usize];
-        if p.accessor() || !p.configurable() {
+        let words = self.elems.words()?;
+        if n as usize + 1 != words.len() || words.as_slice().last() == Some(&PACK_EMPTY) {
             return None;
         }
         self.note_structural();
-        let (_, p) = self.entries.pop().unwrap();
-        self.elems.pop();
-        if let Some(index) = self.elems.index_mut() {
-            index.remove(index_key(n as usize));
-        }
-        Some(p.into_value())
+        let word = self.elems.words_mut().unwrap().pop()?;
+        // SAFETY: a used word is a Value's bits.
+        Some(unsafe { Value::from_bits(word) })
     }
 
     /// The packed element slots of an Array that keeps every index in element storage (no index
@@ -8164,81 +7859,22 @@ impl Props {
         if !length.writable() || length.number_value() != Some(len as f64) {
             return None;
         }
-        if let Some(words) = self.elems.words() {
-            // Every word is a plain element or a hole, so each moves down one index with its
-            // attributes; holes need the caller's proof that they read as absent.
-            if words.len() != len || (!holes_read_absent && !words_have_no_holes(words)) {
-                return None;
-            }
-            self.note_structural();
-            let first = self.elems.words_mut().unwrap().shift().unwrap();
-            self.set_array_length_value((len - 1) as f64);
-            // SAFETY: a used word is a Value's bits.
-            let first = unsafe { Value::from_bits(first) };
-            return Some(if first.is_empty() {
-                Value::Undefined
-            } else {
-                first
-            });
-        }
-        let safe = |index: usize, property: &Property| {
-            !property.is_empty()
-                && !property.accessor()
-                && if index + 1 == len {
-                    // The last source is read/deleted, never assigned.
-                    property.configurable()
-                } else {
-                    // Descriptor attributes stay with the destination index.
-                    property.writable()
-                }
-        };
-        if self.elems.len() != len
-            || !self
-                .elems
-                .elems
-                .iter()
-                .enumerate()
-                .all(|(n, &slot)| slot != NO_SLOT && safe(n, &self.entries.fields[slot as usize]))
-        {
+        // Every word is a plain element or a hole, so each moves down one index with its
+        // attributes; holes need the caller's proof that they read as absent.
+        let words = self.elems.words()?;
+        if words.len() != len || (!holes_read_absent && !words_have_no_holes(words)) {
             return None;
         }
-
-        // No JavaScript, collection or fallible semantic operation follows the
-        // proof. Rotate owning words, not Properties: this keeps each index's
-        // attributes, transfers every reference once, and returns the original
-        // first owner from the removed tail.
-        let first = {
-            for n in 1..len {
-                let previous = self.elems[n - 1] as usize;
-                let next = self.elems[n] as usize;
-                self.entries.fields[previous]
-                    .packed
-                    .swap(&self.entries.fields[next].packed);
-            }
-            let last = len - 1;
-            let slot = self.elems[last] as usize;
-            if slot + 1 == self.entries.len() {
-                // The ordinary append-built representation needs only O(1) tail
-                // maintenance.
-                self.pop_last_element(last as u32)
-                    .expect("shift preflight proved removable dense tail")
-            } else {
-                let first = self.entries.fields[slot].take_value();
-                let removed = self.remove_key(index_key(last));
-                debug_assert!(removed);
-                // remove() maintains named-key slots, symbol owners, hash indices
-                // and prototype invalidation. Trim its final hole to keep dense
-                // append eligible, including when named properties follow elements.
-                self.elems.pop();
-                first
-            }
-        };
-        let slot = self
-            .find(crate::atom::names::LENGTH.key())
-            .expect("Array length is not removed");
-        self.entries.fields[slot].set_value(Value::Num((len - 1) as f64));
-        self.len_slot.set(SlotMemo::of(slot));
-        Some(first)
+        self.note_structural();
+        let first = self.elems.words_mut().unwrap().shift().unwrap();
+        self.set_array_length_value((len - 1) as f64);
+        // SAFETY: a used word is a Value's bits.
+        let first = unsafe { Value::from_bits(first) };
+        Some(if first.is_empty() {
+            Value::Undefined
+        } else {
+            first
+        })
     }
 
     /// ECMA-262 #sec-array.prototype.unshift (e28783d5): a plain contiguous own
@@ -8261,14 +7897,11 @@ impl Props {
         if !length.writable() || length.number_value() != Some(len as f64) {
             return false;
         }
-        if len == 0 && !self.elems.has_words() {
-            if self.elems.len() != 0 {
-                return false;
-            }
-        } else if self
-            .elems
-            .words()
-            .is_none_or(|words| words.len() != len || !words_have_no_holes(words))
+        if (len != 0 || self.elems.has_words())
+            && self
+                .elems
+                .words()
+                .is_none_or(|words| words.len() != len || !words_have_no_holes(words))
         {
             // A word array whose every element is present: the destinations keep plain
             // attributes, as the spec's Set and CreateDataProperty leave them.
@@ -8286,21 +7919,12 @@ impl Props {
     /// then on (an emptied-but-once-large map keeps using it).
     #[inline(always)]
     fn find(&self, key: PropKey) -> Option<usize> {
-        // Every classic dense element already records its entry slot. This must serve mutable
-        // lookups, replacement, deletion and slot ICs as well as reads: array maps deliberately
-        // omit a redundant numeric-key hash index, so scanning here made those operations linear
-        // in the number of elements. Packed elements have no entry slot and are handled by the
-        // caller. With no far insertion, a sidecar miss proves that no named entry can contain
-        // this canonical index (the same invariant used by `get`).
+        // An index key lives in the named entries only with `has_far` (SpiderMonkey's
+        // `Indexed`): every other element is a word or absent, which the callers answer. With
+        // it set, the index key is found as any key is (the map's index, else a short scan).
         let array_index = key.as_index();
-        if let Some(n) = array_index {
-            if let Some(&slot) = self.elems.get(n as usize).filter(|&&slot| slot != NO_SLOT) {
-                debug_assert!(matches!(self.entries.get(slot as usize), Some((k, _)) if k == key));
-                return Some(slot as usize);
-            }
-            if !self.has_far.get() {
-                return None;
-            }
+        if array_index.is_some() && !self.has_far.get() {
+            return None;
         }
         // `length` and `prototype` are the hottest keys in array-heavy / allocation-heavy code
         // (every push/pop/length read; every `new`); their slots are memoized — answer without
@@ -8322,7 +7946,7 @@ impl Props {
         }
         // Array shapes describe named keys only. The intrinsic length-only
         // shape therefore proves absence of EVERY other non-index key, even
-        // when the classic dense representation has millions of element entries.
+        // when millions of index keys live in the named entries.
         // Computed method reads (`a[method](...)`) have no static-property IC:
         // scanning those elements here turned a linear push/XOR loop quadratic.
         // This proves only OrdinaryGetOwnProperty absence (ECMA-262 §10.1.5);
@@ -8624,7 +8248,7 @@ impl Props {
         let text = key;
         if let Some(n) = canonical_index(text) {
             // A word's value is copied out and its word kept: the caller writes the
-            // replacement back (and only ordinary objects, which keep no words, take values).
+            // replacement back through `set_value`.
             if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
                 return Some(value);
             }
@@ -8741,29 +8365,12 @@ impl Props {
         self.has_far.set(false);
         self.shape = shape_fresh();
     }
-    /// Append the next dense element while *building a fresh array in order* (element index ==
-    /// entry slot == dense slot): skips the canonical-index parse and, for small indices, the
-    /// key-string allocation. Only valid on a Props whose entries so far are exactly the dense
-    /// elements 0..len. Element words hold plain elements only, so a non-plain element is
-    /// pushed only before any word (the classic slots then keep the whole array).
+    /// Append the next element word while *building a fresh array in order* (its elements so
+    /// far are exactly the words 0..len, with no index key in the named entries): skips the
+    /// canonical-index parse and the existence lookup. A word is a plain element.
     pub(crate) fn push_dense(&mut self, prop: Property) {
-        if prop.is_plain_element() && (self.elems.has_words() || self.can_start_packed_elements(0))
-        {
-            self.push_packed_property(prop);
-            return;
-        }
-        debug_assert!(
-            !self.elems.has_words(),
-            "a non-plain element after element words"
-        );
-        let slot = self.entries.len();
-        let key = index_key(slot);
-        if let Some(index) = self.elems.index_mut() {
-            index.insert(key, slot);
-        }
-        self.reserve_entry();
-        self.entries.push((key, prop));
-        self.elems.push(slot as u32);
+        debug_assert!(!self.has_far.get(), "push_dense beside a named index key");
+        self.push_packed_property(prop);
     }
 
     /// Insert a key *known to be absent* (the caller shape-validated the map), landing on a
@@ -8778,7 +8385,7 @@ impl Props {
             if let Some(index) = self.elems.index_mut() {
                 index.insert(key, slot);
             }
-        } else if self.should_build_index(key) {
+        } else if self.should_build_index() {
             self.build_index();
             self.elems.index_mut().unwrap().insert(key, slot);
         }
@@ -8820,6 +8427,7 @@ impl Props {
     /// No key ownership or runtime key comparison is needed while moving its field values.
     pub(crate) fn append_initialized_field(&mut self, key: PropKey, prop: Property) {
         debug_assert!(self.entries.predicts(key));
+        debug_assert!(key.as_index().is_none(), "an index key is an element word");
         self.elems.retain_symbol_key(key);
         let slot = self.entries.len();
         if let Some(index) = self.elems.index_mut() {
@@ -8896,7 +8504,7 @@ impl Props {
                 if let Some(index) = self.elems.index_mut() {
                     index.insert(key, slot);
                 }
-            } else if self.should_build_index(key) {
+            } else if self.should_build_index() {
                 self.build_index();
                 self.elems.index_mut().unwrap().insert(key, slot);
             }
@@ -8960,9 +8568,7 @@ impl Props {
         {
             self.build_index();
         }
-        self.elems.clear_elems();
-        // We already rebuild every named index below. Forget the old conservative proof
-        // and let the surviving keys reassert it, including those outside packed storage.
+        // Forget the old conservative proof and let the surviving named keys reassert it.
         self.has_far.set(false);
         for slot in 0..self.entries.len() {
             self.note_inserted(slot);
@@ -8996,10 +8602,8 @@ impl Props {
         let Some(i) = self.find(key) else {
             return false;
         };
-        let removed_far = self.has_far.get()
-            && key.as_index().is_some_and(|n| {
-                self.elems.has_words() || self.elems.get(n as usize).copied() != Some(i as u32)
-            });
+        // An index key found in the named entries is one `has_far` records (see `find`).
+        let removed_far = key.as_index().is_some();
         self.note_structural();
         self.entries.remove(i);
         // Slots shifted — deopt to a fresh shape id (see remove_indices_from). Array maps skip
@@ -9027,19 +8631,6 @@ impl Props {
         {
             self.elems.set_index(None);
         }
-        // Dense slots shift down past the removed entry; the removed key's own slot holes.
-        if let Some(elements) = self.elems.iter_mut() {
-            for e in elements {
-                if *e == NO_SLOT {
-                    continue;
-                }
-                match (*e as usize).cmp(&i) {
-                    std::cmp::Ordering::Equal => *e = NO_SLOT,
-                    std::cmp::Ordering::Greater => *e -= 1,
-                    std::cmp::Ordering::Less => {}
-                }
-            }
-        }
         self.elems.release_symbol_key(key);
         if removed_far {
             self.recover_dense_coverage();
@@ -9047,19 +8638,20 @@ impl Props {
         true
     }
 
-    /// A single sparse write must not permanently disable a surviving dense array after
-    /// its key is removed. Cap this extra work: large sparse maps keep their conservative
-    /// proof until a truncation rebuilds them, rather than rescanning on every deletion.
+    /// After a named index key's removal, whether any remains (`has_far`): a single sparse
+    /// write must not permanently send a surviving array or object to its named lookups. Cap
+    /// this extra work: large maps keep their conservative proof until a truncation rebuilds
+    /// it, rather than rescanning on every deletion.
     fn recover_dense_coverage(&mut self) {
         const MAX_RECOVERY_ENTRIES: usize = 256;
         if self.entries.len() > MAX_RECOVERY_ENTRIES {
             return;
         }
-        let packed = self.elems.has_words();
-        let remains = self.entries.keys().iter().enumerate().any(|(slot, key)| {
-            key.as_index()
-                .is_some_and(|n| packed || self.elems.get(n as usize).copied() != Some(slot as u32))
-        });
+        let remains = self
+            .entries
+            .keys()
+            .iter()
+            .any(|key| key.as_index().is_some());
         self.has_far.set(remains);
     }
     /// Ordinary property keys in insertion order. Engine state and private elements live in a

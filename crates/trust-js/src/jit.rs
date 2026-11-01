@@ -7801,14 +7801,7 @@ fn emit_method_elem_dense(
 ) {
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let ev = layout.entry_value as i32;
-    let ea = layout.entry_accessor as u32;
-    let es = layout.entry_size as u64;
     let plain = layout.obj_ic_plain as u32;
-    let commit = a.new_label();
     emit_exec_word_load(a, 10, 20, -16);
     emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 11, slow);
     emit_exec_payload(a, 10, 10);
@@ -7824,27 +7817,8 @@ fn emit_method_elem_dense(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
-    if words_inlinable(layout) {
-        emit_word_read(a, layout, 11, 9, 12, slow, commit);
-    }
-    a.ldr_imm(12, 11, el);
-    a.cbz(12, true, slow);
-    // Dense bounds, then slot = elems[n]; NO_SLOT (0xFFFF_FFFF) is a hole.
-    a.ldr_imm(14, 12, evl);
-    a.cmp_reg_x(9, 14);
-    a.b_cond(C_HS, slow);
-    a.ldr_imm(12, 12, evp);
-    a.add_shifted(12, 12, 9, 2);
-    a.ldr_w_imm(13, 12, 0);
-    a.cmn_imm_w(13, 1);
-    a.b_cond(C_EQ, slow);
-    fields_data(a, layout, 15, 11);
-    a.mov_imm64(16, es);
-    a.madd(15, 13, 16, 15);
-    guard_prop_data(a, 9, 15, ea, slow);
-    a.ldur(12, 15, ev);
+    emit_word_read(a, layout, 11, 9, 12, slow);
     // Commit: the element simply replaces the Number key.
-    a.bind(commit);
     emit_exec_word_store(a, 12, 20, -8);
     a.b(done);
 }
@@ -11225,20 +11199,11 @@ fn emit_update_elem_inline(
     pc: u32,
     l_unwind: usize,
 ) {
-    debug_assert_eq!(layout.entry_accessor, layout.entry_value + 8);
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let ev = layout.entry_value as i32;
-    let ea = layout.entry_accessor as u32;
-    let ew = layout.entry_writable as u32;
-    let es = layout.entry_size as u64;
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
     let done = a.new_label();
-    let element = a.new_label();
     a.mark_push("update-elem");
     // 1. an Obj receiver
     emit_exec_word_load(a, 9, 20, -16);
@@ -11263,51 +11228,20 @@ fn emit_update_elem_inline(
         kind,
         UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
     );
-    let results = a.new_label();
     // 5. element words: a plain element, so a writable data property; the old value is a
-    // Number (a hole and every other kind are tagged NaNs) → d5.
-    if words_inlinable(layout) {
-        let classic = a.new_label();
-        emit_words_base(a, layout, 11, 15, 14);
-        a.cbz(14, false, classic);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_HS, slow);
-        a.add_shifted(17, 15, 9, 3);
-        a.ldr_imm(16, 17, 0);
-        emit_exec_number_guard(a, 16, 5, 13, slow);
-        // --- commit: d6 = old ± 1 replaces the word, which is no edge ---
-        a.fmov_one(7);
-        a.f_arith(if dec { 1 } else { 0 }, 6, 5, 7);
-        emit_exec_number_store(a, 6, 17, 0, 13);
-        emit_word_number_kind(a, layout, 15, 6, 12, 13, 14, 1);
-        a.b(results);
-        a.bind(classic);
-    }
-    // 6. dense element storage; x15 → the element's Property
-    a.ldr_imm(12, 11, el);
-    a.cbz(12, true, slow);
-    a.ldr_imm(14, 12, evl);
+    // Number (a hole and every other kind are tagged NaNs) → d5. Past the used words (every
+    // index, for a map without words), the checked operation.
+    emit_words_base(a, layout, 11, 15, 14);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
-    a.ldr_imm(12, 12, evp);
-    a.add_shifted(12, 12, 9, 2);
-    a.ldr_w_imm(13, 12, 0);
-    a.cmn_imm_w(13, 1); // NO_SLOT: a hole consults the prototype chain
-    a.b_cond(C_EQ, slow);
-    fields_data(a, layout, 15, 11);
-    a.mov_imm64(16, es);
-    a.madd(15, 13, 16, 15);
-    guard_prop_data(a, 14, 15, ea, slow);
-    guard_prop_writable(a, 14, 15, ew, slow);
-    a.bind(element);
-    // 7. the old value is a Number (every other kind is a tagged NaN) → d5
-    a.ldur(16, 15, ev);
+    a.add_shifted(17, 15, 9, 3);
+    a.ldr_imm(16, 17, 0);
     emit_exec_number_guard(a, 16, 5, 13, slow);
-    // --- commit: d6 = old ± 1 replaces [[Value]]; the old Number needs no drop ---
+    // --- commit: d6 = old ± 1 replaces the word, which is no edge ---
     a.fmov_one(7);
     a.f_arith(if dec { 1 } else { 0 }, 6, 5, 7);
-    emit_exec_number_store(a, 6, 15, ev, 13);
-    a.bind(results);
+    emit_exec_number_store(a, 6, 17, 0, 13);
+    emit_word_number_kind(a, layout, 15, 6, 12, 13, 14, 1);
     match kind {
         UpdKind::PreInc | UpdKind::PreDec => {
             emit_exec_number_store(a, 6, 20, -16, 9);
@@ -14137,23 +14071,15 @@ fn emit_name_ic_value_ptr_in(
     a.bind(have);
 }
 
-/// Same gate as [`get_prop_inlinable`] plus the dense-element (`Props::elems`) and
-/// writable-flag offsets the element templates bake in.
+/// Same gate as [`get_elem_inlinable`] plus the descriptor offsets the element stores and
+/// definitions bake in (the define template guards `length`'s entry).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn elem_inlinable(layout: &crate::value::JitLayout) -> bool {
-    let elems = layout.obj_props + layout.props_elems;
-    get_prop_inlinable(layout)
+    get_elem_inlinable(layout)
         && layout.entry_accessor == layout.entry_value + 8
-        && [
-            elems,
-            layout.dense_elems + layout.vec_ptr_off,
-            layout.dense_elems + layout.vec_len_off,
-        ]
-        .into_iter()
-        .all(|off| off.is_multiple_of(8) && off / 8 < 4096)
         && layout.entry_writable < 4096
 }
 
@@ -14191,11 +14117,10 @@ fn emit_words_base(
     a.ldur_w(used, words, -(layout.words_used as i32));
 }
 
-/// Read element x`idx` (a u32) of the Object at x`obj` from its element words into x`out` and
-/// branch to `hit`. A word is a plain data element's value; a map without words falls through
-/// to its classic slots. Past the used words or at a hole, `miss`: the checked operation, which
-/// consults the named entries (an index one of them holds) and the prototype chain. Clobbers
-/// x14 and x15.
+/// Read element x`idx` (a u32) of the Object at x`obj` from its element words into x`out`,
+/// falling through on a hit. A word is a plain data element's value. Past the used words (every
+/// index, for a map without words) or at a hole, `miss`: the checked operation, which consults
+/// the named entries (an index one of them holds) and the prototype chain. Clobbers x14 and x15.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14207,20 +14132,15 @@ fn emit_word_read(
     idx: u32,
     out: u32,
     miss: usize,
-    hit: usize,
 ) {
     debug_assert!(![14, 15].contains(&out) && ![14, 15].contains(&idx));
-    let classic = a.new_label();
     emit_words_base(a, layout, obj, 15, 14);
-    a.cbz(14, false, classic);
     a.cmp_reg_x(idx, 14);
     a.b_cond(C_HS, miss);
     a.ldr_x_lsl3(out, 15, idx);
     a.mov_imm64(14, crate::value::PACK_EMPTY);
     a.cmp_reg_x(out, 14);
     a.b_cond(C_EQ, miss);
-    a.b(hit);
-    a.bind(classic);
 }
 
 /// After d`value`, a Number, replaces a present element of the words at x`words`: the kind bits
@@ -14267,21 +14187,13 @@ fn emit_word_number_kind(
     a.bind(done);
 }
 
-/// The element read templates' offsets: the words, and the classic slot map behind them.
+/// The element read templates' offsets: the element words'.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn get_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
-    let elems = layout.obj_props + layout.props_elems;
-    get_prop_inlinable(layout)
-        && [
-            elems,
-            layout.dense_elems + layout.vec_ptr_off,
-            layout.dense_elems + layout.vec_len_off,
-        ]
-        .into_iter()
-        .all(|off| off.is_multiple_of(8) && off / 8 < 4096)
+    get_prop_inlinable(layout) && words_inlinable(layout)
 }
 
 /// Inline dense-element read (`a[i]`): an own data element of a plain object/array, indexed
@@ -14317,12 +14229,6 @@ fn emit_get_elem_inline_marked(
 ) {
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let ev = layout.entry_value as i32;
-    let ea = layout.entry_accessor as u32;
-    let es = layout.entry_size as u64;
 
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
@@ -14351,30 +14257,10 @@ fn emit_get_elem_inline_marked(
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, typed);
     // 5. element words: a plain element's value in one indexed load, with no index string or
-    // entry-table chase; a hole is absent and consults the prototype chain.
-    if words_inlinable(layout) {
-        emit_word_read(a, layout, 11, 9, 12, slow, hit);
-    }
-    // 6. dense bounds: n < elems.len (x9's upper bits are zero from the w-form fcvtzu)
-    a.ldr_imm(12, 11, el);
-    a.cbz(12, true, slow);
-    a.ldr_imm(14, 12, evl);
-    a.cmp_reg_x(9, 14);
-    a.b_cond(C_HS, slow);
-    // 6. slot = elems[n]; NO_SLOT (0xFFFF_FFFF) = hole → slow
-    a.ldr_imm(12, 12, evp);
-    a.add_shifted(12, 12, 9, 2);
-    a.ldr_w_imm(13, 12, 0);
-    a.cmn_imm_w(13, 1);
-    a.b_cond(C_EQ, slow);
-    // 7. entry base = entries data ptr + slot*entry_size
-    fields_data(a, layout, 15, 11);
-    a.mov_imm64(16, es);
-    a.madd(15, 13, 16, 15);
-    // 8. not an accessor
-    guard_prop_data(a, 9, 15, ea, slow);
-    a.ldur(12, 15, ev); // Copy the complete heap word.
-                        // --- commit: everything validated; from here only writes ---
+    // entry-table chase (x9's upper bits are zero from the w-form fcvtzu); a hole is absent and
+    // consults the prototype chain.
+    emit_word_read(a, layout, 11, 9, 12, slow);
+    // --- commit: everything validated; from here only writes ---
     a.bind(hit);
     // pop obj+key, push value → value lands at the obj slot, sp drops one
     emit_exec_word_store(a, 12, 20, -16);
@@ -14419,19 +14305,8 @@ fn emit_set_elem_inline_marked(
     l_unwind: usize,
     keep: bool,
 ) {
-    if layout.entry_accessor != layout.entry_value + 8 {
-        emit_op_helper(a, H_SET_ELEM, pc, l_unwind);
-        return;
-    }
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let ev = layout.entry_value as i32;
-    let ea = layout.entry_accessor as u32;
-    let ew = layout.entry_writable as u32;
-    let es = layout.entry_size as u64;
 
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
@@ -14455,39 +14330,8 @@ fn emit_set_elem_inline_marked(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, typed);
-    // 5. element words, then dense bounds
+    // 5. element words: overwrite an existing element with the Number
     emit_word_store(a, layout, slow, done, true, keep);
-    a.ldr_imm(12, 11, el);
-    a.cbz(12, true, slow);
-    a.ldr_imm(14, 12, evl);
-    a.cmp_reg_x(9, 14);
-    a.b_cond(C_HS, slow);
-    // 6. slot = elems[n]; hole → slow
-    a.ldr_imm(12, 12, evp);
-    a.add_shifted(12, 12, 9, 2);
-    a.ldr_w_imm(13, 12, 0);
-    a.cmn_imm_w(13, 1);
-    a.b_cond(C_EQ, slow);
-    // 7. entry base
-    fields_data(a, layout, 15, 11);
-    a.mov_imm64(16, es);
-    a.madd(15, 13, 16, 15);
-    // 8. data property, writable
-    guard_prop_data(a, 9, 15, ea, slow);
-    guard_prop_writable(a, 9, 15, ew, slow);
-    // --- commit ---
-    // Move v into the entry.
-    emit_stack_number_load(a, -8, slow);
-    a.stur(16, 15, ev);
-    if keep {
-        // [obj, key, v] → [v]: the result lands at the obj slot
-        emit_exec_word_load(a, 14, 20, -8);
-        emit_exec_word_store(a, 14, 20, -24);
-        a.sub_imm(20, 20, 16);
-    } else {
-        a.sub_imm(20, 20, 24);
-    }
-    a.b(done);
     a.bind(typed);
     let typed_hit = a.new_label();
     typed_array::emit(
@@ -14513,8 +14357,8 @@ fn emit_set_elem_inline_marked(
 
 /// Overwrite an existing element word with the Number at `[x20 - 8]`: the machine-code
 /// `Words::set` for a Number, which is no edge (no card, no remembered block) and keeps the
-/// kind bits exact. A map without words falls through to its classic slots; past the used
-/// words or at a hole (a property creation), `slow`. x9 holds the u32 index, x11 the Object.
+/// kind bits exact, then branch to `done`. Past the used words (every index, for a map without
+/// words) or at a hole (a property creation), `slow`. x9 holds the u32 index, x11 the Object.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14527,12 +14371,7 @@ fn emit_word_store(
     stack_receiver: bool,
     keep: bool,
 ) {
-    if !words_inlinable(layout) {
-        return;
-    }
-    let classic = a.new_label();
     emit_words_base(a, layout, 11, 15, 14);
-    a.cbz(14, false, classic);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
     a.ldr_x_lsl3(12, 15, 9);
@@ -14553,7 +14392,6 @@ fn emit_word_store(
         a.sub_imm(20, 20, consumed as u32);
     }
     a.b(done);
-    a.bind(classic);
 }
 
 /// Inline `lval in rval` (ECMA-262 §13.10.1) when lval is a Number that is exactly an array
@@ -14622,11 +14460,7 @@ fn emit_in_keyed(
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let plain = layout.obj_ic_plain as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
     let slow = a.new_label();
-    let present = a.new_label();
     let done = a.new_label();
     // 1. The receiver must be an Object; the key must be a Number that is exactly a u32.
     //    NaN, negative, fractional and huge values fail the round trip; 2^32 − 1, which is not
@@ -14671,25 +14505,10 @@ fn emit_in_keyed(
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
     // 4. element words: a word that is not a hole is a present own element.
-    if words_inlinable(layout) {
-        emit_word_read(a, layout, 11, 9, 13, slow, present);
-    }
-    // 5. element storage sidecar (none: no elements to find here).
-    a.ldr_imm(12, 11, el);
-    a.cbz(12, true, slow);
-    // Classic: elems[n] names the element's entry slot, NO_SLOT (0xFFFF_FFFF) a hole.
-    a.ldr_imm(14, 12, evl);
-    a.cmp_reg_x(9, 14);
-    a.b_cond(C_HS, slow);
-    a.ldr_imm(12, 12, evp);
-    a.add_shifted(12, 12, 9, 2);
-    a.ldr_w_imm(13, 12, 0);
-    a.cmn_imm_w(13, 1);
-    a.b_cond(C_EQ, slow);
+    emit_word_read(a, layout, 11, 9, 13, slow);
     // --- commit: present own element means [[HasProperty]] is true, with no observable
     // prototype walk, key coercion or getter. Local-source form pushes the result without
     // popping an operand. ---
-    a.bind(present);
     a.mov_imm64(9, crate::value::PACK_BOOL | 1);
     if stack_receiver {
         emit_exec_word_store(a, 9, 20, -16);
@@ -14728,9 +14547,7 @@ fn emit_in_keyed(
 ))]
 fn define_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
     let props = layout.obj_props;
-    crate::value::dense_elements_enabled()
-        && elem_inlinable(layout)
-        && words_inlinable(layout)
+    elem_inlinable(layout)
         && [
             layout.obj_extensible,
             props + layout.props_proto_flag,
@@ -14927,52 +14744,6 @@ enum KeySrc {
     SlotPre(u32, bool),
 }
 
-/// Load and guard a Number for a numeric READ. On success x12 holds its bits, which the
-/// read/write region transfers to its FP home. Stores need only the separate hole guard.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_packed_number_read_guard(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    entry: u32,
-    slow: usize,
-) {
-    a.ldur(12, entry, layout.entry_value as i32);
-    a.lsr_imm(9, 12, 48);
-    // PACK_OBJ sorts above the tagged scalar range, so reject it before the two numeric ranges.
-    a.movz(14, (crate::value::PACK_OBJ >> 48) as u32, 0);
-    a.cmp_reg_x(9, 14);
-    a.b_cond(C_HS, slow);
-    let number = a.new_label();
-    a.movz(14, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-    a.cmp_reg_x(9, 14);
-    a.b_cond(C_LO, number);
-    a.movz(14, (crate::value::PACK_SYM >> 48) as u32, 0);
-    a.cmp_reg_x(9, 14);
-    a.b_cond(C_LS, slow);
-    a.bind(number);
-}
-
-/// A packed dense hole is not an existing own element. Retain its prototype-sensitive slow
-/// path when overwriting any other value kind without consulting ownership or payload data.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_packed_existing_guard(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    entry: u32,
-    slow: usize,
-) {
-    a.ldur(12, entry, layout.entry_value as i32);
-    a.mov_imm64(14, crate::value::PACK_EMPTY);
-    a.cmp_reg_x(12, 14);
-    a.b_cond(C_EQ, slow);
-}
-
 /// Load a Number word at `off` into x16. Other kinds stay on the checked numeric path.
 #[cfg(all(
     target_arch = "aarch64",
@@ -15038,23 +14809,14 @@ fn emit_elem_local_keyed(
 ) {
     #[cfg(not(test))]
     let _ = fast_event;
-    if kind != ElemLocalKind::Get && layout.entry_accessor != layout.entry_value + 8 {
-        for &pc in pcs {
-            emit_op_helper(a, H_SET_ELEM, pc, l_unwind);
-        }
-        return;
-    }
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let ev = layout.entry_value as i32;
-    let ea = layout.entry_accessor as u32;
-    let ew = layout.entry_writable as u32;
-    let es = layout.entry_size as u64;
     let get = kind == ElemLocalKind::Get;
     debug_assert!(get || key == KeySrc::Stack);
+    debug_assert!(
+        get || fast_event.is_none(),
+        "only reads record a fast event"
+    );
     // Stack-keyed layout: Get → [key @ -16]; Set* → [key @ -32, v @ -16].
     let key_off = if get { -8 } else { -16 };
 
@@ -15097,33 +14859,11 @@ fn emit_elem_local_keyed(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, typed);
-    // 5. element words
-    if !get {
-        emit_word_store(a, layout, slow, done, false, kind == ElemLocalKind::SetKeep);
-    } else if words_inlinable(layout) {
-        emit_word_read(a, layout, 11, 9, 12, slow, hit);
-    }
-    // 6. dense bounds
-    a.ldr_imm(12, 11, el);
-    a.cbz(12, true, slow);
-    a.ldr_imm(14, 12, evl);
-    a.cmp_reg_x(9, 14);
-    a.b_cond(C_HS, slow);
-    // 6. slot = elems[n]; hole → slow
-    a.ldr_imm(12, 12, evp);
-    a.add_shifted(12, 12, 9, 2);
-    a.ldr_w_imm(13, 12, 0);
-    a.cmn_imm_w(13, 1);
-    a.b_cond(C_EQ, slow);
-    // 7. entry base
-    fields_data(a, layout, 15, 11);
-    a.mov_imm64(16, es);
-    a.madd(15, 13, 16, 15);
-    // 8. data property (+ writable for the set forms)
-    guard_prop_data(a, 9, 15, ea, slow);
+    // 5. element words: a read copies a plain element's value; a store overwrites an existing
+    // element with the Number.
     if get {
-        // Copy directly into a compact word; preserve d0 (the deferred numeric key).
-        a.ldur(12, 15, ev);
+        emit_word_read(a, layout, 11, 9, 12, slow);
+        // Copied into a compact word; d0 (the deferred numeric key) is preserved.
         a.bind(hit);
         match key {
             KeySrc::Stack => {
@@ -15139,25 +14879,14 @@ fn emit_elem_local_keyed(
                 a.add_imm(20, 20, 8);
             }
         }
-    } else {
-        guard_prop_writable(a, 9, 15, ew, slow);
-        // --- commit: move v into the entry ---
-        emit_stack_number_load(a, -8, slow);
-        a.stur(16, 15, ev);
-        if kind == ElemLocalKind::SetKeep {
-            // The packed store guard proves Number: the result is the stored word.
-            emit_exec_word_load(a, 14, 20, -8);
-            emit_exec_word_store(a, 14, 20, -16);
-            a.sub_imm(20, 20, 8);
-        } else {
-            a.sub_imm(20, 20, 16);
+        #[cfg(test)]
+        if let Some(function) = fast_event {
+            regions::emit_lowering_event(a, function);
         }
+        a.b(done);
+    } else {
+        emit_word_store(a, layout, slow, done, false, kind == ElemLocalKind::SetKeep);
     }
-    #[cfg(test)]
-    if let Some(function) = fast_event {
-        regions::emit_lowering_event(a, function);
-    }
-    a.b(done);
     a.bind(typed);
     if get {
         typed_array::emit(a, layout, None, hit, slow);
@@ -15220,12 +14949,6 @@ fn emit_local_own_dense_data_guard(
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let plain = layout.obj_ic_plain as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let ev = layout.entry_value as i32;
-    let ea = layout.entry_accessor as u32;
-    let es = layout.entry_size as u64;
 
     // In source order the key local is loaded before the receiver local. Merely probing
     // either canonical slot is non-observable; any TDZ value misses to the original PC,
@@ -15257,50 +14980,19 @@ fn emit_local_own_dense_data_guard(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     // `ic_plain` excludes proxies and all objects whose property lookup can invoke an
     // exotic internal method. Array's indexed exotic behavior is already represented by
-    // its live dense sidecar, while this flag rules out any other side-table behavior.
+    // its live element words, while this flag rules out any other side-table behavior.
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
 
-    let classic_dense = a.new_label();
-    let entry_ready = a.new_label();
-    if words_inlinable(layout) {
-        // An element word is a plain data element's value; a hole fails below. A map without
-        // words takes its classic slots.
-        emit_words_base(a, layout, 11, 15, 14);
-        a.cbz(14, false, classic_dense);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_HS, slow);
-        a.ldr_x_lsl3(12, 15, 9);
-        a.b(entry_ready);
-    }
-    a.bind(classic_dense);
-    a.ldr_imm(12, 11, el);
-    a.cbz(12, true, slow);
-    // A classic dense index names an entry slot; NO_SLOT is a hole. Inherited values are
-    // deliberately not accepted here: the checked HasProperty path handles them.
-    a.ldr_imm(14, 12, evl);
-    a.cmp_reg_x(9, 14);
-    a.b_cond(C_HS, slow);
-    a.ldr_imm(12, 12, evp);
-    a.add_shifted(12, 12, 9, 2);
-    a.ldr_w_imm(13, 12, 0);
-    a.cmn_imm_w(13, 1);
-    a.b_cond(C_EQ, slow);
-    fields_data(a, layout, 15, 11);
-    a.mov_imm64(16, es);
-    a.madd(15, 13, 16, 15);
-    guard_prop_data(a, 14, 15, ea, slow);
-    a.ldur(12, 15, ev);
-    a.bind(entry_ready);
-    // Value's Empty word is the deleted-slot marker, not a language value.
-    a.mov_imm64(14, crate::value::PACK_EMPTY);
-    a.cmp_reg_x(12, 14);
-    a.b_cond(C_EQ, slow);
+    // An element word is a plain data element's value. Past the used words (every index, for
+    // a map without words) or at a hole, the original operations: inherited values are
+    // deliberately not accepted here, the checked HasProperty path handles them.
+    emit_word_read(a, layout, 11, 9, 12, slow);
 }
 
-/// After the two TDZ stores, reconstruct the already-guarded descriptor address from the
-/// still-rooted receiver and unchanged numeric key: the stores run no author code and change
-/// no descriptor, so only address derivation repeats. x12 receives the borrowed word.
+/// After the two TDZ stores, reread the already-guarded element word from the still-rooted
+/// receiver and unchanged numeric key: the stores run no author code and change no element, so
+/// only address derivation repeats. x12 receives the borrowed word.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -15312,10 +15004,6 @@ fn emit_local_assumed_dense_data_value(
     key: KeySrc,
 ) {
     let obj_off = layout.obj_from_cell as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let ev = layout.entry_value as i32;
-    let es = layout.entry_size as u64;
 
     match key {
         KeySrc::Slot(offset) => {
@@ -15333,26 +15021,9 @@ fn emit_local_assumed_dense_data_value(
     emit_exec_word_load(a, 10, 22, receiver_off as i32);
     emit_exec_payload(a, 10, 10);
     a.add_imm(11, 10, obj_off);
-
-    let classic_dense = a.new_label();
-    let entry_ready = a.new_label();
-    if words_inlinable(layout) {
-        // The representation the guard proved: words in use, or the classic slots.
-        emit_words_base(a, layout, 11, 15, 14);
-        a.cbz(14, false, classic_dense);
-        a.ldr_x_lsl3(12, 15, 9);
-        a.b(entry_ready);
-    }
-    a.bind(classic_dense);
-    a.ldr_imm(12, 11, el);
-    a.ldr_imm(12, 12, evp);
-    a.add_shifted(12, 12, 9, 2);
-    a.ldr_w_imm(13, 12, 0);
-    fields_data(a, layout, 15, 11);
-    a.mov_imm64(16, es);
-    a.madd(15, 13, 16, 15);
-    a.ldur(12, 15, ev);
-    a.bind(entry_ready);
+    // The word the guard proved present.
+    a.ldr_imm(15, 11, (layout.obj_props + layout.props_words) as u32);
+    a.ldr_x_lsl3(12, 15, 9);
 }
 
 /// One op of a numeric register chain (see [`build_chain`]). Every value the chain produces is a
@@ -16120,13 +15791,10 @@ fn emit_chain_marked(
     pc_labels: &[usize],
     l_unwind: usize,
 ) {
-    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
-    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
-    let el = (layout.obj_props + layout.props_elems) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
@@ -16382,57 +16050,27 @@ fn emit_chain_marked(
                         }
                     }
                 }
-                if words_inlinable(layout) {
-                    // The receiver is already validated (and cached across this helper-free
-                    // chain). Element words are plain data elements, an f64 array in place
-                    // where they hold Numbers; a map without words takes its classic slots.
-                    let indexed = a.new_label();
-                    emit_words_base(a, layout, 11, 15, 14);
-                    a.cbz(14, false, indexed);
-                    a.cmp_reg_x(9, 14);
-                    a.b_cond(C_HS, guard!());
-                    a.ldr_x_lsl3(12, 15, 9);
-                    if is_set {
-                        // An existing element: a hole store would create a property.
-                        a.mov_imm64(14, crate::value::PACK_EMPTY);
-                        a.cmp_reg_x(12, 14);
-                        a.b_cond(C_EQ, guard!());
-                        // The Number's word, its NaN the canonical one.
-                        a.add_shifted(13, 15, 9, 3);
-                        emit_exec_number_store(a, dv, 13, 0, 14);
-                        emit_word_number_kind(a, layout, 15, dv, 12, 13, 14, 1);
-                    } else {
-                        // A Number: a hole and every other kind are tagged NaNs. The guard
-                        // checks through scratch d0, as dk still holds the key a bailout
-                        // replays with.
-                        emit_exec_number_guard(a, 12, 0, 14, guard!());
-                        a.fmov_d_x(dk, 12);
-                    }
-                    a.b(packed_done);
-                    a.bind(indexed);
-                }
-                // The classic slots: the entry the slot map names, a data property (writable
-                // to store), holding a Number to read.
-                a.ldr_imm(12, 11, el);
-                a.cbz(12, true, guard!());
-                a.ldr_imm(14, 12, evl);
+                // The receiver is already validated (and cached across this helper-free chain).
+                // Element words are plain data elements, an f64 array in place where they hold
+                // Numbers; past the used words (every index, for a map without words), the
+                // guard.
+                emit_words_base(a, layout, 11, 15, 14);
                 a.cmp_reg_x(9, 14);
                 a.b_cond(C_HS, guard!());
-                a.ldr_imm(12, 12, evp);
-                a.add_shifted(12, 12, 9, 2);
-                a.ldr_w_imm(13, 12, 0);
-                a.cmn_imm_w(13, 1);
-                a.b_cond(C_EQ, guard!());
-                fields_data(a, layout, 15, 11);
-                a.movz(9, es as u32, 0); // entry stride (< 65536; the key index in x9 is dead)
-                a.madd(15, 13, 9, 15);
-                guard_prop_data(a, 9, 15, ea, guard!());
+                a.ldr_x_lsl3(12, 15, 9);
                 if is_set {
-                    guard_prop_writable(a, 14, 15, ew, guard!());
-                    emit_packed_existing_guard(a, layout, 15, guard!());
-                    emit_exec_number_store(a, dv, 15, ev, 16);
+                    // An existing element: a hole store would create a property.
+                    a.mov_imm64(14, crate::value::PACK_EMPTY);
+                    a.cmp_reg_x(12, 14);
+                    a.b_cond(C_EQ, guard!());
+                    // The Number's word, its NaN the canonical one.
+                    a.add_shifted(13, 15, 9, 3);
+                    emit_exec_number_store(a, dv, 13, 0, 14);
+                    emit_word_number_kind(a, layout, 15, dv, 12, 13, 14, 1);
                 } else {
-                    emit_packed_number_read_guard(a, layout, 15, guard!());
+                    // A Number: a hole and every other kind are tagged NaNs. The guard checks
+                    // through scratch d0, as dk still holds the key a bailout replays with.
+                    emit_exec_number_guard(a, 12, 0, 14, guard!());
                     a.fmov_d_x(dk, 12);
                 }
                 if is_set {

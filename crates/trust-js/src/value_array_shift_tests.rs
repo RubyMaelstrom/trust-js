@@ -21,8 +21,8 @@ fn array(values: Vec<Value>, packed: bool, reverse: bool, named_tail: bool) -> P
             entries.reverse();
         }
         for (index, value) in entries {
-            // Exercise the retained classic fallback explicitly: ordinary array
-            // insertion now chooses contiguous elements for this fixture too.
+            // The named-entry form (an index among the named entries, `has_far`), which
+            // ordinary insertion reaches only past a far or non-plain index.
             let slot = props.entries.len();
             props
                 .entries
@@ -56,8 +56,11 @@ fn number(value: Value) -> f64 {
 }
 
 #[test]
-fn dense_shift_storage_drains_words_and_classic_without_losing_views() {
-    for packed in [false, true] {
+fn dense_shift_storage_drains_words_without_losing_views() {
+    // Elements in the named entries take the generic algorithm.
+    let mut named_entries = numbers(3, false, false, false);
+    assert!(named_entries.shift_dense_array(3, false).is_none());
+    for packed in [true] {
         for named in [false, true] {
             for initial in [1, 3, 10, 16, 32] {
                 let mut props = numbers(initial, packed, false, named);
@@ -120,36 +123,26 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
     assert!(words.shift_dense_array(3, false).is_none());
     assert_eq!(words.get("0").unwrap().number_value(), Some(0.0));
     assert!(!words.get("0").unwrap().configurable());
-    // The classic storage keeps each index's attributes in its entry.
-    {
-        let mut props = numbers(3, false, true, true);
-        props.get_mut("0").unwrap().set_configurable(false);
-        props.get_mut("0").unwrap().set_enumerable(false);
-        props.get_mut("1").unwrap().set_configurable(false);
-        props.get_mut("2").unwrap().set_writable(false);
-        let zero_flags = props.get("0").unwrap().as_entry().meta;
-        let one_flags = props.get("1").unwrap().as_entry().meta;
-        let shape = props.shape();
-        assert_eq!(number(props.shift_dense_array(3, false).unwrap()), 0.0);
-        assert_eq!(props.get("0").unwrap().as_entry().meta, zero_flags);
-        assert_eq!(props.get("1").unwrap().as_entry().meta, one_flags);
-        assert_eq!(props.get("0").unwrap().number_value(), Some(1.0));
-        assert_eq!(props.get("1").unwrap().number_value(), Some(2.0));
-        assert!(props.get("2").is_none());
-        assert_eq!(props.shape(), shape);
-        assert_eq!(
-            props
-                .ordered_keys()
-                .iter()
-                .map(|k| k.text().to_string())
-                .collect::<Vec<_>>(),
-            ["0", "1", "length", "named", "01", "4294967295"]
-        );
-        assert!(
-            props.shift_dense_array(2, false).is_none(),
-            "non-configurable tail must reject"
-        );
-    }
+    // Elements kept in the named entries (out of order, with their own attributes) refuse
+    // too, changing nothing.
+    let mut props = numbers(3, false, true, true);
+    props.get_mut("0").unwrap().set_configurable(false);
+    props.get_mut("2").unwrap().set_writable(false);
+    let zero_flags = props.get("0").unwrap().as_entry().meta;
+    let shape = props.shape();
+    assert!(props.shift_dense_array(3, false).is_none());
+    assert_eq!(props.get("0").unwrap().as_entry().meta, zero_flags);
+    assert_eq!(props.get("0").unwrap().number_value(), Some(0.0));
+    assert_eq!(props.get("2").unwrap().number_value(), Some(2.0));
+    assert_eq!(props.shape(), shape);
+    assert_eq!(
+        props
+            .ordered_keys()
+            .iter()
+            .map(|k| k.text().to_string())
+            .collect::<Vec<_>>(),
+        ["0", "1", "2", "length", "named", "01", "4294967295"]
+    );
 }
 
 #[test]
@@ -214,7 +207,7 @@ fn dense_shift_storage_rejections_are_atomic() {
 
 #[test]
 fn dense_shift_storage_preserves_numeric_bits_and_invalidates_prototype_creation_proofs() {
-    for packed in [false, true] {
+    for packed in [true] {
         let values = vec![
             Value::Num(-0.0),
             Value::Num(f64::NAN),

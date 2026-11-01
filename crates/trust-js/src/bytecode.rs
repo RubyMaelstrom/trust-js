@@ -15993,12 +15993,19 @@ impl Compiler {
                 for k in &keys {
                     self.append_name(&crate::value::encode_string_key(k));
                 }
-                // Distinct keys → a pre-shaped template site ({a:1, a:2} keeps the insert path:
-                // the template's slot-indexed value writes assume one slot per key).
+                // Distinct named keys → a pre-shaped template site ({a:1, a:2} keeps the insert
+                // path: the template's slot-indexed value writes assume one slot per key). An
+                // index key (`{"0": a}`) is an element word, which has no named slot, so such a
+                // literal inserts its keys one by one too.
                 let tidx = {
                     let mut sorted: Vec<&String> = keys.iter().collect();
                     sorted.sort();
-                    if count > 0 && sorted.windows(2).all(|w| w[0] != w[1]) {
+                    if count > 0
+                        && sorted.windows(2).all(|w| w[0] != w[1])
+                        && keys
+                            .iter()
+                            .all(|key| crate::value::canonical_index(key).is_none())
+                    {
                         self.obj_maps += 1;
                         self.obj_maps - 1
                     } else {

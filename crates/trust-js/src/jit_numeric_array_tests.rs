@@ -413,18 +413,6 @@ fn numeric_array_view_invalidations_preserve_descriptors_holes_and_length() {
 
 #[test]
 fn numeric_array_existing_hole_filling_region_invalidates_prepared_views() {
-    check_hole_filling_region_storage(true);
-}
-
-#[test]
-fn numeric_array_existing_hole_filling_region_maintains_classic_views() {
-    check_hole_filling_region_storage(false);
-}
-
-fn check_hole_filling_region_storage(packed: bool) {
-    // Ordinary cold literals now also use contiguous elements. The same test
-    // with TRUST_JS_DENSE_ELEMENTS=0 retains explicit coverage of the classic path.
-    let packed = packed || crate::value::dense_elements_enabled();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(if tier == Tier::Jit {
@@ -436,7 +424,7 @@ fn check_hole_filling_region_storage(packed: bool) {
         engine.set_tier_threshold(32);
         eval(
             &mut engine,
-            &r#"
+            r#"
             var LIMIT=4;
             function Worker(){this.v=0;}
             Worker.prototype.fill=function(packet){var i=0;while(i<LIMIT){
@@ -447,17 +435,9 @@ fn check_hole_filling_region_storage(packed: bool) {
             // actual factory so this regression explicitly exercises raw packed writes.
             function packedFactory(){return [1,2,3,4];}
             for(var warm=0;warm<40;warm++)packedFactory();
-            var worker=new Worker,packet={a:ARRAY_FACTORY},fillArray=packet.a;
+            var worker=new Worker,packet={a:packedFactory()},fillArray=packet.a;
             for(var n=0;n<600;n++){worker.fill(packet);scan(packet.a);}
-        "#
-            .replace(
-                "ARRAY_FACTORY",
-                if packed {
-                    "packedFactory()"
-                } else {
-                    "[1,2,3,4]"
-                },
-            ),
+        "#,
         );
         engine.set_tier(tier);
         reset_entries();
@@ -468,8 +448,8 @@ fn check_hole_filling_region_storage(packed: bool) {
         if tier == Tier::Jit {
             assert_eq!(
                 object.borrow().props.word_values().count(),
-                if packed { 4 } else { 0 },
-                "fixture must exercise the selected packed or classic storage contract"
+                4,
+                "fixture must exercise the element words"
             );
             let body = object.borrow();
             assert_eq!(body.props.get_index(0).unwrap().number_value(), Some(5.0));

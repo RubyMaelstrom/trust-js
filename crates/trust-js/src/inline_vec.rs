@@ -206,15 +206,6 @@ impl<T, const N: usize, S: Spill> InlineVec<T, N, S> {
         self.len += 1;
     }
 
-    pub(crate) fn pop(&mut self) -> Option<T> {
-        if self.len == 0 {
-            return None;
-        }
-        self.len -= 1;
-        // SAFETY: the element at the old last index is initialized and now outside the length.
-        Some(unsafe { self.as_ptr().add(self.len()).read() })
-    }
-
     pub(crate) fn remove(&mut self, index: usize) -> T {
         let len = self.len();
         assert!(
@@ -510,7 +501,7 @@ mod tests {
             "spilling moves elements without dropping them"
         );
         // Shrinking keeps the heap buffer.
-        assert_eq!(vec.pop().map(|c| c.0), Some(4));
+        assert_eq!(vec.remove(4).0, 4);
         assert_eq!(drops.get(), 1);
         assert!(vec.spilled());
         drop(vec);

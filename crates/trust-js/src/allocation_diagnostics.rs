@@ -411,17 +411,9 @@ impl PropertyInventory {
             .elems
             .symbols()
             .map_or(0, |symbols| symbols.capacity() as u64);
-        if let Some(dense) = props.elems.0.as_deref() {
-            result.dense_sidecars = 1;
-            result.dense_sidecar_body_bytes = std::mem::size_of::<super::DenseBuffers>() as u64;
-            result.dense_index_directory_len = dense.elems.len() as u64;
-            result.dense_index_directory_capacity = dense.elems.capacity() as u64;
-            result.dense_index_directory_capacity_bytes = dense
-                .elems
-                .capacity()
-                .saturating_mul(std::mem::size_of::<u32>())
-                as u64;
-        }
+        // The sidecar's and the classic slot map's columns (dense_sidecar*,
+        // dense_index_directory_*) stay zero: W2c step 3 removed both, and the columns keep the
+        // exit's lines comparable with step 1's.
         // The element words: one block of a 16-byte header and 8-byte words (`heap_packed`).
         if let Some(words) = props.elems.words() {
             let word_bytes = |n: usize| n.saturating_mul(8) as u64;
@@ -878,12 +870,13 @@ mod tests {
         assert!(empty_reserve.entry_vec_eligibility.empty_reserved_capacity >= 5);
 
         let mut indexed = Props::new();
-        // Ordinary canonical indices populate the index sidecar but stay in `entries`, with
-        // no element words.
+        // An ordinary object's canonical index is an element word, as an array's is (W2c step
+        // 3), with no sidecar and no named entry.
         indexed.insert("0", Property::plain(super::super::Value::Num(6.0)));
         let indexed = PropertyInventory::from_props(&indexed);
-        assert_eq!(indexed.dense_sidecars, 1);
-        assert_eq!(indexed.dense_heap_packed_vectors, 0);
+        assert_eq!(indexed.dense_sidecars, 0);
+        assert_eq!(indexed.dense_heap_packed_vectors, 1);
+        assert_eq!(indexed.entries_len, 0);
 
         let dense = PropertyInventory::from_props(&array);
         assert_eq!(
@@ -984,7 +977,9 @@ mod tests {
         ordinary_numeric_name.insert("0", Property::plain(super::super::Value::Num(6.0)));
         let ordinary_numeric_name = PropertyInventory::from_props(&ordinary_numeric_name);
         assert_eq!(ordinary_numeric_name.named_entries.slots, 0);
-        assert_eq!(ordinary_numeric_name.classic_index_entries.slots, 1);
+        // A word, not an index entry (W2c step 3).
+        assert_eq!(ordinary_numeric_name.classic_index_entries.slots, 0);
+        assert_eq!(ordinary_numeric_name.packed_dense_fields.slots, 1);
 
         let mut classic = Props::new();
         classic.mark_array();

@@ -763,24 +763,29 @@ fn reentrant_getter_mutation_remembers_the_actual_old_destination() {
 }
 
 #[test]
-fn classic_and_sparse_element_edges_remain_complete_outside_the_packed_blocks() {
+fn named_and_sparse_element_edges_remain_complete_outside_the_packed_blocks() {
     let mut engine = Engine::new();
     let _agent = engine.interp.enter_agent();
+    // Element 0 in the named entries (its descriptor non-plain), then made plain again in
+    // place: the named element's edge stays complete outside the words.
     let mut props = Props::new();
-    props.insert("0", Property::plain(Value::Null));
+    props.insert("0", Property::data(Value::Null, true, true, false));
     props.insert(
         "length",
         Property::data(Value::Num(1.0), true, false, false),
     );
     props.mark_array();
     assert!(!props.elems.has_words());
+    assert!(props.has_far.get());
     let array = Object::new_with_parts(None, props, Exotic::Array);
     let _owner = Rooted::new(Value::Obj(array));
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Major);
     let first = Value::Obj(Object::new(None));
-    assert!(array.borrow_mut().props.set_index_value(0, first).is_ok());
+    // A word write leaves a named element to the generic path; its value-only write is this.
+    assert!(array.borrow_mut().props.set_index_value(0, first).is_err());
+    assert!(array.borrow_mut().props.set_value("0", first));
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Minor);

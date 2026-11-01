@@ -8451,32 +8451,11 @@ impl Interp {
     }
 
     pub fn make_array(&self, items: Vec<Value>) -> Value {
-        if items.len() <= 32 || crate::value::dense_elements_enabled() {
-            return Value::Obj(Object::new_with_parts(
-                Some(self.array_proto),
-                Props::packed_array(items.into_iter()),
-                Exotic::Array,
-            ));
-        }
-        let obj = Object::new(Some(self.array_proto));
-        let len = items.len();
-        {
-            let mut b = obj.borrow_mut();
-            b.props.mark_array();
-            b.props.reserve_dense_exact(len);
-        }
-        obj.borrow_mut().exotic = Exotic::Array;
-        {
-            let mut b = obj.borrow_mut();
-            for v in items {
-                b.props.push_dense(Property::plain(v));
-            }
-            b.props.insert(
-                "length",
-                Property::data(Value::Num(len as f64), true, false, false),
-            );
-        }
-        Value::Obj(obj)
+        Value::Obj(Object::new_with_parts(
+            Some(self.array_proto),
+            Props::packed_array(items.into_iter()),
+            Exotic::Array,
+        ))
     }
 
     /// CreateArrayFromList for an entry pair: copy the canonical word straight into
@@ -8589,30 +8568,11 @@ impl Interp {
     /// `items` points to `len` initialized execution words in stable immutable storage retained
     /// through this call. The caller retires its window only after the copy completes.
     pub(crate) unsafe fn make_array_from_raw(&self, items: *const Value, len: usize) -> Value {
-        if len <= 32 || crate::value::dense_elements_enabled() {
-            let obj = Object::new_with_parts(
-                Some(self.array_proto),
-                unsafe { Props::packed_array_from_raw(items, len) },
-                Exotic::Array,
-            );
-            return Value::Obj(obj);
-        }
-        let obj = Object::new(Some(self.array_proto));
-        {
-            let mut b = obj.borrow_mut();
-            b.props.mark_array();
-            b.props.reserve_dense_exact(len);
-            b.exotic = Exotic::Array;
-            for k in 0..len {
-                b.props
-                    .push_dense(Property::plain(unsafe { items.add(k).read() }));
-            }
-            b.props.insert(
-                "length",
-                Property::data(Value::Num(len as f64), true, false, false),
-            );
-        }
-        Value::Obj(obj)
+        Value::Obj(Object::new_with_parts(
+            Some(self.array_proto),
+            unsafe { Props::packed_array_from_raw(items, len) },
+            Exotic::Array,
+        ))
     }
 
     /// Build the generator/iterator object whose `next`/`return`/`throw` drive its coroutine (stored
