@@ -11,6 +11,10 @@ use std::rc::Rc;
 mod dense_deque;
 #[path = "elem_census.rs"]
 pub(crate) mod elem_census;
+/// W2c step 2b; its users come with step 2c (the plan's "W2c step 2: words").
+#[path = "word_block.rs"]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod word_block;
 pub(crate) use dense_deque::DenseDeque;
 #[cfg(feature = "architecture-diagnostics")]
 #[path = "allocation_diagnostics.rs"]
