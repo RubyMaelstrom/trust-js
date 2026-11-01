@@ -4946,3 +4946,54 @@ Not done: step 3 (a Script's loops admitted by their site's backedges over all e
 workload found needs it. Small regressions: TRust's event-loop and todomvc pages +0.6% and +1.4%
 cycles (setup functions under 8 KB still compile by their loop budgets each page); TypeScript
 +0.5% at a fixed 5 runs (-0.4% timed); RegExp's setup run +2.8%.
+
+### W2c step 2: words (design, 2026-11-01)
+
+Step 1 landed (e92696a5): the census in the tree. The kind byte, which the design computed
+beside today's storage in step 1, comes here, kept by the word block's own operations. A survey
+of the change surface (an agent's, read-only, at e92696a5) sets this step's shape:
+- Every element read hands out `&Property`: get_index (15 production sites, 13 outside
+  value.rs), get, get_key, get_walking and get_with_slot_walking for index keys (`get` has 85
+  production callers, index and named keys mixed and not separable statically), values,
+  packed_values and indexed_properties, packed_array_elements (`&[Property]`, the searches) and
+  plain_elements_mut (`&mut DenseDeque<Property>`, reverse and splice). A word has no Property
+  to point at.
+- The words must hang off Props itself. Nested in today's sidecar (DenseBuffers) and a
+  PackedBuffer box, a 10-element array would take three blocks besides its cell, about 480 B
+  against today's 448 and the model's 288.
+- Packed storage also holds arguments objects' elements and ForInKeys' read-only entries
+  (eval.rs:77-84), and non-plain descriptors (Props::insert over a slot, freeze_descriptors for
+  tagged templates' arrays, SetIntegrityLevel through define_own_property_ordinary).
+- Shift rotates words through shared slices (PropWord cells) after forcing a full trace; three
+  numeric-chain stores index the classic slot map bounded by the mirror and are safe only because
+  the packed exclusion is emitted first (jit.rs:16685-16693, 16761, 19295); twelve ARM64 sites
+  hard-code the 16-byte element stride (`add_shifted ... 4`, gated on property_size == 16).
+
+Four parts, each landed with its tests, and the dump checks where templates change:
+2a. Element views, behaviour-preserving: index-key reads return an `Element<'_>`, a word's value
+   or a named entry's `&Property`, with Property's read methods (value, accessor, getter, setter,
+   writable, enumerable, configurable, number_value, is_plain_element) and to_property; `get` and
+   its walking forms return the same view for every key (a named key's is always an entry); the
+   slice accessors give way to value operations (the searches over values, reverse and splice
+   over a value sequence). Storage, behaviour and dumps unchanged.
+2b. The word block: one storage block of a 16-byte header {used, capacity, shifted, flags} and
+   `capacity` words of Value bits, as SpiderMonkey's ObjectElements (vm/NativeObject.h), the
+   pointer at the first word and the header before it; a static empty block for maps without
+   elements, so generated code never tests for null; front room as `shifted`
+   (numShiftedElements); a block over 64 words keeps its traced length and dirty bitmap in a
+   side record the owner reports, as PackedBuffer does; the kind byte (NO_HOLES, NUMBERS, INT32)
+   in the header's flags, kept by the block's operations, and verified against the words at each
+   collection in debug builds. Unit-tested alone.
+2c. The switch. DenseStorage gains the block as a word of its own (Props 112 -> 120 B; the cell
+   stays in its 192 B class); the sidecar keeps the classic slot map, the mirror and the key
+   index until step 3 removes them. InlinePacked and PackedBuffer go. A non-plain element (an
+   accessor, or attributes other than the defaults) leaves the words for the named entries, its
+   word a hole and `has_far` set (open question 1, SpiderMonkey's `Indexed`); until step 7's
+   integrity kinds, a frozen or sealed array's elements leave the same way (tagged templates'
+   strings arrays). Arguments objects keep words (their elements are plain); ForInKeys' entries,
+   read-only, go to the named entries. ARM64 templates: an 8-byte stride (`lsl #3`), the hole
+   test on the word, no meta word, bounds from the header's used length, and define-elem's
+   append writing the word and bumping `used` and `length`; the collector traces used words.
+   x86-64 calls helpers for every element operation and changes only where offsets move.
+2d. Measures against the parent: the census's element bytes (Splay, chai, React, Djot,
+   sustained), fat-LTO instruction counts, and the dump checks (the element templates only).
