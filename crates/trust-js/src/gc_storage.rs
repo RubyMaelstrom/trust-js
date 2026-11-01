@@ -1,6 +1,6 @@
 //! P1 S6: storage blocks, the variable-size payloads of the engine's cells kept in the Agent
 //! heap's own pages beside the cells (JavaScriptCore's auxiliary space): an object's spilled
-//! named properties, its element sidecar, packed elements, numeric mirror and dense slot map.
+//! named properties, its element sidecar (dense slot map and key index) and element words.
 //!
 //! A block is a leaf cell of the heap's storage kind ([`layout`]): it has no edges and no
 //! finalizer of its own, and nothing zeroes it. Its owner writes every byte it reads, traces

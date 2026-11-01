@@ -64,7 +64,6 @@ fn dense_shift_storage_drains_words_and_classic_without_losing_views() {
                 let shape = props.shape();
                 // A shift moves the words' header one word on, never the words.
                 let pointer = props.elems.words().map(|words| words.as_slice().as_ptr());
-                let mirror_pointer = props.elems.mirror.as_ptr();
                 for removed in 0..initial {
                     let len = initial - removed;
                     assert_eq!(
@@ -78,19 +77,12 @@ fn dense_shift_storage_drains_words_and_classic_without_losing_views() {
                     assert_eq!(props.shape(), shape);
                     assert!(props.get_index((len - 1) as u32).is_none());
                     if packed {
-                        // Element words keep no numeric mirror.
-                        assert_eq!(props.elems.mirror_len(), 0);
                         let words = props.elems.words().unwrap();
                         assert_eq!(
                             Some(words.as_slice().as_ptr()),
                             pointer.map(|p| unsafe { p.add(removed + 1) })
                         );
                         assert_eq!(words.front_room(), removed + 1);
-                    } else {
-                        assert_eq!(props.elems.mirror_len(), len - 1);
-                        assert_eq!(props.elems.mirror.as_ptr(), mirror_pointer);
-                        assert_eq!(props.mirror_holes, 0);
-                        assert_ne!(props.mirror_flags & MIRROR_NO_HOLES, 0);
                     }
                     for index in 0..len - 1 {
                         let expected = (removed + index + 1) as f64;
@@ -98,9 +90,6 @@ fn dense_shift_storage_drains_words_and_classic_without_losing_views() {
                             props.get_index(index as u32).unwrap().number_value(),
                             Some(expected)
                         );
-                        if !packed {
-                            assert_eq!(props.mirror_get(index as u32), Some(expected));
-                        }
                     }
                     if named {
                         assert!(
@@ -164,7 +153,7 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
 }
 
 #[test]
-fn dense_shift_storage_rejections_are_atomic_and_do_not_invalidate_mirrors() {
+fn dense_shift_storage_rejections_are_atomic() {
     let edits: [fn(&mut Props); 10] = [
         |p| {
             p.get_mut("0").unwrap().set_writable(false);
@@ -215,29 +204,10 @@ fn dense_shift_storage_rejections_are_atomic_and_do_not_invalidate_mirrors() {
             let mut props = numbers(3, packed, false, true);
             edit(&mut props);
             let before = snapshot(&props);
-            let mirror: Vec<_> = props.elems.mirror.iter().map(|f| f.to_bits()).collect();
-            let flags = props.mirror_flags;
-            let pointer = props.elems.mirror.as_ptr();
             let shape = props.shape();
             assert!(props.shift_dense_array(3, false).is_none());
             assert_eq!(snapshot(&props), before);
-            assert_eq!(
-                props
-                    .elems
-                    .mirror
-                    .iter()
-                    .map(|f| f.to_bits())
-                    .collect::<Vec<_>>(),
-                mirror
-            );
-            assert_eq!(
-                (
-                    props.mirror_flags,
-                    props.elems.mirror.as_ptr(),
-                    props.shape()
-                ),
-                (flags, pointer, shape)
-            );
+            assert_eq!(props.shape(), shape);
         }
     }
 }
@@ -274,12 +244,6 @@ fn dense_shift_storage_preserves_numeric_bits_and_invalidates_prototype_creation
                     element.number_value().unwrap().to_bits(),
                     expected[removed + n + 1]
                 );
-                if !packed {
-                    assert_eq!(
-                        props.mirror_get(n as u32).unwrap().to_bits(),
-                        expected[removed + n + 1]
-                    );
-                }
             }
         }
     }

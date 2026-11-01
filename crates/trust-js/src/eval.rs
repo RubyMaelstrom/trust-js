@@ -75,7 +75,7 @@ impl ForInKeys {
         let mut bytes =
             std::mem::size_of::<std::cell::RefCell<Object>>() + 2 * std::mem::size_of::<usize>();
         let mut props = Props::new();
-        props.reserve_dense_exact(keys.len(), false);
+        props.reserve_dense_exact(keys.len());
         for key in keys {
             bytes = bytes.saturating_add(key.len().saturating_add(64));
             // Plain element words: no script reaches this object, so its descriptors are

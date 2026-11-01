@@ -662,7 +662,7 @@ fn small_blocks_reallocation_transplant_and_empty_storage_start_safely() {
     // An empty block with a record: its first append is past the traced length 0.
     let mut properties = Props::packed_array(std::iter::empty());
     assert!(!properties.elems.has_words());
-    properties.reserve_dense_exact(word_block::REMEMBER_MIN + 1, false);
+    properties.reserve_dense_exact(word_block::REMEMBER_MIN + 1);
     clean(elements(&properties));
     assert_eq!(
         elements(&properties).remembered(),
@@ -834,7 +834,6 @@ struct NativeAppendGuards {
     memo_is_length: bool,
     length_descriptor: Option<(bool, bool, Option<f64>)>,
     words: Option<(usize, usize)>,
-    mirror_flags: u8,
     remembered: Option<(Option<usize>, Vec<usize>)>,
 }
 
@@ -875,7 +874,6 @@ fn native_append_guards(array: &Gc) -> NativeAppendGuards {
             .elems
             .words()
             .map(|words| (words.len(), words.capacity())),
-        mirror_flags: body.props.mirror_flags,
         remembered: body.props.elems.words().and_then(Words::remembered),
     };
     snapshot
@@ -992,7 +990,6 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
         let words = elements(&body.props);
         assert_eq!(words.len(), 40);
         assert!(words.capacity() > 40 && words.remembered().is_some());
-        assert_eq!(body.props.mirror_flags, 0);
     }
     // The define element template appends the word itself where generated code reads words.
     let native = usize::from(jit_layout(&engine.interp.object_proto).words_valid);
@@ -1044,7 +1041,6 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
             matches!(primed.words, Some((40, capacity)) if capacity > 40),
             "trial={trial} {primed:?}"
         );
-        assert_eq!(primed.mirror_flags, 0, "trial={trial} {primed:?}");
         // Traced up to 40: by the major, or lowered there by the pop or the shorter length.
         assert_eq!(
             primed.remembered,

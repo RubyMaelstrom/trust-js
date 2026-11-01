@@ -471,23 +471,17 @@ fn check_hole_filling_region_storage(packed: bool) {
                 if packed { 4 } else { 0 },
                 "fixture must exercise the selected packed or classic storage contract"
             );
-            if packed {
-                // The words are the f64 view the region read.
-                let body = object.borrow();
-                assert_eq!(body.props.get_index(0).unwrap().number_value(), Some(5.0));
-            } else {
-                assert_eq!(object.borrow().props.mirror_get(0), Some(5.0));
-            }
+            let body = object.borrow();
+            assert_eq!(body.props.get_index(0).unwrap().number_value(), Some(5.0));
         }
         assert_eq!(
             eval(&mut engine, "worker.fill(packet);packet.a.join(',')"),
             "9,10,11,12"
         );
-        // A write either maintains the numeric mirror or invalidates it; it never leaves it stale.
-        assert!(matches!(
-            object.borrow().props.mirror_get(0),
-            None | Some(9.0)
-        ));
+        assert_eq!(
+            object.borrow().props.get_index(0).unwrap().number_value(),
+            Some(9.0)
+        );
         drop(object);
         assert_eq!(eval(&mut engine, "scan(packet.a)"), "42");
         assert_eq!(

@@ -62,11 +62,6 @@ impl<T> DenseDeque<T> {
         self.cap + self.front
     }
 
-    #[cfg(test)]
-    pub(super) fn as_ptr(&self) -> *const T {
-        self.ptr.as_ptr()
-    }
-
     pub(super) fn as_slice(&self) -> &[T] {
         // The logical header owns precisely this initialized range. Spare slots and
         // consumed prefixes contain no owners; Drop frees the original allocation.

@@ -1397,8 +1397,6 @@ pub struct JitLayout {
     pub props_elems: usize,
     /// The `elems` Vec header within the shared dense-buffer allocation.
     pub dense_elems: usize,
-    /// The `mirror` deque's admitted Vec-compatible header within the dense sidecar.
-    pub dense_mirror: usize,
     /// The element words' pointer within `Props` (W2c, [`word_block::Words`]): the address of
     /// the first word, never null (a map without words points past the static empty block's
     /// header, whose used length is zero). A word is a plain element's value, a hole the
@@ -1409,8 +1407,6 @@ pub struct JitLayout {
     pub words_used: usize,
     pub words_capacity: usize,
     pub words_flags: usize,
-    /// The `mirror_flags` byte within `Props`.
-    pub props_mirror_flags: usize,
     /// `size_of::<Property>()` — the keyless instance-field stride.
     pub entry_size: usize,
     /// Packed value within a keyless instance field.
@@ -1768,23 +1764,16 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let thin_none_word = unsafe { *(&thin_none as *const DenseStorage as *const usize) };
     let thin_vec_ok = thin_word == thin_expected && thin_none_word == 0;
 
-    // Deque headers deliberately preserve the admitted Vec word order, while their
-    // allocation owner retains the original base. Validate both deque element types
-    // against the live Vec probes before any backend reads or writes these headers.
-    let mut pv = DenseDeque::with_capacity(3);
-    pv.push(Property::plain(Value::Num(1.0)));
-    let mut mv = DenseDeque::with_capacity(3);
-    mv.push(1.0_f64);
-    let deque_header_ok = vec_ptr_off == Some(offset_of!(DenseDeque<Property>, ptr))
-        && vec_len_off == Some(offset_of!(DenseDeque<Property>, len))
-        && vec_cap_off == Some(offset_of!(DenseDeque<Property>, cap))
-        && vec_ptr_off == Some(offset_of!(DenseDeque<f64>, ptr))
-        && vec_len_off == Some(offset_of!(DenseDeque<f64>, len))
-        && vec_cap_off == Some(offset_of!(DenseDeque<f64>, cap))
-        && pv.len() == 1
-        && pv.capacity() == 3
-        && mv.len() == 1
-        && mv.capacity() == 3;
+    // The slot map's deque header deliberately preserves the admitted Vec word order, while
+    // its allocation owner retains the original base. Validate it against the live Vec probes
+    // before any backend reads it.
+    let mut sv = DenseDeque::with_capacity(3);
+    sv.push(1_u32);
+    let deque_header_ok = vec_ptr_off == Some(offset_of!(DenseDeque<u32>, ptr))
+        && vec_len_off == Some(offset_of!(DenseDeque<u32>, len))
+        && vec_cap_off == Some(offset_of!(DenseDeque<u32>, cap))
+        && sv.len() == 1
+        && sv.capacity() == 3;
     // The element words: the pointer at `props_words` is the first word's address, with the
     // header just before it.
     let header_bytes = std::mem::size_of::<word_block::WordHeader>();
@@ -2036,12 +2025,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         vec_cap_off: vec_cap_off.unwrap_or(0),
         props_elems: offset_of!(Props, elems),
         dense_elems: offset_of!(DenseBuffers, elems),
-        dense_mirror: offset_of!(DenseBuffers, mirror),
         props_words,
         words_used,
         words_capacity,
         words_flags,
-        props_mirror_flags: offset_of!(Props, mirror_flags),
         entry_size: std::mem::size_of::<Property>(),
         str_len_word,
         str_ptr_word,
@@ -5896,7 +5883,6 @@ const _: () = assert!(!std::mem::needs_drop::<Property>());
 #[derive(Clone, Default)]
 struct DenseBuffers {
     elems: DenseDeque<u32>,
-    mirror: DenseDeque<f64>,
     /// The map's own index of its named keys, when it keeps one (`Props::build_index`): one
     /// word here, so the sidecar keeps its size class.
     index: Option<crate::gc_storage::StorageBox<KeyIndex>>,
@@ -6080,7 +6066,6 @@ unsafe impl Sync for EmptyDenseBuffers {}
 
 static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers {
     elems: DenseDeque::new(),
-    mirror: DenseDeque::new(),
     index: None,
 });
 
@@ -6181,21 +6166,14 @@ impl DenseStorage {
             return;
         };
         StorageBox::trace(buffers, sink);
-        let DenseBuffers {
-            elems,
-            mirror,
-            index,
-        } = &**buffers;
+        let DenseBuffers { elems, index } = &**buffers;
         if let Some(index) = index {
             StorageBox::trace(index, sink);
             if let Some(block) = index.slots.spill_ptr() {
                 trace_block(block, sink);
             }
         }
-        for block in [elems.block_ptr(), mirror.block_ptr()]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(block) = elems.block_ptr() {
             trace_block(block, sink);
         }
     }
@@ -6294,42 +6272,12 @@ impl DenseStorage {
     fn clear_elems(&mut self) {
         if let Some(d) = self.0.as_deref_mut() {
             d.elems.clear();
-            d.mirror.clear();
         }
     }
     fn iter_mut(&mut self) -> Option<std::slice::IterMut<'_, u32>> {
         self.0
             .as_deref_mut()
             .map(|buffers| buffers.elems.iter_mut())
-    }
-
-    fn mirror_reserve_exact(&mut self, additional: usize) {
-        if additional != 0 {
-            self.buffers_mut().mirror.reserve_exact(additional);
-        }
-    }
-    fn mirror_len(&self) -> usize {
-        self.0.as_deref().map_or(0, |d| d.mirror.len())
-    }
-    fn mirror_get(&self, index: usize) -> Option<&f64> {
-        self.0.as_deref().and_then(|d| d.mirror.get(index))
-    }
-    fn mirror_get_mut(&mut self, index: usize) -> Option<&mut f64> {
-        self.0.as_deref_mut().and_then(|d| d.mirror.get_mut(index))
-    }
-    fn mirror_push(&mut self, value: f64) {
-        self.buffers_mut().mirror.push(value);
-    }
-    fn mirror_pop(&mut self) -> Option<f64> {
-        self.0.as_deref_mut().and_then(|d| d.mirror.pop())
-    }
-    fn mirror_clear(&mut self) {
-        if let Some(d) = self.0.as_deref_mut() {
-            d.mirror.clear();
-        }
-    }
-    fn mirror_extend<I: IntoIterator<Item = f64>>(&mut self, iter: I) {
-        self.buffers_mut().mirror.extend(iter);
     }
 }
 
@@ -6787,26 +6735,12 @@ pub struct Props {
     /// a class-changing descriptor replacement. Only consulted for non-exotic
     /// objects (arrays keep the key-compare path — same shape can mean different element counts).
     shape: u32,
-    /// One nullable cold-sidecar pointer shared by the optional hash index, dense slot map and
-    /// numeric mirror, the Rust-heap extras, and the element words (W2c). Ordinary small
-    /// named-property objects allocate none of it. Within the sidecar, `elems[n]` is the
+    /// One nullable cold-sidecar pointer shared by the optional hash index and the dense slot
+    /// map, the Rust-heap extras, and the element words (W2c). Ordinary small named-property
+    /// objects allocate none of it. Within the sidecar, `elems[n]` is the
     /// `entries` slot of canonical-index key `n`, or `NO_SLOT`; see `note_inserted` and
     /// `get_index`.
     elems: DenseStorage,
-    /// Raw-f64 read mirror of classic dense elements (element words keep none: they are the
-    /// f64 view). While `mirror_flags & MIRROR_OK`: `mirror.len() == elems.len()`, and
-    /// `mirror[n]` is [`MIRROR_HOLE`] exactly
-    /// when `elems[n]` names no element, else the element is a plain writable data property
-    /// whose value is `Num(mirror[n])`. Element reads become one indexed load (no entry chase,
-    /// no tag check), and `MIRROR_ALL_I32` lets the JIT's int loops skip the exactness guard
-    /// entirely. Entries stay authoritative: fast writers dual-store through
-    /// [`Props::set_index_value`]; any foreign `&mut` escape (`get_index_mut`, `get_mut` /
-    /// `entry_at_mut` on an index key) invalidates the mirror instead of tracking it.
-    /// [`MIRROR_OK`] | [`MIRROR_ALL_I32`] | [`MIRROR_NO_HOLES`].
-    mirror_flags: u8,
-    /// Live hole count in `mirror` (descending array fills pad with holes and then fill them:
-    /// `MIRROR_NO_HOLES` comes back when this returns to zero).
-    mirror_holes: u32,
     /// Some canonical-index key lives ONLY in the string-keyed map (inserted too far past the
     /// dense frontier — see `note_inserted`): `elems` coverage is no longer proof of element
     /// absence, so the dense append/pop fast paths stand down. Truncation rebuilds this proof;
@@ -6830,18 +6764,6 @@ pub struct Props {
     /// it (`remove` re-memoizes on the next lookup via `length_slot`).
     len_slot: std::cell::Cell<SlotMemo>,
 }
-
-/// See [`Props::mirror`]. Bit values are chosen so the masks the JIT tests (`OK|NO_HOLES` and
-/// `OK|NO_HOLES|ALL_I32`) are contiguous — encodable ARM64 logical immediates.
-pub(crate) const MIRROR_OK: u8 = 1;
-pub(crate) const MIRROR_NO_HOLES: u8 = 2;
-/// Every non-hole mirror value is an exact i32 (bit-identical through an i32 round trip, which
-/// also excludes -0.0).
-pub(crate) const MIRROR_ALL_I32: u8 = 4;
-/// The mirror's hole sentinel: a quiet-NaN payload no arithmetic produces. A user CAN craft
-/// this exact bit pattern (typed-array punning), so the write paths refuse to mirror it — it is
-/// never stored as data, which is what makes reading it back as "absent" sound.
-pub(crate) const MIRROR_HOLE: u64 = 0x7FF8_DEAD_0000_0001;
 
 /// Decode a Symbol-valued property key. Escaped String keys begin with two NULs and
 /// therefore never enter Symbol ownership, even when their author text spells a Symbol id.
@@ -7559,12 +7481,6 @@ impl Props {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<u32>()),
             );
-            bytes = bytes.saturating_add(
-                dense
-                    .mirror
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<f64>()),
-            );
             if let Some(index) = self.elems.index() {
                 bytes = bytes
                     .saturating_add(std::mem::size_of::<KeyIndex>())
@@ -7586,8 +7502,6 @@ impl Props {
             entries,
             shape: SHAPE_EMPTY,
             elems: DenseStorage::default(),
-            mirror_flags: MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES,
-            mirror_holes: 0,
             proto_flag: std::cell::Cell::new(false),
             has_far: std::cell::Cell::new(false),
             elem_mode: std::cell::Cell::new(false),
@@ -7636,16 +7550,8 @@ impl Props {
                 layout: Some(layout),
             },
             shape,
-            // An empty array keeps the static empty block and the same empty classic state as
-            // ArrayCreate/make_array([]): later numeric growth builds its mirror rather than
-            // inheriting a permanent invalidation.
+            // An empty array keeps the static empty block until its first element.
             elems: DenseStorage(None, None, word_block::Words::from_values(items)),
-            mirror_flags: if len == 0 {
-                MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES
-            } else {
-                0
-            },
-            mirror_holes: 0,
             proto_flag: Cell::new(false),
             has_far: Cell::new(false),
             elem_mode: Cell::new(true),
@@ -7683,8 +7589,6 @@ impl Props {
             proto_flag: std::cell::Cell::new(false),
             shape: self.shape,
             elems: self.elems.clone(),
-            mirror_flags: self.mirror_flags,
-            mirror_holes: self.mirror_holes,
             has_far: std::cell::Cell::new(self.has_far.get()),
             elem_mode: std::cell::Cell::new(self.elem_mode.get()),
             proto_slot: std::cell::Cell::new(self.proto_slot.get()),
@@ -7750,21 +7654,15 @@ impl Props {
         }
     }
 
-    /// Reserve contiguous elements for a fresh dense array of known size. The
-    /// named-property vector needs only `length`; numeric arrays also retain the
-    /// coherent f64 view used by native loops. The ablation keeps the old split.
-    pub(crate) fn reserve_dense_exact(&mut self, len: usize, numeric: bool) {
+    /// Reserve contiguous elements for a fresh dense array of known size. The named-property
+    /// vector needs only `length`. The ablation keeps the old split.
+    pub(crate) fn reserve_dense_exact(&mut self, len: usize) {
         if (1..=32).contains(&len) || (len != 0 && dense_elements_enabled()) {
             self.entries.reserve_exact(1); // own `length`
             self.elems.words_start().reserve_exact(len);
-            // W2c step 2c: element words keep no packed numeric mirror.
-            self.mirror_flags = 0;
         } else {
             self.entries.reserve_exact(len.saturating_add(1));
             self.elems.reserve_exact(len);
-        }
-        if numeric && !self.elems.has_words() {
-            self.elems.mirror_reserve_exact(len);
         }
     }
 
@@ -7788,8 +7686,6 @@ impl Props {
         let words = self.elems.words_start();
         words.reserve_exact(len);
         words.resize_with_holes(len);
-        // The raw-f64 mirror describes classic `elems` slots, not element words.
-        self.mirror_flags = 0;
     }
 
     /// The element words, for tests outside this module (the ARM64 JIT's).
@@ -7814,8 +7710,6 @@ impl Props {
     /// ECMA-262 Array [[DefineOwnProperty]] / OrdinarySet, e28783d5.
     fn push_packed_property(&mut self, property: Property) {
         debug_assert!(property.is_plain_element(), "a word is a plain element");
-        // W2c step 2c: element words keep no packed numeric mirror.
-        self.mirror_invalidate();
         self.elems.words_start().push(property.into_value());
     }
 
@@ -7833,7 +7727,6 @@ impl Props {
     fn start_packed_elements(&mut self, index: usize, property: Property) {
         debug_assert!(self.can_start_packed_elements(index));
         if index != 0 {
-            self.mirror_invalidate();
             let words = self.elems.words_start();
             words.reserve_exact(index + 1);
             words.resize_with_holes(index);
@@ -7979,89 +7872,7 @@ impl Props {
         Some(Element::entry(&self.entries.fields[slot as usize]))
     }
 
-    /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).
-    #[inline]
-    pub(crate) fn mirror_invalidate(&mut self) {
-        if self.mirror_flags != 0 {
-            self.mirror_flags = 0;
-            self.elems.mirror_clear();
-        }
-    }
-
-    /// Re-mirror element `n` from `entries[slot]` (both already linked via `elems`).
-    /// `filled_hole` = position `n` had no element before this (structural — a *data* value
-    /// that happens to equal the hole sentinel must not confuse the accounting).
-    fn mirror_sync(&mut self, n: usize, slot: usize, filled_hole: bool) {
-        if self.mirror_flags & MIRROR_OK == 0 {
-            return;
-        }
-        if self.elems.mirror_len() != self.elems.len() {
-            // Lockstep was broken by a path this code doesn't know — fail safe.
-            self.mirror_invalidate();
-            return;
-        }
-        let p = &self.entries.fields[slot];
-        match (p.value()).view() {
-            ValueView::Num(f) if !p.accessor() && p.writable() && f.to_bits() != MIRROR_HOLE => {
-                if !f64_exact_i32(f) {
-                    self.mirror_flags &= !MIRROR_ALL_I32;
-                }
-                if filled_hole {
-                    self.mirror_holes -= 1;
-                    if self.mirror_holes == 0 {
-                        self.mirror_flags |= MIRROR_NO_HOLES;
-                    }
-                }
-                *self.elems.mirror_get_mut(n).unwrap() = f;
-            }
-            _ => self.mirror_invalidate(),
-        }
-    }
-
-    /// Grow the mirror alongside `elems` with `pads` holes plus one freshly-linked element.
-    fn mirror_grow(&mut self, pads: usize, slot: usize) {
-        if self.mirror_flags & MIRROR_OK == 0 {
-            return;
-        }
-        // Peek the value first: an object-element array (its very first push, typically) must
-        // not pay a buffer allocation just to invalidate it.
-        {
-            let p = &self.entries.fields[slot];
-            let ok = matches!((p.value()).view(), ValueView::Num(f) if f.to_bits() != MIRROR_HOLE)
-                && !p.accessor()
-                && p.writable();
-            if !ok {
-                self.mirror_invalidate();
-                return;
-            }
-        }
-        if pads > 0 {
-            self.mirror_flags &= !MIRROR_NO_HOLES;
-            self.mirror_holes += pads as u32;
-            self.elems
-                .mirror_extend(std::iter::repeat_n(f64::from_bits(MIRROR_HOLE), pads));
-        }
-        self.elems.mirror_push(0.0);
-        let n = self.elems.mirror_len() - 1;
-        self.mirror_sync(n, slot, false); // freshly appended: never a pre-existing hole
-    }
-
-    /// One-load dense element read: `Some(f)` is the element's Num value; `None` means the
-    /// mirror can't answer (off, out of range, or a hole) — fall back to the classic path,
-    /// which is always correct.
-    #[inline]
-    pub(crate) fn mirror_get(&self, n: u32) -> Option<f64> {
-        if self.mirror_flags & MIRROR_OK == 0 {
-            return None;
-        }
-        let f = *self.elems.mirror_get(n as usize)?;
-        if f.to_bits() == MIRROR_HOLE {
-            return None;
-        }
-        Some(f)
-    }
-
-    /// Overwrite dense element `n`'s value keeping the mirror coherent. `Err` hands the value
+    /// Overwrite dense element `n`'s value. `Err` hands the value
     /// back: no such element, or it isn't a plain writable data property — the caller runs the
     /// generic path.
     #[inline]
@@ -8085,22 +7896,6 @@ impl Props {
         if p.accessor() || !p.writable() {
             return Err(v);
         }
-        if self.mirror_flags & MIRROR_OK != 0 {
-            match &(v).view() {
-                ValueView::Num(f) if f.to_bits() != MIRROR_HOLE => {
-                    if !f64_exact_i32(*f) {
-                        self.mirror_flags &= !MIRROR_ALL_I32;
-                    }
-                    // Lockstep holds whenever the flag does; guard anyway.
-                    match self.elems.mirror_get_mut(n as usize) {
-                        Some(m) => *m = *f,
-                        None => self.mirror_invalidate(),
-                    }
-                }
-                _ => self.mirror_invalidate(),
-            }
-        }
-        let p = &mut self.entries.fields[slot as usize];
         p.set_value(v);
         Ok(())
     }
@@ -8120,9 +7915,7 @@ impl Props {
             }
             let n = n as usize;
             if n < self.elems.len() {
-                let filled_hole = self.elems[n] == NO_SLOT;
                 self.elems[n] = slot as u32;
-                self.mirror_sync(n, slot, filled_hole);
             } else if n <= self.elems.len() + 256 {
                 // The pad tolerates *descending* first-fills (`while (--i >= 0) a[i] = 0`,
                 // `r[i+n] = x[i]` from the top — bignum/matrix code does this constantly): the
@@ -8130,12 +7923,10 @@ impl Props {
                 // whole upper range map-only for the array's lifetime, killing every dense fast
                 // path. 256 covers real dense workloads; a truly sparse `a[1e6]` still stays
                 // map-only at ≤1KB of hole slots per object.
-                let pads = n - self.elems.len();
                 while self.elems.len() < n {
                     self.elems.push(NO_SLOT);
                 }
                 self.elems.push(slot as u32);
-                self.mirror_grow(pads, slot);
             } else {
                 self.has_far.set(true);
             }
@@ -8204,7 +7995,6 @@ impl Props {
         self.reserve_entry();
         self.entries.push((key, prop));
         self.elems.push(slot as u32);
-        self.mirror_grow(0, slot);
         Ok(())
     }
 
@@ -8230,7 +8020,6 @@ impl Props {
                     return Err(prop);
                 }
                 self.note_structural();
-                self.mirror_invalidate();
                 let words = self.elems.words_mut().unwrap();
                 if index < len {
                     words.set(index, prop.into_value());
@@ -8263,14 +8052,11 @@ impl Props {
         self.entries.push((key, prop));
         if n < old_len {
             self.elems[n] = slot as u32;
-            self.mirror_sync(n, slot, true);
         } else {
-            let pads = n - old_len;
             while self.elems.len() < n {
                 self.elems.push(NO_SLOT);
             }
             self.elems.push(slot as u32);
-            self.mirror_grow(pads, slot);
         }
         Ok(())
     }
@@ -8293,7 +8079,6 @@ impl Props {
                 return None;
             }
             self.note_structural();
-            self.mirror_invalidate();
             let word = self.elems.words_mut().unwrap().pop()?;
             // SAFETY: a used word is a Value's bits.
             return Some(unsafe { Value::from_bits(word) });
@@ -8314,17 +8099,6 @@ impl Props {
         self.elems.pop();
         if let Some(index) = self.elems.index_mut() {
             index.remove(index_key(n as usize));
-        }
-        if self.mirror_flags & MIRROR_OK != 0 {
-            debug_assert_eq!(self.elems.mirror_len(), self.elems.len() + 1);
-            let m = self.elems.mirror_pop();
-            if m.map(f64::to_bits) == Some(MIRROR_HOLE) {
-                // (Unreachable while the slot was live, but keep the accounting exact.)
-                self.mirror_holes -= 1;
-                if self.mirror_holes == 0 {
-                    self.mirror_flags |= MIRROR_NO_HOLES;
-                }
-            }
         }
         Some(p.into_value())
     }
@@ -8348,9 +8122,8 @@ impl Props {
     /// an edit that leaves them plain and contiguous. The caller proves ordinary Array internal
     /// methods and that the Array.prototype algorithm being batched only gets, sets and deletes
     /// such elements (plus appends, for which it proves extensibility and prototypes without
-    /// indexed properties): its effect is then exactly the edited list. The numeric mirror is
-    /// dropped and rebuilt on demand. The caller records the new length with
-    /// [`Self::set_array_length_value`]. `None` changes nothing.
+    /// indexed properties): its effect is then exactly the edited list. The caller records the
+    /// new length with [`Self::set_array_length_value`]. `None` changes nothing.
     pub(crate) fn plain_elements_mut(&mut self, len: usize) -> Option<&mut word_block::Words> {
         if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
             return None;
@@ -8364,14 +8137,13 @@ impl Props {
             return None;
         }
         self.note_structural();
-        self.mirror_invalidate();
         self.elems.words_mut()
     }
 
     /// ECMA-262 Array.prototype.shift / OrdinarySetWithOwnDescriptor (e28783d5,
     /// #sec-array.prototype.shift): batch only an entirely unobservable own-data
     /// operation. The caller proves ordinary Array internal methods. A miss changes
-    /// no property or mirror, so the generic algorithm retains its partial effects
+    /// no property, so the generic algorithm retains its partial effects
     /// and abrupt completions. `length` is included in the proof and update.
     ///
     /// `holes_read_absent`: the caller also proved that no prototype of the Array has an
@@ -8399,7 +8171,6 @@ impl Props {
                 return None;
             }
             self.note_structural();
-            self.mirror_invalidate();
             let first = self.elems.words_mut().unwrap().shift().unwrap();
             self.set_array_length_value((len - 1) as f64);
             // SAFETY: a used word is a Value's bits.
@@ -8436,13 +8207,6 @@ impl Props {
         // proof. Rotate owning words, not Properties: this keeps each index's
         // attributes, transfers every reference once, and returns the original
         // first owner from the removed tail.
-        let mirror_flags = if self.mirror_flags & MIRROR_OK != 0 && self.elems.mirror_len() == len {
-            self.elems.buffers_mut().mirror.rotate_left(1);
-            self.mirror_flags
-        } else {
-            self.mirror_invalidate();
-            0
-        };
         let first = {
             for n in 1..len {
                 let previous = self.elems[n - 1] as usize;
@@ -8455,7 +8219,7 @@ impl Props {
             let slot = self.elems[last] as usize;
             if slot + 1 == self.entries.len() {
                 // The ordinary append-built representation needs only O(1) tail
-                // maintenance; this also pops the already-rotated numeric mirror.
+                // maintenance.
                 self.pop_last_element(last as u32)
                     .expect("shift preflight proved removable dense tail")
             } else {
@@ -8466,19 +8230,9 @@ impl Props {
                 // and prototype invalidation. Trim its final hole to keep dense
                 // append eligible, including when named properties follow elements.
                 self.elems.pop();
-                if mirror_flags != 0 {
-                    self.elems.mirror_pop();
-                    self.mirror_flags = mirror_flags | MIRROR_NO_HOLES;
-                    self.mirror_holes = 0;
-                }
                 first
             }
         };
-        if len == 1 && !self.elems.has_words() {
-            // An emptied inline array resumes the ordinary empty classic state.
-            self.mirror_flags = MIRROR_OK | MIRROR_NO_HOLES | MIRROR_ALL_I32;
-            self.mirror_holes = 0;
-        }
         let slot = self
             .find(crate::atom::names::LENGTH.key())
             .expect("Array length is not removed");
@@ -8521,7 +8275,6 @@ impl Props {
             return false;
         }
         self.note_structural();
-        self.mirror_invalidate();
         self.elems.words_start().unshift(items);
         self.set_array_length_value(next as f64);
         true
@@ -8791,7 +8544,7 @@ impl Props {
         self.find(crate::atom::names::PROTOTYPE.key())
             .map(|slot| slot as u32)
     }
-    /// Test-only mutable escape (mirror/descriptor fixtures simulate descriptor edits
+    /// Test-only mutable escape (descriptor fixtures simulate descriptor edits
     /// through it). Production descriptor changes go through `insert`; value-only writes
     /// go through `set_value`/`set_value_at`. Acquisition still demotes, matching the
     /// contract those fixtures must not accidentally rely on.
@@ -8808,9 +8561,6 @@ impl Props {
                 let slot = self.find(PropKey::index(n)).expect("the moved element");
                 self.entries.fields[slot].set_configurable(true);
             }
-        }
-        if text.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
-            self.mirror_invalidate(); // could be an element (see `mirror`)
         }
         match self.find_text(text) {
             Some(i) => {
@@ -8844,12 +8594,8 @@ impl Props {
                 .filter(|words| words.get(n as usize).is_some())
             {
                 words.set(n as usize, v);
-                self.mirror_invalidate();
                 return true;
             }
-        }
-        if text.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
-            self.mirror_invalidate();
         }
         match self.find_text(text) {
             Some(i) => {
@@ -8863,13 +8609,6 @@ impl Props {
     /// `set_value`). The caller has shape/key-validated the slot and established a
     /// writable data descriptor there.
     pub(crate) fn set_value_at(&mut self, slot: usize, v: Value) -> bool {
-        if self
-            .entries
-            .get(slot)
-            .is_some_and(|(k, _)| k.starts_with_digit())
-        {
-            self.mirror_invalidate();
-        }
         match self.entries.fields.get_mut(slot) {
             Some(p) => {
                 p.set_value(v);
@@ -8887,12 +8626,8 @@ impl Props {
             // A word's value is copied out and its word kept: the caller writes the
             // replacement back (and only ordinary objects, which keep no words, take values).
             if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
-                self.mirror_invalidate();
                 return Some(value);
             }
-        }
-        if text.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
-            self.mirror_invalidate();
         }
         let i = self.find_text(text)?;
         Some(self.entries.fields[i].take_value())
@@ -9001,9 +8736,6 @@ impl Props {
         self.note_structural();
         self.entries.clear();
         self.elems.clear();
-        self.elems.mirror_clear();
-        self.mirror_flags = MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES;
-        self.mirror_holes = 0;
         self.len_slot.set(SlotMemo::NONE);
         self.proto_slot.set(SlotMemo::NONE);
         self.has_far.set(false);
@@ -9032,7 +8764,6 @@ impl Props {
         self.reserve_entry();
         self.entries.push((key, prop));
         self.elems.push(slot as u32);
-        self.mirror_grow(0, slot);
     }
 
     /// Insert a key *known to be absent* (the caller shape-validated the map), landing on a
@@ -9125,13 +8856,11 @@ impl Props {
             if prop.is_plain_element() && !named {
                 if n < len {
                     self.note_structural();
-                    self.mirror_invalidate();
                     self.elems.words_mut().unwrap().set(n, prop.into_value());
                     return;
                 }
                 if !self.has_far.get() && n <= len + 256 {
                     self.note_structural();
-                    self.mirror_invalidate();
                     let words = self.elems.words_mut().unwrap();
                     words.resize_with_holes(n);
                     words.push(prop.into_value());
@@ -9143,12 +8872,10 @@ impl Props {
                 self.elems.words_mut().unwrap().set(n, Value::Empty);
                 if prop.is_empty() && !named {
                     self.note_structural();
-                    self.mirror_invalidate();
                     return;
                 }
             }
             self.has_far.set(true);
-            self.mirror_invalidate();
         }
         if let Some(i) = self.find(key) {
             // A whole-descriptor replacement that changes descriptor class cannot stay
@@ -9162,17 +8889,6 @@ impl Props {
                 self.shape = shape_fresh();
             }
             self.entries.fields[i] = prop;
-            if self.mirror_flags & MIRROR_OK != 0 && key.starts_with_digit() {
-                match key.as_index() {
-                    Some(n) if (n as usize) < self.elems.mirror_len() => {
-                        // Replacing an existing entry: position n already had the element.
-                        self.mirror_sync(n as usize, i, false)
-                    }
-                    // A far/map-only index entry stays outside the mirror's range: fine.
-                    Some(_) => {}
-                    None => self.mirror_invalidate(), // "007"-style: not canonical, be safe
-                }
-            }
         } else {
             self.note_structural();
             let slot = self.entries.len();
@@ -9245,12 +8961,6 @@ impl Props {
             self.build_index();
         }
         self.elems.clear_elems();
-        self.mirror_flags = if self.elems.has_words() {
-            0
-        } else {
-            MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES
-        };
-        self.mirror_holes = 0;
         // We already rebuild every named index below. Forget the old conservative proof
         // and let the surviving keys reassert it, including those outside packed storage.
         self.has_far.set(false);
@@ -9276,7 +8986,6 @@ impl Props {
         if let (Some(n), Some(words)) = (key.as_index(), self.elems.words()) {
             if words.get(n as usize).is_some() {
                 self.note_structural();
-                self.mirror_invalidate();
                 self.elems
                     .words_mut()
                     .unwrap()
@@ -9317,19 +9026,6 @@ impl Props {
                 .is_some_and(|layout| layout.has_index())
         {
             self.elems.set_index(None);
-        }
-        if self.mirror_flags & MIRROR_OK != 0 {
-            match key.as_index() {
-                Some(n) if (n as usize) < self.elems.mirror_len() => {
-                    if self.elems.mirror_get(n as usize).unwrap().to_bits() != MIRROR_HOLE {
-                        *self.elems.mirror_get_mut(n as usize).unwrap() =
-                            f64::from_bits(MIRROR_HOLE);
-                        self.mirror_flags &= !MIRROR_NO_HOLES;
-                        self.mirror_holes += 1;
-                    }
-                }
-                Some(_) | None => {}
-            }
         }
         // Dense slots shift down past the removed entry; the removed key's own slot holes.
         if let Some(elements) = self.elems.iter_mut() {
@@ -9463,8 +9159,8 @@ impl Props {
 }
 
 #[cfg(test)]
-#[path = "value_numeric_mirror_tests.rs"]
-mod numeric_mirror_tests;
+#[path = "value_word_kind_tests.rs"]
+mod word_kind_tests;
 
 #[cfg(test)]
 #[path = "value_array_shift_tests.rs"]

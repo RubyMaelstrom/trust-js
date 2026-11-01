@@ -338,9 +338,6 @@ struct PropertyInventory {
     dense_index_directory_len: u64,
     dense_index_directory_capacity: u64,
     dense_index_directory_capacity_bytes: u64,
-    dense_numeric_mirror_len: u64,
-    dense_numeric_mirror_capacity: u64,
-    dense_numeric_mirror_capacity_bytes: u64,
     dense_string_index_capacity: u64,
     dense_symbol_sidecar_capacity: u64,
     entry_vec_eligibility: EntryVecEligibility,
@@ -424,13 +421,6 @@ impl PropertyInventory {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<u32>())
                 as u64;
-            result.dense_numeric_mirror_len = dense.mirror.len() as u64;
-            result.dense_numeric_mirror_capacity = dense.mirror.capacity() as u64;
-            result.dense_numeric_mirror_capacity_bytes = dense
-                .mirror
-                .capacity()
-                .saturating_mul(std::mem::size_of::<f64>())
-                as u64;
         }
         // The element words: one block of a 16-byte header and 8-byte words (`heap_packed`).
         if let Some(words) = props.elems.words() {
@@ -489,9 +479,6 @@ impl PropertyInventory {
         self.dense_index_directory_len += other.dense_index_directory_len;
         self.dense_index_directory_capacity += other.dense_index_directory_capacity;
         self.dense_index_directory_capacity_bytes += other.dense_index_directory_capacity_bytes;
-        self.dense_numeric_mirror_len += other.dense_numeric_mirror_len;
-        self.dense_numeric_mirror_capacity += other.dense_numeric_mirror_capacity;
-        self.dense_numeric_mirror_capacity_bytes += other.dense_numeric_mirror_capacity_bytes;
         self.dense_string_index_capacity += other.dense_string_index_capacity;
         self.dense_symbol_sidecar_capacity += other.dense_symbol_sidecar_capacity;
         self.entry_vec_eligibility
@@ -501,7 +488,7 @@ impl PropertyInventory {
 
     fn json(&self) -> String {
         format!(
-            "{{\"live_objects\":{},\"entries_len\":{},\"entries_capacity\":{},\"entries_unused_capacity\":{},\"entries_capacity_bytes\":{},\"named_entries\":{},\"classic_index_entries\":{},\"entry_vec_eligibility\":{},\"dense_sidecars\":{},\"dense_sidecar_body_bytes\":{},\"dense_heap_packed_len\":{},\"dense_heap_packed_vectors\":{},\"dense_heap_packed_vector_header_bytes\":{},\"dense_heap_packed_capacity\":{},\"dense_heap_packed_unused_capacity\":{},\"dense_heap_packed_capacity_bytes\":{},\"packed_dense_fields\":{},\"dense_eligibility\":{},\"dense_index_directory_len\":{},\"dense_index_directory_capacity\":{},\"dense_index_directory_capacity_bytes\":{},\"dense_numeric_mirror_len\":{},\"dense_numeric_mirror_capacity\":{},\"dense_numeric_mirror_capacity_bytes\":{},\"dense_string_index_capacity\":{},\"dense_symbol_sidecar_capacity\":{}}}",
+            "{{\"live_objects\":{},\"entries_len\":{},\"entries_capacity\":{},\"entries_unused_capacity\":{},\"entries_capacity_bytes\":{},\"named_entries\":{},\"classic_index_entries\":{},\"entry_vec_eligibility\":{},\"dense_sidecars\":{},\"dense_sidecar_body_bytes\":{},\"dense_heap_packed_len\":{},\"dense_heap_packed_vectors\":{},\"dense_heap_packed_vector_header_bytes\":{},\"dense_heap_packed_capacity\":{},\"dense_heap_packed_unused_capacity\":{},\"dense_heap_packed_capacity_bytes\":{},\"packed_dense_fields\":{},\"dense_eligibility\":{},\"dense_index_directory_len\":{},\"dense_index_directory_capacity\":{},\"dense_index_directory_capacity_bytes\":{},\"dense_string_index_capacity\":{},\"dense_symbol_sidecar_capacity\":{}}}",
             self.live_objects,
             self.entries_len,
             self.entries_capacity,
@@ -523,9 +510,6 @@ impl PropertyInventory {
             self.dense_index_directory_len,
             self.dense_index_directory_capacity,
             self.dense_index_directory_capacity_bytes,
-            self.dense_numeric_mirror_len,
-            self.dense_numeric_mirror_capacity,
-            self.dense_numeric_mirror_capacity_bytes,
             self.dense_string_index_capacity,
             self.dense_symbol_sidecar_capacity,
         )

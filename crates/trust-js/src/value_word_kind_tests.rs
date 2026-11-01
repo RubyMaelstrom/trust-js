@@ -1,5 +1,5 @@
-//! Number arrays in element words: the words are the f64 view, so a word array keeps no
-//! numeric mirror, and its kind bits stay exact through every edit.
+//! Number arrays in element words: the words are the f64 view, and their kind bits stay exact
+//! through every edit.
 use super::*;
 use crate::value::ValueView;
 
@@ -34,7 +34,7 @@ fn exact_kind(props: &Props) -> u32 {
 }
 
 #[test]
-fn number_words_keep_no_mirror_and_their_kind_bits() {
+fn number_words_keep_their_kind_bits() {
     for length in [3, 16, 4097] {
         let mut props = packed(length);
         props.insert("named", Property::plain(Value::lstr("kept")));
@@ -44,7 +44,6 @@ fn number_words_keep_no_mirror_and_their_kind_bits() {
         assert_eq!(props.elems.words().unwrap().as_slice().as_ptr(), pointer);
         assert_eq!(props.shape(), shape);
         assert_eq!(props.retained_requested_storage_bytes().0, before);
-        assert_eq!(props.elems.mirror_len(), 0);
         assert_eq!(
             exact_kind(&props),
             word_block::KIND_NO_HOLES | word_block::KIND_NUMBERS | word_block::KIND_INT32
@@ -96,7 +95,6 @@ fn word_edits_keep_the_kind_bits_exact() {
             _ => word_block::KIND_ALL,
         };
         assert_eq!(kind, expected, "{name}");
-        assert_eq!(props.elems.mirror_len(), 0, "{name}");
     }
 }
 

@@ -166,7 +166,6 @@ fn record(families: &mut [Family; 3], object: &Object) {
     if let Some(buffers) = buffers {
         b[1] = class_bytes(std::mem::size_of::<DenseBuffers>());
         b[5] = class_bytes(buffers.elems.capacity() * 4);
-        b[6] = class_bytes(buffers.mirror.capacity() * 8);
         if let Some(index) = buffers.index.as_deref() {
             b[7] = class_bytes(std::mem::size_of::<KeyIndex>()) + class_bytes(index.bytes());
         }

@@ -3717,9 +3717,6 @@ pub(crate) fn ordinary_array_length(props: &Props) -> Option<usize> {
 /// property key. `None` for a hole or an accessor, whose Get must take the specified path.
 pub(crate) fn own_data_element(props: &Props, index: usize) -> Option<Value> {
     let index = u32::try_from(index).ok()?;
-    if let Some(number) = props.mirror_get(index) {
-        return Some(Value::Num(number));
-    }
     props
         .get_index(index)
         .filter(|property| !property.accessor())

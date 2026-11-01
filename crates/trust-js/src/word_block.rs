@@ -29,7 +29,7 @@ pub(crate) const KIND_NO_HOLES: u32 = 1 << 0;
 /// Every used word that is not a hole is a Number.
 pub(crate) const KIND_NUMBERS: u32 = 1 << 1;
 /// Every used word that is not a hole is an exact int32 (bit-identical through an i32, so not
-/// -0; `MIRROR_ALL_I32`'s meaning).
+/// -0).
 pub(crate) const KIND_INT32: u32 = 1 << 2;
 /// The facts of a block with no words.
 pub(crate) const KIND_ALL: u32 = KIND_NO_HOLES | KIND_NUMBERS | KIND_INT32;

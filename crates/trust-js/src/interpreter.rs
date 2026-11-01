@@ -8460,13 +8460,10 @@ impl Interp {
         }
         let obj = Object::new(Some(self.array_proto));
         let len = items.len();
-        let numeric = items
-            .iter()
-            .all(|v| matches!(&(v).view(), ValueView::Num(_)));
         {
             let mut b = obj.borrow_mut();
             b.props.mark_array();
-            b.props.reserve_dense_exact(len, numeric);
+            b.props.reserve_dense_exact(len);
         }
         obj.borrow_mut().exotic = Exotic::Array;
         {
@@ -8601,12 +8598,10 @@ impl Interp {
             return Value::Obj(obj);
         }
         let obj = Object::new(Some(self.array_proto));
-        let numeric =
-            (0..len).all(|k| matches!((unsafe { *items.add(k) }).view(), ValueView::Num(_)));
         {
             let mut b = obj.borrow_mut();
             b.props.mark_array();
-            b.props.reserve_dense_exact(len, numeric);
+            b.props.reserve_dense_exact(len);
             b.exotic = Exotic::Array;
             for k in 0..len {
                 b.props
@@ -9900,10 +9895,6 @@ impl Interp {
             b = o.borrow();
         } else if !(matches!(b.exotic, Exotic::Array) || b.exotic.is_ordinary()) {
             return None;
-        }
-        // One-load mirror hit (see `Props::mirror`); a miss only means "answer classically".
-        if let Some(f) = b.props.mirror_get(n as u32) {
-            return Some(Value::Num(f));
         }
         let p = b.props.get_index(n as u32)?;
         if p.accessor() {
@@ -14629,7 +14620,7 @@ impl Interp {
             // ordinary indexed data properties. Use the same packed storage as
             // fresh arrays without changing the arguments object's exotic kind,
             // length descriptor, or (for sloppy calls) ParameterMap semantics.
-            object.props.reserve_dense_exact(args.len(), false);
+            object.props.reserve_dense_exact(args.len());
             for value in args {
                 object.props.push_dense(Property::plain(*value));
             }
