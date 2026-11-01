@@ -4889,3 +4889,60 @@ first call's loops entering fragments once the budget is spent and its second ca
 1), and no fragment at all (step 2); a function that cannot compile and a Script's loops admitted
 as now (step 1); shadowing, dead zones, captured block bindings, labeled break and continue and
 per-iteration copies across a nested transfer (step 2).
+
+### Tiering: steps 1 and 2, and the budget scaled by size (record, 2026-11-01)
+
+Landed on main, each counted against its parent (fat LTO, user instructions pinned to CPUs 10-13,
+median of 3; scripts, builds and outputs in target/p2/tiering):
+- 72ea95a6, step 1: one budget per function, as designed. NavierStokes's setup and first 20 runs
+  (target/p2/navier-threshold's fixed-work drivers) 22.28 -> 2.30 G instructions at threshold 8,
+  5.98 -> 2.29 G at threshold 1 (2.06 G at 0); its steady 94.2 M a run unchanged. Octane's
+  benchmarks at a fixed 5 runs (w3-exit/codeload/fixed-driver.js, each loaded suite N times):
+  NavierStokes -95.7%, Box2D -17.5%, Gameboy -8.4%, DeltaBlue -8.2%, Crypto -7.7%, zlib -4.6%,
+  RayTrace -2.9%, PdfJS -2.3%, Mandreel -1.2%, CodeLoad -0.5%, Richards and Splay -0.1%;
+  EarleyBoyer +0.1%, TypeScript +0.4%, RegExp +2.8% (the fixed driver's RegExp stops at its
+  checksum after setup's run, in Node too, though not every time: one run of three completed).
+  React -18.5%, Djot -3.2%, chai -0.03%, Vue +0.10%: React's -20.4% at threshold 1 in W3's exit
+  session was this gap. Three tests' counts encoded the call-only rule and now follow the budget.
+- d462d14b, step 2 (DIAGNOSTICS.md 440329d0): frames move at nested loop headers. Against step 1:
+  NavierStokes's first 20 runs 2.30 -> 2.08 G at threshold 8 (2.07 G at 1), its first run 347 ->
+  127 M (107 M at 0); Octane at 5 runs NavierStokes -24.9%, the rest within 0.5%; Vue -0.23%,
+  React -0.61%, Djot -0.49%.
+- Step 2's timing (target/p2/tiering/session-tb2) found the per-page cost the design's measures
+  watched for: TRust's replays' wall times grew (event-loop 246 -> 304 ms, todomvc 772 -> 836 ms)
+  with their engine times within 2.4%. The platform prelude's setup functions, called once in
+  each page's fresh Engine, compiled by their loop budgets: 16 functions and 28,351 operations an
+  event-loop page (TRUST_JS_TIER_LOG), one of them 22,314; 185 M more instructions a page.
+- 47e61ff6: the budget scaled by size, as V8's is (invocations times the function's bytecode
+  length, tiering-manager.cc:187-190, 268-291): a function's source or snapshot encoding in
+  4 KB units, a call weighing 16 backedges a unit; and before its budget compiles it, a function
+  of more than one unit compiles for a transfer only at a body-level loop, so a nested loop of a
+  large function takes a fragment, as before step 2. The event-loop page then compiles 11
+  functions, 1,736 operations, by loop budgets. Against step 2: Octane's fixed runs within 0.4%,
+  Vue +0.02%, React 0.00%, chai -0.01%, Djot +0.75% (its bundle wrappers, 40.7 and 9.9 KB, wait
+  longer; its major collection returns).
+- Checks: rustfmt and clippy in the three landing configurations on Crystal and on zombie (x86-64
+  and aarch64 cross); the targeted tests on both; the lib suite in full at step 2 on both (ARM64
+  2,710 passed, x86-64 2,519). Each new test fails without its change.
+
+Against 02ac6393, timed on Crystal 15:34-16:03 (the other load 1.3-2.9 cores; bench.py, CPU 5;
+target/p2/tiering/session, report.txt): Octane 3388 -> 3540 (+4.5%): NavierStokes +62.7% (5804
+-> 9441), Box2D +17.3%, Gameboy +11.3%, PdfJS +4.0%, Mandreel +2.1%; RegExp -2.7% and Splay
+-6.7%, which step 2's session had at +3.2% and +12.1%, noise at this load. Vue 286 -> 285 ms,
+React 49 -> 38 (-22.4%), Djot 110 -> 105 (-4.5%). TRust (one X925 core, user instructions and
+cycles a steady page, the replay binaries): event-loop +0.39% and +0.55%, todomvc +0.65% and
++1.35%, dom-reconcile -0.59% and -0.72%. The replays' timed engine medians, on ten cores beside
+the other load, differ more (todomvc +4.6%, higher in four of six rounds; dom-reconcile +1.6%,
+event-loop +1.7%), and base's own medians moved up to 2.6% between the two sessions; the pinned
+counts are the measure. The spike, at TRust's threshold 0, unchanged.
+
+The threshold (for the owner, with W3's exit data): at 1 against 8 on the final engine Octane
+-0.9% (NavierStokes -0.8%, CodeLoad -6.7%, SplayLatency -11.1%; Box2D +6.0%), Vue -0.4%, React
++2.6% (39 against 38 ms), Djot -8.6% (96 against 105), and TRust's event-loop engine time +129%
+(50.0 against 21.8 ms: its platform functions compile again each page). Threshold 1's Octane gain
+was NavierStokes's cold calls and React's was its loops; Djot's -8.6% is the one gain left.
+
+Not done: step 3 (a Script's loops admitted by their site's backedges over all executions): no
+workload found needs it. Small regressions: TRust's event-loop and todomvc pages +0.6% and +1.4%
+cycles (setup functions under 8 KB still compile by their loop budgets each page); TypeScript
++0.5% at a fixed 5 runs (-0.4% timed); RegExp's setup run +2.8%.
