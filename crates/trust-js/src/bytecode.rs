@@ -4305,41 +4305,48 @@ fn hoisted_vars_stmt(
 /// alone that admits `eval` and `with`; [`CaptureScan::apply_summary`] replays them where the
 /// function occurs. `None` means the walk itself fails wherever the function is.
 ///
-/// This lets a compilation analyze inner functions whose bodies are still encoded in a static
-/// snapshot (`ast::FunctionBody`) from one temporary decode: while a snapshot bootstraps a Realm
-/// ([`capture_summaries`]), every enclosing compilation reuses the summary, so a platform
-/// prelude's nested function bodies are neither decoded once per enclosing function nor kept.
+/// A summary depends on the function's syntax alone, so a static snapshot stores each function's
+/// with its body (`snapshot::StoredSummary`), written by the encoder: a compilation analyzes an
+/// inner function whose body is still encoded (`ast::FunctionBody`) from that, in every Agent,
+/// without decoding the body. V8 saves the same information with a lazily compiled function: a
+/// preparsed function's unresolved references go to its enclosing scope
+/// (`DeclarationScope::AnalyzePartially`), its preparse data is saved with it and restored when
+/// it is compiled, and no context analyzes it again (src/ast/scopes.cc:792-797, 1840-1907).
 pub(crate) struct CaptureSummary {
-    /// Names referenced inside the function that none of its own scopes declare there.
-    free: Box<[Box<str>]>,
+    /// Names referenced inside the function that none of its own scopes declare there, in
+    /// ascending order.
+    pub(crate) free: Box<[Box<str>]>,
     /// The function is an arrow and reads `this` (or `super`) through arrows only.
-    env_this: bool,
-    direct_eval: bool,
-    with: bool,
+    pub(crate) env_this: bool,
+    pub(crate) direct_eval: bool,
+    pub(crate) with: bool,
 }
 
 thread_local! {
-    /// Summaries of still-encoded functions by encoding identity, while a scope is open.
-    static CAPTURE_SUMMARIES: std::cell::RefCell<(
+    /// The encoded summaries of parsed functions by identity, while a snapshot encoder holds a
+    /// [`summaries_for_encoding`] guard.
+    static ENCODING_SUMMARIES: std::cell::RefCell<(
         usize,
-        crate::fasthash::FastMap<(usize, usize), Option<Rc<CaptureSummary>>>,
+        crate::fasthash::FastMap<*const Function, Rc<[u8]>>,
     )> = std::cell::RefCell::default();
 }
 
-/// Keep the [`CaptureSummary`] of every still-encoded function that compilation analyzes until
-/// the returned guard and every enclosing one are dropped. Static snapshot bootstraps hold one.
-#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
-pub(crate) fn capture_summaries() -> CaptureSummaries {
-    CAPTURE_SUMMARIES.with(|cache| cache.borrow_mut().0 += 1);
-    CaptureSummaries(())
+/// Keep the summary of every parsed function that a snapshot encoder summarizes until the guard
+/// and every enclosing one are dropped: summarizing a function then uses the summaries of the
+/// functions nested in it, so each is scanned once however deeply it is nested. The keys are
+/// the encoder's input, which it borrows for the guard's lifetime: the functions that its
+/// temporary decodes of still-encoded bodies make, and drop, carry stored summaries and are
+/// never keys.
+pub(crate) fn summaries_for_encoding() -> EncodingSummaries {
+    ENCODING_SUMMARIES.with(|cache| cache.borrow_mut().0 += 1);
+    EncodingSummaries(())
 }
 
-#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
-pub(crate) struct CaptureSummaries(());
+pub(crate) struct EncodingSummaries(());
 
-impl Drop for CaptureSummaries {
+impl Drop for EncodingSummaries {
     fn drop(&mut self) {
-        let released = CAPTURE_SUMMARIES.with(|cache| {
+        let released = ENCODING_SUMMARIES.with(|cache| {
             let mut cache = cache.borrow_mut();
             cache.0 -= 1;
             if cache.0 == 0 {
@@ -4352,20 +4359,85 @@ impl Drop for CaptureSummaries {
     }
 }
 
+/// The encoded summary of a parsed function, kept while an encoder holds a
+/// [`summaries_for_encoding`] guard; `None` without one.
+fn encoding_summary(f: &Function) -> Option<Rc<[u8]>> {
+    let key = std::ptr::from_ref(f);
+    let cached = ENCODING_SUMMARIES.with(|cache| {
+        let cache = cache.borrow();
+        if cache.0 == 0 {
+            return Err(());
+        }
+        Ok(cache.1.get(&key).cloned())
+    });
+    match cached {
+        Err(()) => None,
+        Ok(Some(summary)) => Some(summary),
+        Ok(None) => {
+            let summary: Rc<[u8]> = Rc::from(crate::snapshot::StoredSummary::encode(
+                CaptureSummary::of(f).as_ref(),
+            ));
+            ENCODING_SUMMARIES.with(|cache| cache.borrow_mut().1.insert(key, summary.clone()));
+            Some(summary)
+        }
+    }
+}
+
+/// Run `k` over the encoded capture summary of `function`, for a snapshot encoder: the summary its
+/// body's encoding stores, or a scan of the parsed function.
+pub(crate) fn with_summary_encoding<T>(function: &Function, k: impl FnOnce(&[u8]) -> T) -> T {
+    if let Some(stored) = function.body.capture_summary() {
+        return k(stored.bytes());
+    }
+    match encoding_summary(function) {
+        Some(summary) => k(&summary),
+        None => k(&crate::snapshot::StoredSummary::encode(
+            CaptureSummary::of(function).as_ref(),
+        )),
+    }
+}
+
 /// Test builds check every summary that a scan applies against walking the same function at
-/// the same position.
-mod capture_summary_tests {
+/// the same position, and count what the capture scans decode.
+pub(crate) mod capture_summary_tests {
     #[cfg(test)]
-    use super::{CaptureScan, CaptureSummary, Function};
+    use super::{CaptureScan, Function};
 
     #[cfg(test)]
     thread_local! {
         static WALKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Bodies still encoded in a static snapshot that a capture scan decoded to walk an
+        /// inner function (checks' reference walks and the self-binding query aside).
+        pub(crate) static SCAN_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Stored summaries that a capture scan applied.
+        pub(crate) static STORED_SUMMARIES_APPLIED: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+        /// Capture scans summarize a still-encoded function by decoding and scanning it, as
+        /// before snapshots stored summaries, instead of reading the stored one.
+        pub(crate) static COMPUTE_INSTEAD: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// With [`COMPUTE_INSTEAD`], the summary of `f` from a scan of its decoded body.
+    #[cfg(test)]
+    pub(super) fn computed_instead(f: &Function) -> Option<Vec<u8>> {
+        COMPUTE_INSTEAD
+            .with(std::cell::Cell::get)
+            .then(|| crate::snapshot::StoredSummary::encode(super::CaptureSummary::of(f).as_ref()))
+    }
+
+    /// The encoded summary of `f` from walking it whole, its inner functions included.
+    #[cfg(test)]
+    pub(crate) fn walked(f: &Function) -> Vec<u8> {
+        let outer = WALKING.with(|walking| walking.replace(true));
+        let summary = super::CaptureSummary::of(f);
+        WALKING.with(|walking| walking.set(outer));
+        crate::snapshot::StoredSummary::encode(summary.as_ref())
     }
 
     /// Inside a check's reference walk, inner functions are walked, never summarized.
     #[inline(always)]
-    pub(super) fn walking() -> bool {
+    pub(crate) fn walking() -> bool {
         #[cfg(test)]
         return WALKING.with(std::cell::Cell::get);
         #[cfg(not(test))]
@@ -4373,13 +4445,13 @@ mod capture_summary_tests {
     }
 
     #[cfg(test)]
-    pub(super) fn check(scan: &CaptureScan, f: &Function, summary: Option<&CaptureSummary>) {
+    pub(super) fn check(scan: &CaptureScan, f: &Function, summary: crate::snapshot::StoredSummary) {
         let mut walked = scan.clone();
         WALKING.with(|walking| walking.set(true));
         let walked_result = walked.walk_inner_fn(f);
         WALKING.with(|walking| walking.set(false));
         let mut applied = scan.clone();
-        let applied_result = summary.and_then(|summary| applied.apply_summary(summary));
+        let applied_result = applied.apply_summary(summary);
         assert_eq!(
             walked_result.is_some(),
             applied_result.is_some(),
@@ -4404,31 +4476,9 @@ mod capture_summary_tests {
 }
 
 impl CaptureSummary {
-    fn of(f: &Function, encoding: &'static [u8]) -> Option<Rc<CaptureSummary>> {
-        let key = (encoding.as_ptr() as usize, encoding.len());
-        let cached = CAPTURE_SUMMARIES.with(|cache| {
-            let cache = cache.borrow();
-            if cache.0 == 0 {
-                return None;
-            }
-            cache.1.get(&key).cloned()
-        });
-        if let Some(summary) = cached {
-            return summary;
-        }
-        let summary = Self::scan(f).map(Rc::new);
-        CAPTURE_SUMMARIES.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if cache.0 != 0 {
-                cache.1.insert(key, summary.clone());
-            }
-        });
-        summary
-    }
-
     /// Walk `f` as an inner function of a scan that has no scopes of its own: every reference
     /// its scopes leave unresolved is then free, and `env_this` holds for its own arrow chain.
-    fn scan(f: &Function) -> Option<CaptureSummary> {
+    fn of(f: &Function) -> Option<CaptureSummary> {
         let mut scan = CaptureScan::new(f, true);
         scan.arrow_path = vec![false];
         scan.walk_inner_fn(f)?;
@@ -4707,10 +4757,18 @@ impl CaptureScan {
         self.spend_watch_budget()?;
         // The function being compiled reads its own statements, which compiling it needs anyway.
         // Nested functions, and the self-binding query, analyze bodies that may never run: a
-        // body still encoded in a static snapshot is decoded for this walk only.
+        // body still encoded in a static snapshot is decoded for this walk only (an inner
+        // function's capture summary comes from the snapshot instead: `inner_fn`).
         if self.fn_depth == 0 && self.watched_name.is_none() {
             self.fn_statements(func, &func.body)
         } else {
+            #[cfg(test)]
+            if func.body.materialized().is_none()
+                && self.watched_name.is_none()
+                && !capture_summary_tests::walking()
+            {
+                capture_summary_tests::SCAN_DECODES.with(|count| count.set(count.get() + 1));
+            }
             func.body.with(|body| self.fn_statements(func, body))
         }
     }
@@ -5183,14 +5241,29 @@ impl CaptureScan {
         if self.shallow_children && self.fn_depth == 0 {
             return self.walk_inner_fn(f);
         }
-        // A function whose body is still encoded in a static snapshot is summarized instead of
-        // walked (see `CaptureSummary`); the self-binding query keeps its budgeted walk.
+        // A function from a static snapshot is summarized instead of walked, from the summary
+        // its body's encoding stores (see `CaptureSummary`), and so is a parsed function that a
+        // snapshot encoder summarizes; the self-binding query keeps its budgeted walk.
         if self.watched_name.is_none() && !capture_summary_tests::walking() {
-            if let Some(encoding) = f.body.encoding() {
-                let summary = CaptureSummary::of(f, encoding);
+            if let Some(summary) = f.body.capture_summary() {
                 #[cfg(test)]
-                capture_summary_tests::check(self, f, summary.as_deref());
-                return self.apply_summary(&*summary?);
+                if let Some(computed) = capture_summary_tests::computed_instead(f) {
+                    let computed = crate::snapshot::StoredSummary::new(&computed);
+                    capture_summary_tests::check(self, f, computed);
+                    return self.apply_summary(computed);
+                }
+                #[cfg(test)]
+                capture_summary_tests::check(self, f, summary);
+                #[cfg(test)]
+                capture_summary_tests::STORED_SUMMARIES_APPLIED
+                    .with(|count| count.set(count.get() + 1));
+                return self.apply_summary(summary);
+            }
+            if let Some(summary) = encoding_summary(f) {
+                let summary = crate::snapshot::StoredSummary::new(&summary);
+                #[cfg(test)]
+                capture_summary_tests::check(self, f, summary);
+                return self.apply_summary(summary);
             }
         }
         self.walk_inner_fn(f)
@@ -5248,14 +5321,17 @@ impl CaptureScan {
     /// Exactly what [`CaptureScan::walk_inner_fn`] would contribute at this position for the
     /// function `summary` describes: a direct eval or `with` statement it contains, the outer
     /// `this` read through its arrow chain, and the names its references resolve outside it.
-    fn apply_summary(&mut self, summary: &CaptureSummary) -> Option<()> {
-        if summary.direct_eval {
+    fn apply_summary(&mut self, summary: crate::snapshot::StoredSummary) -> Option<()> {
+        if !summary.walks() {
+            return None;
+        }
+        if summary.direct_eval() {
             if !self.allow_direct_eval {
                 return None;
             }
             self.saw_direct_eval = true;
         }
-        if summary.with {
+        if summary.with() {
             if !self.allow_with {
                 return None;
             }
@@ -5263,12 +5339,12 @@ impl CaptureScan {
         }
         // The walk checks the whole path from the compiled function: the part outside the
         // inner function here, the part inside it in the summary.
-        if summary.env_this && self.arrow_path[1..].iter().all(|a| *a) {
+        if summary.env_this() && self.arrow_path[1..].iter().all(|a| *a) {
             self.env_this = true;
         }
         // Each reference is resolved from inside the function, past its own scopes.
         self.fn_depth += 1;
-        for name in summary.free.iter() {
+        for name in summary.free() {
             self.reference(name);
         }
         self.fn_depth -= 1;

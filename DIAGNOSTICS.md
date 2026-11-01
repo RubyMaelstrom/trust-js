@@ -24,9 +24,10 @@ comment/example in the same change.
 - `TRUST_JS_TIER_THRESHOLD=N` sets the tier-up budget of ordinary synchronous author
   functions: N calls, where each backedge the tree-walker runs in a function's own loops
   counts as a sixteenth of a call (16·N backedges, or any mix). A function of 8 KB or more of
-  source (or snapshot encoding) needs proportionally more backedges, 16·N per 4 KB, as V8
-  scales its budget by bytecode length. Async/generator coroutine bytecode remains eager, and
-  self-hosted methods compile on their first call. Once its function has tiered up, a call
+  source (or of its statements' snapshot encoding) needs proportionally more backedges, 16·N
+  per 4 KB, as V8 scales its budget by bytecode length. Async/generator coroutine bytecode
+  remains eager, and self-hosted methods compile on their first call. Once its function has
+  tiered up, a call
   still on the tree-walker leaves it at its next loop header, and any loop leaves after 128
   backedges of one execution, without repeating its parameter binding, hoisting or prefix
   effects. A for, while or do-while loop the body reaches through blocks, ifs, labels and other
@@ -75,6 +76,13 @@ comment/example in the same change.
 - `TRUST_JS_JIT_CHUNK_STUBS=1` gives each ARM64 chunk its own copy of the shared stubs instead
   of veneers to the process-wide stub table. It is a code-size ablation with the same behavior.
 - `TRUST_JS_TIER_LOG=1` helps diagnose compilation bailouts.
+- `TRUST_JS_SUMMARY_SOURCE=<script file>` names the Script that the ignored lib test
+  `lazy_snapshot_body_tests::summary_source_checks` checks the capture summaries of a static
+  snapshot on (`cargo test -p trust-js --lib --features embed -- --ignored summary_source`),
+  such as a browser's assembled platform prelude: every function's stored summary equals walking
+  the parsed function, every function plans alike from stored summaries, from summaries computed
+  by scanning and from the parsed source, and the bootstrap function's plan decodes no body. It
+  prints the snapshot's size and its summaries' share.
 - `TRUST_JS_JIT_DUMP=<names>` prints the bytecode of chunks whose first four slot names contain
   the text, and `TRUST_JS_JIT_CODEDUMP=<names>[@<offset>]` the finished ARM64 words of the same
   chunks (`*` dumps every chunk; hex, one per line; assemble them with `clang

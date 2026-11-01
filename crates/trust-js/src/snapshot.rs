@@ -15,6 +15,14 @@
 //!   [`FunctionBody`]). The first static decode of a snapshot in the process still decodes, and
 //!   so validates, every body under the same budgets as [`decode`]; it drops each body after
 //!   validating it. Later decodes of those immutable bytes skip the bodies by their lengths.
+//! - **A body begins with its function's capture summary** ([`StoredSummary`]), which the
+//!   encoder computes from the parsed function (`bytecode::CaptureSummary`): what scanning the
+//!   function contributes to the capture analysis of a function around it. An enclosing
+//!   function's plan or compilation reads it instead of decoding and scanning a body that is
+//!   still encoded, in every Agent of the process, as V8 restores a lazily compiled function's
+//!   preparse data instead of analyzing the function again (src/ast/scopes.cc:792-797,
+//!   1840-1907). Both decoders check its structure like any other field; its content is
+//!   trusted as the snapshot's statements are (see [`StoredSummary`]).
 //! - **Run-once bootstrap functions are marked** in a second flags byte: the encoder knows which
 //!   function expressions run once per evaluation of the Script (`Function::run_once`). Only a
 //!   static decode keeps the mark, which changes how the function is compiled, never what it
@@ -35,7 +43,7 @@ use crate::token::{KEYWORDS, PUNCTUATORS};
 
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 /// Snapshots are an optimization for trusted build-time glue, but the public embedding API can be
 /// handed arbitrary bytes. Keep corrupt data from turning its length fields into unbounded work.
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
@@ -284,6 +292,48 @@ impl Reader<'_> {
     }
 }
 
+impl<'a> Reader<'a> {
+    /// A reader of `buf` alone, for the parts of an encoding read outside a decode.
+    fn over(buf: &'a [u8]) -> Self {
+        Reader {
+            buf,
+            pos: 0,
+            allocated: 0,
+            depth: 0,
+            lazy: None,
+        }
+    }
+
+    /// A string borrowed from the input; it allocates nothing.
+    fn str_ref(&mut self) -> R<&'a str> {
+        let len = self.usize()?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or("snapshot: position overflow")?;
+        let bytes = self
+            .buf
+            .get(self.pos..end)
+            .ok_or("snapshot: truncated str")?;
+        self.pos = end;
+        std::str::from_utf8(bytes).map_err(|_| "snapshot: bad utf8".into())
+    }
+
+    /// Step past the capture summary that a function body's encoding begins with (see
+    /// [`StoredSummary`]), whose body ends at `end`, after checking its structure.
+    fn capture_summary(&mut self, end: usize) -> R<()> {
+        let len = self.usize()?;
+        let summary_end = self
+            .pos
+            .checked_add(len)
+            .filter(|&summary_end| summary_end <= end)
+            .ok_or("snapshot: truncated capture summary")?;
+        check_summary(&self.buf[self.pos..summary_end])?;
+        self.pos = summary_end;
+        Ok(())
+    }
+}
+
 /// Re-intern an operator string to the `&'static str` the parser would have used.
 fn intern_op(s: &str) -> R<&'static str> {
     KEYWORDS
@@ -317,7 +367,10 @@ fn encode_with_source(body: &[Stmt], include_source: bool) -> Vec<u8> {
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
+    // Summarize each function once: an enclosing function's summary uses its inner functions'.
+    let summaries = crate::bytecode::summaries_for_encoding();
     enc_stmts(&mut w, body);
+    drop(summaries);
     crate::jit::perf_snapshot_encode_end(perf_started);
     w.buf
 }
@@ -381,27 +434,65 @@ fn decode_with(bytes: &[u8], lazy: Option<LazyBodies>) -> R<Vec<Stmt>> {
 /// Decode the statements of a function body that [`decode_static`] left encoded. Its own nested
 /// function bodies stay encoded in turn.
 pub(crate) fn decode_function_body(encoded: &'static [u8]) -> R<Vec<Stmt>> {
+    #[cfg(test)]
+    if !crate::bytecode::capture_summary_tests::walking() {
+        DECODED_BODIES.with(|count| count.set(count.get() + 1));
+    }
+    // The function's capture summary was checked with the rest of the body.
+    let (_, statements) = split_function_body(encoded)?;
     let mut r = Reader {
-        buf: encoded,
+        buf: statements,
         pos: 0,
         allocated: 0,
         depth: 0,
         lazy: Some(LazyBodies {
-            buf: encoded,
+            buf: statements,
             validate: false,
         }),
     };
     let body = dec_stmts(&mut r)?;
-    if r.pos != encoded.len() {
+    if r.pos != statements.len() {
         return Err("snapshot: function body length mismatch".into());
     }
     Ok(body)
+}
+
+/// A function body's encoding, as [`FunctionBody`] keeps it: the function's capture summary,
+/// then the statements.
+fn split_function_body(encoded: &[u8]) -> R<(&[u8], &[u8])> {
+    let mut r = Reader::over(encoded);
+    let len = r.usize()?;
+    let start = r
+        .pos
+        .checked_add(len)
+        .filter(|&start| start <= encoded.len())
+        .ok_or("snapshot: truncated capture summary")?;
+    Ok((&encoded[r.pos..start], &encoded[start..]))
+}
+
+/// The capture summary of the function whose body a validated static snapshot keeps encoded.
+pub(crate) fn body_summary(encoded: &[u8]) -> StoredSummary<'_> {
+    match split_function_body(encoded) {
+        Ok((summary, _)) => StoredSummary(summary),
+        Err(error) => panic!("validated snapshot function body: {error}"),
+    }
+}
+
+/// The byte length of the statements of a body that a validated static snapshot keeps encoded.
+pub(crate) fn body_statements_len(encoded: &[u8]) -> usize {
+    match split_function_body(encoded) {
+        Ok((_, statements)) => statements.len(),
+        Err(error) => panic!("validated snapshot function body: {error}"),
+    }
 }
 
 #[cfg(test)]
 thread_local! {
     /// Function bodies decoded for validation by [`decode_static`] on this thread.
     static VALIDATED_BODIES: Cell<usize> = const { Cell::new(0) };
+    /// Encoded function bodies decoded by [`decode_function_body`] on this thread, outside the
+    /// walks that test builds check capture summaries against.
+    pub(crate) static DECODED_BODIES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Static snapshots this process has decoded with full validation, by address and length.
@@ -1475,7 +1566,7 @@ fn enc_function_inner(w: &mut Writer, f: &Function, run_once: bool) {
         enc_opt_expr(w, &p.default);
         w.bool(p.rest);
     }
-    enc_function_body(w, &f.body);
+    enc_function_body(w, f);
     // Flags packed into one byte.
     let flags = (f.is_arrow as u8)
         | (f.is_strict as u8) << 1
@@ -1549,13 +1640,18 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
     })
 }
 
-/// A function body: its statements' byte length as a little-endian `u32`, then the statements.
-fn enc_function_body(w: &mut Writer, body: &FunctionBody) {
+/// A function body: its byte length as a little-endian `u32`, then the function's capture
+/// summary (its byte length as a LEB128 varint, then a [`StoredSummary`]) and the statements.
+fn enc_function_body(w: &mut Writer, function: &Function) {
     let at = w.buf.len();
     w.buf.extend_from_slice(&[0; 4]);
+    crate::bytecode::with_summary_encoding(function, |summary| {
+        w.uv(summary.len() as u64);
+        w.buf.extend_from_slice(summary);
+    });
     // A lazily decoded body is re-encoded from a temporary decode, as `include_source` may
     // differ from the encoding it was read from.
-    body.with(|stmts| enc_stmts(w, stmts));
+    function.body.with(|stmts| enc_stmts(w, stmts));
     // No representable snapshot holds a 4 GiB body; an impossible length fails decoding.
     let len = u32::try_from(w.buf.len() - at - 4).unwrap_or(u32::MAX);
     w.buf[at..at + 4].copy_from_slice(&len.to_le_bytes());
@@ -1569,6 +1665,9 @@ fn dec_function_body(r: &mut Reader) -> R<FunctionBody> {
         .filter(|&end| end <= r.buf.len())
         .ok_or("snapshot: truncated function body")?;
     let Some(lazy) = r.lazy else {
+        // An eager decode keeps no body encoded, so it never reads the summary; it checks it
+        // as the first static decode does, which therefore accepts the same snapshots.
+        r.capture_summary(end)?;
         let body = dec_stmts(r)?;
         if r.pos != end {
             return Err("snapshot: function body length mismatch".into());
@@ -1577,6 +1676,7 @@ fn dec_function_body(r: &mut Reader) -> R<FunctionBody> {
     };
     if lazy.validate {
         // Exactly the decode `decode` performs, charged to the same budgets.
+        r.capture_summary(end)?;
         let body = dec_stmts(r)?;
         if r.pos != end {
             return Err("snapshot: function body length mismatch".into());
@@ -1588,6 +1688,139 @@ fn dec_function_body(r: &mut Reader) -> R<FunctionBody> {
         r.pos = end;
     }
     Ok(FunctionBody::encoded(&lazy.buf[start..end]))
+}
+
+// ---- capture summaries ------------------------------------------------------------------------
+
+/// Walking the function fails wherever it is; nothing follows.
+const SUMMARY_FAILS: u8 = 0;
+/// Walking the function succeeds; the free names follow.
+const SUMMARY_WALKS: u8 = 1;
+const SUMMARY_ENV_THIS: u8 = 2;
+const SUMMARY_DIRECT_EVAL: u8 = 4;
+const SUMMARY_WITH: u8 = 8;
+const SUMMARY_EFFECTS: u8 = SUMMARY_WALKS | SUMMARY_ENV_THIS | SUMMARY_DIRECT_EVAL | SUMMARY_WITH;
+
+/// A function's capture summary (`bytecode::CaptureSummary`) as its body's encoding holds it,
+/// where the capture analysis of a function around it reads it without decoding the body: a
+/// `u8` of effects, `0` when walking the function fails wherever it is, otherwise 1, plus 2 when
+/// the function reads the outer `this` through its arrow chain, 4 when it contains a direct eval
+/// and 8 when it contains a `with` statement; then, unless the effects are `0`, its free names:
+/// a LEB128 count and that many strings, in ascending order.
+///
+/// Both decoders check a summary's structure as they check the rest of a body: these fields
+/// exactly, valid UTF-8, ascending names and its length. Its content is the snapshot's, like
+/// the statements': the encoder computed it from the function with this build's capture
+/// analysis (snapshots never outlive a build), and test builds check every summary that a scan
+/// applies against walking the function there. A summary corrupted into another well-formed one
+/// stands for an inner function with other references or effects: the plans and compilations
+/// around it still agree with each other, since a record's layout and every static address into
+/// it come from one plan, but names may then resolve as for that other function. V8 likewise
+/// restores a lazily compiled function's preparse data from its snapshot or code cache without
+/// analyzing the function again, and verifies their checksums only in debug builds
+/// (`verify_snapshot_checksum`, src/flags/flag-definitions.h:3487-3490).
+#[derive(Clone, Copy)]
+pub(crate) struct StoredSummary<'a>(&'a [u8]);
+
+impl<'a> StoredSummary<'a> {
+    /// A summary's encoding; `None` when walking the function fails wherever it is.
+    pub(crate) fn encode(summary: Option<&crate::bytecode::CaptureSummary>) -> Vec<u8> {
+        let mut w = Writer {
+            buf: Vec::new(),
+            include_source: false,
+            run_once: false,
+            run_once_callee: std::ptr::null(),
+        };
+        match summary {
+            None => w.u8(SUMMARY_FAILS),
+            Some(summary) => {
+                w.u8(SUMMARY_WALKS
+                    | if summary.env_this {
+                        SUMMARY_ENV_THIS
+                    } else {
+                        0
+                    }
+                    | if summary.direct_eval {
+                        SUMMARY_DIRECT_EVAL
+                    } else {
+                        0
+                    }
+                    | if summary.with { SUMMARY_WITH } else { 0 });
+                w.uv(summary.free.len() as u64);
+                for name in &summary.free {
+                    w.str(name);
+                }
+            }
+        }
+        w.buf
+    }
+
+    /// A summary that [`StoredSummary::encode`] wrote, or that a decode has checked.
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        debug_assert!(check_summary(bytes).is_ok());
+        Self(bytes)
+    }
+
+    pub(crate) fn bytes(self) -> &'a [u8] {
+        self.0
+    }
+
+    /// Walking the function succeeds wherever it is.
+    pub(crate) fn walks(self) -> bool {
+        self.0[0] & SUMMARY_WALKS != 0
+    }
+
+    /// The function is an arrow and reads `this` (or `super`) through arrows only.
+    pub(crate) fn env_this(self) -> bool {
+        self.0[0] & SUMMARY_ENV_THIS != 0
+    }
+
+    pub(crate) fn direct_eval(self) -> bool {
+        self.0[0] & SUMMARY_DIRECT_EVAL != 0
+    }
+
+    pub(crate) fn with(self) -> bool {
+        self.0[0] & SUMMARY_WITH != 0
+    }
+
+    /// The names that the function references and none of its own scopes declare, in order.
+    pub(crate) fn free(self) -> impl Iterator<Item = &'a str> {
+        let mut r = Reader::over(&self.0[1..]);
+        let count = if self.walks() {
+            r.usize().expect("checked capture summary")
+        } else {
+            0
+        };
+        (0..count).map(move |_| r.str_ref().expect("checked capture summary"))
+    }
+}
+
+/// Check a [`StoredSummary`]'s structure.
+fn check_summary(bytes: &[u8]) -> R<()> {
+    let mut r = Reader::over(bytes);
+    let effects = r.u8()?;
+    if effects != SUMMARY_FAILS {
+        if effects & SUMMARY_WALKS == 0 || effects & !SUMMARY_EFFECTS != 0 {
+            return Err("snapshot: invalid capture summary".into());
+        }
+        let count = r.usize()?;
+        // Every name takes at least its length byte.
+        if count > bytes.len() - r.pos {
+            return Err("snapshot: collection length exceeds input".into());
+        }
+        let mut previous = None;
+        for _ in 0..count {
+            let name = r.str_ref()?;
+            if previous.is_some_and(|previous| previous >= name) {
+                return Err("snapshot: capture summary names out of order".into());
+            }
+            previous = Some(name);
+        }
+    }
+    if r.pos != bytes.len() {
+        return Err("snapshot: capture summary length mismatch".into());
+    }
+    Ok(())
 }
 
 fn enc_class(w: &mut Writer, c: &Class) {

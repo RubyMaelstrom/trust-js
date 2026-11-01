@@ -132,6 +132,24 @@ const EXPECTED: &str = "counter=3:6;loops=0,1,2,a1,b2,boom,sw;\
     names=120;outer|inner,inner|outer;eval=42,3,3;annexB=undefined,block,20;\
     gen=0112358,true;hot=5995";
 
+/// While alive, capture scans summarize still-encoded functions by decoding and scanning them
+/// instead of reading the summaries the snapshot stores (`computed`), or read them (`!computed`).
+struct ComputeSummaries(bool);
+
+impl ComputeSummaries {
+    fn new(computed: bool) -> Self {
+        let flag = &crate::bytecode::capture_summary_tests::COMPUTE_INSTEAD;
+        Self(flag.with(|flag| flag.replace(computed)))
+    }
+}
+
+impl Drop for ComputeSummaries {
+    fn drop(&mut self) {
+        let flag = &crate::bytecode::capture_summary_tests::COMPUTE_INSTEAD;
+        flag.with(|flag| flag.set(self.0));
+    }
+}
+
 fn corpus_snapshot() -> &'static [u8] {
     static SNAPSHOT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     SNAPSHOT.get_or_init(|| crate::compile_snapshot(CORPUS).expect("corpus parses"))
@@ -182,24 +200,27 @@ fn lazily_decoded_bodies_behave_like_parsed_source_in_every_tier() {
             "{tier:?}: parsed source"
         );
 
-        for summaries in [false, true] {
+        for computed in [false, true] {
             let mut shared = engine(tier);
             let it = &mut *shared.interp;
-            // Static bootstraps keep summaries for their whole evaluation; without the scope,
-            // every compilation summarizes its inner functions afresh.
-            let scope = summaries.then(crate::bytecode::capture_summaries);
+            // Scans read the summaries the snapshot stores, or, as before it stored them,
+            // decode and scan each still-encoded inner function: the results are the same.
+            let compute = ComputeSummaries::new(computed);
             assert_eq!(
                 run_shared(it),
                 expected,
-                "{tier:?} summaries kept: {summaries}"
+                "{tier:?} summaries computed: {computed}"
             );
-            drop(scope);
+            drop(compute);
 
             // The functions that ran were decoded once; the one that never ran was not.
             let ran = global_function(it, "counterFactory");
             assert!(ran.body.materialized().is_some(), "{tier:?}");
             let never = global_function(it, "neverCalled");
-            assert!(never.body.encoding().is_some(), "{tier:?}: never called");
+            assert!(
+                never.body.materialized().is_none(),
+                "{tier:?}: never called"
+            );
             if tier != Tier::Interp {
                 assert!(
                     global_function(it, "hot")
@@ -218,7 +239,7 @@ fn lazily_decoded_bodies_behave_like_parsed_source_in_every_tier() {
             let child_never = in_realm(it, &child, |it| global_function(it, "neverCalled"));
             assert!(Rc::ptr_eq(&never, &child_never), "{tier:?}: one shared AST");
             assert!(
-                never.body.encoding().is_some(),
+                never.body.materialized().is_none(),
                 "{tier:?}: still never called"
             );
         }
@@ -238,7 +259,10 @@ fn memory_accounting_counts_only_materialized_bodies() {
         crate::ast::scan_function_retained_memory(function, &mut visitor)
     };
     let encoded = measure(&never);
-    assert!(never.body.encoding().is_some(), "measuring does not decode");
+    assert!(
+        never.body.materialized().is_none(),
+        "measuring does not decode"
+    );
     assert!(!never.body.is_empty());
     let materialized = measure(&never);
     assert!(
@@ -270,7 +294,6 @@ fn capture_summaries_preserve_unanalyzable_inner_functions() {
     for tier in TIERS {
         let mut engine = engine(tier);
         let it = &mut *engine.interp;
-        let _summaries = crate::bytecode::capture_summaries();
         let body = it.shared_snapshot_program(snapshot).expect("decodes");
         if let Err(Abrupt::Throw(error)) = it.run_classic_program(&body, None) {
             panic!("{tier:?} threw: {}", render(it, &error));
@@ -464,5 +487,566 @@ fn huge_run_once_bootstrap_bodies_are_interpreted_until_the_call_threshold() {
     assert!(
         bootstrap_function(&parsed).runtime().code.get().is_none(),
         "parsed source also defers cold-loop compilation"
+    );
+}
+
+/// Every function of a Script in preorder, with whether it is a derived class's constructor.
+/// Reading a function's statements materializes them if they are still encoded.
+fn functions_of(body: &[crate::ast::Stmt]) -> Vec<(Rc<crate::ast::Function>, bool)> {
+    let mut functions = Vec::new();
+    visit_functions(body, true, &mut |function, derived| {
+        functions.push((function.clone(), derived));
+    });
+    functions
+}
+
+/// The functions that `body` contains directly, not inside other functions: what its scan
+/// meets as inner functions. Nothing is materialized.
+fn inner_functions_of(body: &[crate::ast::Stmt]) -> Vec<(Rc<crate::ast::Function>, bool)> {
+    let mut functions = Vec::new();
+    visit_functions(body, false, &mut |function, derived| {
+        functions.push((function.clone(), derived));
+    });
+    functions
+}
+
+/// Call `visit` on each function of `body` in preorder, with whether it is a derived class's
+/// constructor, before reading the function's parameters and statements (when `deep`).
+fn visit_functions(
+    body: &[crate::ast::Stmt],
+    deep: bool,
+    visit: &mut dyn FnMut(&Rc<crate::ast::Function>, bool),
+) {
+    use crate::ast::{
+        ArrayElem, ArrayPatElem, Class, Expr, ForInit, Function, MemberKind, Pattern, PropDef,
+        PropKey, Stmt,
+    };
+    struct Collect<'v>(&'v mut dyn FnMut(&Rc<Function>, bool), bool);
+    impl Collect<'_> {
+        fn function(&mut self, function: &Rc<Function>, derived: bool) {
+            (self.0)(function, derived);
+            if !self.1 {
+                return;
+            }
+            for parameter in &function.params {
+                self.pattern(&parameter.pattern);
+                if let Some(default) = &parameter.default {
+                    self.expr(default);
+                }
+            }
+            self.stmts(&function.body);
+        }
+        fn class(&mut self, class: &Class) {
+            for decorator in &class.decorators {
+                self.expr(decorator);
+            }
+            if let Some(heritage) = &class.superclass {
+                self.expr(heritage);
+            }
+            for member in &class.members {
+                for decorator in &member.decorators {
+                    self.expr(decorator);
+                }
+                self.key(&member.key);
+                if let Some(function) = &member.func {
+                    let derived =
+                        class.superclass.is_some() && member.kind == MemberKind::Constructor;
+                    self.function(function, derived);
+                }
+                if let Some(value) = &member.value {
+                    self.expr(value);
+                }
+            }
+        }
+        fn key(&mut self, key: &PropKey) {
+            if let PropKey::Computed(key) = key {
+                self.expr(key);
+            }
+        }
+        fn pattern(&mut self, pattern: &Pattern) {
+            match pattern {
+                Pattern::Ident(_) => {}
+                Pattern::Array(elements) => {
+                    for element in elements {
+                        match element {
+                            ArrayPatElem::Hole => {}
+                            ArrayPatElem::Elem { pattern, default } => {
+                                self.pattern(pattern);
+                                if let Some(default) = default {
+                                    self.expr(default);
+                                }
+                            }
+                            ArrayPatElem::Rest(pattern) => self.pattern(pattern),
+                        }
+                    }
+                }
+                Pattern::Object(object) => {
+                    for property in &object.props {
+                        self.key(&property.key);
+                        self.pattern(&property.value);
+                        if let Some(default) = &property.default {
+                            self.expr(default);
+                        }
+                    }
+                }
+                Pattern::Member(target) => self.expr(target),
+            }
+        }
+        fn elements(&mut self, elements: &[ArrayElem]) {
+            for element in elements {
+                if let ArrayElem::Item(e) | ArrayElem::Spread(e) = element {
+                    self.expr(e);
+                }
+            }
+        }
+        fn decls(&mut self, decls: &[(Pattern, Option<Expr>)]) {
+            for (pattern, init) in decls {
+                self.pattern(pattern);
+                if let Some(init) = init {
+                    self.expr(init);
+                }
+            }
+        }
+        fn expr(&mut self, e: &Expr) {
+            match e {
+                Expr::Paren(e)
+                | Expr::ToStr(e)
+                | Expr::Await(e)
+                | Expr::OptionalChain(e)
+                | Expr::Unary { arg: e, .. }
+                | Expr::Update { arg: e, .. }
+                | Expr::Member { obj: e, .. }
+                | Expr::PrivateIn { obj: e, .. } => self.expr(e),
+                Expr::Yield { arg, .. } => {
+                    if let Some(arg) = arg {
+                        self.expr(arg);
+                    }
+                }
+                Expr::Array(elements) => self.elements(elements),
+                Expr::Object(properties) => {
+                    for property in properties {
+                        match property {
+                            PropDef::KeyValue { key, value } | PropDef::Cover { key, value } => {
+                                self.key(key);
+                                self.expr(value);
+                            }
+                            PropDef::Method { key, func }
+                            | PropDef::Getter { key, func }
+                            | PropDef::Setter { key, func } => {
+                                self.key(key);
+                                self.function(func, false);
+                            }
+                            PropDef::Spread(e) | PropDef::Proto(e) => self.expr(e),
+                        }
+                    }
+                }
+                Expr::Func(function) => self.function(function, false),
+                Expr::Class(class) => self.class(class),
+                Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+                    self.expr(left);
+                    self.expr(right);
+                }
+                Expr::Assign { target, value, .. } => {
+                    self.expr(target);
+                    self.expr(value);
+                }
+                Expr::Cond { test, cons, alt } => {
+                    self.expr(test);
+                    self.expr(cons);
+                    self.expr(alt);
+                }
+                Expr::Call { callee, args, .. } | Expr::New { callee, args, .. } => {
+                    self.expr(callee);
+                    self.elements(args);
+                }
+                Expr::Index { obj, index, .. } => {
+                    self.expr(obj);
+                    self.expr(index);
+                }
+                Expr::Seq(items) => {
+                    for item in items {
+                        self.expr(item);
+                    }
+                }
+                Expr::TaggedTemplate { tag, subs, .. } => {
+                    self.expr(tag);
+                    for sub in subs.iter() {
+                        self.expr(sub);
+                    }
+                }
+                Expr::ImportCall { spec, options, .. } => {
+                    self.expr(spec);
+                    if let Some(options) = options {
+                        self.expr(options);
+                    }
+                }
+                Expr::Num(_)
+                | Expr::BigInt(_)
+                | Expr::Str(_)
+                | Expr::Bool(_)
+                | Expr::Null
+                | Expr::Undefined
+                | Expr::Ident(..)
+                | Expr::This
+                | Expr::Regex { .. }
+                | Expr::Super
+                | Expr::ImportMeta
+                | Expr::NewTarget => {}
+            }
+        }
+        fn stmts(&mut self, stmts: &[Stmt]) {
+            for statement in stmts {
+                self.stmt(statement);
+            }
+        }
+        fn stmt(&mut self, statement: &Stmt) {
+            match statement {
+                Stmt::Expr(e) | Stmt::Throw(e) => self.expr(e),
+                Stmt::Return(value) => {
+                    if let Some(value) = value {
+                        self.expr(value);
+                    }
+                }
+                Stmt::VarDecl { decls, .. } => self.decls(decls),
+                Stmt::FuncDecl(function) => self.function(function, false),
+                Stmt::If { test, cons, alt } => {
+                    self.expr(test);
+                    self.stmt(cons);
+                    if let Some(alt) = alt {
+                        self.stmt(alt);
+                    }
+                }
+                Stmt::Block(body) => self.stmts(body),
+                Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+                    self.expr(test);
+                    self.stmt(&body.statement);
+                }
+                Stmt::For {
+                    init,
+                    test,
+                    update,
+                    body,
+                } => {
+                    match init.as_deref() {
+                        Some(ForInit::VarDecl { decls, .. }) => self.decls(decls),
+                        Some(ForInit::Expr(e)) => self.expr(e),
+                        None => {}
+                    }
+                    for e in [test, update].into_iter().flatten() {
+                        self.expr(e);
+                    }
+                    self.stmt(&body.statement);
+                }
+                Stmt::ForInOf {
+                    left, right, body, ..
+                } => {
+                    self.pattern(left);
+                    self.expr(right);
+                    self.stmt(&body.statement);
+                }
+                Stmt::Try {
+                    block,
+                    handler,
+                    finalizer,
+                } => {
+                    self.stmts(block);
+                    if let Some((parameter, body)) = handler {
+                        if let Some(parameter) = parameter {
+                            self.pattern(parameter);
+                        }
+                        self.stmts(body);
+                    }
+                    if let Some(finalizer) = finalizer {
+                        self.stmts(finalizer);
+                    }
+                }
+                Stmt::Switch { disc, cases } => {
+                    self.expr(disc);
+                    for case in cases {
+                        if let Some(test) = &case.test {
+                            self.expr(test);
+                        }
+                        self.stmts(&case.body);
+                    }
+                }
+                Stmt::Labeled { body, .. } | Stmt::ExportDecl(body) | Stmt::ExportDefault(body) => {
+                    self.stmt(body)
+                }
+                Stmt::With { obj, body } => {
+                    self.expr(obj);
+                    self.stmt(body);
+                }
+                Stmt::ClassDecl(class) => self.class(class),
+                Stmt::Break(_)
+                | Stmt::Continue(_)
+                | Stmt::Empty
+                | Stmt::Debugger
+                | Stmt::Import(_)
+                | Stmt::ExportNamed { .. }
+                | Stmt::ExportAll { .. } => {}
+            }
+        }
+    }
+    let mut collect = Collect(visit, deep);
+    collect.stmts(body);
+}
+
+/// The engine's own static glue as its build scripts assemble it for their snapshots (web's in
+/// trust-js-web/build.rs's order; node's files, each in a block as its build script wraps most
+/// of them, in name order), and the corpus above.
+fn real_scripts() -> Vec<(String, String)> {
+    const WEB: &[&str] = &[
+        "preamble.js",
+        "events.js",
+        "messaging.js",
+        "encoding.js",
+        "serialize.js",
+        "url.js",
+        "urlpattern.js",
+        "streams.js",
+        "streams-webidl.js",
+        "writable.js",
+        "compression.js",
+        "blob.js",
+        "fetch.js",
+        "websocket.js",
+        "eventsource.js",
+        "server.js",
+        "crypto.js",
+        "platform.js",
+        "wasm.js",
+    ];
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let read = |path: String| {
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"))
+    };
+    let mut web = String::from("(() => {\n");
+    for file in WEB {
+        web.push_str(&read(format!("{root}/trust-js-web/src/js/{file}")));
+    }
+    web.push_str("\n})();");
+    let mut node_files: Vec<_> = std::fs::read_dir(format!("{root}/trust-js-node/src/js"))
+        .expect("node glue directory")
+        .map(|entry| entry.expect("node glue file").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "js"))
+        .collect();
+    node_files.sort();
+    let mut node = String::from("(() => {\n");
+    for path in node_files {
+        node.push_str("{\n");
+        node.push_str(&read(path.display().to_string()));
+        node.push_str("\n}\n");
+    }
+    node.push_str("\n})();");
+    vec![
+        ("web glue".into(), web),
+        ("node glue".into(), node),
+        ("corpus".into(), CORPUS.into()),
+    ]
+}
+
+/// What a function's plan decided, in a canonical form: its kind, why, capacity and prefix, and
+/// the capture analysis it keeps for compiling the function.
+fn plan_facts(function: &crate::ast::Function, derived: bool) -> String {
+    let plan = function.scope_plan(derived);
+    let prefix: Vec<String> = plan
+        .prefix
+        .iter()
+        .map(|binding| format!("{}:{}:{}", binding.name, binding.lexical, binding.mutable))
+        .collect();
+    let scan = plan.scan.as_ref().map(|scan| {
+        let mut captured: Vec<&String> = scan.captured.iter().collect();
+        captured.sort();
+        let mut runtime: Vec<&String> = scan.runtime.iter().collect();
+        runtime.sort();
+        format!(
+            "captured {captured:?} env_this {} homed {:?} runtime {runtime:?} eval {} with {}",
+            scan.env_this, scan.homed, scan.direct_eval, scan.with
+        )
+    });
+    format!(
+        "{:?} {:?} capacity {} prefix {prefix:?} scan {scan:?}",
+        plan.kind, plan.why, plan.capacity
+    )
+}
+
+/// Plan every function of `body`, the Script's own inner functions first (as ScriptEvaluation
+/// does), then each function before the functions nested in it are read, as its first call
+/// plans it before its body makes their closures; return each one's plan and its outer context,
+/// in preorder.
+fn plans_of(body: &[crate::ast::Stmt], strict: bool) -> Vec<(String, String)> {
+    crate::bytecode::scope_plan::plan_script(body, strict);
+    let mut plans = Vec::new();
+    visit_functions(body, true, &mut |function, derived| {
+        let facts = plan_facts(function, derived);
+        plans.push((facts, format!("{:?}", function.outer_context_rc())));
+    });
+    plans
+}
+
+fn decode_leaked(snapshot: Vec<u8>) -> Vec<crate::ast::Stmt> {
+    crate::snapshot::decode_static(Box::leak(snapshot.into_boxed_slice())).expect("decodes")
+}
+
+/// Each function's capture summary as the snapshot stores it, against walking the parsed
+/// function whole: the encoder's summaries, each made from the summaries of the functions
+/// nested in it, are the walks'. Returns the number of functions, the snapshot's size and the
+/// bytes its summaries take (with their lengths).
+fn check_stored_summaries(name: &str, source: &str) -> (usize, usize, usize) {
+    let parsed = crate::parser::parse_script(source, false)
+        .ok()
+        .unwrap_or_else(|| panic!("{name} parses"));
+    let snapshot = crate::compile_host_snapshot(source).expect("compiles");
+    let size = snapshot.len();
+    let lazy = decode_leaked(snapshot);
+    let parsed_functions = functions_of(&parsed);
+    let lazy_functions = functions_of(&lazy);
+    assert_eq!(parsed_functions.len(), lazy_functions.len(), "{name}");
+    let mut summary_bytes = 0;
+    for (index, ((parsed, _), (lazy, _))) in
+        parsed_functions.iter().zip(&lazy_functions).enumerate()
+    {
+        let stored = lazy.body.capture_summary().expect("a stored summary");
+        assert_eq!(
+            stored.bytes(),
+            crate::bytecode::capture_summary_tests::walked(parsed),
+            "{name}: function {index} ({:?})",
+            parsed.name
+        );
+        let len = stored.bytes().len();
+        summary_bytes += len + (usize::BITS - len.leading_zeros()).div_ceil(7).max(1) as usize;
+    }
+    (parsed_functions.len(), size, summary_bytes)
+}
+
+#[test]
+fn stored_summaries_equal_walking_each_function_of_real_glue() {
+    for (name, source) in real_scripts() {
+        let (functions, ..) = check_stored_summaries(&name, &source);
+        assert!(functions >= 40, "{name}: {functions} functions");
+    }
+}
+
+/// Plans made from the summaries a snapshot stores equal the plans made from summaries computed
+/// by decoding and scanning each inner function, and both equal the plans of the parsed source.
+/// A function whose body was still encoded when the function around it was planned gets no
+/// outer context from that plan, whichever summary it was given (the parsed source's functions
+/// all get one), so outer contexts are compared between the two snapshot trees only.
+fn check_plans(name: &str, source: &str) -> usize {
+    let parsed = crate::parser::parse_script(source, false)
+        .ok()
+        .unwrap_or_else(|| panic!("{name} parses"));
+    let snapshot = crate::compile_host_snapshot(source).expect("compiles");
+    let stored = plans_of(&decode_leaked(snapshot.clone()), false);
+    let computed = {
+        let _compute = ComputeSummaries::new(true);
+        plans_of(&decode_leaked(snapshot), false)
+    };
+    let scanned = plans_of(&parsed, false);
+    assert_eq!(stored.len(), scanned.len(), "{name}");
+    for (index, ((stored, computed), scanned)) in
+        stored.iter().zip(&computed).zip(&scanned).enumerate()
+    {
+        assert_eq!(
+            stored, computed,
+            "{name}: function {index}, stored and computed"
+        );
+        assert_eq!(
+            stored.0, scanned.0,
+            "{name}: function {index}, stored and parsed"
+        );
+    }
+    stored.len()
+}
+
+#[test]
+fn plans_from_stored_summaries_equal_plans_from_scanning_real_glue() {
+    for (name, source) in real_scripts() {
+        check_plans(&name, &source);
+    }
+}
+
+/// What planning a snapshot's bootstrap function found: the stored summaries it applied, the
+/// bodies that summarizing by scanning instead decodes, and the bodies the plan decodes
+/// temporarily for other syntactic questions (the `this`, `arguments` and `super` flags of the
+/// arrows in it, which other plans and closure creation ask too).
+struct BootstrapPlan {
+    applied: usize,
+    computed_decodes: usize,
+    other_decodes: usize,
+}
+
+/// A static snapshot's bootstrap function, planned at its first call as every Agent plans it:
+/// its plan reads each inner function's stored summary and decodes no body to summarize one.
+/// Summarizing instead by scanning, as before snapshots stored summaries, decodes them all.
+fn check_bootstrap_plan(name: &str, source: &str) -> BootstrapPlan {
+    use crate::bytecode::capture_summary_tests::{SCAN_DECODES, STORED_SUMMARIES_APPLIED};
+    use crate::snapshot::DECODED_BODIES;
+    let snapshot = crate::compile_host_snapshot(source).expect("compiles");
+    let plan = |computed: bool| {
+        let program = decode_leaked(snapshot.clone());
+        crate::bytecode::scope_plan::plan_script(&program, false);
+        let bootstrap = bootstrap_function(&program);
+        bootstrap.body.prepare_to_run();
+        let _compute = ComputeSummaries::new(computed);
+        SCAN_DECODES.with(|count| count.set(0));
+        STORED_SUMMARIES_APPLIED.with(|count| count.set(0));
+        DECODED_BODIES.with(|count| count.set(0));
+        let facts = plan_facts(&bootstrap, false);
+        let decodes = SCAN_DECODES.with(std::cell::Cell::get);
+        let applied = STORED_SUMMARIES_APPLIED.with(std::cell::Cell::get);
+        let all_decodes = DECODED_BODIES.with(std::cell::Cell::get);
+        let inner = inner_functions_of(&bootstrap.body);
+        let encoded = inner
+            .iter()
+            .filter(|(function, _)| function.body.materialized().is_none())
+            .count();
+        (facts, decodes, applied, all_decodes, inner.len(), encoded)
+    };
+    let (stored_facts, stored_decodes, applied, other_decodes, inner, encoded) = plan(false);
+    let (computed_facts, computed_decodes, ..) = plan(true);
+    assert_eq!(stored_facts, computed_facts, "{name}");
+    assert_eq!(
+        stored_decodes, 0,
+        "{name}: the plan decoded bodies to summarize them"
+    );
+    assert_eq!(
+        applied, inner,
+        "{name}: one stored summary for each inner function"
+    );
+    assert_eq!(encoded, inner, "{name}: the inner functions stay encoded");
+    assert!(computed_decodes > 0, "{name}");
+    BootstrapPlan {
+        applied,
+        computed_decodes,
+        other_decodes,
+    }
+}
+
+#[test]
+fn bootstrap_plans_read_stored_summaries_and_decode_no_inner_body() {
+    for (name, source) in real_scripts() {
+        if name != "corpus" {
+            check_bootstrap_plan(&name, &source);
+        }
+    }
+}
+
+/// The same checks over another Script, such as a browser's assembled platform prelude:
+/// `TRUST_JS_SUMMARY_SOURCE=path cargo test -p trust-js --lib --features embed -- --ignored
+/// summary_source` (DIAGNOSTICS.md).
+#[test]
+#[ignore]
+fn summary_source_checks() {
+    let path = std::env::var("TRUST_JS_SUMMARY_SOURCE").expect("TRUST_JS_SUMMARY_SOURCE");
+    let source = std::fs::read_to_string(&path).expect("readable source");
+    let (functions, size, summary_bytes) = check_stored_summaries(&path, &source);
+    check_plans(&path, &source);
+    let plan = check_bootstrap_plan(&path, &source);
+    eprintln!(
+        "{path}: {functions} functions, a {size}-byte snapshot of which summaries take \
+         {summary_bytes}; the bootstrap's plan applied {} stored summaries, decoded {} bodies \
+         for other questions, and decodes {} to compute the summaries",
+        plan.applied, plan.other_decodes, plan.computed_decodes
     );
 }

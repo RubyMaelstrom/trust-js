@@ -624,12 +624,15 @@ impl crate::gc_trace::GcTrace for FunctionMaps {
 /// Reading the statements (`Deref`) materializes them once. They then belong to the Function
 /// like parsed ones, so their node identity (template objects, loop sites) is stable and the
 /// caches built from them stay valid. [`FunctionBody::with`] serves analyses of a function that
-/// is not about to run, such as an enclosing function's capture scan, from a temporary decode
-/// that is dropped afterwards. Memory accounting reads only [`FunctionBody::materialized`].
+/// is not about to run from a temporary decode that is dropped afterwards. An enclosing
+/// function's capture scan needs none: the encoding begins with the function's capture summary
+/// ([`FunctionBody::capture_summary`]). Memory accounting reads only
+/// [`FunctionBody::materialized`].
 #[derive(Clone)]
 pub struct FunctionBody {
     stmts: std::cell::OnceCell<Vec<Stmt>>,
-    /// The statements' snapshot encoding, while they may still be unmaterialized.
+    /// The body's snapshot encoding (the function's capture summary, then the statements), while
+    /// the statements are unmaterialized or materialized from it unchanged.
     encoded: Option<&'static [u8]>,
 }
 
@@ -685,21 +688,20 @@ impl FunctionBody {
         }
     }
 
-    /// The length of the body's snapshot encoding, materialized or not; `None` for a parsed or
-    /// eagerly decoded body.
+    /// The length of the statements' snapshot encoding, materialized or not; `None` for a parsed
+    /// or eagerly decoded body.
     #[inline]
     pub(crate) fn encoded_len(&self) -> Option<usize> {
-        self.encoded.map(<[u8]>::len)
+        self.encoded.map(crate::snapshot::body_statements_len)
     }
 
-    /// The snapshot bytes of a body that is still encoded: an identity that every decode of
-    /// the same function shares.
+    /// The function's capture summary, which a static snapshot stores at the start of the
+    /// body's encoding (`snapshot::StoredSummary`), materialized or not: materialized
+    /// statements are the encoding's, which edits drop. `None` for a parsed or eagerly decoded
+    /// body.
     #[inline]
-    pub(crate) fn encoding(&self) -> Option<&'static [u8]> {
-        match self.stmts.get() {
-            Some(_) => None,
-            None => self.encoded,
-        }
+    pub(crate) fn capture_summary(&self) -> Option<crate::snapshot::StoredSummary<'static>> {
+        self.encoded.map(crate::snapshot::body_summary)
     }
 
     #[cold]
@@ -1527,7 +1529,7 @@ impl Expr {
 
 impl Function {
     /// The function's size in the tier-up budget's units of [`TIER_UNIT_BYTES`] (its source
-    /// text, or the body's snapshot encoding), at least 1. Compiling costs in proportion to a
+    /// text, or its statements' snapshot encoding), at least 1. Compiling costs in proportion to a
     /// function's size, so a large function waits for proportionally more loop work, as V8's
     /// interrupt budget is a number of invocations times the function's bytecode length
     /// (src/execution/tiering-manager.cc:187-190, 268-291).
