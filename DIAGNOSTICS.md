@@ -224,8 +224,10 @@ comment/example in the same change.
   collection: for arrays, arguments objects and other objects with index keys or element
   storage, their count, element slots, elements and holes, the plain ones (no accessor, no
   attributes but the defaults, no far key) and of those the holey, all-Number and all-int32
-  ones, and the bytes of each element storage part, beside the same objects' bytes under
-  W2c's 8-byte words (`w2c`). In test builds, `TRUST_JS_GC_WHY=1` records
+  ones, and the bytes of each element storage part (element words are the `values` part: the
+  block with its header and remembered record; `packed_box` and `dirty` stay zero), beside the
+  same objects' bytes under W2c's model of 8-byte words (`w2c`). In test builds,
+  `TRUST_JS_GC_WHY=1` records
   why each cell was marked (tests print the path with `gc_test::why`/`why_address`; a
   stack root names its frame's return address, for `addr2line`, and its depth below that
   frame's record), and `TRUST_JS_SEGV_BACKTRACE=1` prints a backtrace on a fault.

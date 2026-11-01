@@ -5042,3 +5042,110 @@ Found, not fixed (for the owner):
   are created, 9.2 M, and on nested arrows, 3.2 M), syntax-only and storable the same way.
 - The one-time 114.5 M encode, and the plans' own 55.6 M a page, are the "fresh sources" part:
   folding reference collection into the parser, as V8's preparser does.
+
+### W2c step 2c: the switch (record, 2026-11-01)
+
+Five commits on p2-w2c-words, landed together: 97b9dfaf keeps array elements as words, c1fe1a65
+moves the ARM64 element templates onto them, abea113b checks the block's size arithmetic (a 32-bit
+target's large reservation could pass usize), 8100d1fe splices words in place, and 90512397 builds
+literal words in one pass and keeps empty element storage cheap. The last two answer Vue's +0.20% at
+c1fe1a65 (its JIT code unchanged, so Rust paths), found by microbenchmarks (target/p2/w2c, scratch
+copies of the loops below), parent -> c1fe1a65 -> 90512397: a loop of `[i, i]` literals +9.10% ->
++0.20% (each word was pushed with its capacity check and kind upkeep into a block the growth path
+made), object literals +1.60% -> -1.36% (DenseStorage's out-of-line clone and the record check at
+creation), closures +1.49% -> -0.11%, a Proxy set trap +1.27% -> +0.66% (the call to insert's split
+half, below), constructors (`new C(i)`) +0.48% -> +0.58%, a Proxy get trap +0.31% -> +0.31%, WeakMap
+gets -0.85% -> -0.86%. Splitting Props::insert's named-entry half into a function (for the test-only
+mutable escape) cost property stores a call; forcing it back in line (inline(always)) left a stale
+pointer in a native frame, which the conservative stack scan kept alive
+(payload_cell_tests::a_long_string_held_only_by_a_property_lives_and_dies_with_it and
+jit::rooting_tests::context_return_slot_is_a_root failed, on zombie and once on Crystal), so
+90512397 merges the halves back as they were before 2c and the escape moves a word with a
+non-configurable define instead.
+
+Against the design above, five choices were made in the code; each is the owner's to overrule:
+- ForInKeys' keys are plain words, not named entries: no script reaches that object, so its
+  descriptors are unobservable, and a word is half an entry.
+- The remembered record (traced length and a dirty bit per 64 words, for blocks over 64 words)
+  lives inside the block, after its last word, instead of in a side record the owner reports:
+  one block, and every write through Words::set marks its block. Growth that keeps indices
+  keeps the record, as PackedBuffer's deque growth kept its own; shift, unshift, reverse,
+  clones and whole-map moves trace everything next. Numbers and holes never mark a block.
+- Repeated unshifts keep front room of the used words (SpiderMonkey's tryUnshiftDenseElements
+  reserves ahead the same way; P1's deque prepend reserved max(len, 8)): exact room would have
+  made them quadratic.
+- get_index answers a named element the slot map records (a non-plain element beside words,
+  a frozen array's elements), not only words: copy_numeric_array on a frozen array regressed
+  without it.
+- The loop regions' mirror mode becomes words mode. The preamble proves the receiver's words in
+  use, Numbers and hole-free (and int32 for int reads) by their kind bits, or else by a scan,
+  as P1's packed mirror preparation scanned (Props::reprove_words); a new KIND_SCANNED bit keeps
+  a failed proof from rescanning on every entry until a write could make a fact true again.
+  Region stores canonicalize NaN (a word is a Value's bits; a NaN payload must not read as a
+  tag). Classic storage (the TRUST_JS_DENSE_ELEMENTS=0 ablation, first writes far past the end,
+  frozen arrays, ordinary objects with index keys) runs its loops outside the region; step 3
+  removes the classic slot map and mirror anyway.
+
+Two bugs the tests found, fixed before landing: the chain's word read moved the word into the
+key's register before its number guard, so a bailout replayed `x[NaN]` (a string element read
+as NaN); and get_index stopped at an all-holes block beside named elements (frozen arrays).
+
+Checks at 90512397: rustfmt; clippy in the three landing configurations on Crystal and zombie
+(x86-64), and zombie's aarch64 cross clippy; the lib suite in full on Crystal (2,720) and zombie
+(2,529); the census, dumps and outputs were taken at c1fe1a65 (no later commit changes a template,
+JitLayout or a block's size); Octane at five runs and the fixtures give the parent's outputs (zlib's
+run count prints its heap array, which varies from run to run in the parent too); the classic
+ablation (TRUST_JS_DENSE_ELEMENTS=0) runs the fixtures with the parent's outputs.
+
+Element bytes (TRUST_JS_GC_CENSUS, each run's collection with the most array bytes; fat-LTO
+engines, Crystal):
+| | parent (32df6f1f) | words | model at the parent |
+| --- | --- | --- | --- |
+| Splay (minor) | 268,004 arrays, 120.07 MB | 268,036, 77.20 MB | 77.19 MB |
+| chai (minor) | 3,300, 2.69 MB | 3,207, 1.44 MB | 1.29 MB |
+| Djot (minor) | 1,410, 1.00 MB | 1,704, 0.78 MB | 0.50 MB |
+| React (minor) | 59, 0.21 MB | 31, 0.05 MB | 0.10 MB |
+| sustained (minor) | 36, 5.26 MB | 14, 1.92 MB | 2.63 MB |
+The collection each run picks differs between the engines (fewer collections with words: React
+17 to 10 minor ones, Djot 20 minor and a major to 17 minor), so the rows compare the largest
+array heaps, not one moment. Splay's words equal the model exactly: a cell and a 96-byte block
+per 10-element array, where the parent had the cell and a 256-byte sidecar.
+
+Instruction counts, fat-LTO engines from `git archive` exports (w3-i3b/build.sh), pinned to
+CPUs 10-13 with setarch -R and TRUST_JS_GC_PACING=0, median of 3; Octane at a fixed 5 runs:
+
+| | parent (32df6f1f) | words (90512397) | change |
+| --- | --- | --- | --- |
+| vue | 1,905.1 M | 1,909.9 M | +0.25% |
+| react | 356.5 M | 345.6 M | -3.06% |
+| djot | 689.2 M | 680.5 M | -1.27% |
+| chai | 88,567.4 M | 86,953.5 M | -1.82% |
+| richards | 142.0 M | 141.7 M | -0.17% |
+| deltablue | 297.4 M | 296.1 M | -0.45% |
+| crypto | 825.7 M | 762.1 M | -7.70% |
+| raytrace | 1,066.7 M | 1,067.5 M | +0.08% |
+| earley-boyer | 3,652.4 M | 3,637.3 M | -0.41% |
+| regexp | 317.3 M | 314.4 M | -0.89% |
+| splay | 2,023.9 M | 1,900.4 M | -6.10% |
+| navier-stokes | 664.0 M | 585.3 M | -11.85% |
+| pdfjs | 9,558.8 M | 8,572.5 M | -10.32% |
+| mandreel | 65,968.2 M | 65,899.0 M | -0.10% |
+| gbemu | 23,557.4 M | 23,402.2 M | -0.66% |
+| code-load | 487.6 M | 485.3 M | -0.47% |
+| box2d | 4,756.1 M | 4,712.2 M | -0.92% |
+| zlib | 55,240.2 M | 55,252.0 M | +0.02% |
+| typescript | 61,722.0 M | 60,982.0 M | -1.20% |
+
+Vue, Raytrace and zlib are the regressions, all small: Vue's JIT code is unchanged (its chunks
+dump identically), so its +0.25% is in Rust paths, of the kind the constructor and Proxy
+microbenchmarks above still show (each object's storage word more to initialize, copy and check);
+step 3, which retires the sidecar's slot map and mirror, works on the same paths. React and Djot
+run fewer collections (React 17 to 10 minor, Djot 20 minor and a major to 17 minor).
+
+Dumps: DenseStorage's third word moved Props' fields (rustc reordered them: the named entries from
+offset 0 to 0x48), so every chunk that reads a named field changes its immediates and the gate's
+hashes differ (React 12 of 12 chunks, Djot 155-160 of 163; Vue's 56 are identical). With
+load/store and add offsets masked as well (target/p2/w2c/maskcmp.py), React's chunks with element
+sites (6 of 12) and Djot's (72 of 163) differ, and all but two shrink (67,602 to 66,687 and
+676,596 to 675,862 words); Djot's two longer chunks grew in every instruction kind, calls included
+(another compile's content, not a template's).
