@@ -5768,3 +5768,75 @@ native-operation, count-guard, array-shift, array-length and word-block tests; T
 --tier=jit threshold 8 (53,575 of 53,575, the report identical to 2f17b229's), difftest (138
 agree, 12 skipped, as at 2f17b229), the fixtures' masked outputs and Octane's at five runs as
 2f17b229's.
+
+### W2c step 7: integrity kinds and `length` at slot 0 (design, 2026-11-02)
+
+The owner approved W2c's remaining steps (2026-11-02, "all approved"), with the W2c design's
+open questions 2 (SEALED and FROZEN as kinds) and 6 (`length` in the elements header) as
+recommended. The second does not transfer as written; below.
+
+What the exemplars do (V8 c8b709085e21, SpiderMonkey bf75471716c5, JSC 260278048486; the files
+in target/p2/w3-design/v8-src, target/p2/w2c4/exemplars, target/p2/w2c7/exemplars):
+- Integrity. V8 keeps frozen and sealed elements dense as elements kinds in the map
+  (PACKED/HOLEY_{NONEXTENSIBLE,SEALED,FROZEN}, elements-kind.h:109-119; Map::CopyForPrevent-
+  Extensions, map.cc:1942-2008), each element's attributes implied by the kind (lookup.cc:
+  1438-1443); its store ICs take the frozen kinds slow and never grow the others
+  (builtins-handler-gen.cc:197-208, ic.cc:2915-2945). SpiderMonkey keeps them dense with
+  NOT_EXTENSIBLE, SEALED and FROZEN in the elements header and FrozenElements in the shape
+  ("to simplify JIT code"; NativeObject.h:199-243), leaves its shared empty header unflagged
+  (NativeObject.cpp:106-158), and shrinks capacity to the initialized length when an array becomes
+  non-extensible or gets a read-only length, so the append's capacity test refuses it ("in JIT
+  code every check counts", NativeObject.cpp:1087-1093; Array.cpp:915-931). JSC moves every
+  element into a sparse map (enterDictionaryIndexingMode, JSObject.cpp:2949-2966), which is
+  TRust JS's present way: a frozen array's elements leave the words for named entries, so
+  reads go through the key index and freezing is a define per element.
+- `length`. V8 keeps it in a JSArray field with descriptor 0 always `length`, which it relies on
+  ("nonconfigurable, hence ... guaranteed to stay the first property", array.tq:66-85;
+  MayHaveReadOnlyLength reads descriptor 0, objects-inl.h:873-898). SpiderMonkey's elements header
+  holds it (NativeObject.h:245-282) and JSC's IndexingHeader its publicLength (IndexingHeader.h:
+  120-127): both can, because every array with a nonzero or read-only length owns its header
+  (SpiderMonkey's arrays have fixed elements, ArrayObject-inl.h:35-46; JSC allocates storage
+  for any nonzero length, JSArray.cpp:1307-1323). TRust JS's arrays without elements share one
+  static empty block, which cannot hold `new Array(10)`'s length: the header does not transfer.
+
+Design:
+7b. `length` at slot 0 (V8's descriptor 0). Every Array's first named entry is its `length`, as
+   ArrayCreate and %Array.prototype%'s setup already make it; it is non-configurable, so it is
+   never removed, and a removal before it cannot happen. The invariant is asserted where the
+   slot is resolved (Props::length_property, debug builds), and the two appends in generated
+   code (the map/filter append and step 4's) read the entry at slot 0 directly: no memo load,
+   no empty-memo branch, no slot arithmetic, and no accessor test (a non-configurable data
+   property stays one). Its value is always a Number (ArraySetLength), which the template's
+   test keeps. The census put 21 of the map/filter append's ~75 instructions in finding and
+   checking `length`.
+7a. SEALED and FROZEN as kinds over the words (SpiderMonkey's header flags, V8's kinds): two
+   bits in the header's flags, set on a block the object owns (never the static one; an empty
+   array has nothing to overwrite or delete, and non-extensibility, which both imply, refuses
+   every creation). SetIntegrityLevel sets them in one step for an object whose index keys are
+   all plain words, instead of a define per element; the named entries (with `length`) take the
+   per-key defines as before. A word's descriptor reports them (Element: writable unless
+   FROZEN, configurable unless either). Writes keep them: the value facts' updates mask only
+   those bits (Words::note, reprove), and every path that changes a word other than by an
+   overwrite (pop, shift, unshift, splice, truncation, reordering, the batch edits behind
+   plain_elements_mut) stands down for either bit, so the generic, descriptor-checked algorithm
+   runs; an overwrite stands down for FROZEN, in Rust (set_index_value) and in generated code
+   (the Number overwrite at the site and the shared stub, one bit test; a loop chain's
+   preamble refuses a frozen receiver it stores to). A define that changes one element's
+   attributes moves that element to a named entry with its implied attributes written out (the
+   V8 13.6 bug the research observed: a sealed array normalized with default attributes, so
+   isSealed answered false and a delete succeeded). TestIntegrityLevel reads the bits. Integrity
+   is one-way: the bits are never cleared.
+   SpiderMonkey's capacity trim is not needed for correctness here (the creation sequence
+   already tests extensibility and `length`'s writability) and is left out.
+
+Order: 7b, then 7a, each measured against its parent. Tests: arrays from every creation path
+(literals, ArrayCreate, species, Array.prototype, subclasses, JSON) keep `length` at slot 0;
+frozen and sealed arrays' reads, overwrites, defines, deletes, truncation, every Array.prototype
+method that writes (sort, reverse, fill, copyWithin, splice, push, pop, shift, unshift) in every
+tier, descriptors and key order, and the re-define of one element; Test262's Object.freeze,
+Object.seal, Object.isFrozen, Object.isSealed and Array suites, difftest, GC stress.
+
+Predicted: React about -1% to -2% (its appends' `length`), the map/filter appends elsewhere a few
+instructions each; freezing an array O(1) in its elements, and a frozen array's reads as fast as
+an unfrozen one's (outside the acceptance workloads, which freeze no arrays but tagged templates'
+strings).
