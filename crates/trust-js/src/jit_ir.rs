@@ -243,6 +243,29 @@ pub(crate) struct RegionIr {
     pub(crate) n_slots: usize,
 }
 
+/// [`RegionIr::incoming_edges`]: each block's incoming edges in one array.
+struct IncomingEdges {
+    position: Vec<u32>,
+    start: Vec<u32>,
+    edges: Vec<(u32, u32)>,
+}
+
+impl IncomingEdges {
+    /// The edges into the block at `index` in `RegionIr::blocks`.
+    fn edges_into(&self, index: usize) -> &[(u32, u32)] {
+        &self.edges[self.start[index] as usize..self.start[index + 1] as usize]
+    }
+
+    /// The index in `RegionIr::blocks` of a CFG block inside the region.
+    fn block(&self, id: BlockId) -> Option<usize> {
+        self.position
+            .get(id.index())
+            .copied()
+            .filter(|&index| index != u32::MAX)
+            .map(|index| index as usize)
+    }
+}
+
 /// One function-wide budget, including rejected candidates. Dense loop membership is built
 /// once; nested-loop metadata and repeated unsuccessful frontiers cannot cause quadratic
 /// unbounded work. Running out retains the complete baseline templates.
@@ -848,6 +871,7 @@ impl RegionIr {
     /// appear in edge maps for precise bailout, but that does not make dead initial values
     /// semantic inputs. In particular fresh inlined parameters are assigned before use.
     pub(crate) fn live_entry_locals(&self) -> Vec<bool> {
+        let incoming = self.incoming_edges();
         let mut live = vec![false; self.n_slots];
         let mut visited = vec![false; self.values.len()];
         let mut work: Vec<_> = self
@@ -863,25 +887,75 @@ impl RegionIr {
             match self.values[value.index()].def {
                 ValueDef::RegionInput(FrameLoc::Local(slot)) => live[slot as usize] = true,
                 ValueDef::BlockParam { block, loc } => {
-                    let Some(target) = self.blocks.iter().find(|b| b.cfg_block == block) else {
+                    let Some(target) = incoming.block(block) else {
                         continue;
                     };
-                    let Some(index) = target.params.iter().position(|(home, _)| *home == loc)
+                    let Some(index) = self.blocks[target]
+                        .params
+                        .iter()
+                        .position(|(home, _)| *home == loc)
                     else {
                         continue;
                     };
-                    work.extend(
-                        self.blocks
-                            .iter()
-                            .flat_map(|b| &b.successors)
-                            .filter(|edge| edge.target == block)
-                            .map(|edge| edge.args[index]),
-                    );
+                    work.extend(incoming.edges_into(target).iter().map(|&(pred, edge)| {
+                        self.blocks[pred as usize].successors[edge as usize].args[index]
+                    }));
                 }
                 _ => {}
             }
         }
         live
+    }
+
+    /// Where each CFG block sits in `blocks` (`u32::MAX` for a block outside the region), and
+    /// each region block's incoming edges as (its predecessor's index in `blocks`, the edge's
+    /// index in that block's successors), in the order a walk of every block's successors
+    /// meets them. A pass over block parameters then reads the edges into each block instead
+    /// of every edge of the region for each parameter: every block has a parameter for every
+    /// local, so that walk was cubic in the region's size (9% of DeltaBlue's instructions).
+    fn incoming_edges(&self) -> IncomingEdges {
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|block| block.cfg_block.index() + 1)
+            .max()
+            .unwrap_or(0);
+        let mut position = vec![u32::MAX; blocks];
+        for (index, block) in self.blocks.iter().enumerate() {
+            position[block.cfg_block.index()] = index as u32;
+        }
+        let target = |edge: &IrEdge| {
+            position
+                .get(edge.target.index())
+                .copied()
+                .filter(|&target| target != u32::MAX)
+        };
+        // One array for every block's edges (counted, then placed in walk order).
+        let mut start = vec![0u32; self.blocks.len() + 1];
+        for edge in self.blocks.iter().flat_map(|block| &block.successors) {
+            if let Some(target) = target(edge) {
+                start[target as usize + 1] += 1;
+            }
+        }
+        for index in 1..start.len() {
+            start[index] += start[index - 1];
+        }
+        let mut next = start.clone();
+        let mut edges = vec![(0u32, 0u32); start[self.blocks.len()] as usize];
+        for (pred, block) in self.blocks.iter().enumerate() {
+            for (index, edge) in block.successors.iter().enumerate() {
+                if let Some(target) = target(edge) {
+                    let slot = &mut next[target as usize];
+                    edges[*slot as usize] = (pred as u32, index as u32);
+                    *slot += 1;
+                }
+            }
+        }
+        IncomingEdges {
+            position,
+            start,
+            edges,
+        }
     }
 
     fn remove_trivial_params(&mut self) {
@@ -894,22 +968,26 @@ impl RegionIr {
             }
             id
         };
+        let incoming_edges = self.incoming_edges();
 
         // Non-header parameters with one effective incoming value are aliases, not phis.  A few
         // rounds handle chains of single-predecessor blocks without retaining redundant nodes.
         for _ in 0..self.blocks.len().max(1) {
             let mut changed = false;
-            for block in &self.blocks {
+            for (index, block) in self.blocks.iter().enumerate() {
                 if block.cfg_block == self.header {
                     continue;
                 }
                 for (param_idx, &(_, param)) in block.params.iter().enumerate() {
-                    let mut incoming = self
-                        .blocks
+                    let mut incoming = incoming_edges
+                        .edges_into(index)
                         .iter()
-                        .flat_map(|pred| &pred.successors)
-                        .filter(|edge| edge.target == block.cfg_block)
-                        .filter_map(|edge| edge.args.get(param_idx).copied())
+                        .filter_map(|&(pred, edge)| {
+                            self.blocks[pred as usize].successors[edge as usize]
+                                .args
+                                .get(param_idx)
+                                .copied()
+                        })
                         .map(|id| canonical(id, &replacement));
                     let Some(first) = incoming.next() else {
                         continue;
