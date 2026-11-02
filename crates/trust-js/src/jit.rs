@@ -11255,6 +11255,7 @@ fn emit_update_elem_inline(
     emit_words_base(a, layout, 11, 15, 14);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
+    emit_words_frozen_guard(a, layout, 15, 16, slow);
     a.add_shifted(17, 15, 9, 3);
     a.ldr_imm(16, 17, 0);
     emit_exec_number_guard(a, 16, 5, 13, slow);
@@ -14432,6 +14433,7 @@ fn emit_word_store(
     a.b_cond(C_EQ, rest);
     emit_exec_word_load(a, 13, 20, -8);
     emit_exec_number_guard(a, 13, 1, 16, rest);
+    emit_words_frozen_guard(a, layout, 15, 16, slow);
     // --- commit: the Number's word, then the kind bits; the other stores rejoin here ---
     a.str_x_lsl3(13, 15, 9);
     emit_word_number_kind(a, layout, 15, 1, 12, 13, 14, 2);
@@ -14488,6 +14490,7 @@ fn emit_word_store_body(
     a.mov_imm64(13, crate::value::PACK_EMPTY);
     a.cmp_reg_x(12, 13);
     a.b_cond(C_EQ, create);
+    emit_words_frozen_guard(a, layout, 15, 16, slow);
     emit_exec_word_load(a, 13, 20, -8);
     emit_exec_number_guard(a, 13, 1, 16, other);
     // --- commit: the Number's word, then the kind bits ---
@@ -14512,6 +14515,29 @@ fn emit_word_store_body(
     a.b(stored);
     a.bind(create);
     emit_word_create(a, layout, slow, stored);
+}
+
+/// Branch to `slow` when the words at x`words` are frozen elements (W2c step 7a: a frozen
+/// block's words take no write; a sealed one's take overwrites). Clobbers x`t` and NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_words_frozen_guard(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    words: u32,
+    t: u32,
+    slow: usize,
+) {
+    a.ldur_w(t, words, -(layout.words_flags as i32));
+    a.logic_imm_w(
+        0,
+        t,
+        t,
+        asm::logical_imm_w(crate::value::word_block::KIND_FROZEN).unwrap(),
+    );
+    a.cbnz(t, false, slow);
 }
 
 /// Branch to `slow` when the operand word x`value`, stored as an element, would be a hole:
@@ -16364,10 +16390,12 @@ fn emit_chain_marked(
                 a.b_cond(C_HS, guard!());
                 a.ldr_x_lsl3(12, 15, 9);
                 if is_set {
-                    // An existing element: a hole store would create a property.
+                    // An existing element: a hole store would create a property, and a frozen
+                    // one takes no write.
                     a.mov_imm64(14, crate::value::PACK_EMPTY);
                     a.cmp_reg_x(12, 14);
                     a.b_cond(C_EQ, guard!());
+                    emit_words_frozen_guard(a, layout, 15, 14, guard!());
                     // The Number's word, its NaN the canonical one.
                     a.add_shifted(13, 15, 9, 3);
                     emit_exec_number_store(a, dv, 13, 0, 14);
@@ -18257,7 +18285,9 @@ fn emit_loop_chain(
             // proof was): a failed proof sends execution to the plain loop, whose back edge
             // enters here again, so an unbounded scan of a large holey receiver whose holes
             // the loop fills (each fill withdraws the scan) would cost its length an iteration.
-            use crate::value::word_block::{KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS, KIND_SCANNED};
+            use crate::value::word_block::{
+                KIND_FROZEN, KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS, KIND_SCANNED,
+            };
             if words_inlinable(layout) {
                 let mut need = KIND_NUMBERS | KIND_NO_HOLES;
                 if rp.int_reads {
@@ -18298,6 +18328,10 @@ fn emit_loop_chain(
                 a.cmp_imm_w(14, need);
                 a.b_cond(C_NE, pre_fail);
                 a.bind(ready);
+                // A frozen receiver's words take no store (W2c step 7a); the chain's stores
+                // assume writable elements, so a frozen receiver takes the plain loop.
+                a.logic_imm_w(0, 14, 13, asm::logical_imm_w(KIND_FROZEN).unwrap());
+                a.cbnz(14, false, pre_fail);
             } else {
                 a.b(pre_fail);
             }

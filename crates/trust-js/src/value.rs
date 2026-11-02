@@ -5315,7 +5315,10 @@ pub enum TaIndex {
 /// needs to own or store it.
 #[derive(Clone, Copy)]
 pub(crate) enum Element<'a> {
-    Word(Value),
+    /// A word and its block's integrity bits ([`word_block::KIND_SEALED`],
+    /// [`word_block::KIND_FROZEN`]): a word is an enumerable data element, writable unless frozen
+    /// and configurable unless sealed (W2c step 7a).
+    Word(Value, u32),
     Entry(&'a Property),
 }
 
@@ -5328,7 +5331,10 @@ impl<'a> Element<'a> {
     #[inline]
     pub(crate) fn to_property(self) -> Property {
         match self {
-            Element::Word(value) => Property::plain(value),
+            Element::Word(value, 0) => Property::plain(value),
+            Element::Word(value, integrity) => {
+                Property::data(value, integrity & word_block::KIND_FROZEN == 0, true, false)
+            }
             Element::Entry(property) => property.clone(),
         }
     }
@@ -5337,7 +5343,7 @@ impl<'a> Element<'a> {
     pub(crate) fn as_entry(self) -> &'a Property {
         match self {
             Element::Entry(property) => property,
-            Element::Word(_) => panic!("a word element has no entry"),
+            Element::Word(..) => panic!("a word element has no entry"),
         }
     }
     #[inline]
@@ -5347,42 +5353,42 @@ impl<'a> Element<'a> {
     #[inline]
     pub(crate) fn writable(self) -> bool {
         match self {
-            Element::Word(_) => true,
+            Element::Word(_, integrity) => integrity & word_block::KIND_FROZEN == 0,
             Element::Entry(property) => property.writable(),
         }
     }
     #[inline]
     pub(crate) fn enumerable(self) -> bool {
         match self {
-            Element::Word(_) => true,
+            Element::Word(..) => true,
             Element::Entry(property) => property.enumerable(),
         }
     }
     #[inline]
     pub(crate) fn configurable(self) -> bool {
         match self {
-            Element::Word(_) => true,
+            Element::Word(_, integrity) => integrity == 0,
             Element::Entry(property) => property.configurable(),
         }
     }
     #[inline]
     pub(crate) fn value(self) -> Value {
         match self {
-            Element::Word(value) => value,
+            Element::Word(value, _) => value,
             Element::Entry(property) => property.value(),
         }
     }
     #[inline]
     pub(crate) fn number_value(self) -> Option<f64> {
         match self {
-            Element::Word(value) => value.number(),
+            Element::Word(value, _) => value.number(),
             Element::Entry(property) => property.number_value(),
         }
     }
     #[inline]
     pub(crate) fn holds_object(self, expected: *const RefCell<Object>) -> bool {
         match self {
-            Element::Word(value) => value
+            Element::Word(value, _) => value
                 .as_obj()
                 .is_some_and(|object| std::ptr::eq(Gc::as_ptr(&object), expected)),
             Element::Entry(property) => property.holds_object(expected),
@@ -5391,14 +5397,14 @@ impl<'a> Element<'a> {
     #[inline]
     pub(crate) fn getter(self) -> Option<&'a Value> {
         match self {
-            Element::Word(_) => None,
+            Element::Word(..) => None,
             Element::Entry(property) => property.getter(),
         }
     }
     #[inline]
     pub(crate) fn setter(self) -> Option<&'a Value> {
         match self {
-            Element::Word(_) => None,
+            Element::Word(..) => None,
             Element::Entry(property) => property.setter(),
         }
     }
@@ -7739,8 +7745,10 @@ impl Props {
     /// it (only with `has_far`); `None` when the map has no such own property.
     #[inline]
     pub(crate) fn get_index(&self, n: u32) -> Option<Element<'_>> {
-        if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
-            return Some(Element::Word(value));
+        if let Some(words) = self.elems.words() {
+            if let Some(value) = words.get(n as usize) {
+                return Some(Element::Word(value, words.integrity()));
+            }
         }
         if !self.has_far.get() {
             return None;
@@ -7754,7 +7762,11 @@ impl Props {
     /// generic path.
     #[inline]
     pub(crate) fn set_index_value(&mut self, n: u32, v: Value) -> Result<(), Value> {
-        if let Some(words) = self.elems.words_mut() {
+        if let Some(words) = self
+            .elems
+            .words_mut()
+            .filter(|words| words.integrity() & word_block::KIND_FROZEN == 0)
+        {
             // An existing word only: a hole is an absent element (the prototype chain's, or a
             // named entry's after a non-plain define), which the caller's slow path handles.
             if words.get(n as usize).is_none() {
@@ -7787,6 +7799,9 @@ impl Props {
     /// (words are not in it). `Err` (nothing changed) when the gates don't hold; the caller runs
     /// the generic path. Array validation (length, extensibility) stays at the caller.
     pub(crate) fn try_append_element(&mut self, n: u32, prop: Property) -> Result<(), Property> {
+        if self.word_integrity() != 0 {
+            return Err(prop);
+        }
         if n == 0 && prop.is_plain_element() && self.can_start_packed_elements(0) {
             self.note_structural();
             self.start_packed_elements(0, prop);
@@ -7817,7 +7832,7 @@ impl Props {
             self.start_packed_elements(n as usize, prop);
             return Ok(());
         }
-        if self.has_far.get() || !prop.is_plain_element() {
+        if self.has_far.get() || !prop.is_plain_element() || self.word_integrity() != 0 {
             return Err(prop);
         }
         let Some(words) = self.elems.words() else {
@@ -7848,7 +7863,7 @@ impl Props {
     /// change (words are not in the shape). `Some(value)` = removed; `None` = gates failed,
     /// nothing changed, caller goes generic.
     pub(crate) fn pop_last_element(&mut self, n: u32) -> Option<Value> {
-        if self.has_far.get() || !self.elem_mode.get() {
+        if self.has_far.get() || !self.elem_mode.get() || self.word_integrity() != 0 {
             return None;
         }
         let words = self.elems.words()?;
@@ -7883,7 +7898,12 @@ impl Props {
     /// indexed properties): its effect is then exactly the edited list. The caller records the
     /// new length with [`Self::set_array_length_value`]. `None` changes nothing.
     pub(crate) fn plain_elements_mut(&mut self, len: usize) -> Option<&mut word_block::Words> {
-        if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
+        if len == 0
+            || len > u32::MAX as usize
+            || !self.elem_mode.get()
+            || self.has_far.get()
+            || self.word_integrity() != 0
+        {
             return None;
         }
         let length = self.length_property()?;
@@ -7915,7 +7935,12 @@ impl Props {
         len: usize,
         holes_read_absent: bool,
     ) -> Option<Value> {
-        if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
+        if len == 0
+            || len > u32::MAX as usize
+            || !self.elem_mode.get()
+            || self.has_far.get()
+            || self.word_integrity() != 0
+        {
             return None;
         }
         let length = self.length_property()?;
@@ -7951,7 +7976,7 @@ impl Props {
         else {
             return false;
         };
-        if !self.elem_mode.get() || self.has_far.get() {
+        if !self.elem_mode.get() || self.has_far.get() || self.word_integrity() != 0 {
             return false;
         }
         let Some(length) = self.length_property() else {
@@ -8242,10 +8267,26 @@ impl Props {
             if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
                 // The escape may change the element's attributes, which a word does not keep:
                 // the element leaves for the named entries first, as a non-plain one does (a
-                // non-configurable define moves it), then takes back its plain attributes.
-                self.insert(PropKey::index(n), Property::data(value, true, true, false));
-                let slot = self.find(PropKey::index(n)).expect("the moved element");
-                self.entries.fields[slot].set_configurable(true);
+                // non-configurable define moves it), then takes back its plain attributes. A
+                // sealed or frozen element leaves with its implied ones (W2c step 7a).
+                let integrity = self.word_integrity();
+                if integrity == 0 {
+                    self.insert(PropKey::index(n), Property::data(value, true, true, false));
+                    let slot = self.find(PropKey::index(n)).expect("the moved element");
+                    self.entries.fields[slot].set_configurable(true);
+                } else {
+                    self.note_structural();
+                    self.elems.words_mut().unwrap().move_out(n as usize);
+                    self.insert(
+                        PropKey::index(n),
+                        Property::data(
+                            value,
+                            integrity & word_block::KIND_FROZEN == 0,
+                            true,
+                            false,
+                        ),
+                    );
+                }
             }
         }
         match self.find_text(text) {
@@ -8523,7 +8564,36 @@ impl Props {
             // An index a named entry already holds keeps it there (replaced below), so no
             // element is ever stored twice.
             let named = self.has_far.get() && self.find(key).is_some();
-            if prop.is_plain_element() && !named {
+            let integrity = self.word_integrity();
+            let sealed_word = integrity != 0
+                && !named
+                && self
+                    .elems
+                    .words()
+                    .is_some_and(|words| words.get(n).is_some());
+            if sealed_word {
+                // An element of a sealed or frozen block (W2c step 7a). A define that keeps its
+                // implied attributes (enumerable data, non-configurable, writable unless frozen)
+                // changes at most its value (a frozen one's not at all: the caller found the
+                // values the same); any other moves it to a named entry with the attributes the
+                // define gives in full (V8 13.6 normalized a sealed array's elements with default
+                // attributes, so it stopped being sealed).
+                debug_assert!(!prop.is_empty(), "a sealed element is deleted");
+                let frozen = integrity & word_block::KIND_FROZEN != 0;
+                if !prop.accessor()
+                    && prop.enumerable()
+                    && !prop.configurable()
+                    && prop.writable() != frozen
+                {
+                    if !frozen {
+                        self.note_structural();
+                        self.elems.words_mut().unwrap().set(n, prop.into_value());
+                    }
+                    return;
+                }
+                self.note_structural();
+                self.elems.words_mut().unwrap().move_out(n);
+            } else if prop.is_plain_element() && !named {
                 if n < len {
                     self.note_structural();
                     self.elems.words_mut().unwrap().set(n, prop.into_value());
@@ -8539,7 +8609,7 @@ impl Props {
             } else if n < len {
                 // A non-plain element leaves the words for the named entries, its word a hole
                 // (W2c's design 3, SpiderMonkey's indexed properties); an absent one is a hole.
-                self.elems.words_mut().unwrap().set(n, Value::Empty);
+                self.elems.words_mut().unwrap().move_out(n);
                 if prop.is_empty() && !named {
                     self.note_structural();
                     return;
@@ -8670,6 +8740,7 @@ impl Props {
     pub(crate) fn remove_key(&mut self, key: PropKey) -> bool {
         if let (Some(n), Some(words)) = (key.as_index(), self.elems.words()) {
             if words.get(n as usize).is_some() {
+                debug_assert!(words.integrity() == 0, "a sealed element is deleted");
                 self.note_structural();
                 self.elems
                     .words_mut()
@@ -8779,8 +8850,9 @@ impl Props {
 
     /// Every live property value, including keyless packed elements (for GC tracing).
     pub(crate) fn values(&self) -> impl Iterator<Item = Element<'_>> {
+        let integrity = self.word_integrity();
         self.word_values()
-            .map(Element::Word)
+            .map(move |value| Element::Word(value, integrity))
             .chain(self.entries.fields.iter().map(Element::entry))
     }
 
@@ -8801,16 +8873,31 @@ impl Props {
     /// for OrdinarySet / indexed Get must not mistake a packed descriptor for
     /// an absent property. Named iteration intentionally excludes packed elements.
     pub(crate) fn indexed_properties(&self) -> impl Iterator<Item = Element<'_>> {
-        self.word_values().map(Element::Word).chain(
-            self.entries
-                .iter()
-                .filter_map(|(key, property)| key.as_index().map(|_| Element::entry(property))),
-        )
+        let integrity = self.word_integrity();
+        self.word_values()
+            .map(move |value| Element::Word(value, integrity))
+            .chain(
+                self.entries
+                    .iter()
+                    .filter_map(|(key, property)| key.as_index().map(|_| Element::entry(property))),
+            )
     }
 
     /// The highest non-configurable index at or past `from`: always a named entry's, since a
     /// word is a configurable element.
     pub(crate) fn highest_nonconfig_index_from(&self, from: usize) -> Option<usize> {
+        // A sealed or frozen block's present words are non-configurable elements too.
+        let word = self
+            .elems
+            .words()
+            .filter(|words| words.integrity() != 0)
+            .and_then(|words| {
+                words
+                    .as_slice()
+                    .iter()
+                    .rposition(|&word| word != PACK_EMPTY)
+                    .filter(|&n| n >= from)
+            });
         self.entries
             .iter()
             .filter_map(|(k, p)| {
@@ -8819,13 +8906,43 @@ impl Props {
                     .flatten()
                     .filter(|&n| n >= from)
             })
+            .chain(word)
             .max()
     }
 
     pub(crate) fn integrity_ok(&self, frozen: bool) -> bool {
         let valid = |p: &Property| !p.configurable() && (!frozen || p.accessor() || !p.writable());
-        // A word is a configurable element, so no sealed or frozen map has one.
-        self.word_indices().next().is_none() && self.entries.iter().all(|(_, p)| valid(p))
+        // Present words are elements of the block's integrity level (W2c step 7a).
+        let need = if frozen {
+            word_block::KIND_FROZEN
+        } else {
+            word_block::KIND_SEALED
+        };
+        (self.word_integrity() & need != 0 || self.word_indices().next().is_none())
+            && self.entries.iter().all(|(_, p)| valid(p))
+    }
+
+    /// The element words' integrity bits, 0 for a map without words.
+    #[inline]
+    pub(crate) fn word_integrity(&self) -> u32 {
+        self.elems.words().map_or(0, word_block::Words::integrity)
+    }
+
+    /// SetIntegrityLevel's step for the element words of an object made non-extensible: every
+    /// word becomes a sealed (or frozen) element at once, as SpiderMonkey's elements flags and
+    /// V8's elements kinds make them, where a define per element moved each to a named entry.
+    /// The named entries take their defines as before.
+    pub(crate) fn seal_elements(&mut self, freeze: bool) {
+        if self.elems.words().is_some() {
+            self.note_structural();
+        }
+        if let Some(words) = self.elems.words_mut() {
+            words.set_integrity(if freeze {
+                word_block::KIND_INTEGRITY
+            } else {
+                word_block::KIND_SEALED
+            });
+        }
     }
 }
 

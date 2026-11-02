@@ -642,3 +642,122 @@ fn every_array_keeps_length_at_slot_zero() {
         );
     }
 }
+
+/// W2c step 7a: a frozen or sealed array keeps its element words, with the integrity level in
+/// the block's flags; every operation keeps the specification's results in every tier.
+#[test]
+fn frozen_and_sealed_arrays_keep_their_words_and_their_semantics() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let run = |engine: &mut Engine, source: &str| match engine.eval(source, false).unwrap() {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}\n{source}"),
+        };
+        let result = run(
+            &mut engine,
+            r#"
+            function attempt(f) { try { f(); return 'ok'; } catch (e) { return e.name; } }
+            function strictStore(a, i, v) { 'use strict'; a[i] = v; }
+            var out = [];
+            var f = Object.freeze([1, 2, 3]);
+            f[0] = 9; f[5] = 9;
+            var d = Object.getOwnPropertyDescriptor(f, 1);
+            out.push(Object.isFrozen(f), Object.isSealed(f), f.join(), f.length,
+                     d.writable, d.enumerable, d.configurable, delete f[1], Object.keys(f).join());
+            out.push(attempt(function () { strictStore(f, 0, 9); }),
+                     attempt(function () { f.push(4); }), attempt(function () { f.pop(); }),
+                     attempt(function () { f.shift(); }), attempt(function () { f.unshift(0); }),
+                     attempt(function () { f.reverse(); }), attempt(function () { f.sort(); }),
+                     attempt(function () { f.fill(0); }), attempt(function () { f.copyWithin(0, 1); }),
+                     attempt(function () { f.splice(0, 1); }), attempt(function () { f.length = 0; }),
+                     attempt(function () { Object.defineProperty(f, 0, { value: 9 }); }),
+                     attempt(function () { Object.defineProperty(f, 0, { value: 1 }); }), f.join());
+            var s = Object.seal([3, 1, 2]);
+            s[0] = 5;
+            out.push(Object.isSealed(s), Object.isFrozen(s), s.join(), delete s[0],
+                     attempt(function () { s.push(4); }), attempt(function () { s.pop(); }),
+                     attempt(function () { s.sort(); }), s.join(), attempt(function () { s.reverse(); }),
+                     s.join(), attempt(function () { s.fill(7, 2); }), s.join(),
+                     attempt(function () { s.length = 0; }), s.length, s.join());
+            Object.defineProperty(s, 1, { writable: false });
+            var e = Object.getOwnPropertyDescriptor(s, 1);
+            s[1] = 0; s[0] = 8;
+            out.push(e.writable, e.configurable, Object.isSealed(s), Object.isFrozen(s), delete s[1],
+                     s.join(), Object.keys(s).join());
+            var h = [1, , 3]; Object.freeze(h);
+            out.push(1 in h, h.length, Object.isFrozen(h), JSON.stringify(f));
+            out.join('|')
+        "#,
+        );
+        assert_eq!(
+            result,
+            // Node 24 prints the same (a sloppy `length` store that fails reports no error).
+            "true|true|1,2,3|3|false|true|false|false|0,1,2|\
+             TypeError|TypeError|TypeError|TypeError|TypeError|TypeError|TypeError|TypeError|\
+             TypeError|TypeError|ok|TypeError|ok|1,2,3|\
+             true|false|5,1,2|false|TypeError|TypeError|ok|1,2,5|ok|5,2,1|ok|5,2,7|\
+             ok|3|5,2,7|\
+             false|false|true|false|false|8,2,7|0,1,2|\
+             false|3|true|[1,2,3]",
+            "{tier:?}"
+        );
+        // The representation: the words stay, with the integrity bits.
+        let global = Value::Obj(engine.interp.global);
+        for (name, bits) in [
+            ("f", word_block::KIND_INTEGRITY),
+            ("h", word_block::KIND_INTEGRITY),
+        ] {
+            let array = engine
+                .interp
+                .get_member_key(&global, name)
+                .unwrap_or_else(|_| panic!("{name}"))
+                .as_obj()
+                .unwrap();
+            let body = array.borrow();
+            assert!(
+                !body.props.has_far.get(),
+                "{tier:?} {name}: no named elements"
+            );
+            assert_eq!(body.props.word_integrity(), bits, "{tier:?} {name}");
+        }
+    }
+}
+
+/// Generated stores, increments and loop chains warmed on writable arrays leave a frozen one
+/// as it is (W2c step 7a's guard at every store into words).
+#[test]
+fn generated_code_never_writes_a_frozen_array() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let result = match engine
+        .eval(
+            r#"
+            function store(a, i, v) { a[i] = v; }
+            function storeKeep(a, i, v) { return a[i] = v; }
+            function bump(a, i) { a[i]++; }
+            function fill(a, n) { for (var i = 0; i < n; i++) a[i] = i * 2; return a; }
+            function scale(a, n) { for (var i = 0; i < n; i++) a[i] = a[i] * 3; return a; }
+            for (var w = 0; w < 50; w++) {
+                var t = [1, 2, 3, 4];
+                store(t, 1, 'x'); store(t, 2, 0.5); storeKeep(t, 3, {}); bump(t, 2);
+                fill([0, 0, 0, 0], 4); scale([1, 2, 3, 4], 4);
+            }
+            var f = Object.freeze([1, 2, 3, 4]);
+            store(f, 1, 'x'); store(f, 2, 0.5); var k = storeKeep(f, 3, 7); bump(f, 0);
+            fill(f, 4); scale(f, 4);
+            var s = Object.seal([1, 2, 3, 4]);
+            store(s, 1, 'x'); bump(s, 0); scale(s, 4);
+            [f.join(), k, s.join()].join('|')
+        "#,
+            false,
+        )
+        .unwrap()
+    {
+        Completion::Value(value) => value,
+        Completion::Throw { name, message } => panic!("{name}: {message}"),
+    };
+    assert_eq!(result, "1,2,3,4|7|6,NaN,9,12");
+}

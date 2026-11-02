@@ -2190,6 +2190,22 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         }
     }
     let proxy = proxy_pair(i, obj);
+    // An Array's or ordinary object's element words become sealed (or frozen) elements in one
+    // step (W2c step 7a; SpiderMonkey's elements flags, V8's elements kinds), so the defines
+    // below skip them: no trap or exotic [[DefineOwnProperty]] observes the order. Mapped
+    // arguments, String wrappers and objects with side-table behaviour keep a define per key.
+    let words_sealed = proxy.is_none() && {
+        let object = obj.as_obj().unwrap();
+        let plain = {
+            let body = object.borrow();
+            body.ic_plain.get()
+                && (matches!(body.exotic, crate::value::Exotic::Array) || body.exotic.is_ordinary())
+        };
+        if plain {
+            object.borrow_mut().props.seal_elements(freeze);
+        }
+        plain
+    };
     // A Symbol key's cell stays rooted while the traps below run.
     let mut key_roots = crate::rooting::ValueRoots::new();
     let keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = &proxy {
@@ -2200,12 +2216,20 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         }
         ks
     } else {
-        obj.as_obj()
-            .unwrap()
-            .borrow()
-            .props
+        let object = obj.as_obj().unwrap();
+        let body = object.borrow();
+        body.props
             .ordered_keys()
             .iter()
+            .filter(|k| {
+                !(words_sealed
+                    && k.as_index().is_some_and(|n| {
+                        matches!(
+                            body.props.get_index(n),
+                            Some(crate::value::Element::Word(..))
+                        )
+                    }))
+            })
             .map(|k| crate::value::PropertyKey::stored(k.text().to_string()))
             .collect()
     };

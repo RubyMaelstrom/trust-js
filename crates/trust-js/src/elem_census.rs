@@ -84,7 +84,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
     let mut visit = |element: Element<'_>| {
         elements += 1;
         let plain_attributes = match element {
-            Element::Word(_) => true,
+            Element::Word(..) => true,
             Element::Entry(property) => property.has_plain_element_attributes(),
         };
         if element.accessor() || !plain_attributes {
@@ -106,7 +106,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
         slots = words.len() as u64;
         for n in 0..words.len() {
             if let Some(value) = words.get(n) {
-                visit(Element::Word(value));
+                visit(Element::Word(value, words.integrity()));
             }
         }
     }

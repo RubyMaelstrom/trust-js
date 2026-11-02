@@ -323,7 +323,7 @@ fn holes_shift_in_words_once_the_caller_proves_them_absent() {
                 assert!(element.is_none());
             } else {
                 let element = element.unwrap();
-                assert!(matches!(element, Element::Word(_)));
+                assert!(matches!(element, Element::Word(..)));
                 assert_eq!(number(element.value()), (n + 1) as f64);
             }
         }
@@ -348,6 +348,6 @@ fn cloned_words_change_independently() {
         assert!(clone.shift_dense_array(length, false).is_none());
         assert!(!original.has_far.get());
         assert!(original.get_index(0).unwrap().writable());
-        assert!(matches!(original.get_index(0).unwrap(), Element::Word(_)));
+        assert!(matches!(original.get_index(0).unwrap(), Element::Word(..)));
     }
 }

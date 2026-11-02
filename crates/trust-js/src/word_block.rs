@@ -38,6 +38,14 @@ pub(crate) const KIND_ALL: u32 = KIND_NO_HOLES | KIND_NUMBERS | KIND_INT32;
 /// it), so a cleared kind bit is exact and another proof need not scan. Every write through
 /// [`Words::set`] and every removal clears it.
 pub(crate) const KIND_SCANNED: u32 = 1 << 3;
+/// The integrity levels (W2c step 7a; SpiderMonkey's elements flags, V8's elements kinds), not
+/// facts about the words' values but their elements' attributes: every element is
+/// non-configurable (SEALED), and also non-writable (FROZEN, which comes with SEALED). Set once
+/// on a block the object owns (never the static one), by SetIntegrityLevel; never cleared. A
+/// sealed block's words take overwrites only; a frozen one's take no write.
+pub(crate) const KIND_SEALED: u32 = 1 << 4;
+pub(crate) const KIND_FROZEN: u32 = 1 << 5;
+pub(crate) const KIND_INTEGRITY: u32 = KIND_SEALED | KIND_FROZEN;
 
 /// The 16 bytes before a block's first word. Generated code reads `used` at -16, `capacity` at
 /// -12 and `flags` at -4 from the words' address.
@@ -269,6 +277,21 @@ impl Words {
         }
     }
 
+    /// The integrity bits ([`KIND_SEALED`], [`KIND_FROZEN`]): every element's attributes.
+    #[inline]
+    pub(crate) fn integrity(&self) -> u32 {
+        self.header().flags & KIND_INTEGRITY
+    }
+
+    /// Give every element the integrity level `bits` (sealed, or frozen and sealed). The
+    /// static block has no element to describe and is never written.
+    pub(crate) fn set_integrity(&mut self, bits: u32) {
+        debug_assert!(bits == KIND_SEALED || bits == KIND_INTEGRITY);
+        if !self.is_static_empty() {
+            self.header_mut().flags |= bits;
+        }
+    }
+
     /// The kind bits of the used words.
     #[inline]
     pub(crate) fn kind(&self) -> u32 {
@@ -299,6 +322,10 @@ impl Words {
     /// Store `value` at `index`, below the used length, keeping the kind bits and the record.
     pub(crate) fn set(&mut self, index: usize, value: Value) {
         assert!(index < self.len(), "word index {index} past {}", self.len());
+        debug_assert!(
+            self.integrity() & KIND_FROZEN == 0,
+            "a frozen element is written"
+        );
         let word = value.bits();
         self.note(word);
         self.remember(index, word);
@@ -306,8 +333,19 @@ impl Words {
         unsafe { self.0.as_ptr().add(index).write(word) };
     }
 
+    /// Leave a hole at `index`, below the used length, as its element moves to a named entry
+    /// with attributes a word cannot keep (a define, or a descriptor escape). Not a write of the
+    /// element: a sealed or frozen block allows it (W2c step 7a).
+    pub(crate) fn move_out(&mut self, index: usize) {
+        assert!(index < self.len(), "word index {index} past {}", self.len());
+        self.note(PACK_EMPTY);
+        // SAFETY: a used word of a heap block (the static block has none).
+        unsafe { self.0.as_ptr().add(index).write(PACK_EMPTY) };
+    }
+
     /// Append `value`, growing the block when it is full.
     pub(crate) fn push(&mut self, value: Value) {
+        debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let len = self.len();
         if len == self.capacity() {
             self.reallocate(grown(len, 1), 0);
@@ -321,6 +359,7 @@ impl Words {
 
     /// Remove and return the last word (a hole's too).
     pub(crate) fn pop(&mut self) -> Option<u64> {
+        debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let len = self.len().checked_sub(1)?;
         let word = self.as_slice()[len];
         let header = self.header_mut();
@@ -332,6 +371,7 @@ impl Words {
 
     /// Remove and return the first word, leaving its room in front of the header.
     pub(crate) fn shift(&mut self) -> Option<u64> {
+        debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         if self.is_empty() {
             return None;
         }
@@ -356,6 +396,7 @@ impl Words {
 
     /// Insert `values` before the first word, in front room when there is enough.
     pub(crate) fn unshift(&mut self, values: &[Value]) {
+        debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let n = values.len();
         if n == 0 {
             return;
@@ -402,6 +443,10 @@ impl Words {
 
     /// Reverse the used words in place; their kind bits stay true.
     pub(crate) fn reverse(&mut self) {
+        debug_assert!(
+            self.integrity() & KIND_FROZEN == 0,
+            "a frozen element is written"
+        );
         let len = self.len();
         if len > 1 {
             // Words change places: the next trace reports them all.
@@ -421,6 +466,7 @@ impl Words {
         range: std::ops::Range<usize>,
         values: &[Value],
     ) -> Vec<Option<Value>> {
+        debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let len = self.len();
         assert!(
             range.start <= range.end && range.end <= len,
@@ -466,6 +512,14 @@ impl Words {
 
     /// Keep the first `len` words.
     pub(crate) fn truncate(&mut self, len: usize) {
+        debug_assert!(
+            self.integrity() == 0
+                || self
+                    .as_slice()
+                    .get(len..)
+                    .is_none_or(|tail| tail.iter().all(|&w| w == PACK_EMPTY)),
+            "a sealed block loses an element"
+        );
         if len < self.len() {
             let header = self.header_mut();
             header.used = len as u32;
@@ -476,6 +530,7 @@ impl Words {
 
     /// Lengthen to `len` words with holes after the used ones.
     pub(crate) fn resize_with_holes(&mut self, len: usize) {
+        debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let used = self.len();
         if len <= used {
             return;
@@ -522,7 +577,8 @@ impl Words {
     pub(crate) fn reprove(&mut self) -> u32 {
         let flags = self.computed_kind();
         if !self.is_static_empty() {
-            self.header_mut().flags = flags | KIND_SCANNED;
+            let integrity = self.integrity();
+            self.header_mut().flags = flags | KIND_SCANNED | integrity;
         }
         flags
     }
@@ -755,7 +811,7 @@ impl Words {
     #[inline]
     fn note(&mut self, word: u64) {
         let flags = self.header().flags;
-        let kept = flags & word_kind(word);
+        let kept = flags & (word_kind(word) | KIND_INTEGRITY);
         if kept != flags {
             self.header_mut().flags = kept;
         }
