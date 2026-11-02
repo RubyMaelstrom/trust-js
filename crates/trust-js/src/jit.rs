@@ -14670,16 +14670,12 @@ fn emit_word_create(
     a.b_cond(C_LO, hole);
     a.b_cond(C_NE, slow);
     // 5. An append: room for it (a full block, or the static empty one, grows in the helper),
-    //    and `length` (x17 = its entry, d4 = its Number), writable when x9 reaches it.
+    //    and `length` (x17 = its entry, slot 0, a data property: an Array's first entry, never
+    //    removed; d4 = its Number), writable when x9 reaches it.
     a.ldur_w(16, 15, -(layout.words_capacity as i32));
     a.cmp_reg_x(14, 16);
     a.b_cond(C_HS, slow);
-    slot_memo_load(a, layout, 12, 11, layout.obj_props + layout.props_len_slot);
-    slot_memo_branch_none(a, layout, 12, 16, slow);
     fields_data(a, layout, 17, 11);
-    a.mov_imm64(16, layout.entry_size as u64);
-    a.madd(17, 12, 16, 17);
-    guard_prop_data(a, 16, 17, layout.entry_accessor as u32, slow);
     a.ldur(16, 17, layout.entry_value as i32);
     emit_exec_number_guard(a, 16, 4, 12, slow);
     a.ucvtf_d_w(5, 9);
@@ -14880,7 +14876,6 @@ fn define_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
         ]
         .into_iter()
         .all(|off| off < 4096)
-        && slot_memo_fits(layout, props + layout.props_len_slot)
         && fields_data_fits(layout)
 }
 
@@ -14943,13 +14938,9 @@ fn emit_define_elem_inline(
     a.cbz(12, false, slow);
     a.ldrb_imm(12, 11, props + layout.props_has_far as u32);
     a.cbnz(12, false, slow);
-    // ... and has a memoized, writable data `length` holding a Number (x14 = entry, d1 = L).
-    slot_memo_load(a, layout, 12, 11, layout.obj_props + layout.props_len_slot);
-    slot_memo_branch_none(a, layout, 12, 15, slow);
+    // ... and has a writable `length` holding a Number (x14 = entry, d1 = L): its entry is slot
+    // 0, a data property (an Array's first entry, never removed; V8's descriptor 0).
     fields_data(a, layout, 14, 11);
-    a.mov_imm64(15, layout.entry_size as u64);
-    a.madd(14, 12, 15, 14);
-    guard_prop_data(a, 15, 14, layout.entry_accessor as u32, slow);
     guard_prop_writable(a, 15, 14, layout.entry_writable as u32, slow);
     a.ldur(15, 14, layout.entry_value as i32);
     emit_exec_number_guard(a, 15, 1, 16, slow);

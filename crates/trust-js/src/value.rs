@@ -1358,9 +1358,6 @@ pub struct JitLayout {
     pub obj_is_constructor: usize,
     pub obj_extensible: usize,
     pub props_shape: usize,
-    /// The named-entry slot memo of the own `length` key (`Props::len_slot`, a `SlotMemo`):
-    /// a slot number of `JitRepr::slot_memo_width` bytes, or `JitRepr::slot_memo_none`.
-    pub props_len_slot: usize,
     pub props_proto_flag: usize,
     /// `Props::elem_mode` and `Props::has_far` (`Cell<bool>` bytes): an Array's map whose
     /// canonical-index keys all live in element storage.
@@ -1513,10 +1510,6 @@ pub(crate) struct JitRepr {
     /// keeping the first binding in the environment cell. The source of `JitLayout`'s
     /// `scope_small_*` fields; `None` when the probe disagreed.
     pub(crate) scope_small: Option<crate::interpreter::JitBindingStorage>,
-    /// The width of a `SlotMemo` in bytes (2) and its "no slot" value (the width's all-ones),
-    /// both measured on live memos. A width other than 2 or 4 bytes reports 0.
-    pub(crate) slot_memo_width: usize,
-    pub(crate) slot_memo_none: u32,
     /// `Exotic::Collection`'s discriminant byte (a Map's or Set's data in the cell of an
     /// otherwise ordinary object).
     pub(crate) exotic_collection_tag: Option<u8>,
@@ -1537,7 +1530,6 @@ pub(crate) fn jit_repr() -> &'static JitRepr {
 }
 
 fn probe_jit_repr() -> JitRepr {
-    use std::mem::offset_of;
     // Named fields: an InlineVec keeping the first INLINE_NAMED_SLOTS in the cell, probed in
     // place and spilled.
     let props_fields = Fields::probe_jit_layout(|| Property::plain(Value::Num(0.0)));
@@ -1571,26 +1563,6 @@ fn probe_jit_repr() -> JitRepr {
     let exotic_ordinary_contiguous = collection_ok
         && exotic_collection_tag.is_none_or(|tag| none_tag.checked_add(1) == Some(tag));
 
-    // A SlotMemo's width and "no slot" value, read back from live memos (a `Props` memo cell is
-    // a transparent `Cell<SlotMemo>`).
-    let slot_memo_width = std::mem::size_of::<SlotMemo>();
-    let memo_props = Props::new();
-    let memo_word = |memo: SlotMemo| {
-        memo_props.len_slot.set(memo);
-        let at =
-            (&memo_props as *const Props as *const u8).wrapping_add(offset_of!(Props, len_slot));
-        match slot_memo_width {
-            2 => Some(u32::from(unsafe { at.cast::<u16>().read() })),
-            4 => Some(unsafe { at.cast::<u32>().read() }),
-            _ => None,
-        }
-    };
-    let slot_memo_none = memo_word(SlotMemo::NONE).unwrap_or(0);
-    let slot_memo_ok = memo_word(SlotMemo::of(5)) == Some(5)
-        && SlotMemo::of(5).slot() == Some(5)
-        && SlotMemo::NONE.slot().is_none()
-        && u64::from(slot_memo_none) + 1 == 1u64 << (8 * slot_memo_width);
-
     JitRepr {
         props_fields: props_fields.unwrap_or(JitVecLayout::Vec {
             ptr: 0,
@@ -1598,8 +1570,6 @@ fn probe_jit_repr() -> JitRepr {
             cap: 0,
         }),
         scope_small: Some(crate::interpreter::VarMap::jit_slots_layout()),
-        slot_memo_width: if slot_memo_ok { slot_memo_width } else { 0 },
-        slot_memo_none,
         exotic_collection_tag,
         exotic_ordinary_contiguous,
         valid: props_fields.is_some() && collection_ok,
@@ -1933,7 +1903,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         obj_is_constructor: offset_of!(Object, is_constructor),
         obj_extensible: offset_of!(Object, extensible),
         props_shape: offset_of!(Props, shape),
-        props_len_slot: offset_of!(Props, len_slot),
         props_proto_flag: offset_of!(Props, proto_flag),
         props_elem_mode: offset_of!(Props, elem_mode),
         props_has_far: offset_of!(Props, has_far),
@@ -7652,9 +7621,19 @@ impl Props {
         let length = crate::atom::names::LENGTH.key();
         if let Some(s) = self.len_slot.get().slot() {
             debug_assert!(matches!(self.entries.get(s), Some((k, _)) if k == length));
+            debug_assert!(
+                !self.elem_mode.get() || s == 0,
+                "an Array's length is slot 0"
+            );
             return self.entries.fields.get(s);
         }
         let slot = self.find(length)?;
+        // Generated code reads an Array's `length` at slot 0 (W2c step 7b, V8's descriptor 0):
+        // ArrayCreate defines it first, and as a non-configurable property it is never removed.
+        debug_assert!(
+            !self.elem_mode.get() || slot == 0,
+            "an Array's length is slot 0"
+        );
         self.len_slot.set(SlotMemo::of(slot));
         Some(&self.entries.fields[slot])
     }

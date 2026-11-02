@@ -172,52 +172,6 @@ fn named_field_emitters_read_live_objects() {
 }
 
 #[test]
-fn slot_memo_emitters_read_the_build_width() {
-    let engine = crate::Engine::new();
-    let layout = layout(&engine);
-    let memo = layout.obj_props + layout.props_len_slot;
-    assert!(slot_memo_fits(&layout, memo));
-    let (_code, slot) = assemble(|a| {
-        let none = a.new_label();
-        slot_memo_load(a, &layout, 1, 0, memo);
-        slot_memo_branch_none(a, &layout, 1, 2, none);
-        ret_reg(a, 1);
-        ret_none(a, none);
-    });
-    let base = |object: &crate::value::Gc| &*object.borrow() as *const Object as usize;
-    let plain = Object::new(None);
-    plain
-        .borrow_mut()
-        .props
-        .insert("x", Property::plain(Value::Num(1.0)));
-    assert_eq!(slot(base(&plain), 0), usize::MAX, "no length memo");
-    // A slot past one byte tells the width apart.
-    for before in [0usize, 3, 300] {
-        let object = Object::new(None);
-        for key in 0..before {
-            object
-                .borrow_mut()
-                .props
-                .insert(format!("k{key}").as_str(), Property::plain(Value::Num(0.0)));
-        }
-        object
-            .borrow_mut()
-            .props
-            .insert("length", Property::plain(Value::Num(7.0)));
-        assert_eq!(slot(base(&object), 0), before);
-        let borrowed = object.borrow();
-        let length = borrowed.props.length_property().expect("own length");
-        assert_eq!(
-            borrowed
-                .props
-                .property_at(before)
-                .map(|p| p as *const Property),
-            Some(length as *const Property)
-        );
-    }
-}
-
-#[test]
 fn binding_entry_emitters_read_live_scopes() {
     use crate::interpreter::{new_scope, Binding};
     let engine = crate::Engine::new();

@@ -580,3 +580,65 @@ fn sparse_transitions_keep_properties_and_order() {
         );
     }
 }
+
+/// W2c step 7b: generated code reads an Array's `length` at slot 0 (V8's descriptor 0). Every way
+/// of making an Array defines it first, and nothing moves it.
+#[test]
+fn every_array_keeps_length_at_slot_zero() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    match engine
+        .eval(
+            r#"
+        class Sub extends Array {}
+        var made = [
+            [], [1, 2, 3], new Array(10), new Array(1, 2), Array(3), Array.of(4, 5), Array.from('ab'),
+            [1, 2, 3].map(function (x) { return x; }), [1, 2, 3].filter(function () { return true; }),
+            [1].concat([2]), [1, 2, 3].slice(1), [3, 1, 2].sort(), 'a,b'.split(','), Object.keys({ a: 1 }),
+            JSON.parse('[1,[2]]'), JSON.parse('[1,[2]]')[1], [...'xy'], Array.prototype, new Sub(3), Sub.of(1),
+            (function () { return Array.prototype.slice.call(arguments); })(1, 2), /(a)(b)/.exec('ab'),
+            Object.entries({ k: 1 })[0], [0, 1].flat(), [[0], [1]].flatMap(function (x) { return x; }),
+        ];
+        var named = [1, 2]; named.extra = 1; named.length = 1; delete named.extra; named.more = 2;
+        made.push(named);
+        var frozen = Object.freeze([1, 2]); made.push(frozen);
+        var sealed = Object.seal([1, 2]); made.push(sealed);
+        var ro = [1, 2]; Object.defineProperty(ro, 'length', { writable: false }); made.push(ro);
+        made.length
+        "#,
+            false,
+        )
+        .unwrap()
+    {
+        Completion::Value(count) => assert_eq!(count, "29"),
+        Completion::Throw { name, message } => panic!("{name}: {message}"),
+    }
+    let global = Value::Obj(engine.interp.global);
+    let made = engine
+        .interp
+        .get_member_key(&global, "made")
+        .unwrap_or_else(|_| panic!("made"))
+        .as_obj()
+        .unwrap();
+    let count = made.borrow().props.words().unwrap().len();
+    let length = crate::atom::names::LENGTH.key();
+    for n in 0..count {
+        let array = made
+            .borrow()
+            .props
+            .get_index(n as u32)
+            .unwrap()
+            .value()
+            .as_obj()
+            .unwrap();
+        let body = array.borrow();
+        assert!(matches!(body.exotic, Exotic::Array), "{n}");
+        assert!(body.props.elem_mode.get(), "{n}");
+        assert_eq!(
+            body.props.entries.keys()[0],
+            length,
+            "{n}: length is slot 0"
+        );
+    }
+}

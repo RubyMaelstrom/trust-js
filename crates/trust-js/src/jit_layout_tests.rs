@@ -105,10 +105,6 @@ fn layout_is_valid_with_the_build_ownership() {
             ..
         }
     ));
-    assert_eq!(
-        (layout.repr.slot_memo_width, layout.repr.slot_memo_none),
-        (2, u32::from(u16::MAX))
-    );
     assert!(layout.repr.exotic_collection_tag.is_some());
 }
 
@@ -211,44 +207,6 @@ fn named_fields_read_through_the_fields_description_in_place_and_spilled() {
                 Some(entry)
             );
         }
-    }
-}
-
-#[test]
-fn slot_memos_read_their_width_and_none() {
-    let engine = crate::Engine::new();
-    let layout = probe(&engine);
-    let memo = |object: &Gc| {
-        let at = body(&layout, object) + layout.obj_props + layout.props_len_slot;
-        match layout.repr.slot_memo_width {
-            2 => u32::from(read::<u16>(at, 0)),
-            4 => read::<u32>(at, 0),
-            width => panic!("no {width}-byte slot memo"),
-        }
-    };
-    let plain = Object::new(None);
-    plain
-        .borrow_mut()
-        .props
-        .insert("x", Property::plain(Value::Num(1.0)));
-    assert_eq!(plain.borrow().props.len_slot.get().slot(), None);
-    assert_eq!(memo(&plain), layout.repr.slot_memo_none);
-    // A slot past one byte tells the width apart.
-    for before in [0usize, 2, 300] {
-        let object = Object::new(None);
-        for slot in 0..before {
-            object.borrow_mut().props.insert(
-                format!("k{slot}").as_str(),
-                Property::plain(Value::Num(0.0)),
-            );
-        }
-        object
-            .borrow_mut()
-            .props
-            .insert("length", Property::plain(Value::Num(0.0)));
-        let slot = object.borrow().props.len_slot.get().slot();
-        assert_eq!(slot, Some(before));
-        assert_eq!(memo(&object) as usize, before);
     }
 }
 
