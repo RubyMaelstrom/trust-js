@@ -14418,10 +14418,21 @@ fn emit_word_store(
     a.b_cond(C_EQ, create);
     emit_exec_word_load(a, 13, 20, -8);
     emit_exec_number_guard(a, 13, 1, 16, other);
-    // --- commit: the Number's word, then the kind bits ---
+    // --- commit: the Number's word, then the kind bits; the other stores rejoin here ---
     a.str_x_lsl3(13, 15, 9);
     emit_word_number_kind(a, layout, 15, 1, 12, 13, 14, 2);
-    a.b(stored);
+    a.bind(stored);
+    let consumed = if stack_receiver { 24 } else { 16 };
+    if keep {
+        // The expression result retains the original value, a Number's signed zero and NaN
+        // included.
+        emit_exec_word_load(a, 14, 20, -8);
+        emit_exec_word_store(a, 14, 20, -consumed);
+        a.sub_imm(20, 20, (consumed - 8) as u32);
+    } else {
+        a.sub_imm(20, 20, consumed as u32);
+    }
+    a.b(done);
     a.bind(other);
     emit_word_value_guard(a, 13, 16, 17, slow);
     emit_word_block_unrecorded(a, layout, 15, 16, 17, slow);
@@ -14449,17 +14460,6 @@ fn emit_word_store(
     } else {
         emit_word_create(a, layout, slow, stored);
     }
-    a.bind(stored);
-    let consumed = if stack_receiver { 24 } else { 16 };
-    if keep {
-        // The expression result retains the original Number, including signed zero and NaN.
-        emit_exec_word_load(a, 14, 20, -8);
-        emit_exec_word_store(a, 14, 20, -consumed);
-        a.sub_imm(20, 20, (consumed - 8) as u32);
-    } else {
-        a.sub_imm(20, 20, consumed as u32);
-    }
-    a.b(done);
 }
 
 /// Branch to `slow` when the operand word x`value`, stored as an element, would be a hole:
