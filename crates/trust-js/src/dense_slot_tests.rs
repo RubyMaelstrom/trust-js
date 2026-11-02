@@ -64,10 +64,12 @@ fn dense_slot_mutation_removal_and_reinsertion_keep_sidecar_consistent() {
             "length",
             Property::data(Value::Num(4096.0), true, false, false),
         );
-        // A first far index keeps every index among the named entries (`has_far`); ascending
-        // first writes exercise the element words. Both must preserve identical properties.
+        // A first index past the sparse limit, whose span no density brings back to words
+        // (V8's kRequiresSlowElementsLimit, W2c step 6), keeps every index among the named
+        // entries (`has_far`); ascending first writes exercise the element words. Both must
+        // preserve identical properties.
         if force_classic {
-            props.insert("4095", Property::plain(Value::Num(4095.0)));
+            props.insert("4294967294", Property::plain(Value::Num(-2.0)));
         }
         let packed = !force_classic;
         for n in 0..4096 {

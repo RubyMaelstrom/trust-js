@@ -6616,6 +6616,20 @@ impl SlotMemo {
     }
 }
 
+/// V8's limits for an element joining the words (`Props::words_admit`, W2c step 6): the gap past
+/// the capacity (`JSObject::kMaxGap`), the grown capacity under which no density test applies
+/// (`kMaxUncheckedFastElementsLength`), and the largest span the named entries may move to
+/// (`NumberDictionary::kRequiresSlowElementsLimit`).
+const WORDS_MAX_GAP: usize = 1024;
+const WORDS_MAX_UNCHECKED: usize = 5000;
+const WORDS_MAX_SPAN: usize = (1 << 29) - 1;
+
+/// The words V8's NumberDictionary takes for `n` elements: ComputeCapacity(n) (1.5 n rounded up
+/// to a power of two, at least 4) entries of 3 words.
+fn dictionary_words(n: usize) -> usize {
+    (n + n / 2).next_power_of_two().max(4) * 3
+}
+
 /// The empty-object shape: every `Props` starts here and all empty objects share it, so adding
 /// the same first key to two of them lands on the same child shape.
 const SHAPE_EMPTY: u32 = 0;
@@ -7537,9 +7551,80 @@ impl Props {
 
     /// Whether the map's first element word may start at `index`, on any map (every object has
     /// element storage, as in V8, SpiderMonkey and JSC): no words yet, no index key in the
-    /// named entries (its element would be stored twice), and within the sparse frontier.
+    /// named entries (its element would be stored twice), and admitted by the sparse limit.
     fn can_start_packed_elements(&self, index: usize) -> bool {
-        !self.has_far.get() && !self.elems.has_words() && index <= 256
+        !self.has_far.get() && !self.elems.has_words() && self.words_admit(index)
+    }
+
+    /// Whether element `index`, which the words do not hold, may join them, holes before it
+    /// (W2c step 6; V8's ShouldConvertToSlowElements, js-objects-inl.h): an index below their
+    /// capacity always; one [`WORDS_MAX_GAP`] or more past it never; otherwise while V8's grown
+    /// capacity, (index + 1) * 1.5 + 16, is at most [`WORDS_MAX_UNCHECKED`] words, or the named
+    /// entries would not save a factor of 3 over it. V8 checks an old object past 500 words; a
+    /// TRust JS object carries no age (its pages are young or old, not its cells), so every
+    /// object has V8's young limit.
+    fn words_admit(&self, index: usize) -> bool {
+        let words = self.elems.words();
+        let capacity = words.map_or(0, word_block::Words::capacity);
+        if index < capacity {
+            return true;
+        }
+        if index - capacity >= WORDS_MAX_GAP {
+            return false;
+        }
+        let needed = index + 1;
+        let grown = needed + needed / 2 + 16;
+        grown <= WORDS_MAX_UNCHECKED
+            || 3 * dictionary_words(words.map_or(0, word_block::Words::present)) > grown
+    }
+
+    /// After an index key joins an array's named entries (W2c step 6): when their count
+    /// reaches a power of two (SpiderMonkey's measure, NativeObject.cpp, which keeps the count
+    /// amortized), move every index entry into the words if each is a plain element and the
+    /// named form saves less than half the space (V8's ShouldConvertToFastElements). Arrays
+    /// only: V8 never converts an arguments object, and an ordinary object's index keys are
+    /// part of its shape.
+    fn maybe_densify(&mut self) {
+        if !self.elem_mode.get() || !self.has_far.get() || !self.entries.len().is_power_of_two() {
+            return;
+        }
+        let mut count = 0usize;
+        let mut span = 0usize;
+        for (key, property) in self.entries.iter() {
+            if let Some(n) = key.as_index() {
+                if !property.is_plain_element() {
+                    return;
+                }
+                count += 1;
+                span = span.max(n as usize + 1);
+            }
+        }
+        let words = self.elems.words();
+        let span = span.max(words.map_or(0, word_block::Words::len));
+        let present = words.map_or(0, word_block::Words::present);
+        if count == 0 || span > WORDS_MAX_SPAN || 2 * dictionary_words(present + count) < span {
+            return;
+        }
+        self.note_structural();
+        let moved: Vec<(usize, Value)> = self
+            .entries
+            .iter()
+            .filter_map(|(key, property)| key.as_index().map(|n| (n as usize, property.value())))
+            .collect();
+        let words = self.elems.words_start();
+        words.resize_with_holes(span);
+        for (n, value) in moved {
+            words.set(n, value);
+        }
+        self.entries.retain(|(key, _)| key.as_index().is_none());
+        self.len_slot.set(SlotMemo::NONE);
+        self.proto_slot.set(SlotMemo::NONE);
+        self.elems.set_index(None);
+        if self.entries.len() > INDEX_THRESHOLD {
+            self.build_index();
+        }
+        self.has_far.set(false);
+        let _ = self.length_property();
     }
 
     /// Create a bounded absent prefix on the first indexed write, never in response
@@ -7761,7 +7846,7 @@ impl Props {
         };
         let index = n as usize;
         let len = words.len();
-        if words.get(index).is_some() || index > len + 256 {
+        if words.get(index).is_some() || !self.words_admit(index) {
             return Err(prop);
         }
         self.note_structural();
@@ -8465,7 +8550,7 @@ impl Props {
                     self.elems.words_mut().unwrap().set(n, prop.into_value());
                     return;
                 }
-                if !self.has_far.get() && n <= len + 256 {
+                if !self.has_far.get() && self.words_admit(n) {
                     self.note_structural();
                     let words = self.elems.words_mut().unwrap();
                     words.resize_with_holes(n);
@@ -8532,6 +8617,9 @@ impl Props {
             self.entries.push((key, prop));
             self.note_inserted(slot);
             self.ensure_fallback_index();
+            if key.as_index().is_some() {
+                self.maybe_densify();
+            }
         }
     }
     /// Remove every canonical-index key `>= from` in one pass — array truncation

@@ -487,3 +487,35 @@ fn creation_inside_hot_loops_stays_native() {
         (30, 0, false)
     );
 }
+
+#[test]
+fn loop_chains_scan_at_most_4096_words_to_prove_a_receiver() {
+    // A chained loop's preamble proves a receiver's words again by a scan when its kind bits
+    // fall short, and every hole the loop fills withdraws the scan; a failed proof runs the
+    // iteration in plain code, whose back edge enters the preamble again. Over a large holey
+    // receiver (W2c step 6 admits holes up to 1023 past the capacity) the scan is skipped.
+    let mut engine = engine();
+    eval(
+        &mut engine,
+        "function fill(a,n){for(var i=0;i<n;i++)a[i]=i;return a.length;}\
+         for(var w=0;w<20;w++)fill([],8);",
+    );
+    let calls = || super::TEST_REPROVE_CALLS.with(|count| count.get());
+    super::TEST_REPROVE_CALLS.with(|count| count.set(0));
+    assert_eq!(
+        eval(
+            &mut engine,
+            "var big=[];big[100000]=0;fill(big,20000)+':'+big[19999]"
+        ),
+        "100001:19999"
+    );
+    assert_eq!(calls(), 0, "a receiver past 4,096 words is never scanned");
+    assert_eq!(
+        eval(
+            &mut engine,
+            "var small=[];small[100]=0;fill(small,100)+':'+small[99]"
+        ),
+        "101:99"
+    );
+    assert!(calls() > 0, "a small one still is");
+}

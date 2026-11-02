@@ -204,44 +204,45 @@ fn dense_elements_far_deletion_and_truncation_restore_packed_coverage() {
 /// (filling and reading 200,000 elements after one write at index 1000 took 106.8 s).
 #[test]
 fn dense_elements_far_keys_index_the_named_entries() {
-    // A packed array with one far write, and an empty one whose first write is past 256.
-    for (start, far) in [(3u32, 1000u32), (0, 300)] {
+    // A packed array with one far write, and an empty one whose first write is far: past the
+    // sparse limit and too sparse to densify (W2c step 6), so every later index joins it.
+    let far = 1_000_000u32;
+    for start in [3u32, 0] {
         let mut props = Props::packed_array((0..start).map(|n| Value::Num(n as f64)));
         props.insert(far.to_string().as_str(), Property::plain(Value::Num(-1.0)));
-        assert!(props.has_far.get(), "{start}, {far}");
+        assert!(props.has_far.get(), "{start}");
         for n in start..start + 2000 {
-            if n != far {
-                props.insert(
-                    n.to_string().as_str(),
-                    Property::plain(Value::Num(n as f64)),
-                );
-            }
-        }
-        assert!(props.has_far.get(), "{start}, {far}");
-        assert!(
-            props.elems.index().is_some(),
-            "{start}, {far}: no key index"
-        );
-        for n in 0..start + 2000 {
-            let expected = if n == far { -1.0 } else { n as f64 };
-            assert_eq!(
-                props.get(&n.to_string()).and_then(|p| p.number_value()),
-                Some(expected),
-                "{start}, {far}: {n}"
+            props.insert(
+                n.to_string().as_str(),
+                Property::plain(Value::Num(n as f64)),
             );
         }
+        assert!(props.has_far.get(), "{start}");
+        assert!(props.elems.index().is_some(), "{start}: no key index");
+        for n in 0..start + 2000 {
+            assert_eq!(
+                props.get(&n.to_string()).and_then(|p| p.number_value()),
+                Some(n as f64),
+                "{start}: {n}"
+            );
+        }
+        assert_eq!(
+            props.get(&far.to_string()).and_then(|p| p.number_value()),
+            Some(-1.0)
+        );
         assert!(props.get(&(start + 2000).to_string()).is_none());
         let keys = props.ordered_keys();
         assert_eq!(
             keys.len(),
-            (start + 2000) as usize + 1,
-            "the indices and length"
+            (start + 2000) as usize + 2,
+            "the indices, the far index and length"
         );
         assert!(keys
             .iter()
             .take((start + 2000) as usize)
             .enumerate()
             .all(|(i, key)| key.as_index() == Some(i as u32)));
+        assert_eq!(keys[(start + 2000) as usize].as_index(), Some(far));
     }
 }
 
@@ -439,5 +440,143 @@ fn dense_elements_sparse_recovery_preserves_cyclic_owners_across_gc() {
         );
         eval(&mut engine, "alive=null");
         engine.interp.gc_collect();
+    }
+}
+
+/// W2c step 6: an index joins the words while V8's ShouldConvertToSlowElements would keep fast
+/// elements: below the capacity, under 1024 past it, and past a grown capacity of 5,000 only
+/// while the named entries would not save a factor of 3.
+#[test]
+fn the_sparse_limit_follows_v8() {
+    let plain = |n: f64| Property::plain(Value::Num(n));
+    // An empty array's first index: 1023 past its capacity of none joins the words, 1024 not.
+    for (index, words) in [(1023u32, true), (1024, false)] {
+        let mut props = Props::packed_array(std::iter::empty());
+        props.insert(index.to_string().as_str(), plain(1.0));
+        assert_eq!(!props.has_far.get(), words, "{index}");
+        assert_eq!(
+            props.elems.words().map(word_block::Words::len),
+            words.then_some(index as usize + 1),
+            "{index}"
+        );
+    }
+    // Past a packed literal's exact capacity of 3.
+    for (index, words) in [(1026u32, true), (1027, false)] {
+        let mut props = Props::packed_array((0..3).map(|n| Value::Num(n as f64)));
+        props.insert(index.to_string().as_str(), plain(1.0));
+        assert_eq!(!props.has_far.get(), words, "{index}");
+    }
+    // Index 5000 past a capacity of 4000 grows it to 7,517 words: words while at least 342 of
+    // the 4000 are present (3 * ComputeCapacity(342) * 3 = 9,216), not with 341 (4,608). (The
+    // insert itself would then densify again at once, as V8 converts back on its next add: the
+    // way back compares the dictionary with the length, 5,001, not the grown capacity.)
+    for (present, words) in [(342usize, true), (341, false)] {
+        let mut props = Props::packed_array((0..4000).map(|n| Value::Num(n as f64)));
+        for n in present..4000 {
+            assert!(props.remove(&n.to_string()));
+        }
+        assert_eq!(props.elems.words().unwrap().present(), present);
+        assert_eq!(props.words_admit(5000), words, "{present}");
+    }
+}
+
+/// W2c step 6's way back: when an array's named entries reach a power of two, its index entries
+/// move into the words once each is a plain element and the named form saves less than half
+/// the space (V8's ShouldConvertToFastElements), keeping every value, the order and `length`.
+#[test]
+fn sparse_arrays_densify_when_dense_enough() {
+    let plain = |n: f64| Property::plain(Value::Num(n));
+    for blocked in [false, true] {
+        let mut props = Props::packed_array(std::iter::empty());
+        props.insert("100000", plain(-1.0));
+        assert!(props.has_far.get());
+        if blocked {
+            props.insert("7", Property::data(Value::Num(7.0), false, true, true));
+        }
+        // With the far index and `length`, 16,382 more entries reach 16,384: 16,383 index
+        // entries need 2 * 32,768 * 3 >= 100,001 words; at 8,192 entries they did not.
+        for n in 0..16381u32 {
+            if !(blocked && n == 7) {
+                props.insert(n.to_string().as_str(), plain(n as f64));
+            }
+            assert!(props.has_far.get(), "{n}: {} entries", props.entries.len());
+        }
+        props.insert("16381", plain(16_381.0));
+        if blocked {
+            assert!(props.has_far.get(), "a non-plain element blocks the move");
+            assert!(props.get_index(7).is_some());
+            continue;
+        }
+        assert!(!props.has_far.get());
+        assert_eq!(props.entries.len(), 1, "only `length` remains named");
+        let words = props.elems.words().unwrap();
+        assert_eq!(words.len(), 100_001);
+        assert_eq!(words.present(), 16_383);
+        assert_eq!(
+            props.get_index(100_000).and_then(|e| e.number_value()),
+            Some(-1.0)
+        );
+        assert_eq!(
+            props.get_index(16_381).and_then(|e| e.number_value()),
+            Some(16_381.0)
+        );
+        assert!(props.get_index(16_382).is_none());
+        let keys = props.ordered_keys();
+        assert_eq!(keys.len(), 16_383 + 1);
+        assert!(keys
+            .iter()
+            .take(16_382)
+            .enumerate()
+            .all(|(i, key)| key.as_index() == Some(i as u32)));
+        assert_eq!(keys[16_382].as_index(), Some(100_000));
+    }
+    // An ordinary object's index keys stay named: they are part of its shape.
+    let mut object = Props::new();
+    object.insert("100000", plain(-1.0));
+    for n in 0..20000u32 {
+        object.insert(n.to_string().as_str(), plain(n as f64));
+    }
+    assert!(object.has_far.get());
+}
+
+/// The script-visible results of both transitions are the specification's: values, order,
+/// descriptors and `length`, before and after an array goes to the named entries and back.
+#[test]
+fn sparse_transitions_keep_properties_and_order() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let result = match engine
+            .eval(
+                r#"
+            function check() {
+                var out = [];
+                var a = [1, 2, 3]; a[1000] = 'near';
+                out.push(a.length, a[1000], Object.keys(a).length, 999 in a);
+                var b = []; b[100000] = 'far';
+                for (var i = 0; i < 20000; i++) b[i] = i;
+                var d = Object.getOwnPropertyDescriptor(b, 100000);
+                out.push(b.length, b[19999], b[100000], d.writable && d.enumerable && d.configurable,
+                         Object.keys(b).length, Object.keys(b)[20000], 20000 in b);
+                var c = []; c[50000] = 1; Object.defineProperty(c, 3, { value: 'ro', writable: false });
+                for (var j = 0; j < 9000; j++) if (j !== 3) c[j] = j;
+                c[3] = 'changed';
+                out.push(c[3], Object.keys(c).length, c.length);
+                return out.join();
+            }
+            check()
+        "#,
+                false,
+            )
+            .unwrap()
+        {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        };
+        assert_eq!(
+            result, "1001,near,4,false,100001,19999,far,true,20001,100000,false,ro,9000,50001",
+            "{tier:?}"
+        );
     }
 }

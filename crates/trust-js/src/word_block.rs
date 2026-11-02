@@ -257,6 +257,18 @@ impl Words {
         self.header().shifted as usize
     }
 
+    /// The used words that are no hole: the used length when NO_HOLES holds, else a count.
+    pub(crate) fn present(&self) -> usize {
+        if self.kind() & KIND_NO_HOLES != 0 {
+            self.len()
+        } else {
+            self.as_slice()
+                .iter()
+                .filter(|&&word| word != PACK_EMPTY)
+                .count()
+        }
+    }
+
     /// The kind bits of the used words.
     #[inline]
     pub(crate) fn kind(&self) -> u32 {
