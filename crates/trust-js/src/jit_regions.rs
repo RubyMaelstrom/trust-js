@@ -574,7 +574,11 @@ fn result_demands(
             continue;
         }
         if let ValueDef::OpResult { pc, result: 0 } = ir.values[value.index()].def {
-            if checked_numeric_result(&ops[pc]) {
+            // A free name with a static address (Decision 21) is read as a Number where it is
+            // read, as a frame slot is.
+            let static_name =
+                matches!(ops[pc], Op::LoadName(_, cache) if chunk.jit_name_static(cache).is_some());
+            if checked_numeric_result(&ops[pc]) || static_name {
                 results.insert(pc);
             }
         }
@@ -2067,6 +2071,26 @@ struct NameElementFallback {
     value: Option<Operand>,
 }
 
+/// `dest` = the word of the binding at `address`: Decision 21's `hops` parent links from the
+/// running environment, then the slot, as [`super::operations::emit_static_name_load`] reads
+/// it. Clobbers x9 (and `dest`).
+fn emit_static_name_word(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    address: crate::bytecode::StaticName,
+    dest: u32,
+) {
+    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    for _ in 0..address.hops {
+        a.ldr_imm(9, 9, layout.scope_parent as u32);
+    }
+    a.ldr_imm(
+        dest,
+        9,
+        super::operations::cap_slot_offset(u32::from(address.slot)),
+    );
+}
+
 /// x14 = the address of the word of the binding at `address`, x7 = 0 (a Binding): Decision 21's
 /// `hops` parent links from the running environment, then the slot in place, as
 /// [`super::operations::emit_static_name_load`] reads it. A lexical binding still in its TDZ
@@ -3180,6 +3204,35 @@ pub(super) fn emit(
                     let dest = (depth as i32 - physical as i32) * 8;
                     emit_exec_word_store(a, 10, 20, dest);
                     stack.push(Operand::Canonical);
+                }
+                Op::LoadName(_, cache)
+                    if fast & 8192 != 0
+                        && super::operations::static_name(layout, chunk, cache).is_some() =>
+                {
+                    // A free name with a static address (Decision 21): its binding's word where
+                    // it lives, read as the baseline's LoadName reads it, so nothing virtual
+                    // below it is published (as a frame slot is read above). Feeding arithmetic
+                    // it goes straight into a register as a Number. A word that is not one, or a
+                    // lexical binding in its TDZ (the empty word), leaves the region at this
+                    // read, which has nothing to replay: the baseline's LoadName then produces
+                    // the value or throws.
+                    let address =
+                        super::operations::static_name(layout, chunk, cache).expect("guarded");
+                    saved_work += 2;
+                    emit_static_name_word(a, layout, address, 10);
+                    if plan.numeric_results.contains(&pc) {
+                        emit_exec_number_guard(a, 10, 16 + depth as u32, 9, bailout);
+                        stack.push(Operand::temporary(ScalarKind::Number));
+                    } else {
+                        if address.lexical {
+                            a.mov_imm64(9, crate::value::PACK_EMPTY);
+                            a.cmp_reg_x(10, 9);
+                            a.b_cond(C_EQ, bailout);
+                        }
+                        let dest = (depth as i32 - physical as i32) * 8;
+                        emit_exec_word_store(a, 10, 20, dest);
+                        stack.push(Operand::Canonical);
+                    }
                 }
                 Op::StoreLocal(slot) if plan.reg(slot).is_some() => {
                     saved_work += 2;

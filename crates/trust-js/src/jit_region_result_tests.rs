@@ -501,3 +501,48 @@ fn region_results_profitability_rejection_publishes_no_baseline_targets() {
         "a region that saves work is admitted whatever its code's size"
     );
 }
+
+/// A free name with a static address (Decision 21) read inside a register region: a Number goes
+/// straight into a register for the arithmetic, an object is copied to its stack slot, and every
+/// other word leaves the region at the read with nothing replayed: a binding that becomes a
+/// string partway through a loop concatenates from there on, and a lexical binding in its TDZ
+/// throws through the baseline's LoadName.
+#[test]
+fn region_static_name_reads_keep_numbers_in_registers_and_leave_for_anything_else() {
+    let source = r#"
+        (function () {
+            var width = 7, scale = 0.5, obj = { k: 3 };
+            function sum(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + i * width + scale; } return s; }
+            function useObj(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + obj.k; } return s; }
+            function bump(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + width; if (i === 3) width = "x"; } return s; }
+            function early(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + late * 2; } return s; }
+            var out = [];
+            for (var w = 0; w < 4; w++) { sum(50); useObj(20); }
+            out.push(sum(10), useObj(5), bump(6));
+            width = 7;
+            out.push(sum(4));
+            try { out.push(early(3)); } catch (e) { out.push(e.name); }
+            let late = 2;
+            out.push(early(3));
+            return out.join(",");
+        })()
+    "#;
+    let mut reference = Engine::new();
+    reference.set_tier(Tier::Interp);
+    assert_eq!(
+        evaluate(&mut reference, source),
+        "320,15,28xx,44,ReferenceError,12"
+    );
+    let before = super::regions::executed_regions();
+    let mut jit = Engine::new();
+    jit.set_tier(Tier::Jit);
+    jit.set_tier_threshold(0);
+    assert_eq!(
+        evaluate(&mut jit, source),
+        "320,15,28xx,44,ReferenceError,12"
+    );
+    assert!(
+        super::regions::executed_regions() > before,
+        "the loops must run as register regions"
+    );
+}
