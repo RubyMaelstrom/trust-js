@@ -225,8 +225,11 @@ comment/example in the same change.
   storage, their count, element slots, elements and holes, the plain ones (no accessor, no
   attributes but the defaults, no far key) and of those the holey, all-Number and all-int32
   ones, and the bytes of each element storage part (element words are the `values` part: the
-  block with its header and remembered record; `packed_box` and `dirty` stay zero), beside the
-  same objects' bytes under W2c's model of 8-byte words (`w2c`). In test builds,
+  block with its header and remembered record; a map's own key index is `index`; `sidecar`,
+  `packed_box`, `dirty`, `slot_map` and `mirror` stay zero, kept so lines compare with older
+  ones), beside the same objects' bytes under W2c's model of 8-byte words (`w2c`). The
+  population census's `sidecars` column counts maps with a key index of their own. In test
+  builds,
   `TRUST_JS_GC_WHY=1` records
   why each cell was marked (tests print the path with `gc_test::why`/`why_address`; a
   stack root names its frame's return address, for `addr2line`, and its depth below that
