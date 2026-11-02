@@ -2410,6 +2410,7 @@ mod shared_stub_tests {
             }
             keys.push(SharedStub::CallSecondary.key());
             keys.push(SharedStub::PlainIsArray.key());
+            keys.push(SharedStub::ElemCreate.key());
             for argc in [3u8, 4] {
                 keys.push(SharedStub::MinMax { argc }.key());
             }
@@ -12907,6 +12908,10 @@ enum SharedStub {
     /// the binding validated but is not for the native path (x14 = its value, x7 = its storage
     /// kind), 0 otherwise.
     NameElement { write: bool },
+    /// [`emit_word_create`]: Array [[Set]] creating element x9 of the Object at x11 (cell x10),
+    /// whose words are at x15 with w14 used, from the operand at `[x20 - 8]` → w13 = 1 once the
+    /// element is stored, 0 when the creation is declined before anything is written.
+    ElemCreate,
 }
 
 /// Status codes of the shared direct-call stub, in w8. The common completion is zero, so a site
@@ -12997,6 +13002,7 @@ impl SharedStub {
     const DIRECT_CONSTRUCT: u32 = 0xb00;
     const PLAIN_IS_ARRAY: u32 = 0xc00;
     const MIN_MAX: u32 = 0xd00;
+    const ELEM_CREATE: u32 = 0xe00;
 
     fn key(self) -> u32 {
         match self {
@@ -13062,6 +13068,7 @@ impl SharedStub {
             ))]
             SharedStub::MinMax { argc } => Self::MIN_MAX | u32::from(argc),
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
+            SharedStub::ElemCreate => Self::ELEM_CREATE,
             SharedStub::NameElement { write } => Self::NAME_ELEMENT | u32::from(write),
         }
     }
@@ -13157,6 +13164,7 @@ impl SharedStub {
             Self::NAME_ELEMENT => SharedStub::NameElement {
                 write: key & 1 != 0,
             },
+            Self::ELEM_CREATE => SharedStub::ElemCreate,
             _ => unreachable!("shared stub keys are produced by SharedStub::key"),
         }
     }
@@ -13209,6 +13217,7 @@ impl SharedStub {
             SharedStub::PlainIsArray => named("PlainIsArray", &[]),
             SharedStub::MinMax { argc } => format!("Stub:MinMax(argc={argc})"),
             SharedStub::TypedElement { write } => named("TypedElement", &[("write", write)]),
+            SharedStub::ElemCreate => named("ElemCreate", &[]),
             SharedStub::NameElement { write } => named("NameElement", &[("write", write)]),
         }
     }
@@ -13300,6 +13309,17 @@ impl SharedStub {
                 a.movz(13, 1, 0);
                 a.ret();
                 a.bind(miss);
+                a.movz(13, 0, 0);
+                a.ret();
+            }
+            SharedStub::ElemCreate => {
+                let stored = a.new_label();
+                let declined = a.new_label();
+                emit_word_create(a, layout, declined, stored);
+                a.bind(stored);
+                a.movz(13, 1, 0);
+                a.ret();
+                a.bind(declined);
                 a.movz(13, 0, 0);
                 a.ret();
             }
@@ -14419,7 +14439,16 @@ fn emit_word_store(
     emit_card_mark(a, 10, 16, 17);
     a.b(stored);
     a.bind(create);
-    emit_word_create(a, layout, slow, stored);
+    if a.stubs_ok() && use_shared_stub(a) {
+        // Outside hot loops the creation is the chunk's shared stub (the store sites of
+        // Emscripten code, typed arrays almost all, would otherwise each carry it).
+        let stub = a.shared_stub(SharedStub::ElemCreate.key());
+        a.bl_label(stub);
+        a.cbz(13, false, slow);
+        a.b(stored);
+    } else {
+        emit_word_create(a, layout, slow, stored);
+    }
     a.bind(stored);
     let consumed = if stack_receiver { 24 } else { 16 };
     if keep {

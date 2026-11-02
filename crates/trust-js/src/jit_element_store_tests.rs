@@ -430,3 +430,36 @@ fn stored_cells_survive_collections_of_old_arrays() {
             .to_string()
     );
 }
+
+#[test]
+fn creation_inside_hot_loops_stays_native() {
+    // Store sites inside a loop carry the creation sequence in line; elsewhere they call the
+    // chunk's shared stub (the forms above). Both must create the same elements.
+    let mut engine = engine();
+    eval(
+        &mut engine,
+        "function up(a,n,v){for(var i=0;i<n;i++)a[i]=v;return a;}\
+         function down(a,n,v){for(var i=n-1;i>=0;i--)a[i]=v;return a;}\
+         for(var w=0;w<20;w++){var t=[];t.length=0;up(t,20,w);var u=[];u[19]=0;down(u,19,w);}\
+         var room=[];for(var i=0;i<40;i++)room[i]=i;",
+    );
+    let (result, count) = stable(
+        &mut engine,
+        "room.length=0;var top=[];top[29]=0;var o={};\
+         var r0=[0,1];r0[4]=4;up(r0,0,0);r0[2]=0;",
+        "up(room,40,o);down(top,29,'s');\
+         [room.length,room[39]===o,top.length,top[0],top[28],top[29]].join()",
+    );
+    assert_eq!(result, "40,true,30,s,s,0");
+    assert_eq!(
+        count, 0,
+        "appends and hole fills in loops stay in native code"
+    );
+    let (len, _, kind, _) = words(&mut engine, "room");
+    assert_eq!((len, kind), (40, KIND_NO_HOLES));
+    let (len, _, kind, scanned) = words(&mut engine, "top");
+    assert_eq!(
+        (len, kind & (KIND_NUMBERS | KIND_INT32), scanned),
+        (30, 0, false)
+    );
+}
