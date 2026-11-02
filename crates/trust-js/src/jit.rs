@@ -11255,15 +11255,15 @@ fn emit_update_elem_inline(
     emit_words_base(a, layout, 11, 15, 14);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
-    emit_words_frozen_guard(a, layout, 15, 16, slow);
     a.add_shifted(17, 15, 9, 3);
     a.ldr_imm(16, 17, 0);
     emit_exec_number_guard(a, 16, 5, 13, slow);
-    // --- commit: d6 = old ± 1 replaces the word, which is no edge ---
+    // --- commit: d6 = old ± 1 replaces the word, which is no edge: the kind bits (a frozen
+    // block's words take `slow` first), then the word ---
     a.fmov_one(7);
     a.f_arith(if dec { 1 } else { 0 }, 6, 5, 7);
+    emit_word_number_kind_unfrozen(a, layout, 15, 6, 12, 13, 14, 1, slow);
     emit_exec_number_store(a, 6, 17, 0, 13);
-    emit_word_number_kind(a, layout, 15, 6, 12, 13, 14, 1);
     match kind {
         UpdKind::PreInc | UpdKind::PreDec => {
             emit_exec_number_store(a, 6, 20, -16, 9);
@@ -14233,6 +14233,67 @@ fn emit_word_number_kind(
     a.bind(done);
 }
 
+/// [`emit_word_number_kind`] before d`value`, a Number, replaces a present element of the words
+/// at x`words`, with W2c step 7a's frozen guard folded into its tests: a frozen block's words
+/// take no write, so it branches to `slow` before any write. `KIND_FROZEN` lies between
+/// `KIND_INT32` and `KIND_SCANNED`, so each test's mask is one logical immediate and the guard
+/// costs one instruction on either path (the compare that tells INT32 from FROZEN), where a
+/// guard of its own cost three. The caller stores the word after it. Clobbers x`t1`, x`t2`,
+/// x`t3`, d`dt` and NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_word_number_kind_unfrozen(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    words: u32,
+    value: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    dt: u32,
+    slow: usize,
+) {
+    use crate::value::word_block::{KIND_FROZEN, KIND_INT32, KIND_SCANNED};
+    let done = a.new_label();
+    let int32 = a.new_label();
+    let flags = -(layout.words_flags as i32);
+    a.ldur_w(t1, words, flags);
+    a.logic_imm_w(
+        0,
+        t2,
+        t1,
+        asm::logical_imm_w(KIND_INT32 | KIND_FROZEN).unwrap(),
+    );
+    a.cmp_imm_w(t2, KIND_INT32);
+    a.b_cond(C_EQ, int32);
+    // INT32 clear, or the block frozen: with neither FROZEN nor SCANNED, nothing changes.
+    a.logic_imm_w(
+        0,
+        t2,
+        t1,
+        asm::logical_imm_w(KIND_FROZEN | KIND_SCANNED).unwrap(),
+    );
+    a.cbz(t2, false, done);
+    a.logic_imm_w(0, t2, t1, asm::logical_imm_w(KIND_FROZEN).unwrap());
+    a.cbnz(t2, false, slow);
+    a.logic_imm_w(0, t1, t1, asm::logical_imm_w(!KIND_SCANNED).unwrap());
+    a.stur_w(t1, words, flags);
+    a.b(done);
+    a.bind(int32);
+    a.fcvtzs_w_d(t2, value);
+    a.scvtf_d_w(dt, t2);
+    a.fmov_x_d(t2, dt);
+    a.fmov_x_d(t3, value);
+    a.cmp_reg_x(t2, t3);
+    a.b_cond(C_EQ, done);
+    a.logic_imm_w(0, t1, t1, asm::logical_imm_w(!KIND_INT32).unwrap());
+    a.stur_w(t1, words, flags);
+    a.bind(done);
+}
+
 /// The element read templates' offsets: the element words'.
 #[cfg(all(
     target_arch = "aarch64",
@@ -14433,10 +14494,10 @@ fn emit_word_store(
     a.b_cond(C_EQ, rest);
     emit_exec_word_load(a, 13, 20, -8);
     emit_exec_number_guard(a, 13, 1, 16, rest);
-    emit_words_frozen_guard(a, layout, 15, 16, slow);
-    // --- commit: the Number's word, then the kind bits; the other stores rejoin here ---
+    // --- commit: the kind bits (a frozen block's words take `slow` first), then the Number's
+    // word; the other stores rejoin here ---
+    emit_word_number_kind_unfrozen(a, layout, 15, 1, 12, 16, 14, 2, slow);
     a.str_x_lsl3(13, 15, 9);
-    emit_word_number_kind(a, layout, 15, 1, 12, 13, 14, 2);
     a.bind(stored);
     let consumed = if stack_receiver { 24 } else { 16 };
     if keep {
@@ -16395,11 +16456,11 @@ fn emit_chain_marked(
                     a.mov_imm64(14, crate::value::PACK_EMPTY);
                     a.cmp_reg_x(12, 14);
                     a.b_cond(C_EQ, guard!());
-                    emit_words_frozen_guard(a, layout, 15, 14, guard!());
-                    // The Number's word, its NaN the canonical one.
+                    // The kind bits (a frozen block's words take the guard first), then the
+                    // Number's word, its NaN the canonical one.
+                    emit_word_number_kind_unfrozen(a, layout, 15, dv, 12, 13, 14, 1, guard!());
                     a.add_shifted(13, 15, 9, 3);
                     emit_exec_number_store(a, dv, 13, 0, 14);
-                    emit_word_number_kind(a, layout, 15, dv, 12, 13, 14, 1);
                 } else {
                     // A Number: a hole and every other kind are tagged NaNs. The guard checks
                     // through scratch d0, as dk still holds the key a bailout replays with.

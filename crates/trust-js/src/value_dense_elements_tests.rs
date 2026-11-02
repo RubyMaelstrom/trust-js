@@ -743,14 +743,19 @@ fn generated_code_never_writes_a_frozen_array() {
             for (var w = 0; w < 50; w++) {
                 var t = [1, 2, 3, 4];
                 store(t, 1, 'x'); store(t, 2, 0.5); storeKeep(t, 3, {}); bump(t, 2);
-                fill([0, 0, 0, 0], 4); scale([1, 2, 3, 4], 4);
+                fill([0, 0, 0, 0], 4); scale([1, 2, 3, 4], 4); scale([1.5, 2.5], 2);
             }
             var f = Object.freeze([1, 2, 3, 4]);
             store(f, 1, 'x'); store(f, 2, 0.5); var k = storeKeep(f, 3, 7); bump(f, 0);
             fill(f, 4); scale(f, 4);
             var s = Object.seal([1, 2, 3, 4]);
             store(s, 1, 'x'); bump(s, 0); scale(s, 4);
-            [f.join(), k, s.join()].join('|')
+            // Doubles: the kind update's second test, where FROZEN shares SCANNED's mask.
+            var fd = Object.freeze([1.5, 2.5, 3.5, 4.5]);
+            store(fd, 2, 0.25); bump(fd, 0); fill(fd, 4); scale(fd, 4);
+            var sd = Object.seal([1.5, 2.5, 3.5, 4.5]);
+            store(sd, 2, 0.25); bump(sd, 0); scale(sd, 4);
+            [f.join(), k, s.join(), fd.join(), sd.join()].join('|')
         "#,
             false,
         )
@@ -759,5 +764,9 @@ fn generated_code_never_writes_a_frozen_array() {
         Completion::Value(value) => value,
         Completion::Throw { name, message } => panic!("{name}: {message}"),
     };
-    assert_eq!(result, "1,2,3,4|7|6,NaN,9,12");
+    // Node 24 prints the same.
+    assert_eq!(
+        result,
+        "1,2,3,4|7|6,NaN,9,12|1.5,2.5,3.5,4.5|7.5,7.5,0.75,13.5"
+    );
 }

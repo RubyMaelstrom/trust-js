@@ -33,18 +33,22 @@ pub(crate) const KIND_NUMBERS: u32 = 1 << 1;
 pub(crate) const KIND_INT32: u32 = 1 << 2;
 /// The facts of a block with no words.
 pub(crate) const KIND_ALL: u32 = KIND_NO_HOLES | KIND_NUMBERS | KIND_INT32;
-/// Not a fact about the words: a scan proved the kind bits ([`Words::reprove`]) and no write
-/// since could have made a cleared fact true again (a write that keeps a fact can only clear
-/// it), so a cleared kind bit is exact and another proof need not scan. Every write through
-/// [`Words::set`] and every removal clears it.
-pub(crate) const KIND_SCANNED: u32 = 1 << 3;
 /// The integrity levels (W2c step 7a; SpiderMonkey's elements flags, V8's elements kinds), not
 /// facts about the words' values but their elements' attributes: every element is
 /// non-configurable (SEALED), and also non-writable (FROZEN, which comes with SEALED). Set once
 /// on a block the object owns (never the static one), by SetIntegrityLevel; never cleared. A
 /// sealed block's words take overwrites only; a frozen one's take no write.
-pub(crate) const KIND_SEALED: u32 = 1 << 4;
-pub(crate) const KIND_FROZEN: u32 = 1 << 5;
+///
+/// FROZEN lies between INT32 and SCANNED so that `INT32 | FROZEN` and `FROZEN | SCANNED` are
+/// each one run of bits, a single logical immediate: a generated Number store tests FROZEN
+/// within its kind update's own tests (`emit_word_number_kind_unfrozen` in jit.rs).
+pub(crate) const KIND_FROZEN: u32 = 1 << 3;
+/// Not a fact about the words: a scan proved the kind bits ([`Words::reprove`]) and no write
+/// since could have made a cleared fact true again (a write that keeps a fact can only clear
+/// it), so a cleared kind bit is exact and another proof need not scan. Every write through
+/// [`Words::set`] and every removal clears it.
+pub(crate) const KIND_SCANNED: u32 = 1 << 4;
+pub(crate) const KIND_SEALED: u32 = 1 << 5;
 pub(crate) const KIND_INTEGRITY: u32 = KIND_SEALED | KIND_FROZEN;
 
 /// The 16 bytes before a block's first word. Generated code reads `used` at -16, `capacity` at
