@@ -6180,3 +6180,127 @@ Octane here runs with clock.js, so PdfJS's count is deterministic; the records b
 used the real clock. Checks: rustfmt; clippy in the three landing configurations on Crystal and
 zombie (x86-64), and zombie's aarch64 cross clippy; the 84 region and IR tests, then the lib
 suite on Crystal (2,735) and zombie (2,530).
+
+### Region admission: steps 4b (first part), 2 and 4a (record, 2026-11-02)
+
+Five commits, landed one step at a time (main 6ba8756b, 91cab361, 805fac44 and 32f3fd3f).
+
+Step 4b, first part (6ba8756b): the fused typed-array access reads a name that has a static
+address (Decision 21) where it lives, as the baseline's LoadName reads it. Before, the fusion
+proved the name through its name cache at every access. With Decision 21's scope plans off
+(TRUST_JS_SCOPE_PLANS=0), the fusion saved zlib 7.8%; with them on it cost 4.3%, because every
+other read of those names had become a load from their address. A site with a static address now
+walks to the binding and enters the shared routine past the proof (SharedStub::NameElement's
+`resolved` variant); its cold path reads the name the same way. A lexical binding in its TDZ
+still throws through the full LoadName. Mandreel's names have no static address and keep the
+probe. Counts against b36823b4:
+| | b36823b4 | 6ba8756b | change |
+| --- | --- | --- | --- |
+| Vue | 1,890,466,696 | 1,890,930,093 | +0.02% |
+| React | 337,598,386 | 337,600,217 | +0.00% |
+| Djot | 674,827,121 | 674,829,731 | +0.00% |
+| chai | 83,472,720,509 | 83,449,667,613 | -0.03% |
+| Richards | 141,871,982 | 141,868,398 | -0.00% |
+| DeltaBlue | 266,082,114 | 266,095,772 | +0.01% |
+| Crypto | 749,201,168 | 749,219,170 | +0.00% |
+| RayTrace | 1,055,883,063 | 1,055,887,657 | +0.00% |
+| EarleyBoyer | 3,643,854,677 | 3,642,619,367 | -0.03% |
+| RegExp | 2,839,699,100 | 2,826,256,173 | -0.47% |
+| Splay | 1,888,153,973 | 1,888,155,358 | +0.00% |
+| NavierStokes | 496,517,456 | 496,522,248 | +0.00% |
+| PdfJS | 8,091,356,226 | 8,091,363,922 | +0.00% |
+| Mandreel | 65,772,975,578 | 65,773,475,502 | +0.00% |
+| Gameboy | 22,788,633,108 | 22,788,736,187 | +0.00% |
+| CodeLoad | 481,596,336 | 481,626,138 | +0.01% |
+| Box2D | 4,643,273,748 | 4,643,678,234 | +0.01% |
+| zlib | 167,234,435,621 | 140,735,262,120 | -15.85% |
+| TypeScript | 59,779,291,707 | 59,771,245,924 | -0.01% |
+zlib's -15.85% is more than turning the fusion off (-9.14%): the fused element access stays.
+
+The design's other two parts of 4b move:
+- Not fusing where the element site never sees a typed array (RegExp: 511,908 fallbacks) needs a
+  record of what the site saw, and GetElem has no cache of its own. It becomes one of step 3's
+  exit sites: the fallback counts like a bail, and the next compile does not fuse that site.
+- One shared cold path per chunk instead of a fallback copy at each site waits until those
+  misses are gone. RegExp takes the fallback 511,908 times, so a slower shared path would cost it
+  more than the code it saves.
+
+Step 2 (91cab361): the size test goes, and a function's regions may cover 4,096 operations in
+all (REGION_OPS_BUDGET), counted from their plans before anything is emitted. A plan past the
+budget costs no emission, and a refused plan still covers its operations as before. Counts
+against 6ba8756b:
+| | 6ba8756b | 91cab361 | change |
+| --- | --- | --- | --- |
+| Vue | 1,890,916,708 | 1,890,876,029 | -0.00% |
+| React | 337,598,906 | 337,646,217 | +0.01% |
+| Djot | 674,824,325 | 675,530,099 | +0.10% |
+| chai | 83,465,918,214 | 83,465,137,252 | -0.00% |
+| Richards | 141,868,685 | 141,931,887 | +0.04% |
+| DeltaBlue | 266,099,061 | 266,274,092 | +0.07% |
+| Crypto | 749,222,873 | 749,408,264 | +0.02% |
+| RayTrace | 1,055,899,602 | 1,056,020,055 | +0.01% |
+| EarleyBoyer | 3,642,628,289 | 3,642,855,029 | +0.01% |
+| RegExp | 2,826,275,147 | 2,827,367,084 | +0.04% |
+| Splay | 1,888,173,307 | 1,888,225,436 | +0.00% |
+| NavierStokes | 496,518,722 | 496,568,726 | +0.01% |
+| PdfJS | 8,091,402,116 | 8,095,648,487 | +0.05% |
+| Mandreel | 65,774,973,047 | 65,702,443,300 | -0.11% |
+| Gameboy | 22,788,759,414 | 22,789,877,519 | +0.00% |
+| CodeLoad | 481,623,945 | 481,708,371 | +0.02% |
+| Box2D | 4,643,665,520 | 4,624,607,150 | -0.41% |
+| zlib | 140,735,256,354 | 139,452,494,889 | -0.91% |
+| TypeScript | 59,771,019,914 | 59,771,483,101 | +0.00% |
+At 2,048 operations zlib was +0.05%, Box2D -0.41% and Mandreel -0.03%; 4,096 keeps both of a8's
+loops. Code (one run each, TRUST_JS_TIER_LOG's native bytes) grows where the byte budget had
+refused call- and property-heavy regions, whose code takes 250-290 bytes an operation: RegExp
++8.4%, Mandreel +6.5%, zlib +5.2%, Box2D +4.4%, TypeScript +2.4%, Gameboy +2.0%; the rest within
+0.1%. Djot's +0.10% and DeltaBlue's +0.07% are layout. Djot's generated code (dumpsum.py of
+TRUST_JS_JIT_CODEDUMP=*) and every region decision are the same, and so are its collections. SPE
+moves samples between its JIT code and the compiler's Rust, as Gameboy's address-keyed caches do.
+
+Step 4a (805fac44, 32f3fd3f): a region reads two kinds of operand in place that it used to run as
+effects. Running an operation as an effect published every virtual operand to the frame's operand
+stack, and the consumer reloaded the result with a Number check.
+- A static name. Its binding's word goes into a register as a Number when arithmetic consumes it,
+  or onto its stack slot, with nothing below it published.
+- A numeric element read (GetElemLocal) whose result feeds arithmetic and whose key is a Number in
+  a register. The receiver's element words, or its typed-array view, go straight into a register.
+
+Anything else leaves the region at the read and runs the baseline's operation: a word that is not
+a Number, a lexical binding in its TDZ, a hole, a key that is not an index. NavierStokes's advect:
+-2.23% with the names, -7.42% with both. Counts against 91cab361:
+| | 91cab361 | 32f3fd3f | change |
+| --- | --- | --- | --- |
+| Vue | 1,890,874,973 | 1,888,819,763 | -0.11% |
+| React | 337,644,444 | 337,642,440 | -0.00% |
+| Djot | 675,494,680 | 675,409,773 | -0.01% |
+| chai | 83,466,095,497 | 83,441,657,736 | -0.03% |
+| Richards | 141,931,885 | 141,931,594 | -0.00% |
+| DeltaBlue | 266,275,550 | 266,278,973 | +0.00% |
+| Crypto | 749,406,039 | 749,423,442 | +0.00% |
+| RayTrace | 1,056,017,537 | 1,056,021,023 | +0.00% |
+| EarleyBoyer | 3,642,863,138 | 3,642,631,184 | -0.01% |
+| RegExp | 2,827,394,393 | 2,827,210,751 | -0.01% |
+| Splay | 1,888,227,976 | 1,888,131,125 | -0.01% |
+| NavierStokes | 496,570,097 | 459,748,709 | -7.42% |
+| PdfJS | 8,095,715,991 | 8,090,361,549 | -0.07% |
+| Mandreel | 65,703,408,605 | 65,703,508,635 | +0.00% |
+| Gameboy | 22,789,880,482 | 22,782,844,568 | -0.03% |
+| CodeLoad | 481,690,274 | 481,693,222 | +0.00% |
+| Box2D | 4,624,618,924 | 4,624,688,725 | +0.00% |
+| zlib | 139,452,471,009 | 138,963,055,597 | -0.35% |
+| TypeScript | 59,770,963,412 | 59,771,148,334 | +0.00% |
+Refusing advect's two regions still saves about 4% more. The rest is the element store (the
+region publishes and runs the template) and locals left outside the eight numeric homes, which
+the region guards at every read.
+
+Tests: fused_name_element_sites_read_static_bindings_in_place,
+region_static_name_reads_keep_numbers_in_registers_and_leave_for_anything_else and
+region_numeric_element_reads_stay_in_registers_and_leave_for_anything_else. They cover
+reassignment, values that are not typed arrays or not Numbers, TDZ, holes read through a
+prototype, and keys that are not indices. Each fails with its new path pointed at the wrong slot
+or register. The loops in the last one branch, because a loop without one runs as a numeric loop
+chain, not a region. Checks for each landing: rustfmt; clippy in the three landing
+configurations on Crystal and zombie (x86-64), and zombie's aarch64 cross clippy; the lib suite
+on Crystal (2,736-2,738) and zombie (2,530); the new region tests and the name-fusion tests under
+TRUST_JS_GC_STRESS=1.
