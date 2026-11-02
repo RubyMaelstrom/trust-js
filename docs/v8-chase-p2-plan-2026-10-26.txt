@@ -5615,3 +5615,92 @@ numeric-array, update-element, native-operation, count-guard, array-shift and ar
 tests; Test262 in full at --tier=jit threshold 8 (53,575 of 53,575, the report identical to
 7ebe314b's), difftest (138 agree, 12 skipped, as at 7ebe314b), the fixtures' masked outputs and
 Octane's at five runs as 7ebe314b's.
+
+### W2c step 5: the collector (record, 2026-11-02)
+
+The collector's part landed with step 2 (32df6f1f, 97b9dfaf): Words::trace_values reports a
+block's used words, never its capacity, and nothing for a NUMBERS block, and a minor collection's
+remembered trace of a block over 64 words reports its dirty runs and the words past its traced
+length. A trace census of main 86b0cd4f (every element block the marker's traces visit, by
+purpose; target/p2/w2c5/census): Splay's full traces skip 665,225 NUMBERS blocks (6.65 M words)
+and report 12 blocks of one word each, where the W2c census found 9.76 M words traced, all
+Numbers (5.05% of its instructions). The blocks a trace reports whose words are in fact all
+Numbers (a NUMBERS bit cleared and never proven again) number at most 95 in any workload
+(EarleyBoyer, 589 words), so the marker does not prove the bits again as it scans; V8 and
+SpiderMonkey never take a kind back either.
+
+What step 2's design promised and did not land: the kind bits verified at each collection in
+debug builds. a5f34fda: Words::trace_values asserts in debug builds, at every trace, that each
+kind bit set holds of the words, since the collector skips a NUMBERS block's words and
+generated code trusts all three bits. Checks: rustfmt; clippy in the three landing
+configurations on Crystal and zombie (x86-64), and zombie's aarch64 cross clippy; the lib suite
+on Crystal (2,595) and zombie (2,525) with the assertion on; TRUST_JS_GC_STRESS=1 on the store,
+value, dense-slot, index-name, numeric-array, update-element, native-operation, count-guard,
+array-shift, array-length and word-block tests (108). Release builds are unchanged.
+
+### W2c step 6: the sparse limit and the way back to words (design, 2026-11-02)
+
+The owner's go-ahead for W2c's remaining steps (2026-11-02, "all approved"), with the W2c
+design's open question 5 answered as recommended: V8's limits. Today an index more than 256 past
+the used words, or a map's first index past 256, goes to the named entries (`has_far`), and
+every later index joins it there until a truncation past them. The far-index repros
+(target/p2/w2c-census/edge, main 86b0cd4f, CPU 17, a loaded machine): filling and reading back
+200,000 elements after `a = [1, 2, 3]; a[1000] = 0` takes 117-119 ms against 8-9 ms without the
+far write (Node 24: 11-16 ms); 20,000 after `a = []; a[300] = 0` 11-12 ms, 40,000 23-25 ms (Node
+1 ms); 20,000 after a first write at 100,000 12 ms (Node 13 ms, which goes to its dictionary as
+well).
+
+What the exemplars do (V8 c8b709085e21, SpiderMonkey bf75471716c5, JSC 260278048486):
+- V8, going slow (ShouldConvertToSlowElements, js-objects-inl.h:1266-1286): an index below the
+  capacity stays fast; one at least kMaxGap = 1024 past it goes to the dictionary
+  (js-objects.h:966); otherwise the new capacity NewElementsCapacity(index + 1), (index + 1) *
+  1.5 + 16, stays fast up to kMaxUncheckedOldFastElementsLength = 500 for an old object and
+  kMaxUncheckedFastElementsLength = 5,000 for a young one (js-objects.h:970-974), and past that
+  only while it is under kPreferFastElementsSizeFactor (3) times the dictionary that would hold
+  the used elements (ComputeCapacity(used) * kEntrySize 3; ComputeCapacity rounds 1.5 * used up
+  to a power of two, at least 4: hash-table-inl.h:88-95; dictionary.h:385, 482).
+- V8, going back (ShouldConvertToFastElements, js-objects.cc:5602-5630), on every element added
+  to a dictionary: never once an element needed slow elements (an accessor, an index past
+  2^29 - 1; requires_slow_elements, dictionary.h:458-466), never for arguments objects;
+  otherwise fast when the dictionary saves less than half the space: 2 * capacity * 3 >= the new
+  capacity, an array's length or the largest key + 1, and at least index + 1.
+- SpiderMonkey (NativeObject.h:1878-1884, NativeObject.cpp:555-650, 1489-1503): dense below
+  MIN_SPARSE_INDEX = 1000 slots, sparse past it when under 1/8 of the required capacity would be
+  filled; after adding a sparse index it densifies when the object is extensible, every indexed
+  property is a default data property and at least 1/8 of the span is filled, measuring only when
+  the slot span reaches a power of two (an O(n) count amortized; bug 1782487's cliff).
+- JSC (ArrayConventions.h:67-104, JSObject.cpp:3285-3300, 3384-3396): a vector below index
+  100,000 (MIN_SPARSE_ARRAY_INDEX), and past it while 1/8 dense; a sparse map for an index at
+  least 1000 past the vector length; back to a vector on a put once 1/8 dense.
+
+Design:
+1. One admission rule for an index the words do not hold yet (Props::insert,
+   try_define_dense_element, can_start_packed_elements): V8's. An index below the capacity
+   takes words; one 1024 or more past the capacity takes the named entries; otherwise the
+   grown capacity (Words' growth is V8's NewElementsCapacity already) takes words up to 5,000,
+   and past that while the named form would not save a factor of 3 (3 * ComputeCapacity(used)
+   * 3 > grown, with `used` the words that are no hole: the used length when NO_HOLES holds,
+   else a count). V8's 500 for an old object needs an age TRust JS's objects do not carry
+   (its pages are young or old, not its cells), so every object gets V8's young limit, 5,000:
+   at most about 40 KB of words before the density test applies.
+2. The way back, when an index key joins the named entries: V8's density test with
+   SpiderMonkey's measurement. When the named entries' count reaches a power of two, count the
+   index entries; if every one is a plain element (V8's requires_slow_elements, SpiderMonkey's
+   default data properties) and the named form saves less than half the space (2 * 3 *
+   ComputeCapacity(words that are no hole + index entries) >= the largest index + 1), move them
+   into the words (holes between), drop them from the named entries, rebuild the key index and
+   the slot memos, and clear `has_far`. An ordinary object's index keys are in its shape (step
+   3), so it moves to a fresh shape, as a removal does; an array's shape holds no index key.
+3. Specification equivalence, as for every transition of W2c: an element's descriptor is plain
+   in both forms, OrdinaryOwnPropertyKeys lists indices in ascending order before strings
+   whichever store holds them, and `length` does not change.
+4. Tests: both transitions at their thresholds (1023 and 1024 past the capacity, the 5,000
+   and density limits, the power-of-two densify), non-plain entries never densified, property
+   order and descriptors across both, ordinary objects' shapes; the far-index repros against
+   Node; Test262's Array and Object suites, difftest, GC stress over the element tests; counts
+   over every workload, which no far index reaches (the W2c census).
+
+Predicted: the far-index cliff gone (farcliff's 117 ms to about its 9 ms without the far write;
+farcliff2's writes at 300 like the empty start); a write at 100,000 densifies once the named
+entries reach 16,384, close to V8's (which converts at each add once dense enough); the
+workloads unchanged.
