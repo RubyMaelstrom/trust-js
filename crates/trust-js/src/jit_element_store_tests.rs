@@ -457,8 +457,8 @@ fn stored_cells_survive_minor_collections_of_old_arrays() {
 
 #[test]
 fn creation_inside_hot_loops_stays_native() {
-    // Store sites inside a loop carry the creation sequence in line; elsewhere they call the
-    // chunk's shared stub (the forms above). Both must create the same elements.
+    // Stores in loops, whose regions and chains carry their own code around the sites, create
+    // elements as the stand-alone forms above do.
     let mut engine = engine();
     eval(
         &mut engine,

@@ -2410,7 +2410,7 @@ mod shared_stub_tests {
             }
             keys.push(SharedStub::CallSecondary.key());
             keys.push(SharedStub::PlainIsArray.key());
-            keys.push(SharedStub::ElemCreate.key());
+            keys.push(SharedStub::ElemStore.key());
             for argc in [3u8, 4] {
                 keys.push(SharedStub::MinMax { argc }.key());
             }
@@ -12908,10 +12908,10 @@ enum SharedStub {
     /// the binding validated but is not for the native path (x14 = its value, x7 = its storage
     /// kind), 0 otherwise.
     NameElement { write: bool },
-    /// [`emit_word_create`]: Array [[Set]] creating element x9 of the Object at x11 (cell x10),
-    /// whose words are at x15 with w14 used, from the operand at `[x20 - 8]` → w13 = 1 once the
-    /// element is stored, 0 when the creation is declined before anything is written.
-    ElemCreate,
+    /// [`emit_word_store_body`]: element x9 of the Object at x11 (cell x10), whose words are at
+    /// x15 with w14 used, takes the operand at `[x20 - 8]` → w13 = 1 once it is stored, 0 when
+    /// the store is declined before anything is written.
+    ElemStore,
 }
 
 /// Status codes of the shared direct-call stub, in w8. The common completion is zero, so a site
@@ -13002,7 +13002,7 @@ impl SharedStub {
     const DIRECT_CONSTRUCT: u32 = 0xb00;
     const PLAIN_IS_ARRAY: u32 = 0xc00;
     const MIN_MAX: u32 = 0xd00;
-    const ELEM_CREATE: u32 = 0xe00;
+    const ELEM_STORE: u32 = 0xe00;
 
     fn key(self) -> u32 {
         match self {
@@ -13068,7 +13068,7 @@ impl SharedStub {
             ))]
             SharedStub::MinMax { argc } => Self::MIN_MAX | u32::from(argc),
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
-            SharedStub::ElemCreate => Self::ELEM_CREATE,
+            SharedStub::ElemStore => Self::ELEM_STORE,
             SharedStub::NameElement { write } => Self::NAME_ELEMENT | u32::from(write),
         }
     }
@@ -13164,7 +13164,7 @@ impl SharedStub {
             Self::NAME_ELEMENT => SharedStub::NameElement {
                 write: key & 1 != 0,
             },
-            Self::ELEM_CREATE => SharedStub::ElemCreate,
+            Self::ELEM_STORE => SharedStub::ElemStore,
             _ => unreachable!("shared stub keys are produced by SharedStub::key"),
         }
     }
@@ -13217,7 +13217,7 @@ impl SharedStub {
             SharedStub::PlainIsArray => named("PlainIsArray", &[]),
             SharedStub::MinMax { argc } => format!("Stub:MinMax(argc={argc})"),
             SharedStub::TypedElement { write } => named("TypedElement", &[("write", write)]),
-            SharedStub::ElemCreate => named("ElemCreate", &[]),
+            SharedStub::ElemStore => named("ElemStore", &[]),
             SharedStub::NameElement { write } => named("NameElement", &[("write", write)]),
         }
     }
@@ -13312,10 +13312,10 @@ impl SharedStub {
                 a.movz(13, 0, 0);
                 a.ret();
             }
-            SharedStub::ElemCreate => {
+            SharedStub::ElemStore => {
                 let stored = a.new_label();
                 let declined = a.new_label();
-                emit_word_create(a, layout, declined, stored);
+                emit_word_store_body(a, layout, declined, stored);
                 a.bind(stored);
                 a.movz(13, 1, 0);
                 a.ret();
@@ -14383,16 +14383,12 @@ fn emit_set_elem_inline_marked(
 
 /// Store the value at `[x20 - 8]` as element x9 (a u32) of the Object at x11, whose cell is at
 /// x10, then pop the operands (keeping the value as the expression's result under `keep`) and
-/// branch to `done` (W2c step 4). An existing element is an own writable data property, so
-/// OrdinarySet writes it whatever the prototype chain holds: the machine-code `Words::set`. A
-/// Number keeps the kind bits exact and is no edge; any other value clears NUMBERS and INT32
-/// (exactly, so `KIND_SCANNED` stays: the word it replaces was no hole and it is none) and
-/// marks the owner's card, as every generated store of a reference does, before the next
-/// safepoint. A block with a remembered record takes `slow` for such a value instead: the
-/// word may lie below its traced length, and the helper's `Words::set` marks its dirty block
-/// (the W2c design's decision 4). A hole, or the word just past the used ones, is a property
-/// creation ([`emit_word_create`]); every other index, and the TDZ marker as the value (it
-/// would become a hole), is `slow`. Every check precedes the first write.
+/// branch to `done` (W2c step 4). A Number over an existing element, the common store, stays at
+/// the site: the machine-code `Words::set` of a Number, which keeps the kind bits exact and is
+/// no edge. Every other store is [`emit_word_store_body`]'s, which the site calls as the shared
+/// stub `SharedStub::ElemStore` (so the thousands of store sites of compiled Emscripten code,
+/// typed-array stores almost all, carry three instructions for it, not the sequence), or
+/// carries in line when stubs are off. Everything it declines, with nothing written, is `slow`.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14405,19 +14401,17 @@ fn emit_word_store(
     stack_receiver: bool,
     keep: bool,
 ) {
-    use crate::value::word_block::{KIND_INT32, KIND_NUMBERS};
-    let create = a.new_label();
-    let other = a.new_label();
+    let rest = a.new_label();
     let stored = a.new_label();
     emit_words_base(a, layout, 11, 15, 14);
     a.cmp_reg_x(9, 14);
-    a.b_cond(C_HS, create);
+    a.b_cond(C_HS, rest);
     a.ldr_x_lsl3(12, 15, 9);
     a.mov_imm64(13, crate::value::PACK_EMPTY);
     a.cmp_reg_x(12, 13);
-    a.b_cond(C_EQ, create);
+    a.b_cond(C_EQ, rest);
     emit_exec_word_load(a, 13, 20, -8);
-    emit_exec_number_guard(a, 13, 1, 16, other);
+    emit_exec_number_guard(a, 13, 1, 16, rest);
     // --- commit: the Number's word, then the kind bits; the other stores rejoin here ---
     a.str_x_lsl3(13, 15, 9);
     emit_word_number_kind(a, layout, 15, 1, 12, 13, 14, 2);
@@ -14433,6 +14427,53 @@ fn emit_word_store(
         a.sub_imm(20, 20, consumed as u32);
     }
     a.b(done);
+    a.bind(rest);
+    if a.stubs_ok() && shared_stubs_enabled() {
+        let stub = a.shared_stub(SharedStub::ElemStore.key());
+        a.bl_label(stub);
+        a.cbz(13, false, slow);
+        a.b(stored);
+    } else {
+        emit_word_store_body(a, layout, slow, stored);
+    }
+}
+
+/// Element x9 (a u32) of the Object at x11 (cell x10), with its words at x15 and w14 of them
+/// used, takes the value at `[x20 - 8]`, then `stored`; or `slow`, before any write. An existing
+/// element is an own writable data property, so OrdinarySet writes it whatever the prototype
+/// chain holds: the machine-code `Words::set`. A Number keeps the kind bits exact; any other
+/// value clears NUMBERS and INT32 (exactly, so `KIND_SCANNED` stays: the word it replaces was
+/// no hole and it is none) and marks the owner's card, as every generated store of a
+/// reference does, before the next safepoint. A block with a remembered record takes `slow`
+/// for such a value instead: the word may lie below its traced length, and the helper's
+/// `Words::set` marks its dirty block (the W2c design's decision 4). A hole, or the word just
+/// past the used ones, is a property creation ([`emit_word_create`]); every other index, and
+/// the TDZ marker as the value (it would become a hole), is `slow`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_word_store_body(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    slow: usize,
+    stored: usize,
+) {
+    use crate::value::word_block::{KIND_INT32, KIND_NUMBERS};
+    let create = a.new_label();
+    let other = a.new_label();
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_HS, create);
+    a.ldr_x_lsl3(12, 15, 9);
+    a.mov_imm64(13, crate::value::PACK_EMPTY);
+    a.cmp_reg_x(12, 13);
+    a.b_cond(C_EQ, create);
+    emit_exec_word_load(a, 13, 20, -8);
+    emit_exec_number_guard(a, 13, 1, 16, other);
+    // --- commit: the Number's word, then the kind bits ---
+    a.str_x_lsl3(13, 15, 9);
+    emit_word_number_kind(a, layout, 15, 1, 12, 13, 14, 2);
+    a.b(stored);
     a.bind(other);
     emit_word_value_guard(a, 13, 16, 17, slow);
     emit_word_block_unrecorded(a, layout, 15, 16, 17, slow);
@@ -14450,16 +14491,7 @@ fn emit_word_store(
     emit_card_mark(a, 10, 16, 17);
     a.b(stored);
     a.bind(create);
-    if a.stubs_ok() && use_shared_stub(a) {
-        // Outside hot loops the creation is the chunk's shared stub (the store sites of
-        // Emscripten code, typed arrays almost all, would otherwise each carry it).
-        let stub = a.shared_stub(SharedStub::ElemCreate.key());
-        a.bl_label(stub);
-        a.cbz(13, false, slow);
-        a.b(stored);
-    } else {
-        emit_word_create(a, layout, slow, stored);
-    }
+    emit_word_create(a, layout, slow, stored);
 }
 
 /// Branch to `slow` when the operand word x`value`, stored as an element, would be a hole:
