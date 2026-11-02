@@ -598,6 +598,11 @@ does (Order, step 0).
     (regexp-compiler-tonode.cc:2265-2375, `body_can_be_empty`), SpiderMonkey (its imported
     irregexp, the same code) and JSC (YarrJIT.cpp:4590, 4649) emit it (2026-10-29): both tiers stop
     paying for a check that cannot fire. Folded into W5b's 3d.
+26. Region admission (2026-11-02): the design under "Region admission (design, 2026-11-02)" as
+    written, in its order (input budget, the fused typed-array access, static names in regions,
+    exit sites, the small acyclic spans, then W4's feedback). Step 3 is JSC's per-site exit
+    profile with recompilation, not whole-region refusal. Acyclic spans stay until steps 3 and 4
+    are measured.
 
 ## Non-goals
 
