@@ -5704,3 +5704,67 @@ Predicted: the far-index cliff gone (farcliff's 117 ms to about its 9 ms without
 farcliff2's writes at 300 like the empty start); a write at 100,000 densifies once the named
 entries reach 16,384, close to V8's (which converts at each add once dense enough); the
 workloads unchanged.
+
+### W2c step 6: the sparse limit and the way back to words (record, 2026-11-02)
+
+Two commits on p2-w2c6: abddb903 bounds a loop chain's proof of its receiver's words; c38b4f3c
+admits far indices and densifies sparse arrays by V8's limits (Design 1-2, as written).
+
+The bound, found by the repros: with holes up to 1023 past the capacity admitted, filling a large
+holey array in a chained loop scanned all its words every iteration. A failed preamble proof runs
+the iteration in plain code, whose back edge enters the preamble again, and each hole the loop
+fills withdraws the scan: 20,000 stores after a first write at 100,000 took 721 ms, 98% of it in
+jit_reprove_words. The preamble now proves at most 4,096 used words by a scan (REPROVE_MAX_WORDS,
+the mirror's bound, the W2c design's "bounded scan"); a larger receiver is proven by its kind bits
+alone. A test counts the scans: 3,619 without the bound, none with it, and a small receiver's
+still happen.
+
+The far-index repros (fat LTO, CPU 17, a loaded machine; Node 24 on CPU 18): filling and reading
+200,000 elements after `a = [1, 2, 3]; a[1000] = 0` 119-121 ms -> 9-10 ms (9-11 ms without the
+far write; Node 11-16 ms); 20,000 after `a = []; a[300] = 0` 13 -> 1 ms and 40,000 23 -> 1 ms (Node
+1 ms); 20,000 after a first write at 100,000 11 -> 9 ms (Node 13 ms): the named entries densify at
+16,384, where V8 converts at the first add once dense enough. The W2c exit's "farcliff.js within
+2x of Node" holds.
+
+Choices made in the code, each the owner's to overrule:
+- Every object gets V8's young limit (5,000 words before the density test), as the design said.
+- The admission and the way back can disagree near the limits, as V8's do: an index refused for
+  its grown capacity can densify at once (the way back compares the named form with the largest
+  index + 1, V8's with the length, not with the grown capacity), as V8 converts back on its next
+  add.
+- Two tests' representation expectations moved past the new limits: dense_slot's classic mode
+  starts at index 2^32 - 2, beyond any span the way back takes, and the far-key index test
+  writes at 1,000,000.
+
+Counts against 2f17b229 (fat LTO, Crystal; Octane at a fixed 5 runs), which no far index reaches:
+| | 2f17b229 | step 6 | change |
+| --- | --- | --- | --- |
+| Vue | 1,889,573,675 | 1,890,629,815 | +0.06% |
+| React | 341,816,769 | 341,904,502 | +0.03% |
+| Djot | 676,110,454 | 676,690,091 | +0.09% |
+| chai | 83,477,489,018 | 83,504,978,087 | +0.03% |
+| Richards | 141,717,141 | 141,717,778 | +0.00% |
+| DeltaBlue | 295,087,446 | 295,114,658 | +0.01% |
+| Crypto | 747,662,346 | 749,028,776 | +0.18% |
+| RayTrace | 1,059,241,303 | 1,059,240,123 | -0.00% |
+| EarleyBoyer | 3,616,489,874 | 3,616,519,167 | +0.00% |
+| RegExp | 2,840,148,999 | 2,840,243,292 | +0.00% |
+| Splay | 1,890,405,383 | 1,890,447,121 | +0.00% |
+| NavierStokes | 498,399,469 | 498,249,744 | -0.03% |
+| PdfJS | 8,126,636,764 | 8,129,897,535 | +0.04% |
+| Mandreel | 65,816,933,020 | 65,815,922,671 | -0.00% |
+| Gameboy | 22,771,597,439 | 22,771,683,542 | +0.00% |
+| CodeLoad | 485,237,003 | 485,251,396 | +0.00% |
+| Box2D | 4,667,184,006 | 4,667,246,563 | +0.00% |
+| zlib | 167,427,098,305 | 167,427,433,655 | +0.00% |
+| Typescript | 60,128,295,966 | 60,118,200,846 | -0.02% |
+Within noise; Crypto's +0.18% lies inside the 0.33 points that two functionally identical step-4
+builds moved it.
+
+Checks: rustfmt; clippy in the three landing configurations on Crystal and zombie (x86-64), and
+zombie's aarch64 cross clippy; the lib suite on Crystal (2,599) and zombie (2,528); GC stress on
+the dense-element, store, value, dense-slot, index-name, numeric-array, update-element,
+native-operation, count-guard, array-shift, array-length and word-block tests; Test262 in full at
+--tier=jit threshold 8 (53,575 of 53,575, the report identical to 2f17b229's), difftest (138
+agree, 12 skipped, as at 2f17b229), the fixtures' masked outputs and Octane's at five runs as
+2f17b229's.
