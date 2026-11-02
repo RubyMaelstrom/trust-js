@@ -4690,6 +4690,13 @@ pub fn compile(
     )
 }
 
+/// The operations a function's optional register regions may cover in all (`compile_entry`).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const REGION_OPS_BUDGET: usize = 4096;
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -4982,9 +4989,13 @@ fn compile_entry(
     // forward copy at each interior block of an already selected region.
     let mut region_covered = vec![false; ops.len()];
     let mut acyclic_budget = crate::jit_ir::AcyclicBudget::new(&cfg, ops.len());
-    // All optional general-region copies share one budget, including loop regions.
-    // The preserved baseline and established whole-loop lowerings remain independent.
-    let mut region_copy_bytes = 0usize;
+    // All optional general-region copies share one budget, including loop regions: the
+    // operations they cover, an input measure, as V8 (TurboFan at most 60 KB of bytecode,
+    // Maglev's loop peeling 400 bytecode bytes a loop and 900 a graph), SpiderMonkey (Ion at
+    // most 100,000 bytes) and JSC (DFG at most 100,000 of bytecode cost) bound what they
+    // optimize. Never the code it becomes: no template's size moves a decision. The preserved
+    // baseline and established whole-loop lowerings remain independent.
+    let mut region_ops = 0usize;
     let mut stronger_header_cache = vec![None; ops.len()];
     let in_loop = loop_body_mask(ops);
     // The body's baseline templates end each call to an allocating helper in the
@@ -5059,11 +5070,77 @@ fn compile_entry(
                     let plain_h = emit_loop_chain(&mut a, layout, &plan, &pc_labels, &mut targeted);
                     a.bind(plain_h);
                 } else if let Some(plan) = regions::Plan::build(chunk, &cfg, pc) {
+                    // Covered even when refused: the baseline keeps a refused loop whole.
                     for &(start, end) in plan.ranges() {
                         region_covered[start..end].fill(true);
                     }
                     let checkpoint = a.checkpoint();
-                    let emission = regions::emit(
+                    let emission = (plan.ops() <= REGION_OPS_BUDGET - region_ops).then(|| {
+                        regions::emit(
+                            &mut a,
+                            chunk,
+                            &cfg,
+                            layout,
+                            ilayout,
+                            &plan,
+                            &pc_labels,
+                            &source_targets,
+                            &mut stronger_header_cache,
+                            fast,
+                            array_intrinsics_on,
+                            function_call_intrinsic_on,
+                            l_unwind,
+                            l_direct_finish,
+                            entry_kind,
+                        )
+                    });
+                    match emission {
+                        Some(emission) if emission.profitable() => {
+                            region_ops += plan.ops();
+                            emission.publish(&mut targeted);
+                            a.bind(emission.plain);
+                            if env_flag!("TRUST_JS_JIT_REGIONLOG") {
+                                eprintln!(
+                                    "[jit-region] head {pc}: EMITTED general CFG ({} ops, {} bytes, {} saved-work units)",
+                                    plan.ops(),
+                                    emission.bytes,
+                                    emission.saved_work
+                                );
+                            }
+                        }
+                        Some(emission) => {
+                            a.rewind(checkpoint);
+                            if env_flag!("TRUST_JS_JIT_REGIONLOG") {
+                                eprintln!(
+                                    "[jit-region] head {pc}: retained baseline ({} optional bytes, {} saved-work units)",
+                                    emission.bytes, emission.saved_work
+                                );
+                            }
+                        }
+                        None => {
+                            if env_flag!("TRUST_JS_JIT_REGIONLOG") {
+                                eprintln!(
+                                    "[jit-region] head {pc}: retained baseline ({} ops past the region budget)",
+                                    plan.ops()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if fast & 32768 != 0
+            && layout.valid
+            && !region_covered[pc]
+            && region_ops < REGION_OPS_BUDGET
+        {
+            if let Some(plan) = regions::Plan::build_acyclic(chunk, &cfg, pc, &mut acyclic_budget) {
+                for &(start, end) in plan.ranges() {
+                    region_covered[start..end].fill(true);
+                }
+                let checkpoint = a.checkpoint();
+                let emission = (plan.ops() <= REGION_OPS_BUDGET - region_ops).then(|| {
+                    regions::emit(
                         &mut a,
                         chunk,
                         &cfg,
@@ -5079,18 +5156,25 @@ fn compile_entry(
                         l_unwind,
                         l_direct_finish,
                         entry_kind,
-                    );
-                    if emission.profitable() && emission.bytes <= 128 * 1024 - region_copy_bytes {
-                        region_copy_bytes += emission.bytes;
+                    )
+                });
+                match emission {
+                    Some(emission) if emission.profitable() => {
+                        region_ops += plan.ops();
                         emission.publish(&mut targeted);
                         a.bind(emission.plain);
                         if env_flag!("TRUST_JS_JIT_REGIONLOG") {
                             eprintln!(
-                                "[jit-region] head {pc}: EMITTED general CFG ({} bytes, {} saved-work units)",
-                                emission.bytes, emission.saved_work
+                                "[jit-region] head {pc}: EMITTED acyclic CFG ({} ops, {} bytes, {region_ops} ops in all)",
+                                plan.ops(),
+                                emission.bytes
                             );
                         }
-                    } else {
+                    }
+                    Some(emission) => {
+                        // Code, fixups and private labels roll back together. Crucially, no
+                        // speculative bailout destinations have been published: the mature
+                        // baseline retains every independently legal span fusion.
                         a.rewind(checkpoint);
                         if env_flag!("TRUST_JS_JIT_REGIONLOG") {
                             eprintln!(
@@ -5099,56 +5183,13 @@ fn compile_entry(
                             );
                         }
                     }
-                }
-            }
-        }
-        if fast & 32768 != 0
-            && layout.valid
-            && !region_covered[pc]
-            && region_copy_bytes < 128 * 1024
-        {
-            if let Some(plan) = regions::Plan::build_acyclic(chunk, &cfg, pc, &mut acyclic_budget) {
-                for &(start, end) in plan.ranges() {
-                    region_covered[start..end].fill(true);
-                }
-                let checkpoint = a.checkpoint();
-                let emission = regions::emit(
-                    &mut a,
-                    chunk,
-                    &cfg,
-                    layout,
-                    ilayout,
-                    &plan,
-                    &pc_labels,
-                    &source_targets,
-                    &mut stronger_header_cache,
-                    fast,
-                    array_intrinsics_on,
-                    function_call_intrinsic_on,
-                    l_unwind,
-                    l_direct_finish,
-                    entry_kind,
-                );
-                let added = emission.bytes;
-                if !emission.profitable() || added > 128 * 1024 - region_copy_bytes {
-                    // Code, fixups and private labels roll back together. Crucially, no
-                    // speculative bailout destinations have been published: the mature
-                    // baseline retains every independently legal span fusion.
-                    a.rewind(checkpoint);
-                    if env_flag!("TRUST_JS_JIT_REGIONLOG") {
-                        eprintln!(
-                            "[jit-region] head {pc}: retained baseline ({added} optional bytes, {} saved-work units)",
-                            emission.saved_work
-                        );
-                    }
-                } else {
-                    region_copy_bytes += added;
-                    emission.publish(&mut targeted);
-                    a.bind(emission.plain);
-                    if env_flag!("TRUST_JS_JIT_REGIONLOG") {
-                        eprintln!(
-                            "[jit-region] head {pc}: EMITTED acyclic CFG ({added} bytes, total {region_copy_bytes})"
-                        );
+                    None => {
+                        if env_flag!("TRUST_JS_JIT_REGIONLOG") {
+                            eprintln!(
+                                "[jit-region] head {pc}: retained baseline ({} ops past the region budget)",
+                                plan.ops()
+                            );
+                        }
                     }
                 }
             }

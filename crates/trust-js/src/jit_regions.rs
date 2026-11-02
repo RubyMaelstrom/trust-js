@@ -614,6 +614,12 @@ impl Plan {
         &self.blocks
     }
 
+    /// The operations the region copies: its blocks' bytecode, an input measure that no
+    /// template's size moves.
+    pub(super) fn ops(&self) -> usize {
+        self.blocks.iter().map(|&(start, end)| end - start).sum()
+    }
+
     fn build_kind(
         chunk: &Chunk,
         cfg: &Cfg,
@@ -843,65 +849,31 @@ impl Plan {
 
 /// All optional code and deopt destinations remain private until admission.
 /// Cost units describe eliminated canonical transfers/owner operations, not CPU
-/// cycles. Byte estimates deliberately allow the full mature property/call
-/// templates; the function-wide hard byte budget remains authoritative.
+/// cycles. What a function may copy is bounded by the operations its regions cover
+/// (`compile_entry`'s region budget), never by the code they become.
 pub(super) struct Emission {
     pub(super) plain: usize,
     pub(super) targets: Vec<usize>,
     pub(super) saved_work: usize,
     entry_work: usize,
-    baseline_bytes: usize,
     pub(super) bytes: usize,
     acyclic: bool,
 }
 
 impl Emission {
+    /// The region has something to do: what it saves exceeds what its entry costs (amortized
+    /// over a loop's iterations). Not a size test: none of V8, SpiderMonkey and JSC compares
+    /// optimized code with baseline code (see the plan's "Region admission (design,
+    /// 2026-11-02)").
     pub(super) fn profitable(&self) -> bool {
         let amortization = if self.acyclic { 1 } else { 16 };
         self.saved_work.saturating_mul(amortization) > self.entry_work
-            && self.bytes <= self.baseline_bytes.saturating_mul(2).saturating_add(1024)
     }
 
     pub(super) fn publish(&self, targeted: &mut [bool]) {
         for &pc in &self.targets {
             targeted[pc] = true;
         }
-    }
-}
-
-fn baseline_bytes(op: &Op) -> usize {
-    match op {
-        // These are conservative template-family code charges, not timing
-        // predictions. Complex checked templates must not look artificially cheap.
-        Op::GetProp(..)
-        | Op::GetPropLocal(..)
-        | Op::GetPropThis(..)
-        | Op::GetMethod(..)
-        | Op::GetElem
-        | Op::GetElemLocal(..)
-        | Op::GetMethodElem
-        | Op::SetElem
-        | Op::SetElemDrop
-        | Op::SetElemLocal(..)
-        | Op::SetElemLocalDrop(..) => 1536,
-        Op::Call(..) | Op::CallWithThis(..) | Op::New(..) => 2048,
-        Op::LoadName(..)
-        | Op::LoadNameForCall(..)
-        | Op::LoadNameIn(..)
-        | Op::LoadNameForCallIn(..)
-        | Op::LoadCap(..)
-        | Op::StoreNameCached(..)
-        | Op::UpdateNameCached(..)
-        | Op::StoreCap(..) => 768,
-        Op::LoadLocal(..)
-        | Op::StoreLocal(..)
-        | Op::UpdateLocal(..)
-        | Op::StrictEq
-        | Op::StrictNotEq
-        | Op::EqEq
-        | Op::NotEq => 192,
-        Op::Jump(..) | Op::JumpIfFalse(..) | Op::Const(..) | Op::Undef => 64,
-        _ => 128,
     }
 }
 
@@ -3749,12 +3721,6 @@ pub(super) fn emit(
         targets,
         saved_work,
         entry_work: 1 + plan.homes.len() * 2 + plan.tagged_homes.len(),
-        baseline_bytes: plan
-            .blocks
-            .iter()
-            .flat_map(|&(start, end)| &ops[start..end])
-            .map(baseline_bytes)
-            .sum(),
         bytes: (a.buf.len() - emission_start.0) * 4,
         acyclic: plan.acyclic,
     }

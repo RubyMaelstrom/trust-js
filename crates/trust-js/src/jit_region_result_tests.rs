@@ -472,7 +472,6 @@ fn region_results_profitability_rejection_publishes_no_baseline_targets() {
         targets: vec![1, 2],
         saved_work: 0,
         entry_work: 1,
-        baseline_bytes: 128,
         bytes: 8,
         acyclic: true,
     };
@@ -487,17 +486,18 @@ fn region_results_profitability_rejection_publishes_no_baseline_targets() {
     assert_eq!(a.checkpoint(), checkpoint);
     a.ret();
     assert_eq!(a.finish().len(), 2);
-    let oversized = Emission {
+    // No size test: a region's code is never compared with the baseline's (the function's
+    // region budget counts operations, `compile_entry`).
+    let large = Emission {
         plain,
         targets: vec![1],
         saved_work: 100,
         entry_work: 1,
-        baseline_bytes: 64,
         bytes: 64 * 1024,
         acyclic: false,
     };
     assert!(
-        !oversized.profitable(),
-        "hot loops also obey baseline-relative expansion limits"
+        large.profitable(),
+        "a region that saves work is admitted whatever its code's size"
     );
 }
