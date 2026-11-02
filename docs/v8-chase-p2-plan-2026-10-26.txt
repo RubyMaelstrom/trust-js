@@ -6356,3 +6356,29 @@ counts TailDeep in the exact-PC helper (TEST_JIT_TAIL_DEEP_HELPERS): 50 without 
 with it. Checks: rustfmt; clippy in the three landing configurations on Crystal and zombie, and
 zombie's aarch64 cross clippy; the lib suite on Crystal (2,739) and zombie (2,530); the test
 under TRUST_JS_GC_STRESS=1.
+
+### Region admission: step 4a, third part (record, 2026-11-03)
+
+5cbcad6a: a region stores a Number element in place. The value and the key are in registers, and
+the key may be a tagged home's word, guarded as a Number. advect's `pos` is such a home: it holds
+`undefined` before the loop, so it cannot be a numeric home. The receiver's element words take
+the value as the baseline's store writes a Number over an existing element: the kind bits stay
+exact and a frozen block's words are refused. A typed-array view takes it as the view's store
+does. The element read (32f3fd3f) now takes such keys too. Anything else leaves the region before
+anything is written: holes and appends (property creations), keys that are not indices, and other
+receivers.
+
+Against 2e480ada: NavierStokes -0.22%, TypeScript -0.04%, Vue +0.03%, the rest within 0.01%.
+NavierStokes gained less than the store's share of advect promised. What advect's region still
+loses to the baseline lies in its locals rather than its elements: an SPE profile of the region
+puts 7,640 samples in LoadLocal, 3,269 in UpdateLocal and 2,374 in StoreLocal, against 6,705 in
+GetElemLocal and 2,384 in SetElemLocalDrop. Locals outside the eight numeric homes, and tagged
+homes such as `pos`, are read and written through the frame slot or the home with a guard at
+each use.
+
+Test: region_numeric_element_stores_stay_in_registers_and_leave_for_anything_else. It compares
+with the interpreter over plain arrays, Float64Array and Int32Array views, holes, appends, frozen
+arrays, NaN and -0 values, non-index keys and an array-like object. It fails with the store's
+word or the view's value taken from the wrong register. Checks: rustfmt; clippy in the three
+landing configurations on Crystal and zombie, and zombie's aarch64 cross clippy; the lib suite on
+Crystal (2,740) and zombie (2,530); the element tests under TRUST_JS_GC_STRESS=1.
