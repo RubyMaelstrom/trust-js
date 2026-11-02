@@ -3205,6 +3205,26 @@ pub(super) fn emit(
                     emit_exec_word_store(a, 10, 20, dest);
                     stack.push(Operand::Canonical);
                 }
+                Op::TailDeep
+                    if ilayout.depth.is_multiple_of(4)
+                        && ilayout.depth / 4 < 4096
+                        && !chunk.jit_detailed_feedback_enabled() =>
+                {
+                    // Whether a tail call here is deep enough to run as one: the live
+                    // execution-context depth against the ordinary limit, as the baseline's
+                    // template reads it, left as a Boolean in a register for the JumpIfFalse
+                    // that follows (see `Op::TailDeep`). It used to run in the exact-PC helper.
+                    let limit = crate::bytecode::ordinary_tail_call_depth();
+                    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+                    a.ldr_w_imm(9, 9, ilayout.depth as u32);
+                    a.mov_imm64(10, u64::from(limit));
+                    a.cmp_reg_w(9, 10);
+                    a.cset_w(9, C_HS);
+                    a.mov_imm64(10, crate::value::PACK_BOOL);
+                    a.logic_x(1, 9, 9, 10); // orr: tag the 0/1 payload
+                    a.fmov_d_x(16 + depth as u32, 9);
+                    stack.push(Operand::temporary(ScalarKind::Boolean));
+                }
                 Op::GetElemLocal(receiver)
                     if fast & 1024 != 0
                         && get_elem_inlinable(layout)

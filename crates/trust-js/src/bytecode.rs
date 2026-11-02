@@ -23665,6 +23665,13 @@ pub(crate) unsafe extern "C" fn jit_exec(
     #[cfg(test)]
     if matches!(
         unsafe { &(&(*(*ctx).chunk).ops)[pc as usize] },
+        Op::TailDeep
+    ) {
+        TEST_JIT_TAIL_DEEP_HELPERS.with(|count| count.set(count.get() + 1));
+    }
+    #[cfg(test)]
+    if matches!(
+        unsafe { &(&(*(*ctx).chunk).ops)[pc as usize] },
         Op::UpdateElem(_)
     ) {
         TEST_JIT_UPDATE_ELEM_HELPERS.with(|count| count.set(count.get() + 1));
@@ -25117,6 +25124,10 @@ thread_local! {
     };
     /// `Op::UpdateElem` operations that reached the exact-PC helper.
     pub(crate) static TEST_JIT_UPDATE_ELEM_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    /// `Op::TailDeep` operations that reached the exact-PC helper.
+    pub(crate) static TEST_JIT_TAIL_DEEP_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     pub(crate) static TEST_JIT_TO_STR_HELPERS: std::cell::Cell<usize> = const {

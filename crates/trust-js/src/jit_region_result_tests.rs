@@ -590,3 +590,41 @@ fn region_numeric_element_reads_stay_in_registers_and_leave_for_anything_else() 
         "the loops must run as register regions"
     );
 }
+
+/// A tail position's depth test (`Op::TailDeep`) inside a register region reads the live
+/// execution-context depth in place, as the baseline's template does, instead of running in the
+/// exact-PC helper. Shallow tail calls stay ordinary calls, and a recursion past the ordinary
+/// depth (1,024) still becomes proper tail calls (ECMA-262 PrepareForTailCall).
+#[test]
+fn region_tail_deep_reads_the_depth_in_place_and_keeps_proper_tail_calls() {
+    let source = r#"
+        "use strict";
+        var J = 1, le = 2, fe = 3;
+        function raw(e) { return e && e.raw ? true : false; }
+        function make(e, t, n, o, i) { return e.k + n + o + i; }
+        function view(e) { return raw(e) ? e.k : make(e, !1, J, le, fe); }
+        function count(n, acc) { return n === 0 ? acc : count(n - 1, acc + 1); }
+        var s = 0, plain = { k: 5 }, wrapped = { k: 7, raw: true };
+        for (var w = 0; w < 200; w++) { s = s + view(w & 1 ? plain : wrapped); }
+        s + "," + count(3000, 0) + "," + count(3, 4);
+    "#;
+    let expected = "1800,3000,7";
+    let mut reference = Engine::new();
+    reference.set_tier(Tier::Interp);
+    assert_eq!(evaluate(&mut reference, source), expected);
+    let before = super::regions::executed_regions();
+    let helpers = crate::bytecode::TEST_JIT_TAIL_DEEP_HELPERS.with(std::cell::Cell::get);
+    let mut jit = Engine::new();
+    jit.set_tier(Tier::Jit);
+    jit.set_tier_threshold(0);
+    assert_eq!(evaluate(&mut jit, source), expected);
+    assert!(
+        super::regions::executed_regions() > before,
+        "the tail positions must run in register regions"
+    );
+    assert_eq!(
+        crate::bytecode::TEST_JIT_TAIL_DEEP_HELPERS.with(std::cell::Cell::get),
+        helpers,
+        "no depth test runs in the exact-PC helper"
+    );
+}
