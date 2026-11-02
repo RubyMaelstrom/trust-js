@@ -538,12 +538,22 @@ impl Words {
     /// Report the edges of the words, not the block. A Numbers block has none. A marker's
     /// remembered trace reports only the dirty runs below the traced length and the words past
     /// it; every other trace (a marker's full one, or `None`'s, the verifiers' and the
-    /// heap walks') reports every word.
+    /// heap walks') reports every word. The kind bits are proofs that this trace (NUMBERS: no
+    /// edge) and generated code trust, kept by every write in Rust and in generated code, so
+    /// debug builds check at every trace that each one set holds of the words (W2c step 5): a
+    /// NUMBERS bit left set over a reference would hide it from the collector.
     pub(crate) fn trace_values<S: crate::gc_trace::GcSink + ?Sized>(
         &self,
         purpose: Option<crate::gc_core::TracePurpose>,
         sink: &mut S,
     ) {
+        debug_assert_eq!(
+            self.kind() & KIND_ALL & !self.computed_kind(),
+            0,
+            "element kind bits {:#x} claim more than the words hold ({:#x})",
+            self.kind(),
+            self.computed_kind()
+        );
         if self.kind() & KIND_NUMBERS != 0 {
             return;
         }
