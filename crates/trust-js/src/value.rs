@@ -8540,12 +8540,26 @@ impl Props {
         let words_remove = self.elems.words().is_some_and(|words| {
             words.len() > from && words.as_slice()[from..].iter().any(|&w| w != PACK_EMPTY)
         });
-        if !words_remove && self.entries.iter().all(|(k, _)| keep(k)) {
+        let entries_remove = !self.entries.iter().all(|(k, _)| keep(k));
+        if !words_remove && !entries_remove {
             return;
         }
         self.note_structural();
         if let Some(words) = self.elems.words_mut() {
             words.truncate(from);
+        }
+        if !entries_remove {
+            // Only element words went: every named entry keeps its slot, so the slot memos,
+            // the key index and the shape (named keys only) stand, and an `a.length = 0`
+            // refill appends in native code from its first word (W2c step 4). A set `has_far`
+            // may have outlived its last named index, as the full path below rebuilds it.
+            if self.has_far.get() {
+                self.has_far.set(false);
+                for slot in 0..self.entries.len() {
+                    self.note_inserted(slot);
+                }
+            }
+            return;
         }
         self.entries.retain(|(k, _)| keep(k));
         self.len_slot.set(SlotMemo::NONE);
