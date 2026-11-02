@@ -24387,12 +24387,7 @@ fn dense_own_list(i: &Interp, list: &Value) -> Option<Vec<Value>> {
     };
     let mut values = Vec::with_capacity(len);
     for k in 0..len {
-        let value = b
-            .props
-            .get_index(k as u32)
-            .filter(|p| !p.accessor())
-            .map(|p| p.value())?;
-        values.push(value);
+        values.push(b.props.data_element(k as u32)?);
     }
     Some(values)
 }

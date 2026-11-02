@@ -174,13 +174,7 @@ pub(crate) fn nf_function_apply(
                 // entries. Read those by slot: the generic path allocates a decimal key and walks
                 // the prototype chain for every argument. Holes, accessors, proxies, typed
                 // arrays, and mapped arguments retain full [[Get]] semantics.
-                let own = direct_dense.then(|| {
-                    let b = o.borrow();
-                    b.props
-                        .get_index(k as u32)
-                        .filter(|p| !p.accessor())
-                        .map(|p| p.value())
-                });
+                let own = direct_dense.then(|| o.borrow().props.data_element(k as u32));
                 match own.flatten() {
                     Some(value) => v.push(value),
                     None => v.push(ab(i.get_member_key(&Value::Obj(o), &k.to_string()))?),
@@ -3728,11 +3722,7 @@ pub(crate) fn ordinary_array_length(props: &Props) -> Option<usize> {
 /// Get(object, index) of an own data element of an ordinary object, without allocating the
 /// property key. `None` for a hole or an accessor, whose Get must take the specified path.
 pub(crate) fn own_data_element(props: &Props, index: usize) -> Option<Value> {
-    let index = u32::try_from(index).ok()?;
-    props
-        .get_index(index)
-        .filter(|property| !property.accessor())
-        .map(crate::value::Element::value)
+    props.data_element(u32::try_from(index).ok()?)
 }
 
 /// %ArrayIteratorPrototype%.next without its call boundary (see [`inert_iterator_step`]).

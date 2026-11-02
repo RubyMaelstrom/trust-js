@@ -7791,6 +7791,23 @@ impl Props {
             .map(|slot| Element::entry(&self.entries.fields[slot]))
     }
 
+    /// Own element `n`'s value when it is a data property (a word at any integrity level, or a
+    /// named data entry); `None` when it is absent or an accessor. A read needs no attributes,
+    /// so a word answers without an [`Element`], whose level a caller would have to tell apart.
+    #[inline]
+    pub(crate) fn data_element(&self, n: u32) -> Option<Value> {
+        if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
+            return Some(value);
+        }
+        if !self.has_far.get() {
+            return None;
+        }
+        self.find(PropKey::index(n))
+            .map(|slot| &self.entries.fields[slot])
+            .filter(|property| !property.accessor())
+            .map(Property::value)
+    }
+
     /// Overwrite dense element `n`'s value. `Err` hands the value
     /// back: no such element, or it isn't a plain writable data property — the caller runs the
     /// generic path.
@@ -7838,16 +7855,13 @@ impl Props {
             self.start_packed_elements(0, prop);
             return Ok(());
         }
-        // A sealed or frozen block takes no element (W2c step 7a; the caller's extensibility
-        // check refuses it too).
-        let Some(len) = self
-            .elems
-            .words()
-            .filter(|words| !words.sealed())
-            .map(word_block::Words::len)
-        else {
+        let Some(words) = self.elems.words() else {
             return Err(prop);
         };
+        // A sealed or frozen block's object is non-extensible (W2c step 7a), which every caller
+        // refuses before an append.
+        debug_assert!(!words.sealed(), "an element appended to a sealed block");
+        let len = words.len();
         if self.has_far.get() || n as usize != len || !prop.is_plain_element() {
             return Err(prop);
         }
@@ -7873,9 +7887,12 @@ impl Props {
         if self.has_far.get() || !prop.is_plain_element() {
             return Err(prop);
         }
-        let Some(words) = self.elems.words().filter(|words| !words.sealed()) else {
+        let Some(words) = self.elems.words() else {
             return Err(prop);
         };
+        // A sealed or frozen block's object is non-extensible (W2c step 7a), which every caller
+        // refuses before it defines an element.
+        debug_assert!(!words.sealed(), "an element defined in a sealed block");
         let index = n as usize;
         let len = words.len();
         if words.get(index).is_some() || !self.words_admit(index) {
