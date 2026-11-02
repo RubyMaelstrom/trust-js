@@ -2180,6 +2180,16 @@ pub const H_INTERRUPT: usize = 22;
 /// Exact-PC loop back-edge feedback in diagnostic mode.
 pub const H_LOOP_BACKEDGE: usize = 23;
 
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+thread_local! {
+    /// Calls of [`jit_reprove_words`], for tests.
+    pub(crate) static TEST_REPROVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Pure representation proof: a scan of the element words that makes their kind bits exact
 /// (`Words::reprove`), unless one since the last write already did. No author code, allocation
 /// or safepoint, and no edge changes. The activation owns `raw`.
@@ -2188,12 +2198,22 @@ pub const H_LOOP_BACKEDGE: usize = 23;
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 unsafe extern "C" fn jit_reprove_words(raw: *const std::cell::RefCell<crate::value::Object>) {
+    #[cfg(test)]
+    TEST_REPROVE_CALLS.with(|count| count.set(count.get() + 1));
     // SAFETY: the activation owns `raw` (see above).
     let object = unsafe { &*raw };
     if let Ok(mut body) = object.try_borrow_mut() {
         body.props.reprove_words();
     }
 }
+
+/// The most used words a loop chain's preamble proves again by a scan (`jit_reprove_words`):
+/// the numeric mirror's bound, which W2c's words replaced.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const REPROVE_MAX_WORDS: usize = 4096;
 
 pub const H_GET_METHOD_ELEM: usize = 24;
 /// The historical method-read slot now serves every compact computed-read shape.
@@ -18241,7 +18261,11 @@ fn emit_loop_chain(
             // The element words must be in use, every one a Number with no hole, and (for
             // int-read receivers) an exact int32: element reads become bounds + one indexed
             // load with no tag check. The kind bits say so, or a scan proves them again
-            // (`jit_reprove_words`) unless one since the last write found them exact.
+            // (`jit_reprove_words`) unless one since the last write found them exact. The
+            // scan is bounded (W2c's design: re-provable by a bounded scan, as the mirror's
+            // proof was): a failed proof sends execution to the plain loop, whose back edge
+            // enters here again, so an unbounded scan of a large holey receiver whose holes
+            // the loop fills (each fill withdraws the scan) would cost its length an iteration.
             use crate::value::word_block::{KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS, KIND_SCANNED};
             if words_inlinable(layout) {
                 let mut need = KIND_NUMBERS | KIND_NO_HOLES;
@@ -18259,6 +18283,9 @@ fn emit_loop_chain(
                 a.b_cond(C_EQ, ready);
                 a.logic_imm_w(0, 14, 13, asm::logical_imm_w(KIND_SCANNED).unwrap());
                 a.cbnz(14, false, pre_fail);
+                a.ldur_w(14, 12, -(layout.words_used as i32));
+                a.cmp_imm_x(14, REPROVE_MAX_WORDS as u32);
+                a.b_cond(C_HI, pre_fail);
                 // Cold representation proof preserves all already established integer
                 // homes/receiver pins. d8..d15 are preserved by the C ABI; no transient FP
                 // operand exists in this preamble. This helper cannot execute JS or GC.
