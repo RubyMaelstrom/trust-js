@@ -246,7 +246,7 @@ fn for_in_backing_hits_share_identity_without_retaining_author_objects() {
             // The keys are plain element words: no script reaches this object.
             for index in 0..2 {
                 let property = object.props.get_index(index).unwrap();
-                assert!(matches!(property, crate::value::Element::Word(key, _)
+                assert!(matches!(property, crate::value::Element::Word(key)
                     if matches!(key.view(), crate::value::ValueView::Str(_))));
             }
         }
