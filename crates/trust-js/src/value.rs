@@ -5339,9 +5339,19 @@ impl<'a> Element<'a> {
     /// ([`word_block::Words::integrity`]).
     #[inline]
     pub(crate) fn word(value: Value, integrity: u32) -> Self {
-        if integrity == 0 {
+        // Every level sets SEALED (`Words::sealed`): one bit tells a word without one.
+        if integrity & word_block::KIND_SEALED == 0 {
             Element::Word(value)
-        } else if integrity & word_block::KIND_FROZEN == 0 {
+        } else {
+            Self::word_with_integrity(value, integrity)
+        }
+    }
+    /// A sealed or frozen word's element, out of line: a lookup of any other word pays one
+    /// test of a bit, not the selection of a level.
+    #[cold]
+    #[inline(never)]
+    fn word_with_integrity(value: Value, integrity: u32) -> Self {
+        if integrity & word_block::KIND_FROZEN == 0 {
             Element::SealedWord(value)
         } else {
             Element::FrozenWord(value)
@@ -7542,6 +7552,7 @@ impl Props {
     /// Append one plain element as a word, with no decimal key or index-to-field map. Array
     /// exotic validation (length, extensibility and prototype setters) stays at the caller.
     /// ECMA-262 Array [[DefineOwnProperty]] / OrdinarySet, e28783d5.
+    #[inline]
     fn push_packed_property(&mut self, property: Property) {
         debug_assert!(property.is_plain_element(), "a word is a plain element");
         self.elems.words_start().push(property.into_value());
@@ -7832,7 +7843,7 @@ impl Props {
         let Some(len) = self
             .elems
             .words()
-            .filter(|words| words.integrity() == 0)
+            .filter(|words| !words.sealed())
             .map(word_block::Words::len)
         else {
             return Err(prop);
@@ -7862,7 +7873,7 @@ impl Props {
         if self.has_far.get() || !prop.is_plain_element() {
             return Err(prop);
         }
-        let Some(words) = self.elems.words().filter(|words| words.integrity() == 0) else {
+        let Some(words) = self.elems.words().filter(|words| !words.sealed()) else {
             return Err(prop);
         };
         let index = n as usize;
@@ -7893,7 +7904,7 @@ impl Props {
         if self.has_far.get() || !self.elem_mode.get() {
             return None;
         }
-        let words = self.elems.words().filter(|words| words.integrity() == 0)?;
+        let words = self.elems.words().filter(|words| !words.sealed())?;
         if n as usize + 1 != words.len() || words.as_slice().last() == Some(&PACK_EMPTY) {
             return None;
         }
@@ -7932,7 +7943,7 @@ impl Props {
         if length.accessor() || !length.writable() || length.number_value() != Some(len as f64) {
             return None;
         }
-        let words = self.elems.words().filter(|words| words.integrity() == 0)?;
+        let words = self.elems.words().filter(|words| !words.sealed())?;
         if words.len() != len || !words_have_no_holes(words) {
             return None;
         }
@@ -7966,7 +7977,7 @@ impl Props {
         }
         // Every word is a plain element or a hole, so each moves down one index with its
         // attributes; holes need the caller's proof that they read as absent.
-        let words = self.elems.words().filter(|words| words.integrity() == 0)?;
+        let words = self.elems.words().filter(|words| !words.sealed())?;
         if words.len() != len || (!holes_read_absent && !words_have_no_holes(words)) {
             return None;
         }
@@ -8006,7 +8017,7 @@ impl Props {
         // no integrity bits.
         if (len != 0 || self.elems.has_words())
             && self.elems.words().is_none_or(|words| {
-                words.len() != len || words.integrity() != 0 || !words_have_no_holes(words)
+                words.len() != len || words.sealed() || !words_have_no_holes(words)
             })
         {
             // A word array whose every element is present: the destinations keep plain
@@ -8583,7 +8594,7 @@ impl Props {
             // element is ever stored twice.
             let named = self.has_far.get() && self.find(key).is_some();
             let integrity = self.word_integrity();
-            let sealed_word = integrity != 0
+            let sealed_word = integrity & word_block::KIND_SEALED != 0
                 && !named
                 && self
                     .elems
@@ -8908,7 +8919,7 @@ impl Props {
         let word = self
             .elems
             .words()
-            .filter(|words| words.integrity() != 0)
+            .filter(|words| words.sealed())
             .and_then(|words| {
                 words
                     .as_slice()

@@ -287,12 +287,19 @@ impl Words {
         self.header().flags & KIND_INTEGRITY
     }
 
+    /// Whether the block has an integrity level: every level sets [`KIND_SEALED`] (FROZEN
+    /// comes with it), so one bit answers, a single test-bit branch.
+    #[inline]
+    pub(crate) fn sealed(&self) -> bool {
+        self.header().flags & KIND_SEALED != 0
+    }
+
     /// Give every element the integrity level `bits` (sealed, or frozen and sealed). The
     /// static block has no element to describe and is never written.
     pub(crate) fn set_integrity(&mut self, bits: u32) {
         debug_assert!(bits == KIND_SEALED || bits == KIND_INTEGRITY);
         if !self.is_static_empty() {
-            self.header_mut().flags |= bits;
+            self.header_mut().flags |= bits | KIND_SEALED;
         }
     }
 
