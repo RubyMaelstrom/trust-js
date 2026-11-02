@@ -5535,3 +5535,83 @@ collector skips NUMBERS blocks): GC stress over the new tests and the element te
 protector (Array.prototype or Object.prototype gaining an index, a setter, a proto change, a
 realm switch, another realm's arrays): tests that change each after the sites have run; the
 dump checks change in every chunk with a store site.
+
+### W2c step 4: stores of any value, hole fills and appends (record, 2026-11-02)
+
+Seven commits on p2-w2c4: 2ddae859 the design; 23b33a70 keeps the named entries' slot memos,
+key index and shape when a truncation removes only words (Design 4); b53f122b stores any value,
+fills holes and appends in the ARM64 element templates; 9805f6f2, 796e5ca4 and 6ca7fab2 settle
+where the sequence lives (below); 808839e6 tests stored cells across explicit collections (it
+fails without the owner's card mark, in the collector's old-to-young verification).
+
+Where the sequence lives (Design 3 changed). In line at every site (b53f122b) it grew
+Mandreel's code 7.1%, Gameboy's 5.7% and zlib's 11.7% (5,772 store sites, typed-array stores
+almost all) and moved region admissions both ways: zlib's deflate region, which step 3
+admitted, grew past the 128 KB per-function region budget (129 to 143 KB) and was refused (zlib
+-0.67%, back to step 3a's count), while ten Mandreel decisions flipped (+0.44%). The creation
+sequence as a shared stub outside hot loops (9805f6f2) and everywhere measured alike: these
+sites are almost never in code the emitter marks hot. The sites now keep only the Number
+overwrite they had and send every other store to one shared stub, SharedStub::ElemStore, three
+instructions a site (6ca7fab2), as SpiderMonkey's and JSC's baselines share their store
+handlers: code +0.02% (Vue), +0.03% (Djot), React unchanged, +0.30% (zlib), +0.64% (Mandreel),
++0.21% (Gameboy), and one region decision moves in zlib and one in Mandreel. The call and its
+re-derived checks cost about ten instructions a store: chai -3.39% against -3.54% in line,
+NavierStokes -12.55% against -12.87%.
+
+chai's store helper calls 12.90 M -> 4.46 M (SetElemDrop 9.98 -> 2.63 M, SetElemLocalDrop 2.92
+-> 1.82 M), the 8.44 M the census put in line; the rest are string keys (2.93 M), first
+elements (1.51 M) and growth.
+
+Counts against 7ebe314b (fat LTO, Crystal; user-mode instructions on CPUs 10-13, setarch -R,
+TRUST_JS_GC_PACING=0, median of 3; Octane at a fixed 5 runs):
+| | 7ebe314b | step 4 | change |
+| --- | --- | --- | --- |
+| Vue | 1,904,995,594 | 1,889,566,529 | -0.81% |
+| React | 341,795,055 | 341,814,624 | +0.01% |
+| Djot | 675,821,816 | 676,098,943 | +0.04% |
+| chai | 86,404,011,265 | 83,478,845,439 | -3.39% |
+| Richards | 141,705,977 | 141,718,680 | +0.01% |
+| DeltaBlue | 294,992,787 | 295,082,161 | +0.03% |
+| Crypto | 753,538,995 | 747,659,071 | -0.78% |
+| RayTrace | 1,059,185,776 | 1,059,233,847 | +0.00% |
+| EarleyBoyer | 3,622,058,697 | 3,616,492,619 | -0.15% |
+| RegExp | 2,845,351,186 | 2,840,121,333 | -0.18% |
+| Splay | 1,890,371,418 | 1,890,404,038 | +0.00% |
+| NavierStokes | 569,905,730 | 498,396,042 | -12.55% |
+| PdfJS | 8,479,620,433 | 8,125,556,404 | -4.18% |
+| Mandreel | 65,639,819,196 | 65,816,398,853 | +0.27% |
+| Gameboy | 23,330,631,656 | 22,771,596,430 | -2.40% |
+| CodeLoad | 485,087,416 | 485,234,502 | +0.03% |
+| Box2D | 4,676,586,396 | 4,667,162,961 | -0.20% |
+| zlib | 167,325,217,158 | 167,427,095,163 | +0.06% |
+| Typescript | 60,569,717,963 | 60,128,223,451 | -0.73% |
+The predictions held: chai -3% to -4%, PdfJS -4% to -5%, NavierStokes -12% to -15%, Gameboy -2%,
+Vue -1%, TypeScript -0.5%. The regressions are small: Mandreel +0.27%, one region (function
+@1746839, head 3400) growing from 3,820 to 3,832 bytes past the size test (twice its
+operations' fixed charges plus 1 KB) and refused; Djot +0.04%, DeltaBlue and CodeLoad +0.03%,
+React and Richards +0.01%, in the templates (Djot's +0.08% at b53f122b bisected to them, not to
+23b33a70, with unchanged region decisions). zlib +0.06%: its step-3 region is admitted again.
+
+Measurement: builds that differ only in a template's layout move Gameboy's count by 1.3%
+(22,521 M against 22,819 M, with identical region decisions): its named inline caches re-derive
+and its typed-array length path run at different rates (Interp::ic_get_rederive 0.51% against
+1.31% of instructions, array_buffer_byte_length 5.99% against 4.14%), as caches indexed by heap
+addresses and shape ids collide differently. Changes that small on Gameboy are within that band.
+
+The region size test (Design 5): not changed. Djot's baseline templates (w2c3d) measure 176 bytes
+for an element read against the 1,536 charged, 328-468 for property reads, 312-537 for calls
+against 2,048 and 68 for a name read against 768, while a strict comparison takes 568 against
+192 and a peeking jump 260 against 128: real charges under the same rule would refuse or admit
+regions throughout, a new heuristic rather than a correction. The flips above (12 bytes
+refusing a Mandreel region; zlib's region crossing the budget) say the admission rules decide
+on proxies that any template change moves, and zlib's step-3 region is slower in its work (its
+name-element fallbacks and flushes), which the work estimate does not see: a region-tier item
+of its own.
+
+Checks: rustfmt; clippy in the three landing configurations on Crystal and zombie (x86-64), and
+zombie's aarch64 cross clippy; the lib suite on Crystal (2,595) and zombie (2,525);
+TRUST_JS_GC_STRESS=1 on the 13 store tests and the value, dense-slot, index-name,
+numeric-array, update-element, native-operation, count-guard, array-shift and array-length
+tests; Test262 in full at --tier=jit threshold 8 (53,575 of 53,575, the report identical to
+7ebe314b's), difftest (138 agree, 12 skipped, as at 7ebe314b), the fixtures' masked outputs and
+Octane's at five runs as 7ebe314b's.
