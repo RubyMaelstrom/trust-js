@@ -5392,3 +5392,146 @@ loads before a benchmark moves some counts by itself: declaring one unrelated gl
 earley-boyer.js lowers EarleyBoyer's by 12.6 M (0.35%), and PdfJS's and Gameboy's step-3
 changes moved by 0.16 and 0.08 points between the drivers. Changes that small on those
 benchmarks are within that band.
+
+### W2c step 4: stores of any value, hole fills and appends in line (design, 2026-11-02)
+
+The owner's go-ahead (2026-11-02, after the fixed-run driver's correction). The ARM64 store
+templates (SetElem, SetElemDrop, SetElemLocal, SetElemLocalDrop) overwrite an existing element
+with a Number and send everything else to H_SET_ELEM, about 450 instructions a store (2M appends
+of a 500-element fill: 1,121 M against 219 M without the stores, CPU 0-3, w2c3d).
+
+What reaches the helper (a census build of 7ebe314b, every jit_set_elem call classified by key,
+receiver, value and where the index lands; target/p2/w2c4/census; Octane at five runs):
+| | stores | overwrite, not a Number | overwrite into a large block | append with room | hole | no words | full | string key |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| chai | 12,901,012 | 325 | 0 | 7,205,487 | 1,238,792 | 1,513,600 | 9,015 | 2,933,695 |
+| Vue | 61,829 | 61,765 | 0 | 0 | 0 | 64 | 0 | 0 |
+| Gameboy | 1,496,814 | 0 | 0 | 1,496,222 | 0 | 40 | 552 | 0 |
+| TypeScript | 1,396,650 | 391,795 | 74,421 | 471,753 | 123 | 191,903 | 1,975 | 264,663 |
+| PdfJS | 1,046,008 | 53 | 0 | 1,031,846 | 412 | 2,928 | 5,939 | 4,625 |
+| NavierStokes | 228,252 | 0 | 0 | 228,006 | 0 | 12 | 234 | 0 |
+| Box2D | 51,931 | 23,018 | 13,725 | 10,436 | 3,365 | 1,314 | 73 | 0 |
+| Crypto | 15,878 | 0 | 0 | 6,479 | 8,501 | 409 | 329 | 0 |
+Every u32-keyed store lands on an Array (bar TypeScript's 15,920 into ordinary objects without
+words). No Number overwrite reaches the helper (the template takes them). The appends are
+Numbers and cells alike (chai 6.1 M Numbers, 1.1 M cells; Gameboy 0.8 M and 0.7 M); chai's holes
+are its 216,320 top-down fills (each starts as "no words" past index 0, then fills down); "no
+words" is an array's first element, which allocates its block; a "large block" keeps a
+remembered record (more than 64 words of room) and the index lies below its traced length;
+appends into large blocks (Gameboy, PdfJS, NavierStokes, every one) lie past it. chai's string
+keys are named stores through a computed key (`o[k] = v` in its for-in loops), outside W2c.
+React and Djot reach the helper 0 and 200 times.
+
+What the exemplars do (V8 c8b709085e21, SpiderMonkey bf75471716c5, JSC 260278048486; the files
+in target/p2/w3-design/v8-src and target/p2/w2c4/exemplars):
+- None inlines an element store in its baseline tier. Sparkplug calls KeyedStoreIC
+  (baseline-compiler.cc:1214-1225), whose handlers are one shared builtin per store mode
+  (builtins-definitions.h:517-527; EmitElementStore, code-stub-assembler.cc:14985-15163);
+  SpiderMonkey's baseline tiers run CacheIR stubs shared between sites by their IR ("allows us
+  to share IC code between caches", CacheIR.h:36-41; BaselineCacheIRCompiler.cpp:2057-2108);
+  JSC calls a VM-wide handler chain (InlineCacheCompiler.cpp:620-623). Maglev, V8's inlining
+  tier, emits the map check, the bound and the store in line, its growth too
+  (maglev-graph-builder.cc:5494-5609, 5523-5582). The baselines' call per store leans on a later
+  tier that inlines it; TRust JS has one tier, which inlines its templates as Maglev does.
+- Any value over an existing element: SpiderMonkey's stub has no value-kind logic
+  (CacheIRCompiler.cpp:7312-7355); V8 and JSC change the elements kind in the runtime, because
+  their double kinds store unboxed doubles (code-stub-assembler.cc:15067, 15094;
+  InlineCacheCompiler.cpp:2592-2615). TRust's words are NaN-boxed whatever their kind, so the
+  kind bits clear in line, as SpiderMonkey's NON_PACKED flag does.
+- Appends: V8 grows a packed array only when the key equals `length` (CheckForCapacityGrow,
+  code-stub-assembler.cc:15165-15228) and refuses a read-only `length` when it installs the
+  handler (ic.cc:3142-3144); SpiderMonkey checks extensibility, a writable `length` and the
+  prototype chain when it attaches AddAndStoreDenseElement (CacheIR.cpp:4956-5030), and at run
+  time only the shape and the capacity (CacheIRCompiler.cpp:7357-7382; prepareOOBStoreElement,
+  MacroAssembler.cpp:10278-10360); JSC stores past publicLength within vectorLength
+  (InlineCacheCompiler.cpp:2636-2643). TRust's sites have no attach step, so each store checks
+  extensibility and `length` itself.
+- Holes: SpiderMonkey shares the append's operation and guards Array.prototype and
+  Object.prototype with a realm fuse, one load and a branch (CacheIR.cpp:804-809;
+  CacheIRCompiler.cpp:11868-11880), popped when either gains an indexed property or its first
+  dense element (Watchtower.cpp:162-193, 348-361). TRust's elems_protector is that fuse, an
+  epoch-keyed proof. V8 installs the handler only while no prototype holds read-only elements,
+  with a validity cell (ic.cc:3165-3175); JSC converts every array when a prototype gains an
+  indexed accessor (haveABadTime, JSGlobalObject.cpp:2765-2798).
+- The barrier: V8 emits none for its Smi and double kinds and skips Smis before its page-flag
+  tests (code-generator-arm64.cc:1290-1295); SpiderMonkey skips values typed as non-GC and tests
+  the value's tag first (CacheIRCompiler.cpp:9197-9206), recording the whole cell, or past 256
+  elements the slot (VMFunctions.cpp:1052-1076); JSC filters only on the owner's cell state
+  (JITPropertyAccess.cpp:262-265). TRust's card records the whole owner, as SpiderMonkey's and
+  JSC's whole-cell entries do, and is skipped for a Number, as V8's number kinds skip theirs;
+  its 64-word dirty bitmap is SpiderMonkey's per-slot entries past 256.
+- Growth and the first element: in V8's shared builtin (code-stub-assembler.cc:7172-7248), in
+  SpiderMonkey's pure ABI call one past capacity (addDenseElementPure,
+  MacroAssembler.cpp:10295-10312), in JSC's C++ slow path; not in this step.
+
+Design (ARM64; x86-64 has no element templates and keeps the helper):
+1. One store sequence for the four forms, after today's receiver, key and plainness guards
+   (x9 the index, x10 the cell, x11 the Object):
+   - Overwrite (index below the used words, the word no hole): a Number as today (kind bits
+     through emit_word_number_kind). Any other value clears NUMBERS and INT32, which is then
+     exact, so KIND_SCANNED stays; a NUMBERS block is never traced (Words::trace_values), so
+     the clear is what keeps a stored cell alive. The owner's card is marked (emit_card_mark,
+     as every other generated store of a reference). A block with a remembered record (room
+     past 64 words, front room included) takes the helper, whose Words::set marks the dirty
+     block: the W2c design's decision 4 (in line with W2f's barrier work); TypeScript's 74,421
+     and Box2D's 13,725 are the only such stores measured.
+   - Creation (a hole below the used words, or the index equal to the used length with room):
+     [[Set]] finds no own property, so OrdinarySet consults the prototype chain and then
+     CreateDataProperty on the receiver (ECMA-262 §10.1.9.2, §10.4.2.1). The sequence proves
+     what fast_set_elem proves in Rust: an Array, extensible, not itself a marked prototype (a
+     structural change to one must bump the creation epoch: note_structural), no index among
+     its named entries (has_far clear, so the index is absent), its prototype the active
+     realm's %Array.prototype%, and the protector proof Interp::elems_protector live at the
+     current PROTO_EPOCH (the canonical Array.prototype -> Object.prototype chain has no index
+     key, no exotic hop, and every structural change to either bumps the epoch). A stale proof
+     takes the helper, whose array_prototypes_unshadowed renews it. A realm switch resets it.
+     An append at or past `length` also needs a writable data `length` (its slot memo, as the
+     map/filter append) and sets it to index + 1; an append below `length` (after
+     `new Array(n)`, or a length store) and a hole fill (below the used words, which never pass
+     `length`) leave it. The kind bits: an append keeps NO_HOLES and KIND_SCANNED (no cleared
+     fact can become true) and clears NUMBERS/INT32 as the value breaks them; a hole fill may
+     make NO_HOLES true again, so it clears KIND_SCANNED, with NUMBERS/INT32 as an overwrite.
+     A value that is not a Number marks the owner's card; an append lies past the traced
+     length, so it needs no dirty block (the map/filter append's site E); a hole fill of such
+     a value into a block with a record takes the helper.
+   - Everything else keeps the helper: an index past the used words by more than one (a gap),
+     a full block or none (growth and the first element allocate), an ordinary object's
+     creation (its chain is not the protector's), string and other keys, and the TDZ marker
+     as the value (it would become a hole).
+2. Every check precedes the first write; the commit is the word, the kind bits, the card, the
+   used length and `length`, with no safepoint between them.
+3. The sequence is in line at every site, as the existing templates are and as Maglev inlines
+   its element stores; about 60 instructions more per store site, about 1% of the fixtures'
+   code (Vue 30 store sites in 610 KB, Djot 144 in 3.8 MB, React none).
+4. A truncation (`a.length = n`) that removes only words keeps the named entries' slot memos,
+   key index and shape (Props::remove_indices_from reset them all, a leftover of the named index
+   keys step 3 retired), so an `a.length = 0` refill appends in native code from its first word
+   instead of finding `length` through the helper.
+5. The region size test. Emission::profitable admits a register region when its bytes are at
+   most twice its operations' fixed charges plus 1 KB (jit_regions.rs baseline_bytes: 1,536
+   for every element and property operation, 2,048 for calls, 768 for names). The charges
+   stay fixed while the templates change, so step 3's smaller element templates admitted
+   zlib's a8 region (+0.61% at five runs) and step 4's larger stores could refuse others.
+   Regions are emitted before their baseline code, so the test cannot read the baseline's
+   real bytes. The candidate: charge each operation family the bytes its template emits,
+   measured once per process into a scratch assembler. Today's charges are several times the
+   real sizes (an element read's template is a few hundred bytes against 1,536), so real charges under the
+   same rule would refuse most regions; the rule would need its own calibration. Measured
+   after the stores land, over every workload; it lands only if no workload regresses, and
+   otherwise zlib's region stays a region-tier follow-up (its slow paths' cost in the work
+   estimate, not its size).
+
+Predicted, from the census and about 350-400 instructions saved per store (450 for the helper
+against 50-100 in line): chai -3% to -4% (8.4 M stores), Gameboy -2%, PdfJS -4% to -5%,
+NavierStokes -12% to -15%, TypeScript -0.5%, Vue -1%, Box2D and Crypto small; Richards,
+DeltaBlue, RayTrace, EarleyBoyer, Splay, Mandreel, CodeLoad and the other fixtures unchanged.
+
+Not in this step: the first element and growth (chai 1.5 M, TypeScript 0.19 M), which allocate;
+a pure call that grows the block without the helper's dispatch (SpiderMonkey's
+addDenseElementPure) would save part of it. String-keyed stores (chai 2.9 M) are named stores.
+
+Risks: cells stored by generated code into old arrays (the card) and the NUMBERS clear (the
+collector skips NUMBERS blocks): GC stress over the new tests and the element tests; the
+protector (Array.prototype or Object.prototype gaining an index, a setter, a proto change, a
+realm switch, another realm's arrays): tests that change each after the sites have run; the
+dump checks change in every chunk with a store site.
