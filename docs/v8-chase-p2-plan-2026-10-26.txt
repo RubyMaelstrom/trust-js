@@ -5968,3 +5968,210 @@ element, native-operation, count-guard, array-shift, array-length, word-block, r
 and write-barrier tests; Test262 in full at --tier=jit threshold 8 (53,575 of 53,575, the report
 identical to bfc5e7fe's); difftest (138 agree, 12 skipped); the fixtures' masked outputs as
 bfc5e7fe's.
+
+### Region admission (design, 2026-11-02)
+
+The follow-up W2c steps 3 and 4 left: the native tier's optional register regions (a loop's or a
+bounded acyclic span's SSA copy, jit_regions.rs, with the baseline templates kept as its bailout
+target) are admitted by tests that template changes flip, and zlib's a8 runs slower with its
+region than without it. Measured here on main 5d40ee64; the tools are in
+target/p2/region-admission.
+
+The rules today (jit.rs:5083-5150, jit_regions.rs:859-863):
+1. Work: the units the region saves (transfers, owner operations) times 16 for a loop or 1 for an
+   acyclic span exceed its entry's, 1 + 2 per numeric home + 1 per tagged home.
+2. Size: its bytes are at most twice its operations' fixed charges plus 1 KB.
+3. Budget: a function's optional copies take at most 128 KB in all, granted in pc order.
+
+What decides in practice. A measurement-only build (variants/policy.py) picks the rule by
+environment variable and refuses or keeps single regions by function and head. Counts against
+the current rule (fat LTO, Crystal, user-mode instructions on CPUs 10-13, median of 3; Octane at
+a fixed 5 runs with octane-fixed/clock.js):
+| | no regions | loops only | acyclic only | no tests | no size test | work test only |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | -0.40% | -0.57% | +0.34% | -0.00% | -0.00% | -0.00% |
+| React | +12.28% | -0.46% | +12.77% | +0.00% | +0.00% | -0.00% |
+| Djot | -0.28% | -0.51% | +0.23% | +0.05% | -0.00% | +0.00% |
+| chai | -0.04% | -0.06% | +0.02% | +0.01% | +0.03% | -0.02% |
+| Richards | -0.36% | -0.26% | -0.11% | +0.02% | +0.00% | -0.00% |
+| DeltaBlue | -2.62% | -0.34% | -2.28% | +0.08% | -0.00% | -0.00% |
+| Crypto | -1.20% | -0.23% | -0.96% | +0.03% | -0.00% | +0.00% |
+| RayTrace | +0.13% | +0.29% | -0.17% | +0.00% | +0.00% | -0.00% |
+| EarleyBoyer | -2.14% | -1.05% | -1.08% | +0.02% | -0.00% | -0.00% |
+| RegExp | +1.63% | +0.66% | +1.00% | +0.10% | +0.00% | +0.10% |
+| Splay | -0.60% | -0.37% | -0.23% | +0.01% | -0.00% | +0.00% |
+| NavierStokes | -11.30% | -0.03% | -11.26% | +0.02% | -0.00% | +0.00% |
+| PdfJS | +1.82% | -0.23% | +2.04% | +0.03% | +0.00% | +0.04% |
+| Mandreel | +11.03% | -0.19% | +11.22% | -0.07% | -0.00% | -0.11% |
+| Gameboy | +8.08% | +3.39% | +4.99% | +0.00% | -0.00% | +0.00% |
+| CodeLoad | -0.20% | -0.09% | -0.11% | +0.02% | -0.00% | +0.00% |
+| Box2D | +1.18% | +0.16% | +1.05% | -0.42% | -0.00% | -0.43% |
+| zlib | +16.72% | +0.11% | +16.58% | -5.78% | +0.00% | -5.78% |
+| TypeScript | -0.46% | -0.04% | -0.42% | -0.03% | -0.00% | +0.00% |
+("Loops only" refuses every acyclic span, "acyclic only" every loop; "no tests" admits every region
+the builder plans. Gameboy moves up to 1.3% between builds that differ only in layout. On the
+step-1 build below, the first two columns agree with these within 0.3 points elsewhere.)
+- The size test refuses nothing in any workload today: dropping it changes no count. It decided
+  regions only when a template's size moved under its fixed charges (W2c steps 3 and 4).
+- The work test refuses regions worth at most 0.1% (no tests against the work test alone).
+- The budget decides in large functions (zlib, Mandreel, Box2D, RegExp, TypeScript). Granted in
+  pc order, it reaches a function's later loops last: in a8's full compile the loop at pc 252
+  takes 129,716 bytes and the loop at pc 1452, 70% of a8's instructions, is refused. Without the
+  budget: zlib -5.78%, Box2D -0.43%, Mandreel -0.11%, RegExp +0.10%, PdfJS +0.04%, and code +10.7%
+  (zlib), +8.9% (Mandreel), +12.7% (RegExp), +4.4% (Box2D), +2.4% (TypeScript). Regions cost
+  92 bytes an operation in zlib's a1 and 250-290 in RegExp's and Box2D's largest functions, so a
+  byte budget admits very different programs very differently.
+- Regions as a whole help where no test decides: without any, React +12.3%, zlib +16.7%,
+  Mandreel +11.0%, Gameboy +8.1%, PdfJS +1.8%, RegExp +1.6%, Box2D +1.2%. They also cost:
+  NavierStokes -11.3%, DeltaBlue -2.6%, EarleyBoyer -2.1%, Crypto -1.2% without them. Refusing
+  only the acyclic spans helps ten workloads (EarleyBoyer -1.05%, Vue -0.57%, Djot -0.51%, React
+  -0.46%) and costs Gameboy +3.4%, RegExp +0.66%, RayTrace +0.29%.
+
+No test sees the regions that lose. Four causes, each measured:
+1. Compile time. RegionIr::remove_trivial_params walked every block's successors for each
+   parameter of each block, up to once per block; every block has a parameter for every local,
+   so the pass was cubic in the region's size: 9.2% of DeltaBlue's instructions, 1.2% of
+   CodeLoad's, about 1% of Djot's and EarleyBoyer's. Landed as step 1 (below).
+2. Speculation that keeps failing. A census build (variants/census2.py) counts each region's
+   entries, bails and exits in generated code, by bail site. 81% of the bails are a region's
+   ordinary end at a return, which regions do not lower (jit_regions.rs:2982-2986). The rest
+   are guards that fail on most entries. Each such entry runs the region's entry, part of the
+   work, the bail, and the rest of the iteration in baseline code, whose back edge enters the
+   region again:
+   - DeltaBlue's Plan.execute loop, with `c.execute()` inlined for one constraint class, misses
+     its inline guard on 94% of entries. Refusing that region saves 1.69%.
+   - React's reducerBatch loops speculate a Number Add on string concatenations (`'Todo ' + i`,
+     `'changed-' + i`) and bail on 99% of entries. Also:
+     PdfJS's hottest loop on an Add (100%), zlib's loops on a local's Number guard (99%),
+     Mandreel's on a store to a numeric home (100%), Splay on an Add (52%; refusing it: -0.35%),
+     TypeScript on inline guards (96%) and a call's result guard (68%).
+   Refusing every region whose speculative bails reach half its entries: DeltaBlue -1.79%,
+   Splay -0.35%, Box2D -0.27%, RegExp -0.11%, but React +0.43%, Mandreel +0.41%, PdfJS +0.06%:
+   those regions do more work before the failing guard than the bails cost. The speculation at
+   one site fails, not the region.
+3. Lowering worse than the baseline's.
+   - NavierStokes's advect. As a region its inner loop runs 35% more instructions than as
+     baseline code; refusing its two regions saves 11.05%, all of NavierStokes's loss. The
+     region pushes its operands to the frame's operand stack around each static name read
+     (`width`, `rowSize`: Decision 21's coordinates) and reloads them with a Number check. The
+     baseline's numeric chains keep them in registers.
+   - The fused access to a typed array named by a free name (NameElementPlan). Stub:NameElement
+     proves the name through the generic name cache before the element access. In one zlib run
+     it takes 11.2 G instructions; the same accesses unfused cost 9.4 G (a static name read,
+     Stub:TypedElement and their templates). With the fusion off: zlib -9.14%, RegExp -0.97%
+     (whose fused sites find no typed array: 511,908 fallbacks), Mandreel +8.12%. Each fused
+     site also carries its own copy of the name and element templates as its fallback. That
+     doubles a8's regions (loop 252: 61 KB unfused, 130 KB fused) and spent a8's budget.
+4. Small acyclic regions that end at a return lose in Vue (ve, `return _e(e)?e:ye(...)`, about
+   200 instructions a call more with its region; ke, 29), EarleyBoyer (an nboyer term compare,
+   37 a call) and Djot: refusing them saves 0.40% and 0.17% of Vue, 1.04% of EarleyBoyer and
+   0.19% of Djot. Vue's profile with ve's region shows 4.3 M more instructions in the exact-PC
+   helper (jit_exec); the bail targets a region publishes also stop the baseline's fusions at
+   those pcs. The rest is not yet explained.
+
+What V8, SpiderMonkey and JSC do (target/p2/region-admission/exemplars.txt; V8 c8b70908,
+SpiderMonkey 6bb81100, JSC 26027804):
+- They admit optimized code by counted hotness and never estimate the work it saves:
+  TieringManager::ShouldOptimize compares budgets and has no cost or benefit term
+  (tiering-manager.cc:434-474); SpiderMonkey compares a warm-up counter with thresholds
+  (JitOptions.cpp:211-249); JSC multiplies its thresholds by 0.83 + 0.06 x sqrt(bytecode cost)
+  (CodeBlock.cpp:2512-2607).
+- Their size limits are on input. V8: TurboFan stops at 60 KB of bytecode (pipeline.cc:699-702)
+  and Maglev at 512 KB. Maglev peels only innermost loops under 400 bytecode bytes, 900 per graph
+  (maglev-graph-builder.cc:17775-17800), its nearest kin to an optional copy of a loop. TurboFan
+  inlines up to 920 bytecode bytes in all (js-inlining-heuristic.cc:373-384). SpiderMonkey's Ion
+  stops at 100,000 bytes (Ion.cpp:1964-1988); JSC's DFG at 100,000 of bytecode cost and its FTL
+  at 60,000, with inlining budgets of 2,500 and 12,000 a compilation. None compares optimized
+  machine code with baseline code, and none budgets machine code per function. Only
+  process-wide executable memory counts: SpiderMonkey's 8 MB headroom gate
+  (ProcessExecutableMemory.cpp:904-917) and JSC's pressure-scaled thresholds
+  (ExecutableAllocator.cpp:1146-1163).
+- They count exits, and the next compile drops the speculation that failed, not the code
+  around it. SpiderMonkey recompiles after 10 bailouts of the fixable kinds
+  (IonScript.h:336-341), and particular bailout kinds set script flags that remove just that
+  speculation (BaselineBailouts.cpp:2014-2189). JSC jettisons after 100 exits (5 from loops); it
+  records each frequent exit site by bytecode index and exit kind in the baseline block's
+  ExitProfile, which the next DFG compile consults per speculation, and doubles its thresholds
+  per retry (CodeBlock.cpp:2399-2417, 3093-3123, 2737-2770). V8 marks a deopting call or loop
+  site non-speculative (translated-state.cc:3006-3024).
+- Nothing times optimized code. They keep it from being slower upstream: they compile after
+  feedback settles, speculate from the baseline's profiles (SpiderMonkey transpiles its CacheIR),
+  and turn off-profile paths into counted exits.
+- None makes an optimized copy of a straight-line span. They compile whole functions with loop
+  entries and enter outer loops first.
+
+Design: the exemplars' rule within one tier. Admission by input caps, failed speculation by
+exit sites, and region code no worse than the baseline's for any operation. Each step is
+measured and lands on its own:
+1. The region IR in linear time (landed, below).
+2. Input, not output. The size test goes: it refuses nothing today and decides only when a
+   template's size changes. The 128 KB of output becomes a budget of region operations per
+   function, the unit the exemplars cap, which no template change moves. Its size comes from
+   counts at 1,024, 2,048 and 4,096: the smallest that admits a8's two loops (about 1,360
+   operations in its full compile) without growing RegExp's code for nothing. The work test
+   stays as the builder's test that a region has something to do; it moves no count by more
+   than 0.1%.
+3. Exit sites (JSC's ExitProfile, SpiderMonkey's bailout flags).
+   - Each speculative bail site of a region counts its bails in generated code, on the bail
+     path only. Returns are not counted: they are a region's ordinary end.
+   - At a threshold the chunk records the site and discards its code, so the next call compiles
+     it again. JSC jettisons at 100 and SpiderMonkey invalidates at 10; the threshold is chosen
+     by measurement.
+   - That compile lowers the recorded sites without their speculation. A Number Add becomes the
+     generic add inside the region. An inline guard's miss continues in the region through the
+     call alternative. A local whose guard failed stops being a numeric home.
+   - Expected from the census: DeltaBlue, Splay, Box2D and RegExp keep their regions' work
+     without the bails. React, PdfJS, zlib, Mandreel and TypeScript lose their bails, and no
+     region is refused.
+4. Lowering parity.
+   a. Static name reads stay in registers inside a region (advect; NavierStokes's 11.05% is the
+      bound).
+   b. The fused typed-array access reads its name the way the baseline does, through Decision
+      21's coordinates when the name has them. It is not fused where the element site's cache
+      has seen no typed array (RegExp). All its sites share one cold path per chunk instead of a
+      copy each (a8's 130 KB).
+   c. Find what costs the small acyclic regions that end at a return (Vue's ve, about 200
+      instructions a call), and fix or refuse that shape.
+5. With W4's value classes, regions speculate from the baseline's feedback rather than from SSA
+   demand alone, so most failing speculations are never compiled (all three exemplars speculate
+   from profiles). This is part of W4's remainder.
+
+Not proposed: compiling a region only once its loop is hot, with entry into the new code.
+That is how the exemplars' optimizing tiers work and is Phase 3's tier structure. Removing
+acyclic spans (no exemplar has them; they cost ten workloads 0.2-1% and save Gameboy 3.4%) is
+re-measured after steps 3 and 4.
+
+Order: 2, then 4b (zlib, RegExp), 4a (NavierStokes), 3, 4c, and 5 with W4.
+
+Step 1, landed (b36823b4): remove_trivial_params and live_entry_locals read each block's incoming
+edges from one array built once (RegionIr::incoming_edges), in the order the old walk met them.
+The replacements and live locals are the walk's, and the generated code is byte for byte the same
+in all 18 workloads (dumpsum.py of TRUST_JS_JIT_CODEDUMP=*). Counts against 5d40ee64:
+| | 5d40ee64 | b36823b4 | change |
+| --- | --- | --- | --- |
+| Vue | 1,892,202,993 | 1,890,472,393 | -0.09% |
+| React | 337,925,219 | 337,599,005 | -0.10% |
+| Djot | 676,741,073 | 674,784,793 | -0.29% |
+| chai | 83,474,424,604 | 83,464,925,442 | -0.01% |
+| Richards | 141,835,953 | 141,871,245 | +0.02% |
+| DeltaBlue | 295,499,698 | 266,079,848 | -9.96% |
+| Crypto | 750,424,199 | 749,201,873 | -0.16% |
+| RayTrace | 1,059,324,946 | 1,055,880,862 | -0.33% |
+| EarleyBoyer | 3,669,253,712 | 3,643,861,674 | -0.69% |
+| RegExp | 2,839,498,318 | 2,839,706,745 | +0.01% |
+| Splay | 1,890,602,313 | 1,888,160,288 | -0.13% |
+| NavierStokes | 496,776,265 | 496,517,594 | -0.05% |
+| PdfJS | 8,123,826,654 | 8,091,344,635 | -0.40% |
+| Mandreel | 65,815,734,526 | 65,773,091,366 | -0.06% |
+| Gameboy | 22,800,350,817 | 22,788,647,149 | -0.05% |
+| CodeLoad | 485,406,387 | 481,605,663 | -0.78% |
+| Box2D | 4,669,589,801 | 4,643,290,308 | -0.56% |
+| zlib | 167,353,782,324 | 167,234,427,644 | -0.07% |
+| TypeScript | 60,124,451,263 | 59,779,722,321 | -0.57% |
+Richards' +0.02% and RegExp's +0.01% come from outside the changed code: the generated code is
+the same, and fat LTO compiled two functions the change does not touch differently
+(Interp::make_arguments_object is one instruction shorter, bytecode::finish_chunk seven).
+Octane here runs with clock.js, so PdfJS's count is deterministic; the records before this one
+used the real clock. Checks: rustfmt; clippy in the three landing configurations on Crystal and
+zombie (x86-64), and zombie's aarch64 cross clippy; the 84 region and IR tests, then the lib
+suite on Crystal (2,735) and zombie (2,530).
