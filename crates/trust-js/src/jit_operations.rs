@@ -1064,7 +1064,7 @@ fn fixed_cap(
 
 /// A captured binding's fixed offset from its activation (`env_raw`): the record's header, then
 /// one word a slot (W3 item 3's step 5).
-fn cap_slot_offset(slot: u32) -> u32 {
+pub(super) fn cap_slot_offset(slot: u32) -> u32 {
     (crate::interpreter::RECORD_HEADER + 8 * slot as usize) as u32
 }
 

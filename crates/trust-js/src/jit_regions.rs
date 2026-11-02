@@ -1993,15 +1993,20 @@ fn name_element_stub(a: &asm::Asm) -> bool {
 /// caller's). `leaf` carries the name probe and the element access in line: the shared routine
 /// calls nothing, so its link register stays the caller's.
 ///
+/// `resolved`: the site found the binding at its static address (Decision 21,
+/// [`emit_static_name_ptr`]) and entered with x14 and x7 set, so no name cache is proved.
+///
 /// * `hit`: the element is read (x12 = packed Number, d1 = value) or written.
 /// * `value_miss`: the name validated (x14 = its word, x7 = owner kind) but the receiver or
 ///   index is not for the native path.
 /// * `name_miss`: the name cache did not validate or a typed-array guard failed.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_name_element_body(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     write: bool,
     leaf: bool,
+    resolved: bool,
     hit: usize,
     name_miss: usize,
     value_miss: usize,
@@ -2011,12 +2016,14 @@ pub(super) fn emit_name_element_body(
     #[cfg(not(test))]
     let committed = hit;
     // x14 points at the execution word; x7 remains Binding=0/Property=1.
-    if leaf || !shared_stubs_enabled() {
-        emit_name_ic_value_ptr_body(a, layout, name_miss, true);
-    } else {
-        let stub = a.shared_stub(SharedStub::NameValuePtr { property_ok: true }.key());
-        a.bl_label(stub);
-        a.cbz(9, false, name_miss);
+    if !resolved {
+        if leaf || !shared_stubs_enabled() {
+            emit_name_ic_value_ptr_body(a, layout, name_miss, true);
+        } else {
+            let stub = a.shared_stub(SharedStub::NameValuePtr { property_ok: true }.key());
+            a.bl_label(stub);
+            a.cbz(9, false, name_miss);
+        }
     }
     // x10 = the Object's allocation from either owner's identical execution word.
     a.ldur(12, 14, 0);
@@ -2079,11 +2086,41 @@ struct NameElementFallback {
     physical: usize,
     lazy: bool,
     cache_ptr: usize,
+    /// The name's static address (Decision 21), which the fast path read it at.
+    address: Option<crate::bytecode::StaticName>,
     name_pc: usize,
     elem_pc: usize,
     set: bool,
     key: Operand,
     value: Option<Operand>,
+}
+
+/// x14 = the address of the word of the binding at `address`, x7 = 0 (a Binding): Decision 21's
+/// `hops` parent links from the running environment, then the slot in place, as
+/// [`super::operations::emit_static_name_load`] reads it. A lexical binding still in its TDZ
+/// branches to `miss`, whose full LoadName throws. Clobbers x9, x12 and x13.
+fn emit_static_name_ptr(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    address: crate::bytecode::StaticName,
+    miss: usize,
+) {
+    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+    for _ in 0..address.hops {
+        a.ldr_imm(9, 9, layout.scope_parent as u32);
+    }
+    a.add_imm(
+        14,
+        9,
+        super::operations::cap_slot_offset(u32::from(address.slot)),
+    );
+    if address.lexical {
+        a.ldr_imm(12, 14, 0);
+        a.movz(13, 0x7ffa, 3); // PACK_EMPTY
+        a.cmp_reg_x(12, 13);
+        a.b_cond(C_EQ, miss);
+    }
+    a.movz(7, 0, 0);
 }
 
 /// Where an operand awaits, virtual, above the stack pointer: constants are published as their
@@ -2147,17 +2184,32 @@ fn emit_name_element(
     if plan.set {
         a.fmov_d_d(1, 16 + key_index as u32 + 1);
     }
-    a.mov_imm64(12, cache_ptr as u64);
+    // A name with a static address (Decision 21) is read where it lives, as the baseline's
+    // LoadName reads it; any other name proves its name cache.
+    let address = super::operations::static_name(layout, chunk, cache);
+    let resolved = address.is_some();
+    match address {
+        Some(address) => emit_static_name_ptr(a, layout, address, name_miss),
+        None => a.mov_imm64(12, cache_ptr as u64),
+    }
     if name_element_stub(a) {
         // The sequence below, in one process-wide routine: W13 = 1 after the access, 2 when the
         // binding validated but is not a typed array (x14/x7 still describe it), else 0.
-        let stub = a.shared_stub(SharedStub::NameElement { write: plan.set }.key());
+        let stub = a.shared_stub(
+            SharedStub::NameElement {
+                write: plan.set,
+                resolved,
+            }
+            .key(),
+        );
         a.bl_label(stub);
         a.cbz(13, false, name_miss);
         a.cmp_imm_w(13, 1);
         a.b_cond(C_NE, value_miss);
     } else {
-        emit_name_element_body(a, layout, plan.set, false, hit, name_miss, value_miss);
+        emit_name_element_body(
+            a, layout, plan.set, false, resolved, hit, name_miss, value_miss,
+        );
     }
     a.bind(hit);
     if !plan.set {
@@ -2179,6 +2231,7 @@ fn emit_name_element(
         physical,
         lazy,
         cache_ptr,
+        address,
         name_pc,
         elem_pc: plan.elem_pc,
         set: plan.set,
@@ -2212,7 +2265,18 @@ fn emit_name_element_fallback(
     a.bind(f.name_miss);
     prefix(a);
     a.bind(full);
-    emit_load_name_inline(a, layout, f.cache_ptr, f.name_pc as u32, unwind, false);
+    match f.address {
+        Some(address) => super::operations::emit_static_name_load(
+            a,
+            layout,
+            None,
+            address,
+            false,
+            f.name_pc as u32,
+            unwind,
+        ),
+        None => emit_load_name_inline(a, layout, f.cache_ptr, f.name_pc as u32, unwind, false),
+    }
     a.b(common);
     a.bind(f.value_miss);
     prefix(a);

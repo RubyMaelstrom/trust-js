@@ -12924,11 +12924,12 @@ enum SharedStub {
     /// d1 = value) or written, 0 when the access is declined before anything is written.
     TypedElement { write: bool },
     /// [`regions::emit_name_element_body`]: a fused `LoadName K; key; GetElem/SetElemDrop` access
-    /// with x12 = the name's `NameIc` cell, d3 = the key and (for a write) d1 = the Number to
-    /// store → w13 = 1 after the access (a read leaves x12 = packed Number, d1 = value), 2 when
-    /// the binding validated but is not for the native path (x14 = its value, x7 = its storage
-    /// kind), 0 otherwise.
-    NameElement { write: bool },
+    /// with x12 = the name's `NameIc` cell (or, `resolved`, x14 = the binding's word and x7 = 0
+    /// from its static address), d3 = the key and (for a write) d1 = the Number to store → w13 =
+    /// 1 after the access (a read leaves x12 = packed Number, d1 = value), 2 when the binding
+    /// validated but is not for the native path (x14 = its value, x7 = its storage kind), 0
+    /// otherwise.
+    NameElement { write: bool, resolved: bool },
     /// [`emit_word_store_body`]: element x9 of the Object at x11 (cell x10), whose words are at
     /// x15 with w14 used, takes the operand at `[x20 - 8]` → w13 = 1 once it is stored, 0 when
     /// the store is declined before anything is written.
@@ -13090,7 +13091,9 @@ impl SharedStub {
             SharedStub::MinMax { argc } => Self::MIN_MAX | u32::from(argc),
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
             SharedStub::ElemStore => Self::ELEM_STORE,
-            SharedStub::NameElement { write } => Self::NAME_ELEMENT | u32::from(write),
+            SharedStub::NameElement { write, resolved } => {
+                Self::NAME_ELEMENT | u32::from(write) | u32::from(resolved) << 1
+            }
         }
     }
 
@@ -13184,6 +13187,7 @@ impl SharedStub {
             },
             Self::NAME_ELEMENT => SharedStub::NameElement {
                 write: key & 1 != 0,
+                resolved: key & 2 != 0,
             },
             Self::ELEM_STORE => SharedStub::ElemStore,
             _ => unreachable!("shared stub keys are produced by SharedStub::key"),
@@ -13239,7 +13243,9 @@ impl SharedStub {
             SharedStub::MinMax { argc } => format!("Stub:MinMax(argc={argc})"),
             SharedStub::TypedElement { write } => named("TypedElement", &[("write", write)]),
             SharedStub::ElemStore => named("ElemStore", &[]),
-            SharedStub::NameElement { write } => named("NameElement", &[("write", write)]),
+            SharedStub::NameElement { write, resolved } => {
+                named("NameElement", &[("write", write), ("resolved", resolved)])
+            }
         }
     }
 
@@ -13304,11 +13310,13 @@ impl SharedStub {
                 a.movz(9, 0, 0);
                 a.ret();
             }
-            SharedStub::NameElement { write } => {
+            SharedStub::NameElement { write, resolved } => {
                 let hit = a.new_label();
                 let value_miss = a.new_label();
                 let name_miss = a.new_label();
-                regions::emit_name_element_body(a, layout, write, true, hit, name_miss, value_miss);
+                regions::emit_name_element_body(
+                    a, layout, write, true, resolved, hit, name_miss, value_miss,
+                );
                 a.bind(hit);
                 a.movz(13, 1, 0);
                 a.ret();

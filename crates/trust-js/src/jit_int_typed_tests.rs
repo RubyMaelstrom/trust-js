@@ -116,6 +116,50 @@ fn packed_name_element_reads_and_writes_commit_for_captured_and_global_receivers
     }
 }
 
+/// A fused site whose name has a static address (a closure's `let` or `var`, Decision 21) reads
+/// the binding where it lives, as the baseline's LoadName does, and keeps every way out: a binding
+/// assigned another typed array is read again at each access, one holding no typed array reads
+/// through the ordinary templates, and one still in its TDZ throws through the full LoadName.
+#[test]
+fn fused_name_element_sites_read_static_bindings_in_place() {
+    let source = r#"
+        var out = [];
+        var make = function () {
+            let view = new Int32Array(16);
+            var other = new Float64Array(16);
+            function fill(n) { n = n | 0; for (var k = 0; (k | 0) < (n | 0); k = (k + 1) | 0) view[k & 15] = k * 3; return view[5]; }
+            function sum(n) { n = n | 0; var s = 0; for (var k = 0; (k | 0) < (n | 0); k = (k + 1) | 0) s = (s + view[k & 15]) | 0; return s; }
+            function swap(x) { view = x; }
+            function readOther(n) { n = n | 0; var s = 0; for (var k = 0; (k | 0) < (n | 0); k = (k + 1) | 0) s += other[k & 15]; return s; }
+            function setOther(x) { other = x; }
+            return { fill: fill, sum: sum, swap: swap, readOther: readOther, setOther: setOther };
+        };
+        var m = make();
+        for (var w = 0; w < 6; w++) { m.fill(64); m.sum(64); m.readOther(32); }
+        out.push(m.fill(32), m.sum(32));
+        m.swap(new Int32Array(16)); out.push(m.sum(32));
+        m.swap([1, 2, 3]); out.push(m.sum(3));
+        m.setOther(new Float64Array([0.5, 1.5])); out.push(m.readOther(2));
+        m.setOther("ab"); out.push(m.readOther(2));
+        var tdz = (function () {
+            function early(n) { n = n | 0; var s = 0; for (var k = 0; (k | 0) < (n | 0); k = (k + 1) | 0) s = (s + late[k & 3]) | 0; return s; }
+            var r;
+            try { r = early(4); } catch (e) { r = e.name; }
+            let late = new Int32Array([1, 2, 3, 4]);
+            return r + ":" + early(8);
+        })();
+        out.push(tdz);
+        var RESULT = out.join(",");
+    "#;
+    let committed = super::regions::name_element_commits();
+    assert_eq!(in_every_tier(source), "63,2256,0,6,2,0ab,ReferenceError:20");
+    let now = super::regions::name_element_commits();
+    assert!(
+        now[0] > committed[0] && now[1] > committed[1],
+        "fused reads and writes of static bindings must commit: {committed:?} -> {now:?}"
+    );
+}
+
 /// Numeric frame slots outside the eight register homes: reads and stores in register regions
 /// stay Number-only fast paths, and a slot holding anything else leaves the region.
 #[test]
