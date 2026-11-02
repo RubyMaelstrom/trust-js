@@ -6382,3 +6382,49 @@ arrays, NaN and -0 values, non-index keys and an array-like object. It fails wit
 word or the view's value taken from the wrong register. Checks: rustfmt; clippy in the three
 landing configurations on Crystal and zombie, and zombie's aarch64 cross clippy; the lib suite on
 Crystal (2,740) and zombie (2,530); the element tests under TRUST_JS_GC_STRESS=1.
+
+### Region admission: step 3's mechanism (design, 2026-11-03)
+
+The exit sites (JSC's ExitProfile, SpiderMonkey's bailout flags) need three things the engine does
+not have: a count of each region's failed speculations, a record of them that outlives the code,
+and a way to replace a function's code while it runs.
+
+1. Counts. Each bail stub of a region whose guard can fail counts its bails. That excludes a
+   region's ordinary ends (Return, ReturnBare, ReturnUndef, Throw), which every entry may take.
+   The counter is a word the JitCode owns, one per site, incremented after the stub has published
+   the region's state, so it costs nothing on the region's own path. The census names the sites:
+   inline guards (DeltaBlue, TypeScript), Number Adds on strings (React, PdfJS, Splay), a local's
+   Number guard (zlib), a store of a non-Number into a numeric home (Mandreel), a call's or
+   property read's Number result (TypeScript, Gameboy, Box2D), an int32 operand (Mandreel), the
+   fused typed-array access's fallbacks (RegExp).
+2. The record. When a site's count reaches the threshold, the stub calls a helper. The helper
+   adds the site's pc to the chunk's exit profile, a set of pcs that outlives every compile of
+   the chunk, and discards the chunk's code that took the bail (its fresh-frame or its OSR code).
+   The threshold starts at SpiderMonkey's 10 (frequentBailoutThreshold, IonScript.h) and doubles
+   with each recompile of the chunk, as JSC doubles its exit thresholds per reoptimization
+   (CodeBlock.cpp:2737-2770). After eight recompiles the chunk stops recording (SpiderMonkey
+   disables Ion after 50 unfixable bailouts; JSC caps its retries).
+3. Replacing running code. The bail runs inside the code it discards, and an activation entered
+   by a direct call holds no lease on its code. Running code is found only through activation
+   records (jit::running_code); JitCode's drop asserts it is not running. So the discarded code
+   leaves the slot (Cold, cooldown 0, so the next entry compiles) but not memory: it waits in a
+   list of the code cache's own. A collection pass frees it once no activation runs it and nothing
+   else holds it, as eviction frees code today. The call caches' epoch moves
+   (invalidate_call_caches), so direct calls re-resolve to the new code, as an inline recompile
+   makes them. V8 deoptimizes running frames lazily and JSC jettisons; here the running
+   activation simply finishes in the old code, which is still correct.
+
+The compile reads the profile. A recorded pc keeps its region but loses its speculation:
+- an arithmetic, comparison or int32 operation runs as the generic operation (the region's effect
+  path, the baseline's template);
+- a producer whose Number result was demanded (LoadLocal, a static name, an element or property
+  read, a call) is read without the demand;
+- a store or read of a numeric home's slot takes that slot out of the homes;
+- the fused typed-array access is not fused at that LoadName.
+
+An inline guard is the one exception: its miss runs the call alternative outside the region, so
+a recorded one refuses the region (refusing DeltaBlue's saved 1.69%).
+
+Tests: each kind fails its guard past the threshold, recompiles without it, and gives the
+interpreter's result. A long-running loop discards the code it is running and finishes in it, and
+later calls run the new code. The cap holds under alternating speculations. All under GC stress.
