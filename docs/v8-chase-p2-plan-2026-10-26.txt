@@ -5274,11 +5274,13 @@ documents the census columns. Choices made in the code, each the owner's to over
   population census's `sidecars` column now counts maps with a key index of their own.
 
 The counts at 3b found two regressions, located by building each step (fat LTO, user-mode
-instructions, median of 3; Octane at a fixed 5 runs):
+instructions, median of 3; Octane at a fixed 5 runs under the corrected driver, below; zlib's
+first run alone in the last row):
 | | c294f96b | 3a | 3b | 3c | 0ddef2cb |
 | --- | --- | --- | --- | --- | --- |
-| Splay | 1,899.4 M | 1,897.9 M | 1,912.3 M | 1,913.1 M | 1,891.6 M |
-| zlib | 55,252 M | 55,224 M | 55,444 M | 55,444 M | 55,444 M |
+| Splay | 1,898.6 M | 1,896.2 M | 1,911.1 M | 1,911.1 M | 1,890.4 M |
+| zlib | 166,308.8 M | 166,197.5 M | 167,325.4 M | 167,325.5 M | 167,325.2 M |
+| zlib, one run | 34,356.4 M | 34,328.8 M | 34,548.8 M | | 34,548.6 M |
 - Splay: no generated code changed (every chunk within 4 bytes); array literals cost five more
   instructions a word. Words::from_values' source is unchanged, but with Words::with_capacity
   inlined into make_array_from_raw, LLVM no longer merged the iterator's bound and `take` into
@@ -5290,36 +5292,42 @@ instructions, median of 3; Octane at a fixed 5 runs):
   builds the kind bits without branches, checked against Value::number's tag table for every
   16-bit tag. Against 3a: literals of 1, 3, 10 and 30 elements -2.67%, -1.59%, -2.22% and
   -12.18%, Splay's payload pattern -0.60%, object literals +0.24%.
-- zlib: a register region that the profitability test (Emission::profitable: emitted bytes at
-  most twice the ops' fixed baseline charges plus 1 KB) refused at 3a fits at 3b, because its
-  element templates shrank: zlib's hottest function (a8, Emscripten's deflate loop) compiles to
-  353 KB instead of 273 KB with 136 name sites in regions instead of 30, and runs about 12% more
-  instructions. The step only exposes it; why that region is slower than the templates it
-  replaces (its name-element fallbacks and the flushes around them), and charging the baselines
-  from the templates' real sizes, are follow-ups for the region tier.
+- zlib: +0.68% at 3b against 3a over five runs, the first run +0.64% and each later one +0.69%
+  (the old driver showed +0.40% against 3a and +0.35% against c294f96b, diluted by 20.9 G of
+  its own work, below). A register region that the profitability test
+  (Emission::profitable: emitted bytes at most twice the ops' fixed baseline charges plus 1 KB)
+  refused at 3a fits at 3b, because its element templates shrank: zlib's hottest function (a8,
+  Emscripten's deflate loop) compiles to 353 KB instead of 273 KB with 136 name sites in
+  regions instead of 30, and runs about 12% more instructions. The step only exposes it; why
+  that region is slower than the templates it replaces (its name-element fallbacks and the
+  flushes around them), and charging the baselines from the templates' real sizes, are
+  follow-ups for the region tier.
 
-Counts against c294f96b (fat LTO, Crystal; Octane at a fixed 5 runs):
-| | c294f96b | step 3 | change |
-| --- | --- | --- | --- |
-| Vue | 1,909,717,109 | 1,904,985,490 | -0.25% |
-| React | 345,615,377 | 341,797,832 | -1.10% |
-| Djot | 680,496,829 | 675,830,934 | -0.69% |
-| chai | 86,961,641,314 | 86,397,564,501 | -0.65% |
-| Richards | 141,721,355 | 141,484,654 | -0.17% |
-| DeltaBlue | 296,082,507 | 294,766,673 | -0.44% |
-| Crypto | 761,189,309 | 751,893,777 | -1.22% |
-| RayTrace | 1,067,534,121 | 1,058,596,284 | -0.84% |
-| EarleyBoyer | 3,637,350,194 | 3,618,701,693 | -0.51% |
-| RegExp | 314,427,950 | 312,352,709 | -0.66% |
-| Splay | 1,900,346,859 | 1,891,558,054 | -0.46% |
-| NavierStokes | 585,265,598 | 569,703,369 | -2.66% |
-| PdfJS | 8,573,363,425 | 8,486,386,197 | -1.01% |
-| Mandreel | 65,899,003,171 | 65,636,124,785 | -0.40% |
-| Gameboy | 23,412,377,754 | 23,353,930,274 | -0.25% |
-| CodeLoad | 485,295,785 | 484,397,749 | -0.19% |
-| Box2D | 4,712,231,855 | 4,676,562,611 | -0.76% |
-| zlib | 55,251,978,818 | 55,444,021,806 | +0.35% |
-| Typescript | 60,982,608,642 | 60,563,738,386 | -0.69% |
+Counts against c294f96b (fat LTO, Crystal; Octane at a fixed 5 runs under the corrected driver,
+below; the last column is the old driver's, which ran zlib once and stopped RegExp in its setup):
+| | c294f96b | step 3 | change | old driver |
+| --- | --- | --- | --- | --- |
+| Vue | 1,909,690,302 | 1,904,982,054 | -0.25% | -0.25% |
+| React | 345,614,529 | 341,797,482 | -1.10% | -1.10% |
+| Djot | 680,474,310 | 675,815,205 | -0.68% | -0.69% |
+| chai | 86,959,820,255 | 86,403,530,343 | -0.64% | -0.65% |
+| Richards | 141,952,564 | 141,700,334 | -0.18% | -0.17% |
+| DeltaBlue | 296,314,024 | 294,986,781 | -0.45% | -0.44% |
+| Crypto | 762,866,481 | 753,535,185 | -1.22% | -1.22% |
+| RayTrace | 1,067,927,035 | 1,059,171,426 | -0.82% | -0.84% |
+| EarleyBoyer | 3,639,841,773 | 3,622,056,440 | -0.49% | -0.51% |
+| RegExp | 2,885,175,369 | 2,845,348,030 | -1.38% | -0.66% |
+| Splay | 1,898,634,699 | 1,890,368,809 | -0.44% | -0.46% |
+| NavierStokes | 585,480,198 | 569,908,725 | -2.66% | -2.66% |
+| PdfJS | 8,581,549,699 | 8,480,904,418 | -1.17% | -1.01% |
+| Mandreel | 65,900,667,104 | 65,640,003,542 | -0.40% | -0.40% |
+| Gameboy | 23,407,104,442 | 23,330,606,184 | -0.33% | -0.25% |
+| CodeLoad | 486,016,947 | 485,088,404 | -0.19% | -0.19% |
+| Box2D | 4,712,746,215 | 4,676,534,877 | -0.77% | -0.76% |
+| zlib | 166,308,819,946 | 167,325,240,607 | +0.61% | +0.35% |
+| Typescript | 60,994,169,353 | 60,568,359,358 | -0.70% | -0.69% |
+The fixtures and chai were counted again with the Octane rows (their scripts now reject a failed
+run); their first figures agree within 0.01 points.
 
 Element bytes (TRUST_JS_GC_CENSUS, each run's collection with the most bytes per family):
 | | c294f96b | step 3 |
@@ -5339,8 +5347,48 @@ Checks: rustfmt; clippy in the three landing configurations (all targets) on Cry
 TRUST_JS_GC_STRESS=1 on the value, dense-slot, numeric-array, update-element, native-operation,
 count-guard, array-shift, array-length and index-name tests; Test262 in full at --tier=jit threshold 8
 (53,575 of 53,575, the report identical to c294f96b's), difftest (138 agree, 12 skipped, as at
-c294f96b), the fixtures' masked outputs and Octane at five runs as c294f96b's (zlib prints heap
-words that vary between runs of one engine). Under the fixed-5 driver RegExp's checksum fails in
-every engine: the driver runs each benchmark's Setup without BenchmarkSuite.ResetRNG, so
-RegExp's count measures its setup and a partial first run. One lib run under the LTO build's
-load failed gc_pacing_tests::the_nursery_grows_while_new_objects_survive, which passes alone.
+c294f96b), the fixtures' masked outputs as c294f96b's, and Octane at five runs under the
+corrected driver with c294f96b's outputs, all fifteen benchmarks complete (RegExp's checksum
+included). One lib run under the LTO build's load failed
+gc_pacing_tests::the_nursery_grows_while_new_objects_survive, which passes alone.
+
+### Octane's fixed-run driver, corrected (2026-11-02)
+
+The fixed-run driver behind Octane's instruction counts since W3's exit
+(target/p2/w3-exit/codeload/fixed-driver.js) measured two benchmarks wrongly, and the count
+scripts hid it: they piped perf's output and dropped each run's exit status.
+- zlib. The driver kept its run count N and its loop indices in globals. zlib's first run
+  assigns its own global N, a 16M-element Float64Array (Emscripten's heap view), so the loop
+  test after that run converted the array to a string, read NaN and stopped, and the "ran"
+  line converted it again (which W2c step 2's checks, and this step's before this correction,
+  read as heap words that vary between runs). Every earlier zlib figure at a fixed N is its
+  load, one run and two 16M-number joins: 55,252 M at c294f96b, of which the joins are 20.9 G,
+  against 34,356 M for the load and one run alone. Counting calls to each benchmark's run
+  function found every other benchmark at its N runs.
+- RegExp. The driver ran each Setup without BenchmarkSuite.ResetRNG, which Octane's RunStep
+  calls at each suite's start, so Math.random was the engine's, seeded afresh per process.
+  RegExp's 32,958 draws build its input strings, and its sum missed 1666109 at the end of
+  setup's own run, which threw and ended the process (exit 1). Its figures are its load and
+  that run, on other strings: random strings cost about a quarter of the strings Octane's
+  generator makes, in Node as in TRust (ten runs 78 against 325 ms in Node 24, 300 against
+  1,222 ms in TRust), so the old 314 M was about a ninth of the corrected 2,885 M (setup and
+  five runs). Splay's 8,400 keys were random per process too (its runs spread 0.7 M; now
+  within 6 K).
+
+The corrected driver (target/p2/octane-fixed): prelude.js, loaded after base.js, calls
+ResetRNG before the benchmark files load (Crypto draws 128 numbers for its pool at load, which
+spread its runs by 1 M; now within 8 K); driver.js resets the generator at each suite's start
+as RunStep does, keeps its state inside a function, and prints a completion line last. The
+count scripts (w2c/counts.sh, w2c3/steps.sh, w3-i3b/fixcounts2.sh) print FAIL for a run that
+exits nonzero or lacks that line, and outputs.sh marks it INCOMPLETE. Octane's timed runs use
+upstream run.js, whose RunSuites resets the generator and keeps its state in closures, so they
+were never affected; only Crypto, RegExp, Splay and CodeLoad (15 draws) use Math.random.
+
+Earlier records' zlib and RegExp figures at a fixed N stand for that other work: the tiering
+steps' zlib -4.6% and RegExp +2.8%, W2c step 2's zlib +0.02% and RegExp -0.89%. Against the
+old driver, the function-scoped driver adds 0.16 M instructions to Richards and 0.69 M to
+EarleyBoyer, and the prelude 0.06 M and 2.5 M (an empty script in its place adds 0.16 M). What
+loads before a benchmark moves some counts by itself: declaring one unrelated global before
+earley-boyer.js lowers EarleyBoyer's by 12.6 M (0.35%), and PdfJS's and Gameboy's step-3
+changes moved by 0.16 and 0.08 points between the drivers. Changes that small on those
+benchmarks are within that band.
