@@ -411,23 +411,47 @@ fn appends_to_a_marked_prototype_invalidate_creation_proofs() {
 }
 
 #[test]
-fn stored_cells_survive_collections_of_old_arrays() {
+fn stored_cells_survive_minor_collections_of_old_arrays() {
+    // Old arrays (promoted by a major collection) gain young cells through every native path:
+    // overwrites, hole fills and appends, by a stub and in a loop. Only the owner's card tells
+    // the minor collection that follows about them.
     let mut engine = engine();
     eval(&mut engine, FORMS);
+    eval(
+        &mut engine,
+        "function fill(a,from,to,r){for(var i=from;i<to;i++)a[i]={v:r*100+i};}\
+         var keep=[];for(var r=0;r<8;r++){var a=[0,1,2,3];a[9]=9;a[10]=10;keep.push(a);}\
+         for(var w=0;w<20;w++){var t=[0,1];t[4]=4;for(var f=0;f<4;f++)forms[f](t,f,w);fill(t,0,6,w);}",
+    );
+    engine.interp.gc_collect();
+    eval(
+        &mut engine,
+        "for(var r=0;r<8;r++){var a=keep[r];\
+           for(var f=0;f<4;f++)forms[f](a,f,{v:r*100+f});\
+           for(var i=4;i<9;i++)forms[i&3](a,i,{v:r*100+i});\
+           forms[r&3](a,11,{v:r*100+11});fill(a,12,16,r);}",
+    );
+    engine.interp.gc_collect_minor();
+    // Fresh allocation after the collection would reuse any cell it wrongly freed.
+    eval(
+        &mut engine,
+        "var junk=[];for(var g=0;g<2000;g++)junk.push({v:-1,w:g});",
+    );
+    let expected: i64 = (0..8)
+        .map(|r| {
+            (0..16)
+                .filter(|i| *i != 9 && *i != 10)
+                .map(|i| r * 100 + i)
+                .sum::<i64>()
+        })
+        .sum();
     assert_eq!(
         eval(
             &mut engine,
-            "var keep=[];for(var r=0;r<30;r++){var a=[0,1,2,3];a[9]=9;keep.push(a);}\
-             for(var r=0;r<30;r++)for(var g=0;g<2000;g++)[g,{g:g}];\
-             for(var r=0;r<30;r++){var a=keep[r];for(var f=0;f<4;f++)forms[f](a,f,{v:r*10+f});\
-             for(var i=4;i<9;i++)forms[i&3](a,i,{v:i});forms[r&3](a,10,{v:-r});}\
-             for(var r=0;r<30;r++)for(var g=0;g<2000;g++)[g,{g:g}];\
-             var sum=0;for(var r=0;r<30;r++){var a=keep[r];for(var i=0;i<11;i++)if(i!=9)sum+=a[i].v;}sum",
+            "var sum=0;for(var r=0;r<8;r++){var a=keep[r];\
+             for(var i=0;i<16;i++)if(i!=9&&i!=10)sum+=a[i].v;}sum",
         ),
-        (0..30)
-            .map(|r| (0..4).map(|f| r * 10 + f).sum::<i64>() + (4..9).sum::<i64>() - r)
-            .sum::<i64>()
-            .to_string()
+        expected.to_string()
     );
 }
 
