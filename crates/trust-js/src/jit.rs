@@ -14094,9 +14094,14 @@ fn words_inlinable(layout: &crate::value::JitLayout) -> bool {
     layout.words_valid
         && words.is_multiple_of(8)
         && words / 8 < 4096
-        && [layout.words_used, layout.words_capacity, layout.words_flags]
-            .into_iter()
-            .all(|back| (4..=256).contains(&back) && back.is_multiple_of(4))
+        && [
+            layout.words_used,
+            layout.words_capacity,
+            layout.words_shifted,
+            layout.words_flags,
+        ]
+        .into_iter()
+        .all(|back| (4..=256).contains(&back) && back.is_multiple_of(4))
 }
 
 /// x`words` = the element words of the Object at x`obj` (W2c, [`crate::value::word_block`]),
@@ -14274,10 +14279,11 @@ fn emit_get_elem_inline_marked(
 }
 
 /// Inline dense-element write (`a[i] = v`, and the value-keeping `SetElem` when `keep`): the
-/// machine-code mirror of `Interp::fast_set_elem` — overwrite an existing own writable data
-/// element. The complete word is copied into the slot; under `keep` it also stays on the stack
-/// as the expression result. Accessors, non-writable slots, unsupported incoming words and dense
-/// misses retain the checked path.
+/// machine-code mirror of `Interp::fast_set_elem` — any value over an existing element, into a
+/// hole, or appended, as [`emit_word_store`] admits it. The complete word is copied into the
+/// element; under `keep` it also stays on the stack as the expression result. Everything else
+/// (non-plain receivers, gaps, growth, a prototype chain the protector does not cover, other
+/// keys) retains the checked path.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14330,7 +14336,7 @@ fn emit_set_elem_inline_marked(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, typed);
-    // 5. element words: overwrite an existing element with the Number
+    // 5. element words: any value over an existing element, into a hole, or appended
     emit_word_store(a, layout, slow, done, true, keep);
     a.bind(typed);
     let typed_hit = a.new_label();
@@ -14355,10 +14361,18 @@ fn emit_set_elem_inline_marked(
     a.bind(done);
 }
 
-/// Overwrite an existing element word with the Number at `[x20 - 8]`: the machine-code
-/// `Words::set` for a Number, which is no edge (no card, no remembered block) and keeps the
-/// kind bits exact, then branch to `done`. Past the used words (every index, for a map without
-/// words) or at a hole (a property creation), `slow`. x9 holds the u32 index, x11 the Object.
+/// Store the value at `[x20 - 8]` as element x9 (a u32) of the Object at x11, whose cell is at
+/// x10, then pop the operands (keeping the value as the expression's result under `keep`) and
+/// branch to `done` (W2c step 4). An existing element is an own writable data property, so
+/// OrdinarySet writes it whatever the prototype chain holds: the machine-code `Words::set`. A
+/// Number keeps the kind bits exact and is no edge; any other value clears NUMBERS and INT32
+/// (exactly, so `KIND_SCANNED` stays: the word it replaces was no hole and it is none) and
+/// marks the owner's card, as every generated store of a reference does, before the next
+/// safepoint. A block with a remembered record takes `slow` for such a value instead: the
+/// word may lie below its traced length, and the helper's `Words::set` marks its dirty block
+/// (the W2c design's decision 4). A hole, or the word just past the used ones, is a property
+/// creation ([`emit_word_create`]); every other index, and the TDZ marker as the value (it
+/// would become a hole), is `slow`. Every check precedes the first write.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14371,17 +14385,42 @@ fn emit_word_store(
     stack_receiver: bool,
     keep: bool,
 ) {
+    use crate::value::word_block::{KIND_INT32, KIND_NUMBERS};
+    let create = a.new_label();
+    let other = a.new_label();
+    let stored = a.new_label();
     emit_words_base(a, layout, 11, 15, 14);
     a.cmp_reg_x(9, 14);
-    a.b_cond(C_HS, slow);
+    a.b_cond(C_HS, create);
     a.ldr_x_lsl3(12, 15, 9);
-    a.mov_imm64(14, crate::value::PACK_EMPTY);
-    a.cmp_reg_x(12, 14);
-    a.b_cond(C_EQ, slow);
-    emit_stack_number_load(a, -8, slow);
+    a.mov_imm64(13, crate::value::PACK_EMPTY);
+    a.cmp_reg_x(12, 13);
+    a.b_cond(C_EQ, create);
+    emit_exec_word_load(a, 13, 20, -8);
+    emit_exec_number_guard(a, 13, 1, 16, other);
     // --- commit: the Number's word, then the kind bits ---
-    a.str_x_lsl3(16, 15, 9);
+    a.str_x_lsl3(13, 15, 9);
     emit_word_number_kind(a, layout, 15, 1, 12, 13, 14, 2);
+    a.b(stored);
+    a.bind(other);
+    emit_word_value_guard(a, 13, 16, 17, slow);
+    emit_word_block_unrecorded(a, layout, 15, 16, 17, slow);
+    // --- commit: the word, NUMBERS and INT32 cleared, the owner's card ---
+    a.str_x_lsl3(13, 15, 9);
+    let flags = -(layout.words_flags as i32);
+    a.ldur_w(16, 15, flags);
+    a.logic_imm_w(
+        0,
+        16,
+        16,
+        asm::logical_imm_w(!(KIND_NUMBERS | KIND_INT32)).unwrap(),
+    );
+    a.stur_w(16, 15, flags);
+    emit_card_mark(a, 10, 16, 17);
+    a.b(stored);
+    a.bind(create);
+    emit_word_create(a, layout, slow, stored);
+    a.bind(stored);
     let consumed = if stack_receiver { 24 } else { 16 };
     if keep {
         // The expression result retains the original Number, including signed zero and NaN.
@@ -14392,6 +14431,210 @@ fn emit_word_store(
         a.sub_imm(20, 20, consumed as u32);
     }
     a.b(done);
+}
+
+/// Branch to `slow` when the operand word x`value`, stored as an element, would be a hole:
+/// the TDZ marker's tag (an operand word is never property-only, so nothing else is refused).
+/// Clobbers x`t1`, x`t2` and NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_word_value_guard(a: &mut asm::Asm, value: u32, t1: u32, t2: u32, slow: usize) {
+    a.lsr_imm(t1, value, 48);
+    a.movz(t2, (crate::value::PACK_EMPTY >> 48) as u32, 0);
+    a.cmp_reg_w(t1, t2);
+    a.b_cond(C_EQ, slow);
+}
+
+/// Branch to `slow` when the words at x`words` keep a remembered record (room for more than
+/// [`crate::value::word_block::REMEMBER_MIN`] words, front room included), whose dirty bitmap
+/// an edge written below the traced length must mark (`Words::remember`). Clobbers x`t1`,
+/// x`t2` and NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_word_block_unrecorded(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    words: u32,
+    t1: u32,
+    t2: u32,
+    slow: usize,
+) {
+    a.ldur_w(t1, words, -(layout.words_capacity as i32));
+    a.ldur_w(t2, words, -(layout.words_shifted as i32));
+    a.add_shifted(t1, t1, t2, 0);
+    a.cmp_imm_x(t1, crate::value::word_block::REMEMBER_MIN as u32);
+    a.b_cond(C_HI, slow);
+}
+
+/// `Interp::array_proto` (the active realm's %Array.prototype%, a cell address) and the two
+/// fields of `Interp::elems_protector`'s proof, `(epoch, clean)`, for [`emit_word_create`].
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const INTERP_ARRAY_PROTO: usize = std::mem::offset_of!(crate::interpreter::Interp, array_proto);
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const INTERP_ELEMS_EPOCH: usize = std::mem::offset_of!(crate::interpreter::Interp, elems_protector)
+    + std::mem::offset_of!((u32, bool), 0);
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const INTERP_ELEMS_CLEAN: usize = std::mem::offset_of!(crate::interpreter::Interp, elems_protector)
+    + std::mem::offset_of!((u32, bool), 1);
+
+/// Array [[Set]] of element x9 where no own property exists, as [`emit_word_store`] found it:
+/// a hole below the used words (w14; x12 is then the hole), or the word just past them. With
+/// no own property, OrdinarySet consults the prototype chain, finds nothing, and
+/// CreateDataProperty defines the element on the receiver (ECMA-262 §10.1.9.2, §10.1.6.3;
+/// Array [[DefineOwnProperty]] §10.4.2.1 grows `length` past it). The sequence proves what
+/// `Interp::fast_set_elem` proves in Rust: an Array whose words may gain the element without
+/// notice (extensible; not itself a marked prototype, whose structural changes must bump the
+/// creation epoch, `Props::note_structural`; no index among its named entries, so x9 is
+/// absent), whose prototype is the active realm's %Array.prototype% while
+/// `Interp::elems_protector`'s proof is live at the current `PROTO_EPOCH` (that chain to
+/// Object.prototype holds no index key and no exotic hop; a stale proof takes the helper,
+/// which renews it). An append also needs room, and at `length` a writable data `length`
+/// (through its slot memo, as [`emit_define_elem_inline`]), which becomes x9 + 1; below
+/// `length` (after `new Array(n)` or a `length` store) and in a hole it stays. The kind bits:
+/// an append keeps NO_HOLES and `KIND_SCANNED` (no cleared fact can become true) and clears
+/// what the value breaks; a hole fill may make NO_HOLES true again, so it also clears
+/// `KIND_SCANNED`. A value other than a Number marks the owner's card; an append lies past the
+/// block's traced length and needs no dirty block (as the map/filter append, site E), but such
+/// a value in a hole of a block with a remembered record takes `slow`. Branches to `stored`
+/// after the commit, or to `slow` before any write.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_word_create(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    slow: usize,
+    stored: usize,
+) {
+    use crate::value::word_block::{KIND_INT32, KIND_NUMBERS, KIND_SCANNED};
+    if !define_elem_inlinable(layout) {
+        a.b(slow);
+        return;
+    }
+    let props = layout.obj_props as u32;
+    let flags = -(layout.words_flags as i32);
+    let number_kept = a.new_label();
+    let not_number = a.new_label();
+    let kind_ready = a.new_label();
+    let hole = a.new_label();
+    let below_length = a.new_label();
+    let length_kept = a.new_label();
+    let no_card = a.new_label();
+    // 1. An extensible Array that is no marked prototype, with no index among its named
+    //    entries.
+    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+    a.cmp_imm_w(12, layout.exotic_array_tag as u32);
+    a.b_cond(C_NE, slow);
+    a.ldrb_imm(12, 11, layout.obj_extensible as u32);
+    a.cbz(12, false, slow);
+    a.ldrb_imm(12, 11, props + layout.props_proto_flag as u32);
+    a.cbnz(12, false, slow);
+    a.ldrb_imm(12, 11, props + layout.props_elem_mode as u32);
+    a.cbz(12, false, slow);
+    a.ldrb_imm(12, 11, props + layout.props_has_far as u32);
+    a.cbnz(12, false, slow);
+    // 2. Its prototype is the active realm's %Array.prototype%, and the protector's proof is
+    //    clean at the live epoch (a cached epoch is never u32::MAX, which no proof accepts).
+    a.ldr_imm(12, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    a.ldr_imm(13, 12, INTERP_ARRAY_PROTO as u32);
+    a.ldr_imm(16, 11, layout.obj_proto as u32);
+    a.cmp_reg_x(13, 16);
+    a.b_cond(C_NE, slow);
+    a.ldrb_imm(13, 12, INTERP_ELEMS_CLEAN as u32);
+    a.cbz(13, false, slow);
+    a.ldr_w_imm(13, 12, INTERP_ELEMS_EPOCH as u32);
+    a.mov_imm64(16, crate::value::proto_epoch_ptr() as usize as u64);
+    a.ldr_w_imm(16, 16, 0);
+    a.cmp_reg_w(13, 16);
+    a.b_cond(C_NE, slow);
+    // 3. The value (x13): no hole. w0 = the kind bits it keeps, w1 = whether it is an edge.
+    emit_exec_word_load(a, 13, 20, -8);
+    emit_word_value_guard(a, 13, 16, 17, slow);
+    a.ldur_w(0, 15, flags);
+    emit_exec_number_guard(a, 13, 2, 1, not_number);
+    a.fcvtzs_w_d(1, 2);
+    a.scvtf_d_w(3, 1);
+    a.fmov_x_d(1, 3);
+    a.cmp_reg_x(1, 13);
+    a.b_cond(C_EQ, number_kept);
+    a.logic_imm_w(0, 0, 0, asm::logical_imm_w(!KIND_INT32).unwrap());
+    a.bind(number_kept);
+    a.movz(1, 0, 0);
+    a.b(kind_ready);
+    a.bind(not_number);
+    a.logic_imm_w(
+        0,
+        0,
+        0,
+        asm::logical_imm_w(!(KIND_NUMBERS | KIND_INT32)).unwrap(),
+    );
+    a.movz(1, 1, 0);
+    a.bind(kind_ready);
+    // 4. A hole below the used words, or the next word; past it, a gap of holes (`slow`).
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_LO, hole);
+    a.b_cond(C_NE, slow);
+    // 5. An append: room for it (a full block, or the static empty one, grows in the helper),
+    //    and `length` (x17 = its entry, d4 = its Number), writable when x9 reaches it.
+    a.ldur_w(16, 15, -(layout.words_capacity as i32));
+    a.cmp_reg_x(14, 16);
+    a.b_cond(C_HS, slow);
+    slot_memo_load(a, layout, 12, 11, layout.obj_props + layout.props_len_slot);
+    slot_memo_branch_none(a, layout, 12, 16, slow);
+    fields_data(a, layout, 17, 11);
+    a.mov_imm64(16, layout.entry_size as u64);
+    a.madd(17, 12, 16, 17);
+    guard_prop_data(a, 16, 17, layout.entry_accessor as u32, slow);
+    a.ldur(16, 17, layout.entry_value as i32);
+    emit_exec_number_guard(a, 16, 4, 12, slow);
+    a.ucvtf_d_w(5, 9);
+    a.fcmp(5, 4);
+    a.b_cond(C_LO, below_length);
+    guard_prop_writable(a, 16, 17, layout.entry_writable as u32, slow);
+    a.bind(below_length);
+    // --- commit: the word, its kind bits, the card, the used length, `length` ---
+    a.str_x_lsl3(13, 15, 14);
+    a.stur_w(0, 15, flags);
+    a.cbz(1, false, no_card);
+    emit_card_mark(a, 10, 12, 16);
+    a.bind(no_card);
+    a.add_imm(14, 14, 1);
+    a.stur_w(14, 15, -(layout.words_used as i32));
+    // x9 at or past `length`: it becomes x9 + 1, the new used length (exact: below 2^32 − 1).
+    a.fcmp(5, 4);
+    a.b_cond(C_LO, length_kept);
+    a.ucvtf_d_w(4, 14);
+    a.stur_d(4, 17, layout.entry_value as i32);
+    a.bind(length_kept);
+    a.b(stored);
+    // 6. A hole fill: below `length` already. An edge into a block with a remembered record
+    //    may lie below its traced length (`slow`, before any write).
+    a.bind(hole);
+    let fill = a.new_label();
+    a.cbz(1, false, fill);
+    emit_word_block_unrecorded(a, layout, 15, 16, 17, slow);
+    a.bind(fill);
+    // --- commit: the word, the kind bits and KIND_SCANNED, the card ---
+    a.str_x_lsl3(13, 15, 9);
+    a.logic_imm_w(0, 0, 0, asm::logical_imm_w(!KIND_SCANNED).unwrap());
+    a.stur_w(0, 15, flags);
+    a.cbz(1, false, stored);
+    emit_card_mark(a, 10, 12, 16);
+    a.b(stored);
 }
 
 /// Inline `lval in rval` (ECMA-262 §13.10.1) when lval is a Number that is exactly an array
@@ -14744,16 +14987,6 @@ enum KeySrc {
     SlotPre(u32, bool),
 }
 
-/// Load a Number word at `off` into x16. Other kinds stay on the checked numeric path.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_stack_number_load(a: &mut asm::Asm, off: i32, slow: usize) {
-    emit_exec_word_load(a, 16, 20, off);
-    emit_exec_number_guard(a, 16, 1, 13, slow);
-}
-
 /// Inline fused element access where the receiver lives in a *parameter* slot
 /// ([`crate::bytecode::Op::GetElemLocal`] and friends): like [`emit_get_elem_inline`] /
 /// [`emit_set_elem_inline`] but the receiver is read straight out of the slot — it never crosses
@@ -14859,8 +15092,8 @@ fn emit_elem_local_keyed(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, typed);
-    // 5. element words: a read copies a plain element's value; a store overwrites an existing
-    // element with the Number.
+    // 5. element words: a read copies a plain element's value; a store writes any value over
+    // an existing element, into a hole, or appended ([`emit_word_store`]).
     if get {
         emit_word_read(a, layout, 11, 9, 12, slow);
         // Copied into a compact word; d0 (the deferred numeric key) is preserved.
@@ -20213,3 +20446,11 @@ pub(crate) unsafe fn run_moved_shared(
 ))]
 #[path = "jit_count_guard_tests.rs"]
 mod count_guard_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_element_store_tests.rs"]
+mod element_store_tests;

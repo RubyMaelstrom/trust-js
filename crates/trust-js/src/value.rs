@@ -1388,9 +1388,11 @@ pub struct JitLayout {
     /// [`PACK_EMPTY`] word.
     pub props_words: usize,
     /// The word header's fields, as bytes before the first word: the used length, the
-    /// capacity and the kind bits ([`word_block::KIND_NO_HOLES`] and the rest), each a u32.
+    /// capacity, the front room and the kind bits ([`word_block::KIND_NO_HOLES`] and the
+    /// rest), each a u32.
     pub words_used: usize,
     pub words_capacity: usize,
+    pub words_shifted: usize,
     pub words_flags: usize,
     /// `size_of::<Property>()` — the keyless instance-field stride.
     pub entry_size: usize,
@@ -1704,9 +1706,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let header_bytes = std::mem::size_of::<word_block::WordHeader>();
     let words_at = |field: usize| header_bytes - field;
     let props_words = offset_of!(Props, elems) + offset_of!(DenseStorage, 2);
-    let (words_used, words_capacity, words_flags) = (
+    let (words_used, words_capacity, words_shifted, words_flags) = (
         words_at(offset_of!(word_block::WordHeader, used)),
         words_at(offset_of!(word_block::WordHeader, capacity)),
+        words_at(offset_of!(word_block::WordHeader, shifted)),
         words_at(offset_of!(word_block::WordHeader, flags)),
     );
     let words_probe = Props::packed_array([Value::Num(1.0), Value::Null].into_iter());
@@ -1721,6 +1724,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
                 && base.add(props_words).cast::<*const u64>().read() == first
                 && header(words_used) as usize == words.len()
                 && header(words_capacity) as usize == words.capacity()
+                && header(words_shifted) as usize == words.front_room()
                 && header(words_flags) == words.kind()
         }
     };
@@ -1944,6 +1948,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         props_words,
         words_used,
         words_capacity,
+        words_shifted,
         words_flags,
         entry_size: std::mem::size_of::<Property>(),
         str_len_word,
