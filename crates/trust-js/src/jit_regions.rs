@@ -3205,6 +3205,49 @@ pub(super) fn emit(
                     emit_exec_word_store(a, 10, 20, dest);
                     stack.push(Operand::Canonical);
                 }
+                Op::GetElemLocal(receiver)
+                    if fast & 1024 != 0
+                        && get_elem_inlinable(layout)
+                        && receiver as u32 * 8 + 8 < 4096
+                        && plan.reg(receiver).is_none()
+                        && plan.numeric_results.contains(&pc)
+                        && depth >= 1
+                        && stack[depth - 1].numeric() =>
+                {
+                    // An element read for arithmetic whose key is a Number in a register: the
+                    // receiver's element words (or its typed-array view) read straight into a
+                    // register, as the baseline's numeric chains read them, with nothing on the
+                    // stack published. A receiver or key the native read does not take, a hole,
+                    // an index past the used words or an element that is not a Number leaves the
+                    // region at this read, whose baseline template runs it.
+                    saved_work += 4;
+                    scalar_register(a, &mut stack, physical, depth - 1);
+                    let key = 15 + depth as u32;
+                    emit_exec_word_load(a, 10, 22, receiver as i32 * 8);
+                    emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 11, bailout);
+                    emit_exec_payload(a, 10, 10);
+                    a.add_imm(11, 10, layout.obj_from_cell as u32);
+                    // The key: exactly a u32 (negative and fractional keys, NaN and -0 leave).
+                    a.fcvtzu_w_d(9, key);
+                    a.ucvtf_d_w(1, 9);
+                    a.fcmp(key, 1);
+                    a.b_cond(C_NE, bailout);
+                    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+                    guard_exotic_ordinary_or_array(a, layout, 12, 13, bailout);
+                    let typed = a.new_label();
+                    let read = a.new_label();
+                    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
+                    a.cbz(12, false, typed);
+                    emit_word_read(a, layout, 11, 9, 12, bailout);
+                    a.b(read);
+                    a.bind(typed);
+                    typed_array::emit(a, layout, None, read, bailout);
+                    a.bind(read);
+                    // The key's register holds the key until the read is known to be a Number.
+                    emit_exec_number_guard(a, 12, 0, 13, bailout);
+                    a.fmov_d_d(key, 0);
+                    stack[depth - 1] = Operand::temporary(ScalarKind::Number);
+                }
                 Op::LoadName(_, cache)
                     if fast & 8192 != 0
                         && super::operations::static_name(layout, chunk, cache).is_some() =>

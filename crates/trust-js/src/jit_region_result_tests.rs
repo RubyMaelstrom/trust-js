@@ -546,3 +546,47 @@ fn region_static_name_reads_keep_numbers_in_registers_and_leave_for_anything_els
         "the loops must run as register regions"
     );
 }
+
+/// An element read for arithmetic whose key is a Number in a register reads the receiver's
+/// element words (or its typed-array view) straight into a register (the loops branch, so they
+/// run as register regions rather than numeric loop chains). Everything the native read
+/// does not take leaves the region at the read and runs the baseline template: holes (which
+/// consult the prototype chain), elements that are not Numbers, and keys that are not array
+/// indices (negative or fractional, which name ordinary properties).
+#[test]
+fn region_numeric_element_reads_stay_in_registers_and_leave_for_anything_else() {
+    let source = r#"
+        (function () {
+            function sum(a, n) { var s = 0; for (var i = 0; i < n; i++) { var v = a[(i * 3) & 7]; if (v > 1e9) { s = s - 1; } else { s = s + v * 0.5; } } return s; }
+            function idx(a, n) { var s = 0; for (var i = 0; i < n; i++) { var v = a[i - 1 + 0.5 * (i & 1)]; if (v > 1e9) { s = s - 1; } else { s = s + v; } } return s; }
+            var nums = [1, 2, 3, 4, 5, 6, 7, 8];
+            var f64 = new Float64Array([1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]);
+            var i32 = new Int32Array([8, 7, 6, 5, 4, 3, 2, 1]);
+            var holey = [1, , 3, 4, , 6, 7, 8];
+            var mixed = [1, 2, "x", 4, 5, 6, 7, 8];
+            var named = [1, 2, 3, 4, 5, 6, 7, 8];
+            named[-1] = 1000; named[0.5] = 100; named[2.5] = 10; named[4.5] = 1;
+            var out = [];
+            for (var w = 0; w < 6; w++) { sum(nums, 32); sum(f64, 32); idx(nums, 6); }
+            out.push(sum(nums, 16), sum(f64, 16), sum(i32, 16), sum(holey, 16));
+            Array.prototype[1] = 10; Array.prototype[4] = 20;
+            out.push(sum(holey, 16));
+            delete Array.prototype[1]; delete Array.prototype[4];
+            out.push(sum(mixed, 8), idx(named, 6), sum(nums, 3));
+            return out.join(",");
+        })()
+    "#;
+    let expected = "36,40,36,NaN,59,NaN,1117,6";
+    let mut reference = Engine::new();
+    reference.set_tier(Tier::Interp);
+    assert_eq!(evaluate(&mut reference, source), expected);
+    let before = super::regions::executed_regions();
+    let mut jit = Engine::new();
+    jit.set_tier(Tier::Jit);
+    jit.set_tier_threshold(0);
+    assert_eq!(evaluate(&mut jit, source), expected);
+    assert!(
+        super::regions::executed_regions() > before,
+        "the loops must run as register regions"
+    );
+}
