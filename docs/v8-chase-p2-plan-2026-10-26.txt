@@ -6304,3 +6304,55 @@ chain, not a region. Checks for each landing: rustfmt; clippy in the three landi
 configurations on Crystal and zombie (x86-64), and zombie's aarch64 cross clippy; the lib suite
 on Crystal (2,736-2,738) and zombie (2,530); the new region tests and the name-fusion tests under
 TRUST_JS_GC_STRESS=1.
+
+### Region admission: step 4c, first part (record, 2026-11-03)
+
+03a57cc4: a region tests a tail position's depth (Op::TailDeep) in place. TailDeep asks whether
+a strict-mode tail call is deep enough to run as a proper tail call. The region had no lowering
+for it, so it ran in the exact-PC helper, which costs about 110 instructions, while the
+baseline's template reads the execution context's depth in a few. Vue's `return _e(e) ? e :
+ye(...)` (ve) and similar shapes put it in admitted regions. With TRUST_JS_JIT_OPSTAT,
+regions on and off differ only in TailDeep: 74,719 helper calls in the Vue fixture and 8,417 in
+Djot, none without regions. That was most of what ve's region cost (about 200 instructions a
+call). The region now reads the depth as the baseline does and leaves the Boolean in a register
+for the JumpIfFalse that follows. Counts against 99c43d2a:
+| | 99c43d2a | 03a57cc4 | change |
+| --- | --- | --- | --- |
+| Vue | 1,888,822,707 | 1,875,228,397 | -0.72% |
+| React | 337,643,072 | 337,637,481 | -0.00% |
+| Djot | 675,414,202 | 673,736,574 | -0.25% |
+| chai | 83,451,971,215 | 83,467,331,353 | +0.02% |
+| Richards | 141,931,759 | 141,931,240 | -0.00% |
+| DeltaBlue | 266,280,292 | 266,275,986 | -0.00% |
+| Crypto | 749,420,612 | 749,420,733 | +0.00% |
+| RayTrace | 1,056,011,377 | 1,056,005,855 | -0.00% |
+| EarleyBoyer | 3,642,625,159 | 3,642,637,445 | +0.00% |
+| RegExp | 2,827,202,886 | 2,827,190,470 | -0.00% |
+| Splay | 1,888,116,088 | 1,888,114,592 | -0.00% |
+| NavierStokes | 459,746,727 | 459,746,689 | -0.00% |
+| PdfJS | 8,090,276,017 | 8,082,464,941 | -0.10% |
+| Mandreel | 65,703,759,868 | 65,703,374,849 | -0.00% |
+| Gameboy | 22,782,776,889 | 22,756,500,402 | -0.12% |
+| CodeLoad | 481,696,553 | 481,678,505 | -0.00% |
+| Box2D | 4,624,688,955 | 4,624,655,972 | -0.00% |
+| zlib | 138,963,052,435 | 138,962,947,648 | -0.00% |
+| TypeScript | 59,770,658,247 | 59,758,395,835 | -0.02% |
+Vue gains more than refusing its two worst regions did (-0.56%): tail positions are in many of
+its regions.
+
+Acyclic spans after this step. With every acyclic region refused (variants/deny.py over the
+regions each workload admits), the following change. Vue's spans now pay (+0.14% without them),
+as do Gameboy's (+3.44%), RegExp's (+0.68%), Box2D's (+0.56%) and RayTrace's (+0.30%), and
+Djot's and TypeScript's are neutral (-0.01%, +0.05%). They still cost EarleyBoyer -1.01%, React
+-0.50%, Splay -0.37%, DeltaBlue -0.36%, PdfJS -0.28%, zlib -0.27%, Richards -0.25%, Crypto -0.25%
+and Mandreel -0.15%. Regions on and off send no other operation to the
+exact-PC helper in those workloads, so what is left is the spans' own overhead. React's are the
+two `state.map` callbacks, each a whole tiny function that ends at its return (about six
+instructions a call).
+
+Test: region_tail_deep_reads_the_depth_in_place_and_keeps_proper_tail_calls. It runs a
+`ve`-shaped function and a 3,000-deep strict recursion (past the ordinary depth of 1,024), and
+counts TailDeep in the exact-PC helper (TEST_JIT_TAIL_DEEP_HELPERS): 50 without the change, 0
+with it. Checks: rustfmt; clippy in the three landing configurations on Crystal and zombie, and
+zombie's aarch64 cross clippy; the lib suite on Crystal (2,739) and zombie (2,530); the test
+under TRUST_JS_GC_STRESS=1.
