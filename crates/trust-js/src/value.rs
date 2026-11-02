@@ -7277,9 +7277,8 @@ impl Props {
                 .saturating_add(index.bytes());
         }
         if self.elems.symbols().is_some() {
-            bytes = bytes.saturating_add(std::mem::size_of::<
-                crate::fasthash::FastMap<u64, SymbolRef>,
-            >());
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<crate::fasthash::FastMap<u64, SymbolRef>>());
             exact = false;
         }
         (bytes, exact)
@@ -7304,7 +7303,22 @@ impl Props {
     /// # Safety
     /// `items..items+len` contains immutable initialized execution words valid through this call.
     pub(crate) unsafe fn packed_array_from_raw(items: *const Value, len: usize) -> Props {
-        Self::packed_array_values((0..len).map(|index| unsafe { items.add(index).read() }))
+        // SAFETY: the caller's `len` initialized words; a Value is its word (repr transparent).
+        let words = unsafe { std::slice::from_raw_parts(items.cast::<u64>(), len) };
+        Self::packed_array_words(word_block::Words::from_words(words), len)
+    }
+
+    /// [`Props::packed_array`] of a list in hand: its words are copied in one pass.
+    pub(crate) fn packed_array_from_slice(items: &[Value]) -> Props {
+        // SAFETY: a Value is its word (repr transparent over u64).
+        let words =
+            unsafe { std::slice::from_raw_parts(items.as_ptr().cast::<u64>(), items.len()) };
+        Self::packed_array_words(word_block::Words::from_words(words), items.len())
+    }
+
+    fn packed_array_words(words: word_block::Words, len: usize) -> Props {
+        let shape = array_length_shape();
+        Self::packed_array_named_words(words, len, shape, array_length_layout(), std::iter::empty())
     }
 
     /// CreateArrayFromList / ArrayCreate (ECMA-262 e28783d5). Host/runtime lists
@@ -7330,6 +7344,25 @@ impl Props {
         named: impl ExactSizeIterator<Item = Value>,
     ) -> Props {
         let len = items.len();
+        Self::packed_array_named_words(
+            word_block::Words::from_values(items),
+            len,
+            shape,
+            layout,
+            named,
+        )
+    }
+
+    /// [`Props::packed_array_named`] with the element words built: `len` of them.
+    #[inline(always)]
+    fn packed_array_named_words(
+        words: word_block::Words,
+        len: usize,
+        shape: u32,
+        layout: PropertyLayout,
+        named: impl ExactSizeIterator<Item = Value>,
+    ) -> Props {
+        debug_assert_eq!(words.len(), len);
         let length = Property::data(Value::Num(len as f64), true, false, false);
         Props {
             entries: NamedEntries {
@@ -7340,7 +7373,7 @@ impl Props {
             },
             shape,
             // An empty array keeps the static empty block until its first element.
-            elems: DenseStorage(None, None, word_block::Words::from_values(items)),
+            elems: DenseStorage(None, None, words),
             proto_flag: Cell::new(false),
             has_far: Cell::new(false),
             elem_mode: Cell::new(true),

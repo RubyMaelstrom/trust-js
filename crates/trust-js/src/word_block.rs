@@ -141,6 +141,52 @@ impl Words {
         }
     }
 
+    /// An exact block of the words of `values` (an array literal's evaluated window, a host
+    /// list) with their kind bits. Unlike [`Words::from_values`], each loop has a single bound,
+    /// the slice's, however the caller is inlined.
+    #[inline]
+    pub(crate) fn from_words(values: &[u64]) -> Self {
+        let capacity = values.len();
+        if capacity > SHORT_WORDS {
+            return Self::from_long_words(values);
+        }
+        let mut words = Words::with_capacity(capacity);
+        if capacity == 0 {
+            return words;
+        }
+        let mut flags = KIND_ALL;
+        let first = words.0.as_ptr();
+        for (index, &word) in values.iter().enumerate() {
+            flags &= word_kind(word);
+            // SAFETY: a fresh heap block with room for `capacity` words. The store is volatile
+            // so that the loop stays one short scalar loop: LLVM would split it into a memcpy
+            // call and a vectorized fold, whose fixed cost exceeds a short literal's copy.
+            unsafe { first.add(index).write_volatile(word) };
+        }
+        let header = words.header_mut();
+        header.used = capacity as u32;
+        header.flags = flags;
+        words
+    }
+
+    /// [`Words::from_words`] past [`SHORT_WORDS`]: one copy, then the kind bits folded over it
+    /// (vectorized), out of line.
+    #[inline(never)]
+    fn from_long_words(values: &[u64]) -> Self {
+        let capacity = values.len();
+        let mut words = Words::with_capacity(capacity);
+        // SAFETY: a fresh heap block with room for `capacity` words, which `values` (a slice
+        // elsewhere) does not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), words.0.as_ptr(), capacity) };
+        let flags = values
+            .iter()
+            .fold(KIND_ALL, |flags, &word| flags & word_kind(word));
+        let header = words.header_mut();
+        header.used = capacity as u32;
+        header.flags = flags;
+        words
+    }
+
     /// An exact block of `values`, written in one pass with their kind bits (array literals
     /// and host lists build their elements here).
     pub(crate) fn from_values(values: impl ExactSizeIterator<Item = Value>) -> Self {
@@ -758,18 +804,31 @@ fn block_size(words: usize) -> usize {
         .expect("element block size")
 }
 
+/// The longest list [`Words::from_words`] copies in its scalar loop.
+const SHORT_WORDS: usize = 8;
+
 /// The kind bits a block keeps after holding `word`.
 #[inline]
 fn word_kind(word: u64) -> u32 {
-    if word == PACK_EMPTY {
-        return KIND_NUMBERS | KIND_INT32;
-    }
-    // SAFETY: a Value's bits.
-    match unsafe { Value::from_bits(word) }.number() {
-        Some(n) if f64_exact_i32(n) => KIND_ALL,
-        Some(_) => KIND_NO_HOLES | KIND_NUMBERS,
-        None => KIND_NO_HOLES,
-    }
+    // Without branches: a hole breaks only NO_HOLES, any other word that is not a Number breaks
+    // NUMBERS and INT32, and a Number that is not an exact int32 breaks INT32. A tag word is a
+    // NaN pattern, never an exact int32 (an i32 round trip ends at an integral double).
+    let hole = word == PACK_EMPTY;
+    let number = is_number_word(word);
+    let int32 = f64_exact_i32(f64::from_bits(word));
+    (u32::from(!hole) * KIND_NO_HOLES)
+        | (u32::from(number | hole) * KIND_NUMBERS)
+        | (u32::from(int32 | hole) * KIND_INT32)
+}
+
+/// Whether `word` is a Number's bits: its tag is none of the other kinds' (`Value::number`'s
+/// test), which are 0x7ff9-0x7fff (undefined, the hole, null, Booleans, BigInts, Strings,
+/// Symbols) and 0xfff9-0xfffa (Objects, the deferred prototype). Every Number constructor
+/// canonicalizes NaN, so no Number has one of them.
+#[inline]
+fn is_number_word(word: u64) -> bool {
+    let tag = word >> 48;
+    tag.wrapping_sub(0x7ff9) >= 7 && tag.wrapping_sub(0xfff9) >= 2
 }
 
 /// The capacity to grow a block of `len` used words to for `additional` more: V8's
@@ -824,6 +883,62 @@ mod tests {
     fn exact(words: &Words) {
         assert_eq!(words.kind(), words.kind() & words.computed_kind());
         assert!(words.len() <= words.capacity() || words.is_static_empty());
+    }
+
+    /// The kind bits as `Value::number`'s tag table states them (a reference for `word_kind`):
+    /// Value::from_bits itself refuses the synthetic words the test also covers.
+    fn decoded_kind(word: u64) -> u32 {
+        if word == PACK_EMPTY {
+            return KIND_NUMBERS | KIND_INT32;
+        }
+        let number = !matches!(
+            word & !PACK_PAYLOAD,
+            PACK_UNDEFINED
+                | PACK_EMPTY
+                | PACK_NULL
+                | PACK_BOOL
+                | PACK_BIGINT
+                | PACK_STR
+                | PACK_SYM
+                | PACK_OBJ
+                | PACK_LAZY_PROTO
+        );
+        match number.then(|| f64::from_bits(word)) {
+            Some(n) if f64_exact_i32(n) => KIND_ALL,
+            Some(_) => KIND_NO_HOLES | KIND_NUMBERS,
+            None => KIND_NO_HOLES,
+        }
+    }
+
+    #[test]
+    fn word_kinds_match_the_value_decoding_for_every_tag() {
+        let mut words = vec![
+            PACK_EMPTY,
+            PACK_CANON_NAN,
+            0.0f64.to_bits(),
+            (-0.0f64).to_bits(),
+            1.0f64.to_bits(),
+            (-1.0f64).to_bits(),
+            0.5f64.to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            f64::MAX.to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+            (i32::MAX as f64).to_bits(),
+            (i32::MIN as f64).to_bits(),
+            (i32::MAX as f64 + 1.0).to_bits(),
+            4294967295.0f64.to_bits(),
+        ];
+        // Every 16-bit tag, each with a few payloads: the other kinds' tags and the doubles
+        // around them (0x7ff8 and 0xfff8 are NaNs; 0xfffb and up negative NaN patterns).
+        for tag in 0..=0xffffu64 {
+            for payload in [0, 1, 0x1234_5678, PACK_PAYLOAD] {
+                words.push(tag << 48 | payload);
+            }
+        }
+        for word in words {
+            assert_eq!(word_kind(word), decoded_kind(word), "{word:#018x}");
+        }
     }
 
     #[test]

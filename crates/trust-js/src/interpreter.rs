@@ -8453,7 +8453,7 @@ impl Interp {
     pub fn make_array(&self, items: Vec<Value>) -> Value {
         Value::Obj(Object::new_with_parts(
             Some(self.array_proto),
-            Props::packed_array(items.into_iter()),
+            Props::packed_array_from_slice(&items),
             Exotic::Array,
         ))
     }
