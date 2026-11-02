@@ -1092,6 +1092,12 @@ impl Operand {
         )
     }
 
+    /// [`Self::numeric`], or a tagged home's word, which [`number`] reads as a Number behind a
+    /// guard (as the region's arithmetic reads one).
+    fn numeric_or_tagged_home(self) -> bool {
+        self.numeric() || matches!(self, Self::Borrowed(_))
+    }
+
     fn kind(self) -> Option<ScalarKind> {
         match self {
             Self::Scalar(state) => Some(state.kind),
@@ -3232,16 +3238,16 @@ pub(super) fn emit(
                         && plan.reg(receiver).is_none()
                         && plan.numeric_results.contains(&pc)
                         && depth >= 1
-                        && stack[depth - 1].numeric() =>
+                        && stack[depth - 1].numeric_or_tagged_home() =>
                 {
-                    // An element read for arithmetic whose key is a Number in a register: the
-                    // receiver's element words (or its typed-array view) read straight into a
-                    // register, as the baseline's numeric chains read them, with nothing on the
+                    // An element read for arithmetic whose key is a Number in a register (or a
+                    // tagged home's word, guarded as one): the receiver's element words (or its
+                    // typed-array view) read straight into a register, as the baseline's numeric chains read them, with nothing on the
                     // stack published. A receiver or key the native read does not take, a hole,
                     // an index past the used words or an element that is not a Number leaves the
                     // region at this read, whose baseline template runs it.
                     saved_work += 4;
-                    scalar_register(a, &mut stack, physical, depth - 1);
+                    number(a, &mut stack, physical, depth - 1, bailout);
                     let key = 15 + depth as u32;
                     emit_exec_word_load(a, 10, 22, receiver as i32 * 8);
                     emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 11, bailout);
@@ -3267,6 +3273,73 @@ pub(super) fn emit(
                     emit_exec_number_guard(a, 12, 0, 13, bailout);
                     a.fmov_d_d(key, 0);
                     stack[depth - 1] = Operand::temporary(ScalarKind::Number);
+                }
+                Op::SetElemLocalDrop(receiver)
+                    if fast & 2048 != 0
+                        && elem_inlinable(layout)
+                        && receiver as u32 * 8 + 8 < 4096
+                        && plan.reg(receiver).is_none()
+                        && depth >= 2
+                        && stack[depth - 2].numeric_or_tagged_home()
+                        && stack[depth - 1].numeric() =>
+                {
+                    // A Number stored under a Number key, both in registers (the key may be a
+                    // tagged home's word, guarded as a Number): the receiver's
+                    // element words take it in place, as the baseline's store writes a Number
+                    // over an existing element (the kind bits kept exact, a frozen block's words
+                    // refused), or its typed-array view does, with nothing on the stack
+                    // published. A Number is no reference: no card. A receiver or key the native
+                    // store does not take, a hole or an index past the used words (a property
+                    // creation) leaves the region at the store, whose baseline template runs it,
+                    // before anything is written.
+                    saved_work += 4;
+                    number(a, &mut stack, physical, depth - 2, bailout);
+                    number(a, &mut stack, physical, depth - 1, bailout);
+                    let key = 14 + depth as u32;
+                    let value = key + 1;
+                    emit_exec_word_load(a, 10, 22, receiver as i32 * 8);
+                    emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 11, bailout);
+                    emit_exec_payload(a, 10, 10);
+                    a.add_imm(11, 10, layout.obj_from_cell as u32);
+                    a.fcvtzu_w_d(9, key);
+                    a.ucvtf_d_w(1, 9);
+                    a.fcmp(key, 1);
+                    a.b_cond(C_NE, bailout);
+                    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+                    guard_exotic_ordinary_or_array(a, layout, 12, 13, bailout);
+                    let typed = a.new_label();
+                    let stored = a.new_label();
+                    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
+                    a.cbz(12, false, typed);
+                    emit_words_base(a, layout, 11, 15, 14);
+                    a.cmp_reg_x(9, 14);
+                    a.b_cond(C_HS, bailout);
+                    a.ldr_x_lsl3(12, 15, 9);
+                    a.mov_imm64(13, crate::value::PACK_EMPTY);
+                    a.cmp_reg_x(12, 13);
+                    a.b_cond(C_EQ, bailout);
+                    // The Number's word, its NaN canonical.
+                    let word = a.new_label();
+                    a.fmov_x_d(13, value);
+                    a.fcmp(value, value);
+                    a.b_cond(7, word); // VC: not NaN
+                    a.mov_imm64(13, crate::value::PACK_CANON_NAN);
+                    a.bind(word);
+                    emit_word_number_kind_unfrozen(a, layout, 15, value, 12, 16, 14, 2, bailout);
+                    a.str_x_lsl3(13, 15, 9);
+                    a.b(stored);
+                    a.bind(typed);
+                    a.fmov_d_d(1, value);
+                    typed_array::emit(
+                        a,
+                        layout,
+                        Some(typed_array::WriteValue::Register(1)),
+                        stored,
+                        bailout,
+                    );
+                    a.bind(stored);
+                    stack.pop();
+                    stack.pop();
                 }
                 Op::LoadName(_, cache)
                     if fast & 8192 != 0

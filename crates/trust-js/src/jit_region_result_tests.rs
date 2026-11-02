@@ -628,3 +628,62 @@ fn region_tail_deep_reads_the_depth_in_place_and_keeps_proper_tail_calls() {
         "no depth test runs in the exact-PC helper"
     );
 }
+
+/// A Number stored as an element under a Number key, both in registers, goes into the receiver's
+/// element words (its kind bits kept exact) or its typed-array view in place. Everything the
+/// native store does not take leaves the region at the store and runs the baseline template,
+/// before anything is written: holes and appends (property creations), frozen arrays, keys that
+/// are not indices (ordinary properties), and receivers that are not arrays.
+#[test]
+fn region_numeric_element_stores_stay_in_registers_and_leave_for_anything_else() {
+    let source = r#"
+        (function () {
+            function fill(a, n, base) {
+                for (var i = 0; i < n; i++) {
+                    var k = (i * 3) & 7;
+                    if (k > 100) { base = 0; } else { a[k] = base + i * 0.5; }
+                }
+                return a;
+            }
+            function keyed(a, n) {
+                for (var i = 0; i < n; i++) {
+                    var k = i - 1 + 0.5 * (i & 1);
+                    if (k > 100) { a[0] = 0; } else { a[k] = i; }
+                }
+                return a;
+            }
+            function show(a) {
+                var parts = [];
+                for (var i = 0; i < a.length; i++) parts.push(Object.is(a[i], -0) ? "-0" : String(a[i]));
+                return parts.join(" ") + "|" + Object.keys(a).filter(function (k) { return !(k >>> 0 == k); }).join(" ");
+            }
+            var out = [];
+            for (var w = 0; w < 6; w++) { fill([0, 0, 0, 0, 0, 0, 0, 0], 32, w); fill(new Float64Array(8), 32, w); }
+            out.push(show(fill([0, 0, 0, 0, 0, 0, 0, 0], 16, 1)));
+            out.push(show(fill(new Float64Array(8), 16, 1)));
+            out.push(show(fill(new Int32Array(8), 16, 1.75)));
+            out.push(show(fill([0, , 0, , 0, , 0, ,], 16, 2)));
+            out.push(show(fill([0, 0], 16, 3)));
+            var frozen = Object.freeze([9, 9, 9, 9, 9, 9, 9, 9]);
+            out.push(show(fill(frozen, 16, 4)));
+            out.push(show(fill([1, 2, 3, 4, 5, 6, 7, 8], 8, NaN)));
+            out.push(show(fill([1, 2, 3, 4, 5, 6, 7, 8], 1, -0)));
+            out.push(show(keyed([1, 2, 3, 4, 5, 6, 7, 8], 6)));
+            var obj = { length: 8 };
+            out.push(JSON.stringify(fill(obj, 8, 5)));
+            return out.join("; ");
+        })()
+    "#;
+    let mut reference = Engine::new();
+    reference.set_tier(Tier::Interp);
+    let expected = evaluate(&mut reference, source);
+    let before = super::regions::executed_regions();
+    let mut jit = Engine::new();
+    jit.set_tier(Tier::Jit);
+    jit.set_tier_threshold(0);
+    assert_eq!(evaluate(&mut jit, source), expected);
+    assert!(
+        super::regions::executed_regions() > before,
+        "the loops must run as register regions"
+    );
+}
