@@ -18328,10 +18328,16 @@ fn emit_loop_chain(
                 a.cmp_imm_w(14, need);
                 a.b_cond(C_NE, pre_fail);
                 a.bind(ready);
-                // A frozen receiver's words take no store (W2c step 7a); the chain's stores
-                // assume writable elements, so a frozen receiver takes the plain loop.
-                a.logic_imm_w(0, 14, 13, asm::logical_imm_w(KIND_FROZEN).unwrap());
-                a.cbnz(14, false, pre_fail);
+                // A frozen receiver's words take no store (W2c step 7a): one the chain stores
+                // to takes the plain loop; one it only reads stays (reads ignore the level).
+                let stored = plan
+                    .chain
+                    .iter()
+                    .any(|(op, _)| matches!(op, ChainOp::SetElem(xoff, _) if *xoff == rp.off));
+                if stored {
+                    a.logic_imm_w(0, 14, 13, asm::logical_imm_w(KIND_FROZEN).unwrap());
+                    a.cbnz(14, false, pre_fail);
+                }
             } else {
                 a.b(pre_fail);
             }

@@ -519,3 +519,26 @@ fn loop_chains_scan_at_most_4096_words_to_prove_a_receiver() {
     );
     assert!(calls() > 0, "a small one still is");
 }
+
+#[test]
+fn loop_chains_read_frozen_receivers_and_refuse_to_store_to_them() {
+    // W2c step 7a: a frozen receiver's words take no store, so a chain storing to one takes the
+    // plain loop; a chain that only reads it runs (reads ignore the integrity level).
+    let mut engine = engine();
+    eval(
+        &mut engine,
+        "function sum(a,n){var s=0;for(var i=0;i<n;i++)s+=a[i];return s;}\
+         function twice(a,n){for(var i=0;i<n;i++)a[i]=a[i]*2;return a;}\
+         for(var w=0;w<20;w++){sum([1,2,3,4],4);twice([1,2,3,4],4);}",
+    );
+    let entries = || super::TEST_NUMERIC_REGION_ENTRIES.with(|count| count.get());
+    super::TEST_NUMERIC_REGION_ENTRIES.with(|count| count.set(0));
+    assert_eq!(
+        eval(&mut engine, "var f=Object.freeze([1,2,3,4]);sum(f,4)"),
+        "10"
+    );
+    assert!(entries() > 0, "a chain reading a frozen receiver runs");
+    super::TEST_NUMERIC_REGION_ENTRIES.with(|count| count.set(0));
+    assert_eq!(eval(&mut engine, "twice(f,4).join()"), "1,2,3,4");
+    assert_eq!(entries(), 0, "a chain storing to it takes the plain loop");
+}

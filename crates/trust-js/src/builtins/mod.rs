@@ -2218,20 +2218,19 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
     } else {
         let object = obj.as_obj().unwrap();
         let body = object.borrow();
-        body.props
-            .ordered_keys()
-            .iter()
-            .filter(|k| {
-                !(words_sealed
-                    && k.as_index().is_some_and(|n| {
-                        matches!(
-                            body.props.get_index(n),
-                            Some(crate::value::Element::Word(..))
-                        )
-                    }))
-            })
-            .map(|k| crate::value::PropertyKey::stored(k.text().to_string()))
-            .collect()
+        if words_sealed {
+            // Only the named entries need their defines, whose order no trap observes.
+            body.props
+                .iter()
+                .map(|(k, _)| crate::value::PropertyKey::stored(k.text().to_string()))
+                .collect()
+        } else {
+            body.props
+                .ordered_keys()
+                .iter()
+                .map(|k| crate::value::PropertyKey::stored(k.text().to_string()))
+                .collect()
+        }
     };
     for key in keys {
         // ECMA-262 §7.3.15 SetIntegrityLevel: sealing defines { [[Configurable]]: false } on
