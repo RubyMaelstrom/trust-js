@@ -5840,3 +5840,131 @@ Predicted: React about -1% to -2% (its appends' `length`), the map/filter append
 instructions each; freezing an array O(1) in its elements, and a frozen array's reads as fast as
 an unfrozen one's (outside the acceptance workloads, which freeze no arrays but tagged templates'
 strings).
+
+### W2c step 7: integrity kinds and `length` at slot 0 (record, 2026-11-02)
+
+Seven commits on p2-w2c7. bfc5e7fe is 7b and 9819f66f and 54ee3c55 are 7a, as designed;
+bd6d5b2f, 39a9a4d4, 673d92c4 and 64f7ecdd take back 7a's cost on workloads that freeze nothing.
+
+7b, as designed: the map/filter append and the element store's append read `length` at slot 0.
+Against c38b4f3c (step 6's code): React -1.18% (its appends), Gameboy -0.47%, NavierStokes
+-0.42%, PdfJS -0.15%, chai -0.09%; the rest within 0.11%.
+
+7a, as designed, plus two changes in 54ee3c55:
+- A loop chain refuses a frozen receiver only when it stores to it. A chain that only reads
+  keeps running, since reads ignore the level.
+- SetIntegrityLevel defines only the named entries after sealing the words. No trap observes
+  their order.
+
+Its first counts against 7b moved broadly: chai +0.66%, Vue +0.55%, Gameboy +0.54%, Crypto
++0.33%, PdfJS +0.33%. A measurement-only build without the generated-code guards kept every one
+but part of Crypto's. Two tools found the causes:
+- SPE sampling: `perf record -e arm_spe_0/load_filter=0,store_filter=0,branch_filter=0,
+  jitter=1/u` with `perf report --itrace=i1i`. It records exact PCs; PMU sampling's skid had
+  moved about 1% of the samples between JIT code and Rust.
+- The disassembly.
+
+1. The design's Element::Word(Value, u32), a word with its block's integrity bits, gave that
+   variant two scalars. Option<Element> stopped being a scalar pair (its size stayed 16 bytes),
+   so get_index, get_key, Props::get and get_walking returned it through a hidden pointer that
+   their callers reloaded, named lookups included. One 8-byte field per variant (Word,
+   SealedWord, FrozenWord, Entry) returns it in x0/x1 again (bd6d5b2f).
+2. The gates' loads tipped fat LTO into calling push_packed_property out of line from
+   try_append_element and start_packed_elements, together with Words::reallocate_with_room.
+   `#[inline]` restores the inlining (673d92c4).
+3. The generated-code guard cost a Number overwrite three instructions (load, and, cbnz) just
+   before the kind update loaded the same flags. The update now runs before the store and tests
+   FROZEN within its own tests (39a9a4d4). FROZEN moves to bit 3, between INT32 and SCANNED (now
+   bit 4; SEALED takes bit 5). INT32|FROZEN and FROZEN|SCANNED are then each one logical
+   immediate, so the guard costs one compare on either path. The store site, ++/-- and the
+   chain's element store use it; the shared stub keeps its guard for the other values.
+4. Selecting a level in get_index cost five instructions. Every level sets SEALED, so one
+   test-bit branch identifies a word without a level, and the sealed and frozen elements are
+   built out of line (673d92c4). Reads that need no attributes use Props::data_element, which
+   answers a word without an Element (64f7ecdd).
+5. try_append_element and try_define_dense_element create an element. Every caller refuses a
+   non-extensible object first, and every level implies non-extensibility, so their level tests
+   become debug assertions (64f7ecdd).
+
+The changes against 7b, commit by commit (each a fat-LTO build of that commit):
+| against 7b | 9819f66f | bd6d5b2f | 39a9a4d4 | 673d92c4 | 64f7ecdd |
+| --- | --- | --- | --- | --- | --- |
+| Vue | +0.55% | +0.20% | +0.27% | +0.10% | +0.11% |
+| React | +0.13% | +0.03% | +0.04% | +0.02% | +0.01% |
+| Djot | +0.20% | +0.19% | +0.21% | +0.08% | +0.00% |
+| chai | +0.66% | +0.23% | +0.22% | +0.06% | +0.05% |
+| Richards | +0.04% | +0.02% | +0.01% | +0.01% | +0.01% |
+| DeltaBlue | +0.19% | +0.19% | +0.19% | +0.03% | +0.02% |
+| Crypto | +0.33% | +0.29% | +0.19% | +0.18% | +0.18% |
+| RayTrace | +0.01% | +0.00% | +0.00% | +0.00% | +0.00% |
+| EarleyBoyer | +0.03% | -0.01% | -0.01% | -0.04% | -0.04% |
+| RegExp | +0.00% | +0.00% | -0.00% | -0.00% | -0.00% |
+| Splay | +0.00% | +0.01% | +0.01% | +0.00% | +0.00% |
+| NavierStokes | +0.20% | +0.20% | +0.10% | +0.10% | +0.10% |
+| PdfJS | +0.33% | +0.28% | +0.32% | +0.12% | +0.07% |
+| Mandreel | +0.01% | +0.00% | +0.00% | +0.00% | +0.00% |
+| Gameboy | +0.54% | +0.15% | +0.15% | +0.15% | +0.15% |
+| CodeLoad | +0.04% | +0.01% | +0.01% | +0.01% | +0.01% |
+| Box2D | +0.10% | +0.09% | +0.09% | +0.07% | +0.05% |
+| zlib | +0.00% | +0.00% | +0.00% | +0.00% | +0.00% |
+| Typescript | +0.11% | +0.08% | +0.09% | +0.03% | +0.04% |
+What remains comes from two sources. In generated code, the compare per Number overwrite:
+Crypto +0.18%, NavierStokes +0.10%. In Rust, a test bit per element read and the four-way match
+of its callers: Vue +0.11%, and 0.07% or less elsewhere. Gameboy's +0.15% is layout noise.
+Gameboy reads no clock. 25.7M of its 34.7M is a hash lookup keyed by object addresses (a
+SideSlotTable's HashMap<usize, ...>, FxHasher), whose probes follow the addresses, and those
+move with the binary's size. That lookup takes 2.1% of Gameboy, a lead for later.
+
+Frozen arrays (fat LTO, CPU 17 on a loaded machine; Node 24 on CPU 18), before 7a and at its tip:
+- 2M reads of a frozen 100,000-element array through a called loop: 98-103 ms -> 8-9 ms, the
+  same as an unfrozen array (9-10 ms before). Node: 27-28 ms frozen, 6-8 ms unfrozen.
+- Freezing that array: 31-32 ms -> 0 ms.
+- A nested loop bounded by `x.length` over the frozen array: 141-146 ms -> 38-39 ms, the time
+  that loop takes on an unfrozen array in both builds. Node takes 25-26 ms frozen and 9-11 ms
+  unfrozen; that gap predates step 7.
+
+Counts, step 7 against c38b4f3c (fat LTO, Crystal; Octane at a fixed 5 runs):
+| | c38b4f3c | 7b (bfc5e7fe) | step 7 (64f7ecdd) | change |
+| --- | --- | --- | --- | --- |
+| Vue | 1,890,621,694 | 1,890,093,441 | 1,892,194,627 | +0.08% |
+| React | 341,904,587 | 337,882,438 | 337,922,928 | -1.16% |
+| Djot | 676,741,421 | 676,729,960 | 676,733,894 | -0.00% |
+| chai | 83,508,786,766 | 83,431,168,035 | 83,473,281,894 | -0.04% |
+| Richards | 141,720,158 | 141,711,938 | 141,727,282 | +0.01% |
+| DeltaBlue | 295,114,102 | 295,122,043 | 295,189,826 | +0.03% |
+| Crypto | 749,029,898 | 748,949,728 | 750,331,309 | +0.17% |
+| RayTrace | 1,059,232,971 | 1,059,243,270 | 1,059,270,174 | +0.00% |
+| EarleyBoyer | 3,616,491,599 | 3,620,302,994 | 3,618,892,570 | +0.07% |
+| RegExp | 2,840,214,835 | 2,840,149,195 | 2,840,138,880 | -0.00% |
+| Splay | 1,890,444,267 | 1,890,434,976 | 1,890,465,709 | +0.00% |
+| NavierStokes | 498,254,561 | 496,186,439 | 496,661,256 | -0.32% |
+| PdfJS | 8,133,971,153 | 8,121,933,647 | 8,127,407,099 | -0.08% |
+| Mandreel | 65,816,478,052 | 65,817,113,769 | 65,819,300,193 | +0.00% |
+| Gameboy | 22,771,689,945 | 22,663,698,055 | 22,698,310,801 | -0.32% |
+| CodeLoad | 485,258,512 | 485,245,301 | 485,280,264 | +0.00% |
+| Box2D | 4,667,246,207 | 4,667,279,954 | 4,669,487,598 | +0.05% |
+| zlib | 167,427,424,861 | 167,427,404,810 | 167,434,269,197 | +0.00% |
+| Typescript | 60,117,672,009 | 60,115,317,800 | 60,141,435,474 | +0.04% |
+PdfJS reads the clock. CanvasGraphics_executeOperatorList yields after a 15 ms slice of
+Date.now() (pdfjs.js:2305-2346), so its count follows the machine's speed and load. With
+TRUST_JS_TIER_LOG=1, one build compiled that function on its call count in one run and on its
+loop budget in the next. octane-fixed/clock.js makes the count deterministic: loaded after
+prelude.js, it advances Date.now 1 ms per read. With it, PdfJS goes 8,130,813,730 ->
+8,118,917,400 (7b) -> 8,124,276,355, which is -0.15%, +0.07% and -0.08% overall, as the real
+clock's figures show. The counts scripts keep the real clock, as earlier records used.
+
+Tests: every_array_keeps_length_at_slot_zero (every creation path) and
+frozen_and_sealed_arrays_keep_their_words_and_their_semantics, whose expected output matches Node
+24. The latter covers reads, overwrites, defines, deletes, truncation, every Array.prototype
+writer, descriptors, key order and the re-define of one element. generated_code_never_writes_a_
+frozen_array covers int32 and double arrays, frozen and sealed, at the store site, ++, the
+shared stub and loop chains; dropping the doubles path's FROZEN branch makes it fail.
+loop_chains_read_frozen_receivers_and_refuse_to_store_to_them covers the loop chains.
+
+Checks: rustfmt; clippy in the three landing configurations on Crystal and zombie (x86-64), and
+zombie's aarch64 cross clippy; the lib suite on Crystal (2,735) and zombie (2,530); GC stress
+(246 tests) on the dense-element, store, value, dense-slot, index-name, numeric-array, update-
+element, native-operation, count-guard, array-shift, array-length, word-block, remembered-element
+and write-barrier tests; Test262 in full at --tier=jit threshold 8 (53,575 of 53,575, the report
+identical to bfc5e7fe's); difftest (138 agree, 12 skipped); the fixtures' masked outputs as
+bfc5e7fe's.
