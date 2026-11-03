@@ -117,31 +117,24 @@ fn sequence_emitters_follow_both_layouts() {
 }
 
 #[test]
-fn named_field_emitters_read_live_objects() {
+fn named_slot_emitters_read_live_objects() {
     let engine = crate::Engine::new();
     let layout = layout(&engine);
-    assert!(fields_len_fits(&layout) && fields_data_fits(&layout));
-    // Field `rsi` of the Object at rdi, as the property templates read it: the bounds check
-    // against the live count, then the packed word at `data + slot * entry_size`.
+    assert!(named_slots_fit(&layout));
+    // Slot `rsi` of the Object at rdi, as the property templates read it (W2d step 2): the bounds
+    // check against the live count, then the word at the slot's address, in the cell or the
+    // record.
     let (_code, value) = assemble(|a| {
         let miss = a.label();
-        fields_len(a, &layout, CX, DI);
+        named_len(a, &layout, CX, DI);
         a.nr_cmp(SI, CX);
         a.jcc(AE, miss);
-        fields_data(a, &layout, AX, DI);
-        a.nr_mul_imm(SI, layout.entry_size);
-        a.nr_reg(0x01, AX, SI); // add rax,rsi
-        a.nr_load(AX, AX, layout.entry_value);
+        slot_addr(a, &layout, AX, DI, SI);
+        a.nr_load(AX, AX, 0);
         ret_none(a, miss);
     });
-    let JitVecLayout::Inline {
-        inline_capacity, ..
-    } = layout.repr.props_fields
-    else {
-        panic!("named fields are an InlineVec")
-    };
-    // In place up to four fields; spilled beyond.
-    for count in [1usize, 2, 4, 5, 9] {
+    // In the cell up to seven slots; the rest in the record.
+    for count in [1usize, 2, 6, 7, 8, 9, 14, 40] {
         let object = Object::new(None);
         for slot in 0..count {
             object.borrow_mut().props.insert(
@@ -153,12 +146,6 @@ fn named_field_emitters_read_live_objects() {
         let stored = unsafe { *(&object as *const crate::value::Gc as *const usize) };
         let base = stored + layout.obj_from_cell;
         assert_eq!(base, &*object.borrow() as *const Object as usize);
-        let fields = layout.obj_props + layout.props_entries;
-        assert_eq!(
-            capacity_word(layout.repr.props_fields, base, fields) != 0,
-            count > inline_capacity,
-            "{count} fields are spilled exactly past the inline capacity"
-        );
         for slot in 0..=count {
             // A packed Number is its f64 bits; past the count the sequence answers all ones.
             let read = value(base, slot);
@@ -170,6 +157,17 @@ fn named_field_emitters_read_live_objects() {
                 ),
                 None => assert_eq!(read, usize::MAX, "{count} fields, slot {slot}"),
             }
+        }
+        // A compile-time slot reads the same word.
+        for slot in [0, count - 1] {
+            let (_code, constant) = assemble(|a| {
+                load_slot_const(a, &layout, AX, DI, slot);
+            });
+            assert_eq!(
+                constant(base, 0),
+                value(base, slot),
+                "{count} fields, slot {slot}"
+            );
         }
     }
 }

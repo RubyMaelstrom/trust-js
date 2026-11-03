@@ -137,9 +137,11 @@ fn ordinary_shared_index_respects_live_prefix_and_mutation() {
         short.shared_layout().unwrap(),
         other.shared_layout().unwrap()
     ));
+    // W2d step 2: seven slots in the cell; the record holds the other five of the twelve the
+    // layout predicts, one word each.
     assert_eq!(
         short.retained_requested_storage_bytes(),
-        (12 * std::mem::size_of::<Property>(), true)
+        (crate::value::RECORD_SLOTS_OFF + 5 * 8, true)
     );
 
     short.remove("field2");
@@ -157,9 +159,11 @@ fn ordinary_shared_index_respects_live_prefix_and_mutation() {
         other.shared_layout().unwrap()
     ));
     assert!(short.shared_layout().unwrap().has_index());
+    // W2d step 2: seven slots in the cell; the record holds the other five of the twelve the
+    // layout predicts, one word each.
     assert_eq!(
         short.retained_requested_storage_bytes(),
-        (12 * std::mem::size_of::<Property>(), true)
+        (crate::value::RECORD_SLOTS_OFF + 5 * 8, true)
     );
 
     let private = crate::value::new_property_layout((0..20).map(|i| format!("private{i}")));

@@ -70,13 +70,24 @@ struct FieldInventory {
 }
 
 impl FieldInventory {
-    fn add_property(&mut self, property: &Property) {
+    /// An element word: a plain data element, or a hole.
+    fn add_word(&mut self, value: super::Value) {
+        self.slots += 1;
+        if value.is_empty() {
+            self.holes += 1;
+            return;
+        }
+        self.data += 1;
+        self.default_wec_data += 1;
+    }
+
+    fn add_property(&mut self, property: super::PropRef<'_>) {
         self.slots += 1;
         if property.is_empty() {
             self.holes += 1;
             return;
         }
-        if property.packed.tag() == PACK_LAZY_PROTO {
+        if property.word().tag() == PACK_LAZY_PROTO {
             // Inspect only the packed tag: `value()` would materialize and change the object.
             self.lazy_prototype_values += 1;
         }
@@ -404,11 +415,11 @@ impl PropertyInventory {
         // The key index lives behind the element buffers, the Symbol map in the map's extras,
         // which a map without element buffers can have too.
         result.dense_string_index_capacity = props
-            .elems
+            .entries
             .index()
             .map_or(0, |index| index.capacity() as u64);
         result.dense_symbol_sidecar_capacity = props
-            .elems
+            .entries
             .symbols()
             .map_or(0, |symbols| symbols.capacity() as u64);
         // The sidecar's and the classic slot map's columns (dense_sidecar*,
@@ -427,9 +438,7 @@ impl PropertyInventory {
             result.dense_heap_packed_capacity_bytes = word_bytes(words.capacity());
             for index in 0..words.len() {
                 let value = words.get(index).unwrap_or(super::Value::Empty);
-                result
-                    .packed_dense_fields
-                    .add_property(&Property::plain(value));
+                result.packed_dense_fields.add_word(value);
             }
             if words.is_empty() {
                 result.dense_eligibility.heap_empty_vectors = 1;
@@ -1052,12 +1061,12 @@ mod tests {
         let function_handle = function.as_obj().unwrap();
         let object = function_handle.borrow();
         let prototype = object.props.get_named("prototype").unwrap();
-        assert_eq!(prototype.packed.tag(), PACK_LAZY_PROTO);
-        let packed_before = prototype.packed.bits();
+        assert_eq!(prototype.word().tag(), PACK_LAZY_PROTO);
+        let packed_before = prototype.word().bits();
 
         let inventory = PropertyInventory::from_props(&object.props);
         assert_eq!(inventory.named_entries.lazy_prototype_values, 1);
-        assert_eq!(prototype.packed.bits(), packed_before);
-        assert_eq!(prototype.packed.tag(), PACK_LAZY_PROTO);
+        assert_eq!(prototype.word().bits(), packed_before);
+        assert_eq!(prototype.word().tag(), PACK_LAZY_PROTO);
     }
 }

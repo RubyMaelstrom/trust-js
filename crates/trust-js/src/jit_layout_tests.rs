@@ -89,13 +89,12 @@ fn layout_is_valid_with_the_build_ownership() {
         Gc::as_ptr(&object) as usize,
         "the stored word is the cell address, the `Gc::as_ptr` identity"
     );
-    // Named slots (W2d step 2): seven words in the cell, then the record.
+    // Named slots (W2d step 2): seven words in the cell, within the map, then the record.
     assert_eq!(INLINE_NAMED_SLOTS, 7);
-    assert_eq!(
-        layout.props_slots + 8 * INLINE_NAMED_SLOTS,
-        std::mem::size_of::<crate::value::Props>(),
-        "the cell's slots end the map, and the 128-byte cell"
+    assert!(
+        layout.props_slots + 8 * INLINE_NAMED_SLOTS <= std::mem::size_of::<crate::value::Props>()
     );
+    assert_eq!(std::mem::size_of::<crate::value::Props>(), 96);
     // A record's cell holds at least two slots in place (more in a larger cell).
     assert!(matches!(
         entries_of(&layout),

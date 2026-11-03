@@ -62,13 +62,13 @@ fn storage_carriers_are_plain_data_with_the_native_header_first() {
     // that dropping a map never reads a block, which may have gone with its heap.
     assert!(!std::mem::needs_drop::<KeyIndex>());
     assert!(!std::mem::needs_drop::<Words>());
-    // The map's storage word the JIT follows comes first; the Rust-heap extras and the element
-    // words follow it.
+    // The map keeps one word for its element words (W2d step 2: the key index and the Rust-heap
+    // extras moved to the named entries' out-of-line record, a nullable pointer).
     assert_eq!(
         std::mem::size_of::<DenseStorage>(),
-        3 * std::mem::size_of::<usize>()
+        std::mem::size_of::<usize>()
     );
-    assert_eq!(std::mem::offset_of!(DenseStorage, 0), 0);
+    assert_eq!(std::mem::size_of::<Record>(), std::mem::size_of::<usize>());
     // The header just before the first word, where generated code reads `used` at -16,
     // `capacity` at -12 and `flags` at -4.
     assert_eq!(std::mem::size_of::<word_block::WordHeader>(), 16);

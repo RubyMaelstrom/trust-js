@@ -1070,6 +1070,7 @@ impl Visitor {
             self.detached_property_storage = self.detached_property_storage.saturating_add(
                 size_of::<crate::value::PropertyLayoutData>()
                     + layout.capacity() * size_of::<crate::atom::PropKey>()
+                    + layout.attrs_capacity()
                     + layout.index_bytes().unwrap_or(0),
             );
         }
@@ -2630,7 +2631,12 @@ mod tests {
         let props = Props::with_capacity(17);
         let (bytes, exact) = props.retained_requested_storage_bytes();
         assert!(exact);
-        assert!(bytes >= 17 * size_of::<crate::value::Property>());
+        // W2d step 2: seven slots in the cell; the record's block holds the other ten, one word
+        // each, unused as they are.
+        assert_eq!(
+            bytes,
+            crate::value::RECORD_SLOTS_OFF + (17 - crate::value::INLINE_NAMED_SLOTS) * 8
+        );
     }
 
     #[test]
@@ -2699,14 +2705,25 @@ mod tests {
 
         let expected_layout = size_of::<crate::value::PropertyLayoutData>()
             + layout.capacity() * size_of::<crate::atom::PropKey>()
+            + layout.attrs_capacity()
             + layout.index_bytes().unwrap();
+        // Each map's own storage: its record (W2d step 2: the slots past the cell's seven).
+        let own = |props: &Props| {
+            let (bytes, exact) = props.retained_requested_storage_bytes();
+            assert!(exact);
+            assert_eq!(
+                bytes,
+                crate::value::RECORD_SLOTS_OFF + props.record_capacity() * 8
+            );
+            bytes
+        };
         let mut visitor = Visitor::default();
         visitor.props(&a);
         visitor.props(&b);
         assert_eq!(visitor.property_layouts.len(), 1);
         assert_eq!(
             visitor.detached_property_storage,
-            24 * size_of::<crate::value::Property>() + expected_layout
+            own(&a) + own(&b) + expected_layout
         );
         assert!(
             !visitor.detached_property_storage_opaque,

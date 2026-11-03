@@ -6428,6 +6428,10 @@ fn guard_exotic_ordinary(
 
 /// The bit number of a flag of the Object's flag byte (`JitLayout::obj_flags`, W2d step 1), for
 /// TBZ/TBNZ.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 const fn flag_bit(flag: u8) -> u32 {
     flag.trailing_zeros()
 }
@@ -6435,6 +6439,10 @@ const fn flag_bit(flag: u8) -> u32 {
 /// Branch to `miss` unless the flag byte loaded in `reg` has exactly `expected` among the bits of
 /// `mask`, which must be one run of bits (a logical immediate): `and reg, reg, #mask;
 /// cmp reg, #expected; b.ne miss`. `reg` is clobbered, as are NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 fn guard_flags(a: &mut asm::Asm, reg: u32, mask: u8, expected: u8, miss: usize) {
     debug_assert_eq!(expected & !mask, 0);
     let bits = asm::logical_imm_w(u32::from(mask)).expect("a run of flag bits");

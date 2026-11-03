@@ -1515,7 +1515,7 @@ mod tests {
             panic!("{name} is not an object");
         };
         let object = object.borrow();
-        let ObjectKind::User(user) = &object.call else {
+        let ObjectKind::User(user) = &object.kind else {
             panic!("{name} is not a user function");
         };
         let runtime = user.func.runtime();

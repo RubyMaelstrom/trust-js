@@ -57,7 +57,7 @@ fn number_words_keep_their_kind_bits() {
 #[test]
 fn word_edits_keep_the_kind_bits_exact() {
     let edits: [(&str, fn(&mut Props)); 9] = [
-        ("get_mut", |p| {
+        ("update", |p| {
             assert!(p.update_property("0", |p| p.set_value(Value::Num(8.0))));
         }),
         ("insert", |p| {
@@ -87,8 +87,8 @@ fn word_edits_keep_the_kind_bits_exact() {
             "push" => word_block::KIND_NO_HOLES | word_block::KIND_NUMBERS,
             "non-number" => word_block::KIND_NO_HOLES,
             "delete" | "hole" => word_block::KIND_NUMBERS | word_block::KIND_INT32,
-            // The escape moved element 0 to the named entries, its word a hole.
-            "get_mut" => word_block::KIND_NUMBERS | word_block::KIND_INT32,
+            // A define keeping element 0 plain keeps its word (W2d step 2: no escape moves it
+            // to the named entries any more).
             _ => word_block::KIND_ALL,
         };
         assert_eq!(kind, expected, "{name}");

@@ -2243,7 +2243,8 @@ pub(crate) const KIND_CALLABLE_FIRST: u8 = 2;
 pub(crate) const KIND_EXOTIC_NONE_LAST: u8 = 14;
 /// The last tag [`ObjectKind::is_ordinary`] accepts: those, and a Map's or Set's data.
 pub(crate) const KIND_ORDINARY_LAST: u8 = 15;
-/// [`ObjectKind::TypedArray`]'s tag.
+/// [`ObjectKind::TypedArray`]'s tag (ARM64's typed-array templates compare it).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const KIND_TYPED_ARRAY_TAG: u8 = 1;
 /// [`ObjectKind::Array`]'s tag.
 pub(crate) const KIND_ARRAY_TAG: u8 = 16;
@@ -6501,6 +6502,11 @@ impl PropertyLayoutData {
         self.keys.capacity()
     }
 
+    /// The attribute bytes' block, in bytes (0 while every key is plain).
+    pub(crate) fn attrs_capacity(&self) -> usize {
+        self.attrs.capacity()
+    }
+
     #[inline]
     fn as_slice(&self) -> &[PropKey] {
         &self.keys
@@ -6896,13 +6902,11 @@ struct NamedEntries {
     shape: u32,
 }
 
-/// The word of an unused slot (never read: `len` bounds every read).
-const UNUSED_SLOT: PropWord = PropWord(Cell::new(PACK_UNDEFINED), std::marker::PhantomData);
-
 impl Default for NamedEntries {
     fn default() -> Self {
         NamedEntries {
-            inline: [UNUSED_SLOT; INLINE_NAMED_SLOTS],
+            // An unused slot's word is never read: `len` bounds every read.
+            inline: std::array::from_fn(|_| PropWord::from_value(Value::Undefined)),
             record: Record::default(),
             layout: None,
             len: 0,
@@ -7054,7 +7058,7 @@ impl NamedEntries {
             .as_ref()
             .is_some_and(|layout| layout.get(len) == Some(&key) && layout.attr(len) == attrs)
     }
-    /// Append `key` with `property` (room for it reserved).
+    /// Append `key` with `property`.
     fn push(&mut self, (key, property): (PropKey, Property)) {
         let (word, attrs) = property.into_slot();
         let len = self.len();
@@ -7077,11 +7081,14 @@ impl NamedEntries {
         }
         self.push_predicted(word);
     }
-    /// Append the slot word of the key the layout predicts (room for it reserved).
+    /// Append the slot word of the key the layout predicts, growing the record when the slots are
+    /// full (callers that know the final count reserve it first).
     #[inline]
     fn push_predicted(&mut self, word: PropWord) {
         let len = self.len();
-        debug_assert!(len < self.capacity());
+        if len == self.capacity() {
+            self.reserve_one(0);
+        }
         self.store(len, word);
         self.len += 1;
     }
@@ -9190,6 +9197,11 @@ impl Props {
     #[inline]
     pub(crate) fn entry_at(&self, slot: usize) -> Option<(PropKey, PropRef<'_>)> {
         self.entries.get(slot)
+    }
+    /// The record's slot capacity (tests of the memory accounting).
+    #[cfg(test)]
+    pub(crate) fn record_capacity(&self) -> usize {
+        self.entries.heap_capacity()
     }
     /// The address of slot `slot`'s word, in the cell or the record (tests of generated code's
     /// addressing).
