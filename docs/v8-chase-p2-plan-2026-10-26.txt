@@ -7026,3 +7026,138 @@ Order and checks:
    - the fixtures' output;
    - the census rerun: the "128 B, 7 one-word slots" column, -15% to -56% of bytes;
    - counts, and code dumps diffed by hand on ARM64.
+
+### W2d steps 1 and 2: the kind field and one-word slots (record, 2026-11-03)
+
+Thirteen commits on p2-w2d, from main 50d308cb:
+- step 1: 210d009e (the kind field), f9d0d82d (the flag byte);
+- step 2 as designed: aab8443f (shapes keyed by attributes), 754eea68 and a7326573 (one-word
+  slots and the record, with the Rust API and generated code), 18f78c76 and 607dd245 (tests,
+  accounting, the card comment);
+- after the code dumps and the counts: c9d8babe, 1a9301d3, cc900f99, 4acf5166 with its test
+  59cfbdaa, and the comments and this record.
+
+As designed:
+- ObjectKind with the design's tag order, and the flag byte. RefCell<Object> is 128 bytes: a
+  72-byte header and seven one-word slots, then one record for the rest (6 slots, doubling).
+- PACK_ACCESSOR words; attributes in the layout; transitions keyed (parent, key, attributes);
+  attribute changes memoized as JSC's are; PropRef for reads; no `&mut Property` into a map.
+- Generated code addresses slots below seven in the cell and the rest through the record. The
+  creation probe checks the predicted attributes and has room in the record.
+
+Where the build differs from the design:
+1. Freeze and seal take one attribute-change transition per key that changes, in key order, as
+   their defines would. There are no (parent, freeze) or (parent, seal) transitions; the memo
+   still gives objects frozen from one shape one chain of children.
+2. Generated code's stores still test writability, from the layout's attribute byte
+   (guard_slot_writable_data: three instructions while every key is plain). A property cache's
+   ways record no writability, and an update site (`o.x++`, `o.x += v`: Op::UpdateProp) reads
+   and writes through one cache, so its read's fill and stub-cache promotion fill the ways its
+   write uses. A shape match there does not prove a writable property.
+3. Reads trust the shape where a way proves data. A way that may hold an accessor tests the
+   word's tag (`asr; cmn #5; b.eq`), the cost of main's meta-byte test.
+4. The interpreter's caches keep their live checks, which cost little in Rust: the word's tag for
+   an accessor, the attribute byte for writability.
+5. The global name cache does trust the shape (c9d8babe). Its fill admits only a data property,
+   and at a store or update site only a writable one, as JSC caches a global put only for a
+   writable property under its Structure check. A writing site takes only a writing site's seed
+   (Chunk::new_name_cache), so no read's fill reaches a store. ARM64's body then sets the owner
+   kind to 1 and reads nothing more. x86-64 keeps its live checks, which its Reference path
+   shares. Deep caches and References compute the owner kind live in x7 (x86-64: R11): 1 for
+   writable data, 2 otherwise.
+6. Reads that need no attributes skip the layout (1a9301d3): SlotRef, a slot without its
+   attributes, serves OrdinaryGet's chain walk, the accessor calls, cache hits and prototype
+   reads. OrdinarySet keeps only an accessor's setter or a data property's writability past the
+   map's borrow (Element::set_facts, cc900f99).
+7. The census rerun became a measurement of the heap itself (below).
+
+What the code dumps and the counts found, and fixed:
+- `cmp #0xfffb` in the accessor test is past the 12-bit immediate. The assembler built it in a
+  pushed register at every site (213 in React). An arithmetic shift makes the tag -5, which
+  `cmn #5` tests (c9d8babe).
+- A slot index known only at run time now falls through to a shared scaled add: four
+  instructions in the cell (c9d8babe).
+- The global name cache's body rebuilt the owner kind from the layout: twelve instructions on
+  every global read and write. Mandreel's globals went from +7.09% to -2.72% (c9d8babe).
+- A PropRef's attribute lookup cost about twenty instructions in Vue's getter calls and chain
+  reads. Appends checked for room twice (1a9301d3).
+- SPE sampling found most of the rest in hashbrown's probe loops: the address-keyed side tables
+  (proxies, typed arrays, host objects) probed for every link of a chain walk. FxHasher's finish
+  returned the multiply's product, whose low bits keep an address's alignment zeros, and the
+  table buckets by the low bits: 1024 cells 128 bytes apart reached 8 of 1024 buckets (16 at
+  main's 192 bytes). finish rotates the product left by 26, as rustc-hash 2 does (4acf5166).
+  SpiderMonkey's tables index by the product's high bits; JSC and V8 hash pointers through an
+  avalanche mix. This is the lead W2c step 7 found at 2.1% of Gameboy.
+- PMU sampling put 0.45% of Vue's instructions into Stub:DirectCall(argc=1,with_this), whose
+  code is unchanged: skid. SPE counts +2% of the stub's own samples.
+
+Generated code at the tip (the gate's dumps, wide moves folded): Vue +0.52%, React +0.36%,
+Djot +0.84% against main.
+
+Checks at 59cfbdaa (the landing tree adds only comments and this record):
+- lib: ARM64 2743 passed and 9 ignored on the landing tree; x86-64 (zombie) 2532 and 9 ignored;
+  clippy in the three configurations on both. One earlier full run at 4acf5166 failed three
+  tests that spawn their own executable, because a rebuild in the same target directory replaced
+  it mid-run; they pass, as does the full run above.
+- Test262 at --tier=jit threshold 8: 53575/53575, identical to main's report.
+- difftest: 138 agree, 12 skipped (budget), as main. The fixtures' output equals main's.
+- GC stress 1 (TRUST_JS_GC_STRESS=1) over the tests the step touches: shared_layout 17,
+  property_shape 14, property_read 28, remembered 18, accessor 28, getter 62, setter 17, the
+  storage emitters 3, the new global-store test, value:: 120 (target/p2/w2d/gate-stress). In
+  memory:: 45 of 46 pass: temporal_records_account_zone_and_calendar_strings_once fails under
+  stress on main too, since it assumes no collection between its two readings.
+
+The heap (bytes the collector allocated over the run, from a measurement-only patch applied to
+both exports; the largest live heap at a major collection; release builds of main and 607dd245):
+| workload | allocated | peak live at a major collection |
+| --- | --- | --- |
+| Vue | -20.6% | (no major) |
+| Djot | -25.2% | (no major) |
+| sustained-allocation | -25.6% | -19.3% |
+| chai | -11.7% | -17.8% |
+| Splay | -18.3% | -24.0% |
+| DeltaBlue | -24.5% | (no major) |
+| RayTrace | -43.2% | (no major) |
+| EarleyBoyer | -32.4% | -23.5% |
+| Box2D | -26.4% | main 3.1 MB; the tip runs no major |
+| Typescript | -27.4% | -13.3% |
+| Richards | -9.2% | (no major) |
+The census's model said -15% to -56% of object bytes; these count every cell and block.
+
+Instruction counts against main (fat LTO; user-mode, CPUs 10-13, TRUST_JS_GC_PACING=0; fixtures
+at --tier=jit, Octane at five fixed runs; medians of three). The last column is 4acf5166
+against main with only 4acf5166's hasher (c8351b71, a measurement-only commit): W2d's own change.
+| against main | 607dd245 | c9d8babe | 1a9301d3 | cc900f99 | 4acf5166 | main + hasher | 4acf5166 vs main + hasher |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | +3.59% | +3.39% | +2.44% | +2.38% | -1.87% | -2.01% | +0.14% |
+| React | +0.58% | -1.06% | -1.22% | -1.22% | -1.28% | -0.03% | -1.26% |
+| Djot | -0.54% | -0.79% | -1.08% | -1.09% | -1.31% | -0.09% | -1.22% |
+| chai | +1.47% | +1.03% | +0.76% | +0.70% | -1.89% | -1.13% | -0.78% |
+| Richards | +0.41% | -2.65% | -2.93% | -2.94% | -3.04% | -0.04% | -3.00% |
+| DeltaBlue | +1.40% | -0.60% | -0.87% | -0.87% | -0.98% | -0.02% | -0.96% |
+| Crypto | -1.19% | -2.42% | -2.49% | -2.49% | -2.54% | -0.04% | -2.50% |
+| RayTrace | +3.25% | +1.90% | -0.98% | -0.99% | -0.98% | +0.02% | -1.00% |
+| EarleyBoyer | -1.55% | -4.95% | -5.53% | -5.23% | -5.28% | -0.04% | -5.25% |
+| RegExp | +0.70% | +0.38% | +0.10% | +0.10% | -1.14% | -0.44% | -0.71% |
+| Splay | -10.75% | -11.33% | -11.45% | -11.45% | -11.47% | -0.01% | -11.46% |
+| NavierStokes | -1.36% | -1.35% | -1.43% | -1.44% | -1.50% | -0.04% | -1.46% |
+| PdfJS | +0.58% | -0.14% | -0.28% | -0.31% | -1.12% | -0.39% | -0.73% |
+| Mandreel | +7.09% | -2.72% | -2.72% | -2.73% | -2.80% | -0.07% | -2.73% |
+| Gameboy | +1.76% | +1.64% | +0.99% | +0.99% | -4.39% | -3.34% | -1.09% |
+| CodeLoad | +0.48% | +0.48% | +0.29% | +0.29% | +0.19% | -0.05% | +0.24% |
+| Box2D | -0.07% | -1.77% | -2.12% | -2.12% | -2.16% | -0.05% | -2.12% |
+| zlib | -0.66% | -0.66% | -0.66% | -0.66% | -0.66% | -0.00% | -0.66% |
+| Typescript | +0.97% | +0.69% | +0.16% | +0.19% | -0.12% | -0.09% | -0.04% |
+
+The hasher alone takes 2.01% off Vue, 3.34% off Gameboy and 1.13% off chai on main. With it on
+both sides, W2d itself costs Vue 0.14% and CodeLoad 0.24% and gains everywhere else: Splay
+-11.46% (its live heap), EarleyBoyer -5.25%, Richards -3.00%, Mandreel -2.73%, Crypto -2.50%,
+Box2D -2.12%. Against main as it stands, only CodeLoad is above it (+0.19%).
+
+Follow-ups:
+- A way could record writability (or update sites take a second cache for their write), so
+  that stores trust the shape as the global name cache does.
+- x86-64's global name path could trust the shape as ARM64's does.
+- Change transitions could share their layouts through the shape directory (memory for code that
+  freezes many objects).
+- Steps 3 (cells sized at allocation) and 4 (copy-on-write literals) are next (Decision 28).

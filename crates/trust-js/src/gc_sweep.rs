@@ -44,8 +44,8 @@ enum Membership<'h> {
     List(crate::fasthash::FastSet<usize>),
 }
 
-// Objects are never large cells (value.rs keeps an object's cell within the 192-byte class), so
-// membership reads the pages alone and never the heap's map of large cells.
+// Objects are never large cells (value.rs keeps an object's cell at 128 bytes), so membership
+// reads the pages alone and never the heap's map of large cells.
 const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= gc_core::LARGEST_SMALL_CELL);
 
 impl<'h> DeadObjects<'h> {
