@@ -163,7 +163,7 @@ impl ResolutionIc {
                     let global = i.global.borrow();
                     if !global.kind.exotic_is_none()
                         || global.props.shape() != shape
-                        || global.props.property_at(slot).is_none()
+                        || global.props.slot_at(slot).is_none()
                     {
                         return None;
                     }
@@ -344,7 +344,7 @@ impl DeepNameIc {
                 if !global.kind.exotic_is_none() || global.props.shape() != shape {
                     return None;
                 }
-                let property = global.props.property_at(slot)?;
+                let property = global.props.slot_at(slot)?;
                 (!property.accessor()).then(|| property.value())
             }
         }
@@ -485,7 +485,7 @@ impl Chunk {
                     return None;
                 }
                 let slot = global.props.slot_of(&self.names[n as usize])?;
-                let property = global.props.property_at(slot)?;
+                let property = global.props.slot_at(slot)?;
                 if property.accessor() {
                     return None;
                 }

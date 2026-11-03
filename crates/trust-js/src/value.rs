@@ -6512,14 +6512,17 @@ impl PropertyLayoutData {
         &self.keys
     }
 
-    /// Key `i`'s attributes.
+    /// Key `i`'s attributes. One bound test serves both cases: an empty vector (every key plain)
+    /// and a spelled-out one, which is as long as the keys.
     #[inline]
     pub(crate) fn attr(&self, i: usize) -> u8 {
-        if self.attrs.is_empty() {
-            PROP_PLAIN
+        debug_assert!(self.attrs.is_empty() || self.attrs.len() == self.keys.len());
+        debug_assert!(self.attrs.is_empty() || i < self.attrs.len());
+        if i < self.attrs.len() {
+            // SAFETY: below the length.
+            unsafe { *self.attrs.get_unchecked_spilled(i) }
         } else {
-            debug_assert_eq!(self.attrs.len(), self.keys.len());
-            self.attrs[i]
+            PROP_PLAIN
         }
     }
 
@@ -6791,9 +6794,14 @@ impl<'a> PropRef<'a> {
     pub(crate) fn attrs(self) -> u8 {
         (((self.bits.get() & PROP_REF_ATTRS) << 1) as u8) | u8::from(self.accessor())
     }
+    /// The slot without its attributes (see [`SlotRef`]).
+    #[inline]
+    pub(crate) fn slot(self) -> SlotRef<'a> {
+        SlotRef(self.word())
+    }
     #[inline]
     pub(crate) fn accessor(self) -> bool {
-        self.word().is_accessor()
+        self.slot().accessor()
     }
     #[inline]
     pub(crate) fn writable(self) -> bool {
@@ -6811,32 +6819,26 @@ impl<'a> PropRef<'a> {
     /// [[Value]] reads).
     #[inline]
     pub(crate) fn value(self) -> Value {
-        if self.accessor() {
-            Value::Undefined
-        } else {
-            self.word().materialize()
-        }
+        self.slot().value()
     }
     /// OrdinaryGet's own-data Number case (see [`Property::number_value`]).
     #[inline]
     pub(crate) fn number_value(self) -> Option<f64> {
-        self.word().number()
+        self.slot().number_value()
     }
     /// Whether this data property holds exactly the object at `expected` (see
     /// [`Property::holds_object`]).
     #[inline]
     pub(crate) fn holds_object(self, expected: *const RefCell<Object>) -> bool {
-        self.word()
-            .with_object(|object| std::ptr::eq(Gc::as_ptr(object), expected))
-            .unwrap_or(false)
+        self.slot().holds_object(expected)
     }
     #[inline]
     pub(crate) fn getter(self) -> Option<&'a Value> {
-        self.word().accessors().and_then(|pair| pair.get.get())
+        self.slot().getter()
     }
     #[inline]
     pub(crate) fn setter(self) -> Option<&'a Value> {
-        self.word().accessors().and_then(|pair| pair.set.get())
+        self.slot().setter()
     }
     #[inline]
     pub(crate) fn is_empty(self) -> bool {
@@ -6879,6 +6881,87 @@ impl<'a> PropRef<'a> {
             lazy.visit_retained_memory(visitor);
         } else if !word.is_accessor() {
             visitor.value(&self.value());
+        }
+    }
+}
+
+/// A named slot read in place without its attributes (W2d step 2): what OrdinaryGet, an
+/// accessor's call and a cache hit's data read need. The slot's word says whether it is an
+/// accessor, so no layout lookup is made; a [`PropRef`] adds the writable, enumerable and
+/// configurable bits for the callers that test them.
+#[derive(Clone, Copy)]
+pub(crate) struct SlotRef<'a>(&'a PropWord);
+
+impl<'a> SlotRef<'a> {
+    #[inline]
+    pub(crate) fn accessor(self) -> bool {
+        self.0.is_accessor()
+    }
+    /// The data property's value (undefined for an accessor, as [`PropRef::value`]).
+    #[inline]
+    pub(crate) fn value(self) -> Value {
+        if self.accessor() {
+            Value::Undefined
+        } else {
+            self.0.materialize()
+        }
+    }
+    /// See [`PropRef::number_value`].
+    #[inline]
+    pub(crate) fn number_value(self) -> Option<f64> {
+        self.0.number()
+    }
+    /// See [`PropRef::holds_object`].
+    #[inline]
+    pub(crate) fn holds_object(self, expected: *const RefCell<Object>) -> bool {
+        self.0
+            .with_object(|object| std::ptr::eq(Gc::as_ptr(object), expected))
+            .unwrap_or(false)
+    }
+    #[inline]
+    pub(crate) fn getter(self) -> Option<&'a Value> {
+        self.0.accessors().and_then(|pair| pair.get.get())
+    }
+    #[inline]
+    pub(crate) fn setter(self) -> Option<&'a Value> {
+        self.0.accessors().and_then(|pair| pair.set.get())
+    }
+}
+
+/// An own property as OrdinaryGet reads it ([`Props::read_walking`]): an element word's value, or
+/// a named slot without its attributes. Two words, as [`Element`].
+#[derive(Clone, Copy)]
+pub(crate) enum ElementRead<'a> {
+    Word(Value),
+    Entry(SlotRef<'a>),
+}
+
+impl<'a> ElementRead<'a> {
+    #[inline]
+    fn of(element: Element<'a>) -> Self {
+        match element {
+            Element::Word(value) | Element::SealedWord(value) | Element::FrozenWord(value) => {
+                ElementRead::Word(value)
+            }
+            Element::Entry(property) => ElementRead::Entry(property.slot()),
+        }
+    }
+    #[inline]
+    pub(crate) fn accessor(self) -> bool {
+        matches!(self, ElementRead::Entry(slot) if slot.accessor())
+    }
+    #[inline]
+    pub(crate) fn value(self) -> Value {
+        match self {
+            ElementRead::Word(value) => value,
+            ElementRead::Entry(slot) => slot.value(),
+        }
+    }
+    #[inline]
+    pub(crate) fn getter(self) -> Option<&'a Value> {
+        match self {
+            ElementRead::Word(_) => None,
+            ElementRead::Entry(slot) => slot.getter(),
         }
     }
 }
@@ -7047,6 +7130,12 @@ impl NamedEntries {
         let key = *self.keys().get(slot)?;
         Some((key, self.prop(slot)))
     }
+    /// [`NamedEntries::get`] without the attributes.
+    #[inline]
+    fn get_slot(&self, slot: usize) -> Option<(PropKey, SlotRef<'_>)> {
+        let key = *self.keys().get(slot)?;
+        Some((key, SlotRef(self.slot(slot))))
+    }
     #[inline]
     fn get_prop(&self, slot: usize) -> Option<PropRef<'_>> {
         (slot < self.len()).then(|| self.prop(slot))
@@ -7081,16 +7170,23 @@ impl NamedEntries {
         }
         self.push_predicted(word);
     }
-    /// Append the slot word of the key the layout predicts, growing the record when the slots are
-    /// full (callers that know the final count reserve it first).
+    /// Append the slot word of the key the layout predicts. When the slots are full the record
+    /// grows at once to the layout's length (a constructor's whole field list), or doubles;
+    /// callers that know the final count reserve it first.
     #[inline]
     fn push_predicted(&mut self, word: PropWord) {
         let len = self.len();
         if len == self.capacity() {
-            self.reserve_one(0);
+            self.grow_for_layout();
         }
         self.store(len, word);
         self.len += 1;
+    }
+    /// [`NamedEntries::push_predicted`]'s growth, out of the appends' line.
+    #[inline(never)]
+    fn grow_for_layout(&mut self) {
+        let predicted = self.layout.as_ref().map_or(0, |keys| keys.len());
+        self.reserve_one(predicted);
     }
     /// Replace slot `i`'s property; whether its attributes changed (the layout then detaches,
     /// copy-on-write, to record them).
@@ -8227,14 +8323,6 @@ impl Props {
         Self::packed_array_named(items, self.entries.shape, layout, named)
     }
 
-    /// Room for one more named entry: the cell's seven slots, then the record, which starts at
-    /// six slots and doubles, or takes the layout's predicted count at once (W2d step 2).
-    #[inline]
-    fn reserve_entry(&mut self) {
-        let predicted = self.entries.layout.as_ref().map_or(0, |keys| keys.len());
-        self.entries.reserve_one(predicted);
-    }
-
     /// Reserve the element words of a fresh dense array (or arguments object) of known size; the
     /// named entries need only `length`.
     pub(crate) fn reserve_dense_exact(&mut self, len: usize) {
@@ -9024,6 +9112,20 @@ impl Props {
         self.find_text_with(key, atom)
             .map(|i| Element::entry(self.entries.prop(i)))
     }
+    /// [`Props::get_walking`] for OrdinaryGet, which needs no attributes: the value or the
+    /// accessor's slot (see [`ElementRead`]).
+    #[inline]
+    pub(crate) fn read_walking(
+        &self,
+        key: &str,
+        atom: &mut Option<PropKey>,
+    ) -> Option<ElementRead<'_>> {
+        if let Some(n) = canonical_index(key) {
+            return self.get_key(PropKey::index(n)).map(ElementRead::of);
+        }
+        self.find_text_with(key, atom)
+            .map(|i| ElementRead::Entry(SlotRef(self.entries.slot(i))))
+    }
     /// The memoized own `prototype` slot, for guarded constructor fast paths.
     #[inline]
     pub(crate) fn prototype_slot(&self) -> Option<u32> {
@@ -9200,6 +9302,11 @@ impl Props {
     pub(crate) fn entry_at(&self, slot: usize) -> Option<(PropKey, PropRef<'_>)> {
         self.entries.get(slot)
     }
+    /// [`Props::entry_at`] without the attributes (see [`SlotRef`]).
+    #[inline]
+    pub(crate) fn slot_entry_at(&self, slot: usize) -> Option<(PropKey, SlotRef<'_>)> {
+        self.entries.get_slot(slot)
+    }
     /// The record's slot capacity (tests of the memory accounting).
     #[cfg(test)]
     pub(crate) fn record_capacity(&self) -> usize {
@@ -9216,6 +9323,12 @@ impl Props {
     #[inline]
     pub(crate) fn property_at(&self, slot: usize) -> Option<PropRef<'_>> {
         self.entries.get_prop(slot)
+    }
+    /// [`Props::property_at`] without the attributes (see [`SlotRef`]): for reads of the value or
+    /// the accessor's functions.
+    #[inline]
+    pub(crate) fn slot_at(&self, slot: usize) -> Option<SlotRef<'_>> {
+        (slot < self.entries.len()).then(|| SlotRef(self.entries.slot(slot)))
     }
     /// Drop every property.
     #[cfg(test)]
@@ -9263,7 +9376,6 @@ impl Props {
             }
         }
         self.entries.shape = new_shape;
-        self.reserve_entry();
         self.entries.push((key, prop));
         self.note_inserted(slot);
         self.ensure_fallback_index();
@@ -9278,7 +9390,6 @@ impl Props {
         debug_assert!(self.entries.len() < INDEX_THRESHOLD);
         debug_assert!(key.as_index().is_none());
         debug_assert!(self.entries.index().is_none());
-        self.reserve_entry();
         if self.entries.predicts(key, prop.attrs()) {
             self.entries.push_predicted(prop.into_slot().0);
         } else {
@@ -9296,7 +9407,6 @@ impl Props {
         if let Some(index) = self.entries.index_mut() {
             index.insert(key, slot);
         }
-        self.reserve_entry();
         self.entries.push_predicted(prop.into_slot().0);
         self.ensure_fallback_index();
     }
@@ -9420,7 +9530,6 @@ impl Props {
             } else if key == crate::atom::names::PROTOTYPE.key() {
                 self.proto_slot.set(SlotMemo::of(slot));
             }
-            self.reserve_entry();
             self.entries.push((key, prop));
             self.note_inserted(slot);
             self.ensure_fallback_index();

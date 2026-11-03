@@ -273,7 +273,7 @@ fn getter_cache_owned_snapshot_stays_two_words() {
     let property = Property::plain(Value::Obj(object));
     let read = engine
         .interp
-        .snapshot_cached_get(property.data_ref_for_test(), "value", 0, 0, false)
+        .snapshot_cached_get(property.data_ref_for_test().slot(), "value", 0, 0, false)
         .unwrap();
     drop(property);
     let value = engine
@@ -302,7 +302,7 @@ fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_dr
                 engine
                     .interp
                     .snapshot_cached_get(
-                        object.props.get_named("prototype").unwrap(),
+                        object.props.get_named("prototype").unwrap().slot(),
                         "prototype",
                         0,
                         0,

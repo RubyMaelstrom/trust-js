@@ -109,6 +109,25 @@ impl<T, const N: usize, S: Spill> InlineVec<T, N, S> {
         self.cap as usize
     }
 
+    /// Element `i` of a vector with no in-place room (`N` = 0), through its heap buffer without
+    /// the in-place test: such a vector has spilled whenever it holds an element.
+    ///
+    /// # Safety
+    /// `i` is below the length.
+    #[inline]
+    pub(crate) unsafe fn get_unchecked_spilled(&self, i: usize) -> &T {
+        const {
+            assert!(
+                N == 0,
+                "only a vector without in-place room is always spilled"
+            )
+        };
+        debug_assert!(i < self.len() && self.cap != 0);
+        // SAFETY: a non-empty vector without in-place room keeps its elements in `heap`, whose
+        // first `len` are initialized; the caller keeps `i` below `len`.
+        unsafe { &*self.data.heap.add(i) }
+    }
+
     /// The spill buffer's address while the elements live in one: with [`Spill`] storage the
     /// collector frees (`gc_storage::GcSpill`), the edge the owner reports.
     #[inline]

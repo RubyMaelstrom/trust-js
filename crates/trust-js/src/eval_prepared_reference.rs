@@ -214,7 +214,7 @@ impl Interp {
                 } else {
                     body.props.slot_of(&reference.name)
                 };
-                slot.filter(|slot| body.props.property_at(*slot).is_some_and(|p| !p.accessor()))
+                slot.filter(|slot| body.props.slot_at(*slot).is_some_and(|p| !p.accessor()))
                     .map(|slot| (shape, slot))
             } else {
                 None
@@ -344,7 +344,7 @@ impl Interp {
                 if self.refresh_reference_own_data_hint(reference) {
                     // No author code or structural mutation lies between proof and load.
                     let body = reference.object.as_ref().unwrap().borrow();
-                    let value = body.props.property_at(reference.slot).unwrap().value();
+                    let value = body.props.slot_at(reference.slot).unwrap().value();
                     #[cfg(test)]
                     record_reference_own_path(2);
                     return Ok(value);

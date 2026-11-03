@@ -10419,10 +10419,10 @@ impl Interp {
                 if depth == 0 {
                     let property = if keychk {
                         rb.props
-                            .entry_at(st.slot as usize)
+                            .slot_entry_at(st.slot as usize)
                             .and_then(|(entry, p)| is_key(entry).then_some(p))
                     } else {
-                        rb.props.property_at(st.slot as usize)
+                        rb.props.slot_at(st.slot as usize)
                     };
                     if let Some(p) = property {
                         // Shapes encode descriptor class and every production mutation
@@ -10475,10 +10475,10 @@ impl Interp {
                     if holder_exotic_ok && hb.ic_plain() && hb.props.shape() == st.holder_shape {
                         let property = if keychk {
                             hb.props
-                                .entry_at(st.slot as usize)
+                                .slot_entry_at(st.slot as usize)
                                 .and_then(|(entry, p)| is_key(entry).then_some(p))
                         } else {
-                            hb.props.property_at(st.slot as usize)
+                            hb.props.slot_at(st.slot as usize)
                         };
                         if let Some(p) = property {
                             if p.accessor() == accessor || !keychk {
@@ -10546,7 +10546,7 @@ impl Interp {
                     && (b.kind.is_ordinary()
                         || matches!(b.kind, ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_)));
                 if let Some(slot) = key.and_then(|key| b.props.slot_of_key(key)) {
-                    let p = b.props.property_at(slot).unwrap();
+                    let p = b.props.slot_at(slot).unwrap();
                     let v = self.snapshot_cached_get(
                         p,
                         name,
@@ -10817,7 +10817,7 @@ impl Interp {
         let holder_ref = unsafe { &*(holder as *const std::cell::RefCell<crate::value::Object>) };
         let setter = {
             let b = holder_ref.borrow();
-            let property = b.props.property_at(slot as usize);
+            let property = b.props.slot_at(slot as usize);
             debug_assert!(property.is_some_and(|p| p.accessor()), "a proven accessor");
             property.and_then(|p| p.setter().cloned())
         };
@@ -11160,7 +11160,7 @@ impl Interp {
                 recv_shape = b.props.shape();
             }
             if let Some(slot) = b.props.slot_of_key(key) {
-                if !b.props.property_at(slot)?.accessor() {
+                if !b.props.slot_at(slot)?.accessor() {
                     return None;
                 }
                 self.ic_insert(
@@ -11878,7 +11878,7 @@ impl Interp {
                 } else {
                     // `Props::get` is the semantic lookup and also covers dense/indexed storage;
                     // an untraced data read needs neither the named slot nor the holder shape.
-                    match b.props.get_walking(key, &mut walk_atom) {
+                    match b.props.read_walking(key, &mut walk_atom) {
                         Some(p) if !p.accessor() => return Ok(p.value()),
                         Some(p) => Some(p.getter().cloned()),
                         None => None,
@@ -16273,9 +16273,11 @@ impl Interp {
         let proto = {
             let b = o.borrow();
             let property = if b.props.shape() == prototype_shape {
-                b.props.property_at(prototype_slot as usize)
+                b.props.slot_at(prototype_slot as usize)
             } else {
-                b.props.get_named("prototype")
+                b.props
+                    .get_named("prototype")
+                    .map(crate::value::PropRef::slot)
             };
             match property {
                 Some(p) if !p.accessor() => match (p.value()).view() {
@@ -16546,7 +16548,7 @@ impl Interp {
                 return None;
             }
             let slot = b.props.slot_of("prototype")?;
-            let property = b.props.property_at(slot)?;
+            let property = b.props.slot_at(slot)?;
             if property.accessor() || !matches!((property.value()).view(), ValueView::Obj(_)) {
                 return None;
             }

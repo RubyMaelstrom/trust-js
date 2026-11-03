@@ -21555,7 +21555,7 @@ impl Chunk {
             if !g.kind.exotic_is_none() || g.props.shape() != (ic.binding >> 32) as u32 {
                 return None;
             }
-            let p = g.props.property_at(ic.binding as u32 as usize)?;
+            let p = g.props.slot_at(ic.binding as u32 as usize)?;
             if p.accessor() {
                 return None;
             }
@@ -25577,9 +25577,11 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     let proto = {
         let b = constructor.borrow();
         let property = if b.props.shape() == site.prototype_shape {
-            b.props.property_at(site.prototype_slot as usize)
+            b.props.slot_at(site.prototype_slot as usize)
         } else {
-            b.props.get_named("prototype")
+            b.props
+                .get_named("prototype")
+                .map(crate::value::PropRef::slot)
         };
         match property {
             Some(p) if !p.accessor() => match (p.value()).view() {

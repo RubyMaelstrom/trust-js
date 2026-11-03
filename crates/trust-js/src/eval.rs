@@ -2668,7 +2668,7 @@ impl Interp {
             if b.kind.exotic_is_none() {
                 if let Some(p) = b
                     .props
-                    .get_walking(name, &mut atom.map(crate::atom::PropKey::atom))
+                    .read_walking(name, &mut atom.map(crate::atom::PropKey::atom))
                 {
                     if !p.accessor() {
                         let v = p.value();
