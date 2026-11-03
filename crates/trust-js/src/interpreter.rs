@@ -16337,10 +16337,12 @@ impl Interp {
         let instance_capacity =
             static_capacity.max(instance_layout.as_ref().map_or(0, |keys| keys.len()));
         let proto_ptr = Gc::as_ptr(&proto) as usize;
+        // SAFETY: the entry's function outlives its validated chunk (the call caches' contract).
+        let class = chunk.instance_class(unsafe { &*ic.func }, Some(&proto));
         let this = crate::value::Object::new_built(
             Some(proto),
             crate::value::ObjectKind::Plain,
-            crate::value::CONSTRUCTED_CLASS,
+            class,
             |props| props.init_layout(instance_capacity, instance_layout),
         );
         chunk.note_instance(&this);
@@ -16376,7 +16378,7 @@ impl Interp {
             // capacity class it was allocated in (W2d step 3), and its prototype is the live
             // object just read above. Avoid re-borrowing the new RefCell twice merely to
             // rediscover those construction invariants.
-            let start_shape = crate::value::empty_shape(crate::value::CONSTRUCTED_CLASS);
+            let start_shape = crate::value::empty_shape(class);
             let shapes = if epoch == u32::MAX {
                 None
             } else if let Some(cached) = simple.cached_shapes(epoch, proto_ptr, start_shape) {
@@ -17996,12 +17998,11 @@ impl Interp {
                 };
                 let layout = self.learned_construct_layout(&obj);
                 let capacity = layout.as_ref().map_or(0, |keys| keys.len());
-                let this = Object::new_built(
-                    proto,
-                    crate::value::ObjectKind::Plain,
-                    crate::value::CONSTRUCTED_CLASS,
-                    |props| props.init_layout(capacity, layout),
-                );
+                let class = crate::value::constructed_class(&user.func, proto.as_ref());
+                let this =
+                    Object::new_built(proto, crate::value::ObjectKind::Plain, class, |props| {
+                        props.init_layout(capacity, layout)
+                    });
                 let this_val = Value::Obj(this);
                 self.pending_new_target = new_target;
                 // Base class constructors run their field initializers before the body; plain

@@ -2918,8 +2918,12 @@ pub struct Chunk {
     /// after the constructor returned count, as V8's slack tracking measures the most an initial
     /// map's tree took after seven constructions (js-function.cc:1507-1549,
     /// map-updater.cc:472-511). It only grows, and reserves later instances' records for the
-    /// fields past their cell's seven (`value::CONSTRUCTED_CLASS`).
+    /// fields past their cell's slots ([`Chunk::instance_class`]).
     learned_capacity: std::cell::Cell<u8>,
+    /// A copy of the capacity class its function's instances take in this heap
+    /// (`value::constructed_class`, W2d step 3e), once a construction has decided it, else
+    /// `function_runtime::CLASS_UNDECIDED`.
+    instance_class: std::cell::Cell<u8>,
     /// The constructions [`Chunk::note_instance`] has seen, up to [`CONSTRUCT_LEARNING`], and the
     /// latest one's instance, held weakly until the next construction measures it.
     learning: std::cell::Cell<u8>,
@@ -3152,6 +3156,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             instance_layout,
             forwarded_capacity_hint: _,
             learned_capacity: _,
+            instance_class: _,
             learning: _,
             learning_instance: _, // weak: the heap clears it
             initializer_layout,
@@ -3870,6 +3875,24 @@ impl Chunk {
         self.instance_capacity_hint
             .max(self.forwarded_capacity_hint.get())
             .max(self.learned_capacity.get()) as usize
+    }
+    /// The capacity class of this constructor's instances, `func` being its function and
+    /// `proto` its first instance's prototype ([`crate::value::constructed_class`], W2d step 3e):
+    /// the chunk keeps a copy of the function's decision, which spares the construct paths the
+    /// function's runtime lookup.
+    #[inline]
+    pub(crate) fn instance_class(
+        &self,
+        func: &crate::ast::Function,
+        proto: Option<&crate::value::Gc>,
+    ) -> u32 {
+        let class = self.instance_class.get();
+        if class != crate::function_runtime::CLASS_UNDECIDED {
+            return u32::from(class);
+        }
+        let class = crate::value::constructed_class(func, proto);
+        self.instance_class.set(class as u8);
+        class
     }
     /// Note a construction's new instance (W2d step 3d): over the first [`CONSTRUCT_LEARNING`]
     /// constructions, raise the learned capacity to what the previous instance holds now, and
@@ -8647,6 +8670,7 @@ fn finish_chunk(
         instance_layout,
         forwarded_capacity_hint: std::cell::Cell::new(0),
         learned_capacity: std::cell::Cell::new(0),
+        instance_class: std::cell::Cell::new(crate::function_runtime::CLASS_UNDECIDED),
         learning: std::cell::Cell::new(0),
         learning_instance: std::cell::RefCell::new(None),
         initializer_layout: std::cell::OnceCell::new(),
@@ -25674,10 +25698,12 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     let capacity = chunk
         .instance_capacity_hint()
         .max(layout.as_ref().map_or(0, |keys| keys.len()));
+    // SAFETY: the entry's function outlives its validated chunk (the call caches' contract).
+    let class = chunk.instance_class(unsafe { &*site.call.func }, Some(&proto));
     let instance = crate::value::Object::new_built(
         Some(proto),
         crate::value::ObjectKind::Plain,
-        crate::value::CONSTRUCTED_CLASS,
+        class,
         |props| props.init_layout(capacity, layout),
     );
     chunk.note_instance(&instance);

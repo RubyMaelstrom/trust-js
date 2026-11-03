@@ -1584,6 +1584,18 @@ impl Function {
         flags
     }
 
+    /// How many distinct names this function's own code assigns as `this.name`, at most
+    /// `limit` (W2d step 3e): in every statement, branch, loop and handler, flow-insensitively,
+    /// as JSC's StaticPropertyAnalyzer counts the properties put on `this` for `new F()`
+    /// (bytecompiler/StaticPropertyAnalyzer.h:34-36), but not in nested functions or classes.
+    pub(crate) fn this_store_count(&self, limit: usize) -> usize {
+        self.body.with(|body| {
+            let mut names = Vec::new();
+            this_stores_in(body, &mut names, limit);
+            names.len()
+        })
+    }
+
     /// Whether a method closure of this function must carry its [[HomeObject]]. Method
     /// definitions (ECMA-262 DefineMethod, MethodDefinitionEvaluation) always perform MakeMethod,
     /// but the slot is observable only through `super` references and direct `eval` in the
@@ -1625,6 +1637,124 @@ fn scan_stmts(body: &[Stmt], flags: &mut u8) {
         if *flags == SCAN_ALL {
             return;
         }
+    }
+}
+
+/// Collect into `names`, up to `limit`, the distinct names `stmts` assign as `this.name`
+/// ([`Function::this_store_count`]).
+fn this_stores_in<'a>(stmts: &'a [Stmt], names: &mut Vec<&'a str>, limit: usize) {
+    for s in stmts {
+        if names.len() >= limit {
+            return;
+        }
+        this_stores_in_stmt(s, names, limit);
+    }
+}
+
+fn this_stores_in_stmt<'a>(s: &'a Stmt, names: &mut Vec<&'a str>, limit: usize) {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| this_stores_in_stmt(s, names, limit));
+    }
+    match s {
+        Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+            this_stores_in_expr(e, names, limit)
+        }
+        Stmt::VarDecl { decls, .. } => {
+            for e in decls.iter().filter_map(|(_, init)| init.as_ref()) {
+                this_stores_in_expr(e, names, limit);
+            }
+        }
+        Stmt::If { test, cons, alt } => {
+            this_stores_in_expr(test, names, limit);
+            this_stores_in_stmt(cons, names, limit);
+            if let Some(alt) = alt {
+                this_stores_in_stmt(alt, names, limit);
+            }
+        }
+        Stmt::Block(stmts) => this_stores_in(stmts, names, limit),
+        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+            this_stores_in_expr(test, names, limit);
+            this_stores_in_stmt(&body.statement, names, limit);
+        }
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            match init.as_deref() {
+                Some(ForInit::Expr(e)) => this_stores_in_expr(e, names, limit),
+                Some(ForInit::VarDecl { decls, .. }) => {
+                    for e in decls.iter().filter_map(|(_, init)| init.as_ref()) {
+                        this_stores_in_expr(e, names, limit);
+                    }
+                }
+                None => {}
+            }
+            for e in [test, update].into_iter().flatten() {
+                this_stores_in_expr(e, names, limit);
+            }
+            this_stores_in_stmt(&body.statement, names, limit);
+        }
+        Stmt::ForInOf { right, body, .. } => {
+            this_stores_in_expr(right, names, limit);
+            this_stores_in_stmt(&body.statement, names, limit);
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            this_stores_in(block, names, limit);
+            if let Some((_, handler)) = handler {
+                this_stores_in(handler, names, limit);
+            }
+            if let Some(finalizer) = finalizer {
+                this_stores_in(finalizer, names, limit);
+            }
+        }
+        Stmt::Switch { disc, cases } => {
+            this_stores_in_expr(disc, names, limit);
+            for case in cases {
+                this_stores_in(&case.body, names, limit);
+            }
+        }
+        Stmt::Labeled { body, .. } | Stmt::With { body, .. } => {
+            this_stores_in_stmt(body, names, limit)
+        }
+        // Nested functions and classes are their own code; the rest assign nothing to `this`.
+        _ => {}
+    }
+}
+
+/// The assignments an expression statement makes to `this` members: an assignment, its value
+/// (`this.a = this.b = 0`), a comma sequence, a parenthesized expression or a conditional's
+/// arms. Calls, literals and nested functions are not searched.
+fn this_stores_in_expr<'a>(e: &'a Expr, names: &mut Vec<&'a str>, limit: usize) {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| this_stores_in_expr(e, names, limit));
+    }
+    match e {
+        Expr::Assign { target, value, .. } => {
+            if let Expr::Member { obj, prop, .. } = &**target {
+                if matches!(**obj, Expr::This) && names.len() < limit && !names.contains(&&**prop) {
+                    names.push(prop);
+                }
+            }
+            this_stores_in_expr(value, names, limit);
+        }
+        Expr::Seq(exprs) => {
+            for e in exprs {
+                this_stores_in_expr(e, names, limit);
+            }
+        }
+        Expr::Paren(inner) => this_stores_in_expr(inner, names, limit),
+        Expr::Cond { cons, alt, .. } => {
+            this_stores_in_expr(cons, names, limit);
+            this_stores_in_expr(alt, names, limit);
+        }
+        Expr::Logical { right, .. } => this_stores_in_expr(right, names, limit),
+        _ => {}
     }
 }
 

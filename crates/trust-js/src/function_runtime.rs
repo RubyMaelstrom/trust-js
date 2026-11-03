@@ -34,7 +34,15 @@ pub(crate) struct FunctionRuntime {
     /// Those closures trace it; it is compared by identity with a live active record before a
     /// new closure shares it, so its GC edges are never followed after its sharers die.
     pub(crate) origin: OnceCell<crate::agent_control::RuntimeOrigin>,
+    /// The capacity class of the function's instances in this heap, decided at its first
+    /// construction ([`crate::value::constructed_class`], W2d step 3e), else
+    /// [`CLASS_UNDECIDED`]. Every construct path reads it here (or a chunk's copy of it), so a
+    /// constructor's instances share one class whatever path made them.
+    pub(crate) instance_class: Cell<u8>,
 }
+
+/// [`FunctionRuntime::instance_class`] before the function's first construction.
+pub(crate) const CLASS_UNDECIDED: u8 = u8::MAX;
 
 impl FunctionRuntime {
     pub(crate) fn new() -> Self {
@@ -47,6 +55,7 @@ impl FunctionRuntime {
             osr_code: OnceCell::new(),
             fn_maps: OnceCell::new(),
             origin: OnceCell::new(),
+            instance_class: Cell::new(CLASS_UNDECIDED),
         }
     }
 

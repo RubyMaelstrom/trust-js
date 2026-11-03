@@ -4340,15 +4340,62 @@ pub(crate) mod layout_census {
 pub(crate) const OBJECT_HEADER: usize = std::mem::size_of::<RefCell<Object>>();
 const _: () = assert!(OBJECT_HEADER == 72);
 
-/// The capacity class of every constructor's instance (W2d step 3): seven slots in a 128-byte
-/// cell, as SpiderMonkey gives `new` at least OBJECT4 (vm/JSFunction-inl.h:142-157), JSC at
-/// least 6 inline slots (bytecode/ObjectAllocationProfileInlines.h:67-83) and V8 its expected
-/// count plus 8 (js-function.cc:1507-1549). One class, not one by count: the construct paths
-/// count differently (the generic dispatch by the layout it learned, none before the first
-/// instance; the compiled paths by their static counts, which learning raises), and a compiled
-/// read bakes the shape it saw, which a constructor's instances must therefore all share. The
-/// counts reserve the record for the fields past seven ([`Props::init_layout`]).
+/// The capacity class a constructor's instances take when its code assigns no `this` property
+/// and its prototype holds no default (W2d step 3e): seven slots in a 128-byte cell, as JSC
+/// gives such a `new F()` its default six inline slots ("the static analyzer just didn't see
+/// the real initializer function", bytecode/ObjectAllocationProfileInlines.h:67-83),
+/// SpiderMonkey `new` at least OBJECT4 (vm/JSFunction-inl.h:142-157) and V8 its expected count
+/// plus 8 (js-function.cc:1507-1549). See [`constructed_class`].
 pub(crate) const CONSTRUCTED_CLASS: u32 = 1;
+
+/// The capacity class of `func`'s instances in this heap (W2d step 3e): decided once, at its
+/// first construction, then kept, as JSC fills `new F()`'s allocation profile once per function
+/// at its first construction (runtime/JSFunction.cpp:155-163) and keeps it. One class whatever
+/// path constructs: a compiled read bakes the shape it saw, which a constructor's instances
+/// must therefore share. As JSC's ObjectAllocationProfileBase::initializeProfile
+/// (bytecode/ObjectAllocationProfileInlines.h:67-89), whose default of six inline slots this
+/// class's seven stand for:
+/// - the distinct names the constructor's code assigns as `this.name`
+///   ([`crate::ast::Function::this_store_count`]);
+/// - below seven, plus the prototype's own data properties that hold no function (JSC's
+///   possibleDefaultPropertyCount, ObjectAllocationProfileInlines.h:146-168, which counts
+///   accessors as well), a sum of none taking [`CONSTRUCTED_CLASS`] and a larger one held to it
+///   ("default properties are weak guesses");
+/// - seven or more, as counted.
+/// Fields past the class's cell slots go to the record, which the construct paths reserve by
+/// what they learned ([`Props::init_layout`]).
+#[inline]
+pub(crate) fn constructed_class(func: &crate::ast::Function, proto: Option<&Gc>) -> u32 {
+    let runtime = func.runtime();
+    let decided = runtime.instance_class.get();
+    if decided != crate::function_runtime::CLASS_UNDECIDED {
+        return u32::from(decided);
+    }
+    let class = decide_constructed_class(func, proto);
+    runtime.instance_class.set(class as u8);
+    class
+}
+
+#[cold]
+#[inline(never)]
+fn decide_constructed_class(func: &crate::ast::Function, proto: Option<&Gc>) -> u32 {
+    let default = class_slots(CONSTRUCTED_CLASS);
+    let stores = func.this_store_count(MAX_CELL_SLOTS + 1);
+    let count = if stores < default {
+        let defaults = proto.map_or(0, |proto| {
+            proto
+                .try_borrow()
+                .map_or(0, |proto| proto.props.default_property_count(default))
+        });
+        match stores + defaults {
+            0 => default,
+            sum => sum.min(default),
+        }
+    } else {
+        stores
+    };
+    class_for(count)
+}
 
 /// The offset of an object's first cell slot from its Object, which, after the borrow flag, is
 /// the rest of the cell's header (W2d step 3): generated code addresses the Object.
@@ -10359,6 +10406,24 @@ impl Props {
         self.entries.iter()
     }
 
+    /// How many of the own named properties are data holding anything but a function, at most
+    /// `limit`: a prototype's defaults, which its constructor's instances are likely to set as
+    /// their own (W2d step 3e, [`constructed_class`]).
+    pub(crate) fn default_property_count(&self, limit: usize) -> usize {
+        self.iter()
+            .filter(|(_, property)| {
+                !property.accessor()
+                    && match property.slot().value().view() {
+                        ValueView::Obj(object) => object
+                            .try_borrow()
+                            .is_ok_and(|object| !object.kind.is_callable()),
+                        _ => true,
+                    }
+            })
+            .take(limit)
+            .count()
+    }
+
     /// Every live property value, including keyless packed elements (for GC tracing).
     pub(crate) fn values(&self) -> impl Iterator<Item = Element<'_>> {
         let integrity = self.word_integrity();
@@ -10812,3 +10877,7 @@ mod object_accounting_tests {
 #[cfg(test)]
 #[path = "property_layout_cell_tests.rs"]
 pub(crate) mod property_layout_cell_tests;
+
+#[cfg(test)]
+#[path = "constructed_class_tests.rs"]
+mod constructed_class_tests;
