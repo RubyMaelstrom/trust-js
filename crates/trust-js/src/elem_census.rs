@@ -139,7 +139,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
     }
     // Bytes by allocated size (small-cell classes; a large block counts its own bytes).
     let mut b = [0u64; PARTS.len()];
-    b[0] = class_bytes(std::mem::size_of::<RefCell<Object>>());
+    b[0] = class_bytes(crate::value::OBJECT_CELL);
     let index = p.entries.index();
     let mut capacity = 0usize;
     if let Some(words) = words {

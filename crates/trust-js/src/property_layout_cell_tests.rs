@@ -89,7 +89,9 @@ fn object_and_standalone_props_trace_unused_predictions_in_minor_and_major() {
     let (heap, _release, _active) = isolated();
     let object = Object::new(None);
     collect(&heap, &object, CollectionKind::Major);
-    object.borrow_mut().props = predicted("object prediction");
+    object
+        .borrow_mut()
+        .set_props_for_test(predicted("object prediction"));
     let object_layout = object.borrow().props.shared_layout().unwrap().as_ptr() as usize;
     let standalone = crate::rooting::Rooted::new(predicted("standalone prediction"));
     let standalone_layout = standalone.shared_layout().unwrap().as_ptr() as usize;
@@ -305,9 +307,13 @@ fn native_creation_records_an_old_receivers_only_edge_to_a_young_layout() {
     let heap = engine.interp.gc_heap.clone();
     for _ in 0..256 {
         let epoch = proto_epoch();
-        target.borrow_mut().props = Props::with_capacity(3);
+        target
+            .borrow_mut()
+            .set_props_for_test(Props::with_capacity(3));
         eval(&mut engine, "write();0");
-        target.borrow_mut().props = Props::with_capacity(3);
+        target
+            .borrow_mut()
+            .set_props_for_test(Props::with_capacity(3));
         engine
             .interp
             .gc_collect_precise_for_test(CollectionKind::Major);

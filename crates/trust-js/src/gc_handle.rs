@@ -25,8 +25,10 @@ mod cell {
         #[inline]
         pub(crate) fn new_in(heap: &crate::value::GcState, object: RefCell<Object>) -> Gc {
             let cell = crate::value::alloc_object_cell(heap);
-            // SAFETY: a fresh cell sized and aligned for `RefCell<Object>`. Allocation never
-            // collects, so the cell is initialized before any collection can trace it.
+            // SAFETY: a fresh cell sized and aligned for `RefCell<Object>`, its header, with room
+            // for the map's cell slots after it (W2d step 3), which the map's attach fills.
+            // Allocation never collects, so the cell is initialized before any collection can
+            // trace it.
             unsafe {
                 std::ptr::write(cell, object);
                 Gc(NonNull::new_unchecked(cell))
@@ -89,7 +91,7 @@ mod cell {
         #[inline]
         pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Object> {
             // SAFETY: a reachable handle names a live object cell (Decision 0 / I1): small (an
-            // object's cell is 128 bytes, W2d) and of the carded object kind.
+            // object's cell is at most 192 bytes, W2d) and of the carded object kind.
             unsafe { crate::gc_core::card_mark(self.0.as_ptr().cast()) };
             unsafe { self.0.as_ref() }.borrow_mut()
         }

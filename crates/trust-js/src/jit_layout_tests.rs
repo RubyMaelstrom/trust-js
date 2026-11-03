@@ -89,12 +89,16 @@ fn layout_is_valid_with_the_build_ownership() {
         Gc::as_ptr(&object) as usize,
         "the stored word is the cell address, the `Gc::as_ptr` identity"
     );
-    // Named slots (W2d step 2): seven words in the cell, within the map, then the record.
+    // Named slots (W2d step 3): seven words in the cell right after the Object (the cell's
+    // header), then the record; the map is 40 bytes of the 72-byte header.
     assert_eq!(INLINE_NAMED_SLOTS, 7);
-    assert!(
-        layout.props_slots + 8 * INLINE_NAMED_SLOTS <= std::mem::size_of::<crate::value::Props>()
+    assert_eq!(
+        layout.obj_props + layout.props_slots,
+        std::mem::size_of::<Object>(),
+        "the cell's first slot follows the Object"
     );
-    assert_eq!(std::mem::size_of::<crate::value::Props>(), 96);
+    assert_eq!(std::mem::size_of::<crate::value::Props>(), 40);
+    assert_eq!(crate::value::OBJECT_HEADER, 72);
     // A record's cell holds at least two slots in place (more in a larger cell).
     assert!(matches!(
         entries_of(&layout),
@@ -177,8 +181,8 @@ fn named_fields_read_through_the_fields_description_in_place_and_spilled() {
                 Property::plain(Value::Num(slot as f64)),
             );
         }
-        // W2d step 2: slots below INLINE_NAMED_SLOTS sit in the cell, from `props_entries`; the
-        // rest in the record's block that `props_elems` points to, from RECORD_SLOTS_OFF.
+        // W2d step 3: slots below INLINE_NAMED_SLOTS sit in the cell after the Object; the rest
+        // in the record's block that `props_record` points to, from RECORD_SLOTS_OFF.
         let base = body(&layout, &object) + layout.obj_props;
         let borrowed = object.borrow();
         let props = &borrowed.props;

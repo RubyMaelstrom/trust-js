@@ -63,21 +63,24 @@ impl LazyFunctionPrototype {
         let State::Parent(parent) = &*state else {
             unreachable!()
         };
-        let mut props = Props::with_layout(self.constructor as usize, self.layout.clone());
-        if self.constructor {
-            // A descriptor clone materializes before it can outlive the function. All other
-            // value reads retain their receiver, including reads while its RefCell is borrowed.
-            let owner = self.owner;
-            debug_assert!(props.entries.predicts(
-                crate::atom::PropKey::from_text("constructor"),
-                Property::builtin(super::Value::Null).attrs()
-            ));
-            props
-                .entries
-                .push_predicted(super::PropWord::from_value(super::Value::Obj(owner)));
-        }
-        props.entries.shape = self.shape;
-        let prototype = Object::new_with_parts(Some(*parent), props, ObjectKind::Plain);
+        // The prototype's map is built in its cell (W2d step 3).
+        let prototype = Object::new_built(Some(*parent), ObjectKind::Plain, |props: &mut Props| {
+            props.init_layout(self.constructor as usize, self.layout.clone());
+            if self.constructor {
+                // A descriptor clone materializes before it can outlive the function. All other
+                // value reads retain their receiver, including reads while its RefCell is
+                // borrowed.
+                let owner = self.owner;
+                debug_assert!(props.entries.predicts(
+                    crate::atom::PropKey::from_text("constructor"),
+                    Property::builtin(super::Value::Null).attrs()
+                ));
+                props
+                    .entries
+                    .push_predicted(super::PropWord::from_value(super::Value::Obj(owner)));
+            }
+            props.entries.shape = self.shape;
+        });
         // The write barrier: this cell now names the fresh prototype. No safepoint lies between
         // the card and the store.
         // SAFETY: `self` is the payload of a live deferred-prototype cell (`gc_box::new` moves

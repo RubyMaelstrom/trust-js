@@ -2626,11 +2626,10 @@ fn regexp_array(
         }
         map
     });
-    let props = map.packed_array_from_template(items, named.iter().copied());
-    Value::Obj(Object::new_with_parts(
+    Value::Obj(Object::new_built(
         Some(i.array_proto),
-        props,
         ObjectKind::Array,
+        |props| props.init_array_from_template(map, items, named.iter().copied()),
     ))
 }
 
@@ -2733,12 +2732,14 @@ fn regexp_builtin_exec(
             let indices = if re.has_indices {
                 let array_proto = i.array_proto;
                 let pair = |span: Option<(usize, usize)>| match span {
-                    Some((a, b)) => Value::Obj(Object::new_with_parts(
+                    Some((a, b)) => Value::Obj(Object::new_built(
                         Some(array_proto),
-                        Props::packed_array(
-                            [Value::Num(a as f64), Value::Num(b as f64)].into_iter(),
-                        ),
                         ObjectKind::Array,
+                        |props| {
+                            props.init_packed_array(
+                                [Value::Num(a as f64), Value::Num(b as f64)].into_iter(),
+                            )
+                        },
                     )),
                     None => Value::Undefined,
                 };
@@ -5175,11 +5176,10 @@ fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
         }
         map
     });
-    let props = map.instantiate_plain(values.into_iter());
-    Value::Obj(Object::new_with_parts(
+    Value::Obj(Object::new_built(
         Some(i.object_proto),
-        props,
         ObjectKind::Plain,
+        |props| props.init_instance_plain(map, values.into_iter()),
     ))
 }
 
@@ -6846,7 +6846,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let ValueView::Obj(materialized) = (i.make_array(vec![v; len as usize])).view() else {
                 unreachable!("make_array returns an Array object")
             };
-            let properties = std::mem::take(&mut materialized.borrow_mut().props);
+            let properties = materialized.borrow_mut().take_props();
             o.borrow_mut().replace_properties(properties);
             return Ok(Value::Obj(o));
         }
@@ -9695,11 +9695,10 @@ fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
         map.insert("done", Property::plain(Value::Undefined));
         map
     });
-    let props = map.instantiate_plain([value, Value::Bool(done)].into_iter());
-    Value::Obj(Object::new_with_parts(
+    Value::Obj(Object::new_built(
         Some(i.object_proto),
-        props,
         ObjectKind::Plain,
+        |props| props.init_instance_plain(map, [value, Value::Bool(done)].into_iter()),
     ))
 }
 

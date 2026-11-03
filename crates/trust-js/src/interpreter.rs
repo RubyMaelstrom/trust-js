@@ -8450,20 +8450,20 @@ impl Interp {
     }
 
     pub fn make_array(&self, items: Vec<Value>) -> Value {
-        Value::Obj(Object::new_with_parts(
+        Value::Obj(Object::new_built(
             Some(self.array_proto),
-            Props::packed_array_from_slice(&items),
             ObjectKind::Array,
+            |props| props.init_packed_array_from_slice(&items),
         ))
     }
 
     /// CreateArrayFromList for an entry pair: copy the canonical word straight into
     /// array storage without an intermediate Vec.
     pub(crate) fn make_entry_pair(&self, key: crate::lstr::LStr, value: Value) -> Value {
-        Value::Obj(Object::new_with_parts(
+        Value::Obj(Object::new_built(
             Some(self.array_proto),
-            Props::packed_array([(Value::Str(key)), value].into_iter()),
             ObjectKind::Array,
+            |props| props.init_packed_array([(Value::Str(key)), value].into_iter()),
         ))
     }
 
@@ -8567,10 +8567,11 @@ impl Interp {
     /// `items` points to `len` initialized execution words in stable immutable storage retained
     /// through this call. The caller retires its window only after the copy completes.
     pub(crate) unsafe fn make_array_from_raw(&self, items: *const Value, len: usize) -> Value {
-        Value::Obj(Object::new_with_parts(
+        Value::Obj(Object::new_built(
             Some(self.array_proto),
-            unsafe { Props::packed_array_from_raw(items, len) },
             ObjectKind::Array,
+            // SAFETY: the caller's.
+            |props| unsafe { props.init_packed_array_from_raw(items, len) },
         ))
     }
 
@@ -9500,15 +9501,40 @@ impl Interp {
         // template's `name` slot is entry 1 with the "" value.
         let named = name.filter(|_| func.name.is_none());
         debug_assert_eq!(maps.heap, crate::value::active_heap_id());
-        let fn_map = match named {
-            None => maps.function.clone(),
+        // Instantiate{Ordinary,Generator,Async}FunctionExpression creates the immutable
+        // self-name environment ONCE, outside the activation, when the closure is created.
+        // Retain it in [[Environment]] so all execution tiers and recursive calls share the
+        // correct binding without allocating an extra scope on every call.
+        let self_env = if func.needs_self_environment() {
+            Some(new_scope(Some(env)))
+        } else {
+            None
+        };
+        let kind = ObjectKind::user(
+            func.clone(),
+            self_env.as_ref().cloned().unwrap_or(env),
+            Gc::as_ptr(&self.global) as usize,
+            if func.self_hosted {
+                None
+            } else {
+                self.active_runtime_origin()
+            },
+            self.realm_id,
+        );
+        // The object's map is a copy of its template, written into its cell (W2d step 3).
+        let obj = match named {
+            None => Object::new_built(Some(fn_proto), kind, |props| {
+                props.init_copy_of(&maps.function)
+            }),
             Some(name) => {
                 let mut named = maps.named.borrow_mut();
                 match &*named {
                     // A creation site passes its chunk's interned name, so identity is the common
                     // proof; equal text from another site shares the template too.
-                    Some((cached, props)) if Rc::ptr_eq(cached, name) || **cached == **name => {
-                        props.clone()
+                    Some((cached, template)) if Rc::ptr_eq(cached, name) || **cached == **name => {
+                        Object::new_built(Some(fn_proto), kind, |props| {
+                            props.init_copy_of(template)
+                        })
                     }
                     _ => {
                         let mut props = maps.function.clone();
@@ -9523,36 +9549,11 @@ impl Interp {
                             }
                             props.mark_layout_shared();
                         }
-                        props
+                        Object::new_with_parts(Some(fn_proto), props, kind)
                     }
                 }
             }
         };
-        // Instantiate{Ordinary,Generator,Async}FunctionExpression creates the immutable
-        // self-name environment ONCE, outside the activation, when the closure is created.
-        // Retain it in [[Environment]] so all execution tiers and recursive calls share the
-        // correct binding without allocating an extra scope on every call.
-        let self_env = if func.needs_self_environment() {
-            Some(new_scope(Some(env)))
-        } else {
-            None
-        };
-        let obj = Object::new(Some(fn_proto));
-        {
-            let mut b = obj.borrow_mut();
-            b.kind = ObjectKind::user(
-                func.clone(),
-                self_env.as_ref().cloned().unwrap_or(env),
-                Gc::as_ptr(&self.global) as usize,
-                if func.self_hosted {
-                    None
-                } else {
-                    self.active_runtime_origin()
-                },
-                self.realm_id,
-            );
-            b.adopt_props(fn_map);
-        }
         if has_prototype {
             let proto_parent = match (is_generator, is_async) {
                 (true, false) => self.extra_protos.get("%GeneratorPrototype%").cloned(),
@@ -16308,10 +16309,10 @@ impl Interp {
         let instance_capacity =
             static_capacity.max(instance_layout.as_ref().map_or(0, |keys| keys.len()));
         let proto_ptr = Gc::as_ptr(&proto) as usize;
-        let this = crate::value::Object::new_with_parts(
+        let this = crate::value::Object::new_built(
             Some(proto),
-            crate::value::Props::with_layout(instance_capacity, instance_layout),
             crate::value::ObjectKind::Plain,
+            |props| props.init_layout(instance_capacity, instance_layout),
         );
         let this_val = Value::Obj(this);
         // --- committed: identical shape to call_jit_cached's committed path ---
@@ -17964,11 +17965,9 @@ impl Interp {
                 };
                 let layout = self.learned_construct_layout(&obj);
                 let capacity = layout.as_ref().map_or(0, |keys| keys.len());
-                let this = Object::new_with_parts(
-                    proto,
-                    crate::value::Props::with_layout(capacity, layout),
-                    crate::value::ObjectKind::Plain,
-                );
+                let this = Object::new_built(proto, crate::value::ObjectKind::Plain, |props| {
+                    props.init_layout(capacity, layout)
+                });
                 let this_val = Value::Obj(this);
                 self.pending_new_target = new_target;
                 // Base class constructors run their field initializers before the body; plain

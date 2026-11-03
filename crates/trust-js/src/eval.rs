@@ -69,11 +69,10 @@ pub(crate) struct ForInKeys(Gc);
 
 impl ForInKeys {
     fn new(keys: Vec<String>) -> (Self, usize) {
-        // Include the RefCell<Object> (plus two words) and conservatively charge string
+        // Include the object's cell (plus two words) and conservatively charge string
         // headers/index keys.
         // Unlike a normal Array, this backing cannot retain %Array.prototype% or its realm.
-        let mut bytes =
-            std::mem::size_of::<std::cell::RefCell<Object>>() + 2 * std::mem::size_of::<usize>();
+        let mut bytes = crate::value::OBJECT_CELL + 2 * std::mem::size_of::<usize>();
         let mut props = Props::new();
         props.reserve_dense_exact(keys.len());
         for key in keys {
@@ -7539,11 +7538,15 @@ impl Interp {
             crate::value::remember_code_edges(&p);
             Box::new(p)
         });
-        let props = map.instantiate_plain((0..count).map(|slot| unsafe { base.add(slot).read() }));
-        let obj = crate::value::Object::new_with_parts(
+        let obj = crate::value::Object::new_built(
             Some(self.object_proto),
-            props,
             crate::value::ObjectKind::Plain,
+            |props| {
+                props.init_instance_plain(
+                    map,
+                    (0..count).map(|slot| unsafe { base.add(slot).read() }),
+                )
+            },
         );
         Value::Obj(obj)
     }
@@ -7569,10 +7572,10 @@ impl Interp {
             crate::value::remember_code_edges(&p);
             Box::new(p)
         });
-        let obj = crate::value::Object::new_with_parts(
+        let obj = crate::value::Object::new_built(
             Some(self.object_proto),
-            map.instantiate_plain(values.into_iter()),
             crate::value::ObjectKind::Plain,
+            |props| props.init_instance_plain(map, values.into_iter()),
         );
         Value::Obj(obj)
     }

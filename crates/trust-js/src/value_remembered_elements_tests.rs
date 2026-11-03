@@ -849,7 +849,7 @@ struct NativeAppendGuards {
 #[cfg(target_arch = "aarch64")]
 fn native_append_guards(array: &Gc) -> NativeAppendGuards {
     let body = array.borrow();
-    let length_memo = body.props.len_slot.get().slot();
+    let length_memo = body.props.entries.len_slot.get().slot();
     let snapshot = NativeAppendGuards {
         array: matches!(body.kind, ObjectKind::Array),
         plain: body.ic_plain(),

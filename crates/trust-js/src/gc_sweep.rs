@@ -3,7 +3,6 @@
 //! is made here. Choose key removal or a table scan according to the smaller working set.
 
 use crate::gc_core::{self, DescId};
-use crate::value::Object;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
@@ -46,7 +45,7 @@ enum Membership<'h> {
 
 // Objects are never large cells (value.rs keeps an object's cell at 128 bytes), so membership
 // reads the pages alone and never the heap's map of large cells.
-const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= gc_core::LARGEST_SMALL_CELL);
+const _: () = assert!(crate::value::OBJECT_CELL <= gc_core::LARGEST_SMALL_CELL);
 
 impl<'h> DeadObjects<'h> {
     /// The objects of `heap` found dead by the collection between whose phases the heap is.

@@ -25604,10 +25604,10 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     let capacity = chunk
         .instance_capacity_hint()
         .max(layout.as_ref().map_or(0, |keys| keys.len()));
-    Value::Obj(crate::value::Object::new_with_parts(
+    Value::Obj(crate::value::Object::new_built(
         Some(proto),
-        crate::value::Props::with_layout(capacity, layout),
         crate::value::ObjectKind::Plain,
+        |props| props.init_layout(capacity, layout),
     ))
     .bits()
 }

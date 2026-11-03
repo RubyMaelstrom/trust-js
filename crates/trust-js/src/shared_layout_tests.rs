@@ -50,9 +50,9 @@ fn check(source: &str, expected: &str) {
 fn measured_creation_write(engine: &mut Engine, target: &Gc, fresh: impl Fn() -> Props) -> usize {
     for _ in 0..256 {
         let epoch = crate::value::proto_epoch();
-        target.borrow_mut().props = fresh();
+        target.borrow_mut().set_props_for_test(fresh());
         eval(engine, "write()");
-        target.borrow_mut().props = fresh();
+        target.borrow_mut().set_props_for_test(fresh());
         crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|count| count.set(0));
         eval(engine, "write()");
         let helpers = crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|count| count.get());
@@ -137,11 +137,11 @@ fn ordinary_shared_index_respects_live_prefix_and_mutation() {
         short.shared_layout().unwrap(),
         other.shared_layout().unwrap()
     ));
-    // W2d step 2: seven slots in the cell; the record holds the other five of the twelve the
-    // layout predicts, one word each.
+    // W2d step 3: a map outside any cell keeps the twelve slots the layout predicts in its
+    // record, one word each.
     assert_eq!(
         short.retained_requested_storage_bytes(),
-        (crate::value::RECORD_SLOTS_OFF + 5 * 8, true)
+        (crate::value::RECORD_SLOTS_OFF + 12 * 8, true)
     );
 
     short.remove("field2");
@@ -159,11 +159,11 @@ fn ordinary_shared_index_respects_live_prefix_and_mutation() {
         other.shared_layout().unwrap()
     ));
     assert!(short.shared_layout().unwrap().has_index());
-    // W2d step 2: seven slots in the cell; the record holds the other five of the twelve the
-    // layout predicts, one word each.
+    // W2d step 3: a map outside any cell keeps the twelve slots the layout predicts in its
+    // record, one word each.
     assert_eq!(
         short.retained_requested_storage_bytes(),
-        (crate::value::RECORD_SLOTS_OFF + 5 * 8, true)
+        (crate::value::RECORD_SLOTS_OFF + 12 * 8, true)
     );
 
     let private = crate::value::new_property_layout((0..20).map(|i| format!("private{i}")));
@@ -277,8 +277,8 @@ fn learned_insertion_chains_reserve_once_without_creating_predicted_fields() {
     ));
     assert_eq!(
         partial.borrow().props.retained_requested_storage_bytes(),
-        (crate::value::detached_field_bytes(3), true),
-        "the whole small learned sequence is reserved by its first insertion"
+        (0, true),
+        "the whole small learned sequence is reserved by its first insertion, in the cell"
     );
     assert_eq!(eval(&mut engine, "[Object.keys(partial),'chainSecond' in partial,Object.getOwnPropertyDescriptor(partial,'chainThird')].join('|')"), "chainFirst|false|");
     assert_eq!(eval(&mut engine, "partial.alternative=8;[Object.keys(partial),Object.keys(warm),warm.chainThird,'chainSecond' in partial].join('|')"), "chainFirst,alternative|chainFirst,chainSecond,chainThird|3|false");
@@ -398,7 +398,9 @@ fn native_creation_accepts_equal_keys_from_distinct_allocations() {
     // before tier-up or shared from an independent creation site.
     let layout = crate::value::new_property_layout(vec![Rc::from("alpha"), Rc::from("beta")]);
     for _ in 0..100 {
-        target.borrow_mut().props = Props::with_layout(2, Some(layout.clone()));
+        target
+            .borrow_mut()
+            .set_props_for_test(Props::with_layout(2, Some(layout.clone())));
         eval(&mut engine, "write()");
     }
     assert_eq!(
@@ -473,7 +475,9 @@ fn native_creation_replaces_private_and_shared_layout_cells_without_helpers() {
     );
     let target = object(&mut engine, "target");
     for _ in 0..100 {
-        target.borrow_mut().props = Props::with_capacity(3);
+        target
+            .borrow_mut()
+            .set_props_for_test(Props::with_capacity(3));
         eval(&mut engine, "write()");
     }
     for shared in [false, true] {

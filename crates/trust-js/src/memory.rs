@@ -2476,7 +2476,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         object_bodies: Category::exact(
             totals
                 .object_count
-                .saturating_mul(size_of::<RefCell<Object>>()),
+                .saturating_mul(crate::value::OBJECT_CELL),
         ),
         property_storage: totals.property_storage,
         scope_bodies: Category::exact(
@@ -2628,11 +2628,16 @@ mod tests {
 
     #[test]
     fn property_storage_counts_capacity_not_length() {
+        // W2d step 3: a map outside any cell keeps all seventeen in its record, one word each,
+        // unused as they are; an object's keeps seven in its cell and the other ten there.
         let props = Props::with_capacity(17);
         let (bytes, exact) = props.retained_requested_storage_bytes();
         assert!(exact);
-        // W2d step 2: seven slots in the cell; the record's block holds the other ten, one word
-        // each, unused as they are.
+        assert_eq!(bytes, crate::value::RECORD_SLOTS_OFF + 17 * 8);
+        let _engine = crate::Engine::new();
+        let object = crate::value::Object::new_with_capacity(None, 17);
+        let (bytes, exact) = object.borrow().props.retained_requested_storage_bytes();
+        assert!(exact);
         assert_eq!(
             bytes,
             crate::value::RECORD_SLOTS_OFF + (17 - crate::value::INLINE_NAMED_SLOTS) * 8
@@ -3257,7 +3262,7 @@ mod tests {
         let aggregate = measure(&root, &objects, &scopes);
         assert_eq!(
             aggregate.object_bodies.bytes,
-            objects.len().saturating_mul(size_of::<RefCell<Object>>())
+            objects.len().saturating_mul(crate::value::OBJECT_CELL)
         );
         assert_eq!(
             aggregate.scope_bodies.bytes,
