@@ -95,7 +95,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         let target_is_ctor = i.value_is_constructor(&this);
         obj.borrow_mut().kind = ObjectKind::bound(target, bound_this, bound_args);
         // A bound function is a constructor exactly when its target is.
-        obj.borrow_mut().is_constructor = target_is_ctor;
+        obj.borrow_mut().set_constructor(target_is_ctor);
         obj.borrow_mut()
             .props
             .insert("length", Property::data(Value::Num(l), false, false, true));
@@ -174,7 +174,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         );
         b.props
             .insert("name", Property::data(Value::lstr(""), false, false, false));
-        b.extensible = false;
+        b.set_extensible(false);
     }
     Rc::make_mut(&mut it.extra_protos).insert("%ThrowTypeError%", throw_type_error);
     // Function.prototype.caller / .arguments: accessor properties whose getter AND setter are

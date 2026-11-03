@@ -243,7 +243,7 @@ fn owner(i: &Interp, site: &LoopSite) -> Option<Owner> {
         function: Rc::clone(function),
         threshold: i.tier_threshold,
         units: function.tier_units(),
-        compiles: !(frame.construct && callee.class_kind == crate::value::CLASS_DERIVED)
+        compiles: !(frame.construct && callee.class_kind() == crate::value::CLASS_DERIVED)
             && !user.env.borrow().under_with(),
         first: true,
     })

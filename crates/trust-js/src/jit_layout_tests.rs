@@ -131,8 +131,11 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
         read::<u32>(base, layout.obj_props + layout.props_shape),
         object.borrow().props.shape()
     );
-    assert_eq!(read::<u8>(base, layout.obj_ic_plain), 1);
-    assert_eq!(read::<u8>(base, layout.obj_extensible), 1);
+    // One flag byte: ordinary and extensible, nothing else.
+    assert_eq!(
+        read::<u8>(base, layout.obj_flags),
+        crate::value::FLAG_IC_PLAIN | crate::value::FLAG_EXTENSIBLE
+    );
     let tag = |object: &Gc| read::<u8>(body(&layout, object), layout.obj_kind);
     assert_eq!(tag(&object), 0, "a plain object's kind");
     for (exotic, expected) in [

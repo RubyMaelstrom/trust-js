@@ -242,7 +242,7 @@ fn for_in_backing_hits_share_identity_without_retaining_author_objects() {
             let object_handle = keys.as_obj().unwrap();
             let object = object_handle.borrow();
             assert!(object.proto.is_none());
-            assert!(!object.extensible);
+            assert!(!object.extensible());
             // The keys are plain element words: no script reaches this object.
             for index in 0..2 {
                 let property = object.props.get_index(index).unwrap();

@@ -186,7 +186,7 @@ pub(crate) fn bind_this(i: &mut Interp, target: Value, this_arg: Value) -> Value
     if let Ok(bindfn) = i.get_member_key(&target, "bind") {
         if let Ok(bound) = i.call(bindfn, target, &[this_arg]) {
             if let ValueView::Obj(o) = &(bound).view() {
-                o.borrow_mut().is_constructor = false;
+                o.borrow_mut().set_constructor(false);
                 o.borrow_mut().props.insert(
                     "name",
                     crate::value::Property::data(Value::lstr(""), false, false, true),

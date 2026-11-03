@@ -292,7 +292,7 @@ fn set_own_data_property(object: &Gc, key: &str, value: Value) -> bool {
     };
     let slot = {
         let body = object.borrow();
-        if !body.ic_plain.get() || !body.kind.is_ordinary() {
+        if !body.ic_plain() || !body.kind.is_ordinary() {
             return false;
         }
         let Some(slot) = body.props.slot_of_key(key) else {

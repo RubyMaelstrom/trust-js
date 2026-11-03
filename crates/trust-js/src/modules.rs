@@ -1111,10 +1111,10 @@ impl Interp {
         }
         {
             let mut b = ns.borrow_mut();
-            b.extensible = false;
+            b.set_extensible(false);
             b.props.demote_shape();
         }
-        ns.borrow().ic_plain.set(false);
+        ns.borrow().set_ic_plain(false);
         // `module_ns` is keyed only by object address. Pin the namespace until
         // the collector can evict the side-table entry atomically; a
         // released per-Document module map may otherwise drop the last strong
@@ -1153,7 +1153,7 @@ impl Interp {
                 }
                 dst.props.insert(k, p);
             }
-            dst.extensible = false;
+            dst.set_extensible(false);
             dst.props.demote_shape();
         }
         if let Some(live) = self
@@ -1161,12 +1161,12 @@ impl Interp {
             .get(&(crate::value::Gc::as_ptr(base_o) as usize))
             .cloned()
         {
-            dns.borrow().ic_plain.set(false);
+            dns.borrow().set_ic_plain(false);
             self.gc_pin(&dns);
             self.module_ns
                 .insert(&self.gc_heap, crate::value::Gc::as_ptr(&dns) as usize, live);
         }
-        dns.borrow().ic_plain.set(false);
+        dns.borrow().set_ic_plain(false);
         self.deferred_ns
             .insert(crate::value::Gc::as_ptr(&dns) as usize, dep.to_string());
         self.deferred_ns_objs
@@ -1225,7 +1225,7 @@ impl Interp {
                             .get(&(crate::value::Gc::as_ptr(base_o) as usize))
                             .cloned()
                         {
-                            stub.borrow().ic_plain.set(false);
+                            stub.borrow().set_ic_plain(false);
                             self.gc_pin(&stub);
                             self.module_ns.insert(
                                 &self.gc_heap,

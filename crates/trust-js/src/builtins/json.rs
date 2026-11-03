@@ -470,7 +470,7 @@ impl JsonKey<'_> {
 /// is not a mapped arguments object.
 fn json_plain_get(object: &Gc) -> bool {
     let body = object.borrow();
-    body.ic_plain.get() && !matches!(body.kind, crate::value::ObjectKind::Arguments(Some(_)))
+    body.ic_plain() && !matches!(body.kind, crate::value::ObjectKind::Arguments(Some(_)))
 }
 
 /// Get(holder, key) for SerializeJSONProperty: an own data property of a plain object is read
@@ -517,7 +517,7 @@ fn json_to_json_method(i: &mut Interp, value: &Value) -> Result<Value, Value> {
         loop {
             let next = {
                 let object = current.borrow();
-                if !object.ic_plain.get() {
+                if !object.ic_plain() {
                     break;
                 }
                 match object.props.get("toJSON") {
@@ -689,7 +689,7 @@ fn json_serialize_object(
                 _ => None,
             })
             .collect(),
-        None if object.borrow().ic_plain.get() => {
+        None if object.borrow().ic_plain() => {
             // An ordinary object's [[OwnPropertyKeys]] is its own key order; enumerability is
             // its stored attribute. A record of enumerable named data properties needs no
             // filtering.

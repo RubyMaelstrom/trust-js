@@ -1458,8 +1458,8 @@ fn emit_borrowed_own_read(
     } else {
         a.ldrb_imm(14, 11, layout.obj_kind as u32);
         guard_exotic_ordinary(a, layout, 14, 14, fail);
-        a.ldrb_imm(14, 11, layout.obj_ic_plain as u32);
-        a.cbz(14, false, fail);
+        a.ldrb_imm(14, 11, layout.obj_flags as u32);
+        a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), fail);
         a.ldr_w_imm(14, 11, (layout.obj_props + layout.props_shape) as u32);
         a.ldr_w_imm(16, 12, IC_OFF_RECV_SHAPE);
         a.cmp_reg_w(14, 16);
@@ -1547,8 +1547,8 @@ fn emit_borrowed_method(
         }
         a.ldrb_imm(14, 11, layout.obj_kind as u32);
         guard_exotic_ordinary(a, layout, 14, 14, fail);
-        a.ldrb_imm(14, 11, layout.obj_ic_plain as u32);
-        a.cbz(14, false, fail);
+        a.ldrb_imm(14, 11, layout.obj_flags as u32);
+        a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), fail);
         a.ldr_w_imm(14, 11, (layout.obj_props + layout.props_shape) as u32);
         let shape = if hop == 0 {
             state.recv_shape
@@ -2016,8 +2016,8 @@ pub(super) fn emit_name_element_body(
     a.ldrb_imm(12, 11, layout.obj_kind as u32);
     a.cmp_imm_w(12, crate::value::KIND_TYPED_ARRAY_TAG as u32);
     a.b_cond(C_NE, value_miss);
-    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
-    a.cbnz(12, false, value_miss);
+    a.ldrb_imm(12, 11, layout.obj_flags as u32);
+    a.tbnz(12, flag_bit(crate::value::FLAG_IC_PLAIN), value_miss);
     // The index: exactly a u32 (negative and fractional keys, NaN and -0 miss).
     if jscvt_available() {
         // FJCVTZS reports in Z that the key is an integer within int32 (so -0, fractions,
@@ -3277,8 +3277,8 @@ pub(super) fn emit(
                     let typed = a.new_label();
                     let read = a.new_label();
                     // A typed array's view is read with its tag still in w12.
-                    a.ldrb_imm(13, 11, layout.obj_ic_plain as u32);
-                    a.cbz(13, false, typed);
+                    a.ldrb_imm(13, 11, layout.obj_flags as u32);
+                    a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
                     emit_word_read(a, layout, 11, 9, 12, bailout);
                     a.b(read);
                     a.bind(typed);
@@ -3325,8 +3325,8 @@ pub(super) fn emit(
                     let typed = a.new_label();
                     let stored = a.new_label();
                     // A typed array's view is read with its tag still in w12.
-                    a.ldrb_imm(13, 11, layout.obj_ic_plain as u32);
-                    a.cbz(13, false, typed);
+                    a.ldrb_imm(13, 11, layout.obj_flags as u32);
+                    a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
                     emit_words_base(a, layout, 11, 15, 14);
                     a.cmp_reg_x(9, 14);
                     a.b_cond(C_HS, bailout);

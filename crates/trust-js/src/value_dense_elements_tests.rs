@@ -163,19 +163,19 @@ fn dense_elements_far_deletion_and_truncation_restore_packed_coverage() {
             let mut props = Props::packed_array((0..length).map(|n| Value::Num(n as f64)));
             props.insert("1000000", Property::plain(Value::Num(1.0)));
             props.insert("2000000", Property::plain(Value::Num(2.0)));
-            assert!(props.has_far.get());
+            assert!(props.has_far());
             assert!(
                 props.element_words().is_none(),
                 "far keys block the in-place views"
             );
             assert!(props.remove("2000000"));
-            assert!(props.has_far.get(), "another far key survives");
+            assert!(props.has_far(), "another far key survives");
             if truncate {
                 props.remove_indices_from(length);
             } else {
                 assert!(props.remove("1000000"));
             }
-            assert!(!props.has_far.get(), "{length}, truncate={truncate}");
+            assert!(!props.has_far(), "{length}, truncate={truncate}");
             assert_eq!(props.entries.len(), 1);
             assert!(props.get("1000000").is_none());
             if length != 0 {
@@ -210,14 +210,14 @@ fn dense_elements_far_keys_index_the_named_entries() {
     for start in [3u32, 0] {
         let mut props = Props::packed_array((0..start).map(|n| Value::Num(n as f64)));
         props.insert(far.to_string().as_str(), Property::plain(Value::Num(-1.0)));
-        assert!(props.has_far.get(), "{start}");
+        assert!(props.has_far(), "{start}");
         for n in start..start + 2000 {
             props.insert(
                 n.to_string().as_str(),
                 Property::plain(Value::Num(n as f64)),
             );
         }
-        assert!(props.has_far.get(), "{start}");
+        assert!(props.has_far(), "{start}");
         assert!(props.elems.index().is_some(), "{start}: no key index");
         for n in 0..start + 2000 {
             assert_eq!(
@@ -255,18 +255,18 @@ fn dense_elements_recovery_keeps_named_indices_outside_packed_storage_guarded() 
     assert!(props.find(PropKey::index(1)).is_some());
     assert!(props.elems.words().unwrap().get(1).is_none());
     assert!(props.remove("1000000"));
-    assert!(props.has_far.get(), "a named element remains");
+    assert!(props.has_far(), "a named element remains");
     assert!(props
         .try_append_element(1, Property::plain(Value::Num(2.0)))
         .is_err());
     props.remove_indices_from(2);
-    assert!(props.has_far.get());
+    assert!(props.has_far());
     assert_eq!(props.get("1").unwrap().number_value(), Some(11.0));
     assert!(!props.get("1").unwrap().configurable());
     // The caller's ArraySetLength validation owns configurability checks. Here only
     // the storage proof is tested, after a validated boundary removes that index.
     props.remove_indices_from(1);
-    assert!(!props.has_far.get());
+    assert!(!props.has_far());
     assert!(props
         .try_append_element(1, Property::plain(Value::Num(2.0)))
         .is_ok());
@@ -285,9 +285,9 @@ fn dense_elements_named_recovery_keeps_named_indices_until_truncation() {
         }
         assert!(!props.elems.has_words());
         assert!(props.remove("1000000"));
-        assert!(props.has_far.get(), "the named elements remain");
+        assert!(props.has_far(), "the named elements remain");
         props.remove_indices_from(length / 2);
-        assert!(props.has_far.get());
+        assert!(props.has_far());
         for n in 0..length / 2 {
             assert_eq!(
                 props.get_index(n as u32).unwrap().number_value(),
@@ -299,14 +299,14 @@ fn dense_elements_named_recovery_keeps_named_indices_until_truncation() {
             .is_err());
         // Truncation past every named index restores the words.
         props.remove_indices_from(0);
-        assert!(!props.has_far.get());
+        assert!(!props.has_far());
         assert!(props
             .try_append_element(0, Property::plain(Value::Num(9.0)))
             .is_ok());
         assert!(props.elems.has_words());
         props.insert("1000000", Property::plain(Value::Num(1.0)));
         props.clear();
-        assert!(!props.has_far.get());
+        assert!(!props.has_far());
     }
 }
 
@@ -325,9 +325,9 @@ fn dense_elements_recovery_keeps_named_elements_far_and_word_kinds_exact() {
         assert!(props.remove("1000000"));
         // A non-plain element stays in the named entries, so the map keeps an index there.
         let named = matches!(blocked, "accessor" | "non-writable");
-        assert_eq!(props.has_far.get(), named, "{blocked}");
+        assert_eq!(props.has_far(), named, "{blocked}");
         props.insert("1", Property::plain(Value::Num(2.0)));
-        assert_eq!(props.has_far.get(), named, "{blocked}");
+        assert_eq!(props.has_far(), named, "{blocked}");
         let words = props.elems.words().unwrap();
         assert_eq!(words.kind() & !words.computed_kind(), 0, "{blocked}");
         assert_eq!(words.get(1).is_some(), !named, "{blocked}");
@@ -453,7 +453,7 @@ fn the_sparse_limit_follows_v8() {
     for (index, words) in [(1023u32, true), (1024, false)] {
         let mut props = Props::packed_array(std::iter::empty());
         props.insert(index.to_string().as_str(), plain(1.0));
-        assert_eq!(!props.has_far.get(), words, "{index}");
+        assert_eq!(!props.has_far(), words, "{index}");
         assert_eq!(
             props.elems.words().map(word_block::Words::len),
             words.then_some(index as usize + 1),
@@ -464,7 +464,7 @@ fn the_sparse_limit_follows_v8() {
     for (index, words) in [(1026u32, true), (1027, false)] {
         let mut props = Props::packed_array((0..3).map(|n| Value::Num(n as f64)));
         props.insert(index.to_string().as_str(), plain(1.0));
-        assert_eq!(!props.has_far.get(), words, "{index}");
+        assert_eq!(!props.has_far(), words, "{index}");
     }
     // Index 5000 past a capacity of 4000 grows it to 7,517 words: words while at least 342 of
     // the 4000 are present (3 * ComputeCapacity(342) * 3 = 9,216), not with 341 (4,608). (The
@@ -489,7 +489,7 @@ fn sparse_arrays_densify_when_dense_enough() {
     for blocked in [false, true] {
         let mut props = Props::packed_array(std::iter::empty());
         props.insert("100000", plain(-1.0));
-        assert!(props.has_far.get());
+        assert!(props.has_far());
         if blocked {
             props.insert("7", Property::data(Value::Num(7.0), false, true, true));
         }
@@ -499,15 +499,15 @@ fn sparse_arrays_densify_when_dense_enough() {
             if !(blocked && n == 7) {
                 props.insert(n.to_string().as_str(), plain(n as f64));
             }
-            assert!(props.has_far.get(), "{n}: {} entries", props.entries.len());
+            assert!(props.has_far(), "{n}: {} entries", props.entries.len());
         }
         props.insert("16381", plain(16_381.0));
         if blocked {
-            assert!(props.has_far.get(), "a non-plain element blocks the move");
+            assert!(props.has_far(), "a non-plain element blocks the move");
             assert!(props.get_index(7).is_some());
             continue;
         }
-        assert!(!props.has_far.get());
+        assert!(!props.has_far());
         assert_eq!(props.entries.len(), 1, "only `length` remains named");
         let words = props.elems.words().unwrap();
         assert_eq!(words.len(), 100_001);
@@ -536,7 +536,7 @@ fn sparse_arrays_densify_when_dense_enough() {
     for n in 0..20000u32 {
         object.insert(n.to_string().as_str(), plain(n as f64));
     }
-    assert!(object.has_far.get());
+    assert!(object.has_far());
 }
 
 /// The script-visible results of both transitions are the specification's: values, order,
@@ -634,7 +634,7 @@ fn every_array_keeps_length_at_slot_zero() {
             .unwrap();
         let body = array.borrow();
         assert!(matches!(body.kind, ObjectKind::Array), "{n}");
-        assert!(body.props.elem_mode.get(), "{n}");
+        assert!(body.props.elem_mode(), "{n}");
         assert_eq!(
             body.props.entries.keys()[0],
             length,
@@ -716,10 +716,7 @@ fn frozen_and_sealed_arrays_keep_their_words_and_their_semantics() {
                 .as_obj()
                 .unwrap();
             let body = array.borrow();
-            assert!(
-                !body.props.has_far.get(),
-                "{tier:?} {name}: no named elements"
-            );
+            assert!(!body.props.has_far(), "{tier:?} {name}: no named elements");
             assert_eq!(body.props.word_integrity(), bits, "{tier:?} {name}");
         }
     }

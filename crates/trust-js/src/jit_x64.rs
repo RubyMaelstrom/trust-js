@@ -304,7 +304,7 @@ impl Asm {
         }
         let object_flag = layout
             .obj_from_cell
-            .checked_add(layout.obj_ic_plain)
+            .checked_add(layout.obj_flags)
             .filter(|offset| *offset <= i32::MAX as usize);
         if layout.valid {
             self.cmp_eax(0x7fff);
@@ -331,9 +331,9 @@ impl Asm {
         self.bind(object);
         self.load_word_r13(-SLOT_BYTES);
         self.payload_rax_to_rdx();
-        self.bytes(&[0x80, 0xba]); // cmp byte [rdx+obj.ic_plain],0
+        self.bytes(&[0xf6, 0x82]); // test byte [rdx+obj.flags],FLAG_IC_PLAIN
         self.bytes(&(object_flag.unwrap_or(0) as i32).to_le_bytes());
-        self.bytes(&[0]);
+        self.bytes(&[crate::value::FLAG_IC_PLAIN]);
         self.jcc(0x84, slow);
         self.bind(truthy);
         self.bytes(&[0xba, 0x01, 0x00, 0x00, 0x00]);
@@ -583,7 +583,7 @@ fn emit_prop_own(
     let offsets = [
         layout.obj_from_cell,
         layout.obj_kind,
-        layout.obj_ic_plain,
+        layout.obj_flags,
         layout.obj_props + layout.props_shape,
         layout.entry_size,
         layout.entry_value,
@@ -602,9 +602,9 @@ fn emit_prop_own(
     a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]); // r11=Object
     a.bytes(&(layout.obj_from_cell as i32).to_le_bytes());
     a.guard_exotic_ordinary(layout, R11, AX, slow); // ordinary internal methods
-    a.bytes(&[0x41, 0x80, 0xbb]);
-    a.bytes(&(layout.obj_ic_plain as i32).to_le_bytes());
-    a.bytes(&[0]);
+    a.bytes(&[0x41, 0xf6, 0x83]); // test byte [r11+obj.flags],FLAG_IC_PLAIN
+    a.bytes(&(layout.obj_flags as i32).to_le_bytes());
+    a.bytes(&[crate::value::FLAG_IC_PLAIN]);
     a.jcc(0x84, slow);
     a.bytes(&[0x45, 0x8b, 0x83]); // r8d=live receiver shape
     a.bytes(&((layout.obj_props + layout.props_shape) as i32).to_le_bytes());
@@ -714,7 +714,7 @@ fn emit_prop_num(
     let Ok(obj_off) = i32::try_from(layout.obj_from_cell) else {
         return false;
     };
-    let Ok(plain) = i32::try_from(layout.obj_ic_plain) else {
+    let Ok(plain) = i32::try_from(layout.obj_flags) else {
         return false;
     };
     let Ok(shape) = i32::try_from(layout.obj_props + layout.props_shape) else {
@@ -740,9 +740,9 @@ fn emit_prop_num(
         a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]);
         a.bytes(&obj_off.to_le_bytes());
         a.guard_exotic_ordinary(layout, R11, AX, slow);
-        a.bytes(&[0x41, 0x80, 0xbb]);
+        a.bytes(&[0x41, 0xf6, 0x83]); // test byte [r11+obj.flags],FLAG_IC_PLAIN
         a.bytes(&plain.to_le_bytes());
-        a.bytes(&[0]);
+        a.bytes(&[crate::value::FLAG_IC_PLAIN]);
         a.jcc(0x84, slow);
         a.bytes(&[0x41, 0x81, 0xbb]);
         a.bytes(&shape.to_le_bytes());

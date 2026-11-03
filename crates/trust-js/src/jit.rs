@@ -6354,7 +6354,7 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.entry_accessor >= layout.entry_value + 8
         && layout.obj_from_cell < 4096
         && layout.obj_kind < 4096
-        && layout.obj_ic_plain < 4096
+        && layout.obj_flags < 4096
         && sh.is_multiple_of(4)
         && sh / 4 < 4096
         && fields_data_fits(layout)
@@ -6438,6 +6438,23 @@ fn guard_exotic_ordinary(
 ) {
     a.cmp_imm_w(reg, crate::value::KIND_ORDINARY_LAST as u32);
     a.b_cond(C_HI, miss);
+}
+
+/// The bit number of a flag of the Object's flag byte (`JitLayout::obj_flags`, W2d step 1), for
+/// TBZ/TBNZ.
+const fn flag_bit(flag: u8) -> u32 {
+    flag.trailing_zeros()
+}
+
+/// Branch to `miss` unless the flag byte loaded in `reg` has exactly `expected` among the bits of
+/// `mask`, which must be one run of bits (a logical immediate): `and reg, reg, #mask;
+/// cmp reg, #expected; b.ne miss`. `reg` is clobbered, as are NZCV.
+fn guard_flags(a: &mut asm::Asm, reg: u32, mask: u8, expected: u8, miss: usize) {
+    debug_assert_eq!(expected & !mask, 0);
+    let bits = asm::logical_imm_w(u32::from(mask)).expect("a run of flag bits");
+    a.logic_imm_w(0, reg, reg, bits);
+    a.cmp_imm_w(reg, u32::from(expected));
+    a.b_cond(C_NE, miss);
 }
 
 /// Branch to `miss` unless the kind tag loaded in `reg` carries no exotic state (a plain object,
@@ -6607,7 +6624,7 @@ fn emit_prop_way_probe(
     let ex = layout.obj_kind as u32;
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let d1 = a.new_label();
     a.ldrb_imm(9, 12, IC_OFF_DEPTH);
     a.ldr_w_imm(13, 12, IC_OFF_SLOT);
@@ -6644,7 +6661,7 @@ fn emit_prop_way_probe(
         guard_exotic_ordinary(a, layout, 14, 14, miss);
     }
     a.ldrb_imm(14, 11, plain);
-    a.cbz(14, false, miss);
+    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
     a.ldr_w_imm(14, 11, sh);
     a.ldr_w_imm(16, 12, IC_OFF_RECV_SHAPE);
     a.cmp_reg_w(14, 16);
@@ -6685,7 +6702,7 @@ fn emit_prop_way_probe(
     a.ldrb_imm(14, 11, ex);
     guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
-    a.cbz(14, false, miss);
+    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
     a.ldr_w_imm(14, 11, sh);
     a.ldr_w_imm(16, 12, IC_OFF_MID_SHAPE);
     a.cmp_reg_w(14, 16);
@@ -6697,7 +6714,7 @@ fn emit_prop_way_probe(
     a.ldrb_imm(14, 11, ex);
     guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
-    a.cbz(14, false, miss);
+    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
     a.ldr_w_imm(14, 11, sh);
     a.ldr_w_imm(16, 12, IC_OFF_MID2_SHAPE);
     a.cmp_reg_w(14, 16);
@@ -6713,7 +6730,7 @@ fn emit_prop_way_probe(
     a.ldrb_imm(14, 11, ex);
     guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
-    a.cbz(14, false, miss);
+    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
     a.ldr_w_imm(14, 11, sh);
     a.ldr_w_imm(16, 12, IC_OFF_MID_SHAPE);
     a.cmp_reg_w(14, 16);
@@ -6726,7 +6743,7 @@ fn emit_prop_way_probe(
     a.ldrb_imm(14, 11, ex);
     guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
-    a.cbz(14, false, miss);
+    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
     a.ldr_w_imm(14, 11, sh);
     a.ldr_w_imm(16, 12, IC_OFF_HOLDER_SHAPE);
     a.cmp_reg_w(14, 16);
@@ -6764,7 +6781,7 @@ fn emit_prop_way_probe(
             a.ldrb_imm(14, 11, ex);
             guard_exotic_none_or_wrap(a, layout, 14, 15, false, true, miss);
             a.ldrb_imm(14, 11, plain);
-            a.cbz(14, false, miss);
+            a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
             a.ldr_w_imm(14, 11, sh);
             a.ldr_w_imm(16, 12, shape_off);
             a.cmp_reg_w(14, 16);
@@ -6795,7 +6812,7 @@ fn emit_prop_way_probe(
         a.ldrb_imm(14, 11, ex);
         guard_exotic_ordinary_or_array(a, layout, 14, 15, miss);
         a.ldrb_imm(14, 11, plain);
-        a.cbz(14, false, miss);
+        a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
         a.ldr_w_imm(14, 11, sh);
         a.ldr_w_imm(16, 12, IC_OFF_HOLDER_SHAPE);
         a.cmp_reg_w(14, 16);
@@ -6916,7 +6933,7 @@ fn emit_prop_load_inline(
     let ea = layout.entry_accessor as u32;
     let es = layout.entry_size as u64;
 
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     // Key-checked entries (`IC_ARR_KEYCHK`: the holder is an Array — `arr.length`, or a method
     // on the Array-exotic `Array.prototype`): validated by an inline compare of the entry's key
     // with the site's compile-time name's, one word each (`PropKey`).
@@ -7089,7 +7106,7 @@ fn emit_prop_load_inline(
             guard_exotic_ordinary(a, layout, 14, 14, miss);
         }
         a.ldrb_imm(14, 11, plain);
-        a.cbz(14, false, miss);
+        a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
         a.ldr_w_imm(14, 11, sh);
         a.mov_imm64(16, st.recv_shape as u64);
         a.cmp_reg_w(14, 16);
@@ -7101,7 +7118,7 @@ fn emit_prop_load_inline(
             a.ldrb_imm(14, 11, ex);
             guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
-            a.cbz(14, false, miss);
+            a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
             a.ldr_w_imm(14, 11, sh);
             let expected = if depth == 1 {
                 st.holder_shape
@@ -7119,7 +7136,7 @@ fn emit_prop_load_inline(
             a.ldrb_imm(14, 11, ex);
             guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
-            a.cbz(14, false, miss);
+            a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
             a.ldr_w_imm(14, 11, sh);
             let expected = if depth == 2 {
                 st.holder_shape
@@ -7137,7 +7154,7 @@ fn emit_prop_load_inline(
             a.ldrb_imm(14, 11, ex);
             guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
-            a.cbz(14, false, miss);
+            a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
             a.ldr_w_imm(14, 11, sh);
             a.mov_imm64(16, st.holder_shape as u64);
             a.cmp_reg_w(14, 16);
@@ -7930,7 +7947,7 @@ fn emit_method_elem_dense(
 ) {
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     emit_exec_word_load(a, 10, 20, -16);
     emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 11, slow);
     emit_exec_payload(a, 10, 10);
@@ -7945,7 +7962,7 @@ fn emit_method_elem_dense(
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, slow);
+    a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     emit_word_read(a, layout, 11, 9, 12, slow);
     // Commit: the element simply replaces the Number key.
     emit_exec_word_store(a, 12, 20, -8);
@@ -7988,7 +8005,7 @@ fn emit_computed_method_inline(
     let string_key = a.new_label();
     let shape = (layout.obj_props + layout.props_shape) as u32;
     let exotic = layout.obj_kind as u32;
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let object_data = layout.obj_from_cell as u32;
     if get_elem_inlinable(layout) {
         // A Number key is an element read of a dense array: `table[i & mask](args)`, the
@@ -8061,7 +8078,7 @@ fn emit_computed_method_inline(
     a.cbz(7, false, slow); // an array is allowed only below a named-property holder
     a.bind(ordinary);
     a.ldrb_imm(14, 11, plain);
-    a.cbz(14, false, slow);
+    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     let load = a.new_label();
     let holder = a.new_label();
     a.cbz(7, false, load);
@@ -8076,7 +8093,7 @@ fn emit_computed_method_inline(
         a.b_cond(C_NE, slow);
         a.bind(hop_ordinary);
         a.ldrb_imm(14, 11, plain);
-        a.cbz(14, false, slow);
+        a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
         a.ldr_w_imm(14, 11, shape);
         a.cmp_imm_w(7, hop);
         a.b_cond(C_EQ, holder);
@@ -8710,8 +8727,8 @@ fn emit_is_array_template(
     a.ldrb_imm(14, 11, layout.obj_kind as u32);
     a.cmp_imm_w(14, layout.exotic_array_tag as u32);
     a.b_cond(C_EQ, array);
-    a.ldrb_imm(14, 11, layout.obj_ic_plain as u32);
-    a.cbz(14, false, hit_slow);
+    a.ldrb_imm(14, 11, layout.obj_flags as u32);
+    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), hit_slow);
     a.bind(not_array);
     a.movz(9, 0, 0);
     a.b(commit);
@@ -9525,7 +9542,7 @@ fn emit_call_code_probe(
     use std::mem::offset_of;
     let call_tag = layout.obj_from_cell + layout.obj_kind;
     let call_payload = call_tag + 8;
-    let ic_plain = layout.obj_from_cell + layout.obj_ic_plain;
+    let flags = layout.obj_from_cell + layout.obj_flags;
     let ic_func = offset_of!(crate::bytecode::CallIc, func);
     let ic_realm = offset_of!(crate::bytecode::CallIc, realm);
     if !call_code_probe_supported(layout) {
@@ -9535,8 +9552,8 @@ fn emit_call_code_probe(
     a.ldrb_imm(9, 10, call_tag as u32);
     a.cmp_imm_w(9, crate::value::CALLABLE_USER_TAG as u32);
     a.b_cond(C_NE, miss);
-    a.ldrb_imm(9, 10, ic_plain as u32);
-    a.cbz(9, false, miss);
+    a.ldrb_imm(9, 10, flags as u32);
+    a.tbz(9, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
     a.ldr_imm(9, 10, call_payload as u32); // the closure cell (a `UserFn`)
     a.ldr_imm(11, 9, layout.user_func as u32);
     a.add_imm(11, 11, layout.func_data_off as u32); // the closure's function identity
@@ -9591,7 +9608,7 @@ fn call_code_probe_supported(layout: &crate::value::JitLayout) -> bool {
         && layout.call_probe_valid
         && layout.scope_parent_valid
         && call_tag < 4096
-        && layout.obj_from_cell + layout.obj_ic_plain < 4096
+        && layout.obj_from_cell + layout.obj_flags < 4096
         && fits8(call_tag + 8)
         && fits8(layout.user_func)
         && fits8(layout.user_env)
@@ -9618,8 +9635,8 @@ fn emit_call_code_way(a: &mut asm::Asm, layout: &crate::value::JitLayout, way: u
     a.ldrb_imm(9, 10, call_tag as u32);
     a.cmp_imm_w(9, crate::value::CALLABLE_USER_TAG as u32);
     a.b_cond(C_NE, miss);
-    a.ldrb_imm(9, 10, (layout.obj_from_cell + layout.obj_ic_plain) as u32);
-    a.cbz(9, false, miss);
+    a.ldrb_imm(9, 10, (layout.obj_from_cell + layout.obj_flags) as u32);
+    a.tbz(9, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
     a.ldr_imm(9, 10, (call_tag + 8) as u32); // the closure cell (a `UserFn`)
     a.ldr_imm(11, 9, layout.user_func as u32);
     a.add_imm(11, 11, layout.func_data_off as u32); // the closure's function identity
@@ -11195,10 +11212,9 @@ fn set_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
     get_prop_inlinable(layout)
         && layout.entry_writable < 256
         && layout.entry_accessor < 256
-        && layout.obj_extensible < 4096
+        && layout.obj_flags < 4096
         && layout.obj_proto.is_multiple_of(8)
         && layout.obj_proto / 8 < 4096
-        && layout.obj_props + layout.props_proto_flag < 4096
         && layout.props_elems.is_multiple_of(8)
         && layout.props_elems / 8 < 4096
         && fields_capacity_fits(layout)
@@ -11232,7 +11248,7 @@ fn emit_update_prop_inline(
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
 
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let slow = a.new_label();
     let done = a.new_label();
     // 1. stack: [obj @ -16] — receiver must be an Obj
@@ -11250,7 +11266,7 @@ fn emit_update_prop_inline(
     a.ldrb_imm(9, 11, ex);
     guard_exotic_ordinary(a, layout, 9, 9, slow);
     a.ldrb_imm(9, 11, plain);
-    a.cbz(9, false, slow);
+    a.tbz(9, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     a.ldr_w_imm(9, 11, sh);
     a.cmp_reg_w(9, 14);
     a.b_cond(C_NE, slow);
@@ -11330,7 +11346,7 @@ fn emit_update_elem_inline(
 ) {
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let slow = a.new_label();
     let done = a.new_label();
     a.mark_push("update-elem");
@@ -11352,7 +11368,7 @@ fn emit_update_elem_inline(
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, slow);
+    a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     let dec = matches!(
         kind,
         UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
@@ -11401,7 +11417,7 @@ fn emit_update_elem_inline(
 fn eq_inlinable(layout: &crate::value::JitLayout) -> bool {
     layout.valid
         && layout.obj_from_cell < 4096
-        && layout.obj_ic_plain < 4096
+        && layout.obj_flags < 4096
         && crate::lstr::LEN_OFF.is_multiple_of(4)
         && crate::lstr::LEN_OFF / 4 < 4096
 }
@@ -11531,8 +11547,8 @@ fn emit_local_eq_branch(
         emit_exec_word_load(a, 12, 22, lhs_off as i32);
         emit_exec_payload(a, 12, 12);
         a.add_imm(12, 12, layout.obj_from_cell as u32);
-        a.ldrb_imm(12, 12, layout.obj_ic_plain as u32);
-        a.cbz(12, false, slow);
+        a.ldrb_imm(12, 12, layout.obj_flags as u32);
+        a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
         a.b(unequal);
     }
 
@@ -11549,8 +11565,8 @@ fn emit_local_eq_branch(
         emit_exec_word_load(a, 12, 22, rhs_off as i32);
         emit_exec_payload(a, 12, 12);
         a.add_imm(12, 12, layout.obj_from_cell as u32);
-        a.ldrb_imm(12, 12, layout.obj_ic_plain as u32);
-        a.cbz(12, false, slow);
+        a.ldrb_imm(12, 12, layout.obj_flags as u32);
+        a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
         a.b(unequal);
     }
 
@@ -11605,8 +11621,7 @@ fn instanceof_inlinable(
         && layout.obj_proto.is_multiple_of(8)
         && layout.obj_proto / 8 < 4096
         && layout.obj_kind < 4096
-        && layout.obj_ic_plain < 4096
-        && layout.obj_is_constructor < 4096
+        && layout.obj_flags < 4096
         && sh.is_multiple_of(4)
         && sh / 4 < 4096
         && fields_data_fits(layout)
@@ -11670,10 +11685,9 @@ fn emit_instanceof_inline(
     a.add_imm(12, 11, layout.obj_from_cell as u32);
     a.ldrb_imm(9, 12, layout.obj_kind as u32);
     guard_exotic_none(a, 9, slow);
-    a.ldrb_imm(9, 12, layout.obj_ic_plain as u32);
-    a.cbz(9, false, slow);
-    a.ldrb_imm(9, 12, layout.obj_is_constructor as u32);
-    a.cbz(9, false, slow);
+    a.ldrb_imm(9, 12, layout.obj_flags as u32);
+    a.tbz(9, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
+    a.tbz(9, flag_bit(crate::value::FLAG_CONSTRUCTOR), slow);
     a.ldr_imm(14, 12, layout.obj_proto as u32);
     a.ldr_imm(15, 19, 72); // ctx.interp
     a.ldr_imm(15, 15, il.function_proto as u32);
@@ -11765,10 +11779,9 @@ fn emit_prop_create_probe(
     a.ldr_w_imm(14, 12, IC_OFF_RECV_SHAPE);
     a.cmp_reg_w(13, 14);
     a.b_cond(C_NE, miss);
-    a.ldrb_imm(9, 11, layout.obj_extensible as u32);
-    a.cbz(9, false, miss);
-    a.ldrb_imm(9, 11, (layout.obj_props + layout.props_proto_flag) as u32);
-    a.cbnz(9, false, miss);
+    a.ldrb_imm(9, 11, layout.obj_flags as u32);
+    a.tbz(9, flag_bit(crate::value::FLAG_EXTENSIBLE), miss);
+    a.tbnz(9, flag_bit(crate::value::FLAG_PROTO), miss);
     // A small map: no key index of its own, <=8 entries, and spare capacity.
     a.ldr_imm(9, 11, (layout.obj_props + layout.props_elems) as u32);
     a.cbnz(9, true, miss);
@@ -11925,7 +11938,7 @@ fn emit_set_prop_inline(
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
 
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let slow = a.new_label();
     let done = a.new_label();
     if keep {
@@ -11961,7 +11974,7 @@ fn emit_set_prop_inline(
     a.ldrb_imm(9, 11, ex);
     guard_exotic_ordinary(a, layout, 9, 9, slow);
     a.ldrb_imm(9, 11, plain);
-    a.cbz(9, false, slow);
+    a.tbz(9, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     // Creation IC: constructors repeatedly assign a named field to a fresh receiver whose map
     // lacks it (see `emit_prop_create_probe`). Its ways share the site's cells with ordinary
     // update ways; the single way loop below dispatches on each way's kind.
@@ -12228,8 +12241,8 @@ fn emit_eq_inline(
         a.b_cond(C_NE, la_drop);
         // nullish == Obj is only false for an ordinary object (ic_plain rules out IsHTMLDDA)
         a.add_imm(11, 13, layout.obj_from_cell as u32);
-        a.ldrb_imm(11, 11, layout.obj_ic_plain as u32);
-        a.cbz(11, false, slow);
+        a.ldrb_imm(11, 11, layout.obj_flags as u32);
+        a.tbz(11, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
         a.bind(la_drop);
         a.b(l_false);
         // b is nullish (a is not): false (a BigInt a is unequal like Bool/Num).
@@ -12242,8 +12255,8 @@ fn emit_eq_inline(
         a.cmp_imm_w(9, 8);
         a.b_cond(C_NE, lb_drop);
         a.add_imm(11, 12, layout.obj_from_cell as u32);
-        a.ldrb_imm(11, 11, layout.obj_ic_plain as u32);
-        a.cbz(11, false, slow);
+        a.ldrb_imm(11, 11, layout.obj_flags as u32);
+        a.tbz(11, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
         a.bind(lb_drop);
         a.b(l_false);
     }
@@ -12432,8 +12445,8 @@ fn emit_not_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, 
     a.b_cond(C_NE, os_drop);
     // an Obj is only reliably truthy when it is ordinary (ic_plain rules out IsHTMLDDA)
     a.add_imm(11, 12, layout.obj_from_cell as u32);
-    a.ldrb_imm(11, 11, layout.obj_ic_plain as u32);
-    a.cbz(11, false, slow);
+    a.ldrb_imm(11, 11, layout.obj_flags as u32);
+    a.tbz(11, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     a.bind(os_drop);
     a.movz(11, 0, 0);
     a.b(l_have);
@@ -14118,8 +14131,8 @@ fn emit_name_ic_value_ptr_in(
     a.ldr_imm(14, 19, 56); // the realm's global Object
     a.ldrb_imm(15, 14, g_ex);
     guard_exotic_none(a, 15, slow);
-    a.ldrb_imm(15, 14, layout.obj_ic_plain as u32); // not side-table masked
-    a.cbz(15, false, slow);
+    a.ldrb_imm(15, 14, layout.obj_flags as u32); // not side-table masked
+    a.tbz(15, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     a.ldr_w_imm(15, 14, g_sh); // live shape vs cached (packed high half)
     a.ldr_imm(16, 12, NAME_IC_OFF_BINDING);
     a.lsr_imm(17, 16, 32);
@@ -14458,7 +14471,7 @@ fn emit_get_elem_inline_marked(
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
 
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let slow = a.new_label();
     let done = a.new_label();
     let typed = a.new_label();
@@ -14483,7 +14496,7 @@ fn emit_get_elem_inline_marked(
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(13, 11, plain);
-    a.cbz(13, false, typed);
+    a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
     // 5. element words: a plain element's value in one indexed load, with no index string or
     // entry-table chase (x9's upper bits are zero from the w-form fcvtzu); a hole is absent and
     // consults the prototype chain.
@@ -14537,7 +14550,7 @@ fn emit_set_elem_inline_marked(
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
 
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let slow = a.new_label();
     let done = a.new_label();
     let typed = a.new_label();
@@ -14559,7 +14572,7 @@ fn emit_set_elem_inline_marked(
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(13, 11, plain);
-    a.cbz(13, false, typed);
+    a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
     // 5. element words: any value over an existing element, into a hole, or appended
     emit_word_store(a, layout, slow, done, true, keep);
     a.bind(typed);
@@ -14816,7 +14829,6 @@ fn emit_word_create(
         a.b(slow);
         return;
     }
-    let props = layout.obj_props as u32;
     let flags = -(layout.words_flags as i32);
     let number_kept = a.new_label();
     let not_number = a.new_label();
@@ -14830,14 +14842,17 @@ fn emit_word_create(
     a.ldrb_imm(12, 11, layout.obj_kind as u32);
     a.cmp_imm_w(12, layout.exotic_array_tag as u32);
     a.b_cond(C_NE, slow);
-    a.ldrb_imm(12, 11, layout.obj_extensible as u32);
-    a.cbz(12, false, slow);
-    a.ldrb_imm(12, 11, props + layout.props_proto_flag as u32);
-    a.cbnz(12, false, slow);
-    a.ldrb_imm(12, 11, props + layout.props_elem_mode as u32);
-    a.cbz(12, false, slow);
-    a.ldrb_imm(12, 11, props + layout.props_has_far as u32);
-    a.cbnz(12, false, slow);
+    {
+        use crate::value::{FLAG_ELEM_MODE, FLAG_EXTENSIBLE, FLAG_HAS_FAR, FLAG_PROTO};
+        a.ldrb_imm(12, 11, layout.obj_flags as u32);
+        guard_flags(
+            a,
+            12,
+            FLAG_EXTENSIBLE | FLAG_PROTO | FLAG_ELEM_MODE | FLAG_HAS_FAR,
+            FLAG_EXTENSIBLE | FLAG_ELEM_MODE,
+            slow,
+        );
+    }
     // 2. Its prototype is the active realm's %Array.prototype%, and the protector's proof is
     //    clean at the live epoch (a cached epoch is never u32::MAX, which no proof accepts).
     a.ldr_imm(12, 19, std::mem::offset_of!(JitCtx, interp) as u32);
@@ -14989,7 +15004,7 @@ fn emit_in_keyed(
     debug_assert!(stack_receiver == matches!(key, KeySrc::Stack));
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let slow = a.new_label();
     let done = a.new_label();
     // 1. The receiver must be an Object; the key must be a Number that is exactly a u32.
@@ -15033,7 +15048,7 @@ fn emit_in_keyed(
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, slow);
+    a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     // 4. element words: a word that is not a hole is a present own element.
     emit_word_read(a, layout, 11, 9, 13, slow);
     // --- commit: present own element means [[HasProperty]] is true, with no observable
@@ -15076,17 +15091,7 @@ fn emit_in_keyed(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn define_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
-    let props = layout.obj_props;
-    elem_inlinable(layout)
-        && [
-            layout.obj_extensible,
-            props + layout.props_proto_flag,
-            props + layout.props_elem_mode,
-            props + layout.props_has_far,
-        ]
-        .into_iter()
-        .all(|off| off < 4096)
-        && fields_data_fits(layout)
+    elem_inlinable(layout) && layout.obj_flags < 4096 && fields_data_fits(layout)
 }
 
 /// Inline CreateDataPropertyOrThrow(A, k, V) ([`crate::bytecode::AbstractOp`]; ECMA-262 §7.3.7)
@@ -15109,7 +15114,6 @@ fn emit_define_elem_inline(
     l_unwind: usize,
 ) {
     debug_assert!(define_elem_inlinable(layout));
-    let props = layout.obj_props as u32;
     let slow = a.new_label();
     let done = a.new_label();
     // 1. stack: [A @ -24, k @ -16, V @ -8]. A an Object; k a Number that is exactly a u32 (x9,
@@ -15137,17 +15141,22 @@ fn emit_define_elem_inline(
     a.ldrb_imm(12, 11, layout.obj_kind as u32);
     a.cmp_imm_w(12, layout.exotic_array_tag as u32);
     a.b_cond(C_NE, slow);
-    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
-    a.cbz(12, false, slow);
-    a.ldrb_imm(12, 11, layout.obj_extensible as u32);
-    a.cbz(12, false, slow);
-    // ... that is no marked prototype, keeps every index in element storage ...
-    a.ldrb_imm(12, 11, props + layout.props_proto_flag as u32);
-    a.cbnz(12, false, slow);
-    a.ldrb_imm(12, 11, props + layout.props_elem_mode as u32);
-    a.cbz(12, false, slow);
-    a.ldrb_imm(12, 11, props + layout.props_has_far as u32);
-    a.cbnz(12, false, slow);
+    // ... that is no marked prototype and keeps every index in element storage: the five flag
+    // bits in one compare ...
+    {
+        use crate::value::FLAG_PROTO;
+        use crate::value::{FLAG_ELEM_MODE, FLAG_EXTENSIBLE, FLAG_HAS_FAR, FLAG_IC_PLAIN};
+        a.ldrb_imm(12, 11, layout.obj_flags as u32);
+        guard_flags(
+            a,
+            12,
+            FLAG_IC_PLAIN | FLAG_EXTENSIBLE | FLAG_PROTO | FLAG_ELEM_MODE | FLAG_HAS_FAR,
+            FLAG_IC_PLAIN | FLAG_EXTENSIBLE | FLAG_ELEM_MODE,
+            slow,
+        );
+    }
+    a.ldrb_imm(12, 11, layout.obj_flags as u32);
+    a.tbnz(12, flag_bit(crate::value::FLAG_HAS_FAR), slow);
     // ... and has a writable `length` holding a Number (x14 = entry, d1 = L): its entry is slot
     // 0, a data property (an Array's first entry, never removed; V8's descriptor 0).
     fields_data(a, layout, 14, 11);
@@ -15335,7 +15344,7 @@ fn emit_elem_local_keyed(
     // Stack-keyed layout: Get → [key @ -16]; Set* → [key @ -32, v @ -16].
     let key_off = if get { -8 } else { -16 };
 
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let slow = a.new_label();
     let done = a.new_label();
     let typed = a.new_label();
@@ -15374,7 +15383,7 @@ fn emit_elem_local_keyed(
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(13, 11, plain);
-    a.cbz(13, false, typed);
+    a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
     // 5. element words: a read copies a plain element's value; a store writes any value over
     // an existing element, into a hole, or appended ([`emit_word_store`]).
     if get {
@@ -15465,7 +15474,7 @@ fn emit_local_own_dense_data_guard(
 ) {
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
 
     // In source order the key local is loaded before the receiver local. Merely probing
     // either canonical slot is non-observable; any TDZ value misses to the original PC,
@@ -15499,7 +15508,7 @@ fn emit_local_own_dense_data_guard(
     // exotic internal method. Array's indexed exotic behavior is already represented by
     // its live element words, while this flag rules out any other side-table behavior.
     a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, slow);
+    a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
 
     // An element word is a plain data element's value. Past the used words (every index, for
     // a map without words) or at a hole, the original operations: inherited values are
@@ -16316,7 +16325,7 @@ fn emit_chain_marked(
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
 
     let done = a.new_label();
     // Virtual stack: (d-register, known-int-valued). Int-valued means the f64 is integral and in
@@ -16391,7 +16400,7 @@ fn emit_chain_marked(
                 a.ldrb_imm(14, 11, ex);
                 guard_exotic_ordinary(a, layout, 14, 14, guard!());
                 a.ldrb_imm(14, 11, plain);
-                a.cbz(14, false, guard!());
+                a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), guard!());
                 a.ldr_w_imm(14, 11, sh);
                 a.mov_imm64(16, st.recv_shape as u64);
                 a.cmp_reg_w(14, 16);
@@ -16403,7 +16412,7 @@ fn emit_chain_marked(
                     a.ldrb_imm(14, 11, ex);
                     guard_exotic_ordinary(a, layout, 14, 14, guard!());
                     a.ldrb_imm(14, 11, plain);
-                    a.cbz(14, false, guard!());
+                    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), guard!());
                     a.ldr_w_imm(14, 11, sh);
                     let expected = if st.depth == 1 {
                         st.holder_shape
@@ -16421,7 +16430,7 @@ fn emit_chain_marked(
                     a.ldrb_imm(14, 11, ex);
                     guard_exotic_ordinary(a, layout, 14, 14, guard!());
                     a.ldrb_imm(14, 11, plain);
-                    a.cbz(14, false, guard!());
+                    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), guard!());
                     a.ldr_w_imm(14, 11, sh);
                     a.mov_imm64(16, st.holder_shape as u64);
                     a.cmp_reg_w(14, 16);
@@ -16460,7 +16469,7 @@ fn emit_chain_marked(
                 a.ldrb_imm(14, 11, ex);
                 guard_exotic_ordinary(a, layout, 14, 14, guard!());
                 a.ldrb_imm(14, 11, plain);
-                a.cbz(14, false, guard!());
+                a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), guard!());
                 a.ldr_w_imm(14, 11, sh);
                 a.mov_imm64(16, st.recv_shape as u64);
                 a.cmp_reg_w(14, 16);
@@ -16549,7 +16558,7 @@ fn emit_chain_marked(
                     Some(k) => {
                         a.mov(11, rcache[k].base);
                         a.ldrb_imm(12, 11, plain);
-                        a.cbz(12, false, typed);
+                        a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
                     }
                     None => {
                         // First access to this receiver in the chain: validate once.
@@ -16562,7 +16571,7 @@ fn emit_chain_marked(
                         // No side-table behavior; a typed array's view is read with its tag
                         // still in w12.
                         a.ldrb_imm(13, 11, plain);
-                        a.cbz(13, false, typed);
+                        a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
                         if let Some(base) = rfree.pop() {
                             a.mov(base, 11);
                             rcache.push(RcEnt { off: xoff, base });
@@ -18200,13 +18209,13 @@ fn emit_region_own_entry(
 ) {
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let shape = (layout.obj_props + layout.props_shape) as u32;
     a.add_imm(body_reg, rc_reg, obj_off);
     a.ldrb_imm(9, body_reg, ex);
     guard_exotic_ordinary(a, layout, 9, 9, fail);
     a.ldrb_imm(9, body_reg, plain);
-    a.cbz(9, false, fail);
+    a.tbz(9, flag_bit(crate::value::FLAG_IC_PLAIN), fail);
     a.ldr_w_imm(9, body_reg, shape);
     a.mov_imm64(16, state.recv_shape as u64);
     a.cmp_reg_w(9, 16);
@@ -18285,8 +18294,8 @@ fn emit_linked_scan_region(
         // the comparison in the baseline before committing `next = peek`.  Keep x0 unchanged
         // until after this guard so the materialized loop-head state remains exact.
         a.add_imm(14, 15, layout.obj_from_cell as u32);
-        a.ldrb_imm(9, 14, layout.obj_ic_plain as u32);
-        a.cbz(9, false, fail);
+        a.ldrb_imm(9, 14, layout.obj_flags as u32);
+        a.tbz(9, flag_bit(crate::value::FLAG_IC_PLAIN), fail);
     }
     a.mov(0, 15);
     a.movz(8, 1, 0);
@@ -18330,7 +18339,7 @@ fn emit_loop_chain(
 ) -> usize {
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
-    let plain = layout.obj_ic_plain as u32;
+    let plain = layout.obj_flags as u32;
     let words_off = (layout.obj_props + layout.props_words) as u32;
 
     let plain_h = a.new_label();
@@ -18467,7 +18476,7 @@ fn emit_loop_chain(
         a.ldrb_imm(12, r, ex);
         guard_exotic_ordinary_or_array(a, layout, 12, 13, pre_fail);
         a.ldrb_imm(12, r, plain);
-        a.cbz(12, false, pre_fail);
+        a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), pre_fail);
         if rp.words {
             // The element words must be in use, every one a Number with no hole, and (for
             // int-read receivers) an exact int32: element reads become bounds + one indexed
@@ -19853,8 +19862,8 @@ fn emit_peek_cond_inline(
     emit_exec_word_load(a, 12, 20, -8);
     emit_exec_payload(a, 12, 12);
     a.add_imm(11, 12, layout.obj_from_cell as u32);
-    a.ldrb_imm(11, 11, layout.obj_ic_plain as u32);
-    a.cbz(11, false, slow); // includes the engine's possible HTMLDDA object
+    a.ldrb_imm(11, 11, layout.obj_flags as u32);
+    a.tbz(11, flag_bit(crate::value::FLAG_IC_PLAIN), slow); // includes the engine's possible HTMLDDA object
     a.bind(l_true);
     a.movz(1, 1, 0);
     a.b(done);

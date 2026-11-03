@@ -120,7 +120,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
     let length = (family == 0)
         .then(|| p.length_property().and_then(Property::number_value))
         .flatten();
-    let far = p.has_far.get();
+    let far = p.has_far();
     let plain = !nonplain && !far;
     f.slots += slots;
     f.elements += elements;

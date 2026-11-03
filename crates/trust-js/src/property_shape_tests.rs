@@ -172,7 +172,7 @@ fn property_shapes_exhausted_array_length_hint_does_not_hide_named_properties() 
     let engine = Engine::new();
     engine.interp.activate_gc_heap();
     let mut props = Props::new();
-    props.elem_mode.set(true);
+    props.set_elem_mode(true);
     props.insert("length", Property::plain(Value::Num(12.0)));
     for index in 0..12 {
         // Keep the original classic-storage regression covered when the normal

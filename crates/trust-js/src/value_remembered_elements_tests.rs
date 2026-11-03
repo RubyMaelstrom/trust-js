@@ -231,7 +231,7 @@ fn precise_descriptor_replacement_still_invalidates_the_plain_element_proof() {
     assert!(properties.element_words().is_some());
     properties.insert("65", Property::accessor_prop(None, None, true, true));
     // The accessor leaves the words for the named entries, its word a hole.
-    assert!(properties.has_far.get() && properties.element_words().is_none());
+    assert!(properties.has_far() && properties.element_words().is_none());
     assert!(elements(&properties).get(65).is_none());
     assert!(properties.get("65").is_some_and(Element::accessor));
     assert!(properties.shift_dense_array(128, false).is_none());
@@ -470,7 +470,7 @@ fn remembered_slots_keep_string_bigint_symbol_closure_and_accessor_edges() {
         Property::accessor_prop(Some(getter), Some(setter), true, true),
     );
     // The accessor is a named entry, its word a hole: the entries are traced in full.
-    assert!(array.borrow().props.has_far.get());
+    assert!(array.borrow().props.has_far());
     assert!(elements(&array.borrow().props).get(65).is_none());
     let labels = [
         "string",
@@ -504,6 +504,10 @@ fn remembered_object_trace_preserves_every_non_element_edge_family() {
     let value = engine.interp.make_array(vec![Value::Null; 128]);
     let array = object(value);
     let owner = Rooted::new(value);
+    // An object holds one kind (W2d step 1): the iterator's edge is a second remembered array's.
+    let iterator_value = engine.interp.make_array(vec![Value::Null; 128]);
+    let iterator_array = object(iterator_value);
+    let iterator_owner = Rooted::new(iterator_value);
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Major);
@@ -539,14 +543,14 @@ fn remembered_object_trace_preserves_every_non_element_edge_family() {
             .insert("internal", Property::plain(values[2]));
         body.props
             .insert(key.as_str(), Property::plain(Value::Null));
-        body.kind =
-            ObjectKind::ArrayIterator(crate::gc_storage::PayloadBox::new(ArrayIteratorState {
-                target: values[3],
-                index: 0,
-                kind: 0,
-            }));
         body.kind = ObjectKind::bound(object(values[4]), values[5], vec![values[6]]);
     }
+    iterator_array.borrow_mut().kind =
+        ObjectKind::ArrayIterator(crate::gc_storage::PayloadBox::new(ArrayIteratorState {
+            target: values[3],
+            index: 0,
+            kind: 0,
+        }));
     let words: Vec<u64> = values.into_iter().chain([symbol]).map(witness).collect();
     let labels = [
         "prototype",
@@ -569,7 +573,7 @@ fn remembered_object_trace_preserves_every_non_element_edge_family() {
     assert_eq!(visits()[1] - before[1], 0);
     assert_labeled_live(&engine, &labeled, CellAge::Old);
     assert_symbol_pin_live(&symbol_pin, symbol_word);
-    drop(owner);
+    drop((owner, iterator_owner));
     assert_dead_then_drop_symbol_pin_and_reclaim(&mut engine, &labeled, symbol_pin, symbol_word);
 }
 
@@ -776,7 +780,7 @@ fn named_and_sparse_element_edges_remain_complete_outside_the_packed_blocks() {
     );
     props.mark_array();
     assert!(!props.elems.has_words());
-    assert!(props.has_far.get());
+    assert!(props.has_far());
     let array = Object::new_with_parts(None, props, ObjectKind::Array);
     let _owner = Rooted::new(Value::Obj(array));
     engine
@@ -800,7 +804,7 @@ fn named_and_sparse_element_edges_remain_complete_outside_the_packed_blocks() {
         .borrow_mut()
         .props
         .insert("4000000000", Property::plain(far));
-    assert!(array.borrow().props.has_far.get());
+    assert!(array.borrow().props.has_far());
     engine
         .interp
         .gc_collect_precise_for_test(CollectionKind::Minor);
@@ -848,11 +852,11 @@ fn native_append_guards(array: &Gc) -> NativeAppendGuards {
     let length_memo = body.props.len_slot.get().slot();
     let snapshot = NativeAppendGuards {
         array: matches!(body.kind, ObjectKind::Array),
-        plain: body.ic_plain.get(),
-        extensible: body.extensible,
-        prototype: body.props.proto_flag.get(),
-        element_mode: body.props.elem_mode.get(),
-        far: body.props.has_far.get(),
+        plain: body.ic_plain(),
+        extensible: body.extensible(),
+        prototype: body.props.proto_flag(),
+        element_mode: body.props.elem_mode(),
+        far: body.props.has_far(),
         length_memo,
         memo_is_length: length_memo.is_some_and(|slot| {
             body.props

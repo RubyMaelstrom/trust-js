@@ -6703,7 +6703,7 @@ fn ta_accessor_on_chain(start: &Gc, key: &str) -> Option<(TaAccessor, Gc)> {
     while let Some(object) = cur {
         let next = {
             let b = object.borrow();
-            if !b.ic_plain.get() || !b.kind.is_ordinary() {
+            if !b.ic_plain() || !b.kind.is_ordinary() {
                 return None;
             }
             if let Some(property) = b.props.get(key) {
@@ -6725,7 +6725,7 @@ fn ta_accessor_on_chain(start: &Gc, key: &str) -> Option<(TaAccessor, Gc)> {
 /// `buffer` are each the matching intrinsic %TypedArray.prototype% accessor.
 fn ta_accessor_holder_is_pristine(holder: &Gc) -> bool {
     let holder = holder.borrow();
-    holder.ic_plain.get()
+    holder.ic_plain()
         && holder.kind.is_ordinary()
         && [
             TaAccessor::Length,
@@ -8304,7 +8304,7 @@ impl Interp {
             let borrowed = object.borrow();
             let ordinary = borrowed.kind.is_ordinary()
                 && !borrowed.kind.is_callable()
-                && borrowed.extensible
+                && borrowed.extensible()
                 && self.ordinary_get_ptr(ptr);
             let has_index = borrowed
                 .props
@@ -8319,7 +8319,7 @@ impl Interp {
             }
         }
         self.gc_pin(&object);
-        object.borrow().ic_plain.set(false);
+        object.borrow().set_ic_plain(false);
         self.host_indexed.insert(
             &self.gc_heap,
             ptr,
@@ -8378,7 +8378,7 @@ impl Interp {
     /// as for a JS `class`.
     pub fn set_constructor_prototype(&self, ctor: &Value, proto: &Value) {
         if let Some(c) = ctor.as_obj() {
-            c.borrow_mut().is_constructor = true;
+            c.borrow_mut().set_constructor(true);
             c.borrow_mut()
                 .props
                 .insert("prototype", Property::data(*proto, false, false, false));
@@ -8839,7 +8839,7 @@ impl Interp {
             .insert(Gc::as_ptr(&dda) as usize, Gc::downgrade(&dda));
         // Every JIT object fast path assumes an ordinary object is truthy and not loosely equal to
         // null. Force this exotic through the checked helpers that implement Annex B.3.6.
-        dda.borrow().ic_plain.set(false);
+        dda.borrow().set_ic_plain(false);
         Value::Obj(dda)
     }
 
@@ -8897,7 +8897,7 @@ impl Interp {
         self.htmldda.insert(ptr, Gc::downgrade(&object));
         // Every JIT object fast path assumes an ordinary, truthy object without platform
         // internal methods. Route this one through the checked helpers.
-        object.borrow().ic_plain.set(false);
+        object.borrow().set_ic_plain(false);
         self.gc_pin(&object);
         self.host_indexed.insert(
             &self.gc_heap,
@@ -9551,7 +9551,7 @@ impl Interp {
                 },
                 self.realm_id,
             );
-            b.props = fn_map;
+            b.adopt_props(fn_map);
         }
         if has_prototype {
             let proto_parent = match (is_generator, is_async) {
@@ -9571,7 +9571,7 @@ impl Interp {
             );
         }
         if !is_arrow && !is_method && !is_async && !is_generator {
-            obj.borrow_mut().is_constructor = true;
+            obj.borrow_mut().set_constructor(true);
         }
         if let Some(self_env) = self_env {
             self_env.borrow_mut().vars.insert(
@@ -9822,7 +9822,7 @@ impl Interp {
     #[inline]
     pub(crate) fn plain_own_element_present(object: &Gc, index: u32) -> bool {
         let body = object.borrow();
-        body.ic_plain.get()
+        body.ic_plain()
             && (matches!(body.kind, ObjectKind::Array) || body.kind.is_ordinary())
             && body.props.get_index(index).is_some()
     }
@@ -9836,7 +9836,7 @@ impl Interp {
         }
         let mut b = o.borrow();
         // A set `ic_plain` byte proves no side-table internal methods (see `object_ic_plain`).
-        if !b.ic_plain.get() {
+        if !b.ic_plain() {
             drop(b);
             if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(o) as usize)) {
                 // ECMA-262 ToPropertyKey + TypedArrayGetElement (snapshot e28783d5fc9d): a
@@ -9874,7 +9874,7 @@ impl Interp {
         // identity check before probing the ordinary property storage so a future side-table
         // representation cannot accidentally bypass its trap or backing store. A set
         // `ic_plain` byte proves the object is in none of those tables.
-        if !o.borrow().ic_plain.get() {
+        if !o.borrow().ic_plain() {
             if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(o) as usize)).copied() {
                 // TypedArraySetElement converts the value before checking current bounds. Only
                 // a value already of the view's content type (a Number, or a BigInt for BigInt
@@ -9917,7 +9917,7 @@ impl Interp {
         // proof executes no JS, so all receiver validation and the eventual commit can safely
         // remain under this single borrow.
         if !matches!(b.kind, ObjectKind::Array)
-            || !b.extensible
+            || !b.extensible()
             || !matches!(b.proto.as_ref(), Some(p) if Gc::ptr_eq(p, &self.array_proto))
             || !self.array_prototypes_unshadowed()
         {
@@ -10244,7 +10244,7 @@ impl Interp {
                     | ObjectKind::NumWrap(_)
                     | ObjectKind::BoolWrap(_)
             ))
-            && b.ic_plain.get()
+            && b.ic_plain()
     }
 
     /// The `GetProp`/`GetMethod` inline-cache fast path; `None` means "take the slow path".
@@ -10367,7 +10367,7 @@ impl Interp {
                 // `length`/indices, never Array elements), mirrored in the fill.
                 if !((b.kind.is_ordinary()
                     || matches!(b.kind, ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_)))
-                    && b.ic_plain.get()
+                    && b.ic_plain()
                     && b.props.shape() == shape)
                 {
                     return None;
@@ -10415,7 +10415,7 @@ impl Interp {
                     rb.kind,
                     ObjectKind::StrWrap(_) | ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_)
                 ) && non_digit);
-            if recv_shape_ok && rb.ic_plain.get() && rb.props.shape() == st.recv_shape {
+            if recv_shape_ok && rb.ic_plain() && rb.props.shape() == st.recv_shape {
                 if depth == 0 {
                     let property = if keychk {
                         rb.props
@@ -10456,7 +10456,7 @@ impl Interp {
                                     | ObjectKind::NumWrap(_)
                                     | ObjectKind::BoolWrap(_)
                             ))
-                            && mb.ic_plain.get()
+                            && mb.ic_plain()
                             && mb.props.shape() == mid_shape)
                         {
                             return None;
@@ -10472,8 +10472,7 @@ impl Interp {
                                 | ObjectKind::BoolWrap(_)
                         ))
                         || (keychk && matches!(hb.kind, ObjectKind::Array));
-                    if holder_exotic_ok && hb.ic_plain.get() && hb.props.shape() == st.holder_shape
-                    {
+                    if holder_exotic_ok && hb.ic_plain() && hb.props.shape() == st.holder_shape {
                         let property = if keychk {
                             hb.props
                                 .entry_at(st.slot as usize)
@@ -10900,7 +10899,7 @@ impl Interp {
             return Err(lval); // the generic path raises the RangeError
         }
         let mut b = o.borrow_mut();
-        if !b.ic_plain.get() || !b.kind.is_ordinary() {
+        if !b.ic_plain() || !b.kind.is_ordinary() {
             return Err(lval);
         }
         let Some(p) = b.props.get(name) else {
@@ -10942,7 +10941,7 @@ impl Interp {
         if !b.kind.is_ordinary() {
             return IcSet::Miss;
         }
-        if !b.ic_plain.get() {
+        if !b.ic_plain() {
             return IcSet::Miss;
         }
         // Shape fast path (own writable data property), every way: a shape match means `slot`
@@ -10981,7 +10980,7 @@ impl Interp {
         // commonly initializes subclass instances that have the same empty shape but distinct
         // prototypes. Shape + epoch + prototype identity re-prove the fill-time chain walk, and
         // the recorded child shape makes the insert a plain append.
-        if b.extensible {
+        if b.extensible() {
             let shape = b.props.shape();
             let epoch = crate::value::proto_epoch();
             let proto_ptr = b.proto.as_ref().map_or(0, |p| Gc::as_ptr(p) as usize);
@@ -11117,14 +11116,14 @@ impl Interp {
             // SAFETY: every hop is kept alive by the receiver the caller holds, and nothing
             // mutates the chain during the probe.
             let mb = unsafe { (*hop).try_borrow().ok()? };
-            if !(mb.kind.is_ordinary() && mb.ic_plain.get() && mb.props.shape() == mid) {
+            if !(mb.kind.is_ordinary() && mb.ic_plain() && mb.props.shape() == mid) {
                 return None;
             }
             hop = Gc::as_ptr(mb.proto.as_ref()?);
         }
         // SAFETY: as above.
         let hb = unsafe { (*hop).try_borrow().ok()? };
-        if !(hb.kind.is_ordinary() && hb.ic_plain.get() && hb.props.shape() == st.holder_shape) {
+        if !(hb.kind.is_ordinary() && hb.ic_plain() && hb.props.shape() == st.holder_shape) {
             return None;
         }
         hb.props
@@ -11154,7 +11153,7 @@ impl Interp {
             // SAFETY: every object on the chain is kept alive by `o`, and nothing mutates the
             // chain during the walk.
             let b = unsafe { (*cur).try_borrow().ok()? };
-            if !(b.kind.is_ordinary() && b.ic_plain.get()) {
+            if !(b.kind.is_ordinary() && b.ic_plain()) {
                 return None;
             }
             if depth == 0 {
@@ -11207,7 +11206,7 @@ impl Interp {
         if key.starts_with_digit() {
             return false;
         }
-        if !b.extensible {
+        if !b.extensible() {
             return false;
         }
         let epoch = crate::value::proto_epoch();
@@ -11237,7 +11236,7 @@ impl Interp {
                     return false;
                 }
                 let hb = h.borrow();
-                if !(hb.kind.is_ordinary() && hb.ic_plain.get()) {
+                if !(hb.kind.is_ordinary() && hb.ic_plain()) {
                     return false;
                 }
                 if let Some(slot) = hb.props.slot_of_key(key) {
@@ -11305,7 +11304,7 @@ impl Interp {
         let cell = unsafe { &*(ptr as *const RefCell<crate::value::Object>) };
         // The shared reference ends before this returns, and a mutable borrow elsewhere makes
         // this conservatively report "not proven plain".
-        matches!(unsafe { cell.try_borrow_unguarded() }, Ok(object) if object.ic_plain.get())
+        matches!(unsafe { cell.try_borrow_unguarded() }, Ok(object) if object.ic_plain())
     }
 
     #[inline]
@@ -11376,7 +11375,7 @@ impl Interp {
         // Installing platform-object internal methods clears this one-way
         // ordinary-object proof. Avoid side-table/name probes for ordinary
         // receivers, including every hop of their common property paths.
-        if object.borrow().ic_plain.get() {
+        if object.borrow().ic_plain() {
             return Ok(None);
         }
         let Some(index) = crate::value::canonical_index(key) else {
@@ -11752,7 +11751,7 @@ impl Interp {
         index: f64,
         key: &str,
     ) -> Option<Result<Value, Abrupt>> {
-        if object.borrow().ic_plain.get() {
+        if object.borrow().ic_plain() {
             return None;
         }
         let (target, handler) = self.proxy_at(Gc::as_ptr(object) as usize)?;
@@ -12777,7 +12776,7 @@ impl Interp {
                     );
                 }
             } else {
-                if !obj.borrow().extensible {
+                if !obj.borrow().extensible() {
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.record(
                             crate::feedback::PropertyOutcome::Rejected,
@@ -12815,7 +12814,7 @@ impl Interp {
             return Ok(success);
         }
         // Adding a new index to a non-extensible (sealed/frozen) array is rejected.
-        if !obj.borrow().props.contains(key) && !obj.borrow().extensible {
+        if !obj.borrow().props.contains(key) && !obj.borrow().extensible() {
             if self.strict {
                 return Err(
                     self.throw("TypeError", "cannot add property, object is not extensible")
@@ -12968,7 +12967,7 @@ impl Interp {
         }
         let concrete = {
             let concrete = proto.borrow();
-            concrete.ic_plain.get()
+            concrete.ic_plain()
                 && concrete.kind.is_ordinary()
                 && concrete
                     .proto
@@ -13761,7 +13760,7 @@ impl Interp {
             return false;
         };
         let body = target.borrow();
-        body.ic_plain.get()
+        body.ic_plain()
             && (body.kind.is_ordinary() || matches!(body.kind, ObjectKind::Array))
             && body
                 .props
@@ -14164,7 +14163,7 @@ impl Interp {
             ObjectKind::User(user) => {
                 // A class constructor cannot be [[Call]]ed. (Empty-map guard: this runs on every
                 // single call, and most programs define no classes.)
-                if obj.borrow().class_kind != 0 {
+                if obj.borrow().class_kind() != 0 {
                     return Err(self.throw(
                         "TypeError",
                         "Class constructor cannot be invoked without 'new'",
@@ -15159,7 +15158,7 @@ impl Interp {
                     // The immutable [[Realm]] slot proves same-realm execution independently
                     // of user mutations to the function object's prototype chain.
                     ObjectKind::User(user)
-                        if object.ic_plain.get()
+                        if object.ic_plain()
                             && user.realm == Gc::as_ptr(&self.global) as usize
                             && !user.env.borrow().under_with() =>
                     {
@@ -15167,7 +15166,7 @@ impl Interp {
                     }
                     _ => return CachedCall::Miss,
                 };
-                let class_constructor = object.class_kind != 0;
+                let class_constructor = object.class_kind() != 0;
                 drop(object);
                 if class_constructor {
                     return CachedCall::Miss;
@@ -15444,7 +15443,7 @@ impl Interp {
         target
             .with_object(|object| {
                 let body = object.borrow();
-                body.ic_plain.get() && matches!(body.kind, ObjectKind::User(_))
+                body.ic_plain() && matches!(body.kind, ObjectKind::User(_))
             })
             .unwrap_or(false)
     }
@@ -15462,7 +15461,7 @@ impl Interp {
     ) -> Option<usize> {
         let object = list.as_obj()?;
         let body = object.borrow();
-        if !body.ic_plain.get() {
+        if !body.ic_plain() {
             return None;
         }
         let length = match body.kind {
@@ -15962,7 +15961,7 @@ impl Interp {
             let ObjectKind::User(user) = &callable.kind else {
                 return None;
             };
-            if user.func.is_arrow || user.env.borrow().under_with() || callable.class_kind != 0 {
+            if user.func.is_arrow || user.env.borrow().under_with() || callable.class_kind() != 0 {
                 None
             } else {
                 let same_realm = user.realm == Gc::as_ptr(&self.global) as usize;
@@ -16197,7 +16196,7 @@ impl Interp {
             // Proxy callability uses a native sentinel, not its target's body. Only the
             // actual callee's internal methods matter; unrelated proxies must not disable
             // ordinary native construction throughout the Agent.
-            if b.ic_plain.get() && (b.is_constructor || b.props.contains("prototype")) {
+            if b.ic_plain() && (b.is_constructor() || b.props.contains("prototype")) {
                 match &b.kind {
                     native if native.is_native() => Some(native.clone_callable()),
                     _ => None,
@@ -16512,13 +16511,13 @@ impl Interp {
         let object = o.borrow();
         let (func, env) = match &object.kind {
             ObjectKind::User(user)
-                if object.ic_plain.get() && user.realm == Gc::as_ptr(&self.global) as usize =>
+                if object.ic_plain() && user.realm == Gc::as_ptr(&self.global) as usize =>
             {
                 (user.func.clone(), user.env)
             }
             _ => return None,
         };
-        let class_kind = object.class_kind;
+        let class_kind = object.class_kind();
         drop(object);
         if func.is_arrow || func.is_method || func.is_generator || func.is_async {
             return None;
@@ -16656,7 +16655,7 @@ impl Interp {
         };
         let object = o.borrow();
         let (func, env, realm) = match &object.kind {
-            ObjectKind::User(user) if object.ic_plain.get() => {
+            ObjectKind::User(user) if object.ic_plain() => {
                 (user.func.clone(), user.env, user.realm)
             }
             _ => return None,
@@ -16676,7 +16675,7 @@ impl Interp {
         if realm != Gc::as_ptr(&self.global) as usize {
             return None;
         }
-        if o.borrow().class_kind != 0 {
+        if o.borrow().class_kind() != 0 {
             return None;
         }
         // Not yet tiered / didn't compile / no machine code → generic (which counts calls up).
@@ -16869,7 +16868,7 @@ impl Interp {
         // slot-based locals never aliased it faithfully anyway).
         let allow_compiled_body = !closure.borrow().under_with();
         let derived_class_construct =
-            is_construct && fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
+            is_construct && fn_obj.borrow().class_kind() == crate::value::CLASS_DERIVED;
         if !matches!(self.tier, crate::bytecode::Tier::Interp)
             && !func.is_generator
             && !func.is_async
@@ -16970,7 +16969,7 @@ impl Interp {
         let has_param_exprs = params_have_expr(&func.params);
         // Decision 21: the plan of every function that runs (`bytecode::scope_plan`), which also
         // gives its inner functions their outer contexts.
-        let derived = fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
+        let derived = fn_obj.borrow().class_kind() == crate::value::CLASS_DERIVED;
         let plan = func.scope_plan(derived);
         // Decision 21: a parameter list whose expressions leave its separate record unobservable
         // (`bytecode::parameter_expressions_safe`) runs in a record of its own, whose bindings then
@@ -17024,7 +17023,7 @@ impl Interp {
             // `super.x` resolves its receiver through it, and a constructor's non-object return
             // reads the *current* binding back out of the scope. Otherwise it exists only for
             // bodies that can name `this`.
-            let class_kind = fn_obj.borrow().class_kind;
+            let class_kind = fn_obj.borrow().class_kind();
             let is_class_fn = class_kind != 0;
             let derived_tdz = is_construct && class_kind == crate::value::CLASS_DERIVED;
             if scan & crate::ast::SCAN_THIS != 0 || func.is_method || is_class_fn || is_construct {
@@ -17074,7 +17073,7 @@ impl Interp {
             }
             // Methods and class constructors may reference `super.x` — including from a direct
             // eval in a nested arrow, which resolves this marker lexically long after the call.
-            if func.is_method || fn_obj.borrow().class_kind != 0 {
+            if func.is_method || fn_obj.borrow().class_kind() != 0 {
                 scope.borrow_mut().vars.insert(
                     crate::atom::names::SUPER_PROP_OK.atom(),
                     Binding::data(Value::Bool(true), false, true),
@@ -17243,7 +17242,7 @@ impl Interp {
         // and its `this` must have been initialized by super() (ReferenceError otherwise); both
         // errors are created in the caller's realm (the callee context has conceptually popped).
         if is_construct && !func.is_arrow {
-            let derived = fn_obj.borrow().class_kind == crate::value::CLASS_DERIVED;
+            let derived = fn_obj.borrow().class_kind() == crate::value::CLASS_DERIVED;
             if let Ok(v) = &result {
                 if !matches!((v).view(), ValueView::Obj(_)) {
                     if derived && !matches!((v).view(), ValueView::Undefined | ValueView::Empty) {
@@ -17858,7 +17857,8 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         // A native non-constructor (a method, global function, Math fn) has no own
         // `prototype` property; only real built-in constructors do. Reject `new` on the rest.
-        let constructable = obj.borrow().is_constructor || obj.borrow().props.contains("prototype");
+        let constructable =
+            obj.borrow().is_constructor() || obj.borrow().props.contains("prototype");
 
         if !constructable {
             return Err(self.throw("TypeError", "function is not a constructor"));
@@ -17937,7 +17937,7 @@ impl Interp {
                 // ECMA-262 §10.2.2 [[Construct]] step 3 allocates only for a base constructor. A
                 // derived constructor's `this` is bound by super(), whose base constructor reads
                 // new.target's `prototype` exactly once for the whole chain.
-                let class_kind = obj.borrow().class_kind;
+                let class_kind = obj.borrow().class_kind();
                 if class_kind == crate::value::CLASS_DERIVED {
                     if user.func.default_ctor {
                         return self.construct_default_derived(&obj, args, new_target);
@@ -18239,7 +18239,7 @@ impl Interp {
                 )));
             }
         }
-        let extensible = self.global.borrow().extensible;
+        let extensible = self.global.borrow().extensible();
         for &(name, is_func) in &new_vars {
             if self.global_env.borrow().vars.contains_key(name) {
                 return Err(Abrupt::Throw(self.make_error(

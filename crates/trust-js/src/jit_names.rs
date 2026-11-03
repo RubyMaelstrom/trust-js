@@ -154,8 +154,8 @@ fn emit_deep_name_target_ptr(
     a.cbz(14, true, slow);
     a.ldrb_imm(13, 14, layout.obj_kind as u32);
     guard_exotic_none(a, 13, slow);
-    a.ldrb_imm(13, 14, layout.obj_ic_plain as u32);
-    a.cbz(13, false, slow);
+    a.ldrb_imm(13, 14, layout.obj_flags as u32);
+    a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     a.ldr_w_imm(13, 14, (layout.obj_props + layout.props_shape) as u32);
     a.ldr_w_imm(15, 12, offset_of!(NativeNameDescriptor, shape) as u32);
     a.cmp_reg_w(13, 15);
@@ -250,8 +250,8 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.add_imm(9, 9, layout.obj_from_cell as u32);
     a.ldrb_imm(10, 9, layout.obj_kind as u32);
     guard_exotic_ordinary(a, layout, 10, 10, slow);
-    a.ldrb_imm(10, 9, layout.obj_ic_plain as u32);
-    a.cbz(10, false, slow);
+    a.ldrb_imm(10, 9, layout.obj_flags as u32);
+    a.tbz(10, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     a.ldr_w_imm(10, 8, offset_of!(R, shape) as u32);
     a.cbz(10, false, slow);
     a.cmn_imm_w(10, 1);

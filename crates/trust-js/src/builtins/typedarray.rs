@@ -942,7 +942,7 @@ fn typed_array_over(
     let obj = Object::new(i.extra_protos.get(kind.name()).cloned());
     let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    obj.borrow().ic_plain.set(false);
+    obj.borrow().set_ic_plain(false);
     let info = TaInfo {
         buffer: buf_ptr,
         offset: 0,
@@ -2026,7 +2026,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
     let obj = Object::new(proto);
     let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    obj.borrow().ic_plain.set(false);
+    obj.borrow().set_ic_plain(false);
     i.typed_arrays.insert(
         p,
         TaInfo {
@@ -2395,7 +2395,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
         }
         Ok(t)
     });
-    ta_ctor.borrow_mut().is_constructor = true;
+    ta_ctor.borrow_mut().set_constructor(true);
     ta_ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(ta_proto), false, false, false),

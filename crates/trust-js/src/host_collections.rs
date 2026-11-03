@@ -8,7 +8,7 @@ use crate::value::{Gc, Value};
 
 impl Interp {
     pub(crate) fn host_named_supported(&self, object: &Gc, key: &str) -> bool {
-        if object.borrow().ic_plain.get() || Self::is_sym_key(key) {
+        if object.borrow().ic_plain() || Self::is_sym_key(key) {
             return false;
         }
         self.host_indexed
@@ -26,7 +26,7 @@ impl Interp {
 
     pub(crate) fn host_named_visible(&mut self, object: &Gc, key: &str) -> Result<bool, Abrupt> {
         if self.host_indexed.is_empty()
-            || object.borrow().ic_plain.get()
+            || object.borrow().ic_plain()
             || Self::is_sym_key(key)
             || !self
                 .host_indexed
@@ -52,7 +52,7 @@ impl Interp {
         let mut prototype = object.borrow().proto;
         while let Some(current) = prototype {
             let current = current.borrow();
-            if !current.ic_plain.get() {
+            if !current.ic_plain() {
                 break;
             }
             if current.props.contains(key) {

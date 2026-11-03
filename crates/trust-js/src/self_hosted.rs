@@ -192,7 +192,7 @@ pub(crate) fn length_of_array_like(i: &mut Interp, object: &Value) -> Result<f64
     };
     {
         let body = target.borrow();
-        if body.ic_plain.get() && matches!(body.kind, ObjectKind::Array) {
+        if body.ic_plain() && matches!(body.kind, ObjectKind::Array) {
             if let Some(ValueView::Num(length)) =
                 (body.props.length_property().map(|p| p.value())).map(|__value| (__value).view())
             {

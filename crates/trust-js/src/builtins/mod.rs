@@ -566,7 +566,7 @@ pub(crate) fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Valu
         }
         return Ok(result);
     }
-    Ok(matches!(&(obj).view(), ValueView::Obj(o) if o.borrow().extensible))
+    Ok(matches!(&(obj).view(), ValueView::Obj(o) if o.borrow().extensible()))
 }
 
 /// `[[SetPrototypeOf]]`, proxy-aware. Returns whether the operation succeeded (Reflect-style).
@@ -622,7 +622,7 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
     {
         return Ok(false);
     }
-    if !o.borrow().extensible {
+    if !o.borrow().extensible() {
         return Ok(false);
     }
     // Cycle check: refuse if `o` already lies on the candidate prototype's chain (walking stops at
@@ -746,7 +746,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
             }
         }
         let mut b = o.borrow_mut();
-        b.extensible = false;
+        b.set_extensible(false);
         // Conservative Pilot C demote: shapes do not encode extensibility, and no
         // consumer may treat a pre-existing shape as a creation proof for this object.
         b.props.demote_shape();
@@ -898,7 +898,7 @@ pub(crate) fn has_own_property_trapped(
     };
     {
         let object = o.borrow();
-        if object.ic_plain.get() {
+        if object.ic_plain() {
             return Ok(object.props.contains(key));
         }
     }
@@ -939,9 +939,7 @@ pub(crate) fn object_get_own_property(
 ) -> Result<Option<Property>, Value> {
     {
         let body = o.borrow();
-        if body.ic_plain.get()
-            && (body.kind.is_ordinary() || matches!(body.kind, ObjectKind::Array))
-        {
+        if body.ic_plain() && (body.kind.is_ordinary() || matches!(body.kind, ObjectKind::Array)) {
             return Ok(body.props.get(key).map(crate::value::Element::to_property));
         }
     }
@@ -1413,7 +1411,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
         .filter(|object| i.ordinary_get_ptr(Gc::as_ptr(object) as usize))
     {
         let object = object.borrow();
-        if object.ic_plain.get()
+        if object.ic_plain()
             && object.kind.exotic_is_none()
             && !object.kind.is_callable()
             && object.props.named_data_keys().is_some()
@@ -1903,7 +1901,7 @@ pub(crate) fn reflect_define_on_receiver(
             Ok(true)
         }
         None => {
-            if !ro.borrow().extensible {
+            if !ro.borrow().extensible() {
                 return Ok(false);
             }
             ro.borrow_mut()
@@ -2193,7 +2191,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         let object = obj.as_obj().unwrap();
         let plain = {
             let body = object.borrow();
-            body.ic_plain.get()
+            body.ic_plain()
                 && (matches!(body.kind, crate::value::ObjectKind::Array) || body.kind.is_ordinary())
         };
         if plain {
@@ -3247,7 +3245,7 @@ fn is_constructor_value(v: &Value) -> bool {
                     && !user.func.is_generator
                     && !user.func.is_async
             }
-            _ => b.is_constructor || b.props.contains("prototype"),
+            _ => b.is_constructor() || b.props.contains("prototype"),
         }
     })
 }
@@ -3340,7 +3338,7 @@ pub(crate) fn array_species_create_length(
 fn array_species_is_intrinsic(i: &Interp, original: &Gc) -> bool {
     {
         let body = original.borrow();
-        if !body.ic_plain.get()
+        if !body.ic_plain()
             || !matches!(body.kind, ObjectKind::Array)
             || !body
                 .proto
@@ -3740,7 +3738,7 @@ fn inert_array_iter_step(i: &mut Interp, iterator: &Gc) -> Option<Option<Value>>
         };
         let array = target.borrow();
         // `ic_plain` excludes proxies and typed arrays.
-        if !array.ic_plain.get() || !matches!(array.kind, ObjectKind::Array) {
+        if !array.ic_plain() || !matches!(array.kind, ObjectKind::Array) {
             return None;
         }
         let index = state.index;
@@ -4307,7 +4305,7 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
         return false;
     }
     let source = source.borrow();
-    if !source.ic_plain.get() || !source.kind.exotic_is_none() {
+    if !source.ic_plain() || !source.kind.exotic_is_none() {
         return false;
     }
     let Some(keys) = source.props.named_data_keys() else {
@@ -4317,9 +4315,9 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
         return true;
     }
     let mut target = target.borrow_mut();
-    if !target.ic_plain.get()
+    if !target.ic_plain()
         || !target.kind.exotic_is_none()
-        || !target.extensible
+        || !target.extensible()
         || !target
             .props
             .named_data_keys()
@@ -4330,7 +4328,7 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
     let mut prototype = target.proto;
     while let Some(parent) = prototype {
         let parent = parent.borrow();
-        if !parent.ic_plain.get()
+        if !parent.ic_plain()
             || !parent.kind.exotic_is_none()
             || keys.iter().any(|&key| parent.props.contains_key(key))
         {
@@ -5239,7 +5237,7 @@ fn plain_descriptor_fields(o: &Gc) -> Option<[Option<Value>; 6]> {
     let mut current = Some(*o);
     while let Some(object) = current {
         let body = object.try_borrow().ok()?;
-        if !body.ic_plain.get() || !body.kind.exotic_is_none() {
+        if !body.ic_plain() || !body.kind.exotic_is_none() {
             return None;
         }
         for (field, name) in fields.iter_mut().zip(FIELDS) {
@@ -5543,7 +5541,7 @@ fn define_own_property_ordinary(
 
     let mut cur = match existing {
         None => {
-            if !o.borrow().extensible {
+            if !o.borrow().extensible() {
                 return Ok(false);
             }
             let prop = if d.is_accessor() {
@@ -6237,12 +6235,14 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
         // Set(O, len, E, true) creates an own element: a non-extensible array rejects it
         // (§10.1.6.3 ValidateAndApplyPropertyDescriptor) and the general path throws.
         let len = match b.props.length_property() {
-            Some(p) if b.extensible && !p.accessor() && p.writable() => match (p.value()).view() {
-                ValueView::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => {
-                    Some(n as u32)
+            Some(p) if b.extensible() && !p.accessor() && p.writable() => {
+                match (p.value()).view() {
+                    ValueView::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => {
+                        Some(n as u32)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
             _ => None,
         };
         if let Some(mut len) = len {
@@ -6339,7 +6339,7 @@ pub(crate) fn jit_array_push_one(i: &mut Interp, o: &Gc, value: Value) -> Result
 pub(crate) fn array_push_dense(i: &Interp, o: &Gc, value: Value) -> Result<u32, Value> {
     {
         let b = o.borrow();
-        if !matches!(b.kind, ObjectKind::Array) || !b.ic_plain.get() || !b.extensible {
+        if !matches!(b.kind, ObjectKind::Array) || !b.ic_plain() || !b.extensible() {
             return Err(value);
         }
     }
@@ -6404,7 +6404,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         if matches!(o.borrow().kind, ObjectKind::Array)
             && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
         {
-            let holes_read_absent = o.borrow().extensible && i.array_append_unshadowed(&o);
+            let holes_read_absent = o.borrow().extensible() && i.array_append_unshadowed(&o);
             if let Some(first) = o
                 .borrow_mut()
                 .props
@@ -6438,7 +6438,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             if len + n <= u64::from(u32::MAX)
                 && matches!(o.borrow().kind, ObjectKind::Array)
                 && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
-                && o.borrow().extensible
+                && o.borrow().extensible()
                 && i.array_append_unshadowed(&o)
                 && o.borrow_mut().props.unshift_dense_array(len as usize, args)
             {
@@ -6829,7 +6829,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             && i.array_append_unshadowed(&o)
             && {
                 let object = o.borrow();
-                object.extensible
+                object.extensible()
                     && object.props.iter().count() == 1
                     && object.props.indexed_properties().next().is_none()
                     && object.props.get("length").is_some_and(|length| {
@@ -7398,7 +7398,7 @@ fn edit_plain_elements(
     if len.saturating_add(growth) > u64::from(u32::MAX)
         || !matches!(object.borrow().kind, ObjectKind::Array)
         || !i.ordinary_get_ptr(Gc::as_ptr(object) as usize)
-        || (growth != 0 && (!object.borrow().extensible || !i.array_append_unshadowed(object)))
+        || (growth != 0 && (!object.borrow().extensible() || !i.array_append_unshadowed(object)))
     {
         return false;
     }
@@ -7419,7 +7419,7 @@ fn edit_plain_elements(
 fn search_length(i: &mut Interp, object: &Gc) -> Result<usize, Value> {
     {
         let body = object.borrow();
-        if matches!(body.kind, ObjectKind::Array) && body.ic_plain.get() {
+        if matches!(body.kind, ObjectKind::Array) && body.ic_plain() {
             if let Some(length) = ordinary_array_length(&body.props) {
                 return Ok(length);
             }
@@ -7522,7 +7522,7 @@ fn search_packed_elements(
     equality: ElementEquality,
 ) -> Option<Option<usize>> {
     let body = object.borrow();
-    if !matches!(body.kind, ObjectKind::Array) || !body.ic_plain.get() {
+    if !matches!(body.kind, ObjectKind::Array) || !body.ic_plain() {
         return None;
     }
     let packed = body.props.element_words()?;
@@ -7578,7 +7578,7 @@ fn search_packed_elements(
 /// properties (no hole, accessor or index past its length): reads without observable work.
 fn own_data_elements(object: &Gc, range: std::ops::Range<usize>) -> Option<Vec<Value>> {
     let body = object.borrow();
-    if !matches!(body.kind, ObjectKind::Array) || !body.ic_plain.get() {
+    if !matches!(body.kind, ObjectKind::Array) || !body.ic_plain() {
         return None;
     }
     if range.end > ordinary_array_length(&body.props)? {
@@ -8281,7 +8281,7 @@ fn install_iterator(it: &mut Interp) {
         };
         Ok(Value::Obj(Object::new(proto)))
     });
-    ctor.borrow_mut().is_constructor = true;
+    ctor.borrow_mut().set_constructor(true);
     Rc::make_mut(&mut it.extra_protos).insert("%IteratorCtorMarker%", ctor);
     it.def_method(&ctor, "from", 1, |i, _t, a| {
         let v = arg(a, 0);
@@ -9244,7 +9244,7 @@ fn try_define_plain_array_index(
         return Err(property);
     };
     let mut object = object.borrow_mut();
-    if !object.ic_plain.get() || !matches!(object.kind, ObjectKind::Array) || !object.extensible {
+    if !object.ic_plain() || !matches!(object.kind, ObjectKind::Array) || !object.extensible() {
         return Err(property);
     }
     let Some(length) = object.props.length_property().and_then(|length| {
@@ -9319,7 +9319,7 @@ pub(crate) fn cdp_or_throw(
         let fast = {
             let b = o.borrow();
             matches!(b.kind, ObjectKind::Array)
-                && b.extensible
+                && b.extensible()
                 && !b.props.contains(key)
                 && b.props.get("length").map(|p| p.writable()).unwrap_or(true)
         };

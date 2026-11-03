@@ -16625,7 +16625,7 @@ pub(crate) fn try_function_osr(
     let address = site as *const _ as usize;
     if function.is_async
         || function.is_generator
-        || (construct && callee.borrow().class_kind == crate::value::CLASS_DERIVED)
+        || (construct && callee.borrow().class_kind() == crate::value::CLASS_DERIVED)
         || live_env.borrow().under_with()
     {
         return Ok(None);
@@ -24316,7 +24316,7 @@ unsafe fn jit_reflect_apply_operand_only(
         let object = target_object.borrow();
         match &object.kind {
             crate::value::ObjectKind::Native(nf)
-                if object.ic_plain.get() && i.native_call_in_current_realm(target_object) =>
+                if object.ic_plain() && i.native_call_in_current_realm(target_object) =>
             {
                 *nf
             }
@@ -26259,13 +26259,13 @@ unsafe fn jit_call_inner(
                         // Callable proxies carry a Native sentinel. Never cache it as the
                         // implementation of [[Call]] or bypass apply/revocation checks.
                         crate::value::ObjectKind::Native(nf)
-                            if object.ic_plain.get() && i.native_call_in_current_realm(o) =>
+                            if object.ic_plain() && i.native_call_in_current_realm(o) =>
                         {
                             Some((*nf as usize, 0, Some(*nf)))
                         }
                         #[cfg(feature = "embed")]
                         crate::value::ObjectKind::ScopedNative(nf)
-                            if object.ic_plain.get() && i.native_call_in_current_realm(o) =>
+                            if object.ic_plain() && i.native_call_in_current_realm(o) =>
                         {
                             Some((*nf as usize, CALL_IC_SCOPED_NATIVE, None))
                         }
@@ -26904,7 +26904,7 @@ fn jit_method_operand_stat(obj: &Value, key: &Value) {
     let receiver = match &(obj).view() {
         ValueView::Obj(object) => {
             let object = object.borrow();
-            if !object.ic_plain.get() {
+            if !object.ic_plain() {
                 "exotic object"
             } else if object.kind.is_callable() {
                 "callable object"

@@ -500,7 +500,7 @@ impl Interp {
             chunk.clone()
         };
         if !self.ordinary_get_ptr(crate::value::Gc::as_ptr(&receiver) as usize)
-            || getter.borrow().class_kind != 0
+            || getter.borrow().class_kind() != 0
             || self.gc_tick.wrapping_add(1) & GC_CALL_POLL_MASK == 0
             || crate::value::heap_live_objects(&self.gc_heap) > self.gc_next
             || execution_stack_exhausted(self.depth + 1)
@@ -509,7 +509,7 @@ impl Interp {
         }
         let values = {
             let receiver = receiver.borrow();
-            if !receiver.ic_plain.get() || !receiver.kind.is_ordinary() {
+            if !receiver.ic_plain() || !receiver.kind.is_ordinary() {
                 return None;
             }
             chunk.record_getter_values(&receiver.props)?

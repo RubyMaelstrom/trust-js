@@ -280,7 +280,7 @@ pub(crate) fn make_service(
 ) -> (Gc, Gc) {
     let proto = Object::new(Some(it.object_proto));
     let ctor = it.make_native(name, len, ctor_fn);
-    ctor.borrow_mut().is_constructor = true;
+    ctor.borrow_mut().set_constructor(true);
     ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(proto), false, false, false),

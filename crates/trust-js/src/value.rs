@@ -1354,14 +1354,11 @@ pub struct JitLayout {
     pub(crate) repr: &'static JitRepr,
     pub obj_proto: usize,
     pub obj_props: usize,
-    pub obj_is_constructor: usize,
-    pub obj_extensible: usize,
+    /// The flag byte within `Object` (in its map, W2d step 1): [`FLAG_IC_PLAIN`],
+    /// [`FLAG_EXTENSIBLE`], [`FLAG_ELEM_MODE`], [`FLAG_PROTO`], [`FLAG_HAS_FAR`],
+    /// [`FLAG_CONSTRUCTOR`] and the class kind's two bits.
+    pub obj_flags: usize,
     pub props_shape: usize,
-    pub props_proto_flag: usize,
-    /// `Props::elem_mode` and `Props::has_far` (`Cell<bool>` bytes): an Array's map whose
-    /// canonical-index keys all live in element storage.
-    pub props_elem_mode: usize,
-    pub props_has_far: usize,
     /// The contiguous instance-field storage within `Props` (an `InlineVec` holding the first
     /// fields in the cell). Generated code reaches its elements, length and capacity only as
     /// `JitRepr::props_fields` describes.
@@ -1415,8 +1412,6 @@ pub struct JitLayout {
     pub exotic_numwrap_tag: u8,
     /// `ObjectKind::BoolWrap`'s discriminant byte (Boolean.prototype and Boolean wrappers).
     pub exotic_boolwrap_tag: u8,
-    /// `ic_plain` byte within `Object` (the per-receiver "not in an exotic side table" flag).
-    pub obj_ic_plain: usize,
     /// Fail-closed probe for ordinary numeric typed-array backing storage.
     pub native_typed_array: Option<crate::native_typed_array::Layout>,
     /// Scope offsets are relative to [`Env::as_ptr`] (the `RefCell<Scope>`), what generated code
@@ -1841,18 +1836,13 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         obj_from_cell,
         repr,
         obj_proto: offset_of!(Object, proto),
-        obj_ic_plain: offset_of!(Object, ic_plain),
         // The view is the kind's payload word, read once the tag says TypedArray.
         native_typed_array: crate::native_typed_array::probe_layout(
             offset_of!(Object, kind) + std::mem::size_of::<usize>(),
         ),
         obj_props: offset_of!(Object, props),
-        obj_is_constructor: offset_of!(Object, is_constructor),
-        obj_extensible: offset_of!(Object, extensible),
+        obj_flags: offset_of!(Object, props) + offset_of!(Props, flags),
         props_shape: offset_of!(Props, shape),
-        props_proto_flag: offset_of!(Props, proto_flag),
-        props_elem_mode: offset_of!(Props, elem_mode),
-        props_has_far: offset_of!(Props, has_far),
         props_entries: offset_of!(Props, entries) + offset_of!(NamedEntries, fields),
         props_layout: offset_of!(Props, entries) + offset_of!(NamedEntries, layout),
         layout_keys_len,
@@ -2572,26 +2562,53 @@ const _: () = {
 pub(crate) struct Object {
     pub(crate) proto: Option<Gc>,
     pub(crate) props: Props,
-    pub(crate) extensible: bool,
     /// What the object is beyond its properties: plain, a typed array's view, a callable, a
-    /// collection or an exotic built-in kind ([`ObjectKind`]).
+    /// collection or an exotic built-in kind ([`ObjectKind`]). Its flags ([[Extensible]],
+    /// `ic_plain`, IsConstructor and the class kind) are bits of its map's flag byte
+    /// ([`FLAG_IC_PLAIN`] and the rest), read and written through the methods below.
     pub(crate) kind: ObjectKind,
-    /// `false` for objects whose behavior lives in an interpreter side table — proxies, typed
-    /// arrays, module namespaces — which the kind can't reveal. The JIT's inline
-    /// property/element caches check this byte on the receiver and take the checked helper when
-    /// clear, so ONE proxy existing somewhere no longer disables the caches for every plain
-    /// object in the program (the old global `inline_ic_safe` latch).
-    pub(crate) ic_plain: Cell<bool>,
-    /// IsConstructor, recorded when the object gets its [[Call]]: set for user functions other
-    /// than arrows, methods, generators and async functions, for natives marked as constructors,
-    /// and for bound functions and callable proxies whose target was one. A native with an own
-    /// data `prototype` is a constructor too (`Interp::value_is_constructor`).
-    pub(crate) is_constructor: bool,
+}
+
+impl Object {
+    /// [[Extensible]] ([`FLAG_EXTENSIBLE`]).
+    #[inline]
+    pub(crate) fn extensible(&self) -> bool {
+        self.props.flag(FLAG_EXTENSIBLE)
+    }
+    #[inline]
+    pub(crate) fn set_extensible(&self, extensible: bool) {
+        self.props.set_flag(FLAG_EXTENSIBLE, extensible);
+    }
+    /// No side-table behavior ([`FLAG_IC_PLAIN`]).
+    #[inline]
+    pub(crate) fn ic_plain(&self) -> bool {
+        self.props.flag(FLAG_IC_PLAIN)
+    }
+    #[inline]
+    pub(crate) fn set_ic_plain(&self, plain: bool) {
+        self.props.set_flag(FLAG_IC_PLAIN, plain);
+    }
+    /// IsConstructor ([`FLAG_CONSTRUCTOR`]).
+    #[inline]
+    pub(crate) fn is_constructor(&self) -> bool {
+        self.props.flag(FLAG_CONSTRUCTOR)
+    }
+    #[inline]
+    pub(crate) fn set_constructor(&self, constructor: bool) {
+        self.props.set_flag(FLAG_CONSTRUCTOR, constructor);
+    }
     /// A class constructor's kind ([`CLASS_BASE`] or [`CLASS_DERIVED`]; 0 for every other
-    /// object), set as the class is defined: calls refuse a class constructor, and construction
-    /// treats a derived class's specially, by this byte rather than a probe of the class side
-    /// table (`Interp::class_info`), which keeps the class's elements.
-    pub(crate) class_kind: u8,
+    /// object, see [`FLAG_CLASS_SHIFT`]).
+    #[inline]
+    pub(crate) fn class_kind(&self) -> u8 {
+        (self.props.flags.get() & FLAG_CLASS_MASK) >> FLAG_CLASS_SHIFT
+    }
+    #[inline]
+    pub(crate) fn set_class_kind(&self, kind: u8) {
+        debug_assert!(kind <= CLASS_DERIVED);
+        let flags = self.props.flags.get() & !FLAG_CLASS_MASK;
+        self.props.flags.set(flags | (kind << FLAG_CLASS_SHIFT));
+    }
 }
 
 /// [`Object::class_kind`] of a base class's constructor.
@@ -2631,12 +2648,14 @@ impl Object {
     /// Replace only the receiver's ordinary property payload. Engine state belongs to this
     /// receiver, even when an Array.fill fast path materializes fresh dense storage around it.
     pub(crate) fn replace_properties(&mut self, mut properties: Props) {
-        // `proto_flag` is a property of the OBJECT's history (it served as a live
-        // prototype), not of either property map: a whole-map swap must not clear it,
-        // or later structural changes would stop bumping the creation-IC epoch.
-        properties
-            .proto_flag
-            .set(self.props.proto_flag.get() || properties.proto_flag.get());
+        // The object's flag bits stay with it: its extensibility, `ic_plain`, constructor and
+        // class bits, and `proto_flag`, a property of the OBJECT's history (it served as a live
+        // prototype), not of either property map: a whole-map swap must not clear it, or later
+        // structural changes would stop bumping the creation-IC epoch.
+        let proto = (self.props.flags.get() | properties.flags.get()) & FLAG_PROTO;
+        properties.flags.set(
+            properties.flags.get() & !OBJECT_FLAGS | self.props.flags.get() & OBJECT_FLAGS | proto,
+        );
         let slots = self.take_internal_slots();
         if let Some(extras) = properties.elems.1.as_deref_mut() {
             extras.internal_slots = slots;
@@ -2646,6 +2665,16 @@ impl Object {
         // The words' remembered record described their old owner's marks.
         properties.elems.2.force_full();
         self.props = properties;
+    }
+
+    /// Install a map built for this object (a function template's copy) in one move. The
+    /// object's flag bits stay its own (see [`OBJECT_FLAGS`]); the map's own bits come with it.
+    #[inline]
+    pub(crate) fn adopt_props(&mut self, props: Props) {
+        let object_bits = self.props.flags.get() & OBJECT_FLAGS;
+        self.props = props;
+        let map_bits = self.props.flags.get() & !OBJECT_FLAGS;
+        self.props.flags.set(map_bits | object_bits);
     }
 
     // Objects exist only behind their collected handle; `Gc` is that handle.
@@ -2674,6 +2703,10 @@ impl Object {
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, kind: ObjectKind) -> Gc {
         // Moving a property payload to a new receiver cannot inherit the old owner's proof.
         props.elems.2.force_full();
+        // Nor its flags: a new object is extensible and ordinary, with the map's own bits.
+        props
+            .flags
+            .set(props.flags.get() & !OBJECT_FLAGS | OBJECT_FLAGS_INITIAL);
         #[cfg(feature = "architecture-diagnostics")]
         let caller = std::panic::Location::caller();
         with_active_gc_heap(|heap| {
@@ -2686,18 +2719,7 @@ impl Object {
                 "object prototype belongs to another Agent heap (I6)"
             );
             heap.allocated.set(heap.allocated.get().wrapping_add(1));
-            let obj = Gc::new_in(
-                heap,
-                RefCell::new(Object {
-                    proto,
-                    props,
-                    extensible: true,
-                    kind,
-                    ic_plain: Cell::new(true),
-                    is_constructor: false,
-                    class_kind: 0,
-                }),
-            );
+            let obj = Gc::new_in(heap, RefCell::new(Object { proto, props, kind }));
             #[cfg(feature = "architecture-diagnostics")]
             {
                 let object = obj.borrow();
@@ -3688,15 +3710,7 @@ impl Object {
         purpose: Option<crate::gc_core::TracePurpose>,
     ) {
         use crate::gc_trace::GcTrace;
-        let Object {
-            proto,
-            props,
-            extensible: _,
-            kind,
-            ic_plain: _,
-            is_constructor: _,
-            class_kind: _,
-        } = self;
+        let Object { proto, props, kind } = self;
         if let Some(proto) = proto {
             sink.object(proto);
         }
@@ -3990,7 +4004,7 @@ pub(crate) mod layout_census {
             0
         } else if matches!(object.kind, ObjectKind::Array) {
             1
-        } else if !object.kind.exotic_is_none() || !object.ic_plain.get() {
+        } else if !object.kind.exotic_is_none() || !object.ic_plain() {
             2
         } else {
             3
@@ -6563,16 +6577,62 @@ impl NamedEntries {
     }
 }
 
+/// The flag byte of an object and its property map ([`Props::flags`], W2d step 1). The object's
+/// bits live in its map's byte, which a whole-map replacement keeps ([`Object::replace_properties`]);
+/// the order puts the five that the array-append guard tests in the low bits, so one mask and
+/// compare tests them all.
+///
+/// `false` for objects whose behavior lives in an interpreter side table — proxies, typed
+/// arrays, module namespaces — which the kind can't reveal. The JIT's inline property/element
+/// caches test this bit on the receiver and take the checked helper when it is clear, so ONE
+/// proxy existing somewhere does not disable the caches for every plain object in the program
+/// (the old global `inline_ic_safe` latch).
+pub(crate) const FLAG_IC_PLAIN: u8 = 1 << 0;
+/// [[Extensible]].
+pub(crate) const FLAG_EXTENSIBLE: u8 = 1 << 1;
+/// The map belongs to an `ObjectKind::Array` object: canonical-index key inserts skip the
+/// shape transition. Array shapes encode the *named*-key sequence only (matching `push_dense`,
+/// which never transitioned) — the get-IC only ever uses an array's shape to prove a named key's
+/// ABSENCE or with a per-hit key re-check, never for bare slot trust, so elements must not churn
+/// it: a stable shape is what lets `arr.push(..)`/`arr.length` sites cache at all.
+pub(crate) const FLAG_ELEM_MODE: u8 = 1 << 2;
+/// This object serves (or once served) as some object's prototype: structural changes to it bump
+/// the global [`proto_epoch`], invalidating every property-*creation* inline cache (their
+/// fill-time chain walks proved "no hop shadows this name" — see [`crate::bytecode::IC_CREATE`]).
+/// Set by the creation-IC fill walk itself, one-way; a property of the object's history, so a
+/// whole-map replacement keeps it.
+pub(crate) const FLAG_PROTO: u8 = 1 << 3;
+/// Some canonical-index key lives in the named entries (SpiderMonkey's `Indexed`): a non-plain
+/// element, one past the sparse frontier, or a frozen object's (see `note_inserted`). While it is
+/// clear, an index that is not a word is absent with no lookup; while it is set, the words'
+/// append/pop fast paths stand down. Truncation rebuilds it; deleting a named index can clear it
+/// after a bounded scan of the remaining entries.
+pub(crate) const FLAG_HAS_FAR: u8 = 1 << 4;
+/// IsConstructor, recorded when the object gets its [[Call]]: set for user functions other than
+/// arrows, methods, generators and async functions, for natives marked as constructors, and for
+/// bound functions and callable proxies whose target was one. A native with an own data
+/// `prototype` is a constructor too (`Interp::value_is_constructor`).
+pub(crate) const FLAG_CONSTRUCTOR: u8 = 1 << 5;
+/// A class constructor's kind, two bits ([`CLASS_BASE`] or [`CLASS_DERIVED`]; 0 for every other
+/// object), set as the class is defined: calls refuse a class constructor, and construction
+/// treats a derived class's specially, by these bits rather than a probe of the class side table
+/// (`Interp::class_info`), which keeps the class's elements.
+pub(crate) const FLAG_CLASS_SHIFT: u32 = 6;
+const FLAG_CLASS_MASK: u8 = 0b11 << FLAG_CLASS_SHIFT;
+/// The object's bits, which stay with the object when its map is replaced.
+const OBJECT_FLAGS: u8 =
+    FLAG_IC_PLAIN | FLAG_EXTENSIBLE | FLAG_PROTO | FLAG_CONSTRUCTOR | FLAG_CLASS_MASK;
+/// A new object's: extensible and ordinary (`ic_plain`).
+const OBJECT_FLAGS_INITIAL: u8 = FLAG_IC_PLAIN | FLAG_EXTENSIBLE;
+
 /// Insertion-ordered string-keyed property map. A `Vec` of entries preserves order (good enough for
 /// `for-in`/`Object.keys`); a side `HashMap` keeps lookup O(1).
 #[derive(Clone)]
 pub struct Props {
     entries: NamedEntries,
-    /// This object serves (or once served) as some object's prototype: structural changes to it
-    /// bump the global [`proto_epoch`], invalidating every property-*creation* inline cache
-    /// (their fill-time chain walks proved "no hop shadows this name" — see
-    /// [`crate::bytecode::IC_CREATE`]). Set by the creation-IC fill walk itself, one-way.
-    proto_flag: std::cell::Cell<bool>,
+    /// The object's and the map's flag bits ([`FLAG_IC_PLAIN`] and the rest), one byte that
+    /// generated code tests a bit of (W2d step 1).
+    flags: Cell<u8>,
     /// Object shape (hidden class): the id encoding this map's ordered (key, descriptor
     /// class) sequence (see [`ShapeTable`]). A shared cacheable id proves the same keys in
     /// the same order, so an inline cache that recorded (shape, slot) from one object can
@@ -6585,19 +6645,6 @@ pub struct Props {
     /// element words (W2c): every map's plain data elements, as V8, SpiderMonkey and JSC give
     /// every object element storage. Ordinary small named-property objects allocate none of it.
     elems: DenseStorage,
-    /// Some canonical-index key lives in the named entries (SpiderMonkey's `Indexed`): a
-    /// non-plain element, one past the sparse frontier, or a frozen object's (see
-    /// `note_inserted`). While it is clear, an index that is not a word is absent with no lookup;
-    /// while it is set, the words' append/pop fast paths stand down. Truncation rebuilds it;
-    /// deleting a named index can clear it after a bounded scan of the remaining entries.
-    has_far: std::cell::Cell<bool>,
-    /// This `Props` belongs to an `ObjectKind::Array` object: canonical-index key inserts skip the
-    /// shape transition. Array shapes encode the *named*-key sequence only (matching
-    /// `push_dense`, which never transitioned) — the get-IC only ever uses an array's shape to
-    /// prove a named key's ABSENCE or with a per-hit key re-check, never for bare slot trust,
-    /// so elements must not churn it: a stable shape is what lets `arr.push(..)`/`arr.length`
-    /// sites cache at all.
-    elem_mode: std::cell::Cell<bool>,
     /// The `entries` slot of the `"prototype"` key, or `NO_SLOT` — same memo discipline as
     /// `len_slot`. Every `new` reads the constructor's `.prototype`; function objects are
     /// ordinary maps, so this skips the scan on the construct hot path.
@@ -7238,8 +7285,8 @@ impl Props {
     /// [[OwnPropertyKeys]] order and every Get observes an own data value without author code.
     pub(crate) fn named_data_keys(&self) -> Option<&[PropKey]> {
         if self.elems.has_words()
-            || self.elem_mode.get()
-            || self.has_far.get()
+            || self.elem_mode()
+            || self.has_far()
             || self.entries.iter().any(|(key, property)| {
                 !property.enumerable() || property.accessor() || key.is_symbol()
             })
@@ -7261,7 +7308,7 @@ impl Props {
         }
         if self.entries.is_empty()
             && self.elems.0.is_none()
-            && !self.elem_mode.get()
+            && !self.elem_mode()
             && source
                 .entries
                 .fields
@@ -7340,12 +7387,45 @@ impl Props {
             entries,
             shape: SHAPE_EMPTY,
             elems: DenseStorage::default(),
-            proto_flag: std::cell::Cell::new(false),
-            has_far: std::cell::Cell::new(false),
-            elem_mode: std::cell::Cell::new(false),
+            flags: Cell::new(OBJECT_FLAGS_INITIAL),
             proto_slot: std::cell::Cell::new(SlotMemo::NONE),
             len_slot: std::cell::Cell::new(SlotMemo::NONE),
         }
+    }
+
+    /// Whether `bit` of the flag byte is set.
+    #[inline]
+    fn flag(&self, bit: u8) -> bool {
+        self.flags.get() & bit != 0
+    }
+    #[inline]
+    fn set_flag(&self, bit: u8, on: bool) {
+        let flags = self.flags.get();
+        self.flags.set(if on { flags | bit } else { flags & !bit });
+    }
+    #[inline]
+    fn proto_flag(&self) -> bool {
+        self.flag(FLAG_PROTO)
+    }
+    #[inline]
+    fn set_proto_flag(&self, on: bool) {
+        self.set_flag(FLAG_PROTO, on);
+    }
+    #[inline]
+    fn has_far(&self) -> bool {
+        self.flag(FLAG_HAS_FAR)
+    }
+    #[inline]
+    fn set_has_far(&self, on: bool) {
+        self.set_flag(FLAG_HAS_FAR, on);
+    }
+    #[inline]
+    fn elem_mode(&self) -> bool {
+        self.flag(FLAG_ELEM_MODE)
+    }
+    #[inline]
+    fn set_elem_mode(&self, on: bool) {
+        self.set_flag(FLAG_ELEM_MODE, on);
     }
 
     /// Construct a dense array by copying canonical words from a JIT argument window.
@@ -7424,9 +7504,7 @@ impl Props {
             shape,
             // An empty array keeps the static empty block until its first element.
             elems: DenseStorage(None, None, words),
-            proto_flag: Cell::new(false),
-            has_far: Cell::new(false),
-            elem_mode: Cell::new(true),
+            flags: Cell::new(OBJECT_FLAGS_INITIAL | FLAG_ELEM_MODE),
             proto_slot: Cell::new(SlotMemo::NONE),
             len_slot: Cell::new(SlotMemo::of(0)),
         }
@@ -7458,11 +7536,12 @@ impl Props {
         };
         Props {
             entries,
-            proto_flag: std::cell::Cell::new(false),
+            // The template's map bits; a new object's own.
+            flags: Cell::new(
+                self.flags.get() & (FLAG_HAS_FAR | FLAG_ELEM_MODE) | OBJECT_FLAGS_INITIAL,
+            ),
             shape: self.shape,
             elems: self.elems.clone(),
-            has_far: std::cell::Cell::new(self.has_far.get()),
-            elem_mode: std::cell::Cell::new(self.elem_mode.get()),
             proto_slot: std::cell::Cell::new(self.proto_slot.get()),
             len_slot: std::cell::Cell::new(self.len_slot.get()),
         }
@@ -7484,7 +7563,7 @@ impl Props {
     ) -> Props {
         assert_eq!(named.len() + 1, self.entries.len(), "array-template arity");
         debug_assert!(
-            self.elem_mode.get()
+            self.elem_mode()
                 && !self.elems.has_words()
                 && self
                     .entries
@@ -7585,7 +7664,7 @@ impl Props {
     /// element storage, as in V8, SpiderMonkey and JSC): no words yet, no index key in the
     /// named entries (its element would be stored twice), and admitted by the sparse limit.
     fn can_start_packed_elements(&self, index: usize) -> bool {
-        !self.has_far.get() && !self.elems.has_words() && self.words_admit(index)
+        !self.has_far() && !self.elems.has_words() && self.words_admit(index)
     }
 
     /// Whether element `index`, which the words do not hold, may join them, holes before it
@@ -7617,7 +7696,7 @@ impl Props {
     /// only: V8 never converts an arguments object, and an ordinary object's index keys are
     /// part of its shape.
     fn maybe_densify(&mut self) {
-        if !self.elem_mode.get() || !self.has_far.get() || !self.entries.len().is_power_of_two() {
+        if !self.elem_mode() || !self.has_far() || !self.entries.len().is_power_of_two() {
             return;
         }
         let mut count = 0usize;
@@ -7655,7 +7734,7 @@ impl Props {
         if self.entries.len() > INDEX_THRESHOLD {
             self.build_index();
         }
-        self.has_far.set(false);
+        self.set_has_far(false);
         let _ = self.length_property();
     }
 
@@ -7675,7 +7754,7 @@ impl Props {
     /// becomes `ObjectKind::Array`.
     #[inline]
     pub(crate) fn mark_array(&self) {
-        self.elem_mode.set(true);
+        self.set_elem_mode(true);
     }
 
     /// The `"length"` property, resolved through the `len_slot` memo (one compare, no hashing).
@@ -7684,17 +7763,14 @@ impl Props {
         let length = crate::atom::names::LENGTH.key();
         if let Some(s) = self.len_slot.get().slot() {
             debug_assert!(matches!(self.entries.get(s), Some((k, _)) if k == length));
-            debug_assert!(
-                !self.elem_mode.get() || s == 0,
-                "an Array's length is slot 0"
-            );
+            debug_assert!(!self.elem_mode() || s == 0, "an Array's length is slot 0");
             return self.entries.fields.get(s);
         }
         let slot = self.find(length)?;
         // Generated code reads an Array's `length` at slot 0 (W2c step 7b, V8's descriptor 0):
         // ArrayCreate defines it first, and as a non-configurable property it is never removed.
         debug_assert!(
-            !self.elem_mode.get() || slot == 0,
+            !self.elem_mode() || slot == 0,
             "an Array's length is slot 0"
         );
         self.len_slot.set(SlotMemo::of(slot));
@@ -7719,14 +7795,14 @@ impl Props {
     /// Mark this object as a live prototype (see `proto_flag`).
     #[inline]
     pub(crate) fn mark_proto(&self) {
-        self.proto_flag.set(true);
+        self.set_proto_flag(true);
     }
 
     /// Bump the creation-IC epoch if this object is a marked prototype (called by every
     /// structural mutation).
     #[inline]
     fn note_structural(&self) {
-        if self.proto_flag.get() {
+        if self.proto_flag() {
             bump_proto_epoch();
         }
     }
@@ -7755,7 +7831,7 @@ impl Props {
     /// identity exhaustion and avoids retaining any source object or prototype chain.
     /// Empty prefixes need no layout pin; predictions do not create observable properties.
     pub(crate) fn enumeration_layout(&self) -> Option<(Option<&PropertyLayout>, u8, u64)> {
-        if self.elem_mode.get() || self.elems.has_words() || self.entries.len() > 64 {
+        if self.elem_mode() || self.elems.has_words() || self.entries.len() > 64 {
             return None;
         }
         let layout = if self.entries.is_empty() {
@@ -7807,7 +7883,7 @@ impl Props {
                 return Some(Element::word(value, words.integrity()));
             }
         }
-        if !self.has_far.get() {
+        if !self.has_far() {
             return None;
         }
         self.find(PropKey::index(n))
@@ -7822,7 +7898,7 @@ impl Props {
         if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
             return Some(value);
         }
-        if !self.has_far.get() {
+        if !self.has_far() {
             return None;
         }
         self.find(PropKey::index(n))
@@ -7856,7 +7932,7 @@ impl Props {
     /// that index consult the named entries (find, get_key).
     fn note_inserted(&mut self, slot: usize) {
         if self.entries.keys()[slot].as_index().is_some() {
-            self.has_far.set(true);
+            self.set_has_far(true);
         }
     }
 
@@ -7864,7 +7940,7 @@ impl Props {
     /// [`INDEX_THRESHOLD`] named keys, index keys among them (an ordinary map's index is its
     /// layout's or the fallback, `ensure_fallback_index`).
     fn should_build_index(&self) -> bool {
-        self.elem_mode.get() && self.entries.len() + 1 > INDEX_THRESHOLD
+        self.elem_mode() && self.entries.len() + 1 > INDEX_THRESHOLD
     }
 
     /// Dense tail append: insert element `n` as a word when `n` is exactly the words' end and no
@@ -7885,7 +7961,7 @@ impl Props {
         // refuses before an append.
         debug_assert!(!words.sealed(), "an element appended to a sealed block");
         let len = words.len();
-        if self.has_far.get() || n as usize != len || !prop.is_plain_element() {
+        if self.has_far() || n as usize != len || !prop.is_plain_element() {
             return Err(prop);
         }
         self.note_structural();
@@ -7907,7 +7983,7 @@ impl Props {
             self.start_packed_elements(n as usize, prop);
             return Ok(());
         }
-        if self.has_far.get() || !prop.is_plain_element() {
+        if self.has_far() || !prop.is_plain_element() {
             return Err(prop);
         }
         let Some(words) = self.elems.words() else {
@@ -7941,7 +8017,7 @@ impl Props {
     /// change (words are not in the shape). `Some(value)` = removed; `None` = gates failed,
     /// nothing changed, caller goes generic.
     pub(crate) fn pop_last_element(&mut self, n: u32) -> Option<Value> {
-        if self.has_far.get() || !self.elem_mode.get() {
+        if self.has_far() || !self.elem_mode() {
             return None;
         }
         let words = self.elems.words().filter(|words| !words.sealed())?;
@@ -7962,7 +8038,7 @@ impl Props {
     /// index in the named entries), for a search that compares them in place; a hole is
     /// [`PACK_EMPTY`].
     pub(crate) fn element_words(&self) -> Option<&[u64]> {
-        if !self.elem_mode.get() || self.has_far.get() {
+        if !self.elem_mode() || self.has_far() {
             return None;
         }
         self.elems.words().map(word_block::Words::as_slice)
@@ -7976,7 +8052,7 @@ impl Props {
     /// indexed properties): its effect is then exactly the edited list. The caller records the
     /// new length with [`Self::set_array_length_value`]. `None` changes nothing.
     pub(crate) fn plain_elements_mut(&mut self, len: usize) -> Option<&mut word_block::Words> {
-        if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
+        if len == 0 || len > u32::MAX as usize || !self.elem_mode() || self.has_far() {
             return None;
         }
         let length = self.length_property()?;
@@ -8008,7 +8084,7 @@ impl Props {
         len: usize,
         holes_read_absent: bool,
     ) -> Option<Value> {
-        if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
+        if len == 0 || len > u32::MAX as usize || !self.elem_mode() || self.has_far() {
             return None;
         }
         let length = self.length_property()?;
@@ -8044,7 +8120,7 @@ impl Props {
         else {
             return false;
         };
-        if !self.elem_mode.get() || self.has_far.get() {
+        if !self.elem_mode() || self.has_far() {
             return false;
         }
         let Some(length) = self.length_property() else {
@@ -8080,7 +8156,7 @@ impl Props {
         // `Indexed`): every other element is a word or absent, which the callers answer. With
         // it set, the index key is found as any key is (the map's index, else a short scan).
         let array_index = key.as_index();
-        if array_index.is_some() && !self.has_far.get() {
+        if array_index.is_some() && !self.has_far() {
             return None;
         }
         // `length` and `prototype` are the hottest keys in array-heavy / allocation-heavy code
@@ -8111,7 +8187,7 @@ impl Props {
         // overrides and Proxy traps. Named inserts change the shape, and far
         // canonical indices must retain their ordinary map lookup.
         if self.entries.len() > INDEX_THRESHOLD
-            && self.elem_mode.get()
+            && self.elem_mode()
             && array_index.is_none()
             && key != length
             && is_cacheable_shape(self.shape)
@@ -8123,7 +8199,7 @@ impl Props {
         // crosses INDEX_THRESHOLD. The table may include predicted tail keys; a slot beyond the
         // field vector is not an own property. This miss is conclusive because layout keys are
         // always the exact live prefix followed only by predictions.
-        if !self.elem_mode.get() && self.entries.len() > INDEX_THRESHOLD {
+        if !self.elem_mode() && self.entries.len() > INDEX_THRESHOLD {
             if let Some(layout) = self
                 .entries
                 .layout
@@ -8178,7 +8254,7 @@ impl Props {
             // The array-length shape proves every other named key absent (see `find`), with
             // no atom to look up.
             if self.entries.len() > INDEX_THRESHOLD
-                && self.elem_mode.get()
+                && self.elem_mode()
                 && text != "length"
                 && is_cacheable_shape(self.shape)
                 && self.shape == array_length_shape()
@@ -8245,7 +8321,7 @@ impl Props {
     /// usable layout index (for example shape-identity exhaustion). Common shaped objects keep
     /// the one index on their shared layout instead of one duplicate per receiver.
     fn ensure_fallback_index(&mut self) {
-        if self.elem_mode.get() {
+        if self.elem_mode() {
             return;
         }
         if self
@@ -8281,7 +8357,7 @@ impl Props {
             // An index that is not a word lives in the named entries only with `has_far`:
             // without it a word miss proves absence; scanning every string-key entry is both
             // redundant and especially costly for a hole read from a large array.
-            if !self.has_far.get() {
+            if !self.has_far() {
                 return None;
             }
         }
@@ -8301,7 +8377,7 @@ impl Props {
             if let Some(property) = self.get_index(n) {
                 return Some((property, None));
             }
-            if !self.has_far.get() {
+            if !self.has_far() {
                 return None;
             }
         }
@@ -8364,7 +8440,7 @@ impl Props {
                 // shape's back, so acquiring one for a shape-tracked entry demotes the
                 // shape (array element entries are exempt, as in `remove`). Value-only
                 // writers use `set_value`/`set_value_at` and pay nothing.
-                if !(self.elem_mode.get() && index.is_some()) {
+                if !(self.elem_mode() && index.is_some()) {
                     self.demote_shape();
                 }
                 Some(&mut self.entries.fields[i])
@@ -8534,14 +8610,14 @@ impl Props {
         self.elems.clear();
         self.len_slot.set(SlotMemo::NONE);
         self.proto_slot.set(SlotMemo::NONE);
-        self.has_far.set(false);
+        self.set_has_far(false);
         self.shape = shape_fresh();
     }
     /// Append the next element word while *building a fresh array in order* (its elements so
     /// far are exactly the words 0..len, with no index key in the named entries): skips the
     /// canonical-index parse and the existence lookup. A word is a plain element.
     pub(crate) fn push_dense(&mut self, prop: Property) {
-        debug_assert!(!self.has_far.get(), "push_dense beside a named index key");
+        debug_assert!(!self.has_far(), "push_dense beside a named index key");
         self.push_packed_property(prop);
     }
 
@@ -8563,7 +8639,7 @@ impl Props {
         }
         // If the constructor did not predict this key, reuse the small ordinary transition's
         // key layout. The creation IC still saves the semantic absence/prototype-chain walk.
-        if !self.elem_mode.get()
+        if !self.elem_mode()
             && !self.entries.predicts(key)
             && self.entries.len() < SHARED_LAYOUT_MAX_FIELDS
         {
@@ -8632,7 +8708,7 @@ impl Props {
             let n = n as usize;
             // An index a named entry already holds keeps it there (replaced below), so no
             // element is ever stored twice.
-            let named = self.has_far.get() && self.find(key).is_some();
+            let named = self.has_far() && self.find(key).is_some();
             let integrity = self.word_integrity();
             let sealed_word = integrity & word_block::KIND_SEALED != 0
                 && !named
@@ -8668,7 +8744,7 @@ impl Props {
                     self.elems.words_mut().unwrap().set(n, prop.into_value());
                     return;
                 }
-                if !self.has_far.get() && self.words_admit(n) {
+                if !self.has_far() && self.words_admit(n) {
                     self.note_structural();
                     let words = self.elems.words_mut().unwrap();
                     words.resize_with_holes(n);
@@ -8684,7 +8760,7 @@ impl Props {
                     return;
                 }
             }
-            self.has_far.set(true);
+            self.set_has_far(true);
         }
         if let Some(i) = self.find(key) {
             // A whole-descriptor replacement that changes descriptor class cannot stay
@@ -8693,7 +8769,7 @@ impl Props {
             // `remove` — their shape tracks named keys only. Class-preserving
             // replacements (including enumerable/configurable-only changes) keep it.
             if self.entries.fields[i].class() != prop.class()
-                && !(self.elem_mode.get() && key.as_index().is_some())
+                && !(self.elem_mode() && key.as_index().is_some())
             {
                 self.shape = shape_fresh();
             }
@@ -8709,8 +8785,8 @@ impl Props {
                 self.build_index();
                 self.elems.index_mut().unwrap().insert(key, slot);
             }
-            if !(self.elem_mode.get() && key.as_index().is_some()) {
-                let prefix = (!self.elem_mode.get()
+            if !(self.elem_mode() && key.as_index().is_some()) {
+                let prefix = (!self.elem_mode()
                     && self.entries.len() < SHARED_LAYOUT_MAX_FIELDS
                     && !self.entries.predicts(key))
                 .then(|| {
@@ -8764,8 +8840,8 @@ impl Props {
             // the key index and the shape (named keys only) stand, and an `a.length = 0`
             // refill appends in native code from its first word (W2c step 4). A set `has_far`
             // may have outlived its last named index, as the full path below rebuilds it.
-            if self.has_far.get() {
-                self.has_far.set(false);
+            if self.has_far() {
+                self.set_has_far(false);
                 for slot in 0..self.entries.len() {
                     self.note_inserted(slot);
                 }
@@ -8777,7 +8853,7 @@ impl Props {
         self.proto_slot.set(SlotMemo::NONE);
         self.elems.set_index(None);
         if self.entries.len() > INDEX_THRESHOLD
-            && (self.elem_mode.get()
+            && (self.elem_mode()
                 || !self
                     .entries
                     .layout
@@ -8787,7 +8863,7 @@ impl Props {
             self.build_index();
         }
         // Forget the old conservative proof and let the surviving named keys reassert it.
-        self.has_far.set(false);
+        self.set_has_far(false);
         for slot in 0..self.entries.len() {
             self.note_inserted(slot);
         }
@@ -8828,7 +8904,7 @@ impl Props {
         // Slots shifted — deopt to a fresh shape id (see remove_indices_from). Array maps skip
         // this for ELEMENT keys: their shape tracks named keys only, and array entry slots are
         // only ever trusted through key-checked ICs (IC_ARR_KEYCHK), which re-verify on hit.
-        if !(self.elem_mode.get() && key.as_index().is_some()) {
+        if !(self.elem_mode() && key.as_index().is_some()) {
             self.shape = shape_fresh();
         }
         self.len_slot.set(SlotMemo::NONE);
@@ -8841,7 +8917,7 @@ impl Props {
             // bindings from a global with a thousand properties) stays linear and cheap.
             index.close_gap(i);
         }
-        if !self.elem_mode.get()
+        if !self.elem_mode()
             && self
                 .entries
                 .layout
@@ -8871,7 +8947,7 @@ impl Props {
             .keys()
             .iter()
             .any(|key| key.as_index().is_some());
-        self.has_far.set(remains);
+        self.set_has_far(remains);
     }
     /// Ordinary property keys in insertion order. Engine state and private elements live in a
     /// separate slot map and never participate in ordinary key, descriptor or lookup operations.

@@ -674,7 +674,7 @@ pub(super) fn report(heap: &GcHeap) {
             inventory.unavailable_borrows += 1;
             continue;
         };
-        let family = if !object.ic_plain.get() {
+        let family = if !object.ic_plain() {
             6
         } else if object.kind.is_callable() {
             1

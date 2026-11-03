@@ -61,7 +61,7 @@ fn valid(l: &JitLayout) -> bool {
             l.scope_binding_offset,
             l.binding_value,
             l.obj_props + l.props_shape,
-            l.obj_ic_plain,
+            l.obj_flags,
             l.obj_kind,
             l.entry_size,
             l.entry_value,
@@ -98,8 +98,9 @@ fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
     } else {
         a.guard_exotic_none(l, R9, CX, slow);
     }
-    a.nr_load8(CX, R9, l.obj_ic_plain);
-    a.nr_zero_guard(CX, slow);
+    a.nr_load8(CX, R9, l.obj_flags);
+    a.nr_op_imm(4, CX, i32::from(crate::value::FLAG_IC_PLAIN)); // and
+    a.jcc(EQ, slow);
     storage::fields_len(a, l, CX, R9);
     a.nr_cmp(DX, CX);
     a.jcc(AE, slow);

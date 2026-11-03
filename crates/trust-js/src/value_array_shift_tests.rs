@@ -119,7 +119,7 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
     // named entries, and the storage path then refuses, leaving the generic algorithm to run.
     let mut words = numbers(3, true, false, true);
     words.get_mut("0").unwrap().set_configurable(false);
-    assert!(words.has_far.get());
+    assert!(words.has_far());
     assert!(words.shift_dense_array(3, false).is_none());
     assert_eq!(words.get("0").unwrap().number_value(), Some(0.0));
     assert!(!words.get("0").unwrap().configurable());
@@ -170,10 +170,10 @@ fn dense_shift_storage_rejections_are_atomic() {
             p.get_mut("length").unwrap().set_value(Value::Num(4.0));
         },
         |p| {
-            p.has_far.set(true);
+            p.set_has_far(true);
         },
         |p| {
-            p.elem_mode.set(false);
+            p.set_elem_mode(false);
         },
         |p| {
             p.insert("length", Property::accessor_prop(None, None, false, false));
@@ -259,7 +259,7 @@ fn holes_and_nonplain_descriptors_keep_words_out_of_the_storage_paths() {
     let mut descriptor =
         Props::packed_array([Value::Num(1.0), Value::Num(2.0), Value::Num(3.0)].into_iter());
     descriptor.insert("1", Property::data(Value::Num(2.0), false, true, true));
-    assert!(descriptor.has_far.get());
+    assert!(descriptor.has_far());
     assert!(descriptor.elems.words().unwrap().get(1).is_none());
     let element = descriptor.get_index(1).expect("the named element");
     assert!(matches!(element, Element::Entry(_)) && !element.writable());
@@ -346,7 +346,7 @@ fn cloned_words_change_independently() {
         );
         clone.insert("0", Property::data(Value::Num(0.0), false, true, true));
         assert!(clone.shift_dense_array(length, false).is_none());
-        assert!(!original.has_far.get());
+        assert!(!original.has_far());
         assert!(original.get_index(0).unwrap().writable());
         assert!(matches!(original.get_index(0).unwrap(), Element::Word(_)));
     }

@@ -84,7 +84,7 @@ impl ForInKeys {
         }
         bytes = bytes.saturating_add(props.retained_requested_storage_bytes().0);
         let object = Object::new_with_parts(None, props, ObjectKind::Plain);
-        object.borrow_mut().extensible = false;
+        object.borrow_mut().set_extensible(false);
         (Self(object), bytes)
     }
 
@@ -2272,7 +2272,7 @@ impl Interp {
             }
             // The receiver transitively owns every prototype. This walk runs no author code.
             let object = unsafe { (*current).borrow() };
-            if !object.ic_plain.get() || !object.kind.is_ordinary() {
+            if !object.ic_plain() || !object.kind.is_ordinary() {
                 return None;
             }
             let (layout, prefix, enumerable) = object.props.enumeration_layout()?;
@@ -2888,7 +2888,7 @@ impl Interp {
             .is_some_and(|p| p.writable() && !p.accessor())
         {
             g.props.set_value(name, val);
-        } else if g.props.get(name).is_none() && g.extensible {
+        } else if g.props.get(name).is_none() && g.extensible() {
             g.props.insert(name, Property::data(val, true, true, true));
         }
     }
@@ -3137,7 +3137,7 @@ impl Interp {
         loop {
             let next = {
                 let object = current.borrow();
-                if !object.ic_plain.get()
+                if !object.ic_plain()
                     || !(object.kind.is_ordinary()
                         || matches!(object.kind, crate::value::ObjectKind::Array))
                 {
@@ -3165,7 +3165,7 @@ impl Interp {
         loop {
             let next = {
                 let object = current.borrow();
-                if !object.ic_plain.get()
+                if !object.ic_plain()
                     || !(object.kind.is_ordinary()
                         || matches!(object.kind, crate::value::ObjectKind::Array))
                 {
@@ -3197,7 +3197,7 @@ impl Interp {
             return Err(value);
         };
         let mut object = object.borrow_mut();
-        if !object.ic_plain.get()
+        if !object.ic_plain()
             || !(object.kind.is_ordinary()
                 || matches!(object.kind, crate::value::ObjectKind::Array))
         {
@@ -4224,7 +4224,7 @@ impl Interp {
     pub(crate) fn freeze_object(&self, v: &Value) {
         if let ValueView::Obj(o) = &(v).view() {
             let mut b = o.borrow_mut();
-            b.extensible = false;
+            b.set_extensible(false);
             b.props.freeze_descriptors();
         }
     }
@@ -5906,7 +5906,7 @@ impl Interp {
         if self.global.borrow().props.contains(name) {
             return true;
         }
-        self.global.borrow().extensible
+        self.global.borrow().extensible()
     }
 
     /// CanDeclareGlobalFunction: definable if an existing property is configurable (or a writable,
@@ -5914,7 +5914,7 @@ impl Interp {
     fn can_declare_global_function(&self, name: &str) -> bool {
         let g = self.global.borrow();
         match g.props.get(name) {
-            None => g.extensible,
+            None => g.extensible(),
             Some(p) => p.configurable() || (!p.accessor() && p.writable() && p.enumerable()),
         }
     }
@@ -5949,7 +5949,7 @@ impl Interp {
         if self.global.borrow().props.contains(name) {
             return;
         }
-        if self.global.borrow().extensible {
+        if self.global.borrow().extensible() {
             self.global
                 .borrow_mut()
                 .props
@@ -6654,11 +6654,11 @@ impl Interp {
                 private_members,
             },
         );
-        ctor_obj.borrow_mut().class_kind = if derived {
+        ctor_obj.borrow_mut().set_class_kind(if derived {
             crate::value::CLASS_DERIVED
         } else {
             crate::value::CLASS_BASE
-        };
+        });
 
         // Borrow each record without detaching the backing list: both the current key and
         // the remaining static records stay traced through initializer/decorator callbacks.
@@ -7062,7 +7062,7 @@ impl Interp {
             let nt = self.constructor_new_target();
             return self.construct_nt(*ctor, args, nt);
         }
-        let class_kind = obj.borrow().class_kind;
+        let class_kind = obj.borrow().class_kind();
         let is_class = class_kind != 0;
         let derived = class_kind == crate::value::CLASS_DERIVED;
         let call = obj.borrow().kind.clone_callable();
@@ -7116,10 +7116,10 @@ impl Interp {
                         // itself callable: carry the built-in's [[Call]] behavior onto `this`.
                         let src_call = src.borrow().kind.clone_callable();
                         if src_call.is_callable() && !dst.borrow().kind.is_callable() {
-                            let is_ctor = src.borrow().is_constructor;
+                            let is_ctor = src.borrow().is_constructor();
                             let mut db = dst.borrow_mut();
                             db.kind = src_call;
-                            db.is_constructor = is_ctor;
+                            db.set_constructor(is_ctor);
                         }
                         // Move the native object's internal slots (Map/Set/TypedArray/buffer/etc.)
                         // onto `this`, so a subclass instance carries the built-in's state.
@@ -7153,7 +7153,7 @@ impl Interp {
                             self.gc_pins.remove(&sp);
                         }
                         if let Some(v) = self.typed_arrays.remove(&sp) {
-                            dst.borrow().ic_plain.set(false);
+                            dst.borrow().set_ic_plain(false);
                             self.typed_arrays.insert(dp, v);
                             // The view moves with its side-table entry.
                             if src.borrow().kind.typed_array().is_some() {
@@ -7231,11 +7231,11 @@ impl Interp {
             if let ValueView::Obj(source) = &(value).view() {
                 if !Gc::ptr_eq(source, rest) {
                     let source = source.borrow();
-                    if source.ic_plain.get() && source.kind.exotic_is_none() {
+                    if source.ic_plain() && source.kind.exotic_is_none() {
                         let mut target = rest.borrow_mut();
-                        if target.ic_plain.get()
+                        if target.ic_plain()
                             && target.kind.exotic_is_none()
-                            && target.extensible
+                            && target.extensible()
                             && target.props.try_copy_named_data_from(&source.props)
                         {
                             return Ok(());
@@ -8888,9 +8888,9 @@ impl Interp {
                     });
                 let target = if canonical {
                     let b = rhs.borrow();
-                    (b.is_constructor
+                    (b.is_constructor()
                         && b.kind.exotic_is_none()
-                        && b.ic_plain.get()
+                        && b.ic_plain()
                         && b.props.shape() == cached.recv_shape
                         && b.proto
                             .as_ref()
@@ -8924,9 +8924,9 @@ impl Interp {
         let fill = match (key.as_deref(), &(r).view()) {
             (Some(key), ValueView::Obj(o)) if self.ordinary_get_ptr(Gc::as_ptr(o) as usize) => {
                 let b = o.borrow();
-                if b.is_constructor
+                if b.is_constructor()
                     && b.kind.exotic_is_none()
-                    && b.ic_plain.get()
+                    && b.ic_plain()
                     && crate::value::is_cacheable_shape(b.props.shape())
                     && b.proto
                         .as_ref()
@@ -9279,7 +9279,7 @@ impl Interp {
                     || user.func.is_async)
             }
             call if call.is_native() => {
-                b.is_constructor
+                b.is_constructor()
                     || b.props
                         .get("prototype")
                         .map(|p| !p.accessor())
@@ -9288,7 +9288,7 @@ impl Interp {
             // ECMA-262 BoundFunctionCreate step 5: [[Construct]] is installed at creation exactly
             // when IsConstructor(targetFunc) held then; `bind` records that answer. Reading the
             // record (instead of re-walking the target chain) keeps long bind chains O(1) here.
-            ObjectKind::Bound(_) => b.is_constructor,
+            ObjectKind::Bound(_) => b.is_constructor(),
             _ => false,
         }
     }

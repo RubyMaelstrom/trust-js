@@ -2747,7 +2747,7 @@ fn add_ctor(
     f: NativeFn,
 ) -> Gc {
     let ctor = it.make_native(name, len, f);
-    ctor.borrow_mut().is_constructor = true;
+    ctor.borrow_mut().set_constructor(true);
     ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(proto), false, false, false),

@@ -20,12 +20,13 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
     if target.is_callable() {
         obj.borrow_mut().kind = ObjectKind::Native(proxy_uncallable);
         // A proxy is a constructor exactly when its target is one.
-        obj.borrow_mut().is_constructor = is_constructor_value(&target);
+        obj.borrow_mut()
+            .set_constructor(is_constructor_value(&target));
     }
     let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.inline_ic_safe.set(false);
-    obj.borrow().ic_plain.set(false);
+    obj.borrow().set_ic_plain(false);
     i.proxies.insert(&i.gc_heap, p, (target, handler));
     Ok(Value::Obj(obj))
 }
@@ -37,7 +38,7 @@ fn revoke_proxy(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Valu
         // operation throws a TypeError rather than silently acting like a plain object.
         if let Some(owner) = i.metadata_owner(ptr, |owner, ptr| owner.proxies.contains_key(&ptr)) {
             i.inline_ic_safe.set(false);
-            o.borrow().ic_plain.set(false);
+            o.borrow().set_ic_plain(false);
             let heap = i.gc_heap.clone();
             i.with_metadata_table(
                 owner,
@@ -60,7 +61,7 @@ pub(super) fn install_proxy(it: &mut Interp) {
         }
         make_proxy(i, arg(a, 0), arg(a, 1))
     });
-    ctor.borrow_mut().is_constructor = true; // Proxy is a constructor but has no `.prototype`
+    ctor.borrow_mut().set_constructor(true); // Proxy is a constructor but has no `.prototype`
     it.def_method(&ctor, "revocable", 2, |i, _t, a| {
         let proxy = make_proxy(i, arg(a, 0), arg(a, 1))?;
         let revoke = make_bound(i, revoke_proxy, vec![proxy]);

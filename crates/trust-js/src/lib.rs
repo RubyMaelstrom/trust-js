@@ -1358,7 +1358,7 @@ impl interpreter::Interp {
             return false;
         }
         let mut cell = cell.borrow_mut();
-        if always_extensible && !cell.extensible {
+        if always_extensible && !cell.extensible() {
             return false;
         }
         for (enabled, key) in [
